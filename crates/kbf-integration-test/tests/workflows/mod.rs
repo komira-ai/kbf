@@ -15,7 +15,9 @@
 //!   so each is refused because the lint cannot tell where it lands;
 //! - a job's `permissions` grants anything but `read` or `none`, except the two scopes
 //!   that sign build provenance ([`SIGNING_SCOPES`]: `id-token` and `attestations`),
-//!   which may be `write` only in a job whose `if:` is exactly [`SIGNING_PUSH_ONLY`], and
+//!   which may be `write` only in a job whose `if:` is exactly [`SIGNING_PUSH_ONLY`] (`id-token`
+//!   also in a job whose `if:` is exactly [`RELEASE_PUSH_ONLY`], for the release's deploy step,
+//!   [`DEPLOY_SCOPE`]), and
 //!   `contents` ([`RELEASE_SCOPES`]), which may be `write` only in a job whose `if:` is
 //!   exactly [`RELEASE_PUSH_ONLY`]. So no pull request or merge-queue run holds a
 //!   token that can sign an attestation, every attestation this repository signs names
@@ -153,6 +155,12 @@ const SIGNING_SCOPES: &[&str] = &["id-token", "attestations"];
 /// attestation signed under it names `refs/heads/main`.
 const SIGNING_PUSH_ONLY: &str =
     "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
+
+/// The one signing scope a job may also set to `write` under [`RELEASE_PUSH_ONLY`]: the OIDC
+/// token, which the release workflow's deploy step presents to the farm's update coordinator.
+/// It signs nothing (`attestations` stays under [`SIGNING_PUSH_ONLY`]), and the workflow lint of
+/// `release.yml` holds the one job that has it to `contents: read` beside it.
+const DEPLOY_SCOPE: &str = "id-token";
 
 /// Token scopes a job may set to `write` when it runs only for a push to `main` that releases:
 /// the repository's contents, which creating a release and uploading its assets need.
@@ -652,6 +660,9 @@ impl Lint<'_> {
             let name = scope.as_str().unwrap_or("?");
             let granted = level.as_str().unwrap_or("?");
             if granted == "read" || granted == "none" {
+                continue;
+            }
+            if name == DEPLOY_SCOPE && granted == "write" && condition == Some(RELEASE_PUSH_ONLY) {
                 continue;
             }
             let gate = if SIGNING_SCOPES.contains(&name) {

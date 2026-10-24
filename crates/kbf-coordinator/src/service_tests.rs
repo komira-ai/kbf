@@ -5,9 +5,10 @@ use kbf_types::HostRole;
 use kbf_updater::wire::Reply;
 use serde_json::json;
 
+use crate::converge::State;
 use crate::desired::DesiredStore;
 use crate::identity::Identity;
-use crate::service::{Coordinator, SetError, Unauthorized};
+use crate::service::{CiRefused, Coordinator, SetError, Unauthorized};
 use crate::testutil::{OPERATOR, Rig, beat, ci_token, clock_of, id, updating, version};
 
 const STATE: &str = r#"{"version":"2.0","max_updating":{"daemon":1},
@@ -270,4 +271,82 @@ fn the_coordinators_debug_text_holds_no_secret() {
     let rig = Rig::new("svc-debug");
     let text = format!("{:?}", rig.coordinator);
     assert!(!text.contains(OPERATOR), "{text}");
+}
+
+/// Catches: the convergence read opening to anyone but CI: no bearer, an empty one, a long
+/// one, the operator token, a token signed by another key, and a CI token used a second
+/// time are each refused; and the CI token is refused by the operator's status read.
+#[tokio::test]
+async fn the_convergence_is_read_with_a_ci_token_and_nothing_else() {
+    let rig = Rig::new("svc-converge-auth");
+    rig.at(2_000);
+    let k = keys();
+    let other = mint(&k[1], &good_claims(STATIC_ISSUER));
+    for (bearer, why) in [
+        (None, "missing"),
+        (Some(""), "malformed"),
+        (Some(OPERATOR), "malformed"),
+        (Some(other.as_str()), "unknown_key"),
+    ] {
+        let read = rig.coordinator.convergence(bearer).await;
+        assert_eq!(
+            read.map(|_| ()),
+            Err(CiRefused::Unauthorized(why)),
+            "{bearer:?}"
+        );
+    }
+    let long = "a".repeat(9_000);
+    assert!(matches!(
+        rig.coordinator.convergence(Some(&long)).await,
+        Err(CiRefused::Unauthorized("missing"))
+    ));
+    let token = ci_token();
+    rig.coordinator
+        .convergence(Some(&token))
+        .await
+        .expect("the first use is accepted");
+    assert_eq!(
+        rig.coordinator.convergence(Some(&token)).await.map(|_| ()),
+        Err(CiRefused::Unauthorized("replayed"))
+    );
+    assert_eq!(
+        rig.coordinator.status(Some(&ci_token())).map(|_| ()),
+        Err(Unauthorized)
+    );
+}
+
+/// Catches: the convergence read answering from anything but the heartbeats and the stored
+/// desired state: with none set it is in progress; once set, hosts that heartbeat move it
+/// from in progress to converged; reading it sets no state and orders nothing.
+#[tokio::test]
+async fn the_convergence_follows_the_heartbeats() {
+    let rig = Rig::new("svc-converge");
+    rig.at(2_000);
+    let none = rig.coordinator.convergence(Some(&ci_token())).await;
+    let none = none.expect("read");
+    assert_eq!((none.desired, none.state), (None, State::InProgress));
+    rig.set(STATE).await;
+    let d1 = || who("d1", HostRole::Daemon);
+    rig.coordinator.heartbeat(d1(), beat("1.0"));
+    let behind = rig.coordinator.convergence(Some(&ci_token())).await;
+    assert_eq!(behind.expect("read").state, State::InProgress);
+    rig.coordinator.heartbeat(d1(), beat("2.0"));
+    let short = rig.coordinator.convergence(Some(&ci_token())).await;
+    assert_eq!(
+        short.expect("read").state,
+        State::InProgress,
+        "STATE keeps one storage host and one frontend up, and none has been heard from"
+    );
+    for (name, role) in [("st1", HostRole::Storage), ("fe1", HostRole::Frontend)] {
+        rig.coordinator.heartbeat(who(name, role), beat("2.0"));
+    }
+    let done = rig.coordinator.convergence(Some(&ci_token())).await;
+    let done = done.expect("read");
+    assert_eq!(done.state, State::Converged);
+    let daemons = done
+        .roles
+        .iter()
+        .find(|r| r.role == "daemon")
+        .expect("daemon");
+    assert_eq!(daemons.at_desired, 1);
 }

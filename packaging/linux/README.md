@@ -78,9 +78,9 @@ packaged: `kbf` serves no control socket
 ignored and logged as retired).
 
 Dependencies: the `kbf-installer` deb `crun, uidmap, systemd, ca-certificates`; its rpm the same
-with Fedora's name for `uidmap`, `shadow-utils`. Never Podman, never Envoy (a test pins it): Envoy
-runs on frontend hosts only, is a host prerequisite, and nothing in these packages fetches or
-pins it. The `kbf` package adds only `kbf-installer`.
+with Fedora's name for `uidmap`, `shadow-utils`. Never Podman, never Envoy (a test pins it):
+nothing in these packages depends on, installs or checks Envoy, and kbf runs none. The `kbf`
+package adds only `kbf-installer`.
 
 ## Installing starts and enables nothing
 

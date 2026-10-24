@@ -53,10 +53,12 @@ pub fn is_bundle(name: &str) -> bool {
     name.ends_with(SUFFIX)
 }
 
-/// Whether the asset `name` is a package: a deb of a Linux job (`kbf-installer` or `kbf`) or
-/// the `.pkg` of the macOS one.
+/// Whether the asset `name` is a package: a deb of a Linux job (`kbf-installer` or `kbf`), the
+/// frontend image of one (an OCI image tarball) or the `.pkg` of the macOS one.
 pub fn is_package(name: &str) -> bool {
-    name.ends_with(".deb") || name.ends_with(".pkg")
+    name.ends_with(".deb")
+        || name.ends_with(".pkg")
+        || name.ends_with(crate::pkg_image_asset::SUFFIX)
 }
 
 /// Whether the asset `name` has a provenance bundle: a tarball, or a package (a

@@ -11,7 +11,9 @@ use kbf_updater::wire::{HEARTBEAT_PATH, MAX_HEARTBEAT_BYTES};
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, SanType};
 use serde_json::{Value, json};
 
-use crate::http::{DESIRED_PATH, MAX_DESIRED_BYTES, Peer, STATUS_PATH, Surface, handle};
+use crate::http::{
+    CONVERGENCE_PATH, DESIRED_PATH, MAX_DESIRED_BYTES, Peer, STATUS_PATH, Surface, handle,
+};
 use crate::testutil::{OPERATOR, Rig, ci_token};
 
 /// How long a body has in the tests that are not about patience.
@@ -351,6 +353,18 @@ async fn each_listener_serves_its_own_routes() {
             STATUS_PATH,
             StatusCode::METHOD_NOT_ALLOWED,
         ),
+        (
+            Surface::Heartbeat,
+            "GET",
+            CONVERGENCE_PATH,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Surface::Control,
+            "POST",
+            CONVERGENCE_PATH,
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
         (Surface::Control, "GET", "/", StatusCode::NOT_FOUND),
     ] {
         let (code, body) = call(&rig, surface, &who, request(method, path, None, "")).await;
@@ -508,4 +522,102 @@ async fn an_unreachable_issuer_is_503_and_an_unreadable_header_is_no_bearer() {
     let (code, _) =
         answer(handle(&rig.coordinator, Surface::Control, &None, opaque, PATIENCE).await).await;
     assert_eq!(code, StatusCode::UNAUTHORIZED);
+}
+
+async fn convergence(rig: &Rig, bearer: Option<&str>) -> (StatusCode, Value) {
+    call(
+        rig,
+        Surface::Control,
+        &None,
+        request("GET", CONVERGENCE_PATH, bearer, ""),
+    )
+    .await
+}
+
+/// Catches: the convergence read not being CI's: over HTTP it is 401 with no bearer, with
+/// the operator token and with a token that is no CI token's, 200 with a CI token, and a CI
+/// token does not open the operator's status.
+#[tokio::test]
+async fn the_convergence_needs_a_ci_token_over_http() {
+    let rig = Rig::new("http-converge-auth");
+    for bearer in [None, Some(OPERATOR), Some("not.a.token")] {
+        let (code, body) = convergence(&rig, bearer).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED, "{bearer:?}");
+        assert_eq!(body, json!({"error": "unauthorized"}));
+    }
+    let (code, _) = convergence(&rig, Some(&ci_token())).await;
+    assert_eq!(code, StatusCode::OK);
+    let (code, _) = call(
+        &rig,
+        Surface::Control,
+        &None,
+        request("GET", STATUS_PATH, Some(&ci_token()), ""),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNAUTHORIZED);
+}
+
+/// Catches: the shape CI parses drifting, and the three states being misread from heartbeats
+/// over HTTP: a farm mid-roll, a farm all at the version and a farm with a failed host read
+/// in_progress, converged and blocked, with the counts per role.
+#[tokio::test]
+async fn the_convergence_reports_in_progress_converged_and_blocked() {
+    let rig = Rig::new("http-converge");
+    rig.set(STATE).await;
+    rig.at(2_000);
+    let beat_of = |name: &str, role: &str, body: &str| {
+        (
+            updater(name, role),
+            request("POST", HEARTBEAT_PATH, None, body),
+        )
+    };
+    let at =
+        |v: &str| format!(r#"{{"platform":"linux-x86_64","version":"{v}","health":"healthy"}}"#);
+    let behind = at("1.0");
+    let ok = at("2.0");
+    let failed = r#"{"platform":"linux-x86_64","version":"1.0","health":"healthy",
+        "last_update":{"target":"2.0","outcome":"failed"}}"#
+        .to_owned();
+    let send = |hosts: Vec<(Peer, Request<Full<Bytes>>)>| async {
+        for (who, req) in hosts {
+            let (code, _) = call(&rig, Surface::Heartbeat, &who, req).await;
+            assert_eq!(code, StatusCode::OK);
+        }
+    };
+    send(vec![
+        beat_of("st1", "storage", &ok),
+        beat_of("st2", "storage", &behind),
+    ])
+    .await;
+    let (code, mid) = convergence(&rig, Some(&ci_token())).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(mid["state"], "in_progress");
+    assert_eq!(mid["desired"], "2.0");
+    assert_eq!(mid["quiet"], false);
+    assert_eq!(
+        mid["roles"],
+        json!([{"role": "storage", "at_desired": 1, "updating": 0, "failed": 0, "down": 0}])
+    );
+    send(vec![
+        beat_of("st2", "storage", &ok),
+        beat_of("fe1", "frontend", &ok),
+    ])
+    .await;
+    let (_, done) = convergence(&rig, Some(&ci_token())).await;
+    assert_eq!(done["state"], "converged");
+    send(vec![beat_of("st2", "storage", &failed)]).await;
+    let (_, stuck) = convergence(&rig, Some(&ci_token())).await;
+    assert_eq!(stuck["state"], "blocked");
+    assert_eq!(stuck["roles"][1]["failed"], 1);
+    assert_eq!(stuck["roles"][1]["role"], "storage");
+}
+
+/// Catches: an issuer that cannot be reached answered as a bad token: the convergence read
+/// is 503, as setting the state is.
+#[tokio::test]
+async fn the_convergence_with_an_unreachable_issuer_is_503() {
+    let rig = Rig::with_unreachable_issuer("http-converge-down");
+    let (code, body) = convergence(&rig, Some(&ci_token())).await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, json!({"error": "unavailable"}));
 }

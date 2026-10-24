@@ -4,8 +4,8 @@ Part of [the operator API](api.md).
 
 
 What the scheduler holds and what waits for it. Reads, open like `GET /v1/nodes`, and
-unredacted. The state is in memory: after a restart or a handover both are empty until
-the daemons reconnect. Every answer is `Cache-Control: no-store`; durations carry the
+unredacted. The state is in memory: after a restart both are empty until the daemons
+reconnect, and a frontend lists only what its own scheduler holds. Every answer is `Cache-Control: no-store`; durations carry the
 unit in the key and times are milliseconds since the Unix epoch.
 
 **`GET /v1/leases`**: the leases held now, in lease order.

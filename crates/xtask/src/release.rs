@@ -101,6 +101,7 @@ use crate::build_commit::full_commit;
 use crate::bundles;
 use crate::fetch::Sha256;
 use crate::package::{Platform, read};
+use crate::pkg_image_asset;
 use crate::sums::{self, SUMS};
 use crate::version_facts::{self, Pairing};
 
@@ -252,7 +253,8 @@ pub fn main_control(gh: &Path, repo: &str, on: &str, off: &str) -> Result<String
 }
 
 /// Whether `name` is an asset of `commit`: `<binary>-<commit>-<platform>` and
-/// `.tar.gz`, `.cdx.json`, `.deb` or `.pkg` (the packages; nfpm's own `kbf-installer_<version>_
+/// `.tar.gz`, `.cdx.json`, `.deb`, `.pkg` or `.oci.tar` (the packages; and the frontend image,
+/// [`crate::pkg_image_asset`], which exists for the Linux platforms only; nfpm's own `kbf-installer_<version>_
 /// <arch>.deb` and `pkg build`'s `kbf-installer-<version>-macos-arm64.pkg` name no commit and are
 /// not one), or the version facts of `kbf` for a platform ([`version_facts::is_facts_of`]).
 fn is_asset_of(name: &str, commit: &str) -> bool {
@@ -263,10 +265,18 @@ fn is_asset_of(name: &str, commit: &str) -> bool {
         .strip_suffix(".tar.gz")
         .or_else(|| name.strip_suffix(".cdx.json"))
         .or_else(|| name.strip_suffix(".deb"))
-        .or_else(|| name.strip_suffix(".pkg"));
+        .or_else(|| name.strip_suffix(".pkg"))
+        .or_else(|| name.strip_suffix(pkg_image_asset::SUFFIX));
     let parts = stem.and_then(|s| s.split_once(&format!("-{commit}-")));
-    parts
-        .is_some_and(|(binary, platform)| !binary.is_empty() && Platform::named(platform).is_some())
+    let is_image = name.ends_with(pkg_image_asset::SUFFIX);
+    parts.is_some_and(|(binary, platform)| {
+        let platform = Platform::named(platform);
+        !binary.is_empty()
+            && platform.is_some()
+            && (!is_image
+                || (binary == pkg_image_asset::BINARY
+                    && matches!(platform, Some(Platform::LinuxX86_64 | Platform::LinuxArm64))))
+    })
 }
 
 /// The `release check` verb: the lines to print, then every file name of `dir`

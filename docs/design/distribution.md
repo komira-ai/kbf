@@ -2,8 +2,10 @@
 
 > **Retired in part.** The proxy's update API at `/v1/update/frontend`, its two-slot
 > supervision of frontend children and the `kbf-installer update` client were removed; a
-> pool of frontends behind the proxy is rolled as a package by `kbf-updater`. Passages below
-> that describe them are history.
+> pool of frontends behind the proxy is rolled as a package by `kbf-updater`. kbf also runs no
+> Envoy any more (the packages never depend on it, and nothing installs, checks, renders or reloads
+> it); the passages below that name Envoy, section 5 included, are history. Passages below that
+> describe the removed machinery are history.
 
 Status: design of record. Nothing here is built unless a sentence says so. Labels: **[V]** verified in
 a primary source or in the repo, **[L]** likely (inference, or memory of a primary source), **[U]**
@@ -22,7 +24,7 @@ Scope: on-prem only for now. What is deferred is listed in section 10.
 
 | Thing | What it is | What it does | What it never does |
 |---|---|---|---|
-| `kbf` | The runtime only. One binary: `kbf --mode=frontend\|storage\|daemon\|storage-and-daemon\|all-in-one`, or `mode = "..."` in `/etc/kbf/kbf.toml` (a flag overrides the file). `--config`, `--check` and `--instance` are flags. No positional arguments, no `node` mode; the old subcommand forms are aliases until the test farm has moved, then are removed | Runs the mode. At start it checks its host and refuses with one clear line per missing piece. Enrollment runs inside the start of the `storage`, `daemon` and `storage-and-daemon` modes; the token limits which roles a host may hold. The frontend creates its CA on first start into an empty `--ca-dir` | Install, download or configure anything. It has no `enroll`, `ca` or `token` command: tokens are operator-API routes |
+| `kbf` | The runtime only. One binary: `kbf --mode=frontend\|storage\|daemon\|storage-and-daemon\|all-in-one`, or `mode = "..."` in `/etc/kbf/kbf.toml` (a flag overrides the file). `--config` and `--check` are flags (`--instance` is accepted and ignored). No positional arguments, no `node` mode; the old subcommand forms are aliases until the test farm has moved, then are removed | Runs the mode. At start it checks its host and refuses with one clear line per missing piece. Enrollment runs inside the start of the `storage`, `daemon` and `storage-and-daemon` modes; the token limits which roles a host may hold. The frontend creates its CA on first start into an empty `--ca-dir` | Install, download or configure anything. It has no `enroll`, `ca` or `token` command: tokens are operator-API routes |
 | `kbf-installer` | THE package, and the one root tool for setup and updates of kbf | Setup: writes `kbf.toml` (mode, frontend URL) and places the enrollment token from `--token-file` (0600 root:kbf), pulls the `kbf` release itself (an unprivileged fetch child, the configured source only, verified before anything is root-owned), places and enables units. Then runs as a service: reads orders from the kbf-owned `orders/` directory (dot-temp name, then rename), keeps its state under the root-owned `/var/lib/kbf-installer`, reads settings from `/etc/kbf/installer.toml` | Update itself (only the package manager replaces it), fetch or pin Envoy, decide to update |
 | The package | The way `kbf-installer` reaches a host | Ships the `kbf-installer` binary, unit files (installed disabled, gated), and the trust files. Has no package `Depends:` on Envoy: setup and `check` test the installed Envoy on a frontend host (section 5) | Start a service, own anything under `/var/lib/kbf-installer/releases` |
 
@@ -49,16 +51,14 @@ verbs (`kbf cluster status|drain|undrain|member` is the model) are clients of it
   exist [F, `../api.md`], and answer 404 until the frontend wires enrollment in. Object-store registration is
   designed, not built ([object-store-registration.md](object-store-registration.md)), and so are the update
   endpoints. Every verb and its route is in [operator-verbs.md](operator-verbs.md).
-- **Updates are triggered externally.** Something outside kbf calls the control API to set the desired release;
-  the frontend then rolls the storage and daemon nodes through the drain system, one storage node at a time.
-  The frontend's own update is a second route, `POST /v1/update/frontend {commit}` (same write gates). The
-  frontend writes an order record into its own host's `orders/` directory, the mechanism nodes use, and the
-  host's `kbf-installer` pulls and verifies the release, starts the new instance behind the installed Envoy,
-  waits for its `/readyz`, then hands over; the old instance stops scheduling, relays its open `Execute`
-  streams until they close, and exits. The installer confirms, and reverts if the new instance never becomes
-  ready. One frontend update at a time; a second is refused. `kbf-installer update --frontend` is the
-  command-line client of that call (no root, refused through `sudo`). For
-  our own farm the trigger is its deployment pipeline. kbf has no update button and does not poll for releases
+- **Updates are triggered externally.** A release reaches a host as a package, and something outside kbf
+  installs it: `kbf-updater` drains a host, installs the package, restarts its units, waits until it is healthy
+  and undrains it, one host at a time, the members of a pool first. A frontend that is a member of a `kbf-proxy` pool
+  is rolled alone: drained at the proxy, retired (`POST /v1/frontend/retire`), installed, restarted, waited for
+  and put back, with its open `Execute` streams left to finish
+  ([../deploy/kbf-updater.md](../deploy/kbf-updater.md), [frontend-proxy.md](frontend-proxy.md) section 4). The
+  frontend serves no update route of its own and the proxy answers `/v1/update/frontend*` with 503. For our own
+  farm the trigger is its deployment pipeline. kbf has no update button and does not poll for releases
   (section 10).
 - A same-host proxy makes every caller loopback, which defeats the loopback gate, so the operator API and UI do
   not go through Envoy [V, split-mode-updates.md].
@@ -159,11 +159,11 @@ RestartPreventExitStatus=2
   a release component, and the frontend talks to it over a local socket. Until that is built, the frontend uses
   its in-process file signer (#966 [V]). Details: kbf-installer.md sections 3 and 7.
 
-## 5. Envoy is a host prerequisite the installer checks
+## 5. Envoy was a host prerequisite the installer checked (retired)
 
-Envoy is the frontend's update path: the new frontend instance starts beside the old one behind Envoy, Envoy
-sends new connections to it, and the old instance stops scheduling and relays its open `Execute` streams until
-they close ([kbf-installer.md](kbf-installer.md) section 6, [frontend-handover.md](frontend-handover.md)).
+This section is history. Envoy was once the frontend's update path (a new instance beside the old one, the
+old one handing over); the frontend now sits behind `kbf-proxy` and an update rolls one frontend at a time
+([frontend-proxy.md](frontend-proxy.md) section 4).
 
 - Envoy is **not** part of a kbf release, **not** pinned in a manifest and **not** fetched by `kbf-installer`,
   and it is **not** a package `Depends:` (one `.deb` serves every host, and a dependency cannot apply per host).
@@ -190,11 +190,11 @@ sections 4 and 5):
 - **Activate**: verify the staged release offline (build attestation, pinned `gh` and trusted root), switch
   `current`, restart the unit; the **confirm** order keeps it, a missed window or a crash loop **reverts** to
   `previous` locally (commit-confirm).
-- **Frontend update**, ordered by a `frontend_update` record the frontend writes for its own host after
-  `POST /v1/update/frontend` (its command-line client is `kbf-installer update --commit SHA --frontend --api ADDR`, which needs no root and is refused through `sudo`): it starts
-  the new instance behind the installed Envoy, waits for its readiness, confirms or reverts, and hands over; the old instance stops
-  scheduling and relays its open `Execute` streams until they close, with no timeout (OSS Buck2 never calls
-  `WaitExecution`). One frontend on SQLite now; Postgres and several frontends later.
+- **Frontend update**: not the installer's. It starts, stops and updates no frontend; the package manager
+  replaces `/usr/bin/kbf` and `kbf-updater` restarts the unit, one frontend of the pool at a time
+  ([frontend-proxy.md](frontend-proxy.md) section 4). `POST /v1/update/frontend` and `kbf-installer update
+  --frontend` were removed, so nothing writes the `frontend_update` record any more, which the root helper
+  still understands (`crates/kbf-installer/src/helper/cycle/frontend.rs`).
 - **Node drain and restart** as part of the per-host step.
 - **Fetch identity.** With the `frontend` release source the installer fetches with the host's enrolled node
   certificate. A storage-and-daemon host holds two role pairs: `installer.toml` points at the daemon pair if
@@ -283,6 +283,6 @@ providers; cross-version Envoy upgrades; a managed build service; Postgres and s
 Debian: `dh_installsystemd`, `deb-systemd-helper(1p)`, `policy-rc.d`, Debian Policy 9.1.2 and 10.7.3, FHS 3.0
 section 5.8, `debsums(1)`. systemd: `systemd.unit(5)`, `systemd.service(5)`, `systemd.exec(5)`,
 `sysusers.d(5)`, `tmpfiles.d(5)`; cited from memory, not fetched. Repo: `kbf-installer.md`, `docs/api.md`, `daemon.md`, `pull-updates.md`,
-`split-mode-updates.md`, `frontend-handover.md`, `macos-end-state.md`, `mac-node-provisioning.md`,
+`split-mode-updates.md`, `frontend-proxy.md`, `macos-end-state.md`, `mac-node-provisioning.md`,
 `../deploy/host-releases.md`, `../deploy/linux-build-host.md`; the kbf crates on `feature/pull-updates` and
 `startup/self-checks`.

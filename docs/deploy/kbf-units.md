@@ -70,12 +70,12 @@ checked by the package test.
 | `swap` | a mode that runs builds with `MemorySwapMax=` on its unit: its leases live in the unit's cgroup and may swap |
 | `oom` | a mode that runs builds without an integer `OOMScoreAdjust=` below 0, the build containers' score (a host-wide OOM kill takes the highest score first) |
 | `credential` | a key given to the unit any way but `kbf.toml`: an `EnvironmentFile=`, an `Environment=` naming a key, secret, token or password, a systemd credential, or an ordering after a MinIO unit |
-| `restart` | a node unit (`storage`, `daemon`, `storage-and-daemon`) without `RestartSec=5` and, in `[Unit]`, `StartLimitIntervalSec=0`: systemd's defaults (100 ms, 5 starts in 10 s) end a quickly repeating failure in `start-limit-hit` with the unit down. The frontend keeps `Restart=on-failure` without them: an old frontend that drained after a handover exits 0 and must stay down |
+| `restart` | a mode unit without `Restart=on-failure`, `RestartSec=5` and, in `[Unit]`, `StartLimitIntervalSec=0`: systemd's defaults (100 ms, 5 starts in 10 s) end a quickly repeating failure in `start-limit-hit` with the unit down. `on-failure` restarts no clean exit, so a frontend that was drained and stopped by an operator stays down |
 | `stop` | a mode that drains on SIGTERM (every mode but `daemon`, which has a finite stop) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
 | `kill-mode` | a mode that runs builds (`daemon`, `storage-and-daemon`, `all-in-one`) without `KillMode=mixed`: with the default `control-group` a stop sends SIGTERM to the actions in their sub-cgroups together with the daemon, and the drain ends at once |
 
 The test has more rules than these (`install`, `network`, `gate-*`, `user`, `nofile`,
-`notify`, `handover`, `conflicts`, `memory`, ...); its header lists what each catches.
+`notify`, `conflicts`, `memory`, ...); its header lists what each catches.
 
 **`delegate`.** systemd reads `Delegate=` this way (systemd.resource-control(5), and
 `config_parse_delegate` in systemd's `src/core/load-fragment.c`): a boolean delegates
@@ -195,7 +195,8 @@ database and its schema are `kbf-installer`'s.
 The unit gives no `--handover-socket` (nor a `RuntimeDirectory=` for one): `kbf frontend` has
 no handover any more, and the flag, like `--instance`, is accepted and ignored with a
 warning. The proxy of `docs/design/frontend-proxy.md` swaps nothing in its place: it balances
-over frontends that run on their own. An update of a Postgres frontend is a restart.
+over frontends that run on their own. An update of a frontend is a restart; behind the proxy
+it is a roll of one frontend at a time (below).
 
 **The epoch, and a restore from a backup.** The state store holds the farm's epoch
 (`meta/epoch`), and a frontend that starts keeps it: a restart of a frontend, or the start
@@ -233,17 +234,36 @@ epoch-bump`, then restart the frontend.
 
 ### Updating a frontend without failing a build
 
-The socket-handover template (two instances, `kbf-frontend@a` and `kbf-frontend@b`, and the
-`kbf frontend handover` command that started the idle one) was retired by a maintainer
-decision: the kbf-installer package no longer ships it, `kbf` no longer has the command, and
-no step of this guide enables it. A frontend keeps its state in Postgres, which has no
-writer role to hand over, so the template could not start on a host kbf-installer set up.
-A frontend runs as `kbf-frontend.service` (one process; an update is a restart, and the
-stop drains, below); kbf-installer's proxy starts and swaps none
-(`docs/design/frontend-proxy.md`). `kbf-server` has no control socket
-either: the handover code and its flags (`--handover-socket`, `--instance` and the rest) are
-removed, and the flags are accepted and ignored with a warning for one release. The retired
-design is kept as history in `docs/design/frontend-handover.md`.
+A frontend runs as `kbf-frontend.service`, one process; an update of it is a restart, and the
+stop drains (below). Frontends that share one Postgres state store serve at once and none
+fences another, so a farm that must not fail a build keeps more than one and puts
+`kbf-proxy` in front of them (`docs/design/frontend-proxy.md`). `kbf-updater` then rolls
+them one at a time: it drains a frontend at the proxy, waits until its streams are 0,
+retires it (`POST /v1/frontend/retire`, [api.md](../api.md#get-v1frontendretire-and-post-v1frontendretire)),
+installs the package, restarts the unit, waits until the proxy lists it ready on the new
+commit, and undrains it ([kbf-updater.md](kbf-updater.md)). The proxy starts, adopts and
+swaps no frontend, and `kbf-server` has no control socket.
+
+Removed: the socket-handover template (two instances, `kbf-frontend@a` and `kbf-frontend@b`),
+the `kbf frontend handover` command that started the idle one, the proxy's two-slot
+supervision of frontend children, and the handover code of `kbf-server` with its admin port.
+The kbf-installer package no longer ships the template, and no step of this guide enables it.
+A pool member beyond the plain `kbf-frontend.service` (the member named `-` in the
+inventory) is run from a `kbf-frontend@<name>.service` unit the operator supplies; the updater
+restarts that unit ([kbf-updater.md](kbf-updater.md)).
+The flags that turned them on (`--handover-socket`, `--instance` and the rest, listed in
+[api.md](../api.md#the-admin-calls-removed)) are accepted and ignored with a warning for one
+release.
+
+**A frontend and its storage node at a cold start.** The frontend sends `READY=1` (the unit is
+`Type=notify`) once it serves and its state store and map probes pass, so `systemctl start`
+returns when the frontend can take builds, and fails, at `TimeoutStartSec=120`, when it could
+not. It does not wait for the `--storage` node: at a cold power-up the node may come up after
+the frontend, and a frontend that waited would be killed at `TimeoutStartSec` and restart, in a
+loop. `/readyz` still fails with `storage` listed until the node answers: the proxy sends
+nothing to a frontend that would fail every blob call while another is ready, and the frontend
+keeps its listeners and its state, so it is in rotation again as soon as the node is back, with
+no restart.
 
 ### Draining a frontend behind a load balancer
 

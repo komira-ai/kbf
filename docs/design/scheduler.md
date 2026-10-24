@@ -294,7 +294,8 @@ result for one. What the code does today:
 A frontend schedules onto the daemons connected to it, and the store decides, by the
 conditional writes above, which frontend runs an operation. Each frontend also looks at the
 store every `INTAKE_POLL` (200 ms) to learn what the others did. A farm with no state store,
-one a handover fenced, and one whose store cannot be read do nothing at a poll.
+one a retire fenced (`POST /v1/frontend/retire`), and one whose store cannot be read do
+nothing at a poll.
 
 - **A start.** A starting frontend takes up the operations that wait for a lease and none
   that holds one: the lease belongs to the frontend its node is connected to, and is taken
@@ -317,7 +318,7 @@ one a handover fenced, and one whose store cannot be read do nothing at a poll.
   for the finished retention, as the callers of an operation this frontend finished do.
   Callers who all cancelled are not followed. An operation the store has no trace of (its
   `done/` row outlived the retention) leaves its callers waiting and is reported as an
-  untraced operation, as for a handover.
+  untraced operation, as for the callers of a retired frontend.
 - **Joining.** A request for an action the store holds an operation of (its `inflight/`
   row) joins that operation. If it is queued, or holds a lease on a node this frontend owns,
   the frontend takes it up and the request is a caller of its own scheduler. If it holds a
@@ -409,7 +410,7 @@ kept apart by the rows they read, as the sections above say. The move from gener
 marker is a cold cutover: every frontend that takes generations is stopped before the first one
 that does not is started (see
 [the state-store cutover](../deploy/state-store-cutover.md#moving-to-frontends-that-share-the-store)).
-A SQLite file is held by one process and still takes its generation, which a handover reads.
+A SQLite file is held by one process, so only one frontend can open it, and it takes no generation either.
 
 ### Node phases
 
