@@ -298,6 +298,10 @@ impl crate::diag::DiagHost for SystemHost {
         })
     }
 
+    fn send_frame(&self, port: u32, frame: &Frame) -> Result<(), SendError> {
+        <Self as Host>::send_frame(self, port, frame)
+    }
+
     fn mount_cycle(&self, tag: &str, mountpoint: &Path, inside: &dyn Fn(&Path) -> Value) -> Value {
         use crate::mount::Mounter;
         if let Err(e) = self.mount(tag, mountpoint) {

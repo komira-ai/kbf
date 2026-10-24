@@ -139,6 +139,7 @@ fn diag_cmd(diagnoser: Option<&dyn diag::DiagHost>, args: &diag::DiagArgs) -> Ex
     };
     let report = diag::diagnose(diagnoser, args);
     diag::emit(&report, &args.share, &mut std::io::stdout());
+    diag::deliver(diagnoser, args.vsock_port, &report, &mut std::io::stderr());
     ExitCode::SUCCESS
 }
 
@@ -474,6 +475,13 @@ mod tests {
             _: &dyn Fn(&std::path::Path) -> serde_json::Value,
         ) -> serde_json::Value {
             serde_json::json!(null)
+        }
+        fn send_frame(
+            &self,
+            _: u32,
+            _: &kbf_guest::frame::Frame,
+        ) -> Result<(), kbf_guest::frame::SendError> {
+            Ok(())
         }
     }
 

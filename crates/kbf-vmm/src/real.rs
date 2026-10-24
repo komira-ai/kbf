@@ -1,6 +1,6 @@
 //! The real [`System`]: macOS, the host's tools and Virtualization.framework.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::hostfs::{chown_tree, sibling, tail_of};
-use crate::spec::{Event, VmSpec};
+use crate::spec::{Event, SHUTDOWN_COMMAND, VmSpec};
 use crate::system::{OfflineFile, Poll, Signature, System, VmProcess};
 use crate::{offline, signature, vz};
 
@@ -79,6 +79,12 @@ impl VmProcess for ProcessVm {
 
     fn kill9(&mut self) {
         let _ = self.child.kill();
+    }
+
+    fn request_shutdown(&mut self) {
+        if let Some(stdin) = self.stdin.as_mut() {
+            let _ = writeln!(stdin, "{SHUTDOWN_COMMAND}").and_then(|()| stdin.flush());
+        }
     }
 
     fn request_stop(&mut self) {

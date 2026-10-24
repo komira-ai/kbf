@@ -26,6 +26,8 @@ pub struct Timing {
     pub retry_window: Duration,
     /// How often the host samples a running guest (CPU, disk writes).
     pub sample_every: Duration,
+    /// How long to wait for a guest to shut down when asked, before the VM is force-stopped.
+    pub shutdown_timeout: Duration,
 }
 
 impl Timing {
@@ -38,6 +40,7 @@ impl Timing {
             tick: Duration::from_millis(100),
             retry_window: Duration::from_secs(60),
             sample_every: Duration::from_secs(10),
+            shutdown_timeout: Duration::from_secs(60),
         }
     }
 
@@ -51,6 +54,29 @@ impl Timing {
             tick: Duration::from_millis(1),
             retry_window: z,
             sample_every: Duration::from_millis(2),
+            shutdown_timeout: z,
+        }
+    }
+}
+
+/// How a VM ended when the host stopped it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopKind {
+    /// The guest shut itself down on request: its disk is flushed.
+    GuestShutdown,
+    /// The guest did not shut down in time and the VM was force-stopped.
+    ForceStopped,
+    /// The helper did not exit and was killed.
+    Killed,
+}
+
+impl StopKind {
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::GuestShutdown => "guest shut down",
+            Self::ForceStopped => "force-stopped after the guest did not shut down",
+            Self::Killed => "helper killed",
         }
     }
 }
@@ -270,6 +296,26 @@ impl Vm {
         }
         self.gone = true;
         ok
+    }
+
+    /// Asks the guest to shut down; [`finish_shutdown`](Self::finish_shutdown) waits.
+    pub fn request_shutdown(&mut self) {
+        self.proc.request_shutdown();
+    }
+
+    /// Waits up to `t.shutdown_timeout` for the helper to exit because the guest shut
+    /// down, then falls back to [`stop`](Self::stop) (a force stop, then SIGKILL). How
+    /// the VM ended is the answer; the guest's disk is flushed only after a shutdown.
+    pub fn finish_shutdown(&mut self, t: &Timing) -> StopKind {
+        if self.proc.wait_gone(t.shutdown_timeout) {
+            self.gone = true;
+            return StopKind::GuestShutdown;
+        }
+        if self.stop(t) {
+            StopKind::ForceStopped
+        } else {
+            StopKind::Killed
+        }
     }
 
     /// SIGKILL, and wait for the process to go.

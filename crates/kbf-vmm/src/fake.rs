@@ -23,6 +23,8 @@ pub struct Script {
     pub guest_files: Vec<(String, String)>,
     /// Whether the helper exits after `request_stop`.
     pub exits_on_stop: bool,
+    /// Whether the guest obeys a shutdown request (the helper then exits by itself).
+    pub obeys_shutdown: bool,
     /// What the helper's log tail says.
     pub log: Option<String>,
 }
@@ -34,6 +36,7 @@ impl Script {
             events: vec![Poll::Event(Event::Started { ms: 100 })],
             guest_files: Vec::new(),
             exits_on_stop: true,
+            obeys_shutdown: true,
             log: None,
         }
     }
@@ -53,6 +56,7 @@ impl Script {
             })],
             guest_files: Vec::new(),
             exits_on_stop: true,
+            obeys_shutdown: true,
             log: None,
         }
     }
@@ -60,6 +64,12 @@ impl Script {
     /// Adds a file the guest writes.
     pub fn with_guest_file(mut self, name: &str, body: &str) -> Self {
         self.guest_files.push((name.to_owned(), body.to_owned()));
+        self
+    }
+
+    /// A guest that ignores a shutdown request.
+    pub fn deaf(mut self) -> Self {
+        self.obeys_shutdown = false;
         self
     }
 
@@ -81,7 +91,9 @@ pub struct FakeProc {
     events: VecDeque<Poll>,
     killed: bool,
     stop_asked: bool,
+    shutdown_asked: bool,
     exits_on_stop: bool,
+    obeys_shutdown: bool,
     log: Option<String>,
 }
 
@@ -107,11 +119,16 @@ impl VmProcess for FakeProc {
     fn kill9(&mut self) {
         self.killed = true;
     }
+    fn request_shutdown(&mut self) {
+        self.shutdown_asked = true;
+    }
     fn request_stop(&mut self) {
         self.stop_asked = true;
     }
     fn wait_gone(&mut self, _wait: Duration) -> bool {
-        self.killed || (self.stop_asked && self.exits_on_stop)
+        self.killed
+            || (self.shutdown_asked && self.obeys_shutdown)
+            || (self.stop_asked && self.exits_on_stop)
     }
 }
 
@@ -248,7 +265,9 @@ impl System for FakeSystem {
             events: script.events.into(),
             killed: false,
             stop_asked: false,
+            shutdown_asked: false,
             exits_on_stop: script.exits_on_stop,
+            obeys_shutdown: script.obeys_shutdown,
             log: script.log,
         }))
     }

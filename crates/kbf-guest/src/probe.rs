@@ -182,6 +182,43 @@ pub enum Delivered {
     Share,
 }
 
+/// Sends `frame` with `send`, up to [`VSOCK_ATTEMPTS`] times [`VSOCK_RETRY`] apart (a
+/// refusal is not retried), logging every attempt; the attempt that worked, `None` when
+/// none did.
+pub fn send_with_retries(
+    send: &mut dyn FnMut(&Frame) -> Result<(), SendError>,
+    pause: &dyn Fn(Duration),
+    port: u32,
+    frame: &Frame,
+    log: &mut dyn Write,
+) -> Option<u32> {
+    let name = &frame.name;
+    for attempt in 1..=VSOCK_ATTEMPTS {
+        match send(frame) {
+            Ok(()) => {
+                let _ = writeln!(
+                    log,
+                    "kbf-guest: vsock port {port}: {name} delivered on attempt {attempt}"
+                );
+                return Some(attempt);
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    log,
+                    "kbf-guest: vsock port {port}: attempt {attempt} of {VSOCK_ATTEMPTS} for {name} failed: {e}"
+                );
+                if matches!(e, SendError::Refused(_)) {
+                    break;
+                }
+                if attempt < VSOCK_ATTEMPTS {
+                    pause(VSOCK_RETRY);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Sends `value` to the host as a frame of `kind` named after `out`'s file name, retrying
 /// up to [`VSOCK_ATTEMPTS`] times [`VSOCK_RETRY`] apart, and writes it to `out` (the
 /// share) only when no attempt worked or the host refused the frame. Every attempt and
@@ -206,28 +243,9 @@ pub fn deliver(
         name: name.clone(),
         body: serde_json::to_string_pretty(value)?,
     };
-    for attempt in 1..=VSOCK_ATTEMPTS {
-        match host.send_frame(port, &frame) {
-            Ok(()) => {
-                let _ = writeln!(
-                    log,
-                    "kbf-guest: vsock port {port}: {name} delivered on attempt {attempt}"
-                );
-                return Ok(Delivered::Vsock { attempt });
-            }
-            Err(e) => {
-                let _ = writeln!(
-                    log,
-                    "kbf-guest: vsock port {port}: attempt {attempt} of {VSOCK_ATTEMPTS} for {name} failed: {e}"
-                );
-                if matches!(e, SendError::Refused(_)) {
-                    break;
-                }
-                if attempt < VSOCK_ATTEMPTS {
-                    host.pause(VSOCK_RETRY);
-                }
-            }
-        }
+    let mut send = |f: &Frame| host.send_frame(port, f);
+    if let Some(attempt) = send_with_retries(&mut send, &|d| host.pause(d), port, &frame, log) {
+        return Ok(Delivered::Vsock { attempt });
     }
     let _ = writeln!(
         log,

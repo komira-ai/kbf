@@ -9,7 +9,8 @@
 //! guest's own disk, reporting each step's errno. It prints one JSON object on stdout
 //! (the launch daemon sends that to a file the harvest reads) and also tries to leave it
 //! in `results/kbf-diag.json`. It also says whether the guest can connect to the host on
-//! virtio-socket and whether a test frame came back acknowledged. It runs system tools for the facts and does no shell work.
+//! virtio-socket and whether a test frame came back acknowledged, and sends the whole report to the
+//! host as a `result` frame (`kbf-probe-diag.json`), so it does not depend on the harvest. It runs system tools for the facts and does no shell work.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,12 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::probe::{TICK, WAIT};
+use crate::frame::{Frame, Kind, SendError};
+use crate::probe::{TICK, WAIT, send_with_retries};
+
+/// The name the host stores the report under when it arrives over vsock, so that the
+/// diagnosis does not depend on the harvest.
+pub const REPORT_NAME: &str = "kbf-probe-diag.json";
 
 /// `probe-diag`'s arguments.
 #[derive(Debug, Clone, clap::Args)]
@@ -58,6 +64,11 @@ pub trait DiagHost {
     /// waits for the acknowledgement: whether the connection was made, whether the frame
     /// came back acknowledged, and the errno or error of the step that failed.
     fn vsock_round_trip(&self, port: u32) -> Value;
+    /// One attempt to send `frame` to the host on vsock `port` and read its reply.
+    ///
+    /// # Errors
+    /// No connection or reply, or the host refused the frame.
+    fn send_frame(&self, port: u32, frame: &Frame) -> Result<(), SendError>;
     /// Mounts `tag` at `mountpoint`, runs `inside` on it, and unmounts it again with the
     /// system call; the errno of each of the three.
     fn mount_cycle(&self, tag: &str, mountpoint: &Path, inside: &dyn Fn(&Path) -> Value) -> Value;
@@ -235,6 +246,15 @@ pub fn emit(report: &Value, share: &Path, out: &mut dyn Write) {
     }
 }
 
+/// Sends `report` to the host on vsock `port` as a `result` frame named [`REPORT_NAME`],
+/// with the same retries as a probe's answer, logging each attempt to `log`; whether it
+/// was acknowledged. There is no fallback write: [`emit`] already tried the share.
+pub fn deliver(host: &dyn DiagHost, port: u32, report: &Value, log: &mut dyn Write) -> bool {
+    let frame = Frame::new(Kind::Result, REPORT_NAME, &format!("{report:#}"));
+    let mut send = |f: &Frame| host.send_frame(port, f);
+    send_with_retries(&mut send, &|d| host.pause(d), port, &frame, log).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +266,8 @@ mod tests {
         pauses: Cell<u32>,
         mounted: RefCell<Vec<String>>,
         root: PathBuf,
+        sent: RefCell<Vec<Frame>>,
+        replies: RefCell<Vec<Result<(), SendError>>>,
     }
 
     impl Fake {
@@ -256,6 +278,8 @@ mod tests {
                 exists_after: Cell::new(exists_after),
                 pauses: Cell::new(0),
                 mounted: RefCell::new(Vec::new()),
+                sent: RefCell::new(Vec::new()),
+                replies: RefCell::new(Vec::new()),
             }
         }
     }
@@ -278,6 +302,13 @@ mod tests {
         }
         fn vsock_round_trip(&self, port: u32) -> Value {
             json!({"port": port, "connected": true, "round_trip": true})
+        }
+        fn send_frame(&self, _: u32, frame: &Frame) -> Result<(), SendError> {
+            self.sent.borrow_mut().push(frame.clone());
+            match self.replies.borrow_mut().pop() {
+                Some(Err(e)) => Err(e),
+                _ => Ok(()),
+            }
         }
         fn mount_cycle(&self, tag: &str, mp: &Path, inside: &dyn Fn(&Path) -> Value) -> Value {
             self.mounted
@@ -522,5 +553,44 @@ mod tests {
             String::from_utf8_lossy(&out).contains("kbf-diag: write"),
             "{out:?}"
         );
+    }
+
+    /// Catches a diagnosis that exists only in the guest's files: the report goes to the
+    /// host as a `result` frame under the fixed name, whole, is retried after a failed
+    /// attempt, and a refusal or an unreachable host is reported as not delivered.
+    #[test]
+    fn the_report_goes_to_the_host_as_a_result_frame_with_retries() {
+        let d = tmp("deliver");
+        let host = Fake::new(0, &d);
+        let report = json!({"k": [1, 2]});
+        let mut log = Vec::new();
+        assert!(deliver(&host, 4242, &report, &mut log));
+        let sent = host.sent.borrow();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].kind, Kind::Result);
+        assert_eq!(sent[0].name, REPORT_NAME);
+        assert_eq!(
+            serde_json::from_str::<Value>(&sent[0].body).expect("json"),
+            report
+        );
+        drop(sent);
+        let host = Fake::new(0, &d);
+        host.replies
+            .borrow_mut()
+            .extend([Ok(()), Err(SendError::Unavailable("not yet".into()))]);
+        let mut log = Vec::new();
+        assert!(deliver(&host, 4242, &report, &mut log));
+        assert_eq!(host.sent.borrow().len(), 2);
+        assert!(
+            String::from_utf8(log)
+                .expect("utf8")
+                .contains("attempt 1 of 5")
+        );
+        let host = Fake::new(0, &d);
+        host.replies
+            .borrow_mut()
+            .push(Err(SendError::Refused("no".into())));
+        assert!(!deliver(&host, 4242, &report, &mut Vec::new()));
+        assert_eq!(host.sent.borrow().len(), 1);
     }
 }

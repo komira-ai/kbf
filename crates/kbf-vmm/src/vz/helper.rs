@@ -1,10 +1,12 @@
 //! The VM helper (`kbf-vmm vm-run`): runs one VM on its own serial dispatch queue and
 //! reports on stdout, one JSON [`Event`] per line, until its stdin closes or the guest
-//! stops. Closing stdin force-stops the VM (the guest is not asked to shut down). The main
+//! stops. The line `shutdown` on stdin asks the guest to shut down
+//! (`requestStopWithError`, the guest's power-button request); the helper then waits for
+//! the guest to stop. Closing stdin force-stops the VM. The main
 //! thread only waits on channels; it is never needed by the framework.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::{FromRawFd, RawFd};
 use std::path::PathBuf;
@@ -27,7 +29,7 @@ use objc2_virtualization::{
 use super::config::{self, ConsoleFds};
 use super::{Queued, Shared, describe};
 use crate::sink::{self, Limiter, MAX_CONNECTIONS};
-use crate::spec::{Event, VmSpec};
+use crate::spec::{Event, SHUTDOWN_COMMAND, VmSpec};
 
 /// Prints one event line.
 fn emit(e: &Event) {
@@ -233,6 +235,35 @@ fn fail(stage: &str, message: String, code: Option<String>) -> Result<(), String
 
 /// Releases the VM, its delegate and its listeners on the VM's queue, where the framework
 /// expects every call on them, instead of on whichever thread drops the last reference.
+/// Asks the guest to shut down, on the VM's queue, and reports the request (or why it
+/// failed). The guest stopping is reported by the delegate.
+fn request_guest_shutdown(
+    queue: &DispatchQueue,
+    holder: &Holder,
+    ms: impl Fn() -> u64 + Send + 'static,
+) {
+    let h = holder.clone();
+    queue.exec_async(move || {
+        let Ok(slot) = h.lock() else { return };
+        let Some(running) = slot.as_ref() else { return };
+        // SAFETY: on the VM's queue, the only place the VM is touched.
+        match unsafe { running.get().vm.requestStopWithError() } {
+            Ok(()) => emit(&Event::State {
+                state: "shutdown-requested".to_owned(),
+                ms: ms(),
+            }),
+            Err(e) => {
+                let (message, code) = describe(&e);
+                emit(&Event::Error {
+                    stage: "shutdown".to_owned(),
+                    message,
+                    code,
+                });
+            }
+        }
+    });
+}
+
 fn release_on_queue(queue: &DispatchQueue, holder: &Holder) {
     let h = holder.clone();
     queue.exec_sync(move || {
@@ -329,12 +360,22 @@ pub fn run(spec: &VmSpec) -> Result<(), String> {
         }
     }
 
-    // The parent closing stdin is the request to stop.
+    // The line `shutdown` asks the guest to shut down; the parent closing stdin is the
+    // request to force-stop.
     let stdin_done = done_tx;
+    let (shutdown_queue, shutdown_holder) = (queue.clone(), holder.clone());
     std::thread::spawn(move || {
-        let mut sink = [0u8; 256];
-        let mut stdin = std::io::stdin().lock();
-        while matches!(stdin.read(&mut sink), Ok(n) if n > 0) {}
+        let mut stdin = BufReader::new(std::io::stdin().lock());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if !matches!(stdin.read_line(&mut line), Ok(n) if n > 0) {
+                break;
+            }
+            if line.trim() == SHUTDOWN_COMMAND {
+                request_guest_shutdown(&shutdown_queue, &shutdown_holder, ms);
+            }
+        }
         let _ = stdin_done.send(());
     });
     let _ = done_rx.recv();

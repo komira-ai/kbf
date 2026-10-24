@@ -81,7 +81,8 @@ pub enum Event {
     Vsock { port: u32 },
     /// The guest wrote `text` to a console port.
     Console { port: String, text: String },
-    /// The VM stopped after the parent closed the helper's stdin.
+    /// The VM stopped: the guest shut down after a shutdown request, or the parent closed
+    /// the helper's stdin and the VM was force-stopped.
     Stopped { ms: u64 },
     /// A call failed. `code` is the Virtualization.framework error code name when there is
     /// one (`VirtualMachineLimitExceeded`).
@@ -107,6 +108,10 @@ impl Event {
         serde_json::from_str(line).map_err(|e| format!("not a helper event ({e}): {line}"))
     }
 }
+
+/// The line the parent writes to the helper's stdin to ask the guest to shut down (the
+/// helper then waits for the guest to stop). Closing the stdin instead force-stops the VM.
+pub const SHUTDOWN_COMMAND: &str = "shutdown";
 
 /// The error code name the helper uses when a start is refused for the two-guest limit.
 pub const LIMIT_EXCEEDED: &str = "VirtualMachineLimitExceeded";

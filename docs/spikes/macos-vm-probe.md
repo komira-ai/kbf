@@ -428,6 +428,50 @@ What to read in the next E1 run:
 | same | empty | the job still did not start: read the guest's unified log for the job's label |
 | same | `started` and nothing after | the job started and is waiting: the share's `results` directory never appeared |
 
+### E1 result, sixth run: the path fix works; E1 stopped the VMs too soon
+
+The sixth run (results under `<work dir>/e1-run-b6/results/`, the head that ran the probe
+jobs from the guest's own disk) confirmed the fix: both arms delivered `ready-system`
+(13049 ms headless, 15352 ms with graphics), and the headless arm's four job logs each show
+`started` and then `delivered on attempt 1`.
+
+The new gap was the host's. E1 ended an arm at its first frame, took three samples and
+force-stopped both VMs about 15 seconds after the first growth of the disk. The graphics
+arm had delivered only `ready-system` and `guest-probe-user.json`; its root probe, login
+marker and diagnosis had not run yet, and every guest log in both harvests but one was
+empty, because a force stop leaves the guest's disk unflushed. So the run had no vsock
+diagnosis at all.
+
+Changes:
+
+- E1 waits, per arm, for all five frames (`ready-system`, `ready-login`,
+  `guest-probe-root.json`, `guest-probe-user.json`, `kbf-probe-diag.json`) or for the end
+  of the VM or the guest timeout. `e1.json` lists each arrived frame with the host time it
+  was first seen at (`frames`), the ones that never came (`frames_missing`), and keeps
+  `guest_marker` and `guest_marker_ms` for the first. The summary line prints the missing
+  frames.
+- `probe-diag` also sends its whole report as a `result` frame named
+  `kbf-probe-diag.json` (the same five attempts as a probe's answer, no write to the share
+  on failure), so the diagnosis reaches `results/` without a harvest.
+- Both VMs are asked to shut down before they are stopped. The helper reads a `shutdown`
+  line on its stdin and calls `VZVirtualMachine.requestStopWithError` (the guest's
+  power-button request, not the framework's force stop); the host waits up to a minute for
+  the guest to power off and the helper to exit, then closes the helper's stdin (the force
+  stop `stopWithCompletionHandler`), then kills the helper. `e1.json` has `stop.how`
+  (`guest shut down`, `force-stopped after the guest did not shut down` or `helper
+  killed`) and `stop.ms` for each arm. Whether a macOS guest at the login window honours
+  the request is not known until a Mac runs it; `stop.how` answers it.
+
+What to read in the next E1 run:
+
+| where | line | meaning |
+|---|---|---|
+| `e1.json`, each arm | `frames_missing` is `[]` | every probe job ran; each frame's time is in `frames` |
+| same | a name in `frames_missing` | that job did not deliver within the guest timeout; its log in the harvest says whether it started |
+| `results/kbf-probe-diag.json` | the diagnosis, including `"vsock": {"round_trip": true}` | the diagnosis arrived without the harvest |
+| `e1.json`, each arm | `stop.how` is `guest shut down` | the request worked and the harvest logs are complete |
+| same | `force-stopped ...` | the guest ignored the request; the harvest logs may be empty again |
+
 ## What to send back
 
 Everything the commands wrote, including each helper's log (the cause of a VM that did
