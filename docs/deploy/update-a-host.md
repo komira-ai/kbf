@@ -9,7 +9,7 @@ This page is about a host that is already set up with [`kbf-installer setup`](kb
 | `kbf-installer update --frontend`, through the proxy's update API | the host fetches from its `url` source; a refused order is reported late (see below) |
 | the operating-system package, applied by `kbf-updater` | the way a host normally takes a release (see (c)) |
 
-All three use the same layout: each release in `releases/<commit>/` of the installer tree, the links
+The first two use the same layout: each release in `releases/<commit>/` of the installer tree, the links
 `releases/current` and `releases/previous`, and `state.json`. See
 [host releases](host-releases.md) for the layout and what is trusted.
 
