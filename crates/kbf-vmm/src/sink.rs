@@ -130,10 +130,27 @@ fn rename_at(dir: RawFd, from: &str, to: &str) -> io::Result<()> {
 }
 
 fn unlink_at(dir: RawFd, name: &str) {
-    if let Ok(name) = CString::new(name) {
+    // A name with a NUL cannot have been created, so there is nothing to remove for it.
+    let _ = CString::new(name).map(|name| {
         // SAFETY: `name` is NUL-terminated and outlives the call; `dir` stays open.
-        let _ = unsafe { libc::unlinkat(dir, name.as_ptr(), 0) };
+        unsafe { libc::unlinkat(dir, name.as_ptr(), 0) }
+    });
+}
+
+/// Whether a directory with owner `uid` and `mode` may hold results for the user `euid`:
+/// it must be theirs and closed to everyone else.
+fn check_private(path: &Path, uid: u32, euid: u32, mode: u32) -> Result<(), String> {
+    if uid != euid {
+        return Err(format!("{} is not owned by this user", path.display()));
     }
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "{} is open to other users (mode {:o}); it must be 0700",
+            path.display(),
+            mode & 0o777
+        ));
+    }
+    Ok(())
 }
 
 impl Results {
@@ -152,16 +169,8 @@ impl Results {
             .metadata()
             .map_err(|e| format!("stat {}: {e}", path.display()))?;
         // SAFETY: geteuid takes no arguments and cannot fail.
-        if meta.uid() != unsafe { libc::geteuid() } {
-            return Err(format!("{} is not owned by this user", path.display()));
-        }
-        if meta.mode() & 0o077 != 0 {
-            return Err(format!(
-                "{} is open to other users (mode {:o}); it must be 0700",
-                path.display(),
-                meta.mode() & 0o777
-            ));
-        }
+        let euid = unsafe { libc::geteuid() };
+        check_private(path, meta.uid(), euid, meta.mode())?;
         Ok(Self {
             dir,
             path: path.to_owned(),
@@ -565,6 +574,18 @@ mod tests {
         assert!(Results::open(&d.join("none")).is_err());
         std::fs::write(d.join("file"), "x").expect("file");
         assert!(Results::open(&d.join("file")).is_err());
+    }
+
+    /// Catches a directory of another user being taken as ours, which the mode check alone
+    /// would pass: the owner must be the user the sink runs as.
+    #[test]
+    fn a_directory_owned_by_someone_else_is_not_private() {
+        let p = Path::new("/r");
+        assert_eq!(check_private(p, 501, 501, 0o40700), Ok(()));
+        let e = check_private(p, 0, 501, 0o40700).expect_err("owner");
+        assert!(e.contains("not owned"), "{e}");
+        let e = check_private(p, 501, 501, 0o40750).expect_err("mode");
+        assert!(e.contains("0700"), "{e}");
     }
 
     /// Catches a ready or result frame that does not land at `<results>/<name>` with the

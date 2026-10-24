@@ -638,10 +638,14 @@ mod tests {
         let work = work_with_base("e1-one-silent");
         let sys = FakeSystem::new();
         sys.script(Script::booted());
-        sys.script(Script::booted().with_guest_file(guest::READY_SYSTEM, "{}"));
-        let r = e1(&guest_ctx(&sys, &work));
+        sys.script(complete_guest());
+        let mut c = guest_ctx(&sys, &work);
+        // Several rounds with the second arm already complete.
+        c.timing.guest_timeout = Duration::from_millis(200);
+        let r = e1(&c);
         assert!(arm(&r, 0)["guest_marker_ms"].is_null());
         assert!(arm(&r, 1)["guest_marker_ms"].is_u64());
+        assert_eq!(arm(&r, 1)["frames_missing"], json!([]));
         assert_eq!(arm(&r, 0)["stayed_up"], true);
         let work = work_with_base("e1-never-started");
         let sys = FakeSystem::new();
