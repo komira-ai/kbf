@@ -1,7 +1,7 @@
-//! Pool mode end to end: the serving core over fake members on an in-memory network, the
-//! admin API over in-memory connections, and `Proxy::bind` and `run` on real sockets. They run
-//! on a current-thread runtime under paused time, as the other tests of the core do, except
-//! the ones on real sockets.
+//! The serving core end to end, over a pool of fake members on an in-memory network (the
+//! rig every test of the proxy shares), the admin API over in-memory connections, and
+//! `Proxy::bind` and `run` on real sockets. They run on a current-thread runtime under paused
+//! time, as the other tests of the core do, except the ones on real sockets.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -18,21 +18,21 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use super::kit::{
-    CAPS, CLIENT_IP, Child, Client, MemNet, Script, failing_listener, finish, grpc_ok, read_all,
-    reserve_ports, script, security, start_child_on, tagged, until,
+    Access, CAPS, CLIENT_IP, Child, Client, MemNet, Script, failing_listener, finish, grpc_ok,
+    read_all, reserve_ports, script, security, start_child_on, tagged, until,
 };
 use crate::auth::Buck2Auth;
 use crate::config::{Frontend, Limits, ProxyConfig};
-use crate::control::NoUpdates;
-use crate::core::{Core, Mode};
+use crate::control::{NoUpdates, UpdateHandler};
+use crate::core::Core;
 use crate::metrics::Metrics;
 use crate::pool::{BoxIo, member_addr};
 use crate::pool_admin;
 use crate::pool_probe;
 use crate::route::Target;
+use crate::security::Security;
 use crate::serve::{Listen, serve};
-use crate::slot::ActiveSlot;
-use crate::tls::Acceptor;
+use crate::tls::{Acceptor, TlsReloader};
 use crate::upstreams::{State, Upstreams};
 use crate::{Proxy, ProxyHandle};
 
@@ -85,38 +85,76 @@ fn frontends(n: usize) -> Vec<Frontend> {
     (0..n).map(one).collect()
 }
 
-/// The serving core in pool mode over one fake child per script (members `a`, `b`, `c`).
-struct PoolRig {
-    core: Arc<Core>,
-    members: Arc<Upstreams>,
-    net: Arc<MemNet>,
-    children: Vec<Child>,
+/// The serving core over one fake child per script (members `a`, `b`, `c`, the first
+/// `scripts.len()` of them), behind the listener the tests feed.
+pub(super) struct Rig {
+    pub(super) core: Arc<Core>,
+    pub(super) members: Arc<Upstreams>,
+    pub(super) net: Arc<MemNet>,
+    pub(super) children: Vec<Child>,
+    /// The TLS reloader of a rig built with [`Access::Tls`].
+    pub(super) tls: Option<Arc<TlsReloader>>,
     feed: Sender,
-    // Kept: the serve task stops when its sender is gone.
-    _stop: watch::Sender<bool>,
+    stop: watch::Sender<bool>,
+    pub(super) serving: JoinHandle<()>,
 }
 
-impl PoolRig {
-    fn start(scripts: &[Script]) -> Self {
+impl Rig {
+    /// Members that answer as `scripts` say, under no authentication and the default limits.
+    pub(super) fn start(scripts: &[Script]) -> Self {
+        Self::start_with(scripts, NoUpdates, Limits::default())
+    }
+
+    /// [`Rig::start`] with its own update handler and limits.
+    pub(super) fn start_with<U: UpdateHandler + 'static>(
+        scripts: &[Script],
+        updates: U,
+        limits: Limits,
+    ) -> Self {
+        let security = security(Buck2Auth::None);
+        Self::build_with(scripts, updates, limits, security, Access::Plain(None))
+    }
+
+    /// One tagging member `a` behind a proxy under `mode` and `access`.
+    pub(super) fn start_secure(mode: Buck2Auth, access: Access) -> Self {
+        let (updates, limits) = (NoUpdates, Limits::default());
+        Self::build_with(&[tagged("a")], updates, limits, security(mode), access)
+    }
+
+    /// A rig with its own authentication and its own way of accepting connections.
+    pub(super) fn build_with<U: UpdateHandler + 'static>(
+        scripts: &[Script],
+        updates: U,
+        limits: Limits,
+        security: Security,
+        access: Access,
+    ) -> Self {
         let members = Upstreams::new(&frontends(scripts.len()));
         let net = Arc::new(MemNet::default());
-        let core = Core::with_metrics(
-            Mode::Pool(Arc::clone(&members)),
-            Limits::default(),
-            ActiveSlot::new(),
+        let core = Core::new(
+            Arc::clone(&members),
+            limits,
             net.connector(),
-            security(Buck2Auth::None),
+            security,
             Arc::new(Metrics::default()),
             true,
         );
+        let (tls, acceptor) = match access {
+            Access::Plain(identity) => (None, Acceptor::Plain(identity)),
+            Access::Tls(paths) => {
+                let reloader =
+                    TlsReloader::load(paths, Arc::clone(&core.metrics)).expect("TLS files");
+                let reloader = Arc::new(reloader);
+                (Some(Arc::clone(&reloader)), Acceptor::Tls(reloader))
+            }
+        };
         let (feed, incoming) = Feed::pair();
         let (stop, stopped) = watch::channel(false);
-        let accepting = Acceptor::Plain(None);
-        tokio::spawn(serve(
+        let serving = tokio::spawn(serve(
             Arc::clone(&core),
-            NoUpdates,
+            updates,
             incoming,
-            accepting,
+            acceptor,
             stopped,
         ));
         let mut children = Vec::new();
@@ -130,23 +168,43 @@ impl PoolRig {
             members,
             net,
             children,
+            tls,
             feed,
-            _stop: stop,
+            stop,
+            serving,
         }
     }
 
-    async fn client(&self) -> Client {
+    pub(super) async fn client(&self) -> Client {
         Client::connect(&self.feed, CLIENT_IP).await
     }
 
+    pub(super) async fn client_from(&self, ip: IpAddr) -> Client {
+        Client::connect(&self.feed, ip).await
+    }
+
+    /// Hands the proxy a connection's far half, as if `ip` had connected.
+    pub(super) fn feed_raw(&self, far: DuplexStream, ip: IpAddr) {
+        self.feed.send((far, ip)).expect("the proxy is listening");
+    }
+
+    /// The fake child of member `a`.
+    pub(super) fn a(&self) -> &Child {
+        &self.children[0]
+    }
+
+    pub(super) fn shutdown(&self) {
+        self.stop.send_replace(true);
+    }
+
     /// The streams each child has been given.
-    fn dispatches(&self) -> Vec<usize> {
+    pub(super) fn dispatches(&self) -> Vec<usize> {
         let count = |child: &Child| child.state.dispatches();
         self.children.iter().map(count).collect()
     }
 
     /// Starts the poll of every member.
-    fn probing(&self) -> Vec<JoinHandle<()>> {
+    pub(super) fn probing(&self) -> Vec<JoinHandle<()>> {
         let mut tasks = Vec::new();
         for index in 0..self.members.len() {
             let (core, members) = (Arc::clone(&self.core), Arc::clone(&self.members));
@@ -177,7 +235,7 @@ async fn answer(mut io: impl AsyncRead + AsyncWrite + Unpin, status: Arc<AtomicU
 }
 
 /// Puts an HTTP/1.1 answerer where member `index`'s operator listener was.
-fn operator(rig: &PoolRig, index: usize, status: &Arc<AtomicU16>) -> JoinHandle<()> {
+fn operator(rig: &Rig, index: usize, status: &Arc<AtomicU16>) -> JoinHandle<()> {
     let addr = member_addr(rig.members.base(index), Target::Operator);
     let mut incoming = rig.net.listen(addr);
     let status = Arc::clone(status);
@@ -222,7 +280,7 @@ fn refusing() -> Script {
 /// and that two idle members share them: calls that end before the next begins alternate.
 #[tokio::test(start_paused = true)]
 async fn both_members_take_traffic() {
-    let rig = PoolRig::start(&[tagged("a"), tagged("b")]);
+    let rig = Rig::start(&[tagged("a"), tagged("b")]);
     let mut client = rig.client().await;
     let mut tags = Vec::new();
     for _ in 0..4 {
@@ -239,7 +297,7 @@ async fn both_members_take_traffic() {
 #[tokio::test(start_paused = true)]
 async fn long_held_streams_on_a_send_new_calls_to_b() {
     let release = Arc::new(Semaphore::new(0));
-    let rig = PoolRig::start(&[held_until(&release, "a"), tagged("b")]);
+    let rig = Rig::start(&[held_until(&release, "a"), tagged("b")]);
     let mut client = rig.client().await;
     let (response, mut body) = client.start(CAPS, false).await;
     body.send_data(Bytes::from_static(b"x"), true)
@@ -264,7 +322,7 @@ async fn long_held_streams_on_a_send_new_calls_to_b() {
 #[tokio::test(start_paused = true)]
 async fn draining_a_member_leaves_its_open_stream_to_finish() {
     let release = Arc::new(Semaphore::new(0));
-    let rig = PoolRig::start(&[held_until(&release, "a"), tagged("b")]);
+    let rig = Rig::start(&[held_until(&release, "a"), tagged("b")]);
     let mut client = rig.client().await;
     let (response, mut body) = client.start(CAPS, false).await;
     body.send_data(Bytes::from_static(b"x"), true)
@@ -292,7 +350,7 @@ async fn draining_a_member_leaves_its_open_stream_to_finish() {
 /// Asserts that undraining a member puts it back among the members a call can reach.
 #[tokio::test(start_paused = true)]
 async fn undraining_restores_a_member() {
-    let rig = PoolRig::start(&[tagged("a"), tagged("b")]);
+    let rig = Rig::start(&[tagged("a"), tagged("b")]);
     let mut client = rig.client().await;
     assert!(rig.members.set_draining("a", true));
     for _ in 0..3 {
@@ -310,7 +368,7 @@ async fn undraining_restores_a_member() {
 /// nothing reaches a child, and calls go through again once a member is undrained.
 #[tokio::test(start_paused = true)]
 async fn all_members_draining_is_unavailable() {
-    let rig = PoolRig::start(&[tagged("a"), tagged("b")]);
+    let rig = Rig::start(&[tagged("a"), tagged("b")]);
     let mut client = rig.client().await;
     assert!(rig.members.set_draining("a", true));
     assert!(rig.members.set_draining("b", true));
@@ -327,7 +385,7 @@ async fn all_members_draining_is_unavailable() {
 /// counted against the member that refused.
 #[tokio::test(start_paused = true)]
 async fn a_refusing_member_has_the_request_retried_on_the_other() {
-    let rig = PoolRig::start(&[refusing(), tagged("b")]);
+    let rig = Rig::start(&[refusing(), tagged("b")]);
     let mut client = rig.client().await;
     let reply = client.unary(CAPS).await;
     assert_eq!(reply.text(), "b");
@@ -336,14 +394,14 @@ async fn a_refusing_member_has_the_request_retried_on_the_other() {
     assert_eq!(rig.core.metrics.retries.load(Ordering::Acquire), 1);
     let line = "kbf_proxy_member_failed_total{member=\"a\"} 1\n";
     assert!(rig.members.render().contains(line));
-    until(|| rig.core.slots.open_streams() == 0).await;
+    until(|| rig.core.open_streams() == 0).await;
 }
 
 /// Asserts that when both members refuse, the stream is tried on each once and then answered
 /// `UNAVAILABLE`, and no member is tried twice.
 #[tokio::test(start_paused = true)]
 async fn when_every_member_refuses_the_stream_is_unavailable() {
-    let rig = PoolRig::start(&[refusing(), refusing()]);
+    let rig = Rig::start(&[refusing(), refusing()]);
     let reply = rig.client().await.unary(CAPS).await;
     assert_eq!(reply.grpc_status().as_deref(), Some("14"), "{reply:?}");
     assert_eq!(rig.dispatches(), [1, 1]);
@@ -353,7 +411,7 @@ async fn when_every_member_refuses_the_stream_is_unavailable() {
 /// stream is answered `UNAVAILABLE` at once.
 #[tokio::test(start_paused = true)]
 async fn the_only_member_that_refused_is_not_tried_again() {
-    let rig = PoolRig::start(&[refusing()]);
+    let rig = Rig::start(&[refusing()]);
     let reply = rig.client().await.unary(CAPS).await;
     assert_eq!(reply.grpc_status().as_deref(), Some("14"), "{reply:?}");
     assert_eq!(rig.dispatches(), [1]);
@@ -363,7 +421,7 @@ async fn the_only_member_that_refused_is_not_tried_again() {
 /// unprocessed is not asked again for it either: the other member answers.
 #[tokio::test(start_paused = true)]
 async fn a_member_that_goes_away_has_the_request_retried_on_the_other() {
-    let rig = PoolRig::start(&[tagged("a"), tagged("b")]);
+    let rig = Rig::start(&[tagged("a"), tagged("b")]);
     let first = &rig.children[0].state;
     first.raw_goaway_first.store(true, Ordering::Release);
     let reply = rig.client().await.unary(CAPS).await;
@@ -376,7 +434,7 @@ async fn a_member_that_goes_away_has_the_request_retried_on_the_other() {
 /// `b` is dialed after the one failed dial.
 #[tokio::test(start_paused = true)]
 async fn a_member_that_cannot_be_connected_to_is_ejected() {
-    let mut rig = PoolRig::start(&[tagged("a"), tagged("b")]);
+    let mut rig = Rig::start(&[tagged("a"), tagged("b")]);
     rig.children[0].stop_accepting().await;
     rig.members.set_ready(0, true);
     rig.members.set_ready(1, true);
@@ -399,7 +457,7 @@ async fn a_member_that_cannot_be_connected_to_is_ejected() {
 /// a draining member does not count, and a member that passes again makes it 200.
 #[tokio::test(start_paused = true)]
 async fn readyz_is_503_only_when_no_member_is_ready() {
-    let rig = PoolRig::start(&[tagged("a"), tagged("b")]);
+    let rig = Rig::start(&[tagged("a"), tagged("b")]);
     let (a, b) = (answering(200), answering(200));
     let _listeners = (operator(&rig, 0, &a), operator(&rig, 1, &b));
     let mut client = rig.client().await;
@@ -428,7 +486,7 @@ async fn readyz_is_503_only_when_no_member_is_ready() {
 /// `b`, and when a poll passes for `a` the two share them again.
 #[tokio::test(start_paused = true)]
 async fn calls_prefer_the_ready_member_and_share_when_both_are() {
-    let rig = PoolRig::start(&[tagged("a"), tagged("b")]);
+    let rig = Rig::start(&[tagged("a"), tagged("b")]);
     let (a, b) = (answering(503), answering(200));
     let _listeners = (operator(&rig, 0, &a), operator(&rig, 1, &b));
     let _polls = rig.probing();
@@ -445,26 +503,25 @@ async fn calls_prefer_the_ready_member_and_share_when_both_are() {
     assert_eq!(tags, ["a", "b"]);
 }
 
-/// Asserts that a pool does not read a `WaitExecution` for the term of an old child: a call
-/// that sends its headers and no message is placed on a member at once, not after the time a
-/// slot-mode proxy waits for the message, and a whole one is placed like any other.
+/// Asserts that a `WaitExecution` is placed like any call: one that sends its headers and no
+/// message is placed on a member at once, without waiting for a message, and a whole one is
+/// placed on the next member in turn.
 #[tokio::test(start_paused = true)]
 async fn a_wait_execution_is_placed_like_any_call() {
-    let rig = PoolRig::start(&[tagged("a"), tagged("b")]);
+    let rig = Rig::start(&[tagged("a"), tagged("b")]);
     let mut client = rig.client().await;
     let began = tokio::time::Instant::now();
     let (_response, _body) = client.start(WAIT_EXECUTION, false).await;
     until(|| rig.dispatches()[0] == 1).await;
-    assert!(began.elapsed() < crate::stream::PEEK_FOR);
+    assert!(began.elapsed() < Duration::from_secs(1));
     assert_eq!(client.unary(WAIT_EXECUTION).await.text(), "b");
 }
 
-/// Asserts that `GET /metrics` carries the per-member series (state, readiness, streams open,
-/// streams placed) and, with no one child to ask, appends no child series and counts no
-/// failure to get them.
+/// Asserts that `GET /metrics` carries the proxy's own series and then the per-member series
+/// (state, readiness, streams open, streams placed).
 #[tokio::test(start_paused = true)]
 async fn the_metrics_have_a_series_for_each_member() {
-    let rig = PoolRig::start(&[tagged("a"), tagged("b")]);
+    let rig = Rig::start(&[tagged("a"), tagged("b")]);
     let mut client = rig.client().await;
     assert_eq!(client.unary(CAPS).await.text(), "a");
     assert!(rig.members.set_draining("b", true));
@@ -476,10 +533,13 @@ async fn the_metrics_have_a_series_for_each_member() {
         "kbf_proxy_member_up{member=\"b\"} 0\n",
         "kbf_proxy_member_picked_total{member=\"a\"} 1\n",
         "kbf_proxy_member_open_streams{member=\"b\",target=\"reapi\"} 0\n",
-        "kbf_proxy_child_metrics_failed_total 0\n",
+        "kbf_proxy_panics_total 0\n",
     ] {
         assert!(text.contains(line), "{line:?} is not in:\n{text}");
     }
+    let own = text.find("kbf_proxy_panics_total 0").expect("proxy series");
+    let members = text.find("kbf_proxy_member_up").expect("member series");
+    assert!(own < members, "the proxy's series come first:\n{text}");
 }
 
 /// One HTTP/1.1 request on `io`, answered with the connection closed: the whole response.
@@ -611,7 +671,6 @@ fn free_address() -> SocketAddr {
 /// The config of a files' proxy in pool mode: frontends `a` at `base` and `b` ten above, and
 /// the admin API at `admin`.
 fn pooled(mut config: ProxyConfig, base: u16, admin: Option<SocketAddr>) -> ProxyConfig {
-    config.upstream = None;
     config.frontend = vec![frontend("a", base), frontend("b", base + 10)];
     config.admin_listen = admin;
     config.check().expect("a valid pool table");
@@ -651,10 +710,10 @@ async fn both_ready(addr: SocketAddr) -> bool {
     list.matches("\"ready\":true").count() == 2
 }
 
-/// Asserts that `Proxy::bind` and `run` serve a pool on real sockets: there is no startup
-/// hold, the members' polls make `/readyz` 200, calls reach the members, and a drain asked of
-/// the admin API on its own loopback socket sends the next calls to the other member and shows
-/// in the metrics of the public port.
+/// Asserts that `Proxy::bind` and `run` serve a pool on real sockets: the members' polls make
+/// `/readyz` 200, calls reach the members, and a drain asked of the admin API on its own
+/// loopback socket sends the next calls to the other member and shows in the metrics of the
+/// public port.
 #[test]
 fn run_serves_a_pool_on_real_sockets() {
     let (base, listeners) = reserve_ports();
@@ -662,8 +721,6 @@ fn run_serves_a_pool_on_real_sockets() {
     let mut files = super::bypass::files("pool-real", base, "");
     files.config = pooled(files.config, base, Some(admin_addr));
     let (handle, public, serving) = run_proxy(files.config.clone());
-    assert!(!handle.slots().holding(), "a pool starts with no hold");
-    assert!(handle.startup_hold().is_none());
 
     handle.runtime().block_on(async {
         // The sockets are `a`'s REAPI, worker and operator ports, then `b`'s: the first two of

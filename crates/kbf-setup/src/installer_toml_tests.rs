@@ -559,7 +559,8 @@ server_cert_file = "/etc/kbf/tls/server.pem"
 server_key_file = "/etc/kbf/tls/server.key"
 client_ca_file = "/etc/kbf/tls/ca.pem"
 
-[proxy.upstream]
+[[proxy.frontend]]
+name = "a"
 base_port = 18000
 "#;
 
@@ -574,10 +575,8 @@ fn the_proxy_table_survives_a_render() {
     let text = parsed.render();
     assert_eq!(InstallerToml::parse(&text).expect("parses back"), parsed);
     assert_eq!(InstallerToml::parse(&text).unwrap().render(), text);
-    assert!(
-        text.contains("\n[proxy]\n") && text.contains("[proxy.upstream]"),
-        "{text}"
-    );
+    assert!(text.contains("\n[proxy]\n"), "{text}");
+    assert!(text.contains("[[proxy.frontend]]"), "{text}");
 }
 
 /// Catches `listen` reaching the file unchecked, and the message echoing the value: the

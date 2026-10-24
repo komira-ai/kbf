@@ -1050,36 +1050,20 @@ async fn a_sighup_during_the_stop_does_not_cancel_it() {
     assert!(took < Duration::from_secs(10), "after {took:?}");
 }
 
-/// Asserts that `--check` reads the allow-list of `remote_operator_file`: it refuses one that
-/// does not exist or is not an allow-list, naming the key.
+/// Asserts that `remote_operator_file`, the key of the removed CI credential, is still accepted
+/// and is not read: `--check` of a table that names a file that does not exist is exit 0 with
+/// nothing printed, so a unit written before the removal still starts.
 #[test]
-fn a_bad_allow_list_is_refused_by_check() {
-    let (config, _) = served_config("ci-bad");
-    let dir = config.parent().expect("the directory").to_owned();
-    let bad = dir.join("remote-ci.toml");
-    for (what, text) in [
-        ("missing", None),
-        ("not an allow-list", Some("[remote_operator]\n")),
-    ] {
-        if let Some(text) = text {
-            fs::write(&bad, text).expect("write");
-        }
-        let table = fs::read_to_string(&config).expect("read").replacen(
-            "[[proxy.frontend]]",
-            &format!("remote_operator_file = {bad:?}\n[[proxy.frontend]]"),
-            1,
-        );
-        fs::write(&config, table).expect("write");
-        let out = run(&["--check"], &config);
-        assert_eq!(out.status.code(), Some(2), "{what}");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("remote_operator_file"), "{what}: {stderr}");
-        // Only the first pass adds the key to the table; the second reads it again.
-        let table = fs::read_to_string(&config).expect("read");
-        fs::write(
-            &config,
-            table.replacen(&format!("remote_operator_file = {bad:?}\n"), "", 1),
-        )
-        .expect("write");
-    }
+fn the_retired_allow_list_key_is_accepted_and_not_read() {
+    let (config, _) = served_config("ci-retired");
+    let table = fs::read_to_string(&config).expect("read").replacen(
+        "[[proxy.frontend]]",
+        "remote_operator_file = \"/nonexistent/remote-ci.toml\"\n[[proxy.frontend]]",
+        1,
+    );
+    fs::write(&config, table).expect("write");
+    let out = run(&["--check"], &config);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
 }

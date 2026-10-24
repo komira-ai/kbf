@@ -10,8 +10,10 @@
 //! them: the proxy balances over frontends that run on their own, with no state database, no
 //! child to start or adopt, no handover and no update API (`run` hands over once it has the
 //! activated socket, before it opens any of them). A table with the `upstream` table instead is
-//! the two-slot supervision, which was removed: it is refused (exit 2, `--check` included) in
-//! words that say so.
+//! the two-slot supervision, which was removed: the proxy's own check of the table
+//! (`kbf_proxy::config::ProxyConfig::check_pool`) refuses it (exit 2, `--check` included) in
+//! words that say so. (`setup` and the release fetcher read such a table; only the proxy
+//! refuses it.)
 //!
 //! **Retired flags.** `--kbf-binary`, `--update-dir` and `--orders-dir` belonged to the two-slot
 //! supervision. They are accepted, hidden from `--help` and ignored, and each one given says so
@@ -54,11 +56,6 @@ use crate::layout::Platform;
 
 /// The first descriptor a service manager passes (`SD_LISTEN_FDS_START`).
 pub const FIRST_FD: RawFd = 3;
-
-/// What a table with the `upstream` table is refused with.
-const SLOT_MODE_REMOVED: &str = "two-slot supervision was removed: configure pool mode, a \
-     [[proxy.frontend]] table for each frontend that runs on its own, in place of \
-     [proxy.upstream]";
 
 /// Why the verb stopped.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -105,7 +102,9 @@ impl VerbError {
 /// Reads `path` and returns the `[proxy]` table in it, checked: the keys the verb reads
 /// ([`InstallerToml::parse_tolerant`]: any other key, a source a later build wrote for one, is
 /// ignored, so a package downgrade does not take the public port down), the `[proxy]` table
-/// itself, a file with no `[proxy]` table at all, and a table that is not a pool.
+/// itself, a file with no `[proxy]` table at all, and a table that is not a pool (the file
+/// reader accepts the `upstream` table of the removed supervision, so that `setup` and the
+/// fetcher can read an older file; the proxy does not).
 pub fn load(path: &Path) -> Result<ProxyConfig, VerbError> {
     let usage = |why: String| VerbError::Usage(format!("{}: {why}", path.display()));
     let text = read_config(path)?;
@@ -113,9 +112,7 @@ pub fn load(path: &Path) -> Result<ProxyConfig, VerbError> {
     let proxy = installer
         .proxy
         .ok_or_else(|| usage("has no [proxy] table".to_owned()))?;
-    if proxy.upstream.is_some() {
-        return Err(usage(SLOT_MODE_REMOVED.to_owned()));
-    }
+    proxy.check_pool().map_err(|e| usage(e.to_string()))?;
     Ok(proxy)
 }
 
@@ -359,9 +356,7 @@ pub fn run(args: &ProxyArgs) -> Result<(), VerbError> {
     let path = config_path(args, Platform::current());
     let proxy = load(&path)?;
     if args.check {
-        return proxy
-            .check_remote_file()
-            .map_err(|e| VerbError::Usage(format!("{}: {e}", path.display())));
+        return Ok(());
     }
     let listen_pid = std::env::var("LISTEN_PID").ok();
     let listen_fds = std::env::var("LISTEN_FDS").ok();

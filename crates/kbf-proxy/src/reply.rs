@@ -90,7 +90,7 @@ pub(crate) fn unavailable(grpc: bool, message: &'static str) -> Response<ProxyBo
         grpc_only(GRPC_UNAVAILABLE, message)
     } else {
         let mut response = text(StatusCode::SERVICE_UNAVAILABLE, message);
-        // A held HTTP/1.1 request that outlives its bound is told when to come back.
+        // An HTTP request the proxy cannot place is told when to come back.
         response
             .headers_mut()
             .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
@@ -116,11 +116,6 @@ pub(crate) fn refused(grpc: bool, refusal: Refusal) -> Response<ProxyBody> {
             StatusCode::TOO_MANY_REQUESTS,
             GRPC_RESOURCE_EXHAUSTED,
             "too many wrong credentials from this address",
-        ),
-        Refusal::Unavailable => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            GRPC_UNAVAILABLE,
-            "the credential cannot be checked now: the issuer's keys are unavailable",
         ),
     };
     if grpc {

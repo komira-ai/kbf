@@ -10,10 +10,10 @@ use h2::Reason;
 use http::HeaderMap;
 use tokio::time::Instant;
 
-use super::kit::{
-    CAPS, EXECUTE, OPERATOR, Rig, WRITE, finish, grpc_ok, read_all, script, tagged, until,
-};
-use crate::slot::Slot;
+use super::kit::{CAPS, EXECUTE, OPERATOR, WRITE, finish, grpc_ok, read_all, script, tagged, until};
+use super::pool_kit::Rig;
+use crate::pool::member_addr;
+use crate::route::Target;
 
 const HOUR: Duration = Duration::from_secs(3600);
 
@@ -26,31 +26,41 @@ fn slow(delay: Duration) -> super::kit::Script {
     })
 }
 
+/// The streams open on member `a`'s REAPI listener.
+fn open_on_a(rig: &Rig) -> u64 {
+    rig.members.snapshot()[0].open_streams.reapi
+}
+
+/// Asserts that an `Execute` that is answered after 3 hours is not ended by the idle bound, and
+/// that its place is given back once it has been answered.
 #[tokio::test(start_paused = true)]
 async fn idle_3h_paused_not_closed() {
-    let rig = Rig::start(slow(3 * HOUR + Duration::from_secs(1)), tagged("b")).await;
+    let rig = Rig::start(&[slow(3 * HOUR + Duration::from_secs(1))]);
     let start = Instant::now();
     let reply = rig.client().await.unary(EXECUTE).await;
     assert_eq!(reply.text(), "late", "an Execute is never idle");
     assert_eq!(reply.grpc_status().as_deref(), Some("0"));
     assert!(start.elapsed() >= 3 * HOUR);
-    until(|| rig.core.slots.open_streams() == 0).await;
+    until(|| rig.core.open_streams() == 0).await;
 }
 
+/// Asserts that any call other than an `Execute` that gets no answer for 2 hours is ended
+/// `UNAVAILABLE` at the idle bound, not before and not when the child would have answered, and
+/// that its place on the member is given back.
 #[tokio::test(start_paused = true)]
 async fn any_other_stream_is_closed_after_7200_s_of_silence() {
-    let rig = Rig::start(slow(3 * HOUR), tagged("b")).await;
+    let rig = Rig::start(&[slow(3 * HOUR)]);
     let start = Instant::now();
     let reply = rig.client().await.unary(CAPS).await;
     assert_eq!(reply.grpc_status().as_deref(), Some("14"));
     let waited = start.elapsed();
-    assert!(
-        waited >= 2 * HOUR && waited < 2 * HOUR + Duration::from_secs(5),
-        "closed at the idle bound, not before and not 3 hours later: {waited:?}"
-    );
-    until(|| rig.core.slots.open_permits(Slot::A) == 0).await;
+    assert!(waited >= 2 * HOUR, "before the idle bound: {waited:?}");
+    assert!(waited < 2 * HOUR + Duration::from_secs(5), "{waited:?}");
+    until(|| open_on_a(&rig) == 0).await;
 }
 
+/// Asserts that no deadline ends a stream that keeps moving: a server stream with a message an
+/// hour and a `ByteStream` write with a chunk an hour both run for 3 hours and end in `OK`.
 #[tokio::test(start_paused = true)]
 async fn no_stream_deadline_3h_paused() {
     // A server stream that sends a message every hour for 3 hours is never idle for 2.
@@ -74,7 +84,7 @@ async fn no_stream_deadline_3h_paused() {
         trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
         send.send_trailers(trailers).expect("trailers");
     });
-    let rig = Rig::start(a, tagged("b")).await;
+    let rig = Rig::start(&[a]);
     let start = Instant::now();
     let reply = rig.client().await.unary(CAPS).await;
     assert_eq!(reply.body, b"mmm");
@@ -89,7 +99,7 @@ async fn no_stream_deadline_3h_paused() {
         assert_eq!(body, b"www");
         grpc_ok(&mut call.respond, "written");
     });
-    let rig = Rig::start(a, tagged("b")).await;
+    let rig = Rig::start(&[a]);
     let mut client = rig.client().await;
     let start = Instant::now();
     let (response, mut body) = client.start(WRITE, false).await;
@@ -105,8 +115,11 @@ async fn no_stream_deadline_3h_paused() {
     assert!(start.elapsed() >= 3 * HOUR);
 }
 
+/// Asserts that a member's place for a stream is kept after the child has answered in full
+/// while the client's request is still open, and is given back only when the client ends its
+/// request.
 #[tokio::test(start_paused = true)]
-async fn open_permits_stays_1_until_upstream_rst() {
+async fn the_place_on_a_member_is_kept_until_both_halves_are_finished() {
     // The child answers in full while the client's request is still open.
     let a = script(|mut call| async move {
         let _ = call.body.data().await;
@@ -114,32 +127,27 @@ async fn open_permits_stays_1_until_upstream_rst() {
         // Holds the request half open; the connection carries on.
         std::future::pending::<()>().await;
     });
-    let rig = Rig::start(a, tagged("b")).await;
+    let rig = Rig::start(&[a]);
     let mut client = rig.client().await;
     let (response, mut body) = client.start(EXECUTE, false).await;
     body.send_data(Bytes::from_static(b"part"), false)
         .expect("body");
     let reply = finish(response).await;
     assert_eq!(reply.text(), "early", "the response is complete");
-    // Give every task the chance to drop the permit if it was going to.
+    // Give every task the chance to drop the place if it was going to.
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(
-        rig.core.slots.open_permits(Slot::A),
+        open_on_a(&rig),
         1,
-        "the response is over, the request half is not: the permit stays"
+        "the response is over, the request half is not: the place stays"
     );
-    assert_eq!(
-        rig.core.slots.retire(Slot::B),
-        crate::slot::Retire::NeverOpened
-    );
-    rig.flip_to_b();
-    assert_eq!(rig.core.slots.retire(Slot::A), crate::slot::Retire::Busy(1));
-    // The client ends its request: the stream is finished both ways and the permit drops.
+    // The client ends its request: the stream is finished both ways and the place is given back.
     body.send_data(Bytes::new(), true).expect("end");
-    until(|| rig.core.slots.open_permits(Slot::A) == 0).await;
-    assert_eq!(rig.core.slots.retire(Slot::A), crate::slot::Retire::Closed);
+    until(|| open_on_a(&rig) == 0).await;
 }
 
+/// Asserts that a client that resets its stream reaches the child as a `CANCEL`, and that the
+/// stream's place on the member and its count are given back.
 #[tokio::test(start_paused = true)]
 async fn a_client_reset_reaches_the_child_as_cancel_and_frees_the_permit() {
     let reason = Arc::new(Mutex::new(None));
@@ -154,34 +162,37 @@ async fn a_client_reset_reaches_the_child_as_cancel_and_frees_the_permit() {
             }
         })
     };
-    let rig = Rig::start(a, tagged("b")).await;
+    let rig = Rig::start(&[a]);
     let mut client = rig.client().await;
     let (response, mut body) = client.start(CAPS, false).await;
     body.send_data(Bytes::from_static(b"part"), false)
         .expect("body");
-    until(|| rig.core.slots.open_permits(Slot::A) == 1).await;
+    until(|| open_on_a(&rig) == 1).await;
     body.send_reset(Reason::CANCEL);
     drop(response);
     until(|| reason.lock().expect("lock").is_some()).await;
     assert_eq!(*reason.lock().expect("lock"), Some(Reason::CANCEL));
-    until(|| rig.core.slots.open_permits(Slot::A) == 0).await;
-    until(|| rig.core.slots.open_streams() == 0).await;
+    until(|| open_on_a(&rig) == 0).await;
+    until(|| rig.core.open_streams() == 0).await;
 }
 
+/// Asserts that a child that resets a stream with `INTERNAL_ERROR` before its headers is
+/// answered `UNAVAILABLE` and that the stream is not given to the other member, which would
+/// run a call the child may have started twice.
 #[tokio::test(start_paused = true)]
 async fn a_child_reset_before_headers_is_unavailable_and_not_repeated() {
     let a = script(|mut call| async move {
         read_all(&mut call.body).await;
         call.respond.send_reset(Reason::INTERNAL_ERROR);
     });
-    let rig = Rig::start(a, tagged("b")).await;
+    let rig = Rig::start(&[a, tagged("b")]);
     let reply = rig.client().await.unary(CAPS).await;
     assert_eq!(reply.status, Some(200));
     assert_eq!(reply.grpc_status().as_deref(), Some("14"));
     assert!(reply.body.is_empty());
     assert_eq!(
-        rig.a.state.dispatches(),
-        1,
+        rig.dispatches(),
+        [1, 0],
         "an INTERNAL_ERROR is not a safe failure"
     );
 }
@@ -206,9 +217,11 @@ fn mid_body_reset() -> super::kit::Script {
     })
 }
 
+/// Asserts that a child that resets a gRPC stream after some data has the data delivered and the
+/// stream ended by a non-OK trailer, not by a reset.
 #[tokio::test(start_paused = true)]
 async fn a_child_reset_mid_body_ends_a_grpc_stream_with_a_non_ok_trailer() {
-    let rig = Rig::start(mid_body_reset(), tagged("b")).await;
+    let rig = Rig::start(&[mid_body_reset()]);
     let reply = rig.client().await.unary(CAPS).await;
     assert_eq!(reply.status, Some(200));
     assert_eq!(reply.body, b"part", "the data before the cut is delivered");
@@ -219,13 +232,14 @@ async fn a_child_reset_mid_body_ends_a_grpc_stream_with_a_non_ok_trailer() {
     );
     assert!(reply.trailers.is_some());
     assert!(reply.error.is_none(), "a trailer, not a reset");
-    until(|| rig.core.slots.open_streams() == 0).await;
+    until(|| rig.core.open_streams() == 0).await;
 }
 
+/// Asserts that a child that resets a stream of an HTTP route after some data has the stream
+/// reset for the client, with no gRPC trailer made up, and that nothing panics.
 #[tokio::test(start_paused = true)]
 async fn a_child_reset_mid_body_on_http_is_a_reset_never_a_grpc_trailer() {
-    let mut rig = Rig::start(mid_body_reset(), tagged("b")).await;
-    let _ = &mut rig;
+    let rig = Rig::start(&[mid_body_reset()]);
     let reply = rig.client().await.plain("GET", OPERATOR, b"").await;
     assert_eq!(reply.status, Some(200));
     assert!(reply.error.is_some(), "the stream is reset: {reply:?}");
@@ -233,6 +247,8 @@ async fn a_child_reset_mid_body_on_http_is_a_reset_never_a_grpc_trailer() {
     assert_eq!(rig.core.metrics.panics.load(Ordering::Acquire), 0);
 }
 
+/// Asserts that a request that ends in trailers reaches the child with its data and its
+/// trailers.
 #[tokio::test(start_paused = true)]
 async fn a_request_with_trailers_reaches_the_child_with_them() {
     let seen = Arc::new(Mutex::new(None));
@@ -248,7 +264,7 @@ async fn a_request_with_trailers_reaches_the_child_with_them() {
             }
         })
     };
-    let rig = Rig::start(a, tagged("b")).await;
+    let rig = Rig::start(&[a]);
     let mut client = rig.client().await;
     let (response, mut body) = client.start(CAPS, false).await;
     body.send_data(Bytes::from_static(b"data"), false)
@@ -266,6 +282,8 @@ async fn a_request_with_trailers_reaches_the_child_with_them() {
     assert_eq!(got.1.expect("trailers").get("x-sum").expect("x-sum"), "4");
 }
 
+/// Asserts that a response that goes silent after some data is ended at the idle bound, with
+/// the data delivered, a non-OK trailer, and its place on the member given back.
 #[tokio::test(start_paused = true)]
 async fn a_response_that_goes_silent_is_ended_at_the_idle_bound() {
     let a = script(|mut call| async move {
@@ -285,7 +303,7 @@ async fn a_response_that_goes_silent_is_ended_at_the_idle_bound() {
         tokio::time::sleep(3 * HOUR).await;
         drop(send);
     });
-    let rig = Rig::start(a, tagged("b")).await;
+    let rig = Rig::start(&[a]);
     let start = Instant::now();
     let reply = rig.client().await.unary(CAPS).await;
     assert_eq!(
@@ -298,13 +316,13 @@ async fn a_response_that_goes_silent_is_ended_at_the_idle_bound() {
         "and the stream ends non-OK"
     );
     let waited = start.elapsed();
-    assert!(
-        waited >= 2 * HOUR && waited < 2 * HOUR + Duration::from_secs(5),
-        "{waited:?}"
-    );
-    until(|| rig.core.slots.open_permits(Slot::A) == 0).await;
+    assert!(waited >= 2 * HOUR, "{waited:?}");
+    assert!(waited < 2 * HOUR + Duration::from_secs(5), "{waited:?}");
+    until(|| open_on_a(&rig) == 0).await;
 }
 
+/// Asserts that a child that answers in full and then stops the upload with a reset ends the
+/// request pump, and the stream's place on the member is given back.
 #[tokio::test(start_paused = true)]
 async fn a_child_that_answers_early_and_stops_the_upload_ends_the_pump() {
     let a = script(|mut call| async move {
@@ -314,7 +332,7 @@ async fn a_child_that_answers_early_and_stops_the_upload_ends_the_pump() {
         tokio::time::sleep(Duration::from_secs(1)).await;
         call.respond.send_reset(Reason::NO_ERROR);
     });
-    let rig = Rig::start(a, tagged("b")).await;
+    let rig = Rig::start(&[a]);
     let mut client = rig.client().await;
     let (response, mut body) = client.start(EXECUTE, false).await;
     body.send_data(Bytes::from_static(b"first"), false)
@@ -326,41 +344,23 @@ async fn a_child_that_answers_early_and_stops_the_upload_ends_the_pump() {
     let granted = std::future::poll_fn(|cx| body.poll_capacity(cx)).await;
     assert!(granted.is_some());
     let _ = body.send_data(Bytes::from(vec![9_u8; 100_000]), false);
-    until(|| rig.core.slots.open_permits(Slot::A) == 0).await;
-    assert_eq!(rig.core.slots.open_streams(), 0);
+    until(|| open_on_a(&rig) == 0).await;
+    assert_eq!(rig.core.open_streams(), 0);
 }
 
-#[tokio::test(start_paused = true)]
-async fn an_operator_stream_that_cannot_be_served_gets_a_503() {
-    let rig = Rig::start(tagged("a"), tagged("b")).await;
-    let guard = rig
-        .core
-        .slots
-        .hold(Duration::from_secs(20))
-        .expect("no hold");
-    let reply = rig.client().await.plain("GET", OPERATOR, b"").await;
-    assert_eq!(reply.status, Some(503), "no gRPC trailer on an HTTP route");
-    assert!(reply.grpc_status().is_none());
-    assert_eq!(rig.a.state.dispatches(), 0);
-    drop(guard);
-}
-
+/// Asserts that a member nothing can connect to fails the stream at the connect bound of 3
+/// seconds, `UNAVAILABLE`, and that the failed dial is counted.
 #[tokio::test(start_paused = true)]
 async fn a_child_that_never_accepts_fails_the_stream_at_the_connect_timeout() {
-    let rig = Rig::start(tagged("a"), tagged("b")).await;
-    rig.net.blackhole(super::kit::addr_of(
-        rig.table,
-        Slot::A,
-        crate::route::Target::Reapi,
-    ));
+    let rig = Rig::start(&[tagged("a")]);
+    let reapi = member_addr(rig.members.base(0), Target::Reapi);
+    rig.net.blackhole(reapi);
     let start = Instant::now();
     let reply = rig.client().await.unary(CAPS).await;
     assert_eq!(reply.grpc_status().as_deref(), Some("14"));
     let waited = start.elapsed();
-    assert!(
-        waited >= Duration::from_secs(3) && waited < Duration::from_secs(4),
-        "{waited:?}"
-    );
+    assert!(waited >= Duration::from_secs(3), "{waited:?}");
+    assert!(waited < Duration::from_secs(4), "{waited:?}");
     assert_eq!(
         rig.core
             .metrics
@@ -370,13 +370,15 @@ async fn a_child_that_never_accepts_fails_the_stream_at_the_connect_timeout() {
     );
 }
 
+/// Asserts that an upload that sends a chunk an hour is not idle, and ends in an answer after 3
+/// hours.
 #[tokio::test(start_paused = true)]
 async fn a_slow_upload_is_not_idle_while_it_keeps_sending() {
     let a = script(|mut call| async move {
         read_all(&mut call.body).await;
         grpc_ok(&mut call.respond, "done");
     });
-    let rig = Rig::start(a, tagged("b")).await;
+    let rig = Rig::start(&[a]);
     let mut client = rig.client().await;
     let (response, mut body) = client.start(WRITE, false).await;
     // One chunk an hour for three hours: silent for 1 h at a time, never for 2 h.
@@ -390,13 +392,16 @@ async fn a_slow_upload_is_not_idle_while_it_keeps_sending() {
     assert_eq!(reply.text(), "done", "{reply:?}");
 }
 
+/// Asserts that a child that takes a call and never answers has it ended `UNAVAILABLE` at one
+/// idle bound, and that the call is not given to the other member, because the child may have
+/// started it.
 #[tokio::test(start_paused = true)]
 async fn a_silent_child_ends_the_stream_at_one_idle_bound_and_is_not_dispatched_again() {
     let a = script(|mut call| async move {
         read_all(&mut call.body).await;
         std::future::pending::<()>().await;
     });
-    let rig = Rig::start(a, tagged("b")).await;
+    let rig = Rig::start(&[a, tagged("b")]);
     let start = Instant::now();
     let reply = rig.client().await.unary(CAPS).await;
     assert_eq!(reply.grpc_status().as_deref(), Some("14"), "{reply:?}");
@@ -410,8 +415,11 @@ async fn a_silent_child_ends_the_stream_at_one_idle_bound_and_is_not_dispatched_
         0,
         "an idle bound is not a safe failure: the child may have started the call"
     );
+    assert_eq!(rig.dispatches(), [1, 0]);
 }
 
+/// Asserts that a request pump parked on a child's full flow-control window lets go when the
+/// response half gives up at the idle bound, so the stream's place on the member is given back.
 #[tokio::test(start_paused = true)]
 async fn a_pump_parked_on_a_full_upstream_window_ends_with_the_response() {
     // The child answers the head, then never reads: its window (4 MiB) fills, and the proxy's
@@ -425,7 +433,7 @@ async fn a_pump_parked_on_a_full_upstream_window_ends_with_the_response() {
         let _send = call.respond.send_response(response, false).expect("head");
         std::future::pending::<()>().await;
     });
-    let rig = Rig::start(a, tagged("b")).await;
+    let rig = Rig::start(&[a]);
     let mut client = rig.client().await;
     let (response, mut body) = client.start(WRITE, false).await;
     let answer = tokio::spawn(finish(response));
@@ -446,7 +454,7 @@ async fn a_pump_parked_on_a_full_upstream_window_ends_with_the_response() {
     // Silent for the idle bound: the response half gives up, and the pump must let go.
     let reply = answer.await.expect("client");
     assert_eq!(reply.grpc_status().as_deref(), Some("14"), "{reply:?}");
-    until(|| rig.core.slots.open_permits(Slot::A) == 0).await;
-    assert_eq!(rig.core.slots.open_streams(), 0);
+    until(|| open_on_a(&rig) == 0).await;
+    assert_eq!(rig.core.open_streams(), 0);
     sender.abort();
 }

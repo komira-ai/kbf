@@ -78,8 +78,6 @@
 //! - `sudo-test -p <package> --test <name> [--sudo <path>] [-- <test args>]`
 //!   ([`sudo_test`]): one integration test target built as this user, then its
 //!   `#[ignore]` tests run as root through `sudo -n`.
-//! - `proxy-loom` ([`proxy_loom`]): the loom models of kbf-proxy's slot and gate, built under
-//!   `--cfg kbf_loom` in their own target directory.
 //!
 //! Exit status: 0 when the check passed, 1 when it failed (one reason per line on
 //! stderr), 2 on a usage error.
@@ -112,7 +110,6 @@ pub mod pkg_macos_install;
 pub mod pkg_size;
 pub mod pkg_trust;
 pub mod pkg_version;
-pub mod proxy_loom;
 pub mod release;
 pub mod sudo_test;
 pub mod sums;
@@ -475,9 +472,6 @@ enum Verb {
         #[arg(long, default_value = "sudo")]
         sudo: PathBuf,
     },
-    /// Run the loom models of kbf-proxy's slot and gate (`--cfg kbf_loom`, its own target
-    /// directory, release mode).
-    ProxyLoom,
     /// Build one integration test target, then run its ignored tests as root.
     SudoTest {
         /// The package the target is in.
@@ -886,7 +880,6 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             test: &test,
             args: &args,
         }),
-        Verb::ProxyLoom => proxy_loom::run(&cargo_program(), &root),
         Verb::CrunTests { sudo } => crun_tests::run(&crun_tests::CrunTests {
             cargo: &cargo_program(),
             sudo: &sudo,

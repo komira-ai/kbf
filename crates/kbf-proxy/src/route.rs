@@ -1,4 +1,4 @@
-//! Which child port, auth class, hold bypass and idle timeout a request path has.
+//! Which member port, auth class and idle timeout a request path has.
 //!
 //! The table is closed: a path that matches no prefix is [`Route::Unknown`] and is answered
 //! by the proxy, never forwarded. A child therefore never sees a path the proxy did not
@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-/// A listener of a child frontend.
+/// A listener of a member frontend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     /// REAPI and ByteStream.
@@ -22,7 +22,7 @@ pub enum Target {
 }
 
 impl Target {
-    /// The offset of this listener's port from the slot's base port.
+    /// The offset of this listener's port from the member's base port.
     #[must_use]
     pub const fn offset(self) -> u16 {
         match self {
@@ -43,10 +43,10 @@ impl Target {
 /// What the proxy does with a path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
-    /// Forward to the active child's listener.
+    /// Forward to a member's listener.
     Child(Target),
-    /// The read-only web UI: `/ui` and `/ui/...`, forwarded to the active child's operator
-    /// listener ([`Target::Operator`]). Open: [`AuthClass::Ui`] asks for no credential.
+    /// The read-only web UI: `/ui` and `/ui/...`, forwarded to a member's operator listener
+    /// ([`Target::Operator`]). Open: [`AuthClass::Ui`] asks for no credential.
     Ui,
     /// Served by the proxy: `/v1/update/frontend*`.
     Update,
@@ -54,7 +54,7 @@ pub enum Route {
     Health,
     /// `/readyz`.
     Ready,
-    /// `/metrics`: the proxy's own series, then the active child's operator `/metrics` appended.
+    /// `/metrics`: the proxy's own series, then those of each member.
     Metrics,
     /// Not in the table: the proxy answers 404 (HTTP) or `UNIMPLEMENTED` (gRPC).
     Unknown,
@@ -218,17 +218,6 @@ pub const fn auth_class(route: Route) -> Option<AuthClass> {
     }
 }
 
-/// Whether the hold gate lets the route through while it holds. Only a stream going to a
-/// backend is held; everything the proxy answers itself bypasses: the update API (so `abort`
-/// cannot deadlock), the probes, the metrics, and a path outside the table (answered 404 or
-/// `UNIMPLEMENTED` at once, never forwarded). An operator call (`/v1/*` but the update API) is
-/// held like any backend stream: it waits in the bounded hold queue during a swap hold and is
-/// answered 503 at the bound.
-#[must_use]
-pub const fn bypasses_hold(route: Route) -> bool {
-    !matches!(route, Route::Child(_) | Route::Ui)
-}
-
 /// The idle timeout of `path`. Execute and WaitExecution are matched by their full method
 /// path, so a generic route table needs no per-stream state.
 #[must_use]
@@ -237,13 +226,6 @@ pub fn idle_of(path: &str) -> Idle {
         "/build.bazel.remote.execution.v2.Execution/Execute" | WAIT_EXECUTION => Idle::Never,
         _ => Idle::After(IDLE_DEFAULT),
     }
-}
-
-/// Whether `path` is `WaitExecution`: the one call whose request names the operation it
-/// waits on, and so the child that holds it (design note, section 3, "Routing").
-#[must_use]
-pub fn is_wait_execution(path: &str) -> bool {
-    bare(path) == WAIT_EXECUTION
 }
 
 /// Whether `path` is a ByteStream call, which is never retried.
@@ -324,7 +306,6 @@ mod tests {
         assert_eq!(cold, Route::Child(Target::Worker));
         assert_eq!(auth_class(cold), Some(AuthClass::Worker));
         assert_eq!(route_of("/kbf.enroll.v1.Other/X"), Route::Unknown);
-        assert!(!bypasses_hold(enroll));
     }
 
     #[test]
@@ -356,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_classes_and_hold_bypass() {
+    fn auth_classes() {
         assert_eq!(
             auth_class(Route::Child(Target::Reapi)),
             Some(AuthClass::Reapi)
@@ -370,19 +351,6 @@ mod tests {
             Some(AuthClass::Operator)
         );
         assert_eq!(auth_class(Route::Update), Some(AuthClass::Update));
-        for (path, bypass) in [
-            ("/v1/update/frontend/abort", true),
-            ("/healthz", true),
-            ("/readyz", true),
-            ("/metrics", true),
-            ("/not/in/the/table", true),
-            ("/v1/update/frontendx", false),
-            ("/v1/nodes", false),
-            ("/kbf.worker.v1.Worker/Session", false),
-            ("/google.bytestream.ByteStream/Read", false),
-        ] {
-            assert_eq!(bypasses_hold(route_of(path)), bypass, "{path}");
-        }
         assert_eq!(auth_class(Route::Health), Some(AuthClass::Probe));
         assert_eq!(auth_class(Route::Ready), Some(AuthClass::Probe));
         assert_eq!(auth_class(Route::Metrics), Some(AuthClass::Operator));
@@ -392,8 +360,7 @@ mod tests {
     /// is not, and nothing under `/v1` is.
     ///
     /// Kills: a prefix match that takes `/uix` or `/v1/ui` for the UI; the UI given the
-    /// operator class (or an operator route the UI class); the UI answered by the proxy or
-    /// let past the hold gate.
+    /// operator class (or an operator route the UI class); the UI answered by the proxy.
     #[test]
     fn the_ui_is_its_own_route_and_class() {
         for p in [
@@ -406,10 +373,6 @@ mod tests {
         ] {
             assert_eq!(route_of(p), Route::Ui, "{p}");
             assert_eq!(auth_class(route_of(p)), Some(AuthClass::Ui), "{p}");
-            assert!(
-                !bypasses_hold(route_of(p)),
-                "{p}: the UI is forwarded, so it is held"
-            );
         }
         for p in [
             "/uix",
@@ -508,22 +471,5 @@ mod tests {
         );
         assert!(is_bytestream("/google.bytestream.ByteStream/Write"));
         assert!(!is_bytestream(&format!("{exec}Execute")));
-    }
-
-    /// Only the full `WaitExecution` method path is the call whose request is read for a
-    /// term; a query string does not hide it, and a neighbour does not pass for it.
-    ///
-    /// Catches: a prefix match that reads the request of `Execute` or of another call of the
-    /// service; a path with a query that escapes the read.
-    #[test]
-    fn only_wait_execution_is_read_for_a_term() {
-        let exec = "/build.bazel.remote.execution.v2.Execution/";
-        assert!(is_wait_execution(&format!("{exec}WaitExecution")));
-        assert!(is_wait_execution(&format!("{exec}WaitExecution?x=1")));
-        for other in ["Execute", "WaitExecutionX", "waitexecution", ""] {
-            assert!(!is_wait_execution(&format!("{exec}{other}")), "{other}");
-        }
-        assert!(!is_wait_execution("/google.bytestream.ByteStream/Read"));
-        assert!(!is_wait_execution(""));
     }
 }

@@ -1,8 +1,8 @@
-//! The front-door proxy in front of real `kbf` frontend processes, through a swap
-//! (docs/design/kbf-proxy-api.md section 14, "Soak"): 200 long-lived gRPC streams are open
-//! through the proxy to the frontend in slot A; the swap holds the gate, makes a second real
-//! frontend the active slot (slot B) and releases; every old stream then runs to its end on A,
-//! and every stream opened during the hold or after it is served by B.
+//! The front-door proxy in pool mode in front of real `kbf` frontend processes, drained under
+//! load (docs/design/kbf-proxy-api.md section 14, "Soak"): 200 long-lived gRPC streams are open
+//! through one client connection, spread over two frontends; one frontend is drained through the
+//! admin API; every old stream stays open on its frontend and runs to its end there, and every
+//! stream opened after the drain is served by the other.
 //!
 //! Everything but the proxy library, which runs in this process the way the installer's verb
 //! runs it, is a child process: two `kbf storage` nodes (file stores under the scratch
@@ -14,20 +14,15 @@
 //! The streams are `Execution.Execute` calls, the stream a Buck2 build holds open per action:
 //! no worker runs them, so each is queued on its frontend and the stream stays open and idle.
 //! The frontend counts them itself (`open_executions` of `GET /v1/frontend/drain`), which
-//! makes every figure below the child's own and exact. Which child served a stream is read
-//! from that count, and from where the action is: each action is in the store behind one
-//! frontend only, so a stream the proxy sent to the wrong child would be refused.
+//! makes every figure below the child's own and exact. Every action is in the store behind both
+//! frontends, so either serves any stream.
 //!
 //! What this proves, exactly: the old streams end by the client cancelling them, and each
-//! cancel reaches A (A's own count falls to 0); that is not a `Write` or `Read` completing.
-//! B is ready (polled, `/readyz` 200) before the hold begins, so a release before B is ready
-//! is not exercised. `retire(A)` while the 200 streams are open is `Busy(200)` and leaves
-//! them open and quiet. The proxy runs here at the library level, so SIGINT/SIGTERM are the
-//! verb's own tests (`kbf-installer/tests/proxy_verb.rs`).
-//!
-//! The proxy has no admin listener to poll (U2 builds it); its `/readyz` poll asks each
-//! child's operator listener, which is the `--api-listen` port, so the soak also proves
-//! `/readyz` against the real thing: 200 with A active, and 200 again once B is.
+//! cancel reaches the frontend that has the stream (its own count falls); that is not a `Write`
+//! or `Read` completing. Both frontends are ready (polled, `/readyz` 200) before the streams
+//! start, so each takes a share of them. The drained frontend keeps all the streams it has,
+//! open and quiet, and takes no more. The proxy runs here at the library level, so SIGINT and
+//! SIGTERM are the verb's own tests (`kbf-installer/tests/proxy_verb.rs`).
 //!
 //! Why not `ByteStream.Write` or a `Read` nobody reads (the pull request has the detail):
 //! a `Write` whose last message is followed by an empty DATA frame with END_STREAM (how the
@@ -40,19 +35,22 @@
 
 mod proxy_support;
 
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::io::{Read as _, Write as _};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
 use std::path::Path;
-use std::time::Duration;
 
 use kbf_proxy::Proxy;
+use kbf_proxy::config::Frontend;
 use kbf_proxy::control::NoUpdates;
-use kbf_proxy::slot::{Retire, Slot};
 use kbf_testkit::dir::TestDir;
 use proxy_support::{
     Child, Open, actions, api_get, connect, free_base, frontend_args, link_kbf, open_executions,
     own_config, proxy_config, proxy_get, storage_node, store, until, until_ready, within,
 };
+use serde_json::Value;
+
+const LIST: &str = "/v1/proxy/upstreams";
 
 pub fn frontend(dir: &Path, name: &str, node: &Child, base: u16) -> Child {
     let state = dir.join(name).join("state.db");
@@ -63,19 +61,49 @@ pub fn frontend(dir: &Path, name: &str, node: &Child, base: u16) -> Child {
     )
 }
 
-/// Streams opened before the swap and finished after it.
+/// Streams opened before the drain and finished after it.
 const OLD: usize = 200;
-/// Streams opened while the gate holds: served by the new child.
-const HELD: usize = 20;
-/// Streams opened and finished after the swap: served by the new child.
-const NEW: usize = 30;
+/// Streams opened after the drain: served by the frontend that was not drained.
+const NEW: usize = 50;
 
-/// Catches, with real children, a proxy that: closes or GOAWAYs the client's one connection
-/// at the swap, resets or fails a stream bound before it, moves an old stream to the new
-/// child or a new one to the old, loses a held stream, retires the old slot under a stream,
-/// or reports `/readyz` 503 beside a ready real child.
+/// One request to the proxy's admin API: the status code and the JSON body.
+fn admin(addr: SocketAddr, method: &str, path: &str) -> (u16, Value) {
+    let mut stream = TcpStream::connect(addr).expect("connect to the admin API");
+    let head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\n");
+    let request = format!("{head}Connection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).expect("send");
+    let mut text = String::new();
+    stream.read_to_string(&mut text).expect("read");
+    let (head, body) = text.split_once("\r\n\r\n").expect("a head and a body");
+    let code = head.split_whitespace().nth(1).expect("a status line");
+    let body = serde_json::from_str(body).expect("a JSON body");
+    (code.parse().expect("a status code"), body)
+}
+
+/// The entry of member `name` in the admin API's list.
+fn member(list: &Value, name: &str) -> Value {
+    let members = list.as_array().expect("a list");
+    members
+        .iter()
+        .find(|m| m["name"] == name)
+        .expect("the member is listed")
+        .clone()
+}
+
+/// The streams the proxy counts on member `name`, from the admin API.
+fn proxy_count(admin_addr: SocketAddr, name: &str) -> u64 {
+    let (_, list) = admin(admin_addr, "GET", LIST);
+    member(&list, name)["open_streams"]["reapi"]
+        .as_u64()
+        .expect("a count")
+}
+
+/// Asserts, with real children, that a drain of one frontend with two hundred streams open
+/// leaves the client's one connection alone, resets or fails none of the streams, moves none
+/// from the frontend that has it, places the streams that come after on the other frontend
+/// only, and that the proxy's counts of the streams are the frontends' own.
 #[test]
-fn the_flip_with_two_hundred_streams_drops_none_and_each_child_serves_its_own() {
+fn a_drain_with_two_hundred_streams_drops_none_and_the_other_frontend_serves_the_new() {
     // Declared first, so it drops last: the children are reaped before it is removed.
     let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "proxy-soak");
     let dir = scratch.path().to_path_buf();
@@ -84,8 +112,6 @@ fn the_flip_with_two_hundred_streams_drops_none_and_each_child_serves_its_own() 
     let (node_a, node_b) = (storage_node(&dir, "node-a"), storage_node(&dir, "node-b"));
     let base = free_base();
     let mut a = frontend(&dir, "frontend-a", &node_a, base);
-    // The candidate runs from the start, out of the proxy's table until the swap, so that
-    // its store can hold its actions before any stream asks for them.
     let mut b = frontend(&dir, "frontend-b", &node_b, base + 10);
     let (api_a, api_b) = (
         format!("127.0.0.1:{}", base + 2),
@@ -98,16 +124,20 @@ fn the_flip_with_two_hundred_streams_drops_none_and_each_child_serves_its_own() 
 
     let public = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("public socket");
     let public_addr: SocketAddr = public.local_addr().expect("addr");
-    // The proxy terminates TLS (U4b-2): a CA and a server certificate, and the operator
-    // token file it reads at start.
-    let (config, pki) = proxy_config(&dir, base);
+    let admin_socket = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("admin socket");
+    let admin_addr = admin_socket.local_addr().expect("addr");
+    drop(admin_socket);
+    // The proxy terminates TLS: a CA and a server certificate, and the operator token file it
+    // reads at start.
+    let (mut config, pki) = proxy_config(&dir, base);
+    config.frontend.push(Frontend {
+        name: "b".to_owned(),
+        base_port: base + 10,
+    });
+    config.admin_listen = Some(admin_addr);
+    config.check().expect("a valid pool table");
     let (handle, runner) = Proxy::bind(config, OwnedFd::from(public)).expect("bind");
     let serving = std::thread::spawn(move || runner.run(NoUpdates));
-    // The supervisor's first act: adopt A, end the startup hold.
-    let startup = handle.startup_hold().expect("the startup hold");
-    handle.slots().adopt(Slot::A, None);
-    handle.slots().release_into(Slot::A).expect("A is open");
-    drop(startup);
 
     let client_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -115,142 +145,89 @@ fn the_flip_with_two_hundred_streams_drops_none_and_each_child_serves_its_own() 
         .build()
         .expect("runtime");
     client_runtime.block_on(async {
-        // The old actions are in the store behind A only, the new ones behind B only.
-        let (old_requests, old_blobs) = actions("old", OLD);
-        let (new_requests, new_blobs) = actions("new", HELD + NEW);
-        within("the old actions", store(&a.field("reapi="), old_blobs)).await;
-        within("the new actions", store(&b.field("reapi="), new_blobs)).await;
+        // Every action is in the store behind both frontends.
+        let (requests, blobs) = actions("soak", OLD + NEW);
+        within("the actions in A", store(&a.field("reapi="), blobs.clone())).await;
+        within("the actions in B", store(&b.field("reapi="), blobs)).await;
         let (client, driver) = connect(&public_addr.to_string(), &pki.ca_cert).await;
-        // `/readyz` is the proxy's poll of the real child: 200 once a poll has passed.
+        // `/readyz` is the proxy's poll of the real frontends: 200 once a poll has passed.
         until_ready(&client).await;
+        until("both frontends ready", || {
+            let (_, list) = admin(admin_addr, "GET", LIST);
+            member(&list, "a")["ready"] == true && member(&list, "b")["ready"] == true
+        })
+        .await;
 
-        // 200 streams through one connection to A, each open and idle.
-        let starting: Vec<_> = old_requests
+        // 200 streams through one connection, each open and idle, spread over both frontends.
+        let starting: Vec<_> = requests[..OLD]
             .iter()
             .map(|r| Open::start(&client, r))
             .collect();
         let mut old: Vec<Open> = within("200 old streams", futures::future::join_all(starting))
             .await
             .into_iter()
-            .map(|open| open.expect("an old stream starts on A"))
+            .map(|open| open.expect("an old stream starts"))
             .collect();
-        assert_eq!(open_executions(&api_a), OLD as u64, "A's own count");
-        assert_eq!(open_executions(&api_b), 0);
-        assert_eq!(handle.snapshot().stats(Slot::A).open_streams, OLD as u64);
-        assert_eq!(handle.snapshot().active, Some(Slot::A));
+        let (on_a, on_b) = (open_executions(&api_a), open_executions(&api_b));
+        assert_eq!(on_a + on_b, OLD as u64, "the frontends' own counts");
+        assert_ne!(on_a, 0, "A took a share");
+        assert_ne!(on_b, 0, "B took a share");
+        assert_eq!(proxy_count(admin_addr, "a"), on_a);
+        assert_eq!(proxy_count(admin_addr, "b"), on_b);
 
-        // The swap: hold, make B the active slot, release.
-        let hold = handle
-            .slots()
-            .hold(Duration::from_secs(20))
-            .expect("not holding");
-        let mut held = Vec::new();
-        for request in &new_requests[..HELD] {
-            held.push(tokio::spawn({
-                let (client, request) = (client.clone(), request.clone());
-                async move { Open::start(&client, &request).await }
-            }));
-        }
-        until("the proxy holds the new streams", || {
-            handle.snapshot().held == HELD
-        })
-        .await;
-        assert_eq!(open_executions(&api_b), 0, "nothing reaches B while held");
-        handle.slots().open(Slot::B);
-        handle.slots().release_into(Slot::B).expect("B is open");
-        drop(hold);
-        assert_eq!(handle.snapshot().active, Some(Slot::B));
+        // The drain of A: it lists A as draining with its streams counted.
+        let (code, list) = admin(admin_addr, "POST", &format!("{LIST}/a:drain"));
+        assert_eq!(code, 200, "{list}");
+        assert_eq!(member(&list, "a")["state"], "draining");
+        assert_eq!(member(&list, "a")["open_streams"]["reapi"], on_a);
         assert!(
             !driver.is_finished(),
-            "the flip left the client's connection alone"
+            "the drain left the client's connection alone"
         );
 
-        // The held streams and the streams after the swap are all B's.
+        // The streams after the drain are all B's.
         let mut new = Vec::new();
-        for stream in held {
-            let open = within("a held stream", stream).await.expect("task");
-            new.push(open.expect("a held stream is served by B"));
-        }
-        for request in &new_requests[HELD..] {
+        for request in &requests[OLD..] {
             let open = Open::start(&client, request).await;
             new.push(open.expect("a new stream is served by B"));
         }
-        // And an old action after the swap goes to B, which has not got it: it is refused.
-        let refused = Open::start(&client, &old_requests[0]).await;
-        assert!(
-            refused.is_err(),
-            "a new stream for an old action is not served by A"
-        );
-        assert_eq!(
-            open_executions(&api_b),
-            (HELD + NEW) as u64,
-            "B's own count"
-        );
         assert_eq!(
             open_executions(&api_a),
-            OLD as u64,
+            on_a,
             "A kept its own, and took no more"
         );
-        let snapshot = handle.snapshot();
-        assert_eq!(
-            (
-                snapshot.stats(Slot::A).open_streams,
-                snapshot.stats(Slot::B).open_streams
-            ),
-            (OLD as u64, (HELD + NEW) as u64)
-        );
+        assert_eq!(open_executions(&api_b), on_b + NEW as u64, "B's own count");
 
-        // Every stream is still open and quiet: no GOAWAY, no reset, on either side. A is
-        // not retired under its streams (`can_retire` is the supervisor's read-only probe;
-        // `retire` is its commit, and it would close the slot's connections).
+        // Every stream is still open and quiet: no GOAWAY, no reset, on either side.
         for open in old.iter_mut().chain(new.iter_mut()) {
             assert!(open.quiet().await, "a stream ended or spoke");
         }
-        assert!(!handle.slots().can_retire(Slot::A));
-        // The supervisor's commit with 200 streams open is refused, and refusing latches
-        // nothing: every stream is still open and quiet afterwards, and A still counts them.
-        assert_eq!(
-            handle.slots().retire(Slot::A),
-            Retire::Busy(OLD as u64),
-            "retire of a slot with open streams"
-        );
-        for open in old.iter_mut().chain(new.iter_mut()) {
-            assert!(
-                open.quiet().await,
-                "a refused retire ended or woke a stream"
-            );
-        }
-        assert_eq!(open_executions(&api_a), OLD as u64, "A's count after it");
-        assert_eq!(handle.snapshot().stats(Slot::A).open_streams, OLD as u64);
 
-        // The old streams end (the client cancels them, as Buck2 does) and A sees each one.
+        // The old streams end (the client cancels them, as Buck2 does) and each frontend sees
+        // its own end.
         drop(old);
-        until("A's executions end", || open_executions(&api_a) == 0).await;
-        assert_eq!(
-            open_executions(&api_b),
-            (HELD + NEW) as u64,
-            "B's are untouched"
-        );
-        until("A's last permit drops", || {
-            handle.slots().can_retire(Slot::A)
+        until("the old executions end", || {
+            open_executions(&api_a) == 0 && open_executions(&api_b) == NEW as u64
         })
         .await;
-        assert_eq!(handle.slots().retire(Slot::A), Retire::Closed);
-        assert!(a.stop().is_some_and(|status| status.success()), "A exits 0");
+        until("the proxy's count of A falls to 0", || {
+            proxy_count(admin_addr, "a") == 0
+        })
+        .await;
+        until("the proxy's count of B", || {
+            proxy_count(admin_addr, "b") == NEW as u64
+        })
+        .await;
 
-        // `/readyz` is B's now, and the proxy dropped, refused and retried nothing.
-        until_ready(&client).await;
+        // The proxy dropped, refused and retried nothing.
         let (code, metrics) = proxy_get(&client, "/metrics").await;
         assert_eq!(code, 200);
         for zero in [
             "kbf_proxy_panics_total",
-            "kbf_proxy_hold_rejected_total",
             "kbf_proxy_streams_refused_total",
             "kbf_proxy_upstream_dial_failed_total",
             "kbf_proxy_retries_total",
-            "kbf_proxy_hold_expired_total",
-            "kbf_proxy_hold_abandoned_total",
-            "kbf_proxy_held_streams",
+            "kbf_proxy_unavailable_total",
         ] {
             assert!(
                 metrics.contains(&format!("\n{zero} 0\n")),
@@ -263,11 +240,11 @@ fn the_flip_with_two_hundred_streams_drops_none_and_each_child_serves_its_own() 
         );
         drop(new);
         until("B's executions end", || open_executions(&api_b) == 0).await;
-        assert_eq!(b.stop().and_then(|s| s.code()), Some(0), "B exits 0");
     });
-    assert_eq!(handle.snapshot().holds_abandoned, 0);
     handle.shutdown();
     serving.join().expect("the runner thread").expect("run");
+    assert!(a.stop().is_some_and(|status| status.success()), "A exits 0");
+    assert_eq!(b.stop().and_then(|s| s.code()), Some(0), "B exits 0");
     drop((node_a, node_b));
 }
 

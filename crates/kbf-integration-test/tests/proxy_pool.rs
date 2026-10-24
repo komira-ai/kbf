@@ -138,7 +138,6 @@ fn a_drained_frontend_keeps_its_execute_and_new_ones_go_to_the_other() {
     let admin_addr = admin_socket.local_addr().expect("addr");
     drop(admin_socket);
     let (mut proxy, pki) = proxy_config(&dir, base);
-    proxy.upstream = None;
     proxy.frontend = vec![
         Frontend {
             name: "a".to_owned(),
@@ -152,10 +151,6 @@ fn a_drained_frontend_keeps_its_execute_and_new_ones_go_to_the_other() {
     proxy.admin_listen = Some(admin_addr);
     proxy.check().expect("a valid pool table");
     let (handle, runner) = Proxy::bind(proxy, OwnedFd::from(public)).expect("bind");
-    assert!(
-        handle.startup_hold().is_none(),
-        "a pool starts with no hold"
-    );
     let serving = std::thread::spawn(move || runner.run(NoUpdates));
 
     let client_runtime = tokio::runtime::Builder::new_multi_thread()
