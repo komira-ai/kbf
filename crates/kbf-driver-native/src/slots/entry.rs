@@ -11,9 +11,13 @@
 //! `__as-user` ([`crate::slots::AS_USER_ARG`]) and a system tool. Nothing here runs a
 //! shell, and root applies no flag or ACL change to the entry.
 //!
-//! - [`clear_flags`] (C6): the ACLs of the uid's entries (`find -x ... -user <uid>
-//!   -exec chmod -N`), the user flags and the owner's mode of the entry root and
-//!   everything the uid owns below it ([`CLEAR`]), then the ACLs again.
+//! - [`clear_flags`] (C6): the ACLs of the uid's entries below the four folders (`find
+//!   -x ... -user <uid> -exec chmod -N`), the user flags and the owner's mode of everything
+//!   the uid owns inside them ([`CLEAR`]), then the ACLs again. The entry and its four
+//!   folders keep the flags and ACLs the system set (`sunlnk` is root's to clear, and
+//!   root without Full Disk Access cannot); the check accepts them.
+//! - [`restore`] (C10): the four folders' mode, as the uid ([`RESTORE`]); their flags and
+//!   ACLs stay as the system has them.
 //! - [`empty`] (C7): the entry's `0`, `C`, `T` and `X` emptied and kept, anything else in
 //!   the entry removed ([`EMPTY`]).
 //! - [`left`] (the check): what an uid-side look finds in the entry afterwards
@@ -29,7 +33,7 @@ use std::path::Path;
 
 use kbf_mac_session::sweep;
 
-use super::probe::SKELETON;
+use super::probe::{self, SKELETON};
 
 /// The argument after argv0 that selects this binary's entry mode:
 /// `__entry <mode> <uid> <gid> <dir>`.
@@ -38,10 +42,12 @@ pub const ARG: &str = "__entry";
 pub const CLEAR: &str = "clear";
 /// The mode that empties the entry: `__entry empty <uid> <gid> <dir>`.
 pub const EMPTY: &str = "empty";
+/// The mode that gives the four folders their mode back: `__entry restore <uid> <gid> <dir>`.
+pub const RESTORE: &str = "restore";
 /// The mode that prints what is left in the entry: `__entry look <uid> <gid> <dir>`.
 pub const LOOK: &str = "look";
 
-const USAGE: &str = "usage: __entry clear|empty|look <uid> <gid> <dir>";
+const USAGE: &str = "usage: __entry clear|empty|look|restore <uid> <gid> <dir>";
 
 const FIND: &str = "/usr/bin/find";
 const CHMOD: &str = "/bin/chmod";
@@ -126,14 +132,23 @@ fn join(failed: Vec<String>) -> Result<(), String> {
     }
 }
 
-/// `find`'s arguments that remove the ACL of every entry of the uid at or below
-/// `entry` (never through a link, on one filesystem). A directory is done where `find`
+/// `find`'s arguments that remove the ACL of every entry of the uid below
+/// `entry`, not the entry itself or its four folders (see below) (never through a link, on one filesystem). A directory is done where `find`
 /// meets it, before `find` reads it, so an ACL that denies the listing does not stop the
 /// walk; the other entries are done in batches.
 pub(crate) fn acl_args(entry: &Path, uid: u32) -> Vec<OsString> {
     let words = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
     let mut args = words(&["-x"]);
     args.push(entry.as_os_str().to_owned());
+    // The entry and its four folders keep the ACLs the system gave them; what is in
+    // the folders is cleared.
+    args.extend(words(&["!", "(", "-path"]));
+    args.push(entry.as_os_str().to_owned());
+    for folder in SKELETON {
+        args.extend(words(&["-o", "-path"]));
+        args.push(entry.join(folder).into_os_string());
+    }
+    args.extend(words(&[")"]));
     // One group holds both branches, so that `-user` applies to each.
     args.extend(words(&["-user", &uid.to_string(), "(", "("]));
     args.extend(words(&["-type", "d", "-exec", CHMOD, "-N", "{}", ";", ")"]));
@@ -164,6 +179,60 @@ pub(crate) fn clear_flags(me: &AsUid<'_>, folders: &Path, run: &mut Run<'_>) -> 
         failed.push(why);
     }
     named(folders, failed)
+}
+
+/// C10 for the entry `folders`: the four folders given back their mode as the uid, which
+/// owns them. Nothing else is touched: not the entry, not the flags or ACLs the system
+/// set.
+///
+/// # Errors
+/// The call failed (a folder is not the uid's, or its mode could not be set).
+pub(crate) fn restore(me: &AsUid<'_>, folders: &Path, run: &mut Run<'_>) -> Result<(), String> {
+    named(
+        folders,
+        me.mode(RESTORE, folders, run).err().into_iter().collect(),
+    )
+}
+
+/// [`RESTORE`]: each of [`SKELETON`]'s folders in `dir` that exists is given mode 0700
+/// where its mode differs, and nothing else; one the uid does not own is an error that
+/// names it. Run as the uid. Exit 1 when a folder could not be put right.
+fn restore_folders(
+    dir: &Path,
+    uid: u32,
+    chmod: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+) -> sweep::Swept {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut swept = sweep::Swept::default();
+    for name in SKELETON {
+        let path = dir.join(name);
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => meta,
+            Ok(_) => {
+                swept
+                    .errors
+                    .push(format!("{}: not a directory", path.display()));
+                continue;
+            }
+            // The system makes it again, as the user, when it is next asked for.
+            Err(why) if why.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(why) => {
+                swept.errors.push(format!("{}: {why}", path.display()));
+                continue;
+            }
+        };
+        let (wrong_owner, wrong_mode) = probe::folder_fix((meta.uid(), meta.mode()), (uid, 0o700));
+        if wrong_owner {
+            swept.errors.push(format!(
+                "{}: owned by {}, not the pool user",
+                path.display(),
+                meta.uid()
+            ));
+        } else if wrong_mode && let Err(why) = chmod(&path) {
+            swept.errors.push(format!("{}: {why}", path.display()));
+        }
+    }
+    swept
 }
 
 /// C7 for the entry `folders`: emptied as the uid.
@@ -223,7 +292,7 @@ pub(crate) fn dispatch(
         return Some(2);
     };
     let mode = match mode.to_str() {
-        Some(mode @ (CLEAR | EMPTY | LOOK)) => mode,
+        Some(mode @ (CLEAR | EMPTY | LOOK | RESTORE)) => mode,
         _ => {
             let _ = writeln!(err, "{ARG}: no mode {mode:?}");
             return Some(2);
@@ -235,7 +304,11 @@ pub(crate) fn dispatch(
     }
     let dir = Path::new(dir);
     let swept = match mode {
-        CLEAR => sweep::clear_flags(dir, uid),
+        CLEAR => sweep::clear_flags_within(dir, uid, &SKELETON),
+        RESTORE => restore_folders(dir, uid, &mut |path| {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        }),
         EMPTY => sweep::empty_keeping(dir, uid, &SKELETON),
         _ => return Some(look(dir, out, err)),
     };

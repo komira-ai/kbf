@@ -1069,3 +1069,84 @@ fn an_entry_swapped_in_after_the_judgement_does_not_change_its_targets_mode() {
         }
     }
 }
+
+/// Catches a clear that changes the entry or one of its kept folders themselves (the
+/// system owns their flags and ACLs, and the owner cannot change them), one that does not
+/// go below a kept folder, and one that skips the other entries of the entry.
+#[test]
+fn clear_flags_within_clears_below_the_kept_folders_and_not_the_folders() {
+    if root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = scratch("within");
+    let entry = dir.join("entry");
+    fs::create_dir_all(entry.join("T/sub")).unwrap();
+    fs::create_dir_all(entry.join("junk")).unwrap();
+    fs::write(entry.join("T/f"), "x").unwrap();
+    chmod(&entry.join("T/f"), 0o400);
+    chmod(&entry.join("T/sub"), 0o500);
+    chmod(&entry.join("junk"), 0o500);
+    chmod(&entry.join("T"), 0o500);
+    let swept = clear_flags_within(&entry, me(), &["T"]);
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+    let modes = [
+        mode(&entry.join("T")),
+        mode(&entry.join("T/f")),
+        mode(&entry.join("T/sub")),
+        mode(&entry.join("junk")),
+    ];
+    chmod(&entry.join("T"), 0o700);
+    assert_eq!(swept.errors, Vec::<String>::new());
+    assert_eq!(modes, [0o500, 0o700, 0o700, 0o700]);
+    assert_eq!(
+        clear_flags_within(&dir.join("absent"), me(), &["T"]),
+        Swept::default()
+    );
+}
+
+/// A kept folder that cannot be opened is an error that names it; a kept name that is a
+/// file is cleared like any other entry.
+#[test]
+fn clear_flags_within_names_a_kept_folder_it_cannot_enter() {
+    if root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = scratch("within-closed");
+    let entry = dir.join("entry");
+    fs::create_dir_all(entry.join("T")).unwrap();
+    fs::write(entry.join("C"), "x").unwrap();
+    chmod(&entry.join("C"), 0o400);
+    chmod(&entry.join("T"), 0o000);
+    let swept = clear_flags_within(&entry, me(), &["T", "C"]);
+    chmod(&entry.join("T"), 0o700);
+    assert_eq!(swept.errors.len(), 1, "{:?}", swept.errors);
+    assert!(
+        swept.errors[0].ends_with("entry/T: Permission denied (os error 13)"),
+        "{:?}",
+        swept.errors
+    );
+    assert_eq!(
+        fs::metadata(entry.join("C")).unwrap().permissions().mode() & 0o700,
+        0o700
+    );
+}
+
+/// Catches a skip of Apple's protected cache that also skips what is not a refusal of
+/// the system (any other error, or anything below the top of a base), and a warning
+/// repeated for the same path.
+#[test]
+fn only_the_systems_refusal_of_a_top_level_entry_is_skipped_and_said_once() {
+    let denied = io::Error::from_raw_os_error(Errno::PERM.raw_os_error());
+    let other = io::Error::from_raw_os_error(Errno::IO.raw_os_error());
+    assert!(protected_top_entry(0, &denied));
+    assert!(!protected_top_entry(1, &denied));
+    assert!(!protected_top_entry(0, &other));
+    let mut seen = Vec::new();
+    assert!(first_time(&mut seen, Path::new("/Library/Caches/a")));
+    assert!(!first_time(&mut seen, Path::new("/Library/Caches/a")));
+    assert!(first_time(&mut seen, Path::new("/Library/Caches/b")));
+    warn_once(Path::new("/Library/Caches/a"));
+    warn_once(Path::new("/Library/Caches/a"));
+}

@@ -206,7 +206,7 @@ impl Os for MacSlot<'_> {
             ),
             Step::Shared => complete(&sweep::sweep(&probe::shared_plan(), &user.name, user.uid)),
             Step::Crashes => joined(crash::sweep(&crash_dirs(), &self.crash_scope())),
-            Step::Restore => restore(ready),
+            Step::Restore => restore(ready, &self.as_uid()),
             Step::Look => {
                 for look in 0..2 {
                     if look > 0 {
@@ -358,8 +358,9 @@ pub(super) fn crash_dirs() -> Vec<PathBuf> {
 }
 
 /// C10: the home the user's (made anew where it is gone), mode 0700, no flags; the
-/// entry's root and folders as they were found at the start, with no lock or `hidden`.
-fn restore(ready: &Ready) -> Result<(), String> {
+/// entry's four folders their mode back, as the uid (see [`entry::restore`]). The flags
+/// and ACLs of the entry and its folders are the system's and are never touched.
+fn restore(ready: &Ready, me: &entry::AsUid<'_>) -> Result<(), String> {
     let (uid, gid) = (ready.user.uid, ready.user.gid);
     let mut failed = Vec::new();
     let home = match open_dir(&ready.home) {
@@ -370,41 +371,30 @@ fn restore(ready: &Ready) -> Result<(), String> {
     if let Err(why) = home {
         failed.push(format!("{}: {why}", ready.home.display()));
     }
-    match open_dir(&ready.folders) {
-        Ok(root) => {
-            if let Err(why) = set_flags(&root, probe::kept_flags(ready.entry.flags)) {
-                failed.push(format!("{}: {why}", ready.folders.display()));
-            }
-        }
-        Err(why) => failed.push(format!("{}: {why}", ready.folders.display())),
-    }
-    for (name, folder_gid, flags) in &ready.entry.folders {
-        let path = ready.folders.join(name);
-        let result = match open_dir(&path) {
-            Ok(dir) => own(&dir, (uid, *folder_gid, 0o700), probe::kept_flags(*flags)),
-            // The system makes it again, as the user, when it is next asked for.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        };
-        if let Err(why) = result {
-            failed.push(format!("{}: {why}", path.display()));
-        }
-    }
+    failed.extend(entry::restore(me, &ready.folders, &mut run_child).err());
     joined(failed)
 }
 
-/// Whether the entry's root and folders are as C10 leaves them.
+/// Whether the entry's four folders are as C10 leaves them: the pool user's, mode 0700.
 fn entry_is_restored(ready: &Ready) -> Result<(), String> {
-    let root = rustix::fs::lstat(&ready.folders)
-        .map_err(|e| format!("{}: {e}", ready.folders.display()))?;
-    if probe::unrestored(root.st_flags) {
-        return Err(format!(
-            "{}: flags {:#x}",
-            ready.folders.display(),
-            root.st_flags
-        ));
+    let mut wrong = Vec::new();
+    for name in probe::SKELETON {
+        let path = ready.folders.join(name);
+        // One the system has not made yet is made, as the user, when it is asked for.
+        let Ok(meta) = rustix::fs::lstat(&path) else {
+            continue;
+        };
+        let has = (meta.st_uid, u32::from(meta.st_mode));
+        if probe::folder_fix(has, (ready.user.uid, 0o700)) != (false, false) {
+            wrong.push(format!(
+                "{}: owner {} mode {:o}",
+                path.display(),
+                has.0,
+                has.1 & 0o7777
+            ));
+        }
     }
-    Ok(())
+    joined(wrong)
 }
 
 /// The mounts under the home or the entry, unmounted (`diskutil unmount force`, then

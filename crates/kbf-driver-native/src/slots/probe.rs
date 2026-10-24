@@ -29,34 +29,24 @@ pub(crate) const MAX_SCANS: usize = 100;
 /// second process look.
 pub(crate) const SCAN_PAUSE: Duration = Duration::from_millis(200);
 
-/// The user flags the clean never gives back to an entry root or folder, as bits of
-/// `st_flags`: `uchg` and `uappnd` (a lock would stop the next removal) and `hidden`
-/// (the system sets it and it hides the entry from the listing the check reads).
-/// `nodump` and `opaque` are kept when the system had them.
-pub(crate) const NOT_RESTORED: u32 = 0x2 | 0x4 | 0x8000;
-
-/// The flags an entry root or folder is given back, from the `recorded` ones found when
-/// the slot was resolved: those without [`NOT_RESTORED`].
-pub(crate) fn kept_flags(recorded: u32) -> u32 {
-    recorded & !NOT_RESTORED
-}
-
-/// Whether the `flags` of a restored entry root hold one the restore never leaves
-/// ([`NOT_RESTORED`]). The same set [`kept_flags`] removes, so a root the system gave
-/// `nodump` or `opaque` is not found wrong after every clean.
-pub(crate) fn unrestored(flags: u32) -> bool {
-    flags & NOT_RESTORED != 0
-}
-
-/// What the restore of a directory has to change to give it `want` (uid, gid, mode),
-/// from what it `has`: whether the owner (and group) and whether the mode. Nothing that
-/// is right already is touched, since root without Full Disk Access is refused the
-/// change of the uid's `/var/folders` entry even to the value it holds.
+/// What the restore of the home has to change to give it `want` (uid, gid, mode), from
+/// what it `has`: whether the owner (and group) and whether the mode. Nothing that is
+/// right already is touched.
 pub(crate) fn ownership_to_change(has: (u32, u32, u32), want: (u32, u32, u32)) -> (bool, bool) {
     (
         (has.0, has.1) != (want.0, want.1),
         has.2 & 0o7777 != want.2 & 0o7777,
     )
+}
+
+/// What a restored `/var/folders` folder (the entry's `0`, `C`, `T`, `X`) is given back:
+/// its owner and its permission bits only. The system sets the rest (flags such as
+/// `sunlnk`, ACLs, extended attributes); neither root without Full Disk Access nor the
+/// owner can change them, so they are the baseline and are never touched. From what it
+/// `has` (uid, mode) and `want`s: whether the owner is wrong, and whether the mode
+/// differs (the owner changes that itself).
+pub(crate) fn folder_fix(has: (u32, u32), want: (u32, u32)) -> (bool, bool) {
+    (has.0 != want.0, has.1 & 0o7777 != want.1 & 0o7777)
 }
 
 /// The places the shared sweep covers: launchd's per-uid files, and every entry the uid

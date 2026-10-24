@@ -275,7 +275,7 @@ fn acls_are_removed_only_from_the_uids_entries_and_never_through_a_link() {
     assert_eq!(
         args,
         format!(
-            "-x {FOLDERS} -user 61003 ( ( -type d -exec /bin/chmod -N {{}} ; ) -o ( ! -type l -exec /bin/chmod -N {{}} + ) )"
+            "-x {FOLDERS} ! ( -path {FOLDERS} -o -path {FOLDERS}/0 -o -path {FOLDERS}/C -o -path {FOLDERS}/T -o -path {FOLDERS}/X ) -user 61003 ( ( -type d -exec /bin/chmod -N {{}} ; ) -o ( ! -type l -exec /bin/chmod -N {{}} + ) )"
         )
     );
 }
@@ -500,4 +500,118 @@ fn the_look_mode_fails_when_it_cannot_list_the_entry_or_one_of_its_folders() {
     let (code, out, err) = call(LOOK, &entry);
     assert_eq!((code, out.as_str()), (Some(1), ""));
     assert!(err.contains("entry/T: not a directory"), "{err}");
+}
+
+#[test]
+fn the_restore_is_one_call_as_the_uid_and_names_the_entry_when_it_fails() {
+    let log = Log::default();
+    restore(&me(), Path::new(FOLDERS), &mut runner(&log, &[])).expect("restored");
+    assert_eq!(*log.borrow(), vec![mode_call("restore")]);
+    let why = restore(
+        &me(),
+        Path::new(FOLDERS),
+        &mut runner(&Log::default(), &["restore"]),
+    )
+    .expect_err("fails");
+    assert_eq!(why, format!("{FOLDERS}: restore failed"));
+}
+
+#[test]
+fn the_clear_mode_leaves_the_entry_and_its_four_folders_as_the_system_has_them() {
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let dir = tree("clear-keeps");
+    let entry = entry_with_files(&dir);
+    for folder in ["0", "C", "T", "X"] {
+        fs::set_permissions(entry.join(folder), fs::Permissions::from_mode(0o500)).expect("chmod");
+    }
+    let (code, _, err) = call(CLEAR, &entry);
+    assert_eq!((code, err.as_str()), (Some(0), ""));
+    for folder in ["0", "C", "T", "X"] {
+        let mode = fs::metadata(entry.join(folder))
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o500, "{folder}");
+    }
+    for folder in ["0", "C", "T", "X"] {
+        fs::set_permissions(entry.join(folder), fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+}
+
+fn restore_in(entry: &Path, uid: u32) -> (usize, Vec<String>, Vec<PathBuf>) {
+    let mut changed = Vec::new();
+    let swept = restore_folders(entry, uid, &mut |path| {
+        changed.push(path.to_owned());
+        Ok(())
+    });
+    (changed.len(), swept.errors, changed)
+}
+
+#[test]
+fn the_restore_changes_the_mode_of_a_folder_only_where_it_differs() {
+    let dir = tree("restore");
+    let entry = entry_with_files(&dir);
+    for folder in ["0", "C", "T", "X"] {
+        fs::set_permissions(entry.join(folder), fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    assert_eq!(restore_in(&entry, me_now()).0, 0);
+    fs::set_permissions(entry.join("C"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    let (count, errors, changed) = restore_in(&entry, me_now());
+    assert_eq!((count, errors), (1, Vec::new()));
+    assert_eq!(changed, vec![entry.join("C")]);
+}
+
+#[test]
+fn the_restore_fails_naming_a_folder_that_is_not_the_pool_users() {
+    let dir = tree("restore-owner");
+    let entry = entry_with_files(&dir);
+    // The test is another uid than the one asked for: the folders are not that uid's.
+    let (count, errors, _) = restore_in(&entry, me_now() + 1);
+    assert_eq!(count, 0);
+    assert_eq!(errors.len(), 4, "{errors:?}");
+    assert!(
+        errors[0].starts_with(&*entry.join("0").to_string_lossy()),
+        "{errors:?}"
+    );
+    assert!(errors[0].contains("not the pool user"), "{errors:?}");
+}
+
+#[test]
+fn the_restore_skips_a_missing_folder_and_fails_on_a_file_or_a_refused_change() {
+    let dir = tree("restore-odd");
+    let entry = dir.path().join("entry");
+    fs::create_dir_all(entry.join("T")).expect("T");
+    fs::write(entry.join("C"), "x").expect("file");
+    fs::set_permissions(entry.join("T"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    let mut refuse = |_: &Path| Err(std::io::Error::from_raw_os_error(1));
+    let swept = restore_folders(&entry, me_now(), &mut refuse);
+    assert_eq!(swept.errors.len(), 2, "{:?}", swept.errors);
+    assert!(
+        swept.errors[0].contains("C: not a directory"),
+        "{:?}",
+        swept.errors
+    );
+    assert!(swept.errors[1].contains("T: "), "{:?}", swept.errors);
+    // The entry itself is not a directory: the folders under it cannot be looked at.
+    let file = dir.path().join("file");
+    fs::write(&file, "x").expect("file");
+    let swept = restore_folders(&file, me_now(), &mut refuse);
+    assert_eq!(swept.errors.len(), 4, "{:?}", swept.errors);
+}
+
+#[test]
+fn the_restore_mode_is_selected_and_runs_as_the_uid() {
+    let dir = tree("restore-mode");
+    let entry = entry_with_files(&dir);
+    fs::set_permissions(entry.join("T"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    let (code, _, err) = call(RESTORE, &entry);
+    assert_eq!((code, err.as_str()), (Some(0), ""));
+    let mode = fs::metadata(entry.join("T"))
+        .expect("meta")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o7777, 0o700);
 }

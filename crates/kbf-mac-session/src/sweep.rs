@@ -302,7 +302,16 @@ fn visit(
     (depth, park): (usize, &Park),
     swept: &mut Swept,
 ) -> io::Result<()> {
-    let Some(stat) = examine(dir, name)? else {
+    let stat = match examine(dir, name) {
+        // Apple's own protected caches (data vaults) refuse root without Full Disk
+        // Access even to be examined; they are not the uid's, which cannot make one.
+        Err(why) if protected_top_entry(depth, &why) => {
+            warn_once(here);
+            return Ok(());
+        }
+        other => other?,
+    };
+    let Some(stat) = stat else {
         return Ok(());
     };
     // Another filesystem mounted here is never entered.
@@ -328,6 +337,34 @@ fn visit(
         _ => {}
     }
     Ok(())
+}
+
+/// Whether `why`, from the examination of an entry at `depth` of a swept base, is the
+/// system refusing root a top-level entry (an Apple data vault) and nothing the uid's own:
+/// a refusal ("operation not permitted") of a top-level entry only. Deeper, and any other
+/// error, still fails the sweep.
+fn protected_top_entry(depth: usize, why: &io::Error) -> bool {
+    depth == 0 && why.raw_os_error() == Some(Errno::PERM.raw_os_error())
+}
+
+/// Logs that `path` is skipped, once for each path in the process.
+fn warn_once(path: &Path) {
+    static SEEN: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if first_time(&mut seen, path) {
+        tracing::warn!(path = %path.display(), "not swept: the system refuses root this entry; it is not the pool user's");
+    }
+}
+
+/// Whether `path` is new to `seen`; it is added.
+fn first_time(seen: &mut Vec<PathBuf>, path: &Path) -> bool {
+    if seen.iter().any(|p| p == path) {
+        return false;
+    }
+    seen.push(path.to_owned());
+    true
 }
 
 #[cfg(target_os = "linux")]
@@ -575,6 +612,36 @@ pub fn clear_flags(dir: &Path, uid: u32) -> Swept {
     let result = clear_base(dir, uid, &mut swept);
     note(&mut swept, dir, result);
     swept
+}
+
+/// [`clear_flags`] for a `/var/folders` entry, as the uid: `dir` itself and each directory
+/// of it named in `keep` keep the flags, ACLs and mode the system gave them (it protects
+/// those from the user and from root alike); everything below them, and every other entry
+/// of `dir`, is cleared as [`clear_flags`] does. Each error is recorded against its path.
+#[must_use]
+pub fn clear_flags_within(dir: &Path, uid: u32, keep: &[&str]) -> Swept {
+    let mut swept = Swept::default();
+    let result = clear_within(dir, uid, keep, &mut swept);
+    note(&mut swept, dir, result);
+    swept
+}
+
+fn clear_within(path: &Path, uid: u32, keep: &[&str], swept: &mut Swept) -> io::Result<()> {
+    let Some(dir) = open_base(path)? else {
+        return Ok(());
+    };
+    let dev = rustix::fs::fstat(&dir)?.st_dev;
+    for name in listed(&dir)? {
+        let here = path.join(&name);
+        let result = examine(&dir, &name).and_then(|stat| match stat {
+            Some(stat) if is_kept(&name, keep, &stat, dev) => open_child(&dir, &name, &stat)
+                .and_then(|child| clear_below(&child, &here, uid, dev, 1, swept)),
+            Some(_) => clear_entry(&dir, &name, &here, (uid, dev, 0), swept),
+            None => Ok(()),
+        });
+        note(swept, &here, vanished(result));
+    }
+    Ok(())
 }
 
 /// [`clear_flags`] from the opened `path`.
