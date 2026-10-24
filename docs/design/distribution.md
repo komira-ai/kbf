@@ -53,9 +53,10 @@ verbs (`kbf cluster status|drain|undrain|member` is the model) are clients of it
   endpoints. Every verb and its route is in [operator-verbs.md](operator-verbs.md).
 - **Updates are triggered externally.** A release reaches a host as a package, and something outside kbf
   installs it: `kbf-updater` drains a host, installs the package, restarts its units, waits until it is healthy
-  and undrains it, one host at a time, the members of a pool first. A frontend that is a member of a `kbf-proxy` pool
-  is rolled alone: drained at the proxy, retired (`POST /v1/frontend/retire`), installed, restarted, waited for
-  and put back, with its open `Execute` streams left to finish
+  and undrains it, one host at a time, the members of a pool first. A frontend that is a member of a pool
+  is rolled alone, through its operator API at `127.0.0.1:<base+2>`: its peers are found ready, it drains itself
+  (`POST /v1/frontend/drain`) and exits with its open `Execute` streams left to finish, the package is installed
+  once per host, the unit is restarted, and the member is waited for until it is ready on the target commit
   ([../deploy/kbf-updater.md](../deploy/kbf-updater.md), [frontend-proxy.md](frontend-proxy.md) section 4). The
   frontend serves no update route of its own and the proxy answers `/v1/update/frontend*` with 503. For our own
   farm the trigger is its deployment pipeline. kbf has no update button and does not poll for releases

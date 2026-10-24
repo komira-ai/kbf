@@ -14,7 +14,8 @@ The by-hand way uses this layout: each release in `releases/<commit>/` of the in
 [host releases](host-releases.md) for the layout and what is trusted.
 
 A farm whose hosts run the packages is rolled by [kbf-updater](kbf-updater.md), which also
-drains, retires and restarts the frontends of a kbf-proxy pool one at a time.
+drains, installs and restarts the frontend members of a pool one at a time, through each
+member's own operator API.
 
 ## Upgrade the installer first (seq)
 
