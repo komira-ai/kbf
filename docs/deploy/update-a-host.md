@@ -7,9 +7,9 @@ This page is about a host that is already set up with [`kbf-installer setup`](kb
 |---|---|
 | by hand, with `kbf-deploy host install` and a restart | only a host of the earlier layout, whose units run `releases/current/kbf`; the `kbf` package's units run `/usr/bin/kbf` |
 | `kbf-installer update --frontend`, through the proxy's update API | the host fetches from its `url` source; a refused order is reported late (see below) |
-| pull updates, where the frontend offers and the host fetches | planned |
+| the operating-system package, applied by `kbf-updater` | the way a host normally takes a release (see (c)) |
 
-All three use the same layout: each release in `releases/<commit>/` of the installer tree, the links
+The first two use the same layout: each release in `releases/<commit>/` of the installer tree, the links
 `releases/current` and `releases/previous`, and `state.json`. See
 [host releases](host-releases.md) for the layout and what is trusted.
 
@@ -156,23 +156,13 @@ is in the `refusal` of `status.json`. One thing is missing:
   host is the first proof that its `url` source, its trust files and its fetch user work. Keep the
   by-hand path (a) as the way back.
 
-## (c) Planned: pull updates
+## (c) By package, with `kbf-updater`
 
-Planned: the frontend offers a release and each host pulls it. The design is
-[pull updates](../design/pull-updates.md). Three things are needed:
+A release reaches a host as an operating-system package. `kbf-updater` drains the host, installs the
+package, restarts the units, waits until the host is healthy and undrains it; on a Mac it installs the
+signed tarball instead. The frontend keeps no release store and no desired release: the routes
+`GET /v1/update` and `POST /v1/update/{desired,pause,resume}` and the release routes answer `404`, and
+`--releases-dir` is accepted, ignored and warned about (see [the operator API](../api.md)).
 
-- The frontend runs with `--releases-dir`, the release store, and a state store (`--state-store`).
-  Without them every update endpoint answers `503` naming the missing flag. `setup` has no flag
-  for `releases-dir`; it is a `kbf.toml` key the operator sets (see the configuration reference).
-- A desired release: an operator offers a commit with `POST /v1/update/desired`
-  `{"commit": "<40 hex>"}`, which needs a complete release in the store, and `GET /v1/update` shows
-  it with its generation. `POST /v1/update/pause` and `/resume` hold and release the rollout.
-- A floor on each host. `installer.toml` carries `min_generation`, and a host refuses an order below
-  it. `setup --min-generation N` raises it (it never lowers it).
-
-Planned: a host pulling an update on its own. The host's release fetcher is wired into `run` (a
-fetch from the `url` source works, as under (b)), but nothing yet asks the frontend what the
-desired release is: the installer carries the desired generation in an order and applies no rule to
-it. A host whose release source is `frontend` (the default for the node modes) cannot fetch at all,
-because `installer.toml` has no key for the frontend's address or its pinned CA, and the fetch
-refuses with that reason.
+The floor on each host is unchanged: `installer.toml` carries `min_generation`, a host refuses an
+order below it, and `setup --min-generation N` raises it (it never lowers it).
