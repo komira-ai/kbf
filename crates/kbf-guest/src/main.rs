@@ -11,7 +11,8 @@
 //! `probe-guest` and `probe-ready`, which record what each user can do in a guest
 //! (src/probe.rs), and `mount-share`, the root mount daemon's bounded virtiofs mount
 //! (src/mount.rs), and `probe-diag`, which says what a root process sees of the share
-//! and which write step is refused (src/diag.rs).
+//! and which write step is refused (src/diag.rs), and `shutdown-listen`, the root daemon
+//! that shuts the guest down when the host asks over virtio-socket (src/shutdown.rs).
 
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
@@ -24,6 +25,7 @@ use kbf_guest::mount;
 use kbf_guest::probe;
 use kbf_guest::server::{Agent, Config, HELLO_TIMEOUT};
 use kbf_guest::session;
+use kbf_guest::shutdown;
 use kbf_guest::wire::TOKEN_LEN;
 
 /// The agent inside a VM guest: runs one command per boot for the host.
@@ -68,6 +70,14 @@ enum Cmd {
     /// Print, as JSON on stdout, what the process is and sees of the mounted share and
     /// which file operation on it is refused. Runs as any user, root included.
     ProbeDiag(diag::DiagArgs),
+    /// Listen on a virtio-socket port for the host's `shutdown` command and shut the guest
+    /// down cleanly (`/sbin/shutdown -h now`). Runs as root, as a LaunchDaemon; exits 0
+    /// after the shutdown was started and non-zero when the listener fails.
+    ShutdownListen {
+        /// The guest vsock port to listen on.
+        #[arg(long, default_value_t = shutdown::PORT)]
+        port: u32,
+    },
 }
 
 fn main() -> ExitCode {
@@ -84,6 +94,7 @@ fn run(cli: Cli, root: Result<(), String>) -> ExitCode {
         real_probe_host().as_deref(),
         real_mounter().as_deref(),
         real_diagnoser().as_deref(),
+        real_shutdown_daemon().as_deref(),
     )
 }
 
@@ -94,10 +105,15 @@ fn run_with(
     host: Option<&dyn probe::Host>,
     mounter: Option<&dyn mount::Mounter>,
     diagnoser: Option<&dyn diag::DiagHost>,
+    daemon: Option<&dyn shutdown::Daemon>,
 ) -> ExitCode {
     if !matches!(
         cli.command,
-        Cmd::ProbeGuest(_) | Cmd::ProbeReady(_) | Cmd::MountShare(_) | Cmd::ProbeDiag(_)
+        Cmd::ProbeGuest(_)
+            | Cmd::ProbeReady(_)
+            | Cmd::MountShare(_)
+            | Cmd::ProbeDiag(_)
+            | Cmd::ShutdownListen { .. }
     ) && let Err(e) = root
     {
         eprintln!("{e}");
@@ -128,7 +144,34 @@ fn run_with(
         }),
         Cmd::MountShare(args) => mount_cmd(mounter, &args),
         Cmd::ProbeDiag(args) => diag_cmd(diagnoser, &args),
+        Cmd::ShutdownListen { port } => shutdown_cmd(daemon, port),
     }
+}
+
+/// Runs the shutdown listener with `daemon` (`None`: not a macOS guest, refuse with 2).
+fn shutdown_cmd(daemon: Option<&dyn shutdown::Daemon>, port: u32) -> ExitCode {
+    let Some(daemon) = daemon else {
+        eprintln!("kbf-guest: shutdown-listen runs inside a macOS guest");
+        return ExitCode::from(2);
+    };
+    match daemon.run(port, &mut std::io::stderr()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("kbf-guest: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The daemon `shutdown-listen` runs: the real guest on macOS, nothing elsewhere.
+#[cfg(target_os = "macos")]
+fn real_shutdown_daemon() -> Option<Box<dyn shutdown::Daemon>> {
+    Some(Box::new(kbf_guest::shutdown_host::SystemDaemon))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn real_shutdown_daemon() -> Option<Box<dyn shutdown::Daemon>> {
+    None
 }
 
 /// Diagnoses the share with `diagnoser` (`None`: not a macOS guest, refuse with 2).
@@ -370,7 +413,7 @@ mod tests {
         let r = ["probe-ready", "--out", ready.to_str().expect("p")];
         for args in [&g[..], &r[..]] {
             assert_eq!(
-                run_with(cli(args), refusal(), Some(&h_acking()), None, None),
+                run_with(cli(args), refusal(), Some(&h_acking()), None, None, None),
                 ExitCode::SUCCESS
             );
         }
@@ -395,7 +438,7 @@ mod tests {
             "/w",
         ];
         assert_eq!(
-            run_with(cli(&g), refusal(), Some(&h()), None, None),
+            run_with(cli(&g), refusal(), Some(&h()), None, None, None),
             ExitCode::SUCCESS
         );
         let r = [
@@ -406,7 +449,7 @@ mod tests {
             "p",
         ];
         assert_eq!(
-            run_with(cli(&r), refusal(), Some(&h()), None, None),
+            run_with(cli(&r), refusal(), Some(&h()), None, None, None),
             ExitCode::SUCCESS
         );
         let text = std::fs::read_to_string(&guest).expect("guest result");
@@ -417,7 +460,7 @@ mod tests {
                 .contains("\"session\"")
         );
         assert_eq!(
-            run_with(cli(&r), refusal(), None, None, None),
+            run_with(cli(&r), refusal(), None, None, None, None),
             ExitCode::from(2)
         );
     }
@@ -445,7 +488,8 @@ mod tests {
             "--attempts=2",
             "--delay-ms=0",
         ];
-        let go = |m: Option<&dyn mount::Mounter>| run_with(cli(&args), refusal(), None, m, None);
+        let go =
+            |m: Option<&dyn mount::Mounter>| run_with(cli(&args), refusal(), None, m, None, None);
         assert_eq!(go(Some(&M(true))), ExitCode::SUCCESS);
         assert_eq!(go(Some(&M(false))), ExitCode::FAILURE);
         assert_eq!(go(None), ExitCode::from(2));
@@ -495,8 +539,42 @@ mod tests {
         let share = format!("--share={}", dir.join("none").display());
         let control = format!("--control-dir={}", dir.join("none").display());
         let args = ["probe-diag", share.as_str(), control.as_str()];
-        let go = |d: Option<&dyn diag::DiagHost>| run_with(cli(&args), refusal(), None, None, d);
+        let go =
+            |d: Option<&dyn diag::DiagHost>| run_with(cli(&args), refusal(), None, None, d, None);
         assert_eq!(go(Some(&D)), ExitCode::SUCCESS);
         assert_eq!(go(None), ExitCode::from(2));
+    }
+
+    /// A shutdown daemon that works or fails as told, recording the port it was given.
+    struct Dm(Option<&'static str>, std::cell::Cell<u32>);
+
+    impl shutdown::Daemon for Dm {
+        fn run(&self, port: u32, _: &mut dyn std::io::Write) -> Result<(), String> {
+            self.1.set(port);
+            self.0.map_or(Ok(()), |e| Err(e.to_owned()))
+        }
+    }
+
+    /// Catches `shutdown-listen` refused as root (it is a root daemon: `shutdown` needs
+    /// root), a listener failure that exits 0 (launchd would not restart it and the host
+    /// would never get an ack), the port flag ignored, and a run where there is no guest
+    /// that does not exit 2.
+    #[test]
+    fn shutdown_listen_runs_as_root_on_its_port_and_fails_loud() {
+        let refusal = || Err("kbf-guest refuses to run as root".to_owned());
+        let go = |args: &[&str], d: Option<&dyn shutdown::Daemon>| {
+            run_with(cli(args), refusal(), None, None, None, d)
+        };
+        let ok = Dm(None, std::cell::Cell::new(0));
+        assert_eq!(go(&["shutdown-listen"], Some(&ok)), ExitCode::SUCCESS);
+        assert_eq!(ok.1.get(), 5001);
+        assert_eq!(
+            go(&["shutdown-listen", "--port=6000"], Some(&ok)),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(ok.1.get(), 6000);
+        let bad = Dm(Some("bind failed"), std::cell::Cell::new(0));
+        assert_eq!(go(&["shutdown-listen"], Some(&bad)), ExitCode::FAILURE);
+        assert_eq!(go(&["shutdown-listen"], None), ExitCode::from(2));
     }
 }

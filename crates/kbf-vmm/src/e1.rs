@@ -37,8 +37,17 @@ struct Arm {
     /// Every expected frame that has arrived, with the host time it was first seen at, in
     /// arrival order. The first is the guest marker.
     frames: Vec<(&'static str, u64)>,
-    /// How the VM ended when the host stopped it, and how long that took.
-    stop: Option<(StopKind, u64)>,
+    stop: Option<Stop>,
+}
+
+/// How the host stopped a VM.
+struct Stop {
+    how: StopKind,
+    /// How long it took after the request.
+    ms: u64,
+    /// How the helper's `shutdown` command over vsock went: whether the guest acked, and
+    /// why not (`None`: the helper reported nothing).
+    command: Option<(bool, String)>,
 }
 
 /// Every frame a healthy guest delivers over vsock: the system and login markers, the
@@ -189,8 +198,9 @@ fn observe(ctx: &Ctx<'_>, vms: &mut [Vm], arms: &mut [Arm]) -> Option<String> {
 
 /// Asks every guest to shut down at once, then gives each up to the shutdown timeout, so
 /// that a guest's disk is flushed before the clone is harvested; a guest that does not
-/// obey is force-stopped. The helper's request is `requestStopWithError` (the guest's
-/// power-button request), not the framework's force stop.
+/// obey is force-stopped. The helper first sends the guest a `shutdown` command over vsock
+/// (a macOS guest at the login window ignores the power-button request) and, when no ack
+/// comes, falls back to `requestStopWithError`, not the framework's force stop.
 fn stop_gracefully(ctx: &Ctx<'_>, vms: &mut [Vm], arms: &mut [Arm]) {
     for vm in vms.iter_mut().filter(|vm| vm.ended.is_none()) {
         vm.request_shutdown();
@@ -201,7 +211,11 @@ fn stop_gracefully(ctx: &Ctx<'_>, vms: &mut [Vm], arms: &mut [Arm]) {
         }
         let asked = vm.ms();
         let how = vm.finish_shutdown(&ctx.timing);
-        arm.stop = Some((how, vm.ms().saturating_sub(asked)));
+        arm.stop = Some(Stop {
+            how,
+            ms: vm.ms().saturating_sub(asked),
+            command: vm.shutdown_command(),
+        });
     }
 }
 
@@ -217,7 +231,12 @@ fn arm_json(ctx: &Ctx<'_>, vm: &Vm, arm: &Arm) -> Value {
         "guest_marker_ms": arm.frames.first().map(|(_, ms)| *ms),
         "frames": arm.frames.iter().map(|(n, ms)| json!({"name": n, "ms": ms})).collect::<Vec<_>>(),
         "frames_missing": arm.missing(),
-        "stop": arm.stop.map(|(how, ms)| json!({"how": how.name(), "ms": ms})),
+        "stop": arm.stop.as_ref().map(|stop| json!({
+            "how": stop.how.name(),
+            "ms": stop.ms,
+            "vsock_acked": stop.command.as_ref().map(|(acked, _)| acked),
+            "vsock_detail": stop.command.as_ref().map(|(_, detail)| detail),
+        })),
         "trace": vm.trace_json(),
         "samples": arm.samples.iter().map(Sample::json).collect::<Vec<_>>(),
         "activity": sampler::summarize(&arm.samples),
@@ -613,7 +632,8 @@ mod tests {
         sys.script(Script::booted());
         sys.script(Script::booted().deaf());
         let r = e1(&guest_ctx(&sys, &work));
-        assert_eq!(arm(&r, 0)["stop"]["how"], "guest shut down");
+        assert_eq!(arm(&r, 0)["stop"]["how"], "guest shut down (requestStop)");
+        assert!(arm(&r, 0)["stop"]["vsock_acked"].is_null());
         assert_eq!(
             arm(&r, 1)["stop"]["how"],
             "force-stopped after the guest did not shut down"
@@ -628,6 +648,56 @@ mod tests {
         let r = e1(&guest_ctx(&sys, &work));
         assert_eq!(arm(&r, 0)["stop"]["how"], "helper killed");
         assert!(arm(&r, 1)["stop"].is_null());
+    }
+
+    /// Catches a host that does not use the vsock `shutdown` command, one that does not
+    /// record whether the guest acked it and why not, and a fall back that is skipped: an
+    /// acking guest ends "guest shut down (vsock)"; a guest the command cannot reach is
+    /// shut down by the stop request, or force-stopped when that is ignored too (the
+    /// login-window case); an acking guest that then does not stop is force-stopped and
+    /// the report still says it acked.
+    #[test]
+    fn the_vsock_shutdown_is_recorded_and_no_ack_falls_back_to_the_stop_request_then_force() {
+        let work = work_with_base("e1-shutdown-vsock");
+        let sys = FakeSystem::new();
+        sys.script(Script::booted().acking_shutdown());
+        sys.script(
+            Script::booted()
+                .unreachable_by_vsock("connect: errno 61")
+                .deaf(),
+        );
+        let r = e1(&guest_ctx(&sys, &work));
+        let (a, b) = (arm(&r, 0)["stop"].clone(), arm(&r, 1)["stop"].clone());
+        assert_eq!(a["how"], "guest shut down (vsock)");
+        assert_eq!(a["vsock_acked"], true);
+        assert_eq!(a["vsock_detail"], "acked");
+        assert_eq!(b["how"], "force-stopped after the guest did not shut down");
+        assert_eq!(b["vsock_acked"], false);
+        assert_eq!(b["vsock_detail"], "connect: errno 61");
+        let trace = arm(&r, 1)["trace"]["events"].to_string();
+        assert!(trace.contains("shutdown-command"), "{trace}");
+
+        let work = work_with_base("e1-shutdown-fallback");
+        let sys = FakeSystem::new();
+        sys.script(Script::booted().unreachable_by_vsock("no ack in 5 s"));
+        sys.script(Script::booted().acking_shutdown().deaf());
+        let r = e1(&guest_ctx(&sys, &work));
+        assert_eq!(arm(&r, 0)["stop"]["how"], "guest shut down (requestStop)");
+        assert_eq!(arm(&r, 0)["stop"]["vsock_acked"], false);
+        assert_eq!(
+            arm(&r, 1)["stop"]["how"],
+            "force-stopped after the guest acked the vsock shutdown and did not stop"
+        );
+        assert_eq!(arm(&r, 1)["stop"]["vsock_acked"], true);
+
+        let work = work_with_base("e1-shutdown-vsock-kill");
+        let sys = FakeSystem::new();
+        let mut stuck = Script::booted().acking_shutdown().deaf();
+        stuck.exits_on_stop = false;
+        sys.script(stuck);
+        sys.script(Script::booted().then(Poll::Event(Event::Stopped { ms: 7 })));
+        let r = e1(&guest_ctx(&sys, &work));
+        assert_eq!(arm(&r, 0)["stop"]["how"], "helper killed");
     }
 
     /// Catches an arm that has already written its marker being watched (and its helper

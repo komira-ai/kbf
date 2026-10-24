@@ -62,8 +62,14 @@ impl Timing {
 /// How a VM ended when the host stopped it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopKind {
-    /// The guest shut itself down on request: its disk is flushed.
+    /// The guest acked the host's `shutdown` command over vsock and shut itself down: its
+    /// disk is flushed.
+    GuestShutdownVsock,
+    /// No ack came; the guest shut down on the framework's stop request (the power-button
+    /// request, which a macOS guest at the login window ignores): its disk is flushed.
     GuestShutdown,
+    /// The guest acked the command but did not stop in time and the VM was force-stopped.
+    ForceStoppedAfterAck,
     /// The guest did not shut down in time and the VM was force-stopped.
     ForceStopped,
     /// The helper did not exit and was killed.
@@ -74,7 +80,11 @@ impl StopKind {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Self::GuestShutdown => "guest shut down",
+            Self::GuestShutdownVsock => "guest shut down (vsock)",
+            Self::GuestShutdown => "guest shut down (requestStop)",
+            Self::ForceStoppedAfterAck => {
+                "force-stopped after the guest acked the vsock shutdown and did not stop"
+            }
             Self::ForceStopped => "force-stopped after the guest did not shut down",
             Self::Killed => "helper killed",
         }
@@ -305,17 +315,44 @@ impl Vm {
 
     /// Waits up to `t.shutdown_timeout` for the helper to exit because the guest shut
     /// down, then falls back to [`stop`](Self::stop) (a force stop, then SIGKILL). How
-    /// the VM ended is the answer; the guest's disk is flushed only after a shutdown.
+    /// the VM ended is the answer, and whether the guest acked the vsock command (the
+    /// helper's `shutdown-command` event) is part of it; the guest's disk is flushed only
+    /// after a shutdown.
     pub fn finish_shutdown(&mut self, t: &Timing) -> StopKind {
-        if self.proc.wait_gone(t.shutdown_timeout) {
+        let gone = self.proc.wait_gone(t.shutdown_timeout);
+        self.drain_events();
+        let acked = self.shutdown_command().is_some_and(|(acked, _)| acked);
+        if gone {
             self.gone = true;
-            return StopKind::GuestShutdown;
+            return if acked {
+                StopKind::GuestShutdownVsock
+            } else {
+                StopKind::GuestShutdown
+            };
         }
-        if self.stop(t) {
-            StopKind::ForceStopped
-        } else {
-            StopKind::Killed
+        match (self.stop(t), acked) {
+            (true, true) => StopKind::ForceStoppedAfterAck,
+            (true, false) => StopKind::ForceStopped,
+            (false, _) => StopKind::Killed,
         }
+    }
+
+    /// Keeps the events the helper has already printed, without waiting for more.
+    fn drain_events(&mut self) {
+        while let Poll::Event(e) = self.proc.poll(Duration::ZERO) {
+            self.events.push(e);
+            self.event_ms.push(self.ms());
+        }
+    }
+
+    /// How the helper's `shutdown` command to the guest went, once it has reported:
+    /// whether the guest acked, and the reason when it did not.
+    #[must_use]
+    pub fn shutdown_command(&self) -> Option<(bool, String)> {
+        self.events.iter().find_map(|e| match e {
+            Event::ShutdownCommand { acked, detail, .. } => Some((*acked, detail.clone())),
+            _ => None,
+        })
     }
 
     /// SIGKILL, and wait for the process to go.

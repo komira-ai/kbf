@@ -33,6 +33,9 @@ pub struct Script {
     pub exits_on_stop: bool,
     /// Whether the guest obeys a shutdown request (the helper then exits by itself).
     pub obeys_shutdown: bool,
+    /// What the helper reports about its vsock `shutdown` command when asked to shut the
+    /// guest down: whether the guest acked, and why not. `None`: nothing is reported.
+    pub shutdown_command: Option<(bool, String)>,
     /// What the helper's log tail says.
     pub log: Option<String>,
 }
@@ -47,6 +50,7 @@ impl Script {
             late_files: Vec::new(),
             exits_on_stop: true,
             obeys_shutdown: true,
+            shutdown_command: None,
             log: None,
         }
     }
@@ -69,6 +73,7 @@ impl Script {
             late_files: Vec::new(),
             exits_on_stop: true,
             obeys_shutdown: true,
+            shutdown_command: None,
             log: None,
         }
     }
@@ -89,6 +94,20 @@ impl Script {
     pub fn delivering_after(mut self, polls: u32, name: &str, body: &str) -> Self {
         self.late_files
             .push((polls, name.to_owned(), body.to_owned()));
+        self
+    }
+
+    /// A guest whose daemon acks the vsock `shutdown` command (and then, unless it is
+    /// also [`deaf`](Self::deaf), shuts down).
+    pub fn acking_shutdown(mut self) -> Self {
+        self.shutdown_command = Some((true, "acked".to_owned()));
+        self
+    }
+
+    /// A guest whose daemon does not answer the vsock command (`why` is the helper's
+    /// reason); the helper falls back to the stop request.
+    pub fn unreachable_by_vsock(mut self, why: &str) -> Self {
+        self.shutdown_command = Some((false, why.to_owned()));
         self
     }
 
@@ -122,6 +141,7 @@ pub struct FakeProc {
     shutdown_asked: bool,
     exits_on_stop: bool,
     obeys_shutdown: bool,
+    shutdown_command: Option<(bool, String)>,
     log: Option<String>,
 }
 
@@ -158,6 +178,13 @@ impl VmProcess for FakeProc {
     }
     fn request_shutdown(&mut self) {
         self.shutdown_asked = true;
+        if let Some((acked, detail)) = self.shutdown_command.take() {
+            self.events.push_back(Poll::Event(Event::ShutdownCommand {
+                acked,
+                detail,
+                ms: 1,
+            }));
+        }
     }
     fn request_stop(&mut self) {
         self.stop_asked = true;
@@ -323,6 +350,7 @@ impl System for FakeSystem {
             shutdown_asked: false,
             exits_on_stop: script.exits_on_stop,
             obeys_shutdown: script.obeys_shutdown,
+            shutdown_command: script.shutdown_command,
             log: script.log,
         }))
     }
