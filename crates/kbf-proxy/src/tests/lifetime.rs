@@ -10,7 +10,9 @@ use h2::Reason;
 use http::HeaderMap;
 use tokio::time::Instant;
 
-use super::kit::{CAPS, EXECUTE, OPERATOR, WRITE, finish, grpc_ok, read_all, script, tagged, until};
+use super::kit::{
+    CAPS, EXECUTE, OPERATOR, WRITE, finish, grpc_ok, read_all, script, tagged, until,
+};
 use super::pool_kit::Rig;
 use crate::pool::member_addr;
 use crate::route::Target;
