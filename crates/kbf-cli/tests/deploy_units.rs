@@ -126,7 +126,7 @@ fn paths(p: [PathBuf; 3]) -> [String; 3] {
 /// as other settings than the ones written. Each mode's unit and its setup file are read
 /// by kbf's own parser: the frontend and the all-in-one resolve to their flags (listeners,
 /// certificates toward storage, token file and the Postgres state store as the file
-/// spells them, no handover flag, which a Postgres store refuses), and the three modes
+/// spells them, no flag of the removed handover), and the three modes
 /// that enroll resolve to a start of the mode the unit names, on the file.
 #[test]
 fn each_packaged_mode_unit_starts_its_own_mode_on_the_kbf_toml_setup_writes() {
@@ -169,10 +169,10 @@ fn each_packaged_mode_unit_starts_its_own_mode_on_the_kbf_toml_setup_writes() {
                     Some(Path::new("/etc/kbf/api-token"))
                 );
                 assert_eq!(flags.server.state_store, Some(setup_state_store()));
-                // `kbf frontend` refuses a Postgres store with a control socket.
+                // The file writes no flag of the removed handover and admin port.
                 assert!(
-                    flags.handover.is_none(),
-                    "the postgres file gives a handover"
+                    flags.retired.warnings().is_empty(),
+                    "the file gives a retired flag"
                 );
             }
             Invocation::AllInOne(flags) => {
@@ -392,9 +392,13 @@ fn each_rows_certificate_names_its_role_as_storage_reads_it() {
         assert_eq!(role.name(), row.role(), "{row:?}");
         roles.push(role);
     }
-    // Every role storage knows is some row's.
+    // Every role storage knows is some row's, a host's updater excepted: it is enrolled with a
+    // token (`kbf-updater enroll`), not deployed by a unit of this table.
     for role in PeerRole::ALL {
-        assert!(roles.contains(&role), "{role:?} is no row's");
+        assert!(
+            roles.contains(&role) || role == PeerRole::Updater,
+            "{role:?} is no row's"
+        );
     }
 }
 

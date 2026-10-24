@@ -26,8 +26,8 @@ use crate::ports::{FrontendControl, PortError, RetireStatus};
 const RETIRE: &str = "/v1/frontend/retire";
 
 /// How long the `POST` of the retire may take to be answered. The frontend answers it once the
-/// retire has ended, which is up to ten seconds of quiesce and the same again for the requeues
-/// (more with `--handover-quiesce-secs`), longer than the client's bound for any other call.
+/// retire has ended, which is up to ten seconds of quiesce and the same again for the requeues,
+/// longer than the client's bound for any other call.
 const RETIRE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Deserialize)]

@@ -27,7 +27,8 @@ server_cert_file = "/etc/kbf/tls/server.pem"
 server_key_file = "/etc/kbf/tls/server.key"
 client_ca_file = "/etc/kbf/tls/ca.pem"
 hold_max_s = 15
-[proxy.upstream]
+[[proxy.frontend]]
+name = "a"
 base_port = 18000
 "#;
 

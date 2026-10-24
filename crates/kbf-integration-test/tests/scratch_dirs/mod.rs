@@ -28,11 +28,6 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         "the image store every cell shares, kept between runs on purpose (subordinate-id owned, read-only images)",
     ),
     (
-        "crates/kbf-harness/src/farm.rs",
-        1,
-        "product code: the name of the farm's control socket, not a directory",
-    ),
-    (
         "crates/kbf-harness/src/lib.rs",
         1,
         "one root whose per-run directories the next run sweeps (`sweep_dead`, tested)",

@@ -62,7 +62,7 @@ pub(crate) const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 pub(crate) struct StreamPanicked;
 
 /// Stops a task when its handle drops. A plain `JoinHandle` detaches instead, and a client
-/// that reset its stream would leave a held ticket and a permit behind.
+/// that reset its stream would leave a permit behind.
 struct AbortOnDrop<T>(JoinHandle<T>);
 
 impl<T> Drop for AbortOnDrop<T> {
@@ -107,7 +107,7 @@ impl<U: UpdateHandler + 'static> Service<U> {
         peer: &Peer,
     ) -> Response<ProxyBody> {
         // HTTP/1.1 is checked, and made to look like HTTP/2, before anything reads the request.
-        let request = if peer.h1 {
+        let mut request = if peer.h1 {
             match crate::h1::admit(request) {
                 Ok(request) => request,
                 Err(answer) => return *answer,
@@ -125,14 +125,13 @@ impl<U: UpdateHandler + 'static> Service<U> {
         if route == Route::Ui && !ui_method_allowed(request.method()) {
             return method_not_allowed();
         }
-        // Who may call it, before the call is counted or held or forwarded.
-        let mut request = request;
-        if let Err(refused) = admit(&self.core, route, &mut request, peer).await {
+        // Who may call it, before the call is counted or forwarded.
+        if let Err(refused) = admit(&self.core, route, &mut request, peer) {
             return *refused;
         }
-        // Counted from accept: a bypass stream is one for its whole life, a backend stream
-        // until its permit exists.
-        let pending = self.core.slots.begin_stream();
+        // Counted from accept: a stream the proxy answers itself is one for its whole life, a
+        // backend stream until its place on a member exists.
+        let pending = self.core.begin_stream();
         match route {
             Route::Child(target) => {
                 let core = Arc::clone(&self.core);
@@ -147,28 +146,14 @@ impl<U: UpdateHandler + 'static> Service<U> {
             }
             Route::Update => self.update(request).await,
             Route::Health => text(StatusCode::OK, "ok"),
-            // Slot mode: the one writer is the proxy's own poll of the active child. Pool mode:
-            // the polls of the members (`pool_probe`), each of which writes its own member.
+            // The writers are the polls of the members (`pool_probe`), each of which writes its
+            // own member.
             Route::Ready if self.core.is_ready() => text(StatusCode::OK, "ok"),
             Route::Ready => text(StatusCode::SERVICE_UNAVAILABLE, "not ready"),
             Route::Metrics => {
-                let child = crate::child_metrics::fetch(
-                    &self.core,
-                    request.headers().get(header::AUTHORIZATION).cloned(),
-                )
-                .await;
-                let mut body = self
-                    .core
-                    .metrics
-                    .render(&self.core.slots, &self.core.queue)
-                    .into_bytes();
-                // Pool mode: a series for each member, in place of the one child's.
-                if let Some(members) = &self.core.upstreams {
-                    body.extend_from_slice(members.render().as_bytes());
-                }
-                if let Some(child) = child {
-                    body.extend_from_slice(child.as_bytes());
-                }
+                // The proxy's own series, then a series for each member.
+                let mut body = self.core.metrics.render().into_bytes();
+                body.extend_from_slice(self.core.upstreams.render().as_bytes());
                 let mut response = text(StatusCode::OK, body);
                 response.headers_mut().insert(
                     header::CONTENT_TYPE,
@@ -210,11 +195,10 @@ impl<U: UpdateHandler + 'static> Service<U> {
     }
 }
 
-/// Decides whether the caller of `request` may make it ([`crate::security::Security`]), and
-/// for a CI job admitted by OIDC puts the operator token where the OIDC token was when the call
-/// goes to a child. `Err` is the refusal to answer with. Not generic, so that every
-/// instantiation of the service shares one copy.
-async fn admit(
+/// Decides whether the caller of `request` may make it ([`crate::security::Security`]). `Err`
+/// is the refusal to answer with. Not generic, so that every instantiation of the service
+/// shares one copy.
+fn admit(
     core: &Core,
     route: Route,
     request: &mut Request<Incoming>,
@@ -223,49 +207,45 @@ async fn admit(
     let Some(class) = auth_class(route) else {
         return Ok(());
     };
-    let security = &core.security;
     let call = (request.method(), request.uri());
-    let verdict = security
-        .authorize_call(
-            class,
-            call,
-            request.headers(),
-            peer.identity.as_ref(),
-            peer.ip,
-            now(),
-        )
-        .await;
-    let who = match verdict {
+    let verdict = core.security.authorize_call(
+        class,
+        call,
+        request.headers(),
+        peer.identity.as_ref(),
+        peer.ip,
+        now(),
+    );
+    match verdict {
         Ok(Admitted::Credential) => return Ok(()),
-        Ok(Admitted::Ci(who)) => who,
+        Ok(Admitted::SelfNode(node)) => {
+            tracing::info!(%node, method = %request.method(), path = request.uri().path(),
+                "host updater: admitted for its own node");
+        }
         Err(refusal) => {
             Metrics::inc(&core.metrics.auth_refused);
             return Err(Box::new(refused(route.grpc(), refusal)));
         }
-    };
-    tracing::info!(jti = %who.jti, workflow = %who.job_workflow_ref,
-        git_ref = ?who.git_ref, sha = ?who.sha, path = request.uri().path(),
-        "remote ci: admitted");
-    // A call for the child carries the operator token from here on: the child's gate takes no
-    // other credential, and the OIDC token goes no further than this proxy. The update API is
-    // the proxy's own.
-    if route != Route::Update {
-        let operator = security
-            .tokens
-            .operator
-            .as_ref()
-            .and_then(crate::auth::Token::bearer_header);
-        let Some(operator) = operator else {
-            Metrics::inc(&core.metrics.auth_refused);
-            return Err(Box::new(refused(
-                route.grpc(),
-                AuthRefusal::PermissionDenied,
-            )));
-        };
-        request
-            .headers_mut()
-            .insert(header::AUTHORIZATION, operator);
     }
+    // A host updater's call for its node carries the operator token from here on: the child's
+    // gate takes no other credential, and whatever the host sent goes no further than this
+    // proxy.
+    let operator = core
+        .security
+        .tokens
+        .operator
+        .as_ref()
+        .and_then(crate::auth::Token::bearer_header);
+    let Some(operator) = operator else {
+        Metrics::inc(&core.metrics.auth_refused);
+        return Err(Box::new(refused(
+            route.grpc(),
+            AuthRefusal::PermissionDenied,
+        )));
+    };
+    request
+        .headers_mut()
+        .insert(header::AUTHORIZATION, operator);
     Ok(())
 }
 

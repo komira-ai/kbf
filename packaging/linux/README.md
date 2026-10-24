@@ -59,23 +59,23 @@ pkg-config` writes (for both packages): this directory holds the inputs, and
 
 ### Which frontend unit
 
-A frontend host enables exactly one of two units; they bind the same ports.
+A frontend host runs `kbf-frontend.service`, and may put `kbf-proxy` in front of the frontends.
 
-- `kbf-frontend.service`: a host **without** the frontend proxy. One process, `kbf
+- `kbf-frontend.service`: a frontend. One process, `kbf
   --mode=frontend --config /etc/kbf/kbf.toml`, run from `/usr/bin/kbf` (no slots, no
   `--instance`, no `--handover-socket`); listeners, state store and certificates are
   `kbf.toml`'s. An update is a restart after the `kbf` package is upgraded.
-- `kbf-proxy` (the unprivileged proxy that starts the frontend as its child, in the
-  `kbf-installer` package; its unit is not changed by the package split and runs its children
-  from the installer's release tree as before): a host **with** the proxy does not enable a
-  frontend unit.
+- `kbf-proxy` (the unprivileged proxy in the `kbf-installer` package: the public port and the
+  load balancer over the frontends of its pool, which run on their own; it starts none of
+  them).
 
 `pkg-config` refuses anything else in the unit directory (a unit named none of `kbf-*.service`,
 `kbf-*.socket` and `kbf.slice`, a fourth trust file, no unit of the `kbf-installer` package).
 
 The socket-handover template (`kbf-frontend@.service`, instances `a` and `b`) is no longer
-packaged: the proxy swaps frontend children instead, and a frontend with a Postgres store
-refuses a control socket.
+packaged: `kbf` serves no control socket
+(`--instance`, `--handover-socket` and the other flags of the removed handover are accepted,
+ignored and logged as retired).
 
 Dependencies: the `kbf-installer` deb `crun, uidmap, systemd, ca-certificates`; its rpm the same
 with Fedora's name for `uidmap`, `shadow-utils`. Never Podman, never Envoy (a test pins it): Envoy

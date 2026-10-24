@@ -49,8 +49,7 @@ futures = "0.3.34"
 # through hyper and tonic.
 h2 = "0.4.20"
 hex = "0.4.3"
-# The status line and headers of an HTTPS answer (kbf-deploy: `mdm fetch`, `mdm verify`)
-# and of the installer's loopback calls to a child (kbf-installer: `proxy::child_http`).
+# The status line and headers of an HTTPS answer (kbf-deploy: `mdm fetch`, `mdm verify`).
 # Already in the tree through hyper.
 httparse = "1.10.1"
 # Header maps of the front-door proxy (kbf-proxy); already in the tree through hyper.
@@ -73,9 +72,6 @@ postgres = "0.19.10"
 # takes plain TCP only). Both are already in the tree through axum and tonic.
 hyper = { version = "1.12.0", default-features = false }
 hyper-util = { version = "0.1.21", default-features = false }
-# The model checker behind kbf-proxy's permit and hold-gate models (`--cfg kbf_loom`,
-# `cargo xtask proxy-loom`). A dev-dependency only, and only under that cfg.
-loom = "0.7.2"
 md-5 = "0.11.0"
 # macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
 objc2 = "0.6.5"
@@ -249,6 +245,7 @@ kbf-types = { path = "crates/kbf-types" }
 kbf-ui = { path = "crates/kbf-ui" }
 kbf-unitfile = { path = "crates/kbf-unitfile" }
 kbf-update = { path = "crates/kbf-update" }
+kbf-updater = { path = "crates/kbf-updater" }
 # The CI verbs (`cargo xtask`); kbf-integration-test reads the interpreter budget with its parser.
 xtask = { path = "crates/xtask" }
 
@@ -257,10 +254,8 @@ xtask = { path = "crates/xtask" }
 # its `lib.rs` (an in-source attribute overrides this table), and the layering test in
 # `kbf-integration-test` checks that the deny is present.
 [workspace.lints.rust]
-# `kbf_loom` swaps kbf-proxy's atomics for loom's (`cargo xtask proxy-loom`). Not `loom`:
-# tokio reads `cfg(loom)` too and then needs a loom dependency of its own.
 # `coverage` is set by cargo-llvm-cov (crates/kbf-all-in-one-test and crates/kbf-daemon-test compile their tests out under it).
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kbf_loom)", "cfg(coverage)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
 
 [workspace.lints.clippy]
 disallowed_methods = "allow"

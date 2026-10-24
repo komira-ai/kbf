@@ -1,4 +1,4 @@
-//! Which child port, auth class, hold bypass and idle timeout a request path has.
+//! Which member port, auth class and idle timeout a request path has.
 //!
 //! The table is closed: a path that matches no prefix is [`Route::Unknown`] and is answered
 //! by the proxy, never forwarded. A child therefore never sees a path the proxy did not
@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-/// A listener of a child frontend.
+/// A listener of a member frontend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     /// REAPI and ByteStream.
@@ -22,7 +22,7 @@ pub enum Target {
 }
 
 impl Target {
-    /// The offset of this listener's port from the slot's base port.
+    /// The offset of this listener's port from the member's base port.
     #[must_use]
     pub const fn offset(self) -> u16 {
         match self {
@@ -43,10 +43,10 @@ impl Target {
 /// What the proxy does with a path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
-    /// Forward to the active child's listener.
+    /// Forward to a member's listener.
     Child(Target),
-    /// The read-only web UI: `/ui` and `/ui/...`, forwarded to the active child's operator
-    /// listener ([`Target::Operator`]). Open: [`AuthClass::Ui`] asks for no credential.
+    /// The read-only web UI: `/ui` and `/ui/...`, forwarded to a member's operator listener
+    /// ([`Target::Operator`]). Open: [`AuthClass::Ui`] asks for no credential.
     Ui,
     /// Served by the proxy: `/v1/update/frontend*`.
     Update,
@@ -54,7 +54,7 @@ pub enum Route {
     Health,
     /// `/readyz`.
     Ready,
-    /// `/metrics`: the proxy's own series, then the active child's operator `/metrics` appended.
+    /// `/metrics`: the proxy's own series, then those of each member.
     Metrics,
     /// Not in the table: the proxy answers 404 (HTTP) or `UNIMPLEMENTED` (gRPC).
     Unknown,
@@ -218,15 +218,43 @@ pub const fn auth_class(route: Route) -> Option<AuthClass> {
     }
 }
 
-/// Whether the hold gate lets the route through while it holds. Only a stream going to a
-/// backend is held; everything the proxy answers itself bypasses: the update API (so `abort`
-/// cannot deadlock), the probes, the metrics, and a path outside the table (answered 404 or
-/// `UNIMPLEMENTED` at once, never forwarded). An operator call (`/v1/*` but the update API) is
-/// held like any backend stream: it waits in the bounded hold queue during a swap hold and is
-/// answered 503 at the bound.
+/// The node a host's updater may act on by this call, if the call is one of the three the
+/// proxy lets an updater certificate make for its own node (`docs/design/updates.md`):
+///
+/// - `POST /v1/nodes/{id}:drain`
+/// - `POST /v1/nodes/{id}:uncordon`
+/// - `GET /v1/nodes/{id}`
+///
+/// The shapes are exact. The id is a node id as the farm spells it (1 to 63 of `a-z`, `0-9`
+/// and `-`, not starting or ending with `-`), so a `.`, a `/`, a `%` or any other byte makes
+/// the call none of the three: nothing is percent-decoded or normalized, and what the proxy
+/// compares with the certificate is what the child will read. A query string makes it none of
+/// them, as does any other verb (`:cordon` included) or method.
 #[must_use]
-pub const fn bypasses_hold(route: Route) -> bool {
-    !matches!(route, Route::Child(_) | Route::Ui)
+pub fn self_node_of<'a>(method: &http::Method, uri: &'a http::Uri) -> Option<&'a str> {
+    if uri.query().is_some() {
+        return None;
+    }
+    let rest = uri.path().strip_prefix("/v1/nodes/")?;
+    let (id, verb) = match rest.split_once(':') {
+        Some((id, verb)) => (id, Some(verb)),
+        None => (rest, None),
+    };
+    let shape = matches!(
+        (method, verb),
+        (&http::Method::GET, None) | (&http::Method::POST, Some("drain" | "uncordon"))
+    );
+    (shape && is_node_label(id)).then_some(id)
+}
+
+/// Whether `id` is a node id: a lower-case DNS label.
+fn is_node_label(id: &str) -> bool {
+    (1..=63).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !id.starts_with('-')
+        && !id.ends_with('-')
 }
 
 /// The idle timeout of `path`. Execute and WaitExecution are matched by their full method
@@ -237,13 +265,6 @@ pub fn idle_of(path: &str) -> Idle {
         "/build.bazel.remote.execution.v2.Execution/Execute" | WAIT_EXECUTION => Idle::Never,
         _ => Idle::After(IDLE_DEFAULT),
     }
-}
-
-/// Whether `path` is `WaitExecution`: the one call whose request names the operation it
-/// waits on, and so the child that holds it (design note, section 3, "Routing").
-#[must_use]
-pub fn is_wait_execution(path: &str) -> bool {
-    bare(path) == WAIT_EXECUTION
 }
 
 /// Whether `path` is a ByteStream call, which is never retried.
@@ -324,7 +345,6 @@ mod tests {
         assert_eq!(cold, Route::Child(Target::Worker));
         assert_eq!(auth_class(cold), Some(AuthClass::Worker));
         assert_eq!(route_of("/kbf.enroll.v1.Other/X"), Route::Unknown);
-        assert!(!bypasses_hold(enroll));
     }
 
     #[test]
@@ -356,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_classes_and_hold_bypass() {
+    fn auth_classes() {
         assert_eq!(
             auth_class(Route::Child(Target::Reapi)),
             Some(AuthClass::Reapi)
@@ -370,19 +390,6 @@ mod tests {
             Some(AuthClass::Operator)
         );
         assert_eq!(auth_class(Route::Update), Some(AuthClass::Update));
-        for (path, bypass) in [
-            ("/v1/update/frontend/abort", true),
-            ("/healthz", true),
-            ("/readyz", true),
-            ("/metrics", true),
-            ("/not/in/the/table", true),
-            ("/v1/update/frontendx", false),
-            ("/v1/nodes", false),
-            ("/kbf.worker.v1.Worker/Session", false),
-            ("/google.bytestream.ByteStream/Read", false),
-        ] {
-            assert_eq!(bypasses_hold(route_of(path)), bypass, "{path}");
-        }
         assert_eq!(auth_class(Route::Health), Some(AuthClass::Probe));
         assert_eq!(auth_class(Route::Ready), Some(AuthClass::Probe));
         assert_eq!(auth_class(Route::Metrics), Some(AuthClass::Operator));
@@ -392,8 +399,7 @@ mod tests {
     /// is not, and nothing under `/v1` is.
     ///
     /// Kills: a prefix match that takes `/uix` or `/v1/ui` for the UI; the UI given the
-    /// operator class (or an operator route the UI class); the UI answered by the proxy or
-    /// let past the hold gate.
+    /// operator class (or an operator route the UI class); the UI answered by the proxy.
     #[test]
     fn the_ui_is_its_own_route_and_class() {
         for p in [
@@ -406,10 +412,6 @@ mod tests {
         ] {
             assert_eq!(route_of(p), Route::Ui, "{p}");
             assert_eq!(auth_class(route_of(p)), Some(AuthClass::Ui), "{p}");
-            assert!(
-                !bypasses_hold(route_of(p)),
-                "{p}: the UI is forwarded, so it is held"
-            );
         }
         for p in [
             "/uix",
@@ -509,21 +511,69 @@ mod tests {
         assert!(is_bytestream("/google.bytestream.ByteStream/Write"));
         assert!(!is_bytestream(&format!("{exec}Execute")));
     }
+    fn node_call(method: &str, uri: &str) -> Option<String> {
+        let method: http::Method = method.parse().expect("a method");
+        let uri: http::Uri = uri.parse().expect("a uri");
+        self_node_of(&method, &uri).map(str::to_owned)
+    }
 
-    /// Only the full `WaitExecution` method path is the call whose request is read for a
-    /// term; a query string does not hide it, and a neighbour does not pass for it.
-    ///
-    /// Catches: a prefix match that reads the request of `Execute` or of another call of the
-    /// service; a path with a query that escapes the read.
+    /// The three calls a host's updater may make about its node, and only those shapes: the
+    /// node's id is returned, and nothing else (another verb, method, query, spelling or
+    /// extra segment) names a node.
     #[test]
-    fn only_wait_execution_is_read_for_a_term() {
-        let exec = "/build.bazel.remote.execution.v2.Execution/";
-        assert!(is_wait_execution(&format!("{exec}WaitExecution")));
-        assert!(is_wait_execution(&format!("{exec}WaitExecution?x=1")));
-        for other in ["Execute", "WaitExecutionX", "waitexecution", ""] {
-            assert!(!is_wait_execution(&format!("{exec}{other}")), "{other}");
+    fn the_node_calls_of_an_updater_are_three_exact_shapes() {
+        for (method, uri) in [
+            ("POST", "/v1/nodes/host-1:drain"),
+            ("POST", "/v1/nodes/host-1:uncordon"),
+            ("GET", "/v1/nodes/host-1"),
+            ("GET", "http://frontend.test/v1/nodes/host-1"),
+        ] {
+            assert_eq!(
+                node_call(method, uri).as_deref(),
+                Some("host-1"),
+                "{method} {uri}"
+            );
         }
-        assert!(!is_wait_execution("/google.bytestream.ByteStream/Read"));
-        assert!(!is_wait_execution(""));
+        assert_eq!(
+            node_call("GET", &format!("/v1/nodes/{}", "a".repeat(63))).map(|id| id.len()),
+            Some(63)
+        );
+        assert_eq!(node_call("GET", "/v1/nodes/9").as_deref(), Some("9"));
+        let long = format!("/v1/nodes/{}", "a".repeat(64));
+        for (method, uri) in [
+            ("GET", "/v1/nodes"),
+            ("GET", "/v1/nodes/"),
+            ("GET", "/v1/nodes/host-1/"),
+            ("GET", "/v1/nodes/host-1/leases"),
+            ("POST", "/v1/nodes/host-1"),
+            ("GET", "/v1/nodes/host-1:drain"),
+            ("PUT", "/v1/nodes/host-1"),
+            ("DELETE", "/v1/nodes/host-1"),
+            ("HEAD", "/v1/nodes/host-1"),
+            ("POST", "/v1/nodes/host-1:cordon"),
+            ("POST", "/v1/nodes/host-1:Drain"),
+            ("POST", "/v1/nodes/host-1:drain:drain"),
+            ("POST", "/v1/nodes/host-1:"),
+            ("POST", "/v1/nodes/:drain"),
+            ("GET", "/v1/nodes/host-1?x=1"),
+            ("POST", "/v1/nodes/host-1:drain?x=1"),
+            ("GET", "/v1/nodes/HOST-1"),
+            ("GET", "/v1/nodes/host_1"),
+            ("GET", "/v1/nodes/host.1"),
+            ("GET", "/v1/nodes/-host"),
+            ("GET", "/v1/nodes/host-"),
+            ("GET", "/v1/nodes/host%2D1"),
+            ("POST", "/v1/nodes/host-1%3Adrain"),
+            ("GET", "/v1/nodes/host-1/../host-2"),
+            ("GET", "/v1/nodes/../host-2"),
+            ("GET", "/v1/nodes/.."),
+            ("GET", "//v1/nodes/host-1"),
+            ("GET", "/v1/nodesx/host-1"),
+            ("GET", "/v1/node/host-1"),
+            ("GET", "/v1/members/host-1"),
+            ("GET", long.as_str()),
+        ] {
+            assert_eq!(node_call(method, uri), None, "{method} {uri}");
+        }
     }
 }

@@ -119,3 +119,140 @@ A `roll.json` written by an earlier build, which has none of the phases `drainin
 The other way does not hold: an earlier build does not know these phases and refuses to start on
 a `roll.json` that holds one, so finish or abort a roll that is in a member's turn before
 downgrading the updater.
+
+## The agent mode
+
+`kbf-updater agent` is the other mode of this program, and the one the maintainers' design
+([../design/updates.md](../design/updates.md)) ends on: an unprivileged updater on every host that
+dials the coordinator and owns that host's update. The roll mode above is unchanged and keeps
+working (until the roll and its ssh path are deleted, in the last step of that design).
+
+```text
+kbf-updater agent --coordinator <dns name>:<port> --channel NAME
+                  (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
+                  [--frontend <dns name>:<port>]
+                  [--operator-api http://IP:PORT --token-file FILE
+                  [--operator-proxy-auth-file FILE]] [--helper-socket PATH]
+                  [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
+                  [--health-poll-secs N] [--retry-secs N]
+```
+
+- `--coordinator`: a DNS name and a port. The coordinator's certificate must chain to the farm CA
+  for that name and have the role `coordinator`; that is checked after the handshake and before
+  anything is sent.
+- `--state-dir`: the directory `kbf-updater enroll` filled ([below](#enrolling-a-host)): the key,
+  the certificate and the CA are its files. The agent renews the certificate at half its life
+  and writes the new one there; `--frontend` is where. The certificate is the farm CA's `updater`
+  certificate: its one DNS name is this node's id and its `urn:kbf:host-role:` is what the host
+  runs (`storage`, `daemon` or `mac-daemon`; a `frontend` is refused, the roll updates frontends).
+  The agent reads both from it. The files are read for every heartbeat and every call to the
+  frontend, so a renewed pair is used from the next one, if it names the same node and role as the
+  pair the agent started with (a pair for another node is refused until the agent is restarted).
+  The key file must be a regular file of the agent's user with mode 0600 or 0400, as the token
+  file must.
+- `--client-cert`, `--client-key`, `--ca`: instead of `--state-dir`, files an operator placed.
+  Nothing renews them. Not both.
+- `--frontend`: the frontend's public address, a DNS name and a port (the kbf-proxy). The node's
+  drain, undrain and status are calls there, made with the updater's certificate and **no token**;
+  see [the boundary](#the-boundary). It is required with `--state-dir`.
+- `--channel`: the channel of the helper's allowlist. The version the coordinator names is looked
+  up in it by the helper, never fetched by URL.
+- `--helper-socket`: the socket of `kbf-host-install --serve` (default
+  `/run/kbf-host-install/local.sock`; [host-install.md](host-install.md#the-local-socket)).
+- `--operator-api`, `--token-file`, `--operator-proxy-auth-file`: optional, together: the full
+  operator token over the frontend's loopback, an opt-in fallback used instead of the
+  certificate; see the boundary below.
+- Times, in seconds, 1 to 86400: `--heartbeat-secs` 15, `--drain-deadline-secs` 600,
+  `--health-timeout-secs` 300, `--health-poll-secs` 5, `--retry-secs` 900.
+
+### The heartbeat
+
+A POST of `{"platform", "version", "health", "last_update", "updating"}` to `/v1/heartbeat`, at
+start and every `--heartbeat-secs`, on a thread of its own, so that it goes on through a whole A/B
+(a host that is silent for 45 seconds counts as down). `version` is the version text the host's
+helper knows for the release that runs; for a release placed by hand it is
+`0.1.0+g<12 hex digits>`, which names the commit and nothing else, and an update to the same commit
+teaches the helper the text. `health` is the node's health check against the running version.
+`updating` is the target while an A/B runs; `last_update` is how the last one ended. **The node id
+and the role are in no field**: the coordinator reads them from the certificate.
+
+### One A/B
+
+On a reply of `update to X` (and only X is used from it), in this order, each step only if the one
+before it worked:
+
+1. **Fetch and verify** through the helper (`install`): the release is fetched on the host and
+   checked there. An unattested build, one of another commit, or one the channel does not have is
+   refused here, and the node has not been touched.
+2. **Drain** the node at the frontend (`:drain` of the operator API, as the roll mode does for a
+   daemon host, with the updater's certificate through the proxy; a storage host is never drained) and wait for its leases, for at most
+   `--drain-deadline-secs`.
+3. **Switch** (`switch`): the helper puts X on trial and restarts the units.
+4. **Health**: the node's health check (`node_health`: a storage member is `active` on the build, a daemon is connected on it) of X, held drained, for
+   at most `--health-timeout-secs`, and never past the helper's deadline less ten seconds.
+5. **Confirm** X if it is healthy. If it is not, **revert**: the helper does that by itself at its
+   deadline whatever this process is doing; the agent asks for it at once.
+6. **Undrain** only if the node is healthy: on X after a confirm, or on the release that ran
+   after a revert. A node that is not healthy stays drained.
+
+The result goes in the next heartbeat. A restart of the agent in the middle finds the helper's
+pending marker (`query`) and finishes the trial from step 4; nothing is fetched, drained or
+switched twice. A target that failed is not tried again before `--retry-secs`, however often
+the coordinator names it.
+
+### Enrolling a host
+
+A host gets its updater certificate from the farm CA with a one-time token, with `kbf-updater enroll`:
+
+```text
+kbf-updater enroll --frontend <dns name>:<port> --node-id ID --token-file FILE --state-dir DIR
+```
+
+1. On the frontend the operator makes the token (`POST /v1/enroll/tokens`, [../api.md](../api.md)):
+   `{"roles": ["updater"], "node_id": "host-1", "host_role": "daemon"}`, one use. The token fixes
+   the node id and the host role; a token for a node's roles (`storage`, `daemon`) is refused for
+   an updater, and an updater token is refused for any other role, for another node id, a second
+   time and after it expired.
+2. On the host, as the agent's account, the token goes in a file of that account's with mode 0600
+   and the state directory is that account's with mode 0700 (the command refuses otherwise,
+   before it reads the token). The command makes the key on the host (mode 0600; only a request
+   signed by it is sent), checks the frontend against the CA pin the token carries and the answer
+   (role, node id, key, chain) before it writes anything, installs `pki/updater.key`,
+   `pki/updater.pem` and `pki/ca.pem`, and removes the token file. Run again after a success it
+   finds the host enrolled and changes nothing; after a failure it leaves the token file for a retry.
+3. The agent started with `--state-dir DIR` renews the certificate at half its life (spread by up
+   to 10%), by a request signed by the key the registry holds, retrying every five minutes
+   doubling to an hour, and logs an error when less than a day is left. A host whose certificate
+   lapsed during an outage recovers by itself, for as long as the host is not replaced.
+
+Revoking the host by its id (`POST /v1/enroll/nodes/{id}/revoke`) revokes its updater row too, so the
+renewal is refused and the certificate runs out at its end. The proxy does not read the deny list,
+so a certificate already issued keeps its three own-node calls (drain, uncordon, status) until it
+expires: seven days by default, thirty at most. A host re-enrolled with a `replace` token stops
+the old key from renewing in the same way and does not cut off a certificate already issued.
+The `deadline_secs` of a self-drain is whatever the host sends; it only moves that host's own
+drain deadline.
+
+The CA's key is the frontend's alone; the coordinator holds none. The units in
+`packaging/host-agent` use this layout ([its README](../../packaging/host-agent/README.md)).
+
+### The boundary
+
+The design says the full operator token must not be on hosts, and the agent does not need it. The
+drain of a node (`NodeDrain`: cordon, drain, uncordon) and the node's status for its health are
+calls to the operator API, which is on the frontend's loopback. The agent makes them through the
+frontend's public proxy with its updater certificate: **the proxy admits, for that certificate,
+`POST /v1/nodes/{id}:drain`, `POST /v1/nodes/{id}:uncordon` and `GET /v1/nodes/{id}` for the
+certificate's own node id, and nothing else** (another node's id, the cordon, a listing, the update
+API and everything else is `403`; so are the worker and build-cache paths whatever `buck2_auth`
+says), and puts the operator token in itself. The shipped units give the agent no token. The proxy's certificate for the name in `--frontend` must be the farm CA's `frontend` certificate (the agent checks the chain to the farm CA, the name and the role before it sends a byte), not a public one.
+
+What remains of the token: `--operator-api` and `--token-file` (and the proxy secret file) are an
+opt-in fallback for a host whose operator accepts the token there (anything running as the agent's
+account can then read it); given, they are used instead of the certificate. A **storage** host
+needs them: its health is read from `GET /v1/enroll/nodes` and `GET /v1/members`, which a
+certificate cannot reach, so a storage host's agent without them heartbeats and refuses every update
+order before it fetches anything, and the roll updates the host. Without `--frontend` and without
+the token an agent does the same for any host. The mechanism is behind two small ports (`Drain`,
+`HealthCheck`), so that a storage-health route a certificate may call replaces the refusal and not
+the agent.

@@ -344,7 +344,7 @@ pub enum RoleError {
     Unknown,
 }
 
-/// A role a token can grant. The farm has a third, `frontend`, which a frontend gives
+/// A role a token can grant. The farm has another, `frontend`, which a frontend gives
 /// only to itself (design section 6.3), and no "client" role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Role {
@@ -352,11 +352,15 @@ pub enum Role {
     Storage,
     /// Runs actions.
     Daemon,
+    /// A host's updater (`docs/design/updates.md`): it dials the update coordinator and
+    /// calls the frontend for its own node only. A token grants it alone, never with another
+    /// role, and names the host's role ([`crate::HostRole`]).
+    Updater,
 }
 
 impl Role {
     /// Every grantable role, in the order a request's certificates are listed.
-    pub const ALL: [Self; 2] = [Self::Storage, Self::Daemon];
+    pub const ALL: [Self; 3] = [Self::Storage, Self::Daemon, Self::Updater];
 
     /// Its name: the `RoleCsr.role` and `IssuedCert.role` spelling, and the last part of
     /// the role URI `urn:kbf:role:<name>` in the certificate.
@@ -365,6 +369,7 @@ impl Role {
         match self {
             Self::Storage => "storage",
             Self::Daemon => "daemon",
+            Self::Updater => "updater",
         }
     }
 
@@ -372,6 +377,7 @@ impl Role {
         match self {
             Self::Storage => 1,
             Self::Daemon => 2,
+            Self::Updater => 4,
         }
     }
 }
@@ -444,6 +450,14 @@ impl RoleSet {
     #[must_use]
     pub const fn contains(self, role: Role) -> bool {
         self.0 & role.bit() != 0
+    }
+
+    /// Whether the set holds [`Role::Updater`] together with another role. A host's updater
+    /// is its own enrollment, with its own certificate and its own registry row, and no
+    /// token or request may mix it with the roles of a node.
+    #[must_use]
+    pub const fn mixes_updater(self) -> bool {
+        self.contains(Role::Updater) && self.0 != Role::Updater.bit()
     }
 
     /// The roles, in [`Role::ALL`] order.
@@ -974,9 +988,10 @@ mod tests {
     /// `RoleCsr.role` spelling and the tail of the role URI).
     #[test]
     fn roles_have_their_wire_names() {
-        assert_eq!(Role::ALL.map(Role::name), ["storage", "daemon"]);
+        assert_eq!(Role::ALL.map(Role::name), ["storage", "daemon", "updater"]);
         assert_eq!("storage".parse(), Ok(Role::Storage));
         assert_eq!("daemon".parse(), Ok(Role::Daemon));
+        assert_eq!("updater".parse(), Ok(Role::Updater));
         assert_eq!("frontend".parse::<Role>(), Err(RoleError::Frontend));
         for bad in ["", "Storage", "client", "storage ", "daemon\n"] {
             assert_eq!(bad.parse::<Role>(), Err(RoleError::Unknown), "{bad:?}");
@@ -1029,6 +1044,24 @@ mod tests {
         assert_eq!(
             RoleSetError::Duplicate(Role::Daemon).to_string(),
             "role daemon is named twice"
+        );
+    }
+
+    /// An updater is its own enrollment: a set that holds it with another role is the one
+    /// the registry and the frontend refuse, and the set of it alone is not.
+    #[test]
+    fn an_updater_is_never_mixed_with_a_node_role() {
+        let set = |roles: &[Role]| RoleSet::new(roles.iter().copied()).unwrap();
+        assert!(!set(&[Role::Updater]).mixes_updater());
+        assert!(set(&[Role::Updater, Role::Daemon]).mixes_updater());
+        assert!(set(&[Role::Storage, Role::Updater]).mixes_updater());
+        assert!(!set(&[Role::Storage, Role::Daemon]).mixes_updater());
+        assert_eq!(
+            RoleSet::from_names(["updater"])
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            [Role::Updater]
         );
     }
 

@@ -11,11 +11,10 @@ use tokio::time::Instant;
 use crate::config::Limits;
 use crate::control::NoUpdates;
 
-use super::kit::{
-    CAPS, EXECUTE, RawFrame, RawPeer, Rig, finish, frame_on, grpc_ok, read_all, script, send_end,
-    tagged,
-};
+use super::kit::{CAPS, EXECUTE, RawFrame, RawPeer, finish, frame_on, grpc_ok};
+use super::kit::{read_all, script, send_end, tagged};
 use super::pki::client_config;
+use super::pool_kit::Rig;
 use super::secure::{connect_tls, tls_rig};
 use crate::auth::Buck2Auth;
 
@@ -32,7 +31,7 @@ async fn keepalive_closes_dead_peer_only() {
         tokio::time::sleep(10 * MINUTE).await;
         grpc_ok(&mut call.respond, "late");
     });
-    let rig = Rig::start(slow, tagged("b")).await;
+    let rig = Rig::start(&[slow]);
     let mut live = rig.client().await;
     let (response, mut body) = live.start(EXECUTE, false).await;
     send_end(&mut body, Bytes::from_static(b"x"));
@@ -75,7 +74,7 @@ async fn the_downstream_keepalive_follows_the_configured_limits() {
         keepalive_ack_s: 3,
         ..Limits::default()
     };
-    let rig = Rig::start_with(tagged("a"), tagged("b"), NoUpdates, limits).await;
+    let rig = Rig::start_with(&[tagged("a")], NoUpdates, limits);
     let start = Instant::now();
     let mut dead = RawPeer::connect(&rig).await;
     let closed = tokio::time::timeout(MINUTE, async { while dead.next().await.is_some() {} }).await;
@@ -91,14 +90,14 @@ async fn the_downstream_keepalive_follows_the_configured_limits() {
 /// one that opens a new connection for each stream because it thinks the quiet one is gone.
 #[tokio::test(start_paused = true)]
 async fn upstream_ping_keeps_a_quiet_connection_warm() {
-    let rig = Rig::start(tagged("a"), tagged("b")).await;
-    *rig.a.state.raw_pongs_first.lock().expect("lock") = Some(usize::MAX);
+    let rig = Rig::start(&[tagged("a")]);
+    *rig.a().state.raw_pongs_first.lock().expect("lock") = Some(usize::MAX);
     let mut client = rig.client().await;
     // Answered by nobody: the stream and its connection just sit there.
     let (_first, _body) = client.start(CAPS, true).await;
     tokio::time::sleep(Duration::from_secs(95)).await;
     // The dial check, then 30, 60 and 90 s.
-    assert_eq!(rig.a.state.pings.load(Ordering::Acquire), 4);
+    assert_eq!(rig.a().state.pings.load(Ordering::Acquire), 4);
     let (_second, _body) = client.start(CAPS, true).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let dials = rig.core.metrics.upstream_dials.load(Ordering::Acquire);
@@ -111,15 +110,15 @@ async fn upstream_ping_keeps_a_quiet_connection_warm() {
 /// loopback child for longer than 20 s, and the streams already on it are still good.
 #[tokio::test(start_paused = true)]
 async fn an_unanswered_upstream_ping_stops_new_streams_and_only_the_backstop_closes() {
-    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    let rig = Rig::start(&[tagged("a")]);
     // The dial check is answered; nothing after it is.
-    *rig.a.state.raw_pongs_first.lock().expect("lock") = Some(1);
+    *rig.a().state.raw_pongs_first.lock().expect("lock") = Some(1);
     let mut client = rig.client().await;
     let start = Instant::now();
     let (response, _body) = client.start(CAPS, true).await;
     let first = tokio::spawn(finish(response));
     tokio::time::sleep(Duration::from_secs(55)).await;
-    assert_eq!(rig.a.state.pings.load(Ordering::Acquire), 2);
+    assert_eq!(rig.a().state.pings.load(Ordering::Acquire), 2);
 
     // The PING of 30 s is unanswered at 50 s: a new stream goes to a new connection.
     let second = tokio::time::timeout(Duration::from_secs(5), client.unary(CAPS))

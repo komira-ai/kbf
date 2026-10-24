@@ -444,14 +444,14 @@ enum CopyFault {
 
 /// A writer that counts and hashes what it passes on, and remembers that a failure was its
 /// destination's.
-struct Hashing<'a, W> {
-    to: &'a mut W,
+struct Hashing<'a> {
+    to: &'a mut dyn Write,
     hasher: Sha256,
     bytes: u64,
     failed: bool,
 }
 
-impl<W: Write> Write for Hashing<'_, W> {
+impl Write for Hashing<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let n = self.to.write(buf).inspect_err(|_| self.failed = true)?;
         self.hasher.update(&buf[..n]);
@@ -465,7 +465,7 @@ impl<W: Write> Write for Hashing<'_, W> {
 }
 
 /// All of `from` written to `to`: how many bytes, and their sha256 in lowercase hex.
-fn copy_hashed(from: &mut impl Read, to: &mut impl Write) -> Result<(u64, String), CopyFault> {
+fn copy_hashed(from: &mut dyn Read, to: &mut dyn Write) -> Result<(u64, String), CopyFault> {
     let mut hashing = Hashing {
         to,
         hasher: Sha256::new(),

@@ -661,6 +661,36 @@ impl Config {
         }
     }
 
+    /// The settings of an enrollment that is not a node's: a host's updater, which has no
+    /// `kbf.toml`. It names the frontend, the node (the token fixes it), the token file and the
+    /// state directory; the rest is what an absent key means in a file: no advertise address,
+    /// no zone, the pin for first contact, and the directories of a node under `state_dir`
+    /// (unused by an updater).
+    #[must_use]
+    pub fn updater(
+        frontend: FrontendUrl,
+        node_id: NodeId,
+        token_file: PathBuf,
+        state_dir: PathBuf,
+    ) -> Self {
+        Self {
+            mode: None,
+            frontend,
+            token_file,
+            node_id,
+            advertise: None,
+            zone: String::new(),
+            hot_dir: state_dir.join("hot"),
+            meta_dir: state_dir.join("meta"),
+            data_dir: state_dir.join("data"),
+            reserve_cpus: None,
+            trust: Trust::Pin,
+            storage_table: false,
+            daemon_table: false,
+            state_dir,
+        }
+    }
+
     /// Warnings once the roles are known (they come from the token, not the file): a
     /// `[storage]` or `[daemon]` table for a role the frontend did not grant, and an
     /// `advertise` on a node granted no storage role.

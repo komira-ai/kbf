@@ -1,0 +1,51 @@
+[package]
+name = "kbf-coordinator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The update coordinator (docs/design/updates.md): a deployable of its own that tells each
+# host's updater which version to run, within per-role limits. Updaters dial it over mutual
+# TLS (the farm CA's `updater` certificates, the coordinator's own `coordinator` one); CI sets
+# the one desired state with a GitHub Actions OIDC token (kbf-oidc); an operator reads the
+# status with the operator token. The decision is a pure function (`decide`) over the
+# heartbeats the coordinator has seen; the only state on disk is the desired state.
+[[bin]]
+name = "kbf-coordinator"
+path = "src/main.rs"
+
+[dependencies]
+kbf-oidc.workspace = true
+kbf-tls.workspace = true
+kbf-types.workspace = true
+kbf-updater.workspace = true
+bytes.workspace = true
+clap.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+futures.workspace = true
+kbf-ca.workspace = true
+kbf-oidc = { workspace = true, features = ["testkit"] }
+kbf-testkit.workspace = true
+rcgen.workspace = true
+rustix = { workspace = true, features = ["process"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

@@ -35,20 +35,6 @@ impl Socket {
         bound.map_err(bind_error(addr))
     }
 
-    /// A second handle on the same bound socket: connections wait in one queue, and
-    /// whichever handle is served accepts them. A process that serves a stand-in on the
-    /// clone and hands the original to the real server loses no connection between the
-    /// two ([`crate::managed`]).
-    ///
-    /// # Errors
-    /// The descriptor cannot be duplicated.
-    pub fn try_clone(&self) -> io::Result<Self> {
-        Ok(Self {
-            local: self.local,
-            listener: self.listener.try_clone()?,
-        })
-    }
-
     /// The listener for a gRPC server, and the latch that closes it: connections it
     /// accepts have Nagle's algorithm off (see [`crate::serve::bind`]), and are served
     /// over TLS when `tls` is given ([`Incoming`]: it must be called inside a Tokio
@@ -200,7 +186,7 @@ struct Open {
 /// connections and closes the socket at once, wherever the server is in accepting. The
 /// transport's own shutdown keeps the socket open until the last connection is gone, and
 /// stops accepting only when it next looks at the listener; a process that stops
-/// listening (a handover stops the worker listener) must not go on holding the socket
+/// listening (a retire stops the worker listener) must not go on holding the socket
 /// open, where connections would queue for nobody.
 pub(crate) struct Stoppable(Arc<Mutex<Open>>);
 

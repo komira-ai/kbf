@@ -59,8 +59,9 @@ rustix = { workspace = true, features = ["process", "system"] }
 # The Postgres state schema version, which `kbf --version --json` reports.
 kbf-state = { workspace = true, features = ["postgres"] }
 # `kbf setup` (src/setup.rs): the first configuration of a host from the packages. Without the
-# library's `proxy` feature, so this binary links no kbf-proxy: the host behind the proxy is
-# `kbf-installer setup`'s (tests/layering.rs in kbf-integration-test checks the tree).
+# library's `proxy` feature, so this binary links no kbf-proxy: an installer.toml with a
+# `[proxy]` table is `kbf-installer setup`'s to keep (tests/layering.rs in kbf-integration-test
+# checks the tree).
 kbf-setup.workspace = true
 # The identity `kbf --version --json` prints (src/version.rs), and the bodies of
 # `kbf cluster` (src/cluster.rs).

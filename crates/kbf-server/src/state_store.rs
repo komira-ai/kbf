@@ -6,10 +6,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, Fenced, GENERATION, Revision, SHARED_WRITERS, ScanPage,
-    ScanRange, Store, StoreError, StoreTime, Txn, Versioned,
-};
+use kbf_state::Store;
 
 use crate::farm::{EpochPolicy, StateError};
 use crate::members::MembershipConfig;
@@ -22,8 +19,8 @@ pub enum StateStoreUri {
     Sqlite(PathBuf),
     /// `postgres:///kbf?host=/run/postgresql`: a database on a Unix socket, reached as the
     /// process's own user (peer authentication). Several frontends may open it at once and
-    /// all write: none takes a generation ([`Fenced`]), and the generation row holds a marker
-    /// instead ([`StateStoreUri::open`]).
+    /// all write: none takes a generation, and the generation row holds a marker instead
+    /// ([`StateStoreUri::open`]).
     Postgres(PostgresUrl),
 }
 
@@ -212,8 +209,8 @@ impl StateStoreUri {
             .expect("LOCAL_POSTGRES is a socket URL the parser accepts")
     }
 
-    /// What names the store, for two processes to agree they mean the same one (the
-    /// handover): a SQLite store's file, a Postgres store's URL without a password.
+    /// What names the store, for two processes to agree they mean the same one: a SQLite
+    /// store's file, a Postgres store's URL without a password.
     #[must_use]
     pub fn identity(&self) -> PathBuf {
         match self {
@@ -229,16 +226,16 @@ impl StateStoreUri {
     /// fences another. What the open does write is the generation row, once: it ensures
     /// that `meta/generation` holds [`kbf_state::SHARED_WRITERS`], with a write conditional
     /// on the row read, so frontends that open together agree. A store that holds the marker
-    /// opens as it is. A store that holds a generation (one that a build which takes
+    /// opens as it is. A store that holds a generation (one that an older build which takes
     /// generations last opened) gets the marker in its place, which is the cold cutover: it
-    /// is only right when every such frontend is stopped first, for the marker fences the
-    /// last holder's writes and a build that takes generations fails to start on the store
-    /// ([`kbf_state::TakeError::Corrupt`]).
+    /// is only right when every such frontend is stopped first, for a build that takes
+    /// generations fails to start on the store, which holds a marker where it reads a
+    /// number.
     ///
     /// A SQLite file is created, with its directory, if missing (directories it makes are
     /// 0700 and the file 0600: the scheduler's state is for this user alone), and held by
-    /// this process alone: a second open of it (a second frontend) is refused. It takes
-    /// the next generation, which a handover reads ([`StateStoreUri::open_after_handover`]).
+    /// this process alone: a second open of it (a second frontend) is refused. No generation
+    /// is written to it.
     ///
     /// This blocks, as the store's calls do, and may be called from an async task.
     ///
@@ -247,177 +244,24 @@ impl StateStoreUri {
     /// filesystem or is not a state store; or the generation row of a Postgres store cannot
     /// be set to the marker.
     pub fn open(&self) -> Result<StateStore, StateError> {
-        match self {
-            Self::Sqlite(_) => self.open_at(None, self.epoch_policy()),
-            Self::Postgres(_) => {
-                let store = self.open_backend()?;
-                kbf_state::share(store.as_ref()).map_err(open_error)?;
-                Ok(StateStore {
-                    store,
-                    epoch: self.epoch_policy(),
-                    members: MembershipConfig::default(),
-                    history: None,
-                })
-            }
-        }
-    }
-
-    /// Opens the store as the successor of the process that held generation `generation`
-    /// and has let go of it, and keeps its epoch: the daemons that reconnect keep the runs
-    /// of the leases they hold. Nothing is written unless the store is at exactly that
-    /// generation, so a file that was restored or swapped since is refused, and so is one
-    /// another writer has taken, and so is a store that holds the marker of shared
-    /// frontends ([`StateStoreUri::open`]), which has no generation to succeed.
-    ///
-    /// # Errors
-    /// [`StateError::Open`]: as [`StateStoreUri::open`], or the store is not at
-    /// `generation`.
-    pub fn open_after_handover(&self, generation: u64) -> Result<StateStore, StateError> {
-        self.open_at(Some(generation), EpochPolicy::Keep)
-    }
-
-    /// Opens the store to wait for a takeover: the generation is not taken, the epoch is
-    /// not touched and nothing is written ([`Candidate`]). The backend's own open still
-    /// refuses a store whose schema version this build does not support; no schema is
-    /// made or changed here.
-    ///
-    /// # Errors
-    /// [`StateError::Open`]: as [`StateStoreUri::open`].
-    pub fn open_candidate(&self) -> Result<Candidate, StateError> {
-        Ok(Candidate::over(self.open_backend()?))
-    }
-
-    /// The backend's store, opened as it is: no generation taken, nothing written here. A
-    /// SQLite store opens, and the start logs [`SQLITE_REMOVED`] once.
-    fn open_backend(&self) -> Result<Arc<dyn Store>, StateError> {
-        match self {
+        let store = match self {
             Self::Sqlite(path) => {
                 tracing::warn!("{SQLITE_REMOVED}");
-                open_sqlite(path)
+                open_sqlite(path)?
             }
-            Self::Postgres(url) => open_postgres(url),
-        }
-    }
-
-    fn open_at(&self, expect: Option<u64>, epoch: EpochPolicy) -> Result<StateStore, StateError> {
-        let inner = self.open_backend()?;
-        // This process is the store's writer from here: it takes the next generation, and
-        // every write through the handle is checked against it ([`Fenced`]).
-        let fenced = Fenced::take(inner, expect).map_err(open_error)?;
+            Self::Postgres(url) => {
+                let store = open_postgres(url)?;
+                kbf_state::share(store.as_ref()).map_err(open_error)?;
+                store
+            }
+        };
         Ok(StateStore {
-            store: Arc::new(fenced),
-            epoch,
+            store,
+            epoch: self.epoch_policy(),
             // The defaults; a start sets the --member-* flags (`start::with_members`).
             members: MembershipConfig::default(),
             history: None,
         })
-    }
-}
-
-/// A store opened by a process that waits to take over from the one that holds the
-/// generation: it can read, and no write goes through the handle it gives out. It takes
-/// the generation only when [`Candidate::take_over`] is called, expecting the holder's.
-pub struct Candidate {
-    inner: Arc<dyn Store>,
-}
-
-impl Candidate {
-    /// A candidate over an open store (what [`StateStoreUri::open_candidate`] makes of a
-    /// backend's store, and what a test makes of an in-memory one).
-    #[must_use]
-    pub fn over(inner: Arc<dyn Store>) -> Self {
-        Self { inner }
-    }
-
-    /// A handle that reads the store and refuses every write.
-    #[must_use]
-    pub fn reader(&self) -> Arc<dyn Store> {
-        Arc::new(ReadOnly(Arc::clone(&self.inner)))
-    }
-
-    /// The generation the store is at now (0 when no writer has taken one).
-    ///
-    /// # Errors
-    /// [`StateError::Store`]: the store cannot be read, or the row is not a number.
-    pub fn generation(&self) -> Result<u64, StateError> {
-        generation_of(self.inner.as_ref())
-    }
-
-    /// Takes the generation, which must be exactly `expect`, and keeps the epoch: the
-    /// daemons that reconnect keep the runs of their leases. Nothing is written when the
-    /// store is at another generation. Returns the store the caller now writes through.
-    ///
-    /// # Errors
-    /// [`StateError::Open`]: the store is not at `expect`, or another writer took the
-    /// generation first.
-    pub fn take_over(&self, expect: u64) -> Result<StateStore, StateError> {
-        let fenced = Fenced::take(Arc::clone(&self.inner), Some(expect)).map_err(open_error)?;
-        Ok(StateStore {
-            store: Arc::new(fenced),
-            epoch: EpochPolicy::Keep,
-            members: MembershipConfig::default(),
-            history: None,
-        })
-    }
-}
-
-/// The generation row of `store`: 0 when it has none.
-///
-/// # Errors
-/// [`StateError::Store`] when the store cannot be read; [`StateError::Corrupt`] when the
-/// row is not eight bytes.
-pub fn generation_of(store: &dyn Store) -> Result<u64, StateError> {
-    let Some(row) = store.get(GENERATION)? else {
-        return Ok(0);
-    };
-    let bytes = <[u8; 8]>::try_from(row.value.as_slice()).map_err(|_| StateError::Corrupt {
-        key: GENERATION.to_owned(),
-        why: "not an 8-byte number".to_owned(),
-    })?;
-    Ok(u64::from_be_bytes(bytes))
-}
-
-/// Whether the generation row of `store` holds [`SHARED_WRITERS`]: the frontends share the
-/// store and none holds a generation. False when the store cannot be read.
-pub(crate) fn holds_no_generation(store: &dyn Store) -> bool {
-    store
-        .get(GENERATION)
-        .ok()
-        .flatten()
-        .is_some_and(|row| row.value == SHARED_WRITERS)
-}
-
-/// A store handle that reads and writes nothing: what a candidate probes.
-struct ReadOnly(Arc<dyn Store>);
-
-impl Store for ReadOnly {
-    fn apply_batch(&self, _: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
-        Err(StoreError::Failed(
-            "this process waits for a takeover and writes nothing".to_owned(),
-        ))
-    }
-    fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
-        self.0.get(key)
-    }
-    fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
-        self.0.scan_prefix(prefix)
-    }
-    fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
-        self.0.scan_range(scan)
-    }
-    fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
-        self.0.changes(after, limit)
-    }
-    fn reap_expired(&self) -> Result<usize, StoreError> {
-        Err(StoreError::Failed(
-            "this process waits for a takeover and writes nothing".to_owned(),
-        ))
-    }
-    fn commit_stats(&self) -> CommitStats {
-        self.0.commit_stats()
-    }
-    fn now(&self) -> StoreTime {
-        self.0.now()
     }
 }
 

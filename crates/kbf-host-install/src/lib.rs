@@ -45,6 +45,14 @@
 //! result is the `apply` field of `query` (`docs/deploy/host-install.md`). The platform picks
 //! the side; both are compiled everywhere.
 //!
+//! # The local socket
+//!
+//! `kbf-host-install --serve` ([`local`]) serves the same host over a unix socket (mode 0600,
+//! owned by the account of `kbf-updater`) instead of ssh: stage a release beside the running
+//! one, switch to it on trial, confirm it, query, revert. It owns the revert: a release on
+//! trial that no one confirms by its deadline is put back by this program, with a pending
+//! marker on disk that a restart or a reboot finds. The forced command above is unchanged.
+//!
 //! The paths this program reads as root are constants of [`host::Host::production`]. The
 //! only way to point them elsewhere is a `cfg(test)` constructor: no environment variable
 //! and no argument does it. (One variable does exist, `KBF_HOST_INSTALL_UNIT`: it makes the
@@ -57,6 +65,7 @@ mod audit;
 mod config;
 mod debver;
 mod host;
+mod local;
 mod locks;
 pub(crate) mod mac;
 mod node_id;
@@ -93,6 +102,22 @@ pub mod contract {
         match crate::request::Request::parse(command) {
             Ok(crate::request::Request::Restart { unit }) => Some(unit.as_str().to_owned()),
             _ => None,
+        }
+    }
+
+    /// The local socket's requests and answers (`kbf-host-install --serve`), for the agent
+    /// mode of `kbf-updater`, which reads the answers and writes the requests.
+    pub mod local {
+        pub use crate::local::answer::{Answer, Code, LastView, PendingView, QueryView};
+        pub use crate::local::serve::ServeConfig;
+
+        /// The verb of `line`, when it is a request the socket accepts (`stage`, `switch`,
+        /// `confirm`, `revert` or `query`); `None` for anything it would refuse.
+        #[must_use]
+        pub fn request_verb(line: &str) -> Option<&'static str> {
+            crate::local::request::LocalRequest::parse(line)
+                .ok()
+                .map(|request| request.verb())
         }
     }
 
@@ -150,6 +175,14 @@ pub fn main() -> ExitCode {
             &mut std::io::stdout(),
             &mut std::io::stderr(),
         ));
+    }
+    // The local socket: `kbf-updater`'s door, beside the forced command (see [`local`]).
+    if args.first().is_some_and(|arg| arg == "--serve") {
+        let rest: Option<Vec<String>> = args[1..]
+            .iter()
+            .map(|arg| arg.to_str().map(str::to_owned))
+            .collect();
+        return rest.map_or(ExitCode::from(2), |rest| local::production::main(&rest));
     }
     // Both sides are compiled everywhere, so the Linux build checks the Mac code.
     if cfg!(target_os = "macos") {

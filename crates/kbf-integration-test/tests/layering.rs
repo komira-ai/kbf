@@ -382,6 +382,34 @@ fn storage_reaches_no_frontend_crate() {
     );
 }
 
+/// The crates that make or hold certificate authority: the farm CA (`kbf-ca`: the signer
+/// and the issuing of every certificate) and the frontend (`kbf-server`, which holds the CA
+/// and runs the enroll listener).
+const CA_SIDE: &[&str] = &["kbf-ca", "kbf-server"];
+
+/// The update coordinator and a host's updater take their certificates from the farm CA
+/// and never hold it: the coordinator's certificate is made for it, and an updater makes its
+/// key on the host and has a certificate signed for it (`docs/design/updates.md`, section
+/// 5). Neither crate's normal dependencies may reach the CA or the frontend.
+#[test]
+fn the_coordinator_and_the_updater_hold_no_ca_code() {
+    let g = load_graph();
+    for member in ["kbf-coordinator", "kbf-updater", "kbf-enroll"] {
+        let (_, root) = g.members.get(member).expect("a workspace member");
+        assert!(root.is_some(), "{member} must have a library target");
+        let violations = reaches(&g, member, CA_SIDE);
+        assert!(
+            violations.is_empty(),
+            "{member} reaches the CA side:\n{}",
+            violations.join("\n")
+        );
+    }
+    assert!(
+        !reaches(&g, "kbf-server", &["kbf-ca"]).is_empty(),
+        "the frontend's closure must reach kbf-ca, or this walk proves nothing"
+    );
+}
+
 /// The daemon crates: the daemon's code, which the `kbf-daemon` binary is and which
 /// `kbf daemon` runs inside the `kbf` binary, with the drivers, which `kbf-node` names
 /// and so are in its closure.
@@ -459,9 +487,9 @@ fn route_reaches_neither_the_frontend_nor_the_daemon() {
 /// (`kbf-server`, `kbf-front`, `kbf-storage`, `kbf-node`, `kbf-daemon`, the binaries
 /// `kbf-cli` and `kbf-all-in-one`), and does not know the installer, its host plan or its
 /// update types (`kbf-installer`, `kbf-setup`, `kbf-host`, `kbf-update`, `kbf-deploy`): the
-/// admin calls to a child are the installer's, through a trait that lives there (the proxy's
-/// one is the read-only `GET role`, for the child's term, over plain HTTP), and the installer
-/// and the setup library depend on the proxy, not the other way round.
+/// admin calls to a child are the installer's, through a trait that lives there (the proxy
+/// makes none), and the installer and the setup library depend on the proxy, not the other way
+/// round.
 const PROXY_MUST_NOT_REACH: &[&str] = &[
     "kbf-installer",
     "kbf-setup",
@@ -507,36 +535,19 @@ fn the_proxy_reaches_no_child_installer_or_runtime_crate() {
     );
 }
 
-/// The files of `kbf-installer/src` that may name the proxy: the verb that hosts it, the
-/// swap's real gate over the proxy's handle (`proxy/gate_real.rs`, with its tests), and the
-/// supervisor that starts the children on the ports of the proxy's upstream table
-/// (`proxy/supervisor.rs`, which also holds the real gate), the verb's own tests
-/// (`proxy_verb_tests.rs`, which start a real proxy over a migrated database and compare the
-/// deploy's copy of the proxy's port layout in `observe.rs` with the proxy's), and the verb's
-/// pool mode (`proxy_pool.rs`, which binds and runs the proxy over frontends that run on
-/// their own, with no supervisor). The rest of `proxy/` is written against traits and names
-/// no proxy type. Everything else, the root helper
-/// (`helper/`, `run.rs`) first of all, runs as root and links a network stack it never runs
-/// if it names a proxy type. The settings file whose `[proxy]` table the verb reads and the
-/// table `setup --proxy` writes are in `kbf-setup` (`SETUP_MAY_NAME_THE_PROXY`).
-const MAY_NAME_THE_PROXY: &[&str] = &[
-    "proxy/gate_real.rs",
-    "proxy/gate_real_tests.rs",
-    "proxy/supervisor.rs",
-    "proxy/supervisor_tests.rs",
-    "proxy_pool.rs",
-    "proxy_verb.rs",
-    "proxy_verb_tests.rs",
-    "proxy_verb_copies_tests.rs",
-];
+/// The files of `kbf-installer/src` that may name the proxy: the verb that hosts it and the
+/// verb's pool mode (`proxy_pool.rs`, which binds and runs the proxy over frontends that run on
+/// their own). Everything else, the root helper (`helper/`, `run.rs`) first of all, runs as root
+/// and links a network stack it never runs if it names a proxy type. The settings file whose
+/// `[proxy]` table the verb reads is in `kbf-setup` (`SETUP_MAY_NAME_THE_PROXY`).
+const MAY_NAME_THE_PROXY: &[&str] = &["proxy_pool.rs", "proxy_verb.rs"];
 
 /// The files of `kbf-setup/src` that may name the proxy: the settings file whose `[proxy]`
-/// table the proxy verb reads (`installer_toml.rs`) and the table `setup --proxy` writes
-/// (`setup/proxy.rs`, which builds the table the proxy would read, with the proxy's own
-/// defaults and checks). `setup` runs as root; the rest of the library names no proxy type.
-/// Both are behind the library's `proxy` feature, which `kbf setup` (the `kbf` binary) does
-/// not turn on.
-const SETUP_MAY_NAME_THE_PROXY: &[&str] = &["installer_toml.rs", "setup/proxy.rs"];
+/// table the proxy verb reads and `setup` keeps as it is (`installer_toml.rs`). `setup` runs as
+/// root; the rest of the library names no proxy type, the proxy's flags (`setup/proxy.rs`, taken
+/// only to be refused) included. The table is behind the library's `proxy` feature, which `kbf
+/// setup` (the `kbf` binary) does not turn on.
+const SETUP_MAY_NAME_THE_PROXY: &[&str] = &["installer_toml.rs"];
 
 /// The files that may name the verb's module (`proxy_verb`): the dispatch and its tests, and the
 /// verb's pool mode (`proxy_pool.rs`, which shares the verb's stop flag and signal handling). A
@@ -626,7 +637,7 @@ fn the_root_half_of_the_installer_names_nothing_of_the_proxy() {
 /// Asserts that, of the files of `kbf-setup/src`, only those in `SETUP_MAY_NAME_THE_PROXY` name
 /// `kbf_proxy`, that each of those still does, and that the scan found the library's files.
 #[test]
-fn the_setup_library_names_the_proxy_only_where_it_writes_the_table() {
+fn the_setup_library_names_the_proxy_only_where_it_keeps_the_table() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kbf-setup/src");
     let mut files = Vec::new();
     rust_files(&src, &src, &mut files);

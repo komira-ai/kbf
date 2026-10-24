@@ -1,5 +1,9 @@
 # Updating a frontend or an all-in-one host behind Envoy, without failing a build
 
+> **Retired.** The installer's all-in-one swap behind the proxy (`kbf-installer`'s two-slot
+> supervision) was removed, and kbf runs no Envoy. This page is history; nothing here is an
+> instruction.
+
 Status: design, not implemented (the handover code it builds on, #857, #879 and #887, is merged on arch-v2).
 **Everything new in 6.4 is a design, not code: `RaftMetaLog::demote`, `open_follower`, `Follower::promote`,
 `Host::open_resumed`, `Raft::restore_applied`, `Store::open_from` and `Store::retire` do not exist on arch-v2 today.**

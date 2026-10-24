@@ -1,4 +1,5 @@
-//! The pool-mode rules of the `[proxy]` table: `[[frontend]]` tables and `admin_listen`.
+//! The rules of the `[proxy]` table about the children: `[[frontend]]` tables, the removed
+//! `upstream` table and `admin_listen`.
 
 use super::*;
 
@@ -9,7 +10,7 @@ server_key_file = "/etc/kbf/tls/server.key"
 client_ca_file = "/etc/kbf/tls/ca.pem"
 "#;
 
-/// The slot-mode table, for the tests of the two modes together.
+/// The table of the removed two-slot supervision.
 const UPSTREAM: &str = "[upstream]\nbase_port = 18000\n";
 
 /// One `[[frontend]]` table.
@@ -29,14 +30,11 @@ fn refused(text: &str) -> String {
     error.to_string()
 }
 
-/// Asserts that a table of `[[frontend]]` tables is pool mode: the frontends are read in
-/// order with their names and base ports, there is no slot table (the placeholder stands for
-/// it), and without `admin_listen` there is no admin API.
+/// Asserts that a table of `[[frontend]]` tables is read: the frontends are in order with their
+/// names and base ports, and without `admin_listen` there is no admin API.
 #[test]
 fn a_pool_table_is_read_with_its_frontends() {
     let config = ProxyConfig::from_toml_str(&pool("")).expect("valid");
-    assert_eq!(config.upstream, None);
-    assert_eq!(config.slot_table(), UpstreamTable::POOL_MODE);
     assert_eq!(config.admin_listen, None);
     let names: Vec<&str> = config.frontend.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names, ["a", "b"]);
@@ -44,24 +42,49 @@ fn a_pool_table_is_read_with_its_frontends() {
     assert_eq!(bases, [18_000, 18_010]);
 }
 
-/// Asserts that a slot-mode table has its slot table back from `slot_table` and no frontends.
+/// Asserts that the `upstream` table of the removed two-slot supervision is refused with the
+/// words that say what replaced it, alone, beside frontends and beside `admin_listen`, and that
+/// a table that gives no frontend and no `upstream` table is refused for the frontends it lacks.
 #[test]
-fn a_slot_table_has_no_frontends() {
-    let text = format!("{HEAD}{UPSTREAM}");
-    let config = ProxyConfig::from_toml_str(&text).expect("valid");
-    assert_eq!(config.slot_table(), UpstreamTable { base_port: 18_000 });
-    assert!(config.frontend.is_empty());
-}
-
-/// Asserts that exactly one of the `upstream` table and the `[[frontend]]` tables is given:
-/// both is refused, and so is neither.
-#[test]
-fn exactly_one_of_upstream_and_frontend_is_given() {
-    let both = format!("{}{UPSTREAM}", pool(""));
-    let why = refused(&both);
-    assert!(why.contains("not both"), "{why}");
+fn the_upstream_table_is_refused_and_the_frontends_are_needed() {
+    let alone = refused(&format!("{HEAD}{UPSTREAM}"));
+    assert_eq!(alone, SLOT_MODE_REMOVED);
+    assert!(alone.contains("[[proxy.frontend]]"), "{alone}");
+    let both = refused(&format!("{}{UPSTREAM}", pool("")));
+    assert_eq!(both, SLOT_MODE_REMOVED);
+    let admin = format!("admin_listen = \"127.0.0.1:18090\"\n{HEAD}{UPSTREAM}");
+    assert_eq!(refused(&admin), SLOT_MODE_REMOVED);
     let neither = refused(HEAD);
     assert!(neither.contains("are needed"), "{neither}");
+}
+
+/// Asserts that a table with the `upstream` table, alone or beside frontends, is accepted by
+/// `from_value` and `check` (which `setup` and the release fetcher read an older file with),
+/// written back whole, and refused only by `check_pool` and `from_toml_str`, which are the
+/// proxy's start.
+#[test]
+fn the_upstream_table_is_read_and_written_back_and_refused_only_for_serving() {
+    for text in [
+        format!("{HEAD}{UPSTREAM}"),
+        format!("{}{UPSTREAM}", pool("")),
+    ] {
+        let table: toml::Value = toml::from_str(&text).expect("toml");
+        let config = ProxyConfig::from_value(table).expect("read");
+        assert_eq!(config.upstream, Some(UpstreamTable { base_port: 18_000 }));
+        assert_eq!(config.check(), Ok(()));
+        let written = toml::to_string(&config).expect("serializes");
+        assert!(
+            written.contains("[upstream]\nbase_port = 18000\n"),
+            "{written}"
+        );
+        let again: ProxyConfig = toml::from_str(&written).expect("parses");
+        assert_eq!(again, config);
+        assert_eq!(
+            config.check_pool(),
+            Err(ConfigError::Invalid(SLOT_MODE_REMOVED))
+        );
+        assert_eq!(refused(&text), SLOT_MODE_REMOVED);
+    }
 }
 
 /// Asserts that a frontend name is 1 to 64 letters, digits, `-` and `_`, and that two
@@ -161,14 +184,6 @@ fn admin_listen_must_not_use_a_frontend_port() {
     for free in [17_999, 18_005, 18_009, 18_015] {
         assert!(ProxyConfig::from_toml_str(&with(free)).is_ok(), "{free}");
     }
-}
-
-/// Asserts that `admin_listen` belongs to pool mode: a slot-mode table that sets it is refused.
-#[test]
-fn admin_listen_is_not_for_slot_mode() {
-    let text = format!("admin_listen = \"127.0.0.1:18090\"\n{HEAD}{UPSTREAM}");
-    let why = refused(&text);
-    assert!(why.contains("pool mode"), "{why}");
 }
 
 /// Asserts that a table written back out (as `setup` rewrites `installer.toml`) reads as the

@@ -81,7 +81,7 @@ pub use durable::{
     ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, ID_BLOCK, INTAKE_POLL, ORPHAN_WAIT,
     OWNER_CACHE_TTL, SESSION_RENEWAL, StateError,
 };
-pub use handover::{FOLLOW_EVERY, UNTRACED_LOOKS};
+pub use handover::FOLLOW_EVERY;
 pub use phase::Reported;
 
 use self::ack::{Verdict, refusal};
@@ -315,12 +315,9 @@ struct State {
     /// nothing and queues nothing.
     fenced: bool,
     /// For each operation this farm's callers wait on ([`Farm::follow`]) that the last
-    /// looks found neither unfinished nor ended, how many looks in a row. Only reported
-    /// (`kbf_frontend_relay_untraced`): no look count ends a caller's wait.
+    /// looks found neither unfinished nor ended, how many looks in a row. Only logged:
+    /// no look count ends a caller's wait.
     untraced_kept: BTreeMap<OperationId, u32>,
-    /// The same for the operations relays follow ([`kbf_front::Handed::look`]), until
-    /// the relay lets go of them.
-    untraced_relayed: BTreeMap<OperationId, u32>,
     /// The learned-sizes shadow ([`crate::learned`]); off unless `--learned-sizes`
     /// says otherwise.
     learned: Learned,
@@ -433,7 +430,6 @@ impl Farm {
                 unclaimed: BTreeMap::new(),
                 fenced: false,
                 untraced_kept: BTreeMap::new(),
-                untraced_relayed: BTreeMap::new(),
                 learned: Learned::new(LearnedSizes::Off, 0, 0),
                 unwritten_floors: Vec::new(),
                 intake: Intake::default(),
@@ -554,13 +550,6 @@ impl Farm {
     #[must_use]
     pub fn open_executions(&self) -> u64 {
         self.cache.metrics().execute.open_executions.get()
-    }
-
-    /// Execute and WaitExecution calls this process forwards to its successor, open now
-    /// (`kbf_handover_relays_open`): each keeps a handed-over frontend alive.
-    #[must_use]
-    pub fn relays_open(&self) -> u64 {
-        self.cache.metrics().handover_relays_open.get()
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {

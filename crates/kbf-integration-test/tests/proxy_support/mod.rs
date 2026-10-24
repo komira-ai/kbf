@@ -1,7 +1,7 @@
-//! What the two proxy soaks share (`proxy_soak.rs`, `proxy_aio_soak.rs`): real `kbf`
-//! children (this test binary run through a link named `kbf`), the TLS h2 client of the
+//! What the proxy tests share (`proxy_soak.rs`, `proxy_pool.rs`, `ui_through_proxy.rs`): real
+//! `kbf` children (this test binary run through a link named `kbf`), the TLS h2 client of the
 //! proxy, the `Execute` streams a Buck2 build holds open, and reads of a child's own count
-//! of them. Each soak says in its own header what it proves with them.
+//! of them. Each test says in its own header what it proves with them.
 
 use std::io::{BufReader, Read as _, Write as _};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -155,20 +155,21 @@ pub async fn until(what: &str, mut done: impl FnMut() -> bool) {
     assert!(met, "{what}");
 }
 
-/// The ports of a base, as the proxy's static table has them.
+/// The ports of two members whose bases are ten apart, as the proxy has them: REAPI, worker,
+/// operator and admin calls of each.
 const OFFSETS: [u16; 8] = [0, 1, 2, 3, 10, 11, 12, 13];
 
 /// The claims of this process, kept until it exits (a lock lives as long as its file).
 static CLAIMED: std::sync::Mutex<Vec<std::fs::File>> = std::sync::Mutex::new(Vec::new());
 
-/// A base port such that the REAPI, worker, operator and admin ports of slot A (the base plus
-/// 0 to 3) and of slot B (plus 10 to 13), as the proxy's static table has them, are free now
-/// and stay claimed against every other test process using this function.
+/// A base port such that the REAPI, worker, operator and admin ports of the first member (the
+/// base plus 0 to 3) and of a second (plus 10 to 13), as the proxy has them, are free now and
+/// stay claimed against every other test process using this function.
 ///
 /// Probing alone is not enough: the probe's sockets are closed before the children bind, and
 /// nextest runs each test in its own process, so two tests whose pid-derived bases are a few
 /// apart (their port sets overlap) probe the same free ports and then one child finds its port
-/// taken, exits, and the swap respawns it as a candidate. Each port is therefore also claimed
+/// taken and exits. Each port is therefore also claimed
 /// by an exclusive lock on a file named for it, held until this process exits. The bases stay
 /// below the ephemeral range, so no outgoing connection takes one of them either.
 pub fn free_base() -> u16 {
@@ -226,10 +227,9 @@ pub fn storage_node(dir: &Path, name: &str) -> Child {
     )
 }
 
-/// The arguments of a `kbf frontend` on the ports of the slot whose base is `base`, in front
-/// of the storage node at `storage` (its `host:port`), keeping its state in the SQLite file
-/// `state` (a frontend starts only over a state store, and a file is held by one process, so
-/// each slot has its own).
+/// The arguments of a `kbf frontend` on the ports from `base`, in front of the storage node at
+/// `storage` (its `host:port`), keeping its state in the SQLite file `state` (a frontend starts
+/// only over a state store, and a file is held by one process, so each frontend has its own).
 pub fn frontend_args(storage: &str, base: u16, state: &Path) -> Vec<String> {
     vec![
         "frontend".to_owned(),
@@ -241,9 +241,10 @@ pub fn frontend_args(storage: &str, base: u16, state: &Path) -> Vec<String> {
     ]
 }
 
-/// The proxy's configuration for `base` (slot A's first port; slot B is ten above): TLS
-/// from a CA and a server certificate written under `dir/pki`, and the operator token file
-/// the proxy reads at start (0600, at least 32 characters).
+/// The proxy's configuration for the one member `a` whose first port is `base` (a test of
+/// more members adds them, ten ports apart): TLS from a CA and a server certificate written
+/// under `dir/pki`, and the operator token file the proxy reads at start (0600, at least 32
+/// characters).
 pub fn proxy_config(
     dir: &Path,
     base: u16,
@@ -263,7 +264,7 @@ pub fn proxy_config(
          server_key_file = {:?}\n\
          client_ca_file = {:?}\n\
          proxy_auth_file = {:?}\n\
-         [upstream]\nbase_port = {base}\n",
+         [[frontend]]\nname = \"a\"\nbase_port = {base}\n",
         pki.server_cert,
         pki.server_key,
         pki.ca_cert,
@@ -478,7 +479,7 @@ pub async fn proxy_get(client: &SendRequest<Bytes>, path: &str) -> (u16, String)
     (status, String::from_utf8_lossy(&text).into_owned())
 }
 
-/// Waits (at most 30 s) until the proxy's `/readyz` is 200.
+/// Waits (at most 30 s) until the proxy's `/readyz` is 200: some member is up and ready.
 pub async fn until_ready(client: &SendRequest<Bytes>) {
     let mut code = proxy_get(client, "/readyz").await.0;
     for _ in 0..1_500 {
@@ -490,6 +491,6 @@ pub async fn until_ready(client: &SendRequest<Bytes>) {
     }
     assert_eq!(
         code, 200,
-        "/readyz never went 200 with a ready real child active"
+        "/readyz never went 200 with a ready real child in the pool"
     );
 }

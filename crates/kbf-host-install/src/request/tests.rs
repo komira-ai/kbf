@@ -392,3 +392,45 @@ fn the_unit_is_made_from_a_checked_name() {
     let over = "a".repeat(MAX_FRONTEND_LEN + 1);
     assert!(Unit::frontend(&over).is_err());
 }
+
+/// A unit the local socket may restart is `kbf-<name>.service` or `kbf-<name>@<instance>.service`
+/// and nothing else: no other prefix, no path, no option, no other kind of unit, no empty
+/// name, no trailing hyphen, no plain-unit marker as an instance.
+#[test]
+fn a_configured_service_is_a_kbf_service_and_nothing_else() {
+    for good in [
+        "kbf-daemon.service",
+        "kbf-storage-and-daemon.service",
+        "kbf-frontend@a.service",
+        "kbf-frontend@main-2.service",
+        "kbf-x.service",
+        "kbf-daemon2.service",
+        "kbf-9.service",
+    ] {
+        assert_eq!(Unit::service(good).unwrap().as_str(), good, "{good}");
+    }
+    let long = format!("kbf-{}.service", "a".repeat(61));
+    for bad in [
+        "",
+        "kbf-.service",
+        "kbf.service",
+        "sshd.service",
+        "kbf-daemon",
+        "kbf-daemon.timer",
+        "kbf-daemon.socket",
+        "kbf-daemon.service ",
+        "-kbf-daemon.service",
+        "--now.service",
+        "kbf-Daemon.service",
+        "kbf-daemon-.service",
+        "kbf-da/emon.service",
+        "kbf-daemon@.service",
+        "kbf-daemon@-.service",
+        "kbf-daemon@A.service",
+        "kbf-daemon@a@b.service",
+        "kbf-daemon\n.service",
+        long.as_str(),
+    ] {
+        assert!(Unit::service(bad).is_err(), "{bad:?}");
+    }
+}

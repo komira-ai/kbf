@@ -491,7 +491,7 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         );
     }
     if let Verb::Proxy(args) = &cli.verb {
-        return match proxy_verb::run(args, &root_of(cli)) {
+        return match proxy_verb::run(args) {
             Ok(()) => Exit::Ok,
             Err(e) => say(
                 e.exit(),
@@ -501,16 +501,15 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         };
     }
     let result = match &cli.verb {
-        // `setup` checks for root itself and prints its steps ahead of its own result.
+        // `setup` checks for root itself and prints its steps ahead of its own result. The
+        // proxy's flags are refused first, from the flags alone: two-slot supervision was
+        // removed, so a run that gives one reads and changes nothing.
         Verb::Setup(args) => {
+            if let Some(refusal) = args.proxy.refusal() {
+                return finish_setup(cli.json, Err(refusal), &[], out, err);
+            }
             let mut steps = Vec::new();
-            let result = setup::cli_with_proxy(
-                root_of(cli),
-                &args.setup,
-                &args.proxy,
-                cli.apply,
-                &mut steps,
-            );
+            let result = setup::cli(root_of(cli), &args.setup, cli.apply, &mut steps);
             return finish_setup(cli.json, result, &steps, out, err);
         }
         Verb::Run(args) => run(root_of(cli), args),

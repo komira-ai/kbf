@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use kbf_state::{Cond, Store, Txn};
-use kbf_types::{NodeId, RoleSet, TokenId, TokenSecret};
+use kbf_types::{HostRole, NodeId, Role, RoleSet, TokenId, TokenSecret};
 use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 
@@ -22,8 +22,12 @@ pub const MAX_USES: u32 = 1000;
 /// What an operator asks of a new token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenSpec {
-    /// The roles it grants.
+    /// The roles it grants. [`Role::Updater`] only alone, and then with `host_role`, a
+    /// `node_id` and one use: an updater's token is for one host, once.
     pub roles: RoleSet,
+    /// What the host runs, which its updater's certificate names: given for the role
+    /// [`Role::Updater`] and for no other.
+    pub host_role: Option<HostRole>,
     /// How many nodes it can enroll: 1 to [`MAX_USES`].
     pub max_uses: u32,
     /// How long it lives from now: more than zero, at most [`MAX_TTL`]; [`DEFAULT_TTL`]
@@ -51,6 +55,8 @@ pub struct TokenInfo {
     pub id: TokenId,
     /// The roles it grants.
     pub roles: RoleSet,
+    /// What the host runs, for a token that grants the role `updater`.
+    pub host_role: Option<HostRole>,
     /// Uses allowed.
     pub max_uses: u32,
     /// Uses consumed.
@@ -84,6 +90,7 @@ pub(crate) fn info(id: &TokenId, row: &TokenRow) -> Result<TokenInfo, Corrupt> {
     Ok(TokenInfo {
         id: id.clone(),
         roles: rows::role_set(&row.roles, "token")?,
+        host_role: host_role_of(row.host_role.as_deref(), "token")?,
         max_uses: row.max_uses,
         uses: row.uses,
         expires_at: row.expires_at,
@@ -96,6 +103,15 @@ pub(crate) fn info(id: &TokenId, row: &TokenRow) -> Result<TokenInfo, Corrupt> {
         label: row.label.clone(),
         created_by: row.created_by.clone(),
     })
+}
+
+/// The host role a row names, if it names one.
+pub(crate) fn host_role_of(
+    name: Option<&str>,
+    family: &'static str,
+) -> Result<Option<HostRole>, Corrupt> {
+    name.map(|name| name.parse().map_err(|_| Corrupt(family)))
+        .transpose()
 }
 
 /// Stores a new token whose secret is `secret`. The caller drew `id` and `secret` from a
@@ -114,6 +130,7 @@ pub fn create_token(
     if !(1..=MAX_USES).contains(&spec.max_uses) {
         return Err(RegistryError::Invalid("max_uses must be 1 to 1000"));
     }
+    check_updater(spec)?;
     if !spec.names.iter().all(|name| is_name_rule(name)) {
         return Err(RegistryError::Invalid(
             "names must be host names, addresses or .suffixes",
@@ -145,12 +162,55 @@ pub fn create_token(
         created_at: now,
         created_by: spec.created_by.clone(),
         revoked_at: None,
+        host_role: spec.host_role.map(|role| role.name().to_owned()),
     };
     let txn = Txn::new().put(rows::token_key(id), row.encode_to_vec(), Cond::Absent);
     if store.txn(txn)?.is_err() {
         return Err(RegistryError::Invalid("a token with this id exists"));
     }
     Ok(info(id, &row)?)
+}
+
+/// The rules of an updater's token: the host role goes with the role `updater` and with no
+/// other, which is granted alone, for one named host, once.
+fn check_updater(spec: &TokenSpec) -> Result<(), RegistryError> {
+    if !spec.roles.contains(Role::Updater) {
+        return match spec.host_role {
+            None => Ok(()),
+            Some(_) => Err(RegistryError::Invalid(
+                "host_role goes with the role updater only",
+            )),
+        };
+    }
+    if spec.roles.mixes_updater() {
+        return Err(RegistryError::Invalid("the role updater is granted alone"));
+    }
+    if spec.host_role.is_none() {
+        return Err(RegistryError::Invalid("an updater token needs a host_role"));
+    }
+    if spec.node_id.is_none() || spec.node_prefix.is_some() {
+        return Err(RegistryError::Invalid(
+            "an updater token names its one host by node_id, not by a prefix",
+        ));
+    }
+    if spec.max_uses != 1 {
+        return Err(RegistryError::Invalid("an updater token has one use"));
+    }
+    Ok(())
+}
+
+/// The host role the token `id` fixes: `None` for a token that is unknown or fixes none.
+/// A caller asks it only to learn what to sign, and signs only after the registry has
+/// verified the token's secret, so the answer reveals nothing to a caller without it.
+///
+/// # Errors
+/// The store failing; a row that does not decode.
+pub fn token_host_role(store: &dyn Store, id: &TokenId) -> Result<Option<HostRole>, RegistryError> {
+    let read = rows::fetch::<TokenRow>(store, &rows::token_key(id), "token")?;
+    Ok(read
+        .map(|read| host_role_of(read.row.host_role.as_deref(), "token"))
+        .transpose()?
+        .flatten())
 }
 
 /// Every token, by id. The secret is not in the answer.

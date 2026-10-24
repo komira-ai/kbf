@@ -619,9 +619,8 @@ once the retire has completed, with `retired` true. Calling it again changes not
 answers the same status. The retire:
 
 - refuses every new Execute `UNAVAILABLE`, which Buck2 retries when it opens a call;
-- waits, for at most ten seconds (`--handover-quiesce-secs` where the frontend has a
-  handover socket), for the calls between their request and their queueing, then stops
-  taking work: the frontend reads no more of the state store's queue, grants nothing,
+- waits, for at most ten seconds, for the calls between their request and their queueing,
+  then stops taking work: the frontend reads no more of the state store's queue, grants nothing,
   claims nothing and writes the requeues the store had refused (for at most the same
   time again);
 - stops the worker listener and ends every worker stream `UNAVAILABLE`, so each daemon
@@ -680,10 +679,10 @@ call changes nothing. Every answer carries `Cache-Control: no-store`.
 | `GET /v1/enroll/nodes` | lists the nodes | `{"nodes": [...]}` |
 | `POST /v1/enroll/nodes/{id}/revoke` | revokes a node | `{"id": "...", "denied": [...]}` |
 
-**Create.** The body is `{"roles": ["daemon"], "max_uses": 1, "expires_in": 86400,
-"node_id": "n1", "node_prefix": "rack-", "names": [".example"], "replace": false,
-"label": "rack 4"}`; only `roles` is required (`storage` and `daemon`, one to two, no
-repeat). `max_uses` is 1 to 1000 (default 1); `expires_in` is seconds, at least 1 and at
+**Create.** The body is `{"roles": ["daemon"], "host_role": null, "max_uses": 1,
+"expires_in": 86400, "node_id": "n1", "node_prefix": "rack-", "names": [".example"],
+"replace": false, "label": "rack 4"}`; only `roles` is required (`storage` and `daemon`, one to
+two, no repeat; or `updater` alone, below). `max_uses` is 1 to 1000 (default 1); `expires_in` is seconds, at least 1 and at
 most 30 days (default a day); `node_id` and `node_prefix` restrict the node ids the token
 enrolls; `names` restricts the hosts a storage node may advertise (a host, or a suffix that
 starts with `.`; empty allows any); `replace` lets it re-enroll an id that exists. An
@@ -700,7 +699,14 @@ returns the hash, the secret or the string. Lose it and revoke the token. A toke
 string cannot be built (the frontend has no CA pin, `503`; the random source fails, `500`)
 is not stored.
 
-`info` and each element of `tokens` are `{id, roles, max_uses, uses, expires_at,
+**A host's updater** ([deploy/kbf-updater.md](deploy/kbf-updater.md#enrolling-a-host)) enrolls with
+a token whose `roles` is `["updater"]` and nothing else, with `host_role` (`frontend`, `storage`,
+`daemon` or `mac-daemon`: what its certificate says the host runs), the one `node_id` it is for
+(no `node_prefix`) and one use; each of those is a `400` if wrong, and `host_role` is a `400` on a
+token that does not grant `updater`. Its certificate has the role `updater`; the updater has a
+registry row of its own, beside any node of the same id, and the node listing does not show it.
+
+`info` and each element of `tokens` are `{id, roles, host_role, max_uses, uses, expires_at,
 created_at, revoked_at, node_id, node_prefix, names, replace, label, created_by}`; times
 are seconds on the state store's clock. **Revoke** stops new enrollments with the token;
 nodes it enrolled stay enrolled, and revoking a revoked token is a `200`. `404` for an
@@ -758,8 +764,6 @@ carries the SHA-256 of the root, and pins it.
 | `--enroll-rate-per-minute=N`, `--enroll-rate-burst=N`, `--enroll-max-in-flight=N` | the limits below (defaults 60, 30, 64) |
 | `--enroll-worker-endpoint`, `--enroll-cas-endpoint`, `--enroll-storage-port` | what every node is told (`NodeConfig`) |
 | `--enroll-allow-unenforced-deny` | see the start gate |
-
-With `--instance=b` the enroll port moves ten above, as the others do.
 
 
 **Order of an `Enroll`.** The shape (ids, role names, the size of each CSR) is checked
@@ -938,107 +942,21 @@ whoever acts on a zero keeps new writes away from the node first (drains it), th
 again. A member that left the map (a `DOWN` member leaves after the dwell) is not counted.
 `503` with `{"error": ...}` when the membership cannot be read.
 
-## The admin calls: `GET /v1/admin/role` and `POST /v1/admin/{quiesce,resume,takeover,stand-down}`
+## The admin calls (removed)
 
-A `kbf --mode frontend` started with `--admin-listen <addr>` serves these on a port of
-their own, separate from the operator API. The address must be a loopback address (any
-other is refused at start, in the flags and again when the port is bound): the calls move
-the scheduler's role, so nothing but the host's own processes may reach them. The port
-needs `--state-store`.
-
-**Who may call.** With `--proxy-auth-file` (a frontend behind the proxy) every call, `GET
-role` too, must present the proxy's secret as `x-kbf-proxy-auth: <64 hex digits>` (the
-header of [Behind the farm's proxy](#behind-the-farms-proxy); no identity header is
-needed). A call with no secret, or a wrong one, is refused `403` with
-`{"error": "..."}`, as on the operator API, and is not acted on. The proxy sends the secret
-on every admin call. Without `--proxy-auth-file` the calls take no credential: the port is
-loopback-only and every local process may call it, which is for a host with no proxy. The calls and the `role` answer
-are versioned by `admin_protocol` in `kbf --version --json` (`docs/artifacts.md`).
-
-**`GET /v1/admin/role`**:
-
-```json
-{
-  "role": "active",
-  "instance_id": "5d1c4a52-8b0e-4f64-9a27-3c0e4f8d9a10",
-  "admin_protocol": 1,
-  "generation": 7,
-  "held_generation": 7,
-  "superseded": false,
-  "open_streams": 3,
-  "open_sessions": 2,
-  "reapi": "127.0.0.1:8980",
-  "worker": "127.0.0.1:8981",
-  "api": "127.0.0.1:8982"
-}
-```
-
-- `role`: `candidate` (started with `--await-takeover`: holds no generation and schedules
-  nothing), `active` (holds the generation and schedules), `quiesced` (holds it and has
-  stopped scheduling, assigning and requeueing) or `stood-down` (another process holds the
-  generation).
-- `instance_id`: a UUID, new for each process.
-- `generation`: the generation the state store is at now (`null` if it cannot be read);
-  `held_generation`: the one this process took (`null` for a candidate). A takeover passes
-  the holder's `generation` as `expect`. A process over a Postgres store, which the
-  frontends share and which holds no generation, answers `null` for both.
-- `superseded`: the store has refused a write of this process because another writer holds
-  the generation.
-- `open_streams`: Execute and WaitExecution streams open; `open_sessions`: worker streams
-  open.
-- `reapi`, `worker`, `api`: the listeners. A candidate has no worker listener, and a
-  stood-down process has none again.
-
-Every call below answers `200` with this object after the call. A call that does not apply
-answers `409` with the object and an `error` naming why (`role`, or a generation); a body
-that is not what the call takes is `400`.
-
-**`POST /v1/admin/quiesce`** (active or quiesced): waits, for at most 10 seconds, for the
-Execute calls between their request and their queueing and the results being taken, then
-fences the farm: it feeds the scheduler nothing, so nothing is granted, assigned or
-requeued, a call that would queue is refused `UNAVAILABLE`, and a worker's result or
-heartbeat is not applied. It writes the requeues the store refused. Idempotent. Open
-streams and worker sessions stay open. While quiesced, a worker's heartbeat or result is not
-applied, so a quiesce is meant to last seconds (a takeover's limit is 10): one longer than
-the leases' expiry lets the scheduler expire the leases of work still running and requeue it
-when the process resumes. Nothing bounds it. Refused with `409` when the store holds no
-generation (a Postgres store shared by frontends): nothing could take over, and nothing is
-stopped.
-
-**`POST /v1/admin/resume`** (quiesced or active): undoes a quiesce, for a takeover that did
-not happen. A process over a store that holds no generation is never quiesced, so a resume
-of it changes nothing. Refused with `409` when the store is no longer at `held_generation` or
-the
-store has refused a write of this process (another writer holds it: only `stand-down`
-applies). The farm fed the scheduler nothing while it was quiesced, so its memory is the
-store's as of the quiesce; nothing is reloaded.
-
-**`POST /v1/admin/takeover`**, body `{"expect": N}` (candidate only): takes the generation,
-which must be exactly `N` (a store at another generation is refused with `409` and nothing
-is written), keeps the epoch (daemons that redial keep the runs of their leases), reads all
-state from the store, and starts the scheduler, the reconciler and the worker listener on
-the sockets the candidate already bound. `500` if the generation was taken and the
-frontend could not start; the process then ends. Refused with `409` when the store holds no
-generation (a Postgres store shared by frontends).
-
-**`POST /v1/admin/stand-down`** (active, quiesced or stood-down): the old holder's step
-after a takeover elsewhere. It ends the worker streams with `UNAVAILABLE` ("connect
-again"), stops the worker listener, goes not ready (`/readyz`, the health service) and
-answers the Execute and WaitExecution streams it kept from the `done/` rows the new
-holder writes, with no GOAWAY and no timeout. It does not give up the state store. It is
-not undone. A process that is never told to stand down but finds it is fenced (the store
-refused a write of its own: `superseded` turns true) fences its farm and answers its kept
-calls from the `done/` rows the same way. The process exits only when told to (`open_streams` and `open_sessions` say
-when it holds nothing).
-
-**A candidate** (`--await-takeover`, which needs `--admin-listen`) opens the state store
-without taking the generation, touches no epoch and writes nothing; it serves `/readyz`,
-`grpc.health.v1` and `GetCapabilities`, and no other REAPI call (`UNIMPLEMENTED`). It runs
-no scheduler or reconciler and binds no worker listener. It makes and changes no schema.
-A SQLite state file is held by one process (an exclusive file lock), so a candidate cannot
-run beside the process that holds the file: side by side needs the Postgres store.
-A start without `--await-takeover` takes the next generation and keeps the epoch, as any
-start does; only `POST /v1/epoch/bump` changes it.
+A `kbf --mode frontend` no longer serves `GET /v1/admin/role` and
+`POST /v1/admin/{quiesce,resume,takeover,stand-down}`, and has no candidate that waits for
+a takeover: frontends that share a Postgres state store each take work from it, and a
+frontend leaves service by [the retire](#get-v1frontendretire-and-post-v1frontendretire) or a stop. The flags that
+turned the admin port on (`--admin-listen`, `--await-takeover`) and the flags of the
+handover between two frontends of one host (`--handover-socket`, `--instance`,
+`--handover-quiesce-secs`, `--handover-follow-interval-ms`, `--handover-watchdog-secs`,
+`--handover-peer-name`, `--envoy-check-interval-ms`, `--envoy-check-timeout-ms`,
+`--envoy-unhealthy-threshold`), and their keys in the `[handover]` table of `kbf.toml`, are
+still accepted so that a unit or file written before the removal starts: they are hidden
+from `--help`, do nothing, and each one given logs a warning naming it. They are removed in
+the release after. `admin_protocol` in `kbf --version --json` (`docs/artifacts.md`) stays 1
+for a proxy that still reads it.
 
 ## `/v1/object-stores/...`
 
@@ -1992,134 +1910,13 @@ treated as `UNAVAILABLE`. `UNAVAILABLE` for a caller ahead of the node is the no
 lost push: the caller's map may be the right one, so the caller tries again, and the
 node's next push makes the call succeed.
 
-## `PUT /v1/releases/{commit}/{platform}/{name}`, `GET /v1/releases` and `GET /v1/releases/{commit}`
+## `PUT /v1/releases/{commit}/{platform}/{name}`, `GET /v1/releases` and `GET /v1/releases/{commit}` (removed)
 
-The frontend's release store (`docs/design/pull-updates.md` section 6.3): the tarballs of a
-release and their build attestations, kept as uploaded. Mounted by `--releases-dir`; without a store all three answer
-`503` naming `--releases-dir`.
-
-- `commit` is 40 lowercase hex digits, `platform` is `linux-x86_64`, `linux-arm64` or
-  `darwin-arm64`, `name` is `kbf` or `kbf-daemon` (the tarball) or either with the suffix
-  `.attestation` (its build attestation bundle), or `version.json` (the platform's version
-  facts, below). Anything else is `400`; no segment is ever joined into a path as it arrived.
-- `PUT` takes the file as the body, with the write gates of the section "Who may write" except
-  the JSON content type (loopback peer, and the proxy's secret with `--proxy-auth-file`, no `Origin`, the bearer token). A tarball is at most
-  512 MiB (`413` past it), a bundle at most 256 KiB; an empty body is `400`. The body is written to
-  a `.partial` file, synced, and renamed into place, so an interrupted upload leaves nothing
-  visible.
-- `201` `{"sha256", "size"}` for a new key. A release is immutable: the same bytes again are
-  `200` with the same answer, other bytes are `409` and change nothing. The answer for a
-  bundle carries the bundle's own digest, and the store also names the bundle by that
-  digest next to the tarballs (one file, two names), so that `ReleaseService.Fetch` serves a
-  bundle like a tarball. A bundle stored before that link existed has no such name until the
-  same bytes are put again (`200`); `Describe` reports it as lacking until then, though
-  `GET /v1/releases` and the offers still count its platform complete.
-- **Version facts.** `PUT /v1/releases/{commit}/{platform}/version.json` takes, as the body
-  (at most 4 KiB), the exact bytes of that platform's `kbf --version --json`: the file
-  `kbf-<commit>-<platform>.version.json` the release's build writes. The offers carry its
-  `protocol`, `min_protocol`, `state_schema` and `profile` (`docs/design/pull-updates.md`
-  section 6.2). The document is read with the parser the installer reads a staged binary's report
-  with, and is `400`, naming the file and the reason, when it does not parse, names another commit
-  (its first 12 digits) or, if it names one, another platform than the path, is not a `release`
-  build, has a `protocol` or `state_schema` of 0 or past 32 bits, or a `min_protocol` above
-  `protocol`. Same immutability and answers as a tarball. **A platform stored without it is
-  accepted and held, and is never offered:** the `201`/`200` answer of its tarball or attestation
-  `PUT` carries `"note": "no version facts (kbf-<commit>-<platform>.version.json): nodes will not
-  be offered this platform; rebuild the release to include it"`, and `GET /v1/releases` lists the
-  platform with `"version_facts": false` and the same `note` (`true` and no `note` when stored).
-  A commit stored before this field existed lists as `false` and is not offered either.
-  The document is unattested (the store attests no file) and is only a hint: the node runs the staged,
-  attested binary and refuses the activation unless its own report equals the offer's facts. The platform
-  check applies only if the document names a platform, which `kbf --version --json` does not today. A
-  well-formed document with wrong numbers is pinned (a different body is a `409`) and every node then
-  refuses that release with facts-differ; the repair is a new commit.
-- `GET` is open and lists `{"releases": [{"commit", "platforms": [{"platform", "complete",
-  "version_facts", "note"?, "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
-  order above, a platform `complete` when it holds, with their attestations, the tarballs its
-  hosts need: `kbf` for every platform, `darwin-arm64` included (a Mac runs `kbf --mode=daemon`,
-  and no darwin `kbf-daemon` is built). A component is
-  listed when its tarball is stored.
-- `GET /v1/releases` and the gRPC `ReleaseService.Fetch` are unauthenticated at the router and
-  the service. `Fetch` is mounted on the worker listener, behind its mutual TLS and the role
-  table (the daemon role alone may call it) when TLS is configured; in plain-text worker mode
-  it is open, like every worker method. `GET /v1/releases` is open to whoever reaches the
-  operator API, like `GET /v1/nodes`: it lists commits, platforms and digests, no bytes. The
-  store is mounted by `--releases-dir`, which needs `--api-listen`; without the flag every
-  update endpoint answers `503`.
-
-### `ReleaseService.Describe` and `GET /v1/releases/{commit}`
-
-What the store holds of one release, for a caller that was given no offer: the installer's
-`frontend_update` order names a commit and nothing else (`docs/design/kbf-installer.md`
-section 5), so it asks the release source what the commit holds before it fetches. The
-answer is claims, not trust: the installer fetches each file by its digest and verifies the
-tarball against its bundle, which it does for an offer's components too.
-
-`rpc Describe(DescribeRequest) returns (ReleaseDescription)` on `kbf.update.v1.ReleaseService`
-(`crates/kbf-proto/proto/kbf/update/v1/update.proto`):
-
-- `DescribeRequest{commit, platform}`: `commit` is 40 lowercase hex digits; `platform` is
-  `linux-x86_64`, `linux-arm64` or `darwin-arm64`, or empty for every platform the release
-  is complete for.
-- `ReleaseDescription{commit, components}`: one `ReleaseComponent{name, platform, tarball,
-  sha256, size, bundle_sha256, bundle_size}` for each tarball a host of each described
-  platform needs (the same rule as an offer: `kbf` for a Linux platform, `kbf-daemon` for
-  `darwin-arm64`, and nothing else the store happens to hold), in platform order
-  (`linux-x86_64`, `linux-arm64`, `darwin-arm64`). `tarball` is the file name
-  `<name>-<commit>-<platform>.tar.gz`; `sha256` and `size` are the tarball's;
-  `bundle_sha256` and `bundle_size` are the build-provenance bundle's
-  (`<tarball>.sigstore.json`, at most 256 KiB). Both files are served by `Fetch` under their
-  digests.
-- A platform is described only when complete: every tarball it needs is stored with its
-  bundle, and the bundle is served by its digest. With a platform asked, one that is not
-  complete fails the call. With none asked, an incomplete platform is left out and the call
-  fails only when none is complete.
-- `INVALID_ARGUMENT` for a commit that is not exactly 40 lowercase hex digits (a 12-digit
-  short commit included) and for a platform that is not one of the three; `NOT_FOUND` when no
-  tarball of the commit is stored (a bundle alone is not a release); `FAILED_PRECONDITION`
-  when the platform asked is not complete, or none is, with a message that names what is
-  lacking per platform (`linux-arm64 has no tarball of kbf`, `linux-x86_64 has no attestation
-  of kbf`, or a bundle not served by its digest, which putting it again repairs);
-  `UNAVAILABLE` without `--releases-dir`; `INTERNAL` for a store that fails, saying only that.
-- **Who may call it** is the rule of `Fetch`, one row of the worker listener's role table:
-  under mutual TLS the daemon role alone (another role is `PERMISSION_DENIED`, no certificate
-  is `UNAUTHENTICATED`); in plain-text worker mode it is open, like every worker method.
-  The service itself checks nothing.
-
-`GET /v1/releases/{commit}` answers the same description for every complete platform as
-JSON, open like `GET /v1/releases`: `200`, `400` for a commit that is not 40 lowercase hex
-digits, `404` when no tarball of it is stored, `409` when no platform is complete (the
-message is `Describe`'s), `503` without a store.
-
-```json
-{
-  "schema": 1,
-  "commit": "<40 hex>",
-  "components": [
-    {
-      "name": "kbf",
-      "platform": "linux-x86_64",
-      "tarball": "kbf-<commit>-linux-x86_64.tar.gz",
-      "sha256": "<64 hex>",
-      "size": 123,
-      "bundle_sha256": "<64 hex>",
-      "bundle_size": 456
-    }
-  ]
-}
-```
-
-`schema` is `1`. A field is added without moving it; a reader takes `schema` 1 only, ignores
-keys it does not know, and holds every value to the shape above before it uses it.
-
-**The `url` source's file.** A `url` release source is a static HTTPS server of the store's
-layout (`docs/design/kbf-installer.md` section 5): `files/<sha256>` holds every tarball and
-every bundle by digest, and `releases/<commit>.json` is this route's body, saved. Nothing
-in this repository writes that tree: the release workflow attaches tarballs and bundles to a
-GitHub release by name, and `kbf-server` serves no files over HTTP. A mirror is made from a
-frontend's store: copy its `files/` directory and save the route's body for each commit
-(`curl -fsS "$API/v1/releases/$COMMIT" > releases/$COMMIT.json`); a commit that is not
-complete for any platform has no file to save (`409`).
+`kbf-server` no longer keeps a release store: the three routes answer `404`, and the
+gRPC `kbf.update.v1.ReleaseService` (`Fetch`, `Describe`) is not served, so a call to it
+is refused as a method the worker listener does not serve. A release reaches a host as a
+package. `--releases-dir` is accepted, hidden from `--help` and ignored for one release, and
+logs a warning naming it; a directory left there is never opened, changed or deleted.
 
 ## `GET /v1/update` and `POST /v1/update/{desired,pause,resume}` (removed)
 

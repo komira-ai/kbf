@@ -3,8 +3,8 @@
 //! Every farm process asks the kernel to kill it when the harness dies ([`crate::procs`]), but
 //! the Buck2 daemons of the load are not the harness's children: each leads a session of its
 //! own, started by a `buck2 build` client that has ended. A harness killed by SIGKILL (a
-//! runner that cancels a job and gives it no time) runs no `Drop`, so those daemons, and the
-//! frontend's control socket, would be left behind.
+//! runner that cancels a job and gives it no time) runs no `Drop`, so those daemons would
+//! be left behind.
 //!
 //! So the harness starts, before the farm, a second process: `kbf-beta reap`. It leads a
 //! session of its own and has no parent-death signal, and it reads its standard input, a pipe
@@ -12,8 +12,8 @@
 //! closes the pipe, and the sentinel exits having done nothing. When the harness dies by any
 //! means, the kernel closes the pipe, the sentinel reads the end of its input with no `done`,
 //! and it kills the process groups the roles recorded ([`crate::procs::pgid_file`]: the kernel
-//! kills a role itself with the harness but not what the role started), the daemons of the
-//! loops, and removes the control socket.
+//! kills a role itself with the harness but not what the role started) and the daemons of the
+//! loops.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -51,9 +51,6 @@ pub struct Reap {
     /// The longest one `buck2 kill` may take, in milliseconds.
     #[arg(long)]
     pub kill_timeout_ms: u64,
-    /// The frontend's control socket, which a killed frontend leaves behind.
-    #[arg(long)]
-    pub socket: Option<PathBuf>,
     /// The directory the roles record their process groups in (the run's logs).
     #[arg(long)]
     pub pgids: Option<PathBuf>,
@@ -69,16 +66,15 @@ pub enum Word {
 }
 
 impl Reap {
-    /// The cleanup of `daemons` and, if there is one, `socket`.
+    /// The cleanup of `daemons` and, if there is one, the process groups in `pgids`.
     #[must_use]
-    pub fn new(daemons: &Daemons, socket: Option<PathBuf>, pgids: Option<PathBuf>) -> Self {
+    pub fn new(daemons: &Daemons, pgids: Option<PathBuf>) -> Self {
         Self {
             buck2: daemons.buck2.clone(),
             project: daemons.project.clone(),
             lanes: daemons.lanes,
             run_id: daemons.run_id.clone(),
             kill_timeout_ms: u64::try_from(daemons.kill_timeout.as_millis()).unwrap_or(u64::MAX),
-            socket,
             pgids,
         }
     }
@@ -111,10 +107,6 @@ impl Reap {
             "--kill-timeout-ms".into(),
             self.kill_timeout_ms.to_string().into(),
         ];
-        if let Some(socket) = &self.socket {
-            args.push("--socket".into());
-            args.push(socket.clone().into());
-        }
         if let Some(pgids) = &self.pgids {
             args.push("--pgids".into());
             args.push(pgids.clone().into());
@@ -123,7 +115,7 @@ impl Reap {
     }
 
     /// The sentinel's whole life: waits for the harness to say it is done, or to die, and in
-    /// the second case kills the daemons and removes the control socket. Exits 0 after a
+    /// the second case kills the roles' process groups and the daemons. Exits 0 after a
     /// `done` and 1 after the cleanup of a harness that died.
     pub fn run(&self, input: &mut dyn BufRead) -> u8 {
         match word(input) {
@@ -133,9 +125,6 @@ impl Reap {
                     kill_groups(pgids);
                 }
                 self.daemons().kill_all();
-                if let Some(socket) = &self.socket {
-                    let _ = std::fs::remove_file(socket);
-                }
                 1
             }
         }

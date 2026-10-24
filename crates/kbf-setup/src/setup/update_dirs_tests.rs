@@ -26,8 +26,8 @@ fn written(exec: &FakeExec, path: &str) -> [Option<String>; 2] {
 
 /// Catches a mode writing the wrong set: the two modes whose daemon takes orders get both keys,
 /// with the layout's paths (not literals in setup), and the others get neither. `all-in-one`'s
-/// sibling takes no orders (it is restarted with its package), so it has no key; a frontend and a
-/// storage node have no daemon.
+/// in-process daemon refuses `--update-dir` at start, so a key there would stop the host; a
+/// frontend and a storage node have no daemon.
 ///
 /// Catches: `takes_orders` true for all-in-one (its file gets the keys).
 #[test]

@@ -27,7 +27,7 @@ use crate::build_seq::UNKNOWN;
 pub struct Build<'a> {
     /// Its commit count; [`UNKNOWN`] (0) when it could not count.
     pub seq: u64,
-    /// Its commit: 40 hex digits when known (a release of the store, and the running build
+    /// Its commit: 40 hex digits when known (a release offered, and the running build
     /// when [`crate::BUILD_COMMIT_FULL`] is), else the running build's 12
     /// ([`crate::BUILD_COMMIT`]), which names a 40-digit commit it is a prefix of.
     pub commit: &'a str,

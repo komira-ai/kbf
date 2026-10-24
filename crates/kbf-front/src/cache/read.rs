@@ -393,3 +393,106 @@ impl<M: MetaLog, O: ObjectStore> BlobRead<M, O> {
         Err(CacheError::Unreachable(self.digest))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use kbf_objstore::MemoryStore;
+
+    use super::*;
+    use crate::cache::{Hold, VerifiedBlob};
+    use crate::meta_log::MemoryMetaLog;
+
+    type Memory = Cache<MemoryMetaLog, MemoryStore>;
+
+    fn blob(text: &'static str) -> VerifiedBlob {
+        VerifiedBlob::hashed(Bytes::from_static(text.as_bytes()))
+    }
+
+    /// The bytes `[from, to)` of `digest`, read in windows and gathered.
+    async fn gathered(cache: &Memory, digest: &Digest, from: u64, to: u64) -> Bytes {
+        let opened = cache.read_windows(digest, from, to).await;
+        opened.expect("opens").gather().await.expect("reads")
+    }
+
+    /// Asserts that a read opens only on a range within a blob somebody has: a range that
+    /// ends before it begins or past the blob's end is refused as invalid, a blob nobody
+    /// has is not found, and the empty blob, a held blob and an indexed blob read as
+    /// their bytes.
+    #[tokio::test]
+    async fn a_read_opens_only_on_a_range_within_a_blob_somebody_has() {
+        let cache = Cache::memory().with_ram_ack_bytes(1024);
+        let held = blob("held in RAM");
+        let indexed = blob("in the index");
+        let (held_at, stored) = (held.digest(), indexed.digest());
+        assert_eq!(cache.hold(&held), Hold::Held);
+        cache
+            .store_blobs(vec![indexed.clone()])
+            .await
+            .expect("stored");
+
+        let backwards = cache.read_windows(&held_at, 5, 4).await.map(drop);
+        assert!(matches!(backwards, Err(CacheError::Invalid(_))));
+        let beyond = held_at.size_bytes + 1;
+        let past = cache.read_windows(&held_at, 0, beyond).await.map(drop);
+        assert!(matches!(past, Err(CacheError::Invalid(_))));
+        let nobody = blob("nobody has it").digest();
+        let absent = cache.read_windows(&nobody, 0, 4).await.map(drop);
+        assert!(matches!(absent, Err(CacheError::NotFound(_))));
+
+        let empty = gathered(&cache, &blob("").digest(), 0, 0).await;
+        assert!(empty.is_empty());
+        let from_ram = gathered(&cache, &held_at, 0, held_at.size_bytes).await;
+        assert_eq!(from_ram, "held in RAM");
+        let from_index = gathered(&cache, &stored, 0, stored.size_bytes).await;
+        assert_eq!(from_index, "in the index");
+    }
+
+    /// Asserts that a blob of more than one window is read whole (its windows joined), by
+    /// a range inside its last window (the first window is read and hashed, and none of
+    /// it handed over), and by an empty range (nothing handed over).
+    #[tokio::test]
+    async fn a_blob_over_one_window_is_read_whole_and_by_range() {
+        let cache = Cache::memory().with_ram_ack_bytes(16 << 20);
+        let big = VerifiedBlob::hashed(Bytes::from(vec![7u8; 9 << 20]));
+        let digest = big.digest();
+        assert_eq!(cache.hold(&big), Hold::Held);
+        let size = digest.size_bytes;
+
+        let whole = gathered(&cache, &digest, 0, size).await;
+        assert_eq!(whole.len() as u64, size);
+        let tail = gathered(&cache, &digest, size - 10, size).await;
+        assert_eq!(tail, vec![7u8; 10]);
+        let none = gathered(&cache, &digest, 5, 5).await;
+        assert!(none.is_empty());
+    }
+
+    /// Asserts that a blob whose bytes do not hash to its digest fails its read as
+    /// unreachable instead of handing the bytes over: a held blob stored under a digest
+    /// of other bytes of the same length.
+    #[tokio::test]
+    async fn a_held_blob_whose_bytes_fail_its_digest_is_unreachable() {
+        let cache = Cache::memory().with_ram_ack_bytes(1024);
+        let claimed = blob("aaaa").digest();
+        let wrong = VerifiedBlob::trusted(claimed, Bytes::from_static(b"bbbb"));
+        assert_eq!(cache.hold(&wrong), Hold::Held);
+        let failed = cache.read_blob(&claimed).await;
+        assert!(matches!(failed, Err(CacheError::Unreachable(_))));
+    }
+
+    /// Asserts that a blob over the most the server reads whole is refused as invalid by
+    /// `read_blob`, and not read: a held blob under a digest that claims one byte more.
+    #[tokio::test]
+    async fn a_blob_over_the_decoded_limit_is_not_read_whole() {
+        let cache = Cache::memory().with_ram_ack_bytes(1024);
+        let stand_in = blob("a stand-in for a huge blob");
+        let huge = Digest {
+            size_bytes: MAX_DECODED_BLOB_BYTES + 1,
+            ..stand_in.digest()
+        };
+        let held = VerifiedBlob::trusted(huge, stand_in.bytes);
+        assert_eq!(cache.hold(&held), Hold::Held);
+        let refused = cache.read_blob(&huge).await;
+        assert!(matches!(refused, Err(CacheError::Invalid(_))));
+    }
+}

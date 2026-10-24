@@ -139,3 +139,30 @@ fn version_with_anything_else_is_refused() {
         }
     }
 }
+
+/// `--serve` is the local socket's mode and takes only its own flags: with none, or with a flag
+/// it does not know, it exits 2 with its usage and serves nothing; anywhere but first it is no
+/// flag at all and the program is the forced command, which refuses.
+#[test]
+fn serve_takes_its_own_flags_and_nothing_else() {
+    for args in [
+        &["--serve"][..],
+        &["--serve", "--socket", "/run/kbf-host-install/local.sock"],
+        &["--serve", "--bogus", "1"],
+        &["--serve", "--socket", "relative", "--socket-user", "u"],
+    ] {
+        let out = run(None, args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert!(err.contains("usage: kbf-host-install --serve"), "{err}");
+    }
+    if as_root() {
+        return;
+    }
+    let out = run(None, &["query", "--serve"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), REFUSED);
+    let out = run(Some(OsStr::new("query")), &["--serve", "--socket"]);
+    assert_eq!(out.status.code(), Some(2), "needs a value");
+}

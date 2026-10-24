@@ -7,9 +7,7 @@
 //!
 //! - The daemon role opens a worker session (`kbf.worker.v1.Worker/Session`, which also
 //!   carries the storage map to the daemon) and makes the blob calls: `ByteStream`,
-//!   `ContentAddressableStorage` (the chunking calls too) and `kbf.worker.v1.Segments`, and
-//!   fetches the release it was offered (`kbf.update.v1.ReleaseService/Fetch`) and asks what
-//!   a commit holds (`kbf.update.v1.ReleaseService/Describe`).
+//!   `ContentAddressableStorage` (the chunking calls too) and `kbf.worker.v1.Segments`.
 //! - The storage role registers and heartbeats (`kbf.map.v1.Membership`); a storage
 //!   node gets the map in those answers. It also fetches the farm's registered cold store
 //!   and its keys (`kbf.enroll.v1.ColdStore/GetStoreConfig`): the only method that
@@ -88,11 +86,6 @@ pub const WORKER_LISTENER_ROLES: &[(&str, &[PeerRole])] = &[
         "/build.bazel.remote.execution.v2.ContentAddressableStorage/RegisterChunkMapping",
         DAEMON,
     ),
-    // The node's update client fetches the release it was offered (the daemon half of a
-    // storage-and-daemon host presents its daemon certificate).
-    ("/kbf.update.v1.ReleaseService/Fetch", DAEMON),
-    // What the release it is to fetch holds (the installer asks before it fetches).
-    ("/kbf.update.v1.ReleaseService/Describe", DAEMON),
     ("/kbf.worker.v1.Segments/Begin", DAEMON),
     ("/kbf.worker.v1.Segments/PutRange", DAEMON),
     ("/kbf.worker.v1.Segments/Commit", DAEMON),

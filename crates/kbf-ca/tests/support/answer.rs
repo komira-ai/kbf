@@ -241,7 +241,7 @@ fn names_node(cert: &X509Certificate<'_>, node_id: &NodeId, role: Role) -> bool 
         })
         .collect();
     match role {
-        Role::Daemon => names == [node_id.as_str()],
+        Role::Daemon | Role::Updater => names == [node_id.as_str()],
         Role::Storage => names.contains(&node_id.as_str()),
     }
 }

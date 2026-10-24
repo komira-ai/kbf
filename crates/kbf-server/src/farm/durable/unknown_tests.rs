@@ -121,22 +121,6 @@ fn unknown_rows_are_skipped_and_the_known_rows_load() {
     assert_eq!(loaded, [(OperationId(1), Some(grant()))]);
 }
 
-/// Asserts that the search for the operations that run an action passes over an `op/` row
-/// that holds a command this binary does not know, and finds the operation of a row it
-/// can read.
-#[test]
-fn the_search_for_an_actions_operations_passes_over_an_unknown_row() {
-    let store = store();
-    let durable = open(&store);
-    let submit = encode(FarmInput::Submit(request(1))).expect("encode");
-    put(&store, OP_KNOWN, submit);
-    put(&store, OP_UNKNOWN, unknown());
-    let found = durable
-        .operations_of(None, &request(1).key.action)
-        .expect("the search reads the rows");
-    assert_eq!(found, [OperationId(1)]);
-}
-
 /// Asserts that a single `op/` row a write depends on is refused, naming the row, when it
 /// holds a command this binary does not know: only a scan skips such a row.
 #[test]
@@ -183,22 +167,22 @@ fn a_request_joins_an_operation_past_an_unknown_lease_row() {
     assert!(!text.contains(LEASE_UNKNOWN), "{text}");
 }
 
-/// Asserts that a start logs the key of a row it skips, and that the search for an
-/// action's operations, which a request makes, passes over the same row without logging
-/// it.
+/// Asserts that a start logs the key of a row it skips, and that the search for the
+/// operations a node holds leases for, which a worker's arrival makes, passes over the same
+/// row without logging it.
 #[test]
 fn only_a_start_logs_the_rows_it_skips() {
     let store = store();
     let durable = open(&store);
-    put(&store, OP_UNKNOWN, unknown());
+    put(&store, LEASE_UNKNOWN, unknown());
     let lines = Lines::default();
     let _guard = lines.subscribe();
     durable
-        .operations_of(None, &request(1).key.action)
+        .held_by(&grant().worker)
         .expect("the search reads the rows");
     let text = lines.text();
-    assert!(!text.contains(OP_UNKNOWN), "{text}");
+    assert!(!text.contains(LEASE_UNKNOWN), "{text}");
     durable.load().expect("the rows load");
     let text = lines.text();
-    assert!(text.contains(OP_UNKNOWN), "{text}");
+    assert!(text.contains(LEASE_UNKNOWN), "{text}");
 }

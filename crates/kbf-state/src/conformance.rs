@@ -22,7 +22,6 @@ use crate::types::{
 use crate::{GROUP_COMMIT_WINDOW, TARGET_WRITES_PER_SECOND};
 
 mod c8_snapshot;
-pub mod fence;
 
 pub use c8_snapshot::C8_SNAPSHOT_PREFIX;
 

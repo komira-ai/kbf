@@ -258,19 +258,45 @@ fn apply(host: &MacHost, runner: &dyn Runner, plan: &Plan) -> Result<(), String>
         previous: plan.before_previous.clone(),
     };
     lay_out(host, runner, plan, &staged)?;
-    if flip(host, &before, &plan.commit).is_err() {
+    switch(host, runner, &plan.commit, &before)
+}
+
+/// Move the links to the laid-out release `commit` and restart the daemon on it. When the
+/// daemon does not come up, the links go back to `before` and the old release is started
+/// again; the error says which step failed and what became of the old release.
+pub(crate) fn switch(
+    host: &MacHost,
+    runner: &dyn Runner,
+    commit: &str,
+    before: &Links,
+) -> Result<(), String> {
+    if flip(host, before, commit).is_err() {
         // A flip that stopped halfway must not leave `previous` naming the release that ran.
-        let _ = restore(host, &before);
+        let _ = restore(host, before);
         return Err("links_failed".to_owned());
     }
-    let Err(why) = restart(host, runner, &plan.commit) else {
+    let Err(why) = restart(host, runner, commit) else {
         return Ok(());
     };
     // The new release did not come up: the links go back, and the old release must.
-    let restored = restore(host, &before).is_ok();
-    let Some(old) = before.current.as_deref() else {
-        return Err(format!("{why}:no_previous"));
+    let tail = match switch_back(host, runner, before) {
+        Ok(()) => "rolled_back",
+        Err(failed) => failed,
     };
+    Err(format!("{why}:{tail}"))
+}
+
+/// Put both links back as `before` had them and start the release `before.current` names.
+///
+/// # Errors
+/// What became of the old release: `rollback_failed`, or `no_previous` when there was none.
+pub(crate) fn switch_back(
+    host: &MacHost,
+    runner: &dyn Runner,
+    before: &Links,
+) -> Result<(), &'static str> {
+    let restored = restore(host, before).is_ok();
+    let old = before.current.as_deref().ok_or("no_previous")?;
     // The daemon is not restarted on a file that is not root's to run, nor one that is gone.
     let back = restored
         && host
@@ -278,18 +304,16 @@ fn apply(host: &MacHost, runner: &dyn Runner, plan: &Plan) -> Result<(), String>
             .check_file(&host.release(old).join(BINARY))
             .is_ok()
         && restart(host, runner, old).is_ok();
-    Err(format!(
-        "{why}:{}",
-        if back {
-            "rolled_back"
-        } else {
-            "rollback_failed"
-        }
-    ))
+    if back { Ok(()) } else { Err("rollback_failed") }
 }
 
 /// `releases/<commit>/kbf` and its `VERSION`.
-fn lay_out(host: &MacHost, runner: &dyn Runner, plan: &Plan, staged: &Path) -> Result<(), String> {
+pub(crate) fn lay_out(
+    host: &MacHost,
+    runner: &dyn Runner,
+    plan: &Plan,
+    staged: &Path,
+) -> Result<(), String> {
     let dest = host.release(&plan.commit);
     let binary = dest.join(BINARY);
     if fs::symlink_metadata(&dest).is_err() {

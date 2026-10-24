@@ -548,3 +548,110 @@ launchd, and no stage left behind.
   before it is killed; the copy then refuses the file, and the stage is removed.
 - A channel with `sums` pins the commit and the tarball's hash, and needs an edit of the sums file
   for each new release; the point of this source is a channel without them.
+
+## The local socket
+
+`kbf-host-install --serve` is the program's other door, for the agent mode of `kbf-updater`
+([kbf-updater.md](kbf-updater.md#the-agent-mode), [../design/updates.md](../design/updates.md)).
+It serves a unix socket instead of the ssh forced command, which stays as described above and
+is not changed. It does one host's A/B: put the next release beside the one that runs, switch to
+it on trial, keep it or go back.
+
+```text
+kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N] [--restart-unit UNIT]...
+```
+
+- `--socket`: an absolute path. The program binds it itself (a `umask` of 0177, then a `chown`
+  to the account), mode 0600, in a directory that is root's and that others cannot write. A
+  stale socket file is replaced; a file of another kind in the way is an error.
+- `--socket-user`: the one account that may connect. On Linux it is looked up in `/etc/passwd`,
+  on a Mac with `dscl`; root is refused.
+- `--window-secs`: how long a release on trial has to be confirmed, 120 to 1800 (default 600).
+- `--restart-unit`: on Linux, a unit that runs the release (`kbf-<name>.service` or
+  `kbf-<name>@<instance>.service`), repeated for each; at least one is required. A Mac restarts
+  the daemon's launchd job and takes none.
+
+Nothing else is configured by a flag or the environment: the files this program reads as root are
+constants, as above. The units and jobs that start it are in
+[`packaging/host-agent`](../../packaging/host-agent/README.md).
+
+### The five requests
+
+One line in, one JSON line out, one connection at a time. The same grammar for the version and
+the channel as the forced command's (single spaces, no control byte; no path or URL anywhere).
+
+```text
+query
+install kbf=<version> from <channel>
+switch kbf=<version>
+confirm kbf=<version>
+revert
+```
+
+| request | does |
+|---|---|
+| `install` | looks `<version>` up in the channel, fetches the release **on the host**, verifies it, and lays it out beside the one that runs. No link moves and nothing restarts. The same version asked again is answered from what is laid out; the version the host runs already is answered at once (`current: true`) and teaches the host its version text |
+| `switch` | puts the laid-out release in place **on trial**: the pending marker, with its deadline, is written before the first link moves; then the links move and the units restart on it. A unit that does not come up puts the host back at once |
+| `confirm` | keeps the release on trial. Asked again after it was answered, the answer is the same |
+| `revert` | goes back to the release that ran, now |
+| `query` | what runs, what is on trial and until when, how the last update ended, and whether another install, switch or restart is running |
+
+Answers: `staged` (`version`, `commit`, `current`), `switched` (`version`, `commit`,
+`deadline_unix`), `confirmed`, `reverted` (`version`, the release the host is back on, when it
+knows its text), `query` (`commit`, `version`, `node_id`, `pending`, `last`, `busy`), and
+`{"result":"refused","reason":CODE}` (nothing ran) or `{"result":"failed","reason":CODE}` with a
+code from a closed set: `bad_command`, `channel_not_allowed`, `config_invalid`, `config_unsafe`,
+`unknown_release`, `ambiguous_release`, `fetch_failed`, `verify_failed`, `pending`, `not_staged`,
+`nothing_pending`, `no_current`, `busy`, `stage_failed`, `switch_failed`, `revert_failed`,
+`state_unavailable`, `audit_unavailable`. The detail of a refusal goes to the journal, cleaned,
+never to the line.
+
+### The revert is this program's
+
+A release on trial has a deadline, in wall-clock seconds, on disk with the marker. The program
+checks it about five times a second between connections: a release that nobody confirmed by its
+deadline is put back by this program, **needing nothing of the release on trial to run**, the
+updater to be alive, or the host to have stayed up. The first check after a start is the same
+check, so a host that rebooted with a release on trial goes back at once if the deadline passed
+while it was down, and waits out what is left of the window if it did not. A revert that
+cannot be done (the units will not start on the release that ran) leaves the marker, and the next
+check tries again.
+
+Every request but `query` is audited like a forced-command request (verb `stage`, `switch`,
+`confirm` or `revert`), and the install, the switch and the confirm are not run when the audit log
+cannot be opened. A revert is never held back by it. The install lock is the same file as the
+forced command's, so the two never overlap.
+
+### On Linux
+
+The release goes in the layout of `kbf-installer` ([host-releases.md](host-releases.md)):
+`/var/lib/kbf-installer/releases/<commit>`, the `current` and `previous` links, and the
+installer's `state.json`, which is also where the pending marker lives (`pending_confirm`, with
+the deadline). A host that was set up by hand with `kbf-deploy host install` has all of it; a host
+with no `current` release has nothing to go back to and is refused (`no_current`). The channels
+are in `/etc/kbf/host-install-releases.toml`, in the format of the Mac's allowlist below (a
+channel whose `source = "github"`; the ssh path's `host-install.toml` is the apt channels' and is
+not read):
+
+```toml
+[channels.stable]
+source = "github"
+```
+
+`install` lists the repository's releases, downloads `kbf-<commit>-linux-<arch>.tar.gz` and its
+bundle as the installer's unprivileged user, copies them once into the installer's scratch, and
+runs the installer's verify pipeline over the copy with the pinned `gh` and trusted root
+([host-releases.md](host-releases.md#what-is-trusted)): the attestation must be of this
+repository's `artifacts.yml` on a hosted runner, for the full commit, on the channel's branch; the
+tarball must hold the one executable of this CPU; and the binary run as the unprivileged user must
+say it is that commit. Nothing is fetched when the trust files are not root's. A release whose
+`protocol` or `state_schema` is newer than this program's `kbf-installer` understands is refused
+(the installer's rule, `verify_failed`): put the newer installer on the host first.
+
+### On a Mac
+
+The release is checked and laid out by the same code as the ssh path's install (above), into the
+kit tree, with the channels of the same `host-install.toml`. The swap is the apply job's: the links,
+then a restart of the daemon's job that must say it was welcomed, and the old release started again
+if it does not. The pending marker is `pending.json` in the work directory, root's and 0600, and
+holds the links as they were.

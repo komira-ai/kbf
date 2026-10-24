@@ -308,7 +308,7 @@ fn install_front(
 
 /// Root's private directory: made 0711 (others may pass through to the stage when it is
 /// opened for the checks that run as another user, and may list nothing) and trusted.
-fn ensure_work(host: &MacHost) -> Result<(), Outcome> {
+pub(crate) fn ensure_work(host: &MacHost) -> Result<(), Outcome> {
     let made = fs::create_dir(&host.work)
         .and_then(|()| fs::set_permissions(&host.work, fs::Permissions::from_mode(0o711)));
     match made {
@@ -326,7 +326,7 @@ fn ensure_work(host: &MacHost) -> Result<(), Outcome> {
 }
 
 /// The kit is there and is root's: the tree, `releases`, and the daemon's job.
-fn check_kit(host: &MacHost) -> Result<(), Outcome> {
+pub(crate) fn check_kit(host: &MacHost) -> Result<(), Outcome> {
     host.kit_trust
         .check_dir(&host.releases())
         .map_err(|e| fail(FailureCode::PackageStateUnclean, format!("releases: {e}")))?;
@@ -359,4 +359,4 @@ pub fn main_process() -> u8 {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

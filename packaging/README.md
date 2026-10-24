@@ -25,3 +25,15 @@
   through `install.sh` has no route to the mode units yet.
 - Tested by `crates/xtask/tests/install_sh.rs` against a local HTTP server, with a stub
   installer (`xtask-fake`) and stub unit, trust, sysusers.d and tmpfiles.d files, and fake systemd tools.
+- `container/kbf-coordinator/Dockerfile`: the image of the update coordinator
+  (docs/design/updates.md): the `kbf-coordinator` binary on the pinned Ubuntu base, run as an
+  unprivileged user, its files mounted by the orchestrator. The repository builds no
+  container image of its own yet (the frontend image of docs/design/distribution.md is not
+  built), so this is the one image definition; the release workflow does not package or publish
+  the coordinator yet, and the Dockerfile's header says how to build it from a local binary.
+  Operating notes: the coordinator takes its own `--oidc-config`, and its audience should be
+  one no other verifier accepts (not the frontend proxy's), so a token minted for another
+  service cannot set the desired state. An updater certificate is not revocable: a stolen
+  one acts only as its own node, but it can hold its role's update slot or report a dead host
+  healthy, and an old version reported by any daemon, storage or Mac host holds back the
+  frontends. Replace the farm CA or let the certificate expire to end it.

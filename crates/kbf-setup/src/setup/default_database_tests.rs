@@ -1,6 +1,6 @@
 //! The default of `frontend` and `all-in-one`: given no `--database`, setup makes the local role
-//! and database, and tells the operator what the server must admit. The fake host and the model
-//! of a server are `provision_tests.rs`'s. Each test says the behaviour it asserts.
+//! and database, and tells the operator what the server must admit. The fake host and the model of
+//! a server are `provision_tests.rs`'s. Each test says the behaviour it asserts.
 
 use super::*;
 
@@ -15,6 +15,9 @@ const HBA: &str =
     "  pg_hba.conf, above the first `local` line: local  kbf  kbf-server  peer map=kbf";
 const IDENT_ROOT: &str = "  pg_ident.conf: kbf  root  kbf-server";
 const IDENT_SERVICE: &str = "  pg_ident.conf: kbf  kbf-server  kbf-server";
+/// The default of an all-in-one host: the same database, reached as `kbf`, the account its one
+/// unit runs as.
+const ALL_IN_ONE_DATABASE: &str = "postgres:///kbf?host=/run/postgresql&user=kbf";
 
 /// The flags of a host that gives no `--database`.
 fn bare(mode: Mode) -> Raw {
@@ -100,23 +103,31 @@ fn a_frontend_with_no_database_gets_the_local_role_database_and_schema() {
 }
 
 /// Asserts that an all-in-one host given no `--database` provisions the local database as a
-/// frontend does, and that the children's file and `installer.toml` carry the local default.
+/// frontend does, as the account its one unit runs as (`kbf`, not the frontend's `kbf-server`),
+/// asks for the schema at that URL, and that `installer.toml` and the one `kbf.toml` carry the
+/// local default, which the rules the logins need name.
 #[test]
 fn an_all_in_one_host_with_no_database_gets_the_local_role_database_and_schema() {
     let world = Shared::default();
     let server = Server::fresh();
     let (exec, out) = setup_on(&world, &server, &bare(Mode::AllInOne), APPLY);
-    out.expect("setup");
+    let out = out.expect("setup");
     let made = creates(&world);
     assert_eq!(made.len(), 2, "{made:?}");
+    let set = "\\set role 'kbf'\n\\set db 'kbf'\n";
+    for script in &made {
+        assert!(script.starts_with(set), "{script}");
+    }
+    let url = ALL_IN_ONE_DATABASE;
     assert_eq!(
         *server.asked.borrow(),
-        [format!("reach {DATABASE}"), format!("setup {DATABASE}")]
+        [format!("reach {url}"), format!("setup {url}")]
     );
-    let store = format!("state-store = \"{DATABASE}\"\n");
-    assert!(text(&exec, AIO_FRONTEND_TOML).contains(&store));
-    let database = format!("database = \"{DATABASE}\"\n");
+    let store = format!("state-store = \"{url}\"\n");
+    assert!(text(&exec, KBF_TOML).contains(&store));
+    let database = format!("database = \"{url}\"\n");
     assert!(text(&exec, INSTALLER_TOML).contains(&database));
+    assert!(out.contains("  pg_ident.conf: kbf  kbf  kbf"), "{out}");
 }
 
 /// Asserts that a daemon setup does not provision: psql is never run, no schema is asked for,
@@ -294,8 +305,8 @@ fn a_linked_os_release_is_read_through_its_fallback() {
 }
 
 /// Asserts that a stopped server, and a host with no `postgres` account, are refused with the
-/// install command of the distribution and the way to start the server, and that neither
-/// `kbf.toml` nor the frontend's file is written.
+/// install command of the distribution and the way to start the server, and that no `kbf.toml`
+/// is written.
 #[test]
 fn a_stopped_server_and_a_missing_server_are_refused_with_the_install_command() {
     let world = Shared::default();
@@ -307,7 +318,6 @@ fn a_stopped_server_and_a_missing_server_are_refused_with_the_install_command() 
     for wanted in ["exit status 2", "start the server", DNF, "--initdb"] {
         assert!(said.contains(wanted), "{wanted}: {said}");
     }
-    assert!(!exec.entries.contains_key(&hp(AIO_FRONTEND_TOML)));
     assert!(!exec.entries.contains_key(&hp(KBF_TOML)));
 
     let mut exec = exec_on(&world);
@@ -352,11 +362,12 @@ fn the_rules_the_logins_need_are_printed_in_a_dry_run_and_an_apply() {
 }
 
 /// Asserts that the default names the database `kbf` on the local socket, reached as the
-/// account the frontend runs as, for both modes and whether or not `--create-local-database` is
-/// also given; and that a node mode has no database, defaulted or not.
+/// account its unit runs as (`kbf-server` for a frontend, `kbf` for an all-in-one host), whether
+/// or not `--create-local-database` is also given; and that a node mode has no database,
+/// defaulted or not.
 #[test]
 fn the_default_is_the_kbf_database_on_the_local_socket() {
-    for mode in [Mode::Frontend, Mode::AllInOne] {
+    for (mode, role) in [(Mode::Frontend, "kbf-server"), (Mode::AllInOne, "kbf")] {
         for flag in [false, true] {
             let mut r = bare(mode);
             r.create_local_database = flag;
@@ -370,7 +381,7 @@ fn the_default_is_the_kbf_database_on_the_local_socket() {
                     local.socket_dir.as_str(),
                     local.port
                 ),
-                ("kbf-server", "kbf", "/run/postgresql", None)
+                (role, "kbf", "/run/postgresql", None)
             );
         }
     }

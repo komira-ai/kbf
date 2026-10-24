@@ -1,55 +1,14 @@
-//! The seams U7 and U8 use: the update-API handler and the status the proxy reports.
+//! The seam of the update API: the handler of `/v1/update/frontend*` and what it is given and
+//! answers.
 //!
-//! The admin calls on a child (`takeover`, `quiesce`, `stand_down`, `resume`, `role`) are not
-//! here. The proxy makes none of them that change a child: U7a's supervisor is their only
-//! caller, so the trait (`ChildControl`) lives in `kbf-installer` with the supervisor, and the
-//! proxy only supplies the child's admin port ([`crate::config::UpstreamTable::admin_port`])
-//! and the headers that authenticate a call to it ([`crate::identity::admin_headers`]). The one
-//! call the proxy makes itself is the read-only `GET role`, once a second per open slot, for
-//! the term of the child's operation names (`crate::term`).
+//! The proxy serves the path itself and calls a handler for it. The handler `kbf-installer`
+//! runs it with is [`NoUpdates`]: a proxy over a pool updates no frontend (a frontend is
+//! drained through the admin API, restarted and put back by whoever updates it), so the path
+//! answers 503.
 
 use std::time::Duration;
 
 use http::{HeaderName, HeaderValue};
-
-use crate::slot::Slot;
-
-/// The proxy's count for one slot, for `GET /v1/update/frontend`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SlotStats {
-    /// Streams bound to the slot, held-then-released and queued ones included.
-    pub open_streams: u64,
-}
-
-/// One read of everything `GET /v1/update/frontend` reports. The fields are read one after
-/// another, so a stream between release and bind is in none of the counts: the snapshot is
-/// a hint, and only `ActiveSlot::retire` is authoritative.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ProxySnapshot {
-    /// The active slot.
-    pub active: Option<Slot>,
-    /// Whether new streams are being held.
-    pub holding: bool,
-    /// Streams in the hold queue.
-    pub held: usize,
-    /// Each slot's stats, A then B.
-    pub per_slot: [SlotStats; 2],
-    /// Whether `/readyz` would answer 200 (an active child and a poll that passed).
-    pub ready: bool,
-    /// Holds that ended by a guard's drop, nobody having released them into a slot.
-    pub holds_abandoned: u64,
-}
-
-impl ProxySnapshot {
-    /// The stats of `slot`.
-    #[must_use]
-    pub const fn stats(&self, slot: Slot) -> SlotStats {
-        match slot {
-            Slot::A => self.per_slot[0],
-            Slot::B => self.per_slot[1],
-        }
-    }
-}
 
 /// The largest update-API body the proxy passes on; a larger one is answered 413 by the
 /// proxy ([`UpdateReply::payload_too_large`]) without calling the handler.
@@ -124,11 +83,9 @@ impl UpdateReply {
     }
 }
 
-/// The pluggable handler of the update API: U8a's actor. The proxy authenticates first
-/// ([`crate::auth::decide`] with the update class, the one place that later swaps to OIDC),
-/// rate limits, enforces [`MAX_UPDATE_BODY`] and [`UPDATE_DEADLINE`], and then calls this.
-/// The handler owns no state machine: it asks U7a's actor (a trait in `kbf-installer`) for
-/// `abort`, `rollback` and `force-retire`, and U7a alone writes `update.json`.
+/// The pluggable handler of the update API. The proxy authenticates first ([`crate::auth::decide`]
+/// with the update class), enforces [`MAX_UPDATE_BODY`] and [`UPDATE_DEADLINE`], and then calls
+/// this.
 ///
 /// A client that got a 504 or lost its connection retries, so every command must be
 /// idempotent and the handler must answer a repeat of a command in flight with the state of the
@@ -138,7 +95,7 @@ pub trait UpdateHandler: Send + Sync {
     fn handle(&self, request: UpdateRequest) -> impl Future<Output = UpdateReply> + Send;
 }
 
-/// The reply of the built-in handler until U8 lands: 503 and a JSON error.
+/// The reply of the built-in handler: 503 and a JSON error.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoUpdates;
 
@@ -153,7 +110,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn until_u8_the_update_api_answers_503() {
+    async fn the_built_in_handler_answers_503() {
         let reply = NoUpdates
             .handle(UpdateRequest {
                 method: "GET".into(),
@@ -186,20 +143,5 @@ mod tests {
         assert!(UpdateRequest::body_fits(4096));
         assert!(!UpdateRequest::body_fits(4097));
         assert_eq!(UPDATE_DEADLINE, Duration::from_secs(30));
-    }
-
-    #[test]
-    fn a_snapshot_reads_each_slot_apart() {
-        let snap = ProxySnapshot {
-            active: Some(Slot::B),
-            holding: true,
-            held: 3,
-            per_slot: [SlotStats { open_streams: 200 }, SlotStats::default()],
-            ready: false,
-            holds_abandoned: 1,
-        };
-        assert_eq!(snap.stats(Slot::A).open_streams, 200);
-        assert_eq!(snap.stats(Slot::B), SlotStats::default());
-        assert_eq!(ProxySnapshot::default().active, None);
     }
 }

@@ -10,7 +10,10 @@ use kbf_ca::{CLOCK_FLOOR_UNIX, ISSUED_AT_OID, Policy, SystemEntropy};
 use kbf_enroll_registry::{TokenSpec, create_token};
 use kbf_proto::kbf::enroll::v1 as pb;
 use kbf_state::fake::{Fake, Flaw};
-use kbf_state::{ManualClock, Store};
+use kbf_state::{
+    Changes, Commit, CommitStats, Conflict, ManualClock, Revision, ScanPage, ScanRange, Store,
+    StoreError, StoreTime, Txn, Versioned,
+};
 use kbf_testkit::dir::TestDir;
 use kbf_types::{NodeId, Role, RoleSet, TokenId, TokenSecret};
 use rcgen::{Attribute, CertificateParams, DistinguishedName, KeyPair};
@@ -134,6 +137,37 @@ pub fn service_with(store: &Arc<dyn Store>, ca: &Arc<Ca>, settings: NodeSettings
     )
 }
 
+/// A store that reads what the store underneath holds and refuses every write as one of a
+/// superseded handle ([`StoreError::Fenced`]).
+pub struct WritesFenced(pub Arc<dyn Store>);
+
+impl Store for WritesFenced {
+    fn apply_batch(&self, _batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
+        Err(StoreError::Fenced)
+    }
+    fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
+        self.0.get(key)
+    }
+    fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
+        self.0.scan_prefix(prefix)
+    }
+    fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
+        self.0.scan_range(scan)
+    }
+    fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
+        self.0.changes(after, limit)
+    }
+    fn reap_expired(&self) -> Result<usize, StoreError> {
+        Err(StoreError::Fenced)
+    }
+    fn commit_stats(&self) -> CommitStats {
+        self.0.commit_stats()
+    }
+    fn now(&self) -> StoreTime {
+        self.0.now()
+    }
+}
+
 impl Farm {
     /// Moves the store's clock (and so the time certificates are issued at).
     pub fn advance(&self, secs: u64) {
@@ -199,6 +233,7 @@ pub fn register_cold(farm: &Farm) -> u64 {
 pub fn spec(roles: &[Role]) -> TokenSpec {
     TokenSpec {
         roles: RoleSet::new(roles.iter().copied()).expect("roles"),
+        host_role: None,
         max_uses: 1,
         ttl: None,
         node_id: None,

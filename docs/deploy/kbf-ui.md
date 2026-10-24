@@ -19,7 +19,7 @@ web UI" in [api.md](../api.md).
 
 ## Reaching it
 
-- **Behind the proxy** (a `frontend` host set up with `--proxy`): open
+- **Behind the proxy** (a pool of frontends given as `[[proxy.frontend]]` tables): open
   `https://<proxy address>:8980/ui`. The proxy's one public port (`8980` unless
   `kbf-proxy.socket` says otherwise) forwards `/ui` and `/ui/...` to the active frontend's
   operator API, so there is no second port to open. The proxy lets `GET` and `HEAD`
@@ -69,7 +69,7 @@ and images from the page's own origin only (no page uses an image), `X-Content-T
 `Cache-Control: no-store`, `Cross-Origin-Resource-Policy: same-origin`,
 `Cross-Origin-Opener-Policy: same-origin` and a `Permissions-Policy` that denies the powerful
 browser features. The proxy leaves a forwarded answer's headers as the server set them. The answers the proxy
-makes itself (the 503 handover page during a frontend swap, 404, 405, 401, the probes) carry
+makes itself (404, 405, 401, the probes) carry
 a stricter set: `Content-Security-Policy: default-src 'none'; frame-ancestors 'none';
 base-uri 'none'; form-action 'none'`, `X-Content-Type-Options: nosniff`,
 `Referrer-Policy: no-referrer`, `Cache-Control: no-store` and
@@ -108,8 +108,8 @@ Overview, Nodes and Node; any other value or parameter is a `400`.
 | Storage | `/ui/storage` | Under-replicated blobs, each member's state, repair debts and open writes, and its write-tier flush backlog |
 | Log | `/ui/runs/{run_id}/logs/{stream}` | One run's log (`stdout`, `stderr` or `result`) as escaped text, the last 1 MiB (`?from=start` for the first), with a note that names the end shown when it is cut, a link to the other end and a link that downloads the whole log; reached from the Action page |
 
-Nodes, leases and the queue live in the server's memory: after a restart or a frontend
-swap they are empty until the daemons reconnect, and the pages say so, with the time the
+Nodes, leases and the queue live in the server's memory: after a restart of the frontend
+they are empty until the daemons reconnect, and the pages say so, with the time the
 server started and how long it has run (`started_unix_ms` and `uptime_ms` of
 `GET /v1/health`; a page says the time is not known when the server does not send it).
 A value the server

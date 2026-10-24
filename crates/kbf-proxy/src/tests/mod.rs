@@ -3,11 +3,9 @@
 //! on a wall clock.
 
 mod bypass;
-mod fenced;
 mod flood;
 mod frames;
 mod h1;
-mod hold;
 mod keepalive;
 mod kit;
 mod lifetime;
@@ -17,9 +15,8 @@ pub(crate) mod pki;
 mod pool_kit;
 mod ready;
 mod reload;
-mod remote;
 mod routing;
 mod secure;
+mod self_node;
 mod sni;
 mod ui;
-mod wait_term;

@@ -4,10 +4,9 @@
 //! The writer is `helper/status.rs`. This is the strict reader of what it writes (a key it does
 //! not name is refused), pinned to the golden fixture `testdata/golden/status.json`, which is
 //! the writer's bytes: a key added to the writer moves the writer's golden test, this type and
-//! the fixture in the same change. The readers that matter ignore keys they do not know, so a
-//! key added here is additive to them: the node's (`kbf-update`, `helper.rs`) and the frontend
-//! proxy's ([`crate::proxy::api::traits::InstallerStatus`]); each is tested against the
-//! writer's bytes too.
+//! the fixture in the same change. The reader that matters ignores keys it does not know, so a
+//! key added here is additive to it: the node's (`kbf-update`, `helper.rs`) is tested against
+//! the writer's bytes too.
 //!
 //! `state` words map 1:1 to `UpdateStatus.State` on the wire. `refusal` is the last refusal as
 //! text, usually leading `<word>: <message>` with the word one of section 5's (some are plain

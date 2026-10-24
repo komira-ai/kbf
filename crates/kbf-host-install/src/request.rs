@@ -144,11 +144,44 @@ impl Unit {
         Ok(Self(format!("kbf-frontend@{name}.service")))
     }
 
+    /// A unit of the root-owned configuration of the local socket: `kbf-<name>.service`, or
+    /// `kbf-<name>@<instance>.service`, `<name>` of lower-case letters, digits and `-` and
+    /// `<instance>` as a frontend's. The unit name is a file name's worth of text and
+    /// nothing else, so it cannot be taken for an option or name another kind of unit.
+    ///
+    /// # Errors
+    /// [`BadCommand`] when `text` is not such a name.
+    pub fn service(text: &str) -> Result<Self, BadCommand> {
+        let stem = text.strip_suffix(".service").ok_or(BadCommand)?;
+        let (base, instance) = match stem.split_once('@') {
+            Some((base, instance)) => (base, Some(instance)),
+            None => (stem, None),
+        };
+        let plain = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-';
+        let base_ok = base.len() <= MAX_SERVICE_LEN
+            && base.strip_prefix("kbf-").is_some_and(|rest| {
+                !rest.is_empty() && rest.bytes().all(plain) && !rest.ends_with('-')
+            });
+        if !base_ok {
+            return Err(BadCommand);
+        }
+        if let Some(instance) = instance {
+            Self::frontend(instance)?;
+            if instance == "-" {
+                return Err(BadCommand);
+            }
+        }
+        Ok(Self(text.to_owned()))
+    }
+
     /// The unit name, safe as an argument and as JSON.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
+
+/// The longest base name of a configured unit, in bytes.
+const MAX_SERVICE_LEN: usize = 64;
 
 /// An accepted request.
 #[derive(Debug, Clone)]

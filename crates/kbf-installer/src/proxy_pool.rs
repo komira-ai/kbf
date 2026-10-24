@@ -2,7 +2,7 @@
 //! their own (`[[frontend]]` tables of the `[proxy]` table), with nothing to supervise.
 //!
 //! The verb binds the runtime to the activated socket and serves until SIGTERM or SIGINT, and
-//! SIGHUP re-reads the certificate files, all as in slot mode (`proxy_verb::handle_signals`).
+//! SIGHUP re-reads the certificate files (`proxy_verb::handle_signals`).
 //! There is no child to start or adopt, no migration, no handover and no update API behind
 //! `/v1/update/frontend` (it answers 503): a frontend is updated by draining it through the
 //! admin API (`admin_listen`), restarting it and putting it back, by whoever updates it. A stop
@@ -34,8 +34,8 @@ pub(crate) fn run(
     let members = config.frontend.len();
     let (handle, runner) = Proxy::bind(config, listener)
         .map_err(|e| io::Error::other(format!("cannot start the proxy: {e}")))?;
-    // The signals are handled as slot mode handles them: one stop drains and ends the process
-    // within the bound, a second ends it at once, and SIGHUP reloads the TLS files.
+    // One stop drains and ends the process within the bound, a second ends it at once, and
+    // SIGHUP reloads the TLS files.
     let stop = Stop::production();
     let drain: Arc<dyn Fn() + Send + Sync> = {
         let handle = handle.clone();

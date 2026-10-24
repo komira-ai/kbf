@@ -1,6 +1,5 @@
 //! `status.json` as the helper writes it: the golden bytes of the writer, and the node's reader
-//! reading them. (The frontend proxy's reader is tested beside the proxy, on the same writer.)
-//! What each test proves is named on it, with the defect it catches.
+//! reading them. What each test proves is named on it, with the defect it catches.
 
 use std::fs;
 
@@ -48,7 +47,7 @@ fn described() -> (State, Memory) {
 /// the diff of the file is the review of the format.
 ///
 /// Catches a key of `status.json` changed without the readers being looked at: the node's
-/// reader, the proxy's and this file all name the keys.
+/// reader and this file both name the keys.
 ///
 /// Catches: `available` written before `release_source`; either key written as `null`
 /// when it is absent (the second test); `seq` written as text.
@@ -112,19 +111,11 @@ fn a_status_with_no_seed_and_no_source_carries_neither_key() {
     }
 }
 
-/// The id of the order a refusal answers is told while there is one, and every reader of the
-/// status takes it: the frontend proxy's (which blames a refusal on its own update by it), the
-/// strict reader, and the node's, which ignores the key and reads the rest as before. A status
-/// whose refusal is no order's has no such key.
-///
-/// Catches a writer and a reader that disagree on the key's name (the proxy would then never
-/// attribute a refusal, and an update whose order was refused would wait out its staging
-/// deadline), and a key written as `null`.
-///
-/// Catches: the key renamed in the writer; its `skip_serializing_if` removed.
+/// Asserts that the id of the order a refusal answers is told while there is one, that the strict
+/// reader reads it, and that the node's reader ignores the key and still reports the status. A
+/// status whose refusal is no order's has no such key.
 #[test]
-fn the_order_a_refusal_answers_is_told_while_there_is_one_and_read_by_every_reader() {
-    use crate::proxy::api::traits::{JsonFileStatus, StatusReader};
+fn the_order_a_refusal_answers_is_told_and_read_by_the_strict_reader_and_the_node() {
     use crate::status_v2::StatusV2;
     let (state, mut memory) = described();
     memory.refused_order_id = Some(41);
@@ -136,9 +127,6 @@ fn the_order_a_refusal_answers_is_told_while_there_is_one_and_read_by_every_read
     let dir = kbf_host::testkit::scratch("status-refused-id");
     let path = dir.join("status.json");
     fs::write(&path, &bytes).expect("written");
-    let proxy = JsonFileStatus::new(&path);
-    let read = proxy.read().expect("the proxy reads it");
-    assert_eq!(read.refused_order_id, Some(41));
     let node = kbf_update::helper::read(&path);
     assert!(matches!(node, Helper::Reported(_)), "{node:?}");
 
