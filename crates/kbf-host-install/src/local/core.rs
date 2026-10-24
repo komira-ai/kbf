@@ -99,10 +99,15 @@ impl Saved {
     /// commit just named is never the one forgotten).
     fn note(&mut self, commit: &str, version: &str) {
         self.versions.insert(commit.to_owned(), version.to_owned());
-        while self.versions.len() > KEEP_VERSIONS {
-            let Some(old) = self.versions.keys().find(|k| *k != commit).cloned() else {
-                break;
-            };
+        let surplus = self.versions.len().saturating_sub(KEEP_VERSIONS);
+        let forget: Vec<String> = self
+            .versions
+            .keys()
+            .filter(|known| *known != commit)
+            .take(surplus)
+            .cloned()
+            .collect();
+        for old in forget {
             self.versions.remove(&old);
         }
     }

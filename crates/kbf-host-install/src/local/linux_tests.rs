@@ -125,8 +125,10 @@ struct Net {
     assets: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
     /// Things that go wrong, by name.
     broken: BTreeSet<&'static str>,
-    /// Units that do not restart, and units that never become active.
+    /// Units that do not restart, units that do not restart the first time, and units that
+    /// never become active.
     restart_fails: BTreeSet<String>,
+    restart_fails_once: BTreeSet<String>,
     inactive: BTreeSet<String>,
 }
 
@@ -147,7 +149,7 @@ fn exec(code: i32, stdout: &str, stderr: &str) -> io::Result<Exec> {
 impl Runner for Sim {
     fn run(&self, cmd: &Cmd) -> io::Result<Exec> {
         self.calls.borrow_mut().push(cmd.clone());
-        let net = self.net.borrow();
+        let mut net = self.net.borrow_mut();
         let name = Path::new(&cmd.program)
             .file_name()
             .unwrap()
@@ -156,7 +158,11 @@ impl Runner for Sim {
         match name.as_str() {
             "systemctl" => {
                 let unit = cmd.args.last().unwrap();
+                if net.broken.contains("no-systemctl") {
+                    return Err(io::Error::other("cannot start systemctl"));
+                }
                 match cmd.args[0].as_str() {
+                    "restart" if net.restart_fails_once.remove(unit) => exec(5, "", "failed once"),
                     "restart" if net.restart_fails.contains(unit) => exec(5, "", "failed"),
                     "is-active" if net.inactive.contains(unit) => exec(3, "inactive", ""),
                     _ => exec(0, "", ""),
@@ -208,10 +214,23 @@ impl Runner for Sim {
                     let Some(bytes) = files.get(&asset) else {
                         return exec(1, "", "no assets match");
                     };
-                    if net.broken.contains("bundle-is-a-link") && asset.ends_with(".json") {
-                        std::os::unix::fs::symlink("/etc/hostname", dir.join(&asset)).unwrap();
+                    let path = dir.join(&asset);
+                    let kind = if asset.ends_with(".json") {
+                        "bundle"
                     } else {
-                        fs::write(dir.join(&asset), bytes).unwrap();
+                        "tarball"
+                    };
+                    let broken =
+                        |what: &str| net.broken.contains(format!("{kind}-{what}").as_str());
+                    if broken("is-a-link") {
+                        std::os::unix::fs::symlink("/etc/hostname", &path).unwrap();
+                    } else if broken("is-a-directory") {
+                        fs::create_dir(&path).unwrap();
+                    } else {
+                        fs::write(&path, bytes).unwrap();
+                        if broken("is-hard-linked") {
+                            fs::hard_link(&path, dir.join(format!("{asset}.twin"))).unwrap();
+                        }
                     }
                 }
                 exec(0, "", "")
@@ -663,6 +682,34 @@ fn what_cannot_be_staged_is_refused_and_leaves_nothing() {
             Code::FetchFailed,
         ),
         (
+            "the-tarball-is-a-directory",
+            Box::new(|rig| {
+                rig.net.borrow_mut().broken.insert("tarball-is-a-directory");
+            }),
+            Code::FetchFailed,
+        ),
+        (
+            "the-tarball-is-hard-linked",
+            Box::new(|rig| {
+                rig.net.borrow_mut().broken.insert("tarball-is-hard-linked");
+            }),
+            Code::FetchFailed,
+        ),
+        (
+            "the-bundle-is-a-directory",
+            Box::new(|rig| {
+                rig.net.borrow_mut().broken.insert("bundle-is-a-directory");
+            }),
+            Code::FetchFailed,
+        ),
+        (
+            "the-bundle-is-hard-linked",
+            Box::new(|rig| {
+                rig.net.borrow_mut().broken.insert("bundle-is-hard-linked");
+            }),
+            Code::FetchFailed,
+        ),
+        (
             "the-bundle-is-a-link",
             Box::new(|rig| {
                 rig.net.borrow_mut().broken.insert("bundle-is-a-link");
@@ -768,6 +815,31 @@ fn a_version_without_a_commit_and_untrusted_settings_are_refused_before_a_fetch(
     assert!(refused(Code::VerifyFailed)(&fault), "{fault:?}");
 }
 
+/// A scratch the host cannot clear fails the stage before anything is fetched.
+#[test]
+fn a_scratch_that_cannot_be_cleared_is_a_failure() {
+    let rig = Rig::new("stuck");
+    let work = rig.root().join("var/lib/kbf-installer/work");
+    fs::create_dir_all(&work).unwrap();
+    fs::write(
+        work.join(format!("{}.fetch", &COMMIT[..12])),
+        "a file where a directory goes",
+    )
+    .unwrap();
+    let fault = rig.stage().unwrap_err();
+    assert!(
+        !fault.refused && fault.code == Code::StageFailed,
+        "{fault:?}"
+    );
+    assert!(
+        !rig.calls
+            .borrow()
+            .iter()
+            .any(|c| c.program.ends_with("curl")),
+        "nothing was fetched"
+    );
+}
+
 /// A scratch the host cannot make fails the stage and does not touch the release.
 #[test]
 fn a_scratch_that_cannot_be_made_is_a_failure() {
@@ -861,25 +933,6 @@ fn a_release_that_does_not_come_up_is_put_back_at_once() {
         assert!(state.pending_confirm.is_none());
         assert_eq!(rig.link("current").as_deref(), Some(A));
     }
-
-    // A unit that fails on B and works on A: the way back works.
-    let rig = Rig::new("noup-back");
-    rig.stage().unwrap();
-    rig.net
-        .borrow_mut()
-        .restart_fails
-        .insert("kbf-daemon.service".to_owned());
-    let calls_before = rig.calls.borrow().len();
-    let net = Rc::clone(&rig.net);
-    let fault = {
-        // After the first restart fails, let the unit work again, as it would on A.
-        let result = rig.backend.switch(COMMIT, 600, 1_000);
-        net.borrow_mut().restart_fails.clear();
-        result.unwrap_err()
-    };
-    assert!(!fault.refused);
-    assert_eq!(rig.state().current.unwrap().to_string(), A);
-    assert!(rig.calls.borrow().len() > calls_before);
 }
 
 /// The installer's own refusals come through as failures: a window it does not take, a
@@ -1089,4 +1142,77 @@ fn an_unconfirmed_release_is_reverted_by_the_tick_and_a_confirmed_one_stays() {
     assert_eq!(ab.tick(), None);
     let state = state::read_unlocked(&rig.layout).unwrap().unwrap();
     assert_eq!(state.current.unwrap().to_string(), COMMIT);
+}
+
+/// A unit that fails once and works again, as it would on the release that ran, lets the host
+/// go back: the fault says the switch failed, and the host is on A, units up.
+#[test]
+fn a_unit_that_fails_on_b_and_not_on_a_leaves_the_host_on_a() {
+    let rig = Rig::new("noup-once");
+    rig.stage().unwrap();
+    rig.net
+        .borrow_mut()
+        .restart_fails_once
+        .insert("kbf-daemon.service".to_owned());
+    let fault = rig.backend.switch(COMMIT, 600, 1_000).unwrap_err();
+    assert_eq!(
+        (fault.code, fault.refused),
+        (Code::SwitchFailed, false),
+        "{fault:?}"
+    );
+    assert!(fault.detail.contains("failed once"), "{fault:?}");
+    assert_eq!(rig.state().current.unwrap().to_string(), A);
+    assert!(rig.state().pending_confirm.is_none());
+    assert_eq!(rig.link("current").as_deref(), Some(A));
+}
+
+/// A `systemctl` that cannot be run fails the switch, and the way back, which needs it too.
+#[test]
+fn without_systemctl_a_switch_cannot_go_back_either() {
+    let rig = Rig::new("nosystemctl");
+    rig.stage().unwrap();
+    rig.net.borrow_mut().broken.insert("no-systemctl");
+    let fault = rig.backend.switch(COMMIT, 600, 1_000).unwrap_err();
+    assert_eq!(fault.code, Code::RevertFailed, "{fault:?}");
+    assert!(fault.detail.contains("cannot start systemctl"), "{fault:?}");
+    assert_eq!(
+        rig.state().current.unwrap().to_string(),
+        A,
+        "the state is back all the same"
+    );
+}
+
+/// A release directory whose `kbf` is not a file is not a release that is laid out.
+#[test]
+fn a_release_directory_without_a_binary_file_is_not_laid_out() {
+    let rig = Rig::new("hollow");
+    let dir = rig.releases().join(COMMIT);
+    fs::create_dir_all(dir.join("kbf")).unwrap();
+    assert!(!rig.backend.has(COMMIT));
+    fs::remove_dir(dir.join("kbf")).unwrap();
+    fs::write(dir.join("kbf"), binary("b")).unwrap();
+    assert!(rig.backend.has(COMMIT));
+}
+
+/// What the program starts with on a Linux host: the layout of the installer on the real root,
+/// the channels file, the programs of a stage, and no lease waited for.
+#[test]
+fn the_production_host_is_the_installers_layout_and_the_programs_of_a_stage() {
+    let host = super::linux::production(vec![Unit::service("kbf-daemon.service").unwrap()]);
+    assert_eq!(
+        host.allowlist,
+        Path::new("/etc/kbf/host-install-releases.toml")
+    );
+    assert_eq!(
+        host.layout.join(&host.layout.releases()),
+        Path::new("/var/lib/kbf-installer/releases")
+    );
+    assert_eq!(host.units.len(), 1);
+    assert_eq!(host.owner, Owner { uid: 0, gid: 0 });
+    let tools = Tools::production();
+    assert_eq!(tools.curl, Path::new("/usr/bin/curl"));
+    assert_eq!(tools.tarball_max, 512 * 1024 * 1024);
+    assert_eq!(host.tools.download, tools.download);
+    use kbf_installer::helper::leases::LeaseSource;
+    assert_eq!(super::linux::NoLeases.live(), Ok(0));
 }

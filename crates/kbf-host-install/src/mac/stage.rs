@@ -106,7 +106,7 @@ fn stage_inner(
     let token = match &channel.source {
         Source::Github {
             token_file: Some(file),
-        } => Some(read_token(&host.trust, file)?),
+        } => Some(read_token(&host.trust, file).map_err(Outcome::Refused)?),
         _ => None,
     };
     // The pinned tools are root's, or nothing from them is believed.
@@ -255,8 +255,8 @@ fn pick_failed(e: PickError, whence: &str, github: bool) -> Outcome {
 
 /// The token for the API in `file`, which is root's alone to write: one line of letters,
 /// digits, `_` and `-`.
-pub(crate) fn read_token(trust: &Trust, file: &Path) -> Result<String, Outcome> {
-    let text = trust.read(file).map_err(|e| Outcome::Refused(refusal(e)))?;
+pub(crate) fn read_token(trust: &Trust, file: &Path) -> Result<String, crate::outcome::Refusal> {
+    let text = trust.read(file).map_err(refusal)?;
     let token = text.trim();
     let plain = !token.is_empty()
         && token.len() <= 255
@@ -266,7 +266,7 @@ pub(crate) fn read_token(trust: &Trust, file: &Path) -> Result<String, Outcome> 
     if plain {
         Ok(token.to_owned())
     } else {
-        Err(Outcome::Refused(crate::outcome::Refusal::ConfigInvalid))
+        Err(crate::outcome::Refusal::ConfigInvalid)
     }
 }
 

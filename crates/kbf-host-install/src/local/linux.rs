@@ -26,7 +26,7 @@
 //! apt channels' and is not read.
 
 use std::cell::RefCell;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -36,7 +36,7 @@ use kbf_host::exec::Exec;
 use kbf_host::path::Root;
 use kbf_host::step::Owner;
 use kbf_installer::activate::{self, Activated, Arm};
-use kbf_installer::attest::{GhCheck, SourceRef};
+use kbf_installer::attest::GhCheck;
 use kbf_installer::helper::leases::LeaseSource;
 use kbf_installer::layout::{Layout, Platform};
 use kbf_installer::refusal::Refusal as InstallerRefusal;
@@ -96,7 +96,7 @@ impl Tools {
 
 /// No lease is waited for: a stage of the update path moves no link and the updater has
 /// drained the node before it switches.
-struct NoLeases;
+pub(super) struct NoLeases;
 
 impl LeaseSource for NoLeases {
     fn live(&self) -> Result<usize, String> {
@@ -206,17 +206,15 @@ impl<E: Exec> Linux<E> {
             ));
         };
         let token = match token_file {
-            Some(file) => Some(read_token(trust, file).map_err(refused_outcome)?),
+            Some(file) => Some(read_token(trust, file).map_err(config_fault)?),
             None => None,
         };
         let verify_refused =
             |e: InstallerRefusal| Fault::refused(Code::VerifyFailed, e.to_string());
         let settings = {
             let settings = Settings::load(&*self.trust, &self.layout).map_err(verify_refused)?;
-            let wanted = SourceRef::new(&channel.source_ref)
-                .map_err(|e| Fault::refused(Code::ConfigInvalid, e.to_string()))?;
             settings
-                .narrowed_to(&[wanted.as_str().to_owned()])
+                .narrowed_to(std::slice::from_ref(&channel.source_ref))
                 .map_err(|e| Fault::refused(Code::ConfigInvalid, e.to_string()))?
         };
         // Nothing is fetched that cannot be checked: the pinned `gh` and the trusted root are
@@ -322,15 +320,6 @@ impl<E: Exec> Linux<E> {
     }
 }
 
-/// The refusal an outcome of the Mac code's helpers carries, as a fault.
-fn refused_outcome(outcome: crate::outcome::Outcome) -> Fault {
-    match outcome {
-        crate::outcome::Outcome::Refused(refusal)
-        | crate::outcome::Outcome::RefusedBecause(refusal, _) => config_fault(refusal),
-        _ => Fault::failed(Code::ConfigInvalid, "the token file cannot be read"),
-    }
-}
-
 /// What the host holds a component to: the contract's timeouts, this build's supported
 /// numbers and no operator floor (a rollback is an install of an older release).
 fn policy(max_component: u64) -> Policy {
@@ -349,11 +338,10 @@ struct Copied {
     sha256: String,
 }
 
-/// Copy the untrusted file `src` to the new file `dst` (root's, 0600) through the open
-/// descriptor, hashing what is copied: a regular file with one link, at most `cap` bytes,
-/// not followed through a symbolic link.
-fn copy_hashing(src: &Path, dst: &Path, cap: u64) -> io::Result<Copied> {
-    let mut file = OpenOptions::new()
+/// Open the untrusted file `src` without following a symbolic link, and accept it only as a
+/// regular file with one link of at most `cap` bytes.
+fn open_plain(src: &Path, cap: u64) -> io::Result<File> {
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(nofollow())
         .open(src)?;
@@ -364,23 +352,29 @@ fn copy_hashing(src: &Path, dst: &Path, cap: u64) -> io::Result<Copied> {
     if meta.len() > cap {
         return Err(io::Error::other(format!("larger than {cap} bytes")));
     }
+    Ok(file)
+}
+
+/// Copy the untrusted file `src` to the new file `dst` (root's, 0600) through the open
+/// descriptor, hashing what is copied (see [`open_plain`]). A file that grew since it was
+/// looked at is cut at `cap`; the digest then names the cut bytes, which no attestation lists.
+fn copy_hashing(src: &Path, dst: &Path, cap: u64) -> io::Result<Copied> {
+    let file = open_plain(src, cap)?;
     let mut out = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(dst)?;
+    let mut capped = file.take(cap);
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut len = 0_u64;
     loop {
-        let n = (&mut file).take(cap - len + 1).read(&mut buffer)?;
+        let n = capped.read(&mut buffer)?;
         if n == 0 {
             break;
         }
         len += n as u64;
-        if len > cap {
-            return Err(io::Error::other(format!("larger than {cap} bytes")));
-        }
         hasher.update(&buffer[..n]);
         out.write_all(&buffer[..n])?;
     }
@@ -393,18 +387,10 @@ fn copy_hashing(src: &Path, dst: &Path, cap: u64) -> io::Result<Copied> {
     Ok(Copied { len, sha256 })
 }
 
-/// The text of the untrusted file `src`, at most `cap` bytes, not followed through a link.
+/// The text of the untrusted file `src` (see [`open_plain`]).
 fn read_capped(src: &Path, cap: u64) -> io::Result<String> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(nofollow())
-        .open(src)?;
-    let meta = file.metadata()?;
-    if !meta.is_file() || meta.nlink() != 1 || meta.len() > cap {
-        return Err(io::Error::other("not a regular file within its limit"));
-    }
     let mut text = String::new();
-    file.take(cap).read_to_string(&mut text)?;
+    open_plain(src, cap)?.take(cap).read_to_string(&mut text)?;
     Ok(text)
 }
 

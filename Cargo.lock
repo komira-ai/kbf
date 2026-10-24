@@ -1550,7 +1550,6 @@ dependencies = [
  "hyper-util",
  "kbf-ca",
  "kbf-oidc",
- "kbf-peer",
  "kbf-testkit",
  "kbf-tls",
  "kbf-types",
@@ -2697,11 +2696,16 @@ dependencies = [
 name = "kbf-updater"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "httparse",
+ "kbf-ca",
  "kbf-host-install",
+ "kbf-peer",
  "kbf-testkit",
  "kbf-types",
  "libc",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror",

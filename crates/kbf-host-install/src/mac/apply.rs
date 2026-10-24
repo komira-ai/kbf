@@ -279,10 +279,11 @@ pub(crate) fn switch(
         return Ok(());
     };
     // The new release did not come up: the links go back, and the old release must.
-    Err(format!(
-        "{why}:{}",
-        go_back(host, runner, before).unwrap_or("no_previous")
-    ))
+    let tail = match switch_back(host, runner, before) {
+        Ok(()) => "rolled_back",
+        Err(failed) => failed,
+    };
+    Err(format!("{why}:{tail}"))
 }
 
 /// Put both links back as `before` had them and start the release `before.current` names.
@@ -294,18 +295,8 @@ pub(crate) fn switch_back(
     runner: &dyn Runner,
     before: &Links,
 ) -> Result<(), &'static str> {
-    match go_back(host, runner, before) {
-        Some("rolled_back") => Ok(()),
-        Some(failed) => Err(failed),
-        None => Err("no_previous"),
-    }
-}
-
-/// The links back as `before` had them, then the old release started: `rolled_back` or
-/// `rollback_failed`, or none when there was no old release.
-fn go_back(host: &MacHost, runner: &dyn Runner, before: &Links) -> Option<&'static str> {
     let restored = restore(host, before).is_ok();
-    let old = before.current.as_deref()?;
+    let old = before.current.as_deref().ok_or("no_previous")?;
     // The daemon is not restarted on a file that is not root's to run, nor one that is gone.
     let back = restored
         && host
@@ -313,11 +304,7 @@ fn go_back(host: &MacHost, runner: &dyn Runner, before: &Links) -> Option<&'stat
             .check_file(&host.release(old).join(BINARY))
             .is_ok()
         && restart(host, runner, old).is_ok();
-    Some(if back {
-        "rolled_back"
-    } else {
-        "rollback_failed"
-    })
+    if back { Ok(()) } else { Err("rollback_failed") }
 }
 
 /// `releases/<commit>/kbf` and its `VERSION`.

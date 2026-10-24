@@ -1,9 +1,13 @@
 //! `kbf-host-install --serve` as a process: the flags, the account, the socket, the backend
 //! of the platform this program runs on, and the loop.
+//!
+//! The paths this program reads and writes as root are constants here and in the backends;
+//! the serving itself takes them as arguments ([`Place`], [`LinuxEnv`]) so that a test serves
+//! a scratch directory with the same code.
 
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,7 +16,7 @@ use super::backend::Backend;
 use super::core::Ab;
 use super::serve::{self, ServeConfig, Serving};
 use crate::mac::layout::MacHost;
-use crate::runner::SystemRunner;
+use crate::runner::{Runner, SystemRunner};
 use crate::trust::Trust;
 
 /// Root's directory for this program's state on a Linux host.
@@ -55,33 +59,30 @@ pub(super) fn main_with(
     }
 }
 
-fn run(config: &ServeConfig) -> Result<(), String> {
-    if cfg!(target_os = "macos") {
-        serve_mac(config)
-    } else {
-        serve_linux(config)
-    }
+/// The platform's serving. (Selected by the target, not by an `if`: the other is compiled and
+/// tested on every platform all the same.)
+#[cfg(target_os = "macos")]
+pub(super) fn run(config: &ServeConfig) -> Result<(), String> {
+    serve_mac(config)
 }
 
-fn log(line: &str) {
+#[cfg(not(target_os = "macos"))]
+pub(super) fn run(config: &ServeConfig) -> Result<(), String> {
+    serve_linux(config)
+}
+
+pub(super) fn log(line: &str) {
     eprintln!("kbf-host-install: {line}");
 }
 
 /// Make root's private directory `dir` (0700) if it is not there, and check it.
 pub(super) fn private_dir(trust: &Trust, dir: &Path) -> Result<(), String> {
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(dir)
-        .or_else(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        })
-        .map_err(|e| format!("{}: {e}", dir.display()))?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    let say = |e: std::io::Error| format!("{}: {e}", dir.display());
+    match fs::DirBuilder::new().mode(0o700).create(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(say(e)),
+        _ => {}
+    }
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(say)?;
     trust
         .check_dir(dir)
         .map_err(|e| format!("{}: {e}", dir.display()))
@@ -94,20 +95,19 @@ pub(super) fn serve_with<B: Backend>(
     place: &Place<'_>,
     stop: &AtomicBool,
 ) -> Result<(), String> {
-    let (state_dir, trust, ids, audit) = (place.state_dir, place.trust, place.ids, place.audit);
     let ab = Ab::new(
         backend,
-        state_dir.join("state.json"),
-        trust.clone(),
+        place.state_dir.join("state.json"),
+        place.trust.clone(),
         config.window_secs,
         Box::new(unix_now),
     );
-    let listener = serve::bind(trust, &config.socket, ids)
+    let listener = serve::bind(place.trust, &config.socket, place.ids)
         .map_err(|e| format!("{}: {e}", config.socket.display()))?;
     let serving = Serving {
         ab: &ab,
-        trust,
-        audit,
+        trust: place.trust,
+        audit: place.audit,
         log: &log,
     };
     serving
@@ -123,66 +123,115 @@ pub(super) struct Place<'a> {
     pub(super) audit: &'a Path,
 }
 
-#[cfg(target_os = "linux")]
-fn serve_linux(config: &ServeConfig) -> Result<(), String> {
+/// What a Linux host's serving reads: the passwd file the account is looked up in, and the
+/// private state directory and audit log it writes.
+pub(super) struct LinuxEnv {
+    pub(super) passwd: PathBuf,
+    pub(super) state_dir: PathBuf,
+    pub(super) audit: PathBuf,
+}
+
+impl LinuxEnv {
+    pub(super) fn production() -> Self {
+        Self {
+            passwd: PathBuf::from("/etc/passwd"),
+            state_dir: PathBuf::from(LINUX_STATE_DIR),
+            audit: PathBuf::from(AUDIT),
+        }
+    }
+}
+
+/// A Linux host: the account of the socket from the passwd file (never root), the state directory
+/// made private, then the serving.
+pub(super) fn serve_linux_with<B: Backend>(
+    config: &ServeConfig,
+    env: &LinuxEnv,
+    trust: &Trust,
+    backend: B,
+    stop: &AtomicBool,
+) -> Result<(), String> {
     if config.units.is_empty() {
         return Err("--restart-unit is required on a Linux host".to_owned());
     }
-    let trust = Trust::root();
     let passwd = trust
-        .read(Path::new("/etc/passwd"))
-        .map_err(|e| format!("/etc/passwd: {e}"))?;
+        .read(&env.passwd)
+        .map_err(|e| format!("{}: {e}", env.passwd.display()))?;
     let ids = serve::passwd_ids(&passwd, &config.user)
         .filter(|(uid, gid)| *uid != 0 && *gid != 0)
         .ok_or_else(|| format!("the account {} has no usable ids", config.user))?;
-    let state_dir = Path::new(LINUX_STATE_DIR);
-    private_dir(&trust, state_dir)?;
-    serve_with(
+    private_dir(trust, &env.state_dir)?;
+    let place = Place {
+        state_dir: &env.state_dir,
+        trust,
+        ids,
+        audit: &env.audit,
+    };
+    serve_with(config, backend, &place, stop)
+}
+
+/// The Linux side as the program runs it.
+pub(super) fn serve_linux(config: &ServeConfig) -> Result<(), String> {
+    serve_linux_for(config)
+}
+
+#[cfg(target_os = "linux")]
+fn serve_linux_for(config: &ServeConfig) -> Result<(), String> {
+    serve_linux_with(
         config,
+        &LinuxEnv::production(),
+        &Trust::root(),
         super::linux::production(config.units.clone()),
-        &Place {
-            state_dir,
-            trust: &trust,
-            ids,
-            audit: Path::new(AUDIT),
-        },
         &AtomicBool::new(false),
     )
 }
 
 #[cfg(not(target_os = "linux"))]
-fn serve_linux(_config: &ServeConfig) -> Result<(), String> {
+fn serve_linux_for(_config: &ServeConfig) -> Result<(), String> {
     Err("this program serves a Linux host on Linux only".to_owned())
 }
 
-fn serve_mac(config: &ServeConfig) -> Result<(), String> {
+/// A Mac: the account of the socket from `dscl` (through `runner`, never root), the work
+/// directory made, then the serving of the kit by `backend_runner`'s tools.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(super) fn serve_mac_with(
+    config: &ServeConfig,
+    host: MacHost,
+    runner: &dyn Runner,
+    backend_runner: Box<dyn Runner>,
+    stop: &AtomicBool,
+) -> Result<(), String> {
     use crate::mac::tools;
     if !config.units.is_empty() {
         return Err(
             "--restart-unit is for a Linux host: a Mac restarts the daemon's job".to_owned(),
         );
     }
-    let host = MacHost::production();
-    let exec = crate::runner::Runner::run(
-        &SystemRunner,
-        &tools::dscl_ids(&config.user, host.tuning.tool),
-    )
-    .map_err(|e| format!("dscl: {e}"))?;
+    let exec = runner
+        .run(&tools::dscl_ids(&config.user, host.tuning.tool))
+        .map_err(|e| format!("dscl: {e}"))?;
     let who = tools::parse_ids(&exec.stdout_text())
         .filter(|id| id.uid != 0 && id.gid != 0)
         .ok_or_else(|| format!("the account {} has no usable ids", config.user))?;
     crate::mac::ensure_work(&host).map_err(|_| "the work directory is not usable".to_owned())?;
-    let (trust, work) = (host.trust.clone(), host.work.clone());
-    let backend = super::mac_backend::MacBackend::new(host, Box::new(SystemRunner));
-    serve_with(
+    let (trust, work, audit) = (host.trust.clone(), host.work.clone(), host.audit.clone());
+    let backend = super::mac_backend::MacBackend::new(host, backend_runner);
+    let place = Place {
+        state_dir: &work,
+        trust: &trust,
+        ids: (who.uid, who.gid),
+        audit: &audit,
+    };
+    serve_with(config, backend, &place, stop)
+}
+
+/// The Mac side as the program runs it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(super) fn serve_mac(config: &ServeConfig) -> Result<(), String> {
+    serve_mac_with(
         config,
-        backend,
-        &Place {
-            state_dir: &work,
-            trust: &trust,
-            ids: (who.uid, who.gid),
-            audit: Path::new(AUDIT),
-        },
+        MacHost::production(),
+        &SystemRunner,
+        Box::new(SystemRunner),
         &AtomicBool::new(false),
     )
 }

@@ -654,3 +654,43 @@ fn the_versions_remembered_are_bounded() {
     let saved: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(saved["versions"].as_object().unwrap().len(), 16);
 }
+
+/// A state file whose directory is not a directory cannot be looked at: that is the records being
+/// unavailable, not a host with none.
+#[test]
+fn a_state_file_that_cannot_be_looked_at_is_unavailable() {
+    let fx = Fx::new("ab-enotdir");
+    fs::write(fx.dir.join("lock"), "a file").unwrap();
+    let ab = Ab::new(
+        Fake {
+            world: Rc::clone(&fx.world),
+            lock: fx.dir.join("lock2"),
+        },
+        fx.dir.join("lock/state.json"),
+        Trust::owned_by(fs::metadata(&*fx.dir).unwrap().uid(), &fx.dir),
+        WINDOW,
+        Box::new(|| 1),
+    );
+    let answer = ab.handle(&LocalRequest::Query);
+    assert!(failed(Code::StateUnavailable)(&answer), "{answer:?}");
+}
+
+/// A confirm asked again is answered only for the release that was confirmed: a host that runs
+/// a release whose last update ended another way, or for another version, is not told it was
+/// confirmed.
+#[test]
+fn a_repeated_confirm_is_for_the_release_that_was_confirmed() {
+    let fx = Fx::new("ab-confirm-last");
+    // The host learns that it runs VA, and VB failed by revert.
+    fx.install(VA);
+    fx.install(VB);
+    fx.ask(&format!("switch kbf={VB}"));
+    fx.ask("revert");
+    fx.install(VA);
+    assert!(refused(Code::NothingPending)(
+        &fx.ask(&format!("confirm kbf={VA}"))
+    ));
+    assert!(refused(Code::NothingPending)(
+        &fx.ask(&format!("confirm kbf={VB}"))
+    ));
+}

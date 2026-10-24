@@ -30,6 +30,8 @@ pub mod units;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+// Compiled and tested everywhere, used by the program on a Mac only.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub mod mac_backend;
 
 #[cfg(test)]
@@ -46,3 +48,5 @@ mod production_tests;
 mod request_tests;
 #[cfg(test)]
 mod serve_tests;
+#[cfg(test)]
+mod units_tests;

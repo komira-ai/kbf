@@ -167,6 +167,14 @@ fn the_socket_is_0600_and_binds_only_where_it_is_safe() {
     assert!(bind(&trust(&dir), &socket, ids).is_err());
     fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
 
+    // A directory that cannot be looked into: the socket's own file cannot be looked at.
+    if meta.uid() != 0 {
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o600)).unwrap();
+        let err = bind(&trust(&dir), &run.join("blind"), ids).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     // A path with no directory, a directory that is not there, and a socket path whose
     // account cannot be given it.
     assert!(bind(&trust(&dir), Path::new("/"), ids).is_err());

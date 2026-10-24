@@ -11,7 +11,8 @@ use super::core::Ab;
 use super::mac_backend::MacBackend;
 use super::request::LocalRequest;
 use crate::mac::kit;
-use crate::mac::tests::fx::{Fx, NEW, NEW_VERSION, OLD, OLD_VERSION, Sim, mkdir, write};
+use crate::mac::release::{bundle_name, tarball_name};
+use crate::mac::tests::fx::{Fx, NEW, NEW_VERSION, OLD, OLD_VERSION, Sim, mkdir, tarball, write};
 use crate::request::{Channel, Version};
 use crate::runner::{Cmd, Exec, Runner};
 
@@ -395,4 +396,92 @@ fn an_unconfirmed_release_is_reverted_by_the_tick_and_a_confirmed_one_stays() {
     assert_eq!(ab.tick(), None);
     assert_eq!(current(&fx).as_deref(), Some(NEW));
     let _ = OLD_VERSION;
+}
+
+/// GitHub holds `NEW` as release `v1.0`.
+fn github(fx: &Fx, sim: &Sim) {
+    write(
+        &fx.host.allowlist,
+        0o644,
+        b"[channels.stable]\nsource = \"github\"\n",
+    );
+    let release = format!(
+        "{{\"tag_name\":\"v1.0\",\"draft\":false,\"assets\":[\
+         {{\"name\":\"{}\",\"size\":100}},{{\"name\":\"{}\",\"size\":10}}]}}",
+        tarball_name(NEW),
+        bundle_name(NEW)
+    );
+    sim.pages.borrow_mut().push(format!("[{release}]"));
+    let tar = tarball(&[("kbf", tar::EntryType::Regular, &fx.new_binary)]);
+    let mut assets = sim.assets.borrow_mut();
+    let files = assets.entry("v1.0".to_owned()).or_default();
+    files.insert(tarball_name(NEW), tar);
+    files.insert(bundle_name(NEW), b"{}\n".to_vec());
+}
+
+/// What the release source and the configuration say is passed on as the closed code of the
+/// socket: a release the channel does not have, two that start the same, a listing that cannot
+/// be fetched, an allowlist or a tool that is not root's.
+#[test]
+fn what_the_release_source_and_the_configuration_say_is_passed_on() {
+    let (fx, sim, backend) = rig("mb-github");
+    github(&fx, &sim);
+    assert_eq!(
+        backend.stage(&version(NEW_VERSION), &stable()).unwrap(),
+        NEW
+    );
+
+    let (fx, sim, backend) = rig("mb-github-unknown");
+    github(&fx, &sim);
+    sim.pages.borrow_mut()[0] = "[]".to_owned();
+    let fault = backend.stage(&version(NEW_VERSION), &stable()).unwrap_err();
+    assert!(refused(Code::UnknownRelease)(&fault), "{fault:?}");
+
+    let (fx, sim, backend) = rig("mb-github-twin");
+    github(&fx, &sim);
+    let twin = format!("{}{}", &NEW[..12], "c".repeat(28));
+    let release = format!(
+        "{{\"tag_name\":\"v2.0\",\"draft\":false,\"assets\":[\
+         {{\"name\":\"{}\",\"size\":100}},{{\"name\":\"{}\",\"size\":10}}]}}",
+        tarball_name(&twin),
+        bundle_name(&twin)
+    );
+    let first = sim.pages.borrow()[0].clone();
+    sim.pages.borrow_mut()[0] = format!("{},{}]", &first[..first.len() - 1], release);
+    let fault = backend.stage(&version(NEW_VERSION), &stable()).unwrap_err();
+    assert!(refused(Code::AmbiguousRelease)(&fault), "{fault:?}");
+
+    let (fx, sim, backend) = rig("mb-github-net");
+    github(&fx, &sim);
+    sim.break_("list-net");
+    let fault = backend.stage(&version(NEW_VERSION), &stable()).unwrap_err();
+    assert!(refused(Code::FetchFailed)(&fault), "{fault:?}");
+
+    let (fx, _, backend) = rig("mb-unsafe-allowlist");
+    fs::set_permissions(&fx.host.allowlist, fs::Permissions::from_mode(0o666)).unwrap();
+    let fault = backend.stage(&version(NEW_VERSION), &stable()).unwrap_err();
+    assert!(refused(Code::ConfigUnsafe)(&fault), "{fault:?}");
+
+    let (fx, sim, backend) = rig("mb-unsafe-tool");
+    github(&fx, &sim);
+    fs::set_permissions(&fx.host.gh, fs::Permissions::from_mode(0o666)).unwrap();
+    let fault = backend.stage(&version(NEW_VERSION), &stable()).unwrap_err();
+    assert!(refused(Code::ConfigUnsafe)(&fault), "{fault:?}");
+}
+
+/// A work directory that is not a directory makes the marker unreadable, not absent; and a
+/// marker that is not there is cleared without complaint.
+#[test]
+fn a_work_directory_that_is_not_one_and_an_absent_marker() {
+    let (fx, _, backend) = rig("mb-work");
+    let nothing = Pending {
+        commit: NEW.into(),
+        from: OLD.into(),
+        deadline_unix: Some(1),
+        activation: String::new(),
+    };
+    backend.confirm(&nothing).unwrap();
+    fs::remove_dir_all(&fx.host.work).unwrap();
+    write(&fx.host.work, 0o644, b"a file, not a directory");
+    assert_eq!(backend.pending().unwrap_err().code, Code::StateUnavailable);
 }

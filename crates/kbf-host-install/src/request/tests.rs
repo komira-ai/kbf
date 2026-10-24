@@ -404,6 +404,8 @@ fn a_configured_service_is_a_kbf_service_and_nothing_else() {
         "kbf-frontend@a.service",
         "kbf-frontend@main-2.service",
         "kbf-x.service",
+        "kbf-daemon2.service",
+        "kbf-9.service",
     ] {
         assert_eq!(Unit::service(good).unwrap().as_str(), good, "{good}");
     }
