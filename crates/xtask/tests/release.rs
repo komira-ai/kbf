@@ -1676,3 +1676,82 @@ fn publish_releases_the_package_and_its_bundle() {
         "{names:?}"
     );
 }
+
+fn image(commit: &str, repository: &str, platform: &str) -> String {
+    format!("{repository}-image-{commit}-{platform}.tar")
+}
+
+#[test]
+fn check_accepts_the_images_of_the_commit_with_their_bundles_and_counts_them() {
+    // Catches: an image archive in SHA256SUMS refused as "not an asset of <commit>" (the
+    // release of the first main push that lists one fails), accepted with no bundle, or
+    // not counted in the bundles line; and an image of another commit or of no platform,
+    // or a bare `.tar` that is no image, accepted.
+    let root = scratch("check-image");
+    let listed = dist(&root, COMMIT);
+    add_deb(
+        &listed,
+        &image(COMMIT, "kbf-frontend", "linux-x86_64"),
+        true,
+    );
+    add_deb(
+        &listed,
+        &image(COMMIT, "kbf-coordinator", "linux-arm64"),
+        true,
+    );
+    let (code, out, err) = check(&listed, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(
+        out,
+        format!(
+            "sums: 8 files match; the flipped copy does not\n\
+             names: every listed file is an asset of {COMMIT}\n\
+             bundles: each of the 3 tarballs and 2 image(s) has one provenance bundle\n"
+        )
+    );
+    let root = scratch("check-image-bundle");
+    let held = dist(&root, COMMIT);
+    let name = image(COMMIT, "kbf-frontend", "linux-x86_64");
+    add_deb(&held, &name, false);
+    let (code, out, err) = check(&held, COMMIT);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!("xtask: {name}: no provenance bundle {name}.sigstore.json\n")
+    );
+    for foreign in [
+        image(OTHER, "kbf-frontend", "linux-x86_64"),
+        image(COMMIT, "kbf-frontend", "linux-riscv"),
+        format!("-{COMMIT}-linux-arm64.tar"),
+    ] {
+        let root = scratch("check-image-foreign");
+        let dist = dist(&root, COMMIT);
+        add_deb(&dist, &foreign, true);
+        let (code, out, err) = check(&dist, COMMIT);
+        assert_eq!(code, Some(1), "{foreign}: {out}");
+        assert_eq!(
+            err,
+            format!("xtask: {foreign}: not an asset of {COMMIT}\n"),
+            "{foreign}"
+        );
+    }
+}
+
+#[test]
+fn publish_releases_the_image_and_its_bundle() {
+    // Catches: a release that lists an image in SHA256SUMS and uploads neither it nor its
+    // bundle, so the operator path (verify the archive offline, then import it) has
+    // nothing to start from.
+    let root = scratch("publish-image");
+    let dist = dist(&root, COMMIT);
+    let name = image(COMMIT, "kbf-coordinator", "linux-x86_64");
+    add_deb(&dist, &name, true);
+    let (code, _, err) = publish(&root, None);
+    assert_eq!(code, Some(0), "{err}");
+    let names: Vec<String> = released(&root).into_iter().map(|(n, _)| n).collect();
+    assert!(names.contains(&name), "{names:?}");
+    assert!(
+        names.contains(&format!("{name}.sigstore.json")),
+        "{names:?}"
+    );
+}

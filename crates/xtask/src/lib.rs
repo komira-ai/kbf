@@ -41,6 +41,12 @@
 //!   `kbf-<commit>-<platform>.deb`, refused unless its `/usr/bin/kbf` is the `kbf` of the
 //!   attested tarball, it depends on no `kbf-installer` and replaces `kbf-installer`, and it
 //!   holds the units of the modes and nothing else.
+//! - `image-build`, `image-asset` and `image-test` ([`image`]): the container image of the frontend and of
+//!   the update coordinator as the release assets `kbf-frontend-image-<commit>-<platform>.tar`
+//!   and `kbf-coordinator-image-<commit>-<platform>.tar` (a `docker save` archive, imported
+//!   without a registry), refused unless the image holds the attested binary, runs as a user
+//!   that is not root and bakes in no setting; and its load and run in Docker, which must
+//!   name the commit.
 //! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf-installer` package
 //!   carries, in the one form a deb and an rpm put in the same order, and the most a package
 //!   that carries a kbf release may weigh. `pkg-config` and `pkg-asset` take them up with
@@ -97,6 +103,7 @@ pub mod crun_tests;
 pub mod darwin;
 pub mod entitlements;
 pub mod fetch;
+pub mod image;
 pub mod installer_tarball;
 pub mod package;
 pub mod pkg;
@@ -372,6 +379,69 @@ enum Verb {
         /// Only check `--package`, which must be named as the asset; write nothing.
         #[arg(long)]
         verify_only: bool,
+    },
+    /// Build the container image of the frontend or the coordinator from a binary and save it
+    /// as a `docker save` archive.
+    ImageBuild {
+        /// The image.
+        #[arg(long, value_enum)]
+        image: image::Image,
+        /// The directory holding the image's `Dockerfile` (`packaging/container/<image>`).
+        #[arg(long)]
+        dockerfile_dir: PathBuf,
+        /// The binary the image carries.
+        #[arg(long)]
+        binary: PathBuf,
+        /// The commit it is built from (`$GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The directory the build context and the archive go in.
+        #[arg(long)]
+        out: PathBuf,
+        /// The docker program.
+        #[arg(long, default_value = "docker")]
+        docker: PathBuf,
+    },
+    /// A container image of the frontend or the coordinator as a release asset, refused unless
+    /// it holds the built binary, runs as a user that is not root and bakes in no setting.
+    ImageAsset {
+        /// The image.
+        #[arg(long, value_enum)]
+        image: image::Image,
+        /// The `docker save` archive of the image, tagged `<repository>:<commit>`.
+        #[arg(long)]
+        archive: PathBuf,
+        /// The binary the image was built from, which `build-commit check` has checked.
+        #[arg(long)]
+        binary: PathBuf,
+        /// The CycloneDX SBOM of that binary.
+        #[arg(long)]
+        sbom: PathBuf,
+        /// The platform it was built for (`linux-x86_64`, `linux-arm64`).
+        #[arg(long, value_enum)]
+        platform: package::Platform,
+        /// The commit it was built from (`$GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The directory the assets and their lines of `SHA256SUMS.<platform>` go in.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Load an image archive into Docker and check that its binary names the commit, that it
+    /// runs as a user that is not root, and that it does not start with nothing mounted.
+    ImageTest {
+        /// The image.
+        #[arg(long, value_enum)]
+        image: image::Image,
+        /// The `docker save` archive of the image.
+        #[arg(long)]
+        archive: PathBuf,
+        /// The commit it was built from (`$GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The docker program.
+        #[arg(long, default_value = "docker")]
+        docker: PathBuf,
     },
     /// Install a package into a fresh container and check it never starts or enables.
     PkgInstallTest {
@@ -1049,6 +1119,55 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         }
         #[cfg(not(target_os = "macos"))]
         Verb::PkgMacosInstallTest { .. } => Err(darwin::needs_macos("pkg-macos-install-test")),
+        Verb::ImageBuild {
+            image,
+            dockerfile_dir,
+            binary,
+            commit,
+            out,
+            docker,
+        } => image::build(
+            &mut pkg_install::process(&docker),
+            &image::Build {
+                image,
+                dockerfile_dir: &dockerfile_dir,
+                binary: &binary,
+                commit: &commit,
+                out: &out,
+            },
+        ),
+        Verb::ImageAsset {
+            image,
+            archive,
+            binary,
+            sbom,
+            platform,
+            commit,
+            out,
+        } => image::asset(
+            &archive,
+            &sbom,
+            &out,
+            &image::Check {
+                image,
+                platform,
+                commit: &commit,
+                binary: &binary,
+            },
+        ),
+        Verb::ImageTest {
+            image,
+            archive,
+            commit,
+            docker,
+        } => image::run(
+            &mut pkg_install::process(&docker),
+            &image::Test {
+                image,
+                archive: &archive,
+                commit: &commit,
+            },
+        ),
         Verb::PkgInstallTest {
             package,
             format,

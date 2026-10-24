@@ -561,7 +561,7 @@ pub fn verify_attestations(dir: &Path, a: &Attestations) -> Result<Vec<String>, 
     let mut printed = Vec::new();
     for l in &lines {
         let file = dir.join(&l.name);
-        if l.name.ends_with(".tar.gz") {
+        if l.name.ends_with(".tar.gz") || bundles::is_image(&l.name) {
             a.require(&file, workflow, None)?;
             a.require(&file, workflow, Some(SBOM_PREDICATE))?;
             a.require_bundle(dir, &l.name, workflow)?;
@@ -578,7 +578,7 @@ pub fn verify_attestations(dir: &Path, a: &Attestations) -> Result<Vec<String>, 
             printed.push(format!("verified: {} (provenance)", l.name));
         } else {
             return Err(Error::Failed(format!(
-                "{SUMS} lists {}, neither a tarball, a package, an SBOM nor version facts",
+                "{SUMS} lists {}, neither a tarball, an image, a package, an SBOM nor version facts",
                 l.name
             )));
         }

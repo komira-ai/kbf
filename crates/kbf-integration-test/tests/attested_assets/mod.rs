@@ -111,6 +111,47 @@ pub fn packaged_macos_pkgs(workflow: &str) -> Result<Vec<String>, String> {
     Ok(found)
 }
 
+/// The (image, platform) of every `cargo xtask image-asset` line in the workflow's `run:`
+/// steps, in file order: `image` is the word after `--image` (`frontend` or `coordinator`).
+/// The image's asset is `kbf-<image>-image-<commit>-<platform>.tar`, with an SBOM of its own
+/// ([`image_asset_name`]). An error names a line without `--image` or `--platform`.
+pub fn packaged_images(workflow: &str) -> Result<Vec<(String, String)>, String> {
+    let mut found = Vec::new();
+    for step in workflows::run_steps(workflow)? {
+        for line in step.script.lines().map(str::trim_start) {
+            let Some(args) = line.strip_prefix("cargo xtask image-asset ") else {
+                continue;
+            };
+            let words: Vec<&str> = args.split_whitespace().collect();
+            let flag = |f: &str| {
+                let at = words.iter().position(|w| *w == f)?;
+                words.get(at + 1).map(|v| v.trim_matches('"').to_owned())
+            };
+            let (Some(image), Some(platform)) = (flag("--image"), flag("--platform")) else {
+                return Err(format!(
+                    "{}/{}: an image-asset line without --image and --platform: {line}",
+                    step.job, step.step
+                ));
+            };
+            found.push((image, platform));
+        }
+    }
+    Ok(found)
+}
+
+/// What an image's asset is called before its extension, `<name>` of [`stem`]: `kbf-frontend-image`
+/// or `kbf-coordinator-image`. An error for an image the workflow names that the release set
+/// does not know.
+pub fn image_asset_name(image: &str) -> Result<&'static str, String> {
+    match image {
+        "frontend" => Ok("kbf-frontend-image"),
+        "coordinator" => Ok("kbf-coordinator-image"),
+        other => Err(format!(
+            "`cargo xtask image-asset --image {other}`: not an image of the release set"
+        )),
+    }
+}
+
 /// The (subject-path, sbom-path) of every `actions/attest-sbom` step of `job`. An error
 /// for such a step that lacks either path, or that is under `if:` or
 /// `continue-on-error:` (it could be skipped while the job passes).
@@ -170,6 +211,18 @@ pub fn unattested(workflow: &str, attest_jobs: &[&str]) -> Result<Vec<String>, S
         if !attested.contains(&pair) {
             wrong.push(format!(
                 "{name} for {platform} is packaged, but `{attest_job}` has no attest-sbom step with subject-path {} and sbom-path {}",
+                pair.0, pair.1
+            ));
+        }
+        expected.push(pair);
+    }
+    // An image is attested like a tarball: its archive with the SBOM of its binary.
+    for (image, platform) in packaged_images(workflow)? {
+        let stem = stem(image_asset_name(&image)?, &platform);
+        let pair = (format!("dist/{stem}.tar"), format!("dist/{stem}.cdx.json"));
+        if !attested.contains(&pair) {
+            wrong.push(format!(
+                "the {image} image for {platform} is made an asset, but `{attest_job}` has no attest-sbom step with subject-path {} and sbom-path {}",
                 pair.0, pair.1
             ));
         }

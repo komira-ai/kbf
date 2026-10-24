@@ -19,6 +19,9 @@
 //!   `cargo xtask pkg-macos-asset` lists ([`attested_assets::packaged_macos_pkgs`]) are
 //!   held to the same two rules, as `dist/kbf-installer-<commit>-<platform>.deb` (`.pkg`),
 //!   `dist/kbf-<commit>-<platform>.deb` and their `.deb.sigstore.json` (`.pkg.sigstore.json`).
+//!   So are the container images that `cargo xtask image-asset` lists
+//!   ([`attested_assets::packaged_images`]), as `dist/kbf-<image>-image-<commit>-<platform>.tar`
+//!   and its `.tar.sigstore.json`.
 //! - **Its bundle's name.** The step after it sets `BUNDLE` to that step's
 //!   `bundle-path` output and copies it to `dist/<tarball>.sigstore.json` (the action
 //!   leaves it in a temporary directory under a name that is the same for every
@@ -108,6 +111,10 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
     }
     for platform in attested_assets::packaged_macos_pkgs(artifacts)? {
         packages.push(("kbf-installer", platform, "pkg"));
+    }
+    // The images are held to the same rules, as `dist/kbf-<image>-image-<commit>-<platform>.tar`.
+    for (image, platform) in attested_assets::packaged_images(artifacts)? {
+        packages.push((attested_assets::image_asset_name(&image)?, platform, "tar"));
     }
     let groups: BTreeSet<&str> = packaged
         .iter()

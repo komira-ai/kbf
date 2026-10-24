@@ -38,8 +38,9 @@ by `crates/kbf-integration-test/tests/release_artifacts`.
 Thirteen tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of
 `kbf-installer` ([below](#the-kbf-installer-package-deb)), two of `kbf`
-([below](#the-kbf-package-deb)) and one macOS package of `kbf-installer`
-([below](#the-kbf-installer-package-pkg-macos)), built by one job per platform:
+([below](#the-kbf-package-deb)), four container images (the frontend and the update
+coordinator, for each Linux platform; [below](#the-container-images)) and one macOS package of
+`kbf-installer` ([below](#the-kbf-installer-package-pkg-macos)), built by one job per platform:
 
 | Asset | Runner | Target |
 |---|---|---|
@@ -80,6 +81,15 @@ The packages are the two Linux jobs' debs (two each) and the macOS job's `.pkg`:
 | `kbf-<commit>-linux-x86_64.deb` | the `linux-x86_64` job | the `kbf` of the tarball of the same name at `/usr/bin/kbf`, the unit of every mode, a dependency on `kbf-installer` of the same version or later, and the replacement of `kbf-installer` (its files, not the package) |
 | `kbf-<commit>-linux-arm64.deb` | the `linux-arm64` job | the same for arm64 |
 | `kbf-installer-<commit>-darwin-arm64.pkg` | the `darwin-arm64` job (`macos-15`, `cargo xtask pkg build`) | the `kbf-installer` of the tarball of the same name, its LaunchDaemon property list, the pinned darwin `gh` and a trust directory |
+
+The container images are the two Linux jobs' `docker save` archives, with an SBOM each:
+
+| Asset | Built by | Holds |
+|---|---|---|
+| `kbf-frontend-image-<commit>-linux-x86_64.tar` | the `linux-x86_64` job | the `kbf` of the job at `/usr/bin/kbf`, run as `kbf --mode=frontend`, on the pinned Ubuntu base |
+| `kbf-frontend-image-<commit>-linux-arm64.tar` | the `linux-arm64` job | the same for arm64 |
+| `kbf-coordinator-image-<commit>-linux-x86_64.tar` | the `linux-x86_64` job | the `kbf-coordinator` of the job at `/usr/bin/kbf-coordinator` on the same base |
+| `kbf-coordinator-image-<commit>-linux-arm64.tar` | the `linux-arm64` job | the same for arm64 |
 
 The set above is pinned: `crates/kbf-integration-test/tests/release_artifacts` fails a pull request
 that drops one of these files from the workflow, packages one that is not listed, or
@@ -339,11 +349,12 @@ How a bundle is made, and what is checked of it:
 - **Not an SBOM's.** The SBOM attestation of a tarball carries the whole SBOM and can be
   larger than a bundle may be (below); it is not given to a host. A tarball has exactly
   one bundle, a package (`kbf-installer` or `kbf`) has exactly one (`<package>.sigstore.json`,
-  the same kind of attestation over the one `.deb`), and nothing else has one.
+  the same kind of attestation over the one `.deb`), so has a container image
+  (`<image>.tar.sigstore.json`), and nothing else has one.
 - **Not in `SHA256SUMS`.** The bundle is made after the sums, from the files they list, so
   they cannot list it. `cargo xtask verify-assets sums` leaves out names that end
   `.sigstore.json`, and `cargo xtask release check` holds the directory to one
-  `<tarball>.sigstore.json` per tarball (and per `.deb` and `.pkg`) the sums list and none for anything else.
+  `<tarball>.sigstore.json` per tarball (and per `.deb`, `.pkg` and image `.tar`) the sums list and none for anything else.
 - **Its size and shape.** A bundle is one line of JSON (`mediaType` of a Sigstore bundle,
   `dsseEnvelope`, `verificationMaterial`) of at most 256 KiB, the room a host's order
   record has for one. `release check` refuses an empty file, two bundles in one file and
@@ -473,6 +484,53 @@ needs `kbf-installer` installed first, or both files given to one `apt install .
 sudo apt install ./kbf-installer-<commit>-linux-x86_64.deb ./kbf-<commit>-linux-x86_64.deb
 ```
 
+## The container images
+
+The frontend and the update coordinator also come as container images, for a farm that runs
+them under an orchestrator ([deploy/containers.md](deploy/containers.md)). There is no registry:
+each image is a release asset, an archive made by `docker save`, and the operator imports the
+verified file into the container runtime of the host that runs it
+(`sudo k3s ctr -n k8s.io images import <file>` for k3s). `docker save` is used rather than an
+OCI archive from a builder plug-in because the runner then needs nothing but Docker, the name
+the image is known by (`kbf-frontend:<commit>`, `kbf-coordinator:<commit>`) travels in the
+file, and both `docker load` and `ctr images import` read it.
+
+The files are `kbf-frontend-image-<commit>-<platform>.tar` and
+`kbf-coordinator-image-<commit>-<platform>.tar` for `linux-x86_64` and `linux-arm64`, each with
+`kbf-<image>-image-<commit>-<platform>.cdx.json`: the SBOM of the binary in the image (the
+Rust crates in it; the Ubuntu packages of the base are not in it, and the base is named by
+the digest in the Dockerfile). The Dockerfiles are
+[`packaging/container/kbf-frontend`](../packaging/container/kbf-frontend/Dockerfile) and
+[`packaging/container/kbf-coordinator`](../packaging/container/kbf-coordinator/Dockerfile): a
+base pinned by its image index digest, a user that is not root (uid 10001), the binary as the
+entrypoint, and no environment variable, setting, key or token in the image.
+
+Each Linux job runs, after it has built and checked the binaries:
+
+1. `cargo xtask image-build` builds the image from the `Dockerfile` and the binary alone (the
+   commit is a build argument that becomes the label `org.opencontainers.image.revision`), saves
+   it, and removes it from the daemon;
+2. `cargo xtask image-test` loads the archive again and runs it: the binary names the commit
+   (`kbf --version`, and for `kbf` `--version --json`, a release build; `kbf-coordinator
+   --version`), the image runs as the user id 10001, and started with nothing mounted it exits
+   non-zero;
+3. `cargo xtask image-asset` refuses the archive unless it holds one image tagged
+   `<repository>:<commit>` for the platform's architecture, runs as a user that is not root with
+   the binary as its entrypoint, sets no environment variable but `PATH`, names the commit in its
+   label, holds `usr/bin/<binary>` byte for byte the binary that was built and checked, and holds
+   no file in `/etc/kbf`, `/etc/kbf-coordinator`, `/var/lib/kbf-server` or
+   `/var/lib/kbf-coordinator`; then it copies the archive and the SBOM into `dist` and lists
+   both in `SHA256SUMS`.
+
+An image is attested like a tarball: build provenance (as one subject of the `SHA256SUMS`
+attestation, and alone), an SBOM attestation, and its bundle
+`kbf-<image>-image-<commit>-<platform>.tar.sigstore.json` in `bundles-linux`. The verify job
+checks all three, offline for the bundle, with the commands of
+[the section on bundles](#provenance-bundles-verifying-a-tarball-offline); the archive is what
+the attestation covers, so verify it before `images import`. An image is about the size of the
+Ubuntu base layer plus the binary (tens of megabytes before compression); the four archives
+add to every run's artifacts and to every release.
+
 ## The kbf-installer package (pkg, macOS)
 
 A Mac gets `kbf-installer` the same way, as one file that holds everything it needs to verify a
@@ -551,7 +609,7 @@ themselves do not expire with the artifacts.
 A release is the files the `artifacts` stage of the pipeline run of a push to `main` left for one commit,
 attached unchanged to a GitHub release
 ([`.github/workflows/release.yml`](../.github/workflows/release.yml)). Nothing is
-rebuilt. Its assets are every tarball and SBOM in the table above, for that commit, the
+rebuilt. Its assets are every tarball, package, image and SBOM in the tables above, for that commit, the
 `kbf-<commit>-<platform>.version.json` of each platform, their
 `SHA256SUMS`, and the provenance bundle of each tarball, `<tarball>.sigstore.json`, beside
 it.

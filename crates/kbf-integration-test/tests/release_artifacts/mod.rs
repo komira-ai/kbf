@@ -177,6 +177,7 @@ pub fn problems(workflow: &str) -> Result<Vec<String>, String> {
     facts::rules(workflow, &mut out)?;
     packages(workflow, &mut out)?;
     kbf_package::rules(workflow, &mut out)?;
+    images::rules(workflow, &mut out)?;
     mac_package(workflow, &mut out)?;
     darwin(workflow, &mut out)?;
     pull_request_gate(workflow, &mut out)?;
@@ -854,6 +855,14 @@ fn the_docs_describe_the_release_set() {
             }
         }
     }
+    for platform in PACKAGES {
+        for image in images::IMAGES {
+            let file = format!("`kbf-{image}-image-<commit>-{platform}.tar`");
+            if !doc.contains(&file) {
+                missing.push(format!("docs/artifacts.md does not list {file}"));
+            }
+        }
+    }
     let file = format!("`kbf-installer-<commit>-{MAC_PACKAGE}.pkg`");
     if !doc.contains(&file) {
         missing.push(format!("docs/artifacts.md does not list {file}"));
@@ -875,6 +884,8 @@ fn the_docs_describe_the_release_set() {
         "sudo installer -pkg kbf-installer-<commit>-darwin-arm64.pkg -target /",
         "`kbf-<commit>-<platform>.version.json`",
         "**no SBOM attestation**",
+        "docker save",
+        "k3s ctr -n k8s.io images import",
         "**the branch the package is attested on**",
     ] {
         if !doc.contains(phrase) {
@@ -940,6 +951,28 @@ mod rules {
     /// The verify job's check of the signed `.pkg`.
     fn verify_mac_package_step() -> String {
         "      - name: Package darwin-arm64\n        run: cargo xtask pkg-macos-asset --verify-only --package dist/kbf-installer-$GITHUB_SHA-darwin-arm64.pkg --commit $GITHUB_SHA --binary-tarball dist/kbf-installer-$GITHUB_SHA-darwin-arm64.tar.gz --expect-ref $GITHUB_REF\n".to_owned()
+    }
+
+    /// The steps that check the coordinator's identity, then build, test and make assets of
+    /// both images of `platform`, as the Linux jobs have them.
+    fn image_steps(platform: &str) -> String {
+        let mut w = "      - name: Coordinator identity\n        run: cargo xtask build-commit check \"target/$TARGET/release/kbf-coordinator\" \"$GITHUB_SHA\"\n".to_owned();
+        for image in images::IMAGES {
+            let bin = if *image == "frontend" {
+                "kbf"
+            } else {
+                "kbf-coordinator"
+            };
+            let krate = if *image == "frontend" {
+                "kbf-cli"
+            } else {
+                "kbf-coordinator"
+            };
+            w.push_str(&format!(
+                "      - name: Build {image}\n        run: cargo xtask image-build --image {image} --dockerfile-dir packaging/container/kbf-{image} --binary \"target/$TARGET/release/{bin}\" --commit \"$GITHUB_SHA\" --out \"$RUNNER_TEMP/image\"\n      - name: Test {image}\n        run: cargo xtask image-test --image {image} --archive \"$RUNNER_TEMP/image/kbf-{image}.tar\" --commit \"$GITHUB_SHA\"\n      - name: Asset {image}\n        run: cargo xtask image-asset --image {image} --archive \"$RUNNER_TEMP/image/kbf-{image}.tar\" --binary \"target/$TARGET/release/{bin}\" --sbom crates/{krate}/{bin}_bin.cdx.json --platform {platform} --commit \"$GITHUB_SHA\" --out dist\n"
+            ));
+        }
+        w
     }
 
     /// The step that checks `name --version --json` of the binary built.
@@ -1023,6 +1056,7 @@ mod rules {
                 w.push_str(&kbf_build_steps());
                 w.push_str(&package_steps(platform));
                 w.push_str(&kbf_asset_step(platform));
+                w.push_str(&image_steps(platform));
             }
             if *job == MAC_PACKAGE {
                 w.push_str(&mac_package_steps());
@@ -1935,10 +1969,12 @@ mod rules {
         );
     }
 
+    mod images_tests;
     mod kbf_package_tests;
 }
 
 mod facts;
+mod images;
 #[cfg(test)]
 mod installer;
 mod kbf_package;

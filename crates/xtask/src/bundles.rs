@@ -2,8 +2,9 @@
 //! the Sigstore bundle of the one build provenance attestation the `attest-*` job signed
 //! for that tarball alone, so a host can verify the tarball offline
 //! (`gh attestation verify <tarball> --bundle <bundle>`) without fetching anything from
-//! GitHub. The `kbf-installer` and `kbf` debs (`<binary>-<commit>-<platform>.deb`) have one
-//! too, and everything here says "tarball" of them as well ([`needs_bundle`]).
+//! GitHub. The `kbf-installer` and `kbf` debs (`<binary>-<commit>-<platform>.deb`) and the
+//! container images (`<image>-image-<commit>-<platform>.tar`) have one too, and everything
+//! here says "tarball" of them as well ([`needs_bundle`]).
 //!
 //! A bundle is made after `SHA256SUMS` (the attestation signs the sums' files), so the
 //! sums cannot list it: [`is_bundle`] is how `verify-assets sums` knows to leave it
@@ -59,11 +60,17 @@ pub fn is_package(name: &str) -> bool {
     name.ends_with(".deb") || name.ends_with(".pkg")
 }
 
-/// Whether the asset `name` has a provenance bundle: a tarball, or a package (a
-/// `kbf-installer` or `kbf` deb, or the `.pkg`), but not an SBOM, which is a subject of the
-/// sums' attestation only.
+/// Whether the asset `name` is a container image (`docker save`'s `.tar`, not a `.tar.gz`
+/// tarball): the image of the frontend or of the update coordinator ([`crate::image`]).
+pub fn is_image(name: &str) -> bool {
+    name.ends_with(".tar")
+}
+
+/// Whether the asset `name` has a provenance bundle: a tarball, a package (a
+/// `kbf-installer` or `kbf` deb, or the `.pkg`) or an image, but not an SBOM, which is a
+/// subject of the sums' attestation only.
 pub fn needs_bundle(name: &str) -> bool {
-    name.ends_with(".tar.gz") || is_package(name)
+    name.ends_with(".tar.gz") || is_package(name) || is_image(name)
 }
 
 /// `commit` with its last hex digit changed: a commit the bundle was not made for.
