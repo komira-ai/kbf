@@ -64,7 +64,7 @@ fn failed<T>(why: impl Into<String>) -> Result<T, FetchError> {
 }
 
 /// What a fetch takes from a release: the file of the platform and the attestation bundle
-/// that names it, and for a package also the release's `SHA256SUMS`.
+/// that names it, and for a package or an image also the release's `SHA256SUMS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssetKind {
     /// `kbf-<commit>-<platform>.tar.gz`.
@@ -73,15 +73,38 @@ pub enum AssetKind {
     Deb,
     /// `kbf-<commit>-<platform>.rpm`.
     Rpm,
+    /// `kbf-frontend-image-<commit>-<platform>.oci.tar`, the frontend as a container image.
+    FrontendImage,
 }
 
 impl AssetKind {
-    /// The extension of the file's name.
+    /// The extension of the file's name. The image's name also has `frontend-image-` before
+    /// the commit, so take its name from [`Self::name_on`].
     pub fn extension(self) -> &'static str {
         match self {
             Self::Tarball => release::TARBALL_EXTENSION,
             Self::Deb => "deb",
             Self::Rpm => "rpm",
+            Self::FrontendImage => "oci.tar",
+        }
+    }
+
+    /// The name of the file of `commit` for `platform`.
+    pub fn name_on(self, platform: &str, commit: &str) -> String {
+        match self {
+            Self::FrontendImage => format!("kbf-frontend-image-{commit}-{platform}.oci.tar"),
+            _ => release::asset_name_on(platform, self.extension(), commit),
+        }
+    }
+
+    /// The commit in the file name `name` of this kind for `platform`.
+    pub fn commit_of_name_on<'a>(self, platform: &str, name: &'a str) -> Option<&'a str> {
+        match self {
+            Self::FrontendImage => name
+                .strip_prefix("kbf-frontend-image-")
+                .and_then(|rest| rest.strip_suffix(&format!("-{platform}.oci.tar")))
+                .filter(|commit| release::is_commit(commit)),
+            _ => release::commit_of_asset_on(platform, self.extension(), name),
         }
     }
 
@@ -228,7 +251,7 @@ impl Fetcher<'_> {
         let mut args: Vec<String> = ["release", "download", tag, "--repo", REPO]
             .map(str::to_owned)
             .to_vec();
-        let file = release::asset_name_on(self.platform, self.asset.extension(), commit);
+        let file = self.asset.name_on(self.platform, commit);
         let mut names = vec![file.clone(), release::bundle_of(&file)];
         if self.asset.with_sums() {
             names.push(release::SUMS_NAME.to_owned());
@@ -454,9 +477,7 @@ fn note(
 ) {
     for release in releases.iter().filter(|r| !r.draft && tag_ok(&r.tag_name)) {
         for asset in &release.assets {
-            let Some(commit) =
-                release::commit_of_asset_on(platform, asset_kind.extension(), &asset.name)
-            else {
+            let Some(commit) = asset_kind.commit_of_name_on(platform, &asset.name) else {
                 continue;
             };
             if !commit.starts_with(prefix) {

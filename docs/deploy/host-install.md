@@ -559,7 +559,8 @@ is not changed. It does one host's A/B: put the next release beside the one that
 it on trial, keep it or go back.
 
 ```text
-kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N] [--layout installer|deb|rpm] [--restart-unit UNIT]...
+kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N]
+                 [--layout installer|deb|rpm] (--restart-unit UNIT... | --frontend-container)
 ```
 
 - `--socket`: an absolute path. The program binds it itself (a `umask` of 0177, then a `chown`
@@ -573,8 +574,12 @@ kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N] [--l
   are the `kbf` package's and run `/usr/bin/kbf`, updated by installing that package ("On a Linux
   daemon host that runs the package"). A Mac takes none.
 - `--restart-unit`: on Linux, a unit that runs the release (`kbf-<name>.service` or
-  `kbf-<name>@<instance>.service`), repeated for each; at least one is required. A Mac restarts
-  the daemon's launchd job and takes none.
+  `kbf-<name>@<instance>.service`), repeated for each; at least one is required, unless the host
+  serves a frontend container. A Mac restarts the daemon's launchd job and takes none.
+- `--frontend-container`: a Linux host whose frontend runs as a container, not as units: the
+  release is the frontend's image and the switch recreates the container
+  ([A frontend container](#a-frontend-container)). Not given with `--restart-unit`, nor with
+  `--layout deb` or `rpm`.
 
 Nothing else is configured by a flag or the environment: the files this program reads as root are
 constants, as above. The units and jobs that start it are in
@@ -608,7 +613,7 @@ knows its text), `query` (`commit`, `version`, `node_id`, `pending`, `last`, `bu
 code from a closed set: `bad_command`, `channel_not_allowed`, `config_invalid`, `config_unsafe`,
 `unknown_release`, `ambiguous_release`, `fetch_failed`, `verify_failed`, `pending`, `not_staged`,
 `nothing_pending`, `no_current`, `busy`, `stage_failed`, `switch_failed`, `revert_failed`,
-`state_unavailable`, `audit_unavailable`. The detail of a refusal goes to the journal, cleaned,
+`state_unavailable`, `audit_unavailable`, `peer_not_ready`, `runtime_failed`. The detail of a refusal goes to the journal, cleaned,
 never to the line.
 
 ### The revert is this program's
@@ -628,6 +633,8 @@ cannot be opened. A revert is never held back by it. The install lock is the sam
 forced command's, so the two never overlap.
 
 ### On Linux
+
+(A host whose frontend is a container is [below](#a-frontend-container).)
 
 The release goes in the layout of `kbf-installer` ([host-releases.md](host-releases.md)):
 `/var/lib/kbf-installer/releases/<commit>`, the `current` and `previous` links, and the
@@ -682,6 +689,91 @@ The release publishes a deb for each CPU. It does not publish an rpm yet, so on 
 
 A node that was set up by hand moves to this layout once, with
 `kbf-host-install --migrate-to-package` ([native-package-migration.md](native-package-migration.md)).
+
+### A frontend container
+
+With `--frontend-container` the release is the frontend's image
+(`kbf-frontend-image-<commit>-linux-<arch>.oci.tar`, [artifacts.md](../artifacts.md#the-frontend-image-oci))
+and the runtime is Docker. The five requests are the same, so the pending marker, its deadline and
+the revert at the deadline are the same. The host needs `docker` at `/usr/bin/docker`, the channels
+file above (the image is fetched from the same releases), the installer's trust files (the pinned
+`gh` and trusted root), and a root-owned `/etc/kbf/host-install-frontend.toml`, which describes the
+container ([the example](../../packaging/host-agent/linux/host-install-frontend.toml)):
+
+| key | meaning |
+|---|---|
+| `name`, `restart` | the container's name and Docker's restart policy (`no`, `always`, `unless-stopped`, `on-failure[:N]`) |
+| `network`, `user` | optional: `--network` and `--user` |
+| `ports`, `mounts`, `command` | `--publish` and `--volume` entries, and the flags after the image; each entry is one argument, never a shell word |
+| `api` | where this host reaches the frontend's operator API (a published port), for `/readyz` and `/healthz` |
+| `drain_token_file` | the operator token as a path **inside** the container |
+| `peers` | optional: the other frontends' operator APIs this host can reach |
+| `drain_secs` | optional (default 180, at most 1800): how long a drain is waited for |
+| `ready_secs` | optional (default 90, 10 to 600): how long a new container has to be ready |
+
+A switch has to fit `--window-secs`: `drain_secs` + 30 (the stop) + `ready_secs` is checked against
+it (`config_invalid` when it does not).
+
+**install** fetches the image, its attestation bundle and the release's `SHA256SUMS` as the
+installer's unprivileged user, copies them once into a directory of root's, and checks, before the
+runtime sees the file: the copy's sha256 is the one `SHA256SUMS` lists for the image (and the one
+the channel's pinned `sums` list, if it has some), and `gh attestation verify` accepts the copy
+offline for the full commit on the channel's branch, from `artifacts.yml` on a hosted runner. Only
+then is the image loaded (`docker image load`), and its id recorded in `frontend.json` (root's,
+0600, in `/var/lib/kbf-host-install`). Containers are made from that id, never from a tag. A
+release that fails the check changes nothing: nothing is loaded and nothing is stopped.
+
+**switch**, in this order:
+
+1. it refuses (`peer_not_ready`) if any of `peers` does not answer `/readyz` with 200, before
+   anything is written. This program can see only its own host and these peers; without `peers`
+   the coordinator's order (one frontend at a time, never the last ready one) is the guard;
+2. the pending marker is written to `frontend.json` with its deadline, the images of both
+   releases and a copy of the configuration;
+3. the restart policy is set to `no` (a drained frontend exits by itself, and must not be brought
+   back as the old release);
+4. the frontend is asked to drain through its own operator API: `docker exec` runs
+   `/usr/bin/kbf cluster drain --frontend --token-file <drain_token_file>` in the container, where
+   the API is on loopback ([api.md](../api.md#get-v1frontenddrain-and-post-v1frontenddrain)):
+   `/readyz` answers 503 and the work it has finishes;
+5. it waits until the container has ended (a drained frontend exits when it is idle) or
+   `drain_secs` is out, and then stops it (`docker stop`, 30 s) and removes it;
+6. the new container is made from the new image with **the configuration of step 2, byte for
+   byte**: `docker run --detach --name <name> --restart <restart> [--network] [--user]
+   [--publish]... [--volume]... <image id> <command>...`;
+7. it waits up to `ready_secs` for `/readyz` to answer 200 and `/healthz` to name the release's
+   commit.
+
+When any step fails, the container is removed and made again from the **old** image id with the
+same configuration, waited for the same way (on the old commit), the marker is cleared, and the
+switch answers `failed` (`switch_failed`). If the old container cannot be made again either,
+the answer is `revert_failed` and the marker stays: the deadline, or a `revert`, tries again.
+
+Three things to know when you set it up:
+
+- **`peers` is the only guard this program has against taking down the last ready frontend.**
+  Without it nothing here looks at another frontend, and only the coordinator's order protects
+  you. List every other frontend's operator API this host can reach; the example file's address
+  is a documentation address to replace.
+- **The operator API must be reachable on the published port.** `api` is a published port on the
+  bridge network, so the frontend inside the container must listen on a non-loopback address
+  (not `--api-listen 127.0.0.1:...`), or `/readyz` is never seen and every switch fails. Writes
+  still require a loopback peer, which Docker's NAT does not give an outside caller; the drain
+  runs inside the container, where the peer is loopback.
+- **The health the updater's agent reports is what the last switch saw.** It comes from the
+  release this program recorded as current, which `switch` sets after `/readyz` answered 200 on
+  the target commit. It is not a probe made at each heartbeat: a container that crashes later is
+  reported healthy until the next switch or the host's own supervision (Docker's restart policy)
+  deals with it.
+
+**confirm** clears the marker and forgets the old image. **revert**, which the deadline also
+calls (so a host that rebooted in the middle of a switch is put back when the first check after the
+start finds the deadline passed), removes whatever container there is and makes the old one again
+from the copy of the configuration in the marker, not from the file as it is now.
+
+Before the first switch the release that runs is read from the container's image reference
+(`kbf-frontend:<commit>`, the name `docker image load` gives it); make the first container from the
+image of a release with the same options as the file.
 
 ### On a Mac
 

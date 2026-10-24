@@ -70,6 +70,9 @@ pub const ALLOWLIST: &str = "/etc/kbf/host-install-releases.toml";
 /// The most a release's tarball may be, in bytes.
 pub const TARBALL_MAX: u64 = 512 * 1024 * 1024;
 
+/// The most a frontend image may be, in bytes.
+pub const IMAGE_MAX: u64 = 1024 * 1024 * 1024;
+
 /// The programs and the time limits of a stage.
 #[derive(Debug, Clone)]
 pub struct Tools {
@@ -81,6 +84,8 @@ pub struct Tools {
     pub download: Duration,
     /// The largest tarball taken in.
     pub tarball_max: u64,
+    /// The largest frontend image taken in.
+    pub image_max: u64,
 }
 
 impl Tools {
@@ -90,6 +95,7 @@ impl Tools {
             tool: Duration::from_secs(60),
             download: Duration::from_secs(900),
             tarball_max: TARBALL_MAX,
+            image_max: IMAGE_MAX,
         }
     }
 }
@@ -125,7 +131,7 @@ pub struct Linux<E: Exec> {
     pub(crate) owner: Owner,
 }
 
-fn commit_id(commit: &str) -> Result<CommitId, Fault> {
+pub(super) fn commit_id(commit: &str) -> Result<CommitId, Fault> {
     CommitId::new(commit).map_err(|e| Fault::failed(Code::StateUnavailable, e.to_string()))
 }
 
@@ -170,6 +176,19 @@ pub(super) fn fetch_fault(e: FetchError) -> Fault {
     }
 }
 
+/// What [`Linux::prepare`] read: everything a fetch and its check need.
+pub(super) struct Prepared {
+    /// The version's 12 hex digits.
+    pub(super) prefix: String,
+    /// The token of the channel for the GitHub API, if it names one.
+    pub(super) token: Option<String>,
+    pub(super) settings: Settings,
+    /// The unprivileged user the fetch runs as.
+    pub(super) who: Identity,
+    /// The channel's pinned sums, if it has some.
+    pub(super) sums: Option<PathBuf>,
+}
+
 /// The refusal of the allowlist or of a channel, as the socket tells it.
 pub(super) fn config_fault(refusal: Refusal) -> Fault {
     let code = match refusal {
@@ -203,13 +222,16 @@ impl<E: Exec> Linux<E> {
     }
 
     /// The scratch directory the unprivileged user fetches into, owned by it.
-    fn fetch_scratch(&self, prefix: &str, who: Identity) -> Result<PathBuf, Fault> {
+    pub(super) fn fetch_scratch(&self, prefix: &str, who: Identity) -> Result<PathBuf, Fault> {
         let work = self.layout.join(&self.layout.work_dir());
         fetch_scratch_in(&work, prefix, who)
     }
 
-    /// Fetch and verify the release; the commit.
-    fn fetch_and_verify(&self, version: &Version, channel: &Channel) -> Result<String, Fault> {
+    /// What a fetch needs of the root-owned configuration, read once: the channel's source
+    /// and branch, the token for the listing, the settings of the installer and the user the
+    /// fetch runs as. Nothing is fetched that cannot be checked: the pinned `gh` and the
+    /// trusted root are root's, or this host does not believe what they would say.
+    pub(super) fn prepare(&self, version: &Version, channel: &Channel) -> Result<Prepared, Fault> {
         let prefix = crate::mac::release::commit_prefix(version.as_str()).ok_or_else(|| {
             Fault::refused(
                 Code::UnknownRelease,
@@ -237,8 +259,6 @@ impl<E: Exec> Linux<E> {
                 .narrowed_to(std::slice::from_ref(&channel.source_ref))
                 .map_err(|e| Fault::refused(Code::ConfigInvalid, e.to_string()))?
         };
-        // Nothing is fetched that cannot be checked: the pinned `gh` and the trusted root are
-        // root's, or this host does not believe what they would say.
         GhCheck::pinned(&self.layout, &settings)
             .check_trust(&*self.trust)
             .map_err(verify_refused)?;
@@ -246,8 +266,26 @@ impl<E: Exec> Linux<E> {
             uid: settings.run_as.uid,
             gid: settings.run_as.gid,
         };
-        let scratch = self.fetch_scratch(prefix, who)?;
-        let result = self.download_and_verify(prefix, token.as_deref(), &settings, who, &scratch);
+        Ok(Prepared {
+            prefix: prefix.to_owned(),
+            token,
+            settings,
+            who,
+            sums: channel.sums,
+        })
+    }
+
+    /// Fetch and verify the release; the commit.
+    fn fetch_and_verify(&self, version: &Version, channel: &Channel) -> Result<String, Fault> {
+        let prepared = self.prepare(version, channel)?;
+        let scratch = self.fetch_scratch(&prepared.prefix, prepared.who)?;
+        let result = self.download_and_verify(
+            &prepared.prefix,
+            prepared.token.as_deref(),
+            &prepared.settings,
+            prepared.who,
+            &scratch,
+        );
         let _ = fs::remove_dir_all(&scratch);
         result
     }

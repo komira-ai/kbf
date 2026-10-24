@@ -56,11 +56,15 @@ pub enum Code {
     StateUnavailable,
     /// The audit log cannot be opened, so nothing was run.
     AuditUnavailable,
+    /// Another frontend this host can see is not ready, so this one is not taken down.
+    PeerNotReady,
+    /// The container runtime could not be asked, or did not do what it was asked.
+    RuntimeFailed,
 }
 
 impl Code {
     /// Every code.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 20] = [
         Self::BadCommand,
         Self::ChannelNotAllowed,
         Self::ConfigInvalid,
@@ -79,6 +83,8 @@ impl Code {
         Self::RevertFailed,
         Self::StateUnavailable,
         Self::AuditUnavailable,
+        Self::PeerNotReady,
+        Self::RuntimeFailed,
     ];
 
     /// The code whose closed spelling this is.
@@ -107,6 +113,8 @@ impl Code {
             Self::RevertFailed => "revert_failed",
             Self::StateUnavailable => "state_unavailable",
             Self::AuditUnavailable => "audit_unavailable",
+            Self::PeerNotReady => "peer_not_ready",
+            Self::RuntimeFailed => "runtime_failed",
         }
     }
 }

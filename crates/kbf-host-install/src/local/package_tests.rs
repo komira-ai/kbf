@@ -495,6 +495,7 @@ impl Rig {
                 tool: Duration::from_secs(5),
                 download: Duration::from_secs(5),
                 tarball_max: 64 * 1024,
+                image_max: 64 * 1024,
             },
         };
         let rig = Self {

@@ -180,6 +180,10 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
   required with `--state-dir`.
 - `--channel`: the channel of the helper's allowlist. The version the coordinator names is looked
   up in it by the helper, never fetched by URL.
+- `--daemon-node`: for the agent of a **frontend host** that also runs a daemon: the daemon's node
+  id. The agent drains that node around the frontend's update (with the operator token if the
+  agent has one, else with its certificate, which names its own node only). Without it a frontend
+  host's node is not drained.
 - `--helper-socket`: the socket of `kbf-host-install --serve` (default
   `/run/kbf-host-install/local.sock`; [host-install.md](host-install.md#the-local-socket)).
 - `--operator-api`, `--token-file`: optional, together: the full
@@ -187,6 +191,18 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
   certificate; see the boundary below.
 - Times, in seconds, 1 to 86400: `--heartbeat-secs` 15, `--drain-deadline-secs` 600,
   `--health-timeout-secs` 300, `--health-poll-secs` 5, `--retry-secs` 900.
+
+### A frontend host
+
+A host whose certificate says `frontend` runs its frontend as a container, and its helper is
+`kbf-host-install --serve --frontend-container` ([host-install.md](host-install.md#a-frontend-container)).
+The agent runs the same A/B as for any host (install, switch, health, confirm, or revert) and
+reports it in the next heartbeat. What differs is who does the frontend's part: the helper drains
+the container through the frontend's own operator API, recreates it from the new attested image
+with the same run configuration, waits for `/readyz` and `/healthz` on the target commit, and puts
+the old image back on any failure; the agent's health check is the helper's word that the release
+runs. The coordinator orders frontends one at a time and never the last one that is ready; the
+helper adds its own refusal when a `peers` entry of its configuration is not ready.
 
 ### The heartbeat
 

@@ -156,8 +156,10 @@ pub(super) fn serve_linux_with<B: Backend>(
     backend: B,
     stop: &AtomicBool,
 ) -> Result<(), String> {
-    if config.units.is_empty() {
-        return Err("--restart-unit is required on a Linux host".to_owned());
+    if config.units.is_empty() && !config.frontend_container {
+        return Err(
+            "--restart-unit is required on a Linux host (or --frontend-container)".to_owned(),
+        );
     }
     let passwd = trust
         .read(&env.passwd)
@@ -184,6 +186,15 @@ pub(super) fn serve_linux(config: &ServeConfig) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn serve_linux_for(config: &ServeConfig) -> Result<(), String> {
     let env = LinuxEnv::production();
+    if config.frontend_container {
+        return serve_linux_with(
+            config,
+            &env,
+            &Trust::root(),
+            super::frontend::production(),
+            &AtomicBool::new(false),
+        );
+    }
     let format = match config.layout {
         Layout::Installer => {
             return serve_linux_with(
@@ -227,9 +238,11 @@ pub(super) fn serve_mac_with(
     if config.layout != Layout::Installer {
         return Err("--layout is for a Linux host: a Mac keeps its releases in the kit".to_owned());
     }
-    if !config.units.is_empty() {
+    if !config.units.is_empty() || config.frontend_container {
         return Err(
-            "--restart-unit is for a Linux host: a Mac restarts the daemon's job".to_owned(),
+            "--restart-unit and --frontend-container are for a Linux host: a Mac restarts the \
+             daemon's job"
+                .to_owned(),
         );
     }
     let exec = runner

@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use kbf_host_install::contract::local::ServeConfig;
+use kbf_host_install::contract::local::{FrontendConfig, ServeConfig};
 use kbf_updater::agent::enroll::parse_flags as parse_enroll;
 use kbf_updater::agent::flags::{DEFAULT_HELPER_SOCKET, parse_flags};
 
@@ -131,6 +131,33 @@ fn the_linux_units_agree_with_the_programs_and_with_each_other() {
         .filter_map(|l| l.split_whitespace().nth(1))
         .collect();
     assert_eq!(defined, [user.as_str()]);
+}
+
+/// The helper's unit for a host whose frontend is a container serves the same socket for the same
+/// account, takes no unit to restart, and the example of its configuration is a configuration
+/// the program accepts, one that fits the window the unit gives a trial.
+#[test]
+fn the_frontend_container_unit_and_its_configuration_agree_with_the_program() {
+    let agent = read("linux/kbf-updater-agent.service");
+    let user = unit_value(&agent, "User");
+    let helper = read("linux/kbf-host-local-frontend.service");
+    let line = words(&unit_value(&helper, "ExecStart"));
+    assert_eq!(line[1], "--serve");
+    let serve = ServeConfig::parse(&line[2..]).expect("the helper's flags");
+    assert!(serve.frontend_container && serve.units.is_empty());
+    assert_eq!(serve.socket, Path::new(DEFAULT_HELPER_SOCKET));
+    assert_eq!(serve.user, user, "only the agent's account may connect");
+    assert_eq!(unit_value(&helper, "User"), "root");
+    assert_eq!(unit_value(&helper, "Restart"), "always");
+    assert_eq!(unit_value(&helper, "StateDirectoryMode"), "0700");
+    assert!(unit_value(&helper, "After").contains("docker.service"));
+
+    let config = FrontendConfig::parse(&read("linux/host-install-frontend.toml"))
+        .expect("the example configuration");
+    assert!(
+        config.switch_secs() <= serve.window_secs,
+        "a switch has to fit the window of a trial"
+    );
 }
 
 /// The same on a Mac: the agent's job parses, runs as an account that is not root, and reaches the

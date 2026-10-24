@@ -7,9 +7,11 @@ use std::time::{Duration, Instant};
 
 use kbf_types::ReleasePlatform;
 
+use super::build::no_drain;
+use super::container_health::ContainerHealth;
 use super::coordinator::CoordinatorError;
 use super::flags::Timing;
-use super::local::Trial;
+use super::local::{LocalInstaller, Trial};
 use super::renew::Renewer;
 use super::run::{Agent, Stop, World};
 use super::status::Status;
@@ -60,16 +62,30 @@ impl Rig {
     }
 
     fn agent(&self) -> Agent {
+        self.agent_with(
+            host(Role::Daemon),
+            Arc::new(self.drain.clone()),
+            Arc::new(self.health.clone()),
+        )
+    }
+
+    /// The agent of a host of another role, with its own drain and health check.
+    fn agent_with(
+        &self,
+        host: crate::inventory::Host,
+        drain: Arc<dyn crate::ports::Drain>,
+        health: Arc<dyn crate::ports::HealthCheck>,
+    ) -> Agent {
         let logs = Arc::clone(&self.logs);
         Agent::new(
-            host(Role::Daemon),
+            host,
             "stable".to_owned(),
             self.timing,
             World {
                 coordinator: Arc::new(self.coordinator.clone()),
                 local: Arc::new(self.local.clone()),
-                drain: Arc::new(self.drain.clone()),
-                health: Arc::new(self.health.clone()),
+                drain,
+                health,
                 clock: Arc::new(SystemClock::new()),
                 unix_now: Arc::new(|| 10_000),
                 renewer: self.renewer.clone(),
@@ -495,4 +511,71 @@ fn an_agent_with_no_renewer_has_none_to_run() {
     let agent = rig.agent();
     rig.run_until(&agent, |rig| !rig.beats().is_empty());
     assert!(!rig.beats().is_empty());
+}
+
+/// The agent of a host whose frontend is a container runs the A/B through the helper: install,
+/// switch, then the helper's own word that the release runs, confirm; it drains no node, and
+/// the next heartbeat says the update succeeded and what runs.
+#[test]
+fn the_agent_of_a_frontend_host_updates_through_the_helper_and_reports() {
+    let rig = Rig::new();
+    ordered(&rig, VB);
+    let health = ContainerHealth::new(Arc::new(LocalInstaller(Arc::new(rig.local.clone()))));
+    let agent = rig.agent_with(host(Role::Frontend), no_drain(), Arc::new(health));
+    rig.run_until(&agent, |rig| {
+        rig.beats().iter().any(|b| b.last_update.is_some())
+    });
+    let helper: Vec<String> = rig.events.of(&[
+        "local:install",
+        "local:switch",
+        "local:confirm",
+        "local:revert",
+    ]);
+    assert_eq!(
+        helper,
+        [
+            format!("local:install {VB} stable"),
+            format!("local:switch {VB}"),
+            format!("local:confirm {VB}"),
+        ]
+    );
+    assert!(
+        rig.events.of(&["drain", "leases", "undrain"]).is_empty(),
+        "no node is drained"
+    );
+    let beats = rig.beats();
+    let last = beats
+        .iter()
+        .rev()
+        .find(|b| b.last_update.is_some())
+        .unwrap();
+    assert_eq!(
+        last.last_update.as_ref().unwrap().outcome,
+        Outcome::Succeeded
+    );
+    assert_eq!(last.last_update.as_ref().unwrap().target, version(VB));
+    assert_eq!(last.version, version(VB));
+}
+
+/// When the helper fails the switch (it has put the old container back), the agent reports
+/// failed and the host is still on the old version.
+#[test]
+fn a_switch_the_helper_could_not_make_is_reported_failed_on_the_old_version() {
+    let rig = Rig::new();
+    ordered(&rig, VB);
+    rig.local.world().switch = Err(super::local::LocalError::Failed("switch_failed".to_owned()));
+    let health = ContainerHealth::new(Arc::new(LocalInstaller(Arc::new(rig.local.clone()))));
+    let agent = rig.agent_with(host(Role::Frontend), no_drain(), Arc::new(health));
+    rig.run_until(&agent, |rig| {
+        rig.beats().iter().any(|b| b.last_update.is_some())
+    });
+    let beats = rig.beats();
+    let last = beats
+        .iter()
+        .rev()
+        .find(|b| b.last_update.is_some())
+        .unwrap();
+    assert_eq!(last.last_update.as_ref().unwrap().outcome, Outcome::Failed);
+    assert_eq!(last.version.commit(), Some("aaaaaaaaaaaa"));
+    assert_eq!(rig.events.count("local:confirm"), 0);
 }

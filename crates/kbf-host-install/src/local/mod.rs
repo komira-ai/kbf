@@ -31,8 +31,13 @@ pub mod serve;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub mod units;
 
+// Compiled and tested everywhere, used by the program on Linux only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub mod frontend;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "linux")]
+mod linux_image;
 // A Linux host that runs the `kbf` package: the update is the package manager's.
 #[cfg(target_os = "linux")]
 pub mod package;

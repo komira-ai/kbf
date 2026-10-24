@@ -78,6 +78,7 @@ impl Rig {
             enroll_frontend: None,
             state_dir: None,
             node_api: None,
+            daemon_node: None,
             timing: Timing::DEFAULT,
         }
     }

@@ -59,6 +59,30 @@ pub fn commit_of_asset_on<'a>(platform: &str, extension: &str, name: &'a str) ->
         .filter(|commit| is_commit(commit))
 }
 
+/// The sha256 that `sums` lists for the file `name`: the lines are `<64 hex>  <name>`.
+///
+/// # Errors
+/// [`PickError::Malformed`] for sums that are not such lines (or name a file twice),
+/// [`PickError::Unknown`] when `name` is not listed.
+pub fn listed_hash(sums: &str, name: &str) -> Result<String, PickError> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut found = None;
+    if !sums.is_empty() && !sums.ends_with('\n') {
+        return Err(PickError::Malformed);
+    }
+    for line in sums.lines() {
+        let (hash, file) = line.split_once("  ").ok_or(PickError::Malformed)?;
+        let hash_ok = hash.len() == 64 && hash.bytes().all(is_hex);
+        if !hash_ok || file.is_empty() || file.contains('/') || !seen.insert(file) {
+            return Err(PickError::Malformed);
+        }
+        if file == name {
+            found = Some(hash.to_owned());
+        }
+    }
+    found.ok_or(PickError::Unknown)
+}
+
 /// The tarball of `commit`.
 pub fn tarball_name(commit: &str) -> String {
     tarball_name_on(PLATFORM, commit)
