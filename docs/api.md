@@ -779,7 +779,7 @@ both with a group:
 | `--ca-dir` | `0700` | `0750`, group `NAME` |
 | `ca.pem` | `0644` | `0640`, group `NAME` |
 | `ca.key` | `0600` | `0600`, not given to the group |
-| peers served | the user id of `--frontend-uid` | that user id, and any peer whose effective group is `NAME` or whose account has `NAME` as its primary group or is listed as one of its members (`/etc/passwd` and `/etc/group`, read at every connection) |
+| peers served | the user id of `--frontend-uid` | that user id, and any peer whose effective group is `NAME` or whose account has `NAME` as its primary group or is listed as one of its members (`/etc/passwd` and `/etc/group` only, not NSS, read at every connection) |
 
 The signer must itself be a member of `NAME` (a process can only give a file to a group it
 belongs to), and the frontend's account a member too; the package's sysusers file makes
