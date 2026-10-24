@@ -246,6 +246,8 @@ kbf-ui = { path = "crates/kbf-ui" }
 kbf-unitfile = { path = "crates/kbf-unitfile" }
 kbf-update = { path = "crates/kbf-update" }
 kbf-updater = { path = "crates/kbf-updater" }
+# The hot/cold object store library; it depends on no kbf crate (kbf-integration-test keeps it so).
+tierstore = { path = "crates/tierstore" }
 # The CI verbs (`cargo xtask`); kbf-integration-test reads the interpreter budget with its parser.
 xtask = { path = "crates/xtask" }
 
@@ -254,7 +256,7 @@ xtask = { path = "crates/xtask" }
 # its `lib.rs` (an in-source attribute overrides this table), and the layering test in
 # `kbf-integration-test` checks that the deny is present.
 [workspace.lints.rust]
-# `coverage` is set by cargo-llvm-cov (crates/kbf-all-in-one-test and crates/kbf-daemon-test compile their tests out under it).
+# `coverage` is set by cargo-llvm-cov (crates/kbf-farm-test and crates/kbf-daemon-test compile their tests out under it).
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
 
 [workspace.lints.clippy]

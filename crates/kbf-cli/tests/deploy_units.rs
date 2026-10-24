@@ -302,6 +302,13 @@ fn no_packaged_unit_is_refused_over_where_its_directories_are() {
         .map(|m| (m.name, setup_file(m.name).to_owned()))
         .collect();
     cases.push(("storage", STORAGE_BY_HAND.to_owned()));
+    // The mode that runs a node's storage and daemon together, given a metadata directory
+    // as the all-in-one's file has (its setup file names none).
+    let node = format!(
+        "{}\n[stores]\nmeta-dir = \"/var/lib/kbf-server/raft\"\n",
+        setup_file("storage-and-daemon")
+    );
+    cases.push(("storage-and-daemon", node));
     let mut moved = 0;
     for (mode, text) in cases {
         let farm = text

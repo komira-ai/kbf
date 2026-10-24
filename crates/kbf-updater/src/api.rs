@@ -152,17 +152,14 @@ pub enum ErrorCode {
     /// drained.
     NodeIdentity,
     /// The frontend could not drain the host's node, or did not answer; the node may be left
-    /// drained. For a frontend member rolled without a proxy: it did not exit within the bound
+    /// drained. For a frontend member: it did not exit within the bound
     /// and is left draining (a drain it would not accept is not said to be left draining; one it
     /// did not answer is said to be possibly draining).
     DrainFailed,
     /// The host runs the target, but the frontend could not return its node to placement; the
     /// node is left drained.
     UndrainFailed,
-    /// A frontend member refused or failed its retire, or did not end its streams; it is left
-    /// drained.
-    RetireFailed,
-    /// The host could not restart a frontend member's unit; the member is left drained.
+    /// The host could not restart a frontend member's unit; the member is left draining.
     RestartFailed,
 }
 
@@ -189,7 +186,6 @@ impl ErrorCode {
             | ErrorCode::NodeIdentity
             | ErrorCode::DrainFailed
             | ErrorCode::UndrainFailed
-            | ErrorCode::RetireFailed
             | ErrorCode::RestartFailed => 500,
         }
     }
@@ -247,10 +243,11 @@ impl RollState {
 /// Where one host is in its turn.
 ///
 /// The last four phases are a frontend pool member's (see [`crate::inventory::Member`]): the
-/// turn goes `pending`, `draining`, `retiring`, `installing`, `restarting`, `waiting_healthy`,
-/// `undraining`, `done`. They were added to the set after the others, and a record written
-/// before them holds none of them and reads as it did. Without a proxy the turn goes `pending`,
-/// `draining`, `installing`, `restarting`, `waiting_healthy`, `done`.
+/// turn goes `pending`, `draining`, `installing`, `restarting`, `waiting_healthy`, `done`.
+/// `retiring` and `undraining` belong to a turn that an earlier build took at a proxy; a record
+/// that holds one is still read, and the roll refuses to go on from it. The phases were added to
+/// the set after the others, and a record written before them holds none of them and reads as
+/// it did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
@@ -260,13 +257,13 @@ pub enum Phase {
     WaitingHealthy,
     Done,
     Failed,
-    /// A member is out of the proxy's pool and its open streams are waited for.
+    /// A member has been told to drain itself and is waited for until it has exited.
     Draining,
-    /// The member's frontend is retiring: it hands its work to the other frontends.
+    /// Only in a record of an earlier build: the member was retiring at a proxy.
     Retiring,
     /// The member's unit is restarted on the new package.
     Restarting,
-    /// The member runs the target and is ready; it is being put back in the pool.
+    /// Only in a record of an earlier build: the member was being put back at a proxy.
     Undraining,
 }
 
@@ -424,7 +421,6 @@ mod tests {
             (ErrorCode::NodeIdentity, "node_identity", 500),
             (ErrorCode::DrainFailed, "drain_failed", 500),
             (ErrorCode::UndrainFailed, "undrain_failed", 500),
-            (ErrorCode::RetireFailed, "retire_failed", 500),
             (ErrorCode::RestartFailed, "restart_failed", 500),
         ];
         for (c, name, status) in all {

@@ -1,7 +1,7 @@
-//! The turn of a frontend that is a member of a pool when the updater has no proxy, over the
+//! The turn of a frontend that is a member of a pool, over the
 //! fakes: its order, the wait for the other members to be ready and what starts it again, the
 //! wait for the member to exit and its bound, every failure after the drain leaving the member
-//! not serving, a restart of the updater in each phase, and the proxy's turn when there is one.
+//! not serving, a restart of the updater in each phase, and a record of an earlier build's turn at a proxy.
 
 use std::time::Duration;
 
@@ -85,12 +85,6 @@ fn idle() -> DrainStatus {
     }
 }
 
-/// Whether the call is one that a member is asked to drain itself or to say it is ready.
-fn is_own(event: &Event) -> bool {
-    let own = ["member drain", "member drain status", "ready"];
-    own.contains(&event.word().as_str())
-}
-
 /// Two members, `a` on host `fe1` and `b` on host `fe2`, which are one host.
 fn inventory() -> Inventory {
     Inventory::parse(&format!(
@@ -100,11 +94,10 @@ fn inventory() -> Inventory {
     .expect("inventory")
 }
 
-/// A rig with no proxy, whose hosts `fe1` and `fe2` are one host. The members answer as the
+/// A rig whose hosts `fe1` and `fe2` are one host. The members answer as the
 /// fakes do unless a test says otherwise: ready, and gone when their drain is read.
 fn member_rig(name: &str) -> Rig {
     let rig = Rig::new(name);
-    rig.pool.set_configured(false);
     rig.inst.same_host("fe2", "fe1");
     rig
 }
@@ -130,7 +123,7 @@ fn phases(roll: &Roll) -> Vec<Phase> {
 /// ready for the whole window, the member is told to drain, its exit is waited for, the host is
 /// installed on, the unit is restarted, and the member is waited for until it is ready on the
 /// target's commit. It also asserts that the only repeated calls are the seven asks of the other
-/// member's readiness, that no pool or retire call is made, that the record ends `done` with one
+/// member's readiness, that no other call is made, that the record ends `done` with one
 /// install, and that the window is the only wait.
 #[test]
 fn a_turn_without_a_proxy_goes_peers_drain_exit_install_restart_ready() {
@@ -651,8 +644,8 @@ fn a_member_found_draining_that_was_never_told_to_drain_waits_for_the_others() {
 
 /// Asserts that a record that holds the member in a phase only a turn at a proxy has (`retiring`
 /// or `undraining`) fails the turn with `swap_abandoned`, telling the operator to abort the
-/// roll, before any call is made: the updater was started without a proxy after the roll began
-/// with one, and the turn is not guessed at.
+/// roll, before any call is made: an earlier build began the roll at a proxy, and the turn is not
+/// guessed at.
 #[test]
 fn a_record_in_a_phase_of_a_turn_at_a_proxy_fails_the_turn_before_any_call() {
     let found = [Phase::Retiring, Phase::Undraining];
@@ -668,21 +661,4 @@ fn a_record_in_a_phase_of_a_turn_at_a_proxy_fails_the_turn_before_any_call() {
         assert!(detail.contains("abort the roll"), "{detail}");
         assert!(rig.log.events().is_empty(), "{phase:?}");
     }
-}
-
-/// Asserts that with a proxy the turn is the proxy's, as before: the member is drained and put
-/// back at the proxy, and neither told to drain itself nor asked if it is ready.
-#[test]
-fn with_a_proxy_the_turn_is_the_proxys_and_the_member_does_not_drain_itself() {
-    let rig = Rig::new("np-with-proxy");
-    rig.pool.set_members(&["a", "b"]);
-    rig.inst.same_host("fe2", "fe1");
-    let u = open_over(&rig);
-    let roll = run(&u, only("fe1"));
-    assert_eq!(roll.state, RollState::Done);
-    let events = rig.log.events();
-    assert!(events.contains(&Event::PoolDrain("a".to_owned())));
-    assert!(events.contains(&Event::PoolUndrain("a".to_owned())));
-    let own: Vec<&Event> = events.iter().filter(|e| is_own(e)).collect();
-    assert!(own.is_empty(), "{own:?}");
 }

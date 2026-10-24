@@ -1,8 +1,8 @@
 //! The ports of the roll: everything the state machine asks of the outside world. The real
 //! adapters are [`crate::safe_http`] (safe-to-stop), [`crate::ssh_installer`] (install),
-//! [`crate::node_drain`] (drain), [`crate::node_health`] (health), [`crate::pool_http`] (the
-//! proxy's pool) and [`crate::frontend_http`] (a frontend member's own API).
-//! [`crate::fakes`] has one scripted fake per port.
+//! [`crate::node_drain`] (drain), [`crate::node_health`] (health) and
+//! [`crate::frontend_http`] (a frontend member's own API). [`crate::fakes`] has one scripted
+//! fake per port.
 //!
 //! The traits are synchronous: a roll is one host at a time and waits on each answer, so
 //! there is nothing to overlap, and a caller runs [`crate::Updater::drive`] on its own thread.
@@ -214,59 +214,6 @@ pub trait Drain: Send + Sync {
     fn undrain(&self, host: &Host) -> Result<(), PortError>;
 }
 
-/// One member of the kbf-proxy pool, as the proxy's admin API lists it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PoolMember {
-    /// The name the proxy knows it by: the `instance` of its inventory line.
-    pub name: String,
-    /// It takes no new stream: it was drained, or is in a state this build does not know.
-    pub draining: bool,
-    /// The proxy's probe of it passes.
-    pub ready: bool,
-    /// Streams open on its REAPI listener.
-    pub reapi_streams: u64,
-    /// Streams open on its operator listener.
-    pub operator_streams: u64,
-}
-
-impl PoolMember {
-    /// Whether the proxy gives it new streams and expects them answered: up and ready.
-    pub fn serves(&self) -> bool {
-        !self.draining & self.ready
-    }
-
-    /// The streams a restart would cut: those open on its REAPI and operator listeners.
-    pub fn streams(&self) -> u64 {
-        self.reapi_streams + self.operator_streams
-    }
-}
-
-/// The pool of frontends that kbf-proxy balances over, through its loopback admin API.
-pub trait Pool: Send + Sync {
-    /// Whether there is a proxy to drain members at: false when the updater was started
-    /// without `--proxy-admin`, and a member is then rolled without one (it drains itself and
-    /// is restarted; see `updater_no_proxy.rs`).
-    fn configured(&self) -> bool;
-    /// Every member, as the proxy sees it now.
-    fn view(&self) -> Result<Vec<PoolMember>, PortError>;
-    /// Take the member `name` out of the pool: it takes no new stream, and the streams it has
-    /// go on. Doing it again changes nothing.
-    fn drain(&self, name: &str) -> Result<(), PortError>;
-    /// Put the member `name` back. Doing it again changes nothing.
-    fn undrain(&self, name: &str) -> Result<(), PortError>;
-}
-
-/// What a frontend says of its retire: `GET` and `POST /v1/frontend/retire`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-pub struct RetireStatus {
-    /// The retire has completed and will not be undone.
-    pub retired: bool,
-    /// Execute and WaitExecution streams open on it now.
-    pub open_streams: u64,
-    /// Worker sessions it holds.
-    pub open_sessions: u64,
-}
-
 /// What a frontend says of its own drain: `GET /v1/frontend/drain`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub struct DrainStatus {
@@ -289,11 +236,6 @@ fn phase_is_closing<'de, D: serde::Deserializer<'de>>(phase: D) -> Result<bool, 
 
 /// A frontend pool member's own operator API, reached on loopback at the member's ports.
 pub trait FrontendControl: Send + Sync {
-    /// Begin the member's retire and return when it has ended, with the status then. Doing it
-    /// again answers the same status. A retire is not undone: the unit is restarted after it.
-    fn retire(&self, host: &Host) -> Result<RetireStatus, PortError>;
-    /// The member's retire as it is now.
-    fn retire_status(&self, host: &Host) -> Result<RetireStatus, PortError>;
     /// The commit the member's binary was built from.
     fn commit(&self, host: &Host) -> Result<String, PortError>;
     /// Begin the member's own drain (`POST /v1/frontend/drain`): it answers `/readyz` 503,
@@ -486,23 +428,6 @@ mod tests {
         assert_eq!(own.restart_frontend(&host, "-"), Ok(()));
         assert_eq!(own.install(&host, &v), refused("install"));
         assert_eq!(own.report(&host), refused("report"));
-    }
-
-    /// Asserts that a pool member serves only when it is up and ready, whichever of the two
-    /// is missing, and that its streams are those of its REAPI and operator listeners.
-    #[test]
-    fn a_pool_member_serves_when_up_and_ready_and_counts_two_listeners() {
-        let member = |draining, ready| PoolMember {
-            name: "a".to_owned(),
-            draining,
-            ready,
-            reapi_streams: 2,
-            operator_streams: 3,
-        };
-        assert!(member(false, true).serves());
-        assert!(!member(true, true).serves());
-        assert!(!member(false, false).serves());
-        assert_eq!(member(false, true).streams(), 5);
     }
 
     /// Catches a kind that is lost or shown wrongly: the tuple-style call is `Other`, the
