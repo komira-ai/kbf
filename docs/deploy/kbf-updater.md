@@ -127,6 +127,12 @@ downgrading the updater.
 dials the coordinator and owns that host's update. The roll mode above is unchanged and keeps
 working (until the roll and its ssh path are deleted, in the last step of that design).
 
+The program is a release asset for each platform that runs it: `kbf-updater-<commit>-linux-x86_64.tar.gz`,
+`kbf-updater-<commit>-linux-arm64.tar.gz` and `kbf-updater-<commit>-darwin-arm64.tar.gz`, each with one
+member, `kbf-updater`, attested like every tarball ([../artifacts.md](../artifacts.md)). The macOS one
+is signed ad hoc with the hardened runtime, as the other macOS binaries are; a Mac runs the agent as
+`_kbf-updater` from the property list in `packaging/host-agent/macos`.
+
 ```text
 kbf-updater agent --coordinator <dns name>:<port> --client-cert FILE --client-key FILE --ca FILE
                   --channel NAME [--operator-api http://IP:PORT --token-file FILE
