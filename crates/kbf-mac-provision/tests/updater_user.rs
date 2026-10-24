@@ -165,16 +165,16 @@ fn a_second_apply_changes_nothing() {
 }
 
 /// Catches: the account's id left to chance when the profile does not fix it: it is the
-/// highest free id below 500, skipping the role account's, and it stays on a second run.
+/// highest free id below the VM user's range (449 when all of 450 to 499 are free, and
+/// never one from that range), and it stays on a second run.
 #[test]
 fn an_unset_id_is_the_highest_free_one_and_is_kept() {
     let mut mac = FakeMac::converged("updater-auto-id");
     let text = format!("{}updater_user=_kbf-updater\n", mac.profile_text());
     mac.set_profile(text);
-    mac.state_mut().user("builder", 499);
     let r = apply(&mac);
     assert_eq!(r.failed, 0, "{}", r.text);
-    assert_eq!(ls(&mac, STATE_DIR), "drwx------ 498 498");
+    assert_eq!(ls(&mac, STATE_DIR), "drwx------ 449 449");
     assert_eq!(apply(&mac).text, "");
 }
 
@@ -362,8 +362,8 @@ fn apply_repairs_a_drifted_account_and_its_directories() {
 }
 
 /// Catches: an id left to chance landing on one that is taken: with `updater_id` unset
-/// the pick skips ids a user holds, ids a group holds, the role account's and the VM
-/// user's.
+/// the pick skips ids a user holds, ids a group holds and the role account's, and
+/// stays below the VM user's range.
 #[test]
 fn an_unset_id_skips_every_id_that_is_taken_or_reserved() {
     let mut mac = FakeMac::converged("updater-skip");
@@ -372,12 +372,12 @@ fn an_unset_id_skips_every_id_that_is_taken_or_reserved() {
         mac.profile_text()
     );
     mac.set_profile(text);
-    mac.state_mut().user("builder", 498);
+    mac.state_mut().user("builder", 449);
     mac.state_mut()
-        .attr("/Groups/builders", "PrimaryGroupID", "497");
+        .attr("/Groups/builders", "PrimaryGroupID", "448");
     let r = apply_keys(&mac, Some("updater_user"));
     assert_eq!(r.failed, 0, "{}", r.text);
-    assert_eq!(ls(&mac, STATE_DIR), "drwx------ 496 496");
+    assert_eq!(ls(&mac, STATE_DIR), "drwx------ 447 447");
 }
 
 /// Catches: `apply` choosing an id when every one is taken, or changing the uid of an
@@ -420,6 +420,16 @@ fn apply_leaves_the_account_alone_when_no_id_is_free_or_its_uid_is_unusable() {
             r.text
         );
     }
+    let mut mac = converged_without_id("updater-uid-none");
+    mac.state_mut().user_attr("_kbf-updater", "UniqueID", "");
+    let r = apply(&mac);
+    assert!(
+        r.text.contains(
+            "NOTE updater_user: the account _kbf-updater has no UniqueID; remove it with `sudo dscl . -delete /Users/_kbf-updater` and run apply again"
+        ),
+        "{}",
+        r.text
+    );
     let mut mac = converged_without_id("updater-uid-vm");
     let text = format!("{}vm_user_uid={ID}\n", mac.profile_text());
     mac.set_profile(text);

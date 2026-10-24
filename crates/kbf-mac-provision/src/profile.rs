@@ -537,7 +537,7 @@ fn pool(
 
 /// The first and last uid of the standing VM user: below 500, so the account is hidden
 /// from the login window like a role account, and above the ids macOS keeps.
-const VM_USER_UIDS: RangeInclusive<u32> = 450..=499;
+pub(crate) const VM_USER_UIDS: RangeInclusive<u32> = 450..=499;
 
 /// `vm_user_uid` (a number from 450 to 499, not `role_id`; unset: the profile has no VM
 /// user). A VM user logs in automatically, which FileVault forbids, so the profile may

@@ -2,7 +2,7 @@
 //! kbf-updater agent's LaunchDaemon runs as, and the two directories that agent writes.
 //!
 //! - The account: user and group of one id (`updater_id`, 200 to 499; unset, `apply`
-//!   takes the highest id below 500 that is free), shell `/usr/bin/false`, home
+//!   takes the highest free id below the VM user's range), shell `/usr/bin/false`, home
 //!   `/var/empty`, hidden, no password. It is made as the role account is.
 //! - [`STATE_DIR`] holds the agent's key, certificate and CA: the account's, mode 700.
 //!   [`LOG_DIR`] holds its logs: the account's, mode 755.
@@ -15,7 +15,7 @@ use std::io;
 use crate::directory::{Batch, Directory, Record};
 use crate::items::{Ctx, Lines, Outcome, fail, or, pass};
 use crate::pool::dir_of;
-use crate::profile::UPDATER_IDS;
+use crate::profile::{UPDATER_IDS, VM_USER_UIDS};
 
 /// The only name `updater_user` may have: the `UserName` of the agent's property list.
 pub(crate) const NAME: &str = "_kbf-updater";
@@ -130,13 +130,17 @@ pub(crate) fn updater_user(c: &Ctx<'_>) -> Outcome {
 }
 
 /// The id `apply` gives a new account when the profile fixes none: the highest id below
-/// 500 that no user or group holds and that is not `role_id` or `vm_user_uid`.
+/// the VM user's range that no user or group holds and that is not `role_id`. The pick
+/// never lands in the VM user's range, so a profile that later sets `vm_user_uid` finds
+/// the id free.
 fn new_id(c: &Ctx<'_>, dir: &Directory) -> Option<u32> {
-    UPDATER_IDS.rev().find(|id| {
-        usable(c, *id)
-            && dir.uid_holder((*id).into(), |_| false).is_none()
-            && dir.gid_holder((*id).into(), "").is_none()
-    })
+    (*UPDATER_IDS.start()..*VM_USER_UIDS.start())
+        .rev()
+        .find(|id| {
+            usable(c, *id)
+                && dir.uid_holder((*id).into(), |_| false).is_none()
+                && dir.gid_holder((*id).into(), "").is_none()
+        })
 }
 
 /// Makes the account, its group and the two directories what [`updater_user`] wants.
@@ -145,6 +149,11 @@ pub(crate) fn fix_updater_user(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
     let dir = Directory::read(c).map_err(io::Error::other)?;
     let id = match (id_of(c, dir.user(NAME)), dir.user(NAME)) {
         (Some(id), _) => id,
+        (None, Some(record)) if record.get("UniqueID").is_empty() => {
+            return Err(io::Error::other(format!(
+                "the account {NAME} has no UniqueID; remove it with `sudo dscl . -delete /Users/{NAME}` and run apply again"
+            )));
+        }
         (None, Some(record)) => {
             return Err(io::Error::other(format!(
                 "{NAME} has uid {}, not an id from 200 to 499 other than role_id and vm_user_uid: not changed",
