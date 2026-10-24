@@ -89,7 +89,8 @@ a frontend or all-in-one host, the state database's schema, and the mode's units
 enrollment token and enrolls itself at its first start. A `frontend` or `all-in-one` host
 does not enroll; its certificates and addresses are the operator's, and `setup` takes them as
 flags. A host from the packages can run the same verb as `kbf setup --mode=<mode>` (without the
-proxy's flags). Details: [kbf-installer-setup.md](kbf-installer-setup.md).
+proxy's flags). Details: [kbf-installer-setup.md](kbf-installer-setup.md). A frontend can also run as
+a container image, with no installer: [containers.md](containers.md).
 
 ## Ports and who dials whom
 
@@ -277,7 +278,8 @@ the `Planned:` paragraph.
    `storage` or `daemon`, as `urn:kbf:role:<role>`). The frontend runs the enrollment
    listener: `--enroll-listen`, `--ca-dir`, `--frontend-name` (repeatable) and `--ca-signer`
    (the socket of the `kbf-signer` process that holds the CA key; `--ca-dev-file-signer` is
-   for development). The operator makes a token with `POST /v1/enroll/tokens`, and a node
+   for development; a frontend that runs as another account than the signer needs the
+   signer's `--client-group`, see the signer's socket in [api.md](../api.md)). The operator makes a token with `POST /v1/enroll/tokens`, and a node
    enrolls with it at its first start and renews at half of its certificate's life (7 days by
    default, `--enroll-cert-lifetime-secs`). A node host needs no hand-issued certificate. The
    table of what each certificate must contain is in [kbf-units.md](kbf-units.md).
@@ -323,7 +325,7 @@ leases they held before. Copying a joining member's slice to it
 
 | mode | on SIGTERM or SIGINT | what bounds it |
 |---|---|---|
-| `frontend` | drains | `--shutdown-timeout-secs` (0 by default: no deadline); a second signal |
+| `frontend` | drains, by the sequence below | `--drain-lb-wait` (10 s by default) and `--drain-deadline` (900 s by default); `--shutdown-timeout-secs` (0 by default: no deadline); a second signal |
 | `all-in-one` | the frontend half drains; the daemon half does not | as `frontend`; the daemon half stops when the server half has |
 | `storage` | stops | none of its own |
 | `daemon` | drains | `--drain-deadline-secs` (600 by default); a second signal |
@@ -331,14 +333,19 @@ leases they held before. Copying a joining member's slice to it
 
 **The frontend.** Buck2 does not recover an Execute stream that breaks after it started, so
 a stop that cuts a stream fails its action. On the first signal, or on
-`POST /v1/frontend/drain` (`kbf cluster drain --frontend --token-file F`), the frontend turns
-`/readyz` to 503, refuses each new Execute with `UNAVAILABLE` (which Buck2 retries), sends GOAWAY on
-the REAPI listener, and keeps every open Execute and WaitExecution stream until its action
-is done. It exits 0 once the REAPI connections have closed. The worker listener and the
-operator API stay up until then, so daemons go on reporting results. A second signal, or
-`--shutdown-timeout-secs` running out, ends the open streams `UNAVAILABLE` and stops the
-server. Under systemd that needs `TimeoutStopSec=infinity`; the units that `kbf-deploy`
-renders set it.
+`POST /v1/frontend/drain` (`kbf cluster drain --frontend --token-file F`), the frontend
+(which has a state store) takes itself out of any load balancer in five steps
+([kbf-units.md](kbf-units.md#draining-a-frontend-behind-a-load-balancer)): `/readyz` turns to
+503 while everything is still served; after `--drain-lb-wait` it refuses each new Execute with
+`UNAVAILABLE` (which Buck2 retries), takes no more work from the state store, and sends
+GOAWAY on the REAPI, worker and operator API listeners; it keeps every open Execute and
+WaitExecution stream until its action is done, at most `--drain-deadline`; then it ends the
+worker streams and the streams left `UNAVAILABLE` and exits 0. `GET /v1/frontend/drain`
+reports the phase. A second signal skips the waits, and `--shutdown-timeout-secs` running
+out does the same. A frontend with no state store (a test setup) drains at once: `/readyz`
+503, new Execute calls refused, GOAWAY on the REAPI listener, and exit 0 once the REAPI
+connections have closed. Under systemd that needs `TimeoutStopSec=infinity`; the units that
+`kbf-deploy` renders set it.
 
 **`all-in-one`.** The process has the frontend's drain and no drain of its own for builds.
 `--drain-deadline-secs` is used by `daemon` and `storage-and-daemon`, and `all-in-one` stops

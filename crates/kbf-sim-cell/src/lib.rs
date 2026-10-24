@@ -15,14 +15,16 @@
 //! of its [`StorePlan`]: it hangs, is slow, fails PUTs, or loses their answers. The
 //! server can be taken down at a named point of its write path ([`CrashPlan`]).
 //!
-//! **All-in-one** ([`Kind::WholeProcess`]): one daemon is the daemon half of the
-//! server's process (`kbf all-in-one`; its design, kbf#657, section 8).
-//! It stores each run's output in the server before it reports, and a kill of the
-//! process takes both halves down together, mid-build, and starts both again.
+//! **Storage and daemon in one process** ([`Kind::WholeProcess`]): one daemon is the
+//! daemon half of the server's process (`kbf storage-and-daemon`; its design,
+//! docs/design/architecture-v2.md, sections 1 and 10). It stores each run's output in
+//! the server before it reports, and a kill of the process takes both halves down
+//! together, mid-build, and starts both again. The cell's server is also the scheduler,
+//! so the kill is stricter than a node's: the scheduler's state goes with it.
 //!
 //! [`run`] runs a [`Scenario`] step by step and checks properties 1 to 7 of ha.md
 //! section 15, the write path's 8 and 9 (docs/design/write-tier-scenarios.md), and
-//! all-in-one's 14, after every step ([`check`]); a violation panics with the
+//! the node's 14, after every step ([`check`]); a violation panics with the
 //! scenario, the seed and the property. A seed replays to the same trace. [`sweep`]
 //! runs a scenario per seed and reports every failing seed.
 

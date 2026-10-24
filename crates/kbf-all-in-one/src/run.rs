@@ -491,4 +491,55 @@ mod tests {
             "{said}"
         );
     }
+
+    /// The combined start (`serve` and `with_daemon`'s normal path) through the crate's own
+    /// API, not the `kbf` binary: the server half starts on its flags over temp stores, the
+    /// daemon half (fake driver, dialling nothing that answers) starts over the in-process
+    /// plane, and both stop cleanly, `serve` returning `Ok`, once the server half is asked
+    /// to stop with SIGTERM. Catches: `with_daemon` not stopping the daemon half when the
+    /// server half ends, or returning the server half's stop as a failure; `serve` not
+    /// starting the daemon half over the server half's plane. The combined start goes away
+    /// with the all-in-one mode. SIGTERM is sent to this process again and again until
+    /// `serve` returns, from a thread, with a handler of the test's own installed first so
+    /// that none is fatal before the server half has installed its handler.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_combined_start_serves_and_stops_both_halves_when_the_server_half_is_stopped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (dir, daemon) = fake_daemon("combined-start");
+        let at = |name: &str| dir.join(name).display().to_string();
+        let server = kbf_server::Args::try_parse_from([
+            "kbf-server".to_owned(),
+            "--listen=127.0.0.1:0".to_owned(),
+            "--worker-listen=127.0.0.1:0".to_owned(),
+            "--default-platform=none".to_owned(),
+            format!("--cold-store=file://{}", at("cold")),
+            format!("--meta-dir={}", at("meta")),
+        ])
+        .expect("the server's flags");
+        let flags = Flags { server, daemon };
+
+        // Keeps SIGTERM handled for the whole test, whichever half installs its own.
+        let guard = Runtime::new().expect("runtime");
+        let _handled = {
+            let _context = guard.enter();
+            kbf_node::Signals::install().expect("handlers")
+        };
+        let done = Arc::new(AtomicBool::new(false));
+        let sender = {
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    // SAFETY: raise(3) on this process, which handles SIGTERM above.
+                    assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            })
+        };
+        let served = serve(prepared(&flags));
+        done.store(true, Ordering::SeqCst);
+        sender.join().expect("the sender");
+        assert!(served.is_ok(), "both halves stopped cleanly");
+    }
 }

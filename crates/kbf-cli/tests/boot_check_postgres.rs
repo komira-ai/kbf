@@ -1,4 +1,4 @@
-//! `kbf boot-check` against a real server, as a frontend or all-in-one unit runs it before the
+//! `kbf boot-check` against a real server, as a frontend unit runs it before the
 //! start: a database with no schema is given it and the check passes, one already at this
 //! build's schema is left alone, one ahead of this build by an expand step passes too, one with
 //! a contract step above this build is refused when the store opens, and a login the server
@@ -106,21 +106,19 @@ impl Drop for Database {
     }
 }
 
-/// Asserts that a frontend and an all-in-one unit on a database with no schema pass the check,
+/// Asserts that a frontend unit on a database with no schema passes the check,
 /// which says it created the schema at this build's version, and that a store of this build
 /// then opens on it: the unit starts on the schema it needs.
 #[test]
 fn a_database_with_no_schema_is_given_it_and_the_unit_starts() {
     let latest = schema::latest();
     let created = format!("created the schema at version {latest}");
-    for mode in ["frontend", "all-in-one"] {
-        let db = Database::new("fresh", None);
-        let (code, err) = db.boot_check(mode);
-        assert_eq!(code, Some(0), "{mode}: {err}");
-        assert!(err.contains(&created), "{mode}: {err}");
-        assert_eq!(schema::current(&db.config()), Ok(schema::latest()));
-        PostgresStore::open(&db.config()).expect("a store opens on what the check made");
-    }
+    let db = Database::new("fresh", None);
+    let (code, err) = db.boot_check("frontend");
+    assert_eq!(code, Some(0), "{err}");
+    assert!(err.contains(&created), "{err}");
+    assert_eq!(schema::current(&db.config()), Ok(schema::latest()));
+    PostgresStore::open(&db.config()).expect("a store opens on what the check made");
 }
 
 /// Asserts that a database already at this build's schema is left alone: the check passes and
@@ -155,7 +153,7 @@ fn a_database_ahead_by_an_expand_step_passes_the_check_and_is_left_alone() {
     let mut set = schema::embedded();
     set.push(later);
     schema::apply(&db.config(), &set, n1).expect("the later release is installed");
-    let (code, err) = db.boot_check("all-in-one");
+    let (code, err) = db.boot_check("frontend");
     assert_eq!(code, Some(0), "{err}");
     assert!(err.contains("nothing to apply"), "{err}");
     assert!(!err.contains("installer"), "{err}");

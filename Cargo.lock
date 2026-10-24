@@ -1374,16 +1374,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kbf-all-in-one-test"
-version = "0.1.0"
-dependencies = [
- "kbf-harness",
- "kbf-testkit",
- "kbf-transfer",
- "tokio",
-]
-
-[[package]]
 name = "kbf-auth"
 version = "0.1.0"
 dependencies = [
@@ -1773,6 +1763,16 @@ dependencies = [
  "serde_json",
  "thiserror",
  "time",
+]
+
+[[package]]
+name = "kbf-farm-test"
+version = "0.1.0"
+dependencies = [
+ "kbf-harness",
+ "kbf-testkit",
+ "kbf-transfer",
+ "tokio",
 ]
 
 [[package]]
@@ -4370,6 +4370,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tierstore"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
