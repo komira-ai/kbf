@@ -395,6 +395,8 @@ fn e1_flags_and_the_harvest_verb_reach_their_steps() {
         .map(|(s, _)| s.graphics)
         .collect();
     assert_eq!(graphics, [false, true]);
+    // The share matrix is on by default.
+    assert!(sys.starts.borrow().iter().all(|(s, _)| s.tagged.len() > 2));
     assert!(work.join("e1-x").is_dir());
     let cli = Cli::parse_from(["kbf-vmm", "probe", "e1", "--work-dir", "w"]);
     assert!(matches!(&cli.command, Cmd::Probe(a) if !a.common.headless && !a.keep));
@@ -416,10 +418,18 @@ fn e1_flags_and_the_harvest_verb_reach_their_steps() {
             "--guest-binary",
             bin.to_str().expect("p"),
             "--headless",
+            "--no-matrix",
         ],
     );
     assert_eq!(code, OK, "{out}");
     assert!(sys2.starts.borrow().iter().all(|(s, _)| !s.graphics));
+    assert!(
+        sys2.starts
+            .borrow()
+            .iter()
+            .all(|(s, _)| s.tagged.len() == 2),
+        "no matrix"
+    );
     let bundle = work.join("e1-x");
     let harvested = work.join("h");
     sys.uid.set(0);

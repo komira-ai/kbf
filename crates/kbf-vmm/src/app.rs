@@ -38,6 +38,7 @@ fn context<'a>(
         guest_binary: common.guest_binary.clone(),
         keep,
         graphics: !common.headless,
+        matrix: !common.no_matrix,
         timing,
     })
 }

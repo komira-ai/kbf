@@ -119,7 +119,7 @@ pub fn prepare_share(ctx: &Ctx<'_>, name: &str) -> Result<Share, String> {
 }
 
 /// Makes the new directory `path` with exactly `mode` (not reduced by the umask).
-fn make_dir(path: &Path, mode: u32) -> Result<(), String> {
+pub(crate) fn make_dir(path: &Path, mode: u32) -> Result<(), String> {
     std::fs::create_dir(path)
         .and_then(|()| std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)))
         .map_err(|e| format!("create {}: {e}", path.display()))
@@ -127,7 +127,7 @@ fn make_dir(path: &Path, mode: u32) -> Result<(), String> {
 
 /// Removes whatever is at `path` without following a symbolic link. A removal that fails
 /// is not reported here: the `create_dir` that follows fails on what is left.
-fn remove_leftover(path: &Path) {
+pub(crate) fn remove_leftover(path: &Path) {
     let _ = match std::fs::symlink_metadata(path) {
         Err(_) => Ok(()),
         Ok(m) if m.is_dir() => std::fs::remove_dir_all(path),

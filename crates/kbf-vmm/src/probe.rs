@@ -71,6 +71,8 @@ pub struct Ctx<'a> {
     /// guest crash-loops its window server. E1's first arm stays headless regardless, as
     /// the comparison.
     pub graphics: bool,
+    /// Give E1's VMs the share matrix (`crate::matrix`); `--no-matrix` turns it off.
+    pub matrix: bool,
     pub timing: Timing,
 }
 

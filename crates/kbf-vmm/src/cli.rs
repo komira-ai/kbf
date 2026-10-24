@@ -76,6 +76,10 @@ pub struct Common {
     /// (E1's first arm is headless either way.)
     #[arg(long)]
     pub headless: bool,
+    /// Do not attach the share matrix to E1's VMs (about ten extra virtiofs devices, each
+    /// with a host directory that differs in one factor; see `docs/spikes/macos-vm-probe.md`).
+    #[arg(long)]
+    pub no_matrix: bool,
 }
 
 #[derive(Debug, Args)]

@@ -13,6 +13,13 @@ use serde::{Deserialize, Serialize};
 pub struct TaggedShare {
     pub tag: String,
     pub path: PathBuf,
+    /// When set, the share is a multiple-directory share that lists `path` under this name;
+    /// otherwise a single-directory share.
+    #[serde(default)]
+    pub multiple_name: Option<String>,
+    /// Whether the guest may write to it.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// One VM to run, from a bundle on disk (see `bundle`). There is no network device: the
@@ -145,10 +152,20 @@ mod tests {
         let mut s = VmSpec::minimal("/b".into());
         s.graphics = true;
         s.automount_dir = Some("/share".into());
-        s.tagged = vec![TaggedShare {
-            tag: "t".into(),
-            path: "/t".into(),
-        }];
+        s.tagged = vec![
+            TaggedShare {
+                tag: "t".into(),
+                path: "/t".into(),
+                multiple_name: None,
+                read_only: false,
+            },
+            TaggedShare {
+                tag: "u".into(),
+                path: "/u".into(),
+                multiple_name: Some("m".into()),
+                read_only: true,
+            },
+        ];
         s.vsock_ports = vec![5000];
         s.console_ports = vec!["kbf.probe".into()];
         let text = serde_json::to_string(&s).expect("json");

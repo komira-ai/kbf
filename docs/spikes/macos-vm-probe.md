@@ -276,6 +276,65 @@ unmounts it with the system call, reporting the errno of each. Read it like this
 | `results/` fails and the mount root works (or the reverse) | a per-directory difference: owner or mode as the guest maps it |
 | everything ok in the diagnosis but `com.kbf.probe.root.log` still shows the refusal | the refusal is specific to the binary running from the share (the process is located on the volume it writes to) |
 
+### E1 result, third run: nothing can be created in any share
+
+`probe-diag` settled the guest side. The first step of every write fails: `create`, with
+`EPERM`, for root (uid 0, all groups), in the share root `/private/var/kbf-mnt`, in
+`results/` (shown `drwxrwxrwx`, owner `_unknown`) and in a second mount of the `kbfprobe`
+tag; `mkdir` fails the same way. The control directory on the guest's disk passes every
+step. The daemons that run as `nobody` fail the same way (about 95 `create ...
+Operation not permitted` lines each), so no guest identity can create anything in a
+virtiofs share. The mount shows `(AppleVirtIOFS, nodev, nosuid)`, SIP is on, and
+unmounting works now. The host's unified log shows no TCC or sandbox denial in the window.
+So the refusal is on the host side of the share, or in how virtiofs maps ownership for a
+macOS guest (every file shows owner uid 99).
+
+Apple's documentation for `VZSharedDirectory` and `VZVirtioFileSystemDeviceConfiguration`
+says nothing about the host directory's owner, mode, location or path form (no
+requirement of a real path, no statement for `/Users` against `/private`), says the mount
+commands are meant to be run by a user logged in to the guest, and gives automount
+examples that share a directory in the user's home. It names no cause, so there is no
+direct fix; the next run is a matrix.
+
+### The share matrix
+
+`probe e1` now gives each VM, besides the three shares above, one extra virtiofs device
+per row of this table (`--no-matrix` leaves them out). Each has its own host directory
+`kbf-<vm>-mx-<name>` and tag `kbfmx<i>`; rows differ from `base` in one factor.
+
+| name | what differs from `base` (work directory, mode 0777, owned by the user running `kbf-vmm`, single-directory share, writable) |
+|---|---|
+| `base` | nothing |
+| `mode755` | mode 0755 |
+| `tmp` | location `/private/tmp` |
+| `shared` | location the shared-users directory under the Users folder (`Shared`) |
+| `multiple` | a multiple-directory share (the directory is listed as `m`) |
+| `other-owner` | owned by another user; made only by a root run, otherwise listed as skipped |
+| `control-mode555` | negative control: mode 0555, nobody can write on the host |
+| `control-readonly` | negative control: the share is marked read-only |
+
+The host writes the list into `matrix.json` in the main share. The guest (`com.kbf.probe.diag`)
+mounts each tag at `/private/tmp/kbfmx-<name>`, runs the write steps in it (in `m/` for the
+multiple-directory share), and unmounts it. The automount share
+(`/Volumes/My Shared Files/kbf`) is written to as well. After the run the host lists every
+matrix directory in `details.arms[].matrix_host`: its real path, owner and mode, and every
+file the guest left in it (anything listed landed on the host).
+
+Read `matrix` in `<harvest>/private/var/log/kbf-probe-diag` (one row per share, with
+`cycle.inside.steps` and `first_failed_step`) together with `matrix_host` in `e1.json`:
+
+| observation | meaning |
+|---|---|
+| every row fails at `create`, including `tmp` and `shared`, the host listings are empty | the location, the mode and the single/multiple type do not matter; the refusal is in the guest's virtiofs for any host directory (or in the Virtualization service), not in what we pass |
+| `base` fails but `tmp` or `shared` works (or the reverse) | the location matters; compare `real_path` (a path through a symbolic link or a protected folder) and the host's TCC rules for the home directory |
+| `base` fails but `mode755` works | the mode matters (it should not: the guest cannot see the host mode) |
+| `multiple` works and the single-directory rows fail | single-directory shares are read-only for guests in practice; share a multiple-directory share instead |
+| `control-mode555` and `base` fail alike, with the same errno | the host's file permissions are the cause; check who owns `base` and the VM helper's user in `matrix_host` |
+| `control-readonly` fails with a different errno than `base` (`EROFS` against `EPERM`) | `base` is not being treated as read-only; the refusal is something else |
+| a row fails in the guest but its file is listed in `matrix_host` | the write reached the host and the guest was told it failed |
+| `other-owner` works and `base` fails | the directory must not be owned by the VM's user (unlikely; re-run as root to get this row) |
+| the automount write works and the matrix rows fail | use the automount path for results (it needs a user session or the system's own mount; see `automount` in the guest's probe result) |
+
 ## What to send back
 
 Everything the commands wrote, including each helper's log (the cause of a VM that did

@@ -72,10 +72,14 @@ pub(crate) fn attach_share(spec: &mut VmSpec, share: &Share, channels: Channels)
         TaggedShare {
             tag: guest::SHARE_TAG.to_owned(),
             path: share.dir.clone(),
+            multiple_name: None,
+            read_only: false,
         },
         TaggedShare {
             tag: guest::TAG.to_owned(),
             path: share.tagged.clone(),
+            multiple_name: None,
+            read_only: false,
         },
     ];
     if channels.vsock {
