@@ -507,14 +507,12 @@ fn the_proxy_reaches_no_child_installer_or_runtime_crate() {
     );
 }
 
-/// The files of `kbf-installer/src` that may name the proxy: the verb that hosts it, the
-/// verb's own tests (`proxy_verb_tests.rs`, which compare the deploy's copy of the proxy's port
-/// layout in `observe.rs` with the proxy's), and the verb's pool mode (`proxy_pool.rs`, which
-/// binds and runs the proxy over frontends that run on their own). Everything else, the root
-/// helper (`helper/`, `run.rs`) first of all, runs as root and links a network stack it never
-/// runs if it names a proxy type. The settings file whose `[proxy]` table the verb reads is in
-/// `kbf-setup` (`SETUP_MAY_NAME_THE_PROXY`).
-const MAY_NAME_THE_PROXY: &[&str] = &["proxy_pool.rs", "proxy_verb.rs", "proxy_verb_tests.rs"];
+/// The files of `kbf-installer/src` that may name the proxy: the verb that hosts it and the
+/// verb's pool mode (`proxy_pool.rs`, which binds and runs the proxy over frontends that run on
+/// their own). Everything else, the root helper (`helper/`, `run.rs`) first of all, runs as root
+/// and links a network stack it never runs if it names a proxy type. The settings file whose
+/// `[proxy]` table the verb reads is in `kbf-setup` (`SETUP_MAY_NAME_THE_PROXY`).
+const MAY_NAME_THE_PROXY: &[&str] = &["proxy_pool.rs", "proxy_verb.rs"];
 
 /// The files of `kbf-setup/src` that may name the proxy: the settings file whose `[proxy]`
 /// table the proxy verb reads and `setup` keeps as it is (`installer_toml.rs`). `setup` runs as

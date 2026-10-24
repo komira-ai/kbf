@@ -306,8 +306,11 @@ pub(crate) fn handle_signals(
     });
     for mut signals in [term?, int?] {
         let (drain, stop) = (Arc::clone(drain), Arc::clone(stop));
+        // A signal stream never ends (tokio's `Signal::recv` always returns `Some`), so the
+        // task has no exit of its own; the runtime's end drops it.
         runtime.spawn(async move {
-            while signals.recv().await.is_some() {
+            loop {
+                signals.recv().await;
                 drop(stop.signalled(&*drain));
             }
         });
@@ -322,7 +325,8 @@ pub(crate) fn handle_signals(
     let mut hup = hup?;
     let reloading = handle.clone();
     runtime.spawn(async move {
-        while hup.recv().await.is_some() {
+        loop {
+            hup.recv().await;
             let handle = reloading.clone();
             drop(tokio::task::spawn_blocking(move || {
                 let line = match handle.reload_tls() {

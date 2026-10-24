@@ -70,7 +70,6 @@ pub mod golden;
 pub mod helper;
 pub mod host_mode;
 pub mod meta_log;
-pub mod observe;
 mod proxy_pool;
 pub mod proxy_verb;
 pub mod record;

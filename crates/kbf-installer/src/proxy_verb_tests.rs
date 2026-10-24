@@ -3,7 +3,6 @@ use std::net::{Ipv4Addr, TcpListener};
 use std::os::fd::IntoRawFd as _;
 use std::path::PathBuf;
 
-use kbf_proxy::route::Target;
 use rustix::io::{FdFlags, fcntl_getfd};
 
 use super::*;
@@ -426,17 +425,4 @@ fn proxy_reads_the_installer_toml_setup_wrote_on_the_platform() {
         config_path(&given, Platform::MacOs),
         PathBuf::from("/x.toml")
     );
-}
-
-/// Asserts that the copy of the proxy's port layout in `observe` is the proxy's own
-/// (`kbf_proxy::config`, the constants of the slot table): the
-/// deploy verb finds the operator listener of each frontend as `base + stride * slot + offset`
-/// without naming the proxy, so a layout that differs would send its gates to the wrong port.
-#[test]
-fn the_deploys_port_layout_is_the_proxys() {
-    use crate::observe::{MAX_BASE_PORT, OPERATOR_OFFSET, SLOT_STRIDE};
-
-    assert_eq!(SLOT_STRIDE, kbf_proxy::config::SLOT_STRIDE);
-    assert_eq!(OPERATOR_OFFSET, Target::Operator.offset());
-    assert_eq!(MAX_BASE_PORT, kbf_proxy::config::MAX_BASE_PORT);
 }
