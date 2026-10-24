@@ -9,27 +9,54 @@ here is in a package yet: the binaries are release assets (`docs/deploy/host-ins
 | `linux/kbf-host-local.service` | `kbf-host-install --serve`, as root: the local socket (`/run/kbf-host-install/local.sock`, mode 0600, owned by `kbf-updater`) that stages a release, switches to it on trial, and goes back by itself at the deadline |
 | `linux/kbf-updater-agent.service` | `kbf-updater agent`, as `kbf-updater`: the heartbeat to the coordinator and the host's A/B through that socket |
 | `linux/kbf-updater.conf` | the sysusers.d entry of the `kbf-updater` account (no login, no home) |
+| `enroll-example.txt` | the enrollment command, as the tests read it |
 | `macos/com.komira.kbf-host-install-local.plist` | the same socket on a Mac, as root, in `/var/db/kbf-host-install` |
 | `macos/com.komira.kbf-updater-agent.plist` | the agent on a Mac, as `_kbf-updater` |
 
-The values in the files are examples (`coordinator.farm.example`, the paths of the certificate,
-the key and the CA): edit them to the farm's. `crates/kbf-updater/tests/agent_packaging.rs`
+The values in the files are examples (`coordinator.farm.example`, `frontend.farm.example`, the
+state directory): edit them to the farm's. `crates/kbf-updater/tests/agent_packaging.rs`
 reads these files and checks that every command line parses as the programs parse it, that
 the two ends agree on the socket and on the account that may connect to it, and that the agent
 is not root.
 
+## Enrolling a host
+
+A host gets its updater certificate from the farm CA with a one-time token. On the frontend,
+the operator makes the token for this host (`POST /v1/enroll/tokens`, `docs/api.md`) with
+`"roles": ["updater"]`, the host's `node_id` and its `host_role` (`storage`, `daemon` or
+`mac-daemon`); it is good for one use. On the host, as the agent's account (`kbf-updater`, or
+`_kbf-updater` on a Mac), with the token in a file of that account's, mode 0600:
+
+```sh
+install -d -o kbf-updater -m 0700 /var/lib/kbf-updater
+sudo -u kbf-updater sh -c 'umask 077; cat > /var/lib/kbf-updater/enroll.token'   # paste the token, end with ^D
+sudo -u kbf-updater /usr/libexec/kbf/kbf-updater enroll --frontend frontend.farm.example:443 --node-id host-1 --token-file /var/lib/kbf-updater/enroll.token --state-dir /var/lib/kbf-updater
+```
+
+The key is made on the host and stays there (mode 0600, the account's); only a request signed
+by it is sent. The command checks the frontend against the CA pin in the token, checks what it
+gets back, writes `pki/updater.key`, `pki/updater.pem` and `pki/ca.pem` into the state
+directory, and removes the token file. The agent then starts (or is restarted, if it was
+waiting) and renews the certificate itself at half its life. `enroll-example.txt` is that
+command, which `crates/kbf-updater/tests/agent_packaging.rs` checks against the unit's
+`--state-dir` and the program's flags.
+
 ## What the agent needs
 
-- **Files an operator places**: the updater's certificate and key, and the farm CA (enrollment
-  is a later step). The certificate says which node this is and what the host runs.
+- **Its certificate**: from the enrollment above, in the state directory. The certificate says
+  which node this is and what the host runs; the agent's flags say neither. (Placed files still
+  work, with `--client-cert`, `--client-key` and `--ca` in place of `--state-dir`; nothing
+  renews them.)
 - **A configuration for the helper's channels**: on Linux `/etc/kbf/host-install-releases.toml`,
   on a Mac the existing `host-install.toml`. See `docs/deploy/host-install.md`, "The local socket".
-- **No credential for the frontend's operator API, as shipped.** The drain of the node and the
-  node's health are calls to it, and it has no scoped credential yet (`docs/api.md`: its roles are
-  planned), so they need the full operator token, which the design keeps off hosts. The units
-  and jobs here give the agent none: it heartbeats and refuses every update order before it
-  fetches anything. An operator who accepts the token on a host adds `--operator-api` and
-  `--token-file` to the agent's command line (the API is on the frontend's loopback), knowing
-  that the agent's account can then read the token. A scoped credential for `:drain`,
-  `:uncordon` and node status is what lifts the boundary.
+- **No operator token, as shipped.** The drain of the node, its undrain and its status are three
+  calls to the frontend (`--frontend`) made with the host's own certificate. The frontend's
+  proxy admits exactly those three, for the node in the certificate and no other, and puts the
+  operator token in itself, so the host never holds it (`docs/design/updates.md`, "Trust"). An
+  operator who wants the full token on a host adds `--operator-api` and `--token-file` to the
+  agent's command line (the API is on the frontend's loopback), knowing that the agent's account
+  can then read it; the agent uses it instead of the certificate.
+- **A storage host's health** is read from operator routes a certificate cannot reach, so a
+  storage host needs the token above or is updated by the roll: its agent heartbeats and
+  refuses update orders until then.
 - **A frontend host is not served**: its certificate is refused. The roll updates frontends.

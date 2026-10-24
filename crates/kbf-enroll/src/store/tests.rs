@@ -74,6 +74,9 @@ fn pair_matches(store: &Store, role: Role) -> bool {
 
 use rustls::pki_types::pem::PemObject;
 
+/// The roles of a node (a host's updater is not one).
+const NODE_ROLES: [Role; 2] = [Role::Storage, Role::Daemon];
+
 /// An enrolled store: keys and certificates for both roles installed.
 fn enrolled(name: &str) -> (kbf_testkit::dir::TestDir, Store, Node) {
     let (root, store) = store(name);
@@ -132,7 +135,7 @@ fn pending_makes_a_key_and_request_per_role_and_a_retry_gets_the_same() {
         vec![Role::Storage, Role::Daemon]
     );
     assert_ne!(first[0].spki, first[1].spki, "one key per role");
-    for role in Role::ALL {
+    for role in NODE_ROLES {
         let staged = store.staging().join(format!("{}.key", role.name()));
         assert_eq!(mode(&staged), 0o600);
         assert_eq!(
@@ -195,7 +198,7 @@ fn a_damaged_staged_key_is_reported() {
 #[test]
 fn a_first_install_puts_every_file_in_place_with_its_mode_and_clears_staging() {
     let (_root, store, node) = enrolled("store-install");
-    for role in Role::ALL {
+    for role in NODE_ROLES {
         assert_eq!(mode(&store.key_path(role)), 0o600);
         assert_eq!(mode(&store.cert_path(role)), 0o644);
         assert!(pair_matches(&store, role));
@@ -238,7 +241,7 @@ fn a_crash_at_any_point_of_a_renewal_leaves_a_certificate_that_matches_its_key()
         let new = node(&certs, 2);
         store.stage(&certs, b"CA TWO", &new).unwrap();
         store.commit_steps(crash_after).unwrap();
-        for role in Role::ALL {
+        for role in NODE_ROLES {
             assert!(
                 pair_matches(&store, role),
                 "step {crash_after}: {role} pair"
@@ -255,7 +258,7 @@ fn a_crash_at_any_point_of_a_renewal_leaves_a_certificate_that_matches_its_key()
         assert_eq!(store.recover().unwrap(), Some(new), "step {crash_after}");
         assert!(!store.staging().exists());
         assert_eq!(std::fs::read(store.ca_path()).unwrap(), b"CA TWO");
-        for role in Role::ALL {
+        for role in NODE_ROLES {
             assert!(pair_matches(&store, role));
         }
     }
@@ -280,7 +283,7 @@ fn a_crash_during_a_first_install_is_finished_by_the_next_start() {
             "not enrolled until node.json moves"
         );
         assert_eq!(store.recover().unwrap(), Some(node), "step {crash_after}");
-        for role in Role::ALL {
+        for role in NODE_ROLES {
             assert!(pair_matches(&store, role), "step {crash_after}: {role}");
             assert_eq!(mode(&store.key_path(role)), 0o600);
         }
@@ -445,4 +448,30 @@ fn the_stored_configuration_keeps_what_the_frontend_sent() {
         None,
         "an unknown mode is kept, not guessed"
     );
+}
+
+/// An updater is a role of the store like the others: its key and certificate are
+/// `updater.key` (0600) and `updater.pem` in `pki/`, an install commits them, and the paths a
+/// flag names before the directory is opened are the paths of the opened store.
+#[test]
+fn an_updaters_files_are_named_for_its_role_and_found_without_opening_the_store() {
+    let (root, store) = store("updater-files");
+    let only = RoleSet::new([Role::Updater]).unwrap();
+    store.pending(only).unwrap();
+    let certs = [cert_for(&store, Role::Updater, true, "b1")];
+    let node = node(&certs, 1);
+    store.stage(&certs, b"CA ONE", &node).unwrap();
+    store.commit().unwrap();
+    assert_eq!(node.roles(), [Role::Updater]);
+    assert_eq!(mode(&store.key_path(Role::Updater)), 0o600);
+    assert!(pair_matches(&store, Role::Updater));
+
+    let named = Store::unopened(&root.join("state"));
+    assert_eq!(named.key_path(Role::Updater), store.key_path(Role::Updater));
+    assert_eq!(
+        named.cert_path(Role::Updater),
+        store.cert_path(Role::Updater)
+    );
+    assert_eq!(named.ca_path(), store.ca_path());
+    assert!(store.key_path(Role::Updater).ends_with("pki/updater.key"));
 }

@@ -22,6 +22,9 @@ use support::fake::{self, LIFE_S, Running, Spoil};
 use support::{config_for, facts, scratch};
 use x509_parser::prelude::{FromDer, X509CertificationRequest};
 
+/// The roles of a node (a host's updater is not one).
+const NODE_ROLES: [Role; 2] = [Role::Storage, Role::Daemon];
+
 struct Harness {
     running: Running,
     config: Config,
@@ -82,11 +85,11 @@ impl Harness {
 #[tokio::test]
 async fn at_half_life_the_node_renews_with_its_own_key_and_no_token() {
     let h = enrolled("renew-half").await;
-    let old_key: Vec<_> = Role::ALL
+    let old_key: Vec<_> = NODE_ROLES
         .iter()
         .map(|r| h.bytes(h.store.key_path(*r)))
         .collect();
-    let old_cert: Vec<_> = Role::ALL
+    let old_cert: Vec<_> = NODE_ROLES
         .iter()
         .map(|r| h.bytes(h.store.cert_path(*r)))
         .collect();
@@ -114,7 +117,7 @@ async fn at_half_life_the_node_renews_with_its_own_key_and_no_token() {
     assert_eq!(sent.csrs.len(), 2);
 
     // New serials and expiry; the same keys, byte for byte; certificates replaced.
-    for (i, role) in Role::ALL.iter().enumerate() {
+    for (i, role) in NODE_ROLES.iter().enumerate() {
         assert_eq!(
             h.bytes(h.store.key_path(*role)),
             old_key[i],
@@ -250,7 +253,7 @@ async fn a_node_that_has_not_enrolled_has_nothing_to_renew() {
 #[tokio::test]
 async fn refusals_to_renew_are_typed_and_leave_the_installed_pair_alone() {
     let h = enrolled("renew-refused").await;
-    let before: Vec<_> = Role::ALL
+    let before: Vec<_> = NODE_ROLES
         .iter()
         .map(|r| h.bytes(h.store.cert_path(*r)))
         .collect();
@@ -271,7 +274,7 @@ async fn refusals_to_renew_are_typed_and_leave_the_installed_pair_alone() {
             "{err:?}"
         );
     }
-    let after: Vec<_> = Role::ALL
+    let after: Vec<_> = NODE_ROLES
         .iter()
         .map(|r| h.bytes(h.store.cert_path(*r)))
         .collect();
@@ -290,7 +293,7 @@ async fn a_renewal_answer_that_cannot_be_validated_keeps_the_old_pair() {
         Spoil::LateRenewAfter,
     ] {
         let h = enrolled(&format!("renew-spoil-{spoil:?}")).await;
-        let before: Vec<_> = Role::ALL
+        let before: Vec<_> = NODE_ROLES
             .iter()
             .map(|r| h.bytes(h.store.cert_path(*r)))
             .collect();
@@ -299,7 +302,7 @@ async fn a_renewal_answer_that_cannot_be_validated_keeps_the_old_pair() {
             .await
             .unwrap_err();
         assert!(matches!(err, RenewError::Answer(_)), "{spoil:?}: {err:?}");
-        let after: Vec<_> = Role::ALL
+        let after: Vec<_> = NODE_ROLES
             .iter()
             .map(|r| h.bytes(h.store.cert_path(*r)))
             .collect();

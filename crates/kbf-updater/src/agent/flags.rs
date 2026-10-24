@@ -2,29 +2,39 @@
 //! environment.
 //!
 //! ```text
-//! kbf-updater agent --coordinator <dns name>:<port> --client-cert FILE --client-key FILE --ca FILE
-//!                   --channel NAME [--operator-api http://IP:PORT --token-file FILE
+//! kbf-updater agent --coordinator <dns name>:<port> --channel NAME
+//!                   (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
+//!                   [--frontend <dns name>:<port>]
+//!                   [--operator-api http://IP:PORT --token-file FILE
 //!                   [--operator-proxy-auth-file FILE]] [--helper-socket PATH]
 //!                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
 //!                   [--health-poll-secs N] [--retry-secs N]
 //! ```
 //!
 //! - `--coordinator`: where the coordinator is; its certificate must be for that name.
-//! - `--client-cert`, `--client-key`, `--ca`: files an operator placed (enrollment is a later
-//!   step): this host's updater certificate and key, and the farm CA that signed the
-//!   coordinator's certificate. The certificate says which node this is and what the host
-//!   runs; neither is a flag.
+//! - `--state-dir`: the directory `kbf-updater enroll` filled (the key, the certificate and the
+//!   CA are its files, [`kbf_enroll::store::Store`]'s). The agent renews the certificate at half
+//!   its life and writes the new one there; it needs `--frontend` for that.
+//! - `--client-cert`, `--client-key`, `--ca`: instead, files an operator placed: this host's
+//!   updater certificate and key, and the farm CA that signed the coordinator's certificate.
+//!   Nothing renews them. The certificate says which node this is and what the host runs;
+//!   neither is a flag.
+//! - `--frontend`: the frontend's public address, the kbf-proxy. The node's drain, its undrain
+//!   and its status are three calls there, made with the updater's own certificate and no
+//!   token: the proxy admits them for the node in the certificate and for no other, and
+//!   admits nothing else from an updater. Renewals go there too.
 //! - `--channel`: the release channel the helper's allowlist names; the version the
 //!   coordinator names is looked up in it by the helper, never by URL.
 //! - `--helper-socket`: the socket of `kbf-host-install --serve` (default
 //!   `/run/kbf-host-install/local.sock`).
 //! - `--operator-api`, `--token-file`, `--operator-proxy-auth-file`: the frontend's loopback
-//!   operator API, as in the roll mode, for the drain of the node and the node's health.
-//!   **There is no scoped credential for these calls yet** (`docs/api.md`: the operator API's
-//!   roles are planned), so the token is the full operator token. Giving it to an agent is a
-//!   choice of the operator, made by giving both `--operator-api` and `--token-file` (the
-//!   proxy secret needs them): without them the agent heartbeats and refuses every update
-//!   order, before it fetches anything. The packaged units give neither.
+//!   operator API, as in the roll mode, as an **opt-in fallback** for the drain and the
+//!   node's health: the credential is the full operator token, which the design keeps off
+//!   hosts. Giving it to an agent is a choice of the operator, made by giving both
+//!   `--operator-api` and `--token-file` (the proxy secret needs them), and it is then used
+//!   instead of the updater's certificate for those calls. Without either way (no `--frontend`
+//!   and no token) the agent heartbeats and refuses every update order, before it fetches
+//!   anything. The packaged units give no token.
 //! - Times, in seconds: `--heartbeat-secs` (default 15), `--drain-deadline-secs` (600, how long
 //!   the node's leases are waited for), `--health-timeout-secs` (300, how long the release on
 //!   trial has to show healthy), `--health-poll-secs` (5) and `--retry-secs` (900, how long a
@@ -32,19 +42,25 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use kbf_enroll::store::Store;
+use kbf_types::Role;
 
 use super::coordinator::{Endpoint, TlsFiles};
 use crate::daemon::parse_operator_url;
 
-pub const USAGE: &str = "usage: kbf-updater agent --coordinator DNSNAME:PORT --client-cert FILE \
---client-key FILE --ca FILE --channel NAME [--operator-api http://IP:PORT --token-file FILE \
-[--operator-proxy-auth-file FILE]] [--helper-socket PATH] [--heartbeat-secs N] \
-[--drain-deadline-secs N] [--health-timeout-secs N] [--health-poll-secs N] [--retry-secs N]\n";
+pub const USAGE: &str = "usage: kbf-updater agent --coordinator DNSNAME:PORT --channel NAME \
+(--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE) [--frontend DNSNAME:PORT] \
+[--operator-api http://IP:PORT --token-file FILE [--operator-proxy-auth-file FILE]] \
+[--helper-socket PATH] [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N] \
+[--health-poll-secs N] [--retry-secs N]\n";
 
-const FLAGS: [&str; 14] = [
+const FLAGS: [&str; 16] = [
     "--coordinator",
+    "--state-dir",
+    "--frontend",
     "--client-cert",
     "--client-key",
     "--ca",
@@ -102,6 +118,10 @@ pub struct Config {
     pub files: TlsFiles,
     pub channel: String,
     pub helper_socket: PathBuf,
+    /// The frontend's public address: where the node's own drain is made and renewals go.
+    pub frontend: Option<Endpoint>,
+    /// The enrollment's state directory, if the certificate is the agent's to renew.
+    pub state_dir: Option<PathBuf>,
     /// The frontend's operator API for the drain and the health, if the operator gave the agent
     /// the credential for it.
     pub node_api: Option<NodeApi>,
@@ -114,6 +134,39 @@ pub struct NodeApi {
     pub addr: SocketAddr,
     pub token_file: PathBuf,
     pub proxy_auth_file: Option<PathBuf>,
+}
+
+/// The `--flag value` and `--flag=value` pairs of `args`, each flag of `known` given at most
+/// once.
+///
+/// # Errors
+/// An argument that is no known flag, a flag with no value, a flag given twice.
+pub(super) fn collect<'k>(
+    args: &[String],
+    known: &[&'k str],
+) -> Result<BTreeMap<&'k str, String>, String> {
+    let mut found = BTreeMap::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) => (name, Some(value.to_owned())),
+            None => (arg.as_str(), None),
+        };
+        let Some(&flag) = known.iter().find(|f| **f == name) else {
+            return Err(format!("unknown argument {name}"));
+        };
+        let value = match inline {
+            Some(value) => value,
+            None => rest
+                .next()
+                .cloned()
+                .ok_or_else(|| format!("{flag} needs a value"))?,
+        };
+        if found.insert(flag, value).is_some() {
+            return Err(format!("{flag} is given twice"));
+        }
+    }
+    Ok(found)
 }
 
 /// A number of seconds from 1 to a day.
@@ -130,27 +183,7 @@ fn secs(flag: &str, text: &str) -> Result<Duration, String> {
 /// # Errors
 /// What is wrong with them, in a line.
 pub fn parse_flags(args: &[String]) -> Result<Config, String> {
-    let mut found: BTreeMap<&str, String> = BTreeMap::new();
-    let mut rest = args.iter();
-    while let Some(arg) = rest.next() {
-        let (name, inline) = match arg.split_once('=') {
-            Some((name, value)) => (name, Some(value.to_owned())),
-            None => (arg.as_str(), None),
-        };
-        let Some(&flag) = FLAGS.iter().find(|f| **f == name) else {
-            return Err(format!("unknown argument {name}"));
-        };
-        let value = match inline {
-            Some(value) => value,
-            None => rest
-                .next()
-                .cloned()
-                .ok_or_else(|| format!("{flag} needs a value"))?,
-        };
-        if found.insert(flag, value).is_some() {
-            return Err(format!("{flag} is given twice"));
-        }
-    }
+    let mut found = collect(args, &FLAGS)?;
     let mut take = |flag: &str| {
         found
             .remove(flag)
@@ -158,14 +191,25 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
     };
     let coordinator =
         Endpoint::parse(&take("--coordinator")?).map_err(|why| format!("--coordinator: {why}"))?;
-    let files = TlsFiles {
-        cert: PathBuf::from(take("--client-cert")?),
-        key: PathBuf::from(take("--client-key")?),
-        ca: PathBuf::from(take("--ca")?),
-    };
     let channel = take("--channel")?;
     if !channel_ok(&channel) {
         return Err("--channel must be a channel name: [a-z0-9][a-z0-9-]{0,31}".to_owned());
+    }
+    let frontend = found
+        .remove("--frontend")
+        .map(|text| Endpoint::parse(&text).map_err(|why| format!("--frontend: {why}")))
+        .transpose()?;
+    let state_dir = found.remove("--state-dir").map(PathBuf::from);
+    let files = tls_files(
+        state_dir.as_deref(),
+        [
+            found.remove("--client-cert"),
+            found.remove("--client-key"),
+            found.remove("--ca"),
+        ],
+    )?;
+    if state_dir.is_some() && frontend.is_none() {
+        return Err("--state-dir needs --frontend: the certificate is renewed there".to_owned());
     }
     let api = found.remove("--operator-api");
     let token = found.remove("--token-file");
@@ -207,9 +251,36 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
         files,
         channel,
         helper_socket,
+        frontend,
+        state_dir,
         node_api,
         timing,
     })
+}
+
+/// The files of this host's TLS: those of `state_dir` (`kbf-updater enroll` made them), or the
+/// three an operator placed, and never a mixture.
+fn tls_files(state_dir: Option<&Path>, placed: [Option<String>; 3]) -> Result<TlsFiles, String> {
+    match (state_dir, placed) {
+        (Some(dir), [None, None, None]) => {
+            let store = Store::unopened(dir);
+            Ok(TlsFiles {
+                cert: store.cert_path(Role::Updater),
+                key: store.key_path(Role::Updater),
+                ca: store.ca_path(),
+            })
+        }
+        (None, [Some(cert), Some(key), Some(ca)]) => Ok(TlsFiles {
+            cert: PathBuf::from(cert),
+            key: PathBuf::from(key),
+            ca: PathBuf::from(ca),
+        }),
+        _ => Err(
+            "give --state-dir, or all of --client-cert, --client-key and --ca (and not \
+                  both)"
+                .to_owned(),
+        ),
+    }
 }
 
 /// The grammar of a channel name, as the helper checks it (`[a-z0-9][a-z0-9-]{0,31}`).

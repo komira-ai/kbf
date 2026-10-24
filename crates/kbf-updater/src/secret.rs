@@ -61,12 +61,16 @@ pub(crate) fn read_secret(path: &Path, flag: &str, limit: u64) -> Result<Vec<u8>
     let fail = |why: &str| format!("{flag}: {why}");
     let io = |e: std::io::Error| fail(&e.kind().to_string());
     let (file, meta) = open_checked(path).map_err(io)?;
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let me = unsafe { libc::geteuid() };
-    file_rule(meta.is_file(), meta.uid(), meta.mode(), me).map_err(fail)?;
+    file_rule(meta.is_file(), meta.uid(), meta.mode(), euid()).map_err(fail)?;
     let mut bytes = Vec::new();
     file.take(limit + 1).read_to_end(&mut bytes).map_err(io)?;
     Ok(bytes)
+}
+
+/// The effective user of this process.
+pub fn euid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
 }
 
 /// Open without following a symlink and without blocking on a FIFO; the metadata is of the

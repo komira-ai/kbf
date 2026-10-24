@@ -2401,6 +2401,7 @@ dependencies = [
  "kbf-tls",
  "kbf-types",
  "kbf-ui",
+ "kbf-updater",
  "libc",
  "percent-encoding",
  "postgres",
@@ -2671,8 +2672,10 @@ dependencies = [
  "base64 0.23.1",
  "httparse",
  "kbf-ca",
+ "kbf-enroll",
  "kbf-host-install",
  "kbf-peer",
+ "kbf-proto",
  "kbf-testkit",
  "kbf-types",
  "libc",
@@ -2681,6 +2684,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

@@ -107,7 +107,7 @@ Podman is neither required nor installed, and the package's smoke test fails if 
 
 ### 3.5 Updates are not enrollment's business
 
-Updates are triggered externally through the frontend's control API and carried out by `kbf-installer` ([kbf-installer.md](kbf-installer.md) section 6; [distribution.md](distribution.md) section 1). The UI is read-only and has no update button. The boundary between what a package upgrade changes and what a release update changes is distribution.md section 3 (rules 1 to 9); this document adds none. The node reports `NodeFacts.package_version`, the version of the `kbf-installer` package, so that the read-only UI can show a package that is older than the frontend's.
+Updates are triggered externally through the frontend's control API and carried out by `kbf-installer`, or, on a host that runs an updater, by that updater, which enrolls like a node but for its own role (section 6.3, [updates.md](updates.md)) ([kbf-installer.md](kbf-installer.md) section 6; [distribution.md](distribution.md) section 1). The UI is read-only and has no update button. The boundary between what a package upgrade changes and what a release update changes is distribution.md section 3 (rules 1 to 9); this document adds none. The node reports `NodeFacts.package_version`, the version of the `kbf-installer` package, so that the read-only UI can show a package that is older than the frontend's.
 
 ### 3.6 Envoy
 
@@ -502,6 +502,7 @@ A new library crate with no network and no state-store code: key and certificate
 | `storage-<node>` (storage, both EKUs) | token role `storage`, `RoleCsr.role = "storage"` | DNS: node id and advertise host |
 | `daemon-<node>`, `daemon-<mac>` (daemon, clientAuth) | token role `daemon` | the Mac id is `node.id`; use a `node_id`-bound one-use token |
 | (a node that is both) | two certificates, **two keys**, from one request | one key per role, so a leak or a deny of one key does not silently imply the other; the registry row holds both |
+| a host's updater ([updates.md](updates.md) section 5) | token role `updater`, alone, with the token's `host_role` and `node_id` and one use; `RoleCsr.role = "updater"` | one certificate (clientAuth), DNS: the node id; the host role as a second URI `urn:kbf:host-role:<name>`; renewed as a node is, from its own registry row |
 | "client" in the owner's list | **not a role** | buck2 and CI present no certificate; the REAPI listener stays server TLS with a certificate for the farm's public name; client API tokens are later and enter through `kbf-auth` (`tlsClientCertificate`, `jwt` are the named "not built yet" variants **[F]**) |
 | the REAPI certificate (a pair issued outside kbf today) | **not issued by this CA**, as now **[F]** | supplied as files; `kbf-tls` reloads on renewal. In-process ACME is out of scope |
 
@@ -558,6 +559,7 @@ Unchanged by this work, stated so the boundary is not ambiguous: worker and stor
 |---|---|---|
 | `enroll/token/<id>` | token row (5.1) | none (kept after use for audit; a purge command removes rows expired more than 90 days) |
 | `enroll/node/<id>` | registry row (5.7) | none |
+| `enroll/updater/<id>` | registry row (5.7) of a host's updater, in a family of its own so that it and the node of the same id neither supersede nor deny each other | none |
 | `enroll/serial/<hex>` | `{node_id, role, not_after}` | none |
 | `enroll/key/<spki-sha256>` | `{node_id, role}` | none |
 | `enroll/req/<token_id>/<csr sha256>` | `{node_id}` | `expires_at` of the token plus 1 day |

@@ -79,6 +79,8 @@ mod node_health_tests;
 #[cfg(test)]
 mod pool_http_tests;
 #[cfg(test)]
+mod reply_tests;
+#[cfg(test)]
 mod safe_http_tests;
 #[cfg(test)]
 mod server_tests;
@@ -108,7 +110,7 @@ pub fn version_line() -> String {
 
 /// The binary, as a function so that it is tested: the argument list in, the exit code and the
 /// text out. `--version` prints the version; `agent` and the flags of [`agent::flags`] start
-/// the agent mode ([`run_agent_with`]); the flags of [`daemon`] start the updater,
+/// the agent mode ([`run_agent_with`]), `enroll` enrolls the host ([`run_enroll_with`]); the flags of [`daemon`] start the updater,
 /// call `ready` with a handle that stops it, and return when it is stopped. Anything else is
 /// a usage error (exit 2); a start that fails is exit 1 with the reason.
 pub fn run_with(args: &[String], ready: impl FnOnce(daemon::Stopper)) -> (u8, String) {
@@ -135,11 +137,23 @@ pub fn run_agent_with(args: &[String], ready: impl FnOnce(agent::Stop)) -> (u8, 
     }
 }
 
-/// [`run_with`] or [`run_agent_with`], for the binary: nothing to do once started.
+/// `kbf-updater enroll ...` ([`agent::enroll`]): the host gets its updater certificate with a
+/// one-time token. The user is the process's, the time the clock's.
+pub fn run_enroll_with(args: &[String]) -> (u8, String) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        });
+    agent::enroll::run_enroll(args.get(2..).unwrap_or_default(), secret::euid(), now)
+}
+
+/// [`run_with`], [`run_agent_with`] or [`run_enroll_with`], for the binary: nothing to do once
+/// started.
 pub fn run(args: &[String]) -> (u8, String) {
-    if args.get(1).map(String::as_str) == Some("agent") {
-        run_agent_with(args, |_| {})
-    } else {
-        run_with(args, |_| {})
+    match args.get(1).map(String::as_str) {
+        Some("agent") => run_agent_with(args, |_| {}),
+        Some("enroll") => run_enroll_with(args),
+        _ => run_with(args, |_| {}),
     }
 }

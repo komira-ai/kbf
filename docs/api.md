@@ -679,10 +679,10 @@ call changes nothing. Every answer carries `Cache-Control: no-store`.
 | `GET /v1/enroll/nodes` | lists the nodes | `{"nodes": [...]}` |
 | `POST /v1/enroll/nodes/{id}/revoke` | revokes a node | `{"id": "...", "denied": [...]}` |
 
-**Create.** The body is `{"roles": ["daemon"], "max_uses": 1, "expires_in": 86400,
-"node_id": "n1", "node_prefix": "rack-", "names": [".example"], "replace": false,
-"label": "rack 4"}`; only `roles` is required (`storage` and `daemon`, one to two, no
-repeat). `max_uses` is 1 to 1000 (default 1); `expires_in` is seconds, at least 1 and at
+**Create.** The body is `{"roles": ["daemon"], "host_role": null, "max_uses": 1,
+"expires_in": 86400, "node_id": "n1", "node_prefix": "rack-", "names": [".example"],
+"replace": false, "label": "rack 4"}`; only `roles` is required (`storage` and `daemon`, one to
+two, no repeat; or `updater` alone, below). `max_uses` is 1 to 1000 (default 1); `expires_in` is seconds, at least 1 and at
 most 30 days (default a day); `node_id` and `node_prefix` restrict the node ids the token
 enrolls; `names` restricts the hosts a storage node may advertise (a host, or a suffix that
 starts with `.`; empty allows any); `replace` lets it re-enroll an id that exists. An
@@ -699,7 +699,14 @@ returns the hash, the secret or the string. Lose it and revoke the token. A toke
 string cannot be built (the frontend has no CA pin, `503`; the random source fails, `500`)
 is not stored.
 
-`info` and each element of `tokens` are `{id, roles, max_uses, uses, expires_at,
+**A host's updater** ([deploy/kbf-updater.md](deploy/kbf-updater.md#enrolling-a-host)) enrolls with
+a token whose `roles` is `["updater"]` and nothing else, with `host_role` (`frontend`, `storage`,
+`daemon` or `mac-daemon`: what its certificate says the host runs), the one `node_id` it is for
+(no `node_prefix`) and one use; each of those is a `400` if wrong, and `host_role` is a `400` on a
+token that does not grant `updater`. Its certificate has the role `updater`; the updater has a
+registry row of its own, beside any node of the same id, and the node listing does not show it.
+
+`info` and each element of `tokens` are `{id, roles, host_role, max_uses, uses, expires_at,
 created_at, revoked_at, node_id, node_prefix, names, replace, label, created_by}`; times
 are seconds on the state store's clock. **Revoke** stops new enrollments with the token;
 nodes it enrolled stay enrolled, and revoking a revoked token is a `200`. `404` for an

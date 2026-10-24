@@ -392,9 +392,13 @@ fn each_rows_certificate_names_its_role_as_storage_reads_it() {
         assert_eq!(role.name(), row.role(), "{row:?}");
         roles.push(role);
     }
-    // Every role storage knows is some row's.
+    // Every role storage knows is some row's, a host's updater excepted: it is enrolled with a
+    // token (`kbf-updater enroll`), not deployed by a unit of this table.
     for role in PeerRole::ALL {
-        assert!(roles.contains(&role), "{role:?} is no row's");
+        assert!(
+            roles.contains(&role) || role == PeerRole::Updater,
+            "{role:?} is no row's"
+        );
     }
 }
 

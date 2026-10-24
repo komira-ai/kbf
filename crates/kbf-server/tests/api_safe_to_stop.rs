@@ -347,6 +347,7 @@ fn issued_role(role: Role, seed: u8, i: usize, now: u64) -> IssuedRole {
 fn enroll(store: &dyn Store, n: u8, name: &str, roles: &[Role], advertise: &str) {
     let spec = TokenSpec {
         roles: RoleSet::new(roles.iter().copied()).expect("roles"),
+        host_role: None,
         max_uses: 1,
         ttl: None,
         node_id: None,
