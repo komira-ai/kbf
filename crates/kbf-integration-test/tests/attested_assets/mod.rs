@@ -63,6 +63,13 @@ pub fn packaged_kbf_debs(workflow: &str) -> Result<Vec<String>, String> {
     deb_platforms(workflow, "pkg-kbf-asset")
 }
 
+/// The platform of every `cargo xtask pkg-image-asset` line in the workflow's `run:` steps that
+/// makes the frontend image an asset (it has no `--verify-only`), in file order. An error names a
+/// line without `--platform`.
+pub fn packaged_frontend_images(workflow: &str) -> Result<Vec<String>, String> {
+    deb_platforms(workflow, "pkg-image-asset")
+}
+
 /// The platform of every `cargo xtask <verb>` line of the `run:` steps without
 /// `--verify-only`, in file order.
 fn deb_platforms(workflow: &str, verb: &str) -> Result<Vec<String>, String> {
