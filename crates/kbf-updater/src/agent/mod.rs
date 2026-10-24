@@ -8,6 +8,7 @@
 //! - [`local`]: `kbf-host-install`'s local socket, which does the root work;
 //! - [`enroll`] and [`renew`]: the host's certificate, made once with a token and renewed by the
 //!   agent at half its life;
+//! - [`frontend`]: a frontend host's drain at the kbf-proxy pool, and its health;
 //! - [`status`]: what the heartbeat says;
 //! - [`update`]: one host's A/B, step by step;
 //! - [`run`]: the two threads, and the wiring of the real ports ([`build`]).
@@ -15,6 +16,7 @@
 pub mod coordinator;
 pub mod enroll;
 pub mod flags;
+pub mod frontend;
 pub mod local;
 pub mod renew;
 pub mod run;
@@ -24,7 +26,8 @@ pub mod update;
 mod build;
 
 pub use build::{
-    NO_CREDENTIAL, NoCredential, STORAGE_NEEDS_TOKEN, no_drain, run_agent, run_config,
+    FRONTEND_NEEDS_POOL, NO_CREDENTIAL, NoCredential, POOL_IS_FRONTENDS, STORAGE_NEEDS_TOKEN,
+    no_drain, run_agent, run_config,
 };
 pub use run::{Agent, Stop, World};
 
@@ -38,6 +41,8 @@ mod enroll_tests;
 mod entry_tests;
 #[cfg(test)]
 mod flags_tests;
+#[cfg(test)]
+mod frontend_node_tests;
 #[cfg(test)]
 mod frontend_tests;
 #[cfg(test)]

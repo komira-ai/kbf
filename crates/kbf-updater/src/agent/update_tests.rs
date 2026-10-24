@@ -185,14 +185,15 @@ fn an_unattested_or_wrong_commit_build_is_refused_before_the_drain() {
     assert_eq!(rig.events.count("drain"), 0);
 }
 
-/// A health check that is told not to touch a host (a role this build does not update) stops the
-/// update before the helper is asked anything; so does a helper that does not answer.
+/// A health check that is told not to touch a host stops the update after the helper is asked what
+/// runs and before anything is fetched, drained or switched; a helper that does not answer stops
+/// it sooner.
 #[test]
 fn a_refusal_of_the_health_check_or_a_silent_helper_stops_it_at_once() {
     let rig = Rig::new();
     *rig.health.refuses.lock().unwrap() = Some("not a pool member".to_owned());
     assert_eq!(rig.run(VB), failed(VB));
-    assert!(rig.events.all().is_empty());
+    assert_eq!(rig.events.all(), ["local:query"]);
     assert!(rig.logged("not a pool member"));
 
     let rig = Rig::new();

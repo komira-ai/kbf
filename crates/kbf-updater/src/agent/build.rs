@@ -11,15 +11,18 @@ use rustls::pki_types::pem::PemObject;
 use super::coordinator::{HttpsCoordinator, TlsFiles};
 use super::enroll::frontend_url;
 use super::flags::Config;
+use super::frontend::FrontendNode;
 use super::local::{Limits, LocalInstaller, SocketLocal};
 use super::renew::{FrontendRenewer, Renewer};
 use super::run::{Agent, Stop, World};
 use super::status::{Status, host_platform};
+use crate::frontend_http::HttpFrontend;
 use crate::identity::{Identity, identity_of};
 use crate::inventory::{Host, Role};
 use crate::node_drain::NodeDrain;
 use crate::node_health::NodeHealth;
 use crate::operator::OperatorApi;
+use crate::pool_http::HttpPool;
 use crate::ports::{Drain, Health, HealthCheck, PortError, SystemClock};
 use crate::version::Version;
 
@@ -89,10 +92,20 @@ impl Drain for NoCredential {
     }
 }
 
+/// Why the agent of a frontend host started without the pool refuses to start.
+pub const FRONTEND_NEEDS_POOL: &str = "this certificate is a frontend's: its agent drains the \
+     frontend at the kbf-proxy, so give --proxy-admin and --pool-member";
+
+/// Why the agent of any other host given the pool refuses to start.
+pub const POOL_IS_FRONTENDS: &str =
+    "--proxy-admin and --pool-member are for the agent of a frontend host";
+
 /// The drain and the health of a host.
 type NodePorts = (Arc<dyn Drain>, Arc<dyn HealthCheck>);
 
-/// The drain and the health of the host `identity` names, by the way the agent was given to the
+/// The drain and the health of the host `identity` names. A frontend host's are the pool's
+/// ([`FrontendNode`]): the member is drained at the proxy's admin API and judged by it and by
+/// its own `healthz`, with no credential. For the others, by the way the agent was given to the
 /// frontend:
 ///
 /// - the operator token (`--operator-api`, `--token-file`), the opt-in fallback, if it was given;
@@ -108,6 +121,19 @@ pub(super) fn node_ports(
     local: &Arc<SocketLocal>,
 ) -> Result<NodePorts, String> {
     let installer = || Arc::new(LocalInstaller(local.clone()));
+    match (role, &cfg.pool) {
+        (Role::Frontend, Some(pool)) => {
+            let control = HttpFrontend::with_api(OperatorApi::anonymous(pool.admin));
+            let node = Arc::new(FrontendNode::new(
+                Arc::new(HttpPool::new(pool.admin)),
+                Arc::new(control),
+            ));
+            return Ok((node.clone(), node));
+        }
+        (Role::Frontend, None) => return Err(FRONTEND_NEEDS_POOL.to_owned()),
+        (_, Some(_)) => return Err(POOL_IS_FRONTENDS.to_owned()),
+        (_, None) => {}
+    }
     if let Some(api) = &cfg.node_api {
         let api = OperatorApi::new(
             api.addr,
@@ -191,20 +217,14 @@ pub(super) fn unix_now() -> u64 {
 /// The agent of this host, with the real ports.
 ///
 /// # Errors
-/// Why not: no releases for this platform, a certificate that is no updater's or is a
-/// frontend's (a frontend is updated by the roll, not yet by the agent), files that do not make
-/// a TLS configuration, or an operator API client whose token files are not usable.
+/// Why not: no releases for this platform, a certificate that is no updater's, a frontend's
+/// certificate without `--proxy-admin` and `--pool-member` (or another's with them), files that
+/// do not make a TLS configuration, or an operator API client whose token files are not usable.
 pub fn build(cfg: &Config) -> Result<Agent, String> {
     let platform = host_platform().ok_or("kbf has no release for this platform")?;
     let identity = identity_of_files(&cfg.files)?;
     let role = match identity.role {
-        HostRole::Frontend => {
-            return Err(
-                "this certificate is a frontend's: a frontend is updated by the roll, \
-                        not by the agent"
-                    .to_owned(),
-            );
-        }
+        HostRole::Frontend => Role::Frontend,
         HostRole::Storage => Role::Storage,
         HostRole::Daemon => Role::Daemon,
         HostRole::MacDaemon => Role::MacDaemon,
@@ -217,7 +237,7 @@ pub fn build(cfg: &Config) -> Result<Agent, String> {
         role,
         host_key: String::new(),
         node_id: Some(node_id),
-        member: None,
+        member: cfg.pool.as_ref().map(|pool| pool.member.clone()),
     };
     let local = Arc::new(SocketLocal::new(&cfg.helper_socket, Limits::default()));
     let (drain, health) = node_ports(cfg, &identity, host.role, &local)?;

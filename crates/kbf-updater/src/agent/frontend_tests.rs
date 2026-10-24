@@ -74,6 +74,7 @@ impl Rig {
             frontend: addr.map(|a| Endpoint::parse(&format!("localhost:{}", a.port())).unwrap()),
             state_dir: None,
             node_api: None,
+            pool: None,
             timing: Timing::DEFAULT,
         }
     }

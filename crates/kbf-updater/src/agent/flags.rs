@@ -6,7 +6,9 @@
 //!                   (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
 //!                   [--frontend <dns name>:<port>]
 //!                   [--operator-api http://IP:PORT --token-file FILE
-//!                   [--operator-proxy-auth-file FILE]] [--helper-socket PATH]
+//!                   [--operator-proxy-auth-file FILE]]
+//!                   [--proxy-admin http://IP:PORT --pool-member NAME:BASE]
+//!                   [--helper-socket PATH]
 //!                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
 //!                   [--health-poll-secs N] [--retry-secs N]
 //! ```
@@ -35,6 +37,13 @@
 //!   instead of the updater's certificate for those calls. Without either way (no `--frontend`
 //!   and no token) the agent heartbeats and refuses every update order, before it fetches
 //!   anything. The packaged units give no token.
+//! - `--proxy-admin`, `--pool-member`: for the agent of a **frontend** host, and only for it
+//!   (both, or neither). The kbf-proxy's admin API on loopback, and the member of its pool this
+//!   host runs, as `NAME:BASE` (the `instance` and the first port of the member's
+//!   `[[proxy.frontend]]` entry). The agent drains the member there, never when no other member
+//!   is up and ready, checks the member's own `healthz` on loopback (the operator port is
+//!   `BASE` plus 2) and puts it back. One member per host: a host that runs several is updated
+//!   by the roll. A frontend's certificate without them is refused when the agent starts.
 //! - Times, in seconds: `--heartbeat-secs` (default 15), `--drain-deadline-secs` (600, how long
 //!   the node's leases are waited for), `--health-timeout-secs` (300, how long the release on
 //!   trial has to show healthy), `--health-poll-secs` (5) and `--retry-secs` (900, how long a
@@ -49,15 +58,16 @@ use kbf_enroll::store::Store;
 use kbf_types::Role;
 
 use super::coordinator::{Endpoint, TlsFiles};
-use crate::daemon::parse_operator_url;
+use crate::daemon::{parse_loopback_url, parse_operator_url};
+use crate::inventory::Member;
 
 pub const USAGE: &str = "usage: kbf-updater agent --coordinator DNSNAME:PORT --channel NAME \
 (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE) [--frontend DNSNAME:PORT] \
 [--operator-api http://IP:PORT --token-file FILE [--operator-proxy-auth-file FILE]] \
-[--helper-socket PATH] [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N] \
+[--proxy-admin http://IP:PORT --pool-member NAME:BASE] [--helper-socket PATH] [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N] \
 [--health-poll-secs N] [--retry-secs N]\n";
 
-const FLAGS: [&str; 16] = [
+const FLAGS: [&str; 18] = [
     "--coordinator",
     "--state-dir",
     "--frontend",
@@ -68,6 +78,8 @@ const FLAGS: [&str; 16] = [
     "--operator-api",
     "--token-file",
     "--operator-proxy-auth-file",
+    "--proxy-admin",
+    "--pool-member",
     "--helper-socket",
     "--heartbeat-secs",
     "--drain-deadline-secs",
@@ -125,7 +137,18 @@ pub struct Config {
     /// The frontend's operator API for the drain and the health, if the operator gave the agent
     /// the credential for it.
     pub node_api: Option<NodeApi>,
+    /// The pool of kbf-proxy and the member this host runs, for the agent of a frontend host.
+    pub pool: Option<PoolConfig>,
     pub timing: Timing,
+}
+
+/// The kbf-proxy pool a frontend host's member is in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolConfig {
+    /// The proxy's admin API, on loopback.
+    pub admin: SocketAddr,
+    /// The member this host runs.
+    pub member: Member,
 }
 
 /// The frontend's loopback operator API and the credential for it.
@@ -231,6 +254,7 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
             );
         }
     };
+    let pool = pool_config(found.remove("--proxy-admin"), found.remove("--pool-member"))?;
     let helper_socket = found
         .remove("--helper-socket")
         .map_or_else(|| PathBuf::from(DEFAULT_HELPER_SOCKET), PathBuf::from);
@@ -254,8 +278,31 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
         frontend,
         state_dir,
         node_api,
+        pool,
         timing,
     })
+}
+
+/// `--proxy-admin` and `--pool-member`, which come together or not at all.
+fn pool_config(
+    admin: Option<String>,
+    member: Option<String>,
+) -> Result<Option<PoolConfig>, String> {
+    let (admin, member) = match (admin, member) {
+        (None, None) => return Ok(None),
+        (Some(admin), Some(member)) => (admin, member),
+        _ => {
+            return Err(
+                "--proxy-admin and --pool-member are given together, or not at all".to_owned(),
+            );
+        }
+    };
+    let admin = parse_loopback_url("--proxy-admin", &admin)?;
+    let (instance, base) = member
+        .split_once(':')
+        .ok_or("--pool-member must be NAME:BASE, as the member's instance and base port")?;
+    let member = Member::parse(instance, base).map_err(|why| format!("--pool-member: {why}"))?;
+    Ok(Some(PoolConfig { admin, member }))
 }
 
 /// The files of this host's TLS: those of `state_dir` (`kbf-updater enroll` made them), or the

@@ -127,6 +127,30 @@ pub struct Member {
 }
 
 impl Member {
+    /// The member named `instance` with its first port `base`, as the text of an inventory line
+    /// or a flag gives them.
+    ///
+    /// # Errors
+    /// The name is none the host takes for a unit instance, or the base is no port from which
+    /// the member's ports fit.
+    pub fn parse(instance: &str, base: &str) -> Result<Member, String> {
+        if !frontend_name_ok(instance) {
+            return Err(format!(
+                "instance {instance:?} must be - or 1..=32 of a-z, 0-9 and -, from a letter"
+            ));
+        }
+        let in_range = |port: &u16| (MIN_BASE..=MAX_BASE).contains(port);
+        let Some(base_port) = base.parse().ok().filter(in_range) else {
+            return Err(format!(
+                "base {base:?} must be a port from {MIN_BASE} to {MAX_BASE}"
+            ));
+        };
+        Ok(Member {
+            instance: instance.to_owned(),
+            base_port,
+        })
+    }
+
     /// The port of the member's operator API, on loopback.
     pub fn operator_port(&self) -> u16 {
         self.base_port + OPERATOR_OFFSET
@@ -355,23 +379,7 @@ fn parse_member(role: Role, fields: &[&str]) -> Result<Option<Member>, String> {
         (false, _, _) => Err("instance= and base= belong to a frontend line".to_owned()),
         (true, Some(_), None) => Err("instance= needs base=".to_owned()),
         (true, None, Some(_)) => Err("base= needs instance=".to_owned()),
-        (true, Some(instance), Some(base)) => {
-            if !frontend_name_ok(instance) {
-                return Err(format!(
-                    "instance {instance:?} must be - or 1..=32 of a-z, 0-9 and -, from a letter"
-                ));
-            }
-            let in_range = |port: &u16| (MIN_BASE..=MAX_BASE).contains(port);
-            let Some(base_port) = base.parse().ok().filter(in_range) else {
-                return Err(format!(
-                    "base {base:?} must be a port from {MIN_BASE} to {MAX_BASE}"
-                ));
-            };
-            Ok(Some(Member {
-                instance: instance.to_owned(),
-                base_port,
-            }))
-        }
+        (true, Some(instance), Some(base)) => Member::parse(instance, base).map(Some),
     }
 }
 

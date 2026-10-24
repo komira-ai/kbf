@@ -132,7 +132,9 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
                   (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
                   [--frontend <dns name>:<port>]
                   [--operator-api http://IP:PORT --token-file FILE
-                  [--operator-proxy-auth-file FILE]] [--helper-socket PATH]
+                  [--operator-proxy-auth-file FILE]]
+                  [--proxy-admin http://IP:PORT --pool-member NAME:BASE]
+                  [--helper-socket PATH]
                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
                   [--health-poll-secs N] [--retry-secs N]
 ```
@@ -144,7 +146,7 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
   the certificate and the CA are its files. The agent renews the certificate at half its life
   and writes the new one there; `--frontend` is where. The certificate is the farm CA's `updater`
   certificate: its one DNS name is this node's id and its `urn:kbf:host-role:` is what the host
-  runs (`storage`, `daemon` or `mac-daemon`; a `frontend` is refused, the roll updates frontends).
+  runs (`storage`, `daemon`, `mac-daemon` or `frontend`).
   The agent reads both from it. The files are read for every heartbeat and every call to the
   frontend, so a renewed pair is used from the next one, if it names the same node and role as the
   pair the agent started with (a pair for another node is refused until the agent is restarted).
@@ -162,8 +164,43 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
 - `--operator-api`, `--token-file`, `--operator-proxy-auth-file`: optional, together: the full
   operator token over the frontend's loopback, an opt-in fallback used instead of the
   certificate; see the boundary below.
+- `--proxy-admin`, `--pool-member`: together, and for the agent of a **frontend** host only (see
+  [a frontend host](#a-frontend-host)).
 - Times, in seconds, 1 to 86400: `--heartbeat-secs` 15, `--drain-deadline-secs` 600,
   `--health-timeout-secs` 300, `--health-poll-secs` 5, `--retry-secs` 900.
+
+### A frontend host
+
+The agent runs on every host, a frontend's included; it only dials out and listens on nothing.
+kbf-proxy stays in front of the frontends only, and carries the traffic between the old and the
+new frontend. On a frontend host the agent takes the host's member out of the proxy's pool, swaps,
+checks the member and puts it back, with the same steps as for any host, but over the pool:
+
+- `--proxy-admin http://<loopback ip>:<port>`: the proxy's admin API, as in the roll mode. It
+  asks for no credential.
+- `--pool-member <instance>:<base>`: the member this host runs, as the `instance` and `base` of its
+  inventory line. Its operator API, for `healthz`, is on loopback at `base` plus 2.
+
+A frontend's certificate without the two flags, or any other host's with them, is refused when
+the agent starts. One member per host: a host that runs several is updated by the roll.
+
+1. **Drain**: the member is drained at the proxy (`:drain` of the admin API), and the swap waits
+   for the streams open on it, for at most `--drain-deadline-secs`.
+2. **Switch**: the helper swaps and restarts its configured units (`kbf-host-install --serve
+   --restart-unit kbf-frontend@<instance>.service`, one for the member), with the pending marker and the
+   revert as for any host.
+3. **Health** (held drained): the proxy lists the member ready, and its `healthz` names the
+   target's commit.
+4. **Undrain** only if the member is healthy (on the new release after the confirm, or on the old
+   one after a revert), and the proxy must then list it taking streams.
+
+The agent never drains a member when no other member is up and ready, and says so
+(`this frontend is the only member of the kbf-proxy pool that is up and ready ...`) before it
+fetches anything. The coordinator does not order the last frontend that is up either, and orders
+frontends only after storage and daemons. A farm with a single frontend therefore never updates it
+through the agent: the operator adds a second frontend to the pool, or updates that host by hand
+in a window in which the farm may be down. An update the helper has on trial when the agent
+restarts is finished without that check: the member was drained while another served.
 
 ### The heartbeat
 

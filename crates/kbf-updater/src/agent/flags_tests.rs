@@ -4,7 +4,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::flags::{DEFAULT_HELPER_SOCKET, NodeApi, Timing, parse_flags};
+use super::flags::{DEFAULT_HELPER_SOCKET, NodeApi, PoolConfig, Timing, parse_flags};
+use crate::inventory::Member;
 
 fn args(words: &[&str]) -> Vec<String> {
     words.iter().map(|w| (*w).to_owned()).collect()
@@ -247,4 +248,60 @@ fn the_state_directory_goes_with_the_frontend_and_not_with_placed_files() {
     assert!(err.starts_with("give --state-dir, or all of"), "{err}");
     let placed = parse_flags(&with(&["--frontend", "f.example:443"])).unwrap();
     assert_eq!((placed.state_dir, placed.frontend.is_some()), (None, true));
+}
+
+/// `--proxy-admin` and `--pool-member` make the pool of a frontend host's agent; without them
+/// there is none.
+#[test]
+fn the_pool_of_a_frontend_host_is_read_from_its_two_flags() {
+    assert_eq!(parse_flags(&args(&REQUIRED)).unwrap().pool, None);
+    let config = parse_flags(&with(&[
+        "--proxy-admin",
+        "http://127.0.0.1:9090",
+        "--pool-member=fe1:18000",
+    ]))
+    .unwrap();
+    assert_eq!(
+        config.pool,
+        Some(PoolConfig {
+            admin: "127.0.0.1:9090".parse().unwrap(),
+            member: Member {
+                instance: "fe1".to_owned(),
+                base_port: 18000,
+            },
+        })
+    );
+}
+
+/// One of the two flags alone, an admin address that is not loopback, a member that is no
+/// `NAME:BASE`, a name the host would not take for a unit and a base that is no port are refused
+/// with the flag in the message.
+#[test]
+fn the_pool_flags_come_together_and_are_checked() {
+    let admin = ["--proxy-admin", "http://127.0.0.1:9090"];
+    let member = ["--pool-member", "fe1:18000"];
+    for half in [&admin[..], &member[..]] {
+        let err = parse_flags(&with(half)).unwrap_err();
+        assert!(err.contains("given together"), "{half:?}: {err}");
+    }
+    let cases = [
+        ("http://203.0.113.5:9090", "fe1:18000", "--proxy-admin"),
+        (
+            "http://127.0.0.1:9090",
+            "fe1",
+            "--pool-member must be NAME:BASE",
+        ),
+        (
+            "http://127.0.0.1:9090",
+            "Fe1:18000",
+            "--pool-member: instance",
+        ),
+        ("http://127.0.0.1:9090", "fe1:80", "--pool-member: base"),
+        ("http://127.0.0.1:9090", "fe1:x", "--pool-member: base"),
+    ];
+    for (admin, member, expect) in cases {
+        let err =
+            parse_flags(&with(&["--proxy-admin", admin, "--pool-member", member])).unwrap_err();
+        assert!(err.contains(expect), "{member}: {err}");
+    }
 }

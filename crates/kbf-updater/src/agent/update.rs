@@ -3,6 +3,9 @@
 //!
 //! In this order, and each step only if the one before it worked:
 //!
+//! 0. **Refusal**: a host the health check says must not be updated now (a frontend that is the
+//!    only member of the pool that is up) fails the update here, once the host is found to be
+//!    neither on trial nor at the target already, and before anything is fetched.
 //! 1. **Fetch and verify** B on the host: the helper fetches the release the version names
 //!    from the channel it is configured for, checks the attestation on the host (signer
 //!    `komira-ai/kbf` `artifacts.yml`, hosted runners, the full commit, the channel's branch)
@@ -10,7 +13,8 @@
 //!    before the node is touched. The updater never takes a URL or a path from the
 //!    coordinator's reply: the version is the only input, and it is looked up by the helper.
 //! 2. **Drain** the node at the frontend and wait for its leases (`NodeDrain`: cordon, drain,
-//!    uncordon over the operator API; a cordon is durable).
+//!    uncordon over the operator API; a cordon is durable). A frontend host drains its pool
+//!    member at the proxy and waits for its streams (`FrontendNode`).
 //! 3. **Switch**: the helper puts B in place on trial, with a pending marker and a deadline on
 //!    its disk, and restarts the service on it.
 //! 4. **Health**: the node's health check (`node_health`) until B shows healthy, for no longer
@@ -84,9 +88,6 @@ impl Update<'_> {
             self.log(&format!("update to {target}: {why}"));
             result(target, Outcome::Failed)
         };
-        if let Some(why) = self.ports.health.refusal(self.host) {
-            return failed(&why);
-        }
         let state = match self.ports.local.query() {
             Ok(state) => state,
             Err(e) => return failed(&e),
@@ -97,6 +98,10 @@ impl Update<'_> {
         }
         if state.version.as_ref() == Some(target) {
             return result(target, Outcome::Succeeded);
+        }
+        // Before anything is fetched or changed: why this host must not be updated now.
+        if let Some(why) = self.ports.health.refusal(self.host) {
+            return failed(&why);
         }
         // 1. Fetch and verify. Nothing of the node has changed if this fails.
         let staged = match self.ports.local.install(target, self.channel) {

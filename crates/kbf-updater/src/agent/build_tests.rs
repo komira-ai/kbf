@@ -10,16 +10,16 @@ use kbf_testkit::dir::TestDir;
 use kbf_types::HostRole;
 
 use super::build::{
-    NO_CREDENTIAL, NoCredential, NoDrain, build, drain_for, identity_of_files, no_drain, run_agent,
-    run_config, unix_now,
+    FRONTEND_NEEDS_POOL, NO_CREDENTIAL, NoCredential, NoDrain, POOL_IS_FRONTENDS, build, drain_for,
+    identity_of_files, no_drain, run_agent, run_config, unix_now,
 };
 use super::coordinator::{Endpoint, TlsFiles};
-use super::flags::{Config, NodeApi, Timing};
+use super::flags::{Config, NodeApi, PoolConfig, Timing};
 use super::pki::{Pki, write_files};
 use super::run::Stop;
 use super::status::host_platform;
 use super::testing::host;
-use crate::inventory::Role;
+use crate::inventory::{Member, Role};
 use crate::operator::OperatorApi;
 use crate::ports::{Drain, HealthCheck};
 use crate::version::Version;
@@ -51,6 +51,7 @@ impl Rig {
                 token_file: token,
                 proxy_auth_file: None,
             }),
+            pool: None,
             timing: Timing {
                 heartbeat: Duration::from_millis(20),
                 ..Timing::DEFAULT
@@ -114,25 +115,30 @@ fn the_identity_comes_from_the_certificate() {
     );
 }
 
-/// An agent is built for a storage, daemon or Mac host; a frontend's certificate is refused (the
-/// roll updates frontends), and so are files that make no TLS configuration and an operator token
-/// file the API client does not accept.
+/// An agent is built for a storage, daemon, Mac or frontend host (the frontend's with its pool),
+/// and so are not files that make no TLS configuration or an operator token file the API client
+/// does not accept.
 #[test]
-fn an_agent_is_built_for_every_host_but_a_frontend() {
+fn an_agent_is_built_for_every_host_role() {
     assert!(
         host_platform().is_some(),
         "tests run where kbf has releases"
     );
-    for role in [HostRole::Storage, HostRole::Daemon, HostRole::MacDaemon] {
-        let rig = Rig::new("bd-built", role);
+    for role in [
+        HostRole::Storage,
+        HostRole::Daemon,
+        HostRole::MacDaemon,
+        HostRole::Frontend,
+    ] {
+        let mut rig = Rig::new("bd-built", role);
+        if role == HostRole::Frontend {
+            rig.config.pool = Some(pool());
+        }
         let agent = build(&rig.config).unwrap_or_else(|e| panic!("{role}: {e}"));
         let status = agent.status();
         assert_eq!(status.version, Version::parse("0").unwrap());
         assert_eq!(status.health, crate::wire::Health::Unhealthy);
     }
-    let rig = Rig::new("bd-frontend", HostRole::Frontend);
-    let err = build(&rig.config).err().unwrap();
-    assert!(err.contains("frontend"), "{err}");
 
     let mut rig = Rig::new("bd-nofiles", HostRole::Daemon);
     std::fs::write(&rig.config.files.ca, "").unwrap();
@@ -148,6 +154,28 @@ fn an_agent_is_built_for_every_host_but_a_frontend() {
     assert!(build(&rig2.config).err().unwrap().contains("--token-file"));
     rig.config.files.cert = rig.dir.join("absent.pem");
     assert!(build(&rig.config).is_err());
+}
+
+fn pool() -> PoolConfig {
+    PoolConfig {
+        admin: "127.0.0.1:1".parse().unwrap(),
+        member: Member {
+            instance: "fe1".to_owned(),
+            base_port: 18000,
+        },
+    }
+}
+
+/// A frontend's agent is given the pool its member is in, and an agent of any other host is
+/// given none: either way round is refused when the agent starts, with the reason.
+#[test]
+fn the_pool_flags_belong_to_a_frontend_hosts_agent() {
+    let rig = Rig::new("bd-fe-nopool", HostRole::Frontend);
+    assert_eq!(build(&rig.config).err().unwrap(), FRONTEND_NEEDS_POOL);
+
+    let mut rig = Rig::new("bd-daemon-pool", HostRole::Daemon);
+    rig.config.pool = Some(pool());
+    assert_eq!(build(&rig.config).err().unwrap(), POOL_IS_FRONTENDS);
 }
 
 /// A storage host's node is never drained (the roll never drains one, a daemon on it
@@ -304,6 +332,7 @@ fn an_agent_with_a_state_directory_renews_what_it_was_enrolled_with() {
         frontend: Some(Endpoint::parse("localhost:1").unwrap()),
         state_dir: Some(state.clone()),
         node_api: None,
+        pool: None,
         timing: Timing {
             heartbeat: Duration::from_millis(20),
             ..Timing::DEFAULT
