@@ -23,7 +23,7 @@
 //! The request has the headers of `kbf cluster`, including a JSON content type: the gated
 //! routes want one on every call, a `GET` too. A `POST` carries a JSON body or none.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -221,8 +221,14 @@ impl OperatorApi {
             Wire::Loopback(addr) => {
                 let request =
                     Self::request(&addr.to_string(), method, path, body, token, proxy_secret);
-                self.loopback(*addr, request.as_bytes())
-                    .map_err(|e| PortError::unreachable(format!("{what}: {}", e.kind())))
+                let sent = self.loopback(*addr, request.as_bytes());
+                sent.map_err(|e| {
+                    let text = format!("{what}: {}", e.kind());
+                    match e.kind() {
+                        ErrorKind::ConnectionRefused => PortError::refused(text),
+                        _ => PortError::unreachable(text),
+                    }
+                })
             }
             Wire::Proxy(proxy) => {
                 let host = format!("{}:{}", proxy.endpoint.host, proxy.endpoint.port);
