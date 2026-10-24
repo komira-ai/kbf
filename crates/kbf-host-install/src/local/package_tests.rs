@@ -38,51 +38,51 @@ use crate::trust::Trust;
 
 /// The release that runs when a test starts, installed by the package manager and never staged
 /// by this program.
-const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+pub(crate) const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 /// A third build.
-const C: &str = "cccccccccccccccccccccccccccccccccccccccc";
+pub(crate) const C: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
-fn build(commit: &str, seq: u32, run: u32) -> String {
+pub(crate) fn build(commit: &str, seq: u32, run: u32) -> String {
     format!("0.1.{seq}+g{}-{run}", &commit[..12])
 }
 
-fn a_version() -> String {
+pub(crate) fn a_version() -> String {
     build(A, 6, 2)
 }
 
-fn new_version() -> String {
+pub(crate) fn new_version() -> String {
     build(COMMIT, 7, 3)
 }
 
-fn c_version() -> String {
+pub(crate) fn c_version() -> String {
     build(C, 8, 4)
 }
 
-fn arch_name() -> String {
+pub(crate) fn arch_name() -> String {
     Arch::current().to_string()
 }
 
-fn stable() -> Channel {
+pub(crate) fn stable() -> Channel {
     Channel::new("stable").unwrap()
 }
 
-fn version(text: &str) -> Version {
+pub(crate) fn version(text: &str) -> Version {
     Version::new(text).unwrap()
 }
 
 /// The bytes of a package file: its name, version and architecture.
-fn bytes_of(name: &str, version: &str, arch: &str) -> Vec<u8> {
+pub(crate) fn bytes_of(name: &str, version: &str, arch: &str) -> Vec<u8> {
     format!("{name}|{version}|{arch}").into_bytes()
 }
 
-fn fields_of(bytes: &[u8]) -> (String, String, String) {
+pub(crate) fn fields_of(bytes: &[u8]) -> (String, String, String) {
     let text = String::from_utf8_lossy(bytes).into_owned();
     let mut each = text.split('|');
     let mut next = || each.next().unwrap_or("").to_owned();
     (next(), next(), next())
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub(crate) fn sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -90,7 +90,7 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 /// An rpm's Version and Release for the deb's one version text.
-fn rpm_pair(version: &str) -> String {
+pub(crate) fn rpm_pair(version: &str) -> String {
     let Some((base, rest)) = version.split_once("+g") else {
         return version.to_owned();
     };
@@ -98,12 +98,12 @@ fn rpm_pair(version: &str) -> String {
     format!("{base} {run}.g{sha}")
 }
 
-fn put(path: &Path, text: impl AsRef<str>) {
+pub(crate) fn put(path: &Path, text: impl AsRef<str>) {
     fs::write(path, text.as_ref()).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
 }
 
-fn exec(code: i32, stdout: &str, stderr: &str) -> io::Result<Exec> {
+pub(crate) fn exec(code: i32, stdout: &str, stderr: &str) -> io::Result<Exec> {
     Ok(Exec {
         code: Some(code),
         stdout: stdout.into(),
@@ -112,27 +112,39 @@ fn exec(code: i32, stdout: &str, stderr: &str) -> io::Result<Exec> {
 }
 
 /// What the network, the package database and the service manager are.
-struct Net {
-    format: Format,
+pub(crate) struct Net {
+    pub(crate) format: Format,
     /// The state directory, which the fake package manager looks at when it installs.
-    state_dir: PathBuf,
+    pub(crate) state_dir: PathBuf,
     /// The listing of the releases, one JSON object each.
-    releases: Vec<String>,
+    pub(crate) releases: Vec<String>,
     /// The files of each release, by tag and then by asset name.
-    assets: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
+    pub(crate) assets: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
     /// The version of the installed package.
-    installed: Option<String>,
+    pub(crate) installed: Option<String>,
     /// What happened, in order.
-    events: Vec<String>,
-    broken: BTreeSet<&'static str>,
+    pub(crate) events: Vec<String>,
+    pub(crate) broken: BTreeSet<&'static str>,
     /// Units that do not restart the first time.
-    restart_fails_once: BTreeSet<String>,
+    pub(crate) restart_fails_once: BTreeSet<String>,
     /// How many installations fail before they work.
-    install_fails: usize,
+    pub(crate) install_fails: usize,
+    /// Units that never restart.
+    pub(crate) restart_never: BTreeSet<String>,
+    /// How many times `systemctl daemon-reload` fails before it works.
+    pub(crate) reload_fails: usize,
+    /// What `systemctl show --property=MainPID --value` prints.
+    pub(crate) main_pid: String,
+    /// The commit `/usr/bin/kbf --version --json` prints, when it prints one.
+    pub(crate) kbf_commit: Option<String>,
+    /// A path whose existence is noted when the main process is asked for: the old layout.
+    pub(crate) watch: Option<PathBuf>,
+    /// Release files (by the end of their names) that `gh release download` does not leave.
+    pub(crate) skip_files: Vec<String>,
 }
 
 impl Net {
-    fn file_name(&self, commit: &str) -> String {
+    pub(crate) fn file_name(&self, commit: &str) -> String {
         let ext = self.format.asset().extension();
         format!("kbf-{commit}-linux-{}.{ext}", arch_name())
     }
@@ -140,7 +152,7 @@ impl Net {
     /// Install the package file `path`, as the package manager does; the event records what
     /// the host looked like at that moment: whether a trial is on disk and the previous
     /// package is kept.
-    fn install(&mut self, path: &str, args: &[String]) -> io::Result<Exec> {
+    pub(crate) fn install(&mut self, path: &str, args: &[String]) -> io::Result<Exec> {
         let bytes = fs::read(path).unwrap();
         let (_, version, _) = fields_of(&bytes);
         let record: serde_json::Value = fs::read_to_string(self.state_dir.join("package.json"))
@@ -168,9 +180,9 @@ impl Net {
 }
 
 /// The programs of the host-install side.
-struct Sim {
-    net: Rc<RefCell<Net>>,
-    calls: Rc<RefCell<Vec<Cmd>>>,
+pub(crate) struct Sim {
+    pub(crate) net: Rc<RefCell<Net>>,
+    pub(crate) calls: Rc<RefCell<Vec<Cmd>>>,
 }
 
 impl Runner for Sim {
@@ -184,14 +196,47 @@ impl Runner for Sim {
             .into_owned();
         let last = cmd.args.last().cloned().unwrap_or_default();
         match name.as_str() {
+            "kbf" => {
+                net.events.push("kbf-version".to_owned());
+                match &net.kbf_commit {
+                    Some(commit) => exec(
+                        0,
+                        &format!(
+                            "{{\"commit\":\"{}\",\"version\":\"0.1.0\"}}\n",
+                            &commit[..12]
+                        ),
+                        "",
+                    ),
+                    None => exec(1, "", "no"),
+                }
+            }
             "systemctl" => match cmd.args[0].as_str() {
                 "restart" => {
                     net.events.push(format!("restart:{last}"));
                     if net.restart_fails_once.remove(&last) {
                         exec(5, "", "failed once")
+                    } else if net.restart_never.contains(&last) {
+                        exec(5, "", "failed")
                     } else {
                         exec(0, "", "")
                     }
+                }
+                "daemon-reload" => {
+                    net.events.push("reload".to_owned());
+                    if net.reload_fails > 0 {
+                        net.reload_fails -= 1;
+                        exec(1, "", "failed")
+                    } else {
+                        exec(0, "", "")
+                    }
+                }
+                "show" => {
+                    if net.broken.contains("no-show") {
+                        return Err(io::Error::other("cannot start systemctl"));
+                    }
+                    let old = net.watch.as_ref().is_some_and(|p| p.exists());
+                    net.events.push(format!("show:old_layout={old}"));
+                    exec(0, &net.main_pid, "")
                 }
                 _ => {
                     net.events.push(format!("active:{last}"));
@@ -236,9 +281,43 @@ impl Runner for Sim {
                     let Some(bytes) = files.get(&asset) else {
                         return exec(1, "", "no assets match");
                     };
+                    if net
+                        .skip_files
+                        .iter()
+                        .any(|end| asset.ends_with(end.as_str()))
+                    {
+                        continue;
+                    }
                     fs::write(dir.join(&asset), bytes).unwrap();
                 }
                 exec(0, "", "")
+            }
+            "dpkg-query" | "rpm"
+                if net.broken.contains("no-database")
+                    && !cmd
+                        .args
+                        .iter()
+                        .any(|a| a == "--package" || a == "--upgrade") =>
+            {
+                Err(io::Error::other("cannot start the package database tool"))
+            }
+            "dpkg" | "rpm"
+                if net.broken.contains("no-install-tool")
+                    && !cmd.args.iter().any(|a| a == "--query") =>
+            {
+                Err(io::Error::other("cannot start the installer"))
+            }
+            "dpkg-deb" | "rpm"
+                if net.broken.contains("no-inspect-tool")
+                    && cmd.args.iter().any(|a| a == "--package" || a == "--field") =>
+            {
+                Err(io::Error::other("cannot start the inspector"))
+            }
+            "dpkg-deb" | "rpm"
+                if net.broken.contains("inspect-fails")
+                    && cmd.args.iter().any(|a| a == "--package" || a == "--field") =>
+            {
+                exec(2, "", "not a package")
             }
             "dpkg-query" => {
                 net.events.push("query".to_owned());
@@ -284,7 +363,7 @@ impl Runner for Sim {
 }
 
 /// The backend of a rig, lent to the core, which owns the one it is given.
-struct Borrowed<'a>(&'a PackageHost);
+pub(crate) struct Borrowed<'a>(&'a PackageHost);
 
 impl Backend for Borrowed<'_> {
     fn lock_file(&self) -> PathBuf {
@@ -317,21 +396,21 @@ impl Backend for Borrowed<'_> {
 }
 
 /// A host that runs package A, with a channel `stable` that offers whatever a test offers.
-struct Rig {
-    dir: TestDir,
-    root: TestDir,
-    state_dir: PathBuf,
-    format: Format,
-    backend: PackageHost,
-    net: Rc<RefCell<Net>>,
-    calls: Rc<RefCell<Vec<Cmd>>>,
-    installer: Rc<RefCell<Vec<Spawn>>>,
+pub(crate) struct Rig {
+    pub(crate) dir: TestDir,
+    pub(crate) root: TestDir,
+    pub(crate) state_dir: PathBuf,
+    pub(crate) format: Format,
+    pub(crate) backend: PackageHost,
+    pub(crate) net: Rc<RefCell<Net>>,
+    pub(crate) calls: Rc<RefCell<Vec<Cmd>>>,
+    pub(crate) installer: Rc<RefCell<Vec<Spawn>>>,
     /// How `gh attestation verify` ends.
-    gh_exit: Rc<RefCell<i32>>,
+    pub(crate) gh_exit: Rc<RefCell<i32>>,
 }
 
 impl Rig {
-    fn new(name: &str, format: Format) -> Self {
+    pub(crate) fn new(name: &str, format: Format) -> Self {
         let root = TestDir::under(std::env::temp_dir(), &format!("hi-pkg-root-{name}"));
         let layout = Layout::new(Root::new(&*root).unwrap(), Platform::Linux);
         let dir = TestDir::under(std::env::temp_dir(), &format!("hi-pkg-host-{name}"));
@@ -368,6 +447,12 @@ impl Rig {
             broken: BTreeSet::new(),
             restart_fails_once: BTreeSet::new(),
             install_fails: 0,
+            restart_never: BTreeSet::new(),
+            reload_fails: 0,
+            main_pid: "4242\n".to_owned(),
+            kbf_commit: None,
+            watch: None,
+            skip_files: Vec::new(),
         }));
         let calls = Rc::new(RefCell::new(Vec::new()));
         let gh_exit = Rc::new(RefCell::new(0));
@@ -429,21 +514,21 @@ impl Rig {
         rig
     }
 
-    fn file_name(&self, commit: &str) -> String {
+    pub(crate) fn file_name(&self, commit: &str) -> String {
         self.net.borrow().file_name(commit)
     }
 
     /// The channel's GitHub offers the package of `commit`, which says it is `version`.
-    fn offer(&self, commit: &str, version: &str) {
+    pub(crate) fn offer(&self, commit: &str, version: &str) {
         self.offer_bytes(commit, &bytes_of("kbf", version, self.format_arch()));
     }
 
-    fn format_arch(&self) -> &'static str {
+    pub(crate) fn format_arch(&self) -> &'static str {
         self.format.arch_name(Arch::current())
     }
 
     /// The release of `commit` holds a package file with these bytes, listed in its sums.
-    fn offer_bytes(&self, commit: &str, bytes: &[u8]) {
+    pub(crate) fn offer_bytes(&self, commit: &str, bytes: &[u8]) {
         let file = self.file_name(commit);
         let tag = format!("v-{}", &commit[..8]);
         let sums = format!("{}  {file}\n", sha256(bytes));
@@ -465,7 +550,7 @@ impl Rig {
         files.insert("SHA256SUMS".to_owned(), sums.into_bytes());
     }
 
-    fn set_sums(&self, commit: &str, text: &str) {
+    pub(crate) fn set_sums(&self, commit: &str, text: &str) {
         let tag = format!("v-{}", &commit[..8]);
         self.net
             .borrow_mut()
@@ -475,37 +560,37 @@ impl Rig {
             .insert("SHA256SUMS".to_owned(), text.as_bytes().to_vec());
     }
 
-    fn events(&self) -> Vec<String> {
+    pub(crate) fn events(&self) -> Vec<String> {
         self.net.borrow().events.clone()
     }
 
-    fn installs(&self) -> Vec<String> {
+    pub(crate) fn installs(&self) -> Vec<String> {
         self.events()
             .into_iter()
             .filter(|e| e.starts_with("install:"))
             .collect()
     }
 
-    fn count(&self, event: &str) -> usize {
+    pub(crate) fn count(&self, event: &str) -> usize {
         self.events().iter().filter(|e| *e == event).count()
     }
 
-    fn installed(&self) -> Option<String> {
+    pub(crate) fn installed(&self) -> Option<String> {
         self.net.borrow().installed.clone()
     }
 
-    fn restarts(&self) -> Vec<String> {
+    pub(crate) fn restarts(&self) -> Vec<String> {
         self.events()
             .into_iter()
             .filter(|e| e.starts_with("restart:"))
             .collect()
     }
 
-    fn record(&self) -> Record {
+    pub(crate) fn record(&self) -> Record {
         self.backend.store.load().unwrap()
     }
 
-    fn kept_files(&self) -> BTreeSet<String> {
+    pub(crate) fn kept_files(&self) -> BTreeSet<String> {
         fs::read_dir(self.state_dir.join("packages"))
             .map(|d| {
                 d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -514,11 +599,11 @@ impl Rig {
             .unwrap_or_default()
     }
 
-    fn kept(&self, commit: &str) -> PathBuf {
+    pub(crate) fn kept(&self, commit: &str) -> PathBuf {
         self.state_dir.join("packages").join(self.file_name(commit))
     }
 
-    fn work(&self) -> Vec<String> {
+    pub(crate) fn work(&self) -> Vec<String> {
         fs::read_dir(self.root.join("var/lib/kbf-installer/work"))
             .map(|d| {
                 d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -527,11 +612,11 @@ impl Rig {
             .unwrap_or_default()
     }
 
-    fn stage(&self, text: &str) -> Result<String, Fault> {
+    pub(crate) fn stage(&self, text: &str) -> Result<String, Fault> {
         self.backend.stage(&version(text), &stable())
     }
 
-    fn ab(&self, clock: Rc<std::cell::Cell<u64>>) -> Ab<Borrowed<'_>> {
+    pub(crate) fn ab(&self, clock: Rc<std::cell::Cell<u64>>) -> Ab<Borrowed<'_>> {
         let uid = fs::metadata(&*self.dir).unwrap().uid();
         Ab::new(
             Borrowed(&self.backend),
@@ -543,7 +628,7 @@ impl Rig {
     }
 
     /// Nothing was installed, restarted, kept or recorded.
-    fn assert_nothing_changed(&self) {
+    pub(crate) fn assert_nothing_changed(&self) {
         let events = self.events();
         assert!(
             !events
@@ -564,12 +649,12 @@ impl Drop for Rig {
     }
 }
 
-fn both(test: impl Fn(Format)) {
+pub(crate) fn both(test: impl Fn(Format)) {
     test(Format::Deb);
     test(Format::Rpm);
 }
 
-fn refused(code: Code) -> impl Fn(&Fault) -> bool {
+pub(crate) fn refused(code: Code) -> impl Fn(&Fault) -> bool {
     move |fault| fault.refused && fault.code == code
 }
 
@@ -1278,14 +1363,19 @@ fn the_current_release_is_named_as_well_as_the_host_can() {
 fn an_unreadable_database_or_record_is_unavailable() {
     both(|format| {
         let rig = Rig::new("unavailable", format);
-        rig.net.borrow_mut().installed = Some("not a version".to_owned());
-        // dpkg-query would print "ii  not a version"; the fake keeps one word per field.
-        if format == Format::Rpm {
-            assert_eq!(
-                rig.backend.current().unwrap_err().code,
-                Code::StateUnavailable
-            );
-        }
+        // A database that prints no version, and one that cannot be asked.
+        rig.net.borrow_mut().installed = Some(String::new());
+        assert_eq!(
+            rig.backend.current().unwrap_err().code,
+            Code::StateUnavailable
+        );
+        rig.net.borrow_mut().installed = Some(a_version());
+        rig.net.borrow_mut().broken.insert("no-database");
+        assert_eq!(
+            rig.backend.current().unwrap_err().code,
+            Code::StateUnavailable
+        );
+        rig.net.borrow_mut().broken.remove("no-database");
         rig.net.borrow_mut().installed = Some(a_version());
         fs::write(rig.state_dir.join("package.json"), "{not json").unwrap();
         fs::set_permissions(
@@ -1343,4 +1433,283 @@ fn the_production_host_is_the_package_layout_and_the_programs_of_a_stage() {
         host.layout.join(&host.layout.gh()),
         Path::new("/usr/share/kbf-installer/trust/gh")
     );
+}
+
+/// A check directory that cannot be made is a failure of the stage, with nothing kept.
+#[test]
+fn a_check_directory_that_cannot_be_made_fails_the_stage() {
+    both(|format| {
+        let rig = Rig::new("check-dir", format);
+        let work = rig.root.join("var/lib/kbf-installer/work");
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join(format!("{COMMIT}.check")), b"in the way").unwrap();
+        let fault = rig.stage(&new_version()).unwrap_err();
+        assert!(
+            !fault.refused && fault.code == Code::StageFailed,
+            "{fault:?}"
+        );
+        assert!(rig.kept_files().is_empty());
+        assert_eq!(rig.record(), Record::default());
+    });
+}
+
+/// A download that leaves out any of the three files, though `gh` said it worked, is a refused
+/// fetch and keeps nothing.
+#[test]
+fn a_download_that_leaves_a_file_out_is_refused() {
+    both(|format| {
+        let own = format!(".{}", format.asset().extension());
+        for missing in [own.as_str(), ".sigstore.json", "SHA256SUMS"] {
+            let rig = Rig::new("left-out", format);
+            rig.net.borrow_mut().skip_files.push(missing.to_owned());
+            let fault = rig.stage(&new_version()).unwrap_err();
+            assert!(refused(Code::FetchFailed)(&fault), "{missing}: {fault:?}");
+            assert!(rig.kept_files().is_empty());
+            assert_eq!(rig.record(), Record::default());
+            assert!(rig.work().is_empty());
+        }
+    });
+}
+
+/// Tools that cannot be started or fail on the file are refusals of the package, and a package
+/// manager that cannot be started to install is a failure that goes back the same way.
+#[test]
+fn tools_that_cannot_run_are_failures_not_guesses() {
+    both(|format| {
+        for flag in ["no-inspect-tool", "inspect-fails"] {
+            let rig = Rig::new("tools-inspect", format);
+            rig.net.borrow_mut().broken.insert(flag);
+            let fault = rig.stage(&new_version()).unwrap_err();
+            assert!(refused(Code::VerifyFailed)(&fault), "{flag}: {fault:?}");
+            rig.assert_nothing_changed();
+        }
+        let rig = Rig::new("tools-install", format);
+        rig.stage(&new_version()).unwrap();
+        rig.net.borrow_mut().broken.insert("no-install-tool");
+        let fault = rig.backend.switch(COMMIT, 600, 1_000).unwrap_err();
+        assert_eq!(fault.code, Code::RevertFailed, "{fault:?}");
+        assert!(
+            fault.detail.contains("cannot start the installer"),
+            "{fault:?}"
+        );
+        assert!(rig.record().pending.is_some());
+    });
+}
+
+/// A kept copy that went missing since the update that confirmed it is fetched again when the
+/// next update needs it as the package to go back to.
+#[test]
+fn a_running_packages_lost_copy_is_fetched_again_for_the_next_update() {
+    both(|format| {
+        let rig = Rig::new("lost-running", format);
+        let now = Rc::new(std::cell::Cell::new(1_000_u64));
+        let ab = rig.ab(now);
+        let ask = |line: &str| ab.handle(&LocalRequest::parse(line).unwrap());
+        let (v, c) = (new_version(), c_version());
+        ask(&format!("install kbf={v} from stable"));
+        ask(&format!("switch kbf={v}"));
+        ask(&format!("confirm kbf={v}"));
+        fs::remove_file(rig.kept(COMMIT)).unwrap();
+        let downloads = rig.count("download");
+        ask(&format!("install kbf={c} from stable"));
+        assert!(matches!(
+            ask(&format!("switch kbf={c}")),
+            Answer::Switched { .. }
+        ));
+        assert_eq!(
+            rig.count("download"),
+            downloads + 2,
+            "the new one and the lost one"
+        );
+        assert!(rig.kept(COMMIT).exists());
+        assert_eq!(rig.installed(), Some(c));
+    });
+}
+
+/// A going back with no trial is refused; a trial that names no kept copy, or whose kept copy is
+/// gone and whose channel is unreadable, cannot be gone back from and says so; so does a staged
+/// package with an unreadable channel on a switch.
+#[test]
+fn a_record_that_cannot_be_gone_back_from_is_a_failure_that_says_so() {
+    both(|format| {
+        let rig = Rig::new("record", format);
+        let pending = Pending {
+            commit: COMMIT.to_owned(),
+            from: A.to_owned(),
+            deadline_unix: Some(1),
+            activation: "x".to_owned(),
+        };
+        let fault = rig.backend.revert(&pending).unwrap_err();
+        assert!(refused(Code::NothingPending)(&fault), "{fault:?}");
+
+        let kept = |channel: &str, version: String| super::package_store::Kept {
+            version,
+            sha256: sha256(b"x"),
+            channel: channel.to_owned(),
+        };
+        let trial = super::package_store::Trial {
+            commit: COMMIT.to_owned(),
+            from: A.to_owned(),
+            deadline_unix: 1,
+            activation: "x".to_owned(),
+        };
+        // No copy kept.
+        let mut record = Record {
+            pending: Some(trial.clone()),
+            ..Record::default()
+        };
+        rig.backend.store.save(&record).unwrap();
+        let fault = rig.backend.revert(&pending).unwrap_err();
+        assert!(
+            fault.detail.contains("no copy of the package that ran"),
+            "{fault:?}"
+        );
+        // A copy that is not there, kept through a channel that is not a name.
+        record
+            .files
+            .insert(A.to_owned(), kept("Not A Channel", a_version()));
+        rig.backend.store.save(&record).unwrap();
+        let fault = rig.backend.revert(&pending).unwrap_err();
+        assert!(
+            fault.detail.contains("kept channel is unreadable"),
+            "{fault:?}"
+        );
+        // A staged package kept through such a channel cannot be switched to.
+        record.pending = None;
+        record
+            .files
+            .insert(COMMIT.to_owned(), kept("Not A Channel", new_version()));
+        rig.backend.store.save(&record).unwrap();
+        fs::create_dir_all(rig.state_dir.join("packages")).unwrap();
+        fs::write(rig.kept(COMMIT), b"x").unwrap();
+        let fault = rig.backend.switch(COMMIT, 600, 1_000).unwrap_err();
+        assert_eq!(fault.code, Code::StateUnavailable, "{fault:?}");
+        assert!(rig.installs().is_empty());
+    });
+}
+
+/// The store's own failures: a record that cannot be written, a directory of kept files that
+/// cannot be made, a source that is gone or changed while it is kept, a kept file that is not a
+/// file or is too big, and a prune with nothing to prune.
+#[test]
+fn the_store_says_what_it_could_not_do() {
+    let rig = Rig::new("store", Format::Deb);
+    let store = &rig.backend.store;
+
+    // The record cannot be written.
+    fs::create_dir(rig.state_dir.join("package.json.new")).unwrap();
+    assert_eq!(
+        store.save(&Record::default()).unwrap_err().code,
+        Code::StateUnavailable
+    );
+    fs::remove_dir(rig.state_dir.join("package.json.new")).unwrap();
+    store.save(&Record::default()).unwrap();
+
+    // Nothing to prune from, and nothing kept.
+    let mut record = Record::default();
+    store.prune(&mut record, &[A]);
+    assert!(!store.has(A));
+
+    // The directory of kept files cannot be made.
+    let source = rig.dir.join("source");
+    fs::write(&source, b"kbf|1|x").unwrap();
+    fs::write(rig.state_dir.join("packages"), b"in the way").unwrap();
+    let fault = store
+        .keep(A, &source, &sha256(b"kbf|1|x"), 1024)
+        .unwrap_err();
+    assert_eq!(fault.code, Code::StageFailed, "{fault:?}");
+    fs::remove_file(rig.state_dir.join("packages")).unwrap();
+
+    // The source is gone, or is not the bytes that were verified.
+    let fault = store
+        .keep(A, &rig.dir.join("nothing"), &sha256(b"x"), 1024)
+        .unwrap_err();
+    assert_eq!(fault.code, Code::StageFailed, "{fault:?}");
+    let fault = store.keep(A, &source, &sha256(b"other"), 1024).unwrap_err();
+    assert!(
+        fault.detail.contains("changed while it was kept"),
+        "{fault:?}"
+    );
+    assert!(!store.has(A));
+    assert!(
+        rig.kept_files().is_empty(),
+        "no half-kept file: {:?}",
+        rig.kept_files()
+    );
+
+    // A kept file that is a directory, or is over the limit, is not the verified file.
+    let kept = super::package_store::Kept {
+        version: a_version(),
+        sha256: sha256(b"kbf|1|x"),
+        channel: "stable".to_owned(),
+    };
+    store.keep(A, &source, &kept.sha256, 1024).unwrap();
+    assert!(store.verified(A, &kept, 1024).is_ok());
+    assert!(refused(Code::VerifyFailed)(
+        &store.verified(A, &kept, 3).unwrap_err()
+    ));
+    fs::remove_file(store.path(A)).unwrap();
+    fs::create_dir(store.path(A)).unwrap();
+    assert!(refused(Code::VerifyFailed)(
+        &store.verified(A, &kept, 1024).unwrap_err()
+    ));
+    assert!(!store.has(A));
+}
+
+/// A kept package is reused for the very version, and only while the file is there: a newer
+/// build of the same commit, or a kept file that went missing, is fetched.
+#[test]
+fn a_kept_package_is_reused_only_for_its_version_and_while_it_is_there() {
+    both(|format| {
+        let rig = Rig::new("reuse", format);
+        rig.stage(&new_version()).unwrap();
+        rig.stage(&new_version()).unwrap();
+        assert_eq!(
+            rig.count("download"),
+            1,
+            "the second stage used the kept file"
+        );
+
+        // The same commit, built again with another run number.
+        let again = build(COMMIT, 7, 99);
+        rig.offer(COMMIT, &again);
+        assert_eq!(rig.stage(&again).unwrap(), COMMIT);
+        assert_eq!(rig.count("download"), 2);
+        assert_eq!(rig.record().files[COMMIT].version, again);
+
+        // The record says kept; the file is not there.
+        fs::remove_file(rig.kept(COMMIT)).unwrap();
+        rig.stage(&again).unwrap();
+        assert_eq!(rig.count("download"), 3);
+        assert!(rig.kept(COMMIT).exists());
+    });
+}
+
+/// A record that cannot be read for a reason other than being absent (here a link) is
+/// unavailable, and an absent one is empty.
+#[test]
+fn a_record_that_is_a_link_is_unavailable_and_an_absent_one_is_empty() {
+    let rig = Rig::new("record-link", Format::Deb);
+    assert_eq!(rig.record(), Record::default());
+    std::os::unix::fs::symlink("elsewhere", rig.state_dir.join("package.json")).unwrap();
+    assert_eq!(
+        rig.backend.pending().unwrap_err().code,
+        Code::StateUnavailable
+    );
+}
+
+/// A `SHA256SUMS` over the limit is not taken, whatever else the release holds.
+#[test]
+fn sums_over_the_limit_are_not_taken() {
+    both(|format| {
+        let rig = Rig::new("big-sums", format);
+        let listing = rig.net.borrow().releases[0].clone();
+        rig.net.borrow_mut().releases[0] = listing.replace(
+            "\"SHA256SUMS\",\"size\":",
+            "\"SHA256SUMS\",\"size\":99999999",
+        );
+        let fault = rig.stage(&new_version()).unwrap_err();
+        assert!(refused(Code::FetchFailed)(&fault), "{fault:?}");
+        rig.assert_nothing_changed();
+    });
 }

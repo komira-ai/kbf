@@ -370,12 +370,19 @@ fn open_plain(src: &Path, cap: u64) -> io::Result<File> {
 /// descriptor, hashing what is copied (see [`open_plain`]). A file that grew since it was
 /// looked at is cut at `cap`; the digest then names the cut bytes, which no attestation lists.
 pub(super) fn copy_hashing(src: &Path, dst: &Path, cap: u64) -> io::Result<Copied> {
+    copy_hashing_mode(src, dst, cap, 0o600)
+}
+
+/// [`copy_hashing`] into a file of mode `mode`.
+pub(super) fn copy_hashing_mode(src: &Path, dst: &Path, cap: u64, mode: u32) -> io::Result<Copied> {
     let file = open_plain(src, cap)?;
     let mut out = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .mode(mode)
         .open(dst)?;
+    // The mode is exactly `mode`, whatever the umask.
+    out.set_permissions(fs::Permissions::from_mode(mode))?;
     let mut capped = file.take(cap);
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024];

@@ -31,9 +31,8 @@
 //!
 //! The channels are those of the hand-placed layout (`/etc/kbf/host-install-releases.toml`).
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::fs;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use kbf_host::exec::Exec;
@@ -48,9 +47,9 @@ use kbf_installer::stage::BUNDLE_CAP;
 use super::answer::Code;
 use super::backend::{Backend, Fault, Pending};
 use super::linux::{
-    Tools, config_fault, copy_hashing, fetch_fault, fetch_scratch_in, read_capped, state_fault,
+    Tools, config_fault, copy_hashing_mode, fetch_fault, fetch_scratch_in, read_capped, state_fault,
 };
-use super::package_format::{Format, PACKAGE, SumsError, sums_entry};
+use super::package_format::{Format, Meta, PACKAGE, SumsError, sums_entry};
 use super::package_store::{Kept, Record, Store, Trial};
 use super::units::restart_and_wait;
 use crate::host::Host;
@@ -96,6 +95,11 @@ impl Check {
     fn make(work: &Path, commit: &str, who: Identity) -> Result<Self, Fault> {
         let stage_failed =
             |e: std::io::Error| Fault::failed(Code::StageFailed, format!("check: {e}"));
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(work)
+            .map_err(stage_failed)?;
         let dir = work.join(format!("{commit}.check"));
         let _ = fs::remove_dir_all(&dir);
         let made = Self { dir };
@@ -113,25 +117,23 @@ impl Check {
     fn home(&self) -> PathBuf {
         self.dir.join("gh")
     }
-
-    /// Write `bytes` as the new file `name`, readable by all (public release bytes).
-    fn put(&self, name: &str, bytes: &[u8]) -> Result<PathBuf, Fault> {
-        let path = self.dir.join(name);
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .open(&path)
-            .and_then(|mut file| file.write_all(bytes))
-            .map_err(|e| Fault::failed(Code::StageFailed, format!("check: {e}")))?;
-        Ok(path)
-    }
 }
 
 impl Drop for Check {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+
+/// A release's package file and what goes with it, copied once: the directory they are in goes
+/// when this does.
+pub(crate) struct Copies {
+    check: Check,
+    pub(crate) package: PathBuf,
+    bundle: PathBuf,
+    sums: String,
+    pub(crate) sha256: String,
+    name: String,
 }
 
 impl PackageHost {
@@ -166,26 +168,10 @@ impl PackageHost {
         }
     }
 
-    /// The release `version` names, kept and verified; its commit. A file this host holds
-    /// for that very version is not fetched again.
-    fn acquire(
-        &self,
-        record: &mut Record,
-        version: &Version,
-        channel: &Channel,
-    ) -> Result<String, Fault> {
-        let prefix = commit_prefix(version.as_str()).ok_or_else(|| {
-            Fault::refused(
-                Code::UnknownRelease,
-                "the version carries no commit (+g and 12 hex digits)",
-            )
-        })?;
-        let held = record.files.iter().find(|(commit, kept)| {
-            commit.starts_with(prefix) && kept.version == version.as_str() && self.store.has(commit)
-        });
-        if let Some((commit, _)) = held {
-            return Ok(commit.clone());
-        }
+    /// What a fetch or a check of the channel `channel` goes by: the host's settings narrowed to
+    /// the channel's branch, and the token of its API, if it names one. The pinned `gh` and the
+    /// trusted root must be root's, or nothing is believed.
+    pub(crate) fn prepare(&self, channel: &Channel) -> Result<(Settings, Option<String>), Fault> {
         let trust = &self.host.trust;
         let allowlist = MacAllowlist::load(trust, &self.allowlist).map_err(config_fault)?;
         let entry = allowlist.channel(trust, channel).map_err(config_fault)?;
@@ -203,11 +189,33 @@ impl PackageHost {
             .map_err(verify_refused)?
             .narrowed_to(std::slice::from_ref(&entry.source_ref))
             .map_err(|e| Fault::refused(Code::ConfigInvalid, e.to_string()))?;
-        // Nothing is fetched that cannot be checked: the pinned `gh` and the trusted root are
-        // root's, or this host does not believe what they would say.
         GhCheck::pinned(&self.layout, &settings)
             .check_trust(&*self.trust)
             .map_err(verify_refused)?;
+        Ok((settings, token))
+    }
+
+    /// The release `version` names, kept and verified; its commit. A file this host holds
+    /// for that very version is not fetched again.
+    fn acquire(
+        &self,
+        record: &mut Record,
+        version: &str,
+        channel: &Channel,
+    ) -> Result<String, Fault> {
+        let prefix = commit_prefix(version).ok_or_else(|| {
+            Fault::refused(
+                Code::UnknownRelease,
+                "the version carries no commit (+g and 12 hex digits)",
+            )
+        })?;
+        let held = record.files.iter().find(|(commit, kept)| {
+            commit.starts_with(prefix) && kept.version == version && self.store.has(commit)
+        });
+        if let Some((commit, _)) = held {
+            return Ok(commit.clone());
+        }
+        let (settings, token) = self.prepare(channel)?;
         let who = Identity {
             uid: settings.run_as.uid,
             gid: settings.run_as.gid,
@@ -220,7 +228,7 @@ impl PackageHost {
         record.files.insert(
             commit.clone(),
             Kept {
-                version: version.as_str().to_owned(),
+                version: version.to_owned(),
                 sha256: kept,
                 channel: channel.as_str().to_owned(),
             },
@@ -233,11 +241,11 @@ impl PackageHost {
     fn fetch_and_check(
         &self,
         (work, scratch): (&Path, &Path),
-        version: &Version,
+        version: &str,
         token: Option<&str>,
         settings: &Settings,
     ) -> Result<(String, String), Fault> {
-        let prefix = commit_prefix(version.as_str()).unwrap_or_default();
+        let prefix = commit_prefix(version).unwrap_or_default();
         let who = Identity {
             uid: settings.run_as.uid,
             gid: settings.run_as.gid,
@@ -268,25 +276,77 @@ impl PackageHost {
 
         let file_name = release::asset_name_on(&platform, extension, &commit);
         let bundle_name = release::bundle_of(&file_name);
+        let copies = self.copy_in(
+            (work, &commit),
+            who,
+            [
+                &scratch.join(&file_name),
+                &scratch.join(&bundle_name),
+                &scratch.join(release::SUMS_NAME),
+            ],
+            &file_name,
+        )?;
+        let meta = self.check_copies(&copies, &id, settings)?;
+        if meta.version != version {
+            return Err(verify_refused(format!(
+                "the package is version {}, not {version}",
+                meta.version
+            )));
+        }
+        self.store.keep(
+            &commit,
+            &copies.package,
+            &copies.sha256,
+            self.tools.tarball_max,
+        )?;
+        Ok((commit, copies.sha256))
+    }
+
+    /// Copy the package, its bundle and the release's sums (`from`, in that order) once into a
+    /// directory of the checks' own, through descriptors; only the copies are looked at from
+    /// here on.
+    pub(crate) fn copy_in(
+        &self,
+        (work, commit): (&Path, &str),
+        who: Identity,
+        from: [&Path; 3],
+        file_name: &str,
+    ) -> Result<Copies, Fault> {
         let fetch_failed = |name: &str, e: std::io::Error| {
             Fault::refused(Code::FetchFailed, format!("{name}: {e}"))
         };
-        let check = Check::make(work, &commit, who)?;
-        // Copied once, through descriptors; only the copies are looked at from here on.
-        let package = check.dir.join(&file_name);
-        let copied = copy_hashing(&scratch.join(&file_name), &package, self.tools.tarball_max)
-            .map_err(|e| fetch_failed(&file_name, e))?;
-        fs::set_permissions(&package, fs::Permissions::from_mode(0o644))
-            .map_err(|e| fetch_failed(&file_name, e))?;
-        let bundle = read_capped(&scratch.join(&bundle_name), BUNDLE_CAP)
+        let bundle_name = release::bundle_of(file_name);
+        let check = Check::make(work, commit, who)?;
+        let package = check.dir.join(file_name);
+        let bundle = check.dir.join(&bundle_name);
+        let copied = copy_hashing_mode(from[0], &package, self.tools.tarball_max, 0o644)
+            .map_err(|e| fetch_failed(file_name, e))?;
+        copy_hashing_mode(from[1], &bundle, BUNDLE_CAP, 0o644)
             .map_err(|e| fetch_failed(&bundle_name, e))?;
-        let sums = read_capped(&scratch.join(release::SUMS_NAME), BUNDLE_CAP)
-            .map_err(|e| fetch_failed(release::SUMS_NAME, e))?;
-        let bundle = check.put(&bundle_name, bundle.as_bytes())?;
+        let sums =
+            read_capped(from[2], BUNDLE_CAP).map_err(|e| fetch_failed(release::SUMS_NAME, e))?;
+        Ok(Copies {
+            check,
+            package,
+            bundle,
+            sums,
+            sha256: copied.sha256,
+            name: file_name.to_owned(),
+        })
+    }
 
+    /// Every check a package passes before it is kept or installed, offline, on the copies:
+    /// the sums list its digest, `gh attestation verify` accepts it and its bundle for the
+    /// commit, and the package manager reads it as `kbf` for this host's CPU. What it says.
+    pub(crate) fn check_copies(
+        &self,
+        copies: &Copies,
+        id: &CommitId,
+        settings: &Settings,
+    ) -> Result<Meta, Fault> {
         // 1. The digest the release lists.
-        match sums_entry(&sums, &file_name) {
-            Ok(listed) if listed == copied.sha256 => {}
+        match sums_entry(&copies.sums, &copies.name) {
+            Ok(listed) if listed == copies.sha256 => {}
             Ok(_) => {
                 return Err(verify_refused(
                     "the package is not the file SHA256SUMS lists",
@@ -304,22 +364,20 @@ impl PackageHost {
             runner: &*self.installer_runner,
         };
         gh_check
-            .verify(&tools, &check.home(), &package, &bundle, &id)
+            .verify(
+                &tools,
+                &copies.check.home(),
+                &copies.package,
+                &copies.bundle,
+                id,
+            )
             .map_err(verify_refused)?;
         // 3. What the package says it is.
-        self.check_meta(&package, settings, version)?;
-        self.store
-            .keep(&commit, &package, &copied.sha256, self.tools.tarball_max)?;
-        Ok((commit, copied.sha256))
+        self.read_meta(&copies.package, settings)
     }
 
-    /// The package manager reads the file's own fields, and they are what was asked for.
-    fn check_meta(
-        &self,
-        package: &Path,
-        settings: &Settings,
-        version: &Version,
-    ) -> Result<(), Fault> {
+    /// The package manager reads the file's own fields: `kbf`, for this host's CPU.
+    fn read_meta(&self, package: &Path, settings: &Settings) -> Result<Meta, Fault> {
         let exec = self
             .runner
             .run(&self.format.inspect(package))
@@ -336,16 +394,13 @@ impl PackageHost {
             .read_meta(&exec.stdout_text())
             .map_err(verify_refused)?;
         let arch = self.format.arch_name(settings.arch);
-        if meta.name != PACKAGE || meta.arch != arch || meta.version != version.as_str() {
+        if meta.name != PACKAGE || meta.arch != arch {
             return Err(verify_refused(format!(
-                "the package is {} {} for {}, not {PACKAGE} {} for {arch}",
-                meta.name,
-                meta.version,
-                meta.arch,
-                version.as_str()
+                "the package is {} for {}, not {PACKAGE} for {arch}",
+                meta.name, meta.arch
             )));
         }
-        Ok(())
+        Ok(meta)
     }
 
     /// A verified copy of the package that runs (`version`) is kept: the one this host holds,
@@ -365,30 +420,27 @@ impl PackageHost {
             {
                 return Ok(commit);
             }
+            // A copy that is gone or changed is not trusted: it is fetched again.
+            record.files.remove(&commit);
         }
-        let version = Version::new(version).map_err(|_| {
-            Fault::refused(
+        if Version::new(version).is_err() {
+            return Err(Fault::refused(
                 Code::NoCurrent,
                 "the package that runs has a version this program does not read",
-            )
-        })?;
-        if commit_prefix(version.as_str()).is_none() {
+            ));
+        }
+        if commit_prefix(version).is_none() {
             return Err(Fault::refused(
                 Code::NoCurrent,
                 "the package that runs names no build, so no copy of it can be kept",
             ));
         }
-        // A copy that is gone or changed is not trusted: it is fetched again.
-        if let Some(commit) = record.commit_of(version.as_str()).map(str::to_owned) {
-            record.files.remove(&commit);
-        }
-        self.acquire(record, &version, channel)
+        self.acquire(record, version, channel)
     }
 
     /// The previous package is installed again, the trial is over, and the units restart on
     /// it. Whether the host is whole again.
     fn put_back(&self) -> Result<(), Fault> {
-        let revert_failed = |why: String| Fault::failed(Code::RevertFailed, why);
         let mut record = self.store.load()?;
         let trial = record
             .pending
@@ -406,31 +458,34 @@ impl PackageHost {
             Err(_) => {
                 // Gone or changed: the same release is fetched and checked again.
                 record.files.remove(&trial.from);
-                let version = Version::new(&kept.version)
-                    .map_err(|_| revert_failed("the kept version is unreadable".to_owned()))?;
-                let channel = Channel::new(&kept.channel)
-                    .map_err(|_| revert_failed("the kept channel is unreadable".to_owned()))?;
-                let commit = self.acquire(&mut record, &version, &channel).map_err(|f| {
-                    revert_failed(format!("fetching the package that ran: {}", f.detail))
-                })?;
-                let kept = &record.files[&commit];
-                self.store
-                    .verified(&commit, kept, self.tools.tarball_max)
-                    .map_err(|f| revert_failed(f.detail))?
+                let channel = kept_channel(&kept).map_err(revert_failed)?;
+                let commit = self
+                    .acquire(&mut record, &kept.version, &channel)
+                    .map_err(|f| {
+                        revert_failed(format!("fetching the package that ran: {}", f.detail))
+                    })?;
+                self.store.path(&commit)
             }
         };
         self.install(&path).map_err(revert_failed)?;
         record.pending = None;
         self.store.prune(&mut record, &[trial.from.as_str()]);
-        self.store
-            .save(&record)
-            .map_err(|f| revert_failed(f.detail))?;
+        self.store.save(&record)?;
         self.restart_units().map_err(|why| {
             revert_failed(format!(
                 "the host is back on the package that ran, but: {why}"
             ))
         })
     }
+}
+
+fn revert_failed(why: String) -> Fault {
+    Fault::failed(Code::RevertFailed, why)
+}
+
+/// The channel a kept package was fetched through.
+fn kept_channel(kept: &Kept) -> Result<Channel, String> {
+    Channel::new(&kept.channel).map_err(|_| "the kept channel is unreadable".to_owned())
 }
 
 impl Backend for PackageHost {
@@ -476,7 +531,7 @@ impl Backend for PackageHost {
 
     fn stage(&self, version: &Version, channel: &Channel) -> Result<String, Fault> {
         let mut record = self.store.load()?;
-        let commit = self.acquire(&mut record, version, channel)?;
+        let commit = self.acquire(&mut record, version.as_str(), channel)?;
         self.store.save(&record)?;
         Ok(commit)
     }
@@ -498,8 +553,7 @@ impl Backend for PackageHost {
                 "that release is the one that runs",
             ));
         }
-        let channel = Channel::new(&target.channel)
-            .map_err(|_| state_fault("the kept channel is unreadable"))?;
+        let channel = kept_channel(&target).map_err(state_fault)?;
         let from = self.keep_running(&mut record, &running, &channel)?;
         record.pending = Some(Trial {
             commit: commit.to_owned(),

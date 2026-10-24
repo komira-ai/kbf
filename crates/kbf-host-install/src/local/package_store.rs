@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use super::answer::Code;
 use super::backend::Fault;
 use super::linux::{copy_hashing, state_fault};
-use crate::trust::Trust;
+use crate::trust::{Trust, TrustError};
 
 /// A verified package file this host keeps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,15 +107,13 @@ impl Store {
     /// # Errors
     /// The file is not root's alone, or does not parse.
     pub fn load(&self) -> Result<Record, Fault> {
-        match fs::symlink_metadata(self.record_file()) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Record::default()),
+        let text = match self.trust.read(&self.record_file()) {
+            Ok(text) => text,
+            Err(TrustError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Record::default());
+            }
             Err(e) => return Err(state_fault(format!("package.json: {e}"))),
-            Ok(_) => {}
-        }
-        let text = self
-            .trust
-            .read(&self.record_file())
-            .map_err(|e| state_fault(format!("package.json: {e}")))?;
+        };
         serde_json::from_str(&text).map_err(|e| state_fault(format!("package.json: {e}")))
     }
 
@@ -181,6 +179,11 @@ impl Store {
             ));
         }
         Ok(path)
+    }
+
+    /// Where the kept file of `commit` is (or would be).
+    pub fn path(&self, commit: &str) -> PathBuf {
+        self.file_of(commit)
     }
 
     /// Whether a file is kept for `commit`.
