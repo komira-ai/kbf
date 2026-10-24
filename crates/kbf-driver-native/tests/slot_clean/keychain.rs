@@ -98,8 +98,8 @@ async fn a_keychain_item_one_lease_stores_is_not_readable_by_the_next() {
     // `SecItemAdd` is a finding that fails the test.
     let stored = added.iter().any(|l| l.ends_with(" 0"));
     // -34018 and the statuses of a user with no file keychain to add to (-25307, -25308,
-    // -25291, -25294).
-    let unreachable = ["-34018", "-25307", "-25308", "-25291", "-25294"];
+    // -25291, -25294, and -60008 seen on the hosted runner).
+    let unreachable = ["-34018", "-25307", "-25308", "-25291", "-25294", "-60008"];
     let no_entitlement = !added.is_empty()
         && added
             .iter()

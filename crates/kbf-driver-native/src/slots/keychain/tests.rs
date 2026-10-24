@@ -9,7 +9,7 @@ fn a_status_says_whether_to_delete_again_stop_or_fail() {
     // A process without the entitlement cannot reach the data-protection keychain.
     assert_eq!(after_delete(true, MISSING_ENTITLEMENT), Deleted::Nothing);
     // No file keychain for the user: there is none to hold an item.
-    for status in [-25294, -25307, -25291, -25308] {
+    for status in [-25294, -25307, -25291, -25308, -60008] {
         assert_eq!(after_delete(false, status), Deleted::Nothing, "{status}");
         // The data-protection keychain does not answer so: that is a failure.
         assert_eq!(
