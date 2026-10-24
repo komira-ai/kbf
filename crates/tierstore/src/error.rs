@@ -10,6 +10,16 @@ pub enum Error {
     /// A create-only put on a key that exists.
     #[error("object {0} already exists")]
     AlreadyExists(String),
+    /// A put that replaces an object only if it has a given content tag, and the object has
+    /// another.
+    #[error("object {0} does not have the expected content tag")]
+    PreconditionFailed(String),
+    /// The backend has no room for the object. Freeing room may let a retry succeed.
+    #[error("backend is full: {0}")]
+    Full(String),
+    /// A client write to a key under a prefix the proxy keeps for itself.
+    #[error("key {0} is under a reserved prefix")]
+    Reserved(String),
     /// The backend did not answer (down, timed out, refused the connection). Retrying later
     /// may succeed.
     #[error("backend unavailable: {0}")]

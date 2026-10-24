@@ -1,382 +1,530 @@
-//! A store over a hot and a cold backend.
+//! The proxy: a store over a hot and a cold backend.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::sync::{Mutex as TurnLock, Notify};
-use tokio::task::JoinHandle;
+use tokio::sync::{Mutex as AsyncMutex, Notify, OnceCell};
+use tokio::time::Instant;
 
-use crate::state::State;
-use crate::{Backend, ByteRange, Error, Listed, Meta};
+use crate::journal::{
+    USAGE_KEY, Usage, encode_journal, is_reserved, journal_key, journal_prefix, load_checkpoint,
+    proxy_key, seq_of,
+};
+use crate::{Backend, ByteRange, Clock, Error, JournalEntry, JournalOp, Listed, Meta};
 
-/// The shortest interval the background task waits between passes.
-const MIN_RETRY: Duration = Duration::from_millis(1);
-
-/// What one [`Tiered::write_back`] pass did.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct WriteBackReport {
-    /// Objects the cold tier now holds: copied there, or found there already with the same
-    /// size and content tag.
-    pub copied: Vec<String>,
-    /// Objects the cold tier holds with a different size or content tag. They stay in the
-    /// hot tier, are never evicted and are left alone by later passes until they are deleted.
-    pub clashed: Vec<String>,
-    /// Objects that could not be copied, with why. They stay pending and are tried again by
-    /// the next pass.
-    pub failed: Vec<(String, Error)>,
+/// The settings of a [`Proxy`].
+#[derive(Clone)]
+pub struct ProxyConfig {
+    /// Names the proxy's journal and its checkpoint. It is not empty and has no `/`. Every
+    /// running proxy has an id of its own, and a proxy that restarts keeps its id.
+    pub proxy_id: String,
+    /// The bytes the hot tier is meant to hold, which the usage the reconciler publishes is
+    /// compared with.
+    pub hot_budget: u64,
+    /// The share of the budget (0.95, say) above which a put is delayed by `back_pressure`
+    /// and a read does not copy the object it found in the cold tier into the hot tier.
+    pub critical: f64,
+    /// How long a put waits before it is written to the hot tier while the usage is above the
+    /// critical share.
+    pub back_pressure: Duration,
+    /// The most entries one journal object holds. A batch that reaches it is written at once.
+    pub batch_entries: usize,
+    /// How long a batch waits for more entries before it is written.
+    pub linger: Duration,
+    /// How long the usage object that was read is used before it is read again, and how long
+    /// the hot tier is taken to be full after it said so.
+    pub usage_refresh: Duration,
+    /// The age of the usage object past which it is ignored, as if it were missing.
+    pub usage_stale_after: Duration,
+    /// The time, for the entries and for the age of the usage object.
+    pub clock: Arc<dyn Clock>,
 }
 
-/// What one [`Tiered::evict`] pass did.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct EvictionReport {
-    /// Objects removed from the hot tier because the cold tier holds them.
-    pub evicted: Vec<String>,
-    /// Objects the cold tier turned out not to hold (gone, or other content): they are
-    /// pending again, and stay in the hot tier.
-    pub unconfirmed: Vec<String>,
-    /// Objects that could not be checked or removed, with why. They stay in the hot tier.
-    pub failed: Vec<(String, Error)>,
+impl ProxyConfig {
+    /// The settings for a proxy `proxy_id` and a hot tier of `hot_budget` bytes, with a
+    /// critical share of 0.95, a back-pressure of 20 ms, batches of at most 64 entries that
+    /// wait 50 ms, a usage object that is read every second and ignored after 30 seconds.
+    #[must_use]
+    pub fn new(proxy_id: &str, hot_budget: u64, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            proxy_id: proxy_id.to_owned(),
+            hot_budget,
+            critical: 0.95,
+            back_pressure: Duration::from_millis(20),
+            batch_entries: 64,
+            linger: Duration::from_millis(50),
+            usage_refresh: Duration::from_secs(1),
+            usage_stale_after: Duration::from_secs(30),
+            clock,
+        }
+    }
 }
 
-/// What one [`Tiered::maintain`] pass did: the write-back, then the eviction.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Maintenance {
-    /// The copies to the cold tier.
-    pub write_back: WriteBackReport,
-    /// The removals from the hot tier.
-    pub eviction: EvictionReport,
+/// How full the hot tier is taken to be, least full first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Level {
+    Open,
+    Critical,
+    Full,
+}
+
+/// What the proxy believes of the hot tier's capacity.
+#[derive(Default)]
+struct Capacity {
+    /// When the usage object was last read, and the bytes it gave if it gave any.
+    read: Option<(Instant, Option<u64>)>,
+    /// Until when the hot tier is taken to be full, after it said so.
+    full_until: Option<Instant>,
+}
+
+/// One journal object being filled, and the outcome of writing it.
+#[derive(Default)]
+struct Batch {
+    entries: Mutex<Vec<JournalEntry>>,
+    /// Notified when the batch reaches its size, to cut the linger short.
+    full: Notify,
+    /// Set once, by whichever caller waiting on the batch writes it.
+    outcome: OnceCell<Result<(), Error>>,
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    // No method panics while holding the lock, so a poisoned state is still whole.
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn is_data(object: &Listed) -> bool {
+    !is_reserved(&object.key)
+}
+
+fn refuse_reserved(key: &str) -> Result<(), Error> {
+    if is_reserved(key) {
+        Err(Error::Reserved(key.to_owned()))
+    } else {
+        Ok(())
+    }
 }
 
 /// A store over a HOT and a COLD [`Backend`] that is itself a [`Backend`].
 ///
-/// - **Put** goes to the hot tier, create-only, and succeeds when the hot tier has the
-///   object. The cold tier is not involved, so a put succeeds while the cold tier is down.
-///   Create-only is the hot tier's: a key evicted from it can be put again, and the
-///   write-back then finds the old object in the cold tier and compares content tags (see
-///   [`WriteBackReport::clashed`]). A put refused as existing for an object the store does
-///   not count (an earlier put of it failed after the write landed) starts counting it, so
-///   the write-back copies it.
-/// - **Write-back** copies each object from the hot tier to the cold tier, create-only on
-///   the cold side: a cold object already there with the same size and content tag counts as
-///   copied. [`Tiered::write_back`] is one pass; [`Tiered::spawn_background`] runs passes.
-///   An object is read whole into memory, one at a time, and a delete waits for the copy in
-///   progress, so the backends must bound each of their calls with a timeout.
-/// - **Reads** go to the hot tier, and to the cold tier only when the hot tier has no such
-///   object (any other hot error is returned), with ranges. A read from the hot tier makes
-///   the object the most recently used. Nothing is promoted from cold to hot.
-/// - **Eviction** removes an object from the hot tier only when the cold tier holds it: a
-///   HEAD of both tiers must give the same size and content tag. It runs while the hot tier
-///   holds more bytes than its budget, least recently used first. With the cold tier down
-///   nothing is evicted and the hot tier grows past its budget until the cold tier is back
-///   and the write-back has run. [`Tiered::evict`] is one pass.
-/// - **Delete** removes the object from both tiers, hot first, and an object is not copied
-///   or evicted while it is being deleted.
-/// - **List** is the union of both tiers without duplicates, the hot tier's size where both
-///   hold the key. It lists the hot tier first: an object that is no longer in the hot tier
-///   when it is listed was removed only after the cold tier held it, so the cold listing that
-///   follows has it. It fails if either tier does not answer, so a listing that is used for
-///   recovery or collection is never short.
+/// The proxy needs no state for correctness: any number of proxies, each with an id of its
+/// own, work over the same two backends, and one that restarts finds what it needs in them.
+/// Objects are immutable. "Flushed" means that the cold tier holds the object, and a
+/// [`Reconciler`](crate::Reconciler) does the flushing from the journals the proxies write.
 ///
-/// # Restart
-/// The write-back needs no database of its own. What is pending is what the hot tier holds
-/// and the cold tier does not (or holds at another size), which [`Tiered::open`] reads by
-/// listing both tiers. A store opened over the same backends as a stopped one therefore
-/// finishes the stopped one's write-backs. What a restart loses is the use order: objects
-/// found by the listing start as used in listing order.
+/// - **Get** reads the hot tier, else the cold tier. An object it read from the cold tier is
+///   copied back into the hot tier, create-only (it is fine if another read got there
+///   first), unless the hot tier is above the critical mark; the copy is journaled, in the
+///   background, so that the reconciler can evict it again. A failed copy-back does not
+///   fail the read. A ranged read that misses the hot tier reads the whole object from the
+///   cold tier, since the hot tier takes the whole of it, and cuts the range from that.
+/// - **Head** reads the hot tier, else the cold tier, and copies nothing back.
+/// - **Put** is refused with [`Error::AlreadyExists`] if the key exists in the cold tier (it
+///   may have been evicted from the hot tier) or in the hot tier. The cold tier is asked
+///   first (a HEAD); then the object is written to the hot tier, create-only; then an entry
+///   is appended to the journal; then the put is acknowledged. **The acknowledgement waits
+///   for the journal object that holds the entry to be written to the hot tier**: an object
+///   that is acknowledged and not journaled would be in no one's list of objects to copy to
+///   the cold tier, and so could be lost with the hot tier. A put whose journal append fails
+///   is not acknowledged, and the object it wrote to the hot tier is removed, best effort:
+///   left there it would never be copied, and would make a retry of the put fail with
+///   [`Error::AlreadyExists`].
+/// - **Delete** removes the object from the hot tier and from the cold tier, then appends a
+///   delete entry, which lets the reconciler undo a copy to the cold tier that was under way.
+/// - **List** is the union of both tiers without duplicates (the hot tier's entry where both
+///   hold the key), in key order, without the keys under the reserved prefixes `_journal/` and
+///   `_tiering/`. [`Backend::list_page`] pages through the merged listing: the last key of a
+///   page is the continuation token, and `max_keys` is kept to. A put or a delete of a key
+///   under a reserved prefix is refused with [`Error::Reserved`].
 ///
-/// One `Tiered` is the only writer of the hot tier it is opened over: it counts the hot
-/// tier's bytes itself.
-pub struct Tiered {
-    hot: Arc<dyn Backend>,
-    cold: Arc<dyn Backend>,
-    budget: u64,
-    state: Mutex<State>,
-    /// Held while a pass handles one object and while an object is deleted, so that a delete
-    /// cannot be undone by a copy that read the object before it.
-    turn: TurnLock<()>,
-    /// Woken by a put, so the background task copies it without waiting out its interval.
-    wake: Notify,
+/// The journal is written in batches of at most [`ProxyConfig::batch_entries`] entries, each
+/// batch after [`ProxyConfig::linger`] at most, as `_journal/<proxy_id>/<seq>`, create-only,
+/// one object at a time. The numbers of a proxy go up by one from the first; a proxy that
+/// starts lists its own journal prefix and its checkpoint, and goes on after the highest
+/// number it finds.
+///
+/// **Capacity.** The proxy reads the usage that the reconciler publishes (`_tiering/usage`,
+/// at most every [`ProxyConfig::usage_refresh`]); a usage that is missing, unreadable or
+/// older than [`ProxyConfig::usage_stale_after`] counts as not full. Above
+/// [`ProxyConfig::critical`] of the budget a put waits [`ProxyConfig::back_pressure`] first.
+/// At the budget, or when the hot tier answers a put (of the object, or of the journal object
+/// that holds its entry) with [`Error::Full`], puts go straight to the cold tier, create-only
+/// and unjournaled, and never fail for lack of room in the hot tier; reads still use both
+/// tiers, and the hot tier is used again once the usage falls (or a
+/// [`ProxyConfig::usage_refresh`] after it said it was full).
+///
+/// **Known limits.**
+///
+/// - A put that is dropped (its caller gave up) after the object reached the hot tier and
+///   before its journal object was written leaves the object in the hot tier with no entry:
+///   it is never copied or evicted, and a retry of the put is refused as existing. Bound the
+///   calls inside the backends rather than dropping a put.
+/// - The checks and the write of a put are not atomic. Two proxies that put the same key
+///   at once, one to the hot tier and one (the hot tier being full for it) to the cold tier,
+///   may both succeed; the reconciler then counts the cold tier's object as the copy of the
+///   hot tier's, and the object of the cold tier is the one that stays.
+/// - A get that copies an object back into the hot tier while it is deleted may put it back
+///   there, with a put entry after the delete entry.
+pub struct Proxy {
+    inner: Arc<Inner>,
 }
 
-impl Tiered {
-    /// Opens a store over `hot` and `cold` that keeps the hot tier at or under
-    /// `hot_budget` bytes by evicting objects the cold tier holds.
+struct Inner {
+    hot: Arc<dyn Backend>,
+    cold: Arc<dyn Backend>,
+    config: ProxyConfig,
+    /// The batch that takes the next entry, if there is one.
+    open: Mutex<Option<Arc<Batch>>>,
+    /// The number of the next journal object. It is held while an object is written, so that
+    /// the objects are written one at a time, and a number is used again if its write failed.
+    next_seq: AsyncMutex<u64>,
+    capacity: Mutex<Capacity>,
+}
+
+impl Proxy {
+    /// Starts a proxy over `hot` and `cold`.
     ///
-    /// Lists both tiers to find what the hot tier holds and which of it the cold tier holds
-    /// with the same size; the rest is pending write-back.
+    /// It lists the journal objects of its own id in the hot tier, reads its checkpoint, and
+    /// tells the reconciler that it has a journal.
     ///
     /// # Errors
-    /// The error of a listing that failed.
+    /// [`Error::Other`] if the proxy id is empty or has a `/`, or the checkpoint is not
+    /// readable; the error of the hot tier if it fails one of those calls.
     pub async fn open(
         hot: Arc<dyn Backend>,
         cold: Arc<dyn Backend>,
-        hot_budget: u64,
+        config: ProxyConfig,
     ) -> Result<Self, Error> {
-        let in_hot = hot.list("").await?;
-        let in_cold = cold.list("").await?;
-        let cold_sizes: BTreeMap<String, u64> = in_cold
-            .into_iter()
-            .map(|object| (object.key, object.size))
-            .collect();
-        let mut state = State::default();
-        for object in in_hot {
-            let copied = cold_sizes.get(&object.key) == Some(&object.size);
-            state.insert(&object.key, object.size, copied);
+        let id = config.proxy_id.as_str();
+        if id.is_empty() || id.contains('/') {
+            return Err(Error::Other(format!("invalid proxy id {id:?}")));
         }
-        Ok(Self {
+        let prefix = journal_prefix(id);
+        let listed = hot.list(&prefix).await?;
+        let newest = listed
+            .iter()
+            .filter_map(|object| seq_of(&prefix, &object.key))
+            .max();
+        let checkpoint = load_checkpoint(hot.as_ref(), id).await?;
+        match hot.put(&proxy_key(id), Bytes::new()).await {
+            Ok(()) | Err(Error::AlreadyExists(_)) => {}
+            Err(error) => return Err(error),
+        }
+        let next = newest.unwrap_or(0).max(checkpoint.seq) + 1;
+        let inner = Inner {
             hot,
             cold,
-            budget: hot_budget,
-            state: Mutex::new(state),
-            turn: TurnLock::new(()),
-            wake: Notify::new(),
+            config,
+            open: Mutex::new(None),
+            next_seq: AsyncMutex::new(next),
+            capacity: Mutex::new(Capacity::default()),
+        };
+        Ok(Self {
+            inner: Arc::new(inner),
         })
     }
+}
 
-    /// The bytes the store counts in the hot tier.
-    #[must_use]
-    pub fn hot_bytes(&self) -> u64 {
-        self.state().bytes()
+impl Inner {
+    fn entry(&self, op: JournalOp, key: &str, size: u64) -> JournalEntry {
+        JournalEntry {
+            op,
+            key: key.to_owned(),
+            size,
+            time: self.config.clock.now(),
+        }
     }
 
-    /// The objects the cold tier does not hold yet and that did not clash, oldest first.
-    #[must_use]
-    pub fn pending(&self) -> Vec<String> {
-        self.state().pending()
+    /// Adds an entry to the open batch, which becomes the batch that is written when it is
+    /// full.
+    fn join(&self, entry: JournalEntry) -> Arc<Batch> {
+        let mut open = locked(&self.open);
+        let batch = Arc::clone(open.get_or_insert_with(Arc::default));
+        let count = {
+            let mut entries = locked(&batch.entries);
+            entries.push(entry);
+            entries.len()
+        };
+        if count >= self.config.batch_entries {
+            *open = None;
+            batch.full.notify_one();
+        }
+        batch
     }
 
-    /// The objects the cold tier holds with other content, in key order.
-    #[must_use]
-    pub fn clashed(&self) -> Vec<String> {
-        self.state().clashed()
+    /// Writes the batch as the next journal object: after its linger, or at once if it is
+    /// full. A number that is taken (by a write that failed after it reached the hot tier)
+    /// is skipped.
+    async fn write_batch(&self, batch: &Arc<Batch>) -> Result<(), Error> {
+        let wait = tokio::time::timeout(self.config.linger, batch.full.notified());
+        let _ = wait.await;
+        {
+            let mut open = locked(&self.open);
+            let _ = open.take_if(|current| Arc::ptr_eq(current, batch));
+        }
+        let entries = locked(&batch.entries).clone();
+        let body = encode_journal(&entries);
+        let mut next = self.next_seq.lock().await;
+        loop {
+            let key = journal_key(&self.config.proxy_id, *next);
+            match self.hot.put(&key, body.clone()).await {
+                Ok(()) => {
+                    *next += 1;
+                    return Ok(());
+                }
+                Err(Error::AlreadyExists(_)) => *next += 1,
+                Err(error) => return Err(error),
+            }
+        }
     }
 
-    fn state(&self) -> MutexGuard<'_, State> {
-        // No method panics while holding the lock, so a poisoned state is still whole.
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Appends an entry to the journal: waits until the journal object that holds it is
+    /// written to the hot tier. Callers that wait on one batch share its outcome, and if the
+    /// one that writes it is dropped, another takes over.
+    async fn append(&self, entry: JournalEntry) -> Result<(), Error> {
+        let batch = self.join(entry);
+        let outcome = batch.outcome.get_or_init(|| self.write_batch(&batch));
+        outcome.await.clone()
     }
 
-    /// Whether both tiers hold the key with the same size and content tag.
-    async fn same_object(&self, key: &str) -> Result<bool, Error> {
-        let hot = self.hot.head(key).await?;
+    /// Journals a put of an object that the hot tier holds, and takes the object out of the
+    /// hot tier if that fails.
+    async fn journal_put(&self, key: &str, size: u64) -> Result<(), Error> {
+        let appended = self.append(self.entry(JournalOp::Put, key, size)).await;
+        if appended.is_err() {
+            let _ = self.hot.delete(key).await;
+        }
+        appended
+    }
+
+    fn latch_full(&self) {
+        let until = Instant::now() + self.config.usage_refresh;
+        locked(&self.capacity).full_until = Some(until);
+    }
+
+    fn is_fresh(&self, usage: &Usage) -> bool {
+        let age = self.config.clock.now().saturating_sub(usage.time);
+        u128::from(age) <= self.config.usage_stale_after.as_millis()
+    }
+
+    async fn refresh_usage(&self, now: Instant) -> Option<u64> {
+        let fetched = self.hot.get(USAGE_KEY, None).await.ok();
+        let usage = fetched.and_then(|body| serde_json::from_slice::<Usage>(&body).ok());
+        let hot_bytes = usage.filter(|u| self.is_fresh(u)).map(|u| u.hot_bytes);
+        locked(&self.capacity).read = Some((now, hot_bytes));
+        hot_bytes
+    }
+
+    fn classify(&self, hot_bytes: Option<u64>) -> Level {
+        let budget = self.config.hot_budget;
+        let critical = (self.config.critical * budget as f64) as u64;
+        match hot_bytes {
+            Some(bytes) if bytes >= budget => Level::Full,
+            Some(bytes) if bytes >= critical => Level::Critical,
+            _ => Level::Open,
+        }
+    }
+
+    async fn level(&self) -> Level {
+        let now = Instant::now();
+        let (full_until, read) = {
+            let capacity = locked(&self.capacity);
+            (capacity.full_until, capacity.read)
+        };
+        if full_until.is_some_and(|until| now < until) {
+            return Level::Full;
+        }
+        let hot_bytes = match read {
+            Some((at, bytes)) if now.duration_since(at) < self.config.usage_refresh => bytes,
+            _ => self.refresh_usage(now).await,
+        };
+        self.classify(hot_bytes)
+    }
+
+    /// Writes the object to the cold tier, create-only, when the hot tier is full. The hot
+    /// tier is asked first, since a put is refused where either tier holds the key.
+    async fn put_cold(&self, key: &str, body: Bytes) -> Result<(), Error> {
+        match self.hot.head(key).await {
+            Ok(_) => return Err(Error::AlreadyExists(key.to_owned())),
+            Err(Error::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        self.cold.put(key, body).await
+    }
+
+    async fn put_hot(&self, key: &str, body: Bytes) -> Result<(), Error> {
+        let size = body.len() as u64;
+        let stored = match self.hot.put(key, body.clone()).await {
+            Ok(()) => self.journal_put(key, size).await,
+            failed => failed,
+        };
+        match stored {
+            Err(Error::Full(_)) => {
+                self.latch_full();
+                self.put_cold(key, body).await
+            }
+            other => other,
+        }
+    }
+
+    async fn put_object(&self, key: &str, body: Bytes) -> Result<(), Error> {
+        refuse_reserved(key)?;
         match self.cold.head(key).await {
-            Ok(cold) => Ok(cold == hot),
-            Err(Error::NotFound(_)) => Ok(false),
-            Err(error) => Err(error),
+            Ok(_) => return Err(Error::AlreadyExists(key.to_owned())),
+            Err(Error::NotFound(_)) => {}
+            Err(error) => return Err(error),
         }
-    }
-
-    /// Copies one object to the cold tier: `true` if the cold tier holds it afterwards,
-    /// `false` if it holds other content under the key.
-    async fn copy_one(&self, key: &str) -> Result<bool, Error> {
-        let body = self.hot.get(key, None).await?;
-        match self.cold.put(key, body).await {
-            Ok(()) => Ok(true),
-            Err(Error::AlreadyExists(_)) => self.same_object(key).await,
-            Err(error) => Err(error),
-        }
-    }
-
-    /// One write-back pass: copies the objects that are pending when it starts to the cold
-    /// tier, oldest first.
-    ///
-    /// An object put during the pass waits for the next one, so a steady stream of puts
-    /// cannot keep the pass from ending (the eviction after it would not run). An object
-    /// deleted before its turn is left out. An object that fails stays pending and is tried
-    /// again by the next pass. A pass ends at the first failure that says the cold tier (or
-    /// the hot tier) is unavailable, since the next object would fail the same way.
-    pub async fn write_back(&self) -> WriteBackReport {
-        let mut report = WriteBackReport::default();
-        let work = self.state().pending();
-        for key in work {
-            let _turn = self.turn.lock().await;
-            if !self.state().is_pending(&key) {
-                continue;
+        match self.level().await {
+            Level::Full => self.put_cold(key, body).await,
+            Level::Critical => {
+                tokio::time::sleep(self.config.back_pressure).await;
+                self.put_hot(key, body).await
             }
-            match self.copy_one(&key).await {
-                Ok(true) => {
-                    self.state().set_copied(&key, true);
-                    report.copied.push(key);
-                }
-                Ok(false) => {
-                    self.state().set_clashed(&key);
-                    report.clashed.push(key);
-                }
-                Err(error) => {
-                    if note_failure(&mut report.failed, key, error) {
-                        break;
-                    }
-                }
-            }
+            Level::Open => self.put_hot(key, body).await,
         }
-        report
     }
 
-    /// Starts tracking an object the hot tier holds and the store does not know: one whose
-    /// put was refused as existing after an earlier put of it failed with the write landed.
-    /// Left untracked it would never be copied to the cold tier.
-    async fn adopt(&self, key: &str) {
-        if self.state().tracks(key) {
+    /// Copies an object read from the cold tier into the hot tier, and journals the copy in
+    /// the background.
+    async fn copy_back(self: &Arc<Self>, key: &str, body: &Bytes) {
+        if self.level().await >= Level::Critical {
             return;
         }
-        if let Ok(meta) = self.hot.head(key).await {
-            self.state().insert(key, meta.size, false);
-            self.wake.notify_one();
-        }
-    }
-
-    /// Removes one object from the hot tier if the cold tier holds it: `true` if removed,
-    /// `false` if the cold tier does not hold it (it is pending again).
-    async fn evict_one(&self, key: &str) -> Result<bool, Error> {
-        if !self.same_object(key).await? {
-            self.state().set_copied(key, false);
-            return Ok(false);
-        }
-        self.hot.delete(key).await?;
-        self.state().remove(key);
-        Ok(true)
-    }
-
-    /// One eviction pass: while the hot tier holds more bytes than its budget, removes the
-    /// least recently used object the cold tier holds.
-    ///
-    /// Objects the cold tier has not been seen to hold are never candidates, so with the
-    /// cold tier down, or the write-back behind, the pass ends with the hot tier over its
-    /// budget. Before each removal the cold tier is asked again; an object it no longer
-    /// holds stays and becomes pending. A pass ends at the first failure that says a tier
-    /// is unavailable.
-    pub async fn evict(&self) -> EvictionReport {
-        let mut report = EvictionReport::default();
-        let mut skip = BTreeSet::new();
-        loop {
-            let _turn = self.turn.lock().await;
-            let next = self.state().next_victim(self.budget, &skip);
-            let Some(key) = next else {
-                break;
-            };
-            match self.evict_one(&key).await {
-                Ok(true) => report.evicted.push(key),
-                Ok(false) => report.unconfirmed.push(key),
-                Err(error) => {
-                    skip.insert(key.clone());
-                    if note_failure(&mut report.failed, key, error) {
-                        break;
-                    }
-                }
+        match self.hot.put(key, body.clone()).await {
+            Ok(()) => {
+                let inner = Arc::clone(self);
+                let key = key.to_owned();
+                let size = body.len() as u64;
+                drop(tokio::spawn(async move {
+                    let _ = inner.journal_put(&key, size).await;
+                }));
             }
-        }
-        report
-    }
-
-    /// A write-back pass, then an eviction pass.
-    pub async fn maintain(&self) -> Maintenance {
-        let write_back = self.write_back().await;
-        let eviction = self.evict().await;
-        Maintenance {
-            write_back,
-            eviction,
+            Err(Error::Full(_)) => self.latch_full(),
+            Err(_) => {}
         }
     }
 
-    /// Starts a task that runs [`Tiered::maintain`] at once, then again whenever an object
-    /// is put and at least every `retry_every` (a millisecond at least, so a zero interval
-    /// does not keep the task spinning), so a pass that failed is retried. The report of
-    /// each pass is dropped: [`Tiered::pending`] and [`Tiered::clashed`] say what is left.
-    ///
-    /// The task stops when the returned handle is dropped, possibly in the middle of a
-    /// pass. A copy that reached the cold tier but was not recorded is found there by the
-    /// next pass. A removal from the hot tier that was not recorded leaves the object
-    /// counted in [`Tiered::hot_bytes`] until a store is opened again over the backends.
-    ///
-    /// Must be called inside a tokio runtime.
-    #[must_use]
-    pub fn spawn_background(self: &Arc<Self>, retry_every: Duration) -> Background {
-        let tiered = Arc::clone(self);
-        let every = retry_every.max(MIN_RETRY);
-        let task: JoinHandle<()> = tokio::spawn(async move {
-            loop {
-                tiered.maintain().await;
-                let _ = tokio::time::timeout(every, tiered.wake.notified()).await;
-            }
-        });
-        Background { task }
-    }
-}
-
-/// Records a failed step and says whether the pass is to stop: the failure says a backend is
-/// unavailable, so the next object would fail the same way.
-fn note_failure(failed: &mut Vec<(String, Error)>, key: String, error: Error) -> bool {
-    let stop = error.is_unavailable();
-    failed.push((key, error));
-    stop
-}
-
-/// The handle of the task [`Tiered::spawn_background`] started. Dropping it stops the task.
-pub struct Background {
-    task: JoinHandle<()>,
-}
-
-impl Drop for Background {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-#[async_trait]
-impl Backend for Tiered {
-    async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
-        let size = body.len() as u64;
-        if let Err(error) = self.hot.put(key, body).await {
-            if matches!(error, Error::AlreadyExists(_)) {
-                self.adopt(key).await;
-            }
-            return Err(error);
-        }
-        self.state().insert(key, size, false);
-        self.wake.notify_one();
-        Ok(())
-    }
-
-    async fn get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
+    async fn get_object(
+        self: &Arc<Self>,
+        key: &str,
+        range: Option<ByteRange>,
+    ) -> Result<Bytes, Error> {
         match self.hot.get(key, range).await {
-            Ok(body) => {
-                self.state().touch(key);
-                Ok(body)
-            }
-            Err(Error::NotFound(_)) => self.cold.get(key, range).await,
-            Err(error) => Err(error),
+            Err(Error::NotFound(_)) => {}
+            found => return found,
+        }
+        let body = self.cold.get(key, None).await?;
+        self.copy_back(key, &body).await;
+        match range {
+            Some(range) => range.slice(&body),
+            None => Ok(body),
         }
     }
 
-    async fn head(&self, key: &str) -> Result<Meta, Error> {
+    async fn head_object(&self, key: &str) -> Result<Meta, Error> {
         match self.hot.head(key).await {
             Err(Error::NotFound(_)) => self.cold.head(key).await,
             found => found,
         }
     }
 
-    async fn delete(&self, key: &str) -> Result<(), Error> {
-        let _turn = self.turn.lock().await;
+    async fn delete_object(&self, key: &str) -> Result<(), Error> {
+        refuse_reserved(key)?;
         self.hot.delete(key).await?;
-        self.state().remove(key);
-        self.cold.delete(key).await
+        self.cold.delete(key).await?;
+        self.append(self.entry(JournalOp::Delete, key, 0)).await
+    }
+
+    async fn list_objects(&self, prefix: &str) -> Result<Vec<Listed>, Error> {
+        let mut in_hot = self.hot.list(prefix).await?;
+        in_hot.retain(is_data);
+        let in_cold = self.cold.list(prefix).await?;
+        Ok(merge(in_hot, in_cold, usize::MAX))
+    }
+
+    async fn list_objects_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Result<Vec<Listed>, Error> {
+        let in_hot = data_page(self.hot.as_ref(), prefix, start_after, max_keys).await?;
+        let in_cold = self.cold.list_page(prefix, start_after, max_keys).await?;
+        Ok(merge(in_hot, in_cold, max_keys))
+    }
+}
+
+/// The first `max_keys` objects of the listing of `hot` after `start_after`, without the
+/// objects under the reserved prefixes: pages of the hot tier are read until enough objects
+/// are left or the listing ends.
+async fn data_page(
+    hot: &dyn Backend,
+    prefix: &str,
+    start_after: Option<&str>,
+    max_keys: usize,
+) -> Result<Vec<Listed>, Error> {
+    let mut found: Vec<Listed> = Vec::new();
+    let mut after = start_after.map(str::to_owned);
+    loop {
+        let page = hot.list_page(prefix, after.as_deref(), max_keys).await?;
+        let full_page = page.len() >= max_keys;
+        after = page.last().map(|object| object.key.clone());
+        found.extend(page.into_iter().filter(is_data));
+        if !full_page || found.len() >= max_keys {
+            break;
+        }
+    }
+    found.truncate(max_keys);
+    Ok(found)
+}
+
+/// The objects of both listings, each key once (the hot tier's entry where both have it), in
+/// key order, at most `max_keys` of them.
+fn merge(in_hot: Vec<Listed>, in_cold: Vec<Listed>, max_keys: usize) -> Vec<Listed> {
+    let mut merged: BTreeMap<String, Listed> = BTreeMap::new();
+    for object in in_hot.into_iter().chain(in_cold) {
+        merged.entry(object.key.clone()).or_insert(object);
+    }
+    merged.into_values().take(max_keys).collect()
+}
+
+#[async_trait]
+impl Backend for Proxy {
+    async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
+        self.inner.put_object(key, body).await
+    }
+
+    /// The proxy keeps objects immutable: it never replaces one.
+    async fn put_if_match(&self, key: &str, _body: Bytes, _etag: &str) -> Result<String, Error> {
+        Err(Error::Other(format!("the proxy does not replace {key}")))
+    }
+
+    async fn get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
+        self.inner.get_object(key, range).await
+    }
+
+    async fn head(&self, key: &str) -> Result<Meta, Error> {
+        self.inner.head_object(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), Error> {
+        self.inner.delete_object(key).await
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<Listed>, Error> {
-        let mut merged: BTreeMap<String, u64> = BTreeMap::new();
-        for object in self.hot.list(prefix).await? {
-            merged.insert(object.key, object.size);
-        }
-        for object in self.cold.list(prefix).await? {
-            merged.entry(object.key).or_insert(object.size);
-        }
-        let objects: Vec<Listed> = merged
-            .into_iter()
-            .map(|(key, size)| Listed { key, size })
-            .collect();
-        Ok(objects)
+        self.inner.list_objects(prefix).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Result<Vec<Listed>, Error> {
+        self.inner
+            .list_objects_page(prefix, start_after, max_keys)
+            .await
     }
 }

@@ -54,17 +54,30 @@ impl ByteRange {
     }
 }
 
-/// What a HEAD says about an object: its size and a content tag.
+/// What a HEAD says about an object: its size, a content tag and when it was last written.
 ///
-/// Two objects are taken to hold the same bytes when their `Meta` are equal, so a backend's
-/// tag must be a function of the content (a checksum, or an entity tag that the backend
-/// computes from the bytes) and the same function on both sides of a comparison.
+/// Two objects are taken to hold the same bytes when [`Meta::same_content`] says so, so a
+/// backend's tag must be a function of the content (a checksum, or an entity tag that the
+/// backend computes from the bytes) and the same function on both sides of a comparison. The
+/// time of the last write is not part of the content: it is a backend's own clock.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Meta {
     /// The object's size in bytes.
     pub size: u64,
     /// The object's content tag, compared as it is.
     pub tag: String,
+    /// When the object was last written, in milliseconds since the Unix epoch, as the
+    /// backend's clock counts them (a backend with a coarser clock, whole seconds as S3 has,
+    /// gives equal times to objects written close together).
+    pub modified: u64,
+}
+
+impl Meta {
+    /// Whether both describe the same bytes: the same size and the same content tag.
+    #[must_use]
+    pub fn same_content(&self, other: &Meta) -> bool {
+        (self.size, &self.tag) == (other.size, &other.tag)
+    }
 }
 
 /// One object in a listing.
@@ -74,23 +87,41 @@ pub struct Listed {
     pub key: String,
     /// The object's size in bytes.
     pub size: u64,
+    /// When the object was last written, as in [`Meta::modified`].
+    pub modified: u64,
 }
 
-/// An S3-compatible object store with the five calls this crate needs, and no more.
+/// Whether `key` sorts after the key a listing is to start after, if there is one.
+fn is_after(key: &str, start_after: Option<&str>) -> bool {
+    start_after.is_none_or(|after| key > after)
+}
+
+/// An S3-compatible object store with the calls this crate needs, and no more.
 ///
-/// Objects are immutable: a key is written once. The trait is used as `dyn Backend`, so a
-/// tiered store holds its two tiers without a type parameter.
+/// Objects are immutable: a key is written once. The exception is the few small objects that
+/// the proxy and the reconciler keep for themselves (the lease, the checkpoints, the usage),
+/// which [`Backend::put_if_match`] rewrites in place. The trait is used as `dyn Backend`, so
+/// a proxy holds its two tiers without a type parameter.
 ///
-/// An implementation over a network bounds each call with a timeout of its own: the tiered
-/// store waits for the calls it makes, and a call that never returns stops its write-back and
-/// the deletes behind it.
+/// An implementation over a network bounds each call with a timeout of its own: the proxy
+/// and the reconciler wait for the calls they make, and a call that never returns stops the
+/// copies to the cold tier and the deletes behind it.
 #[async_trait]
 pub trait Backend: Send + Sync {
     /// Writes an object, only if the key does not exist (`If-None-Match: *`).
     ///
     /// # Errors
     /// [`Error::AlreadyExists`] if the key exists; the stored object is left as it was.
+    /// [`Error::Full`] if the backend has no room for the object.
     async fn put(&self, key: &str, body: Bytes) -> Result<(), Error>;
+
+    /// Replaces the object, only if its content tag is `etag` (`If-Match`), and gives the
+    /// content tag of the new object.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] if no object has the key. [`Error::PreconditionFailed`] if the
+    /// object has another content tag; the stored object is left as it was.
+    async fn put_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<String, Error>;
 
     /// Reads the object, or the bytes of `range` of it (see [`ByteRange`]).
     ///
@@ -98,7 +129,7 @@ pub trait Backend: Send + Sync {
     /// [`Error::NotFound`] if no object has the key.
     async fn get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error>;
 
-    /// The object's size and content tag.
+    /// The object's size, content tag and time of last write.
     ///
     /// # Errors
     /// [`Error::NotFound`] if no object has the key.
@@ -108,7 +139,28 @@ pub trait Backend: Send + Sync {
     /// is safe.
     async fn delete(&self, key: &str) -> Result<(), Error>;
 
-    /// Every object whose key starts with `prefix`, in ascending key order. For recovery and
-    /// garbage collection only: the listing need not be consistent with recent writes.
+    /// Every object whose key starts with `prefix`, in ascending key order. The listing need
+    /// not be consistent with recent writes.
     async fn list(&self, prefix: &str) -> Result<Vec<Listed>, Error>;
+
+    /// A page of the objects [`Backend::list`] gives: at most `max_keys` of those whose key
+    /// sorts after `start_after` (all of them for `None`), in ascending key order.
+    ///
+    /// The last key of a page is the continuation token of the next one, and a page of fewer
+    /// than `max_keys` objects is the last. The provided implementation cuts the whole
+    /// listing; a backend over a network lists a page at a time instead.
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Result<Vec<Listed>, Error> {
+        let all = self.list(prefix).await?;
+        let page: Vec<Listed> = all
+            .into_iter()
+            .filter(|object| is_after(&object.key, start_after))
+            .take(max_keys)
+            .collect();
+        Ok(page)
+    }
 }

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tierstore::{Backend, ByteRange, CachedStore, Error, FaultyBackend, MemoryBackend, Op};
 
-use crate::support::{Rig, body, keys};
+use crate::support::{Rig, assert_absent, body, keys, page};
 
 /// A cache over a memory backend whose calls are counted.
 struct Fixture {
@@ -197,7 +197,7 @@ async fn two_simultaneous_misses_leave_one_entry() {
     assert_eq!(f.cached.cached_bytes(), 5);
 }
 
-/// Asserts that put, head and list go to the backend as they are.
+/// Asserts that put, head, list and a page of a listing go to the backend as they are.
 #[tokio::test]
 async fn put_head_and_list_pass_through() {
     let f = fixture(100);
@@ -205,29 +205,50 @@ async fn put_head_and_list_pass_through() {
     assert_eq!(f.cached.head("k").await.unwrap().size, 5);
     assert_eq!(keys(&f.cached).await, ["k"]);
     assert_eq!(keys(&*f.backend).await, ["k"]);
+    assert_eq!(page(&f.cached, None, 10).await, ["k"]);
     assert_eq!(f.backend.calls(Op::Head), 1);
+    assert_eq!(f.backend.calls(Op::List), 3);
     assert_eq!(f.cached.cached_bytes(), 0);
 }
 
-/// Asserts that the cache works in front of a tiered store: a repeated range is not read
-/// from either tier again, and a delete through the cache removes the object from both
-/// tiers.
+/// Asserts that a put that replaces an object drops its cached ranges, so that the next read
+/// sees the new bytes, and that a put that is refused leaves the cached ranges in place.
 #[tokio::test]
-async fn the_cache_works_in_front_of_a_tiered_store() {
+async fn a_put_that_replaces_an_object_drops_its_cached_ranges() {
+    let f = fixture(100);
+    f.cached.put("k", body("old")).await.unwrap();
+    f.cached.get("k", None).await.unwrap();
+    let tag = f.cached.head("k").await.unwrap().tag;
+
+    let refused = f.cached.put_if_match("k", body("new!"), "other").await;
+    assert_eq!(refused, Err(Error::PreconditionFailed("k".to_owned())));
+    assert_eq!(f.cached.cached_bytes(), 3);
+
+    let swap = f.cached.put_if_match("k", body("new!"), &tag);
+    swap.await.unwrap();
+    assert_eq!(f.cached.cached_bytes(), 0);
+    assert_eq!(f.cached.get("k", None).await.unwrap(), body("new!"));
+}
+
+/// Asserts that the cache works in front of a proxy: a repeated range is not read from
+/// either tier again, and a delete through the cache removes the object from both tiers.
+#[tokio::test(start_paused = true)]
+async fn the_cache_works_in_front_of_a_proxy() {
     let rig = Rig::new();
-    let tiered = Arc::new(rig.open(100).await);
-    let cached = CachedStore::new(tiered.clone(), 100);
+    let proxy = Arc::new(rig.proxy("p1", 1000).await);
+    let cached = CachedStore::new(proxy.clone(), 100);
     cached.put("k", body("0123456789")).await.unwrap();
+    let reads = rig.hot.calls(Op::Get);
     for _ in 0..3 {
         let got = cached.get("k", range(4, 2)).await.unwrap();
         assert_eq!(got, body("45"));
     }
-    assert_eq!(rig.hot.calls(Op::Get), 1);
+    assert_eq!(rig.hot.calls(Op::Get), reads + 1);
     assert_eq!(rig.cold.calls(Op::Get), 0);
 
-    tiered.write_back().await;
+    rig.cold_mem.put("k", body("0123456789")).await.unwrap();
     cached.delete("k").await.unwrap();
-    assert_eq!(keys(&*rig.hot_mem).await, Vec::<String>::new());
-    assert_eq!(keys(&*rig.cold_mem).await, Vec::<String>::new());
+    assert_absent(&*rig.hot_mem, "k").await;
+    assert_absent(&*rig.cold_mem, "k").await;
     assert_eq!(cached.cached_bytes(), 0);
 }

@@ -1,237 +1,241 @@
-//! What a [`Tiered`](crate::Tiered) knows about the objects in its hot tier.
+//! What a [`Reconciler`](crate::Reconciler) keeps in memory: what the hot tier holds, as the
+//! journals say, and how far each proxy's journal has been applied.
+//!
+//! None of it is a record of anything. It is rebuilt from the checkpoints and the journal
+//! objects, which are what the reconciler persists, by reading them again.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, VecDeque};
 
-/// One object in the hot tier.
-struct Entry {
-    /// The object's size in bytes.
+use crate::journal::{Checkpoint, JournalEntry, JournalOp};
+
+/// Where a journal entry sits in the journal of a proxy: the number of the object, and the
+/// index of the entry in the object. Positions are ordered as the entries were appended.
+pub(crate) type Position = (u64, u64);
+
+/// An object the journals say the hot tier holds, and the entry that put it there.
+struct Resident {
+    proxy: String,
+    at: Position,
     size: u64,
-    /// When it was last put or read, as a position in the order of uses.
-    tick: u64,
-    /// Whether the cold tier holds a copy: the write-back copied it, or recovery found one
-    /// of the same size.
+    /// Whether the cold tier holds it: the journal object of the entry is applied.
     copied: bool,
 }
 
-/// The hot tier's objects, with their use order and the byte count the budget is held to.
-///
-/// It is a cache of what the two backends hold, rebuilt by listing them when a store is
-/// opened. It is not a record of anything the backends do not hold.
+impl Resident {
+    /// Whether the object was put by the entry at `at` in the journal of `proxy`.
+    fn is_entry(&self, proxy: &str, at: Position) -> bool {
+        (self.proxy.as_str(), self.at) == (proxy, at)
+    }
+}
+
+/// A put entry whose object the cold tier holds, which the hot tier may drop.
+#[derive(Clone)]
+pub(crate) struct Candidate {
+    pub(crate) at: Position,
+    pub(crate) key: String,
+    pub(crate) time: u64,
+}
+
+/// Where the reconciler is in the journal of one proxy.
 #[derive(Default)]
-pub(crate) struct State {
-    entries: BTreeMap<String, Entry>,
-    /// Ticks to keys, least recently used first. Every entry has exactly one tick here.
-    order: BTreeMap<u64, String>,
-    /// Keys the cold tier holds with other content than the hot tier's. The write-back leaves
-    /// them alone until they are deleted.
-    clashed: BTreeSet<String>,
-    clock: u64,
-    bytes: u64,
+pub(crate) struct Stream {
+    /// The number of the last journal object that was read.
+    pub(crate) read_through: u64,
+    /// The journal objects up to this number are applied.
+    pub(crate) checkpoint: u64,
+    /// The entries before this position are done with. It is where the journal is read from
+    /// after a restart.
+    pub(crate) cursor: Position,
+    /// The puts the cold tier holds, in the order they were appended, that the hot tier has
+    /// not dropped.
+    pub(crate) candidates: VecDeque<Candidate>,
+    /// The journal objects that are read and not applied yet, in order.
+    pub(crate) pending: VecDeque<(u64, Vec<JournalEntry>)>,
+    /// The journal objects that were read, with the time they were written, in order. They
+    /// are deleted once they are applied, left behind by the cursor, and old enough. After a
+    /// restart the objects before the cursor are not in it: they are not read again.
+    pub(crate) retained: VecDeque<(u64, u64)>,
+    /// The checkpoint as it is stored.
+    pub(crate) persisted: Checkpoint,
 }
 
-impl State {
-    /// Starts tracking an object, as the most recently used. An object already tracked under
-    /// the key is replaced, so that every entry keeps exactly one tick and one count of bytes.
-    pub(crate) fn insert(&mut self, key: &str, size: u64, copied: bool) {
-        if let Some(old) = self.entries.remove(key) {
-            self.order.remove(&old.tick);
-            self.bytes -= old.size;
+impl Stream {
+    /// A stream that resumes from a stored checkpoint.
+    pub(crate) fn resume(checkpoint: Checkpoint) -> Self {
+        Self {
+            read_through: checkpoint.evict_seq.saturating_sub(1),
+            checkpoint: checkpoint.seq,
+            cursor: (checkpoint.evict_seq, checkpoint.evict_idx),
+            persisted: checkpoint,
+            ..Self::default()
         }
-        self.clock += 1;
-        self.order.insert(self.clock, key.to_owned());
-        let entry = Entry {
+    }
+
+    /// The checkpoint to store now.
+    pub(crate) fn snapshot(&self) -> Checkpoint {
+        Checkpoint {
+            seq: self.checkpoint,
+            evict_seq: self.cursor.0,
+            evict_idx: self.cursor.1,
+        }
+    }
+}
+
+/// The objects the hot tier holds by the journals, the bytes they take, and the streams.
+#[derive(Default)]
+pub(crate) struct Books {
+    /// The latest put entry of each key that the hot tier holds.
+    index: BTreeMap<String, Resident>,
+    usage: u64,
+    lag: u64,
+    pub(crate) streams: BTreeMap<String, Stream>,
+}
+
+impl Books {
+    /// The bytes of the objects the hot tier holds.
+    pub(crate) fn usage(&self) -> u64 {
+        self.usage
+    }
+
+    /// The bytes of the objects the hot tier holds that the cold tier does not.
+    pub(crate) fn lag(&self) -> u64 {
+        self.lag
+    }
+
+    pub(crate) fn stream(&mut self, proxy: &str) -> &mut Stream {
+        self.streams.entry(proxy.to_owned()).or_default()
+    }
+
+    /// Whether the put entry at `at` is the latest word on `key`.
+    pub(crate) fn is_current(&self, proxy: &str, at: Position, key: &str) -> bool {
+        let found = self.index.get(key);
+        found.is_some_and(|resident| resident.is_entry(proxy, at))
+    }
+
+    /// Takes a key out of what the hot tier holds. A key that is not there is ignored.
+    pub(crate) fn forget(&mut self, key: &str) {
+        if let Some(old) = self.index.remove(key) {
+            self.usage -= old.size;
+            if !old.copied {
+                self.lag -= old.size;
+            }
+        }
+    }
+
+    /// Records a put entry: the hot tier holds the object, and the cold tier does not yet.
+    pub(crate) fn put(&mut self, proxy: &str, at: Position, key: &str, size: u64) {
+        self.forget(key);
+        self.usage += size;
+        self.lag += size;
+        let resident = Resident {
+            proxy: proxy.to_owned(),
+            at,
             size,
-            tick: self.clock,
-            copied,
+            copied: false,
         };
-        self.entries.insert(key.to_owned(), entry);
-        self.bytes += size;
+        self.index.insert(key.to_owned(), resident);
     }
 
-    /// Stops tracking an object, and forgets that it clashed.
-    pub(crate) fn remove(&mut self, key: &str) {
-        if let Some(entry) = self.entries.remove(key) {
-            self.order.remove(&entry.tick);
-            self.bytes -= entry.size;
-        }
-        self.clashed.remove(key);
-    }
-
-    /// Makes an object the most recently used, if it is tracked.
-    pub(crate) fn touch(&mut self, key: &str) {
-        self.clock += 1;
-        let clock = self.clock;
-        if let Some(entry) = self.entries.get_mut(key) {
-            self.order.remove(&entry.tick);
-            entry.tick = clock;
-            self.order.insert(clock, key.to_owned());
-        }
-    }
-
-    /// Records whether the cold tier holds a copy of an object. An untracked key is ignored.
-    pub(crate) fn set_copied(&mut self, key: &str, copied: bool) {
-        if let Some(entry) = self.entries.get_mut(key) {
-            entry.copied = copied;
-        }
-    }
-
-    /// Records that the cold tier holds other content under this key than the hot tier.
-    pub(crate) fn set_clashed(&mut self, key: &str) {
-        self.clashed.insert(key.to_owned());
-    }
-
-    /// Whether an object is tracked.
-    pub(crate) fn tracks(&self, key: &str) -> bool {
-        self.entries.contains_key(key)
-    }
-
-    /// The bytes of the tracked objects.
-    pub(crate) fn bytes(&self) -> u64 {
-        self.bytes
-    }
-
-    /// The keys that clashed, in key order.
-    pub(crate) fn clashed(&self) -> Vec<String> {
-        self.clashed.iter().cloned().collect()
-    }
-
-    /// The tracked objects the cold tier does not hold yet and that did not clash, least
-    /// recently used first.
-    fn pending_keys(&self) -> impl Iterator<Item = &String> {
-        self.order
-            .values()
-            .filter(move |key| !self.entries[*key].copied)
-            .filter(move |key| !self.clashed.contains(*key))
-    }
-
-    /// The objects the cold tier does not hold yet and that did not clash, least recently
-    /// used first.
-    pub(crate) fn pending(&self) -> Vec<String> {
-        self.pending_keys().cloned().collect()
-    }
-
-    /// Whether an object is tracked and the cold tier does not hold it yet and it did not
-    /// clash.
-    pub(crate) fn is_pending(&self, key: &str) -> bool {
-        let Some(entry) = self.entries.get(key) else {
-            return false;
+    /// Records that the cold tier holds the object of a put entry, which makes it a
+    /// candidate for eviction. An entry that a later one replaced is ignored.
+    pub(crate) fn copied(&mut self, proxy: &str, at: Position, key: &str, time: u64) {
+        let found = self.index.get_mut(key);
+        let Some(resident) = found.filter(|r| r.is_entry(proxy, at)) else {
+            return;
         };
-        if entry.copied {
-            return false;
+        resident.copied = true;
+        self.lag -= resident.size;
+        let candidate = Candidate {
+            at,
+            key: key.to_owned(),
+            time,
+        };
+        self.stream(proxy).candidates.push_back(candidate);
+    }
+
+    /// Records that the hot tier does not hold the object of a put entry after all (it was
+    /// deleted before the copy). An entry that a later one replaced is ignored.
+    pub(crate) fn gone(&mut self, proxy: &str, at: Position, key: &str) {
+        if self.is_current(proxy, at, key) {
+            self.forget(key);
         }
-        !self.clashed.contains(key)
     }
 
-    /// The least recently used object the cold tier holds that is not in `skip`, if the
-    /// tracked bytes are above `budget`.
-    pub(crate) fn next_victim(&self, budget: u64, skip: &BTreeSet<String>) -> Option<String> {
-        if self.bytes <= budget {
-            return None;
+    /// Reads a journal object into the books: registers its entries, and queues the object
+    /// to be applied unless the checkpoint says it is applied.
+    pub(crate) fn read_object(
+        &mut self,
+        proxy: &str,
+        seq: u64,
+        modified: u64,
+        entries: Vec<JournalEntry>,
+    ) {
+        let stream = self.stream(proxy);
+        let cursor = stream.cursor;
+        let applied = seq <= stream.checkpoint;
+        stream.read_through = seq;
+        stream.retained.push_back((seq, modified));
+        for (index, entry) in entries.iter().enumerate() {
+            let at = (seq, index as u64);
+            if at < cursor {
+                continue;
+            }
+            match entry.op {
+                JournalOp::Put => {
+                    self.put(proxy, at, &entry.key, entry.size);
+                    if applied {
+                        self.copied(proxy, at, &entry.key, entry.time);
+                    }
+                }
+                JournalOp::Delete => self.forget(&entry.key),
+                JournalOp::Unknown => {}
+            }
         }
-        self.order
-            .values()
-            .filter(|key| self.entries[*key].copied)
-            .find(|key| !skip.contains(key.as_str()))
-            .cloned()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn skipping(keys: &[&str]) -> BTreeSet<String> {
-        keys.iter().map(|key| String::from(*key)).collect()
+        if !applied {
+            self.stream(proxy).pending.push_back((seq, entries));
+        }
     }
 
-    /// Asserts that the tracked bytes, the pending list and the clash list follow inserts,
-    /// touches, clashes and removals, and that removing an untracked key changes nothing.
-    #[test]
-    fn bytes_and_pending_follow_the_objects() {
-        let mut state = State::default();
-        state.insert("a", 10, false);
-        state.insert("b", 20, true);
-        state.insert("c", 5, false);
-        assert_eq!(state.bytes(), 35);
-        assert_eq!(state.pending(), ["a", "c"]);
-        state.touch("a");
-        assert_eq!(state.pending(), ["c", "a"]);
-        state.set_clashed("c");
-        assert_eq!(state.pending(), ["a"]);
-        assert_eq!(state.clashed(), ["c"]);
-        state.remove("c");
-        assert_eq!(state.bytes(), 30);
-        assert_eq!(state.clashed(), Vec::<String>::new());
-        state.remove("nothing");
-        assert_eq!(state.bytes(), 30);
+    /// The first candidate of the stream whose first candidate is the oldest, by its time
+    /// and then the name of the proxy, with the name of the proxy.
+    pub(crate) fn next_victim(&self) -> Option<(String, Candidate)> {
+        let mut oldest: Option<(&String, &Candidate)> = None;
+        for (id, stream) in &self.streams {
+            let Some(front) = stream.candidates.front() else {
+                continue;
+            };
+            match oldest {
+                Some((have_id, have)) if (have.time, have_id) <= (front.time, id) => {}
+                _ => oldest = Some((id, front)),
+            }
+        }
+        oldest.map(|(id, front)| (id.clone(), front.clone()))
     }
 
-    /// Asserts that inserting a key that is already tracked replaces its entry: the bytes are
-    /// the new object's, the key is listed once in the use order, and removing it leaves
-    /// nothing behind.
-    #[test]
-    fn inserting_a_tracked_key_replaces_its_entry() {
-        let mut state = State::default();
-        state.insert("a", 10, true);
-        state.insert("b", 5, false);
-        state.insert("a", 3, false);
-        assert_eq!(state.bytes(), 8);
-        assert_eq!(state.pending(), ["b", "a"]);
-        state.remove("a");
-        assert_eq!(state.bytes(), 5);
-        assert_eq!(state.pending(), ["b"]);
-        assert!(state.tracks("b"));
-        assert!(!state.tracks("a"));
+    /// Takes the first candidate of a stream off, and moves the cursor to the next candidate,
+    /// or to the end of what is applied if there is none.
+    pub(crate) fn pop(&mut self, proxy: &str) {
+        let stream = self.stream(proxy);
+        stream.candidates.pop_front();
+        let next = stream.candidates.front().map(|front| front.at);
+        stream.cursor = next.unwrap_or((stream.checkpoint + 1, 0));
     }
 
-    /// Asserts that marking or touching an untracked key changes nothing, and that
-    /// marking a tracked one moves it between the pending list and the copied ones.
-    #[test]
-    fn untracked_keys_are_ignored() {
-        let mut state = State::default();
-        state.set_copied("nothing", true);
-        state.touch("nothing");
-        assert_eq!(state.bytes(), 0);
-        state.insert("a", 1, false);
-        state.set_copied("a", true);
-        assert_eq!(state.pending(), Vec::<String>::new());
-        state.set_copied("a", false);
-        assert_eq!(state.pending(), ["a"]);
+    fn first_candidate(&self, proxy: &str) -> Option<Candidate> {
+        self.streams[proxy].candidates.front().cloned()
     }
 
-    /// Asserts that a victim is named only above the budget, is the least recently used
-    /// object the cold tier holds, and is never one in the skip set or one it lacks.
-    #[test]
-    fn the_victim_is_the_oldest_copied_object_above_the_budget() {
-        let mut state = State::default();
-        state.insert("a", 10, true);
-        state.insert("b", 10, false);
-        state.insert("c", 10, true);
-        let none = skipping(&[]);
-        let a = skipping(&["a"]);
-        let a_and_c = skipping(&["a", "c"]);
-        let b = skipping(&["b"]);
-        assert_eq!(state.next_victim(30, &none), None);
-        assert_eq!(state.next_victim(25, &none), Some("a".to_owned()));
-        assert_eq!(state.next_victim(25, &a), Some("c".to_owned()));
-        assert_eq!(state.next_victim(25, &a_and_c), None);
-        assert_eq!(state.next_victim(25, &b), Some("a".to_owned()));
-    }
-
-    /// Asserts that an object is pending only while it is tracked, the cold tier is not known
-    /// to hold it and it has not clashed.
-    #[test]
-    fn an_object_is_pending_until_copied_clashed_or_removed() {
-        let mut state = State::default();
-        state.insert("a", 1, false);
-        state.insert("b", 1, true);
-        state.insert("c", 1, false);
-        state.set_clashed("c");
-        assert!(state.is_pending("a"));
-        assert!(!state.is_pending("b"));
-        assert!(!state.is_pending("c"));
-        assert!(!state.is_pending("nothing"));
-        state.remove("a");
-        assert!(!state.is_pending("a"));
+    /// Takes the candidates that a later entry replaced, or a delete removed, off the front
+    /// of each stream, so that the cursor does not stay behind them.
+    pub(crate) fn trim_stale(&mut self) {
+        let proxies: Vec<String> = self.streams.keys().cloned().collect();
+        for proxy in proxies {
+            while let Some(first) = self.first_candidate(&proxy) {
+                if self.is_current(&proxy, first.at, &first.key) {
+                    break;
+                }
+                self.pop(&proxy);
+            }
+        }
     }
 }

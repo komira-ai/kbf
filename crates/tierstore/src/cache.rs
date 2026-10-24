@@ -102,15 +102,17 @@ impl Cache {
     }
 }
 
-/// A [`Backend`] that answers repeated reads from RAM.
+/// A [`Backend`] that answers repeated reads from RAM. It is a cache of the node it runs on,
+/// not state.
 ///
 /// A read is cached under the object's key and the range asked for, so a read of another
 /// range of the same object is a read of the backend. The cache holds at most `budget`
 /// bytes, least recently used out first (an empty read counts as one byte); a read larger
 /// than the budget is not cached.
-/// Errors are never cached. A delete drops the object's cached ranges, and a read that was
-/// in flight during the delete does not fill the cache afterwards. Everything but `get` and
-/// `delete` goes to the backend as it is.
+/// Errors are never cached. A delete, and a put that replaces the object, drop the object's
+/// cached ranges, and a read that was in flight during it does not fill the cache
+/// afterwards. Everything but `get`, `delete` and `put_if_match` goes to the backend as it
+/// is.
 pub struct CachedStore {
     inner: Arc<dyn Backend>,
     budget: u64,
@@ -161,6 +163,12 @@ impl Backend for CachedStore {
         self.inner.put(key, body).await
     }
 
+    async fn put_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<String, Error> {
+        let tag = self.inner.put_if_match(key, body, etag).await?;
+        self.cache().drop_key(key);
+        Ok(tag)
+    }
+
     async fn get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
         let cache_key = CacheKey {
             key: key.to_owned(),
@@ -187,5 +195,14 @@ impl Backend for CachedStore {
 
     async fn list(&self, prefix: &str) -> Result<Vec<Listed>, Error> {
         self.inner.list(prefix).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Result<Vec<Listed>, Error> {
+        self.inner.list_page(prefix, start_after, max_keys).await
     }
 }
