@@ -106,8 +106,9 @@ jobs:
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
-          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
-          # file, so a restored target/ must hold none of the files a run writes there.
+          # Not target/pkg or target/pkg-trust: pkg-config refuses to overwrite a file, so a
+          # restored target/ must hold none of the files a run writes there (pkg-trust empties
+          # its directory first, but the trust files are still never taken from a cache).
           path: |
             ~/.cargo/registry
             ~/.cargo/git
@@ -211,8 +212,9 @@ jobs:
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
-          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
-          # file, so a restored target/ must hold none of the files a run writes there.
+          # Not target/pkg or target/pkg-trust: pkg-config refuses to overwrite a file, so a
+          # restored target/ must hold none of the files a run writes there (pkg-trust empties
+          # its directory first, but the trust files are still never taken from a cache).
           path: |
             ~/.cargo/registry
             ~/.cargo/git
@@ -247,8 +249,9 @@ jobs:
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
-          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
-          # file, so a restored target/ must hold none of the files a run writes there.
+          # Not target/pkg or target/pkg-trust: pkg-config refuses to overwrite a file, so a
+          # restored target/ must hold none of the files a run writes there (pkg-trust empties
+          # its directory first, but the trust files are still never taken from a cache).
           path: |
             ~/.cargo/registry
             ~/.cargo/git
@@ -341,8 +344,9 @@ jobs:
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
-          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
-          # file, so a restored target/ must hold none of the files a run writes there.
+          # Not target/pkg or target/pkg-trust: pkg-config refuses to overwrite a file, so a
+          # restored target/ must hold none of the files a run writes there (pkg-trust empties
+          # its directory first, but the trust files are still never taken from a cache).
           path: |
             ~/.cargo/registry
             ~/.cargo/git
@@ -375,8 +379,9 @@ jobs:
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
-          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
-          # file, so a restored target/ must hold none of the files a run writes there.
+          # Not target/pkg or target/pkg-trust: pkg-config refuses to overwrite a file, so a
+          # restored target/ must hold none of the files a run writes there (pkg-trust empties
+          # its directory first, but the trust files are still never taken from a cache).
           path: |
             ~/.cargo/registry
             ~/.cargo/git
@@ -466,8 +471,9 @@ jobs:
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
-          # Not target/pkg or target/pkg-trust: pkg-trust and pkg-config refuse to overwrite a
-          # file, so a restored target/ must hold none of the files a run writes there.
+          # Not target/pkg or target/pkg-trust: pkg-config refuses to overwrite a file, so a
+          # restored target/ must hold none of the files a run writes there (pkg-trust empties
+          # its directory first, but the trust files are still never taken from a cache).
           path: |
             ~/.cargo/registry
             ~/.cargo/git
