@@ -300,11 +300,6 @@ pub fn deploy(
         plan,
         service,
     };
-    let log = |out: &mut dyn Write, text: &str| {
-        writeln!(out, "{text}")
-            .and_then(|()| out.flush())
-            .map_err(|e| Error::Output(e.to_string()))
-    };
     let baseline =
         Read::of(&client.send_retrying(out, READ_BASELINE, CONVERGENCE_PATH, None, plan)?)?.live();
     log(out, &baseline_line(&baseline))?;
@@ -351,6 +346,13 @@ pub fn deploy(
     }
 }
 
+/// One line of the log, flushed.
+fn log(out: &mut dyn Write, text: &str) -> Result<(), Error> {
+    writeln!(out, "{text}")
+        .and_then(|()| out.flush())
+        .map_err(|e| Error::Output(e.to_string()))
+}
+
 struct Client<'a> {
     runner: ureq::Agent,
     coordinator: ureq::Agent,
@@ -375,9 +377,10 @@ impl Client<'_> {
                 Err(Error::Call { what, why })
                     if attempt < POST_ATTEMPTS && retryable(what, &why) =>
                 {
-                    writeln!(out, "the call failed, trying again: {what}: {why}")
-                        .and_then(|()| out.flush())
-                        .map_err(|e| Error::Output(e.to_string()))?;
+                    log(
+                        out,
+                        &format!("the call failed, trying again: {what}: {why}"),
+                    )?;
                     attempt += 1;
                     std::thread::sleep(plan.every);
                 }

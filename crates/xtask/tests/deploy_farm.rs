@@ -347,11 +347,22 @@ fn counts_that_do_not_change_fail_as_a_stall_before_the_deadline() {
 #[test]
 fn a_read_that_fails_is_tried_again_and_a_refused_one_is_not() {
     // Proves: a 503 on a read is reported and the wait goes on to converged; a 401 on a read
-    // ends the wait at once as a refusal, without a second read.
+    // ends the wait at once as a refusal, without a second read; a 401 on the read before the
+    // deploy ends it before anything is posted.
     let fake_ok = serve(Script::new(vec![Err(503), Ok(farm("converged", 0, 0))]));
     let (result, out) = run(&fake_ok, &fake_ok.plan());
     assert_eq!(result, Ok(()), "{out}");
     assert!(out.contains("the read failed, trying again"), "{out}");
+    let early = serve(Script::after(Err(401), vec![]));
+    let (result, _) = run(&early, &early.plan());
+    assert_eq!(
+        result,
+        Err(Error::Refused {
+            what: "read the farm before the deploy",
+            status: 401
+        })
+    );
+    assert!(early.requests("/v1/desired").is_empty());
     let fake_no = serve(Script::new(vec![Err(401), Ok(farm("converged", 0, 0))]));
     let (result, _) = run(&fake_no, &fake_no.plan());
     assert_eq!(
@@ -497,6 +508,15 @@ fn a_runner_with_no_token_and_an_answer_that_is_no_table_fail_with_reasons() {
         let (result, _) = run(&odd, &odd.plan());
         assert!(matches!(result, Err(Error::Answer(_))), "{result:?}");
     }
+    for answer in [
+        json!({}),
+        json!({"state": "converged", "roles": [{"role": "storage"}]}),
+    ] {
+        let odd = serve(Script::after(Ok(answer), vec![]));
+        let (result, _) = run(&odd, &odd.plan());
+        assert!(matches!(result, Err(Error::Answer(_))), "{result:?}");
+        assert!(odd.requests("/v1/desired").is_empty());
+    }
     let empty = serve(Script::new(vec![Ok(
         json!({"state": "in_progress", "roles": []}),
     )]));
@@ -565,20 +585,48 @@ fn a_token_the_service_does_not_give_is_an_error_whatever_it_says() {
 #[test]
 fn a_log_that_cannot_be_written_ends_the_deploy_with_an_error() {
     // Proves: a failed write of the log (a closed pipe) is an error, not a panic or a silent
-    // wait, whether it is the masking of a token (the first line) or a table.
+    // wait, at each line of the deploy: the masking of a token, the baseline, the notice that
+    // the version is set, a table, and the note that a call is tried again.
+    let mask = "::add-mask::tok-0\n".len();
+    let baseline = "baseline: hosts live before the deploy: storage 2, daemon 1\n".len();
+    let desired = "desired version 2.0 set\n".len();
     let fake = serve(Script::new(vec![Ok(farm("converged", 0, 0))]));
     let ca = [fake.ca.clone()];
     let roots = Roots {
         runner: &ca,
         coordinator: &ca,
     };
-    for room in [0, "::add-mask::tok-0\n".len()] {
+    for room in [
+        0,
+        mask,
+        mask + baseline,
+        mask + baseline + mask,
+        mask + baseline + mask + desired,
+        mask + baseline + mask + desired + mask,
+    ] {
         let result = deploy(&fake.plan(), &fake.service(), &roots, &mut Room { room });
         assert!(
             matches!(result, Err(Error::Output(_))),
             "{room}: {result:?}"
         );
     }
+    let mut script = Script::new(vec![Ok(farm("converged", 0, 0))]);
+    script.post_503s = 1;
+    let retried = serve(script);
+    let ca = [retried.ca.clone()];
+    let roots = Roots {
+        runner: &ca,
+        coordinator: &ca,
+    };
+    let result = deploy(
+        &retried.plan(),
+        &retried.service(),
+        &roots,
+        &mut Room {
+            room: mask + baseline + mask,
+        },
+    );
+    assert!(matches!(result, Err(Error::Output(_))), "{result:?}");
 }
 
 /// A farm answer with the given counts per role: (role, at_desired, updating, failed, down).
@@ -646,7 +694,8 @@ fn a_host_that_was_down_before_the_deploy_does_not_block_it() {
 #[test]
 fn a_host_that_joins_during_the_deploy_is_fine() {
     // Proves: more hosts at the version than were live at the baseline, and a role the
-    // baseline did not list at all, pass.
+    // baseline did not list at all, pass; so does a baseline with no host at all (printed as
+    // "none").
     let fake = serve(Script::after(
         Ok(counts("in_progress", "1.0", &[("storage", 1, 0, 0, 0)])),
         vec![Ok(counts(
@@ -657,6 +706,13 @@ fn a_host_that_joins_during_the_deploy_is_fine() {
     ));
     let (result, out) = run(&fake, &fake.plan());
     assert_eq!(result, Ok(()), "{out}");
+    let fake = serve(Script::after(
+        Ok(counts("in_progress", "1.0", &[])),
+        vec![Ok(counts("converged", "2.0", &[("storage", 1, 0, 0, 0)]))],
+    ));
+    let (result, out) = run(&fake, &fake.plan());
+    assert_eq!(result, Ok(()), "{out}");
+    assert!(out.contains("before the deploy: none"), "{out}");
 }
 
 #[test]
