@@ -29,6 +29,9 @@
 //! - [`pool_http`] and [`frontend_http`]: the real pool, over the admin API of kbf-proxy, and
 //!   the real control of a frontend member, over its own operator API;
 //! - [`daemon`]: the flags and the wiring of all of it.
+//!
+//! And for the coordinator that tells each host's updater what to run
+//! (`docs/design/updates.md`): [`wire`], the heartbeat and the reply.
 
 pub mod api;
 pub mod daemon;
@@ -50,6 +53,7 @@ pub mod secret;
 pub mod server;
 pub mod ssh_installer;
 pub mod version;
+pub mod wire;
 
 mod timing;
 mod updater;
@@ -89,6 +93,8 @@ mod updater_mac_tests;
 mod updater_restart_tests;
 #[cfg(test)]
 mod updater_tests;
+#[cfg(test)]
+mod wire_tests;
 
 /// The program's text for `--version`.
 pub fn version_line() -> String {

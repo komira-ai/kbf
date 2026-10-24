@@ -15,6 +15,7 @@
 mod digest;
 mod enroll;
 pub mod enroll_api;
+mod host_role;
 mod image;
 mod lease;
 pub mod object_store_api;
@@ -33,6 +34,7 @@ pub use enroll::{
     CaPin, NodeId, NodeIdError, PartFault, RefusalCode, RefusalReason, Role, RoleError, RoleSet,
     RoleSetError, Token, TokenError, TokenId, TokenSecret,
 };
+pub use host_role::{HostRole, HostRoleError};
 pub use image::{ImageError, ImageRef};
 pub use lease::{LeaseId, LeaseKind};
 pub use phase::NodePhase;

@@ -1,0 +1,163 @@
+//! The two HTTP surfaces, mapped onto [`Coordinator`].
+//!
+//! - **Heartbeat** (mutual TLS, updaters): `POST /v1/heartbeat` with the heartbeat as JSON;
+//!   the answer is the reply as JSON. The caller is the certificate's updater identity
+//!   ([`identity_of`]); a certificate that names none is refused with 403 before the body
+//!   is read.
+//! - **Control** (TLS, no client certificate): `POST /v1/desired` with CI's OIDC token as
+//!   the bearer and the desired state as JSON; `GET /v1/status` with the operator token as
+//!   the bearer.
+//!
+//! An answer is JSON, and an error is `{"error":"<code>"}` with a code from a closed set:
+//! never a claim value, a path or the text of an internal error.
+
+use std::sync::Arc;
+
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full, Limited};
+use hyper::body::Body;
+use hyper::header::{AUTHORIZATION, CONTENT_TYPE};
+use hyper::{Method, Request, Response, StatusCode};
+use kbf_updater::wire::{HEARTBEAT_PATH, Heartbeat, MAX_HEARTBEAT_BYTES};
+use serde::Serialize;
+
+use crate::identity::identity_of;
+use crate::service::{Coordinator, SetError};
+
+/// The path CI posts the desired state to.
+pub const DESIRED_PATH: &str = "/v1/desired";
+
+/// The path an operator reads the status from.
+pub const STATUS_PATH: &str = "/v1/status";
+
+/// The most bytes of a desired state read.
+pub const MAX_DESIRED_BYTES: usize = 4096;
+
+/// Which listener a request came in on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Surface {
+    /// The mutual-TLS listener of the updaters.
+    Heartbeat,
+    /// The listener of CI and the operator.
+    Control,
+}
+
+/// The leaf of the client certificate a connection presented, DER.
+pub type Peer = Option<Arc<[u8]>>;
+
+type Answer = Response<Full<Bytes>>;
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+fn json<T: Serialize>(status: StatusCode, value: &T) -> Answer {
+    let body = serde_json::to_vec(value).unwrap_or_default();
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap_or_default()
+}
+
+fn error(status: StatusCode, code: &'static str) -> Answer {
+    json(status, &serde_json::json!({ "error": code }))
+}
+
+fn bearer<B>(request: &Request<B>) -> Option<&str> {
+    request
+        .headers()
+        .get(AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+/// The body of `request`, if it is at most `limit` bytes.
+async fn read<B>(request: Request<B>, limit: usize) -> Option<Bytes>
+where
+    B: Body,
+    B::Error: Into<BoxError>,
+{
+    let body = Limited::new(request.into_body(), limit);
+    body.collect()
+        .await
+        .ok()
+        .map(http_body_util::Collected::to_bytes)
+}
+
+/// Answers one request that came in on `surface` from `peer`.
+pub async fn handle<B>(
+    coordinator: &Coordinator,
+    surface: Surface,
+    peer: &Peer,
+    request: Request<B>,
+) -> Answer
+where
+    B: Body,
+    B::Error: Into<BoxError>,
+{
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    match (surface, method, path.as_str()) {
+        (Surface::Heartbeat, Method::POST, HEARTBEAT_PATH) => {
+            heartbeat(coordinator, peer, request).await
+        }
+        (Surface::Control, Method::POST, DESIRED_PATH) => desired(coordinator, request).await,
+        (Surface::Control, Method::GET, STATUS_PATH) => {
+            match coordinator.status(bearer(&request)) {
+                Ok(status) => json(StatusCode::OK, &status),
+                Err(_) => error(StatusCode::UNAUTHORIZED, "unauthorized"),
+            }
+        }
+        (Surface::Heartbeat, _, HEARTBEAT_PATH)
+        | (Surface::Control, _, DESIRED_PATH | STATUS_PATH) => {
+            error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
+        }
+        _ => error(StatusCode::NOT_FOUND, "not_found"),
+    }
+}
+
+async fn heartbeat<B>(coordinator: &Coordinator, peer: &Peer, request: Request<B>) -> Answer
+where
+    B: Body,
+    B::Error: Into<BoxError>,
+{
+    let identity = match peer.as_deref().map(identity_of) {
+        Some(Ok(identity)) => identity,
+        Some(Err(why)) => {
+            tracing::warn!(%why, "refused a heartbeat: the certificate is no updater's");
+            return error(StatusCode::FORBIDDEN, "forbidden");
+        }
+        None => {
+            tracing::warn!("refused a heartbeat: no client certificate");
+            return error(StatusCode::FORBIDDEN, "forbidden");
+        }
+    };
+    let beat = read(request, MAX_HEARTBEAT_BYTES)
+        .await
+        .and_then(|bytes| serde_json::from_slice::<Heartbeat>(&bytes).ok());
+    match beat {
+        Some(beat) => json(StatusCode::OK, &coordinator.heartbeat(identity, beat)),
+        None => error(StatusCode::BAD_REQUEST, "bad_request"),
+    }
+}
+
+async fn desired<B>(coordinator: &Coordinator, request: Request<B>) -> Answer
+where
+    B: Body,
+    B::Error: Into<BoxError>,
+{
+    let token = bearer(&request).map(str::to_owned);
+    let Some(body) = read(request, MAX_DESIRED_BYTES).await else {
+        return error(StatusCode::BAD_REQUEST, "bad_request");
+    };
+    match coordinator.set_desired(token.as_deref(), &body).await {
+        Ok(desired) => json(StatusCode::OK, &desired),
+        Err(SetError::Unauthorized(_)) => error(StatusCode::UNAUTHORIZED, "unauthorized"),
+        Err(SetError::Unavailable) => error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        Err(SetError::Invalid(_)) => error(StatusCode::BAD_REQUEST, "bad_request"),
+        Err(SetError::Store(why)) => {
+            tracing::error!(%why, "the desired state could not be stored");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        }
+    }
+}
