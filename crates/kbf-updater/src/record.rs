@@ -48,8 +48,8 @@ pub struct Record {
 
 impl Record {
     /// The record contradicts itself: for an explicit host list, the roll's hosts are not the
-    /// request's aliases (the same ones, in the same order, with at most one moved to the
-    /// front for the frontend; [`crate::Updater::open`] holds the exact plan to the inventory);
+    /// request's aliases (the same ones, in the same order, with some moved to the front for
+    /// the frontends; [`crate::Updater::open`] holds the exact plan to the inventory);
     /// a host is in flight while an earlier one is not done, a later one has begun, or the
     /// state says more than the hosts do. A hand-edited or half-merged file lands here and
     /// not in a roll that touches the wrong host.
@@ -101,18 +101,19 @@ impl Record {
     }
 }
 
-/// `have` is `asked` as the plan makes it: the same aliases in the same order, except that
-/// one (the frontend) may have been moved to the front.
+/// `have` is `asked` as the plan makes it: the same aliases, with the frontends (one or, for
+/// pool members, several) moved to the front and everything else in its order. So some first
+/// `k` of `have` are in `asked`'s order, and the rest follow in `asked`'s order.
 fn is_plan_of(have: &[&str], asked: &[String]) -> bool {
     if have.len() != asked.len() {
         return false;
     }
-    if have.iter().zip(asked).all(|(h, a)| h == a) {
-        return true;
-    }
-    (0..asked.len()).any(|i| {
-        let rest = asked[..i].iter().chain(&asked[i + 1..]);
-        have[0] == asked[i] && have[1..].iter().zip(rest).all(|(h, a)| h == a)
+    (0..=have.len()).any(|k| {
+        let front = &have[..k];
+        let first = asked.iter().filter(|a| front.contains(&a.as_str()));
+        let rest = asked.iter().filter(|a| !front.contains(&a.as_str()));
+        let planned = first.chain(rest).map(String::as_str);
+        have.iter().copied().eq(planned)
     })
 }
 

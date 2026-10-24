@@ -117,7 +117,7 @@ const MAX_FRONTEND_LEN: usize = 32;
 /// Whether `name` is one the host accepts in `restart frontend=<name>`, restated here on the
 /// text so that a loosening of either side is caught by the contract test: `-` for the plain
 /// unit, else `[a-z][a-z0-9-]{0,31}`.
-fn frontend_name_ok(name: &str) -> bool {
+pub(crate) fn frontend_name_ok(name: &str) -> bool {
     let lower_or_digit = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
     let mut bytes = name.bytes();
     let instance = bytes.next().is_some_and(|b| b.is_ascii_lowercase())

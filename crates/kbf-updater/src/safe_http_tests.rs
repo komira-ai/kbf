@@ -21,6 +21,7 @@ fn host(alias: &str) -> Host {
         role: Role::Storage,
         host_key: KEY.to_owned(),
         node_id: None,
+        member: None,
     }
 }
 

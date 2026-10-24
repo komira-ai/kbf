@@ -5,12 +5,15 @@
 //! - [`api`]: the request, the roll as a poller sees it, the closed set of error codes;
 //! - [`version`]: the one rule for a version, shared with the host-side wrapper;
 //! - [`inventory`]: the root-owned host file, and the order a roll touches the hosts in;
-//! - [`ports`]: safe-to-stop, install and query, health, and the clock, as traits;
+//! - [`ports`]: safe-to-stop, install and query, health, the proxy's pool, a frontend member's
+//!   own API, and the clock, as traits;
 //! - [`ssh_installer`]: the install port over ssh to the `kbf-host-install` forced command;
 //! - [`record`]: `roll.json`, the durable record;
-//! - [`Updater`]: the state machine over all of the above. One roll at a time, the frontend
+//! - [`Updater`]: the state machine over all of the above. One roll at a time, the frontends
 //!   first, the first failure stops it, a restart asks the host before it installs again; a
-//!   `mac-daemon` host's install starts an apply that the roll polls until it is done;
+//!   `mac-daemon` host's install starts an apply that the roll polls until it is done; a
+//!   frontend that is a member of the kbf-proxy pool is drained, retired, installed on,
+//!   restarted and put back, one at a time and never the last one that is up;
 //! - [`fakes`]: a scripted fake of every port.
 //!
 //! And around it:
@@ -22,12 +25,15 @@
 //! - [`safe_http`]: the real safe-to-stop, a call to the operator API;
 //! - [`node_drain`]: the real drain of a daemon host's node, over the operator API;
 //! - [`health`] and [`node_health`]: the real health check of a storage or daemon host, over
-//!   the operator API; a frontend host is refused until the kbf-proxy drain control exists;
+//!   the operator API; a frontend that is no pool member is refused;
+//! - [`pool_http`] and [`frontend_http`]: the real pool, over the admin API of kbf-proxy, and
+//!   the real control of a frontend member, over its own operator API;
 //! - [`daemon`]: the flags and the wiring of all of it.
 
 pub mod api;
 pub mod daemon;
 pub mod fakes;
+pub mod frontend_http;
 pub mod health;
 pub mod http;
 pub mod inventory;
@@ -35,6 +41,7 @@ pub mod listener;
 pub mod node_drain;
 pub mod node_health;
 pub mod operator;
+pub mod pool_http;
 pub mod ports;
 pub mod record;
 pub mod reply;
@@ -44,18 +51,24 @@ pub mod server;
 pub mod ssh_installer;
 pub mod version;
 
+mod timing;
 mod updater;
 
-pub use updater::{Ports, Started, Timing, Updater};
+pub use timing::Timing;
+pub use updater::{Ports, STREAMS_BOUND, Started, Updater};
 
 #[cfg(test)]
 mod daemon_tests;
+#[cfg(test)]
+mod frontend_http_tests;
 #[cfg(test)]
 mod listener_tests;
 #[cfg(test)]
 mod node_drain_tests;
 #[cfg(test)]
 mod node_health_tests;
+#[cfg(test)]
+mod pool_http_tests;
 #[cfg(test)]
 mod safe_http_tests;
 #[cfg(test)]
@@ -68,6 +81,8 @@ mod updater_drain_tests;
 mod updater_followup_tests;
 #[cfg(test)]
 mod updater_fresh_host_tests;
+#[cfg(test)]
+mod updater_frontend_tests;
 #[cfg(test)]
 mod updater_mac_tests;
 #[cfg(test)]

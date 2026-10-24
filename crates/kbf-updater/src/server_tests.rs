@@ -40,6 +40,7 @@ fn prepare(name: &str, proxy_uid: u32) -> Config {
         operator_api: "127.0.0.1:1".parse().expect("addr"),
         token_file: dir.join("unused"),
         operator_proxy_auth_file: None,
+        proxy_admin: None,
         ssh_key_file: dir.join("unused-key"),
         ssh_user: "kbf".to_owned(),
         channel: "stable".to_owned(),
@@ -92,6 +93,8 @@ impl Farm {
             drain: Box::new(crate::fakes::FakeDrain::new(&log)),
             health: Box::new(health),
             clock: Box::new(clock),
+            pool: Box::new(crate::fakes::FakePool::new(&log)),
+            frontend: Box::new(crate::fakes::FakeFrontend::new(&log)),
         };
         let settings = tune(Settings::new(cfg.proxy_uid));
         let daemon =
@@ -588,6 +591,8 @@ fn bare_server(name: &str) -> (Server, std::sync::mpsc::Receiver<String>, Lines)
         drain: Box::new(crate::fakes::FakeDrain::new(&log)),
         health: Box::new(FakeHealth::new(&log)),
         clock: Box::new(FakeClock::new()),
+        pool: Box::new(crate::fakes::FakePool::new(&log)),
+        frontend: Box::new(crate::fakes::FakeFrontend::new(&log)),
     };
     let updater = crate::Updater::open(
         crate::inventory::Inventory::load(&cfg.inventory, own_uid()).expect("inventory"),
@@ -726,6 +731,8 @@ fn a_running_roll_found_at_start_is_resumed() {
             drain: Box::new(crate::fakes::FakeDrain::new(&log)),
             health: Box::new(FakeHealth::new(&log)),
             clock: Box::new(FakeClock::new()),
+            pool: Box::new(crate::fakes::FakePool::new(&log)),
+            frontend: Box::new(crate::fakes::FakeFrontend::new(&log)),
         };
         let updater = crate::Updater::open(
             crate::inventory::Inventory::load(&cfg.inventory, own_uid()).expect("inventory"),

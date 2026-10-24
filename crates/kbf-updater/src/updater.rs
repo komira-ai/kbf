@@ -7,6 +7,13 @@
 //! finds the host where its work began and never earlier.
 //! The first failure stops the roll and no later host is asked about, let alone touched.
 //!
+//! A frontend that is a member of the kbf-proxy pool (an inventory line with `instance=` and
+//! `base=`) takes a turn of its own, in `updater_frontend.rs`: drained at the proxy, its
+//! streams waited for, retired, installed on, restarted, waited for until the proxy lists it
+//! ready on the target's commit, and put back. Its phases are `draining`, `retiring`,
+//! `installing`, `restarting`, `waiting_healthy` and `undraining`. Every failure on the way
+//! leaves the member drained. The roll never takes the last member that is up and ready out.
+//!
 //! A `mac-daemon` host takes the daemon's turn with one difference. Its `install` only starts
 //! the apply on the Mac and answers `apply_started`; the roll marks the host `waiting_healthy`
 //! and polls `query` every [`Timing::apply_poll`] until the apply is `done` with the target
@@ -43,82 +50,46 @@ use crate::api::{
 };
 use crate::inventory::{Host, Inventory, Role};
 use crate::ports::{
-    Apply, Clock, Drain, Health, HealthCheck, InstallAnswer, Installed, Installer, PortError,
-    SafeToStop, Stop,
+    Apply, Clock, Drain, FrontendControl, Health, HealthCheck, InstallAnswer, Installed, Installer,
+    Pool, PortError, SafeToStop, Stop,
 };
 use crate::record::{FORMAT, Record, RollStore, StoreError, roll_id};
+use crate::timing::Timing;
 use crate::version::Version;
 
-/// How long the roll waits for each thing. The defaults are the package-update design's
-/// (node health 300 s, daemon 780 s, no answer 120 s); the frontend's bound, the safe-to-stop
-/// bound and the cap on an install in progress are this crate's choices.
-#[derive(Clone, Debug)]
-pub struct Timing {
-    /// Between two asks of the same port.
-    pub poll: Duration,
-    /// How long a host may stay unsafe to stop (or safe-to-stop unanswered) before the roll
-    /// fails at it.
-    pub safe_bound: Duration,
-    /// How long a restart waits for a host that answers "install in progress".
-    pub install_bound: Duration,
-    /// How long a restart waits for a host that does not answer a query at all.
-    pub query_bound: Duration,
-    pub healthy_frontend: Duration,
-    pub healthy_storage: Duration,
-    pub healthy_daemon: Duration,
-    /// How long a daemon host's node is given to finish its leases once it is drained. When
-    /// the time is out the host is installed anyway, with the leases it still holds.
-    pub drain_deadline: Duration,
-    /// Between two asks of a Mac host how its apply stands.
-    pub apply_poll: Duration,
-    /// How long a Mac host's apply may take, from the answer `apply_started` (or from a
-    /// restart that resumes the wait), to be `done` for the target.
-    pub apply_deadline: Duration,
-}
+#[path = "updater_frontend.rs"]
+mod frontend;
 
-impl Default for Timing {
-    fn default() -> Timing {
-        Timing {
-            poll: Duration::from_secs(5),
-            safe_bound: Duration::from_secs(300),
-            install_bound: Duration::from_secs(900),
-            query_bound: Duration::from_secs(120),
-            healthy_frontend: Duration::from_secs(300),
-            healthy_storage: Duration::from_secs(300),
-            healthy_daemon: Duration::from_secs(780),
-            drain_deadline: Duration::from_secs(600),
-            apply_poll: Duration::from_secs(5),
-            apply_deadline: Duration::from_secs(600),
-        }
-    }
-}
+/// How long the roll waits for the streams of a frontend member to end, both the streams the
+/// proxy still holds open on it after it is drained, and those the member itself reports once
+/// it has retired. When it is out the roll fails with the member left drained.
+pub const STREAMS_BOUND: Duration = Duration::from_secs(900);
 
-impl Timing {
-    fn healthy(&self, role: Role) -> Duration {
-        match role {
-            Role::Frontend => self.healthy_frontend,
-            Role::Storage => self.healthy_storage,
-            Role::Daemon | Role::MacDaemon => self.healthy_daemon,
-        }
-    }
-}
-
-/// The five ports of a roll.
+/// The seven ports of a roll.
 pub struct Ports {
     pub safe: Box<dyn SafeToStop>,
     pub installer: Box<dyn Installer>,
     pub drain: Box<dyn Drain>,
     pub health: Box<dyn HealthCheck>,
     pub clock: Box<dyn Clock>,
+    /// The proxy's pool, for the frontends that are members of it.
+    pub pool: Box<dyn Pool>,
+    /// A frontend member's own API.
+    pub frontend: Box<dyn FrontendControl>,
 }
 
 /// `halt`, with the node it leaves drained named. A store error is not changed.
 fn left_drained(host: &Host, halt: Halt) -> Halt {
     let node = host.node_id.as_deref().unwrap_or(&host.alias);
-    let note = |detail: String| format!("{detail}; node {node} ({}) is left drained", host.alias);
+    let note = format!("node {node} ({}) is left drained", host.alias);
+    noted(halt, &note)
+}
+
+/// `halt`, with `note` after its detail. A store error is not changed.
+fn noted(halt: Halt, note: &str) -> Halt {
     match halt {
-        Halt::Fail(code, detail) => Halt::Fail(code, note(detail)),
-        Halt::Interrupt(detail) => Halt::Interrupt(note(detail)),
+        Halt::Fail(code, detail) => Halt::Fail(code, format!("{detail}; {note}")),
+        Halt::Interrupt(detail) => Halt::Interrupt(format!("{detail}; {note}")),
         Halt::Store(e) => Halt::Store(e),
     }
 }
@@ -554,6 +525,11 @@ impl Updater {
                 }
             }
         }
+        if let (Role::Frontend, Some(member)) = (host.role, &host.member) {
+            self.frontend_turn(idx, host, &member.instance, target, phase)?;
+            self.mark(idx, Phase::Done, false)?;
+            return Ok(());
+        }
         let held = host.role.is_daemon();
         self.install_and_wait(idx, host, target, phase, held)
             .map_err(|halt| if held { left_drained(host, halt) } else { halt })?;
@@ -596,7 +572,15 @@ impl Updater {
                 }
             }
             Phase::Installing => apply = self.recover_install(idx, host, target)?,
-            Phase::WaitingHealthy | Phase::Done | Phase::Failed => {}
+            // The phases of a frontend member's turn are never a node's; one that is found on
+            // a node is waited on like `waiting_healthy`.
+            Phase::WaitingHealthy
+            | Phase::Done
+            | Phase::Failed
+            | Phase::Draining
+            | Phase::Retiring
+            | Phase::Restarting
+            | Phase::Undraining => {}
         }
         if apply {
             self.wait_apply(host, target)?;
@@ -887,15 +871,27 @@ impl Updater {
     /// Wait for `host` to run the target. `held`: its node is drained by the roll, which a
     /// daemon is not asked to be serving through.
     fn wait_healthy(&self, host: &Host, target: &Version, held: bool) -> Result<(), Halt> {
-        let start = self.now();
         let bound = self.timing.healthy(host.role);
-        loop {
-            let asked = if held {
+        self.wait_until(bound, || {
+            if held {
                 self.ports.health.check_held(host, target)
             } else {
                 self.ports.health.check(host, target)
-            };
-            let last = match asked {
+            }
+        })
+    }
+
+    /// Ask `check` every [`Timing::poll`] until it says healthy, for at most `bound`. A host
+    /// that will not get there fails the wait at once; one that is only not there yet, or
+    /// cannot be asked, is asked again until the bound is out.
+    fn wait_until(
+        &self,
+        bound: Duration,
+        check: impl Fn() -> Result<Health, PortError>,
+    ) -> Result<(), Halt> {
+        let start = self.now();
+        loop {
+            let last = match check() {
                 Ok(Health::Healthy) => return Ok(()),
                 Ok(Health::Abandoned(why)) => {
                     return Err(Halt::Fail(ErrorCode::SwapAbandoned, why));

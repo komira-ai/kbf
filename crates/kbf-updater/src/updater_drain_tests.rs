@@ -19,13 +19,8 @@ fn dm_events(rig: &Rig) -> Vec<String> {
         .touching("dm")
         .into_iter()
         .map(|e| match e {
-            Event::Check(_) => "check".to_owned(),
             Event::Install(..) => "install".to_owned(),
-            Event::Query(_) => "query".to_owned(),
-            Event::Health(_) => "health".to_owned(),
-            Event::Drain(_, secs) => format!("drain {secs}"),
-            Event::Leases(_) => "leases".to_owned(),
-            Event::Undrain(_) => "undrain".to_owned(),
+            other => other.word(),
         })
         .collect()
 }

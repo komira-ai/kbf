@@ -3,11 +3,17 @@
 //!
 //! # A frontend host
 //!
-//! Not installed on and not judged: [`FRONTEND_REFUSAL`]. A frontend update has to move
-//! traffic away and back at kbf-proxy's drain control, which is not built yet. The roll asks
-//! [`HealthCheck::refusal`] before it calls the installer for a host and fails there, with
-//! nothing changed on the host and none after it touched. [`NodeHealth::check`] says the same
-//! ([`Health::Abandoned`]) as a second line of defence.
+//! A frontend that is a member of the kbf-proxy pool is judged by the roll itself, through the
+//! proxy's pool and the member's own API (`updater_frontend.rs`: ready at the proxy and built
+//! from the target's commit), because that needs the pool and not the operator API of the
+//! frontend this module asks. [`NodeHealth::check`] says so ([`Health::Abandoned`]) if it is
+//! asked about one.
+//!
+//! A frontend whose inventory line lists no `instance=` and `base=` is not a member, and
+//! nothing can move traffic away from it: it is not installed on and not judged
+//! ([`NO_MEMBER_REFUSAL`]). The roll asks [`HealthCheck::refusal`] before it calls the
+//! installer for a host and fails there, with nothing changed on the host and none after it
+//! touched.
 //!
 //! # A storage host
 //!
@@ -59,9 +65,13 @@ use crate::operator::{CHECK, OperatorApi, WHAT};
 use crate::ports::{Health, HealthCheck, Installer, PortError};
 use crate::version::Version;
 
-/// What the check says of a frontend host.
-pub const FRONTEND_REFUSAL: &str =
-    "frontend updates need the kbf-proxy drain control, which is not built yet";
+/// What the check says of a frontend host that is listed without `instance=` and `base=`.
+pub const NO_MEMBER_REFUSAL: &str =
+    "a frontend is rolled as a pool member: list it with instance=<name> and base=<port>";
+
+/// What the check says if it is asked about a frontend member.
+pub const MEMBER_ELSEWHERE: &str =
+    "a frontend member is judged through the kbf-proxy pool by the roll, not here";
 
 #[derive(Deserialize)]
 struct Enrolled {
@@ -217,16 +227,20 @@ impl NodeHealth {
 }
 
 impl HealthCheck for NodeHealth {
-    /// A frontend is refused before it is installed, not after (see [`FRONTEND_REFUSAL`]).
+    /// A frontend that is no pool member is refused before it is installed, not after (see
+    /// [`NO_MEMBER_REFUSAL`]).
     fn refusal(&self, host: &Host) -> Option<String> {
-        (host.role == Role::Frontend).then(|| FRONTEND_REFUSAL.to_owned())
+        match (host.role, &host.member) {
+            (Role::Frontend, None) => Some(NO_MEMBER_REFUSAL.to_owned()),
+            _ => None,
+        }
     }
 
     /// A daemon-only host is judged as a daemon, a storage host as a storage node, and a
-    /// frontend not at all.
+    /// frontend not here (see [`MEMBER_ELSEWHERE`]).
     fn check(&self, host: &Host, target: &Version) -> Result<Health, PortError> {
         match host.role {
-            Role::Frontend => Ok(Health::Abandoned(FRONTEND_REFUSAL.to_owned())),
+            Role::Frontend => Ok(Health::Abandoned(MEMBER_ELSEWHERE.to_owned())),
             Role::Daemon | Role::MacDaemon => self.daemon(host, target, false),
             Role::Storage => self.storage(host, target),
         }
