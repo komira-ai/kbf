@@ -1,7 +1,7 @@
 //! `kbf`: one binary with five modes (docs/design/cluster.md, sections 1 and 5.1), named
 //! and mapped to what they run in one table, [`names::MODES`].
 //!
-//! **The mode is a flag, never a word.** `kbf --mode=frontend|storage|daemon|storage-and-daemon|all-in-one`,
+//! **The mode is a flag, never a word.** `kbf --mode=frontend|storage|daemon|storage-and-daemon`,
 //! or `mode = "..."` in `kbf.toml` (`kbf` alone reads it); a flag overrides the file and the
 //! start says so. The old subcommand forms (`kbf frontend`, `kbf storage`, ...) are hidden
 //! aliases that run exactly as before, kept until the units and the test farm move
@@ -10,9 +10,9 @@
 //!
 //! - `daemon`: the build node. Takes exactly the flags `kbf-daemon` takes
 //!   ([`kbf_node::Cli`]) and refuses, by name, every flag of another mode.
-//! - `all-in-one`: the server and the daemon in one process, as `kbf-all-in-one`
-//!   runs them today. Takes exactly the flags `kbf-all-in-one` takes
-//!   ([`kbf_all_in_one::cli`]).
+//! - `all-in-one`: removed. Every way to ask for it (`--mode`, the hidden word, `mode =` in
+//!   `kbf.toml`, `--check`, `boot-check`, `setup`) exits 2 with [`ALL_IN_ONE_REMOVED`]; the
+//!   table row and the flags it parsed stay for one release.
 //! - `storage`: the storage node ([`kbf_server::storage_node`]). Takes
 //!   `kbf-server`'s store, write and log flags and its own listener flags, and refuses
 //!   every other flag of `kbf-server` (and so any state-store flag: a storage node
@@ -96,7 +96,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use boot_check::BOOT_CHECK;
-use clap::builder::PossibleValuesParser;
+use clap::builder::{PossibleValue, PossibleValuesParser};
 use clap::error::ErrorKind;
 use clap::{
     Arg, ArgAction, ArgMatches, Args as _, Command, CommandFactory as _, FromArgMatches as _,
@@ -247,7 +247,6 @@ fn mode_command(name: &'static str, entry: Entry) -> Command {
 /// modes are also its hidden subcommands (the old forms, `kbf <mode> ...`).
 #[must_use]
 pub fn command() -> Command {
-    let modes: Vec<&'static str> = MODES.iter().map(|m| m.name).collect();
     let mut cmd = Command::new("kbf")
         .version(kbf_server::SERVER_VERSION)
         .about("The kbf build farm.")
@@ -256,11 +255,11 @@ pub fn command() -> Command {
             Arg::new("mode")
                 .long("mode")
                 .value_name("MODE")
-                .value_parser(PossibleValuesParser::new(modes))
+                .value_parser(mode_values())
                 .help(
                     "What this process is: `frontend` (the REAPI front end), `storage` (a \
                      storage node), `daemon` (a build node), `storage-and-daemon` (both in \
-                     one process) or `all-in-one` (all three). Without it the mode is \
+                     one process). Without it the mode is \
                      `mode` in kbf.toml. `kbf --mode=<mode> --help` lists the mode's flags",
                 ),
         )
@@ -348,6 +347,57 @@ struct Split {
 /// and the way out, and the daemon does not start.
 const LABEL_REMOVED: &str =
     "--label was removed: placement uses what the node reports (OSFamily, ISA); delete the flag";
+
+/// What a command line that asks for the `all-in-one` mode is told: the text `kbf setup`
+/// gives too ([`kbf_setup::cli::ALL_IN_ONE_REMOVED`]).
+pub use kbf_setup::cli::ALL_IN_ONE_REMOVED;
+
+/// Fails with [`ALL_IN_ONE_REMOVED`] when `args` ask for the `all-in-one` mode, as
+/// `--mode=all-in-one`, `--mode all-in-one` or the hidden word `kbf all-in-one`.
+///
+/// # Errors
+/// The refusal, which exits 2; a `--mode` with no value is clap's to refuse, not this.
+pub fn refuse_all_in_one(args: &[OsString]) -> Result<(), clap::Error> {
+    let mut words = args.iter().skip(1);
+    let mut first = true;
+    while let Some(arg) = words.next() {
+        let at_start = std::mem::take(&mut first);
+        let Some(text) = arg.to_str() else { continue };
+        if text == "--" {
+            break;
+        }
+        let asked = if at_start && !text.starts_with('-') {
+            text == names::ALL_IN_ONE
+        } else {
+            value_of("mode", text, &mut words)
+                .ok()
+                .flatten()
+                .is_some_and(|v| v == names::ALL_IN_ONE)
+        };
+        if asked {
+            return Err(command().error(ErrorKind::InvalidValue, ALL_IN_ONE_REMOVED));
+        }
+    }
+    Ok(())
+}
+
+/// The values `--mode` takes: the modes, `all-in-one` among them but hidden, so that it is
+/// listed nowhere and `--mode=all-in-one` gets [`ALL_IN_ONE_REMOVED`] from
+/// [`refuse_all_in_one`] before clap reads it.
+pub(crate) fn mode_values() -> PossibleValuesParser {
+    PossibleValuesParser::new(
+        MODES.map(|m| PossibleValue::new(m.name).hide(m.name == names::ALL_IN_ONE)),
+    )
+}
+
+/// The names of the modes that can be asked for.
+fn listed_modes() -> Vec<&'static str> {
+    MODES
+        .iter()
+        .map(|m| m.name)
+        .filter(|name| *name != names::ALL_IN_ONE)
+        .collect()
+}
 
 /// A flag that takes a value, as `--name value` or `--name=value`; `None` for another word.
 fn value_of<'a>(
@@ -493,7 +543,20 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString>,
 {
-    parse_words(args.into_iter().map(Into::into).collect(), default_config)
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    refuse_all_in_one(&args)?;
+    parse_words(args, default_config)
+}
+
+/// [`parse_from`] without the refusal of `all-in-one`, for the tests of the variant that the
+/// refusal leaves in place until it is deleted.
+#[cfg(test)]
+pub(crate) fn parse_internal<I, T>(args: I) -> Result<Invocation, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    parse_words(args.into_iter().map(Into::into).collect(), None).map(|parsed| parsed.invocation)
 }
 
 /// [`parse_with`] on the words as the one type, so that the generic wrapper is the only
@@ -596,7 +659,7 @@ fn mode_of_file(
     path: Option<&std::path::Path>,
     default_config: Option<&std::path::Path>,
 ) -> Result<&'static Mode, clap::Error> {
-    let modes = MODES.map(|m| m.name).join("|");
+    let modes = listed_modes().join("|");
     let where_ = path.map_or_else(
         || {
             default_config.map_or_else(
@@ -619,6 +682,9 @@ fn mode_of_file(
     let Some(file) = file else {
         return Err(no_mode("it sets none"));
     };
+    if file == names::ALL_IN_ONE {
+        return Err(command().error(ErrorKind::InvalidValue, ALL_IN_ONE_REMOVED));
+    }
     MODES.iter().find(|m| m.name == file).ok_or_else(|| {
         command().error(
             ErrorKind::InvalidValue,

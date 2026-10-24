@@ -246,11 +246,11 @@ fn the_command_line_takes_a_mode_and_optionally_the_installer_toml() {
     };
     assert_eq!(parsed, want);
     assert_eq!(DEFAULT_INSTALLER_CONFIG, "/etc/kbf/installer.toml");
-    let given = ["--mode", "all-in-one", "--installer-config=/x/i.toml"];
+    let given = ["--mode", "storage", "--installer-config=/x/i.toml"];
     let parsed = parse(&boot(&given)).expect("parses");
-    assert_eq!(parsed.mode, names::ALL_IN_ONE);
+    assert_eq!(parsed.mode, names::STORAGE);
     assert_eq!(parsed.installer_config, Path::new("/x/i.toml"));
-    for mode in names::MODES {
+    for mode in names::MODES.iter().filter(|m| m.name != names::ALL_IN_ONE) {
         let flag = format!("--mode={}", mode.name);
         let parsed = parse(&boot(&[flag.as_str()])).expect("a mode");
         assert_eq!(parsed.mode, mode.name);
@@ -278,8 +278,9 @@ fn a_command_line_that_is_not_a_mode_and_nothing_else_is_a_usage_error() {
 fn the_help_names_the_verb_the_modes_and_the_default_installer_toml() {
     let help = command().render_long_help().to_string();
     assert!(help.contains("kbf boot-check"), "{help}");
-    for mode in names::MODES {
+    for mode in names::MODES.iter().filter(|m| m.name != names::ALL_IN_ONE) {
         assert!(help.contains(mode.name), "{}: {help}", mode.name);
     }
+    assert!(!help.contains("all-in-one"), "{help}");
     assert!(help.contains(DEFAULT_INSTALLER_CONFIG), "{help}");
 }

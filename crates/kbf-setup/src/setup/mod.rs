@@ -64,6 +64,8 @@ pub mod retired;
 pub mod validate;
 
 #[cfg(test)]
+mod all_in_one_refused_tests;
+#[cfg(test)]
 pub(crate) mod fake;
 #[cfg(test)]
 mod fetch_user_tests;
@@ -421,6 +423,12 @@ pub fn cli(
     apply: bool,
     out: &mut dyn Write,
 ) -> Result<(), SetupError> {
+    // Before the host is looked at, so that nothing is read or changed for a mode that is gone.
+    if args.mode == Mode::AllInOne {
+        return Err(SetupError::Unsupported(
+            crate::cli::ALL_IN_ONE_REMOVED.to_owned(),
+        ));
+    }
     on_host(root, raw_from(args), args.no_start, apply, out)
 }
 
