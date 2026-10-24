@@ -129,6 +129,7 @@ impl Farm {
             &secret,
             &TokenSpec {
                 roles: RoleSet::new(roles.iter().copied()).expect("roles"),
+                host_role: None,
                 max_uses: uses,
                 ttl,
                 node_id: None,

@@ -22,6 +22,7 @@ use std::time::Duration;
 use super::coordinator::Coordinator;
 use super::flags::Timing;
 use super::local::{HostState, Local};
+use super::renew::Renewer;
 use super::status::{Shared, Status, version_of_commit};
 use super::update::{Ports, Update};
 use crate::inventory::Host;
@@ -46,6 +47,16 @@ impl Stop {
     }
 }
 
+/// Sleeps for `total`, or until `stop`.
+fn sleep(total: Duration, stop: &Stop) {
+    let mut slept = Duration::ZERO;
+    while slept < total && !stop.stopped() {
+        let step = SLICE.min(total - slept);
+        std::thread::sleep(step);
+        slept += step;
+    }
+}
+
 /// Everything an agent talks to.
 pub struct World {
     pub coordinator: Arc<dyn Coordinator>,
@@ -54,6 +65,9 @@ pub struct World {
     pub health: Arc<dyn HealthCheck>,
     pub clock: Arc<dyn Clock>,
     pub unix_now: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// Keeps the certificate fresh, for a host the agent enrolled (`--state-dir`); none for
+    /// files an operator placed.
+    pub renewer: Option<Arc<dyn Renewer>>,
     pub log: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
@@ -102,6 +116,9 @@ impl Agent {
         let (orders, inbox) = channel();
         std::thread::scope(|scope| {
             scope.spawn(|| self.heartbeats(stop, &orders));
+            if let Some(renewer) = &self.world.renewer {
+                scope.spawn(|| self.renewals(renewer.as_ref(), stop));
+            }
             if let Some(target) = &resumed {
                 self.update(target);
             }
@@ -158,12 +175,15 @@ impl Agent {
                 Ok(Reply::Nothing) => {}
                 Err(e) => self.log(&format!("heartbeat: {e}")),
             }
-            let mut slept = Duration::ZERO;
-            while slept < self.timing.heartbeat && !stop.stopped() {
-                let step = SLICE.min(self.timing.heartbeat - slept);
-                std::thread::sleep(step);
-                slept += step;
-            }
+            sleep(self.timing.heartbeat, stop);
+        }
+    }
+
+    /// The certificate's renewals, on a thread of their own: a renewal calls the frontend and
+    /// may wait for it, and neither a heartbeat nor an update waits for that.
+    fn renewals(&self, renewer: &dyn Renewer, stop: &Stop) {
+        while !stop.stopped() {
+            sleep(renewer.round(), stop);
         }
     }
 

@@ -18,9 +18,12 @@ publish.workspace = true
 # The agent mode (`agent`, docs/design/updates.md) is the other way round: an updater on every
 # host that dials the coordinator over mutual TLS (rustls, the ring provider the workspace
 # already builds, over a std socket), reads its own certificate for who it is (kbf-peer), and
-# drives its host's A/B through `kbf-host-install`'s local socket.
+# drives its host's A/B through `kbf-host-install`'s local socket. Its certificate is made once
+# by `kbf-updater enroll` (a one-time token, `kbf-enroll`) and renewed by the agent.
 [dependencies]
+kbf-enroll.workspace = true
 kbf-peer.workspace = true
+kbf-proto.workspace = true
 kbf-types.workspace = true
 httparse.workspace = true
 libc.workspace = true
@@ -28,6 +31,9 @@ rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# `kbf-updater enroll` and the renewal call `kbf-enroll`, which is async; each runs a
+# current-thread runtime of its own, on a thread of its own. Nothing else here is async.
+tokio = { workspace = true, features = ["net", "rt", "time"] }
 
 [dev-dependencies]
 base64.workspace = true

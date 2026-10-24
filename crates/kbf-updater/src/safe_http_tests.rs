@@ -126,9 +126,9 @@ fn refusals_and_failures_are_errors_of_the_right_kind_and_leak_nothing() {
             "did not answer with HTTP",
         ),
         (
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n0\r\n\r\n".to_vec(),
             PortErrorKind::Other,
-            "chunked",
+            "encoding",
         ),
         (
             b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n{\"safe\":true".to_vec(),

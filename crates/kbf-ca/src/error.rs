@@ -80,6 +80,9 @@ pub enum CaError {
     /// A daemon certificate with an advertise host.
     #[error("a daemon certificate names only its node")]
     AdvertiseForDaemon,
+    /// A node certificate asked for the role `updater`, which has its own certificate.
+    #[error("an updater's certificate is made by issue_updater, not as a node's")]
+    NotANodeRole,
     /// A frontend certificate with no names.
     #[error("a frontend certificate needs a name")]
     NoNames,

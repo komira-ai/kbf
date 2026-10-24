@@ -30,6 +30,8 @@ pub mod tls;
 
 #[cfg(test)]
 mod testkit;
+#[cfg(test)]
+mod updater_tests;
 
 use std::io::Read as _;
 

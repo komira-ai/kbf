@@ -72,6 +72,8 @@ zeroize.workspace = true
 [dev-dependencies]
 # The node's client of `kbf.enroll.v1`, run against the real enroll listener (tests/enroll_node.rs).
 kbf-enroll.workspace = true
+# The host's updater, run against the same listener (tests/enroll_updater.rs).
+kbf-updater.workspace = true
 # An S3 service on loopback that refuses any other key pair (tests/cold_apply.rs).
 kbf-objstore = { workspace = true, features = ["testkit"] }
 # Loopback ports nothing can take (kbf_testkit::port), and the test Postgres server's URL
