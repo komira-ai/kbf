@@ -541,8 +541,6 @@ fn the_cordoned_workers_that_could_run_an_operation_are_named() {
             waiter: WaiterId(waiter),
             request,
         });
-        h.s.waiters(OperationId(u64::from(waiter) - 101))
-            .map(|_| ());
     };
     let plain = request(1);
     let big = Request {
