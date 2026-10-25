@@ -1,0 +1,13 @@
+//! The S3 front of the tiering proxy and its binary: the client of kbf against the server over
+//! loopback, requests signed by hand, the drain, and the `tierstore` process.
+
+mod binary;
+mod client;
+mod drain;
+mod files;
+mod idle;
+mod raw;
+mod run;
+mod signer;
+mod stalled;
+mod support;

@@ -13,7 +13,7 @@ use crate::journal::{
     USAGE_KEY, Usage, encode_journal, is_reserved, journal_key, journal_prefix, load_checkpoint,
     proxy_key, seq_of,
 };
-use crate::{Backend, ByteRange, Clock, Error, JournalEntry, JournalOp, Listed, Meta};
+use crate::{Backend, ByteRange, Clock, Error, JournalEntry, JournalOp, Listed, Meta, PartBody};
 
 /// The settings of a [`Proxy`].
 #[derive(Clone)]
@@ -138,6 +138,15 @@ fn refuse_reserved(key: &str) -> Result<(), Error> {
 ///   `_tiering/`. [`Backend::list_page`] pages through the merged listing: the last key of a
 ///   page is the continuation token, and `max_keys` is kept to. A put or a delete of a key
 ///   under a reserved prefix is refused with [`Error::Reserved`].
+/// - **Multipart uploads** (`create_upload`, `upload_part`, `complete_upload`, `abort_upload`)
+///   go straight to the cold tier: the parts are passed on as they arrive, so the proxy holds no
+///   part, in memory or on disk, and the uploads are the cold tier's own (they outlive the
+///   proxy where the cold tier keeps them). The completion is a create-only put to the cold
+///   tier, and so is refused with [`Error::AlreadyExists`] where either tier holds the key. It
+///   journals nothing, as a put that goes to the cold tier of a full hot tier journals nothing:
+///   the object is in the cold tier, so a get, a head, a listing and a delete find it, and the
+///   reconciler has nothing to copy. It is in the hot tier only after a get copies it back.
+///   The cold tier must do multipart uploads (the provided methods of [`Backend`] do not).
 ///
 /// The journal is written in batches of at most [`ProxyConfig::batch_entries`] entries, each
 /// batch after [`ProxyConfig::linger`] at most, as `_journal/<proxy_id>/<seq>`, create-only,
@@ -343,15 +352,35 @@ impl Inner {
         self.classify(hot_bytes)
     }
 
-    /// Writes the object to the cold tier, create-only, when the hot tier is full. The hot
-    /// tier is asked first, since a put is refused where either tier holds the key.
-    async fn put_cold(&self, key: &str, body: Bytes) -> Result<(), Error> {
+    /// Checks that the hot tier has no object `key`: the hot tier is asked before the cold tier
+    /// is written, since a put is refused where either tier holds the key.
+    async fn check_not_in_hot(&self, key: &str) -> Result<(), Error> {
         match self.hot.head(key).await {
-            Ok(_) => return Err(Error::AlreadyExists(key.to_owned())),
-            Err(Error::NotFound(_)) => {}
-            Err(error) => return Err(error),
+            Ok(_) => Err(Error::AlreadyExists(key.to_owned())),
+            Err(Error::NotFound(_)) => Ok(()),
+            Err(error) => Err(error),
         }
+    }
+
+    /// Writes the object to the cold tier, create-only, when the hot tier is full.
+    async fn put_cold(&self, key: &str, body: Bytes) -> Result<(), Error> {
+        self.check_not_in_hot(key).await?;
         self.cold.put(key, body).await
+    }
+
+    /// Creates the object of a multipart upload in the cold tier, create-only, as `put_cold`
+    /// does. The cold tier's own completion refuses a key it holds. The object is not
+    /// journaled, as a put to the cold tier is not: it is in the cold tier, which is where the
+    /// reconciler would copy it to.
+    async fn complete_cold(
+        &self,
+        key: &str,
+        id: &str,
+        parts: &[(u32, String)],
+    ) -> Result<String, Error> {
+        refuse_reserved(key)?;
+        self.check_not_in_hot(key).await?;
+        self.cold.complete_upload(key, id, parts).await
     }
 
     async fn put_hot(&self, key: &str, body: Bytes) -> Result<(), Error> {
@@ -526,5 +555,35 @@ impl Backend for Proxy {
         self.inner
             .list_objects_page(prefix, start_after, max_keys)
             .await
+    }
+
+    async fn create_upload(&self, key: &str) -> Result<String, Error> {
+        refuse_reserved(key)?;
+        self.inner.cold.create_upload(key).await
+    }
+
+    async fn upload_part(
+        &self,
+        key: &str,
+        id: &str,
+        number: u32,
+        body: PartBody<'_>,
+    ) -> Result<String, Error> {
+        refuse_reserved(key)?;
+        self.inner.cold.upload_part(key, id, number, body).await
+    }
+
+    async fn complete_upload(
+        &self,
+        key: &str,
+        id: &str,
+        parts: &[(u32, String)],
+    ) -> Result<String, Error> {
+        self.inner.complete_cold(key, id, parts).await
+    }
+
+    async fn abort_upload(&self, key: &str, id: &str) -> Result<(), Error> {
+        refuse_reserved(key)?;
+        self.inner.cold.abort_upload(key, id).await
     }
 }

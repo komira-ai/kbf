@@ -5,10 +5,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
 use sha2::{Digest, Sha256};
 
-use crate::{Backend, ByteRange, Clock, Error, Listed, Meta};
+use crate::{Backend, ByteRange, Clock, Error, Listed, Meta, PartBody};
 
 /// A clock a test sets by hand, for the times a [`MemoryBackend`] gives its objects. It starts
 /// at zero and moves only when told to, so two tiers that share one clock agree on the time.
@@ -58,11 +59,30 @@ fn tag_of(body: &Bytes) -> String {
     hex::encode(Sha256::digest(body))
 }
 
+/// A multipart upload in progress: the key it is for, and the parts stored so far by number,
+/// each with its content tag.
+struct Upload {
+    key: String,
+    parts: BTreeMap<u32, (Bytes, String)>,
+}
+
+/// The multipart uploads in progress, by upload id.
+#[derive(Default)]
+struct Uploads {
+    /// How many uploads were started, which numbers the next.
+    started: u64,
+    open: BTreeMap<String, Upload>,
+}
+
 /// A bucket held in memory. Its content tag is the hex of the SHA-256 of the body, and an
 /// object's time of last write is what its [`TestClock`] said when it was put.
+///
+/// It does multipart uploads too, holding the parts in memory until the upload is completed or
+/// aborted; the parts of an upload are not objects, and are not listed.
 #[derive(Default)]
 pub struct MemoryBackend {
     objects: Mutex<BTreeMap<String, Stored>>,
+    uploads: Mutex<Uploads>,
     clock: Arc<TestClock>,
 }
 
@@ -79,6 +99,7 @@ impl MemoryBackend {
     pub fn with_clock(clock: Arc<TestClock>) -> Self {
         Self {
             objects: Mutex::new(BTreeMap::new()),
+            uploads: Mutex::default(),
             clock,
         }
     }
@@ -100,6 +121,23 @@ impl MemoryBackend {
             .get(key)
             .map(|stored| (stored.body.clone(), stored.modified));
         found.ok_or_else(|| Error::NotFound(key.to_owned()))
+    }
+
+    fn uploads(&self) -> MutexGuard<'_, Uploads> {
+        // No method panics while holding the lock, so a poisoned map is still whole.
+        self.uploads.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the upload `id` is open and is for `key`.
+    fn check_upload(&self, key: &str, id: &str) -> Result<(), Error> {
+        let uploads = self.uploads();
+        let found = uploads.open.get(id);
+        let known = found.is_some_and(|upload| upload.key == key);
+        if known {
+            Ok(())
+        } else {
+            Err(Error::NotFound(id.to_owned()))
+        }
     }
 }
 
@@ -163,5 +201,70 @@ impl Backend for MemoryBackend {
             })
             .collect();
         Ok(listed)
+    }
+
+    async fn create_upload(&self, key: &str) -> Result<String, Error> {
+        let mut uploads = self.uploads();
+        uploads.started += 1;
+        let id = format!("upload-{}", uploads.started);
+        let upload = Upload {
+            key: key.to_owned(),
+            parts: BTreeMap::new(),
+        };
+        uploads.open.insert(id.clone(), upload);
+        Ok(id)
+    }
+
+    async fn upload_part(
+        &self,
+        key: &str,
+        id: &str,
+        number: u32,
+        mut body: PartBody<'_>,
+    ) -> Result<String, Error> {
+        self.check_upload(key, id)?;
+        let mut whole = BytesMut::new();
+        while let Some(chunk) = body.next().await {
+            whole.extend_from_slice(&chunk?);
+        }
+        let part = whole.freeze();
+        let tag = tag_of(&part);
+        let mut uploads = self.uploads();
+        let upload = uploads.open.get_mut(id).filter(|up| up.key == key);
+        let upload = upload.ok_or_else(|| Error::NotFound(id.to_owned()))?;
+        upload.parts.insert(number, (part, tag.clone()));
+        Ok(tag)
+    }
+
+    async fn complete_upload(
+        &self,
+        key: &str,
+        id: &str,
+        parts: &[(u32, String)],
+    ) -> Result<String, Error> {
+        let mut whole = BytesMut::new();
+        {
+            let uploads = self.uploads();
+            let upload = uploads.open.get(id).filter(|up| up.key == key);
+            let upload = upload.ok_or_else(|| Error::NotFound(id.to_owned()))?;
+            for (number, tag) in parts {
+                let named = upload.parts.get(number).filter(|(_, held)| held == tag);
+                let Some((bytes, _)) = named else {
+                    return Err(Error::InvalidPart(format!("part {number}")));
+                };
+                whole.extend_from_slice(bytes);
+            }
+        }
+        let object = whole.freeze();
+        let tag = tag_of(&object);
+        self.put(key, object).await?;
+        self.uploads().open.remove(id);
+        Ok(tag)
+    }
+
+    async fn abort_upload(&self, key: &str, id: &str) -> Result<(), Error> {
+        self.check_upload(key, id)?;
+        self.uploads().open.remove(id);
+        Ok(())
     }
 }

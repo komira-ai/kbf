@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::{Backend, ByteRange, Error, Listed, Meta};
+use crate::{Backend, ByteRange, Error, Listed, Meta, PartBody};
 
 /// The kinds of call a [`FaultyBackend`] tells apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -25,6 +25,14 @@ pub enum Op {
     Delete,
     /// [`Backend::list`].
     List,
+    /// [`Backend::create_upload`].
+    CreateUpload,
+    /// [`Backend::upload_part`].
+    UploadPart,
+    /// [`Backend::complete_upload`].
+    CompleteUpload,
+    /// [`Backend::abort_upload`].
+    AbortUpload,
 }
 
 /// The error of a call that fails because its backend is down or was told to fail it.
@@ -204,5 +212,36 @@ impl Backend for FaultyBackend {
         self.plan().listed.push(prefix.to_owned());
         self.enter(Op::List, prefix).await?;
         self.inner.list(prefix).await
+    }
+
+    async fn create_upload(&self, key: &str) -> Result<String, Error> {
+        self.enter(Op::CreateUpload, key).await?;
+        self.inner.create_upload(key).await
+    }
+
+    async fn upload_part(
+        &self,
+        key: &str,
+        id: &str,
+        number: u32,
+        body: PartBody<'_>,
+    ) -> Result<String, Error> {
+        self.enter(Op::UploadPart, key).await?;
+        self.inner.upload_part(key, id, number, body).await
+    }
+
+    async fn complete_upload(
+        &self,
+        key: &str,
+        id: &str,
+        parts: &[(u32, String)],
+    ) -> Result<String, Error> {
+        self.enter(Op::CompleteUpload, key).await?;
+        self.inner.complete_upload(key, id, parts).await
+    }
+
+    async fn abort_upload(&self, key: &str, id: &str) -> Result<(), Error> {
+        self.enter(Op::AbortUpload, key).await?;
+        self.inner.abort_upload(key, id).await
     }
 }

@@ -8,6 +8,7 @@ mod conformance;
 mod faults;
 mod journal;
 mod lease;
+mod multipart;
 mod reconciler;
 mod reconciler_faults;
 #[cfg(feature = "s3")]

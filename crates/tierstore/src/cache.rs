@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::{Backend, ByteRange, Error, Listed, Meta};
+use crate::{Backend, ByteRange, Error, Listed, Meta, PartBody};
 
 /// What a cached read was asked for: an object, and a range of it or the whole of it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -112,7 +112,8 @@ impl Cache {
 /// Errors are never cached. A delete, and a put that replaces the object, drop the object's
 /// cached ranges, and a read that was in flight during it does not fill the cache
 /// afterwards. Everything but `get`, `delete` and `put_if_match` goes to the backend as it
-/// is.
+/// is, the calls of multipart uploads included (a completion creates an object, which no read
+/// has cached).
 pub struct CachedStore {
     inner: Arc<dyn Backend>,
     budget: u64,
@@ -204,5 +205,32 @@ impl Backend for CachedStore {
         max_keys: usize,
     ) -> Result<Vec<Listed>, Error> {
         self.inner.list_page(prefix, start_after, max_keys).await
+    }
+
+    async fn create_upload(&self, key: &str) -> Result<String, Error> {
+        self.inner.create_upload(key).await
+    }
+
+    async fn upload_part(
+        &self,
+        key: &str,
+        id: &str,
+        number: u32,
+        body: PartBody<'_>,
+    ) -> Result<String, Error> {
+        self.inner.upload_part(key, id, number, body).await
+    }
+
+    async fn complete_upload(
+        &self,
+        key: &str,
+        id: &str,
+        parts: &[(u32, String)],
+    ) -> Result<String, Error> {
+        self.inner.complete_upload(key, id, parts).await
+    }
+
+    async fn abort_upload(&self, key: &str, id: &str) -> Result<(), Error> {
+        self.inner.abort_upload(key, id).await
     }
 }

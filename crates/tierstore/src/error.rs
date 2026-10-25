@@ -20,6 +20,14 @@ pub enum Error {
     /// A client write to a key under a prefix the proxy keeps for itself.
     #[error("key {0} is under a reserved prefix")]
     Reserved(String),
+    /// A completion of a multipart upload names a part that was not uploaded, or one whose
+    /// content tag is not the one that was named.
+    #[error("invalid part: {0}")]
+    InvalidPart(String),
+    /// The backend does not do this call: the multipart calls of a [`Backend`](crate::Backend)
+    /// that does not override them.
+    #[error("not supported: {0}")]
+    Unsupported(String),
     /// The backend did not answer (down, timed out, refused the connection). Retrying later
     /// may succeed.
     #[error("backend unavailable: {0}")]
