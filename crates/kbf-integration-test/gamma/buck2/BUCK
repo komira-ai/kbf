@@ -1,0 +1,32 @@
+# Four actions in a chain, each `/bin/sh -c`: `seed` writes the run's nonce, `upper` reads
+# `seed`, `count` reads `upper`, and `proof` joins the three. The farm has to run each on
+# a worker after the one before it wrote its output, which exercises inputs that are
+# outputs of earlier actions.
+load(":defs.bzl", "step")
+
+step(
+    name = "seed",
+    script = 'echo "gamma $2" > "$1"',
+)
+
+step(
+    name = "upper",
+    script = 'cat "$3" | tr a-z A-Z > "$1"',
+    srcs = [":seed"],
+)
+
+step(
+    name = "count",
+    script = 'wc -c < "$3" > "$1"',
+    srcs = [":upper"],
+)
+
+step(
+    name = "proof",
+    script = 'cat "$3" "$4" "$5" > "$1"',
+    srcs = [
+        ":seed",
+        ":upper",
+        ":count",
+    ],
+)

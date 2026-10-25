@@ -1,0 +1,14 @@
+//! The frontend's blobs in packs (`kbf_front::Packs`), over real gRPC: the batch CAS calls and
+//! ByteStream of a proxy given packs, in front of a storage node (a real one, or the fake node
+//! that streams), an in-memory pack index and an in-memory object store that count what they
+//! are asked and fail when told to.
+//!
+//! Every test says the behaviour it asserts.
+
+#[path = "../proxy/harness.rs"]
+mod harness;
+
+mod bytestream;
+mod cas;
+mod store;
+mod support;

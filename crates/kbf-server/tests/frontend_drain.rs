@@ -7,6 +7,7 @@ mod support;
 use kbf_proto::reapi::execution_stage::Value as ExecStage;
 use kbf_server::api::{FRONTEND_DRAIN, NODES};
 use kbf_server::api_client::{OperatorClient, Reply};
+use prost::Message as _;
 use serde_json::{Value, json};
 use support::{API_TOKEN, Cell, Job, PROMPT, done, output, ran, stage};
 use tonic::Code;
@@ -37,19 +38,19 @@ async fn begin(cell: &Cell, token: bool, body: &'static str) -> Reply {
     .await
 }
 
-/// Catches the endpoint's whole contract on a frontend with one open stream and its
-/// operation queued with no worker to run it:
+/// Catches the endpoint's whole contract on a frontend with one open stream whose
+/// operation runs on a node's lease:
 /// - the status names `draining`, `open_executions` and `queued_operations`, as a
 ///   count of each (an orchestrator tells idle from queued-with-no-worker by them);
 /// - a `POST` without the token (401) or with a body that is not `{}` (400) changes
 ///   nothing (defect: the gate left out of `begin_drain`);
 /// - a `POST` with the token begins the drain and answers its status, again and again
 ///   (idempotent): `/readyz` is 503, a new Execute is refused, and the
-///   stream opened before it still gets its operation's end, from a daemon that
-///   registers after the drain (defect: the stream ended by the drain).
+///   stream opened before it still gets its operation's end (defect: the stream of a
+///   running operation ended by the drain).
 ///   The REAPI connection is sent GOAWAY (`Drain::begin`'s unit tests pin each effect).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_drain_by_the_endpoint_keeps_the_open_stream_and_refuses_the_next() {
+async fn a_drain_by_the_endpoint_keeps_the_running_stream_and_refuses_the_next() {
     let cell = Cell::start_with_api().await;
     let job = Job::new("drained by the endpoint", &[]);
     cell.upload(&job.blobs()).await;
@@ -79,6 +80,15 @@ async fn a_drain_by_the_endpoint_keeps_the_open_stream_and_refuses_the_next() {
         }),
         "an open stream whose operation waits for a worker"
     );
+    let mut daemon = cell.daemon("node-a", 4, 8).await;
+    let start = daemon.start().await;
+    let running = loop {
+        let op = ops.message().await.expect("healthy").expect("EXECUTING");
+        if stage(&op) == ExecStage::Executing as i32 {
+            break op;
+        }
+    };
+    assert_eq!(stage(&running), ExecStage::Executing as i32);
 
     let refused = begin(&cell, false, "").await;
     assert_eq!(refused.status, 401, "{refused:?}");
@@ -96,7 +106,7 @@ async fn a_drain_by_the_endpoint_keeps_the_open_stream_and_refuses_the_next() {
         "draining": true,
         "phase": "draining",
         "open_executions": 1,
-        "queued_operations": 1
+        "queued_operations": 0
     });
     assert_eq!(
         serde_json::from_str::<Value>(&begun.body).expect("JSON"),
@@ -120,14 +130,45 @@ async fn a_drain_by_the_endpoint_keeps_the_open_stream_and_refuses_the_next() {
     next.expect_err("a new Execute during the drain");
     assert_eq!(status(&cell).await, want, "the refused Execute was queued");
 
-    // The worker listener is not drained: a daemon registers now, takes the lease and
-    // reports, and the stream opened before the drain ends with its result.
-    let mut daemon = cell.daemon("node-a", 4, 8).await;
-    let start = daemon.start().await;
+    // The worker listener is not drained: the daemon reports, and the stream opened
+    // before the drain ends with its result.
     let ack = daemon.report(ran(start.lease_id, &result)).await;
     assert!(ack.accepted, "{ack:?}");
     let last = done(&mut ops).await;
     assert_eq!(stage(&last), ExecStage::Completed as i32);
+}
+
+/// Catches a drain by the endpoint that keeps the stream of an operation that has never
+/// started and that no worker can run (it would wait for the whole deadline): the stream
+/// ends UNAVAILABLE at once, naming why, and the operation is not cancelled by it
+/// (`sequence::tests` pins that the scheduler still holds it queued).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drain_by_the_endpoint_ends_the_queued_stream() {
+    let cell = Cell::start_with_api().await;
+    let job = Job::new("queued across the endpoint's drain", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let queued = ops.message().await.expect("healthy").expect("QUEUED");
+    assert_eq!(stage(&queued), ExecStage::Queued as i32);
+    // The scheduler says no worker can run it (the stage `Waiting`) at its first tick.
+    loop {
+        let op = ops.message().await.expect("healthy").expect("an update");
+        let meta = op.metadata.as_ref().expect("metadata");
+        let meta = kbf_proto::reapi::ExecuteOperationMetadata::decode(meta.value.as_slice());
+        let waits = meta.expect("metadata").partial_execution_metadata;
+        if waits.is_some_and(|partial| !partial.auxiliary_metadata.is_empty()) {
+            break;
+        }
+    }
+
+    let begun = begin(&cell, true, "").await;
+    assert_eq!(begun.status, 200, "{begun:?}");
+    let ended = tokio::time::timeout(PROMPT, ops.message())
+        .await
+        .expect("the queued stream ends after the drain began")
+        .expect_err("it ends with an error");
+    assert_eq!(ended.code(), Code::Unavailable, "{ended:?}");
+    assert!(ended.message().contains("never started"), "{ended:?}");
 }
 
 /// Catches an idle frontend whose drain answer is lost: with no REAPI connection the
@@ -148,15 +189,25 @@ async fn an_idle_frontend_answers_the_drain_that_ends_it() {
 
 /// Catches an escalation that does not end the streams: a drain that began (by the
 /// endpoint, as here, or by a signal) waits for the stream's action, and
-/// `Drain::close`, which a second signal calls, ends it UNAVAILABLE now. Catches:
+/// `Drain::close`, which a second signal calls, ends it UNAVAILABLE now (here the
+/// operation runs on a node, so the drain keeps its stream until then). Catches:
 /// `Drain::close` not closing (the read times out).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_ends_the_streams_of_a_drain() {
     let cell = Cell::start_with_api().await;
     let job = Job::new("forced by a close", &[]);
     cell.upload(&job.blobs()).await;
+    let mut daemon = cell.daemon("node-a", 4, 8).await;
     let mut ops = cell.execute(&job.action).await;
     ops.message().await.expect("healthy").expect("QUEUED");
+    daemon.start().await;
+    let running = loop {
+        let op = ops.message().await.expect("healthy").expect("EXECUTING");
+        if stage(&op) == ExecStage::Executing as i32 {
+            break op;
+        }
+    };
+    assert_eq!(stage(&running), ExecStage::Executing as i32);
     let begun = begin(&cell, true, "").await;
     assert_eq!(begun.status, 200, "{begun:?}");
 

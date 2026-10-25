@@ -32,6 +32,8 @@ fn timing(lb_wait: u64, deadline: u64) -> DrainTiming {
 /// A serving frontend's parts, as the drain stands them down: a farm over a state store, a
 /// drain with the listeners' stops, and the sequence over them.
 struct Rig {
+    /// The state store this frontend shares with [`other_frontend`]s.
+    shared: Arc<Fake>,
     backend: Backend,
     farm: Arc<Farm>,
     drain: Arc<Drain>,
@@ -54,6 +56,7 @@ impl Rig {
         let value = 7_u64.to_be_bytes().to_vec();
         let generation = Txn::new().put(kbf_state::GENERATION, value, Cond::Any);
         store.txn(generation).expect("store").expect("put");
+        let shared = Arc::new(store);
         let backend = Backend::from(Arc::new(Cache::memory()));
         let farm = Farm::new(
             backend.clone(),
@@ -61,7 +64,7 @@ impl Rig {
             kbf_sched::FINISHED_RETENTION,
         )
         .with_state(Some(StateStore {
-            store: Arc::new(store),
+            store: Arc::clone(&shared) as Arc<dyn Store>,
             epoch: EpochPolicy::Keep,
             members: Default::default(),
             history: None,
@@ -83,6 +86,7 @@ impl Rig {
         };
         let sequence = Sequence::new(stand.clone(), api.clone(), timing);
         Self {
+            shared,
             backend,
             farm,
             drain,
@@ -346,4 +350,671 @@ fn the_defaults_are_ten_seconds_and_fifteen_minutes() {
     let timing = DrainTiming::default();
     assert_eq!(timing.lb_wait, Duration::from_secs(10));
     assert_eq!(timing.deadline, Duration::from_secs(900));
+}
+
+/// What begins the drain in the tests below: a stop signal, or `POST /v1/frontend/drain`.
+/// Both end in the same sequence ([`Retire::drain`]), and these tests run each.
+#[derive(Clone, Copy, Debug)]
+enum Begin {
+    Signal,
+    Endpoint,
+}
+
+/// The `Execution` service over the rig's farm, as the REAPI listener serves it.
+fn execution(rig: &Rig) -> kbf_front::ExecutionService<Farm> {
+    kbf_front::ExecutionService::with_authorizers(
+        rig.backend.clone(),
+        Arc::clone(&rig.farm),
+        rig.closing.clone(),
+        Arc::new(kbf_auth::Authorizers::allow_all()),
+    )
+}
+
+/// Opens a WaitExecution stream on `ticket`'s operation and follows it in a task, which
+/// ends with the stream: `Ok` when the stream ended cleanly (the operation is done) and
+/// the status when it ended with an error.
+async fn follow(
+    rig: &Rig,
+    ticket: &kbf_front::Ticket,
+) -> tokio::task::JoinHandle<Result<(), Status>> {
+    use futures::StreamExt as _;
+    use kbf_proto::reapi::execution_server::Execution as _;
+    let request = kbf_proto::reapi::WaitExecutionRequest {
+        name: ticket.name.clone(),
+    };
+    let mut stream = execution(rig)
+        .wait_execution(tonic::Request::new(request))
+        .await
+        .expect("WaitExecution")
+        .into_inner();
+    tokio::spawn(async move {
+        while let Some(operation) = stream.next().await {
+            operation?;
+        }
+        Ok(())
+    })
+}
+
+/// Runs the stop (or the endpoint's drain) in a task of its own, which ends with it.
+fn begin(rig: &Rig, how: Begin, timeout: Duration) -> tokio::task::JoinHandle<()> {
+    let retire = Arc::new(rig.retire());
+    let drain = Arc::clone(&rig.drain);
+    tokio::spawn(async move {
+        match how {
+            Begin::Signal => stopped(&drain, &retire, timeout).await,
+            Begin::Endpoint => {
+                retire.get().expect("set").drain();
+                drain.sequence_finished().await;
+            }
+        }
+    })
+}
+
+/// Lets the tasks that are ready run, and `by` of paused time pass.
+async fn pass(by: Duration) {
+    tokio::time::sleep(by).await;
+}
+
+/// Lets `secs` seconds of paused time pass, feeding the farm every second as its
+/// heartbeats and ticks do: the drain's hold on the nodes is applied on a farm input, not
+/// when the drain begins, so a test that never feeds the farm sees a farm that has not
+/// yet held anything.
+async fn pass_feeding(rig: &Rig, secs: u64) {
+    for _ in 0..secs {
+        pass(Duration::from_secs(1)).await;
+        rig.farm.tick().await;
+    }
+    // Let the tasks the last input woke run.
+    pass(Duration::from_millis(1)).await;
+}
+
+/// A result for `lease`, which the farm accepts without a cache write: the operation
+/// is done.
+fn finished(lease: kbf_types::LeaseId) -> kbf_proto::worker::Result {
+    kbf_proto::worker::Result {
+        lease_id: Some(kbf_proto::worker::LeaseId {
+            term: lease.term,
+            seq: lease.seq,
+        }),
+        status: Some(kbf_proto::google::rpc::Status {
+            code: Code::InvalidArgument as i32,
+            message: "test".to_owned(),
+            details: Vec::new(),
+        }),
+        action_result: None,
+        action_digest: None,
+        memory_kill: 0,
+        lost: 0,
+    }
+}
+
+/// Puts one operation under a running lease and one in the queue with every worker
+/// cordoned, and opens a stream on each. Returns the running one's lease and both
+/// streams, queued first.
+async fn one_running_one_queued(
+    rig: &Rig,
+) -> (
+    kbf_types::LeaseId,
+    tokio::task::JoinHandle<Result<(), Status>>,
+    tokio::task::JoinHandle<Result<(), Status>>,
+) {
+    let mut inbox = register(rig);
+    let running = submit(&rig.farm, request(1)).expect("queued");
+    rig.farm.tick().await;
+    assert_eq!(starts(&mut inbox), 1, "the first operation did not start");
+    rig.farm
+        .place(&WorkerId::new("node-a"), crate::farm::NodeAction::Cordon)
+        .expect("cordoned");
+    let queued = submit(&rig.farm, request(2)).expect("queued");
+    rig.farm.tick().await;
+    assert_eq!(starts(&mut inbox), 0, "a cordoned node was given work");
+    let views = rig.farm.lease_views(None);
+    let [view] = &views.leases[..] else {
+        panic!("one lease expected");
+    };
+    let lease = view.lease;
+    let queued = follow(rig, &queued).await;
+    let running = follow(rig, &running).await;
+    (lease, queued, running)
+}
+
+/// Asserts that a stop, or the endpoint's drain, with one operation running and one queued
+/// behind a cordoned worker: leaves both streams alone while the load balancer wait runs;
+/// when it is over ends the queued stream UNAVAILABLE at once, naming the operation, while
+/// the running one stays open; keeps the drain going while the lease runs, far past the
+/// load balancer wait; and, once the lease is done, answers the running stream with its
+/// done operation and ends the drain.
+async fn a_queued_stream_ends_at_once_and_a_running_one_is_kept(how: Begin) {
+    let rig = Rig::new(timing(10, 900));
+    let (lease, queued, running) = one_running_one_queued(&rig).await;
+    let began = Instant::now();
+    let stop = begin(&rig, how, Duration::MAX);
+
+    pass_feeding(&rig, 9).await;
+    assert!(!queued.is_finished(), "{how:?}: ended in the wait");
+    assert!(!running.is_finished());
+
+    pass_feeding(&rig, 2).await;
+    assert!(queued.is_finished(), "{how:?}: the queued stream is open");
+    let ended = queued.await.expect("task").expect_err("ended");
+    assert_eq!(ended.code(), Code::Unavailable, "{how:?}: {ended:?}");
+    assert!(ended.message().contains("operations/"), "{ended:?}");
+    assert!(
+        began.elapsed() < Duration::from_secs(12),
+        "{how:?}: {:?}",
+        began.elapsed()
+    );
+
+    pass_feeding(&rig, 40).await;
+    assert!(!running.is_finished(), "{how:?}: the running stream ended");
+    assert!(!stop.is_finished(), "{how:?}: exited with a lease running");
+    assert_eq!(rig.drain.phase(), Phase::Draining);
+
+    rig.farm
+        .report(&WorkerId::new("node-a"), finished(lease))
+        .await;
+    let ended = tokio::time::timeout(Duration::from_secs(10), stop);
+    ended
+        .await
+        .expect("the stop ends once the lease is done")
+        .expect("task");
+    running
+        .await
+        .expect("task")
+        .expect("the done operation, then the end");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_ends_the_queued_stream_at_once_and_keeps_the_running_one() {
+    a_queued_stream_ends_at_once_and_a_running_one_is_kept(Begin::Signal).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_endpoints_drain_ends_the_queued_stream_at_once_and_keeps_the_running_one() {
+    a_queued_stream_ends_at_once_and_a_running_one_is_kept(Begin::Endpoint).await;
+}
+
+/// Asserts that with only a queued operation, behind a cordoned worker, the stop (or the
+/// endpoint's drain) is over by the load balancer wait and a small margin, with no second
+/// signal and no stop timeout, and not at the drain deadline.
+async fn only_a_queued_operation_does_not_hold_the_stop(how: Begin) {
+    let rig = Rig::new(timing(10, 900));
+    let _inbox = register(&rig);
+    rig.farm
+        .place(&WorkerId::new("node-a"), crate::farm::NodeAction::Cordon)
+        .expect("cordoned");
+    let queued = submit(&rig.farm, request(1)).expect("queued");
+    rig.farm.tick().await;
+    let stream = follow(&rig, &queued).await;
+    let began = Instant::now();
+    let stop = begin(&rig, how, Duration::MAX);
+
+    let waited = tokio::time::timeout(Duration::from_secs(60), stop).await;
+    waited
+        .expect("the stop ends long before the deadline")
+        .expect("task");
+    let took = began.elapsed();
+    assert!(
+        took >= Duration::from_secs(10),
+        "{how:?}: before the wait: {took:?}"
+    );
+    assert!(
+        took < Duration::from_secs(10) + Duration::from_secs(5),
+        "{how:?}: {took:?}"
+    );
+    let ended = stream.await.expect("task").expect_err("ended");
+    assert_eq!(ended.code(), Code::Unavailable, "{how:?}: {ended:?}");
+    assert_eq!(rig.drain.phase(), Phase::Closing);
+    // Ending the stream did not cancel the operation: it is queued still, for the
+    // frontends that take over its work.
+    assert_eq!(rig.farm.queued_operations(), 1, "{how:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_with_only_a_queued_operation_ends_within_the_lb_wait() {
+    only_a_queued_operation_does_not_hold_the_stop(Begin::Signal).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_endpoints_drain_with_only_a_queued_operation_ends_within_the_lb_wait() {
+    only_a_queued_operation_does_not_hold_the_stop(Begin::Endpoint).await;
+}
+
+/// Asserts that a stop whose running action outlasts `--drain-deadline`, with no stop
+/// timeout, ends at the deadline (and the clients' grace) and no earlier: the running
+/// stream is then ended UNAVAILABLE.
+async fn a_running_action_is_cut_at_the_drain_deadline(how: Begin) {
+    let rig = Rig::new(timing(0, 30));
+    let mut inbox = register(&rig);
+    let running = submit(&rig.farm, request(1)).expect("queued");
+    rig.farm.tick().await;
+    assert_eq!(starts(&mut inbox), 1, "the operation did not start");
+    let running = follow(&rig, &running).await;
+    let began = Instant::now();
+    let stop = begin(&rig, how, Duration::MAX);
+
+    pass(Duration::from_secs(29)).await;
+    assert!(!running.is_finished());
+    assert!(!stop.is_finished(), "{how:?}: ended before the deadline");
+
+    let waited = tokio::time::timeout(Duration::from_secs(60), stop).await;
+    waited
+        .expect("the stop ends at the deadline")
+        .expect("task");
+    let took = began.elapsed();
+    assert!(took >= Duration::from_secs(30), "{how:?}: {took:?}");
+    let latest = Duration::from_secs(30) + CLOSE_GRACE + Duration::from_secs(2);
+    assert!(took < latest, "{how:?}: {took:?}");
+    let ended = running.await.expect("task").expect_err("ended");
+    assert_eq!(ended.code(), Code::Unavailable, "{how:?}: {ended:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_ends_at_the_drain_deadline_when_a_running_action_outlasts_it() {
+    a_running_action_is_cut_at_the_drain_deadline(Begin::Signal).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_endpoints_drain_ends_at_the_deadline_when_a_running_action_outlasts_it() {
+    a_running_action_is_cut_at_the_drain_deadline(Begin::Endpoint).await;
+}
+
+/// Asserts that an operation a worker can take but that is only queued (the node is full)
+/// keeps its stream through the drain, which no longer ends it: the stream is open past the
+/// load balancer wait and until the deadline, which ends it with the stop. Buck2 does not
+/// recover a stream that ends after the call opened, so a queued operation is not ended
+/// early.
+async fn a_queued_operation_a_worker_can_take_keeps_its_stream(how: Begin) {
+    let rig = Rig::new(timing(0, 30));
+    let mut inbox = register(&rig);
+    for tag in 1..=4 {
+        let _running = submit(&rig.farm, request(tag)).expect("queued");
+    }
+    rig.farm.tick().await;
+    assert_eq!(starts(&mut inbox), 4, "the node did not fill");
+    let queued = submit(&rig.farm, request(5)).expect("queued");
+    rig.farm.tick().await;
+    assert!(matches!(*queued.stage.borrow(), kbf_front::Stage::Queued));
+    let stream = follow(&rig, &queued).await;
+    let began = Instant::now();
+    let stop = begin(&rig, how, Duration::MAX);
+
+    pass_feeding(&rig, 29).await;
+    assert!(
+        !stream.is_finished(),
+        "{how:?}: a queued stream was ended early"
+    );
+    assert!(
+        !stop.is_finished(),
+        "{how:?}: the stop ended before the deadline"
+    );
+    tokio::time::timeout(Duration::from_secs(60), stop)
+        .await
+        .expect("the stop ends at the deadline")
+        .expect("task");
+    assert!(began.elapsed() >= Duration::from_secs(30), "{how:?}");
+    let ended = stream.await.expect("task").expect_err("ended");
+    assert_eq!(ended.code(), Code::Unavailable, "{how:?}: {ended:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_keeps_the_stream_of_a_queued_operation_a_worker_can_take() {
+    a_queued_operation_a_worker_can_take_keeps_its_stream(Begin::Signal).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_endpoints_drain_keeps_the_stream_of_a_queued_operation_a_worker_can_take() {
+    a_queued_operation_a_worker_can_take_keeps_its_stream(Begin::Endpoint).await;
+}
+
+/// Asserts that an operation that had a lease, lost it to a silent node and now waits
+/// behind a cordoned worker keeps its stream: it reads `WaitingKept`, not `Waiting`,
+/// and the stream lasts until the deadline, as that of any operation that has run.
+async fn a_requeued_operation_keeps_its_stream(how: Begin) {
+    let rig = Rig::new(timing(0, 30));
+    let mut inbox = register(&rig);
+    let ticket = submit(&rig.farm, request(1)).expect("queued");
+    rig.farm.tick().await;
+    assert_eq!(starts(&mut inbox), 1, "the operation did not start");
+    rig.farm
+        .place(&WorkerId::new("node-a"), crate::farm::NodeAction::Cordon)
+        .expect("cordoned");
+    // The node goes silent past the lease grace (60 s): the lease is given up and requeued.
+    pass(Duration::from_secs(70)).await;
+    rig.farm.tick().await;
+    assert!(
+        matches!(*ticket.stage.borrow(), kbf_front::Stage::WaitingKept(_)),
+        "{how:?}: {:?}",
+        *ticket.stage.borrow()
+    );
+    let stream = follow(&rig, &ticket).await;
+    let began = Instant::now();
+    let stop = begin(&rig, how, Duration::MAX);
+
+    pass_feeding(&rig, 29).await;
+    assert!(
+        !stream.is_finished(),
+        "{how:?}: an operation that ran was ended early"
+    );
+    assert!(!stop.is_finished(), "{how:?}");
+    tokio::time::timeout(Duration::from_secs(60), stop)
+        .await
+        .expect("the stop ends at the deadline")
+        .expect("task");
+    assert!(began.elapsed() >= Duration::from_secs(30), "{how:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_keeps_the_stream_of_an_operation_requeued_after_a_lost_lease() {
+    a_requeued_operation_keeps_its_stream(Begin::Signal).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_endpoints_drain_keeps_the_stream_of_an_operation_requeued_after_a_lost_lease() {
+    a_requeued_operation_keeps_its_stream(Begin::Endpoint).await;
+}
+
+/// Asserts the order of a lease's start: at the point the `Start` is about to leave, the
+/// operation's callers already read `Executing`, so a drain that ends the streams of
+/// operations that cannot start never ends one whose `Start` is in flight.
+#[tokio::test(start_paused = true)]
+async fn a_start_is_never_sent_before_its_callers_read_executing() {
+    let rig = Rig::new(timing(0, 30));
+    let _inbox = register(&rig);
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    crate::farm::BEFORE_START.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |stages| {
+            record.lock().expect("lock").push(stages);
+        }));
+    });
+    let _ticket = submit(&rig.farm, request(1)).expect("queued");
+    rig.farm.tick().await;
+    crate::farm::BEFORE_START.with(|hook| hook.borrow_mut().take());
+    assert_eq!(
+        *seen.lock().expect("lock"),
+        [[kbf_front::Stage::Executing]],
+        "the Start left before its callers read Executing"
+    );
+}
+
+/// Asserts that an operation no worker could ever run (none is connected) is ended at the
+/// end of the load balancer wait, with the stop, whichever way the drain began: it would
+/// only fail at the deadline.
+async fn an_operation_no_worker_could_run_ends_at_the_lb_wait(how: Begin) {
+    let rig = Rig::new(timing(10, 900));
+    let ticket = submit(&rig.farm, request(1)).expect("queued");
+    rig.farm.tick().await;
+    assert!(
+        matches!(*ticket.stage.borrow(), kbf_front::Stage::Waiting(_)),
+        "{how:?}: {:?}",
+        *ticket.stage.borrow()
+    );
+    let stream = follow(&rig, &ticket).await;
+    let began = Instant::now();
+    let stop = begin(&rig, how, Duration::MAX);
+
+    pass_feeding(&rig, 9).await;
+    assert!(!stream.is_finished(), "{how:?}: ended in the wait");
+    pass_feeding(&rig, 2).await;
+    let ended = stream.await.expect("task").expect_err("ended");
+    assert_eq!(ended.code(), Code::Unavailable, "{how:?}: {ended:?}");
+    tokio::time::timeout(Duration::from_secs(60), stop)
+        .await
+        .expect("the stop ends")
+        .expect("task");
+    assert!(began.elapsed() < Duration::from_secs(15), "{how:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_ends_the_stream_of_an_operation_no_worker_could_run_at_the_lb_wait() {
+    an_operation_no_worker_could_run_ends_at_the_lb_wait(Begin::Signal).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_endpoints_drain_ends_the_stream_of_an_operation_no_worker_could_run_at_the_lb_wait() {
+    an_operation_no_worker_could_run_ends_at_the_lb_wait(Begin::Endpoint).await;
+}
+
+/// The cases where an operator's cordon is part of what holds the operation. The
+/// operation can never start on this frontend once the drain is under way, whether the
+/// capable workers are all operator-cordoned (the sole worker, or both of two) or only
+/// some are (the others being held by the drain): the operator's cordon is a reason the
+/// operation would also have waited for after the drain, so its stream ends at the end of
+/// the load balancer wait and does not delay the stop. Only an operation whose every
+/// capable worker is held by the drain alone stays queued for the other frontends.
+async fn operator_cordoned_workers_end_the_stream_at_the_lb_wait(how: Begin, two_nodes: bool) {
+    let rig = Rig::new(timing(10, 900));
+    let mut inbox = register(&rig);
+    rig.farm
+        .place(&WorkerId::new("node-a"), crate::farm::NodeAction::Cordon)
+        .expect("cordoned");
+    if two_nodes {
+        let caps = kbf_caps::NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
+            .expect("caps")
+            .with_drivers(["container"]);
+        let (outbound, _inbox_b) = mpsc::unbounded_channel();
+        rig.farm.register(
+            &WorkerId::new("node-b"),
+            DaemonInstance::new("daemon-b"),
+            DaemonInstance::new(""),
+            Reported::serving(Resources::new(4_000, 8 << 30), caps),
+            outbound,
+            Default::default(),
+        );
+        for tag in 1..=4 {
+            let _running = submit(&rig.farm, request(tag)).expect("queued");
+        }
+        rig.farm.tick().await;
+    }
+    let ticket = submit(&rig.farm, request(9)).expect("queued");
+    rig.farm.tick().await;
+    assert_eq!(starts(&mut inbox), 0, "a cordoned node was given work");
+    let stream = follow(&rig, &ticket).await;
+    let stop = begin(&rig, how, Duration::MAX);
+
+    pass_feeding(&rig, 9).await;
+    assert!(!stream.is_finished(), "{how:?}: ended in the wait");
+    pass_feeding(&rig, 2).await;
+    assert!(
+        stream.is_finished(),
+        "{how:?}: two_nodes {two_nodes}: still open"
+    );
+    let ended = stream.await.expect("task").expect_err("ended");
+    assert_eq!(ended.code(), Code::Unavailable, "{how:?}: {ended:?}");
+    if !two_nodes {
+        tokio::time::timeout(Duration::from_secs(60), stop)
+            .await
+            .expect("the stop ends")
+            .expect("task");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_operator_cordoned_only_worker_ends_the_stream_at_the_lb_wait() {
+    operator_cordoned_workers_end_the_stream_at_the_lb_wait(Begin::Signal, false).await;
+    operator_cordoned_workers_end_the_stream_at_the_lb_wait(Begin::Endpoint, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_operator_cordoned_worker_beside_a_drain_held_one_ends_the_stream_at_the_lb_wait() {
+    operator_cordoned_workers_end_the_stream_at_the_lb_wait(Begin::Signal, true).await;
+    operator_cordoned_workers_end_the_stream_at_the_lb_wait(Begin::Endpoint, true).await;
+}
+
+/// A second frontend over the rig's state store with a node of its own, `node-x`, whose
+/// session row the first frontend finds at its intake poll. Returned with the node's
+/// stream, which is kept open.
+fn other_frontend(rig: &Rig) -> (Farm, Inbox) {
+    let farm = Farm::new(
+        Backend::from(Arc::new(Cache::memory())),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    )
+    .with_state(Some(StateStore {
+        store: Arc::clone(&rig.shared) as Arc<dyn Store>,
+        epoch: EpochPolicy::Keep,
+        members: Default::default(),
+        history: None,
+    }))
+    .expect("a second farm over the store");
+    let caps = kbf_caps::NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
+        .expect("caps")
+        .with_drivers(["container"]);
+    let (outbound, inbox) = mpsc::unbounded_channel();
+    farm.register(
+        &WorkerId::new("node-x"),
+        DaemonInstance::new("daemon-x"),
+        DaemonInstance::new(""),
+        Reported::serving(Resources::new(4_000, 8 << 30), caps),
+        outbound,
+        Default::default(),
+    );
+    (farm, inbox)
+}
+
+/// Asserts what the ruling says for an operation no worker of this frontend could run: with
+/// another frontend that has a worker that could, its stream is kept through the load
+/// balancer wait (that frontend takes the operation), until the deadline ends it with the
+/// stop; with no other frontend it ends at the end of the wait.
+async fn a_waiting_stream_follows_whether_another_frontend_could_take_it(how: Begin, other: bool) {
+    let rig = Rig::new(timing(10, 30));
+    let _other = other.then(|| other_frontend(&rig));
+    let ticket = submit(&rig.farm, request(1)).expect("queued");
+    rig.farm.tick().await;
+    rig.farm.intake();
+    let kept = matches!(*ticket.stage.borrow(), kbf_front::Stage::WaitingKept(_));
+    assert_eq!(kept, other, "{how:?}: {:?}", *ticket.stage.borrow());
+    let stream = follow(&rig, &ticket).await;
+    let stop = begin(&rig, how, Duration::MAX);
+
+    pass_feeding(&rig, 20).await;
+    assert_eq!(
+        stream.is_finished(),
+        !other,
+        "{how:?}: another frontend {other}"
+    );
+    if other {
+        tokio::time::timeout(Duration::from_secs(60), stop)
+            .await
+            .expect("the stop ends at the deadline")
+            .expect("task");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_keeps_a_waiting_stream_when_another_frontend_could_take_it() {
+    a_waiting_stream_follows_whether_another_frontend_could_take_it(Begin::Signal, true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_endpoints_drain_keeps_a_waiting_stream_when_another_frontend_could_take_it() {
+    a_waiting_stream_follows_whether_another_frontend_could_take_it(Begin::Endpoint, true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_ends_a_waiting_stream_when_no_other_frontend_could_take_it() {
+    a_waiting_stream_follows_whether_another_frontend_could_take_it(Begin::Signal, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_endpoints_drain_ends_a_waiting_stream_when_no_other_frontend_could_take_it() {
+    a_waiting_stream_follows_whether_another_frontend_could_take_it(Begin::Endpoint, false).await;
+}
+
+/// Asserts that an operation that waited for a worker and went back to `Queued` when a
+/// worker that could run it appeared (the node is full) keeps its stream through the drain:
+/// its stage reads `Queued`, not `Waiting`, once the reason is cleared.
+async fn an_operation_that_stopped_waiting_keeps_its_stream(how: Begin) {
+    let rig = Rig::new(timing(10, 30));
+    let tickets: Vec<_> = (1..=5)
+        .map(|tag| submit(&rig.farm, request(tag)).expect("queued"))
+        .collect();
+    rig.farm.tick().await;
+    let last = &tickets[4];
+    assert!(
+        matches!(*last.stage.borrow(), kbf_front::Stage::Waiting(_)),
+        "{how:?}: {:?}",
+        *last.stage.borrow()
+    );
+    let mut inbox = register(&rig);
+    rig.farm.tick().await;
+    assert_eq!(starts(&mut inbox), 4, "{how:?}: the node did not fill");
+    assert!(
+        matches!(*last.stage.borrow(), kbf_front::Stage::Queued),
+        "{how:?}: {:?}",
+        *last.stage.borrow()
+    );
+    let stream = follow(&rig, last).await;
+    let stop = begin(&rig, how, Duration::MAX);
+
+    pass_feeding(&rig, 20).await;
+    assert!(!stream.is_finished(), "{how:?}: ended");
+    tokio::time::timeout(Duration::from_secs(60), stop)
+        .await
+        .expect("the stop ends at the deadline")
+        .expect("task");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_keeps_the_stream_of_an_operation_that_stopped_waiting() {
+    an_operation_that_stopped_waiting_keeps_its_stream(Begin::Signal).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_endpoints_drain_keeps_the_stream_of_an_operation_that_stopped_waiting() {
+    an_operation_that_stopped_waiting_keeps_its_stream(Begin::Endpoint).await;
+}
+
+/// Asserts that another frontend's node that cannot run the operation (too small for its
+/// request, or of another platform) does not keep its stream: the operation still reads
+/// `Waiting`, and the stream ends at the end of the load balancer wait.
+async fn another_frontends_node_that_cannot_run_it_does_not_keep_the_stream(
+    how: Begin,
+    request: Request,
+) {
+    let rig = Rig::new(timing(10, 900));
+    let _other = other_frontend(&rig);
+    let ticket = submit(&rig.farm, request).expect("queued");
+    rig.farm.tick().await;
+    rig.farm.intake();
+    assert!(
+        matches!(*ticket.stage.borrow(), kbf_front::Stage::Waiting(_)),
+        "{how:?}: {:?}",
+        *ticket.stage.borrow()
+    );
+    let stream = follow(&rig, &ticket).await;
+    let stop = begin(&rig, how, Duration::MAX);
+
+    pass_feeding(&rig, 9).await;
+    assert!(!stream.is_finished(), "{how:?}: ended in the wait");
+    pass_feeding(&rig, 2).await;
+    let ended = stream.await.expect("task").expect_err("ended");
+    assert_eq!(ended.code(), Code::Unavailable, "{how:?}: {ended:?}");
+    tokio::time::timeout(Duration::from_secs(60), stop)
+        .await
+        .expect("the stop ends with the wait")
+        .expect("task");
+}
+
+#[tokio::test(start_paused = true)]
+async fn another_frontends_node_too_small_for_the_operation_does_not_keep_its_stream() {
+    for how in [Begin::Signal, Begin::Endpoint] {
+        let big = Request {
+            resources: Resources::new(64_000, 1 << 30),
+            ..request(1)
+        };
+        another_frontends_node_that_cannot_run_it_does_not_keep_the_stream(how, big).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn another_frontends_node_of_another_platform_does_not_keep_the_stream() {
+    for how in [Begin::Signal, Begin::Endpoint] {
+        let mac = Request {
+            needs: kbf_caps::Request::from_platform([("OSFamily", "macos")]).expect("platform"),
+            ..request(1)
+        };
+        another_frontends_node_that_cannot_run_it_does_not_keep_the_stream(how, mac).await;
+    }
 }

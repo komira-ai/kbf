@@ -4,7 +4,7 @@
 
 use kbf_types::Refusal;
 
-use super::blocks_tests::{Racing, durable_over, request};
+use super::blocks_tests::{Racing, durable_over, farm_over, request};
 use super::owner::pair_row;
 use super::owner_tests::{grant, overwrite, remove, value_of};
 use super::transition_tests::{ending, rows, subject};
@@ -151,4 +151,21 @@ fn ending_an_operation_deletes_a_stale_index_row() {
         .expect("refused");
 
     assert_eq!(rows(&store, "lease-by-op/"), 0);
+}
+
+/// Catches a restart that forgets an operation had a lease: a farm that recovers operation 4
+/// under a lease (taken up when its node says `Hello` here) counts it as started, so if it
+/// is queued again its streams read `WaitingKept` (a drain keeps them), not `Waiting`.
+#[test]
+fn a_recovered_operation_with_a_lease_counts_as_started() {
+    let store = Racing::new();
+    let durable = durable_over(&store);
+    running(&durable);
+    drop(durable);
+
+    let farm = farm_over(&store);
+    // The leased operation is taken up when its node says `Hello` here.
+    let _inbox = super::intake_tests::register(&farm, "node-a");
+    let started = farm.lock().ever_started.clone();
+    assert_eq!(started, [OperationId(4)].into());
 }

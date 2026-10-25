@@ -5,6 +5,7 @@
 //! `--drain-lb-wait` and `--drain-deadline` are set in seconds, as an operator sets them.
 
 use kbf_proto::google::longrunning::Operation;
+use kbf_proto::reapi::execution_stage::Value as ExecStage;
 use kbf_server::api::FRONTEND_DRAIN;
 use tonic::{Code, Status, Streaming};
 
@@ -116,6 +117,20 @@ async fn stream_end(ops: &mut Streaming<Operation>) -> Status {
     ended.expect("the stream ends in time")
 }
 
+/// Reads `ops` until its operation is executing: a lease for it has started on a node.
+async fn until_executing(ops: &mut Streaming<Operation>) {
+    let reading = async {
+        loop {
+            let op = ops.message().await.expect("healthy").expect("an update");
+            if support::stage(&op) == ExecStage::Executing as i32 {
+                return;
+            }
+        }
+    };
+    let read = tokio::time::timeout(Duration::from_secs(30), reading).await;
+    read.expect("the operation starts executing in time");
+}
+
 /// Asserts that a new Execute of `job` on `client` is not taken once the wait is over. The
 /// frontend refuses it UNAVAILABLE and sends the REAPI listener GOAWAY in the same step, so
 /// on the connection `client` already holds it surfaces as UNAVAILABLE from the service or
@@ -135,7 +150,8 @@ async fn assert_refused_after_the_wait(client: &Client, job: &Job) {
 /// `draining`, a new Execute is refused UNAVAILABLE, and the frontend takes no more work in
 /// from the store (an operation queued on the other frontend then stays off its queue),
 /// while the operation it holds is run by a daemon of the other frontend and its caller
-/// gets the result. Then the frontend, with nothing open, exits 0.
+/// gets the result: the stream of that queued operation, which a worker could take, is kept.
+/// Then the frontend, with nothing open, exits 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_wait_serves_everything_and_its_end_hands_the_work_to_the_other_frontend() {
     let flags = ["--drain-lb-wait=5", "--drain-deadline=60"];
@@ -143,16 +159,23 @@ async fn the_wait_serves_everything_and_its_end_hands_the_work_to_the_other_fron
     let (a, b) = (&pair.a, &pair.b);
     let on_a = Client::connect(a.reapi, a.worker).await;
     let on_b = Client::connect(b.reapi, b.worker).await;
-    let (first, second, third) = (
+    let (first, second, third, hold) = (
         Job::new("taken in the wait", &[]),
         Job::new("refused after the wait", &[]),
         Job::new("queued on the other frontend", &[]),
+        Job::new("keeps the drained frontend open", &[]),
     );
-    for job in [&first, &second, &third] {
+    for job in [&first, &second, &third, &hold] {
         on_a.upload(&job.blobs()).await;
     }
     let result = support::output(&on_b, "built while the frontend drains", 0).await;
     assert!(in_phase(a.api, "serving").await);
+    // The one node of this frontend has room for one lease: `hold` takes it and keeps the
+    // frontend from exiting at once, and `first` queues behind it.
+    let mut node_a = on_a.daemon("node-a", 1, 4).await;
+    let mut held = on_a.execute(&hold.action).await;
+    let held_start = node_a.start().await;
+    until_executing(&mut held).await;
 
     let begun = begin_drain(a.api).await;
     assert_eq!(begun["phase"], "lb_wait", "{begun}");
@@ -167,6 +190,21 @@ async fn the_wait_serves_everything_and_its_end_hands_the_work_to_the_other_fron
     })
     .await;
     assert_refused_after_the_wait(&on_a, &second).await;
+    // `first` waits behind the running `hold` on the busy node, so a worker could take it:
+    // its stream is kept, though this frontend places nothing now (the other frontend
+    // takes the operation).
+    let quiet = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match ops.message().await {
+                Ok(Some(_)) => {}
+                ended => return ended.map(|_| ()),
+            }
+        }
+    });
+    assert!(
+        quiet.await.is_err(),
+        "the stream of a queued operation ended"
+    );
 
     let mut late = on_b.execute(&third.action).await;
     until("both operations are queued on the other", async || {
@@ -183,16 +221,20 @@ async fn the_wait_serves_everything_and_its_end_hands_the_work_to_the_other_fron
         let ack = daemon.report(ran(start.lease_id, &result)).await;
         assert!(ack.accepted, "{ack:?}");
     }
+    let last = done(&mut late).await;
+    assert_eq!(response(&last).result, Some(result.clone()));
+    // The caller of `first` gets the result the other frontend records.
     let last = done(&mut ops).await;
     assert_eq!(response(&last).result, Some(result.clone()));
-    let last = done(&mut late).await;
-    assert_eq!(response(&last).result, Some(result));
+    let ack = node_a.report(ran(held_start.lease_id, &result)).await;
+    assert!(ack.accepted, "{ack:?}");
+    done(&mut held).await;
 
     until("the drained frontend exits", async || {
         pair.a.served.is_finished()
     })
     .await;
-    drop((ops, late, daemon, on_a, on_b));
+    drop((ops, held, late, daemon, node_a, on_a, on_b));
     pair.stop().await;
 }
 
@@ -301,8 +343,10 @@ async fn a_stop_signal_runs_the_same_sequence() {
     for job in [&first, &second, &third] {
         client.upload(&job.blobs()).await;
     }
+    // A node of the frontend runs both operations, so their streams have a lease to wait for.
+    let daemon = client.daemon("node-a", 4, 8).await;
     let mut before = client.execute(&first.action).await;
-    before.message().await.expect("healthy").expect("QUEUED");
+    until_executing(&mut before).await;
 
     pair.a.signal();
     let a = &pair.a;
@@ -317,11 +361,7 @@ async fn a_stop_signal_runs_the_same_sequence() {
         "a unary call in the wait"
     );
     let mut in_the_wait = client.execute(&second.action).await;
-    in_the_wait
-        .message()
-        .await
-        .expect("healthy")
-        .expect("QUEUED");
+    until_executing(&mut in_the_wait).await;
 
     until("the wait is over", async || {
         in_phase(a.api, "draining").await
@@ -332,7 +372,7 @@ async fn a_stop_signal_runs_the_same_sequence() {
 
     drop((before, in_the_wait));
     until("the frontend exits", async || pair.a.served.is_finished()).await;
-    drop(client);
+    drop((daemon, client));
     pair.stop().await;
 }
 
@@ -348,8 +388,9 @@ async fn every_listener_is_sent_goaway_when_the_wait_ends() {
     let client = Client::connect(a.reapi, a.worker).await;
     let job = Job::new("holds the drain open", &[]);
     client.upload(&job.blobs()).await;
+    let _daemon = client.daemon("node-a", 4, 8).await;
     let mut ops = client.execute(&job.action).await;
-    ops.message().await.expect("healthy").expect("QUEUED");
+    until_executing(&mut ops).await;
     let mut open = [h2(a.reapi).await, h2(a.worker).await, h2(a.api).await];
 
     begin_drain(a.api).await;

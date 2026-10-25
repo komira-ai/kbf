@@ -43,12 +43,53 @@ the TLS flags the frontend keeps the farm's storage map and routes every call by
 the pack index at start: two tables of the Postgres state store (`pack` and `blob`) that
 say which pack holds each blob and where. The worker listener then answers a daemon's
 `kbf.worker.v1.PackIndex/Locate` from the index (daemon certificates only; without the flag
-the service is not registered and the call is UNIMPLEMENTED). Nothing else reads or writes
-them yet. It needs a `postgres://` state store whose schema
+the service is not registered and the call is UNIMPLEMENTED). Unless the frontend is also
+given the pack store flags below, nothing else reads or writes them. It needs a
+`postgres://` state store whose schema
 has the tables, which `kbf-installer setup` and the update step create, and a `sqlite://`
 state store is refused with a line that says so (exit 2). With the flag off no pack table is
 touched. The tables are an additive schema step: a kbf of the previous release keeps running
 on the migrated schema.
+
+**Packs** (off by default; the `[packs]` table of `kbf.toml`). With
+`--pack-store-endpoint` (an `http://host:port` S3-compatible object store),
+`--pack-store-bucket` and `--pack-store-credentials-file` (JSON
+`{"access_key_id": "...", "secret_access_key": "..."}`, mode 0600 or 0400; the secret is never
+a flag), and `--pack-index`, the frontend keeps the blobs clients upload in packs: many blobs
+in one object, written to the store with a create-only request and recorded in the pack
+index before the upload is acknowledged (a failed write answers UNAVAILABLE; packs finished
+before the failure stay recorded, and the client sends the rest again). FindMissingBlobs asks the index and then, for the digests it lacks, the storage
+nodes. A read, the client's and Execute's own, looks in the index first and fetches only the
+blob's bytes from its pack with a ranged request, hashes them, and serves them (a pack that
+holds other bytes than the digest names is never served); a blob the index lacks is read
+from the storage nodes as before. A blob over 64 MiB and a compressed blob are not packed.
+`--pack-bytes` (default 32 MiB) is the length at which a pack is closed, `--pack-writer`
+(default `frontend`) names the frontend in its pack keys, `--pack-store-region` (default
+`us-east-1`) is the signing region, and `--pack-cache-dir` with `--pack-cache-bytes` keeps
+the blobs read from packs on a local disk. At start the frontend checks that the store
+refuses to replace an object, and does not serve if it does not. `GET /metrics` gains the
+`kbf_pack_*` families. Left out, no object store is built or contacted and the frontend
+serves exactly as before. A daemon reads a blob that is only in a pack with `--pack-read`
+(below).
+
+The uploads into packs share a bound on the bytes they hold in flight,
+`--pack-inflight-bytes` (default 1 GiB, at least 64 MiB, the largest blob that is packed, so
+that no upload is refused for its size; at most 4294967295): an upload takes its blob's size as
+soon as its resource name has arrived, before it reads on, and gives it back when it ends, and
+one that finds the bound spent waits its turn, so a burst of uploads is slowed down and none is
+failed for it (`kbf_pack_upload_waits_total` counts the waits, `kbf_pack_inflight_bytes` and
+`kbf_pack_inflight_peak_bytes` the bytes taken). The bound counts blob bytes, not the memory of
+the process. A `BatchUpdateBlobs` is decoded before its handler runs, so the bytes it holds
+while it waits are not counted, and it has no idle timeout; reads are not counted either (a
+read holds one blob, at most 64 MiB, or one batch). `--pack-upload-idle-timeout` (default 30
+seconds, at most a day) ends a ByteStream upload that gets no byte of its body for that long
+with `DEADLINE_EXCEEDED`: it stores and records nothing, gives its bytes back, and is logged
+and counted (`kbf_pack_upload_idle_timeouts_total`). The time before the resource name has
+arrived is not counted, so a client that never sends it is not cut by this timeout. An upload
+that keeps sending, however slowly, is never cut and keeps its bytes until it ends, so
+`--pack-inflight-bytes` is the only bound on that. A client that claims a blob and sends
+nothing holds only its reservation, never a buffer of the claimed size. Both flags are
+accepted and ignored without `--pack-store-endpoint`.
 
 A daemon reads from the packs with `--pack-read` (off by default; the `[packs]` table of
 `kbf.toml`), which needs `--pack-store-endpoint`, `--pack-store-bucket` and
@@ -361,7 +402,10 @@ a stop that cuts a stream fails its action. On the first signal, or on
 503 while everything is still served; after `--drain-lb-wait` it refuses each new Execute with
 `UNAVAILABLE` (which Buck2 retries), takes no more work from the state store, and sends
 GOAWAY on the REAPI, worker and operator API listeners; it keeps every open Execute and
-WaitExecution stream until its action is done, at most `--drain-deadline`; then it ends the
+WaitExecution stream until its action is done, at most `--drain-deadline`, except a stream
+whose operation was never started, that no worker on this frontend can run and that no
+other frontend can take, which ends `UNAVAILABLE` at the end of the load balancer wait (the
+action would fail at the deadline anyway); then it ends the
 worker streams and the streams left `UNAVAILABLE` and exits 0. `GET /v1/frontend/drain`
 reports the phase. A second signal skips the waits, and `--shutdown-timeout-secs` running
 out does the same. A frontend with no state store (a test setup) drains at once: `/readyz`

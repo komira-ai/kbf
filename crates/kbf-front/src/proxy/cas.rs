@@ -22,6 +22,7 @@ use kbf_proto::reapi::{
 use tonic::{Request, Response, Status, Streaming};
 
 use super::owners::Owners;
+use super::packed::{self, Packs};
 use crate::{MAX_BATCH_TOTAL_BYTES, wire};
 
 /// Blobs of one batch in flight at once.
@@ -41,6 +42,33 @@ macro_rules! cas_call {
 pub(super) struct ProxyCas {
     pub owners: Owners,
     pub authorizers: Arc<Authorizers>,
+    /// Where the blobs are looked for first and uploads are written, when there are packs.
+    pub packs: Option<Packs>,
+}
+
+/// The blob a batch item carries, once it is checked: its digest parses, its data is not
+/// compressed and hashes to the digest.
+///
+/// # Errors
+/// INVALID_ARGUMENT naming the check the item fails.
+pub(super) fn checked(
+    digest: Option<&reapi::Digest>,
+    compressor: i32,
+    data: Bytes,
+) -> Result<(kbf_types::Digest, Bytes), Status> {
+    let digest = wire::digest(digest)?;
+    if compressor != reapi::compressor::Value::Identity as i32 {
+        return Err(Status::invalid_argument(format!(
+            "blob {digest}: compressor {compressor} is not supported",
+        )));
+    }
+    let actual = kbf_segments::sha256(&data);
+    if actual != digest {
+        return Err(Status::invalid_argument(format!(
+            "blob {digest}: the data is {actual}"
+        )));
+    }
+    Ok((digest, data))
 }
 
 type Boxed<T> = BoxStream<'static, Result<T, Status>>;
@@ -64,18 +92,7 @@ impl ProxyCas {
         compressor: i32,
         data: Bytes,
     ) -> Result<(), Status> {
-        let digest = wire::digest(digest)?;
-        if compressor != reapi::compressor::Value::Identity as i32 {
-            return Err(Status::invalid_argument(format!(
-                "blob {digest}: compressor {compressor} is not supported",
-            )));
-        }
-        let actual = kbf_segments::sha256(&data);
-        if actual != digest {
-            return Err(Status::invalid_argument(format!(
-                "blob {digest}: the data is {actual}"
-            )));
-        }
+        let (digest, data) = checked(digest, compressor, data)?;
         self.owners.put(&digest, data).await
     }
 
@@ -102,7 +119,10 @@ impl ContentAddressableStorage for ProxyCas {
             .await?;
         wire::check_digest_function(request.digest_function)?;
         let asked = wire::digests(&request.blob_digests)?;
-        let missing = self.owners.find_missing(&asked).await?;
+        let missing = match &self.packs {
+            Some(packs) => packed::find_missing(packs, &self.owners, &asked).await?,
+            None => self.owners.find_missing(&asked).await?,
+        };
         Ok(Response::new(FindMissingBlobsResponse {
             missing_blob_digests: asked
                 .iter()
@@ -145,6 +165,10 @@ impl ContentAddressableStorage for ProxyCas {
                 )
             })
             .collect();
+        if let Some(packs) = &self.packs {
+            let responses = packed::store_batch(packs, items).await;
+            return Ok(Response::new(BatchUpdateBlobsResponse { responses }));
+        }
         let responses = stream::iter(items)
             .map(|(digest, compressor, data)| async move {
                 let stored = self.store_one(digest.as_ref(), compressor, data).await;
@@ -182,10 +206,20 @@ impl ContentAddressableStorage for ProxyCas {
                 "batch asks for {total} bytes; at most {MAX_BATCH_TOTAL_BYTES} are allowed"
             )));
         }
+        // With packs the batch is read from them together; what they do not serve is asked of
+        // the nodes below, item by item.
+        let served = match &self.packs {
+            Some(packs) => packed::read_many(packs, &request.digests).await,
+            None => packed::Served::new(),
+        };
+        let served = &served;
         let responses = stream::iter(request.digests)
             .map(|asked| async move {
                 let read = match wire::digest(Some(&asked)) {
-                    Ok(digest) => self.owners.read_blob(&digest).await,
+                    Ok(digest) => match &self.packs {
+                        Some(_) => packed::read_blob(served, &self.owners, &digest).await,
+                        None => self.owners.read_blob(&digest).await,
+                    },
                     Err(e) => Err(e),
                 };
                 // The copy the response carries is counted (`kbf_bytes_in_flight`) until

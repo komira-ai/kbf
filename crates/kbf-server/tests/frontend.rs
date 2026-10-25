@@ -1510,7 +1510,7 @@ async fn a_listen_address_that_is_taken_is_a_refused_start_naming_it() {
 /// Catches a `kbf frontend` that lacks what `kbf-server` has for its drain: the operator
 /// endpoint (`GET`/`POST /v1/frontend/drain`, one shared `Drain`), its counts of open
 /// streams and queued operations, and `Drain::close` (the second stop signal's action).
-/// An Execute waits for a worker: the status reads one stream and one queued operation;
+/// An Execute runs on a node: the status reads one stream and no queued operation;
 /// a `POST` with the token drains (`/readyz` 503); a close ends the stream UNAVAILABLE
 /// and the serving future. Catches: the frontend's API router given a
 /// drain that is not the one its serving future drains.
@@ -1526,11 +1526,15 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     let token_flag = format!("--api-token-file={}", path.display());
     let (_stop, stopped) = oneshot::channel::<()>();
-    let handle = start_frontend(&flags(&[&url, &token_flag]).expect("flags"), || {
-        Ok(async move {
-            let _ = stopped.await;
-        })
-    })
+    let heartbeat = "--heartbeat-interval-ms=100";
+    let handle = start_frontend(
+        &flags(&[&url, &token_flag, heartbeat]).expect("flags"),
+        || {
+            Ok(async move {
+                let _ = stopped.await;
+            })
+        },
+    )
     .expect("starts");
     let (reapi, worker, api) = (handle.reapi, handle.worker, handle.api.expect("an API"));
     let drain = handle.drain();
@@ -1540,6 +1544,15 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
     client.upload(&job.blobs()).await;
     let mut ops = client.execute(&job.action).await;
     ops.message().await.expect("healthy").expect("QUEUED");
+    // A node takes the lease, so the stream has a running action: the drain keeps it.
+    let mut daemon = client.daemon("node-a", 4, 8).await;
+    daemon.start().await;
+    loop {
+        let op = ops.message().await.expect("healthy").expect("EXECUTING");
+        if support::stage(&op) == kbf_proto::reapi::execution_stage::Value::Executing as i32 {
+            break;
+        }
+    }
 
     let call = |token: Option<&'static str>, post: bool| async move {
         tokio::task::spawn_blocking(move || {
@@ -1560,7 +1573,7 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
         "draining": false,
         "phase": "serving",
         "open_executions": 1,
-        "queued_operations": 1
+        "queued_operations": 0
     });
     assert_eq!(
         serde_json::from_str::<Value>(&status.body).expect("JSON"),
@@ -1578,7 +1591,8 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
         .expect("the stream ends after a close")
         .expect_err("with an error");
     assert_eq!(ended.code(), tonic::Code::Unavailable, "{ended:?}");
-    drop(ops);
+    assert!(ended.message().contains("shutting down"), "{ended:?}");
+    drop((ops, daemon));
     drop(client);
     tokio::time::timeout(Duration::from_secs(30), served)
         .await

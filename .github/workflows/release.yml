@@ -47,12 +47,15 @@
 #          is named `publish`; the release lint pins the job list.
 # bump     opens the pull request in the internal repository that moves its submodule to the
 #          released commit, with a token of the release bot scoped to that repository.
-# deploy   sets the published release as the desired version on the farm's update coordinator
-#          and waits for the farm to converge (cargo xtask deploy-farm); it passes with a notice
-#          when the repository variable KBF_COORDINATOR_URL is unset. The one job that holds
-#          `id-token: write`, and no write scope. When the coordinator is reachable only on a
-#          Tailscale network, it joins that network first as an ephemeral node, with the same
-#          run token (TS_CLIENT_ID and KBF_COORDINATOR_URL set; skipped otherwise).
+# gamma    the gamma stage. Sets the published release as the desired version on the farm's
+#          update coordinator and waits for the farm to converge (cargo xtask deploy-farm); it
+#          passes with a notice when the repository variable KBF_COORDINATOR_URL is unset. Then
+#          it proves the farm with a Buck2 build of a small project, remote only, every action
+#          new in this run (cargo xtask prove-farm); it passes with a notice when FARM_ADDRESS
+#          is unset. The one job that holds `id-token: write`, and no write scope. When the
+#          coordinator is reachable only on a Tailscale network, it joins that network first
+#          as an ephemeral node, with the same run token (TS_CLIENT_ID and KBF_COORDINATOR_URL
+#          set; skipped otherwise).
 #
 # A run releases one commit; a run of an old commit tags and publishes nothing (the highest
 # release tag must name this commit or an ancestor of it: `release tag` and `release publish`
@@ -406,8 +409,8 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
         run: cargo xtask release bump-internal --repo "$GITHUB_REPOSITORY" --version "$VERSION" --sha "$COMMIT" --internal-repo komira-ai/komira-internal --submodule kbf
 
-  # The last step of a release: tell the farm's update coordinator "desired = this release" and
-  # wait until the farm converges (docs/deploy/kbf-updater.md, "Turn on the deploy step"). It
+  # The gamma stage, the last step of a release: tell the farm's update coordinator "desired =
+  # this release" and wait until the farm converges (docs/deploy/kbf-updater.md, "Turn on the gamma stage"). It
   # runs only after the release is published, holds no write scope and no secret, and holds the
   # run's OIDC token (`id-token: write`) for the one thing it is for: the coordinator accepts a
   # token of this workflow on main, for the `release` environment, and nothing else. The
@@ -416,7 +419,7 @@ jobs:
   # unaffected. The wait is bounded (the verb's `--deadline-min`, 60 by default, under this
   # job's timeout), and a farm that is blocked, stalled or out of time fails the job; the
   # release stays published whatever this job says.
-  deploy:
+  gamma:
     needs: [plan, publish]
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
     runs-on: ubuntu-24.04
@@ -425,6 +428,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      BUCK2_VERSION: 2026-10-01
+      BUCK2_SHA256: 828aba01bf80e8ba50ed27d89be86efe0246b3807c3d040e1ea7b4810a55fb78
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -459,3 +465,19 @@ jobs:
           MIN_UP_STORAGE: ${{ vars.KBF_MIN_UP_STORAGE || '1' }}
           MIN_UP_FRONTEND: ${{ vars.KBF_MIN_UP_FRONTEND || '1' }}
         run: cargo xtask deploy-farm --url "$COORDINATOR_URL" --ca-pem "$COORDINATOR_CA" --version "$VERSION" --min-up-storage "$MIN_UP_STORAGE" --min-up-frontend "$MIN_UP_FRONTEND"
+      # The proof. The farm now runs this release; build a small project (four `/bin/sh -c`
+      # actions that depend on each other) against it with remote execution on and local off, and
+      # read Buck2's own count of the actions it ran: some remote, none local. The run id and
+      # attempt are an argument of every action, so none is answered from a cache. The farm's
+      # address, instance, TLS and platform properties are the organisation variables FARM_*;
+      # with FARM_ADDRESS unset the verb prints a notice and passes, as deploy-farm does.
+      - name: Fetch buck2 (pinned version, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --out "$RUNNER_TEMP/tools/buck2" --extract zst
+      - name: Prove the farm with a remote-only Buck2 build
+        env:
+          FARM_ADDRESS: ${{ vars.FARM_ADDRESS }}
+          FARM_INSTANCE: ${{ vars.FARM_INSTANCE }}
+          FARM_TLS: ${{ vars.FARM_TLS }}
+          FARM_PROPERTIES: ${{ vars.FARM_LINUX_X86_64_PROPERTIES }}
+          NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: cargo xtask prove-farm --address "$FARM_ADDRESS" --instance "$FARM_INSTANCE" --tls "$FARM_TLS" --properties "$FARM_PROPERTIES" --buck2 "$RUNNER_TEMP/tools/buck2" --project crates/kbf-integration-test/gamma/buck2 --nonce "$NONCE"
