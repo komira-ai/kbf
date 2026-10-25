@@ -1,9 +1,11 @@
 //! AWS Signature Version 4 for S3, header form, checked on the server's side.
 //!
-//! A request is accepted when it carries the `Authorization` header of the configured access
-//! key, signed over `host`, `x-amz-content-sha256` and `x-amz-date` at least, made within 15
-//! minutes of the server's clock, with the signature that the configured secret gives. Query
-//! strings (presigned URLs) and signed streams are not accepted.
+//! A request is accepted when it carries the `Authorization` header of one of the configured
+//! access keys (the key is picked by the id in the credential), signed over `host`,
+//! `x-amz-content-sha256` and `x-amz-date` at least, made within 15 minutes of the server's
+//! clock, with the signature that the secret of that key gives. The role of the key comes with
+//! the answer, for the caller to hold the call to it. Query strings (presigned URLs) and signed
+//! streams are not accepted.
 
 use hmac::{Hmac, KeyInit, Mac};
 use hyper::StatusCode;
@@ -12,6 +14,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_perc
 use sha2::{Digest, Sha256};
 
 use super::ServerConfig;
+use super::keys::Role;
 use super::reply::S3Error;
 use super::request::{header, query_pairs};
 use super::time::amz_date;
@@ -67,6 +70,19 @@ pub(crate) const MISMATCH: Refusal = Refusal {
     code: "SignatureDoesNotMatch",
     message: "The request signature does not match the one calculated from the request.",
 };
+
+pub(crate) const READ_ONLY: Refusal = Refusal {
+    code: "AccessDenied",
+    message: "Access Denied: this access key may read objects and list the bucket only.",
+};
+
+/// A request whose signature is good: the hash of its body that the signature covers, and the
+/// role of the key that signed it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Signed {
+    pub(crate) payload: String,
+    pub(crate) role: Role,
+}
 
 impl From<Refusal> for S3Error {
     fn from(refusal: Refusal) -> Self {
@@ -186,17 +202,18 @@ fn string_to_sign(stamp: &str, auth: &Authorization<'_>, request: &str) -> Strin
 /// Checks the signature of a request.
 ///
 /// Gives the value of its `x-amz-content-sha256` header, the hash of the body that the
-/// signature covers, which the caller checks the body against.
+/// signature covers, which the caller checks the body against, and the role of the key it is
+/// signed with. The key is the one whose id the credential names, in the server's region.
 ///
 /// # Errors
 /// The [`Refusal`] that says what is wrong with the request.
-pub(crate) fn verify(config: &ServerConfig, parts: &Parts) -> Result<String, Refusal> {
+pub(crate) fn verify(config: &ServerConfig, parts: &Parts) -> Result<Signed, Refusal> {
     let text = header(&parts.headers, "authorization").ok_or(UNSIGNED)?;
     let auth = Authorization::parse(text).ok_or(MALFORMED)?;
-    let ours = (config.access_key_id.as_str(), config.region.as_str());
-    if (auth.key_id, auth.region) != ours {
-        return Err(UNKNOWN_KEY);
-    }
+    let known = config.key(auth.key_id);
+    let (secret, role) = known
+        .filter(|_| auth.region == config.region)
+        .ok_or(UNKNOWN_KEY)?;
     if !REQUIRED.iter().all(|name| auth.signed.contains(name)) {
         return Err(WEAK);
     }
@@ -213,20 +230,38 @@ pub(crate) fn verify(config: &ServerConfig, parts: &Parts) -> Result<String, Ref
     let payload = header(&parts.headers, "x-amz-content-sha256");
     let payload = payload.ok_or(MALFORMED)?;
     let request = canonical_request(parts, &auth, payload).ok_or(MALFORMED)?;
-    let key = signing_key(&config.secret_access_key, auth.date, auth.region);
+    let key = signing_key(secret, auth.date, auth.region);
     let mut mac = keyed(&key);
     mac.update(string_to_sign(stamp, &auth, &request).as_bytes());
     let signature = hex::decode(auth.signature).ok();
     if signature.is_none_or(|tag| mac.verify_slice(&tag).is_err()) {
         return Err(MISMATCH);
     }
-    Ok(payload.to_owned())
+    Ok(Signed {
+        payload: payload.to_owned(),
+        role,
+    })
 }
 
-/// A request, signed as a client would sign it, for the tests of the server.
+/// A request, signed as a client would sign it with the full key, for the tests of the server.
 #[cfg(test)]
 pub(crate) fn sign(
     config: &ServerConfig,
+    method: &str,
+    uri: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+) -> hyper::Request<http_body_util::Full<bytes::Bytes>> {
+    let (id, secret) = (&config.access_key_id, &config.secret_access_key);
+    sign_as(config, (id, secret), method, uri, extra, body)
+}
+
+/// A request, signed as a client would sign it with the key `(id, secret)`, for the tests of
+/// the server.
+#[cfg(test)]
+pub(crate) fn sign_as(
+    config: &ServerConfig,
+    key: (&str, &str),
     method: &str,
     uri: &str,
     extra: &[(&str, &str)],
@@ -236,6 +271,7 @@ pub(crate) fn sign(
     use http_body_util::Full;
     use hyper::Request;
 
+    let (id, secret) = key;
     let stamp = amz_date(config.clock.now());
     let payload = hex::encode(Sha256::digest(body));
     let mut builder = Request::builder()
@@ -255,14 +291,14 @@ pub(crate) fn sign(
         .collect();
     names.sort();
     let auth = Authorization {
-        key_id: &config.access_key_id,
+        key_id: id,
         date: &stamp[..8],
         region: &config.region,
         signed: names.iter().map(String::as_str).collect(),
         signature: "",
     };
     let request = canonical_request(&parts, &auth, &payload).expect("a canonical request");
-    let key = signing_key(&config.secret_access_key, auth.date, auth.region);
+    let key = signing_key(secret, auth.date, auth.region);
     let to_sign = string_to_sign(&stamp, &auth, &request);
     let signature = hex::encode(hmac(&key, to_sign.as_bytes()));
     let (key_id, date, region) = (auth.key_id, auth.date, auth.region);

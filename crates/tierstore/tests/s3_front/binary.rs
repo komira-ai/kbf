@@ -16,6 +16,7 @@ use kbf_testkit::reaped::{Reaped, first_line, spawn};
 use reqwest::Client;
 use rustix::process::{Pid, Signal, kill_process};
 
+use crate::client::assert_refused;
 use crate::files::{BIN_KEY_ID, BIN_SECRET, Files, with};
 
 const BIN: &str = env!("CARGO_BIN_EXE_tierstore");
@@ -59,12 +60,18 @@ fn start(flags: &[String]) -> Running {
 }
 
 impl Running {
+    /// The client of kbf with the key of the key file.
     fn store(&self) -> S3Store {
+        self.store_as(BIN_KEY_ID, BIN_SECRET)
+    }
+
+    /// The client of kbf with this key.
+    fn store_as(&self, key_id: &str, secret: &str) -> S3Store {
         let config = S3Config {
             endpoint: format!("http://{}", self.addr),
             region: "us-east-1".to_owned(),
             bucket: "tier-bucket".to_owned(),
-            credentials: Credentials::new(BIN_KEY_ID, BIN_SECRET),
+            credentials: Credentials::new(key_id, secret),
             capabilities: Capabilities {
                 conditional_put: true,
                 object_lock: false,
@@ -198,6 +205,72 @@ fn a_start_that_cannot_go_on_says_why() {
     let (code, _, err) = run(&good);
     assert_eq!(code, 1);
     assert!(err.contains("others can read it"), "{err}");
+}
+
+/// Asserts that the binary serves a read-only key given as a JSON file beside the full key of a
+/// file of two lines: the read-only key reads a ranged get of what the full key put, and is
+/// refused a put and a delete with 403 `AccessDenied`.
+#[tokio::test]
+async fn it_serves_a_read_only_key_from_a_json_file_beside_the_full_key() {
+    let files = Files::new("bin-read-only");
+    let json = r#"{"access_key_id": "AKIDREADER", "secret_access_key": "reader-secret"}"#;
+    let reader_file = files.secret("reader.json", json);
+    let reader_flag = reader_file.display().to_string();
+    let flags = files.flags(&[
+        "--read-only-key-file",
+        reader_flag.as_str(),
+        "--drain-lb-wait",
+        "50ms",
+    ]);
+    let mut running = start(&flags);
+    let full = running.store();
+    let reader = running.store_as("AKIDREADER", "reader-secret");
+    let k = ObjectKey::new("cas/ro").unwrap();
+    let body = Bytes::from_static(b"read by the daemons");
+    full.put_new(&k, body, None).await.unwrap();
+    let first = ByteRange::new(0, 4).unwrap();
+    assert_eq!(reader.get_range(&k, first).await.unwrap(), "read");
+    let other = ObjectKey::new("cas/other").unwrap();
+    let put = reader.put_new(&other, Bytes::from_static(b"x"), None).await;
+    assert_refused(put, 403, "AccessDenied");
+    let delete = reader.delete(&k).await;
+    assert_refused(delete, 403, "AccessDenied");
+    assert_eq!(full.get_range(&k, first).await.unwrap(), "read");
+    running.signal(Signal::TERM);
+    assert_eq!(running.exit_code().await, Some(0));
+}
+
+/// Asserts that two keys with one id, the full key's and a read-only key's, are refused at start
+/// with status 2, as flags that cannot be mended by a restart are, with a message that names the
+/// id and the flags and not the secret; that a read-only key file that is not a key (a JSON
+/// object with a field besides the two) or that others can read exits 1 and names the flag, and
+/// not the secret.
+#[test]
+fn a_read_only_key_file_that_cannot_be_used_is_a_start_that_says_why() {
+    let files = Files::new("bin-read-only-refused");
+    let same = files.secret("same", &format!("{BIN_KEY_ID}\nanother-secret\n"));
+    let flag = |path: &std::path::Path| {
+        let shown = path.display().to_string();
+        files.flags(&["--read-only-key-file", shown.as_str()])
+    };
+    let (code, out, err) = run(&flag(same.as_path()));
+    assert_eq!((code, out.as_str()), (2, ""));
+    assert!(err.starts_with("tierstore: "), "{err}");
+    assert!(err.contains(BIN_KEY_ID), "{err}");
+    assert!(err.contains("--read-only-key-file"), "{err}");
+    assert!(!err.contains("another-secret"), "{err}");
+    let extra = r#"{"access_key_id": "A", "secret_access_key": "topsecret", "note": 1}"#;
+    let typo = files.secret("typo", extra);
+    let (code, _, err) = run(&flag(typo.as_path()));
+    assert_eq!(code, 1);
+    assert!(err.contains("--read-only-key-file"), "{err}");
+    assert!(!err.contains("topsecret"), "{err}");
+    let open = files.secret("open", "READER\nreader-secret\n");
+    std::fs::set_permissions(&open, Permissions::from_mode(0o644)).unwrap();
+    let (code, _, err) = run(&flag(open.as_path()));
+    assert_eq!(code, 1);
+    assert!(err.contains("others can read it"), "{err}");
+    assert!(!err.contains("reader-secret"), "{err}");
 }
 
 /// Asserts that the binary serves over two S3 tiers, each a bucket of a store of its own that it

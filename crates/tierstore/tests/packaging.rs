@@ -56,7 +56,8 @@ fn parse(unit: &str) -> Cli {
 
 /// Asserts that the command line of the unit runs the binary of the release as `tierstore`, that
 /// it parses with the flags the binary has, and that it describes two different S3 tiers, each
-/// with an endpoint, and three key files of absolute paths that are not the same file.
+/// with an endpoint, and four key files of absolute paths that are not the same file: the full
+/// key, one read-only key (the daemons') and the key of each tier.
 #[test]
 fn the_command_line_is_the_binarys_flags_for_two_s3_tiers() {
     let unit = read("tierstore.service");
@@ -73,16 +74,24 @@ fn the_command_line_is_the_binarys_flags_for_two_s3_tiers() {
     let hot_key = hot_key.expect("--hot-credentials-file");
     let cold_key = cli.cold_credentials_file.as_deref();
     let cold_key = cold_key.expect("--cold-credentials-file");
-    let files = [cli.access_key_file.as_path(), hot_key, cold_key];
+    let readers = &cli.read_only_key_file;
+    assert_eq!(readers.len(), 1, "{readers:?}");
+    let read_only_key = readers[0].as_path();
+    let files = [
+        cli.access_key_file.as_path(),
+        read_only_key,
+        hot_key,
+        cold_key,
+    ];
     for file in files {
         assert!(file.is_absolute(), "{file:?}");
     }
     let distinct: BTreeSet<&Path> = files.into_iter().collect();
-    assert_eq!(distinct.len(), 3);
+    assert_eq!(distinct.len(), 4);
 }
 
 /// Asserts that no secret is on the command line or in the environment of the unit: the flags
-/// whose names speak of a key, a secret, a credential, a token or a password are the three that
+/// whose names speak of a key, a secret, a credential, a token or a password are the four that
 /// name a file (`-file`), and the unit sets no environment variable and reads no environment
 /// file.
 #[test]
@@ -96,7 +105,7 @@ fn no_secret_is_on_the_command_line_or_in_the_environment() {
         .iter()
         .filter(|flag| SECRET_WORDS.iter().any(|name| flag.contains(*name)))
         .collect();
-    assert_eq!(secret_flags.len(), 3, "{secret_flags:?}");
+    assert_eq!(secret_flags.len(), 4, "{secret_flags:?}");
     for flag in secret_flags {
         assert!(flag.ends_with("-file"), "{flag} is not a file");
     }

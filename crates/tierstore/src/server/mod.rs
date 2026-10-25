@@ -38,10 +38,21 @@
 //! when the client goes away before the answer, so that no object is left without the journal
 //! entry that has it copied.
 //!
-//! Requests are signed with SigV4 in the `Authorization` header (see `auth`): the one access key
-//! of [`ServerConfig`], over `host`, `x-amz-content-sha256` and `x-amz-date` at least, and a
-//! request without a good signature, a presigned URL included, is answered 403 before its body
-//! is read.
+//! Requests are signed with SigV4 in the `Authorization` header (see `auth`): by one of the
+//! access keys of [`ServerConfig`], over `host`, `x-amz-content-sha256` and `x-amz-date` at
+//! least, and a request without a good signature, a presigned URL included, is answered 403
+//! before its body is read. A request names its key by the key id of its credential, and an id
+//! that is no key's is `InvalidAccessKeyId`.
+//!
+//! # Access keys
+//!
+//! The server has one full key, which may do everything above, and any number of read-only
+//! keys ([`ServerConfig::read_only_keys`], `--read-only-key-file` in the binary), which may do
+//! GetObject, HeadObject, ListObjectsV2 and HeadBucket and nothing else. Any other call signed
+//! by a read-only key (a put, a delete, CreateBucket, and every call of a multipart upload) is
+//! answered 403 `AccessDenied` with the S3 error document before its body is read, and changes
+//! nothing. The roles are of the key and not of a prefix: a key that may write under one prefix
+//! only is not built yet.
 //!
 //! # Checksums
 //!
@@ -97,6 +108,7 @@
 mod auth;
 pub mod cli;
 mod idle;
+mod keys;
 mod ops;
 mod reply;
 mod request;
@@ -115,6 +127,8 @@ mod ops_tests;
 mod reply_tests;
 #[cfg(test)]
 mod request_tests;
+#[cfg(test)]
+mod role_tests;
 #[cfg(test)]
 mod server_tests;
 #[cfg(test)]
@@ -143,6 +157,8 @@ use tokio::sync::{Notify, watch};
 
 use crate::{Backend, Clock};
 
+pub use keys::AccessKey;
+
 use idle::Watched;
 use reply::{Answer, S3Error, answer};
 use request::{BoxError, Check, Query, Reader, Target, resolve};
@@ -154,10 +170,14 @@ pub struct ServerConfig {
     pub bucket: String,
     /// The region in the credential scope of a signature.
     pub region: String,
-    /// The access key id requests are signed with.
+    /// The id of the full key, which may do everything the server serves.
     pub access_key_id: String,
-    /// The secret access key requests are signed with.
+    /// The secret of the full key.
     pub secret_access_key: String,
+    /// The read-only keys, which may read objects and list the bucket and do nothing else (see
+    /// the module docs). None by default. Their ids differ from each other's and from the full
+    /// key's: if one is the full key's, the full key is the one that is meant.
+    pub read_only_keys: Vec<AccessKey>,
     /// The most bytes of a request body: the largest object that one put takes, and the
     /// largest part of an upload.
     pub max_request_bytes: usize,
@@ -180,7 +200,7 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// The settings for `bucket` and an access key, in region `us-east-1`, with bodies of at
+    /// The settings for `bucket` and a full access key, in region `us-east-1`, with bodies of at
     /// most 256 MiB, 30 seconds of idle time for a body or an answer, a minute for a request
     /// head (and for an idle connection to send its next request), a drain that waits 10
     /// seconds with `/readyz` at 503 and then at most 15 minutes for the requests in flight.
@@ -196,6 +216,7 @@ impl ServerConfig {
             region: "us-east-1".to_owned(),
             access_key_id: access_key_id.to_owned(),
             secret_access_key: secret_access_key.to_owned(),
+            read_only_keys: Vec::new(),
             max_request_bytes: 256 << 20,
             body_idle_timeout: Duration::from_secs(30),
             header_timeout: Duration::from_secs(60),
@@ -467,11 +488,12 @@ impl Server {
         if self.phase() == REFUSING {
             return Err(S3Error::draining());
         }
-        let claim = auth::verify(&self.config, parts)?;
+        let signed = auth::verify(&self.config, parts)?;
+        signed.role.permit(&parts.method)?;
         let target = resolve(&self.config.bucket, parts.uri.path())?;
         let query = Query::parse(parts.uri.query())?;
         let data = matches!((&parts.method, &target), (&Method::PUT, Target::Object(_)));
-        let check = Check::new(&claim, &parts.headers, data)?;
+        let check = Check::new(&signed.payload, &parts.headers, data)?;
         let limit = self.config.max_request_bytes;
         let reader = Reader::new(body, limit, self.config.body_idle_timeout);
         self.dispatch(parts, target, &query, reader, check).await

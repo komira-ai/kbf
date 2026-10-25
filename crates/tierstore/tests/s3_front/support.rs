@@ -109,6 +109,30 @@ impl Harness {
         self.signed_at(FIXED_STAMP, method, path, query, headers, body)
     }
 
+    /// The headers that sign a request for the server at the fixed time with the key
+    /// `(id, secret)`, whichever key that is.
+    pub fn signed_as(
+        &self,
+        key: (&str, &str),
+        method: &str,
+        path: &str,
+        query: &[(&str, &str)],
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Vec<(String, String)> {
+        let host = self.addr.to_string();
+        let request = Request {
+            method,
+            host: &host,
+            path,
+            query,
+            headers,
+            body,
+            stamp: FIXED_STAMP,
+        };
+        sign(&request, key.0, key.1)
+    }
+
     /// The headers that sign a request made at the time `stamp` names.
     pub fn signed_at(
         &self,
