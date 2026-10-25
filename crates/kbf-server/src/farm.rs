@@ -274,6 +274,10 @@ struct State {
     /// cleared while the scheduler holds the operation: a drain ends the streams of an
     /// operation that waits for a worker only if it is not in here.
     ever_started: BTreeSet<OperationId>,
+    /// The nodes the drain cordoned itself when it closed this farm's intake
+    /// ([`State::hold_placements`]), as opposed to an operator's cordon: an operation
+    /// that waits only for these is queued, not stuck, since the other frontends take it.
+    drain_held: BTreeSet<WorkerId>,
     next_stream: u64,
     /// The newest stream of each node the machine has registered.
     links: BTreeMap<WorkerId, Link>,
@@ -432,6 +436,7 @@ impl Farm {
                 finished_retention,
                 stages: BTreeMap::new(),
                 ever_started: BTreeSet::new(),
+                drain_held: BTreeSet::new(),
                 next_stream: 0,
                 links: BTreeMap::new(),
                 paused: BTreeSet::new(),
@@ -1596,8 +1601,20 @@ impl State {
         let stage = match &waiting.reason {
             Some(why) => {
                 tracing::warn!(%operation, reason = %why, "no live worker can run the operation");
+                let cordoned = self.sched.cordoned_could(operation);
+                // Stuck here for good (`Waiting`) unless it has run, or the only thing
+                // between it and a worker is this drain's own cordon: with the intake
+                // closed it is queued for the other frontends, like any queued work.
+                // Held by an operator's cordon (alone, or beside the drain's) or by no
+                // worker at all, it can never start here.
+                let only_drain = !cordoned.is_empty()
+                    && cordoned
+                        .iter()
+                        .all(|worker| self.drain_held.contains(worker));
                 if self.ever_started.contains(&operation) {
                     Stage::WaitingAfterStart(why.clone())
+                } else if only_drain {
+                    Stage::Queued
                 } else {
                     Stage::Waiting(why.clone())
                 }

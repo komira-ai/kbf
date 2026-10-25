@@ -6,9 +6,9 @@
 //! stream that breaks, so ending one fails its action: kbf#791). The one early end is the
 //! stream of an operation that was never started and that no worker can run
 //! (`kbf_front::Stage::Waiting`): it would fail at the deadline anyway, so it ends at once
-//! and the stop is not held; the operation stays queued. It takes the server out of `/readyz` and
-//! the health service, and sends GOAWAY to the REAPI listener's connections, which then
-//! stop accepting. The serving future returns once the REAPI connections have closed.
+//! and the stop is not held; the operation stays queued. The drain takes the server out of
+//! `/readyz` and the health service, and sends GOAWAY to the REAPI listener's connections,
+//! which then stop accepting. The serving future returns once the REAPI connections have closed.
 //!
 //! The effects are stages, each idempotent, so an update can take them apart:
 //!

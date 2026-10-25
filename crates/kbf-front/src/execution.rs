@@ -1269,8 +1269,9 @@ async fn unstartable_while_draining(mut closing: Closing, mut stage: watch::Rece
 /// abandoned), or `closing` closing first (the server is going away), ends the stream
 /// UNAVAILABLE; so does a drain while the operation can never start
 /// ([`unstartable_while_draining`]). A change already there is sent before a close is
-/// noticed. At every tick of `progress` the operation is sent again at its current stage. `open` (the call's
-/// metrics guard) is dropped with the stream, and told of each stage read.
+/// noticed. At every tick of `progress` the operation is sent again at its current stage.
+/// `open` (the call's metrics guard) is dropped with the stream, and told of each stage
+/// read.
 fn operations(
     ticket: Ticket,
     closing: Closing,

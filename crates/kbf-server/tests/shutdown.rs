@@ -190,7 +190,8 @@ async fn sigterm_ends_open_execute_streams_unavailable() {
 
 /// Catches a stop that holds for an operation that has never started and that no worker
 /// can run: with no deadline (the default) and no worker connected, SIGTERM ends the
-/// stream UNAVAILABLE at once (naming why) and the server exits 0 with no second signal. The client's connection stays open throughout.
+/// stream UNAVAILABLE at once (naming why) and the server exits 0 with no second signal.
+/// The client's connection stays open throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sigterm_ends_a_queued_stream_at_once_and_the_server_exits() {
     let (mut server, reapi, worker) = Running::start(&[]);
@@ -490,8 +491,8 @@ async fn not_ready(addr: SocketAddr) {
 /// is): systemd, an operator or the rollout that waited out its drain sends another to
 /// end the drain, and with no shutdown timeout (the default) nothing else would.
 /// The first SIGTERM drains and the stream is kept (the status names it: one stream
-/// open, none queued: the operation runs on a node); the second ends the stream UNAVAILABLE and the server
-/// exits 0. The defect it catches is `serve_escalating` not spawning the escalation.
+/// open, none queued: the operation runs on a node); the second ends the stream
+/// UNAVAILABLE and the server exits 0. The defect it catches is `serve_escalating` not spawning the escalation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_sigterm_ends_the_drain() {
     let (mut server, line) = Running::start_line(&[

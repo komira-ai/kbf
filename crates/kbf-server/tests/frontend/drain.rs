@@ -150,9 +150,8 @@ async fn assert_refused_after_the_wait(client: &Client, job: &Job) {
 /// `draining`, a new Execute is refused UNAVAILABLE, and the frontend takes no more work in
 /// from the store (an operation queued on the other frontend then stays off its queue),
 /// while the operation it holds is run by a daemon of the other frontend and its caller
-/// gets the result. Then the frontend, with nothing open, exits 0. The stream of the
-/// operation it holds queued ends UNAVAILABLE when the wait is over, and the call reopened
-/// on the other frontend gets the same result.
+/// gets the result: the stream of that queued operation, which a worker could take, is kept.
+/// Then the frontend, with nothing open, exits 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_wait_serves_everything_and_its_end_hands_the_work_to_the_other_frontend() {
     let flags = ["--drain-lb-wait=5", "--drain-deadline=60"];
@@ -191,11 +190,21 @@ async fn the_wait_serves_everything_and_its_end_hands_the_work_to_the_other_fron
     })
     .await;
     assert_refused_after_the_wait(&on_a, &second).await;
-    // The operation it holds is cordoned off every worker and never started, so its stream ends; the
-    // operation is still queued, for the other frontend to take.
-    let ended = stream_end(&mut ops).await;
-    assert_eq!(ended.code(), Code::Unavailable, "{ended}");
-    assert!(ended.message().contains("never started"), "{ended}");
+    // `first` waits behind the running `hold` on the busy node, so a worker could take it:
+    // its stream is kept, though this frontend places nothing now (the other frontend
+    // takes the operation).
+    let quiet = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match ops.message().await {
+                Ok(Some(_)) => {}
+                ended => return ended.map(|_| ()),
+            }
+        }
+    });
+    assert!(
+        quiet.await.is_err(),
+        "the stream of a queued operation ended"
+    );
 
     let mut late = on_b.execute(&third.action).await;
     until("both operations are queued on the other", async || {
@@ -214,20 +223,18 @@ async fn the_wait_serves_everything_and_its_end_hands_the_work_to_the_other_fron
     }
     let last = done(&mut late).await;
     assert_eq!(response(&last).result, Some(result.clone()));
+    // The caller of `first` gets the result the other frontend records.
+    let last = done(&mut ops).await;
+    assert_eq!(response(&last).result, Some(result.clone()));
     let ack = node_a.report(ran(held_start.lease_id, &result)).await;
     assert!(ack.accepted, "{ack:?}");
     done(&mut held).await;
-    // Buck2 reopens the call that ended: the other frontend answers it, from the result
-    // of the operation it ran.
-    let mut again = on_b.execute(&first.action).await;
-    let last = done(&mut again).await;
-    assert_eq!(response(&last).result, Some(result));
 
     until("the drained frontend exits", async || {
         pair.a.served.is_finished()
     })
     .await;
-    drop((ops, held, late, again, daemon, node_a, on_a, on_b));
+    drop((ops, held, late, daemon, node_a, on_a, on_b));
     pair.stop().await;
 }
 

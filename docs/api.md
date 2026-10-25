@@ -651,15 +651,18 @@ over a state store (`kbf frontend` requires one):
    retries only the opening of an Execute call, not a stream that breaks after it, so an
    ended stream fails that Buck2 action: the frontend ends none before the deadline except
    one whose operation can never start. That is an operation that has never been started
-   and that no live worker can run (`WAITING`: every worker that could run it is cordoned,
-   or there is none; the stream says so in its metadata): its stream ends `UNAVAILABLE` at
-   once, when step 3 begins, naming why. The action would fail at the deadline anyway, so
-   this costs nothing and frees the stop. An operation that is only queued (a worker can
-   take it) and any operation that ever had a lease, even one queued again after a lost
-   lease, keeps its stream until it is done or the deadline. Ending a stream does not
-   cancel the operation: it stays queued for the other frontends. An execution running on a node of this frontend
-   finishes here: the node's result is taken and the caller is answered. An execution
-   another frontend took is answered from the result it records in the state store.
+   and that no live worker can run (`WAITING`: there is no worker that could run it, or at
+   least one that could is cordoned by an operator, or not serving; the stream says so in
+   its metadata): its stream ends `UNAVAILABLE` at once, when step 3 begins, naming why. The
+   action would fail at the deadline anyway, so this costs nothing and frees the stop. An
+   operation that is only queued (a worker can take it), and one that waits only for the
+   nodes this drain cordoned in step 3 (the other frontends take it), keep their streams,
+   as does any operation that ever had a lease, even one queued again after a lost lease:
+   they stay until the operation is done or the deadline. Ending a stream does not cancel
+   the operation: it stays queued for the other frontends. An execution running on a node
+   of this frontend finishes here: the node's result is taken and the caller is answered.
+   An execution another frontend took is answered from the result it records in the state
+   store.
 5. **Close and exit.** The frontend stands down as a retire does (below): the farm is
    fenced, and the worker streams that are left end `UNAVAILABLE`, so each daemon dials
    another frontend through the load balancer, which keeps its leases (the state store's

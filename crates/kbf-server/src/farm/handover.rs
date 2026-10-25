@@ -238,6 +238,7 @@ impl State {
         let open = |worker: &&WorkerId| self.sched.cordon(worker).is_none();
         let nodes: Vec<WorkerId> = self.machine.nodes().filter(open).cloned().collect();
         for worker in nodes {
+            self.drain_held.insert(worker.clone());
             let none = self.sched.apply(Input::new(now, Event::Cordon { worker }));
             debug_assert!(none.is_empty(), "a cordon has no effect: {none:?}");
         }
