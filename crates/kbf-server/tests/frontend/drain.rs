@@ -191,11 +191,11 @@ async fn the_wait_serves_everything_and_its_end_hands_the_work_to_the_other_fron
     })
     .await;
     assert_refused_after_the_wait(&on_a, &second).await;
-    // The operation it holds has no running lease, so its stream ends at once; the
+    // The operation it holds is cordoned off every worker and never started, so its stream ends; the
     // operation is still queued, for the other frontend to take.
     let ended = stream_end(&mut ops).await;
     assert_eq!(ended.code(), Code::Unavailable, "{ended}");
-    assert!(ended.message().contains("no running lease"), "{ended}");
+    assert!(ended.message().contains("never started"), "{ended}");
 
     let mut late = on_b.execute(&third.action).await;
     until("both operations are queued on the other", async || {
