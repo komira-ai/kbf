@@ -82,6 +82,11 @@ image tag as a job ([containers.md](containers.md#the-frontend)).
   copy of `kbf.toml`. The copies are the same except `state-store`, which is the socket URL
   above. The file must not be writable by group or other, or the start is refused
   (`crates/kbf-cli/src/config.rs:346-368`).
+- **its own history objects directory**, if `--history-objects` is a `file://` directory. The
+  file store takes an exclusive lock on `LOCK` in that directory when it opens
+  (`crates/kbf-objstore/src/fs_store.rs:294-304`), so a second frontend pointed at the same
+  directory fails to start. Give each frontend its own directory, or an object store that
+  several processes may share.
 - **65532-owned copies of the certificates, keys and the operator token** that `kbf.toml`
   names. The operator token (`api-token-file`) is also what the update drain presents. A token
   file must be owned by the server's user and be mode 0600 or 0400
