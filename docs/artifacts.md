@@ -84,7 +84,7 @@ The packages are the two Linux jobs' debs (one each) and container images (two e
 
 | Asset | Built by | Holds |
 |---|---|---|
-| `kbf-<commit>-linux-x86_64.deb` | the `linux-x86_64` job (`ubuntu-24.04`, nfpm for amd64) | the `kbf` of the tarball of the same name at `/usr/bin/kbf`, the unit of every mode, `kbf.slice`, the users and directories they run with, and the trust directory (the pinned `gh` for amd64, the Sigstore trusted root, `installer.conf`); it replaces and breaks the old `kbf-installer` |
+| `kbf-<commit>-linux-x86_64.deb` | the `linux-x86_64` job (`ubuntu-24.04`, nfpm for amd64) | the `kbf` of the tarball of the same name at `/usr/bin/kbf`, the unit of every mode, `kbf.slice`, the users and directories they run with, and the trust directory (the pinned `gh` for amd64, the Sigstore trusted root, `installer.conf`); it replaces the old `kbf-installer` |
 | `kbf-<commit>-linux-arm64.deb` | the `linux-arm64` job (`ubuntu-24.04-arm`, nfpm for arm64) | the same for arm64 |
 | `kbf-frontend-image-<commit>-linux-x86_64.oci.tar` | the `linux-x86_64` job (`ubuntu-24.04`, BuildKit) | an OCI image of the `kbf` of the tarball of the same name, which runs `kbf --mode=frontend` as a user that is not root |
 | `kbf-frontend-image-<commit>-linux-arm64.oci.tar` | the `linux-arm64` job | the same for arm64 |
@@ -403,9 +403,14 @@ The package has no maintainer script, so the package manager replaces the file a
 nothing: the operator restarts the mode unit that runs it (a stop drains).
 Each mode unit runs `kbf boot-check` before it starts `kbf`: the check is the `kbf` file itself
 (it brings the state database to the schema that `kbf` needs, for the modes that keep state in
-it). The package depends on `crun`, `uidmap`, `systemd` and `ca-certificates` (the dependencies the
-`kbf-installer` package had) and suggests `postgresql`, for a frontend or all-in-one host that
-keeps its state on the host; on no package of this project. It is built, like every other, from
+it). The package depends on no package: a host updates it with a plain `dpkg --install`
+(`kbf-host-install` does, and so does `--migrate-to-package`), which resolves nothing, and a
+dependency the host lacks would leave `kbf` unpacked, unconfigured and then undone. It recommends
+`crun`, `uidmap`, `systemd` and `ca-certificates` (the dependencies the `kbf-installer` package
+had; `crun` and `uidmap` are the container driver's, whose preflight names `crun` when it is
+missing, and `systemd` and `ca-certificates` are on any host that runs these units, but a
+recommendation cannot fail an install where a dependency can) and suggests `postgresql`, for a
+frontend or all-in-one host that keeps its state on the host. It is built, like every other, from
 the files the job has just built and checked: `cargo xtask pkg-trust`, `pkg-config` and
 `pkg-build` (nfpm, pinned by SHA-256, builds the deb and the rpm twice and the bytes must match),
 and a fresh Ubuntu 24.04 container installs, runs, removes and purges the deb
@@ -418,9 +423,10 @@ has the `kbf-installer` and `kbf` debs of the release before, installed by apt a
   that `build-commit check-asset` checked for the commit, mode 0755;
 - it holds the files above, with their modes (0644 but the executable `kbf` and `gh`, 0755), and
   no other file;
-- its control file says the package `kbf`, the architecture of the platform, the dependencies and
-  the suggestion above, no `Depends` on `kbf-installer`, and `Replaces` and `Breaks` of
-  `kbf-installer (<< 0.1.1)`: every `kbf-installer` deb that was published is `0.1.0+<commit>`;
+- its control file says the package `kbf`, the architecture of the platform, the recommendations
+  and the suggestion above, no `Depends`, `Pre-Depends`, `Breaks` or `Conflicts` at all, and
+  `Replaces` of `kbf-installer (<< 0.1.1)`: every `kbf-installer` deb that was published is
+  `0.1.0+<commit>`;
 - `usr/share/kbf/trust/gh` is the pinned `gh` the job downloaded, executable, `trusted_root.jsonl`
   is JSON lines, and `installer.conf` is exactly `SOURCE_REFS=` and the branch the package is
   attested on.
@@ -465,39 +471,46 @@ inside it is a snapshot, which a later Sigstore key rotation outdates (no code r
 The files of the retired `kbf-installer` package that are still used are the `kbf` package's now:
 `kbf.slice`, the needrestart drop-in, and the sysusers, tmpfiles and trust files (the last three at
 new names, `kbf.conf` and `/usr/share/kbf/trust/`). The deb of `kbf` says `Replaces: kbf-installer
-(<< 0.1.1)` so that dpkg unpacks it over the files the old package owns, and `Breaks: kbf-installer
-(<< 0.1.1)` so that the package manager removes the old package when it installs this one:
+(<< 0.1.1)` so that dpkg unpacks it over the files the old package owns. It does not say `Breaks`
+or `Depends`: a native-package host is updated with a plain `dpkg --install` (no apt, no force
+flag), and `Breaks` of an installed `kbf-installer` makes that refuse, which is exactly the host
+that moves from the hand-placed layout with `--migrate-to-package`. So installing `kbf` leaves
+`kbf-installer` installed, with the rest of its files, until an operator purges it:
 
 ```text
-sudo apt install --allow-downgrades ./kbf-<commit>-linux-x86_64.deb
+sudo dpkg --install kbf-<commit>-linux-x86_64.deb      # or: sudo apt install ./kbf-<commit>-linux-x86_64.deb
+sudo dpkg --purge kbf-installer                        # when ready
 ```
 
-`--allow-downgrades` is there because a deb's version is `0.1.0+<commit>` and apt compares the
-commit as text, which says nothing about which build is newer. apt lists `kbf-installer` among the
-packages it removes and removes it. What happens to the host:
+(With apt, `--allow-downgrades` too: a deb's version is `0.1.0+<commit>` and apt compares the
+commit as text, which says nothing about which build is newer.) What happens to the host:
 
-- the users keep their ids, and the group `kbf-signer-clients` keeps its members: removing a
-  package deletes no account, and `/var/lib/kbf-installer` (the hand-placed layout of the
-  releases, which `kbf-host-install` and `kbf-deploy host` use) is not in any package;
-- the files above are `kbf`'s: dpkg says so for each (`dpkg -S`), and removing or purging
-  `kbf-installer` afterwards deletes none of them;
-- what only the old package carried is gone with it: `/usr/bin/kbf-installer`,
+- the users keep their ids, and the group `kbf-signer-clients` keeps its members: no package
+  deletes an account, and `/var/lib/kbf-installer` (the hand-placed layout of the releases, which
+  `kbf-host-install` and `kbf-deploy host` use) is not in any package;
+- the files above are `kbf`'s: dpkg says so for each (`dpkg -S`), and purging `kbf-installer`
+  afterwards deletes none of them;
+- what only the old package carried goes when it is purged: `/usr/bin/kbf-installer`,
   `kbf-installer.service`, `kbf-proxy.service` and `kbf-proxy.socket`, and its sysusers and
   tmpfiles files under the old name (the new files make the same users and directories). A
   host that still runs the proxy or the installer's service stops them first
   (`systemctl disable --now kbf-proxy.socket kbf-proxy.service kbf-installer.service`): the
-  package has no maintainer script that does;
+  package has no maintainer script that does. (No farm host does: they run the mode's unit only);
+- `kbf setup` enables the unit of the mode and no other: it no longer enables
+  `kbf-installer.service`, which no package carries, nor writes the `kbf-proxy.socket` drop-in;
 - a host that has not taken the new package yet is read at `/usr/share/kbf-installer/trust/`,
   until v0.0.9.
 
-`cargo xtask pkg-upgrade-test` runs this in a fresh container with systemd as PID 1 and the real
-apt and dpkg, on the two debs of the release before (`v0.0.7`, fetched and checked against their
-SHA-256), for both architectures: it installs the old `kbf-installer` and the old `kbf`, makes
-the users, installs the new `kbf` over them, and requires that the version is the new one, that
-every file of the package is at its path, `root:root` with its mode and bytes, and owned by `kbf` and
-not by `kbf-installer`, that `kbf-installer` and its binary and trust directory are gone, that
-`dpkg --purge kbf-installer` then deletes none of those files, and that the users have their
-ids.
+`cargo xtask pkg-upgrade-test` runs this in fresh containers with systemd as PID 1 and the real
+apt and dpkg, on the debs of the release before (`v0.0.7`, fetched and checked against their
+SHA-256), for both architectures, three ways: `apt-get install` over a host with the old
+`kbf-installer` and `kbf`; a plain `dpkg --install` over the same host; and a plain `dpkg
+--install` over a host that has only the old `kbf` deb, with neither `crun` nor `uidmap` (that deb
+had no dependencies). In each it requires that `kbf` is `install ok installed` at the new
+version, that `dpkg --audit` is clean, that every file of the package is at its path, `root:root`
+with its mode and bytes, and owned by `kbf` and not by `kbf-installer`, that `kbf-installer` is
+still installed, that `dpkg --purge kbf-installer` then deletes none of those files, and that the
+users have their ids.
 
 The rpm of `kbf` names no replacement (an rpm `Obsoletes` would remove the old package, and no rpm
 is published): it is built and installed in a container by CI, nothing more.

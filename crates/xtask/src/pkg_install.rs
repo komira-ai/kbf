@@ -7,8 +7,8 @@
 //! The container is built from `<image-dir>/Dockerfile` and run with `--privileged`.
 //! After the package manager installs the package:
 //!
-//! 1. its dependencies are exactly the ones this crate lists, and it has no maintainer
-//!    script (nothing can start or enable anything);
+//! 1. it has no dependency, its recommendations are exactly the ones this crate lists, and it
+//!    has no maintainer script (nothing can start or enable anything);
 //! 2. every entry of the listing is at its path, `root:root`, with its mode and bytes;
 //! 3. every packaged unit is `disabled` or `static` and none is active;
 //! 4. after `systemd-sysusers` and `systemd-tmpfiles --create` (what a boot, and
@@ -52,9 +52,10 @@ pub enum Format {
 }
 
 impl Format {
-    /// The dependencies the package must list, as the contract says them (and not as
+    /// The recommendations the package must list, as the contract says them (and not as
     /// `pkg_linux` does: a check that read `pkg_linux`'s lists would pass whatever they held).
-    fn depends(self) -> &'static [&'static str] {
+    /// It must list no dependency at all.
+    fn recommends(self) -> &'static [&'static str] {
         match self {
             Format::Deb => &["crun", "uidmap", "systemd", "ca-certificates"],
             Format::Rpm => &["crun", "shadow-utils", "systemd", "ca-certificates"],
@@ -74,6 +75,14 @@ impl Format {
         match self {
             Format::Deb => vec!["dpkg-query", "-W", "-f=${Depends}", name],
             Format::Rpm => vec!["rpm", "-qR", name],
+        }
+    }
+
+    /// The command that prints the recommendations of the package `name`.
+    fn recommends_command(self, name: &str) -> Vec<&str> {
+        match self {
+            Format::Deb => vec!["dpkg-query", "-W", "-f=${Recommends}", name],
+            Format::Rpm => vec!["rpm", "-q", "--recommends", name],
         }
     }
 
@@ -375,12 +384,18 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
         problems.push("the package is not installed after install".to_owned());
     }
     let depends = names(&c.say(&format.depends_command(t.name))?);
-    let mut want: Vec<String> = format.depends().iter().map(|d| (*d).to_owned()).collect();
+    eq(&mut problems, "dependencies", &depends.join(" "), "");
+    let recommends = names(&c.say(&format.recommends_command(t.name))?);
+    let mut want: Vec<String> = format
+        .recommends()
+        .iter()
+        .map(|d| (*d).to_owned())
+        .collect();
     want.sort();
     eq(
         &mut problems,
-        "dependencies",
-        &depends.join(" "),
+        "recommendations",
+        &recommends.join(" "),
         &want.join(" "),
     );
     let pattern = format!("{}.*", t.name);

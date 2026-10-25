@@ -13,6 +13,8 @@ enum Defect {
     NotInstalled,
     WrongDepends,
     PodmanDepends,
+    /// The package depends on `crun` (a plain `dpkg --install` would not configure it).
+    HasDepends,
     MaintainerScript,
     WrongOwner,
     WrongBytes,
@@ -142,6 +144,11 @@ impl World {
                 ok: self.installed,
                 ..ok("")
             },
+            ["dpkg-query", "-W", "-f=${Depends}", _] => ok(if self.is(Defect::HasDepends) {
+                "crun"
+            } else {
+                ""
+            }),
             ["dpkg-query", ..] => ok(if self.is(Defect::WrongDepends) {
                 "crun, systemd"
             } else if self.is(Defect::PodmanDepends) {
@@ -149,9 +156,14 @@ impl World {
             } else {
                 "crun, uidmap, systemd, ca-certificates"
             }),
-            ["rpm", "-qR", _] => ok(
-                "crun\nshadow-utils\nsystemd\nca-certificates\nrpmlib(CompressedFileNames) <= 3.0.4-1\n",
-            ),
+            ["rpm", "-qR", _] => ok(if self.is(Defect::HasDepends) {
+                "crun\nrpmlib(CompressedFileNames) <= 3.0.4-1\n"
+            } else {
+                "rpmlib(CompressedFileNames) <= 3.0.4-1\n"
+            }),
+            ["rpm", "-q", "--recommends", _] => {
+                ok("crun\nshadow-utils\nsystemd\nca-certificates\n")
+            }
             ["find", ..] => ok(if self.is(Defect::MaintainerScript) {
                 "kbf.list\nkbf.postinst\n"
             } else {
@@ -493,13 +505,23 @@ fn the_unit_account_check_reads_unit_files_and_skips_directories() {
 
 #[test]
 fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
-    let cases: [(Format, Defect, &str); 19] = [
+    let cases: [(Format, Defect, &str); 21] = [
         (
             Format::Deb,
             Defect::NotInstalled,
             "the package is not installed after install",
         ),
-        (Format::Deb, Defect::WrongDepends, "dependencies:"),
+        (Format::Deb, Defect::WrongDepends, "recommendations:"),
+        (
+            Format::Deb,
+            Defect::HasDepends,
+            "dependencies: \"crun\", not \"\"",
+        ),
+        (
+            Format::Rpm,
+            Defect::HasDepends,
+            "dependencies: \"crun\", not \"\"",
+        ),
         (Format::Deb, Defect::PodmanDepends, "podman"),
         (
             Format::Deb,

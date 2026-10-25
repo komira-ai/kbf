@@ -37,7 +37,6 @@ pub const ALL_IN_ONE_UNIT: &str = "kbf-all-in-one.service";
 const FRONTEND_USER: &str = "kbf-server";
 /// The unit of a frontend host.
 const FRONTEND_UNIT: &str = "kbf-frontend.service";
-pub const INSTALLER_UNIT: &str = "kbf-installer.service";
 /// The timer, and the drop-in of the service it started, that an earlier build's setup wrote
 /// (a daily `pg_dump`): setup removes them from a host that has them.
 const OLD_BACKUP_TIMER: &str = "kbf-backup.timer";
@@ -433,7 +432,6 @@ pub fn before_release(
         .map(|file| read_token(exec, file))
         .transpose()?;
     let settings = installer_settings(exec, v, platform)?;
-    let listen = settings.proxy_listen();
     let mut notes = Vec::new();
     if settings.has_proxy_table() {
         notes.push(
@@ -478,51 +476,10 @@ pub fn before_release(
         root,
         settings.render().into_bytes(),
     )?;
-    if platform == Platform::Linux {
-        proxy_listen(&mut p, root, listen, &mut notes)?;
-    }
     Ok(Outcome {
         plan: p.finish(),
         notes,
     })
-}
-
-/// The text of the drop-in that moves `kbf-proxy.socket` to `addr`: the empty `ListenStream=`
-/// clears the packaged port first (without it the socket would listen on both).
-pub fn proxy_listen_dropin(addr: std::net::SocketAddr) -> String {
-    format!("[Socket]\nListenStream=\nListenStream={addr}\n")
-}
-
-/// Makes `listen.conf` say `listen` (written atomically, root's, 0644), or removes it when
-/// the operator set no address. Systemd reads drop-ins at `daemon-reload` and a socket takes
-/// a new address at its next restart: setup does neither (the proxy socket is the public
-/// port, and restarting it is the operator's call), so it says so.
-fn proxy_listen(
-    p: &mut Pl<'_, '_>,
-    root: Owner,
-    listen: Option<std::net::SocketAddr>,
-    notes: &mut Vec<String>,
-) -> Result<(), SetupError> {
-    let changed = match listen {
-        Some(addr) => {
-            dir(p, paths::PROXY_SOCKET_DIR, 0o755, root)?;
-            file(
-                p,
-                paths::PROXY_LISTEN_DROPIN,
-                0o644,
-                root,
-                proxy_listen_dropin(addr).into_bytes(),
-            )?
-        }
-        None => p.absent(hp(paths::PROXY_LISTEN_DROPIN)?)?,
-    };
-    if changed {
-        notes.push(format!(
-            "{} changed: run `systemctl daemon-reload`, then `systemctl restart kbf-proxy.socket` to move the public port; setup does not (a restart of the socket drops connections waiting in it)",
-            paths::PROXY_LISTEN_DROPIN
-        ));
-    }
-    Ok(())
 }
 
 /// The first operator token: made once, when the file is not there. It is never printed; the
@@ -760,10 +717,9 @@ fn units(
         }
         Platform::Linux => {
             let backup_gone = remove_old_backup_timer(p, os, &mut notes)?;
-            let wanted = mode_units(v.mode)
-                .iter()
-                .map(|u| (*u, start_mode))
-                .chain([(INSTALLER_UNIT, !no_start)]);
+            // Only the unit of the mode: the `kbf` package ships no other unit (the installer's
+            // and the proxy's are not in it).
+            let wanted = mode_units(v.mode).iter().map(|u| (*u, start_mode));
             if backup_gone {
                 p.run(Cmd::new(hp(SYSTEMCTL)?).arg("daemon-reload"));
             }

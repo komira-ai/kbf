@@ -1,32 +1,36 @@
 //! `pkg-upgrade-test --old-installer <deb> --old-kbf <deb> --package <deb> --listing <file>
-//! --image-dir <dir> [--docker <program>]`: a host that has the `kbf-installer` deb and the
-//! `kbf` deb of the release before takes the `kbf` deb of this one, in a fresh container with
-//! systemd as PID 1 and the package managers that install it (apt and dpkg, not a model of
-//! them).
+//! --image-dir <dir> [--docker <program>]`: a host that has the `kbf` deb of the release before
+//! (and, but for one leg, its `kbf-installer` deb) takes the `kbf` deb of this one, in a fresh
+//! container with systemd as PID 1 and the package managers that install it (apt and dpkg, not a
+//! model of them).
 //!
 //! The old debs are published assets of an earlier release, so the files they own are the
-//! files a real host has. The upgrade is made two ways, each in a container of its own:
+//! files a real host has. The upgrade is made three ways, each in a container of its own:
 //!
-//! - **apt** (what an operator does): `apt-get install` of the new deb. It `Breaks` the old
-//!   installer, so apt removes it; afterwards the old installer is not installed and its
-//!   binary and old trust directory are gone;
-//! - **dpkg** (what the `Replaces` is for): `dpkg --install --force-breaks` of the new deb, with
-//!   the old installer still installed, so that dpkg unpacks the new files over the ones the
-//!   installer owns, which nothing but `Replaces` allows.
+//! - **apt** (what an operator does with the file): `apt-get install` of the new deb on a host
+//!   with both old debs. There is no `Breaks`, so apt leaves the installer installed;
+//! - **dpkg**: a plain `dpkg --install` of the new deb (no force flag, no resolution: how
+//!   `kbf-host-install` updates a native-package host and `--migrate-to-package` moves a
+//!   hand-placed one) on a host with both old debs. Nothing but `Replaces` lets dpkg unpack the
+//!   new files over the ones the installer owns;
+//! - **dpkg without the installer**: the same on a host that has only the old `kbf` deb, which
+//!   had no dependencies, so it has neither `crun` nor `uidmap`: the new deb must configure
+//!   without them (a `Depends` on them would leave it unpacked, unconfigured and undone).
 //!
 //! In each container:
 //!
-//! 1. the old `kbf-installer` and the old `kbf` are installed, and the checks that make the
-//!    rest mean something hold: the installer owns the trust directory and `kbf.slice`
-//!    (so the new package has files to take over), and after `systemd-sysusers` and
-//!    `systemd-tmpfiles --create` the users exist (so there are users to keep);
-//! 2. the new `kbf` is installed over them: afterwards `kbf` is at the new version, every entry
-//!    of `--listing` is at its path, `root:root`, with its mode and bytes, and dpkg says `kbf`
-//!    owns each file of it (the trust files, the sysusers and tmpfiles files, the slice, the
-//!    needrestart drop-in), not `kbf-installer`;
-//! 3. purging the old installer deletes none of the entries: removing `kbf-installer` takes
-//!    nothing `kbf` owns, and nothing is left half-installed (`dpkg --audit`);
-//! 4. the users have the ids they had, and the directories `tmpfiles.d` makes exist.
+//! 1. the old debs are installed, and the checks that make the rest mean something hold: with the
+//!    installer, it owns the trust directory and `kbf.slice` (so the new package has files to
+//!    take over) and, after `systemd-sysusers` and `systemd-tmpfiles --create`, the users exist
+//!    (so there are users to keep); without it, `crun` and `uidmap` are not installed;
+//! 2. the new `kbf` is installed over them: afterwards `kbf` is `install ok installed` at the new
+//!    version, `dpkg --audit` is clean, every entry of `--listing` is at its path, `root:root`,
+//!    with its mode and bytes, and dpkg says `kbf` owns each file of it (the trust files, the
+//!    sysusers and tmpfiles files, the slice, the needrestart drop-in), not `kbf-installer`;
+//! 3. with the installer: it is still installed (its binary is there), and purging it deletes
+//!    none of the entries: removing `kbf-installer` takes nothing `kbf` owns;
+//! 4. the users have the ids they had (or, without the installer, exist now that the package's
+//!    sysusers file has been read), and the directories `tmpfiles.d` makes exist.
 //!
 //! Every command is one `docker` argv run through a closure ([`Docker`]), as in
 //! [`crate::pkg_install`], so the checks are tested against a model of the container.
@@ -49,38 +53,44 @@ pub struct UpgradeTest<'a> {
     /// The `listing.txt` of `pkg-config` for `package`.
     pub listing: &'a Path,
     pub image_dir: &'a Path,
-    /// A name no other container of the host has; the two containers add `-apt` and `-dpkg`.
+    /// A name no other container of the host has; each container adds its leg's name.
     pub container: &'a str,
 }
 
-/// How the new deb is installed over the old packages.
+/// How the new deb is installed, and over what.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Via {
-    /// `apt-get install`: the package manager resolves the `Breaks` by removing the old
-    /// installer.
+    /// `apt-get install`, on a host with both old debs.
     Apt,
-    /// `dpkg --install --force-breaks`: the old installer stays, and `Replaces` is what lets
-    /// the new files be unpacked over its own.
+    /// A plain `dpkg --install`, on a host with both old debs.
     Dpkg,
+    /// A plain `dpkg --install`, on a host with only the old `kbf` deb.
+    DpkgWithoutInstaller,
 }
 
 impl Via {
-    /// Both, in the order they run.
-    pub const ALL: [Via; 2] = [Via::Apt, Via::Dpkg];
+    /// All of them, in the order they run.
+    pub const ALL: [Via; 3] = [Via::Apt, Via::Dpkg, Via::DpkgWithoutInstaller];
 
     /// The word in the container's name and in the problems.
     pub fn name(self) -> &'static str {
         match self {
             Via::Apt => "apt",
             Via::Dpkg => "dpkg",
+            Via::DpkgWithoutInstaller => "dpkg-without-installer",
         }
+    }
+
+    /// Whether the host has the old `kbf-installer` deb.
+    fn has_installer(self) -> bool {
+        self != Via::DpkgWithoutInstaller
     }
 
     /// The command that installs `deb` (a path in the container) over the old packages.
     fn install(self, deb: &str) -> Vec<&str> {
         match self {
             Via::Apt => vec!["apt-get", "-y", "--allow-downgrades", "install", deb],
-            Via::Dpkg => vec!["dpkg", "--install", "--force-breaks", deb],
+            Via::Dpkg | Via::DpkgWithoutInstaller => vec!["dpkg", "--install", deb],
         }
     }
 }
@@ -123,7 +133,13 @@ fn install_old(
     c.must(what, &Via::Apt.install(&deb), problems)
 }
 
-/// The checks after the container is up and the three debs are in it.
+/// Whether the package `name` is installed.
+fn installed(c: &mut Container, name: &str) -> Result<bool, Error> {
+    let status = c.say(&["dpkg-query", "-W", "-f=${Status}", name])?;
+    Ok(status == "install ok installed")
+}
+
+/// The checks after the container is up and the debs are in it.
 fn checks(
     c: &mut Container,
     t: &UpgradeTest,
@@ -131,37 +147,53 @@ fn checks(
     via: Via,
 ) -> Result<Vec<String>, Error> {
     let mut problems = Vec::new();
-    install_old(
-        c,
-        "installing the old kbf-installer",
-        t.old_installer,
-        &mut problems,
-    )?;
+    let with_installer = via.has_installer();
+    if with_installer {
+        install_old(
+            c,
+            "installing the old kbf-installer",
+            t.old_installer,
+            &mut problems,
+        )?;
+    }
     install_old(c, "installing the old kbf", t.old_kbf, &mut problems)?;
-    for name in [pkg_linux::NAME, pkg_linux::KBF_NAME] {
-        let status = c.say(&["dpkg-query", "-W", "-f=${Status}", name])?;
-        eq(
-            &mut problems,
-            &format!("{name} before the upgrade"),
-            &status,
-            "install ok installed",
-        );
+    let mut before_names = vec![pkg_linux::KBF_NAME];
+    if with_installer {
+        before_names.push(pkg_linux::NAME);
     }
-    for path in HANDED_OVER {
-        eq(
-            &mut problems,
-            &format!("the owner of {path} before the upgrade"),
-            &owner(c, path)?,
-            pkg_linux::NAME,
-        );
+    for name in before_names {
+        if !installed(c, name)? {
+            problems.push(format!("{name} is not installed before the upgrade"));
+        }
     }
-    c.must("systemd-sysusers", &["systemd-sysusers"], &mut problems)?;
-    c.must(
-        "systemd-tmpfiles",
-        &["systemd-tmpfiles", "--create"],
-        &mut problems,
-    )?;
-    let before = ids(c)?;
+    let before = if with_installer {
+        for path in HANDED_OVER {
+            eq(
+                &mut problems,
+                &format!("the owner of {path} before the upgrade"),
+                &owner(c, path)?,
+                pkg_linux::NAME,
+            );
+        }
+        c.must("systemd-sysusers", &["systemd-sysusers"], &mut problems)?;
+        c.must(
+            "systemd-tmpfiles",
+            &["systemd-tmpfiles", "--create"],
+            &mut problems,
+        )?;
+        Some(ids(c)?)
+    } else {
+        // The host the old `kbf` deb alone made: it had no dependency, so `crun` and `uidmap`
+        // are not there for a dependency of the new one to be met by.
+        for name in ["crun", "uidmap"] {
+            if installed(c, name)? {
+                problems.push(format!(
+                    "{name} is installed before the upgrade, so the test cannot show the new package needs nothing"
+                ));
+            }
+        }
+        None
+    };
     if !problems.is_empty() {
         // The rest would not mean what it says.
         return Ok(problems);
@@ -169,6 +201,18 @@ fn checks(
 
     let new = inside(t.package);
     c.must("installing the new kbf", &via.install(&new), &mut problems)?;
+    if !installed(c, pkg_linux::KBF_NAME)? {
+        let status = c.say(&["dpkg-query", "-W", "-f=${Status}", pkg_linux::KBF_NAME])?;
+        problems.push(format!(
+            "kbf is {status:?} after the upgrade, not \"install ok installed\""
+        ));
+    }
+    eq(
+        &mut problems,
+        "dpkg --audit after the upgrade",
+        &c.say(&["dpkg", "--audit"])?,
+        "",
+    );
     let want = c.say(&["dpkg-deb", "-f", &new, "Version"])?;
     let got = c.say(&["dpkg-query", "-W", "-f=${Version}", pkg_linux::KBF_NAME])?;
     eq(
@@ -188,31 +232,42 @@ fn checks(
             );
         }
     }
-    if via == Via::Apt {
-        // The package manager resolved the `Breaks`: the old installer is gone, and its own files.
-        let status = c.say(&["dpkg-query", "-W", "-f=${Status}", pkg_linux::NAME])?;
-        if status == "install ok installed" {
-            problems.push("kbf-installer is still installed beside the new kbf".to_owned());
+    if with_installer {
+        // Nothing removed the installer: it stays, with the rest of its files, until purged.
+        if !installed(c, pkg_linux::NAME)? {
+            problems.push(
+                "kbf-installer is gone after the upgrade, though nothing removed it".to_owned(),
+            );
         }
-        for path in [pkg_linux::BINARY_PATH, "/usr/share/kbf-installer/trust/gh"] {
-            if c.ok(&["test", "-e", path])? {
-                problems.push(format!("{path} is still there after the upgrade"));
+        if !c.ok(&["test", "-e", pkg_linux::BINARY_PATH])? {
+            problems.push(format!(
+                "{} is gone after the upgrade",
+                pkg_linux::BINARY_PATH
+            ));
+        }
+        c.must(
+            "purging the old kbf-installer",
+            &["dpkg", "--purge", pkg_linux::NAME],
+            &mut problems,
+        )?;
+        for e in entries {
+            if !c.ok(&["test", "-e", &e.dst])? {
+                problems.push(format!("{} is gone after kbf-installer is purged", e.dst));
             }
         }
-    }
-
-    c.must(
-        "purging the old kbf-installer",
-        &["dpkg", "--purge", pkg_linux::NAME],
-        &mut problems,
-    )?;
-    for e in entries {
-        if !c.ok(&["test", "-e", &e.dst])? {
-            problems.push(format!("{} is gone after kbf-installer is purged", e.dst));
+        if c.ok(&["test", "-e", pkg_linux::BINARY_PATH])? {
+            problems.push(format!(
+                "{} is still there after kbf-installer is purged",
+                pkg_linux::BINARY_PATH
+            ));
         }
+        eq(
+            &mut problems,
+            "dpkg --audit after the purge",
+            &c.say(&["dpkg", "--audit"])?,
+            "",
+        );
     }
-    let audit = c.say(&["dpkg", "--audit"])?;
-    eq(&mut problems, "dpkg --audit", &audit, "");
 
     c.must("systemd-sysusers", &["systemd-sysusers"], &mut problems)?;
     c.must(
@@ -220,7 +275,17 @@ fn checks(
         &["systemd-tmpfiles", "--create"],
         &mut problems,
     )?;
-    eq(&mut problems, "the users and their ids", &ids(c)?, &before);
+    let after = ids(c)?;
+    match before {
+        Some(before) => eq(&mut problems, "the users and their ids", &after, &before),
+        None => {
+            for user in USERS {
+                if !c.ok(&["getent", "passwd", user])? {
+                    problems.push(format!("the user {user} does not exist after the upgrade"));
+                }
+            }
+        }
+    }
     for (path, mode) in TMPFILES_DIRS {
         let got = c.say(&["stat", "-c", "%U:%G:%a:%F", path])?;
         eq(
@@ -238,9 +303,11 @@ fn started(
     docker: &mut Docker,
     t: &UpgradeTest,
     (container, image): (&str, &str),
+    via: Via,
 ) -> Result<(), Error> {
     up(docker, t.image_dir, image, container)?;
-    for deb in [t.old_installer, t.old_kbf, t.package] {
+    let installer = via.has_installer().then_some(t.old_installer);
+    for deb in installer.into_iter().chain([t.old_kbf, t.package]) {
         let target = format!("{container}:{}", inside(deb));
         must(docker, &["cp", &deb.to_string_lossy(), &target])?;
     }
@@ -256,7 +323,7 @@ fn session(
 ) -> Result<Vec<String>, Error> {
     let container = format!("{}-{}", t.container, via.name());
     let image = format!("{}-upgrade-test-{container}", pkg_linux::KBF_NAME);
-    let result = match started(docker, t, (&container, &image)) {
+    let result = match started(docker, t, (&container, &image), via) {
         Ok(()) => {
             Container::booted(docker, &container).and_then(|mut c| checks(&mut c, t, entries, via))
         }
@@ -281,7 +348,7 @@ pub fn run(docker: &mut Docker, t: &UpgradeTest) -> Result<Vec<String>, Error> {
     }
     if problems.is_empty() {
         return Ok(vec![format!(
-            "{} takes over from kbf-installer by apt and by dpkg: its files change hands, the users keep their ids, and removing the installer takes none of them",
+            "{} takes over from kbf-installer and from the old kbf alone, by apt and by a plain dpkg --install: it configures with nothing else installed, its files change hands, the users keep their ids, and purging the installer takes none of them",
             t.package.display()
         )]);
     }

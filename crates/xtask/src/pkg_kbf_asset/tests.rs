@@ -9,9 +9,9 @@ const VERSION: &str = "0.1.0+0123456789ab";
 const MAIN: &str = "refs/heads/main";
 const FEATURE: &str = "refs/heads/feature/arch-v2";
 const ROOT: &str = "{\"mediaType\":\"trustedroot\"}\n";
-/// The `Depends` a good deb has: [`DEB_DEPENDS`], spelled out so that a change to the list
+/// The `Recommends` a good deb has: [`DEB_RECOMMENDS`], spelled out so that a change to the list
 /// shows here too.
-const DEPENDS: &str = "crun, uidmap, systemd, ca-certificates";
+const RECOMMENDS: &str = "crun, uidmap, systemd, ca-certificates";
 const REPLACES: &str = "kbf-installer (<< 0.1.1)";
 
 /// An empty directory of its own for one test.
@@ -82,10 +82,11 @@ struct Fix {
     package: &'static str,
     version: &'static str,
     arch: &'static str,
-    depends: String,
+    /// Control lines of a relation the good deb has none of, `Depends` for one.
+    relations: Vec<(&'static str, String)>,
+    recommends: String,
     suggests: String,
     replaces: String,
-    breaks: String,
     drop: Option<String>,
     /// Files a good package does not hold, with their modes and bytes.
     extra: Vec<(String, u32, Vec<u8>)>,
@@ -102,10 +103,10 @@ impl Fix {
             package: "kbf",
             version: VERSION,
             arch: "amd64",
-            depends: DEPENDS.to_owned(),
+            relations: Vec::new(),
+            recommends: RECOMMENDS.to_owned(),
             suggests: "postgresql".to_owned(),
             replaces: REPLACES.to_owned(),
-            breaks: REPLACES.to_owned(),
             drop: None,
             extra: Vec::new(),
         }
@@ -126,10 +127,13 @@ impl Fix {
             self.package,
             self.version,
             self.arch,
-            line("Depends", &self.depends),
+            line("Recommends", &self.recommends),
             line("Suggests", &self.suggests),
             line("Replaces", &self.replaces),
-            line("Breaks", &self.breaks),
+            self.relations
+                .iter()
+                .map(|(name, value)| line(name, value))
+                .collect::<String>(),
         );
         let control_tgz = tgz(&[("control", 0o644, control.as_bytes())]);
         let binary = "usr/bin/kbf".to_owned();
@@ -392,48 +396,41 @@ fn the_control_file_names_the_package_and_the_architecture() {
     assert_eq!(got, [want]);
 }
 
-/// Asserts that the control file must not depend on `kbf-installer`: the name alone, with a
-/// version, with no space before the version, among other packages, with an architecture and
-/// as one of several alternatives are each refused alone, and other packages, a name that only
-/// starts like it and another version of the package's own name are not.
+/// Asserts that the control file has no `Depends`, `Pre-Depends`, `Breaks` or `Conflicts`, each
+/// refused alone with whatever it says (the installer's name, another package, or both): a host
+/// updates the package with a plain `dpkg --install`, which resolves nothing, so a dependency the
+/// host lacks leaves the package unconfigured and a `Breaks` of the installer makes dpkg refuse.
 #[test]
-fn the_control_file_does_not_depend_on_the_installer() {
-    let with_depends = |more: &str| {
-        let mut fix = Fix::new();
-        fix.depends = format!("{DEPENDS}, {more}");
-        found("depends", &fix)
-    };
-    let names = "but the kbf package depends on no \"kbf-installer\"";
-    for more in [
-        "kbf-installer",
-        "kbf-installer (>= 0.1.0+0123456789ab)",
-        "kbf-installer(>= 0.1.0+0123456789ab)",
-        "kbf-installer (= 0.1.0+0123456789ab), crun",
-        "kbf-installer:any",
-        "crun | kbf-installer",
-    ] {
-        let got = with_depends(more);
-        assert_eq!(got.len(), 1, "{more:?}: {got:?}");
-        assert!(got[0].contains(names), "{more:?}: {got:?}");
-    }
-    for more in [
-        "crun (>= 1.0)",
-        "kbf-installer-extra (>= 0.1.0+0123456789ab)",
-        "kbf (>= 0.1.0+0123456789ab)",
-    ] {
-        let got = with_depends(more);
-        assert_eq!(got, Vec::<String>::new(), "{more:?}");
+fn the_control_file_has_no_dependency_break_or_conflict() {
+    for name in ["Depends", "Pre-Depends", "Breaks", "Conflicts"] {
+        for value in [
+            "crun",
+            "kbf-installer",
+            "kbf-installer (<< 0.1.1)",
+            "systemd, kbf-installer (>= 0.1.0+0123456789ab)",
+        ] {
+            let mut fix = Fix::new();
+            fix.relations.push((name, value.to_owned()));
+            let got = found("relations", &fix);
+            assert_eq!(got.len(), 1, "{name} {value:?}: {got:?}");
+            assert!(
+                got[0].starts_with(&format!(
+                    "control says {name} {value:?}, but the kbf package has none"
+                )),
+                "{name} {value:?}: {got:?}"
+            );
+        }
     }
 }
 
-/// Asserts that the control file must depend on what the package needs, the installer's
+/// Asserts that the control file must recommend what the package wants, the installer's
 /// package having been where those came from, and suggest Postgres: each missing one is
 /// refused alone, naming it.
 #[test]
-fn the_control_file_depends_on_what_the_package_needs() {
+fn the_control_file_recommends_what_the_package_wants() {
     for gone in ["crun", "uidmap", "systemd", "ca-certificates"] {
         let mut fix = Fix::new();
-        fix.depends = DEPENDS
+        fix.recommends = RECOMMENDS
             .split(", ")
             .filter(|d| *d != gone)
             .collect::<Vec<_>>()
@@ -441,7 +438,7 @@ fn the_control_file_depends_on_what_the_package_needs() {
         let got = found("needs", &fix);
         assert_eq!(got.len(), 1, "{gone}: {got:?}");
         assert!(
-            got[0].starts_with("control says Depends ")
+            got[0].starts_with("control says Recommends ")
                 && got[0].ends_with(&format!("which does not hold \"{gone}\"")),
             "{gone}: {got:?}"
         );
@@ -456,47 +453,38 @@ fn the_control_file_depends_on_what_the_package_needs() {
     );
 }
 
-/// Asserts that the control file must say that the package replaces and breaks the
-/// `kbf-installer` below the bound, because the units, the slice, the trust files and the rest
-/// were that package's files: no line, another package, a name that only starts like it, the
-/// package unbounded and a bound that is not the one are refused, each alone, and the entry
-/// among others, or with other spacing, is not.
+/// Asserts that the control file must say that the package replaces the `kbf-installer` below
+/// the bound, because the units, the slice, the trust files and the rest were that package's
+/// files: no line, another package, a name that only starts like it, the package unbounded and a
+/// bound that is not the one are refused, each alone, and the entry among others, or with other
+/// spacing, is not.
 #[test]
-fn the_control_file_replaces_and_breaks_the_installer_below_the_bound() {
-    for field in ["Replaces", "Breaks"] {
-        let with = |value: &str| {
-            let mut fix = Fix::new();
-            if field == "Replaces" {
-                fix.replaces = value.to_owned();
-            } else {
-                fix.breaks = value.to_owned();
-            }
-            found("relation", &fix)
-        };
-        let hold = format!("which does not hold \"{REPLACES}\"");
-        for value in [
-            "",
-            "kbf",
-            "kbf-installer-extra (<< 0.1.1)",
-            "kbf-installer",
-            "kbf-installer (<< 9)",
-            "kbf-installer (<= 0.1.1)",
-        ] {
-            let got = with(value);
-            assert_eq!(got.len(), 1, "{field} {value:?}: {got:?}");
-            assert!(
-                got[0].starts_with(&format!("control says {field} ")),
-                "{got:?}"
-            );
-            assert!(got[0].ends_with(&hold), "{field} {value:?}: {got:?}");
-        }
-        for value in [
-            REPLACES,
-            "other, kbf-installer (<< 0.1.1)",
-            "kbf-installer(<<0.1.1)  ",
-        ] {
-            assert_eq!(with(value), Vec::<String>::new(), "{field} {value:?}");
-        }
+fn the_control_file_replaces_the_installer_below_the_bound() {
+    let with = |value: &str| {
+        let mut fix = Fix::new();
+        fix.replaces = value.to_owned();
+        found("relation", &fix)
+    };
+    let hold = format!("which does not hold \"{REPLACES}\"");
+    for value in [
+        "",
+        "kbf",
+        "kbf-installer-extra (<< 0.1.1)",
+        "kbf-installer",
+        "kbf-installer (<< 9)",
+        "kbf-installer (<= 0.1.1)",
+    ] {
+        let got = with(value);
+        assert_eq!(got.len(), 1, "{value:?}: {got:?}");
+        assert!(got[0].starts_with("control says Replaces "), "{got:?}");
+        assert!(got[0].ends_with(&hold), "{value:?}: {got:?}");
+    }
+    for value in [
+        REPLACES,
+        "other, kbf-installer (<< 0.1.1)",
+        "kbf-installer(<<0.1.1)  ",
+    ] {
+        assert_eq!(with(value), Vec::<String>::new(), "{value:?}");
     }
 }
 
@@ -514,7 +502,7 @@ fn a_control_file_without_its_lines_is_refused() {
     let got = problems(&deb, &c).expect("problems");
     let package = "control says Package \"(none)\", not \"kbf\"".to_owned();
     assert!(got.contains(&package), "{got:?}");
-    for field in ["Depends", "Suggests", "Replaces", "Breaks"] {
+    for field in ["Recommends", "Suggests", "Replaces"] {
         let said = got
             .iter()
             .any(|p| p.starts_with(&format!("control says {field} \"\"")));
@@ -596,7 +584,7 @@ fn verify_only_checks_the_asset_by_its_name_and_writes_nothing() {
     assert!(printed[0].starts_with(&start), "{printed:?}");
     assert_eq!(std::fs::read_dir(&dir).expect("ls").count(), before);
     let mut bad = Fix::new();
-    bad.depends = format!("{DEPENDS}, kbf-installer");
+    bad.relations.push(("Depends", "crun".to_owned()));
     std::fs::write(&named, bad.deb()).expect("bad deb");
     let err = asset(&named, COMMIT, &Mode::VerifyOnly, &c).expect_err("refused");
     assert!(matches!(err, Error::Refused(_)), "{err:?}");

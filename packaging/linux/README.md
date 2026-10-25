@@ -43,21 +43,25 @@ installer-tarball`, which no release publishes, still place them under it.)
   own update path restarts them. A host without needrestart ignores it;
 - nothing else, all of it `root:root`, with one time (`SOURCE_DATE_EPOCH`) on every file and the
   package;
-- dependencies (deb) `crun, uidmap, systemd, ca-certificates`, (rpm) the same with Fedora's name
-  for `uidmap`, `shadow-utils`, and a suggestion of `postgresql` (rpm `postgresql-server`) for a
-  frontend or all-in-one host that keeps its state on the host; no dependency on another package,
-  and none on `kbf-installer` (`pkg-kbf-asset` refuses a deb whose `Depends` names it);
-- in the deb only, `Replaces: kbf-installer (<< 0.1.1)` and `Breaks: kbf-installer (<< 0.1.1)`
-  (`KBF_DEB_REPLACES`, `KBF_DEB_BREAKS`; every `kbf-installer` deb that was published is
-  `0.1.0+<commit>`). The mode units, the slice, the needrestart drop-in and the trust files were
-  files of the `kbf-installer` package, and dpkg refuses to unpack `kbf` over files another
-  package owns unless `kbf` says it replaces that package; `Breaks` makes the package manager
-  remove the old package when it installs this one, so nothing is left beside it with the
-  rest of its files (its binary, the proxy's units). The files change hands, the users and the
-  directories stay, and removing the old package afterwards takes none of them:
-  `cargo xtask pkg-upgrade-test` runs exactly that, with the real apt and dpkg. The rpm names
-  nothing: an rpm `Obsoletes` would remove the old package, and no rpm is published.
-  `pkg-kbf-asset` checks the deb's `Depends`, `Replaces` and `Breaks`.
+- no dependency of any kind: a host updates the package with a plain `dpkg --install`
+  (`kbf-host-install`, and `--migrate-to-package`), which resolves nothing, and a dependency the
+  host lacks would leave `kbf` unpacked, unconfigured and undone. It recommends (deb) `crun,
+  uidmap, systemd, ca-certificates`, (rpm) the same with Fedora's name for `uidmap`,
+  `shadow-utils` (`crun` and `uidmap` are the container driver's; `systemd` and `ca-certificates`
+  are on any host that runs the units, and a recommendation cannot fail an install), and suggests
+  `postgresql` (rpm `postgresql-server`) for a frontend or all-in-one host that keeps its state on
+  the host (`pkg-kbf-asset` refuses a deb with a `Depends`, `Pre-Depends`, `Breaks` or
+  `Conflicts`);
+- in the deb only, `Replaces: kbf-installer (<< 0.1.1)` (`KBF_DEB_REPLACES`; every
+  `kbf-installer` deb that was published is `0.1.0+<commit>`). The mode units, the slice, the
+  needrestart drop-in and the trust files were files of the `kbf-installer` package, and dpkg
+  refuses to unpack `kbf` over files another package owns unless `kbf` says it replaces that
+  package. There is no `Breaks`: it would make a plain `dpkg --install` refuse on a host that has
+  the installer, which is where `--migrate-to-package` starts. So the installer stays installed
+  until purged; the files change hands, the users and the directories stay, and purging the old
+  package afterwards takes none of them: `cargo xtask pkg-upgrade-test` runs exactly that, with
+  the real apt and dpkg. The rpm names nothing: an rpm `Obsoletes` would remove the old package,
+  and no rpm is published.
 
 ### Which frontend unit
 
@@ -85,7 +89,7 @@ Envoy, and kbf runs none.
 
 ## Installing starts and enables nothing
 
-The package has no maintainer script (`xtask pkg-install-test` fails on one, in both formats; the
+The package has no maintainer script (`xtask pkg-install-test` fails on one or on a dependency, in both formats; the
 configuration names none, which a test in `pkg_linux/tests.rs` pins), so nothing runs at install,
 upgrade, remove or purge: no unit is enabled, started or restarted, no user or directory is
 created by a script.
@@ -126,8 +130,9 @@ with a trust directory `cargo xtask pkg-trust` writes (the pinned `gh`, the Sigs
 root `gh` fetched, and an `installer.conf` whose `SOURCE_REFS` is the branch the package is
 attested on), installs the deb in a fresh Ubuntu container (`cargo xtask pkg-install-test`, with
 `--probe`s that the packaged `gh` runs and the binary names the commit), takes it over a host
-that has the previous release's `kbf-installer` and `kbf` debs (`cargo xtask pkg-upgrade-test`:
-the debs are fetched from that release and checked against SHA-256 pins in the workflow), and
+that has the previous release's `kbf-installer` and `kbf` debs, by apt and by a plain `dpkg --install`,
+and over a host that has only the old `kbf` (`cargo xtask pkg-upgrade-test`: the debs are fetched
+from that release and checked against SHA-256 pins in the workflow), and
 `cargo xtask pkg-kbf-asset` makes `kbf-<commit>-<platform>.deb` an asset, listed in `SHA256SUMS`
 and attested with a bundle, refused unless its `/usr/bin/kbf` is the `kbf` of the job's own
 tarball and its trust directory is for the branch it is attested on

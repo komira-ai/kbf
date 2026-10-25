@@ -277,8 +277,8 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
     assert_eq!(text.lines().count(), 3, "{text}");
 }
 
-/// Asserts that the configuration is named `kbf`, depends on what the installer's package did
-/// (deb and rpm), suggests Postgres, runs no script, lists its files as root's, and carries the
+/// Asserts that the configuration is named `kbf`, recommends what the installer's package
+/// depended on (deb and rpm) and depends on nothing, suggests Postgres, runs no script, lists its files as root's, and carries the
 /// version and architecture it is given.
 #[test]
 fn the_config_has_the_contract_dependencies_no_script_and_root_files() {
@@ -290,16 +290,18 @@ fn the_config_has_the_contract_dependencies_no_script_and_root_files() {
     assert!(text.contains("version: \"1.2.3+ci\""), "{text}");
     assert!(
         text.contains(
-            "depends:\n  - \"crun\"\n  - \"uidmap\"\n  - \"systemd\"\n  - \"ca-certificates\"\n"
+            "recommends:\n  - \"crun\"\n  - \"uidmap\"\n  - \"systemd\"\n  - \"ca-certificates\"\n"
         ),
         "{text}"
     );
     assert!(
         text.contains(
-            "overrides:\n  rpm:\n    depends:\n      - \"crun\"\n      - \"shadow-utils\""
+            "overrides:\n  rpm:\n    recommends:\n      - \"crun\"\n      - \"shadow-utils\""
         ),
         "{text}"
     );
+    // No dependency of either kind: a plain `dpkg --install` resolves nothing.
+    assert!(!text.contains("depends"), "{text}");
     assert!(text.contains("buildhost: \"kbf-build\""), "{text}");
     for banned in [
         "podman",
@@ -308,7 +310,6 @@ fn the_config_has_the_contract_dependencies_no_script_and_root_files() {
         "postinstall",
         "preinstall",
         "mtime",
-        "recommends",
     ] {
         assert!(!text.contains(banned), "{banned} in {text}");
     }
@@ -336,11 +337,12 @@ fn the_config_has_the_contract_dependencies_no_script_and_root_files() {
     assert!(arm.contains("arch: \"arm64\""), "{arm}");
 }
 
-/// Asserts that the deb replaces and breaks every `kbf-installer` below the bound, which is
-/// how its files change hands and the installer goes, that the rpm names neither, and that the
-/// bound is above every version of the installer that was published (`0.1.0+<commit>`).
+/// Asserts that the deb replaces every `kbf-installer` below the bound, which is how a plain
+/// `dpkg --install` unpacks over its files, that it does not break it (dpkg would refuse on a host
+/// that has it), that the rpm names neither, and that the bound is above every version of the
+/// installer that was published (`0.1.0+<commit>`).
 #[test]
-fn the_deb_replaces_and_breaks_the_old_installer_and_the_rpm_names_it_not() {
+fn the_deb_replaces_the_old_installer_and_breaks_it_not_and_the_rpm_names_it_not() {
     let t = Tree::new("relations");
     let entries = kbf_plan(&t.inputs()).expect("plan");
     let text = config(&entries, Platform::LinuxX86_64, "1.2.3+ci");
@@ -348,17 +350,12 @@ fn the_deb_replaces_and_breaks_the_old_installer_and_the_rpm_names_it_not() {
         text.contains("  deb:\n    replaces:\n      - \"kbf-installer (<< 0.1.1)\"\n"),
         "{text}"
     );
-    assert!(
-        text.contains(
-            "deb:\n  compression: \"gzip\"\n  breaks:\n    - \"kbf-installer (<< 0.1.1)\"\n"
-        ),
-        "{text}"
-    );
+    for banned in ["breaks", "conflicts"] {
+        assert!(!text.contains(banned), "{banned} in {text}");
+    }
     assert_eq!(text.matches("replaces").count(), 1, "{text}");
-    assert_eq!(text.matches("breaks").count(), 1, "{text}");
-    assert_eq!(text.matches("kbf-installer").count(), 2, "{text}");
+    assert_eq!(text.matches("kbf-installer").count(), 1, "{text}");
     assert_eq!(KBF_DEB_REPLACES, ["kbf-installer (<< 0.1.1)"]);
-    assert_eq!(KBF_DEB_BREAKS, KBF_DEB_REPLACES);
     assert_eq!(INSTALLER_RETIRED_FROM, "0.1.1");
     // The rpm's own sections do not mention the installer: the lines under `rpm:`.
     let rpm = text.split("\nrpm:\n").nth(1).expect("rpm section");
@@ -836,7 +833,7 @@ fn the_package_ships_the_units_directory_but_the_retired_ones() {
 /// would put it on every node.
 #[test]
 fn no_dependency_of_the_package_names_envoy() {
-    for dep in DEB_DEPENDS.iter().chain(RPM_DEPENDS.iter()) {
+    for dep in DEB_RECOMMENDS.iter().chain(RPM_RECOMMENDS.iter()) {
         assert!(!dep.to_lowercase().contains("envoy"), "{dep}");
     }
 }
@@ -847,7 +844,7 @@ fn no_dependency_of_the_package_names_envoy() {
 /// (the frontend operator is not told what to install).
 #[test]
 fn postgres_is_suggested_not_required() {
-    for dep in DEB_DEPENDS.iter().chain(RPM_DEPENDS.iter()) {
+    for dep in DEB_RECOMMENDS.iter().chain(RPM_RECOMMENDS.iter()) {
         assert!(!dep.to_lowercase().contains("postgres"), "{dep}");
     }
     let cfg = config(&[], Platform::LinuxX86_64, "0.0.0+ci");
@@ -861,7 +858,10 @@ fn postgres_is_suggested_not_required() {
         cfg.contains("    suggests:\n      - \"postgresql-server\"\n"),
         "the rpm suggests postgresql-server: {cfg}"
     );
-    assert!(!cfg.contains("recommends"), "{cfg}");
+    // Nor recommended: apt installs recommended packages by default.
+    let recommended = cfg.split("recommends:").nth(1).expect("recommends");
+    let recommended = recommended.split("suggests:").next().expect("section");
+    assert!(!recommended.contains("postgres"), "{cfg}");
 }
 
 #[test]

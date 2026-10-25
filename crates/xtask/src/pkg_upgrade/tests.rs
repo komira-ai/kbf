@@ -16,8 +16,14 @@ enum Defect {
     InstallOfNewFails,
     /// The new deb does not say it replaces the installer: the files stay the installer's.
     FilesStayWithInstaller,
-    /// The new deb does not break the installer: both stay installed.
-    InstallerStays,
+    /// The new deb `Breaks` the installer: a plain `dpkg --install` refuses on a host that has it
+    /// (apt removes the installer instead).
+    BreaksTheInstaller,
+    /// The new deb `Depends` on `crun`: a plain `dpkg --install` leaves it unpacked and
+    /// unconfigured on a host without it (apt installs it).
+    DependsOnCrun,
+    /// The image already has `crun`, so the host without the installer does not lack it.
+    CrunPreinstalled,
     VersionStale,
     PurgeTakesKbfFiles,
     UsersRenumbered,
@@ -62,6 +68,9 @@ struct World {
     present: BTreeSet<String>,
     uid_base: u32,
     kbf_version: &'static str,
+    /// The new `kbf` is unpacked and not configured.
+    unconfigured: bool,
+    installer_purged: bool,
     log: Vec<String>,
 }
 
@@ -81,6 +90,8 @@ impl World {
             present: BTreeSet::new(),
             uid_base: 990,
             kbf_version: "0.1.0+old",
+            unconfigured: false,
+            installer_purged: false,
             log: Vec::new(),
         }
     }
@@ -100,11 +111,16 @@ impl World {
         self.owner.clear();
         self.present.clear();
         self.kbf_version = "0.1.0+old";
+        self.unconfigured = false;
+        self.installer_purged = false;
+        if self.is(Defect::CrunPreinstalled) {
+            self.installed.insert("crun");
+        }
     }
 
-    /// `deb` installed; the new `kbf` removes the old installer when `breaks_removes` (what
-    /// apt does with a `Breaks`; `dpkg --force-breaks` leaves it installed).
-    fn install(&mut self, deb: &str, breaks_removes: bool) -> Out {
+    /// `deb` installed by apt (`by_apt`, which resolves a `Break` by removing the installer and a
+    /// `Depends` by installing it) or by a plain `dpkg --install` (which does neither).
+    fn install(&mut self, deb: &str, by_apt: bool) -> Out {
         if deb.ends_with("kbf-installer-old.deb") {
             self.installed.insert("kbf-installer");
             for path in OLD_INSTALLER_ONLY {
@@ -121,16 +137,28 @@ impl World {
             if self.is(Defect::InstallOfNewFails) {
                 return fail("E: Unable to correct problems, you have held broken packages.");
             }
-            self.installed.insert("kbf");
-            if !self.is(Defect::VersionStale) {
-                self.kbf_version = "0.1.0+new";
-            }
-            if breaks_removes && !self.is(Defect::InstallerStays) {
-                // The package manager removes what the new package breaks.
+            if self.is(Defect::BreaksTheInstaller) && self.installed.contains("kbf-installer") {
+                if !by_apt {
+                    return fail(
+                        "dpkg: regarding /var/tmp/kbf-new.deb containing kbf:\n kbf breaks kbf-installer (<< 0.1.1) and is installed.",
+                    );
+                }
+                // apt removes what the new package breaks.
                 self.installed.remove("kbf-installer");
                 for path in OLD_INSTALLER_ONLY {
                     self.present.remove(path);
                 }
+            }
+            if self.is(Defect::DependsOnCrun) && !self.installed.contains("crun") {
+                if by_apt {
+                    self.installed.insert("crun");
+                } else {
+                    self.unconfigured = true;
+                }
+            }
+            self.installed.insert("kbf");
+            if !self.is(Defect::VersionStale) {
+                self.kbf_version = "0.1.0+new";
             }
             for e in self.entries.clone() {
                 let held = self.owner.get(&e.dst).copied();
@@ -139,6 +167,11 @@ impl World {
                 }
                 self.own(&e.dst, "kbf");
             }
+        }
+        if self.unconfigured {
+            return fail(
+                "dpkg: error processing package kbf (--install):\n dependency problems - leaving unconfigured",
+            );
         }
         ok("")
     }
@@ -161,9 +194,11 @@ impl World {
         match args {
             ["systemctl", "is-system-running", "--wait"] => ok("running"),
             ["apt-get", "-y", "--allow-downgrades", "install", deb] => self.install(deb, true),
-            ["dpkg", "--install", "--force-breaks", deb] => self.install(deb, false),
+            ["dpkg", "--install", deb] => self.install(deb, false),
             ["dpkg-query", "-W", "-f=${Status}", package] => {
-                if self.installed.contains(package) {
+                if self.unconfigured && *package == "kbf" {
+                    ok("install ok unpacked")
+                } else if self.installed.contains(package) {
                     ok("install ok installed")
                 } else {
                     fail("")
@@ -185,16 +220,22 @@ impl World {
                 for path in held {
                     self.present.remove(&path);
                 }
+                self.installed.remove("kbf-installer");
+                self.installer_purged = true;
                 if self.is(Defect::PurgeTakesKbfFiles) {
                     self.present.clear();
                 }
                 ok("")
             }
-            ["dpkg", "--audit"] => ok(""),
+            ["dpkg", "--audit"] => ok(if self.unconfigured {
+                "The following packages have been unpacked but not yet configured:\n kbf"
+            } else {
+                ""
+            }),
             ["systemd-sysusers"] | ["systemd-tmpfiles", "--create"] => ok(""),
             ["id", "-u", user] => {
                 let at = USERS.iter().position(|u| u == user).expect("a known user");
-                let renumbered = self.is(Defect::UsersRenumbered) && self.installed.len() == 1;
+                let renumbered = self.is(Defect::UsersRenumbered) && self.installer_purged;
                 let base = self.uid_base + if renumbered { 100 } else { 0 };
                 ok(&format!("{}\n", base + at as u32))
             }
@@ -290,10 +331,11 @@ fn refused(result: Result<Vec<String>, Error>) -> Vec<String> {
     }
 }
 
-/// Asserts that the upgrade is made twice, in a container of its own each, by apt and by dpkg;
-/// that in each the old installer and the old kbf are installed first and the new kbf over them,
-/// then the old installer purged; and that a host where every step holds is accepted with one
-/// line saying what was shown.
+/// Asserts that the upgrade is made three ways, in a container of its own each (apt and a plain
+/// dpkg over the old installer and kbf, a plain dpkg over the old kbf alone); that in each the old
+/// debs are installed first and the new kbf over them, with no force flag, then the old installer
+/// purged where there is one; and that a host where every step holds is accepted with one line
+/// saying what was shown.
 #[test]
 fn a_host_that_hands_its_files_to_the_new_kbf_and_keeps_its_users_passes() {
     let (result, world) = upgrade("good", Defect::None);
@@ -310,40 +352,33 @@ fn a_host_that_hands_its_files_to_the_new_kbf_and_keeps_its_users_passes() {
             l.contains("apt-get") || l.contains("dpkg --install") || l.contains("dpkg --purge")
         })
         .collect();
+    let apt = |deb: &str| format!("apt-get -y --allow-downgrades install /var/tmp/{deb}");
     let want = [
+        ("c1-apt", apt("kbf-installer-old.deb")),
+        ("c1-apt", apt("kbf-old.deb")),
+        ("c1-apt", apt("kbf-new.deb")),
+        ("c1-apt", "dpkg --purge kbf-installer".to_owned()),
+        ("c1-dpkg", apt("kbf-installer-old.deb")),
+        ("c1-dpkg", apt("kbf-old.deb")),
+        ("c1-dpkg", "dpkg --install /var/tmp/kbf-new.deb".to_owned()),
+        ("c1-dpkg", "dpkg --purge kbf-installer".to_owned()),
+        ("c1-dpkg-without-installer", apt("kbf-old.deb")),
         (
-            "c1-apt",
-            "apt-get -y --allow-downgrades install /var/tmp/kbf-installer-old.deb",
+            "c1-dpkg-without-installer",
+            "dpkg --install /var/tmp/kbf-new.deb".to_owned(),
         ),
-        (
-            "c1-apt",
-            "apt-get -y --allow-downgrades install /var/tmp/kbf-old.deb",
-        ),
-        (
-            "c1-apt",
-            "apt-get -y --allow-downgrades install /var/tmp/kbf-new.deb",
-        ),
-        ("c1-apt", "dpkg --purge kbf-installer"),
-        (
-            "c1-dpkg",
-            "apt-get -y --allow-downgrades install /var/tmp/kbf-installer-old.deb",
-        ),
-        (
-            "c1-dpkg",
-            "apt-get -y --allow-downgrades install /var/tmp/kbf-old.deb",
-        ),
-        (
-            "c1-dpkg",
-            "dpkg --install --force-breaks /var/tmp/kbf-new.deb",
-        ),
-        ("c1-dpkg", "dpkg --purge kbf-installer"),
     ];
     assert_eq!(steps.len(), want.len(), "{steps:?}");
     for (step, (container, command)) in steps.iter().zip(want) {
         assert_eq!(**step, format!("exec {container} {command}"));
     }
-    // The three debs are copied into each container before anything runs in it.
-    for container in ["c1-apt", "c1-dpkg"] {
+    // The debs are copied into each container before anything runs in it: all three where the
+    // host has the old installer, and two where it has not.
+    for (container, debs) in [
+        ("c1-apt", 3),
+        ("c1-dpkg", 3),
+        ("c1-dpkg-without-installer", 2),
+    ] {
         let first_exec = world
             .log
             .iter()
@@ -353,7 +388,7 @@ fn a_host_that_hands_its_files_to_the_new_kbf_and_keeps_its_users_passes() {
             .iter()
             .filter(|l| l.starts_with("cp ") && l.contains(&format!(" {container}:")))
             .count();
-        assert_eq!(copies, 3, "{container}: {:?}", world.log);
+        assert_eq!(copies, debs, "{container}: {:?}", world.log);
         // Each container and its image are removed after its run.
         assert!(
             world.log.contains(&format!("rm -f {container}")),
@@ -383,24 +418,67 @@ fn files_that_stay_with_the_old_installer_are_refused() {
     );
 }
 
-/// Asserts that an installer left installed beside the new kbf is refused: the package
-/// manager is to remove what the new package breaks.
+/// Asserts that a new deb that `Breaks` the installer is refused where a plain `dpkg --install`
+/// meets it (a host that has the installer, which is where `--migrate-to-package` starts), and
+/// that apt, which removes the installer instead, is not the leg that says so.
 #[test]
-fn an_installer_that_is_still_installed_after_the_upgrade_is_refused() {
-    let (result, _) = upgrade("stays", Defect::InstallerStays);
+fn a_deb_that_breaks_the_installer_is_refused_by_a_plain_dpkg() {
+    let (result, _) = upgrade("breaks", Defect::BreaksTheInstaller);
     let problems = refused(result);
     assert!(
-        problems
-            .iter()
-            .any(|p| p == "apt: kbf-installer is still installed beside the new kbf"),
+        problems.iter().any(|p| p.starts_with(
+            "dpkg: installing the new kbf failed: dpkg: regarding /var/tmp/kbf-new.deb containing kbf"
+        )),
         "{problems:?}"
     );
     assert!(
         problems
             .iter()
-            .any(|p| p == "apt: /usr/bin/kbf-installer is still there after the upgrade"),
+            .all(|p| !p.starts_with("apt: installing the new kbf failed")),
         "{problems:?}"
     );
+}
+
+/// Asserts that a new deb that `Depends` on `crun` is refused on the host that has only the old
+/// `kbf` deb (and so no `crun`), where a plain `dpkg --install` leaves the package unpacked and
+/// unconfigured, and that the host that has the installer's dependencies is not the leg that
+/// says so.
+#[test]
+fn a_deb_that_depends_on_crun_is_refused_where_the_host_lacks_it() {
+    let (result, _) = upgrade("depends", Defect::DependsOnCrun);
+    let problems = refused(result);
+    assert!(
+        problems.iter().any(|p| p.starts_with(
+            "dpkg-without-installer: installing the new kbf failed: dpkg: error processing package kbf"
+        )),
+        "{problems:?}"
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.starts_with("dpkg-without-installer: kbf is \"install ok unpacked\"")),
+        "{problems:?}"
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.starts_with("dpkg-without-installer: dpkg --audit after the upgrade: ")),
+        "{problems:?}"
+    );
+}
+
+/// Asserts that the host that is meant to lack `crun` and `uidmap` having `crun` is refused before
+/// the upgrade: the leg would show nothing.
+#[test]
+fn a_host_that_already_has_crun_cannot_show_the_package_needs_nothing() {
+    let (result, world) = upgrade("crun-there", Defect::CrunPreinstalled);
+    let problems = refused(result);
+    assert!(
+        problems.iter().any(|p| p
+            == "dpkg-without-installer: crun is installed before the upgrade, so the test cannot show the new package needs nothing"),
+        "{problems:?}"
+    );
+    let _ = world;
 }
 
 /// Asserts that purging the old installer's record taking a file the new kbf owns is refused,

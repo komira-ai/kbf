@@ -12,9 +12,11 @@
 //!   is not packaged;
 //! - [`config`] renders a list as the nfpm configuration, with the dependencies as
 //!   constants here (never Podman, never Envoy), no maintainer script, every file
-//!   `root:root`, and no time (nfpm takes it from `SOURCE_DATE_EPOCH`). The deb replaces and
-//!   breaks every `kbf-installer` older than [`INSTALLER_RETIRED_FROM`]
-//!   ([`KBF_DEB_REPLACES`], [`KBF_DEB_BREAKS`]): the files above were its files;
+//!   `root:root`, and no time (nfpm takes it from `SOURCE_DATE_EPOCH`). The package `Depends` on
+//!   nothing: a host that updates it with a plain `dpkg --install` (no apt, no resolution) must be
+//!   able to configure it. The deb replaces every `kbf-installer` older than
+//!   [`INSTALLER_RETIRED_FROM`] ([`KBF_DEB_REPLACES`]): the files above were its files. It does not
+//!   `Break` it, which would make that same plain `dpkg --install` refuse on a host that has it;
 //! - [`files`] lists the files of the retired installer's package for `installer-tarball`
 //!   (the payload of `packaging/install.sh`), which no release publishes any more;
 //! - [`listing`] renders the same list as the file the install test checks the
@@ -47,21 +49,17 @@ pub const KBF_UNITS: [&str; 5] = [
     "kbf-storage.service",
 ];
 /// The first version no `kbf-installer` package has: every deb that was published is
-/// `0.1.0+<commit>`. The deb of `kbf` replaces and breaks the installer packages below it, so
-/// that a later package of that name (there is none) would not be.
+/// `0.1.0+<commit>`. The deb of `kbf` replaces the installer packages below it, so that a later
+/// package of that name (there is none) would not be.
 pub const INSTALLER_RETIRED_FROM: &str = "0.1.1";
 /// What the deb of the `kbf` package `Replaces`: the `kbf-installer` package of every
 /// published version. The units of the modes, `kbf.slice`, the trust files and the needrestart
 /// drop-in were files of its deb, and dpkg refuses to unpack `kbf` over files another package
-/// owns unless `kbf` says it replaces that package; with it, the files change hands and the
-/// installer can be removed without taking them. The rpm names nothing: its only form,
+/// owns unless `kbf` says it replaces that package; with it, a plain `dpkg --install` of `kbf`
+/// unpacks over the installer's files, which change hands, and the installer stays installed (with
+/// the rest of its files) until an operator purges it, taking none of them. The rpm names nothing: its only form,
 /// `Obsoletes`, would remove the installer, and no rpm is published.
 pub const KBF_DEB_REPLACES: [&str; 1] = ["kbf-installer (<< 0.1.1)"];
-/// What the deb of the `kbf` package `Breaks`: the same packages. `Replaces` alone lets both be
-/// installed, with the installer's other files (its binary, its proxy units) beside a `kbf`
-/// that owns the rest; `Breaks` makes the package manager remove the installer when `kbf` is
-/// installed over it. Removing a package keeps the users and the directories `kbf` now owns.
-pub const KBF_DEB_BREAKS: [&str; 1] = ["kbf-installer (<< 0.1.1)"];
 /// Where the unit files go.
 pub const UNIT_DIR: &str = "/usr/lib/systemd/system";
 /// The one packaged unit that is not a `kbf-*.service` or `kbf-*.socket`: the slice
@@ -109,9 +107,14 @@ pub fn unit_accounts(text: &str) -> Vec<(&'static str, String)> {
     }
     found
 }
-/// The `Depends` of the deb of `kbf`. (They were the installer's: `kbf` is now the one package a
-/// host needs, and the installer no longer pulls them in.)
-pub const DEB_DEPENDS: [&str; 4] = ["crun", "uidmap", "systemd", "ca-certificates"];
+/// The `Recommends` of the deb of `kbf` (they were the installer's `Depends`). Not `Depends`: a
+/// host updates this package with a plain `dpkg --install`, which resolves nothing, so a
+/// dependency a host lacks would leave `kbf` unpacked and unconfigured and then undone. `crun`
+/// and `uidmap` are the container driver's, and its preflight names `crun` when it is missing;
+/// `systemd` runs the units and `ca-certificates` is what the host's downloads verify with, and
+/// any host that runs these units has them, but a recommendation cannot fail an install where a
+/// dependency can.
+pub const DEB_RECOMMENDS: [&str; 4] = ["crun", "uidmap", "systemd", "ca-certificates"];
 /// The `Suggests` of the deb: a Postgres server, for a frontend or all-in-one host that keeps
 /// its state on the host. A suggestion, not a `Depends` or `Recommends`: node hosts keep no
 /// state in Postgres, and apt installs recommended packages by default. `setup` refuses a
@@ -119,8 +122,8 @@ pub const DEB_DEPENDS: [&str; 4] = ["crun", "uidmap", "systemd", "ca-certificate
 pub const DEB_SUGGESTS: [&str; 1] = ["postgresql"];
 /// The `Suggests` of the rpm.
 pub const RPM_SUGGESTS: [&str; 1] = ["postgresql-server"];
-/// The `Requires` of the rpm: Fedora's `uidmap` is `shadow-utils`.
-pub const RPM_DEPENDS: [&str; 4] = ["crun", "shadow-utils", "systemd", "ca-certificates"];
+/// The `Recommends` of the rpm: Fedora's `uidmap` is `shadow-utils`.
+pub const RPM_RECOMMENDS: [&str; 4] = ["crun", "shadow-utils", "systemd", "ca-certificates"];
 
 /// The lines of a YAML list of the strings `names`, each at `indent`.
 fn list(names: &[&str], indent: &str) -> String {
@@ -134,13 +137,14 @@ fn list(names: &[&str], indent: &str) -> String {
 const DESCRIPTION: &str =
     "The kbf build farm runtime, the systemd units of its modes, and what they run with.";
 
-/// The `depends`, `suggests` and `overrides` keys of the configuration, as lines.
+/// The `recommends`, `suggests` and `overrides` keys of the configuration, as lines (there is no
+/// `depends`).
 fn relations() -> String {
     format!(
-        "depends:\n{}suggests:\n{}overrides:\n  rpm:\n    depends:\n{}    suggests:\n{}  deb:\n    replaces:\n{}",
-        list(&DEB_DEPENDS, "  "),
+        "recommends:\n{}suggests:\n{}overrides:\n  rpm:\n    recommends:\n{}    suggests:\n{}  deb:\n    replaces:\n{}",
+        list(&DEB_RECOMMENDS, "  "),
         list(&DEB_SUGGESTS, "  "),
-        list(&RPM_DEPENDS, "      "),
+        list(&RPM_RECOMMENDS, "      "),
         list(&RPM_SUGGESTS, "      "),
         list(&KBF_DEB_REPLACES, "      "),
     )
@@ -447,7 +451,7 @@ pub fn config(entries: &[Entry], platform: Platform, version: &str) -> String {
          homepage: \"https://github.com/komira-ai/kbf\"\n\
          license: \"Apache-2.0\"\n\
          {relations}\
-         deb:\n  compression: \"gzip\"\n  breaks:\n{breaks}\
+         deb:\n  compression: \"gzip\"\n\
          rpm:\n  compression: \"gzip\"\n  buildhost: {host}\n\
          contents:\n",
         name = quoted(KBF_NAME),
@@ -455,7 +459,6 @@ pub fn config(entries: &[Entry], platform: Platform, version: &str) -> String {
         version = quoted(version),
         description = quoted(DESCRIPTION),
         relations = relations(),
-        breaks = list(&KBF_DEB_BREAKS, "    "),
         host = quoted(BUILD_HOST),
     );
     for e in entries {

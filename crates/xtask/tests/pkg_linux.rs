@@ -110,8 +110,8 @@ fn the_stub_prints_its_arguments_and_exits_zero() {
 
 /// Asserts that `pkg-config` writes the configuration and the listing of the `kbf` package in
 /// the output directory: the binary, the five mode units, the slice, the sysusers and tmpfiles
-/// files, the needrestart drop-in and the three trust files, the dependencies of the deb and
-/// the rpm, the replacement and the break of `kbf-installer` in the deb only, and none of the
+/// files, the needrestart drop-in and the three trust files, the recommendations of the deb
+/// and the rpm (no dependency), the replacement of `kbf-installer` in the deb only (no break), and none of the
 /// retired installer's files.
 #[test]
 fn pkg_config_writes_the_kbf_package() {
@@ -123,14 +123,14 @@ fn pkg_config_writes_the_kbf_package() {
     assert!(yaml.contains("dst: \"/usr/bin/kbf\""), "{yaml}");
     assert!(
         yaml.contains(
-            "depends:\n  - \"crun\"\n  - \"uidmap\"\n  - \"systemd\"\n  - \"ca-certificates\"\n"
+            "recommends:\n  - \"crun\"\n  - \"uidmap\"\n  - \"systemd\"\n  - \"ca-certificates\"\n"
         ),
         "{yaml}"
     );
+    assert!(!yaml.contains("depends"), "{yaml}");
     let replaces = "  deb:\n    replaces:\n      - \"kbf-installer (<< 0.1.1)\"\n";
     assert!(yaml.contains(replaces), "{yaml}");
-    let breaks = "deb:\n  compression: \"gzip\"\n  breaks:\n    - \"kbf-installer (<< 0.1.1)\"\n";
-    assert!(yaml.contains(breaks), "{yaml}");
+    assert!(!yaml.contains("breaks"), "{yaml}");
     let listing = std::fs::read_to_string(dir.join("out/listing.txt")).expect("listing");
     assert!(listing.contains(" 0755 /usr/bin/kbf "), "{listing}");
     for unit in [
@@ -432,13 +432,12 @@ fn tgz(files: &[(&str, u32, &[u8])]) -> Vec<u8> {
     tar.into_inner().expect("tar").finish().expect("gzip")
 }
 
-/// The control file of a good `kbf` deb: the dependencies, the suggestion, and the replacement
-/// and the break of the old installer.
+/// The control file of a good `kbf` deb: the recommendations, the suggestion, and the replacement
+/// of the old installer (no dependency, no break).
 const KBF_CONTROL: &[u8] = b"Package: kbf\nVersion: 0.1.0\nArchitecture: amd64\n\
-                             Depends: crun, uidmap, systemd, ca-certificates\n\
+                             Recommends: crun, uidmap, systemd, ca-certificates\n\
                              Suggests: postgresql\n\
-                             Replaces: kbf-installer (<< 0.1.1)\n\
-                             Breaks: kbf-installer (<< 0.1.1)\n";
+                             Replaces: kbf-installer (<< 0.1.1)\n";
 
 /// A deb as nfpm writes the `kbf` package, holding `kbf`, the unit of every mode, the slice, the
 /// sysusers, tmpfiles and needrestart files, and `gh` and the trust files for `source_ref`.

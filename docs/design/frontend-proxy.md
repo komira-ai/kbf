@@ -58,10 +58,9 @@ sections that described the removed machinery are not reused.
   read the secret it writes. The root helper keeps its "no socket, no network" property, and the
   proxy and the helper exchange nothing.
 - **Public address.** The packaged `kbf-proxy.socket` listens on port 8980. `[proxy] listen` in
-  `installer.toml` moves it: `kbf-installer setup` writes the drop-in
-  `kbf-proxy.socket.d/listen.conf` (empty `ListenStream=`, then the address) and never restarts
-  the socket; the operator runs `systemctl daemon-reload` and `systemctl restart
-  kbf-proxy.socket`. The proxy itself ignores the key: it takes the socket systemd hands it.
+  `installer.toml` moved it: `kbf-installer setup` wrote the drop-in
+  `kbf-proxy.socket.d/listen.conf` (empty `ListenStream=`, then the address) and never restarted
+  the socket. No release ships the socket now, and `setup` writes no drop-in. The proxy itself ignores the key: it takes the socket systemd hands it.
 - **The identity secret.** The proxy writes a 32-byte file under `/run/kbf-proxy/` (tmpfs, so per
   boot; `RuntimeDirectoryPreserve=yes`, so it survives a restart of the proxy). A frontend is
   given the file with `--proxy-auth-file` and reads it when it starts.

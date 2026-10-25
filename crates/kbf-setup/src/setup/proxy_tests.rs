@@ -25,11 +25,8 @@ fn systemctl(exec: &FakeExec) -> Vec<String> {
         .collect()
 }
 
-/// The units a frontend host is set up with: its own and the installer's, and no proxy unit.
-const FRONTEND_UNITS: [&str; 2] = [
-    "run /usr/bin/systemctl enable -- kbf-frontend.service",
-    "run /usr/bin/systemctl enable --now -- kbf-installer.service",
-];
+/// The units a frontend host is set up with: its own, and no proxy unit and no installer's.
+const FRONTEND_UNITS: [&str; 1] = ["run /usr/bin/systemctl enable -- kbf-frontend.service"];
 
 /// Asserts that a frontend host that has no `[proxy]` table gets none, and the unit of a frontend
 /// and not a proxy's: setup writes no proxy table and enables no proxy unit.

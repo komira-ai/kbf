@@ -6,12 +6,14 @@
 //! The deb is opened ([`crate::pkg_asset::open`]) and refused unless:
 //!
 //! - its control file says the architecture of `--platform`, the package `kbf`, the
-//!   dependencies and suggestions of [`crate::pkg_linux`] and none on `kbf-installer`, and
-//!   that it `Replaces` and `Breaks` the `kbf-installer` packages older than the first
-//!   version that has none ([`KBF_DEB_REPLACES`], [`KBF_DEB_BREAKS`]): the units, `kbf.slice`,
-//!   the sysusers and tmpfiles files, the needrestart drop-in and the trust files were files
-//!   of the installer's deb, and dpkg refuses to unpack a package over files another package
-//!   owns, and keeps both packages' files apart, unless the control file says so;
+//!   recommendations and suggestions of [`crate::pkg_linux`], no `Depends`, `Pre-Depends`,
+//!   `Breaks` or `Conflicts` at all (a host updates it with a plain `dpkg --install`, which
+//!   resolves nothing: a dependency the host lacks leaves it unconfigured, and a `Breaks` of the
+//!   installer makes dpkg refuse on a host that has it), and that it `Replaces` the
+//!   `kbf-installer` packages older than the first version that has none
+//!   ([`KBF_DEB_REPLACES`]): the units, `kbf.slice`, the sysusers and tmpfiles files, the
+//!   needrestart drop-in and the trust files were files of the installer's deb, and dpkg refuses
+//!   to unpack a package over files another package owns unless the control file says so;
 //! - `usr/bin/kbf` is byte for byte the `kbf` inside `--kbf-tarball`, the tarball
 //!   `build-commit check-asset` has already shown names the commit: the deb carries the
 //!   bytes the build identified, not others. It is mode 0755;
@@ -37,8 +39,8 @@ use crate::Error;
 use crate::package::Platform;
 use crate::pkg_asset::{self, Mode};
 use crate::pkg_linux::{
-    DEB_DEPENDS, DEB_SUGGESTS, KBF_DEB_BREAKS, KBF_DEB_REPLACES, KBF_NAME, KBF_PATH, KBF_UNITS,
-    NAME, NEEDRESTART_PATH, SLICE, SYSUSERS_PATH, TMPFILES_PATH, TRUST_DIR, TRUST_FILES, UNIT_DIR,
+    DEB_RECOMMENDS, DEB_SUGGESTS, KBF_DEB_REPLACES, KBF_NAME, KBF_PATH, KBF_UNITS,
+    NEEDRESTART_PATH, SLICE, SYSUSERS_PATH, TMPFILES_PATH, TRUST_DIR, TRUST_FILES, UNIT_DIR,
 };
 
 /// The file name of the asset.
@@ -70,14 +72,6 @@ fn squashed(text: &str) -> String {
 /// Whether the comma-separated control field value `list` holds the entry `want`.
 fn holds(list: &str, want: &str) -> bool {
     list.split(',').any(|d| squashed(d) == squashed(want))
-}
-
-/// Whether the control field value `list` has an entry that names the package `package`,
-/// whatever version or architecture the entry asks for (`pkg (>= 1)`, `pkg:any`) and whether
-/// it is one of several alternatives (`other | pkg`).
-fn names(list: &str, package: &str) -> bool {
-    list.split([',', '|'])
-        .any(|entry| entry.trim().split(['(', ':', ' ']).next() == Some(package))
 }
 
 /// The path of the file `dst` of the package in a data tarball (no leading slash).
@@ -120,28 +114,19 @@ pub fn problems(deb: &[u8], c: &Check) -> Result<Vec<String>, Error> {
             package.unwrap_or("(none)")
         ));
     }
-    let depends = field(&opened.control, "Depends: ").unwrap_or_default();
-    if names(depends, NAME) {
-        problems.push(format!(
-            "control says Depends {depends:?}, but the kbf package depends on no {NAME:?}"
-        ));
-    }
-    for want in DEB_DEPENDS {
-        if !holds(depends, want) {
+    for name in ["Depends", "Pre-Depends", "Breaks", "Conflicts"] {
+        let got = field(&opened.control, &format!("{name}: ")).unwrap_or_default();
+        if !got.trim().is_empty() {
             problems.push(format!(
-                "control says Depends {depends:?}, which does not hold {want:?}"
+                "control says {name} {got:?}, but the kbf package has none: a plain `dpkg --install` resolves nothing"
             ));
         }
     }
-    let suggests = field(&opened.control, "Suggests: ").unwrap_or_default();
-    for want in DEB_SUGGESTS {
-        if !holds(suggests, want) {
-            problems.push(format!(
-                "control says Suggests {suggests:?}, which does not hold {want:?}"
-            ));
-        }
-    }
-    for (name, wanted) in [("Replaces", KBF_DEB_REPLACES), ("Breaks", KBF_DEB_BREAKS)] {
+    for (name, wanted) in [
+        ("Recommends", &DEB_RECOMMENDS[..]),
+        ("Suggests", &DEB_SUGGESTS[..]),
+        ("Replaces", &KBF_DEB_REPLACES[..]),
+    ] {
         let got = field(&opened.control, &format!("{name}: ")).unwrap_or_default();
         for want in wanted {
             if !holds(got, want) {
