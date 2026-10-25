@@ -1,16 +1,21 @@
 //! The node binding and the deny list of the worker listener (issue #79), without a
 //! network: certificates are made here and handed over as DER.
 
-use std::path::PathBuf;
+#[path = "support/hooked.rs"]
+mod hooked;
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use hooked::Hooked;
 use kbf_map::DenyEntry;
-use kbf_server::identity::{Denied, DenyList, DenyListError, PeerCert, Peers};
+use kbf_server::identity::{
+    DENY_SNAPSHOT_SWEEPS, Denied, DenyList, DenyListError, PeerCert, Peers,
+};
 use kbf_server::members::{Members, MembershipConfig};
-use kbf_state::fake::{Fake, Flaw};
-use kbf_state::{Cond, ManualClock, Store, Txn};
+use kbf_state::{Cond, Store, Txn};
 use rcgen::{CertificateParams, DnType, KeyPair, SanType, SerialNumber};
 use tonic::Code;
 
@@ -409,19 +414,22 @@ async fn a_list_renamed_over_the_old_one_is_read_even_at_the_same_size() {
     assert!(list.current().await.is_err());
 }
 
-/// Members over an empty store, and the store, for the tests of the `deny/` rows.
-fn members() -> (Arc<Fake>, Arc<Members>) {
-    let fake = Arc::new(Fake::with_flaw(
-        Arc::new(ManualClock::default()),
-        Flaw::None,
-    ));
+const TTL: Duration = Duration::from_secs(60);
+/// One membership sweep: the sweeper refreshes every beat.
+const BEAT: Duration = Duration::from_secs(20);
+
+/// Members over an empty store, refreshed once (as the sweeper does at start), and the
+/// store, for the tests of the `deny/` rows.
+fn members() -> (Arc<Hooked>, Arc<Members>) {
+    let store = Hooked::new();
     let config = MembershipConfig {
-        ttl: Duration::from_secs(60),
-        dwell: Duration::from_secs(60),
+        ttl: TTL,
+        dwell: TTL,
         replication: 2,
     };
-    let members = Arc::new(Members::new(Arc::clone(&fake) as Arc<dyn Store>, config));
-    (fake, members)
+    let members = Arc::new(Members::new(Arc::clone(&store) as Arc<dyn Store>, config));
+    members.refresh().expect("the first refresh");
+    (store, members)
 }
 
 fn rows_only(members: &Arc<Members>) -> Peers {
@@ -434,14 +442,14 @@ fn rows_only(members: &Arc<Members>) -> Peers {
 
 /// A revoked serial is refused and an unrelated node is admitted, from the store's rows
 /// alone (no file); the same node under another serial is not refused by that serial; a row
-/// written after the peers were built is seen at the next check, and one taken off
-/// readmits.
+/// written and refreshed (as a revoke and `POST /v1/denied` do before they answer) is seen at
+/// the next check, and one taken off readmits.
 ///
 /// Catches: rows read once at start, rows ignored beside a deny file, and a serial row
 /// that names the node and not the certificate.
 #[tokio::test]
 async fn the_stores_deny_rows_refuse_a_serial_and_a_node_at_every_check() {
-    let (_fake, members) = members();
+    let (_store, members) = members();
     let peers = rows_only(&members);
     let revoked = PeerCert::from_der(&cert(vec![dns("node-a")], "x", &[0x0a, 0x1b])).expect("cert");
     let reissued =
@@ -453,6 +461,7 @@ async fn the_stores_deny_rows_refuse_a_serial_and_a_node_at_every_check() {
         .parse()
         .expect("entry");
     members.deny(&serial, "leaked").expect("deny");
+    members.refresh().expect("refresh");
     let refused = peers
         .admit(Some(&revoked), "node-a")
         .await
@@ -467,14 +476,37 @@ async fn the_stores_deny_rows_refuse_a_serial_and_a_node_at_every_check() {
     assert!(peers.admit(Some(&other), "node-b").await.is_ok());
 
     assert!(members.allow(&serial).expect("allow"));
+    members.refresh().expect("refresh");
     assert!(peers.admit(Some(&revoked), "node-a").await.is_ok());
 
     let node: DenyEntry = "node node-a".parse().expect("entry");
     members.deny(&node, "revoked").expect("deny");
+    members.refresh().expect("refresh");
     for who in [&revoked, &reissued] {
         let refused = peers.admit(Some(who), "node-a").await.expect_err("node");
         assert_eq!(refused.code(), Code::PermissionDenied);
     }
+    assert!(peers.admit(Some(&other), "node-b").await.is_ok());
+}
+
+/// A node revoked behind the farm's proxy, where there is no certificate and the proxy
+/// forwards a node id, is refused by its `node` row.
+#[tokio::test]
+async fn a_proxied_node_is_refused_by_the_stores_node_row() {
+    let (_store, members) = members();
+    let peers = rows_only(&members);
+    let proxied = PeerCert::proxied("node-a", &[]);
+    let other = PeerCert::proxied("node-b", &[]);
+    assert!(peers.admit(Some(&proxied), "node-a").await.is_ok());
+    members
+        .deny(&"node node-a".parse().expect("entry"), "revoked")
+        .expect("deny");
+    members.refresh().expect("refresh");
+    let refused = peers
+        .admit(Some(&proxied), "node-a")
+        .await
+        .expect_err("revoked");
+    assert_eq!(refused.code(), Code::PermissionDenied);
     assert!(peers.admit(Some(&other), "node-b").await.is_ok());
 }
 
@@ -484,7 +516,7 @@ async fn the_stores_deny_rows_refuse_a_serial_and_a_node_at_every_check() {
 /// Catches: the rows replacing the file's entries (or the file replacing the rows).
 #[tokio::test]
 async fn the_file_and_the_rows_both_refuse() {
-    let (_fake, members) = members();
+    let (_store, members) = members();
     let (_dir, path) = scratch("both.deny");
     std::fs::write(&path, "node node-a\n").expect("write");
     let peers = Peers::Certified {
@@ -495,6 +527,7 @@ async fn the_file_and_the_rows_both_refuse() {
     members
         .deny(&"node node-b".parse().expect("entry"), "revoked")
         .expect("deny");
+    members.refresh().expect("refresh");
     let a = peer(vec![dns("node-a")]);
     let b = peer(vec![dns("node-b")]);
     let c = peer(vec![dns("node-c")]);
@@ -505,35 +538,107 @@ async fn the_file_and_the_rows_both_refuse() {
     assert!(peers.admit(Some(&c), "node-c").await.is_ok());
 }
 
-/// Rows that cannot be read refuse every check UNAVAILABLE, the node that would have been
-/// admitted included, and a file that would have refused does not turn that into
-/// PERMISSION_DENIED.
+/// Checks read no row of the store: after the refresh, many messages and blob calls cost
+/// no read of `deny/`.
 ///
-/// Catches: a deny source that cannot be read admitting (fail open).
+/// Catches: a store query (and a pooled connection) per heartbeat, result and blob call.
 #[tokio::test]
-async fn deny_rows_that_cannot_be_read_admit_nobody() {
-    let (fake, members) = members();
-    // A row that spells no entry: the list is not guessed at.
-    let written = fake
+async fn admitting_reads_no_deny_row_from_the_store() {
+    let (store, members) = members();
+    let peers = rows_only(&members);
+    let a = peer(vec![dns("node-a")]);
+    let reads = store.count("deny/");
+    for _ in 0..50 {
+        peers.admit(Some(&a), "node-a").await.expect("admitted");
+    }
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    members.refresh().expect("refresh");
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "a refresh reads the rows once"
+    );
+}
+
+/// A refresh that fails keeps the last snapshot in use for three sweeps, still refusing
+/// whom it refused; after that every caller is refused UNAVAILABLE, until a refresh reads the
+/// rows again. A corrupt `deny/` row is such a failure; deleting it repairs.
+///
+/// Catches: one failed refresh ending every stream (no bounded staleness), a snapshot
+/// trusted for ever, and a corrupt row that is guessed around.
+#[tokio::test(start_paused = true)]
+async fn a_failing_refresh_serves_the_last_snapshot_for_three_sweeps_and_then_refuses_all() {
+    assert_eq!(DENY_SNAPSHOT_SWEEPS, 3);
+    let (store, members) = members();
+    let peers = rows_only(&members);
+    let (a, b) = (peer(vec![dns("node-a")]), peer(vec![dns("node-b")]));
+    members
+        .deny(&"node node-a".parse().expect("entry"), "revoked")
+        .expect("deny");
+    members.refresh().expect("refresh");
+
+    let written = store
         .txn(Txn::new().put("deny/bogus/x", b"?".to_vec(), Cond::Any))
         .expect("write the row");
-    assert!(written.is_ok(), "the row was written");
-    let peers = rows_only(&members);
-    for node in ["node-a", "node-b"] {
-        let refused = peers
-            .admit(Some(&peer(vec![dns(node)])), node)
-            .await
-            .expect_err("nobody is admitted");
+    assert!(written.is_ok());
+    members
+        .refresh()
+        .expect_err("a corrupt row fails the refresh");
+
+    tokio::time::advance(BEAT * 3 - Duration::from_secs(1)).await;
+    members.refresh().expect_err("still corrupt");
+    let refused = peers
+        .admit(Some(&a), "node-a")
+        .await
+        .expect_err("still refused");
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert!(
+        peers.admit(Some(&b), "node-b").await.is_ok(),
+        "within the bound"
+    );
+
+    tokio::time::advance(Duration::from_secs(2)).await;
+    for (who, node) in [(&a, "node-a"), (&b, "node-b")] {
+        let refused = peers.admit(Some(who), node).await.expect_err("too old");
         assert_eq!(refused.code(), Code::Unavailable, "{node}");
         assert!(
             !refused.message().contains("bogus"),
-            "the store's own text stays inside: {}",
+            "{}",
             refused.message()
         );
     }
-    let blob_style = peers
-        .admit(None, "node-a")
+
+    let gone = store
+        .txn(Txn::new().delete("deny/bogus/x", Cond::Any))
+        .expect("delete the row");
+    assert!(gone.is_ok());
+    members.refresh().expect("repaired");
+    assert!(peers.admit(Some(&b), "node-b").await.is_ok());
+    assert_eq!(
+        peers
+            .admit(Some(&a), "node-a")
+            .await
+            .expect_err("revoked")
+            .code(),
+        Code::PermissionDenied
+    );
+}
+
+/// Before any refresh has read the rows nobody is admitted.
+///
+/// Catches: a listener that admits on an empty list before its first refresh.
+#[tokio::test]
+async fn before_the_first_refresh_nobody_is_admitted() {
+    let store = Hooked::new();
+    let config = MembershipConfig {
+        ttl: TTL,
+        dwell: TTL,
+        replication: 2,
+    };
+    let members = Arc::new(Members::new(store as Arc<dyn Store>, config));
+    let refused = rows_only(&members)
+        .admit(Some(&peer(vec![dns("node-a")])), "node-a")
         .await
-        .expect_err("no peer either");
-    assert_eq!(blob_style.code(), Code::Unavailable);
+        .expect_err("no snapshot");
+    assert_eq!(refused.code(), Code::Unavailable);
 }

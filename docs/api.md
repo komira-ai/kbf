@@ -567,8 +567,9 @@ receives, which `GET /v1/members` does not show.
 **What it cuts.** The entry is applied to the storage nodes, the membership service and the
 worker listener: a daemon whose certificate or node is denied here is refused on its stream
 (`Hello`, `Heartbeat`, `Result`, ...), its open stream ends at its next message, and its blob
-calls on that listener are refused `PERMISSION_DENIED`. The listener reads these rows at every
-check beside `--worker-deny-list`; rows it cannot read refuse every check `UNAVAILABLE`. The
+calls on that listener are refused `PERMISSION_DENIED`. The listener checks against the membership's copy of these rows (refreshed by this call before
+it answers, and every beat) beside `--worker-deny-list`; when the copy is more than three sweeps
+old, every check is refused `UNAVAILABLE` (see Revocation, above). The
 file stays what it was: a list the listener alone reads, which takes effect without the state
 store. `GET /v1/denied` shows the list; `GET /v1/members` does not.
 
@@ -945,13 +946,25 @@ ended after 30 seconds and a TLS handshake after its own deadline.
 
 **Revocation is enforced (design section 8.3).** Revoking a node refuses its renewal at
 once and writes its deny rows (`POST /v1/enroll/nodes/{id}/revoke`, above). Storage reads them
-through the membership map, and the **worker listener reads them at every check** beside
-`--worker-deny-list`: a revoked node's `Hello`, and its `Heartbeat`, `Result`, `NodeStatus`,
-`MapRequest` and `UpdateStatus` on an open stream, its REAPI worker calls and its blob calls
-are refused `PERMISSION_DENIED`, and its open stream ends at its next message (a heartbeat at
-the latest). The revoke also refreshes the membership map before it answers, so storage
-follows at once and not at the next membership refresh. Rows that cannot be read refuse every
-worker-listener check `UNAVAILABLE`: nobody is admitted on a list that could not be read.
+through the membership map, and the **worker listener checks every call against the
+membership's in-memory copy of them** (no store read per call), beside `--worker-deny-list`:
+a revoked node's `Hello`, and its `Heartbeat`, `Result`, `NodeStatus`, `MapRequest` and
+`UpdateStatus` on an open stream, its REAPI worker calls and its blob calls are refused
+`PERMISSION_DENIED`, and its open stream ends at its next message (a heartbeat at the latest).
+The revoke refreshes that copy before it answers, so the worker listener and storage follow at
+once, and the membership sweeper refreshes it every beat (a third of `ttl`), so a row written
+by another frontend is seen within one sweep.
+
+**When the rows cannot be read.** A refresh that fails (the store down for a moment) leaves the
+last copy in use for three sweeps (`DENY_SNAPSHOT_SWEEPS` beats): callers it denied stay denied
+and the others are still admitted. After that, and before the first refresh after a start, every
+worker-listener check is refused `UNAVAILABLE`: nobody is admitted on a list that may be out of
+date. A corrupt `deny/` row (one whose key is not `deny/<serial|spki-sha256|node>/<value>`)
+makes every refresh fail, so three sweeps after it appears the worker listener refuses everyone,
+and the log says `membership refresh` failed. Repair: read the key from the log or list the
+`deny/` rows in the state store, delete the bad row (or re-add the entry with
+`POST /v1/denied`, after deleting it), and the next sweep readmits everyone not denied. A revoke
+whose refresh failed is enforced at the next successful sweep.
 A revoked node no longer keeps working until its certificate expires. Taking its rows off the
 deny list (`DELETE /v1/denied?entry=...`, one call per entry the revoke listed) readmits the
 node, but a revoked node's id is burned for enrollment. Behind `--proxy-auth-file` only the

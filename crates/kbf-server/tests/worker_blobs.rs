@@ -491,24 +491,23 @@ async fn a_node_certificate_reads_and_writes_blobs_on_the_worker_listener() {
 /// The `deny/` rows of the state store (what a node revocation through the enroll API
 /// writes, and `POST /v1/denied`) refuse blob calls on the worker listener from the next
 /// call on, by node and by serial, beside `--worker-deny-list`; a node they do not name
-/// goes on being served; and rows taken off readmit.
+/// goes on being served; and rows taken off readmit. The entries go in through the
+/// operator API, which refreshes the membership before it answers.
 ///
 /// Catches: a worker listener that reads only its file, so a revoked daemon keeps reading
 /// and writing blobs until its certificate expires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_state_stores_deny_rows_refuse_blob_calls_from_the_next_one_on() {
-    use kbf_map::DenyEntry;
-    use kbf_server::members::{Members, MembershipConfig};
-    use kbf_server::{EpochPolicy, StateStore, bind_server_with_state};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use kbf_server::api_client::OperatorClient;
+    use kbf_server::members::MembershipConfig;
+    use kbf_server::token::ApiToken;
+    use kbf_server::{Api, EpochPolicy, StateStore, bind_server_with_state};
     use kbf_state::fake::{Fake, Flaw};
     use kbf_state::{ManualClock, Store};
 
     let pki = Pki::new("rows");
-    let config = MembershipConfig {
-        ttl: std::time::Duration::from_secs(60),
-        dwell: std::time::Duration::from_secs(60),
-        replication: 2,
-    };
     let fake = Arc::new(Fake::with_flaw(
         Arc::new(ManualClock::default()),
         Flaw::None,
@@ -516,23 +515,49 @@ async fn the_state_stores_deny_rows_refuse_blob_calls_from_the_next_one_on() {
     let state = StateStore {
         store: Arc::clone(&fake) as Arc<dyn Store>,
         epoch: EpochPolicy::Keep,
-        members: config,
+        members: MembershipConfig {
+            ttl: std::time::Duration::from_secs(60),
+            dwell: std::time::Duration::from_secs(60),
+            replication: 2,
+        },
         history: None,
+    };
+    let token_file = pki.dir.join("api.token");
+    std::fs::write(&token_file, "kbf-test-token-0123456789abcdef0123456789\n").expect("token");
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    let api = Api {
+        listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        token: Some(ApiToken::from_file(&token_file).expect("a token")),
+        local_cache: None,
     };
     let listeners = pki.args(&[]).listeners().expect("listeners");
     let bound = bind_server_with_state(
         Arc::new(Cache::memory()),
         listeners,
-        None,
+        Some(api),
         kbf_auth::Policy::allow_all(),
         Some(state),
         pending(),
     )
     .expect("bind");
-    let worker = bound.worker;
+    let (worker, api_addr) = (bound.worker, bound.api.expect("the API"));
     tokio::spawn(async move { bound.serving.await.expect("serve") });
-    // Another handle on the same rows, as the enroll API's is.
-    let rows = Members::new(Arc::clone(&fake) as Arc<dyn Store>, config);
+    let operator = move |method: &'static str, entry: &'static str| {
+        let client = OperatorClient::new(
+            api_addr,
+            Some("kbf-test-token-0123456789abcdef0123456789".to_owned()),
+        );
+        tokio::task::spawn_blocking(move || {
+            let reply = if method == "POST" {
+                let body = format!(r#"{{"entry":"{entry}","reason":"revoked"}}"#);
+                client.post("/v1/denied", &body)
+            } else {
+                client.delete(&format!("/v1/denied?entry={}", entry.replace(' ', "%20")))
+            }
+            .expect("the API answers");
+            assert_eq!(reply.status, 200, "{}", reply.body);
+        })
+    };
 
     let (revoked, by_serial, unrelated) = (
         pki.node(&["node-1"], 21),
@@ -544,18 +569,25 @@ async fn the_state_stores_deny_rows_refuse_blob_calls_from_the_next_one_on() {
         pki.channel(worker, Some(&by_serial.identity)).await,
         pki.channel(worker, Some(&unrelated.identity)).await,
     ];
+    // The sweeper's first refresh, which gives the listener the rows, runs at start.
+    let mut served = false;
+    for _ in 0..100 {
+        if write(&channels[0], b"before").await.is_ok() {
+            served = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(served, "served once the first refresh has read the rows");
     for channel in &channels {
         write(channel, b"before")
             .await
             .expect("served before any row");
     }
 
-    let node: DenyEntry = "node node-1".parse().expect("entry");
-    let serial: DenyEntry = format!("serial {:x}", by_serial.serial)
-        .parse()
-        .expect("entry");
-    rows.deny(&node, "revoked").expect("deny");
-    rows.deny(&serial, "revoked").expect("deny");
+    operator("POST", "node node-1").await.expect("deny");
+    // 0x16 is the serial 22.
+    operator("POST", "serial 16").await.expect("deny");
     for channel in &channels[..2] {
         for code in [
             write(channel, b"after").await.expect_err("write").code(),
@@ -571,7 +603,7 @@ async fn the_state_stores_deny_rows_refuse_blob_calls_from_the_next_one_on() {
         .await
         .expect("an unrelated node is served");
 
-    assert!(rows.allow(&node).expect("allow"));
+    operator("DELETE", "node node-1").await.expect("allow");
     write(&channels[0], b"again").await.expect("readmitted");
     assert_eq!(
         write(&channels[1], b"again")
