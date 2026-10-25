@@ -790,3 +790,41 @@ async fn a_connected_daemons_lease_is_never_swept() {
     assert_eq!(rows(&store, "lease/"), 1);
     assert_eq!(farm.lock().intake.orphans_seen(), 0);
 }
+
+/// Asserts what the intake poll's look at the other frontends' daemons does: a node this
+/// frontend holds is not listed as another's, one whose stream has closed is (its session
+/// row is there), and an operation the scheduler refused after the unservable wait is no
+/// longer decided again.
+#[tokio::test(start_paused = true)]
+async fn the_poll_lists_a_closed_stream_as_remote_and_forgets_refused_operations() {
+    let store = Racing::new();
+    let farm = farm_over(&store);
+    let inbox = register(&farm, "node-a");
+    farm.intake();
+    assert!(farm.lock().intake.remote.is_empty(), "a held node");
+    drop(inbox);
+    farm.intake();
+    assert_eq!(farm.lock().intake.remote.len(), 1, "a closed stream");
+
+    let mut big = request(9);
+    big.resources = Resources::new(64_000, 1 << 30);
+    let ticket = farm
+        .submit(Submission {
+            request: big,
+            call: None,
+            described: Described::default(),
+            evidence: Default::default(),
+        })
+        .expect("queued");
+    farm.tick().await;
+    assert!(
+        !farm.lock().stuck.is_empty(),
+        "{:?}",
+        *ticket.stage.borrow()
+    );
+    tokio::time::sleep(kbf_sched::UNSERVABLE_WAIT + Duration::from_secs(1)).await;
+    farm.tick().await;
+    farm.intake();
+    assert!(matches!(*ticket.stage.borrow(), Stage::Done(_)));
+    assert!(farm.lock().stuck.is_empty());
+}
