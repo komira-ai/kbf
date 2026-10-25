@@ -11,17 +11,25 @@
 //! upload (`multipart.rs`): parts of [`part_size`] sent one at a time, each held in
 //! memory only while it is sent, and the upload aborted on any failure.
 //!
+//! Beyond the trait, [`S3Store`] has the calls an object used for coordination needs
+//! (`tagged.rs`): [`S3Store::head`] (size, entity tag, time of last write),
+//! [`S3Store::get_all`], [`S3Store::put_if_match`] (`If-Match`) and
+//! [`S3Store::list_stamped`] (a listing with the time of last write).
+//!
 //! Not built yet: TLS (an `https` endpoint is refused).
 
 #[cfg(feature = "testkit")]
 pub mod fake;
 mod multipart;
 mod sigv4;
+mod tagged;
+mod times;
 mod xml;
 
 pub use multipart::{
     MAX_PART_BYTES, MAX_PARTS, MIN_PART_BYTES, MULTIPART_THRESHOLD, PART_BYTES, part_size,
 };
+pub use tagged::{ObjectHead, StampedObject, StampedPage};
 
 use std::fmt;
 use std::future::Future;
@@ -47,10 +55,11 @@ use sigv4::{EMPTY_SHA256, Request, Signer, Utc};
 pub const WAIT_RETRY: Duration = Duration::from_millis(250);
 
 /// How many times a ranged read is sent again after its transport failed (not timed
-/// out): a connection the store, or the path to it, closed after the request went out
-/// ("connection closed before message completed") says nothing of the next one, and a
-/// pooled connection closed while idle fails this way. A read is idempotent. Three
-/// sends in all.
+/// out by kbf or by a limit of the client): a connection the store, or the path to it,
+/// closed after the request went out ("connection closed before message completed")
+/// says nothing of the next one, a pooled connection closed while idle fails this way,
+/// and so does one the kernel gave up on after the request went out (`ETIMEDOUT`,
+/// "Connection timed out", mid-body). A read is idempotent. Three sends in all.
 pub const READ_RETRIES: u32 = 2;
 
 /// The wait before the first resend of a read; each resend waits twice the one before.
@@ -59,16 +68,45 @@ const READ_RETRY_WAIT: Duration = Duration::from_millis(50);
 /// Whether a failed read may be sent again: it failed in transport and not by running
 /// out of time (a store that is `request_timeout` slow stays slow, and a resend would
 /// multiply the wait of a read that cannot succeed).
+///
+/// Two timeouts are not that. After the request went out, the kernel giving up on a
+/// dead connection (`ETIMEDOUT`) says nothing of the store, and a fresh connection may
+/// well answer; reqwest's `is_timeout` is true for it, as it is for any `io::Error` of
+/// kind `TimedOut` in the cause chain, so that chain is searched. Before the request
+/// went out (`is_connect`) every timeout stays refused: the client's connect limit also
+/// ends as such an `io::Error`, and a store that does not answer a connect in time is
+/// slow or down, not a dead connection. So are [`Stalled`] and the per-request limit
+/// this module sets on the client, which put no such `io::Error` in the chain.
 fn is_retryable(e: &ObjectStoreError) -> bool {
     match e {
         ObjectStoreError::Transport(cause) => {
-            !cause.is::<Stalled>()
-                && cause
-                    .downcast_ref::<reqwest::Error>()
-                    .is_none_or(|r| !r.is_timeout())
+            if cause.is::<Stalled>() {
+                return false;
+            }
+            match cause.downcast_ref::<reqwest::Error>() {
+                Some(r) if r.is_connect() => !r.is_timeout(),
+                Some(r) => os_timed_out(r) || !r.is_timeout(),
+                None => true,
+            }
         }
         _ => false,
     }
+}
+
+/// Whether an `io::Error` of kind `TimedOut` (the kernel's `ETIMEDOUT` on a dead
+/// connection) is anywhere in the causes of `e`.
+fn os_timed_out(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = e.source();
+    while let Some(err) = source {
+        if err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 /// A read that got no byte from the store for `request_timeout`: no answer, or a body
@@ -591,6 +629,19 @@ impl ObjectStore for S3Store {
         after: Option<&ListToken>,
         max_keys: PageSize,
     ) -> Result<ListPage, ObjectStoreError> {
+        let body = self.list_body(prefix, after, max_keys).await?;
+        xml::list_page(&body)
+    }
+}
+
+impl S3Store {
+    /// The body of the answer to one ListObjectsV2 request.
+    async fn list_body(
+        &self,
+        prefix: &KeyPrefix,
+        after: Option<&ListToken>,
+        max_keys: PageSize,
+    ) -> Result<Bytes, ObjectStoreError> {
         let mut query = vec![
             ("list-type", "2".to_owned()),
             ("prefix", prefix.as_str().to_owned()),
@@ -610,8 +661,7 @@ impl ObjectStore for S3Store {
         if resp.status() != StatusCode::OK {
             return Err(failure(resp).await);
         }
-        let body = resp.bytes().await.map_err(transport)?;
-        xml::list_page(&body)
+        resp.bytes().await.map_err(transport)
     }
 }
 
@@ -926,6 +976,128 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    /// The error reqwest gives for a response whose body delivers a few bytes and then
+    /// fails with `kind`, read as `get_range_once` reads one, wrapped as it wraps it.
+    async fn body_error(kind: std::io::ErrorKind) -> (ObjectStoreError, bool) {
+        struct Failing {
+            kind: std::io::ErrorKind,
+            sent: bool,
+        }
+        impl http_body::Body for Failing {
+            type Data = Bytes;
+            type Error = std::io::Error;
+            fn poll_frame(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+                let sent = std::mem::replace(&mut self.sent, true);
+                std::task::Poll::Ready(Some(if sent {
+                    Err(std::io::Error::from(self.kind))
+                } else {
+                    Ok(http_body::Frame::data(Bytes::from_static(b"part")))
+                }))
+            }
+        }
+        let body = reqwest::Body::wrap(Failing { kind, sent: false });
+        let mut resp = reqwest::Response::from(http::Response::new(body));
+        let first = resp.chunk().await.unwrap();
+        assert_eq!(first.as_deref(), Some(&b"part"[..]));
+        let e = resp.chunk().await.unwrap_err();
+        let timeout = e.is_timeout();
+        (transport(e), timeout)
+    }
+
+    /// Catches: a read whose connection the kernel timed out mid-body (`ETIMEDOUT`,
+    /// which reqwest also reports as `is_timeout`) never sent again, failing a large
+    /// download that a fresh connection would finish; and the same for a failure that
+    /// is no timeout at all being refused.
+    #[tokio::test]
+    async fn a_body_cut_by_an_os_level_timeout_is_resent() {
+        let (e, timeout) = body_error(std::io::ErrorKind::TimedOut).await;
+        assert!(timeout, "reqwest must call this a timeout: {e:?}");
+        assert!(is_retryable(&e));
+        let (e, timeout) = body_error(std::io::ErrorKind::ConnectionReset).await;
+        assert!(!timeout);
+        assert!(is_retryable(&e));
+    }
+
+    /// Catches: the client's own connect limit, which ends as an `io::Error` of kind
+    /// `TimedOut` in the chain, taken for a dead connection and sent again; and a
+    /// refused connection taken for a timeout.
+    // Linux drops a SYN when the accept queue is full; BSD and macOS may reset instead.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_connect_that_times_out_is_not_resent_but_a_refused_one_is() {
+        // A listener whose accept queue is full drops the next SYN: the connect hangs.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
+        let _listener = socket.listen(1).unwrap();
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let filler = tokio::net::TcpSocket::new_v4().unwrap();
+            if let Ok(Ok(c)) =
+                tokio::time::timeout(Duration::from_millis(200), filler.connect(addr)).await
+            {
+                held.push(c);
+            }
+        }
+        let client = client_builder(Duration::from_millis(100), POOL_IDLE_TIMEOUT)
+            .build()
+            .unwrap();
+        let e = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(e.is_connect(), "{e:?}");
+        assert!(e.is_timeout(), "{e:?}");
+        assert!(!is_retryable(&transport(e)));
+
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gone = closed.local_addr().unwrap();
+        drop(closed);
+        let e = client
+            .get(format!("http://{gone}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(e.is_connect(), "{e:?}");
+        assert!(!e.is_timeout(), "{e:?}");
+        assert!(is_retryable(&transport(e)));
+    }
+
+    /// Catches: every non-connect reqwest error sent again, including the client's own
+    /// per-request limit, which ends a read against a store that accepts and never
+    /// answers and would multiply the wait of a read that cannot succeed.
+    #[tokio::test]
+    async fn a_request_that_exceeds_its_client_timeout_is_not_resent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _silent = tokio::spawn(async move {
+            let held = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(held);
+        });
+        let e = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .timeout(Duration::from_millis(100))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(e.is_timeout(), "{e:?}");
+        assert!(!e.is_connect(), "{e:?}");
+        assert!(!is_retryable(&transport(e)));
+    }
+
+    /// Catches: this module's own stall treated as worth a resend.
+    #[test]
+    fn a_stall_is_not_resent() {
+        assert!(!is_retryable(&ObjectStoreError::Transport(Arc::new(
+            Stalled
+        ))));
     }
 
     /// Catches: a transport error of the timeout kind from reqwest, or this module's

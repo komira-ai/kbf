@@ -15,8 +15,8 @@ use serde_json::Value;
 
 use super::core_tests::{A, Fake, Fx};
 use super::production::{
-    LinuxEnv, Place, log, main_with, private_dir, run, serve_linux, serve_linux_with, serve_mac,
-    serve_mac_with, serve_with, unix_now,
+    LinuxEnv, Place, bound_container, log, main_with, private_dir, run, serve_linux,
+    serve_linux_with, serve_mac, serve_mac_with, serve_with, unix_now,
 };
 use super::serve::ServeConfig;
 use crate::mac::tests::fx::{Fx as MacFx, Sim, mkdir};
@@ -198,6 +198,7 @@ fn a_backend_is_served_on_the_socket_until_told_to_stop() {
     let audit = fx.dir.join("audit.log");
     let place = Place {
         state_dir: &fx.dir,
+        state_name: "state.json",
         trust: &trust,
         ids: (meta.uid(), meta.gid()),
         audit: &audit,
@@ -245,6 +246,7 @@ fn a_linux_host_looks_up_the_account_and_makes_its_state_directory() {
     let env = LinuxEnv {
         passwd,
         state_dir: dir.join("state"),
+        state_name: "state.json".to_owned(),
         audit: dir.join("audit.log"),
     };
     let trust = trust(&dir);
@@ -284,6 +286,7 @@ fn a_linux_host_looks_up_the_account_and_makes_its_state_directory() {
     let missing = LinuxEnv {
         passwd: dir.join("no-passwd"),
         state_dir: dir.join("state"),
+        state_name: "state.json".to_owned(),
         audit: dir.join("audit.log"),
     };
     let err = serve_linux_with(
@@ -298,6 +301,7 @@ fn a_linux_host_looks_up_the_account_and_makes_its_state_directory() {
     let blocked = LinuxEnv {
         passwd: env.passwd.clone(),
         state_dir: dir.join("passwd/state"),
+        state_name: "state.json".to_owned(),
         audit: dir.join("audit.log"),
     };
     let err = serve_linux_with(
@@ -445,5 +449,49 @@ fn each_layout_reaches_its_backend_and_a_mac_takes_only_its_own() {
         } else {
             assert!(mac.contains("--layout is for a Linux host"), "{mac}");
         }
+    }
+}
+
+/// A helper started with the default file is bound to no container (its files keep their
+/// names); with another file it is bound to the container that file names, read through the
+/// trust, and a file that cannot be read stops the start naming the file.
+#[test]
+fn a_helper_with_its_own_file_is_bound_to_the_container_it_names() {
+    let (dir, _run) = scratch("hi-bound");
+    let file = dir.join("fe-b.toml");
+    fs::write(
+        &file,
+        "[frontend]\nname = \"kbf-fe-b\"\nrestart = \"always\"\napi = \"127.0.0.1:28982\"\ndrain_token_file = \"/t\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    let flags = |extra: &[&str]| {
+        let mut all = vec![
+            "--socket",
+            "/s",
+            "--socket-user",
+            "u",
+            "--frontend-container",
+        ];
+        all.extend(extra);
+        ServeConfig::parse(&words(&all)).unwrap()
+    };
+    let t = trust(&dir);
+    assert_eq!(bound_container(&t, &flags(&[])), Ok(None));
+    let own = flags(&["--frontend-config", &file.display().to_string()]);
+    assert_eq!(bound_container(&t, &own), Ok(Some("kbf-fe-b".to_owned())));
+    let missing = flags(&[
+        "--frontend-config",
+        &dir.join("nope.toml").display().to_string(),
+    ]);
+    assert!(
+        bound_container(&t, &missing)
+            .unwrap_err()
+            .contains("nope.toml")
+    );
+    if cfg!(target_os = "linux") {
+        // The program's own start reads the file as root: this one is not, so it stops there.
+        let err = serve_linux(&missing).unwrap_err();
+        assert!(err.contains("nope.toml"), "{err}");
     }
 }

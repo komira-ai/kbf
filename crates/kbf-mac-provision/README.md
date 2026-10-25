@@ -24,7 +24,8 @@ What the script did not do:
   - `kbf_volume` (`/Volumes/<name>`, default `/Volumes/kbf`): a mounted APFS volume
     (`diskutil info` gives the path itself as the mount point), not indexed (`mdutil -s`, and `.metadata_never_index` at its
     root) and excluded from Time Machine (`tmutil isexcluded`). `apply` writes the
-    marker, runs `mdutil -i off` and `tmutil addexclusion`; it does not make the volume
+    marker, runs `mdutil -i off` and `tmutil addexclusion -v` (the volume form);
+    it does not make the volume
     (`diskutil apfs addVolume` is the operator's).
   - `pool_users` (`pool_users`, 1 to 100, default 100; `pool_first_uid`, default 61000
     and never below 600): users `kbf-pool-<i>` for `i < pool_users`
@@ -137,6 +138,10 @@ kbf-mac-provision revert                                # root: put back the rec
   record named `kbf-vm` has another uid. `check` cannot compare the password with the
   account's (a hash cannot be read back).
   `autologin=vm` makes automatic login as this user the wanted state; see the `autologin` row.
+- `updater_user` (optional, `_kbf-updater`) and `updater_id` (optional, 200 to 499, not
+  `role_id` or `vm_user_uid`; it needs `updater_user`) are the service account of the
+  macOS kbf-updater agent, whose property list runs as `_kbf-updater`. The name is the one
+  the property list has, so no other is accepted. See the `updater_user` row.
 - An example profile, with placeholder values, is [example.profile](example.profile).
 
 ## Items
@@ -151,6 +156,7 @@ letters and `_` only.
 | `hostname` | `<farm>-mac-<nn>`, lower case, at most 63 characters | `scutil --get` `HostName`, `LocalHostName`, `ComputerName` | `scutil --set` each that differs |
 | `admin_user` | account | `dscl`: it exists, and it and `root` are the only administrators: the names in `admin`'s `GroupMembership`, and every account in `dscl . -list /Users` that `dseditgroup -o checkmember` counts as a member of `admin` (which finds one by primary group 80 or a nested group) | check only |
 | `role_user` (`role_id`) | `_name`, id 200-499 | `dscl`: user and group with that id, shell `/usr/bin/false`, home `/var/empty`, hidden, no password (`Password` is `*` and there is no `AuthenticationAuthority`); no other user and no other group holds the id | `dscl . -create`, and `-delete` of `AuthenticationAuthority` (refused if the id is taken) |
+| `updater_user` (`updater_id`) | `_kbf-updater`, id 200-499; unset: not managed | `dscl`: user and group of one id, shell `/usr/bin/false`, home `/var/empty`, hidden, no password, as for `role_user`; no other user and no other group holds the id; `/var/db/kbf-updater` (the agent's state: key, certificate, CA) is the account's, mode 700, and `/Library/Logs/kbf-updater` (its logs) the account's, mode 755 | `dscl . -create` of the user and group (with `updater_id` unset, the highest free id below 450, the VM user's range, that is not `role_id`), `-delete` of `AuthenticationAuthority`, and the two directories made, owned and chmoded (nothing is changed while another user or group holds the id) |
 | `power_sleep`, `power_standby`, `power_powernap`, `power_autorestart`, `power_womp` | numbers | `pmset -g` | `pmset -a` |
 | `updates_auto_download`, `updates_auto_install_macos`, `updates_auto_install_security`, `updates_config_data`, `appstore_auto_update` | 0 or 1 | `defaults read /Library/Preferences/com.apple.SoftwareUpdate` `AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`, `CriticalUpdateInstall`, `ConfigDataInstall`, `AutomaticallyInstallAppUpdates` | `defaults write ... -bool`. **Verify on the pinned version:** the SoftwareUpdate payload is removed in macOS 27, and whether these local preferences are still honoured is not known; every line says so |
 | `xcode_disable_manifest_sandbox` (optional) | 0 or 1 | `defaults read /Library/Preferences/com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox`; left out, the item passes as "not managed" | `defaults write ... -bool`. It is not in the revert record. `xcodebuild` resolving a Swift package runs each manifest under SwiftPM's own `sandbox-exec`, which macOS refuses inside the native driver's sandbox (`sandbox_apply: Operation not permitted`); `xcodebuild` takes the switch only as a user default, and this system-domain value is read by every user after their own. `swift build` has `--disable-sandbox` instead. Unverified until a macOS runner shows `xcodebuild` honouring the system domain |

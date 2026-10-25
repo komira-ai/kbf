@@ -104,7 +104,15 @@ fn what_would_have_to_be_guessed_is_refused() {
             &format!("ExecStart={R}/current/kbf --x=%H\n"),
             "does not carry",
         ),
+        (
+            &format!("ExecStart={R}/current/kbf --x=a\\b\n"),
+            "does not carry",
+        ),
         (&format!("ExecStart={R}/current/kbf ; rm\n"), "\";\""),
+        (
+            &format!("ExecStart={R}/current/kbf --x=a;b\n"),
+            "does not carry",
+        ),
         (
             &format!("ExecStart={R}/current/kbf 'a'\n"),
             "does not carry",
@@ -122,4 +130,14 @@ fn a_dangling_continuation_is_read_as_it_is() {
     let text = format!("[Service]\nExecStart={R}/current/kbf --mode=daemon \\");
     let unit = parse(&text, R).unwrap();
     assert_eq!(unit.args, ["--mode=daemon"]);
+}
+
+/// A cold-store URL with a query (`?` and `&`) is one plain word and is read unchanged.
+#[test]
+fn a_cold_store_url_with_a_query_is_carried_as_it_is() {
+    let flag = "--cold-store=s3://bucket-name/prefix/?endpoint=http://127.0.0.1:30900&conditional-put=true";
+    let text =
+        format!("[Service]\nExecStart={R}/current/kbf --mode=storage {flag} --node-id st1\n");
+    let unit = parse(&text, R).unwrap();
+    assert_eq!(unit.args, ["--mode=storage", flag, "--node-id", "st1"]);
 }

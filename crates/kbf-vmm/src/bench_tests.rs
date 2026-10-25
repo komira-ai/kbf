@@ -73,8 +73,16 @@ fn a_bench_runs_cold_then_warm_and_reports_every_measure() {
     for _ in 0..6 {
         sys.script(ready());
     }
-    let r = bench::run(&ctx(&sys, &work), 3);
+    let mut c = ctx(&sys, &work);
+    c.graphics = true;
+    let r = bench::run(&c, 3);
     assert_eq!(r.status, Status::Ok, "{r:?}");
+    assert!(
+        sys.starts
+            .borrow()
+            .iter()
+            .all(|(s, _)| s.graphics && s.tagged.len() == 2)
+    );
     assert_eq!(sys.purges.get(), 3);
     assert_eq!(sys.starts.borrow().len(), 6);
     for mode in ["cold", "warm"] {

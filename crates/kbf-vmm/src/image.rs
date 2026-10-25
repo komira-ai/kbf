@@ -102,6 +102,9 @@ pub struct BaseArgs {
     /// After the install, write the probe launch daemons and the Setup Assistant marker
     /// into the image as root.
     pub offline_setup: bool,
+    /// The `kbf-guest` the offline setup copies onto the guest's disk (required with
+    /// `offline_setup`).
+    pub guest_binary: Option<PathBuf>,
 }
 
 /// The curl flags of a restore image download. `-q` first, so a `.curlrc` of the invoking
@@ -231,9 +234,13 @@ pub fn base(sys: &dyn System, args: &BaseArgs) -> Report {
     };
     let _ = std::fs::remove_file(&staged);
     let offline = args.offline_setup.then(|| {
+        let binary = args
+            .guest_binary
+            .as_deref()
+            .ok_or_else(|| guest::NEEDS_GUEST_BINARY.to_owned())?;
         sys.offline_write(
             &args.out.join(crate::bundle::DISK),
-            &guest::offline_payload(),
+            &guest::offline_payload_from(binary)?,
         )
     });
     let (offline_json, failed) = match offline {
@@ -266,7 +273,7 @@ pub fn base(sys: &dyn System, args: &BaseArgs) -> Report {
 
 /// `image setup`: the offline write (P0) into an existing base bundle.
 #[must_use]
-pub fn setup(sys: &dyn System, base: &Path) -> Report {
+pub fn setup(sys: &dyn System, base: &Path, guest_binary: Option<&Path>) -> Report {
     let probe = "image-setup";
     if sys.uid() != 0 {
         return Report::needs_manual(
@@ -278,13 +285,55 @@ pub fn setup(sys: &dyn System, base: &Path) -> Report {
     if let Err(e) = crate::bundle::check(base) {
         return Report::error(probe, e.to_string());
     }
-    match sys.offline_write(&base.join(crate::bundle::DISK), &guest::offline_payload()) {
+    let Some(binary) = guest_binary else {
+        return Report::needs_manual(probe, guest::NEEDS_GUEST_BINARY, json!({"bundle": base}));
+    };
+    let payload = match guest::offline_payload_from(binary) {
+        Ok(p) => p,
+        Err(e) => return Report::error(probe, e),
+    };
+    match sys.offline_write(&base.join(crate::bundle::DISK), &payload) {
         Ok(observed) => Report::ok(
             probe,
             format!("the probe launch daemons are in {}", base.display()),
             json!({"bundle": base, "offline_setup": observed}),
         ),
         Err(e) => Report::error(probe, format!("offline setup: {e}")),
+    }
+}
+
+/// `image harvest`: copies the allowlisted diagnostics out of a kept clone's disk into the
+/// new directory `out`, with the disk attached read-only.
+#[must_use]
+pub fn harvest(sys: &dyn System, bundle: &Path, out: &Path) -> Report {
+    let probe = "image-harvest";
+    if sys.uid() != 0 {
+        return Report::needs_manual(
+            probe,
+            "needs root: attaching a guest disk image with its ownership honoured; run with sudo",
+            json!({"uid": sys.uid()}),
+        );
+    }
+    if let Err(e) = crate::bundle::check(bundle) {
+        return Report::error(probe, e.to_string());
+    }
+    if std::fs::symlink_metadata(out).is_ok() {
+        return Report::error(
+            probe,
+            format!("{} exists; harvest writes a new directory", out.display()),
+        );
+    }
+    match sys.offline_harvest(&bundle.join(crate::bundle::DISK), out) {
+        Ok(observed) => Report::ok(
+            probe,
+            format!(
+                "the allowlisted files of {} are in {}",
+                bundle.display(),
+                out.display()
+            ),
+            json!({"bundle": bundle, "out": out, "offline_read": observed}),
+        ),
+        Err(e) => Report::error(probe, format!("harvest: {e}")),
     }
 }
 
@@ -304,6 +353,7 @@ mod tests {
             out: dir.join("out"),
             disk_gib: 64,
             offline_setup: false,
+            guest_binary: None,
         }
     }
 
@@ -460,9 +510,16 @@ mod tests {
         let sys = FakeSystem::new();
         let mut a = args(&dir, &ipsw_file(&dir), HELLO);
         a.offline_setup = true;
+        a.guest_binary = Some(dir.join("kbf-guest-src"));
+        std::fs::write(dir.join("kbf-guest-src"), "bin").expect("bin");
         let r = base(&sys, &a);
         assert_eq!(r.status, Status::Ok);
         assert_eq!(r.details["offline_setup"]["written"], 5);
+        assert!(
+            sys.offline_calls.borrow()[0]
+                .1
+                .contains(&"usr/local/libexec/kbf-guest".to_owned())
+        );
         assert_eq!(
             sys.offline_calls.borrow()[0].0,
             dir.join("out").join("disk.img")
@@ -471,10 +528,34 @@ mod tests {
         *sys.offline.borrow_mut() = Err("hdiutil said no".into());
         let mut a = args(&dir2, &ipsw_file(&dir2), HELLO);
         a.offline_setup = true;
+        a.guest_binary = Some(dir.join("kbf-guest-src"));
         let r = base(&sys, &a);
         assert_eq!(r.status, Status::NeedsManual);
         assert!(r.reason.expect("reason").contains("hdiutil said no"));
         assert_eq!(r.details["offline_setup"]["failure"], "hdiutil said no");
+    }
+
+    /// Catches an offline setup that writes daemons whose mounter has no binary to run
+    /// (no guest binary named, or one that cannot be read): nothing is written and the
+    /// report says to give `--guest-binary`.
+    #[test]
+    fn the_offline_setup_without_a_readable_guest_binary_writes_nothing() {
+        let dir = tmp("image-offline-nobin");
+        let sys = FakeSystem::new();
+        let mut a = args(&dir, &ipsw_file(&dir), HELLO);
+        a.offline_setup = true;
+        let r = base(&sys, &a);
+        assert_eq!(r.status, Status::NeedsManual);
+        assert!(r.reason.expect("reason").contains("--guest-binary"));
+        assert!(sys.offline_calls.borrow().is_empty());
+        let dir2 = tmp("image-offline-nobin2");
+        let mut a = args(&dir2, &ipsw_file(&dir2), HELLO);
+        a.offline_setup = true;
+        a.guest_binary = Some(dir2.join("missing"));
+        let r = base(&sys, &a);
+        assert_eq!(r.status, Status::NeedsManual);
+        assert!(r.reason.expect("reason").contains("missing"));
+        assert!(sys.offline_calls.borrow().is_empty());
     }
 
     /// Catches a download that is installed unverified, kept after a mismatch, or kept
@@ -576,6 +657,33 @@ mod tests {
         ]));
     }
 
+    /// Catches an `image setup` that writes a file the payload does not list (the root
+    /// helper runs this verb for the daemon, so nothing outside `offline_payload()` may
+    /// reach the guest's disk), a path that climbs out of the guest volume, or a payload
+    /// that differs from the one `image base --offline-setup` writes.
+    #[test]
+    fn setup_writes_exactly_the_offline_payload_paths() {
+        let work = crate::fake::work_with_base("image-setup-paths");
+        let base_dir = work.join("base");
+        let sys = FakeSystem::new();
+        sys.uid.set(0);
+        let bin = work.join("guest-src");
+        std::fs::write(&bin, "bin").expect("bin");
+        let r = setup(&sys, &base_dir, Some(&bin));
+        assert_eq!(r.status, Status::Ok);
+        let calls = sys.offline_calls.borrow();
+        assert_eq!(calls.len(), 1);
+        let want: Vec<String> = guest::offline_payload(Some(b"bin".to_vec()))
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(calls[0].1, want);
+        for path in &calls[0].1 {
+            assert!(!path.starts_with('/'), "{path}");
+            assert!(!path.split('/').any(|part| part == ".."), "{path}");
+        }
+    }
+
     /// Catches `image setup` writing as a non-root user, writing into a directory that
     /// is not a bundle, writing to the wrong disk, or hiding a write failure.
     #[test]
@@ -583,19 +691,60 @@ mod tests {
         let work = crate::fake::work_with_base("image-setup");
         let base_dir = work.join("base");
         let sys = FakeSystem::new();
-        let r = setup(&sys, &base_dir);
+        let bin = work.join("guest-src");
+        std::fs::write(&bin, "bin").expect("bin");
+        let r = setup(&sys, &base_dir, Some(&bin));
         assert_eq!(r.status, Status::NeedsManual);
         assert!(r.reason.expect("reason").contains("root"));
         assert!(sys.offline_calls.borrow().is_empty());
         sys.uid.set(0);
-        let r = setup(&sys, &work.join("none"));
+        let r = setup(&sys, &work.join("none"), Some(&bin));
         assert_eq!(r.status, Status::Error);
         assert!(sys.offline_calls.borrow().is_empty());
-        let r = setup(&sys, &base_dir);
+        let r = setup(&sys, &base_dir, None);
+        assert_eq!(r.status, Status::NeedsManual);
+        assert!(r.reason.expect("reason").contains("--guest-binary"));
+        let r = setup(&sys, &base_dir, Some(&work.join("missing")));
+        assert_eq!(r.status, Status::Error);
+        assert!(sys.offline_calls.borrow().is_empty());
+        let r = setup(&sys, &base_dir, Some(&bin));
         assert_eq!(r.status, Status::Ok);
         assert_eq!(sys.offline_calls.borrow()[0].0, base_dir.join("disk.img"));
         *sys.offline.borrow_mut() = Err("no volume".into());
-        let r = setup(&sys, &base_dir);
+        let r = setup(&sys, &base_dir, Some(&bin));
+        assert_eq!(r.status, Status::Error);
+        assert!(r.reason.expect("reason").contains("no volume"));
+    }
+
+    /// Catches `image harvest` running as a non-root user, on a directory that is not a
+    /// bundle, into a directory that exists, against the wrong disk, or hiding a failure.
+    #[test]
+    fn harvest_reads_the_disk_of_a_bundle_as_root_into_a_new_directory() {
+        let work = crate::fake::work_with_base("image-harvest");
+        let bundle = work.join("base");
+        let out = work.join("harvested");
+        let sys = FakeSystem::new();
+        let r = harvest(&sys, &bundle, &out);
+        assert_eq!(r.status, Status::NeedsManual);
+        assert!(r.reason.expect("reason").contains("root"));
+        sys.uid.set(0);
+        let r = harvest(&sys, &work.join("none"), &out);
+        assert_eq!(r.status, Status::Error);
+        std::fs::create_dir(&out).expect("out");
+        let r = harvest(&sys, &bundle, &out);
+        assert_eq!(r.status, Status::Error);
+        assert!(r.reason.expect("reason").contains("exists"));
+        assert!(sys.harvest_calls.borrow().is_empty());
+        std::fs::remove_dir(&out).expect("rm");
+        let r = harvest(&sys, &bundle, &out);
+        assert_eq!(r.status, Status::Ok);
+        assert_eq!(r.details["offline_read"]["copied"], serde_json::json!([]));
+        assert_eq!(
+            sys.harvest_calls.borrow()[0],
+            (bundle.join("disk.img"), out.clone())
+        );
+        *sys.harvest.borrow_mut() = Err("no volume".into());
+        let r = harvest(&sys, &bundle, &out);
         assert_eq!(r.status, Status::Error);
         assert!(r.reason.expect("reason").contains("no volume"));
     }

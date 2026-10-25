@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N]
-//!                   [--layout installer|deb|rpm] (--restart-unit UNIT... | --frontend-container)
+//!                   [--layout installer|deb|rpm]
+//!                   (--restart-unit UNIT... | --frontend-container [--frontend-config PATH])
 //! ```
 //!
 //! The program binds the socket itself (a umask of 0177, then a chown to the account), in a
@@ -21,6 +22,10 @@
 //! root are constants, as they are for the ssh path; no flag moves them. `--frontend-container`
 //! serves a frontend that runs as a container instead of units ([`super::frontend`]); it takes
 //! no `--restart-unit`.
+//! `--frontend-config` names the container's configuration (default
+//! `/etc/kbf/host-install-frontend.toml`); with another file, the helper keeps its record, its
+//! A/B state and its lock under names made from the container's name, so that a host runs one
+//! helper, with its own `--socket`, per container.
 //!
 //! `--layout` says how a Linux host keeps its releases: `installer` (the default) is the
 //! hand-placed layout of `kbf-installer` (`releases/<commit>` with the links `current` and
@@ -59,7 +64,7 @@ const REVERT_RETRY: Duration = Duration::from_secs(30);
 
 pub const USAGE: &str = "usage: kbf-host-install --serve --socket PATH --socket-user NAME \
 [--window-secs N] [--layout installer|deb|rpm] \
-(--restart-unit UNIT... | --frontend-container)\n";
+(--restart-unit UNIT... | --frontend-container [--frontend-config PATH])\n";
 
 /// How a host keeps the releases it runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -94,6 +99,8 @@ pub struct ServeConfig {
     pub units: Vec<Unit>,
     /// The host runs the frontend as a container, not as units.
     pub frontend_container: bool,
+    /// The frontend container's configuration file.
+    pub frontend_config: PathBuf,
 }
 
 impl ServeConfig {
@@ -109,6 +116,7 @@ impl ServeConfig {
         let mut layout = None;
         let mut units = Vec::new();
         let mut frontend_container = false;
+        let mut frontend_config = None;
         let mut rest = args.iter();
         while let Some(arg) = rest.next() {
             let (name, inline) = match arg.split_once('=') {
@@ -140,6 +148,7 @@ impl ServeConfig {
                 "--socket-user" => once(&mut user)?,
                 "--window-secs" => once(&mut window)?,
                 "--layout" => once(&mut layout)?,
+                "--frontend-config" => once(&mut frontend_config)?,
                 "--restart-unit" => {
                     units.push(Unit::service(&value).map_err(|BadCommand| {
                         format!("--restart-unit {value:?} is not a kbf unit")
@@ -175,6 +184,16 @@ impl ServeConfig {
                 "--frontend-container and --layout deb or rpm are not given together".to_owned(),
             );
         }
+        let frontend_config = match frontend_config {
+            Some(_) if !frontend_container => {
+                return Err("--frontend-config needs --frontend-container".to_owned());
+            }
+            Some(path) if !Path::new(&path).is_absolute() => {
+                return Err("--frontend-config must be an absolute path".to_owned());
+            }
+            Some(path) => PathBuf::from(path),
+            None => PathBuf::from(super::frontend::config::CONFIG),
+        };
         Ok(Self {
             socket,
             user,
@@ -182,6 +201,7 @@ impl ServeConfig {
             layout,
             units,
             frontend_container,
+            frontend_config,
         })
     }
 }

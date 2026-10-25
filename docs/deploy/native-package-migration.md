@@ -21,9 +21,10 @@ kbf-host-install --migrate-to-package --layout deb --channel stable \
 
 ## Before: what the node needs
 
-- `kbf-host-install` ([host-install.md](host-install.md#getting-the-binary)) and the
-  `kbf-installer` package, which carries the pinned `gh`, the trusted root and `installer.conf`
-  that the check uses (`/usr/share/kbf-installer/trust`). The program refuses when they are not
+- `kbf-host-install` ([host-install.md](host-install.md#getting-the-binary)) and the pinned
+  `gh`, the trusted root and `installer.conf` that the check uses, which the `kbf` package
+  carries (`/usr/share/kbf/trust`; a host that still has the old `kbf-installer` package is read
+  at `/usr/share/kbf-installer/trust`, until v0.0.9). The program refuses when they are not
   root's.
 - `/etc/kbf/host-install-releases.toml` with the channel named by `--channel`, as for the local
   socket (`source = "github"`; its branch is the one the attestation must name).
@@ -60,7 +61,8 @@ Both the plan and `--apply` do these, and change nothing:
 2. The unit is the unit of a daemon mode (`kbf-daemon`, `kbf-storage`, `kbf-storage-and-daemon` or
    `kbf-all-in-one`), is a regular file in `/etc/systemd/system`, has exactly one `ExecStart=`, and
    that runs the `kbf` of a release under `/var/lib/kbf-installer/releases`. Its flags are plain
-   words: a quote, a `$`, a `%`, a `;` or the like in a flag stops the move, and the line says
+   words (letters, digits and `_ . / : = @ + , ~ - ? &`, so a cold-store URL with a query is
+   carried as it is): whitespace, a quote, a backslash, a `$`, a `%`, a `;` or the like in a flag stops the move, and the line says
    which word. A `--mode=` it gives must be the mode of the unit's name.
 3. No drop-in `10-node-flags.conf` and no `<unit>.hand-placed` file is there already.
 4. The package in `--dir` is the package of that commit and passes every check an update's package

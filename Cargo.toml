@@ -202,6 +202,7 @@ kbf-enroll-registry = { path = "crates/kbf-enroll-registry" }
 kbf-enroll = { path = "crates/kbf-enroll" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
+kbf-guest = { path = "crates/kbf-guest" }
 kbf-gate = { path = "crates/kbf-gate" }
 kbf-harness = { path = "crates/kbf-harness" }
 kbf-history = { path = "crates/kbf-history" }
@@ -247,7 +248,8 @@ kbf-ui = { path = "crates/kbf-ui" }
 kbf-unitfile = { path = "crates/kbf-unitfile" }
 kbf-update = { path = "crates/kbf-update" }
 kbf-updater = { path = "crates/kbf-updater" }
-# The hot/cold object store library; it depends on no kbf crate (kbf-integration-test keeps it so).
+# The hot/cold object store library; it depends on no kbf crate unless its `s3` feature is on
+# (kbf-integration-test keeps it so).
 tierstore = { path = "crates/tierstore" }
 # The CI verbs (`cargo xtask`); kbf-integration-test reads the interpreter budget with its parser.
 xtask = { path = "crates/xtask" }

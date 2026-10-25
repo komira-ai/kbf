@@ -8,7 +8,7 @@
 //!
 //! The numbers below are the top of that range with a little room, not a measurement: no
 //! package carries a release yet. The change that first builds one replaces them with its
-//! measured size and a margin, and `pkg-asset` calls [`problem`] on the package then. Until
+//! measured size and a margin, and `pkg-kbf-asset` calls [`problem`] on the package then. Until
 //! then no package is held to it.
 
 use crate::package::Platform;

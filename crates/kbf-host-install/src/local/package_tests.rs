@@ -1432,7 +1432,7 @@ fn the_production_host_is_the_package_layout_and_the_programs_of_a_stage() {
     assert_eq!(host.tools.tarball_max, 512 * 1024 * 1024);
     assert_eq!(
         host.layout.join(&host.layout.gh()),
-        Path::new("/usr/share/kbf-installer/trust/gh")
+        Path::new("/usr/share/kbf/trust/gh")
     );
 }
 

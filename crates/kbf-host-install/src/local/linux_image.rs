@@ -114,11 +114,11 @@ impl<E: Exec> Linux<E> {
         Ok((commit, files))
     }
 
-    /// `work/<commit>.check`, where the installer's own checks sweep after a crash.
-    fn check_dir(&self, commit: &str) -> PathBuf {
+    /// `work/<commit>.check` (`<commit>.<tag>.check` for a helper with a tag), where the installer's own checks sweep after a crash.
+    pub(super) fn check_dir(&self, commit: &str) -> PathBuf {
         self.layout
             .join(&self.layout.work_dir())
-            .join(format!("{commit}.check"))
+            .join(format!("{}.check", self.tagged(commit)))
     }
 
     /// A root-owned directory for the checks, with the unprivileged user's home for `gh`.

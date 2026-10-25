@@ -8,7 +8,7 @@
 //!   [`layout::Platform`]): each release in its own directory under
 //!   `/var/lib/kbf-installer/releases/<commit>/`, the `current` and `previous` links beside them,
 //!   the state under `/var/lib/kbf-installer/` (Linux) or `/var/db/kbf-installer/` (macOS) and
-//!   its trust files under `/usr/share/kbf-installer/trust/`.
+//!   its trust files under `/usr/share/kbf/trust/`.
 //! - [`state`]: `state.json` (schema 2: the current, previous and staged commits, the one
 //!   waiting to be confirmed, the order floor and the rest), with `state.json.bak` as the last
 //!   good copy, read and written under an exclusive lock and replaced whole by a rename.

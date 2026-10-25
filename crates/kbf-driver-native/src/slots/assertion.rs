@@ -12,8 +12,7 @@
 //!
 //! | probe | the user is clean when |
 //! |---|---|
-//! | [`Probe::Processes`] | no process has it as its real, effective or saved uid, but launchd's own |
-//! | [`Probe::Domain`] | `launchctl print user/<uid>` lists no job but launchd's own |
+//! | [`Probe::Processes`] | no process has it as its real, effective or saved uid |
 //! | [`Probe::Ipc`] | `ipcs -a` lists no object it owns or made |
 //! | [`Probe::Mounts`] | nothing is mounted or attached under its home, its `/var/folders` entry or the lease directory, no mount anywhere is marked as mounted by it, and it attached no image |
 //! | [`Probe::Home`] | its home is an empty directory, mode 0700, its uid and gid, with no flags, and the ACL and extended attributes (names and values) it had in the baseline |
@@ -22,17 +21,13 @@
 //! | [`Probe::Schedules`] | it has no cron or `at` job |
 //! | [`Probe::Record`] | its directory record and `id` equal the baseline's |
 //!
-//! Launchd's own services differ from run to run (a service loaded on demand, a pid), so
-//! the baseline notes each with its plist path and program ([`Probe::Services`]) and
-//! never compares the list. A job is launchd's own by the file its plist names
-//! ([`own_plist`]: under the system folders, root's, nobody else can write it, the same
-//! label), and, if the baseline noted a service of its label, only with the plist path
-//! and program it noted ([`is_own_job`]): never by its label or a line of text that a
-//! lease can choose. Every job is printed and judged at every look.
-//!
-//! Only the `user/<uid>` domain is read for jobs; a job loaded into another domain of
-//! the uid (`gui/<uid>`) runs as a process of the uid while it runs, which
-//! [`Probe::Processes`] sees, and is not seen while it is idle.
+//! launchd is **not asked** about the user. A root `launchctl print user/<uid>` of a
+//! domain that is gone makes the domain again, with launchd's own agents (`distnoted`)
+//! running in it as the uid, which the next lease would inherit (measured on a Mac). The
+//! processes probe is the check that the domain and its jobs are gone: a job runs as a
+//! process of the uid, and a domain that is made would show its agents in the same table.
+//! A job that is loaded and idle in a domain that is still there cannot be seen, and
+//! needs no seeing: the clean booted the domain out, and its processes were killed.
 //!
 //! A probe that cannot run is red, never green; so is a probe that needs a baseline and
 //! has none.
@@ -47,7 +42,6 @@ use super::probe;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Probe {
     Processes,
-    Domain,
     Ipc,
     Mounts,
     Home,
@@ -55,15 +49,11 @@ pub(crate) enum Probe {
     Shared,
     Schedules,
     Record,
-    /// Launchd's own per-user services: recorded, never compared.
-    Services,
 }
 
 /// Every probe, in the order they are read.
-pub(crate) const ALL: [Probe; 10] = [
+pub(crate) const ALL: [Probe; 8] = [
     Probe::Processes,
-    Probe::Services,
-    Probe::Domain,
     Probe::Ipc,
     Probe::Mounts,
     Probe::Home,
@@ -74,9 +64,8 @@ pub(crate) const ALL: [Probe; 10] = [
 ];
 
 /// The cheap probes, run again when a slot is handed to a lease.
-pub(crate) const CHEAP: [Probe; 6] = [
+pub(crate) const CHEAP: [Probe; 5] = [
     Probe::Processes,
-    Probe::Domain,
     Probe::Ipc,
     Probe::Mounts,
     Probe::Home,
@@ -91,15 +80,12 @@ pub(crate) enum Kind {
     /// The lines must equal the baseline's. A baseline holds only the lines
     /// [`baseline_defects`] does not find wrong.
     Recorded,
-    /// The lines are kept in the baseline and not compared.
-    Noted,
 }
 
 impl Probe {
     pub(crate) const fn kind(self) -> Kind {
         match self {
             Self::Home | Self::Entry | Self::Record => Kind::Recorded,
-            Self::Services => Kind::Noted,
             _ => Kind::Absent,
         }
     }
@@ -109,7 +95,6 @@ impl fmt::Display for Probe {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Processes => "processes",
-            Self::Domain => "launchd",
             Self::Ipc => "ipc",
             Self::Mounts => "mounts",
             Self::Home => "home",
@@ -117,7 +102,6 @@ impl fmt::Display for Probe {
             Self::Shared => "shared",
             Self::Schedules => "schedules",
             Self::Record => "record",
-            Self::Services => "services",
         })
     }
 }
@@ -194,7 +178,6 @@ fn baseline_defects(probe: Probe, lines: &[String]) -> Lines {
             .filter(|l| !recorded(l))
             .map(|l| format!("{probe}: + {l}"))
             .collect(),
-        Kind::Noted => Vec::new(),
     }
 }
 
@@ -245,7 +228,6 @@ fn cannot_run(probe: Probe, why: &str) -> String {
 /// How `now` differs from `before` for `probe` (see [`Kind`]).
 pub(crate) fn differences(probe: Probe, now: &[String], before: Option<&[String]>) -> Lines {
     match probe.kind() {
-        Kind::Noted => Vec::new(),
         Kind::Absent => now.iter().map(|l| format!("{probe}: + {l}")).collect(),
         Kind::Recorded => {
             let before = before.unwrap_or_default();
@@ -307,118 +289,16 @@ pub(crate) fn parse_ps(text: &str) -> Result<Vec<Proc>, String> {
     Ok(procs)
 }
 
-/// The live processes with `uid` as real, effective or saved uid, other than the pids in
-/// `own` (launchd's own agents): `pid command` each.
-pub(crate) fn uid_processes(procs: &[Proc], uid: u32, own: &[i32]) -> Lines {
+/// The live processes with `uid` as real, effective or saved uid: `pid command` each.
+/// launchd's own agents are not left out: the domain is gone after the clean and nothing
+/// reads it, so none runs.
+pub(crate) fn uid_processes(procs: &[Proc], uid: u32) -> Lines {
     let ours = |p: &&Proc| p.real == uid || p.effective == uid || p.saved == uid;
     procs
         .iter()
         .filter(ours)
-        .filter(|p| !p.zombie && !own.contains(&p.pid))
+        .filter(|p| !p.zombie)
         .map(|p| format!("{} {}", p.pid, p.command))
-        .collect()
-}
-
-/// Whether the plist the job `label` says it came from is launchd's own, judged on the
-/// file and not on a line of text that a job can write (a submitted job has no plist, and
-/// an argument can carry a line that looks like the plist line): the real path (links and
-/// `..` resolved) lies under one of `roots`, `owner` owns the file and no one else can
-/// write it, and its `Label` is the job's.
-pub(crate) fn own_plist(path: &str, label: &str, roots: &[&str], owner: u32) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    // The real path, and its metadata (a file that goes between the two is not launchd's).
-    let Some((real, meta)) = std::fs::canonicalize(path)
-        .ok()
-        .and_then(|real| std::fs::metadata(&real).ok().map(|meta| (real, meta)))
-    else {
-        return false;
-    };
-    let under = |root: &&str| real.to_string_lossy().starts_with(*root);
-    if !roots.iter().any(under) || meta.uid() != owner || meta.mode() & 0o022 != 0 {
-        return false;
-    }
-    plist::Value::from_file(&real)
-        .ok()
-        .and_then(|v| {
-            v.as_dictionary()?
-                .get("Label")?
-                .as_string()
-                .map(|l| l == label)
-        })
-        .unwrap_or(false)
-}
-
-/// One service of the uid's launchd domain, as the assertion needs it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Job {
-    pub pid: Option<i32>,
-    pub label: String,
-    /// The plist and the program `launchctl print` says it has.
-    pub plist: Option<String>,
-    pub program: Option<String>,
-    /// Its plist is launchd's own ([`is_own_job`]).
-    pub own: bool,
-}
-
-/// The line the baseline keeps of a service: `label`, plist path and program, apart by
-/// tabs (a missing plist or program is empty).
-pub(crate) fn service_line(label: &str, plist: Option<&str>, program: Option<&str>) -> String {
-    format!(
-        "{label}\t{}\t{}",
-        plist.unwrap_or_default(),
-        program.unwrap_or_default()
-    )
-}
-
-/// Whether a job is launchd's own: it has a plist, `on_file` (the check of the file,
-/// [`own_plist`]) accepts it for the job's label, and if the baseline (`known`, the lines
-/// of [`service_line`]) noted a service of that label, the plist path and the program are
-/// the ones it noted. A label alone never makes a job launchd's own: a lease that boots
-/// out a service and submits its own job under the label has a different plist (none) or
-/// program.
-pub(crate) fn is_own_job(
-    (label, plist, program): (&str, Option<&str>, Option<&str>),
-    known: &[String],
-    on_file: &dyn Fn(&str) -> bool,
-) -> bool {
-    let Some(path) = plist else {
-        return false;
-    };
-    let prefix = format!("{label}\t");
-    let mut noted = known.iter().filter(|k| k.starts_with(&prefix)).peekable();
-    if noted.peek().is_some() {
-        let now = service_line(label, plist, program);
-        if !noted.any(|k| *k == now) {
-            return false;
-        }
-    }
-    on_file(path)
-}
-
-/// The pids of launchd's own running services.
-pub(crate) fn own_pids(jobs: &[Job]) -> Vec<i32> {
-    jobs.iter()
-        .filter(|j| j.own)
-        .filter_map(|j| j.pid)
-        .collect()
-}
-
-/// The jobs that are not launchd's own: `job <label>` each, with the pid while running.
-pub(crate) fn foreign_jobs(jobs: &[Job]) -> Lines {
-    jobs.iter()
-        .filter(|j| !j.own)
-        .map(|j| match j.pid {
-            Some(pid) => format!("job {} (pid {pid})", j.label),
-            None => format!("job {}", j.label),
-        })
-        .collect()
-}
-
-/// The label, plist path and program of launchd's own services: what the baseline notes.
-pub(crate) fn own_services(jobs: &[Job]) -> Lines {
-    jobs.iter()
-        .filter(|j| j.own)
-        .map(|j| service_line(&j.label, j.plist.as_deref(), j.program.as_deref()))
         .collect()
 }
 
@@ -654,10 +534,10 @@ pub(crate) fn entry_lines(
         if facts.uid != uid {
             lines.push(format!("{name}: owned by {}", facts.uid));
         }
-        if probe::unrestored(facts.flags) {
-            lines.push(format!("{name}: flags {:#x}", facts.flags));
-        }
-        lines.extend(facts.acl.iter().map(|a| format!("{name}: acl {a}")));
+        // The flags and ACLs of a folder are the system's (root without Full Disk Access
+        // cannot change them, nor the user): recorded like the mode, not asked to be none.
+        lines.push(format!(". {name} flags {:#x}", facts.flags));
+        lines.extend(facts.acl.iter().map(|a| format!(". {name} acl {a}")));
         lines.extend(facts.entries.iter().map(|e| format!("{name}: entry {e}")));
     }
     lines

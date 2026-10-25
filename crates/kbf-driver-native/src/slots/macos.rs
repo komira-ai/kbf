@@ -54,6 +54,9 @@ pub struct Ready {
     baseline: assert::Baseline,
     /// The uids of the pool's users.
     pool: std::ops::RangeInclusive<u32>,
+    /// The empty directories of the home the last clean kept, because the system refused
+    /// their removal: what the check may find left empty.
+    pub kept: std::sync::Mutex<Vec<PathBuf>>,
 }
 
 /// The `/var/folders` entry of a slot as the system made it, found when the slot was
@@ -250,7 +253,7 @@ fn mac_cleaner(
             within,
             grace,
             pool: pool.clone(),
-            judged: probe::OwnLabels::default(),
+            program: &program,
         };
         let run = || match skipped {
             None => clean::clean(&slot),
@@ -721,6 +724,7 @@ fn resolve(user: &SlotUser, program: &Path) -> io::Result<Ready> {
         rules,
         baseline: assert::Baseline::new(),
         pool: assert::no_pool(),
+        kept: std::sync::Mutex::default(),
     })
 }
 
@@ -798,6 +802,7 @@ mod tests {
                 rules: String::new(),
                 baseline: assert::Baseline::new(),
                 pool: 0..=0,
+                kept: std::sync::Mutex::default(),
             })
             .collect()
     }

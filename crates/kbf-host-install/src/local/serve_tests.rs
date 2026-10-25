@@ -644,3 +644,57 @@ fn the_frontend_container_flag_stands_for_the_units() {
             .contains("takes no value and is given once")
     );
 }
+
+/// `--frontend-config` names the container's file, once, as an absolute path, and only for a
+/// helper of a container; left out it is the default file.
+#[test]
+fn the_frontend_config_flag_names_the_file() {
+    let base = [
+        "--socket",
+        "/s",
+        "--socket-user",
+        "u",
+        "--frontend-container",
+    ];
+    let with = |extra: &[&str]| {
+        let mut words: Vec<&str> = base.to_vec();
+        words.extend(extra);
+        ServeConfig::parse(&args(&words))
+    };
+    assert_eq!(
+        with(&[]).unwrap().frontend_config,
+        PathBuf::from("/etc/kbf/host-install-frontend.toml")
+    );
+    assert_eq!(
+        with(&["--frontend-config", "/etc/kbf/fe-b.toml"])
+            .unwrap()
+            .frontend_config,
+        PathBuf::from("/etc/kbf/fe-b.toml")
+    );
+    assert_eq!(
+        with(&["--frontend-config=/x.toml"])
+            .unwrap()
+            .frontend_config,
+        PathBuf::from("/x.toml")
+    );
+    assert!(
+        with(&["--frontend-config=a.toml"])
+            .unwrap_err()
+            .contains("absolute")
+    );
+    assert!(
+        with(&["--frontend-config=/a", "--frontend-config=/b"])
+            .unwrap_err()
+            .contains("given twice")
+    );
+    let units = ServeConfig::parse(&args(&[
+        "--socket",
+        "/s",
+        "--socket-user",
+        "u",
+        "--restart-unit",
+        "kbf-daemon.service",
+        "--frontend-config=/a",
+    ]));
+    assert!(units.unwrap_err().contains("needs --frontend-container"));
+}

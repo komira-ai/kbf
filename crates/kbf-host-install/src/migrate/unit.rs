@@ -38,12 +38,27 @@ fn is_list(directive: &str) -> bool {
     )
 }
 
-/// The characters a word of a flag may have: enough for `--cold-store=file:///var/lib/kbf/cold`,
-/// `--listen=0.0.0.0:8981` and `--node-id st1`, and no character a shell or systemd would
-/// read for itself.
+/// The punctuation a word of a flag may have besides ASCII letters and digits, each safe in a
+/// systemd `ExecStart=` word written without quotes:
+///
+/// - `_ . / : = @ + , ~ -` are in paths, addresses and `--flag=value` (`file:///var/lib/kbf/cold`,
+///   `0.0.0.0:8981`); systemd reads none of them, and the prefix characters (`@ - : + !`) matter
+///   only at the start of the whole command, which `parse` checks apart.
+/// - `?` and `&` join the query of a cold-store URL
+///   (`s3://bucket/prefix/?endpoint=http://127.0.0.1:9000&conditional-put=true`). systemd is not
+///   a shell: neither starts a glob, a background job or a pipeline in an `ExecStart=` word.
+///
+/// Refused on purpose: whitespace (it splits words), quotes and `\` (systemd unquotes and
+/// unescapes them), `$` (variable expansion), `%` (a specifier, written `%%` in a unit) and `;`
+/// (a separator of commands).
+const WORD_PUNCTUATION: &[u8] = b"_./:=@+,~-?&";
+
+/// Whether `word` is one a drop-in can carry unchanged: enough for
+/// `--cold-store=file:///var/lib/kbf/cold`, `--listen=0.0.0.0:8981` and `--node-id st1`, and
+/// no character systemd would read for itself.
 fn plain_word(word: &str) -> bool {
     word.bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b"_./:=@+,~-".contains(&b))
+        .all(|b| b.is_ascii_alphanumeric() || WORD_PUNCTUATION.contains(&b))
 }
 
 /// Join the lines the file continues with a backslash into the lines systemd reads, dropping

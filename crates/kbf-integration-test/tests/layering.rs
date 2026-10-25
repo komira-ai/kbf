@@ -58,8 +58,10 @@
 //!   that cannot see `kbf-objstore` beneath it, which would make that check pass vacuously;
 //! - the hot/cold object store library (`tierstore`) depending, directly or through another
 //!   crate, on any other crate of this workspace, which would stop it from moving to a
-//!   repository of its own; and a walk that cannot see its dependencies, which would make
-//!   that check pass vacuously.
+//!   repository of its own (its `s3` feature, off unless a crate turns it on, adds the S3
+//!   client of `kbf-objstore`; a crate that turns it on is a change to make here on
+//!   purpose); and a walk that cannot see its dependencies, which would make that check pass
+//!   vacuously.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -576,6 +578,8 @@ fn pack_reaches_neither_the_frontend_nor_the_daemon() {
 /// Asserts that the normal dependencies of the object store library (`tierstore`), direct
 /// and through other crates, include no other crate of this workspace, and that the walk
 /// sees its dependencies (it reaches `tokio`), so the check does not pass on an empty walk.
+/// The graph has the features of the whole workspace: `tierstore`'s `s3` feature, which adds
+/// `kbf-objstore`, is off in it, and a crate that turned it on would fail this test.
 #[test]
 fn tierstore_reaches_no_other_workspace_crate() {
     let g = load_graph();

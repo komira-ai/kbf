@@ -274,7 +274,7 @@ fn settled(units: &[&str]) -> FakeOs {
     os.subuid = "kbf:100000:65536\n".to_owned();
     os.subgid = os.subuid.clone();
     os.lingering.insert("kbf".to_owned());
-    for u in units.iter().chain(&["kbf-installer.service"]) {
+    for u in units {
         os.enabled.insert((*u).to_owned());
     }
     os
@@ -341,7 +341,6 @@ fn a_bare_daemon_host_gets_accounts_dirs_token_settings_config_then_units() {
             "run /usr/sbin/usermod --add-subgids 100000-165535 -- kbf",
             "run /usr/bin/loginctl enable-linger kbf",
             "run /usr/bin/systemctl enable --now -- kbf-daemon.service",
-            "run /usr/bin/systemctl enable --now -- kbf-installer.service",
         ]
     );
     let dirs: Vec<_> = exec
@@ -682,7 +681,6 @@ fn each_mode_enables_its_own_units() {
         let expected: Vec<String> = units
             .iter()
             .map(|u| format!("run /usr/bin/systemctl enable{now} -- {u}"))
-            .chain(["run /usr/bin/systemctl enable --now -- kbf-installer.service".to_owned()])
             .collect();
         assert_eq!(enables, expected, "{mode:?}");
         assert_eq!(mode_units(mode), units, "{mode:?}");
@@ -701,10 +699,7 @@ fn nothing_of_the_mode_starts_without_a_release_or_with_no_start() {
             .into_iter()
             .filter(|c| c.contains("systemctl"))
             .collect::<Vec<_>>(),
-        [
-            "run /usr/bin/systemctl enable -- kbf-daemon.service",
-            "run /usr/bin/systemctl enable --now -- kbf-installer.service",
-        ]
+        ["run /usr/bin/systemctl enable -- kbf-daemon.service",]
     );
     assert!(out.contains("no release is installed yet"), "{out}");
     let mut exec = released(host(), Platform::Linux);
@@ -736,10 +731,7 @@ fn a_host_with_the_kbf_package_and_no_release_tree_starts_its_units() {
         .collect();
     assert_eq!(
         systemctl,
-        [
-            "run /usr/bin/systemctl enable --now -- kbf-daemon.service",
-            "run /usr/bin/systemctl enable --now -- kbf-installer.service",
-        ]
+        ["run /usr/bin/systemctl enable --now -- kbf-daemon.service",]
     );
     assert!(!out.contains("no release is installed yet"), "{out}");
     let mut exec = host();
@@ -751,10 +743,7 @@ fn a_host_with_the_kbf_package_and_no_release_tree_starts_its_units() {
         .collect();
     assert_eq!(
         systemctl,
-        [
-            "run /usr/bin/systemctl enable -- kbf-frontend.service",
-            "run /usr/bin/systemctl enable --now -- kbf-installer.service",
-        ]
+        ["run /usr/bin/systemctl enable -- kbf-frontend.service",]
     );
 }
 
@@ -1629,9 +1618,6 @@ mod provision;
 
 #[path = "proxy_tests.rs"]
 mod proxy_tests;
-
-#[path = "proxy_listen_tests.rs"]
-mod proxy_listen;
 
 #[path = "old_backup_tests.rs"]
 mod old_backup;

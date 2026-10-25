@@ -62,6 +62,8 @@ pub(super) struct Inner {
     pub(super) lies_about_commit: Option<String>,
     /// Every `run` that was asked, as docker's arguments.
     pub(super) runs: Vec<Vec<String>>,
+    /// The container's name and operator API when they are not the default ones.
+    pub(super) serving: Option<(String, SocketAddr)>,
 }
 
 /// The world, shared by the runtime, the probe and the test.
@@ -110,6 +112,11 @@ impl World {
             commit.to_owned(),
         ));
         id
+    }
+
+    /// The container is called `name` and its operator API is `api`.
+    pub(super) fn serving(&self, name: &str, api: &str) {
+        self.0.borrow_mut().serving = Some((name.to_owned(), api.parse().unwrap()));
     }
 
     pub(super) fn made(&self) -> Option<Made> {
@@ -198,7 +205,11 @@ impl Runtime for World {
         if inner.inspect_fails_from.is_some_and(|n| inner.inspects > n) {
             return Err(RuntimeError("docker inspect failed".to_owned()));
         }
-        assert_eq!(name, "kbf-frontend");
+        let expected = inner
+            .serving
+            .as_ref()
+            .map_or("kbf-frontend", |s| s.0.as_str());
+        assert_eq!(name, expected);
         Ok(inner.container.as_ref().map(|c| Container {
             image_id: c.image_id.clone(),
             image_ref: c.image_ref.clone(),
@@ -272,7 +283,11 @@ impl Probe for World {
             });
         }
         let refused = || Err(format!("{addr}{path}: connection refused"));
-        if addr != API.parse::<SocketAddr>().unwrap() {
+        let api = inner
+            .serving
+            .as_ref()
+            .map_or_else(|| API.parse().unwrap(), |s| s.1);
+        if addr != api {
             return refused();
         }
         let Some(c) = inner.container.as_ref().filter(|c| c.running) else {

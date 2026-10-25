@@ -38,6 +38,7 @@ pub mod server;
 pub mod spawn;
 pub mod start;
 pub mod sweep;
+mod xattr;
 
 #[cfg(target_os = "macos")]
 pub mod macos;

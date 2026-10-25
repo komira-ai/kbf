@@ -256,6 +256,28 @@ fn the_drop_in_names_the_mode_and_the_account_the_unit_ran_as() {
     assert!(text.contains("boot-check --mode=daemon\n"));
 }
 
+/// A flag with `?` and `&` reaches the drop-in byte for byte, on `ExecStart=` and on the check.
+#[test]
+fn a_cold_store_url_with_a_query_reaches_the_drop_in_byte_for_byte() {
+    let flag = "--cold-store=s3://bucket-name/prefix/?endpoint=http://127.0.0.1:30900&conditional-put=true";
+    let old = unit::parse(
+        &format!("[Service]\nExecStart=/r/current/kbf --mode=storage {flag}\n"),
+        "/r",
+    )
+    .unwrap();
+    let text = drop_in(&old, "storage");
+    assert!(
+        text.contains(&format!("ExecStart=/usr/bin/kbf --mode=storage {flag}\n")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "ExecStartPre=/usr/bin/kbf --mode=storage {flag} --check\n"
+        )),
+        "{text}"
+    );
+}
+
 /// What the migration cannot carry, or finds wrong, is refused before anything changes: the
 /// host is not on the hand-placed layout, a release is on trial, the unit is not one it can
 /// read, or the package in the directory is not a verified package of the commit the host runs.

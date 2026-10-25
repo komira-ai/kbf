@@ -218,3 +218,71 @@ fn the_file_is_read_through_the_trust() {
     let why = FrontendConfig::load(&trust, &path).unwrap_err();
     assert!(why.contains("frontend.toml"), "{why}");
 }
+
+/// `group_add` gids come out as `--group-add <gid>` words, in the order given, after `--user`
+/// and before the first `--publish`.
+#[test]
+fn group_add_gids_are_exact_argv_words_in_order() {
+    let text = MINIMAL.replace(
+        "restart = \"unless-stopped\"",
+        "restart = \"unless-stopped\"\nuser = \"65532:65532\"\ngroup_add = [\"990\", \"4294967295\", \"007\"]\nports = [\"8980:8980\"]",
+    );
+    let config = FrontendConfig::parse(&text).unwrap();
+    assert_eq!(config.run.group_add, [990, u32::MAX, 7]);
+    assert_eq!(
+        config.run.run_args("sha256:abc"),
+        [
+            "run",
+            "--detach",
+            "--name",
+            "kbf-frontend",
+            "--restart",
+            "unless-stopped",
+            "--user",
+            "65532:65532",
+            "--group-add",
+            "990",
+            "--group-add",
+            "4294967295",
+            "--group-add",
+            "7",
+            "--publish",
+            "8980:8980",
+            "sha256:abc"
+        ]
+    );
+    // Left out, there is none.
+    assert!(
+        FrontendConfig::parse(MINIMAL)
+            .unwrap()
+            .run
+            .group_add
+            .is_empty()
+    );
+}
+
+/// A gid that is not a decimal number from 1 to 4294967295 is refused, naming `group_add`.
+#[test]
+fn a_gid_that_is_not_a_plain_nonzero_number_is_refused() {
+    for bad in [
+        "0",
+        "admin",
+        "-1",
+        "+5",
+        "1 2",
+        " 7",
+        "7 ",
+        "",
+        "0x10",
+        "4294967296",
+        "1e3",
+        "٣",
+    ] {
+        let text = with(&format!("group_add = [{bad:?}]"));
+        assert!(refusal(&text).contains("group_add"), "{bad:?}");
+    }
+    // One bad gid among good ones refuses the file.
+    assert!(refusal(&with("group_add = [\"990\", \"0\"]")).contains("group_add"));
+    // A number that is not quoted is not a string: refused too.
+    FrontendConfig::parse(&with("group_add = [990]")).unwrap_err();
+}

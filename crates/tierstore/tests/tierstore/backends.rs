@@ -8,7 +8,8 @@ use tierstore::{
     SystemClock, TestClock, decode_journal, encode_journal,
 };
 
-use crate::support::{body, check_ranges, keys, page};
+use crate::conformance;
+use crate::support::{body, keys};
 
 /// Asserts that a second put of a key is refused with `AlreadyExists` and leaves the first
 /// object's bytes in place, on two separate backends (the hot and the cold tier are two).
@@ -17,21 +18,17 @@ async fn a_second_put_of_a_key_is_refused_and_changes_nothing() {
     let first = MemoryBackend::new();
     let second = MemoryBackend::new();
     for backend in [&first, &second] {
-        backend.put("k", body("one")).await.unwrap();
-        let again = backend.put("k", body("two")).await;
-        assert_eq!(again, Err(Error::AlreadyExists("k".to_owned())));
-        assert_eq!(backend.get("k", None).await.unwrap(), body("one"));
+        conformance::a_second_put_is_refused(backend).await;
     }
 }
 
 /// Asserts that ranges are byte-exact on a backend: the first byte, the last byte, a slice
-/// in the middle, a range running past the end (cut at the end), empty ranges inside the
-/// object and at its end, and an error for a range starting past the end.
+/// in the middle, a range running past the end (cut at the end, even when its end overflows
+/// a number), empty ranges inside the object and at its end, and an error for a range
+/// starting past the end.
 #[tokio::test]
 async fn ranges_are_byte_exact() {
-    let backend = MemoryBackend::new();
-    backend.put("k", body("0123456789")).await.unwrap();
-    check_ranges(&backend, "k").await;
+    conformance::ranges_are_byte_exact(&MemoryBackend::new()).await;
 }
 
 /// Asserts that a range reports the offset and the size it was made with.
@@ -43,22 +40,25 @@ fn a_range_reports_what_it_was_made_with() {
 }
 
 /// Asserts that head gives the size and a content tag that is equal for equal bytes and
-/// different for different bytes of the same size, and that `same_content` compares the two
-/// and not the times of last write.
+/// different for different bytes of the same size, and that `same_content` compares the two.
 #[tokio::test]
 async fn head_gives_the_size_and_a_tag_of_the_content() {
+    let backend = MemoryBackend::new();
+    conformance::head_gives_the_size_and_a_tag_of_the_content(&backend).await;
+}
+
+/// Asserts that head gives the time of last write that the clock of the backend said when the
+/// object was put, and that `same_content` compares the content and not those times.
+#[tokio::test]
+async fn head_gives_the_time_of_last_write_and_same_content_ignores_it() {
     let clock = Arc::new(TestClock::new());
     let backend = MemoryBackend::with_clock(clock.clone());
     backend.put("a", body("same")).await.unwrap();
     clock.set(7);
     backend.put("b", body("same")).await.unwrap();
-    backend.put("c", body("diff")).await.unwrap();
     let a = backend.head("a").await.unwrap();
     let b = backend.head("b").await.unwrap();
-    let c = backend.head("c").await.unwrap();
-    assert_eq!(a.size, 4);
     assert!(a.same_content(&b));
-    assert!(!a.same_content(&c));
     assert_eq!((a.modified, b.modified), (0, 7));
 }
 
@@ -83,58 +83,45 @@ async fn a_listing_gives_the_times_of_last_write() {
 #[tokio::test]
 async fn an_absent_key_is_not_found_and_deleting_it_succeeds() {
     let backend = MemoryBackend::new();
-    let missing = Error::NotFound("k".to_owned());
-    assert_eq!(backend.get("k", None).await.unwrap_err(), missing);
-    assert_eq!(backend.head("k").await.unwrap_err(), missing);
-    assert_eq!(backend.delete("k").await, Ok(()));
-    assert_eq!(keys(&backend).await, Vec::<String>::new());
+    conformance::an_absent_key_is_not_found_and_deleting_it_succeeds(&backend).await;
 }
 
 /// Asserts that a delete removes the object and that a deleted key can be put again.
 #[tokio::test]
 async fn a_deleted_key_is_gone_and_can_be_put_again() {
     let backend = MemoryBackend::new();
-    backend.put("k", body("old")).await.unwrap();
-    backend.delete("k").await.unwrap();
-    assert_eq!(keys(&backend).await, Vec::<String>::new());
-    backend.put("k", body("new")).await.unwrap();
-    assert_eq!(backend.get("k", None).await.unwrap(), body("new"));
+    conformance::a_deleted_key_is_gone_and_can_be_put_again(&backend).await;
 }
 
 /// Asserts that a listing holds the keys under the prefix, in key order, with their sizes.
 #[tokio::test]
 async fn a_listing_holds_the_keys_under_a_prefix_in_order() {
     let backend = MemoryBackend::new();
-    backend.put("b/2", body("bb")).await.unwrap();
-    backend.put("a/1", body("a")).await.unwrap();
-    backend.put("b/1", body("b")).await.unwrap();
-    assert_eq!(keys(&backend).await, ["a/1", "b/1", "b/2"]);
-    let listed = backend.list("b/").await.unwrap();
-    let sizes: Vec<u64> = listed.iter().map(|object| object.size).collect();
-    assert_eq!(sizes, [1, 2]);
-    let names: Vec<&str> = listed.iter().map(|object| object.key.as_str()).collect();
-    assert_eq!(names, ["b/1", "b/2"]);
+    conformance::a_listing_holds_the_keys_under_a_prefix_in_order(&backend).await;
 }
 
 /// Asserts that a page of a listing holds at most `max_keys` keys that sort after the
-/// start-after key, in key order, and that a page shorter than `max_keys` is the last.
+/// start-after key, in key order, that a page shorter than `max_keys` is the last, and that
+/// a page of none holds none.
 #[tokio::test]
 async fn a_page_of_a_listing_starts_after_a_key_and_is_cut_at_max_keys() {
     let backend = MemoryBackend::new();
-    for key in ["a", "b", "c", "d", "x"] {
-        backend.put(key, body("v")).await.unwrap();
-    }
-    assert_eq!(page(&backend, None, 2).await, ["a", "b"]);
-    assert_eq!(page(&backend, Some("b"), 2).await, ["c", "d"]);
-    assert_eq!(page(&backend, Some("d"), 2).await, ["x"]);
-    assert_eq!(page(&backend, Some("x"), 2).await, Vec::<String>::new());
+    conformance::a_page_starts_after_a_key_and_is_cut_at_max_keys(&backend).await;
 }
 
-/// Asserts that a put with the content tag of the object replaces it, gives the new object's
-/// content tag, and moves the time of last write; that a put with another tag is refused and
-/// changes nothing; and that a put over an absent key is `NotFound`.
+/// Asserts that a put with the content tag of the object replaces it and gives the new
+/// object's content tag; that a put with another tag, or with the tag the object had before,
+/// is refused and changes nothing; and that a put over an absent key is `NotFound`.
 #[tokio::test]
 async fn a_put_if_match_replaces_only_the_object_with_that_tag() {
+    let backend = MemoryBackend::new();
+    conformance::a_put_if_match_replaces_only_the_object_with_that_tag(&backend).await;
+}
+
+/// Asserts that a put that replaces moves the time of last write on, and that a put that is
+/// refused does not.
+#[tokio::test]
+async fn a_put_if_match_moves_the_time_of_last_write_only_when_it_replaces() {
     let clock = Arc::new(TestClock::new());
     let backend = MemoryBackend::with_clock(clock.clone());
     backend.put("k", body("one")).await.unwrap();
@@ -142,20 +129,12 @@ async fn a_put_if_match_replaces_only_the_object_with_that_tag() {
 
     clock.set(9);
     let wrong = backend.put_if_match("k", body("x"), "not-the-tag").await;
-    assert_eq!(wrong, Err(Error::PreconditionFailed("k".to_owned())));
-    assert_eq!(backend.get("k", None).await.unwrap(), body("one"));
+    assert!(wrong.is_err());
     assert_eq!(backend.head("k").await.unwrap().modified, 0);
 
     let swap = backend.put_if_match("k", body("two"), &tag);
-    let new_tag = swap.await.unwrap();
-    let head = backend.head("k").await.unwrap();
-    assert_eq!(head.tag, new_tag);
-    assert_ne!(new_tag, tag);
-    assert_eq!(head.modified, 9);
-    assert_eq!(backend.get("k", None).await.unwrap(), body("two"));
-
-    let absent = backend.put_if_match("other", body("x"), &tag).await;
-    assert_eq!(absent, Err(Error::NotFound("other".to_owned())));
+    swap.await.unwrap();
+    assert_eq!(backend.head("k").await.unwrap().modified, 9);
 }
 
 /// Asserts that a journal encodes as a JSON list of entries with the operation in capitals,

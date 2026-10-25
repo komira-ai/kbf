@@ -37,9 +37,9 @@
 //!   frontends that run under their own units, configured by hand with `[[proxy.frontend]]`
 //!   tables (docs/design/kbf-proxy-api.md, the pool section). A `[proxy]` table that
 //!   `installer.toml` already has is read and written back as it is.
-//! - `[proxy] listen` of `installer.toml` (the operator's key) becomes the drop-in
-//!   `kbf-proxy.socket.d/listen.conf` on Linux, and no key removes the drop-in. Setup never
-//!   reloads systemd or restarts the socket: it says that is needed.
+//! - `[proxy] listen` of `installer.toml` is the operator's key and setup writes no drop-in
+//!   for it: the `kbf` package ships no `kbf-proxy.socket` to move, and no unit of the proxy
+//!   or of the installer is enabled (the units setup enables are the mode's).
 //! - It writes no release source and none of the keys that go with one: `installer.toml` keeps
 //!   the `release_source` and the keys a host set up by an earlier build has, and a host with no
 //!   file gets the default source. The flags that named them (`--release-source`,

@@ -27,7 +27,9 @@ use std::collections::BTreeSet;
 use kbf_driver_native::slots::clean::{
     self, Check, Left, Os, Outcome, STEPS, Skipped, Step, WithSkipped,
 };
-use support::slot_rows::{COVERS, ROWS, UNCOVERED, UNROWED, covered_by};
+use support::slot_rows::{
+    CORE, COVERS, ROWS, UNCOVERED, UNROWED, Unplanted, classify_unplanted, covered_by,
+};
 
 /// A row left by the lease, and the step that removes it.
 type Residue = (&'static str, Step);
@@ -241,4 +243,42 @@ step_tests! {
 #[test]
 fn there_is_a_test_of_necessity_for_every_step() {
     assert_eq!(TESTED, STEPS);
+}
+
+/// Catches a test that passes vacuously (a core row unplanted), one that fails where the
+/// system only refuses crontab or at (a launch daemon's context), and one that excuses a row
+/// for anything but the plant's exact `refused <row>: EPERM` line.
+#[test]
+fn a_row_the_system_refuses_is_not_plantable_and_any_other_unplanted_row_fails() {
+    let text =
+        "crontab: tmp/tmp.1: Operation not permitted\nrefused crontab: EPERM\nrefused at: EPERM\n";
+    let got = classify_unplanted(&["crontab", "at"], text);
+    assert_eq!(got.failed, Vec::<String>::new());
+    assert_eq!(
+        got.not_plantable,
+        vec![
+            ("crontab".to_owned(), "refused crontab: EPERM".to_owned()),
+            ("at".to_owned(), "refused at: EPERM".to_owned()),
+        ]
+    );
+    // The tool's own words are not the marker; nor is another row's line, nor a row that
+    // may not be excused, whatever the output says.
+    let got = classify_unplanted(
+        &["crontab", "at", "shared", "var-tmp", "sem"],
+        "crontab: bad: Operation not permitted\nrefused shared: EPERM\nrefused var-tmp: EPERM\nrefused sem: EPERM\nrefused attic: EPERM\n",
+    );
+    assert_eq!(got.failed, ["crontab", "at", "shared", "var-tmp", "sem"]);
+    assert!(got.not_plantable.is_empty());
+    for row in CORE {
+        let got = classify_unplanted(&[row], &format!("refused {row}: EPERM\n"));
+        assert_eq!(
+            got,
+            Unplanted {
+                not_plantable: Vec::new(),
+                failed: vec![row.to_owned()]
+            },
+            "{row}"
+        );
+    }
+    assert!(CORE.iter().all(|c| ROWS.iter().any(|(r, _)| r == c)));
 }

@@ -110,3 +110,40 @@ pub fn covered_by(step: Step) -> &'static [&'static str] {
         .find(|(s, _)| *s == step)
         .map_or(&[], |(_, rows)| *rows)
 }
+
+/// The rows lease A must plant on any Mac: a run that planted fewer proves nothing.
+pub const CORE: [&str; 7] = ["home", "T", "C", "keychain", "agent", "defaults", "tmp"];
+
+/// The only rows whose planting the system may refuse and the test excuse: the setuid
+/// schedulers, which a launch daemon without Full Disk Access is refused.
+const EXCUSABLE: [&str; 2] = ["crontab", "at"];
+
+/// How [`classify_unplanted`] sorted the rows lease A did not plant.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Unplanted {
+    /// Rows the system refused to let lease A plant here: the row and the line that says so
+    /// ("Operation not permitted" or EPERM). They are left out of the precondition.
+    pub not_plantable: Vec<(String, String)>,
+    /// Rows not planted for any other reason, or a [`CORE`] row at all: the test fails.
+    pub failed: Vec<String>,
+}
+
+/// Sorts `unplanted` (rows not planted) by what the plant's own output `text` says: a row
+/// of [`EXCUSABLE`] for which the plant printed exactly `refused <row>: EPERM` is not
+/// plantable here; every other row, and every core row, is a failure.
+#[must_use]
+pub fn classify_unplanted(unplanted: &[&str], text: &str) -> Unplanted {
+    let mut sorted = Unplanted::default();
+    for row in unplanted {
+        let line = format!("refused {row}: EPERM");
+        let refused = EXCUSABLE.contains(row)
+            && !CORE.contains(row)
+            && text.lines().any(|l| l.trim() == line);
+        if refused {
+            sorted.not_plantable.push(((*row).to_owned(), line));
+        } else {
+            sorted.failed.push((*row).to_owned());
+        }
+    }
+    sorted
+}
