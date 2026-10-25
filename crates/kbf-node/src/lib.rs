@@ -34,10 +34,10 @@
 //! lease's input files from, and the shared input trees. Their budgets
 //! come from the filesystem, not from flags; `--data-max-bytes` only lowers them.
 //!
-//! With `--pack-read` (off by default; `pack_read`) the data plane of `kbf daemon` reads blobs
-//! from the packs of the farm's object store first, finding them through the frontend's pack
-//! index; a blob it does not locate is read where it always was, and outputs are stored
-//! where they were.
+//! With `--pack-read` (off by default; `pack_read`) the data plane of `kbf daemon` and of the
+//! daemon half of `kbf storage-and-daemon` with a frontend reads blobs from the packs of the
+//! farm's object store first, finding them through the frontend's pack index; a blob it does
+//! not locate is read where it always was, and outputs are stored where they were.
 //!
 //! The log goes to stderr, in color only when stderr is a terminal: under launchd or
 //! systemd it is a file or a journal, where escape codes are noise (issue #170). The
@@ -611,12 +611,15 @@ pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
 /// storage-and-daemon` with a frontend): the data plane routes every blob by the map the
 /// frontend sends, the blobs of `local` in-process and the others over TLS to their
 /// owners ([`kbf_daemon::member_cas`]). There is no `--cas` leg: with no map held a call
-/// fails UNAVAILABLE and writes nothing.
+/// fails UNAVAILABLE and writes nothing. With `--pack-read` reads ask the packs first
+/// (`pack_read`), the frontend over a connection to the first `--server`.
 ///
 /// # Errors
 /// As [`start`].
 pub fn start_member(cli: &Cli, local: LocalMember) -> Result<NodeHandle, Error> {
-    cli.pack_read.refuse_in_process()?;
+    if let Some(settings) = cli.pack_read.settings() {
+        return pack_read::start_member(cli, local, settings);
+    }
     let maps = Arc::new(MapHolder::new());
     let held = Arc::clone(&maps);
     let own = local.addr().to_owned();

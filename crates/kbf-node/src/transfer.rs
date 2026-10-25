@@ -82,9 +82,25 @@ pub(crate) fn endpoint(cli: &Cli) -> Result<Endpoint, Error> {
         .cas
         .clone()
         .ok_or("--cas is required by the container and native drivers")?;
+    mutual("--cas", cli, url)
+}
+
+/// The endpoint of the first `--server`, the frontend's worker listener the daemon's session
+/// is made to, over mutual TLS with the daemon's own TLS files and the daemon's HTTP/2
+/// keepalive, for a daemon that has no `--cas` (`kbf storage-and-daemon`). The certificate
+/// presented is the one the session presents, so it names the same role. Nothing connects
+/// until it is used.
+pub(crate) fn server_endpoint(cli: &Cli) -> Result<Endpoint, Error> {
+    let url = cli.daemon.servers.first().cloned();
+    mutual("--server", cli, url.ok_or("--server is required")?)
+}
+
+/// The endpoint at `url`, which `flag` named, over mutual TLS with the daemon's own TLS files
+/// and the daemon's HTTP/2 keepalive.
+fn mutual(flag: &str, cli: &Cli, url: String) -> Result<Endpoint, Error> {
     if !url.starts_with("https://") {
         return Err(format!(
-            "--cas {url:?} must be an https:// URL: the server's worker listener, which \
+            "{flag} {url:?} must be an https:// URL: the server's worker listener, which \
              serves blobs over mutual TLS only"
         )
         .into());
