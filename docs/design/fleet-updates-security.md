@@ -356,22 +356,30 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 > - **The image verbs** `image-setup <bundle>` and `image-harvest <bundle> <out>` are the two
 >   root-only steps of building a guest image (`kbf-vmm image setup`, which writes the guest's
 >   Data volume offline, and `kbf-vmm image harvest`, a read-only attach), so the daemon runs
->   them and no one needs `sudo`. The program is `--vmm` (default the kit's `current/kbf-vmm`)
->   and the guest binary is `--guest-binary`; each must be a regular file, root's and writable
->   by no one else, and a request carries no program and no argument but the paths (the wire
->   refuses unknown fields). A path must be a name directly inside `--images-dir`, compared by
->   component (`..`, a longer path and a lookalike sibling are refused); the helper builds the
->   path it passes on from the configured directory and that name. The images directory is the
->   helper's own and not writable by others (group-writable only with the sticky bit, which is
->   what keeps the VM user from renaming a bundle the helper has taken). Before `kbf-vmm` runs
->   the helper opens the bundle without following a link, makes it root's and mode 0700
->   through the descriptor, checks the name still leads to it, and makes every file in it
->   root's, refusing anything but plain single-link files. After `image-setup` the files, then
->   the bundle, go to the VM user and carry `uchg` (`chflags -h`); after `image-harvest` the
->   owners and modes go back to what they were. `image-harvest` makes `<out>` itself (new,
->   root's, 0700) and has `kbf-vmm` write `<out>/files`. A user-immutable flag is one its owner
->   can clear, so `uchg` on a bundle the VM user owns stops accidents, not the VM user; keeping
->   the base root's and group-readable with `schg` is the stronger layout and is not built.
+>   them and no one needs `sudo`. Two directories: `--staging-dir`, which the VM user owns and
+>   `kbf-vmm image base --out` builds a new bundle in (and keeps clones in), and `--images-dir`,
+>   which is root's, closed to group and others (the helper refuses it otherwise, sticky bit
+>   or not), and holds sealed bases and harvest output. The program is `--vmm` (default the
+>   kit's `current/kbf-vmm`) and the guest binary is `--guest-binary`; each must be a regular
+>   file, root's and writable by no one else, and a request carries no program and no argument
+>   but the paths (the wire refuses unknown fields). A path must be a name directly inside the
+>   directory it belongs to, compared by component (`..`, a longer path and a lookalike sibling
+>   are refused); the helper builds the path it passes on from the configured directory and
+>   that name. A bundle the VM user owns is taken first: opened without following a link, made
+>   root's and mode 0700 through the descriptor, the name checked again, every file in it made
+>   root's, anything but plain single-link files refused. `image-setup` then moves the bundle
+>   into the images directory with a rename (one volume; the name is checked again there, as
+>   the user owns the staging directory, and the move is undone if something else arrived),
+>   runs `kbf-vmm`, and seals the base: it STAYS root's, directory mode 0750 and files 0640
+>   with the VM user's primary group, and root sets `uchg` on the files and then the
+>   directory. The VM user clones it through its group and cannot change or unflag it; a
+>   clone keeps `uchg` and is the user's own, so `kbf-vmm`'s clone step clears it on each
+>   clone right after `clonefile` (measured on a Mac: a non-root `clonefile` of a root-owned
+>   0640 base works, the clone keeps the flag, the user can clear it only on its own copy). A
+>   failure after the take moves the bundle back to staging with its owners and modes.
+>   `image-harvest` takes a kept clone from staging (and gives it back as it was) or reads a
+>   sealed base in the images directory (already closed, so left alone), makes `<out>` itself
+>   (new, root's, 0700) in the images directory and has `kbf-vmm` write `<out>/files`.
 > - Every program the switch and the scan run (`defaults`, `launchctl`, `fdesetup`,
 >   `sfltool`) goes through the host's command runner with an empty environment, so
 >   the unit tests fake each one and nothing in CI restarts: the macOS CI job runs the

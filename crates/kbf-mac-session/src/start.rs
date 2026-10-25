@@ -75,13 +75,18 @@ pub struct Args {
     /// rests at the login window and the `role-*` verbs are refused.
     #[arg(long)]
     pub vm_user: Option<VmUser>,
-    /// The directory of guest image bundles the image verbs (`image-setup`,
-    /// `image-harvest`) act in: only a bundle directly inside it. It must be the helper's
-    /// own (root's) and not writable by others; group-writable only with the sticky bit,
-    /// so the VM user can make a bundle in it but cannot move one the helper has taken.
-    /// It may be reached through a link (`/var` is one); nothing below it may be.
+    /// The directory of sealed guest base images and harvest output the image verbs
+    /// (`image-setup`, `image-harvest`) act in: only a name directly inside it. It must be
+    /// the helper's own (root's) and not writable by group or others; a sealed base in it
+    /// stays root's, so the VM user can read it through its group and never change it. It
+    /// may be reached through a link (`/var` is one); nothing below it may.
     #[arg(long, default_value = "/var/db/kbf-vm/images")]
     pub images_dir: PathBuf,
+    /// The directory the VM user builds a new bundle in (`kbf-vmm image base --out`) and
+    /// keeps clones in. `image-setup` takes a bundle by name from it and moves it into
+    /// the images directory, so it must be on the same volume.
+    #[arg(long, default_value = "/var/db/kbf-vm/staging")]
+    pub staging_dir: PathBuf,
     /// The `kbf-vmm` the image verbs run, the only program they run. It must be a regular
     /// file, the helper's own (root's) and writable by no one else; the path may go
     /// through the kit's `current` link.
@@ -98,6 +103,7 @@ impl Args {
     fn image_settings(&self) -> ImageSettings {
         ImageSettings {
             dir: self.images_dir.clone(),
+            staging: self.staging_dir.clone(),
             vmm: self.vmm.clone(),
             guest: self.guest_binary.clone(),
         }

@@ -1,5 +1,9 @@
-//! The image verbs over a fake host: real files in a scratch images directory, the
-//! program runs recorded and answered by the fake.
+//! The image verbs over a fake host: real files in scratch staging and images
+//! directories, the program runs recorded and answered by the fake.
+//!
+//! The tests run as an ordinary user, so "the VM user's" bundle is one the helper does
+//! not count as closed: group-writable (0775 and 0664). A root's closed object is 0750 and
+//! 0640.
 
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
@@ -32,10 +36,11 @@ fn set_mode(path: &Path, mode: u32) {
 }
 
 /// A helper whose VM user is this test's own uid (the one account a test can give a file
-/// to), over an images directory holding the installed programs' stand-ins.
+/// to), over a staging and an images directory and the installed programs' stand-ins.
 struct Img {
     rig: Rig,
     images: PathBuf,
+    staging: PathBuf,
     vmm: String,
     guest: String,
 }
@@ -55,8 +60,10 @@ fn img(name: &str) -> Img {
         },
     );
     let settings = rig.helper.settings.image.clone();
-    std::fs::create_dir(&settings.dir).unwrap();
-    set_mode(&settings.dir, 0o755);
+    for (dir, open) in [(&settings.dir, 0o755), (&settings.staging, 0o775)] {
+        std::fs::create_dir(dir).unwrap();
+        set_mode(dir, open);
+    }
     for program in [&settings.vmm, &settings.guest] {
         std::fs::write(program, "program").unwrap();
         set_mode(program, 0o755);
@@ -66,25 +73,42 @@ fn img(name: &str) -> Img {
         vmm: settings.vmm.display().to_string(),
         guest: settings.guest.display().to_string(),
         images: settings.dir,
+        staging: settings.staging,
         rig,
     }
 }
 
 impl Img {
+    /// A name in the images directory, as text.
     fn path(&self, name: &str) -> String {
         self.images.join(name).display().to_string()
     }
 
-    /// A bundle: the four files, mode 0644, in a directory of mode 0755.
-    fn bundle(&self, name: &str) -> PathBuf {
-        let dir = self.images.join(name);
-        std::fs::create_dir(&dir).unwrap();
+    /// A name in the staging directory, as text.
+    fn spath(&self, name: &str) -> String {
+        self.staging.join(name).display().to_string()
+    }
+
+    /// A bundle in `dir`: the four files, in a directory; `dir_mode` and `file_mode`.
+    fn make(dir: &Path, name: &str, dir_mode: u32, file_mode: u32) -> PathBuf {
+        let bundle = dir.join(name);
+        std::fs::create_dir(&bundle).unwrap();
         for file in FILES {
-            std::fs::write(dir.join(file), file).unwrap();
-            set_mode(&dir.join(file), 0o644);
+            std::fs::write(bundle.join(file), file).unwrap();
+            set_mode(&bundle.join(file), file_mode);
         }
-        set_mode(&dir, 0o755);
-        dir
+        set_mode(&bundle, dir_mode);
+        bundle
+    }
+
+    /// A bundle the VM user built, in the staging directory.
+    fn bundle(&self, name: &str) -> PathBuf {
+        Self::make(&self.staging, name, 0o775, 0o664)
+    }
+
+    /// A sealed base in the images directory.
+    fn sealed(&self, name: &str) -> PathBuf {
+        Self::make(&self.images, name, 0o750, 0o640)
     }
 
     /// Every program run so far, as `program arg ...`.
@@ -120,13 +144,22 @@ impl Img {
         )
     }
 
+    /// `kbf-vmm image harvest ...` for the bundle at `bundle` (a path as text).
     fn harvest_command(&self, bundle: &str, out: &str) -> String {
         format!(
-            "{} image harvest --bundle {} --out {}/files",
+            "{} image harvest --bundle {bundle} --out {}/files",
             self.vmm,
-            self.path(bundle),
             self.path(out)
         )
+    }
+
+    /// `chflags -h uchg` on the four files of the base `name`, then on the base.
+    fn flag_commands(&self, name: &str) -> [String; 2] {
+        let files = FILES.map(|f| format!(" {}", self.path(&format!("{name}/{f}"))));
+        [
+            format!("{CHFLAGS} -h uchg{}", files.concat()),
+            format!("{CHFLAGS} -h uchg {}", self.path(name)),
+        ]
     }
 
     /// Notes `look` of the filesystem at each program run, by the command's text.
@@ -139,10 +172,19 @@ impl Img {
         seen
     }
 
-    fn untouched(&self, bundle: &Path) {
-        assert_eq!(mode(bundle), 0o755, "{}", bundle.display());
+    /// A bundle the VM user built is as it was: its modes, in `dir`.
+    fn as_built(&self, bundle: &Path) {
+        assert_eq!(mode(bundle), 0o775, "{}", bundle.display());
         for file in FILES {
-            assert_eq!(mode(&bundle.join(file)), 0o644);
+            assert_eq!(mode(&bundle.join(file)), 0o664, "{file}");
+        }
+    }
+
+    /// A sealed base is as sealed.
+    fn as_sealed(&self, bundle: &Path) {
+        assert_eq!(mode(bundle), 0o750, "{}", bundle.display());
+        for file in FILES {
+            assert_eq!(mode(&bundle.join(file)), 0o640, "{file}");
         }
     }
 }
@@ -152,44 +194,70 @@ fn refused(result: Result<String, String>, says: &str) {
     assert!(why.contains(says), "{why}");
 }
 
-/// Catches: a bundle or output path outside the images directory (another directory, a
-/// sibling whose name starts like it, a relative name, the directory itself) reaching
-/// `kbf-vmm`.
+/// Catches: a bundle or output path outside the directory it must be in (another
+/// directory, a sibling whose name starts like it, a relative name, the directory itself,
+/// a file inside a bundle, the images directory for a setup) reaching `kbf-vmm`.
 #[test]
-fn a_bundle_outside_the_images_directory_is_refused() {
+fn a_bundle_outside_the_staging_directory_is_refused() {
     let img = img("outside");
     let inside = img.bundle("b");
     let other = img.rig.dir.join("other");
     std::fs::create_dir(&other).unwrap();
-    let lookalike = img.rig.dir.join("images-evil");
+    let lookalike = img.rig.dir.join("staging-evil");
     std::fs::create_dir(&lookalike).unwrap();
-    for outside in [
+    let staging = img.staging.display().to_string();
+    let images = img.images.display().to_string();
+    let not_a_name = "not a name directly inside";
+    let neither = [
         other.display().to_string(),
         lookalike.join("b").display().to_string(),
         "b".to_owned(),
-        "images/b".to_owned(),
-        img.images.display().to_string(),
         "/".to_owned(),
-        img.path("b/disk.img"),
-    ] {
+    ];
+    for outside in &neither {
         let helper = &img.rig.helper;
-        let says = if outside.ends_with("disk.img") || outside == img.images.display().to_string() {
-            "not a name directly inside"
-        } else {
-            "not inside the images directory"
-        };
-        refused(helper.image_setup(&outside), says);
-        refused(helper.image_harvest(&outside, &img.path("out")), says);
-        refused(helper.image_harvest(&img.path("b"), &outside), says);
+        refused(
+            helper.image_setup(outside),
+            "not inside the staging directory",
+        );
+        refused(
+            helper.image_harvest(outside, &img.path("out")),
+            "inside neither",
+        );
+    }
+    // A sealed base's name is not a setup bundle: setup takes from staging only.
+    refused(
+        img.rig.helper.image_setup(&img.path("b")),
+        "not inside the staging directory",
+    );
+    for deeper in [staging.clone(), img.spath("b/disk.img")] {
+        refused(img.rig.helper.image_setup(&deeper), not_a_name);
+        refused(
+            img.rig.helper.image_harvest(&deeper, &img.path("out")),
+            not_a_name,
+        );
+    }
+    refused(
+        img.rig.helper.image_harvest(&images, &img.path("out")),
+        not_a_name,
+    );
+    // The output goes to the images directory only.
+    let in_staging = img.spath("o");
+    for out in neither.iter().chain([&in_staging]) {
+        refused(
+            img.rig.helper.image_harvest(&img.spath("b"), out),
+            "not inside the images directory",
+        );
     }
     refused(img.rig.helper.image_setup("b\0"), "NUL");
     assert!(img.commands().is_empty());
     assert!(!img.images.join("out").exists());
-    img.untouched(&inside);
+    img.as_built(&inside);
 }
 
 /// Catches: a bundle that is a symlink being followed (the helper would attach a disk
-/// image elsewhere as root), or a link's target being taken (chowned, locked).
+/// image elsewhere as root), or a link's target being taken (chowned, locked), in either
+/// directory.
 #[test]
 fn a_symlinked_bundle_is_refused() {
     let img = img("link");
@@ -197,25 +265,28 @@ fn a_symlinked_bundle_is_refused() {
     std::fs::create_dir(&real).unwrap();
     for file in FILES {
         std::fs::write(real.join(file), file).unwrap();
-        set_mode(&real.join(file), 0o644);
+        set_mode(&real.join(file), 0o664);
     }
-    set_mode(&real, 0o755);
-    symlink(&real, img.images.join("link")).unwrap();
-    symlink(img.rig.dir.join("nowhere"), img.images.join("dangling")).unwrap();
+    set_mode(&real, 0o775);
+    for (dir, prefix) in [(&img.staging, ""), (&img.images, "i")] {
+        symlink(&real, dir.join(format!("{prefix}link"))).unwrap();
+        let nowhere = img.rig.dir.join("nowhere");
+        symlink(nowhere, dir.join(format!("{prefix}dangling"))).unwrap();
+    }
     for name in ["link", "dangling"] {
         refused(
-            img.rig.helper.image_setup(&img.path(name)),
+            img.rig.helper.image_setup(&img.spath(name)),
             "not a plain directory",
         );
-        refused(
-            img.rig
-                .helper
-                .image_harvest(&img.path(name), &img.path("out")),
-            "not a plain directory",
-        );
+        for bundle in [img.spath(name), img.path(&format!("i{name}"))] {
+            refused(
+                img.rig.helper.image_harvest(&bundle, &img.path("out")),
+                "not a plain directory",
+            );
+        }
     }
     assert!(img.commands().is_empty());
-    img.untouched(&real);
+    img.as_built(&real);
     assert!(
         !img.images.join("out").exists(),
         "an output directory was left"
@@ -223,198 +294,271 @@ fn a_symlinked_bundle_is_refused() {
 }
 
 /// Catches: a path that reaches a bundle through a symlinked parent being accepted: a
-/// link to the images directory (outside it by name), and a link inside it (a name
-/// below the images directory is one level deep or refused).
+/// link to the staging directory (outside it by name), and a link inside it (a name below
+/// the directory is one level deep or refused).
 #[test]
 fn a_symlink_in_a_parent_of_the_bundle_is_refused() {
     let img = img("parent");
     let real = img.bundle("b");
     let alias = img.rig.dir.join("alias");
-    symlink(&img.images, &alias).unwrap();
+    symlink(&img.staging, &alias).unwrap();
     refused(
         img.rig
             .helper
             .image_setup(&alias.join("b").display().to_string()),
-        "not inside the images directory",
+        "not inside the staging directory",
     );
-    let sub = img.images.join("sub");
+    let sub = img.staging.join("sub");
     std::fs::create_dir(&sub).unwrap();
     symlink(&real, sub.join("b")).unwrap();
-    symlink(&img.images, img.images.join("self")).unwrap();
+    symlink(&img.staging, img.staging.join("self")).unwrap();
     for deeper in ["sub/b", "self/b"] {
         refused(
-            img.rig.helper.image_setup(&img.path(deeper)),
+            img.rig.helper.image_setup(&img.spath(deeper)),
             "not a name directly inside",
         );
         refused(
             img.rig
                 .helper
-                .image_harvest(&img.path("b"), &img.path(deeper)),
+                .image_harvest(&img.spath("b"), &img.path(deeper)),
             "not a name directly inside",
         );
     }
     assert!(img.commands().is_empty());
-    img.untouched(&real);
+    img.as_built(&real);
 }
 
 /// Catches: `..` accepted, at the front, in the middle or at the end, where it would
-/// lead out of the images directory or to another bundle.
+/// lead out of the directory or to another bundle.
 #[test]
 fn dotdot_is_refused() {
     let img = img("dotdot");
     let real = img.bundle("b");
+    let staging = img.staging.display().to_string();
     let images = img.images.display().to_string();
     for path in [
-        format!("{images}/../images/b"),
-        format!("{images}/b/.."),
-        format!("{images}/.."),
-        format!("{images}/b/../b"),
-        format!("{images}/../../etc"),
+        format!("{staging}/../staging/b"),
+        format!("{staging}/b/.."),
+        format!("{staging}/.."),
+        format!("{staging}/b/../b"),
+        format!("{staging}/../../etc"),
     ] {
         refused(img.rig.helper.image_setup(&path), "`..`");
         refused(
             img.rig.helper.image_harvest(&path, &img.path("out")),
             "`..`",
         );
-        refused(img.rig.helper.image_harvest(&img.path("b"), &path), "`..`");
+    }
+    for path in [
+        format!("{images}/../images/o"),
+        format!("{images}/o/.."),
+        format!("{images}/.."),
+    ] {
+        refused(img.rig.helper.image_harvest(&img.spath("b"), &path), "`..`");
+        refused(
+            img.rig.helper.image_harvest(&path, &img.path("out")),
+            "`..`",
+        );
     }
     assert!(img.commands().is_empty());
-    img.untouched(&real);
+    img.as_built(&real);
 }
 
-/// Catches: the helper running any program but the installed `kbf-vmm` (and `chflags`
-/// on the bundle's own paths), or with any argument but the ones it builds: the
-/// complete list of what runs for each verb.
+/// Catches: the helper running any program but the installed `kbf-vmm` (and `chflags` on
+/// the base's own paths), or with any argument but the ones it builds: the complete list
+/// of what runs for each verb and each place a harvest bundle can be.
 #[test]
 fn the_helper_runs_only_kbf_vmm_and_chflags_with_its_own_arguments() {
     let img = img("argv");
     img.bundle("base");
-    img.rig.helper.image_setup(&img.path("base")).unwrap();
-    let flags = |names: &[&str]| {
-        let paths: Vec<String> = names
-            .iter()
-            .map(|n| format!(" {}", img.path(&format!("base/{n}"))))
-            .collect();
-        format!("{CHFLAGS} -h uchg{}", paths.concat())
-    };
+    img.rig.helper.image_setup(&img.spath("base")).unwrap();
+    let [files, dir] = img.flag_commands("base");
+    assert_eq!(img.commands(), [img.setup_command("base"), files, dir]);
+    // The caller's text never reaches the argv: a repeated separator and a trailing slash
+    // name the same bundle, and the argument is the configured path.
+    img.bundle("second");
+    img.rig.host.state().log.clear();
+    let sloppy = format!("{}//second/", img.staging.display());
+    img.rig.helper.image_setup(&sloppy).unwrap();
+    assert_eq!(img.commands()[0], img.setup_command("second"));
+    let clone = img.bundle("clone");
+    img.rig.host.state().log.clear();
+    let helper = &img.rig.helper;
+    helper
+        .image_harvest(&img.spath("clone"), &img.path("out"))
+        .unwrap();
+    helper
+        .image_harvest(&img.path("base"), &img.path("out2"))
+        .unwrap();
     assert_eq!(
         img.commands(),
         [
-            img.setup_command("base"),
-            flags(&FILES),
-            format!("{CHFLAGS} -h uchg {}", img.path("base")),
+            img.harvest_command(&img.spath("clone"), "out"),
+            img.harvest_command(&img.path("base"), "out2"),
         ]
     );
-    // The caller's text never reaches the argv: a trailing slash and a repeated
-    // separator name the same bundle, and the argument is the configured path.
-    img.rig.host.state().log.clear();
-    let sloppy = format!("{}//base/", img.images.display());
-    img.rig.helper.image_setup(&sloppy).unwrap();
-    assert_eq!(img.commands()[0], img.setup_command("base"));
-    let clone = img.bundle("clone");
-    img.rig.host.state().log.clear();
-    img.rig
-        .helper
-        .image_harvest(&img.path("clone"), &img.path("out"))
-        .unwrap();
-    assert_eq!(img.commands(), [img.harvest_command("clone", "out")]);
-    img.untouched(&clone);
+    img.as_built(&clone);
 }
 
-/// Catches: `kbf-vmm` running on a bundle the VM user can still swap or write (the
-/// directory and its files must be root's and closed while it runs), the flags set
-/// before the files went back (which would refuse the chown), a bundle left root's
-/// afterwards, and a base image left unflagged.
+/// Catches: `kbf-vmm` running on a bundle the VM user can still swap or write (the bundle
+/// must be root's, closed, and in the images directory while it runs), the flags set
+/// before the files were sealed, a base left the VM user's, or left unflagged, or left
+/// readable by others: the base stays root's, 0750 and 0640, group the VM user's.
 #[test]
-fn setup_takes_the_bundle_while_kbf_vmm_runs_and_returns_it_flagged() {
+fn setup_moves_the_bundle_in_seals_it_and_leaves_it_root_owned() {
     let img = img("setup");
-    let bundle = img.bundle("base");
-    let (dir, disk) = (bundle.clone(), bundle.join("disk.img"));
+    let built = img.bundle("base");
+    let (dir, disk, staged) = (
+        img.images.join("base"),
+        img.images.join("base/disk.img"),
+        built.clone(),
+    );
     let seen = img.watch(move || {
-        let (d, f) = (
-            std::fs::metadata(&dir).unwrap(),
-            std::fs::metadata(&disk).unwrap(),
-        );
-        format!("dir {:o} {} file {}", d.mode() & 0o7777, d.uid(), f.uid())
+        format!(
+            "dir {:o} disk {:o} staged {}",
+            mode(&dir),
+            mode(&disk),
+            staged.exists()
+        )
     });
     img.answer(img.setup_command("base"), true, "{\"status\":\"ok\"}\n", "");
-    let report = img.rig.helper.image_setup(&img.path("base")).unwrap();
+    let report = img.rig.helper.image_setup(&img.spath("base")).unwrap();
     assert_eq!(report, "{\"status\":\"ok\"}\n");
-    let euid = rustix::process::geteuid().as_raw();
-    let seen = seen.lock().unwrap().clone();
-    // The bundle is closed (0700) and root's for the program, and for the flags on its
-    // files; the flag on the directory comes after it is the VM user's again.
-    assert_eq!(seen.len(), 3, "{seen:?}");
+    let [files, dir] = img.flag_commands("base");
+    // Closed (0700) and out of staging for the program; the files are sealed before they
+    // are flagged; the directory is sealed before it is flagged.
     assert_eq!(
-        seen[0],
-        format!(
-            "{} => dir 700 {euid} file {euid}",
-            img.setup_command("base")
-        )
+        *seen.lock().unwrap(),
+        [
+            format!(
+                "{} => dir 700 disk 664 staged false",
+                img.setup_command("base")
+            ),
+            format!("{files} => dir 700 disk 640 staged false"),
+            format!("{dir} => dir 750 disk 640 staged false"),
+        ]
     );
-    assert!(
-        seen[1].ends_with(&format!("=> dir 700 {euid} file {euid}")),
-        "{seen:?}"
-    );
-    assert!(
-        seen[2].ends_with(&format!("=> dir 755 {me} file {me}", me = me())),
-        "{seen:?}"
-    );
-    img.untouched(&bundle);
-    assert_eq!(std::fs::metadata(&bundle).unwrap().uid(), me());
+    let base = img.images.join("base");
+    img.as_sealed(&base);
+    assert!(!built.exists());
+    let euid = rustix::process::geteuid().as_raw();
+    for path in std::iter::once(base.clone()).chain(FILES.map(|f| base.join(f))) {
+        let owner = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            (owner.uid(), owner.gid()),
+            (euid, my_gid()),
+            "{}",
+            path.display()
+        );
+    }
 }
 
-/// Catches: a failed `kbf-vmm` (exit status, or not started) leaving the bundle root's
-/// and closed so the VM user cannot remove or retry it, or being flagged immutable.
+/// Catches: a setup over a base of the same name (the rename would put the new bundle
+/// in a sealed base, or fail half way), or one that leaves the bundle moved.
 #[test]
-fn a_failed_setup_gives_the_bundle_back_unflagged() {
+fn setup_refuses_a_name_the_images_directory_has() {
+    let img = img("exists");
+    let built = img.bundle("base");
+    let sealed = img.sealed("base");
+    refused(
+        img.rig.helper.image_setup(&img.spath("base")),
+        "is in the images directory already",
+    );
+    img.as_built(&built);
+    img.as_sealed(&sealed);
+    assert!(img.commands().is_empty());
+}
+
+/// Catches: a failed `kbf-vmm` (exit status, or not started), seal or flag leaving the
+/// bundle in the images directory, root's and closed so the VM user cannot remove or
+/// retry it; the bundle goes back to the staging directory as it was.
+#[test]
+fn a_failed_setup_gives_the_bundle_back_to_staging_as_it_was() {
     let img = img("setup-fail");
-    let bundle = img.bundle("base");
+    let built = img.bundle("base");
     img.answer(
         img.setup_command("base"),
         false,
         "{\"status\":\"error\"}",
         "no volume",
     );
-    let why = img.rig.helper.image_setup(&img.path("base")).unwrap_err();
+    let why = img.rig.helper.image_setup(&img.spath("base")).unwrap_err();
     assert!(
         why.contains("kbf-vmm failed: no volume {\"status\":\"error\"}"),
         "{why}"
     );
-    img.untouched(&bundle);
+    img.as_built(&built);
+    assert!(!img.images.join("base").exists());
     assert_eq!(img.commands(), [img.setup_command("base")]);
 
     img.rig.host.state().fail.insert("command");
     refused(
-        img.rig.helper.image_setup(&img.path("base")),
+        img.rig.helper.image_setup(&img.spath("base")),
         "running kbf-vmm",
     );
-    img.untouched(&bundle);
+    img.as_built(&built);
     assert_eq!(img.commands().len(), 2);
     img.rig.host.state().fail.clear();
 
-    // The flag step failing is a failure too, and the bundle still goes back.
-    img.rig.host.state().log.clear();
+    // A flag step failing is a failure too, and the bundle still goes back.
     img.answer(img.setup_command("base"), true, "", "");
-    let files = FILES
-        .map(|f| format!(" {}", img.path(&format!("base/{f}"))))
-        .concat();
-    img.answer(
-        format!("{CHFLAGS} -h uchg{files}"),
-        false,
-        "",
-        "Operation not permitted",
-    );
+    let [files, dir] = img.flag_commands("base");
+    img.answer(files, false, "", "Operation not permitted");
     refused(
-        img.rig.helper.image_setup(&img.path("base")),
+        img.rig.helper.image_setup(&img.spath("base")),
         "chflags failed: Operation not permitted",
     );
-    img.untouched(&bundle);
+    img.as_built(&built);
+    assert!(!img.images.join("base").exists());
+    img.answer(img.flag_commands("base")[0].clone(), true, "", "");
+    img.answer(dir, false, "", "no");
+    refused(
+        img.rig.helper.image_setup(&img.spath("base")),
+        "chflags failed: no",
+    );
+    img.as_built(&built);
+    assert!(!img.images.join("base").exists());
+}
+
+/// Catches: a rename that fails (the images directory cannot be written) leaving the
+/// bundle taken, root's and closed, in the staging directory.
+#[test]
+fn a_failed_move_gives_the_bundle_back() {
+    let img = img("move-fail");
+    let built = img.bundle("base");
+    set_mode(&img.images, 0o555);
+    refused(
+        img.rig.helper.image_setup(&img.spath("base")),
+        "moving base",
+    );
+    set_mode(&img.images, 0o755);
+    img.as_built(&built);
+    assert!(img.commands().is_empty());
+}
+
+/// Catches: a name swapped for another object between the claim and the rename (the user
+/// owns the staging directory) leaving that object in the images directory: it is moved
+/// back.
+#[test]
+fn something_else_that_arrives_in_the_move_is_moved_back() {
+    let img = img("swapped");
+    let held_for = img.bundle("a");
+    let other = img.bundle("b");
+    let staging = open_dir(&img.staging).unwrap();
+    let images = open_dir(&img.images).unwrap();
+    let held = fstat(open_dir(&held_for).unwrap()).unwrap();
+    let why = move_into(&staging, &images, "b", &held).unwrap_err();
+    assert!(why.contains("b changed while it was being taken"), "{why}");
+    assert!(other.exists());
+    assert!(!img.images.join("b").exists());
+    move_into(&staging, &images, "a", &held).unwrap();
+    assert!(img.images.join("a").exists());
+    assert!(!held_for.exists());
 }
 
 /// Catches: a bundle holding a subdirectory, a symlink or a hard link to a file
-/// elsewhere being taken: the chown would reach the target, or the return to the VM
-/// user would hand it a file it must not own.
+/// elsewhere being taken: the chown would reach the target, or the seal would give the
+/// target to the VM user's group.
 #[test]
 fn a_bundle_holding_anything_but_plain_files_is_refused_and_given_back() {
     let img = img("odd");
@@ -430,16 +574,17 @@ fn a_bundle_holding_anything_but_plain_files_is_refused_and_given_back() {
             _ => std::fs::hard_link(&elsewhere, &at).unwrap(),
         }
         let says = "not a plain file with one link";
-        refused(img.rig.helper.image_setup(&img.path("b")), says);
+        refused(img.rig.helper.image_setup(&img.spath("b")), says);
         refused(
             img.rig
                 .helper
-                .image_harvest(&img.path("b"), &img.path("out")),
+                .image_harvest(&img.spath("b"), &img.path("out")),
             says,
         );
-        img.untouched(&bundle);
+        img.as_built(&bundle);
         assert_eq!(mode(&elsewhere), 0o600);
         assert!(!img.images.join("out").exists());
+        assert!(!img.images.join("b").exists());
         if odd == "sub" {
             std::fs::remove_dir(&at).unwrap();
         } else {
@@ -448,31 +593,30 @@ fn a_bundle_holding_anything_but_plain_files_is_refused_and_given_back() {
     }
     assert!(img.commands().is_empty());
     // And a plain bundle still works after those.
-    img.rig.helper.image_setup(&img.path("b")).unwrap();
+    img.rig.helper.image_setup(&img.spath("b")).unwrap();
 }
 
 /// Catches: a setup on a Mac with no VM user, or whose VM user has no account, going
-/// ahead (there is nobody to hand the bundle to), or taking the bundle first.
+/// ahead (there is no group to seal the base for), or taking the bundle first.
 #[test]
 fn setup_needs_the_vm_user_before_it_touches_the_bundle() {
     let img = img("no-vm");
     let bundle = img.bundle("b");
     img.rig.host.state().users.clear();
-    refused(img.rig.helper.image_setup(&img.path("b")), "has no account");
-    img.untouched(&bundle);
-    let plain = rig_vm_with(
-        "img-no-vm-user",
-        UidRange::new(me() + 100, me() + 103).unwrap(),
-        None,
-        None,
+    refused(
+        img.rig.helper.image_setup(&img.spath("b")),
+        "has no account",
     );
+    img.as_built(&bundle);
+    let range = UidRange::new(me() + 100, me() + 103).unwrap();
+    let plain = rig_vm_with("img-no-vm-user", range, None, None);
     plain.helper.boot_reset(&[]).unwrap();
     plain.host.state().log.clear();
     let path = plain
         .helper
         .settings
         .image
-        .dir
+        .staging
         .join("b")
         .display()
         .to_string();
@@ -489,61 +633,77 @@ fn the_installed_programs_must_be_the_helpers_own_and_closed_to_others() {
     let settings = img.rig.helper.settings.image.clone();
     set_mode(&settings.vmm, 0o775);
     refused(
-        img.rig.helper.image_setup(&img.path("b")),
+        img.rig.helper.image_setup(&img.spath("b")),
         "writable by its group or others",
     );
     refused(
         img.rig
             .helper
-            .image_harvest(&img.path("b"), &img.path("out")),
+            .image_harvest(&img.spath("b"), &img.path("out")),
         "writable by its group or others",
     );
     set_mode(&settings.vmm, 0o755);
     set_mode(&settings.guest, 0o646);
     refused(
-        img.rig.helper.image_setup(&img.path("b")),
+        img.rig.helper.image_setup(&img.spath("b")),
         "writable by its group or others",
     );
     // `image-harvest` does not use the guest binary.
     img.rig
         .helper
-        .image_harvest(&img.path("b"), &img.path("out"))
+        .image_harvest(&img.spath("b"), &img.path("out"))
         .unwrap();
     set_mode(&settings.guest, 0o755);
     std::fs::remove_file(&settings.guest).unwrap();
-    refused(img.rig.helper.image_setup(&img.path("b")), "opening");
+    refused(img.rig.helper.image_setup(&img.spath("b")), "opening");
     std::fs::create_dir(&settings.guest).unwrap();
     refused(
-        img.rig.helper.image_setup(&img.path("b")),
+        img.rig.helper.image_setup(&img.spath("b")),
         "is not a regular file",
     );
-    img.untouched(&bundle);
+    img.as_built(&bundle);
 }
 
-/// Catches: an images directory other users can write (they could swap a bundle's name
-/// for a link), or a group-writable one without the sticky bit; and the sticky,
-/// group-writable layout the VM user needs being refused.
+/// Catches: an images directory other users can write (they could add a name that the
+/// VM user then reads as a base), a group-writable one even with the sticky bit (the
+/// images directory is root's alone), or missing; and a missing staging directory.
 #[test]
-fn the_images_directory_must_be_closed_to_others() {
+fn the_images_directory_must_be_closed_to_group_and_others() {
     let img = img("dir");
     let bundle = img.bundle("b");
-    for open in [0o777, 0o1777, 0o775, 0o757] {
+    for open in [0o777, 0o1777, 0o775, 0o1775, 0o757] {
         set_mode(&img.images, open);
         refused(
-            img.rig.helper.image_setup(&img.path("b")),
+            img.rig.helper.image_setup(&img.spath("b")),
             "the images directory",
         );
+        refused(
+            img.rig
+                .helper
+                .image_harvest(&img.spath("b"), &img.path("out")),
+            "writable by its group or others",
+        );
     }
-    set_mode(&img.images, 0o1775);
-    img.rig.helper.image_setup(&img.path("b")).unwrap();
+    img.as_built(&bundle);
     set_mode(&img.images, 0o755);
-    std::fs::remove_dir_all(&bundle).unwrap();
     std::fs::remove_dir(&img.images).unwrap();
-    refused(
-        img.rig.helper.image_setup(&img.path("b")),
-        "opening the images directory",
-    );
-    assert_eq!(img.commands().len(), 3);
+    refused(img.rig.helper.image_setup(&img.spath("b")), "opening");
+    std::fs::create_dir(&img.images).unwrap();
+    set_mode(&img.images, 0o755);
+    std::fs::remove_dir_all(&img.staging).unwrap();
+    refused(img.rig.helper.image_setup(&img.spath("b")), "opening");
+    assert!(img.commands().is_empty());
+}
+
+/// Catches: an object another user owns, or one group or others can write, counted as
+/// closed (the helper would leave it as it is and attach a disk image the user can write).
+#[test]
+fn only_the_helpers_own_unwritable_objects_are_closed() {
+    assert!(closed_by(0, 0, 0o750));
+    assert!(closed_by(0, 0, 0o640));
+    assert!(!closed_by(501, 0, 0o750));
+    assert!(!closed_by(0, 0, 0o770));
+    assert!(!closed_by(0, 0, 0o702));
 }
 
 /// Catches: an images directory owned by another user being trusted.
@@ -553,7 +713,7 @@ fn an_images_directory_another_user_owns_is_refused() {
     stat.st_uid = rustix::process::geteuid().as_raw() + 1;
     stat.st_mode = 0o755;
     assert!(
-        shared_safely(&stat)
+        closed_dir(&stat)
             .unwrap_err()
             .contains("not the helper's uid")
     );
@@ -561,7 +721,7 @@ fn an_images_directory_another_user_owns_is_refused() {
 
 /// Catches: a harvest output directory that is not new, not root's or not mode 0700
 /// (readable by the VM user whose guest it was copied from), or outside the images
-/// directory; and the harvest not being what the helper builds.
+/// directory; and the harvest not being what the helper builds. The happy path.
 #[test]
 fn harvest_makes_its_output_directory_0700_root_owned_inside_the_images_directory() {
     let img = img("harvest");
@@ -572,25 +732,18 @@ fn harvest_makes_its_output_directory_0700_root_owned_inside_the_images_director
         let m = std::fs::metadata(&watched).unwrap();
         format!("out {:o} {}", m.mode() & 0o7777, m.uid())
     });
-    img.answer(
-        img.harvest_command("clone", "out"),
-        true,
-        "{\"harvest\":1}",
-        "",
-    );
+    let command = img.harvest_command(&img.spath("clone"), "out");
+    img.answer(command.clone(), true, "{\"harvest\":1}", "");
     let report = img
         .rig
         .helper
-        .image_harvest(&img.path("clone"), &img.path("out"))
+        .image_harvest(&img.spath("clone"), &img.path("out"))
         .unwrap();
     assert_eq!(report, "{\"harvest\":1}");
     let euid = rustix::process::geteuid().as_raw();
     assert_eq!(
-        seen.lock().unwrap().clone(),
-        [format!(
-            "{} => out 700 {euid}",
-            img.harvest_command("clone", "out")
-        )]
+        *seen.lock().unwrap(),
+        [format!("{command} => out 700 {euid}")]
     );
     let made = std::fs::metadata(&out).unwrap();
     assert!(made.is_dir());
@@ -598,17 +751,17 @@ fn harvest_makes_its_output_directory_0700_root_owned_inside_the_images_director
     assert_eq!(made.uid(), euid);
     assert_eq!(made.gid(), rustix::process::getegid().as_raw());
     assert_eq!(out.parent().unwrap(), img.images);
-    img.untouched(&bundle);
-    assert_eq!(std::fs::metadata(&bundle).unwrap().uid(), me());
+    img.as_built(&bundle);
     assert_eq!(img.commands().len(), 1);
 }
 
 /// Catches: a harvest into an existing name (a directory, a file, a link that would lead
-/// anywhere), into the bundle itself, or one that removes what was there.
+/// anywhere), into the sealed base it reads, or one that removes what was there.
 #[test]
 fn harvest_makes_only_a_new_output_directory() {
     let img = img("harvest-new");
     let bundle = img.bundle("clone");
+    let base = img.sealed("base");
     std::fs::create_dir(img.images.join("taken")).unwrap();
     std::fs::write(img.images.join("taken/keep"), "x").unwrap();
     std::fs::write(img.images.join("file"), "x").unwrap();
@@ -617,20 +770,21 @@ fn harvest_makes_only_a_new_output_directory() {
         refused(
             img.rig
                 .helper
-                .image_harvest(&img.path("clone"), &img.path(name)),
+                .image_harvest(&img.spath("clone"), &img.path(name)),
             "making",
         );
     }
     refused(
         img.rig
             .helper
-            .image_harvest(&img.path("clone"), &img.path("clone")),
+            .image_harvest(&img.path("base"), &img.path("base")),
         "must not be the bundle",
     );
     assert!(img.images.join("taken/keep").exists());
     assert!(!img.rig.dir.join("elsewhere").exists());
     assert!(img.commands().is_empty());
-    img.untouched(&bundle);
+    img.as_built(&bundle);
+    img.as_sealed(&base);
 }
 
 /// Catches: a failed harvest leaving an empty output directory behind (a retry would be
@@ -639,15 +793,20 @@ fn harvest_makes_only_a_new_output_directory() {
 fn a_failed_harvest_removes_its_empty_output_directory_and_returns_the_bundle() {
     let img = img("harvest-fail");
     let bundle = img.bundle("clone");
-    img.answer(img.harvest_command("clone", "out"), false, "", "no volume");
+    img.answer(
+        img.harvest_command(&img.spath("clone"), "out"),
+        false,
+        "",
+        "no volume",
+    );
     refused(
         img.rig
             .helper
-            .image_harvest(&img.path("clone"), &img.path("out")),
+            .image_harvest(&img.spath("clone"), &img.path("out")),
         "kbf-vmm failed: no volume",
     );
     assert!(!img.images.join("out").exists());
-    img.untouched(&bundle);
+    img.as_built(&bundle);
     // A partial copy stays.
     let partial = img.images.join("out");
     img.rig.host.state().on_command = Some(Box::new(move |_| {
@@ -656,28 +815,52 @@ fn a_failed_harvest_removes_its_empty_output_directory_and_returns_the_bundle() 
     refused(
         img.rig
             .helper
-            .image_harvest(&img.path("clone"), &img.path("out")),
+            .image_harvest(&img.spath("clone"), &img.path("out")),
         "kbf-vmm failed",
     );
     assert!(img.images.join("out/files").is_dir());
-    img.untouched(&bundle);
+    img.as_built(&bundle);
 }
 
-/// Catches: a harvest of a bundle the VM user owns giving it back to root (or to the VM
-/// user, when another user made the clone): the owners go back to what they were.
+/// Catches: a harvest of a kept clone giving it back as root's, or with another mode
+/// than it had.
 #[test]
-fn harvest_gives_the_bundle_back_to_its_owner_and_mode() {
+fn harvest_gives_a_clone_back_with_its_owner_and_modes() {
     let img = img("harvest-owner");
     let bundle = img.bundle("clone");
-    set_mode(&bundle, 0o750);
-    set_mode(&bundle.join("disk.img"), 0o600);
+    set_mode(&bundle, 0o770);
+    set_mode(&bundle.join("disk.img"), 0o660);
     img.rig
         .helper
-        .image_harvest(&img.path("clone"), &img.path("out"))
+        .image_harvest(&img.spath("clone"), &img.path("out"))
         .unwrap();
-    assert_eq!(mode(&bundle), 0o750);
-    assert_eq!(mode(&bundle.join("disk.img")), 0o600);
-    assert_eq!(mode(&bundle.join("aux.img")), 0o644);
+    assert_eq!(mode(&bundle), 0o770);
+    assert_eq!(mode(&bundle.join("disk.img")), 0o660);
+    assert_eq!(mode(&bundle.join("aux.img")), 0o664);
+    assert_eq!(std::fs::metadata(&bundle).unwrap().uid(), me());
+}
+
+/// Catches: a harvest of a sealed base taking it (locking it 0700, changing its group
+/// or modes) or failing on its `uchg` files: it is root's and closed already, so
+/// nothing is changed.
+#[test]
+fn harvest_of_a_sealed_base_changes_nothing() {
+    let img = img("harvest-sealed");
+    let base = img.sealed("base");
+    let watched = base.clone();
+    let seen = img.watch(move || format!("base {:o}", mode(&watched)));
+    img.rig
+        .helper
+        .image_harvest(&img.path("base"), &img.path("out"))
+        .unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [format!(
+            "{} => base 750",
+            img.harvest_command(&img.path("base"), "out")
+        )]
+    );
+    img.as_sealed(&base);
 }
 
 /// Catches: a claim that is satisfied by a name that now leads to another directory, or
@@ -697,13 +880,27 @@ fn a_claim_holds_only_for_the_same_directory_the_helper_owns() {
 }
 
 /// Catches: an error that loses what was being done, or the OS's reason; a path that is
-/// not text being passed on as an argument.
+/// not text being passed on as an argument; an undo that runs on success or hides the
+/// original error.
 #[test]
 fn errors_name_the_step_and_a_path_must_be_text() {
     let why = at("locking b")(rustix::io::Errno::ACCESS);
     assert!(why.starts_with("locking b: "), "{why}");
     warn_if_failed("a step", Ok(()));
     warn_if_failed("a step", Err("failed".to_owned()));
+    let mut undone = 0;
+    let ok = or_undo("x", Ok(1), || {
+        undone += 1;
+        Ok(())
+    });
+    assert_eq!(ok, Ok(1));
+    let bad: Result<u8, String> = Err("first".to_owned());
+    let kept = or_undo("x", bad, || {
+        undone += 10;
+        Err("second".to_owned())
+    });
+    assert_eq!(kept, Err("first".to_owned()));
+    assert_eq!(undone, 10);
     use std::os::unix::ffi::OsStrExt as _;
     let bad = Path::new(std::ffi::OsStr::from_bytes(b"/images/\xff"));
     assert!(ImageSettings::text(bad).unwrap_err().contains("not UTF-8"));
@@ -716,7 +913,6 @@ fn the_report_is_cut_at_the_frame_limit_on_a_character_boundary() {
     assert_eq!(report("ok"), "ok");
     let long = format!("a{}", "é".repeat(IMAGE_REPORT_BYTES));
     let cut = report(&long);
-    assert!(cut.len() <= IMAGE_REPORT_BYTES);
     assert_eq!(cut.len(), IMAGE_REPORT_BYTES - 1);
     assert!(long.starts_with(&cut));
 }
@@ -734,17 +930,17 @@ fn a_panic_in_one_image_verb_does_not_stop_the_next() {
         });
         assert!(panicked.join().is_err());
     });
-    helper.image_setup(&img.path("b")).unwrap();
+    helper.image_setup(&img.spath("b")).unwrap();
 }
 
-/// Catches: the same bundle set up twice at once; the second waits for the first.
+/// Catches: two image verbs at once; the second waits for the first.
 #[test]
 fn image_verbs_run_one_at_a_time() {
     let img = img("serial");
     img.bundle("b");
     let held = img.rig.helper.one_image_job();
     let helper = &img.rig.helper;
-    let path = img.path("b");
+    let path = img.spath("b");
     std::thread::scope(|scope| {
         let second = scope.spawn(|| helper.image_setup(&path));
         std::thread::sleep(std::time::Duration::from_millis(200));

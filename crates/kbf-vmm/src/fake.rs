@@ -128,6 +128,10 @@ pub struct FakeSystem {
     /// Runs after each successful clone with the destination path.
     pub after_clone: RefCell<Option<CloneHook>>,
     pub cloned: RefCell<Vec<(PathBuf, PathBuf)>>,
+    /// Every path `clear_immutable` was asked about, in order.
+    pub unflagged: RefCell<Vec<PathBuf>>,
+    /// Makes `clear_immutable` fail.
+    pub unflag_fails: Cell<bool>,
     pub identity: RefCell<Result<Vec<u8>, String>>,
     pub uid: Cell<u32>,
     pub ppid: Cell<u32>,
@@ -161,6 +165,8 @@ impl FakeSystem {
             clone_budget: Cell::new(None),
             after_clone: RefCell::new(None),
             cloned: RefCell::new(Vec::new()),
+            unflagged: RefCell::new(Vec::new()),
+            unflag_fails: Cell::new(false),
             identity: RefCell::new(Ok(b"fresh-id".to_vec())),
             uid: Cell::new(501),
             ppid: Cell::new(1234),
@@ -201,6 +207,14 @@ pub fn good_signature() -> Signature {
 }
 
 impl System for FakeSystem {
+    fn clear_immutable(&self, path: &Path) -> io::Result<()> {
+        self.unflagged.borrow_mut().push(path.to_owned());
+        if self.unflag_fails.get() {
+            return Err(io::Error::other("EPERM"));
+        }
+        Ok(())
+    }
+
     fn clonefile(&self, src: &Path, dst: &Path) -> io::Result<()> {
         let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if *self.clone_fails_on.borrow() == Some(name) {

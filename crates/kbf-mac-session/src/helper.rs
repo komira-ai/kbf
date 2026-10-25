@@ -33,8 +33,9 @@
 //!   an ordinary uid outside the lease range. `role-run` and `role-session-ready` answer
 //!   for the GUI session only while no lease holds it.
 //! - The image verbs ([`image`]: `image-setup`, `image-harvest`) run the one installed
-//!   `kbf-vmm` as root on a bundle directly inside the images directory, with argv the
-//!   helper builds; the caller names only the bundle (and the output directory).
+//!   `kbf-vmm` as root on a bundle directly inside the staging or images directory, with
+//!   argv the helper builds; the caller names only the bundle (and the output directory).
+//!   A base the setup built stays root's, sealed.
 //! - Every verb but `boot-reset` is refused until the boot reset has succeeded.
 //!
 //! The mutating verbs run one at a time (one lock around the ledger), and `run` holds

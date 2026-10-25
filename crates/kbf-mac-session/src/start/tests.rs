@@ -79,6 +79,7 @@ fn the_flags_default_to_the_design() {
     assert_eq!(args.homes, PathBuf::from("/Users"));
     assert_eq!(args.grant_keys, None);
     assert_eq!(args.images_dir, PathBuf::from("/var/db/kbf-vm/images"));
+    assert_eq!(args.staging_dir, PathBuf::from("/var/db/kbf-vm/staging"));
     assert_eq!(args.vmm, PathBuf::from("/usr/local/kbf/current/kbf-vmm"));
     assert_eq!(
         args.guest_binary,
@@ -113,6 +114,8 @@ fn the_image_flags_reach_the_settings() {
         "r",
         "--images-dir",
         "/i",
+        "--staging-dir",
+        "/s",
         "--vmm",
         "/k/kbf-vmm",
         "--guest-binary",
@@ -120,6 +123,7 @@ fn the_image_flags_reach_the_settings() {
     ]);
     let image = args.image_settings();
     assert_eq!(image.dir, PathBuf::from("/i"));
+    assert_eq!(image.staging, PathBuf::from("/s"));
     assert_eq!(image.vmm, PathBuf::from("/k/kbf-vmm"));
     assert_eq!(image.guest, PathBuf::from("/k/kbf-guest"));
 }

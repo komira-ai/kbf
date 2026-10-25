@@ -99,14 +99,16 @@ pub enum Request {
     RoleSessionReady,
     /// End every process of the standing VM user (its session with them).
     RoleKillUid,
-    /// As root, write the guest's first-boot files into the base image bundle `bundle`
-    /// (`kbf-vmm image setup`), then hand the bundle back to the standing VM user,
-    /// locked. `bundle` is a path directly inside the images directory. There is no
-    /// program and no argument here: the helper runs its own installed `kbf-vmm`.
+    /// As root, take the base image bundle `bundle` (a path directly inside the staging
+    /// directory), move it into the images directory, write the guest's first-boot files
+    /// into it (`kbf-vmm image setup`) and seal it: root's, mode 0750/0640 with the VM
+    /// user's group, `uchg`. There is no program and no argument here: the helper runs its
+    /// own installed `kbf-vmm`.
     ImageSetup { bundle: String },
     /// As root, copy the diagnostics allowlist out of the stopped guest bundle `bundle`
-    /// into the new directory `out` (`kbf-vmm image harvest`). Both are paths directly
-    /// inside the images directory; the helper makes `out` (root's, mode 0700).
+    /// (directly inside the staging or the images directory) into the new directory `out`
+    /// (directly inside the images directory) (`kbf-vmm image harvest`); the helper makes
+    /// `out`, root's and mode 0700.
     ImageHarvest { bundle: String, out: String },
     /// The boot reset, before the daemon's `Hello`: `held` are the leases the server
     /// still holds for this node.

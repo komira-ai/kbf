@@ -287,24 +287,26 @@ fn the_image_verbs_work_over_the_socket() {
     };
     refused(
         client.image_setup("/elsewhere/b"),
-        "not inside the images directory",
+        "not inside the staging directory",
     );
     refused(
         client.image_harvest("/elsewhere/b", "/elsewhere/o"),
-        "not inside the images directory",
+        "inside neither",
     );
     std::fs::create_dir(&image.dir).unwrap();
+    std::fs::create_dir(&image.staging).unwrap();
     for program in [&image.vmm, &image.guest] {
         std::fs::write(program, "program").unwrap();
         std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     std::fs::set_permissions(&image.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let bundle = image.dir.join("clone");
+    let bundle = image.staging.join("clone");
     std::fs::create_dir(&bundle).unwrap();
     std::fs::write(bundle.join("disk.img"), "d").unwrap();
     let dir = |name: &str| image.dir.join(name).display().to_string();
+    let staged = |name: &str| image.staging.join(name).display().to_string();
     // Not the VM user's account yet: setup is refused before it takes the bundle.
-    refused(client.image_setup(&dir("clone")), "has no account");
+    refused(client.image_setup(&staged("clone")), "has no account");
     served.host.state().users.insert(
         "kbf-vm".to_owned(),
         crate::helper::NewUser {
@@ -329,7 +331,12 @@ fn the_image_verbs_work_over_the_socket() {
             stderr: String::new(),
         },
     );
-    assert_eq!(client.image_setup(&dir("clone")).unwrap(), "{\"setup\":1}");
+    assert_eq!(
+        client.image_setup(&staged("clone")).unwrap(),
+        "{\"setup\":1}"
+    );
+    assert!(image.dir.join("clone").is_dir());
+    assert!(!bundle.exists());
     served.host.state().answers.insert(
         format!(
             "{} image harvest --bundle {} --out {}/files",
