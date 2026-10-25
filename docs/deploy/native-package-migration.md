@@ -21,9 +21,10 @@ kbf-host-install --migrate-to-package --layout deb --channel stable \
 
 ## Before: what the node needs
 
-- `kbf-host-install` ([host-install.md](host-install.md#getting-the-binary)) and the
-  `kbf-installer` package, which carries the pinned `gh`, the trusted root and `installer.conf`
-  that the check uses (`/usr/share/kbf-installer/trust`). The program refuses when they are not
+- `kbf-host-install` ([host-install.md](host-install.md#getting-the-binary)) and the pinned
+  `gh`, the trusted root and `installer.conf` that the check uses, which the `kbf` package
+  carries (`/usr/share/kbf/trust`; a host that still has the old `kbf-installer` package is read
+  at `/usr/share/kbf-installer/trust`, until v0.0.9). The program refuses when they are not
   root's.
 - `/etc/kbf/host-install-releases.toml` with the channel named by `--channel`, as for the local
   socket (`source = "github"`; its branch is the one the attestation must name).

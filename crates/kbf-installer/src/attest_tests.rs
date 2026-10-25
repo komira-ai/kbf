@@ -61,10 +61,7 @@ fn gh_is_asked_for_exactly_the_pinned_attestation() {
     let calls = runner.calls();
     assert_eq!(calls.len(), 1);
     let call = &calls[0];
-    assert_eq!(
-        call.program,
-        PathBuf::from("/usr/share/kbf-installer/trust/gh")
-    );
+    assert_eq!(call.program, PathBuf::from("/usr/share/kbf/trust/gh"));
     assert_eq!(
         strings(&call.args),
         [
@@ -74,7 +71,7 @@ fn gh_is_asked_for_exactly_the_pinned_attestation() {
             "--bundle",
             "/work/in/provenance.jsonl",
             "--custom-trusted-root",
-            "/usr/share/kbf-installer/trust/trusted_root.jsonl",
+            "/usr/share/kbf/trust/trusted_root.jsonl",
             "--repo",
             "komira-ai/kbf",
             "--signer-workflow",

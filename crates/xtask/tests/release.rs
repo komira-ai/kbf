@@ -1532,7 +1532,7 @@ fn publish_refuses_a_set_hash_that_is_not_a_hash() {
     assert_eq!(code, Some(2), "{err}");
 }
 
-/// The deb of `platform` named `name`, added to `dist` as `pkg-asset` and the attest job
+/// The deb of `platform` named `name`, added to `dist` as `pkg-kbf-asset` and the attest job
 /// leave it: the file, its line in `SHA256SUMS`, and its bundle when `bundle`.
 fn add_deb(dist: &Path, name: &str, bundle: bool) {
     let bytes = format!("{name} bytes");

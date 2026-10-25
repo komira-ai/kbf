@@ -547,7 +547,7 @@ impl<E: Exec> Backend for Linux<E> {
 /// The host as it is: the real `exec` and runners, this program's own paths.
 pub fn production(units: Vec<Unit>) -> Linux<kbf_host::HostExec> {
     let root = Root::host();
-    let layout = Layout::new(root.clone(), Platform::current());
+    let layout = Layout::new(root.clone(), Platform::current()).with_trust_fallback();
     Linux {
         layout,
         exec: RefCell::new(kbf_host::HostExec::new(root.clone())),

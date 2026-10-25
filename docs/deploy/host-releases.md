@@ -27,7 +27,7 @@ The paths are in one place, `kbf_installer::layout`
 | installer tree | `/var/lib/kbf-installer` | `/usr/local/kbf-installer` |
 | state dir | the installer tree | `/var/db/kbf-installer` |
 | lock | `/run/kbf-installer/lock` | `/var/run/kbf-installer/lock` |
-| trust dir | `/usr/share/kbf-installer/trust` | `/usr/local/kbf-installer/trust` |
+| trust dir | `/usr/share/kbf/trust` (the `kbf` package's; `/usr/share/kbf-installer/trust` is read when it is absent, until v0.0.9) | `/usr/local/kbf-installer/trust` |
 
 This replaces the earlier `/usr/local/kbf`, `/var/lib/kbf-deploy` and
 `/usr/local/libexec/kbf-deploy` (a path change made together in `kbf-deploy` and the
@@ -147,7 +147,7 @@ frontend only says which commit and carries the files. Residuals: `main` is not
 branch-protected, there is no downgrade floor in the MVP (an older attested release is
 accepted), and a separate Ed25519 release key is a documented later option.
 
-The trust list is the trust directory above (`/usr/share/kbf-installer/trust/` on Linux), root-owned and closed to group and
+The trust list is the trust directory above (`/usr/share/kbf/trust/` on Linux, where the `kbf` package puts it; a host that has not taken that package yet is read at `/usr/share/kbf-installer/trust/`, where the old `kbf-installer` package put it, until v0.0.9), root-owned and closed to group and
 other writes, the same on both platforms:
 
 - `gh`: the pinned GitHub CLI release (2.102.0 at this writing; Linux amd64 and arm64
@@ -156,7 +156,7 @@ other writes, the same on both platforms:
   key (a stage then says `not-attested`).
 - `installer.conf` (optional): `SOURCE_REFS`, `RUN_AS_UID`, `RUN_AS_GID`.
 
-They are installed by the host's bootstrap, not by this repository. The pins (version,
+On Linux the `kbf` package installs them (`docs/artifacts.md`); on a Mac, the `kbf-installer` package does. The pins (version,
 sha256 of `gh`, the trusted root's sha256) live with it. Each of them, and every directory
 above it, must be owned by uid 0, not a link, and not writable by group or others;
 otherwise the stage refuses and names the path (`untrusted-owner`, `untrusted-writable`,

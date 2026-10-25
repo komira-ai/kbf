@@ -195,7 +195,8 @@ not require them; a file that has them is left as it is. The other keys
    can go on) with `installer.toml` written and no `kbf.toml` or unit; running it again finishes.
 8. `/etc/kbf/kbf.toml`, as above.
 9. The units, last. On Linux `systemctl enable`, with `--now` unless `--no-start`: the mode's unit
-    (only when a release is installed), and `kbf-installer.service`. `kbf-frontend.service` and
+    (only when a release is installed), and no other (on a Mac, the installer's job; on Linux no
+    package carries `kbf-installer.service` now). `kbf-frontend.service` and
     `kbf-all-in-one.service` are enabled and never started by `setup`: starting one takes the
     database, the TLS files and the port. `setup` enables no proxy unit. A unit that is enabled
     already is left
@@ -270,12 +271,8 @@ sections 7 and 9). `setup` therefore sets up no proxy host:
   (`kbf-frontend.service` for a frontend) whatever the file holds, and says so when the file has
   a `[proxy]` table; it enables no proxy unit, and writes none of the proxy's keys.
 
-`kbf-proxy.socket` ships listening on port 8980. To change it set `listen = "host:port"` in the
-`[proxy]` table of `installer.toml`; on Linux `setup` then writes
-`/etc/systemd/system/kbf-proxy.socket.d/listen.conf` with `ListenStream=` (empty, to clear the
-packaged port) and `ListenStream=<address>`. With no `listen` it removes the drop-in. It never
-restarts the socket: it says to run `systemctl daemon-reload` and `systemctl restart
-kbf-proxy.socket`.
+No release ships `kbf-proxy.socket` any more, so `setup` writes no drop-in for the `listen` key of
+the `[proxy]` table and leaves any `listen.conf` an earlier build wrote where it is.
 
 ## The state database
 

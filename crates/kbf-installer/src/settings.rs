@@ -1,6 +1,6 @@
 //! The host's settings: what only root may decide about how a release is checked.
 //!
-//! `installer.conf` in the trust directory (`/usr/share/kbf-installer/trust/` on Linux, [`crate::layout::Layout::settings`]) holds
+//! `installer.conf` in the trust directory (`/usr/share/kbf/trust/` on Linux, [`crate::layout::Layout::settings`]) holds
 //! `KEY=VALUE` lines (blank lines and `#` comments are skipped; every key at most once;
 //! a key this build does not know is refused):
 //!

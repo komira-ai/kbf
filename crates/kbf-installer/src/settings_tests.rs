@@ -107,7 +107,7 @@ fn a_settings_file_is_closed_and_strict() {
     let message = load("FOO=1\n").expect_err("refused").to_string();
     assert_eq!(
         message,
-        "settings /usr/share/kbf-installer/trust/installer.conf: line 1: \"FOO\" is not a setting"
+        "settings /usr/share/kbf/trust/installer.conf: line 1: \"FOO\" is not a setting"
     );
     let mut exec = trusted_host();
     exec.entries.insert(

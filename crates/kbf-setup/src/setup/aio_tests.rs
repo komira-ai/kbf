@@ -59,10 +59,7 @@ fn an_all_in_one_host_gets_its_one_unit_and_the_golden_kbf_toml() {
         .collect();
     assert_eq!(
         enables,
-        [
-            "run /usr/bin/systemctl enable -- kbf-all-in-one.service",
-            "run /usr/bin/systemctl enable --now -- kbf-installer.service",
-        ]
+        ["run /usr/bin/systemctl enable -- kbf-all-in-one.service",]
     );
     assert!(
         out.contains("note: kbf-all-in-one.service is enabled, not started"),
