@@ -1434,12 +1434,12 @@ fn the_network_join_of_deploy_uses_the_run_token_and_variables_only() {
     // without a tailnet would fail every release), the join moved before the build (the
     // build's scripts would see the network) or after the verb, an `env:` on it, a second
     // join, and the action used by another job.
-    let join = "          oauth-client-id: ${{ vars.KBF_DEPLOY_TS_CLIENT_ID }}\n";
+    let join = "          oauth-client-id: ${{ vars.TS_CLIENT_ID }}\n";
     red(
         &plant(
             "deploy",
             join,
-            "          oauth-client-id: ${{ vars.KBF_DEPLOY_TS_CLIENT_ID }}\n          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}\n",
+            "          oauth-client-id: ${{ vars.TS_CLIENT_ID }}\n          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}\n",
         ),
         "reads a secret",
     );
@@ -1447,14 +1447,18 @@ fn the_network_join_of_deploy_uses_the_run_token_and_variables_only() {
         &plant(
             "deploy",
             join,
-            "          oauth-client-id: ${{ vars.KBF_DEPLOY_TS_CLIENT_ID }}\n          authkey: ${{ vars.KBF_DEPLOY_TS_KEY }}\n",
+            "          oauth-client-id: ${{ vars.TS_CLIENT_ID }}\n          authkey: ${{ vars.TS_KEY }}\n",
         ),
+        "not exactly",
+    );
+    red(
+        &plant("deploy", "tags: tag:ci", "tags: tag:ci,tag:admin"),
         "not exactly",
     );
     red(
         &plant(
             "deploy",
-            "audience: ${{ vars.KBF_DEPLOY_TS_AUDIENCE }}",
+            "audience: ${{ vars.TS_AUDIENCE }}",
             "audience: ${{ vars.OTHER }}",
         ),
         "not exactly",
@@ -1462,7 +1466,7 @@ fn the_network_join_of_deploy_uses_the_run_token_and_variables_only() {
     red(
         &plant(
             "deploy",
-            "        if: ${{ vars.KBF_DEPLOY_TS_CLIENT_ID != '' }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
             "        if: ${{ vars.OTHER != '' }}\n",
         ),
         "is under `if:`",
@@ -1470,7 +1474,7 @@ fn the_network_join_of_deploy_uses_the_run_token_and_variables_only() {
     red(
         &plant(
             "deploy",
-            "        if: ${{ vars.KBF_DEPLOY_TS_CLIENT_ID != '' }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
             "",
         ),
         "not under exactly `if:",
@@ -1500,8 +1504,8 @@ fn the_network_join_of_deploy_uses_the_run_token_and_variables_only() {
     red(
         &plant(
             "deploy",
-            "        if: ${{ vars.KBF_DEPLOY_TS_CLIENT_ID != '' }}\n",
-            "        if: ${{ vars.KBF_DEPLOY_TS_CLIENT_ID != '' }}\n        env:\n          TS_AUTHKEY: ${{ vars.KBF_DEPLOY_TS_KEY }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n        env:\n          TS_AUTHKEY: ${{ vars.TS_KEY }}\n",
         ),
         "has an `env:`",
     );

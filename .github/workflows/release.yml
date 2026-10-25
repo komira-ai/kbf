@@ -52,7 +52,7 @@
 #          when the repository variable KBF_COORDINATOR_URL is unset. The one job that holds
 #          `id-token: write`, and no write scope. When the coordinator is reachable only on a
 #          Tailscale network, it joins that network first as an ephemeral node, with the same
-#          run token (KBF_DEPLOY_TS_CLIENT_ID set; skipped otherwise).
+#          run token (TS_CLIENT_ID and KBF_COORDINATOR_URL set; skipped otherwise).
 #
 # A run releases one commit; a run of an old commit tags and publishes nothing (the highest
 # release tag must name this commit or an ancestor of it: `release tag` and `release publish`
@@ -438,16 +438,17 @@ jobs:
       - run: cargo build -p xtask --locked
       # When the coordinator is reachable only on a Tailscale network: join it, after the build
       # (its scripts never see that network), as an ephemeral node. Tailscale's workload identity
-      # federation takes this run's OIDC token, so the job still holds no secret; the client id,
-      # the audience and the tags are repository variables. Unset (a fork, a repository with no
-      # farm, a coordinator on a public address) the step is skipped and the verb runs as before.
+      # federation takes this run's OIDC token, so the job still holds no secret. The client id and
+      # the audience are the variables TS_CLIENT_ID and TS_AUDIENCE, the trust credential CI jobs
+      # join the network with, as `tag:ci`. Either variable unset (a fork, a repository with no
+      # farm or no network) the step is skipped and the verb runs as before.
       - name: Join the farm's Tailscale network
-        if: ${{ vars.KBF_DEPLOY_TS_CLIENT_ID != '' }}
+        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}
         uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
         with:
-          oauth-client-id: ${{ vars.KBF_DEPLOY_TS_CLIENT_ID }}
-          audience: ${{ vars.KBF_DEPLOY_TS_AUDIENCE }}
-          tags: ${{ vars.KBF_DEPLOY_TS_TAGS }}
+          oauth-client-id: ${{ vars.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE }}
+          tags: tag:ci
       # The version is the release's; the minimums default to 1 and are the farm's to raise.
       - name: Set this release as the farm's desired version, and wait for the farm to converge
         env:

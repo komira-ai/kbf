@@ -26,7 +26,7 @@
 //!   `deploy-farm` step is given the release's version and that address, and has no `if:` (an
 //!   unset variable is a notice from the verb, not a skipped step). It may join a Tailscale
 //!   network first, in one step of [`TS_ACTION`] after the build and before the verb, under
-//!   [`TS_IF`] and given exactly [`TS_WITH`] (repository variables; the run token, no secret).
+//!   [`TS_IF`] and given exactly [`TS_WITH`] (variables and the tag; the run token, no secret).
 //!   No other job uses that action.
 //! - **Halt on red.** No `always()`, `failure()`, `cancelled()` or `continue-on-error`, and no
 //!   step under `if:` but the ones of `notes` that read the previous release and the network
@@ -67,15 +67,17 @@ const DEPLOY_URL: &str = "vars.KBF_COORDINATOR_URL";
 /// The action `deploy` joins a Tailscale network with, pinned by commit.
 const TS_ACTION: &str = "tailscale/github-action@";
 
-/// The one condition of the network join: the client id is set (unset, the step is skipped).
-const TS_IF: &str = "${{ vars.KBF_DEPLOY_TS_CLIENT_ID != '' }}";
+/// The one condition of the network join: the trust credential's client id and the
+/// coordinator's address are both set (either unset, the step is skipped).
+const TS_IF: &str = "${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}";
 
 /// The inputs of the network join, all of them: workload identity federation with the run's
-/// token, so no `authkey` or `oauth-secret`.
+/// token (the CI trust credential, `TS_CLIENT_ID` and `TS_AUDIENCE`, as `tag:ci`), so no
+/// `authkey` or `oauth-secret`.
 const TS_WITH: [(&str, &str); 3] = [
-    ("oauth-client-id", "${{ vars.KBF_DEPLOY_TS_CLIENT_ID }}"),
-    ("audience", "${{ vars.KBF_DEPLOY_TS_AUDIENCE }}"),
-    ("tags", "${{ vars.KBF_DEPLOY_TS_TAGS }}"),
+    ("oauth-client-id", "${{ vars.TS_CLIENT_ID }}"),
+    ("audience", "${{ vars.TS_AUDIENCE }}"),
+    ("tags", "tag:ci"),
 ];
 
 /// The jobs, in file order.
@@ -1083,12 +1085,12 @@ fn tailnet_join(
         want.sort_unstable();
         if with != want {
             out.push(format!(
-                "the network join of `{DEPLOY}` is given {with:?}, not exactly {want:?}: the client id, audience and tags are repository variables, and the run token is its only credential"
+                "the network join of `{DEPLOY}` is given {with:?}, not exactly {want:?}: the client id and audience are the CI trust credential's variables, the tag is `tag:ci`, and the run token is its only credential"
             ));
         }
         if !step.env.is_empty() {
             out.push(format!(
-                "the network join of `{DEPLOY}` has an `env:`: its inputs are the three repository variables of `with:` alone"
+                "the network join of `{DEPLOY}` has an `env:`: its inputs are the three of `with:` alone"
             ));
         }
         if i > verb_at || built.is_none_or(|b| i < b) {
