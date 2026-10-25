@@ -1,5 +1,7 @@
 //! The answers: the plain ones, and S3's error answers with their status codes and codes.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::header::{HeaderName, HeaderValue};
@@ -7,8 +9,10 @@ use hyper::{Response, StatusCode};
 
 use crate::Error;
 
-use super::uploads::Rejected;
 use super::xml::error_body;
+
+/// The header that has the hash of the body that the signature covers.
+pub(crate) const PAYLOAD_HEADER: &str = "x-amz-content-sha256";
 
 /// What the server sends back.
 pub(crate) type Answer = Response<Full<Bytes>>;
@@ -86,6 +90,35 @@ impl S3Error {
             .with("connection", "close")
     }
 
+    /// A request whose body took no byte for the idle timeout: the connection is closed.
+    pub(crate) fn request_timeout(idle: Duration) -> Self {
+        let text = format!("No byte of the request body arrived within {idle:?}.");
+        Self::new(StatusCode::BAD_REQUEST, "RequestTimeout", text)
+            .with("connection", "close")
+    }
+
+    /// Whether this is the answer to a request that stalled.
+    pub(crate) fn is_timeout(&self) -> bool {
+        self.code == "RequestTimeout"
+    }
+
+    /// A body whose hash is not the one the request claimed in the header `header`.
+    pub(crate) fn mismatch(header: &str) -> Self {
+        if header == PAYLOAD_HEADER {
+            let text = "The x-amz-content-sha256 header is not the SHA-256 of the body.";
+            Self::new(StatusCode::BAD_REQUEST, "XAmzContentSHA256Mismatch", text)
+        } else {
+            let text = format!("The {header} you specified did not match what was received.");
+            Self::new(StatusCode::BAD_REQUEST, "BadDigest", text)
+        }
+    }
+
+    /// A checksum header whose value is not a hash of the right length, in base64.
+    pub(crate) fn invalid_digest(header: &str) -> Self {
+        let text = format!("The {header} you specified is not valid.");
+        Self::new(StatusCode::BAD_REQUEST, "InvalidDigest", text)
+    }
+
     /// A request for a bucket other than the one this server serves.
     pub(crate) fn no_such_bucket(bucket: &str) -> Self {
         let text = format!("The bucket {bucket:?} does not exist on this server.");
@@ -141,25 +174,11 @@ impl From<Error> for S3Error {
             }
             Error::Full(_) => (StatusCode::SERVICE_UNAVAILABLE, "SlowDown"),
             Error::Reserved(_) => (StatusCode::FORBIDDEN, "AccessDenied"),
+            Error::InvalidPart(_) => (StatusCode::BAD_REQUEST, "InvalidPart"),
+            Error::Unsupported(_) => (StatusCode::NOT_IMPLEMENTED, "NotImplemented"),
             Error::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable"),
             Error::Other(_) => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
         };
         Self::new(status, code, error.to_string())
-    }
-}
-
-impl From<Rejected> for S3Error {
-    fn from(rejected: Rejected) -> Self {
-        match rejected {
-            Rejected::NoSuchUpload => Self::no_such_upload(),
-            Rejected::Full => {
-                let text = "Too many bytes of unfinished multipart uploads; retry later.";
-                Self::new(StatusCode::SERVICE_UNAVAILABLE, "SlowDown", text)
-            }
-            Rejected::TooLarge => {
-                let text = "The parts of the upload are more than this server can hold at once.";
-                Self::new(StatusCode::BAD_REQUEST, "EntityTooLarge", text)
-            }
-        }
     }
 }

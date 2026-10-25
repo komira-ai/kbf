@@ -11,11 +11,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use crate::raw::call;
-use crate::stalled::{Stalled, head, read_answer, status_of};
+use crate::stalled::{Stalled, head, read_answer, send_get, status_of};
 use crate::support::{BUCKET, Harness};
 
 /// Waits until the server has a request in flight.
-async fn until_in_flight(h: &Harness) {
+pub async fn until_in_flight(h: &Harness) {
     let waiting = async {
         while h.server.in_flight() == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -26,23 +26,11 @@ async fn until_in_flight(h: &Harness) {
 }
 
 /// The signed headers of a put of `body` to the key `k`, and its path.
-fn put_headers(h: &Harness, body: &[u8]) -> (Vec<(String, String)>, String) {
+pub fn put_headers(h: &Harness, body: &[u8]) -> (Vec<(String, String)>, String) {
     let path = format!("/{BUCKET}/k");
     let create = [("if-none-match", "*")];
     let headers = h.signed("PUT", &path, &[], &create, body);
     (headers, path)
-}
-
-/// Sends a signed get of `key` on a connection of its own, which closes after the answer, and
-/// does not read the answer.
-async fn send_get(h: &Harness, key: &str) -> TcpStream {
-    let path = format!("/{BUCKET}/{key}");
-    let mut headers = h.signed("GET", &path, &[], &[], b"");
-    headers.push(("connection".to_owned(), "close".to_owned()));
-    let text = head("GET", &path, &headers, 0);
-    let mut stream = TcpStream::connect(h.addr).await.unwrap();
-    stream.write_all(text.as_bytes()).await.unwrap();
-    stream
 }
 
 /// Asserts the sequence of a drain: `/readyz` is 503 at once, the S3 calls are still served

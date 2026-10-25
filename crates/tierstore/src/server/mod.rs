@@ -18,12 +18,16 @@
 //! - DeleteObject, which succeeds for a key that is not there;
 //! - ListObjectsV2 with `prefix`, `max-keys`, `continuation-token` and `start-after`, without
 //!   `delimiter`;
-//! - CreateMultipartUpload, UploadPart, CompleteMultipartUpload and AbortMultipartUpload. The
-//!   parts are held in memory by the server that took them (up to
-//!   [`ServerConfig::max_staged_bytes`], for [`ServerConfig::upload_ttl`]) and the completed
-//!   object is written to the backend as one create-only put, so the parts of an upload go to
-//!   one server, an upload does not outlive a restart, and an object larger than
-//!   [`ServerConfig::max_staged_bytes`] cannot be uploaded in parts (`EntityTooLarge`);
+//! - CreateMultipartUpload, UploadPart, CompleteMultipartUpload and AbortMultipartUpload, which
+//!   the backend does (the [`Proxy`](crate::Proxy) passes them to its cold tier). The server
+//!   holds no part: the body of an UploadPart is handed to the backend as a stream, piece by
+//!   piece as it arrives, so a part of any size is stored without being held in memory, and
+//!   the completion joins the parts into the object in the backend, create-only. A part
+//!   whose body is refused (a checksum that does not match, a body over the limit, a stalled
+//!   one) is not stored. An upload is the backend's: it lives as long as the backend keeps it,
+//!   and `NoSuchUpload` is the answer for an id the backend does not hold. The ETag of a part
+//!   is the content tag the backend gives it, and that of the completion is the content tag of
+//!   the object;
 //! - CreateBucket and HeadBucket of the served bucket (always successful), for setup tools.
 //!
 //! Every other call, a copy (`x-amz-copy-source`), and a query parameter this front does not
@@ -37,8 +41,42 @@
 //! Requests are signed with SigV4 in the `Authorization` header (see `auth`): the one access key
 //! of [`ServerConfig`], over `host`, `x-amz-content-sha256` and `x-amz-date` at least, and a
 //! request without a good signature, a presigned URL included, is answered 403 before its body
-//! is read. The body is checked against the hash the signature covers. Other checksums a client
-//! sends (`x-amz-checksum-*`) are not checked.
+//! is read.
+//!
+//! # Checksums
+//!
+//! The body of a request is checked while it is read, against every hash the request carries,
+//! and a body that does not match is refused with 400 and nothing is stored (a put stores
+//! nothing; a part is not kept):
+//!
+//! - the hash the signature covers (`x-amz-content-sha256`, as hex): `XAmzContentSHA256Mismatch`
+//!   for a body that is not that;
+//! - `Content-MD5`, `x-amz-checksum-crc32`, `x-amz-checksum-crc32c`, `x-amz-checksum-sha1` and
+//!   `x-amz-checksum-sha256`, each the base64 of the hash (the CRCs as four big-endian bytes):
+//!   `BadDigest` for a body that does not match, `InvalidDigest` for a value that is not the
+//!   base64 of a hash of the right length;
+//! - `x-amz-checksum-crc64nvme` is answered `NotImplemented` (the crate depends on no CRC-64
+//!   implementation), and so is a trailing checksum or a signed stream (`STREAMING-` payloads,
+//!   `aws-chunked`), which the clients of kbf do not use.
+//!
+//! The `x-amz-checksum-*` headers are read on the body of a put of an object or of a part, which
+//! is the data they are the checksums of. On any other request they are not: those of a
+//! CompleteMultipartUpload are the checksums of the whole object it makes, not of its XML body,
+//! so they are ignored there. `Content-MD5` and the signed hash are held to every body.
+//!
+//! A body with no checksum header and the signed hash `UNSIGNED-PAYLOAD` is accepted unchecked.
+//!
+//! # Idle bodies
+//!
+//! Every wait for a piece of a request body, and every write of an answer, is bounded by
+//! [`ServerConfig::body_idle_timeout`]; the head of a request has
+//! [`ServerConfig::header_timeout`]. The bound is on the time with no progress, not the time of
+//! the whole: a body that is slow and steady is not cut.
+//! If no byte of a request body arrives for that long, the request is answered 400
+//! `RequestTimeout` with `Connection: close` and a line is logged, and nothing is stored. If the
+//! client takes no byte of an answer for that long (its receive buffer stays full), the
+//! connection is closed and a line is logged. A drain therefore waits for a stalled client no
+//! longer than that timeout.
 //!
 //! `GET /healthz` is 200 while the process runs. `GET /readyz` is 200 until the drain begins and
 //! 503 after. Neither is signed, so a bucket cannot have either name.
@@ -58,15 +96,19 @@
 
 mod auth;
 pub mod cli;
+mod idle;
 mod ops;
 mod reply;
 mod request;
 mod time;
-mod uploads;
 mod xml;
 
 #[cfg(test)]
 mod auth_tests;
+#[cfg(test)]
+mod completion_tests;
+#[cfg(test)]
+mod idle_tests;
 #[cfg(test)]
 mod ops_tests;
 #[cfg(test)]
@@ -80,11 +122,10 @@ mod testing;
 #[cfg(test)]
 mod time_tests;
 #[cfg(test)]
-mod uploads_tests;
-#[cfg(test)]
 mod xml_tests;
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -102,9 +143,9 @@ use tokio::sync::{Notify, watch};
 
 use crate::{Backend, Clock};
 
+use idle::Watched;
 use reply::{Answer, S3Error, answer};
-use request::{BoxError, Query, check_payload, read_body, resolve};
-use uploads::Uploads;
+use request::{BoxError, Check, Query, Reader, Target, resolve};
 
 /// The settings of a [`Server`].
 #[derive(Clone)]
@@ -120,10 +161,11 @@ pub struct ServerConfig {
     /// The most bytes of a request body: the largest object that one put takes, and the
     /// largest part of an upload.
     pub max_request_bytes: usize,
-    /// The most bytes that the parts of the unfinished multipart uploads hold.
-    pub max_staged_bytes: u64,
-    /// How long an upload that gets no part is kept.
-    pub upload_ttl: Duration,
+    /// How long a request body may go without a byte arriving, and how long the client may
+    /// go without taking a byte of an answer, before the request ends: a body that arrives
+    /// slowly but steadily is not cut, and neither is a slow reader that keeps taking bytes.
+    /// See the module docs.
+    pub body_idle_timeout: Duration,
     /// How long a client has to send the head of a request. It also bounds how long a
     /// connection may wait, idle, for its next request, so keep it above the time a client
     /// keeps an idle connection in its pool.
@@ -139,9 +181,9 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     /// The settings for `bucket` and an access key, in region `us-east-1`, with bodies of at
-    /// most 256 MiB, 1 GiB of unfinished uploads kept for an hour, a minute for a request head
-    /// (and for an idle connection to send its next request), a drain that waits 10 seconds
-    /// with `/readyz` at 503 and then at most 15 minutes for the requests in flight.
+    /// most 256 MiB, 30 seconds of idle time for a body or an answer, a minute for a request
+    /// head (and for an idle connection to send its next request), a drain that waits 10
+    /// seconds with `/readyz` at 503 and then at most 15 minutes for the requests in flight.
     #[must_use]
     pub fn new(
         bucket: &str,
@@ -155,8 +197,7 @@ impl ServerConfig {
             access_key_id: access_key_id.to_owned(),
             secret_access_key: secret_access_key.to_owned(),
             max_request_bytes: 256 << 20,
-            max_staged_bytes: 1 << 30,
-            upload_ttl: Duration::from_secs(3600),
+            body_idle_timeout: Duration::from_secs(30),
             header_timeout: Duration::from_secs(60),
             drain_lb_wait: Duration::from_secs(10),
             drain_deadline: Duration::from_secs(900),
@@ -187,7 +228,6 @@ const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 pub struct Server {
     backend: Arc<dyn Backend>,
     config: ServerConfig,
-    uploads: Uploads,
     phase: AtomicU8,
     /// Notified once, when the drain begins.
     drain_requested: Notify,
@@ -241,11 +281,9 @@ impl Server {
     /// A server over `backend`.
     #[must_use]
     pub fn new(backend: Arc<dyn Backend>, config: ServerConfig) -> Arc<Self> {
-        let epoch = config.clock.now();
         Arc::new(Self {
             backend,
             config,
-            uploads: Uploads::new(epoch),
             phase: AtomicU8::new(SERVING),
             drain_requested: Notify::new(),
             inflight: AtomicUsize::new(0),
@@ -272,6 +310,12 @@ impl Server {
         self.inflight.load(Ordering::SeqCst)
     }
 
+    /// The connections that are open now, those that wait for a request included.
+    #[must_use]
+    pub fn open_connections(&self) -> usize {
+        self.open.load(Ordering::SeqCst)
+    }
+
     /// Begins the drain: `/readyz` says 503 from now on, and [`Server::serve`] runs the rest of
     /// the sequence. Calling it again does nothing more.
     pub fn begin_drain(&self) {
@@ -287,7 +331,7 @@ impl Server {
         loop {
             tokio::select! {
                 accepted = listener.accept() => match accepted {
-                    Ok((stream, _)) => self.connection(stream),
+                    Ok((stream, peer)) => self.connection(stream, peer),
                     Err(_) => tokio::time::sleep(ACCEPT_PAUSE).await,
                 },
                 () = self.drain_requested.notified() => break,
@@ -298,7 +342,7 @@ impl Server {
         loop {
             tokio::select! {
                 accepted = listener.accept() => match accepted {
-                    Ok((stream, _)) => self.connection(stream),
+                    Ok((stream, peer)) => self.connection(stream, peer),
                     Err(_) => tokio::time::sleep(ACCEPT_PAUSE).await,
                 },
                 () = &mut wait => break,
@@ -350,16 +394,17 @@ impl Server {
 
     /// Serves one connection on a task of its own, which ends with the connection, or after the
     /// drain has closed it.
-    fn connection(self: &Arc<Self>, stream: TcpStream) {
+    fn connection(self: &Arc<Self>, stream: TcpStream, peer: SocketAddr) {
         let server = Arc::clone(self);
         let service = service_fn(move |request| {
             let server = Arc::clone(&server);
             async move { Ok::<_, Infallible>(server.handle(request).await) }
         });
+        let watched = Watched::new(stream, self.config.body_idle_timeout, peer);
         let serving = http1::Builder::new()
             .timer(TokioTimer::new())
             .header_read_timeout(self.config.header_timeout)
-            .serve_connection(TokioIo::new(stream), service);
+            .serve_connection(TokioIo::new(watched), service);
         let connected = Connected::enter(self);
         let mut closing = self.closing.subscribe();
         drop(tokio::spawn(async move {
@@ -380,7 +425,8 @@ impl Server {
     /// Answers one request.
     pub async fn handle<B>(&self, request: Request<B>) -> Response<Full<Bytes>>
     where
-        B: hyper::body::Body,
+        B: hyper::body::Body + Send,
+        B::Data: Send,
         B::Error: Into<BoxError>,
     {
         let _flight = Flight::enter(self);
@@ -389,7 +435,12 @@ impl Server {
         let (parts, body) = request.into_parts();
         let outcome = self.respond(&parts, body).await;
         let path = parts.uri.path();
-        let mut response = outcome.unwrap_or_else(|error| error.into_answer(path, &id));
+        let mut response = outcome.unwrap_or_else(|error| {
+            if error.is_timeout() {
+                self.log_stalled(&parts, &id);
+            }
+            error.into_answer(path, &id)
+        });
         let name = HeaderName::from_static("x-amz-request-id");
         response
             .headers_mut()
@@ -397,9 +448,17 @@ impl Server {
         response
     }
 
+    /// Logs a request that was ended because its body stalled.
+    fn log_stalled(&self, parts: &Parts, id: &str) {
+        let (method, path) = (&parts.method, parts.uri.path());
+        let idle = self.config.body_idle_timeout;
+        eprintln!("tierstore: request {id} ({method} {path}): body idle for {idle:?}, closed");
+    }
+
     async fn respond<B>(&self, parts: &Parts, body: B) -> Result<Answer, S3Error>
     where
-        B: hyper::body::Body,
+        B: hyper::body::Body + Send,
+        B::Data: Send,
         B::Error: Into<BoxError>,
     {
         if let Some(answer) = self.probe(parts) {
@@ -409,11 +468,13 @@ impl Server {
             return Err(S3Error::draining());
         }
         let claim = auth::verify(&self.config, parts)?;
-        let body = read_body(body, self.config.max_request_bytes).await?;
-        check_payload(&claim, &body)?;
         let target = resolve(&self.config.bucket, parts.uri.path())?;
         let query = Query::parse(parts.uri.query())?;
-        self.dispatch(parts, target, &query, body).await
+        let data = matches!((&parts.method, &target), (&Method::PUT, Target::Object(_)));
+        let check = Check::new(&claim, &parts.headers, data)?;
+        let limit = self.config.max_request_bytes;
+        let reader = Reader::new(body, limit, self.config.body_idle_timeout);
+        self.dispatch(parts, target, &query, reader, check).await
     }
 
     /// The answer to a health or readiness probe, which are not signed.

@@ -1,18 +1,34 @@
 //! Fixtures of the unit tests of the server: a server over in-memory tiers, and requests
 //! signed for it.
 
+use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
+use hyper::body::{Body, Frame};
 use hyper::header::HeaderMap;
 use hyper::{Request, StatusCode};
+use md5::Md5;
+use ring::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest as sha1_of};
 use roxmltree::Document;
+use sha2::{Digest, Sha256};
+use tokio::time::{Sleep, sleep};
 
-use crate::{Backend, FaultyBackend, MemoryBackend, Proxy, ProxyConfig, TestClock};
+use crate::{
+    Backend, ByteRange, Error, FaultyBackend, Listed, MemoryBackend, Meta, Proxy, ProxyConfig,
+    TestClock,
+};
 
 use super::auth::sign;
+use super::request::BoxError;
 use super::{Server, ServerConfig};
 
 pub(super) const KEY_ID: &str = "AKIDEXAMPLE";
@@ -23,6 +39,27 @@ pub(super) const BUCKET: &str = "tier-bucket";
 
 /// The time of the clock of the rig, which is 2027-01-15 08:00:00 UTC.
 pub(super) const NOW: u64 = 1_800_000_000_000;
+
+/// The headers in which a request may carry a checksum of its body.
+pub(super) const CHECKSUMS: [&str; 5] = [
+    "content-md5",
+    "x-amz-checksum-crc32",
+    "x-amz-checksum-crc32c",
+    "x-amz-checksum-sha1",
+    "x-amz-checksum-sha256",
+];
+
+/// The value of the checksum header `name` for `body`, worked out apart from the server.
+pub(super) fn checksum(name: &str, body: &[u8]) -> String {
+    let hash: Vec<u8> = match name {
+        "content-md5" => Md5::digest(body).to_vec(),
+        "x-amz-checksum-crc32" => crc32fast::hash(body).to_be_bytes().to_vec(),
+        "x-amz-checksum-crc32c" => crc32c::crc32c(body).to_be_bytes().to_vec(),
+        "x-amz-checksum-sha1" => sha1_of(&SHA1_FOR_LEGACY_USE_ONLY, body).as_ref().to_vec(),
+        _ => Sha256::digest(body).to_vec(),
+    };
+    STANDARD.encode(hash)
+}
 
 /// The text of every element called `name` in `xml`, in document order.
 pub(super) fn texts(xml: &str, name: &str) -> Vec<String> {
@@ -110,8 +147,27 @@ impl Rig {
         self.send_raw(request).await
     }
 
+    /// Sends a request signed for the server whose body is the one `played` plays, in place of
+    /// the bytes `signed`, which are what the signature covers.
+    pub(super) async fn send_played(
+        &self,
+        method: &str,
+        uri: &str,
+        extra: &[(&str, &str)],
+        signed: &[u8],
+        played: Scripted,
+    ) -> Reply {
+        let (parts, _) = sign(&self.config, method, uri, extra, signed).into_parts();
+        self.send_raw(Request::from_parts(parts, played)).await
+    }
+
     /// Sends a request as it is and reads the answer.
-    pub(super) async fn send_raw(&self, request: Request<Full<Bytes>>) -> Reply {
+    pub(super) async fn send_raw<B>(&self, request: Request<B>) -> Reply
+    where
+        B: Body + Send,
+        B::Data: Send,
+        B::Error: Into<BoxError>,
+    {
         let response = self.server.handle(request).await;
         let (parts, body) = response.into_parts();
         let bytes = body.collect().await.expect("a whole body").to_bytes();
@@ -145,5 +201,95 @@ impl Rig {
     pub(super) async fn list(&self, query: &str) -> Reply {
         let uri = format!("/{BUCKET}?list-type=2&{query}");
         self.send("GET", &uri, &[], b"").await
+    }
+}
+
+/// One step of the body that a [`Scripted`] plays.
+pub(super) enum Step {
+    /// A piece of the body.
+    Data(&'static [u8]),
+    /// Nothing happens for this long (tokio time).
+    Wait(Duration),
+    /// A frame of trailers, which carries no byte of the body.
+    Trailers,
+    /// The body fails.
+    Fail,
+}
+
+/// A request body that plays steps, so that a test says when its pieces arrive.
+pub(super) struct Scripted {
+    steps: VecDeque<Step>,
+    waiting: Option<Pin<Box<Sleep>>>,
+}
+
+impl Scripted {
+    pub(super) fn new(steps: Vec<Step>) -> Self {
+        Self {
+            steps: steps.into(),
+            waiting: None,
+        }
+    }
+}
+
+impl Body for Scripted {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(timer) = this.waiting.as_mut() {
+                if timer.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                this.waiting = None;
+            }
+            let Some(step) = this.steps.pop_front() else {
+                return Poll::Ready(None);
+            };
+            match step {
+                Step::Data(bytes) => {
+                    return Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(bytes)))));
+                }
+                Step::Wait(time) => this.waiting = Some(Box::pin(sleep(time))),
+                Step::Trailers => {
+                    return Poll::Ready(Some(Ok(Frame::trailers(HeaderMap::new()))));
+                }
+                Step::Fail => return Poll::Ready(Some(Err(std::io::Error::other("cut")))),
+            }
+        }
+    }
+}
+
+/// A backend that does what the trait requires of it and no multipart upload: it holds nothing.
+pub(super) struct Plain;
+
+#[async_trait]
+impl Backend for Plain {
+    async fn put(&self, key: &str, _body: Bytes) -> Result<(), Error> {
+        Err(Error::Full(key.to_owned()))
+    }
+
+    async fn put_if_match(&self, key: &str, _body: Bytes, _etag: &str) -> Result<String, Error> {
+        Err(Error::NotFound(key.to_owned()))
+    }
+
+    async fn get(&self, key: &str, _range: Option<ByteRange>) -> Result<Bytes, Error> {
+        Err(Error::NotFound(key.to_owned()))
+    }
+
+    async fn head(&self, key: &str) -> Result<Meta, Error> {
+        Err(Error::NotFound(key.to_owned()))
+    }
+
+    async fn delete(&self, _key: &str) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn list(&self, _prefix: &str) -> Result<Vec<Listed>, Error> {
+        Ok(Vec::new())
     }
 }

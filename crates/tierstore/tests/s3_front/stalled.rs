@@ -1,9 +1,13 @@
-//! Requests held in flight on a connection of their own: a body that stops part-way.
+//! Requests held in flight on a connection of their own: a body that stops part-way, a body that
+//! trickles, and an answer that is not read.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+use crate::support::{BUCKET, Harness};
 
 /// The text of a request that has a body of `length` bytes: the request line, the headers, and
 /// the blank line.
@@ -26,6 +30,18 @@ pub async fn read_answer(stream: &mut TcpStream) -> String {
 /// The status code of an answer.
 pub fn status_of(answer: &str) -> u16 {
     answer[9..12].parse().unwrap()
+}
+
+/// Sends a signed get of `key` on a connection of its own, which closes after the answer, and
+/// does not read the answer.
+pub async fn send_get(h: &Harness, key: &str) -> TcpStream {
+    let path = format!("/{BUCKET}/{key}");
+    let mut headers = h.signed("GET", &path, &[], &[], b"");
+    headers.push(("connection".to_owned(), "close".to_owned()));
+    let text = head("GET", &path, &headers, 0);
+    let mut stream = TcpStream::connect(h.addr).await.unwrap();
+    stream.write_all(text.as_bytes()).await.unwrap();
+    stream
 }
 
 /// A put whose body was sent in part, so that the server holds it in flight.
@@ -60,5 +76,21 @@ impl Stalled {
     pub async fn finish(mut self) -> u16 {
         self.stream.write_all(&self.rest).await.unwrap();
         status_of(&read_answer(&mut self.stream).await)
+    }
+
+    /// Sends the rest of the body a byte at a time, `gap` apart, and gives the status code of the
+    /// answer.
+    pub async fn trickle(mut self, gap: Duration) -> u16 {
+        self.stream.set_nodelay(true).unwrap();
+        for byte in std::mem::take(&mut self.rest) {
+            tokio::time::sleep(gap).await;
+            self.stream.write_all(&[byte]).await.unwrap();
+        }
+        status_of(&read_answer(&mut self.stream).await)
+    }
+
+    /// Reads the answer to the end of the connection without sending the rest of the body.
+    pub async fn answer(mut self) -> String {
+        read_answer(&mut self.stream).await
     }
 }

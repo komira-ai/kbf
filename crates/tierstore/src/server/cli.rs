@@ -6,9 +6,13 @@
 //! tiers. Everything is a flag; the process reads no environment variable, and the secret
 //! access key is read from a file, not from the command line.
 //!
-//! The tiers of this build are `memory` only: nothing is kept when the process stops, and the
-//! objects of a memory tier carry the time zero. Tiers over S3 stores are added with the S3
-//! backend of this crate, and then `--hot` and `--cold` name them.
+//! The tiers of this build are `memory` and `dir:<path>`. A memory tier keeps nothing when the
+//! process stops, and its objects carry the time zero. A directory tier keeps its objects, and
+//! the multipart uploads in progress, in a directory of the local file system (see
+//! [`DirBackend`](crate::DirBackend)), so that they outlive a restart; the directory is made if
+//! it does not exist. Tiers over S3 stores are added with the S3 backend of this crate, and
+//! then `--hot` and `--cold` name them. The cold tier must do multipart uploads, which both of
+//! these do, and the proxy passes them to it.
 //!
 //! On SIGTERM or SIGINT the process drains (see the [`server`](super) docs): `/readyz` says 503,
 //! it serves for `--drain-lb-wait`, refuses new requests, waits for those in flight and for the
@@ -30,7 +34,8 @@ use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
 use crate::{
-    Backend, Clock, MemoryBackend, Proxy, ProxyConfig, Reconciler, ReconcilerConfig, SystemClock,
+    Backend, Clock, DirBackend, MemoryBackend, Proxy, ProxyConfig, Reconciler, ReconcilerConfig,
+    SystemClock,
 };
 
 use super::{Drained, Server, ServerConfig};
@@ -39,8 +44,6 @@ use super::{Drained, Server, ServerConfig};
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 const DEFAULT_MAX_REQUEST_BYTES: u64 = 256 << 20;
-
-const DEFAULT_MAX_STAGED_BYTES: u64 = 1 << 30;
 
 /// `tierstore`: an S3 server over a hot and a cold tier.
 ///
@@ -56,11 +59,12 @@ pub struct Cli {
     /// across restarts, and give each process over the same tiers one of its own.
     #[arg(long)]
     pub proxy_id: String,
-    /// The hot tier: `memory`, the only kind this build opens. Its objects are lost when the
-    /// process stops.
+    /// The hot tier: `memory` (its objects are lost when the process stops) or `dir:<path>`
+    /// (a directory, made if it does not exist).
     #[arg(long)]
     pub hot: String,
-    /// The cold tier: `memory`, the only kind this build opens.
+    /// The cold tier: `memory` or `dir:<path>`. Multipart uploads go straight to it, part by
+    /// part, so it must do them; both kinds do.
     #[arg(long)]
     pub cold: String,
     /// The bytes the hot tier is meant to hold; the water marks are shares of it.
@@ -118,12 +122,14 @@ pub struct Cli {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub max_request_bytes: u64,
-    /// The most bytes that the parts of unfinished multipart uploads hold in memory.
-    #[arg(long, default_value_t = DEFAULT_MAX_STAGED_BYTES)]
-    pub max_staged_bytes: u64,
-    /// How long a multipart upload that gets no part is kept.
-    #[arg(long, default_value = "1h", value_parser = parse_duration)]
-    pub upload_ttl: Duration,
+    /// How long a request body may go without a byte arriving, and how long a client may go
+    /// without taking a byte of an answer, before the request ends: a number and `ms`, `s`,
+    /// `m` or `h`. A body that arrives slowly but steadily is never cut, however long the whole
+    /// takes. A request whose body stalls is answered 400 `RequestTimeout` and its connection
+    /// is closed; a connection whose client stops reading an answer is closed. Both are
+    /// logged on stderr, and a drain waits no longer than this for a stalled client.
+    #[arg(long, default_value = "30s", value_parser = parse_duration)]
+    pub body_idle_timeout: Duration,
 }
 
 /// A duration: a whole number of `ms`, `s`, `m` or `h`, such as `250ms` or `15m`.
@@ -161,10 +167,14 @@ struct Built {
 
 /// The tier a flag names.
 fn tier(flag: &str, spec: &str) -> Result<Arc<dyn Backend>, String> {
-    match spec {
-        "memory" => Ok(Arc::new(MemoryBackend::new())),
+    match (spec, spec.strip_prefix("dir:")) {
+        ("memory", _) => Ok(Arc::new(MemoryBackend::new())),
+        (_, Some(path)) => match DirBackend::open(path) {
+            Ok(dir) => Ok(Arc::new(dir)),
+            Err(why) => Err(format!("{flag} {spec:?}: {why}")),
+        },
         _ => {
-            let why = "only `memory` can be opened by this build; S3 tiers are not built in yet";
+            let why = "only `memory` and `dir:<path>` can be opened by this build";
             Err(format!("{flag} {spec:?}: {why}"))
         }
     }
@@ -204,6 +214,9 @@ fn build(cli: &Cli) -> Result<Built, String> {
     if matches!(cli.bucket.as_str(), "healthz" | "readyz") {
         return Err(format!("--bucket {:?} is the name of a probe path", cli.bucket));
     }
+    if cli.body_idle_timeout.is_zero() {
+        return Err("--body-idle-timeout must be longer than zero".to_owned());
+    }
     let (key_id, secret) = read_key(&cli.access_key_file)?;
     let hot = tier("--hot", &cli.hot)?;
     let cold = tier("--cold", &cli.cold)?;
@@ -211,8 +224,7 @@ fn build(cli: &Cli) -> Result<Built, String> {
     let mut server = ServerConfig::new(&cli.bucket, &key_id, &secret, Arc::clone(&clock));
     server.region = cli.region.clone();
     server.max_request_bytes = usize::try_from(cli.max_request_bytes).unwrap_or(usize::MAX);
-    server.max_staged_bytes = cli.max_staged_bytes;
-    server.upload_ttl = cli.upload_ttl;
+    server.body_idle_timeout = cli.body_idle_timeout;
     server.drain_lb_wait = cli.drain_lb_wait;
     server.drain_deadline = cli.drain_deadline;
     let mut proxy = ProxyConfig::new(&cli.proxy_id, cli.hot_bytes, Arc::clone(&clock));

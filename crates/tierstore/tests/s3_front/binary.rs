@@ -166,8 +166,8 @@ fn the_flags_are_parsed_and_refused_as_the_usage_says() {
 }
 
 /// Asserts that a start that cannot go on exits with status 1 and a reason that names the flag:
-/// a key file that others can read, a tier that is not `memory`, water marks out of order,
-/// an id that is not an id, and an address that is in use.
+/// a key file that others can read, a tier that is neither `memory` nor `dir:<path>`, water marks
+/// out of order, an id that is not an id, and an address that is in use.
 #[test]
 fn a_start_that_cannot_go_on_says_why() {
     let files = Files::new("bin-refused");

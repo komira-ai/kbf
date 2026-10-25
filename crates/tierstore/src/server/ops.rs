@@ -1,22 +1,20 @@
 //! The S3 operations: each is calls to the backend and the answer S3 gives.
 
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use hyper::StatusCode;
+use hyper::body::Body;
 use hyper::http::request::Parts;
-use sha2::{Digest, Sha256};
 
 use crate::journal::is_reserved;
 use crate::{ByteRange, Error, Meta};
 
 use super::Server;
 use super::reply::{Answer, S3Error, answer, xml_answer};
-use super::request::{Query, Target, header};
+use super::request::{BoxError, Check, Query, Reader, Refused, Target, header, pieces};
 use super::time::http_date;
-use super::uploads::Part;
 use super::xml::{self, Listing};
 
 /// The query parameters this front understands. A request with another is not served.
@@ -94,6 +92,18 @@ fn refuse_reserved(key: &str) -> Result<(), S3Error> {
     Ok(())
 }
 
+/// Refuses what this front does not do whatever the call is: a query parameter it does not
+/// know, and a copy.
+fn refuse_unsupported(parts: &Parts, query: &Query) -> Result<(), S3Error> {
+    if !query.only(&SUPPORTED) {
+        return Err(S3Error::unsupported("this query parameter is not supported"));
+    }
+    if header(&parts.headers, "x-amz-copy-source").is_some() {
+        return Err(S3Error::unsupported("copying an object is not supported"));
+    }
+    Ok(())
+}
+
 /// The number of keys a listing asked for, at most [`PAGE_LIMIT`].
 fn page_size(query: &Query) -> Result<usize, S3Error> {
     let Some(text) = query.get("max-keys") else {
@@ -150,15 +160,24 @@ fn conditional(parts: &Parts, key: &str, meta: &Meta) -> Result<Option<Answer>, 
 /// Runs a call that changes the store to its end on a task of its own. The server drops the
 /// future of a request when the client goes away, and a put dropped after it wrote the object
 /// and before it wrote the journal entry would leave an object that nothing copies or evicts,
-/// and a key that no put can take.
-async fn detached<T, F>(call: F) -> Result<T, S3Error>
+/// and a key that no put can take. The completion of a multipart upload is carried to its end
+/// too, so that the parts it joins are not left half joined.
+async fn detached<T, F>(call: F) -> Result<T, Error>
 where
     T: Send + 'static,
     F: Future<Output = Result<T, Error>> + Send + 'static,
 {
     let done = tokio::spawn(call).await;
-    let finished = done.expect("a call to the backend does not panic");
-    finished.map_err(S3Error::from)
+    done.expect("a call to the backend does not panic")
+}
+
+/// The answer to a failed call on a multipart upload: where the backend has no such upload, it
+/// is `NoSuchUpload`, not `NoSuchKey`.
+fn upload_error(error: Error) -> S3Error {
+    match error {
+        Error::NotFound(_) => S3Error::no_such_upload(),
+        other => S3Error::from(other),
+    }
 }
 
 /// The key a listing starts after: the one its continuation token stands for, else
@@ -170,42 +189,30 @@ fn start_after(query: &Query) -> Result<Option<String>, S3Error> {
     }
 }
 
-/// The parts a completion names, joined, if every one was uploaded with that ETag.
-fn assemble(wanted: &[(u32, String)], staged: &BTreeMap<u32, Part>) -> Result<Bytes, S3Error> {
-    let ascending = wanted.windows(2).all(|pair| pair[0].0 < pair[1].0);
-    if !ascending {
-        let text = "The parts must be listed in ascending order of their numbers.";
-        return Err(S3Error::new(StatusCode::BAD_REQUEST, "InvalidPartOrder", text));
-    }
-    let mut object = BytesMut::new();
-    for (number, tag) in wanted {
-        let part = staged.get(number).filter(|part| part.tag == *tag);
-        let Some(part) = part else {
-            let text = "A part was not uploaded, or its ETag is not the one that was named.";
-            return Err(S3Error::new(StatusCode::BAD_REQUEST, "InvalidPart", text));
-        };
-        object.extend_from_slice(&part.body);
-    }
-    Ok(object.freeze())
-}
-
 impl Server {
-    /// Does what a request asks for, once it is signed and its body is read.
-    pub(super) async fn dispatch(
+    /// Does what a request asks for, once it is signed. A multipart part is streamed to the
+    /// backend as its body arrives; every other call reads its body first.
+    pub(super) async fn dispatch<B>(
         &self,
         parts: &Parts,
         target: Target,
         query: &Query,
-        body: Bytes,
-    ) -> Result<Answer, S3Error> {
-        if !query.only(&SUPPORTED) {
-            return Err(S3Error::unsupported("this query parameter is not supported"));
-        }
-        if header(&parts.headers, "x-amz-copy-source").is_some() {
-            return Err(S3Error::unsupported("copying an object is not supported"));
-        }
+        reader: Reader<B>,
+        check: Check,
+    ) -> Result<Answer, S3Error>
+    where
+        B: Body + Send,
+        B::Data: Send,
+        B::Error: Into<BoxError>,
+    {
+        refuse_unsupported(parts, query)?;
         let method = parts.method.as_str();
-        match (method, target, query.has_any(&MULTIPART)) {
+        let multipart = query.has_any(&MULTIPART);
+        if let ("PUT", Target::Object(key), true) = (method, &target, multipart) {
+            return self.upload_part(query, key, reader, check).await;
+        }
+        let body = reader.read_all(check).await?;
+        match (method, target, multipart) {
             ("PUT" | "HEAD", Target::Bucket, false) => {
                 Ok(answer(StatusCode::OK, &[], Bytes::new()))
             }
@@ -213,10 +220,11 @@ impl Server {
             ("GET", Target::Object(key), false) => self.get_object(parts, &key).await,
             ("HEAD", Target::Object(key), false) => self.head_object(parts, &key).await,
             ("PUT", Target::Object(key), false) => self.put_object(parts, &key, body).await,
-            ("PUT", Target::Object(key), true) => self.upload_part(query, &key, body).await,
             ("DELETE", Target::Object(key), false) => self.delete_object(&key).await,
-            ("DELETE", Target::Object(key), true) => self.abort_upload(query, &key),
-            ("POST", Target::Object(key), true) if query.has("uploads") => self.start_upload(&key),
+            ("DELETE", Target::Object(key), true) => self.abort_upload(query, &key).await,
+            ("POST", Target::Object(key), true) if query.has("uploads") => {
+                self.start_upload(&key).await
+            }
             ("POST", Target::Object(key), true) if query.has("uploadId") => {
                 self.complete_upload(query, &key, body).await
             }
@@ -284,14 +292,16 @@ impl Server {
     async fn delete_object(&self, key: &str) -> Result<Answer, S3Error> {
         refuse_reserved(key)?;
         let (backend, key) = (Arc::clone(&self.backend), key.to_owned());
-        detached(async move { backend.delete(&key).await }).await?;
+        let deleted = detached(async move { backend.delete(&key).await }).await;
+        deleted.map_err(S3Error::from)?;
         Ok(answer(StatusCode::NO_CONTENT, &[], Bytes::new()))
     }
 
     /// Creates the object in the backend, and goes on to the end if the request is dropped.
     async fn put_detached(&self, key: &str, body: Bytes) -> Result<(), S3Error> {
         let (backend, key) = (Arc::clone(&self.backend), key.to_owned());
-        detached(async move { backend.put(&key, body).await }).await
+        let put = detached(async move { backend.put(&key, body).await }).await;
+        put.map_err(S3Error::from)
     }
 
     async fn list_objects(&self, query: &Query) -> Result<Answer, S3Error> {
@@ -315,14 +325,30 @@ impl Server {
         Ok(xml_answer(StatusCode::OK, listing.to_xml()))
     }
 
-    fn start_upload(&self, key: &str) -> Result<Answer, S3Error> {
+    async fn start_upload(&self, key: &str) -> Result<Answer, S3Error> {
         refuse_reserved(key)?;
-        let id = self.uploads.create(key, self.config.upload_ttl);
+        let created = self.backend.create_upload(key).await;
+        let id = created.map_err(upload_error)?;
         let body = xml::initiate(&self.config.bucket, key, &id);
         Ok(xml_answer(StatusCode::OK, body))
     }
 
-    async fn upload_part(&self, query: &Query, key: &str, body: Bytes) -> Result<Answer, S3Error> {
+    /// Stores a part from the body of the request as it arrives: the backend reads the pieces
+    /// of the body from a stream, and the body is checked against its hashes as the pieces pass,
+    /// so a part of any size is stored without being held. A part that is refused (a hash that
+    /// does not match, a body that is too large or stalls) is not stored.
+    async fn upload_part<B>(
+        &self,
+        query: &Query,
+        key: &str,
+        reader: Reader<B>,
+        check: Check,
+    ) -> Result<Answer, S3Error>
+    where
+        B: Body + Send,
+        B::Data: Send,
+        B::Error: Into<BoxError>,
+    {
         refuse_reserved(key)?;
         let id = query.get("uploadId");
         let parse = |text: &str| text.parse::<u32>().ok();
@@ -333,12 +359,15 @@ impl Server {
         if !(1..=PART_LIMIT).contains(&number) {
             return Err(S3Error::invalid("a part number is from 1 to 10000"));
         }
-        let tag = hex::encode(Sha256::digest(&body));
-        let etag = format!("\"{tag}\"");
-        let part = Part { body, tag };
-        let (limit, ttl) = (self.config.max_staged_bytes, self.config.upload_ttl);
-        self.uploads.add_part(id, key, number, part, limit, ttl)?;
-        Ok(answer(StatusCode::OK, &[("etag", etag)], Bytes::new()))
+        let refused = Refused::default();
+        let body = pieces(reader, check, refused.clone());
+        let stored = self.backend.upload_part(key, id, number, body).await;
+        if let Some(error) = refused.take() {
+            return Err(error);
+        }
+        let etag = stored.map_err(upload_error)?;
+        let headers = [("etag", format!("\"{etag}\""))];
+        Ok(answer(StatusCode::OK, &headers, Bytes::new()))
     }
 
     async fn complete_upload(
@@ -354,23 +383,24 @@ impl Server {
             let text = "The request body is not a list of parts.";
             return Err(S3Error::new(StatusCode::BAD_REQUEST, "MalformedXML", text));
         };
-        let staged = self.uploads.parts(id, key);
-        let staged = staged.ok_or_else(S3Error::no_such_upload)?;
-        let object = assemble(&wanted, &staged)?;
-        self.put_detached(key, object).await?;
-        self.uploads.finish(id);
-        let tags: String = wanted.iter().map(|(_, tag)| tag.as_str()).collect();
-        let (digest, count) = (hex::encode(Sha256::digest(tags)), wanted.len());
-        let etag = format!("\"{digest}-{count}\"");
+        let ascending = wanted.windows(2).all(|pair| pair[0].0 < pair[1].0);
+        if !ascending {
+            let text = "The parts must be listed in ascending order of their numbers.";
+            return Err(S3Error::new(StatusCode::BAD_REQUEST, "InvalidPartOrder", text));
+        }
+        let (backend, name, upload) = (Arc::clone(&self.backend), key.to_owned(), id.to_owned());
+        let call = async move { backend.complete_upload(&name, &upload, &wanted).await };
+        let etag = detached(call).await.map_err(upload_error)?;
+        let etag = format!("\"{etag}\"");
         let body = xml::completed(&self.config.bucket, key, &etag);
         Ok(xml_answer(StatusCode::OK, body))
     }
 
-    fn abort_upload(&self, query: &Query, key: &str) -> Result<Answer, S3Error> {
+    async fn abort_upload(&self, query: &Query, key: &str) -> Result<Answer, S3Error> {
+        refuse_reserved(key)?;
         let id = query.get("uploadId").unwrap_or_default();
-        if !self.uploads.abort(id, key) {
-            return Err(S3Error::no_such_upload());
-        }
+        let aborted = self.backend.abort_upload(key, id).await;
+        aborted.map_err(upload_error)?;
         Ok(answer(StatusCode::NO_CONTENT, &[], Bytes::new()))
     }
 }

@@ -119,8 +119,7 @@ fn the_flags_have_their_defaults() {
     assert_eq!(cli.lease_ttl, Duration::from_secs(30));
     assert_eq!(cli.reconcile_interval, Duration::from_secs(5));
     assert_eq!(cli.max_request_bytes, 256 << 20);
-    assert_eq!(cli.max_staged_bytes, 1 << 30);
-    assert_eq!(cli.upload_ttl, Duration::from_secs(3600));
+    assert_eq!(cli.body_idle_timeout, Duration::from_secs(30));
 }
 
 /// Asserts that every flag that has a default can be given, and is read.
@@ -139,8 +138,7 @@ fn the_flags_can_all_be_given() {
         ("--lease-ttl", "20s"),
         ("--reconcile-interval", "1s"),
         ("--max-request-bytes", "10"),
-        ("--max-staged-bytes", "20"),
-        ("--upload-ttl", "90s"),
+        ("--body-idle-timeout", "7s"),
     ];
     let cli = Cli::try_parse_from(flags("key", &given)).unwrap();
     assert_eq!(cli.region, "eu-west-1");
@@ -153,8 +151,8 @@ fn the_flags_can_all_be_given() {
     assert_eq!(cli.copy_parallel, 4);
     assert_eq!(cli.lease_ttl, Duration::from_secs(20));
     assert_eq!(cli.reconcile_interval, Duration::from_secs(1));
-    assert_eq!((cli.max_request_bytes, cli.max_staged_bytes), (10, 20));
-    assert_eq!(cli.upload_ttl, Duration::from_secs(90));
+    assert_eq!(cli.max_request_bytes, 10);
+    assert_eq!(cli.body_idle_timeout, Duration::from_secs(7));
 }
 
 /// Asserts that flags that are not valid are refused when they are read: one that is not known,
@@ -209,8 +207,7 @@ fn the_help_names_every_flag_and_the_version_the_package() {
         "--lease-ttl",
         "--reconcile-interval",
         "--max-request-bytes",
-        "--max-staged-bytes",
-        "--upload-ttl",
+        "--body-idle-timeout",
     ];
     for name in names {
         assert!(help.contains(name), "{name}");
@@ -242,8 +239,7 @@ fn the_settings_are_made_from_the_flags() {
     assert_eq!(built.server.access_key_id, "AKID");
     assert_eq!(built.server.secret_access_key, "secret");
     assert_eq!(built.server.max_request_bytes, 256 << 20);
-    assert_eq!(built.server.max_staged_bytes, 1 << 30);
-    assert_eq!(built.server.upload_ttl, Duration::from_secs(3600));
+    assert_eq!(built.server.body_idle_timeout, Duration::from_secs(30));
     assert_eq!(built.server.drain_lb_wait, Duration::from_secs(10));
     assert_eq!(built.server.drain_deadline, Duration::from_secs(900));
     assert_eq!(built.proxy.proxy_id, "p1");
@@ -261,7 +257,8 @@ fn the_settings_are_made_from_the_flags() {
 
 /// Asserts that flags that do not fit together are refused with a message that names them: the
 /// water marks out of order, a reconcile interval that is not shorter than the lease, a bucket
-/// called like a probe path, a tier that cannot be opened, and a key file that cannot be used.
+/// called like a probe path, an idle timeout of zero, a tier that cannot be opened, and a key
+/// file that cannot be used.
 #[test]
 fn flags_that_do_not_fit_together_are_refused() {
     let dir = TestDir::under(std::env::temp_dir(), "tierstore-refused");
@@ -276,6 +273,8 @@ fn flags_that_do_not_fit_together_are_refused() {
     assert!(interval.contains("--reconcile-interval"), "{interval}");
     assert!(refused(&|cli| cli.bucket = "readyz".to_owned()).contains("probe path"));
     assert!(refused(&|cli| cli.bucket = "healthz".to_owned()).contains("probe path"));
+    let idle = refused(&|cli| cli.body_idle_timeout = Duration::ZERO);
+    assert!(idle.contains("--body-idle-timeout"), "{idle}");
     let hot = refused(&|cli| cli.hot = "s3://hot".to_owned());
     assert!(hot.contains("--hot"), "{hot}");
     let cold = refused(&|cli| cli.cold = "/var/cold".to_owned());
@@ -285,14 +284,25 @@ fn flags_that_do_not_fit_together_are_refused() {
     assert!(key.contains("--access-key-file"), "{key}");
 }
 
-/// Asserts that a memory tier opens and any other kind is refused with the flag's name and the
-/// kind it was given.
+/// Asserts that a memory tier and a directory tier open, the directory being made, and that any
+/// other kind, and a directory that has no name or cannot be made, is refused with the flag's
+/// name and the kind it was given.
 #[test]
-fn only_a_memory_tier_opens() {
+fn only_a_memory_or_a_directory_tier_opens() {
     assert!(tier("--hot", "memory").is_ok());
+    let dir = TestDir::under(std::env::temp_dir(), "tierstore-tiers");
+    let made = dir.path().join("made/here");
+    assert!(tier("--hot", &format!("dir:{}", made.display())).is_ok());
+    assert!(made.join(".uploads").is_dir());
     let why = tier("--cold", "s3://bucket").err().unwrap();
     assert!(why.contains("--cold"), "{why}");
     assert!(why.contains("s3://bucket"), "{why}");
+    let unnamed = tier("--cold", "dir:").err().unwrap();
+    assert!(unnamed.contains("--cold"), "{unnamed}");
+    let file = key_file(&dir, "file", "x", 0o600);
+    let under = format!("dir:{}/inside", file.display());
+    let blocked = tier("--hot", &under).err().unwrap();
+    assert!(blocked.contains("--hot"), "{blocked}");
 }
 
 /// Asserts that the key file is read as an id on the first line and a secret on the second,

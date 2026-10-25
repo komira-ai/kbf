@@ -5,6 +5,7 @@ mod binary;
 mod client;
 mod drain;
 mod files;
+mod idle;
 mod raw;
 mod run;
 mod signer;

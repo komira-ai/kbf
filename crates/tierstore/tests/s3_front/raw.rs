@@ -1,6 +1,8 @@
 //! Requests signed by hand and sent with a plain HTTP client: what the client of kbf does not
 //! send, and the answers as they are on the wire.
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use reqwest::{Client, Method, Response};
 use tierstore::Backend;
 
@@ -167,6 +169,45 @@ async fn the_probes_are_open_and_the_unknown_is_refused() {
     let signed = h.signed("GET", &path, &query, &[], b"");
     let delimited = send(&h, "GET", &path, &query, &signed, b"").await;
     assert_eq!(delimited.status(), 501);
+}
+
+/// The base64 of the big-endian CRC-32 of `bytes`, the value of an `x-amz-checksum-crc32` header.
+fn crc32_of(bytes: &[u8]) -> String {
+    STANDARD.encode(crc32fast::hash(bytes).to_be_bytes())
+}
+
+/// Asserts that a put whose body is not the one an `x-amz-checksum-crc32` header claims is 400
+/// `BadDigest` and stores nothing, that a put whose body is the one is stored, that a
+/// `Content-MD5` that is not the base64 of an MD5 is 400 `InvalidDigest`, and that the checksum of
+/// an algorithm the server does not compute is 501.
+#[tokio::test]
+async fn a_checksum_that_does_not_match_is_400_and_nothing_is_stored() {
+    let h = Harness::start_fixed(|_| {}).await;
+    let (wrong, right) = (crc32_of(b"other"), crc32_of(b"hello"));
+    let bad = [
+        ("if-none-match", "*"),
+        ("x-amz-checksum-crc32", wrong.as_str()),
+    ];
+    let refused = call(&h, "PUT", "k", &[], &bad, b"hello").await;
+    assert_eq!(refused.status(), 400);
+    let body = text(refused).await;
+    assert!(body.contains("<Code>BadDigest</Code>"), "{body}");
+    assert!(h.hot_mem.get("k", None).await.is_err());
+    let good = [
+        ("if-none-match", "*"),
+        ("x-amz-checksum-crc32", right.as_str()),
+    ];
+    let stored = call(&h, "PUT", "k", &[], &good, b"hello").await;
+    assert_eq!(stored.status(), 200);
+    assert_eq!(h.hot_mem.get("k", None).await.unwrap(), "hello");
+    let malformed = [("content-md5", "!!!")];
+    let invalid = call(&h, "PUT", "j", &[], &malformed, b"hello").await;
+    assert_eq!(invalid.status(), 400);
+    assert!(text(invalid).await.contains("<Code>InvalidDigest</Code>"));
+    let crc64 = [("x-amz-checksum-crc64nvme", "AAAAAAAAAAA=")];
+    let unsupported = call(&h, "PUT", "j", &[], &crc64, b"hello").await;
+    assert_eq!(unsupported.status(), 501);
+    assert!(h.hot_mem.get("j", None).await.is_err());
 }
 
 /// Asserts that a body of the limit is taken and a longer one is 413.

@@ -11,10 +11,13 @@
 //!   small objects the crate rewrites), get with an optional byte range, head (size, content
 //!   tag and time of last write), delete, and list by prefix, whole or a page at a time. Its
 //!   methods are async, as the object store clients of the workspace are, and boxed so that a
-//!   backend is used as `dyn Backend`.
+//!   backend is used as `dyn Backend`. It also has the four calls of a multipart upload
+//!   (create, upload a part from a stream of chunks, complete, abort), which a backend need
+//!   not override: the provided ones answer [`Error::Unsupported`].
 //! - [`MemoryBackend`] is an in-memory backend whose times come from a [`TestClock`] that a
 //!   test sets by hand, and [`FaultyBackend`] wraps a backend to fail or delay chosen calls
-//!   and to count them: both are for tests.
+//!   and to count them: both are for tests. [`DirBackend`] keeps a bucket in a directory of the
+//!   local file system, parts of uploads included, which are streamed to files.
 //! - [`Proxy`] is a store over a hot and a cold backend that is itself a [`Backend`]. Any
 //!   number of proxies (one per node, each with its own id) work over the same two backends,
 //!   and none needs state for correctness. A get reads the hot tier, else the cold tier, and
@@ -23,7 +26,11 @@
 //!   acknowledged only after an entry for it is durable in a journal object
 //!   `_journal/<proxy_id>/<seq>` in the hot tier. A delete removes the object from both tiers
 //!   and journals the delete. A listing merges the two tiers. When the hot tier is full the
-//!   proxy writes new objects straight to the cold tier.
+//!   proxy writes new objects straight to the cold tier. A multipart upload goes straight to
+//!   the cold tier, part by part, never staged in the proxy: it creates the object there only
+//!   when the upload is completed (create-only: a key that exists in either tier is refused),
+//!   and journals nothing, as a put to the cold tier of a full hot tier does not; a read copies
+//!   the object into the hot tier.
 //! - [`Reconciler`] is the one runner, guarded by a lease object in the hot tier. It tails
 //!   the journals, copies each put from the hot tier to the cold tier (in parallel, bounded),
 //!   applies the deletes, records how far it got in a checkpoint per proxy, evicts the
@@ -40,7 +47,8 @@
 //! Every proxy, reconciler and cache takes its settings as constructor parameters.
 //!
 //! With the `server` feature the crate also has the `server` module, the S3 API front of a
-//! [`Proxy`] (the calls of S3 clients, signed with SigV4, answered from the two tiers), and the
+//! [`Proxy`] (the calls of S3 clients, signed with SigV4, answered from the two tiers, with
+//! request bodies and answers that must make progress and checksums that are verified), and the
 //! `tierstore` binary, which runs a proxy, that front and a [`Reconciler`] in one process
 //! (`cargo build -p tierstore --features server`).
 
@@ -49,6 +57,7 @@
 mod backend;
 mod cache;
 mod clock;
+mod dir;
 mod error;
 mod faulty;
 mod journal;
@@ -60,9 +69,10 @@ pub mod server;
 mod state;
 mod tiered;
 
-pub use backend::{Backend, ByteRange, Listed, Meta};
+pub use backend::{Backend, ByteRange, Listed, Meta, PartBody};
 pub use cache::CachedStore;
 pub use clock::{Clock, SystemClock};
+pub use dir::DirBackend;
 pub use error::Error;
 pub use faulty::{FaultyBackend, Op};
 pub use journal::{JournalEntry, JournalOp, decode_journal, encode_journal};
