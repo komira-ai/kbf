@@ -125,6 +125,7 @@ impl Rig {
             host,
             config_file: dir.join("frontend.toml"),
             record_file: dir.join(RECORD),
+            bound_name: None,
             pace: world.pace(),
         }
     }
@@ -560,7 +561,8 @@ fn the_real_pace_tells_time_and_sleeps() {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_production_frontend_is_on_the_hosts_paths() {
-    let frontend = super::production();
+    let frontend = super::production(PathBuf::from(super::config::CONFIG), None);
+    assert!(frontend.bound_name.is_none());
     assert_eq!(
         frontend.config_file,
         PathBuf::from("/etc/kbf/host-install-frontend.toml")
@@ -574,6 +576,17 @@ fn the_production_frontend_is_on_the_hosts_paths() {
         PathBuf::from("/run/kbf-host-install.lock")
     );
     assert_eq!(frontend.pace.poll, std::time::Duration::from_secs(2));
+    // With a file of its own, the container's name makes the record and the lock.
+    let own = super::production(PathBuf::from("/etc/kbf/fe-b.toml"), Some("kbf-fe-b".into()));
+    assert_eq!(own.config_file, PathBuf::from("/etc/kbf/fe-b.toml"));
+    assert_eq!(
+        own.record_file,
+        PathBuf::from("/var/lib/kbf-host-install/frontend-kbf-fe-b.json")
+    );
+    assert_eq!(
+        own.lock_file(),
+        PathBuf::from("/run/kbf-host-install-frontend-kbf-fe-b.lock")
+    );
 }
 
 /// When the old container cannot be made again either, the switch fails with the marker kept,

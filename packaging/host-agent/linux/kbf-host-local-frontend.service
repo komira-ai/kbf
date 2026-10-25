@@ -7,6 +7,9 @@
 # (host-install-frontend.toml, here, is an example).
 #
 # Use this unit or kbf-host-local.service on a host, not both: the socket is the same.
+# A host with two frontend containers runs one copy of this unit per container, each with its own
+# --socket, --frontend-config file and (so) its own record: see "Two frontends on one host" in
+# the document above.
 [Unit]
 Description=kbf-host-install, the local socket of this host's update agent (frontend container)
 Documentation=https://github.com/komira-ai/kbf/blob/main/docs/deploy/host-install.md

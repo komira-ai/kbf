@@ -580,6 +580,8 @@ kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N]
   release is the frontend's image and the switch recreates the container
   ([A frontend container](#a-frontend-container)). Not given with `--restart-unit`, nor with
   `--layout deb` or `rpm`.
+- `--frontend-config PATH` (with `--frontend-container`): the absolute path of the container's
+  configuration, default `/etc/kbf/host-install-frontend.toml`. See "Two frontends on one host".
 
 Nothing else is configured by a flag or the environment: the files this program reads as root are
 constants, as above. The units and jobs that start it are in
@@ -704,6 +706,7 @@ container ([the example](../../packaging/host-agent/linux/host-install-frontend.
 |---|---|
 | `name`, `restart` | the container's name and Docker's restart policy (`always`, `unless-stopped`, `on-failure[:N]`). `no` is refused: nothing else starts the container, so it would stay down after a reboot of the host or of Docker |
 | `network`, `user` | optional: `--network` and `--user` |
+| `group_add` | optional: a list of numeric group ids as quoted strings (`["990"]`), each passed as `--group-add <gid>` after `--user`, on the container a switch makes and on the old one put back. Each is decimal digits only, from 1 to 4294967295: no name, sign, space or `0`, and `config_invalid` otherwise. A frontend that reaches `kbf-signer`'s socket through the signer's `--client-group` needs that group's id here, or a recreated container can no longer sign |
 | `ports`, `mounts`, `command` | `--publish` and `--volume` entries, and the flags after the image; each entry is one argument, never a shell word |
 | `api` | where this host reaches the frontend's operator API (a published port, or the host's own listen address under `network = "host"`), for `/readyz` and `/healthz` |
 | `drain_token_file` | the operator token as a path **inside** the container |
@@ -740,7 +743,7 @@ release that fails the check changes nothing: nothing is loaded and nothing is s
    `drain_secs` is out, and then stops it (`docker stop`, 30 s) and removes it;
 6. the new container is made from the new image with **the configuration of step 2, byte for
    byte**: `docker run --detach --name <name> --restart <restart> [--network] [--user]
-   [--publish]... [--volume]... <image id> <command>...`;
+   [--group-add]... [--publish]... [--volume]... <image id> <command>...`;
 7. it waits up to `ready_secs` for `/readyz` to answer 200 and `/healthz` to name the release's
    commit.
 
@@ -782,7 +785,31 @@ while a release is on trial (a plain `docker image prune` is safe: the old image
 
 Before the first switch the release that runs is read from the container's image reference
 (`kbf-frontend:<commit>`, the name `docker image load` gives it); make the first container from the
-image of a release with the same options as the file.
+image of a release with the same options as the file. A container that already exists, made by hand
+from `kbf-frontend:<commit>`, is adopted the same way: write a file that describes it (its name,
+network, user, groups, mounts, ports and command) and the first switch starts from the image it
+runs, with nothing recorded before.
+
+#### Two frontends on one host
+
+A host that runs a frontend container for each of two names (for example `kbf-fe-a` and
+`kbf-fe-b`) runs one helper per container, each its own unit with its own file and socket:
+
+```text
+kbf-host-install --serve --socket /run/kbf-host-install/fe-a.sock --socket-user kbf-updater \
+  --frontend-container --frontend-config /etc/kbf/host-install-frontend-a.toml
+```
+
+A helper started with a `--frontend-config` other than the default keeps its files under the name
+of the container in that file, in `/var/lib/kbf-host-install`: the record is
+`frontend-<name>.json`, the A/B state is `state-frontend-<name>.json`, and its install lock is
+`/run/kbf-host-install-frontend-<name>.lock`. Two helpers for two containers therefore share no
+record, pending marker or lock, and the deadline revert of one cannot touch the other's container.
+The helper for the default file keeps `frontend.json`, `state.json` and the host's lock, as
+before. The name is read when the helper starts; a file that names another container afterwards is
+refused with `config_invalid` until the helper is restarted. Give the helpers different `--socket`
+paths (and different `--socket-user`s, or the same one with a socket each). Each file lists the
+other frontend in `peers`.
 
 ### On a Mac
 
