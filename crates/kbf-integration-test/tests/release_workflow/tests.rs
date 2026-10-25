@@ -1668,3 +1668,20 @@ fn the_proof_reads_the_farm_variables_and_the_nonce_through_env_alone() {
         "the job `bump` reads a `FARM_` variable",
     );
 }
+
+#[test]
+fn the_buck2_fetch_step_takes_its_pins_from_the_job_env_alone() {
+    // Catches: a step-level `env:` on the fetch step that overrides the checksum or the
+    // version, which would fetch a Buck2 the pins lint never compared with beta.yml's.
+    let fetch = "      - name: Fetch buck2 (pinned version, checked by SHA-256)\n";
+    for key in ["BUCK2_SHA256", "BUCK2_VERSION"] {
+        red(
+            &plant(
+                "gamma",
+                fetch,
+                &format!("{fetch}        env:\n          {key}: other\n"),
+            ),
+            "Buck2 fetch step of `gamma` has an `env:`",
+        );
+    }
+}

@@ -43,12 +43,13 @@ stages:
     after: [build]
     result: beta-result.json
     events: [workflow_call]
-  # Gamma has no stage here: gamma.yml is deleted, and gamma moves to kbf-updater (the
-  # package-update design, section 13). The 24 hour bake and its verdict run outside Actions.
   # release.yml plans, verifies, tags with the release bot, publishes, bumps the internal
-  # repository and sets the release as the farm's desired version, in one run. It is started by
-  # the completion of a successful pipeline run (`workflow_run`), the one workflow that is, so
-  # that a newer push cancelling the pipeline never cancels a release that has started.
+  # repository, and then its `gamma` job sets the release as the farm's desired version on the
+  # update coordinator, waits for the farm to converge, and proves the farm with a remote-only
+  # Buck2 build (`cargo xtask prove-farm`). All of it is one run, in the stage below. It is
+  # started by the completion of a successful pipeline run (`workflow_run`), the one workflow
+  # that is, so that a newer push cancelling the pipeline never cancels a release that has
+  # started. gamma.yml is deleted, and the 24 hour bake and its verdict run outside Actions.
   - name: prod
     runs: actions
     after: [beta]

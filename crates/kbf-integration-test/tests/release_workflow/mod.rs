@@ -1111,6 +1111,13 @@ fn prove_farm(steps: &[workflows::Step], farm_at: usize, out: &mut Vec<String>) 
             "`{job}` does not fetch Buck2 with `{BUCK2_FETCH}` before `{verb}`"
         ));
     }
+    if let Some(f) = fetched
+        && !steps[f].env.is_empty()
+    {
+        out.push(format!(
+                "the Buck2 fetch step of `{job}` has an `env:`: its pins are the job's `BUCK2_VERSION` and `BUCK2_SHA256`, which the pins lint ties to beta.yml, and a step's own could fetch other bytes"
+            ));
+    }
     flag_is(&words, verb, "--address", "$FARM_ADDRESS", out);
     flag_is(&words, verb, "--instance", "$FARM_INSTANCE", out);
     flag_is(&words, verb, "--tls", "$FARM_TLS", out);

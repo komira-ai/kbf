@@ -124,6 +124,42 @@ fn gamma_mismatches(release: &str, beta: &str) -> Result<Vec<String>, String> {
     Ok(problems)
 }
 
+/// Every step of `text` that fetches Buck2 (its `run:` names `$BUCK2_VERSION`) and has an
+/// `env:` of its own: the pins come from the job's `env:`, which [`mismatches`] compares, and
+/// a step's own would fetch other bytes. An error when the text does not parse.
+fn fetch_step_overrides(text: &str) -> Result<Vec<String>, String> {
+    let mut found = Vec::new();
+    for job in workflows::job_names(text)? {
+        for step in workflows::job_steps(text, &job)? {
+            let fetches = step
+                .run
+                .as_deref()
+                .is_some_and(|r| r.contains("$BUCK2_VERSION"));
+            if fetches && !step.env.is_empty() {
+                found.push(format!(
+                    "{BETA}: the Buck2 fetch step of job {job} has an `env:`; the pins are the job's"
+                ));
+            }
+        }
+    }
+    Ok(found)
+}
+
+#[test]
+fn no_buck2_fetch_step_overrides_the_pins_with_an_env_of_its_own() {
+    // Catches: a step-level `env:` on a Buck2 fetch step in beta.yml or release.yml that
+    // changes the checksum or the version after the job-level pins were compared.
+    let root = super::repo_root();
+    for path in [BETA, RELEASE] {
+        let text = std::fs::read_to_string(root.join(path)).expect(path);
+        assert_eq!(fetch_step_overrides(&text), Ok(Vec::new()), "{path}");
+    }
+    let planted = "on: push\npermissions: {}\njobs:\n  smoke:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: cargo xtask fetch --url x/$BUCK2_VERSION --sha256 \"$BUCK2_SHA256\"\n        env:\n          BUCK2_SHA256: other\n";
+    let found = fetch_step_overrides(planted).expect("parses");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(fetch_step_overrides("jobs: [").is_err());
+}
+
 #[test]
 fn the_gamma_job_fetches_the_buck2_of_the_beta_smoke() {
     // Catches: a Buck2 bump in beta.yml that leaves the release's proof on the old bytes,
