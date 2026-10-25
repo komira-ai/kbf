@@ -44,7 +44,9 @@
 //! removed in the next release ([`crate::StateStoreUri::open`]).
 //!
 //! **The pack index** is off unless `--pack-index` is given (the flag's help has its rules).
-//! The started frontend carries it ([`FrontendHandle::pack_index`]).
+//! The started frontend carries it ([`FrontendHandle::pack_index`]) and its worker listener
+//! answers daemons' `kbf.worker.v1.PackIndex/Locate` from it ([`crate::pack_locate`]); without
+//! the flag that service is not registered.
 //!
 //! **Packs** are off unless `--pack-store-endpoint` is given (`pack_flags` has the flags and
 //! what they need): client uploads are then kept in packs ([`kbf_front::Packs`]); without it
@@ -493,7 +495,8 @@ pub struct FrontendHandle {
 
 impl FrontendHandle {
     /// The pack index `--pack-index` opened on the Postgres state store, or `None` without the
-    /// flag. With the pack store flags too, the frontend writes and reads it.
+    /// flag. The worker listener's `PackIndex` service answers daemons from it, and with the
+    /// pack store flags too, the frontend writes and reads it.
     #[must_use]
     pub fn pack_index(&self) -> Option<Arc<dyn PackIndex>> {
         self.pack_index.clone()
@@ -889,6 +892,8 @@ impl<'a> Prepared<'a> {
             peers.clone(),
         );
         let cold_store = cold_store(members.clone(), &peers, delivery.as_ref());
+        // Only with `--pack-index`: otherwise a daemon's Locate is UNIMPLEMENTED.
+        let locate = crate::pack_locate::service(pack_index.as_ref(), &peers);
         let sessions = WorkerService::new(
             Arc::clone(&farm),
             peers,
@@ -977,6 +982,7 @@ impl<'a> Prepared<'a> {
                 .add_service(worker_service)
                 .add_optional_service(membership)
                 .add_optional_service(cold_store)
+                .add_optional_service(locate)
                 .serve_with_incoming_shutdown(worker_incoming, worker_stopped);
             // Told when the REAPI listener is done (see `serve::stop_api`).
             let (api_stop_when_done, api_stopped) = tokio::sync::oneshot::channel::<()>();

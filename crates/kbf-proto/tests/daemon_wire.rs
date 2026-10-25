@@ -3,8 +3,10 @@
 //! A daemon-only node holds no cold-store credential and reaches bytes only through
 //! storage (docs/design/architecture-v2.md, section 9). The flags keep the credential
 //! off its command line and out of its environment (kbf-cli's tests), its unit loads
-//! none (kbf-deploy's `linux/modes_tests.rs`), and the layering keeps the object-store
-//! client out of the daemon crates (kbf-integration-test's tests/layering.rs); this file keeps it off
+//! none (kbf-deploy's `linux/modes_tests.rs`), and the layering keeps `kbf-front`,
+//! `kbf-server` and `ureq` out of the daemon crates (kbf-integration-test's
+//! tests/layering.rs), so that apart from the read-only key of `--pack-read` the daemon
+//! builds no cold store; this file keeps it off
 //! the wire's schema: no message of any service in a package the daemon has clients for
 //! (`DAEMON_PACKAGES`: the work stream and segments, storage's action store, ByteStream,
 //! the REAPI services and the release fetch of self-update), and no message of the storage map (which `Welcome` and
@@ -55,6 +57,7 @@ const DAEMON_PACKAGES: &[&str] = &[
 const DAEMON_SERVICES: &[&str] = &[
     ".kbf.worker.v1.Worker",
     ".kbf.worker.v1.Segments",
+    ".kbf.worker.v1.PackIndex",
     ".kbf.storage.v1.ActionStore",
     ".kbf.update.v1.ReleaseService",
     ".google.bytestream.ByteStream",
@@ -123,6 +126,7 @@ fn descriptors() -> FileDescriptorSet {
         [
             "kbf/worker/v1/worker.proto",
             "kbf/worker/v1/segments.proto",
+            "kbf/worker/v1/pack_index.proto",
             "kbf/storage/v1/storage.proto",
             "kbf/map/v1/map.proto",
             "kbf/update/v1/update.proto",

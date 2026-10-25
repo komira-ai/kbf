@@ -115,6 +115,7 @@ pub mod node_map;
 pub mod node_self;
 mod notify;
 pub mod object_store;
+pub mod pack_locate;
 pub mod proxy_auth;
 pub mod raft_log;
 mod ram_drain;

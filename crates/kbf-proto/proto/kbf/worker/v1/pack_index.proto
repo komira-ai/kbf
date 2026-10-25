@@ -1,0 +1,45 @@
+// kbf.worker.v1.PackIndex: where blobs lie inside packs (many blobs in one stored object).
+//
+// The frontend keeps the pack index (--pack-index). A daemon that reads blobs from the packs
+// itself (--pack-read) asks the frontend where a blob is, then reads that range of that pack
+// from the object store and hashes it. The daemon opens no connection to the index's database.
+//
+// Served on the worker listener only, to the daemon role, each call admitted as the listener's
+// blob calls are (docs/design/worker-protocol.md, "Blobs on the worker listener"). A frontend
+// started without --pack-index does not register the service: the call is UNIMPLEMENTED, and
+// the daemon reads the blob where it did before.
+syntax = "proto3";
+
+package kbf.worker.v1;
+
+import "build/bazel/remote/execution/v2/remote_execution.proto";
+
+service PackIndex {
+  // Where each blob is, in request order. At most 1000 digests a call (more is
+  // INVALID_ARGUMENT), each a SHA-256 digest (a hash that is not 64 hex digits, or a negative
+  // size, is INVALID_ARGUMENT). A blob the index has no row for is answered as not located:
+  // that is not an error, and the daemon reads it where it did before. UNAVAILABLE when the
+  // index cannot be read.
+  rpc Locate(PackLocateRequest) returns (PackLocateResponse);
+}
+
+message PackLocateRequest {
+  repeated build.bazel.remote.execution.v2.Digest digests = 1;
+}
+
+// Where a blob lies: the bytes `offset` to `offset + length` of the pack named `pack`.
+message PackLocation {
+  // False when the index has no row for the digest; the other fields are then empty.
+  bool located = 1;
+  // The name of the pack in the object store the farm's packs are kept in.
+  string pack = 2;
+  // Where the blob starts in the pack.
+  uint64 offset = 3;
+  // The blob's length in bytes.
+  uint64 length = 4;
+}
+
+message PackLocateResponse {
+  // One per requested digest, in request order.
+  repeated PackLocation locations = 1;
+}

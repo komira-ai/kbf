@@ -7,7 +7,8 @@
 //!
 //! - The daemon role opens a worker session (`kbf.worker.v1.Worker/Session`, which also
 //!   carries the storage map to the daemon) and makes the blob calls: `ByteStream`,
-//!   `ContentAddressableStorage` (the chunking calls too) and `kbf.worker.v1.Segments`.
+//!   `ContentAddressableStorage` (the chunking calls too) and `kbf.worker.v1.Segments`, and,
+//!   from a frontend started with `--pack-index`, `kbf.worker.v1.PackIndex/Locate`.
 //! - The storage role registers and heartbeats (`kbf.map.v1.Membership`); a storage
 //!   node gets the map in those answers. It also fetches the farm's registered cold store
 //!   and its keys (`kbf.enroll.v1.ColdStore/GetStoreConfig`): the only method that
@@ -99,6 +100,9 @@ pub const WORKER_LISTENER_ROLES: &[(&str, &[PeerRole])] = &[
     ("/kbf.worker.v1.Segments/Commit", DAEMON),
     ("/kbf.worker.v1.Segments/Locate", DAEMON),
     ("/kbf.worker.v1.Segments/ReadRange", DAEMON),
+    // Where a blob lies in a pack (`crate::pack_locate`): served only by a frontend started
+    // with `--pack-index`, which answers UNIMPLEMENTED to the daemon role otherwise.
+    ("/kbf.worker.v1.PackIndex/Locate", DAEMON),
     ("/kbf.map.v1.Membership/Register", STORAGE),
     ("/kbf.map.v1.Membership/Heartbeat", STORAGE),
     // The registered cold store and its keys (`crate::store_config`): storage nodes only.

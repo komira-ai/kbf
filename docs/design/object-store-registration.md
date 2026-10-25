@@ -308,7 +308,7 @@ and applies the keys. When the open is deferred, `cold_store` and the node's ref
 | the node | keys never on disk, in argv or in the environment; a scan of the temp dir and the arguments |
 | the state database, the audit rows, `Debug` output | never hold the secret |
 | a sentinel scan that passes vacuously | each scan first asserts the sentinel **is** in the secret file, then that it is nowhere else |
-| the daemon wire | `Welcome`, `MapUpdate`, `Session` and the daemon heartbeat carry no store field; the daemon crates link no object-store client **[F: `crates/kbf-integration-test/tests/layering.rs`, `crates/kbf-proto/tests/daemon_wire.rs`]** |
+| the daemon wire | `Welcome`, `MapUpdate`, `Session` and the daemon heartbeat carry no store field; apart from the read-only key of `--pack-read`, the daemon builds no cold store: its crates cannot reach `kbf-front`, `kbf-server` or `ureq` **[F: `crates/kbf-integration-test/tests/layering.rs`, `crates/kbf-proto/tests/daemon_wire.rs`]** |
 
 ## 10. The probe is a request from the frontend to an operator's endpoint
 

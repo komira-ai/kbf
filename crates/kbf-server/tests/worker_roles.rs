@@ -57,7 +57,7 @@ const GET_STORE_CONFIG: &str = "/kbf.enroll.v1.ColdStore/GetStoreConfig";
 
 /// Every method the worker listener serves and the one role that may call it, spelled
 /// out here and not read from the table.
-const EXPECTED: [(&str, PeerRole); 20] = {
+const EXPECTED: [(&str, PeerRole); 21] = {
     use PeerRole::{Daemon, Storage};
     [
         (SESSION, Daemon),
@@ -101,6 +101,7 @@ const EXPECTED: [(&str, PeerRole); 20] = {
         ("/kbf.worker.v1.Segments/Commit", Daemon),
         ("/kbf.worker.v1.Segments/Locate", Daemon),
         ("/kbf.worker.v1.Segments/ReadRange", Daemon),
+        ("/kbf.worker.v1.PackIndex/Locate", Daemon),
         (REGISTER, Storage),
         (HEARTBEAT, Storage),
         (GET_STORE_CONFIG, Storage),

@@ -15,6 +15,8 @@ path = "tests/bin/keeper_swap.rs"
 test = false
 
 [dependencies]
+# The bytes of a blob read from a pack (`packed`).
+bytes.workspace = true
 clap.workspace = true
 # The input cache's index snapshot (`cache::index`).
 crc32fast.workspace = true
@@ -23,8 +25,14 @@ hex.workspace = true
 kbf-caps.workspace = true
 kbf-map.workspace = true
 kbf-mapsync.workspace = true
+# `ObjectStore`, which the pack reader is generic over (`packed`).
+kbf-objstore.workspace = true
+# The packing client's reader: blobs by digest from the packs of an object store (`packed`).
+kbf-pack.workspace = true
 kbf-proto.workspace = true
 kbf-route.workspace = true
+# `PackIndex`, which `RemoteIndex` is for the pack reader, and `BlobDigest` (`packed`).
+kbf-state.workspace = true
 # The node's one cache (`kbf_storage::local_cache`), which the input cache shares with
 # local storage on a node that runs both.
 kbf-storage.workspace = true
@@ -44,13 +52,15 @@ tonic = { workspace = true, features = ["tls-ring"] }
 tracing.workspace = true
 
 [dev-dependencies]
-bytes.workspace = true
 kbf-auth.workspace = true
+# The checks every data plane passes, run against the packed plane (tests/packed_conformance.rs).
+kbf-cas-conformance.workspace = true
 kbf-front.workspace = true
 kbf-meta.workspace = true
 kbf-segments.workspace = true
-kbf-objstore.workspace = true
 kbf-server.workspace = true
+# The in-memory pack index the pack-read tests record packs in.
+kbf-state = { workspace = true, features = ["test-support"] }
 kbf-store.workspace = true
 # The program the tests' actions run, kbf-testkit's act verbs, through the test binary.
 kbf-testkit.workspace = true

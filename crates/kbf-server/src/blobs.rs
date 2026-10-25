@@ -45,7 +45,11 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::identity::{Peers, presented};
 
 /// Admits the call `request` is, as the module docs say, or says why not (and logs it).
-async fn admit<T>(peers: &Peers, request: &Request<T>, call: &'static str) -> Result<(), Status> {
+pub(crate) async fn admit<T>(
+    peers: &Peers,
+    request: &Request<T>,
+    call: &'static str,
+) -> Result<(), Status> {
     let admitted = peers.admit_call(&presented(request.extensions())).await;
     admitted.map(drop).inspect_err(|refused| {
         let (code, reason) = (refused.code(), refused.message());

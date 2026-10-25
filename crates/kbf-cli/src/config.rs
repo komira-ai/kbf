@@ -198,14 +198,18 @@ const GROUPS: &[(&str, &[&str])] = &[
     ),
     ("log", &["log-dir", "log-files", "log-max-bytes"]),
     (
-        // The frontend's blobs in packs (`kbf_server::frontend`'s `pack_flags`); `pack-index`,
-        // which they need, stays with the scheduler's state store.
+        // Blobs in packs: the frontend's (`kbf_server::frontend`'s `pack_flags`; `pack-index`,
+        // which they need, stays with the scheduler's state store) and the daemon's reads of
+        // them (`kbf_node`'s `pack_read`). The `pack-store-*` keys name the object store in both.
         "packs",
         &[
             "pack-bytes",
             "pack-cache-bytes",
             "pack-cache-dir",
             "pack-inflight-bytes",
+            "pack-read",
+            "pack-read-cache-bytes",
+            "pack-read-cache-dir",
             "pack-store-bucket",
             "pack-store-credentials-file",
             "pack-store-endpoint",

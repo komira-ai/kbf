@@ -197,6 +197,22 @@ segment-upload-streams = 16
 # How many segment uploads of one action's outputs are in flight at once: the server checks and stages one upload while the next are sending (`docs/design/write-path.md`, section 4.1). Their `PutRange` calls still take permits of `--transfer-in-flight`'s uploads' share
 segment-uploads-in-flight = 4
 
+[packs]
+# Reads the blobs of a lease from the packs of the farm's object store before the storage nodes: the daemon asks the frontend where a blob lies (over the connection to `--cas`), reads that range of that pack and checks it against the digest. A blob the frontend does not locate, and a frontend that serves no locations (it was started without `--pack-index`), leave the read where it was, and outputs are stored where they were. A pack that is gone, or whose bytes are not the digest, fails the read. Needs `--pack-store-endpoint`, `--pack-store-bucket` and `--pack-store-credentials-file`. Refused by `kbf storage-and-daemon` and `kbf all-in-one`, whose daemon half reads blobs in-process. Left out, no object store is built or contacted and every blob is read as it always was
+pack-read = false
+# The most bytes of blobs `--pack-read-cache-dir` holds
+# pack-read-cache-bytes = "BYTES"
+# A directory this process owns where the blobs read from packs are kept, one file each, checked by digest on every read; the least recently used are removed to stay within `--pack-read-cache-bytes`. The daemon's input cache already keeps blobs by digest, so left out nothing more is kept. Needs `--pack-read-cache-bytes`
+# pack-read-cache-dir = "DIR"
+# The bucket of `--pack-store-endpoint` that holds the packs, under the keys `cas/`. Needs `--pack-read`
+# pack-store-bucket = "BUCKET"
+# A file with the key pair for `--pack-store-endpoint`, as JSON `{"access_key_id": "...", "secret_access_key": "..."}`, readable by its owner alone (mode 0600 or 0400): a key that may read the objects under `cas/` and write none. The secret is never a flag: a command line is world-readable. Needs `--pack-read`
+# pack-store-credentials-file = "PATH"
+# The S3-compatible object store the packs are kept in, as `http://host:port`. The daemon only reads from it. Needs `--pack-read`
+# pack-store-endpoint = "URL"
+# The region the requests to `--pack-store-endpoint` are signed for; `us-east-1` if left out
+pack-store-region = "us-east-1"
+
 [scheduler]
 # The OS and architecture, as `<os>/<arch>` (`linux` or `macos`; `x86_64` or `arm64`), of an action whose platform names no OS, no architecture and no ISA level, so that it is not given to whichever node sorts first, a Mac among them. Not applied to an action that asks for `xcode` or an iOS device, which only a Mac reports. `none` applies no default: such an action runs on any node that fits. Placement only: the action's digest and cache key do not change
 default-platform = "linux/x86_64"
