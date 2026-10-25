@@ -178,11 +178,13 @@ fn over(
     plane: Arc<FarmCas>,
 ) -> Result<Arc<PackedCas<FarmCas>>, Error> {
     let reader = reader(cli, settings)?;
-    tracing::info!(
-        endpoint = %settings.endpoint,
-        bucket = %settings.bucket,
-        "data plane: blobs are read from packs first; outputs go to the storage nodes"
+    // Built before the macro, which evaluates its fields only when a subscriber takes the line.
+    let line = format!(
+        "data plane: blobs are read from packs first (endpoint {}, bucket {}); outputs go to \
+         the storage nodes",
+        settings.endpoint, settings.bucket
     );
+    tracing::info!("{line}");
     Ok(Arc::new(PackedCas::new(plane, Arc::new(reader))))
 }
 
