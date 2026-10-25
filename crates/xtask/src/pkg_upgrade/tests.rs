@@ -22,6 +22,12 @@ enum Defect {
     /// The new deb `Depends` on `crun`: a plain `dpkg --install` leaves it unpacked and
     /// unconfigured on a host without it (apt installs it).
     DependsOnCrun,
+    /// Installing the new deb removes the old installer, which nothing asked.
+    InstallerGoneEarly,
+    /// Purging the old installer leaves its binary.
+    PurgeLeavesBinary,
+    /// The users are not made after the upgrade.
+    UsersNotMade,
     /// The image already has `crun`, so the host without the installer does not lack it.
     CrunPreinstalled,
     VersionStale,
@@ -156,6 +162,12 @@ impl World {
                     self.unconfigured = true;
                 }
             }
+            if self.is(Defect::InstallerGoneEarly) {
+                self.installed.remove("kbf-installer");
+                for path in OLD_INSTALLER_ONLY {
+                    self.present.remove(path);
+                }
+            }
             self.installed.insert("kbf");
             if !self.is(Defect::VersionStale) {
                 self.kbf_version = "0.1.0+new";
@@ -218,6 +230,9 @@ impl World {
                     .map(|(p, _)| p.clone())
                     .collect();
                 for path in held {
+                    if self.is(Defect::PurgeLeavesBinary) && path == OLD_INSTALLER_ONLY[0] {
+                        continue;
+                    }
                     self.present.remove(&path);
                 }
                 self.installed.remove("kbf-installer");
@@ -239,6 +254,7 @@ impl World {
                 let base = self.uid_base + if renumbered { 100 } else { 0 };
                 ok(&format!("{}\n", base + at as u32))
             }
+            ["getent", "passwd", _] if self.is(Defect::UsersNotMade) => fail(""),
             ["getent", "group", "kbf-signer-clients"] => {
                 ok("kbf-signer-clients:x:991:kbf-signer,kbf-server\n")
             }
@@ -604,4 +620,37 @@ fn a_listing_that_cannot_be_read_is_an_error() {
     .expect_err("no listing");
     assert!(!matches!(err, Error::Refused(_)), "{err:?}");
     assert!(world.borrow().log.is_empty());
+}
+
+/// Asserts that an installer that is gone after the upgrade, though nothing removed it, a binary
+/// the purge leaves, and users that are not there on the host without the installer are each
+/// refused: the installer stays until purged, and the purge takes its own files.
+#[test]
+fn an_installer_that_goes_by_itself_a_purge_that_leaves_a_file_and_missing_users_are_refused() {
+    let (result, _) = upgrade("gone", Defect::InstallerGoneEarly);
+    let problems = refused(result);
+    for want in [
+        "apt: kbf-installer is gone after the upgrade, though nothing removed it",
+        "apt: /usr/bin/kbf-installer is gone after the upgrade",
+        "dpkg: kbf-installer is gone after the upgrade, though nothing removed it",
+    ] {
+        assert!(problems.iter().any(|p| p == want), "{want}: {problems:?}");
+    }
+    let (result, _) = upgrade("left", Defect::PurgeLeavesBinary);
+    let problems = refused(result);
+    assert!(
+        problems
+            .iter()
+            .any(|p| p
+                == "dpkg: /usr/bin/kbf-installer is still there after kbf-installer is purged"),
+        "{problems:?}"
+    );
+    let (result, _) = upgrade("users", Defect::UsersNotMade);
+    let problems = refused(result);
+    assert!(
+        problems
+            .iter()
+            .any(|p| p == "dpkg-without-installer: the user kbf does not exist after the upgrade"),
+        "{problems:?}"
+    );
 }
