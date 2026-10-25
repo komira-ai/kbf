@@ -2216,6 +2216,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-pack"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "hex",
+ "kbf-objstore",
+ "kbf-segments",
+ "kbf-state",
+ "kbf-testkit",
+ "kbf-types",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kbf-peer"
 version = "0.1.0"
 dependencies = [
