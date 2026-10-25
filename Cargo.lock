@@ -2163,6 +2163,8 @@ dependencies = [
  "futures",
  "hex",
  "hmac 0.13.0",
+ "http",
+ "http-body",
  "kbf-objstore",
  "kbf-segments",
  "kbf-testkit",

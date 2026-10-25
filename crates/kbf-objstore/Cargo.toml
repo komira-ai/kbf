@@ -37,6 +37,8 @@ tracing.workspace = true
 # Loopback ports nothing can take (kbf_testkit::port).
 kbf-testkit.workspace = true
 clap.workspace = true
+http.workspace = true
+http-body.workspace = true
 kbf-objstore = { workspace = true, features = ["testkit"] }
 tokio = { workspace = true, features = ["macros", "net", "io-util", "rt-multi-thread", "test-util"] }
 
