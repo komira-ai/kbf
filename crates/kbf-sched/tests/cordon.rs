@@ -520,3 +520,49 @@ fn a_drain_pauses_at_its_deadline_and_stays_paused() {
     h.drain("a", 30);
     assert_eq!(h.s.cordon(&w("a")), Some(&Cordon::Drained));
 }
+
+/// Catches `Scheduler::cordoned_could` naming a worker that could not run the operation, or
+/// missing one that could: with `a` and `b` cordoned it names both for a plain request;
+/// none for a request larger than any worker, for a platform no worker satisfies and for a
+/// lease kind no worker's driver serves; and none for an operation it does not hold. A
+/// worker that is not cordoned is never named.
+#[test]
+fn the_cordoned_workers_that_could_run_an_operation_are_named() {
+    let mut h = Harness::new();
+    h.worker("a");
+    h.worker("b");
+    h.worker("c");
+    h.cordon("a");
+    h.cordon("b");
+    let mut waiter = 100;
+    let mut submit = |h: &mut Harness, request: Request| {
+        waiter += 1;
+        h.feed(Event::Submit {
+            waiter: WaiterId(waiter),
+            request,
+        });
+        h.s.waiters(OperationId(u64::from(waiter) - 101))
+            .map(|_| ());
+    };
+    let plain = request(1);
+    let big = Request {
+        resources: Resources::new(64_000, GIB),
+        ..request(2)
+    };
+    let mac = Request {
+        needs: kbf_caps::Request::from_platform([("OSFamily", "macos")]).unwrap(),
+        ..request(3)
+    };
+    let vm = Request {
+        kind: kbf_types::LeaseKind::Vm,
+        ..request(4)
+    };
+    for request in [plain, big, mac, vm] {
+        submit(&mut h, request);
+    }
+    assert_eq!(h.s.cordoned_could(OperationId(0)), [w("a"), w("b")]);
+    for n in 1..=3 {
+        assert_eq!(h.s.cordoned_could(OperationId(n)), [], "operation {n}");
+    }
+    assert_eq!(h.s.cordoned_could(OperationId(99)), []);
+}
