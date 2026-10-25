@@ -1026,6 +1026,8 @@ mod tests {
     /// Catches: the client's own connect limit, which ends as an `io::Error` of kind
     /// `TimedOut` in the chain, taken for a dead connection and sent again; and a
     /// refused connection taken for a timeout.
+    // Linux drops a SYN when the accept queue is full; BSD and macOS may reset instead.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_connect_that_times_out_is_not_resent_but_a_refused_one_is() {
         // A listener whose accept queue is full drops the next SYN: the connect hangs.
@@ -1065,6 +1067,29 @@ mod tests {
         assert!(e.is_connect(), "{e:?}");
         assert!(!e.is_timeout(), "{e:?}");
         assert!(is_retryable(&transport(e)));
+    }
+
+    /// Catches: every non-connect reqwest error sent again, including the client's own
+    /// per-request limit, which ends a read against a store that accepts and never
+    /// answers and would multiply the wait of a read that cannot succeed.
+    #[tokio::test]
+    async fn a_request_that_exceeds_its_client_timeout_is_not_resent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _silent = tokio::spawn(async move {
+            let held = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(held);
+        });
+        let e = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .timeout(Duration::from_millis(100))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(e.is_timeout(), "{e:?}");
+        assert!(!e.is_connect(), "{e:?}");
+        assert!(!is_retryable(&transport(e)));
     }
 
     /// Catches: this module's own stall treated as worth a resend.
