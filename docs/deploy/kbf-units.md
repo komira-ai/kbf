@@ -303,7 +303,8 @@ to hand its work to: its queued operations that have not started wait with the r
 
 On SIGTERM kbf's frontend drains (the sequence above; `all-in-one`'s drains at once: it
 refuses new Execute calls, which Buck2 retries elsewhere, and keeps every open Execute and
-WaitExecution stream until its action is done); `--shutdown-timeout-secs` is 0, no
+WaitExecution stream whose operation has a running lease until its action is done, and
+ends the streams of operations still queued UNAVAILABLE at once); `--shutdown-timeout-secs` is 0, no
 deadline, by default, and a frontend over a state store is bounded by `--drain-deadline`. A
 `--shutdown-timeout-secs` above 0 ends a drain that a signal began when it runs out, as a
 second signal does, even if that is before the wait or the deadline: leave it at 0.

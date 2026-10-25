@@ -347,3 +347,257 @@ fn the_defaults_are_ten_seconds_and_fifteen_minutes() {
     assert_eq!(timing.lb_wait, Duration::from_secs(10));
     assert_eq!(timing.deadline, Duration::from_secs(900));
 }
+
+/// What begins the drain in the tests below: a stop signal, or `POST /v1/frontend/drain`.
+/// Both end in the same sequence ([`Retire::drain`]), and these tests run each.
+#[derive(Clone, Copy, Debug)]
+enum Begin {
+    Signal,
+    Endpoint,
+}
+
+/// The `Execution` service over the rig's farm, as the REAPI listener serves it.
+fn execution(rig: &Rig) -> kbf_front::ExecutionService<Farm> {
+    kbf_front::ExecutionService::with_authorizers(
+        rig.backend.clone(),
+        Arc::clone(&rig.farm),
+        rig.closing.clone(),
+        Arc::new(kbf_auth::Authorizers::allow_all()),
+    )
+}
+
+/// Opens a WaitExecution stream on `ticket`'s operation and follows it in a task, which
+/// ends with the stream: `Ok` when the stream ended cleanly (the operation is done) and
+/// the status when it ended with an error.
+async fn follow(
+    rig: &Rig,
+    ticket: &kbf_front::Ticket,
+) -> tokio::task::JoinHandle<Result<(), Status>> {
+    use futures::StreamExt as _;
+    use kbf_proto::reapi::execution_server::Execution as _;
+    let request = kbf_proto::reapi::WaitExecutionRequest {
+        name: ticket.name.clone(),
+    };
+    let mut stream = execution(rig)
+        .wait_execution(tonic::Request::new(request))
+        .await
+        .expect("WaitExecution")
+        .into_inner();
+    tokio::spawn(async move {
+        while let Some(operation) = stream.next().await {
+            operation?;
+        }
+        Ok(())
+    })
+}
+
+/// Runs the stop (or the endpoint's drain) in a task of its own, which ends with it.
+fn begin(rig: &Rig, how: Begin, timeout: Duration) -> tokio::task::JoinHandle<()> {
+    let retire = Arc::new(rig.retire());
+    let drain = Arc::clone(&rig.drain);
+    tokio::spawn(async move {
+        match how {
+            Begin::Signal => stopped(&drain, &retire, timeout).await,
+            Begin::Endpoint => {
+                retire.get().expect("set").drain();
+                drain.sequence_finished().await;
+            }
+        }
+    })
+}
+
+/// Lets the tasks that are ready run, and `by` of paused time pass.
+async fn pass(by: Duration) {
+    tokio::time::sleep(by).await;
+}
+
+/// A result for `lease`, which the farm accepts without a cache write: the operation
+/// is done.
+fn finished(lease: kbf_types::LeaseId) -> kbf_proto::worker::Result {
+    kbf_proto::worker::Result {
+        lease_id: Some(kbf_proto::worker::LeaseId {
+            term: lease.term,
+            seq: lease.seq,
+        }),
+        status: Some(kbf_proto::google::rpc::Status {
+            code: Code::InvalidArgument as i32,
+            message: "test".to_owned(),
+            details: Vec::new(),
+        }),
+        action_result: None,
+        action_digest: None,
+        memory_kill: 0,
+        lost: 0,
+    }
+}
+
+/// Puts one operation under a running lease and one in the queue with every worker
+/// cordoned, and opens a stream on each. Returns the running one's lease and both
+/// streams, queued first.
+async fn one_running_one_queued(
+    rig: &Rig,
+) -> (
+    kbf_types::LeaseId,
+    tokio::task::JoinHandle<Result<(), Status>>,
+    tokio::task::JoinHandle<Result<(), Status>>,
+) {
+    let mut inbox = register(rig);
+    let running = submit(&rig.farm, request(1)).expect("queued");
+    rig.farm.tick().await;
+    assert_eq!(starts(&mut inbox), 1, "the first operation did not start");
+    rig.farm
+        .place(&WorkerId::new("node-a"), crate::farm::NodeAction::Cordon)
+        .expect("cordoned");
+    let queued = submit(&rig.farm, request(2)).expect("queued");
+    rig.farm.tick().await;
+    assert_eq!(starts(&mut inbox), 0, "a cordoned node was given work");
+    let views = rig.farm.lease_views(None);
+    let [view] = &views.leases[..] else {
+        panic!("one lease expected");
+    };
+    let lease = view.lease;
+    let queued = follow(rig, &queued).await;
+    let running = follow(rig, &running).await;
+    (lease, queued, running)
+}
+
+/// Asserts that a stop, or the endpoint's drain, with one operation running and one queued
+/// behind a cordoned worker: leaves both streams alone while the load balancer wait runs;
+/// when it is over ends the queued stream UNAVAILABLE at once, naming the operation, while
+/// the running one stays open; keeps the drain going while the lease runs, far past the
+/// load balancer wait; and, once the lease is done, answers the running stream with its
+/// done operation and ends the drain.
+async fn a_queued_stream_ends_at_once_and_a_running_one_is_kept(how: Begin) {
+    let rig = Rig::new(timing(10, 900));
+    let (lease, queued, running) = one_running_one_queued(&rig).await;
+    let began = Instant::now();
+    let stop = begin(&rig, how, Duration::MAX);
+
+    pass(Duration::from_secs(9)).await;
+    assert!(!queued.is_finished(), "{how:?}: ended in the wait");
+    assert!(!running.is_finished());
+
+    pass(Duration::from_secs(2)).await;
+    assert!(queued.is_finished(), "{how:?}: the queued stream is open");
+    let ended = queued.await.expect("task").expect_err("ended");
+    assert_eq!(ended.code(), Code::Unavailable, "{how:?}: {ended:?}");
+    assert!(ended.message().contains("operations/"), "{ended:?}");
+    assert!(
+        began.elapsed() < Duration::from_secs(12),
+        "{how:?}: {:?}",
+        began.elapsed()
+    );
+
+    pass(Duration::from_secs(120)).await;
+    assert!(!running.is_finished(), "{how:?}: the running stream ended");
+    assert!(!stop.is_finished(), "{how:?}: exited with a lease running");
+    assert_eq!(rig.drain.phase(), Phase::Draining);
+
+    rig.farm
+        .report(&WorkerId::new("node-a"), finished(lease))
+        .await;
+    let ended = tokio::time::timeout(Duration::from_secs(10), stop);
+    ended
+        .await
+        .expect("the stop ends once the lease is done")
+        .expect("task");
+    running
+        .await
+        .expect("task")
+        .expect("the done operation, then the end");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_ends_the_queued_stream_at_once_and_keeps_the_running_one() {
+    a_queued_stream_ends_at_once_and_a_running_one_is_kept(Begin::Signal).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_endpoints_drain_ends_the_queued_stream_at_once_and_keeps_the_running_one() {
+    a_queued_stream_ends_at_once_and_a_running_one_is_kept(Begin::Endpoint).await;
+}
+
+/// Asserts that with only a queued operation, behind a cordoned worker, the stop (or the
+/// endpoint's drain) is over by the load balancer wait and a small margin, with no second
+/// signal and no stop timeout, and not at the drain deadline.
+async fn only_a_queued_operation_does_not_hold_the_stop(how: Begin) {
+    let rig = Rig::new(timing(10, 900));
+    let _inbox = register(&rig);
+    rig.farm
+        .place(&WorkerId::new("node-a"), crate::farm::NodeAction::Cordon)
+        .expect("cordoned");
+    let queued = submit(&rig.farm, request(1)).expect("queued");
+    rig.farm.tick().await;
+    let stream = follow(&rig, &queued).await;
+    let began = Instant::now();
+    let stop = begin(&rig, how, Duration::MAX);
+
+    let waited = tokio::time::timeout(Duration::from_secs(60), stop).await;
+    waited
+        .expect("the stop ends long before the deadline")
+        .expect("task");
+    let took = began.elapsed();
+    assert!(
+        took >= Duration::from_secs(10),
+        "{how:?}: before the wait: {took:?}"
+    );
+    assert!(
+        took < Duration::from_secs(10) + Duration::from_secs(5),
+        "{how:?}: {took:?}"
+    );
+    let ended = stream.await.expect("task").expect_err("ended");
+    assert_eq!(ended.code(), Code::Unavailable, "{how:?}: {ended:?}");
+    assert_eq!(rig.drain.phase(), Phase::Closing);
+    // Ending the stream did not cancel the operation: it is queued still, for the
+    // frontends that take over its work.
+    assert_eq!(rig.farm.queued_operations(), 1, "{how:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_with_only_a_queued_operation_ends_within_the_lb_wait() {
+    only_a_queued_operation_does_not_hold_the_stop(Begin::Signal).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_endpoints_drain_with_only_a_queued_operation_ends_within_the_lb_wait() {
+    only_a_queued_operation_does_not_hold_the_stop(Begin::Endpoint).await;
+}
+
+/// Asserts that a stop whose running action outlasts `--drain-deadline`, with no stop
+/// timeout, ends at the deadline (and the clients' grace) and no earlier: the running
+/// stream is then ended UNAVAILABLE.
+async fn a_running_action_is_cut_at_the_drain_deadline(how: Begin) {
+    let rig = Rig::new(timing(0, 30));
+    let mut inbox = register(&rig);
+    let running = submit(&rig.farm, request(1)).expect("queued");
+    rig.farm.tick().await;
+    assert_eq!(starts(&mut inbox), 1, "the operation did not start");
+    let running = follow(&rig, &running).await;
+    let began = Instant::now();
+    let stop = begin(&rig, how, Duration::MAX);
+
+    pass(Duration::from_secs(29)).await;
+    assert!(!running.is_finished());
+    assert!(!stop.is_finished(), "{how:?}: ended before the deadline");
+
+    let waited = tokio::time::timeout(Duration::from_secs(60), stop).await;
+    waited
+        .expect("the stop ends at the deadline")
+        .expect("task");
+    let took = began.elapsed();
+    assert!(took >= Duration::from_secs(30), "{how:?}: {took:?}");
+    let latest = Duration::from_secs(30) + CLOSE_GRACE + Duration::from_secs(2);
+    assert!(took < latest, "{how:?}: {took:?}");
+    let ended = running.await.expect("task").expect_err("ended");
+    assert_eq!(ended.code(), Code::Unavailable, "{how:?}: {ended:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_ends_at_the_drain_deadline_when_a_running_action_outlasts_it() {
+    a_running_action_is_cut_at_the_drain_deadline(Begin::Signal).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_endpoints_drain_ends_at_the_deadline_when_a_running_action_outlasts_it() {
+    a_running_action_is_cut_at_the_drain_deadline(Begin::Endpoint).await;
+}

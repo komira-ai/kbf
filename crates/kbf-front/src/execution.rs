@@ -32,11 +32,22 @@
 //!
 //! **Draining** ([`Closer::drain`], on SIGTERM): a new Execute is refused UNAVAILABLE,
 //! which Buck2 retries when it opens the call (up to 5 attempts, so the next try can
-//! land on another frontend), and every open Execute and WaitExecution stream stays
-//! open until its action is done. Buck2 does not recover a stream that breaks after
-//! it started: it never calls WaitExecution and never sends the Execute again, so an
-//! action whose stream is cut fails as `remote_call_error`. Ending a stream UNAVAILABLE
-//! is therefore a last resort, not a retry (kbf#791).
+//! land on another frontend), and every open Execute and WaitExecution stream whose
+//! operation has a running lease (stage `Executing`) stays open until its action is
+//! done. Buck2 does not recover a stream that breaks after the action started: it never
+//! calls WaitExecution and never sends the Execute again, so an action whose stream is
+//! cut fails as `remote_call_error`. Ending such a stream UNAVAILABLE is therefore a
+//! last resort, not a retry (kbf#791).
+//!
+//! A stream whose operation is still queued (stage `Queued` or `Waiting`: no lease has
+//! started, maybe because every worker that could run it is cordoned) has no running
+//! action to protect, so the drain ends it UNAVAILABLE at once, and so it does a
+//! WaitExecution opened later on such an operation, after its first operation. The
+//! client reopens the call, which Buck2 does. The operation itself is not cancelled:
+//! ending a stream drops only the stream's view of it, and the scheduler keeps it queued
+//! (a frontend over a state store has closed its intake, and the other frontends take
+//! it; Execute of the same action joins it there). A frontend without a state store
+//! loses it with its process.
 //!
 //! **Progress** ([`progress`]): every open stream is sent its operation again, same
 //! name, `done` false, its current stage, once per progress interval, so a load
@@ -300,6 +311,19 @@ impl Closing {
         let dropped = self
             .0
             .wait_for(|phase| *phase == Phase::Closed)
+            .await
+            .is_err();
+        if dropped {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// Completes once the closer has begun to drain or has closed; never, if it is
+    /// dropped first.
+    pub(crate) async fn drained(&mut self) {
+        let dropped = self
+            .0
+            .wait_for(|phase| *phase != Phase::Open)
             .await
             .is_err();
         if dropped {
@@ -1220,11 +1244,27 @@ pub(crate) fn operation(name: &str, action: &Digest, stage: &Stage, cached: bool
     }
 }
 
+/// Completes once the server is draining and the operation is queued (no lease for it has
+/// started): its stream has no running action to protect, so it ends and the client
+/// retries. Never while a lease runs: that stream stays until its action is done.
+async fn queued_while_draining(mut closing: Closing, mut stage: watch::Receiver<Stage>) {
+    closing.drained().await;
+    let queued = stage
+        .wait_for(|stage| matches!(stage, Stage::Queued | Stage::Waiting(_)))
+        .await
+        .is_ok();
+    if !queued {
+        // The operation was abandoned: the branch that reads the stage reports that.
+        std::future::pending::<()>().await;
+    }
+}
+
 /// The operation as its stage changes: the stage now, then each change, ending after
 /// the done operation. A stage that stops changing before it is done (the operation was
 /// abandoned), or `closing` closing first (the server is going away), ends the stream
-/// UNAVAILABLE. A change already there is sent before a close is noticed. At every tick
-/// of `progress` the operation is sent again at its current stage. `open` (the call's
+/// UNAVAILABLE; so does a drain while the operation is queued
+/// ([`queued_while_draining`]). A change already there is sent before a close is
+/// noticed. At every tick of `progress` the operation is sent again at its current stage. `open` (the call's
 /// metrics guard) is dropped with the stream, and told of each stage read.
 fn operations(
     ticket: Ticket,
@@ -1246,6 +1286,7 @@ fn operations(
         async move {
             let (mut stage, mut closing, mut progress, mut open, first) = state?;
             if !first {
+                let (watching, peeking) = (closing.clone(), stage.clone());
                 let gone = tokio::select! {
                     biased;
                     changed = stage.changed() => changed
@@ -1253,6 +1294,10 @@ fn operations(
                         .then(|| format!("operation {name} was abandoned")),
                     () = closing.closed() => Some(format!(
                         "the server is shutting down; operation {name} ends here, Execute it again"
+                    )),
+                    () = queued_while_draining(watching, peeking) => Some(format!(
+                        "the server is draining and operation {name} has no running lease; \
+                         it ends here, Execute it again (the operation is not cancelled)"
                     )),
                     () = progress.tick() => None,
                 };
