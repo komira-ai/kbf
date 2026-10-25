@@ -11,7 +11,7 @@ These files go beside the binary.
 | `tierstore.service` | the unit: the binary as `tierstore`, an account that is not root, a two-tier S3 setup, a stop that waits for the drain, and the hardening of the other example units |
 | `tierstore.conf` | the sysusers.d entry of the `tierstore` account (no login, no home) |
 
-The values in the unit are examples (`192.0.2.10`, `hot-s3.farm.example`, the bucket names, the
+The values in the unit are examples (`192.0.2.10`, `s3-hot.example`, the bucket names, the
 sizes): edit them to the setup's. `crates/tierstore/tests/packaging.rs` reads these files and
 checks that the command line parses as the binary parses it, that no secret is on it, that the
 stop timeout covers the drain, and that nothing starts the unit by itself.

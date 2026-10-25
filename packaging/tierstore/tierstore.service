@@ -34,11 +34,11 @@ ExecStart=/usr/libexec/kbf/tierstore \
   --bucket tierstore \
   --access-key-file /etc/tierstore/access.key \
   --hot s3:tierstore-hot \
-  --hot-endpoint http://hot-s3.farm.example:9000 \
+  --hot-endpoint http://s3-hot.example:9000 \
   --hot-credentials-file /etc/tierstore/hot.credentials \
   --hot-bytes 1099511627776 \
   --cold s3:tierstore-cold \
-  --cold-endpoint http://cold-s3.farm.example:9000 \
+  --cold-endpoint http://s3-cold.example:9000 \
   --cold-credentials-file /etc/tierstore/cold.credentials \
   --drain-lb-wait 10s \
   --drain-deadline 15m
