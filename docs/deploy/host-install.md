@@ -822,6 +822,12 @@ restarted. Give the helpers different `--socket`
 paths (and different `--socket-user`s, or the same one with a socket each). Each file lists the
 other frontend in `peers`.
 
+The helper makes each container with the mounts its own file lists, and shares nothing between
+the two. So each file must give its frontend its own state directory and, when
+`--history-objects` is a `file://` directory, its own history directory. The file store locks
+`LOCK` in that directory (`crates/kbf-objstore/src/fs_store.rs:294-304`), so a second frontend on
+the same directory fails to start.
+
 ### On a Mac
 
 The release is checked and laid out by the same code as the ssh path's install (above), into the
