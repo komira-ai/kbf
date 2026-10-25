@@ -269,7 +269,7 @@ fn nothing_follows_the_bootouts_on_the_uids_domains() {
 /// is named, and the gui domain is not tried.
 #[test]
 fn a_user_domain_bootout_that_is_not_0_fails_the_clean_naming_the_code() {
-    for code in [1, 3, 113, 125, 126] {
+    for code in [1, 3, 112, 113, 125, 126] {
         let fake = Fake::new(vec![exited(code)]);
         let why = end(&fake, 700).expect_err("a refused bootout passed");
         assert_eq!(why, format!("launchctl bootout user/700 exited {code}"));
@@ -279,16 +279,17 @@ fn a_user_domain_bootout_that_is_not_0_fails_the_clean_naming_the_code() {
     assert_eq!(end(&fake, 700), Ok(()));
 }
 
-/// The same for `gui/<uid>`: 0 and 125 (what an absent gui domain answers, measured on a
-/// Mac Studio: "Domain does not support specified action") are done; every other code
+/// The same for `gui/<uid>`: 0, 125 (what an absent gui domain answers on a Mac Studio:
+/// "Domain does not support specified action") and 112 (what it answers on the macOS 26.6
+/// CI runner) are done; every other code
 /// fails the step and is named.
 #[test]
-fn a_gui_domain_bootout_is_done_on_0_or_125_and_fails_on_any_other_code() {
-    for code in [0, 125] {
+fn a_gui_domain_bootout_is_done_on_0_112_or_125_and_fails_on_any_other_code() {
+    for code in [0, 112, 125] {
         let fake = Fake::new(vec![exited(0), exited(code)]);
         assert_eq!(end(&fake, 700), Ok(()), "gui exited {code}");
     }
-    for code in [1, 3, 113, 126] {
+    for code in [1, 3, 111, 113, 126] {
         let fake = Fake::new(vec![exited(0), exited(code)]);
         let why = end(&fake, 700).expect_err("a refused bootout passed");
         assert_eq!(why, format!("launchctl bootout gui/700 exited {code}"));

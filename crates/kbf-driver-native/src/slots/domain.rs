@@ -81,9 +81,10 @@ pub(crate) fn end(launchd: &dyn Launchd, uid: u32) -> Result<(), String> {
 /// an absent `user/<uid>` answers 0).
 const USER_DONE: [i32; 1] = [0];
 
-/// The same for `gui/<uid>`: 0, or 125 ("Domain does not support specified action"),
-/// which is what an absent `gui/<uid>` answers (measured on a Mac Studio).
-const GUI_DONE: [i32; 2] = [0, 125];
+/// The same for `gui/<uid>`: 0, or what an absent `gui/<uid>` answers: 125 ("Domain does
+/// not support specified action") on a Mac Studio, and 112 on the macOS 26.6 CI runner
+/// (both measured).
+const GUI_DONE: [i32; 3] = [0, 112, 125];
 
 /// Boots `domain` out until launchd stops saying it is tearing down (124). A code in
 /// `done` ends the wait; any other code fails the step and is named: a refused bootout
