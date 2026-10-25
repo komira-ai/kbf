@@ -1530,6 +1530,9 @@ impl State {
         });
         self.stages.insert(waiter, watch::channel(Stage::Queued).0);
         if let Some(grant) = &op.lease {
+            // A recovered operation that holds a lease has been started: if it is queued
+            // again, its streams read `WaitingKept`.
+            self.ever_started.insert(op.operation);
             let stamp = Stamp {
                 queued: now,
                 started: now,

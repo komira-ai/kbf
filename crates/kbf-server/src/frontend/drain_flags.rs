@@ -42,8 +42,14 @@ pub(super) fn args() -> [Arg; 2] {
             .value_parser(clap::value_parser!(u64).range(1..))
             .default_value(DEFAULT_DEADLINE)
             .help(
-                "The longest, in seconds, a drain waits for the open executions to finish \
-                 after it has refused new ones. Those still open then are ended UNAVAILABLE, \
+                "The longest, in seconds, a drain (a stop signal or `POST /v1/frontend/drain`) \
+                 waits for the open executions to finish after it has refused new ones; a \
+                 stop always ends by then, unless `--shutdown-timeout-secs` ends it earlier. \
+                 The one stream that does not wait is that of an operation that was never \
+                 started, that no worker on this frontend can run and that no other \
+                 frontend can take: it ends UNAVAILABLE as the drain begins, since that action would fail at the deadline anyway (Buck2 retries \
+                 only the opening of a call), and the operation stays queued for the other \
+                 frontends. Executions still open at the deadline are ended UNAVAILABLE, \
                  the daemons' worker streams end and the process exits. Buck2 does not \
                  recover a stream that breaks mid-action, so an action that runs longer than \
                  this fails: update in a quiet window, or set it above the longest action. \

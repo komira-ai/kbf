@@ -33,10 +33,21 @@
 //! **Draining** ([`Closer::drain`], on SIGTERM): a new Execute is refused UNAVAILABLE,
 //! which Buck2 retries when it opens the call (up to 5 attempts, so the next try can
 //! land on another frontend), and every open Execute and WaitExecution stream stays
-//! open until its action is done. Buck2 does not recover a stream that breaks after
-//! it started: it never calls WaitExecution and never sends the Execute again, so an
-//! action whose stream is cut fails as `remote_call_error`. Ending a stream UNAVAILABLE
-//! is therefore a last resort, not a retry (kbf#791).
+//! open until its action is done. Buck2 retries only the opening of the call: it does
+//! not recover a stream that breaks after it started (it never calls WaitExecution and
+//! never sends the Execute again), so an action whose stream is cut fails as
+//! `remote_call_error`. Ending a stream UNAVAILABLE is therefore a last resort, not a
+//! retry (kbf#791).
+//!
+//! The one early end: a stream whose operation has never been started and cannot start
+//! (stage [`Stage::Waiting`]: no worker on this frontend can run it, for example every
+//! capable worker is cordoned, and no other frontend of the state store has one that
+//! could take it) ends UNAVAILABLE when the drain begins, which is the end of the load
+//! balancer wait. That action would fail at the drain deadline anyway, so ending it costs
+//! nothing and lets the stop finish. A `Queued` operation a worker can take, an operation
+//! another frontend could take, and any operation that ever had a lease (running, or
+//! queued again after a lost one: [`Stage::WaitingKept`]), keep their streams. The
+//! operation is not cancelled by the stream ending.
 //!
 //! **Progress** ([`progress`]): every open stream is sent its operation again, same
 //! name, `done` false, its current stage, once per progress interval, so a load
@@ -183,8 +194,14 @@ pub struct Submission {
 pub enum Stage {
     /// Waiting for room.
     Queued,
-    /// Queued, and no live worker can run it now: why.
+    /// Queued, never started, and no live worker of this frontend can run it now: why. A
+    /// drain ends the streams of an operation in this stage, since it can never start: no
+    /// other frontend of the state store has a worker that could take it either.
     Waiting(String),
+    /// As [`Stage::Waiting`], but a drain keeps its streams: a lease for the operation did
+    /// start once (and was lost, so it was queued again), or another frontend of the
+    /// state store has a worker that could run it and takes it once this one stands down.
+    WaitingKept(String),
     /// A lease for it has started on a worker.
     Executing,
     /// Finished.
@@ -300,6 +317,19 @@ impl Closing {
         let dropped = self
             .0
             .wait_for(|phase| *phase == Phase::Closed)
+            .await
+            .is_err();
+        if dropped {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// Completes once the closer has begun to drain or has closed; never, if it is
+    /// dropped first.
+    pub(crate) async fn drained(&mut self) {
+        let dropped = self
+            .0
+            .wait_for(|phase| *phase != Phase::Open)
             .await
             .is_err();
         if dropped {
@@ -1161,7 +1191,7 @@ pub(crate) fn operation(name: &str, action: &Digest, stage: &Stage, cached: bool
     let mut partial = None;
     let (value, result) = match stage {
         Stage::Queued => (execution_stage::Value::Queued, None),
-        Stage::Waiting(why) => {
+        Stage::Waiting(why) | Stage::WaitingKept(why) => {
             let info = ErrorInfo {
                 reason: NO_WORKER_REASON.to_owned(),
                 domain: ERROR_DOMAIN.to_owned(),
@@ -1220,12 +1250,31 @@ pub(crate) fn operation(name: &str, action: &Digest, stage: &Stage, cached: bool
     }
 }
 
+/// Completes once the server is draining and the operation is [`Stage::Waiting`]: it has
+/// never been started and can never start, so it could only fail at the drain deadline,
+/// and ending it when the drain begins frees the stop. The call fails (Buck2 does not recover
+/// an ended stream), as it would at the deadline. Never for a plain `Queued` operation
+/// (a worker may take it), nor for one that ever had a lease ([`Stage::WaitingKept`]).
+async fn unstartable_while_draining(mut closing: Closing, mut stage: watch::Receiver<Stage>) {
+    closing.drained().await;
+    let queued = stage
+        .wait_for(|stage| matches!(stage, Stage::Waiting(_)))
+        .await
+        .is_ok();
+    if !queued {
+        // The operation was abandoned: the branch that reads the stage reports that.
+        std::future::pending::<()>().await;
+    }
+}
+
 /// The operation as its stage changes: the stage now, then each change, ending after
 /// the done operation. A stage that stops changing before it is done (the operation was
 /// abandoned), or `closing` closing first (the server is going away), ends the stream
-/// UNAVAILABLE. A change already there is sent before a close is noticed. At every tick
-/// of `progress` the operation is sent again at its current stage. `open` (the call's
-/// metrics guard) is dropped with the stream, and told of each stage read.
+/// UNAVAILABLE; so does a drain while the operation can never start
+/// ([`unstartable_while_draining`]). A change already there is sent before a close is
+/// noticed. At every tick of `progress` the operation is sent again at its current stage.
+/// `open` (the call's metrics guard) is dropped with the stream, and told of each stage
+/// read.
 fn operations(
     ticket: Ticket,
     closing: Closing,
@@ -1246,6 +1295,7 @@ fn operations(
         async move {
             let (mut stage, mut closing, mut progress, mut open, first) = state?;
             if !first {
+                let (watching, peeking) = (closing.clone(), stage.clone());
                 let gone = tokio::select! {
                     biased;
                     changed = stage.changed() => changed
@@ -1253,6 +1303,10 @@ fn operations(
                         .then(|| format!("operation {name} was abandoned")),
                     () = closing.closed() => Some(format!(
                         "the server is shutting down; operation {name} ends here, Execute it again"
+                    )),
+                    () = unstartable_while_draining(watching, peeking) => Some(format!(
+                        "the server is draining and operation {name} was never started and no \
+                         worker can run it; it ends here (the operation is not cancelled)"
                     )),
                     () = progress.tick() => None,
                 };
@@ -1262,7 +1316,13 @@ fn operations(
             }
             let now = stage.borrow_and_update().clone();
             let done = matches!(now, Stage::Done(_));
-            open.update(matches!(now, Stage::Queued | Stage::Waiting(_)), done);
+            open.update(
+                matches!(
+                    now,
+                    Stage::Queued | Stage::Waiting(_) | Stage::WaitingKept(_)
+                ),
+                done,
+            );
             let next = (!done).then_some((stage, closing, progress, open, false));
             Some((Ok(operation(&name, &action, &now, false)), next))
         }
