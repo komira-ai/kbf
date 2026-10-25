@@ -41,12 +41,34 @@ the TLS flags the frontend keeps the farm's storage map and routes every call by
 
 `--pack-index` (off by default; the `pack-index` key of `[scheduler]` in `kbf.toml`) opens
 the pack index at start: two tables of the Postgres state store (`pack` and `blob`) that
-say which pack holds each blob and where. Nothing reads or writes them yet, so the flag
-only checks that the store can hold them. It needs a `postgres://` state store whose schema
+say which pack holds each blob and where. The worker listener then answers a daemon's
+`kbf.worker.v1.PackIndex/Locate` from the index (daemon certificates only; without the flag
+the service is not registered and the call is UNIMPLEMENTED). Nothing else reads or writes
+them yet. It needs a `postgres://` state store whose schema
 has the tables, which `kbf-installer setup` and the update step create, and a `sqlite://`
 state store is refused with a line that says so (exit 2). With the flag off no pack table is
 touched. The tables are an additive schema step: a kbf of the previous release keeps running
 on the migrated schema.
+
+A daemon reads from the packs with `--pack-read` (off by default; the `[packs]` table of
+`kbf.toml`), which needs `--pack-store-endpoint`, `--pack-store-bucket` and
+`--pack-store-credentials-file` (a JSON key pair, mode 0600 or 0400, of a key that may read
+`cas/` and write nothing; `--pack-store-region` defaults to `us-east-1`). Its reads ask the
+frontend where a blob lies, read that range of the pack from the object store and check it
+against the digest. A blob the frontend does not locate, and a frontend without
+`--pack-index`, leave the read where it was (the storage nodes), as does a frontend of the
+previous release, which answers PERMISSION_DENIED (logged once, then once more after a
+read that was answered, and counted as `unasked`); `missing`, uploads and every
+other call are unchanged, so the daemon still uploads its outputs to the storage members.
+A pack that is gone or whose bytes are not the digest fails the read. Each read asks for one
+blob: one `Locate` call and one ranged request, with at most 16 asking at once. A blob of
+more than 64 MiB is read where it was before, as a read from a pack holds the whole blob in
+memory, outside the transfer budget (`--transfer-bytes-in-flight`). `--pack-read-cache-dir` with
+`--pack-read-cache-bytes` adds a cache of the blobs read from packs (the daemon's input
+cache already keeps blobs by digest, so it is off by default). `kbf daemon` only:
+`kbf storage-and-daemon` and `kbf all-in-one` read blobs in-process and refuse the flag.
+Counts of what was read from packs, elsewhere, lost and damaged are logged when the daemon
+stops (`pack reads: ...`), and a lost or damaged blob is logged when it is found.
 
 **`storage`.** It serves the storage service over gRPC and nothing else: no REAPI, no
 scheduler, no operator API (only `GET /metrics`, on `--metrics-listen`, off unless given).

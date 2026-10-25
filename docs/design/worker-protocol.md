@@ -315,6 +315,15 @@ the objects holding them ([write-path.md](write-path.md#4-segment-upload-the-dae
 An upload belongs to the connection that began it: a call naming it on another
 connection is `NOT_FOUND`.
 
+A frontend started with `--pack-index` also serves `kbf.worker.v1.PackIndex/Locate` to the
+daemon role (`pack_index.proto`): for up to 1000 digests, in order, where each blob lies in a
+pack (the pack, the offset and the length) or that the index has no row for it. A daemon
+started with `--pack-read` reads the blobs it finds that way from the object store and hashes
+them; it reads every other blob where it did before. Admitted by the same rule as the blob
+calls. A frontend without `--pack-index` does not register the service: the call is
+`UNIMPLEMENTED`. More than 1000 digests, or a digest that is not SHA-256, is
+`INVALID_ARGUMENT`; an index that cannot be read is `UNAVAILABLE`.
+
 Not checked: that the node is registered or connected, or that it reads only the
 inputs of leases it holds. A certificate the deny list does not refuse can read any
 blob whose digest it names, and write blobs.

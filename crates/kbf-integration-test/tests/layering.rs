@@ -30,19 +30,23 @@
 //!   frontend and the daemon both link it, and neither may pull in the other's code
 //!   through it;
 //! - a daemon crate (`DAEMON_ONLY`: `kbf-node`, the `kbf-daemon` binary's library, and
-//!   `kbf-daemon` beneath it) depending, directly or through another crate, on the object
-//!   store client, a crate that holds one, or a standalone HTTP client one could be
-//!   written over (`COLD_STORE_CLIENT`); and a walk that cannot see the client (the
-//!   client crate renamed, or the server no longer reaching it), which would make that
-//!   check pass vacuously. A daemon-only node holds no cold-store credential and reaches
-//!   bytes only through storage (docs/design/architecture-v2.md, section 9). What this
-//!   pins is the daemon's code: the daemon crates cannot name an object-store client, so
-//!   the separate `kbf-daemon` binary links none. It does not pin the binary a
-//!   daemon-only node runs. The deployed `kbf daemon` is the `kbf` binary (`kbf-cli`),
-//!   which links `kbf-server` and `kbf-objstore` for its other modes (`JOINERS`). For
-//!   that binary the protection is that it is given no credential: its unit loads no
-//!   environment file or systemd credential (kbf-deploy's `linux/modes_tests.rs`), and no
-//!   daemon flag names a store or reads an environment variable (kbf-cli's tests);
+//!   `kbf-daemon` beneath it) depending, directly or through another crate, on a crate that
+//!   holds the cold store behind its cache, or on a standalone HTTP client one could be
+//!   written over (`COLD_STORE_CLIENT`); and a walk that cannot see those crates (renamed,
+//!   or the server no longer reaching the front), which would make that check pass
+//!   vacuously. A daemon-only node holds no cold-store credential and reaches bytes
+//!   through storage (docs/design/architecture-v2.md, section 9). The one exception is
+//!   `--pack-read` (`kbf_daemon::packed`): a daemon reads the packs of the farm's object
+//!   store with a key that may read `cas/` and write nothing, in a file named by a flag,
+//!   so the daemon crates now reach the object store client (`kbf-objstore`) and the HTTP
+//!   client it is written over (`reqwest`), and the check no longer refuses them. What this
+//!   pins is the daemon's code: the daemon crates cannot build the cold store of a
+//!   frontend or a storage node. The deployed `kbf daemon` is the `kbf` binary
+//!   (`kbf-cli`), which links `kbf-server` for its other modes (`JOINERS`). For that
+//!   binary the protection is that it is given no credential in its environment: its unit
+//!   loads no environment file or systemd credential (kbf-deploy's `linux/modes_tests.rs`),
+//!   and no daemon flag names a store or reads an environment variable, but the seven
+//!   `--pack-read` flags, which take a key file and never a secret (kbf-cli's tests);
 //! - the front-door proxy library (`kbf-proxy`) depending, directly or through another crate,
 //!   on a child's, the installer's or the runtime's crates (`PROXY_MUST_NOT_REACH`); and any
 //!   file of `kbf-installer/src` outside `MAY_NAME_THE_PROXY`, the root helper first of all,
@@ -470,20 +474,20 @@ fn the_updater_has_no_tie_to_the_proxy() {
 /// and so are in its closure.
 const DAEMON_ONLY: &[&str] = &["kbf-node", "kbf-daemon"];
 
-/// What a daemon crate's normal dependencies must not reach: the object store client
-/// (`kbf-objstore`, which signs S3 requests), the crates that hold the cold store behind
-/// their cache and build it from a cold-store URI (`kbf-front`, `kbf-server`), and the
-/// standalone HTTP clients an S3 client could be written over (`reqwest`, which
-/// `kbf-objstore` is written over, and `ureq`). `hyper-util` is not listed: tonic's
-/// channel, which the daemon dials the server with, is built on its client.
-const COLD_STORE_CLIENT: &[&str] = &["kbf-objstore", "kbf-front", "kbf-server", "reqwest", "ureq"];
+/// What a daemon crate's normal dependencies must not reach: the crates that hold the cold
+/// store behind their cache and build it from a cold-store URI (`kbf-front`, `kbf-server`),
+/// and a standalone HTTP client an S3 client could be written over (`ureq`). The object
+/// store client (`kbf-objstore`) and the `reqwest` it is written over are not listed since
+/// `--pack-read`: a daemon reads packs with it (the module docs). `hyper-util` is not listed
+/// either: tonic's channel, which the daemon dials the server with, is built on its client.
+const COLD_STORE_CLIENT: &[&str] = &["kbf-front", "kbf-server", "ureq"];
 
 #[test]
 fn a_daemon_cannot_build_a_cold_store_client() {
     let g = load_graph();
     // Every name the check looks for is a package of the graph, and the walk sees the
-    // client where it is linked: the server builds its cold store from it. Without
-    // these, a renamed or misspelled crate would pass the check below.
+    // crate where it is linked: the server holds the front, which builds the cold store.
+    // Without these, a renamed or misspelled crate would pass the check below.
     for name in COLD_STORE_CLIENT {
         assert!(
             g.names.values().any(|n| n == *name),
@@ -491,8 +495,8 @@ fn a_daemon_cannot_build_a_cold_store_client() {
         );
     }
     assert!(
-        !reaches(&g, "kbf-server", &["kbf-objstore"]).is_empty(),
-        "the server's closure must reach kbf-objstore, or this walk proves nothing"
+        !reaches(&g, "kbf-server", &["kbf-front"]).is_empty(),
+        "the server's closure must reach kbf-front, or this walk proves nothing"
     );
     let violations: Vec<String> = DAEMON_ONLY
         .iter()
@@ -500,8 +504,9 @@ fn a_daemon_cannot_build_a_cold_store_client() {
         .collect();
     assert!(
         violations.is_empty(),
-        "a daemon crate reaches an object-store client (a daemon-only node holds no \
-         cold-store credential, docs/design/architecture-v2.md section 9):\n{}",
+        "a daemon crate reaches a crate that builds the cold store or a standalone HTTP \
+         client (a daemon-only node holds no cold-store credential, \
+         docs/design/architecture-v2.md section 9):\n{}",
         violations.join("\n")
     );
 }
@@ -537,10 +542,10 @@ fn route_reaches_neither_the_frontend_nor_the_daemon() {
 }
 
 /// What the packing client's normal dependencies must not reach: the frontend's scheduler and
-/// authorization, the server and the storage node, and the daemon's side. A frontend uses the
-/// packing client, and a daemon will once the design wires it; a path to either side's code
-/// would make the other link it. The change that wires it into the daemon must also change
-/// `COLD_STORE_CLIENT`, as `kbf-pack` is written over `kbf-objstore`.
+/// authorization, the server and the storage node, and the daemon's side. A frontend and a
+/// daemon (`--pack-read`) use the packing client; a path to either side's code would make the
+/// other link it. Wiring it into the daemon changed `COLD_STORE_CLIENT`, as `kbf-pack` is
+/// written over `kbf-objstore`.
 const PACK_MUST_NOT_REACH: &[&str] = &[
     "kbf-sched",
     "kbf-auth",

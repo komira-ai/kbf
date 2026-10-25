@@ -198,6 +198,20 @@ const GROUPS: &[(&str, &[&str])] = &[
     ),
     ("log", &["log-dir", "log-files", "log-max-bytes"]),
     (
+        // The daemon's reads of blobs from the packs of the farm's object store
+        // (`kbf_node`'s `pack_read`).
+        "packs",
+        &[
+            "pack-read",
+            "pack-read-cache-bytes",
+            "pack-read-cache-dir",
+            "pack-store-bucket",
+            "pack-store-credentials-file",
+            "pack-store-endpoint",
+            "pack-store-region",
+        ],
+    ),
+    (
         // Not `enroll` or `frontend`: those tables are the enrollment client's own.
         "enroll-service",
         &[

@@ -34,6 +34,11 @@
 //! lease's input files from, and the shared input trees. Their budgets
 //! come from the filesystem, not from flags; `--data-max-bytes` only lowers them.
 //!
+//! With `--pack-read` (off by default; `pack_read`) the data plane of `kbf daemon` reads blobs
+//! from the packs of the farm's object store first, finding them through the frontend's pack
+//! index; a blob it does not locate is read where it always was, and outputs are stored
+//! where they were.
+//!
 //! The log goes to stderr, in color only when stderr is a terminal: under launchd or
 //! systemd it is a file or a journal, where escape codes are noise (issue #170). The
 //! daemon does not rotate it; the service manager that owns stderr does. systemd's
@@ -152,6 +157,8 @@ pub struct Cli {
     output_upload_deadline_secs: u64,
     #[command(flatten)]
     transfer: transfer::TransferArgs,
+    #[command(flatten)]
+    pack_read: pack_read::PackReadArgs,
     /// The cgroup lease cgroups are made under, from the cgroup root (container). Left
     /// out, the daemon sets up its own cgroup, which its systemd unit must delegate
     /// (`Delegate=yes`): it moves itself into a `supervisor` leaf there and makes
@@ -586,6 +593,10 @@ impl NodeHandle {
 /// checks fail ([`ImageUnusable`] among them, for which [`exit_code`] answers 2), or
 /// the node cannot be detected.
 pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
+    // With `--pack-read`, the same plane with its reads going to the packs first.
+    if let Some(settings) = cli.pack_read.settings() {
+        return pack_read::start(cli, settings);
+    }
     // The map the frontend pushes lands in `maps`: the daemon fills it, the data plane
     // routes by it.
     let maps = Arc::new(MapHolder::new());
@@ -605,6 +616,7 @@ pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
 /// # Errors
 /// As [`start`].
 pub fn start_member(cli: &Cli, local: LocalMember) -> Result<NodeHandle, Error> {
+    cli.pack_read.refuse_in_process()?;
     let maps = Arc::new(MapHolder::new());
     let held = Arc::clone(&maps);
     let own = local.addr().to_owned();
@@ -626,6 +638,7 @@ pub fn start_with<C: Cas>(
     cli: &Cli,
     plane: impl Fn(&Cli) -> Result<Arc<C>, Error> + 'static,
 ) -> Result<NodeHandle, Error> {
+    cli.pack_read.refuse_in_process()?;
     start_over(cli, None, move |cli, _| plane(cli))
 }
 
@@ -1287,6 +1300,7 @@ mod container {
 
 mod data_dir;
 mod instance;
+mod pack_read;
 mod retired;
 mod run;
 mod transfer;

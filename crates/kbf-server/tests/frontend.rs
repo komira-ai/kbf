@@ -19,6 +19,9 @@ mod membership_tls;
 #[path = "frontend/object_stores.rs"]
 mod object_stores;
 
+#[path = "frontend/pack_locate.rs"]
+mod pack_locate;
+
 #[path = "frontend/proxy_auth.rs"]
 mod proxy_auth;
 

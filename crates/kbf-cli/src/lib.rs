@@ -907,4 +907,6 @@ pub fn main() -> ExitCode {
 }
 
 #[cfg(test)]
+mod daemon_flag_tests;
+#[cfg(test)]
 mod tests;
