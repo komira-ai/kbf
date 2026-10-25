@@ -440,8 +440,8 @@ jobs:
       # (its scripts never see that network), as an ephemeral node. Tailscale's workload identity
       # federation takes this run's OIDC token, so the job still holds no secret. The client id and
       # the audience are the variables TS_CLIENT_ID and TS_AUDIENCE, the trust credential CI jobs
-      # join the network with, as `tag:ci`. Either variable unset (a fork, a repository with no
-      # farm or no network) the step is skipped and the verb runs as before.
+      # join the network with, as `tag:ci`. With TS_CLIENT_ID or KBF_COORDINATOR_URL unset (a fork,
+      # a repository with no farm or no network) the step is skipped and the verb runs as before.
       - name: Join the farm's Tailscale network
         if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}
         uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0

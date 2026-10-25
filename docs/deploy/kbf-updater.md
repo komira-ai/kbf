@@ -369,7 +369,7 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    The `sha` of the token is the head of `main`, not the commit released. A token is good for one
    call. The control listener (`--control-listen`) must be reachable from GitHub-hosted runners;
    the heartbeat listener need not be. A control listener on a Tailscale network only is
-   reachable too: the job joins that network first when `TS_CLIENT_ID` is set (below).
+   reachable too: the job joins that network first when `TS_CLIENT_ID` and `KBF_COORDINATOR_URL` are set (below).
 2. **Enroll the hosts**, so that their updaters heartbeat to the coordinator
    ([The agent mode](#the-agent-mode)). A host that does not heartbeat is `down`, and the
    coordinator does not wait for it: it says `converged` when every host that does heartbeat runs
@@ -385,7 +385,7 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    |---|---|
    | `KBF_COORDINATOR_URL` | `https://<name>:<port>` of the control listener, no path. Unset or empty: the step is off |
    | `KBF_COORDINATOR_CA` | the farm CA's certificate (PEM, public). The coordinator's certificate is the farm CA's, which no system store holds; empty trusts the system store instead |
-   | `TS_CLIENT_ID`, `TS_AUDIENCE` | optional, for a coordinator reachable only on a Tailscale network: the client id and audience of the Tailscale trust credential (workload identity federation) that CI jobs join the network with, as `tag:ci`. It must trust this repository's `release` environment (the token's subject is `repo:<owner>/<repo>:environment:release`), and the network's policy must let `tag:ci` reach the control listener. With both set and `KBF_COORDINATOR_URL` set, the job joins as an ephemeral node with the run's OIDC token, after the build and before the verb; no secret is involved. Either unset: the step is skipped |
+   | `TS_CLIENT_ID`, `TS_AUDIENCE` | optional, for a coordinator reachable only on a Tailscale network: the client id and audience of the Tailscale trust credential (workload identity federation) that CI jobs join the network with, as `tag:ci`. It must trust this repository's `release` environment (the token's subject is `repo:<owner>/<repo>:environment:release`), and the network's policy must let `tag:ci` reach the control listener. With `TS_CLIENT_ID` and `KBF_COORDINATOR_URL` set, the job joins as an ephemeral node with the run's OIDC token, after the build and before the verb; no secret is involved. `TS_CLIENT_ID` or `KBF_COORDINATOR_URL` unset: the step is skipped (`TS_AUDIENCE` must be set with `TS_CLIENT_ID`) |
    | `KBF_MIN_UP_STORAGE`, `KBF_MIN_UP_FRONTEND` | optional: the storage hosts and frontends that must stay up while others update (default 1 each). The operator picks the storage number so that every blob stays readable |
 
 ### What the step does
