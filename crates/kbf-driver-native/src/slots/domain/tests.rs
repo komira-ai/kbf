@@ -79,8 +79,8 @@ fn the_domains_are_booted_out_whole_once_each_and_nothing_else_is_run() {
 /// Catches a 124 ("tearing down") read as done (a job that launchd is still stopping would
 /// be missed), a wait that is not bounded (a domain that never settles would hang the
 /// slot), and a wait with no pauses (150 bootouts back to back): 124 and timeouts are
-/// waited out by booting the domain out again; any other answer, a missing domain (113)
-/// included, ends the domain's wait at once.
+/// waited out by booting the domain out again; a done code ends the domain's wait
+/// at once.
 #[test]
 fn a_domain_tearing_down_is_waited_for_and_the_wait_is_bounded() {
     let fake = Fake::new(vec![exited(124), Said::TimedOut, exited(0)]);
@@ -95,10 +95,6 @@ fn a_domain_tearing_down_is_waited_for_and_the_wait_is_bounded() {
             "bootout gui/700"
         ]
     );
-
-    let fake = Fake::new(vec![exited(113)]);
-    assert_eq!(end(&fake, 700), Ok(()));
-    assert_eq!(*fake.pauses.borrow(), 0);
 
     let fake = Fake::new(vec![exited(124)]);
     let why = end(&fake, 700).expect_err("never settles");
@@ -210,7 +206,9 @@ impl Launchd for World {
                     domains.remove(at);
                     exited(0)
                 }
-                None => exited(113),
+                // Measured: an absent user domain answers 0, an absent gui domain 125.
+                None if target.starts_with("gui/") => exited(125),
+                None => exited(0),
             },
             // Measured: a root `print` of a missing user domain makes it, and launchd
             // starts its per-user agents in it at once.
@@ -262,4 +260,41 @@ fn nothing_follows_the_bootouts_on_the_uids_domains() {
         asked.iter().all(|a| a.starts_with("bootout ")),
         "a verb that can make the domain: {asked:?}"
     );
+}
+
+/// Catches a bootout that fails open: a refused bootout leaves the domain, and an idle
+/// loaded job in it (`StartInterval`, `WatchPaths`) shows in no process table and would
+/// fire in the next lease. For `user/<uid>` only 0 is done (an absent domain answers 0,
+/// measured on a Mac Studio); every other code, 125 and 113 included, fails the step and
+/// is named, and the gui domain is not tried.
+#[test]
+fn a_user_domain_bootout_that_is_not_0_fails_the_clean_naming_the_code() {
+    for code in [1, 3, 113, 125, 126] {
+        let fake = Fake::new(vec![exited(code)]);
+        let why = end(&fake, 700).expect_err("a refused bootout passed");
+        assert_eq!(why, format!("launchctl bootout user/700 exited {code}"));
+        assert_eq!(fake.asked(), ["bootout user/700"]);
+    }
+    let fake = Fake::new(vec![exited(124), exited(0)]);
+    assert_eq!(end(&fake, 700), Ok(()));
+}
+
+/// The same for `gui/<uid>`: 0 and 125 (what an absent gui domain answers, measured on a
+/// Mac Studio: "Domain does not support specified action") are done; every other code
+/// fails the step and is named.
+#[test]
+fn a_gui_domain_bootout_is_done_on_0_or_125_and_fails_on_any_other_code() {
+    for code in [0, 125] {
+        let fake = Fake::new(vec![exited(0), exited(code)]);
+        assert_eq!(end(&fake, 700), Ok(()), "gui exited {code}");
+    }
+    for code in [1, 3, 113, 126] {
+        let fake = Fake::new(vec![exited(0), exited(code)]);
+        let why = end(&fake, 700).expect_err("a refused bootout passed");
+        assert_eq!(why, format!("launchctl bootout gui/700 exited {code}"));
+    }
+    // Tearing down first, then done.
+    let fake = Fake::new(vec![exited(0), exited(124), exited(125)]);
+    assert_eq!(end(&fake, 700), Ok(()));
+    assert_eq!(*fake.pauses.borrow(), 1);
 }

@@ -67,18 +67,32 @@ pub(crate) fn end(launchd: &dyn Launchd, uid: u32) -> Result<(), String> {
     // The alarm for a call: `alarm`, or what is left of [`WITHIN`] if less.
     let limit =
         |alarm: Duration| alarm.min(WITHIN.saturating_sub(launchd.now().saturating_sub(began)));
-    for domain in [format!("user/{uid}"), format!("gui/{uid}")] {
-        boot_out(launchd, &domain, &limit)?;
+    for (domain, done) in [
+        (format!("user/{uid}"), &USER_DONE[..]),
+        (format!("gui/{uid}"), &GUI_DONE[..]),
+    ] {
+        boot_out(launchd, &domain, done, &limit)?;
     }
     Ok(())
 }
 
-/// Boots `domain` out until launchd stops saying it is tearing down. Not an error
-/// whatever else it says: a domain that does not exist cannot be booted out (113), and
-/// the process table is the judge of what is left.
+/// The exit codes of `launchctl bootout user/<uid>` that mean the domain is gone: 0, for
+/// a domain that was booted out and for one that was not there (measured on a Mac Studio:
+/// an absent `user/<uid>` answers 0).
+const USER_DONE: [i32; 1] = [0];
+
+/// The same for `gui/<uid>`: 0, or 125 ("Domain does not support specified action"),
+/// which is what an absent `gui/<uid>` answers (measured on a Mac Studio).
+const GUI_DONE: [i32; 2] = [0, 125];
+
+/// Boots `domain` out until launchd stops saying it is tearing down (124). A code in
+/// `done` ends the wait; any other code fails the step and is named: a refused bootout
+/// leaves the domain, and an idle loaded job in it (`StartInterval`, `WatchPaths`) that
+/// no process table shows would fire in the next lease.
 fn boot_out(
     launchd: &dyn Launchd,
     domain: &str,
+    done: &[i32],
     limit: &dyn Fn(Duration) -> Duration,
 ) -> Result<(), String> {
     for look in 0..POLLS {
@@ -94,7 +108,10 @@ fn boot_out(
             Said::Missing(why) => return Err(format!("launchctl bootout {domain}: {why}")),
             Said::TimedOut => {}
             Said::Exited { code } if code == probe::TEARING_DOWN => {}
-            Said::Exited { .. } => return Ok(()),
+            Said::Exited { code } if done.contains(&code) => return Ok(()),
+            Said::Exited { code } => {
+                return Err(format!("launchctl bootout {domain} exited {code}"));
+            }
         }
     }
     Err(format!(
