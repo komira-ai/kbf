@@ -41,12 +41,34 @@ the TLS flags the frontend keeps the farm's storage map and routes every call by
 
 `--pack-index` (off by default; the `pack-index` key of `[scheduler]` in `kbf.toml`) opens
 the pack index at start: two tables of the Postgres state store (`pack` and `blob`) that
-say which pack holds each blob and where. Nothing reads or writes them yet, so the flag
-only checks that the store can hold them. It needs a `postgres://` state store whose schema
+say which pack holds each blob and where. Unless the frontend is also given the pack store
+flags below, nothing reads or writes them, and the flag only checks that the store can hold
+them. It needs a `postgres://` state store whose schema
 has the tables, which `kbf-installer setup` and the update step create, and a `sqlite://`
 state store is refused with a line that says so (exit 2). With the flag off no pack table is
 touched. The tables are an additive schema step: a kbf of the previous release keeps running
 on the migrated schema.
+
+**Packs** (off by default; the `[packs]` table of `kbf.toml`). With
+`--pack-store-endpoint` (an `http://host:port` S3-compatible object store),
+`--pack-store-bucket` and `--pack-store-credentials-file` (JSON
+`{"access_key_id": "...", "secret_access_key": "..."}`, mode 0600 or 0400; the secret is never
+a flag), and `--pack-index`, the frontend keeps the blobs clients upload in packs: many blobs
+in one object, written to the store with a create-only request and recorded in the pack
+index before the upload is acknowledged (a failed write answers UNAVAILABLE; packs finished
+before the failure stay recorded, and the client sends the rest again). FindMissingBlobs asks the index and then, for the digests it lacks, the storage
+nodes. A read, the client's and Execute's own, looks in the index first and fetches only the
+blob's bytes from its pack with a ranged request, hashes them, and serves them (a pack that
+holds other bytes than the digest names is never served); a blob the index lacks is read
+from the storage nodes as before. A blob over 64 MiB and a compressed blob are not packed.
+`--pack-bytes` (default 32 MiB) is the length at which a pack is closed, `--pack-writer`
+(default `frontend`) names the frontend in its pack keys, `--pack-store-region` (default
+`us-east-1`) is the signing region, and `--pack-cache-dir` with `--pack-cache-bytes` keeps
+the blobs read from packs on a local disk. At start the frontend checks that the store
+refuses to replace an object, and does not serve if it does not. `GET /metrics` gains the
+`kbf_pack_*` families. Left out, no object store is built or contacted and the frontend
+serves exactly as before. Daemons read blobs from the storage nodes only, so they cannot yet
+read a blob that is only in a pack.
 
 **`storage`.** It serves the storage service over gRPC and nothing else: no REAPI, no
 scheduler, no operator API (only `GET /metrics`, on `--metrics-listen`, off unless given).

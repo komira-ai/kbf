@@ -605,10 +605,11 @@ pub struct Args {
     )]
     pub ui: bool,
     /// Opens the pack index at start: the tables in the Postgres state store that say which
-    /// pack holds each blob and where. Nothing reads or writes them yet, so the flag only
-    /// checks that the store can hold them. Needs `--state-store` as a `postgres://` URL whose
-    /// schema has the pack tables (`kbf-installer setup` makes them); a `sqlite://` store is
-    /// refused. Left out, no pack table is touched
+    /// pack holds each blob and where. A frontend given `--pack-store-endpoint` reads and
+    /// writes them; without it nothing does, and the flag only checks that the store can hold
+    /// them. Needs `--state-store` as a `postgres://` URL whose schema has the pack tables
+    /// (`kbf-installer setup` makes them); a `sqlite://` store is refused. Left out, no pack
+    /// table is touched
     #[arg(long)]
     pub pack_index: bool,
 }

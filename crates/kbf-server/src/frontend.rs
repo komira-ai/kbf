@@ -44,8 +44,11 @@
 //! removed in the next release ([`crate::StateStoreUri::open`]).
 //!
 //! **The pack index** is off unless `--pack-index` is given (the flag's help has its rules).
-//! The started frontend carries it ([`FrontendHandle::pack_index`]); nothing in the frontend
-//! reads or writes it yet.
+//! The started frontend carries it ([`FrontendHandle::pack_index`]).
+//!
+//! **Packs** are off unless `--pack-store-endpoint` is given (`pack_flags` has the flags and
+//! what they need): client uploads are then kept in packs ([`kbf_front::Packs`]); without it
+//! no object store is built or contacted and the frontend serves exactly as it did.
 //!
 //! **Readiness** (`GET /readyz`, `grpc.health.v1`) fails when the storage node does not
 //! answer an action-cache lookup within `--readyz-store-timeout-ms`, when the state store (if
@@ -94,7 +97,7 @@ use futures::FutureExt as _;
 use futures::future::{AbortHandle, Abortable, BoxFuture};
 use kbf_auth::AuthenticateLayer;
 use kbf_front::{
-    Backend, MAX_MESSAGE_BYTES, Owner, Owners, Proxy, RECORDER_CHANNEL, Recorder,
+    Backend, MAX_MESSAGE_BYTES, Owner, Owners, Packs, Proxy, RECORDER_CHANNEL, Recorder,
     RequestMetadataLayer, Routed,
 };
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
@@ -108,6 +111,7 @@ use kbf_tls::TlsSource;
 use tonic::service::Routes;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server};
 
+pub use self::pack_flags::{PackFlagError, PackFlags};
 use crate::drain::Drain;
 use crate::enroll::flags::EnrollFlags;
 use crate::enroll::start as enroll_start;
@@ -219,6 +223,9 @@ pub struct FrontendFlags {
     /// The flags of the removed handover and admin port, which are accepted and ignored
     /// ([`RetiredHandoverFlags`]).
     pub retired: RetiredHandoverFlags,
+    /// `--pack-store-endpoint` and its companions: the blobs clients upload are kept in packs
+    /// in an object store. `None` without the endpoint, where nothing is packed.
+    pub packs: Option<PackFlags>,
 }
 
 /// The long names of the flags of [`Args`] that `kbf frontend` hides and refuses by name
@@ -271,6 +278,7 @@ pub fn command() -> Command {
     .args(crate::enroll::flags::args())
     .args(handoff::args())
     .args(drain_flags::args())
+    .args(pack_flags::args())
     .arg(
         Arg::new(SECRETS_DIR)
             .long("object-store-secrets-dir")
@@ -338,6 +346,7 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         handoff: handoff::from_matches(m),
         drain: drain_flags::from_matches(m),
         retired: RetiredHandoverFlags::from_arg_matches(m)?,
+        packs: pack_flags::from_matches(m),
     })
 }
 
@@ -478,11 +487,13 @@ pub struct FrontendHandle {
     ready: Ready,
     /// The pack index `--pack-index` opened, if the flag was given.
     pack_index: Option<Arc<dyn PackIndex>>,
+    /// The packs `--pack-store-endpoint` describes, if the flag was given.
+    packs: Option<Packs>,
 }
 
 impl FrontendHandle {
     /// The pack index `--pack-index` opened on the Postgres state store, or `None` without the
-    /// flag. Nothing in the frontend reads or writes it yet.
+    /// flag. With the pack store flags too, the frontend writes and reads it.
     #[must_use]
     pub fn pack_index(&self) -> Option<Arc<dyn PackIndex>> {
         self.pack_index.clone()
@@ -525,8 +536,12 @@ impl FrontendHandle {
     /// future and `POST /v1/frontend/drain` begin alike.
     ///
     /// # Errors
-    /// A listener fails while serving.
+    /// A listener fails while serving; or the pack store does not refuse to replace an object
+    /// (or cannot be written to), which is checked before anything is served.
     pub async fn serve(self) -> Result<(), ServeError> {
+        if let Some(packs) = &self.packs {
+            packs.check_create_only().await.map_err(ServeError::Packs)?;
+        }
         let tasks = self
             .background
             .into_iter()
@@ -567,7 +582,10 @@ pub fn checks(
 type Shutdown = Box<dyn FnOnce() -> io::Result<Pin<Box<dyn Future<Output = ()> + Send>>>>;
 
 /// Binds the frontend the flags describe. Nothing is opened but the state store (if
-/// given), and the storage node is dialed when first used.
+/// given), the pack index (`--pack-index`) and the packs (`--pack-store-endpoint`): for the
+/// packs the credentials file is read, the cache directory made and the S3 client built, and
+/// nothing is sent to the pack store until [`FrontendHandle::serve`] checks it. The storage
+/// node is dialed when first used.
 ///
 /// `shutdown` is called once, after the flags are checked and before anything is bound,
 /// and returns the future whose completion stops the frontend; the binary's is
@@ -575,7 +593,10 @@ type Shutdown = Box<dyn FnOnce() -> io::Result<Pin<Box<dyn Future<Output = ()> +
 ///
 /// # Errors
 /// A flag the frontend refuses, a TLS file that cannot be read, a state store that
-/// cannot be opened, a listener that cannot be bound, or a `shutdown` that fails.
+/// cannot be opened, pack flags that cannot be opened (a credentials file that is missing or
+/// readable by others, an endpoint the store client does not take, a writer name a key cannot
+/// hold, a cache directory that cannot be made), a listener that cannot be bound, or a
+/// `shutdown` that fails.
 pub fn start_frontend<S, F>(
     flags: &FrontendFlags,
     shutdown: S,
@@ -716,6 +737,7 @@ impl<'a> Prepared<'a> {
         let storage = Arc::new(RemoteStorage::new(channel.clone(), 0));
         let state_store = store_of(state.as_ref());
         let routed = routed_of(members.as_ref(), flags, &storage)?;
+        let packs = pack_flags::open(flags.packs.as_ref(), pack_index.as_ref())?;
         let checks = Arc::new(checks(
             Arc::clone(&readiness),
             storage.clone(),
@@ -724,8 +746,8 @@ impl<'a> Prepared<'a> {
             timeout,
         ));
         let backend = match &routed {
-            Some(routed) => Backend::routed(Arc::clone(routed), storage),
-            None => Backend::remote(storage),
+            Some(routed) => Backend::routed_over(Arc::clone(routed), storage, packs.clone()),
+            None => Backend::remote_over(storage, packs.clone()),
         };
         // A failed run's logs are read from the storage node, under a budget of this
         // frontend's own: it serves no blob route to share one with.
@@ -845,6 +867,7 @@ impl<'a> Prepared<'a> {
             history.as_ref().map(crate::history::History::stats),
             members.clone(),
             tls_sources,
+            packs.clone(),
         ));
         // The storage health, if there are members.
         let api_routes = members.iter().fold(api_routes, |routes, members| {
@@ -883,6 +906,7 @@ impl<'a> Prepared<'a> {
         let authorizers = Arc::new(policy.authorizers);
         let bootstrap = Owner::new(&flags.storage.uri().to_string(), channel);
         let proxy = Proxy::new(proxy_owners(routed, bootstrap), Arc::clone(&authorizers));
+        let proxy = proxy.with_packs(packs.clone());
         let streams = kbf_front::OpenStreams { closing, progress };
         let reapi_routes = kbf_front::routes_proxied(
             &proxy,
@@ -1038,6 +1062,7 @@ impl<'a> Prepared<'a> {
                 notify: None,
             },
             pack_index,
+            packs,
         })
     }
 }
@@ -1086,22 +1111,26 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
 }
 
 /// `GET /metrics`: what the service counts, in the Prometheus text format, history's
-/// counters when it keeps history, the storage health of `members` when there are any, and
-/// the reloads of the listeners' `tls` files.
+/// counters when it keeps history, the storage health of `members` when there are any, the
+/// reloads of the listeners' `tls` files, and the counters of the `packs` when there are any.
 fn metrics_route(
     backend: Backend,
     history: Option<Arc<crate::history::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
+    packs: Option<Packs>,
 ) -> axum::Router {
     let tls = Arc::new(tls);
     let render = move || {
         let (backend, members, tls) = (backend.clone(), members.clone(), Arc::clone(&tls));
-        let history = history.clone();
+        let (history, packs) = (history.clone(), packs.clone());
         async move {
             let mut text = backend.render_metrics();
             if let Some(history) = history {
                 history.render(&mut text);
+            }
+            if let Some(packs) = packs {
+                packs.render_metrics(&mut text);
             }
             crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);
@@ -1163,6 +1192,9 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
 
 mod drain_flags;
 mod handoff;
+mod pack_flags;
 
+#[cfg(test)]
+mod pack_tests;
 #[cfg(test)]
 mod tests;

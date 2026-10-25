@@ -198,6 +198,21 @@ const GROUPS: &[(&str, &[&str])] = &[
     ),
     ("log", &["log-dir", "log-files", "log-max-bytes"]),
     (
+        // The frontend's blobs in packs (`kbf_server::frontend`'s `pack_flags`); `pack-index`,
+        // which they need, stays with the scheduler's state store.
+        "packs",
+        &[
+            "pack-bytes",
+            "pack-cache-bytes",
+            "pack-cache-dir",
+            "pack-store-bucket",
+            "pack-store-credentials-file",
+            "pack-store-endpoint",
+            "pack-store-region",
+            "pack-writer",
+        ],
+    ),
+    (
         // Not `enroll` or `frontend`: those tables are the enrollment client's own.
         "enroll-service",
         &[

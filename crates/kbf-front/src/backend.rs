@@ -25,6 +25,14 @@
 //! entry's blobs to the action's owner before it commits there
 //! (`kbf_route::Router::commit_with_closure`), until av2-12 gives an entry the
 //! acknowledgements of its writers.
+//!
+//! **Packs.** A frontend given [`Packs`] ([`Backend::remote_over`], [`Backend::routed_over`])
+//! has the blobs clients upload in packs, not on its nodes, so the Action and Command blobs, the
+//! input check and the walk of the input tree look in the pack index first and ask the nodes
+//! about what it lacks (`layered`). The action cache, the result blobs and the closure check
+//! are the nodes': daemons write them.
+
+mod layered;
 
 use std::fmt;
 use std::sync::Arc;
@@ -38,12 +46,14 @@ use kbf_storage::{Storage, StorageError};
 use kbf_types::Digest;
 use prost::Message as _;
 
+use self::layered::{Layered, Primary};
 use crate::cache::Cache;
 use crate::closure;
 use crate::input_tree::Walked;
 use crate::input_walk::{Blobs, Trees, walk};
 use crate::meta_log::{Leadership, MetaLog};
 use crate::metrics::CacheMetrics;
+use crate::proxy::Packs;
 use crate::routed::Routed;
 
 /// The store behind Execute and the scheduler. Cheap to clone.
@@ -87,11 +97,14 @@ impl Backend {
     /// metrics of its own: the frontend holds no cache to keep them.
     #[must_use]
     pub fn remote(storage: Arc<dyn Storage>) -> Self {
-        Self(Arc::new(Remote {
-            storage,
-            metrics: CacheMetrics::default(),
-            trees: Trees::default(),
-        }))
+        Self::remote_over(storage, None)
+    }
+
+    /// [`Backend::remote`], with the blobs a frontend keeps in `packs` looked for first (a
+    /// frontend without packs passes `None`, and the store is the one `remote` makes).
+    #[must_use]
+    pub fn remote_over(storage: Arc<dyn Storage>, packs: Option<Packs>) -> Self {
+        Self(Arc::new(Remote::new(storage, packs)))
     }
 
     /// A store of the storage nodes the map `routed` names, once it has two members or
@@ -104,14 +117,22 @@ impl Backend {
     /// action's owner with its blobs copied there first.
     #[must_use]
     pub fn routed(routed: Arc<Routed>, storage: Arc<dyn Storage>) -> Self {
+        Self::routed_over(routed, storage, None)
+    }
+
+    /// [`Backend::routed`], with the blobs a frontend keeps in `packs` looked for first (a
+    /// frontend without packs passes `None`, and the store is the one `routed` makes).
+    #[must_use]
+    pub fn routed_over(
+        routed: Arc<Routed>,
+        storage: Arc<dyn Storage>,
+        packs: Option<Packs>,
+    ) -> Self {
         Self(Arc::new(RoutedPlane {
             routed,
-            bootstrap: Remote {
-                storage,
-                metrics: CacheMetrics::default(),
-                trees: Trees::default(),
-            },
+            bootstrap: Remote::new(storage, packs.clone()),
             trees: Trees::default(),
+            packs,
         }))
     }
 
@@ -270,15 +291,42 @@ struct Remote {
     /// Directories is used (every Directory it holds is still asked about); nothing is
     /// remembered as verified.
     trees: Trees,
+    /// The blobs the frontend keeps in packs, looked for before the node.
+    packs: Option<Packs>,
+}
+
+impl Remote {
+    fn new(storage: Arc<dyn Storage>, packs: Option<Packs>) -> Self {
+        Self {
+            storage,
+            metrics: CacheMetrics::default(),
+            trees: Trees::default(),
+            packs,
+        }
+    }
 }
 
 impl Plane for Remote {
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Answer<Vec<Digest>>> {
-        self.storage.find_missing(digests)
+        match &self.packs {
+            None => self.storage.find_missing(digests),
+            Some(packs) => Box::pin(async move {
+                let held = Held(&*self.storage);
+                let layered = Layered { packs, rest: &held };
+                layered.find_missing(digests).await
+            }),
+        }
     }
 
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<bytes::Bytes>> {
-        self.storage.read_blob(digest)
+        match &self.packs {
+            None => self.storage.read_blob(digest),
+            Some(packs) => Box::pin(async move {
+                let held = Held(&*self.storage);
+                let layered = Layered { packs, rest: &held };
+                layered.read_blob(digest).await
+            }),
+        }
     }
 
     fn action_result<'a>(
@@ -305,7 +353,13 @@ impl Plane for Remote {
     }
 
     fn walk_inputs(&self, root: Digest) -> BoxFuture<'_, Answer<Walked>> {
-        Box::pin(async move { walk(&Held(&*self.storage), root, &self.trees).await })
+        Box::pin(async move {
+            let held = Held(&*self.storage);
+            match &self.packs {
+                None => walk(&held, root, &self.trees).await,
+                Some(packs) => walk(&Layered { packs, rest: &held }, root, &self.trees).await,
+            }
+        })
     }
 
     fn metrics(&self) -> &CacheMetrics {
@@ -332,6 +386,8 @@ struct RoutedPlane {
     bootstrap: Remote,
     /// The Directories verified held on the farm, shared by every Execute.
     trees: Trees,
+    /// The blobs the frontend keeps in packs, looked for before the owners.
+    packs: Option<Packs>,
 }
 
 impl RoutedPlane {
@@ -347,16 +403,32 @@ impl RoutedPlane {
 
 impl Plane for RoutedPlane {
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Answer<Vec<Digest>>> {
-        match self.routing() {
-            Some(router) => Box::pin(router.find_missing(digests)),
-            None => self.bootstrap.find_missing(digests),
+        match (self.routing(), &self.packs) {
+            (Some(router), None) => Box::pin(router.find_missing(digests)),
+            (Some(router), Some(packs)) => Box::pin(async move {
+                let primary = Primary(router);
+                let layered = Layered {
+                    packs,
+                    rest: &primary,
+                };
+                layered.find_missing(digests).await
+            }),
+            (None, _) => self.bootstrap.find_missing(digests),
         }
     }
 
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<bytes::Bytes>> {
-        match self.routing() {
-            Some(router) => Box::pin(router.read_blob(digest)),
-            None => self.bootstrap.read_blob(digest),
+        match (self.routing(), &self.packs) {
+            (Some(router), None) => Box::pin(router.read_blob(digest)),
+            (Some(router), Some(packs)) => Box::pin(async move {
+                let primary = Primary(router);
+                let layered = Layered {
+                    packs,
+                    rest: &primary,
+                };
+                layered.read_blob(digest).await
+            }),
+            (None, _) => self.bootstrap.read_blob(digest),
         }
     }
 
@@ -392,9 +464,16 @@ impl Plane for RoutedPlane {
     }
 
     fn walk_inputs(&self, root: Digest) -> BoxFuture<'_, Answer<Walked>> {
-        match self.routing() {
-            Some(router) => Box::pin(async move { walk(router, root, &self.trees).await }),
-            None => self.bootstrap.walk_inputs(root),
+        match (self.routing(), &self.packs) {
+            (Some(router), None) => Box::pin(async move { walk(router, root, &self.trees).await }),
+            (Some(router), Some(packs)) => Box::pin(async move {
+                let layered = Layered {
+                    packs,
+                    rest: router,
+                };
+                walk(&layered, root, &self.trees).await
+            }),
+            (None, _) => self.bootstrap.walk_inputs(root),
         }
     }
 
