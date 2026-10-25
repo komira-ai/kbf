@@ -132,6 +132,8 @@ pub mod serve;
 mod serve_goaway_tests;
 #[cfg(test)]
 mod serve_remote_tests;
+#[cfg(test)]
+mod serve_start_tests;
 mod size_key;
 pub mod stamp;
 mod stand;

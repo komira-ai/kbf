@@ -963,8 +963,11 @@ date. A corrupt `deny/` row (one whose key is not `deny/<serial|spki-sha256|node
 makes every refresh fail, so three sweeps after it appears the worker listener refuses everyone,
 and the log says `membership refresh` failed. Repair: read the key from the log or list the
 `deny/` rows in the state store, delete the bad row (or re-add the entry with
-`POST /v1/denied`, after deleting it), and the next sweep readmits everyone not denied. A revoke
-whose refresh failed is enforced at the next successful sweep.
+`POST /v1/denied`, after deleting it), and the next sweep readmits everyone not denied. If the refresh that follows a revoke fails, the failure is logged and the revoke still
+answers; the worker listener then enforces it from the next successful sweep, within one beat.
+A deny written by another frontend is seen within one sweep. A frontend refreshes once before
+it serves, so a restart does not refuse daemons until the first sweep; if that refresh fails
+it logs an error and starts, and the rule above applies.
 A revoked node no longer keeps working until its certificate expires. Taking its rows off the
 deny list (`DELETE /v1/denied?entry=...`, one call per entry the revoke listed) readmits the
 node, but a revoked node's id is burned for enrollment. Behind `--proxy-auth-file` only the
