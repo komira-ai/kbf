@@ -2,8 +2,22 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::BoxStream;
 
 use crate::Error;
+
+/// The body of a part of a multipart upload, as the chunks it arrives in, so that a part of any
+/// size is stored without being held in memory whole.
+///
+/// A chunk that is an error ends the body: the backend stores nothing of the part and gives
+/// that error.
+pub type PartBody<'a> = BoxStream<'a, Result<Bytes, Error>>;
+
+/// The error of a multipart call that a backend does not override.
+fn not_supported(call: &str) -> Error {
+    let text = format!("{call}: this backend does not do multipart uploads");
+    Error::Unsupported(text)
+}
 
 /// A byte range to read: `len` bytes from `offset`.
 ///
@@ -105,7 +119,8 @@ fn is_after(key: &str, start_after: Option<&str>) -> bool {
 ///
 /// An implementation over a network bounds each call with a timeout of its own: the proxy
 /// and the reconciler wait for the calls they make, and a call that never returns stops the
-/// copies to the cold tier and the deletes behind it.
+/// copies to the cold tier and the deletes behind it. The exception is [`Backend::upload_part`],
+/// whose time is set by the client that sends the part (see there).
 #[async_trait]
 pub trait Backend: Send + Sync {
     /// Writes an object, only if the key does not exist (`If-None-Match: *`).
@@ -148,7 +163,9 @@ pub trait Backend: Send + Sync {
     ///
     /// The last key of a page is the continuation token of the next one, and a page of fewer
     /// than `max_keys` objects is the last. The provided implementation cuts the whole
-    /// listing; a backend over a network lists a page at a time instead.
+    /// listing; a backend over a network lists a page at a time instead, and one whose store
+    /// caps a page (S3 gives at most 1000 keys) reads further pages until it has `max_keys`
+    /// objects or the listing ends, because a caller takes a short page for the last.
     async fn list_page(
         &self,
         prefix: &str,
@@ -162,5 +179,80 @@ pub trait Backend: Send + Sync {
             .take(max_keys)
             .collect();
         Ok(page)
+    }
+
+    /// Starts a multipart upload of an object `key`, and gives the id of the upload.
+    ///
+    /// The four calls of a multipart upload (this one, [`Backend::upload_part`],
+    /// [`Backend::complete_upload`] and [`Backend::abort_upload`]) are provided: a backend
+    /// that does not override them answers each with [`Error::Unsupported`]. A backend that
+    /// does keeps the parts of an upload apart from the objects (they are not listed and not
+    /// read), and the id names an upload of one key only. A backend may refuse a key it cannot
+    /// store at once (the directory backend does, for a key that is empty or too long to be a
+    /// file name); a key it would take is not looked at again until the upload is completed.
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] unless the backend does multipart uploads. [`Error::Reserved`]
+    /// for a key the backend keeps for itself. [`Error::Other`] for a key it cannot store.
+    async fn create_upload(&self, _key: &str) -> Result<String, Error> {
+        Err(not_supported("create_upload"))
+    }
+
+    /// Stores the part `number` of the upload `id` of `key` from `body`, in place of the part
+    /// of that number if there is one, and gives the part's content tag, which a completion
+    /// names.
+    ///
+    /// The body is read a chunk at a time and written as it arrives; an implementation does not
+    /// hold the whole part in memory (the in-memory backend of the tests does). A body that
+    /// ends with an error stores nothing, and the call gives that error.
+    ///
+    /// The time of the call is set by the client that sends the part, so a bound on it counts
+    /// the time with no chunk taken, not the time of the whole call, which would cut a client
+    /// that is slow and steady. The server already bounds the wait for each chunk of a body.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] if no upload `id` of `key` is open. [`Error::Unsupported`] unless
+    /// the backend does multipart uploads. The error of `body`, if it ends with one.
+    async fn upload_part(
+        &self,
+        _key: &str,
+        _id: &str,
+        _number: u32,
+        _body: PartBody<'_>,
+    ) -> Result<String, Error> {
+        Err(not_supported("upload_part"))
+    }
+
+    /// Completes the upload `id` of `key`: creates the object `key` from the parts named, in
+    /// the order given, which is ascending by part number, each with the content tag
+    /// [`Backend::upload_part`] gave it. Gives the content tag of the new object, which
+    /// [`Backend::head`] gives it too, and which is the tag a [`Backend::put`] of the same bytes
+    /// gives (not an S3 multipart ETag), since the reconciler compares the tags of the objects
+    /// of the two tiers to tell that a copy is the same. The parts and the upload are gone once
+    /// the object is created.
+    ///
+    /// Like [`Backend::put`] the completion only creates: where the key exists the upload is
+    /// left open.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] if no upload `id` of `key` is open. [`Error::InvalidPart`] if a part
+    /// named was not uploaded or has another content tag. [`Error::AlreadyExists`] if the key
+    /// exists. [`Error::Unsupported`] unless the backend does multipart uploads.
+    async fn complete_upload(
+        &self,
+        _key: &str,
+        _id: &str,
+        _parts: &[(u32, String)],
+    ) -> Result<String, Error> {
+        Err(not_supported("complete_upload"))
+    }
+
+    /// Drops the upload `id` of `key` and the parts it holds.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] if no upload `id` of `key` is open. [`Error::Unsupported`] unless
+    /// the backend does multipart uploads.
+    async fn abort_upload(&self, _key: &str, _id: &str) -> Result<(), Error> {
+        Err(not_supported("abort_upload"))
     }
 }

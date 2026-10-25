@@ -186,6 +186,11 @@ fn errors_say_what_happened() {
         "object k does not have the expected content tag",
     );
     says(&Error::Full("hot".to_owned()), "backend is full: hot");
+    says(
+        &Error::InvalidPart("part 3".to_owned()),
+        "invalid part: part 3",
+    );
+    says(&Error::Unsupported("no".to_owned()), "not supported: no");
     let reserved = Error::Reserved("_tiering/x".to_owned());
     says(&reserved, "key _tiering/x is under a reserved prefix");
     says(&Error::Other("odd".to_owned()), "backend error: odd");
