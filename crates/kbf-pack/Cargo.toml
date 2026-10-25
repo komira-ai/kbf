@@ -1,0 +1,38 @@
+[package]
+name = "kbf-pack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+# The reads of one call that are in flight at once (`buffer_unordered`).
+futures.workspace = true
+# The names of the read cache's files: the hash of a blob in hex.
+hex.workspace = true
+# `ObjectStore`: the create-only write and the ranged read of a pack object.
+kbf-objstore.workspace = true
+# The segment layout of a pack: the footer builder and the record checksum.
+kbf-segments.workspace = true
+# `PackIndex`: where the write rule records a pack and where the reader finds a blob.
+kbf-state.workspace = true
+# `Digest`, the key of a segment's index.
+kbf-types.workspace = true
+thiserror.workspace = true
+# `rt`, to run the blocking index and cache calls off the async worker threads.
+tokio = { workspace = true, features = ["rt"] }
+# A write that failed and a cache that could not keep a blob are logged, not returned.
+tracing.workspace = true
+
+[dev-dependencies]
+# The in-memory index the tests record packs in.
+kbf-state = { workspace = true, features = ["test-support"] }
+# `TestDir`, the cache directories of the tests.
+kbf-testkit.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true
