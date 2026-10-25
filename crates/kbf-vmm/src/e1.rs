@@ -196,24 +196,43 @@ fn observe(ctx: &Ctx<'_>, vms: &mut [Vm], arms: &mut [Arm]) -> Option<String> {
     sample_all(ctx, vms, arms).or(table_error)
 }
 
-/// Asks every guest to shut down at once, then gives each up to the shutdown timeout, so
-/// that a guest's disk is flushed before the clone is harvested; a guest that does not
-/// obey is force-stopped. The helper first sends the guest a `shutdown` command over vsock
-/// (a macOS guest at the login window ignores the power-button request) and, when no ack
-/// comes, falls back to `requestStopWithError`, not the framework's force stop.
+/// Asks every guest to shut down at once, then waits for all of them together, up to one
+/// shutdown timeout in all, so that a guest's disk is flushed before the clone is
+/// harvested; a guest that does not obey is force-stopped. The helper first sends the
+/// guest a `shutdown` command over vsock (a macOS guest at the login window ignores the
+/// power-button request) and, when no ack comes, falls back to `requestStopWithError`, not
+/// the framework's force stop. Each VM's time is measured from its own request to the
+/// moment it was seen stopped, not from when the host got round to waiting for it.
 fn stop_gracefully(ctx: &Ctx<'_>, vms: &mut [Vm], arms: &mut [Arm]) {
-    for vm in vms.iter_mut().filter(|vm| vm.ended.is_none()) {
-        vm.request_shutdown();
-    }
-    for (vm, arm) in vms.iter_mut().zip(arms.iter_mut()) {
-        if vm.ended.is_some() {
-            continue;
+    let mut asked: Vec<Option<u64>> = Vec::new();
+    for vm in vms.iter_mut() {
+        let live = vm.ended.is_none();
+        if live {
+            vm.request_shutdown();
         }
-        let asked = vm.ms();
-        let how = vm.finish_shutdown(&ctx.timing);
+        asked.push(live.then(|| vm.ms()));
+    }
+    let deadline = Instant::now() + ctx.timing.shutdown_timeout;
+    let mut stopped: Vec<Option<u64>> = vec![None; vms.len()];
+    loop {
+        for (i, vm) in vms.iter_mut().enumerate() {
+            if asked[i].is_some() && stopped[i].is_none() && vm.has_exited() {
+                stopped[i] = Some(vm.ms());
+            }
+        }
+        let waiting = (0..vms.len()).any(|i| asked[i].is_some() && stopped[i].is_none());
+        if !waiting || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(ctx.timing.tick);
+    }
+    for (i, (vm, arm)) in vms.iter_mut().zip(arms.iter_mut()).enumerate() {
+        let Some(asked) = asked[i] else { continue };
+        let how = vm.finish_shutdown(&ctx.timing, Duration::ZERO);
+        let seen = stopped[i].unwrap_or_else(|| vm.ms());
         arm.stop = Some(Stop {
             how,
-            ms: vm.ms().saturating_sub(asked),
+            ms: seen.saturating_sub(asked),
             command: vm.shutdown_command(),
         });
     }
@@ -698,6 +717,48 @@ mod tests {
         sys.script(Script::booted().then(Poll::Event(Event::Stopped { ms: 7 })));
         let r = e1(&guest_ctx(&sys, &work));
         assert_eq!(arm(&r, 0)["stop"]["how"], "helper killed");
+    }
+
+    /// Catches a stop time measured from when the host got round to waiting for the arm
+    /// instead of from its own request (run 9: the second arm reported 0 ms after waiting
+    /// behind the first one's 6.3 s). Both guests take 150 ms to stop after the request, so
+    /// both report at least that, and the guests are waited for together: two guests that
+    /// both ignore the request cost one shutdown timeout in all, not two.
+    #[test]
+    fn each_guests_stop_time_runs_from_its_own_request_and_the_wait_is_one_timeout() {
+        let slow = Duration::from_millis(150);
+        let work = work_with_base("e1-stop-times");
+        let sys = FakeSystem::new();
+        sys.script(Script::booted().acking_shutdown().stopping_after(slow));
+        sys.script(Script::booted().acking_shutdown().stopping_after(slow));
+        let mut c = guest_ctx(&sys, &work);
+        c.timing.shutdown_timeout = Duration::from_secs(2);
+        let r = e1(&c);
+        for i in 0..2 {
+            let stop = &arm(&r, i)["stop"];
+            assert_eq!(stop["how"], "guest shut down (vsock)", "arm {i}");
+            let ms = stop["ms"].as_u64().expect("ms");
+            assert!(ms >= 150, "arm {i}: {ms} ms");
+            assert!(ms < 1500, "arm {i}: {ms} ms");
+        }
+
+        let work = work_with_base("e1-stop-one-timeout");
+        let sys = FakeSystem::new();
+        sys.script(Script::booted().deaf());
+        sys.script(Script::booted().deaf());
+        let mut c = guest_ctx(&sys, &work);
+        c.timing.shutdown_timeout = Duration::from_millis(300);
+        let began = Instant::now();
+        let r = e1(&c);
+        let took = began.elapsed();
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+        assert!(took < Duration::from_millis(580), "{took:?}");
+        for i in 0..2 {
+            assert_eq!(
+                arm(&r, i)["stop"]["how"],
+                "force-stopped after the guest did not shut down"
+            );
+        }
     }
 
     /// Catches an arm that has already written its marker being watched (and its helper

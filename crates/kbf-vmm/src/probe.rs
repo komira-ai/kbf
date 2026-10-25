@@ -313,13 +313,18 @@ impl Vm {
         self.proc.request_shutdown();
     }
 
-    /// Waits up to `t.shutdown_timeout` for the helper to exit because the guest shut
+    /// Whether the helper has exited, without waiting.
+    pub fn has_exited(&mut self) -> bool {
+        self.proc.wait_gone(Duration::ZERO)
+    }
+
+    /// Waits up to `wait` for the helper to exit because the guest shut
     /// down, then falls back to [`stop`](Self::stop) (a force stop, then SIGKILL). How
     /// the VM ended is the answer, and whether the guest acked the vsock command (the
     /// helper's `shutdown-command` event) is part of it; the guest's disk is flushed only
     /// after a shutdown.
-    pub fn finish_shutdown(&mut self, t: &Timing) -> StopKind {
-        let gone = self.proc.wait_gone(t.shutdown_timeout);
+    pub fn finish_shutdown(&mut self, t: &Timing, wait: Duration) -> StopKind {
+        let gone = self.proc.wait_gone(wait);
         self.drain_events();
         let acked = self.shutdown_command().is_some_and(|(acked, _)| acked);
         if gone {

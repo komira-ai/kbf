@@ -27,8 +27,9 @@
 //! program is run by a [`Runner`], so the whole flow runs in unit tests on any OS. The
 //! macOS listener is `shutdown_host`.
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::frame::{Frame, Kind, read_frame_within, write_frame};
 
@@ -43,6 +44,9 @@ pub const MAX_COMMAND_FRAME_BYTES: usize = 256;
 pub const PROGRAM: &str = "/sbin/shutdown";
 /// Its arguments: halt, now.
 pub const ARGS: [&str; 2] = ["-h", "now"];
+/// How long the whole frame has to arrive, from the first read. The socket's per-read
+/// timeout alone lets a peer holding the one connection slot send a byte every few seconds.
+pub const FRAME_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Runs a program by `exec`, no shell.
 pub trait Runner {
@@ -105,15 +109,46 @@ pub enum Served {
     Dropped,
 }
 
-/// Answers the one frame on `stream`: acknowledges the shutdown command and runs it, or
-/// refuses.
+/// A reader that fails once its deadline has passed, whatever the stream does.
+struct Deadline<'a, S> {
+    inner: &'a mut S,
+    until: Instant,
+}
+
+impl<S: Read> Read for Deadline<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if Instant::now() >= self.until {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the frame did not arrive within its deadline",
+            ));
+        }
+        self.inner.read(buf)
+    }
+}
+
+/// [`handle_within`] with [`FRAME_DEADLINE`].
 pub fn handle<S: Read + Write, R: Runner>(stream: &mut S, runner: &R) -> Served {
+    handle_within(stream, runner, FRAME_DEADLINE)
+}
+
+/// Answers the one frame on `stream`, which has `deadline` to arrive: acknowledges the
+/// shutdown command and runs it, or refuses.
+pub fn handle_within<S: Read + Write, R: Runner>(
+    stream: &mut S,
+    runner: &R,
+    deadline: Duration,
+) -> Served {
     let refuse = |stream: &mut S, name: &str, why: String| {
         // Best effort: the peer may be gone.
         let _ = write_frame(stream, &Frame::new(Kind::Refused, name, &why));
         Served::Refused(why)
     };
-    match read_frame_within(stream, MAX_COMMAND_FRAME_BYTES) {
+    let mut reader = Deadline {
+        inner: &mut *stream,
+        until: Instant::now() + deadline,
+    };
+    match read_frame_within(&mut reader, MAX_COMMAND_FRAME_BYTES) {
         Ok(Some(frame)) if frame == Frame::new(Kind::Shutdown, NAME, "") => {
             let acked = write_frame(stream, &Frame::new(Kind::Ack, NAME, "")).is_ok();
             match runner.run(PROGRAM, &ARGS) {
@@ -384,6 +419,42 @@ mod tests {
 
     fn encode_bytes(f: &Frame) -> Vec<u8> {
         crate::frame::encode(f).expect("encode")
+    }
+
+    /// Catches a peer that drips the frame a byte at a time, each inside the socket's
+    /// per-read timeout, and so holds the only connection for as long as it likes: past
+    /// the deadline the read fails, the peer is refused, and nothing runs.
+    #[test]
+    fn a_frame_that_arrives_too_slowly_is_refused_and_nothing_runs() {
+        struct Drip(Cursor<Vec<u8>>, Rc<RefCell<Vec<u8>>>);
+        impl Read for Drip {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(10));
+                self.0.read(&mut buf[..1])
+            }
+        }
+        impl Write for Drip {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.1.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let written = Rc::new(RefCell::new(Vec::new()));
+        let mut p = Drip(Cursor::new(encode_bytes(&command())), written.clone());
+        let runner = Fake::new(&written);
+        let served = handle_within(&mut p, &runner, Duration::from_millis(100));
+        assert_eq!(
+            served,
+            Served::Refused("stream error: the frame did not arrive within its deadline".into())
+        );
+        assert!(runner.calls.borrow().is_empty());
+        // The same frame at the same pace is served when the deadline allows it.
+        let mut p = Drip(Cursor::new(encode_bytes(&command())), written.clone());
+        let served = handle_within(&mut p, &runner, Duration::from_secs(30));
+        assert_eq!(served, Served::Shutdown { acked: true });
     }
 
     /// Catches a peer that connects and says nothing being treated as a command.

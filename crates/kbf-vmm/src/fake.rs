@@ -36,6 +36,8 @@ pub struct Script {
     /// What the helper reports about its vsock `shutdown` command when asked to shut the
     /// guest down: whether the guest acked, and why not. `None`: nothing is reported.
     pub shutdown_command: Option<(bool, String)>,
+    /// How long after the shutdown request an obeying guest takes to stop.
+    pub gone_after: Duration,
     /// What the helper's log tail says.
     pub log: Option<String>,
 }
@@ -51,6 +53,7 @@ impl Script {
             exits_on_stop: true,
             obeys_shutdown: true,
             shutdown_command: None,
+            gone_after: Duration::ZERO,
             log: None,
         }
     }
@@ -74,6 +77,7 @@ impl Script {
             exits_on_stop: true,
             obeys_shutdown: true,
             shutdown_command: None,
+            gone_after: Duration::ZERO,
             log: None,
         }
     }
@@ -111,6 +115,12 @@ impl Script {
         self
     }
 
+    /// A guest that takes `after` to stop once asked to shut down.
+    pub fn stopping_after(mut self, after: Duration) -> Self {
+        self.gone_after = after;
+        self
+    }
+
     /// A guest that ignores a shutdown request.
     pub fn deaf(mut self) -> Self {
         self.obeys_shutdown = false;
@@ -142,6 +152,9 @@ pub struct FakeProc {
     exits_on_stop: bool,
     obeys_shutdown: bool,
     shutdown_command: Option<(bool, String)>,
+    gone_after: Duration,
+    /// When the shutdown was requested.
+    shutdown_at: std::time::Instant,
     log: Option<String>,
 }
 
@@ -178,6 +191,7 @@ impl VmProcess for FakeProc {
     }
     fn request_shutdown(&mut self) {
         self.shutdown_asked = true;
+        self.shutdown_at = std::time::Instant::now();
         if let Some((acked, detail)) = self.shutdown_command.take() {
             self.events.push_back(Poll::Event(Event::ShutdownCommand {
                 acked,
@@ -189,10 +203,16 @@ impl VmProcess for FakeProc {
     fn request_stop(&mut self) {
         self.stop_asked = true;
     }
-    fn wait_gone(&mut self, _wait: Duration) -> bool {
-        self.killed
-            || (self.shutdown_asked && self.obeys_shutdown)
-            || (self.stop_asked && self.exits_on_stop)
+    fn wait_gone(&mut self, wait: Duration) -> bool {
+        if self.killed || (self.stop_asked && self.exits_on_stop) {
+            return true;
+        }
+        if !(self.shutdown_asked && self.obeys_shutdown) {
+            return false;
+        }
+        let left = self.gone_after.saturating_sub(self.shutdown_at.elapsed());
+        std::thread::sleep(left.min(wait));
+        self.shutdown_at.elapsed() >= self.gone_after
     }
 }
 
@@ -351,6 +371,8 @@ impl System for FakeSystem {
             exits_on_stop: script.exits_on_stop,
             obeys_shutdown: script.obeys_shutdown,
             shutdown_command: script.shutdown_command,
+            gone_after: script.gone_after,
+            shutdown_at: std::time::Instant::now(),
             log: script.log,
         }))
     }

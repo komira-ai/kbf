@@ -205,6 +205,9 @@ fn fail(stage: &str, message: String, code: Option<String>) -> Result<(), String
 
 /// How long the guest's daemon has to answer the `shutdown` command (connect, send, ack).
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `connectToPort` has to call its completion handler before the helper gives up
+/// on the command and falls back to the stop request.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Asks the guest to shut down: first the `shutdown` command over vsock to the guest's
 /// daemon (`guest_command`), because a macOS guest at the login window ignores the
@@ -235,6 +238,17 @@ fn request_guest_shutdown(
             command_failed("the VM has no virtio socket device".to_owned(), &q, &h, ms);
             return;
         };
+        // Whichever of the completion handler and the timer below settles first decides; the
+        // other does nothing. Without the timer a handler that never fires would leave the
+        // guest with neither the command nor the stop request.
+        let settled = Arc::new(AtomicBool::new(false));
+        let (timer_settled, tq, th) = (settled.clone(), q.clone(), h.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(CONNECT_TIMEOUT);
+            if !timer_settled.swap(true, Ordering::SeqCst) {
+                command_failed("connect: no completion".to_owned(), &tq, &th, ms);
+            }
+        });
         let (q2, h2) = (q.clone(), h.clone());
         let block = RcBlock::new(
             move |conn: *mut VZVirtioSocketConnection, err: *mut NSError| {
