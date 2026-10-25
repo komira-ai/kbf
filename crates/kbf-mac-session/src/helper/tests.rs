@@ -71,6 +71,7 @@ pub(super) fn rig_vm_with(
         serial: "SERIAL1".to_owned(),
         session: SessionPaths::under(&dir),
         scan: crate::scan::ScanSettings::under(&dir),
+        image: crate::helper::ImageSettings::under(&dir),
         vm_user: vm_user.map(|name| crate::lease::VmUser::new(name).unwrap()),
     };
     let ledger = Ledger::open(&dir.join("ledger")).unwrap();

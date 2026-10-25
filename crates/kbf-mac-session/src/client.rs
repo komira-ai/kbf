@@ -173,6 +173,40 @@ impl Client {
         }
     }
 
+    /// `image-setup`: as root, writes the guest's first-boot files into the base image
+    /// bundle `bundle` (a path directly inside the helper's images directory) and
+    /// returns what `kbf-vmm` reported.
+    ///
+    /// # Errors
+    /// The call failed or was refused (a bundle the helper will not touch, no VM user,
+    /// or `kbf-vmm` failed).
+    pub fn image_setup(&self, bundle: &str) -> Result<String, ClientError> {
+        let request = Request::ImageSetup {
+            bundle: bundle.to_owned(),
+        };
+        match self.call(&request, &[])?.1 {
+            Reply::Imaged { report } => Ok(report),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// `image-harvest`: as root, copies the diagnostics allowlist out of the stopped
+    /// guest bundle `bundle` into the new directory `out` (both directly inside the
+    /// images directory) and returns what `kbf-vmm` reported.
+    ///
+    /// # Errors
+    /// The call failed or was refused.
+    pub fn image_harvest(&self, bundle: &str, out: &str) -> Result<String, ClientError> {
+        let request = Request::ImageHarvest {
+            bundle: bundle.to_owned(),
+            out: out.to_owned(),
+        };
+        match self.call(&request, &[])?.1 {
+            Reply::Imaged { report } => Ok(report),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// `kill-uid`: returns once no process of the lease user is left.
     ///
     /// # Errors

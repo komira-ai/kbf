@@ -70,6 +70,12 @@ pub trait System {
     /// # Errors
     /// The call failed (`EXDEV` across volumes, `ENOTSUP` off APFS, `EEXIST`).
     fn clonefile(&self, src: &Path, dst: &Path) -> io::Result<()>;
+    /// Clears the user-immutable flag (`uchg`) on `path`, which a clone of a sealed base
+    /// keeps; a path without the flag is left alone. The caller owns `path`.
+    ///
+    /// # Errors
+    /// The file could not be examined or the flag could not be cleared.
+    fn clear_immutable(&self, path: &Path) -> io::Result<()>;
     /// The data representation of a new `VZMacMachineIdentifier`.
     ///
     /// # Errors
