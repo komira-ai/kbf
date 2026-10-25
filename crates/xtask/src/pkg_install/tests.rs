@@ -388,9 +388,16 @@ impl World {
                 format!("Started {unit} - the unit."),
             ]
         } else {
-            vec![format!(
-                "{unit} - the unit was skipped because of an unmet condition check (ConditionPathExists={path})."
-            )]
+            // Each distro's systemd words the skip its own way.
+            vec![if self.deb {
+                format!(
+                    "{unit} - the unit was skipped because of an unmet condition check (ConditionPathExists={path})."
+                )
+            } else {
+                format!(
+                    "{unit} - the unit skipped, unmet condition check ConditionPathExists={path}"
+                )
+            }]
         };
         for line in lines {
             self.journal.push((unit.to_owned(), line));
