@@ -141,7 +141,7 @@ const DESCRIPTION: &str =
 /// `depends`).
 fn relations() -> String {
     format!(
-        "recommends:\n{}suggests:\n{}overrides:\n  rpm:\n    recommends:\n{}    suggests:\n{}  deb:\n    replaces:\n{}",
+        "depends:\n{}suggests:\n{}overrides:\n  rpm:\n    recommends:\n{}    suggests:\n{}  deb:\n    replaces:\n{}",
         list(&DEB_RECOMMENDS, "  "),
         list(&DEB_SUGGESTS, "  "),
         list(&RPM_RECOMMENDS, "      "),
