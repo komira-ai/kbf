@@ -52,7 +52,9 @@ impl Listing<'_> {
         let mut xml = format!("{PROLOG}<ListBucketResult xmlns=\"{NAMESPACE}\">");
         xml.push_str(&element("Name", &bucket));
         xml.push_str(&element("Prefix", &prefix));
-        xml.push_str(&format!("<KeyCount>{count}</KeyCount><MaxKeys>{max_keys}</MaxKeys>"));
+        xml.push_str(&format!(
+            "<KeyCount>{count}</KeyCount><MaxKeys>{max_keys}</MaxKeys>"
+        ));
         xml.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
         xml.push_str(&next_token(self.next.as_deref()));
         for object in self.objects {

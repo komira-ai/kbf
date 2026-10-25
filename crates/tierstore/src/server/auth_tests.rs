@@ -178,9 +178,8 @@ fn a_request_without_a_signature_is_refused() {
 #[test]
 fn a_header_that_is_not_sigv4_is_malformed() {
     let signed = "SignedHeaders=host;x-amz-content-sha256;x-amz-date";
-    let with = |scope: &str| {
-        format!("AWS4-HMAC-SHA256 Credential={scope}, {signed}, Signature=abcdef")
-    };
+    let with =
+        |scope: &str| format!("AWS4-HMAC-SHA256 Credential={scope}, {signed}, Signature=abcdef");
     let scope = "AKIDEXAMPLE/20270115/us-east-1/s3/aws4_request";
     let cases = [
         "Basic abc".to_owned(),

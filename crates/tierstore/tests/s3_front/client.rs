@@ -194,7 +194,10 @@ async fn only_the_configured_key_is_served() {
     assert!(text.contains("<Code>AccessDenied</Code>"), "{text}");
     assert!(h.hot_mem.get("cas/denied", None).await.is_err());
     let waiting = h.store(CONDITIONAL);
-    waiting.wait_answering(Duration::from_secs(5)).await.unwrap();
+    waiting
+        .wait_answering(Duration::from_secs(5))
+        .await
+        .unwrap();
 }
 
 /// Asserts that a put the store has no room for, in either tier, is answered 503 `SlowDown`,

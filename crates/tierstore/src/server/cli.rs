@@ -196,7 +196,9 @@ fn read_key(path: &Path) -> Result<(String, String), String> {
     let secret = lines.next().filter(|line| !line.is_empty());
     match (id, secret) {
         (Some(id), Some(secret)) => Ok((id.to_owned(), secret.to_owned())),
-        _ => Err(fail("the id is on the first line and the secret on the second".to_owned())),
+        _ => Err(fail(
+            "the id is on the first line and the secret on the second".to_owned(),
+        )),
     }
 }
 
@@ -212,7 +214,10 @@ fn build(cli: &Cli) -> Result<Built, String> {
         return Err("--reconcile-interval must be shorter than --lease-ttl".to_owned());
     }
     if matches!(cli.bucket.as_str(), "healthz" | "readyz") {
-        return Err(format!("--bucket {:?} is the name of a probe path", cli.bucket));
+        return Err(format!(
+            "--bucket {:?} is the name of a probe path",
+            cli.bucket
+        ));
     }
     if cli.body_idle_timeout.is_zero() {
         return Err("--body-idle-timeout must be longer than zero".to_owned());

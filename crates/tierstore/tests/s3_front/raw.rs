@@ -69,7 +69,10 @@ async fn a_put_with_if_none_match_creates_once() {
     assert_eq!(second.headers()["x-amz-request-id"].len(), 16);
     let body = text(second).await;
     assert!(body.contains("<Code>PreconditionFailed</Code>"), "{body}");
-    assert!(body.contains("<Resource>/tier-bucket/k</Resource>"), "{body}");
+    assert!(
+        body.contains("<Resource>/tier-bucket/k</Resource>"),
+        "{body}"
+    );
     assert_eq!(h.hot_mem.get("k", None).await.unwrap(), "one");
 }
 
@@ -131,7 +134,9 @@ async fn requests_that_are_not_properly_signed_are_refused() {
     let unsigned = Client::new().get(&url).send().await.unwrap();
     assert_eq!(unsigned.status(), 403);
     assert!(text(unsigned).await.contains("<Code>AccessDenied</Code>"));
-    let basic = Client::new().get(&url).header("authorization", "Basic eDp5");
+    let basic = Client::new()
+        .get(&url)
+        .header("authorization", "Basic eDp5");
     let basic = basic.send().await.unwrap();
     assert_eq!(basic.status(), 403);
     assert!(text(basic).await.contains("AuthorizationHeaderMalformed"));

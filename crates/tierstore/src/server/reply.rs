@@ -37,7 +37,7 @@ pub(crate) fn answer(
         let value = HeaderValue::from_str(&header_text(value)).expect("printable ASCII");
         response
             .headers_mut()
-            .insert(HeaderName::from_static(*name), value);
+            .insert(HeaderName::from_static(name), value);
     }
     response
 }
@@ -93,8 +93,7 @@ impl S3Error {
     /// A request whose body took no byte for the idle timeout: the connection is closed.
     pub(crate) fn request_timeout(idle: Duration) -> Self {
         let text = format!("No byte of the request body arrived within {idle:?}.");
-        Self::new(StatusCode::BAD_REQUEST, "RequestTimeout", text)
-            .with("connection", "close")
+        Self::new(StatusCode::BAD_REQUEST, "RequestTimeout", text).with("connection", "close")
     }
 
     /// Whether this is the answer to a request that stalled.

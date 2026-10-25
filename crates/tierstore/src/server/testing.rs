@@ -187,7 +187,8 @@ impl Rig {
     /// Puts an object through the server, create-only.
     pub(super) async fn put(&self, key: &str, body: &[u8]) -> Reply {
         let uri = format!("/{BUCKET}/{key}");
-        self.send("PUT", &uri, &[("if-none-match", "*")], body).await
+        self.send("PUT", &uri, &[("if-none-match", "*")], body)
+            .await
     }
 
     /// Gets an object through the server, with a `Range` header if there is one.

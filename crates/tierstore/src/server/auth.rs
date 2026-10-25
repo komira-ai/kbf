@@ -153,7 +153,9 @@ fn canonical_request(parts: &Parts, auth: &Authorization<'_>, payload: &str) -> 
         .collect();
     let method = parts.method.as_str();
     let (path, query, signed) = (encode(&path, PATH), query.join("&"), names.join(";"));
-    Some(format!("{method}\n{path}\n{query}\n{headers}\n{signed}\n{payload}"))
+    Some(format!(
+        "{method}\n{path}\n{query}\n{headers}\n{signed}\n{payload}"
+    ))
 }
 
 fn keyed(key: &[u8]) -> Hmac<Sha256> {
@@ -215,7 +217,7 @@ pub(crate) fn verify(config: &ServerConfig, parts: &Parts) -> Result<String, Ref
     let mut mac = keyed(&key);
     mac.update(string_to_sign(stamp, &auth, &request).as_bytes());
     let signature = hex::decode(auth.signature).ok();
-    if !signature.is_some_and(|tag| mac.verify_slice(&tag).is_ok()) {
+    if signature.is_none_or(|tag| mac.verify_slice(&tag).is_err()) {
         return Err(MISMATCH);
     }
     Ok(payload.to_owned())

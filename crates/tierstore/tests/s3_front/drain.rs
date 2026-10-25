@@ -70,7 +70,10 @@ async fn the_drain_serves_through_the_wait_then_refuses_then_ends() {
     let answer = reading.await.unwrap();
     assert_eq!(status_of(&answer), 503);
     assert!(answer.contains("connection: close"), "{answer}");
-    assert!(answer.contains("<Code>ServiceUnavailable</Code>"), "{answer}");
+    assert!(
+        answer.contains("<Code>ServiceUnavailable</Code>"),
+        "{answer}"
+    );
     assert!(TcpStream::connect(h.addr).await.is_err());
     assert!(!h.served.is_finished());
 

@@ -79,9 +79,8 @@ pub fn sign(request: &Request<'_>, key_id: &str, secret: &str) -> Vec<(String, S
     let k_signing = hmac(&k_service, b"aws4_request");
     let signature = hex::encode(hmac(&k_signing, to_sign.as_bytes()));
     let credential = format!("Credential={key_id}/{scope}");
-    let authorization = format!(
-        "AWS4-HMAC-SHA256 {credential}, SignedHeaders={signed}, Signature={signature}"
-    );
+    let authorization =
+        format!("AWS4-HMAC-SHA256 {credential}, SignedHeaders={signed}, Signature={signature}");
     headers.push(("authorization".to_owned(), authorization));
     headers
 }

@@ -96,7 +96,9 @@ fn refuse_reserved(key: &str) -> Result<(), S3Error> {
 /// know, and a copy.
 fn refuse_unsupported(parts: &Parts, query: &Query) -> Result<(), S3Error> {
     if !query.only(&SUPPORTED) {
-        return Err(S3Error::unsupported("this query parameter is not supported"));
+        return Err(S3Error::unsupported(
+            "this query parameter is not supported",
+        ));
     }
     if header(&parts.headers, "x-amz-copy-source").is_some() {
         return Err(S3Error::unsupported("copying an object is not supported"));
@@ -142,7 +144,9 @@ fn names(parts: &Parts, name: &str, tag: &str) -> Option<bool> {
 fn conditional(parts: &Parts, key: &str, meta: &Meta) -> Result<Option<Answer>, S3Error> {
     let since = ["if-modified-since", "if-unmodified-since"];
     if since.iter().any(|name| parts.headers.contains_key(*name)) {
-        return Err(S3Error::unsupported("only If-Match and If-None-Match are supported"));
+        return Err(S3Error::unsupported(
+            "only If-Match and If-None-Match are supported",
+        ));
     }
     let if_match = names(parts, "if-match", &meta.tag);
     let if_none_match = names(parts, "if-none-match", &meta.tag);
@@ -286,7 +290,9 @@ impl Server {
         if meta.tag != tag.trim_matches('"') {
             return Err(S3Error::from(Error::PreconditionFailed(key.to_owned())));
         }
-        Err(S3Error::unsupported("objects are immutable and cannot be replaced"))
+        Err(S3Error::unsupported(
+            "objects are immutable and cannot be replaced",
+        ))
     }
 
     async fn delete_object(&self, key: &str) -> Result<Answer, S3Error> {
@@ -306,7 +312,9 @@ impl Server {
 
     async fn list_objects(&self, query: &Query) -> Result<Answer, S3Error> {
         if query.get("list-type") != Some("2") {
-            return Err(S3Error::unsupported("only ListObjectsV2 (list-type=2) is supported"));
+            return Err(S3Error::unsupported(
+                "only ListObjectsV2 (list-type=2) is supported",
+            ));
         }
         let prefix = query.get("prefix").unwrap_or_default();
         let max_keys = page_size(query)?;
@@ -354,7 +362,9 @@ impl Server {
         let parse = |text: &str| text.parse::<u32>().ok();
         let number = query.get("partNumber").and_then(parse);
         let (Some(id), Some(number)) = (id, number) else {
-            return Err(S3Error::invalid("an upload id and a part number are needed"));
+            return Err(S3Error::invalid(
+                "an upload id and a part number are needed",
+            ));
         };
         if !(1..=PART_LIMIT).contains(&number) {
             return Err(S3Error::invalid("a part number is from 1 to 10000"));
@@ -386,7 +396,11 @@ impl Server {
         let ascending = wanted.windows(2).all(|pair| pair[0].0 < pair[1].0);
         if !ascending {
             let text = "The parts must be listed in ascending order of their numbers.";
-            return Err(S3Error::new(StatusCode::BAD_REQUEST, "InvalidPartOrder", text));
+            return Err(S3Error::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidPartOrder",
+                text,
+            ));
         }
         let (backend, name, upload) = (Arc::clone(&self.backend), key.to_owned(), id.to_owned());
         let call = async move { backend.complete_upload(&name, &upload, &wanted).await };
