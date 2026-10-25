@@ -73,22 +73,26 @@ impl State {
     /// in it can be unlinked, and a flagged directory cannot be removed from its parent)
     /// until the last flag under it is cleared.
     fn chflags(&mut self, args: &[&str]) {
-        use std::os::unix::fs::PermissionsExt as _;
         let flag = args[1];
         for path in &args[2..] {
-            let path = PathBuf::from(path);
-            if flag == "uchg" {
-                self.immutable.insert(path.clone());
-            } else {
-                self.immutable.remove(&path);
-            }
-            if self.enforce_uchg {
-                let parent = path.parent().unwrap();
-                let held = self.immutable.iter().any(|p| p.parent() == Some(parent));
-                let mode = std::fs::metadata(parent).unwrap().permissions().mode();
-                let mode = if held { mode & !0o222 } else { mode | 0o200 };
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode)).unwrap();
-            }
+            self.set_flag(PathBuf::from(path), flag == "uchg");
+        }
+    }
+
+    /// Sets or clears `uchg` on `path` (and its effect, when `enforce_uchg` is on).
+    fn set_flag(&mut self, path: PathBuf, on: bool) {
+        use std::os::unix::fs::PermissionsExt as _;
+        if on {
+            self.immutable.insert(path.clone());
+        } else {
+            self.immutable.remove(&path);
+        }
+        if self.enforce_uchg {
+            let parent = path.parent().unwrap();
+            let held = self.immutable.iter().any(|p| p.parent() == Some(parent));
+            let mode = std::fs::metadata(parent).unwrap().permissions().mode();
+            let mode = if held { mode & !0o222 } else { mode | 0o200 };
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode)).unwrap();
         }
     }
 }
@@ -255,7 +259,20 @@ impl Host for FakeHost {
             | rustix::fs::OFlags::CLOEXEC;
         let to = rustix::fs::openat(dir, name, flags, rustix::fs::Mode::from_raw_mode(0o644))?;
         let mut from = std::fs::File::from(src.try_clone_to_owned()?);
-        io::copy(&mut from, &mut std::fs::File::from(to)).map(drop)
+        io::copy(&mut from, &mut std::fs::File::from(to))?;
+        // A clone of a file with `uchg` has it too.
+        let (source, target) = (fd_path(&src), fd_path(&dir).join(name));
+        let mut state = self.state();
+        if state.immutable.contains(&source) {
+            state.set_flag(target, true);
+        }
+        Ok(())
+    }
+
+    fn clear_user_flags(&self, file: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+        self.call("clear_user_flags", "clear_user_flags".to_owned())?;
+        self.state().set_flag(fd_path(&file), false);
+        Ok(())
     }
 
     fn boot_session(&self) -> io::Result<String> {
@@ -276,6 +293,11 @@ impl Host for FakeHost {
             "{PAUSES} pauses: a wait without a bound"
         );
     }
+}
+
+/// The path an open descriptor names (Linux).
+fn fd_path(fd: &impl std::os::fd::AsRawFd) -> PathBuf {
+    std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap()
 }
 
 /// A fresh scratch directory for one test. Under `/tmp` with a short name, not the

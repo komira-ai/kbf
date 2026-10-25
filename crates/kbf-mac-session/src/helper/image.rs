@@ -9,19 +9,22 @@
 //! - `image-setup <bundle>` opens each file of the bundle named in the staging directory
 //!   without following a link (plain files with a single link only, and at most 16 entries), and
 //!   clones each into a NEW directory in the images directory that the helper makes: root's,
-//!   mode 0700. A clone is a new inode (`fclonefileat`, O(1) on APFS), so a descriptor or a
+//!   mode 0700 (a clone of a file with `uchg` has it too, so every clone's user flags are
+//!   cleared at once, before it is chowned). A clone is a new inode (`fclonefileat`, O(1) on APFS), so a descriptor or a
 //!   mapping the VM user holds on its own disk image reaches nothing of the copy: a measured
 //!   Mac showed that a write descriptor opened before root's chown, chmod 0640 and `uchg`
 //!   keeps writing through all three, so taking the user's inodes in place cannot work. It
 //!   runs `kbf-vmm image setup --base <images>/<name> --guest-binary <guest>` on the copy,
 //!   which attaches the disk image and writes the guest's first-boot files into its Data
 //!   volume, and seals the copy: root's, directory mode 0750 and files 0640 with the VM
-//!   user's primary group, and `uchg` on the files, then the directory, from root, which the
+//!   user's primary group (every file `kbf-vmm` left in it too), and `uchg` on the files, then
+//!   the directory, from root, which the
 //!   VM user cannot clear. The user's original in staging is left alone (the user may remove
 //!   it). The VM user clones the base through its group; `kbf-vmm` clears `uchg` on each
 //!   clone, which is the user's own. A failure removes the copy (clearing `uchg` first when
-//!   it may be set: an immutable file cannot be unlinked), so no failure leaves an unsealed
-//!   base in the images directory.
+//!   it may be set, which is from the first clone on: an immutable file cannot be unlinked) and
+//!   removing every entry the directory holds, so no failure leaves an unsealed base in the
+//!   images directory; an entry that is not a regular file is left and named in the error.
 //!   That root attaches a disk image the user built is inherent to the verb: the copy defeats
 //!   the user changing the image after the helper took it, not what was in it.
 //! - `image-harvest <bundle> <out>` runs `kbf-vmm image harvest --bundle <bundle> --out
@@ -408,6 +411,7 @@ fn list_names(dir: &OwnedFd, name: &str) -> Result<Vec<String>, String> {
             names.push(file);
         }
     }
+    names.sort();
     if names.len() > MAX_ENTRIES {
         return Err(format!(
             "{name} holds more than {MAX_ENTRIES} entries; a bundle holds four files"
@@ -444,17 +448,28 @@ fn open_sources(dir: &OwnedFd, name: &str) -> Result<Vec<(String, OwnedFd)>, Str
 struct Copy {
     dir: OwnedFd,
     name: String,
-    /// The files made so far, in name order.
-    files: Vec<String>,
 }
 
 impl Copy {
+    /// The names in the copy, each a plain file: what `kbf-vmm` left, whatever it wrote.
+    fn plain_files(&self) -> Result<Vec<String>, String> {
+        let files = list_names(&self.dir, &self.name)?;
+        for file in &files {
+            let stat = statat(&self.dir, file.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(at(&format!("{}/{file}", self.name)))?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+                return Err(format!("{}/{file} is not a regular file", self.name));
+            }
+        }
+        Ok(files)
+    }
+
     /// Seals the files: root's, mode 0640, group `gid`. Each is opened without following
     /// a link.
-    fn seal_files(&self, gid: u32) -> Result<(), String> {
+    fn seal_files(&self, files: &[String], gid: u32) -> Result<(), String> {
         let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         let (uid, _) = mine();
-        for file in &self.files {
+        for file in files {
             let opened = openat(&self.dir, file.as_str(), flags, Mode::empty())
                 .map_err(at(&format!("opening {file}")))?;
             fchown(&opened, Some(uid), Some(Gid::from_raw(gid)))
@@ -550,20 +565,21 @@ impl Helper {
         ))?;
         let sources = open_sources(&original, &name)?;
         tracing::info!(bundle = %name, files = sources.len(), "image-setup: copying the bundle into the images directory");
-        let mut copy = Copy {
+        let copy = Copy {
             dir: new_private_dir(&images, &name)?,
             name: name.clone(),
-            files: Vec::new(),
         };
-        let flagged = std::cell::Cell::new(false);
+        // A clone of a flagged file is flagged, so the copy may carry `uchg` from its first
+        // file on: the undo always clears it.
         let done = self
-            .fill_copy(&mut copy, &sources)
-            .and_then(|()| self.seal_copy(&copy, role.account.gid, &flagged));
-        or_undo(
-            &format!("removing the copy {name} after a failure"),
-            done,
-            || self.remove_copy(&images, &copy, flagged.get()),
-        )
+            .fill_copy(&copy, &sources)
+            .and_then(|()| self.seal_copy(&copy, role.account.gid));
+        done.map_err(|why| {
+            match self.remove_copy(&images, &copy) {
+                Ok(()) => why,
+                Err(more) => format!("{why}; and the copy was not removed: {more}"),
+            }
+        })
         .inspect_err(|why| tracing::warn!(bundle = %name, "image-setup failed: {why}"))
         .inspect(|_| {
             tracing::info!(bundle = %name, gid = role.account.gid, "image-setup done; the base is sealed: root's, 0750/0640, uchg");
@@ -571,16 +587,19 @@ impl Helper {
     }
 
     /// Clones each source into the copy (new inodes owned by the helper, mode 0600).
-    fn fill_copy(&self, copy: &mut Copy, sources: &[(String, OwnedFd)]) -> Result<(), String> {
+    fn fill_copy(&self, copy: &Copy, sources: &[(String, OwnedFd)]) -> Result<(), String> {
         let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         let (uid, gid) = mine();
         for (file, source) in sources {
-            copy.files.push(file.clone());
             self.host
                 .clone_file(source.as_fd(), copy.dir.as_fd(), file)
                 .map_err(at(&format!("copying {file}")))?;
             let made = openat(&copy.dir, file.as_str(), flags, Mode::empty())
                 .map_err(at(&format!("opening the copy of {file}")))?;
+            // A clone of a file with `uchg` has it too, and root could not take the copy.
+            self.host
+                .clear_user_flags(made.as_fd())
+                .map_err(at(&format!("clearing the flags of the copy of {file}")))?;
             fchown(&made, Some(uid), Some(gid))
                 .map_err(at(&format!("taking the copy of {file}")))?;
             fchmod(&made, Mode::from_raw_mode(0o600))
@@ -589,45 +608,48 @@ impl Helper {
         Ok(())
     }
 
-    /// Runs `kbf-vmm image setup` on the copy and seals it (files and directory, then the
-    /// flags on the files and last on the directory). `flagged` is set before the first
-    /// `chflags`, so the undo knows whether `uchg` may be there.
-    fn seal_copy(
-        &self,
-        copy: &Copy,
-        gid: u32,
-        flagged: &std::cell::Cell<bool>,
-    ) -> Result<String, String> {
+    /// Runs `kbf-vmm image setup` on the copy and seals what is in it afterwards (files and
+    /// directory, then the flags on the files and last on the directory).
+    fn seal_copy(&self, copy: &Copy, gid: u32) -> Result<String, String> {
         let image = &self.settings.image;
         let path = image.dir.join(&copy.name);
         let base = ImageSettings::text(&path)?;
         let guest = ImageSettings::text(&image.guest)?;
         let report = self.run_vmm(&["image", "setup", "--base", base, "--guest-binary", guest])?;
-        copy.seal_files(gid)?;
+        let names = copy.plain_files()?;
+        copy.seal_files(&names, gid)?;
         copy.seal_dir(gid)?;
-        flagged.set(true);
-        let files: Vec<PathBuf> = copy.files.iter().map(|file| path.join(file)).collect();
+        let files: Vec<PathBuf> = names.iter().map(|file| path.join(file)).collect();
         self.chflags("uchg", &files)?;
         self.chflags("uchg", std::slice::from_ref(&path))?;
         Ok(report)
     }
 
-    /// Removes the copy: `uchg` cleared first when it may be set (an immutable file cannot
-    /// be unlinked, nor a directory holding one), then the files, then the directory. All
-    /// through the descriptor of the copy; the first error is returned.
-    fn remove_copy(&self, images: &OwnedFd, copy: &Copy, flagged: bool) -> Result<(), String> {
+    /// Removes the copy: `uchg` cleared first (an immutable file cannot be unlinked, nor a
+    /// directory holding one), then every entry the directory holds (what the helper cloned
+    /// and what `kbf-vmm` wrote), then the directory. All through the descriptor of the
+    /// copy. An entry that is not a regular file is left, and named in the error (and so the
+    /// directory, which is root's and 0700, stays); the first error is returned.
+    fn remove_copy(&self, images: &OwnedFd, copy: &Copy) -> Result<(), String> {
         let path = self.settings.image.dir.join(&copy.name);
-        let unflagged = if flagged {
-            let mut paths: Vec<PathBuf> = copy.files.iter().map(|file| path.join(file)).collect();
-            paths.push(path);
-            self.chflags("nouchg", &paths)
-        } else {
-            Ok(())
-        };
+        let names = list_names(&copy.dir, &copy.name)?;
+        let mut paths: Vec<PathBuf> = names.iter().map(|file| path.join(file)).collect();
+        paths.push(path);
+        let unflagged = self.chflags("nouchg", &paths);
         let mut removed = Ok(());
-        for file in &copy.files {
-            let gone = unlinkat(&copy.dir, file.as_str(), AtFlags::empty())
-                .map_err(at(&format!("removing the copy of {file}")));
+        for file in &names {
+            let stat = statat(&copy.dir, file.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(at(&format!("{}/{file}", copy.name)));
+            let gone = stat.and_then(|stat| {
+                if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+                    return Err(format!(
+                        "left {}/{file}: it is not a regular file",
+                        copy.name
+                    ));
+                }
+                unlinkat(&copy.dir, file.as_str(), AtFlags::empty())
+                    .map_err(at(&format!("removing {}/{file}", copy.name)))
+            });
             removed = removed.and(gone);
         }
         let dir = unlinkat(images, copy.name.as_str(), AtFlags::REMOVEDIR)
@@ -698,15 +720,29 @@ fn make_private_dir(images: &OwnedFd, name: &str) -> Result<(), String> {
 
 /// [`make_private_dir`], returning the directory's descriptor.
 fn new_private_dir(images: &OwnedFd, name: &str) -> Result<OwnedFd, String> {
+    new_dir_with(images, name, |made| {
+        let (uid, gid) = mine();
+        fchown(made, Some(uid), Some(gid)).map_err(at(&format!("taking {name}")))?;
+        fchmod(made, Mode::from_raw_mode(0o700)).map_err(at(&format!("locking {name}")))
+    })
+}
+
+/// Makes the new directory `name` in `images`, opens it and runs `finish` on it; if the
+/// open or `finish` fails the empty directory is removed again.
+fn new_dir_with(
+    images: &OwnedFd,
+    name: &str,
+    finish: impl FnOnce(&OwnedFd) -> Result<(), String>,
+) -> Result<OwnedFd, String> {
     mkdirat(images, name, Mode::from_raw_mode(0o700))
         .map_err(at(&format!("making {name} in the images directory")))?;
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let made =
-        openat(images, name, flags, Mode::empty()).map_err(at(&format!("opening {name}")))?;
-    let (uid, gid) = mine();
-    fchown(&made, Some(uid), Some(gid)).map_err(at(&format!("taking {name}")))?;
-    fchmod(&made, Mode::from_raw_mode(0o700)).map_err(at(&format!("locking {name}")))?;
-    Ok(made)
+    let finished = openat(images, name, flags, Mode::empty())
+        .map_err(at(&format!("opening {name}")))
+        .and_then(|made| finish(&made).map(|()| made));
+    or_undo(&format!("removing the empty {name}"), finished, || {
+        unlinkat(images, name, AtFlags::REMOVEDIR).map_err(at("removing"))
+    })
 }
 
 #[cfg(test)]

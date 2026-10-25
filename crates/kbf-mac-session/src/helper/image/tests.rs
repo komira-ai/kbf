@@ -162,6 +162,12 @@ impl Img {
         ]
     }
 
+    /// `chflags -h nouchg` on the files of the base `name`, then on the base: the undo.
+    fn unflag_command(&self, name: &str) -> String {
+        let files = FILES.map(|f| format!(" {}", self.path(&format!("{name}/{f}"))));
+        format!("{CHFLAGS} -h nouchg{} {}", files.concat(), self.path(name))
+    }
+
     /// Notes `look` of the filesystem at each program run, by the command's text.
     fn watch(&self, look: impl Fn() -> String + Send + 'static) -> Arc<Mutex<Vec<String>>> {
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -549,7 +555,10 @@ fn a_failed_setup_removes_the_copy_clearing_uchg_first() {
         "{why}"
     );
     gone(&img);
-    assert_eq!(img.commands(), [img.setup_command("base")]);
+    assert_eq!(
+        img.commands(),
+        [img.setup_command("base"), img.unflag_command("base")]
+    );
 
     img.rig.host.state().fail.insert("command");
     refused(
@@ -557,8 +566,9 @@ fn a_failed_setup_removes_the_copy_clearing_uchg_first() {
         "running kbf-vmm",
     );
     gone(&img);
-    assert_eq!(img.commands().len(), 2);
+    assert_eq!(img.commands().len(), 4);
     img.rig.host.state().fail.clear();
+    img.rig.host.state().log.clear();
 
     // The files flagged and the directory not: removal needs the flags cleared first.
     img.rig.host.state().enforce_uchg = true;
@@ -614,7 +624,12 @@ fn a_failed_copy_leaves_nothing_in_the_images_directory() {
     set_mode(&img.images, 0o755);
     assert!(!img.images.join("base").exists());
     img.as_built(&built);
-    assert!(img.commands().is_empty());
+    // Only the first attempt got as far as the copy, which may carry `uchg` from its first
+    // file on, so the undo cleared it (on the empty directory).
+    assert_eq!(
+        img.commands(),
+        [format!("{CHFLAGS} -h nouchg {}", img.path("base"))]
+    );
 }
 
 /// Catches: a bundle holding a subdirectory, a symlink or a hard link to a file
@@ -768,261 +783,6 @@ fn the_images_directory_must_be_closed_to_group_and_others() {
     assert!(img.commands().is_empty());
 }
 
-/// Catches: an object another user owns, or one group or others can write, counted as
-/// closed (the helper would leave it as it is and attach a disk image the user can write).
-#[test]
-fn only_the_helpers_own_unwritable_objects_are_closed() {
-    assert!(closed_by(0, 0, 0o750));
-    assert!(closed_by(0, 0, 0o640));
-    assert!(!closed_by(501, 0, 0o750));
-    assert!(!closed_by(0, 0, 0o770));
-    assert!(!closed_by(0, 0, 0o702));
-}
-
-/// Catches: an images directory owned by another user being trusted.
-#[test]
-fn an_images_directory_another_user_owns_is_refused() {
-    let mut stat = fstat(std::fs::File::open(".").unwrap()).unwrap();
-    stat.st_uid = rustix::process::geteuid().as_raw() + 1;
-    stat.st_mode = 0o755;
-    assert!(
-        closed_dir(&stat)
-            .unwrap_err()
-            .contains("not the helper's uid")
-    );
-}
-
-/// Catches: a harvest output directory that is not new, not root's or not mode 0700
-/// (readable by the VM user whose guest it was copied from), or outside the images
-/// directory; and the harvest not being what the helper builds. The happy path.
-#[test]
-fn harvest_makes_its_output_directory_0700_root_owned_inside_the_images_directory() {
-    let img = img("harvest");
-    let bundle = img.bundle("clone");
-    let out = img.images.join("out");
-    let watched = out.clone();
-    let seen = img.watch(move || {
-        let m = std::fs::metadata(&watched).unwrap();
-        format!("out {:o} {}", m.mode() & 0o7777, m.uid())
-    });
-    let command = img.harvest_command(&img.spath("clone"), "out");
-    img.answer(command.clone(), true, "{\"harvest\":1}", "");
-    let report = img
-        .rig
-        .helper
-        .image_harvest(&img.spath("clone"), &img.path("out"))
-        .unwrap();
-    assert_eq!(report, "{\"harvest\":1}");
-    let euid = rustix::process::geteuid().as_raw();
-    assert_eq!(
-        *seen.lock().unwrap(),
-        [format!("{command} => out 700 {euid}")]
-    );
-    let made = std::fs::metadata(&out).unwrap();
-    assert!(made.is_dir());
-    assert_eq!(made.mode() & 0o7777, 0o700);
-    assert_eq!(made.uid(), euid);
-    assert_eq!(made.gid(), rustix::process::getegid().as_raw());
-    assert_eq!(out.parent().unwrap(), img.images);
-    img.as_built(&bundle);
-    assert_eq!(img.commands().len(), 1);
-}
-
-/// Catches: a harvest into an existing name (a directory, a file, a link that would lead
-/// anywhere), into the sealed base it reads, or one that removes what was there.
-#[test]
-fn harvest_makes_only_a_new_output_directory() {
-    let img = img("harvest-new");
-    let bundle = img.bundle("clone");
-    let base = img.sealed("base");
-    std::fs::create_dir(img.images.join("taken")).unwrap();
-    std::fs::write(img.images.join("taken/keep"), "x").unwrap();
-    std::fs::write(img.images.join("file"), "x").unwrap();
-    symlink(img.rig.dir.join("elsewhere"), img.images.join("link")).unwrap();
-    for name in ["taken", "file", "link"] {
-        refused(
-            img.rig
-                .helper
-                .image_harvest(&img.spath("clone"), &img.path(name)),
-            "making",
-        );
-    }
-    refused(
-        img.rig
-            .helper
-            .image_harvest(&img.path("base"), &img.path("base")),
-        "must not be the bundle",
-    );
-    assert!(img.images.join("taken/keep").exists());
-    assert!(!img.rig.dir.join("elsewhere").exists());
-    assert!(img.commands().is_empty());
-    img.as_built(&bundle);
-    img.as_sealed(&base);
-}
-
-/// Catches: a failed harvest leaving an empty output directory behind (a retry would be
-/// refused), removing a partial copy a person may want, or leaving the bundle root's.
-#[test]
-fn a_failed_harvest_removes_its_empty_output_directory_and_returns_the_bundle() {
-    let img = img("harvest-fail");
-    let bundle = img.bundle("clone");
-    img.answer(
-        img.harvest_command(&img.spath("clone"), "out"),
-        false,
-        "",
-        "no volume",
-    );
-    refused(
-        img.rig
-            .helper
-            .image_harvest(&img.spath("clone"), &img.path("out")),
-        "kbf-vmm failed: no volume",
-    );
-    assert!(!img.images.join("out").exists());
-    img.as_built(&bundle);
-    // A partial copy stays.
-    let partial = img.images.join("out");
-    img.rig.host.state().on_command = Some(Box::new(move |_| {
-        std::fs::create_dir_all(partial.join("files")).unwrap();
-    }));
-    refused(
-        img.rig
-            .helper
-            .image_harvest(&img.spath("clone"), &img.path("out")),
-        "kbf-vmm failed",
-    );
-    assert!(img.images.join("out/files").is_dir());
-    img.as_built(&bundle);
-}
-
-/// Catches: a harvest of a kept clone giving it back as root's, or with another mode
-/// than it had.
-#[test]
-fn harvest_gives_a_clone_back_with_its_owner_and_modes() {
-    let img = img("harvest-owner");
-    let bundle = img.bundle("clone");
-    set_mode(&bundle, 0o770);
-    set_mode(&bundle.join("disk.img"), 0o660);
-    img.rig
-        .helper
-        .image_harvest(&img.spath("clone"), &img.path("out"))
-        .unwrap();
-    assert_eq!(mode(&bundle), 0o770);
-    assert_eq!(mode(&bundle.join("disk.img")), 0o660);
-    assert_eq!(mode(&bundle.join("aux.img")), 0o664);
-    assert_eq!(std::fs::metadata(&bundle).unwrap().uid(), me());
-}
-
-/// Catches: a harvest of a sealed base taking it (locking it 0700, changing its group
-/// or modes) or failing on its `uchg` files: it is root's and closed already, so
-/// nothing is changed.
-#[test]
-fn harvest_of_a_sealed_base_changes_nothing() {
-    let img = img("harvest-sealed");
-    let base = img.sealed("base");
-    let watched = base.clone();
-    let seen = img.watch(move || format!("base {:o}", mode(&watched)));
-    img.rig
-        .helper
-        .image_harvest(&img.path("base"), &img.path("out"))
-        .unwrap();
-    assert_eq!(
-        *seen.lock().unwrap(),
-        [format!(
-            "{} => base 750",
-            img.harvest_command(&img.path("base"), "out")
-        )]
-    );
-    img.as_sealed(&base);
-}
-
-/// Catches: a claim that is satisfied by a name that now leads to another directory, or
-/// to one the helper does not own.
-#[test]
-fn a_claim_holds_only_for_the_same_directory_the_helper_owns() {
-    let mut mine = fstat(std::fs::File::open(".").unwrap()).unwrap();
-    mine.st_uid = rustix::process::geteuid().as_raw();
-    assert_eq!(check_claim("b", &mine, &mine), Ok(()));
-    let mut other = mine;
-    other.st_ino = mine.st_ino + 1;
-    let why = check_claim("b", &mine, &other).unwrap_err();
-    assert!(why.contains("b changed while it was being taken"), "{why}");
-    let mut theirs = mine;
-    theirs.st_uid = mine.st_uid + 1;
-    assert!(check_claim("b", &mine, &theirs).is_err());
-}
-
-/// Catches: an error that loses what was being done, or the OS's reason; a path that is
-/// not text being passed on as an argument; an undo that runs on success or hides the
-/// original error.
-#[test]
-fn errors_name_the_step_and_a_path_must_be_text() {
-    let why = at("locking b")(rustix::io::Errno::ACCESS);
-    assert!(why.starts_with("locking b: "), "{why}");
-    warn_if_failed("a step", Ok(()));
-    warn_if_failed("a step", Err("failed".to_owned()));
-    let mut undone = 0;
-    let ok = or_undo("x", Ok(1), || {
-        undone += 1;
-        Ok(())
-    });
-    assert_eq!(ok, Ok(1));
-    let bad: Result<u8, String> = Err("first".to_owned());
-    let kept = or_undo("x", bad, || {
-        undone += 10;
-        Err("second".to_owned())
-    });
-    assert_eq!(kept, Err("first".to_owned()));
-    assert_eq!(undone, 10);
-    use std::os::unix::ffi::OsStrExt as _;
-    let bad = Path::new(std::ffi::OsStr::from_bytes(b"/images/\xff"));
-    assert!(ImageSettings::text(bad).unwrap_err().contains("not UTF-8"));
-    assert_eq!(ImageSettings::text(Path::new("/images/b")), Ok("/images/b"));
-}
-
-/// Catches: a report that overruns the reply frame, or is cut inside a character.
-#[test]
-fn the_report_is_cut_at_the_frame_limit_on_a_character_boundary() {
-    assert_eq!(report("ok"), "ok");
-    let long = format!("a{}", "é".repeat(IMAGE_REPORT_BYTES));
-    let cut = report(&long);
-    assert_eq!(cut.len(), IMAGE_REPORT_BYTES - 1);
-    assert!(long.starts_with(&cut));
-}
-
-/// Catches: one panicked image verb stopping every later one.
-#[test]
-fn a_panic_in_one_image_verb_does_not_stop_the_next() {
-    let img = img("poison");
-    img.bundle("b");
-    let helper = &img.rig.helper;
-    std::thread::scope(|scope| {
-        let panicked = scope.spawn(|| {
-            let _one = helper.images.lock().unwrap();
-            panic!("a verb panicked holding the image lock");
-        });
-        assert!(panicked.join().is_err());
-    });
-    helper.image_setup(&img.spath("b")).unwrap();
-}
-
-/// Catches: two image verbs at once; the second waits for the first.
-#[test]
-fn image_verbs_run_one_at_a_time() {
-    let img = img("serial");
-    img.bundle("b");
-    let held = img.rig.helper.one_image_job();
-    let helper = &img.rig.helper;
-    let path = img.spath("b");
-    std::thread::scope(|scope| {
-        let second = scope.spawn(|| helper.image_setup(&path));
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(
-            img.commands().is_empty(),
-            "ran while another verb held the lock"
-        );
-        drop(held);
-        second.join().unwrap().unwrap();
-    });
-    assert_eq!(img.commands().len(), 3);
-}
+mod copy;
+mod harvest;
+mod units;

@@ -379,8 +379,11 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 >   directory. The user's original is left alone. The VM user clones the base through its group
 >   (a non-root `clonefile` of a root-owned 0640 base works, the clone keeps the flag, the user
 >   can clear it only on its own copy) and `kbf-vmm`'s clone step clears `uchg` on each clone.
->   A failure removes the copy, clearing `uchg` first (an immutable file cannot be unlinked), so
->   no failure leaves a base in the images directory. `image-harvest` reads a kept clone in
+>   A clone of a flagged file is flagged too (measured), so every clone's user flags are cleared
+>   right after it is made. A failure removes the copy, clearing `uchg` first (an immutable file
+>   cannot be unlinked) and removing every entry in it, including what `kbf-vmm` wrote, so no
+>   failure leaves a base in the images directory (an entry that is not a regular file is left
+>   and named in the error). `image-harvest` reads a kept clone in
 >   staging, whose inodes are the user's: the bundle is taken first (opened without following a
 >   link, made root's and 0700 through the descriptor, the name checked again, every file made
 >   root's, anything but plain single-link files refused) and given back with its owners and

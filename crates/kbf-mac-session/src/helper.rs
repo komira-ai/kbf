@@ -161,6 +161,12 @@ pub trait Host: Send + Sync {
         dir: std::os::fd::BorrowedFd<'_>,
         name: &str,
     ) -> io::Result<()>;
+    /// Clears every user flag (`uchg` among them) of the open file `file` (macOS:
+    /// `fchflags(fd, 0)`), as root. A clone of a flagged file is flagged.
+    ///
+    /// # Errors
+    /// The flags could not be cleared.
+    fn clear_user_flags(&self, file: std::os::fd::BorrowedFd<'_>) -> io::Result<()>;
     /// This boot's identifier (macOS: `kern.bootsessionuuid`), for the baseline
     /// window.
     ///

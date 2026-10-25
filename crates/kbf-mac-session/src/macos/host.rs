@@ -293,6 +293,16 @@ impl Host for MacHost {
         }
     }
 
+    fn clear_user_flags(&self, file: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: the descriptor is open for the call.
+        if unsafe { libc::fchflags(file.as_raw_fd(), 0) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     fn boot_session(&self) -> io::Result<String> {
         let mut buffer = [0u8; 128];
         let mut len = buffer.len();
