@@ -356,3 +356,44 @@ fn a_directory_in_the_way_of_the_checks_fails_the_stage() {
 fn the_production_limit_for_an_image_is_a_gibibyte() {
     assert_eq!(super::Tools::production().image_max, 1 << 30);
 }
+
+/// Two helpers (two frontend containers) that stage the same release one after another, the
+/// first's download still held, never touch each other's directories: each has its own, named
+/// after its container, and the default helper keeps the plain names.
+#[test]
+fn helpers_with_different_containers_keep_their_own_directories() {
+    let mut rig = Rig::new("image-two-helpers");
+    rig.offer_good_image();
+    let me = super::me();
+    let who = crate::runner::Identity {
+        uid: me.uid,
+        gid: me.gid,
+    };
+    // The scratch of the fetch.
+    let plain = rig.backend.fetch_scratch("abcd", who).unwrap();
+    rig.backend.scratch_tag = Some("kbf-fe-a".to_owned());
+    let tagged = rig.backend.fetch_scratch("abcd", who).unwrap();
+    assert_eq!(plain.file_name().unwrap(), "abcd.fetch");
+    assert_eq!(tagged.file_name().unwrap(), "abcd.kbf-fe-a.fetch");
+    assert!(plain.exists() && tagged.exists());
+    // The checked copy that the handle holds.
+    let first = rig.backend.fetch(&version(), &stable()).unwrap();
+    rig.backend.scratch_tag = Some("kbf-fe-b".to_owned());
+    let second = rig.backend.fetch(&version(), &stable()).unwrap();
+    assert_ne!(first.file, second.file);
+    assert!(
+        first
+            .file
+            .starts_with(rig.work().join(format!("{COMMIT}.kbf-fe-a.check")))
+    );
+    assert!(
+        second
+            .file
+            .starts_with(rig.work().join(format!("{COMMIT}.kbf-fe-b.check")))
+    );
+    assert_eq!(fs::read(&first.file).unwrap(), IMAGE);
+    drop(second);
+    // The first helper's copy is still there after the second's is gone.
+    assert_eq!(fs::read(&first.file).unwrap(), IMAGE);
+    assert!(plain.exists() && tagged.exists());
+}

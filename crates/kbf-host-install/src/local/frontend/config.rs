@@ -7,6 +7,7 @@
 //! restart = "unless-stopped"                 # docker's restart policy
 //! network = "bridge"                         # optional
 //! user = "65532:65532"                       # optional
+//! group_add = ["990"]                        # optional: supplementary gids, as quoted numbers
 //! ports = ["127.0.0.1:8982:8982"]            # docker's --publish forms
 //! mounts = ["/etc/kbf:/etc/kbf:ro"]          # docker's --volume forms
 //! command = ["--config", "/etc/kbf/kbf.toml"]  # the flags after the image
@@ -53,6 +54,14 @@ pub struct RunSpec {
     pub network: Option<String>,
     #[serde(default)]
     pub user: Option<String>,
+    /// Supplementary groups of the container's process (`--group-add`), never 0.
+    ///
+    /// Not written when empty, so that a record of a host that sets none is the bytes the
+    /// helper wrote before this key existed, and an older helper (which refuses unknown keys)
+    /// still reads it. A host that sets `group_add` must settle or revert any release on trial
+    /// before the helper is rolled back to a version without it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_add: Vec<u32>,
     #[serde(default)]
     pub ports: Vec<String>,
     #[serde(default)]
@@ -73,6 +82,10 @@ impl RunSpec {
                 args.push(flag.to_owned());
                 args.push(value.clone());
             }
+        }
+        for gid in &self.group_add {
+            args.push("--group-add".to_owned());
+            args.push(gid.to_string());
         }
         for (flag, values) in [("--publish", &self.ports), ("--volume", &self.mounts)] {
             for value in values {
@@ -115,6 +128,8 @@ struct Entry {
     network: Option<String>,
     user: Option<String>,
     #[serde(default)]
+    group_add: Vec<String>,
+    #[serde(default)]
     ports: Vec<String>,
     #[serde(default)]
     mounts: Vec<String>,
@@ -150,6 +165,14 @@ fn user_ok(text: &str) -> bool {
     let mut parts = text.split(':');
     let ok = |part: Option<&str>| part.is_some_and(word_ok);
     ok(parts.next()) && parts.next().is_none_or(word_ok) && parts.next().is_none()
+}
+
+/// A group id: decimal digits only (no name, sign or space), from 1 to `u32::MAX`.
+fn gid(text: &str) -> Option<u32> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok().filter(|gid| *gid != 0)
 }
 
 fn plain(text: &str) -> bool {
@@ -210,11 +233,17 @@ impl FrontendConfig {
     pub fn parse(text: &str) -> Result<Self, String> {
         let file: File = toml::from_str(text).map_err(|e| e.message().to_owned())?;
         let entry = file.frontend;
+        let group_add = entry
+            .group_add
+            .iter()
+            .map(|g| gid(g).ok_or_else(|| format!("group_add {g:?} is not a group id from 1")))
+            .collect::<Result<_, _>>()?;
         let run = RunSpec {
             name: entry.name,
             restart: entry.restart,
             network: entry.network,
             user: entry.user,
+            group_add,
             ports: entry.ports,
             mounts: entry.mounts,
             command: entry.command,

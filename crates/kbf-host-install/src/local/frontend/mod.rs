@@ -54,6 +54,38 @@ pub const IMAGE_REPOSITORY: &str = "kbf-frontend";
 /// Where the frontend's record is, below the private state directory.
 pub const RECORD: &str = "frontend.json";
 
+/// The names of the files one helper keeps, which are its alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Files {
+    /// The record, in the private state directory.
+    pub record: String,
+    /// The A/B state, in the same directory.
+    pub state: String,
+    /// The install lock; none for the default configuration, whose lock is the host's.
+    pub lock: Option<PathBuf>,
+}
+
+impl Files {
+    /// The files of the helper for the container `bound` (a helper started with its own
+    /// configuration file), or the default helper's, whose names do not change.
+    pub fn of(bound: Option<&str>) -> Self {
+        match bound {
+            None => Self {
+                record: RECORD.to_owned(),
+                state: "state.json".to_owned(),
+                lock: None,
+            },
+            Some(name) => Self {
+                record: format!("frontend-{name}.json"),
+                state: format!("state-frontend-{name}.json"),
+                lock: Some(PathBuf::from(format!(
+                    "/run/kbf-host-install-frontend-{name}.lock"
+                ))),
+            },
+        }
+    }
+}
+
 /// The tag the image of `commit` is loaded as.
 pub fn image_tag(commit: &str) -> String {
     format!("{IMAGE_REPOSITORY}:{commit}")
@@ -138,6 +170,10 @@ pub struct Frontend<S: ImageSource, R: Runtime, P: Probe> {
     pub config_file: PathBuf,
     /// `frontend.json`.
     pub record_file: PathBuf,
+    /// The container this helper was started for, when its configuration is not the default
+    /// file: the files above were named after it, so a configuration that names another
+    /// container is refused.
+    pub bound_name: Option<String>,
     pub pace: Pace,
 }
 
@@ -166,8 +202,18 @@ fn drain_argv(config: &FrontendConfig) -> Vec<String> {
 
 impl<S: ImageSource, R: Runtime, P: Probe> Frontend<S, R, P> {
     fn config(&self) -> Result<FrontendConfig, Fault> {
-        FrontendConfig::load(&self.host.trust, &self.config_file)
-            .map_err(|why| Fault::refused(Code::ConfigInvalid, why))
+        let config = FrontendConfig::load(&self.host.trust, &self.config_file)
+            .map_err(|why| Fault::refused(Code::ConfigInvalid, why))?;
+        match &self.bound_name {
+            Some(bound) if *bound != config.run.name => Err(Fault::refused(
+                Code::ConfigInvalid,
+                format!(
+                    "the container is {:?} and this helper was started for {bound:?}; restart it",
+                    config.run.name
+                ),
+            )),
+            _ => Ok(config),
+        }
     }
 
     fn record(&self) -> Result<Record, Fault> {
@@ -458,12 +504,21 @@ impl<S: ImageSource, R: Runtime, P: Probe> Backend for Frontend<S, R, P> {
     }
 }
 
-/// The frontend container of this host as the program runs it.
+/// The frontend container of this host as the program runs it, from the configuration
+/// `config_file`. `bound` is the container's name when that is not the default file: the
+/// record and the lock are then this container's own.
 #[cfg(target_os = "linux")]
-pub fn production()
--> Frontend<super::linux::Linux<kbf_host::HostExec>, runtime::Docker, probe::Http> {
+pub fn production(
+    config_file: PathBuf,
+    bound: Option<String>,
+) -> Frontend<super::linux::Linux<kbf_host::HostExec>, runtime::Docker, probe::Http> {
+    let files = Files::of(bound.as_deref());
+    let mut host = Host::production();
+    host.install_lock = files.lock.unwrap_or(host.install_lock);
+    let mut source = super::linux::production(Vec::new());
+    source.scratch_tag = bound.clone();
     Frontend {
-        source: super::linux::production(Vec::new()),
+        source,
         runtime: runtime::Docker::new(
             Box::new(crate::runner::SystemRunner),
             Path::new("/usr/bin/docker").to_path_buf(),
@@ -471,9 +526,10 @@ pub fn production()
         probe: probe::Http {
             limit: Duration::from_secs(5),
         },
-        host: Host::production(),
-        config_file: PathBuf::from(config::CONFIG),
-        record_file: Path::new(super::production::LINUX_STATE_DIR).join(RECORD),
+        host,
+        config_file,
+        record_file: Path::new(super::production::LINUX_STATE_DIR).join(files.record),
+        bound_name: bound,
         pace: Pace::real(),
     }
 }
@@ -488,5 +544,7 @@ mod probe_tests;
 mod record_tests;
 #[cfg(test)]
 mod runtime_tests;
+#[cfg(test)]
+mod several_tests;
 #[cfg(test)]
 mod tests;
