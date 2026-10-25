@@ -29,7 +29,12 @@
 //!     `--cas` leg to fall back on), and until the storage half holds one its service refuses
 //!     every call, its own member's included (UNAVAILABLE, as it refuses any caller's). The
 //!     in-process plane of the one-box mode moves output files without spooling them
-//!     (`Cas::intake`); the routed plane does not yet.
+//!     (`Cas::intake`); the routed plane does not yet. With `--pack-read` the routed plane's
+//!     reads ask the farm's packs first (`kbf_node::start_member`): the daemon half asks the
+//!     frontend where a blob lies over a connection to the first `--server`, with its own
+//!     (daemon-role) certificate, and everything but a read is the routed plane's. Without
+//!     a `--frontend` the flag is refused: the node is the whole farm, and there is no
+//!     frontend to ask.
 //! - **One cache**: when the hot store is a directory on `--data-dir`'s filesystem, as
 //!   in `kbf all-in-one` (`crate::one_cache`).
 //! - **Stopping**: on the first SIGTERM or SIGINT the daemon half drains

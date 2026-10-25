@@ -106,10 +106,19 @@ blob: one `Locate` call and one ranged request, with at most 16 asking at once. 
 more than 64 MiB is read where it was before, as a read from a pack holds the whole blob in
 memory, outside the transfer budget (`--transfer-bytes-in-flight`). `--pack-read-cache-dir` with
 `--pack-read-cache-bytes` adds a cache of the blobs read from packs (the daemon's input
-cache already keeps blobs by digest, so it is off by default). `kbf daemon` only:
-`kbf storage-and-daemon` and `kbf all-in-one` read blobs in-process and refuse the flag.
-Counts of what was read from packs, elsewhere, lost and damaged are logged when the daemon
-stops (`pack reads: ...`), and a lost or damaged blob is logged when it is found.
+cache already keeps blobs by digest, so it is off by default). `kbf daemon` asks over its
+connection to `--cas`. `kbf storage-and-daemon` with a `--frontend` reads packs too, over
+its member plane: its daemon half asks over a connection to the first `--server`, the
+frontend's worker listener that its session is made to, with the certificate the session
+presents. That certificate has the `daemon` role, the only one the listener lets call
+`Locate` (the node's storage half has a certificate of its own, with the `storage` role, and
+does not call it), so no role table changes. The flags are the same, with the same fallbacks,
+errors and bounds; reads of the local member's blobs and of the others' are alike packed
+reads first, and the outputs still go to the members. `kbf all-in-one` and
+`kbf storage-and-daemon` without a `--frontend` read blobs in-process from a store that is
+the whole farm, with no frontend to ask and no pack index, and refuse the flag. Counts of
+what was read from packs, elsewhere, lost and damaged are logged when the daemon stops
+(`pack reads: ...`), and a lost or damaged blob is logged when it is found.
 
 The blobs the storage members flushed before the frontends wrote packs are in no pack the
 index knows, so a read of one still goes to the members. `kbf-pack-adopt`, an operator tool and
@@ -131,7 +140,8 @@ process: the daemon half reads and writes the node's own storage through calls, 
 no socket between. Linux only, container driver only. With `--frontend` the node registers
 and the daemon routes each blob by the frontend's map: a blob this node owns goes in-process,
 any other goes over mutual TLS to its owner. Without `--frontend` the node is the whole
-farm.
+farm. With `--frontend`, `--pack-read` makes the daemon half read blobs from the packs first
+(see "Packs" above).
 
 ### The one-port proxy
 

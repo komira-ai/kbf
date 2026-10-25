@@ -1,8 +1,9 @@
-//! The `--pack-read` flags, the credentials file, and the starts that wrap the farm's data plane.
+//! The `--pack-read` flags, the credentials file, and the starts that wrap the data planes.
 
 use std::os::unix::fs::PermissionsExt as _;
 
 use clap::Parser as _;
+use kbf_server::storage_half::StorageHalf;
 
 use super::*;
 use crate::tests::{scratch, tls_files};
@@ -150,15 +151,16 @@ fn the_companions_come_with_pack_read_and_it_comes_with_them() {
 }
 
 /// Asserts that a daemon that reads blobs in-process refuses `--pack-read`, naming the flag and
-/// the mode that reads packs, and takes the daemon without it.
+/// the frontend it lacks, and takes the daemon without it.
 #[test]
 fn an_in_process_daemon_refuses_pack_read() {
     let on = parse(&ON).expect("flags").pack_read;
     let said = on.refuse_in_process().expect_err("refused").to_string();
-    assert_eq!(
-        said,
-        "--pack-read: this daemon half reads blobs in-process; run `kbf daemon` to read packs"
+    assert!(
+        said.starts_with("--pack-read: no frontend to ask"),
+        "{said}"
     );
+    assert!(said.ends_with("storage-and-daemon --frontend`)"), "{said}");
     let off = parse(&[]).expect("flags").pack_read;
     assert!(off.refuse_in_process().is_ok());
 }
@@ -243,18 +245,19 @@ async fn the_reader_is_built_from_the_settings_or_refused_by_flag() {
     let path = keys(&dir, "keys.json", &pair(), 0o600);
     let cli = daemon(&dir, &on(&path));
     let settings = cli.pack_read.settings().expect("on");
-    assert!(reader(&cli, &settings).is_ok());
+    assert!(reader(&cli, &settings, transfer::endpoint).is_ok());
+    assert!(reader(&cli, &settings, transfer::server_endpoint).is_ok());
     let cache = dir.join("cache");
     let cached = PackRead {
         cache: Some((cache.clone(), 1 << 20)),
         ..settings.clone()
     };
-    assert!(reader(&cli, &cached).is_ok());
+    assert!(reader(&cli, &cached, transfer::endpoint).is_ok());
     assert!(cache.is_dir(), "the cache's directory was made");
 
     let refused = |settings: &PackRead, cli: &Cli| {
-        let failed = reader(cli, settings).err().expect("refused");
-        failed.to_string()
+        let built = reader(cli, settings, transfer::endpoint);
+        built.err().expect("refused").to_string()
     };
     let tls = PackRead {
         endpoint: "https://127.0.0.1:9".to_owned(),
@@ -299,11 +302,11 @@ fn a_daemon_starts_with_the_packs_in_front_of_its_plane_or_is_refused() {
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
 
-/// Asserts that the daemons that read blobs in-process refuse `--pack-read` at their start: the
-/// one beside a server's own process (`start_with`) and the one beside a storage node
-/// (`start_member`), and that neither starts anything.
-#[tokio::test]
-async fn the_in_process_starts_refuse_pack_read() {
+/// Asserts that the daemon that reads blobs in-process beside a server's own process
+/// (`start_with`: `kbf all-in-one`, and `kbf storage-and-daemon` without a `--frontend`) refuses
+/// `--pack-read` at its start, naming the flag, and starts nothing.
+#[test]
+fn the_in_process_start_refuses_pack_read() {
     let dir = scratch("pack-read-in-process");
     tls_files(&dir);
     let path = keys(&dir, "keys.json", &pair(), 0o600);
@@ -311,7 +314,12 @@ async fn the_in_process_starts_refuse_pack_read() {
     let started = crate::start_with(&cli, crate::remote);
     let refused = started.err().expect("refused");
     assert!(refused.to_string().contains("--pack-read"), "{refused}");
+    kbf_outputs::remove_tree(&dir).expect("clean");
+}
 
+/// A storage half on a loopback port, and the member it is for the daemon half beside it. The
+/// half is kept by the caller for as long as the member is used.
+async fn storage_member(dir: &Path) -> (StorageHalf, LocalMember) {
     let argv = [
         "storage".to_owned(),
         "--storage-listen=127.0.0.1:0".to_owned(),
@@ -323,14 +331,81 @@ async fn the_in_process_starts_refuse_pack_read() {
     let half = kbf_server::storage_half::start(&flags, || Ok(std::future::pending::<()>()))
         .await
         .expect("the storage half starts");
-    let local = kbf_daemon::LocalMember::new(half.addr.to_string(), half.in_process());
+    let local = LocalMember::new(half.addr.to_string(), half.in_process());
+    (half, local)
+}
+
+/// `start_member` over `local` for a daemon with these more flags, no `--cas` (a
+/// storage-and-daemon has none) and these `--server` URLs: nothing, or what it refused with.
+async fn started_member(
+    dir: &Path,
+    more: &[String],
+    servers: &[&str],
+    local: &LocalMember,
+) -> Result<(), String> {
+    let mut cli = daemon(dir, more);
+    cli.cas = None;
+    cli.daemon.servers = servers.iter().map(|url| (*url).to_owned()).collect();
+    let local = local.clone();
     // `start_member` builds a runtime of its own, which tokio refuses on a thread running tasks.
     let start = tokio::task::spawn_blocking(move || {
         crate::start_member(&cli, local)
             .map(drop)
             .map_err(|e| e.to_string())
     });
-    let said = start.await.expect("joined").expect_err("refused");
-    assert!(said.contains("--pack-read"), "{said}");
+    start.await.expect("joined")
+}
+
+/// Asserts that `start_member` with `--pack-read` makes the daemon half of a storage-and-daemon
+/// with the packs in front of its member plane, without a `--cas`: the start is refused with
+/// the file named for a key pair file that cannot be used, and with `--server` named for a
+/// frontend that is not an https URL, before any blob is read; without `--pack-read` the same
+/// daemon starts as it did.
+#[tokio::test]
+async fn a_member_daemon_starts_with_the_packs_in_front_of_its_plane_or_is_refused() {
+    let dir = scratch("pack-read-member");
+    tls_files(&dir);
+    let path = keys(&dir, "keys.json", &pair(), 0o600);
+    let open = keys(&dir, "open.json", &pair(), 0o644);
+    let (_half, local) = storage_member(&dir).await;
+    let https = ["https://127.0.0.1:1"];
+
+    let started = started_member(&dir, &on(&path), &https, &local).await;
+    assert_eq!(started, Ok(()));
+    let started = started_member(&dir, &on(&open), &https, &local).await;
+    let said = started.expect_err("refused");
+    assert!(said.contains("open.json"), "{said}");
+    let started = started_member(&dir, &on(&path), &["http://127.0.0.1:1"], &local).await;
+    let said = started.expect_err("refused");
+    assert!(
+        said.starts_with("--server \"http://127.0.0.1:1\" must be an https:// URL"),
+        "{said}"
+    );
+    let started = started_member(&dir, &[], &https, &local).await;
+    assert_eq!(started, Ok(()));
+    kbf_outputs::remove_tree(&dir).expect("clean");
+}
+
+/// Asserts that a daemon with no `--cas` asks the frontend over its first `--server` (the
+/// listener its session is made to, with its own TLS files), and that a first `--server` that
+/// is not an https URL, or none, is refused with the flag named.
+#[test]
+fn the_frontend_is_asked_over_the_first_server() {
+    let dir = scratch("pack-read-server");
+    tls_files(&dir);
+    let mut cli = daemon(&dir, &[]);
+    cli.daemon.servers = vec![
+        "https://127.0.0.1:2".to_owned(),
+        "https://127.0.0.1:3".to_owned(),
+    ];
+    let endpoint = transfer::server_endpoint(&cli).expect("the first server");
+    assert_eq!(endpoint.uri().port_u16(), Some(2));
+
+    cli.daemon.servers = vec!["http://127.0.0.1:2".to_owned()];
+    let said = transfer::server_endpoint(&cli).expect_err("not https");
+    assert!(said.to_string().starts_with("--server "), "{said}");
+    cli.daemon.servers = Vec::new();
+    let said = transfer::server_endpoint(&cli).expect_err("none");
+    assert_eq!(said.to_string(), "--server is required");
     kbf_outputs::remove_tree(&dir).expect("clean");
 }

@@ -17,13 +17,21 @@ use std::future::pending;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use kbf_daemon::cas::Cas as _;
+use bytes::Bytes;
+use kbf_daemon::cas::{Cas as _, digest_of};
 use kbf_daemon::{
-    Daemon, DaemonConfig, FakeRuntime, LocalMember, NodeReport, Runtime, TlsFiles, member_cas,
+    Daemon, DaemonConfig, FakeRuntime, LocalMember, NodeReport, PackedCas, Runtime, TlsFiles,
+    member_cas,
 };
 use kbf_map::{Member, MemberId};
 use kbf_mapsync::MapHolder;
+use kbf_objstore::{Capabilities, MemoryStore};
+use kbf_pack::{Blob, PackKeys, Packer, PackerConfig, Reader, ReaderConfig, WriterKind};
+use kbf_proto::worker::PackLocateRequest;
+use kbf_proto::worker::pack_index_client::PackIndexClient;
 use kbf_route::Nodes;
+use kbf_state::pack_index::memory::MemoryPackIndex;
+use kbf_state::{ManualClock, PackIndex};
 use kbf_storage::service::{CatchUp, InProcess};
 use kbf_storage::{Storage, StorageError};
 use kbf_transfer::{CasError, RoutedCas, TransferConfig, proto_digest};
@@ -32,6 +40,7 @@ use support::farm::{
     unmapped_in_process,
 };
 use support::scratch;
+use tonic::transport::Endpoint;
 
 /// The node dialler a daemon half calls other members through, counting its calls by
 /// member address: a call here is a call over the network.
@@ -405,4 +414,87 @@ async fn a_daemon_half_reading_a_miss_on_its_catching_up_node_is_told_unavailabl
     catch_up.finish();
     let missing = a.cas.get(&wire).await.expect_err("a miss");
     assert!(matches!(missing, CasError::Missing(..)), "{missing:?}");
+}
+
+/// A packed plane over the member plane of a process (`--pack-read` of `kbf
+/// storage-and-daemon`), and the packer that fills the packs it reads: a memory object store
+/// and a memory pack index stand for the farm's.
+struct Packed {
+    cas: PackedCas<RoutedCas>,
+    packer: Packer<MemoryStore>,
+}
+
+fn packed(process: &Process) -> Packed {
+    let caps = Capabilities {
+        conditional_put: true,
+        object_lock: false,
+    };
+    let store = Arc::new(MemoryStore::new(caps));
+    let clock = Arc::new(ManualClock::default());
+    let index: Arc<dyn PackIndex> = Arc::new(MemoryPackIndex::new(clock));
+    let keys = PackKeys::new(WriterKind::Daemon, "node-a", "boot1").expect("keys");
+    let config = PackerConfig::default();
+    let packer = Packer::new(Arc::clone(&store), Arc::clone(&index), keys, config);
+    let reader = Reader::new(store, index, None, ReaderConfig::default());
+    Packed {
+        cas: PackedCas::new(Arc::clone(&process.cas), Arc::new(reader)),
+        packer: packer.expect("packer"),
+    }
+}
+
+/// Asserts what the packed plane over a member plane does. A blob only a pack holds, which the
+/// member plane cannot read, is read from the pack. A blob only the members hold is read from
+/// them, the packs having none of it. A write goes to the member that owns the blob, and the
+/// closure check (`missing`) is the members' answer: a blob held only by a pack is missing, one
+/// the members hold is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_packed_member_plane_reads_packs_first_and_leaves_the_rest_to_the_members() {
+    let (a, _b, map, _front) = farm("member-packed").await;
+    let packed = packed(&a);
+
+    let in_pack = b"held by a pack and by no storage node";
+    let blob = Blob {
+        digest: kbf_pack::blob_digest(in_pack),
+        bytes: Bytes::from_static(in_pack),
+    };
+    packed.packer.pack(vec![blob]).await.expect("packed");
+    let wire = digest_of(in_pack);
+    let unread = a.cas.get(&wire).await.expect_err("no member holds it");
+    assert!(matches!(unread, CasError::Missing(..)), "{unread:?}");
+    assert_eq!(packed.cas.get(&wire).await, Ok(in_pack.to_vec()));
+    assert_eq!(packed.cas.stats().served, 1);
+
+    let bytes = blob_owned_by(&map, a.id, "held by the members");
+    let stored = packed.cas.put(bytes.clone()).await.expect("stored");
+    assert!(
+        a.node.holds(&digest(&bytes)).await,
+        "the owner took the write"
+    );
+    assert_eq!(packed.cas.get(&stored).await, Ok(bytes));
+    let stats = packed.cas.stats();
+    assert_eq!((stats.served, stats.elsewhere), (1, 1));
+
+    let missing = packed.cas.missing(&[wire.clone(), stored]).await;
+    assert_eq!(missing, [wire]);
+}
+
+/// Asserts that a daemon-role certificate, as the helper of this farm builds it for a daemon
+/// half, is admitted to `kbf.worker.v1.PackIndex/Locate` on the frontend's worker listener: the
+/// frontend here is started without `--pack-index`, so the call is answered UNIMPLEMENTED, where
+/// a certificate whose role the table does not take would be refused PERMISSION_DENIED. The call
+/// is made on the generated client, so the status code is seen as the frontend sent it (the
+/// daemon's `RemoteIndex` reads UNAVAILABLE the same as UNIMPLEMENTED). That the session
+/// certificate of a real node has the daemon role is not shown here: it rests on the module
+/// documentation of the role table (`worker_roles.rs`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_half_may_ask_the_frontend_where_blobs_lie() {
+    let (a, _b, _map, front) = farm("member-locate").await;
+    let url = format!("https://localhost:{}", front.worker.port());
+    let tls = a.tls.load().expect("TLS files");
+    let endpoint = Endpoint::from_shared(url).expect("endpoint");
+    let channel = endpoint.tls_config(tls).expect("TLS").connect_lazy();
+    let mut client = PackIndexClient::new(channel);
+    let asked = client.locate(PackLocateRequest::default()).await;
+    let status = asked.expect_err("the frontend serves no locations");
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
 }
