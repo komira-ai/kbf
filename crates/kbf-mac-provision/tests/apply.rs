@@ -32,7 +32,7 @@ fn one_apply_converges_a_fresh_mac() {
             "CHANGE role_user: role account and group _kbf, id 480",
             "CHANGE kbf_volume: wrote /Volumes/kbf/.metadata_never_index",
             "CHANGE kbf_volume: Spotlight indexing off (mdutil -i off)",
-            "CHANGE kbf_volume: excluded from Time Machine (tmutil addexclusion)",
+            "CHANGE kbf_volume: excluded from Time Machine (tmutil addexclusion -v)",
             "CHANGE pool_users: group kbfpool, gid 700",
             "CHANGE pool_users: made /Volumes/kbf/home, root's, mode 755",
             "CHANGE pool_users: user kbf-pool-0, uid 700",
@@ -117,6 +117,21 @@ fn one_apply_converges_a_fresh_mac() {
 /// lease user's `xcodebuild` finds after its own), left unwritten, written as a string
 /// or with the wrong sense (1 is `true`), recorded in the revert record (it is not in
 /// it), or managed when the profile leaves the key out.
+/// The volume is excluded with `tmutil addexclusion -v`: without `-v` the call exits 0
+/// and the volume stays included, so the next check fails "not excluded".
+#[test]
+fn the_volume_is_excluded_from_time_machine_with_the_volume_flag() {
+    let mac = FakeMac::fresh("apply-tmutil-volume");
+    let r = apply_keys(&mac, Some("kbf_volume"));
+    assert_eq!(r.failed, 0, "{}", r.text);
+    assert_eq!(
+        calls(&mac, "tmutil addexclusion"),
+        ["tmutil addexclusion -v /Volumes/kbf"]
+    );
+    let c = check_keys(&mac, Some("kbf_volume"));
+    assert_eq!(c.failed, 0, "{}", c.text);
+}
+
 #[test]
 fn the_xcode_manifest_sandbox_default_is_written_when_the_profile_asks() {
     const KEY: &str = "IDEPackageSupportDisableManifestSandbox";

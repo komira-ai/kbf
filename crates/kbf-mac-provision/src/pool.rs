@@ -148,8 +148,8 @@ pub(crate) fn fix_kbf_volume(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
         out.change(c.key, "Spotlight indexing off (mdutil -i off)");
     }
     if backed_up(c) {
-        run(c, TMUTIL, &["addexclusion", volume]);
-        out.change(c.key, "excluded from Time Machine (tmutil addexclusion)");
+        run(c, TMUTIL, &["addexclusion", "-v", volume]);
+        out.change(c.key, "excluded from Time Machine (tmutil addexclusion -v)");
     }
     Ok(())
 }
