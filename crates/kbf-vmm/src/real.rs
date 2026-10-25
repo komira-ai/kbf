@@ -140,6 +140,22 @@ impl System for RealSystem {
         }
     }
 
+    fn clear_immutable(&self, path: &Path) -> std::io::Result<()> {
+        use std::os::macos::fs::MetadataExt as _;
+        let flags = std::fs::symlink_metadata(path)?.st_flags();
+        if flags & libc::UF_IMMUTABLE == 0 {
+            return Ok(());
+        }
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        // SAFETY: `c_path` is a NUL-terminated path that outlives the call.
+        if unsafe { libc::chflags(c_path.as_ptr(), flags & !libc::UF_IMMUTABLE) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
     fn new_machine_identifier(&self) -> Result<Vec<u8>, String> {
         Ok(vz::new_machine_identifier())
     }

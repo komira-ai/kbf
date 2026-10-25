@@ -24,7 +24,8 @@ What the script did not do:
   - `kbf_volume` (`/Volumes/<name>`, default `/Volumes/kbf`): a mounted APFS volume
     (`diskutil info` gives the path itself as the mount point), not indexed (`mdutil -s`, and `.metadata_never_index` at its
     root) and excluded from Time Machine (`tmutil isexcluded`). `apply` writes the
-    marker, runs `mdutil -i off` and `tmutil addexclusion`; it does not make the volume
+    marker, runs `mdutil -i off` and `tmutil addexclusion -v` (the volume form);
+    it does not make the volume
     (`diskutil apfs addVolume` is the operator's).
   - `pool_users` (`pool_users`, 1 to 100, default 100; `pool_first_uid`, default 61000
     and never below 600): users `kbf-pool-<i>` for `i < pool_users`
