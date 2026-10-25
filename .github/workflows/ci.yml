@@ -195,16 +195,6 @@ jobs:
       # target/llvm-cov-target, so every path, the cache's included, stays the same.
       # The checks run first and fail with the disk named, so a short disk reads as
       # "runner out of disk" and not as test failures.
-      - name: Refuse early when a disk is short (the second disk 64 GiB, the root disk 60 GiB)
-        run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --disk /mnt --disk-min-free-gb 64 --root-min-free-gb 60
-      - name: Make the second disk's directory for the instrumented build
-        run: sudo install -d -m 1777 /mnt/kbf-llvm-cov-target
-      - name: Make the mount point in the workspace
-        run: mkdir -p target/llvm-cov-target
-      - name: Put the instrumented build on the second disk
-        run: sudo mount --bind /mnt/kbf-llvm-cov-target target/llvm-cov-target
-      - name: Free disk with the build on the second disk (report)
-        run: df -h / /mnt target/llvm-cov-target
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
@@ -221,6 +211,8 @@ jobs:
       # ('profile file is not compatible'). `llvm-cov clean --workspace` removes the workspace's
       # own artifacts and profiles and keeps the dependencies' builds, which are what the cache
       # is for.
+      - name: Disk use under target after the cache restore (report)
+        run: du -xhd 2 target
       - name: Drop the workspace's coverage artifacts the cache restored
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
       # nextest runs a process per test, so a test's line coverage must not rest on another
