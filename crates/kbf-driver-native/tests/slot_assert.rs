@@ -268,16 +268,18 @@ fn bootstrap(user: &SlotUser, drop_to: &str, label: &str) {
     });
 }
 
-/// Catches a launchd probe that cannot see a job a lease bootstrapped into the user's
-/// domain (with `LimitLoadToSessionType=Background`, which a pool user's domain accepts),
-/// or that judges the job by a label chosen to look like launchd's own: this one is named
-/// `com.apple.` and lives in the user's home, so it is not launchd's.
+/// Catches a probe that cannot see the process of a job a lease bootstrapped into the
+/// user's domain (with `LimitLoadToSessionType=Background`, which a pool user's domain
+/// accepts) and kept alive (`KeepAlive`), and a clean that leaves the job or its domain
+/// behind: the agent is named `com.apple.` and lives in the user's home, and the check
+/// afterwards, which asks launchd nothing, is green only if the clean's bootout took the
+/// domain and its agent, and nothing started it again.
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_assert"]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_launch_agent_is_seen_then_cleaned() {
     let control = Control {
         name: "assert-agent",
-        red: "launchd: + job ",
+        red: "processes: + ",
         cheap: true,
         prepare: None,
     };
@@ -287,7 +289,7 @@ async fn a_launch_agent_is_seen_then_cleaned() {
             &scratch.as_user_binary(),
             "com.apple.kbf-assert-agent",
         );
-        "com.apple.kbf-assert-agent".to_owned()
+        "/bin/sleep".to_owned()
     })
     .await;
 }

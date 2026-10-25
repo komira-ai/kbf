@@ -89,15 +89,6 @@ pub(crate) fn plist_path(printed: &str) -> Option<&str> {
         .map(str::trim_end)
 }
 
-/// The program in what `launchctl print user/<uid>/<label>` says: its `program = ` line
-/// one level in. A job that names its program only in `arguments` has none.
-pub(crate) fn program_path(printed: &str) -> Option<&str> {
-    printed
-        .lines()
-        .find_map(|line| line.strip_prefix("\tprogram = "))
-        .map(str::trim_end)
-}
-
 /// The services `launchctl print user/<uid>` lists: `services = {`, one `<pid, 0 when
 /// not running> <last exit or -> <label>` per line, then `}`. A pid of 0 or less is
 /// `None`. The label is the rest of the line after the two columns, so a label with a

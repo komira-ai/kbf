@@ -42,6 +42,10 @@ use support::pool::{Scratch, Users, config, home_of, ids_of};
 use support::slot_rows::{ROWS, classify_unplanted};
 use support::{MemoryCas, PROMPT, Spec, stdout};
 
+/// How long the uid's processes are given to show up after the clean: the time a domain
+/// the clean left behind takes to start launchd's agents.
+const SETTLE: Duration = Duration::from_secs(5);
+
 fn assert_root() {
     support::pool::assert_root("slot_clean");
 }
@@ -358,6 +362,18 @@ async fn freshness(name: &str, skipped: Option<Skipped>) -> Fresh {
     let left = kbf_driver_native::slots::macos::host::leftover_processes(user.uid).expect("list");
     if !left.is_empty() {
         found.push(("processes".to_owned(), format!("{left:?}")));
+    }
+    // After a settle: a clean that left a launchd domain behind (a `launchctl print` of a
+    // gone `user/<uid>` makes it) has launchd's agents running as the uid seconds later,
+    // which the look above, made at once, does not see.
+    tokio::time::sleep(SETTLE).await;
+    let settled =
+        kbf_driver_native::slots::macos::host::leftover_processes(user.uid).expect("list");
+    if !settled.is_empty() {
+        found.push((
+            "processes after the settle".to_owned(),
+            format!("{settled:?}"),
+        ));
     }
     for (row, pid) in [("sleeper", outside.sleeper), ("setuid", outside.setuid_pid)] {
         if pid.is_some_and(support::alive) {
