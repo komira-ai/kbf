@@ -130,7 +130,8 @@ are configuration (the unit below, the certificate, and each agent's `--coordina
    docker image ls kbf-coordinator
    ```
 
-   The image is `kbf-coordinator:<commit>`.
+   The image is `kbf-coordinator:<commit>`, where `<commit>` is the full 40-character commit
+   (`--version` prints only its first 12 digits).
 2. **Make the files**, on the host, under the paths the image's default command names
    (`packaging/container/kbf-coordinator/Dockerfile`, `CMD`):
 
@@ -142,7 +143,9 @@ are configuration (the unit below, the certificate, and each agent's `--coordina
    | `/etc/kbf-coordinator/operator.token` | the operator token, 32 to 4096 visible ASCII characters | uid 65532, 0600 or 0400; any other owner or mode is refused at start |
    | `/var/lib/kbf-coordinator` | the state directory | uid 65532, 0700 |
 
-   The directory is mounted read-write and the rest read-only (`:ro`). The coordinator checks no
+   `/etc/kbf-coordinator` itself must be searchable by uid 65532 (for example `root:root`, 0755);
+   otherwise every file in the bind mount fails to open, whatever its own mode. The state
+   directory is mounted read-write and the rest read-only (`:ro`). The coordinator checks no
    mode on the directory: it must let uid 65532 create and rename files in it (the state file is
    written as `desired.json.new`, mode 0600, and renamed over `desired.json`), and 0700 is the
    least that does. The certificate and key are looked at again every 60 s

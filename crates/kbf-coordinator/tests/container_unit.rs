@@ -108,3 +108,34 @@ fn the_unit_mounts_what_the_image_reads_and_publishes_both_listeners() {
         Some("kbf-coordinator:<commit>")
     );
 }
+
+/// Catches: a listener published on every interface (`0.0.0.0`, `[::]`) or by a bare port, and
+/// a unit that drops the container's hardening (read-only root, no capabilities, no new
+/// privileges).
+#[test]
+fn the_unit_publishes_on_chosen_addresses_and_runs_hardened() {
+    let words = exec_start(&read("kbf-coordinator-container.service"));
+    let publishes = values(&words, "--publish");
+    assert_eq!(publishes.len(), 2, "two listeners: {publishes:?}");
+    for p in &publishes {
+        // host-address:host-port:container-port, the address being a specific one.
+        let (host, rest) = if let Some(v6) = p.strip_prefix('[') {
+            let (addr, rest) = v6.split_once("]:").expect("a bracketed address");
+            (addr, rest)
+        } else {
+            p.split_once(':').expect("an address and ports")
+        };
+        assert_eq!(rest.split(':').count(), 2, "{p}: host and container port");
+        assert!(
+            host.parse::<std::net::IpAddr>().is_ok(),
+            "{p}: names a host address"
+        );
+        assert!(
+            !host.parse::<std::net::IpAddr>().unwrap().is_unspecified(),
+            "{p}: not every interface"
+        );
+    }
+    assert!(words.iter().any(|w| w == "--read-only"), "--read-only");
+    assert_eq!(values(&words, "--cap-drop"), ["ALL"]);
+    assert!(values(&words, "--security-opt").contains(&"no-new-privileges"));
+}
