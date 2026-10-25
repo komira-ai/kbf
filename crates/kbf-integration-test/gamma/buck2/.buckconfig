@@ -1,0 +1,12 @@
+# The gamma stage's proof project (`cargo xtask prove-farm`, the `gamma` job of
+# .github/workflows/release.yml): a few shell actions that depend on each other, built
+# remote-only against the farm a release was just deployed to. No prelude: the rules are in
+# this project.
+#
+# Not here: the farm's address, TLS and instance, the execution platform and the run's nonce.
+# The verb writes them to `.buckconfig.local` for each run (`prove_farm::render_buckconfig`).
+[cells]
+  root = .
+
+[buck2]
+  digest_algorithms = SHA256

@@ -139,7 +139,7 @@ are configuration (the unit below, the certificate, and each agent's `--coordina
    |---|---|---|
    | `/etc/kbf-coordinator/tls.pem`, `tls.key` | the certificate and key (role `coordinator`) | key: uid 65532, 0600 |
    | `/etc/kbf-coordinator/ca.pem` | the farm CA certificate | readable by 65532 |
-   | `/etc/kbf-coordinator/oidc.toml` | the allow-list of CI's OIDC token ([kbf-updater.md](kbf-updater.md#turn-on-the-deploy-step)) | readable by 65532 |
+   | `/etc/kbf-coordinator/oidc.toml` | the allow-list of CI's OIDC token ([kbf-updater.md](kbf-updater.md#turn-on-the-gamma-stage)) | readable by 65532 |
    | `/etc/kbf-coordinator/operator.token` | the operator token, 32 to 4096 visible ASCII characters | uid 65532, 0600 or 0400; any other owner or mode is refused at start |
    | `/var/lib/kbf-coordinator` | the state directory | uid 65532, 0700 |
 
@@ -167,7 +167,7 @@ are configuration (the unit below, the certificate, and each agent's `--coordina
 **An update** is a new image, a new tag: verify and load the next archive as in step 1, change
 `<commit>` in the unit, `systemctl daemon-reload`, `systemctl restart kbf-coordinator`. The
 desired state is in the state directory and survives; a restarted coordinator waits 30 s before
-it says a farm has converged ([kbf-updater.md](kbf-updater.md#turn-on-the-deploy-step)). To go
+it says a farm has converged ([kbf-updater.md](kbf-updater.md#turn-on-the-gamma-stage)). To go
 back, name the old tag again.
 
 **`kbf-host-install --frontend-container` cannot drive this.** That backend is the frontend's:
