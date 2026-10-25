@@ -55,10 +55,11 @@ use sigv4::{EMPTY_SHA256, Request, Signer, Utc};
 pub const WAIT_RETRY: Duration = Duration::from_millis(250);
 
 /// How many times a ranged read is sent again after its transport failed (not timed
-/// out): a connection the store, or the path to it, closed after the request went out
-/// ("connection closed before message completed") says nothing of the next one, and a
-/// pooled connection closed while idle fails this way. A read is idempotent. Three
-/// sends in all.
+/// out by kbf or by a limit of the client): a connection the store, or the path to it,
+/// closed after the request went out ("connection closed before message completed")
+/// says nothing of the next one, a pooled connection closed while idle fails this way,
+/// and so does one the kernel gave up on (`ETIMEDOUT`, "Connection timed out"). A read
+/// is idempotent. Three sends in all.
 pub const READ_RETRIES: u32 = 2;
 
 /// The wait before the first resend of a read; each resend waits twice the one before.
@@ -67,16 +68,42 @@ const READ_RETRY_WAIT: Duration = Duration::from_millis(50);
 /// Whether a failed read may be sent again: it failed in transport and not by running
 /// out of time (a store that is `request_timeout` slow stays slow, and a resend would
 /// multiply the wait of a read that cannot succeed).
+///
+/// The kernel giving up on a dead connection is not that: its `ETIMEDOUT` says nothing
+/// of the store, and a fresh connection may well answer. reqwest's `is_timeout` is true
+/// for it too, as it is for any `io::Error` of kind `TimedOut` in the cause chain, so
+/// that chain is searched first. The timeouts reqwest raises itself (the connect limit
+/// and the per-request limit this module sets on the client) put no such error in the
+/// chain and stay refused, as does [`Stalled`].
 fn is_retryable(e: &ObjectStoreError) -> bool {
     match e {
         ObjectStoreError::Transport(cause) => {
-            !cause.is::<Stalled>()
-                && cause
-                    .downcast_ref::<reqwest::Error>()
-                    .is_none_or(|r| !r.is_timeout())
+            if cause.is::<Stalled>() {
+                return false;
+            }
+            match cause.downcast_ref::<reqwest::Error>() {
+                Some(r) => os_timed_out(r) || !r.is_timeout(),
+                None => true,
+            }
         }
         _ => false,
     }
+}
+
+/// Whether an `io::Error` of kind `TimedOut` (the kernel's `ETIMEDOUT` on a dead
+/// connection) is anywhere in the causes of `e`.
+fn os_timed_out(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = e.source();
+    while let Some(err) = source {
+        if err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 /// A read that got no byte from the store for `request_timeout`: no answer, or a body
@@ -946,6 +973,36 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    /// Catches: a read whose connection the kernel timed out (`ETIMEDOUT`, which reqwest
+    /// also reports as `is_timeout`) never sent again, failing a large download that a
+    /// fresh connection would finish; and the fix swallowing a stall with it.
+    #[tokio::test]
+    async fn an_os_level_timed_out_connection_is_resent_but_a_stall_is_not() {
+        struct TimedOutResolver;
+        impl reqwest::dns::Resolve for TimedOutResolver {
+            fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                Box::pin(async {
+                    let e: Box<dyn std::error::Error + Send + Sync> =
+                        Box::new(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                    Err(e)
+                })
+            }
+        }
+        let client = reqwest::Client::builder()
+            .dns_resolver(Arc::new(TimedOutResolver))
+            .build()
+            .unwrap();
+        let e = client
+            .get("http://store.invalid/")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(e.is_timeout(), "{e:?}");
+        assert!(is_retryable(&transport(e)));
+        let stalled = ObjectStoreError::Transport(Arc::new(Stalled));
+        assert!(!is_retryable(&stalled));
     }
 
     /// Catches: a transport error of the timeout kind from reqwest, or this module's
