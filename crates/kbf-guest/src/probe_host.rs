@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use crate::frame::{self, Frame, Kind, SendError};
 use crate::probe::Host;
+use crate::vsock::{AF_VSOCK, HOST_CID, SOCKADDR_VM_LEN, set_io_timeout, sockaddr_vm};
 
 pub struct SystemHost;
 
@@ -21,16 +22,8 @@ fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
-/// The address family of virtio sockets. UNCERTAIN: this is the value `<sys/vsock.h>` of
-/// the macOS SDK gives `AF_VSOCK` (as on Linux), and the layout below is its
-/// `struct sockaddr_vm` (length byte, family byte, two reserved bytes, port, CID). Whether a
-/// macOS guest's kernel serves the family to a process at all is what the first run of this
-/// code in a guest answers; `socket` failing is reported as such, not guessed around.
-const AF_VSOCK: libc::c_int = 40;
-/// The host's context id.
-const HOST_CID: u32 = 2;
 /// How long a read or write on the connection may block.
-const IO_TIMEOUT_SECS: libc::time_t = 10;
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A failed step of connecting to the host.
 #[derive(Debug)]
@@ -66,32 +59,13 @@ fn connect_host(port: u32) -> Result<File, ConnectError> {
     // SAFETY: `fd` was just returned by socket(2) and nothing else owns it.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     let file = File::from(owned);
-    let timeout = libc::timeval {
-        tv_sec: IO_TIMEOUT_SECS,
-        tv_usec: 0,
-    };
-    for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
-        // SAFETY: `timeout` is a `timeval` and its size is passed.
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                option,
-                std::ptr::from_ref(&timeout).cast(),
-                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-            )
-        };
-        if rc != 0 {
-            return Err(fail("setsockopt"));
-        }
-    }
-    let mut addr = [0u8; 16];
-    addr[0] = 16;
-    addr[1] = AF_VSOCK as u8;
-    addr[4..8].copy_from_slice(&port.to_le_bytes());
-    addr[8..12].copy_from_slice(&HOST_CID.to_le_bytes());
-    // SAFETY: `addr` is a 16-byte buffer and its length is passed.
-    if unsafe { libc::connect(fd, addr.as_ptr().cast(), 16) } != 0 {
+    set_io_timeout(fd, IO_TIMEOUT).map_err(|errno| ConnectError {
+        stage: "setsockopt",
+        errno,
+    })?;
+    let addr = sockaddr_vm(HOST_CID, port);
+    // SAFETY: `addr` is a `struct sockaddr_vm`-sized buffer and its length is passed.
+    if unsafe { libc::connect(fd, addr.as_ptr().cast(), SOCKADDR_VM_LEN as libc::socklen_t) } != 0 {
         return Err(fail("connect"));
     }
     Ok(file)

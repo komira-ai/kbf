@@ -47,6 +47,8 @@ fn every_failure_is_not_a_boot() {
                 late_files: vec![],
                 exits_on_stop: true,
                 obeys_shutdown: true,
+                shutdown_command: None,
+                gone_after: Duration::ZERO,
                 log: None,
             },
             "no started event",
@@ -91,6 +93,8 @@ fn every_failure_is_not_a_boot() {
                 late_files: vec![],
                 exits_on_stop: true,
                 obeys_shutdown: true,
+                shutdown_command: None,
+                gone_after: Duration::ZERO,
                 log: None,
             },
             "signal Some(9)",
@@ -146,6 +150,8 @@ fn waiting_for_a_file() {
         late_files: vec![],
         exits_on_stop: true,
         obeys_shutdown: true,
+        shutdown_command: None,
+        gone_after: Duration::ZERO,
         log: None,
     });
     let mut gone = vm(&sys, &work);
@@ -169,6 +175,8 @@ fn stop_asks_first_and_kills_when_ignored() {
     sys.script(Script {
         exits_on_stop: false,
         obeys_shutdown: true,
+        shutdown_command: None,
+        gone_after: Duration::ZERO,
         log: None,
         ..Script::booted()
     });
@@ -237,6 +245,8 @@ fn a_start_is_retried_only_for_the_guest_limit() {
         late_files: vec![],
         exits_on_stop: true,
         obeys_shutdown: true,
+        shutdown_command: None,
+        gone_after: Duration::ZERO,
         log: None,
     });
     assert!(
@@ -335,6 +345,8 @@ fn the_start_time_is_the_started_event_and_an_existing_clone_is_kept() {
         late_files: vec![],
         exits_on_stop: true,
         obeys_shutdown: true,
+        shutdown_command: None,
+        gone_after: Duration::ZERO,
         log: None,
     });
     let mut v = vm(&sys, &work);

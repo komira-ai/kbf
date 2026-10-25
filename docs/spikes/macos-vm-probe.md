@@ -536,6 +536,25 @@ What to read in the next E1 run: `results_files` (the host directory) lists the 
 `share_files` is empty unless the vsock route failed; `frames_missing` is `[]`; a frame
 in `share_files` and not in `results_files` means the guest used the fallback.
 
+Runs 7 and 8 both ended with every VM force-stopped after the 60 s wait, so the stop
+request is ignored by a guest at the login window and data the guest had not flushed is
+lost. The host now asks over the virtio socket instead: image setup installs a root
+LaunchDaemon (`com.kbf.probe.shutdown`, `kbf-guest shutdown-listen`, run from the guest's
+disk with KeepAlive) that listens on guest vsock port 5001; on stop the helper connects to
+it through `VZVirtioSocketDevice.connectToPort`, sends one `shutdown` frame in the same
+codec as the results, and the daemon answers `ack` and runs `/sbin/shutdown -h now` (fixed
+argv, no shell; it accepts only that frame, at most 256 bytes, and refuses everything
+else). With an ack the host waits up to the shutdown timeout for the VM to stop; with none
+within 5 s the helper falls back to `requestStopWithError`, then the force stop, as before.
+Nothing of this has run in a guest: that a macOS guest serves `AF_VSOCK=40` to a process,
+the `sockaddr_vm` layout, binding on any context id, and that `connectToPort` reaches the
+listener are checked on a Studio next. To read in the next E1 run: each arm's `stop.how` is
+`guest shut down (vsock)` when it worked (`guest shut down (requestStop)` when only the
+fallback did, `force-stopped ...` when neither did), `stop.vsock_acked` and
+`stop.vsock_detail` say whether the daemon acked and why not, the arm's trace holds a
+`shutdown-command` event, and `/var/log/com.kbf.probe.shutdown.log` in the harvest shows
+the listener's `bind` result and each connection.
+
 ## What to send back
 
 Everything the commands wrote, including each helper's log (the cause of a VM that did
