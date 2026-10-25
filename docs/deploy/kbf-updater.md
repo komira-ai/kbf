@@ -347,7 +347,9 @@ a release on a real farm. It does nothing until an operator has done the three t
 until then the job prints `::notice::the deploy step is off` and passes, so a fork or a repository
 that runs no farm is unaffected. Nothing in this repository does any of them.
 
-1. **Deploy the coordinator** (`kbf-coordinator`, [the design](../design/updates.md)) with a
+1. **Deploy the coordinator** (`kbf-coordinator`, [the design](../design/updates.md); as a pod
+   under an orchestrator such as k3s, or as one container on one host under Docker, see
+   [containers.md](containers.md#run-the-coordinator-on-one-host)) with a
    certificate the farm CA issued with the role `coordinator`, and an allow-list for CI's OIDC
    token in the file `--oidc-config` names. The job's token is the run's, so the allow-list must
    say exactly this, and nothing wider:
@@ -367,8 +369,9 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    `event_names` must name `workflow_run`: the release workflow is started by the completion of
    the pipeline, and its tokens say so (the default list is `push` and `workflow_dispatch`).
    The `sha` of the token is the head of `main`, not the commit released. A token is good for one
-   call. The control listener (`--control-listen`) must be reachable from GitHub-hosted runners;
-   the heartbeat listener need not be.
+   call. The control listener (`--control-listen`) must be reachable from the runner that runs the
+   `deploy` job, over whatever network joins them; the heartbeat listener only from the hosts'
+   updaters. Both addresses are configuration of the deployment, not of kbf.
 2. **Enroll the hosts**, so that their updaters heartbeat to the coordinator
    ([The agent mode](#the-agent-mode)). A host that does not heartbeat is `down`, and the
    coordinator does not wait for it: it says `converged` when every host that does heartbeat runs
