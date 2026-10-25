@@ -26,6 +26,7 @@ use objc2_virtualization::{
 
 use super::config::{self, ConsoleFds};
 use super::{Queued, Shared, describe};
+use crate::guest_command::Arbiter;
 use crate::sink::{self, Limiter, MAX_CONNECTIONS, Results};
 use crate::spec::{Event, SHUTDOWN_COMMAND, VmSpec};
 
@@ -238,14 +239,17 @@ fn request_guest_shutdown(
             command_failed("the VM has no virtio socket device".to_owned(), &q, &h, ms);
             return;
         };
-        // Whichever of the completion handler and the timer below settles first decides; the
-        // other does nothing. Without the timer a handler that never fires would leave the
-        // guest with neither the command nor the stop request.
-        let settled = Arc::new(AtomicBool::new(false));
+        // The worker below (started by the completion handler) and this timer each call
+        // `try_settle` before they send or emit anything; the first wins and the other does
+        // nothing. The worker settles before it sends, so a guest that acked and is still
+        // powering off is never given the stop request; a completion that comes after the
+        // timer won drops its connection without sending. Without the timer a handler that
+        // never fires would leave the guest with neither the command nor the stop request.
+        let settled = Arc::new(Arbiter::default());
         let (timer_settled, tq, th) = (settled.clone(), q.clone(), h.clone());
         std::thread::spawn(move || {
             std::thread::sleep(CONNECT_TIMEOUT);
-            if !timer_settled.swap(true, Ordering::SeqCst) {
+            if timer_settled.try_settle() {
                 command_failed("connect: no completion".to_owned(), &tq, &th, ms);
             }
         });
@@ -262,9 +266,14 @@ fn request_guest_shutdown(
                         |e| describe(e).0,
                     )),
                 };
-                let (q3, h3) = (q2.clone(), h2.clone());
+                let (q3, h3, arbiter) = (q2.clone(), h2.clone(), settled.clone());
                 // Off the VM's queue: the exchange blocks on the guest.
                 std::thread::spawn(move || {
+                    if !arbiter.try_settle() {
+                        // The timer already fell back to the stop request: send nothing,
+                        // report nothing, and drop the connection.
+                        return;
+                    }
                     let result =
                         connection
                             .map_err(|e| format!("connect: {e}"))

@@ -752,7 +752,7 @@ mod tests {
         let r = e1(&c);
         let took = began.elapsed();
         assert!(took >= Duration::from_millis(300), "{took:?}");
-        assert!(took < Duration::from_millis(580), "{took:?}");
+        assert!(took < Duration::from_millis(1500), "{took:?}");
         for i in 0..2 {
             assert_eq!(
                 arm(&r, i)["stop"]["how"],

@@ -8,9 +8,25 @@
 //! exchange over it, which runs in unit tests on any OS.
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use kbf_guest::frame::{self, Frame, Kind, SendError};
 use kbf_guest::shutdown::NAME;
+
+/// Decides who acts on a shutdown request: the connection's completion (which sends the
+/// command) or the timer that falls back to the stop request when no completion comes.
+/// Each calls [`try_settle`](Self::try_settle) before doing anything visible, and only the
+/// first caller gets `true`; the other does nothing, so the guest gets the command or the
+/// stop request, not both, and no spurious "no ack" is reported for a command that was sent.
+#[derive(Debug, Default)]
+pub struct Arbiter(AtomicBool);
+
+impl Arbiter {
+    /// True for exactly one caller over the arbiter's life.
+    pub fn try_settle(&self) -> bool {
+        !self.0.swap(true, Ordering::SeqCst)
+    }
+}
 
 /// Sends the `shutdown` command on `stream` and waits for the guest's reply.
 ///
@@ -60,6 +76,33 @@ mod tests {
             reply: Cursor::new(bytes),
             sent: Vec::new(),
         }
+    }
+
+    /// Catches a timer that presses the power button although the command was sent (the
+    /// guest acked and was still powering off after the timer's delay), a late completion
+    /// that sends the command after the timer fell back, and two parties that both win:
+    /// the first to settle wins, the other finds it settled, whichever it is, and of many
+    /// racing threads exactly one wins.
+    #[test]
+    fn exactly_one_of_the_completion_and_the_timer_acts() {
+        let a = Arbiter::default();
+        assert!(a.try_settle(), "the completion won");
+        assert!(!a.try_settle(), "the timer finds it settled");
+        assert!(!a.try_settle());
+        let a = Arbiter::default();
+        assert!(a.try_settle(), "the timer won");
+        assert!(!a.try_settle(), "a late completion finds it settled");
+        let a = std::sync::Arc::new(Arbiter::default());
+        let wins: usize = (0..16)
+            .map(|_| {
+                let a = a.clone();
+                std::thread::spawn(move || usize::from(a.try_settle()))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().expect("thread"))
+            .sum();
+        assert_eq!(wins, 1);
     }
 
     /// Catches a host that sends anything but the one `shutdown` frame the guest's listener
