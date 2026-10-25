@@ -2238,9 +2238,29 @@ dependencies = [
  "kbf-state",
  "kbf-testkit",
  "kbf-types",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "kbf-pack-adopt"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "kbf-objstore",
+ "kbf-pack",
+ "kbf-segments",
+ "kbf-state",
+ "kbf-testkit",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

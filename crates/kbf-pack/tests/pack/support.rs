@@ -51,6 +51,10 @@ pub struct FaultyStore {
     lose_puts: AtomicU32,
     fail_gets: AtomicU32,
     fail_deletes: AtomicU32,
+    pass_gets: AtomicU32,
+    pass_lists: AtomicU32,
+    fail_lists: AtomicU32,
+    vanishing: Mutex<Option<String>>,
     ranges: Mutex<Vec<(String, u64, u64)>>,
 }
 
@@ -75,6 +79,10 @@ impl FaultyStore {
             lose_puts: AtomicU32::new(0),
             fail_gets: AtomicU32::new(0),
             fail_deletes: AtomicU32::new(0),
+            pass_gets: AtomicU32::new(0),
+            pass_lists: AtomicU32::new(0),
+            fail_lists: AtomicU32::new(0),
+            vanishing: Mutex::new(None),
             ranges: Mutex::new(Vec::new()),
         }
     }
@@ -101,9 +109,31 @@ impl FaultyStore {
         self.fail_gets.store(n, Ordering::SeqCst);
     }
 
+    /// After the next `ok` reads go through, the `n` after them fail.
+    pub fn fail_gets_after(&self, ok: u32, n: u32) {
+        self.pass_gets.store(ok, Ordering::SeqCst);
+        self.fail_gets.store(n, Ordering::SeqCst);
+    }
+
     /// The next `n` deletes fail.
     pub fn fail_deletes(&self, n: u32) {
         self.fail_deletes.store(n, Ordering::SeqCst);
+    }
+
+    /// After the next `ok` listing calls go through, the one after them fails.
+    pub fn fail_list_after(&self, ok: u32) {
+        self.pass_lists.store(ok, Ordering::SeqCst);
+        self.fail_lists.store(1, Ordering::SeqCst);
+    }
+
+    /// From now on `key` is deleted from the store just before it is read: it was listed, and
+    /// is gone by the time its footer is asked for.
+    pub fn vanish(&self, key: &str) {
+        let mut doomed = self
+            .vanishing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *doomed = Some(key.to_owned());
     }
 
     /// Every range read so far: the key, the offset and the length.
@@ -162,8 +192,17 @@ impl ObjectStore for FaultyStore {
     ) -> Result<Bytes, ObjectStoreError> {
         let asked = (key.to_string(), range.offset(), range.size());
         note(&self.ranges, asked);
-        if fires(&self.fail_gets) {
+        let passes = fires(&self.pass_gets);
+        if !passes && fires(&self.fail_gets) {
             return Err(injected());
+        }
+        let doomed = self
+            .vanishing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if doomed.as_deref() == Some(key.as_str()) {
+            self.inner.delete(key).await?;
         }
         self.inner.get_range(key, range).await
     }
@@ -185,6 +224,10 @@ impl ObjectStore for FaultyStore {
         after: Option<&ListToken>,
         max_keys: PageSize,
     ) -> Result<ListPage, ObjectStoreError> {
+        let passes = fires(&self.pass_lists);
+        if !passes && fires(&self.fail_lists) {
+            return Err(injected());
+        }
         self.inner.list(prefix, after, max_keys).await
     }
 }

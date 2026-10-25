@@ -21,9 +21,12 @@ kbf-segments.workspace = true
 kbf-state.workspace = true
 # `Digest`, the key of a segment's index.
 kbf-types.workspace = true
+# The report of an adoption (`adopt`), which is also its checkpoint, is kept as JSON.
+serde.workspace = true
 thiserror.workspace = true
-# `rt`, to run the blocking index and cache calls off the async worker threads.
-tokio = { workspace = true, features = ["rt"] }
+# `rt`, to run the blocking index and cache calls off the async worker threads; `time`, to
+# space out the segments an adoption handles.
+tokio = { workspace = true, features = ["rt", "time"] }
 # A write that failed and a cache that could not keep a blob are logged, not returned.
 tracing.workspace = true
 
@@ -32,7 +35,10 @@ tracing.workspace = true
 kbf-state = { workspace = true, features = ["test-support"] }
 # `TestDir`, the cache directories of the tests.
 kbf-testkit.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+# The report of an adoption written and read back (tests/pack/adopt.rs).
+serde_json.workspace = true
+# `test-util`: the clock of the test that paces an adoption stands still until it is waited on.
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 
 [lints]
 workspace = true
