@@ -1432,8 +1432,8 @@ fn the_network_join_of_deploy_uses_the_run_token_and_variables_only() {
     // Catches: a secret given to the join (the job would hold more than the run token), an
     // input added or changed, the join under another condition or unconditional (a farm
     // without a tailnet would fail every release), the join moved before the build (the
-    // build's scripts would see the network) or after the verb, a second join, and the
-    // action used by another job.
+    // build's scripts would see the network) or after the verb, an `env:` on it, a second
+    // join, and the action used by another job.
     let join = "          oauth-client-id: ${{ vars.KBF_DEPLOY_TS_CLIENT_ID }}\n";
     red(
         &plant(
@@ -1490,6 +1490,20 @@ fn the_network_join_of_deploy_uses_the_run_token_and_variables_only() {
     red(
         &problems(&moved).expect("the planted workflow is read"),
         "not after `cargo build -p xtask`",
+    );
+    // After the verb: the join moved to the end of the file, which is the end of `deploy`.
+    let late = [&real[..start], &real[end..], block].concat();
+    red(
+        &problems(&late).expect("the planted workflow is read"),
+        "before `cargo xtask deploy-farm`",
+    );
+    red(
+        &plant(
+            "deploy",
+            "        if: ${{ vars.KBF_DEPLOY_TS_CLIENT_ID != '' }}\n",
+            "        if: ${{ vars.KBF_DEPLOY_TS_CLIENT_ID != '' }}\n        env:\n          TS_AUTHKEY: ${{ vars.KBF_DEPLOY_TS_KEY }}\n",
+        ),
+        "has an `env:`",
     );
     let twice = real.replacen(block, &format!("{block}{block}"), 1);
     red(

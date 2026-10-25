@@ -1034,7 +1034,8 @@ fn deploy_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
 }
 
 /// The network join of `deploy`, if there is one: one step, after the build of xtask and before
-/// the verb (at `verb_at`), under [`TS_IF`], given exactly [`TS_WITH`]; and in no other job.
+/// the verb (at `verb_at`), under [`TS_IF`], given exactly [`TS_WITH`] and no `env:`; and in no
+/// other job.
 fn tailnet_join(
     release: &str,
     steps: &[workflows::Step],
@@ -1083,6 +1084,11 @@ fn tailnet_join(
         if with != want {
             out.push(format!(
                 "the network join of `{DEPLOY}` is given {with:?}, not exactly {want:?}: the client id, audience and tags are repository variables, and the run token is its only credential"
+            ));
+        }
+        if !step.env.is_empty() {
+            out.push(format!(
+                "the network join of `{DEPLOY}` has an `env:`: its inputs are the three repository variables of `with:` alone"
             ));
         }
         if i > verb_at || built.is_none_or(|b| i < b) {
