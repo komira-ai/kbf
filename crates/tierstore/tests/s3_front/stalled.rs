@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 
 use crate::support::{BUCKET, Harness};
 
@@ -32,6 +32,12 @@ pub fn status_of(answer: &str) -> u16 {
     answer[9..12].parse().unwrap()
 }
 
+/// The receive buffer of the connection of [`send_get`]. A small fixed one, so that what the
+/// server can send ahead of the reader, and how soon a read lets it send more, do not depend on
+/// how large the host lets a socket's buffer grow (a host with 32 MiB receive buffers held back
+/// a slow but steady reader's answer past the idle time).
+const GET_RECEIVE_BUFFER: u32 = 256 << 10;
+
 /// Sends a signed get of `key` on a connection of its own, which closes after the answer, and
 /// does not read the answer.
 pub async fn send_get(h: &Harness, key: &str) -> TcpStream {
@@ -39,7 +45,9 @@ pub async fn send_get(h: &Harness, key: &str) -> TcpStream {
     let mut headers = h.signed("GET", &path, &[], &[], b"");
     headers.push(("connection".to_owned(), "close".to_owned()));
     let text = head("GET", &path, &headers, 0);
-    let mut stream = TcpStream::connect(h.addr).await.unwrap();
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(GET_RECEIVE_BUFFER).unwrap();
+    let mut stream = socket.connect(h.addr).await.unwrap();
     stream.write_all(text.as_bytes()).await.unwrap();
     stream
 }
