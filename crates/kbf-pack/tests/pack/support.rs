@@ -56,10 +56,18 @@ pub struct FaultyStore {
 
 impl FaultyStore {
     pub fn empty() -> Self {
-        let capabilities = Capabilities {
+        Self::with(Capabilities {
             conditional_put: true,
             object_lock: false,
-        };
+        })
+    }
+
+    /// An empty store that claims no create-only writes: a second write of a key replaces it.
+    pub fn replacing() -> Self {
+        Self::with(Capabilities::default())
+    }
+
+    fn with(capabilities: Capabilities) -> Self {
         Self {
             inner: MemoryStore::new(capabilities),
             pass_puts: AtomicU32::new(0),

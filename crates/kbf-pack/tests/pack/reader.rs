@@ -160,7 +160,7 @@ async fn bytes_the_store_does_not_have_are_lost() {
     let gone = blob("a blob whose pack was deleted");
     let past = blob("a blob that starts past the end of its object");
     let cut = blob("a blob that its object ends in the middle of");
-    let rig = packed(&[gone.clone()]).await;
+    let rig = packed(std::slice::from_ref(&gone)).await;
     rig.store.delete(&keys().key(0)).await.unwrap();
     rig.store.seed("cas/x/past", b"0123456789").await;
     rig.store.seed("cas/x/cut", b"0123456789").await;
@@ -182,7 +182,7 @@ async fn bytes_the_store_does_not_have_are_lost() {
 async fn bytes_that_are_not_the_digest_are_damaged() {
     let good = blob("a blob that is stored as it should be");
     let genuine = blob("0123456789");
-    let rig = packed(&[good.clone()]).await;
+    let rig = packed(std::slice::from_ref(&good)).await;
     rig.store.seed("cas/x/forged", b"ABCDEFGHIJ").await;
     let forged_row = row("cas/x/forged", 10, &genuine, 0);
     rig.index.record_pack(&forged_row).unwrap();

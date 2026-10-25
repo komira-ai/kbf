@@ -3,13 +3,13 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use kbf_objstore::{ByteRange, Capabilities, MemoryStore, ObjectStore};
+use kbf_objstore::{ByteRange, ObjectStore};
 use kbf_pack::{Blob, Fetch, PackError, Packer, PackerConfig, ReaderConfig, check_create_only};
 use kbf_segments::SegmentReader;
 use kbf_segments::layout::footer_len;
 use kbf_state::{MAX_BATCH, PackIndex};
 
-use crate::support::{Rig, blob, digests, filler, keys, limits, pack_all, pack_key};
+use crate::support::{FaultyStore, Rig, blob, digests, filler, keys, limits, pack_all, pack_key};
 
 /// Asserts that blobs are packed into one pack under the writer's first key, that the object
 /// is a segment whose footer holds every blob, that the index points each blob at the pack,
@@ -318,7 +318,7 @@ async fn a_failed_record_is_tried_again_for_the_same_pack() {
     let packer = rig.packer(PackerConfig::default());
     let x = blob("x");
 
-    let packed = pack_all(&packer, &[x.clone()]).await;
+    let packed = pack_all(&packer, std::slice::from_ref(&x)).await;
 
     assert_eq!(packed.packs[0].key, pack_key(0));
     assert_eq!(packed.packs[0].indexed, 1);
@@ -497,7 +497,9 @@ async fn the_create_only_self_test_passes_on_a_store_that_refuses_to_replace() {
 #[tokio::test]
 async fn a_store_that_replaces_objects_is_refused() {
     let rig = Rig::new();
-    let store = Arc::new(MemoryStore::new(Capabilities::default()));
+    // The same store type as every other packer of these tests, so that the refusal is a branch
+    // of the one copy of `Packer::new` they all run.
+    let store = Arc::new(FaultyStore::replacing());
 
     let tested = check_create_only(&*store, &keys()).await.unwrap_err();
     assert!(matches!(tested, PackError::CreateOnlySelfTest));
