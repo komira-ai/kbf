@@ -29,7 +29,10 @@
 //! **The proxy.** [`Proxy`] answers a client's CAS, ByteStream and action-cache calls from
 //! storage nodes instead of the cache ([`routes_proxied`]; `kbf-server --storage`):
 //! ByteStream as a raw HTTP/2 pass-through that never holds a blob, the rest at the
-//! tonic level. See the `proxy` module for what it keeps and what it does not do yet.
+//! tonic level. See the `proxy` module for what it keeps and what it does not do yet. Given
+//! [`Packs`], the proxy writes a client's uploads into packs in an object store and finds them
+//! through the pack index ([`Proxy::with_packs`]), and so does the backend Execute reads
+//! through ([`Backend::remote_over`], [`Backend::routed_over`]).
 //!
 //! **The backend.** Execute reads the store through a [`Backend`], a cache in this
 //! process, a storage node ([`Backend::remote`]) or the storage nodes of a map
@@ -123,7 +126,11 @@ pub use crate::execution::{
 pub use crate::input_tree::{ENTRY_OVERHEAD, InputTreeConfig};
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
 pub use crate::operations::OperationsService;
-pub use crate::proxy::{Direction, Meter, Method, Owner, Owners, Proxy};
+pub use crate::proxy::{
+    DEFAULT_INFLIGHT_BYTES, DEFAULT_UPLOAD_IDLE_TIMEOUT, Direction, MAX_PACKED_BLOB_BYTES,
+    MAX_UPLOAD_IDLE_TIMEOUT, Meter, Method, Owner, Owners, PackMetrics, PackSettings, PackStore,
+    Packs, Proxy,
+};
 pub use crate::recorder::{
     ActionLabel, DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording,
     Tap, listing, owner, wall_now,

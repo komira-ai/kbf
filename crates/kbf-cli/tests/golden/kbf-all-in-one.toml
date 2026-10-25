@@ -210,7 +210,7 @@ input-tree-cache-bytes = 268435456
 input-tree-cache-entries = 1048576
 # The most Directory blobs the input check reads from the store at once, across all Executes
 input-tree-reads-in-flight = 64
-# Opens the pack index at start: the tables in the Postgres state store that say which pack holds each blob and where. Nothing reads or writes them yet, so the flag only checks that the store can hold them. Needs `--state-store` as a `postgres://` URL whose schema has the pack tables (`kbf-installer setup` makes them); a `sqlite://` store is refused. Left out, no pack table is touched
+# Opens the pack index at start: the tables in the Postgres state store that say which pack holds each blob and where. A frontend given `--pack-store-endpoint` reads and writes them; without it nothing does, and the flag only checks that the store can hold them. Needs `--state-store` as a `postgres://` URL whose schema has the pack tables (`kbf-installer setup` makes them); a `sqlite://` store is refused. Left out, no pack table is touched
 pack-index = false
 # How often, in seconds, every open Execute and WaitExecution stream is sent its operation again (same name, not done, current stage), so a load balancer's idle timeout never cuts a long action. 0 sends none
 progress-interval-secs = 30

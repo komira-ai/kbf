@@ -72,6 +72,15 @@
 //! **Compression.** A gRPC-compressed message hides the name, so a call whose first
 //! message is compressed, or that names a `grpc-encoding` other than `identity`, is
 //! INVALID_ARGUMENT.
+//!
+//! **Packs.** Given packs, a Read of a blob the pack index holds is answered from its pack
+//! (a blob it lacks is passed on as above), and a Write of a plain blob within the packs'
+//! bound is received whole, hashed and packed: the exceptions to "no payload byte is
+//! collected" above, which hold one blob. Such a Write first takes its blob's size from the
+//! room that the uploads into packs share once the name has been read, and waits for it while
+//! they hold it all; it is ended DEADLINE_EXCEEDED if, once it has the room, no byte of its
+//! body arrives for the idle timeout (the `packed` module has the rules). Every other call is
+//! passed through as before.
 
 use std::convert::Infallible;
 use std::future::{Future, poll_fn};
@@ -91,6 +100,7 @@ use tonic::{Code, Status};
 
 use super::body::{Guard, Pass, Probe, Upload, collect, compressed, name_in};
 use super::owners::{Owner, Owners, no_storage};
+use super::packed::{self, Packs};
 use super::{Direction, Meter, Method, name};
 
 /// The raw ByteStream service.
@@ -99,6 +109,8 @@ pub(super) struct RawByteStream {
     pub owners: Owners,
     pub authorizers: Arc<Authorizers>,
     pub meter: Arc<Meter>,
+    /// The blobs read from and written to packs when there are some (the `packed` module).
+    pub packs: Option<Packs>,
 }
 
 impl NamedService for RawByteStream {
@@ -172,6 +184,15 @@ impl RawByteStream {
         }
     }
 
+    /// The packs, if there are any and an upload named `name` of the blob `digest` is theirs:
+    /// the blob is within their bound and the name is not that of compressed bytes.
+    fn packs_for(&self, name: &str, digest: &Digest) -> Option<&Packs> {
+        match &self.packs {
+            Some(packs) if packed::applies(packs, name, digest) => Some(packs),
+            _ => None,
+        }
+    }
+
     /// Authorizes the call `method` against the instance in `name`, and says which blob
     /// it is about.
     async fn authorized(
@@ -206,6 +227,10 @@ impl RawByteStream {
         // What was read to find the name is the part of the upload that can be sent again.
         upload.seal();
         let resource = self.authorized(parts, Method::Write, &name).await?;
+        if let Some(packs) = self.packs_for(&name, &resource.digest) {
+            let body = Body::new(up);
+            return packed::write_stream(packs, body, &name, resource.digest).await;
+        }
         // The upload waits for an owner while it can be sent whole: nothing of it but the
         // frames above has been read from the client.
         let mut waiting = self.owners.waiting();
@@ -316,6 +341,12 @@ impl RawByteStream {
             let owners = [self.owners.writer(&resource.digest)?];
             let answered = self.ask_all(&owners, None, parts, &request, method).await;
             return answered.map_err(|unanswered| unanswered.status);
+        }
+        if let Some(packs) = &self.packs {
+            let answered = packed::read_stream(packs, &name, &resource.digest, &request).await?;
+            if let Some(response) = answered {
+                return Ok(response);
+            }
         }
         // A read asks every owner in turn, and while none answers and one is away, again
         // after a pause, against the placement as it is by then.

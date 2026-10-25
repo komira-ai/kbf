@@ -31,6 +31,8 @@ kbf-enroll-registry.workspace = true
 kbf-mdm-api.workspace = true
 kbf-meta.workspace = true
 kbf-objstore.workspace = true
+# The pack keys, the read cache and the errors of the frontend's packs (frontend/pack_flags.rs).
+kbf-pack.workspace = true
 # The certificate's names, serial and key hash a deny entry is compared with (identity.rs,
 # members_rpc.rs): the one reader the storage service uses too.
 kbf-peer.workspace = true

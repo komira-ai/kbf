@@ -206,6 +206,9 @@ pub enum ServeError {
     /// The storage map could not be read from the state store.
     #[error("storage map: {0}")]
     Map(#[from] MembershipError),
+    /// The pack store does not refuse to replace an object, or cannot be written to.
+    #[error("--pack-store-endpoint: {0}")]
+    Packs(String),
 }
 
 /// A server that is listening: the addresses it bound, and the future that serves
