@@ -129,6 +129,10 @@ pub struct Linux<E: Exec> {
     pub(crate) tools: Tools,
     /// Who owns the files of a stage: root, on a host.
     pub(crate) owner: Owner,
+    /// The name of the frontend container this helper serves, when it has a configuration
+    /// file of its own: it is part of the names of the scratch and check directories, so that
+    /// two helpers staging at once never remove each other's download.
+    pub(crate) scratch_tag: Option<String>,
 }
 
 pub(super) fn commit_id(commit: &str) -> Result<CommitId, Fault> {
@@ -224,7 +228,15 @@ impl<E: Exec> Linux<E> {
     /// The scratch directory the unprivileged user fetches into, owned by it.
     pub(super) fn fetch_scratch(&self, prefix: &str, who: Identity) -> Result<PathBuf, Fault> {
         let work = self.layout.join(&self.layout.work_dir());
-        fetch_scratch_in(&work, prefix, who)
+        fetch_scratch_in(&work, &self.tagged(prefix), who)
+    }
+
+    /// `name`, with this helper's tag if it has one: `<name>.<tag>`.
+    pub(super) fn tagged(&self, name: &str) -> String {
+        match &self.scratch_tag {
+            Some(tag) => format!("{name}.{tag}"),
+            None => name.to_owned(),
+        }
     }
 
     /// What a fetch needs of the root-owned configuration, read once: the channel's source
@@ -560,5 +572,6 @@ pub fn production(units: Vec<Unit>) -> Linux<kbf_host::HostExec> {
         installer_runner: Box::new(kbf_installer::run::SystemRunner),
         tools: Tools::production(),
         owner: Owner { uid: 0, gid: 0 },
+        scratch_tag: None,
     }
 }

@@ -714,6 +714,12 @@ container ([the example](../../packaging/host-agent/linux/host-install-frontend.
 | `drain_secs` | optional (default 180, at most 1800): how long a drain is waited for |
 | `ready_secs` | optional (default 90, 10 to 600): how long a new container has to be ready |
 
+`group_add` is written into the record only when it is set, so that a host that sets none writes
+the record it always did and an older helper still reads it. **A host that sets `group_add` must
+settle (confirm) or revert any release on trial before the helper is rolled back to a version
+without `group_add`**: that version refuses a record with a key it does not know, and could not run
+the deadline revert.
+
 A switch has to fit `--window-secs`: `drain_secs` + 30 (the stop) + `ready_secs` is checked against
 it (`config_invalid` when it does not).
 
@@ -801,13 +807,18 @@ kbf-host-install --serve --socket /run/kbf-host-install/fe-a.sock --socket-user 
 ```
 
 A helper started with a `--frontend-config` other than the default keeps its files under the name
-of the container in that file, in `/var/lib/kbf-host-install`: the record is
-`frontend-<name>.json`, the A/B state is `state-frontend-<name>.json`, and its install lock is
-`/run/kbf-host-install-frontend-<name>.lock`. Two helpers for two containers therefore share no
-record, pending marker or lock, and the deadline revert of one cannot touch the other's container.
-The helper for the default file keeps `frontend.json`, `state.json` and the host's lock, as
-before. The name is read when the helper starts; a file that names another container afterwards is
-refused with `config_invalid` until the helper is restarted. Give the helpers different `--socket`
+of the container in that file. **Per helper**, in `/var/lib/kbf-host-install`: the record
+`frontend-<name>.json` and the A/B state `state-frontend-<name>.json`; the install lock
+`/run/kbf-host-install-frontend-<name>.lock`; and the download and check directories under the
+installer's work directory (`<commit-prefix>.<name>.fetch`, `<commit>.<name>.check`). **Shared** by all
+helpers: the audit log (append-only, safe to share) and Docker's image store. Two helpers for two
+containers therefore share no record, pending marker, lock or download, and the deadline revert of
+one cannot touch the other's container. The helper for the default file keeps `frontend.json`,
+`state.json`, the host's install lock and the plain directory names, as before. A named helper does
+**not** take the host's install lock (`/run/kbf-host-install.lock`) that the installer and the
+other paths take; it serializes only with itself. The name is read when the helper starts; a file
+that names another container afterwards is refused with `config_invalid` until the helper is
+restarted. Give the helpers different `--socket`
 paths (and different `--socket-user`s, or the same one with a socket each). Each file lists the
 other frontend in `peers`.
 

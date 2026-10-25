@@ -515,8 +515,10 @@ pub fn production(
     let files = Files::of(bound.as_deref());
     let mut host = Host::production();
     host.install_lock = files.lock.unwrap_or(host.install_lock);
+    let mut source = super::linux::production(Vec::new());
+    source.scratch_tag = bound.clone();
     Frontend {
-        source: super::linux::production(Vec::new()),
+        source,
         runtime: runtime::Docker::new(
             Box::new(crate::runner::SystemRunner),
             Path::new("/usr/bin/docker").to_path_buf(),

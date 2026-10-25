@@ -346,6 +346,7 @@ impl Rig {
                 uid: who.uid,
                 gid: who.gid,
             },
+            scratch_tag: None,
         };
         let rig = Self {
             dir,

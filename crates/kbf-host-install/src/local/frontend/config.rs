@@ -55,7 +55,12 @@ pub struct RunSpec {
     #[serde(default)]
     pub user: Option<String>,
     /// Supplementary groups of the container's process (`--group-add`), never 0.
-    #[serde(default)]
+    ///
+    /// Not written when empty, so that a record of a host that sets none is the bytes the
+    /// helper wrote before this key existed, and an older helper (which refuses unknown keys)
+    /// still reads it. A host that sets `group_add` must settle or revert any release on trial
+    /// before the helper is rolled back to a version without it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group_add: Vec<u32>,
     #[serde(default)]
     pub ports: Vec<String>,

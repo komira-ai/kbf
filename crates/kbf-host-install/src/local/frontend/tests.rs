@@ -562,7 +562,7 @@ fn the_real_pace_tells_time_and_sleeps() {
 #[test]
 fn the_production_frontend_is_on_the_hosts_paths() {
     let frontend = super::production(PathBuf::from(super::config::CONFIG), None);
-    assert!(frontend.bound_name.is_none());
+    assert!(frontend.bound_name.is_none() && frontend.source.scratch_tag.is_none());
     assert_eq!(
         frontend.config_file,
         PathBuf::from("/etc/kbf/host-install-frontend.toml")
@@ -579,6 +579,7 @@ fn the_production_frontend_is_on_the_hosts_paths() {
     // With a file of its own, the container's name makes the record and the lock.
     let own = super::production(PathBuf::from("/etc/kbf/fe-b.toml"), Some("kbf-fe-b".into()));
     assert_eq!(own.config_file, PathBuf::from("/etc/kbf/fe-b.toml"));
+    assert_eq!(own.source.scratch_tag.as_deref(), Some("kbf-fe-b"));
     assert_eq!(
         own.record_file,
         PathBuf::from("/var/lib/kbf-host-install/frontend-kbf-fe-b.json")
