@@ -1,0 +1,41 @@
+# The update coordinator (docs/design/updates.md) as a container on one host, under Docker
+# (docs/deploy/containers.md, "Run the coordinator on one host"). The image is the attested
+# release asset kbf-coordinator-image-<commit>-<platform>.oci.tar, loaded with
+# `docker image load`; there is no registry. It is known as kbf-coordinator:<commit>.
+#
+# Edit before use: <commit> (twice, with the loaded image), and the two addresses after
+# --publish. 192.0.2.10 is a documentation address: publish on the address the updaters and CI
+# reach this host at, which is configuration of this file and of nothing in kbf. The ports inside
+# the container are the image's: 8443 (heartbeat, mutual TLS) and 8444 (control).
+#
+# Files on the host, and nothing else is mounted:
+#   /etc/kbf-coordinator/tls.pem, tls.key, ca.pem, oidc.toml, operator.token
+#       read-only; the key and the token owned by uid 65532, mode 0600 (the token is refused
+#       at any other mode)
+#   /var/lib/kbf-coordinator   the desired state; owned by uid 65532, mode 0700
+#
+# An update is `docker image load` of the next archive, then edit <commit> and
+# `systemctl restart kbf-coordinator`. Restart=always replaces unless-stopped: Docker's own
+# restart policy is off (--rm), so systemd is the only thing that starts the container.
+[Unit]
+Description=kbf-coordinator, the update coordinator (container)
+Documentation=https://github.com/komira-ai/kbf/blob/main/docs/deploy/containers.md
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/bin/docker rm --force kbf-coordinator
+ExecStart=/usr/bin/docker run --rm --name kbf-coordinator --user 65532:65532 \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --publish 192.0.2.10:8443:8443 --publish 192.0.2.10:8444:8444 \
+  --volume /etc/kbf-coordinator:/etc/kbf-coordinator:ro \
+  --volume /var/lib/kbf-coordinator:/var/lib/kbf-coordinator \
+  kbf-coordinator:<commit>
+ExecStop=/usr/bin/docker stop --time 30 kbf-coordinator
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

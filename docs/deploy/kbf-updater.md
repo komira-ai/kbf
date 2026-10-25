@@ -347,7 +347,9 @@ a release on a real farm. It does nothing until an operator has done the three t
 until then the job prints `::notice::the deploy step is off` and passes, so a fork or a repository
 that runs no farm is unaffected. Nothing in this repository does any of them.
 
-1. **Deploy the coordinator** (`kbf-coordinator`, [the design](../design/updates.md)) with a
+1. **Deploy the coordinator** (`kbf-coordinator`, [the design](../design/updates.md); as a pod
+   under an orchestrator such as k3s, or as one container on one host under Docker, see
+   [containers.md](containers.md#run-the-coordinator-on-one-host)) with a
    certificate the farm CA issued with the role `coordinator`, and an allow-list for CI's OIDC
    token in the file `--oidc-config` names. The job's token is the run's, so the allow-list must
    say exactly this, and nothing wider:
