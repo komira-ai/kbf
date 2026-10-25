@@ -203,6 +203,15 @@ jobs:
       # is for.
       - name: Drop the workspace's coverage artifacts the cache restored
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
+      # The cache also restored target/debug, a plain (not instrumented) build of the workspace
+      # that this job does not run: the tests build into target/llvm-cov-target, and only the
+      # coverage gate (`cargo run -p kbf-coverage`, a few crates) builds plain, after the tests.
+      # Carried from run to run it had grown to 53 GB of a 145 GB runner, which left the tests
+      # under the stores' 5% free-space floor ('the store stopped taking the streamed blob').
+      # Dropping it before the tests gives them that room, and the cache saved after this run
+      # holds only what the job builds.
+      - name: Drop the plain debug build the cache restored
+        run: rm -rf target/debug
       # nextest runs a process per test, so a test's line coverage must not rest on another
       # test of the process: a `tracing` macro evaluates its fields only when a subscriber is
       # registered, so a test that runs one installs its own (`tracing::subscriber::set_default`
