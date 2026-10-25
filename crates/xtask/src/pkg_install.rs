@@ -14,8 +14,8 @@
 //! 4. after `systemd-sysusers` and `systemd-tmpfiles --create` (what a boot, and
 //!    `kbf setup`, do) the three users exist with no login shell and the three
 //!    directories exist, `root:root` 0755;
-//! 5. each `--gate` unit does not start without its file, and its condition passes once
-//!    the file exists;
+//! 5. each `--gate` unit does not start without its file (the journal says its condition
+//!    skipped the start), and begins to start once the file exists;
 //! 6. each `--probe` command exits 0 in the container and prints its text: the packaged
 //!    `gh` runs on the container's architecture, the binary names the commit.
 //!
@@ -222,18 +222,6 @@ impl<'a, 'b> Container<'a, 'b> {
         }
         Ok(())
     }
-
-    /// The properties `systemctl show` prints for `unit`.
-    fn show(&mut self, unit: &str) -> Result<BTreeMap<String, String>, Error> {
-        let mut args = vec!["systemctl", "show", unit];
-        args.extend(["-p", "ConditionResult", "-p", "ExecMainStartTimestamp"]);
-        let shown = self.say(&args)?;
-        Ok(shown
-            .lines()
-            .filter_map(|l| l.split_once('='))
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-            .collect())
-    }
 }
 
 /// A problem unless `got` is `want`.
@@ -256,40 +244,56 @@ fn names(text: &str) -> Vec<String> {
     names
 }
 
+/// What the journal says of the starts of `unit` since boot: how many the condition skipped
+/// (`was skipped because of an unmet condition check`) and how many began (`Starting ...`, which
+/// systemd logs only once the conditions hold).
+///
+/// The journal and not `systemctl show -p ConditionResult`: systemd reports `no` for a unit that
+/// is inactive again, and a unit whose program ends at once (the test's stand-in for `kbf`, or a
+/// real one that fails) is inactive again before `show` runs.
+fn starts(c: &mut Container, unit: &str) -> Result<(usize, usize), Error> {
+    c.exec(&["journalctl", "--sync"])?;
+    let log = c.say(&["journalctl", "-u", unit, "-o", "cat", "--no-pager"])?;
+    let skipped = log
+        .lines()
+        .filter(|l| l.contains("was skipped because of an unmet condition check"))
+        .count();
+    let begun = log.lines().filter(|l| l.starts_with("Starting ")).count();
+    Ok((skipped, begun))
+}
+
 /// The unit `gate` names, started without and then with its file.
 fn gate(c: &mut Container, g: &Gate, problems: &mut Vec<String>) -> Result<(), Error> {
     let unit = &g.unit;
-    // A start the condition skips succeeds; the properties say what happened.
+    // A start the condition skips succeeds; the journal says what happened.
     c.exec(&["rm", "-f", &g.path])?;
     c.exec(&["systemctl", "start", unit])?;
-    let shown = c.show(unit)?;
-    let got = |k: &str| shown.get(k).map_or("", String::as_str).to_owned();
-    eq(
-        problems,
-        &format!("{unit} without {}: ConditionResult", g.path),
-        &got("ConditionResult"),
-        "no",
-    );
-    eq(
-        problems,
-        &format!("{unit} without {}: ExecMainStartTimestamp", g.path),
-        &got("ExecMainStartTimestamp"),
-        "",
-    );
+    let (skipped, begun) = starts(c, unit)?;
+    if skipped == 0 {
+        problems.push(format!(
+            "{unit} without {}: its start was not skipped by its condition",
+            g.path
+        ));
+    }
+    if begun != 0 {
+        problems.push(format!("{unit} without {}: it began to start", g.path));
+    }
     c.must(
         "creating the gate file",
         &["install", "-D", "-m", "0644", "/dev/null", &g.path],
         problems,
     )?;
     c.exec(&["systemctl", "start", unit])?;
-    let shown = c.show(unit)?;
-    let got = |k: &str| shown.get(k).map_or("", String::as_str).to_owned();
-    eq(
-        problems,
-        &format!("{unit} with {}: ConditionResult", g.path),
-        &got("ConditionResult"),
-        "yes",
-    );
+    let (skipped_again, begun_again) = starts(c, unit)?;
+    if skipped_again != skipped {
+        problems.push(format!(
+            "{unit} with {}: its start was skipped by its condition again",
+            g.path
+        ));
+    }
+    if begun_again == 0 {
+        problems.push(format!("{unit} with {}: it did not begin to start", g.path));
+    }
     // The unit may have started or failed on what comes after its condition; either
     // way it must not stay.
     c.exec(&["systemctl", "stop", unit])?;
