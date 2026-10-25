@@ -26,6 +26,8 @@ enum Defect {
     UnitNamesMissingGroup,
     DirNotMade,
     GateIgnored,
+    /// The unit's condition never holds, file or not.
+    GateNeverHolds,
     GateRunsWithoutFile,
     RemoveKeepsFile,
     RemoveDeletesConfig,
@@ -377,7 +379,7 @@ impl World {
         } else {
             "/etc/kbf/installer.toml"
         };
-        let holds = self.files.contains(path)
+        let holds = (self.files.contains(path) && !self.is(Defect::GateNeverHolds))
             || self.is(Defect::GateIgnored)
             || self.is(Defect::GateRunsWithoutFile);
         let lines: Vec<String> = if holds {
@@ -527,7 +529,7 @@ fn the_unit_account_check_reads_unit_files_and_skips_directories() {
 
 #[test]
 fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
-    let cases: [(Format, Defect, &str); 21] = [
+    let cases: [(Format, Defect, &str); 22] = [
         (
             Format::Deb,
             Defect::NotInstalled,
@@ -596,6 +598,11 @@ fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
             Format::Deb,
             Defect::GateIgnored,
             "kbf-node.service without /etc/kbf/kbf.toml: its start was not skipped by its condition",
+        ),
+        (
+            Format::Deb,
+            Defect::GateNeverHolds,
+            "kbf-node.service with /etc/kbf/kbf.toml: it did not begin to start",
         ),
         (
             Format::Deb,
