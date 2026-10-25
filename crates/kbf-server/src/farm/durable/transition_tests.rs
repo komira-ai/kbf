@@ -539,4 +539,12 @@ fn the_remote_sessions_are_the_rows_of_nodes_this_frontend_does_not_hold() {
         .expect("put");
     let error = mine.remote_sessions(&none).expect_err("a corrupt row");
     assert!(error.to_string().contains("session/c"), "{error}");
+    // A row that decodes to another scheduler input is refused as well.
+    let submit = encode(FarmInput::Submit(request(1))).expect("encodes");
+    store
+        .txn(Txn::new().put("session/c", submit, Cond::Any))
+        .expect("store")
+        .expect("put");
+    let error = mine.remote_sessions(&none).expect_err("another input");
+    assert!(error.to_string().contains("session/c"), "{error}");
 }

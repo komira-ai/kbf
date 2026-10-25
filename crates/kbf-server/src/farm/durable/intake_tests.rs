@@ -805,6 +805,17 @@ async fn the_poll_lists_a_closed_stream_as_remote_and_forgets_refused_operations
     drop(inbox);
     farm.intake();
     assert_eq!(farm.lock().intake.remote.len(), 1, "a closed stream");
+    // A session row that cannot be read leaves the list as it was.
+    store
+        .txn(Txn::new().put("session/zz", vec![0xff], Cond::Any))
+        .expect("store")
+        .expect("put");
+    farm.intake();
+    assert_eq!(farm.lock().intake.remote.len(), 1, "a corrupt row");
+    store
+        .txn(Txn::new().delete("session/zz", Cond::Any))
+        .expect("store")
+        .expect("delete");
 
     let mut big = request(9);
     big.resources = Resources::new(64_000, 1 << 30);
