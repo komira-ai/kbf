@@ -14,7 +14,10 @@
 //!   methods are async, as the object store clients of the workspace are, and boxed so that a
 //!   backend is used as `dyn Backend`. It also has the four calls of a multipart upload
 //!   (create, upload a part from a stream of chunks, complete, abort), which a backend need
-//!   not override: the provided ones answer [`Error::Unsupported`].
+//!   not override: the provided ones answer [`Error::Unsupported`]. A backend whose store
+//!   must know the length of a part before it is sent overrides
+//!   [`Backend::upload_part_with_len`] too, which the S3 front calls with the `Content-Length`
+//!   of the request.
 //! - [`MemoryBackend`] is an in-memory backend whose times come from a [`TestClock`] that a
 //!   test sets by hand, and [`FaultyBackend`] wraps a backend to fail or delay chosen calls
 //!   and to count them: both are for tests. [`DirBackend`] keeps a bucket in a directory of the
@@ -22,7 +25,9 @@
 //! - `S3Backend` (feature `s3`, in the module `s3`) is a bucket of an S3-compatible store as
 //!   a [`Backend`]: a create-only put is `If-None-Match: *`, a put that replaces is
 //!   `If-Match`, a get is a ranged GET, a head gives the `ETag` as the content tag, and a
-//!   listing follows the continuation tokens. It does not yet do the multipart calls.
+//!   listing follows the continuation tokens. It does the multipart calls too: the chunks of
+//!   a part are sent to the store as they arrive, never collected, and a completion is
+//!   create-only.
 //! - [`Proxy`] is a store over a hot and a cold backend that is itself a [`Backend`]. Any
 //!   number of proxies (one per node, each with its own id) work over the same two backends,
 //!   and none needs state for correctness. A get reads the hot tier, else the cold tier, and
@@ -55,7 +60,8 @@
 //! [`Proxy`] (the calls of S3 clients, signed with SigV4, answered from the two tiers, with
 //! request bodies and answers that must make progress and checksums that are verified), and the
 //! `tierstore` binary, which runs a proxy, that front and a [`Reconciler`] in one process
-//! (`cargo build -p tierstore --features server`).
+//! (`cargo build -p tierstore --features server`), over memory, directory or S3 tiers; the
+//! feature turns `s3` on.
 
 #![forbid(unsafe_code)]
 

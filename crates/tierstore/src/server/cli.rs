@@ -6,13 +6,21 @@
 //! tiers. Everything is a flag; the process reads no environment variable, and the secret
 //! access key is read from a file, not from the command line.
 //!
-//! The tiers of this build are `memory` and `dir:<path>`. A memory tier keeps nothing when the
+//! The tiers are `memory`, `dir:<path>` and `s3:<bucket>`. A memory tier keeps nothing when the
 //! process stops, and its objects carry the time zero. A directory tier keeps its objects, and
 //! the multipart uploads in progress, in a directory of the local file system (see
 //! [`DirBackend`](crate::DirBackend)), so that they outlive a restart; the directory is made if
-//! it does not exist. Tiers over S3 stores are added with the S3 backend of this crate, and
-//! then `--hot` and `--cold` name them. The cold tier must do multipart uploads, which both of
-//! these do, and the proxy passes them to it.
+//! it does not exist. A tier `s3:<bucket>` is a bucket of an S3-compatible store (see
+//! [`S3Backend`]), which the flags of the tier say how to reach, with the name of the tier as
+//! their prefix: `--hot-endpoint` or `--cold-endpoint` (`http://host[:port]`, required),
+//! `--hot-region` or `--cold-region` (the signing region, `us-east-1` if not given), and
+//! `--hot-credentials-file` or `--cold-credentials-file` (required: the access key id on the
+//! first line and the secret access key on the second, in a file only its owner may read, as
+//! for `--access-key-file`; a secret on the command line would be world-readable). The two
+//! tiers have a key of their own, so they may be two stores. These flags are refused for a tier
+//! that is not an S3 bucket, since they would do nothing. A request to an S3 tier is bounded by
+//! `--s3-request-timeout`. The cold tier must do multipart uploads, which all three kinds do,
+//! and the proxy passes them to it.
 //!
 //! On SIGTERM or SIGINT the process drains (see the [`server`](super) docs): `/readyz` says 503,
 //! it serves for `--drain-lb-wait`, refuses new requests, waits for those in flight and for the
@@ -23,6 +31,7 @@
 use std::ffi::OsString;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -33,9 +42,10 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
+use crate::s3::{Capabilities, Credentials, S3Config};
 use crate::{
     Backend, Clock, DirBackend, MemoryBackend, Proxy, ProxyConfig, Reconciler, ReconcilerConfig,
-    SystemClock,
+    S3Backend, SystemClock,
 };
 
 use super::{Drained, Server, ServerConfig};
@@ -44,6 +54,16 @@ use super::{Drained, Server, ServerConfig};
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 const DEFAULT_MAX_REQUEST_BYTES: u64 = 256 << 20;
+
+/// The signing region of an S3 tier whose region is not given.
+const DEFAULT_REGION: &str = "us-east-1";
+
+/// How long a connection to an S3 tier may take to be opened.
+const S3_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The slowest rate, in bytes a second, at which the body of a write to an S3 tier is taken for
+/// granted to go: a write may take its request timeout plus its length at this rate.
+const S3_MIN_BODY_RATE: Option<NonZeroU64> = NonZeroU64::new(1 << 20);
 
 /// `tierstore`: an S3 server over a hot and a cold tier.
 ///
@@ -59,14 +79,51 @@ pub struct Cli {
     /// across restarts, and give each process over the same tiers one of its own.
     #[arg(long)]
     pub proxy_id: String,
-    /// The hot tier: `memory` (its objects are lost when the process stops) or `dir:<path>`
-    /// (a directory, made if it does not exist).
+    /// The hot tier: `memory` (its objects are lost when the process stops), `dir:<path>` (a
+    /// directory, made if it does not exist) or `s3:<bucket>` (a bucket of an S3-compatible
+    /// store, which needs `--hot-endpoint` and `--hot-credentials-file`).
     #[arg(long)]
     pub hot: String,
-    /// The cold tier: `memory` or `dir:<path>`. Multipart uploads go straight to it, part by
-    /// part, so it must do them; both kinds do.
+    /// The cold tier: `memory`, `dir:<path>` or `s3:<bucket>` (which needs `--cold-endpoint`
+    /// and `--cold-credentials-file`). Multipart uploads go straight to it, part by part, so it
+    /// must do them; all three kinds do.
     #[arg(long)]
     pub cold: String,
+    /// The endpoint of the hot tier when it is `s3:<bucket>`: `http://host[:port]`, with no
+    /// path. TLS is not built yet.
+    #[arg(long)]
+    pub hot_endpoint: Option<String>,
+    /// The region in the credential scope of the requests to the hot tier when it is
+    /// `s3:<bucket>`; `us-east-1` if not given.
+    #[arg(long)]
+    pub hot_region: Option<String>,
+    /// The file that holds the access key of the hot tier when it is `s3:<bucket>`: the access
+    /// key id on the first line and the secret access key on the second. Only its owner may
+    /// read it (mode 0600).
+    #[arg(long)]
+    pub hot_credentials_file: Option<PathBuf>,
+    /// The endpoint of the cold tier when it is `s3:<bucket>`: `http://host[:port]`, with no
+    /// path. TLS is not built yet.
+    #[arg(long)]
+    pub cold_endpoint: Option<String>,
+    /// The region in the credential scope of the requests to the cold tier when it is
+    /// `s3:<bucket>`; `us-east-1` if not given.
+    #[arg(long)]
+    pub cold_region: Option<String>,
+    /// The file that holds the access key of the cold tier when it is `s3:<bucket>`: the
+    /// access key id on the first line and the secret access key on the second. Only its owner
+    /// may read it (mode 0600).
+    #[arg(long)]
+    pub cold_credentials_file: Option<PathBuf>,
+    /// The limit on a request to an `s3:<bucket>` tier: a number and `ms`, `s`, `m` or `h`. A
+    /// request with a small body, or none, may take this long in all; a ranged read may take
+    /// longer while bytes keep arriving; a write may take this long plus the time its body
+    /// takes at 1 MiB a second; and the part of a multipart upload, which is as slow as the
+    /// client that sends it, is cut only if it makes no progress for this long. The completion
+    /// of a multipart upload has a small body, so it may take this long in all, and a store may
+    /// take minutes to put a large object together: set this longer than the longest.
+    #[arg(long, default_value = "60s", value_parser = parse_duration)]
+    pub s3_request_timeout: Duration,
     /// The bytes the hot tier is meant to hold; the water marks are shares of it.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub hot_bytes: u64,
@@ -165,7 +222,97 @@ struct Built {
     cold: Arc<dyn Backend>,
 }
 
-/// The tier a flag names.
+/// The flags that say how to reach a tier that is an S3 bucket.
+struct S3Flags<'a> {
+    endpoint: Option<&'a str>,
+    region: Option<&'a str>,
+    credentials: Option<&'a Path>,
+}
+
+impl S3Flags<'_> {
+    /// Whether any of the flags was given.
+    fn given(&self) -> bool {
+        let given = [
+            self.endpoint.is_some(),
+            self.region.is_some(),
+            self.credentials.is_some(),
+        ];
+        given.contains(&true)
+    }
+}
+
+impl Cli {
+    /// The flags of the hot tier that are for an S3 bucket.
+    fn hot_s3(&self) -> S3Flags<'_> {
+        S3Flags {
+            endpoint: self.hot_endpoint.as_deref(),
+            region: self.hot_region.as_deref(),
+            credentials: self.hot_credentials_file.as_deref(),
+        }
+    }
+
+    /// The flags of the cold tier that are for an S3 bucket.
+    fn cold_s3(&self) -> S3Flags<'_> {
+        S3Flags {
+            endpoint: self.cold_endpoint.as_deref(),
+            region: self.cold_region.as_deref(),
+            credentials: self.cold_credentials_file.as_deref(),
+        }
+    }
+}
+
+/// The tier a flag names, with the flags that go with it: a bucket of an S3-compatible store,
+/// or one of the kinds that `tier` opens, which have no use for those flags.
+fn open_tier(
+    flag: &str,
+    spec: &str,
+    s3: &S3Flags<'_>,
+    timeout: Duration,
+) -> Result<Arc<dyn Backend>, String> {
+    match spec.strip_prefix("s3:") {
+        Some(bucket) => s3_tier(flag, spec, bucket, s3, timeout),
+        None if s3.given() => {
+            let why = "its endpoint, region and credentials flags are for an `s3:<bucket>` tier";
+            Err(format!("{flag} {spec:?}: {why}"))
+        }
+        None => tier(flag, spec),
+    }
+}
+
+/// The bucket `bucket` of the S3-compatible store that `s3` says how to reach, as the tier
+/// that `flag` names with `spec`.
+fn s3_tier(
+    flag: &str,
+    spec: &str,
+    bucket: &str,
+    s3: &S3Flags<'_>,
+    timeout: Duration,
+) -> Result<Arc<dyn Backend>, String> {
+    let fail = |why: String| format!("{flag} {spec:?}: {why}");
+    let Some(endpoint) = s3.endpoint else {
+        return Err(fail(format!("it needs {flag}-endpoint")));
+    };
+    let Some(credentials) = s3.credentials else {
+        return Err(fail(format!("it needs {flag}-credentials-file")));
+    };
+    let credentials_flag = format!("{flag}-credentials-file");
+    let (key_id, secret) = read_credentials(&credentials_flag, credentials)?;
+    let config = S3Config {
+        endpoint: endpoint.to_owned(),
+        region: s3.region.unwrap_or(DEFAULT_REGION).to_owned(),
+        bucket: bucket.to_owned(),
+        credentials: Credentials::new(key_id, secret),
+        capabilities: Capabilities::default(),
+        connect_timeout: S3_CONNECT_TIMEOUT,
+        request_timeout: timeout,
+        min_body_rate: S3_MIN_BODY_RATE,
+    };
+    let built = S3Backend::new(config);
+    let backend = built.map_err(|why| fail(why.to_string()))?;
+    Ok(Arc::new(backend))
+}
+
+/// The tier a flag names, of the kinds that need no flags besides the tier's own.
 fn tier(flag: &str, spec: &str) -> Result<Arc<dyn Backend>, String> {
     match (spec, spec.strip_prefix("dir:")) {
         ("memory", _) => Ok(Arc::new(MemoryBackend::new())),
@@ -174,16 +321,21 @@ fn tier(flag: &str, spec: &str) -> Result<Arc<dyn Backend>, String> {
             Err(why) => Err(format!("{flag} {spec:?}: {why}")),
         },
         _ => {
-            let why = "only `memory` and `dir:<path>` can be opened by this build";
+            let why = "only `memory`, `dir:<path>` and `s3:<bucket>` are tiers";
             Err(format!("{flag} {spec:?}: {why}"))
         }
     }
 }
 
-/// The access key id and the secret access key in the file.
+/// The access key id and the secret access key in the file of `--access-key-file`.
 fn read_key(path: &Path) -> Result<(String, String), String> {
+    read_credentials("--access-key-file", path)
+}
+
+/// The access key id and the secret access key in the file that the flag `flag` names.
+fn read_credentials(flag: &str, path: &Path) -> Result<(String, String), String> {
     let shown = path.display();
-    let fail = |why: String| format!("--access-key-file {shown}: {why}");
+    let fail = |why: String| format!("{flag} {shown}: {why}");
     let meta = std::fs::metadata(path);
     let meta = meta.map_err(|why| fail(why.to_string()))?;
     if meta.permissions().mode() & 0o077 != 0 {
@@ -222,9 +374,13 @@ fn build(cli: &Cli) -> Result<Built, String> {
     if cli.body_idle_timeout.is_zero() {
         return Err("--body-idle-timeout must be longer than zero".to_owned());
     }
+    if cli.s3_request_timeout.is_zero() {
+        return Err("--s3-request-timeout must be longer than zero".to_owned());
+    }
     let (key_id, secret) = read_key(&cli.access_key_file)?;
-    let hot = tier("--hot", &cli.hot)?;
-    let cold = tier("--cold", &cli.cold)?;
+    let timeout = cli.s3_request_timeout;
+    let hot = open_tier("--hot", &cli.hot, &cli.hot_s3(), timeout)?;
+    let cold = open_tier("--cold", &cli.cold, &cli.cold_s3(), timeout)?;
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut server = ServerConfig::new(&cli.bucket, &key_id, &secret, Arc::clone(&clock));
     server.region = cli.region.clone();

@@ -436,7 +436,7 @@ async fn the_fake_refuses_what_s3_refuses() {
 /// Catches a store without conditional writes sent a condition (S3 refuses a key
 /// written again only when asked), or refusing an overwrite it should take: on such a
 /// store a single PUT and a multipart upload over an existing key both replace it, and
-/// an abort of an upload the service never began is refused.
+/// an abort of an upload the service never began is refused as `NoSuchUpload` (404).
 #[tokio::test]
 async fn a_store_without_conditional_writes_replaces_a_key() {
     let s3 = FakeS3::start().await;
@@ -459,5 +459,6 @@ async fn a_store_without_conditional_writes_replaces_a_key() {
     assert_eq!(s3.stats().completed, 1, "{requests:?}");
     let unknown = format!("{}/kbf-fake/cas/replaced?uploadId=never", s3.endpoint());
     let refused = reqwest::Client::new().delete(unknown).send().await.unwrap();
-    assert_eq!(refused.status(), 500);
+    assert_eq!(refused.status(), 404);
+    assert!(refused.text().await.unwrap().contains("NoSuchUpload"));
 }

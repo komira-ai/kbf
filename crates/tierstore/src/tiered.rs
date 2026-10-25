@@ -569,8 +569,22 @@ impl Backend for Proxy {
         number: u32,
         body: PartBody<'_>,
     ) -> Result<String, Error> {
+        let sized = self.upload_part_with_len(key, id, number, None, body);
+        sized.await
+    }
+
+    async fn upload_part_with_len(
+        &self,
+        key: &str,
+        id: &str,
+        number: u32,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<String, Error> {
         refuse_reserved(key)?;
-        self.inner.cold.upload_part(key, id, number, body).await
+        let cold = &self.inner.cold;
+        let upload = cold.upload_part_with_len(key, id, number, len, body);
+        upload.await
     }
 
     async fn complete_upload(

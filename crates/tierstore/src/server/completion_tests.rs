@@ -1,5 +1,6 @@
-//! The checksum headers of the completion of a multipart upload, which are the checksums of the
-//! object it makes and not of its body.
+//! The headers of the calls of a multipart upload that are not about their own body: the
+//! checksum headers of the completion, which are the checksums of the object it makes, and the
+//! `Content-Length` of a part, which the backend is told.
 
 use hyper::StatusCode;
 
@@ -46,4 +47,24 @@ async fn a_completion_is_not_held_to_the_checksums_of_the_object_it_makes() {
     let extra = [("content-md5", right.as_str())];
     let done = rig.send("POST", &uri, &extra, body.as_bytes()).await;
     assert_eq!(done.status, StatusCode::OK);
+}
+
+/// Asserts that the length of a part is told to the backend when the request declares it in
+/// `Content-Length`, and that none is told when the request declares none or declares what is
+/// not a length: the cold tier is called with the length 5, and with none twice.
+#[tokio::test(start_paused = true)]
+async fn the_length_of_a_part_is_told_to_the_backend_when_the_request_declares_it() {
+    let rig = Rig::new(MEBIBYTE).await;
+    let id = start(&rig, "big").await;
+    let uri = format!("/{BUCKET}/big?partNumber=1&uploadId={id}");
+    let declared = [
+        vec![("content-length", "5")],
+        vec![],
+        vec![("content-length", "many")],
+    ];
+    for extra in declared {
+        let reply = rig.send("PUT", &uri, &extra, b"hello").await;
+        assert_eq!(reply.status, StatusCode::OK);
+    }
+    assert_eq!(rig.cold.part_lengths(), [Some(5), None, None]);
 }

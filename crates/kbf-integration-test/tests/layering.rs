@@ -58,10 +58,11 @@
 //!   that cannot see `kbf-objstore` beneath it, which would make that check pass vacuously;
 //! - the hot/cold object store library (`tierstore`) depending, directly or through another
 //!   crate, on any other crate of this workspace, which would stop it from moving to a
-//!   repository of its own (its `s3` feature, off unless a crate turns it on, adds the S3
-//!   client of `kbf-objstore`; a crate that turns it on is a change to make here on
-//!   purpose); and a walk that cannot see its dependencies, which would make that check pass
-//!   vacuously.
+//!   repository of its own (its `s3` feature, off by default, adds the S3 client of
+//!   `kbf-objstore`, and so does its `server` feature, which the `tierstore` binary needs;
+//!   the check reads the tree of the crate built alone, so the features that its own tests
+//!   turn on do not count); and a walk that cannot see its dependencies, which would make
+//!   that check pass vacuously.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -578,8 +579,10 @@ fn pack_reaches_neither_the_frontend_nor_the_daemon() {
 /// Asserts that the normal dependencies of the object store library (`tierstore`), direct
 /// and through other crates, include no other crate of this workspace, and that the walk
 /// sees its dependencies (it reaches `tokio`), so the check does not pass on an empty walk.
-/// The graph has the features of the whole workspace: `tierstore`'s `s3` feature, which adds
-/// `kbf-objstore`, is off in it, and a crate that turned it on would fail this test.
+/// The tree is that of `cargo build -p tierstore`, with the features the crate has by default:
+/// its `s3` feature, which adds `kbf-objstore`, is off in it, and so is `server`, which turns
+/// `s3` on for the `tierstore` binary. It is not the graph of `cargo metadata`, which has the
+/// features of the whole workspace, where the tests of `tierstore` turn `server` on.
 #[test]
 fn tierstore_reaches_no_other_workspace_crate() {
     let g = load_graph();
@@ -588,22 +591,38 @@ fn tierstore_reaches_no_other_workspace_crate() {
         .get("tierstore")
         .expect("tierstore is a workspace member");
     assert!(root.is_some(), "tierstore must have a library target");
+    let linked = linked_by("tierstore");
     assert!(
-        !reaches(&g, "tierstore", &["tokio"]).is_empty(),
-        "tierstore's closure must reach tokio, or this walk proves nothing"
+        linked.contains("tokio"),
+        "tierstore's tree must hold tokio, or this walk proves nothing: {linked:?}"
     );
-    let others: Vec<&str> = g
+    let violations: Vec<&str> = g
         .members
         .keys()
         .map(String::as_str)
         .filter(|name| *name != "tierstore")
+        .filter(|name| linked.contains(*name))
         .collect();
-    let violations = reaches(&g, "tierstore", &others);
     assert!(
         violations.is_empty(),
-        "tierstore reaches another crate of this workspace:\n{}",
-        violations.join("\n")
+        "tierstore links another crate of this workspace: {violations:?}"
     );
+}
+
+/// Asserts that the tree of `cargo build -p tierstore --features s3` holds `kbf-objstore` (the
+/// S3 client that `S3Backend` adapts) and that of `--features server` holds it too, so that the
+/// check above sees the edge it guards, and that `server` turns `s3` on.
+#[test]
+fn tierstore_links_the_s3_client_only_with_its_s3_or_server_feature() {
+    let bare = linked_by("tierstore");
+    assert!(
+        !bare.contains("kbf-objstore"),
+        "without a feature: {bare:?}"
+    );
+    for features in ["s3", "server"] {
+        let linked = linked_with("tierstore", features);
+        assert!(linked.contains("kbf-objstore"), "{features}: {linked:?}");
+    }
 }
 
 /// What the front-door proxy library's normal dependencies must not reach
@@ -803,10 +822,21 @@ fn the_setup_library_names_the_proxy_only_where_it_keeps_the_table() {
 /// workspace (the installer turns the setup library's `proxy` feature on for everyone), this
 /// resolves the features of the one package, as building it alone does.
 fn linked_by(package: &str) -> BTreeSet<String> {
+    tree(package, &[])
+}
+
+/// As [`linked_by`], with these features of the package on (`cargo tree --features`).
+fn linked_with(package: &str, features: &str) -> BTreeSet<String> {
+    tree(package, &["--features", features])
+}
+
+/// The names `cargo tree` prints for the normal edges of `package`, with these extra arguments.
+fn tree(package: &str, extra: &[&str]) -> BTreeSet<String> {
     let cargo = std::env::var("CARGO").expect("CARGO is set when cargo runs a test");
     let out = Command::new(cargo)
         .args(["tree", "--locked", "--edges", "normal", "--prefix", "none"])
         .args(["--format", "{p}", "--package", package])
+        .args(extra)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("run cargo tree");

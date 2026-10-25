@@ -185,8 +185,9 @@ pub trait Backend: Send + Sync {
     ///
     /// The four calls of a multipart upload (this one, [`Backend::upload_part`],
     /// [`Backend::complete_upload`] and [`Backend::abort_upload`]) are provided: a backend
-    /// that does not override them answers each with [`Error::Unsupported`]. A backend that
-    /// does keeps the parts of an upload apart from the objects (they are not listed and not
+    /// that does not override them answers each with [`Error::Unsupported`] (so does
+    /// [`Backend::upload_part_with_len`], which only adds the length of the part). A backend
+    /// that does keeps the parts of an upload apart from the objects (they are not listed and not
     /// read), and the id names an upload of one key only. A backend may refuse a key it cannot
     /// store at once (the directory backend does, for a key that is empty or too long to be a
     /// file name); a key it would take is not looked at again until the upload is completed.
@@ -223,13 +224,38 @@ pub trait Backend: Send + Sync {
         Err(not_supported("upload_part"))
     }
 
+    /// As [`Backend::upload_part`], for a part whose length may be known before it is read:
+    /// `len` is the number of bytes `body` is to give, or `None` if the caller does not know.
+    ///
+    /// A store that needs the length of a request body before it is sent (S3 does) is written
+    /// to by a backend that overrides this call, and sends the part as it arrives; it answers
+    /// [`Backend::upload_part`] as this call with `None`, for which it must hold the part,
+    /// since a stream does not say how long it is. A backend that uses `len` stores nothing
+    /// of a body that gives more or fewer bytes, and the call is an error. The provided method
+    /// ignores `len`, as the in-memory and the directory backend have no use for it.
+    ///
+    /// # Errors
+    /// As [`Backend::upload_part`].
+    async fn upload_part_with_len(
+        &self,
+        key: &str,
+        id: &str,
+        number: u32,
+        _len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<String, Error> {
+        self.upload_part(key, id, number, body).await
+    }
+
     /// Completes the upload `id` of `key`: creates the object `key` from the parts named, in
     /// the order given, which is ascending by part number, each with the content tag
     /// [`Backend::upload_part`] gave it. Gives the content tag of the new object, which
-    /// [`Backend::head`] gives it too, and which is the tag a [`Backend::put`] of the same bytes
-    /// gives (not an S3 multipart ETag), since the reconciler compares the tags of the objects
-    /// of the two tiers to tell that a copy is the same. The parts and the upload are gone once
-    /// the object is created.
+    /// [`Backend::head`] gives it too. The in-memory and the directory backend give the tag a
+    /// [`Backend::put`] of the same bytes gives; a store that tags an object made of parts by
+    /// its parts (S3 does: a hash of the tags of the parts and their number) gives that tag,
+    /// which is not the tag of a put of the same bytes, so the tags of two tiers tell that two
+    /// objects are the same only if both were made the same way. The parts and the upload are
+    /// gone once the object is created.
     ///
     /// Like [`Backend::put`] the completion only creates: where the key exists the upload is
     /// left open.

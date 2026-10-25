@@ -69,6 +69,9 @@ struct Plan {
     calls: BTreeMap<Op, u64>,
     /// The prefix of every list call, failed or not, in the order of the calls.
     listed: Vec<String>,
+    /// The length every call that uploads a part was given, failed or not, in the order of the
+    /// calls.
+    lengths: Vec<Option<u64>>,
 }
 
 /// Passes every call to the backend it wraps, unless it was told to fail or delay it.
@@ -139,6 +142,13 @@ impl FaultyBackend {
     #[must_use]
     pub fn listed_prefixes(&self) -> Vec<String> {
         self.plan().listed.clone()
+    }
+
+    /// The length that each call that uploads a part (with or without a length) was given, the
+    /// failed ones included, in the order of the calls: `None` where the caller gave none.
+    #[must_use]
+    pub fn part_lengths(&self) -> Vec<Option<u64>> {
+        self.plan().lengths.clone()
     }
 
     fn plan(&self) -> MutexGuard<'_, Plan> {
@@ -226,8 +236,23 @@ impl Backend for FaultyBackend {
         number: u32,
         body: PartBody<'_>,
     ) -> Result<String, Error> {
+        let sized = self.upload_part_with_len(key, id, number, None, body);
+        sized.await
+    }
+
+    async fn upload_part_with_len(
+        &self,
+        key: &str,
+        id: &str,
+        number: u32,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<String, Error> {
+        self.plan().lengths.push(len);
         self.enter(Op::UploadPart, key).await?;
-        self.inner.upload_part(key, id, number, body).await
+        let inner = &self.inner;
+        let upload = inner.upload_part_with_len(key, id, number, len, body);
+        upload.await
     }
 
     async fn complete_upload(

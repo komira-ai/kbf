@@ -1,8 +1,10 @@
 //! An [`ObjectStore`] over the S3 REST API: path-style addressing, SigV4 signing,
 //! plain HTTP.
 //!
-//! Written against S3 as MinIO and RustFS serve it. It signs every payload (the store
-//! checks the body against the signed hash), refuses a ranged read answered with
+//! Written against S3 as MinIO and RustFS serve it. It signs every payload it has (the store
+//! checks the body against the signed hash; a part streamed from a source, whose hash is
+//! not known when the request is signed, is sent with `UNSIGNED-PAYLOAD`, see `parts.rs`),
+//! refuses a ranged read answered with
 //! anything but the exact range asked for, and deletes the exact object version on a
 //! store with Object Lock, so a retained object is refused rather than hidden behind a
 //! delete marker.
@@ -16,11 +18,17 @@
 //! [`S3Store::get_all`], [`S3Store::put_if_match`] (`If-Match`) and
 //! [`S3Store::list_stamped`] (a listing with the time of last write).
 //!
+//! A caller that drives a multipart upload itself has the four calls one at a time
+//! (`parts.rs`): [`S3Store::create_multipart`], [`S3Store::upload_part_stream`] (the part
+//! is sent as it is read from a stream, never held whole), [`S3Store::complete_multipart`]
+//! and [`S3Store::abort_multipart`].
+//!
 //! Not built yet: TLS (an `https` endpoint is refused).
 
 #[cfg(feature = "testkit")]
 pub mod fake;
 mod multipart;
+mod parts;
 mod sigv4;
 mod tagged;
 mod times;
@@ -370,15 +378,9 @@ impl Conn {
         method: Method,
         key: Option<&ObjectKey>,
         query: &[(&str, String)],
-        mut headers: Vec<(&'static str, String)>,
+        headers: Vec<(&'static str, String)>,
         body: &[u8],
     ) -> reqwest::RequestBuilder {
-        // `ObjectKey` holds only unreserved characters and `/`, so the path needs no
-        // encoding and is signed exactly as sent.
-        let path = match key {
-            Some(k) => format!("/{}/{}", self.bucket, k.as_str()),
-            None => format!("/{}", self.bucket),
-        };
         // PERF: hashing a 128 MiB segment takes a fraction of a second on this task's
         // thread; move it off the runtime if upload latency shows it.
         let payload = if body.is_empty() {
@@ -386,8 +388,27 @@ impl Conn {
         } else {
             hex::encode(Sha256::digest(body))
         };
+        self.signed_payload(method, key, query, headers, &payload)
+    }
+
+    /// The signed request for a body whose hex SHA-256 is `payload` (or `UNSIGNED-PAYLOAD`),
+    /// with no limit set and no body attached.
+    fn signed_payload(
+        &self,
+        method: Method,
+        key: Option<&ObjectKey>,
+        query: &[(&str, String)],
+        mut headers: Vec<(&'static str, String)>,
+        payload: &str,
+    ) -> reqwest::RequestBuilder {
+        // `ObjectKey` holds only unreserved characters and `/`, so the path needs no
+        // encoding and is signed exactly as sent.
+        let path = match key {
+            Some(k) => format!("/{}/{}", self.bucket, k.as_str()),
+            None => format!("/{}", self.bucket),
+        };
         let amz_date = Utc::of(SystemTime::now(), false).amz();
-        headers.push(("x-amz-content-sha256", payload.clone()));
+        headers.push(("x-amz-content-sha256", payload.to_owned()));
         headers.push(("x-amz-date", amz_date.clone()));
         let authorization = Signer {
             access_key_id: &self.credentials.access_key_id,
@@ -401,7 +422,7 @@ impl Conn {
                 path: &path,
                 query,
                 headers: &headers,
-                payload_sha256: &payload,
+                payload_sha256: payload,
             },
             &amz_date,
         );

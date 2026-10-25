@@ -213,7 +213,9 @@ impl Server {
         let method = parts.method.as_str();
         let multipart = query.has_any(&MULTIPART);
         if let ("PUT", Target::Object(key), true) = (method, &target, multipart) {
-            return self.upload_part(query, key, reader, check).await;
+            let declared = header(&parts.headers, "content-length");
+            let len = declared.and_then(|text| text.parse().ok());
+            return self.upload_part(query, key, len, reader, check).await;
         }
         let body = reader.read_all(check).await?;
         match (method, target, multipart) {
@@ -344,11 +346,14 @@ impl Server {
     /// Stores a part from the body of the request as it arrives: the backend reads the pieces
     /// of the body from a stream, and the body is checked against its hashes as the pieces pass,
     /// so a part of any size is stored without being held. A part that is refused (a hash that
-    /// does not match, a body that is too large or stalls) is not stored.
+    /// does not match, a body that is too large or stalls) is not stored. `len` is the
+    /// `Content-Length` of the request, if it has one, which the backend is told: a store that
+    /// must know the length of a part before it is sent is written to as the part arrives.
     async fn upload_part<B>(
         &self,
         query: &Query,
         key: &str,
+        len: Option<u64>,
         reader: Reader<B>,
         check: Check,
     ) -> Result<Answer, S3Error>
@@ -371,7 +376,9 @@ impl Server {
         }
         let refused = Refused::default();
         let body = pieces(reader, check, refused.clone());
-        let stored = self.backend.upload_part(key, id, number, body).await;
+        let backend = &self.backend;
+        let storing = backend.upload_part_with_len(key, id, number, len, body);
+        let stored = storing.await;
         if let Some(error) = refused.take() {
             return Err(error);
         }
