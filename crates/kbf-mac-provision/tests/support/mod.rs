@@ -566,10 +566,13 @@ impl FakeMac {
                 s.spotlight_off.insert(self.strip_root(volume).into());
                 done(true)
             }
-            ("tmutil", ["addexclusion", path]) => {
+            // Measured on macOS 27: without `-v` the call succeeds and `isexcluded`
+            // still says [Included] for a volume mount point; only `-v` excludes it.
+            ("tmutil", ["addexclusion", "-v", path]) => {
                 s.backup_excluded.insert(self.strip_root(path).into());
                 done(true)
             }
+            ("tmutil", ["addexclusion", _]) => done(true),
             ("dseditgroup", ["-o", "edit", "-d", user, "-t", "user", group]) => {
                 let record = format!("/Groups/{group}");
                 let members: Vec<String> = s
