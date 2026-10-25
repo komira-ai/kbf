@@ -52,6 +52,8 @@ struct World {
     /// The package is a deb: dpkg keeps a conffile on remove.
     deb: bool,
     started: BTreeSet<String>,
+    /// The journal: the unit and the line.
+    journal: Vec<(String, String)>,
     log: Vec<String>,
 }
 
@@ -114,6 +116,7 @@ impl World {
             purged: false,
             deb: true,
             started: BTreeSet::new(),
+            journal: Vec::new(),
             log: Vec::new(),
         }
     }
@@ -206,9 +209,16 @@ impl World {
             }),
             ["systemctl", "start", unit] => {
                 self.started.insert((*unit).to_owned());
+                self.journal_start(unit);
                 ok("")
             }
-            ["systemctl", "show", unit, ..] => self.show(unit),
+            ["journalctl", "--sync"] => ok(""),
+            ["journalctl", "-u", unit, ..] => ok(&self
+                .journal
+                .iter()
+                .filter(|(u, _)| u == unit)
+                .map(|(_, l)| format!("{l}\n"))
+                .collect::<String>()),
             ["systemd-sysusers"] => {
                 self.users_made = true;
                 ok("")
@@ -356,7 +366,11 @@ impl World {
         ok(&text)
     }
 
-    fn show(&self, unit: &str) -> Out {
+    /// What systemd writes to the journal for a start of `unit`: the line of a start the
+    /// condition skips, or `Starting` and `Started` once the condition holds. The unit exits at
+    /// once, as the stand-in for `kbf` does, so it is inactive again when the start returns (and
+    /// `systemctl show -p ConditionResult` of it says `no` whatever the file holds).
+    fn journal_start(&mut self, unit: &str) {
         // The gate: the unit's condition holds when its file exists.
         let path = if unit.contains("node") {
             "/etc/kbf/kbf.toml"
@@ -365,16 +379,20 @@ impl World {
         };
         let holds = self.files.contains(path)
             || self.is(Defect::GateIgnored)
-            || (self.is(Defect::GateRunsWithoutFile) && !self.files.contains(path));
-        let ran = if self.is(Defect::GateRunsWithoutFile) {
-            "Mon 2026-01-01 00:00:00 UTC"
+            || self.is(Defect::GateRunsWithoutFile);
+        let lines: Vec<String> = if holds {
+            vec![
+                format!("Starting {unit} - the unit..."),
+                format!("Started {unit} - the unit."),
+            ]
         } else {
-            ""
+            vec![format!(
+                "{unit} - the unit was skipped because of an unmet condition check (ConditionPathExists={path})."
+            )]
         };
-        ok(&format!(
-            "ConditionResult={}\nExecMainStartTimestamp={ran}\n",
-            if holds { "yes" } else { "no" }
-        ))
+        for line in lines {
+            self.journal.push((unit.to_owned(), line));
+        }
     }
 
     /// `getent <database> <name>`: the accounts sysusers makes are in `passwd` (the
@@ -491,7 +509,11 @@ fn the_unit_account_check_reads_unit_files_and_skips_directories() {
     for format in [Format::Deb, Format::Rpm] {
         let (world, result) = run_with(format, Defect::None);
         result.unwrap_or_else(|e| panic!("{format:?}: {e}"));
-        let cats: Vec<&String> = world.log.iter().filter(|l| l.contains(" cat ")).collect();
+        let cats: Vec<&String> = world
+            .log
+            .iter()
+            .filter(|l| l.starts_with("exec c1 cat "))
+            .collect();
         assert_eq!(
             cats,
             [
@@ -573,12 +595,12 @@ fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
         (
             Format::Deb,
             Defect::GateIgnored,
-            "kbf-node.service without /etc/kbf/kbf.toml: ConditionResult",
+            "kbf-node.service without /etc/kbf/kbf.toml: its start was not skipped by its condition",
         ),
         (
             Format::Deb,
             Defect::GateRunsWithoutFile,
-            "kbf-installer.service without /etc/kbf/installer.toml: ExecMainStartTimestamp",
+            "kbf-installer.service without /etc/kbf/installer.toml: it began to start",
         ),
         (
             Format::Deb,
