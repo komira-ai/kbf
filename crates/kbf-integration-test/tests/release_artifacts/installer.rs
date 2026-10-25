@@ -1,9 +1,10 @@
 //! `kbf-installer` in the pinned release set, on the real workflow with one of its steps
 //! taken out at a time.
 //!
-//! The installer is the one root tool of a host and is built, attested and released like
-//! every component, so a tarball of it per platform has to reach `dist/` with everything
-//! the others have. Each lint reads the workflow for its own part of that, and none of
+//! The installer is the root tool of a Mac and is built, attested and released like every
+//! component, so a tarball of it for macOS has to reach `dist/` with everything the others
+//! have. (No Linux job packages it: its Linux files are the `kbf` package's, and a package
+//! line for it on Linux is a file the set does not list.) Each lint reads the workflow for its own part of that, and none of
 //! them runs an attestation on a pull request (the attest and verify jobs run on a push):
 //! a step of the installer that goes missing would pass the pull request and turn the
 //! branch red, or release the tarball without a bundle. So the test below takes the real
@@ -23,6 +24,9 @@
 use super::*;
 
 const INSTALLER: &str = "kbf-installer";
+
+/// The platforms whose job packages the installer.
+const PLATFORMS: [&str; 1] = ["darwin-arm64"];
 
 fn read(path: &str) -> String {
     std::fs::read_to_string(crate::repo_root().join(path)).expect(path)
@@ -95,9 +99,10 @@ fn the_installer_is_pinned_for_every_platform_and_the_real_workflow_passes() {
     // some lint refuses: the control for the plants below, which would otherwise go red
     // for a reason of their own.
     for platform in BUILD_JOBS {
-        assert!(
+        assert_eq!(
             ASSETS.contains(&(INSTALLER, *platform)),
-            "{INSTALLER} for {platform} is not in ASSETS"
+            PLATFORMS.contains(platform),
+            "{INSTALLER} for {platform} in ASSETS"
         );
     }
     assert!(IDENTIFIED.contains(&INSTALLER), "{IDENTIFIED:?}");
@@ -116,8 +121,8 @@ fn each_lint_names_the_installer_step_that_is_missing() {
     // installer broken (the plant took out the one step and no more).
     let real = read(crate::ARTIFACTS_WORKFLOW);
     let mut unnamed = Vec::new();
-    for platform in BUILD_JOBS {
-        let job = *platform;
+    for platform in PLATFORMS {
+        let job = platform;
         let attest = attest_job(platform);
         let stem = attested_assets::stem(INSTALLER, platform);
         let tarball = format!("dist/{stem}.tar.gz");
@@ -185,7 +190,7 @@ fn each_lint_names_the_installer_step_that_is_missing() {
                 )],
             ),
         ];
-        if *platform == "darwin-arm64" {
+        if platform == "darwin-arm64" {
             plants.push((
                 "its signature",
                 drop_step(&real, job, &["cargo xtask sign-darwin", &binary]),
@@ -225,4 +230,38 @@ fn each_lint_names_the_installer_step_that_is_missing() {
         }
     }
     assert!(unnamed.is_empty(), "{}", unnamed.join("\n"));
+}
+
+#[test]
+fn a_linux_installer_tarball_is_a_file_the_release_set_does_not_list() {
+    // Catches: the Linux installer packaged again (a package line brought back in a Linux job)
+    // without the set, docs/artifacts.md and the release saying so: the lint names the line,
+    // for each Linux platform, and the real workflow has none.
+    let real = read(crate::ARTIFACTS_WORKFLOW);
+    for platform in ["linux-x86_64", "linux-arm64"] {
+        assert!(
+            !real.contains(&format!("kbf-installer-$GITHUB_SHA-{platform}")),
+            "the workflow names the installer for {platform}"
+        );
+        assert!(
+            !real.contains(&format!("kbf-installer-${{{{ github.sha }}}}-{platform}")),
+            "the workflow attests the installer for {platform}"
+        );
+        let line = format!(
+            "      - name: Package kbf-installer\n        run: cargo xtask package --binary \"target/$TARGET/release/kbf-installer\" --sbom crates/kbf-installer/kbf-installer_bin.cdx.json --platform {platform} --commit \"$GITHUB_SHA\" --out dist\n"
+        );
+        let anchor = format!(
+            "      - name: Package kbf-host-install\n        run: cargo xtask package --binary \"target/$TARGET/release/kbf-host-install\" --sbom crates/kbf-host-install/kbf-host-install_bin.cdx.json --platform {platform}"
+        );
+        assert!(real.contains(&anchor), "{platform}: the anchor step");
+        let planted = real.replacen(&anchor, &format!("{line}{anchor}"), 1);
+        let got = all_problems(&planted);
+        let want =
+            format!("{INSTALLER} for {platform} is packaged but not in the pinned release set");
+        assert!(
+            got.iter().any(|p| p.contains(&want)),
+            "{platform}: {got:#?}"
+        );
+        assert!(!all_problems(&real).iter().any(|p| p.contains(INSTALLER)));
+    }
 }

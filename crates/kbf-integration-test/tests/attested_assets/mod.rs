@@ -48,14 +48,6 @@ pub fn packaged(workflow: &str) -> Result<Vec<(String, String)>, String> {
     Ok(found)
 }
 
-/// The platform of every `cargo xtask pkg-asset` line in the workflow's `run:` steps that
-/// makes the `kbf-installer` deb an asset (it has no `--verify-only`: that one only checks
-/// the file the attest job signed), in file order. An error names a line without
-/// `--platform`.
-pub fn packaged_debs(workflow: &str) -> Result<Vec<String>, String> {
-    deb_platforms(workflow, "pkg-asset")
-}
-
 /// The platform of every `cargo xtask pkg-kbf-asset` line in the workflow's `run:` steps that
 /// makes the `kbf` deb an asset (it has no `--verify-only`: that one only checks the file the
 /// attest job signed), in file order. An error names a line without `--platform`.

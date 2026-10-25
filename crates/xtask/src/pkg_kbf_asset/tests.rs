@@ -6,6 +6,13 @@ use crate::package::tarball as binary_tarball;
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const VERSION: &str = "0.1.0+0123456789ab";
+const MAIN: &str = "refs/heads/main";
+const FEATURE: &str = "refs/heads/feature/arch-v2";
+const ROOT: &str = "{\"mediaType\":\"trustedroot\"}\n";
+/// The `Depends` a good deb has: [`DEB_DEPENDS`], spelled out so that a change to the list
+/// shows here too.
+const DEPENDS: &str = "crun, uidmap, systemd, ca-certificates";
+const REPLACES: &str = "kbf-installer (<< 0.1.1)";
 
 /// An empty directory of its own for one test.
 fn scratch(name: &str) -> PathBuf {
@@ -68,12 +75,17 @@ fn in_units(unit: &str) -> String {
 struct Fix {
     kbf: Vec<u8>,
     kbf_mode: u32,
+    /// The mode of every file but the binary and `gh`.
     unit_mode: u32,
+    gh: Vec<u8>,
+    conf: String,
     package: &'static str,
     version: &'static str,
     arch: &'static str,
     depends: String,
+    suggests: String,
     replaces: String,
+    breaks: String,
     drop: Option<String>,
     /// Files a good package does not hold, with their modes and bytes.
     extra: Vec<(String, u32, Vec<u8>)>,
@@ -85,34 +97,68 @@ impl Fix {
             kbf: b"\x7fELF the kbf built for the commit".to_vec(),
             kbf_mode: 0o755,
             unit_mode: 0o644,
+            gh: b"\x7fELF the pinned gh".to_vec(),
+            conf: format!("SOURCE_REFS={MAIN}\n"),
             package: "kbf",
             version: VERSION,
             arch: "amd64",
-            depends: String::new(),
-            replaces: "kbf-installer".to_owned(),
+            depends: DEPENDS.to_owned(),
+            suggests: "postgresql".to_owned(),
+            replaces: REPLACES.to_owned(),
+            breaks: REPLACES.to_owned(),
             drop: None,
             extra: Vec::new(),
         }
     }
 
-    /// The deb: nfpm's layout, gzip members, `./` paths. The control file has a `Depends` line
-    /// only when the fixture depends on something.
+    /// The deb: nfpm's layout, gzip members, `./` paths. The control file has a line only for
+    /// a relation the fixture has.
     fn deb(&self) -> Vec<u8> {
-        let depends = if self.depends.is_empty() {
-            String::new()
-        } else {
-            format!("Depends: {}\n", self.depends)
+        let line = |name: &str, value: &str| {
+            if value.is_empty() {
+                String::new()
+            } else {
+                format!("{name}: {value}\n")
+            }
         };
         let control = format!(
-            "Package: {}\nVersion: {}\nArchitecture: {}\n{depends}Replaces: {}\n",
-            self.package, self.version, self.arch, self.replaces
+            "Package: {}\nVersion: {}\nArchitecture: {}\n{}{}{}{}",
+            self.package,
+            self.version,
+            self.arch,
+            line("Depends", &self.depends),
+            line("Suggests", &self.suggests),
+            line("Replaces", &self.replaces),
+            line("Breaks", &self.breaks),
         );
         let control_tgz = tgz(&[("control", 0o644, control.as_bytes())]);
         let binary = "usr/bin/kbf".to_owned();
         let mut files = vec![(binary, self.kbf_mode, self.kbf.as_slice())];
-        for unit in KBF_UNITS {
+        for unit in KBF_UNITS.into_iter().chain([SLICE]) {
             files.push((in_units(unit), self.unit_mode, unit.as_bytes()));
         }
+        for (path, text) in [
+            ("usr/lib/sysusers.d/kbf.conf", "u kbf"),
+            ("usr/lib/tmpfiles.d/kbf.conf", "d /x"),
+            ("etc/needrestart/conf.d/kbf.conf", "# n"),
+        ] {
+            files.push((path.to_owned(), self.unit_mode, text.as_bytes()));
+        }
+        files.push((
+            "usr/share/kbf/trust/gh".to_owned(),
+            0o755,
+            self.gh.as_slice(),
+        ));
+        files.push((
+            "usr/share/kbf/trust/installer.conf".to_owned(),
+            0o644,
+            self.conf.as_bytes(),
+        ));
+        files.push((
+            "usr/share/kbf/trust/trusted_root.jsonl".to_owned(),
+            0o644,
+            ROOT.as_bytes(),
+        ));
         files.retain(|(p, _, _)| Some(p) != self.drop.as_ref());
         for (path, mode, bytes) in &self.extra {
             files.push((path.clone(), *mode, bytes.as_slice()));
@@ -138,10 +184,13 @@ fn world(name: &str, fix: &Fix, kbf: &[u8], platform: Platform) -> (PathBuf, Pat
     (dir, deb, tarball)
 }
 
+/// The checks for a package attested on `main`, with no pinned `gh` to compare.
 fn check(platform: Platform, tarball: &Path) -> Check<'_> {
     Check {
         platform,
         kbf_tarball: tarball,
+        expect_ref: MAIN,
+        gh: None,
     }
 }
 
@@ -211,10 +260,10 @@ fn a_package_whose_kbf_is_not_the_attested_one_is_refused() {
     assert!(got[0].ends_with("holds no kbf"), "{got:?}");
 }
 
-/// Asserts that a package whose `kbf` is not mode 0755 and one whose units are not mode 0644
-/// are refused, each naming the file and the mode.
+/// Asserts that a package whose `kbf` is not mode 0755 and one whose other files are not mode
+/// 0644 are refused, each naming the file and the mode.
 #[test]
-fn the_kbf_must_be_executable_and_the_units_plain_files() {
+fn the_kbf_must_be_executable_and_the_other_files_plain() {
     let mut fix = Fix::new();
     fix.kbf_mode = 0o700;
     let got = found("kbf-mode", &fix);
@@ -222,20 +271,44 @@ fn the_kbf_must_be_executable_and_the_units_plain_files() {
     let mut fix = Fix::new();
     fix.unit_mode = 0o755;
     let got = found("unit-mode", &fix);
-    assert_eq!(got.len(), KBF_UNITS.len(), "{got:?}");
-    for unit in KBF_UNITS {
-        let want = format!("{} has mode 0755, not 0644", in_units(unit));
-        assert!(got.contains(&want), "{want} in {got:?}");
-    }
+    let mut want: Vec<String> = KBF_UNITS
+        .into_iter()
+        .chain([SLICE])
+        .map(in_units)
+        .chain(
+            [
+                "usr/lib/sysusers.d/kbf.conf",
+                "usr/lib/tmpfiles.d/kbf.conf",
+                "etc/needrestart/conf.d/kbf.conf",
+            ]
+            .map(str::to_owned),
+        )
+        .map(|path| format!("{path} has mode 0755, not 0644"))
+        .collect();
+    want.sort();
+    let mut got = got;
+    got.sort();
+    assert_eq!(got, want);
 }
 
-/// Asserts that a package missing `usr/bin/kbf`, or the unit of any one mode, is refused
-/// naming the missing file and nothing else.
+/// Asserts that a package missing `usr/bin/kbf`, the unit of any one mode, the slice, the
+/// sysusers, tmpfiles or needrestart file, or any trust file, is refused naming the missing
+/// file and nothing else.
 #[test]
-fn a_package_without_the_kbf_or_the_unit_of_a_mode_is_refused() {
+fn a_package_without_any_file_it_ships_is_refused() {
     let mut paths = vec!["usr/bin/kbf".to_owned()];
-    for unit in KBF_UNITS {
+    for unit in KBF_UNITS.into_iter().chain([SLICE]) {
         paths.push(in_units(unit));
+    }
+    for path in [
+        "usr/lib/sysusers.d/kbf.conf",
+        "usr/lib/tmpfiles.d/kbf.conf",
+        "etc/needrestart/conf.d/kbf.conf",
+        "usr/share/kbf/trust/gh",
+        "usr/share/kbf/trust/installer.conf",
+        "usr/share/kbf/trust/trusted_root.jsonl",
+    ] {
+        paths.push(path.to_owned());
     }
     for gone in paths {
         let mut fix = Fix::new();
@@ -244,16 +317,60 @@ fn a_package_without_the_kbf_or_the_unit_of_a_mode_is_refused() {
     }
 }
 
-/// Asserts that a package that holds a file of the `kbf-installer` package, or any file but
-/// the binary and the units, is refused naming it.
+/// Asserts that a package that holds a file of the retired installer, or any file it does not
+/// ship, is refused naming it.
 #[test]
 fn a_package_that_holds_another_file_is_refused() {
-    for path in ["usr/bin/kbf-installer", "usr/lib/systemd/system/kbf.slice"] {
+    for path in [
+        "usr/bin/kbf-installer",
+        "usr/lib/systemd/system/kbf-proxy.service",
+        "usr/lib/systemd/system/kbf-installer.service",
+        "usr/share/kbf-installer/trust/gh",
+        "usr/share/kbf/trust/extra",
+    ] {
         let mut fix = Fix::new();
         fix.extra.push((path.to_owned(), 0o644, b"x".to_vec()));
         let want = format!("holds {path}, which the kbf package does not ship");
         assert_eq!(found("extra", &fix), [want]);
     }
+}
+
+/// Asserts that the verb holds the trust directory to the branch the package is attested for,
+/// in both directions, and to the pinned `gh`: a main package whose conf trusts the other
+/// branch, a feature package attested on main, and a `gh` that is not the downloaded one are
+/// each refused alone. (`pkg_asset`'s tests hold the checks themselves to their cases.)
+#[test]
+fn the_trust_directory_is_for_the_branch_and_holds_the_pinned_gh() {
+    let mut fix = Fix::new();
+    fix.conf = format!("SOURCE_REFS={FEATURE}\n");
+    let got = found("trust-feature", &fix);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(
+        got[0].contains(
+            "trusts refs/heads/feature/arch-v2, but this package is attested for refs/heads/main"
+        ),
+        "{got:?}"
+    );
+    let (dir, deb, tarball) = world("trust-expect", &fix, &fix.kbf, Platform::LinuxX86_64);
+    let bytes = std::fs::read(&deb).expect("deb");
+    let c = Check {
+        expect_ref: FEATURE,
+        ..check(Platform::LinuxX86_64, &tarball)
+    };
+    assert_eq!(
+        problems(&bytes, &c).expect("problems"),
+        Vec::<String>::new()
+    );
+    let gh = dir.join("gh");
+    std::fs::write(&gh, b"\x7fELF another gh").expect("gh");
+    let c = Check {
+        expect_ref: FEATURE,
+        gh: Some(&gh),
+        ..check(Platform::LinuxX86_64, &tarball)
+    };
+    let got = problems(&bytes, &c).expect("problems");
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].contains("is not the pinned gh"), "{got:?}");
 }
 
 /// Asserts that the control file must name the package `kbf` and the architecture of the
@@ -277,68 +394,115 @@ fn the_control_file_names_the_package_and_the_architecture() {
 
 /// Asserts that the control file must not depend on `kbf-installer`: the name alone, with a
 /// version, with no space before the version, among other packages, with an architecture and
-/// as one of several alternatives are each refused alone, and no `Depends` line, other
-/// packages, a name that only starts like it and another version of the package's own name are
-/// not.
+/// as one of several alternatives are each refused alone, and other packages, a name that only
+/// starts like it and another version of the package's own name are not.
 #[test]
 fn the_control_file_does_not_depend_on_the_installer() {
-    let with_depends = |depends: &str| {
+    let with_depends = |more: &str| {
         let mut fix = Fix::new();
-        fix.depends = depends.to_owned();
+        fix.depends = format!("{DEPENDS}, {more}");
         found("depends", &fix)
     };
     let names = "but the kbf package depends on no \"kbf-installer\"";
-    for depends in [
+    for more in [
         "kbf-installer",
         "kbf-installer (>= 0.1.0+0123456789ab)",
         "kbf-installer(>= 0.1.0+0123456789ab)",
-        "systemd, kbf-installer (= 0.1.0+0123456789ab), crun",
+        "kbf-installer (= 0.1.0+0123456789ab), crun",
         "kbf-installer:any",
         "crun | kbf-installer",
     ] {
-        let got = with_depends(depends);
-        assert_eq!(got.len(), 1, "{depends:?}: {got:?}");
-        assert!(got[0].contains(names), "{depends:?}: {got:?}");
+        let got = with_depends(more);
+        assert_eq!(got.len(), 1, "{more:?}: {got:?}");
+        assert!(got[0].contains(names), "{more:?}: {got:?}");
     }
-    for depends in [
-        "",
-        "systemd",
-        "systemd, crun (>= 1.0)",
+    for more in [
+        "crun (>= 1.0)",
         "kbf-installer-extra (>= 0.1.0+0123456789ab)",
         "kbf (>= 0.1.0+0123456789ab)",
     ] {
-        let got = with_depends(depends);
-        assert_eq!(got, Vec::<String>::new(), "{depends:?}");
+        let got = with_depends(more);
+        assert_eq!(got, Vec::<String>::new(), "{more:?}");
     }
 }
 
-/// Asserts that the control file must say that the package replaces `kbf-installer`, of any
-/// version, because the units of the modes were that package's files: no `Replaces`, another
-/// package, a name that only starts like it and a replacement of some versions only are
-/// refused, each alone, and the name among others, or with spaces around it, is not.
+/// Asserts that the control file must depend on what the package needs, the installer's
+/// package having been where those came from, and suggest Postgres: each missing one is
+/// refused alone, naming it.
 #[test]
-fn the_control_file_replaces_the_installer() {
-    let with_replaces = |replaces: &str| {
+fn the_control_file_depends_on_what_the_package_needs() {
+    for gone in ["crun", "uidmap", "systemd", "ca-certificates"] {
         let mut fix = Fix::new();
-        fix.replaces = replaces.to_owned();
-        found("replaces", &fix)
-    };
-    let hold = "which does not hold \"kbf-installer\"";
-    for replaces in ["", "kbf", "kbf-installer-extra", "kbf-installer (<< 9)"] {
-        let got = with_replaces(replaces);
-        assert_eq!(got.len(), 1, "{replaces:?}: {got:?}");
-        assert!(got[0].starts_with("control says Replaces "), "{got:?}");
-        assert!(got[0].contains(hold), "{replaces:?}: {got:?}");
+        fix.depends = DEPENDS
+            .split(", ")
+            .filter(|d| *d != gone)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let got = found("needs", &fix);
+        assert_eq!(got.len(), 1, "{gone}: {got:?}");
+        assert!(
+            got[0].starts_with("control says Depends ")
+                && got[0].ends_with(&format!("which does not hold \"{gone}\"")),
+            "{gone}: {got:?}"
+        );
     }
-    for replaces in ["kbf-installer", "other, kbf-installer", "kbf-installer  "] {
-        let got = with_replaces(replaces);
-        assert_eq!(got, Vec::<String>::new(), "{replaces:?}");
+    let mut fix = Fix::new();
+    fix.suggests = String::new();
+    let got = found("suggests", &fix);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(
+        got[0].ends_with("which does not hold \"postgresql\""),
+        "{got:?}"
+    );
+}
+
+/// Asserts that the control file must say that the package replaces and breaks the
+/// `kbf-installer` below the bound, because the units, the slice, the trust files and the rest
+/// were that package's files: no line, another package, a name that only starts like it, the
+/// package unbounded and a bound that is not the one are refused, each alone, and the entry
+/// among others, or with other spacing, is not.
+#[test]
+fn the_control_file_replaces_and_breaks_the_installer_below_the_bound() {
+    for field in ["Replaces", "Breaks"] {
+        let with = |value: &str| {
+            let mut fix = Fix::new();
+            if field == "Replaces" {
+                fix.replaces = value.to_owned();
+            } else {
+                fix.breaks = value.to_owned();
+            }
+            found("relation", &fix)
+        };
+        let hold = format!("which does not hold \"{REPLACES}\"");
+        for value in [
+            "",
+            "kbf",
+            "kbf-installer-extra (<< 0.1.1)",
+            "kbf-installer",
+            "kbf-installer (<< 9)",
+            "kbf-installer (<= 0.1.1)",
+        ] {
+            let got = with(value);
+            assert_eq!(got.len(), 1, "{field} {value:?}: {got:?}");
+            assert!(
+                got[0].starts_with(&format!("control says {field} ")),
+                "{got:?}"
+            );
+            assert!(got[0].ends_with(&hold), "{field} {value:?}: {got:?}");
+        }
+        for value in [
+            REPLACES,
+            "other, kbf-installer (<< 0.1.1)",
+            "kbf-installer(<<0.1.1)  ",
+        ] {
+            assert_eq!(with(value), Vec::<String>::new(), "{field} {value:?}");
+        }
     }
 }
 
-/// Asserts that a control file without the `Package` line, and one without the `Replaces`
-/// line, are refused, the missing `Package` shown as `(none)` and the missing `Replaces` as an
-/// empty value, and that the missing `Depends` line is not a problem.
+/// Asserts that a control file without the `Package` line, and one without the relations, are
+/// refused, the missing `Package` shown as `(none)` and each missing relation as an empty
+/// value.
 #[test]
 fn a_control_file_without_its_lines_is_refused() {
     let fix = Fix::new();
@@ -350,12 +514,12 @@ fn a_control_file_without_its_lines_is_refused() {
     let got = problems(&deb, &c).expect("problems");
     let package = "control says Package \"(none)\", not \"kbf\"".to_owned();
     assert!(got.contains(&package), "{got:?}");
-    let depends = got.iter().any(|p| p.starts_with("control says Depends"));
-    assert!(!depends, "{got:?}");
-    let replaces = got
-        .iter()
-        .any(|p| p.starts_with("control says Replaces \"\""));
-    assert!(replaces, "{got:?}");
+    for field in ["Depends", "Suggests", "Replaces", "Breaks"] {
+        let said = got
+            .iter()
+            .any(|p| p.starts_with(&format!("control says {field} \"\"")));
+        assert!(said, "{field}: {got:?}");
+    }
 }
 
 /// Asserts that a damaged archive is named and not taken for a package: bytes that are no
@@ -383,10 +547,7 @@ fn the_asset_is_listed_once_and_written_once() {
     let (dir, deb, tarball) = world("twice", &fix, &fix.kbf, Platform::LinuxX86_64);
     let out = dir.join("dist");
     std::fs::create_dir(&out).expect("dist");
-    let earlier = format!(
-        "{}  kbf-installer-{COMMIT}-linux-x86_64.deb\n",
-        Sha256::of(b"t")
-    );
+    let earlier = format!("{}  kbf-{COMMIT}-linux-x86_64.tar.gz\n", Sha256::of(b"t"));
     std::fs::write(out.join("SHA256SUMS.linux-x86_64"), &earlier).expect("sums");
     let c = check(Platform::LinuxX86_64, &tarball);
     asset(&deb, COMMIT, &Mode::Add(&out), &c).expect("first");
@@ -435,7 +596,7 @@ fn verify_only_checks_the_asset_by_its_name_and_writes_nothing() {
     assert!(printed[0].starts_with(&start), "{printed:?}");
     assert_eq!(std::fs::read_dir(&dir).expect("ls").count(), before);
     let mut bad = Fix::new();
-    bad.depends = "kbf-installer".to_owned();
+    bad.depends = format!("{DEPENDS}, kbf-installer");
     std::fs::write(&named, bad.deb()).expect("bad deb");
     let err = asset(&named, COMMIT, &Mode::VerifyOnly, &c).expect_err("refused");
     assert!(matches!(err, Error::Refused(_)), "{err:?}");

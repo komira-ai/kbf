@@ -9,7 +9,7 @@
 //!   `/var/lib/kbf-installer/releases/<commit>/` (macOS: `/usr/local/kbf-installer`), the
 //!   `current` and `previous` links beside them in `releases/`, the state in the same tree
 //!   (macOS: `/var/db/kbf-installer`) and the trust files under
-//!   `/usr/share/kbf-installer/trust/`.
+//!   `/usr/share/kbf/trust/`.
 //! - [`state`]: `state.json`, schema 2 (the current, previous and staged commits, the one
 //!   waiting to be confirmed, the order floor and the rest), with `state.json.bak` as the
 //!   last good copy, read and written under an exclusive lock on

@@ -212,7 +212,7 @@ fn an_out_path_that_cannot_be_inspected_is_refused_with_the_os_error() {
 
 #[test]
 fn conf_ref_reads_back_only_what_conf_writes() {
-    // Catches: pkg-asset accepting a conf with more than the one line it generates (a
+    // Catches: pkg-kbf-asset accepting a conf with more than the one line it generates (a
     // second key, a comment, CRLF, no final newline, an empty value), which the
     // installer might read differently from the build.
     for r in [

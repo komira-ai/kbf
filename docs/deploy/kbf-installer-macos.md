@@ -14,7 +14,7 @@ The paths are in one place, `crates/kbf-setup/src/layout.rs` (re-exported as `kb
 | installer tree (releases, links) | `/var/lib/kbf-installer` | `/usr/local/kbf-installer` |
 | installer state (`state.json`, `status.json`, `orders/`) | the installer tree | `/var/db/kbf-installer` |
 | lock | `/run/kbf-installer/lock` | `/var/run/kbf-installer/lock` |
-| trust directory | `/usr/share/kbf-installer/trust` | `/usr/local/kbf-installer/trust` |
+| trust directory | `/usr/share/kbf/trust` (until v0.0.9 also read at `/usr/share/kbf-installer/trust`, when the first is absent) | `/usr/local/kbf-installer/trust` |
 | configuration directory | `/etc/kbf` | `/usr/local/etc/kbf` |
 | `kbf.toml`, `installer.toml` | in the configuration directory | in the configuration directory |
 | enrollment token, operator token | `/etc/kbf/enroll.token`, `/etc/kbf/api-token` | `/usr/local/etc/kbf/enroll.token`, `/usr/local/etc/kbf/api-token` |

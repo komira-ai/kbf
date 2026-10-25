@@ -599,7 +599,7 @@ pub fn production(units: Vec<Unit>, format: Format, state_dir: &Path) -> Package
     let platform = format!("linux-{}", kbf_installer::binary::Arch::current());
     PackageHost {
         format,
-        layout: Layout::new(root.clone(), Platform::current()),
+        layout: Layout::new(root.clone(), Platform::current()).with_trust_fallback(),
         trust: Box::new(kbf_host::HostExec::new(root)),
         store: Store::new(
             state_dir.to_path_buf(),

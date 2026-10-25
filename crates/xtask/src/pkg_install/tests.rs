@@ -89,13 +89,13 @@ fn entry_dir(dst: &str) -> Entry {
 
 fn entries() -> Vec<Entry> {
     vec![
-        entry_file("/usr/bin/kbf-installer", 0o755, "binary"),
+        entry_file("/usr/bin/kbf", 0o755, "binary"),
         entry_file("/usr/lib/systemd/system/kbf-node.service", 0o644, "node"),
         entry_file("/usr/lib/systemd/system/kbf.slice", 0o644, "slice"),
         // A directory a package may own under the unit directory: it is not read for
         // accounts (it has no bytes).
         entry_dir("/usr/lib/systemd/system/kbf-node.service.d"),
-        entry_dir("/usr/share/kbf-installer"),
+        entry_dir("/usr/share/kbf"),
         // A conffile: dpkg keeps it on remove and deletes it on purge.
         entry_file("/etc/needrestart/conf.d/kbf.conf", 0o644, "conffile"),
     ]
@@ -153,9 +153,9 @@ impl World {
                 "crun\nshadow-utils\nsystemd\nca-certificates\nrpmlib(CompressedFileNames) <= 3.0.4-1\n",
             ),
             ["find", ..] => ok(if self.is(Defect::MaintainerScript) {
-                "kbf-installer.list\nkbf-installer.postinst\n"
+                "kbf.list\nkbf.postinst\n"
             } else {
-                "kbf-installer.list\nkbf-installer.md5sums\n"
+                "kbf.list\nkbf.md5sums\n"
             }),
             ["rpm", "-q", "--scripts", _] => ok(if self.is(Defect::MaintainerScript) {
                 "postinstall scriptlet\n"
@@ -252,13 +252,13 @@ impl World {
 
     fn remove(&mut self, purge: bool) -> Out {
         if !self.installed {
-            return fail("E: Unable to locate package kbf-installer");
+            return fail("E: Unable to locate package kbf");
         }
         self.installed = false;
         self.purged = purge;
         for e in &self.entries {
             let conffile = e.dst.starts_with("/etc/");
-            let keeps = (self.defect == Defect::RemoveKeepsFile && e.dst.ends_with("kbf-installer"))
+            let keeps = (self.defect == Defect::RemoveKeepsFile && e.dst == "/usr/bin/kbf")
                 // dpkg keeps a conffile until the purge.
                 || (conffile && self.deb && !purge)
                 || (conffile && purge && self.is(Defect::PurgeKeepsConffile))
@@ -405,7 +405,7 @@ fn gates() -> Vec<Gate> {
 
 fn probes() -> Vec<Probe> {
     vec![
-        "/usr/share/kbf-installer/trust/gh --version::gh version 2.102.0"
+        "/usr/share/kbf/trust/gh --version::gh version 2.102.0"
             .parse()
             .expect("probe"),
     ]
@@ -434,7 +434,8 @@ fn run_with(format: Format, defect: Defect) -> (World, Result<Vec<String>, Error
     let result = run(
         &mut |args| Ok(world.borrow_mut().docker(args)),
         &InstallTest {
-            package: Path::new("/p/kbf-installer.pkg"),
+            name: "kbf",
+            package: Path::new("/p/kbf.pkg"),
             format,
             listing: &listing,
             image_dir: Path::new("/p/image"),
@@ -464,7 +465,7 @@ fn a_package_that_does_everything_the_contract_says_passes_in_both_formats() {
         assert!(ran("remove"));
         // The container and its image are removed whatever happened.
         assert_eq!(world.log[world.log.len() - 2], "rm -f c1");
-        assert!(world.log[world.log.len() - 1].starts_with("rmi kbf-installer-test-c1"));
+        assert!(world.log[world.log.len() - 1].starts_with("rmi kbf-test-c1"));
         // Nothing the test runs starts a unit on its own: it only starts the gated ones
         // it asks to.
         assert_eq!(world.started.len(), 2);
@@ -503,7 +504,7 @@ fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
         (
             Format::Deb,
             Defect::MaintainerScript,
-            "maintainer scripts: \"kbf-installer.postinst\"",
+            "maintainer scripts: \"kbf.postinst\"",
         ),
         (
             Format::Rpm,
@@ -513,13 +514,9 @@ fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
         (
             Format::Deb,
             Defect::WrongOwner,
-            "/usr/bin/kbf-installer: \"kbf:root:755:regular file\"",
+            "/usr/bin/kbf: \"kbf:root:755:regular file\"",
         ),
-        (
-            Format::Deb,
-            Defect::WrongBytes,
-            "/usr/bin/kbf-installer sha256",
-        ),
+        (Format::Deb, Defect::WrongBytes, "/usr/bin/kbf sha256"),
         (
             Format::Deb,
             Defect::UnitEnabled,
@@ -564,7 +561,7 @@ fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
         (
             Format::Deb,
             Defect::RemoveKeepsFile,
-            "/usr/bin/kbf-installer is still there after remove",
+            "/usr/bin/kbf is still there after remove",
         ),
         (
             Format::Deb,
@@ -650,6 +647,7 @@ fn a_listing_that_is_not_there_is_an_error_before_docker_runs() {
     let err = run(
         &mut never,
         &InstallTest {
+            name: "kbf",
             package: Path::new("/p"),
             format: Format::Deb,
             listing: Path::new("/nonexistent/listing.txt"),
@@ -683,13 +681,15 @@ fn a_probe_runs_in_the_container_and_its_output_must_hold_the_text() {
     assert!(
         world
             .log
-            .contains(&"exec c1 /usr/share/kbf-installer/trust/gh --version".to_owned()),
+            .contains(&"exec c1 /usr/share/kbf/trust/gh --version".to_owned()),
         "{:#?}",
         world.log
     );
     let got = problems(Format::Deb, Defect::GhNotRunnable);
     assert!(
-        got.contains("`/usr/share/kbf-installer/trust/gh --version` failed in the container: exec format error"),
+        got.contains(
+            "`/usr/share/kbf/trust/gh --version` failed in the container: exec format error"
+        ),
         "{got}"
     );
     let got = problems(Format::Deb, Defect::GhWrongVersion);
@@ -702,12 +702,10 @@ fn a_probe_runs_in_the_container_and_its_output_must_hold_the_text() {
 #[test]
 fn a_probe_is_a_command_and_the_text_it_must_print() {
     // Catches: a probe with no text (it would pass on any output) or no command.
-    let p: Probe = "kbf-installer --version --json::abc123"
-        .parse()
-        .expect("probe");
-    assert_eq!(p.argv, ["kbf-installer", "--version", "--json"]);
+    let p: Probe = "kbf --version --json::abc123".parse().expect("probe");
+    assert_eq!(p.argv, ["kbf", "--version", "--json"]);
     assert_eq!(p.contains, "abc123");
-    for bad in ["kbf-installer --version", "::text", "gh --version::"] {
+    for bad in ["kbf --version", "::text", "gh --version::"] {
         assert!(bad.parse::<Probe>().is_err(), "{bad:?}");
     }
 }
