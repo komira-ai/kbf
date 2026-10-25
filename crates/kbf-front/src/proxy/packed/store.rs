@@ -6,6 +6,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -19,18 +20,36 @@ use kbf_types::{Digest, DigestFunction};
 use tonic::Status;
 
 use super::metrics::PackMetrics;
+use super::room::{Budget, DEFAULT_INFLIGHT_BYTES, Room};
 
 /// The largest blob a frontend puts in a pack or serves from one by default: 64 MiB, the
 /// most it holds in memory to hash a blob before the first byte of it is sent.
 pub const MAX_PACKED_BLOB_BYTES: u64 = 64 << 20;
 
-/// How a frontend cuts its packs and what it keeps of what it read.
+/// How long an upload into packs may go without a byte of its body arriving, by default.
+pub const DEFAULT_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The longest idle timeout [`Packs`] keeps: a day. A longer one is taken as a day, so that the
+/// deadline of an upload (the time now and the timeout) never overflows the clock.
+pub const MAX_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How a frontend cuts its packs, how much it takes in at once and what it keeps of what it
+/// read.
 #[derive(Clone)]
 pub struct PackSettings {
     /// The length at which a pack of client uploads is closed.
     pub pack_bytes: u64,
     /// The largest blob that is packed or served from a pack ([`Packs::max_blob_bytes`]).
     pub max_blob_bytes: u64,
+    /// The bytes that the uploads into packs may hold in flight together: each takes the size
+    /// of its blob before it reads a byte, and an upload that finds the rest spent waits.
+    /// Reads are not counted. An upload of a blob larger than this is refused. At most
+    /// `u32::MAX`.
+    pub inflight_bytes: u32,
+    /// How long a ByteStream upload may go without a byte of its body arriving before it is
+    /// ended DEADLINE_EXCEEDED and gives its bytes back. Only bytes count as progress: a
+    /// slow upload that keeps sending is never cut. At most [`MAX_UPLOAD_IDLE_TIMEOUT`].
+    pub upload_idle_timeout: Duration,
     /// The blobs read from packs are kept here, when there is a cache.
     pub cache: Option<Arc<ReadCache>>,
 }
@@ -40,6 +59,8 @@ impl Default for PackSettings {
         Self {
             pack_bytes: FRONTEND_PACK_BYTES,
             max_blob_bytes: MAX_PACKED_BLOB_BYTES,
+            inflight_bytes: DEFAULT_INFLIGHT_BYTES,
+            upload_idle_timeout: DEFAULT_UPLOAD_IDLE_TIMEOUT,
             cache: None,
         }
     }
@@ -92,6 +113,8 @@ pub struct Packs {
     store: Arc<dyn PackStore>,
     index: Arc<dyn PackIndex>,
     max_blob_bytes: u64,
+    upload_idle_timeout: Duration,
+    budget: Budget,
     metrics: Arc<PackMetrics>,
 }
 
@@ -132,11 +155,14 @@ impl Packs {
             packer,
             reader,
         };
+        let metrics = Arc::<PackMetrics>::default();
         Ok(Self {
             store: Arc::new(over),
             index,
             max_blob_bytes: settings.max_blob_bytes,
-            metrics: Arc::default(),
+            upload_idle_timeout: settings.upload_idle_timeout.min(MAX_UPLOAD_IDLE_TIMEOUT),
+            budget: Budget::new(settings.inflight_bytes, Arc::clone(&metrics)),
+            metrics,
         })
     }
 
@@ -145,6 +171,29 @@ impl Packs {
     #[must_use]
     pub fn max_blob_bytes(&self) -> u64 {
         self.max_blob_bytes
+    }
+
+    /// The bytes that uploads into packs may hold in flight together
+    /// ([`PackSettings::inflight_bytes`]).
+    #[must_use]
+    pub fn inflight_bytes(&self) -> u32 {
+        self.budget.cap()
+    }
+
+    /// How long a ByteStream upload may go without a byte of its body arriving
+    /// ([`PackSettings::upload_idle_timeout`]).
+    #[must_use]
+    pub fn upload_idle_timeout(&self) -> Duration {
+        self.upload_idle_timeout
+    }
+
+    /// `bytes` of the room that uploads share ([`PackSettings::inflight_bytes`]), waiting for
+    /// the uploads ahead to give enough back. The room is given back when it is dropped.
+    ///
+    /// # Errors
+    /// RESOURCE_EXHAUSTED when `bytes` is over all of the room.
+    pub(super) async fn reserve(&self, bytes: u64) -> Result<Room, Status> {
+        self.budget.reserve(bytes).await
     }
 
     /// What these packs have counted.
@@ -156,6 +205,15 @@ impl Packs {
     /// Appends the pack families to `out` in the Prometheus text format.
     pub fn render_metrics(&self, out: &mut String) {
         self.metrics.render(out);
+    }
+
+    /// Appends the pack families of `packs`, if a frontend has them, to `out`; without packs
+    /// it appends nothing. A frontend's scrape calls this rather than matching the option
+    /// itself, so that the choice is one branch of one function.
+    pub fn render_metrics_of(packs: Option<&Packs>, out: &mut String) {
+        if let Some(packs) = packs {
+            packs.render_metrics(out);
+        }
     }
 
     /// Checks that the object store refuses to replace an object, as the write rule needs:
@@ -192,10 +250,29 @@ impl Packs {
     /// packs only the rest; a pack that was stored and not recorded is an object no row points
     /// at.
     ///
+    /// The bytes of `blobs` are taken from the room that uploads share first, waiting for it
+    /// if the uploads ahead hold it all, and given back when this returns.
+    ///
     /// # Errors
     /// INVALID_ARGUMENT when a blob's bytes are not its digest; UNAVAILABLE when the store
-    /// or the index failed.
+    /// or the index failed; RESOURCE_EXHAUSTED when the blobs together are over all of the
+    /// room.
     pub async fn put(&self, blobs: Vec<(Digest, Bytes)>) -> Result<(), Status> {
+        let bytes = blobs.iter().map(|(_, data)| data.len() as u64).sum();
+        let room = self.reserve(bytes).await?;
+        self.put_in(blobs, room).await
+    }
+
+    /// As [`Packs::put`], for blobs whose bytes are already counted in `room`, which is
+    /// given back when this returns.
+    ///
+    /// # Errors
+    /// As [`Packs::put`], but for RESOURCE_EXHAUSTED.
+    pub(super) async fn put_in(
+        &self,
+        blobs: Vec<(Digest, Bytes)>,
+        room: Room,
+    ) -> Result<(), Status> {
         let blobs = blobs
             .into_iter()
             .map(|(digest, bytes)| Blob {
@@ -204,6 +281,7 @@ impl Packs {
             })
             .collect();
         let packed = self.store.pack(blobs).await;
+        drop(room);
         self.stored(packed)
     }
 

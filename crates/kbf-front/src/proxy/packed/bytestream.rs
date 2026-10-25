@@ -5,15 +5,20 @@
 //!
 //! A `Read` is served from the blob as the packs hold it, hashed, cut to
 //! `[read_offset, read_offset + read_limit)` and sent in messages of at most
-//! [`READ_CHUNK_BYTES`](crate::READ_CHUNK_BYTES), each made as it is polled. A `Write` is
-//! received whole, message by message, under the rules of the cache's ByteStream (the same
-//! resource, the next offset, no more than the digest's size, `finish_write` to end), and
-//! packed.
+//! [`READ_CHUNK_BYTES`](crate::READ_CHUNK_BYTES), each made as it is polled. A `Write` takes
+//! the bytes its resource name claims from the room that uploads share (waiting for it, before
+//! it reads on past the frames that carry the name), is received whole, message by message,
+//! under the rules of the cache's ByteStream (the same resource, the next offset, no more than
+//! the digest's size, `finish_write` to end), and packed. The buffer grows with the bytes that
+//! arrive, a message longer than the rest of the blob, the name and the protobuf's own tags can
+//! make it is refused at its length prefix, before any of it is buffered, and an upload that
+//! gets no byte for [`Packs::upload_idle_timeout`] after the name ends DEADLINE_EXCEEDED.
 
 use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body::{Body as _, Frame};
@@ -21,6 +26,7 @@ use kbf_proto::google::bytestream::{ReadRequest, ReadResponse, WriteRequest, Wri
 use kbf_storage::in_flight;
 use kbf_types::Digest;
 use prost::Message as _;
+use tokio::time::{Instant, timeout_at};
 use tonic::Status;
 use tonic::body::Body;
 use tonic::codegen::http;
@@ -89,11 +95,16 @@ pub(in crate::proxy) async fn read(
 }
 
 /// A `Write` whose request is `body` (all of it, from the first message), for the blob
-/// `digest` named `name`: received whole, packed, and answered with the blob's size.
+/// `digest` named `name`: received whole, packed, and answered with the blob's size. The
+/// bytes the name claims are taken from the room that uploads share before `body` is read on
+/// past the frames that carry the name (which the caller has read), and given back when the
+/// call ends, however it ends.
 ///
 /// # Errors
 /// INVALID_ARGUMENT for a stream that breaks the rules of an upload or whose bytes are not the
-/// digest; UNAVAILABLE when the packs could not be written; or the client's own error if its
+/// digest; UNAVAILABLE when the packs could not be written; RESOURCE_EXHAUSTED when the blob
+/// alone is over all of the room; DEADLINE_EXCEEDED when no byte of `body` arrived for
+/// [`Packs::upload_idle_timeout`] once the room was taken; or the client's own error if its
 /// request broke.
 pub(in crate::proxy) async fn write(
     packs: &Packs,
@@ -101,8 +112,9 @@ pub(in crate::proxy) async fn write(
     name: &str,
     digest: Digest,
 ) -> Result<http::Response<Body>, Status> {
-    let received = receive(body, name, &digest).await?;
-    packs.put(vec![(digest, received)]).await?;
+    let room = packs.reserve(digest.size_bytes).await?;
+    let received = receive(packs, body, name, &digest).await?;
+    packs.put_in(vec![(digest, received)], room).await?;
     let committed = WriteResponse {
         committed_size: i64::try_from(digest.size_bytes).unwrap_or(i64::MAX),
     };
@@ -113,29 +125,77 @@ pub(in crate::proxy) async fn write(
     Ok(grpc(Body::new(Framed(frames))))
 }
 
-/// The bytes of the blob `digest` that the messages of `body` carry, counted as held from the
-/// allocation (`kbf_bytes_in_flight`) until the packs are done with them.
-async fn receive(mut body: Body, name: &str, digest: &Digest) -> Result<Bytes, Status> {
+/// The bytes of the blob `digest` that the messages of `body` carry, counted as held
+/// (`kbf_bytes_in_flight`) from the allocation until the packs are done with them. The buffer
+/// grows with the bytes that arrive ([`grow`]), so an upload that claims a large blob and sends
+/// nothing holds none of it here. The upload is given up if no byte of `body` arrives for the
+/// idle timeout of `packs`: the time is counted from the last frame that carried a byte, so a
+/// slow upload that keeps sending is never cut, and a frame without a byte (an empty data
+/// frame, trailers) is not progress.
+async fn receive(
+    packs: &Packs,
+    mut body: Body,
+    name: &str,
+    digest: &Digest,
+) -> Result<Bytes, Status> {
     let size = digest.size_bytes;
-    // The size is within the bound the caller checked (`applies`): allocated at once.
-    let capacity = usize::try_from(size).unwrap_or_default();
-    let held = in_flight::hold(capacity as u64);
-    let mut received: Vec<u8> = Vec::with_capacity(capacity);
+    // The size is within the bound the caller checked (`applies`).
+    let limit = usize::try_from(size).unwrap_or(usize::MAX);
+    let idle = packs.upload_idle_timeout();
+    let mut held = in_flight::hold(0);
+    let mut received: Vec<u8> = Vec::new();
     let mut pending = Messages::default();
+    let mut deadline = Instant::now() + idle;
     loop {
-        while let Some(message) = pending.take_message()? {
+        while let Some(message) = pending.take_message(name, received.len() as u64, size)? {
             check(&message, name, received.len() as u64, size)?;
+            grow(&mut received, message.data.len(), limit);
+            held.add(received.capacity() as u64 - held.bytes());
             received.extend_from_slice(&message.data);
             if message.finish_write {
                 return Ok(in_flight::counted_with(received, held));
             }
         }
-        let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+        let next = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx));
+        let Ok(frame) = timeout_at(deadline, next).await else {
+            return Err(stalled(packs, digest, idle));
+        };
         let frame = frame
             .ok_or_else(|| Status::invalid_argument("write stream ended without finish_write"))??;
-        pending.push(frame.data_ref().map_or(&[][..], Bytes::as_ref));
+        let data = frame.data_ref().map_or(&[][..], Bytes::as_ref);
+        if !data.is_empty() {
+            deadline = Instant::now() + idle;
+        }
+        pending.push(data);
     }
 }
+
+/// Makes room in `buf` for `more` bytes more, without ever holding room for more than `limit`
+/// bytes (the size of the blob, which the bytes were checked to fit in): the capacity doubles
+/// when it is short, so that a blob sent in many messages is copied a few times, not once per
+/// message.
+fn grow(buf: &mut Vec<u8>, more: usize, limit: usize) {
+    let needed = buf.len() + more;
+    if needed > buf.capacity() {
+        let doubled = buf.capacity().saturating_mul(2);
+        let target = doubled.max(needed).min(limit);
+        buf.reserve_exact(target - buf.len());
+    }
+}
+
+/// The end of an upload of `digest` that got no byte of its body for `idle`, counted and
+/// logged: DEADLINE_EXCEEDED.
+fn stalled(packs: &Packs, digest: &Digest, idle: Duration) -> Status {
+    packs.metrics().upload_idle_timeouts.add(1);
+    tracing::warn!(%digest, ?idle, "an upload into packs got no byte of its body in time: ended");
+    Status::deadline_exceeded(format!(
+        "no byte of the upload of {digest} arrived within {idle:?}"
+    ))
+}
+
+/// The most the protobuf of a `WriteRequest` adds to its name and its data: the tags and
+/// lengths of its four fields (at most 25 bytes), with room to spare.
+const MESSAGE_TAGS_BYTES: u64 = 32;
 
 /// Whether `message`, which comes after `received` bytes of an upload of `size` bytes named
 /// `name`, keeps the rules of an upload.
@@ -171,12 +231,21 @@ impl Messages {
         self.buf.extend_from_slice(data);
     }
 
-    /// The next whole `WriteRequest`, if the bytes so far hold one.
+    /// The next whole `WriteRequest`, if the bytes so far hold one, of the upload of `size`
+    /// bytes named `name` that has received `received` of them. The length in the prefix is
+    /// checked as soon as the prefix is there, so that no more is buffered for a message than
+    /// the rest of the blob, the name and the protobuf's tags can make it.
     ///
     /// # Errors
-    /// INVALID_ARGUMENT for a compressed message or one that is not a `WriteRequest`;
-    /// RESOURCE_EXHAUSTED for a message over the largest a call may carry.
-    fn take_message(&mut self) -> Result<Option<WriteRequest>, Status> {
+    /// INVALID_ARGUMENT for a compressed message, one that is not a `WriteRequest`, or one
+    /// whose length is over what the rest of the upload can carry; RESOURCE_EXHAUSTED for a
+    /// message over the largest a call may carry.
+    fn take_message(
+        &mut self,
+        name: &str,
+        received: u64,
+        size: u64,
+    ) -> Result<Option<WriteRequest>, Status> {
         let Some(&[flag, a, b, c, d]) = self.buf.first_chunk::<5>() else {
             return Ok(None);
         };
@@ -187,6 +256,14 @@ impl Messages {
         if len > MAX_MESSAGE_BYTES {
             return Err(Status::resource_exhausted(format!(
                 "a message of {len} bytes is over the {MAX_MESSAGE_BYTES} a call may carry"
+            )));
+        }
+        let rest = size.saturating_sub(received);
+        let allowed = rest.saturating_add(name.len() as u64 + MESSAGE_TAGS_BYTES);
+        if len as u64 > allowed {
+            return Err(Status::invalid_argument(format!(
+                "a message of {len} bytes carries more than the {rest} bytes left of the {size} \
+                 the resource names"
             )));
         }
         let Some(proto) = self.buf.get(5..5 + len) else {
@@ -278,6 +355,7 @@ mod tests {
     use tonic::Code;
 
     use super::*;
+    use crate::PackSettings;
 
     /// One gRPC message of `proto` with the flag byte `flag`.
     fn wire(flag: u8, proto: &[u8]) -> Vec<u8> {
@@ -296,6 +374,12 @@ mod tests {
         }
     }
 
+    /// The next message of `messages` whatever the size of the upload: the only limit is the
+    /// largest message a call may carry.
+    fn take_any(messages: &mut Messages) -> Result<Option<WriteRequest>, Status> {
+        messages.take_message("", 0, u64::MAX)
+    }
+
     /// Asserts that a message is taken only when whole, however the bytes arrive: a cut
     /// before the end of the length prefix or of the message yields nothing, and the rest of
     /// the bytes are kept for the next message.
@@ -310,7 +394,7 @@ mod tests {
         let mut messages = Messages::default();
         for (cut, byte) in bytes.iter().enumerate() {
             messages.push(&[*byte]);
-            let taken = messages.take_message().expect("well formed");
+            let taken = take_any(&mut messages).expect("well formed");
             assert_eq!(taken.is_some(), ends.contains(&(cut + 1)));
         }
         assert!(messages.buf.is_empty());
@@ -323,20 +407,44 @@ mod tests {
     fn a_message_that_cannot_be_read_is_refused() {
         let mut compressed = Messages::default();
         compressed.push(&wire(1, b"x"));
-        let refused = compressed.take_message().expect_err("compressed");
+        let refused = take_any(&mut compressed).expect_err("compressed");
         assert_eq!(refused.code(), Code::InvalidArgument);
         assert!(refused.message().contains("compress"), "{refused}");
 
         let mut huge = Messages::default();
         huge.push(&[0, 0xff, 0xff, 0xff, 0xff]);
-        let refused = huge.take_message().expect_err("over the bound");
+        let refused = take_any(&mut huge).expect_err("over the bound");
         assert_eq!(refused.code(), Code::ResourceExhausted);
 
         let mut garbage = Messages::default();
         garbage.push(&wire(0, &[0xff, 0xff]));
-        let refused = garbage.take_message().expect_err("not protobuf");
+        let refused = take_any(&mut garbage).expect_err("not protobuf");
         assert_eq!(refused.code(), Code::InvalidArgument);
         assert!(refused.message().contains("WriteRequest"), "{refused}");
+    }
+
+    /// Asserts that a message whose length prefix says it is longer than the rest of the blob,
+    /// the name and the protobuf's tags can make it is refused INVALID_ARGUMENT as soon as the
+    /// prefix is read, with none of its body there, and that a prefix of the longest message
+    /// that can be made is not refused (nothing is taken until the body is there).
+    #[test]
+    fn a_message_longer_than_the_rest_of_the_blob_is_refused_at_its_prefix() {
+        let mut declared = Messages::default();
+        declared.push(&[0, 0, 0x50, 0, 0]);
+        let taken = declared.take_message(NAME, 0, 10);
+        let refused = taken.expect_err("5 MiB for 10 bytes");
+        assert_eq!(refused.code(), Code::InvalidArgument);
+        let said = refused.message();
+        assert!(said.contains("more than the 10 bytes"), "{said}");
+
+        let longest = u32::try_from(10 + NAME.len() + 32).expect("small");
+        for (len, is_refused) in [(longest, false), (longest + 1, true)] {
+            let mut prefix = Messages::default();
+            prefix.push(&[0]);
+            prefix.push(&len.to_be_bytes());
+            let taken = prefix.take_message(NAME, 0, 10);
+            assert_eq!(taken.is_err(), is_refused, "{len}");
+        }
     }
 
     /// Asserts that the first message of a request is the protobuf its prefix says, and that
@@ -360,6 +468,11 @@ mod tests {
 
     /// Packs over an in-memory store and index.
     fn packs() -> Packs {
+        packs_with(PackSettings::default())
+    }
+
+    /// Packs over an in-memory store and index, as `settings` say.
+    fn packs_with(settings: PackSettings) -> Packs {
         let create_only = kbf_objstore::Capabilities {
             conditional_put: true,
             object_lock: false,
@@ -370,7 +483,7 @@ mod tests {
         let index: std::sync::Arc<dyn kbf_state::PackIndex> = std::sync::Arc::new(index);
         let keys = kbf_pack::PackKeys::new(kbf_pack::WriterKind::Frontend, "fe1", "boot1");
         let keys = keys.expect("keys");
-        let made = Packs::new(store, index, keys, crate::PackSettings::default());
+        let made = Packs::new(store, index, keys, settings);
         made.expect("packs")
     }
 
@@ -437,5 +550,262 @@ mod tests {
         assert_eq!(data.as_ref(), [0, 0, 0, 0, 2, b'a', b'b']);
         let second = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
         assert!(second.is_none());
+    }
+
+    /// The name every upload of these tests is made under.
+    const NAME: &str = "main/uploads/u1/blobs/h/1";
+
+    /// The idle timeout of these tests.
+    const IDLE: Duration = Duration::from_secs(30);
+
+    type Sender = tokio::sync::mpsc::UnboundedSender<Frame<Bytes>>;
+    type Upload = tokio::task::JoinHandle<Result<(), Status>>;
+
+    /// A request body fed by the test: the frames sent arrive in order, and the body ends when
+    /// the sender is dropped.
+    struct Fed(tokio::sync::mpsc::UnboundedReceiver<Frame<Bytes>>);
+
+    impl http_body::Body for Fed {
+        type Data = Bytes;
+        type Error = Status;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
+            self.0.poll_recv(cx).map(|frame| frame.map(Ok))
+        }
+    }
+
+    /// The sender that feeds a body, and the body.
+    fn fed() -> (Sender, Body) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (sender, Body::new(Fed(receiver)))
+    }
+
+    /// A blob of `len` bytes of `fill`, and its digest.
+    fn blob_of(len: usize, fill: u8) -> (Digest, Bytes) {
+        let bytes = Bytes::from(vec![fill; len]);
+        (kbf_segments::sha256(&bytes), bytes)
+    }
+
+    /// Sends the message of a Write that puts `data` at `offset`, and ends the upload if
+    /// `finish`.
+    fn send(tx: &Sender, offset: i64, data: &[u8], finish: bool) {
+        let message = write_request(NAME, offset, data, finish);
+        let frame = Frame::data(Bytes::from(wire(0, &message.encode_to_vec())));
+        // A body whose upload has ended takes nothing more.
+        let _ = tx.send(frame);
+    }
+
+    /// A Write of `digest` over `body`, run as a task.
+    fn upload(packs: &Packs, body: Body, digest: Digest) -> Upload {
+        let packs = packs.clone();
+        tokio::spawn(async move { write(&packs, body, NAME, digest).await.map(|_| ()) })
+    }
+
+    /// Lets every task that can run run until it waits: the paused clock moves on only when
+    /// none can.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    /// Packs that hold `inflight` bytes of uploads at once and cut an upload that sends no byte
+    /// for [`IDLE`].
+    fn packs_for(inflight: u32) -> Packs {
+        packs_with(PackSettings {
+            inflight_bytes: inflight,
+            upload_idle_timeout: IDLE,
+            ..PackSettings::default()
+        })
+    }
+
+    /// Asserts that an upload that stops sending is ended DEADLINE_EXCEEDED once the idle
+    /// timeout has passed since its last byte, and not before; that it stores and records
+    /// nothing, is counted, and gives back its bytes, so that an upload that was waiting for
+    /// the room is admitted then and is stored. Asserts also that the upload counts the bytes it
+    /// holds as the 10 that arrived, not the 60 it claimed.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_upload_is_cut_and_its_room_goes_to_the_one_waiting() {
+        let packs = packs_for(100);
+        let (stalled, stalled_bytes) = blob_of(60, b'a');
+        let (waiting, waiting_bytes) = blob_of(60, b'b');
+        let (stalled_tx, body) = fed();
+        let stalled_upload = upload(&packs, body, stalled);
+        send(&stalled_tx, 0, &stalled_bytes[..10], false);
+        let (waiting_tx, body) = fed();
+        let waiting_upload = upload(&packs, body, waiting);
+        send(&waiting_tx, 0, &waiting_bytes, true);
+        let started = Instant::now();
+
+        settle().await;
+        let metrics = packs.metrics();
+        assert_eq!(metrics.inflight_bytes(), 60);
+        assert_eq!(metrics.upload_waits.get(), 1);
+        assert_eq!(in_flight::process().current(), 10);
+        assert!(!waiting_upload.is_finished());
+
+        tokio::time::advance(IDLE - Duration::from_secs(1)).await;
+        settle().await;
+        assert!(!stalled_upload.is_finished(), "cut before the timeout");
+        assert!(!waiting_upload.is_finished());
+
+        let cut = stalled_upload.await.expect("joined").expect_err("cut");
+        assert_eq!(cut.code(), Code::DeadlineExceeded);
+        assert!(started.elapsed() >= IDLE);
+        waiting_upload.await.expect("joined").expect("stored");
+        assert_eq!(metrics.upload_idle_timeouts.get(), 1);
+        assert_eq!(metrics.inflight_bytes(), 0);
+        assert_eq!(metrics.inflight_peak_bytes(), 60);
+        let found = packs.read(&waiting).await.expect("read");
+        assert_eq!(found, Some(waiting_bytes));
+        let lost = packs.read(&stalled).await.expect("read");
+        assert!(lost.is_none());
+    }
+
+    /// Asserts that an upload that sends a byte every 20 seconds, and so takes far longer in
+    /// all than the idle timeout, is not cut and is stored: only a pause is.
+    #[tokio::test(start_paused = true)]
+    async fn an_upload_that_keeps_sending_is_never_cut() {
+        let packs = packs_for(100);
+        let (digest, bytes) = blob_of(10, b'x');
+        let (tx, body) = fed();
+        let running = upload(&packs, body, digest);
+        let started = Instant::now();
+        let pace = IDLE - Duration::from_secs(10);
+        let last = bytes.len() - 1;
+        let sent = bytes.clone();
+        let feeder = tokio::spawn(async move {
+            for (at, byte) in sent.iter().enumerate() {
+                tokio::time::sleep(pace).await;
+                let offset = i64::try_from(at).expect("small");
+                send(&tx, offset, &[*byte], at == last);
+            }
+        });
+
+        running.await.expect("joined").expect("not cut");
+
+        feeder.await.expect("joined");
+        assert!(started.elapsed() >= IDLE * 6);
+        assert_eq!(packs.metrics().upload_idle_timeouts.get(), 0);
+        let found = packs.read(&digest).await.expect("read");
+        assert_eq!(found, Some(bytes));
+    }
+
+    /// Asserts that only bytes are progress: an upload that sends one byte and then empty data
+    /// frames is cut the idle timeout after the byte, not after the last empty frame.
+    #[tokio::test(start_paused = true)]
+    async fn frames_without_a_byte_do_not_postpone_the_idle_timeout() {
+        let packs = packs_for(100);
+        let (digest, bytes) = blob_of(10, b'y');
+        let (tx, body) = fed();
+        let running = upload(&packs, body, digest);
+        let started = Instant::now();
+        send(&tx, 0, &bytes[..1], false);
+        tokio::spawn(async move {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                let _ = tx.send(Frame::data(Bytes::new()));
+            }
+        });
+
+        let cut = running.await.expect("joined").expect_err("cut");
+
+        assert_eq!(cut.code(), Code::DeadlineExceeded);
+        assert!(started.elapsed() >= IDLE);
+        assert!(started.elapsed() < Duration::from_secs(40));
+        assert_eq!(packs.metrics().upload_idle_timeouts.get(), 1);
+        let found = packs.read(&digest).await.expect("read");
+        assert!(found.is_none());
+    }
+
+    /// Asserts that an upload of a blob larger than all the room is refused RESOURCE_EXHAUSTED
+    /// at once, without a byte of its body read, and counted, and that it takes nothing.
+    #[tokio::test]
+    async fn an_upload_larger_than_all_the_room_is_refused_unread() {
+        let packs = packs_for(10);
+        let (digest, _) = blob_of(11, b'z');
+        let (_tx, body) = fed();
+
+        let refused = write(&packs, body, NAME, digest).await;
+
+        let refused = refused.expect_err("refused");
+        assert_eq!(refused.code(), Code::ResourceExhausted);
+        let metrics = packs.metrics();
+        assert_eq!(metrics.upload_refusals.get(), 1);
+        assert_eq!(metrics.inflight_bytes(), 0);
+        assert!(packs.read(&digest).await.expect("read").is_none());
+    }
+
+    /// Asserts that four uploads of 40 bytes into a room of 100 all succeed: the first two take
+    /// 80 bytes, the others wait (counted) and are admitted as the earlier ones finish, and the
+    /// bytes reserved at once never pass the room.
+    #[tokio::test(start_paused = true)]
+    async fn uploads_that_together_are_over_the_room_all_succeed() {
+        let packs = packs_for(100);
+        let blobs: Vec<(Digest, Bytes)> = (0..4).map(|i| blob_of(40, b'a' + i)).collect();
+        let mut senders = Vec::new();
+        let mut uploads = Vec::new();
+        for (digest, _) in &blobs {
+            let (tx, body) = fed();
+            senders.push(tx);
+            uploads.push(upload(&packs, body, *digest));
+        }
+
+        settle().await;
+        let metrics = packs.metrics();
+        assert_eq!(metrics.inflight_bytes(), 80);
+        assert_eq!(metrics.upload_waits.get(), 2);
+        assert!(uploads.iter().all(|running| !running.is_finished()));
+
+        for (tx, (_, bytes)) in senders.iter().zip(&blobs) {
+            send(tx, 0, bytes, true);
+        }
+        for running in uploads {
+            running.await.expect("joined").expect("stored");
+        }
+
+        assert_eq!(metrics.inflight_bytes(), 0);
+        assert_eq!(metrics.inflight_peak_bytes(), 80);
+        for (digest, bytes) in blobs {
+            let found = packs.read(&digest).await.expect("read");
+            assert_eq!(found, Some(bytes));
+        }
+    }
+
+    /// Asserts that a receive buffer is given room for the bytes that arrive and not for the
+    /// size claimed, grows by doubling (a few copies, not one per message), and is never larger
+    /// than the size claimed.
+    #[test]
+    fn a_receive_buffer_grows_with_the_bytes_and_never_past_the_size() {
+        let mut claimed: Vec<u8> = Vec::new();
+        grow(&mut claimed, 5, 1000);
+        assert!(claimed.capacity() >= 5);
+        assert!(claimed.capacity() < 1000);
+
+        let limit = 100;
+        let mut buf = Vec::new();
+        let mut capacities = Vec::new();
+        for _ in 0..limit {
+            grow(&mut buf, 1, limit);
+            buf.push(7);
+            assert!(buf.capacity() <= limit);
+            capacities.push(buf.capacity());
+        }
+        capacities.dedup();
+        assert!(capacities.len() <= 10, "{capacities:?}");
+    }
+
+    /// Asserts that the idle timeout is the default of 30 seconds unless given, and that one
+    /// longer than a day is kept as a day, so that no deadline overflows.
+    #[tokio::test]
+    async fn the_idle_timeout_is_thirty_seconds_and_at_most_a_day() {
+        assert_eq!(packs().upload_idle_timeout(), Duration::from_secs(30));
+        let forever = packs_with(PackSettings {
+            upload_idle_timeout: Duration::MAX,
+            ..PackSettings::default()
+        });
+        let kept = forever.upload_idle_timeout();
+        assert_eq!(kept, Duration::from_secs(86_400));
     }
 }

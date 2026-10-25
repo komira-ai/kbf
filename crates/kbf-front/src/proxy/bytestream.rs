@@ -76,7 +76,11 @@
 //! **Packs.** Given packs, a Read of a blob the pack index holds is answered from its pack
 //! (a blob it lacks is passed on as above), and a Write of a plain blob within the packs'
 //! bound is received whole, hashed and packed: the exceptions to "no payload byte is
-//! collected" above, which hold one blob. Every other call is passed through as before.
+//! collected" above, which hold one blob. Such a Write first takes its blob's size from the
+//! room that the uploads into packs share once the name has been read, and waits for it while
+//! they hold it all; it is ended DEADLINE_EXCEEDED if, once it has the room, no byte of its
+//! body arrives for the idle timeout (the `packed` module has the rules). Every other call is
+//! passed through as before.
 
 use std::convert::Infallible;
 use std::future::{Future, poll_fn};

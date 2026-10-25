@@ -127,8 +127,9 @@ pub use crate::input_tree::{ENTRY_OVERHEAD, InputTreeConfig};
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
 pub use crate::operations::OperationsService;
 pub use crate::proxy::{
-    Direction, MAX_PACKED_BLOB_BYTES, Meter, Method, Owner, Owners, PackMetrics, PackSettings,
-    PackStore, Packs, Proxy,
+    DEFAULT_INFLIGHT_BYTES, DEFAULT_UPLOAD_IDLE_TIMEOUT, Direction, MAX_PACKED_BLOB_BYTES,
+    MAX_UPLOAD_IDLE_TIMEOUT, Meter, Method, Owner, Owners, PackMetrics, PackSettings, PackStore,
+    Packs, Proxy,
 };
 pub use crate::recorder::{
     ActionLabel, DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording,

@@ -134,6 +134,8 @@ pack-bytes = 33554432
 # pack-cache-bytes = "BYTES"
 # A directory this process owns where the blobs read from packs are kept, one file each, checked by digest on every read; the least recently used are removed to stay within `--pack-cache-bytes`. Left out, nothing is kept
 # pack-cache-dir = "DIR"
+# The most bytes of client uploads into packs this frontend holds in flight at once, at least 67108864 (the largest blob that is packed, so that no upload is refused for its size) and at most 4294967295. Each upload takes its blob's size as soon as its resource name has arrived, before it reads on, and gives it back when it ends; one that finds the rest taken waits its turn, so a burst of uploads is slowed down, not failed. The bound counts blob bytes, not the memory of the process: a batch upload is decoded before it waits, so the bytes it holds meanwhile are not counted, and reads are not counted. Used only with `--pack-store-endpoint`
+pack-inflight-bytes = 1073741824
 # The bucket of `--pack-store-endpoint` that holds the packs, under the keys `cas/f/<--pack-writer>/<start>/<sequence>`
 # pack-store-bucket = "BUCKET"
 # A file with the key pair for `--pack-store-endpoint`, as JSON `{"access_key_id": "...", "secret_access_key": "..."}`, readable by its owner alone (mode 0600 or 0400). The secret is never a flag: a command line is world-readable
@@ -142,6 +144,8 @@ pack-bytes = 33554432
 # pack-store-endpoint = "URL"
 # The region the requests to `--pack-store-endpoint` are signed for
 pack-store-region = "us-east-1"
+# How long, in seconds, a ByteStream upload into packs may go without a byte of its body arriving before it is ended DEADLINE_EXCEEDED and gives back its bytes, so that a client that stops sending cannot hold room for ever. The time before its resource name has arrived is not counted. An upload that keeps sending, however slowly, is never cut and keeps its bytes until it ends, so `--pack-inflight-bytes` is the only bound on that. At least 1, at most 86400. Used only with `--pack-store-endpoint`
+pack-upload-idle-timeout = 30
 # The name of this frontend in the keys of its packs and in the pack index's record of who wrote each: give each frontend of a farm one of its own. Used only with `--pack-store-endpoint`
 pack-writer = "frontend"
 

@@ -3,9 +3,11 @@
 //! Each test says the behaviour it asserts.
 
 use std::sync::atomic::Ordering::SeqCst;
+use std::time::Duration;
 
-use futures::stream;
-use kbf_front::{Owners, PackSettings};
+use bytes::Bytes;
+use futures::{StreamExt as _, stream};
+use kbf_front::{Owners, PackSettings, Packs};
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::google::bytestream::{ReadRequest, WriteRequest};
 use kbf_state::{NewPack, PackBlob, PackIndex as _};
@@ -76,6 +78,12 @@ async fn write(front: &Channel, messages: Vec<WriteRequest>) -> Result<i64, Stat
         .write(stream::iter(messages))
         .await?;
     Ok(sent.into_inner().committed_size)
+}
+
+/// The size a Write of the whole of `bytes` in one message is acknowledged with, or the status
+/// that ended it.
+async fn write_whole(front: &Channel, digest: &Digest, bytes: &[u8]) -> Result<i64, Status> {
+    write(front, vec![message(&upload(digest), 0, bytes, true)]).await
 }
 
 /// A pack the index records for `digest` at offset 0, of `size` bytes, under `key`.
@@ -338,6 +346,86 @@ async fn a_write_whose_pack_cannot_be_stored_is_unavailable() {
     assert!(rig.index.has_all(&[digest]));
 }
 
+/// Asserts that Writes whose blobs together are over all of the room all succeed: with room for
+/// 100 bytes, six Writes of 40 bytes sent together are all acknowledged and stored, and the
+/// bytes reserved at once never pass 100 and are given back.
+#[tokio::test]
+async fn writes_that_together_are_over_the_room_all_succeed() {
+    let settings = PackSettings {
+        inflight_bytes: 100,
+        ..PackSettings::default()
+    };
+    let rig = Rig::with(settings).await;
+    let blobs: Vec<(Digest, Bytes)> = (0..6).map(|i| blob(&format!("{i:0>40}"))).collect();
+    let writes = blobs
+        .iter()
+        .map(|(digest, bytes)| write_whole(&rig.front, digest, bytes));
+
+    let acknowledged = futures::future::join_all(writes).await;
+
+    for sent in acknowledged {
+        assert_eq!(sent.expect("acknowledged"), 40);
+    }
+    let metrics = rig.packs.metrics();
+    assert!(metrics.inflight_peak_bytes() >= 40);
+    assert!(metrics.inflight_peak_bytes() <= 100);
+    assert_eq!(metrics.inflight_bytes(), 0);
+    for (digest, _) in &blobs {
+        assert!(rig.index.has_all(&[*digest]));
+    }
+}
+
+/// Asserts that a Write of a blob larger than all of the room is refused RESOURCE_EXHAUSTED,
+/// naming the flag, and stores nothing, while a Write that fits is acknowledged.
+#[tokio::test]
+async fn a_write_larger_than_all_the_room_is_refused() {
+    let settings = PackSettings {
+        inflight_bytes: 16,
+        ..PackSettings::default()
+    };
+    let rig = Rig::with(settings).await;
+    let (big, big_bytes) = blob("a blob of more than sixteen bytes");
+    let (small, small_bytes) = blob("sixteen bytes!!!");
+
+    let refused = write_whole(&rig.front, &big, &big_bytes).await;
+
+    let refused = refused.expect_err("refused");
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+    let said = refused.message();
+    assert!(said.contains("--pack-inflight-bytes"), "{said}");
+    assert!(rig.index.has_none(&[big]));
+    assert_eq!(rig.packs.metrics().upload_refusals.get(), 1);
+    let fits = write_whole(&rig.front, &small, &small_bytes).await;
+    assert_eq!(fits.expect("acknowledged"), 16);
+}
+
+/// Asserts that, over real gRPC, a Write that sends part of its blob and then nothing, without
+/// ending its request, is answered DEADLINE_EXCEEDED once the idle timeout has passed, stores
+/// and records nothing, is counted, and gives its room back.
+#[tokio::test]
+async fn a_write_that_stops_sending_is_ended_by_the_idle_timeout() {
+    let settings = PackSettings {
+        upload_idle_timeout: Duration::from_millis(300),
+        ..PackSettings::default()
+    };
+    let rig = Rig::with(settings).await;
+    let (digest, bytes) = blob("a blob that is never finished");
+    let first = message(&upload(&digest), 0, &bytes[..5], false);
+    let stalled = stream::iter([first]).chain(stream::pending());
+
+    let sent = ByteStreamClient::new(rig.front.clone())
+        .write(stalled)
+        .await;
+
+    let ended = sent.expect_err("ended");
+    assert_eq!(ended.code(), Code::DeadlineExceeded);
+    assert!(rig.index.has_none(&[digest]));
+    assert!(rig.store.keys().await.is_empty());
+    let metrics = rig.packs.metrics();
+    assert_eq!(metrics.upload_idle_timeouts.get(), 1);
+    assert_eq!(metrics.inflight_bytes(), 0);
+}
+
 /// Asserts that the families of the pack layer are in the text a scrape gets, with the counts of
 /// what was done.
 #[tokio::test]
@@ -349,8 +437,11 @@ async fn the_counters_are_rendered() {
     let read = read_range(&rig.front, name(&digest), 0, 0).await;
     read.expect("read");
 
+    let mut none = String::from("kept\n");
+    Packs::render_metrics_of(None, &mut none);
+    assert_eq!(none, "kept\n");
     let mut text = String::from("kept\n");
-    rig.packs.render_metrics(&mut text);
+    Packs::render_metrics_of(Some(&rig.packs), &mut text);
 
     assert!(text.starts_with("kept\n"), "{text}");
     for line in [
@@ -358,8 +449,14 @@ async fn the_counters_are_rendered() {
         "kbf_pack_written_blobs_total 1\n",
         "kbf_pack_reads_total 1\n",
         "kbf_pack_read_fallbacks_total 0\n",
+        "kbf_pack_upload_waits_total 0\n",
+        "kbf_pack_upload_refusals_total 0\n",
+        "kbf_pack_upload_idle_timeouts_total 0\n",
+        "kbf_pack_inflight_bytes 0\n",
+        "kbf_pack_inflight_peak_bytes 7\n",
     ] {
         assert!(text.contains(line), "{line:?} missing from\n{text}");
     }
     assert!(text.contains("# TYPE kbf_pack_digest_mismatches_total counter"));
+    assert!(text.contains("# TYPE kbf_pack_inflight_bytes gauge"));
 }

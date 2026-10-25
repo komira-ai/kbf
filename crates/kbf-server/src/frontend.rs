@@ -1129,9 +1129,7 @@ fn metrics_route(
             if let Some(history) = history {
                 history.render(&mut text);
             }
-            if let Some(packs) = packs {
-                packs.render_metrics(&mut text);
-            }
+            Packs::render_metrics_of(packs.as_ref(), &mut text);
             crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);
             ([(CONTENT_TYPE, crate::metrics::TEXT_FORMAT)], text)

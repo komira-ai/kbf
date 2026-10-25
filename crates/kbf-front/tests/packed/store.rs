@@ -2,6 +2,7 @@
 //! call through the proxy can reach (a blob that lies about its digest, a bound, a cache).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use kbf_front::{MAX_PACKED_BLOB_BYTES, PackSettings, Packs};
@@ -22,18 +23,29 @@ fn packs_over(store: &Arc<Spy>, settings: PackSettings) -> Result<Packs, PackErr
     Packs::new(Arc::clone(store), index, keys(), settings)
 }
 
-/// Asserts the defaults: packs of the frontend's size, a bound of 64 MiB and no cache; and
-/// that the packs print without the store.
+/// Asserts the defaults: packs of the frontend's size, a bound of 64 MiB, room for 1 GiB of
+/// uploads in flight, an idle timeout of 30 seconds and no cache; and that the packs print
+/// without the store.
 #[tokio::test]
 async fn the_defaults_are_the_frontends() {
     let settings = PackSettings::default();
     assert_eq!(settings.pack_bytes, FRONTEND_PACK_BYTES);
     assert_eq!(settings.max_blob_bytes, MAX_PACKED_BLOB_BYTES);
     assert_eq!(MAX_PACKED_BLOB_BYTES, 64 << 20);
+    assert_eq!(settings.inflight_bytes, kbf_front::DEFAULT_INFLIGHT_BYTES);
+    assert_eq!(kbf_front::DEFAULT_INFLIGHT_BYTES, 1 << 30);
+    assert_eq!(settings.upload_idle_timeout, Duration::from_secs(30));
+    assert_eq!(
+        settings.upload_idle_timeout,
+        kbf_front::DEFAULT_UPLOAD_IDLE_TIMEOUT
+    );
     assert!(settings.cache.is_none());
 
     let rig = Rig::new().await;
     assert_eq!(rig.packs.max_blob_bytes(), MAX_PACKED_BLOB_BYTES);
+    assert_eq!(rig.packs.inflight_bytes(), settings.inflight_bytes);
+    let idle = rig.packs.upload_idle_timeout();
+    assert_eq!(idle, settings.upload_idle_timeout);
     let printed = format!("{:?}", rig.packs);
     assert!(printed.contains("max_blob_bytes"), "{printed}");
 }

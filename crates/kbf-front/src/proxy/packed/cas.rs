@@ -69,7 +69,9 @@ pub(in crate::proxy) async fn read_blob(
 
 /// Packs the blobs of `items` that pass the checks of a stored blob, together, and answers
 /// each item alone, in order: the refusal of its own check, or, for a blob that passed, OK
-/// when the packs hold it and the index has its row, else the failure of the write.
+/// when the packs hold it and the index has its row, else the failure of the write. The bytes
+/// of those blobs are taken from the room that uploads share first ([`Packs::put`]), waiting
+/// for it if need be; when they are together over all of it, each of them is RESOURCE_EXHAUSTED.
 pub(in crate::proxy) async fn store_batch(
     packs: &Packs,
     items: Vec<Item>,

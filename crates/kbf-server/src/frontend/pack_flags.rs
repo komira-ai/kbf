@@ -5,8 +5,9 @@
 //! `--pack-store-endpoint` is given, and then a frontend serves exactly as it did: no object
 //! store is built or contacted. The endpoint needs `--pack-index`, the bucket and the
 //! credentials file, which clap enforces (so does the file of `kbf.toml`, which becomes flags).
-//! The companions that have a default (`--pack-store-region`, `--pack-bytes`, `--pack-writer`)
-//! need nothing, since the config template writes every flag with a default as a live line.
+//! The companions that have a default (`--pack-store-region`, `--pack-bytes`, `--pack-writer`,
+//! `--pack-inflight-bytes`, `--pack-upload-idle-timeout`) need nothing, since the config
+//! template writes every flag with a default as a live line.
 //!
 //! The credentials are a file and never a flag, as a command line is world-readable: JSON with
 //! `access_key_id` and `secret_access_key`, readable by its owner alone.
@@ -38,6 +39,8 @@ const PACK_BYTES: &str = "pack_bytes";
 const WRITER: &str = "pack_writer";
 const CACHE_DIR: &str = "pack_cache_dir";
 const CACHE_BYTES: &str = "pack_cache_bytes";
+const INFLIGHT_BYTES: &str = "pack_inflight_bytes";
+const UPLOAD_IDLE_TIMEOUT: &str = "pack_upload_idle_timeout";
 
 /// The id of `--pack-index`, which the endpoint needs.
 const PACK_INDEX: &str = "pack_index";
@@ -53,8 +56,15 @@ const DEFAULT_WRITER: &str = "frontend";
 /// request is given up on: 1 MiB/s.
 const MIN_PUT_RATE: u64 = 1 << 20;
 
-/// The eight flags.
-pub(super) fn args() -> [Arg; 8] {
+/// The least `--pack-inflight-bytes`: the largest blob the packs take (64 MiB), so that no
+/// upload they accept is refused for its size alone.
+const MIN_INFLIGHT_BYTES: i64 = 64 << 20;
+
+/// The longest `--pack-upload-idle-timeout`, in seconds: a day, the longest the packs keep.
+const MAX_IDLE_SECS: u64 = kbf_front::MAX_UPLOAD_IDLE_TIMEOUT.as_secs();
+
+/// The ten flags.
+pub(super) fn args() -> [Arg; 10] {
     [
         Arg::new(ENDPOINT)
             .long("pack-store-endpoint")
@@ -113,6 +123,38 @@ pub(super) fn args() -> [Arg; 8] {
                  of one batch or upload that do not fit are written as the next pack. Used \
                  only with `--pack-store-endpoint`",
             ),
+        Arg::new(INFLIGHT_BYTES)
+            .long("pack-inflight-bytes")
+            .value_name("BYTES")
+            .value_parser(clap::value_parser!(u32).range(MIN_INFLIGHT_BYTES..))
+            // DEFAULT_INFLIGHT_BYTES (1 GiB), which clap cannot take as a computed string; the
+            // default-flags test parses it back and compares it with the constant.
+            .default_value("1073741824")
+            .help(
+                "The most bytes of client uploads into packs this frontend holds in flight at \
+                 once, at least 67108864 (the largest blob that is packed, so that no upload is \
+                 refused for its size) and at most 4294967295. Each upload takes its blob's size \
+                 as soon as its resource name has arrived, before it reads on, and gives it back \
+                 when it ends; one that finds the rest taken waits its turn, so a burst of \
+                 uploads is slowed down, not failed. The bound counts blob bytes, not the memory \
+                 of the process: a batch upload is decoded before it waits, so the bytes it \
+                 holds meanwhile are not counted, and reads are not counted. Used only with \
+                 `--pack-store-endpoint`",
+            ),
+        Arg::new(UPLOAD_IDLE_TIMEOUT)
+            .long("pack-upload-idle-timeout")
+            .value_name("SECONDS")
+            .value_parser(clap::value_parser!(u64).range(1..=MAX_IDLE_SECS))
+            .default_value("30")
+            .help(
+                "How long, in seconds, a ByteStream upload into packs may go without a byte of \
+                 its body arriving before it is ended DEADLINE_EXCEEDED and gives back its \
+                 bytes, so that a client that stops sending cannot hold room for ever. The \
+                 time before its resource name has arrived is not counted. An upload that keeps \
+                 sending, however slowly, is never cut and keeps its bytes until it ends, so \
+                 `--pack-inflight-bytes` is the only bound on that. At least 1, at most 86400. \
+                 Used only with `--pack-store-endpoint`",
+            ),
         Arg::new(WRITER)
             .long("pack-writer")
             .value_name("NAME")
@@ -155,6 +197,10 @@ pub struct PackFlags {
     pub credentials_file: PathBuf,
     /// `--pack-bytes`.
     pub pack_bytes: u64,
+    /// `--pack-inflight-bytes`.
+    pub inflight_bytes: u32,
+    /// `--pack-upload-idle-timeout`.
+    pub upload_idle_timeout: Duration,
     /// `--pack-writer`.
     pub writer: String,
     /// `--pack-cache-dir` and `--pack-cache-bytes`, both or neither.
@@ -167,6 +213,8 @@ pub(super) fn from_matches(m: &ArgMatches) -> Option<PackFlags> {
     // clap makes the bucket and the credentials come with the endpoint, and the two flags of
     // the cache come together; the others have a default.
     let text = |id: &str| m.get_one::<String>(id).cloned().unwrap_or_default();
+    let inflight = m.get_one::<u32>(INFLIGHT_BYTES).copied();
+    let idle_secs = m.get_one::<u64>(UPLOAD_IDLE_TIMEOUT).copied();
     Some(PackFlags {
         endpoint: endpoint.clone(),
         bucket: text(BUCKET),
@@ -176,6 +224,8 @@ pub(super) fn from_matches(m: &ArgMatches) -> Option<PackFlags> {
             .cloned()
             .unwrap_or_default(),
         pack_bytes: m.get_one::<u64>(PACK_BYTES).copied().unwrap_or_default(),
+        inflight_bytes: inflight.unwrap_or_default(),
+        upload_idle_timeout: Duration::from_secs(idle_secs.unwrap_or_default()),
         writer: text(WRITER),
         cache: m
             .get_one::<PathBuf>(CACHE_DIR)
@@ -237,6 +287,8 @@ impl PackFlags {
             .transpose()?;
         let settings = PackSettings {
             pack_bytes: self.pack_bytes,
+            inflight_bytes: self.inflight_bytes,
+            upload_idle_timeout: self.upload_idle_timeout,
             cache: cache.map(Arc::new),
             ..PackSettings::default()
         };

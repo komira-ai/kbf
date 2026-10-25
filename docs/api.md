@@ -1514,6 +1514,10 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_read_lost_total` | counter | reads of a blob the index has and whose pack the store lacks, answered by the storage nodes (alert on any) |
 | `kbf_pack_read_errors_total` | counter | reads that failed because the pack index or the pack store could not answer |
 | `kbf_pack_digest_mismatches_total` | counter | reads of a blob whose pack held other bytes than its digest: never served, UNAVAILABLE (alert on any) |
+| `kbf_pack_inflight_bytes`, `kbf_pack_inflight_peak_bytes` | gauge | bytes the uploads into packs have taken of `--pack-inflight-bytes` now, and the most at once since the start (never above the flag) |
+| `kbf_pack_upload_waits_total` | counter | uploads that found `--pack-inflight-bytes` spent and waited their turn: a burst slowed down, none failed. Rising steadily means the bound is below what clients send |
+| `kbf_pack_upload_refusals_total` | counter | uploads refused RESOURCE_EXHAUSTED because their blobs alone are over `--pack-inflight-bytes` |
+| `kbf_pack_upload_idle_timeouts_total` | counter | ByteStream uploads ended DEADLINE_EXCEEDED because, after their resource name had arrived, no byte of their body arrived for `--pack-upload-idle-timeout`; nothing was stored and their bytes were given back |
 
 **Reading a stall with idle slots.** `kbf_sched_queued` high and `kbf_sched_leases` below the
 nodes' slots means work is waiting that placement cannot use (look at the node's booking and

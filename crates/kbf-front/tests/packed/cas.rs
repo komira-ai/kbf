@@ -17,6 +17,7 @@ const OK: i32 = Code::Ok as i32;
 const UNAVAILABLE: i32 = Code::Unavailable as i32;
 const INVALID: i32 = Code::InvalidArgument as i32;
 const NOT_FOUND: i32 = Code::NotFound as i32;
+const EXHAUSTED: i32 = Code::ResourceExhausted as i32;
 
 fn digests(blobs: &[(Digest, Bytes)]) -> Vec<Digest> {
     blobs.iter().map(|(digest, _)| *digest).collect()
@@ -108,6 +109,34 @@ async fn a_bad_item_of_a_batch_is_refused_alone() {
 
     assert!(rig.index.has_all(&[good.0]));
     assert!(rig.index.has_none(&[other]));
+}
+
+/// Asserts that a batch whose blobs that passed their checks are together over all of the room
+/// that uploads share is answered RESOURCE_EXHAUSTED for each of them, while a blob refused for
+/// its own reason keeps that answer; that nothing is stored or recorded; and that the same blobs
+/// sent in batches that fit are acknowledged.
+#[tokio::test]
+async fn a_batch_over_all_the_room_is_refused_and_smaller_ones_are_not() {
+    let settings = PackSettings {
+        inflight_bytes: 10,
+        ..PackSettings::default()
+    };
+    let rig = Rig::with(settings).await;
+    let one = blob("12345678");
+    let two = blob("abcdefgh");
+    let lying = item(&blob("other").0, &Bytes::from_static(b"not that"));
+    let requests = vec![item(&one.0, &one.1), lying, item(&two.0, &two.1)];
+
+    let answered = send_update(&rig.front, requests).await;
+
+    assert_eq!(answered, [EXHAUSTED, INVALID, EXHAUSTED]);
+    assert!(rig.store.keys().await.is_empty());
+    assert!(rig.index.has_none(&[one.0, two.0]));
+    assert_eq!(rig.packs.metrics().upload_refusals.get(), 1);
+    assert_eq!(update(&rig.front, std::slice::from_ref(&one)).await, [OK]);
+    assert_eq!(update(&rig.front, std::slice::from_ref(&two)).await, [OK]);
+    assert!(rig.index.has_all(&[one.0, two.0]));
+    assert_eq!(rig.packs.metrics().inflight_bytes(), 0);
 }
 
 /// Asserts that a blob the index has is not packed again: a second upload is acknowledged, adds

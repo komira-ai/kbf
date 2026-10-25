@@ -51,6 +51,8 @@ fn the_pack_flags_are_off_unless_the_endpoint_is_given() {
         "--pack-bytes=1048576",
         "--pack-writer=fe1",
         "--pack-store-region=eu-west-1",
+        "--pack-inflight-bytes=67108864",
+        "--pack-upload-idle-timeout=5",
     ];
     assert_eq!(parsed(&companions).expect("parses").packs, None);
 }
@@ -102,7 +104,8 @@ fn the_flags_need_each_other() {
 }
 
 /// Asserts that the flags make the setting they say, and that the defaults are the frontend's:
-/// packs closed at 32 MiB, the writer called `frontend`, the region `us-east-1`, no cache.
+/// packs closed at 32 MiB, room for 1 GiB of uploads in flight, an idle timeout of 30 seconds,
+/// the writer called `frontend`, the region `us-east-1`, no cache.
 #[test]
 fn the_flags_make_the_setting() {
     let plain = parsed(&STORE).expect("parses").packs.expect("packs");
@@ -114,6 +117,8 @@ fn the_flags_make_the_setting() {
             region: "us-east-1".to_owned(),
             credentials_file: PathBuf::from("/etc/kbf/pack.json"),
             pack_bytes: FRONTEND_PACK_BYTES,
+            inflight_bytes: kbf_front::DEFAULT_INFLIGHT_BYTES,
+            upload_idle_timeout: kbf_front::DEFAULT_UPLOAD_IDLE_TIMEOUT,
             writer: "frontend".to_owned(),
             cache: None,
         }
@@ -122,6 +127,8 @@ fn the_flags_make_the_setting() {
     more.extend([
         "--pack-store-region=eu-west-1",
         "--pack-bytes=4096",
+        "--pack-inflight-bytes=134217728",
+        "--pack-upload-idle-timeout=7",
         "--pack-writer=fe7",
         "--pack-cache-dir=/var/cache/packs",
         "--pack-cache-bytes=1000000",
@@ -129,10 +136,45 @@ fn the_flags_make_the_setting() {
     let set = parsed(&more).expect("parses").packs.expect("packs");
     assert_eq!(set.region, "eu-west-1");
     assert_eq!((set.pack_bytes, set.writer.as_str()), (4096, "fe7"));
+    assert_eq!(set.inflight_bytes, 128 << 20);
+    assert_eq!(set.upload_idle_timeout, Duration::from_secs(7));
     assert_eq!(
         set.cache,
         Some((PathBuf::from("/var/cache/packs"), 1_000_000))
     );
+}
+
+/// Asserts the bounds of the room and idle-timeout flags: the room is refused below the largest
+/// blob the packs take (64 MiB, so that no upload they accept is refused for its size) and one
+/// past 4294967295 bytes, and accepted at both; the idle timeout is refused at 0 and one past a
+/// day (86400 seconds), and accepted at the day.
+#[test]
+fn the_room_and_idle_flags_are_bounded() {
+    let least = i64::try_from(kbf_front::MAX_PACKED_BLOB_BYTES);
+    assert_eq!(least.expect("small"), MIN_INFLIGHT_BYTES);
+    let state = STORE[0];
+    for bad in [
+        "--pack-inflight-bytes=0",
+        "--pack-inflight-bytes=67108863",
+        "--pack-inflight-bytes=4294967296",
+        "--pack-upload-idle-timeout=0",
+        "--pack-upload-idle-timeout=86401",
+    ] {
+        let kind = refused(&[state, bad]);
+        assert_eq!(kind, ErrorKind::ValueValidation, "{bad}");
+    }
+    let mut smallest = STORE.to_vec();
+    smallest.push("--pack-inflight-bytes=67108864");
+    let set = parsed(&smallest).expect("parses").packs.expect("packs");
+    assert_eq!(set.inflight_bytes, 64 << 20);
+    let mut most = STORE.to_vec();
+    most.extend([
+        "--pack-inflight-bytes=4294967295",
+        "--pack-upload-idle-timeout=86400",
+    ]);
+    let set = parsed(&most).expect("parses").packs.expect("packs");
+    assert_eq!(set.inflight_bytes, u32::MAX);
+    assert_eq!(set.upload_idle_timeout, Duration::from_secs(86_400));
 }
 
 /// The key pair file's text.
@@ -188,6 +230,8 @@ fn flags(dir: &Path) -> PackFlags {
         region: "us-east-1".to_owned(),
         credentials_file: file(dir, "pack-credentials.json", KEYS, 0o600),
         pack_bytes: 1 << 20,
+        inflight_bytes: 1 << 20,
+        upload_idle_timeout: Duration::from_secs(5),
         writer: "fe1".to_owned(),
         cache: None,
     }
@@ -197,10 +241,11 @@ fn index() -> Arc<dyn PackIndex> {
     Arc::new(MemoryPackIndex::new(Arc::new(ManualClock::default())))
 }
 
-/// Asserts that the flags open into packs (nothing is sent to the store to do it), with a
-/// cache when there is one, and that each thing the flags name that cannot be used is refused
-/// naming its flag: an endpoint the store client does not take, a writer name a key cannot
-/// hold, a cache directory that cannot be made, a credentials file that is not there.
+/// Asserts that the flags open into packs (nothing is sent to the store to do it) that carry
+/// the room for uploads and the idle timeout the flags say, with a cache when there is one, and
+/// that each thing the flags name that cannot be used is refused naming its flag: an endpoint
+/// the store client does not take, a writer name a key cannot hold, a cache directory that
+/// cannot be made, a credentials file that is not there.
 #[test]
 fn the_flags_open_into_packs_or_are_refused_by_flag() {
     let dir = scratch_dir("pack-open");
@@ -208,6 +253,8 @@ fn the_flags_open_into_packs_or_are_refused_by_flag() {
     ok.cache = Some((dir.path().join("cache"), 4096));
     let packs = ok.open(index()).expect("opens");
     assert_eq!(packs.max_blob_bytes(), kbf_front::MAX_PACKED_BLOB_BYTES);
+    assert_eq!(packs.inflight_bytes(), 1 << 20);
+    assert_eq!(packs.upload_idle_timeout(), Duration::from_secs(5));
     assert!(dir.path().join("cache").is_dir());
 
     let mut tls = flags(dir.path());

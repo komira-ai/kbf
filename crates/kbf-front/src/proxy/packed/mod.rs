@@ -16,6 +16,22 @@
 //! packer records each pack before it starts the next), and a write sent again packs only the
 //! rest.
 //!
+//! **Room.** The uploads of one frontend share a budget of bytes in flight
+//! ([`PackSettings::inflight_bytes`], `--pack-inflight-bytes`): a ByteStream `Write` takes the
+//! size its resource name claims as soon as the name has arrived, before it reads on past the
+//! frames that carry it, and a `BatchUpdateBlobs` takes the bytes of its blobs before it packs
+//! them. One that finds the budget spent waits, in turn, for the uploads ahead to finish, and
+//! one that alone is over the whole budget is answered RESOURCE_EXHAUSTED. A `Write` buffer
+//! grows with the bytes that arrive, never past the size claimed. A `BatchUpdateBlobs` is
+//! decoded by tonic before its handler runs, so its bytes are in memory while it waits, and it
+//! has no idle timeout; the budget bounds what is packed at once, not what is received. A
+//! `Write` that gets no byte of its body for [`PackSettings::upload_idle_timeout`]
+//! (`--pack-upload-idle-timeout`) once it has the room is ended DEADLINE_EXCEEDED, stores and
+//! records nothing, and gives its bytes back; a client that never completes the resource name
+//! holds no room and is not cut by it, and a slow upload that keeps sending is never cut and
+//! keeps its room until it ends. Reads are not counted: a read holds at most one blob (at most
+//! [`Packs::max_blob_bytes`]) or one batch.
+//!
 //! **Reads.** The index is asked first. A blob it has is read with ranged requests of its
 //! pack (the blob's bytes and no others), hashed, and served; a read of a range of it
 //! (`read_offset`, `read_limit`) is cut from the hashed blob. A blob the index lacks, or whose
@@ -34,9 +50,14 @@
 mod bytestream;
 mod cas;
 mod metrics;
+mod room;
 mod store;
 
 pub(in crate::proxy) use self::bytestream::{applies, read as read_stream, write as write_stream};
 pub(in crate::proxy) use self::cas::{Served, find_missing, read_blob, read_many, store_batch};
 pub use self::metrics::PackMetrics;
-pub use self::store::{MAX_PACKED_BLOB_BYTES, PackSettings, PackStore, Packs};
+pub use self::room::DEFAULT_INFLIGHT_BYTES;
+pub use self::store::{
+    DEFAULT_UPLOAD_IDLE_TIMEOUT, MAX_PACKED_BLOB_BYTES, MAX_UPLOAD_IDLE_TIMEOUT, PackSettings,
+    PackStore, Packs,
+};
