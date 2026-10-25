@@ -128,6 +128,6 @@ jobs:
     stage: prod
   # Presents the run's OIDC token to the farm's update coordinator and signs nothing: the row is
   # `signing: true` because the job holds `id-token: write`, which only a signing row may.
-  - job: release.yml#deploy
+  - job: release.yml#gamma
     stage: prod
     signing: true

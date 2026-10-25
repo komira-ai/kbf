@@ -213,7 +213,7 @@ helper adds its own refusal when a `peers` entry of its configuration is not rea
 **A lone frontend is never updated by the coordinator.** A frontend is ordered only when at least
 `max(KBF_MIN_UP_FRONTEND, 1)` *other* frontends are up (`required_up` in
 `crates/kbf-coordinator/src/decide.rs`), so with one frontend there is nobody else and no order is
-ever sent, whatever `KBF_MIN_UP_FRONTEND` says; the deploy job then fails when the stall or the
+ever sent, whatever `KBF_MIN_UP_FRONTEND` says; the gamma job then fails when the stall or the
 deadline passes. A storage host is in the same case when `KBF_MIN_UP_STORAGE` is 1 or more (the
 default) and it is the only one. For a farm the coordinator deploys, run two or more frontends. With
 one, update it by hand in a maintenance window, through its helper's socket
@@ -339,9 +339,9 @@ whose operator accepts the token there (anything running as the agent's account 
 given, they are used instead of the certificate. Without `--frontend` and without the token an
 agent heartbeats and refuses every update order before it fetches anything, for any host.
 
-## Turn on the deploy step
+## Turn on the gamma stage
 
-The last job of `release.yml`, `deploy`, tells the update coordinator "desired = this release" once
+The last job of `release.yml`, `gamma`, tells the update coordinator "desired = this release" once
 `publish` has made the release, and waits until the farm converges. It is the end-to-end check of
 a release on a real farm. It does nothing until an operator has done the three things below, once;
 until then the job prints `::notice::the deploy step is off` and passes, so a fork or a repository
@@ -388,6 +388,7 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    | `KBF_COORDINATOR_URL` | `https://<name>:<port>` of the control listener, no path. Unset or empty: the step is off |
    | `KBF_COORDINATOR_CA` | the farm CA's certificate (PEM, public). The coordinator's certificate is the farm CA's, which no system store holds; empty trusts the system store instead |
    | `TS_CLIENT_ID`, `TS_AUDIENCE` | optional, for a coordinator reachable only on a Tailscale network: the client id and audience of the Tailscale trust credential (workload identity federation) that CI jobs join the network with, as `tag:ci`. It must trust this repository's `release` environment (the token's subject is `repo:<owner>/<repo>:environment:release`), and the network's policy must let `tag:ci` reach the control listener. With `TS_CLIENT_ID` and `KBF_COORDINATOR_URL` set, the job joins as an ephemeral node with the run's OIDC token, after the build and before the verb; no secret is involved. `TS_CLIENT_ID` or `KBF_COORDINATOR_URL` unset: the step is skipped (`TS_AUDIENCE` must be set with `TS_CLIENT_ID`) |
+   | `FARM_ADDRESS`, `FARM_INSTANCE`, `FARM_TLS`, `FARM_LINUX_X86_64_PROPERTIES` | optional, for the proof below: the farm's REAPI address as `grpc://<host>:<port>` (also when TLS is on), its instance name (empty: the empty instance), `true` or `false` for TLS, and the platform properties of the Linux x86-64 workers as a comma-separated `key=value` list, such as `OSFamily=linux,ISA=x86-64`. `FARM_ADDRESS` unset or empty: the proof is off |
    | `KBF_MIN_UP_STORAGE`, `KBF_MIN_UP_FRONTEND` | optional: the storage hosts and frontends that must stay up while others update (default 1 each). The operator picks the storage number so that every blob stays readable |
 
 ### What the step does
@@ -427,7 +428,22 @@ the version and none updating or failed, and `min_up` hosts of the storage and f
 so a coordinator that has just restarted does not report a farm it has not heard from as
 converged.
 
-The `deploy` job runs in the `release` environment, like `publish`: if the environment has
+### The proof
+
+After `deploy-farm` the job builds a small Buck2 project against the farm it has just
+deployed (`cargo xtask prove-farm`; the project is `crates/kbf-integration-test/gamma/buck2`,
+four `/bin/sh -c` actions that depend on each other). The Buck2 is the pinned one the beta
+smoke uses. The verb writes the project's `.buckconfig.local` from the four `FARM_*` variables:
+the REAPI address for the engine, the action cache and the CAS, TLS, the instance name, and an
+execution platform with remote execution on, local execution off and the properties. The run id
+and attempt are an argument of every action, so no action of a run has been run or cached
+before. It then reads the `Commands: N (cached: C, remote: R, local: L)` line Buck2 prints at
+the end of the build, and fails the job unless `R` is above 0 and `L` is 0 (a build that fails
+or prints no such line fails too). With `FARM_ADDRESS` unset it prints
+`::notice::the gamma proof is off` and passes. The job needs no secret for it; a farm that
+requires a credential for its REAPI address is not covered.
+
+The `gamma` job runs in the `release` environment, like `publish`: if the environment has
 required reviewers, a release is approved a second time before the job starts.
 
 One release at a time holds across the deploy: the workflow's group does not cancel, so a second

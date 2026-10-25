@@ -115,12 +115,9 @@ fn a_stage_whose_only_job_is_deleted_is_refused() {
         .expect("text");
     let found = check(cut, &workflows);
     refused(&found, "stage `prod` is an `actions` stage with no job");
-    // The release's deploy job holds `id-token: write`, which only a signing row may: with its
+    // The release's gamma job holds `id-token: write`, which only a signing row may: with its
     // row gone it is named too, and nothing else is.
-    refused(
-        &found,
-        "job `deploy` can write `id-token` or `attestations`",
-    );
+    refused(&found, "job `gamma` can write `id-token` or `attestations`");
     assert_eq!(found.len(), 2, "{found:#?}");
 }
 

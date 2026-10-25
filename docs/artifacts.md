@@ -269,7 +269,7 @@ and a host that trusts one asks for that branch with `--source-ref`; an asset at
 only takes the files of the pipeline run of a push to `main`, so a file built from any other branch is
 never released.
 
-Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write` (the release workflow's `deploy` job holds `id-token: write` alone, to present it to the update coordinator, and signs nothing; see [Releases](#releases)), and only
+Only the `attest-*` jobs (`attest-linux`, `attest-darwin-arm64`) hold `id-token: write` and `attestations: write` (the release workflow's `gamma` job holds `id-token: write` alone, to present it to the update coordinator, and signs nothing; see [Releases](#releases)), and only
 under the exact `if:` that limits it to a push to `main` (the
 `verify-*` jobs run under the same one). The workflow lint
 (`crates/kbf-integration-test/tests/workflows`) refuses those scopes in any other job, and in one
@@ -688,12 +688,12 @@ can create one. The jobs, each with the least token it needs:
 | `notes` | checks the tag (`release verify`), the identity of this release and of the one before it, and writes the notes | read |
 | `publish` | creates the release with those files and notes (`release publish`) | `contents: write`; environment `release` |
 | `bump` | opens the pull request in the internal repository that moves its submodule to the release (`release bump-internal`) | `contents: read`; environment `release` |
-| `deploy` | after `publish`, sets the release as the desired version on the farm's update coordinator and waits for the farm to converge (`deploy-farm`); passes with a notice when the repository variable `KBF_COORDINATOR_URL` is unset ([deploy/kbf-updater.md](deploy/kbf-updater.md#turn-on-the-deploy-step)) | `contents: read`, `id-token: write`; environment `release` |
+| `gamma` | after `publish`, sets the release as the desired version on the farm's update coordinator and waits for the farm to converge (`deploy-farm`); passes with a notice when the repository variable `KBF_COORDINATOR_URL` is unset. Then builds a small Buck2 project against the farm, remote only, and fails unless some action ran remotely and none locally (`prove-farm`); passes with a notice when `FARM_ADDRESS` is unset ([deploy/kbf-updater.md](deploy/kbf-updater.md#turn-on-the-gamma-stage)) | `contents: read`, `id-token: write`; environment `release` |
 
 Every job after `plan` runs only when `plan` says the push ships code and does not change the
 pipeline (`.github/`, `infra/`, `crates/xtask/` and the like): a push of docs only releases
 nothing and the run is green, and a push that changes the pipeline is released by the next one
-that does not. `tag`, `notes`, `publish`, `bump` and `deploy` also repeat the condition on the run that started the
+that does not. `tag`, `notes`, `publish`, `bump` and `gamma` also repeat the condition on the run that started the
 workflow (conclusion `success`, event `push`, branch `main`, this repository). The pipeline run is never cancelled
 and the newest waiting push queues behind it; `plan` measures from the highest release tag that is an ancestor of the
 commit, so the code of a push that was replaced while waiting is released with the next one. No job runs after a red one (no `always()`, no
@@ -743,7 +743,7 @@ commit. (The notes are written after the tag, because they read it.)
 
 `crates/kbf-integration-test/tests/release_workflow` holds the file to all of this (and `pipeline_workflow` holds the pipeline it follows to its order, its cancel and its triggers): the events
 (the completion of a `pipeline` run for `main` only), the job graph and the scopes, `if:` and environment of each job, the halt on
-red, a checkout of the commit the pipeline built alone, the release bot's key read in `tag` and `bump` only, `id-token: write` in `deploy` only (the coordinator's address is read from a repository variable there and nowhere else),
+red, a checkout of the commit the pipeline built alone, the release bot's key read in `tag` and `bump` only, `id-token: write` in `gamma` only (the coordinator's address and the farm's `FARM_*` settings are read from repository variables there and nowhere else),
 the data that flows from job to job, pinned actions and an empty top-level `permissions`. The
 job list is pinned, `publish` among them (`gamma.yml`, which followed the workflow, is deleted). On every
 pull request into `main`, CI asks GitHub the same on-`main` question for the pull request's base

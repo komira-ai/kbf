@@ -12,25 +12,31 @@
 //! - **The graph.** The jobs [`JOBS`], in that order, each with exactly the `needs`, token
 //!   scopes, `if:` and `environment` of [`RULES`]; the jobs that write need `plan` and `verify`,
 //!   directly or through another. Only `publish` holds a write scope (`contents`), `id-token` is
-//!   held by `deploy` alone ([`ID_TOKEN`]), and the jobs that tag, publish, bump or deploy run
+//!   held by `gamma` alone ([`ID_TOKEN`]), and the jobs that tag, publish, bump or run the gamma stage
 //!   only under [`RELEASE_IF`]: a successful pipeline run for a push to `main` of code that is
 //!   not a change to the pipeline.
 //! - **Never cancelled, never queued behind a skipped run.** The concurrency group is `release`
 //!   for a successful pipeline run and the run's own for any other (a cancelled or red pipeline
 //!   run starts this workflow too, to skip it, and must not replace a release waiting in the
 //!   group), and it never cancels.
-//! - **The deploy step.** `deploy` needs `plan` and `publish` (it runs after the release is
+//! - **The gamma stage.** `gamma` needs `plan` and `publish` (it runs after the release is
 //!   published), holds `contents: read` and `id-token: write` and no secret, and reads the
 //!   coordinator's address from the repository variable `KBF_COORDINATOR_URL` alone: no address
-//!   is written in the file and no other job reads the variable ([`DEPLOY_URL`]). Its one
+//!   is written in the file and no other job reads the variable ([`COORDINATOR_URL_VAR`]). Its one
 //!   `deploy-farm` step is given the release's version and that address, and has no `if:` (an
 //!   unset variable is a notice from the verb, not a skipped step). It may join a Tailscale
 //!   network first, in one step of [`TS_ACTION`] after the build and before the verb, under
 //!   [`TS_IF`] and given exactly [`TS_WITH`] (variables and the tag; the run token, no secret).
 //!   No other job uses that action.
+//! - **The gamma proof.** After `deploy-farm`, `gamma` fetches the pinned Buck2 (the fetch
+//!   line of [`BUCK2_FETCH`], the one place the job may name an `https://` address) and runs
+//!   `cargo xtask prove-farm` once, unconditionally (an unset `FARM_ADDRESS` is a notice from
+//!   the verb). The verb is given the four organisation variables ([`FARM_VARS`]) through the
+//!   step's `env:` and nothing else of the environment but the run id and attempt as the nonce
+//!   ([`NONCE`]); no other job reads a `FARM_` variable, and no address is written.
 //! - **Halt on red.** No `always()`, `failure()`, `cancelled()` or `continue-on-error`, and no
 //!   step under `if:` but the ones of `notes` that read the previous release and the network
-//!   join of `deploy`.
+//!   join of `gamma`.
 //! - **One commit.** The workflow sets `COMMIT` to the commit the pipeline run built and
 //!   `PIPELINE_RUN` to its id; every checkout is of that commit (a `ref` of exactly that, no
 //!   `repository` or `token`), and no expression reads `inputs.`, a pull request or `head_ref`,
@@ -44,7 +50,7 @@
 //!   pipeline run left for it; `verify` downloads the files of the pipeline run that started this
 //!   one and no other; `tag` writes the record from that run and tags the planned tag at
 //!   `COMMIT` with that record; `notes` checks the tag and writes the notes and the set hash;
-//!   `publish` is given those, the planned tag and `COMMIT`; `bump` and `deploy` are given the
+//!   `publish` is given those, the planned tag and `COMMIT`; `bump` and `gamma` are given the
 //!   planned version.
 //!   Only `plan` and `verify` read another run's artifacts; every later job takes what `verify`
 //!   checked. Each flag below is held to the value that makes it mean what its verb says.
@@ -58,13 +64,31 @@ use super::workflows;
 const PUBLISH: &str = "publish";
 
 /// The job that sets the published release as the farm's desired version and waits.
-const DEPLOY: &str = "deploy";
+const GAMMA: &str = "gamma";
 
 /// The repository variable that holds the coordinator's address, and the one environment
-/// variable of `deploy` it is read into.
-const DEPLOY_URL: &str = "vars.KBF_COORDINATOR_URL";
+/// variable of `gamma` it is read into.
+const COORDINATOR_URL_VAR: &str = "vars.KBF_COORDINATOR_URL";
 
-/// The action `deploy` joins a Tailscale network with, pinned by commit.
+/// The organisation variables of the farm the proof builds against, as the `env:` key of the
+/// proof step that reads each and the variable.
+const FARM_VARS: [(&str, &str); 4] = [
+    ("FARM_ADDRESS", "${{ vars.FARM_ADDRESS }}"),
+    ("FARM_INSTANCE", "${{ vars.FARM_INSTANCE }}"),
+    ("FARM_TLS", "${{ vars.FARM_TLS }}"),
+    (
+        "FARM_PROPERTIES",
+        "${{ vars.FARM_LINUX_X86_64_PROPERTIES }}",
+    ),
+];
+
+/// The nonce of the proof: every action of the project takes it, so each run's are new.
+const NONCE: &str = "${{ github.run_id }}-${{ github.run_attempt }}";
+
+/// The step of `gamma` that fetches Buck2, exactly as `beta.yml` does.
+const BUCK2_FETCH: &str = "cargo xtask fetch --url \"https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst\" --sha256 \"$BUCK2_SHA256\" --out \"$RUNNER_TEMP/tools/buck2\" --extract zst";
+
+/// The action `gamma` joins a Tailscale network with, pinned by commit.
 const TS_ACTION: &str = "tailscale/github-action@";
 
 /// The one condition of the network join: the trust credential's client id and the
@@ -81,7 +105,7 @@ const TS_WITH: [(&str, &str); 3] = [
 ];
 
 /// The jobs, in file order.
-const JOBS: [&str; 7] = ["plan", "verify", "tag", "notes", PUBLISH, "bump", DEPLOY];
+const JOBS: [&str; 7] = ["plan", "verify", "tag", "notes", PUBLISH, "bump", GAMMA];
 
 /// The events that start the workflow: the completion of a run of [`PIPELINE`], filtered to
 /// [`TYPES`] and `branches: [main]`, and only while [`CHAIN`] is whole.
@@ -119,9 +143,9 @@ pub const RELEASE_IF: &str = "${{ github.event.workflow_run.conclusion == 'succe
 /// repository.
 pub const PLAN_IF: &str = "${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository }}";
 
-/// The jobs that may hold `id-token: write`: the deploy step, which presents the token to the
+/// The jobs that may hold `id-token: write`: the gamma stage, which presents the token to the
 /// farm's update coordinator and signs nothing.
-const ID_TOKEN: &[&str] = &[DEPLOY];
+const ID_TOKEN: &[&str] = &[GAMMA];
 
 /// The `(job, scope)` pairs that may be `write`.
 const WRITERS: &[(&str, &str)] = &[(PUBLISH, "contents")];
@@ -185,7 +209,7 @@ const RULES: [Rule; 7] = [
         environment: Some(ENVIRONMENT),
     },
     Rule {
-        job: DEPLOY,
+        job: GAMMA,
         needs: &["plan", PUBLISH],
         permissions: &[("contents", "read"), ("id-token", "write")],
         condition: Some(RELEASE_IF),
@@ -200,7 +224,7 @@ const APP_TOKEN: &str = "actions/create-github-app-token@";
 /// The jobs that write must (transitively) need these.
 const GATING: &[&str] = &["plan", "verify"];
 /// The jobs that write, or hold a token that can.
-const WRITING: &[&str] = &["tag", "notes", PUBLISH, "bump", DEPLOY];
+const WRITING: &[&str] = &["tag", "notes", PUBLISH, "bump", GAMMA];
 
 /// The group and the no-cancel of the one release at a time. A pipeline run that did not
 /// succeed starts this workflow too (every job skips); its group is its own, so it never
@@ -327,7 +351,7 @@ pub fn problems(release: &str) -> Result<Vec<String>, String> {
     notes_job(release, &mut out)?;
     publish_job(release, &mut out)?;
     bump_job(release, &mut out)?;
-    deploy_job(release, &mut out)?;
+    gamma_job(release, &mut out)?;
     // The shared rules, as the workflow lint reads them (pins, runners, permissions).
     out.extend(
         workflows::scan(release, &workflows::Repo::default())
@@ -493,10 +517,10 @@ fn halting(release: &str, out: &mut Vec<String>) -> Result<(), String> {
                 .as_deref()
                 .is_some_and(|c| c == "${{ steps.previous.outputs.previous != '' }}");
             let join =
-                job == DEPLOY && uses(&step, TS_ACTION) && step.condition.as_deref() == Some(TS_IF);
+                job == GAMMA && uses(&step, TS_ACTION) && step.condition.as_deref() == Some(TS_IF);
             if step.conditional && !(job == "notes" && previous) && !join {
                 out.push(format!(
-                    "a step of `{job}` ({:?}) is under `if:` or `continue-on-error:`: only the previous release's steps of `notes` and the network join of `deploy` may be",
+                    "a step of `{job}` ({:?}) is under `if:` or `continue-on-error:`: only the previous release's steps of `notes` and the network join of `gamma` may be",
                     step.name.as_deref().or(step.uses.as_deref()).unwrap_or("?")
                 ));
             }
@@ -980,22 +1004,39 @@ fn bump_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// The deploy step: the address from the repository variable alone, in no other job and in
+/// The gamma stage: the address from the repository variable alone, in no other job and in
 /// no literal, the release's version, and the one verb unconditionally.
-fn deploy_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
-    let job = DEPLOY;
+fn gamma_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
+    let job = GAMMA;
     let steps = workflows::job_steps(release, job)?;
     for other in JOBS.iter().filter(|j| **j != job) {
-        if job_text(release, other).contains(DEPLOY_URL) {
+        if job_text(release, other).contains(COORDINATOR_URL_VAR) {
             out.push(format!(
-                "the job `{other}` reads `{DEPLOY_URL}`: the coordinator's address is `{job}`'s alone"
+                "the job `{other}` reads `{COORDINATOR_URL_VAR}`: the coordinator's address is `{job}`'s alone"
             ));
         }
     }
-    let text = job_text(release, job);
+    for other in JOBS.iter().filter(|j| **j != job) {
+        if job_text(release, other).contains("vars.FARM_") {
+            out.push(format!(
+                "the job `{other}` reads a `FARM_` variable: the farm's address and platform are `{job}`'s alone"
+            ));
+        }
+    }
+    // The pinned Buck2 download is the one address the job names.
+    let text: String = job_text(release, job)
+        .lines()
+        .filter(|l| !l.contains(BUCK2_FETCH))
+        .collect::<Vec<_>>()
+        .join("\n");
     if text.contains("http://") || text.contains("https://") {
         out.push(format!(
-            "the job `{job}` writes an address: the coordinator's is the repository variable `{DEPLOY_URL}`, never a literal"
+            "the job `{job}` writes an address: the coordinator's is the repository variable `{COORDINATOR_URL_VAR}`, never a literal"
+        ));
+    }
+    if text.contains("grpc://") || text.contains("grpcs://") {
+        out.push(format!(
+            "the job `{job}` writes a farm address: it is the organisation variable `FARM_ADDRESS`, never a literal"
         ));
     }
     if text.contains("secrets.") {
@@ -1022,7 +1063,7 @@ fn deploy_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         job,
         step,
         "COORDINATOR_URL",
-        &format!("${{{{ {DEPLOY_URL} }}}}"),
+        &format!("${{{{ {COORDINATOR_URL_VAR} }}}}"),
         out,
     );
     env_is(
@@ -1032,10 +1073,70 @@ fn deploy_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         "${{ needs.plan.outputs.version }}",
         out,
     );
+    prove_farm(&steps, at, out);
     Ok(())
 }
 
-/// The network join of `deploy`, if there is one: one step, after the build of xtask and before
+/// The proof step of `gamma`: Buck2 fetched as `beta.yml` does, then one unconditional
+/// `prove-farm` after `deploy-farm` (at `farm_at`), given the four `FARM_` variables and the
+/// nonce through `env:` and the fetched Buck2 and the project by their paths.
+fn prove_farm(steps: &[workflows::Step], farm_at: usize, out: &mut Vec<String>) {
+    let job = GAMMA;
+    let verb = "cargo xtask prove-farm";
+    let Some((at, step, words)) = run_of(job, steps, "cargo xtask prove-farm ", out) else {
+        return;
+    };
+    if at < farm_at {
+        out.push(format!(
+            "`{verb}` runs before `cargo xtask deploy-farm`: it would prove the farm of the last release"
+        ));
+    }
+    let count = steps
+        .iter()
+        .filter(|s| lines(s).any(|l| l.starts_with("cargo xtask prove-farm ")))
+        .count();
+    if count != 1 {
+        out.push(format!("`{job}` runs `{verb}` {count} times, not once"));
+    }
+    if step.condition.is_some() || step.conditional {
+        out.push(format!(
+            "`{verb}` is under a condition: an unset `FARM_ADDRESS` is the verb's notice, not a skipped step"
+        ));
+    }
+    let fetched = steps
+        .iter()
+        .position(|s| s.run.as_deref().map(str::trim) == Some(BUCK2_FETCH));
+    if fetched.is_none_or(|f| f > at) {
+        out.push(format!(
+            "`{job}` does not fetch Buck2 with `{BUCK2_FETCH}` before `{verb}`"
+        ));
+    }
+    flag_is(&words, verb, "--address", "$FARM_ADDRESS", out);
+    flag_is(&words, verb, "--instance", "$FARM_INSTANCE", out);
+    flag_is(&words, verb, "--tls", "$FARM_TLS", out);
+    flag_is(&words, verb, "--properties", "$FARM_PROPERTIES", out);
+    flag_is(&words, verb, "--buck2", "$RUNNER_TEMP/tools/buck2", out);
+    flag_is(
+        &words,
+        verb,
+        "--project",
+        "crates/kbf-integration-test/gamma/buck2",
+        out,
+    );
+    flag_is(&words, verb, "--nonce", "$NONCE", out);
+    for (key, want) in FARM_VARS {
+        env_is(job, step, key, want, out);
+    }
+    env_is(job, step, "NONCE", NONCE, out);
+    if step.env.len() != FARM_VARS.len() + 1 {
+        out.push(format!(
+            "the step of `{job}` that runs `{verb}` has {} `env:` entries, not the four `FARM_` variables and the nonce",
+            step.env.len()
+        ));
+    }
+}
+
+/// The network join of `gamma`, if there is one: one step, after the build of xtask and before
 /// the verb (at `verb_at`), under [`TS_IF`], given exactly [`TS_WITH`] and no `env:`; and in no
 /// other job.
 fn tailnet_join(
@@ -1044,13 +1145,13 @@ fn tailnet_join(
     verb_at: usize,
     out: &mut Vec<String>,
 ) -> Result<(), String> {
-    for job in JOBS.iter().filter(|j| **j != DEPLOY) {
+    for job in JOBS.iter().filter(|j| **j != GAMMA) {
         if workflows::job_steps(release, job)?
             .iter()
             .any(|s| uses(s, TS_ACTION))
         {
             out.push(format!(
-                "the job `{job}` uses `{TS_ACTION}`: only `{DEPLOY}` joins the farm's network"
+                "the job `{job}` uses `{TS_ACTION}`: only `{GAMMA}` joins the farm's network"
             ));
         }
     }
@@ -1059,7 +1160,7 @@ fn tailnet_join(
         .collect();
     if joins.len() > 1 {
         out.push(format!(
-            "`{DEPLOY}` uses `{TS_ACTION}` {} times, not once",
+            "`{GAMMA}` uses `{TS_ACTION}` {} times, not once",
             joins.len()
         ));
     }
@@ -1072,7 +1173,7 @@ fn tailnet_join(
         let step = &steps[i];
         if step.condition.as_deref() != Some(TS_IF) {
             out.push(format!(
-                "the network join of `{DEPLOY}` is not under exactly `if: {TS_IF}`"
+                "the network join of `{GAMMA}` is not under exactly `if: {TS_IF}`"
             ));
         }
         let mut with: Vec<(&str, &str)> = step
@@ -1085,17 +1186,17 @@ fn tailnet_join(
         want.sort_unstable();
         if with != want {
             out.push(format!(
-                "the network join of `{DEPLOY}` is given {with:?}, not exactly {want:?}: the client id and audience are the CI trust credential's variables, the tag is `tag:ci`, and the run token is its only credential"
+                "the network join of `{GAMMA}` is given {with:?}, not exactly {want:?}: the client id and audience are the CI trust credential's variables, the tag is `tag:ci`, and the run token is its only credential"
             ));
         }
         if !step.env.is_empty() {
             out.push(format!(
-                "the network join of `{DEPLOY}` has an `env:`: its inputs are the three of `with:` alone"
+                "the network join of `{GAMMA}` has an `env:`: its inputs are the three of `with:` alone"
             ));
         }
         if i > verb_at || built.is_none_or(|b| i < b) {
             out.push(format!(
-                "the network join of `{DEPLOY}` is not after `cargo build -p xtask` and before `cargo xtask deploy-farm`: the build's scripts would see the network, or the verb would run without it"
+                "the network join of `{GAMMA}` is not after `cargo build -p xtask` and before `cargo xtask deploy-farm`: the build's scripts would see the network, or the verb would run without it"
             ));
         }
     }

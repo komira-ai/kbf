@@ -98,6 +98,81 @@ fn mismatches(beta: &str, ci: &str, also: &[&str]) -> Result<Vec<String>, String
     Ok(problems)
 }
 
+/// The workflow and job that fetch the same Buck2 to prove the farm after a deploy.
+const RELEASE: &str = ".github/workflows/release.yml";
+const GAMMA: &str = "gamma";
+
+/// Every way the pins of the release workflow's gamma job differ from the smoke job's: the
+/// proof must build with the Buck2 the beta run was tested with. An error when either text
+/// does not parse or lacks its job.
+fn gamma_mismatches(release: &str, beta: &str) -> Result<Vec<String>, String> {
+    let theirs = workflows::job_env(beta, JOB)?;
+    let mine = workflows::job_env(release, GAMMA)?;
+    let mut problems = Vec::new();
+    for pin in PINS {
+        let want = theirs.iter().find(|(k, _)| k == pin).map(|(_, v)| v);
+        let have = mine.iter().find(|(k, _)| k == pin).map(|(_, v)| v);
+        match (want, have) {
+            (Some(w), Some(h)) if w == h => {}
+            (Some(w), Some(h)) => problems.push(format!(
+                "{RELEASE}: {pin} is {h} in the {GAMMA} job, but {BETA} job {JOB} has {w}"
+            )),
+            (_, None) => problems.push(format!("{RELEASE}: the {GAMMA} job does not set {pin}")),
+            (None, Some(_)) => problems.push(format!("{BETA}: the {JOB} job does not set {pin}")),
+        }
+    }
+    Ok(problems)
+}
+
+#[test]
+fn the_gamma_job_fetches_the_buck2_of_the_beta_smoke() {
+    // Catches: a Buck2 bump in beta.yml that leaves the release's proof on the old bytes,
+    // or the reverse.
+    let root = super::repo_root();
+    let read = |path: &str| std::fs::read_to_string(root.join(path)).expect(path);
+    assert_eq!(
+        gamma_mismatches(&read(RELEASE), &read(BETA)),
+        Ok(Vec::new())
+    );
+}
+
+#[test]
+fn a_gamma_pin_that_differs_or_is_missing_is_named() {
+    // Catches: the comparison passing when the version or checksum drifts, a pin is lost
+    // from either side, or a workflow does not parse.
+    let job = |name: &str, env: &str| {
+        format!(
+            "on: push\npermissions: {{}}\njobs:\n  {name}:\n    runs-on: ubuntu-24.04\n    env:\n{env}    steps:\n      - run: true\n"
+        )
+    };
+    let pins = |v: &str, s: &str| format!("      BUCK2_VERSION: {v}\n      BUCK2_SHA256: {s}\n");
+    let beta = job(JOB, &pins("1", "aa"));
+    assert_eq!(
+        gamma_mismatches(&job(GAMMA, &pins("1", "aa")), &beta),
+        Ok(Vec::new())
+    );
+    let found = gamma_mismatches(&job(GAMMA, &pins("2", "bb")), &beta).expect("parses");
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(
+        found[0].contains("BUCK2_VERSION is 2") && found[0].contains("has 1"),
+        "{found:?}"
+    );
+    let found = gamma_mismatches(&job(GAMMA, "      OTHER: 1\n"), &beta).expect("parses");
+    assert!(
+        found.iter().all(|f| f.contains("does not set")),
+        "{found:?}"
+    );
+    assert_eq!(found.len(), 2, "{found:?}");
+    let found = gamma_mismatches(&job(GAMMA, &pins("1", "aa")), &job(JOB, "      OTHER: 1\n"))
+        .expect("parses");
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(gamma_mismatches("jobs: [", &beta).is_err());
+    assert!(
+        gamma_mismatches(&job("other", ""), &beta).is_err(),
+        "no gamma job"
+    );
+}
+
 #[test]
 fn the_beta_workflow_copies_the_pins_of_ci() {
     // Catches: a Buck2 or action bump in another job of beta.yml that leaves the smoke job on

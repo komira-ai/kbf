@@ -12,6 +12,10 @@
 //!   release is published, set it as the update coordinator's desired version (CI's OIDC token)
 //!   and wait until the farm converges; exit 1 when it is blocked, stalled or out of time. An
 //!   empty `--url` prints a notice and exits 0.
+//! - `prove-farm --address <grpc url> --instance <name> --tls <true|false> --properties <k=v,...> --buck2 <path>
+//!   --project <dir> --nonce <text>` ([`prove_farm`]): after the deploy, build a small Buck2 project against the
+//!   farm, remote only, and exit 1 unless some action ran remotely and none locally. An empty `--address` prints a
+//!   notice and exits 0.
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
 //!   row the working tree's budget file has and `<rev>`'s does not is refused, unless
 //!   git sees the row's path renamed from a path `<rev>` has a row for. CI runs
@@ -120,6 +124,7 @@ pub mod pkg_size;
 pub mod pkg_trust;
 pub mod pkg_upgrade;
 pub mod pkg_version;
+pub mod prove_farm;
 pub mod release;
 pub mod sudo_test;
 pub mod sums;
@@ -180,6 +185,8 @@ enum Verb {
     /// Set a published release as the farm's desired version on the update coordinator and
     /// wait for the farm to converge.
     DeployFarm(deploy_farm::Args),
+    /// Prove the farm after a deploy with a remote-only Buck2 build of a small project.
+    ProveFarm(prove_farm::Args),
     /// Refuse a row the budget file gains against `--base`.
     BudgetDiff {
         /// The revision to compare with (on a pull request, the base branch).
@@ -984,6 +991,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         }),
         Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
         Verb::DeployFarm(args) => deploy_farm::run(&args),
+        Verb::ProveFarm(args) => prove_farm::run(&args),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::SourceDateEpoch { commit, output } => {
             source_date_epoch(&root, &commit, &output).map(|line| vec![line])
