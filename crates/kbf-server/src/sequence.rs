@@ -17,9 +17,10 @@
 //!    accepting; the operator API goes on answering so that the drain can be read.
 //! 4. It waits until no execution is open, at most [`DrainTiming::deadline`]
 //!    (`--drain-deadline`, 15 minutes by default), so a stop always ends. The streams of
-//!    operations still queued (no lease started, for example every capable worker is
-//!    cordoned) are ended UNAVAILABLE by step 3 ([`Drain::begin`]) and do not wait;
-//!    the operations stay queued for the other frontends. An execution that runs on a node of this
+//!    operations that were never started and that no worker can run (every capable worker
+//!    is cordoned, or there is none) end UNAVAILABLE as step 3 begins and do not wait: they
+//!    would fail at the deadline anyway. Every other stream waits, as Buck2 does not recover
+//!    one that ends. The operations stay queued for the other frontends. An execution that runs on a node of this
 //!    frontend finishes here: its result is taken, and its caller is answered. An execution
 //!    whose operation another frontend took is followed in the state store.
 //! 5. It stands down as a retire does ([`Stand::release`]: the farm is fenced, the worker
@@ -60,9 +61,9 @@ pub struct DrainTiming {
     /// interval times its unhealthy threshold, and the time its routes take to change. 0
     /// goes on at once.
     pub lb_wait: Duration,
-    /// The longest the drain waits for the executions that have a running lease after it
-    /// refuses new ones; the ones still open then are ended UNAVAILABLE. Streams of
-    /// operations still queued do not wait.
+    /// The longest the drain waits for the open executions after it refuses new ones; the
+    /// ones still open then are ended UNAVAILABLE. Streams of operations that can never
+    /// start do not wait.
     pub deadline: Duration,
 }
 

@@ -1,11 +1,12 @@
 //! Draining the frontend: begun by a stop signal or by `POST /v1/frontend/drain`
 //! ([`crate::api`]), in stages.
 //!
-//! A drain refuses every new Execute UNAVAILABLE and lets the open streams of operations
-//! with a running lease run until their action is done (Buck2 does not recover a stream
-//! that breaks, so ending one fails its action: kbf#791). The streams of operations still
-//! queued end UNAVAILABLE at once (`kbf_front::Closer::drain`): they have no action to
-//! protect, and the client's retry costs nothing; the operations stay queued. It takes the server out of `/readyz` and
+//! A drain refuses every new Execute UNAVAILABLE and lets the open streams run until
+//! their action is done (Buck2 retries only the opening of a call and does not recover a
+//! stream that breaks, so ending one fails its action: kbf#791). The one early end is the
+//! stream of an operation that was never started and that no worker can run
+//! (`kbf_front::Stage::Waiting`): it would fail at the deadline anyway, so it ends at once
+//! and the stop is not held; the operation stays queued. It takes the server out of `/readyz` and
 //! the health service, and sends GOAWAY to the REAPI listener's connections, which then
 //! stop accepting. The serving future returns once the REAPI connections have closed.
 //!

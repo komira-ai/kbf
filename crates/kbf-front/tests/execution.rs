@@ -459,17 +459,17 @@ async fn a_drain_keeps_open_streams_and_refuses_new_executes() {
     }
 }
 
-/// Catches a drain that keeps the stream of an operation no lease has started (it waits,
-/// queued, for a worker that may never come, and holds the stop with it), and a drain that
-/// ends the stream of an operation whose lease is running (Buck2 does not recover that
-/// one). Operation 0 is queued, operation 1 is waiting for a worker (its stage is
-/// `Waiting`), operation 2 is running; each has a stream open, and a second stream
-/// waits on operation 0. After `drain`, the queued and waiting streams end UNAVAILABLE
-/// at once, naming their operation; the running stream gets nothing and stays open
-/// until its operation is done. A WaitExecution opened after the drain on the queued
-/// operation is sent its first operation and ends UNAVAILABLE.
+/// Catches a drain that ends a stream it must keep, and one that keeps a stream that can
+/// never finish. Buck2 does not recover a stream that breaks after the call opened, so
+/// only an operation that has never been started and that no worker can run
+/// (`Stage::Waiting`) is ended early. Operation 0 is plainly queued (a worker may take
+/// it), 1 is waiting with no worker and never started, 2 is running, 3 waits for a worker
+/// but had a lease once (`WaitingAfterStart`). After `drain`, only stream 1 (and a second
+/// stream on it, and a WaitExecution opened later on it, after its first operation) ends
+/// UNAVAILABLE, naming its operation; streams 0, 2 and 3 stay silent, and each ends
+/// with its done operation when the operation is done.
 #[tokio::test]
-async fn a_drain_ends_the_streams_of_queued_operations_and_keeps_the_running_ones() {
+async fn a_drain_ends_only_the_streams_of_operations_that_can_never_start() {
     let script = Arc::new(Script::default());
     let (closer, closing) = kbf_front::closing();
     let farm = Farm::with_execution_until(Arc::clone(&script), closing).await;
@@ -477,6 +477,7 @@ async fn a_drain_ends_the_streams_of_queued_operations_and_keeps_the_running_one
         job("queued", &[], false),
         job("waiting", &[], false),
         job("running", &[], false),
+        job("requeued", &[], false),
     ];
     for job in &jobs {
         farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
@@ -496,39 +497,35 @@ async fn a_drain_ends_the_streams_of_queued_operations_and_keeps_the_running_one
             })
             .await
     };
-    let mut waited = wait(0).await.expect("WaitExecution").into_inner();
+    let mut waited = wait(1).await.expect("WaitExecution").into_inner();
     next(&mut waited).await.expect("healthy").expect("queued");
-    script.set(1, Stage::Waiting("no worker".to_owned()));
-    next(&mut streams[1])
-        .await
-        .expect("healthy")
-        .expect("waiting");
-    script.set(2, Stage::Executing);
-    next(&mut streams[2])
-        .await
-        .expect("healthy")
-        .expect("executing");
+    for (n, to) in [
+        (1, Stage::Waiting("no worker".to_owned())),
+        (2, Stage::Executing),
+        (3, Stage::WaitingAfterStart("no worker".to_owned())),
+    ] {
+        script.set(n, to);
+        next(&mut streams[n])
+            .await
+            .expect("healthy")
+            .expect("update");
+    }
 
     closer.drain();
-    let [queued, waiting, running] = &mut streams[..] else {
-        unreachable!("three streams");
-    };
-    for (n, what, ops) in [(0, "queued", queued), (1, "waiting", waiting)] {
-        let gone = next(ops).await.expect_err(what);
-        assert_eq!(gone.code(), Code::Unavailable, "{what}: {gone:?}");
-        assert!(
-            gone.message().contains(&format!("operations/{n}")),
-            "{what}: {gone:?}"
-        );
-    }
-    let gone = next(&mut waited)
-        .await
-        .expect_err("second stream on the queued one");
+    let gone = next(&mut streams[1]).await.expect_err("waiting");
     assert_eq!(gone.code(), Code::Unavailable, "{gone:?}");
-    let quiet = tokio::time::timeout(std::time::Duration::from_millis(300), running.message());
-    assert!(quiet.await.is_err(), "the running stream spoke or ended");
+    assert!(gone.message().contains("operations/1"), "{gone:?}");
+    // The update that stage change sent it first, then the end.
+    next(&mut waited).await.expect("healthy").expect("waiting");
+    let gone = next(&mut waited).await.expect_err("second stream on it");
+    assert_eq!(gone.code(), Code::Unavailable, "{gone:?}");
+    for n in [0, 2, 3] {
+        let quiet =
+            tokio::time::timeout(std::time::Duration::from_millis(300), streams[n].message());
+        assert!(quiet.await.is_err(), "stream {n} spoke or ended");
+    }
 
-    let mut late = wait(0)
+    let mut late = wait(1)
         .await
         .expect("WaitExecution during the drain")
         .into_inner();
@@ -539,10 +536,12 @@ async fn a_drain_ends_the_streams_of_queued_operations_and_keeps_the_running_one
     let gone = next(&mut late).await.expect_err("opened during the drain");
     assert_eq!(gone.code(), Code::Unavailable, "{gone:?}");
 
-    script.set(2, Stage::Done(Finished::Ran(Box::default())));
-    let done = next(running).await.expect("kept").expect("done");
-    assert!(done.done, "{done:?}");
-    assert_eq!(next(running).await.expect("ends"), None);
+    for n in [0, 2, 3] {
+        script.set(n, Stage::Done(Finished::Ran(Box::default())));
+        let done = next(&mut streams[n]).await.expect("kept").expect("done");
+        assert!(done.done, "stream {n}: {done:?}");
+        assert_eq!(next(&mut streams[n]).await.expect("ends"), None);
+    }
 }
 
 /// A dispatch whose first `submit` stops inside the call until the test lets it go,

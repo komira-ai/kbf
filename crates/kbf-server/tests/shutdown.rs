@@ -188,10 +188,9 @@ async fn sigterm_ends_open_execute_streams_unavailable() {
     assert!(status.success(), "kbf-server exited with {status}");
 }
 
-/// Catches a stop that holds for an operation no lease runs: with no deadline (the
-/// default) and no worker to run the operation, SIGTERM ends the stream UNAVAILABLE at once
-/// (naming that the operation has no running lease, so the client reopens the call) and the
-/// server exits 0 with no second signal. The client's connection stays open throughout.
+/// Catches a stop that holds for an operation that has never started and that no worker
+/// can run: with no deadline (the default) and no worker connected, SIGTERM ends the
+/// stream UNAVAILABLE at once (naming why) and the server exits 0 with no second signal. The client's connection stays open throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sigterm_ends_a_queued_stream_at_once_and_the_server_exits() {
     let (mut server, reapi, worker) = Running::start(&[]);
@@ -216,7 +215,7 @@ async fn sigterm_ends_a_queued_stream_at_once_and_the_server_exits() {
         .expect("the queued stream ends after SIGTERM")
         .expect_err("it ends with an error");
     assert_eq!(ended.code(), Code::Unavailable, "{ended:?}");
-    assert!(ended.message().contains("no running lease"), "{ended:?}");
+    assert!(ended.message().contains("never started"), "{ended:?}");
     let status = server.exited(PROMPT).await;
     assert!(status.success(), "kbf-server exited with {status}");
     drop(client);

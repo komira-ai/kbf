@@ -341,10 +341,11 @@ pub struct Args {
     pub finished_retention_secs: u64,
     /// How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to
     /// finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and
-    /// sends GOAWAY, and every open Execute and WaitExecution stream whose operation has
-    /// a running lease stays open until its action is done; the streams of operations
-    /// still queued (no lease started, say every capable worker is cordoned) end
-    /// UNAVAILABLE at once, which Buck2 retries, and the operations stay queued. On a
+    /// sends GOAWAY, and every open Execute and WaitExecution stream stays open until its
+    /// action is done; the exception is a stream whose operation was never started and
+    /// that no worker can run (say every capable worker is cordoned), which ends
+    /// UNAVAILABLE at once, since that action would fail at the deadline anyway (Buck2
+    /// retries only the opening of a call). The operation stays queued. On a
     /// frontend over a state store, `--drain-deadline` bounds the wait in any case; this
     /// flag bounds it earlier. Buck2 never recovers a stream that breaks mid-action, so the
     /// default, 0, is no deadline; set one at least as long as the longest action. When

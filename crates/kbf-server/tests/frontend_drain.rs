@@ -7,6 +7,7 @@ mod support;
 use kbf_proto::reapi::execution_stage::Value as ExecStage;
 use kbf_server::api::{FRONTEND_DRAIN, NODES};
 use kbf_server::api_client::{OperatorClient, Reply};
+use prost::Message as _;
 use serde_json::{Value, json};
 use support::{API_TOKEN, Cell, Job, PROMPT, done, output, ran, stage};
 use tonic::Code;
@@ -137,11 +138,10 @@ async fn a_drain_by_the_endpoint_keeps_the_running_stream_and_refuses_the_next()
     assert_eq!(stage(&last), ExecStage::Completed as i32);
 }
 
-/// Catches a drain by the endpoint that keeps the stream of an operation no lease runs
-/// (it waits for a worker that may never come, and the stop with it): the stream ends
-/// UNAVAILABLE at once, naming that the operation has no running lease, and the
-/// operation is not cancelled by it (`sequence::tests` pins that the scheduler still
-/// holds it queued).
+/// Catches a drain by the endpoint that keeps the stream of an operation that has never
+/// started and that no worker can run (it would wait for the whole deadline): the stream
+/// ends UNAVAILABLE at once, naming why, and the operation is not cancelled by it
+/// (`sequence::tests` pins that the scheduler still holds it queued).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_drain_by_the_endpoint_ends_the_queued_stream() {
     let cell = Cell::start_with_api().await;
@@ -150,6 +150,16 @@ async fn a_drain_by_the_endpoint_ends_the_queued_stream() {
     let mut ops = cell.execute(&job.action).await;
     let queued = ops.message().await.expect("healthy").expect("QUEUED");
     assert_eq!(stage(&queued), ExecStage::Queued as i32);
+    // The scheduler says no worker can run it (the stage `Waiting`) at its first tick.
+    loop {
+        let op = ops.message().await.expect("healthy").expect("an update");
+        let meta = op.metadata.as_ref().expect("metadata");
+        let meta = kbf_proto::reapi::ExecuteOperationMetadata::decode(meta.value.as_slice());
+        let waits = meta.expect("metadata").partial_execution_metadata;
+        if waits.is_some_and(|partial| !partial.auxiliary_metadata.is_empty()) {
+            break;
+        }
+    }
 
     let begun = begin(&cell, true, "").await;
     assert_eq!(begun.status, 200, "{begun:?}");
@@ -158,7 +168,7 @@ async fn a_drain_by_the_endpoint_ends_the_queued_stream() {
         .expect("the queued stream ends after the drain began")
         .expect_err("it ends with an error");
     assert_eq!(ended.code(), Code::Unavailable, "{ended:?}");
-    assert!(ended.message().contains("no running lease"), "{ended:?}");
+    assert!(ended.message().contains("never started"), "{ended:?}");
 }
 
 /// Catches an idle frontend whose drain answer is lost: with no REAPI connection the

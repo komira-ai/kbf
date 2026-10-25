@@ -601,3 +601,125 @@ async fn a_stop_ends_at_the_drain_deadline_when_a_running_action_outlasts_it() {
 async fn the_endpoints_drain_ends_at_the_deadline_when_a_running_action_outlasts_it() {
     a_running_action_is_cut_at_the_drain_deadline(Begin::Endpoint).await;
 }
+
+/// Asserts that an operation a worker can take but that is only queued (the node is full)
+/// keeps its stream through the drain, which no longer ends it: the stream is open past the
+/// load balancer wait and until the deadline, which ends it with the stop. Buck2 does not
+/// recover a stream that ends after the call opened, so a queued operation is not ended
+/// early.
+async fn a_queued_operation_a_worker_can_take_keeps_its_stream(how: Begin) {
+    let rig = Rig::new(timing(0, 30));
+    let mut inbox = register(&rig);
+    for tag in 1..=4 {
+        let _running = submit(&rig.farm, request(tag)).expect("queued");
+    }
+    rig.farm.tick().await;
+    assert_eq!(starts(&mut inbox), 4, "the node did not fill");
+    let queued = submit(&rig.farm, request(5)).expect("queued");
+    rig.farm.tick().await;
+    assert!(matches!(*queued.stage.borrow(), kbf_front::Stage::Queued));
+    let stream = follow(&rig, &queued).await;
+    let began = Instant::now();
+    let stop = begin(&rig, how, Duration::MAX);
+
+    pass(Duration::from_secs(29)).await;
+    assert!(
+        !stream.is_finished(),
+        "{how:?}: a queued stream was ended early"
+    );
+    assert!(
+        !stop.is_finished(),
+        "{how:?}: the stop ended before the deadline"
+    );
+    tokio::time::timeout(Duration::from_secs(60), stop)
+        .await
+        .expect("the stop ends at the deadline")
+        .expect("task");
+    assert!(began.elapsed() >= Duration::from_secs(30), "{how:?}");
+    let ended = stream.await.expect("task").expect_err("ended");
+    assert_eq!(ended.code(), Code::Unavailable, "{how:?}: {ended:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_keeps_the_stream_of_a_queued_operation_a_worker_can_take() {
+    a_queued_operation_a_worker_can_take_keeps_its_stream(Begin::Signal).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_endpoints_drain_keeps_the_stream_of_a_queued_operation_a_worker_can_take() {
+    a_queued_operation_a_worker_can_take_keeps_its_stream(Begin::Endpoint).await;
+}
+
+/// Asserts that an operation that had a lease, lost it to a silent node and now waits
+/// behind a cordoned worker keeps its stream: it reads `WaitingAfterStart`, not `Waiting`,
+/// and the stream lasts until the deadline, as that of any operation that has run.
+async fn a_requeued_operation_keeps_its_stream(how: Begin) {
+    let rig = Rig::new(timing(0, 30));
+    let mut inbox = register(&rig);
+    let ticket = submit(&rig.farm, request(1)).expect("queued");
+    rig.farm.tick().await;
+    assert_eq!(starts(&mut inbox), 1, "the operation did not start");
+    rig.farm
+        .place(&WorkerId::new("node-a"), crate::farm::NodeAction::Cordon)
+        .expect("cordoned");
+    // The node goes silent past the lease grace (60 s): the lease is given up and requeued.
+    pass(Duration::from_secs(70)).await;
+    rig.farm.tick().await;
+    assert!(
+        matches!(
+            *ticket.stage.borrow(),
+            kbf_front::Stage::WaitingAfterStart(_)
+        ),
+        "{how:?}: {:?}",
+        *ticket.stage.borrow()
+    );
+    let stream = follow(&rig, &ticket).await;
+    let began = Instant::now();
+    let stop = begin(&rig, how, Duration::MAX);
+
+    pass(Duration::from_secs(29)).await;
+    assert!(
+        !stream.is_finished(),
+        "{how:?}: an operation that ran was ended early"
+    );
+    assert!(!stop.is_finished(), "{how:?}");
+    tokio::time::timeout(Duration::from_secs(60), stop)
+        .await
+        .expect("the stop ends at the deadline")
+        .expect("task");
+    assert!(began.elapsed() >= Duration::from_secs(30), "{how:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_keeps_the_stream_of_an_operation_requeued_after_a_lost_lease() {
+    a_requeued_operation_keeps_its_stream(Begin::Signal).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_endpoints_drain_keeps_the_stream_of_an_operation_requeued_after_a_lost_lease() {
+    a_requeued_operation_keeps_its_stream(Begin::Endpoint).await;
+}
+
+/// Asserts the order of a lease's start: at the point the `Start` is about to leave, the
+/// operation's callers already read `Executing`, so a drain that ends the streams of
+/// operations that cannot start never ends one whose `Start` is in flight.
+#[tokio::test(start_paused = true)]
+async fn a_start_is_never_sent_before_its_callers_read_executing() {
+    let rig = Rig::new(timing(0, 30));
+    let _inbox = register(&rig);
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    crate::farm::BEFORE_START.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |stages| {
+            record.lock().expect("lock").push(stages);
+        }));
+    });
+    let _ticket = submit(&rig.farm, request(1)).expect("queued");
+    rig.farm.tick().await;
+    crate::farm::BEFORE_START.with(|hook| hook.borrow_mut().take());
+    assert_eq!(
+        *seen.lock().expect("lock"),
+        [[kbf_front::Stage::Executing]],
+        "the Start left before its callers read Executing"
+    );
+}

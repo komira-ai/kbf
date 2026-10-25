@@ -616,9 +616,9 @@ pod's deletion) begin the same one.
 - `queued_operations`: operations in the scheduler's queue, with no lease yet. With
   `open_executions` it tells idle (both 0) from busy, and a stream that waits for a
   worker (`open_executions` above 0, `queued_operations` above 0, no lease running)
-  from one that runs. Once a drain has begun, the streams of queued operations are ended
-  `UNAVAILABLE`, so `open_executions` then counts the streams of running leases and
-  `queued_operations` can stay above 0 with no stream open. `kbf_front_executes_started_total` (see the metrics below) tells a
+  from one that runs. Once a drain has begun, the streams of operations that were never
+  started and that no worker can run are ended `UNAVAILABLE`, so `queued_operations` can
+  stay above 0 with fewer streams open. `kbf_front_executes_started_total` (see the metrics below) tells a
   client that has just come from one that is still there.
 
 **`POST /v1/frontend/drain`**: begins the drain, a write that passes every gate of
@@ -646,15 +646,18 @@ over a state store (`kbf frontend` requires one):
    drains their connections: calls in flight on a connection finish and new ones open
    elsewhere. The REAPI and worker listeners stop accepting; this API goes on answering, so
    the drain can be read. Phase `draining`.
-4. **Wait for the running executions.** The frontend waits only for the operations that
-   have a running lease. The Execute and WaitExecution stream of an operation that is still
-   queued (no lease has started: for example every worker that could run it is cordoned,
-   so it is requeued and never starts) ends `UNAVAILABLE` at once, when step 3 begins,
-   naming that the operation has no running lease; Buck2 retries the call it reopens, so
-   that costs the client a retry. The operation is not cancelled: it stays queued, and the
-   other frontends take it (step 3); the client's retry joins it there, or starts it. The
-   wait lasts until `open_executions` is 0, at most `--drain-deadline` seconds (default
-   900, at least 1), so a drain always ends. An execution running on a node of this frontend
+4. **Wait for the executions.** The wait lasts until `open_executions` is 0, at most
+   `--drain-deadline` seconds (default 900, at least 1), so a drain always ends. Buck2
+   retries only the opening of an Execute call, not a stream that breaks after it, so an
+   ended stream fails that Buck2 action: the frontend ends none before the deadline except
+   one whose operation can never start. That is an operation that has never been started
+   and that no live worker can run (`WAITING`: every worker that could run it is cordoned,
+   or there is none; the stream says so in its metadata): its stream ends `UNAVAILABLE` at
+   once, when step 3 begins, naming why. The action would fail at the deadline anyway, so
+   this costs nothing and frees the stop. An operation that is only queued (a worker can
+   take it) and any operation that ever had a lease, even one queued again after a lost
+   lease, keeps its stream until it is done or the deadline. Ending a stream does not
+   cancel the operation: it stays queued for the other frontends. An execution running on a node of this frontend
    finishes here: the node's result is taken and the caller is answered. An execution
    another frontend took is answered from the result it records in the state store.
 5. **Close and exit.** The frontend stands down as a retire does (below): the farm is
@@ -672,8 +675,8 @@ SIGTERM or SIGINT skips the waits of steps 2 and 4 and goes on to step 5, and
 `--shutdown-timeout-secs` (default 0, none), when a signal began the drain, does the
 same when it runs out. A server with no state store (`kbf-server`; a frontend started by a
 test) drains at once instead: `/readyz` `503`, new Execute calls refused, the REAPI
-listener sent GOAWAY, the streams of operations that have a running lease kept until their
-action is done, those of operations still queued ended `UNAVAILABLE` at once (as in step 4),
+listener sent GOAWAY, the open streams kept until their action is done except the
+streams of operations that can never start, which end `UNAVAILABLE` at once (as in step 4),
 and the server exits when the REAPI connections have closed, bounded by
 `--shutdown-timeout-secs` (it has no `--drain-deadline`).
 
@@ -1318,7 +1321,7 @@ otherwise; the body lists each failing check and why:
 
 | Check | Fails when |
 |---|---|
-| `stopping` | the server has received SIGTERM or SIGINT, or `POST /v1/frontend/drain` has begun a drain, or `POST /v1/frontend/retire` has retired the frontend. It answers `503` from that moment, and for the rest of the drain; open Execute streams whose operation has a running lease are kept until their action is done, and only the drain deadline (`--drain-deadline`, on a frontend over a state store), the shutdown timeout (`--shutdown-timeout-secs`) or a second signal ends them; the streams of operations still queued end `UNAVAILABLE` at once |
+| `stopping` | the server has received SIGTERM or SIGINT, or `POST /v1/frontend/drain` has begun a drain, or `POST /v1/frontend/retire` has retired the frontend. It answers `503` from that moment, and for the rest of the drain; open Execute streams are kept until their action is done, and only the drain deadline (`--drain-deadline`, on a frontend over a state store), the shutdown timeout (`--shutdown-timeout-secs`) or a second signal ends them; the one exception is a stream whose operation was never started and that no worker can run, which ends `UNAVAILABLE` at once |
 | `leader` | the server does not hold the scheduler role. A single server runs every role and always holds it; the check is there for a replicated control log, whose followers fail it. **Planned**: a second readiness path, without this check, for the servers that may serve reads ([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)) |
 | `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000; it bounds the gRPC health service's probe too), or answers with an error. The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
 

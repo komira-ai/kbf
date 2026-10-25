@@ -121,6 +121,18 @@ pub fn process_term() -> u64 {
 /// Where the server sends a worker's messages: the outbound half of its stream.
 pub type Outbound = mpsc::UnboundedSender<Result<ServerMessage, Status>>;
 
+/// A test's check of the callers' stages at the point a `Start` is about to be sent.
+#[cfg(test)]
+pub(crate) type StartHook = Box<dyn Fn(Vec<Stage>)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Called with the stage of each caller of the operation just before a `Start` is sent,
+    /// by tests that check what is true at that point.
+    pub(crate) static BEFORE_START: std::cell::RefCell<Option<StartHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Names one worker stream, so messages from a replaced stream can be told apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StreamId(u64);
@@ -258,6 +270,10 @@ struct State {
     finished_retention: Duration,
     /// The channel of each caller the machine keeps, forgotten with its record.
     stages: BTreeMap<WaiterId, watch::Sender<Stage>>,
+    /// The operations a `Start` was sent for, marked before the `Start` leaves and never
+    /// cleared while the scheduler holds the operation: a drain ends the streams of an
+    /// operation that waits for a worker only if it is not in here.
+    ever_started: BTreeSet<OperationId>,
     next_stream: u64,
     /// The newest stream of each node the machine has registered.
     links: BTreeMap<WorkerId, Link>,
@@ -415,6 +431,7 @@ impl Farm {
                 machine: FarmMachine::new(term),
                 finished_retention,
                 stages: BTreeMap::new(),
+                ever_started: BTreeSet::new(),
                 next_stream: 0,
                 links: BTreeMap::new(),
                 paused: BTreeSet::new(),
@@ -1431,6 +1448,8 @@ impl State {
         let forgotten = self.machine.forget_dropped(held);
         self.answered
             .retain(|_, operation| sched.state(*operation).is_some());
+        self.ever_started
+            .retain(|operation| sched.state(*operation).is_some());
         for id in forgotten {
             self.stages.remove(&id);
         }
@@ -1523,7 +1542,23 @@ impl State {
     /// `Start` names the newest heartbeat taken on the worker's stream and the window
     /// after it in which the daemon may still act on the `Start` (issue #23).
     fn start(&mut self, start: StartLease) {
+        // Marked, and its callers shown executing, before the `Start` leaves: a stream
+        // that reads the stage later never sees an operation that has a `Start` in
+        // flight as one that cannot start.
+        self.ever_started.insert(start.operation);
+        let waiters = self.sched.waiters(start.operation).unwrap_or_default();
+        for stage in waiters.iter().filter_map(|id| self.stages.get(id)) {
+            stage.send_replace(Stage::Executing);
+        }
         let heartbeat_seq = self.links.get(&start.worker).map_or(0, |l| l.newest_beat);
+        #[cfg(test)]
+        BEFORE_START.with(|hook| {
+            if let Some(hook) = &*hook.borrow() {
+                let waiters = self.sched.waiters(start.operation).unwrap_or_default();
+                let stages = waiters.iter().filter_map(|id| self.stages.get(id));
+                hook(stages.map(|stage| stage.borrow().clone()).collect());
+            }
+        });
         self.send_for(&start.worker, start.operation, |_| {
             server_message::Message::Start(Start {
                 lease_id: Some(wire_lease(start.lease)),
@@ -1536,10 +1571,6 @@ impl State {
                 device_id: start.device.clone().unwrap_or_default(),
             })
         });
-        let waiters = self.sched.waiters(start.operation).unwrap_or_default();
-        for stage in waiters.iter().filter_map(|id| self.stages.get(id)) {
-            stage.send_replace(Stage::Executing);
-        }
         let now = SystemTime::now();
         // An operation with a `Start` has its first waiter (see `send_for`).
         let queued = self
@@ -1565,7 +1596,11 @@ impl State {
         let stage = match &waiting.reason {
             Some(why) => {
                 tracing::warn!(%operation, reason = %why, "no live worker can run the operation");
-                Stage::Waiting(why.clone())
+                if self.ever_started.contains(&operation) {
+                    Stage::WaitingAfterStart(why.clone())
+                } else {
+                    Stage::Waiting(why.clone())
+                }
             }
             None => {
                 tracing::info!(%operation, "a live worker can run the operation again");
