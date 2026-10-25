@@ -221,6 +221,19 @@ impl Backend for CachedStore {
         self.inner.upload_part(key, id, number, body).await
     }
 
+    async fn upload_part_with_len(
+        &self,
+        key: &str,
+        id: &str,
+        number: u32,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<String, Error> {
+        let inner = &self.inner;
+        let upload = inner.upload_part_with_len(key, id, number, len, body);
+        upload.await
+    }
+
     async fn complete_upload(
         &self,
         key: &str,

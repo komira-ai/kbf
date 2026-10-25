@@ -13,6 +13,10 @@ use sha2::{Digest, Sha256};
 pub(crate) const EMPTY_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+/// What `x-amz-content-sha256` says of a body whose hash is not known before it is sent: the
+/// request is signed without a hash of its body.
+pub(crate) const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
+
 /// What is signed for one request.
 pub(crate) struct Request<'a> {
     pub method: &'a str,

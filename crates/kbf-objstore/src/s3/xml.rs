@@ -121,12 +121,27 @@ pub(crate) fn upload_id(body: &[u8]) -> Result<String, ObjectStoreError> {
 
 /// The body of CompleteMultipartUpload: each part's number and ETag, in order.
 pub(crate) fn complete_request(etags: &[String]) -> String {
+    complete_document((1..).zip(etags.iter().map(String::as_str)))
+}
+
+/// The body of CompleteMultipartUpload for parts a caller numbers itself: each part's number
+/// and ETag, in the order given.
+pub(crate) fn complete_parts_request(parts: &[(u32, String)]) -> String {
+    complete_document(parts.iter().map(numbered))
+}
+
+/// A part a caller numbered, as a number and an ETag.
+fn numbered(part: &(u32, String)) -> (u64, &str) {
+    (u64::from(part.0), part.1.as_str())
+}
+
+/// A CompleteMultipartUpload document naming these parts, a number and an ETag each.
+fn complete_document<'a>(parts: impl Iterator<Item = (u64, &'a str)>) -> String {
     let mut out =
         String::from("<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
-    for (i, etag) in etags.iter().enumerate() {
+    for (number, etag) in parts {
         out.push_str(&format!(
-            "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
-            i + 1,
+            "<Part><PartNumber>{number}</PartNumber><ETag>{}</ETag></Part>",
             escape(etag)
         ));
     }
@@ -135,15 +150,19 @@ pub(crate) fn complete_request(etags: &[String]) -> String {
 }
 
 /// A CompleteMultipartUpload answer of 200: success only if it is a
-/// `CompleteMultipartUploadResult`. S3 answers 200 and then an `<Error>` when the
-/// completion fails after the answer started.
-pub(crate) fn complete_answer(body: &[u8]) -> Result<(), ObjectStoreError> {
+/// `CompleteMultipartUploadResult`, and then the `ETag` of the object it names, quotes
+/// included, if it names one. S3 answers 200 and then an `<Error>` when the completion fails
+/// after the answer started.
+pub(crate) fn complete_answer(body: &[u8]) -> Result<Option<String>, ObjectStoreError> {
     let text = std::str::from_utf8(body).unwrap_or_default();
-    let root = Document::parse(text)
-        .ok()
-        .map(|doc| doc.root_element().tag_name().name().to_owned());
-    match root.as_deref() {
-        Some("CompleteMultipartUploadResult") => Ok(()),
+    let doc = Document::parse(text).ok();
+    let root = doc.as_ref().map(Document::root_element);
+    let name = root.map(|root| root.tag_name().name().to_owned());
+    match name.as_deref() {
+        Some("CompleteMultipartUploadResult") => {
+            let etag = root.and_then(|root| child_text(root, "ETag"));
+            Ok(etag.map(|etag| etag.trim().to_owned()))
+        }
         Some("Error") => {
             let (code, message) = error_code_message(body);
             Err(ObjectStoreError::Service {
@@ -254,7 +273,10 @@ mod tests {
         let done = format!(
             "<CompleteMultipartUploadResult {NS}><ETag>\"x-2\"</ETag></CompleteMultipartUploadResult>"
         );
-        assert!(complete_answer(done.as_bytes()).is_ok());
+        let etag = complete_answer(done.as_bytes()).unwrap();
+        assert_eq!(etag.as_deref(), Some("\"x-2\""));
+        let bare = format!("<CompleteMultipartUploadResult {NS}/>");
+        assert_eq!(complete_answer(bare.as_bytes()).unwrap(), None);
         let late = b"<Error><Code>InternalError</Code><Message>m</Message></Error>";
         let late = complete_answer(late).err().map(|e| e.to_string());
         assert_eq!(late.as_deref(), Some("store answered 200 InternalError: m"));
@@ -262,6 +284,22 @@ mod tests {
             complete_answer(b""),
             Err(ObjectStoreError::Protocol(_))
         ));
+    }
+
+    /// Asserts that a completion names the parts by the numbers the caller gave, in the order
+    /// given and not by position, with the ETags escaped.
+    #[test]
+    fn a_completion_names_parts_by_their_own_numbers() {
+        let body = complete_parts_request(&[(2, "\"a\"".into()), (5, "b&c".into())]);
+        assert!(
+            body.contains(
+                "<Part><PartNumber>2</PartNumber><ETag>\"a\"</ETag></Part>\
+                 <Part><PartNumber>5</PartNumber><ETag>b&amp;c</ETag></Part>"
+            ),
+            "{body}"
+        );
+        assert!(body.starts_with("<CompleteMultipartUpload "), "{body}");
+        assert!(body.ends_with("</CompleteMultipartUpload>"), "{body}");
     }
 
     /// Catches: an error body read without its code, which callers match on.

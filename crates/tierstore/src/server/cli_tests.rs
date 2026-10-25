@@ -2,7 +2,7 @@
 
 use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use crate::{
     TestClock,
 };
 
-use super::{Cli, build, parse_duration, read_key, reconcile, share, tier};
+use super::{Cli, S3Flags, build, open_tier, parse_duration, read_key, reconcile, share, tier};
 
 const MEBIBYTE: u64 = 1 << 20;
 
@@ -120,6 +120,16 @@ fn the_flags_have_their_defaults() {
     assert_eq!(cli.reconcile_interval, Duration::from_secs(5));
     assert_eq!(cli.max_request_bytes, 256 << 20);
     assert_eq!(cli.body_idle_timeout, Duration::from_secs(30));
+    assert_eq!(cli.s3_request_timeout, Duration::from_secs(60));
+    let s3_flags = [
+        cli.hot_endpoint.is_some(),
+        cli.hot_region.is_some(),
+        cli.hot_credentials_file.is_some(),
+        cli.cold_endpoint.is_some(),
+        cli.cold_region.is_some(),
+        cli.cold_credentials_file.is_some(),
+    ];
+    assert!(!s3_flags.contains(&true), "no S3 flag by default");
 }
 
 /// Asserts that every flag that has a default can be given, and is read.
@@ -139,6 +149,13 @@ fn the_flags_can_all_be_given() {
         ("--reconcile-interval", "1s"),
         ("--max-request-bytes", "10"),
         ("--body-idle-timeout", "7s"),
+        ("--s3-request-timeout", "90s"),
+        ("--hot-endpoint", "http://127.0.0.1:9000"),
+        ("--hot-region", "eu-west-1"),
+        ("--hot-credentials-file", "hot-key"),
+        ("--cold-endpoint", "http://127.0.0.1:9001"),
+        ("--cold-region", "eu-west-2"),
+        ("--cold-credentials-file", "cold-key"),
     ];
     let cli = Cli::try_parse_from(flags("key", &given)).unwrap();
     assert_eq!(cli.region, "eu-west-1");
@@ -153,6 +170,15 @@ fn the_flags_can_all_be_given() {
     assert_eq!(cli.reconcile_interval, Duration::from_secs(1));
     assert_eq!(cli.max_request_bytes, 10);
     assert_eq!(cli.body_idle_timeout, Duration::from_secs(7));
+    assert_eq!(cli.s3_request_timeout, Duration::from_secs(90));
+    let hot = cli.hot_s3();
+    assert_eq!(hot.endpoint, Some("http://127.0.0.1:9000"));
+    assert_eq!(hot.region, Some("eu-west-1"));
+    assert_eq!(hot.credentials, Some(Path::new("hot-key")));
+    let cold = cli.cold_s3();
+    assert_eq!(cold.endpoint, Some("http://127.0.0.1:9001"));
+    assert_eq!(cold.region, Some("eu-west-2"));
+    assert_eq!(cold.credentials, Some(Path::new("cold-key")));
 }
 
 /// Asserts that flags that are not valid are refused when they are read: one that is not known,
@@ -208,6 +234,13 @@ fn the_help_names_every_flag_and_the_version_the_package() {
         "--reconcile-interval",
         "--max-request-bytes",
         "--body-idle-timeout",
+        "--s3-request-timeout",
+        "--hot-endpoint",
+        "--hot-region",
+        "--hot-credentials-file",
+        "--cold-endpoint",
+        "--cold-region",
+        "--cold-credentials-file",
     ];
     for name in names {
         assert!(help.contains(name), "{name}");
@@ -257,8 +290,8 @@ fn the_settings_are_made_from_the_flags() {
 
 /// Asserts that flags that do not fit together are refused with a message that names them: the
 /// water marks out of order, a reconcile interval that is not shorter than the lease, a bucket
-/// called like a probe path, an idle timeout of zero, a tier that cannot be opened, and a key
-/// file that cannot be used.
+/// called like a probe path, an idle timeout of zero, a request timeout of zero for the S3
+/// tiers, a tier that cannot be opened, and a key file that cannot be used.
 #[test]
 fn flags_that_do_not_fit_together_are_refused() {
     let dir = TestDir::under(std::env::temp_dir(), "tierstore-refused");
@@ -275,6 +308,8 @@ fn flags_that_do_not_fit_together_are_refused() {
     assert!(refused(&|cli| cli.bucket = "healthz".to_owned()).contains("probe path"));
     let idle = refused(&|cli| cli.body_idle_timeout = Duration::ZERO);
     assert!(idle.contains("--body-idle-timeout"), "{idle}");
+    let wait = refused(&|cli| cli.s3_request_timeout = Duration::ZERO);
+    assert!(wait.contains("--s3-request-timeout"), "{wait}");
     let hot = refused(&|cli| cli.hot = "s3://hot".to_owned());
     assert!(hot.contains("--hot"), "{hot}");
     let cold = refused(&|cli| cli.cold = "/var/cold".to_owned());
@@ -303,6 +338,91 @@ fn only_a_memory_or_a_directory_tier_opens() {
     let under = format!("dir:{}/inside", file.display());
     let blocked = tier("--hot", &under).err().unwrap();
     assert!(blocked.contains("--hot"), "{blocked}");
+}
+
+/// Asserts that a tier `s3:<bucket>` is built from the flags of its tier, each tier from its
+/// own: the settings are made without a request, the region is not needed, and the two tiers
+/// have a key file of their own.
+#[test]
+fn an_s3_tier_is_built_from_the_flags_of_its_tier() {
+    let dir = TestDir::under(std::env::temp_dir(), "tierstore-s3-tiers");
+    let hot_key = key_file(&dir, "hot-key", "HOTID\nhot-secret\n", 0o600);
+    let cold_key = key_file(&dir, "cold-key", "COLDID\ncold-secret\n", 0o600);
+    let mut cli = cli(&dir);
+    cli.hot = "s3:hot-bucket".to_owned();
+    cli.hot_endpoint = Some("http://127.0.0.1:9000".to_owned());
+    cli.hot_credentials_file = Some(hot_key);
+    cli.cold = "s3:cold-bucket".to_owned();
+    cli.cold_endpoint = Some("http://127.0.0.1:9001".to_owned());
+    cli.cold_region = Some("eu-west-1".to_owned());
+    cli.cold_credentials_file = Some(cold_key);
+    build(&cli).expect("built");
+}
+
+/// Asserts that an S3 tier that its flags do not describe is refused with a message that names
+/// the flag: no endpoint, no credentials file, a file that is missing, that others can read or
+/// that lacks a line, an endpoint that is not valid (TLS is not built), and a bucket name that
+/// is not one; and that the flags of an S3 tier are refused for a tier of another kind.
+#[test]
+fn an_s3_tier_that_its_flags_do_not_describe_is_refused() {
+    let dir = TestDir::under(std::env::temp_dir(), "tierstore-s3-refused");
+    let good = key_file(&dir, "good", "ID\nsecret\n", 0o600);
+    let open = key_file(&dir, "open", "ID\nsecret\n", 0o644);
+    let incomplete = key_file(&dir, "incomplete", "ID\n", 0o600);
+    let missing = dir.path().join("missing");
+    let http = Some("http://127.0.0.1:9000");
+    let timeout = Duration::from_secs(5);
+    let refused = |spec: &str, endpoint: Option<&str>, credentials: Option<&Path>| {
+        let flags = S3Flags {
+            endpoint,
+            region: None,
+            credentials,
+        };
+        let opened = open_tier("--cold", spec, &flags, timeout);
+        opened.err().expect("refused")
+    };
+    let no_endpoint = refused("s3:bucket", None, Some(&good));
+    assert!(no_endpoint.contains("--cold-endpoint"), "{no_endpoint}");
+    assert!(no_endpoint.contains("s3:bucket"), "{no_endpoint}");
+    let no_key = refused("s3:bucket", http, None);
+    assert!(no_key.contains("--cold-credentials-file"), "{no_key}");
+    let gone = refused("s3:bucket", http, Some(&missing));
+    assert!(gone.contains("--cold-credentials-file"), "{gone}");
+    assert!(gone.contains("missing"), "{gone}");
+    let others = refused("s3:bucket", http, Some(&open));
+    assert!(others.contains("others can read it"), "{others}");
+    let short = refused("s3:bucket", http, Some(&incomplete));
+    assert!(short.contains("on the second"), "{short}");
+    let tls = refused("s3:bucket", Some("https://127.0.0.1:9000"), Some(&good));
+    assert!(tls.contains("TLS"), "{tls}");
+    assert!(tls.contains("--cold"), "{tls}");
+    let name = refused("s3:Not_A_Bucket", http, Some(&good));
+    assert!(name.contains("bucket name"), "{name}");
+
+    let given = [
+        (http, None, None),
+        (None, Some("eu-west-1"), None),
+        (None, None, Some(good.as_path())),
+    ];
+    for (endpoint, region, credentials) in given {
+        let flags = S3Flags {
+            endpoint,
+            region,
+            credentials,
+        };
+        let opened = open_tier("--hot", "memory", &flags, timeout);
+        let why = opened.err().unwrap();
+        assert!(why.contains("--hot"), "{why}");
+        assert!(why.contains("s3:<bucket>"), "{why}");
+    }
+    let none = S3Flags {
+        endpoint: None,
+        region: None,
+        credentials: None,
+    };
+    assert!(open_tier("--hot", "memory", &none, timeout).is_ok());
+    let unknown = open_tier("--hot", "tape", &none, timeout).err().unwrap();
+    assert!(unknown.contains("s3:<bucket>"), "{unknown}");
 }
 
 /// Asserts that the key file is read as an id on the first line and a secret on the second,

@@ -8,14 +8,16 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kbf_objstore::s3::fake::FakeS3;
+use futures::{StreamExt, stream};
+use kbf_objstore::s3::fake::{FakeS3, part_etag};
 use tierstore::s3::{Capabilities, Credentials, S3Config};
 use tierstore::{
-    Backend, ByteRange, Clock, Error, Proxy, ProxyConfig, Reconciler, ReconcilerConfig, S3Backend,
-    SystemClock,
+    Backend, ByteRange, Clock, Error, PartBody, Proxy, ProxyConfig, Reconciler, ReconcilerConfig,
+    S3Backend, SystemClock,
 };
 
 use crate::conformance;
+use crate::multipart::{contract, large};
 use crate::support::{body, keys, page};
 
 fn config(endpoint: &str) -> S3Config {
@@ -160,6 +162,21 @@ async fn the_backend_is_create_only_whatever_the_configuration_claims() {
     conformance::a_second_put_is_refused(&backend).await;
 }
 
+/// A body of these chunks, for a part.
+fn chunks(texts: &[&'static str]) -> PartBody<'static> {
+    let mut items = Vec::new();
+    for &text in texts {
+        items.push(Ok(body(text)));
+    }
+    stream::iter(items).boxed()
+}
+
+/// The tag the S3 service gives a part of these bytes, as the backend gives it: without the
+/// quotes.
+fn part_tag(bytes: &[u8]) -> String {
+    part_etag(bytes).trim_matches('"').to_owned()
+}
+
 /// Asserts that a configuration the client refuses is refused by the backend, before any
 /// request.
 #[test]
@@ -269,10 +286,15 @@ async fn a_key_the_client_cannot_name_is_refused_before_any_request() {
     assert_other(backend.delete(key).await);
     assert_other(backend.list(key).await);
     assert_other(backend.list_page("", Some(key), 5).await);
+    assert_other(backend.create_upload(key).await);
+    assert_other(backend.upload_part(key, "u", 1, chunks(&["x"])).await);
+    assert_other(backend.complete_upload(key, "u", &[]).await);
+    assert_other(backend.abort_upload(key, "u").await);
     assert_eq!(s3.requests(), Vec::<String>::new());
 }
 
-/// Asserts that a store that cannot be reached is `Unavailable` for every call.
+/// Asserts that a store that cannot be reached is `Unavailable` for every call, the calls of a
+/// multipart upload included (a part whose chunks are not taken is given up with the request).
 #[tokio::test]
 async fn a_store_that_cannot_be_reached_is_unavailable() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -289,6 +311,21 @@ async fn a_store_that_cannot_be_reached_is_unavailable() {
         backend.head("k").await.unwrap_err(),
         backend.delete("k").await.unwrap_err(),
         backend.list("").await.unwrap_err(),
+    ];
+    for error in errors {
+        assert!(error.is_unavailable(), "{error}");
+    }
+    let created = backend.create_upload("k").await.unwrap_err();
+    let sending = backend.upload_part("k", "u", 1, chunks(&["x"]));
+    let sized = backend.upload_part_with_len("k", "u", 2, Some(2), chunks(&["a", "b"]));
+    let parts = [(1, "t".to_owned())];
+    let completed = backend.complete_upload("k", "u", &parts);
+    let errors = [
+        created,
+        sending.await.unwrap_err(),
+        sized.await.unwrap_err(),
+        completed.await.unwrap_err(),
+        backend.abort_upload("k", "u").await.unwrap_err(),
     ];
     for error in errors {
         assert!(error.is_unavailable(), "{error}");
@@ -328,4 +365,86 @@ async fn a_proxy_and_a_reconciler_work_over_two_s3_backends() {
     assert!(one.pass().await.held);
     one.stop().await;
     assert!(two.pass().await.held);
+}
+
+/// Asserts that the S3 backend does the calls of a multipart upload as the trait says, held to
+/// the same checks as the in-memory and the directory backend: parts of a length that is told
+/// and of one that is not, replaced by number, with the tag the service gives them; a
+/// completion that names parts wrongly, or an upload that is not held, refused; a completion
+/// that never replaces an object; a part whose body fails not stored; an abort; and a large
+/// part sent in chunks. No upload is left open, and the two objects made of parts were
+/// completed.
+#[tokio::test]
+async fn the_s3_backend_does_multipart_uploads() {
+    let (s3, backend) = backend().await;
+    s3.set_min_part_bytes(0);
+    contract(&backend, part_tag).await;
+    large(&backend).await;
+    assert_eq!(s3.incomplete_uploads(), 0);
+    assert_eq!(s3.stats().completed, 2);
+}
+
+/// Asserts that a completion that names a part under the least size S3 takes, before the last
+/// one, is refused as `InvalidPart`, and that the upload is left open.
+#[tokio::test]
+async fn a_completion_with_a_small_part_before_the_last_is_an_invalid_part() {
+    let (s3, backend) = backend().await;
+    let id = backend.create_upload("k").await.unwrap();
+    let uploading = backend.upload_part("k", &id, 1, chunks(&["small"]));
+    let one = uploading.await.unwrap();
+    let uploading = backend.upload_part("k", &id, 2, chunks(&["tiny"]));
+    let two = uploading.await.unwrap();
+    let parts = [(1, one), (2, two)];
+    let refused = backend.complete_upload("k", &id, &parts).await;
+    let invalid = matches!(refused, Err(Error::InvalidPart(_)));
+    assert!(invalid, "{refused:?}");
+    assert_eq!(s3.incomplete_uploads(), 1);
+}
+
+/// Asserts that a part whose body gives more or fewer bytes than the length told is refused as
+/// `Other`, and is not stored.
+#[tokio::test]
+async fn a_part_of_another_length_than_told_is_refused_and_not_stored() {
+    let (s3, backend) = backend().await;
+    let id = backend.create_upload("k").await.unwrap();
+    for len in [1, 5] {
+        let body = chunks(&["ab", "c"]);
+        let sending = backend.upload_part_with_len("k", &id, 1, Some(len), body);
+        assert_other(sending.await);
+    }
+    assert_eq!(s3.stats().parts, 0);
+}
+
+/// Asserts that the S3 backend gives its tags without quotes, as the other backends do: the
+/// tag of a head and that of a put with a tag are the MD5 of the bytes, and a put with a tag
+/// takes it with quotes or without; the tag of a completion is the one a head gives the object
+/// afterwards, ends with the number of parts and is not the tag of a put of the same bytes.
+#[tokio::test]
+async fn tags_are_given_without_quotes_and_taken_with_or_without() {
+    let (s3, backend) = backend().await;
+    s3.set_min_part_bytes(0);
+    backend.put("k", body("one")).await.unwrap();
+    let tag = backend.head("k").await.unwrap().tag;
+    assert_eq!((tag.len(), tag.contains('"')), (32, false));
+    let quoted = format!("\"{tag}\"");
+    let swap = backend.put_if_match("k", body("two"), &quoted);
+    let second = swap.await.unwrap();
+    assert_eq!((second.len(), second.contains('"')), (32, false));
+    assert_eq!(backend.head("k").await.unwrap().tag, second);
+    let swap = backend.put_if_match("k", body("three"), &second);
+    let third = swap.await.unwrap();
+    assert_eq!(backend.head("k").await.unwrap().tag, third);
+
+    let id = backend.create_upload("m").await.unwrap();
+    let uploading = backend.upload_part("m", &id, 1, chunks(&["ab"]));
+    let one = uploading.await.unwrap();
+    let uploading = backend.upload_part("m", &id, 2, chunks(&["cd"]));
+    let two = uploading.await.unwrap();
+    let parts = [(1, one), (2, two)];
+    let made = backend.complete_upload("m", &id, &parts).await.unwrap();
+    assert_eq!(backend.head("m").await.unwrap().tag, made);
+    assert!(!made.contains('"'), "{made}");
+    assert!(made.ends_with("-2"), "{made}");
+    backend.put("plain", body("abcd")).await.unwrap();
+    assert_ne!(backend.head("plain").await.unwrap().tag, made);
 }

@@ -11,7 +11,16 @@
 //! worked out when a HEAD asks for it and for a PUT that carries `If-Match` (an object of
 //! many GiB of zeros is held compactly, and hashing it at every PUT would cost what the
 //! compact form saves), so a HEAD of an object that does not fit in memory is not for this
-//! service.
+//! service. The tag of a part depends on its bytes alone ([`part_etag`]; it is not an MD5,
+//! which a part of many MiB of zeros would cost the same), and the tag of an object made of
+//! parts is, as on S3, not the MD5 of its bytes: it is the quoted hex MD5 of the tags of the
+//! parts, a dash and the number of parts. The answer to the completion names it, and so does
+//! a HEAD.
+//!
+//! An upload is known by its id and its key: a part, a completion or an abort that names
+//! the id of an upload with another key finds no upload, as on S3 (`NoSuchUpload`, 404 for a
+//! part or an abort and 400 for a completion). The 5 MiB that every part but the last must
+//! have can be lowered ([`FakeS3::set_min_part_bytes`]) for a test that sends small parts.
 //!
 //! It keeps what a test asks about: the uploads begun and not yet completed or aborted
 //! ([`FakeS3::incomplete_uploads`]), how many single PUTs and parts it took and the
@@ -24,6 +33,8 @@
 //! is refused 403, as a real store refuses a wrong key.
 
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -150,10 +161,16 @@ impl State {
         at.map(|i| self.failures.remove(i)).is_some()
     }
 
-    /// Keeps `kept` under `key`, stamped with the time of the service.
-    fn store(&mut self, key: String, kept: Kept) {
+    /// Keeps `kept` under `key`, stamped with the time of the service, with the entity tag
+    /// `joined` if it is made of parts and the tag of its bytes if not.
+    fn store(&mut self, key: String, kept: Kept, joined: Option<String>) {
         let modified = self.time.unwrap_or_else(system_seconds);
-        self.objects.insert(key, Stored { kept, modified });
+        let stored = Stored {
+            kept,
+            modified,
+            joined,
+        };
+        self.objects.insert(key, stored);
     }
 }
 
@@ -167,6 +184,33 @@ fn system_seconds() -> u64 {
 fn etag_of(kept: &Kept) -> String {
     let digest = Md5::digest(kept.read(0, kept.len));
     format!("\"{}\"", hex::encode(digest))
+}
+
+/// The entity tag this service gives a part: quoted, and a hash of the bytes that is
+/// worked out from the runs they are kept in, so that a run of zeros costs its length and
+/// not its bytes.
+fn part_tag(kept: &Kept) -> String {
+    let mut hasher = DefaultHasher::new();
+    for run in &kept.runs {
+        match run {
+            Ok(bytes) => {
+                1_u8.hash(&mut hasher);
+                bytes.hash(&mut hasher);
+            }
+            Err(zeros) => {
+                0_u8.hash(&mut hasher);
+                zeros.hash(&mut hasher);
+            }
+        }
+    }
+    format!("\"{:016x}\"", hasher.finish())
+}
+
+/// The entity tag this service gives a part of these bytes, quotes included: the same for
+/// the same bytes, and another for other bytes.
+#[must_use]
+pub fn part_etag(bytes: &[u8]) -> String {
+    part_tag(&Kept::of(bytes))
 }
 
 /// `Sun, 06 Nov 1994 08:49:37 GMT`, the form of a `Last-Modified` header.
@@ -198,6 +242,15 @@ struct Upload {
 struct Stored {
     kept: Kept,
     modified: u64,
+    /// The entity tag of an object made of parts; none for an object of one PUT.
+    joined: Option<String>,
+}
+
+impl Stored {
+    /// The entity tag of the object.
+    fn etag(&self) -> String {
+        self.joined.clone().unwrap_or_else(|| etag_of(&self.kept))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -215,6 +268,9 @@ struct State {
     credentials: Option<(String, String)>,
     /// The signing regions of the requests so far.
     regions: std::collections::BTreeSet<String>,
+    /// The least size of a part that is not the last of its upload, when a test set one
+    /// ([`FakeS3::set_min_part_bytes`]); [`super::MIN_PART_BYTES`] otherwise.
+    min_part: Option<u64>,
     /// The next AbortMultipartUpload is to be held ([`FakeS3::hold_next_abort`]).
     hold_abort: bool,
     /// AbortMultipartUpload requests held and not yet dropped.
@@ -302,6 +358,13 @@ impl FakeS3 {
     /// Fails the next request `failure` names, once.
     pub fn fail(&self, failure: Failure) {
         self.lock().failures.push(failure);
+    }
+
+    /// From now on takes a part of at least `bytes` bytes where S3 takes one of 5 MiB or
+    /// more: every part of an upload but the last has to be that large when the upload is
+    /// completed. For a test that sends parts of a few bytes.
+    pub fn set_min_part_bytes(&self, bytes: u64) {
+        self.lock().min_part = Some(bytes);
     }
 
     /// Holds the next AbortMultipartUpload request unanswered and unhandled: the
@@ -511,12 +574,15 @@ fn handle(state: &mut State, request: &Request) -> Vec<u8> {
                 state.take(Failure::Part(number)),
                 state.take(Failure::NoEtag),
             );
-            let upload = state.uploads.get_mut(&id).filter(|_| !failed);
-            let Some(upload) = upload else {
+            if failed {
                 return error("500 Internal Server Error", "InternalError");
+            }
+            let upload = state.uploads.get_mut(&id).filter(|up| up.key == key);
+            let Some(upload) = upload else {
+                return error("404 Not Found", "NoSuchUpload");
             };
-            let etag = format!("\"{id}-{number}-{body_len}\"");
             let kept = Kept::of(&request.body);
+            let etag = part_tag(&kept);
             upload.parts.insert(number, (etag.clone(), kept));
             state.stats.parts += 1;
             let headers = if no_etag {
@@ -528,9 +594,14 @@ fn handle(state: &mut State, request: &Request) -> Vec<u8> {
         }
         ("POST", None, Some(id), None) => complete(state, &id, &key, conditional, &request.body),
         ("DELETE", None, Some(id), None) => {
-            if state.take(Failure::Abort) || state.uploads.remove(&id).is_none() {
+            if state.take(Failure::Abort) {
                 return error("500 Internal Server Error", "InternalError");
             }
+            let known = state.uploads.get(&id).is_some_and(|up| up.key == key);
+            if !known {
+                return error("404 Not Found", "NoSuchUpload");
+            }
+            state.uploads.remove(&id);
             state.stats.aborted += 1;
             answer("204 No Content", &[], b"")
         }
@@ -555,7 +626,7 @@ fn put_object(state: &mut State, key: String, conditional: bool, request: &Reque
         let Some(stored) = state.objects.get(&key) else {
             return error("404 Not Found", "NoSuchKey");
         };
-        if etag_of(&stored.kept) != *expected {
+        if stored.etag() != *expected {
             return error("412 Precondition Failed", "PreconditionFailed");
         }
     }
@@ -567,7 +638,7 @@ fn put_object(state: &mut State, key: String, conditional: bool, request: &Reque
         Some(_) => vec![("etag", etag_of(&kept))],
         None => vec![],
     };
-    state.store(key, kept);
+    state.store(key, kept, None);
     state.stats.single_puts += 1;
     answer("200 OK", &headers, b"")
 }
@@ -656,10 +727,11 @@ fn unescape(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// The object an upload's completion names: its parts, in the order the body lists
-/// them, each with its ETag and every one but the last at least 5 MiB; or the S3 error
-/// code that refuses it.
-fn assemble(upload: &Upload, body: &[u8]) -> Result<Kept, &'static str> {
+/// The object an upload's completion names, and its entity tag: its parts, in the order the
+/// body lists them, each with its ETag and every one but the last at least `min_part` bytes;
+/// or the S3 error code that refuses it. The entity tag is the quoted hex MD5 of the tags
+/// of the parts, a dash and the number of parts.
+fn assemble(upload: &Upload, body: &[u8], min_part: u64) -> Result<(Kept, String), &'static str> {
     let text = String::from_utf8_lossy(body);
     let doc = roxmltree::Document::parse(&text).map_err(|_| "MalformedXML")?;
     let field = |part: roxmltree::Node<'_, '_>, name: &str| {
@@ -676,23 +748,30 @@ fn assemble(upload: &Upload, body: &[u8]) -> Result<Kept, &'static str> {
         })
         .collect();
     let mut object = Kept::default();
+    let mut tags = Md5::new();
     for (i, (number, etag)) in named.iter().enumerate() {
         let kept = number.and_then(|n| upload.parts.get(&n));
         let kept = kept
             .filter(|(e, _)| Some(e) == etag.as_ref())
             .ok_or("InvalidPart")?;
-        let small = i + 1 < named.len() && kept.1.len < super::MIN_PART_BYTES;
+        let small = i + 1 < named.len() && kept.1.len < min_part;
         (!small).then_some(()).ok_or("EntityTooSmall")?;
         object.extend(&kept.1);
+        tags.update(kept.0.as_bytes());
     }
-    Ok(object)
+    let joined = format!("\"{}-{}\"", hex::encode(tags.finalize()), named.len());
+    Ok((object, joined))
 }
 
 /// CompleteMultipartUpload ([`assemble`]); conditional on `If-None-Match: *`.
 fn complete(state: &mut State, id: &str, key: &str, conditional: bool, body: &[u8]) -> Vec<u8> {
+    let min_part = state.min_part.unwrap_or(super::MIN_PART_BYTES);
     let upload = state.uploads.get(id).filter(|u| u.key == key);
-    let object = match upload.ok_or("NoSuchUpload").and_then(|u| assemble(u, body)) {
-        Ok(object) => object,
+    let assembled = upload
+        .ok_or("NoSuchUpload")
+        .and_then(|u| assemble(u, body, min_part));
+    let (object, joined) = match assembled {
+        Ok(assembled) => assembled,
         Err(code) => return error("400 Bad Request", code),
     };
     if state.take(Failure::CompleteLate) {
@@ -706,10 +785,12 @@ fn complete(state: &mut State, id: &str, key: &str, conditional: bool, body: &[u
         return error("412 Precondition Failed", "PreconditionFailed");
     }
     state.uploads.remove(id);
-    state.store(key.to_owned(), object);
+    state.store(key.to_owned(), object, Some(joined.clone()));
     state.stats.completed += 1;
-    let done =
-        "<CompleteMultipartUploadResult><ETag>\"done\"</ETag></CompleteMultipartUploadResult>";
+    let done = format!(
+        "<CompleteMultipartUploadResult><ETag>{joined}</ETag>\
+         </CompleteMultipartUploadResult>"
+    );
     answer("200 OK", &[], done.as_bytes())
 }
 
@@ -719,7 +800,7 @@ fn head(state: &State, key: &str) -> Vec<u8> {
         return answer("404 Not Found", &[], b"");
     };
     let headers = [
-        ("etag", etag_of(&stored.kept)),
+        ("etag", stored.etag()),
         ("last-modified", http_date(stored.modified)),
     ];
     answer_sized("200 OK", stored.kept.len, &headers, b"")
@@ -841,6 +922,27 @@ mod tests {
         assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
         assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
         assert_eq!(iso_date(1_255_369_830), "2009-10-12T17:50:30.000Z");
+    }
+
+    /// Asserts that the tag of a part is quoted and depends on the bytes of the part and
+    /// nothing else: the same for the same bytes, another for other bytes, for zeros of
+    /// another length, and for the same number of zeros with a one in another place.
+    #[test]
+    fn the_tag_of_a_part_depends_on_its_bytes() {
+        let tag = part_etag(b"hello ");
+        assert_eq!(tag, part_etag(b"hello "));
+        assert_ne!(tag, part_etag(b"HELLO "));
+        assert!(tag.starts_with('"'), "{tag}");
+        assert!(tag.ends_with('"'), "{tag}");
+        assert_eq!(tag.trim_matches('"').len(), 16);
+        let zeros = |n: usize| part_etag(&vec![0_u8; n]);
+        assert_eq!(zeros(3 * RUN), zeros(3 * RUN));
+        assert_ne!(zeros(3 * RUN), zeros(3 * RUN + 1));
+        let mut shifted = vec![0_u8; 2 * RUN];
+        shifted[RUN] = 1;
+        let mut other = vec![0_u8; 2 * RUN];
+        other[RUN + 1] = 1;
+        assert_ne!(part_etag(&shifted), part_etag(&other));
     }
 
     /// Asserts that the entity tag is the quoted hex MD5 of the bytes (the tag S3 gives an

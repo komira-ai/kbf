@@ -7,8 +7,11 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use bytes::Bytes;
-use kbf_objstore::s3::{Credentials, S3Config, S3Store};
-use kbf_objstore::{ByteRange, Capabilities, ObjectKey, ObjectStore};
+use futures::StreamExt;
+use futures::stream;
+use kbf_objstore::s3::fake::FakeS3;
+use kbf_objstore::s3::{Credentials, MULTIPART_THRESHOLD, S3Config, S3Store};
+use kbf_objstore::{BodyStream, ByteRange, Capabilities, ObjectKey, ObjectStore, ObjectStoreError};
 use kbf_testkit::reaped::{Reaped, first_line, spawn};
 use reqwest::Client;
 use rustix::process::{Pid, Signal, kill_process};
@@ -166,8 +169,8 @@ fn the_flags_are_parsed_and_refused_as_the_usage_says() {
 }
 
 /// Asserts that a start that cannot go on exits with status 1 and a reason that names the flag:
-/// a key file that others can read, a tier that is neither `memory` nor `dir:<path>`, water marks
-/// out of order, an id that is not an id, and an address that is in use.
+/// a key file that others can read, a tier that names a bucket and says nothing of the store it
+/// is in, water marks out of order, an id that is not an id, and an address that is in use.
 #[test]
 fn a_start_that_cannot_go_on_says_why() {
     let files = Files::new("bin-refused");
@@ -176,6 +179,9 @@ fn a_start_that_cannot_go_on_says_why() {
     assert_eq!((code, out.as_str()), (1, ""));
     assert!(err.starts_with("tierstore: "), "{err}");
     assert!(err.contains("--hot"), "{err}");
+    let (code, _, err) = run(&with(&good, "--cold", "tape"));
+    assert_eq!(code, 1);
+    assert!(err.contains("--cold"), "{err}");
     let (code, _, err) = run(&files.flags(&["--low-water", "90"]));
     assert_eq!(code, 1);
     assert!(err.contains("--low-water"), "{err}");
@@ -192,4 +198,133 @@ fn a_start_that_cannot_go_on_says_why() {
     let (code, _, err) = run(&good);
     assert_eq!(code, 1);
     assert!(err.contains("others can read it"), "{err}");
+}
+
+/// Asserts that the binary serves over two S3 tiers, each a bucket of a store of its own that it
+/// reaches with the key file and the region of its tier: an object put is read back, is in the
+/// hot store and then, copied by the reconciler, in the cold store; a multipart upload lands in
+/// the cold store only, as one object made of the parts, with no upload left open; and the
+/// requests of each tier were signed with the key and the region of that tier (each store
+/// refuses another key); and the `ETag` a head answers is the tag in quotes once, for an
+/// object put whole and for one made of parts, and an `If-Match` with it names the object's
+/// tag (the answer is that objects cannot be replaced) where another tag is a failed
+/// precondition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn it_serves_over_two_s3_tiers_and_lands_a_multipart_upload_in_the_cold_one() {
+    let hot = FakeS3::start().await;
+    let cold = FakeS3::start().await;
+    hot.require_credentials("HOTKEY", "hot-secret");
+    cold.require_credentials("COLDKEY", "cold-secret");
+    let files = Files::new("bin-s3-tiers");
+    let hot_key = files.secret("hot-key", "HOTKEY\nhot-secret\n");
+    let cold_key = files.secret("cold-key", "COLDKEY\ncold-secret\n");
+    let hot_key = hot_key.display().to_string();
+    let cold_key = cold_key.display().to_string();
+    let base = files.flags(&[
+        "--drain-lb-wait",
+        "50ms",
+        "--reconcile-interval",
+        "100ms",
+        "--lease-ttl",
+        "1s",
+        "--hot-endpoint",
+        hot.endpoint(),
+        "--hot-credentials-file",
+        hot_key.as_str(),
+        "--cold-endpoint",
+        cold.endpoint(),
+        "--cold-region",
+        "eu-west-1",
+        "--cold-credentials-file",
+        cold_key.as_str(),
+    ]);
+    let flags = with(&base, "--hot", "s3:hot-bucket");
+    let flags = with(&flags, "--cold", "s3:cold-bucket");
+    let mut running = start(&flags);
+    let store = running.store();
+
+    let small = ObjectKey::new("cas/small").unwrap();
+    let text = Bytes::from_static(b"small object");
+    store.put_new(&small, text, None).await.unwrap();
+    let all = ByteRange::new(0, 12).unwrap();
+    let got = store.get_range(&small, all).await.unwrap();
+    assert_eq!(got, "small object");
+    let name = "cas/small".to_owned();
+    assert!(hot.keys().contains(&name));
+    for _ in 0..500 {
+        if cold.keys().contains(&name) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(cold.keys().contains(&name), "not copied");
+
+    let big = ObjectKey::new("cas/big").unwrap();
+    let len = MULTIPART_THRESHOLD + 1;
+    let bytes = Bytes::from(vec![9_u8; usize::try_from(len).unwrap()]);
+    let body: BodyStream = stream::iter(vec![Ok(bytes)]).boxed();
+    store.put_stream(&big, len, body).await.unwrap();
+    assert_eq!(cold.object_len(&big), Some(len));
+    assert!(!hot.keys().contains(&"cas/big".to_owned()));
+    let completed = (cold.stats().completed, hot.stats().completed);
+    assert_eq!(completed, (1, 0));
+    assert_eq!(cold.incomplete_uploads(), 0);
+    assert_eq!(store.head(&big).await.unwrap().size, len);
+    let head = store.head(&big).await.unwrap();
+    let inner = head.etag.trim_matches('"');
+    assert_eq!(head.etag, format!("\"{inner}\""));
+    let head = store.head(&small).await.unwrap();
+    let inner = head.etag.trim_matches('"');
+    assert_eq!(head.etag, format!("\"{inner}\""));
+    let swap = store.put_if_match(&small, Bytes::new(), &head.etag);
+    let same = swap.await.unwrap_err();
+    assert!(
+        matches!(same, ObjectStoreError::Service { status: 501, .. }),
+        "{same:?}"
+    );
+    let swap = store.put_if_match(&small, Bytes::new(), "\"stale\"");
+    let stale = swap.await.unwrap_err();
+    assert!(
+        matches!(stale, ObjectStoreError::Service { status: 412, .. }),
+        "{stale:?}"
+    );
+    assert_eq!(hot.regions(), ["us-east-1"]);
+    assert_eq!(cold.regions(), ["eu-west-1"]);
+
+    running.signal(Signal::TERM);
+    assert_eq!(running.exit_code().await, Some(0));
+}
+
+/// Asserts that a start with a tier that its flags do not describe exits with status 1 and a
+/// reason that names the flag: an S3 tier with no endpoint, one whose credentials file is not
+/// there, one whose bucket name is not a bucket name, and the flags of an S3 tier given for a
+/// tier that is not one.
+#[test]
+fn an_s3_tier_that_its_flags_do_not_describe_is_a_start_that_says_why() {
+    let files = Files::new("bin-s3-refused");
+    let secret = files.secret("hot-key", "ID\nsecret\n");
+    let key = secret.display().to_string();
+    let no_endpoint = files.flags(&["--hot-credentials-file", key.as_str()]);
+    let s3 = with(&no_endpoint, "--hot", "s3:hot-bucket");
+    let (code, out, err) = run(&s3);
+    assert_eq!((code, out.as_str()), (1, ""));
+    assert!(err.starts_with("tierstore: "), "{err}");
+    assert!(err.contains("--hot-endpoint"), "{err}");
+
+    let described = files.flags(&[
+        "--hot-credentials-file",
+        key.as_str(),
+        "--hot-endpoint",
+        "http://127.0.0.1:1",
+    ]);
+    let flags = with(&described, "--hot", "s3:hot-bucket");
+    let (code, _, err) = run(&with(&flags, "--hot-credentials-file", "/no/such/file"));
+    assert_eq!(code, 1);
+    assert!(err.contains("--hot-credentials-file"), "{err}");
+    let (code, _, err) = run(&with(&flags, "--hot", "s3:Not_A_Bucket"));
+    assert_eq!(code, 1);
+    assert!(err.contains("bucket name"), "{err}");
+    let (code, _, err) = run(&with(&flags, "--hot", "memory"));
+    assert_eq!(code, 1);
+    assert!(err.contains("s3:<bucket>"), "{err}");
 }

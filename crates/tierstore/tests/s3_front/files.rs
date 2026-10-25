@@ -27,6 +27,14 @@ impl Files {
         Self { _dir: dir, key }
     }
 
+    /// A file called `name` next to the key file, that only its owner can read, with this text.
+    pub fn secret(&self, name: &str, text: &str) -> PathBuf {
+        let path = self.key.with_file_name(name);
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
     /// The flags a start needs, then `extra` (flags it does not have already).
     pub fn flags(&self, extra: &[&str]) -> Vec<String> {
         let key = self.key.display().to_string();

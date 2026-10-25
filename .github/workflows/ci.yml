@@ -76,9 +76,12 @@ jobs:
         if: ${{ !cancelled() }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
         if: ${{ !cancelled() }}
-      # The object store library with its `s3` feature (the adapter over the S3 client of
-      # kbf-objstore), which is off in the workspace run above: no crate turns it on yet.
-      - run: cargo clippy -p tierstore --features s3 --all-targets --locked -- -D warnings
+      # The object store library with its `s3` feature alone (the adapter over the S3 client of
+      # kbf-objstore). The workspace run above has the feature on as well, since the crate's own
+      # tests turn `server` on and `server` enables `s3`; the library alone is built here, since
+      # its tests would turn `server` on in this build too, so the code that is compiled only
+      # without `server` is linted.
+      - run: cargo clippy -p tierstore --features s3 --lib --locked -- -D warnings
         if: ${{ !cancelled() }}
       # The setup library without its `proxy` feature, as the `kbf` binary links it. The workspace
       # run above has the feature on (the installer is in the workspace), so the code that is
@@ -210,8 +213,9 @@ jobs:
       # it looks like LLVM issue 220574). Lines and branches, all the gate reads, are
       # unaffected: their totals match llvm-cov's own text report.
       - run: mkdir -p target/coverage
-      # `--features tierstore/s3` puts the object store library's S3 backend (off by default; no
-      # crate turns it on yet) into the run, so its tests count toward the 99% of tierstore.
+      # `--features tierstore/s3` puts the object store library's S3 backend (off by default; the
+      # crate's own tests turn it on through `server`) into the run whichever way they are built,
+      # so its tests count toward the 99% of tierstore.
       - name: Run the fast tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions

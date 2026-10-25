@@ -5,17 +5,40 @@
 //! SigV4, a timeout on every request), and each answer is read into this crate's [`Error`].
 //!
 //! - `put` is a PUT with `If-None-Match: *`; the 412 is [`Error::AlreadyExists`].
-//! - `put_if_match` is a PUT with `If-Match: <tag>`, the tag as given; the 412 is
-//!   [`Error::PreconditionFailed`] and a 404 is [`Error::NotFound`]. It gives the `ETag` of
-//!   the answer.
+//! - `put_if_match` is a PUT with `If-Match: "<tag>"` (a tag given in quotes is not quoted
+//!   twice); the 412 is [`Error::PreconditionFailed`] and a 404 is [`Error::NotFound`]. It
+//!   gives the `ETag` of the answer, without its quotes.
 //! - `get` is a GET, with `Range: bytes=<first>-<last>` for a range.
-//! - `head` is a HEAD: `Content-Length`, `ETag` (the content tag, quotes included) and
-//!   `Last-Modified`.
+//! - `head` is a HEAD: `Content-Length`, `ETag` (the content tag, without its quotes, as the
+//!   other backends give it and the S3 front, which quotes it, expects) and `Last-Modified`.
 //! - `delete` is a DELETE; a 404 is a success.
 //! - `list` and `list_page` are ListObjectsV2 with `prefix`, a `max-keys` of at most 1000,
 //!   `start-after` on the first request and the `continuation-token` of each answer on the
 //!   next. A page that repeats the token it was sent ends the listing with an
 //!   [`Error::Other`].
+//! - `create_upload` is CreateMultipartUpload and gives the upload id of the store.
+//! - `upload_part_with_len` is UploadPart whose body is the chunks of the part as they
+//!   arrive, never collected: the request carries the length as its `Content-Length`, is
+//!   signed with `UNSIGNED-PAYLOAD`, and ends with the body, so a part of any size is held a
+//!   few chunks at a time. A body that gives an error, also after its last byte, or more or
+//!   fewer bytes than the length, stores nothing and gives that error ([`Error::Other`] for
+//!   the length). `upload_part`, for a caller that does not know the length, holds the whole
+//!   part first, since S3 takes no part of unknown length. The tag of a part is the `ETag` of
+//!   the answer without its quotes, which is how the S3 front names a part to its client and
+//!   how a completion names it again. The signature of a part carries no hash of its bytes, so
+//!   the store has none to check them against; the connection is plain HTTP (the client
+//!   refuses TLS), so a part is as safe on its way as the network between the proxy and the
+//!   store.
+//! - `complete_upload` is CompleteMultipartUpload with `If-None-Match: *`, so a key that
+//!   exists is [`Error::AlreadyExists`] and the upload stays open. It gives the `ETag` the
+//!   answer names for the object (without its quotes), which is what `head` gives it too, and
+//!   needs no second request, which could fail after the object was made. On S3 the tag
+//!   of an object made of parts is not the MD5 of its bytes, so it is not the tag of a `put`
+//!   of the same bytes, unlike in the in-memory and the directory backend.
+//! - `abort_upload` is AbortMultipartUpload.
+//! - An upload the store does not hold (`NoSuchUpload`) is [`Error::NotFound`] with the upload
+//!   id, and a completion the store refuses for its parts (`InvalidPart`, `InvalidPartOrder`,
+//!   `EntityTooSmall`) is [`Error::InvalidPart`]. S3 takes no part under 5 MiB but the last.
 //!
 //! Notes on the mapping:
 //!
@@ -29,7 +52,7 @@
 //! - A listing of more than 1000 objects is several requests: `list_page` follows the
 //!   continuation tokens until it has `max_keys` objects or the listing ends, since a page
 //!   shorter than `max_keys` means the last.
-//! - The content tag is the `ETag`. S3 makes it the MD5 of the bytes of an object written by
+//! - The content tag is the `ETag`, without its quotes. S3 makes it the MD5 of the bytes of an object written by
 //!   one PUT, which is what every write of this backend is, so equal bytes have equal tags
 //!   in two buckets of one kind of store. A store that encrypts with keys of its own makes
 //!   the tag from something else: compare tags only between backends of one store.
@@ -45,14 +68,22 @@
 //!   drive) is [`Error::Full`]. Anything else that is not a success is [`Error::Other`].
 //!
 //! Each request is bounded by the `request_timeout` of the [`S3Config`], and a read is sent
-//! again after a failure in transport; a write never is.
+//! again after a failure in transport; a write never is. A part is the exception to the bound:
+//! it is as slow as the client that sends it, so only a part that makes no progress for the
+//! `request_timeout` is cut, as an [`Error::Unavailable`].
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
+use futures::future;
+use futures::stream;
 use kbf_objstore::s3::{S3Store, StampedObject};
-use kbf_objstore::{KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError, PageSize};
+use kbf_objstore::{
+    BodyStream, KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError, PageSize,
+};
+use tokio::sync::mpsc;
 
-use crate::{Backend, ByteRange, Error, Listed, Meta};
+use crate::{Backend, ByteRange, Error, Listed, Meta, PartBody};
 
 pub use kbf_objstore::Capabilities;
 pub use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError};
@@ -60,6 +91,12 @@ pub use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError};
 /// The greatest byte position a `Range` names. A store reads the positions as signed 64-bit
 /// numbers and refuses or ignores a larger one, so a range is cut here before it is sent.
 const LAST_POSITION: u64 = u64::MAX >> 1;
+
+/// How many chunks of a part wait for the request that sends them to take them.
+const CHUNKS_WAITING: usize = 1;
+
+/// The codes with which a store refuses a completion for the parts it names.
+const INVALID_PART_CODES: [&str; 3] = ["InvalidPart", "InvalidPartOrder", "EntityTooSmall"];
 
 /// One bucket of an S3-compatible store, as a [`Backend`].
 #[derive(Debug)]
@@ -188,6 +225,77 @@ fn by_status(status: u16, key: String, message: String) -> Error {
     }
 }
 
+/// What a failed call on the upload `id` of `key` means: an upload the store does not hold is
+/// [`Error::NotFound`] with the id, a completion it refuses for its parts is
+/// [`Error::InvalidPart`], and anything else is what it is for any call on `key`.
+fn upload_error(error: ObjectStoreError, key: &str, id: &str) -> Error {
+    let code = service_code(&error);
+    if code == "NoSuchUpload" {
+        return Error::NotFound(id.to_owned());
+    }
+    if INVALID_PART_CODES.contains(&code) {
+        return Error::InvalidPart(error.to_string());
+    }
+    map_error(error, key)
+}
+
+/// The S3 code of an answer of the store that refused, or the empty text for any other error.
+fn service_code(error: &ObjectStoreError) -> &str {
+    match error {
+        ObjectStoreError::Service { code, .. } => code.as_str(),
+        _ => "",
+    }
+}
+
+/// The tag of an object or of a part as the other backends give it and the front names it:
+/// the `ETag` without its quotes.
+fn unquoted(etag: &str) -> String {
+    etag.trim_matches('"').to_owned()
+}
+
+/// A content tag as an entity tag is sent to the store in `If-Match`: in quotes, once.
+fn quoted(tag: &str) -> String {
+    format!("\"{}\"", tag.trim_matches('"'))
+}
+
+/// The bytes of `body`, collected, for a part of a length that is not known.
+async fn collect(mut body: PartBody<'_>) -> Result<Bytes, Error> {
+    let mut whole = BytesMut::new();
+    while let Some(chunk) = body.next().await {
+        whole.extend_from_slice(&chunk?);
+    }
+    Ok(whole.freeze())
+}
+
+/// A part that is held whole, as a length and a body of one chunk.
+fn held(whole: Bytes) -> (u64, PartBody<'static>) {
+    let len = whole.len() as u64;
+    (len, stream::once(future::ready(Ok(whole))).boxed())
+}
+
+/// Sends the chunks of `body` to `sink`, to be the body of the request that sends them to the
+/// store, and gives the error that ended `body`, if one did. It stops when the request is over
+/// and takes no more.
+async fn feed(
+    mut body: PartBody<'_>,
+    sink: mpsc::Sender<Result<Bytes, ObjectStoreError>>,
+) -> Option<Error> {
+    while let Some(chunk) = body.next().await {
+        let sent = match chunk {
+            Ok(bytes) => sink.send(Ok(bytes)).await,
+            Err(error) => {
+                let ended = ObjectStoreError::Body(error.to_string());
+                let _ = sink.send(Err(ended)).await;
+                return Some(error);
+            }
+        };
+        if sent.is_err() {
+            return None;
+        }
+    }
+    None
+}
+
 #[async_trait]
 impl Backend for S3Backend {
     async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
@@ -198,8 +306,10 @@ impl Backend for S3Backend {
 
     async fn put_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<String, Error> {
         let object = object_key(key)?;
-        let put = self.store.put_if_match(&object, body, etag);
-        put.await.map_err(|e| map_error(e, key))
+        let etag = quoted(etag);
+        let put = self.store.put_if_match(&object, body, &etag);
+        let tag = put.await.map_err(|e| map_error(e, key))?;
+        Ok(unquoted(&tag))
     }
 
     async fn get(&self, key: &str, range: Option<ByteRange>) -> Result<Bytes, Error> {
@@ -217,7 +327,7 @@ impl Backend for S3Backend {
         let head = head.await.map_err(|e| map_error(e, key))?;
         Ok(Meta {
             size: head.size,
-            tag: head.etag,
+            tag: unquoted(&head.etag),
             modified: head.modified_millis,
         })
     }
@@ -239,6 +349,70 @@ impl Backend for S3Backend {
         max_keys: usize,
     ) -> Result<Vec<Listed>, Error> {
         self.listed(prefix, start_after, max_keys).await
+    }
+
+    async fn create_upload(&self, key: &str) -> Result<String, Error> {
+        let object = object_key(key)?;
+        let create = self.store.create_multipart(&object);
+        create.await.map_err(|e| map_error(e, key))
+    }
+
+    async fn upload_part(
+        &self,
+        key: &str,
+        id: &str,
+        number: u32,
+        body: PartBody<'_>,
+    ) -> Result<String, Error> {
+        let sized = self.upload_part_with_len(key, id, number, None, body);
+        sized.await
+    }
+
+    async fn upload_part_with_len(
+        &self,
+        key: &str,
+        id: &str,
+        number: u32,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<String, Error> {
+        let object = object_key(key)?;
+        let (len, body) = match len {
+            Some(len) => (len, body),
+            None => held(collect(body).await?),
+        };
+        let (sink, mut chunks) = mpsc::channel(CHUNKS_WAITING);
+        let source: BodyStream = stream::poll_fn(move |cx| chunks.poll_recv(cx)).boxed();
+        let store = &self.store;
+        let sending = store.upload_part_stream(&object, id, number, len, source);
+        let (ended, sent) = futures::join!(feed(body, sink), sending);
+        if let Some(error) = ended {
+            return Err(error);
+        }
+        let etag = sent.map_err(|e| upload_error(e, key, id))?;
+        Ok(unquoted(&etag))
+    }
+
+    async fn complete_upload(
+        &self,
+        key: &str,
+        id: &str,
+        parts: &[(u32, String)],
+    ) -> Result<String, Error> {
+        let object = object_key(key)?;
+        let named: Vec<(u32, String)> = parts
+            .iter()
+            .map(|(number, tag)| (*number, quoted(tag)))
+            .collect();
+        let complete = self.store.complete_multipart(&object, id, &named);
+        let etag = complete.await.map_err(|e| upload_error(e, key, id))?;
+        Ok(unquoted(&etag))
+    }
+
+    async fn abort_upload(&self, key: &str, id: &str) -> Result<(), Error> {
+        let object = object_key(key)?;
+        let abort = self.store.abort_multipart(&object, id);
+        abort.await.map_err(|e| upload_error(e, key, id))
     }
 }
 

@@ -17,11 +17,14 @@ publish.workspace = true
 # `S3Backend`, a `Backend` over the S3 client of `kbf-objstore`. Off by default: without it the
 # crate's own dependencies include no kbf crate (crates/kbf-integration-test/tests/layering.rs
 # checks the normal dependencies without it; the tests always build `kbf-objstore`, see
-# `[dev-dependencies]`). CI runs the tests and clippy with it on (.github/workflows/ci.yml).
+# `[dev-dependencies]`). `server` turns it on. CI runs the tests and clippy with it on
+# (.github/workflows/ci.yml).
 s3 = ["dep:kbf-objstore"]
 # `server`: the S3 API front of the proxy (the `server` module) and the `tierstore` binary that
 # runs it. Off by default, so the library carries no HTTP stack; the crate's own tests turn it on
-# through the dev-dependency on itself, so the workspace runs build and test it.
+# through the dev-dependency on itself, so the workspace runs build and test it. It turns `s3`
+# on, since the binary's tiers may be S3 buckets; that is why the dependencies of the crate
+# without features, and not those of the whole workspace, are what layering.rs checks.
 server = [
     "dep:base64",
     "dep:clap",
@@ -35,6 +38,7 @@ server = [
     "dep:percent-encoding",
     "dep:ring",
     "dep:roxmltree",
+    "s3",
     "tokio/macros",
     "tokio/net",
     "tokio/rt-multi-thread",
