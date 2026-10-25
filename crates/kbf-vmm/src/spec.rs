@@ -84,6 +84,16 @@ pub enum Event {
     /// The VM stopped: the guest shut down after a shutdown request, or the parent closed
     /// the helper's stdin and the VM was force-stopped.
     Stopped { ms: u64 },
+    /// The helper sent the guest the `shutdown` command over vsock (`guest_command`) and
+    /// this is how it went. `acked`: the guest's daemon answered `ack`, so the guest is
+    /// shutting itself down and the helper waits for it; otherwise `detail` says why not
+    /// and the helper has fallen back to the framework's stop request (the guest's
+    /// power-button request).
+    ShutdownCommand {
+        acked: bool,
+        detail: String,
+        ms: u64,
+    },
     /// A call failed. `code` is the Virtualization.framework error code name when there is
     /// one (`VirtualMachineLimitExceeded`).
     Error {
@@ -109,8 +119,10 @@ impl Event {
     }
 }
 
-/// The line the parent writes to the helper's stdin to ask the guest to shut down (the
-/// helper then waits for the guest to stop). Closing the stdin instead force-stops the VM.
+/// The line the parent writes to the helper's stdin to ask the guest to shut down. The
+/// helper sends the guest the `shutdown` command over vsock first and falls back to the
+/// framework's stop request when no ack comes; it then waits for the guest to stop.
+/// Closing the stdin instead force-stops the VM.
 pub const SHUTDOWN_COMMAND: &str = "shutdown";
 
 /// The error code name the helper uses when a start is refused for the two-guest limit.
@@ -137,6 +149,11 @@ mod tests {
                 text: "hi\n".into(),
             },
             Event::Stopped { ms: 4 },
+            Event::ShutdownCommand {
+                acked: false,
+                detail: "connect: refused".into(),
+                ms: 5,
+            },
             Event::Error {
                 stage: "start".into(),
                 message: "m".into(),

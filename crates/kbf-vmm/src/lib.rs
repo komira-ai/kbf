@@ -12,6 +12,7 @@ pub mod cli;
 pub mod e1;
 pub mod gates;
 pub mod guest;
+pub mod guest_command;
 pub mod harvest;
 pub mod hostfs;
 pub mod image;

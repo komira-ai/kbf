@@ -249,7 +249,7 @@ impl Results {
                 spent.total += len;
                 Ok(target)
             }
-            Kind::Ack | Kind::Refused => {
+            Kind::Shutdown | Kind::Ack | Kind::Refused => {
                 Err("a guest sends ready, result and log frames".to_owned())
             }
         }
@@ -621,7 +621,7 @@ mod tests {
                 assert!(r.store(&Frame::new(kind, name, "x")).is_err(), "{name}");
             }
         }
-        for kind in [Kind::Ack, Kind::Refused] {
+        for kind in [Kind::Shutdown, Kind::Ack, Kind::Refused] {
             let e = r.store(&Frame::new(kind, "ok", "x")).expect_err("kind");
             assert!(e.contains("ready, result and log"), "{e}");
         }
