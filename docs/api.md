@@ -651,12 +651,15 @@ over a state store (`kbf frontend` requires one):
    retries only the opening of an Execute call, not a stream that breaks after it, so an
    ended stream fails that Buck2 action: the frontend ends none before the deadline except
    one whose operation can never start. That is an operation that has never been started
-   and that no live worker can run (`WAITING`: there is no worker that could run it, or at
-   least one that could is cordoned by an operator, or not serving; the stream says so in
-   its metadata): its stream ends `UNAVAILABLE` at once, when step 3 begins, naming why. The
+   and that no live worker can run: no worker on this frontend, and no other frontend to
+   take it (`WAITING`: there is no worker that could run it, or at least one that could is
+   cordoned by an operator, or not serving, and no daemon connected to another frontend
+   of the state store could run it; the stream says so in its metadata). Its stream ends
+   `UNAVAILABLE` at the end of the load balancer wait, when step 3 begins, naming why. The
    action would fail at the deadline anyway, so this costs nothing and frees the stop. An
    operation that is only queued (a worker can take it), and one that waits only for the
-   nodes this drain cordoned in step 3 (the other frontends take it), keep their streams,
+   nodes this drain cordoned in step 3, and one that a daemon of another frontend could
+   run (the other frontends take it), keep their streams,
    as does any operation that ever had a lease, even one queued again after a lost lease:
    they stay until the operation is done or the deadline. Ending a stream does not cancel
    the operation: it stays queued for the other frontends. An execution running on a node
@@ -679,7 +682,8 @@ SIGTERM or SIGINT skips the waits of steps 2 and 4 and goes on to step 5, and
 same when it runs out. A server with no state store (`kbf-server`; a frontend started by a
 test) drains at once instead: `/readyz` `503`, new Execute calls refused, the REAPI
 listener sent GOAWAY, the open streams kept until their action is done except the
-streams of operations that can never start, which end `UNAVAILABLE` at once (as in step 4),
+streams of operations that can never start (there is no other frontend), which end
+`UNAVAILABLE` when the drain begins (as in step 4),
 and the server exits when the REAPI connections have closed, bounded by
 `--shutdown-timeout-secs` (it has no `--drain-deadline`).
 
@@ -1324,7 +1328,7 @@ otherwise; the body lists each failing check and why:
 
 | Check | Fails when |
 |---|---|
-| `stopping` | the server has received SIGTERM or SIGINT, or `POST /v1/frontend/drain` has begun a drain, or `POST /v1/frontend/retire` has retired the frontend. It answers `503` from that moment, and for the rest of the drain; open Execute streams are kept until their action is done, and only the drain deadline (`--drain-deadline`, on a frontend over a state store), the shutdown timeout (`--shutdown-timeout-secs`) or a second signal ends them; the one exception is a stream whose operation was never started and that no worker can run, which ends `UNAVAILABLE` at once |
+| `stopping` | the server has received SIGTERM or SIGINT, or `POST /v1/frontend/drain` has begun a drain, or `POST /v1/frontend/retire` has retired the frontend. It answers `503` from that moment, and for the rest of the drain; open Execute streams are kept until their action is done, and only the drain deadline (`--drain-deadline`, on a frontend over a state store), the shutdown timeout (`--shutdown-timeout-secs`) or a second signal ends them; the one exception is a stream whose operation was never started, that no worker on this frontend can run and that no other frontend can take, which ends `UNAVAILABLE` when the drain begins |
 | `leader` | the server does not hold the scheduler role. A single server runs every role and always holds it; the check is there for a replicated control log, whose followers fail it. **Planned**: a second readiness path, without this check, for the servers that may serve reads ([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)) |
 | `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000; it bounds the gRPC health service's probe too), or answers with an error. The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
 

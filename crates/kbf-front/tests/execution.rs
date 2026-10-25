@@ -464,7 +464,7 @@ async fn a_drain_keeps_open_streams_and_refuses_new_executes() {
 /// only an operation that has never been started and that no worker can run
 /// (`Stage::Waiting`) is ended early. Operation 0 is plainly queued (a worker may take
 /// it), 1 is waiting with no worker and never started, 2 is running, 3 waits for a worker
-/// but had a lease once (`WaitingAfterStart`). After `drain`, only stream 1 (and a second
+/// but had a lease once (`WaitingKept`). After `drain`, only stream 1 (and a second
 /// stream on it, and a WaitExecution opened later on it, after its first operation) ends
 /// UNAVAILABLE, naming its operation; streams 0, 2 and 3 stay silent, and each ends
 /// with its done operation when the operation is done.
@@ -502,7 +502,7 @@ async fn a_drain_ends_only_the_streams_of_operations_that_can_never_start() {
     for (n, to) in [
         (1, Stage::Waiting("no worker".to_owned())),
         (2, Stage::Executing),
-        (3, Stage::WaitingAfterStart("no worker".to_owned())),
+        (3, Stage::WaitingKept("no worker".to_owned())),
     ] {
         script.set(n, to);
         next(&mut streams[n])

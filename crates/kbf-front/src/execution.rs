@@ -40,12 +40,14 @@
 //! retry (kbf#791).
 //!
 //! The one early end: a stream whose operation has never been started and cannot start
-//! (stage [`Stage::Waiting`]: no live worker can run it, for example every capable worker
-//! is cordoned) ends UNAVAILABLE at once. That action would fail at the drain deadline
-//! anyway, so ending it costs nothing and lets the stop finish. A `Queued` operation a
-//! worker can take, and any operation that ever had a lease (running, or queued again
-//! after a lost one: [`Stage::WaitingAfterStart`]), keep their streams. The operation is
-//! not cancelled by the stream ending.
+//! (stage [`Stage::Waiting`]: no worker on this frontend can run it, for example every
+//! capable worker is cordoned, and no other frontend of the state store has one that
+//! could take it) ends UNAVAILABLE when the drain begins, which is the end of the load
+//! balancer wait. That action would fail at the drain deadline anyway, so ending it costs
+//! nothing and lets the stop finish. A `Queued` operation a worker can take, an operation
+//! another frontend could take, and any operation that ever had a lease (running, or
+//! queued again after a lost one: [`Stage::WaitingKept`]), keep their streams. The
+//! operation is not cancelled by the stream ending.
 //!
 //! **Progress** ([`progress`]): every open stream is sent its operation again, same
 //! name, `done` false, its current stage, once per progress interval, so a load
@@ -192,13 +194,14 @@ pub struct Submission {
 pub enum Stage {
     /// Waiting for room.
     Queued,
-    /// Queued, never started, and no live worker can run it now: why. A drain ends the
-    /// streams of an operation in this stage, since it can never start on this frontend.
+    /// Queued, never started, and no live worker of this frontend can run it now: why. A
+    /// drain ends the streams of an operation in this stage, since it can never start: no
+    /// other frontend of the state store has a worker that could take it either.
     Waiting(String),
-    /// As [`Stage::Waiting`], but a lease for the operation did start once (and was lost,
-    /// so it was queued again). A drain keeps its streams, as it does for any operation
-    /// that has run.
-    WaitingAfterStart(String),
+    /// As [`Stage::Waiting`], but a drain keeps its streams: a lease for the operation did
+    /// start once (and was lost, so it was queued again), or another frontend of the
+    /// state store has a worker that could run it and takes it once this one stands down.
+    WaitingKept(String),
     /// A lease for it has started on a worker.
     Executing,
     /// Finished.
@@ -1188,7 +1191,7 @@ pub(crate) fn operation(name: &str, action: &Digest, stage: &Stage, cached: bool
     let mut partial = None;
     let (value, result) = match stage {
         Stage::Queued => (execution_stage::Value::Queued, None),
-        Stage::Waiting(why) | Stage::WaitingAfterStart(why) => {
+        Stage::Waiting(why) | Stage::WaitingKept(why) => {
             let info = ErrorInfo {
                 reason: NO_WORKER_REASON.to_owned(),
                 domain: ERROR_DOMAIN.to_owned(),
@@ -1248,10 +1251,10 @@ pub(crate) fn operation(name: &str, action: &Digest, stage: &Stage, cached: bool
 }
 
 /// Completes once the server is draining and the operation is [`Stage::Waiting`]: it has
-/// never been started and no live worker can run it, so it could only fail at the drain
-/// deadline, and ending it at once frees the stop. The call fails (Buck2 does not recover
+/// never been started and can never start, so it could only fail at the drain deadline,
+/// and ending it when the drain begins frees the stop. The call fails (Buck2 does not recover
 /// an ended stream), as it would at the deadline. Never for a plain `Queued` operation
-/// (a worker may take it), nor for one that ever had a lease ([`Stage::WaitingAfterStart`]).
+/// (a worker may take it), nor for one that ever had a lease ([`Stage::WaitingKept`]).
 async fn unstartable_while_draining(mut closing: Closing, mut stage: watch::Receiver<Stage>) {
     closing.drained().await;
     let queued = stage
@@ -1316,7 +1319,7 @@ fn operations(
             open.update(
                 matches!(
                     now,
-                    Stage::Queued | Stage::Waiting(_) | Stage::WaitingAfterStart(_)
+                    Stage::Queued | Stage::Waiting(_) | Stage::WaitingKept(_)
                 ),
                 done,
             );

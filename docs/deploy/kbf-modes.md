@@ -340,9 +340,9 @@ a stop that cuts a stream fails its action. On the first signal, or on
 `UNAVAILABLE` (which Buck2 retries), takes no more work from the state store, and sends
 GOAWAY on the REAPI, worker and operator API listeners; it keeps every open Execute and
 WaitExecution stream until its action is done, at most `--drain-deadline`, except a stream
-whose operation was never started and that no worker can run, which ends `UNAVAILABLE` at
-once (the action would fail at the deadline anyway; the operation stays queued for the
-other frontends); then it ends the
+whose operation was never started, that no worker on this frontend can run and that no
+other frontend can take, which ends `UNAVAILABLE` at the end of the load balancer wait (the
+action would fail at the deadline anyway); then it ends the
 worker streams and the streams left `UNAVAILABLE` and exits 0. `GET /v1/frontend/drain`
 reports the phase. A second signal skips the waits, and `--shutdown-timeout-secs` running
 out does the same. A frontend with no state store (a test setup) drains at once: `/readyz`

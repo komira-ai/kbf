@@ -32,6 +32,8 @@ fn timing(lb_wait: u64, deadline: u64) -> DrainTiming {
 /// A serving frontend's parts, as the drain stands them down: a farm over a state store, a
 /// drain with the listeners' stops, and the sequence over them.
 struct Rig {
+    /// The state store this frontend shares with [`other_frontend`]s.
+    shared: Arc<Fake>,
     backend: Backend,
     farm: Arc<Farm>,
     drain: Arc<Drain>,
@@ -54,6 +56,7 @@ impl Rig {
         let value = 7_u64.to_be_bytes().to_vec();
         let generation = Txn::new().put(kbf_state::GENERATION, value, Cond::Any);
         store.txn(generation).expect("store").expect("put");
+        let shared = Arc::new(store);
         let backend = Backend::from(Arc::new(Cache::memory()));
         let farm = Farm::new(
             backend.clone(),
@@ -61,7 +64,7 @@ impl Rig {
             kbf_sched::FINISHED_RETENTION,
         )
         .with_state(Some(StateStore {
-            store: Arc::new(store),
+            store: Arc::clone(&shared) as Arc<dyn Store>,
             epoch: EpochPolicy::Keep,
             members: Default::default(),
             history: None,
@@ -83,6 +86,7 @@ impl Rig {
         };
         let sequence = Sequence::new(stand.clone(), api.clone(), timing);
         Self {
+            shared,
             backend,
             farm,
             drain,
@@ -664,7 +668,7 @@ async fn the_endpoints_drain_keeps_the_stream_of_a_queued_operation_a_worker_can
 }
 
 /// Asserts that an operation that had a lease, lost it to a silent node and now waits
-/// behind a cordoned worker keeps its stream: it reads `WaitingAfterStart`, not `Waiting`,
+/// behind a cordoned worker keeps its stream: it reads `WaitingKept`, not `Waiting`,
 /// and the stream lasts until the deadline, as that of any operation that has run.
 async fn a_requeued_operation_keeps_its_stream(how: Begin) {
     let rig = Rig::new(timing(0, 30));
@@ -679,10 +683,7 @@ async fn a_requeued_operation_keeps_its_stream(how: Begin) {
     pass(Duration::from_secs(70)).await;
     rig.farm.tick().await;
     assert!(
-        matches!(
-            *ticket.stage.borrow(),
-            kbf_front::Stage::WaitingAfterStart(_)
-        ),
+        matches!(*ticket.stage.borrow(), kbf_front::Stage::WaitingKept(_)),
         "{how:?}: {:?}",
         *ticket.stage.borrow()
     );
@@ -839,4 +840,128 @@ async fn an_operator_cordoned_only_worker_ends_the_stream_at_the_lb_wait() {
 async fn an_operator_cordoned_worker_beside_a_drain_held_one_ends_the_stream_at_the_lb_wait() {
     operator_cordoned_workers_end_the_stream_at_the_lb_wait(Begin::Signal, true).await;
     operator_cordoned_workers_end_the_stream_at_the_lb_wait(Begin::Endpoint, true).await;
+}
+
+/// A second frontend over the rig's state store with a node of its own, `node-x`, whose
+/// session row the first frontend finds at its intake poll. Returned with the node's
+/// stream, which is kept open.
+fn other_frontend(rig: &Rig) -> (Farm, Inbox) {
+    let farm = Farm::new(
+        Backend::from(Arc::new(Cache::memory())),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    )
+    .with_state(Some(StateStore {
+        store: Arc::clone(&rig.shared) as Arc<dyn Store>,
+        epoch: EpochPolicy::Keep,
+        members: Default::default(),
+        history: None,
+    }))
+    .expect("a second farm over the store");
+    let caps = kbf_caps::NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
+        .expect("caps")
+        .with_drivers(["container"]);
+    let (outbound, inbox) = mpsc::unbounded_channel();
+    farm.register(
+        &WorkerId::new("node-x"),
+        DaemonInstance::new("daemon-x"),
+        DaemonInstance::new(""),
+        Reported::serving(Resources::new(4_000, 8 << 30), caps),
+        outbound,
+        Default::default(),
+    );
+    (farm, inbox)
+}
+
+/// Asserts what the ruling says for an operation no worker of this frontend could run: with
+/// another frontend that has a worker that could, its stream is kept through the load
+/// balancer wait (that frontend takes the operation), until the deadline ends it with the
+/// stop; with no other frontend it ends at the end of the wait.
+async fn a_waiting_stream_follows_whether_another_frontend_could_take_it(how: Begin, other: bool) {
+    let rig = Rig::new(timing(10, 30));
+    let _other = other.then(|| other_frontend(&rig));
+    let ticket = submit(&rig.farm, request(1)).expect("queued");
+    rig.farm.tick().await;
+    rig.farm.intake();
+    let kept = matches!(*ticket.stage.borrow(), kbf_front::Stage::WaitingKept(_));
+    assert_eq!(kept, other, "{how:?}: {:?}", *ticket.stage.borrow());
+    let stream = follow(&rig, &ticket).await;
+    let stop = begin(&rig, how, Duration::MAX);
+
+    pass_feeding(&rig, 20).await;
+    assert_eq!(
+        stream.is_finished(),
+        !other,
+        "{how:?}: another frontend {other}"
+    );
+    if other {
+        tokio::time::timeout(Duration::from_secs(60), stop)
+            .await
+            .expect("the stop ends at the deadline")
+            .expect("task");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_keeps_a_waiting_stream_when_another_frontend_could_take_it() {
+    a_waiting_stream_follows_whether_another_frontend_could_take_it(Begin::Signal, true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_endpoints_drain_keeps_a_waiting_stream_when_another_frontend_could_take_it() {
+    a_waiting_stream_follows_whether_another_frontend_could_take_it(Begin::Endpoint, true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_ends_a_waiting_stream_when_no_other_frontend_could_take_it() {
+    a_waiting_stream_follows_whether_another_frontend_could_take_it(Begin::Signal, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_endpoints_drain_ends_a_waiting_stream_when_no_other_frontend_could_take_it() {
+    a_waiting_stream_follows_whether_another_frontend_could_take_it(Begin::Endpoint, false).await;
+}
+
+/// Asserts that an operation that waited for a worker and went back to `Queued` when a
+/// worker that could run it appeared (the node is full) keeps its stream through the drain:
+/// its stage reads `Queued`, not `Waiting`, once the reason is cleared.
+async fn an_operation_that_stopped_waiting_keeps_its_stream(how: Begin) {
+    let rig = Rig::new(timing(10, 30));
+    let tickets: Vec<_> = (1..=5)
+        .map(|tag| submit(&rig.farm, request(tag)).expect("queued"))
+        .collect();
+    rig.farm.tick().await;
+    let last = &tickets[4];
+    assert!(
+        matches!(*last.stage.borrow(), kbf_front::Stage::Waiting(_)),
+        "{how:?}: {:?}",
+        *last.stage.borrow()
+    );
+    let mut inbox = register(&rig);
+    rig.farm.tick().await;
+    assert_eq!(starts(&mut inbox), 4, "{how:?}: the node did not fill");
+    assert!(
+        matches!(*last.stage.borrow(), kbf_front::Stage::Queued),
+        "{how:?}: {:?}",
+        *last.stage.borrow()
+    );
+    let stream = follow(&rig, last).await;
+    let stop = begin(&rig, how, Duration::MAX);
+
+    pass_feeding(&rig, 20).await;
+    assert!(!stream.is_finished(), "{how:?}: ended");
+    tokio::time::timeout(Duration::from_secs(60), stop)
+        .await
+        .expect("the stop ends at the deadline")
+        .expect("task");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_keeps_the_stream_of_an_operation_that_stopped_waiting() {
+    an_operation_that_stopped_waiting_keeps_its_stream(Begin::Signal).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_endpoints_drain_keeps_the_stream_of_an_operation_that_stopped_waiting() {
+    an_operation_that_stopped_waiting_keeps_its_stream(Begin::Endpoint).await;
 }

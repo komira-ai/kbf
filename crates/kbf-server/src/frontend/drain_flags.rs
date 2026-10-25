@@ -46,8 +46,8 @@ pub(super) fn args() -> [Arg; 2] {
                  waits for the open executions to finish after it has refused new ones; a \
                  stop always ends by then, unless `--shutdown-timeout-secs` ends it earlier. \
                  The one stream that does not wait is that of an operation that was never \
-                 started and that no worker can run: it ends UNAVAILABLE as the drain \
-                 begins, since that action would fail at the deadline anyway (Buck2 retries \
+                 started, that no worker on this frontend can run and that no other \
+                 frontend can take: it ends UNAVAILABLE as the drain begins, since that action would fail at the deadline anyway (Buck2 retries \
                  only the opening of a call), and the operation stays queued for the other \
                  frontends. Executions still open at the deadline are ended UNAVAILABLE, \
                  the daemons' worker streams end and the process exits. Buck2 does not \

@@ -17,6 +17,12 @@ impl Scheduler {
         op.unservable.as_ref().map(|u| u.reason.as_str())
     }
 
+    /// The request `operation` was submitted with, if the scheduler holds it.
+    #[must_use]
+    pub fn request(&self, operation: OperationId) -> Option<&Request> {
+        self.ops.get(&operation).map(|op| &op.request)
+    }
+
     /// The cordoned (or not serving) live workers that could run `operation` if placement
     /// could use them: the ones a "every worker that can run it is cordoned" reason names.
     /// Empty when `operation` is unknown or no such worker could.

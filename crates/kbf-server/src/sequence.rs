@@ -17,9 +17,11 @@
 //!    accepting; the operator API goes on answering so that the drain can be read.
 //! 4. It waits until no execution is open, at most [`DrainTiming::deadline`]
 //!    (`--drain-deadline`, 15 minutes by default), so a stop always ends. The streams of
-//!    operations that were never started and that no worker can run (every capable worker
-//!    is cordoned by an operator, or there is none) end UNAVAILABLE as step 3 begins and do
-//!    not wait: they would fail at the deadline anyway. Every other stream waits, as Buck2
+//!    operations that were never started and that no worker on this frontend can run (every
+//!    capable worker is cordoned by an operator, or there is none), with no other frontend
+//!    of the store to take them (no daemon of another frontend could run them: the
+//!    `session/` rows, read at each intake poll), end UNAVAILABLE as step 3 begins, at the
+//!    end of the load balancer wait, and do not wait: they would fail at the deadline anyway. Every other stream waits, as Buck2
 //!    does not recover one that ends, including the stream of an operation that waits only
 //!    for the nodes this drain cordoned itself (step 3): the other frontends take it. The
 //!    operations stay queued for the other frontends. An execution that runs on a node of

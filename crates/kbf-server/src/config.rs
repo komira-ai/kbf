@@ -343,9 +343,9 @@ pub struct Args {
     /// finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and
     /// sends GOAWAY, and every open Execute and WaitExecution stream stays open until its
     /// action is done; the exception is a stream whose operation was never started and
-    /// that no worker can run (say every capable worker is cordoned), which ends
-    /// UNAVAILABLE at once, since that action would fail at the deadline anyway (Buck2
-    /// retries only the opening of a call). The operation stays queued. On a
+    /// that no worker on this frontend can run (say every capable worker is cordoned) and
+    /// no other frontend can take, which ends UNAVAILABLE as the drain begins, since that
+    /// action would fail at the deadline anyway (Buck2 retries only the opening of a call). The operation stays queued. On a
     /// frontend over a state store, `--drain-deadline` bounds the wait in any case; this
     /// flag bounds it earlier. Buck2 never recovers a stream that breaks mid-action, so the
     /// default, 0, is no deadline; set one at least as long as the longest action. When

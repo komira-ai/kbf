@@ -278,6 +278,9 @@ struct State {
     /// ([`State::hold_placements`]), as opposed to an operator's cordon: an operation
     /// that waits only for these is queued, not stuck, since the other frontends take it.
     drain_held: BTreeSet<WorkerId>,
+    /// The operations the scheduler says no live worker can run now, with its reason: the
+    /// ones whose stage [`State::stage_for`] decides again when what it depends on changes.
+    stuck: BTreeMap<OperationId, String>,
     next_stream: u64,
     /// The newest stream of each node the machine has registered.
     links: BTreeMap<WorkerId, Link>,
@@ -437,6 +440,7 @@ impl Farm {
                 stages: BTreeMap::new(),
                 ever_started: BTreeSet::new(),
                 drain_held: BTreeSet::new(),
+                stuck: BTreeMap::new(),
                 next_stream: 0,
                 links: BTreeMap::new(),
                 paused: BTreeSet::new(),
@@ -1596,42 +1600,72 @@ impl State {
 
     /// Tells an operation's callers why it waits, or that it no longer waits for a
     /// worker that can run it. Logged, so an operator sees it too.
-    fn waiting(&self, waiting: &Waiting) {
+    fn waiting(&mut self, waiting: &Waiting) {
         let operation = waiting.operation;
         let stage = match &waiting.reason {
             Some(why) => {
                 tracing::warn!(%operation, reason = %why, "no live worker can run the operation");
-                let cordoned = self.sched.cordoned_could(operation);
-                // Stuck here for good (`Waiting`) unless it has run, or the only thing
-                // between it and a worker is this drain's own cordon: with the intake
-                // closed it is queued for the other frontends, like any queued work.
-                // Held by an operator's cordon (alone, or beside the drain's) or by no
-                // worker at all, it can never start here.
-                let only_drain = !cordoned.is_empty()
-                    && cordoned
-                        .iter()
-                        .all(|worker| self.drain_held.contains(worker));
-                if self.ever_started.contains(&operation) {
-                    Stage::WaitingAfterStart(why.clone())
-                } else if only_drain {
-                    Stage::Queued
-                } else {
-                    Stage::Waiting(why.clone())
-                }
+                self.stuck.insert(operation, why.clone());
+                self.stage_for(operation, why)
             }
             None => {
                 tracing::info!(%operation, "a live worker can run the operation again");
+                self.stuck.remove(&operation);
                 Stage::Queued
             }
         };
-        // A caller that joins a waiting operation is told again; the others, who
-        // already know, see no repeated update.
+        self.show(operation, &stage);
+    }
+
+    /// The stage of `operation`, which no live worker of this frontend can run now (`why`).
+    /// `Waiting` means its streams can be ended by a drain: it was never started and can
+    /// never start here. Not that when it has run (`WaitingKept`); when another frontend
+    /// has a worker that could run it and takes it once this one stands down
+    /// (`WaitingKept`); or when the only thing between it and a worker is this drain's own
+    /// cordon, with the intake closed (`Queued`: it is queued for the other frontends like
+    /// any queued work). Held by an operator's cordon (alone, or beside the drain's) or by
+    /// no worker at all, with no other frontend to take it, it can never start.
+    fn stage_for(&self, operation: OperationId, why: &str) -> Stage {
+        let cordoned = self.sched.cordoned_could(operation);
+        let only_drain = !cordoned.is_empty()
+            && cordoned
+                .iter()
+                .all(|worker| self.drain_held.contains(worker));
+        let elsewhere = self.sched.request(operation).is_some_and(|request| {
+            let remote = &self.intake.remote;
+            remote
+                .iter()
+                .any(|(caps, capacity)| request.runnable_on(caps, capacity))
+        });
+        if self.ever_started.contains(&operation) || elsewhere {
+            Stage::WaitingKept(why.to_owned())
+        } else if only_drain {
+            Stage::Queued
+        } else {
+            Stage::Waiting(why.to_owned())
+        }
+    }
+
+    /// Decides again the stage of every operation that waits for a worker, after the
+    /// daemons of the other frontends were read.
+    fn republish_stuck(&mut self) {
+        let alive: BTreeSet<OperationId> = self.sched.queued().collect();
+        self.stuck.retain(|operation, _| alive.contains(operation));
+        for (operation, why) in self.stuck.clone() {
+            let stage = self.stage_for(operation, &why);
+            self.show(operation, &stage);
+        }
+    }
+
+    /// Shows `stage` to the callers of `operation`. A caller that joins a waiting
+    /// operation is told again; the others, who already know, see no repeated update.
+    fn show(&self, operation: OperationId, stage: &Stage) {
         let waiters = self.sched.waiters(operation).unwrap_or_default();
         for channel in waiters.iter().filter_map(|id| self.stages.get(id)) {
             channel.send_if_modified(|now| {
-                let changed = *now != stage;
+                let changed = *now != *stage;
                 if changed {
-                    now.clone_from(&stage);
+                    now.clone_from(stage);
                 }
                 changed
             });

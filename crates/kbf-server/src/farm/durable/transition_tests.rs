@@ -506,3 +506,37 @@ fn a_session_row_that_is_not_a_registration_is_refused_naming_it() {
             .expect("delete");
     }
 }
+
+/// Asserts that the daemons of the other frontends are the session rows of the nodes this
+/// frontend does not hold: a node in `connected` is left out, the others are listed with
+/// their capacity, and a row that is not a registration is refused naming it.
+#[test]
+fn the_remote_sessions_are_the_rows_of_nodes_this_frontend_does_not_hold() {
+    let store = Racing::new();
+    let (mine, other) = (durable_over(&store), durable_over(&store));
+    let none = std::collections::BTreeSet::new();
+    assert!(mine.remote_sessions(&none).expect("no sessions").is_empty());
+    let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
+        .expect("caps")
+        .with_drivers(["container"]);
+    let reported = Reported::serving(Resources::new(4_000, 8 << 30), caps);
+    let daemon = DaemonInstance::new("daemon");
+    for node in ["node-a", "node-b"] {
+        other
+            .session(&WorkerId::new(node), &daemon, false, &reported)
+            .expect("a session");
+    }
+
+    let held = [WorkerId::new("node-a")].into();
+    let remote = mine.remote_sessions(&held).expect("sessions");
+    assert_eq!(remote.len(), 1);
+    assert_eq!(remote[0].1, Resources::new(4_000, 8 << 30));
+    assert_eq!(mine.remote_sessions(&none).expect("sessions").len(), 2);
+
+    store
+        .txn(Txn::new().put("session/c", vec![0xff], Cond::Any))
+        .expect("store")
+        .expect("put");
+    let error = mine.remote_sessions(&none).expect_err("a corrupt row");
+    assert!(error.to_string().contains("session/c"), "{error}");
+}

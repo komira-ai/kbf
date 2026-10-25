@@ -95,6 +95,10 @@ pub(in crate::farm) struct Intake {
     orphan_wait: Duration,
     /// The stored epoch, if it is past the one this frontend serves.
     epoch_ahead: Option<u64>,
+    /// The daemons connected to the other frontends of the state store (capabilities and
+    /// capacity), as the `session/` rows listed at the last poll: an in-memory view of
+    /// whether another frontend has a worker that could take this one's queued work.
+    pub(in crate::farm) remote: Vec<(kbf_caps::NodeCaps, kbf_types::Resources)>,
 }
 
 impl Default for Intake {
@@ -107,6 +111,7 @@ impl Default for Intake {
             orphans: BTreeMap::new(),
             orphan_wait: ORPHAN_WAIT,
             epoch_ahead: None,
+            remote: Vec::new(),
         }
     }
 }
@@ -274,6 +279,28 @@ impl State {
         self.apply_cordons(now, polled.cordons, polled.at);
         self.apply_floors(&polled.floors, &polled.key_floors);
         self.sweep_orphans();
+        self.look_at_remote_sessions();
+    }
+
+    /// Reads the daemons of the other frontends from the `session/` rows, and tells the
+    /// callers of the operations that wait for a worker whether one of them could run it
+    /// ([`State::republish_stuck`]).
+    fn look_at_remote_sessions(&mut self) {
+        let connected: BTreeSet<WorkerId> = self
+            .links
+            .iter()
+            .filter(|(_, link)| !link.outbound.is_closed())
+            .map(|(worker, _)| worker.clone())
+            .collect();
+        let mut remote = None;
+        self.durably("a session look", |d| {
+            remote = Some(d.remote_sessions(&connected)?);
+            Ok(())
+        });
+        if let Some(remote) = remote {
+            self.intake.remote = remote;
+            self.republish_stuck();
+        }
     }
 
     /// Reports the stored epoch `stored` once when it is past `served`.

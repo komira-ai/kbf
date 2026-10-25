@@ -40,8 +40,9 @@
 //!   once while everything is still served, new Execute calls are refused after
 //!   `--drain-lb-wait`, every listener is sent GOAWAY, open executions run until they
 //!   are done or `--drain-deadline` (but the streams of operations that were never started
-//!   and that no worker can run end UNAVAILABLE at once), and the process exits 0. Any
-//!   other server drains at once ([`crate::drain`]): new Execute calls are refused, `/readyz` goes false, the REAPI
+//!   and that no worker on this frontend can run and no other frontend can take end
+//!   UNAVAILABLE when the drain begins), and the process exits 0. Any other server drains at
+//!   once ([`crate::drain`]): new Execute calls are refused, `/readyz` goes false, the REAPI
 //!   listener is sent GOAWAY, open streams run until their action is done, and the server
 //!   exits when they have. It is not undone: a drained frontend is restarted.
 //!
