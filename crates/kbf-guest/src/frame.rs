@@ -7,9 +7,11 @@
 //! many bytes of JSON:
 //!
 //! ```text
-//! {"kind": "ready" | "result" | "log" | "ack" | "refused", "name": "...", "body": "..."}
+//! {"kind": "ready" | "result" | "log" | "shutdown" | "ack" | "refused", "name": "...", "body": "..."}
 //! ```
 //!
+//! The host sends one `shutdown` frame (name `shutdown`, empty body) to the guest's
+//! command listener ([`crate::shutdown`]), which answers `ack` and shuts the guest down.
 //! The guest sends `ready`, `result` and `log`; `name` is the file name the host writes
 //! under its results directory (a `log` is appended to `<name>.log`), and `body` is the
 //! file's text. The host answers each frame with `ack` (same name, empty body) or
@@ -39,9 +41,12 @@ pub enum Kind {
     Result,
     /// Text appended to `<name>.log`.
     Log,
-    /// The host's reply: the frame was written.
+    /// The host's command to the guest: shut down cleanly (see [`crate::shutdown`]). A guest
+    /// never sends it, and the host's results listener refuses it.
+    Shutdown,
+    /// The reply: the frame was written (results) or the command was accepted (shutdown).
     Ack,
-    /// The host's reply: the frame was not written; the body says why.
+    /// The reply: the frame was not written or the command not accepted; the body says why.
     Refused,
 }
 
@@ -68,7 +73,7 @@ impl Frame {
 /// A frame that cannot be encoded or decoded.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FrameError {
-    #[error("a frame of {len} bytes is over the {MAX_FRAME_BYTES} byte limit")]
+    #[error("a frame of {len} bytes is over the limit of this reader (at most {MAX_FRAME_BYTES})")]
     TooLarge { len: usize },
     #[error("a body of {len} bytes is over the {MAX_BODY_BYTES} byte limit")]
     BodyTooLarge { len: usize },
@@ -117,6 +122,18 @@ fn read_up_to<R: Read>(r: &mut R, n: usize) -> Result<Vec<u8>, FrameError> {
 /// The stream ended inside a frame, the length is 0 or over the limit (nothing is
 /// allocated for it), the bytes are not a frame, or the body is over its limit.
 pub fn read_frame<R: Read>(r: &mut R) -> Result<Option<Frame>, FrameError> {
+    read_frame_within(r, MAX_FRAME_BYTES)
+}
+
+/// [`read_frame`] with a smaller frame limit: a listener that expects only short frames
+/// refuses a longer one from its length alone, before it reads or allocates anything for it.
+///
+/// # Errors
+/// As [`read_frame`], with `max_frame` in place of [`MAX_FRAME_BYTES`].
+pub fn read_frame_within<R: Read>(
+    r: &mut R,
+    max_frame: usize,
+) -> Result<Option<Frame>, FrameError> {
     let head = read_up_to(r, 4)?;
     if head.is_empty() {
         return Ok(None);
@@ -131,7 +148,7 @@ pub fn read_frame<R: Read>(r: &mut R) -> Result<Option<Frame>, FrameError> {
     if len == 0 {
         return Err(FrameError::Empty);
     }
-    if len > MAX_FRAME_BYTES {
+    if len > max_frame {
         return Err(FrameError::TooLarge { len });
     }
     let json = read_up_to(r, len)?;
@@ -214,6 +231,7 @@ mod tests {
             Kind::Ready,
             Kind::Result,
             Kind::Log,
+            Kind::Shutdown,
             Kind::Ack,
             Kind::Refused,
         ] {
@@ -229,6 +247,7 @@ mod tests {
             Kind::Ready,
             Kind::Result,
             Kind::Log,
+            Kind::Shutdown,
             Kind::Ack,
             Kind::Refused,
         ] {
@@ -430,5 +449,33 @@ mod tests {
         assert!(e.to_string().starts_with("reply:"), "{e}");
         let e = exchange(&mut Broken, &sent).expect_err("broken");
         assert!(e.to_string().starts_with("send:"), "{e}");
+    }
+
+    /// Catches a reader with a smaller limit that reads, or allocates for, a frame over its
+    /// limit (the command listener must not read megabytes from a peer), and one that
+    /// refuses a frame exactly at the limit.
+    #[test]
+    fn a_smaller_limit_refuses_from_the_length_and_accepts_a_frame_at_the_limit() {
+        let bytes = encode(&frame(Kind::Ready)).expect("encode");
+        let len = bytes.len() - 4;
+        assert_eq!(
+            read_frame_within(&mut Cursor::new(bytes.clone()), len),
+            Ok(Some(frame(Kind::Ready)))
+        );
+        assert_eq!(
+            read_frame_within(&mut Cursor::new(bytes[..4].to_vec()), len - 1),
+            Err(FrameError::TooLarge { len })
+        );
+    }
+
+    /// Catches a `shutdown` kind spelled differently from the one the guest's listener and
+    /// the host's command agree on.
+    #[test]
+    fn the_shutdown_command_is_spelled_shutdown_on_the_wire() {
+        let bytes = encode(&Frame::new(Kind::Shutdown, "shutdown", "")).expect("encode");
+        assert_eq!(
+            std::str::from_utf8(&bytes[4..]).expect("utf8"),
+            r#"{"kind":"shutdown","name":"shutdown","body":""}"#
+        );
     }
 }

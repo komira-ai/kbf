@@ -50,7 +50,9 @@
 # deploy   sets the published release as the desired version on the farm's update coordinator
 #          and waits for the farm to converge (cargo xtask deploy-farm); it passes with a notice
 #          when the repository variable KBF_COORDINATOR_URL is unset. The one job that holds
-#          `id-token: write`, and no write scope.
+#          `id-token: write`, and no write scope. When the coordinator is reachable only on a
+#          Tailscale network, it joins that network first as an ephemeral node, with the same
+#          run token (TS_CLIENT_ID and KBF_COORDINATOR_URL set; skipped otherwise).
 #
 # A run releases one commit; a run of an old commit tags and publishes nothing (the highest
 # release tag must name this commit or an ancestor of it: `release tag` and `release publish`
@@ -434,6 +436,19 @@ jobs:
       # coordinator's allow-list (this workflow, on main, for `release`) and the hosts' own
       # signature and hash checks bound what a token can do.
       - run: cargo build -p xtask --locked
+      # When the coordinator is reachable only on a Tailscale network: join it, after the build
+      # (its scripts never see that network), as an ephemeral node. Tailscale's workload identity
+      # federation takes this run's OIDC token, so the job still holds no secret. The client id and
+      # the audience are the variables TS_CLIENT_ID and TS_AUDIENCE, the trust credential CI jobs
+      # join the network with, as `tag:ci`. With TS_CLIENT_ID or KBF_COORDINATOR_URL unset (a fork,
+      # a repository with no farm or no network) the step is skipped and the verb runs as before.
+      - name: Join the farm's Tailscale network
+        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+        with:
+          oauth-client-id: ${{ vars.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE }}
+          tags: tag:ci
       # The version is the release's; the minimums default to 1 and are the farm's to raise.
       - name: Set this release as the farm's desired version, and wait for the farm to converge
         env:

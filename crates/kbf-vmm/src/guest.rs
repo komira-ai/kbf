@@ -77,6 +77,13 @@ pub const LOCAL_MARKER: &str = "/private/var/log/kbf-probe-local";
 /// The label of the root daemon that runs `kbf-guest probe-diag`, and the file launchd
 /// writes its JSON to (on the guest's own disk, because the share refuses writes).
 pub const DIAG_LABEL: &str = "com.kbf.probe.diag";
+/// The label of the root daemon that listens on [`SHUTDOWN_PORT`] for the host's `shutdown`
+/// command (`kbf-guest shutdown-listen`). Its log is `/var/log/<label>.log`, which the
+/// harvest reads.
+pub const SHUTDOWN_LABEL: &str = "com.kbf.probe.shutdown";
+/// The guest vsock port that daemon listens on; the host connects to it to ask for a clean
+/// shutdown.
+pub const SHUTDOWN_PORT: u32 = kbf_guest::shutdown::PORT;
 pub const DIAG_OUTPUT: &str = "/private/var/log/kbf-probe-diag";
 /// Where the daemons that run as `nobody` keep their logs: `nobody` cannot create a file
 /// in `/var/log`, and the second E1 run left no log of theirs there.
@@ -308,9 +315,10 @@ fn guest_args(sub: &[&str]) -> Vec<String> {
 
 /// The files the offline write puts into the guest: the Setup Assistant marker, the mount
 /// point directory, the copy of `kbf-guest` the mount daemon runs (when `bootstrap` holds
-/// its bytes), and seven launch daemons (the share mounter, a probe as root, a probe as
-/// `nobody`, the system marker, the login marker, the share diagnosis, and the local
-/// marker that needs none of the others).
+/// its bytes), and eight launch daemons (the share mounter, a probe as root, a probe as
+/// `nobody`, the system marker, the login marker, the share diagnosis, the local marker
+/// that needs none of the others, and the shutdown listener, which runs from the guest's
+/// own disk like the mounter and is restarted by launchd whenever it fails).
 #[must_use]
 pub fn offline_payload(bootstrap: Option<Vec<u8>>) -> Vec<OfflineFile> {
     let out = |name: &str| format!("{GUEST_SHARE}/{RESULTS}/{name}");
@@ -334,7 +342,7 @@ pub fn offline_payload(bootstrap: Option<Vec<u8>>) -> Vec<OfflineFile> {
         mode: 0o755,
     }));
     // (label, user, arguments, restarted by launchd until it succeeds)
-    let daemons: [(&str, Option<&str>, Vec<String>, bool); 7] = [
+    let daemons: [(&str, Option<&str>, Vec<String>, bool); 8] = [
         (
             "com.kbf.probe.mount",
             None,
@@ -439,6 +447,21 @@ pub fn offline_payload(bootstrap: Option<Vec<u8>>) -> Vec<OfflineFile> {
             .map(str::to_owned)
             .to_vec(),
             false,
+        ),
+        (
+            // Root, because `shutdown` needs it; from the guest's disk, because the share is
+            // not mounted when launchd loads the job (and a shutdown must not depend on it).
+            SHUTDOWN_LABEL,
+            None,
+            [
+                BOOTSTRAP,
+                "shutdown-listen",
+                "--port",
+                &SHUTDOWN_PORT.to_string(),
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            true,
         ),
         (
             LOCAL_LABEL,
@@ -557,7 +580,7 @@ mod tests {
     /// start, a daemon that waits for a path the mounter does not make, or a root control
     /// that runs as nobody (the G3 verdict compares the two users).
     #[test]
-    fn the_offline_payload_holds_the_marker_the_mount_point_the_binary_and_seven_daemons() {
+    fn the_offline_payload_holds_the_marker_the_mount_point_the_binary_and_eight_daemons() {
         let files = offline_payload(Some(b"bin".to_vec()));
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths[0], "private/var/db/.AppleSetupDone");
@@ -568,7 +591,7 @@ mod tests {
             (&b"bin"[..], 0o755)
         );
         assert_eq!(BOOTSTRAP, format!("/{}", paths[2]));
-        assert_eq!(paths.len(), 10);
+        assert_eq!(paths.len(), 11);
         assert!(paths[3..].iter().all(|p| holds(&[
             p.starts_with("Library/LaunchDaemons/com.kbf.probe."),
             p.ends_with(".plist")
@@ -610,7 +633,7 @@ mod tests {
         }
         // Without the binary the copy is not written; the daemons still are.
         let bare = offline_payload(None);
-        assert_eq!(bare.len(), 9);
+        assert_eq!(bare.len(), 10);
         assert!(bare.iter().all(|f| f.path != paths[2]));
     }
 
@@ -749,6 +772,37 @@ mod tests {
                 suffix: ".log"
             }
         );
+    }
+
+    /// Catches a shutdown listener that is missing (the guest then ignores the host's
+    /// command and every VM is force-stopped), runs as a user that cannot shut the guest
+    /// down, runs the copy on the share (not mounted when launchd loads the job: the
+    /// fifth E1 run), is not restarted when it fails to bind early in the boot, or listens
+    /// on a port the host does not connect to.
+    #[test]
+    fn the_shutdown_daemon_runs_as_root_from_the_guest_disk_with_keepalive_on_the_hosts_port() {
+        let files = offline_payload(Some(Vec::new()));
+        let plist = plist_of(&files, SHUTDOWN_LABEL);
+        assert!(
+            holds(&[
+                plist.contains(&format!("<string>{BOOTSTRAP}</string>")),
+                plist.contains("<string>shutdown-listen</string>"),
+                plist.contains(&format!("<string>{SHUTDOWN_PORT}</string>")),
+                !plist.contains(GUEST_SHARE),
+                !plist.contains(&format!("{GUEST_SHARE}/{GUEST_BIN}")),
+                !plist.contains("UserName"),
+                plist.contains("<key>KeepAlive</key>"),
+                plist.contains("<key>RunAtLoad</key>"),
+                plist.contains("<string>/var/log/com.kbf.probe.shutdown.log</string>"),
+                !plist.contains("StandardOutPath"),
+            ]),
+            "{plist}"
+        );
+        // No shell: the label, the program, the subcommand, the flag, the port and the
+        // log path are the only strings.
+        assert_eq!(plist.matches("<string>").count(), 6, "{plist}");
+        assert_eq!(SHUTDOWN_PORT, 5001);
+        assert_ne!(SHUTDOWN_PORT, VSOCK_PORT);
     }
 
     /// Catches a binary read from the wrong place or a missing file that is not reported.
