@@ -27,7 +27,7 @@ use crate::{
     TestClock,
 };
 
-use super::auth::sign;
+use super::auth::{sign, sign_as};
 use super::request::BoxError;
 use super::{Server, ServerConfig};
 
@@ -144,6 +144,20 @@ impl Rig {
         body: &[u8],
     ) -> Reply {
         let request = sign(&self.config, method, uri, extra, body);
+        self.send_raw(request).await
+    }
+
+    /// Sends a request signed with the key `(id, secret)`, whichever key that is, and reads the
+    /// answer.
+    pub(super) async fn send_as(
+        &self,
+        key: (&str, &str),
+        method: &str,
+        uri: &str,
+        extra: &[(&str, &str)],
+        body: &[u8],
+    ) -> Reply {
+        let request = sign_as(&self.config, key, method, uri, extra, body);
         self.send_raw(request).await
     }
 

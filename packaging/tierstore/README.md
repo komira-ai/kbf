@@ -13,8 +13,9 @@ These files go beside the binary.
 
 The values in the unit are examples (`192.0.2.10`, `s3-hot.example`, the bucket names, the
 sizes): edit them to the setup's. `crates/tierstore/tests/packaging.rs` reads these files and
-checks that the command line parses as the binary parses it, that no secret is on it, that the
-stop timeout covers the drain, and that nothing starts the unit by itself.
+checks that the command line parses as the binary parses it, that no secret is on it (every key
+and credential flag names a file), that the stop timeout covers the drain, and that nothing
+starts the unit by itself.
 
 ## Placing the binary
 
@@ -44,15 +45,47 @@ install -m 0644 tierstore.service /etc/systemd/system/tierstore.service
 systemctl daemon-reload
 ```
 
-Then write the three key files, each owned by `tierstore` with mode 0600 (the process refuses a
-key file that others can read). Each holds the access key id on its first line and the secret
-access key on its second:
+Then write the four key files, each owned by `tierstore` with mode 0600 or 0400 (the process
+refuses a key file that its group or others can read):
 
-- `/etc/tierstore/access.key`: the key clients sign their requests to `tierstore` with
-  (`--access-key-file`);
+- `/etc/tierstore/access.key`: the full key, the one clients that write sign their requests to
+  `tierstore` with (`--access-key-file`). It may do everything the server serves: put, get, head,
+  list, delete, and the calls of a multipart upload;
+- `/etc/tierstore/daemons.key`: a read-only key (`--read-only-key-file`), for the daemons that
+  read blobs and must not write or delete them. A request signed with it may get and head an
+  object, list the bucket and head the bucket; a put, a delete, CreateBucket or any call of a
+  multipart upload is answered 403 `AccessDenied`, before its body is read, and changes nothing.
+  Give the flag once for each read-only key, to give each reader a key of its own. The access key
+  ids of all the keys of one server must differ: a request names its key by its id, so a start
+  with two keys that have one id is refused with exit status 2;
 - `/etc/tierstore/hot.credentials` and `/etc/tierstore/cold.credentials`: the keys `tierstore`
   signs its requests to the two stores with (`--hot-credentials-file`,
   `--cold-credentials-file`). The two tiers may be two stores, and have a key each.
+
+Every one of these files holds its key in one of two forms, and the process tells them apart by
+the first byte of the file that is not white space: `{` is JSON, anything else is two lines.
+
+```json
+{"access_key_id": "AKIDEXAMPLE", "secret_access_key": "the secret"}
+```
+
+or, as two lines, the access key id and then the secret access key:
+
+```text
+AKIDEXAMPLE
+the secret
+```
+
+The JSON form is the one that the pack flags of the frontend and of the daemon read
+(`--pack-store-credentials-file`), but `tierstore` is stricter than they are: it needs exactly
+the two fields, both non-empty strings, and refuses a file with another field, with a field
+misspelled or with an empty value. So one file holds both the key that a daemon signs with and
+the key that `tierstore` checks only if it has exactly those two non-empty fields; a pack-flags
+file that has another field must be trimmed to be shared. `tierstore` takes the values of the
+JSON form as they are, without trimming. No message of the process carries a secret.
+
+A role belongs to a key, not to a prefix: a read-only key may read every object of the bucket,
+and there is no key yet that may write under one prefix only.
 
 A secret is never on the command line or in the environment: the process reads no environment
 variable, and the unit sets none.
@@ -66,6 +99,7 @@ The unit's `ExecStart=` is a complete command line. The flags to edit:
 | `--listen` | the address the S3 API, `/healthz` and `/readyz` are served on |
 | `--proxy-id` | names this process's journal and its lease in the hot tier; keep it across restarts, and give each process over the same tiers one of its own |
 | `--bucket` | the name of the one bucket clients see |
+| `--access-key-file`, `--read-only-key-file` | the full key, and (given once for each) the read-only keys; see above |
 | `--hot`, `--cold` | the tiers: `s3:<bucket>` for a bucket of an S3-compatible store (also `dir:<path>` and `memory`; a `dir:` path must also be writable under `ProtectSystem=strict`, so add it to `ReadWritePaths=`) |
 | `--hot-endpoint`, `--cold-endpoint` | where the tier's store is, `http://host[:port]` (TLS is not built yet); `--hot-region` and `--cold-region` set the signing region of a tier, `us-east-1` if not given |
 | `--hot-bytes` | the bytes the hot tier is meant to hold; the water marks are shares of it (`--high-water`, `--low-water`, `--critical`) |
@@ -95,5 +129,6 @@ load balancer sees it, refuses new requests, waits for those in flight for at mo
 the sum of the two flags and the lease's wait, so that systemd does not send SIGKILL to a drain
 in progress; if `--drain-deadline` is raised, raise it too. A start that fails is tried again
 after five seconds; exit status 2 (a command line the argument parser refused: an unknown flag, a
-missing or malformed value) is not, since a restart cannot mend it. Flag combinations and key
-files refused after parsing exit 1, and are tried again every five seconds.
+missing or malformed value; or two keys with one access key id) is not, since a restart cannot
+mend it. Other flag combinations and key files refused after parsing exit 1, and are tried again
+every five seconds.

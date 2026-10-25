@@ -9,14 +9,44 @@ use sha2::{Digest, Sha256};
 
 use crate::TestClock;
 
-use super::ServerConfig;
 use super::auth::{
-    MALFORMED, MISMATCH, SKEWED, UNKNOWN_KEY, UNSIGNED, WEAK, canonical_header, sign, verify,
+    MALFORMED, MISMATCH, SKEWED, Signed, UNKNOWN_KEY, UNSIGNED, WEAK, canonical_header, sign,
+    sign_as, verify,
 };
+use super::keys::Role;
 use super::testing::{BUCKET, KEY_ID, NOW, SECRET};
 use super::time::amz_date;
+use super::{AccessKey, ServerConfig};
 
 const EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// The ids and the secrets of the two read-only keys of `keyed_config`.
+const READ_ONE: (&str, &str) = ("AKIDREADONE", "read-one-secret");
+const READ_TWO: (&str, &str) = ("AKIDREADTWO", "read-two-secret");
+
+/// What a good signature by the full key gives, for a body with this hash.
+fn full(payload: &str) -> Signed {
+    Signed {
+        payload: payload.to_owned(),
+        role: Role::Full,
+    }
+}
+
+/// A server with the full key and the two read-only keys.
+fn keyed_config() -> ServerConfig {
+    let mut config = server_config(SECRET, NOW);
+    config.read_only_keys = vec![
+        AccessKey::new(READ_ONE.0, READ_ONE.1),
+        AccessKey::new(READ_TWO.0, READ_TWO.1),
+    ];
+    config
+}
+
+/// A `GET` of an object, signed with this key id and this secret, whichever key they are.
+fn signed_by(config: &ServerConfig, (id, secret): (&str, &str)) -> Parts {
+    let signed = sign_as(config, (id, secret), "GET", "/b/k", &[], b"");
+    signed.into_parts().0
+}
 
 /// The example secret from the S3 SigV4 documentation, which its examples are signed with at
 /// the time `DOC_NOW`.
@@ -89,7 +119,7 @@ fn the_documented_examples_verify() {
             ("authorization", get_auth),
         ],
     );
-    assert_eq!(verify(&doc_config(), &get), Ok(EMPTY.to_owned()));
+    assert_eq!(verify(&doc_config(), &get), Ok(full(EMPTY)));
     let list_auth = concat!(
         "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, ",
         "SignedHeaders=host;x-amz-content-sha256;x-amz-date, ",
@@ -105,7 +135,7 @@ fn the_documented_examples_verify() {
             ("authorization", list_auth),
         ],
     );
-    assert_eq!(verify(&doc_config(), &list), Ok(EMPTY.to_owned()));
+    assert_eq!(verify(&doc_config(), &list), Ok(full(EMPTY)));
 }
 
 /// Asserts that the canonical form of a header has its values trimmed, the runs of white space
@@ -120,7 +150,8 @@ fn a_header_is_canonical_with_its_values_trimmed_folded_and_joined() {
 }
 
 /// Asserts that a request signed as a client signs it is accepted, with the hash of its body
-/// given back, whatever white space and repeated values its headers have.
+/// given back, whatever white space and repeated values its headers have, and with the role of
+/// the full key.
 #[test]
 fn a_signed_request_is_accepted_and_gives_its_payload_hash() {
     let config = server_config(SECRET, NOW);
@@ -128,7 +159,60 @@ fn a_signed_request_is_accepted_and_gives_its_payload_hash() {
     let signed = sign(&config, "PUT", "/b/a%20b?x=1&y=%2F", &extra, b"hello");
     let parts = signed.into_parts().0;
     let hash = hex::encode(Sha256::digest(b"hello"));
-    assert_eq!(verify(&config, &parts), Ok(hash));
+    assert_eq!(verify(&config, &parts), Ok(full(&hash)));
+}
+
+/// Asserts that the key a request names, by the id in its credential, is the one whose secret
+/// checks it and whose role it has: the full key and each of two read-only keys are accepted
+/// with their own roles.
+#[test]
+fn each_key_is_accepted_with_its_own_role() {
+    let config = keyed_config();
+    let by_full = verify(&config, &signed_by(&config, (KEY_ID, SECRET)));
+    assert_eq!(by_full, Ok(full(EMPTY)));
+    for key in [READ_ONE, READ_TWO] {
+        let accepted = verify(&config, &signed_by(&config, key));
+        let read_only = Signed {
+            payload: EMPTY.to_owned(),
+            role: Role::ReadOnly,
+        };
+        assert_eq!(accepted, Ok(read_only), "{}", key.0);
+    }
+}
+
+/// Asserts that a key is not checked with the secret of another: a request that names one key
+/// and is signed with the secret of another, the full key's or a read-only key's, is a
+/// signature that does not match, and an id that no key has is an unknown key, with or without
+/// read-only keys on the server.
+#[test]
+fn a_key_is_checked_with_its_own_secret_and_an_unknown_id_is_refused() {
+    let config = keyed_config();
+    let crossed = [
+        (READ_ONE.0, SECRET),
+        (KEY_ID, READ_ONE.1),
+        (READ_ONE.0, READ_TWO.1),
+        (READ_TWO.0, "wrong"),
+    ];
+    for key in crossed {
+        let refusal = verify(&config, &signed_by(&config, key));
+        assert_eq!(refusal, Err(MISMATCH), "{key:?}");
+    }
+    let nobody = signed_by(&config, ("AKIDNOBODY", SECRET));
+    assert_eq!(verify(&config, &nobody), Err(UNKNOWN_KEY));
+    let alone = server_config(SECRET, NOW);
+    let reader = signed_by(&alone, READ_ONE);
+    assert_eq!(verify(&alone, &reader), Err(UNKNOWN_KEY));
+}
+
+/// Asserts that the region of the credential of a read-only key must be the server's, as the
+/// full key's must be.
+#[test]
+fn the_region_of_a_read_only_key_must_be_the_servers() {
+    let config = keyed_config();
+    let mut request = signed_by(&config, READ_ONE);
+    let text = authorization(&request).replace("/us-east-1/", "/eu-west-1/");
+    set(&mut request, "authorization", &text);
+    assert_eq!(verify(&config, &request), Err(UNKNOWN_KEY));
 }
 
 /// Asserts that a change to anything the signature covers is refused as a signature that does

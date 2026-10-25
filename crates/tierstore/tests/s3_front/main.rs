@@ -7,6 +7,7 @@ mod drain;
 mod files;
 mod idle;
 mod raw;
+mod roles;
 mod run;
 mod signer;
 mod stalled;

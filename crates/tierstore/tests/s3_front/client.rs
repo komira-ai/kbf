@@ -16,34 +16,34 @@ use tierstore::{Backend, Error, Op};
 
 use crate::support::Harness;
 
-const CONDITIONAL: Capabilities = Capabilities {
+pub const CONDITIONAL: Capabilities = Capabilities {
     conditional_put: true,
     object_lock: false,
 };
 
-fn key(name: &str) -> ObjectKey {
+pub fn key(name: &str) -> ObjectKey {
     ObjectKey::new(name).unwrap()
 }
 
 /// The bytes `[offset, offset + len)`.
-fn window(offset: u64, len: u64) -> ByteRange {
+pub fn window(offset: u64, len: u64) -> ByteRange {
     ByteRange::new(offset, len).unwrap()
 }
 
 /// Puts `body` under `name`.
-async fn put(store: &S3Store, name: &str, body: &'static [u8]) {
+pub async fn put(store: &S3Store, name: &str, body: &'static [u8]) {
     let body = Bytes::from_static(body);
     store.put_new(&key(name), body, None).await.unwrap();
 }
 
 /// Reads `len` bytes of `name` from `offset`.
-async fn read(store: &S3Store, name: &str, offset: u64, len: u64) -> Bytes {
+pub async fn read(store: &S3Store, name: &str, offset: u64, len: u64) -> Bytes {
     let bytes = window(offset, len);
     store.get_range(&key(name), bytes).await.unwrap()
 }
 
 /// Asserts that a call was answered with this status and S3 code.
-fn assert_refused<T: Debug>(result: Result<T, ObjectStoreError>, status: u16, code: &str) {
+pub fn assert_refused<T: Debug>(result: Result<T, ObjectStoreError>, status: u16, code: &str) {
     match result.unwrap_err() {
         ObjectStoreError::Service {
             status: got,

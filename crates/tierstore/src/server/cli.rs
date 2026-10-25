@@ -14,25 +14,34 @@
 //! [`S3Backend`]), which the flags of the tier say how to reach, with the name of the tier as
 //! their prefix: `--hot-endpoint` or `--cold-endpoint` (`http://host[:port]`, required),
 //! `--hot-region` or `--cold-region` (the signing region, `us-east-1` if not given), and
-//! `--hot-credentials-file` or `--cold-credentials-file` (required: the access key id on the
-//! first line and the secret access key on the second, in a file only its owner may read, as
-//! for `--access-key-file`; a secret on the command line would be world-readable). The two
-//! tiers have a key of their own, so they may be two stores. These flags are refused for a tier
-//! that is not an S3 bucket, since they would do nothing. A request to an S3 tier is bounded by
-//! `--s3-request-timeout`. The cold tier must do multipart uploads, which all three kinds do,
-//! and the proxy passes them to it.
+//! `--hot-credentials-file` or `--cold-credentials-file` (required: a file only its owner may
+//! read, in the form of `--access-key-file` below; a secret on the command line would be
+//! world-readable). The two tiers have a key of their own, so they may be two stores. These
+//! flags are refused for a tier that is not an S3 bucket, since they would do nothing. A request
+//! to an S3 tier is bounded by `--s3-request-timeout`. The cold tier must do multipart uploads,
+//! which all three kinds do, and the proxy passes them to it.
+//!
+//! The clients of the S3 front sign with one of its access keys. `--access-key-file` is the full
+//! key, which may do everything the front serves; each `--read-only-key-file` (the flag may be
+//! given any number of times) is a key that may only read objects and list the bucket (see the
+//! [`server`](super) docs), such as the key of the daemons that read blobs. The id of a key is
+//! what a request names it by, so the ids must all differ. The file of every key and credential
+//! flag holds the id and the secret either as JSON, `{"access_key_id": "...",
+//! "secret_access_key": "..."}` (the form kbf's pack flags read; tierstore also refuses any other
+//! field and an empty value), or as two lines, the id and then the secret; it is JSON when its
+//! first byte that is not white space is `{`. Only its owner may read the file (mode 0600 or
+//! 0400), and no message of the process names a secret.
 //!
 //! On SIGTERM or SIGINT the process drains (see the [`server`](super) docs): `/readyz` says 503,
 //! it serves for `--drain-lb-wait`, refuses new requests, waits for those in flight and for the
 //! answers it is sending for at most `--drain-deadline`, gives the reconciler's lease up and
-//! exits with status 0. A start that fails exits with status 1, and flags that are not valid
-//! with status 2.
+//! exits with status 0. A start that fails exits with status 1. Flags that are not valid exit
+//! with status 2: those the parser refuses, and two keys that have one id.
 
 use std::ffi::OsString;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -48,10 +57,17 @@ use crate::{
     S3Backend, SystemClock,
 };
 
+use super::keys::{ensure_distinct, read_credentials, read_only_keys};
 use super::{Drained, Server, ServerConfig};
 
 /// A start-up error, for the operator.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// Flags that cannot go together, which only the files they name show: the process exits with
+/// status 2, as for flags the parser refused, since a restart cannot mend them.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct InvalidFlags(String);
 
 const DEFAULT_MAX_REQUEST_BYTES: u64 = 256 << 20;
 
@@ -67,8 +83,9 @@ const S3_MIN_BODY_RATE: Option<NonZeroU64> = NonZeroU64::new(1 << 20);
 
 /// `tierstore`: an S3 server over a hot and a cold tier.
 ///
-/// It serves one bucket with one access key, writes new objects to the hot tier, copies them
-/// to the cold tier in the background, and frees the hot tier when it fills.
+/// It serves one bucket to the clients that sign with its full access key or with one of its
+/// read-only keys, writes new objects to the hot tier, copies them to the cold tier in the
+/// background, and frees the hot tier when it fills.
 #[derive(Clone, Debug, Parser)]
 #[command(name = "tierstore", version)]
 pub struct Cli {
@@ -97,9 +114,9 @@ pub struct Cli {
     /// `s3:<bucket>`; `us-east-1` if not given.
     #[arg(long)]
     pub hot_region: Option<String>,
-    /// The file that holds the access key of the hot tier when it is `s3:<bucket>`: the access
-    /// key id on the first line and the secret access key on the second. Only its owner may
-    /// read it (mode 0600).
+    /// The file that holds the access key of the hot tier when it is `s3:<bucket>`: JSON,
+    /// `{"access_key_id": "...", "secret_access_key": "..."}`, or the access key id on the first
+    /// line and the secret access key on the second. Only its owner may read it (mode 0600).
     #[arg(long)]
     pub hot_credentials_file: Option<PathBuf>,
     /// The endpoint of the cold tier when it is `s3:<bucket>`: `http://host[:port]`, with no
@@ -110,9 +127,8 @@ pub struct Cli {
     /// `s3:<bucket>`; `us-east-1` if not given.
     #[arg(long)]
     pub cold_region: Option<String>,
-    /// The file that holds the access key of the cold tier when it is `s3:<bucket>`: the
-    /// access key id on the first line and the secret access key on the second. Only its owner
-    /// may read it (mode 0600).
+    /// The file that holds the access key of the cold tier when it is `s3:<bucket>`, in the
+    /// form of `--hot-credentials-file`. Only its owner may read it (mode 0600).
     #[arg(long)]
     pub cold_credentials_file: Option<PathBuf>,
     /// The limit on a request to an `s3:<bucket>` tier: a number and `ms`, `s`, `m` or `h`. A
@@ -144,10 +160,19 @@ pub struct Cli {
     /// The region in the credential scope of a request's signature.
     #[arg(long, default_value = "us-east-1")]
     pub region: String,
-    /// The file that holds the access key: the access key id on the first line and the secret
-    /// access key on the second. Only its owner may read it (mode 0600).
+    /// The file that holds the full access key, which may do everything the server serves:
+    /// JSON, `{"access_key_id": "...", "secret_access_key": "..."}` (both fields and no other),
+    /// or the access key id on the first line and the secret access key on the second. Only its
+    /// owner may read it (mode 0600).
     #[arg(long)]
     pub access_key_file: PathBuf,
+    /// A file that holds a read-only access key, in the form of `--access-key-file`: a key that
+    /// may get and head objects, list the bucket and head the bucket, and is refused every
+    /// write, delete and multipart call with 403 `AccessDenied`. Give the flag once for each
+    /// such key (the daemons' key, say); the ids of all keys must differ, or the start is
+    /// refused with status 2. Only its owner may read it (mode 0600).
+    #[arg(long)]
+    pub read_only_key_file: Vec<PathBuf>,
     /// How long, after the drain began, the server goes on serving everything, so that the
     /// 503 of `/readyz` is seen: a number and `ms`, `s`, `m` or `h`.
     #[arg(long, default_value = "10s", value_parser = parse_duration)]
@@ -332,57 +357,36 @@ fn read_key(path: &Path) -> Result<(String, String), String> {
     read_credentials("--access-key-file", path)
 }
 
-/// The access key id and the secret access key in the file that the flag `flag` names.
-fn read_credentials(flag: &str, path: &Path) -> Result<(String, String), String> {
-    let shown = path.display();
-    let fail = |why: String| format!("{flag} {shown}: {why}");
-    let meta = std::fs::metadata(path);
-    let meta = meta.map_err(|why| fail(why.to_string()))?;
-    if meta.permissions().mode() & 0o077 != 0 {
-        return Err(fail("others can read it; make it mode 0600".to_owned()));
-    }
-    let text = std::fs::read_to_string(path);
-    let text = text.map_err(|why| fail(why.to_string()))?;
-    let mut lines = text.lines().map(str::trim);
-    let id = lines.next().filter(|line| !line.is_empty());
-    let secret = lines.next().filter(|line| !line.is_empty());
-    match (id, secret) {
-        (Some(id), Some(secret)) => Ok((id.to_owned(), secret.to_owned())),
-        _ => Err(fail(
-            "the id is on the first line and the secret on the second".to_owned(),
-        )),
-    }
-}
-
 /// Checks the flags that depend on each other, and makes the settings they stand for.
-fn build(cli: &Cli) -> Result<Built, String> {
+fn build(cli: &Cli) -> Result<Built, Error> {
     if cli.low_water >= cli.high_water {
-        return Err("--low-water must be below --high-water".to_owned());
+        return Err("--low-water must be below --high-water".into());
     }
     if cli.high_water > cli.critical {
-        return Err("--high-water must not be above --critical".to_owned());
+        return Err("--high-water must not be above --critical".into());
     }
     if cli.reconcile_interval >= cli.lease_ttl {
-        return Err("--reconcile-interval must be shorter than --lease-ttl".to_owned());
+        return Err("--reconcile-interval must be shorter than --lease-ttl".into());
     }
     if matches!(cli.bucket.as_str(), "healthz" | "readyz") {
-        return Err(format!(
-            "--bucket {:?} is the name of a probe path",
-            cli.bucket
-        ));
+        let name = &cli.bucket;
+        return Err(format!("--bucket {name:?} is the name of a probe path").into());
     }
     if cli.body_idle_timeout.is_zero() {
-        return Err("--body-idle-timeout must be longer than zero".to_owned());
+        return Err("--body-idle-timeout must be longer than zero".into());
     }
     if cli.s3_request_timeout.is_zero() {
-        return Err("--s3-request-timeout must be longer than zero".to_owned());
+        return Err("--s3-request-timeout must be longer than zero".into());
     }
     let (key_id, secret) = read_key(&cli.access_key_file)?;
+    let read_only = read_only_keys(&cli.read_only_key_file)?;
+    ensure_distinct(&key_id, &read_only).map_err(InvalidFlags)?;
     let timeout = cli.s3_request_timeout;
     let hot = open_tier("--hot", &cli.hot, &cli.hot_s3(), timeout)?;
     let cold = open_tier("--cold", &cli.cold, &cli.cold_s3(), timeout)?;
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut server = ServerConfig::new(&cli.bucket, &key_id, &secret, Arc::clone(&clock));
+    server.read_only_keys = read_only;
     server.region = cli.region.clone();
     server.max_request_bytes = usize::try_from(cli.max_request_bytes).unwrap_or(usize::MAX);
     server.body_idle_timeout = cli.body_idle_timeout;
@@ -522,7 +526,8 @@ pub fn main(args: Vec<OsString>) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(why) => {
             eprintln!("tierstore: {why}");
-            ExitCode::from(1)
+            let invalid = why.downcast_ref::<InvalidFlags>().is_some();
+            ExitCode::from(if invalid { 2 } else { 1 })
         }
     }
 }

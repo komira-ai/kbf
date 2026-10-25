@@ -52,7 +52,7 @@ async fn until_closed(h: &Harness) {
 }
 
 /// The id in the answer to a start of a multipart upload.
-fn upload_id(xml: &str) -> &str {
+pub fn upload_id(xml: &str) -> &str {
     let (_, rest) = xml.split_once("<UploadId>").unwrap();
     rest.split_once("</UploadId>").unwrap().0
 }

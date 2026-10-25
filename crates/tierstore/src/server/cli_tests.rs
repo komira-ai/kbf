@@ -11,14 +11,20 @@ use clap::{CommandFactory, Parser};
 use kbf_testkit::dir::TestDir;
 use tokio::sync::Notify;
 
+use crate::server::AccessKey;
 use crate::{
     Backend, FaultyBackend, MemoryBackend, Op, Proxy, ProxyConfig, Reconciler, ReconcilerConfig,
     TestClock,
 };
 
-use super::{Cli, S3Flags, build, open_tier, parse_duration, read_key, reconcile, share, tier};
+use super::{
+    Cli, InvalidFlags, S3Flags, build, open_tier, parse_duration, read_key, reconcile, share, tier,
+};
 
 const MEBIBYTE: u64 = 1 << 20;
+
+/// The JSON form of a key file with the id `JSONID` and the secret `json-secret`.
+const JSON_KEY: &str = r#"{"access_key_id": "JSONID", "secret_access_key": "json-secret"}"#;
 
 /// The flags every start needs, with `overrides` in place of the flags they name or added.
 fn flags(key_file: &str, overrides: &[(&str, &str)]) -> Vec<String> {
@@ -130,6 +136,24 @@ fn the_flags_have_their_defaults() {
         cli.cold_credentials_file.is_some(),
     ];
     assert!(!s3_flags.contains(&true), "no S3 flag by default");
+    assert!(cli.read_only_key_file.is_empty());
+}
+
+/// Asserts that `--read-only-key-file` can be given any number of times, and that the files are
+/// kept in the order of the flags.
+#[test]
+fn the_read_only_key_flag_is_repeatable() {
+    let mut args = flags("key", &[]);
+    let repeated = [
+        "--read-only-key-file",
+        "first",
+        "--read-only-key-file",
+        "second",
+    ];
+    args.extend(repeated.map(str::to_owned));
+    let cli = Cli::try_parse_from(args).unwrap();
+    let files = [PathBuf::from("first"), PathBuf::from("second")];
+    assert_eq!(cli.read_only_key_file, files);
 }
 
 /// Asserts that every flag that has a default can be given, and is read.
@@ -225,6 +249,7 @@ fn the_help_names_every_flag_and_the_version_the_package() {
         "--bucket",
         "--region",
         "--access-key-file",
+        "--read-only-key-file",
         "--drain-lb-wait",
         "--drain-deadline",
         "--journal-linger",
@@ -259,14 +284,23 @@ fn a_percent_is_a_share() {
 }
 
 /// Asserts that the settings are made from the flags: the key file's key and secret, the
-/// bucket and region, the limits, the water marks as shares, the id of the proxy as the holder
-/// of the lease, and the durations.
+/// read-only keys of their files (one in each form) in the order of the flags, the bucket and
+/// region, the limits, the water marks as shares, the id of the proxy as the holder of the
+/// lease, and the durations.
 #[test]
 fn the_settings_are_made_from_the_flags() {
     let dir = TestDir::under(std::env::temp_dir(), "tierstore-build");
     let mut cli = cli(&dir);
     cli.region = "eu-west-1".to_owned();
+    let lines = key_file(&dir, "reader-lines", "READ1\nread-secret-1\n", 0o600);
+    let json = key_file(&dir, "reader-json", JSON_KEY, 0o400);
+    cli.read_only_key_file = vec![lines, json];
     let built = build(&cli).expect("built");
+    let readers = [
+        AccessKey::new("READ1", "read-secret-1"),
+        AccessKey::new("JSONID", "json-secret"),
+    ];
+    assert_eq!(built.server.read_only_keys, readers);
     assert_eq!(built.server.bucket, "tier-bucket");
     assert_eq!(built.server.region, "eu-west-1");
     assert_eq!(built.server.access_key_id, "AKID");
@@ -291,14 +325,17 @@ fn the_settings_are_made_from_the_flags() {
 /// Asserts that flags that do not fit together are refused with a message that names them: the
 /// water marks out of order, a reconcile interval that is not shorter than the lease, a bucket
 /// called like a probe path, an idle timeout of zero, a request timeout of zero for the S3
-/// tiers, a tier that cannot be opened, and a key file that cannot be used.
+/// tiers, a tier that cannot be opened, and a key file, of the full key or of a read-only one,
+/// that cannot be used. None of them is `InvalidFlags`, the refusal that exits with status 2.
 #[test]
 fn flags_that_do_not_fit_together_are_refused() {
     let dir = TestDir::under(std::env::temp_dir(), "tierstore-refused");
     let refused = |change: &dyn Fn(&mut Cli)| {
         let mut cli = cli(&dir);
         change(&mut cli);
-        build(&cli).err().expect("refused")
+        let why = build(&cli).err().expect("refused");
+        assert!(why.downcast_ref::<InvalidFlags>().is_none(), "{why}");
+        why.to_string()
     };
     assert!(refused(&|cli| cli.low_water = 80).contains("--low-water"));
     assert!(refused(&|cli| cli.high_water = 96).contains("--high-water"));
@@ -317,6 +354,41 @@ fn flags_that_do_not_fit_together_are_refused() {
     let missing = dir.path().join("missing");
     let key = refused(&|cli| cli.access_key_file = missing.clone());
     assert!(key.contains("--access-key-file"), "{key}");
+    let reader = refused(&|cli| cli.read_only_key_file = vec![missing.clone()]);
+    assert!(reader.contains("--read-only-key-file"), "{reader}");
+    assert!(reader.contains("missing"), "{reader}");
+}
+
+/// Asserts that two keys with one id are refused with a message that names the id and the two
+/// flags and not the secrets, and as flags that cannot go together (exit status 2): a read-only
+/// key with the id of the full key, and two read-only keys with one id. The start is refused
+/// before a tier is opened: a directory tier is not made.
+#[test]
+fn two_keys_with_one_id_are_invalid_flags_refused_before_a_tier_is_opened() {
+    let dir = TestDir::under(std::env::temp_dir(), "tierstore-twice");
+    let same = key_file(&dir, "same", "AKID\nanother-secret\n", 0o600);
+    let reader = key_file(&dir, "reader", "READ1\nread-secret-1\n", 0o600);
+    let again = key_file(&dir, "again", JSON_KEY, 0o600);
+    let json_twice = key_file(&dir, "twice", JSON_KEY, 0o600);
+    let made = dir.path().join("made");
+    let cases = [
+        vec![same],
+        vec![reader.clone(), again, json_twice],
+        vec![reader.clone(), reader],
+    ];
+    for files in cases {
+        let mut cli = cli(&dir);
+        cli.hot = format!("dir:{}", made.display());
+        cli.read_only_key_file = files;
+        let why = build(&cli).err().expect("refused");
+        assert!(why.downcast_ref::<InvalidFlags>().is_some(), "{why}");
+        let text = why.to_string();
+        assert!(text.contains("used twice"), "{text}");
+        assert!(text.contains("--access-key-file"), "{text}");
+        assert!(text.contains("--read-only-key-file"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+        assert!(!made.exists());
+    }
 }
 
 /// Asserts that a memory tier and a directory tier open, the directory being made, and that any
@@ -342,21 +414,25 @@ fn only_a_memory_or_a_directory_tier_opens() {
 
 /// Asserts that a tier `s3:<bucket>` is built from the flags of its tier, each tier from its
 /// own: the settings are made without a request, the region is not needed, and the two tiers
-/// have a key file of their own.
+/// have a key file of their own, the hot one in the JSON form and the cold one in the two-line
+/// form, and then the other way round.
 #[test]
 fn an_s3_tier_is_built_from_the_flags_of_its_tier() {
     let dir = TestDir::under(std::env::temp_dir(), "tierstore-s3-tiers");
-    let hot_key = key_file(&dir, "hot-key", "HOTID\nhot-secret\n", 0o600);
+    let hot_key = key_file(&dir, "hot-key", JSON_KEY, 0o600);
     let cold_key = key_file(&dir, "cold-key", "COLDID\ncold-secret\n", 0o600);
     let mut cli = cli(&dir);
     cli.hot = "s3:hot-bucket".to_owned();
     cli.hot_endpoint = Some("http://127.0.0.1:9000".to_owned());
-    cli.hot_credentials_file = Some(hot_key);
+    cli.hot_credentials_file = Some(hot_key.clone());
     cli.cold = "s3:cold-bucket".to_owned();
     cli.cold_endpoint = Some("http://127.0.0.1:9001".to_owned());
     cli.cold_region = Some("eu-west-1".to_owned());
-    cli.cold_credentials_file = Some(cold_key);
+    cli.cold_credentials_file = Some(cold_key.clone());
     build(&cli).expect("built");
+    cli.hot_credentials_file = Some(cold_key);
+    cli.cold_credentials_file = Some(hot_key);
+    build(&cli).expect("built the other way round");
 }
 
 /// Asserts that an S3 tier that its flags do not describe is refused with a message that names
@@ -369,6 +445,8 @@ fn an_s3_tier_that_its_flags_do_not_describe_is_refused() {
     let good = key_file(&dir, "good", "ID\nsecret\n", 0o600);
     let open = key_file(&dir, "open", "ID\nsecret\n", 0o644);
     let incomplete = key_file(&dir, "incomplete", "ID\n", 0o600);
+    let typo = r#"{"access_key_id": "ID", "secret_acess_key": "secret"}"#;
+    let misspelled = key_file(&dir, "misspelled", typo, 0o600);
     let missing = dir.path().join("missing");
     let http = Some("http://127.0.0.1:9000");
     let timeout = Duration::from_secs(5);
@@ -393,6 +471,9 @@ fn an_s3_tier_that_its_flags_do_not_describe_is_refused() {
     assert!(others.contains("others can read it"), "{others}");
     let short = refused("s3:bucket", http, Some(&incomplete));
     assert!(short.contains("on the second"), "{short}");
+    let typed = refused("s3:bucket", http, Some(&misspelled));
+    assert!(typed.contains("--cold-credentials-file"), "{typed}");
+    assert!(typed.contains("access_key_id"), "{typed}");
     let tls = refused("s3:bucket", Some("https://127.0.0.1:9000"), Some(&good));
     assert!(tls.contains("TLS"), "{tls}");
     assert!(tls.contains("--cold"), "{tls}");
@@ -426,14 +507,18 @@ fn an_s3_tier_that_its_flags_do_not_describe_is_refused() {
 }
 
 /// Asserts that the key file is read as an id on the first line and a secret on the second,
-/// trimmed, with either line ending; that others may not read it; and that a file with a
-/// missing or empty line, a missing file and a directory are refused with the flag's name.
+/// trimmed, with either line ending, or as JSON; that others may not read it; and that a file
+/// with a missing or empty line, a missing file and a directory are refused with the flag's
+/// name.
 #[test]
 fn the_key_file_is_an_id_and_a_secret_that_only_its_owner_reads() {
     let dir = TestDir::under(std::env::temp_dir(), "tierstore-key");
     let want = Ok(("AKID".to_owned(), "secret".to_owned()));
     let spaced = key_file(&dir, "spaced", "  AKID \n secret \n", 0o600);
     assert_eq!(read_key(&spaced), want);
+    let json = r#"{"access_key_id": "AKID", "secret_access_key": "secret"}"#;
+    let from_json = key_file(&dir, "json", json, 0o600);
+    assert_eq!(read_key(&from_json), want);
     let crlf = key_file(&dir, "crlf", "AKID\r\nsecret\r\n", 0o600);
     assert_eq!(read_key(&crlf), want);
     let open = key_file(&dir, "open", "AKID\nsecret\n", 0o644);
