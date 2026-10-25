@@ -60,6 +60,9 @@
 //! - the packing client (`kbf-pack`) depending, directly or through another crate, on the
 //!   frontend, the server, the storage node or the daemon (`PACK_MUST_NOT_REACH`); and a walk
 //!   that cannot see `kbf-objstore` beneath it, which would make that check pass vacuously;
+//! - the pack adoption tool (`kbf-pack-adopt`) depending, directly or through another crate, on
+//!   a crate of `PACK_MUST_NOT_REACH`, so that the operator binary never links the frontend, the
+//!   server or the daemon; and a walk that cannot see `kbf-pack` beneath it;
 //! - the hot/cold object store library (`tierstore`) depending, directly or through another
 //!   crate, on any other crate of this workspace, which would stop it from moving to a
 //!   repository of its own (its `s3` feature, off by default, adds the S3 client of
@@ -577,6 +580,29 @@ fn pack_reaches_neither_the_frontend_nor_the_daemon() {
     assert!(
         violations.is_empty(),
         "kbf-pack reaches a frontend or daemon crate:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Asserts that the pack adoption tool (`kbf-pack-adopt`), an operator binary of its own,
+/// reaches none of the crates the packing client may not (`PACK_MUST_NOT_REACH`), and that the
+/// walk sees the packing client beneath it, so the check does not pass on an empty walk.
+#[test]
+fn pack_adopt_reaches_neither_the_frontend_nor_the_daemon() {
+    let g = load_graph();
+    let (_, root) = g
+        .members
+        .get("kbf-pack-adopt")
+        .expect("kbf-pack-adopt is a workspace member");
+    assert!(root.is_some(), "kbf-pack-adopt must have a library target");
+    assert!(
+        !reaches(&g, "kbf-pack-adopt", &["kbf-pack"]).is_empty(),
+        "kbf-pack-adopt's closure must reach kbf-pack, or this walk proves nothing"
+    );
+    let violations = reaches(&g, "kbf-pack-adopt", PACK_MUST_NOT_REACH);
+    assert!(
+        violations.is_empty(),
+        "kbf-pack-adopt reaches a frontend or daemon crate:\n{}",
         violations.join("\n")
     );
 }
