@@ -20,7 +20,7 @@ use kbf_state::{
 fn fires(armed: &AtomicU32) -> bool {
     let down = |n: u32| n.checked_sub(1);
     armed
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, down)
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, down)
         .is_ok()
 }
 

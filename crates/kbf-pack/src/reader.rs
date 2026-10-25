@@ -124,7 +124,7 @@ impl<S: ObjectStore> Reader<S> {
         let distinct: BTreeSet<BlobDigest> = digests.iter().copied().collect();
         let wanted: Vec<BlobDigest> = distinct.into_iter().collect();
         let mut found = BTreeMap::new();
-        let rest = self.from_cache(wanted, &mut found).await;
+        let rest = self.answer_from_cache(wanted, &mut found).await;
         let spans = self.plan(&rest, &mut found).await?;
         let mut fresh = Vec::new();
         for (span, got) in self.fetch_all(spans).await {
@@ -168,7 +168,7 @@ impl<S: ObjectStore> Reader<S> {
     }
 
     /// Answers from the cache what it holds, in `found`, and returns the rest of `wanted`.
-    async fn from_cache(
+    async fn answer_from_cache(
         &self,
         wanted: Vec<BlobDigest>,
         found: &mut BTreeMap<BlobDigest, Fetch>,

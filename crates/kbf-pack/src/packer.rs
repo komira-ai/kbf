@@ -179,7 +179,13 @@ impl<S: ObjectStore> Packer<S> {
                 packs.push(self.commit(writer).await?);
                 continue;
             }
-            if in_open >= self.config.max_blobs || !add(&mut open, &blob)? {
+            // One condition per `if`: the open pack is full by count, or the blob does not fit.
+            let added = if in_open < self.config.max_blobs {
+                add(&mut open, &blob)?
+            } else {
+                false
+            };
+            if !added {
                 let full = std::mem::replace(&mut open, SegmentWriter::new(limit));
                 packs.push(self.commit(full).await?);
                 add(&mut open, &blob)?;
