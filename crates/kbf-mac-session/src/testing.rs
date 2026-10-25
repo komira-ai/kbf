@@ -295,16 +295,35 @@ impl Host for FakeHost {
     }
 }
 
-/// The path an open descriptor names (Linux).
-fn fd_path(fd: &impl std::os::fd::AsRawFd) -> PathBuf {
-    std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap()
+/// The path an open descriptor names: `/proc` on Linux, `F_GETPATH` on macOS (which
+/// answers the path with its links resolved; [`scratch`] is already resolved).
+fn fd_path(fd: &impl std::os::fd::AsFd) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = rustix::fs::getpath(fd).unwrap();
+        PathBuf::from(std::ffi::OsStr::from_bytes(path.as_bytes()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use std::os::fd::AsRawFd as _;
+        std::fs::read_link(format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd())).unwrap()
+    }
 }
 
 /// A fresh scratch directory for one test. Under `/tmp` with a short name, not the
 /// per-user temporary folder: a socket path on macOS holds at most 104 bytes, and
 /// macOS's per-user temporary folder alone takes about 50.
+///
+/// Under the resolved `/tmp` (`/private/tmp` on macOS), so a path the tests hand a
+/// command is the one `F_GETPATH` answers for the same file. In the user's own group:
+/// a new entry takes its directory's group on macOS and `/tmp` is `wheel`'s, which a
+/// test user cannot give a file to, as the helper does when it gives a bundle back.
 pub(crate) fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
-    kbf_testkit::dir::TestDir::under("/tmp", &format!("kms-{name}"))
+    let root = std::fs::canonicalize("/tmp").unwrap();
+    let dir = kbf_testkit::dir::TestDir::under(root, &format!("kms-{name}"));
+    std::os::unix::fs::chown(dir.path(), None, Some(rustix::process::getgid().as_raw())).unwrap();
+    dir
 }
 
 /// Shows tracing output in test logs, so the log statements' arguments run.
