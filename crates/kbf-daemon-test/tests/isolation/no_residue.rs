@@ -323,7 +323,7 @@ fn a_restarted_daemon_sweeps_the_lease_it_left() {
 fn stand_in_rmdir(rig: &Rig) {
     let actions = rig
         .bin()
-        .join("cgroup/kbf.slice/kbf-all-in-one.service/actions");
+        .join("cgroup/kbf.slice/kbf-storage-and-daemon.service/actions");
     for entry in probe::read_dir(&actions).expect("the actions cgroup") {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with(probe::LEASE_PREFIX) {

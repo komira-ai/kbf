@@ -366,7 +366,8 @@ fn every_mode_takes_check_and_config() {
         "--key=node.key",
         "--node-id=n",
     ];
-    for mode in names::MODES {
+    // `all-in-one` is refused before any file is read; binary.rs pins that.
+    for mode in names::MODES.iter().filter(|m| m.name != names::ALL_IN_ONE) {
         let mut words = vec!["kbf", mode.name];
         match mode.name {
             names::FRONTEND => words.push("--storage=http://127.0.0.1:1"),

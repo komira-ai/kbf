@@ -9,9 +9,11 @@ use std::time::Duration;
 use super::fx::{Fx, NEW, NEW_VERSION, OLD, OLD_VERSION, mkdir, write};
 use crate::mac::channel::{DEFAULT_SOURCE_REF, MacAllowlist, Source, is_branch_ref};
 use crate::mac::conf::{node_id, parse_node_id};
+use crate::mac::fetch::AssetKind;
 use crate::mac::kit::{self, Links};
 use crate::mac::release::{
-    PickError, bundle_name, commit_prefix, is_commit, pick, pick_named, tarball_name,
+    PickError, SUMS_NAME, bundle_name, bundle_of, commit_prefix, is_commit, listed_hash, pick,
+    pick_named, tarball_name,
 };
 use crate::mac::status::{self, ApplyState};
 use crate::mac::tools;
@@ -882,4 +884,84 @@ fn the_running_commit_is_the_release_the_daemon_process_executes() {
         None,
         "launchctl cannot start"
     );
+}
+
+// ---- the files of a release ----
+
+/// A release file is named for its kind, platform and commit, its bundle is the same name with
+/// `.sigstore.json`, and a name gives its commit back only for its own kind and platform.
+#[test]
+fn a_release_file_has_its_own_name_bundle_and_commit() {
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let tarball = AssetKind::Tarball;
+    let image = AssetKind::FrontendImage;
+    assert_eq!(
+        tarball.name_on("linux-arm64", commit),
+        format!("kbf-{commit}-linux-arm64.tar.gz")
+    );
+    assert_eq!(
+        image.name_on("linux-arm64", commit),
+        format!("kbf-frontend-image-{commit}-linux-arm64.oci.tar")
+    );
+    assert_eq!(
+        bundle_of(&image.name_on("linux-x86_64", commit)),
+        format!("kbf-frontend-image-{commit}-linux-x86_64.oci.tar.sigstore.json")
+    );
+    assert_eq!(
+        bundle_of(&tarball.name_on("linux-x86_64", commit)),
+        format!("kbf-{commit}-linux-x86_64.tar.gz.sigstore.json")
+    );
+
+    assert_eq!(
+        AssetKind::Deb.name_on("linux-arm64", commit),
+        format!("kbf-{commit}-linux-arm64.deb")
+    );
+    for kind in [tarball, image, AssetKind::Deb, AssetKind::Rpm] {
+        let name = kind.name_on("linux-arm64", commit);
+        assert_eq!(kind.commit_of_name_on("linux-arm64", &name), Some(commit));
+        assert_eq!(kind.commit_of_name_on("linux-x86_64", &name), None);
+        assert_eq!(
+            kind.commit_of_name_on("linux-arm64", &format!("{name}.sigstore.json")),
+            None
+        );
+    }
+    // One kind's name is not the other's.
+    let image_name = image.name_on("linux-arm64", commit);
+    assert_eq!(tarball.commit_of_name_on("linux-arm64", &image_name), None);
+    let tarball_name = tarball.name_on("linux-arm64", commit);
+    assert_eq!(image.commit_of_name_on("linux-arm64", &tarball_name), None);
+    // A commit that is not 40 hex digits is none.
+    assert_eq!(
+        image.commit_of_name_on("linux-arm64", "kbf-frontend-image-abc-linux-arm64.oci.tar"),
+        None
+    );
+}
+
+/// The sha256 a release's sums list for a file is found by the file's whole name; sums that are
+/// not lines of `<64 hex>  <name>` (or name a file twice, or a path) are malformed, and a file
+/// not listed is unknown.
+#[test]
+fn the_sums_give_the_sha256_listed_for_one_file() {
+    let (a, b) = ("a".repeat(64), "b".repeat(64));
+    let sums = format!("{a}  one.tar\n{b}  two.tar\n");
+    assert_eq!(SUMS_NAME, "SHA256SUMS");
+    assert_eq!(listed_hash(&sums, "two.tar").as_deref(), Ok(b.as_str()));
+    assert_eq!(listed_hash(&sums, "one.tar").as_deref(), Ok(a.as_str()));
+    assert_eq!(listed_hash(&sums, "two"), Err(PickError::Unknown));
+    assert_eq!(listed_hash("", "one.tar"), Err(PickError::Unknown));
+    for bad in [
+        format!("{a}  one.tar"),
+        format!("{a} one.tar\n"),
+        format!("{}  one.tar\n", "a".repeat(63)),
+        format!("{}  one.tar\n", "A".repeat(64)),
+        format!("{a}  \n"),
+        format!("{a}  dir/one.tar\n"),
+        format!("{a}  one.tar\n{b}  one.tar\n"),
+    ] {
+        assert_eq!(
+            listed_hash(&bad, "one.tar"),
+            Err(PickError::Malformed),
+            "{bad:?}"
+        );
+    }
 }

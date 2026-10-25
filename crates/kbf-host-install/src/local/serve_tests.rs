@@ -18,7 +18,7 @@ use super::answer::{Answer, Code};
 use super::backend::Fault;
 use super::core_tests::{A, B, Fx, VA, VB};
 use super::request::MAX_LINE_LEN;
-use super::serve::{ServeConfig, Serving, bind, passwd_ids, read_line};
+use super::serve::{Layout, ServeConfig, Serving, bind, passwd_ids, read_line};
 use crate::trust::Trust;
 
 fn trust(dir: &Path) -> Trust {
@@ -41,6 +41,37 @@ fn the_ids_of_an_account_come_from_the_passwd_text() {
     assert_eq!(passwd_ids(passwd, "short"), None);
     assert_eq!(passwd_ids(passwd, "nobody"), None);
     assert_eq!(passwd_ids("", "root"), None);
+}
+
+/// `--layout` says how the host keeps its releases: the hand-placed layout of `kbf-installer`
+/// when it is absent or says `installer`, the `kbf` package as a deb or an rpm when it says so;
+/// anything else, or a second one, is refused.
+#[test]
+fn the_layout_flag_names_how_releases_are_kept() {
+    let with = |extra: &[&str]| {
+        let mut words = vec!["--socket", "/s", "--socket-user", "u"];
+        words.extend_from_slice(extra);
+        ServeConfig::parse(&args(&words))
+    };
+    assert_eq!(with(&[]).unwrap().layout, Layout::Installer);
+    assert_eq!(
+        with(&["--layout", "installer"]).unwrap().layout,
+        Layout::Installer
+    );
+    assert_eq!(with(&["--layout", "deb"]).unwrap().layout, Layout::Deb);
+    assert_eq!(with(&["--layout=rpm"]).unwrap().layout, Layout::Rpm);
+    assert!(
+        with(&["--layout", "tarball"])
+            .unwrap_err()
+            .contains("installer, deb or rpm")
+    );
+    assert!(
+        with(&["--layout", "deb", "--layout", "rpm"])
+            .unwrap_err()
+            .contains("given twice")
+    );
+    assert!(with(&["--layout"]).unwrap_err().contains("needs a value"));
+    assert!(super::serve::USAGE.contains("--layout installer|deb|rpm"));
 }
 
 /// The flags: the socket and its account are required, the window defaults to ten minutes and
@@ -67,6 +98,7 @@ fn the_flags_make_one_config_and_refuse_the_rest() {
 
     let minimal = ServeConfig::parse(&args(&["--socket", "/s", "--socket-user", "u"])).unwrap();
     assert_eq!((minimal.window_secs, minimal.units.len()), (600, 0));
+    assert!(!minimal.frontend_container);
 
     let bad: [(&[&str], &str); 10] = [
         (&["--socket-user", "u"], "--socket is required"),
@@ -557,4 +589,112 @@ fn a_revert_that_fails_is_not_retried_on_every_turn() {
     });
     // One attempt, said twice: the loop's line and the failure's.
     assert_eq!(logged.len(), 2, "{logged:?}");
+}
+
+/// `--frontend-container` is a flag with no value, given once, and it replaces the units: a
+/// host serves a container or restarts units, not both.
+#[test]
+fn the_frontend_container_flag_stands_for_the_units() {
+    let base = ["--socket", "/s", "--socket-user", "u"];
+    let with = |extra: &[&str]| {
+        let mut words: Vec<&str> = base.to_vec();
+        words.extend(extra);
+        ServeConfig::parse(&args(&words))
+    };
+    let config = with(&["--frontend-container"]).unwrap();
+    assert!(config.frontend_container && config.units.is_empty());
+    // It may come before the flags that take a value.
+    let first = ServeConfig::parse(&args(&[
+        "--frontend-container",
+        "--socket",
+        "/s",
+        "--socket-user",
+        "u",
+    ]))
+    .unwrap();
+    assert!(first.frontend_container);
+    for bad in [
+        &["--frontend-container", "--frontend-container"][..],
+        &["--frontend-container=yes"],
+        &[
+            "--frontend-container",
+            "--restart-unit",
+            "kbf-daemon.service",
+        ],
+        &[
+            "--restart-unit",
+            "kbf-daemon.service",
+            "--frontend-container",
+        ],
+        &["--frontend-container", "--layout", "deb"],
+        &["--layout=rpm", "--frontend-container"],
+    ] {
+        assert!(with(bad).is_err(), "{bad:?}");
+    }
+    assert!(
+        with(&["--frontend-container", "--layout", "deb"])
+            .unwrap_err()
+            .contains("--layout deb or rpm")
+    );
+    // The hand-placed layout, named, is the default and goes with a container.
+    assert!(with(&["--frontend-container", "--layout", "installer"]).is_ok());
+    assert!(
+        with(&["--frontend-container", "--frontend-container"])
+            .unwrap_err()
+            .contains("takes no value and is given once")
+    );
+}
+
+/// `--frontend-config` names the container's file, once, as an absolute path, and only for a
+/// helper of a container; left out it is the default file.
+#[test]
+fn the_frontend_config_flag_names_the_file() {
+    let base = [
+        "--socket",
+        "/s",
+        "--socket-user",
+        "u",
+        "--frontend-container",
+    ];
+    let with = |extra: &[&str]| {
+        let mut words: Vec<&str> = base.to_vec();
+        words.extend(extra);
+        ServeConfig::parse(&args(&words))
+    };
+    assert_eq!(
+        with(&[]).unwrap().frontend_config,
+        PathBuf::from("/etc/kbf/host-install-frontend.toml")
+    );
+    assert_eq!(
+        with(&["--frontend-config", "/etc/kbf/fe-b.toml"])
+            .unwrap()
+            .frontend_config,
+        PathBuf::from("/etc/kbf/fe-b.toml")
+    );
+    assert_eq!(
+        with(&["--frontend-config=/x.toml"])
+            .unwrap()
+            .frontend_config,
+        PathBuf::from("/x.toml")
+    );
+    assert!(
+        with(&["--frontend-config=a.toml"])
+            .unwrap_err()
+            .contains("absolute")
+    );
+    assert!(
+        with(&["--frontend-config=/a", "--frontend-config=/b"])
+            .unwrap_err()
+            .contains("given twice")
+    );
+    let units = ServeConfig::parse(&args(&[
+        "--socket",
+        "/s",
+        "--socket-user",
+        "u",
+        "--restart-unit",
+        "kbf-daemon.service",
+        "--frontend-config=/a",
+    ]));
+    assert!(units.unwrap_err().contains("needs --frontend-container"));
 }

@@ -209,13 +209,12 @@ impl Batch {
         self.0.is_empty()
     }
 
-    /// Runs the commands in one `dscl .` process; nothing runs when there are none. The
-    /// exit status is not used: `apply` checks every item again afterwards, and says
-    /// what is still wrong.
-    pub(crate) fn run(&self, c: &Ctx<'_>) {
-        if !self.is_empty() {
-            c.mac.succeeds_with_input(DSCL, &["."], &self.0);
-        }
+    /// Runs the commands in one `dscl .` process; nothing runs when there are none.
+    /// `false` when `dscl` did not run, exited non-zero or printed a `DS Error`. Most
+    /// callers do not use it: `apply` checks every item again afterwards, and says what
+    /// is still wrong.
+    pub(crate) fn run(&self, c: &Ctx<'_>) -> bool {
+        self.is_empty() || c.mac.succeeds_with_input(DSCL, &["."], &self.0)
     }
 }
 

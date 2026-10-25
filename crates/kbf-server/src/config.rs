@@ -604,6 +604,13 @@ pub struct Args {
         value_name = "BOOL"
     )]
     pub ui: bool,
+    /// Opens the pack index at start: the tables in the Postgres state store that say which
+    /// pack holds each blob and where. Nothing reads or writes them yet, so the flag only
+    /// checks that the store can hold them. Needs `--state-store` as a `postgres://` URL whose
+    /// schema has the pack tables (`kbf-installer setup` makes them); a `sqlite://` store is
+    /// refused. Left out, no pack table is touched
+    #[arg(long)]
+    pub pack_index: bool,
 }
 
 /// This server in the tier registry. A farm runs one server today

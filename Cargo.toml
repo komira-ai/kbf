@@ -188,7 +188,7 @@ zeroize = "1.9.1"
 zip = { version = "9.0.1", default-features = false, features = ["deflate-flate2"] }
 
 kbf-alert = { path = "crates/kbf-alert" }
-kbf-all-in-one = { path = "crates/kbf-all-in-one" }
+kbf-storage-and-daemon = { path = "crates/kbf-storage-and-daemon" }
 kbf-auth = { path = "crates/kbf-auth" }
 kbf-ca = { path = "crates/kbf-ca" }
 kbf-caps = { path = "crates/kbf-caps" }
@@ -202,6 +202,7 @@ kbf-enroll-registry = { path = "crates/kbf-enroll-registry" }
 kbf-enroll = { path = "crates/kbf-enroll" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
+kbf-guest = { path = "crates/kbf-guest" }
 kbf-gate = { path = "crates/kbf-gate" }
 kbf-harness = { path = "crates/kbf-harness" }
 kbf-history = { path = "crates/kbf-history" }
@@ -246,7 +247,8 @@ kbf-ui = { path = "crates/kbf-ui" }
 kbf-unitfile = { path = "crates/kbf-unitfile" }
 kbf-update = { path = "crates/kbf-update" }
 kbf-updater = { path = "crates/kbf-updater" }
-# The hot/cold object store library; it depends on no kbf crate (kbf-integration-test keeps it so).
+# The hot/cold object store library; it depends on no kbf crate unless its `s3` feature is on
+# (kbf-integration-test keeps it so).
 tierstore = { path = "crates/tierstore" }
 # The CI verbs (`cargo xtask`); kbf-integration-test reads the interpreter budget with its parser.
 xtask = { path = "crates/xtask" }
@@ -256,7 +258,7 @@ xtask = { path = "crates/xtask" }
 # its `lib.rs` (an in-source attribute overrides this table), and the layering test in
 # `kbf-integration-test` checks that the deny is present.
 [workspace.lints.rust]
-# `coverage` is set by cargo-llvm-cov (crates/kbf-all-in-one-test and crates/kbf-daemon-test compile their tests out under it).
+# `coverage` is set by cargo-llvm-cov (crates/kbf-farm-test and crates/kbf-daemon-test compile their tests out under it).
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
 
 [workspace.lints.clippy]

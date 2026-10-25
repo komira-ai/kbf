@@ -2,7 +2,9 @@
 //!
 //! No Virtualization.framework here: the guest only uses what any process may.
 
+use std::fs::File;
 use std::io::Write;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -10,12 +12,63 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::frame::{self, Frame, Kind, SendError};
 use crate::probe::Host;
+use crate::vsock::{AF_VSOCK, HOST_CID, SOCKADDR_VM_LEN, set_io_timeout, sockaddr_vm};
 
 pub struct SystemHost;
 
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+/// How long a read or write on the connection may block.
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A failed step of connecting to the host.
+#[derive(Debug)]
+struct ConnectError {
+    stage: &'static str,
+    errno: i32,
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} failed: errno {} ({})",
+            self.stage,
+            self.errno,
+            std::io::Error::from_raw_os_error(self.errno)
+        )
+    }
+}
+
+/// Connects a stream socket to the host on vsock `port`, with a read and write timeout, so
+/// a host that never answers cannot hold the probe.
+fn connect_host(port: u32) -> Result<File, ConnectError> {
+    let fail = |stage| ConnectError {
+        stage,
+        errno: errno(),
+    };
+    // SAFETY: plain socket(2) call; a descriptor it returns is owned by the `File` below.
+    let fd = unsafe { libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(fail("socket"));
+    }
+    // SAFETY: `fd` was just returned by socket(2) and nothing else owns it.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let file = File::from(owned);
+    set_io_timeout(fd, IO_TIMEOUT).map_err(|errno| ConnectError {
+        stage: "setsockopt",
+        errno,
+    })?;
+    let addr = sockaddr_vm(HOST_CID, port);
+    // SAFETY: `addr` is a `struct sockaddr_vm`-sized buffer and its length is passed.
+    if unsafe { libc::connect(fd, addr.as_ptr().cast(), SOCKADDR_VM_LEN as libc::socklen_t) } != 0 {
+        return Err(fail("connect"));
+    }
+    Ok(file)
 }
 
 impl Host for SystemHost {
@@ -41,27 +94,16 @@ impl Host for SystemHost {
     }
 
     fn vsock(&self, port: u32) -> Value {
-        // macOS has no public AF_VSOCK; 40 is the Linux value, tried to see what the
-        // kernel answers. The socket call is the question; a connect is tried only if it
-        // succeeds, with a BSD-layout address (length byte, family byte) for the host
-        // (CID 2).
-        const AF_VSOCK: libc::c_int = 40;
-        // SAFETY: plain socket(2) call; the descriptor is closed below.
-        let fd = unsafe { libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0) };
-        if fd < 0 {
-            return json!({"socket_errno": errno(), "connected": false});
+        match connect_host(port) {
+            Ok(_) => json!({"socket_errno": null, "connect_errno": null, "connected": true}),
+            Err(e) if e.stage == "socket" => json!({"socket_errno": e.errno, "connected": false}),
+            Err(e) => json!({"socket_errno": null, "connect_errno": e.errno, "connected": false}),
         }
-        let mut addr = [0u8; 16];
-        addr[0] = 16;
-        addr[1] = AF_VSOCK as u8;
-        addr[4..8].copy_from_slice(&port.to_le_bytes());
-        addr[8..12].copy_from_slice(&2u32.to_le_bytes());
-        // SAFETY: `addr` is a 16-byte buffer and its length is passed.
-        let rc = unsafe { libc::connect(fd, addr.as_ptr().cast(), 16) };
-        let connect_errno = (rc != 0).then(errno);
-        // SAFETY: `fd` is the descriptor opened above.
-        unsafe { libc::close(fd) };
-        json!({"socket_errno": null, "connect_errno": connect_errno, "connected": rc == 0})
+    }
+
+    fn send_frame(&self, port: u32, frame: &Frame) -> Result<(), SendError> {
+        let mut stream = connect_host(port).map_err(|e| SendError::Unavailable(e.to_string()))?;
+        frame::exchange(&mut stream, frame)
     }
 
     fn console(&self, name: &str) -> Value {
@@ -140,5 +182,116 @@ impl Host for SystemHost {
 
     fn pause(&self, d: Duration) {
         std::thread::sleep(d);
+    }
+}
+
+impl crate::mount::Mounter for SystemHost {
+    fn mount(&self, tag: &str, mountpoint: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(mountpoint)
+            .map_err(|e| format!("create {}: {e}", mountpoint.display()))?;
+        let out = Command::new("/sbin/mount_virtiofs")
+            .arg(tag)
+            .arg(mountpoint)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("run /sbin/mount_virtiofs: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "mount_virtiofs exited {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    }
+
+    fn pause(&self, d: Duration) {
+        std::thread::sleep(d);
+    }
+}
+
+impl crate::diag::DiagHost for SystemHost {
+    fn run(&self, program: &str, args: &[&str]) -> Value {
+        match Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(out) => json!({
+                "exit_code": out.status.code(),
+                "stdout": String::from_utf8_lossy(&out.stdout).trim_end(),
+                "stderr": String::from_utf8_lossy(&out.stderr).trim_end(),
+            }),
+            Err(e) => json!({"spawn_error": e.to_string()}),
+        }
+    }
+
+    fn ids(&self) -> Value {
+        // SAFETY: the four calls take no arguments and cannot fail.
+        let (uid, euid, gid, egid) = unsafe {
+            (
+                libc::getuid(),
+                libc::geteuid(),
+                libc::getgid(),
+                libc::getegid(),
+            )
+        };
+        json!({"uid": uid, "euid": euid, "gid": gid, "egid": egid})
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+
+    fn pause(&self, d: Duration) {
+        std::thread::sleep(d);
+    }
+
+    fn vsock_round_trip(&self, port: u32) -> Value {
+        let mut stream = match connect_host(port) {
+            Ok(s) => s,
+            Err(e) => {
+                return json!({
+                    "port": port,
+                    "connected": false,
+                    "round_trip": false,
+                    "stage": e.stage,
+                    "errno": e.errno,
+                    "error": e.to_string(),
+                });
+            }
+        };
+        let test = Frame::new(Kind::Log, "vsock-test", "kbf-guest probe-diag test frame\n");
+        let sent = frame::exchange(&mut stream, &test);
+        json!({
+            "port": port,
+            "connected": true,
+            "round_trip": sent.is_ok(),
+            "error": sent.err().map(|e| e.to_string()),
+        })
+    }
+
+    fn send_frame(&self, port: u32, frame: &Frame) -> Result<(), SendError> {
+        <Self as Host>::send_frame(self, port, frame)
+    }
+
+    fn mount_cycle(&self, tag: &str, mountpoint: &Path, inside: &dyn Fn(&Path) -> Value) -> Value {
+        use crate::mount::Mounter;
+        if let Err(e) = self.mount(tag, mountpoint) {
+            return json!({"mounted": false, "error": e});
+        }
+        let inside = inside(mountpoint);
+        let unmounted = std::ffi::CString::new(mountpoint.as_os_str().as_encoded_bytes())
+            .map_err(|e| e.to_string())
+            .and_then(|path| {
+                // SAFETY: `path` is a NUL-terminated string that outlives the call.
+                if unsafe { libc::unmount(path.as_ptr(), 0) } == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error().to_string())
+                }
+            });
+        json!({"mounted": true, "inside": inside, "unmount_error": unmounted.err()})
     }
 }

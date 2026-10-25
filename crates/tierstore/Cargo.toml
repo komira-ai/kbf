@@ -7,13 +7,18 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# A generic hot/cold object store over S3-compatible backends. It knows nothing of kbf and has
-# no kbf crate among its normal dependencies, so it can move to a repository of its own
-# (crates/kbf-integration-test/tests/layering.rs keeps it that way). The tests of the `server`
-# feature use `kbf-objstore` and `kbf-testkit` as dev-dependencies, which stay behind when it
+# A generic hot/cold object store over S3-compatible backends. It knows nothing of kbf and its
+# normal dependencies include no kbf crate unless the `s3` feature is on, so it can move to a
+# repository of its own (crates/kbf-integration-test/tests/layering.rs keeps it that way). The
+# tests use `kbf-objstore` and `kbf-testkit` as dev-dependencies, which stay behind when it
 # moves.
 
 [features]
+# `S3Backend`, a `Backend` over the S3 client of `kbf-objstore`. Off by default: without it the
+# crate's own dependencies include no kbf crate (crates/kbf-integration-test/tests/layering.rs
+# checks the normal dependencies without it; the tests always build `kbf-objstore`, see
+# `[dev-dependencies]`). CI runs the tests and clippy with it on (.github/workflows/ci.yml).
+s3 = ["dep:kbf-objstore"]
 # `server`: the S3 API front of the proxy (the `server` module) and the `tierstore` binary that
 # runs it. Off by default, so the library carries no HTTP stack; the crate's own tests turn it on
 # through the dev-dependency on itself, so the workspace runs build and test it.
@@ -63,6 +68,8 @@ http-body-util = { workspace = true, optional = true }
 # The HTTP/1.1 server under the S3 front (`server`).
 hyper = { workspace = true, features = ["http1", "server"], optional = true }
 hyper-util = { workspace = true, features = ["tokio"], optional = true }
+# `s3` only: the S3 client that `S3Backend` adapts.
+kbf-objstore = { workspace = true, optional = true }
 # The MD5 a client may send as the `Content-MD5` of a body (`server`).
 md-5 = { workspace = true, optional = true }
 # The decoding of a request's path and query, and the encoding SigV4 signs (`server`).
@@ -84,8 +91,10 @@ tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
 [dev-dependencies]
 # Signs the requests the tests of the S3 front send by hand, apart from the code that checks them.
 hmac.workspace = true
-# The S3 client kbf itself uses, which the tests of the S3 front drive it with.
-kbf-objstore.workspace = true
+# The S3 client kbf itself uses, which the tests of the S3 front drive it with, and the loopback
+# S3 service of the tests of `S3Backend`. A dev-dependency is built for every test build, with
+# the `s3` feature or without it, though only the `s3` tests use the service.
+kbf-objstore = { workspace = true, features = ["testkit"] }
 # Scratch directories and key files of the tests of the binary.
 kbf-testkit.workspace = true
 # Sends the requests the S3 client does not: unsigned ones and ones signed by hand.

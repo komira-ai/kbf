@@ -23,6 +23,7 @@ use kbf_meta::Retention;
 use kbf_objstore::{
     Floor, FsStore, FsStoreError, KeyPrefix, ObjectStore, objects_source, statvfs_source,
 };
+use kbf_state::PackIndex;
 use kbf_storage::local_cache::{HeldBytes, LocalCache};
 use kbf_store::StdFs;
 use kbf_threads::Topology;
@@ -97,9 +98,18 @@ pub struct ServerHandle {
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
     _pass: Option<AbortOnDrop>,
+    /// The pack index `--pack-index` opened, if the flag was given.
+    pack_index: Option<Arc<dyn PackIndex>>,
 }
 
 impl ServerHandle {
+    /// The pack index `--pack-index` opened on the Postgres state store, or `None` without the
+    /// flag. Nothing in the server reads or writes it yet.
+    #[must_use]
+    pub fn pack_index(&self) -> Option<Arc<dyn PackIndex>> {
+        self.pack_index.clone()
+    }
+
     /// The line `kbf-server` prints once it is bound (see the binary's docs for its
     /// fields).
     #[must_use]
@@ -286,6 +296,7 @@ where
     args.retired_release.warn();
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
+    let pack_index = args.open_pack_index()?;
     let state = with_members(
         args.open_state_store().map_err(ServeError::State)?,
         args.members(),
@@ -337,6 +348,7 @@ where
         serving: Box::pin(bound.serving),
         _flusher,
         _pass,
+        pack_index,
     })
 }
 
@@ -584,6 +596,56 @@ mod tests {
         assert!(said.contains("another kbf process"), "{said}");
         drop(first);
         start("three").await.expect("free once the first is gone");
+    }
+
+    /// Starts a server over `args` on a metadata log and a cold store of its own, in the
+    /// directory `dir` under `root`.
+    async fn boot(args: &Args, root: &Path, dir: &str) -> Result<ServerHandle, Box<dyn Error>> {
+        let log = RaftMetaLog::open_dir(&root.join(dir), Retention::default(), "kbf/")
+            .await
+            .expect("open the log");
+        let (prefix, id) = (log.store_prefix(), log.log_id());
+        let store = FsStore::open(&root.join(format!("{dir}-blobs")), Floor::Bytes(1))
+            .expect("open the store");
+        serve_with(args, None, log, store, prefix, id, interrupted).await
+    }
+
+    /// Asserts that `--pack-index` reaches the started server: over a Postgres state store a
+    /// server given the flag carries the index and one without it carries none, and a start is
+    /// refused with the line that says why when the flag has no state store or a SQLite one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_started_server_carries_the_pack_index_the_flag_names() {
+        // The test database makes and drops itself with a runtime of its own, which tokio
+        // refuses on a thread that is running tasks: both happen on a thread of their own.
+        let db = std::thread::spawn(kbf_state::postgres::test_database);
+        let db = db.join().expect("a test database");
+        let root = crate::test_dir::scratch_dir("kbf-server-pack-index");
+        let mut args = Args::parse_from([
+            "kbf-server",
+            "--listen=127.0.0.1:0",
+            "--worker-listen=127.0.0.1:0",
+        ]);
+        args.state_store = Some(db.url().parse().expect("a postgres URL"));
+        let off = boot(&args, &root, "off").await;
+        let off = off.expect("starts without the flag");
+        assert!(off.pack_index().is_none());
+        drop(off);
+        args.pack_index = true;
+        let on = boot(&args, &root, "on").await;
+        let on = on.expect("starts with the flag");
+        assert!(on.pack_index().is_some());
+        drop(on);
+        let file = root.join("state.db");
+        args.state_store = Some(crate::StateStoreUri::Sqlite(file));
+        let refused = boot(&args, &root, "sqlite").await;
+        let said = refused.err().expect("SQLite").to_string();
+        assert!(said.contains("not SQLite"), "{said}");
+        args.state_store = None;
+        let refused = boot(&args, &root, "none").await;
+        let said = refused.err().expect("no state store").to_string();
+        assert!(said.contains("needs --state-store"), "{said}");
+        let dropped = std::thread::spawn(move || drop(db));
+        dropped.join().expect("the test database is dropped");
     }
 
     /// Catches the server sizing itself from anything but the CPU count: on the 44-core,

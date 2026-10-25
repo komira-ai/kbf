@@ -46,6 +46,10 @@ pub enum Gate {
     /// Start a VM from a launch-daemon child, nobody logged in, as a throwaway uid.
     #[value(alias = "p5")]
     G5,
+    /// Why a booted guest never reaches its own userspace: two guests at once, every
+    /// helper event timed, CPU and disk writes sampled, the clones kept for `image
+    /// harvest` (give `--guest-binary` and `--keep`).
+    E1,
     /// Whether a root offline write into a guest volume works.
     P0,
     /// The third-VM limit error, and the slot after SIGKILL of a helper.
@@ -67,6 +71,15 @@ pub struct Common {
     /// A `kbf-guest` built for macOS, copied into the folder shared with each guest.
     #[arg(long)]
     pub guest_binary: Option<PathBuf>,
+    /// Start the probe VMs without a graphics device. Without this flag they have one,
+    /// because a headless guest crash-loops its window server; use this to compare.
+    /// (E1's first arm is headless either way.)
+    #[arg(long)]
+    pub headless: bool,
+    /// Do not attach the share matrix to E1's VMs (about ten extra virtiofs devices, each
+    /// with a host directory that differs in one factor; see `docs/spikes/macos-vm-probe.md`).
+    #[arg(long)]
+    pub no_matrix: bool,
 }
 
 #[derive(Debug, Args)]
@@ -78,6 +91,10 @@ pub struct ProbeArgs {
     /// The user id G5 starts the helper as (default 59001); needs root.
     #[arg(long)]
     pub run_as_uid: Option<u32>,
+    /// Leave the clones and their shares in the work directory when the probe ends, so
+    /// `image harvest` can read the guest's disk.
+    #[arg(long)]
+    pub keep: bool,
 }
 
 #[derive(Debug, Args)]
@@ -109,6 +126,10 @@ pub enum ImageCmd {
         /// the installed image (probe P0's question).
         #[arg(long)]
         offline_setup: bool,
+        /// The `kbf-guest` for macOS that `--offline-setup` copies onto the guest's disk
+        /// (the mount daemon runs it); required with `--offline-setup`.
+        #[arg(long)]
+        guest_binary: Option<PathBuf>,
     },
     /// As root, write the probe launch daemons and the Setup Assistant marker into an
     /// existing base bundle (the `--offline-setup` step, for a bundle built without it).
@@ -116,5 +137,19 @@ pub enum ImageCmd {
         /// The base bundle directory.
         #[arg(long)]
         base: PathBuf,
+        /// The `kbf-guest` for macOS to copy onto the guest's disk; the mount daemon runs it.
+        #[arg(long)]
+        guest_binary: Option<PathBuf>,
+    },
+    /// As root, copy a fixed allowlist of diagnostics (the probe daemons' logs, the local
+    /// marker, the unified log's data files, crash reports) out of a stopped guest's disk
+    /// into a new directory. The disk is attached read-only; nothing else is read.
+    Harvest {
+        /// The bundle (a clone kept by `probe e1 --keep`).
+        #[arg(long)]
+        bundle: PathBuf,
+        /// The new directory to copy into; it must not exist.
+        #[arg(long)]
+        out: PathBuf,
     },
 }

@@ -43,6 +43,10 @@
 //! opened and probed by `/readyz`; a `sqlite://` one starts and logs that SQLite is
 //! removed in the next release ([`crate::StateStoreUri::open`]).
 //!
+//! **The pack index** is off unless `--pack-index` is given (the flag's help has its rules).
+//! The started frontend carries it ([`FrontendHandle::pack_index`]); nothing in the frontend
+//! reads or writes it yet.
+//!
 //! **Readiness** (`GET /readyz`, `grpc.health.v1`) fails when the storage node does not
 //! answer an action-cache lookup within `--readyz-store-timeout-ms`, when the state store (if
 //! configured) does not answer a read, and when the storage map is not loaded (always
@@ -96,6 +100,7 @@ use kbf_front::{
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
 use kbf_proto::worker::worker_server::WorkerServer;
 use kbf_route::{DEFAULT_HOLD, Hold, TlsNodes};
+use kbf_state::PackIndex;
 use kbf_storage::Storage;
 use kbf_storage::service::RemoteStorage;
 use kbf_threads::Topology;
@@ -166,6 +171,7 @@ pub const ALLOWED: &[&str] = &[
     "shutdown_timeout_secs",
     "invocation_memory",
     "state_store",
+    "pack_index",
     "member_ttl_secs",
     "member_dwell_secs",
     "history_objects",
@@ -308,6 +314,9 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         )));
     }
     let server = Args::from_arg_matches(m)?;
+    if let Err(why) = server.pack_index_url() {
+        return Err(refuse(why.to_string()));
+    }
     let enroll = crate::enroll::flags::from_matches(m).map_err(refuse)?;
     let storage = server
         .storage()
@@ -467,9 +476,18 @@ pub struct FrontendHandle {
     background: Vec<BoxFuture<'static, ()>>,
     /// Tells the service manager the frontend serves, once its probes pass.
     ready: Ready,
+    /// The pack index `--pack-index` opened, if the flag was given.
+    pack_index: Option<Arc<dyn PackIndex>>,
 }
 
 impl FrontendHandle {
+    /// The pack index `--pack-index` opened on the Postgres state store, or `None` without the
+    /// flag. Nothing in the frontend reads or writes it yet.
+    #[must_use]
+    pub fn pack_index(&self) -> Option<Arc<dyn PackIndex>> {
+        self.pack_index.clone()
+    }
+
     /// The frontend's drain ([`Drain`]): `POST /v1/frontend/drain` begins it, and the
     /// shutdown future given to [`start_frontend`] does.
     #[must_use]
@@ -585,13 +603,14 @@ fn bind_frontend(
     shutdown: Shutdown,
 ) -> Result<FrontendHandle, Box<dyn Error>> {
     let prepared = Prepared::new(flags)?;
+    let pack_index = flags.server.open_pack_index()?;
     let state = flags
         .server
         .state_store
         .as_ref()
         .map(crate::StateStoreUri::open)
         .transpose()?;
-    prepared.start(state, shutdown)
+    prepared.start(state, pack_index, shutdown)
 }
 
 /// A frontend's start up to the state store: everything the flags decide that needs no
@@ -668,10 +687,12 @@ impl<'a> Prepared<'a> {
         })
     }
 
-    /// Opens everything over `state` and serves on the listeners bound.
+    /// Opens everything over `state` and serves on the listeners bound. The `pack_index`
+    /// (`--pack-index`) is opened already; the handle carries it.
     fn start(
         self,
         state: Option<crate::StateStore>,
+        pack_index: Option<Arc<dyn PackIndex>>,
         shutdown: Shutdown,
     ) -> Result<FrontendHandle, Box<dyn Error>> {
         let Self {
@@ -741,6 +762,8 @@ impl<'a> Prepared<'a> {
             listeners.worker_tls,
             proxy.as_ref(),
         );
+        // The rows a revocation writes, beside the file: a revoked daemon is refused here.
+        let peers = peers.with_denied_rows(members.clone());
         let tls_sources: Vec<TlsSource> = listeners
             .reapi_tls
             .iter()
@@ -778,7 +801,7 @@ impl<'a> Prepared<'a> {
                 let store = state_store
                     .clone()
                     .ok_or("--enroll-listen needs --state-store: the registry lives in it")?;
-                prepared.serve(store)
+                prepared.serve(store, members.clone())
             })
             .transpose()?;
         let (enroll_api, enroll_serve, enroll_renewal, enroll_tls) = match enrolled {
@@ -1014,6 +1037,7 @@ impl<'a> Prepared<'a> {
                 checks,
                 notify: None,
             },
+            pack_index,
         })
     }
 }

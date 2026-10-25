@@ -1,6 +1,6 @@
 //! The real [`System`]: macOS, the host's tools and Virtualization.framework.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::hostfs::{chown_tree, sibling, tail_of};
-use crate::spec::{Event, VmSpec};
+use crate::spec::{Event, SHUTDOWN_COMMAND, VmSpec};
 use crate::system::{OfflineFile, Poll, Signature, System, VmProcess};
 use crate::{offline, signature, vz};
 
@@ -81,6 +81,12 @@ impl VmProcess for ProcessVm {
         let _ = self.child.kill();
     }
 
+    fn request_shutdown(&mut self) {
+        if let Some(stdin) = self.stdin.as_mut() {
+            let _ = writeln!(stdin, "{SHUTDOWN_COMMAND}").and_then(|()| stdin.flush());
+        }
+    }
+
     fn request_stop(&mut self) {
         self.stdin = None;
     }
@@ -134,6 +140,22 @@ impl System for RealSystem {
         }
     }
 
+    fn clear_immutable(&self, path: &Path) -> std::io::Result<()> {
+        use std::os::macos::fs::MetadataExt as _;
+        let flags = std::fs::symlink_metadata(path)?.st_flags();
+        if flags & libc::UF_IMMUTABLE == 0 {
+            return Ok(());
+        }
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        // SAFETY: `c_path` is a NUL-terminated path that outlives the call.
+        if unsafe { libc::chflags(c_path.as_ptr(), flags & !libc::UF_IMMUTABLE) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
     fn new_machine_identifier(&self) -> Result<Vec<u8>, String> {
         Ok(vz::new_machine_identifier())
     }
@@ -151,7 +173,7 @@ impl System for RealSystem {
         if let Some(uid) = run_as {
             let mut paths = vec![spec.bundle.clone(), spec_path.clone(), log_path.clone()];
             paths.extend(spec.automount_dir.clone());
-            paths.extend(spec.tagged.as_ref().map(|t| t.path.clone()));
+            paths.extend(spec.tagged.iter().map(|t| t.path.clone()));
             for p in paths {
                 chown_tree(&p, uid, uid)?;
             }
@@ -255,6 +277,23 @@ impl System for RealSystem {
 
     fn offline_write(&self, disk: &Path, files: &[OfflineFile]) -> Result<Value, String> {
         offline::write(disk, files)
+    }
+
+    fn offline_harvest(&self, disk: &Path, out: &Path) -> Result<Value, String> {
+        offline::harvest(disk, out)
+    }
+
+    fn process_table(&self) -> Result<String, String> {
+        let out = Command::new("/bin/ps")
+            .args(["-axo", "pid=,cputime=,comm="])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("run ps: {e}"))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(format!("ps failed ({})", out.status))
+        }
     }
 
     fn fetch(&self, url: &str, dest: &Path) -> Result<(), String> {

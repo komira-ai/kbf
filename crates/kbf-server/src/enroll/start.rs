@@ -21,6 +21,7 @@ use super::listener::EnrollListener;
 use super::service::EnrollService;
 use super::tls::{FrontendTls, unix_now};
 use crate::listen::{Binder, Latch, Socket};
+use crate::members::Members;
 
 /// What the start says when the CA key is a file in this process.
 const DEV_SIGNER_WARNING: &str =
@@ -112,11 +113,16 @@ pub(crate) fn prepare_with(
 
 impl Prepared {
     /// The service, the listener and the API over the open state store `store` (the
-    /// frontend's fenced handle). Must be called inside a Tokio runtime.
+    /// frontend's fenced handle). Must be called inside a Tokio runtime. With `members`, a
+    /// node revoke refreshes the membership map at once ([`EnrollApi::with_members`]).
     ///
     /// # Errors
     /// The runtime cannot register the socket.
-    pub fn serve(self, store: Arc<dyn Store>) -> Result<Serving, Box<dyn Error>> {
+    pub fn serve(
+        self,
+        store: Arc<dyn Store>,
+        members: Option<Arc<Members>>,
+    ) -> Result<Serving, Box<dyn Error>> {
         let Self {
             flags,
             socket,
@@ -129,11 +135,10 @@ impl Prepared {
             &flags.frontend_names,
             flags.settings.clone(),
         );
-        let api = Arc::new(EnrollApi::new(
-            store,
-            Arc::new(CaPins(Arc::clone(&ca))),
-            Arc::new(OsRandom),
-        ));
+        let api = Arc::new(
+            EnrollApi::new(store, Arc::new(CaPins(Arc::clone(&ca))), Arc::new(OsRandom))
+                .with_members(members),
+        );
         let (listener, latch) =
             EnrollListener::new(socket, service, Arc::clone(&tls), flags.limits).serve()?;
         Ok(Serving {

@@ -1,9 +1,7 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::package::tarball as binary_tarball;
 
-const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const MAIN: &str = "refs/heads/main";
 // A package built on the former development branch, `feature/arch-v2`: kept as the
 // non-main ref hosts that installed such a package still trust (docs/artifacts.md).
@@ -67,11 +65,9 @@ fn ar(members: &[(&str, &[u8])]) -> Vec<u8> {
     out
 }
 
-/// What a good package holds, each of which a test may change.
+/// What a good package's trust directory holds, each of which a test may change.
 #[derive(Clone)]
 struct Fix {
-    binary: Vec<u8>,
-    binary_mode: u32,
     gh: Vec<u8>,
     gh_mode: u32,
     conf: String,
@@ -80,15 +76,11 @@ struct Fix {
     drop: Option<&'static str>,
     /// A directory entry ahead of the files, as nfpm writes `./usr/`.
     dirs: bool,
-    /// Files a good package does not hold, with their modes and bytes.
-    extra: Vec<(String, u32, Vec<u8>)>,
 }
 
 impl Fix {
     fn new() -> Fix {
         Fix {
-            binary: b"\x7fELF the kbf-installer built for the commit".to_vec(),
-            binary_mode: 0o755,
             gh: b"\x7fELF the pinned gh".to_vec(),
             gh_mode: 0o755,
             conf: format!("SOURCE_REFS={MAIN}\n"),
@@ -96,35 +88,30 @@ impl Fix {
             arch: "amd64",
             drop: None,
             dirs: false,
-            extra: Vec::new(),
         }
     }
 
     /// The deb: nfpm's layout, gzip members, `./` paths.
     fn deb(&self) -> Vec<u8> {
         let control = format!(
-            "Package: kbf-installer\nVersion: 0.1.0\nArchitecture: {}\n",
+            "Package: kbf\nVersion: 0.1.0\nArchitecture: {}\n",
             self.arch
         );
         let control_tgz = tgz(&[("control", 0o644, control.as_bytes())]);
         let mut files: Vec<(&str, u32, &[u8])> = vec![
-            ("usr/bin/kbf-installer", self.binary_mode, &self.binary),
-            ("usr/share/kbf-installer/trust/gh", self.gh_mode, &self.gh),
+            ("usr/share/kbf/trust/gh", self.gh_mode, &self.gh),
             (
-                "usr/share/kbf-installer/trust/installer.conf",
+                "usr/share/kbf/trust/installer.conf",
                 0o644,
                 self.conf.as_bytes(),
             ),
             (
-                "usr/share/kbf-installer/trust/trusted_root.jsonl",
+                "usr/share/kbf/trust/trusted_root.jsonl",
                 0o644,
                 self.root.as_bytes(),
             ),
         ];
         files.retain(|(p, _, _)| Some(*p) != self.drop);
-        for (path, mode, bytes) in &self.extra {
-            files.push((path.as_str(), *mode, bytes.as_slice()));
-        }
         if self.dirs {
             files.insert(0, ("usr/", 0o755, &[]));
         }
@@ -136,122 +123,36 @@ impl Fix {
     }
 }
 
-/// A directory with the attested tarball of `binary` for `platform`, the pinned gh and
-/// `deb`: (dir, deb path, tarball path, gh path).
-fn world(
-    name: &str,
-    fix: &Fix,
-    binary: &[u8],
-    platform: Platform,
-) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
-    let dir = scratch(name);
-    let tarball = dir.join(format!("kbf-installer-{COMMIT}-{}.tar.gz", platform.name()));
-    std::fs::write(
-        &tarball,
-        binary_tarball("kbf-installer", binary).expect("tarball"),
-    )
-    .expect("tarball");
-    let gh = dir.join("gh");
-    std::fs::write(&gh, b"\x7fELF the pinned gh").expect("gh");
-    let deb = dir.join("kbf-installer_0.1.0+0123456789ab_amd64.deb");
-    std::fs::write(&deb, fix.deb()).expect("deb");
-    (dir, deb, tarball, gh)
+/// The pinned `gh` of a scratch directory, with the bytes a good package holds.
+fn pinned(name: &str) -> PathBuf {
+    let gh = scratch(name).join("gh");
+    std::fs::write(&gh, Fix::new().gh).expect("gh");
+    gh
 }
 
-fn check<'a>(platform: Platform, tarball: &'a Path, r: &'a str, gh: Option<&'a Path>) -> Check<'a> {
-    Check {
-        platform,
-        binary_tarball: tarball,
-        expect_ref: r,
-        gh,
-    }
+/// What opening `fix` and `trust_problems` say of it as the trust directory of a package
+/// attested for `expect`, with the pinned `gh` given or not.
+fn trust(fix: &Fix, expect: &str, gh: Option<&Path>) -> Vec<String> {
+    let mut problems = Vec::new();
+    let opened = open(&fix.deb(), Platform::LinuxX86_64, &mut problems).expect("opens");
+    problems.extend(trust_problems(&opened, expect, gh).expect("problems"));
+    problems
 }
 
-/// The problems of `fix` as the package for `expect` on x86_64.
+/// The problems of `fix` as the package for `expect` on x86_64, with the pinned `gh`.
 fn found(name: &str, fix: &Fix, expect: &str) -> Vec<String> {
-    let (_, deb, tarball, gh) = world(name, fix, &Fix::new().binary, Platform::LinuxX86_64);
-    problems(
-        &std::fs::read(&deb).expect("deb"),
-        &check(Platform::LinuxX86_64, &tarball, expect, Some(&gh)),
-    )
-    .expect("problems")
+    trust(fix, expect, Some(&pinned(name)))
 }
 
 #[test]
-fn a_package_of_the_attested_binary_that_trusts_its_branch_is_accepted_as_the_asset() {
-    // Control for the whole verb: catches a check that refuses a correct package for
-    // either platform or either branch, an asset not named for the commit and platform,
-    // a sums line that is not the file's digest, and an asset that is not the package's
-    // bytes.
-    for (platform, arch, r) in [
-        (Platform::LinuxX86_64, "amd64", MAIN),
-        (Platform::LinuxArm64, "arm64", FEATURE),
-    ] {
+fn a_trust_directory_of_the_pinned_gh_that_trusts_its_branch_is_accepted() {
+    // Control for the checks: catches one that refuses a correct directory for either
+    // branch, or a pinned gh given and the same bytes.
+    for r in [MAIN, FEATURE] {
         let mut fix = Fix::new();
-        fix.arch = arch;
         fix.conf = format!("SOURCE_REFS={r}\n");
-        let (dir, deb, tarball, gh) = world("good", &fix, &fix.binary, platform);
-        let out = dir.join("dist");
-        let printed = asset(
-            &deb,
-            COMMIT,
-            &Mode::Add(&out),
-            &check(platform, &tarball, r, Some(&gh)),
-        )
-        .expect("asset");
-        let name = format!("kbf-installer-{COMMIT}-{}.deb", platform.name());
-        let bytes = std::fs::read(&deb).expect("deb");
-        assert_eq!(std::fs::read(out.join(&name)).expect("asset"), bytes);
-        let line = format!("{}  {name}\n", Sha256::of(&bytes));
-        assert_eq!(
-            std::fs::read_to_string(out.join(format!("SHA256SUMS.{}", platform.name())))
-                .expect("sums"),
-            line
-        );
-        assert_eq!(
-            printed,
-            vec![format!("packaged {name}:"), line.trim_end().to_owned()]
-        );
+        assert_eq!(found("good", &fix, r), Vec::<String>::new(), "{r}");
     }
-}
-
-#[test]
-fn a_package_whose_binary_is_not_the_attested_one_is_refused() {
-    // Catches: the deb carrying a binary other than the one `build-commit check-asset`
-    // showed names the commit and the attestation covers (a one-byte difference is
-    // enough), and a tarball with no kbf-installer in it.
-    let mut fix = Fix::new();
-    let mut other = fix.binary.clone();
-    *other.last_mut().expect("byte") ^= 1;
-    fix.binary = other;
-    let got = found("binary-differs", &fix, MAIN);
-    assert_eq!(got.len(), 1, "{got:?}");
-    assert!(
-        got[0].starts_with("usr/bin/kbf-installer (sha256:")
-            && got[0].contains("is not the binary of"),
-        "{got:?}"
-    );
-    // The tarball holds another file name.
-    let fix = Fix::new();
-    let (dir, deb, _, gh) = world(
-        "tarball-other-name",
-        &fix,
-        &fix.binary,
-        Platform::LinuxX86_64,
-    );
-    let tarball = dir.join("t.tar.gz");
-    std::fs::write(
-        &tarball,
-        binary_tarball("kbf", &fix.binary).expect("tarball"),
-    )
-    .expect("t");
-    let got = problems(
-        &std::fs::read(&deb).expect("deb"),
-        &check(Platform::LinuxX86_64, &tarball, MAIN, Some(&gh)),
-    )
-    .expect("problems");
-    assert_eq!(got.len(), 1, "{got:?}");
-    assert!(got[0].ends_with("holds no kbf-installer"), "{got:?}");
 }
 
 #[test]
@@ -311,9 +212,9 @@ fn a_package_trusts_exactly_the_branch_it_is_attested_for() {
 #[test]
 fn the_packaged_gh_is_the_pinned_one_and_executable() {
     // Catches: a gh that is not the program the job downloaded and checked by SHA-256
-    // (a wrong-architecture or substituted one), an empty gh, a gh that is not 0755, a
-    // binary that is not 0755, and, with no pinned gh given (verify-only), the byte
-    // comparison alone being skipped and not the rest.
+    // (a wrong-architecture or substituted one), an empty gh, a gh that is not 0755, and,
+    // with no pinned gh given (verify-only), the byte comparison alone being skipped and
+    // not the rest.
     let mut fix = Fix::new();
     fix.gh = b"\x7fELF another gh".to_vec();
     let got = found("gh-other", &fix, MAIN);
@@ -335,40 +236,18 @@ fn the_packaged_gh_is_the_pinned_one_and_executable() {
         "{got:?}"
     );
     let mut fix = Fix::new();
-    fix.binary_mode = 0o700;
-    assert!(
-        found("bin-mode", &fix, MAIN)
-            .iter()
-            .any(|p| p.ends_with("has mode 0700, not 0755"))
-    );
-    let mut fix = Fix::new();
     fix.gh = b"\x7fELF another gh".to_vec();
-    let (_, deb, tarball, _) = world("gh-unpinned", &fix, &fix.binary, Platform::LinuxX86_64);
-    let got = problems(
-        &std::fs::read(&deb).expect("deb"),
-        &check(Platform::LinuxX86_64, &tarball, MAIN, None),
-    )
-    .expect("problems");
-    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(trust(&fix, MAIN, None), Vec::<String>::new());
 }
 
 #[test]
-fn the_wrong_architecture_a_missing_trust_file_and_a_bad_root_are_refused() {
-    // Catches: an arm64 package shipped under the x86_64 asset name (or the reverse), a
-    // trust file missing from the package, a trusted root that is not JSON lines, and
-    // garbage or a cut-short archive taken for a deb.
-    let mut fix = Fix::new();
-    fix.arch = "arm64";
-    let got = found("arch", &fix, MAIN);
-    assert_eq!(
-        got,
-        ["control says Architecture \"arm64\", not \"amd64\" for linux-x86_64"]
-    );
+fn a_missing_trust_file_and_a_bad_root_are_refused() {
+    // Catches: a trust file missing from the package, and a trusted root that is not JSON
+    // lines.
     for gone in [
-        "usr/bin/kbf-installer",
-        "usr/share/kbf-installer/trust/gh",
-        "usr/share/kbf-installer/trust/installer.conf",
-        "usr/share/kbf-installer/trust/trusted_root.jsonl",
+        "usr/share/kbf/trust/gh",
+        "usr/share/kbf/trust/installer.conf",
+        "usr/share/kbf/trust/trusted_root.jsonl",
     ] {
         let mut fix = Fix::new();
         fix.drop = Some(gone);
@@ -386,123 +265,32 @@ fn the_wrong_architecture_a_missing_trust_file_and_a_bad_root_are_refused() {
             .any(|p| p.contains("trusted_root.jsonl line 1: not JSON")),
         "{got:?}"
     );
-    let (_, _, tarball, gh) = world(
-        "garbage",
-        &Fix::new(),
-        &Fix::new().binary,
-        Platform::LinuxX86_64,
-    );
-    let c = check(Platform::LinuxX86_64, &tarball, MAIN, Some(&gh));
-    let good = Fix::new().deb();
-    assert_eq!(
-        problems(b"hello", &c).expect("p"),
-        ["not an ar archive (a deb starts `!<arch>`)"]
-    );
-    assert!(problems(&good[..good.len() - 5], &c).expect("p")[0].contains("cut short"));
-    let no_data = ar(&[("debian-binary", b"2.0\n")]);
-    assert_eq!(
-        problems(&no_data, &c).expect("p"),
-        ["has no control.tar.gz (nfpm is configured for gzip)"]
-    );
 }
 
 #[test]
-fn the_asset_is_listed_once_and_written_once() {
-    // Catches: the line not appended (the package would be an unlisted file that
-    // verify-assets refuses, or worse missing from the attested SHA256SUMS), an existing
-    // line for the asset not refused (a second run, or two platforms' jobs sharing a
-    // directory, would list it twice), the other lines of the sums file lost, and an
-    // asset overwritten.
-    let fix = Fix::new();
-    let (dir, deb, tarball, gh) = world("twice", &fix, &fix.binary, Platform::LinuxX86_64);
-    let out = dir.join("dist");
-    std::fs::create_dir(&out).expect("dist");
-    let earlier = format!(
-        "{}  kbf-installer-{COMMIT}-linux-x86_64.tar.gz\n",
-        Sha256::of(b"t")
-    );
-    std::fs::write(out.join("SHA256SUMS.linux-x86_64"), &earlier).expect("sums");
-    let c = check(Platform::LinuxX86_64, &tarball, MAIN, Some(&gh));
-    asset(&deb, COMMIT, &Mode::Add(&out), &c).expect("first");
-    let text = std::fs::read_to_string(out.join("SHA256SUMS.linux-x86_64")).expect("sums");
-    assert!(
-        text.starts_with(&earlier) && text.lines().count() == 2,
-        "{text}"
-    );
-    let err = asset(&deb, COMMIT, &Mode::Add(&out), &c).expect_err("twice");
-    assert!(
-        err.to_string().ends_with(&format!(
-            "already lists kbf-installer-{COMMIT}-linux-x86_64.deb"
-        )),
-        "{err}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(out.join("SHA256SUMS.linux-x86_64")).expect("sums"),
-        text
-    );
+fn a_pinned_gh_that_cannot_be_read_is_an_error_not_a_finding() {
+    // Catches: the job's own input being absent taken for a refusal of the package.
+    let none = scratch("absent-gh").join("none");
+    let mut problems = Vec::new();
+    let opened = open(&Fix::new().deb(), Platform::LinuxX86_64, &mut problems).expect("opens");
+    let err = trust_problems(&opened, MAIN, Some(&none)).expect_err("no gh");
+    assert!(!matches!(err, Error::Refused(_)), "{err:?}");
 }
 
 #[test]
-fn a_refused_package_leaves_nothing_in_the_output() {
-    // Catches: the asset copied or listed before the checks (an unattested-able file in
-    // dist, listed in the sums the attest job signs).
+fn the_wrong_architecture_is_refused() {
+    // Catches: an arm64 package shipped under the x86_64 asset name (or the reverse).
     let mut fix = Fix::new();
-    fix.conf = format!("SOURCE_REFS={FEATURE}\n");
-    let (dir, deb, tarball, gh) = world("refused", &fix, &fix.binary, Platform::LinuxX86_64);
-    let out = dir.join("dist");
-    let err = asset(
-        &deb,
-        COMMIT,
-        &Mode::Add(&out),
-        &check(Platform::LinuxX86_64, &tarball, MAIN, Some(&gh)),
-    )
-    .expect_err("refused");
-    assert!(matches!(err, Error::Refused(_)), "{err:?}");
-    assert!(!out.exists(), "created {}", out.display());
-}
-
-#[test]
-fn verify_only_checks_the_asset_by_its_name_and_writes_nothing() {
-    // Catches: --verify-only on a file that is not named as the asset (the verify job
-    // would check some other file than the one signed), writing or listing anything,
-    // and the same refusals as the build side (a main package trusting another branch).
-    let fix = Fix::new();
-    let (dir, deb, tarball, gh) = world("verify-only", &fix, &fix.binary, Platform::LinuxX86_64);
-    let c = check(Platform::LinuxX86_64, &tarball, MAIN, Some(&gh));
-    let err = asset(&deb, COMMIT, &Mode::VerifyOnly, &c).expect_err("not named as the asset");
-    assert!(
-        err.to_string().contains(&format!(
-            "is not named kbf-installer-{COMMIT}-linux-x86_64.deb"
-        )),
-        "{err}"
+    fix.arch = "arm64";
+    let mut problems = Vec::new();
+    let _ = open(&fix.deb(), Platform::LinuxX86_64, &mut problems);
+    assert_eq!(
+        problems,
+        ["control says Architecture \"arm64\", not \"amd64\" for linux-x86_64"]
     );
-    let named = dir.join(format!("kbf-installer-{COMMIT}-linux-x86_64.deb"));
-    std::fs::copy(&deb, &named).expect("copy");
-    let before = std::fs::read_dir(&dir).expect("ls").count();
-    let printed = asset(&named, COMMIT, &Mode::VerifyOnly, &c).expect("verify");
-    assert_eq!(printed.len(), 1, "{printed:?}");
-    assert_eq!(std::fs::read_dir(&dir).expect("ls").count(), before);
-    let other = check(Platform::LinuxX86_64, &tarball, FEATURE, Some(&gh));
-    assert!(asset(&named, COMMIT, &Mode::VerifyOnly, &other).is_err());
-}
-
-#[test]
-fn a_commit_that_is_not_one_and_a_mac_are_usage_errors() {
-    // Catches: an asset named for a short or upper-case "commit", and a darwin platform
-    // (there is no Mac deb).
-    let fix = Fix::new();
-    let (dir, deb, tarball, gh) = world("usage", &fix, &fix.binary, Platform::LinuxX86_64);
-    let c = check(Platform::LinuxX86_64, &tarball, MAIN, Some(&gh));
-    let out = dir.join("dist");
-    assert!(matches!(
-        asset(&deb, "XYZ", &Mode::Add(&out), &c),
-        Err(Error::NotACommit(_))
-    ));
-    let mac = check(Platform::DarwinArm64, &tarball, MAIN, Some(&gh));
-    assert!(matches!(
-        asset(&deb, COMMIT, &Mode::Add(&out), &mac),
-        Err(Error::Usage(_))
-    ));
+    let mut problems = Vec::new();
+    let _ = open(&fix.deb(), Platform::LinuxArm64, &mut problems);
+    assert_eq!(problems, Vec::<String>::new());
 }
 
 #[test]
@@ -530,25 +318,24 @@ fn sole_is_the_file_or_the_one_package_of_the_directory() {
 }
 
 #[test]
-fn the_version_is_what_the_installer_says_after_its_name_and_nothing_else() {
-    // Catches: a version taken from another program's output (the test stub's, a
-    // `kbf --version`), from a binary that failed, from one that printed more or
-    // fewer words, or one with no commit (`+`), which would name a package that no
-    // commit names.
+fn the_version_is_what_the_program_says_after_its_name_and_nothing_else() {
+    // Catches: a version taken from another program's output (the test stub's, another
+    // binary's), from a binary that failed, from one that printed more or fewer words,
+    // or one with no commit (`+`), which would name a package that no commit names.
     assert_eq!(
-        version_of(true, "kbf-installer 0.1.0+0123456789ab\n").as_deref(),
+        version_of(true, "kbf 0.1.0+0123456789ab\n", "kbf").as_deref(),
         Some("0.1.0+0123456789ab")
     );
     for (ok, out) in [
-        (false, "kbf-installer 0.1.0+0123456789ab\n"),
-        (true, "kbf 0.1.0+0123456789ab\n"),
-        (true, "kbf-installer 0.1.0\n"),
-        (true, "kbf-installer\n"),
-        (true, "kbf-installer 0.1.0+0123456789ab extra\n"),
+        (false, "kbf 0.1.0+0123456789ab\n"),
+        (true, "kbf-installer 0.1.0+0123456789ab\n"),
+        (true, "kbf 0.1.0\n"),
+        (true, "kbf\n"),
+        (true, "kbf 0.1.0+0123456789ab extra\n"),
         (true, "kbf-installer-stub (test only) --version\n"),
         (true, ""),
     ] {
-        assert_eq!(version_of(ok, out), None, "{ok} {out:?}");
+        assert_eq!(version_of(ok, out, "kbf"), None, "{ok} {out:?}");
     }
 }
 
@@ -565,14 +352,11 @@ fn raw_ar(size: &str, end: &str) -> Vec<u8> {
     out
 }
 
-/// The problems of `deb` as the package for `MAIN` on x86_64.
-fn problems_of(name: &str, deb: &[u8]) -> Vec<String> {
-    let (_, _, tarball, gh) = world(name, &Fix::new(), &Fix::new().binary, Platform::LinuxX86_64);
-    problems(
-        deb,
-        &check(Platform::LinuxX86_64, &tarball, MAIN, Some(&gh)),
-    )
-    .expect("problems")
+/// The problems of opening `deb` as the package for x86_64.
+fn problems_of(deb: &[u8]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let _ = open(deb, Platform::LinuxX86_64, &mut problems);
+    problems
 }
 
 #[test]
@@ -583,28 +367,25 @@ fn a_damaged_archive_is_named_not_taken_for_a_package() {
     // something else than what is wrong with the package.
     let bad = raw_ar("10", "XX");
     assert_eq!(
-        problems_of("ar-end", &bad),
+        problems_of(&bad),
         ["an ar member header without its terminator"]
     );
     let bad = raw_ar("abc", "`\n");
-    assert_eq!(
-        problems_of("ar-size", &bad),
-        ["x/: an ar member with no size"]
-    );
+    assert_eq!(problems_of(&bad), ["x/: an ar member with no size"]);
     let good = tgz(&[("control", 0o644, b"Architecture: amd64\n")]);
     let junk_gz = ar(&[("control.tar.gz", b"not gzip"), ("data.tar.gz", &good)]);
     assert!(
-        problems_of("junk-control", &junk_gz)[0].starts_with("control.tar.gz: not a gzip stream"),
+        problems_of(&junk_gz)[0].starts_with("control.tar.gz: not a gzip stream"),
         "{:?}",
-        problems_of("junk-control", &junk_gz)
+        problems_of(&junk_gz)
     );
     let no_data = ar(&[("control.tar.gz", &good)]);
     assert_eq!(
-        problems_of("no-data", &no_data),
+        problems_of(&no_data),
         ["has no data.tar.gz (nfpm is configured for gzip)"]
     );
     let junk_data = ar(&[("control.tar.gz", &good), ("data.tar.gz", b"not gzip")]);
-    let got = problems_of("junk-data", &junk_data);
+    let got = problems_of(&junk_data);
     assert_eq!(got.len(), 1, "{got:?}");
     assert!(
         got[0].starts_with("data.tar.gz: not a gzip stream"),
@@ -617,10 +398,10 @@ fn a_damaged_archive_is_named_not_taken_for_a_package() {
         gz.write_all(&[7u8; 1024]).expect("write");
         gz.finish().expect("gzip")
     };
-    let got = problems_of(
-        "not-tar",
-        &ar(&[("control.tar.gz", &not_tar), ("data.tar.gz", &not_tar)]),
-    );
+    let got = problems_of(&ar(&[
+        ("control.tar.gz", &not_tar),
+        ("data.tar.gz", &not_tar),
+    ]));
     assert!(got[0].starts_with("control.tar.gz: not a tar"), "{got:?}");
     assert!(
         got.iter().any(|p| p.starts_with("data.tar.gz: not a tar")),
@@ -646,25 +427,19 @@ fn a_damaged_archive_is_named_not_taken_for_a_package() {
         gz.write_all(&raw).expect("write");
         gz.finish().expect("gzip")
     };
-    let got = problems_of(
-        "bad-mode",
-        &ar(&[
-            ("control.tar.gz", &good),
-            ("data.tar.gz", &tar_of(true, b"x", 1024)),
-        ]),
-    );
+    let got = problems_of(&ar(&[
+        ("control.tar.gz", &good),
+        ("data.tar.gz", &tar_of(true, b"x", 1024)),
+    ]));
     assert_eq!(got.len(), 1, "{got:?}");
     assert!(
         got[0].starts_with("data.tar.gz: usr/bin/kbf-installer: "),
         "{got:?}"
     );
-    let got = problems_of(
-        "cut",
-        &ar(&[
-            ("control.tar.gz", &good),
-            ("data.tar.gz", &tar_of(false, &[1u8; 1000], 522)),
-        ]),
-    );
+    let got = problems_of(&ar(&[
+        ("control.tar.gz", &good),
+        ("data.tar.gz", &tar_of(false, &[1u8; 1000], 522)),
+    ]));
     assert_eq!(got.len(), 1, "{got:?}");
     assert!(got[0].starts_with("data.tar.gz: "), "{got:?}");
 }
@@ -675,78 +450,30 @@ fn directory_entries_of_the_data_tarball_are_not_files_of_the_package() {
     // everything refused), or the files after them lost.
     let mut fix = Fix::new();
     fix.dirs = true;
-    assert_eq!(found("dirs", &fix, MAIN), Vec::<String>::new());
+    let mut problems = Vec::new();
+    let opened = open(&fix.deb(), Platform::LinuxX86_64, &mut problems).expect("opens");
+    assert_eq!(problems, Vec::<String>::new());
+    let paths: Vec<&str> = opened.files.iter().map(|m| m.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "usr/share/kbf/trust/gh",
+            "usr/share/kbf/trust/installer.conf",
+            "usr/share/kbf/trust/trusted_root.jsonl"
+        ]
+    );
 }
 
 #[test]
-fn files_the_check_needs_that_are_not_there_are_errors_not_findings() {
-    // Catches: a missing deb, tarball or pinned gh, a binary that does not run and a
-    // header cut short taken for a refusal of the package (or a panic): the job's own
-    // inputs being absent is a failure of the job.
-    let fix = Fix::new();
-    let (dir, deb, tarball, gh) = world("absent", &fix, &fix.binary, Platform::LinuxX86_64);
-    let none = dir.join("none");
-    let c = check(Platform::LinuxX86_64, &tarball, MAIN, Some(&gh));
-    let err = asset(&none, COMMIT, &Mode::VerifyOnly, &c).expect_err("no deb");
-    assert!(!matches!(err, Error::Refused(_)), "{err:?}");
-    let bytes = std::fs::read(&deb).expect("deb");
-    let c = check(Platform::LinuxX86_64, &none, MAIN, Some(&gh));
-    let err = problems(&bytes, &c).expect_err("no tarball");
-    assert!(!matches!(err, Error::Refused(_)), "{err:?}");
-    let c = check(Platform::LinuxX86_64, &tarball, MAIN, Some(&none));
-    let err = problems(&bytes, &c).expect_err("no gh");
-    assert!(!matches!(err, Error::Refused(_)), "{err:?}");
-    assert!(binary_version(&none).is_err());
+fn a_program_that_does_not_run_and_a_truncated_header_are_errors_not_findings() {
+    // Catches: a binary that does not run, an empty directory and a header cut short taken
+    // for a refusal of the package (or a panic).
+    let dir = scratch("absent");
+    assert!(binary_version(&dir.join("none")).is_err());
     let empty = dir.join("empty");
     std::fs::create_dir(&empty).expect("dir");
     assert!(sole(&empty, "deb").is_err());
     // A header cut short: 8 bytes of magic and 10 of a member header.
-    let got = problems_of("short-header", &[&b"!<arch>\n"[..], &[b'x'; 10]].concat());
+    let got = problems_of(&[&b"!<arch>\n"[..], &[b'x'; 10]].concat());
     assert_eq!(got, ["a truncated ar member header"]);
-}
-
-/// Asserts that the paths of the `kbf` package are the binary and each mode unit, as a data
-/// tarball names them: no leading slash, the binary first.
-#[test]
-fn the_kbf_package_paths_are_the_binary_and_the_mode_units() {
-    let paths = kbf_package_paths();
-    assert_eq!(paths.len(), 1 + KBF_UNITS.len());
-    assert_eq!(paths[0], "usr/bin/kbf");
-    for unit in KBF_UNITS {
-        let path = format!("usr/lib/systemd/system/{unit}");
-        assert!(paths.contains(&path), "{path} in {paths:?}");
-    }
-}
-
-/// Asserts that a `kbf-installer` deb that carries `usr/bin/kbf` or the unit of a mode is
-/// refused, once per such file and naming it, whatever else it holds.
-#[test]
-fn a_package_that_carries_the_kbf_binary_or_a_mode_unit_is_refused() {
-    for path in kbf_package_paths() {
-        let mut fix = Fix::new();
-        fix.extra.push((path.clone(), 0o755, b"x".to_vec()));
-        let got = found("carries-kbf", &fix, MAIN);
-        assert_eq!(
-            got,
-            [format!("holds {path}, which only the kbf package ships")]
-        );
-    }
-    let mut fix = Fix::new();
-    for path in kbf_package_paths() {
-        fix.extra.push((path, 0o644, Vec::new()));
-    }
-    let got = found("carries-all-kbf", &fix, MAIN);
-    assert_eq!(got.len(), 1 + KBF_UNITS.len(), "{got:?}");
-}
-
-/// Asserts that a `kbf-installer` deb with the files of its own package and `kbf.slice`,
-/// which `kbf-proxy.service` runs in and so stays with it, is not refused for holding them.
-#[test]
-fn the_slice_and_the_proxy_units_stay_in_the_installer_package() {
-    let mut fix = Fix::new();
-    for unit in ["kbf.slice", "kbf-proxy.service", "kbf-installer.service"] {
-        let path = format!("usr/lib/systemd/system/{unit}");
-        fix.extra.push((path, 0o644, Vec::new()));
-    }
-    assert_eq!(found("installer-units", &fix, MAIN), Vec::<String>::new());
 }

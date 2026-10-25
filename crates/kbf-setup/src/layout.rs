@@ -13,8 +13,11 @@
 //!   seq_floor                              the highest seq not allowed (a seed must exceed it)
 //!   work/                                  scratch of a stage in progress (kbf_installer::stage)
 //! /run/kbf-installer/lock                  the lock the state is read and written under
-//! /usr/share/kbf-installer/trust/          what offline verification trusts (package-owned)
+//! /usr/share/kbf/trust/                    what offline verification trusts (the kbf package's)
 //!   gh, trusted_root.jsonl, installer.conf
+//! /usr/share/kbf-installer/trust/          the same, where the retired kbf-installer package put it
+//!                                          (read only when the directory above is absent: see
+//!                                          [`Layout::with_trust_fallback`])
 //! /usr/share/kbf-installer/seed/<commit12>/  the release the package carries (package-owned)
 //!   manifest.json, kbf-<commit>-<platform>.tar.gz, and that file with .sigstore.json
 //! ```
@@ -46,7 +49,13 @@ const MACOS_ROOT: &str = "/usr/local/kbf-installer";
 const MACOS_STATE_DIR: &str = "/var/db/kbf-installer";
 const LINUX_LOCK: &str = "/run/kbf-installer/lock";
 const MACOS_LOCK: &str = "/var/run/kbf-installer/lock";
-const LINUX_TRUST: &str = "/usr/share/kbf-installer/trust";
+const LINUX_TRUST: &str = "/usr/share/kbf/trust";
+/// Where the trust directory was while the `kbf-installer` package carried it. A host that has
+/// not yet been given the `kbf` package that carries [`LINUX_TRUST`] still has its files here.
+///
+/// REMOVE IN v0.0.9: the release after the first one whose `kbf` package carries the trust
+/// directory (v0.0.8). Delete this constant, [`Layout::with_trust_fallback`] and its callers.
+const LINUX_TRUST_LEGACY: &str = "/usr/share/kbf-installer/trust";
 const MACOS_TRUST: &str = "/usr/local/kbf-installer/trust";
 /// What the package installs: the trust directory and the seed directory are in it. The
 /// Mac pkg installs into the installer's own tree.
@@ -243,11 +252,44 @@ impl std::str::FromStr for Platform {
 pub struct Layout {
     root: Root,
     platform: Platform,
+    /// The trust directory is the retired package's ([`LINUX_TRUST_LEGACY`]), not the `kbf`
+    /// package's. Only [`Layout::with_trust_fallback`] sets it.
+    trust_legacy: bool,
 }
 
 impl Layout {
+    /// A layout whose trust directory is where the `kbf` package puts it.
     pub fn new(root: Root, platform: Platform) -> Layout {
-        Layout { root, platform }
+        Layout {
+            root,
+            platform,
+            trust_legacy: false,
+        }
+    }
+
+    /// This layout, with the trust directory the retired `kbf-installer` package put on a
+    /// Linux host if (and only if) the `kbf` package's directory is absent under the root and
+    /// the old one is there, so a host that has not yet taken the new package keeps verifying.
+    /// When both exist the new one is used, and so it is when neither does. Decided here, once:
+    /// every path the layout then names agrees.
+    ///
+    /// REMOVE IN v0.0.9, with [`LINUX_TRUST_LEGACY`].
+    #[must_use]
+    pub fn with_trust_fallback(mut self) -> Layout {
+        if self.platform == Platform::Linux {
+            let is_dir = |dir: &str| self.root.join(&path(dir)).is_dir();
+            self.trust_legacy = !is_dir(LINUX_TRUST) && is_dir(LINUX_TRUST_LEGACY);
+        }
+        self
+    }
+
+    /// The trust directory this layout names.
+    fn trust(&self) -> &'static str {
+        if self.trust_legacy {
+            LINUX_TRUST_LEGACY
+        } else {
+            self.platform.trust()
+        }
     }
 
     /// A Linux host's layout under `root`.
@@ -380,22 +422,22 @@ impl Layout {
 
     /// The directory of what offline verification trusts.
     pub fn trust_dir(&self) -> HostPath {
-        path(self.platform.trust())
+        path(self.trust())
     }
 
     /// The pinned `gh`.
     pub fn gh(&self) -> HostPath {
-        path_in(self.platform.trust(), GH)
+        path_in(self.trust(), GH)
     }
 
     /// The Sigstore trusted root, as `gh attestation trusted-root` prints it.
     pub fn trusted_root(&self) -> HostPath {
-        path_in(self.platform.trust(), TRUSTED_ROOT)
+        path_in(self.trust(), TRUSTED_ROOT)
     }
 
     /// The host's settings (`installer.conf`), optional.
     pub fn settings(&self) -> HostPath {
-        path_in(self.platform.trust(), SETTINGS)
+        path_in(self.trust(), SETTINGS)
     }
 
     /// `seed/<build>`, beside the trust directory: the release the package carries. `build`
@@ -435,3 +477,7 @@ pub fn release_link(commit: &CommitId) -> PathBuf {
 fn path_in(dir: &str, name: &str) -> HostPath {
     HostPath::new(&format!("{dir}/{name}")).expect("a layout directory and a plain name")
 }
+
+#[cfg(test)]
+#[path = "layout_tests.rs"]
+mod tests;

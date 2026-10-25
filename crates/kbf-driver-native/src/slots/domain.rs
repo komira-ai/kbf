@@ -1,43 +1,43 @@
-//! C1 of the clean: end the slot's launchd domains and wait until the domain lists
-//! nothing of the lease's. The tool is [`Launchd`] (`launchctl`, run by
-//! [`super::macos::host`]); the rules are here, tested on every platform with a fake.
+//! C1 of the clean: end the slot's launchd domains. The tool is [`Launchd`] (`launchctl`,
+//! run by [`super::macos::host`]); the rules are here, tested on every platform with a
+//! fake.
 //!
 //! - The domains `user/<uid>` and `gui/<uid>` are booted out **whole**, once each. A job
 //!   is never booted out by its label: inside a domain that is going down, a per-label
-//!   bootout answers 124 ("tearing down") and was read as a failed step, which the old
-//!   retry then hid.
-//! - Then `launchctl print user/<uid>` is polled until the domain lists no job but
-//!   launchd's own (judged by where a job's plist lies, [`probe::is_own_plist`], never by
-//!   its label, which a lease chooses), or is gone. Exit 124 means "keep waiting". The
-//!   poll is bounded ([`POLLS`] looks, [`POLL_PAUSE`] apart), and so is the whole step:
-//!   every `launchctl` call is cut to what is left of [`WITHIN`] (the slot clean runs
-//!   before the daemon says `Hello`, so a hung launchd must not hold the start for the
-//!   sum of its alarms). A domain that still lists a job at either bound fails the step,
-//!   naming the jobs.
+//!   bootout answers 124 ("tearing down"), which is waited out by booting the **domain**
+//!   out again. The bootout is the **last** verb the clean runs on either domain.
+//! - Nothing prints the domain afterwards, here or in the steps that follow. A root
+//!   `launchctl print user/<uid>` of a domain that is gone **makes it again** (measured
+//!   on a Mac: the print reports `creator = launchctl[<pid>]` and launchd starts the
+//!   per-user agents in it, `distnoted` among them, as the uid, which the next lease
+//!   would inherit). That a domain and its jobs are gone is read from the process table
+//!   by uid, which makes nothing: C3 kills and C11 looks at it.
+//! - The wait is bounded ([`POLLS`] bootouts, [`POLL_PAUSE`] apart), and so is the whole
+//!   step: every `launchctl` call is cut to what is left of [`WITHIN`] (the slot clean
+//!   runs before the daemon says `Hello`, so a hung launchd must not hold the start for
+//!   the sum of its alarms).
 
 use std::time::Duration;
 
 use super::probe;
 
 /// How long one `bootout` may take before it is killed: the domain's teardown runs on in
-/// launchd, and the poll below is what waits for it.
+/// launchd, and booting it out again is what waits for it.
 pub(crate) const BOOTOUT_ALARM: Duration = Duration::from_secs(20);
 
-/// How long one `print` may take.
-pub(crate) const PRINT_ALARM: Duration = Duration::from_secs(20);
-
-/// The most the whole step takes: bootouts and polls together.
+/// The most the whole step takes, all its bootouts together.
 pub(crate) const WITHIN: Duration = Duration::from_secs(60);
 
-/// How many times the poll looks at the domain, and the pause between looks.
+/// How many times a domain is booted out while it says it is tearing down, and the pause
+/// between.
 pub(crate) const POLLS: usize = 150;
 pub(crate) const POLL_PAUSE: Duration = Duration::from_millis(200);
 
 /// What one `launchctl` run said.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Said {
-    /// It exited with `code`, printing `stdout`.
-    Exited { code: i32, stdout: String },
+    /// It exited with `code`.
+    Exited { code: i32 },
     /// It did not end within its alarm and was killed.
     TimedOut,
     /// It could not be run.
@@ -56,79 +56,68 @@ pub(crate) trait Launchd {
     fn now(&self) -> Duration;
 }
 
-/// Boots the slot's domains out and waits until `user/<uid>` lists none of the lease's
-/// jobs.
+/// Boots the slot's domains out, `user/<uid>` then `gui/<uid>`. Nothing else is run on
+/// them: see the module documentation for why no print follows.
 ///
 /// # Errors
-/// The domain still listed jobs after [`POLLS`] looks (their labels), or `launchctl`
-/// could not be run.
+/// A domain was still tearing down after [`POLLS`] bootouts or the step ran past
+/// [`WITHIN`], or `launchctl` could not be run.
 pub(crate) fn end(launchd: &dyn Launchd, uid: u32) -> Result<(), String> {
     let began = launchd.now();
     // The alarm for a call: `alarm`, or what is left of [`WITHIN`] if less.
     let limit =
         |alarm: Duration| alarm.min(WITHIN.saturating_sub(launchd.now().saturating_sub(began)));
-    let late = |domain: &str| format!("launchctl on {domain} did not settle within {WITHIN:?}");
-    for domain in [format!("user/{uid}"), format!("gui/{uid}")] {
-        if limit(BOOTOUT_ALARM).is_zero() {
-            return Err(late(&domain));
-        }
-        // Not an error whatever it says: a domain that does not exist cannot be booted
-        // out, and one that is going down says 124. The poll below is the judge.
-        if let Said::Missing(why) = launchd.run(&["bootout", &domain], limit(BOOTOUT_ALARM)) {
-            return Err(format!("launchctl bootout {domain}: {why}"));
-        }
+    for (domain, done) in [
+        (format!("user/{uid}"), &USER_DONE[..]),
+        (format!("gui/{uid}"), &GUI_DONE[..]),
+    ] {
+        boot_out(launchd, &domain, done, &limit)?;
     }
-    let domain = format!("user/{uid}");
-    let mut foreign = Vec::new();
+    Ok(())
+}
+
+/// The exit codes of `launchctl bootout user/<uid>` that mean the domain is gone: 0, for
+/// a domain that was booted out and for one that was not there (measured on a Mac Studio:
+/// an absent `user/<uid>` answers 0).
+const USER_DONE: [i32; 1] = [0];
+
+/// The same for `gui/<uid>`: 0, or what an absent `gui/<uid>` answers: 125 ("Domain does
+/// not support specified action") on a Mac Studio, and 112 on the macOS 26.6 CI runner
+/// (both measured).
+const GUI_DONE: [i32; 3] = [0, 112, 125];
+
+/// Boots `domain` out until launchd stops saying it is tearing down (124). A code in
+/// `done` ends the wait; any other code fails the step and is named: a refused bootout
+/// leaves the domain, and an idle loaded job in it (`StartInterval`, `WatchPaths`) that
+/// no process table shows would fire in the next lease.
+fn boot_out(
+    launchd: &dyn Launchd,
+    domain: &str,
+    done: &[i32],
+    limit: &dyn Fn(Duration) -> Duration,
+) -> Result<(), String> {
     for look in 0..POLLS {
         if look > 0 {
             launchd.pause(POLL_PAUSE);
         }
-        if limit(PRINT_ALARM).is_zero() {
-            return Err(format!("{}; jobs left: {foreign:?}", late(&domain)));
+        if limit(BOOTOUT_ALARM).is_zero() {
+            return Err(format!(
+                "launchctl on {domain} did not settle within {WITHIN:?}"
+            ));
         }
-        match launchd.run(&["print", &domain], limit(PRINT_ALARM)) {
-            Said::Missing(why) => return Err(format!("launchctl print {domain}: {why}")),
+        match launchd.run(&["bootout", domain], limit(BOOTOUT_ALARM)) {
+            Said::Missing(why) => return Err(format!("launchctl bootout {domain}: {why}")),
             Said::TimedOut => {}
-            Said::Exited { code: 0, stdout } => {
-                foreign = foreign_jobs(launchd, &domain, &stdout, &limit);
-                if foreign.is_empty() {
-                    return Ok(());
-                }
+            Said::Exited { code } if code == probe::TEARING_DOWN => {}
+            Said::Exited { code } if done.contains(&code) => return Ok(()),
+            Said::Exited { code } => {
+                return Err(format!("launchctl bootout {domain} exited {code}"));
             }
-            Said::Exited { code, .. } if code == probe::TEARING_DOWN => {}
-            // The domain is not there (or cannot be printed, which the clean's check
-            // stands in for): nothing of the lease's is in it.
-            Said::Exited { .. } => return Ok(()),
         }
     }
     Err(format!(
-        "{domain} still lists jobs after {POLLS} looks: {foreign:?}"
+        "{domain} still tearing down after {POLLS} bootouts"
     ))
-}
-
-/// The labels in the printed `domain` that are not launchd's own: each is printed on its
-/// own for its plist's path.
-fn foreign_jobs(
-    launchd: &dyn Launchd,
-    domain: &str,
-    printed: &str,
-    limit: &dyn Fn(Duration) -> Duration,
-) -> Vec<String> {
-    probe::listed_services(printed)
-        .into_iter()
-        .filter(|(_, label)| {
-            let target = format!("{domain}/{label}");
-            let own = match launchd.run(&["print", &target], limit(PRINT_ALARM)) {
-                Said::Exited { code: 0, stdout } => {
-                    probe::plist_path(&stdout).is_some_and(probe::is_own_plist)
-                }
-                _ => false,
-            };
-            !own
-        })
-        .map(|(_, label)| label)
-        .collect()
 }
 
 #[cfg(test)]

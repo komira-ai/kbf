@@ -10,7 +10,7 @@
 //!   side, or the default branch of the installer (`DEFAULT_REF`) no longer the one a
 //!   package built on `main` trusts;
 //! - a package built on a feature branch loading as trusting `main` (or the reverse), the
-//!   case `pkg-asset` and the verify job exist to refuse: the parsed `source_refs` are
+//!   case `pkg-kbf-asset` and the verify job exist to refuse: the parsed `source_refs` are
 //!   exactly the branch asked for, and nothing else;
 //! - `xtask`'s and the installer's rule for a ref disagreeing: xtask refusing a ref the
 //!   installer takes (a branch that could never be released) or accepting one the installer
@@ -52,8 +52,8 @@ fn host_with(conf: &[u8]) -> FakeExec {
     for dir in [
         "/usr",
         "/usr/share",
-        "/usr/share/kbf-installer",
-        "/usr/share/kbf-installer/trust",
+        "/usr/share/kbf",
+        "/usr/share/kbf/trust",
     ] {
         exec.entries.insert(
             HostPath::new(dir).expect("path"),
@@ -112,10 +112,114 @@ fn the_installer_reads_the_branch_pkg_trust_wrote_and_no_other() {
     assert_eq!(loaded.run_as, defaults.run_as, "no key beyond SOURCE_REFS");
 }
 
+/// A host (a fake) whose directories along `files` are root's, and whose `files` hold the bytes
+/// given, as a package leaves them.
+fn host_files(files: &[(&str, &[u8])]) -> FakeExec {
+    let root = Owner { uid: 0, gid: 0 };
+    let mut exec = FakeExec::new(0);
+    for (path, bytes) in files {
+        let mut dir = String::new();
+        for part in path.split('/').skip(1).take(path.split('/').count() - 2) {
+            dir = format!("{dir}/{part}");
+            exec.entries.insert(
+                HostPath::new(&dir).expect("path"),
+                Entry::Dir {
+                    perms: Perms::new(0o755),
+                    owner: root,
+                },
+            );
+        }
+        exec.entries.insert(
+            HostPath::new(path).expect("path"),
+            Entry::File {
+                perms: Perms::new(0o644),
+                owner: root,
+                bytes: bytes.to_vec(),
+            },
+        );
+    }
+    exec
+}
+
+#[test]
+fn the_file_the_package_installs_is_the_file_the_installer_reads() {
+    // Catches: the package and the reader of its trust directory naming two places (the
+    // package moved without the layout, or the layout without the package), or two names: the
+    // directory and each file of it, for the layout a host is given without the fallback.
+    let layout = host();
+    assert_eq!(layout.trust_dir().as_str(), xtask::pkg_linux::TRUST_DIR);
+    let read = [layout.gh(), layout.trusted_root(), layout.settings()];
+    let mut read: Vec<&str> = read.iter().map(|p| p.as_str()).collect();
+    read.sort_unstable();
+    let mut packaged: Vec<String> = xtask::pkg_linux::TRUST_FILES
+        .iter()
+        .map(|(name, _)| format!("{}/{name}", xtask::pkg_linux::TRUST_DIR))
+        .collect();
+    packaged.sort();
+    assert_eq!(read, packaged);
+}
+
+#[test]
+fn the_old_trust_directory_is_read_only_when_the_new_one_is_absent() {
+    // Catches: a host that still has the files where the `kbf-installer` package put them
+    // refused (it would stop verifying the day it is given this build), the old directory read
+    // when the `kbf` package's is there too (the conf of a package no longer installed would
+    // decide which branch is trusted), and a fallback that decides a different directory for
+    // `gh` than for `installer.conf`.
+    let (old, new) = (
+        "/usr/share/kbf-installer/trust/installer.conf",
+        "/usr/share/kbf/trust/installer.conf",
+    );
+    let (old_conf, new_conf) = (
+        b"SOURCE_REFS=refs/heads/from-the-old-package\n".as_slice(),
+        b"SOURCE_REFS=refs/heads/from-the-new-package\n".as_slice(),
+    );
+    let refs = |layout: &Layout, exec: &FakeExec| {
+        let settings = Settings::load(exec, layout).expect("loads");
+        settings
+            .source_refs
+            .iter()
+            .map(|r| r.as_str().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let layout_over = |name: &str, dirs: &[&str]| {
+        let root = scratch(name);
+        for dir in dirs {
+            std::fs::create_dir_all(root.join(dir)).expect("trust directory");
+        }
+        Layout::new(Root::new(root).expect("absolute"), Platform::Linux).with_trust_fallback()
+    };
+    // Only the old directory: its conf decides, and so does its gh.
+    let layout = layout_over("fallback-old-only", &["usr/share/kbf-installer/trust"]);
+    let exec = host_files(&[(old, old_conf)]);
+    assert_eq!(refs(&layout, &exec), ["refs/heads/from-the-old-package"]);
+    assert_eq!(layout.gh().as_str(), "/usr/share/kbf-installer/trust/gh");
+    // Both: the new one decides, though the old conf is there to be read.
+    let layout = layout_over(
+        "fallback-both",
+        &["usr/share/kbf-installer/trust", "usr/share/kbf/trust"],
+    );
+    let exec = host_files(&[(old, old_conf), (new, new_conf)]);
+    assert_eq!(refs(&layout, &exec), ["refs/heads/from-the-new-package"]);
+    assert_eq!(layout.gh().as_str(), "/usr/share/kbf/trust/gh");
+    // Neither: the defaults, from the new path (no conf to read at either).
+    let layout = layout_over("fallback-neither", &[]);
+    let exec = host_files(&[]);
+    assert_eq!(refs(&layout, &exec), [DEFAULT_REF]);
+    assert_eq!(layout.settings().as_str(), new);
+    // And a layout that was not asked for the fallback does not read the old conf even where
+    // it is the only one.
+    let root = scratch("fallback-not-asked");
+    std::fs::create_dir_all(root.join("usr/share/kbf-installer/trust")).expect("old directory");
+    let plain = Layout::new(Root::new(root).expect("absolute"), Platform::Linux);
+    let exec = host_files(&[(old, old_conf)]);
+    assert_eq!(refs(&plain, &exec), [DEFAULT_REF]);
+}
+
 #[test]
 fn xtask_and_the_installer_agree_on_which_refs_are_branches() {
     // Catches: pkg-trust refusing a branch the installer takes, or writing a conf for a
-    // ref the installer refuses (which `pkg-asset` would then ship).
+    // ref the installer refuses (which `pkg-kbf-asset` would then ship).
     for r in [
         "refs/heads/main",
         "refs/heads/team/topic-2",

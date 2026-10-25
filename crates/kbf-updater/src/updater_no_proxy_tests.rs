@@ -28,7 +28,7 @@ const THEN_B: &str = "qy:fe2 rn:fe2,b rd:fe2 cm:fe2";
 
 /// A call as a word: `rd:` a member was asked if it is ready, `fd:` it was told to drain, `fs:`
 /// its drain was read, `qy:` a query, `in:` an install of the target, `rn:` a restart as
-/// `alias,unit`, `cm:` a commit.
+/// `alias,unit`, `cm:` a commit, `ck:` safe-to-stop, `hl:` health.
 fn ev(word: &str) -> Event {
     let (kind, rest) = word.split_once(':').unwrap_or((word, ""));
     let name = rest.to_owned();
@@ -37,6 +37,8 @@ fn ev(word: &str) -> Event {
         "fd" => Event::MemberDrain(name),
         "fs" => Event::MemberDrainStatus(name),
         "qy" => Event::Query(name),
+        "ck" => Event::Check(name),
+        "hl" => Event::Health(name),
         "in" => Event::Install(name, TARGET.to_owned()),
         "rn" => {
             let (alias, unit) = rest.split_once(',').unwrap_or_default();
@@ -85,11 +87,12 @@ fn idle() -> DrainStatus {
     }
 }
 
-/// Two members, `a` on host `fe1` and `b` on host `fe2`, which are one host.
-fn inventory() -> Inventory {
+/// Two members, `a` on host `fe1` and `b` on host `fe2`, which are one host, and then `extra`
+/// lines.
+fn inventory_with(extra: &str) -> Inventory {
     Inventory::parse(&format!(
         "fe1 fe.farm.example frontend {KEY} instance=a base=18000\n\
-         fe2 fe.farm.example frontend {KEY} instance=b base=18010\n"
+         fe2 fe.farm.example frontend {KEY} instance=b base=18010\n{extra}"
     ))
     .expect("inventory")
 }
@@ -103,7 +106,7 @@ fn member_rig(name: &str) -> Rig {
 }
 
 fn open_over(rig: &Rig) -> Updater {
-    rig.open_inventory(inventory(), rig.store())
+    rig.open_inventory(inventory_with(""), rig.store())
 }
 
 fn run(u: &Updater, hosts: Hosts) -> Roll {
@@ -660,5 +663,119 @@ fn a_record_in_a_phase_of_a_turn_at_a_proxy_fails_the_turn_before_any_call() {
         let detail = &failure.detail;
         assert!(detail.contains("abort the roll"), "{detail}");
         assert!(rig.log.events().is_empty(), "{phase:?}");
+    }
+}
+
+/// Asserts that a member found `installing` after a restart of the updater, whose host reports
+/// the install begun before the restart as still in progress, waits for it one poll apart and
+/// makes no second install beside it: the host reports the target on the next ask, and the turn
+/// goes on to the restart and the wait for readiness without a drain, and the second member is
+/// then rolled as its turn goes.
+#[test]
+fn an_install_still_in_progress_after_a_restart_is_waited_for_and_not_repeated() {
+    let rig = member_rig("np-install-wait");
+    let target = Installed::Version(TARGET.to_owned());
+    rig.inst.set_installed("fe1", target);
+    rig.inst
+        .script_query("fe1", vec![Ok(Installed::InProgress)]);
+    rig.store().save(&record(Phase::Installing)).expect("save");
+    let u = open_over(&rig);
+    let roll = u.drive("roll-1").expect("drive");
+    assert_eq!(roll.state, RollState::Done);
+    let want = seq("qy:fe1 qy:fe1 rn:fe1,a rd:fe1 cm:fe1");
+    assert_eq!(rig.log.events()[..want.len()], want[..]);
+    assert!(rig.log.installs().is_empty());
+    assert!(!rig.log.events().contains(&ev("fd:fe1")));
+    // One poll of the install, then the window the second member's turn waits.
+    assert_eq!(rig.elapsed(), Duration::from_secs(5 + 30));
+}
+
+/// Asserts that an install that stays in progress fails the turn at the member when the install
+/// bound is out (900 s after the window of the other member's readiness), with `install_failed`,
+/// the host and the bound in the detail and the member named as not serving, that no install is
+/// made beside it, and that the unit is not restarted.
+#[test]
+fn an_install_that_stays_in_progress_fails_the_turn_at_the_install_bound() {
+    let rig = member_rig("np-install-stuck");
+    rig.inst.set_installed("fe1", Installed::InProgress);
+    let u = open_over(&rig);
+    let roll = run(&u, only("fe1"));
+    assert_eq!(roll.state, RollState::Failed);
+    let failure = roll.failure.expect("failure");
+    assert_eq!(failure.code, ErrorCode::InstallFailed);
+    let detail = &failure.detail;
+    let stuck = "an install on fe1 was still in progress after 900 s";
+    assert!(detail.contains(stuck), "{detail}");
+    assert!(detail.contains("is not serving"), "{detail}");
+    let t = Timing::default();
+    assert_eq!(rig.elapsed(), t.peer_ready + t.install_bound);
+    assert!(rig.log.installs().is_empty());
+    assert!(!rig.log.events().contains(&ev("rn:fe1,a")));
+}
+
+/// Asserts that with a storage host in the inventory, listed after the two members, the members
+/// are rolled first, each as its turn goes, and the storage host after them as a host that is
+/// not a member: safe-to-stop, install and health, with the storage host's install the second of
+/// the roll.
+#[test]
+fn members_are_rolled_before_the_other_hosts() {
+    let rig = member_rig("np-then-storage");
+    // The storage host is listed before the members on purpose: only the roll's own order
+    // puts the members first.
+    let inv = Inventory::parse(&format!(
+        "st1 st1.farm.example storage {KEY}\n\
+         fe1 fe.farm.example frontend {KEY} instance=a base=18000\n\
+         fe2 fe.farm.example frontend {KEY} instance=b base=18010\n"
+    ))
+    .expect("inventory");
+    let u = rig.open_inventory(inv, rig.store());
+    let roll = run(&u, Hosts::default());
+    assert_eq!(roll.state, RollState::Done);
+    assert_eq!(phases(&roll), [Phase::Done, Phase::Done, Phase::Done]);
+    assert_eq!(rig.log.installs(), ["fe1", "st1"]);
+    let want = [turn_a(), turn_b(), "ck:st1 in:st1 hl:st1".to_owned()].join(" ");
+    assert_eq!(rig.log.events(), seq(&want));
+}
+
+/// An old record, as an earlier build wrote it: a host that is done and a host `waiting_healthy`.
+const OLD_RECORD: &str = r#"{
+  "format": 1,
+  "seq": 1,
+  "request": {"package": "kbf", "version": "0.1.7+g0123456789ab-3", "hosts": "all",
+              "idempotency_key": "run-1"},
+  "roll": {"id": "roll-1", "state": "running",
+           "hosts": [{"alias": "fe1", "phase": "done", "attempts": 1, "detail": null},
+                     {"alias": "fe2", "phase": "waiting_healthy", "attempts": 1,
+                      "detail": null}],
+           "failure": null},
+  "resumes": 0,
+  "abort_requested": false
+}"#;
+
+/// Asserts that a record an earlier build wrote still parses and checks with no format raise,
+/// that the roll resumes on the member in `waiting_healthy` with no drain, install or restart
+/// (only its readiness and commit are asked), and that the phases of a member's turn are written
+/// as snake case words.
+#[test]
+fn an_old_roll_record_still_parses_and_resumes() {
+    let rec: Record = serde_json::from_str(OLD_RECORD).expect("old record");
+    assert_eq!(rec.format, FORMAT);
+    assert_eq!(rec.check(), Ok(()));
+    let rig = member_rig("np-old-record");
+    std::fs::write(rig.dir.join("roll.json"), OLD_RECORD).expect("write");
+    let loaded = rig.store().load().expect("load").expect("record");
+    assert_eq!(loaded, rec);
+    let u = open_over(&rig);
+    let roll = u.drive("roll-1").expect("drive");
+    assert_eq!(roll.state, RollState::Done);
+    assert_eq!(rig.log.events(), seq("rd:fe2 cm:fe2"));
+    let words = [
+        (Phase::Draining, "\"draining\""),
+        (Phase::Installing, "\"installing\""),
+        (Phase::Restarting, "\"restarting\""),
+        (Phase::WaitingHealthy, "\"waiting_healthy\""),
+    ];
+    for (phase, word) in words {
+        assert_eq!(serde_json::to_string(&phase).expect("json"), word);
     }
 }

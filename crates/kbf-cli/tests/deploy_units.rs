@@ -136,6 +136,13 @@ fn each_packaged_mode_unit_starts_its_own_mode_on_the_kbf_toml_setup_writes() {
         let words = start_words(&unit(&name), &name);
         assert_eq!(words, [format!("--mode={}", mode.name)], "{name}");
         let config = write_config(dir.path(), setup_file(mode.name));
+        if mode.name == "all-in-one" {
+            // Kept for one release; `kbf` refuses the mode the unit names. A follow-up
+            // rewrites this fixture for the replacement nodes.
+            let e = parse_with(argv(&words, &config), None).expect_err("refused");
+            assert!(e.to_string().contains(kbf_cli::ALL_IN_ONE_REMOVED), "{e}");
+            continue;
+        }
         let parsed = match parse_with(argv(&words, &config), None) {
             Ok(parsed) => parsed,
             Err(e) => panic!("kbf {} refuses {name} on its setup file:\n{e}", mode.name),
@@ -295,6 +302,13 @@ fn no_packaged_unit_is_refused_over_where_its_directories_are() {
         .map(|m| (m.name, setup_file(m.name).to_owned()))
         .collect();
     cases.push(("storage", STORAGE_BY_HAND.to_owned()));
+    // The mode that runs a node's storage and daemon together, given a metadata directory
+    // as the all-in-one's file has (its setup file names none).
+    let node = format!(
+        "{}\n[stores]\nmeta-dir = \"/var/lib/kbf-server/raft\"\n",
+        setup_file("storage-and-daemon")
+    );
+    cases.push(("storage-and-daemon", node));
     let mut moved = 0;
     for (mode, text) in cases {
         let farm = text
@@ -309,6 +323,11 @@ fn no_packaged_unit_is_refused_over_where_its_directories_are() {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        if mode == "all-in-one" {
+            // `kbf` refuses the mode, so there is no start to check; a follow-up
+            // moves this case to a mode that has a metadata directory.
+            continue;
+        }
         for text in [text.clone(), farm] {
             let name = format!("kbf-{mode}.service");
             let words = start_words(&unit(&name), &name);

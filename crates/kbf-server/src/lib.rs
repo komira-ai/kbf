@@ -132,6 +132,8 @@ pub mod serve;
 mod serve_goaway_tests;
 #[cfg(test)]
 mod serve_remote_tests;
+#[cfg(test)]
+mod serve_start_tests;
 mod size_key;
 pub mod stamp;
 mod stand;
@@ -183,7 +185,7 @@ pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_in
 pub use start_exit::{
     NOT_READY, REFUSED, STALE_WRITER_HINT, StartFailure, hint as start_hint, said as start_said,
 };
-pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
+pub use state_store::{PackIndexFlagError, StateStore, StateStoreUri, StateStoreUriError};
 pub use streams::{StreamArgs, StreamLimits};
 pub use ui_mount::bind_server_with_options;
 pub use worker::HostFloor;

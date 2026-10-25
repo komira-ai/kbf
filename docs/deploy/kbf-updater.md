@@ -79,8 +79,9 @@ turn of a member is:
    then runs its own drain, which does not depend on the balancer: `/readyz` 503, no new work and
    GOAWAY on its listeners, a wait for the executions open on it, and its exit. The roll waits
    until the member's operator API refuses the connection (it has exited) or its
-   `GET /v1/frontend/drain` reports `"closing": true` (the frontend in this tree does not report
-   it, and is waited for until it exits), for at most `--frontend-drain-deadline-secs`
+   `GET /v1/frontend/drain` reports `"phase": "closing"` (the streams that are left are being
+   closed and the process exits within seconds; a status with another phase, or none, is taken
+   to be still draining), for at most `--frontend-drain-deadline-secs`
    (`drain_failed`). A member that answers the status but says it is not draining fails the roll
    at once (`drain_failed`). A member that is not running refuses the connection of the drain
    itself, has nothing to drain, and the turn goes on; a drain that gets no answer (a timeout)
@@ -144,6 +145,11 @@ The program is a release asset for each platform that runs it: `kbf-updater-<com
 member, `kbf-updater`, attested like every tarball ([../artifacts.md](../artifacts.md)). The macOS one
 is signed ad hoc with the hardened runtime, as the other macOS binaries are; a Mac runs the agent as
 `_kbf-updater` from the property list in `packaging/host-agent/macos`.
+The account `_kbf-updater` and the two directories the agent writes, `/var/db/kbf-updater` (its
+state directory, the account's, mode 700) and `/Library/Logs/kbf-updater` (its logs, the account's,
+mode 755), come from the `updater_user` item of `kbf-mac-provision`: put `updater_user=_kbf-updater`
+(and, to fix the id, `updater_id=<200 to 499>`) in the Mac's profile and run `apply`
+([the item](../../crates/kbf-mac-provision/README.md)). Nothing else creates the account.
 
 ```text
 kbf-updater agent --coordinator <dns name>:<port> --channel NAME
@@ -161,7 +167,8 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
   the certificate and the CA are its files. The agent renews the certificate at half its life
   and writes the new one there; `--enroll-frontend` is where. The certificate is the farm CA's `updater`
   certificate: its one DNS name is this node's id and its `urn:kbf:host-role:` is what the host
-  runs (`storage`, `daemon` or `mac-daemon`; a `frontend` is refused, the roll updates frontends).
+  runs (`frontend`, `storage`, `daemon` or `mac-daemon`; a `frontend` host's helper runs the
+  frontend as a container, see [A frontend host](#a-frontend-host)).
   The agent reads both from it. The files are read for every heartbeat and every call to the
   frontend, so a renewed pair is used from the next one, if it names the same node and role as the
   pair the agent started with (a pair for another node is refused until the agent is restarted).
@@ -179,6 +186,10 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
   required with `--state-dir`.
 - `--channel`: the channel of the helper's allowlist. The version the coordinator names is looked
   up in it by the helper, never fetched by URL.
+- `--daemon-node`: for the agent of a **frontend host** that also runs a daemon: the daemon's node
+  id. The agent drains that node around the frontend's update (with the operator token if the
+  agent has one, else with its certificate, which names its own node only). Without it a frontend
+  host's node is not drained.
 - `--helper-socket`: the socket of `kbf-host-install --serve` (default
   `/run/kbf-host-install/local.sock`; [host-install.md](host-install.md#the-local-socket)).
 - `--operator-api`, `--token-file`: optional, together: the full
@@ -186,6 +197,37 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
   certificate; see the boundary below.
 - Times, in seconds, 1 to 86400: `--heartbeat-secs` 15, `--drain-deadline-secs` 600,
   `--health-timeout-secs` 300, `--health-poll-secs` 5, `--retry-secs` 900.
+
+### A frontend host
+
+A host whose certificate says `frontend` runs its frontend as a container, and its helper is
+`kbf-host-install --serve --frontend-container` ([host-install.md](host-install.md#a-frontend-container)).
+The agent runs the same A/B as for any host (install, switch, health, confirm, or revert) and
+reports it in the next heartbeat. What differs is who does the frontend's part: the helper drains
+the container through the frontend's own operator API, recreates it from the new attested image
+with the same run configuration, waits for `/readyz` and `/healthz` on the target commit, and puts
+the old image back on any failure; the agent's health check is the helper's word that the release
+runs. The coordinator orders frontends one at a time and never the last one that is ready; the
+helper adds its own refusal when a `peers` entry of its configuration is not ready.
+
+**A lone frontend is never updated by the coordinator.** A frontend is ordered only when at least
+`max(KBF_MIN_UP_FRONTEND, 1)` *other* frontends are up (`required_up` in
+`crates/kbf-coordinator/src/decide.rs`), so with one frontend there is nobody else and no order is
+ever sent, whatever `KBF_MIN_UP_FRONTEND` says; the deploy job then fails when the stall or the
+deadline passes. A storage host is in the same case when `KBF_MIN_UP_STORAGE` is 1 or more (the
+default) and it is the only one. For a farm the coordinator deploys, run two or more frontends. With
+one, update it by hand in a maintenance window, through its helper's socket
+([host-install.md](host-install.md#the-five-requests)), as the socket's account:
+
+```text
+install kbf=<version> from <channel>
+switch kbf=<version>
+confirm kbf=<version>
+```
+
+The farm's frontend is down for the length of the switch (its `drain_secs`, the stop, and
+`ready_secs`), so do it when nothing needs it. The switch answers `switched` only after `/readyz` answered 200 on the
+new commit; send `confirm` then, or the helper reverts at the window's deadline.
 
 ### The heartbeat
 
@@ -239,6 +281,8 @@ kbf-updater enroll --frontend <dns name>:<port> --node-id ID --token-file FILE -
    the node id and the host role; a token for a node's roles (`storage`, `daemon`) is refused for
    an updater, and an updater token is refused for any other role, for another node id, a second
    time and after it expired.
+   A frontend host is enrolled the same way, with `"host_role": "frontend"` in the token. The word
+   `frontend` is refused only in the token's `roles` list (`Role::from_str`), never as the `host_role`.
 2. On the host, as the agent's account, the token goes in a file of that account's with mode 0600
    and the state directory is that account's with mode 0700 (the command refuses otherwise,
    before it reads the token). The command makes the key on the host (mode 0600; only a request
@@ -303,7 +347,9 @@ a release on a real farm. It does nothing until an operator has done the three t
 until then the job prints `::notice::the deploy step is off` and passes, so a fork or a repository
 that runs no farm is unaffected. Nothing in this repository does any of them.
 
-1. **Deploy the coordinator** (`kbf-coordinator`, [the design](../design/updates.md)) with a
+1. **Deploy the coordinator** (`kbf-coordinator`, [the design](../design/updates.md); as a pod
+   under an orchestrator such as k3s, or as one container on one host under Docker, see
+   [containers.md](containers.md#run-the-coordinator-on-one-host)) with a
    certificate the farm CA issued with the role `coordinator`, and an allow-list for CI's OIDC
    token in the file `--oidc-config` names. The job's token is the run's, so the allow-list must
    say exactly this, and nothing wider:
@@ -324,7 +370,8 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    the pipeline, and its tokens say so (the default list is `push` and `workflow_dispatch`).
    The `sha` of the token is the head of `main`, not the commit released. A token is good for one
    call. The control listener (`--control-listen`) must be reachable from GitHub-hosted runners;
-   the heartbeat listener need not be.
+   the heartbeat listener need not be. A control listener on a Tailscale network only is
+   reachable too: the job joins that network first when `TS_CLIENT_ID` and `KBF_COORDINATOR_URL` are set (below).
 2. **Enroll the hosts**, so that their updaters heartbeat to the coordinator
    ([The agent mode](#the-agent-mode)). A host that does not heartbeat is `down`, and the
    coordinator does not wait for it: it says `converged` when every host that does heartbeat runs
@@ -340,6 +387,7 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    |---|---|
    | `KBF_COORDINATOR_URL` | `https://<name>:<port>` of the control listener, no path. Unset or empty: the step is off |
    | `KBF_COORDINATOR_CA` | the farm CA's certificate (PEM, public). The coordinator's certificate is the farm CA's, which no system store holds; empty trusts the system store instead |
+   | `TS_CLIENT_ID`, `TS_AUDIENCE` | optional, for a coordinator reachable only on a Tailscale network: the client id and audience of the Tailscale trust credential (workload identity federation) that CI jobs join the network with, as `tag:ci`. It must trust this repository's `release` environment (the token's subject is `repo:<owner>/<repo>:environment:release`), and the network's policy must let `tag:ci` reach the control listener. With `TS_CLIENT_ID` and `KBF_COORDINATOR_URL` set, the job joins as an ephemeral node with the run's OIDC token, after the build and before the verb; no secret is involved. `TS_CLIENT_ID` or `KBF_COORDINATOR_URL` unset: the step is skipped (`TS_AUDIENCE` must be set with `TS_CLIENT_ID`) |
    | `KBF_MIN_UP_STORAGE`, `KBF_MIN_UP_FRONTEND` | optional: the storage hosts and frontends that must stay up while others update (default 1 each). The operator picks the storage number so that every blob stays readable |
 
 ### What the step does

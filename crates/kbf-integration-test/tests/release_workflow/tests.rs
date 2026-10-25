@@ -1428,6 +1428,106 @@ fn deploy_reads_the_coordinators_address_from_the_variable_alone() {
 }
 
 #[test]
+fn the_network_join_of_deploy_uses_the_run_token_and_variables_only() {
+    // Catches: a secret given to the join (the job would hold more than the run token), an
+    // input added or changed, the join under another condition or unconditional (a farm
+    // without a tailnet would fail every release), the join moved before the build (the
+    // build's scripts would see the network) or after the verb, an `env:` on it, a second
+    // join, and the action used by another job.
+    let join = "          oauth-client-id: ${{ vars.TS_CLIENT_ID }}\n";
+    red(
+        &plant(
+            "deploy",
+            join,
+            "          oauth-client-id: ${{ vars.TS_CLIENT_ID }}\n          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}\n",
+        ),
+        "reads a secret",
+    );
+    red(
+        &plant(
+            "deploy",
+            join,
+            "          oauth-client-id: ${{ vars.TS_CLIENT_ID }}\n          authkey: ${{ vars.TS_KEY }}\n",
+        ),
+        "not exactly",
+    );
+    red(
+        &plant("deploy", "tags: tag:ci", "tags: tag:ci,tag:admin"),
+        "not exactly",
+    );
+    red(
+        &plant(
+            "deploy",
+            "audience: ${{ vars.TS_AUDIENCE }}",
+            "audience: ${{ vars.OTHER }}",
+        ),
+        "not exactly",
+    );
+    red(
+        &plant(
+            "deploy",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
+            "        if: ${{ vars.OTHER != '' }}\n",
+        ),
+        "is under `if:`",
+    );
+    red(
+        &plant(
+            "deploy",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
+            "",
+        ),
+        "not under exactly `if:",
+    );
+    let step = "      - name: Join the farm's Tailscale network\n";
+    let real = real();
+    let start = real.find(step).expect("the join step");
+    let end = start
+        + real[start..]
+            .find("      # The version is the release's;")
+            .expect("the next comment");
+    let block = &real[start..end];
+    // The build line of `deploy` (other jobs build xtask too): the last one before the join.
+    let build = "      - run: cargo build -p xtask --locked\n";
+    let at = real[..start].rfind(build).expect("deploy's build of xtask");
+    let moved = [&real[..at], block, &real[at..start], &real[end..]].concat();
+    red(
+        &problems(&moved).expect("the planted workflow is read"),
+        "not after `cargo build -p xtask`",
+    );
+    // After the verb: the join moved to the end of the file, which is the end of `deploy`.
+    let late = [&real[..start], &real[end..], block].concat();
+    red(
+        &problems(&late).expect("the planted workflow is read"),
+        "before `cargo xtask deploy-farm`",
+    );
+    red(
+        &plant(
+            "deploy",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n        env:\n          TS_AUTHKEY: ${{ vars.TS_KEY }}\n",
+        ),
+        "has an `env:`",
+    );
+    let twice = real.replacen(block, &format!("{block}{block}"), 1);
+    red(
+        &problems(&twice).expect("the planted workflow is read"),
+        "times, not once",
+    );
+    red(
+        &plant(
+            "bump",
+            "      - uses: actions/checkout@",
+            &format!(
+                "      - uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0\n{}",
+                "      - uses: actions/checkout@"
+            ),
+        ),
+        "the job `bump` uses `tailscale/github-action@`",
+    );
+}
+
+#[test]
 fn the_deploy_step_is_not_skipped_by_a_condition_of_its_own() {
     // Catches: the unset variable turned into a skipped step (which would show no notice) by
     // an `if:` on the step; the lint of every job's steps refuses it.

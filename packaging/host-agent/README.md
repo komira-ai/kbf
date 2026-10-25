@@ -6,7 +6,9 @@ here is in a package yet: the binaries are release assets (`docs/deploy/host-ins
 
 | file | what |
 |---|---|
+| `linux/kbf-host-local-frontend.service`, `linux/host-install-frontend.toml` | the same socket for a host whose frontend is a container (`--frontend-container`), and an example of its `/etc/kbf/host-install-frontend.toml`; use this unit or the next, not both |
 | `linux/kbf-host-local.service` | `kbf-host-install --serve`, as root: the local socket (`/run/kbf-host-install/local.sock`, mode 0600, owned by `kbf-updater`) that stages a release, switches to it on trial, and goes back by itself at the deadline |
+| `linux/kbf-host-local.service` on a host that runs the `kbf` package | add `--layout deb` (or `rpm`) to its `--serve` line: the update is then an installation of the attested package (`docs/deploy/host-install.md`, "On a Linux daemon host that runs the package"); a hand-placed host moves once with `kbf-host-install --migrate-to-package` (`docs/deploy/native-package-migration.md`) |
 | `linux/kbf-updater-agent.service` | `kbf-updater agent`, as `kbf-updater`: the heartbeat to the coordinator and the host's A/B through that socket |
 | `linux/kbf-updater.conf` | the sysusers.d entry of the `kbf-updater` account (no login, no home) |
 | `enroll-example.txt` | the enrollment command, as the tests read it |
@@ -60,5 +62,9 @@ command, which `crates/kbf-updater/tests/agent_packaging.rs` checks against the 
   the agent uses it instead of the certificate.
 - **Where the certificate is renewed**: `--enroll-frontend`, the frontend's enroll listener
   (`--enroll-listen`), which is the address the enrollment above was given.
-- **A frontend host is not served**: its certificate is refused. A frontend is a container
-  that `kbf-host-install` drains and recreates; the updater does not update one.
+- **A frontend host** runs its frontend as a container (`linux/kbf-host-local-frontend.service`
+  in place of `kbf-host-local.service`, with `/etc/kbf/host-install-frontend.toml`; see
+  `docs/deploy/host-install.md`, "A frontend container"). Its agent runs the A/B through the
+  helper, which drains the container through the frontend's own operator API, recreates it from the
+  new attested image and puts the old image back when the new one is not ready. The agent drains no
+  node unless `--daemon-node` names the daemon the host also runs.

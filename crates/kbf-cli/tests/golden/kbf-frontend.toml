@@ -17,13 +17,13 @@ ca-dev-file-signer = false
 # ca-dir = "DIR"
 # The socket of the kbf-signer process that holds the CA key (production). This process holds no CA key.
 # ca-signer = "SOCKET"
-# Allow --enroll-listen although this build's storage does not enforce the deny rows a node revocation writes: a revoked node is refused renewal at once but storage serves it until its certificate expires.
+# Does nothing: this build enforces the deny rows a node revocation writes, so --enroll-listen needs no acceptance. Still accepted so existing units start; it will be removed in a later release.
 enroll-allow-unenforced-deny = false
 # What --cas is for a daemon-only node, told to every node. Empty: none.
 # enroll-cas-endpoint = "URL"
 # How long the certificates the CA issues live (3600 to 2592000); a node renews at half. The signer's own --lifetime-secs must be at least this.
 enroll-cert-lifetime-secs = 604800
-# Serve kbf.enroll.v1 (Enroll and Renew) on this address, over TLS with the frontend's own certificate from the CA. Off unless given. It needs --state-store, --ca-dir, --frontend-name, and --ca-signer (or, for development, --ca-dev-file-signer). While this build does not enforce deny rows in storage it also needs --enroll-allow-unenforced-deny.
+# Serve kbf.enroll.v1 (Enroll and Renew) on this address, over TLS with the frontend's own certificate from the CA. Off unless given. It needs --state-store, --ca-dir, --frontend-name, and --ca-signer (or, for development, --ca-dev-file-signer).
 # enroll-listen = "ADDR"
 # Calls the listener works on at once, from all sources; the next is refused `rate limited`.
 enroll-max-in-flight = 64
@@ -134,6 +134,8 @@ default-platform = "linux/x86_64"
 finished-retention-secs = 60
 # The heartbeat interval daemons are asked for, in milliseconds, at most half the window in which a daemon may act on a `Start` (each `Start` names the newest heartbeat the server took, so a longer interval would leave it too little)
 heartbeat-interval-ms = 5000
+# Opens the pack index at start: the tables in the Postgres state store that say which pack holds each blob and where. Nothing reads or writes them yet, so the flag only checks that the store can hold them. Needs `--state-store` as a `postgres://` URL whose schema has the pack tables (`kbf-installer setup` makes them); a `sqlite://` store is refused. Left out, no pack table is touched
+pack-index = false
 # How often, in seconds, every open Execute and WaitExecution stream is sent its operation again (same name, not done, current stage), so a load balancer's idle timeout never cuts a long action. 0 sends none
 progress-interval-secs = 30
 # How long, in milliseconds, `GET /readyz` on the operator API and the REAPI listener's `grpc.health.v1` service wait for the object store to answer their read-only probe before they answer not ready

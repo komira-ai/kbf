@@ -252,7 +252,10 @@ async fn ask(
 }
 
 fn open() -> Peers {
-    Peers::Certified { deny_list: None }
+    Peers::Certified {
+        deny_list: None,
+        denied_rows: None,
+    }
 }
 
 /// A call that did not pass the layer (no admitted updater with it), or that names another
@@ -367,6 +370,7 @@ async fn the_deny_list_applies_to_the_node() {
     let list = DenyList::open(&path).expect("a list");
     let peers = Peers::Certified {
         deny_list: Some(list),
+        denied_rows: None,
     };
     let (code, said) = ask(
         peers.clone(),

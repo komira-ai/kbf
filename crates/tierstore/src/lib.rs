@@ -2,8 +2,9 @@
 //!
 //! The crate knows nothing of what is stored: objects are immutable byte strings under string
 //! keys, and it has no crate of the workspace it lives in among its normal dependencies, so that
-//! it can move to a repository of its own (its tests of the `server` feature use two of them as
-//! dev-dependencies, which stay behind).
+//! it can move to a repository of its own. The one exception is the feature `s3` (off by
+//! default), which adds `S3Backend`, an adapter over the S3 client of `kbf-objstore`; its tests
+//! use two crates of the workspace as dev-dependencies, which stay behind.
 //!
 //! - [`Backend`] is the minimal API of an S3-compatible store: a create-only put (it fails
 //!   with [`Error::AlreadyExists`] where the key exists, as `If-None-Match: *` does), a put
@@ -18,6 +19,10 @@
 //!   test sets by hand, and [`FaultyBackend`] wraps a backend to fail or delay chosen calls
 //!   and to count them: both are for tests. [`DirBackend`] keeps a bucket in a directory of the
 //!   local file system, parts of uploads included, which are streamed to files.
+//! - `S3Backend` (feature `s3`, in the module `s3`) is a bucket of an S3-compatible store as
+//!   a [`Backend`]: a create-only put is `If-None-Match: *`, a put that replaces is
+//!   `If-Match`, a get is a ranged GET, a head gives the `ETag` as the content tag, and a
+//!   listing follows the continuation tokens. It does not yet do the multipart calls.
 //! - [`Proxy`] is a store over a hot and a cold backend that is itself a [`Backend`]. Any
 //!   number of proxies (one per node, each with its own id) work over the same two backends,
 //!   and none needs state for correctness. A get reads the hot tier, else the cold tier, and
@@ -64,6 +69,8 @@ mod journal;
 mod lease;
 mod memory;
 mod reconciler;
+#[cfg(feature = "s3")]
+pub mod s3;
 #[cfg(feature = "server")]
 pub mod server;
 mod state;
@@ -78,4 +85,6 @@ pub use faulty::{FaultyBackend, Op};
 pub use journal::{JournalEntry, JournalOp, decode_journal, encode_journal};
 pub use memory::{MemoryBackend, TestClock};
 pub use reconciler::{PassReport, Reconciler, ReconcilerConfig};
+#[cfg(feature = "s3")]
+pub use s3::S3Backend;
 pub use tiered::{Proxy, ProxyConfig};

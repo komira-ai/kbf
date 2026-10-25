@@ -6,7 +6,8 @@
 //! [`Reply::Refused`], and hangs up). The client's request is then one frame, a
 //! [`Call`] that carries that nonce, so a request written before the helper's check
 //! cannot pass for one written after it (S4.3). `run` attaches four descriptors to it
-//! (`SCM_RIGHTS`): stdin, stdout, stderr and the lease directory, in that order. The
+//! (`SCM_RIGHTS`): stdin, stdout, stderr and the lease directory, in that order, and so
+//! does `role-run`. The
 //! helper answers with one frame, except that a started `run` answers
 //! [`Reply::Started`] and then, when the process exits, [`Reply::Exited`].
 
@@ -30,6 +31,9 @@ pub const RUN_FDS: usize = 4;
 /// [`SCAN_LINE_BYTES`], so the reply fits a frame; the helper's log holds them all.
 pub const SCAN_LINES: usize = 20;
 pub const SCAN_LINE_BYTES: usize = 300;
+
+/// The most bytes of `kbf-vmm`'s report an image verb's reply carries.
+pub const IMAGE_REPORT_BYTES: usize = 16 * 1024;
 
 /// The receive buffer for ancillary data. On Linux, room for one more descriptor than a
 /// request may carry: the kernel cuts what does not fit, says so (`MSG_CTRUNC`), and
@@ -79,8 +83,33 @@ pub enum Request {
     UserDelete { lease: String },
     /// Auto-login into the lease's user, then a userspace restart.
     SessionLogin { lease: String },
-    /// Clear auto-login, then a userspace restart.
+    /// Rest the Mac, then a userspace restart: at the standing VM user when the helper
+    /// has one (`--vm-user`), else at the login window (auto-login cleared).
     SessionIdle,
+    /// Start a process as the standing VM user in its GUI session, with the same four
+    /// descriptors as `run`. Refused unless the VM user's `gui/<uid>` domain is up and
+    /// no lease holds the session.
+    RoleRun {
+        argv: Vec<String>,
+        #[serde(default)]
+        env: Vec<(String, String)>,
+    },
+    /// Whether the standing VM user's GUI session (`gui/<uid>`) is up. False while a
+    /// lease holds the session.
+    RoleSessionReady,
+    /// End every process of the standing VM user (its session with them).
+    RoleKillUid,
+    /// As root, take the base image bundle `bundle` (a path directly inside the staging
+    /// directory), move it into the images directory, write the guest's first-boot files
+    /// into it (`kbf-vmm image setup`) and seal it: root's, mode 0750/0640 with the VM
+    /// user's group, `uchg`. There is no program and no argument here: the helper runs its
+    /// own installed `kbf-vmm`.
+    ImageSetup { bundle: String },
+    /// As root, copy the diagnostics allowlist out of the stopped guest bundle `bundle`
+    /// (directly inside the staging or the images directory) into the new directory `out`
+    /// (directly inside the images directory) (`kbf-vmm image harvest`); the helper makes
+    /// `out`, root's and mode 0700.
+    ImageHarvest { bundle: String, out: String },
     /// The boot reset, before the daemon's `Hello`: `held` are the leases the server
     /// still holds for this node.
     BootReset {
@@ -157,6 +186,9 @@ pub enum Reply {
     },
     /// The baseline is recorded: how many items each class holds.
     Baselined { classes: Vec<(String, usize)> },
+    /// An image verb ran: what `kbf-vmm` printed (its JSON report), cut to
+    /// [`IMAGE_REPORT_BYTES`].
+    Imaged { report: String },
     /// The request was refused or failed, and why.
     Refused { reason: String },
 }
@@ -648,6 +680,67 @@ mod tests {
         let classes = vec![("lease-users".to_owned(), 1)];
         let text = serde_json::to_string(&Reply::Baselined { classes }).unwrap();
         assert_eq!(text, r#"{"baselined":{"classes":[["lease-users",1]]}}"#);
+    }
+
+    /// Catches: role verbs that change the wire of the lease verbs, or whose names
+    /// differ from the ones the daemon sends; and a `role-run` that needs an `env` an
+    /// older sender leaves out.
+    #[test]
+    fn the_role_verbs_are_their_own_verbs() {
+        let text = serde_json::to_string(&Request::RoleSessionReady).unwrap();
+        assert_eq!(text, r#"{"verb":"role-session-ready"}"#);
+        let text = serde_json::to_string(&Request::RoleKillUid).unwrap();
+        assert_eq!(text, r#"{"verb":"role-kill-uid"}"#);
+        let run = Request::RoleRun {
+            argv: vec!["/usr/bin/true".to_owned()],
+            env: Vec::new(),
+        };
+        let text = serde_json::to_string(&run).unwrap();
+        assert_eq!(
+            text,
+            r#"{"verb":"role-run","argv":["/usr/bin/true"],"env":[]}"#
+        );
+        let bare = r#"{"verb":"role-run","argv":["/usr/bin/true"]}"#;
+        assert_eq!(serde_json::from_str::<Request>(bare).unwrap(), run);
+    }
+
+    /// Catches: an image verb that can carry a program, an argument vector or a
+    /// guest binary path from the caller (the helper must run only its own installed
+    /// `kbf-vmm`, with argv it builds), or whose names differ from the daemon's.
+    #[test]
+    fn an_image_verb_carries_paths_and_nothing_to_run() {
+        let setup = Request::ImageSetup {
+            bundle: "/images/base".to_owned(),
+        };
+        let text = serde_json::to_string(&setup).unwrap();
+        assert_eq!(text, r#"{"verb":"image-setup","bundle":"/images/base"}"#);
+        assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), setup);
+        let harvest = Request::ImageHarvest {
+            bundle: "/images/clone".to_owned(),
+            out: "/images/out".to_owned(),
+        };
+        let text = serde_json::to_string(&harvest).unwrap();
+        assert_eq!(
+            text,
+            r#"{"verb":"image-harvest","bundle":"/images/clone","out":"/images/out"}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), harvest);
+        for hostile in [
+            r#"{"verb":"image-setup","bundle":"/images/b","program":"/bin/sh"}"#,
+            r#"{"verb":"image-setup","bundle":"/images/b","argv":["/bin/sh"]}"#,
+            r#"{"verb":"image-setup","bundle":"/images/b","guest-binary":"/tmp/g"}"#,
+            r#"{"verb":"image-harvest","bundle":"/images/b","out":"/images/o","args":[]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Request>(hostile).is_err(),
+                "{hostile}"
+            );
+        }
+        let text = serde_json::to_string(&Reply::Imaged {
+            report: "{}".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(text, r#"{"imaged":{"report":"{}"}}"#);
     }
 
     /// Catches a `run` that changes on the wire for the daemons that predate the

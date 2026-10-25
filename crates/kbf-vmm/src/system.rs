@@ -30,6 +30,10 @@ pub trait VmProcess {
     fn poll(&mut self, wait: Duration) -> Poll;
     /// SIGKILL: the helper gets no chance to stop its VM.
     fn kill9(&mut self);
+    /// Asks the guest to shut down (the helper keeps running until the guest has stopped,
+    /// then exits). Without a guest that obeys, [`request_stop`](Self::request_stop) is
+    /// still needed.
+    fn request_shutdown(&mut self);
     /// Closes the helper's stdin, which makes it force-stop its VM (the guest is not asked
     /// to shut down) and exit.
     fn request_stop(&mut self);
@@ -66,6 +70,12 @@ pub trait System {
     /// # Errors
     /// The call failed (`EXDEV` across volumes, `ENOTSUP` off APFS, `EEXIST`).
     fn clonefile(&self, src: &Path, dst: &Path) -> io::Result<()>;
+    /// Clears the user-immutable flag (`uchg`) on `path`, which a clone of a sealed base
+    /// keeps; a path without the flag is left alone. The caller owns `path`.
+    ///
+    /// # Errors
+    /// The file could not be examined or the flag could not be cleared.
+    fn clear_immutable(&self, path: &Path) -> io::Result<()>;
     /// The data representation of a new `VZMacMachineIdentifier`.
     ///
     /// # Errors
@@ -101,6 +111,17 @@ pub trait System {
     /// # Errors
     /// A step failed; the message names it.
     fn offline_write(&self, disk: &Path, files: &[OfflineFile]) -> Result<Value, String>;
+    /// Attaches the raw disk image `disk` read-only, copies the harvest allowlist out of
+    /// its Data volume into the new directory `out`, detaches, and returns the manifest.
+    ///
+    /// # Errors
+    /// A step failed; the message names it.
+    fn offline_harvest(&self, disk: &Path, out: &Path) -> Result<Value, String>;
+    /// The process table as text, one `pid cputime command` row per line (`ps`).
+    ///
+    /// # Errors
+    /// The table could not be read.
+    fn process_table(&self) -> Result<String, String>;
     /// Downloads `url` to `dest`.
     ///
     /// # Errors

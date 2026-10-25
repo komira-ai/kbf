@@ -14,7 +14,7 @@ use objc2_open_directory::{ODNode, ODRecord, ODSession, kODNodeTypeLocalNodes};
 use security_framework::random::SecRandom;
 
 use crate::autologin::{self, CommandOutput};
-use crate::helper::{self, Host, LiveProcess, NewUser};
+use crate::helper::{self, Account, Host, LiveProcess, NewUser};
 
 const USERS: &str = "dsRecTypeStandard:Users";
 const GROUPS: &str = "dsRecTypeStandard:Groups";
@@ -58,6 +58,33 @@ impl Host for MacHost {
             return Err(io::Error::from_raw_os_error(code));
         }
         Ok(!found.is_null())
+    }
+
+    fn account(&self, name: &str) -> io::Result<Option<Account>> {
+        let c_name = std::ffi::CString::new(name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the name holds NUL"))?;
+        // SAFETY: a zeroed passwd is a valid value for getpwnam_r to overwrite.
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut buffer = vec![0 as libc::c_char; 1 << 16];
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: every pointer is to a live, writable value of the right type, the name
+        // is NUL-terminated, and `buffer.len()` is the buffer's size.
+        let code = unsafe {
+            libc::getpwnam_r(
+                c_name.as_ptr(),
+                &raw mut entry,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &raw mut found,
+            )
+        };
+        if code != 0 {
+            return Err(io::Error::from_raw_os_error(code));
+        }
+        Ok((!found.is_null()).then_some(Account {
+            uid: entry.pw_uid,
+            gid: entry.pw_gid,
+        }))
     }
 
     fn make_home(&self, homes: &Path, name: &str, uid: u32, gid: u32) -> io::Result<()> {
@@ -236,6 +263,44 @@ impl Host for MacHost {
 
     fn pause(&self) {
         std::thread::sleep(Duration::from_millis(100));
+    }
+
+    fn clone_file(
+        &self,
+        src: std::os::fd::BorrowedFd<'_>,
+        dir: std::os::fd::BorrowedFd<'_>,
+        name: &str,
+    ) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        /// `CLONE_NOOWNCOPY` (`sys/clonefile.h`): the clone is owned by the caller, not the
+        /// source's owner.
+        const CLONE_NOOWNCOPY: u32 = 0x0002;
+        let c_name = std::ffi::CString::new(name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the name holds NUL"))?;
+        // SAFETY: both descriptors are open for the call and the name is NUL-terminated.
+        let code = unsafe {
+            libc::fclonefileat(
+                src.as_raw_fd(),
+                dir.as_raw_fd(),
+                c_name.as_ptr(),
+                CLONE_NOOWNCOPY,
+            )
+        };
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn clear_user_flags(&self, file: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: the descriptor is open for the call.
+        if unsafe { libc::fchflags(file.as_raw_fd(), 0) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 
     fn boot_session(&self) -> io::Result<String> {

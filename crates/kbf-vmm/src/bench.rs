@@ -28,10 +28,11 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::bundle::{self, Identity};
+use crate::gates::{Channels, attach_share};
 use crate::guest::{self, Share};
 use crate::probe::{Ctx, Step, Vm};
 use crate::report::{Report, summary_json};
-use crate::spec::{TaggedShare, VmSpec};
+use crate::spec::VmSpec;
 
 /// One run's measurements in milliseconds; `None` is a marker that never appeared.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -99,7 +100,7 @@ fn await_markers(ctx: &Ctx<'_>, vm: &mut Vm, share: &Share, t0: Instant) -> Mark
 
 /// Removes a run's directories.
 fn remove(ctx: &Ctx<'_>, name: &str) {
-    for suffix in ["", "-share", "-tagged"] {
+    for suffix in ["", "-share", "-tagged", "-results"] {
         let _ = std::fs::remove_dir_all(ctx.work.join(format!("{name}{suffix}")));
     }
 }
@@ -141,11 +142,8 @@ fn one_run(ctx: &Ctx<'_>, name: &str, cold: bool) -> Result<Run, String> {
     let clone = bundle::clone_bundle(ctx.sys, &ctx.base, &dest, Identity::Keep)
         .map_err(|e| e.to_string())?;
     let mut spec = VmSpec::minimal(dest);
-    spec.automount_dir = Some(share.dir.clone());
-    spec.tagged = Some(TaggedShare {
-        tag: guest::TAG.to_owned(),
-        path: share.tagged.clone(),
-    });
+    spec.graphics = ctx.graphics;
+    attach_share(&mut spec, &share, Channels::NONE);
     let t0 = Instant::now();
     let started = ctx.spawn_retrying(name, &spec)?;
     let mut vm = started.vm;

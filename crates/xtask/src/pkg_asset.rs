@@ -1,50 +1,15 @@
-//! `pkg-asset --package <deb> --platform <platform> --commit <sha> --binary-tarball <file>
-//! --expect-ref refs/heads/<branch> [--gh <program>] (--out <dir> | --verify-only)`: the
-//! `kbf-installer` deb as a release asset, `kbf-installer-<commit>-<platform>.deb`, and
-//! the checks that tie it to the bytes the attestation covers.
-//!
-//! The deb is opened (an `ar` archive of `control.tar.gz` and `data.tar.gz`, as nfpm
-//! writes it with gzip) and refused unless:
-//!
-//! - its control file says the architecture of `--platform` (`amd64` or `arm64`);
-//! - `usr/bin/kbf-installer` is byte for byte the binary inside `--binary-tarball`, the
-//!   tarball `build-commit check-asset` has already shown names the commit: the deb
-//!   carries the bytes the build identified, not others;
-//! - `usr/share/kbf-installer/trust/installer.conf` is exactly `SOURCE_REFS=` and
-//!   `--expect-ref` ([`crate::pkg_trust::conf`]): a deb built on `main` trusts `main`
-//!   and a deb built on a feature branch trusts that branch, never the reverse;
-//! - the trust directory holds `gh` (mode 0755, and byte for byte `--gh`, the pinned
-//!   program the job downloaded and checked, when given), `installer.conf` and a
-//!   `trusted_root.jsonl` that is JSON lines ([`crate::pkg_trust::root_problems`]),
-//!   with the modes of [`crate::pkg_linux::TRUST_FILES`];
-//! - it holds neither `usr/bin/kbf` nor a unit of the modes ([`crate::pkg_linux::KBF_UNITS`]):
-//!   the `kbf` package carries them ([`crate::pkg_kbf_asset`]).
-//!
-//! Then, without `--verify-only`, it copies the deb to `<out>/kbf-installer-<commit>-
-//! <platform>.deb` and appends its line to `<out>/SHA256SUMS.<platform>`
-//! ([`crate::sums`]), refusing a deb already listed. With `--verify-only` it makes the
-//! checks on `--package`, which must already be named as the asset (the file the attest
-//! job signed, downloaded again by the verify job) and writes nothing.
+//! What the verbs that make a deb an asset have in common ([`publish`]), and how a deb is read:
+//! its `ar` archive of `control.tar.gz` and `data.tar.gz`, as nfpm writes it with gzip
+//! ([`open`]), and the checks of the trust directory a package carries ([`trust_problems`]).
+//! The verb that uses them is [`crate::pkg_kbf_asset`]'s.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::fetch::Sha256;
 use crate::package::{Platform, open_sums, read, write_new, write_sums};
-use crate::pkg_linux::{self, KBF_PATH, KBF_UNITS, TRUST_DIR, TRUST_FILES, UNIT_DIR};
+use crate::pkg_linux::{self, TRUST_DIR, TRUST_FILES};
 use crate::{Error, build_commit, pkg_trust, sums};
-
-/// The binary's path in the deb, and in the data tarball (no leading slash).
-const BINARY: &str = "usr/bin/kbf-installer";
-
-/// The paths of the files of the `kbf` package, as a data tarball names them (no leading
-/// slash): the `kbf` binary and the units of the modes.
-pub(crate) fn kbf_package_paths() -> Vec<String> {
-    std::iter::once(KBF_PATH.to_owned())
-        .chain(KBF_UNITS.iter().map(|unit| format!("{UNIT_DIR}/{unit}")))
-        .map(|path| path.trim_start_matches('/').to_owned())
-        .collect()
-}
 
 /// The package file `package` names: the file itself, or, for a directory, the one file
 /// in it whose name ends `.<ext>` (what nfpm left in `pkg-build --out`, under a name made
@@ -73,38 +38,36 @@ pub fn sole(package: &Path, ext: &str) -> Result<PathBuf, Error> {
 }
 
 /// The package version of `binary`: the `<version>+<12 of the commit>` its `--version`
-/// prints after its name (`kbf-installer 0.1.0+0123456789ab`), the version `pkg-config`
-/// gives the package so that the package, the binary and the commit name each other.
+/// prints after its name (`kbf 0.1.0+0123456789ab`), the version `pkg-config` gives the
+/// package so that the package, the binary and the commit name each other.
 ///
 /// # Errors
 /// The binary does not run, or prints anything else.
 pub fn binary_version(binary: &Path) -> Result<String, Error> {
+    let name = binary
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let out = pkg_linux::spawn(std::process::Command::new(binary).arg("--version"))?;
-    version_of(out.ok, &out.stdout).ok_or_else(|| {
+    version_of(out.ok, &out.stdout, &name).ok_or_else(|| {
         Error::Failed(format!(
-            "{} --version printed {:?}, not `{} <version>+<commit>`",
+            "{} --version printed {:?}, not `{name} <version>+<commit>`",
             binary.display(),
             out.stdout.trim(),
-            pkg_linux::NAME
         ))
     })
 }
 
-/// The version in the `--version` output `stdout` of a program that exited with success
-/// `ok`: the second word of exactly `kbf-installer <version>+<commit>`.
-fn version_of(ok: bool, stdout: &str) -> Option<String> {
+/// The version in the `--version` output `stdout` of the program `name` that exited with
+/// success `ok`: the second word of exactly `<name> <version>+<commit>`.
+fn version_of(ok: bool, stdout: &str, name: &str) -> Option<String> {
     let words: Vec<&str> = stdout.split_whitespace().collect();
     match (ok, words.as_slice()) {
-        (true, [name, version]) if *name == pkg_linux::NAME && version.contains('+') => {
+        (true, [program, version]) if *program == name && version.contains('+') => {
             Some((*version).to_owned())
         }
         _ => None,
     }
-}
-
-/// The file name of the asset.
-pub fn file_name(commit: &str, platform: Platform) -> String {
-    format!("{}-{commit}-{}.deb", pkg_linux::NAME, platform.name())
 }
 
 /// The `Architecture` a deb for `platform` carries.
@@ -301,47 +264,29 @@ pub(crate) fn binary_problems(
     Ok(problems)
 }
 
-/// The inputs of the checks.
-pub struct Check<'a> {
-    pub platform: Platform,
-    /// The `kbf-installer-<commit>-<platform>.tar.gz` the deb's binary must equal.
-    pub binary_tarball: &'a Path,
-    /// The branch the deb must trust: `refs/heads/<branch>`.
-    pub expect_ref: &'a str,
-    /// The pinned `gh` the deb's must equal, when the job has it.
-    pub gh: Option<&'a Path>,
-}
-
-/// What is wrong with `deb` (the bytes of the package) as the `kbf-installer` package
-/// for `c`: one line per problem, none when it meets every check above.
+/// What is wrong with the trust directory of the deb `opened`, which must be `dir` (no leading
+/// slash): `gh` (mode 0755, and byte for byte `gh`, the pinned program the job downloaded and
+/// checked, when given), `installer.conf` exactly `SOURCE_REFS=` and `expect_ref`
+/// ([`crate::pkg_trust::conf`]), and a `trusted_root.jsonl` that is JSON lines
+/// ([`crate::pkg_trust::root_problems`]), each with the mode of [`TRUST_FILES`].
 ///
 /// # Errors
-/// A file `c` names cannot be read.
-pub fn problems(deb: &[u8], c: &Check) -> Result<Vec<String>, Error> {
+/// The pinned `gh` cannot be read.
+pub(crate) fn trust_problems(
+    opened: &Opened,
+    expect_ref: &str,
+    gh: Option<&Path>,
+) -> Result<Vec<String>, Error> {
     let mut problems = Vec::new();
-    if !pkg_trust::ref_ok(c.expect_ref) {
+    if !pkg_trust::ref_ok(expect_ref) {
         problems.push(format!(
-            "--expect-ref {:?} is not refs/heads/<branch>",
-            c.expect_ref
+            "--expect-ref {expect_ref:?} is not refs/heads/<branch>"
         ));
-    }
-    let Some(deb) = open(deb, c.platform, &mut problems) else {
-        return Ok(problems);
-    };
-    let file = |path: &str| deb.file(path);
-    // The binary the attestation covers is the one in the package.
-    let binary = binary_problems(file(BINARY), BINARY, pkg_linux::NAME, c.binary_tarball)?;
-    problems.extend(binary);
-    // The runtime and the units of its modes are the `kbf` package's.
-    for path in kbf_package_paths() {
-        if file(&path).is_some() {
-            problems.push(format!("holds {path}, which only the kbf package ships"));
-        }
     }
     let dir = TRUST_DIR.trim_start_matches('/');
     for (name, mode) in TRUST_FILES {
         let path = format!("{dir}/{name}");
-        let Some(m) = file(&path) else {
+        let Some(m) = opened.file(&path) else {
             problems.push(format!("holds no {path}"));
             continue;
         };
@@ -352,10 +297,9 @@ pub fn problems(deb: &[u8], c: &Check) -> Result<Vec<String>, Error> {
             "installer.conf" => {
                 let text = String::from_utf8_lossy(&m.bytes);
                 match pkg_trust::conf_ref(&text) {
-                    Some(r) if r == c.expect_ref => {}
+                    Some(r) if r == expect_ref => {}
                     Some(r) => problems.push(format!(
-                        "{path} trusts {r}, but this package is attested for {}",
-                        c.expect_ref
+                        "{path} trusts {r}, but this package is attested for {expect_ref}"
                     )),
                     None => problems.push(format!(
                         "{path} is not exactly `SOURCE_REFS=refs/heads/<branch>` and a newline: {text:?}"
@@ -373,7 +317,7 @@ pub fn problems(deb: &[u8], c: &Check) -> Result<Vec<String>, Error> {
                 if m.bytes.is_empty() {
                     problems.push(format!("{path} is empty"));
                 }
-                if let Some(gh) = c.gh
+                if let Some(gh) = gh
                     && m.bytes != read(gh)?
                 {
                     problems.push(format!(
@@ -393,22 +337,6 @@ pub enum Mode<'a> {
     Add(&'a Path),
     /// Check `--package`, which must be the asset already.
     VerifyOnly,
-}
-
-/// The `pkg-asset` verb: the lines to print.
-///
-/// # Errors
-/// The commit is not one, the deb is refused, or a file cannot be read or written.
-pub fn asset(deb: &Path, commit: &str, mode: &Mode, c: &Check) -> Result<Vec<String>, Error> {
-    let said = format!(
-        "a {} package of the binary in {}, trusting {}",
-        c.platform.name(),
-        c.binary_tarball.display(),
-        c.expect_ref
-    );
-    let name = file_name(commit, c.platform);
-    let found = |bytes: &[u8]| problems(bytes, c);
-    publish(deb, (commit, c.platform), &name, mode, found, &said)
 }
 
 /// What the verbs that make a deb an asset have in common: the commit and the platform are

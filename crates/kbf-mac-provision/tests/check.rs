@@ -53,8 +53,8 @@ fn a_fresh_mac_fails_every_item_apply_sets() {
         "{}",
         r.text
     );
-    assert!(r.text.ends_with("check: 10 pass, 21 fail\n"), "{}", r.text);
-    assert_eq!(r.text.lines().count(), 32);
+    assert!(r.text.ends_with("check: 12 pass, 21 fail\n"), "{}", r.text);
+    assert_eq!(r.text.lines().count(), 34);
     assert_eq!(mac.writes(), Vec::<String>::new());
 }
 
@@ -66,7 +66,7 @@ fn a_converged_mac_passes_every_item() {
     let mac = FakeMac::converged("converged");
     let r = check(&mac);
     assert_eq!(r.failed, 0, "{}", r.text);
-    assert!(r.text.ends_with("check: 31 pass, 0 fail\n"), "{}", r.text);
+    assert!(r.text.ends_with("check: 33 pass, 0 fail\n"), "{}", r.text);
     for want in [
         "PASS updates_auto_download: AutomaticDownload = 0 (the SoftwareUpdate payload is removed in macOS 27",
         "PASS filevault: off",

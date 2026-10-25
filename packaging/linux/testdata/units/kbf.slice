@@ -1,0 +1,7 @@
+# Static slice: the parent cgroup of every kbf unit (the units say Slice=kbf.slice).
+# MemoryMin= is per host (the sum of the units' reservations): kbf-installer writes it into
+# kbf.slice.d/memory.conf from kbf.toml; none is set here.
+[Unit]
+Description=kbf build farm
+
+[Slice]

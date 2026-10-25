@@ -63,6 +63,57 @@ fn failed<T>(why: impl Into<String>) -> Result<T, FetchError> {
     Err(FetchError::Failed(why.into()))
 }
 
+/// What a fetch takes from a release: the file of the platform and the attestation bundle
+/// that names it, and for a package or an image also the release's `SHA256SUMS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetKind {
+    /// `kbf-<commit>-<platform>.tar.gz`.
+    Tarball,
+    /// `kbf-<commit>-<platform>.deb`.
+    Deb,
+    /// `kbf-<commit>-<platform>.rpm`.
+    Rpm,
+    /// `kbf-frontend-image-<commit>-<platform>.oci.tar`, the frontend as a container image.
+    FrontendImage,
+}
+
+impl AssetKind {
+    /// The extension of the file's name. The image's name also has `frontend-image-` before
+    /// the commit, so take its name from [`Self::name_on`].
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Tarball => release::TARBALL_EXTENSION,
+            Self::Deb => "deb",
+            Self::Rpm => "rpm",
+            Self::FrontendImage => "oci.tar",
+        }
+    }
+
+    /// The name of the file of `commit` for `platform`.
+    pub fn name_on(self, platform: &str, commit: &str) -> String {
+        match self {
+            Self::FrontendImage => format!("kbf-frontend-image-{commit}-{platform}.oci.tar"),
+            _ => release::asset_name_on(platform, self.extension(), commit),
+        }
+    }
+
+    /// The commit in the file name `name` of this kind for `platform`.
+    pub fn commit_of_name_on<'a>(self, platform: &str, name: &'a str) -> Option<&'a str> {
+        match self {
+            Self::FrontendImage => name
+                .strip_prefix("kbf-frontend-image-")
+                .and_then(|rest| rest.strip_suffix(&format!("-{platform}.oci.tar")))
+                .filter(|commit| release::is_commit(commit)),
+            _ => release::commit_of_asset_on(platform, self.extension(), name),
+        }
+    }
+
+    /// Whether the release's checksum file is taken beside it.
+    fn with_sums(self) -> bool {
+        self != Self::Tarball
+    }
+}
+
 /// What a fetch may take.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -80,6 +131,8 @@ pub struct Limits {
 pub struct Fetcher<'a> {
     /// The platform of the release files to take: `darwin-arm64`, `linux-x86_64`, ...
     pub platform: &'a str,
+    /// Which of the platform's files to take.
+    pub asset: AssetKind,
     pub runner: &'a dyn Runner,
     pub curl: &'a Path,
     pub gh: &'a Path,
@@ -113,6 +166,7 @@ struct Found {
     tag: String,
     tarball_size: u64,
     bundle_size: Option<u64>,
+    sums_size: Option<u64>,
 }
 
 /// A tag as `gh release download` takes one as an argument: letters, digits and `. _ + -`,
@@ -191,16 +245,18 @@ impl Fetcher<'_> {
         }
     }
 
-    /// `gh release download` of the tarball and the bundle of `commit` from the release
-    /// `tag`, into `scratch`.
+    /// `gh release download` of the file and the bundle of `commit` (and, for a package, the
+    /// release's `SHA256SUMS`) from the release `tag`, into `scratch`.
     pub fn download_cmd(&self, tag: &str, commit: &str, scratch: &Path) -> Cmd {
         let mut args: Vec<String> = ["release", "download", tag, "--repo", REPO]
             .map(str::to_owned)
             .to_vec();
-        for name in [
-            release::tarball_name_on(self.platform, commit),
-            release::bundle_name_on(self.platform, commit),
-        ] {
+        let file = self.asset.name_on(self.platform, commit);
+        let mut names = vec![file.clone(), release::bundle_of(&file)];
+        if self.asset.with_sums() {
+            names.push(release::SUMS_NAME.to_owned());
+        }
+        for name in names {
             args.push("--pattern".to_owned());
             args.push(name);
         }
@@ -217,7 +273,12 @@ impl Fetcher<'_> {
                 max: self
                     .limits
                     .tarball_max
-                    .saturating_add(self.limits.bundle_max),
+                    .saturating_add(self.limits.bundle_max)
+                    .saturating_add(if self.asset.with_sums() {
+                        self.limits.bundle_max
+                    } else {
+                        0
+                    }),
             }),
             ..Cmd::default()
         }
@@ -233,7 +294,7 @@ impl Fetcher<'_> {
         let mut complete = false;
         for page in 1..=MAX_PAGES {
             let releases = self.list_page(page)?;
-            note(&mut found, &releases, self.platform, prefix);
+            note(&mut found, &releases, (self.platform, self.asset), prefix);
             // Only an empty page ends the listing: a short one is not taken for the end.
             if releases.is_empty() {
                 complete = true;
@@ -250,9 +311,20 @@ impl Fetcher<'_> {
             (Some(_), Some(_)) => return Err(FetchError::Ambiguous),
         };
         let Some(bundle_size) = found.bundle_size else {
-            return failed("the release lists no attestation bundle for the tarball");
+            return failed("the release lists no attestation bundle for the file");
         };
-        if found.tarball_size > self.limits.tarball_max || bundle_size > self.limits.bundle_max {
+        let sums_size = if self.asset.with_sums() {
+            let Some(size) = found.sums_size else {
+                return failed("the release lists no SHA256SUMS");
+            };
+            size
+        } else {
+            0
+        };
+        if found.tarball_size > self.limits.tarball_max
+            || bundle_size > self.limits.bundle_max
+            || sums_size > self.limits.bundle_max
+        {
             return failed("a release file is larger than the limit");
         }
         let download = self.download_cmd(&found.tag, &commit, scratch);
@@ -395,26 +467,35 @@ fn retry_after(response: &Response<'_>) -> String {
     }
 }
 
-/// Note the tarballs of the commits that start with `prefix` in `releases`. The first
+/// Note the files of the commits that start with `prefix` in `releases`. The first
 /// listing of a commit (the newest release) is the one kept.
-fn note(found: &mut BTreeMap<String, Found>, releases: &[Release], platform: &str, prefix: &str) {
+fn note(
+    found: &mut BTreeMap<String, Found>,
+    releases: &[Release],
+    (platform, asset_kind): (&str, AssetKind),
+    prefix: &str,
+) {
     for release in releases.iter().filter(|r| !r.draft && tag_ok(&r.tag_name)) {
         for asset in &release.assets {
-            let Some(commit) = release::commit_of_name_on(platform, &asset.name) else {
+            let Some(commit) = asset_kind.commit_of_name_on(platform, &asset.name) else {
                 continue;
             };
             if !commit.starts_with(prefix) {
                 continue;
             }
-            let bundle = release::bundle_name_on(platform, commit);
+            let bundle = release::bundle_of(&asset.name);
+            let size_of = |name: &str| {
+                release
+                    .assets
+                    .iter()
+                    .find(|a| a.name == name)
+                    .map(|a| a.size)
+            };
             found.entry(commit.to_owned()).or_insert_with(|| Found {
                 tag: release.tag_name.clone(),
                 tarball_size: asset.size,
-                bundle_size: release
-                    .assets
-                    .iter()
-                    .find(|a| a.name == bundle)
-                    .map(|a| a.size),
+                bundle_size: size_of(&bundle),
+                sums_size: size_of(release::SUMS_NAME),
             });
         }
     }

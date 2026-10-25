@@ -36,14 +36,14 @@ pub fn keeps_state_in_database(name: &str) -> bool {
 pub enum Entry {
     /// The worker daemon: `kbf_node::run`, the flags of `kbf-daemon`.
     Daemon,
-    /// The server and the daemon in one process: `kbf_all_in_one::run`, the flags of
+    /// The server and the daemon in one process: `kbf_storage_and_daemon::run`, the flags of
     /// `kbf-server` and of `kbf-daemon`.
     AllInOne,
     /// The storage node: `kbf_server::storage_node::run`, `kbf-server`'s store, write and
     /// log flags and its own listener flags.
     Storage,
     /// The storage node and the daemon in one process:
-    /// `kbf_all_in_one::storage_and_daemon::run`, the flags of `kbf storage` and of
+    /// `kbf_storage_and_daemon::storage_and_daemon::run`, the flags of `kbf storage` and of
     /// `kbf-daemon`.
     StorageAndDaemon,
     /// The frontend: `kbf_server::frontend::run`, `kbf-server`'s listener, scheduler and

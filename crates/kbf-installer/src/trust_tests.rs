@@ -51,7 +51,7 @@ fn a_path_or_directory_others_could_replace_is_refused_naming_it() {
     let path = [
         (crate::fixtures::GH_PATH, true),
         (crate::fixtures::TRUST_DIR, false),
-        ("/usr/share/kbf-installer", false),
+        ("/usr/share/kbf", false),
         ("/usr/share", false),
         ("/usr", false),
     ];

@@ -428,7 +428,7 @@ async fn the_fake_refuses_what_s3_refuses() {
         let answer = complete("upload-1", body).await.unwrap();
         assert!(refused(answer).await.contains(code), "{code}");
     }
-    let other = client.head(url("")).send().await.unwrap();
+    let other = client.patch(url("")).send().await.unwrap();
     assert_eq!(other.status(), 501);
     assert_eq!((s3.stats().completed, s3.incomplete_uploads()), (0, 1));
 }

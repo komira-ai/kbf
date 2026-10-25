@@ -217,6 +217,8 @@ impl Runner for Sim {
                     let path = dir.join(&asset);
                     let kind = if asset.ends_with(".json") {
                         "bundle"
+                    } else if asset == "SHA256SUMS" {
+                        "sums"
                     } else {
                         "tarball"
                     };
@@ -338,11 +340,13 @@ impl Rig {
                 tool: Duration::from_secs(5),
                 download: Duration::from_secs(5),
                 tarball_max: 64 * 1024,
+                image_max: 64 * 1024,
             },
             owner: Owner {
                 uid: who.uid,
                 gid: who.gid,
             },
+            scratch_tag: None,
         };
         let rig = Self {
             dir,
@@ -439,7 +443,7 @@ fn refused(code: Code) -> impl Fn(&Fault) -> bool {
 }
 
 /// The release is fetched as the unprivileged user, checked by `gh attestation verify` offline
-/// for the full commit and the farm's workflow on hosted runners and the channel's branch, run
+/// for the full commit and the release workflow on hosted runners and the channel's branch, run
 /// once as that user and installed as `releases/<commit>`; no link moves, nothing restarts, and
 /// the scratch is gone.
 #[test]
@@ -1216,3 +1220,6 @@ fn the_production_host_is_the_installers_layout_and_the_programs_of_a_stage() {
     use kbf_installer::helper::leases::LeaseSource;
     assert_eq!(super::linux::NoLeases.live(), Ok(0));
 }
+
+#[path = "linux_image_tests.rs"]
+mod image;

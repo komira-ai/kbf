@@ -6,12 +6,28 @@
 //!   `/etc/kcpassword` for it, sets `autoLoginUser` to the user, and only then asks for
 //!   a userspace restart. Refused while the record names another lease.
 //! - `session-idle` clears `autoLoginUser` and `/etc/kcpassword`, removes the intent
-//!   record, and asks for the same restart: the Mac rests at the login window.
+//!   record, and asks for the same restart: the Mac rests at the login window. With a
+//!   VM user configured (`--vm-user`) it rests there instead: it needs the VM user's
+//!   account and FileVault off, reads the VM user's password from the file
+//!   `kbf-mac-provision` wrote (it never makes or resets one, which would strand the
+//!   account's login keychain; a missing or invalid file fails, naming the path),
+//!   writes `/etc/kcpassword` for it if that differs, sets `autoLoginUser` to it, then
+//!   the intent record `vm`, and last asks for the restart. It switches a lease's
+//!   session away too, as `session-idle` always has.
+//! - `session-login <lease>` switches away from the VM user's session, the one session
+//!   a lease may replace. That no VM runs then is the daemon's rule (it drains first).
 //! - `boot-reset [held]` runs once per start of the helper, and every other verb is
 //!   refused until it has succeeded: the daemon calls it before its `Hello`, naming the
 //!   leases the server still holds for the node. The lease the intent record names is
-//!   kept, with its auto-login, only if it is among them and its user is live; otherwise
-//!   auto-login and `/etc/kcpassword` are cleared and the record removed. Then every
+//!   kept, with its auto-login, only if it is among them and its user is live. With a
+//!   VM user configured and an account the helper acts on, the Mac's rest is kept too:
+//!   when the record is `vm`, or when there is no record and `autoLoginUser` already
+//!   names the VM user (provisioning set it; the record is written then). Otherwise
+//!   auto-login and `/etc/kcpassword` are cleared and the record removed: a stale
+//!   lease session never survives, and the Mac then sits at the login window until
+//!   `session-idle` rests it at the VM user. The VM user is never deleted or killed
+//!   here: the leases whose users are deleted are those the ledger holds, and a lease
+//!   user's name cannot be the VM user's ([`crate::lease::VmUser`]). Then every
 //!   other live lease user is killed and deleted (with the sweep of `user-delete`): a Mac
 //!   that lost power mid-lease never stays logged in as a dead lease user. A reset that
 //!   fails part-way can be repeated.
@@ -25,7 +41,10 @@ use std::sync::atomic::Ordering;
 use kbf_types::LeaseId;
 
 use super::Helper;
-use crate::autologin::{self, read_intent, remove, write_intent, write_kcpassword};
+use super::role::{Gui, Role};
+use crate::autologin::{
+    self, Intent, ensure_kcpassword, read_intent, remove, write_intent, write_kcpassword,
+};
 use crate::lease::{parse_lease, user_name};
 use crate::ledger::Ledger;
 
@@ -57,7 +76,7 @@ impl Helper {
         let ledger = self.lock();
         self.live_uid(&ledger, lease)?;
         match read_intent(&paths.intent)? {
-            Some(other) if other != lease => {
+            Some(Intent::Lease(other)) if other != lease => {
                 return Err(format!(
                     "the session belongs to lease {other}; session-idle first"
                 ));
@@ -65,7 +84,7 @@ impl Helper {
             _ => {}
         }
         autologin::require_filevault_off(self.host.as_ref())?;
-        write_intent(&paths.intent, lease)
+        write_intent(&paths.intent, Intent::Lease(lease))
             .map_err(|why| format!("writing {}: {why}", paths.intent.display()))?;
         let name = user_name(lease);
         let password = self
@@ -80,16 +99,96 @@ impl Helper {
         autologin::restart_userspace(self.host.as_ref())
     }
 
-    /// `session-idle`: clears auto-login, then a userspace restart.
+    /// `session-idle`: rests the Mac, then a userspace restart: at the VM user when one
+    /// is configured, else at the login window (auto-login cleared). A Mac already
+    /// resting at a VM user whose GUI session is up is left alone: no restart, so
+    /// running VMs survive a repeat.
     ///
     /// # Errors
-    /// Auto-login could not be cleared, the record removed, or the restart asked for.
+    /// Auto-login could not be cleared (or set to the VM user, whose account must be
+    /// one the helper acts on, with FileVault off), the record changed, or the restart
+    /// asked for. A failure while setting the VM user leaves the previous record, so a
+    /// lease's user stays guarded until the switch is made; a repeat or the boot reset
+    /// finishes or clears what was set.
     pub fn session_idle(&self) -> Result<(), String> {
         let ledger = self.lock();
-        self.clear_session()?;
-        drop(ledger);
-        tracing::info!("auto-login cleared; restarting userspace");
+        if self.settings.vm_user.is_some() {
+            let Some(name) = self.rest_at_vm()? else {
+                tracing::info!("already resting at the VM user; nothing to restart");
+                return Ok(());
+            };
+            drop(ledger);
+            tracing::info!("auto-login set to {name}; restarting userspace");
+        } else {
+            self.clear_session()?;
+            drop(ledger);
+            tracing::info!("auto-login cleared; restarting userspace");
+        }
         autologin::restart_userspace(self.host.as_ref())
+    }
+
+    /// Makes the VM user the one the login window logs in: the password,
+    /// `/etc/kcpassword` and `autoLoginUser`, then the record last, so a failure before
+    /// it leaves the old record guarding its lease user. Returns the VM user's name,
+    /// or `None` when the Mac already rests there with its GUI session up.
+    fn rest_at_vm(&self) -> Result<Option<String>, String> {
+        let role = self.vm_role()?;
+        let paths = &self.settings.session;
+        autologin::require_filevault_off(self.host.as_ref())?;
+        if self.resting_at_vm_with_gui(&role)? {
+            return Ok(None);
+        }
+        // The VM user's password is set once, by `kbf-mac-provision`, and never changed
+        // here: a reset would strand its login keychain.
+        let password = autologin::read_vm_password(paths)?;
+        ensure_kcpassword(&paths.kcpassword, password.as_bytes())
+            .map_err(|why| format!("writing {}: {why}", paths.kcpassword.display()))?;
+        autologin::set_auto_login(self.host.as_ref(), paths, role.name)?;
+        write_intent(&paths.intent, Intent::Vm)
+            .map_err(|why| format!("writing {}: {why}", paths.intent.display()))?;
+        Ok(Some(role.name.to_owned()))
+    }
+
+    /// Whether the record is `vm`, `autoLoginUser` is the VM user and `gui/<uid>` exists.
+    fn resting_at_vm_with_gui(&self, role: &Role<'_>) -> Result<bool, String> {
+        let paths = &self.settings.session;
+        if read_intent(&paths.intent)? != Some(Intent::Vm) {
+            return Ok(false);
+        }
+        let named = autologin::read_auto_login(self.host.as_ref(), paths)?;
+        Ok(named.as_deref() == Some(role.name) && self.vm_gui(role)? == Gui::Up)
+    }
+
+    /// Whether `autoLoginUser` is the VM user; anything unreadable is "no".
+    fn auto_login_is_vm(&self, role: &Role<'_>) -> bool {
+        match autologin::read_auto_login(self.host.as_ref(), &self.settings.session) {
+            Ok(named) => named.as_deref() == Some(role.name),
+            Err(why) => {
+                tracing::warn!("auto-login is unreadable, so not the VM user's: {why}");
+                false
+            }
+        }
+    }
+
+    /// Whether the boot reset keeps the Mac resting at the VM user: one is configured
+    /// with an account the helper acts on, `autoLoginUser` is it, and the record names
+    /// it or there is no record (the record is written then). A `vm` record over any
+    /// other auto-login is a half-made switch and is cleared.
+    fn keeps_vm_rest(&self, intent: Option<Intent>) -> bool {
+        let Ok(role) = self.vm_role() else {
+            return false;
+        };
+        match intent {
+            Some(Intent::Vm) => self.auto_login_is_vm(&role),
+            Some(Intent::Lease(_)) => false,
+            None => {
+                let paths = &self.settings.session;
+                self.auto_login_is_vm(&role)
+                    && write_intent(&paths.intent, Intent::Vm)
+                        .map_err(|why| tracing::warn!("writing {}: {why}", paths.intent.display()))
+                        .is_ok()
+            }
+        }
     }
 
     /// Clears auto-login and `/etc/kcpassword`, then removes the intent record.
@@ -122,9 +221,15 @@ impl Helper {
                 None
             }
         };
-        let kept =
-            intent.filter(|lease| held.contains(lease) && self.live_uid(&ledger, *lease).is_ok());
-        if kept.is_none() {
+        let kept = match intent {
+            Some(Intent::Lease(lease))
+                if held.contains(&lease) && self.live_uid(&ledger, lease).is_ok() =>
+            {
+                Some(lease)
+            }
+            _ => None,
+        };
+        if kept.is_none() && !self.keeps_vm_rest(intent) {
             self.clear_session()?;
         }
         let mut deleted = Vec::new();

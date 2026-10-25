@@ -55,8 +55,10 @@
 //!   `cargo build -p kbf-cli` holds `kbf-setup` and no `kbf-proxy`;
 //! - the hot/cold object store library (`tierstore`) depending, directly or through another
 //!   crate, on any other crate of this workspace, which would stop it from moving to a
-//!   repository of its own; and a walk that cannot see its dependencies, which would make
-//!   that check pass vacuously.
+//!   repository of its own (its `s3` feature, off unless a crate turns it on, adds the S3
+//!   client of `kbf-objstore`; a crate that turns it on is a change to make here on
+//!   purpose); and a walk that cannot see its dependencies, which would make that check pass
+//!   vacuously.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -281,7 +283,7 @@ fn pure_modules_deny_the_clippy_lists() {
 
 /// The crates allowed to depend on both the server and the node library: the combined
 /// binary and the one `kbf` binary.
-const JOINERS: &[&str] = &["kbf-all-in-one", "kbf-cli"];
+const JOINERS: &[&str] = &["kbf-storage-and-daemon", "kbf-cli"];
 
 /// What the server library's normal dependencies must not reach: the daemon side. The
 /// server stores and schedules; it never moves blobs as a client.
@@ -533,6 +535,8 @@ fn route_reaches_neither_the_frontend_nor_the_daemon() {
 /// Asserts that the normal dependencies of the object store library (`tierstore`), direct
 /// and through other crates, include no other crate of this workspace, and that the walk
 /// sees its dependencies (it reaches `tokio`), so the check does not pass on an empty walk.
+/// The graph has the features of the whole workspace: `tierstore`'s `s3` feature, which adds
+/// `kbf-objstore`, is off in it, and a crate that turned it on would fail this test.
 #[test]
 fn tierstore_reaches_no_other_workspace_crate() {
     let g = load_graph();
@@ -563,7 +567,7 @@ fn tierstore_reaches_no_other_workspace_crate() {
 /// (docs/design/kbf-proxy-api.md, sections 1 and 11). The proxy routes bytes: it never
 /// decodes a child's protocol (`kbf-proto`), runs none of the frontend, storage or node code
 /// (`kbf-server`, `kbf-front`, `kbf-storage`, `kbf-node`, `kbf-daemon`, the binaries
-/// `kbf-cli` and `kbf-all-in-one`), and does not know the installer, its host plan or its
+/// `kbf-cli` and `kbf-storage-and-daemon`), and does not know the installer, its host plan or its
 /// update types (`kbf-installer`, `kbf-setup`, `kbf-host`, `kbf-update`, `kbf-deploy`): the
 /// admin calls to a child are the installer's, through a trait that lives there (the proxy
 /// makes none), and the installer and the setup library depend on the proxy, not the other way
@@ -580,7 +584,7 @@ const PROXY_MUST_NOT_REACH: &[&str] = &[
     "kbf-node",
     "kbf-daemon",
     "kbf-cli",
-    "kbf-all-in-one",
+    "kbf-storage-and-daemon",
     "kbf-proto",
 ];
 

@@ -366,6 +366,7 @@ pub(crate) fn worker_peers(
                 .layer(WorkerRolesLayer::new(Admission::Certified)),
             Peers::Certified {
                 deny_list: tls.deny_list,
+                denied_rows: None,
             },
             Some(tls.server),
         ),
@@ -375,6 +376,7 @@ pub(crate) fn worker_peers(
                 .layer(WorkerRolesLayer::new(Admission::Certified)),
             Peers::Certified {
                 deny_list: behind.deny_list.clone(),
+                denied_rows: None,
             },
             None,
         ),
@@ -440,10 +442,21 @@ pub(crate) fn members_of(
 ) -> Option<Arc<Members>> {
     let state = state?;
     let members = Members::new(Arc::clone(&state.store), state.members);
-    Some(Arc::new(match handoff {
+    let members = Arc::new(match handoff {
         Some(handoff) => members.with_handoff(handoff),
         None => members,
-    }))
+    });
+    // One refresh before any listener serves, so the worker listener has the deny rows from
+    // its first call and a restart does not bounce every daemon until the sweeper's first
+    // beat. A failure is loud and the start goes on: the sweeper tries again every beat.
+    if let Err(error) = members.refresh() {
+        tracing::error!(
+            %error,
+            "the first membership refresh failed: the worker listener refuses every call \
+             until a refresh reads the deny rows"
+        );
+    }
+    Some(members)
 }
 
 /// The storage map daemons are sent: `explicit` if a caller gave one, else the members'
@@ -504,7 +517,7 @@ pub(crate) fn cold_store(
 
 fn admitted(peers: &Peers) -> (Admission, Option<DenyList>) {
     match peers {
-        Peers::Certified { deny_list } => (Admission::Certified, deny_list.clone()),
+        Peers::Certified { deny_list, .. } => (Admission::Certified, deny_list.clone()),
         Peers::Unauthenticated => (Admission::Open, None),
     }
 }
@@ -796,6 +809,8 @@ where
         listeners.worker_tls,
         proxy.as_ref(),
     );
+    // The rows a revocation writes, beside the file: a revoked daemon is refused here.
+    let peers = peers.with_denied_rows(members.clone());
     let tls_sources: Vec<TlsSource> = listeners
         .reapi_tls
         .iter()

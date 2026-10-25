@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::backend::Backend;
 use super::core::Ab;
-use super::serve::{self, ServeConfig, Serving};
+use super::serve::{self, Layout, ServeConfig, Serving};
 use crate::mac::layout::MacHost;
 use crate::runner::{Runner, SystemRunner};
 use crate::trust::Trust;
@@ -100,7 +100,7 @@ pub(super) fn serve_with<B: Backend>(
 ) -> Result<(), String> {
     let ab = Ab::new(
         backend,
-        place.state_dir.join("state.json"),
+        place.state_dir.join(place.state_name),
         place.trust.clone(),
         config.window_secs,
         Box::new(unix_now),
@@ -121,6 +121,7 @@ pub(super) fn serve_with<B: Backend>(
 /// Where the state and the audit log are, who is trusted to own them, and who may connect.
 pub(super) struct Place<'a> {
     pub(super) state_dir: &'a Path,
+    pub(super) state_name: &'a str,
     pub(super) trust: &'a Trust,
     pub(super) ids: (u32, u32),
     pub(super) audit: &'a Path,
@@ -132,6 +133,8 @@ pub(super) struct Place<'a> {
 pub(super) struct LinuxEnv {
     pub(super) passwd: PathBuf,
     pub(super) state_dir: PathBuf,
+    /// The file of the A/B state, in `state_dir`.
+    pub(super) state_name: String,
     pub(super) audit: PathBuf,
 }
 
@@ -141,6 +144,7 @@ impl LinuxEnv {
         Self {
             passwd: PathBuf::from("/etc/passwd"),
             state_dir: PathBuf::from(LINUX_STATE_DIR),
+            state_name: "state.json".to_owned(),
             audit: PathBuf::from(AUDIT),
         }
     }
@@ -156,8 +160,10 @@ pub(super) fn serve_linux_with<B: Backend>(
     backend: B,
     stop: &AtomicBool,
 ) -> Result<(), String> {
-    if config.units.is_empty() {
-        return Err("--restart-unit is required on a Linux host".to_owned());
+    if config.units.is_empty() && !config.frontend_container {
+        return Err(
+            "--restart-unit is required on a Linux host (or --frontend-container)".to_owned(),
+        );
     }
     let passwd = trust
         .read(&env.passwd)
@@ -168,6 +174,7 @@ pub(super) fn serve_linux_with<B: Backend>(
     private_dir(trust, &env.state_dir)?;
     let place = Place {
         state_dir: &env.state_dir,
+        state_name: &env.state_name,
         trust,
         ids,
         audit: &env.audit,
@@ -181,13 +188,54 @@ pub(super) fn serve_linux(config: &ServeConfig) -> Result<(), String> {
     serve_linux_for(config)
 }
 
+/// The container a helper is started for, when its configuration is not the default file
+/// (`None` for the default, whose files keep their names).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn bound_container(
+    trust: &Trust,
+    config: &ServeConfig,
+) -> Result<Option<String>, String> {
+    if config.frontend_config == Path::new(super::frontend::config::CONFIG) {
+        return Ok(None);
+    }
+    super::frontend::config::FrontendConfig::load(trust, &config.frontend_config)
+        .map(|loaded| Some(loaded.run.name))
+}
+
 #[cfg(target_os = "linux")]
 fn serve_linux_for(config: &ServeConfig) -> Result<(), String> {
+    let mut env = LinuxEnv::production();
+    if config.frontend_container {
+        let trust = Trust::root();
+        let bound = bound_container(&trust, config)?;
+        env.state_name = super::frontend::Files::of(bound.as_deref()).state;
+        return serve_linux_with(
+            config,
+            &env,
+            &trust,
+            super::frontend::production(config.frontend_config.clone(), bound),
+            &AtomicBool::new(false),
+        );
+    }
+    let format = match config.layout {
+        Layout::Installer => {
+            return serve_linux_with(
+                config,
+                &env,
+                &Trust::root(),
+                super::linux::production(config.units.clone()),
+                &AtomicBool::new(false),
+            );
+        }
+        Layout::Deb => super::package_format::Format::Deb,
+        Layout::Rpm => super::package_format::Format::Rpm,
+    };
+    let backend = super::package::production(config.units.clone(), format, &env.state_dir);
     serve_linux_with(
         config,
-        &LinuxEnv::production(),
+        &env,
         &Trust::root(),
-        super::linux::production(config.units.clone()),
+        backend,
         &AtomicBool::new(false),
     )
 }
@@ -209,9 +257,14 @@ pub(super) fn serve_mac_with(
     stop: &AtomicBool,
 ) -> Result<(), String> {
     use crate::mac::tools;
-    if !config.units.is_empty() {
+    if config.layout != Layout::Installer {
+        return Err("--layout is for a Linux host: a Mac keeps its releases in the kit".to_owned());
+    }
+    if !config.units.is_empty() || config.frontend_container {
         return Err(
-            "--restart-unit is for a Linux host: a Mac restarts the daemon's job".to_owned(),
+            "--restart-unit and --frontend-container are for a Linux host: a Mac restarts the \
+             daemon's job"
+                .to_owned(),
         );
     }
     let exec = runner
@@ -225,6 +278,7 @@ pub(super) fn serve_mac_with(
     let backend = super::mac_backend::MacBackend::new(host, backend_runner);
     let place = Place {
         state_dir: &work,
+        state_name: "state.json",
         trust: &trust,
         ids: (who.uid, who.gid),
         audit: &audit,
