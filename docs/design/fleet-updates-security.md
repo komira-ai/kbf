@@ -365,21 +365,29 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 >   but the paths (the wire refuses unknown fields). A path must be a name directly inside the
 >   directory it belongs to, compared by component (`..`, a longer path and a lookalike sibling
 >   are refused); the helper builds the path it passes on from the configured directory and
->   that name. A bundle the VM user owns is taken first: opened without following a link, made
->   root's and mode 0700 through the descriptor, the name checked again, every file in it made
->   root's, anything but plain single-link files refused. `image-setup` then moves the bundle
->   into the images directory with a rename (one volume; the name is checked again there, as
->   the user owns the staging directory, and the move is undone if something else arrived),
->   runs `kbf-vmm`, and seals the base: it STAYS root's, directory mode 0750 and files 0640
->   with the VM user's primary group, and root sets `uchg` on the files and then the
->   directory. The VM user clones it through its group and cannot change or unflag it; a
->   clone keeps `uchg` and is the user's own, so `kbf-vmm`'s clone step clears it on each
->   clone right after `clonefile` (measured on a Mac: a non-root `clonefile` of a root-owned
->   0640 base works, the clone keeps the flag, the user can clear it only on its own copy). A
->   failure after the take moves the bundle back to staging with its owners and modes.
->   `image-harvest` takes a kept clone from staging (and gives it back as it was) or reads a
->   sealed base in the images directory (already closed, so left alone), makes `<out>` itself
->   (new, root's, 0700) in the images directory and has `kbf-vmm` write `<out>/files`.
+>   that name.
+>   `image-setup` never takes the user's inodes. A measured Mac showed that a write descriptor
+>   the user opened before root's chown, chmod and `uchg` keeps writing through all three, so
+>   taking the bundle in place cannot stop a user who holds a descriptor or a mapping on its
+>   disk image (and root's chown of a `uchg` file fails). The helper opens each file of the
+>   staging bundle without following a link (plain files with one link only, at most 16
+>   entries) and clones it (`fclonefileat`, O(1) on APFS, new inodes) into a new directory it
+>   makes in the images directory: root's, 0700. It runs `kbf-vmm` on that copy (root attaches
+>   a disk image the user built; that is inherent, and the copy defeats changes after the
+>   copy was made, not what was in it) and seals the copy: it stays root's, directory 0750 and
+>   files 0640 with the VM user's primary group, and root sets `uchg` on the files and then the
+>   directory. The user's original is left alone. The VM user clones the base through its group
+>   (a non-root `clonefile` of a root-owned 0640 base works, the clone keeps the flag, the user
+>   can clear it only on its own copy) and `kbf-vmm`'s clone step clears `uchg` on each clone.
+>   A failure removes the copy, clearing `uchg` first (an immutable file cannot be unlinked), so
+>   no failure leaves a base in the images directory. `image-harvest` reads a kept clone in
+>   staging, whose inodes are the user's: the bundle is taken first (opened without following a
+>   link, made root's and 0700 through the descriptor, the name checked again, every file made
+>   root's, anything but plain single-link files refused) and given back with its owners and
+>   modes; that is acceptable because harvest only reads, but a user holding a descriptor can
+>   change what is read while it is read. A sealed base in the images directory is read as it
+>   is (root's and closed already). The helper makes `<out>` itself (new, root's, 0700) in the
+>   images directory and has `kbf-vmm` write `<out>/files`.
 > - Every program the switch and the scan run (`defaults`, `launchctl`, `fdesetup`,
 >   `sfltool`) goes through the host's command runner with an empty environment, so
 >   the unit tests fake each one and nothing in CI restarts: the macOS CI job runs the

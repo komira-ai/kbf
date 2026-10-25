@@ -336,7 +336,7 @@ fn the_image_verbs_work_over_the_socket() {
         "{\"setup\":1}"
     );
     assert!(image.dir.join("clone").is_dir());
-    assert!(!bundle.exists());
+    assert!(bundle.exists(), "the original is left alone");
     served.host.state().answers.insert(
         format!(
             "{} image harvest --bundle {} --out {}/files",

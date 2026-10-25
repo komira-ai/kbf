@@ -57,8 +57,40 @@ pub(crate) struct State {
     /// Runs with each command's text before it is answered: a change on the host
     /// between two of the helper's steps.
     pub(crate) on_command: Option<Hook>,
+    /// Whether `chflags` on the fake host has the effect `uchg` has: a file with the flag
+    /// cannot be unlinked, and neither can a directory that holds one. Modelled by taking
+    /// the write permission off the parent of each flagged path until `nouchg`.
+    pub(crate) enforce_uchg: bool,
+    /// The paths `chflags` has set `uchg` on.
+    pub(crate) immutable: BTreeSet<PathBuf>,
     /// The launchd domains that exist (`gui/<uid>` once a login has completed).
     pub(crate) domains: BTreeSet<String>,
+}
+
+impl State {
+    /// The effect of a successful `chflags -h uchg|nouchg <paths>` when `enforce_uchg` is
+    /// on: the parent of every path with the flag loses its write permission (so nothing
+    /// in it can be unlinked, and a flagged directory cannot be removed from its parent)
+    /// until the last flag under it is cleared.
+    fn chflags(&mut self, args: &[&str]) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let flag = args[1];
+        for path in &args[2..] {
+            let path = PathBuf::from(path);
+            if flag == "uchg" {
+                self.immutable.insert(path.clone());
+            } else {
+                self.immutable.remove(&path);
+            }
+            if self.enforce_uchg {
+                let parent = path.parent().unwrap();
+                let held = self.immutable.iter().any(|p| p.parent() == Some(parent));
+                let mode = std::fs::metadata(parent).unwrap().permissions().mode();
+                let mode = if held { mode & !0o222 } else { mode | 0o200 };
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        }
+    }
 }
 
 /// The fake host; clones share their state.
@@ -167,11 +199,11 @@ impl Host for FakeHost {
             None => String::new(),
         };
         self.call("command", format!("command {text}{seen}"))?;
-        let state = self.state();
+        let mut state = self.state();
         if let Some(hook) = &state.on_command {
             hook(&text);
         }
-        Ok(match state.answers.get(&text) {
+        let output = match state.answers.get(&text) {
             Some(answer) => answer.clone(),
             None if text == "/usr/bin/fdesetup isactive" => CommandOutput {
                 success: false,
@@ -187,7 +219,11 @@ impl Host for FakeHost {
                 success: true,
                 ..CommandOutput::default()
             },
-        })
+        };
+        if output.success && program == crate::helper::CHFLAGS {
+            state.chflags(args);
+        }
+        Ok(output)
     }
 
     fn account(&self, name: &str) -> io::Result<Option<Account>> {
@@ -202,6 +238,24 @@ impl Host for FakeHost {
     fn reset_password(&self, name: &str) -> io::Result<String> {
         self.call("reset_password", format!("reset_password {name}"))?;
         Ok(format!("pw-{name}"))
+    }
+
+    /// A real copy of the bytes into a new file (mode 0644, owned by the test).
+    fn clone_file(
+        &self,
+        src: std::os::fd::BorrowedFd<'_>,
+        dir: std::os::fd::BorrowedFd<'_>,
+        name: &str,
+    ) -> io::Result<()> {
+        self.call("clone_file", format!("clone_file {name}"))?;
+        let flags = rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::EXCL
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC;
+        let to = rustix::fs::openat(dir, name, flags, rustix::fs::Mode::from_raw_mode(0o644))?;
+        let mut from = std::fs::File::from(src.try_clone_to_owned()?);
+        io::copy(&mut from, &mut std::fs::File::from(to)).map(drop)
     }
 
     fn boot_session(&self) -> io::Result<String> {

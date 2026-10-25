@@ -66,7 +66,7 @@ mod leak;
 mod role;
 mod switch;
 
-pub use image::ImageSettings;
+pub use image::{CHFLAGS, ImageSettings};
 pub use switch::Reset;
 
 /// How many times `kill-uid` kills and looks again before it gives up.
@@ -149,6 +149,18 @@ pub trait Host: Send + Sync {
     /// # Errors
     /// There is no such user, or the password could not be set.
     fn reset_password(&self, name: &str) -> io::Result<String>;
+    /// Clones the open file `src` as the new file `name` in the directory `dir`: a
+    /// copy-on-write copy (macOS: `fclonefileat` with `CLONE_NOOWNCOPY`) with a new inode,
+    /// owned by the caller, so a descriptor someone holds on `src` reaches nothing of it.
+    ///
+    /// # Errors
+    /// `name` exists, the volume cannot clone, or the copy failed.
+    fn clone_file(
+        &self,
+        src: std::os::fd::BorrowedFd<'_>,
+        dir: std::os::fd::BorrowedFd<'_>,
+        name: &str,
+    ) -> io::Result<()>;
     /// This boot's identifier (macOS: `kern.bootsessionuuid`), for the baseline
     /// window.
     ///

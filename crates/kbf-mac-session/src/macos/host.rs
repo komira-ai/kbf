@@ -265,6 +265,34 @@ impl Host for MacHost {
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    fn clone_file(
+        &self,
+        src: std::os::fd::BorrowedFd<'_>,
+        dir: std::os::fd::BorrowedFd<'_>,
+        name: &str,
+    ) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        /// `CLONE_NOOWNCOPY` (`sys/clonefile.h`): the clone is owned by the caller, not the
+        /// source's owner.
+        const CLONE_NOOWNCOPY: u32 = 0x0002;
+        let c_name = std::ffi::CString::new(name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the name holds NUL"))?;
+        // SAFETY: both descriptors are open for the call and the name is NUL-terminated.
+        let code = unsafe {
+            libc::fclonefileat(
+                src.as_raw_fd(),
+                dir.as_raw_fd(),
+                c_name.as_ptr(),
+                CLONE_NOOWNCOPY,
+            )
+        };
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     fn boot_session(&self) -> io::Result<String> {
         let mut buffer = [0u8; 128];
         let mut len = buffer.len();
