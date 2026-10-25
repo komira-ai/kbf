@@ -160,16 +160,23 @@ async fn the_wait_serves_everything_and_its_end_hands_the_work_to_the_other_fron
     let (a, b) = (&pair.a, &pair.b);
     let on_a = Client::connect(a.reapi, a.worker).await;
     let on_b = Client::connect(b.reapi, b.worker).await;
-    let (first, second, third) = (
+    let (first, second, third, hold) = (
         Job::new("taken in the wait", &[]),
         Job::new("refused after the wait", &[]),
         Job::new("queued on the other frontend", &[]),
+        Job::new("keeps the drained frontend open", &[]),
     );
-    for job in [&first, &second, &third] {
+    for job in [&first, &second, &third, &hold] {
         on_a.upload(&job.blobs()).await;
     }
     let result = support::output(&on_b, "built while the frontend drains", 0).await;
     assert!(in_phase(a.api, "serving").await);
+    // The one node of this frontend has room for one lease: `hold` takes it and keeps the
+    // frontend from exiting at once, and `first` queues behind it.
+    let mut node_a = on_a.daemon("node-a", 1, 4).await;
+    let mut held = on_a.execute(&hold.action).await;
+    let held_start = node_a.start().await;
+    until_executing(&mut held).await;
 
     let begun = begin_drain(a.api).await;
     assert_eq!(begun["phase"], "lb_wait", "{begun}");
@@ -207,6 +214,9 @@ async fn the_wait_serves_everything_and_its_end_hands_the_work_to_the_other_fron
     }
     let last = done(&mut late).await;
     assert_eq!(response(&last).result, Some(result.clone()));
+    let ack = node_a.report(ran(held_start.lease_id, &result)).await;
+    assert!(ack.accepted, "{ack:?}");
+    done(&mut held).await;
     // Buck2 reopens the call that ended: the other frontend answers it, from the result
     // of the operation it ran.
     let mut again = on_b.execute(&first.action).await;
@@ -217,7 +227,7 @@ async fn the_wait_serves_everything_and_its_end_hands_the_work_to_the_other_fron
         pair.a.served.is_finished()
     })
     .await;
-    drop((ops, late, again, daemon, on_a, on_b));
+    drop((ops, held, late, again, daemon, node_a, on_a, on_b));
     pair.stop().await;
 }
 
