@@ -35,7 +35,7 @@ by `crates/kbf-integration-test/tests/release_artifacts`.
 
 ## What is built
 
-19 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
+21 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of `kbf`
 ([below](#the-kbf-package-deb)), one frontend and one update coordinator container image per
 Linux architecture ([below](#the-frontend-and-coordinator-images-oci)) and one macOS package of `kbf-installer`
@@ -44,8 +44,8 @@ Linux architecture ([below](#the-frontend-and-coordinator-images-oci)) and one m
 | Asset | Runner | Target |
 |---|---|---|
 | `kbf-<commit>-darwin-arm64.tar.gz`, `kbf-deploy-<commit>-darwin-arm64.tar.gz`, `kbf-installer-<commit>-darwin-arm64.tar.gz`, `kbf-host-install-<commit>-darwin-arm64.tar.gz`, `kbf-updater-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
-| `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz`, `kbf-host-install-<commit>-linux-x86_64.tar.gz`, `kbf-updater-<commit>-linux-x86_64.tar.gz`, `kbf-signer-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
-| `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz`, `kbf-host-install-<commit>-linux-arm64.tar.gz`, `kbf-updater-<commit>-linux-arm64.tar.gz`, `kbf-signer-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
+| `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz`, `kbf-host-install-<commit>-linux-x86_64.tar.gz`, `kbf-updater-<commit>-linux-x86_64.tar.gz`, `kbf-signer-<commit>-linux-x86_64.tar.gz`, `tierstore-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
+| `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz`, `kbf-host-install-<commit>-linux-arm64.tar.gz`, `kbf-updater-<commit>-linux-arm64.tar.gz`, `kbf-signer-<commit>-linux-arm64.tar.gz`, `tierstore-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
 
 `kbf` is the one binary with all five modes (`kbf --mode=daemon`, `kbf --mode=all-in-one`,
 `kbf --mode=storage`, and the two modes not built yet; [cluster.md](design/cluster.md) sections 1
@@ -79,6 +79,14 @@ the guide says. Each tarball holds one member, the binary under its own name. Th
 (`kbf --mode=frontend --ca-signer`; [the design](design/install-and-enrollment.md), section 6.1). It has Linux
 tarballs only, no package and no container image; it is taken by digest, verified, and placed like the
 two tools above. Its tarball holds one member, the binary under its own name.
+
+`tierstore` is the hot and cold S3 object store proxy (`crates/tierstore`): an S3 server over two
+tiers that copies new objects to the cold tier and frees the hot one when it fills. It is built with
+the crate's `server` feature, in a `cargo build` of its own. It has Linux tarballs only, no package
+and no container image; it is taken by digest, verified, and placed like `kbf-signer` and the host
+tools above, and its tarball holds one member, the binary under its own name. The host updater does
+not update it: the farm places it, and the example unit and the flags to fill in are in
+[`packaging/tierstore`](../packaging/tierstore/README.md).
 
 The packages are the two Linux jobs' debs (one each) and container images (two each), and the macOS job's `.pkg`:
 

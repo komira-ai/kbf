@@ -10,9 +10,9 @@
 //! - **The release set.** The `cargo xtask package` lines of the workflow name exactly
 //!   [`ASSETS`] (binary and platform): `kbf`, `kbf-host-install` and `kbf-updater` for the
 //!   three platforms (a Mac runs the host agent), `kbf-installer` for macOS only (its Linux
-//!   package is the `kbf` package's now), `kbf-daemon`,
-//!   `kbf-server`, `kbf-deploy` and `kbf-signer` for Linux, `kbf-deploy` for macOS (a Mac runs `kbf daemon`;
-//!   there is no darwin `kbf-daemon`). Each one's SBOM attestation is
+//!   package is the `kbf` package's now), `kbf-daemon`, `kbf-server`, `kbf-deploy`,
+//!   `kbf-signer` and `tierstore` for Linux, `kbf-deploy` for macOS (a Mac runs
+//!   `kbf daemon`; there is no darwin `kbf-daemon`). Each one's SBOM attestation is
 //!   [`crate::attested_assets`]' business, and its provenance bundle
 //!   [`crate::attested_bundles`]'.
 //! - **Who signs, and when.** The workflow runs for pull requests and the merge queue
@@ -89,6 +89,7 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-host-install", "linux-x86_64"),
     ("kbf-updater", "linux-x86_64"),
     ("kbf-signer", "linux-x86_64"),
+    ("tierstore", "linux-x86_64"),
     ("kbf", "linux-arm64"),
     ("kbf-daemon", "linux-arm64"),
     ("kbf-server", "linux-arm64"),
@@ -96,6 +97,7 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-host-install", "linux-arm64"),
     ("kbf-updater", "linux-arm64"),
     ("kbf-signer", "linux-arm64"),
+    ("tierstore", "linux-arm64"),
 ];
 
 /// The binaries of [`ASSETS`] that name the commit they were built from (`<binary>
