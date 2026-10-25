@@ -196,11 +196,7 @@ async fn a_frontend_that_serves_nothing_has_no_locations_to_give() {
     let world = World::new().await;
     world.pack(b"packed").await;
     let asked = vec![blob(b"packed"), blob(b"other")];
-    for code in [
-        Code::Unimplemented,
-        Code::Unimplemented,
-        Code::Unavailable,
-    ] {
+    for code in [Code::Unimplemented, Code::Unimplemented, Code::Unavailable] {
         world.frontend.set(Mode::Refuse(code));
         let located = world.locate(asked.clone()).await.expect("no error");
         assert_eq!(located, [None, None], "{code:?}");

@@ -115,12 +115,7 @@ impl fmt::Display for PackStats {
         write!(
             f,
             "served={} served_bytes={} elsewhere={} unasked={} lost={} damaged={}",
-            self.served,
-            self.served_bytes,
-            self.elsewhere,
-            self.unasked,
-            self.lost,
-            self.damaged
+            self.served, self.served_bytes, self.elsewhere, self.unasked, self.lost, self.damaged
         )
     }
 }

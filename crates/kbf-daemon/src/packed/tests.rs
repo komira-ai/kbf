@@ -415,7 +415,9 @@ async fn everything_but_the_reads_is_the_plane_underneaths() {
     rig.cas.put_records(Vec::new()).await.expect("records");
     let dir = TestDir::under(std::env::temp_dir(), "packed-cas-spool");
     let spool = Spool::create(&dir).expect("a spool");
-    rig.cas.put_spool(Arc::new(spool)).await.expect("spool");
+    // Through the wrapper itself: the blanket `Cas for Arc<C>` does not forward `put_spool`.
+    let wrapper: &PackedCas<Held> = &rig.cas;
+    wrapper.put_spool(Arc::new(spool)).await.expect("spool");
     assert!(rig.cas.intake().is_none());
     assert_eq!(rig.cas.in_flight(), 7);
     let calls = [

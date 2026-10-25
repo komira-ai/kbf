@@ -893,7 +893,7 @@ impl<'a> Prepared<'a> {
         );
         let cold_store = cold_store(members.clone(), &peers, delivery.as_ref());
         // Only with `--pack-index`: otherwise a daemon's Locate is UNIMPLEMENTED.
-        let packs = crate::pack_locate::service(pack_index.as_ref(), &peers);
+        let locate = crate::pack_locate::service(pack_index.as_ref(), &peers);
         let sessions = WorkerService::new(
             Arc::clone(&farm),
             peers,
@@ -982,7 +982,7 @@ impl<'a> Prepared<'a> {
                 .add_service(worker_service)
                 .add_optional_service(membership)
                 .add_optional_service(cold_store)
-                .add_optional_service(packs)
+                .add_optional_service(locate)
                 .serve_with_incoming_shutdown(worker_incoming, worker_stopped);
             // Told when the REAPI listener is done (see `serve::stop_api`).
             let (api_stop_when_done, api_stopped) = tokio::sync::oneshot::channel::<()>();
