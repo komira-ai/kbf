@@ -1,0 +1,46 @@
+[package]
+name = "kbf-pack-adopt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The operator tool that adopts the segments storage members already flushed to the cold
+# store into the pack index, in place (`kbf_pack::Adopter`). It is a binary of its own and
+# never part of `kbf`: it does nothing unless an operator runs it, and the only thing it writes
+# to the object store or the database is the pack index, and only with `--mode apply` (it
+# also writes the checkpoint and report files it is told to).
+[dependencies]
+clap.workspace = true
+# `S3Store`, the read-only client of the members' bucket.
+kbf-objstore.workspace = true
+# `Adopter`, which lists the segments, reads their footers and records them.
+kbf-pack.workspace = true
+# `PostgresConfig` and `PostgresPackIndex`: the pack index is in the Postgres state store.
+kbf-state = { workspace = true, features = ["postgres"] }
+# The credentials file, the checkpoint and the report are JSON.
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# `rt` and `time`: the current-thread runtime the adoption runs on.
+tokio = { workspace = true, features = ["rt", "time"] }
+# The credentials file is read into memory that is overwritten when it is dropped.
+zeroize.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+# `FakeS3`, an S3 service on loopback for the end-to-end tests.
+kbf-objstore = { workspace = true, features = ["testkit"] }
+# The segments the tests put in the fake store.
+kbf-segments.workspace = true
+# The in-memory pack index and, for one test, a Postgres database of its own.
+kbf-state = { workspace = true, features = ["test-database", "test-support"] }
+# `TestDir`, and the test Postgres server the database is made on.
+kbf-testkit = { workspace = true, features = ["postgres"] }
+# A multi-thread runtime keeps the fake store serving while the tool runs on the test's thread.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

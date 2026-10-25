@@ -111,6 +111,11 @@ cache already keeps blobs by digest, so it is off by default). `kbf daemon` only
 Counts of what was read from packs, elsewhere, lost and damaged are logged when the daemon
 stops (`pack reads: ...`), and a lost or damaged blob is logged when it is found.
 
+The blobs the storage members flushed before the frontends wrote packs are in no pack the
+index knows, so a read of one still goes to the members. `kbf-pack-adopt`, an operator tool and
+a binary of its own, indexes those segments where they lie, with no byte copied and nothing
+written to the object store: [pack-adopt.md](pack-adopt.md) gives the order to run it in.
+
 **`storage`.** It serves the storage service over gRPC and nothing else: no REAPI, no
 scheduler, no operator API (only `GET /metrics`, on `--metrics-listen`, off unless given).
 It has no state store; it reaches one only through a frontend. Without `--frontend` it is a
@@ -444,4 +449,6 @@ maintenance without stopping it, `kbf cluster drain <node>`.
   single host.
 - [linux-build-host.md](linux-build-host.md): what a Linux build host installs and gives
   the daemon.
+- [pack-adopt.md](pack-adopt.md): indexing the segments the storage members already hold into
+  the pack index, in place.
 - The operator API, with its gates, in [api.md](../api.md).

@@ -17,6 +17,10 @@
 //! - [`ReadCache`] is the bounded on-disk cache of blobs a reader keeps in front of the
 //!   store: least recently used out first, written with a temporary file and a rename,
 //!   checked by digest on every read.
+//! - [`Adopter`] indexes, in place, the segments that storage members flushed to the cold store
+//!   before there were packs: a segment has the layout of a pack, so one record of the index
+//!   per segment, made from its footer, makes its blobs readable through [`Reader`]. It copies
+//!   nothing, and does nothing unless it is run; the operator tool `kbf-pack-adopt` runs it.
 //!
 //! Pack keys are `cas/d/<node>/<boot>/<seq>` for a daemon and `cas/f/<frontend>/<boot>/<seq>`
 //! for a frontend ([`PackKeys`]); the sequence number is sixteen hex digits, so a listing of
@@ -25,6 +29,7 @@
 //! The index's calls block, so the packer and the reader run them on the async runtime's
 //! blocking pool, and the cache's file calls too.
 
+mod adopt;
 mod blocking;
 mod cache;
 mod digest;
@@ -33,6 +38,10 @@ mod keys;
 mod packer;
 mod reader;
 
+pub use adopt::{
+    AdoptConfig, AdoptError, AdoptMode, AdoptReport, AdoptRun, Adopter, CHECKPOINT_EVERY,
+    MAX_PROBLEMS, Problem, ProblemKind, Saver,
+};
 pub use cache::ReadCache;
 pub use digest::blob_digest;
 pub use error::{CacheError, PackError, ReadError};
