@@ -451,7 +451,7 @@ pub fn config(entries: &[Entry], platform: Platform, version: &str) -> String {
          homepage: \"https://github.com/komira-ai/kbf\"\n\
          license: \"Apache-2.0\"\n\
          {relations}\
-         deb:\n  compression: \"gzip\"\n\
+         deb:\n  compression: \"gzip\"\n  breaks:\n    - \"kbf-installer (<< 0.1.1)\"\n\
          rpm:\n  compression: \"gzip\"\n  buildhost: {host}\n\
          contents:\n",
         name = quoted(KBF_NAME),
