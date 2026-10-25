@@ -12,7 +12,7 @@
 //! - After every clean the whole assertion runs against that baseline ([`after_clean`]);
 //!   when the slot is handed to a lease the cheap probes run again
 //!   ([`Slot::assert_ready`]), which sees what arrived after the clean's last look.
-//!   The cheap probes are the processes, launchd's jobs, IPC, mounts, the home and the
+//!   The cheap probes are the processes, IPC, mounts, the home and the
 //!   entry, within [`READY_WITHIN`]; the shared places and the schedules are read after
 //!   the clean only, not at slot-ready.
 //! - A red result is the same as a failed clean: the slot is not offered, the differing
@@ -37,7 +37,7 @@ use kbf_mac_session::sweep::SweepPlan;
 use super::host;
 use super::{Ready, Slot, launch_command};
 use crate::network::{Isolation, Network};
-use crate::slots::assertion::{self, Facts, Job, Lines, Probe, Reader, Snapshot};
+use crate::slots::assertion::{self, Facts, Lines, Probe, Reader, Snapshot};
 use crate::slots::clean::Outcome;
 use crate::slots::tool::run_within;
 use crate::slots::{crash, entry, probe};
@@ -60,7 +60,7 @@ const RECORD_ATTRS: [&str; 5] = [
     "UserShell",
 ];
 
-/// How long one tool the readers run may take: a hung `hdiutil` or `launchctl` is a probe
+/// How long one tool the readers run may take: a hung `hdiutil` is a probe
 /// that cannot run (red), never a lease or a recovery that waits for ever.
 const READ_WITHIN: Duration = Duration::from_secs(60);
 
@@ -68,13 +68,6 @@ const READ_WITHIN: Duration = Duration::from_secs(60);
 /// then is not read and the result is red, so a lease is never held up for ever by a
 /// string of slow tools (each of which is bounded by [`READ_WITHIN`]).
 const READY_WITHIN: Duration = Duration::from_secs(120);
-
-/// What `launchctl print` exits with for a target that is not there ("Could not find
-/// service"). Any other failure is not "gone".
-const NOT_FOUND: i32 = 113;
-
-/// How long the processes probe waits before it looks a second time at a finding.
-const LOOK_AGAIN: Duration = Duration::from_millis(500);
 
 /// How long the warm-up command may take.
 const WARM_UP_WITHIN: Duration = Duration::from_secs(60);
@@ -90,8 +83,6 @@ pub(super) struct MacReader<'a> {
     program: &'a Path,
     /// The lease directory, while the slot has one.
     lease: Option<&'a Path>,
-    /// launchd's jobs for the uid, read once for the processes and the domain.
-    jobs: OnceLock<Result<Vec<Job>, String>>,
 }
 
 impl<'a> MacReader<'a> {
@@ -100,7 +91,6 @@ impl<'a> MacReader<'a> {
             ready,
             program,
             lease,
-            jobs: OnceLock::new(),
         }
     }
 
@@ -113,50 +103,19 @@ impl<'a> MacReader<'a> {
         }
     }
 
-    /// The label, plist path and program of each of launchd's own services the baseline noted.
-    fn known(&self) -> &[String] {
-        self.ready
-            .baseline
-            .get()
-            .and_then(|b| b.lines(Probe::Services))
-            .map_or(&[][..], Vec::as_slice)
-    }
-
-    fn jobs(&self) -> Result<&[Job], String> {
-        self.jobs
-            .get_or_init(|| jobs_of(self.ready.user.uid, self.known()))
-            .as_deref()
-            .map_err(Clone::clone)
-    }
-
     fn roots(&self) -> Vec<&Path> {
         let mut roots = vec![self.ready.home.as_path(), self.ready.folders.as_path()];
         roots.extend(self.lease);
         roots
     }
 
-    /// The processes of the uid that are not launchd's own. A finding is looked at once
-    /// more, with the jobs read again: one of launchd's own services that ended between
-    /// the process table and the jobs (an idle on-demand daemon) is in the first look
-    /// alone, a lease's process is in both.
+    /// The processes of the uid, from the process table alone: launchd is not asked
+    /// (see [`assertion`]).
     fn processes(&self) -> Result<Lines, String> {
-        let found = self.processes_by(self.jobs()?)?;
-        if found.is_empty() {
-            return Ok(found);
-        }
-        std::thread::sleep(LOOK_AGAIN);
-        let jobs = jobs_of(self.ready.user.uid, self.known())?;
-        self.processes_by(&jobs)
-    }
-
-    fn processes_by(&self, jobs: &[Job]) -> Result<Lines, String> {
         let uid = self.ready.user.uid;
-        // The processes first, then the jobs: a process started in between is in
-        // neither, never in the first alone.
         let table = tool(PS, &["-axo", "pid=,ruid=,uid=,svuid=,stat=,comm="])?;
         let procs = assertion::parse_ps(&String::from_utf8_lossy(&table))?;
-        let own = assertion::own_pids(jobs);
-        Ok(assertion::uid_processes(&procs, uid, &own))
+        Ok(assertion::uid_processes(&procs, uid))
     }
 
     fn ipc(&self) -> Result<Lines, String> {
@@ -260,8 +219,6 @@ impl Reader for MacReader<'_> {
     fn read(&self, probe: Probe) -> Result<Lines, String> {
         match probe {
             Probe::Processes => self.processes(),
-            Probe::Domain => Ok(assertion::foreign_jobs(self.jobs()?)),
-            Probe::Services => Ok(assertion::own_services(self.jobs()?)),
             Probe::Ipc => self.ipc(),
             Probe::Mounts => self.mounts(),
             Probe::Home => self.home(),
@@ -271,72 +228,6 @@ impl Reader for MacReader<'_> {
             Probe::Record => self.record(),
         }
     }
-}
-
-/// The jobs of `user/<uid>`: each service `launchctl print user/<uid>` lists, with whether
-/// it is launchd's own. A domain that is not there has none. A launchctl that cannot be
-/// run or says anything but "not found", and a listed service that cannot be read and is
-/// still listed on a second look, are errors: a job that is not seen is never green.
-///
-/// Every service is printed, the baseline's too: a job is launchd's own only if the file
-/// its plist path names is ([`assertion::own_plist`]) and, if the baseline (`known`)
-/// noted a service of its label, that plist path and program are the noted ones
-/// ([`assertion::is_own_job`]). A label is never enough.
-fn jobs_of(uid: u32, known: &[String]) -> Result<Vec<Job>, String> {
-    let domain_target = format!("user/{uid}");
-    let Some(domain) = print(&domain_target)? else {
-        return Ok(Vec::new());
-    };
-    let mut jobs = Vec::new();
-    for (pid, label) in probe::listed_services(&domain) {
-        let Some(printed) = print(&format!("{domain_target}/{label}"))? else {
-            // Gone since the listing, or not readable: the listing says which.
-            let again = print(&domain_target)?.unwrap_or_default();
-            if probe::listed_services(&again)
-                .iter()
-                .any(|(_, l)| *l == label)
-            {
-                return Err(format!("the job {label:?} is listed and cannot be printed"));
-            }
-            continue;
-        };
-        let (plist, program) = (probe::plist_path(&printed), probe::program_path(&printed));
-        let own = assertion::is_own_job((&label, plist, program), known, &|path| {
-            assertion::own_plist(path, &label, &probe::OWN_PLISTS, 0)
-        });
-        jobs.push(Job {
-            pid,
-            plist: plist.map(str::to_owned),
-            program: program.map(str::to_owned),
-            label,
-            own,
-        });
-    }
-    Ok(jobs)
-}
-
-/// What `launchctl print <target>` says; `None` when the target is not there
-/// ([`NOT_FOUND`]).
-///
-/// # Errors
-/// `launchctl` did not run or finish, or exited any other way (a domain being torn down
-/// is not an absent one).
-fn print(target: &str) -> Result<Option<String>, String> {
-    let mut command = Command::new(uid::LAUNCHCTL);
-    command.args(["print", target]);
-    let (status, stdout, stderr) = run_within(&mut command, READ_WITHIN)
-        .map_err(|e| format!("{} print {target}: {e}", uid::LAUNCHCTL))?;
-    if status.success() {
-        return Ok(Some(String::from_utf8_lossy(&stdout).into_owned()));
-    }
-    if status.code() == Some(NOT_FOUND) {
-        return Ok(None);
-    }
-    Err(format!(
-        "{} print {target}: {status}: {}",
-        uid::LAUNCHCTL,
-        String::from_utf8_lossy(&stderr).trim()
-    ))
 }
 
 /// `program`'s stdout, if it exited 0 within [`READ_WITHIN`].
@@ -541,7 +432,7 @@ pub(super) type Baseline = OnceLock<Snapshot>;
 
 impl Slot {
     /// Runs the cheap probes of the assertion for a lease whose directory is `lease`, as
-    /// the slot is handed to it: the processes and launchd's jobs, System V IPC, mounts
+    /// the slot is handed to it: the processes, System V IPC, mounts
     /// and attached images, the home and the `/var/folders` entry, against the baseline.
     /// The lines that differ; empty when the user is as the baseline says. The slot is
     /// then to be set aside ([`Slot::set_aside`]) if there are any. Always empty for slots

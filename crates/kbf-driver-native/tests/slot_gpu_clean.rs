@@ -388,6 +388,10 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
     let caches_after = look(&[&caches_c, "-maxdepth", "1", metal[0], metal[1]]);
     let still = registry_clients_of(uid);
     drop(litter);
+    // After a settle: a clean that left a launchd domain behind (a `launchctl print` of a
+    // gone `user/<uid>` makes it) has launchd's agents running as the uid seconds later.
+    std::thread::sleep(Duration::from_secs(5));
+    let alive = kbf_driver_native::slots::macos::host::leftover_processes(uid).expect("list");
 
     assert!(
         !caches.is_empty(),
@@ -417,6 +421,10 @@ async fn a_pool_lease_that_used_the_gpu_leaves_none_of_it_after_the_clean() {
         "files left in the home: {files_in_home:?}"
     );
     assert!(outside.is_empty(), "the uid still owns {outside:?}");
+    assert!(
+        alive.is_empty(),
+        "uid {uid} runs {alive:?} five seconds after the clean"
+    );
     assert!(
         still.is_empty(),
         "the registry still has clients of the uid: {still:?}"

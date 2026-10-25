@@ -14,8 +14,8 @@
 //!
 //! The order, C1 to C11 ([`Step::code`]):
 //!
-//! 1. [`Step::Bootout`]: end the slot's launchd domains, whole, and wait until the domain
-//!    lists nothing of the lease's.
+//! 1. [`Step::Bootout`]: end the slot's launchd domains, whole. No `launchctl` verb is run
+//!    on them afterwards: a root `print` makes a gone domain again.
 //! 2. [`Step::Schedules`]: the uid's crontab and `at` jobs, before the kill: no job
 //!    starts after it.
 //! 3. [`Step::Kill`]: every process of the uid.
@@ -44,8 +44,9 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Step {
     /// C1. The slot's launchd domains `user/<uid>` and `gui/<uid>` booted out whole (no
-    /// job by its label), then waited for: launchd starts no `KeepAlive` or on-demand job
-    /// of the uid again, and the domain lists only launchd's own.
+    /// job by its label): launchd starts no `KeepAlive` or on-demand job of the uid again.
+    /// It is the last thing run on either domain: a root `launchctl print` of a gone
+    /// `user/<uid>` makes it again, with launchd's agents running in it as the uid.
     Bootout,
     /// C2. The uid's crontab and `at` jobs, before the kill: no job starts after it.
     Schedules,
