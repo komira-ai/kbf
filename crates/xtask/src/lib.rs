@@ -83,6 +83,9 @@
 //!   with its line in `SHA256SUMS.<platform>`. The release set holds it for every `kbf`
 //!   tarball (`verify-assets sums`, `release check`), because only a runner of a platform
 //!   can run its binary.
+//! - `runner-disk --disk <path> --disk-min-free-gb <n> --root-min-free-gb <n> [--root <path>]`
+//!   ([`runner_disk`]): exit 1 naming the disk when the second disk is not a separate disk or
+//!   either disk has less free space than the coverage run needs.
 //! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
 //!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
 //!   unit.
@@ -126,6 +129,7 @@ pub mod pkg_upgrade;
 pub mod pkg_version;
 pub mod prove_farm;
 pub mod release;
+pub mod runner_disk;
 pub mod sudo_test;
 pub mod sums;
 pub mod version_facts;
@@ -187,6 +191,8 @@ enum Verb {
     DeployFarm(deploy_farm::Args),
     /// Prove the farm after a deploy with a remote-only Buck2 build of a small project.
     ProveFarm(prove_farm::Args),
+    /// Check that the runner's root disk and second disk have the room the coverage run needs.
+    RunnerDisk(runner_disk::Args),
     /// Refuse a row the budget file gains against `--base`.
     BudgetDiff {
         /// The revision to compare with (on a pull request, the base branch).
@@ -992,6 +998,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
         Verb::DeployFarm(args) => deploy_farm::run(&args),
         Verb::ProveFarm(args) => prove_farm::run(&args),
+        Verb::RunnerDisk(args) => runner_disk::run(&args),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::SourceDateEpoch { commit, output } => {
             source_date_epoch(&root, &commit, &output).map(|line| vec![line])

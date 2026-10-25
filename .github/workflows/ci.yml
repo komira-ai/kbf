@@ -169,7 +169,7 @@ jobs:
       # was lost mid-test). Remove toolchains the image preinstalls that this job never
       # uses; the Postgres service container's image is not touched.
       - name: Free disk before (report)
-        run: df -h /
+        run: df -h / /mnt
       - name: Remove preinstalled toolchains this job does not use
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/powershell /usr/share/swift /usr/local/lib/node_modules
       # Images the runner preloads and this job never runs; the Postgres service container's
@@ -185,6 +185,26 @@ jobs:
       - run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --version
       - name: Install cargo-nextest (pinned version and checksum)
         run: cargo "+$COVERAGE_TOOLCHAIN" xtask fetch --url "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/cargo-nextest-$NEXTEST_VERSION-x86_64-unknown-linux-gnu.tar.gz" --sha256 "$NEXTEST_SHA256" --out "$HOME/.cargo/bin/cargo-nextest" --extract tar.gz --member cargo-nextest
+      # The instrumented workspace build (target/llvm-cov-target, about 59 GB with the tests'
+      # temporary files under it) plus the restored target/debug (about 50 GB) filled the root
+      # disk: the run measured 120 GB free before the tests and 5.6 GB after, below the 5%
+      # floor kbf-server's file store refuses to write under, and about 30 tests failed with
+      # "Unavailable(Store(Transport(Full ...". The runner's second disk, mounted at /mnt,
+      # takes the instrumented build and, with it, the tests' temporary files
+      # (CARGO_TARGET_TMPDIR sits under the target directory). It is bind-mounted over
+      # target/llvm-cov-target, so every path, the cache's included, stays the same.
+      # The checks run first and fail with the disk named, so a short disk reads as
+      # "runner out of disk" and not as test failures.
+      - name: Refuse early when a disk is short (the second disk 64 GiB, the root disk 60 GiB)
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --disk /mnt --disk-min-free-gb 64 --root-min-free-gb 60
+      - name: Make the second disk's directory for the instrumented build
+        run: sudo install -d -m 1777 /mnt/kbf-llvm-cov-target
+      - name: Make the mount point in the workspace
+        run: mkdir -p target/llvm-cov-target
+      - name: Put the instrumented build on the second disk
+        run: sudo mount --bind /mnt/kbf-llvm-cov-target target/llvm-cov-target
+      - name: Free disk with the build on the second disk (report)
+        run: df -h / /mnt target/llvm-cov-target
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
@@ -224,7 +244,7 @@ jobs:
       # which directories grew (the instrumented build, the tests' own temporary files).
       - name: Free disk after the tests (report)
         if: ${{ always() }}
-        run: df -h /
+        run: df -h / /mnt target/llvm-cov-target
       - name: Disk use under target after the tests (report)
         if: ${{ always() }}
         run: du -xhd 2 target
