@@ -15,18 +15,14 @@ fn the_gate_opens_only_for_enforcement_or_an_explicit_acceptance() {
     assert_eq!(check(true, true), Ok(()));
 }
 
-/// This build does not enforce deny rows, so a start without the flag is refused, with a
-/// message that names the flag that accepts it.
+/// This build enforces deny rows, so a start without the flag is accepted, and the flag
+/// changes nothing.
 ///
-/// Catches: the marker flipped without the change that makes it true (this test is
-/// changed in the same commit as B3c), and an error message that does not tell the
-/// operator what to do.
+/// Catches: the marker turned off again (a build that cannot enforce a revocation), and a
+/// gate that still asks for an acceptance although revocation is enforced.
 #[test]
-fn this_build_refuses_enroll_listen_without_the_acceptance() {
-    const { assert!(!DENY_ENFORCED, "B3c flips this and changes this test") };
-    let refused = start_gate(false).expect_err("refused");
-    let text = refused.to_string();
-    assert!(text.contains("--enroll-allow-unenforced-deny"), "{text}");
-    assert!(text.contains("--enroll-listen"), "{text}");
+fn this_build_starts_enroll_listen_without_the_acceptance() {
+    const { assert!(DENY_ENFORCED) };
+    assert_eq!(start_gate(false), Ok(()));
     assert_eq!(start_gate(true), Ok(()));
 }

@@ -3,7 +3,14 @@
 
 use std::path::PathBuf;
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use kbf_map::DenyEntry;
 use kbf_server::identity::{Denied, DenyList, DenyListError, PeerCert, Peers};
+use kbf_server::members::{Members, MembershipConfig};
+use kbf_state::fake::{Fake, Flaw};
+use kbf_state::{Cond, ManualClock, Store, Txn};
 use rcgen::{CertificateParams, DnType, KeyPair, SanType, SerialNumber};
 use tonic::Code;
 
@@ -289,7 +296,10 @@ fn a_certified_listener_needs_a_readable_certificate() {
         None
     );
     assert_eq!(Peers::Unauthenticated.peer(None).expect("plain"), None);
-    let certified = Peers::Certified { deny_list: None };
+    let certified = Peers::Certified {
+        deny_list: None,
+        denied_rows: None,
+    };
     let none = certified.peer(None).expect_err("no certificate");
     assert_eq!(none.code(), Code::Unauthenticated);
     let garbage = certified.peer(Some(b"junk")).expect_err("junk");
@@ -309,7 +319,10 @@ fn a_certified_listener_needs_a_readable_certificate() {
 async fn admission_binds_the_node_and_reads_the_deny_list_each_time() {
     let a = peer(vec![dns("node-a")]);
     assert!(Peers::Unauthenticated.admit(None, "anything").await.is_ok());
-    let without_list = Peers::Certified { deny_list: None };
+    let without_list = Peers::Certified {
+        deny_list: None,
+        denied_rows: None,
+    };
     assert!(without_list.admit(Some(&a), "node-a").await.is_ok());
     assert_eq!(
         without_list
@@ -324,6 +337,7 @@ async fn admission_binds_the_node_and_reads_the_deny_list_each_time() {
     std::fs::write(&path, "# nothing denied yet\n").expect("write");
     let with_list = Peers::Certified {
         deny_list: Some(DenyList::open(&path).expect("open")),
+        denied_rows: None,
     };
     assert!(with_list.admit(Some(&a), "node-a").await.is_ok());
     assert_eq!(
@@ -393,4 +407,133 @@ async fn a_list_renamed_over_the_old_one_is_read_even_at_the_same_size() {
         Err(DenyListError::Parse { line: 1, .. })
     ));
     assert!(list.current().await.is_err());
+}
+
+/// Members over an empty store, and the store, for the tests of the `deny/` rows.
+fn members() -> (Arc<Fake>, Arc<Members>) {
+    let fake = Arc::new(Fake::with_flaw(
+        Arc::new(ManualClock::default()),
+        Flaw::None,
+    ));
+    let config = MembershipConfig {
+        ttl: Duration::from_secs(60),
+        dwell: Duration::from_secs(60),
+        replication: 2,
+    };
+    let members = Arc::new(Members::new(Arc::clone(&fake) as Arc<dyn Store>, config));
+    (fake, members)
+}
+
+fn rows_only(members: &Arc<Members>) -> Peers {
+    Peers::Certified {
+        deny_list: None,
+        denied_rows: None,
+    }
+    .with_denied_rows(Some(Arc::clone(members)))
+}
+
+/// A revoked serial is refused and an unrelated node is admitted, from the store's rows
+/// alone (no file); the same node under another serial is not refused by that serial; a row
+/// written after the peers were built is seen at the next check, and one taken off
+/// readmits.
+///
+/// Catches: rows read once at start, rows ignored beside a deny file, and a serial row
+/// that names the node and not the certificate.
+#[tokio::test]
+async fn the_stores_deny_rows_refuse_a_serial_and_a_node_at_every_check() {
+    let (_fake, members) = members();
+    let peers = rows_only(&members);
+    let revoked = PeerCert::from_der(&cert(vec![dns("node-a")], "x", &[0x0a, 0x1b])).expect("cert");
+    let reissued =
+        PeerCert::from_der(&cert(vec![dns("node-a")], "x", &[0x0a, 0x1c])).expect("cert");
+    let other = PeerCert::from_der(&cert(vec![dns("node-b")], "x", &[0x0b])).expect("cert");
+    assert!(peers.admit(Some(&revoked), "node-a").await.is_ok());
+
+    let serial: DenyEntry = format!("serial {}", revoked.serial())
+        .parse()
+        .expect("entry");
+    members.deny(&serial, "leaked").expect("deny");
+    let refused = peers
+        .admit(Some(&revoked), "node-a")
+        .await
+        .expect_err("the serial is revoked");
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert!(
+        refused.message().contains("serial"),
+        "{}",
+        refused.message()
+    );
+    assert!(peers.admit(Some(&reissued), "node-a").await.is_ok());
+    assert!(peers.admit(Some(&other), "node-b").await.is_ok());
+
+    assert!(members.allow(&serial).expect("allow"));
+    assert!(peers.admit(Some(&revoked), "node-a").await.is_ok());
+
+    let node: DenyEntry = "node node-a".parse().expect("entry");
+    members.deny(&node, "revoked").expect("deny");
+    for who in [&revoked, &reissued] {
+        let refused = peers.admit(Some(who), "node-a").await.expect_err("node");
+        assert_eq!(refused.code(), Code::PermissionDenied);
+    }
+    assert!(peers.admit(Some(&other), "node-b").await.is_ok());
+}
+
+/// The file and the rows are both applied: an entry in either refuses, and neither
+/// shadows the other.
+///
+/// Catches: the rows replacing the file's entries (or the file replacing the rows).
+#[tokio::test]
+async fn the_file_and_the_rows_both_refuse() {
+    let (_fake, members) = members();
+    let (_dir, path) = scratch("both.deny");
+    std::fs::write(&path, "node node-a\n").expect("write");
+    let peers = Peers::Certified {
+        deny_list: Some(DenyList::open(&path).expect("open")),
+        denied_rows: None,
+    }
+    .with_denied_rows(Some(Arc::clone(&members)));
+    members
+        .deny(&"node node-b".parse().expect("entry"), "revoked")
+        .expect("deny");
+    let a = peer(vec![dns("node-a")]);
+    let b = peer(vec![dns("node-b")]);
+    let c = peer(vec![dns("node-c")]);
+    for (who, node) in [(&a, "node-a"), (&b, "node-b")] {
+        let refused = peers.admit(Some(who), node).await.expect_err("denied");
+        assert_eq!(refused.code(), Code::PermissionDenied, "{node}");
+    }
+    assert!(peers.admit(Some(&c), "node-c").await.is_ok());
+}
+
+/// Rows that cannot be read refuse every check UNAVAILABLE, the node that would have been
+/// admitted included, and a file that would have refused does not turn that into
+/// PERMISSION_DENIED.
+///
+/// Catches: a deny source that cannot be read admitting (fail open).
+#[tokio::test]
+async fn deny_rows_that_cannot_be_read_admit_nobody() {
+    let (fake, members) = members();
+    // A row that spells no entry: the list is not guessed at.
+    let written = fake
+        .txn(Txn::new().put("deny/bogus/x", b"?".to_vec(), Cond::Any))
+        .expect("write the row");
+    assert!(written.is_ok(), "the row was written");
+    let peers = rows_only(&members);
+    for node in ["node-a", "node-b"] {
+        let refused = peers
+            .admit(Some(&peer(vec![dns(node)])), node)
+            .await
+            .expect_err("nobody is admitted");
+        assert_eq!(refused.code(), Code::Unavailable, "{node}");
+        assert!(
+            !refused.message().contains("bogus"),
+            "the store's own text stays inside: {}",
+            refused.message()
+        );
+    }
+    let blob_style = peers
+        .admit(None, "node-a")
+        .await
+        .expect_err("no peer either");
+    assert_eq!(blob_style.code(), Code::Unavailable);
 }

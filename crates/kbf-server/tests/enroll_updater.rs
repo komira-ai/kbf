@@ -79,7 +79,7 @@ async fn start(name: &str) -> Farm {
     };
     let prepared = prepare(&flags).expect("prepared");
     let (port, pin) = (prepared.local().port(), prepared.ca().pin());
-    let mut serving = prepared.serve(Arc::clone(&store)).expect("serving");
+    let mut serving = prepared.serve(Arc::clone(&store), None).expect("serving");
     let listener = std::mem::replace(&mut serving.listener, Box::pin(std::future::pending()));
     tokio::spawn(listener);
     Farm {

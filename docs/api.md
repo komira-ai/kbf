@@ -243,7 +243,7 @@ included), and every call of a certificate that is not an updater's (a daemon's,
 frontend's), whatever the path; a call with no client certificate does not get past the handshake.
 The id is compared as written: it is 1 to 63 of `a-z`, `0-9` and `-` (not first or last), nothing
 is decoded, and a query string makes the call none of the four. A node on the listener's deny list
-(`--worker-deny-list`) is refused. `404` for a node the frontend has not seen since it started
+(`--worker-deny-list`, or the `deny/` rows) is refused. `404` for a node the frontend has not seen since it started
 (a storage host without a daemon part has none). The listener offers `h2` and `http/1.1`; the
 updater's client speaks HTTP/1.1 with one request per connection.
 
@@ -564,13 +564,13 @@ then the frontends still route to it, and the other nodes already refuse its cop
 write it is the primary for fails in that window. The entries are in the map every node
 receives, which `GET /v1/members` does not show.
 
-**What it does not cut.** The entry is applied to the storage nodes and to the membership
-service, not to the worker listener: a daemon whose certificate is denied here loses its
-storage access but keeps its work stream, and goes on receiving actions (their commands,
-environments and input digests), and its blob calls on that listener are served, until it
-is listed in `--worker-deny-list`, the file that listener reads
-([worker-protocol.md](design/worker-protocol.md)). To take a daemon off the farm, list it in
-both. `GET /v1/denied` shows the list; `GET /v1/members` does not.
+**What it cuts.** The entry is applied to the storage nodes, the membership service and the
+worker listener: a daemon whose certificate or node is denied here is refused on its stream
+(`Hello`, `Heartbeat`, `Result`, ...), its open stream ends at its next message, and its blob
+calls on that listener are refused `PERMISSION_DENIED`. The listener reads these rows at every
+check beside `--worker-deny-list`; rows it cannot read refuse every check `UNAVAILABLE`. The
+file stays what it was: a list the listener alone reads, which takes effect without the state
+store. `GET /v1/denied` shows the list; `GET /v1/members` does not.
 
 **Locking yourself out.** An entry that names the frontend's own certificate (by serial or
 key, or a `node` that is the name in it) makes every storage node refuse the frontend. The
@@ -852,7 +852,7 @@ carries the SHA-256 of the root, and pins it.
 | `--enroll-cert-lifetime-secs=N` | certificate life, 3600 to 2592000 (default 604800); nodes renew at half. The signer's own `--lifetime-secs` must be at least this |
 | `--enroll-rate-per-minute=N`, `--enroll-rate-burst=N`, `--enroll-max-in-flight=N` | the limits below (defaults 60, 30, 64) |
 | `--enroll-worker-endpoint`, `--enroll-cas-endpoint`, `--enroll-storage-port` | what every node is told (`NodeConfig`) |
-| `--enroll-allow-unenforced-deny` | see the start gate |
+| `--enroll-allow-unenforced-deny` | does nothing (see the start gate); still accepted so existing units start, and removed in a later release |
 
 **The signer's socket.** `kbf-signer` runs as its own account and, alone, serves its Unix
 socket to `--frontend-uid` (the kernel's `SO_PEERCRED` user id of each connection; any other
@@ -943,13 +943,22 @@ its accept path. **The counts are in memory: they start again at a restart**, so
 process gives every source a full bucket. A call is
 ended after 30 seconds and a TLS handshake after its own deadline.
 
-**Start gate (design section 8.3).** Revoking a node refuses its renewal at once, but the
-deny rows it writes are enforced by storage and the worker listener only when the
-revocation unit lands (`enroll::gate::DENY_ENFORCED`, `false` in this build). Until then
-`--enroll-listen` is **refused at start** unless `--enroll-allow-unenforced-deny` is also
-given, which accepts that a revoked node is still served by storage until its certificate
-expires (at most `--enroll-cert-lifetime-secs`). The refusal happens before the CA
-directory or any socket is touched.
+**Revocation is enforced (design section 8.3).** Revoking a node refuses its renewal at
+once and writes its deny rows (`POST /v1/enroll/nodes/{id}/revoke`, above). Storage reads them
+through the membership map, and the **worker listener reads them at every check** beside
+`--worker-deny-list`: a revoked node's `Hello`, and its `Heartbeat`, `Result`, `NodeStatus`,
+`MapRequest` and `UpdateStatus` on an open stream, its REAPI worker calls and its blob calls
+are refused `PERMISSION_DENIED`, and its open stream ends at its next message (a heartbeat at
+the latest). The revoke also refreshes the membership map before it answers, so storage
+follows at once and not at the next membership refresh. Rows that cannot be read refuse every
+worker-listener check `UNAVAILABLE`: nobody is admitted on a list that could not be read.
+A revoked node no longer keeps working until its certificate expires. Taking its rows off the
+deny list (`DELETE /v1/denied?entry=...`, one call per entry the revoke listed) readmits the
+node, but a revoked node's id is burned for enrollment. Behind `--proxy-auth-file` only the
+`node` row can name a caller (the proxy forwards no serial or key).
+
+`--enroll-listen` therefore needs no acceptance, and `--enroll-allow-unenforced-deny` does
+nothing: a unit that still passes it starts as before.
 
 ### Operator steps
 
@@ -959,7 +968,7 @@ directory or any socket is touched.
    ```sh
    kbf --mode=frontend ... --state-store=<uri> --api-token-file /etc/kbf/api.token \
      --enroll-listen=0.0.0.0:7444 --frontend-name=kbf.example.com \
-     --ca-dir=/var/lib/kbf/ca --ca-dev-file-signer --enroll-allow-unenforced-deny
+     --ca-dir=/var/lib/kbf/ca --ca-dev-file-signer
    ```
 
 2. Make a token, on the frontend's host (the answer holds the token string once):
@@ -990,7 +999,8 @@ directory or any socket is touched.
    operator's choice.
 
 4. Revoke a node or a token with the routes above. A revoked node is refused `NodeRevoked`
-   on its next renewal.
+   on its next renewal, and from the moment the revoke answers its worker streams end and its
+   calls on the worker listener are refused (see above).
 
 ## `GET /v1/storage`
 

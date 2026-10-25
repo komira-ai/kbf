@@ -571,7 +571,7 @@ Counters use the store's C3 counters; the issued serial is random, not a counter
 
 ### 8.3 The deny path is the largest hidden dependency
 
-Revocation as designed needs three things that do not exist: a writer of `Map.denied`, storage-side enforcement, and a store-backed source for the worker listener. They are one unit (B3c) so they land with a test that denies a node and watches **a storage node** refuse it. **Gate.** B3b registers `--enroll-listen` but the frontend refuses to start with it unless the build carries the marker `DENY_ENFORCED`, which B3c sets in the same change that makes storage apply `Map.denied`; B3b's CI test asserts the refusal. So an enrollment listener cannot be switched on in production, by mistake, while a revoked node would still be served by storage. Until B3c merges, revocation is "refuse renewal and wait for expiry" plus the existing file deny list on the worker listener, and the operator guide must say so.
+Revocation needed three things: a writer of `Map.denied`, storage-side enforcement, and a store-backed source for the worker listener. All three have landed. The marker `DENY_ENFORCED` is `true`: the worker listener reads the `deny/` rows at every check beside `--worker-deny-list` and fails closed (UNAVAILABLE) when it cannot read them, and a revoke refreshes the membership map before it answers. `--enroll-allow-unenforced-deny` is accepted and does nothing; it is removed in a later release. (Earlier text: B3b registered `--enroll-listen` but the frontend refused to start with it unless the build carried the marker.)
 
 ### 8.4 Ports and URL
 

@@ -366,6 +366,7 @@ pub(crate) fn worker_peers(
                 .layer(WorkerRolesLayer::new(Admission::Certified)),
             Peers::Certified {
                 deny_list: tls.deny_list,
+                denied_rows: None,
             },
             Some(tls.server),
         ),
@@ -375,6 +376,7 @@ pub(crate) fn worker_peers(
                 .layer(WorkerRolesLayer::new(Admission::Certified)),
             Peers::Certified {
                 deny_list: behind.deny_list.clone(),
+                denied_rows: None,
             },
             None,
         ),
@@ -504,7 +506,7 @@ pub(crate) fn cold_store(
 
 fn admitted(peers: &Peers) -> (Admission, Option<DenyList>) {
     match peers {
-        Peers::Certified { deny_list } => (Admission::Certified, deny_list.clone()),
+        Peers::Certified { deny_list, .. } => (Admission::Certified, deny_list.clone()),
         Peers::Unauthenticated => (Admission::Open, None),
     }
 }
@@ -796,6 +798,8 @@ where
         listeners.worker_tls,
         proxy.as_ref(),
     );
+    // The rows a revocation writes, beside the file: a revoked daemon is refused here.
+    let peers = peers.with_denied_rows(members.clone());
     let tls_sources: Vec<TlsSource> = listeners
         .reapi_tls
         .iter()
