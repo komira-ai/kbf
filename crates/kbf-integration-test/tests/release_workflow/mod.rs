@@ -24,9 +24,13 @@
 //!   coordinator's address from the repository variable `KBF_COORDINATOR_URL` alone: no address
 //!   is written in the file and no other job reads the variable ([`DEPLOY_URL`]). Its one
 //!   `deploy-farm` step is given the release's version and that address, and has no `if:` (an
-//!   unset variable is a notice from the verb, not a skipped step).
+//!   unset variable is a notice from the verb, not a skipped step). It may join a Tailscale
+//!   network first, in one step of [`TS_ACTION`] after the build and before the verb, under
+//!   [`TS_IF`] and given exactly [`TS_WITH`] (repository variables; the run token, no secret).
+//!   No other job uses that action.
 //! - **Halt on red.** No `always()`, `failure()`, `cancelled()` or `continue-on-error`, and no
-//!   step under `if:` but the ones of `notes` that read the previous release.
+//!   step under `if:` but the ones of `notes` that read the previous release and the network
+//!   join of `deploy`.
 //! - **One commit.** The workflow sets `COMMIT` to the commit the pipeline run built and
 //!   `PIPELINE_RUN` to its id; every checkout is of that commit (a `ref` of exactly that, no
 //!   `repository` or `token`), and no expression reads `inputs.`, a pull request or `head_ref`,
@@ -59,6 +63,20 @@ const DEPLOY: &str = "deploy";
 /// The repository variable that holds the coordinator's address, and the one environment
 /// variable of `deploy` it is read into.
 const DEPLOY_URL: &str = "vars.KBF_COORDINATOR_URL";
+
+/// The action `deploy` joins a Tailscale network with, pinned by commit.
+const TS_ACTION: &str = "tailscale/github-action@";
+
+/// The one condition of the network join: the client id is set (unset, the step is skipped).
+const TS_IF: &str = "${{ vars.KBF_DEPLOY_TS_CLIENT_ID != '' }}";
+
+/// The inputs of the network join, all of them: workload identity federation with the run's
+/// token, so no `authkey` or `oauth-secret`.
+const TS_WITH: [(&str, &str); 3] = [
+    ("oauth-client-id", "${{ vars.KBF_DEPLOY_TS_CLIENT_ID }}"),
+    ("audience", "${{ vars.KBF_DEPLOY_TS_AUDIENCE }}"),
+    ("tags", "${{ vars.KBF_DEPLOY_TS_TAGS }}"),
+];
 
 /// The jobs, in file order.
 const JOBS: [&str; 7] = ["plan", "verify", "tag", "notes", PUBLISH, "bump", DEPLOY];
@@ -472,9 +490,11 @@ fn halting(release: &str, out: &mut Vec<String>) -> Result<(), String> {
                 .condition
                 .as_deref()
                 .is_some_and(|c| c == "${{ steps.previous.outputs.previous != '' }}");
-            if step.conditional && !(job == "notes" && previous) {
+            let join =
+                job == DEPLOY && uses(&step, TS_ACTION) && step.condition.as_deref() == Some(TS_IF);
+            if step.conditional && !(job == "notes" && previous) && !join {
                 out.push(format!(
-                    "a step of `{job}` ({:?}) is under `if:` or `continue-on-error:`: only the previous release's steps of `notes` may be",
+                    "a step of `{job}` ({:?}) is under `if:` or `continue-on-error:`: only the previous release's steps of `notes` and the network join of `deploy` may be",
                     step.name.as_deref().or(step.uses.as_deref()).unwrap_or("?")
                 ));
             }
@@ -981,9 +1001,10 @@ fn deploy_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
             "the job `{job}` reads a secret: it holds the run's OIDC token and nothing else"
         ));
     }
-    let Some((_, step, words)) = run_of(job, &steps, "cargo xtask deploy-farm ", out) else {
+    let Some((at, step, words)) = run_of(job, &steps, "cargo xtask deploy-farm ", out) else {
         return Ok(());
     };
+    tailnet_join(release, &steps, at, out)?;
     let verb = "cargo xtask deploy-farm";
     flag_is(&words, verb, "--url", "$COORDINATOR_URL", out);
     flag_is(&words, verb, "--ca-pem", "$COORDINATOR_CA", out);
@@ -1009,6 +1030,67 @@ fn deploy_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         "${{ needs.plan.outputs.version }}",
         out,
     );
+    Ok(())
+}
+
+/// The network join of `deploy`, if there is one: one step, after the build of xtask and before
+/// the verb (at `verb_at`), under [`TS_IF`], given exactly [`TS_WITH`]; and in no other job.
+fn tailnet_join(
+    release: &str,
+    steps: &[workflows::Step],
+    verb_at: usize,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    for job in JOBS.iter().filter(|j| **j != DEPLOY) {
+        if workflows::job_steps(release, job)?
+            .iter()
+            .any(|s| uses(s, TS_ACTION))
+        {
+            out.push(format!(
+                "the job `{job}` uses `{TS_ACTION}`: only `{DEPLOY}` joins the farm's network"
+            ));
+        }
+    }
+    let joins: Vec<usize> = (0..steps.len())
+        .filter(|&i| uses(&steps[i], TS_ACTION))
+        .collect();
+    if joins.len() > 1 {
+        out.push(format!(
+            "`{DEPLOY}` uses `{TS_ACTION}` {} times, not once",
+            joins.len()
+        ));
+    }
+    let built = steps.iter().position(|s| {
+        s.run
+            .as_deref()
+            .is_some_and(|r| r.trim() == "cargo build -p xtask --locked")
+    });
+    for &i in &joins {
+        let step = &steps[i];
+        if step.condition.as_deref() != Some(TS_IF) {
+            out.push(format!(
+                "the network join of `{DEPLOY}` is not under exactly `if: {TS_IF}`"
+            ));
+        }
+        let mut with: Vec<(&str, &str)> = step
+            .with
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        with.sort_unstable();
+        let mut want = TS_WITH.to_vec();
+        want.sort_unstable();
+        if with != want {
+            out.push(format!(
+                "the network join of `{DEPLOY}` is given {with:?}, not exactly {want:?}: the client id, audience and tags are repository variables, and the run token is its only credential"
+            ));
+        }
+        if i > verb_at || built.is_none_or(|b| i < b) {
+            out.push(format!(
+                "the network join of `{DEPLOY}` is not after `cargo build -p xtask` and before `cargo xtask deploy-farm`: the build's scripts would see the network, or the verb would run without it"
+            ));
+        }
+    }
     Ok(())
 }
 
