@@ -965,3 +965,56 @@ async fn a_stop_keeps_the_stream_of_an_operation_that_stopped_waiting() {
 async fn the_endpoints_drain_keeps_the_stream_of_an_operation_that_stopped_waiting() {
     an_operation_that_stopped_waiting_keeps_its_stream(Begin::Endpoint).await;
 }
+
+/// Asserts that another frontend's node that cannot run the operation (too small for its
+/// request, or of another platform) does not keep its stream: the operation still reads
+/// `Waiting`, and the stream ends at the end of the load balancer wait.
+async fn another_frontends_node_that_cannot_run_it_does_not_keep_the_stream(
+    how: Begin,
+    request: Request,
+) {
+    let rig = Rig::new(timing(10, 900));
+    let _other = other_frontend(&rig);
+    let ticket = submit(&rig.farm, request).expect("queued");
+    rig.farm.tick().await;
+    rig.farm.intake();
+    assert!(
+        matches!(*ticket.stage.borrow(), kbf_front::Stage::Waiting(_)),
+        "{how:?}: {:?}",
+        *ticket.stage.borrow()
+    );
+    let stream = follow(&rig, &ticket).await;
+    let stop = begin(&rig, how, Duration::MAX);
+
+    pass_feeding(&rig, 9).await;
+    assert!(!stream.is_finished(), "{how:?}: ended in the wait");
+    pass_feeding(&rig, 2).await;
+    let ended = stream.await.expect("task").expect_err("ended");
+    assert_eq!(ended.code(), Code::Unavailable, "{how:?}: {ended:?}");
+    tokio::time::timeout(Duration::from_secs(60), stop)
+        .await
+        .expect("the stop ends with the wait")
+        .expect("task");
+}
+
+#[tokio::test(start_paused = true)]
+async fn another_frontends_node_too_small_for_the_operation_does_not_keep_its_stream() {
+    for how in [Begin::Signal, Begin::Endpoint] {
+        let big = Request {
+            resources: Resources::new(64_000, 1 << 30),
+            ..request(1)
+        };
+        another_frontends_node_that_cannot_run_it_does_not_keep_the_stream(how, big).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn another_frontends_node_of_another_platform_does_not_keep_the_stream() {
+    for how in [Begin::Signal, Begin::Endpoint] {
+        let mac = Request {
+            needs: kbf_caps::Request::from_platform([("OSFamily", "macos")]).expect("platform"),
+            ..request(1)
+        };
+        another_frontends_node_that_cannot_run_it_does_not_keep_the_stream(how, mac).await;
+    }
+}

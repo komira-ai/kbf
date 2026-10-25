@@ -284,8 +284,15 @@ impl State {
 
     /// Reads the daemons of the other frontends from the `session/` rows, and tells the
     /// callers of the operations that wait for a worker whether one of them could run it
-    /// ([`State::republish_stuck`]).
+    /// ([`State::republish_stuck`]). Nothing needs the list unless an operation waits, so
+    /// with none the scan is skipped (a scan on top of the orphan sweep's, five times a
+    /// second). Accepted staleness: when an operation first waits, the list may be up to
+    /// one poll old, and the next poll's republish corrects its stage.
     fn look_at_remote_sessions(&mut self) {
+        if self.stuck.is_empty() {
+            self.intake.remote.clear();
+            return;
+        }
         let connected: BTreeSet<WorkerId> = self
             .links
             .iter()
