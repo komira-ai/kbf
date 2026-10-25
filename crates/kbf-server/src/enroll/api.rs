@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{PinSource, Random};
 use crate::api::{error, gate, json};
+use crate::members::Members;
 use crate::proxy_auth::Caller;
 use crate::token::ApiToken;
 
@@ -63,6 +64,9 @@ pub struct EnrollApi {
     store: Arc<dyn Store>,
     pins: Arc<dyn PinSource>,
     random: Arc<dyn Random>,
+    /// The membership, refreshed at once after a node revoke; `None` leaves that to the
+    /// sweeper's next beat.
+    members: Option<Arc<Members>>,
 }
 
 impl EnrollApi {
@@ -73,7 +77,17 @@ impl EnrollApi {
             store,
             pins,
             random,
+            members: None,
         }
+    }
+
+    /// The API refreshing `members` right after a node revoke, as `POST /v1/denied` does,
+    /// so the map storage nodes follow carries the new deny rows at once and not at the
+    /// next sweep.
+    #[must_use]
+    pub fn with_members(mut self, members: Option<Arc<Members>>) -> Self {
+        self.members = members;
+        self
     }
 }
 
@@ -400,6 +414,14 @@ fn revoke_node_by_id(api: &EnrollApi, id: &str) -> Result<NodeRevoked, Failure> 
         .parse::<NodeId>()
         .map_err(|_| Failure::new(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
     let denied = revoke_node(&*api.store, &parsed, OPERATOR)?;
+    // The rows are written and every check of the worker listener and of registration reads
+    // them; the map follows at once. A failure here changes no one's admission, and the
+    // sweeper's next beat does the same, so it is logged, not returned.
+    if let Some(members) = &api.members
+        && let Err(error) = members.refresh()
+    {
+        tracing::warn!(%error, node = %parsed, "refreshing the map after a node revoke failed; the next beat does it");
+    }
     Ok(NodeRevoked {
         id: parsed.to_string(),
         denied: denied.iter().map(ToString::to_string).collect(),

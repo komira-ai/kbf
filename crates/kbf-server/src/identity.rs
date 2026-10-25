@@ -41,9 +41,21 @@
 //! A storage node's `Register` and `Heartbeat` ([`crate::members_rpc`]) are checked against
 //! the same list by its certificate ([`DenyList::admit_cert`]): a listed serial or key,
 //! or any DNS name in it that is a listed node, is refused PERMISSION_DENIED, and an
-//! unusable list UNAVAILABLE. The file is this listener's only: the operator's list that
-//! the storage nodes enforce is the `deny/` rows of the state store ([`crate::members`]),
-//! carried to them in the map. Both are compared with a certificate through the one reader,
+//! unusable list UNAVAILABLE.
+//!
+//! **The store's rows.** The operator's list the storage nodes enforce is the `deny/` rows
+//! of the state store ([`crate::members`]): `POST /v1/denied`, and every node revoked through
+//! the enroll API (its id, its serials and its key hashes). The worker listener reads those
+//! rows at every check as well ([`Peers::with_denied_rows`]), and refuses what either the
+//! file or the rows name, with the same matchers. The rows are the membership's in-memory
+//! snapshot (no store read per check), as fresh as its newest refresh: a revoke and
+//! `POST /v1/denied` refresh before they answer, and the sweeper every beat. A refresh that
+//! fails keeps the earlier snapshot in use for [`DENY_SNAPSHOT_SWEEPS`] beats; after that, or
+//! before any refresh has read the rows, every check is refused UNAVAILABLE (fail closed), as
+//! an unusable file does. A corrupt `deny/` row makes every refresh fail, so it ends in that
+//! state until the row is repaired (see `docs/api.md`). A revoked daemon's stream therefore
+//! ends at its next message, and its blob calls are refused from the next call.
+//! Both are compared with a certificate through the one reader,
 //! `kbf_peer::identity_of` ([`PeerCert`] wraps it).
 //! Replace the file by renaming a new one over it: an in-place edit that keeps the
 //! size and lands within the filesystem's timestamp granularity may go unseen until
@@ -58,6 +70,7 @@ use kbf_peer::PeerIdentity;
 use tonic::Status;
 use tonic::codegen::http::Extensions;
 
+use crate::members::Members;
 use crate::proxy_auth::{Identity, Trust};
 
 /// What the server takes from a client certificate: the identity a deny entry is compared
@@ -185,10 +198,82 @@ pub enum Peers {
     Certified {
         /// Read again at every check.
         deny_list: Option<DenyList>,
+        /// The operator's `deny/` rows in the state store, which a node revocation writes;
+        /// read again at every check, and merged with the file's entries.
+        denied_rows: Option<DeniedRows>,
     },
 }
 
+/// How many membership sweeps old the deny list a refresh last read may be and still be
+/// used. The sweeper refreshes every beat ([`crate::members_rpc::sweep`]), so a refresh or
+/// two that fail (a store hiccup) change nothing, and one that keeps failing (the store
+/// down, or a corrupt `deny/` row) refuses every caller after this many.
+pub const DENY_SNAPSHOT_SWEEPS: u32 = 3;
+
+/// The `deny/` rows of the state store as the membership's newest refresh read them
+/// ([`Members::denied_snapshot`]): checked from memory at every call, never by a store read
+/// of its own. A revoke and `POST /v1/denied` refresh before they answer, and the sweeper
+/// refreshes every beat.
+#[derive(Clone)]
+pub struct DeniedRows {
+    members: Arc<Members>,
+    /// How old the snapshot may be: [`DENY_SNAPSHOT_SWEEPS`] beats.
+    max_age: std::time::Duration,
+}
+
+impl DeniedRows {
+    /// The rows `members` keeps.
+    #[must_use]
+    pub fn new(members: Arc<Members>) -> Self {
+        let max_age = members.config().beat() * DENY_SNAPSHOT_SWEEPS;
+        Self { members, max_age }
+    }
+
+    /// What the rows denied at the newest refresh that read them.
+    ///
+    /// # Errors
+    /// UNAVAILABLE: no refresh has read the rows yet, or the newest is older than
+    /// [`DENY_SNAPSHOT_SWEEPS`] beats: nobody is admitted on a list that may be out of date.
+    /// The text is fixed: the store's own error is not for a node.
+    fn current(&self) -> Result<Denied, Status> {
+        let unusable = |why: &str| {
+            tracing::error!(
+                why,
+                "the deny rows refuse every check until a refresh reads them"
+            );
+            Status::unavailable("the server's denied nodes could not be read")
+        };
+        let Some((rows, at)) = self.members.denied_snapshot() else {
+            return Err(unusable("no refresh has read them yet"));
+        };
+        if at.elapsed() > self.max_age {
+            return Err(unusable("the newest refresh that read them is too old"));
+        }
+        Ok(Denied::from_entries(rows.as_ref().clone()))
+    }
+}
+
+impl std::fmt::Debug for DeniedRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeniedRows")
+    }
+}
+
 impl Peers {
+    /// These peers, also refusing what the `deny/` rows of `members` name (the operator's
+    /// list and every node revoked through the enroll API), read at every check beside the
+    /// file. Plain-text peers are unchanged: they name no one.
+    #[must_use]
+    pub fn with_denied_rows(self, members: Option<Arc<Members>>) -> Self {
+        match (self, members) {
+            (Self::Certified { deny_list, .. }, Some(members)) => Self::Certified {
+                deny_list,
+                denied_rows: Some(DeniedRows::new(members)),
+            },
+            (peers, _) => peers,
+        }
+    }
+
     /// The certificate of a new stream or blob call, from the chain TLS verified (`leaf`
     /// is its first certificate; `None` in plain text). Its role was checked before the
     /// call was routed ([`crate::worker_roles`]).
@@ -233,13 +318,26 @@ impl Peers {
             peer.names(node_id)?;
         }
         let Self::Certified {
-            deny_list: Some(deny_list),
+            deny_list,
+            denied_rows,
         } = self
         else {
             return Ok(());
         };
-        let denied = deny_list.current().await.map_err(|e| unusable(&e))?;
-        match denied.refuses(peer, node_id) {
+        // Both sources are read before either answer is used: one that cannot be read
+        // is UNAVAILABLE even when the other would have refused.
+        let file = match deny_list {
+            Some(list) => Some(list.current().await.map_err(|e| unusable(&e))?),
+            None => None,
+        };
+        let rows = match denied_rows {
+            Some(rows) => Some(rows.current()?),
+            None => None,
+        };
+        let why = file
+            .and_then(|file| file.refuses(peer, node_id))
+            .or_else(|| rows.and_then(|rows| rows.refuses(peer, node_id)));
+        match why {
             Some(why) => Err(Status::permission_denied(format!("denied: {why}"))),
             None => Ok(()),
         }
@@ -428,6 +526,20 @@ impl Denied {
             }
         }
         Ok(denied)
+    }
+
+    /// The entries `rows` hold, as the matchers read them.
+    #[must_use]
+    pub fn from_entries(rows: Vec<DenyEntry>) -> Self {
+        let mut denied = Self::default();
+        for row in rows {
+            match row {
+                DenyEntry::Serial(v) => denied.serials.insert(v),
+                DenyEntry::SpkiSha256(v) => denied.spkis.insert(v),
+                DenyEntry::Node(v) => denied.nodes.insert(v),
+            };
+        }
+        denied
     }
 
     /// Why a stream with certificate `peer` speaking as `node_id` is denied, if it is: a

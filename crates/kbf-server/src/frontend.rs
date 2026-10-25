@@ -762,6 +762,8 @@ impl<'a> Prepared<'a> {
             listeners.worker_tls,
             proxy.as_ref(),
         );
+        // The rows a revocation writes, beside the file: a revoked daemon is refused here.
+        let peers = peers.with_denied_rows(members.clone());
         let tls_sources: Vec<TlsSource> = listeners
             .reapi_tls
             .iter()
@@ -799,7 +801,7 @@ impl<'a> Prepared<'a> {
                 let store = state_store
                     .clone()
                     .ok_or("--enroll-listen needs --state-store: the registry lives in it")?;
-                prepared.serve(store)
+                prepared.serve(store, members.clone())
             })
             .transpose()?;
         let (enroll_api, enroll_serve, enroll_renewal, enroll_tls) = match enrolled {
