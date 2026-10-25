@@ -244,9 +244,12 @@ fn names(text: &str) -> Vec<String> {
     names
 }
 
-/// What the journal says of the starts of `unit` since boot: how many the condition skipped
-/// (`was skipped because of an unmet condition check`) and how many began (`Starting ...`, which
-/// systemd logs only once the conditions hold).
+/// What the journal says of the starts of `unit` since boot: how many the condition skipped and how
+/// many began (`Starting ...`, which systemd logs only once the conditions hold). A skipped start
+/// is the line that says `unmet condition check`, which both systemds in the test images write:
+/// Ubuntu's 255 `... was skipped because of an unmet condition check (...)`, Fedora's 259
+/// `... skipped, unmet condition check ...`. (Not the message id: a skipped start is logged with
+/// the id of a started one, `JOB_RESULT=done`.)
 ///
 /// The journal and not `systemctl show -p ConditionResult`: systemd reports `no` for a unit that
 /// is inactive again, and a unit whose program ends at once (the test's stand-in for `kbf`, or a
@@ -256,7 +259,7 @@ fn starts(c: &mut Container, unit: &str) -> Result<(usize, usize), Error> {
     let log = c.say(&["journalctl", "-u", unit, "-o", "cat", "--no-pager"])?;
     let skipped = log
         .lines()
-        .filter(|l| l.contains("was skipped because of an unmet condition check"))
+        .filter(|l| l.contains("unmet condition check"))
         .count();
     let begun = log.lines().filter(|l| l.starts_with("Starting ")).count();
     Ok((skipped, begun))
