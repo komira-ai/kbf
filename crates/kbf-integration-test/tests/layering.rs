@@ -53,6 +53,9 @@
 //! - the `kbf` binary (`kbf-cli`) linking the proxy: `kbf setup` is built on the setup library
 //!   without its `proxy` feature (`kbf-installer` turns it on), so the tree of
 //!   `cargo build -p kbf-cli` holds `kbf-setup` and no `kbf-proxy`;
+//! - the packing client (`kbf-pack`) depending, directly or through another crate, on the
+//!   frontend, the server, the storage node or the daemon (`PACK_MUST_NOT_REACH`); and a walk
+//!   that cannot see `kbf-objstore` beneath it, which would make that check pass vacuously;
 //! - the hot/cold object store library (`tierstore`) depending, directly or through another
 //!   crate, on any other crate of this workspace, which would stop it from moving to a
 //!   repository of its own (its `s3` feature, off by default, adds the S3 client of
@@ -529,6 +532,46 @@ fn route_reaches_neither_the_frontend_nor_the_daemon() {
     assert!(
         violations.is_empty(),
         "kbf-route reaches a frontend or daemon crate:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// What the packing client's normal dependencies must not reach: the frontend's scheduler and
+/// authorization, the server and the storage node, and the daemon's side. A frontend uses the
+/// packing client, and a daemon will once the design wires it; a path to either side's code
+/// would make the other link it. The change that wires it into the daemon must also change
+/// `COLD_STORE_CLIENT`, as `kbf-pack` is written over `kbf-objstore`.
+const PACK_MUST_NOT_REACH: &[&str] = &[
+    "kbf-sched",
+    "kbf-auth",
+    "kbf-front",
+    "kbf-server",
+    "kbf-storage",
+    "kbf-transfer",
+    "kbf-node",
+    "kbf-daemon",
+    "kbf-cli",
+];
+
+/// Asserts that the packing client (`kbf-pack`) reaches neither the frontend nor the daemon,
+/// and that the walk sees the object store client it is written over, so the check does not
+/// pass on an empty walk.
+#[test]
+fn pack_reaches_neither_the_frontend_nor_the_daemon() {
+    let g = load_graph();
+    let (_, root) = g
+        .members
+        .get("kbf-pack")
+        .expect("kbf-pack is a workspace member");
+    assert!(root.is_some(), "kbf-pack must have a library target");
+    assert!(
+        !reaches(&g, "kbf-pack", &["kbf-objstore"]).is_empty(),
+        "kbf-pack's closure must reach kbf-objstore, or this walk proves nothing"
+    );
+    let violations = reaches(&g, "kbf-pack", PACK_MUST_NOT_REACH);
+    assert!(
+        violations.is_empty(),
+        "kbf-pack reaches a frontend or daemon crate:\n{}",
         violations.join("\n")
     );
 }
