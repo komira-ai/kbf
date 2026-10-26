@@ -7,7 +7,6 @@
 //! the guest must be off.
 
 use std::io::Cursor;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -90,24 +89,6 @@ fn run(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     }
 }
 
-fn put(root: &Path, f: &OfflineFile) -> Result<Value, String> {
-    let path = root.join(&f.path);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    std::fs::write(&path, &f.contents).map_err(|e| format!("write {}: {e}", path.display()))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(f.mode))
-        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
-    let meta = std::fs::metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
-    Ok(json!({
-        "path": f.path,
-        "uid": meta.uid(),
-        "gid": meta.gid(),
-        "mode": format!("{:o}", meta.mode() & 0o7777),
-        "bytes": meta.len(),
-    }))
-}
-
 /// Attaches `disk` (read-only when `readonly`), runs `f` on the Data volume, and detaches.
 /// Returns what `f` returned with the attach facts added.
 fn with_data_volume(
@@ -169,10 +150,7 @@ fn with_data_volume(
 /// A step failed; the image is detached whenever the attach worked.
 pub fn write(disk: &Path, files: &[OfflineFile]) -> Result<Value, String> {
     with_data_volume(disk, false, |root| {
-        let written = files
-            .iter()
-            .map(|f| put(root, f))
-            .collect::<Result<Vec<_>, _>>()?;
+        let written = crate::offline_put::put_all(root, files)?;
         Ok(json!({"written": written}))
     })
 }
