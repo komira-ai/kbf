@@ -247,7 +247,7 @@ impl<E: Exec> Linux<E> {
         let prefix = crate::mac::release::commit_prefix(version.as_str()).ok_or_else(|| {
             Fault::refused(
                 Code::UnknownRelease,
-                "the version carries no commit (+g and 12 hex digits)",
+                "the version carries no commit (+g or +, then 12 hex digits)",
             )
         })?;
         let trust: &Trust = &self.host.trust;

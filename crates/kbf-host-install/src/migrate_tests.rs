@@ -11,7 +11,7 @@ use kbf_installer::state::{Locked, State};
 
 use super::*;
 use crate::local::package_format::Format;
-use crate::local::package_tests::{A, Rig, a_version, both, bytes_of, put, sha256};
+use crate::local::package_tests::{A, Rig, a_version, both, bytes_of, deb_build, put, sha256};
 
 const UNIT: &str = "kbf-storage-and-daemon.service";
 
@@ -235,6 +235,24 @@ fn the_migration_installs_carries_the_flags_restarts_checks_and_only_then_remove
         // Only the unit migrated is restarted.
         assert_eq!(mig.rig.restarts(), [format!("restart:{UNIT}")]);
     });
+}
+
+/// The kbf deb of the host's own commit is migrated to although its version is the deb's real
+/// `<semver>+<12 hex>`, with no `g`: the 12 digits are read from it and equal the commit's.
+#[test]
+fn a_deb_of_the_hosts_commit_is_migrated_by_its_real_version_shape() {
+    let mig = Mig::new("mig-deb-version", Format::Deb);
+    let version = deb_build(A, 6);
+    let file = mig.rig.file_name(A);
+    let bytes = bytes_of("kbf", &version, mig.rig.format_arch());
+    fs::write(mig.files.join(&file), &bytes).unwrap();
+    let sums = format!("{}  {file}\n", sha256(&bytes));
+    mig.replace_release_file("SHA256SUMS", sums.as_bytes());
+
+    let (code, out, err) = mig.run(true);
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    assert!(out.ends_with(&format!("migrated: {UNIT} runs the kbf package\n")));
+    assert_eq!(mig.rig.installed(), Some(version));
 }
 
 /// A drop-in carries a flag-less unit's mode and a root unit's account; a unit that lists no
