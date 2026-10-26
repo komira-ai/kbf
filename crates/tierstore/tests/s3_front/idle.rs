@@ -1,7 +1,6 @@
 //! The idle limit on an answer over a real connection: the one test of it on a TCP stream. The
 //! other tests of the idle limit, of bodies and of answers, are in the crate, on a paused clock
 //! over in-memory pipes (`src/server/body_stall_tests.rs`, `src/server/drain_tests.rs`).
-
 //! The slow but steady reader is in `src/server/slow_reader_tests.rs`.
 use std::time::Duration;
 
@@ -42,6 +41,11 @@ async fn a_get_whose_client_stops_reading_is_closed_by_the_server() {
     let first = tokio::time::timeout(SAFETY, stream.read(&mut piece)).await;
     let read = first.unwrap().unwrap();
     assert!(read > 0);
+    // The client stops reading here. The server, unable to send for the idle time, closes the
+    // connection; the test waits for that close itself (the count of open connections falling
+    // to none), bounded only so that a server that never closes fails the test.
+    let closed = tokio::time::timeout(SAFETY, until_no_connection(&h)).await;
+    assert!(closed.is_ok());
     let mut received = piece[..read].to_vec();
     let ended = tokio::time::timeout(SAFETY, stream.read_to_end(&mut received)).await;
     assert!(ended.is_ok());
@@ -51,4 +55,12 @@ async fn a_get_whose_client_stops_reading_is_closed_by_the_server() {
     let drained = tokio::time::timeout(SAFETY, h.served).await;
     assert_eq!(drained.unwrap().unwrap(), Drained { abandoned: 0 });
     assert_eq!(h.server.open_connections(), 0);
+}
+
+/// Returns once the server has no connection open. It asks again after each yield to the
+/// runtime, never after a fixed time: the caller bounds the whole wait.
+async fn until_no_connection(h: &Harness) {
+    while h.server.open_connections() > 0 {
+        tokio::task::yield_now().await;
+    }
 }
