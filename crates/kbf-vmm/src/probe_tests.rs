@@ -155,12 +155,13 @@ fn waiting_for_a_file() {
         log: None,
     });
     let mut gone = vm(&sys, &work);
-    let began = std::time::Instant::now();
+    let before = sys.clock.now();
     assert!(
         gone.wait_file(&work.join("never"), Duration::from_secs(30), t)
             .is_none()
     );
-    assert!(began.elapsed() < Duration::from_secs(5));
+    // No time passed on the clock the wait reads, let alone the 30 s it was given.
+    assert_eq!(sys.clock.now(), before);
 }
 
 /// Catches a stop that reports success for a helper that had to be killed, and a kill
@@ -392,20 +393,21 @@ fn a_stop_event_ends_the_file_wait_and_says_why() {
     ] {
         sys.script(script);
         let mut v = vm(&sys, &work);
-        let began = std::time::Instant::now();
+        let before = sys.clock.now();
         assert!(
             v.wait_file(&work.join("never"), Duration::from_secs(60), t)
                 .is_none()
         );
-        assert!(began.elapsed() < Duration::from_secs(10), "{why}");
+        let used = sys.clock.now() - before;
+        assert!(used < Duration::from_secs(60), "{why}: waited {used:?}");
         assert_eq!(v.ended.as_deref(), Some(why));
-        // A second wait on the same VM does not start the time over.
-        let again = std::time::Instant::now();
+        // A second wait on the same VM does not start the time over: it ends at once.
+        let again = sys.clock.now();
         assert!(
             v.wait_file(&work.join("never"), Duration::from_secs(60), t)
                 .is_none()
         );
-        assert!(again.elapsed() < Duration::from_secs(10));
+        assert_eq!(sys.clock.now(), again, "{why}");
     }
     // A file written before the stop is still found.
     sys.script(Script::booted().then(Poll::Event(Event::Stopped { ms: 9 })));

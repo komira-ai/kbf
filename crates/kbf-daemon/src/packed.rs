@@ -35,7 +35,8 @@
 //! which streams it to a file, and is counted as read elsewhere.
 //!
 //! The counts of what was served and why a read went elsewhere are [`PackStats`], logged when
-//! the plane is dropped.
+//! the last plane and [`PackCounter`] counting into them are dropped. A daemon given the counter
+//! ([`crate::Daemon::with_pack_reads`]) sends the totals in every heartbeat.
 
 use std::fmt;
 use std::sync::Arc;
@@ -46,6 +47,7 @@ use futures::future::BoxFuture;
 use kbf_objstore::ObjectStore;
 use kbf_pack::{Fetch, ReadError, Reader};
 use kbf_proto::reapi::Digest;
+use kbf_proto::worker::PackReadCounts;
 use kbf_state::BlobDigest;
 use kbf_transfer::cas::{Cas, CasError, Chunks, Intake, label};
 use kbf_transfer::{Record, Spool};
@@ -120,6 +122,33 @@ impl fmt::Display for PackStats {
     }
 }
 
+impl From<PackStats> for PackReadCounts {
+    fn from(stats: PackStats) -> Self {
+        Self {
+            served: stats.served,
+            served_bytes: stats.served_bytes,
+            elsewhere: stats.elsewhere,
+            unasked: stats.unasked,
+            lost: stats.lost,
+            damaged: stats.damaged,
+        }
+    }
+}
+
+/// A handle on the counts of the [`PackedCas`] made with it ([`PackedCas::with_counter`]), and
+/// of every plane made from that one. The daemon holds one to put the counts in its heartbeats
+/// ([`crate::Daemon::with_pack_reads`]); a clone counts into the same totals.
+#[derive(Clone, Debug, Default)]
+pub struct PackCounter(Arc<Counts>);
+
+impl PackCounter {
+    /// What the planes counting into this handle have done so far.
+    #[must_use]
+    pub fn stats(&self) -> PackStats {
+        self.0.stats()
+    }
+}
+
 /// [`PackStats`] as they are counted; logged when the last handle on them goes.
 #[derive(Debug, Default)]
 struct Counts {
@@ -181,10 +210,17 @@ impl<C: Cas> PackedCas<C> {
     /// `inner`, with its reads going to `packs` first.
     #[must_use]
     pub fn new(inner: Arc<C>, packs: Arc<dyn PackReads>) -> Self {
+        Self::with_counter(inner, packs, &PackCounter::default())
+    }
+
+    /// [`Self::new`], counting into `counter`, which the caller keeps to read the counts
+    /// without the plane.
+    #[must_use]
+    pub fn with_counter(inner: Arc<C>, packs: Arc<dyn PackReads>, counter: &PackCounter) -> Self {
         Self {
             inner,
             packs,
-            counts: Arc::default(),
+            counts: Arc::clone(&counter.0),
             asking: Arc::new(Semaphore::new(MAX_ASKING)),
         }
     }

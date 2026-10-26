@@ -1714,3 +1714,82 @@ fn sums_over_the_limit_are_not_taken() {
         rig.assert_nothing_changed();
     });
 }
+
+// ---- a deb of the farm: `<semver>+<12 hex>`, with no `g` ----
+
+/// The version text a kbf deb carries today: the semver and the first 12 digits of the commit.
+/// The binaries of the same build say `+g<12 hex>`; the deb does not.
+pub(crate) fn deb_build(commit: &str, seq: u32) -> String {
+    format!("0.1.{seq}+{}", &commit[..12])
+}
+
+/// A host whose package database and releases all use the deb's real version shape.
+fn deb_rig(name: &str) -> Rig {
+    let rig = Rig::new(name, Format::Deb);
+    for (commit, seq) in [(COMMIT, 7), (A, 6), (C, 8)] {
+        rig.offer(commit, &deb_build(commit, seq));
+    }
+    rig.net.borrow_mut().installed = Some(deb_build(A, 6));
+    rig
+}
+
+/// The commit of a deb that no record names is read from its version, `+<12 hex>`, so a host
+/// that never staged the package that runs still says which release it is.
+#[test]
+fn the_current_release_of_a_deb_host_is_read_from_the_debs_version() {
+    let rig = deb_rig("deb-current");
+    assert_eq!(rig.backend.current().unwrap().as_deref(), Some(&A[..12]));
+}
+
+/// A package update on a host with a deb of the real version shape: the version the coordinator
+/// names is accepted, the release is fetched and checked against it, the package that runs
+/// (named by its own deb version) is kept for the way back, and the new one is installed and
+/// confirmed. This is the path a coordinator-driven update takes.
+#[test]
+fn a_deb_update_stages_keeps_the_running_package_switches_and_confirms() {
+    let rig = deb_rig("deb-update");
+    let now = Rc::new(std::cell::Cell::new(1_000_u64));
+    let ab = rig.ab(now);
+    let ask = |line: &str| ab.handle(&LocalRequest::parse(line).unwrap());
+    let (a, v) = (deb_build(A, 6), deb_build(COMMIT, 7));
+
+    assert!(matches!(
+        ask(&format!("install kbf={v} from stable")),
+        Answer::Staged { current: false, .. }
+    ));
+    assert!(rig.kept(COMMIT).exists());
+    assert!(matches!(
+        ask(&format!("switch kbf={v}")),
+        Answer::Switched { .. }
+    ));
+    assert!(rig.kept(A).exists(), "the package that ran is kept");
+    assert_eq!(rig.installed(), Some(v.clone()));
+    assert!(matches!(
+        ask(&format!("confirm kbf={v}")),
+        Answer::Confirmed { .. }
+    ));
+
+    // Back to the first deb, from the copy kept, with no new download.
+    let downloads = rig.count("download");
+    assert!(matches!(
+        ask(&format!("install kbf={a} from stable")),
+        Answer::Staged { current: false, .. }
+    ));
+    assert_eq!(rig.count("download"), downloads, "the kept copy is used");
+    assert_eq!(rig.record().files[COMMIT].version, v);
+    assert_eq!(rig.record().files[A].version, a);
+}
+
+/// A deb whose commit is not the one the request names is refused: the 12 digits are compared
+/// exactly, whether or not there is a `g`.
+#[test]
+fn a_deb_version_of_another_commit_is_not_the_release_asked_for() {
+    let rig = deb_rig("deb-other");
+    // The release of COMMIT holds a package that says it is the build of C.
+    rig.offer(COMMIT, &deb_build(C, 8));
+    let fault = rig.stage(&deb_build(COMMIT, 7)).unwrap_err();
+    assert!(fault.refused, "{}", fault.detail);
+    assert!(fault.detail.contains("not 0.1.7+"), "{}", fault.detail);
+    assert!(!rig.kept(COMMIT).exists());
+    assert!(rig.installs().is_empty());
+}

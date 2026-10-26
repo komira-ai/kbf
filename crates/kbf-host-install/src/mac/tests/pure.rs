@@ -242,7 +242,7 @@ fn the_configuration_check_command() {
 // ---- the release a version names ----
 
 #[test]
-fn a_version_names_the_commit_digits_after_plus_g() {
+fn a_version_names_the_commit_digits_after_the_last_plus() {
     for (version, want) in [
         ("0.1.7+gbbbbbbbbbbbb-3", Some("bbbbbbbbbbbb")),
         ("0.1.7+g0123456789ab", Some("0123456789ab")),
@@ -254,6 +254,19 @@ fn a_version_names_the_commit_digits_after_plus_g() {
         ("0.1.7+g0123456789ab.1", None),
         ("0.1.7-3", None),
         ("1.2.3-1", None),
+        // A deb's version has no `g`: `<semver>+<12 hex>`, with or without `-<run>`.
+        ("0.1.0+cb6f107dd94c", Some("cb6f107dd94c")),
+        ("0.1.7+0123456789ab-3", Some("0123456789ab")),
+        ("0.1.7~feat+0123456789ab-9", Some("0123456789ab")),
+        ("0.1.7+g0123456789ab+0123456789cd", Some("0123456789cd")),
+        ("0.1.7+0123456789a", None),
+        ("0.1.7+0123456789abc", None),
+        ("0.1.7+0123456789AB", None),
+        ("0.1.7+0123456789ax", None),
+        ("0.1.7+gg0123456789ab", None),
+        ("0.1.7+0123456789ab.1", None),
+        ("0.1.7+", None),
+        ("0123456789ab", None),
     ] {
         assert_eq!(commit_prefix(version), want, "{version}");
     }

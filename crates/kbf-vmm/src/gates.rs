@@ -115,7 +115,7 @@ pub(crate) fn start_guest_clone(
 fn guest_userspace_ms(ctx: &Ctx<'_>, vm: &mut Vm, share: &Share) -> Option<f64> {
     let marker = share.results().join(guest::READY_SYSTEM);
     vm.wait_file(&marker, ctx.timing.guest_timeout, ctx.timing.tick)
-        .map(|_| vm.began.elapsed().as_secs_f64() * 1000.0)
+        .map(|_| vm.since_spawn().as_secs_f64() * 1000.0)
 }
 
 /// Starts `count` clones of `prefix` with `identity` at once and judges each. "Booted"

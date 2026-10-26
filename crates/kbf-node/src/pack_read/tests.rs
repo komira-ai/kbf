@@ -3,7 +3,9 @@
 use std::os::unix::fs::PermissionsExt as _;
 
 use clap::Parser as _;
+use kbf_proto::reapi::Digest;
 use kbf_server::storage_half::StorageHalf;
+use kbf_transfer::CasError;
 
 use super::*;
 use crate::tests::{scratch, tls_files};
@@ -299,6 +301,70 @@ fn a_daemon_starts_with_the_packs_in_front_of_its_plane_or_is_refused() {
     let cli = daemon(&dir, &on(&open));
     let refused = crate::start(&cli).err().expect("refused");
     assert!(refused.to_string().contains("open.json"), "{refused}");
+    kbf_outputs::remove_tree(&dir).expect("clean");
+}
+
+/// Asserts that the daemon `start` makes with `--pack-read` is given the counter its data plane
+/// counts into, so its heartbeats carry the counts, and that without `--pack-read` it is given
+/// none, so its heartbeats carry none.
+#[test]
+fn a_daemon_carries_the_pack_counts_only_with_pack_read() {
+    let dir = scratch("pack-read-counts");
+    tls_files(&dir);
+    let path = keys(&dir, "keys.json", &pair(), 0o600);
+    let packed = crate::start(&daemon(&dir, &on(&path))).expect("starts");
+    let counted = packed.daemon.pack_reads().is_some();
+    drop(packed);
+    let plain = crate::start(&daemon(&dir, &[])).expect("starts");
+    let uncounted = plain.daemon.pack_reads().is_none();
+    drop(plain);
+    assert!(counted);
+    assert!(uncounted);
+    kbf_outputs::remove_tree(&dir).expect("clean");
+}
+
+/// A data plane that holds no blob.
+struct Empty;
+
+impl Cas for Empty {
+    type Lease = Arc<Self>;
+
+    fn lease(self: &Arc<Self>, _: &kbf_types::LeaseId) -> Arc<Self> {
+        Arc::clone(self)
+    }
+
+    async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
+        Err(CasError::Missing(digest.hash.clone()))
+    }
+
+    async fn put(&self, _: Vec<u8>) -> Result<Digest, CasError> {
+        Err(CasError::Unavailable("-".into(), "no CAS".into()))
+    }
+}
+
+/// Asserts that the plane `over` makes counts into the counter it is given: a read of a blob
+/// whose hash is no SHA-256 digest goes to the plane underneath and is counted as read
+/// elsewhere in that counter, and in nothing else.
+#[tokio::test]
+async fn the_plane_counts_into_the_counter_it_is_given() {
+    let dir = scratch("pack-read-over");
+    tls_files(&dir);
+    let path = keys(&dir, "keys.json", &pair(), 0o600);
+    let cli = daemon(&dir, &on(&path));
+    let settings = cli.pack_read.settings().expect("on");
+    let counter = PackCounter::default();
+    let empty = Arc::new(Empty);
+    let plane = over(&cli, &settings, empty, transfer::endpoint, &counter);
+    let plane = plane.expect("the plane");
+    let digest = Digest {
+        hash: "not-hex".to_owned(),
+        size_bytes: 1,
+    };
+    let read = plane.get(&digest).await;
+    assert!(matches!(read, Err(CasError::Missing(_))), "{read:?}");
+    let stats = counter.stats();
+    assert_eq!(stats.elsewhere, 1);
+    assert_eq!(stats.served + stats.unasked + stats.lost + stats.damaged, 0);
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
 

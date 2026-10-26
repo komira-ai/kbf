@@ -139,6 +139,21 @@ the whole farm, with no frontend to ask and no pack index, and refuse the flag. 
 what was read from packs, elsewhere, lost and damaged are logged when the daemon stops
 (`pack reads: ...`), and a lost or damaged blob is logged when it is found.
 
+The same counts ride every heartbeat of a daemon that has `--pack-read` (since the daemon
+process started; a daemon without the flag sends none), and the frontend its session is on
+exports the newest of each node on `GET /metrics` as `kbf_pack_daemon_served_total{node}`,
+`kbf_pack_daemon_served_bytes_total{node}`, `kbf_pack_daemon_elsewhere_total{node}`,
+`kbf_pack_daemon_unasked_total{node}`, `kbf_pack_daemon_lost_total{node}` and
+`kbf_pack_daemon_damaged_total{node}` ([api.md](../api.md#get-metrics) has what each counts
+and what a gone node shows). They are the gate for moving a farm to packs: the legacy reads
+are the frontend's `kbf_pack_read_fallbacks_total` plus the sum over nodes of
+`kbf_pack_daemon_elsewhere_total`, which must have stopped rising, and
+`kbf_pack_daemon_unasked_total` must stay flat (a rising one is the packs being skipped), and
+`kbf_pack_daemon_lost_total` and `kbf_pack_daemon_damaged_total` must stay 0. Reads of blobs
+over 64 MiB and of digests that are not SHA-256 are never asked of the packs and always count in
+`kbf_pack_daemon_elsewhere_total`, so the sum stops rising apart from those. A daemon is counted
+by the frontend its session is on, so the sums are taken over every frontend of the farm.
+
 The blobs the storage members flushed before the frontends wrote packs are in no pack the
 index knows, so a read of one still goes to the members. `kbf-pack-adopt`, an operator tool and
 a binary of its own, indexes those segments where they lie, with no byte copied and nothing

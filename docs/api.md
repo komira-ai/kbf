@@ -1542,6 +1542,36 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_commits_total` | counter | packs a daemon stored that `kbf.worker.v1.PackIndex/CommitPack` recorded in the pack index (a retry of a commit already recorded is not counted again) |
 | `kbf_pack_commit_rejects_total` | counter | commits of a pack refused with nothing recorded: the writer was not the caller, the name or the list of blobs was not one a daemon may commit, the pack was not in the store, a sampled blob was not its digest (`--pack-commit-sample`; alert on any), or the pack was recorded before with other contents. A store or an index that failed is UNAVAILABLE to the daemon and is not counted |
 
+**Pack reads by daemons.** A daemon started with `--pack-read` ([kbf-modes.md](deploy/kbf-modes.md))
+puts the counts of its pack reads in every heartbeat, and the frontend its worker stream is on
+keeps the newest of each node and exports them, one sample per node, labelled `node`. They
+are the counts of the daemon's process: they start again from 0 when it restarts, as any counter
+may. A node that sent none (a daemon without `--pack-read`, or one built before the field) has
+no sample, and with no node sending any the families are absent. A node whose stream has closed
+keeps the counts of its last heartbeat until the frontend restarts (a node's other facts are
+kept the same way); a node whose next heartbeat carries none, such as a daemon restarted without
+`--pack-read`, loses its samples. Each read of a blob counts in exactly one of served, elsewhere,
+unasked, lost and damaged.
+
+| Family | Type | What it measures |
+|---|---|---|
+| `kbf_pack_daemon_served_total{node}`, `kbf_pack_daemon_served_bytes_total{node}` | counter | blobs the node's daemon read from a pack, and their bytes |
+| `kbf_pack_daemon_elsewhere_total{node}` | counter | reads of a blob no pack holds (or that is not asked of the packs, or whose frontend serves no locations): answered by the storage nodes, as before packs |
+| `kbf_pack_daemon_unasked_total{node}` | counter | reads answered by the storage nodes because the packs could not be asked (the pack index or the pack store failed): the daemon is reading around the packs |
+| `kbf_pack_daemon_lost_total{node}` | counter | reads that failed because the pack the index names is gone or too short (UNAVAILABLE to the lease; alert on any) |
+| `kbf_pack_daemon_damaged_total{node}` | counter | reads that failed because the bytes in the pack are not the digest (never served; alert on any) |
+
+**The gate for moving a farm to packs.** The legacy reads are the reads that still go to the storage
+nodes for a blob a pack could hold: the frontend's `kbf_pack_read_fallbacks_total` plus the sum
+over nodes of `kbf_pack_daemon_elsewhere_total`. A farm has moved when that sum has stopped
+rising (`increase()` over a window longer than a build is 0), and `kbf_pack_daemon_unasked_total`,
+`kbf_pack_daemon_lost_total` and `kbf_pack_daemon_damaged_total` have stayed flat throughout
+(the last two at 0). A rising `kbf_pack_daemon_unasked_total` says the packs are being skipped,
+not that nothing is left on the nodes. A read of a blob over 64 MiB, or of one whose digest is
+not SHA-256, is never asked of the packs and always counts in `kbf_pack_daemon_elsewhere_total`,
+so a farm that reads such blobs has a sum that keeps rising: the criterion is that it has stopped
+rising apart from those reads.
+
 **Reading a stall with idle slots.** `kbf_sched_queued` high and `kbf_sched_leases` below the
 nodes' slots means work is waiting that placement cannot use (look at the node's booking and
 `GET /v1/nodes`). `kbf_sched_queued` low while buck2 has many Executes open means they have not

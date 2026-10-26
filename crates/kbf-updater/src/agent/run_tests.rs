@@ -19,7 +19,7 @@ use super::testing::{
     COMMIT_B, Events, FakeCoordinator, FakeDrain, FakeHealth, FakeLocal, VA, VB, host, version,
 };
 use crate::inventory::Role;
-use crate::ports::{Health, SystemClock};
+use crate::ports::{Health, PortError, SystemClock};
 use crate::wire::{Health as WireHealth, Heartbeat, Outcome, Reply};
 
 fn timing() -> Timing {
@@ -111,6 +111,15 @@ impl Rig {
 
     fn beats(&self) -> Vec<Heartbeat> {
         self.coordinator.beats()
+    }
+
+    fn logged_count(&self, needle: &str) -> usize {
+        self.logs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains(needle))
+            .count()
     }
 
     fn logged(&self, needle: &str) -> bool {
@@ -576,4 +585,75 @@ fn a_switch_the_helper_could_not_make_is_reported_failed_on_the_old_version() {
     assert_eq!(last.last_update.as_ref().unwrap().outcome, Outcome::Failed);
     assert_eq!(last.version.commit(), Some("aaaaaaaaaaaa"));
     assert_eq!(rig.events.count("local:confirm"), 0);
+}
+
+const NOT_ENROLLED: &str = "n1 is not an enrolled node";
+
+#[test]
+fn an_abandoned_health_answer_is_logged_once_and_the_status_is_unhealthy() {
+    let rig = Rig::new();
+    rig.health
+        .say(VA, vec![Ok(Health::Abandoned(NOT_ENROLLED.to_owned()))]);
+    let agent = rig.agent();
+    agent.refresh();
+    assert_eq!(agent.status().health, WireHealth::Unhealthy);
+    assert_eq!(rig.logged_count(NOT_ENROLLED), 1);
+}
+
+#[test]
+fn the_same_answer_on_the_next_refresh_is_not_logged_again() {
+    let rig = Rig::new();
+    rig.health
+        .say(VA, vec![Ok(Health::Abandoned(NOT_ENROLLED.to_owned()))]);
+    let agent = rig.agent();
+    agent.refresh();
+    agent.refresh();
+    assert_eq!(agent.status().health, WireHealth::Unhealthy);
+    assert_eq!(rig.logged_count(NOT_ENROLLED), 1);
+}
+
+#[test]
+fn a_waiting_answer_and_a_failed_check_are_logged_with_their_text() {
+    let rig = Rig::new();
+    rig.health.say(
+        VA,
+        vec![Ok(Health::Waiting("the swap is not done".to_owned()))],
+    );
+    let agent = rig.agent();
+    agent.refresh();
+    assert_eq!(rig.logged_count("the swap is not done"), 1);
+    rig.health
+        .say(VA, vec![Err(PortError::unreachable("connection refused"))]);
+    agent.refresh();
+    assert_eq!(agent.status().health, WireHealth::Unhealthy);
+    assert_eq!(rig.logged_count("connection refused"), 1);
+}
+
+#[test]
+fn healthy_again_is_logged_once() {
+    let rig = Rig::new();
+    rig.health
+        .say(VA, vec![Ok(Health::Abandoned(NOT_ENROLLED.to_owned()))]);
+    let agent = rig.agent();
+    agent.refresh();
+    rig.health.say(VA, vec![Ok(Health::Healthy)]);
+    agent.refresh();
+    agent.refresh();
+    assert_eq!(agent.status().health, WireHealth::Healthy);
+    assert_eq!(rig.logged_count("healthy again"), 1);
+}
+
+#[test]
+fn a_helper_that_reports_no_version_is_logged() {
+    let rig = Rig::new();
+    {
+        let mut world = rig.local.world();
+        world.state.version = None;
+        world.state.commit = None;
+    }
+    let agent = rig.agent();
+    agent.refresh();
+    agent.refresh();
+    assert_eq!(agent.status().health, WireHealth::Unhealthy);
+    assert_eq!(rig.logged_count("neither a version nor a known commit"), 1);
 }

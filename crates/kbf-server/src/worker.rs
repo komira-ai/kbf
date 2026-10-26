@@ -25,7 +25,8 @@
 //!   ([`crate::farm::ACK_WINDOW`]). A lease it lists that the
 //!   scheduler no longer holds on the node is sent a `Cancel` (issue #23). A lease it
 //!   leaves out that was lost to a restart past its farm reruns answers the
-//!   operation's callers;
+//!   operation's callers. The pack-read counts it carries, if any, are kept as the node's
+//!   newest for `/metrics` ([`Farm::note_pack_reads`]);
 //! - a `Result` the deny list now refuses ends the stream, so it never reaches the
 //!   action cache. Otherwise it is accepted only from the node holding the
 //!   operation's current lease, and only if the action it names (if any) is the one
@@ -320,6 +321,9 @@ impl Session {
                 self.peers
                     .admit(self.peer.as_ref(), worker.as_str())
                     .await?;
+                // Before the acknowledgement below, so a daemon that has been acknowledged
+                // has its counts on `/metrics`.
+                farm.note_pack_reads(worker, stream, beat.pack_reads);
                 let running = beat
                     .running
                     .iter()

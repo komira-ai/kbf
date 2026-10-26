@@ -448,6 +448,52 @@ async fn a_lease_reads_packs_and_counts_with_its_plane() {
     assert_eq!(lease.stats(), stats);
 }
 
+/// Asserts that a plane made with a counter counts into it, its leases' reads too, and that a
+/// clone of the counter reads the same totals; and that a plane made without one has a counter
+/// of its own, which reads what that plane counted.
+#[tokio::test]
+async fn a_plane_counts_into_the_counter_it_is_made_with() {
+    let held = Held::default();
+    let digest = held.insert(b"counted");
+    let counter = PackCounter::default();
+    let packs = Arc::new(Counting::default());
+    let cas = Arc::new(PackedCas::with_counter(Arc::new(held), packs, &counter));
+    assert_eq!(cas.get(&digest).await, Ok(b"counted".to_vec()));
+    let lease = cas.lease(&LeaseId::new(1, 2));
+    assert_eq!(lease.get(&digest).await, Ok(b"counted".to_vec()));
+    assert_eq!(counter.stats().elsewhere, 2);
+    assert_eq!(counter.clone().stats(), cas.stats());
+
+    let alone = PackedCas::new(Arc::new(Held::default()), Arc::new(Counting::default()));
+    let absent = digest_of(b"absent");
+    let missing = CasError::Missing(label(&absent));
+    assert_eq!(alone.get(&absent).await, Err(missing));
+    assert_eq!(alone.stats().elsewhere, 1);
+    assert_eq!(counter.stats().elsewhere, 2);
+}
+
+/// Asserts that the wire counts are the plane's counts, each in its own field.
+#[test]
+fn the_wire_counts_are_the_planes_counts() {
+    let stats = PackStats {
+        served: 5,
+        served_bytes: 4096,
+        elsewhere: 2,
+        unasked: 1,
+        lost: 3,
+        damaged: 4,
+    };
+    let want = PackReadCounts {
+        served: 5,
+        served_bytes: 4096,
+        elsewhere: 2,
+        unasked: 1,
+        lost: 3,
+        damaged: 4,
+    };
+    assert_eq!(PackReadCounts::from(stats), want);
+}
+
 /// Asserts the counts' text, which the plane logs when it is dropped.
 #[test]
 fn the_counts_are_spelled_for_the_log() {

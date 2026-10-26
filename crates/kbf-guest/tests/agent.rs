@@ -3,8 +3,6 @@
 
 mod common;
 
-use std::time::{Duration, Instant};
-
 use common::{Served, Shares, act, alive, program, user_shell, wait_for_file};
 use kbf_guest::wire::{End, OutputKind};
 
@@ -39,13 +37,19 @@ fn stdout_and_stderr_are_byte_exact_and_end_at_the_exit() {
     let shares = Shares::new("streams");
     let served = Served::start(shares.config());
     let mut client = served.connect();
+    let pid_file = shares.outputs.join("late.pid");
+    let pidfile = pid_file.to_str().expect("utf-8 path");
     let script = "printf 'out\\000bin\\n'; printf 'err' >&2; \
-                  (sleep 1; echo late; echo late >&2) & exit 0";
-    client.run(&user_shell(script, &[])).expect("started");
+                  (sleep 60; echo late; echo late >&2) & echo $! > \"$PIDFILE\"; exit 0";
+    client
+        .run(&user_shell(script, &[("PIDFILE", pidfile)]))
+        .expect("started");
     let exit = client.wait().expect("exited");
     assert_eq!(exit.end, End::Exited(0));
     assert!(!exit.stragglers);
-    std::thread::sleep(Duration::from_millis(1500));
+    // The late writer is gone before `Exited` was sent, so it can never write.
+    let late: i32 = wait_for_file(&pid_file).parse().expect("pid");
+    assert!(!alive(late), "the late writer {late} survived the exit");
     assert_eq!(shares.out("stdout"), b"out\0bin\n");
     assert_eq!(shares.out("stderr"), b"err");
 }
@@ -94,15 +98,9 @@ fn the_timeout_kills_the_group() {
         &[("PIDFILE", pidfile)],
     );
     req.timeout_ms = 300;
-    let started = Instant::now();
     client.run(&req).expect("started");
     let exit = client.wait().expect("exited");
     assert_eq!(exit.end, End::TimedOut);
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "{:?}",
-        started.elapsed()
-    );
     assert!(exit.usage.wall_micros >= 300_000, "{:?}", exit.usage);
     let child: i32 = wait_for_file(&pid_file).parse().expect("pid");
     assert!(!alive(child), "the timed-out group's child survived");

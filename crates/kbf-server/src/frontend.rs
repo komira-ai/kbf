@@ -883,6 +883,7 @@ impl<'a> Prepared<'a> {
             members.clone(),
             tls_sources,
             packs.clone(),
+            Arc::clone(&farm),
         ));
         // The storage health, if there are members.
         let api_routes = members.iter().fold(api_routes, |routes, members| {
@@ -1136,24 +1137,27 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
 
 /// `GET /metrics`: what the service counts, in the Prometheus text format, history's
 /// counters when it keeps history, the storage health of `members` when there are any, the
-/// reloads of the listeners' `tls` files, and the counters of the `packs` when there are any.
+/// reloads of the listeners' `tls` files, the counters of the `packs` when there are any, and
+/// the pack reads the daemons of `farm` report.
 fn metrics_route(
     backend: Backend,
     history: Option<Arc<crate::history::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
     packs: Option<Packs>,
+    farm: Arc<Farm>,
 ) -> axum::Router {
     let tls = Arc::new(tls);
     let render = move || {
         let (backend, members, tls) = (backend.clone(), members.clone(), Arc::clone(&tls));
-        let (history, packs) = (history.clone(), packs.clone());
+        let (history, packs, farm) = (history.clone(), packs.clone(), Arc::clone(&farm));
         async move {
             let mut text = backend.render_metrics();
             if let Some(history) = history {
                 history.render(&mut text);
             }
             Packs::render_metrics_of(packs.as_ref(), &mut text);
+            crate::pack_daemon_metrics::render(&mut text, &farm.pack_reads());
             crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);
             ([(CONTENT_TYPE, crate::metrics::TEXT_FORMAT)], text)
