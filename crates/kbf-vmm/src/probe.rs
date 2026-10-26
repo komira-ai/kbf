@@ -1,13 +1,14 @@
 //! What every probe shares: the context a probe runs in, running VMs and waiting on them.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use crate::bundle::{self, Identity};
 use crate::spec::{Event, VmSpec};
-use crate::system::{Poll, System, VmProcess};
+use crate::system::{Clock, Poll, System, VmProcess};
 
 /// How long the probes wait for each thing. The binary uses [`Timing::real`]; tests use
 /// [`Timing::instant`].
@@ -127,7 +128,9 @@ pub struct Vm {
     /// Why the helper's run ended before it was asked to, if it did: the terminal event
     /// or the helper's exit. A wait for the guest stops as soon as this is set.
     pub ended: Option<String>,
-    pub began: Instant,
+    /// The clock every wait of this VM reads, and its reading at the spawn.
+    clock: Arc<dyn Clock>,
+    began: Duration,
     gone: bool,
 }
 
@@ -174,13 +177,15 @@ impl Vm {
         run_as: Option<u32>,
     ) -> Result<Self, String> {
         let proc = sys.start_vm(spec, run_as)?;
+        let clock = sys.clock();
         Ok(Self {
             name: name.to_owned(),
             proc,
             events: Vec::new(),
             event_ms: Vec::new(),
             ended: None,
-            began: Instant::now(),
+            began: clock.now(),
+            clock,
             gone: false,
         })
     }
@@ -188,9 +193,9 @@ impl Vm {
     /// Reads helper events for up to `wait`, keeping them, until a terminal one (an error,
     /// a stop, the helper's end) or, when `until_started`, the `started` event.
     pub fn watch(&mut self, wait: Duration, tick: Duration, until_started: bool) -> Step {
-        let end = Instant::now() + wait;
+        let end = self.clock.now() + wait;
         loop {
-            let left = end.saturating_duration_since(Instant::now());
+            let left = end.saturating_sub(self.clock.now());
             if left.is_zero() {
                 return Step::Timeout;
             }
@@ -233,7 +238,13 @@ impl Vm {
     /// Milliseconds since the spawn.
     #[must_use]
     pub fn ms(&self) -> u64 {
-        u64::try_from(self.began.elapsed().as_millis()).unwrap_or(u64::MAX)
+        u64::try_from(self.since_spawn().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Time since the spawn, on the VM's clock.
+    #[must_use]
+    pub fn since_spawn(&self) -> Duration {
+        self.clock.now().saturating_sub(self.began)
     }
 
     /// Every helper event with the time it arrived, and why the run ended if it did.
@@ -286,13 +297,13 @@ impl Vm {
     /// early, with `None`, when the VM stops or errors or the helper exits (the guest
     /// will write nothing more): [`ended`](Self::ended) says why.
     pub fn wait_file(&mut self, path: &Path, wait: Duration, tick: Duration) -> Option<Duration> {
-        let began = Instant::now();
+        let began = self.clock.now();
         loop {
             // Existence only, without following a link the guest may have left.
             if std::fs::symlink_metadata(path).is_ok() {
-                return Some(began.elapsed());
+                return Some(self.clock.now().saturating_sub(began));
             }
-            if began.elapsed() >= wait || self.gone || self.ended.is_some() {
+            if self.clock.now().saturating_sub(began) >= wait || self.gone || self.ended.is_some() {
                 return None;
             }
             // Events keep arriving while the guest boots: keep them.
@@ -464,7 +475,8 @@ impl Ctx<'_> {
     /// # Errors
     /// The spawn failed, the start failed for another reason, or the window ran out.
     pub fn spawn_retrying(&self, name: &str, spec: &VmSpec) -> Result<Retried, String> {
-        let began = Instant::now();
+        let clock = self.sys.clock();
+        let began = clock.now();
         let mut attempts = 0;
         loop {
             attempts += 1;
@@ -474,15 +486,15 @@ impl Ctx<'_> {
                     return Ok(Retried {
                         vm,
                         attempts,
-                        waited: began.elapsed(),
+                        waited: clock.now().saturating_sub(began),
                     });
                 }
                 Step::Failed(b) if b.code.as_deref() == Some(crate::spec::LIMIT_EXCEEDED) => {
                     vm.proc.wait_gone(self.timing.tick);
-                    if began.elapsed() >= self.timing.retry_window {
+                    if clock.now().saturating_sub(began) >= self.timing.retry_window {
                         return Err(format!("still at the guest limit after {attempts} starts"));
                     }
-                    std::thread::sleep(self.timing.tick);
+                    clock.pause(self.timing.tick);
                 }
                 Step::Failed(b) => return Err(b.failure.unwrap_or_default()),
                 Step::Timeout => return Err("no started event in time".to_owned()),

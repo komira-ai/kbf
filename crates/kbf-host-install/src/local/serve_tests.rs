@@ -7,18 +7,21 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use kbf_testkit::dir::TestDir;
 use serde_json::{Value, json};
 
 use super::answer::{Answer, Code};
 use super::backend::Fault;
-use super::core_tests::{A, B, Fx, VA, VB};
+use super::core_tests::{A, B, Fx, VA, VB, World};
 use super::request::MAX_LINE_LEN;
 use super::serve::{Layout, ServeConfig, Serving, bind, passwd_ids, read_line};
+use crate::pace::fake::Fake;
+use crate::pace::{Now, Pace, real_now};
 use crate::trust::Trust;
 
 fn trust(dir: &Path) -> Trust {
@@ -258,6 +261,11 @@ fn audit_lines(fx: &Fx) -> Vec<Value> {
 
 /// Run `body` with a [`Serving`] over a fresh fake host; the log lines it wrote come back.
 fn with_serving(name: &str, body: impl FnOnce(&Fx, &Wire<'_>)) -> Vec<String> {
+    with_serving_paced(name, &Pace::real(), body)
+}
+
+/// [`with_serving`] on the clock `pace` tells.
+fn with_serving_paced(name: &str, pace: &Pace, body: impl FnOnce(&Fx, &Wire<'_>)) -> Vec<String> {
     let fx = Fx::new(name);
     let lines = RefCell::new(Vec::new());
     let log = |line: &str| lines.borrow_mut().push(line.to_owned());
@@ -268,6 +276,7 @@ fn with_serving(name: &str, body: impl FnOnce(&Fx, &Wire<'_>)) -> Vec<String> {
         trust: &trust,
         audit: &audit,
         log: &log,
+        pace,
     };
     body(&fx, &Wire { serving: &serving });
     lines.into_inner()
@@ -503,30 +512,37 @@ fn the_tick_logs_what_it_did() {
 
 /// A client that sends a byte now and then is cut off at the window for the whole line, not
 /// given a new window with every byte; a line sent at once, in pieces within the window, or
-/// too long, or not text, is read as it should be.
+/// too long, or not text, is read as it should be. Time here is made up: it moves a hundred
+/// milliseconds with every look at the clock, and the bytes are already there to be read, so
+/// what is asserted is how much of what the client sent was read before the window ended.
 #[test]
 fn a_client_that_trickles_is_cut_off_at_the_window_for_the_whole_line() {
     let window = Duration::from_millis(300);
     let (client, server) = UnixStream::pair().unwrap();
-    let slow = std::thread::spawn(move || {
-        for _ in 0..40 {
-            if (&client).write_all(b"q").is_err() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    });
-    let started = Instant::now();
-    assert_eq!(read_line(&server, window), None);
-    assert!(started.elapsed() < Duration::from_millis(1500));
-    drop(server);
-    slow.join().unwrap();
+    // 400 bytes and no end of line, the client still there: not too long to be refused for
+    // its length, and not over, so that only the window can end the read.
+    (&client).write_all(&[b'q'; 400]).unwrap();
+    let clock = Fake::stepping(Duration::from_millis(100));
+    assert_eq!(read_line(&server, window, &clock.now_fn()), None);
+    // Looks at 0 (the start), 100, 200 and 300 ms: two reads of 64 bytes, then the window is
+    // over and nothing more is read.
+    assert_eq!(clock.reads(), 4);
+    server.set_nonblocking(true).unwrap();
+    let mut rest = Vec::new();
+    let _ = (&server).read_to_end(&mut rest);
+    assert_eq!(
+        rest.len(),
+        400 - 2 * 64,
+        "what was not read when the window ended"
+    );
+    drop(client);
 
+    let now = real_now();
     let read = |bytes: &[u8]| {
         let (client, server) = UnixStream::pair().unwrap();
         (&client).write_all(bytes).unwrap();
         drop(client);
-        read_line(&server, window)
+        read_line(&server, window, &now)
     };
     assert_eq!(read(b"query\n").as_deref(), Some("query"));
     assert_eq!(read(b"query"), None, "no end of line");
@@ -537,22 +553,45 @@ fn a_client_that_trickles_is_cut_off_at_the_window_for_the_whole_line() {
     assert_eq!(read(&long).map(|l| l.len()), Some(MAX_LINE_LEN));
     long.insert(0, b'a');
     assert_eq!(read(&long), None, "one byte too many");
-    // In pieces, within the window.
+
+    // In pieces, within the window: the rest of the line arrives at the third look at the
+    // clock, 60 ms in, which is before the window is over.
     let (client, server) = UnixStream::pair().unwrap();
-    let pieces = std::thread::spawn(move || {
-        (&client).write_all(b"que").unwrap();
-        std::thread::sleep(Duration::from_millis(60));
-        (&client).write_all(b"ry\n").unwrap();
+    (&client).write_all(b"que").unwrap();
+    let looks = std::cell::Cell::new(0_u64);
+    let piecewise: Now = Box::new(move || {
+        let look = looks.get();
+        looks.set(look + 1);
+        if look == 2 {
+            (&client).write_all(b"ry\n").unwrap();
+        }
+        Duration::from_millis(30 * look)
     });
-    assert_eq!(read_line(&server, window).as_deref(), Some("query"));
-    pieces.join().unwrap();
+    assert_eq!(
+        read_line(&server, window, &piecewise).as_deref(),
+        Some("query")
+    );
+}
+
+/// How many times the fake backend was asked to revert.
+fn count_reverts(world: &RefCell<World>) -> usize {
+    world
+        .borrow()
+        .calls
+        .iter()
+        .filter(|c| *c == "revert")
+        .count()
 }
 
 /// A revert that fails with the release still on trial is tried again after a pause, not on
-/// every turn of the loop (and its unit restarted five times a second).
+/// every turn of the loop (and its unit restarted five times a second). The loop runs 160
+/// idle turns of 200 ms on a made-up clock, 32 seconds: the revert is tried on the first turn
+/// and not again by the 100th (20 s in), and tried once more when the 30 s pause is over.
 #[test]
 fn a_revert_that_fails_is_not_retried_on_every_turn() {
-    let logged = with_serving("sv-retry", |fx, wire| {
+    let clock = Fake::new();
+    let pace = clock.pace();
+    let logged = with_serving_paced("sv-retry", &pace, |fx, wire| {
         fx.ask(&format!("install kbf={VB} from stable"));
         fx.ask(&format!("switch kbf={VB}"));
         fx.clock.set(100_000);
@@ -568,27 +607,25 @@ fn a_revert_that_fails_is_not_retried_on_every_turn() {
         )
         .unwrap();
         let stop = Arc::new(AtomicBool::new(false));
-        let stopper = {
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(900));
-                stop.store(true, Ordering::Relaxed);
-            })
-        };
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        {
+            let (stop, seen, world) = (Arc::clone(&stop), Rc::clone(&seen), Rc::clone(&fx.world));
+            clock.on_sleep(move |turn| {
+                if turn == 100 {
+                    seen.borrow_mut().push(count_reverts(&world));
+                }
+                if turn == 160 {
+                    seen.borrow_mut().push(count_reverts(&world));
+                    stop.store(true, Ordering::Relaxed);
+                }
+            });
+        }
         wire.serving.run(&listener, &stop).unwrap();
-        stopper.join().unwrap();
-        let reverts = fx
-            .world
-            .borrow()
-            .calls
-            .iter()
-            .filter(|c| *c == "revert")
-            .count();
-        assert_eq!(reverts, 1);
+        assert_eq!(*seen.borrow(), [1, 2], "reverts by 20 s, and by 32 s");
         assert!(fx.query().pending.is_some(), "still on trial");
     });
-    // One attempt, said twice: the loop's line and the failure's.
-    assert_eq!(logged.len(), 2, "{logged:?}");
+    // Two attempts, each said twice: the loop's line and the failure's.
+    assert_eq!(logged.len(), 4, "{logged:?}");
 }
 
 /// `--frontend-container` is a flag with no value, given once, and it replaces the units: a

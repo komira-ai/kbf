@@ -38,6 +38,8 @@
 //! daemon half of `kbf storage-and-daemon` with a frontend reads blobs from the packs of the
 //! farm's object store first, finding them through the frontend's pack index; a blob it does
 //! not locate is read where it always was, and outputs are stored where they were.
+//! With `--pack-write` as well (off by default; `pack_read`) it writes its outputs into packs
+//! while the frontend takes pack commits.
 //!
 //! The log goes to stderr, in color only when stderr is a terminal: under launchd or
 //! systemd it is a file or a journal, where escape codes are noise (issue #170). The

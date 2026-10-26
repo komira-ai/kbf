@@ -49,12 +49,13 @@ fn injected() -> ObjectStoreError {
     }
 }
 
-/// A memory object store that claims what it is told to, whose writes fail when armed to, and
-/// whose range reads are logged.
+/// A memory object store that claims what it is told to, whose writes and range reads fail when
+/// armed to, and whose range reads are logged.
 pub struct Spy {
     inner: MemoryStore,
     claims: Capabilities,
     reject_puts: AtomicU32,
+    reject_reads: AtomicU32,
     puts: AtomicU32,
     ranges: Mutex<Vec<(String, u64, u64)>>,
 }
@@ -88,6 +89,7 @@ impl Spy {
             inner: MemoryStore::new(behaves),
             claims,
             reject_puts: AtomicU32::new(0),
+            reject_reads: AtomicU32::new(0),
             puts: AtomicU32::new(0),
             ranges: Mutex::new(Vec::new()),
         }
@@ -96,6 +98,11 @@ impl Spy {
     /// The next `n` writes fail before they store anything.
     pub fn reject_puts(&self, n: u32) {
         self.reject_puts.store(n, SeqCst);
+    }
+
+    /// The next `n` range reads fail (after they are logged).
+    pub fn reject_reads(&self, n: u32) {
+        self.reject_reads.store(n, SeqCst);
     }
 
     /// How many writes were tried.
@@ -161,6 +168,9 @@ impl ObjectStore for Spy {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(asked);
+        if fires(&self.reject_reads) {
+            return Err(injected());
+        }
         self.inner.get_range(key, range).await
     }
 

@@ -63,7 +63,7 @@ mod tests {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     /// Catches a timeout that is not applied (a silent peer would hold the listener for
     /// good) and a descriptor that is not a socket being reported as success.
@@ -71,10 +71,8 @@ mod tests {
     fn a_silent_peer_times_out_and_a_bad_descriptor_is_an_error() {
         let (mut a, _b) = UnixStream::pair().expect("pair");
         set_io_timeout(a.as_raw_fd(), Duration::from_millis(50)).expect("set");
-        let began = Instant::now();
         let e = a.read(&mut [0u8; 1]).expect_err("times out");
         assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
-        assert!(began.elapsed() < Duration::from_secs(5));
         assert_eq!(set_io_timeout(-1, Duration::from_secs(1)), Err(libc::EBADF));
     }
 

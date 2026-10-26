@@ -1,0 +1,45 @@
+# kbf.toml of frontend-b. Mounted at /etc/kbf/kbf.toml in the container.
+# Every key is a flag's long name; tables group them (kbf --mode=frontend --help).
+# All values here are placeholders: replace them with your own.
+# It is frontend-a.toml with nothing changed: the two frontends share all settings.
+
+mode = "frontend"
+
+[listener]
+# In a container the listeners must bind a reachable address, not loopback.
+listen = "0.0.0.0:8980"          # REAPI (Buck2)
+worker-listen = "0.0.0.0:8981"   # daemons and storage nodes, mutual TLS
+# Operator API, /healthz and /readyz. Envoy reaches it for health checks; do not
+# publish it. Writes need a loopback peer and the token below.
+api-listen = "0.0.0.0:8982"
+# A stop (SIGTERM) waits for open streams. 0 is no deadline. If you set one,
+# make it at least as long as your longest action.
+shutdown-timeout-secs = 0
+
+[tls]
+# REAPI: server certificate only. It must cover the name clients dial (the
+# load balancer's name, here "kbf.example.com").
+reapi-tls-cert = "/etc/kbf/tls/reapi.pem"
+reapi-tls-key = "/etc/kbf/tls/reapi.key"
+# Worker listener: mutual TLS. The three go together.
+worker-tls-cert = "/etc/kbf/tls/worker.pem"
+worker-tls-key = "/etc/kbf/tls/worker.key"
+worker-client-ca = "/etc/kbf/tls/farm-ca.pem"
+# A file holding the operator token (32 or more characters). It must be owned by
+# the user the container runs as, mode 0600 or 0400. Never put the token in this file.
+api-token-file = "/etc/kbf/secrets/operator-token"
+
+[scheduler]
+# The same value on every frontend. No password: kbf refuses one, and its Postgres
+# client does not speak TLS, so keep the database on a private network.
+state-store = "postgres://kbf@postgres/kbf"
+
+[storage-client]
+# The bootstrap storage node (a bare-metal node outside this compose); the
+# frontend learns the rest from the farm's storage map.
+storage = "https://storage-1.example.com:8983"
+# The frontend's own certificate toward storage; it names the role
+# urn:kbf:role:frontend.
+storage-client-cert = "/etc/kbf/tls/storage-client.pem"
+storage-client-key = "/etc/kbf/tls/storage-client.key"
+storage-ca = "/etc/kbf/tls/farm-ca.pem"

@@ -14,7 +14,7 @@
 use std::io::{self, IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
 use std::os::fd::{BorrowedFd, OwnedFd};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rustix::net::sockopt::{Timeout, set_socket_timeout};
 use rustix::net::{
@@ -232,9 +232,43 @@ pub fn recv_by<T: for<'de> Deserialize<'de>>(
     max_fds: usize,
     deadline: Instant,
 ) -> io::Result<Option<(T, Vec<OwnedFd>)>> {
-    recv_frame(socket, max_fds, Some(deadline))?
+    let origin = Instant::now();
+    recv_within(
+        socket,
+        max_fds,
+        deadline.saturating_duration_since(origin),
+        &|| origin.elapsed(),
+    )
+}
+
+/// A reading of a clock: time since an origin that does not change.
+pub type Now<'a> = &'a dyn Fn() -> Duration;
+
+/// [`recv_by`] with the deadline `within` after the call, on the clock `now`: the whole
+/// frame is due when `now()` reads `within` more than it did at the call, and each read
+/// waits only for what `now()` says is left. A test passes a clock it moves itself.
+///
+/// # Errors
+/// As [`recv_by`].
+pub fn recv_within<T: for<'de> Deserialize<'de>>(
+    socket: BorrowedFd<'_>,
+    max_fds: usize,
+    within: Duration,
+    now: Now<'_>,
+) -> io::Result<Option<(T, Vec<OwnedFd>)>> {
+    let due = Due {
+        by: now().saturating_add(within),
+        now,
+    };
+    recv_frame(socket, max_fds, Some(&due))?
         .map(|(body, fds)| Ok((serde_json::from_slice(&body)?, fds)))
         .transpose()
+}
+
+/// When a frame is due, and the clock that says what is left.
+struct Due<'a> {
+    by: Duration,
+    now: Now<'a>,
 }
 
 fn send_frame(socket: BorrowedFd<'_>, body: &[u8], fds: &[BorrowedFd<'_>]) -> io::Result<()> {
@@ -284,7 +318,7 @@ fn write_all(socket: BorrowedFd<'_>, mut rest: &[u8]) -> io::Result<()> {
 fn recv_frame(
     socket: BorrowedFd<'_>,
     max_fds: usize,
-    deadline: Option<Instant>,
+    deadline: Option<&Due<'_>>,
 ) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
     let mut fds = Vec::new();
     let mut header = [0u8; 4];
@@ -322,13 +356,13 @@ fn fill(
     socket: BorrowedFd<'_>,
     buf: &mut [u8],
     fds: &mut Vec<OwnedFd>,
-    deadline: Option<Instant>,
+    deadline: Option<&Due<'_>>,
 ) -> io::Result<usize> {
     let late = || io::Error::new(io::ErrorKind::TimedOut, "the deadline passed");
     let mut got = 0;
     while got < buf.len() {
         if let Some(deadline) = deadline {
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = deadline.by.saturating_sub((deadline.now)());
             if left.is_zero() {
                 return Err(late());
             }
@@ -543,10 +577,37 @@ mod tests {
         );
     }
 
-    /// Catches: `recv_by` waiting per read instead of to its deadline, checking the
-    /// deadline only after reading, the receive timeout set once rather than before
-    /// every read (a short read then restarts the full wait), or a plain `recv`'s own read timeout reported as a
-    /// passed deadline.
+    /// A clock that reads the next of `readings` (in ms) at each call and the last one
+    /// after that, and counts the calls: each call is one look at what is left, so a
+    /// test says when each read of the frame happens without waiting for it.
+    struct Script {
+        readings: Vec<u64>,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl Script {
+        fn new(readings: &[u64]) -> Self {
+            Self {
+                readings: readings.to_vec(),
+                calls: std::cell::Cell::new(0),
+            }
+        }
+        fn now(&self) -> std::time::Duration {
+            let at = self.calls.get();
+            self.calls.set(at + 1);
+            let ms = self.readings[at.min(self.readings.len() - 1)];
+            std::time::Duration::from_millis(ms)
+        }
+    }
+
+    fn receive_timeout(fd: BorrowedFd<'_>) -> Option<std::time::Duration> {
+        rustix::net::sockopt::socket_timeout(fd, rustix::net::sockopt::Timeout::Recv).unwrap()
+    }
+
+    /// Catches: `recv_by` checking the deadline only after reading, a deadline already
+    /// passed handed to the OS as a zero timeout (which means no timeout), a plain
+    /// `recv`'s own read timeout reported as a passed deadline, and a frame that
+    /// arrives in time not being read.
     #[test]
     fn recv_by_ends_at_its_deadline() {
         use std::time::Duration;
@@ -560,30 +621,9 @@ mod tests {
         assert_eq!(reply, Reply::Killed);
         // Half a frame, the rest never sent (`a` stays open): refused at the deadline.
         a.write_all(&frame[..6]).unwrap();
-        let start = Instant::now();
-        let deadline = start + Duration::from_millis(50);
+        let deadline = Instant::now() + Duration::from_millis(50);
         let late = recv_by::<Reply>(b.as_fd(), 0, deadline).unwrap_err();
         assert_eq!(late.kind(), io::ErrorKind::TimedOut, "{late}");
-        assert!(start.elapsed() < Duration::from_secs(5));
-        // Half a header 300 ms in, then nothing: the first read waits 300 ms and comes
-        // back short, so the next read may wait only the 200 ms left. A receive timeout
-        // set once, before the first read, would let it wait the whole 500 ms again.
-        let (mut a, b) = UnixStream::pair().unwrap();
-        let start = Instant::now();
-        let deadline = start + Duration::from_millis(500);
-        let writer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            a.write_all(&frame[..2]).unwrap();
-            a
-        });
-        let late = recv_by::<Reply>(b.as_fd(), 0, deadline).unwrap_err();
-        let elapsed = start.elapsed();
-        assert_eq!(late.kind(), io::ErrorKind::TimedOut, "{late}");
-        assert!(
-            elapsed < Duration::from_millis(600),
-            "the deadline was 500 ms, refused after {elapsed:?}"
-        );
-        drop(writer.join().unwrap());
         // Without a deadline, a read timeout set on the socket is its own error.
         let (_a, b) = UnixStream::pair().unwrap();
         b.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
@@ -591,12 +631,36 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
     }
 
+    /// Catches: a receive timeout set once, before the first read, rather than before
+    /// every read from what is left (a short read would then restart the full wait and
+    /// a trickling sender could stretch the deadline). Two bytes of a header are
+    /// queued; the clock reads 0 ms at the start and 30 ms when the second read looks
+    /// at what is left of 50 ms, so that read may wait 20 ms and no more.
+    #[test]
+    fn each_read_waits_only_for_what_is_left_of_the_deadline() {
+        use std::time::Duration;
+        let (mut a, b) = UnixStream::pair().unwrap();
+        a.write_all(&[0, 0]).unwrap();
+        // Readings: the start (0), the first look (0), the second look (30).
+        let clock = Script::new(&[0, 0, 30]);
+        let now = || clock.now();
+        let late = recv_within::<Reply>(b.as_fd(), 0, Duration::from_millis(50), &now).unwrap_err();
+        assert_eq!(late.kind(), io::ErrorKind::TimedOut, "{late}");
+        assert_eq!(clock.calls.get(), 3, "one look per read");
+        assert_eq!(receive_timeout(b.as_fd()), Some(Duration::from_millis(20)));
+        drop(a);
+    }
+
     /// Catches a receive that gives up when a signal interrupts it. With a receive
     /// timeout set, `recvmsg` is never restarted after a signal handler runs (Linux
     /// returns EINTR even under `SA_RESTART`): the read must be retried, to the same
-    /// deadline, not reported as an error.
+    /// deadline, not reported as an error. The first look at what is left allows 30 s
+    /// (a safety bound: nothing arrives, so only a signal ends that read); a signaller
+    /// interrupts it until the read has looked again, and the second look finds the
+    /// deadline passed.
     #[test]
     fn a_signal_does_not_end_recv_by() {
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
         extern "C" fn ignore(_: libc::c_int) {}
         // SAFETY: installs a handler that does nothing for a signal no other code of
@@ -614,22 +678,27 @@ mod tests {
         // which is joined below.
         let me = unsafe { libc::pthread_self() } as usize;
         let (_a, b) = UnixStream::pair().unwrap();
-        let start = Instant::now();
-        let deadline = start + Duration::from_millis(500);
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let stop = done.clone();
         let signaller = std::thread::spawn(move || {
-            for _ in 0..3 {
-                std::thread::sleep(Duration::from_millis(100));
+            while !stop.load(Ordering::SeqCst) {
                 // SAFETY: the receiving thread is alive until this thread is joined.
                 unsafe { libc::pthread_kill(me as libc::pthread_t, libc::SIGUSR2) };
+                std::thread::yield_now();
             }
         });
-        let late = recv_by::<Reply>(b.as_fd(), 0, deadline).unwrap_err();
-        let elapsed = start.elapsed();
+        // Readings: the start (0), the first look (0: 30 s left), the second look
+        // (after the interrupted read: past the 30 s deadline).
+        let clock = Script::new(&[0, 0, 30_000]);
+        let now = || clock.now();
+        let late = recv_within::<Reply>(b.as_fd(), 0, Duration::from_secs(30), &now).unwrap_err();
+        done.store(true, Ordering::SeqCst);
         signaller.join().unwrap();
         assert_eq!(late.kind(), io::ErrorKind::TimedOut, "{late}");
-        assert!(
-            elapsed >= Duration::from_millis(450),
-            "gave up after {elapsed:?}"
+        assert_eq!(
+            clock.calls.get(),
+            3,
+            "the read looked again after the signal"
         );
     }
 

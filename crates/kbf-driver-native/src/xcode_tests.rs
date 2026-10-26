@@ -8,6 +8,11 @@ use std::os::unix::fs::PermissionsExt as _;
 use kbf_proto::reapi::platform::Property;
 
 use super::*;
+use std::time::Instant;
+
+// The busy-program test, the only one that moves time, runs on Linux only.
+#[cfg(target_os = "linux")]
+use crate::pace::{Hooked, Manual, Pace};
 
 pub(crate) fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
     crate::unit_dir(&format!("xcode-{name}"))
@@ -1014,32 +1019,37 @@ fn a_busy_program_is_started_again_within_the_limit() {
     // Its interpreter is the act steps' link: run, it echoes its own path.
     std::fs::write(&program, format!("#!{} echo\n", act().display())).expect("script");
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    let held = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(200));
-        drop(writer);
+    // The writer is let go at the third pause between two starts; the waits after that,
+    // for the program's answer, are made in real time.
+    let writer = std::cell::RefCell::new(Some(writer));
+    let pace = Hooked::new(|pause| {
+        if pause == 3 {
+            writer.borrow_mut().take();
+        }
     });
-    let out = output_within(std::process::Command::new(&program), WITHIN, &dir).expect("answers");
+    let out =
+        output_paced(&pace, std::process::Command::new(&program), WITHIN, &dir).expect("answers");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         format!("{}\n", program.display())
     );
-    held.join().expect("closed");
+    assert!(
+        writer.borrow().is_none(),
+        "it started before the writer let go"
+    );
 
+    // Held for good, the program is retried until the limit, which the test's clock runs
+    // out without waiting, and then reported busy.
     let _writer = std::fs::OpenOptions::new()
         .append(true)
         .open(&program)
         .expect("open");
-    let started = Instant::now();
+    let pace = Manual::default();
     let limit = Duration::from_millis(300);
-    let busy = output_within(std::process::Command::new(&program), limit, &dir).expect_err("busy");
+    let busy =
+        output_paced(&pace, std::process::Command::new(&program), limit, &dir).expect_err("busy");
     assert_eq!(busy.raw_os_error(), Some(libc::ETXTBSY));
-    // Retrying a busy program stops at its own limit; one second covers the last
-    // retry and the spawn, not a host stall (this test has no hung fake).
-    let waited = started.elapsed();
-    assert!(
-        waited < limit + Duration::from_secs(1),
-        "waited past the limit: {waited:?}"
-    );
+    assert_eq!(pace.now(), limit, "retried at every look up to the limit");
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
 

@@ -6,6 +6,8 @@ a frontend is updated by taking it out of the pool, retiring it, restarting it a
 back, one at a time. The crate's API and the decisions behind it are in
 [kbf-proxy-api.md](kbf-proxy-api.md).
 
+The recommended way to update a frontend without failing a build is a load balancer in front of several frontends: [frontends-behind-a-load-balancer.md](../deploy/frontends-behind-a-load-balancer.md).
+
 Removed, and not described here any more: the proxy's two-slot supervision of frontend children
 (starting, adopting, swapping them, the hold of new streams during a swap, the routing of a
 `WaitExecution` by the old child's term, the update API at `/v1/update/frontend` and the

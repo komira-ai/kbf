@@ -8,6 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::probe::{Http, Probe, Reply, commit, ready};
+use crate::pace::{fake::Fake, real_now};
 
 /// A server that answers one connection with `answer`, then closes. The request it read.
 fn serve(answer: Vec<u8>) -> (SocketAddr, JoinHandle<String>) {
@@ -32,6 +33,7 @@ fn serve(answer: Vec<u8>) -> (SocketAddr, JoinHandle<String>) {
 fn http() -> Http {
     Http {
         limit: Duration::from_secs(5),
+        now: real_now(),
     }
 }
 
@@ -58,8 +60,7 @@ fn a_get_is_sent_and_the_status_and_body_come_back() {
     assert_eq!(http().get(addr, "/readyz").unwrap().status, 503);
 }
 
-/// An answer that is not an HTTP/1 response is an error, and so is a server that is not there
-/// or does not finish in time.
+/// An answer that is not an HTTP/1 response is an error, and so is a server that is not there.
 #[test]
 fn what_is_not_an_http_answer_is_an_error() {
     for bad in [
@@ -79,35 +80,65 @@ fn what_is_not_an_http_answer_is_an_error() {
     let addr = gone.local_addr().unwrap();
     drop(gone);
     assert!(http().get(addr, "/readyz").unwrap_err().contains("/readyz"));
+}
 
-    // A server that accepts and says nothing: the call ends at its limit.
+/// A call is given a limit for all of it, counted on the clock the probe was given. The limit
+/// here is an hour and the clock jumps past it, so that nothing real is waited for: a call
+/// whose time is up is an error before it reads again, with the server still silent, and one
+/// whose answer keeps coming is cut at the limit, after as many reads as the time allowed.
+#[test]
+fn a_call_ends_at_its_limit_on_the_clock_it_was_given() {
+    let hour = Duration::from_secs(3600);
+
+    // A server that accepts and says nothing until the call has ended. The first reading is
+    // the start of the call; the second, after the connection, is two hours later.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let (release, released) = std::sync::mpsc::channel::<()>();
     let silent = thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        thread::sleep(Duration::from_millis(600));
+        let _ = released.recv();
         drop(stream);
     });
-    let quick = Http {
-        limit: Duration::from_millis(150),
+    let clock = Fake::stepping(2 * hour);
+    let silent_probe = Http {
+        limit: hour,
+        now: clock.now_fn(),
     };
-    assert!(quick.get(addr, "/readyz").is_err());
+    let why = silent_probe.get(addr, "/readyz").unwrap_err();
+    assert!(why.contains("/readyz"), "{why}");
+    assert_eq!(
+        clock.reads(),
+        2,
+        "the start, and the one look at what was left"
+    );
+    release.send(()).unwrap();
     silent.join().unwrap();
 
-    // One that drips its answer for longer than the limit.
+    // One whose answer never ends (more than a read takes at a time) and has no end of head:
+    // each look at the clock is twenty minutes later, so the fourth finds the hour up.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let dripping = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        for _ in 0..30 {
-            if stream.write_all(b"X").is_err() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
+        let _ = stream.write_all(&[b'X'; 60 * 1024]);
     });
-    let why = quick.get(addr, "/readyz").unwrap_err();
+    let clock = Fake::stepping(hour / 3);
+    let dripped = Http {
+        limit: hour,
+        now: clock.now_fn(),
+    };
+    let why = dripped.get(addr, "/readyz").unwrap_err();
     assert!(why.contains("/readyz"), "{why}");
+    assert!(
+        !why.contains("not an HTTP response"),
+        "cut at the limit, not read to the end: {why}"
+    );
+    assert_eq!(
+        clock.reads(),
+        4,
+        "the start, two reads, and the look that found the hour up"
+    );
     dripping.join().unwrap();
 }
 

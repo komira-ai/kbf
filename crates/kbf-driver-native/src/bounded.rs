@@ -2,7 +2,9 @@
 
 use std::io::Read as _;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::pace::{Pace, Wall};
 
 /// How long the output of a child that has exited is waited for.
 const REAP: Duration = Duration::from_secs(2);
@@ -10,6 +12,11 @@ const REAP: Duration = Duration::from_secs(2);
 /// The stdout of `command` (stdin closed, stderr dropped) if it exits with success within
 /// `within`; `Err(true)` if it was still running then (it is killed and reaped on another thread), `Err(false)` if it could not be started, failed, or exited with an error.
 pub(crate) fn stdout_within(command: &mut Command, within: Duration) -> Result<Vec<u8>, bool> {
+    stdout_paced(&Wall::new(), command, within)
+}
+
+/// [`stdout_within`] with the deadline read on `pace`.
+fn stdout_paced(pace: &dyn Pace, command: &mut Command, within: Duration) -> Result<Vec<u8>, bool> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -25,14 +32,14 @@ pub(crate) fn stdout_within(command: &mut Command, within: Duration) -> Result<V
         let _ = stdout.read_to_end(&mut text);
         let _ = sent.send(text);
     });
-    let give_up = Instant::now() + within;
+    let give_up = pace.now() + within;
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
                 return Ok(received.recv_timeout(REAP).unwrap_or_default());
             }
             Ok(Some(_)) | Err(_) => return Err(false),
-            Ok(None) if Instant::now() < give_up => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) if pace.now() < give_up => pace.pause(Duration::from_millis(10)),
             Ok(None) => {
                 // Reaped off this thread: a process stuck in the kernel is waited for
                 // there, not here.
@@ -49,18 +56,23 @@ pub(crate) fn stdout_within(command: &mut Command, within: Duration) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pace::Manual;
 
     /// Catches a read that waits for a hung command (a lease end or a slot clean would
-    /// hang with it): `sleep 30` is cut off near the deadline, reported as timed out,
-    /// and not left running.
+    /// hang with it): `sleep 30` is cut off at the deadline, reported as timed out. The
+    /// deadline is read on the test's clock, so the call is cut off at exactly the
+    /// 300 ms, not before and not later, and the test does not wait for it; a `sleep 30`
+    /// cannot exit in the instant that clock takes to run it out.
     #[test]
     fn a_command_that_hangs_is_cut_off_at_the_deadline() {
-        let started = Instant::now();
-        let got = stdout_within(Command::new("sleep").arg("30"), Duration::from_millis(300));
+        let pace = Manual::default();
+        let got = stdout_paced(
+            &pace,
+            Command::new("sleep").arg("30"),
+            Duration::from_millis(300),
+        );
         assert_eq!(got, Err(true));
-        let took = started.elapsed();
-        assert!(took >= Duration::from_millis(300), "{took:?}");
-        assert!(took < Duration::from_secs(5), "not cut off: {took:?}");
+        assert_eq!(pace.now(), Duration::from_millis(300));
     }
 
     /// Catches a command that cannot be started taken for a timeout (a caller would

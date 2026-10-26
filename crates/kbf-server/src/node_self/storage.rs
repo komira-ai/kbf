@@ -337,6 +337,45 @@ mod tests {
         }
     }
 
+    /// A node adopted into the registry, with the address one member registered, is shown that
+    /// member (id, state, build) as an enrolled node is: the join reads the registry's
+    /// advertise address and the adopted row holds one. Catches a join that skips rows with
+    /// no certificate and so answers `unknown_node` for a node provisioned by hand.
+    #[test]
+    fn an_adopted_node_sees_the_member_at_its_address() {
+        let clock = Arc::new(kbf_state::ManualClock::default());
+        let store = kbf_state::fake::Fake::with_flaw(clock, kbf_state::fake::Flaw::None);
+        let roles = kbf_types::RoleSet::new([kbf_types::Role::Storage]).expect("roles");
+        let id = "st1".parse().expect("node id");
+        // Before the adoption the registry does not know the node.
+        let before = own_view(
+            &WorkerId::new("st1"),
+            &crate::storage_gate::advertised(&store).expect("read"),
+            &members(),
+            &BTreeMap::new(),
+            &health(2, Some(0)),
+        );
+        assert_eq!(before.half, Half::UnknownNode);
+        kbf_enroll_registry::adopt_node(&store, &id, roles, "192.0.2.1:8982").expect("adopt");
+        let commits = BTreeMap::from([(MemberId(1), Some("abc123".to_owned()))]);
+        let own = own_view(
+            &WorkerId::new("st1"),
+            &crate::storage_gate::advertised(&store).expect("read"),
+            &members(),
+            &commits,
+            &health(2, Some(0)),
+        );
+        assert_eq!(own.half, Half::Member);
+        assert_eq!(
+            own.member,
+            Some(OwnMember {
+                id: 1,
+                state: "active",
+                build_commit: Some("abc123".to_owned())
+            })
+        );
+    }
+
     async fn body(answer: Response) -> (StatusCode, serde_json::Value) {
         let code = answer.status();
         let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX)

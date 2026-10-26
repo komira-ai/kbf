@@ -3,8 +3,8 @@
 //! The pack index lives in the frontends' shared state store, and a daemon opens no connection
 //! to it. [`RemoteIndex`] is `kbf_state::PackIndex` over the frontend's worker listener
 //! (`kbf.worker.v1.PackIndex/Locate`), for `kbf_pack::Reader`, which asks the index where a blob
-//! lies and then reads that range of that pack from the object store. It **locates and does
-//! nothing else**:
+//! lies and then reads that range of that pack from the object store, and for `kbf_pack::Packer`,
+//! which records the packs a daemon stored. It **locates and commits, and does nothing else**:
 //!
 //! - [`PackIndex::locate`] asks the frontend. A frontend that serves nothing (it was started
 //!   without `--pack-index`: UNIMPLEMENTED) or is not there (UNAVAILABLE) has no location to
@@ -14,8 +14,18 @@
 //! - [`PackIndex::find_missing`] is the digests `locate` has no place for.
 //! - [`PackIndex::touch`] touches nothing and says so: a daemon does not record the use of a
 //!   blob (retention sees the frontends' reads only).
-//! - Recording a pack and the garbage-collection queries are refused: a daemon writes no pack
-//!   with this index (a later change, which commits through the frontend).
+//! - [`PackIndex::record_pack`] commits a pack the daemon stored in the object store, through
+//!   the frontend (`kbf.worker.v1.PackIndex/CommitPack`; the writer is the node id, which is the
+//!   `d/<node>` of the pack's writer name without its kind). The frontend checks a sample of the
+//!   pack's blobs and records the pack, or refuses. A frontend that has no pack store answers
+//!   UNIMPLEMENTED, which is [`PackIndexError::Unsupported`]; a key that is recorded with other
+//!   contents is [`PackIndexError::Conflict`]; a status that a repeat does not change
+//!   (PERMISSION_DENIED, INVALID_ARGUMENT) is [`PackIndexError::Refused`]; every other failure
+//!   is the call's store error, with the status in its text. `kbf_pack::Packer` tries a record
+//!   again after the last kind only. Only a daemon told by the frontend's `Welcome` that it
+//!   takes the call should make it.
+//! - The garbage-collection queries and [`PackIndex::pack`] are refused: a daemon is not the
+//!   index's keeper.
 //!
 //! The trait's calls block, and `kbf_pack::Reader` makes them on the runtime's blocking pool, so
 //! a call waits for the frontend's answer on a [`Handle`] of that runtime. It must not be made
@@ -26,7 +36,9 @@ use std::time::Duration;
 
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::pack_index_client::PackIndexClient;
-use kbf_proto::worker::{PackLocateRequest, PackLocateResponse, PackLocation};
+use kbf_proto::worker::{
+    CommitPackRequest, PackLocateRequest, PackLocateResponse, PackLocation, PackedBlob,
+};
 use kbf_state::{
     BlobDigest, Location, MAX_BATCH, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
     StoreError,
@@ -41,8 +53,13 @@ use tonic::{Code, Request, Status};
 /// where it was before.
 pub const LOCATE_WITHIN: Duration = Duration::from_secs(5);
 
+/// How long one `CommitPack` call may take before it fails: the frontend checks a sample of the
+/// pack's blobs against the object store before it records the pack, so a call takes longer than
+/// a `Locate`. A commit that times out is sent again by the packer.
+pub const COMMIT_WITHIN: Duration = Duration::from_secs(30);
+
 /// What the methods of the index that a daemon does not have are refused with.
-const LOCATE_ONLY: &str = "a daemon's pack index only locates blobs";
+const NOT_KEPT: &str = "a daemon's pack index only locates blobs and commits packs";
 
 /// The frontend's pack index, reached over the worker listener (the module docs).
 pub struct RemoteIndex {
@@ -84,6 +101,36 @@ impl RemoteIndex {
         }
     }
 
+    /// One `CommitPack` call for `pack`, written by the node `node`.
+    async fn commit(&self, node: &str, pack: &NewPack) -> Result<Recorded, PackIndexError> {
+        let blobs = pack
+            .blobs
+            .iter()
+            .map(|blob| PackedBlob {
+                digest: Some(wire(&blob.digest)),
+                offset: blob.offset,
+            })
+            .collect();
+        let mut request = Request::new(CommitPackRequest {
+            pack: pack.key.clone(),
+            size: pack.size,
+            blobs,
+            writer: node.to_owned(),
+        });
+        request.set_timeout(COMMIT_WITHIN);
+        let mut client = self.client.clone();
+        match client.commit_pack(request).await {
+            Ok(answer) => {
+                let answer = answer.into_inner();
+                Ok(Recorded {
+                    created: answer.created,
+                    indexed: answer.indexed,
+                })
+            }
+            Err(status) => Err(commit_failed(&status, &pack.key)),
+        }
+    }
+
     /// Logs that the frontend serves no locations, the first time after it did.
     fn say_unserved(&self, status: &Status) {
         if !self.unserved.swap(true, Ordering::Relaxed) {
@@ -97,12 +144,16 @@ impl RemoteIndex {
 }
 
 impl PackIndex for RemoteIndex {
-    fn record_pack(&self, _: &NewPack) -> Result<Recorded, PackIndexError> {
-        Err(failed(LOCATE_ONLY.to_owned()))
+    fn record_pack(&self, pack: &NewPack) -> Result<Recorded, PackIndexError> {
+        let node = pack
+            .writer
+            .strip_prefix(DAEMON_WRITER)
+            .ok_or_else(|| failed(format!("{:?} is not a daemon's writer name", pack.writer)))?;
+        self.runtime.block_on(self.commit(node, pack))
     }
 
     fn pack(&self, _: &str) -> Result<Option<PackInfo>, PackIndexError> {
-        Err(failed(LOCATE_ONLY.to_owned()))
+        Err(failed(NOT_KEPT.to_owned()))
     }
 
     fn locate(&self, digests: &[BlobDigest]) -> Result<Vec<Option<Location>>, PackIndexError> {
@@ -130,11 +181,11 @@ impl PackIndex for RemoteIndex {
     }
 
     fn dead_packs(&self, _: Duration, _: usize) -> Result<Vec<PackInfo>, PackIndexError> {
-        Err(failed(LOCATE_ONLY.to_owned()))
+        Err(failed(NOT_KEPT.to_owned()))
     }
 
     fn unreferenced_keys(&self, _: &[String]) -> Result<Vec<String>, PackIndexError> {
-        Err(failed(LOCATE_ONLY.to_owned()))
+        Err(failed(NOT_KEPT.to_owned()))
     }
 }
 
@@ -149,8 +200,26 @@ fn failed(why: String) -> PackIndexError {
     PackIndexError::Store(StoreError::Failed(why))
 }
 
+/// The writer name a daemon's packs carry in the index (`kbf_pack::PackKeys::writer`): the kind
+/// `d`, a slash, and the node id.
+const DAEMON_WRITER: &str = "d/";
+
+/// The index's error for a failed `CommitPack` call of the pack `key`.
+fn commit_failed(status: &Status, key: &str) -> PackIndexError {
+    match status.code() {
+        Code::Unimplemented => PackIndexError::Unsupported,
+        Code::AlreadyExists => PackIndexError::Conflict {
+            key: key.to_owned(),
+        },
+        Code::PermissionDenied | Code::InvalidArgument => {
+            PackIndexError::Refused(format!("commit: {status}"))
+        }
+        _ => failed(format!("commit: {status}")),
+    }
+}
+
 /// A digest as the wire spells it.
-fn wire(digest: &BlobDigest) -> Digest {
+pub(crate) fn wire(digest: &BlobDigest) -> Digest {
     Digest {
         hash: hex::encode(digest.hash),
         // A blob's length is at most `i64::MAX`: it came from a REAPI digest.

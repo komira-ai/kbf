@@ -214,7 +214,7 @@ impl Record {
     ///
     /// # Errors
     /// The bytes cannot be read.
-    pub(crate) async fn read(&self, at: u64, len: u64) -> io::Result<Vec<u8>> {
+    pub async fn read(&self, at: u64, len: u64) -> io::Result<Vec<u8>> {
         let (source, len) = (
             self.source.clone(),
             usize::try_from(len).map_err(io::Error::other)?,

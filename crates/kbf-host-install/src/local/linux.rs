@@ -122,6 +122,8 @@ pub struct Linux<E: Exec> {
     pub(crate) allowlist: PathBuf,
     pub(crate) units: Vec<Unit>,
     pub(crate) restart_wait: Wait,
+    /// The clock the wait is counted on.
+    pub(crate) pace: crate::pace::Pace,
     /// `systemctl`, `curl` and `gh release download`.
     pub(crate) runner: Box<dyn Runner>,
     /// `gh attestation verify` and the probe, the installer's way.
@@ -206,7 +208,7 @@ pub(super) fn config_fault(refusal: Refusal) -> Fault {
 impl<E: Exec> Linux<E> {
     fn restart_units(&self) -> Result<(), String> {
         for unit in &self.units {
-            restart_and_wait(&*self.runner, unit, self.restart_wait)?;
+            restart_and_wait(&*self.runner, unit, self.restart_wait, &self.pace)?;
         }
         Ok(())
     }
@@ -247,7 +249,7 @@ impl<E: Exec> Linux<E> {
         let prefix = crate::mac::release::commit_prefix(version.as_str()).ok_or_else(|| {
             Fault::refused(
                 Code::UnknownRelease,
-                "the version carries no commit (+g and 12 hex digits)",
+                "the version carries no commit (+g or +, then 12 hex digits)",
             )
         })?;
         let trust: &Trust = &self.host.trust;
@@ -568,6 +570,7 @@ pub fn production(units: Vec<Unit>) -> Linux<kbf_host::HostExec> {
         allowlist: PathBuf::from(ALLOWLIST),
         units,
         restart_wait: crate::plan::ACTIVE_WAIT,
+        pace: crate::pace::Pace::real(),
         runner: Box::new(crate::runner::SystemRunner),
         installer_runner: Box::new(kbf_installer::run::SystemRunner),
         tools: Tools::production(),

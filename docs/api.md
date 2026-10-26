@@ -258,7 +258,7 @@ the storage:
 
 | Field | Meaning |
 |---|---|
-| `half` | how the node stands to the storage members: `member` (its storage half is the member whose address it enrolled with, joined as safe-to-stop joins them), `no_storage` (it enrolled with no storage address), `unknown_node` (the enrollment registry does not know it), `unlinked` (no member, or more than one, has its address) |
+| `half` | how the node stands to the storage members: `member` (its storage half is the member whose address it enrolled with, joined as safe-to-stop joins them), `no_storage` (it enrolled with no storage address), `unknown_node` (the enrollment registry does not know it; [adopt](#v1enrolltokens-and-v1enrollnodes) a node provisioned before enrollment), `unlinked` (no member, or more than one, has its address) |
 | `why` | for `unknown_node` and `unlinked` only: a sentence saying which; it may repeat the address the node itself enrolled with |
 | `member` | for `member` only: that member's own `id`, `state` and `build_commit` (`null` if it said none). No other member is named |
 | `storage.members_active` | the storage members that are `active`, as `GET /v1/storage` counts them |
@@ -789,6 +789,7 @@ call changes nothing. Every answer carries `Cache-Control: no-store`.
 | `DELETE /v1/enroll/tokens/{id}` | revokes a token | `{"id": "..."}` |
 | `GET /v1/enroll/nodes` | lists the nodes | `{"nodes": [...]}` |
 | `POST /v1/enroll/nodes/{id}/revoke` | revokes a node | `{"id": "...", "denied": [...]}` |
+| `POST /v1/enroll/nodes/{id}:adopt` | records a node provisioned before enrollment | the node, as `GET /v1/enroll/nodes` lists it |
 
 **Create.** The body is `{"roles": ["daemon"], "host_role": null, "max_uses": 1,
 "expires_in": 86400, "node_id": "n1", "node_prefix": "rack-", "names": [".example"],
@@ -830,6 +831,24 @@ and no certificate or key. **Revoking a node** takes no body (or `{}`), marks it
 each unexpired serial it holds or held and each of its keys, in one transaction; `denied`
 lists them as the deny list spells them (`node n1`, `serial ...`, `spki-sha256 ...`). `400`
 for a node already revoked, `404` for an unknown or malformed id.
+
+**Adopting a node.** A node provisioned by hand, with certificates the operator issued, was
+never enrolled, so the registry does not know it: its storage-health answer is `unknown_node`
+and the safe-to-stop check cannot join it to its storage member, both of which go through the
+address the node advertised when it enrolled. `POST /v1/enroll/nodes/{id}:adopt` writes that
+registry row without enrolling. The body is `{"roles": ["storage"], "advertise":
+"host:7000"}`; `roles` is required, and `advertise` is required for a node with the `storage` role
+and must be absent or empty for any other. The roles are `storage` and `daemon` (not `updater`), and `advertise`
+follows enrollment's rules (a DNS name or IP address, read in lower case, and a port from 1 to
+65535, not loopback, unspecified, link-local or multicast, and not a name this frontend
+serves). An unknown field, a malformed body or id, or a value enrollment refuses is a
+`400`; an id the registry holds (revoked ones included) or an address another node holds is
+a `409`. The answer is the node as the listing shows it: `active`, with `token_id` and
+`token_label` both `adopted`, `not_after` `0` (it holds no certificate) and no
+`last_renewed_at`. The call issues no certificate and writes no serial or key. An adopted
+node never renews (a renewal of it is refused as `unknown_node`); revoking it marks it
+`revoked` and writes one deny row, for the node id (which refuses the node's existing operator-issued certificates, as for an enrolled node). A token with `replace` can enroll over
+an adopted id, which then becomes an enrolled node.
 
 **Failures.** `400` for a body or value the registry refuses, `404` (above), `409` when
 the store refuses the write as fenced (`Fenced`, which no current store returns: nothing
@@ -1529,7 +1548,7 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_writes_total`, `kbf_pack_written_bytes_total`, `kbf_pack_written_blobs_total` | counter | packs stored and recorded in the pack index, their bytes (footers included), and the blobs in them |
 | `kbf_pack_skipped_blobs_total` | counter | blobs of a write the pack index had already, so not packed again |
 | `kbf_pack_write_failures_total` | counter | writes that failed because the store or the pack index could not take a pack (UNAVAILABLE to the client): the blobs not yet recorded are missing and the client sends them again, and packs finished before the failure stay recorded. A blob that is not its digest is INVALID_ARGUMENT and is not counted |
-| `kbf_pack_find_missing_asked_total`, `kbf_pack_find_missing_found_total` | counter | digests put to the pack index by FindMissingBlobs and by Execute's check of an action's inputs, and the ones it had (the rest go on to the storage nodes) |
+| `kbf_pack_find_missing_asked_total`, `kbf_pack_find_missing_found_total` | counter | digests put to the pack index by FindMissingBlobs, by Execute's check of an action's inputs and by the check of an action result's blobs (written, or hit), and the ones it had (the rest go on to the storage nodes) |
 | `kbf_pack_reads_total`, `kbf_pack_read_bytes_total` | counter | blobs served from a pack (a client's read or Execute's own), and their bytes |
 | `kbf_pack_read_fallbacks_total` | counter | reads of a blob the pack index lacks, answered by the storage nodes: a blob uploaded before packs were on. Falling to 0 over time is how a farm sees that nothing is left on the nodes to find |
 | `kbf_pack_read_lost_total` | counter | reads of a blob the index has and whose pack the store lacks, answered by the storage nodes (alert on any) |
@@ -1539,6 +1558,59 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_upload_waits_total` | counter | uploads that found `--pack-inflight-bytes` spent and waited their turn: a burst slowed down, none failed. Rising steadily means the bound is below what clients send |
 | `kbf_pack_upload_refusals_total` | counter | uploads refused RESOURCE_EXHAUSTED because their blobs alone are over `--pack-inflight-bytes` |
 | `kbf_pack_upload_idle_timeouts_total` | counter | ByteStream uploads ended DEADLINE_EXCEEDED because, after their resource name had arrived, no byte of their body arrived for `--pack-upload-idle-timeout`; nothing was stored and their bytes were given back |
+| `kbf_pack_commits_total` | counter | packs a daemon stored that `kbf.worker.v1.PackIndex/CommitPack` recorded in the pack index (a retry of a commit already recorded is not counted again) |
+| `kbf_pack_commit_rejects_total` | counter | commits of a pack refused with nothing recorded: the writer was not the caller, the name or the list of blobs was not one a daemon may commit, the pack was not in the store, a sampled blob was not its digest (`--pack-commit-sample`; alert on any), or the pack was recorded before with other contents. A store or an index that failed is UNAVAILABLE to the daemon and is not counted |
+
+**Pack reads by daemons.** A daemon started with `--pack-read` ([kbf-modes.md](deploy/kbf-modes.md))
+puts the counts of its pack reads in every heartbeat, and the frontend its worker stream is on
+keeps the newest of each node and exports them, one sample per node, labelled `node`. They
+are the counts of the daemon's process: they start again from 0 when it restarts, as any counter
+may. A node that sent none (a daemon without `--pack-read`, or one built before the field) has
+no sample, and with no node sending any the families are absent. A node whose stream has closed
+keeps the counts of its last heartbeat until the frontend restarts (a node's other facts are
+kept the same way); a node whose next heartbeat carries none, such as a daemon restarted without
+`--pack-read`, loses its samples. Each read of a blob counts in exactly one of served, elsewhere,
+unasked, lost and damaged.
+
+| Family | Type | What it measures |
+|---|---|---|
+| `kbf_pack_daemon_served_total{node}`, `kbf_pack_daemon_served_bytes_total{node}` | counter | blobs the node's daemon read from a pack, and their bytes |
+| `kbf_pack_daemon_elsewhere_total{node}` | counter | reads of a blob no pack holds (or that is not asked of the packs, or whose frontend serves no locations): answered by the storage nodes, as before packs |
+| `kbf_pack_daemon_unasked_total{node}` | counter | reads answered by the storage nodes because the packs could not be asked (the pack index or the pack store failed): the daemon is reading around the packs |
+| `kbf_pack_daemon_lost_total{node}` | counter | reads that failed because the pack the index names is gone or too short (UNAVAILABLE to the lease; alert on any) |
+| `kbf_pack_daemon_damaged_total{node}` | counter | reads that failed because the bytes in the pack are not the digest (never served; alert on any) |
+
+**Pack writes by daemons.** A daemon started with `--pack-write` (which needs `--pack-read`;
+[kbf-modes.md](deploy/kbf-modes.md)) also puts the counts of its pack writes in every heartbeat,
+and the frontend keeps and exports them as it does the reads: one sample per node, labelled
+`node`, the counts of the daemon's process (they start again from 0 when it restarts). A node that
+sent none (a daemon without `--pack-write`, or one built before the field) has no sample of these
+families, whether or not it sent read counts, and a node whose next heartbeat carries none loses
+them. The unit is the blob: each blob of the outputs a daemon puts is in a committed pack or was
+written to the storage nodes instead, and counts in exactly one fallback reason then.
+
+| Family | Type | What it measures |
+|---|---|---|
+| `kbf_pack_daemon_packs_written_total{node}`, `kbf_pack_daemon_blobs_packed_total{node}`, `kbf_pack_daemon_packed_bytes_total{node}` | counter | packs the node's daemon stored and had the frontend commit, the blobs in them, and their bytes (footers included) |
+| `kbf_pack_daemon_write_fallbacks_total{node,reason}` | counter | blobs written to the storage nodes instead of into a pack, by `reason`: `off` (the frontend does not take pack commits, or answered UNIMPLEMENTED earlier), `unfit` (over the largest blob a pack holds, not a SHA-256 digest, or over the in-flight budget), `unsupported` (the commit was answered UNIMPLEMENTED), `refused` (the commit was refused for a reason a repeat does not change), `store` (the object store failed the put of the pack), `record` (the commit failed for a reason a repeat may pass), `index` (the pack index failed before the pack was written) |
+| `kbf_pack_daemon_missing_indexed_total{node}`, `kbf_pack_daemon_missing_unasked_total{node}` | counter | digests of a find-missing question the pack index answered, and digests that went to the storage nodes whole because the index could not be asked |
+
+A farm that writes packs has `kbf_pack_daemon_write_fallbacks_total` flat at 0 apart from `off`
+and `unfit`; a rising `store`, `record` or `index` says the packs are failing and outputs are going
+to the storage nodes (nothing is lost: the pack object of a failed commit is unindexed garbage
+under the daemon's own prefix). A pack that was stored and not committed leaves that garbage, and
+its blobs are counted in `record`, not in `blobs_packed`.
+
+**The gate for moving a farm to packs.** The legacy reads are the reads that still go to the storage
+nodes for a blob a pack could hold: the frontend's `kbf_pack_read_fallbacks_total` plus the sum
+over nodes of `kbf_pack_daemon_elsewhere_total`. A farm has moved when that sum has stopped
+rising (`increase()` over a window longer than a build is 0), and `kbf_pack_daemon_unasked_total`,
+`kbf_pack_daemon_lost_total` and `kbf_pack_daemon_damaged_total` have stayed flat throughout
+(the last two at 0). A rising `kbf_pack_daemon_unasked_total` says the packs are being skipped,
+not that nothing is left on the nodes. A read of a blob over 64 MiB, or of one whose digest is
+not SHA-256, is never asked of the packs and always counts in `kbf_pack_daemon_elsewhere_total`,
+so a farm that reads such blobs has a sum that keeps rising: the criterion is that it has stopped
+rising apart from those reads.
 
 **Reading a stall with idle slots.** `kbf_sched_queued` high and `kbf_sched_leases` below the
 nodes' slots means work is waiting that placement cannot use (look at the node's booking and

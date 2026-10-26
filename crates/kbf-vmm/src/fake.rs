@@ -5,6 +5,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use kbf_testkit::dir::TestDir;
@@ -12,7 +14,35 @@ use serde_json::{Value, json};
 
 use crate::bundle::{FILES, Sizing};
 use crate::spec::{Event, LIMIT_EXCEEDED, VmSpec};
-use crate::system::{OfflineFile, Poll, Signature, System, VmProcess};
+use crate::system::{Clock, OfflineFile, Poll, Signature, System, VmProcess};
+
+/// A clock that moves only when something passes time: a quiet poll, a wait for the helper
+/// to exit, a pause. Every fake helper of one [`FakeSystem`] shares it, so a wait of a
+/// minute costs nothing and always ends at the same reading.
+#[derive(Debug, Default)]
+pub struct FakeClock(AtomicU64);
+
+impl FakeClock {
+    /// What the clock reads.
+    pub fn now(&self) -> Duration {
+        Duration::from_nanos(self.0.load(Ordering::SeqCst))
+    }
+
+    /// Moves the clock on by `d`.
+    pub fn advance(&self, d: Duration) {
+        let nanos = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        self.0.fetch_add(nanos, Ordering::SeqCst);
+    }
+}
+
+impl Clock for FakeClock {
+    fn now(&self) -> Duration {
+        FakeClock::now(self)
+    }
+    fn pause(&self, d: Duration) {
+        self.advance(d);
+    }
+}
 
 /// What one scripted helper does.
 #[derive(Clone)]
@@ -154,7 +184,8 @@ pub struct FakeProc {
     shutdown_command: Option<(bool, String)>,
     gone_after: Duration,
     /// When the shutdown was requested.
-    shutdown_at: std::time::Instant,
+    shutdown_at: Duration,
+    clock: Arc<FakeClock>,
     log: Option<String>,
 }
 
@@ -182,7 +213,7 @@ impl VmProcess for FakeProc {
             };
         }
         self.events.pop_front().unwrap_or_else(|| {
-            std::thread::sleep(wait.min(Duration::from_millis(1)));
+            self.clock.advance(wait);
             Poll::Quiet
         })
     }
@@ -191,7 +222,7 @@ impl VmProcess for FakeProc {
     }
     fn request_shutdown(&mut self) {
         self.shutdown_asked = true;
-        self.shutdown_at = std::time::Instant::now();
+        self.shutdown_at = self.clock.now();
         if let Some((acked, detail)) = self.shutdown_command.take() {
             self.events.push_back(Poll::Event(Event::ShutdownCommand {
                 acked,
@@ -210,9 +241,10 @@ impl VmProcess for FakeProc {
         if !(self.shutdown_asked && self.obeys_shutdown) {
             return false;
         }
-        let left = self.gone_after.saturating_sub(self.shutdown_at.elapsed());
-        std::thread::sleep(left.min(wait));
-        self.shutdown_at.elapsed() >= self.gone_after
+        let since = |c: &FakeClock| c.now().saturating_sub(self.shutdown_at);
+        let left = self.gone_after.saturating_sub(since(&self.clock));
+        self.clock.advance(left.min(wait));
+        since(&self.clock) >= self.gone_after
     }
 }
 
@@ -258,6 +290,8 @@ pub struct FakeSystem {
     pub helper: RefCell<Result<(), String>>,
     pub helper_specs: RefCell<Vec<VmSpec>>,
     next_pid: Cell<u32>,
+    /// The time the probes read: see [`FakeClock`].
+    pub clock: Arc<FakeClock>,
 }
 
 impl FakeSystem {
@@ -298,6 +332,7 @@ impl FakeSystem {
             helper: RefCell::new(Ok(())),
             helper_specs: RefCell::new(Vec::new()),
             next_pid: Cell::new(1000),
+            clock: Arc::new(FakeClock::default()),
         }
     }
 
@@ -317,6 +352,10 @@ pub fn good_signature() -> Signature {
 }
 
 impl System for FakeSystem {
+    fn clock(&self) -> Arc<dyn Clock> {
+        self.clock.clone()
+    }
+
     fn clear_immutable(&self, path: &Path) -> io::Result<()> {
         self.unflagged.borrow_mut().push(path.to_owned());
         if self.unflag_fails.get() {
@@ -395,7 +434,8 @@ impl System for FakeSystem {
             obeys_shutdown: script.obeys_shutdown,
             shutdown_command: script.shutdown_command,
             gone_after: script.gone_after,
-            shutdown_at: std::time::Instant::now(),
+            shutdown_at: self.clock.now(),
+            clock: self.clock.clone(),
             log: script.log,
         }))
     }

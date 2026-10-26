@@ -87,8 +87,8 @@ use kbf_proto::google::rpc::Code;
 use kbf_proto::kbf::map::v1 as wire;
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{
-    self, DaemonMessage, Heartbeat, Hello, Phase, ServerMessage, daemon_message, server_message,
-    worker_client::WorkerClient,
+    self, DaemonMessage, Heartbeat, Hello, PackWriteCounts, Phase, ServerMessage, daemon_message,
+    server_message, worker_client::WorkerClient,
 };
 use kbf_types::{LeaseId, NodePhase};
 use tokio::sync::{Notify, mpsc, watch};
@@ -105,6 +105,7 @@ use crate::connect::{
 use crate::contact::Contact;
 use crate::lease::{Done, Leases, failure, lease_id, proto_lease_id};
 use crate::map::{MapLink, map_asked};
+use crate::packed::{PackCommit, PackCounter};
 use crate::phases::LeasePhases;
 use crate::pressure;
 use crate::report::NodeReport;
@@ -257,6 +258,12 @@ pub struct Daemon {
     /// Each lease acted on and not yet forgotten: the epoch of its Start and the action
     /// it named.
     granted: BTreeMap<LeaseId, Granted>,
+    /// The counts of the pack reads of the data plane, if it reads packs; see
+    /// [`Self::with_pack_reads`].
+    pack_reads: Option<PackCounter>,
+    /// The handle the frontend's Welcome turns pack writes on and off with, if the data plane
+    /// writes packs; see [`Self::with_pack_writes`].
+    pack_commit: Option<PackCommit>,
     /// The suspend-counting clock that contact and the Start window read.
     clock: Arc<dyn Clock>,
     /// This daemon process's `Hello.instance_id`, the same on every stream it opens.
@@ -351,6 +358,8 @@ impl Daemon {
             unacked: BTreeMap::new(),
             epoch: None,
             granted: BTreeMap::new(),
+            pack_reads: None,
+            pack_commit: None,
             clock: Arc::new(SystemClock),
             instance: instance_id(),
             predecessor: String::new(),
@@ -365,6 +374,50 @@ impl Daemon {
     pub fn with_map(mut self, holder: Arc<kbf_mapsync::MapHolder>) -> Self {
         self.map = Some(MapLink::new(holder));
         self
+    }
+
+    /// Puts the counts of the pack reads `counter` holds in every Heartbeat
+    /// (`Heartbeat.pack_reads`), as they stand when it is sent: the totals since this
+    /// process started, which the server shows per node. Without it a Heartbeat carries
+    /// none, as before the field existed.
+    #[must_use]
+    pub fn with_pack_reads(mut self, counter: PackCounter) -> Self {
+        self.pack_reads = Some(counter);
+        self
+    }
+
+    /// Sets `commit` from every Welcome (`Welcome.pack_commit`): the data plane that writes packs
+    /// ([`crate::PackedCas::with_writes`], given the same handle) writes them only while the
+    /// frontend says it takes commits. Given the counter of [`Self::with_pack_reads`] too, the
+    /// daemon also puts the counts of its pack writes in every Heartbeat
+    /// (`Heartbeat.pack_writes`). Without it a Welcome sets nothing and a Heartbeat carries no
+    /// write counts.
+    #[must_use]
+    pub fn with_pack_writes(mut self, commit: PackCommit) -> Self {
+        self.pack_commit = Some(commit);
+        self
+    }
+
+    /// The counter [`Self::with_pack_reads`] was given; `None` for a daemon whose
+    /// Heartbeats carry no counts.
+    #[must_use]
+    pub const fn pack_reads(&self) -> Option<&PackCounter> {
+        self.pack_reads.as_ref()
+    }
+
+    /// The counts of the pack writes for a Heartbeat: those of the counter
+    /// [`Self::with_pack_reads`] was given, and only for a daemon that also writes packs
+    /// ([`Self::with_pack_writes`]).
+    fn pack_writes_counted(&self) -> Option<PackWriteCounts> {
+        self.pack_commit.as_ref()?;
+        self.pack_reads.as_ref().map(|c| c.stats().writes.into())
+    }
+
+    /// The handle [`Self::with_pack_writes`] was given; `None` for a daemon that sets none from
+    /// its Welcomes.
+    #[must_use]
+    pub const fn pack_writes(&self) -> Option<&PackCommit> {
+        self.pack_commit.as_ref()
     }
 
     /// This daemon process's instance id (`Hello.instance_id`), drawn when it was built.
@@ -772,6 +825,8 @@ impl Daemon {
                         seq,
                         report_hash: self.report.hash().to_vec(),
                         running: self.listed().into_iter().map(proto_lease_id).collect(),
+                        pack_reads: self.pack_reads.as_ref().map(|c| c.stats().into()),
+                        pack_writes: self.pack_writes_counted(),
                     };
                     send(&tx, daemon_message::Message::Heartbeat(heartbeat));
                 }
@@ -863,6 +918,9 @@ impl Daemon {
                 "heartbeat interval {interval:?} does not fit the fence time {:?}",
                 self.contact.fence_after()
             )));
+        }
+        if let Some(commit) = &self.pack_commit {
+            commit.welcomed(w.pack_commit);
         }
         Ok((interval, (w.epoch != 0).then_some(w.epoch), w.map))
     }

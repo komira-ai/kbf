@@ -292,18 +292,20 @@ impl Spent {
 struct Deadline<'a, S> {
     inner: &'a mut S,
     frame: Duration,
-    until: Instant,
+    /// The time since an origin; the real one is the monotonic clock, a test passes its own.
+    now: &'a dyn Fn() -> Duration,
+    until: Duration,
 }
 
 impl<S> Deadline<'_, S> {
     fn start_frame(&mut self) {
-        self.until = Instant::now() + self.frame;
+        self.until = (self.now)() + self.frame;
     }
 }
 
 impl<S: Read> Read for Deadline<'_, S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if Instant::now() >= self.until {
+        if (self.now)() >= self.until {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "the frame did not arrive in time",
@@ -350,7 +352,8 @@ pub struct Served {
 /// ends the connection (the stream cannot be resynchronised) after one `refused` reply.
 /// Every frame and failure is logged to `log`.
 pub fn serve<S: Read + Write>(stream: &mut S, results: &Results, log: &mut dyn Write) -> Served {
-    serve_within(stream, results, log, FRAME_DEADLINE)
+    let origin = Instant::now();
+    serve_within(stream, results, log, FRAME_DEADLINE, &|| origin.elapsed())
 }
 
 /// [`serve`] with each frame due within `frame`.
@@ -359,11 +362,13 @@ fn serve_within<S: Read + Write>(
     results: &Results,
     log: &mut dyn Write,
     frame: Duration,
+    now: &dyn Fn() -> Duration,
 ) -> Served {
     let mut stream = Deadline {
         inner: stream,
         frame,
-        until: Instant::now() + frame,
+        now,
+        until: now() + frame,
     };
     let stream = &mut stream;
     let mut served = Served {
@@ -942,12 +947,14 @@ mod tests {
         bytes: Vec<u8>,
         at: usize,
         pause: Duration,
+        /// The test's clock: every read moves it on by `pause`.
+        clock: std::rc::Rc<std::cell::Cell<Duration>>,
         reads: usize,
     }
 
     impl Read for Drip {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            std::thread::sleep(self.pause);
+            self.clock.set(self.clock.get() + self.pause);
             self.reads += 1;
             if self.at >= self.bytes.len() {
                 return Ok(0);
@@ -978,25 +985,41 @@ mod tests {
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &Frame::new(Kind::Ready, "r", "{}")).expect("frame");
         let total = bytes.len();
+        let clock = std::rc::Rc::new(std::cell::Cell::new(Duration::ZERO));
+        let now = || clock.get();
         let mut slow = Drip {
             bytes: bytes.clone(),
             at: 0,
             pause: Duration::from_millis(20),
+            clock: clock.clone(),
             reads: 0,
         };
-        let began = Instant::now();
-        let served = serve_within(&mut slow, &r, &mut Vec::new(), Duration::from_millis(100));
+        let served = serve_within(
+            &mut slow,
+            &r,
+            &mut Vec::new(),
+            Duration::from_millis(100),
+            &now,
+        );
         assert_eq!(served.end, End::BadFrame);
-        assert!(slow.reads < total, "{} reads of {total}", slow.reads);
-        assert!(began.elapsed() < Duration::from_secs(5));
+        // Reads at 0, 20, 40, 60 and 80 ms were inside the deadline; the sixth is refused.
+        assert_eq!(slow.reads, 5, "reads of {total} bytes");
+        assert!(total > 5);
         assert_eq!(names(&path), Vec::<String>::new());
         let mut quick = Drip {
             bytes,
             at: 0,
             pause: Duration::ZERO,
+            clock: clock.clone(),
             reads: 0,
         };
-        let served = serve_within(&mut quick, &r, &mut Vec::new(), Duration::from_secs(30));
+        let served = serve_within(
+            &mut quick,
+            &r,
+            &mut Vec::new(),
+            Duration::from_secs(30),
+            &now,
+        );
         assert_eq!((served.stored, served.end), (1, End::Closed));
     }
 

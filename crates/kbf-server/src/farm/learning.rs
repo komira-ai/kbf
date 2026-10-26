@@ -305,17 +305,27 @@ impl State {
         self.learned.unwritten(&refused);
     }
 
+    /// Writes the changed summaries and the floors not yet written; `now` skips the wait
+    /// for the write-behind interval.
+    pub(super) fn write_behind(&mut self, now: bool) {
+        let rows = if now {
+            self.learned.due_now()
+        } else {
+            self.learned.due()
+        };
+        self.write_estimates(&rows);
+        if !self.unwritten_floors.is_empty() {
+            self.write_key_floors();
+        }
+    }
+
     /// Writes behind the summaries changed since they were last written, and sweeps the
     /// stale ones from the store once an hour, a bounded number of rows at a tick.
     pub(super) fn flush_learned(&mut self) {
         if self.learned.off() || self.fenced {
             return;
         }
-        let rows = self.learned.due();
-        self.write_estimates(&rows);
-        if !self.unwritten_floors.is_empty() {
-            self.write_key_floors();
-        }
+        self.write_behind(false);
         let Some(today) = self.learned.sweep_due() else {
             return;
         };

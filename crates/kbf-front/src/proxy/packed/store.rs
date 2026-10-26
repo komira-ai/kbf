@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use kbf_objstore::ObjectStore;
+use kbf_objstore::{ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
 use kbf_pack::{
     Blob, FRONTEND_PACK_BYTES, Fetch, PackError, PackKeys, Packed, Packer, PackerConfig, ReadCache,
     ReadError, Reader, ReaderConfig, check_create_only,
@@ -80,6 +80,13 @@ pub trait PackStore: Send + Sync {
 
     /// Checks that the store refuses to replace an object.
     fn check_create_only(&self) -> BoxFuture<'_, Result<(), PackError>>;
+
+    /// The bytes of `range` of the object `key` that the store has, as the store answers.
+    fn read_range<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        range: ByteRange,
+    ) -> BoxFuture<'a, Result<Bytes, ObjectStoreError>>;
 }
 
 /// A packer and a reader over one store.
@@ -105,17 +112,25 @@ impl<S: ObjectStore> PackStore for Over<S> {
     fn check_create_only(&self) -> BoxFuture<'_, Result<(), PackError>> {
         Box::pin(check_create_only(&*self.store, &self.keys))
     }
+
+    fn read_range<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        range: ByteRange,
+    ) -> BoxFuture<'a, Result<Bytes, ObjectStoreError>> {
+        Box::pin(self.store.get_range(key, range))
+    }
 }
 
 /// The frontend's packs. Cheap to clone; every clone is the same packs.
 #[derive(Clone)]
 pub struct Packs {
-    store: Arc<dyn PackStore>,
-    index: Arc<dyn PackIndex>,
+    pub(super) store: Arc<dyn PackStore>,
+    pub(super) index: Arc<dyn PackIndex>,
     max_blob_bytes: u64,
     upload_idle_timeout: Duration,
     budget: Budget,
-    metrics: Arc<PackMetrics>,
+    pub(super) metrics: Arc<PackMetrics>,
 }
 
 impl fmt::Debug for Packs {
@@ -426,7 +441,7 @@ fn to_index(digest: &Digest) -> BlobDigest {
 }
 
 /// The digest an index row names.
-fn from_index(digest: &BlobDigest) -> Digest {
+pub(super) fn from_index(digest: &BlobDigest) -> Digest {
     Digest::new(DigestFunction::Sha256, digest.hash, digest.size)
 }
 
@@ -442,7 +457,7 @@ fn index_failed(error: PackIndexError) -> Status {
 ///
 /// # Panics
 /// If `work` panics, or the runtime shuts down under it: neither is an error to hand back.
-async fn offload<T, F>(work: F) -> T
+pub(super) async fn offload<T, F>(work: F) -> T
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,

@@ -7,12 +7,13 @@ use super::*;
 /// sections 3.3, S2 to S4) through a flag only the daemon gained, which the refusal
 /// cannot see, or through the environment: clap's `env` feature, which a flag needs to
 /// read a variable, is off in the workspace. The daemon's only credentials are its node
-/// identity (`--ca-cert`, `--cert`, `--key`) and, for `--pack-read` alone, the file of a key
-/// pair that may read the farm's packs and write nothing. The words are the wire test's
+/// identity (`--ca-cert`, `--cert`, `--key`) and, for `--pack-read`, the file of a key pair that
+/// may read the farm's packs and write nothing, and, for `--pack-write`, the file of one that
+/// may create them. The words are the wire test's
 /// (kbf-proto's tests/daemon_wire.rs): a part (`store`) is matched anywhere in a flag, a
 /// short word (`sts`, `url`, `key`) only as a whole word between dashes, except in the
 /// reviewed flags of `REVIEWED_DAEMON_FLAGS`, each of which must still be a flag, and the
-/// seven flags of `PACK_READ_FLAGS`, which name a store, a bucket, an endpoint, a region and
+/// nine flags of `PACK_READ_FLAGS`, which name a store, a bucket, an endpoint, a region and
 /// a credentials file as a path and are checked for neither. Of all the daemon's flags,
 /// only `--pack-store-credentials-file` names a credential, and it takes a `PATH`.
 #[test]
@@ -25,7 +26,7 @@ fn the_daemon_takes_no_store_credential_or_environment_variable() {
         "mac-session-socket",
     ];
     /// The flags of `--pack-read` (`kbf_node`'s `pack_read`): the object store the daemon
-    /// reads packs from, and the file of its read-only key pair, never the key itself.
+    /// reads packs from and writes them to, and the files of its key pairs, never a key itself.
     const PACK_READ_FLAGS: &[&str] = &[
         "pack-read",
         "pack-read-cache-bytes",
@@ -34,6 +35,8 @@ fn the_daemon_takes_no_store_credential_or_environment_variable() {
         "pack-store-credentials-file",
         "pack-store-endpoint",
         "pack-store-region",
+        "pack-store-write-credentials-file",
+        "pack-write",
     ];
     let flags = longs(&kbf_node::Cli::command());
     for flag in &flags {
@@ -79,17 +82,23 @@ fn the_daemon_takes_no_store_credential_or_environment_variable() {
             "--{reviewed} is no longer a flag"
         );
     }
-    // The key pair is a file: the one flag that names a credential names it as a path.
+    // The key pairs are files: the only flags that name a credential name one as a path.
     let named: Vec<&String> = flags.iter().filter(|f| f.contains("credential")).collect();
-    assert_eq!(named, ["pack-store-credentials-file"]);
+    let files = [
+        "pack-store-credentials-file",
+        "pack-store-write-credentials-file",
+    ];
+    assert_eq!(named, files);
     let command = kbf_node::Cli::command();
-    let file = command
-        .get_arguments()
-        .find(|arg| arg.get_long() == Some("pack-store-credentials-file"))
-        .expect("the credentials file flag");
-    let values = file.get_value_names().unwrap_or_default();
-    let shown: Vec<String> = values.iter().map(ToString::to_string).collect();
-    assert_eq!(shown, ["PATH"]);
+    for name in files {
+        let file = command
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some(name))
+            .expect("the credentials file flag");
+        let values = file.get_value_names().unwrap_or_default();
+        let shown: Vec<String> = values.iter().map(ToString::to_string).collect();
+        assert_eq!(shown, ["PATH"], "--{name}");
+    }
     let workspace = include_str!("../../../Cargo.toml");
     let clap = workspace
         .lines()

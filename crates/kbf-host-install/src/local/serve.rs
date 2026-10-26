@@ -40,13 +40,14 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt, chown};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::answer::{Answer, Code};
 use super::backend::Backend;
 use super::core::Ab;
 use super::request::{LocalRequest, MAX_LINE_LEN};
 use crate::audit::{self, Audit};
+use crate::pace::{Now, Pace};
 use crate::request::{BadCommand, Unit};
 use crate::trust::Trust;
 
@@ -262,6 +263,8 @@ pub struct Serving<'a, B: Backend> {
     pub audit: &'a Path,
     /// Where the log of what happened goes (stderr, in production).
     pub log: &'a dyn Fn(&str),
+    /// The clock of the loop's pauses and of a client's window.
+    pub pace: &'a Pace,
 }
 
 impl<B: Backend> Serving<'_, B> {
@@ -269,7 +272,7 @@ impl<B: Backend> Serving<'_, B> {
     pub fn serve_one(&self, stream: UnixStream) {
         let _ = stream.set_nonblocking(false);
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-        let line = read_line(&stream, IO_TIMEOUT);
+        let line = read_line(&stream, IO_TIMEOUT, &self.pace.now);
         let answer = self.answer(line.as_deref());
         let mut writer = &stream;
         let wrote = writeln!(writer, "{}", answer.json_line()).and_then(|()| writer.flush());
@@ -365,14 +368,14 @@ impl<B: Backend> Serving<'_, B> {
     /// Serve until `stop` is set: the connections, and the ticks between them.
     pub fn run(&self, listener: &UnixListener, stop: &AtomicBool) -> io::Result<()> {
         listener.set_nonblocking(true)?;
-        let mut hold_revert_until = Instant::now();
+        let mut hold_revert_until = Duration::ZERO;
         while !stop.load(Ordering::Relaxed) {
-            if Instant::now() >= hold_revert_until && self.tick() {
-                hold_revert_until = Instant::now() + REVERT_RETRY;
+            if (self.pace.now)() >= hold_revert_until && self.tick() {
+                hold_revert_until = (self.pace.now)() + REVERT_RETRY;
             }
             match listener.accept() {
                 Ok((stream, _)) => self.serve_one(stream),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(IDLE),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => (self.pace.sleep)(IDLE),
                 Err(e) => return Err(e),
             }
         }
@@ -383,13 +386,13 @@ impl<B: Backend> Serving<'_, B> {
 /// The first line the client sent, within [`MAX_LINE_LEN`] bytes and within `window` in all
 /// (a client that trickles bytes is cut off, not waited for), without its end; none when it
 /// sent none in time, a longer one, or text that is not UTF-8.
-pub(super) fn read_line(stream: &UnixStream, window: Duration) -> Option<String> {
-    let end = Instant::now() + window;
+pub(super) fn read_line(stream: &UnixStream, window: Duration, now: &Now) -> Option<String> {
+    let end = now() + window;
     let mut line = Vec::new();
     let mut chunk = [0u8; 64];
     loop {
         // A zero timeout is an error: a deadline that has passed ends the wait there.
-        let left = end.saturating_duration_since(Instant::now());
+        let left = end.saturating_sub(now());
         let got = stream
             .set_read_timeout(Some(left))
             .and_then(|()| (&*stream).read(&mut chunk))

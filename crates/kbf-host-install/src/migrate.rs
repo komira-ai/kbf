@@ -408,7 +408,7 @@ fn apply(step: &Step, host: &PackageHost, config: &Config, place: &Place) -> Res
             fs::rename(from, to).map_err(|e| format!("{}: {e}", from.display()))
         }
         Step::Reload => ran(&systemctl(&["daemon-reload"]), "systemctl daemon-reload").map(drop),
-        Step::Restart => restart_and_wait(runner, &config.unit, host.restart_wait),
+        Step::Restart => restart_and_wait(runner, &config.unit, host.restart_wait, &host.pace),
         Step::Check { commit } => check(host, config, place, commit),
         Step::RemoveOldLayout(dir) => {
             fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))
@@ -487,7 +487,7 @@ fn put_back(host: &PackageHost, config: &Config, place: &Place) -> Result<(), St
     if !matches!(&reloaded, Ok(exec) if exec.success()) {
         problems.push("systemctl daemon-reload did not work".to_owned());
     }
-    if let Err(why) = restart_and_wait(&*host.runner, &config.unit, host.restart_wait) {
+    if let Err(why) = restart_and_wait(&*host.runner, &config.unit, host.restart_wait, &host.pace) {
         problems.push(why);
     }
     if problems.is_empty() {

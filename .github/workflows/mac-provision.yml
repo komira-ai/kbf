@@ -1,7 +1,7 @@
 # kbf-mac-provision for a Mac: built from the commit for darwin-arm64, signed ad hoc with
 # the hardened runtime by `cargo xtask sign-darwin`, as a workflow artifact to download and
-# copy to a farm Mac (docs/deploy/kbf-installer-macos.md, step 2). No other workflow builds
-# it: the release and artifacts workflows carry the daemon, the installer and their helpers.
+# copy to a farm Mac (docs/deploy/kbf-installer-macos.md, step 2) before a release has it. The
+# artifacts workflow builds, attests and releases it too (docs/artifacts.md).
 #
 # The job builds and signs the binary, checks the signature, runs `--help` and the tests of
 # the crate (every item against a fake Mac), and keeps the file. It runs on a pull request

@@ -461,7 +461,7 @@ fn a_recorded_baseline_holds_facts_and_not_a_wrong_state() {
         ],
     );
     let base = record(&user).expect("facts are recorded");
-    assert!(assert(&user, Some(&base), &ALL, (&|| false, None)).is_empty());
+    assert!(assert(&user, Some(&base), &ALL, (&|| false, &|| false)).is_empty());
     // The attribute gone and a new one are both differences.
     let now = Fake::clean();
     now.set(
@@ -480,7 +480,7 @@ fn a_recorded_baseline_holds_facts_and_not_a_wrong_state() {
             &now,
             Some(&base),
             &[Probe::Home, Probe::Entry],
-            (&|| false, None)
+            (&|| false, &|| false)
         ),
         lines(&[
             "home: + xattr kbf.new",
@@ -499,7 +499,7 @@ fn a_stopped_check_reads_no_further_probe() {
         reads.set(reads.get() + 1);
         reads.get() > 2
     };
-    let red = assert(&Fake::clean(), Some(&base), &CHEAP, (&stopped, None));
+    let red = assert(&Fake::clean(), Some(&base), &CHEAP, (&stopped, &|| false));
     assert_eq!(reads.get(), 3);
     assert_eq!(red, lines(&["mounts: not read, the check was stopped"]));
 }
@@ -510,7 +510,7 @@ fn a_stopped_check_reads_no_further_probe() {
 #[test]
 fn the_comparison_tolerates_nothing_a_lease_can_make() {
     let base = baseline();
-    assert!(assert(&Fake::clean(), Some(&base), &ALL, (&|| false, None)).is_empty());
+    assert!(assert(&Fake::clean(), Some(&base), &ALL, (&|| false, &|| false)).is_empty());
     let cases: [(Probe, &[&str], &str); 7] = [
         (
             Probe::Processes,
@@ -539,12 +539,12 @@ fn the_comparison_tolerates_nothing_a_lease_can_make() {
     for (probe, found, line) in cases {
         let now = Fake::clean();
         now.set(probe, found);
-        let red = assert(&now, Some(&base), &ALL, (&|| false, None));
+        let red = assert(&now, Some(&base), &ALL, (&|| false, &|| false));
         assert!(red.contains(&line.to_owned()), "{probe}: {red:?}");
     }
     let now = Fake::clean();
     now.set(Probe::Record, &["id uid=61001(u) gid=20(staff)"]);
-    let red = assert(&now, Some(&base), &[Probe::Record], (&|| false, None));
+    let red = assert(&now, Some(&base), &[Probe::Record], (&|| false, &|| false));
     assert_eq!(
         red,
         lines(&["record: - UniqueID=61001"]),
@@ -552,7 +552,7 @@ fn the_comparison_tolerates_nothing_a_lease_can_make() {
     );
     let now = Fake::clean();
     now.set(Probe::Entry, &[". owned by 61001:20 mode 700 flags 0x2"]);
-    let red = assert(&now, Some(&base), &[Probe::Entry], (&|| false, None));
+    let red = assert(&now, Some(&base), &[Probe::Entry], (&|| false, &|| false));
     assert_eq!(
         red,
         lines(&[
@@ -570,7 +570,7 @@ fn a_probe_that_cannot_run_or_has_no_baseline_is_red() {
     for probe in ALL {
         let now = Fake::clean();
         now.fail(probe, "boom");
-        let red = assert(&now, Some(&base), &[probe], (&|| false, None));
+        let red = assert(&now, Some(&base), &[probe], (&|| false, &|| false));
         assert_eq!(red.len(), 1, "{probe}: {red:?}");
         assert!(
             red[0].starts_with(&format!("{probe}: cannot run")),
@@ -582,7 +582,7 @@ fn a_probe_that_cannot_run_or_has_no_baseline_is_red() {
         &Fake::clean(),
         None,
         &[Probe::Home, Probe::Entry, Probe::Record, Probe::Ipc],
-        (&|| false, None),
+        (&|| false, &|| false),
     );
     assert_eq!(
         red,
@@ -592,7 +592,7 @@ fn a_probe_that_cannot_run_or_has_no_baseline_is_red() {
             "record: no baseline to compare with"
         ])
     );
-    assert!(assert(&Fake::clean(), None, &[Probe::Ipc], (&|| false, None)).is_empty());
+    assert!(assert(&Fake::clean(), None, &[Probe::Ipc], (&|| false, &|| false)).is_empty());
 }
 
 /// Catches a cheap subset that leaves out one of the probes a slot is handed over with
@@ -642,7 +642,7 @@ impl Slotted for Slot {
 fn asserted_book(world: &Arc<Fake>, base: &Arc<Snapshot>) -> Arc<Book<Slot>> {
     let (world, base) = (Arc::clone(world), Arc::clone(base));
     let cleaner: Cleaner<Slot> = Arc::new(move |_: &Slot| {
-        let red = assert(world.as_ref(), Some(&base), &ALL, (&|| false, None));
+        let red = assert(world.as_ref(), Some(&base), &ALL, (&|| false, &|| false));
         if red.is_empty() {
             Outcome::Clean
         } else {
@@ -691,7 +691,7 @@ async fn a_slot_that_fails_the_assertion_at_slot_ready_is_set_aside() {
     let (index, permit) = book.take().await.expect("a slot");
     // What a lease finds at slot-ready: a mount that was not there at the clean.
     world.set(Probe::Mounts, &["mounted /private/var/folders/x/T/vol"]);
-    let red = assert(world.as_ref(), Some(&base), &CHEAP, (&|| false, None));
+    let red = assert(world.as_ref(), Some(&base), &CHEAP, (&|| false, &|| false));
     assert_eq!(
         red,
         lines(&["mounts: + mounted /private/var/folders/x/T/vol"])
@@ -722,7 +722,7 @@ fn an_extended_attribute_line_holds_its_value() {
     let now = Fake::clean();
     now.set(Probe::Home, &["xattr n=32"]);
     assert_eq!(
-        assert(&now, Some(&base), &[Probe::Home], (&|| false, None)),
+        assert(&now, Some(&base), &[Probe::Home], (&|| false, &|| false)),
         lines(&["home: + xattr n=32", "home: - xattr n=31"])
     );
 }
@@ -733,32 +733,33 @@ fn baseline_with_home(home: &[&str]) -> Snapshot {
     record(&fake).expect("a baseline")
 }
 
-/// A reader that takes `pause` for each probe it reads.
-struct Slow(Fake, Duration);
+/// A reader that counts the probes it reads.
+struct Counting(Fake, std::cell::Cell<usize>);
 
-impl Reader for Slow {
+impl Reader for Counting {
     fn read(&self, probe: Probe) -> Result<Lines, String> {
-        std::thread::sleep(self.1);
+        self.1.set(self.1.get() + 1);
         self.0.read(probe)
     }
 }
 
 /// Catches a check with no total budget: a probe not begun when the budget is used is not
 /// read, and the result is red and says why; with room left every probe is read; a probe
-/// that began is read in full.
+/// that began is read in full. The budget is used up once the first probe has been read.
 #[test]
 fn a_check_that_runs_out_of_time_is_red() {
     let base = baseline();
-    let slow = Slow(Fake::clean(), Duration::from_millis(60));
-    let now = std::time::Instant::now();
-    let red = assert(
-        &slow,
-        Some(&base),
-        &CHEAP,
-        (&|| false, Some(now + Duration::from_millis(30))),
-    );
+    let reader = Counting(Fake::clean(), std::cell::Cell::new(0));
+    let used_up = || reader.1.get() >= 1;
+    let red = assert(&reader, Some(&base), &CHEAP, (&|| false, &used_up));
     // The first probe began in time and was read in full; the second was not begun.
     assert_eq!(red, lines(&["ipc: not read, the check ran out of time"]));
-    let room = Some(std::time::Instant::now() + Duration::from_secs(60));
-    assert!(assert(&slow, Some(&base), &CHEAP, (&|| false, room)).is_empty());
+    assert_eq!(reader.1.get(), 1);
+    let reader = Counting(Fake::clean(), std::cell::Cell::new(0));
+    assert!(assert(&reader, Some(&base), &CHEAP, (&|| false, &|| false)).is_empty());
+    assert_eq!(
+        reader.1.get(),
+        CHEAP.len(),
+        "with room left every probe is read"
+    );
 }

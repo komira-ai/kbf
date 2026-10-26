@@ -1529,46 +1529,56 @@ mod tests {
 
     /// Catches blocking work that goes on after the future waiting for it was dropped (the
     /// runtime shutting down, or a panic unwinding through the poll): the drop sets the
-    /// cancel flag, so the work records no step after the one in flight. A run that
-    /// finishes does not leave the flag set (the canaries reuse it after the hand-over).
-    /// Catches the drop guard being removed.
+    /// cancel flag, so the work ends by it. A run that finishes does not leave the flag
+    /// set (the canaries reuse it after the hand-over). Catches the drop guard being
+    /// removed. The wait is dropped once the work has started, by a `select!` that takes
+    /// another branch, and the work is waited for by its own signal when it ends; it
+    /// would otherwise run to its 30 s safety bound and be seen not to have been
+    /// cancelled.
     #[test]
     fn a_dropped_wait_stops_the_blocking_work_too() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::{Arc, Mutex};
+        use std::sync::{Arc, mpsc};
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
             .build()
             .expect("runtime");
-        let steps = Arc::new(Mutex::new(0_u32));
         let cancel = Arc::new(AtomicBool::new(false));
-        let (work_steps, work_cancel) = (Arc::clone(&steps), Arc::clone(&cancel));
+        let work_cancel = Arc::clone(&cancel);
+        let (started_tx, mut started) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (ended_tx, ended) = mpsc::channel::<bool>();
         let work = async move {
             let _ = tokio::task::spawn_blocking(move || {
-                while !work_cancel.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(20));
-                    *work_steps.lock().expect("steps") += 1;
+                // Says it started on every step until the flag is set, so the wait is
+                // dropped only after the work was running and the flag was still clear. At
+                // most 30 s of steps: a flag that never comes ends the loop and the
+                // test's asserts report it.
+                for _ in 0..30_000 {
+                    if work_cancel.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let _ = started_tx.send(());
+                    std::thread::sleep(Duration::from_millis(1));
                 }
+                let _ = ended_tx.send(work_cancel.load(Ordering::SeqCst));
             })
             .await;
         };
-        // The wait is dropped by the timeout, as a shutdown or a panic would drop it.
-        let ended = rt.block_on(async {
-            tokio::time::timeout(
-                Duration::from_millis(70),
-                until_killed(work, &cancel, std::future::pending::<Option<()>>()),
-            )
-            .await
+        // The wait is dropped when the work has started, as a shutdown or a panic would
+        // drop it.
+        rt.block_on(async {
+            tokio::select! {
+                _ = started.recv() => {}
+                _ = until_killed(work, &cancel, std::future::pending::<Option<()>>()) => {
+                    panic!("the work ended by itself")
+                }
+            }
         });
-        assert!(ended.is_err(), "the wait was not dropped");
         assert!(
             cancel.load(Ordering::SeqCst),
             "the drop did not set the flag"
         );
-        let at_drop = *steps.lock().expect("steps");
-        std::thread::sleep(Duration::from_millis(150));
         assert!(
-            *steps.lock().expect("steps") <= at_drop + 1,
+            ended.recv().expect("the work ended"),
             "work went on after the wait was dropped"
         );
         let finished = AtomicBool::new(false);

@@ -73,6 +73,8 @@ pub struct PackageHost {
     pub(crate) allowlist: PathBuf,
     pub(crate) units: Vec<Unit>,
     pub(crate) restart_wait: Wait,
+    /// The clock the wait is counted on.
+    pub(crate) pace: crate::pace::Pace,
     /// `systemctl`, `curl`, `gh release download` and the package manager's tools.
     pub(crate) runner: Box<dyn Runner>,
     /// `gh attestation verify`, the installer's way.
@@ -139,7 +141,7 @@ pub(crate) struct Copies {
 impl PackageHost {
     fn restart_units(&self) -> Result<(), String> {
         for unit in &self.units {
-            restart_and_wait(&*self.runner, unit, self.restart_wait)?;
+            restart_and_wait(&*self.runner, unit, self.restart_wait, &self.pace)?;
         }
         Ok(())
     }
@@ -206,7 +208,7 @@ impl PackageHost {
         let prefix = commit_prefix(version).ok_or_else(|| {
             Fault::refused(
                 Code::UnknownRelease,
-                "the version carries no commit (+g and 12 hex digits)",
+                "the version carries no commit (+g or +, then 12 hex digits)",
             )
         })?;
         let held = record.files.iter().find(|(commit, kept)| {
@@ -611,6 +613,7 @@ pub fn production(units: Vec<Unit>, format: Format, state_dir: &Path) -> Package
         allowlist: PathBuf::from(super::linux::ALLOWLIST),
         units,
         restart_wait: crate::plan::ACTIVE_WAIT,
+        pace: crate::pace::Pace::real(),
         runner: Box::new(crate::runner::SystemRunner),
         installer_runner: Box::new(kbf_installer::run::SystemRunner),
         tools: Tools::production(),

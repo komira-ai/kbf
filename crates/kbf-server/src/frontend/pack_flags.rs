@@ -6,8 +6,12 @@
 //! store is built or contacted. The endpoint needs `--pack-index`, the bucket and the
 //! credentials file, which clap enforces (so does the file of `kbf.toml`, which becomes flags).
 //! The companions that have a default (`--pack-store-region`, `--pack-bytes`, `--pack-writer`,
-//! `--pack-inflight-bytes`, `--pack-upload-idle-timeout`) need nothing, since the config
-//! template writes every flag with a default as a live line.
+//! `--pack-inflight-bytes`, `--pack-upload-idle-timeout`, `--pack-commit-sample`) need nothing,
+//! since the config template writes every flag with a default as a live line.
+//!
+//! With the endpoint and `--pack-index` the frontend also takes a daemon's `CommitPack`
+//! ([`crate::pack_locate`]): `--pack-commit-sample` says how many blobs of a committed pack it
+//! reads back and checks ([`commits`]).
 //!
 //! The credentials are a file and never a flag, as a command line is world-readable: JSON with
 //! `access_key_id` and `secret_access_key`, readable by its owner alone.
@@ -31,6 +35,8 @@ use kbf_pack::{CacheError, PackError, PackKeys, ReadCache, WriterKind};
 use kbf_state::PackIndex;
 use zeroize::Zeroizing;
 
+use crate::pack_locate::PackCommits;
+
 const ENDPOINT: &str = "pack_store_endpoint";
 const BUCKET: &str = "pack_store_bucket";
 const REGION: &str = "pack_store_region";
@@ -41,6 +47,7 @@ const CACHE_DIR: &str = "pack_cache_dir";
 const CACHE_BYTES: &str = "pack_cache_bytes";
 const INFLIGHT_BYTES: &str = "pack_inflight_bytes";
 const UPLOAD_IDLE_TIMEOUT: &str = "pack_upload_idle_timeout";
+const COMMIT_SAMPLE: &str = "pack_commit_sample";
 
 /// The id of `--pack-index`, which the endpoint needs.
 const PACK_INDEX: &str = "pack_index";
@@ -63,8 +70,12 @@ const MIN_INFLIGHT_BYTES: i64 = 64 << 20;
 /// The longest `--pack-upload-idle-timeout`, in seconds: a day, the longest the packs keep.
 const MAX_IDLE_SECS: u64 = kbf_front::MAX_UPLOAD_IDLE_TIMEOUT.as_secs();
 
-/// The ten flags.
-pub(super) fn args() -> [Arg; 10] {
+/// The most `--pack-commit-sample` takes: the most blobs a pack holds
+/// ([`kbf_front::MAX_COMMIT_BLOBS`]), at which every blob of a pack is checked.
+const MAX_COMMIT_SAMPLE: i64 = 16_384;
+
+/// The eleven flags.
+pub(super) fn args() -> [Arg; 11] {
     [
         Arg::new(ENDPOINT)
             .long("pack-store-endpoint")
@@ -155,6 +166,21 @@ pub(super) fn args() -> [Arg; 10] {
                  `--pack-inflight-bytes` is the only bound on that. At least 1, at most 86400. \
                  Used only with `--pack-store-endpoint`",
             ),
+        Arg::new(COMMIT_SAMPLE)
+            .long("pack-commit-sample")
+            .value_name("BLOBS")
+            .value_parser(clap::value_parser!(u32).range(0..=MAX_COMMIT_SAMPLE))
+            .default_value("2")
+            .help(
+                "How many blobs of each pack a daemon commits this frontend reads back from the \
+                 pack store and checks against their digests before it records the pack, spread \
+                 over the pack from a start that its name picks (the same commit is always \
+                 checked at the same blobs). A pack with fewer blobs is checked whole, and \
+                 16384, the most blobs a pack holds, checks every blob. 0 checks no blob and \
+                 trusts the daemon: a blob that is not its digest is then caught only when it is \
+                 first read. The last byte of the pack is read in any case, so a pack that is \
+                 not stored is always refused. Used only with `--pack-store-endpoint`",
+            ),
         Arg::new(WRITER)
             .long("pack-writer")
             .value_name("NAME")
@@ -205,6 +231,8 @@ pub struct PackFlags {
     pub writer: String,
     /// `--pack-cache-dir` and `--pack-cache-bytes`, both or neither.
     pub cache: Option<(PathBuf, u64)>,
+    /// `--pack-commit-sample`.
+    pub commit_sample: usize,
 }
 
 /// The setting the flags in `m` make: `None` unless `--pack-store-endpoint` is given.
@@ -215,6 +243,7 @@ pub(super) fn from_matches(m: &ArgMatches) -> Option<PackFlags> {
     let text = |id: &str| m.get_one::<String>(id).cloned().unwrap_or_default();
     let inflight = m.get_one::<u32>(INFLIGHT_BYTES).copied();
     let idle_secs = m.get_one::<u64>(UPLOAD_IDLE_TIMEOUT).copied();
+    let sample = m.get_one::<u32>(COMMIT_SAMPLE).copied();
     Some(PackFlags {
         endpoint: endpoint.clone(),
         bucket: text(BUCKET),
@@ -231,7 +260,16 @@ pub(super) fn from_matches(m: &ArgMatches) -> Option<PackFlags> {
             .get_one::<PathBuf>(CACHE_DIR)
             .cloned()
             .zip(m.get_one::<u64>(CACHE_BYTES).copied()),
+        commit_sample: sample.unwrap_or_default() as usize,
     })
+}
+
+/// What the frontend commits a daemon's packs with: the packs and the number of blobs of a pack
+/// to check, when it has both (`--pack-store-endpoint` opened packs); none otherwise, and the
+/// frontend answers `CommitPack` UNIMPLEMENTED.
+pub(super) fn commits(packs: Option<&Packs>, flags: Option<&PackFlags>) -> Option<PackCommits> {
+    let both = packs.zip(flags);
+    both.map(|(packs, flags)| PackCommits::new(packs.clone(), flags.commit_sample))
 }
 
 /// Why the pack store cannot be opened. No message carries the secret.

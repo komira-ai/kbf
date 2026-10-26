@@ -185,14 +185,14 @@ fn baseline_defects(probe: Probe, lines: &[String]) -> Lines {
 /// line` for what is there and should not be, `probe: - line` for what the baseline has
 /// and is gone. Empty means the user is as the baseline says. `stopped` is asked before
 /// each probe: when it says so (the lease was killed) the rest are not read, and the
-/// result says that. `until` is the time the check may take in all: asked before each
-/// probe (one that has begun is not cut short; the tools it runs have their own limit),
-/// and a probe not begun by then is not read, which is red.
+/// result says that. `out_of_time` says whether the time the check may take in all has
+/// passed: asked before each probe (one that has begun is not cut short; the tools it
+/// runs have their own limit), and a probe not begun by then is not read, which is red.
 pub(crate) fn assert(
     reader: &dyn Reader,
     baseline: Option<&Snapshot>,
     probes: &[Probe],
-    (stopped, until): (&dyn Fn() -> bool, Option<std::time::Instant>),
+    (stopped, out_of_time): (&dyn Fn() -> bool, &dyn Fn() -> bool),
 ) -> Lines {
     let mut wrong = Vec::new();
     for &probe in probes {
@@ -200,7 +200,7 @@ pub(crate) fn assert(
             wrong.push(format!("{probe}: not read, the check was stopped"));
             break;
         }
-        if until.is_some_and(|t| std::time::Instant::now() >= t) {
+        if out_of_time() {
             wrong.push(format!("{probe}: not read, the check ran out of time"));
             break;
         }

@@ -43,6 +43,10 @@ server-only or converged (server and builds on one host): the server's units, th
 priorities between MinIO, the server and builds, and the memory left to builds.
 [docs/deploy/kbf-ui.md](docs/deploy/kbf-ui.md) is the operator guide to the read-only,
 open web UI: how to reach it, how to turn it off, and what it exposes.
+[docs/deploy/frontends-behind-a-load-balancer.md](docs/deploy/frontends-behind-a-load-balancer.md)
+is the recommended deployment: several frontends behind a load balancer, bare-metal nodes,
+one object store, and a live update that drains one frontend at a time (Envoy and compose
+examples in [examples/deploy](examples/deploy)).
 [docs/deploy/containers.md](docs/deploy/containers.md) runs the frontend and the update
 coordinator as container images: the attested archives, their import without a registry, and
 the files each one is given.

@@ -137,7 +137,8 @@ impl Prepared {
         );
         let api = Arc::new(
             EnrollApi::new(store, Arc::new(CaPins(Arc::clone(&ca))), Arc::new(OsRandom))
-                .with_members(members),
+                .with_members(members)
+                .with_frontend_names(&flags.frontend_names),
         );
         let (listener, latch) =
             EnrollListener::new(socket, service, Arc::clone(&tls), flags.limits).serve()?;
