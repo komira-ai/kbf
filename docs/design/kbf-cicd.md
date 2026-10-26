@@ -727,10 +727,10 @@ does not skip the check: the beta is red ("not run" is not "passed").
 
 ## 11. Metrics the stages read
 
-Exist **[F]**: `kbf_cache_lost_blobs`, `kbf_cache_blob_losses_total`, `kbf_execute_requests_total`, `kbf_execute_errors_total`,
+Exist **[F]**: `kbf_cache_lost_blobs`, `kbf_cache_blob_losses_total`, `kbf_execute_requests_total`, `kbf_execute_errors_total{cause}` (status, client_abort, dropped; M11),
 `kbf_execute_in_flight`, `kbf_execute_queued_seconds` (histogram), `kbf_frontend_relay_untraced`, the write-tier series.
 Open pull requests **[open]**: `under_replicated_blobs`, open writes, repair debt, planned-down (#912, #913, #914).
-**[missing]**: failed actions by class (M10), execute errors by cause (M11), a process boot counter and a membership-state
+**[missing]**: failed actions by class (M10), a process boot counter and a membership-state
 gauge (M13), a `FindMissingBlobs` latency histogram (M14).
 
 ## 12. Missing pieces and the issues to file
