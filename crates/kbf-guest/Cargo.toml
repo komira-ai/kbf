@@ -25,6 +25,7 @@ path = "src/bin/kbf-guest-act.rs"
 test = false
 
 [dependencies]
+base64.workspace = true
 clap.workspace = true
 hex.workspace = true
 kbf-testkit.workspace = true

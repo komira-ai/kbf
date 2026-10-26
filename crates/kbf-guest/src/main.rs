@@ -12,7 +12,8 @@
 //! (src/probe.rs), and `mount-share`, the root mount daemon's bounded virtiofs mount
 //! (src/mount.rs), and `probe-diag`, which says what a root process sees of the share
 //! and which write step is refused (src/diag.rs), and `shutdown-listen`, the root daemon
-//! that shuts the guest down when the host asks over virtio-socket (src/shutdown.rs).
+//! that shuts the guest down when the host asks over virtio-socket (src/shutdown.rs), and
+//! `sim`, the root daemon that runs the iOS simulator probe (src/sim.rs).
 
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
@@ -26,6 +27,7 @@ use kbf_guest::probe;
 use kbf_guest::server::{Agent, Config, HELLO_TIMEOUT};
 use kbf_guest::session;
 use kbf_guest::shutdown;
+use kbf_guest::sim;
 use kbf_guest::wire::TOKEN_LEN;
 
 /// The agent inside a VM guest: runs one command per boot for the host.
@@ -78,6 +80,11 @@ enum Cmd {
         #[arg(long, default_value_t = shutdown::PORT)]
         port: u32,
     },
+    /// Run the iOS simulator probe (Xcode first launch, a runtime added, a device created,
+    /// booted and photographed) and send one frame per step to the host. Runs as root, as a
+    /// LaunchDaemon, once per boot; the steps that need a user session run as the console
+    /// user through `launchctl asuser`.
+    Sim(sim::SimArgs),
 }
 
 fn main() -> ExitCode {
@@ -95,6 +102,7 @@ fn run(cli: Cli, root: Result<(), String>) -> ExitCode {
         real_mounter().as_deref(),
         real_diagnoser().as_deref(),
         real_shutdown_daemon().as_deref(),
+        real_sim_host().as_deref(),
     )
 }
 
@@ -106,6 +114,7 @@ fn run_with(
     mounter: Option<&dyn mount::Mounter>,
     diagnoser: Option<&dyn diag::DiagHost>,
     daemon: Option<&dyn shutdown::Daemon>,
+    sim_host: Option<&dyn sim::SimHost>,
 ) -> ExitCode {
     if !matches!(
         cli.command,
@@ -114,6 +123,7 @@ fn run_with(
             | Cmd::MountShare(_)
             | Cmd::ProbeDiag(_)
             | Cmd::ShutdownListen { .. }
+            | Cmd::Sim(_)
     ) && let Err(e) = root
     {
         eprintln!("{e}");
@@ -145,7 +155,43 @@ fn run_with(
         Cmd::MountShare(args) => mount_cmd(mounter, &args),
         Cmd::ProbeDiag(args) => diag_cmd(diagnoser, &args),
         Cmd::ShutdownListen { port } => shutdown_cmd(daemon, port),
+        Cmd::Sim(args) => sim_cmd(sim_host, &args),
     }
+}
+
+/// Runs the iOS simulator probe with `host` (`None`: not a macOS guest, refuse with 2).
+/// Exits 0 when the run ended and the host got its summary, whatever the steps' verdicts
+/// (the host reads them from the frames), 1 when it was not root or the summary never
+/// arrived.
+fn sim_cmd(host: Option<&dyn sim::SimHost>, args: &sim::SimArgs) -> ExitCode {
+    let Some(host) = host else {
+        eprintln!("kbf-guest: sim runs inside a macOS guest");
+        return ExitCode::from(2);
+    };
+    let summary = sim::run(host, &sim::Config::from(args), &mut std::io::stderr());
+    let sent = !summary.undelivered.iter().any(|n| n == sim::SUMMARY_NAME);
+    if summary.steps.is_empty() || !sent {
+        eprintln!(
+            "kbf-guest: sim: no run to report ({})",
+            summary
+                .note
+                .as_deref()
+                .unwrap_or("the summary frame did not reach the host")
+        );
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// The host `sim` uses: the real guest on macOS, nothing elsewhere.
+#[cfg(target_os = "macos")]
+fn real_sim_host() -> Option<Box<dyn sim::SimHost>> {
+    Some(Box::new(kbf_guest::sim_host::RealSimHost::new()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn real_sim_host() -> Option<Box<dyn sim::SimHost>> {
+    None
 }
 
 /// Runs the shutdown listener with `daemon` (`None`: not a macOS guest, refuse with 2).
@@ -413,7 +459,15 @@ mod tests {
         let r = ["probe-ready", "--out", ready.to_str().expect("p")];
         for args in [&g[..], &r[..]] {
             assert_eq!(
-                run_with(cli(args), refusal(), Some(&h_acking()), None, None, None),
+                run_with(
+                    cli(args),
+                    refusal(),
+                    Some(&h_acking()),
+                    None,
+                    None,
+                    None,
+                    None
+                ),
                 ExitCode::SUCCESS
             );
         }
@@ -438,7 +492,7 @@ mod tests {
             "/w",
         ];
         assert_eq!(
-            run_with(cli(&g), refusal(), Some(&h()), None, None, None),
+            run_with(cli(&g), refusal(), Some(&h()), None, None, None, None),
             ExitCode::SUCCESS
         );
         let r = [
@@ -449,7 +503,7 @@ mod tests {
             "p",
         ];
         assert_eq!(
-            run_with(cli(&r), refusal(), Some(&h()), None, None, None),
+            run_with(cli(&r), refusal(), Some(&h()), None, None, None, None),
             ExitCode::SUCCESS
         );
         let text = std::fs::read_to_string(&guest).expect("guest result");
@@ -460,7 +514,7 @@ mod tests {
                 .contains("\"session\"")
         );
         assert_eq!(
-            run_with(cli(&r), refusal(), None, None, None, None),
+            run_with(cli(&r), refusal(), None, None, None, None, None),
             ExitCode::from(2)
         );
     }
@@ -488,8 +542,9 @@ mod tests {
             "--attempts=2",
             "--delay-ms=0",
         ];
-        let go =
-            |m: Option<&dyn mount::Mounter>| run_with(cli(&args), refusal(), None, m, None, None);
+        let go = |m: Option<&dyn mount::Mounter>| {
+            run_with(cli(&args), refusal(), None, m, None, None, None)
+        };
         assert_eq!(go(Some(&M(true))), ExitCode::SUCCESS);
         assert_eq!(go(Some(&M(false))), ExitCode::FAILURE);
         assert_eq!(go(None), ExitCode::from(2));
@@ -539,8 +594,9 @@ mod tests {
         let share = format!("--share={}", dir.join("none").display());
         let control = format!("--control-dir={}", dir.join("none").display());
         let args = ["probe-diag", share.as_str(), control.as_str()];
-        let go =
-            |d: Option<&dyn diag::DiagHost>| run_with(cli(&args), refusal(), None, None, d, None);
+        let go = |d: Option<&dyn diag::DiagHost>| {
+            run_with(cli(&args), refusal(), None, None, d, None, None)
+        };
         assert_eq!(go(Some(&D)), ExitCode::SUCCESS);
         assert_eq!(go(None), ExitCode::from(2));
     }
@@ -563,7 +619,7 @@ mod tests {
     fn shutdown_listen_runs_as_root_on_its_port_and_fails_loud() {
         let refusal = || Err("kbf-guest refuses to run as root".to_owned());
         let go = |args: &[&str], d: Option<&dyn shutdown::Daemon>| {
-            run_with(cli(args), refusal(), None, None, None, d)
+            run_with(cli(args), refusal(), None, None, None, d, None)
         };
         let ok = Dm(None, std::cell::Cell::new(0));
         assert_eq!(go(&["shutdown-listen"], Some(&ok)), ExitCode::SUCCESS);
@@ -576,5 +632,100 @@ mod tests {
         let bad = Dm(Some("bind failed"), std::cell::Cell::new(0));
         assert_eq!(go(&["shutdown-listen"], Some(&bad)), ExitCode::FAILURE);
         assert_eq!(go(&["shutdown-listen"], None), ExitCode::from(2));
+    }
+
+    /// A simulator host with nothing staged: every command succeeds, the screenshot is a
+    /// few bytes, and the vsock acknowledges (or not).
+    struct S {
+        root: bool,
+        up: bool,
+    }
+
+    impl sim::SimHost for S {
+        fn is_root(&self) -> bool {
+            self.root
+        }
+        fn runtime_images(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn app_bundles(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn console_user(&self) -> Option<sim::ConsoleUser> {
+            Some(sim::ConsoleUser {
+                uid: 501,
+                name: "u".to_owned(),
+            })
+        }
+        fn prepare_out_dir(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn read_screenshot(&self, _: usize) -> Result<Vec<u8>, String> {
+            Ok(vec![1, 2, 3])
+        }
+        fn run(&self, argv: &[String], _: std::time::Duration) -> sim::Outcome {
+            let line = argv.join(" ");
+            let stdout = if line.contains("list runtimes") {
+                r#"{"runtimes":[{"identifier":"com.apple.CoreSimulator.SimRuntime.iOS-27-0","version":"27.0","isAvailable":true}]}"#
+            } else if line.contains("list devicetypes") {
+                r#"{"devicetypes":[{"identifier":"t","name":"iPhone 16"}]}"#
+            } else if line.contains("simctl create") {
+                "6F3A1B2C-0D4E-4F5A-8B6C-7D8E9F0A1B2C\n"
+            } else {
+                ""
+            };
+            sim::Outcome {
+                ended: sim::Ended::Exited(0),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+                cut: false,
+                ms: 1,
+            }
+        }
+        fn send(
+            &self,
+            _: u32,
+            _: &kbf_guest::frame::Frame,
+        ) -> Result<(), kbf_guest::frame::SendError> {
+            if self.up {
+                Ok(())
+            } else {
+                Err(kbf_guest::frame::SendError::Unavailable("no".into()))
+            }
+        }
+        fn pause(&self, _: std::time::Duration) {}
+    }
+
+    /// Catches `sim` being refused as root (it is a root daemon, so the refusal that guards
+    /// the agent must not apply), run off macOS, or reporting success without a summary the
+    /// host received or when it was not root.
+    #[test]
+    fn sim_runs_as_root_and_exits_by_whether_the_host_got_its_summary() {
+        let root = || Err("kbf-guest refuses to run as root".to_owned());
+        let go = |host: Option<&dyn sim::SimHost>| {
+            run_with(cli(&["sim"]), root(), None, None, None, None, host)
+        };
+        assert_eq!(
+            go(Some(&S {
+                root: true,
+                up: true
+            })),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            go(Some(&S {
+                root: true,
+                up: false
+            })),
+            ExitCode::FAILURE
+        );
+        assert_eq!(
+            go(Some(&S {
+                root: false,
+                up: true
+            })),
+            ExitCode::FAILURE
+        );
+        assert_eq!(go(None), ExitCode::from(2));
     }
 }

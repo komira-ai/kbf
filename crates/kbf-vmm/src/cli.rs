@@ -50,6 +50,10 @@ pub enum Gate {
     /// helper event timed, CPU and disk writes sampled, the clones kept for `image
     /// harvest` (give `--guest-binary` and `--keep`).
     E1,
+    /// The iOS simulator inside a guest: first launch of Xcode, a runtime added, a device
+    /// created, booted and photographed, one result frame per step (give `--guest-binary`;
+    /// the base needs `image setup --xcode --sim-runtime`).
+    E3,
     /// Whether a root offline write into a guest volume works.
     P0,
     /// The third-VM limit error, and the slot after SIGKILL of a helper.
@@ -95,6 +99,20 @@ pub struct ProbeArgs {
     /// `image harvest` can read the guest's disk.
     #[arg(long)]
     pub keep: bool,
+    /// E3 only: which guests to run, one after the other: `on` (a graphics device, the
+    /// default, unless `--headless`), `off` (none) or `both` (`off` first, then `on`).
+    #[arg(long, value_enum)]
+    pub graphics: Option<Graphics>,
+}
+
+/// The guests `probe e3` runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum Graphics {
+    On,
+    Off,
+    /// Without graphics first, then with.
+    Both,
 }
 
 #[derive(Debug, Args)]
@@ -163,7 +181,12 @@ pub enum ImageCmd {
         /// and SHA-256, and each bundle's files with a SHA-256 for each.
         #[arg(long = "sim-runtime", value_name = "DMG_OR_BUNDLE")]
         sim_runtimes: Vec<PathBuf>,
-        /// Copy symbolic links inside Xcode.app whose target leaves the app (an absolute
+        /// An app bundle (`<name>.app`, built for the iOS simulator, with an Info.plist) to
+        /// stage under /private/var/kbf-sim/apps for `probe e3` to install and launch; copied
+        /// by the same rules as --xcode. The directory then holds exactly this app.
+        #[arg(long)]
+        sim_app: Option<PathBuf>,
+        /// Copy symbolic links inside Xcode.app (or the app) whose target leaves the app (an absolute
         /// path elsewhere, or more `..` than the link is deep) as links, and list them in
         /// the report. Without this flag such a link is refused.
         #[arg(long)]

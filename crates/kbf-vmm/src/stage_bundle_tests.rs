@@ -58,8 +58,8 @@ fn a_bundle_is_planned_as_a_tree_with_the_dmg_name_rules() {
     // The bundle's bytes are part of what the free-space check counts.
     assert_eq!(
         Plan {
-            xcode: None,
-            runtimes: plans
+            runtimes: plans,
+            ..Plan::default()
         }
         .bytes(),
         20 + 5

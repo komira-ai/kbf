@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+base64.workspace = true
 hex.workspace = true
 kbf-guest.workspace = true
 libc.workspace = true

@@ -10,6 +10,7 @@ pub mod bench;
 pub mod bundle;
 pub mod cli;
 pub mod e1;
+pub mod e3;
 pub mod gates;
 pub mod guest;
 pub mod guest_command;
@@ -39,6 +40,8 @@ mod vz;
 mod app_tests;
 #[cfg(test)]
 mod bench_tests;
+#[cfg(test)]
+mod e3_tests;
 #[cfg(test)]
 mod fake;
 #[cfg(test)]

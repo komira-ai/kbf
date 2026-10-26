@@ -57,12 +57,16 @@ fn a_leftover_that_cannot_be_removed_stops_the_stage_and_touches_nothing_outside
         ("stale.dmg", 0),
         (".runtimes.kbf-staging", 0),
         ("iOS.dmg", 0),
+        ("old.app", 0),
     ] {
         let dir = tmp("tamper-immutable");
         let app = fake_xcode(&dir);
         write(&dir.join("iOS.dmg"), "hello", 0o644);
-        let plan = plan(Some(&app), &[dir.join("iOS.dmg")], false).expect("plan");
+        let demo = fake_app(&dir, "Demo.app");
+        let plan =
+            plan_with_app(Some(&app), &[dir.join("iOS.dmg")], Some(&demo), false).expect("plan");
         let volume = tampered_volume(&dir);
+        std::fs::create_dir_all(volume.join("private/var/kbf-sim/apps/old.app")).expect("old");
         let outside = dir.join("host-file");
         write(&outside, "keep me", 0o644);
         let sim = volume.join("private/var/kbf-sim");
@@ -284,4 +288,20 @@ fn planned_modes_lose_group_and_world_write_and_keep_the_rest() {
     let staged = volume.join("Applications/Xcode.app/Contents");
     assert_eq!(mode_of(&staged.join("Info.plist")), 0o644);
     assert_eq!(mode_of(&staged.join("Frameworks")), 0o755);
+}
+
+/// Catches a partial app bundle left under its staging name in the app directory (where the
+/// guest looks for what to install) when the copy fails.
+#[test]
+fn a_failed_app_build_leaves_no_staging_tree_in_the_app_directory() {
+    let dir = tmp("tamper-app");
+    let demo = fake_app(&dir, "Demo.app");
+    let plan = plan_with_app(None, &[], Some(&demo), false).expect("plan");
+    std::fs::remove_file(demo.join("Info.plist")).expect("gone");
+    let volume = tampered_volume(&dir);
+    Harness::new(100 * GIB)
+        .run(&volume, &plan)
+        .expect_err("copy");
+    let apps = volume.join("private/var/kbf-sim/apps");
+    assert_eq!(std::fs::read_dir(apps).expect("apps").count(), 0);
 }

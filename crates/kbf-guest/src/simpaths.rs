@@ -4,7 +4,8 @@
 
 /// The Xcode the setup clones into the guest.
 pub const XCODE_APP: &str = "/Applications/Xcode.app";
-/// The directory holding the simulator runtime disk images (`*.dmg`), exactly the ones
+/// The directory holding the simulator runtimes (disk images `*.dmg` and exported bundles
+/// `*.exportedBundle`), exactly the ones
 /// the latest setup staged.
 pub const RUNTIME_DIR: &str = "/private/var/kbf-sim/runtimes";
 /// The directory holding app bundles the setup staged for the simulator to install.

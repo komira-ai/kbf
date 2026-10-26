@@ -685,6 +685,14 @@ pub fn run(ctx: &Ctx<'_>, gate: Gate, run_as: Option<u32>) -> Report {
         Gate::G3 => g3(ctx),
         Gate::G5 => g5(ctx, run_as),
         Gate::E1 => crate::e1::e1(ctx),
+        Gate::E3 => crate::e3::e3(
+            ctx,
+            if ctx.graphics {
+                crate::cli::Graphics::On
+            } else {
+                crate::cli::Graphics::Off
+            },
+        ),
         Gate::P0 => p0(ctx),
         Gate::P2 => p2(ctx),
         Gate::P6 => p6(ctx),

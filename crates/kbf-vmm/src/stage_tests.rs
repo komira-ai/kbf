@@ -854,14 +854,22 @@ mod setup_flow {
         };
         let r = setup(&sys, &base, &args);
         assert_eq!(r.status, Status::Ok, "{r:?}");
-        // Staging alone writes no daemons and needs no guest binary.
-        assert!(sys.offline_calls.borrow().is_empty());
+        // Staging alone needs no guest binary: the only file written to the disk is the
+        // simulator daemon's plist.
+        assert_eq!(
+            sys.offline_calls.borrow().clone(),
+            vec![(
+                base.join("disk.img"),
+                vec!["Library/LaunchDaemons/com.kbf.sim.plist".to_owned()]
+            )]
+        );
         let calls = sys.stage_calls.borrow();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, base.join("disk.img"));
         assert_eq!(calls[0].1.xcode.as_ref().expect("x").source, app);
         assert_eq!(calls[0].1.runtimes[0].name, "iOS.dmg");
-        assert!(r.details["offline_setup"].is_null());
+        // The write that put the simulator daemon in is reported next to the staging.
+        assert!(!r.details["offline_setup"].is_null());
         assert_eq!(
             r.details["staged"],
             serde_json::json!({"xcode": null, "runtimes": null})
@@ -881,8 +889,12 @@ mod setup_flow {
                 sys.offline_calls.borrow().len(),
                 sys.stage_calls.borrow().len()
             ),
-            (1, 2)
+            (2, 2)
         );
+        // One write holds the probe daemons and the simulator daemon together.
+        let written = sys.offline_calls.borrow()[1].1.clone();
+        assert!(written.contains(&"usr/local/libexec/kbf-guest".to_owned()));
+        assert!(written.contains(&"Library/LaunchDaemons/com.kbf.sim.plist".to_owned()));
         assert!(!r.details["offline_setup"].is_null());
     }
 
@@ -966,6 +978,202 @@ mod setup_flow {
             reason.contains("staging:") && reason.contains("not enough room"),
             "{reason}"
         );
+    }
+}
+
+fn fake_app(dir: &Path, name: &str) -> PathBuf {
+    let app = dir.join(name);
+    write(&app.join("Info.plist"), "<plist/>", 0o644);
+    write(&app.join("Demo"), "binary", 0o755);
+    write(&app.join("Frameworks/F.framework/F"), "framework", 0o644);
+    link("F", &app.join("Frameworks/F.framework/Current"));
+    app
+}
+
+/// Catches an app bundle taken without the checks of Xcode.app: a link as the bundle, a
+/// directory with no Info.plist, a name the guest path or a frame name cannot carry, and
+/// an absolute link that names a path of another tree.
+#[test]
+fn an_app_bundle_is_a_real_app_directory_with_a_safe_name_and_contained_links() {
+    let dir = tmp("stage-app-plan");
+    let app = fake_app(&dir, "Demo.app");
+    let p = plan_app(&app, false).expect("plan");
+    assert_eq!(p.name, "Demo.app");
+    assert_eq!(
+        p.tree.bytes,
+        ("<plist/>".len() + "binary".len() + "framework".len()) as u64
+    );
+    assert!(
+        p.tree
+            .nodes
+            .iter()
+            .any(|n| matches!(n, Node::Link { rel, target } if rel.ends_with("Current") && target == Path::new("F")))
+    );
+
+    link("Demo.app", &dir.join("Alias.app"));
+    assert_eq!(
+        plan_app(&dir.join("Alias.app"), false),
+        Err(StageError::Symlink(dir.join("Alias.app")))
+    );
+    std::fs::create_dir(dir.join("Bare.app")).expect("bare");
+    assert_eq!(
+        plan_app(&dir.join("Bare.app"), false),
+        Err(StageError::NotApp(dir.join("Bare.app")))
+    );
+    for bad in ["no suffix", "a b.app", "x..app", ".hidden.app"] {
+        let d = dir.join(bad);
+        write(&d.join("Info.plist"), "x", 0o644);
+        assert_eq!(
+            plan_app(&d, false),
+            Err(StageError::BadAppName(d.clone())),
+            "{bad}"
+        );
+    }
+
+    // Absolute links are judged against the app's own place in the guest.
+    link("/private/var/kbf-sim/apps/Demo.app/Demo", &app.join("self"));
+    assert!(plan_app(&app, false).is_ok());
+    link("/Applications/Xcode.app/Contents", &app.join("other"));
+    let e = plan_app(&app, false).expect_err("refused").to_string();
+    assert!(
+        e.contains("leaves the app") && e.contains("--allow-external-links"),
+        "{e}"
+    );
+    assert_eq!(
+        plan_app(&app, true)
+            .expect("allowed")
+            .tree
+            .external_links
+            .len(),
+        1
+    );
+}
+
+/// Catches an app that lands anywhere but under the apps directory, a directory that keeps
+/// an earlier app (the guest installs the one it finds), Xcode.app touched by an
+/// app-only setup, and an app that is not owned by root.
+#[test]
+fn an_app_is_staged_alone_in_its_directory_and_replaces_the_earlier_one() {
+    let dir = tmp("stage-app");
+    let app = fake_app(&dir, "Demo.app");
+    let volume = volume_in(&dir);
+    write(
+        &volume.join("private/var/kbf-sim/apps/Old.app/Info.plist"),
+        "old",
+        0o644,
+    );
+    write(&volume.join("Applications/Xcode.app/keep"), "keep", 0o644);
+    let plan = plan_with_app(None, &[], Some(&app), false).expect("plan");
+    let h = Harness::new(100 * GIB);
+    let out = h.run(&volume, &plan).expect("execute");
+    let apps = volume.join("private/var/kbf-sim/apps");
+    assert_eq!(listing(&apps.join("Demo.app")), listing(&app));
+    let top: Vec<_> = std::fs::read_dir(&apps)
+        .expect("dir")
+        .map(|e| e.expect("e").file_name())
+        .collect();
+    assert_eq!(top, ["Demo.app"]);
+    assert_eq!(
+        std::fs::read_to_string(volume.join("Applications/Xcode.app/keep")).expect("keep"),
+        "keep"
+    );
+    assert_eq!(
+        (out["app"]["name"].as_str(), out["app"]["dest"].as_str()),
+        (Some("Demo.app"), Some("/private/var/kbf-sim/apps/Demo.app"))
+    );
+    assert_eq!(out["xcode"], Value::Null);
+    assert!(
+        h.chowned
+            .borrow()
+            .contains(&apps.join(".Demo.app.kbf-staging/Demo"))
+    );
+    let m: Value = serde_json::from_str(
+        &std::fs::read_to_string(volume.join("private/var/kbf-sim/staged.json")).expect("manifest"),
+    )
+    .expect("json");
+    assert_eq!(m["app"], out["app"]);
+    // A rerun replaces it.
+    write(&app.join("Extra"), "more", 0o644);
+    let plan = plan_with_app(None, &[], Some(&app), false).expect("plan");
+    Harness::new(100 * GIB).run(&volume, &plan).expect("rerun");
+    assert_eq!(listing(&apps.join("Demo.app")), listing(&app));
+}
+
+/// Catches a space check that forgets the app.
+#[test]
+fn the_app_counts_toward_the_space_needed() {
+    let dir = tmp("stage-app-space");
+    let app = fake_app(&dir, "Demo.app");
+    let plan = plan_with_app(None, &[], Some(&app), false).expect("plan");
+    assert_eq!(plan.bytes(), plan.app.as_ref().expect("app").tree.bytes);
+    assert!(plan.bytes() > 0 && !plan.is_empty());
+    let volume = volume_in(&dir);
+    let e = Harness::new(plan.bytes() + HEADROOM_BYTES - 1)
+        .run(&volume, &plan)
+        .expect_err("tight");
+    assert!(e.contains("not enough room"), "{e}");
+}
+
+mod setup_app_flow {
+    use super::*;
+    use crate::fake::{FakeSystem, work_with_base};
+    use crate::image::{SetupArgs, setup};
+    use crate::report::Status;
+
+    /// Catches `--sim-app` not reaching the volume writer or the daemon, and a refused app
+    /// reaching the disk.
+    #[test]
+    fn the_app_is_staged_with_the_daemon_and_a_refused_app_writes_nothing() {
+        let work = work_with_base("stage-setup-app");
+        let base = work.join("base");
+        let app = fake_app(&work, "Demo.app");
+        let sys = FakeSystem::new();
+        sys.uid.set(0);
+        let args = SetupArgs {
+            sim_app: Some(app.clone()),
+            ..SetupArgs::default()
+        };
+        let r = setup(&sys, &base, &args);
+        assert_eq!(r.status, Status::Ok, "{r:?}");
+        assert_eq!(
+            sys.offline_calls.borrow()[0].1,
+            ["Library/LaunchDaemons/com.kbf.sim.plist"]
+        );
+        let calls = sys.stage_calls.borrow();
+        assert_eq!(calls[0].1.app.as_ref().expect("app").name, "Demo.app");
+        assert!(calls[0].1.xcode.is_none() && calls[0].1.runtimes.is_empty());
+        drop(calls);
+
+        link("/etc", &app.join("etc"));
+        let sys = FakeSystem::new();
+        sys.uid.set(0);
+        let r = setup(&sys, &base, &args);
+        assert_eq!(r.status, Status::Error);
+        assert!(r.reason.expect("reason").contains("leaves the app"));
+        assert!(sys.offline_calls.borrow().is_empty() && sys.stage_calls.borrow().is_empty());
+    }
+
+    /// Catches a setup that writes only the probe daemons and still installs the simulator
+    /// daemon (every other probe would then start the simulator run).
+    #[test]
+    fn a_setup_with_nothing_staged_writes_no_simulator_daemon() {
+        let work = work_with_base("stage-setup-nosim");
+        let base = work.join("base");
+        let bin = work.join("guest-src");
+        std::fs::write(&bin, "bin").expect("bin");
+        let sys = FakeSystem::new();
+        sys.uid.set(0);
+        let args = SetupArgs {
+            guest_binary: Some(bin),
+            ..SetupArgs::default()
+        };
+        assert_eq!(setup(&sys, &base, &args).status, Status::Ok);
+        let written = sys.offline_calls.borrow()[0].1.clone();
+        assert!(
+            written.iter().all(|p| !p.contains("com.kbf.sim")),
+            "{written:?}"
+        );
+        assert!(sys.stage_calls.borrow().is_empty());
     }
 }
 
@@ -1270,6 +1478,66 @@ fn the_links_let_through_by_the_flag_are_listed_in_the_staging_report() {
         out["xcode"]["external_links"],
         serde_json::json!([{"path": "Contents/Developer/man", "target": "/usr/share/man"}])
     );
+}
+
+/// Catches an emptiness test that forgets one of the three things a setup stages (a setup
+/// of only runtimes, or only an app, would then write the daemon and stage nothing).
+#[test]
+fn a_plan_is_empty_only_when_nothing_is_staged() {
+    let dir = tmp("stage-empty");
+    let app = fake_app(&dir, "Demo.app");
+    write(&dir.join("rt.dmg"), "x", 0o644);
+    assert!(Plan::default().is_empty());
+    assert!(
+        !plan(Some(&fake_xcode(&dir)), &[], false)
+            .expect("xcode")
+            .is_empty()
+    );
+    assert!(
+        !plan(None, &[dir.join("rt.dmg")], false)
+            .expect("rt")
+            .is_empty()
+    );
+    assert!(
+        !plan_with_app(None, &[], Some(&app), false)
+            .expect("app")
+            .is_empty()
+    );
+}
+
+/// Catches an app path that is a plain file or is missing being taken for a bundle, or
+/// reported as something else.
+#[test]
+fn an_app_path_that_is_a_file_or_missing_is_refused_with_the_cause() {
+    let dir = tmp("stage-app-bad");
+    write(&dir.join("File.app"), "x", 0o644);
+    assert_eq!(
+        plan_app(&dir.join("File.app"), false),
+        Err(StageError::NotApp(dir.join("File.app")))
+    );
+    let e = plan_app(&dir.join("Missing.app"), false)
+        .expect_err("missing")
+        .to_string();
+    assert!(e.starts_with("stat "), "{e}");
+}
+
+/// Catches an apps directory that cannot be listed passing as empty (a stale app in it
+/// would be installed instead).
+#[test]
+fn an_apps_directory_that_cannot_be_listed_is_an_error() {
+    if !not_root() {
+        return;
+    }
+    let dir = tmp("stage-apps-unreadable");
+    let app = fake_app(&dir, "Demo.app");
+    let volume = volume_in(&dir);
+    let apps = volume.join("private/var/kbf-sim/apps");
+    std::fs::create_dir_all(&apps).expect("apps");
+    std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(0o300)).expect("chmod");
+    let plan = plan_with_app(None, &[], Some(&app), false).expect("plan");
+    let e = Harness::new(100 * GIB).run(&volume, &plan);
+    std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    assert!(e.unwrap_err().starts_with("read "));
 }
 
 /// Catches a tree clone that keeps the setuid, setgid or sticky bit of the host tree (the

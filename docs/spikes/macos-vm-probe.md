@@ -643,6 +643,65 @@ sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest \
   later on an existing path opens it without following a link; ownership is `lchown`. A
   directory the stage creates on the way is given mode 0755 explicitly, whatever the umask.
 
+### Running the simulator probe
+
+```sh
+# once, as root, after `image base --cpus --memory-mib --disk-gib` (see above); --sim-app
+# is optional: an app built for the simulator (<name>.app); $RUNTIME is a <name>.dmg or a
+# <name>.exportedBundle
+sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest \
+  --xcode /Applications/Xcode.app --sim-runtime $RUNTIME [--sim-app $APP.app]
+# as the console user, from Terminal on the Mac: hours on a first run
+$D/kbf-vmm probe e3 --work-dir $W --guest-binary $D/kbf-guest [--keep] [--graphics both|on|off] | tee $W/e3.json
+```
+
+Staging also installs one more launch daemon, `com.kbf.sim`, which runs `kbf-guest sim` as
+root once per boot from the copy of `kbf-guest` on the guest's disk: pass `--guest-binary` in
+this setup or have passed it in an earlier one, or the daemon has nothing to run. A base that has it runs the simulator steps on every boot, E1 included.
+The steps, in order, each one command with its own deadline (the flags of the daemon, with
+the defaults shown; a command still running at its deadline is killed with its process
+group):
+
+| step | runs as | command | deadline |
+|---|---|---|---|
+| `xcode-select` | root | `xcode-select -s /Applications/Xcode.app` | 120 s |
+| `license` | root | `xcodebuild -license accept` | 120 s |
+| `first-launch` | root | `xcodebuild -runFirstLaunch` | 1800 s |
+| `runtime-add-<name>.dmg` | root | `xcrun simctl runtime add <dmg>`, one per staged image | 1800 s |
+| `runtime-import-<name>.exportedBundle` | root | `xcodebuild -importPlatform <bundle>`, one per staged bundle | 1800 s |
+| `list-runtimes` | user | `xcrun simctl list runtimes -j`; the newest available iOS runtime is used | 120 s |
+| `list-devicetypes` | user | `xcrun simctl list devicetypes -j`; the last iPhone listed is used | 120 s |
+| `create` | user | `xcrun simctl create kbf-sim <device type> <runtime>` | 120 s |
+| `boot`, `bootstatus` | user | `simctl boot <udid>`, `simctl bootstatus <udid> -b` | 600 s |
+| `app-id`, `install`, `launch` | user | with `--sim-app`: the bundle id from `Info.plist` (letters, digits, `.`, `-`, `_`, at most 255 bytes), `simctl install`, `simctl launch` | 120 s, 600 s, 600 s |
+| `screenshot` | user | `simctl io <udid> screenshot --type=jpeg` | 120 s |
+| `shutdown` | user | `simctl shutdown <udid>` | 120 s |
+
+"User" means the guest's auto-login user, in that user's session
+(`launchctl asuser <uid> sudo -u <name> -H -- <command>`). The user steps wait up to 300 s
+for that user to be logged in at the console and fail, saying so, if nobody is.
+
+Each step sends the host one frame, `sim-step-NN-<step>.json`, as it ends: the step, its
+command, `status` (`ok`, `failed` for a non-zero exit or a signal, `timeout`, `error` for a
+command that could not start or whose output named nothing to continue with, `skipped`; when the output named nothing to continue with, the note repeats at most 512 bytes of it and ends with `...[cut]` if it was longer, so a frame stays under the body limit),
+the exit code or signal, the milliseconds, and the last 8 KiB of stdout and stderr. A step
+runs only when the steps it needs succeeded; a skipped step names the one to blame and its
+command is not run. `shutdown` needs only `boot`, and `screenshot` only `bootstatus`, so a
+failed install still gets a picture and the device is shut down. The screenshot comes in a
+frame of its own (`sim-screenshot.json`, base64, at most 700000 bytes before encoding, so
+the frame stays under the 1 MiB body limit); the probe writes it to
+`<work>/e3-<arm>-screenshot.jpg`. `sim-summary.json` ends the run. Frames that never reached
+the host (it was not listening for 5 tries each) are listed in the summary.
+
+The probe prints, for each guest, `steps` (every frame), `problems` (the steps that were
+not `ok`, with how), `summary`, `screenshot`, `stop` and the helper's event `trace`. A guest
+that sent no step frame is reported as such: check that the base was set up with the
+staging flags and that `/var/log/com.kbf.sim.log` (read with `image harvest` after a
+`--keep` run) shows the daemon started. `--graphics both` runs the headless guest, stops it,
+then runs the one with a graphics device, so the two never run at once. The guests are
+sized as the base was built (`sizing.json`); a base without that record runs with 2 CPUs
+and 4 GiB and the report says so.
+
 ## What to send back
 
 Everything the commands wrote, including each helper's log (the cause of a VM that did
