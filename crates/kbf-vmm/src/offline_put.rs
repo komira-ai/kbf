@@ -184,16 +184,29 @@ mod tests {
         }
     }
 
-    /// These tests need permission checks that root bypasses; say so and skip.
-    fn skip_as_root() -> bool {
+    /// These tests need permission checks that root bypasses; as root say so and skip.
+    fn unless_root(body: impl FnOnce()) {
         // SAFETY: geteuid cannot fail.
-        let root = unsafe { libc::geteuid() } == 0;
+        run_unless(unsafe { libc::geteuid() } == 0, body);
+    }
+
+    fn run_unless(root: bool, body: impl FnOnce()) {
         if root {
             eprintln!(
                 "skipped: running as root, which bypasses the permission checks this test needs"
             );
+        } else {
+            body();
         }
-        root
+    }
+
+    /// Catches the root skip running a test body as root, or skipping it for a normal user.
+    #[test]
+    fn the_root_skip_skips_only_as_root() {
+        let mut ran = Vec::new();
+        run_unless(true, || ran.push("root"));
+        run_unless(false, || ran.push("user"));
+        assert_eq!(ran, ["user"]);
     }
 
     fn real_env() -> Env<'static> {
@@ -368,23 +381,23 @@ mod tests {
     /// and a destination that cannot be created.
     #[test]
     fn unreadable_parents_and_unwritable_directories_are_errors() {
-        if skip_as_root() {
-            return;
-        }
-        let root = tmp("put-eacces");
-        std::fs::create_dir_all(root.join("locked/sub")).expect("dirs");
-        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000))
-            .expect("lock");
-        let stat = put(&root, &file("locked/sub/f", 0o644), &real_env()).expect_err("stat");
-        assert!(stat.starts_with("stat "), "{stat}");
-        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o555))
-            .expect("ro");
-        let create = put(&root, &file("locked/f", 0o644), &real_env()).expect_err("create");
-        assert!(create.contains("locked/f"), "{create}");
-        let mkdir = put(&root, &file("locked/newdir/f", 0o644), &real_env()).expect_err("mkdir");
-        assert!(mkdir.starts_with("create "), "{mkdir}");
-        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755))
-            .expect("unlock");
+        unless_root(|| {
+            let root = tmp("put-eacces");
+            std::fs::create_dir_all(root.join("locked/sub")).expect("dirs");
+            std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000))
+                .expect("lock");
+            let stat = put(&root, &file("locked/sub/f", 0o644), &real_env()).expect_err("stat");
+            assert!(stat.starts_with("stat "), "{stat}");
+            std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o555))
+                .expect("ro");
+            let create = put(&root, &file("locked/f", 0o644), &real_env()).expect_err("create");
+            assert!(create.contains("locked/f"), "{create}");
+            let mkdir =
+                put(&root, &file("locked/newdir/f", 0o644), &real_env()).expect_err("mkdir");
+            assert!(mkdir.starts_with("create "), "{mkdir}");
+            std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755))
+                .expect("unlock");
+        });
     }
 
     /// Catches the production remover following a link or treating a missing path as an
@@ -409,28 +422,26 @@ mod tests {
     /// cannot give a file to root).
     #[test]
     fn a_refused_owner_change_on_the_file_is_an_error() {
-        if skip_as_root() {
-            return;
-        }
-        let root = tmp("put-chown");
-        let env = Env {
-            remove: &remove_path,
-            owner: Some((0, 0)),
-        };
-        let e = put(&root, &file("f", 0o644), &env).expect_err("chown refused");
-        assert!(e.starts_with("write "), "{e}");
-        assert!(e.contains(&root.join("f").display().to_string()), "{e}");
+        unless_root(|| {
+            let root = tmp("put-chown");
+            let env = Env {
+                remove: &remove_path,
+                owner: Some((0, 0)),
+            };
+            let e = put(&root, &file("f", 0o644), &env).expect_err("chown refused");
+            assert!(e.starts_with("write "), "{e}");
+            assert!(e.contains(&root.join("f").display().to_string()), "{e}");
+        });
     }
 
     /// Catches `put_all` not asking for root ownership (a non-root run is refused, naming the path).
     #[test]
     fn put_all_gives_files_to_root_and_names_the_path_when_refused() {
-        if skip_as_root() {
-            return;
-        }
-        let root = tmp("put-all");
-        // The owner is 0:0, which a test run as a normal user cannot give away to.
-        let e = put_all(&root, &[file("a/x", 0o644)]).expect_err("not root");
-        assert!(e.contains(&root.join("a").display().to_string()), "{e}");
+        unless_root(|| {
+            let root = tmp("put-all");
+            // The owner is 0:0, which a test run as a normal user cannot give away to.
+            let e = put_all(&root, &[file("a/x", 0o644)]).expect_err("not root");
+            assert!(e.contains(&root.join("a").display().to_string()), "{e}");
+        });
     }
 }
