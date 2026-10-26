@@ -171,6 +171,15 @@ over 64 MiB and of digests that are not SHA-256 are never asked of the packs and
 `kbf_pack_daemon_elsewhere_total`, so the sum stops rising apart from those. A daemon is counted
 by the frontend its session is on, so the sums are taken over every frontend of the farm.
 
+A daemon that also has `--pack-write` puts the counts of its pack writes in every heartbeat too,
+and the frontend exports them as `kbf_pack_daemon_packs_written_total{node}`,
+`kbf_pack_daemon_blobs_packed_total{node}`, `kbf_pack_daemon_packed_bytes_total{node}`,
+`kbf_pack_daemon_write_fallbacks_total{node,reason}` (`reason` is one of `off`, `unfit`,
+`unsupported`, `refused`, `store`, `record`, `index`), `kbf_pack_daemon_missing_indexed_total{node}`
+and `kbf_pack_daemon_missing_unasked_total{node}` ([api.md](../api.md#get-metrics)). A rising
+`store`, `record` or `index` fallback is outputs going to the storage nodes because packs are
+failing; `off` is a frontend that does not take pack commits.
+
 The blobs the storage members flushed before the frontends wrote packs are in no pack the
 index knows, so a read of one still goes to the members. `kbf-pack-adopt`, an operator tool and
 a binary of its own, indexes those segments where they lie, with no byte copied and nothing

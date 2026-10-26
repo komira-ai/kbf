@@ -18,8 +18,8 @@ use kbf_proto::reapi::{
     batch_update_blobs_request,
 };
 use kbf_proto::worker::{
-    Capability, DaemonMessage, Heartbeat, Hello, PackReadCounts, ServerMessage, daemon_message,
-    server_message, worker_client::WorkerClient,
+    Capability, DaemonMessage, Heartbeat, Hello, PackReadCounts, PackWriteCounts, ServerMessage,
+    daemon_message, server_message, worker_client::WorkerClient,
 };
 use kbf_state::pack_index::memory::MemoryPackIndex;
 use kbf_state::{BlobDigest, ManualClock, PackIndex};
@@ -318,10 +318,20 @@ impl Daemon {
 
     /// Sends a heartbeat carrying `pack_reads` and waits for the server's acknowledgement of it.
     async fn beat(&mut self, pack_reads: Option<PackReadCounts>) {
+        self.beat_counted(pack_reads, None).await;
+    }
+
+    /// [`Self::beat`], carrying `pack_writes` too.
+    async fn beat_counted(
+        &mut self,
+        pack_reads: Option<PackReadCounts>,
+        pack_writes: Option<PackWriteCounts>,
+    ) {
         self.seq += 1;
         let beat = Heartbeat {
             seq: self.seq,
             pack_reads,
+            pack_writes,
             ..Heartbeat::default()
         };
         let message = DaemonMessage {
@@ -392,6 +402,63 @@ async fn a_frontend_exports_the_pack_reads_its_daemons_report() {
     reading.beat(None).await;
     let text = scrape(api).await;
     assert!(!text.contains("kbf_pack_daemon_"), "{text}");
+    served.abort();
+}
+
+/// Asserts that a frontend puts the pack-write counts its daemons send on their heartbeats on
+/// `GET /metrics`: none before a daemon has sent any, a sample per node and per fallback reason
+/// for the node that sent them, none for a node that sent read counts only, and no write sample
+/// once the node's next heartbeat carries none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_exports_the_pack_writes_its_daemons_report() {
+    let flags = flags_of(&[]);
+    let handle = started(&flags, Some(index())).expect("starts");
+    let (worker, api) = (handle.worker, handle.api.expect("the operator API"));
+    let served = tokio::spawn(handle.serve());
+    let text = scrape(api).await;
+    assert!(!text.contains("kbf_pack_daemon_"), "{text}");
+
+    let mut writing = Daemon::open(worker, "node-a").await;
+    let mut reading = Daemon::open(worker, "node-b").await;
+    let counts = PackWriteCounts {
+        packs: 3,
+        packed: 5,
+        packed_bytes: 4096,
+        fallback_store: 2,
+        missing_indexed: 8,
+        ..PackWriteCounts::default()
+    };
+    let reads = Some(PackReadCounts::default());
+    writing.beat_counted(reads, Some(counts)).await;
+    reading.beat_counted(reads, None).await;
+    let text = scrape(api).await;
+    for (family, want) in [
+        ("packs_written", 3),
+        ("blobs_packed", 5),
+        ("packed_bytes", 4096),
+        ("missing_indexed", 8),
+        ("missing_unasked", 0),
+    ] {
+        let header = format!("# TYPE kbf_pack_daemon_{family}_total counter\n");
+        assert!(text.contains(&header), "{header}{text}");
+        let sample = format!("kbf_pack_daemon_{family}_total{{node=\"node-a\"}} {want}\n");
+        assert!(text.contains(&sample), "{sample}{text}");
+    }
+    let family = "kbf_pack_daemon_write_fallbacks_total";
+    let store = format!("{family}{{node=\"node-a\",reason=\"store\"}} 2\n");
+    assert!(text.contains(&store), "{store}{text}");
+    let off = format!("{family}{{node=\"node-a\",reason=\"off\"}} 0\n");
+    assert!(text.contains(&off), "{off}{text}");
+    let other = format!("{family}{{node=\"node-b\"");
+    assert!(!text.contains(&other), "{text}");
+
+    writing.beat_counted(reads, None).await;
+    let text = scrape(api).await;
+    assert!(
+        !text.contains("kbf_pack_daemon_packs_written_total"),
+        "{text}"
+    );
+    assert!(!text.contains(family), "{text}");
     served.abort();
 }
 

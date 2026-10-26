@@ -74,6 +74,7 @@ mod learning;
 mod named;
 mod nodes;
 mod pack_reads;
+mod pack_writes;
 mod phase;
 mod record;
 pub mod sched_view;
@@ -361,6 +362,9 @@ struct State {
     /// The pack-read counts on the newest heartbeat of each node that sent any
     /// ([`Farm::note_pack_reads`]).
     pack_reads: BTreeMap<WorkerId, worker::PackReadCounts>,
+    /// The pack-write counts on the newest heartbeat of each node that sent any
+    /// ([`Farm::note_pack_writes`]).
+    pack_writes: BTreeMap<WorkerId, worker::PackWriteCounts>,
 }
 
 /// How many committed records the farm holds for a state store that refuses them.
@@ -470,6 +474,7 @@ impl Farm {
                 intake: Intake::default(),
                 watched: BTreeMap::new(),
                 pack_reads: BTreeMap::new(),
+                pack_writes: BTreeMap::new(),
             }),
         }
     }

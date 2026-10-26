@@ -26,7 +26,8 @@ use kbf_proto::reapi::{
 };
 use kbf_proto::worker::{
     Capability, DaemonMessage, Heartbeat, Hello, LeaseId, LeaseOffer, NodeStatus, PackReadCounts,
-    ResultAck, ServerMessage, Start, daemon_message, server_message, worker_client::WorkerClient,
+    PackWriteCounts, ResultAck, ServerMessage, Start, daemon_message, server_message,
+    worker_client::WorkerClient,
 };
 use kbf_server::token::ApiToken;
 use kbf_server::{
@@ -1152,8 +1153,28 @@ impl FakeDaemon {
         self.expect("HeartbeatAck", ack_of(seq)).await;
     }
 
+    /// [`Self::beat_acked`] with the pack-write counts `pack_writes` too.
+    pub async fn beat_counted_acked(
+        &mut self,
+        pack_reads: Option<PackReadCounts>,
+        pack_writes: Option<PackWriteCounts>,
+    ) {
+        let seq = self.beat_with(&[], pack_reads, pack_writes);
+        self.expect("HeartbeatAck", ack_of(seq)).await;
+    }
+
     /// Sends a heartbeat with the next sequence number; the number.
     fn beat(&mut self, running: &[LeaseId], pack_reads: Option<PackReadCounts>) -> u64 {
+        self.beat_with(running, pack_reads, None)
+    }
+
+    /// [`Self::beat`] carrying the pack-write counts `pack_writes` too.
+    fn beat_with(
+        &mut self,
+        running: &[LeaseId],
+        pack_reads: Option<PackReadCounts>,
+        pack_writes: Option<PackWriteCounts>,
+    ) -> u64 {
         self.seq += 1;
         let seq = self.seq;
         self.send(daemon_message::Message::Heartbeat(Heartbeat {
@@ -1161,6 +1182,7 @@ impl FakeDaemon {
             report_hash: Vec::new(),
             running: running.to_vec(),
             pack_reads,
+            pack_writes,
         }));
         seq
     }

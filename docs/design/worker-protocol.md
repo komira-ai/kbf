@@ -366,6 +366,12 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
   present only on a daemon started with `--pack-read`. A daemon without the flag, and one built
   before the field, send none, and a server built before it skips the field. The server keeps the
   newest of each node for `GET /metrics` (`kbf_pack_daemon_*`, [api.md](../api.md#get-metrics)).
+- `pack_writes` (optional): the counts of the daemon's pack writes since its process started
+  (`PackWriteCounts`: `packs`, `packed`, `packed_bytes`, seven `fallback_*` counts,
+  `missing_indexed`, `missing_unasked`), present only on a daemon started with `--pack-write`. A
+  daemon without the flag, and one built before the field, send none, and a server built before it
+  skips the field. The server keeps the newest of each node for `GET /metrics`
+  (`kbf_pack_daemon_*`, [api.md](../api.md#get-metrics)).
 
 The server acknowledges a heartbeat with `HeartbeatAck { seq }`, but only one from the
 node's newest stream. A heartbeat from a replaced stream is dropped unacknowledged, so

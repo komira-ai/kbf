@@ -345,6 +345,10 @@ message Heartbeat {
   // when the daemon reads packs (`--pack-read`): a daemon that does not, or one built
   // before the field, sends none, and a server built before it skips the field.
   PackReadCounts pack_reads = 4;
+  // What this daemon's pack writes did since the daemon process started. Present only
+  // when the daemon writes packs (`--pack-write`): a daemon that does not, or one built
+  // before the field, sends none, and a server built before it skips the field.
+  PackWriteCounts pack_writes = 5;
 }
 
 // The counts of a daemon's pack reads, cumulative since the daemon process started (they
@@ -367,6 +371,42 @@ message PackReadCounts {
   uint64 lost = 5;
   // Reads that failed because the bytes in the pack are not the digest.
   uint64 damaged = 6;
+}
+
+// The counts of a daemon's pack writes, cumulative since the daemon process started (they
+// start again from 0 when it restarts). The unit is the blob, not the call: each blob of a
+// put of outputs is either in a committed pack (packs, packed, packed_bytes) or written to the
+// storage nodes instead, and adds 1 to exactly one of the fallback counts.
+message PackWriteCounts {
+  // Packs committed: stored, and recorded by the frontend.
+  uint64 packs = 1;
+  // Blobs in those packs.
+  uint64 packed = 2;
+  // The bytes of those packs, footers included.
+  uint64 packed_bytes = 3;
+  // Blobs written to the storage nodes because packing was off: the frontend did not say it
+  // takes pack commits, or a commit was answered UNIMPLEMENTED earlier.
+  uint64 fallback_off = 4;
+  // Blobs written to the storage nodes because they do not fit a pack: over the largest blob a
+  // pack holds, not a SHA-256 digest, or over the in-flight budget.
+  uint64 fallback_unfit = 5;
+  // Blobs written to the storage nodes because the commit was answered UNIMPLEMENTED.
+  uint64 fallback_unsupported = 6;
+  // Blobs written to the storage nodes because the commit was refused for a reason a repeat
+  // does not change.
+  uint64 fallback_refused = 7;
+  // Blobs written to the storage nodes because the object store failed the put of the pack.
+  uint64 fallback_store = 8;
+  // Blobs written to the storage nodes because the commit failed for a reason a repeat may pass.
+  uint64 fallback_record = 9;
+  // Blobs written to the storage nodes because the pack index failed before the pack was
+  // written.
+  uint64 fallback_index = 10;
+  // Digests of a find-missing question that the pack index answered for.
+  uint64 missing_indexed = 11;
+  // Digests of a find-missing question that went to the storage nodes whole because the pack
+  // index could not be asked.
+  uint64 missing_unasked = 12;
 }
 
 // The server's acknowledgement of a Heartbeat.

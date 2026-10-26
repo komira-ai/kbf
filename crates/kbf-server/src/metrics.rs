@@ -56,7 +56,7 @@ impl Extras {
             history.render(out);
         }
         if let Some(farm) = self.farm {
-            crate::pack_daemon_metrics::render(out, &farm.pack_reads());
+            crate::pack_daemon_metrics::render_farm(out, &farm);
         }
     }
 }
