@@ -424,6 +424,60 @@ fn the_choices_read_the_simctl_output() {
         Ok("com.example.App")
     );
     assert!(parse_bundle_id("").is_err() && parse_bundle_id("a b").is_err());
+    // An identifier is a reverse-DNS name: nothing else is put in a command or a frame.
+    assert!(parse_bundle_id("com.example/App").is_err());
+    assert!(parse_bundle_id("com.example.\u{e9}").is_err());
+    assert!(parse_bundle_id(&"a".repeat(MAX_BUNDLE_ID_BYTES)).is_ok());
+    assert!(parse_bundle_id(&"a".repeat(MAX_BUNDLE_ID_BYTES + 1)).is_err());
+}
+
+/// Catches a step frame that cannot be sent: what `simctl create` or `plutil` printed was
+/// repeated whole in the error note, and a multi-MiB line made the frame exceed the body
+/// limit. The note keeps a bounded part of the output and says it was cut.
+#[test]
+fn an_error_note_repeats_a_bounded_part_of_the_output_and_the_frame_encodes() {
+    let huge = format!("{}\n", "\u{e9}".repeat(1 << 20));
+    assert!(huge.len() > 2 << 20);
+    for (step, command) in [("create", "simctl create"), ("app-id", "plutil")] {
+        let mut host = Fake::new();
+        host.apps = vec!["Demo.app".to_owned()];
+        host.answer(
+            command,
+            Outcome {
+                ended: Ended::Exited(0),
+                stdout: huge.clone().into_bytes(),
+                stderr: Vec::new(),
+                cut: false,
+                ms: 1,
+            },
+        );
+        go(&host);
+        let sent = host.sent.borrow();
+        let f = sent
+            .iter()
+            .find(|f| f.name.contains(step))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{step}: {:?}",
+                    sent.iter().map(|f| f.name.clone()).collect::<Vec<_>>()
+                )
+            });
+        assert!(encode(f).is_ok(), "{step}: {} body bytes", f.body.len());
+        let frame: StepFrame = serde_json::from_str(&f.body).expect("a step frame");
+        assert_eq!(frame.status, Status::Error, "{step}");
+        let note = frame.note.expect("a note");
+        assert!(note.len() < 4 * MAX_ECHO_BYTES, "{step}: {}", note.len());
+        assert!(note.contains(&format!("{CUT_MARK}\"")), "{step}: {note}");
+    }
+    // A cut never splits a character, and short output is repeated whole.
+    let two_byte = "\u{e9}".repeat(MAX_ECHO_BYTES);
+    let note = parse_bundle_id(&format!("{two_byte} x")).unwrap_err();
+    assert!(
+        note.contains(&"\u{e9}".repeat(MAX_ECHO_BYTES / 2)),
+        "{note}"
+    );
+    assert!(note.contains(CUT_MARK));
+    assert!(parse_bundle_id("a b").unwrap_err().contains("\"a b\""));
 }
 
 /// Catches a run that drops a step, runs the user steps as root or outside a session, loses

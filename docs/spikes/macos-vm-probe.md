@@ -673,7 +673,7 @@ group):
 | `list-devicetypes` | user | `xcrun simctl list devicetypes -j`; the last iPhone listed is used | 120 s |
 | `create` | user | `xcrun simctl create kbf-sim <device type> <runtime>` | 120 s |
 | `boot`, `bootstatus` | user | `simctl boot <udid>`, `simctl bootstatus <udid> -b` | 600 s |
-| `app-id`, `install`, `launch` | user | with `--sim-app`: the bundle id from `Info.plist`, `simctl install`, `simctl launch` | 120 s, 600 s, 600 s |
+| `app-id`, `install`, `launch` | user | with `--sim-app`: the bundle id from `Info.plist` (letters, digits, `.`, `-`, `_`, at most 255 bytes), `simctl install`, `simctl launch` | 120 s, 600 s, 600 s |
 | `screenshot` | user | `simctl io <udid> screenshot --type=jpeg` | 120 s |
 | `shutdown` | user | `simctl shutdown <udid>` | 120 s |
 
@@ -683,7 +683,7 @@ for that user to be logged in at the console and fail, saying so, if nobody is.
 
 Each step sends the host one frame, `sim-step-NN-<step>.json`, as it ends: the step, its
 command, `status` (`ok`, `failed` for a non-zero exit or a signal, `timeout`, `error` for a
-command that could not start or whose output named nothing to continue with, `skipped`),
+command that could not start or whose output named nothing to continue with, `skipped`; when the output named nothing to continue with, the note repeats at most 512 bytes of it and ends with `...[cut]` if it was longer, so a frame stays under the body limit),
 the exit code or signal, the milliseconds, and the last 8 KiB of stdout and stderr. A step
 runs only when the steps it needs succeeded; a skipped step names the one to blame and its
 command is not run. `shutdown` needs only `boot`, and `screenshot` only `bootstatus`, so a
