@@ -1082,7 +1082,31 @@ fn is_running(pid: &str) -> bool {
     !stat.is_empty() && !stat.starts_with('Z')
 }
 
-/// Catches a deadline that ends only the command it started: the shell here starts a
+/// The command of `the_deadline_also_ends_what_the_command_started`: this test binary run
+/// again for this one test. It starts a minute-long sleep of its own, publishes that
+/// sleep's pid in the file named by the environment, and waits for it. Run on its own (no
+/// variable set) it does nothing.
+#[test]
+fn group_test_helper_starts_a_sleep_and_waits() {
+    let Some(path) = std::env::var_os("KBF_SIM_GROUP_PIDFILE") else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    let mut sleeper = std::process::Command::new("/bin/sleep")
+        .arg("600")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("sleep");
+    // Renamed into place once complete, so that "exists" means "fully written".
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, sleeper.id().to_string()).expect("pid");
+    std::fs::rename(&tmp, &path).expect("publish");
+    let _ = sleeper.wait();
+}
+
+/// Catches a deadline that ends only the command it started: the command here starts a
 /// minute-long sleep of its own and waits for it; once the deadline passes, that sleep must
 /// be gone too, not left running as an orphan of the killed command.
 #[test]
@@ -1094,15 +1118,21 @@ fn the_deadline_also_ends_what_the_command_started() {
             time: Cell::new(0),
             ready: pid_file.clone(),
         },
-        Vec::new(),
+        vec![(
+            "KBF_SIM_GROUP_PIDFILE".into(),
+            pid_file.display().to_string(),
+        )],
     );
-    // The grandchild's output goes to /dev/null so the capture ends with the shell, and the
-    // pid file is renamed into place once complete so that "exists" means "fully written".
-    let script = format!(
-        "sleep 600 >/dev/null 2>&1 & echo $! > '{p}.tmp'; mv '{p}.tmp' '{p}'; wait",
-        p = pid_file.display()
+    let me = std::env::current_exe().expect("test binary");
+    let out = r.run(
+        &argv(&[
+            me.to_str().expect("utf-8 path"),
+            "--exact",
+            "sim_tests::group_test_helper_starts_a_sleep_and_waits",
+            "--test-threads=1",
+        ]),
+        Duration::from_secs(5),
     );
-    let out = r.run(&argv(&["/bin/sh", "-c", &script]), Duration::from_secs(5));
     assert_eq!(out.ended, Ended::TimedOut);
     let pid = std::fs::read_to_string(&pid_file)
         .expect("pid")
