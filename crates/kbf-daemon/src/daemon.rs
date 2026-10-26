@@ -87,8 +87,8 @@ use kbf_proto::google::rpc::Code;
 use kbf_proto::kbf::map::v1 as wire;
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{
-    self, DaemonMessage, Heartbeat, Hello, Phase, ServerMessage, daemon_message, server_message,
-    worker_client::WorkerClient,
+    self, DaemonMessage, Heartbeat, Hello, PackWriteCounts, Phase, ServerMessage, daemon_message,
+    server_message, worker_client::WorkerClient,
 };
 use kbf_types::{LeaseId, NodePhase};
 use tokio::sync::{Notify, mpsc, watch};
@@ -388,7 +388,10 @@ impl Daemon {
 
     /// Sets `commit` from every Welcome (`Welcome.pack_commit`): the data plane that writes packs
     /// ([`crate::PackedCas::with_writes`], given the same handle) writes them only while the
-    /// frontend says it takes commits. Without it a Welcome sets nothing.
+    /// frontend says it takes commits. Given the counter of [`Self::with_pack_reads`] too, the
+    /// daemon also puts the counts of its pack writes in every Heartbeat
+    /// (`Heartbeat.pack_writes`). Without it a Welcome sets nothing and a Heartbeat carries no
+    /// write counts.
     #[must_use]
     pub fn with_pack_writes(mut self, commit: PackCommit) -> Self {
         self.pack_commit = Some(commit);
@@ -400,6 +403,14 @@ impl Daemon {
     #[must_use]
     pub const fn pack_reads(&self) -> Option<&PackCounter> {
         self.pack_reads.as_ref()
+    }
+
+    /// The counts of the pack writes for a Heartbeat: those of the counter
+    /// [`Self::with_pack_reads`] was given, and only for a daemon that also writes packs
+    /// ([`Self::with_pack_writes`]).
+    fn pack_writes_counted(&self) -> Option<PackWriteCounts> {
+        self.pack_commit.as_ref()?;
+        self.pack_reads.as_ref().map(|c| c.stats().writes.into())
     }
 
     /// The handle [`Self::with_pack_writes`] was given; `None` for a daemon that sets none from
@@ -815,6 +826,7 @@ impl Daemon {
                         report_hash: self.report.hash().to_vec(),
                         running: self.listed().into_iter().map(proto_lease_id).collect(),
                         pack_reads: self.pack_reads.as_ref().map(|c| c.stats().into()),
+                        pack_writes: self.pack_writes_counted(),
                     };
                     send(&tx, daemon_message::Message::Heartbeat(heartbeat));
                 }

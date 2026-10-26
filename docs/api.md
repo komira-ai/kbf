@@ -1580,6 +1580,27 @@ unasked, lost and damaged.
 | `kbf_pack_daemon_lost_total{node}` | counter | reads that failed because the pack the index names is gone or too short (UNAVAILABLE to the lease; alert on any) |
 | `kbf_pack_daemon_damaged_total{node}` | counter | reads that failed because the bytes in the pack are not the digest (never served; alert on any) |
 
+**Pack writes by daemons.** A daemon started with `--pack-write` (which needs `--pack-read`;
+[kbf-modes.md](deploy/kbf-modes.md)) also puts the counts of its pack writes in every heartbeat,
+and the frontend keeps and exports them as it does the reads: one sample per node, labelled
+`node`, the counts of the daemon's process (they start again from 0 when it restarts). A node that
+sent none (a daemon without `--pack-write`, or one built before the field) has no sample of these
+families, whether or not it sent read counts, and a node whose next heartbeat carries none loses
+them. The unit is the blob: each blob of the outputs a daemon puts is in a committed pack or was
+written to the storage nodes instead, and counts in exactly one fallback reason then.
+
+| Family | Type | What it measures |
+|---|---|---|
+| `kbf_pack_daemon_packs_written_total{node}`, `kbf_pack_daemon_blobs_packed_total{node}`, `kbf_pack_daemon_packed_bytes_total{node}` | counter | packs the node's daemon stored and had the frontend commit, the blobs in them, and their bytes (footers included) |
+| `kbf_pack_daemon_write_fallbacks_total{node,reason}` | counter | blobs written to the storage nodes instead of into a pack, by `reason`: `off` (the frontend does not take pack commits, or answered UNIMPLEMENTED earlier), `unfit` (over the largest blob a pack holds, not a SHA-256 digest, or over the in-flight budget), `unsupported` (the commit was answered UNIMPLEMENTED), `refused` (the commit was refused for a reason a repeat does not change), `store` (the object store failed the put of the pack), `record` (the commit failed for a reason a repeat may pass), `index` (the pack index failed before the pack was written) |
+| `kbf_pack_daemon_missing_indexed_total{node}`, `kbf_pack_daemon_missing_unasked_total{node}` | counter | digests of a find-missing question the pack index answered, and digests that went to the storage nodes whole because the index could not be asked |
+
+A farm that writes packs has `kbf_pack_daemon_write_fallbacks_total` flat at 0 apart from `off`
+and `unfit`; a rising `store`, `record` or `index` says the packs are failing and outputs are going
+to the storage nodes (nothing is lost: the pack object of a failed commit is unindexed garbage
+under the daemon's own prefix). A pack that was stored and not committed leaves that garbage, and
+its blobs are counted in `record`, not in `blobs_packed`.
+
 **The gate for moving a farm to packs.** The legacy reads are the reads that still go to the storage
 nodes for a blob a pack could hold: the frontend's `kbf_pack_read_fallbacks_total` plus the sum
 over nodes of `kbf_pack_daemon_elsewhere_total`. A farm has moved when that sum has stopped

@@ -6,7 +6,7 @@ mod support;
 
 use std::net::SocketAddr;
 
-use kbf_proto::worker::PackReadCounts;
+use kbf_proto::worker::{PackReadCounts, PackWriteCounts};
 use support::Cell;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -72,4 +72,109 @@ async fn a_server_shows_the_pack_reads_its_daemons_report() {
     reading.beat_acked(&[], None).await;
     let text = scrape(api).await;
     assert!(!text.contains("kbf_pack_daemon_"), "{text}");
+}
+
+/// Write counts in which every count is told apart by its value, 1 to 12 in field order.
+fn written() -> PackWriteCounts {
+    PackWriteCounts {
+        packs: 1,
+        packed: 2,
+        packed_bytes: 3,
+        fallback_off: 4,
+        fallback_unfit: 5,
+        fallback_unsupported: 6,
+        fallback_refused: 7,
+        fallback_store: 8,
+        fallback_record: 9,
+        fallback_index: 10,
+        missing_indexed: 11,
+        missing_unasked: 12,
+    }
+}
+
+/// Asserts that a server shows the pack-write counts of the newest heartbeat of each node that
+/// sent any, as `kbf_pack_daemon_*` counters: a node that sent only read counts has none of the
+/// write samples, the fallbacks have one sample per reason, a later heartbeat replaces the
+/// counts, and a heartbeat without write counts removes the node's write samples and leaves its
+/// read samples.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_shows_the_pack_writes_its_daemons_report() {
+    let cell = Cell::start_with_api().await;
+    let api = cell.api.expect("an operator API");
+    let text = scrape(api).await;
+    assert!(!text.contains("kbf_pack_daemon_"), "{text}");
+
+    let mut writing = cell.daemon("node-a", 8, 16).await;
+    let mut reading = cell.daemon("node-b", 8, 16).await;
+    let reads = PackReadCounts {
+        served: 7,
+        ..PackReadCounts::default()
+    };
+    writing
+        .beat_counted_acked(Some(reads), Some(written()))
+        .await;
+    reading.beat_counted_acked(Some(reads), None).await;
+    let text = scrape(api).await;
+    for (family, want) in [
+        ("packs_written", 1),
+        ("blobs_packed", 2),
+        ("packed_bytes", 3),
+        ("missing_indexed", 11),
+        ("missing_unasked", 12),
+    ] {
+        let header = format!("# TYPE kbf_pack_daemon_{family}_total counter\n");
+        assert!(text.contains(&header), "{header}{text}");
+        let sample = format!("kbf_pack_daemon_{family}_total{{node=\"node-a\"}} {want}\n");
+        assert!(text.contains(&sample), "{sample}{text}");
+    }
+    let reasons = [
+        "off",
+        "unfit",
+        "unsupported",
+        "refused",
+        "store",
+        "record",
+        "index",
+    ];
+    for (i, reason) in reasons.iter().enumerate() {
+        let family = "kbf_pack_daemon_write_fallbacks_total";
+        let sample = format!(
+            "{family}{{node=\"node-a\",reason=\"{reason}\"}} {}\n",
+            i + 4
+        );
+        assert!(text.contains(&sample), "{sample}{text}");
+    }
+    let node_b = text.lines().filter(|l| l.contains("node=\"node-b\""));
+    let node_b: Vec<&str> = node_b.collect();
+    assert_eq!(node_b.len(), 6, "{text}");
+    assert!(
+        node_b.iter().all(|l| l.starts_with("kbf_pack_daemon_")),
+        "{text}"
+    );
+    let write_samples = text
+        .lines()
+        .filter(|l| l.contains("_fallbacks_total{node=\"node-b\""));
+    assert_eq!(write_samples.count(), 0, "{text}");
+
+    let newer = PackWriteCounts {
+        packs: 9,
+        ..written()
+    };
+    writing.beat_counted_acked(Some(reads), Some(newer)).await;
+    let text = scrape(api).await;
+    let sample = "kbf_pack_daemon_packs_written_total{node=\"node-a\"} 9\n";
+    assert!(text.contains(sample), "{text}");
+
+    writing.beat_counted_acked(Some(reads), None).await;
+    let text = scrape(api).await;
+    assert!(
+        !text.contains("kbf_pack_daemon_packs_written_total"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("kbf_pack_daemon_write_fallbacks_total"),
+        "{text}"
+    );
+    let served = "kbf_pack_daemon_served_total{node=\"node-a\"} 7\n";
+    assert!(text.contains(served), "{text}");
 }
