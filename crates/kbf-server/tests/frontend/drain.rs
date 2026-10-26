@@ -14,7 +14,9 @@ use kbf_server::api::FRONTEND_DRAIN;
 use kbf_server::drain::Phase;
 use tonic::{Code, Status, Streaming};
 
-use super::retire::{Member, Pair, bearer, exchange, execute_refusal, polled, queued, readyz};
+use super::retire::{
+    Member, Pair, bearer, exchange, execute_refusal, polled, queued, read_only_exchange, readyz,
+};
 use super::*;
 
 /// The longest a test waits for an event: a bound that only a hang reaches.
@@ -42,11 +44,12 @@ async fn begin_drain(api: SocketAddr) -> Value {
     status
 }
 
-/// The status `GET /v1/frontend/drain` answers, which is 200.
+/// The status `GET /v1/frontend/drain` answers, which is 200, asked again on a connection
+/// the API closed unanswered as GOAWAY passed its socket on ([`read_only_exchange`]).
 async fn status(api: SocketAddr) -> Value {
     let request =
         format!("GET {FRONTEND_DRAIN} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n");
-    let (code, status) = exchange(api, &request).await;
+    let (code, status) = read_only_exchange(api, &request).await;
     assert_eq!(code, 200, "{status}");
     status
 }
