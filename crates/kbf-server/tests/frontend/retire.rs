@@ -18,22 +18,64 @@ use tonic::Code;
 use super::*;
 
 pub(super) async fn readyz(api: SocketAddr) -> u16 {
-    get(api, "/readyz").await.0
+    let request = "GET /readyz HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n";
+    read_only_exchange(api, request).await.0
 }
 
 /// One request and its answer, bounded: a process that never answers fails the test
 /// instead of hanging it.
 pub(super) async fn exchange(addr: SocketAddr, request: &str) -> (u16, Value) {
-    let exchanged = async {
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
-        stream.write_all(request.as_bytes()).await.expect("send");
-        let mut response = String::new();
-        stream.read_to_string(&mut response).await.expect("read");
-        response
+    let response = bounded(addr, async { sent(addr, request).await.expect("read") }).await;
+    answer(&response)
+}
+
+/// A request that changes nothing (a GET) and its answer, bounded like [`exchange`], and sent
+/// again on a new connection when the operator API closes the one it went on unanswered. Once
+/// a drain sends GOAWAY the API's socket passes from one server to the next
+/// (`serve_api_goaway`), and a connection the first server accepted in that moment is closed
+/// with the request unread: the client sees a reset, or a stream that ends with nothing in
+/// it. Such a request can be sent again, as an HTTP client may; the server that took over
+/// accepts the next connection. Any other failure fails the test.
+pub(super) async fn read_only_exchange(addr: SocketAddr, request: &str) -> (u16, Value) {
+    let answered = async {
+        loop {
+            match sent(addr, request).await {
+                Ok(response) if !response.is_empty() => return response,
+                Ok(_) => {}
+                Err(error) if closed_unanswered(&error) => {}
+                Err(error) => panic!("read: {error}"),
+            }
+        }
     };
-    let response = tokio::time::timeout(Duration::from_secs(30), exchanged)
+    answer(&bounded(addr, answered).await)
+}
+
+/// Whether `error` is the end of a connection the server closed before it read the request.
+fn closed_unanswered(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+    )
+}
+
+/// `request` sent on a new connection to `addr`, and everything the server sent back on it.
+async fn sent(addr: SocketAddr, request: &str) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream.write_all(request.as_bytes()).await?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await?;
+    Ok(response)
+}
+
+/// `exchanging`, failing the test if `addr` has not answered within 30 seconds.
+async fn bounded(addr: SocketAddr, exchanging: impl Future<Output = String>) -> String {
+    tokio::time::timeout(Duration::from_secs(30), exchanging)
         .await
-        .unwrap_or_else(|_| panic!("{addr} did not answer within 30 seconds"));
+        .unwrap_or_else(|_| panic!("{addr} did not answer within 30 seconds"))
+}
+
+/// The status code and the JSON body of an HTTP `response` (`Null` for a body that is not JSON).
+fn answer(response: &str) -> (u16, Value) {
     let (head, body) = response.split_once("\r\n\r\n").expect("a head and a body");
     let code = head.split_whitespace().nth(1).and_then(|c| c.parse().ok());
     (
