@@ -78,6 +78,10 @@ fn attempt(
         if state_of(&node.row)? == NodeState::Revoked {
             return Err(RefusalReason::NodeRevoked.into());
         }
+        if !node.row.adopted_roles.is_empty() {
+            // An adopted node holds no certificate from this registry: nothing to renew.
+            return Err(RefusalReason::UnknownNode.into());
+        }
         let held = stored_certs(&node.row)?;
         let newest = held.iter().map(|c| c.not_after).max().unwrap_or(0);
         if now > newest + MAX_EXPIRED_AGE {

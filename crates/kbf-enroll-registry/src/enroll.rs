@@ -162,7 +162,7 @@ pub(crate) fn cert_row(i: &IssuedRole) -> CertRow {
 /// The `host:port` a storage node advertises, lower-cased (the host is a DNS name or an
 /// IP address, as the CA's check takes it), or `None` for a node with no
 /// storage role. A storage node must name one; any other must not.
-fn advertise_of(roles: RoleSet, text: &str) -> Result<Option<String>, Fail> {
+pub(crate) fn advertise_of(roles: RoleSet, text: &str) -> Result<Option<String>, Fail> {
     if !roles.contains(Role::Storage) {
         return if text.is_empty() {
             Ok(None)

@@ -258,7 +258,7 @@ the storage:
 
 | Field | Meaning |
 |---|---|
-| `half` | how the node stands to the storage members: `member` (its storage half is the member whose address it enrolled with, joined as safe-to-stop joins them), `no_storage` (it enrolled with no storage address), `unknown_node` (the enrollment registry does not know it), `unlinked` (no member, or more than one, has its address) |
+| `half` | how the node stands to the storage members: `member` (its storage half is the member whose address it enrolled with, joined as safe-to-stop joins them), `no_storage` (it enrolled with no storage address), `unknown_node` (the enrollment registry does not know it; [adopt](#v1enrolltokens-and-v1enrollnodes) a node provisioned before enrollment), `unlinked` (no member, or more than one, has its address) |
 | `why` | for `unknown_node` and `unlinked` only: a sentence saying which; it may repeat the address the node itself enrolled with |
 | `member` | for `member` only: that member's own `id`, `state` and `build_commit` (`null` if it said none). No other member is named |
 | `storage.members_active` | the storage members that are `active`, as `GET /v1/storage` counts them |
@@ -789,6 +789,7 @@ call changes nothing. Every answer carries `Cache-Control: no-store`.
 | `DELETE /v1/enroll/tokens/{id}` | revokes a token | `{"id": "..."}` |
 | `GET /v1/enroll/nodes` | lists the nodes | `{"nodes": [...]}` |
 | `POST /v1/enroll/nodes/{id}/revoke` | revokes a node | `{"id": "...", "denied": [...]}` |
+| `POST /v1/enroll/nodes/{id}:adopt` | records a node provisioned before enrollment | the node, as `GET /v1/enroll/nodes` lists it |
 
 **Create.** The body is `{"roles": ["daemon"], "host_role": null, "max_uses": 1,
 "expires_in": 86400, "node_id": "n1", "node_prefix": "rack-", "names": [".example"],
@@ -830,6 +831,24 @@ and no certificate or key. **Revoking a node** takes no body (or `{}`), marks it
 each unexpired serial it holds or held and each of its keys, in one transaction; `denied`
 lists them as the deny list spells them (`node n1`, `serial ...`, `spki-sha256 ...`). `400`
 for a node already revoked, `404` for an unknown or malformed id.
+
+**Adopting a node.** A node provisioned by hand, with certificates the operator issued, was
+never enrolled, so the registry does not know it: its storage-health answer is `unknown_node`
+and the safe-to-stop check cannot join it to its storage member, both of which go through the
+address the node advertised when it enrolled. `POST /v1/enroll/nodes/{id}:adopt` writes that
+registry row without enrolling. The body is `{"roles": ["storage"], "advertise":
+"host:7000"}`; `roles` is required, and `advertise` is required for a node with the `storage` role
+and must be absent or empty for any other. The roles are `storage` and `daemon` (not `updater`), and `advertise`
+follows enrollment's rules (a DNS name or IP address, read in lower case, and a port from 1 to
+65535, not loopback, unspecified, link-local or multicast, and not a name this frontend
+serves). An unknown field, a malformed body or id, or a value enrollment refuses is a
+`400`; an id the registry holds (revoked ones included) or an address another node holds is
+a `409`. The answer is the node as the listing shows it: `active`, with `token_id` and
+`token_label` both `adopted`, `not_after` `0` (it holds no certificate) and no
+`last_renewed_at`. The call issues no certificate and writes no serial or key. An adopted
+node never renews (a renewal of it is refused as `unknown_node`); revoking it marks it
+`revoked` and writes one deny row, for the node id. A token with `replace` can enroll over
+an adopted id, which then becomes an enrolled node.
 
 **Failures.** `400` for a body or value the registry refuses, `404` (above), `409` when
 the store refuses the write as fenced (`Fenced`, which no current store returns: nothing
