@@ -21,7 +21,7 @@ use subtle::{Choice, ConstantTimeEq as _};
 use crate::ATTEMPTS;
 use crate::error::Fail;
 use crate::host::is_host;
-use crate::nodes::{NodeState, deny_keys, state_of, with_deny_rows};
+use crate::nodes::{NodeState, deny_keys, is_adopted, state_of, with_deny_rows};
 use crate::rows::{self, CertRow, NodeRow, OwnerRow, Read, STATE_ACTIVE, SerialRow, TokenRow};
 use crate::tokens::secret_digest;
 
@@ -162,7 +162,7 @@ pub(crate) fn cert_row(i: &IssuedRole) -> CertRow {
 /// The `host:port` a storage node advertises, lower-cased (the host is a DNS name or an
 /// IP address, as the CA's check takes it), or `None` for a node with no
 /// storage role. A storage node must name one; any other must not.
-fn advertise_of(roles: RoleSet, text: &str) -> Result<Option<String>, Fail> {
+pub(crate) fn advertise_of(roles: RoleSet, text: &str) -> Result<Option<String>, Fail> {
     if !roles.contains(Role::Storage) {
         return if text.is_empty() {
             Ok(None)
@@ -267,7 +267,10 @@ fn replay(
         return Ok(None);
     };
     let certs = stored_certs(&node.row)?;
-    let live = state_of(&node.row)? == NodeState::Active && certs.iter().all(|c| c.not_after > now);
+    // An adopted row holds no certificate to answer with.
+    let live = state_of(&node.row)? == NodeState::Active
+        && !is_adopted(&node.row)
+        && certs.iter().all(|c| c.not_after > now);
     Ok(live.then_some(Enrolled {
         replayed: true,
         certs,

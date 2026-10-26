@@ -2269,7 +2269,7 @@ mod tests {
     /// Catches a spawn that gives up at once on a program still open for writing (a
     /// just-materialised input another fork briefly holds), instead of retrying.
     #[cfg(target_os = "linux")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_busy_program_is_retried() {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -2294,11 +2294,13 @@ mod tests {
         };
         let exec = || Exec::new(&program, [], []).expect("exec");
         let record = dir.join(format!("busy-record-{}", std::process::id()));
-        let started = Instant::now();
+        let paused_at = tokio::time::Instant::now();
+        // The file was open for writing when the spawn began, so it spawned only after the
+        // closer let go of it at 100 ms of the paused clock: it retried.
         let Spawned { child, pid, .. } = spawn(&mut command(), exec(), &record, KeeperFor::Group)
             .await
             .expect("spawned once closed");
-        assert!(started.elapsed() >= Duration::from_millis(50), "it waited");
+        assert!(tokio::time::Instant::now() - paused_at >= Duration::from_millis(100));
         assert!(pid > 0);
         let out = child.wait_with_output().await.expect("wait");
         assert_eq!(out.status.code(), Some(0), "{out:?}");
@@ -2322,12 +2324,13 @@ mod tests {
         drop(held);
         // Any other failure is not retried: a file that is no program at all.
         std::fs::write(&program, [0x7f, b'E', b'L', b'F', 0, 0]).expect("write");
-        let started = Instant::now();
+        let before = tokio::time::Instant::now();
         let error = spawn(&mut command(), exec(), &record, KeeperFor::Group)
             .await
             .expect_err("not a program");
         assert_ne!(error.raw_os_error(), Some(libc::ETXTBSY));
-        assert!(started.elapsed() < BUSY_WAIT);
+        // No retry pause passed on the paused clock.
+        assert_eq!(tokio::time::Instant::now(), before);
         assert!(!record.exists(), "a failed spawn leaves no run record");
         std::fs::remove_file(&program).expect("remove");
     }

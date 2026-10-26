@@ -53,8 +53,8 @@ pub use enroll::{EnrollRequest, Enrolled, IssuedRole, StoredCert, enroll_txn, re
 pub use error::RegistryError;
 pub use host::canonical_addr;
 pub use nodes::{
-    DenyRecord, NodeInfo, NodeState, deny_rows, list_nodes, node_state, revoke_node,
-    updater_host_role,
+    ADOPTED, DenyRecord, NodeInfo, NodeState, adopt_node, deny_rows, list_nodes, node_state,
+    revoke_node, updater_host_role,
 };
 pub use renew::{
     ISSUED_AT_WINDOW, MAX_EXPIRED_AGE, MIN_INTERVAL, REPLAY_TTL, RenewCsr, RenewRequest, renew_txn,

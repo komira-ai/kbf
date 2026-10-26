@@ -358,7 +358,12 @@ pub(super) fn after_clean(ready: &Ready, program: &Path, clean: &dyn Fn() -> Out
     let dirty = |why: String| Outcome::Dirty { why };
     if let Some(baseline) = ready.baseline.get() {
         let reader = MacReader::new(ready, program, None);
-        let red = assertion::assert(&reader, Some(baseline), &assertion::ALL, (&|| false, None));
+        let red = assertion::assert(
+            &reader,
+            Some(baseline),
+            &assertion::ALL,
+            (&|| false, &|| false),
+        );
         return if red.is_empty() {
             Outcome::Clean
         } else {
@@ -496,7 +501,13 @@ impl Slot {
             let reader = MacReader::new(ready, &program, lease.as_deref());
             let stopped = || cancel.load(Ordering::SeqCst);
             let until = until.map(|within| Instant::now() + within);
-            assertion::assert(&reader, ready.baseline.get(), probes, (&stopped, until))
+            let out_of_time = || until.is_some_and(|t| Instant::now() >= t);
+            assertion::assert(
+                &reader,
+                ready.baseline.get(),
+                probes,
+                (&stopped, &out_of_time),
+            )
         })
         .await;
         red.map_err(|e| RuntimeError::Failed(format!("the assertion did not finish: {e}")))

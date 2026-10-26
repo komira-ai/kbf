@@ -10,6 +10,9 @@ pub enum RegistryError {
     /// The request is not acceptable; the text says what is wrong, never a secret.
     #[error("invalid request: {0}")]
     Invalid(&'static str),
+    /// The id or address named is already held; the text says which.
+    #[error("already exists: {0}")]
+    AlreadyExists(&'static str),
     /// The token or node named does not exist.
     #[error("not found")]
     NotFound,

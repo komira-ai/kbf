@@ -76,6 +76,7 @@ All of these answer 404 until enrollment is wired into the frontend (#1055 **[V]
 | revoke a token | `DELETE /v1/enroll/tokens/{id}` | [F] | full |
 | list enrolled nodes | `GET /v1/enroll/nodes` | [F] | full |
 | revoke an enrolled node | `POST /v1/enroll/nodes/{id}/revoke` | [F] | full |
+| adopt a node provisioned before enrollment | `POST /v1/enroll/nodes/{id}:adopt` | [F] | full |
 
 ### Object store
 

@@ -93,6 +93,26 @@ async fn the_client_reaches_every_route_through_the_gate() {
         assert_eq!(nodes.status, 200);
         let nodes: NodeList = serde_json::from_str(&nodes.body).expect("nodes");
         assert!(nodes.nodes.is_empty());
+        // The adopt route is mounted at `{id}:adopt` (the colon is part of the path).
+        let adopted = client
+            .post(
+                "/v1/enroll/nodes/s1:adopt",
+                r#"{"roles":["storage"],"advertise":"s1.example:7000"}"#,
+            )
+            .expect("adopt");
+        assert_eq!(adopted.status, 200, "{}", adopted.body);
+        let again = client
+            .post("/v1/enroll/nodes/s1:adopt", r#"{"roles":["daemon"]}"#)
+            .expect("adopt again");
+        assert_eq!(again.status, 409, "{}", again.body);
+        let listed = client.get_gated(NODES).expect("nodes");
+        let listed: NodeList = serde_json::from_str(&listed.body).expect("nodes");
+        assert_eq!(listed.nodes.len(), 1);
+        assert_eq!(listed.nodes[0].token_id, "adopted");
+        let other = client
+            .post("/v1/enroll/nodes/s1", r#"{"roles":["daemon"]}"#)
+            .expect("no such verb");
+        assert_eq!(other.status, 404, "{}", other.body);
         let none = client
             .post("/v1/enroll/nodes/n1/revoke", "")
             .expect("revoke node");
