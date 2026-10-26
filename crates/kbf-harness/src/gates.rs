@@ -12,7 +12,7 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::scrape::{Sample, Scrapes};
+use crate::scrape::{Sample, Scrapes, family};
 
 /// The failed-Execute counter: the sum of its `cause` series (status, client_abort, dropped).
 pub const EXECUTE_ERRORS: &str = "kbf_execute_errors_total";
@@ -127,6 +127,23 @@ fn counter_delta(v: &[f64]) -> Result<f64, String> {
     Ok(v[v.len() - 1] - v[0])
 }
 
+/// How each series of the family `name` grew from the first scrape to the last, as
+/// `key +delta`; a series absent from the last is left out. For scrapes [`series`] read:
+/// at least two.
+fn series_deltas(scrapes: &Scrapes, name: &str) -> Vec<String> {
+    let first = &scrapes.samples[0];
+    let last = &scrapes.samples[scrapes.samples.len() - 1];
+    first
+        .series
+        .iter()
+        .filter(|(key, _)| family(key) == name)
+        .filter_map(|(key, was)| {
+            let now = last.series.get(key)?;
+            Some(format!("{key} +{}", now - was))
+        })
+        .collect()
+}
+
 /// The largest value of the scrapes `v`.
 fn gauge_max(v: &[f64]) -> Result<f64, String> {
     Ok(v.iter().copied().fold(f64::MIN, f64::max))
@@ -175,6 +192,20 @@ impl Evidence<'_> {
             ),
             Err(why) => self.row(name, Value::Null, threshold, false, Some(why)),
         }
+    }
+
+    /// The execute-errors gate: the sum of the `cause` series must not move; when it does,
+    /// the detail names how each series moved, so the report says which cause turned it red.
+    fn execute_errors_gate(&self) -> Gate {
+        let mut gate = self.series_gate("execute_errors", EXECUTE_ERRORS, "delta 0", counter_delta);
+        // A gate that moved has causes to name; one with no measure (a series absent, too
+        // few scrapes) has none.
+        if gate.measured.as_f64().is_some_and(|moved| moved != 0.0) {
+            let moved = series_deltas(self.scrapes, EXECUTE_ERRORS);
+            let why = gate.detail.take().unwrap_or_default();
+            gate.detail = Some(format!("{why}; by series: {}", moved.join(", ")));
+        }
+        gate
     }
 
     /// A gate on how a series of the storage nodes moved over the run: `reduce` of each
@@ -279,7 +310,7 @@ impl Evidence<'_> {
                     format!("event logs unreadable (each counts as a failure): {unreadable:?}")
                 }),
             ),
-            self.series_gate("execute_errors", EXECUTE_ERRORS, "delta 0", counter_delta),
+            self.execute_errors_gate(),
             self.nodes_gate(
                 "lost_blobs_gauge",
                 LOST_BLOBS,

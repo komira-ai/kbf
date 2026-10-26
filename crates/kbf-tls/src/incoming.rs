@@ -41,11 +41,13 @@ pub struct ConnInfo {
 }
 
 /// Whether a connection is gone, as its owner has seen it. It is set when a read finds
-/// the peer closed or the socket failed, which happens before the HTTP/2 layer learns of
-/// it and ends the streams, and when the connection is dropped. So a stream that ends
-/// while its connection is not gone was ended by its peer on a connection that stays: a
-/// reset, not a loss. A connection the server itself closes (a keepalive timeout) is set
-/// by the drop, which can come a moment after its streams end.
+/// the peer closed, when a read or a write fails on the socket (a reset, a broken pipe, a
+/// TLS failure), which happens before the HTTP/2 layer learns of it and ends the streams,
+/// and when the connection is dropped. So a stream that ends while its connection is not
+/// gone was ended by its peer on a connection that stays: a reset, not a loss. A loss the
+/// socket does not report (a half-open connection, which only a keepalive timeout finds)
+/// is set by the drop of the connection the server then closes, which can come a moment
+/// after its streams end.
 #[derive(Clone, Debug, Default)]
 pub struct Liveness(Arc<AtomicBool>);
 
@@ -89,13 +91,21 @@ impl Connected for Conn {
     }
 }
 
+/// Runs `$call` on the connection's stream and marks the connection gone if it failed:
+/// a write the socket refused means the peer is lost, whatever the HTTP/2 layer has yet
+/// seen.
 macro_rules! each_io {
-    ($self:expr, $io:ident => $call:expr) => {
-        match &mut $self.get_mut().io {
+    ($self:expr, $io:ident => $call:expr) => {{
+        let this = $self.get_mut();
+        let polled = match &mut this.io {
             Io::Plain($io) => $call,
             Io::Tls($io) => $call,
+        };
+        if let Poll::Ready(Err(_)) = &polled {
+            this.info.live.mark_gone();
         }
-    };
+        polled
+    }};
 }
 
 impl AsyncRead for Conn {

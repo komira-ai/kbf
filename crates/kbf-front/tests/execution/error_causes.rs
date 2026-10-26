@@ -1,6 +1,7 @@
 //! `kbf_execute_errors_total` by cause: an error status, a client that gave a call up,
 //! and a stream dropped under a connection that was lost.
 
+use kbf_auth::{DenyAuthorizer, Policy};
 use kbf_front::metrics::{ErrorCause, ExecuteMetrics};
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
@@ -21,15 +22,17 @@ fn causes(metrics: &ExecuteMetrics) -> [u64; 3] {
 }
 
 /// Waits until `n` Executes have ended (counted in `requests`): a stream its client left
-/// is dropped by the server some time later.
+/// is dropped by the server some time later. It yields to the runtime between looks and
+/// gives up only at the hang deadline, never at a speed bound.
 async fn ended(metrics: &ExecuteMetrics, n: u64) {
-    for _ in 0..200 {
-        if metrics.requests.get() == n {
-            return;
+    tokio::time::timeout(HANG, async {
+        while metrics.requests.get() < n {
+            tokio::task::yield_now().await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    assert_eq!(metrics.requests.get(), n, "the Executes did not end");
+    })
+    .await
+    .expect("the Executes did not end");
+    assert_eq!(metrics.requests.get(), n);
 }
 
 /// Asserts that the page has the series of `cause` at `value`.
@@ -95,6 +98,27 @@ async fn an_error_status_counts_as_status() {
     series(&farm, ErrorCause::Status, 3);
     series(&farm, ErrorCause::ClientAbort, 0);
     series(&farm, ErrorCause::Dropped, 0);
+}
+
+/// Asserts that an Execute the authorizer refuses counts under `cause="status"` and no
+/// other cause.
+///
+/// Catches: a denied call counted as a client abort, or as a drop when the connection is
+/// gone. Mutant: remove the `inspect_err` that fails the guard in `execute`: this goes
+/// red.
+#[tokio::test]
+async fn a_denied_execute_counts_as_status() {
+    let mut policy = Policy::allow_all();
+    policy.authorizers.execute = Arc::new(DenyAuthorizer);
+    let farm = Farm::with_policy(Arc::new(Script::default()), policy).await;
+    let metrics = &farm.cache.metrics().execute;
+    let job = job("denied", &[], false);
+
+    let denied = start(&farm, &job.action).await.expect_err("denied");
+    assert_eq!(denied.code(), Code::PermissionDenied);
+    ended(metrics, 1).await;
+    assert_eq!(causes(metrics), [1, 0, 0]);
+    series(&farm, ErrorCause::Status, 1);
 }
 
 /// Asserts that a client that drops its stream while its connection stays (it resets the
