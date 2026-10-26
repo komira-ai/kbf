@@ -29,6 +29,30 @@ const DEVICETYPES: &str = r#"{"devicetypes":[
  {"identifier":"com.apple.CoreSimulator.SimDeviceType.Apple-Watch-10","name":"Apple Watch 10"}
 ]}"#;
 
+/// `simctl list runtimes -j` as Xcode 26/27 print it: each runtime lists the device types it
+/// can create, oldest first. iOS 27.0 supports no iPhone older than the iPhone 12; the
+/// unavailable iOS 28.0 entry supports a device the available one does not.
+const RUNTIMES_WITH_SUPPORT: &str = r#"{"runtimes":[
+ {"bundlePath":"/Library/Developer/CoreSimulator/Volumes/iOS_24A434/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 27.0.simruntime",
+  "buildversion":"24A434","platform":"iOS","runtimeRoot":"/x","identifier":"com.apple.CoreSimulator.SimRuntime.iOS-27-0",
+  "version":"27.0","isInternal":false,"isAvailable":true,"name":"iOS 27.0","supportedArchitectures":["arm64"],
+  "supportedDeviceTypes":[
+   {"bundlePath":"/d/iPhone 12.simdevicetype","name":"iPhone 12","identifier":"com.apple.CoreSimulator.SimDeviceType.iPhone-12","productFamily":"iPhone"},
+   {"bundlePath":"/d/iPhone 17 Pro.simdevicetype","name":"iPhone 17 Pro","identifier":"com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro","productFamily":"iPhone"},
+   {"bundlePath":"/d/iPad Air.simdevicetype","name":"iPad Air 13-inch (M3)","identifier":"com.apple.CoreSimulator.SimDeviceType.iPad-Air-13-inch-M3","productFamily":"iPad"}]},
+ {"bundlePath":"/y","buildversion":"25A1","platform":"iOS","identifier":"com.apple.CoreSimulator.SimRuntime.iOS-28-0",
+  "version":"28.0","isAvailable":false,"name":"iOS 28.0",
+  "supportedDeviceTypes":[
+   {"bundlePath":"/d/iPhone 99.simdevicetype","name":"iPhone 99","identifier":"com.apple.CoreSimulator.SimDeviceType.iPhone-99","productFamily":"iPhone"}]}
+]}"#;
+
+/// The real-guest listing whose last iPhone the iOS 27 runtime refuses to create.
+const DEVICETYPES_WITH_OLD_LAST: &str = r#"{"devicetypes":[
+ {"identifier":"com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro","name":"iPhone 17 Pro","productFamily":"iPhone"},
+ {"identifier":"com.apple.CoreSimulator.SimDeviceType.iPhone-6s-Plus","name":"iPhone 6s Plus","productFamily":"iPhone"},
+ {"identifier":"com.apple.CoreSimulator.SimDeviceType.Apple-Watch-10","name":"Apple Watch 10","productFamily":"Apple Watch"}
+]}"#;
+
 fn ok_out(stdout: &str) -> Outcome {
     Outcome {
         ended: Ended::Exited(0),
@@ -1432,5 +1456,138 @@ fn a_run_imports_the_staged_bundle_and_ignores_names_the_host_did_not_stage() {
     assert!(
         names.contains(&"sim-step-05-runtime-import-b_27.exportedBundle.json".to_owned()),
         "{names:?}"
+    );
+}
+
+fn runtime_listing_run(runtimes: &str) -> (Fake, SummaryFrame) {
+    let host = Fake::new();
+    host.answer("list runtimes", ok_out(runtimes));
+    host.answer("list devicetypes", ok_out(DEVICETYPES_WITH_OLD_LAST));
+    let summary = go(&host);
+    (host, summary)
+}
+
+fn frame_of(host: &Fake, step: &str) -> StepFrame {
+    host.step_frames()
+        .into_iter()
+        .find(|f| f.step == step)
+        .expect(step)
+}
+
+/// Catches a device type taken from the global list (whose last iPhone, the 6s Plus, the new
+/// runtime refuses) instead of from the chosen runtime's `supportedDeviceTypes`; and a
+/// runtime chosen from an unavailable entry whose support list differs.
+#[test]
+fn the_device_type_comes_from_the_chosen_runtimes_supported_list() {
+    let (host, summary) = runtime_listing_run(RUNTIMES_WITH_SUPPORT);
+    assert!(summary.ok, "{summary:?}");
+    let create = host
+        .commands()
+        .into_iter()
+        .find(|c| c.contains("simctl create"))
+        .expect("create ran");
+    assert!(
+        create.ends_with(
+            "simctl create kbf-sim com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro com.apple.CoreSimulator.SimRuntime.iOS-27-0"
+        ),
+        "{create}"
+    );
+    assert_eq!(
+        summary.device_type.as_deref(),
+        Some("com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro")
+    );
+    // The frames say what was chosen and from where.
+    let note = frame_of(&host, "list-runtimes").note.expect("note");
+    assert!(
+        note.contains("iPhone-17-Pro") && note.contains("supportedDeviceTypes"),
+        "{note}"
+    );
+    let note = frame_of(&host, "list-devicetypes").note.expect("note");
+    assert!(
+        note.contains("iPhone-17-Pro") && note.contains("not used"),
+        "{note}"
+    );
+}
+
+/// Catches the pick rules of the runtime's list: the last iPhone by `productFamily` (later
+/// iPads and watches ignored), a missing `productFamily` read from the name, and the unit
+/// answers for a runtime that is not listed or has no iPhone.
+#[test]
+fn the_supported_list_rule_picks_the_last_iphone() {
+    let id = "com.apple.CoreSimulator.SimRuntime.iOS-27-0";
+    assert_eq!(
+        choose_device_type_for_runtime(RUNTIMES_WITH_SUPPORT, id),
+        Ok(RuntimeDeviceType::Chosen(
+            "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro".to_owned()
+        ))
+    );
+    let no_family = r#"{"runtimes":[{"identifier":"R","supportedDeviceTypes":[
+      {"identifier":"p1","name":"iPhone 1"},{"identifier":"p2","name":"iPhone 2"},{"identifier":"w","name":"Watch"}]}]}"#;
+    assert_eq!(
+        choose_device_type_for_runtime(no_family, "R"),
+        Ok(RuntimeDeviceType::Chosen("p2".to_owned()))
+    );
+    // A family that is not iPhone is not taken even when the name says iPhone.
+    let odd = r#"{"runtimes":[{"identifier":"R","supportedDeviceTypes":[
+      {"identifier":"p1","name":"iPhone 1","productFamily":"iPhone"},{"identifier":"x","name":"iPhone Mirror","productFamily":"Mac"}]}]}"#;
+    assert_eq!(
+        choose_device_type_for_runtime(odd, "R"),
+        Ok(RuntimeDeviceType::Chosen("p1".to_owned()))
+    );
+    assert!(
+        choose_device_type_for_runtime(RUNTIMES_WITH_SUPPORT, "nope")
+            .unwrap_err()
+            .contains("nope")
+    );
+    assert!(
+        choose_device_type_for_runtime("{", "R")
+            .unwrap_err()
+            .contains("not JSON")
+    );
+    assert!(
+        choose_device_type_for_runtime("{}", "R")
+            .unwrap_err()
+            .contains("runtimes")
+    );
+}
+
+/// Catches a runtime whose supported list holds no iPhone falling back to the global list
+/// (which would pick a device the runtime refuses): the step is an error naming the
+/// runtime, and nothing is created.
+#[test]
+fn a_runtime_supporting_no_iphone_is_an_error_naming_it() {
+    let ipads_only = r#"{"runtimes":[{"identifier":"com.apple.CoreSimulator.SimRuntime.iOS-27-0",
+      "version":"27.0","isAvailable":true,"name":"iOS 27.0","supportedDeviceTypes":[
+      {"identifier":"i","name":"iPad Pro","productFamily":"iPad"}]}]}"#;
+    let (host, summary) = runtime_listing_run(ipads_only);
+    assert!(!summary.ok);
+    let f = frame_of(&host, "list-runtimes");
+    assert_eq!(f.status, Status::Error);
+    let note = f.note.expect("note");
+    assert!(
+        note.contains("com.apple.CoreSimulator.SimRuntime.iOS-27-0"),
+        "{note}"
+    );
+    assert!(note.contains("no iPhone"), "{note}");
+    assert_eq!(frame_of(&host, "create").status, Status::Skipped);
+    assert!(!host.commands().iter().any(|c| c.contains("simctl create")));
+}
+
+/// Catches a runtime with no `supportedDeviceTypes` key failing, or the fallback not being
+/// used and not saying so: the old devicetypes rule applies and both notes say it.
+#[test]
+fn a_runtime_without_a_supported_list_falls_back_to_the_devicetypes_listing() {
+    let (host, summary) = runtime_listing_run(RUNTIMES);
+    assert!(summary.ok, "{summary:?}");
+    assert_eq!(
+        summary.device_type.as_deref(),
+        Some("com.apple.CoreSimulator.SimDeviceType.iPhone-6s-Plus")
+    );
+    let note = frame_of(&host, "list-runtimes").note.expect("note");
+    assert!(note.contains("no supportedDeviceTypes"), "{note}");
+    let note = frame_of(&host, "list-devicetypes").note.expect("note");
+    assert!(
+        note.contains("iPhone-6s-Plus") && note.contains("may not be one it supports"),
+        "{note}"
     );
 }
