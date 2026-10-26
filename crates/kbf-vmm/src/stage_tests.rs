@@ -1540,7 +1540,7 @@ fn a_cloned_tree_has_no_setuid_setgid_or_sticky_bit() {
 type Mutation = fn(&Path);
 
 /// Catches a clone of a tree that is not the planned one being installed: a link out of the
-/// app, a new file, a new socket, a file replaced by a link, or a changed size. Nothing is
+/// app, a new file, a new pipe, a file replaced by a link, or a changed size. Nothing is
 /// put under the real name.
 #[test]
 fn a_cloned_tree_that_differs_from_the_plan_is_refused() {
@@ -1549,8 +1549,11 @@ fn a_cloned_tree_that_differs_from_the_plan_is_refused() {
             link("/etc", &t.join("Contents/escape"));
         }),
         ("new file", |t| write(&t.join("Contents/new"), "new", 0o644)),
-        ("new socket", |t| {
-            std::os::unix::net::UnixListener::bind(t.join("Contents/sock")).expect("bind");
+        ("new pipe", |t| {
+            let path = std::ffi::CString::new(t.join("Contents/pipe").as_os_str().as_bytes())
+                .expect("path");
+            // SAFETY: `path` is a NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
         }),
         ("file became a link", |t| {
             let f = t.join("Contents/Info.plist");
