@@ -99,7 +99,9 @@ fn a_restart_runs_two_commands_under_the_lock() {
 }
 
 /// Asserts that a unit that is still `activating` is asked about again until it is active,
-/// and that a look at it that cannot be made counts as not active yet.
+/// and that a look at it that cannot be made counts as not active yet; that the wait pauses
+/// one interval after each look that found it not active and not after the one that found
+/// it active (three pauses for four looks).
 #[test]
 fn a_restart_waits_until_the_unit_is_active() {
     let fx = Fx::new("restart-wait");
@@ -118,6 +120,11 @@ fn a_restart_waits_until_the_unit_is_active() {
     for call in &calls[1..] {
         assert_eq!(*call, plan::unit_active(&unit("a1")));
     }
+    assert_eq!(
+        fx.clock.sleeps(),
+        [fx.host.restart_wait.interval; 3],
+        "one pause after each look that found it not active"
+    );
 }
 
 /// Runs `restart frontend=<name>` against a `systemctl restart` that answers `reply`, and
@@ -178,8 +185,11 @@ fn a_failed_restart_carries_the_exit() {
 }
 
 /// Asserts that a unit that is not active when the wait is over is a `restart_timeout` with
-/// exit status 3 whose detail names the unit: after exactly one look when the wait is zero,
-/// and after more than one when it is not; and that the audit line names the failure.
+/// exit status 3 whose detail names the unit and the seconds waited, and that the audit line
+/// names the failure: after exactly one look and no pause when the wait is zero; and, for a
+/// wait of two seconds with a look every half second, after five looks (at 0, 0.5, 1, 1.5
+/// and 2 seconds of the made-up clock, the last of which finds the time up) and four pauses
+/// of an interval each.
 #[test]
 fn a_unit_that_never_goes_active_times_out() {
     let mut fx = Fx::new("restart-timeout");
@@ -196,21 +206,29 @@ fn a_unit_that_never_goes_active_times_out() {
     );
     assert!(answer.err.contains(TIMEOUT_DETAIL), "{}", answer.err);
     assert_eq!(runner.calls().len(), 2, "one restart and one look");
+    assert!(fx.clock.sleeps().is_empty(), "no pause before giving up");
     assert_eq!(fx.audit_lines()[0]["reason"], "restart_timeout");
 
+    let interval = Duration::from_millis(500);
     fx.host.restart_wait = Wait {
-        timeout: Duration::from_millis(30),
-        interval: Duration::from_millis(5),
+        timeout: Duration::from_secs(2),
+        interval,
     };
     let mut replies = vec![ok("")];
-    replies.extend((0..10_000).map(|_| exec(3, "activating\n", "")));
+    replies.extend((0..10).map(|_| exec(3, "activating\n", "")));
     let runner = FakeRunner::new(replies);
     let answer = fx.run(&runner, "restart frontend=-");
+    assert_eq!(answer.code, 3, "{}", answer.err);
     assert_eq!(answer.json()["reason"], "restart_timeout");
     assert!(
-        runner.calls().len() > 2,
-        "it kept looking until the wait was over"
+        answer
+            .err
+            .contains("kbf-frontend.service was not active 2 seconds after the restart"),
+        "{}",
+        answer.err
     );
+    assert_eq!(runner.calls().len(), 1 + 5, "the restart and five looks");
+    assert_eq!(fx.clock.sleeps(), [interval; 4]);
 }
 
 /// Asserts that a restart that finds the install lock held is `busy`, runs nothing and is

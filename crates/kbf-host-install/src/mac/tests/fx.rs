@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::mac::layout::{APPLY_LABEL, DAEMON_LABEL, MacHost};
 use crate::mac::release::{bundle_name, tarball_name};
 use crate::mac::stage::sha256_of;
+use crate::pace::fake::Fake;
 use crate::runner::{Cmd, Exec, Runner};
 use crate::trust::Trust;
 
@@ -123,6 +124,8 @@ pub struct Fx {
     pub sums: PathBuf,
     /// The binary inside the offered tarball.
     pub new_binary: Vec<u8>,
+    /// The time of this host's waits: it moves only when they sleep.
+    pub clock: Fake,
 }
 
 impl Fx {
@@ -132,6 +135,8 @@ impl Fx {
         let uid = fs::metadata(&*dir).unwrap().uid();
         let mut host = MacHost::for_test(&dir, Trust::owned_by(uid, &dir));
         host.self_exe = dir.join("libexec/kbf-host-install");
+        let clock = Fake::new();
+        host.pace = std::rc::Rc::new(clock.pace());
         mkdir(&dir.join("libexec"), 0o755);
         write(&host.self_exe, 0o755, b"program");
         for sub in [
@@ -203,6 +208,7 @@ impl Fx {
             channel_dir,
             sums,
             new_binary,
+            clock,
         }
     }
 

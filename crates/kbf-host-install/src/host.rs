@@ -134,6 +134,8 @@ pub struct Host {
     pub(crate) self_exe: PathBuf,
     /// How long a restart waits for its unit to be active.
     pub(crate) restart_wait: plan::Wait,
+    /// How that wait tells time and pauses: the real clock here, a made-up one in tests.
+    pub(crate) pace: std::rc::Rc<crate::pace::Pace>,
     pub(crate) trust: Trust,
 }
 
@@ -150,6 +152,7 @@ impl Host {
             hostname: PathBuf::from("/proc/sys/kernel/hostname"),
             self_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from(SELF_EXE)),
             restart_wait: plan::ACTIVE_WAIT,
+            pace: std::rc::Rc::new(crate::pace::Pace::real()),
             trust: Trust::root(),
         }
     }
@@ -170,6 +173,7 @@ impl Host {
                 timeout: std::time::Duration::from_secs(30),
                 interval: std::time::Duration::from_millis(1),
             },
+            pace: std::rc::Rc::new(crate::pace::fake::Fake::new().pace()),
             trust,
         }
     }
