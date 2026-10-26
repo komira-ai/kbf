@@ -132,6 +132,8 @@ mod role_tests;
 #[cfg(test)]
 mod server_tests;
 #[cfg(test)]
+mod slow_reader_tests;
+#[cfg(test)]
 mod testing;
 #[cfg(test)]
 mod time_tests;
@@ -152,7 +154,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 
 use crate::{Backend, Clock};
@@ -415,7 +418,10 @@ impl Server {
 
     /// Serves one connection on a task of its own, which ends with the connection, or after the
     /// drain has closed it.
-    fn connection(self: &Arc<Self>, stream: TcpStream, peer: SocketAddr) {
+    fn connection<S>(self: &Arc<Self>, stream: S, peer: SocketAddr)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let server = Arc::clone(self);
         let service = service_fn(move |request| {
             let server = Arc::clone(&server);
