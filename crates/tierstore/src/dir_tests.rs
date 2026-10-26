@@ -6,11 +6,11 @@ use std::fs::Permissions;
 use std::io::{Error as IoError, ErrorKind};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::time::Duration;
 
 use bytes::Bytes;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, future, stream};
 use kbf_testkit::dir::TestDir;
+use tokio::sync::oneshot;
 
 use crate::{Backend, ByteRange, DirBackend, Error, PartBody};
 
@@ -32,16 +32,21 @@ fn pieces(texts: &[&'static str]) -> PartBody<'static> {
     stream::iter(items).boxed()
 }
 
-/// Gives `item` after a wait.
-async fn later(item: Result<Bytes, Error>) -> Result<Bytes, Error> {
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    item
-}
-
-/// A body of these pieces, each of which comes after a wait.
-fn slow(texts: &[&'static str]) -> PartBody<'static> {
-    let items: Vec<Result<Bytes, Error>> = texts.iter().map(|text| Ok(body(text))).collect();
-    stream::iter(items).then(later).boxed()
+/// A body of the piece `first` and then the piece `second`. When the body is asked for `second`
+/// it tells `started`, and it gives `second` only after `release` is sent or dropped.
+fn gated(
+    first: &'static str,
+    second: &'static str,
+    started: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+) -> PartBody<'static> {
+    let items: Vec<Result<Bytes, Error>> = vec![Ok(body(first))];
+    let rest = stream::once(async move {
+        let _ = started.send(());
+        let _ = release.await;
+        Ok(body(second))
+    });
+    stream::iter(items).chain(rest).boxed()
 }
 
 /// The names of the files in a directory, in order.
@@ -347,14 +352,29 @@ async fn backends_over_one_directory_make_their_temporary_files_apart() {
 }
 
 /// Asserts that two uploads of one part number that overlap leave one file for the number, and
-/// that the content tag of one of them, and not of the other, completes the upload.
+/// that the content tag of one of them, and not of the other, completes the upload. The overlap
+/// is forced by gates: each body gives its first piece and then tells that it waits for its
+/// second, and the test sends both releases only after both have told.
 #[tokio::test]
 async fn two_overlapping_uploads_of_one_part_number_leave_one_part() {
     let (dir, backend) = backend();
     let id = backend.create_upload("k").await.unwrap();
-    let (a, b) = futures::join!(
-        backend.upload_part("k", &id, 1, slow(&["aa", "bb"])),
-        backend.upload_part("k", &id, 1, slow(&["cc", "dd"])),
+    let (started_a, a_started) = oneshot::channel();
+    let (release_a, a_released) = oneshot::channel();
+    let (started_b, b_started) = oneshot::channel();
+    let (release_b, b_released) = oneshot::channel();
+    let body_a = gated("aa", "bb", started_a, a_released);
+    let body_b = gated("cc", "dd", started_b, b_released);
+    let releasing = async {
+        let _ = a_started.await;
+        let _ = b_started.await;
+        let _ = release_a.send(());
+        let _ = release_b.send(());
+    };
+    let (a, b, _) = futures::join!(
+        backend.upload_part("k", &id, 1, body_a),
+        backend.upload_part("k", &id, 1, body_b),
+        releasing,
     );
     let upload = dir.path().join(".uploads").join(&id);
     assert_eq!(names(&upload).len(), 2);
@@ -364,17 +384,26 @@ async fn two_overlapping_uploads_of_one_part_number_leave_one_part() {
 }
 
 /// Asserts that a part whose call is dropped before its body ends leaves no temporary file in the
-/// directory of the upload.
+/// directory of the upload. The call is polled until its body, which never ends, is asked for the
+/// piece after the first and tells a gate; the temporary file is then there, and it is gone once
+/// the call is dropped.
 #[tokio::test]
 async fn a_part_dropped_half_way_leaves_no_temporary_file() {
     let (dir, backend) = backend();
     let id = backend.create_upload("k").await.unwrap();
+    let (started, first_taken) = oneshot::channel();
     let items: Vec<Result<Bytes, Error>> = vec![Ok(body("ab"))];
-    let stalled: PartBody<'static> = stream::iter(items).chain(stream::pending()).boxed();
+    let endless = stream::once(async move {
+        let _ = started.send(());
+        std::future::pending::<Result<Bytes, Error>>().await
+    });
+    let stalled: PartBody<'static> = stream::iter(items).chain(endless).boxed();
     let waiting = backend.upload_part("k", &id, 1, stalled);
-    let result = tokio::time::timeout(Duration::from_millis(200), waiting).await;
-    assert!(result.is_err());
     let upload = dir.path().join(".uploads").join(&id);
+    let parked = future::select(waiting, first_taken).await;
+    assert!(matches!(parked, future::Either::Right((Ok(()), _))));
+    assert_eq!(names(&upload).len(), 2);
+    drop(parked);
     assert_eq!(names(&upload), ["key".to_owned()]);
 }
 
