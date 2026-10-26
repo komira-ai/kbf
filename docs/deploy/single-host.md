@@ -152,8 +152,8 @@ wanted.
 A unit for the Postgres container, and one for `fe-a` (`fe-b` is the same with its own name,
 state directory and ports):
 
-```ini
-# /etc/systemd/system/kbf-postgres.service
+```text
+# /etc/systemd/system/kbf-postgres.service (a sketch: the docker run arguments are the ones above)
 [Unit]
 Description=kbf state database (Postgres container)
 After=docker.service
@@ -170,8 +170,8 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-```ini
-# /etc/systemd/system/kbf-fe-a.service
+```text
+# /etc/systemd/system/kbf-fe-a.service (a sketch: the docker run arguments are the ones above)
 [Unit]
 Description=kbf frontend a
 After=docker.service kbf-postgres.service kbf-signer.service
