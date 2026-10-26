@@ -130,6 +130,90 @@ storage does not enforce the deny rows a node revocation writes (`DENY_ENFORCED`
 `crates/kbf-server/src/enroll/gate.rs:19-30`): a revoked node is still served by storage until
 its certificate expires. Leave it out only when a build enforces them.
 
+## Waiting for Postgres
+
+The commands above can be run by hand, or by systemd as one unit per container. On a reboot
+systemd starts Postgres and the frontends together, and a frontend that reaches the socket
+before Postgres has made it cannot open its state store. Two things cover that, and both are
+wanted.
+
+- **The frontend waits.** For `--state-store-wait-secs` (default 300, 0 to 3600; key
+  `state-store-wait-secs` in `[scheduler]`) it tries the store again after 250 ms, then after
+  twice as long each time up to 10 s, and logs each attempt. It waits for connection refused or
+  reset, a socket that is not there yet, a connect that times out and SQLSTATE 57P03 (starting
+  up). A URL that does not parse, a refused login, a database or role that does not exist and
+  a schema the build does not accept are not waited for: they exit 2 at once. A store that is
+  still not up when the window ends exits **1**.
+- **The unit waits too, and says when to stop.** An `ExecStartPre=` polls `pg_isready` inside
+  the Postgres container, under `timeout` so that a Postgres that never comes up cannot hold the
+  start for ever. `pg_isready` needs `-U` here: the container runs as uid 65532, which has no
+  name for it to look up.
+
+A unit for the Postgres container, and one for `fe-a` (`fe-b` is the same with its own name,
+state directory and ports):
+
+```ini
+# /etc/systemd/system/kbf-postgres.service
+[Unit]
+Description=kbf state database (Postgres container)
+After=docker.service
+Requires=docker.service
+
+[Service]
+ExecStartPre=-/usr/bin/docker rm -f kbf-postgres
+# The arguments of the docker run command above, with --rm.
+ExecStart=/usr/bin/docker run --rm --name kbf-postgres --network none --user 65532:65532 ...
+ExecStop=/usr/bin/docker stop kbf-postgres
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```ini
+# /etc/systemd/system/kbf-fe-a.service
+[Unit]
+Description=kbf frontend a
+After=docker.service kbf-postgres.service kbf-signer.service
+Requires=docker.service kbf-signer.service
+Wants=kbf-postgres.service
+StartLimitIntervalSec=0
+
+[Service]
+# Counts the ExecStartPre= below: systemd's default of 90 s would cut a 240 s wait short.
+TimeoutStartSec=300
+ExecStartPre=/usr/bin/timeout 240 /bin/sh -c 'until /usr/bin/docker exec kbf-postgres pg_isready -q -h /var/run/postgresql -U kbf-server -d kbf; do sleep 2; done'
+ExecStartPre=-/usr/bin/docker rm -f kbf-fe-a
+# The arguments of the docker run command for fe-a above, with --rm.
+ExecStart=/usr/bin/docker run --rm --name kbf-fe-a --network host --user 65532:65532 ...
+# A stop drains: the time must exceed --drain-lb-wait plus --drain-deadline.
+ExecStop=/usr/bin/docker stop --time 3600 kbf-fe-a
+TimeoutStopSec=infinity
+Restart=on-failure
+RestartSec=5
+# Exit 2 is a start the frontend refused (a flag, a certificate, a URL, a login, a schema):
+# starting it again reads the same bytes. A store that stays down past --state-store-wait-secs
+# exits 1, and is started again.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target
+```
+
+If the `timeout` ends the wait, the `ExecStartPre=` fails with status 124 and the unit is
+restarted after `RestartSec`, as for any failure but exit 2. `RestartPreventExitStatus=2` stays:
+it holds the refusals, which a restart cannot cure. `kbf-postgres.service` is pulled in with
+`Wants=` and not `Requires=`, so that a restart of Postgres does not also restart both
+frontends at once; each frontend finds its store gone through `/readyz` and Envoy takes it out.
+
+**Order the signer before the frontend.** A frontend that serves enrollment through the signer
+imports the CA root against the signer's public key at its start, through the socket of
+`--ca-signer` and the `ca.pem` the signer made. A start that finds no signer is a refused start
+(exit 2), which `RestartPreventExitStatus=2` does not retry, so `kbf-signer.service` (the
+host's unit for the signer above) is in `After=` and `Requires=` of both frontends. **Envoy needs no ordering
+against Postgres or the frontends:** it health-checks each frontend with `GET /readyz` and puts
+it into the rotation when it answers 200, whenever that is.
+
 ## The load balancer: TCP passthrough
 
 Envoy, **pinned by digest**, on the host network, listening on the address the farm dials. It

@@ -152,7 +152,9 @@ units carry `RestartPreventExitStatus=2` and `RestartSec=5`, so exit 2 stays dow
   system call that failed because the device was busy, read-only or full, and a
   registration whose boot the node's metadata log has set already (`StaleWriter`, below: only a node that did not report its history, or one past the clamp).
   A frontend or daemon that fails to start is not covered: `frontend` and `kbf-server`
-  exit 2 for every start error, and the daemon half's own codes are unchanged.
+  exit 2 for every start error, and the daemon half's own codes are unchanged. The one
+  exception is the `frontend` mode's state store, below: a Postgres that stays down for
+  all of `--state-store-wait-secs` exits 1.
 
 **A new or restored state store, and the nodes' boots.** The frontend hands each node its
 member id and a boot counter from the store (`boot/<id>`, one more at every registration);
@@ -191,6 +193,25 @@ this release and logs a warning that SQLite is removed in the next (see the upgr
 The URI carries no password (kbf refuses one: the command line is readable by every user on
 the node), so the database is reached by the socket or by the server user's own role. The
 database and its schema are `kbf-installer`'s.
+
+**A state store that is not up yet.** A host that reboots starts Postgres and the frontend
+together, and the frontend is often first. A frontend whose Postgres is not up yet waits for
+it and tries again, after 250 ms and then after twice as long each time up to 10 s, for
+`--state-store-wait-secs` (default 300, 0 to 3600; the `state-store-wait-secs` key of
+`[scheduler]`), and logs every attempt with its number, the seconds waited and the reason.
+These are waited for: connection refused or reset, a Unix socket that does not exist yet, a
+connect that times out, and the server answering SQLSTATE 57P03 (the database system is
+starting up). These are not, and exit 2 at once as ever: a URL that does not parse, a refused
+login, a database or role that does not exist, a schema this build does not accept, and any
+other answer from the server. If the window is used up with the store still not up, the
+frontend exits **1**, so the unit's `Restart=on-failure` starts it again while
+`RestartPreventExitStatus=2` goes on holding a start that was refused.
+`--state-store-wait-secs=0` does not wait and exits 2 for a store that is not up, as before
+the flag. The wait blocks the start: a stop signal sent during it is acted on once the wait
+has ended. The unit's `kbf boot-check` step has no wait of its own: it exits 1 when the
+database cannot be reached, which `Restart=on-failure` starts again. For a Postgres in a
+container beside the unit, see
+[single-host.md](single-host.md#waiting-for-postgres).
 
 The unit gives no `--handover-socket` (nor a `RuntimeDirectory=` for one): `kbf frontend` has
 no handover any more, and the flag, like `--instance`, is accepted and ignored with a

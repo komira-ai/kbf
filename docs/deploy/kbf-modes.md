@@ -35,7 +35,10 @@ listener's work streams, and it routes each cache call to a storage node. It hol
 and refuses every flag of a store. `--storage` is required: the URL of one storage node.
 `--state-store` is required too, a Postgres URL (a `sqlite://` one still starts in this
 release; see "Growing from one host to many"): a frontend given none, by the flag or by `state-store` in `kbf.toml`, exits 2 naming the flag
-before it listens on anything, and `kbf --mode=frontend --check` exits 2 the same way. With
+before it listens on anything, and `kbf --mode=frontend --check` exits 2 the same way. A
+Postgres store that is not up yet is waited for, `--state-store-wait-secs` seconds (default
+300; 0 does not wait), and a start that runs out of the wait exits 1, not 2
+([kbf-units.md](kbf-units.md#the-state-store-postgres-for-the-frontend)). With
 the TLS flags the frontend keeps the farm's storage map and routes every call by it;
 `--storage` is then only the bootstrap node.
 
