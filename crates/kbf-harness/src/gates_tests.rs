@@ -692,4 +692,13 @@ fn a_missing_or_reset_class_series_fails_the_by_class_gate() {
         s.series.insert(class_key("farm"), value);
     }
     assert_eq!(failed(&run), ["failed_actions_by_class"]);
+    let gate = gates(&run)
+        .into_iter()
+        .find(|g| g.name == "failed_actions_by_class")
+        .expect("gate");
+    assert!(
+        gate.detail
+            .expect("detail")
+            .contains("farm: went down from 3 to 0")
+    );
 }

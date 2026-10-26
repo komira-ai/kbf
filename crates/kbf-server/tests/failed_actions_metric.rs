@@ -26,7 +26,7 @@ async fn count(api: SocketAddr, class: &str) -> u64 {
 
 /// Asserts that a server shows every class at 0 before any Execute, counts an action that
 /// exits non-zero as one `action` failure and nothing else, and counts neither an action
-/// that exits 0 nor a cache hit of it.
+/// that exits 0 nor a second caller waiting on the failing one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failing_action_raises_only_the_action_class() {
     let cell = Cell::start_with_api().await;
@@ -50,10 +50,12 @@ async fn a_failing_action_raises_only_the_action_class() {
     let fails = Job::new("fails", &[]);
     cell.upload(&fails.blobs()).await;
     let mut ops = cell.execute(&fails.action).await;
+    let mut twin = cell.execute(&fails.action).await;
     let start = daemon.start().await;
     let result = output(&cell, "a test failed", 1).await;
     assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
     let _ = response(&done(&mut ops).await);
+    let _ = response(&done(&mut twin).await);
     assert_eq!(count(api, "action").await, 1);
     for class in ["farm", "request", "ambiguous"] {
         assert_eq!(count(api, class).await, 0, "{class}");
