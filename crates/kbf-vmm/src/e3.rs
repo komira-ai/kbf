@@ -367,7 +367,12 @@ pub fn e3(ctx: &Ctx<'_>, graphics: Graphics) -> Report {
     for (name, with_graphics) in wanted {
         let (mut vm, mut arm) = match start_arm(ctx, name, *with_graphics) {
             Ok(started) => started,
-            Err(e) => return Report::error(PROBE, e),
+            Err(e) => {
+                // The arms that finished cost a full run each: they stay in the report.
+                let mut r = Report::error(PROBE, e);
+                r.details = json!({"arms": arms, "clones_kept": ctx.keep});
+                return r;
+            }
         };
         observe(ctx, &mut vm, &mut arm);
         stop_gracefully(ctx, &mut vm, &mut arm);

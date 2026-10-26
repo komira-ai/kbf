@@ -783,3 +783,27 @@ fn the_command_line_graphics_mode_reaches_the_probe() {
     );
     assert!(!sys.starts.borrow()[0].0.graphics);
 }
+
+/// Catches a second guest that cannot start discarding the first guest's finished results
+/// (a full run): the error report must still carry that arm.
+#[test]
+fn a_second_guest_that_cannot_start_keeps_the_first_guests_results() {
+    // How many clones one guest takes, measured on a run of its own.
+    let measure_work = work_with_base("e3-second-measure");
+    let measure = FakeSystem::new();
+    measure.script(guest_sending(&all_ok()));
+    let r = e3(&guest_ctx(&measure, &measure_work), Graphics::Off);
+    assert_eq!(r.status, ReportStatus::Ok, "{r:?}");
+    let per_guest = measure.cloned.borrow().len();
+
+    let work = work_with_base("e3-second");
+    let sys = FakeSystem::new();
+    sys.script(guest_sending(&all_ok()));
+    sys.clone_budget.set(Some(per_guest));
+    let r = e3(&guest_ctx(&sys, &work), Graphics::Both);
+    assert_eq!(r.status, ReportStatus::Error, "{r:?}");
+    let arms = r.details["arms"].as_array().expect("arms");
+    assert_eq!(arms.len(), 1, "{r:?}");
+    assert_eq!(arms[0]["name"], "e3-off");
+    assert_eq!(arms[0]["summary"]["ok"], true, "{:?}", arms[0]);
+}

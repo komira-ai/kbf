@@ -1049,6 +1049,83 @@ fn a_command_still_running_at_its_deadline_is_killed() {
     assert!(out.ms >= 5000, "{}", out.ms);
 }
 
+/// A clock that holds time still until a file exists (the command has started what the test
+/// needs it to have started), then moves it forward at once like [`Manual`]. The real
+/// sleep only yields until that progress event; no assertion reads wall time.
+struct AfterReady {
+    time: Cell<u64>,
+    ready: PathBuf,
+}
+
+impl Clock for AfterReady {
+    fn now_ms(&self) -> u64 {
+        self.time.get()
+    }
+    fn sleep(&self, d: Duration) {
+        if self.ready.exists() {
+            self.time
+                .set(self.time.get() + u64::try_from(d.as_millis()).expect("ms"));
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// Whether process `pid` is running (a zombie awaiting its reaper is not).
+fn is_running(pid: &str) -> bool {
+    let out = std::process::Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .expect("ps");
+    let stat = String::from_utf8_lossy(&out.stdout);
+    let stat = stat.trim();
+    !stat.is_empty() && !stat.starts_with('Z')
+}
+
+/// Catches a deadline that ends only the command it started: the shell here starts a
+/// minute-long sleep of its own and waits for it; once the deadline passes, that sleep must
+/// be gone too, not left running as an orphan of the killed command.
+#[test]
+fn the_deadline_also_ends_what_the_command_started() {
+    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-guest-sim-group");
+    let pid_file = dir.join("grandchild.pid");
+    let r = ProcessRunner::new(
+        AfterReady {
+            time: Cell::new(0),
+            ready: pid_file.clone(),
+        },
+        Vec::new(),
+    );
+    // The grandchild's output goes to /dev/null so the capture ends with the shell, and the
+    // pid file is renamed into place once complete so that "exists" means "fully written".
+    let script = format!(
+        "sleep 600 >/dev/null 2>&1 & echo $! > '{p}.tmp'; mv '{p}.tmp' '{p}'; wait",
+        p = pid_file.display()
+    );
+    let out = r.run(&argv(&["/bin/sh", "-c", &script]), Duration::from_secs(5));
+    assert_eq!(out.ended, Ended::TimedOut);
+    let pid = std::fs::read_to_string(&pid_file)
+        .expect("pid")
+        .trim()
+        .to_owned();
+    // The group is killed at once; a reaper may need a moment to clear the entry, so wait
+    // for that event (bounded by tries, not by a time the test asserts).
+    let mut running = true;
+    for _ in 0..3_000 {
+        running = is_running(&pid);
+        if !running {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    if running {
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-9", &pid])
+            .status();
+    }
+    assert!(!running, "the grandchild {pid} outlived the deadline");
+}
+
 /// Catches output past the capture cap going unreported or unbounded.
 #[test]
 fn output_past_the_capture_cap_is_dropped_and_flagged() {
