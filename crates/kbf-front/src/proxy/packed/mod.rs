@@ -46,15 +46,24 @@
 //!
 //! **Not packed:** `QueryWriteStatus` (a blob is reported as the storage node reports it), a
 //! ByteStream `Read` of a compressed blob, and blobs over [`Packs::max_blob_bytes`].
+//!
+//! **Packs a daemon wrote.** [`Packs::commit_pack`] records a pack that a daemon stored in the
+//! object store, after checking a sample of its blobs against their digests (`commit` has the
+//! rules). **GetActionResult** of a client checks that everything an entry's result names is
+//! held, by the index or by the storage nodes (`hit`).
 
 mod bytestream;
 mod cas;
+mod commit;
+mod hit;
 mod metrics;
 mod room;
 mod store;
 
 pub(in crate::proxy) use self::bytestream::{applies, read as read_stream, write as write_stream};
 pub(in crate::proxy) use self::cas::{Served, find_missing, read_blob, read_many, store_batch};
+pub use self::commit::{CommitError, MAX_COMMIT_BLOBS};
+pub(in crate::proxy) use self::hit::held;
 pub use self::metrics::PackMetrics;
 pub use self::room::DEFAULT_INFLIGHT_BYTES;
 pub use self::store::{

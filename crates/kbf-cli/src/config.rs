@@ -206,6 +206,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "pack-bytes",
             "pack-cache-bytes",
             "pack-cache-dir",
+            "pack-commit-sample",
             "pack-inflight-bytes",
             "pack-read",
             "pack-read-cache-bytes",

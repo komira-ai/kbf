@@ -84,7 +84,10 @@ deny list cannot be read, `INVALID_ARGUMENT` otherwise). A stream that sends no 
 with the server's newest, not refused, and a daemon accepts a `Welcome` from the oldest
 version it speaks up to the one its `Hello` named),
 the heartbeat interval in milliseconds, and its **lease epoch** (see
-[Server restarts and the lease epoch](#server-restarts-and-the-lease-epoch)).
+[Server restarts and the lease epoch](#server-restarts-and-the-lease-epoch)), and, in
+`Welcome.pack_commit` (field 5, additive), whether the frontend takes
+`kbf.worker.v1.PackIndex/CommitPack` (see [below](#blobs-on-the-worker-listener)): false
+from a frontend without the pack index and the pack store, and from one that predates the field.
 
 **Only the first `Hello` of a stream registers the node.** It opens a new session, and
 from then on every `Start` for this node goes to this stream. A `Hello` resent on the
@@ -323,6 +326,27 @@ them; it reads every other blob where it did before. Admitted by the same rule a
 calls. A frontend without `--pack-index` does not register the service: the call is
 `UNIMPLEMENTED`. More than 1000 digests, or a digest that is not SHA-256, is
 `INVALID_ARGUMENT`; an index that cannot be read is `UNAVAILABLE`.
+
+With the pack store flags too, the frontend serves `kbf.worker.v1.PackIndex/CommitPack` to the
+daemon role: a daemon that writes its outputs into packs stores a pack in the object store with
+a create-only write and then commits it, naming the pack (`cas/d/<node>/<boot>/<sequence>`), its
+size, its blobs with their offsets, and itself as the writer. The write rule is that a pack is
+stored first and recorded after, so a row of the index never points at a pack that is not
+stored. The frontend refuses a commit whose writer is not the node the caller's certificate
+names (`PERMISSION_DENIED`: a daemon commits only its own packs), a name outside the writer's
+prefix or a list that cannot be a pack's, such as blobs that add up to more bytes than the pack
+(`INVALID_ARGUMENT`), and a pack that is not in the store or is not as long as the commit says
+(`FAILED_PRECONDITION`). It reads the pack's last byte (not its footer) and
+re-hashes a sample of the listed blobs by ranged reads of at most 8 MiB each
+(`--pack-commit-sample`, default 2, chosen from the commit alone so
+that the same commit is always checked at the same blobs); a blob that is not its digest
+refuses the commit (`INVALID_ARGUMENT`) and nothing is recorded; the refusal is counted
+(`kbf_pack_commit_rejects_total`) and logged. The record is idempotent on the pack's name: a
+commit sent again is answered `created: false`, and one with other contents is
+`ALREADY_EXISTS`. A store or an index that cannot answer is `UNAVAILABLE`, and the daemon sends
+the commit again. A frontend without the pack store flags answers `UNIMPLEMENTED`, and says in
+`Welcome.pack_commit` whether it takes the call: a daemon commits only to a frontend that says
+so, and a frontend of the previous release sends nothing there (the field is additive).
 
 Not checked: that the node is registered or connected, or that it reads only the
 inputs of leases it holds. A certificate the deny list does not refuse can read any

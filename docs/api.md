@@ -1529,7 +1529,7 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_writes_total`, `kbf_pack_written_bytes_total`, `kbf_pack_written_blobs_total` | counter | packs stored and recorded in the pack index, their bytes (footers included), and the blobs in them |
 | `kbf_pack_skipped_blobs_total` | counter | blobs of a write the pack index had already, so not packed again |
 | `kbf_pack_write_failures_total` | counter | writes that failed because the store or the pack index could not take a pack (UNAVAILABLE to the client): the blobs not yet recorded are missing and the client sends them again, and packs finished before the failure stay recorded. A blob that is not its digest is INVALID_ARGUMENT and is not counted |
-| `kbf_pack_find_missing_asked_total`, `kbf_pack_find_missing_found_total` | counter | digests put to the pack index by FindMissingBlobs and by Execute's check of an action's inputs, and the ones it had (the rest go on to the storage nodes) |
+| `kbf_pack_find_missing_asked_total`, `kbf_pack_find_missing_found_total` | counter | digests put to the pack index by FindMissingBlobs, by Execute's check of an action's inputs and by the check of an action result's blobs (written, or hit), and the ones it had (the rest go on to the storage nodes) |
 | `kbf_pack_reads_total`, `kbf_pack_read_bytes_total` | counter | blobs served from a pack (a client's read or Execute's own), and their bytes |
 | `kbf_pack_read_fallbacks_total` | counter | reads of a blob the pack index lacks, answered by the storage nodes: a blob uploaded before packs were on. Falling to 0 over time is how a farm sees that nothing is left on the nodes to find |
 | `kbf_pack_read_lost_total` | counter | reads of a blob the index has and whose pack the store lacks, answered by the storage nodes (alert on any) |
@@ -1539,6 +1539,8 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_upload_waits_total` | counter | uploads that found `--pack-inflight-bytes` spent and waited their turn: a burst slowed down, none failed. Rising steadily means the bound is below what clients send |
 | `kbf_pack_upload_refusals_total` | counter | uploads refused RESOURCE_EXHAUSTED because their blobs alone are over `--pack-inflight-bytes` |
 | `kbf_pack_upload_idle_timeouts_total` | counter | ByteStream uploads ended DEADLINE_EXCEEDED because, after their resource name had arrived, no byte of their body arrived for `--pack-upload-idle-timeout`; nothing was stored and their bytes were given back |
+| `kbf_pack_commits_total` | counter | packs a daemon stored that `kbf.worker.v1.PackIndex/CommitPack` recorded in the pack index (a retry of a commit already recorded is not counted again) |
+| `kbf_pack_commit_rejects_total` | counter | commits of a pack refused with nothing recorded: the writer was not the caller, the name or the list of blobs was not one a daemon may commit, the pack was not in the store, a sampled blob was not its digest (`--pack-commit-sample`; alert on any), or the pack was recorded before with other contents. A store or an index that failed is UNAVAILABLE to the daemon and is not counted |
 
 **Reading a stall with idle slots.** `kbf_sched_queued` high and `kbf_sched_leases` below the
 nodes' slots means work is waiting that placement cannot use (look at the node's booking and

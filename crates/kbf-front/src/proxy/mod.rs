@@ -59,8 +59,8 @@ use tonic::transport::Endpoint;
 pub use self::meter::{Direction, Meter, Method};
 pub use self::owners::{Owner, Owners};
 pub use self::packed::{
-    DEFAULT_INFLIGHT_BYTES, DEFAULT_UPLOAD_IDLE_TIMEOUT, MAX_PACKED_BLOB_BYTES,
-    MAX_UPLOAD_IDLE_TIMEOUT, PackMetrics, PackSettings, PackStore, Packs,
+    CommitError, DEFAULT_INFLIGHT_BYTES, DEFAULT_UPLOAD_IDLE_TIMEOUT, MAX_COMMIT_BLOBS,
+    MAX_PACKED_BLOB_BYTES, MAX_UPLOAD_IDLE_TIMEOUT, PackMetrics, PackSettings, PackStore, Packs,
 };
 use self::{ac::ProxyActionCache, bytestream::RawByteStream, cas::ProxyCas};
 use crate::MAX_MESSAGE_BYTES;
@@ -118,6 +118,7 @@ impl Proxy {
         let action_cache = ProxyActionCache {
             owners: self.owners.clone(),
             authorizers: Arc::clone(&self.authorizers),
+            packs: self.packs.clone(),
         };
         let bytestream = RawByteStream {
             owners: self.owners.clone(),
