@@ -555,8 +555,9 @@ mod tests {
     /// The name every upload of these tests is made under.
     const NAME: &str = "main/uploads/u1/blobs/h/1";
 
-    /// The idle timeout of these tests.
-    const IDLE: Duration = Duration::from_secs(30);
+    /// The idle timeout of these tests: not the default, so that a receive that ignored the
+    /// timeout of its packs would be seen.
+    const IDLE: Duration = Duration::from_secs(45);
 
     type Sender = tokio::sync::mpsc::UnboundedSender<Frame<Bytes>>;
     type Upload = tokio::task::JoinHandle<Result<(), Status>>;
@@ -652,6 +653,7 @@ mod tests {
 
         let cut = stalled_upload.await.expect("joined").expect_err("cut");
         assert_eq!(cut.code(), Code::DeadlineExceeded);
+        assert!(cut.message().contains("45s"), "{}", cut.message());
         assert!(started.elapsed() >= IDLE);
         waiting_upload.await.expect("joined").expect("stored");
         assert_eq!(metrics.upload_idle_timeouts.get(), 1);
@@ -663,8 +665,9 @@ mod tests {
         assert!(lost.is_none());
     }
 
-    /// Asserts that an upload that sends a byte every 20 seconds, and so takes far longer in
-    /// all than the idle timeout, is not cut and is stored: only a pause is.
+    /// Asserts that an upload that sends a byte every 10 seconds short of the idle timeout, and
+    /// so takes far longer in all than the idle timeout, is not cut and is stored: only a pause
+    /// is.
     #[tokio::test(start_paused = true)]
     async fn an_upload_that_keeps_sending_is_never_cut() {
         let packs = packs_for(100);
@@ -713,7 +716,7 @@ mod tests {
 
         assert_eq!(cut.code(), Code::DeadlineExceeded);
         assert!(started.elapsed() >= IDLE);
-        assert!(started.elapsed() < Duration::from_secs(40));
+        assert!(started.elapsed() < IDLE + Duration::from_secs(5));
         assert_eq!(packs.metrics().upload_idle_timeouts.get(), 1);
         let found = packs.read(&digest).await.expect("read");
         assert!(found.is_none());

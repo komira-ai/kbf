@@ -3,10 +3,9 @@
 //! Each test says the behaviour it asserts.
 
 use std::sync::atomic::Ordering::SeqCst;
-use std::time::Duration;
 
 use bytes::Bytes;
-use futures::{StreamExt as _, stream};
+use futures::stream;
 use kbf_front::{Owners, PackSettings, Packs};
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::google::bytestream::{ReadRequest, WriteRequest};
@@ -399,32 +398,14 @@ async fn a_write_larger_than_all_the_room_is_refused() {
     assert_eq!(fits.expect("acknowledged"), 16);
 }
 
-/// Asserts that, over real gRPC, a Write that sends part of its blob and then nothing, without
-/// ending its request, is answered DEADLINE_EXCEEDED once the idle timeout has passed, stores
-/// and records nothing, is counted, and gives its room back.
-#[tokio::test]
-async fn a_write_that_stops_sending_is_ended_by_the_idle_timeout() {
-    let settings = PackSettings {
-        upload_idle_timeout: Duration::from_millis(300),
-        ..PackSettings::default()
-    };
-    let rig = Rig::with(settings).await;
-    let (digest, bytes) = blob("a blob that is never finished");
-    let first = message(&upload(&digest), 0, &bytes[..5], false);
-    let stalled = stream::iter([first]).chain(stream::pending());
-
-    let sent = ByteStreamClient::new(rig.front.clone())
-        .write(stalled)
-        .await;
-
-    let ended = sent.expect_err("ended");
-    assert_eq!(ended.code(), Code::DeadlineExceeded);
-    assert!(rig.index.has_none(&[digest]));
-    assert!(rig.store.keys().await.is_empty());
-    let metrics = rig.packs.metrics();
-    assert_eq!(metrics.upload_idle_timeouts.get(), 1);
-    assert_eq!(metrics.inflight_bytes(), 0);
-}
+// The idle timeout of an upload is not tested over gRPC, where it would wait on a real clock.
+// The tests in `src/proxy/packed/bytestream.rs` run it on a paused clock: a stalled upload is
+// ended DEADLINE_EXCEEDED once the timeout has passed since its last byte and not before, stores
+// nothing, is counted, and gives its room back; an upload that keeps sending is never cut; an
+// empty frame is not progress, and the tests run it with a timeout that is not the default.
+// `the_defaults_are_the_frontends` (`store.rs`) asserts only the default timeout, and
+// `the_configured_idle_timeout_is_the_one_the_packs_keep` (`store.rs`) asserts that a timeout
+// given in `PackSettings` is the one `Packs` keeps.
 
 /// Asserts that the families of the pack layer are in the text a scrape gets, with the counts of
 /// what was done.
