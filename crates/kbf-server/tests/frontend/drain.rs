@@ -14,7 +14,7 @@ use kbf_server::api::FRONTEND_DRAIN;
 use kbf_server::drain::Phase;
 use tonic::{Code, Status, Streaming};
 
-use super::retire::{Member, Pair, bearer, exchange, execute_refused, polled, queued, readyz};
+use super::retire::{Member, Pair, bearer, exchange, execute_refusal, polled, queued, readyz};
 use super::*;
 
 /// The longest a test waits for an event: a bound that only a hang reaches.
@@ -176,14 +176,48 @@ async fn until_executing(ops: &mut Streaming<Operation>) {
 /// frontend refuses it UNAVAILABLE and sends the REAPI listener GOAWAY in the same step, so
 /// on the connection `client` already holds it surfaces as UNAVAILABLE from the service or
 /// as CANCELLED when the GOAWAY got there first (as in
-/// `an_open_execute_survives_stop_until_its_action_is_done`). Any other code, or an Execute
-/// that is answered, fails.
+/// `an_open_execute_survives_stop_until_its_action_is_done`), or as INTERNAL when the
+/// frontend's GOAWAY (NO_ERROR) ended the call on that connection ([`GOAWAY_NO_ERROR`]). Any
+/// other code, any other INTERNAL (a GOAWAY with an error, a connection that failed), or an
+/// Execute that is answered, fails, and the whole status is printed.
 async fn assert_refused_after_the_wait(client: &Client, job: &Job) {
-    let refused = execute_refused(client, job).await;
+    let refused = execute_refusal(client, job).await;
+    let refused = refused.expect("a new Execute is refused after the wait");
     assert!(
-        matches!(refused, Some(Code::Unavailable | Code::Cancelled)),
+        is_a_refusal(&refused),
         "a new Execute was not refused after the wait: {refused:?}"
     );
+}
+
+/// How h2 words the error of a call ended by the peer's GOAWAY with NO_ERROR, the code the
+/// frontend's drain sends: the only INTERNAL that is a refusal after the wait. hyper wraps that
+/// error, so it is in the status's chain of sources, not in its message ("h2 protocol error:
+/// http2 error", as CI showed).
+const GOAWAY_NO_ERROR: &str = "connection error received: not a result of an error";
+
+/// Whether an error in the chain of sources of `status` is the peer's GOAWAY with NO_ERROR. A
+/// GOAWAY with an error code, a local protocol error and an INTERNAL from the service carry no
+/// such source.
+fn ended_by_goaway_no_error(status: &tonic::Status) -> bool {
+    let mut next = std::error::Error::source(status);
+    while let Some(error) = next {
+        if error.to_string().contains(GOAWAY_NO_ERROR) {
+            return true;
+        }
+        next = error.source();
+    }
+    false
+}
+
+/// Whether `status` is how the frontend's refusal of new work after the wait reaches a client:
+/// UNAVAILABLE from the service, CANCELLED by the GOAWAY, or a call the GOAWAY (NO_ERROR)
+/// ended.
+fn is_a_refusal(status: &tonic::Status) -> bool {
+    match status.code() {
+        Code::Unavailable | Code::Cancelled => true,
+        Code::Internal => ended_by_goaway_no_error(status),
+        _ => false,
+    }
 }
 
 /// Asserts that in the wait the frontend answers `/readyz` 503 at once and serves on: a
