@@ -112,19 +112,18 @@ pub fn put(root: &Path, f: &OfflineFile, env: &Env<'_>) -> Result<Value, String>
     }
     let path = root.join(&rel);
     (env.remove)(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
-    let mut file = std::fs::OpenOptions::new()
+    let meta = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .custom_flags(libc::O_NOFOLLOW)
         .mode(0o600)
         .open(&path)
-        .map_err(|e| format!("create {}: {e}", path.display()))?;
-    file.write_all(&f.contents)
+        .and_then(|mut file| {
+            file.write_all(&f.contents)?;
+            settle(&file, f.mode, env.owner)?;
+            file.metadata()
+        })
         .map_err(|e| format!("write {}: {e}", path.display()))?;
-    settle(&file, f.mode, env.owner).map_err(|e| format!("chmod {}: {e}", path.display()))?;
-    let meta = file
-        .metadata()
-        .map_err(|e| format!("stat {}: {e}", path.display()))?;
     Ok(json!({
         "path": f.path,
         "uid": meta.uid(),
@@ -343,6 +342,24 @@ mod tests {
         std::fs::write(root.join("f"), "x").expect("file");
         remove_path(&root.join("f")).expect("rm file");
         assert!(!root.join("f").exists());
+    }
+
+    /// Catches a failed mode or owner change on the file being ignored (a non-root caller
+    /// cannot give a file to root).
+    #[test]
+    fn a_refused_owner_change_on_the_file_is_an_error() {
+        // SAFETY: geteuid cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root = tmp("put-chown");
+        let env = Env {
+            remove: &remove_path,
+            owner: Some((0, 0)),
+        };
+        let e = put(&root, &file("f", 0o644), &env).expect_err("chown refused");
+        assert!(e.starts_with("write "), "{e}");
+        assert!(e.contains(&root.join("f").display().to_string()), "{e}");
     }
 
     /// Catches `put_all` skipping the production remover and owner, or dropping a file.
