@@ -71,12 +71,17 @@ async fn refused(addr: SocketAddr) -> bool {
 
 /// The code an Execute is refused with, however it is surfaced.
 pub(super) async fn execute_refused(client: &Client, job: &Job) -> Option<Code> {
+    execute_refusal(client, job)
+        .await
+        .map(|status| status.code())
+}
+
+/// The status an Execute is refused with, however it is surfaced: by the call or by the
+/// first read of its stream. `None` when the Execute is taken.
+pub(super) async fn execute_refusal(client: &Client, job: &Job) -> Option<tonic::Status> {
     match client.execute_with(&job.action, false).await {
-        Err(status) => Some(status.code()),
-        Ok(mut ops) => match ops.message().await {
-            Err(status) => Some(status.code()),
-            Ok(_) => None,
-        },
+        Err(status) => Some(status),
+        Ok(mut ops) => ops.message().await.err(),
     }
 }
 
