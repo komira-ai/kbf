@@ -87,6 +87,9 @@ mod input_phases;
 #[cfg(test)]
 mod intake_tests;
 mod keeper;
+mod logs;
+#[cfg(test)]
+mod logs_tests;
 pub mod numa;
 mod oci;
 mod outputs;

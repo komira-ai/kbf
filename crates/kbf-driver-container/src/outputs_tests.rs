@@ -1,5 +1,7 @@
 //! The walk's pieces: parent checks, limit flags, blocking tasks, byte limits.
 
+use kbf_daemon::cas::label;
+
 use super::*;
 
 /// A fresh scratch directory for one unit test, beside the test binary.
@@ -82,6 +84,7 @@ async fn the_walk_sends_no_task_to_the_blocking_pool_per_file() {
             "",
             &["out".to_owned()],
             OutputLimits::DEFAULT,
+            None,
             &mut result,
         )
         .await
@@ -225,6 +228,7 @@ async fn files_an_intake_took_are_not_sent_again() {
         "",
         &["out/file".to_owned(), "out/dir".to_owned()],
         OutputLimits::DEFAULT,
+        None,
         &mut result,
     )
     .await
