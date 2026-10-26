@@ -624,24 +624,36 @@ fn a_caller_that_sends_nothing_is_dropped() {
 }
 
 /// Catches: a timeout per read only, under which a caller that sends one byte at a
-/// time, each within the timeout, holds a thread for as long as it likes. Here each
-/// byte comes 100 ms after the last, well within the 400 ms; the 24 bytes would take
-/// 2.4 s, and the request is refused at 400 ms.
+/// time, each within the timeout, holds a thread for as long as it likes. The caller
+/// sends the 24 bytes of a frame, and each byte moves the connection's clock on by
+/// 100 ms; the request is due 400 ms after the hello, so it is refused at the deadline
+/// however the bytes and the reads interleave, and a per-read timeout would instead
+/// read the whole frame and answer "bad request".
 #[test]
 fn a_caller_that_drips_its_request_is_dropped_at_the_deadline() {
     use std::io::Write as _;
-    use std::time::Instant;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     trace();
     let dir = scratch("server-drip");
     let helper = quiet_helper(&dir);
     let (caller_end, helper_end) = UnixStream::pair().unwrap();
     let check = Scripted::fixed(Ok(()));
+    let clock = Arc::new(AtomicU64::new(0));
+    let helper_clock = clock.clone();
+    // Told at the helper's first reading of the clock, which starts the 400 ms: the
+    // caller sends nothing before that, so the deadline cannot start late.
+    let (started, started_rx) = std::sync::mpsc::channel();
     let served = std::thread::spawn(move || {
-        connection(
+        connection_on(
             &helper_end,
             &helper,
             check.as_ref(),
             Duration::from_millis(400),
+            &|| {
+                let _ = started.send(());
+                Duration::from_millis(helper_clock.load(Ordering::SeqCst))
+            },
         );
     });
     let hello = proto::recv::<Reply>(caller_end.as_fd(), 0)
@@ -649,12 +661,12 @@ fn a_caller_that_drips_its_request_is_dropped_at_the_deadline() {
         .unwrap()
         .0;
     assert!(matches!(hello, Reply::Hello { .. }), "{hello:?}");
-    let start = Instant::now();
     let mut dripper = caller_end.try_clone().unwrap();
     let drip = std::thread::spawn(move || {
+        started_rx.recv().expect("the helper read the clock");
         // A frame of 20 bytes, then those bytes; the helper hangs up partway.
         for byte in [0, 0, 0, 20].into_iter().chain([b'x'; 20]) {
-            std::thread::sleep(Duration::from_millis(100));
+            clock.fetch_add(100, Ordering::SeqCst);
             if dripper.write_all(&[byte]).is_err() {
                 return;
             }
@@ -663,12 +675,10 @@ fn a_caller_that_drips_its_request_is_dropped_at_the_deadline() {
     let (reply, _) = proto::recv::<Reply>(caller_end.as_fd(), 0)
         .unwrap()
         .unwrap();
-    let waited = start.elapsed();
     assert!(
         matches!(&reply, Reply::Refused { reason } if reason.contains("deadline")),
         "{reply:?}"
     );
-    assert!(waited < Duration::from_millis(1500), "{waited:?}");
     served.join().unwrap();
     drop(caller_end);
     drip.join().unwrap();
