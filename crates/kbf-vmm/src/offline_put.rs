@@ -8,6 +8,14 @@
 //! at the destination is removed (a removal that fails is an error); the file is created
 //! with `O_EXCL | O_NOFOLLOW`; mode and owner are set on the open descriptor.
 //!
+//! The walk uses path strings (`lstat`, then `mkdir` or `create_new`), not a descriptor
+//! held open per directory, so it relies on the guest being powered off with the volume
+//! attached host-side: nothing else changes the tree between a check and its use. The
+//! last hop is still closed against a race by `O_EXCL | O_NOFOLLOW`. A payload path that
+//! ends in `/` or has an empty or `.` component is refused, and the remover works on the
+//! parent directory plus the final name, so a trailing slash can never make `lstat` or a
+//! removal resolve through a link.
+//!
 //! Plain Unix, so it builds and is tested on Linux as well as macOS.
 
 use std::io::{self, Write};
@@ -33,6 +41,16 @@ pub struct Env<'a> {
 /// # Errors
 /// The path cannot be examined or removed (a file the guest made immutable fails here).
 pub fn remove_path(path: &Path) -> io::Result<()> {
+    // The parent plus the final name: `a/f/` and `a/f` name the same entry, and a
+    // trailing slash must not make the kernel resolve a link at `f`.
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} does not end in a file name", path.display()),
+        ));
+    };
+    let path = parent.join(name);
+    let path = path.as_path();
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -87,11 +105,15 @@ fn ensure_parents(root: &Path, rel: &Path, env: &Env<'_>) -> Result<(), String> 
     Ok(())
 }
 
-/// The path of `f` as a relative path of plain names; anything else (`..`, a root) is
-/// an error.
+/// The path of `f` as a relative path of plain names; anything else (`..`, a root, a
+/// trailing `/`, an empty or `.` component) is an error.
 fn relative(f: &OfflineFile) -> Result<PathBuf, String> {
     let rel = Path::new(&f.path);
-    if rel.as_os_str().is_empty() || rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+    // `Path::components` drops a trailing slash, `//` and `.`, so check the string too.
+    if rel.as_os_str().is_empty()
+        || f.path.split('/').any(|s| s.is_empty() || s == ".")
+        || rel.components().any(|c| !matches!(c, Component::Normal(_)))
+    {
         return Err(format!(
             "payload path {:?} is not a relative path of plain names",
             f.path
@@ -160,6 +182,18 @@ mod tests {
             contents: b"payload".to_vec(),
             mode,
         }
+    }
+
+    /// These tests need permission checks that root bypasses; say so and skip.
+    fn skip_as_root() -> bool {
+        // SAFETY: geteuid cannot fail.
+        let root = unsafe { libc::geteuid() } == 0;
+        if root {
+            eprintln!(
+                "skipped: running as root, which bypasses the permission checks this test needs"
+            );
+        }
+        root
     }
 
     fn real_env() -> Env<'static> {
@@ -278,9 +312,8 @@ mod tests {
         assert!(e.contains(&root.join("var").display().to_string()), "{e}");
     }
 
-    /// Catches a directory created at a missing parent keeping the umask-filtered mode or
-    /// the creator's owner when an owner is asked for, and a destination directory left
-    /// in place instead of being removed.
+    /// Catches a destination directory (with contents) left in place instead of being
+    /// replaced by the file, and the new file not getting the requested mode and owner.
     #[test]
     fn ownership_is_set_and_a_directory_at_the_destination_is_replaced() {
         let root = tmp("put-owner");
@@ -296,16 +329,48 @@ mod tests {
     #[test]
     fn paths_that_are_not_plain_relative_names_are_refused() {
         let root = tmp("put-badpath");
-        for p in ["../x", "/etc/x", "a/../../x", ""] {
+        for p in [
+            "../x",
+            "/etc/x",
+            "a/../../x",
+            "",
+            "f/",
+            "a//b",
+            "./a",
+            "a/./b",
+            ".",
+        ] {
             let e = put(&root, &file(p, 0o644), &real_env()).expect_err(p);
             assert!(e.contains("not a relative path"), "{e}");
         }
+    }
+
+    /// Catches a trailing slash resolving through a planted link: `f/` with `f` a link to
+    /// a directory outside must be refused (before the fix `remove_dir_all` ran through the
+    /// link), and the remover itself must treat `f/` as the entry `f`.
+    #[test]
+    fn a_trailing_slash_never_resolves_through_a_link() {
+        let root = tmp("put-slash");
+        let outside = tmp("put-slash-outside");
+        std::fs::write(outside.join("keep"), "x").expect("keep");
+        symlink(&outside, root.join("f")).expect("link");
+        let e = put(&root, &file("f/", 0o644), &real_env()).expect_err("refused");
+        assert!(e.contains("not a relative path"), "{e}");
+        assert!(outside.join("keep").exists());
+        remove_path(&root.join("f/")).expect("removes the link itself");
+        assert!(outside.join("keep").exists());
+        assert!(std::fs::symlink_metadata(root.join("f")).is_err());
+        remove_path(Path::new("/")).expect_err("no final name");
+        remove_path(&root.join("g/..")).expect_err("no final name");
     }
 
     /// Catches a stat or create failure being swallowed: a parent that cannot be searched,
     /// and a destination that cannot be created.
     #[test]
     fn unreadable_parents_and_unwritable_directories_are_errors() {
+        if skip_as_root() {
+            return;
+        }
         let root = tmp("put-eacces");
         std::fs::create_dir_all(root.join("locked/sub")).expect("dirs");
         std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000))
@@ -344,6 +409,9 @@ mod tests {
     /// cannot give a file to root).
     #[test]
     fn a_refused_owner_change_on_the_file_is_an_error() {
+        if skip_as_root() {
+            return;
+        }
         let root = tmp("put-chown");
         let env = Env {
             remove: &remove_path,
@@ -357,6 +425,9 @@ mod tests {
     /// Catches `put_all` not asking for root ownership (a non-root run is refused, naming the path).
     #[test]
     fn put_all_gives_files_to_root_and_names_the_path_when_refused() {
+        if skip_as_root() {
+            return;
+        }
         let root = tmp("put-all");
         // The owner is 0:0, which a test run as a normal user cannot give away to.
         let e = put_all(&root, &[file("a/x", 0o644)]).expect_err("not root");
