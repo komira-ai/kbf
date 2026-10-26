@@ -1,6 +1,7 @@
 //! `deploy-farm` against a fake coordinator and a fake runner token service on loopback, over
 //! TLS with a CA of the test's own, and the binary for its flags and exit codes.
 
+use std::cell::{Cell, RefCell};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
@@ -11,7 +12,9 @@ use std::time::Duration;
 use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::{Value, json};
-use xtask::deploy_farm::{Args, Error, Plan, Roots, TokenService, deploy, pem_roots, run_with};
+use xtask::deploy_farm::{
+    Args, Clock, Error, Plan, Roots, TokenService, deploy_on, pem_roots, run_with,
+};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const RUNNER_KEY: &str = "runner-key";
@@ -94,7 +97,7 @@ impl Fake {
             min_up_frontend: 1,
             deadline: Duration::from_secs(30),
             stall: Duration::from_secs(30),
-            every: Duration::from_millis(20),
+            every: Duration::from_secs(1),
         }
     }
 }
@@ -234,14 +237,47 @@ fn farm(state: &str, updating: u64, failed: u64) -> Value {
     ]})
 }
 
+/// A virtual clock: `sleep` moves `now` and is recorded, so no test waits for a deadline.
+#[derive(Default)]
+struct Time {
+    now: Cell<Duration>,
+    slept: RefCell<Vec<Duration>>,
+}
+
+impl Time {
+    fn clock(&self) -> Clock<'_> {
+        Clock {
+            now: Box::new(|| self.now.get()),
+            sleep: Box::new(|d| {
+                self.now.set(self.now.get() + d);
+                self.slept.borrow_mut().push(d);
+            }),
+        }
+    }
+}
+
+/// `deploy_on` a fresh virtual clock.
+fn deploy(
+    plan: &Plan,
+    service: &TokenService,
+    roots: &Roots<'_>,
+    out: &mut impl Write,
+) -> Result<(), Error> {
+    deploy_on(plan, service, roots, &Time::default().clock(), out)
+}
+
 fn run(fake: &Fake, plan: &Plan) -> (Result<(), Error>, String) {
+    run_timed(fake, plan, &Time::default())
+}
+
+fn run_timed(fake: &Fake, plan: &Plan, time: &Time) -> (Result<(), Error>, String) {
     let mut out = Vec::new();
     let ca = [fake.ca.clone()];
     let roots = Roots {
         runner: &ca,
         coordinator: &ca,
     };
-    let result = deploy(plan, &fake.service(), &roots, &mut out);
+    let result = deploy_on(plan, &fake.service(), &roots, &time.clock(), &mut out);
     (result, String::from_utf8(out).expect("utf8"))
 }
 
@@ -323,25 +359,37 @@ fn a_blocked_farm_fails_at_once_with_its_table_printed() {
 #[test]
 fn a_farm_that_keeps_moving_but_does_not_converge_fails_at_the_deadline() {
     // Proves: counts that change on every read are progress, so only the deadline ends
-    // the wait; it ends it as an error, after a read at the deadline.
+    // the wait; it ends it as an error, after a read at the deadline, and the last sleep
+    // is cut short to land on the deadline (3.5 s of deadline, 1 s between reads).
     let reads = (0..40).map(|n| Ok(farm("in_progress", n % 3, 0))).collect();
     let fake = serve(Script::new(reads));
     let mut plan = fake.plan();
-    plan.deadline = Duration::from_millis(400);
-    let (result, out) = run(&fake, &plan);
-    assert_eq!(result, Err(Error::Deadline(0)), "{out}");
-    assert!(fake.requests("/v1/convergence").len() >= 3);
+    plan.deadline = Duration::from_millis(3500);
+    let time = Time::default();
+    let (result, out) = run_timed(&fake, &plan, &time);
+    assert_eq!(result, Err(Error::Deadline(3)), "{out}");
+    let second = Duration::from_secs(1);
+    assert_eq!(
+        *time.slept.borrow(),
+        [second, second, second, Duration::from_millis(500)]
+    );
+    // The read before the deploy, then the reads at 0, 1, 2, 3 and 3.5 s.
+    assert_eq!(fake.requests("/v1/convergence").len(), 6);
 }
 
 #[test]
 fn counts_that_do_not_change_fail_as_a_stall_before_the_deadline() {
     // Proves: the same counts for the stall time end the wait as a stall, though the
-    // deadline is far off.
+    // deadline is far off: reads at 0, 1, 2 and 3 s, and the stall is judged at the
+    // fourth.
     let fake = serve(Script::new(vec![Ok(farm("in_progress", 1, 0))]));
     let mut plan = fake.plan();
-    plan.stall = Duration::from_millis(200);
-    let (result, _) = run(&fake, &plan);
-    assert_eq!(result, Err(Error::Stalled(0)));
+    plan.stall = Duration::from_secs(3);
+    let time = Time::default();
+    let (result, _) = run_timed(&fake, &plan, &time);
+    assert_eq!(result, Err(Error::Stalled(3)));
+    assert_eq!(time.slept.borrow().len(), 3);
+    assert_eq!(fake.requests("/v1/convergence").len(), 5);
 }
 
 #[test]
@@ -472,9 +520,9 @@ fn a_redirect_from_the_coordinator_is_not_followed() {
     // names; the wait ends as a stall.
     let fake = serve(Script::new(vec![Err(302)]));
     let mut plan = fake.plan();
-    plan.stall = Duration::from_millis(200);
+    plan.stall = Duration::from_secs(3);
     let (result, out) = run(&fake, &plan);
-    assert_eq!(result, Err(Error::Stalled(0)), "{out}");
+    assert_eq!(result, Err(Error::Stalled(3)), "{out}");
     assert!(fake.requests("/v1/elsewhere").is_empty());
 }
 
@@ -521,7 +569,7 @@ fn a_runner_with_no_token_and_an_answer_that_is_no_table_fail_with_reasons() {
         json!({"state": "in_progress", "roles": []}),
     )]));
     let mut plan = empty.plan();
-    plan.stall = Duration::from_millis(100);
+    plan.stall = Duration::from_secs(3);
     let (_, out) = run(&empty, &plan);
     assert!(out.contains("desired (none)"), "{out}");
 }
