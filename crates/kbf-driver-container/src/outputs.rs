@@ -32,8 +32,9 @@
 //! symlink, only when it sends the file ([`crate::hashing`] stamps what it hashed; a
 //! file that changed since is refused, and the server checks every record's digest as it
 //! arrives). One past the byte limit is refused after `limit + 1` bytes. The action's
-//! stdout and stderr are stored the other way, each within its own limit
-//! ([`collect_log`]).
+//! stdout and stderr are stored within their own limit: hashed and sent in the same
+//! `put_records` as the outputs when the store has no intake ([`crate::logs`]), else
+//! one by one through the intake ([`collect_log`]).
 //!
 //! A store in this process (the in-process plane, [`Cas::intake`]) takes each file's
 //! chunks as the hash pass reads them, so each output file, and stdout and stderr, is
@@ -56,7 +57,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use kbf_daemon::cas::{
-    Cas, CasError, FileSource, Intake, OPEN_DIRECTORY, OPEN_FILE, Record, Source, descend, label,
+    Cas, CasError, FileSource, Intake, OPEN_DIRECTORY, OPEN_FILE, Record, Source, descend,
     proto_digest,
 };
 use kbf_daemon::cpu_pool::CpuPool;
@@ -70,6 +71,7 @@ use rustix::io::Errno;
 
 use crate::cas::FileBlob;
 use crate::hashing::{Digested, Job, Outcome, hash_all, read_through};
+use crate::logs::{Logs, add_to, missing_only, through_intake};
 use crate::tree::{Exceeded, TreeError, check_relative};
 
 /// How much output one action may leave. An action past a limit fails with
@@ -136,7 +138,7 @@ impl Budget {
     }
 }
 
-fn limit(shown: &Path, what: Exceeded, limit: u64) -> TreeError {
+pub(crate) fn limit(shown: &Path, what: Exceeded, limit: u64) -> TreeError {
     TreeError::Limit {
         path: shown.to_owned(),
         what,
@@ -385,6 +387,10 @@ pub(crate) fn back_to_parent(dir: &OwnedFd, expected: Identity) -> std::io::Resu
 /// `result`, all of them together within `limits`, and stores the blobs through `cas`.
 /// See the module comment for what is followed (nothing) and what is left out. The files
 /// are hashed on `pool`, once each; the blobs are then stored with [`Cas::put_records`].
+/// With `logs`, the action's stdout and stderr are stored too and their digests set in
+/// `result`: in that same `put_records` when the store has no intake ([`crate::logs`]),
+/// else through the intake once the outputs are stored.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn collect(
     cas: &impl Cas,
     upper: &Path,
@@ -392,6 +398,7 @@ pub(crate) async fn collect(
     working_directory: &str,
     paths: &[String],
     limits: OutputLimits,
+    logs: Option<&Logs<'_>>,
     result: &mut ActionResult,
 ) -> Result<(), TreeError> {
     check_relative("working directory", working_directory)?;
@@ -443,8 +450,12 @@ pub(crate) async fn collect(
         limits.max_bytes,
         &std::mem::take(&mut listing.shown),
     )?;
-    let blobs = assemble(listing, &digested, &jobs, &upper_fd, result);
+    let mut blobs = assemble(listing, &digested, &jobs, &upper_fd, result);
     let taken = digested.iter().filter(|d| d.taken).count();
+    let plain = intake.is_none();
+    if let Some(logs) = logs.filter(|_| plain) {
+        add_to(&mut blobs, logs, result).await?;
+    }
     let finishing = Instant::now();
     finish(intake).await?;
     let take_ms = finishing.elapsed().as_millis() as u64;
@@ -452,18 +463,14 @@ pub(crate) async fn collect(
     // The CAS is asked about every digest at once (the transfer engine cuts it into
     // FindMissing calls and sends them together), and only the missing blobs are sent.
     let asked = Instant::now();
-    let digests: Vec<Digest> = blobs.iter().map(|r| proto_digest(&r.digest)).collect();
-    let missing: HashSet<String> = cas.missing(&digests).await.iter().map(label).collect();
-    let blobs: Vec<Record> = blobs
-        .into_iter()
-        .zip(&digests)
-        .filter(|(_, digest)| missing.contains(&label(digest)))
-        .map(|(record, _)| record)
-        .collect();
+    let blobs = missing_only(cas, blobs).await;
     let find_missing = asked.elapsed();
     let sending = blobs.len();
     let stored = Instant::now();
     cas.put_records(blobs).await?;
+    if let Some(logs) = logs.filter(|_| !plain) {
+        through_intake(cas, logs, result).await?;
+    }
     tracing::info!(
         files,
         blobs = count,

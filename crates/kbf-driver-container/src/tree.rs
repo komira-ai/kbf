@@ -291,5 +291,16 @@ pub async fn collect(
     limits: OutputLimits,
     result: &mut ActionResult,
 ) -> Result<(), TreeError> {
-    crate::outputs::collect(cas, upper, pool, working_directory, paths, limits, result).await
+    let logs = None;
+    crate::outputs::collect(
+        cas,
+        upper,
+        pool,
+        working_directory,
+        paths,
+        limits,
+        logs,
+        result,
+    )
+    .await
 }
