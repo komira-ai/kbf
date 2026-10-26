@@ -50,6 +50,12 @@ pub async fn call(
     send(h, method, &path, query, &signed, body).await
 }
 
+/// The id in the answer to a start of a multipart upload.
+pub fn upload_id(xml: &str) -> &str {
+    let (_, rest) = xml.split_once("<UploadId>").unwrap();
+    rest.split_once("</UploadId>").unwrap().0
+}
+
 /// The text of the body of an answer.
 async fn text(response: Response) -> String {
     response.text().await.unwrap()

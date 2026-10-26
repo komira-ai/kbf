@@ -11,14 +11,15 @@ use clap::{CommandFactory, Parser};
 use kbf_testkit::dir::TestDir;
 use tokio::sync::Notify;
 
-use crate::server::AccessKey;
+use crate::server::{AccessKey, Drained};
 use crate::{
     Backend, FaultyBackend, MemoryBackend, Op, Proxy, ProxyConfig, Reconciler, ReconcilerConfig,
     TestClock,
 };
 
 use super::{
-    Cli, InvalidFlags, S3Flags, build, open_tier, parse_duration, read_key, reconcile, share, tier,
+    Cli, InvalidFlags, S3Flags, build, cut_note, open_tier, parse_duration, read_key, reconcile,
+    share, tier,
 };
 
 const MEBIBYTE: u64 = 1 << 20;
@@ -286,12 +287,15 @@ fn a_percent_is_a_share() {
 /// Asserts that the settings are made from the flags: the key file's key and secret, the
 /// read-only keys of their files (one in each form) in the order of the flags, the bucket and
 /// region, the limits, the water marks as shares, the id of the proxy as the holder of the
-/// lease, and the durations.
+/// lease, and the durations, the lengths of the two parts of the drain (given values that are not
+/// the defaults) among them.
 #[test]
 fn the_settings_are_made_from_the_flags() {
     let dir = TestDir::under(std::env::temp_dir(), "tierstore-build");
     let mut cli = cli(&dir);
     cli.region = "eu-west-1".to_owned();
+    cli.drain_lb_wait = Duration::from_secs(7);
+    cli.drain_deadline = Duration::from_secs(11);
     let lines = key_file(&dir, "reader-lines", "READ1\nread-secret-1\n", 0o600);
     let json = key_file(&dir, "reader-json", JSON_KEY, 0o400);
     cli.read_only_key_file = vec![lines, json];
@@ -307,8 +311,8 @@ fn the_settings_are_made_from_the_flags() {
     assert_eq!(built.server.secret_access_key, "secret");
     assert_eq!(built.server.max_request_bytes, 256 << 20);
     assert_eq!(built.server.body_idle_timeout, Duration::from_secs(30));
-    assert_eq!(built.server.drain_lb_wait, Duration::from_secs(10));
-    assert_eq!(built.server.drain_deadline, Duration::from_secs(900));
+    assert_eq!(built.server.drain_lb_wait, Duration::from_secs(7));
+    assert_eq!(built.server.drain_deadline, Duration::from_secs(11));
     assert_eq!(built.proxy.proxy_id, "p1");
     assert_eq!(built.proxy.hot_budget, 1000);
     assert_eq!(built.proxy.critical, 0.95);
@@ -608,4 +612,15 @@ async fn a_halt_cuts_the_pass_that_is_running() {
     assert!(done.is_ok());
     assert!(hot.get("_tiering/lease", None).await.is_err());
     assert!(cold_mem.get("k", None).await.is_err());
+}
+
+/// Asserts that the report of a drain names the requests that the deadline cut, and that a drain
+/// that cut none reports nothing.
+#[test]
+fn a_drain_that_cut_requests_reports_them_and_one_that_cut_none_says_nothing() {
+    assert_eq!(cut_note(Drained { abandoned: 0 }), "");
+    assert_eq!(
+        cut_note(Drained { abandoned: 3 }),
+        "tierstore: 3 requests were cut at the drain deadline\n"
+    );
 }

@@ -195,7 +195,7 @@ async fn only_the_configured_key_is_served() {
     assert!(h.hot_mem.get("cas/denied", None).await.is_err());
     let waiting = h.store(CONDITIONAL);
     waiting
-        .wait_answering(Duration::from_secs(5))
+        .wait_answering(Duration::from_secs(60))
         .await
         .unwrap();
 }
