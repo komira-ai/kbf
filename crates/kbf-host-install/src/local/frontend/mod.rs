@@ -38,6 +38,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub use crate::pace::Pace;
+
 use self::config::{FrontendConfig, STOP_SECS};
 use self::probe::Probe;
 use self::record::{Record, Slot, Trial};
@@ -136,27 +138,6 @@ pub trait ImageSource {
     /// A refusal for anything the configuration or the release does not allow; nothing but
     /// scratch has changed either way.
     fn fetch(&self, version: &Version, channel: &Channel) -> Result<FetchedImage, Fault>;
-}
-
-/// How the waits tell time and pause: the real clock in the program, a made-up one in tests.
-pub struct Pace {
-    /// How long to pause between two looks.
-    pub poll: Duration,
-    /// A monotonic reading.
-    pub now: Box<dyn Fn() -> Duration>,
-    pub sleep: Box<dyn Fn(Duration)>,
-}
-
-impl Pace {
-    /// The clock of the machine.
-    pub fn real() -> Self {
-        let start = std::time::Instant::now();
-        Self {
-            poll: Duration::from_secs(2),
-            now: Box::new(move || start.elapsed()),
-            sleep: Box::new(std::thread::sleep),
-        }
-    }
 }
 
 /// The frontend container of this host, as a backend of an update.
@@ -525,6 +506,7 @@ pub fn production(
         ),
         probe: probe::Http {
             limit: Duration::from_secs(5),
+            now: crate::pace::real_now(),
         },
         host,
         config_file,

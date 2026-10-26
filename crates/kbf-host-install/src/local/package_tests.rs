@@ -485,6 +485,7 @@ impl Rig {
                 timeout: Duration::from_millis(40),
                 interval: Duration::from_millis(1),
             },
+            pace: crate::pace::fake::Fake::new().pace(),
             runner: Box::new(Sim {
                 net: Rc::clone(&net),
                 calls: Rc::clone(&calls),

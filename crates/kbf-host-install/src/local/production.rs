@@ -16,6 +16,7 @@ use super::backend::Backend;
 use super::core::Ab;
 use super::serve::{self, Layout, ServeConfig, Serving};
 use crate::mac::layout::MacHost;
+use crate::pace::Pace;
 use crate::runner::{Runner, SystemRunner};
 use crate::trust::Trust;
 
@@ -107,11 +108,13 @@ pub(super) fn serve_with<B: Backend>(
     );
     let listener = serve::bind(place.trust, &config.socket, place.ids)
         .map_err(|e| format!("{}: {e}", config.socket.display()))?;
+    let pace = Pace::real();
     let serving = Serving {
         ab: &ab,
         trust: place.trust,
         audit: place.audit,
         log: &log,
+        pace: &pace,
     };
     serving
         .run(&listener, stop)
