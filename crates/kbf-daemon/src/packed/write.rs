@@ -102,6 +102,11 @@ const TAKEN: u8 = 1;
 /// A commit was answered UNIMPLEMENTED: no pack is written for the rest of the process.
 const UNSUPPORTED: u8 = 2;
 
+/// What the plane logs, once, when a commit is answered UNIMPLEMENTED. A constant, so that the
+/// call that logs it is one line, counted whether or not a subscriber takes it.
+const UNSUPPORTED_WARNING: &str = "pack writes: the frontend does not take pack commits \
+    (UNIMPLEMENTED); outputs go to the storage nodes for the rest of this process";
+
 /// Whether the daemon may write packs: a handle the daemon sets from each `Welcome`
 /// ([`crate::Daemon::with_pack_writes`]) and the plane reads before every put. A clone is the
 /// same handle. A new one is off until a `Welcome` says the frontend takes `CommitPack`.
@@ -139,10 +144,7 @@ impl PackCommit {
     /// time.
     pub(super) fn unsupported(&self) {
         if self.0.swap(UNSUPPORTED, Ordering::Relaxed) != UNSUPPORTED {
-            tracing::warn!(
-                "pack writes: the frontend does not take pack commits (UNIMPLEMENTED); \
-                 outputs go to the storage nodes for the rest of this process"
-            );
+            tracing::warn!("{UNSUPPORTED_WARNING}");
         }
     }
 }

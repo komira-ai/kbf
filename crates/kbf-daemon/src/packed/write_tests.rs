@@ -688,13 +688,19 @@ async fn a_commit_that_keeps_failing_writes_the_blobs_to_the_plane_underneath() 
 }
 
 /// Asserts that an object store that refuses the put of the pack leaves no pack, sends no
-/// commit, and has the blobs written to the plane underneath, for each of two puts in a row.
+/// commit, and has the blobs written to the plane underneath, for each of two puts in a row:
+/// a `put`, and a `put_chunks` whose gathered bytes go to the plane underneath as one `put`.
 #[tokio::test]
 async fn a_failed_object_store_put_writes_the_blobs_to_the_plane_underneath() {
     let rig = Rig::new();
     rig.store.refuse.store(true, Ordering::SeqCst);
     rig.cas.put(b"one".to_vec()).await.expect("put");
-    rig.cas.put(b"two".to_vec()).await.expect("put");
+    let two = digest_of(b"two");
+    let sent = rig
+        .cas
+        .put_chunks(two.clone(), chunks(&[b"t", b"wo"]))
+        .await;
+    assert_eq!(sent.expect("put_chunks"), two);
     assert_eq!(rig.store.written(), Vec::<String>::new());
     assert_eq!(rig.index.commits(), 0);
     assert_eq!(rig.under.calls(), ["put", "put"]);
