@@ -7,7 +7,9 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::pace::Now;
 
 /// An answer: its status and its body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,14 +30,16 @@ pub trait Probe {
 /// The most of an answer that is read.
 const ANSWER_MAX: usize = 64 * 1024;
 
-/// HTTP over a TCP connection, with `limit` for all of one call.
+/// HTTP over a TCP connection, with `limit` for all of one call, counted on `now`.
 pub struct Http {
     pub limit: Duration,
+    /// The clock the limit is counted on: the machine's in the program.
+    pub now: Now,
 }
 
 impl Probe for Http {
     fn get(&self, addr: SocketAddr, path: &str) -> Result<Reply, String> {
-        let end = Instant::now() + self.limit;
+        let end = (self.now)() + self.limit;
         let say = |e: std::io::Error| format!("{addr}{path}: {e}");
         let mut stream = TcpStream::connect_timeout(&addr, self.limit).map_err(say)?;
         stream.set_write_timeout(Some(self.limit)).map_err(say)?;
@@ -46,7 +50,7 @@ impl Probe for Http {
         // Each read gets what is left of the time for the whole call.
         while raw.len() < ANSWER_MAX {
             // A time that is up is a read timeout of nothing, which the socket refuses.
-            let left = end.saturating_duration_since(Instant::now());
+            let left = end.saturating_sub((self.now)());
             stream.set_read_timeout(Some(left)).map_err(say)?;
             let n = stream.read(&mut chunk).map_err(say)?;
             if n == 0 {

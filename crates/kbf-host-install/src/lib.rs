@@ -72,6 +72,7 @@ pub(crate) mod mac;
 mod migrate;
 mod node_id;
 mod outcome;
+mod pace;
 mod plan;
 mod request;
 mod runner;
