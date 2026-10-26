@@ -224,8 +224,9 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Log {
     }
 }
 
-/// Every attempt that did not open the store is logged with its number, the time waited so
-/// far and the classified reason; the end says it gave up, and an open after waiting says
+/// The wait's start is logged once with the window; every attempt that did not open the
+/// store is logged with its number, the time waited so far, the window, what remains of it
+/// and the classified reason; the end says it gave up, and an open after waiting says
 /// so. Catches an attempt that is retried silently.
 #[test]
 fn each_attempt_is_logged_with_its_number_wait_and_reason() {
@@ -242,15 +243,21 @@ fn each_attempt_is_logged_with_its_number_wait_and_reason() {
     let text =
         String::from_utf8_lossy(&log.0.lock().unwrap_or_else(PoisonError::into_inner)).into_owned();
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 3, "{text}");
-    assert!(lines[0].contains("attempt=1"), "{text}");
-    assert!(lines[0].contains("waited_secs=0.0"), "{text}");
-    assert!(lines[0].contains("reason=\"not_up\""), "{text}");
-    assert!(lines[1].contains("attempt=2"), "{text}");
-    assert!(lines[1].contains("waited_secs=0.25"), "{text}");
-    assert!(lines[2].contains("attempt=3"), "{text}");
-    assert!(lines[2].contains("waited_secs=0.75"), "{text}");
-    assert!(lines[2].contains("giving up"), "{text}");
+    assert_eq!(lines.len(), 4, "{text}");
+    assert!(lines[0].contains("waiting up to 0.75 s"), "{text}");
+    assert!(lines[0].contains("window_secs=0.75"), "{text}");
+    assert!(lines[1].contains("attempt=1"), "{text}");
+    assert!(lines[1].contains("waited_secs=0.0"), "{text}");
+    assert!(lines[1].contains("window_secs=0.75"), "{text}");
+    assert!(lines[1].contains("remaining_secs=0.75"), "{text}");
+    assert!(lines[1].contains("reason=\"not_up\""), "{text}");
+    assert!(lines[2].contains("attempt=2"), "{text}");
+    assert!(lines[2].contains("waited_secs=0.25"), "{text}");
+    assert!(lines[2].contains("remaining_secs=0.5"), "{text}");
+    assert!(lines[3].contains("attempt=3"), "{text}");
+    assert!(lines[3].contains("waited_secs=0.75"), "{text}");
+    assert!(lines[3].contains("remaining_secs=0.0"), "{text}");
+    assert!(lines[3].contains("giving up"), "{text}");
 
     let opened = Log::default();
     let _guard = tracing::subscriber::set_default(

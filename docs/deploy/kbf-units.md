@@ -109,7 +109,7 @@ not the node itself: dialing its own address, where nothing listens, it never re
 on one (a listener's address in `kbf.toml`) can be missing for a few seconds after boot, and the bind
 fails with "address not available". kbf retries that one error, and only that one, for up
 to 90 seconds (250 ms, doubling to 2 s between attempts, each wait logged with the
-address), below the units' `TimeoutStartSec=120`; every other bind error (address in use,
+address), within the frontend unit's `TimeoutStartSec=420`; every other bind error (address in use,
 permission) is at once fatal. This covers every listener of `frontend`, `storage`,
 `storage-and-daemon` and `all-in-one`. To order a unit after the service that brings the
 address up (`tailscaled.service`, say), put `After=` and `Wants=` in a systemd drop-in on
@@ -198,7 +198,12 @@ database and its schema are `kbf-installer`'s.
 together, and the frontend is often first. A frontend whose Postgres is not up yet waits for
 it and tries again, after 250 ms and then after twice as long each time up to 10 s, for
 `--state-store-wait-secs` (default 300, 0 to 3600; the `state-store-wait-secs` key of
-`[scheduler]`), and logs every attempt with its number, the seconds waited and the reason.
+`[scheduler]`), and logs the start of the wait with the window and every attempt with its
+number, the seconds waited, the window, the seconds of it that remain and the reason. The window
+is the time spent waiting between attempts: the time inside an attempt (a connect that times
+out) is not counted, so a start can take longer than the window. The packaged unit's
+`TimeoutStartSec=420` covers the default window, the 90 s bind budget and the checks; with a
+larger window, raise it in a drop-in.
 These are waited for: connection refused or reset, a Unix socket that does not exist yet, a
 connect that times out, and the server answering SQLSTATE 57P03 (the database system is
 starting up). These are not, and exit 2 at once as ever: a URL that does not parse, a refused
@@ -208,7 +213,12 @@ frontend exits **1**, so the unit's `Restart=on-failure` starts it again while
 `RestartPreventExitStatus=2` goes on holding a start that was refused.
 `--state-store-wait-secs=0` does not wait and exits 2 for a store that is not up, as before
 the flag. The wait blocks the start: a stop signal sent during it is acted on once the wait
-has ended. The unit's `kbf boot-check` step has no wait of its own: it exits 1 when the
+has ended, so with `TimeoutStopSec=infinity` a stop can take up to `--state-store-wait-secs`.
+During the wait the listeners are bound and nothing answers on them: health-check the frontend
+with HTTP `/readyz`, not with a TCP connect. A wrong socket path or a wrong local port in
+`--state-store` looks exactly like a Postgres that is not up yet: the frontend waits the window,
+exits 1, is restarted, and the log names the error. A Postgres that never comes back makes the
+frontend restart every window, visible as exit 1 in the journal. The unit's `kbf boot-check` step has no wait of its own: it exits 1 when the
 database cannot be reached, which `Restart=on-failure` starts again. For a Postgres in a
 container beside the unit, see
 [single-host.md](single-host.md#waiting-for-postgres).
@@ -280,10 +290,11 @@ release.
 
 **A frontend and its storage node at a cold start.** The frontend sends `READY=1` (the unit is
 `Type=notify`) once it serves and its state store and map probes pass, so `systemctl start`
-returns when the frontend can take builds, and fails, at `TimeoutStartSec=120`, when it could
+returns when the frontend can take builds, and fails, at `TimeoutStartSec=420`, when it could
 not. It does not wait for the `--storage` node: at a cold power-up the node may come up after
-the frontend, and a frontend that waited would be killed at `TimeoutStartSec` and restart, in a
-loop. `/readyz` still fails with `storage` listed until the node answers: the proxy sends
+the frontend, and a frontend that waited for it would be killed at `TimeoutStartSec` and restart, in a
+loop. (The frontend does wait for its state store, within the 420 s: 300 s of
+`--state-store-wait-secs` and the 90 s bind budget, with the checks.) `/readyz` still fails with `storage` listed until the node answers: the proxy sends
 nothing to a frontend that would fail every blob call while another is ready, and the frontend
 keeps its listeners and its state, so it is in rotation again as soon as the node is back, with
 no restart.

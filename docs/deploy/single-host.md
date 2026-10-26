@@ -143,7 +143,9 @@ wanted.
   reset, a socket that is not there yet, a connect that times out and SQLSTATE 57P03 (starting
   up). A URL that does not parse, a refused login, a database or role that does not exist and
   a schema the build does not accept are not waited for: they exit 2 at once. A store that is
-  still not up when the window ends exits **1**.
+  still not up when the window ends exits **1**. The window is the time spent waiting between
+  attempts, not the time inside each attempt, and the log gives the window and what remains of
+  it at every attempt.
 - **The unit waits too, and says when to stop.** An `ExecStartPre=` polls `pg_isready` inside
   the Postgres container, under `timeout` so that a Postgres that never comes up cannot hold the
   start for ever. `pg_isready` needs `-U` here: the container runs as uid 65532, which has no
@@ -199,6 +201,14 @@ RestartPreventExitStatus=2
 [Install]
 WantedBy=multi-user.target
 ```
+
+During the wait the listeners are bound but nothing answers on them, so health-check a frontend
+with HTTP `/readyz`, not with a TCP connect. A stop signal sent during the wait is acted on when
+the wait ends, so with `TimeoutStopSec=infinity` a stop can take up to `--state-store-wait-secs`.
+A wrong socket path or a wrong local port in `--state-store` looks exactly like a Postgres that
+is not up yet: the frontend waits the window, exits 1, is restarted, and the log names the
+error. A Postgres that never comes back makes the frontend restart every window, visible as
+exit 1 in the journal.
 
 If the `timeout` ends the wait, the `ExecStartPre=` fails with status 124 and the unit is
 restarted after `RestartSec`, as for any failure but exit 2. `RestartPreventExitStatus=2` stays:

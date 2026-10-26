@@ -8,7 +8,8 @@
 //! yet, a connect that timed out, SQLSTATE 57P03) is opened again after 250 ms, then after
 //! twice as long each time up to 10 s, until the window is used up. Any refusal
 //! ([`OpenFailure::Refused`]: a URL, a login, a database, a schema) is the result at once,
-//! exit 2 as ever, and so is any failure with a window of 0.
+//! exit 2 as ever, and so is any failure with a window of 0. The window is the time spent
+//! waiting between attempts; the time inside an attempt is not counted.
 //!
 //! A window used up with the store still not up is [`NotReached`], which exits 1: the
 //! start was not refused, so a unit that restarts on failure and prevents a restart only
@@ -49,8 +50,10 @@ pub(super) fn args() -> [Arg; 1] {
         .help(
             "How long, in seconds, the start waits for a Postgres `--state-store` that is not \
              up yet (connection refused or reset, a Unix socket that does not exist yet, a \
-             connect that times out, or the server answering that it is starting up), trying \
-             again after 250 ms and then after twice as long each time, up to 10 s. A store \
+             connect that times out, or the server answering that it is starting up), \
+             trying again after 250 ms and then after twice as long each time, up to 10 s. \
+             The window is the time spent waiting between attempts; the time inside an attempt \
+             (a connect that times out) is not counted, so the whole wait can be longer. A store \
              that refuses (a URL that does not parse, a login, a missing database, a schema \
              this build does not accept) is not waited for: the frontend exits 2 at once. If \
              the window is used up with the store still not up, the frontend exits 1, not 2, \
@@ -108,6 +111,7 @@ pub(super) fn open_within(
     let mut waited = Duration::ZERO;
     let mut wait = WAIT_FIRST;
     let mut attempts = 0_u32;
+    let window_secs = window.as_secs_f64();
     loop {
         attempts += 1;
         let last = match attempt() {
@@ -130,6 +134,8 @@ pub(super) fn open_within(
             tracing::error!(
                 attempt = attempts,
                 waited_secs = waited.as_secs_f64(),
+                window_secs,
+                remaining_secs = 0.0,
                 reason = "not_up",
                 error = %last,
                 "the state store is still not reachable, giving up"
@@ -140,11 +146,20 @@ pub(super) fn open_within(
                 last,
             }));
         }
+        if attempts == 1 {
+            tracing::info!(
+                window_secs,
+                "the state store is not up yet, waiting up to {window_secs} s between attempts \
+                 for it"
+            );
+        }
         let pause = wait.min(left);
         tracing::warn!(
             attempt = attempts,
             waited_secs = waited.as_secs_f64(),
             retry_in_secs = pause.as_secs_f64(),
+            window_secs,
+            remaining_secs = left.as_secs_f64(),
             reason = "not_up",
             error = %last,
             "the state store is not reachable yet, waiting to try again"

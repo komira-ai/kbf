@@ -20,7 +20,8 @@ pub enum OpenError {
     /// The server is not there yet, and trying again later can succeed: nothing listens
     /// (connection refused), the connection was reset or aborted, the Unix socket does not
     /// exist yet (Postgres makes it when it starts), the connect timed out, or the server
-    /// answered SQLSTATE 57P03 (`cannot_connect_now`: the database system is starting up).
+    /// answered SQLSTATE 57P03 (`cannot_connect_now`: the database system is starting up, in
+    /// recovery or shutting down).
     #[error(transparent)]
     NotUp(StoreError),
     /// Everything else, and so a start that waiting does not change: a URL the client cannot
@@ -63,10 +64,11 @@ impl From<Fail> for OpenError {
     }
 }
 
-/// Whether the server says it is starting up: `57P03`, the only server answer that a wait
-/// cures. The other class 57 codes (`57P01` shutting down, `57P02` crashed) are a server
-/// going away, which a start that finds it at once should not outwait, and class 28 and
-/// `3D000` are a person's to fix.
+/// Whether the server says it cannot connect now: `57P03` (starting up, in recovery or shutting
+/// down), the only server answer that a wait cures. The other class 57 codes (`57P01` an
+/// administrator's shutdown of the session, `57P02` a crash) are a server going away, which a
+/// start that finds it at once should not outwait, and class 28 and `3D000` are a person's to
+/// fix.
 fn starting_up(code: &SqlState) -> bool {
     *code == SqlState::CANNOT_CONNECT_NOW
 }
