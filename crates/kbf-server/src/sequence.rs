@@ -35,7 +35,10 @@
 //!    future returns and the process exits 0.
 //!
 //! A second stop signal ([`Drain::close`]) skips the waits of steps 2 and 4. The drain is
-//! not undone: the process exits, and a new one is started in its place.
+//! not undone: the process exits, and a new one is started in its place. The two waits can
+//! also be ended one at a time, by hand, as their time running out ends them
+//! ([`Drain::end_lb_wait`], [`Drain::end_deadline`]): a test runs the sequence by the
+//! phases it reports ([`Drain::phases`]) and not by seconds.
 //!
 //! A frontend without a state store has no other frontend to hand its work to and keeps the
 //! plain drain of [`crate::drain`]: [`stopped`] and the endpoint begin it at once.
@@ -131,6 +134,7 @@ impl Sequence {
         tokio::select! {
             () = tokio::time::sleep(timing.lb_wait) => {}
             () = drain.closed() => {}
+            () = drain.lb_wait_ended() => {}
         }
 
         tracing::info!("draining: refusing new executions, taking no more work, sending GOAWAY");
@@ -144,7 +148,14 @@ impl Sequence {
                 () = drain.closed() => {}
             }
         });
-        if idle.await.is_err() {
+        // Biased: with no execution open the wait is over, whether or not the deadline was
+        // ended by hand too, and nothing is cut.
+        let cut = tokio::select! {
+            biased;
+            ended = idle => ended.is_err(),
+            () = drain.deadline_ended() => true,
+        };
+        if cut {
             let open = self.stand.farm.open_executions();
             tracing::warn!(
                 open,
