@@ -299,3 +299,24 @@ async fn the_timeout_path_leaves_logs_out_when_the_store_fails_and_uses_the_inta
     assert_eq!(found[0], None);
     assert_eq!(problems.len(), 1);
 }
+
+/// Asserts that a timed-out action whose two logs are equal (here both empty, then both the
+/// same text) names the one blob for both and sends it once, as the completed path does.
+#[tokio::test]
+async fn the_timeout_path_sends_equal_logs_once() {
+    for (name, bytes) in [("timeout-empty", &b""[..]), ("timeout-equal", &b"same"[..])] {
+        let lease = scratch(name);
+        std::fs::write(lease.join(STDOUT), bytes).expect("write");
+        std::fs::write(lease.join(STDERR), bytes).expect("write");
+        let cas = Plain::new(false);
+        let logs = Logs {
+            dir: &lease,
+            max: 100,
+        };
+        let (found, problems) = store_both(&cas, &logs).await;
+        let digest = digest_of(bytes);
+        assert_eq!(found, [Some(digest.clone()), Some(digest.clone())]);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(cas.groups(), vec![vec![label(&digest)]]);
+    }
+}
