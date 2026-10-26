@@ -224,7 +224,8 @@ fn a_tree_nested_past_the_depth_limit_is_refused() {
     assert!(err_of(plan_xcode(&app, false)).contains("deeper than"));
 }
 
-/// Catches a runtime name that could climb out of the runtime directory or hide there, a
+/// Catches a runtime name that could climb out of the runtime directory, hide there, or make
+/// a result frame name the host refuses (`..`, over 64 bytes), a
 /// link or directory taken for the image, a repeated name, and a list without a bound.
 #[test]
 fn runtimes_are_plain_dmg_files_with_distinct_safe_names() {
@@ -239,6 +240,13 @@ fn runtimes_are_plain_dmg_files_with_distinct_safe_names() {
         vec![("iOS_27.dmg", 5), ("watchOS-27.0.dmg", 6)]
     );
     assert_eq!(plan_runtimes(&[]), Ok(Vec::new()));
+    // The longest allowed name is accepted: the guest turns it into a frame name.
+    let longest = format!("{}.dmg", "n".repeat(MAX_RUNTIME_NAME_BYTES - 4));
+    write(&dir.join(&longest), "x", 0o644);
+    assert_eq!(
+        plan_runtimes(&[dir.join(&longest)]).expect("longest")[0].name,
+        longest
+    );
     for bad in [
         "a b.dmg",
         "x.dmg.zip",
@@ -247,6 +255,8 @@ fn runtimes_are_plain_dmg_files_with_distinct_safe_names() {
         "semi;colon.dmg",
         "ü.dmg",
         "plain",
+        "a..b.dmg",
+        &format!("{}.dmg", "n".repeat(MAX_RUNTIME_NAME_BYTES)),
     ] {
         write(&dir.join(bad), "x", 0o644);
         assert_eq!(

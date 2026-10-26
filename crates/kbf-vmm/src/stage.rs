@@ -36,6 +36,9 @@ use crate::image;
 pub const MAX_ENTRIES: usize = 2_000_000;
 /// The deepest directory nesting the walk follows.
 pub const MAX_DEPTH: usize = 64;
+/// The longest runtime file name: the guest derives the names of its result frames from it,
+/// and a frame name is limited to 100 bytes.
+pub const MAX_RUNTIME_NAME_BYTES: usize = 64;
 /// The most runtimes one setup stages.
 pub const MAX_RUNTIMES: usize = 8;
 /// Free space that must remain on the volume after the copy: the guest writes to its
@@ -64,7 +67,7 @@ pub enum StageError {
     #[error("{0} is not a regular file")]
     NotRegular(PathBuf),
     #[error(
-        "{0}: a runtime must be named <name>.dmg with name made of letters, digits, '.', '_' or '-'"
+        "{0}: a runtime must be named <name>.dmg, at most {MAX_RUNTIME_NAME_BYTES} bytes, with name made of letters, digits, '.', '_' or '-' (no '..')"
     )]
     BadRuntimeName(PathBuf),
     #[error("two runtimes are named {0}; each --sim-runtime needs its own file name")]
@@ -287,6 +290,8 @@ fn runtime_name(path: &Path) -> Option<String> {
     let stem = name.strip_suffix(".dmg")?;
     let ok = !stem.is_empty()
         && !stem.starts_with('.')
+        && !name.contains("..")
+        && name.len() <= MAX_RUNTIME_NAME_BYTES
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
