@@ -861,6 +861,7 @@ where
         history.as_ref().map(crate::history::History::stats),
         members.clone(),
         tls_sources,
+        Some(Arc::clone(&farm)),
     ));
     // The storage health, if there are members: no branch in this generic function.
     let api_routes = members.iter().fold(api_routes, |routes, members| {

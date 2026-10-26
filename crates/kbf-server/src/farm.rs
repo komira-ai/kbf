@@ -73,6 +73,7 @@ mod handover;
 mod learning;
 mod named;
 mod nodes;
+mod pack_reads;
 mod phase;
 mod record;
 pub mod sched_view;
@@ -357,6 +358,9 @@ struct State {
     /// hold, shown what the state store says of it at each intake poll while a ticket holds
     /// the channel ([`State::follow_watched`]).
     watched: BTreeMap<OperationId, watch::Sender<Stage>>,
+    /// The pack-read counts on the newest heartbeat of each node that sent any
+    /// ([`Farm::note_pack_reads`]).
+    pack_reads: BTreeMap<WorkerId, worker::PackReadCounts>,
 }
 
 /// How many committed records the farm holds for a state store that refuses them.
@@ -465,6 +469,7 @@ impl Farm {
                 unwritten_floors: Vec::new(),
                 intake: Intake::default(),
                 watched: BTreeMap::new(),
+                pack_reads: BTreeMap::new(),
             }),
         }
     }
