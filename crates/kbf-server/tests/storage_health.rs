@@ -705,3 +705,37 @@ fn a_restart_moves_the_boot_sample() {
         "{second}"
     );
 }
+
+/// Asserts that `storage_health` reads each member's boot from its live row: a member
+/// that registered again reports the larger boot and the other keeps its own. Catches: a
+/// boot read as a constant, as the member id or as zero in the live-row branch of
+/// `member_reports`, which the hand-built reports above cannot reach.
+#[test]
+fn the_health_nodes_carry_the_boot_of_the_live_row() {
+    let pair = Pair::new(Debts::Known(0), Debts::Known(0));
+    let again = pair.members.register(&node(1)).expect("registers again");
+    assert_eq!(again.boot, 2);
+    let health = pair.health();
+    let boots: Vec<(MemberId, u64)> = health.nodes.iter().map(|n| (n.id, n.boot)).collect();
+    assert_eq!(boots, [(pair.a.0, 2), (pair.b.0, 1)]);
+}
+
+/// Asserts that a member in the map whose row has expired reports the boot the map
+/// entry stands for. Catches: a boot read as zero or as the member id in the map-entry
+/// branch of `member_reports`, so a node that restarted and then went quiet would export
+/// a boot that never moves.
+#[test]
+fn the_health_nodes_carry_the_boot_of_the_map_entry_without_a_row() {
+    let pair = Pair::new(Debts::Known(0), Debts::Known(0));
+    let again = pair.members.register(&node(1)).expect("registers again");
+    pair.members.refresh().expect("map published");
+    pair.advance(31);
+    let health = pair.health();
+    let a = health
+        .nodes
+        .iter()
+        .find(|n| n.id == pair.a.0)
+        .expect("a is in the map");
+    assert_eq!(a.boot, again.boot);
+    assert_eq!(a.boot, 2);
+}
