@@ -418,6 +418,7 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
         farm_whole: &farm_whole,
         stopped: &stopped,
         hung,
+        restarts_allowed: 0,
         load: (load_started, load_finished),
         load_secs,
         stop: (stop_started, stop_finished),

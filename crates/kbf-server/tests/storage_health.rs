@@ -39,6 +39,7 @@ fn reported(id: u64, state: MemberState, debts: Debts, seconds: u64) -> MemberRe
     MemberReport {
         id: MemberId(id),
         state,
+        boot: 1,
         planned: kbf_server::storage_health::Planned::No,
         report: Some(Report {
             said: Reported::debts(debts),
@@ -84,6 +85,7 @@ fn a_member_that_is_down_makes_the_number_unknown_however_little_the_others_owe(
         planned: kbf_server::storage_health::Planned::No,
         id: MemberId(2),
         state: MemberState::Down,
+        boot: 1,
         report: None,
     };
     let health = judge(&[active(1, 0), down, active(3, 0)]);
@@ -602,5 +604,104 @@ fn a_nodes_vitals_are_shown_only_while_its_report_is_fresh() {
         judge(&[active(1, 0)]).nodes[0].vitals,
         Vitals::NONE,
         "a node that sends none"
+    );
+}
+
+// ---- the member families ----
+
+/// The line `kbf_member_state{member="<id>",state="<state>"} <v>`.
+fn state_line(id: u64, state: &str, v: u8) -> String {
+    format!("\nkbf_member_state{{member=\"{id}\",state=\"{state}\"}} {v}\n")
+}
+
+/// Asserts that a member's state is one sample per state name, 1 for its own state and 0
+/// for the rest, and that `kbf_members_not_active` counts the members that are not
+/// `Active`. Catches: a state gauge that is absent for a down member (the gate would read
+/// "no series" as healthy), two states set at once, a count that leaves out a member in a
+/// state the build does not name.
+#[test]
+fn the_state_is_one_hot_and_the_not_active_count_follows_it() {
+    let draining = MemberReport {
+        state: MemberState::Draining,
+        ..active(2, 0)
+    };
+    let unnamed = MemberReport {
+        state: MemberState::Unknown(7),
+        ..active(3, 0)
+    };
+    let text = scrape_of(Some(&judge(&[
+        active(1, 0),
+        draining,
+        unnamed,
+        active(4, 0).down(),
+    ])));
+    for (id, state) in [(1, "active"), (2, "draining"), (3, "unknown"), (4, "down")] {
+        for name in [
+            "joining",
+            "catching_up",
+            "active",
+            "draining",
+            "down",
+            "unknown",
+        ] {
+            let want = u8::from(name == state);
+            let line = state_line(id, name, want);
+            assert!(text.contains(&line), "{line:?} missing from {text}");
+        }
+    }
+    assert!(text.contains("\nkbf_members_not_active 3\n"), "{text}");
+    assert!(text.contains("# TYPE kbf_member_state gauge"), "{text}");
+    assert!(
+        text.contains("# TYPE kbf_members_not_active gauge"),
+        "{text}"
+    );
+
+    let whole = scrape_of(Some(&judge(&[active(1, 0), active(2, 0)])));
+    assert!(whole.contains("\nkbf_members_not_active 0\n"), "{whole}");
+    assert!(whole.contains(&state_line(2, "down", 0)), "{whole}");
+}
+
+/// Asserts that the count and the states are absent, not zero, when the membership cannot
+/// be read, and that with no member there is a count of 0 and no state family. Catches:
+/// a count of 0 exported for an unreadable store (a gate would read it as a whole farm).
+#[test]
+fn the_member_families_are_absent_when_the_membership_is_unknown() {
+    let unreadable = scrape_of(None);
+    for family in [
+        "kbf_members_not_active",
+        "kbf_member_state",
+        "kbf_member_boot",
+    ] {
+        assert!(!unreadable.contains(family), "{family} in {unreadable}");
+    }
+    let empty = scrape_of(Some(&judge(&[])));
+    assert!(empty.contains("\nkbf_members_not_active 0\n"), "{empty}");
+    assert!(!empty.contains("kbf_member_state"), "{empty}");
+    assert!(!empty.contains("kbf_member_boot"), "{empty}");
+}
+
+/// Asserts that the boot counter is exported per member as the registration's, so a
+/// restart (a larger boot) moves the sample and a heartbeat does not. Catches: a boot
+/// that is exported as the member id or a constant, which no restart gate could see.
+#[test]
+fn a_restart_moves_the_boot_sample() {
+    let first = scrape_of(Some(&judge(&[active(1, 0), active(2, 0)])));
+    assert!(
+        first.contains("\nkbf_member_boot{member=\"1\"} 1\n"),
+        "{first}"
+    );
+    assert!(first.contains("# TYPE kbf_member_boot gauge"), "{first}");
+    let restarted = MemberReport {
+        boot: 2,
+        ..active(1, 0)
+    };
+    let second = scrape_of(Some(&judge(&[restarted, active(2, 0)])));
+    assert!(
+        second.contains("\nkbf_member_boot{member=\"1\"} 2\n"),
+        "{second}"
+    );
+    assert!(
+        second.contains("\nkbf_member_boot{member=\"2\"} 1\n"),
+        "{second}"
     );
 }
