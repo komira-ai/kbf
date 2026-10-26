@@ -582,10 +582,16 @@ sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest \
   holds exactly the planned entries (same kinds, link targets and file sizes) and then gets
   the planned modes. Both paths keep extended attributes (the code signature of a file that
   is not a Mach-O lives in `com.apple.cs.*` attributes; resource forks and Finder info can
-  matter too) except `com.apple.quarantine`, which would make the guest treat Xcode as
-  downloaded: the file-by-file copy copies every attribute of a file (between the open
-  files), a directory and a link (the link itself, not what it points at) except that one,
-  and the clone, which carries them, has the quarantine mark removed from every node. An
+  matter too) except two. `com.apple.quarantine` would make the guest treat Xcode as
+  downloaded. `com.apple.macl` is a per-machine access list that SIP protects (root cannot
+  write it) and that means nothing on another machine; an App Store Xcode carries it on the
+  app root, so copying it would fail the stage. (The other attributes measured on such an
+  Xcode are `com.apple.appstore.metadata`, `.store_cohort`, `.storefront` and
+  `.vendor_name`, on the app root; they are copied.) The file-by-file copy copies every
+  attribute of a file (between the open files), a directory and a link (the link itself,
+  not what it points at) except those two, and the clone, which carries them, has both
+  removed from every node; if macOS refuses to remove `com.apple.macl` from the clone, that
+  one refusal is ignored. A refusal to remove or write any other attribute fails the stage. An
   attribute list above 1 MiB or a value above 64 MiB fails the stage, naming the path,
   rather than being skipped (a skipped part of a signature would leave an Xcode that fails
   validation). Attributes are macOS-only code; other systems copy none. The new
@@ -599,11 +605,21 @@ sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest \
   absolute path into `/Applications/Xcode.app`. Any other link, a socket, a pipe or a
   device is refused before the disk is touched. `--allow-external-links` copies such links
   as links and lists them in the report.
-- `--sim-runtime` (repeatable, at most 8, each named `<name>.dmg` with letters, digits,
-  `.`, `_`, `-`) copies the image to `/private/var/kbf-sim/runtimes/<name>.dmg` while
-  hashing it; the directory then holds exactly the runtimes of the latest setup (a setup that names none
-  empties it). The report
-  records each one's name, size and SHA-256.
+- `--sim-runtime` (repeatable, at most 8) takes either `<name>.dmg` (a file) or
+  `<name>.exportedBundle` (a directory, what `xcodebuild -downloadPlatform iOS -exportPath
+  <dir>` writes on current Xcode: `ExportedMetadata.plist` and a `Restore/` directory with
+  the cryptex image, its `.trustcache`, `.cryptex_info` and `.root_hash`, and
+  `BuildManifest.plist`/`Restore.plist`). The name is letters, digits, `.`, `_`, `-` plus
+  the suffix (at most 64 bytes, no `..`, not hidden). An image is copied to
+  `/private/var/kbf-sim/runtimes/<name>.dmg` while hashing it. A bundle is planned with the
+  same walk as Xcode.app (nothing followed; regular files and directories only; a link only
+  when its target stays inside the bundle; a socket, pipe or device refused; not
+  `--allow-external-links`), counted in the free-space check, and copied file by file to
+  `/private/var/kbf-sim/runtimes/<name>.exportedBundle`, each file hashed while it is
+  copied; directories become 0755, files 0644, owner root:wheel. The directory then holds
+  exactly the runtimes of the latest setup (a setup that names none empties it). The report
+  and `staged.json` record an image's kind, name, size and SHA-256, and a bundle's kind,
+  name, total size and a list of `{path, bytes, sha256}` for each file.
 - The free space of the guest's Data volume is read first. If Xcode and the runtimes plus
   4 GiB of headroom do not fit, nothing is written and the error says what is needed, what
   is free and to rebuild the base with a larger `--disk-gib`.
