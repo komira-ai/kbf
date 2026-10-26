@@ -566,6 +566,23 @@ mod tests {
         assert!(sys.offline_calls.borrow().is_empty());
     }
 
+    /// Catches a failure to write the size record throwing away an install that took an
+    /// hour, or going unreported: the bundle stays and the details say what failed.
+    #[test]
+    fn a_size_record_that_cannot_be_written_is_reported_and_the_bundle_stays() {
+        let dir = tmp("image-sizing-fail");
+        let sys = FakeSystem::new();
+        // A directory where the record goes, so that writing the file fails whoever runs this.
+        *sys.after_install.borrow_mut() = Some(Box::new(|out| {
+            std::fs::create_dir(out.join("sizing.json")).expect("dir")
+        }));
+        let r = base(&sys, &args(&dir, &ipsw_file(&dir), HELLO));
+        assert_eq!(r.status, Status::Ok, "{r:?}");
+        let e = r.details["sizing_record_error"].as_str().expect("error");
+        assert!(e.starts_with("write sizing.json: "), "{e}");
+        assert!(dir.join("out").exists());
+    }
+
     /// Catches an installer failure reported as success.
     #[test]
     fn an_install_failure_is_an_error() {

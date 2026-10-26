@@ -3,12 +3,14 @@
 //! and the tree clone are replaced through [`Env`].
 
 use std::cell::RefCell;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::fake::{holds, tmp};
+use crate::stage::link as stage_link;
 use crate::stage::*;
 
 /// The SHA-256 of the bytes `hello`.
@@ -51,7 +53,7 @@ fn fake_xcode(dir: &Path) -> PathBuf {
     app
 }
 
-fn err_of(r: Result<XcodePlan, StageError>) -> String {
+fn err_of(r: Result<TreePlan, StageError>) -> String {
     r.expect_err("refused").to_string()
 }
 
@@ -141,7 +143,8 @@ fn the_app_itself_must_be_a_real_xcode_directory() {
 /// link that stays inside.
 #[test]
 fn a_link_target_must_stay_inside_the_app() {
-    let inside = |t: &str, depth: usize| stays_inside(Path::new(t), depth);
+    let inside =
+        |t: &str, depth: usize| stays_inside(Path::new(t), depth, "/Applications/Xcode.app");
     for ok in [
         ("A", 0),
         ("Versions/Current/lib", 3),
@@ -289,7 +292,11 @@ fn runtimes_are_plain_dmg_files_with_distinct_safe_names() {
 /// paths ownership was set on.
 struct Harness {
     free: u64,
+    /// Reading the free space fails.
+    free_fails: bool,
     clone_ok: bool,
+    /// The n-th (from 0) ownership change fails.
+    chown_fails_at: Option<usize>,
     chowned: RefCell<Vec<PathBuf>>,
     clones: RefCell<u32>,
 }
@@ -298,14 +305,22 @@ impl Harness {
     fn new(free: u64) -> Self {
         Self {
             free,
+            free_fails: false,
             clone_ok: false,
+            chown_fails_at: None,
             chowned: RefCell::new(Vec::new()),
             clones: RefCell::new(0),
         }
     }
 
     fn run(&self, volume: &Path, plan: &Plan) -> Result<Value, String> {
-        let free = |_: &Path| Ok(self.free);
+        let free = |_: &Path| {
+            if self.free_fails {
+                Err(std::io::Error::other("statvfs failed"))
+            } else {
+                Ok(self.free)
+            }
+        };
         let clone = |src: &Path, dst: &Path| {
             *self.clones.borrow_mut() += 1;
             // A failed clone can leave part of the tree behind.
@@ -318,8 +333,13 @@ impl Harness {
             copy_tree(src, dst)
         };
         let chown = |p: &Path| {
+            let n = self.chowned.borrow().len();
             self.chowned.borrow_mut().push(p.to_owned());
-            Ok(())
+            if self.chown_fails_at == Some(n) {
+                Err(std::io::Error::other("not permitted"))
+            } else {
+                Ok(())
+            }
         };
         execute(
             volume,
@@ -719,6 +739,27 @@ fn the_free_space_of_a_real_directory_is_read() {
     let dir = tmp("stage-free");
     assert!(crate::hostfs::free_bytes(&dir).expect("statvfs") > 0);
     assert!(crate::hostfs::free_bytes(&dir.join("none")).is_err());
+    // A path with a NUL cannot be passed to the kernel.
+    let nul = Path::new(std::ffi::OsStr::from_bytes(b"a\0b"));
+    assert!(crate::hostfs::free_bytes(nul).is_err());
+}
+
+/// Catches an ownership change that does nothing, one that follows a link, and one that
+/// reports success when the kernel refused (as a user it is refused: only root may give a
+/// file to root).
+#[test]
+fn a_file_is_given_to_root_only_when_the_kernel_allows_it() {
+    let dir = tmp("stage-lchown");
+    write(&dir.join("f"), "x", 0o644);
+    let r = crate::hostfs::lchown_root(&dir.join("f"));
+    assert_eq!(r.is_ok(), !not_root(), "{r:?}");
+    // A link is changed itself: a dangling link is no error, and its target is not looked at.
+    link("/nonexistent/target", &dir.join("dangling"));
+    let r = crate::hostfs::lchown_root(&dir.join("dangling"));
+    assert_eq!(r.is_ok(), !not_root(), "{r:?}");
+    assert!(crate::hostfs::lchown_root(&dir.join("absent")).is_err());
+    let nul = Path::new(std::ffi::OsStr::from_bytes(b"a\0b"));
+    assert!(crate::hostfs::lchown_root(nul).is_err());
 }
 
 mod setup_flow {
@@ -884,4 +925,307 @@ mod setup_flow {
             "{reason}"
         );
     }
+}
+
+fn not_root() -> bool {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    unsafe { libc::geteuid() != 0 }
+}
+
+/// Catches a refusal that names the wrong kind of file, or a mode that falls through to
+/// the wrong name: every file type the kernel has is told apart.
+#[test]
+#[allow(clippy::useless_conversion)] // mode_t is 32 bits on Linux and 16 on macOS
+fn the_kind_of_a_refused_file_is_named_from_its_mode() {
+    let m = |t: libc::mode_t| u32::from(t) | 0o644;
+    assert_eq!(kind_of(m(libc::S_IFIFO)), "named pipe");
+    assert_eq!(kind_of(m(libc::S_IFSOCK)), "socket");
+    assert_eq!(kind_of(m(libc::S_IFCHR)), "device");
+    assert_eq!(kind_of(m(libc::S_IFBLK)), "device");
+    assert_eq!(kind_of(m(libc::S_IFREG)), "special file");
+    assert_eq!(kind_of(m(libc::S_IFDIR)), "special file");
+}
+
+/// Catches a walk that stops at the first unreadable directory without saying which, and
+/// one that cannot be bounded: the entry and depth limits are real limits.
+#[test]
+fn an_unreadable_directory_and_the_walk_limits_are_errors_naming_the_cause() {
+    let dir = tmp("stage-walk");
+    let app = fake_xcode(&dir);
+    let tight = Limits {
+        max_entries: 3,
+        max_depth: MAX_DEPTH,
+    };
+    let e = plan_xcode_within(&app, false, &tight).expect_err("too many");
+    assert_eq!(e, StageError::TooMany(app.clone(), 3));
+    assert!(e.to_string().contains("more than 3 entries"));
+    let shallow = Limits {
+        max_entries: MAX_ENTRIES,
+        max_depth: 2,
+    };
+    assert!(matches!(
+        plan_xcode_within(&app, false, &shallow),
+        Err(StageError::TooDeep(_, 2))
+    ));
+    // Exactly the entries the tree has fit.
+    let all = plan_xcode(&app, false).expect("plan").nodes.len();
+    let exact = Limits {
+        max_entries: all,
+        max_depth: MAX_DEPTH,
+    };
+    assert!(plan_xcode_within(&app, false, &exact).is_ok());
+
+    if not_root() {
+        let locked = app.join("Contents/Frameworks");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let e = err_of(plan_xcode(&app, false));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(e.contains("read") && e.contains("Frameworks"), "{e}");
+    }
+}
+
+/// Catches a tool that leaves a staged tree half done without saying so, or one that
+/// cannot be told a host call failed: each fallible host call turns into an error naming
+/// what failed, so each is tried.
+#[test]
+fn the_host_calls_report_what_failed() {
+    let dir = tmp("stage-helpers");
+    let missing = dir.join("none/deeper");
+    let env_failing = |_: &Path| -> std::io::Result<()> { Err(std::io::Error::other("no")) };
+    let ok_free = |_: &Path| Ok(0u64);
+    let no_clone = |_: &Path, _: &Path| -> std::io::Result<()> { Err(std::io::Error::other("no")) };
+    let env = Env {
+        free_bytes: &ok_free,
+        clone_tree: &no_clone,
+        chown_root: &env_failing,
+    };
+    assert!(chmod(&missing, 0o755).unwrap_err().starts_with("chmod "));
+    assert!(chown(&env, &missing).unwrap_err().starts_with("chown "));
+    write(&dir.join("exists"), "x", 0o644);
+    assert!(
+        mkdir(&dir.join("exists"), 0o755)
+            .unwrap_err()
+            .starts_with("create ")
+    );
+    assert!(
+        write_text(&missing, "t", 0o644)
+            .unwrap_err()
+            .starts_with("write ")
+    );
+    assert!(file_len(&missing).unwrap_err().starts_with("stat "));
+    assert_eq!(file_len(&dir.join("exists")), Ok(1));
+    assert!(
+        rename(&missing, &dir.join("b"))
+            .unwrap_err()
+            .starts_with("rename ")
+    );
+    assert!(
+        apply_modes(vec![(missing.clone(), 0o755)])
+            .unwrap_err()
+            .starts_with("chmod ")
+    );
+    assert!(
+        copy_file(&missing, &dir.join("c"), 0o644, 0)
+            .unwrap_err()
+            .starts_with("copy ")
+    );
+    // The source changed after the plan: more bytes than planned.
+    let e = copy_file(&dir.join("exists"), &dir.join("d"), 0o644, 7).unwrap_err();
+    assert!(
+        e.contains("changed while it was copied (7 bytes planned, 1 copied)"),
+        "{e}"
+    );
+    write_text(&dir.join("t"), "text", 0o600).expect("write");
+    assert_eq!(std::fs::read_to_string(dir.join("t")).expect("t"), "text");
+    stage_link(Path::new("target"), &dir.join("l")).expect("link");
+    assert!(
+        stage_link(Path::new("target"), &dir.join("l"))
+            .unwrap_err()
+            .starts_with("link ")
+    );
+    // The parent of the new directory is a file, a link or missing.
+    std::fs::create_dir(dir.join("vol")).expect("vol");
+    write(&dir.join("vol/file"), "x", 0o644);
+    let e = ensure_dir(&dir.join("vol"), Path::new("file/inner"), &env).unwrap_err();
+    assert!(e.contains("not a plain directory"), "{e}");
+    // A directory that has to be made is handed to root: a refusal to do that is the error.
+    let e = ensure_dir(&dir.join("vol"), Path::new("new"), &env).unwrap_err();
+    assert!(e.starts_with("chown "), "{e}");
+}
+
+/// Catches a stat error on the way to a directory being taken for "not there" (and the
+/// directory created through it), and a failure to create reported as anything but that.
+#[test]
+fn a_directory_that_cannot_be_examined_or_created_is_an_error() {
+    if !not_root() {
+        return;
+    }
+    let dir = tmp("stage-ensure");
+    let volume = dir.join("volume");
+    std::fs::create_dir_all(volume.join("private/var")).expect("v");
+    let free = |_: &Path| Ok(0u64);
+    let clone = |_: &Path, _: &Path| -> std::io::Result<()> { Ok(()) };
+    let chown = |_: &Path| -> std::io::Result<()> { Ok(()) };
+    let env = Env {
+        free_bytes: &free,
+        clone_tree: &clone,
+        chown_root: &chown,
+    };
+    let lock = |p: &Path, mode| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).expect("chmod")
+    };
+    lock(&volume.join("private"), 0o000);
+    let e = ensure_dir(&volume, Path::new("private/var/x"), &env);
+    lock(&volume.join("private"), 0o755);
+    assert!(e.unwrap_err().starts_with("stat "));
+    lock(&volume, 0o555);
+    let e = ensure_dir(&volume, Path::new("new"), &env);
+    lock(&volume, 0o755);
+    assert!(e.unwrap_err().starts_with("create "));
+}
+
+/// Catches a stage that carries on after a failure to hand a file to root (every file of
+/// the guest's Xcode would then be owned by the host user): it fails at the first ownership
+/// change that fails, whichever one it is, and says which path.
+#[test]
+fn a_failed_ownership_change_stops_the_stage_wherever_it_happens() {
+    let dir = tmp("stage-chown");
+    let app = fake_xcode(&dir);
+    write(&dir.join("rt.dmg"), "hello", 0o644);
+    let plan = plan(Some(&app), &[dir.join("rt.dmg")], false).expect("plan");
+    let h = Harness::new(100 * GIB);
+    h.run(&volume_in(&dir), &plan).expect("a clean run");
+    let calls = h.chowned.borrow().len();
+    assert!(calls > 10, "{calls}");
+    for n in 0..calls {
+        let work = tmp(&format!("stage-chown-{n}"));
+        let mut h = Harness::new(100 * GIB);
+        h.chown_fails_at = Some(n);
+        let e = h.run(&volume_in(&work), &plan).expect_err("fails");
+        assert!(
+            e.starts_with("chown ") && e.contains("not permitted"),
+            "{n}: {e}"
+        );
+    }
+}
+
+/// Catches a free-space reading that fails being taken for plenty of room.
+#[test]
+fn a_failure_to_read_the_free_space_is_an_error_and_nothing_is_written() {
+    let dir = tmp("stage-free-err");
+    let app = fake_xcode(&dir);
+    let plan = plan(Some(&app), &[], false).expect("plan");
+    let volume = volume_in(&dir);
+    let mut h = Harness::new(100 * GIB);
+    h.free_fails = true;
+    let e = h.run(&volume, &plan).expect_err("fails");
+    assert!(
+        e.starts_with("read the free space of ") && e.contains("statvfs failed"),
+        "{e}"
+    );
+    assert!(!volume.join("Applications").exists());
+}
+
+/// Catches a copy that skips the planned file, link or directory that is no longer there
+/// to be copied: a source that vanished, a link or directory that already exists, and an
+/// unreadable runtime directory are errors naming the path.
+#[test]
+fn the_copy_stops_on_a_source_that_vanished_or_a_name_that_is_taken() {
+    let dir = tmp("stage-copy-err");
+    let app = fake_xcode(&dir);
+    let good = plan(Some(&app), &[], false).expect("plan");
+
+    // A file removed between the plan and the copy.
+    let mut gone = good.clone();
+    std::fs::remove_file(app.join("Contents/Info.plist")).expect("rm");
+    let e = Harness::new(100 * GIB)
+        .run(&volume_in(&dir), &gone)
+        .expect_err("gone");
+    assert!(e.starts_with("copy ") && e.contains("Info.plist"), "{e}");
+    write(&app.join("Contents/Info.plist"), "plist", 0o644);
+
+    // The same link twice: the second cannot be made.
+    let tree = gone.xcode.as_mut().expect("x");
+    let first_link = tree
+        .nodes
+        .iter()
+        .find(|n| matches!(n, Node::Link { .. }))
+        .cloned()
+        .expect("link");
+    tree.nodes.push(first_link);
+    let work = tmp("stage-copy-err2");
+    let e = Harness::new(100 * GIB)
+        .run(&volume_in(&work), &gone)
+        .expect_err("twice");
+    assert!(e.starts_with("link "), "{e}");
+
+    // The same directory twice.
+    let mut twice = good.clone();
+    let tree = twice.xcode.as_mut().expect("x");
+    let first_dir = tree
+        .nodes
+        .iter()
+        .find(|n| matches!(n, Node::Dir { .. }))
+        .cloned()
+        .expect("dir");
+    tree.nodes.push(first_dir);
+    let work = tmp("stage-copy-err3");
+    let e = Harness::new(100 * GIB)
+        .run(&volume_in(&work), &twice)
+        .expect_err("twice");
+    assert!(e.starts_with("create "), "{e}");
+}
+
+/// Catches a runtime directory that cannot be listed passing as empty (the stale runtimes
+/// in it would be installed by the guest).
+#[test]
+fn a_runtime_directory_that_cannot_be_listed_is_an_error() {
+    if !not_root() {
+        return;
+    }
+    let dir = tmp("stage-rt-unreadable");
+    write(&dir.join("iOS.dmg"), "hello", 0o644);
+    let volume = volume_in(&dir);
+    let rt = volume.join("private/var/kbf-sim/runtimes");
+    std::fs::create_dir_all(&rt).expect("rt");
+    std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o300)).expect("chmod");
+    let plan = plan(None, &[dir.join("iOS.dmg")], false).expect("plan");
+    let e = Harness::new(100 * GIB).run(&volume, &plan);
+    std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    assert!(e.unwrap_err().starts_with("read "));
+}
+
+/// Catches a rerun that deletes the runtime it is about to stage again, or a runtime
+/// directory that keeps a stale one: the second setup with the same runtime leaves it in
+/// place, byte for byte.
+#[test]
+fn a_runtime_that_is_staged_again_is_replaced_in_place() {
+    let dir = tmp("stage-rt-again");
+    write(&dir.join("iOS.dmg"), "hello", 0o644);
+    let volume = volume_in(&dir);
+    let plan = plan(None, &[dir.join("iOS.dmg")], false).expect("plan");
+    Harness::new(100 * GIB).run(&volume, &plan).expect("first");
+    let out = Harness::new(100 * GIB).run(&volume, &plan).expect("second");
+    assert_eq!(out["runtimes"][0]["sha256"], HELLO);
+    assert_eq!(
+        std::fs::read(volume.join("private/var/kbf-sim/runtimes/iOS.dmg")).expect("dmg"),
+        b"hello"
+    );
+}
+
+/// Catches links that leave the app being copied without a trace in the report: the
+/// links the flag let through are listed in what was staged, with their targets.
+#[test]
+fn the_links_let_through_by_the_flag_are_listed_in_the_staging_report() {
+    let dir = tmp("stage-ext-report");
+    let app = fake_xcode(&dir);
+    link("/usr/share/man", &app.join("Contents/Developer/man"));
+    let plan = plan(Some(&app), &[], true).expect("plan");
+    let out = Harness::new(100 * GIB)
+        .run(&volume_in(&dir), &plan)
+        .expect("execute");
+    assert_eq!(
+        out["xcode"]["external_links"],
+        serde_json::json!([{"path": "Contents/Developer/man", "target": "/usr/share/man"}])
+    );
 }

@@ -251,6 +251,8 @@ pub struct FakeSystem {
     pub fetched: RefCell<Vec<String>>,
     pub install: RefCell<Result<Value, String>>,
     pub installs: RefCell<Vec<(PathBuf, PathBuf, Sizing)>>,
+    /// Runs after each install with the bundle directory.
+    pub after_install: RefCell<Option<CloneHook>>,
     pub stage: RefCell<Result<Value, String>>,
     pub stage_calls: RefCell<Vec<(PathBuf, crate::stage::Plan)>>,
     pub helper: RefCell<Result<(), String>>,
@@ -292,6 +294,7 @@ impl FakeSystem {
             stage: RefCell::new(Ok(json!({"xcode": null, "runtimes": null}))),
             stage_calls: RefCell::new(Vec::new()),
             installs: RefCell::new(Vec::new()),
+            after_install: RefCell::new(None),
             helper: RefCell::new(Ok(())),
             helper_specs: RefCell::new(Vec::new()),
             next_pid: Cell::new(1000),
@@ -452,6 +455,9 @@ impl System for FakeSystem {
         self.installs
             .borrow_mut()
             .push((ipsw.to_owned(), out.to_owned(), *sizing));
+        if let Some(hook) = &*self.after_install.borrow() {
+            hook(out);
+        }
         self.install.borrow().clone()
     }
     fn run_vm_helper(&self, spec: &VmSpec) -> Result<(), String> {

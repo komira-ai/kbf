@@ -44,8 +44,20 @@ pub const MAX_RUNTIMES: usize = 8;
 /// Free space that must remain on the volume after the copy: the guest writes to its
 /// Data volume while it boots, and Xcode's first launch expands what it installs.
 pub const HEADROOM_BYTES: u64 = 4 << 30;
-/// The name Xcode.app is built under inside `Applications` before it is renamed.
-const STAGING_NAME: &str = ".Xcode.app.kbf-staging";
+
+/// The caps of the walk of a tree; tests lower them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub max_entries: usize,
+    pub max_depth: usize,
+}
+
+impl Limits {
+    pub const DEFAULT: Self = Self {
+        max_entries: MAX_ENTRIES,
+        max_depth: MAX_DEPTH,
+    };
+}
 
 /// Why a plan could not be made or a stage could not be done.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -60,10 +72,10 @@ pub enum StageError {
     EscapingLink { path: PathBuf, target: PathBuf },
     #[error("{path}: a {kind}, which is not copied")]
     Special { path: PathBuf, kind: &'static str },
-    #[error("{0}: more than {MAX_ENTRIES} entries")]
-    TooMany(PathBuf),
-    #[error("{0}: nested deeper than {MAX_DEPTH} directories")]
-    TooDeep(PathBuf),
+    #[error("{0}: more than {1} entries")]
+    TooMany(PathBuf, usize),
+    #[error("{0}: nested deeper than {1} directories")]
+    TooDeep(PathBuf, usize),
     #[error("{0} is not a regular file")]
     NotRegular(PathBuf),
     #[error(
@@ -106,9 +118,9 @@ impl Node {
     }
 }
 
-/// Xcode.app as it will be copied.
+/// A directory tree (Xcode.app) as it will be copied.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct XcodePlan {
+pub struct TreePlan {
     pub source: PathBuf,
     pub nodes: Vec<Node>,
     /// The sum of the file sizes.
@@ -129,7 +141,7 @@ pub struct RuntimePlan {
 /// Everything one `image setup` stages.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Plan {
-    pub xcode: Option<XcodePlan>,
+    pub xcode: Option<TreePlan>,
     pub runtimes: Vec<RuntimePlan>,
 }
 
@@ -151,12 +163,13 @@ fn io_err(what: &str, path: &Path, e: &io::Error) -> StageError {
     StageError::Io(format!("{what} {}: {e}", path.display()))
 }
 
-/// Whether the link target `target`, found at `depth` directories below the app's root,
-/// stays inside the app. Only leading `..` components count, and no more than `depth` of
-/// them: a `..` after a name could climb out through a link that name goes through.
-pub(crate) fn stays_inside(target: &Path, depth: usize) -> bool {
+/// Whether the link target `target`, found at `depth` directories below the tree's root,
+/// stays inside the tree (whose own path in the guest is `guest_root`, which an absolute
+/// target may name). Only leading `..` components count, and no more than `depth` of them:
+/// a `..` after a name could climb out through a link that name goes through.
+pub(crate) fn stays_inside(target: &Path, depth: usize, guest_root: &str) -> bool {
     if target.has_root() {
-        return target.starts_with(simpaths::XCODE_APP)
+        return target.starts_with(guest_root)
             && !target.components().any(|c| c == Component::ParentDir);
     }
     let mut up = 0usize;
@@ -166,15 +179,52 @@ pub(crate) fn stays_inside(target: &Path, depth: usize) -> bool {
             Component::ParentDir if named => return false,
             Component::ParentDir => up += 1,
             Component::Normal(_) => named = true,
-            Component::CurDir => {}
-            Component::RootDir | Component::Prefix(_) => return false,
+            // `.`; a relative path has no root or prefix.
+            _ => {}
         }
     }
     up <= depth && target.components().next().is_some()
 }
 
+/// What a directory entry is, read in one step with everything the walk needs, so that a
+/// failure to read any of it is one error.
+struct Entry {
+    name: std::ffi::OsString,
+    meta: std::fs::Metadata,
+    /// Where a symbolic link points.
+    target: Option<PathBuf>,
+}
+
+/// The entries of `dir`, sorted by name (so two plans of one tree are equal); nothing is
+/// followed.
+fn entries(dir: &Path) -> io::Result<Vec<Entry>> {
+    std::fs::read_dir(dir)?
+        .map(|e| {
+            let e = e?;
+            let meta = e.metadata()?;
+            let target = if meta.file_type().is_symlink() {
+                Some(std::fs::read_link(e.path())?)
+            } else {
+                None
+            };
+            Ok(Entry {
+                name: e.file_name(),
+                meta,
+                target,
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()
+        .map(|mut all| {
+            all.sort_by(|a, b| a.name.cmp(&b.name));
+            all
+        })
+}
+
 struct Walk {
     root: PathBuf,
+    /// Where the tree will be in the guest.
+    guest_root: String,
+    limits: Limits,
     allow_external: bool,
     nodes: Vec<Node>,
     bytes: u64,
@@ -183,28 +233,25 @@ struct Walk {
 
 impl Walk {
     fn dir(&mut self, rel: &Path, depth: usize) -> Result<(), StageError> {
-        if depth > MAX_DEPTH {
-            return Err(StageError::TooDeep(self.root.join(rel)));
+        if depth > self.limits.max_depth {
+            return Err(StageError::TooDeep(
+                self.root.join(rel),
+                self.limits.max_depth,
+            ));
         }
         let here = self.root.join(rel);
-        let mut names: Vec<_> = std::fs::read_dir(&here)
-            .map_err(|e| io_err("read", &here, &e))?
-            .map(|e| e.map(|e| e.file_name()))
-            .collect::<Result<_, _>>()
-            .map_err(|e| io_err("read", &here, &e))?;
-        // A fixed order, so two plans of one tree are equal.
-        names.sort();
-        for name in names {
-            if self.nodes.len() >= MAX_ENTRIES {
-                return Err(StageError::TooMany(self.root.clone()));
+        for entry in entries(&here).map_err(|e| io_err("read", &here, &e))? {
+            if self.nodes.len() >= self.limits.max_entries {
+                return Err(StageError::TooMany(
+                    self.root.clone(),
+                    self.limits.max_entries,
+                ));
             }
-            let (child_rel, path) = (rel.join(&name), here.join(&name));
-            let meta = std::fs::symlink_metadata(&path).map_err(|e| io_err("stat", &path, &e))?;
-            let ft = meta.file_type();
-            if ft.is_symlink() {
-                let target =
-                    std::fs::read_link(&path).map_err(|e| io_err("readlink", &path, &e))?;
-                if !stays_inside(&target, depth) {
+            let (child_rel, path) = (rel.join(&entry.name), here.join(&entry.name));
+            let meta = &entry.meta;
+            let mode = meta.permissions().mode() & 0o777;
+            if let Some(target) = entry.target {
+                if !stays_inside(&target, depth, &self.guest_root) {
                     if !self.allow_external {
                         return Err(StageError::EscapingLink { path, target });
                     }
@@ -214,24 +261,24 @@ impl Walk {
                     rel: child_rel,
                     target,
                 });
-            } else if ft.is_dir() {
+            } else if meta.is_dir() {
                 self.nodes.push(Node::Dir {
                     rel: child_rel.clone(),
-                    mode: meta.permissions().mode() & 0o777,
+                    mode,
                 });
                 self.dir(&child_rel, depth + 1)?;
-            } else if ft.is_file() {
+            } else if meta.is_file() {
                 self.bytes += meta.len();
                 self.nodes.push(Node::File {
                     rel: child_rel,
                     src: path,
-                    mode: meta.permissions().mode() & 0o777,
+                    mode,
                     bytes: meta.len(),
                 });
             } else {
                 return Err(StageError::Special {
                     path,
-                    kind: kind_of(&ft),
+                    kind: kind_of(meta.mode()),
                 });
             }
         }
@@ -239,16 +286,15 @@ impl Walk {
     }
 }
 
-fn kind_of(ft: &std::fs::FileType) -> &'static str {
-    use std::os::unix::fs::FileTypeExt;
-    if ft.is_fifo() {
-        "named pipe"
-    } else if ft.is_socket() {
-        "socket"
-    } else if ft.is_char_device() || ft.is_block_device() {
-        "device"
-    } else {
-        "special file"
+/// What kind of file the `st_mode` `mode` describes, for a refusal. The file type constants
+/// are 16 bits wide on macOS and 32 on Linux, hence the conversions.
+#[allow(clippy::useless_conversion)]
+pub(crate) fn kind_of(mode: u32) -> &'static str {
+    match mode & u32::from(libc::S_IFMT) {
+        m if m == u32::from(libc::S_IFIFO) => "named pipe",
+        m if m == u32::from(libc::S_IFSOCK) => "socket",
+        m if m == u32::from(libc::S_IFCHR) || m == u32::from(libc::S_IFBLK) => "device",
+        _ => "special file",
     }
 }
 
@@ -257,7 +303,19 @@ fn kind_of(ft: &std::fs::FileType) -> &'static str {
 /// # Errors
 /// `app` is a link or not an Xcode.app, or something in it is refused (see the module
 /// documentation), or it is too large to walk.
-pub fn plan_xcode(app: &Path, allow_external_links: bool) -> Result<XcodePlan, StageError> {
+pub fn plan_xcode(app: &Path, allow_external_links: bool) -> Result<TreePlan, StageError> {
+    plan_xcode_within(app, allow_external_links, &Limits::DEFAULT)
+}
+
+/// [`plan_xcode`] with other caps on the walk.
+///
+/// # Errors
+/// As [`plan_xcode`].
+pub fn plan_xcode_within(
+    app: &Path,
+    allow_external_links: bool,
+    limits: &Limits,
+) -> Result<TreePlan, StageError> {
     let meta = std::fs::symlink_metadata(app).map_err(|e| io_err("stat", app, &e))?;
     if meta.file_type().is_symlink() {
         return Err(StageError::Symlink(app.to_owned()));
@@ -269,13 +327,15 @@ pub fn plan_xcode(app: &Path, allow_external_links: bool) -> Result<XcodePlan, S
     }
     let mut walk = Walk {
         root: app.to_owned(),
+        guest_root: simpaths::XCODE_APP.to_owned(),
+        limits: *limits,
         allow_external: allow_external_links,
         nodes: Vec::new(),
         bytes: 0,
         external: Vec::new(),
     };
     walk.dir(Path::new(""), 0)?;
-    Ok(XcodePlan {
+    Ok(TreePlan {
         source: app.to_owned(),
         nodes: walk.nodes,
         bytes: walk.bytes,
@@ -362,12 +422,45 @@ fn on_volume(volume: &Path, abs: &str) -> PathBuf {
     volume.join(abs.trim_start_matches('/'))
 }
 
-/// Makes sure every directory on the way to `dir` (under `volume`) is a real directory,
-/// creating the missing ones (root, 0755). A link or a file in the way is an error.
-fn ensure_dir(volume: &Path, dir: &Path, env: &Env<'_>) -> Result<(), String> {
-    let rel = dir
-        .strip_prefix(volume)
-        .map_err(|_| format!("{} is not under the volume", dir.display()))?;
+/// `chmod` of `path` to `mode`.
+pub(crate) fn chmod(path: &Path, mode: u32) -> Result<(), String> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|e| format!("chmod {}: {e}", path.display()))
+}
+
+/// Hands `path` to root through the environment.
+pub(crate) fn chown(env: &Env<'_>, path: &Path) -> Result<(), String> {
+    (env.chown_root)(path).map_err(|e| format!("chown {}: {e}", path.display()))
+}
+
+/// Makes the new directory `path` with `mode` (as far as the umask allows).
+pub(crate) fn mkdir(path: &Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .mode(mode)
+        .create(path)
+        .map_err(|e| format!("create {}: {e}", path.display()))
+}
+
+/// Writes `text` to `path` (any file there is replaced) with `mode`.
+pub(crate) fn write_text(path: &Path, text: &str, mode: u32) -> Result<(), String> {
+    remove_leftover(path);
+    std::fs::write(path, text)
+        .and_then(|()| std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)))
+        .map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// The size of the file at `path`.
+pub(crate) fn file_len(path: &Path) -> Result<u64, String> {
+    std::fs::metadata(path)
+        .map(|m| m.size())
+        .map_err(|e| format!("stat {}: {e}", path.display()))
+}
+
+/// Makes sure every directory on the way to `rel` (a path under `volume`) is a real
+/// directory, creating the missing ones (root, 0755). A link or a file in the way is an
+/// error.
+pub(crate) fn ensure_dir(volume: &Path, rel: &Path, env: &Env<'_>) -> Result<(), String> {
     let mut at = volume.to_owned();
     for c in rel.components() {
         at.push(c);
@@ -380,10 +473,8 @@ fn ensure_dir(volume: &Path, dir: &Path, env: &Env<'_>) -> Result<(), String> {
                 ));
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                std::fs::create_dir(&at).map_err(|e| format!("create {}: {e}", at.display()))?;
-                std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o755))
-                    .map_err(|e| format!("chmod {}: {e}", at.display()))?;
-                (env.chown_root)(&at).map_err(|e| format!("chown {}: {e}", at.display()))?;
+                mkdir(&at, 0o755)?;
+                chown(env, &at)?;
             }
             Err(e) => return Err(format!("stat {}: {e}", at.display())),
         }
@@ -413,93 +504,128 @@ fn check_space(volume: &Path, plan: &Plan, env: &Env<'_>) -> Result<(u64, u64), 
     Ok((free, need))
 }
 
-/// Builds the plan's Xcode.app at `staging` (which does not exist): a tree clone when the
-/// host can, else file by file. Returns the method used.
-fn build_xcode(x: &XcodePlan, staging: &Path, env: &Env<'_>) -> Result<&'static str, String> {
+/// Copies the file `src` to the new file `dst` with `mode`, and checks that `bytes` were
+/// copied (the file is the one that was planned).
+pub(crate) fn copy_file(src: &Path, dst: &Path, mode: u32, bytes: u64) -> Result<(), String> {
+    let copied = std::fs::copy(src, dst)
+        .and_then(|n| {
+            std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode)).map(|()| n)
+        })
+        .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+    if copied == bytes {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} changed while it was copied ({bytes} bytes planned, {copied} copied)",
+            src.display()
+        ))
+    }
+}
+
+/// Makes `dst` a symbolic link to `target`.
+pub(crate) fn link(target: &Path, dst: &Path) -> Result<(), String> {
+    std::os::unix::fs::symlink(target, dst).map_err(|e| format!("link {}: {e}", dst.display()))
+}
+
+/// Sets each directory's final mode, innermost first: a read-only directory would have
+/// refused its own contents.
+pub(crate) fn apply_modes(dirs: Vec<(PathBuf, u32)>) -> Result<(), String> {
+    dirs.into_iter()
+        .rev()
+        .try_for_each(|(dir, mode)| chmod(&dir, mode))
+}
+
+/// Builds the plan's tree at `staging` (which does not exist): a tree clone when the host
+/// can, else file by file. Returns the method used.
+fn build_tree(x: &TreePlan, staging: &Path, env: &Env<'_>) -> Result<&'static str, String> {
     if (env.clone_tree)(&x.source, staging).is_ok() {
         return Ok("clone");
     }
     // A failed clone may leave part of the tree: start from nothing.
     remove_leftover(staging);
-    std::fs::create_dir(staging).map_err(|e| format!("create {}: {e}", staging.display()))?;
+    mkdir(staging, 0o700)?;
     let mut dir_modes = vec![(staging.to_owned(), 0o755)];
     for node in &x.nodes {
         let dst = staging.join(node.rel());
         match node {
             Node::Dir { mode, .. } => {
-                std::fs::create_dir(&dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
+                mkdir(&dst, 0o700)?;
                 dir_modes.push((dst, *mode));
             }
             Node::File {
                 src, mode, bytes, ..
-            } => {
-                let copied = std::fs::copy(src, &dst)
-                    .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
-                if copied != *bytes {
-                    return Err(format!(
-                        "{} changed while it was copied ({bytes} bytes planned, {copied} copied)",
-                        src.display()
-                    ));
-                }
-                std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(*mode))
-                    .map_err(|e| format!("chmod {}: {e}", dst.display()))?;
-            }
-            Node::Link { target, .. } => {
-                std::os::unix::fs::symlink(target, &dst)
-                    .map_err(|e| format!("link {}: {e}", dst.display()))?;
-            }
+            } => copy_file(src, &dst, *mode, *bytes)?,
+            Node::Link { target, .. } => link(target, &dst)?,
         }
     }
-    // Directory modes last: a read-only directory would refuse its own contents.
-    for (dir, mode) in dir_modes.into_iter().rev() {
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))
-            .map_err(|e| format!("chmod {}: {e}", dir.display()))?;
-    }
+    apply_modes(dir_modes)?;
     Ok("copy")
 }
 
-fn stage_xcode(volume: &Path, x: &XcodePlan, env: &Env<'_>) -> Result<Value, String> {
-    let dest = on_volume(volume, simpaths::XCODE_APP);
-    let parent = dest.parent().ok_or("Xcode.app has no parent")?;
+/// `rename` of `from` to `to`.
+pub(crate) fn rename(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::rename(from, to)
+        .map_err(|e| format!("rename {} -> {}: {e}", from.display(), to.display()))
+}
+
+/// Builds `tree` under a staging name beside `dest_abs` (its guest path) and renames it into
+/// place.
+fn stage_tree(
+    volume: &Path,
+    tree: &TreePlan,
+    dest_abs: &str,
+    env: &Env<'_>,
+) -> Result<Value, String> {
+    let dest = on_volume(volume, dest_abs);
+    // `dest_abs` has a parent and a name: it is a path in the guest.
+    let (parent, name) = (
+        Path::new(dest_abs.trim_start_matches('/'))
+            .parent()
+            .unwrap_or(Path::new("")),
+        dest.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+    );
     ensure_dir(volume, parent, env)?;
-    let staging = parent.join(STAGING_NAME);
+    let staging = volume.join(parent).join(format!(".{name}.kbf-staging"));
     remove_leftover(&staging);
-    let method = build_xcode(x, &staging, env)?;
-    (env.chown_root)(&staging).map_err(|e| format!("chown {}: {e}", staging.display()))?;
-    for node in &x.nodes {
-        let p = staging.join(node.rel());
-        (env.chown_root)(&p).map_err(|e| format!("chown {}: {e}", p.display()))?;
+    let method = build_tree(tree, &staging, env)?;
+    chown(env, &staging)?;
+    for node in &tree.nodes {
+        chown(env, &staging.join(node.rel()))?;
     }
     // The finished copy replaces a previous one in a single rename.
     remove_leftover(&dest);
-    std::fs::rename(&staging, &dest)
-        .map_err(|e| format!("rename {} -> {}: {e}", staging.display(), dest.display()))?;
-    let count = |f: fn(&Node) -> bool| x.nodes.iter().filter(|n| f(n)).count();
+    rename(&staging, &dest)?;
+    let count = |f: fn(&Node) -> bool| tree.nodes.iter().filter(|n| f(n)).count();
     Ok(json!({
-        "dest": simpaths::XCODE_APP,
+        "dest": dest_abs,
         "method": method,
-        "bytes": x.bytes,
+        "bytes": tree.bytes,
         "files": count(|n| matches!(n, Node::File { .. })),
         "dirs": count(|n| matches!(n, Node::Dir { .. })),
         "symlinks": count(|n| matches!(n, Node::Link { .. })),
-        "external_links": x.external_links.iter()
+        "external_links": tree.external_links.iter()
             .map(|(p, t)| json!({"path": p, "target": t}))
             .collect::<Vec<_>>(),
     }))
 }
 
 fn stage_runtimes(volume: &Path, runtimes: &[RuntimePlan], env: &Env<'_>) -> Result<Value, String> {
-    let dir = on_volume(volume, simpaths::RUNTIME_DIR);
-    ensure_dir(volume, &dir, env)?;
+    let rel = Path::new(simpaths::RUNTIME_DIR.trim_start_matches('/'));
+    let dir = volume.join(rel);
+    ensure_dir(volume, rel, env)?;
     // The directory holds exactly this setup's runtimes: the guest installs what it finds.
-    let entries = std::fs::read_dir(&dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("read {}: {e}", dir.display()))?;
-        if !runtimes
-            .iter()
-            .any(|r| entry.file_name() == r.name.as_str())
-        {
-            remove_leftover(&entry.path());
+    let present = std::fs::read_dir(&dir)
+        .and_then(|rd| {
+            rd.map(|e| e.map(|e| e.path()))
+                .collect::<io::Result<Vec<_>>>()
+        })
+        .map_err(|e| format!("read {}: {e}", dir.display()))?;
+    for path in present {
+        if !runtimes.iter().any(|r| path.ends_with(&r.name)) {
+            remove_leftover(&path);
         }
     }
     let mut staged = Vec::new();
@@ -507,9 +633,7 @@ fn stage_runtimes(volume: &Path, runtimes: &[RuntimePlan], env: &Env<'_>) -> Res
         let dst = dir.join(&r.name);
         remove_leftover(&dst);
         let sha256 = image::stage(&r.src, &dst).map_err(|e| e.to_string())?;
-        let size = std::fs::metadata(&dst)
-            .map_err(|e| format!("stat {}: {e}", dst.display()))?
-            .size();
+        let size = file_len(&dst)?;
         if size != r.bytes {
             return Err(format!(
                 "{} changed while it was copied ({} bytes planned, {size} copied)",
@@ -517,9 +641,8 @@ fn stage_runtimes(volume: &Path, runtimes: &[RuntimePlan], env: &Env<'_>) -> Res
                 r.bytes
             ));
         }
-        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644))
-            .map_err(|e| format!("chmod {}: {e}", dst.display()))?;
-        (env.chown_root)(&dst).map_err(|e| format!("chown {}: {e}", dst.display()))?;
+        chmod(&dst, 0o644)?;
+        chown(env, &dst)?;
         staged.push(json!({
             "name": r.name,
             "bytes": size,
@@ -542,7 +665,7 @@ pub fn execute(volume: &Path, plan: &Plan, env: &Env<'_>) -> Result<Value, Strin
     let xcode = plan
         .xcode
         .as_ref()
-        .map(|x| stage_xcode(volume, x, env))
+        .map(|x| stage_tree(volume, x, simpaths::XCODE_APP, env))
         .transpose()?;
     let runtimes = if plan.runtimes.is_empty() {
         None
@@ -551,14 +674,11 @@ pub fn execute(volume: &Path, plan: &Plan, env: &Env<'_>) -> Result<Value, Strin
     };
     let manifest =
         json!({"xcode": xcode, "runtimes": runtimes.clone().unwrap_or_else(|| json!([]))});
-    let path = on_volume(volume, simpaths::MANIFEST);
-    let parent = path.parent().ok_or("the manifest has no parent")?;
-    ensure_dir(volume, parent, env)?;
-    remove_leftover(&path);
-    std::fs::write(&path, format!("{manifest:#}\n"))
-        .and_then(|()| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)))
-        .map_err(|e| format!("write {}: {e}", path.display()))?;
-    (env.chown_root)(&path).map_err(|e| format!("chown {}: {e}", path.display()))?;
+    let rel = Path::new(simpaths::MANIFEST.trim_start_matches('/'));
+    ensure_dir(volume, rel.parent().unwrap_or(Path::new("")), env)?;
+    let path = volume.join(rel);
+    write_text(&path, &format!("{manifest:#}\n"), 0o644)?;
+    chown(env, &path)?;
     Ok(json!({
         "free_bytes_before": free,
         "needed_bytes": need,
