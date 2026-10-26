@@ -186,7 +186,26 @@ pub struct Cell {
     pub recorder: kbf_front::Recorder,
     /// The server's frontend drain.
     pub drain: Arc<kbf_server::Drain>,
+    /// The server's farm, whose tick and write-behind a test can run by hand.
+    farm: std::sync::Weak<kbf_server::farm::Farm>,
     client: Client,
+}
+
+impl Cell {
+    fn farm(&self) -> Arc<kbf_server::farm::Farm> {
+        self.farm.upgrade().expect("the farm is serving")
+    }
+
+    /// One tick of the farm now: what the timer does every `tick`, so that the gauges and
+    /// counters `/metrics` serves are published when this returns.
+    pub async fn tick(&self) {
+        self.farm().tick().await;
+    }
+
+    /// The farm's write-behind of its size summaries to the state store, now.
+    pub fn write_behind(&self) {
+        self.farm().write_behind_now();
+    }
 }
 
 impl Drop for Cell {
@@ -663,7 +682,7 @@ impl Cell {
                 let _ = stopped_tx.send(());
             })
             .expect("a server thread");
-        let (reapi, worker, api, recorder, drain) = bound_rx.await.expect("the server binds");
+        let (reapi, worker, api, recorder, drain, farm) = bound_rx.await.expect("the server binds");
         Self {
             cache,
             store,
@@ -674,6 +693,7 @@ impl Cell {
             stopped: Some(stopped),
             recorder,
             drain,
+            farm,
             client: Client::connect(reapi, worker).await,
         }
     }
@@ -687,6 +707,7 @@ type Started = (
     Option<SocketAddr>,
     kbf_front::Recorder,
     Arc<kbf_server::Drain>,
+    std::sync::Weak<kbf_server::farm::Farm>,
 );
 
 /// Says where `bound` listens on `addresses`, then serves it until it stops.
@@ -701,6 +722,7 @@ async fn run(
         bound.api,
         recorder,
         Arc::clone(&bound.drain),
+        bound.farm.clone(),
     ));
     bound.serving.await.expect("serve");
 }

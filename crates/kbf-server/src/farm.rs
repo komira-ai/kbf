@@ -469,6 +469,16 @@ impl Farm {
         }
     }
 
+    /// This farm, built at wall-clock time `unix_ms` (milliseconds since the Unix epoch)
+    /// instead of now: the day its size summaries age by. Set before
+    /// [`Farm::with_learned_sizes`].
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_wall_epoch(mut self, unix_ms: u64) -> Self {
+        self.epoch_unix_ms = unix_ms;
+        self
+    }
+
     /// This farm, with learned sizes `mode` (`--learned-sizes`) over a first rung of
     /// `default_memory` bytes. Set before the farm takes a state store over: `off` reads
     /// none of the size summaries it holds.
@@ -536,6 +546,14 @@ impl Farm {
         metrics.sched_queued.set(state.sched.queued_len() as u64);
         metrics.sched_leases.set(state.sched.leases_held() as u64);
         state.learned.publish(&metrics.estimator_shadow);
+    }
+
+    /// Writes the changed size summaries to the state store now, as the tick does once
+    /// the write-behind interval has passed: for a test that would otherwise wait out
+    /// the interval.
+    #[doc(hidden)]
+    pub fn write_behind_now(&self) {
+        self.lock().write_behind(true);
     }
 
     /// Operations waiting in the scheduler's queue for a lease, now (read under the
