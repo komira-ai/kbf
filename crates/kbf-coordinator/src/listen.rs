@@ -55,19 +55,18 @@ impl Listener {
 /// Serves `listener` for `coordinator` for as long as the future is polled. A client gets
 /// `patience` for its handshake, again for its request head and again for its request body,
 /// and at most `max_connections` are served at once. It never returns.
-pub async fn serve(
+pub fn serve(
     listener: Listener,
     coordinator: Arc<Coordinator>,
     patience: Duration,
     max_connections: usize,
-) -> Infallible {
+) -> impl Future<Output = Infallible> {
     serve_with_slots(
         listener,
         coordinator,
         patience,
         Arc::new(Semaphore::new(max_connections)),
     )
-    .await
 }
 
 /// [`serve`] with the connection slots given: one permit is held for each connection being
