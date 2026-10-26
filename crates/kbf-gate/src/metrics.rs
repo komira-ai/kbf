@@ -111,9 +111,9 @@ impl Metrics {
 
     /// The `q` quantile (0 to 1) of the histogram `name`, interpolated linearly inside the
     /// bucket that holds it, as Prometheus does. `Absent` when there is no such histogram, it
-    /// has no observations, `q` is outside 0 to 1, or the quantile falls in the `+Inf` bucket
-    /// with no finite bound below it to report: an unmeasured latency is never zero.
-    /// A quantile in a `+Inf` bucket that has a finite bound below it reports that bound.
+    /// has no observations, `q` is outside 0 to 1, or the quantile falls in the `+Inf` bucket:
+    /// the latency is above every bound, so no finite value is true, and a clamped bound would
+    /// pass a threshold at or above it. Absent is red under every limit.
     pub fn quantile(&self, name: &str, q: f64) -> Sample {
         let Some(buckets) = self.buckets(name) else {
             return Sample::Absent;
@@ -138,7 +138,7 @@ impl Metrics {
             None => (None, 0.0),
         };
         if bound.is_infinite() {
-            return lower.map_or(Sample::Absent, Sample::Value);
+            return Sample::Absent;
         }
         let lower = lower.unwrap_or(0.0);
         Sample::Value(lower + (bound - lower) * (rank - before) / (count - before))

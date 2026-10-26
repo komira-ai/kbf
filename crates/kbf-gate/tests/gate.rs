@@ -253,20 +253,22 @@ fn a_quantile_is_interpolated_inside_its_bucket() {
     assert!((value(quantile(LATENCY, 0.95)) - 0.35).abs() < 1e-9);
     // Rank 50 is inside the first bucket, which starts at zero.
     assert!((value(quantile(LATENCY, 0.5)) - 0.1 * 50.0 / 90.0).abs() < 1e-9);
-    assert_eq!(quantile(LATENCY, 1.0), Sample::Value(1.0));
+    assert_eq!(quantile(LATENCY, 0.98), Sample::Value(0.5));
 }
 
-/// Asserts that a quantile in the `+Inf` bucket reports the highest finite bound, and that a
-/// histogram with every observation in `+Inf` is unmeasured rather than zero.
+/// Asserts that a quantile in the `+Inf` bucket is absent, not the highest finite bound, so a
+/// threshold at or above that bound cannot pass on a clamped value; a quantile below it is
+/// still read.
 #[test]
-fn a_quantile_past_the_last_finite_bound_is_never_zero() {
-    assert_eq!(quantile(LATENCY, 0.999), Sample::Value(1.0));
-    let all_slow = "kbf_find_missing_seconds_bucket{le=\"+Inf\"} 7\n";
-    assert_eq!(quantile(all_slow, 0.99), Sample::Absent);
+fn a_quantile_past_the_last_finite_bound_is_absent_and_red() {
+    assert_eq!(quantile(LATENCY, 0.999), Sample::Absent);
+    assert_eq!(quantile(LATENCY, 0.99), Sample::Value(1.0));
     assert_eq!(
-        judge(quantile(all_slow, 0.99), Limit::AtMost(1.0)),
+        judge(quantile(LATENCY, 0.999), Limit::AtMost(1.0)),
         Verdict::Red
     );
+    let all_slow = "kbf_find_missing_seconds_bucket{le=\"+Inf\"} 7\n";
+    assert_eq!(quantile(all_slow, 0.99), Sample::Absent);
 }
 
 /// Asserts that a rank of zero skips leading empty buckets, so the minimum is not reported
