@@ -238,6 +238,7 @@ pub struct FlakyIndex {
     inner: MemoryPackIndex,
     store: Arc<FaultyStore>,
     fail_record: AtomicU32,
+    refuse_record: AtomicU32,
     lose_record: AtomicU32,
     fail_find: AtomicU32,
     fail_locate: AtomicU32,
@@ -254,6 +255,7 @@ impl FlakyIndex {
             inner: MemoryPackIndex::new(Arc::new(ManualClock::default())),
             store,
             fail_record: AtomicU32::new(0),
+            refuse_record: AtomicU32::new(0),
             lose_record: AtomicU32::new(0),
             fail_find: AtomicU32::new(0),
             fail_locate: AtomicU32::new(0),
@@ -268,6 +270,11 @@ impl FlakyIndex {
     /// The next `n` records fail.
     pub fn fail_record(&self, n: u32) {
         self.fail_record.store(n, Ordering::SeqCst);
+    }
+
+    /// The next `n` records are refused: the index says a repeat would be refused too.
+    pub fn refuse_record(&self, n: u32) {
+        self.refuse_record.store(n, Ordering::SeqCst);
     }
 
     /// The next `n` records are made and then fail: the answer is lost.
@@ -318,6 +325,9 @@ impl PackIndex for FlakyIndex {
             futures::executor::block_on(asked).unwrap_or(false)
         });
         note(&self.held, held);
+        if fires(&self.refuse_record) {
+            return Err(PackIndexError::Refused("scripted".to_owned()));
+        }
         if fires(&self.fail_record) {
             return Err(PackIndexError::NotMigrated);
         }

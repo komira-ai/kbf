@@ -126,6 +126,14 @@ pub enum PackIndexError {
         /// The pack's key.
         key: String,
     },
+    /// The index behind this call does not take the call, and will not until it is set up to:
+    /// a daemon's commit of a pack to a frontend that has no pack store.
+    #[error("pack index: the index takes no such call")]
+    Unsupported,
+    /// The index refused the call for a reason that a repeat does not change (the caller is not
+    /// allowed to make it, or the pack it names is not acceptable). `0` says why.
+    #[error("pack index: refused: {0}")]
+    Refused(String),
     /// A call named more digests or keys than [`MAX_BATCH`].
     #[error("pack index: {given} entries in one call, at most {max}")]
     TooMany {
@@ -142,6 +150,23 @@ pub enum PackIndexError {
     Store(#[from] StoreError),
 }
 
+impl PackIndexError {
+    /// Whether a repeat of the call that failed with this error gets the same answer: the
+    /// call or the pack is refused, so trying again only waits for the same refusal. A store
+    /// failure, or a schema that is migrated meanwhile, may pass.
+    #[must_use]
+    pub fn is_final(&self) -> bool {
+        match self {
+            Self::Invalid(_)
+            | Self::Conflict { .. }
+            | Self::TooMany { .. }
+            | Self::Unsupported
+            | Self::Refused(_) => true,
+            Self::NotMigrated | Self::Store(_) => false,
+        }
+    }
+}
+
 /// The index of blobs in packs. Calls block, as the state store's do.
 pub trait PackIndex: Send + Sync {
     /// Records `pack` and the blobs it holds, in one transaction.
@@ -155,6 +180,8 @@ pub trait PackIndex: Send + Sync {
     /// [`PackIndexError::Invalid`] for a pack that cannot exist (no key, a size or a blob
     /// the index cannot hold, a digest twice, a blob past the end of the pack);
     /// [`PackIndexError::Conflict`] for a key recorded with other contents;
+    /// [`PackIndexError::Unsupported`] or [`PackIndexError::Refused`] from an index that is
+    /// reached through a service that does not take or does not allow the record;
     /// [`PackIndexError::Store`] when the store fails.
     fn record_pack(&self, pack: &NewPack) -> Result<Recorded, PackIndexError>;
 

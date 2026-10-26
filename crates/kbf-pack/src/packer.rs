@@ -13,6 +13,8 @@
 //!   alone; the packer tries the next sequence number;
 //! - a record that fails after the write is tried again, with the same pack and key, up to
 //!   [`PackerConfig::put_attempts`] times, as the index takes a repeat of a record as a no-op;
+//!   an error for which a repeat gets the same answer ([`PackIndexError::is_final`]: a refusal)
+//!   ends the attempts at once;
 //!   when every attempt fails the pack is one no row points at, which the index reports as
 //!   unreferenced and garbage collection deletes after its grace; the blobs are still missing
 //!   from the index, so packing them again writes a new pack.
@@ -246,9 +248,9 @@ impl<S: ObjectStore> Packer<S> {
         })
     }
 
-    /// Records `pack`, trying again as the config says. The index takes a repeat of a key it
-    /// recorded with the same contents as a no-op, so a record whose answer was lost is safe
-    /// to send again.
+    /// Records `pack`, trying again as the config says, but not after a refusal. The index
+    /// takes a repeat of a key it recorded with the same contents as a no-op, so a record
+    /// whose answer was lost is safe to send again.
     async fn record(&self, pack: NewPack) -> Result<Recorded, PackError> {
         let pack = Arc::new(pack);
         let mut attempt = 1;
@@ -259,7 +261,11 @@ impl<S: ObjectStore> Packer<S> {
                 Ok(recorded) => return Ok(recorded),
                 Err(source) => source,
             };
-            if attempt >= self.config.put_attempts {
+            // A refusal is the same on every repeat: the caller's fallback is the way on.
+            let tried_out = attempt >= self.config.put_attempts;
+            let refused = source.is_final();
+            let stop = if refused { refused } else { tried_out };
+            if stop {
                 return Err(PackError::Record {
                     key: pack.key.clone(),
                     source,
