@@ -12,8 +12,7 @@ use tierstore::server::AccessKey;
 use tierstore::{Backend, Listed, Op};
 
 use crate::client::{CONDITIONAL, assert_refused, key, put, read, window};
-use crate::idle::upload_id;
-use crate::raw::{call, send};
+use crate::raw::{call, send, upload_id};
 use crate::support::{BUCKET, Harness, KEY_ID, SECRET};
 
 /// The id and the secret of the first read-only key.

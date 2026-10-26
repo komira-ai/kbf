@@ -16,7 +16,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use kbf_tls::TlsSource;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
@@ -54,13 +55,28 @@ impl Listener {
 /// Serves `listener` for `coordinator` for as long as the future is polled. A client gets
 /// `patience` for its handshake, again for its request head and again for its request body,
 /// and at most `max_connections` are served at once. It never returns.
-pub async fn serve(
+pub fn serve(
     listener: Listener,
     coordinator: Arc<Coordinator>,
     patience: Duration,
     max_connections: usize,
+) -> impl Future<Output = Infallible> {
+    serve_with_slots(
+        listener,
+        coordinator,
+        patience,
+        Arc::new(Semaphore::new(max_connections)),
+    )
+}
+
+/// [`serve`] with the connection slots given: one permit is held for each connection being
+/// served, so a caller can see how many are in use.
+pub async fn serve_with_slots(
+    listener: Listener,
+    coordinator: Arc<Coordinator>,
+    patience: Duration,
+    slots: Arc<Semaphore>,
 ) -> Infallible {
-    let slots = Arc::new(Semaphore::new(max_connections));
     loop {
         // A slot first, then the accept: with none free, clients queue in the backlog.
         // (The semaphore is never closed, so this is always `Some`.)
@@ -87,13 +103,16 @@ pub async fn serve(
     }
 }
 
-async fn connection(
-    stream: TcpStream,
+/// Serves one connection until it ends: the TLS handshake, then HTTP/1.1, each with its limit.
+pub async fn connection<S>(
+    stream: S,
     tls: TlsSource,
     surface: Surface,
     coordinator: Arc<Coordinator>,
     patience: Duration,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut config = (*tls.config()).clone();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let shaken = tokio::time::timeout(patience, TlsAcceptor::from(Arc::new(config)).accept(stream));

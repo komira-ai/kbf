@@ -477,11 +477,17 @@ pub async fn run(
     let reconciling = reconcile(reconciler, cli.reconcile_interval, halt);
     let (drained, ()) = tokio::join!(serving, reconciling);
     watcher.abort();
-    if drained.abandoned > 0 {
-        let cut = drained.abandoned;
-        eprintln!("tierstore: {cut} requests were cut at the drain deadline");
-    }
+    eprint!("{}", cut_note(drained));
     Ok(drained)
+}
+
+/// What [`run`] reports on stderr of a drain: a line when the drain deadline cut requests, and
+/// nothing when it cut none.
+fn cut_note(drained: Drained) -> String {
+    match drained.abandoned {
+        0 => String::new(),
+        cut => format!("tierstore: {cut} requests were cut at the drain deadline\n"),
+    }
 }
 
 /// Resolves on SIGTERM or SIGINT. The handlers are in place when this returns.

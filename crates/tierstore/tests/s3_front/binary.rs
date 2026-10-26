@@ -21,6 +21,10 @@ use crate::files::{BIN_KEY_ID, BIN_SECRET, Files, with};
 
 const BIN: &str = env!("CARGO_BIN_EXE_tierstore");
 
+/// The longest a test waits for the binary to do what it was asked to. It only stops a test whose
+/// process hangs, and then the test fails: no test asserts how long the binary takes.
+const SAFETY: Duration = Duration::from_secs(60);
+
 /// Runs the binary to its end: the exit status, stdout and stderr.
 fn run(flags: &[String]) -> (i32, String, String) {
     let out = Command::new(BIN).args(flags).output().unwrap();
@@ -33,7 +37,9 @@ fn run(flags: &[String]) -> (i32, String, String) {
 
 /// A running binary, and the address it said it listens on.
 struct Running {
-    child: Reaped,
+    /// None once `exit_code` has taken it to wait for its end.
+    child: Option<Reaped>,
+    pid: Pid,
     addr: String,
     /// Keeps the pipe of the binary's stdout open.
     _stdout: std::io::BufReader<std::process::ChildStdout>,
@@ -52,8 +58,10 @@ fn start(flags: &[String]) -> Running {
     assert_eq!(words[0], "tierstore", "{line}");
     assert_eq!(words[1], env!("CARGO_PKG_VERSION"), "{line}");
     let listen = words[2].strip_prefix("listen=").expect("listen=");
+    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
     Running {
-        child,
+        child: Some(child),
+        pid,
         addr: listen.to_owned(),
         _stdout: reader,
     }
@@ -84,31 +92,56 @@ impl Running {
     }
 
     fn signal(&self, signal: Signal) {
-        let pid = Pid::from_raw(i32::try_from(self.child.id()).unwrap()).unwrap();
-        kill_process(pid, signal).unwrap();
+        kill_process(self.pid, signal).unwrap();
     }
 
-    /// The exit code, once the process has exited.
+    /// The exit code, once the process has exited: a thread of the blocking pool waits for the
+    /// process to end. A process that has not ended within `SAFETY` is killed, so that the wait
+    /// ends, and the test fails.
     async fn exit_code(&mut self) -> Option<i32> {
-        for _ in 0..1000 {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                return status.code();
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut child = self.child.take().expect("no process to wait for");
+        let waiting = tokio::task::spawn_blocking(move || {
+            let status = child.wait();
+            (child, status)
+        });
+        let waited = tokio::time::timeout(SAFETY, waiting).await;
+        if waited.is_err() {
+            kill_process(self.pid, Signal::KILL).unwrap();
         }
-        panic!("the process did not exit");
+        let (_child, status) = waited.expect("the process did not exit").unwrap();
+        status.unwrap().code()
     }
+}
+
+/// Waits until the drain of the binary has begun: `/readyz` says 503, which it does through the
+/// wait, or the connection is refused, which it is once the wait is over. The binary is asked
+/// again as soon as it has answered, and nothing is asserted about how long it takes.
+async fn until_draining(ready: &str) {
+    let client = Client::new();
+    let asking = async {
+        loop {
+            match client.get(ready).send().await {
+                Ok(probe) if probe.status() != 503 => {}
+                _ => return,
+            }
+        }
+    };
+    let waited = tokio::time::timeout(SAFETY, asking).await;
+    assert!(waited.is_ok());
 }
 
 /// Asserts that the binary prints one start line with its version and the address it is bound
 /// to, serves S3 calls with the key of its key file, answers `/readyz` 200, and on SIGTERM
-/// answers `/readyz` 503, goes on serving through the wait, and exits with status 0.
+/// stops answering `/readyz` 200 (it says 503, or takes no connection once the wait is over) and
+/// exits with status 0. The test waits for the drain to begin and for the exit, and asserts nothing about
+/// how long either takes; that the server goes on serving through the wait is asserted in the
+/// crate (`src/server/drain_tests.rs`).
 #[tokio::test]
 async fn it_announces_serves_and_drains_on_sigterm() {
     let files = Files::new("bin-sigterm");
     let flags = files.flags(&[
         "--drain-lb-wait",
-        "1500ms",
+        "3s",
         "--reconcile-interval",
         "100ms",
         "--lease-ttl",
@@ -128,11 +161,7 @@ async fn it_announces_serves_and_drains_on_sigterm() {
     assert_eq!(probe.status(), 200);
 
     running.signal(Signal::TERM);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let probe = Client::new().get(&ready).send().await.unwrap();
-    assert_eq!(probe.status(), 503);
-    let still = ByteRange::new(7, 2).unwrap();
-    assert_eq!(store.get_range(&k, still).await.unwrap(), "by");
+    until_draining(&ready).await;
     assert_eq!(running.exit_code().await, Some(0));
 }
 
@@ -324,13 +353,13 @@ async fn it_serves_over_two_s3_tiers_and_lands_a_multipart_upload_in_the_cold_on
     assert_eq!(got, "small object");
     let name = "cas/small".to_owned();
     assert!(hot.keys().contains(&name));
-    for _ in 0..500 {
-        if cold.keys().contains(&name) {
-            break;
+    let copying = async {
+        while !cold.keys().contains(&name) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(cold.keys().contains(&name), "not copied");
+    };
+    let copied = tokio::time::timeout(SAFETY, copying).await;
+    assert!(copied.is_ok(), "not copied");
 
     let big = ObjectKey::new("cas/big").unwrap();
     let len = MULTIPART_THRESHOLD + 1;

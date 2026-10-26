@@ -29,7 +29,11 @@
 //!
 //! A frontend over a state store does not call [`Drain::begin`] at once: it runs the drain
 //! as a sequence ([`crate::sequence`]), which [`Drain::announce`]s first, waits for the load
-//! balancer to see it, and only then begins. [`Drain::phase`] says where it is.
+//! balancer to see it, and only then begins. [`Drain::phase`] says where it is, and
+//! [`Drain::phases`] tells each change of it as it is made. The two waits of that sequence
+//! (`--drain-lb-wait` and `--drain-deadline`) end by time in a running frontend;
+//! [`Drain::end_lb_wait`] and [`Drain::end_deadline`] end them by hand, so that a test runs
+//! the sequence by events and not by seconds.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -100,6 +104,12 @@ pub struct Drain {
     /// listeners registered with [`Drain::begins`] are closed by it.
     started: Stop,
     closed: watch::Sender<bool>,
+    /// The phase now, told to every receiver of [`Drain::phases`] when it changes.
+    phases: watch::Sender<Phase>,
+    /// Given by [`Drain::end_lb_wait`].
+    lb_wait_over: Stop,
+    /// Given by [`Drain::end_deadline`].
+    deadline_over: Stop,
 }
 
 impl Drain {
@@ -124,6 +134,9 @@ impl Drain {
             finished: Stop::new(),
             started: Stop::new(),
             closed: watch::Sender::new(false),
+            phases: watch::Sender::new(Phase::Serving),
+            lb_wait_over: Stop::new(),
+            deadline_over: Stop::new(),
         };
         (drain, begun)
     }
@@ -178,7 +191,9 @@ impl Drain {
     /// before any call is refused. Returns whether this call was the first.
     pub fn announce(&self) -> bool {
         self.readiness.stop();
-        !self.announced.swap(true, Ordering::SeqCst)
+        let first = !self.announced.swap(true, Ordering::SeqCst);
+        self.publish();
+        first
     }
 
     /// Where the drain is: [`Phase::Closing`] once [`Drain::close`] has been called, else
@@ -195,6 +210,54 @@ impl Drain {
         } else {
             Phase::Serving
         }
+    }
+
+    /// Tells every receiver of [`Drain::phases`] the phase now, if it is not the one they were
+    /// last told. The phase is read under the channel's lock, so two stages that publish at
+    /// once leave the later phase told last.
+    fn publish(&self) {
+        self.phases.send_if_modified(|told| {
+            let now = self.phase();
+            std::mem::replace(told, now) != now
+        });
+    }
+
+    /// The phase of the drain as it changes: the receiver holds the phase now, and its
+    /// `changed` and `wait_for` complete when a stage moves it ([`Phase`] only goes forward).
+    /// A caller follows a drain by these events instead of by asking `GET
+    /// /v1/frontend/drain` again and again. A phase that is passed over between two looks
+    /// is not seen, so wait for one the drain stays in until the caller moves it on.
+    #[must_use]
+    pub fn phases(&self) -> watch::Receiver<Phase> {
+        self.phases.subscribe()
+    }
+
+    /// Ends the load balancer wait of the drain sequence ([`crate::sequence`]) now, as
+    /// `--drain-lb-wait` running out does: the sequence goes on to refuse new Execute calls
+    /// and send every listener GOAWAY. Given before the sequence reaches its wait, the wait
+    /// is skipped. It ends only that wait; the deadline has [`Drain::end_deadline`].
+    pub fn end_lb_wait(&self) {
+        self.lb_wait_over.fire();
+    }
+
+    /// Ends the wait of the drain sequence for the open executions now, as
+    /// `--drain-deadline` running out does: the executions still open are ended
+    /// UNAVAILABLE, the sequence stands down and its phase becomes [`Phase::Closing`]. Given
+    /// before the sequence reaches that wait, the wait is skipped. With no execution open the
+    /// wait is over already, and nothing is ended; the sequence logs an ending by hand as it
+    /// logs the deadline running out.
+    pub fn end_deadline(&self) {
+        self.deadline_over.fire();
+    }
+
+    /// Completes once [`Drain::end_lb_wait`] has been called.
+    pub(crate) async fn lb_wait_ended(&self) {
+        self.lb_wait_over.fired().await;
+    }
+
+    /// Completes once [`Drain::end_deadline`] has been called.
+    pub(crate) async fn deadline_ended(&self) {
+        self.deadline_over.fired().await;
     }
 
     /// Marks that a frontend's drain sequence runs. Returns whether this call was the
@@ -232,6 +295,7 @@ impl Drain {
             return false;
         }
         self.started.fire();
+        self.publish();
         // Taken once: the `began` swap above lets one call this far. The listener is gone
         // only if the server already stopped, and the send then has no one to tell.
         let _ = stages.goaway.take().map(|goaway| goaway.send(()));
@@ -276,6 +340,7 @@ impl Drain {
         self.begin();
         self.closer.close();
         self.closed.send_replace(true);
+        self.publish();
     }
 
     /// Completes once [`Drain::close`] has been called.
@@ -297,6 +362,8 @@ impl std::fmt::Debug for Drain {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    use futures::FutureExt as _;
 
     use super::*;
 
@@ -634,6 +701,71 @@ mod tests {
         assert_eq!(name(Phase::LbWait), "\"lb_wait\"");
         assert_eq!(name(Phase::Draining), "\"draining\"");
         assert_eq!(name(Phase::Closing), "\"closing\"");
+    }
+
+    /// Asserts that the phase receiver is told each change of the phase once, in order, and
+    /// is told nothing when a stage is repeated: serving, then `lb_wait` on the first
+    /// `announce`, then `draining` on the first `begin`, then `closing` on the first `close`;
+    /// and that a drain begun with no announcement goes from serving to draining.
+    #[test]
+    fn the_phase_receiver_is_told_each_change_once() {
+        let (drain, _closing, _readiness, _goaway) = fresh();
+        let mut phases = drain.phases();
+        assert_eq!(*phases.borrow_and_update(), Phase::Serving);
+        let told = |phases: &mut watch::Receiver<Phase>| {
+            let changed = phases.has_changed().expect("sender alive");
+            let now = *phases.borrow_and_update();
+            (changed, now)
+        };
+        assert_eq!(told(&mut phases), (false, Phase::Serving));
+        drain.announce();
+        assert_eq!(told(&mut phases), (true, Phase::LbWait));
+        drain.announce();
+        assert_eq!(told(&mut phases), (false, Phase::LbWait));
+        drain.begin();
+        assert_eq!(told(&mut phases), (true, Phase::Draining));
+        drain.begin();
+        assert_eq!(told(&mut phases), (false, Phase::Draining));
+        drain.close();
+        assert_eq!(told(&mut phases), (true, Phase::Closing));
+        drain.close();
+        assert_eq!(told(&mut phases), (false, Phase::Closing));
+
+        let (drain, _closing, _readiness, _goaway) = fresh();
+        let mut phases = drain.phases();
+        drain.begin();
+        assert_eq!(told(&mut phases), (true, Phase::Draining));
+    }
+
+    /// Asserts that a receiver made after the drain began holds the phase it is in, and that
+    /// `wait_for` completes on a phase the drain has reached and on one it reaches later.
+    #[tokio::test]
+    async fn a_phase_receiver_made_late_holds_the_phase_and_waits_for_a_later_one() {
+        let (drain, _closing, _readiness, _goaway) = fresh();
+        drain.announce();
+        let mut phases = drain.phases();
+        assert_eq!(*phases.borrow(), Phase::LbWait);
+        let reached = phases.wait_for(|now| *now == Phase::LbWait).await;
+        reached.expect("alive");
+        assert!(phases.changed().now_or_never().is_none(), "told again");
+        drain.begin();
+        let reached = phases.wait_for(|now| *now == Phase::Draining).await;
+        reached.expect("alive");
+    }
+
+    /// Asserts that the two waits of the sequence end only when they are ended by hand, each
+    /// alone: neither is over at first, ending the load balancer wait leaves the deadline
+    /// wait going, and ending the deadline completes it.
+    #[test]
+    fn the_waits_of_the_sequence_end_when_they_are_ended_by_hand() {
+        let (drain, _closing, _readiness, _goaway) = fresh();
+        assert!(drain.lb_wait_ended().now_or_never().is_none());
+        assert!(drain.deadline_ended().now_or_never().is_none());
+        drain.end_lb_wait();
+        assert!(drain.lb_wait_ended().now_or_never().is_some());
+        assert!(drain.deadline_ended().now_or_never().is_none());
+        drain.end_deadline();
+        assert!(drain.deadline_ended().now_or_never().is_some());
     }
 
     /// Asserts that the sequence marks are what the frontend relies on: only the first

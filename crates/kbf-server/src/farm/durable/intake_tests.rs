@@ -683,6 +683,45 @@ async fn the_poll_looks_at_the_store_every_interval() {
     running.abort();
 }
 
+/// Asserts that the count of intake polls goes up by one for each poll that runs to the end
+/// and is told to its receiver, and does not move for a poll that cannot read the store or
+/// for a farm with no state store; and that a poll of a fenced farm, and one of a closed
+/// intake, count too.
+#[tokio::test(start_paused = true)]
+async fn the_count_of_intake_polls_follows_the_polls_that_ran_to_the_end() {
+    let none = Farm::new(
+        Arc::new(Cache::memory()),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
+    let stateless = none.intake_polls();
+    none.intake();
+    assert_eq!(*stateless.borrow(), 0, "a stateless farm polled");
+
+    let store = Racing::new();
+    let farm = farm_over(&store);
+    let mut polls = farm.intake_polls();
+    assert_eq!(*polls.borrow_and_update(), 0);
+    farm.intake();
+    assert!(polls.has_changed().expect("the farm is alive"));
+    assert_eq!(*polls.borrow_and_update(), 1);
+    farm.intake();
+    assert_eq!(*polls.borrow_and_update(), 2);
+
+    overwrite(&store, "queue/zz", Vec::new());
+    farm.intake();
+    assert_eq!(*polls.borrow(), 2, "a poll that read nothing was counted");
+    remove(&store, "queue/zz");
+
+    farm.fence();
+    farm.intake();
+    assert_eq!(*polls.borrow(), 3, "a fenced farm's poll was not counted");
+    farm.resume();
+    farm.close_intake();
+    farm.intake();
+    assert_eq!(*polls.borrow(), 4, "a closed intake did not count");
+}
+
 /// Asserts that the poll reports a stored epoch past the one this frontend serves, and
 /// reports none when they are the same.
 #[tokio::test(start_paused = true)]

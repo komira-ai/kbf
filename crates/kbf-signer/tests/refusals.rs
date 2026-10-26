@@ -13,7 +13,7 @@ use rcgen::{
     PKCS_ECDSA_P384_SHA384, PKCS_ED25519, SanType,
 };
 use std::sync::OnceLock;
-use support::{Ca, Evil, NOW, ca_true, custom_extension, dns, make_ca, role_uri};
+use support::{Ca, Evil, NOW, ca_true, custom_extension, dns, host_role_uri, make_ca, role_uri};
 
 fn ca() -> &'static Ca {
     static CA: OnceLock<Ca> = OnceLock::new();
@@ -332,4 +332,122 @@ fn only_a_certificate_body_and_nothing_after_it() {
     let mut tbs = Evil::new(ca()).tbs();
     tbs.push(0);
     assert_eq!(check(&tbs, Route::Node), Err(Refusal::Trailing));
+}
+
+// The updater shape: role `updater`, one host-role URI, one DNS name, clientAuth only.
+
+fn updater(tweak: impl FnOnce(&mut Evil<'static>)) -> Result<(), Refusal> {
+    node(|e| {
+        e.params.subject_alt_names =
+            vec![role_uri("updater"), host_role_uri("daemon"), dns("node-a")];
+        tweak(e);
+    })
+}
+
+// Catches: a signer that refuses the updater certificate the farm's own builder makes (the
+// control for the refusals below), in either order of the two URIs.
+#[test]
+fn the_farms_updater_certificate_is_accepted_on_the_node_route() {
+    assert_eq!(updater(|_| {}), Ok(()));
+    assert_eq!(
+        updater(|e| e.params.subject_alt_names = vec![
+            host_role_uri("mac-daemon"),
+            dns("node-a"),
+            role_uri("updater")
+        ]),
+        Ok(())
+    );
+}
+
+// Catches: an updater certificate with two host roles, none, an unknown one, or one that is
+// not a host-role URI (the coordinator could be told a host is two things).
+#[test]
+fn an_updater_names_exactly_one_known_host_role() {
+    let refused = Err(Refusal::RoleUri);
+    assert_eq!(
+        updater(|e| e.params.subject_alt_names = vec![
+            role_uri("updater"),
+            host_role_uri("daemon"),
+            host_role_uri("storage"),
+            dns("node-a")
+        ]),
+        refused
+    );
+    assert_eq!(
+        updater(|e| e.params.subject_alt_names = vec![role_uri("updater"), dns("node-a")]),
+        refused
+    );
+    for bad in ["nope", "Daemon", "", "daemon "] {
+        assert_eq!(
+            updater(|e| e.params.subject_alt_names =
+                vec![role_uri("updater"), host_role_uri(bad), dns("node-a")]),
+            refused,
+            "{bad:?}"
+        );
+    }
+    assert_eq!(
+        updater(|e| e.params.subject_alt_names =
+            vec![role_uri("updater"), role_uri("updater"), dns("node-a")]),
+        refused
+    );
+}
+
+// Catches: a host-role URI added to a daemon, storage or frontend certificate, or to the
+// coordinator's, so a role could carry a second identity.
+#[test]
+fn a_host_role_uri_is_refused_on_every_other_role() {
+    for role in ["daemon", "storage", "frontend", "coordinator", "operator"] {
+        assert!(
+            node(|e| e.params.subject_alt_names =
+                vec![role_uri(role), host_role_uri("daemon"), dns("node-a")])
+            .is_err(),
+            "{role}"
+        );
+    }
+}
+
+// Catches: an updater certificate that can serve (serverAuth), or has two names.
+#[test]
+fn an_updater_is_client_auth_only_and_names_one_node() {
+    assert_eq!(
+        updater(|e| e.params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ClientAuth,
+            ExtendedKeyUsagePurpose::ServerAuth
+        ]),
+        Err(Refusal::ExtendedKeyUsage)
+    );
+    assert_eq!(
+        updater(|e| e.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth]),
+        Err(Refusal::ExtendedKeyUsage)
+    );
+    assert_eq!(
+        updater(|e| e.params.subject_alt_names = vec![
+            role_uri("updater"),
+            host_role_uri("daemon"),
+            dns("node-a"),
+            dns("node-b")
+        ]),
+        Err(Refusal::Name)
+    );
+}
+
+// Catches: the frontend route (the frontend's own door) signing an updater certificate.
+#[test]
+fn the_frontend_route_refuses_an_updater() {
+    let mut evil = Evil::new(ca());
+    evil.params.subject_alt_names =
+        vec![role_uri("updater"), host_role_uri("daemon"), dns("node-a")];
+    assert_eq!(check(&evil.tbs(), Route::Frontend), Err(Refusal::RoleUri));
+}
+
+// Catches: the coordinator's certificate (serverAuth, role `coordinator`) signed on either
+// route: it is not reachable from a token, so the signer holds no door for it.
+#[test]
+fn the_coordinators_certificate_is_not_signed_on_either_route() {
+    let mut evil = Evil::new(ca());
+    evil.params.subject_alt_names = vec![role_uri("coordinator"), dns("coord.example")];
+    evil.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let tbs = evil.tbs();
+    assert_eq!(check(&tbs, Route::Node), Err(Refusal::RoleUri));
+    assert_eq!(check(&tbs, Route::Frontend), Err(Refusal::RoleUri));
 }

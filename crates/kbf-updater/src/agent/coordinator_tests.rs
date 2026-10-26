@@ -7,7 +7,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use kbf_testkit::dir::TestDir;
 use kbf_types::{HostRole, ReleasePlatform};
@@ -56,6 +56,8 @@ pub(super) struct Seen {
     /// The client's certificate, DER.
     pub(super) client: Option<Vec<u8>>,
     pub(super) handshake_failed: bool,
+    /// The client hung up while the server was still writing its answer a byte at a time.
+    pub(super) client_left: bool,
 }
 
 pub(super) fn server_config(pki: &Pki, leaf: &Leaf) -> Arc<ServerConfig> {
@@ -148,6 +150,7 @@ fn one(config: &Arc<ServerConfig>, tcp: TcpStream, answer: Plan) -> Seen {
             for byte in b"HTTP/1.1 200 OK\r\nX-Slow: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy".iter()
             {
                 if tls.write_all(&[*byte]).and_then(|()| tls.flush()).is_err() {
+                    seen.client_left = true;
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(60));
@@ -605,15 +608,12 @@ fn a_reply_that_trickles_is_cut_off_at_the_time_allowed_for_all_of_it() {
     let rig = Rig::new("co-trickle");
     let (addr, server) = rig.coordinator(vec![Plan::Trickle]);
     let client = rig.client(addr).with_timeout(Duration::from_millis(500));
-    let started = Instant::now();
     let err = client.heartbeat(&beat()).unwrap_err();
     assert!(matches!(err, CoordinatorError::Unreachable(_)), "{err:?}");
-    assert!(
-        started.elapsed() < Duration::from_millis(1800),
-        "{:?}",
-        started.elapsed()
-    );
-    server.join().unwrap();
+    // The client gave up while the reply was still coming in, rather than reading it to the
+    // end: the server's write to a closed connection failed before its last byte.
+    let seen = server.join().unwrap();
+    assert!(seen[0].client_left, "the client waited for the whole reply");
 }
 
 /// The key file is held to the rule of the token file: a key that others can read, or that is

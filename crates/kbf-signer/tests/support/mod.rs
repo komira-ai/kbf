@@ -267,6 +267,10 @@ pub fn role_uri(role: &str) -> SanType {
     SanType::URI(Ia5String::try_from(format!("urn:kbf:role:{role}")).expect("ia5"))
 }
 
+pub fn host_role_uri(name: &str) -> SanType {
+    SanType::URI(Ia5String::try_from(format!("urn:kbf:host-role:{name}")).expect("ia5"))
+}
+
 pub fn dns(name: &str) -> SanType {
     SanType::DnsName(Ia5String::try_from(name).expect("ia5"))
 }

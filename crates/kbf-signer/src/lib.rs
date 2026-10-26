@@ -20,7 +20,10 @@
 //!   design's table allows for the route it came in on ([`Route`]): not a CA, not a role
 //!   other than the route's (the node route cannot mint a `frontend` certificate), no
 //!   lifetime over the policy, only the key usage, extended key usage and extensions of
-//!   the table. A frontend that is fully compromised can therefore mint only well-formed
+//!   the table. A host's `updater` certificate is a node-route shape: exactly two URIs, the
+//!   role and one `urn:kbf:host-role:<name>` that names a host role (and that no other role
+//!   may carry), one DNS name, clientAuth only. The coordinator's certificate is not
+//!   signed here on either route. A frontend that is fully compromised can therefore mint only well-formed
 //!   node certificates.
 //! - [`SocketSigner`] is the frontend's side: a [`kbf_ca::Signer`] whose custody is
 //!   [`kbf_ca::Custody::External`], so `Authority::require_external` accepts it.

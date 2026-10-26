@@ -50,6 +50,18 @@ async fn the_defaults_are_the_frontends() {
     assert!(printed.contains("max_blob_bytes"), "{printed}");
 }
 
+/// Asserts that the idle timeout a frontend is configured with is the one its packs keep.
+#[tokio::test]
+async fn the_configured_idle_timeout_is_the_one_the_packs_keep() {
+    let settings = PackSettings {
+        upload_idle_timeout: Duration::from_secs(7),
+        ..PackSettings::default()
+    };
+    let rig = Rig::with(settings).await;
+
+    assert_eq!(rig.packs.upload_idle_timeout(), Duration::from_secs(7));
+}
+
 /// Asserts that packs are refused over a store that does not claim create-only writes, which
 /// the write rule needs.
 #[tokio::test]
