@@ -991,6 +991,10 @@ fn no_hardware_uuid_means_no_by_host_file_and_no_marker() {
             Status::Error,
         ),
         (out(Ended::Exited(1), "", "ioreg: nope"), Status::Failed),
+        (
+            out(Ended::SpawnFailed("no ioreg".to_owned()), "", ""),
+            Status::Error,
+        ),
     ] {
         let host = Fake::new();
         host.answer("/ioreg", answer);
@@ -1127,6 +1131,7 @@ fn a_password_split_by_the_tail_cut_or_the_capture_cap_never_shows_in_part() {
     for (text, name) in [
         (format!("noise {}", &PASSWORD[..10]), "ends"),
         (format!("{} noise", &PASSWORD[9..]), "starts"),
+        ("noise only".to_owned(), "neither"),
     ] {
         let host = Fake::new();
         let mut o = out(Ended::Exited(1), &text, &text);

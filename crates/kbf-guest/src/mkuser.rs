@@ -532,21 +532,18 @@ fn record(f: &mut StepFrame, out: &Outcome, cfg: &Config, password: &str) {
         if !password.is_empty() {
             s = s.replace(password, REDACTED);
             if out.cut {
-                for k in (1..password.len()).rev() {
-                    if let Some(head) = password.get(..k)
-                        && s.ends_with(head)
-                    {
-                        s.truncate(s.len() - k);
-                        break;
-                    }
-                }
-                for k in (1..password.len()).rev() {
-                    if let Some(rest) = password.get(password.len() - k..)
-                        && s.starts_with(rest)
-                    {
-                        s.drain(..k);
-                        break;
-                    }
+                let pw = password.as_bytes();
+                let len = pw.len();
+                if let Some(k) = (1..len)
+                    .rev()
+                    .find(|&k| s.as_bytes().ends_with(pw.split_at(k).0))
+                {
+                    s.truncate(s.len() - k);
+                } else if let Some(k) = (1..len)
+                    .rev()
+                    .find(|&k| s.as_bytes().starts_with(pw.split_at(len - k).1))
+                {
+                    s.drain(..k);
                 }
             }
         }
@@ -596,25 +593,18 @@ fn execute(
     s: &Step,
     f: &mut StepFrame,
 ) {
-    let known = uuid.clone();
-    // An argument as shown in a frame (`shown`) or as run; a per-host path needs the UUID.
+    // A step that names the hardware UUID needs `hw-uuid`, so it has run (and the UUID is
+    // known) whenever this step runs; without it the path would lack the UUID and not exist.
+    let known = uuid.clone().unwrap_or_default();
     let arg = |a: &Arg, shown: bool| match a {
-        Arg::Text(t) => Some(t.clone()),
-        Arg::Password => Some(if shown { WITHHELD } else { password }.to_owned()),
-        Arg::ByHost(dir, domain, ext) => {
-            known.as_deref().map(|u| format!("{dir}/{domain}.{u}{ext}"))
-        }
+        Arg::Text(t) => t.clone(),
+        Arg::Password => if shown { WITHHELD } else { password }.to_owned(),
+        Arg::ByHost(dir, domain, ext) => format!("{dir}/{domain}.{known}{ext}"),
     };
     match &s.action {
         Action::Run(args) => {
-            let shown: Option<Vec<String>> = args.iter().map(|a| arg(a, true)).collect();
-            let argv: Option<Vec<String>> = args.iter().map(|a| arg(a, false)).collect();
-            let (Some(shown), Some(argv)) = (shown, argv) else {
-                f.status = Status::Error;
-                f.note = Some("the hardware UUID is not known".to_owned());
-                return;
-            };
-            f.argv = shown;
+            f.argv = args.iter().map(|a| arg(a, true)).collect();
+            let argv: Vec<String> = args.iter().map(|a| arg(a, false)).collect();
             let out = host.run(&argv, cfg.quick);
             record(f, &out, cfg, password);
         }
@@ -632,14 +622,8 @@ fn execute(
         }
         Action::MakeDirs(paths, mode) => give(host, f, name, paths, *mode, false),
         Action::GiveFiles(args, mode) => {
-            let paths: Option<Vec<String>> = args.iter().map(|a| arg(a, false)).collect();
-            match paths {
-                Some(p) => give(host, f, name, &p, *mode, true),
-                None => {
-                    f.status = Status::Error;
-                    f.note = Some("the hardware UUID is not known".to_owned());
-                }
-            }
+            let paths: Vec<String> = args.iter().map(|a| arg(a, false)).collect();
+            give(host, f, name, &paths, *mode, true);
         }
         Action::WriteKcpassword => {
             f.argv = vec![

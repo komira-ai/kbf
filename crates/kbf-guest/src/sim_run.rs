@@ -212,9 +212,8 @@ fn kill_group(child: &mut Child) {
 /// [`Wanted::Unreadable`], never [`Wanted::No`].
 #[must_use]
 pub fn read_wanted(path: &std::path::Path) -> Wanted {
-    match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Wanted::No,
-        _ => {}
+    if std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        return Wanted::No;
     }
     let bytes = match read_regular(path, 256) {
         Ok(b) => b,
