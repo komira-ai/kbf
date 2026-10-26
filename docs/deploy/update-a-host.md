@@ -17,6 +17,9 @@ A farm whose hosts run the packages is rolled by [kbf-updater](kbf-updater.md), 
 drains, installs and restarts the frontend members of a pool one at a time, through each
 member's own operator API.
 
+Frontends in containers behind a load balancer are updated by draining one at a time:
+[frontends-behind-a-load-balancer.md](frontends-behind-a-load-balancer.md).
+
 ## Upgrade the installer first (seq)
 
 A kbf built from main at or after commit 0c650e54 prints `seq` in `--version --json`, and every

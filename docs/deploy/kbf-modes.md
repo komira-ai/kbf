@@ -209,6 +209,9 @@ with the `upstream` table is refused. It fronts `kbf --mode=frontend` only; an `
 process cannot sit behind it. The update of a pool is described in
 [kbf-updater.md](kbf-updater.md).
 
+To run several frontends behind a load balancer of your own instead (Envoy, with a
+compose example), see [frontends-behind-a-load-balancer.md](frontends-behind-a-load-balancer.md).
+
 ### The installer's role
 
 `kbf-installer setup --mode=<mode>` makes a host ready for one mode: the accounts and
