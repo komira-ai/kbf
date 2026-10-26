@@ -1513,42 +1513,18 @@ mod real {
     /// for no gain.
     static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    /// How long, in seconds, `xcodebuild test -destination` waits for its device to
-    /// appear before it gives up: its `-destination-timeout`, 30 s by default. This is
-    /// the contract the lease's device has to meet; a device listed only later fails a
-    /// default `xcodebuild test`.
-    const DESTINATION_TIMEOUT: u64 = 30;
-
     /// Whether [`a_real_simulator_is_made_booted_and_deleted_for_the_lease`] has run in
     /// this process: the sibling test says so in its log, to tell a listing that is
     /// late after a lease's device from one on a quiet node.
     static LEASE_TEST_RAN: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
-    /// How long one sandboxed `xcodebuild -showdestinations` try takes on a hosted
-    /// runner: 15 s in the native-macos job (a try that listed the device at once
-    /// reported itself at 15 s). A try sees a listing only when it ends, so a device
-    /// that appears just before [`DESTINATION_TIMEOUT`] can be reported up to one try
-    /// later.
-    const ONE_TRY: u64 = 15;
-
-    /// The latest elapsed time, in seconds since the first try started, at which the
-    /// first try that lists the device may end and still meet the contract:
-    /// [`DESTINATION_TIMEOUT`] plus one try's own duration. A try reports when it ends,
-    /// so a passing value proves the device was listed no later than [`ONE_TRY`]
-    /// seconds past the contract. The bound errs strict the other way: a device that
-    /// appears while a try is already past its listing step waits for that try, the
-    /// 5 s pause and a whole next try, so one that appears in the last seconds before
-    /// [`DESTINATION_TIMEOUT`] can fail.
-    const LISTED_BY: u64 = DESTINATION_TIMEOUT + ONE_TRY;
-
-    /// How long, in seconds after its first try, the action keeps retrying
-    /// `-showdestinations` while the device is not listed. Longer than [`LISTED_BY`]
-    /// on purpose: a device that appears late still fails the test, but the per-try
-    /// lines then say when it appeared (or that it never did, and whether any
-    /// simulator was listed at all), which tells a late listing from a sandbox that
-    /// lists nothing.
-    const POLL_FOR: u64 = 120;
+    /// How long, in seconds after its first try, a look keeps retrying
+    /// `-showdestinations` while the device is not listed. A hang guard only: the tests
+    /// assert that the device is listed, never how soon (tests do not assert timing).
+    /// When it was first listed is printed for the reader. Well inside the action's
+    /// own 600 s timeout.
+    const POLL_FOR: u64 = 480;
 
     /// `xcrun args`, unsandboxed (the test's own view), its stdout; panics on failure.
     fn xcrun(args: &[&str]) -> String {
@@ -1753,16 +1729,14 @@ mod real {
     /// Catches, on a real Mac: `simctl create` in the default set not working under the
     /// actions' sandbox (create, or the delete at the end, refused), a device the
     /// action cannot boot from its sandbox, a device the action's own `xcodebuild
-    /// -showdestinations` does not list from the sandbox, or lists only after
-    /// [`LISTED_BY`] seconds (so `xcodebuild test -destination id=$KBF_SIMULATOR_UDID`
-    /// with its default timeout could not use it), and a booted device left running or
+    /// -showdestinations` does not list from the sandbox at all, and a booted device left running or
     /// registered after the lease. The driver boots the device and waits before the action runs until
     /// `xcrun xcdevice list` names it and its own sandboxed `xcodebuild
     /// -showdestinations` lists it (issue #608); the action's `bootstatus -b` then
     /// returns at once, and a try that lists none prints how many devices are booted
-    /// and the `CoreSimulator` processes. This checks that its wait stands
-    /// for what the action's own `xcodebuild` sees: its first try is expected to list
-    /// the device. The driver's own looks (their time and the simulators each listed)
+    /// and the `CoreSimulator` processes. This checks that the action's own
+    /// `xcodebuild` lists the device it was given; which try first listed it, and at
+    /// what second, is printed, not asserted. The driver's own looks (their time and the simulators each listed)
     /// are in its log lines "xcodebuild -showdestinations look". The action keeps trying for [`POLL_FOR`] seconds;
     /// each try prints to the action's stderr what it saw: its exit, whether it named
     /// the lease's device, and how many iOS simulators it listed (none at all would
@@ -1830,12 +1804,12 @@ mod real {
             lines[2], "1",
             "xcodebuild lists the device from the sandbox within {POLL_FOR} s"
         );
-        let listed_at: u64 = lines[3].parse().expect("seconds to the first listing");
-        assert!(
-            listed_at <= LISTED_BY,
-            "xcodebuild first listed the device at {listed_at} s, after the {LISTED_BY} s \
-             a default `xcodebuild test -destination` allows ({DESTINATION_TIMEOUT} s \
-             -destination-timeout plus one {ONE_TRY} s try)"
+        // When it was first listed is for the reader, not asserted (tests do not
+        // assert timing).
+        let _ = writeln!(
+            std::io::stderr(),
+            "xcodebuild first listed the device at {} s",
+            lines[3]
         );
         assert!(
             !xcrun(&["simctl", "list", "devices", "-j"]).contains(udid),

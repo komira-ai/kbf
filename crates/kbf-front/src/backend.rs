@@ -29,9 +29,13 @@
 //! **Packs.** A frontend given [`Packs`] ([`Backend::remote_over`], [`Backend::routed_over`])
 //! has the blobs clients upload in packs, not on its nodes, so the Action and Command blobs, the
 //! input check and the walk of the input tree look in the pack index first and ask the nodes
-//! about what it lacks (`layered`). The action cache, the result blobs and the closure check
-//! are the nodes': daemons write them.
+//! about what it lacks (`layered`). The action cache and the result blobs are the nodes', but
+//! the closure check is not: a blob a daemon wrote into a pack is not on a node, so the check
+//! of an action-cache write and of every hit asks the pack index first and the nodes for the
+//! rest (`closed`), and the entry handed to the nodes names only the blobs they hold.
+//! Without packs the nodes check the entry alone, as they always did.
 
+mod closed;
 mod layered;
 
 use std::fmt;
@@ -46,7 +50,8 @@ use kbf_storage::{Storage, StorageError};
 use kbf_types::Digest;
 use prost::Message as _;
 
-use self::layered::{Layered, Primary};
+pub(crate) use self::closed::{checked, on_nodes, served};
+pub(crate) use self::layered::{Layered, Primary};
 use crate::cache::Cache;
 use crate::closure;
 use crate::input_tree::Walked;
@@ -333,14 +338,37 @@ impl Plane for Remote {
         &'a self,
         action: &'a Digest,
     ) -> BoxFuture<'a, Answer<Option<(Digest, ActionResult)>>> {
-        self.storage.action_result(action)
+        let storage = &self.storage;
+        match &self.packs {
+            None => storage.action_result(action),
+            Some(packs) => Box::pin(async move {
+                let hit = storage.action_result(action).await?;
+                let held = Held(&**storage);
+                let layered = Layered { packs, rest: &held };
+                served(hit, &layered).await
+            }),
+        }
     }
 
     fn prepare_action_result<'a>(
         &'a self,
         result: &'a ActionResult,
     ) -> BoxFuture<'a, Answer<ActionRecord>> {
-        self.storage.prepare_action_result(result)
+        let storage = &self.storage;
+        match &self.packs {
+            None => storage.prepare_action_result(result),
+            Some(packs) => Box::pin(async move {
+                let held = Held(&**storage);
+                let layered = Layered { packs, rest: &held };
+                let closure = checked(result, &layered).await?;
+                let encoded = bytes::Bytes::from(result.encode_to_vec());
+                let stored = storage.put(encoded).await?;
+                Ok(ActionRecord {
+                    result: stored,
+                    closure,
+                })
+            }),
+        }
     }
 
     fn commit_action_record(
@@ -348,8 +376,15 @@ impl Plane for Remote {
         action: Digest,
         record: ActionRecord,
     ) -> BoxFuture<'_, Answer<()>> {
-        self.storage
-            .commit_action_record(Role::Daemon, action, record)
+        let storage = &self.storage;
+        match &self.packs {
+            None => storage.commit_action_record(Role::Daemon, action, record),
+            Some(packs) => Box::pin(async move {
+                let record = on_nodes(packs, record).await?;
+                let committed = storage.commit_action_record(Role::Daemon, action, record);
+                committed.await
+            }),
+        }
     }
 
     fn walk_inputs(&self, root: Digest) -> BoxFuture<'_, Answer<Walked>> {
@@ -436,9 +471,17 @@ impl Plane for RoutedPlane {
         &'a self,
         action: &'a Digest,
     ) -> BoxFuture<'a, Answer<Option<(Digest, ActionResult)>>> {
-        match self.routing() {
-            Some(router) => Box::pin(router.action_result(action)),
-            None => self.bootstrap.action_result(action),
+        match (self.routing(), &self.packs) {
+            (Some(router), None) => Box::pin(router.action_result(action)),
+            (Some(router), Some(packs)) => Box::pin(async move {
+                let hit = router.action_result(action).await?;
+                let layered = Layered {
+                    packs,
+                    rest: router,
+                };
+                served(hit, &layered).await
+            }),
+            (None, _) => self.bootstrap.action_result(action),
         }
     }
 
@@ -446,9 +489,22 @@ impl Plane for RoutedPlane {
         &'a self,
         result: &'a ActionResult,
     ) -> BoxFuture<'a, Answer<ActionRecord>> {
-        match self.routing() {
-            Some(router) => Box::pin(prepare(router, result)),
-            None => self.bootstrap.prepare_action_result(result),
+        match (self.routing(), &self.packs) {
+            (Some(router), None) => Box::pin(prepare(router, result)),
+            (Some(router), Some(packs)) => Box::pin(async move {
+                let layered = Layered {
+                    packs,
+                    rest: router,
+                };
+                let closure = checked(result, &layered).await?;
+                let encoded = bytes::Bytes::from(result.encode_to_vec());
+                let stored = router.put(encoded).await?;
+                Ok(ActionRecord {
+                    result: stored,
+                    closure,
+                })
+            }),
+            (None, _) => self.bootstrap.prepare_action_result(result),
         }
     }
 
@@ -457,9 +513,16 @@ impl Plane for RoutedPlane {
         action: Digest,
         record: ActionRecord,
     ) -> BoxFuture<'_, Answer<()>> {
-        match self.routing() {
-            Some(router) => Box::pin(router.commit_with_closure(Role::Daemon, action, record)),
-            None => self.bootstrap.commit_action_record(action, record),
+        match (self.routing(), &self.packs) {
+            (Some(router), None) => {
+                Box::pin(router.commit_with_closure(Role::Daemon, action, record))
+            }
+            (Some(router), Some(packs)) => Box::pin(async move {
+                let record = on_nodes(packs, record).await?;
+                let committed = router.commit_with_closure(Role::Daemon, action, record);
+                committed.await
+            }),
+            (None, _) => self.bootstrap.commit_action_record(action, record),
         }
     }
 

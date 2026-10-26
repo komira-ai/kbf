@@ -50,7 +50,9 @@
 //!
 //! **Packs** are off unless `--pack-store-endpoint` is given (`pack_flags` has the flags and
 //! what they need): client uploads are then kept in packs ([`kbf_front::Packs`]); without it
-//! no object store is built or contacted and the frontend serves exactly as it did.
+//! no object store is built or contacted and the frontend serves exactly as it did. With the
+//! pack index too, the frontend takes a daemon's `CommitPack` (it must read the pack to check it)
+//! and says so in `Welcome.pack_commit`.
 //!
 //! **Readiness** (`GET /readyz`, `grpc.health.v1`) fails when the storage node does not
 //! answer an action-cache lookup within `--readyz-store-timeout-ms`, when the state store (if
@@ -881,6 +883,7 @@ impl<'a> Prepared<'a> {
             members.clone(),
             tls_sources,
             packs.clone(),
+            Arc::clone(&farm),
         ));
         // The storage health, if there are members.
         let api_routes = members.iter().fold(api_routes, |routes, members| {
@@ -902,15 +905,19 @@ impl<'a> Prepared<'a> {
             peers.clone(),
         );
         let cold_store = cold_store(members.clone(), &peers, delivery.as_ref());
-        // Only with `--pack-index`: otherwise a daemon's Locate is UNIMPLEMENTED.
-        let locate = crate::pack_locate::service(pack_index.as_ref(), &peers);
+        // Only with `--pack-index`: otherwise a daemon's Locate is UNIMPLEMENTED; and its
+        // CommitPack too is UNIMPLEMENTED without the pack store, which checks the pack.
+        let commits = pack_flags::commits(packs.as_ref(), flags.packs.as_ref());
+        let committing = crate::pack_locate::commit_served(pack_index.as_ref(), commits.as_ref());
+        let locate = crate::pack_locate::service(pack_index.as_ref(), &peers, commits);
         let sessions = WorkerService::new(
             Arc::clone(&farm),
             peers,
             listeners.heartbeat_interval,
             listeners.hello_wait,
         )
-        .with_host_floor(listeners.vm_host_floor);
+        .with_host_floor(listeners.vm_host_floor)
+        .with_pack_commit(committing);
         // Daemons are sent the members' map: Welcome.map and a MapUpdate at each bump.
         let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
         let worker_service = WorkerServer::new(sessions)
@@ -1130,24 +1137,27 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
 
 /// `GET /metrics`: what the service counts, in the Prometheus text format, history's
 /// counters when it keeps history, the storage health of `members` when there are any, the
-/// reloads of the listeners' `tls` files, and the counters of the `packs` when there are any.
+/// reloads of the listeners' `tls` files, the counters of the `packs` when there are any, and
+/// the pack reads the daemons of `farm` report.
 fn metrics_route(
     backend: Backend,
     history: Option<Arc<crate::history::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
     packs: Option<Packs>,
+    farm: Arc<Farm>,
 ) -> axum::Router {
     let tls = Arc::new(tls);
     let render = move || {
         let (backend, members, tls) = (backend.clone(), members.clone(), Arc::clone(&tls));
-        let (history, packs) = (history.clone(), packs.clone());
+        let (history, packs, farm) = (history.clone(), packs.clone(), Arc::clone(&farm));
         async move {
             let mut text = backend.render_metrics();
             if let Some(history) = history {
                 history.render(&mut text);
             }
             Packs::render_metrics_of(packs.as_ref(), &mut text);
+            crate::pack_daemon_metrics::render(&mut text, &farm.pack_reads());
             crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);
             ([(CONTENT_TYPE, crate::metrics::TEXT_FORMAT)], text)

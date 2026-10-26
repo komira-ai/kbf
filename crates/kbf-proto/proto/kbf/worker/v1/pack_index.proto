@@ -4,10 +4,15 @@
 // itself (--pack-read) asks the frontend where a blob is, then reads that range of that pack
 // from the object store and hashes it. The daemon opens no connection to the index's database.
 //
+// A daemon that stores a pack in the object store asks the frontend to record it here
+// (CommitPack): the frontend checks a sample of the pack's blobs against their digests before
+// the index points any blob at it.
+//
 // Served on the worker listener only, to the daemon role, each call admitted as the listener's
 // blob calls are (docs/design/worker-protocol.md, "Blobs on the worker listener"). A frontend
 // started without --pack-index does not register the service: the call is UNIMPLEMENTED, and
-// the daemon reads the blob where it did before.
+// the daemon reads the blob where it did before. A frontend started with --pack-index and
+// without the pack store flags serves Locate and answers CommitPack UNIMPLEMENTED.
 syntax = "proto3";
 
 package kbf.worker.v1;
@@ -21,6 +26,25 @@ service PackIndex {
   // that is not an error, and the daemon reads it where it did before. UNAVAILABLE when the
   // index cannot be read.
   rpc Locate(PackLocateRequest) returns (PackLocateResponse);
+
+  // Records a pack the daemon has stored in the object store, and the blobs it holds, in the
+  // index. The pack is written first and committed after (a row never points at a pack that is
+  // not stored), and a commit is idempotent on the pack's name: the same pack sent again is
+  // answered with created false. The answers:
+  //
+  // - PERMISSION_DENIED: `writer` is not the node the caller's certificate names.
+  // - INVALID_ARGUMENT: the name is not `cas/d/<writer>/<boot>/<sequence>`, the pack is empty,
+  //   it names more than 16384 blobs or one twice or one past its end, its blobs add up to more
+  //   bytes than `size`, a blob has no digest or one that is not a SHA-256 digest, or a blob the
+  //   frontend checked is not the bytes its digest names (nothing is recorded).
+  // - FAILED_PRECONDITION: the pack is not in the object store, or is not `size` bytes long.
+  // - ALREADY_EXISTS: the name was recorded before with other contents.
+  // - UNAVAILABLE: the object store or the index could not answer; the daemon sends the commit
+  //   again.
+  // - UNIMPLEMENTED: the frontend has no pack store (and so cannot check the pack).
+  //
+  // A daemon should send it only to a frontend whose Welcome says pack_commit.
+  rpc CommitPack(CommitPackRequest) returns (CommitPackResponse);
 }
 
 message PackLocateRequest {
@@ -42,4 +66,31 @@ message PackLocation {
 message PackLocateResponse {
   // One per requested digest, in request order.
   repeated PackLocation locations = 1;
+}
+
+// A blob of a pack: its digest and where its bytes start in the pack.
+message PackedBlob {
+  build.bazel.remote.execution.v2.Digest digest = 1;
+  // Where the blob's bytes start in the pack.
+  uint64 offset = 2;
+}
+
+message CommitPackRequest {
+  // The name of the pack in the object store the farm's packs are kept in:
+  // `cas/d/<writer>/<boot>/<sequence>`.
+  string pack = 1;
+  // The pack's length in bytes, footer included. At least 1.
+  uint64 size = 2;
+  // The blobs the pack holds, in any order, each with where its bytes start. At most 16384.
+  repeated PackedBlob blobs = 3;
+  // The node id of the daemon that wrote the pack: the one DNS name its certificate carries.
+  string writer = 4;
+}
+
+message CommitPackResponse {
+  // True when this call recorded the pack. False when the pack was recorded before with these
+  // contents: a retry of a commit whose answer was lost.
+  bool created = 1;
+  // How many of the pack's blobs the index points at this pack: the ones it had no row for.
+  uint32 indexed = 2;
 }

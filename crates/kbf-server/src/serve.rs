@@ -233,6 +233,10 @@ pub struct Bound<F> {
     /// The invocation records the serving future builds, which the build pages read
     /// ([`crate::http_invocations`]); tests feed it events.
     pub recorder: Recorder,
+    /// The farm the serving future ticks, not owned here (it goes when serving ends);
+    /// tests drive its tick and write-behind by hand instead of waiting for the timer.
+    #[doc(hidden)]
+    pub farm: std::sync::Weak<Farm>,
 }
 
 /// Aborts its task when dropped.
@@ -861,6 +865,7 @@ where
         history.as_ref().map(crate::history::History::stats),
         members.clone(),
         tls_sources,
+        Some(Arc::clone(&farm)),
     ));
     // The storage health, if there are members: no branch in this generic function.
     let api_routes = members.iter().fold(api_routes, |routes, members| {
@@ -963,6 +968,7 @@ where
     .add_service(health);
 
     let stopper = Arc::clone(&drain);
+    let farm_handle = Arc::downgrade(&farm);
     let serving = async move {
         // A task of its own: applying events never delays the tick or an accept loop,
         // and they never delay it. It stops when the serving future does.
@@ -1046,6 +1052,7 @@ where
         drain,
         serving,
         recorder,
+        farm: farm_handle,
     })
 }
 

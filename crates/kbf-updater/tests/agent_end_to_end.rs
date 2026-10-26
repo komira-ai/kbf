@@ -77,7 +77,7 @@ fn an_update_by(way: Way) {
         Way::Certificate => support::frontend_worker(&pki, &events, &stop),
     };
     let socket = dir.join("local.sock");
-    let helper = support::helper(&socket, &events, &stop);
+    let helper = support::helper(&socket, &events, &beats, &stop);
 
     let args: Vec<String> = [
         "kbf-updater",

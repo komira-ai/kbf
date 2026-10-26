@@ -147,7 +147,7 @@ is signed ad hoc with the hardened runtime, as the other macOS binaries are; a M
 `_kbf-updater` from the property list in `packaging/host-agent/macos`.
 The account `_kbf-updater` and the two directories the agent writes, `/var/db/kbf-updater` (its
 state directory, the account's, mode 700) and `/Library/Logs/kbf-updater` (its logs, the account's,
-mode 755), come from the `updater_user` item of `kbf-mac-provision`: put `updater_user=_kbf-updater`
+mode 755), come from the `updater_user` item of `kbf-mac-provision` (a release asset, `kbf-mac-provision-<commit>-darwin-arm64.tar.gz`, attested like every tarball ([../artifacts.md](../artifacts.md))): put `updater_user=_kbf-updater`
 (and, to fix the id, `updater_id=<200 to 499>`) in the Mac's profile and run `apply`
 ([the item](../../crates/kbf-mac-provision/README.md)). Nothing else creates the account.
 

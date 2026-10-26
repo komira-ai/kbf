@@ -941,17 +941,28 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-            !target/tmp/n-1
-            !target/n-1.source
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       # N: the tip's kbf and the stand-in crun the farm's container driver runs, and xtask. Built
       # before any step holds a token, so no build script runs beside one; xtask on its own, as
-      # `cargo xtask` resolves it.
+      # `cargo xtask` resolves it. The test binary is built here too, so the cache saved next
+      # holds every build of this job.
       - name: Build xtask
         run: cargo build -p xtask --locked
       - name: Build the tip (N) and the stand-in crun
         run: cargo build -p kbf-cli --bins --locked
+      - name: Build the mixed-version test
+        run: cargo test -p kbf-integration-test --test mixed_version --locked --no-run
+      # Saved before N-1 is fetched into target/tmp/n-1: a cache holding it makes the fetch of the
+      # next run refuse ("File exists"), and an exclude pattern under `target` does not keep it out.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
       - name: Fetch the Sigstore trusted root, for the offline check of the bundles
         env:
           GH_TOKEN: ${{ github.token }}
@@ -965,13 +976,3 @@ jobs:
       # command.
       - name: The farm of N and N-1
         run: cargo test -p kbf-integration-test --test mixed_version --locked -- --test-threads=1 --nocapture
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-            !target/tmp/n-1
-            !target/n-1.source
-          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}

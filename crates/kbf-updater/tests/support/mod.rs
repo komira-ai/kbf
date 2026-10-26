@@ -431,14 +431,19 @@ pub fn frontend_worker(
 
 /// The helper: the real protocol's answers (the types of `kbf-host-install`), for a host that
 /// runs release A, is offered B, and goes through the A/B as a helper would.
+///
+/// The fetch of a release takes as long as it takes the coordinator to hear two heartbeats that
+/// say the update is running: the helper answers `stage` after they are in `beats`, not after
+/// a time (a minute is only a hang guard).
 pub fn helper(
     socket: &Path,
     events: &Events,
+    beats: &Arc<Mutex<Vec<serde_json::Value>>>,
     stop: &Arc<std::sync::atomic::AtomicBool>,
 ) -> JoinHandle<()> {
     let listener = UnixListener::bind(socket).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let (events, stop) = (events.clone(), Arc::clone(stop));
+    let (events, beats, stop) = (events.clone(), Arc::clone(beats), Arc::clone(stop));
     std::thread::spawn(move || {
         // (commit, version text, staged, pending, last)
         let mut commit = COMMIT_A.to_owned();
@@ -472,7 +477,18 @@ pub fn helper(
                 Some("stage") => {
                     events.push(format!("helper:install {line}"));
                     // A fetch takes a while: the heartbeats go on meanwhile.
-                    std::thread::sleep(Duration::from_millis(2500));
+                    let guard = std::time::Instant::now() + Duration::from_secs(60);
+                    while beats
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|b| b["updating"] == VB)
+                        .count()
+                        < 2
+                        && std::time::Instant::now() < guard
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
                     staged = true;
                     Answer::Staged {
                         version: VB.into(),

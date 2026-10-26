@@ -426,6 +426,17 @@ Properties:
 
 `enroll/node/<node_id>` as above; `enroll/serial/<hex>` and `enroll/key/<spki hash>` give reverse lookups for the operator and the deny writer. `GET /v1/enroll/nodes` lists node id, roles, state, certificate expiry, token label, advertise, last renewal, the config generation the node reports, and a "restart pending" flag; the existing `GET /v1/nodes` (live sessions) and `GET /v1/members` (#858) are joined to it in the UI by node id.
 
+Adopting a node. A node provisioned before enrollment (its certificates issued by hand) has
+no registry row, so the storage-health and safe-to-stop joins, which read the address a node
+advertised from its row, cannot find its storage member. `POST /v1/enroll/nodes/{id}:adopt`
+(`docs/api.md`) writes the same `enroll/node/<id>` row and `enroll/adv/<address>` row as an
+enrollment, in one transaction, with the same checks on the id, the roles and the address, but
+with no token, no certificate and so no serial or key rows. The row lists `adopted` as its
+token and holds one placeholder certificate entry per role (the role, a zero key hash, no
+serial, expiry 0), because an enrolled row's roles are read from its certificates and a
+frontend from before adoption reads no other way. Such a row is never renewed, and revoking it
+denies the node id alone.
+
 ### 5.8 Renewal
 
 - **When.** The node renews when half the certificate's life has passed (the answer's `renew_after`, with ±10% jitter), retries every 5 minutes with doubling to 1 hour on failure, and logs a warning with the remaining time below 24 hours. The metric `kbf_enroll_cert_not_after_seconds{role}` (beside `kbf_tls_leaf_not_after_seconds` **[F]**) lets the frontend's UI alert before expiry.

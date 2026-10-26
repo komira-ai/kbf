@@ -134,6 +134,8 @@ pack-bytes = 33554432
 # pack-cache-bytes = "BYTES"
 # A directory this process owns where the blobs read from packs are kept, one file each, checked by digest on every read; the least recently used are removed to stay within `--pack-cache-bytes`. Left out, nothing is kept
 # pack-cache-dir = "DIR"
+# How many blobs of each pack a daemon commits this frontend reads back from the pack store and checks against their digests before it records the pack, spread over the pack from a start that its name picks (the same commit is always checked at the same blobs). A pack with fewer blobs is checked whole, and 16384, the most blobs a pack holds, checks every blob. 0 checks no blob and trusts the daemon: a blob that is not its digest is then caught only when it is first read. The last byte of the pack is read in any case, so a pack that is not stored is always refused. Used only with `--pack-store-endpoint`
+pack-commit-sample = 2
 # The most bytes of client uploads into packs this frontend holds in flight at once, at least 67108864 (the largest blob that is packed, so that no upload is refused for its size) and at most 4294967295. Each upload takes its blob's size as soon as its resource name has arrived, before it reads on, and gives it back when it ends; one that finds the rest taken waits its turn, so a burst of uploads is slowed down, not failed. The bound counts blob bytes, not the memory of the process: a batch upload is decoded before it waits, so the bytes it holds meanwhile are not counted, and reads are not counted. Used only with `--pack-store-endpoint`
 pack-inflight-bytes = 1073741824
 # The bucket of `--pack-store-endpoint` that holds the packs, under the keys `cas/f/<--pack-writer>/<start>/<sequence>`

@@ -150,6 +150,18 @@ pub fn connection(
     check: &dyn CallerCheck,
     timeout: Duration,
 ) {
+    let origin = Instant::now();
+    connection_on(stream, helper, check, timeout, &|| origin.elapsed());
+}
+
+/// [`connection`] with the request's deadline measured on the clock `now`.
+pub fn connection_on(
+    stream: &UnixStream,
+    helper: &Helper,
+    check: &dyn CallerCheck,
+    timeout: Duration,
+    clock: proto::Now<'_>,
+) {
     let refuse = |why: String| {
         tracing::warn!("refused a caller: {why}");
         reply(
@@ -174,8 +186,7 @@ pub fn connection(
             nonce: nonce.clone(),
         },
     );
-    let deadline = Instant::now() + timeout;
-    let (call, fds) = match proto::recv_by::<Call>(stream.as_fd(), RUN_FDS, deadline) {
+    let (call, fds) = match proto::recv_within::<Call>(stream.as_fd(), RUN_FDS, timeout, clock) {
         Ok(Some(received)) => received,
         Ok(None) => return,
         Err(why) => {

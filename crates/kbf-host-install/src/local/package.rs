@@ -208,7 +208,7 @@ impl PackageHost {
         let prefix = commit_prefix(version).ok_or_else(|| {
             Fault::refused(
                 Code::UnknownRelease,
-                "the version carries no commit (+g and 12 hex digits)",
+                "the version carries no commit (+g or +, then 12 hex digits)",
             )
         })?;
         let held = record.files.iter().find(|(commit, kept)| {

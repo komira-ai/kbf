@@ -205,6 +205,14 @@ fn worker_messages_round_trip() {
             seq: 11,
             report_hash: vec![7; 32],
             running: vec![LeaseId { term: 2, seq: 9 }],
+            pack_reads: Some(worker::PackReadCounts {
+                served: 5,
+                served_bytes: 4096,
+                elsewhere: 2,
+                unasked: 1,
+                lost: 3,
+                damaged: 4,
+            }),
         })),
     };
     let back = DaemonMessage::decode(heartbeat.encode_to_vec().as_slice()).expect("decode");

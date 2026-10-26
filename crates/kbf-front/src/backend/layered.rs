@@ -5,7 +5,9 @@
 //! nodes. [`Layered`] asks the packs for a blob and, if they do not serve it, the blobs under
 //! it (a node, or the nodes of a map); for what is held it asks the index first and the nodes
 //! about only what the index lacks. A store without packs does not build one: its calls are
-//! the ones they were.
+//! the ones they were. The closure check of the action cache reads the blobs through it too
+//! (`closed`, and the proxy's `GetActionResult`), so a result's output that is only in a pack
+//! is held.
 
 use std::sync::Arc;
 
@@ -21,12 +23,12 @@ use crate::input_walk::Blobs;
 use crate::proxy::Packs;
 
 /// A refusal of the packs as the store's: it could not answer.
-fn unavailable(status: Status) -> StorageError {
+pub(super) fn unavailable(status: Status) -> StorageError {
     StorageError::Unavailable(Arc::new(status))
 }
 
 /// `packs` first, then `rest`.
-pub(super) struct Layered<'a> {
+pub(crate) struct Layered<'a> {
     pub packs: &'a Packs,
     pub rest: &'a dyn Blobs,
 }
@@ -59,7 +61,7 @@ impl Blobs for Layered<'_> {
 /// The router as the store's own `find_missing` and `read_blob` ask it: a digest is asked of
 /// its primary, not of every owner a read would try (which is how a walk of the inputs asks
 /// it).
-pub(super) struct Primary<'a>(pub &'a Router);
+pub(crate) struct Primary<'a>(pub &'a Router);
 
 impl Blobs for Primary<'_> {
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> BoxFuture<'a, Answer<Bytes>> {

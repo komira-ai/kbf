@@ -96,23 +96,44 @@ fn a_panic_in_one_image_verb_does_not_stop_the_next() {
     helper.image_setup(&img.spath("b")).unwrap();
 }
 
-/// Catches: two image verbs at once; the second waits for the first.
+/// Catches: two image verbs at once. A verb that does not hold the image lock while it
+/// works would let a second one run beside it; the lock is the only thing that makes
+/// the second wait. At each command a verb runs, a second thread tries the lock and
+/// must find it taken, so every command ran under the lock (no sleep, no race).
 #[test]
 fn image_verbs_run_one_at_a_time() {
     let img = img("serial");
     img.bundle("b");
-    let held = img.rig.helper.one_image_job();
     let helper = &img.rig.helper;
     let path = img.spath("b");
-    std::thread::scope(|scope| {
-        let second = scope.spawn(|| helper.image_setup(&path));
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(
-            img.commands().is_empty(),
-            "ran while another verb held the lock"
-        );
-        drop(held);
-        second.join().unwrap().unwrap();
+    let (ask, asked) = std::sync::mpsc::channel::<()>();
+    let (answer, answers) = std::sync::mpsc::channel::<()>();
+    // The verb waits in the hook until the other thread has looked at the lock.
+    img.rig.host.state().on_command = Some(Box::new(move |_| {
+        ask.send(()).unwrap();
+        answers.recv().unwrap();
+    }));
+    let free = std::thread::scope(|scope| {
+        let checker = scope.spawn(|| {
+            let mut free = Vec::new();
+            for () in asked {
+                free.push(helper.images.try_lock().is_ok());
+                answer.send(()).unwrap();
+            }
+            free
+        });
+        helper.image_setup(&path).unwrap();
+        // Drops the hook, and with it the sender the checker is reading.
+        img.rig.host.state().on_command = None;
+        checker.join().unwrap()
     });
     assert_eq!(img.commands().len(), 3);
+    assert_eq!(
+        free, [false; 3],
+        "the lock was taken at every command the verb ran"
+    );
+    assert!(
+        helper.images.try_lock().is_ok(),
+        "the verb released the lock"
+    );
 }

@@ -53,6 +53,7 @@ fn the_pack_flags_are_off_unless_the_endpoint_is_given() {
         "--pack-store-region=eu-west-1",
         "--pack-inflight-bytes=67108864",
         "--pack-upload-idle-timeout=5",
+        "--pack-commit-sample=5",
     ];
     assert_eq!(parsed(&companions).expect("parses").packs, None);
 }
@@ -105,7 +106,8 @@ fn the_flags_need_each_other() {
 
 /// Asserts that the flags make the setting they say, and that the defaults are the frontend's:
 /// packs closed at 32 MiB, room for 1 GiB of uploads in flight, an idle timeout of 30 seconds,
-/// the writer called `frontend`, the region `us-east-1`, no cache.
+/// the writer called `frontend`, the region `us-east-1`, no cache, two blobs of a committed pack
+/// checked.
 #[test]
 fn the_flags_make_the_setting() {
     let plain = parsed(&STORE).expect("parses").packs.expect("packs");
@@ -121,6 +123,7 @@ fn the_flags_make_the_setting() {
             upload_idle_timeout: kbf_front::DEFAULT_UPLOAD_IDLE_TIMEOUT,
             writer: "frontend".to_owned(),
             cache: None,
+            commit_sample: 2,
         }
     );
     let mut more = STORE.to_vec();
@@ -132,16 +135,47 @@ fn the_flags_make_the_setting() {
         "--pack-writer=fe7",
         "--pack-cache-dir=/var/cache/packs",
         "--pack-cache-bytes=1000000",
+        "--pack-commit-sample=9",
     ]);
     let set = parsed(&more).expect("parses").packs.expect("packs");
     assert_eq!(set.region, "eu-west-1");
     assert_eq!((set.pack_bytes, set.writer.as_str()), (4096, "fe7"));
     assert_eq!(set.inflight_bytes, 128 << 20);
     assert_eq!(set.upload_idle_timeout, Duration::from_secs(7));
+    assert_eq!(set.commit_sample, 9);
     assert_eq!(
         set.cache,
         Some((PathBuf::from("/var/cache/packs"), 1_000_000))
     );
+}
+
+/// Asserts the bounds of `--pack-commit-sample`: 2 by default; 0, which checks no blob, only when
+/// given as a value; 16384, the most blobs a pack holds (so that every blob is checked), at
+/// most; and a number that is negative, past that or not a number is refused.
+#[test]
+fn the_commit_sample_is_two_unless_given_and_at_most_a_packs_blobs() {
+    let most = i64::try_from(kbf_front::MAX_COMMIT_BLOBS);
+    assert_eq!(most.expect("small"), MAX_COMMIT_SAMPLE);
+    let sample = |given: &'static str| {
+        let mut more = STORE.to_vec();
+        more.push(given);
+        parsed(&more).map(|flags| flags.packs.expect("packs").commit_sample)
+    };
+
+    let default = parsed(&STORE).expect("parses").packs.expect("packs");
+    assert_eq!(default.commit_sample, 2);
+    let none = sample("--pack-commit-sample=0");
+    assert_eq!(none.expect("parses"), 0);
+    let every = sample("--pack-commit-sample=16384");
+    assert_eq!(every.expect("parses"), 16384);
+    for bad in [
+        "--pack-commit-sample=16385",
+        "--pack-commit-sample=-1",
+        "--pack-commit-sample=all",
+    ] {
+        let refused = sample(bad).expect_err("refused");
+        assert_eq!(refused.kind(), ErrorKind::ValueValidation, "{bad}");
+    }
 }
 
 /// Asserts the bounds of the room and idle-timeout flags: the room is refused below the largest
@@ -234,6 +268,7 @@ fn flags(dir: &Path) -> PackFlags {
         upload_idle_timeout: Duration::from_secs(5),
         writer: "fe1".to_owned(),
         cache: None,
+        commit_sample: 2,
     }
 }
 
@@ -290,6 +325,25 @@ fn packs_need_both_the_flags_and_the_index() {
     let said = open(Some(&flags), None).expect_err("no index").to_string();
     assert!(said.contains("--pack-index"), "{said}");
     assert!(open(Some(&flags), Some(&index)).expect("both").is_some());
+}
+
+/// Asserts when a frontend commits a daemon's packs: with packs and the flags that made them
+/// both, and with neither alone; and that the commits check as many blobs as
+/// `--pack-commit-sample` says.
+#[test]
+fn a_frontend_commits_packs_only_with_the_packs_and_their_flags() {
+    let dir = scratch_dir("pack-commits");
+    let flags = PackFlags {
+        commit_sample: 7,
+        ..flags(dir.path())
+    };
+    let packs = flags.open(index()).expect("opens");
+
+    let both = commits(Some(&packs), Some(&flags)).expect("both");
+    assert_eq!(both.sample(), 7);
+    assert!(commits(Some(&packs), None).is_none());
+    assert!(commits(None, Some(&flags)).is_none());
+    assert!(commits(None, None).is_none());
 }
 
 /// Asserts that a boot id is the start time in microseconds in hex, a dash, and the process id

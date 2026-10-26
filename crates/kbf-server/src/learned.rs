@@ -468,11 +468,20 @@ impl Learned {
     /// or a full batch does not. The caller puts the keys back with
     /// [`Learned::unwritten`] if the store refuses.
     pub fn due(&mut self) -> Vec<Row> {
+        self.batch(false)
+    }
+
+    /// [`Learned::due`] without the wait: the batch whatever the time since the last one.
+    pub fn due_now(&mut self) -> Vec<Row> {
+        self.batch(true)
+    }
+
+    fn batch(&mut self, now: bool) -> Vec<Row> {
         let waited = self
             .now
             .as_millis()
             .saturating_sub(self.flushed.as_millis());
-        if self.off() || (waited < FLUSH_EVERY_MS && self.dirty.len() < BATCH) {
+        if self.off() || (!now && waited < FLUSH_EVERY_MS && self.dirty.len() < BATCH) {
             return Vec::new();
         }
         self.flushed = self.now;
