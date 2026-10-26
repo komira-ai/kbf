@@ -405,6 +405,26 @@ async fn a_frontend_exports_the_pack_reads_its_daemons_report() {
     served.abort();
 }
 
+/// Asserts that a frontend writes `kbf_execute_failed_actions_total` on `GET /metrics` with a
+/// series of each of the four classes at 0 before any Execute, the page the beta gate reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_exports_its_failed_actions_by_class() {
+    let flags = flags_of(&[]);
+    let handle = started(&flags, Some(index())).expect("starts");
+    let api = handle.api.expect("the operator API");
+    let served = tokio::spawn(handle.serve());
+    let text = scrape(api).await;
+    assert!(
+        text.contains("# TYPE kbf_execute_failed_actions_total counter\n"),
+        "{text}"
+    );
+    for class in ["farm", "request", "action", "ambiguous"] {
+        let sample = format!("kbf_execute_failed_actions_total{{class=\"{class}\"}} 0\n");
+        assert!(text.contains(&sample), "{sample}{text}");
+    }
+    served.abort();
+}
+
 /// Asserts that a frontend puts the pack-write counts its daemons send on their heartbeats on
 /// `GET /metrics`: none before a daemon has sent any, a sample per node and per fallback reason
 /// for the node that sent them, none for a node that sent read counts only, and no write sample

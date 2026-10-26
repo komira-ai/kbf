@@ -1138,7 +1138,7 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
 /// `GET /metrics`: what the service counts, in the Prometheus text format, history's
 /// counters when it keeps history, the storage health of `members` when there are any, the
 /// reloads of the listeners' `tls` files, the counters of the `packs` when there are any, and
-/// the pack reads the daemons of `farm` report.
+/// the pack reads the daemons of `farm` report and its failed actions by class.
 fn metrics_route(
     backend: Backend,
     history: Option<Arc<crate::history::Stats>>,
@@ -1158,6 +1158,7 @@ fn metrics_route(
             }
             Packs::render_metrics_of(packs.as_ref(), &mut text);
             crate::pack_daemon_metrics::render_farm(&mut text, &farm);
+            farm.failed_actions().render(&mut text);
             crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);
             ([(CONTENT_TYPE, crate::metrics::TEXT_FORMAT)], text)

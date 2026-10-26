@@ -893,10 +893,10 @@ capability.
 
 ## 9. Metrics
 
-No metrics endpoint exists; these are what one would carry, labelled by platform and
+`kbf_execute_failed_actions_total{class}` exists (`docs/api.md#get-metrics`): operations finished as failed, per class, with no `reason` label. The rest is what one would carry, labelled by platform and
 node:
 
-- `kbf_results_total{class, reason}`
+- `kbf_results_total{class, reason}`, which would add the reason to the counter above
 - `kbf_farm_reruns_total{reason}` and runs per finished operation
 - `kbf_capability_ready{capability}` (gauge) and `kbf_probe_runs_total{probe, result}`
 - `kbf_signature_matches_total{signature, proven}`
