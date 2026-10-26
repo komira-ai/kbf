@@ -423,9 +423,8 @@ fn the_shadow_totals_print_each_level_and_bucket_under_its_own_label() {
 /// to the requests.
 ///
 /// Catches: two causes swapped, a status read as a drop, a drop with no connection read
-/// as an abort, and an answer counted as an error. Mutants: swap the abort and dropped
-/// arms of `OpenExecute::cause`, test `is_gone` the wrong way round, ignore `failed`: each
-/// goes red here.
+/// as an abort, and an answer counted as an error: the abort and dropped arms of
+/// `OpenExecute::cause` swapped, `is_gone` tested the wrong way round, `failed` ignored.
 #[test]
 fn each_end_of_an_execute_has_its_own_cause() {
     use kbf_tls::Liveness;
@@ -491,8 +490,8 @@ fn each_end_of_an_execute_has_its_own_cause() {
 /// error, with the labels spelled as the dashboards and the gate read them.
 ///
 /// Catches: a cause series absent until first bumped (an absent series would read as a
-/// bug to the gate), a renamed label value, and an unlabeled series left beside them.
-/// Mutant: render only non-zero causes: goes red.
+/// bug to the gate), a renamed label value, an unlabeled series left beside them, and
+/// a cause series rendered only when non-zero.
 #[test]
 fn every_cause_is_rendered_from_the_start() {
     let metrics = Arc::new(ExecuteMetrics::default());

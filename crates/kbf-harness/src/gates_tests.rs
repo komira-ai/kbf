@@ -259,8 +259,8 @@ fn the_execute_error_counter_is_a_delta() {
 /// Asserts that the execute-errors gate reads the sum of the frontend's `cause` series, and
 /// goes red when any one of them moves, a client abort included (no cause is a pass).
 ///
-/// Catches: a gate that reads one cause only, or that excuses `client_abort`. Mutant: read
-/// only the `status` series: the other two cases go red.
+/// Catches: a gate that reads one cause only, or that excuses `client_abort` (reading
+/// only the `status` series, say).
 #[test]
 fn any_one_execute_error_cause_moving_fails_the_gate() {
     let series = |cause: &str| format!("{EXECUTE_ERRORS}{{cause=\"{cause}\"}}");
@@ -296,8 +296,8 @@ fn execute_errors_detail(run: &Run) -> String {
 /// report says whether platform errors or client aborts turned it red, and that the
 /// verdict is still the sum's.
 ///
-/// Catches: a detail that gives only the summed delta. Mutant: leave the per-series part
-/// out of `execute_errors_gate`: this goes red.
+/// Catches: a detail that gives only the summed delta, with the per-series part left out
+/// of `execute_errors_gate`.
 #[test]
 fn a_red_execute_errors_gate_names_the_causes_that_moved() {
     let series = |cause: &str| format!("{EXECUTE_ERRORS}{{cause=\"{cause}\"}}");
@@ -331,8 +331,8 @@ fn a_red_execute_errors_gate_names_the_causes_that_moved() {
 /// scrapes) keeps its own reason as the detail, with no per-series part; and that a cause
 /// series missing from the last scrape only is left out of the part of the others.
 ///
-/// Catches: a per-series part made of series that cannot be read. Mutant: treat an absent
-/// last value as 0: this goes red.
+/// Catches: a per-series part made of series that cannot be read, as when an absent last
+/// value is treated as 0.
 #[test]
 fn an_unmeasured_execute_errors_gate_has_no_per_series_part() {
     let mut run = pass();

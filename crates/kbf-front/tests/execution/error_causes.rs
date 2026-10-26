@@ -70,8 +70,8 @@ async fn relay(
 /// server ends (its operation abandoned).
 ///
 /// Catches: a status counted as a client abort or a drop, and a status that bumps two
-/// series. Mutant: classify by the connection alone (every non-ok end `dropped` or
-/// `client_abort`): this goes red.
+/// series: every non-ok end classified by the connection alone (`dropped` or
+/// `client_abort`).
 #[tokio::test]
 async fn an_error_status_counts_as_status() {
     let script = Arc::new(Script::default());
@@ -104,8 +104,7 @@ async fn an_error_status_counts_as_status() {
 /// other cause.
 ///
 /// Catches: a denied call counted as a client abort, or as a drop when the connection is
-/// gone. Mutant: remove the `inspect_err` that fails the guard in `execute`: this goes
-/// red.
+/// gone: the guard in `execute` not failed by the refusal (the `inspect_err` removed).
 #[tokio::test]
 async fn a_denied_execute_counts_as_status() {
     let mut policy = Policy::allow_all();
@@ -124,8 +123,8 @@ async fn a_denied_execute_counts_as_status() {
 /// Asserts that a client that drops its stream while its connection stays (it resets the
 /// stream) counts under `cause="client_abort"` only.
 ///
-/// Catches: an abort counted as a drop or an error. Mutant: swap the two causes in
-/// `OpenExecute::cause`: this goes red.
+/// Catches: an abort counted as a drop or an error, as when the two causes are swapped in
+/// `OpenExecute::cause`.
 #[tokio::test]
 async fn a_client_that_gives_up_counts_as_a_client_abort() {
     let script = Arc::new(Script::default());
@@ -145,8 +144,8 @@ async fn a_client_that_gives_up_counts_as_a_client_abort() {
 /// Asserts that a stream whose connection is lost under it, with no reset, counts under
 /// `cause="dropped"` only.
 ///
-/// Catches: a lost connection counted as the client's choice. Mutant: swap the two causes
-/// in `OpenExecute::cause`, or never mark the connection gone: this goes red.
+/// Catches: a lost connection counted as the client's choice, whether the two causes are
+/// swapped in `OpenExecute::cause` or the connection is never marked gone.
 #[tokio::test]
 async fn a_lost_connection_counts_as_dropped() {
     let script = Arc::new(Script::default());
@@ -182,9 +181,8 @@ async fn a_lost_connection_counts_as_dropped() {
 /// cause, that every cause is rendered at 0, and that causes and answers add up to the
 /// requests.
 ///
-/// Catches: `ok` set too early or late; a cause series missing until it is first
-/// bumped. Mutant: set `ok` when the stream is made: the abort and status tests go red;
-/// render a cause only when non-zero: this goes red.
+/// Catches: `ok` set too early or late (when the stream is made, say); a cause series
+/// missing until it is first bumped, or rendered only when non-zero.
 #[tokio::test]
 async fn an_answered_execute_counts_under_no_cause() {
     let script = Arc::new(Script::default());

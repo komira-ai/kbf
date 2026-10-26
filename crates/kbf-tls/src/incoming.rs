@@ -115,17 +115,23 @@ impl AsyncRead for Conn {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        let room = buf.remaining();
         let before = buf.filled().len();
         let polled = match &mut this.io {
             Io::Plain(io) => Pin::new(io).poll_read(cx, buf),
             Io::Tls(io) => Pin::new(io).poll_read(cx, buf),
         };
         if let Poll::Ready(read) = &polled {
-            // Ready with nothing read is the end of the stream.
-            if read
-                .as_ref()
-                .map_or(true, |()| buf.filled().len() == before)
-            {
+            let ended = match read {
+                Err(_) => true,
+                // Ok with nothing read is the end of the stream, but only when the buffer
+                // had room: a read into no room completes the same way on a live stream.
+                Ok(()) => match room {
+                    0 => false,
+                    _ => buf.filled().len() == before,
+                },
+            };
+            if ended {
                 this.info.live.mark_gone();
             }
         }

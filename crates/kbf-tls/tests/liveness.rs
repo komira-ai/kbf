@@ -18,9 +18,8 @@ use tonic::transport::server::Connected as _;
 /// Asserts that a TLS connection is gone once its peer closes it (sends close_notify and
 /// shuts the socket).
 ///
-/// Kills: a TLS connection whose end of stream is not seen, so a lost connection is read
-/// as a client's abort. Mutant: mark gone in the `Plain` arm of `poll_read` only: this
-/// goes red.
+/// Catches: a TLS connection whose end of stream is not seen, so a lost connection is read
+/// as a client's abort (only the `Plain` arm of `poll_read` marking the connection gone).
 #[tokio::test]
 async fn a_tls_connection_is_gone_when_its_peer_closes_it() {
     let ca = ca("liveness CA");
@@ -38,8 +37,8 @@ async fn a_tls_connection_is_gone_when_its_peer_closes_it() {
 /// Asserts that a connection whose socket the peer resets is gone: the server's read
 /// fails.
 ///
-/// Kills: a read error taken for nothing, so that a reset connection stays live. Mutant:
-/// mark gone on a zero-length read only: this goes red.
+/// Catches: a read error taken for nothing, so that a reset connection stays live (only a
+/// zero-length read marking the connection gone).
 #[tokio::test]
 async fn a_connection_is_gone_when_its_socket_is_reset() {
     let mut server = echo(tcp(), None);
@@ -110,9 +109,8 @@ async fn gone_after_a_failed_write(vectored: bool) -> bool {
 /// Asserts that a connection is gone once a write to it fails, with no read having seen
 /// the peer go and the connection still open: the server pushes to a peer that has reset.
 ///
-/// Kills: a lost connection counted as a client's abort because h2's write failed before
-/// any read did. Mutant: drop the `mark_gone` after the write in `each_io!`: this goes
-/// red.
+/// Catches: a lost connection counted as a client's abort because h2's write failed before
+/// any read did (the `mark_gone` after the write in `each_io!` dropped).
 #[tokio::test]
 async fn a_connection_is_gone_when_a_write_fails() {
     assert!(gone_after_a_failed_write(false).await);
@@ -120,8 +118,8 @@ async fn a_connection_is_gone_when_a_write_fails() {
 
 /// Asserts the same for the vectored write h2 uses.
 ///
-/// Kills: a vectored write whose failure is not seen. Mutant: mark gone only in
-/// `poll_write`: this goes red.
+/// Catches: a vectored write whose failure is not seen (only `poll_write` marking the
+/// connection gone).
 #[tokio::test]
 async fn a_connection_is_gone_when_a_vectored_write_fails() {
     assert!(gone_after_a_failed_write(true).await);
@@ -130,8 +128,8 @@ async fn a_connection_is_gone_when_a_vectored_write_fails() {
 /// Asserts that a connection the server drops is gone though nothing was read or failed:
 /// the server-initiated close (a keepalive timeout) is told by the drop.
 ///
-/// Kills: a connection dropped by the server that stays live. Mutant: remove the `Drop`
-/// impl of `Conn`: this goes red.
+/// Catches: a connection dropped by the server that stays live (the `Drop` impl of `Conn`
+/// removed).
 #[tokio::test]
 async fn a_connection_the_server_drops_is_gone() {
     let tcp = tcp();
@@ -147,4 +145,38 @@ async fn a_connection_the_server_drops_is_gone() {
     assert!(!info.live.is_gone(), "a connection nobody has closed");
     drop(conn);
     assert!(info.live.is_gone());
+}
+
+/// Asserts that a read into a buffer with no room is not the end of the stream: the
+/// connection stays live, a read with room still returns what the peer sent, and only the
+/// peer's close then marks it gone.
+///
+/// Catches: a read that completes Ok with nothing filled because the buffer was full
+/// taken for the stream's end, so that a live connection is counted as gone (and an
+/// Execute that ends later as dropped instead of a client abort).
+#[tokio::test]
+async fn a_read_with_no_room_does_not_end_the_connection() {
+    let tcp = tcp();
+    let addr = tcp.local_addr().expect("local address");
+    let mut incoming = Incoming::new(tcp, None);
+    let mut peer = TcpStream::connect(addr).await.expect("connect");
+    let mut conn = incoming
+        .next()
+        .await
+        .expect("a connection")
+        .expect("accept");
+    let info = conn.connect_info();
+    // Data pending, so the read with no room completes at once.
+    peer.write_all(b"x").await.expect("write");
+    let empty = conn.read(&mut []).await.expect("a read with no room");
+    assert_eq!(empty, 0);
+    assert!(!info.live.is_gone(), "a read with no room says nothing");
+
+    let mut byte = [0u8; 1];
+    assert_eq!(conn.read(&mut byte).await.expect("read"), 1);
+    assert!(!info.live.is_gone(), "a read that returned data");
+
+    peer.shutdown().await.expect("close");
+    assert_eq!(conn.read(&mut byte).await.expect("read"), 0);
+    assert!(info.live.is_gone(), "the peer's close is the end");
 }
