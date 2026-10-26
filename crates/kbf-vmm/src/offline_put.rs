@@ -214,7 +214,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&outside).expect("r"), "host data");
         assert_eq!(mode_of(&outside), 0o600);
         let m = std::fs::symlink_metadata(root.join("etc/f")).expect("stat");
-        assert!(m.is_file() && !m.file_type().is_symlink());
+        assert!(m.is_file(), "a regular file, not a link");
     }
 
     /// Catches a link at the file that cannot be removed (the guest made it immutable)
