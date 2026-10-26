@@ -11,9 +11,10 @@ use std::io::{self, Read as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::{Fs, Op, Seen};
+use crate::pace::{Pace, Wall};
 
 /// `BOOTSTRAP_NOT_PRIVILEGED`: launchd (or the sandbox in its place) refused the
 /// name.
@@ -89,6 +90,11 @@ pub fn run(program: &str, args: &[String]) -> io::Result<Out> {
 /// # Errors
 /// The program could not be started.
 pub fn run_within(program: &str, args: &[String], within: Duration) -> io::Result<Out> {
+    run_paced(&Wall::new(), program, args, within)
+}
+
+/// [`run_within`] with the deadline read on `pace`.
+fn run_paced(pace: &dyn Pace, program: &str, args: &[String], within: Duration) -> io::Result<Out> {
     let (mut reader, writer) = io::pipe()?;
     let mut child = Command::new(program)
         .args(args)
@@ -103,17 +109,17 @@ pub fn run_within(program: &str, args: &[String], within: Duration) -> io::Resul
         let _ = reader.read_to_end(&mut bytes);
         let _ = send.send(bytes);
     });
-    let started = Instant::now();
+    let started = pace.now();
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break Some(status);
         }
-        if started.elapsed() > within {
+        if pace.now().saturating_sub(started) > within {
             let _ = child.kill();
             let _ = child.wait();
             break None;
         }
-        std::thread::sleep(Duration::from_millis(5));
+        pace.pause(Duration::from_millis(5));
     };
     let bytes = read
         .recv_timeout(Duration::from_secs(1))
@@ -497,6 +503,7 @@ pub fn bootstrap(fs: &dyn Fs, job: &Path) -> Seen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pace::Manual;
 
     /// Catches a `sandbox_check` that failed (-1, or any answer but 0 and 1) read as a
     /// denial, which would let the `lsopen` canary pass with its rule removed.
@@ -563,11 +570,22 @@ mod tests {
             run_within("/bin/ls", &["/nonexistent/kbf-door".into()], TOOL_WITHIN).expect("ls");
         assert!(out.code.is_some_and(|c| c != 0), "{out:?}");
         assert!(out.text.contains("kbf-door"), "{out:?}");
-        let started = Instant::now();
-        let slow =
-            run_within("/bin/sleep", &["30".into()], Duration::from_millis(100)).expect("sleep");
-        assert!(started.elapsed() < Duration::from_secs(10));
+        // The deadline is read on the test's clock: a `sleep 30` cannot exit before it runs
+        // out, and the test does not wait for it.
+        let pace = Manual::default();
+        let slow = run_paced(
+            &pace,
+            "/bin/sleep",
+            &["30".into()],
+            Duration::from_millis(100),
+        )
+        .expect("sleep");
         assert_eq!(slow.code, None);
+        assert_eq!(
+            pace.now(),
+            Duration::from_millis(105),
+            "killed at the first look past 100 ms"
+        );
         assert!(slow.text.contains("killed"), "{slow:?}");
         assert!(run("/nonexistent/tool", &[]).is_err());
     }
