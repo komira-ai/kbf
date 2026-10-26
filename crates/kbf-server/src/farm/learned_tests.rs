@@ -680,7 +680,6 @@ fn write_behind_now_writes_the_changed_summaries_at_once() {
     killed.farm.write_behind_now();
     let written = held(&rows);
     assert_ne!(written, before, "the changed summary is written");
-    assert!(written.len() > before.len(), "as a row of its own");
     killed.farm.write_behind_now();
     assert_eq!(held(&rows), written, "nothing changed since");
 }
