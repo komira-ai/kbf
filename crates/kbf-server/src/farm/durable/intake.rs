@@ -99,6 +99,8 @@ pub(in crate::farm) struct Intake {
     /// capacity), as the `session/` rows listed at the last poll: an in-memory view of
     /// whether another frontend has a worker that could take this one's queued work.
     pub(in crate::farm) remote: Vec<(kbf_caps::NodeCaps, kbf_types::Resources)>,
+    /// How many polls have run to the end ([`Farm::intake_polls`]).
+    polls: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for Intake {
@@ -112,6 +114,7 @@ impl Default for Intake {
             orphan_wait: ORPHAN_WAIT,
             epoch_ahead: None,
             remote: Vec::new(),
+            polls: tokio::sync::watch::Sender::new(0),
         }
     }
 }
@@ -239,6 +242,16 @@ impl Farm {
         }
     }
 
+    /// How many intake polls have run to the end, as a count that tells each poll as it
+    /// completes: a poll of a fenced farm counts (it ends at once, having taken nothing in),
+    /// and one that could not read the store does not. A test waits for polls by this event
+    /// instead of for a time. Poll `n + 2` of a count read at `n` began after the read, so
+    /// it saw everything written before it.
+    #[must_use]
+    pub fn intake_polls(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.lock().intake.polls.subscribe()
+    }
+
     /// The epoch the state store holds, if it is past the one this frontend serves, as the
     /// last intake poll read it: the operator raised it ([`Farm::bump_epoch`]), and this
     /// frontend serves the epoch it started under until it is restarted.
@@ -261,6 +274,7 @@ impl State {
     /// [`Farm::intake`] under the lock.
     pub(in crate::farm) fn take_intake(&mut self, now: FarmTime, served: u64) {
         if self.fenced {
+            self.count_poll();
             return;
         }
         let mut polled = None;
@@ -280,6 +294,14 @@ impl State {
         self.apply_floors(&polled.floors, &polled.key_floors);
         self.sweep_orphans();
         self.look_at_remote_sessions();
+        self.count_poll();
+    }
+
+    /// Counts one poll that ran to the end ([`Farm::intake_polls`]).
+    fn count_poll(&self) {
+        self.intake
+            .polls
+            .send_modify(|polls| *polls = polls.saturating_add(1));
     }
 
     /// Reads the daemons of the other frontends from the `session/` rows, and tells the

@@ -491,9 +491,19 @@ pub struct FrontendHandle {
     pack_index: Option<Arc<dyn PackIndex>>,
     /// The packs `--pack-store-endpoint` describes, if the flag was given.
     packs: Option<Packs>,
+    /// The count of intake polls the farm has run to the end ([`Farm::intake_polls`]).
+    intake_polls: tokio::sync::watch::Receiver<u64>,
 }
 
 impl FrontendHandle {
+    /// The count of intake polls this frontend's farm has run to the end
+    /// ([`Farm::intake_polls`]), told as each completes: a caller waits for polls by this
+    /// event and not by time.
+    #[must_use]
+    pub fn intake_polls(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.intake_polls.clone()
+    }
+
     /// The pack index `--pack-index` opened on the Postgres state store, or `None` without the
     /// flag. The worker listener's `PackIndex` service answers daemons from it, and with the
     /// pack store flags too, the frontend writes and reads it.
@@ -957,6 +967,7 @@ impl<'a> Prepared<'a> {
         }
         background.extend(enroll_renewal);
 
+        let intake_polls = farm.intake_polls();
         let shutdown = shutdown()?;
         let stopper = Arc::clone(&drain);
         let serving = async move {
@@ -1069,6 +1080,7 @@ impl<'a> Prepared<'a> {
             },
             pack_index,
             packs,
+            intake_polls,
         })
     }
 }

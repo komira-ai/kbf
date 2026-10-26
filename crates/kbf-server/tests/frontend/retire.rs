@@ -7,25 +7,15 @@
 
 use kbf_server::api::FRONTEND_RETIRE;
 use kbf_server::frontend::start_frontend;
-use kbf_server::{ServeError, StateStoreUri};
+use kbf_server::{Drain, ServeError, StateStoreUri};
 use kbf_state::postgres::{PostgresConfig, PostgresStore, TestDatabase, test_database};
 use serde_json::json;
 use support::done_within_quiet;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tonic::Code;
 
 use super::*;
-
-/// Waits until `look` says yes, for at most twenty seconds.
-pub(super) async fn until(what: &str, mut look: impl AsyncFnMut() -> bool) {
-    for _ in 0..1000 {
-        if look().await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("never happened: {what}");
-}
 
 pub(super) async fn readyz(api: SocketAddr) -> u16 {
     get(api, "/readyz").await.0
@@ -90,13 +80,31 @@ pub(super) async fn execute_refused(client: &Client, job: &Job) -> Option<Code> 
     }
 }
 
+/// Waits until `member` has run `more` intake polls to the end beyond the ones counted now:
+/// the last of them began after this call, so it saw what was written to the state store
+/// before it.
+pub(super) async fn polled(member: &Member, more: u64) {
+    let mut polls = member.polls.clone();
+    let target = polls.borrow_and_update().saturating_add(more);
+    let waiting = polls.wait_for(|seen| *seen >= target);
+    let reached = tokio::time::timeout(Duration::from_secs(30), waiting).await;
+    let seen = reached.expect("the polls run in time");
+    seen.expect("the frontend is alive");
+}
+
 /// A frontend serving in this test, until its stop signal is given.
 pub(super) struct Member {
     pub(super) reapi: SocketAddr,
     pub(super) worker: SocketAddr,
     pub(super) api: SocketAddr,
+    /// The frontend's drain: the events of its phases, and the ends of its two waits.
+    pub(super) drain: Arc<Drain>,
+    /// Counts the intake polls the frontend has run to the end.
+    pub(super) polls: watch::Receiver<u64>,
     stop: Option<oneshot::Sender<()>>,
     pub(super) served: JoinHandle<Result<(), ServeError>>,
+    /// Becomes true when the serving future has returned.
+    ended: watch::Receiver<bool>,
 }
 
 impl Member {
@@ -110,12 +118,22 @@ impl Member {
         })
         .expect("starts");
         let (reapi, worker, api) = (handle.reapi, handle.worker, handle.api);
+        let (drain, polls) = (handle.drain(), handle.intake_polls());
+        let (finish, ended) = watch::channel(false);
+        let serving = async move {
+            let served = handle.serve().await;
+            finish.send_replace(true);
+            served
+        };
         Self {
             reapi,
             worker,
             api: api.expect("the operator API"),
+            drain,
+            polls,
             stop: Some(stop),
-            served: tokio::spawn(handle.serve()),
+            served: tokio::spawn(serving),
+            ended,
         }
     }
 
@@ -124,8 +142,21 @@ impl Member {
         drop(self.stop.take());
     }
 
-    /// Stops the frontend and waits until it has ended.
+    /// Waits until the frontend has stopped serving, which the end of its serving future
+    /// tells; for at most thirty seconds, which only a hang reaches.
+    pub(super) async fn exits(&self) {
+        let mut ended = self.ended.clone();
+        let waiting = ended.wait_for(|done| *done);
+        let exited = tokio::time::timeout(Duration::from_secs(30), waiting);
+        let told = exited.await.expect("the frontend exits in time");
+        told.expect("the serving task told its end");
+    }
+
+    /// Stops the frontend and waits until it has ended. Its two drain waits are ended first,
+    /// so a frontend that has not drained goes through its sequence at once.
     async fn stop(mut self) {
+        self.drain.end_lb_wait();
+        self.drain.end_deadline();
         self.signal();
         let ended = tokio::time::timeout(Duration::from_secs(30), self.served).await;
         let served = ended.expect("the frontend ends").expect("its task");
@@ -286,10 +317,8 @@ async fn a_retired_frontend_hands_its_daemon_to_the_other_and_still_answers_its_
     assert_eq!(code, 200, "{retired}");
     assert_eq!(retired["retired"], true, "{retired}");
     assert_eq!(retired["open_streams"], 1, "{retired}");
-    until("its worker listener is closed", async || {
-        refused(a.worker).await
-    })
-    .await;
+    // The listener is closed before the retire answers.
+    assert!(refused(a.worker).await, "its worker listener is open");
     let (code, again) = retire(a.api).await;
     assert_eq!(code, 200, "{again}");
     assert_eq!(again, retired, "a second retire changed the status");
@@ -362,20 +391,17 @@ async fn a_retired_frontend_takes_no_more_work_in_from_the_store() {
     client.upload(&first.blobs()).await;
     client.upload(&second.blobs()).await;
     let mut early = client.execute(&first.action).await;
-    until("the first frontend takes the operation in", async || {
-        queued(a.api).await == 1
-    })
-    .await;
+    early.message().await.expect("healthy").expect("QUEUED");
+    polled(a, 2).await;
+    assert_eq!(queued(a.api).await, 1, "the first frontend took it in");
 
     let (code, retired) = retire(a.api).await;
     assert_eq!(code, 200, "{retired}");
     let mut late = client.execute(&second.action).await;
-    until("the second operation is queued", async || {
-        pair.count("queue/") == 2
-    })
-    .await;
-    // Several intake polls of the first frontend.
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    late.message().await.expect("healthy").expect("QUEUED");
+    // The last of two intake polls of the retired frontend began after the operation was
+    // queued; a retired frontend's poll ends at once, having taken nothing in.
+    polled(a, 2).await;
     assert_eq!(queued(a.api).await, 1, "the retired frontend took work in");
     assert_eq!(queued(b.api).await, 2);
 
