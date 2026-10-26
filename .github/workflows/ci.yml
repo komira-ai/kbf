@@ -185,6 +185,13 @@ jobs:
       - run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --version
       - name: Install cargo-nextest (pinned version and checksum)
         run: cargo "+$COVERAGE_TOOLCHAIN" xtask fetch --url "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/cargo-nextest-$NEXTEST_VERSION-x86_64-unknown-linux-gnu.tar.gz" --sha256 "$NEXTEST_SHA256" --out "$HOME/.cargo/bin/cargo-nextest" --extract tar.gz --member cargo-nextest
+      # The `test` job's cache key began with the prefix `cargo-<os>-<arch>-test-`, and beta.yml's
+      # `test-x86` job saves a cache under `cargo-<os>-<arch>-test-x86-` (its plain build of the
+      # workspace, 53 GB once restored). The restore-key prefix matched it, so the root disk held
+      # that build and the instrumented one (59 GB): 120 GB free before the tests, 5.6 GB after,
+      # under the 5% floor of the file store, and about 30 tests failed with
+      # "Unavailable(Store(Transport(Full ...". The key below is this job's own, so no other
+      # job's cache is restored here.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
@@ -192,8 +199,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+          key: cargo-coverage-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-coverage-${{ runner.os }}-${{ runner.arch }}-
       # The cache holds target/, and a push run left the WORKSPACE's instrumented test binaries
       # and coverage profiles in target/llvm-cov-target. `llvm-cov report` reads every
       # instrumented binary and profile there, so a run that restored them merged a binary built
@@ -225,6 +232,12 @@ jobs:
       # `--features tierstore/s3` puts the object store library's S3 backend (off by default; the
       # crate's own tests turn it on through `server`) into the run whichever way they are built,
       # so its tests count toward the 99% of tierstore.
+      # The instrumented build (about 59 GB measured), the tests' temporary files under it and
+      # the file store's 5% free-space floor (about 7.5 GB on this disk) need the room below.
+      # Short here means the restored cache or the image grew: the step says so and stops,
+      # instead of about 30 tests failing with "Full".
+      - name: Refuse early when the disk is short for the tests (80 GiB free)
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --path . --min-free-gb 80
       - name: Run the fast tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
