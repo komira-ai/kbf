@@ -327,7 +327,8 @@ jobs:
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - run: cargo clippy -p kbf-state --features postgres --all-targets --locked -- -D warnings
-      - run: cargo test -p kbf-state --features postgres --locked -- --include-ignored
+      # The write-rate measurement (tests/postgres_write_rate.rs) is read by a person, not a gate.
+      - run: cargo test -p kbf-state --features postgres --locked -- --include-ignored --skip the_write_rate_of_one_two_and_three_frontends
       # The installer's `setup` and update step over a real schema (crates/kbf-setup/src/database_tests.rs).
       - run: 'cargo test -p kbf-setup --features proxy --locked --lib -- --include-ignored database:: setup_creates_the_schema'
       - run: 'cargo test -p kbf-installer --locked --lib --test binary -- --include-ignored database:: setup_creates_the_schema'
