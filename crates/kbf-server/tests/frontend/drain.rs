@@ -189,9 +189,25 @@ async fn assert_refused_after_the_wait(client: &Client, job: &Job) {
     );
 }
 
-/// How the HTTP/2 layer words a call ended by the peer's GOAWAY with NO_ERROR, the code the
-/// frontend's drain sends: the only INTERNAL that is a refusal after the wait.
+/// How h2 words the error of a call ended by the peer's GOAWAY with NO_ERROR, the code the
+/// frontend's drain sends: the only INTERNAL that is a refusal after the wait. hyper wraps that
+/// error, so it is in the status's chain of sources, not in its message ("h2 protocol error:
+/// http2 error", as CI showed).
 const GOAWAY_NO_ERROR: &str = "connection error received: not a result of an error";
+
+/// Whether an error in the chain of sources of `status` is the peer's GOAWAY with NO_ERROR. A
+/// GOAWAY with an error code, a local protocol error and an INTERNAL from the service carry no
+/// such source.
+fn ended_by_goaway_no_error(status: &tonic::Status) -> bool {
+    let mut next = std::error::Error::source(status);
+    while let Some(error) = next {
+        if error.to_string().contains(GOAWAY_NO_ERROR) {
+            return true;
+        }
+        next = error.source();
+    }
+    false
+}
 
 /// Whether `status` is how the frontend's refusal of new work after the wait reaches a client:
 /// UNAVAILABLE from the service, CANCELLED by the GOAWAY, or a call the GOAWAY (NO_ERROR)
@@ -199,7 +215,7 @@ const GOAWAY_NO_ERROR: &str = "connection error received: not a result of an err
 fn is_a_refusal(status: &tonic::Status) -> bool {
     match status.code() {
         Code::Unavailable | Code::Cancelled => true,
-        Code::Internal => status.message().contains(GOAWAY_NO_ERROR),
+        Code::Internal => ended_by_goaway_no_error(status),
         _ => false,
     }
 }
