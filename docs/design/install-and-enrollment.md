@@ -432,8 +432,10 @@ advertised from its row, cannot find its storage member. `POST /v1/enroll/nodes/
 (`docs/api.md`) writes the same `enroll/node/<id>` row and `enroll/adv/<address>` row as an
 enrollment, in one transaction, with the same checks on the id, the roles and the address, but
 with no token, no certificate and so no serial or key rows. The row lists `adopted` as its
-token and carries the roles in a field of its own, since an enrolled row's roles are its
-certificates'. Such a row is never renewed, and revoking it denies the node id alone.
+token and holds one placeholder certificate entry per role (the role, a zero key hash, no
+serial, expiry 0), because an enrolled row's roles are read from its certificates and a
+frontend from before adoption reads no other way. Such a row is never renewed, and revoking it
+denies the node id alone.
 
 ### 5.8 Renewal
 

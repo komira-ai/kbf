@@ -177,10 +177,6 @@ pub(crate) struct NodeRow {
     /// What the host runs, for an updater's row (copied from its token when it enrolled).
     #[prost(string, optional, tag = "12")]
     pub host_role: Option<String>,
-    /// The roles of a node adopted without a certificate; empty for an enrolled node, whose
-    /// roles are its certificates'. A row with any is an adopted row.
-    #[prost(string, repeated, tag = "13")]
-    pub adopted_roles: Vec<String>,
 }
 
 /// `enroll/serial/<hex>`.

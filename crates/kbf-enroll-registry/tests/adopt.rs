@@ -9,7 +9,7 @@ use kbf_enroll_registry::{
     ADOPTED, NodeState, RegistryError, RenewCsr, RenewRequest, adopt_node, deny_rows, list_nodes,
     renew_txn, revoke_node,
 };
-use kbf_state::Op;
+use kbf_state::{Cond, Op, Txn};
 use kbf_types::{
     RefusalReason,
     Role::{Daemon, Storage, Updater},
@@ -286,4 +286,23 @@ fn a_replacing_token_enrolls_over_an_adopted_node() {
     assert!(!n.token_id.is_empty());
     assert_ne!(n.token_id, ADOPTED);
     assert_ne!(n.not_after, 0);
+}
+
+// Catches a request already served answering as replayed from a node row that is an adopted
+// one: an adopted row holds no certificate to return, so the request is decided afresh and
+// the id, which is taken, is refused.
+#[test]
+fn a_served_request_is_never_replayed_from_an_adopted_row() {
+    let env = fake();
+    make_token(&env, 1, &spec(&[Daemon], 5));
+    let req = Req::new(1, "n1", &[Daemon]);
+    req.enroll(&env, 1).expect("enroll");
+    assert!(req.enroll(&env, 1).expect("replay").replayed);
+    // The enrolled row goes (an operator purge); the id is adopted in its place.
+    env.store
+        .txn(Txn::new().delete("enroll/node/n1", Cond::Any))
+        .expect("store")
+        .expect("delete");
+    adopt_node(&*env.store, &node("n1"), roles(&[Daemon]), "").expect("adopt");
+    assert_eq!(req.enroll(&env, 1), Err(RefusalReason::NodeIdInUse));
 }

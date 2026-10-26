@@ -21,7 +21,7 @@ use subtle::{Choice, ConstantTimeEq as _};
 use crate::ATTEMPTS;
 use crate::error::Fail;
 use crate::host::is_host;
-use crate::nodes::{NodeState, deny_keys, state_of, with_deny_rows};
+use crate::nodes::{NodeState, deny_keys, is_adopted, state_of, with_deny_rows};
 use crate::rows::{self, CertRow, NodeRow, OwnerRow, Read, STATE_ACTIVE, SerialRow, TokenRow};
 use crate::tokens::secret_digest;
 
@@ -267,7 +267,10 @@ fn replay(
         return Ok(None);
     };
     let certs = stored_certs(&node.row)?;
-    let live = state_of(&node.row)? == NodeState::Active && certs.iter().all(|c| c.not_after > now);
+    // An adopted row holds no certificate to answer with.
+    let live = state_of(&node.row)? == NodeState::Active
+        && !is_adopted(&node.row)
+        && certs.iter().all(|c| c.not_after > now);
     Ok(live.then_some(Enrolled {
         replayed: true,
         certs,

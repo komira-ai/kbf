@@ -847,7 +847,7 @@ a `409`. The answer is the node as the listing shows it: `active`, with `token_i
 `token_label` both `adopted`, `not_after` `0` (it holds no certificate) and no
 `last_renewed_at`. The call issues no certificate and writes no serial or key. An adopted
 node never renews (a renewal of it is refused as `unknown_node`); revoking it marks it
-`revoked` and writes one deny row, for the node id. A token with `replace` can enroll over
+`revoked` and writes one deny row, for the node id (which refuses the node's existing operator-issued certificates, as for an enrolled node). A token with `replace` can enroll over
 an adopted id, which then becomes an enrolled node.
 
 **Failures.** `400` for a body or value the registry refuses, `404` (above), `409` when

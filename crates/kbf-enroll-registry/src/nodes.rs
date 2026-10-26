@@ -9,7 +9,8 @@ use crate::ATTEMPTS;
 use crate::enroll::advertise_of;
 use crate::error::{Corrupt, RegistryError};
 use crate::rows::{
-    self, DENY_PREFIX, DenyRow, NODE_PREFIX, NodeRow, OwnerRow, STATE_ACTIVE, STATE_REVOKED,
+    self, CertRow, DENY_PREFIX, DenyRow, NODE_PREFIX, NodeRow, OwnerRow, STATE_ACTIVE,
+    STATE_REVOKED,
 };
 
 /// Whether a node may renew and enroll.
@@ -57,11 +58,7 @@ pub(crate) fn state_of(row: &NodeRow) -> Result<NodeState, Corrupt> {
 }
 
 fn node_info(id: NodeId, row: &NodeRow) -> Result<NodeInfo, Corrupt> {
-    let names: Vec<String> = if row.adopted_roles.is_empty() {
-        row.certs.iter().map(|c| c.role.clone()).collect()
-    } else {
-        row.adopted_roles.clone()
-    };
+    let names: Vec<String> = row.certs.iter().map(|c| c.role.clone()).collect();
     Ok(NodeInfo {
         id,
         roles: rows::role_set(&names, "node")?,
@@ -79,6 +76,26 @@ fn node_info(id: NodeId, row: &NodeRow) -> Result<NodeInfo, Corrupt> {
 
 /// The `token_id` and `token_label` of a node adopted into the registry without a token.
 pub const ADOPTED: &str = "adopted";
+
+/// Whether `row` was written by [`adopt_node`]: no token made it, and its `certs` are
+/// placeholders.
+pub(crate) fn is_adopted(row: &NodeRow) -> bool {
+    row.token_id == ADOPTED
+}
+
+/// What an adopted row holds in `certs` for each role: the role, a key hash of 32 zero bytes,
+/// no serial, no certificate and `not_after` 0. A frontend from before adoption derives a
+/// row's roles and expiry from `certs` alone and cannot read a row that has none, so the
+/// placeholder keeps the row readable there: no expiry logic treats a certificate expired at
+/// 0 as live, no deny row is written for its empty serial, and the zero key hash (which no
+/// key has) is the only `spki-sha256` entry a revoke writes.
+fn placeholder_cert(role: &str) -> CertRow {
+    CertRow {
+        role: role.to_owned(),
+        spki_sha256: vec![0; 32],
+        ..CertRow::default()
+    }
+}
 
 /// Records a node that was provisioned before enrollment, so the registry knows its id and
 /// the storage address it advertises (the join of storage health and of safe-to-stop goes
@@ -137,7 +154,7 @@ pub fn adopt_node(
             token_label: ADOPTED.to_owned(),
             state: STATE_ACTIVE,
             created_at: rows::seconds(store.now()),
-            adopted_roles: roles.iter().map(|r| r.name().to_owned()).collect(),
+            certs: roles.iter().map(|r| placeholder_cert(r.name())).collect(),
             ..NodeRow::default()
         };
         let txn = txn.put(&node_key, row.encode_to_vec(), Cond::Absent);
@@ -208,8 +225,11 @@ pub(crate) fn deny_keys(id: &NodeId, row: &NodeRow, now: u64, with_node: bool) -
             .filter(|(_, not_after)| *not_after > now)
             .map(|(serial, _)| rows::deny_serial_key(serial)),
     );
-    for cert in &row.certs {
-        keys.push(rows::deny_spki_key(&cert.spki_sha256));
+    // An adopted row's placeholders hold no key.
+    if !is_adopted(row) {
+        for cert in &row.certs {
+            keys.push(rows::deny_spki_key(&cert.spki_sha256));
+        }
     }
     keys
 }
@@ -318,4 +338,52 @@ pub fn deny_rows(store: &dyn Store) -> Result<Vec<DenyRecord>, RegistryError> {
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use kbf_state::ManualClock;
+    use kbf_state::fake::{Fake, Flaw};
+    use kbf_types::Role;
+
+    use super::*;
+
+    // Pins the row's compatibility with a frontend from before adoption, which derives a row's
+    // roles and expiry from `certs` alone, decodes each key hash as 32 bytes, and on a revoke
+    // writes a deny row for every key hash and every serial that has not expired: the roles
+    // read from `certs` are the adopted ones, the expiry is 0, and a revoke by that logic
+    // writes keys `entry_of` can read and none for a serial.
+    #[test]
+    fn an_adopted_row_reads_as_before_adoption_for_roles_expiry_and_revoke() {
+        let store = Fake::with_flaw(Arc::new(ManualClock::default()), Flaw::None);
+        let id: NodeId = "s1".parse().expect("id");
+        let roles = RoleSet::new([Role::Storage, Role::Daemon]).expect("roles");
+        adopt_node(&store, &id, roles, "s1.example:7000").expect("adopt");
+        let row = rows::fetch::<NodeRow>(&store, &rows::node_key(&id), "node")
+            .expect("read")
+            .expect("row")
+            .row;
+        let names: Vec<String> = row.certs.iter().map(|c| c.role.clone()).collect();
+        assert_eq!(rows::role_set(&names, "node").expect("roles"), roles);
+        assert_eq!(row.certs.iter().map(|c| c.not_after).max(), Some(0));
+        assert!(row.certs.iter().all(|c| c.spki_sha256.len() == 32));
+        let mut old_keys = vec![rows::deny_node_key(&id)];
+        old_keys.extend(
+            row.certs
+                .iter()
+                .filter(|c| c.not_after > 1)
+                .map(|c| rows::deny_serial_key(&c.serial)),
+        );
+        old_keys.extend(
+            row.certs
+                .iter()
+                .map(|c| rows::deny_spki_key(&c.spki_sha256)),
+        );
+        for key in &old_keys {
+            entry_of(key).expect("a deny key the deny list reads");
+        }
+        assert!(old_keys.iter().all(|k| !k.starts_with("deny/serial/")));
+    }
 }
