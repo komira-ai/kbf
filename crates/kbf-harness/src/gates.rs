@@ -191,7 +191,7 @@ impl Evidence<'_> {
     }
 
     /// The gate on the failed-action counter of every class: the delta of each class's series
-    /// over the run, which is 0 when the load planted no failure. A class whose series is absent
+    /// over the run, which is 0 when the load caused no failure. A class whose series is absent
     /// from any scrape fails it, as for every series.
     fn failed_actions_gate(&self) -> Gate {
         let mut measured = serde_json::Map::new();

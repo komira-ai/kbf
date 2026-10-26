@@ -90,8 +90,10 @@ fn each_class_counts_into_its_own_series() {
 /// Asserts the class of each way an operation ends: an exit 0 is no failure, a non-zero
 /// exit, a timeout and a kill at the largest node's memory are the action's, an invalid
 /// action is the request's, and a farm fault, a lost input, an infra failure and a result
-/// the process never saw are the farm's. A mutant that labels everything `action` or
-/// drops the `exit_code` test fails one of these.
+/// the process never saw are the farm's.
+///
+/// Catches: labelling every failure `action`, or dropping the `exit_code` test, which would
+/// fail one of these.
 #[test]
 fn an_operation_is_classed_by_what_its_callers_are_told() {
     let completed = Outcome::Completed {
