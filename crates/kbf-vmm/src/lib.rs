@@ -23,8 +23,10 @@ pub mod sampler;
 pub mod signature;
 pub mod sink;
 pub mod spec;
+pub mod stage;
 pub mod system;
 pub mod volume;
+mod xattr;
 
 #[cfg(target_os = "macos")]
 mod offline;
@@ -43,3 +45,5 @@ mod fake;
 mod gates_tests;
 #[cfg(test)]
 mod probe_tests;
+#[cfg(test)]
+mod stage_tests;

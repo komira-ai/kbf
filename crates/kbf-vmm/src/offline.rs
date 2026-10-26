@@ -177,6 +177,39 @@ pub fn write(disk: &Path, files: &[OfflineFile]) -> Result<Value, String> {
     })
 }
 
+/// Attaches `disk`, stages Xcode and the simulator runtimes of `plan` into its Data
+/// volume as root, and detaches.
+///
+/// # Errors
+/// A step failed (the message says which); the image is detached whenever the attach worked.
+pub fn stage(disk: &Path, plan: &crate::stage::Plan) -> Result<Value, String> {
+    with_data_volume(disk, false, |root| {
+        let env = crate::stage::Env {
+            free_bytes: &crate::hostfs::free_bytes,
+            clone_tree: &clone_tree,
+            chown_root: &crate::hostfs::lchown_root,
+            remove: &crate::stage::remove_path,
+        };
+        Ok(json!({"staged": crate::stage::execute(root, plan, &env)?}))
+    })
+}
+
+/// `clonefile(2)` of a whole directory tree, not following a link at `src`. It fails with
+/// `EXDEV` when `dst` is on another volume, which is the usual case for a guest disk.
+fn clone_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let to_c = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_encoded_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    };
+    let (s, d) = (to_c(src)?, to_c(dst)?);
+    // SAFETY: both are NUL-terminated paths; `CLONE_NOFOLLOW` (1) clones a link as a link.
+    if unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), 1) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Attaches `disk` read-only, copies the allowlist from its Data volume into the new
 /// directory `out`, and detaches.
 ///

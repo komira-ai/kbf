@@ -555,6 +555,94 @@ fallback did, `force-stopped ...` when neither did), `stop.vsock_acked` and
 `shutdown-command` event, and `/var/log/com.kbf.probe.shutdown.log` in the harvest shows
 the listener's `bind` result and each connection.
 
+## E3: Xcode and simulator runtimes in the guest image
+
+The iOS simulator probe needs Xcode and a simulator runtime inside the guest. The base is
+sized for it when it is built, and `image setup` stages the two inputs as root while the
+guest is off:
+
+```sh
+sudo $D/kbf-vmm image base --ipsw <ipsw> --sha256 <digest> --out $W/base \
+  --cpus 6 --memory-mib 16384 --disk-gib 200
+sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest \
+  --xcode /Applications/Xcode.app --sim-runtime ~/Downloads/iOS_27_Simulator_Runtime.dmg \
+  | tee $W/e3-setup.json
+```
+
+- `--cpus`, `--memory-mib` and `--disk-gib` default to what they were before (the restore
+  image's minimums, at least 2 CPUs and 4096 MiB, and 64 GiB). A value below the restore
+  image's minimum is refused. The sizes the install used are written to `sizing.json` in
+  the base bundle.
+- `--xcode` clones the app into the guest's `/Applications/Xcode.app`. The guest disk is on
+  another volume than the app, so in practice this is a file-by-file copy (a tree clone is
+  tried first). Everything becomes owned by root:wheel; the setuid, setgid and sticky bits
+  are dropped on both paths, and so are group and world write (a source 0775 is staged
+  0755, 0666 is 0644; owner bits and the others are kept; a bundle's runtime files are
+  fixed at 0644 and its directories at 0755). The file-by-file copy writes the planned modes
+  and opens each
+  source without following a link, refusing a file that is no longer a regular file. A tree
+  clone copies the live tree, so it is walked again afterwards: it is refused unless it
+  holds exactly the planned entries (same kinds, link targets and file sizes) and then gets
+  the planned modes. Both paths keep extended attributes (the code signature of a file that
+  is not a Mach-O lives in `com.apple.cs.*` attributes; resource forks and Finder info can
+  matter too) except two. `com.apple.quarantine` would make the guest treat Xcode as
+  downloaded. `com.apple.macl` is a per-machine access list that SIP protects (root cannot
+  write it) and that means nothing on another machine; an App Store Xcode carries it on the
+  app root, so copying it would fail the stage. (The other attributes measured on such an
+  Xcode are `com.apple.appstore.metadata`, `.store_cohort`, `.storefront` and
+  `.vendor_name`, on the app root; they are copied.) The file-by-file copy copies every
+  attribute of a file (between the open files), a directory and a link (the link itself,
+  not what it points at) except those two, and the clone, which carries them, has both
+  removed from every node; if macOS refuses to remove `com.apple.macl` from the clone, that
+  one refusal is ignored. A refusal to remove or write any other attribute fails the stage. An
+  attribute list above 1 MiB or a value above 64 MiB fails the stage, naming the path,
+  rather than being skipped (a skipped part of a signature would leave an Xcode that fails
+  validation). Attributes are macOS-only code; other systems copy none. The new
+  copy is built under a staging name and renamed into place, so a failed run never leaves a
+  half Xcode.app under the real name; when the build or a check fails, the staging tree is
+  removed as well. A rerun removes the earlier copy and then renames the
+  new one in (a run that dies between the two leaves no Xcode.app), and it holds both
+  copies until then, so the free-space check, which counts the earlier copy as used, needs
+  room for both.
+- A symbolic link in the app is recreated, never followed, when its target stays inside the
+  app: relative with the `..` components first and no more than the link is deep, or an
+  absolute path into `/Applications/Xcode.app`. Any other link, a socket, a pipe or a
+  device is refused before the disk is touched. `--allow-external-links` copies such links
+  as links and lists them in the report.
+- `--sim-runtime` (repeatable, at most 8) takes either `<name>.dmg` (a file) or
+  `<name>.exportedBundle` (a directory, what `xcodebuild -downloadPlatform iOS -exportPath
+  <dir>` writes on current Xcode: `ExportedMetadata.plist` and a `Restore/` directory with
+  the cryptex image, its `.trustcache`, `.cryptex_info` and `.root_hash`, and
+  `BuildManifest.plist`/`Restore.plist`). The name is letters, digits, `.`, `_`, `-` plus
+  the suffix (at most 64 bytes, no `..`, not hidden). An image is copied to
+  `/private/var/kbf-sim/runtimes/<name>.dmg` while hashing it. A bundle is planned with the
+  same walk as Xcode.app (nothing followed; regular files and directories only; a link only
+  when its target stays inside the bundle; a socket, pipe or device refused; not
+  `--allow-external-links`), counted in the free-space check, and copied file by file to
+  `/private/var/kbf-sim/runtimes/<name>.exportedBundle`, each file hashed while it is
+  copied; directories become 0755, files 0644, owner root:wheel. An image is opened without
+  following a link and without blocking on a pipe, and must be a regular file. Each runtime
+  is built in `/private/var/kbf-sim/.runtimes.kbf-staging` (beside the runtime directory,
+  not in it, since the guest lists the directory) and renamed in when complete; if a build
+  fails, that directory is removed, so no partial runtime is ever listed. At most the planned
+  size of a file is copied (one byte more is read), and a source that grew or shrank fails
+  the stage. The runtime directory then holds
+  exactly the runtimes of the latest setup (a setup that names none empties it). The report
+  and `staged.json` record an image's kind, name, size and SHA-256, and a bundle's kind,
+  name, total size and a list of `{path, bytes, sha256}` for each file.
+- The free space of the guest's Data volume is read first. If Xcode and the runtimes plus
+  4 GiB of headroom do not fit, nothing is written and the error says what is needed, what
+  is free and to rebuild the base with a larger `--disk-gib`.
+- What was staged is also written into the guest as `/private/var/kbf-sim/staged.json`.
+- Every directory the copy writes through on the guest volume must be a plain directory; a
+  link or a file in the way is an error, so a guest that ran earlier cannot redirect the
+  root copy. A leftover in the way (an earlier Xcode.app, a runtime, a staging name,
+  `staged.json`) is removed without following a link, and a removal that fails (a file the
+  guest made immutable) stops the stage with an error naming the path. Files are created
+  exclusively (`staged.json` included) and their mode is set on the open file; a mode set
+  later on an existing path opens it without following a link; ownership is `lchown`. A
+  directory the stage creates on the way is given mode 0755 explicitly, whatever the umask.
+
 ## What to send back
 
 Everything the commands wrote, including each helper's log (the cause of a VM that did

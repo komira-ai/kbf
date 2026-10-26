@@ -20,7 +20,7 @@ use objc2_virtualization::{
 use serde_json::{Value, json};
 
 use super::{Queued, Shared, config, describe, new_machine_identifier, url};
-use crate::bundle::{AUX, DISK, FILES, HARDWARE_MODEL, MACHINE_ID};
+use crate::bundle::{AUX, DISK, FILES, HARDWARE_MODEL, MACHINE_ID, Sizing};
 use crate::spec::VmSpec;
 
 /// What the install queue keeps alive.
@@ -56,7 +56,8 @@ fn load(ipsw: &Path) -> Result<Shared<Retained<VZMacOSRestoreImage>>, String> {
 ///
 /// # Errors
 /// The restore image is unusable on this host or a step failed.
-pub fn install(ipsw: &Path, out: &Path, disk_gib: u64) -> Result<Value, String> {
+pub fn install(ipsw: &Path, out: &Path, sizing: &Sizing) -> Result<Value, String> {
+    let disk_gib = sizing.disk_gib;
     let began = Instant::now();
     let disk_bytes = disk_gib
         .checked_mul(1 << 30)
@@ -79,10 +80,35 @@ pub fn install(ipsw: &Path, out: &Path, disk_gib: u64) -> Result<Value, String> 
             );
         }
         let v = img.operatingSystemVersion();
-        (
-            model.dataRepresentation().to_vec(),
+        // The restore image's minimums are the defaults; a flag may ask for more, never less.
+        let (min_cpus, min_mem) = (
             req.minimumSupportedCPUCount().max(2),
             req.minimumSupportedMemorySize().max(4 << 30),
+        );
+        let cpus = match sizing.cpus {
+            Some(c) if (c as usize) < min_cpus => {
+                return Err(format!(
+                    "--cpus {c} is below the {min_cpus} this restore image needs"
+                ));
+            }
+            Some(c) => c as usize,
+            None => min_cpus,
+        };
+        let mem = match sizing.memory_mib.map(|m| m << 20) {
+            Some(m) if m < min_mem => {
+                return Err(format!(
+                    "--memory-mib {} is below the {} MiB this restore image needs",
+                    m >> 20,
+                    min_mem >> 20
+                ));
+            }
+            Some(m) => m,
+            None => min_mem,
+        };
+        (
+            model.dataRepresentation().to_vec(),
+            cpus,
+            mem,
             format!("{}.{}.{}", v.majorVersion, v.minorVersion, v.patchVersion),
             img.buildVersion().to_string(),
         )
