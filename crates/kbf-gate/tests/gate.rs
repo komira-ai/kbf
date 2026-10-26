@@ -219,3 +219,82 @@ fn buckets_are_summed_over_labels_and_sorted_by_bound() {
         assert_eq!(Metrics::parse(bad).unwrap().buckets("kbf_h"), None, "{bad}");
     }
 }
+
+const LATENCY: &str = r#"
+kbf_find_missing_seconds_bucket{le="0.1"} 90
+kbf_find_missing_seconds_bucket{le="0.5"} 98
+kbf_find_missing_seconds_bucket{le="1"} 99
+kbf_find_missing_seconds_bucket{le="+Inf"} 100
+kbf_find_missing_seconds_sum 12
+kbf_find_missing_seconds_count 100
+"#;
+
+fn quantile(text: &str, q: f64) -> Sample {
+    Metrics::parse(text)
+        .unwrap()
+        .quantile("kbf_find_missing_seconds", q)
+}
+
+fn value(sample: Sample) -> f64 {
+    match sample {
+        Sample::Value(v) => v,
+        Sample::Absent => panic!("absent"),
+    }
+}
+
+/// Asserts that a quantile is read at its own rank and interpolated inside the bucket that
+/// holds it. It catches a gate reading the median for the tail, a bound reported without
+/// interpolation, and an interpolation that starts from the wrong lower bound.
+#[test]
+fn a_quantile_is_interpolated_inside_its_bucket() {
+    // Rank 99 is the last count of the le=1 bucket, so the bound itself.
+    assert_eq!(quantile(LATENCY, 0.99), Sample::Value(1.0));
+    // Rank 95 is five of the eight observations of (0.1, 0.5].
+    assert!((value(quantile(LATENCY, 0.95)) - 0.35).abs() < 1e-9);
+    // Rank 50 is inside the first bucket, which starts at zero.
+    assert!((value(quantile(LATENCY, 0.5)) - 0.1 * 50.0 / 90.0).abs() < 1e-9);
+    assert_eq!(quantile(LATENCY, 1.0), Sample::Value(1.0));
+}
+
+/// Asserts that a quantile in the `+Inf` bucket reports the highest finite bound, and that a
+/// histogram with every observation in `+Inf` is unmeasured rather than zero.
+#[test]
+fn a_quantile_past_the_last_finite_bound_is_never_zero() {
+    assert_eq!(quantile(LATENCY, 0.999), Sample::Value(1.0));
+    let all_slow = "kbf_find_missing_seconds_bucket{le=\"+Inf\"} 7\n";
+    assert_eq!(quantile(all_slow, 0.99), Sample::Absent);
+    assert_eq!(
+        judge(quantile(all_slow, 0.99), Limit::AtMost(1.0)),
+        Verdict::Red
+    );
+}
+
+/// Asserts that a rank of zero skips leading empty buckets, so the minimum is not reported
+/// as the first bound's lower edge of zero.
+#[test]
+fn quantile_zero_skips_empty_leading_buckets() {
+    let text = "kbf_find_missing_seconds_bucket{le=\"0.1\"} 0\n\
+                kbf_find_missing_seconds_bucket{le=\"0.5\"} 4\n\
+                kbf_find_missing_seconds_bucket{le=\"+Inf\"} 4\n";
+    assert!((value(quantile(text, 0.0)) - 0.1).abs() < 1e-9);
+}
+
+/// Asserts that a missing histogram, one with no observations and an out-of-range quantile
+/// are all absent, and that absent is red under the soft band the latency gate uses.
+#[test]
+fn an_unmeasurable_quantile_is_absent_and_red() {
+    let m = Metrics::parse(LATENCY).unwrap();
+    assert_eq!(m.quantile("kbf_other_seconds", 0.99), Sample::Absent);
+    for q in [-0.1, 1.1, f64::NAN] {
+        assert_eq!(m.quantile("kbf_find_missing_seconds", q), Sample::Absent);
+    }
+    let empty = "kbf_find_missing_seconds_bucket{le=\"0.1\"} 0\n\
+                 kbf_find_missing_seconds_bucket{le=\"+Inf\"} 0\n";
+    assert_eq!(quantile(empty, 0.99), Sample::Absent);
+    let band = Limit::Band {
+        warn: 1.5,
+        red: 3.0,
+    };
+    assert_eq!(judge(quantile(empty, 0.99), band), Verdict::Red);
+    assert_eq!(judge(quantile(LATENCY, 0.99), band), Verdict::Green);
+}
