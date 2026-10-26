@@ -76,7 +76,7 @@ const RUNTIME: [&str; 5] = [
 ];
 
 /// The rules, by the tag a violation starts with.
-const RULES: [&str; 35] = [
+const RULES: [&str; 36] = [
     "install",
     "network",
     "positional",
@@ -92,6 +92,7 @@ const RULES: [&str; 35] = [
     "nofile",
     "user",
     "state-dir",
+    "state-dir-search",
     "credential",
     "restart",
     "restart-limit",
@@ -470,6 +471,25 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     };
     if unit.get_in("Service", "StateDirectory").map(trim) != Some(dir) {
         v("state-dir", format!("no StateDirectory={dir}"));
+    }
+    // Catches a container-running unit whose state directory others cannot search: systemd
+    // applies StateDirectoryMode= at every start, and the container driver refuses to start
+    // unless every directory down to its lease directories (under /var/lib/kbf) has the
+    // others-execute bit (its container ids are not the unit user's), so the node would
+    // crash-loop. The bits are read as octal; a unit with no StateDirectoryMode= gets
+    // systemd's 0755, which passes.
+    if matches!(mode, "daemon" | "storage-and-daemon" | "all-in-one") {
+        let bits = unit.get_in("Service", "StateDirectoryMode").map(trim);
+        let searchable = match bits {
+            None => true,
+            Some(m) => u32::from_str_radix(m, 8).is_ok_and(|b| b & 0o001 != 0),
+        };
+        if !searchable {
+            v(
+                "state-dir-search",
+                format!("StateDirectoryMode= is {bits:?}, which others cannot search (need o+x)"),
+            );
+        }
     }
 
     // Catches start-limit-hit on a failure that repeats quickly: every mode unit, the
@@ -1325,6 +1345,24 @@ const DEFECTS: &[(&str, &str, &str, &str)] = &[
         "StateDirectory=kbf-server\n",
         "StateDirectory=kbf\n",
         "state-dir",
+    ),
+    (
+        "kbf-daemon.service",
+        "StateDirectoryMode=0711\n",
+        "StateDirectoryMode=0750\n",
+        "state-dir-search",
+    ),
+    (
+        "kbf-storage-and-daemon.service",
+        "StateDirectoryMode=0711\n",
+        "StateDirectoryMode=0700\n",
+        "state-dir-search",
+    ),
+    (
+        "kbf-all-in-one.service",
+        "StateDirectoryMode=0711\n",
+        "StateDirectoryMode=0750\n",
+        "state-dir-search",
     ),
     (
         "kbf-frontend.service",
