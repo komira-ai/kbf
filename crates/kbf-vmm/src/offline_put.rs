@@ -107,9 +107,7 @@ fn relative(f: &OfflineFile) -> Result<PathBuf, String> {
 /// removed, or a create, write, chmod or chown failed; the message names the path.
 pub fn put(root: &Path, f: &OfflineFile, env: &Env<'_>) -> Result<Value, String> {
     let rel = relative(f)?;
-    if let Some(parent) = rel.parent() {
-        ensure_parents(root, parent, env)?;
-    }
+    ensure_parents(root, rel.parent().unwrap_or(Path::new("")), env)?;
     let path = root.join(&rel);
     (env.remove)(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
     let meta = std::fs::OpenOptions::new()
@@ -309,10 +307,6 @@ mod tests {
     #[test]
     fn unreadable_parents_and_unwritable_directories_are_errors() {
         let root = tmp("put-eacces");
-        // SAFETY: geteuid cannot fail.
-        if unsafe { libc::geteuid() } == 0 {
-            return; // root ignores modes; the other tests cover the paths
-        }
         std::fs::create_dir_all(root.join("locked/sub")).expect("dirs");
         std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000))
             .expect("lock");
@@ -339,6 +333,8 @@ mod tests {
         remove_path(&root.join("l")).expect("rm link");
         assert!(outside.join("keep").exists());
         remove_path(&root.join("absent")).expect("missing is fine");
+        std::fs::write(root.join("plain"), "x").expect("plain");
+        remove_path(&root.join("plain/inner")).expect_err("not a directory is an error");
         std::fs::write(root.join("f"), "x").expect("file");
         remove_path(&root.join("f")).expect("rm file");
         assert!(!root.join("f").exists());
@@ -348,10 +344,6 @@ mod tests {
     /// cannot give a file to root).
     #[test]
     fn a_refused_owner_change_on_the_file_is_an_error() {
-        // SAFETY: geteuid cannot fail.
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
         let root = tmp("put-chown");
         let env = Env {
             remove: &remove_path,
@@ -362,18 +354,12 @@ mod tests {
         assert!(e.contains(&root.join("f").display().to_string()), "{e}");
     }
 
-    /// Catches `put_all` skipping the production remover and owner, or dropping a file.
+    /// Catches `put_all` not asking for root ownership (a non-root run is refused, naming the path).
     #[test]
-    fn put_all_writes_every_file_when_owner_is_the_caller() {
+    fn put_all_gives_files_to_root_and_names_the_path_when_refused() {
         let root = tmp("put-all");
-        let r = put_all(&root, &[file("a/x", 0o644)]);
-        // Owner is 0:0: it succeeds as root and is refused (naming the path) otherwise.
-        // SAFETY: geteuid cannot fail.
-        if unsafe { libc::geteuid() } == 0 {
-            assert_eq!(r.expect("root").len(), 1);
-        } else {
-            let e = r.expect_err("not root");
-            assert!(e.contains(&root.join("a").display().to_string()), "{e}");
-        }
+        // The owner is 0:0, which a test run as a normal user cannot give away to.
+        let e = put_all(&root, &[file("a/x", 0o644)]).expect_err("not root");
+        assert!(e.contains(&root.join("a").display().to_string()), "{e}");
     }
 }
