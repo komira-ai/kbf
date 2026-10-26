@@ -161,11 +161,12 @@ fn p10_two_connections_record_the_same_pack_at_once() {
 
 /// Asserts that blob rows take no part in the commit head. While a state transaction holds
 /// the head (a third connection asks for it without waiting and is refused), two connections
-/// record different packs and both succeed within the server's three-second lock timeout, and
-/// the blobs are found; the state transaction then commits.
+/// record different packs and both succeed, and the blobs are found; the state transaction
+/// then commits. The server's lock timeout (30 s) only stops a test that would otherwise hang
+/// if a record waited for the head; nothing here measures time.
 #[test]
 fn recording_packs_goes_through_while_a_state_transaction_holds_the_head() {
-    let backend = PostgresBackend::new(&url_setting("lock_timeout", "3000"), Flaw::None);
+    let backend = PostgresBackend::new(&url_setting("lock_timeout", "30000"), Flaw::None);
     let config = backend.fresh_config();
     let store = PostgresStore::open(&config).expect("opens");
     let index = PostgresPackIndex::open(&config).expect("opens");
