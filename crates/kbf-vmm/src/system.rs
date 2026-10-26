@@ -4,7 +4,8 @@
 
 use std::io;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -21,6 +22,42 @@ pub enum Poll {
         code: Option<i32>,
         signal: Option<i32>,
     },
+}
+
+/// The time the probes read and pass. The real one is the monotonic clock and a thread
+/// sleep; the fake one is a counter that only moves when something passes time, so a test
+/// of a wait gets the same answer on any host at any load.
+pub trait Clock: Send + Sync {
+    /// Time since an origin fixed when the clock was made; never goes back.
+    fn now(&self) -> Duration;
+    /// Lets `d` pass: the real clock sleeps, the fake one advances.
+    fn pause(&self, d: Duration);
+}
+
+/// The monotonic clock.
+#[derive(Debug)]
+pub struct RealClock(Instant);
+
+impl RealClock {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Instant::now())
+    }
+}
+
+impl Default for RealClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for RealClock {
+    fn now(&self) -> Duration {
+        self.0.elapsed()
+    }
+    fn pause(&self, d: Duration) {
+        std::thread::sleep(d);
+    }
 }
 
 /// A running VM helper process.
@@ -65,6 +102,11 @@ pub struct Signature {
 }
 
 pub trait System {
+    /// The clock the probes wait by. Every call may return a new clock with its own origin:
+    /// only differences between readings of one clock mean anything.
+    fn clock(&self) -> Arc<dyn Clock> {
+        Arc::new(RealClock::new())
+    }
     /// `clonefile(2)`: a copy-on-write copy of the file `src` at `dst`.
     ///
     /// # Errors

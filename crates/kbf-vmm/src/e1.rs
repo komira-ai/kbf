@@ -12,7 +12,7 @@
 //! outcome to a cause.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -168,11 +168,12 @@ fn sample_all(ctx: &Ctx<'_>, vms: &[Vm], arms: &mut [Arm]) -> Option<String> {
 /// Watches both guests until each has delivered every expected frame or ended, or the
 /// guest wait is over; samples on a fixed beat, once at the start and once at the end.
 fn observe(ctx: &Ctx<'_>, vms: &mut [Vm], arms: &mut [Arm]) -> Option<String> {
-    let began = Instant::now();
+    let clock = ctx.sys.clock();
+    let began = clock.now();
     let mut next = Duration::ZERO;
     let mut table_error = None;
     loop {
-        if began.elapsed() >= next {
+        if clock.now().saturating_sub(began) >= next {
             table_error = sample_all(ctx, vms, arms).or(table_error);
             next += ctx.timing.sample_every;
         }
@@ -189,7 +190,7 @@ fn observe(ctx: &Ctx<'_>, vms: &mut [Vm], arms: &mut [Arm]) -> Option<String> {
             .iter()
             .zip(arms.iter())
             .all(|(vm, arm)| arm.complete() || vm.ended.is_some());
-        if settled || began.elapsed() >= ctx.timing.guest_timeout {
+        if settled || clock.now().saturating_sub(began) >= ctx.timing.guest_timeout {
             break;
         }
     }
@@ -212,7 +213,8 @@ fn stop_gracefully(ctx: &Ctx<'_>, vms: &mut [Vm], arms: &mut [Arm]) {
         }
         asked.push(live.then(|| vm.ms()));
     }
-    let deadline = Instant::now() + ctx.timing.shutdown_timeout;
+    let clock = ctx.sys.clock();
+    let deadline = clock.now() + ctx.timing.shutdown_timeout;
     let mut stopped: Vec<Option<u64>> = vec![None; vms.len()];
     loop {
         for (i, vm) in vms.iter_mut().enumerate() {
@@ -221,10 +223,10 @@ fn stop_gracefully(ctx: &Ctx<'_>, vms: &mut [Vm], arms: &mut [Arm]) {
             }
         }
         let waiting = (0..vms.len()).any(|i| asked[i].is_some() && stopped[i].is_none());
-        if !waiting || Instant::now() >= deadline {
+        if !waiting || clock.now() >= deadline {
             break;
         }
-        std::thread::sleep(ctx.timing.tick);
+        clock.pause(ctx.timing.tick);
     }
     for (i, (vm, arm)) in vms.iter_mut().zip(arms.iter_mut()).enumerate() {
         let Some(asked) = asked[i] else { continue };
@@ -481,11 +483,11 @@ mod tests {
         sys.script(complete_guest());
         let mut c = guest_ctx(&sys, &work);
         c.timing.guest_timeout = Duration::from_secs(60);
-        let began = Instant::now();
         let r = e1(&c);
         assert!(
-            began.elapsed() < Duration::from_secs(10),
-            "did not wait out the timeout"
+            sys.clock.now() < c.timing.guest_timeout,
+            "did not wait out the timeout: the clock reads {:?}",
+            sys.clock.now()
         );
         let x = arm(&r, 0);
         assert_eq!(x["stayed_up"], false);
@@ -738,8 +740,7 @@ mod tests {
             let stop = &arm(&r, i)["stop"];
             assert_eq!(stop["how"], "guest shut down (vsock)", "arm {i}");
             let ms = stop["ms"].as_u64().expect("ms");
-            assert!(ms >= 150, "arm {i}: {ms} ms");
-            assert!(ms < 1500, "arm {i}: {ms} ms");
+            assert_eq!(ms, 150, "arm {i}: from its own request to the stop");
         }
 
         let work = work_with_base("e1-stop-one-timeout");
@@ -748,12 +749,11 @@ mod tests {
         sys.script(Script::booted().deaf());
         let mut c = guest_ctx(&sys, &work);
         c.timing.shutdown_timeout = Duration::from_millis(300);
-        let began = Instant::now();
         let r = e1(&c);
-        let took = began.elapsed();
-        assert!(took >= Duration::from_millis(300), "{took:?}");
-        assert!(took < Duration::from_millis(1500), "{took:?}");
         for i in 0..2 {
+            // Both were waited for together: each stop took the one timeout, not the
+            // first one's timeout plus its own.
+            assert_eq!(arm(&r, i)["stop"]["ms"], 300, "arm {i}");
             assert_eq!(
                 arm(&r, i)["stop"]["how"],
                 "force-stopped after the guest did not shut down"
