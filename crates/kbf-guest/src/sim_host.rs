@@ -8,8 +8,8 @@ use crate::frame::{Frame, SendError};
 use crate::mkuser_host::recorded_user;
 use crate::probe::Host;
 use crate::probe_host::SystemHost;
-use crate::sim::{ConsoleUser, OUT_DIR, Outcome, SCREENSHOT_PATH, SimHost};
-use crate::sim_run::{ProcessRunner, SystemClock, read_regular};
+use crate::sim::{ConsoleUser, OUT_DIR, Outcome, SCREENSHOT_PATH, SimHost, Wanted};
+use crate::sim_run::{ProcessRunner, SystemClock, read_regular, read_wanted};
 use crate::simpaths;
 
 pub struct RealSimHost {
@@ -104,8 +104,8 @@ impl SimHost for RealSimHost {
         recorded_user(simpaths::USER_READY)
     }
 
-    fn wanted_user(&self) -> Option<String> {
-        recorded_user(simpaths::USER_WANTED)
+    fn wanted_user(&self) -> Wanted {
+        read_wanted(Path::new(simpaths::USER_WANTED))
     }
 
     fn prepare_out_dir(&self) -> Result<(), String> {

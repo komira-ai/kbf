@@ -746,8 +746,8 @@ mod tests {
         fn ready_user(&self) -> Option<String> {
             None
         }
-        fn wanted_user(&self) -> Option<String> {
-            None
+        fn wanted_user(&self) -> sim::Wanted {
+            sim::Wanted::No
         }
         fn is_root(&self) -> bool {
             self.root

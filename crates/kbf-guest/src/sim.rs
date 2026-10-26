@@ -552,6 +552,19 @@ pub struct ConsoleUser {
     pub name: String,
 }
 
+/// What the guest says about the user it is to have ([`simpaths::USER_WANTED`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Wanted {
+    /// There is no such file: no user is wanted.
+    No,
+    /// The file names this user.
+    User(String),
+    /// The file is there in some form but cannot be read as a valid user name (a link, a
+    /// directory, too large, unreadable, a bad name): what is wanted is not known, which is
+    /// not the same as nothing wanted. The text says why.
+    Unreadable(String),
+}
+
 /// What the run asks of the guest; a fake in tests.
 pub trait SimHost {
     fn is_root(&self) -> bool;
@@ -564,7 +577,7 @@ pub trait SimHost {
     /// The user `kbf-guest mkuser` recorded as ready ([`simpaths::USER_READY`]), if any.
     fn ready_user(&self) -> Option<String>;
     /// The user `image setup --guest-user` asked for ([`simpaths::USER_WANTED`]), if any.
-    fn wanted_user(&self) -> Option<String>;
+    fn wanted_user(&self) -> Wanted;
     /// Makes [`OUT_DIR`] writable by the console user.
     ///
     /// # Errors
@@ -772,18 +785,21 @@ pub fn run(host: &dyn SimHost, cfg: &Config, log: &mut dyn Write) -> SummaryFram
     // A guest that is to have a user but has none yet has no session to run the user steps
     // in: running the root ones would only import the runtimes into the base for nothing.
     let ready = host.ready_user();
-    if ready.is_none()
-        && let Some(wanted) = host.wanted_user()
-    {
-        return finish(
-            &mut r,
-            &[],
-            &State::default(),
-            None,
-            Some(format!(
+    // Fails closed: a wish that cannot be read stops the run as a wish that is not met does.
+    if ready.is_none() {
+        let why = match host.wanted_user() {
+            Wanted::No => None,
+            Wanted::User(wanted) => Some(format!(
                 "the guest user {wanted} does not exist yet: run `kbf-vmm image prime` on this base first"
             )),
-        );
+            Wanted::Unreadable(e) => Some(format!(
+                "{} exists but does not name a user ({e}): whether the guest is to have one is not known, so nothing was run; fix or remove that file, then run `kbf-vmm image prime` if it names one",
+                simpaths::USER_WANTED
+            )),
+        };
+        if let Some(why) = why {
+            return finish(&mut r, &[], &State::default(), None, Some(why));
+        }
     }
     r.user_name = ready;
     let inputs = Inputs {

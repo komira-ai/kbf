@@ -221,6 +221,12 @@ pub enum ImageCmd {
         /// reported as a timeout.
         #[arg(long, default_value_t = 1200, value_parser = clap::value_parser!(u64).range(1..=86_400))]
         deadline_secs: u64,
+        /// How long a guest that is still up at the deadline (or already prepared) has to
+        /// shut down after being asked to, before the host stops it by force. A forced stop
+        /// can leave the base's disk unflushed: copy a base that cannot be rebuilt before
+        /// priming it.
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        shutdown_secs: u64,
     },
     /// As root, copy a fixed allowlist of diagnostics (the probe daemons' logs, the local
     /// marker, the unified log's data files, crash reports) out of a stopped guest's disk

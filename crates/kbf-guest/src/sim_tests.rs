@@ -12,7 +12,7 @@ use clap::Parser;
 
 use crate::frame::{Frame, Kind, MAX_BODY_BYTES, MAX_FRAME_BYTES, SendError, encode};
 use crate::sim::*;
-use crate::sim_run::{Clock, ProcessRunner, read_regular};
+use crate::sim_run::{Clock, ProcessRunner, read_regular, read_wanted};
 
 const UDID: &str = "6F3A1B2C-0D4E-4F5A-8B6C-7D8E9F0A1B2C";
 
@@ -57,6 +57,7 @@ struct Fake {
     /// The user `mkuser` recorded as ready, and the one `image setup --guest-user` asked for.
     ready: Option<String>,
     wanted: Option<String>,
+    wanted_unreadable: Option<String>,
     /// The name of the console user, once there is one.
     console_name: String,
     /// The console user appears once this many pauses have been made; never when `None`.
@@ -91,6 +92,7 @@ impl Fake {
             apps: Vec::new(),
             ready: None,
             wanted: None,
+            wanted_unreadable: None,
             console_name: "kbf".to_owned(),
             user_after_pauses: Some(0),
             answers: RefCell::new(answers),
@@ -149,8 +151,12 @@ impl SimHost for Fake {
     fn ready_user(&self) -> Option<String> {
         self.ready.clone()
     }
-    fn wanted_user(&self) -> Option<String> {
-        self.wanted.clone()
+    fn wanted_user(&self) -> Wanted {
+        match (&self.wanted_unreadable, &self.wanted) {
+            (Some(e), _) => Wanted::Unreadable(e.clone()),
+            (None, Some(n)) => Wanted::User(n.clone()),
+            (None, None) => Wanted::No,
+        }
     }
     fn prepare_out_dir(&self) -> Result<(), String> {
         self.out_dir_made.set(true);
@@ -1534,4 +1540,59 @@ fn a_wanted_user_that_is_not_ready_stops_the_run_before_any_command() {
     host.ready = Some("kbfuser".to_owned());
     host.console_name = "kbfuser".to_owned();
     assert!(go(&host).ok);
+}
+
+/// Catches a wish file that cannot be read being taken for "no user wanted" (the simulator
+/// would then run its root steps in a guest that is to have a user): the run fails closed,
+/// runs nothing, and its note names the file and says why.
+#[test]
+fn a_wish_that_cannot_be_read_stops_the_run_before_any_command() {
+    let mut host = Fake::new();
+    host.wanted_unreadable = Some("is over the 256 byte cap".to_owned());
+    let summary = go(&host);
+    assert!(host.ran.borrow().is_empty());
+    assert!(!summary.ok && summary.steps.is_empty());
+    let note = summary.note.as_deref().expect("note");
+    assert!(
+        note.contains("user-wanted")
+            && note.contains("256 byte cap")
+            && note.contains("nothing was run"),
+        "{note}"
+    );
+    assert_eq!(host.sent.borrow().len(), 1);
+    // With the user ready the wish does not matter.
+    host.ready = Some("kbfuser".to_owned());
+    host.console_name = "kbfuser".to_owned();
+    assert!(go(&host).ok);
+}
+
+/// Catches `user-wanted` read as "none" when it is there: only a missing file is `No`; a good
+/// name (first line, trimmed) is the user; an empty or bad name, a link, a directory, a
+/// file over the cap and non-text are all unreadable.
+#[test]
+fn only_a_missing_wish_file_means_no_user_is_wanted() {
+    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-guest-wanted");
+    let at = |name: &str| dir.join(name);
+    assert_eq!(read_wanted(&at("absent")), Wanted::No);
+    std::fs::write(at("good"), "kbfuser\nignored\n").expect("file");
+    assert_eq!(read_wanted(&at("good")), Wanted::User("kbfuser".to_owned()));
+    std::fs::write(at("spaced"), "  kbfuser \n").expect("file");
+    assert_eq!(
+        read_wanted(&at("spaced")),
+        Wanted::User("kbfuser".to_owned())
+    );
+    std::fs::write(at("empty"), "").expect("file");
+    std::fs::write(at("bad"), "Root\n").expect("file");
+    std::fs::write(at("big"), vec![b'a'; 300]).expect("file");
+    std::fs::write(at("binary"), [0xff, 0xfe, b'\n']).expect("file");
+    std::os::unix::fs::symlink(at("good"), at("link")).expect("link");
+    std::os::unix::fs::symlink(at("absent"), at("dangling")).expect("link");
+    std::fs::create_dir(at("dir")).expect("dir");
+    for name in ["empty", "bad", "big", "binary", "link", "dangling", "dir"] {
+        assert!(
+            matches!(read_wanted(&at(name)), Wanted::Unreadable(_)),
+            "{name}: {:?}",
+            read_wanted(&at(name))
+        );
+    }
 }

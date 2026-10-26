@@ -7,7 +7,8 @@
 //! (`kbf_guest::mkuser`), then powers the guest off. The host collects the frames into
 //! `<base>/prime-results` (private to the host, written only through the sink that checks
 //! every name, like the probes' results), waits for the power-off for at most the deadline
-//! (a guest that is still up then is stopped and the run is a timeout), and prints one JSON
+//! (a guest that is still up then is asked to shut down and, if it does not within
+//! `--shutdown-secs`, stopped by force; the run is a timeout either way), and prints one JSON
 //! object: each step with its status, exit code, time and output tail, the summary, how the
 //! guest ended, and what to run next. A clone of the base made afterwards boots into the
 //! user's session.
@@ -283,7 +284,12 @@ pub fn prime(ctx: &Ctx<'_>, deadline: Duration) -> Report {
             vm.request_shutdown();
             Some(vm.finish_shutdown(&ctx.timing, ctx.timing.shutdown_timeout))
         }
-        Outcome::Timeout => Some(vm.finish_shutdown(&ctx.timing, Duration::ZERO)),
+        // Asked first, so that a guest that is only slow flushes its disk; stopped by
+        // force when it does not shut down within the shutdown wait.
+        Outcome::Timeout => {
+            vm.request_shutdown();
+            Some(vm.finish_shutdown(&ctx.timing, ctx.timing.shutdown_timeout))
+        }
     };
     // Reap the helper in every case; a no-op when it has gone.
     vm.stop(&ctx.timing);

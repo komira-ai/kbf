@@ -522,7 +522,36 @@ fn blank_frame(index: usize, step: &Step, blame: Option<&String>, cfg: &Config) 
 /// Fills `f` from how the command `out` ended; the password never gets in.
 fn record(f: &mut StepFrame, out: &Outcome, cfg: &Config, password: &str) {
     f.ms = out.ms;
-    // An empty password stands for "none": replacing it would put the mark between letters.
+    // The whole capture is cleaned before the tail is taken: a cut made first could split the
+    // password, and a part of it is not matched. When the capture itself was cut (at its cap),
+    // what ends in a first part of the password, or starts with a last part of it, is dropped
+    // too, as that may be a password the cap split. An empty password stands for "none": replacing it would put the mark
+    // between letters.
+    let clean = |bytes: &[u8]| {
+        let mut s = String::from_utf8_lossy(bytes).into_owned();
+        if !password.is_empty() {
+            s = s.replace(password, REDACTED);
+            if out.cut {
+                for k in (1..password.len()).rev() {
+                    if let Some(head) = password.get(..k)
+                        && s.ends_with(head)
+                    {
+                        s.truncate(s.len() - k);
+                        break;
+                    }
+                }
+                for k in (1..password.len()).rev() {
+                    if let Some(rest) = password.get(password.len() - k..)
+                        && s.starts_with(rest)
+                    {
+                        s.drain(..k);
+                        break;
+                    }
+                }
+            }
+        }
+        s
+    };
     let redact = |s: String| {
         if password.is_empty() {
             s
@@ -530,12 +559,10 @@ fn record(f: &mut StepFrame, out: &Outcome, cfg: &Config, password: &str) {
             s.replace(password, REDACTED)
         }
     };
-    let (stdout, cut_out) = tail_text(&out.stdout, cfg.tail_bytes);
-    let (stderr, cut_err) = tail_text(&out.stderr, cfg.tail_bytes);
-    // The password is cut out of the whole capture's tail: one that the cut would split is
-    // not whole in the tail, so it cannot be matched, and a part of it is shorter than 22.
-    f.stdout = redact(stdout);
-    f.stderr = redact(stderr);
+    let (stdout, cut_out) = tail_text(clean(&out.stdout).as_bytes(), cfg.tail_bytes);
+    let (stderr, cut_err) = tail_text(clean(&out.stderr).as_bytes(), cfg.tail_bytes);
+    f.stdout = stdout;
+    f.stderr = stderr;
     f.stdout_truncated = cut_out || out.cut;
     f.stderr_truncated = cut_err || out.cut;
     f.status = match &out.ended {

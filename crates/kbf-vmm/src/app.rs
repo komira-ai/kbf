@@ -153,12 +153,16 @@ pub fn run(
             base,
             guest_binary,
             deadline_secs,
+            shutdown_secs,
         }) => prime_cmd(
             sys,
             base,
             guest_binary,
             Duration::from_secs(*deadline_secs),
-            timing,
+            Timing {
+                shutdown_timeout: Duration::from_secs(*shutdown_secs),
+                ..timing
+            },
         ),
         Cmd::Image(ImageCmd::Harvest { bundle, out }) => image::harvest(sys, bundle, out),
     };

@@ -1088,3 +1088,77 @@ fn a_failed_preference_write_skips_the_ownership_step_and_the_marker() {
         assert_eq!(done.power_off_started, Some(true));
     }
 }
+
+/// Whether `text` holds any run of four or more characters of the password.
+fn leaks(text: &str) -> bool {
+    (0..=PASSWORD.len() - 4).any(|i| text.contains(&PASSWORD[i..i + 4]))
+}
+
+/// Catches a password that is cut by the tail before it is redacted (a part of it, too short
+/// to match, would be sent): with the password at every offset around the tail's cut, for
+/// several tail sizes, in stdout and stderr, no frame field holds four characters of it in
+/// a row; and a capture that was itself cut at its cap in the middle of the password (at the
+/// end, or at the start) shows none of it either.
+#[test]
+fn a_password_split_by_the_tail_cut_or_the_capture_cap_never_shows_in_part() {
+    for tail in [5usize, 17, 22, 30] {
+        for filler in 0..40usize {
+            let host = Fake::new();
+            let line = format!("{}{PASSWORD}{}", "x".repeat(filler), "y".repeat(filler % 7));
+            host.answer("sysadminctl", out(Ended::Exited(1), &line, &line));
+            let cfg = Config::from(&args(&["--tail-bytes", &tail.to_string()]));
+            run(&host, &cfg, "kbfuser", &mut Vec::new());
+            for f in host.step_frames() {
+                for field in [&f.stdout, &f.stderr] {
+                    assert!(!leaks(field), "tail {tail} filler {filler}: {field:?}");
+                }
+            }
+            for sent in host.sent.borrow().iter() {
+                assert!(
+                    !leaks(&sent.body),
+                    "tail {tail} filler {filler}: {}",
+                    sent.body
+                );
+            }
+        }
+    }
+    // The capture cap cut the password: its first part ends the capture, or its last part
+    // starts it.
+    for (text, name) in [
+        (format!("noise {}", &PASSWORD[..10]), "ends"),
+        (format!("{} noise", &PASSWORD[9..]), "starts"),
+    ] {
+        let host = Fake::new();
+        let mut o = out(Ended::Exited(1), &text, &text);
+        o.cut = true;
+        host.answer("sysadminctl", o);
+        go(&host);
+        let frames = host.step_frames();
+        assert!(
+            !leaks(&frames[0].stdout) && !leaks(&frames[0].stderr),
+            "{name}"
+        );
+        assert!(frames[0].stdout_truncated);
+    }
+    // A start failure's note too.
+    let host = Fake::new();
+    host.answer(
+        "sysadminctl",
+        out(Ended::SpawnFailed(format!("x {PASSWORD} y")), "", ""),
+    );
+    go(&host);
+    assert!(!leaks(host.step_frames()[0].note.as_deref().expect("note")));
+}
+
+/// Catches a power-off that is not a halt: the argument list is pinned as literal text, so
+/// that changing `-h` to `-r` (a reboot into the half-made user) is a failing test.
+#[test]
+fn the_power_off_command_is_shutdown_halt_now() {
+    assert_eq!(SHUTDOWN, ["/sbin/shutdown", "-h", "now"]);
+    let host = Fake::new();
+    go(&host);
+    assert_eq!(
+        host.commands().last().map(String::as_str),
+        Some("/sbin/shutdown -h now")
+    );
+}

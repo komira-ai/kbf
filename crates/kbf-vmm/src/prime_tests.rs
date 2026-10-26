@@ -104,6 +104,11 @@ fn powering_off(frames: &[(String, String)]) -> Script {
         .then(Poll::Event(Event::Stopped { ms: 50 }))
 }
 
+/// How many steps a good run has.
+fn n_steps() -> usize {
+    plan("kbfuser", false).len()
+}
+
 fn results(work: &Path) -> std::path::PathBuf {
     work.join("base").join(RESULTS_DIR)
 }
@@ -189,8 +194,8 @@ fn a_good_prime_is_reported_step_by_step_and_points_at_probe_e3() {
     assert!(
         holds(&[
             d["outcome"] == "powered-off",
-            d["steps_received"] == 12,
-            d["steps_ok"] == 12,
+            d["steps_received"] == n_steps(),
+            d["steps_ok"] == n_steps(),
             d["problems"] == serde_json::json!([]),
             d["summary_received"] == true,
             d["summary"]["ok"] == true,
@@ -215,7 +220,7 @@ fn a_good_prime_is_reported_step_by_step_and_points_at_probe_e3() {
     assert!(d["next"].as_str().expect("next").contains("probe e3"));
     let line = r.summary.expect("summary");
     assert!(
-        line.contains("kbfuser") && line.contains("12 of 12"),
+        line.contains("kbfuser") && line.contains(&format!("{0} of {0}", n_steps())),
         "{line}"
     );
     assert_eq!(
@@ -436,7 +441,7 @@ fn frames_that_are_not_ours_or_not_valid_are_listed_or_ignored() {
             .expect("e")
             .contains("expected JSON")
     );
-    assert_eq!(r.details["steps_received"], 12);
+    assert_eq!(r.details["steps_received"], n_steps());
 }
 
 /// Catches `image setup --guest-user` writing the wrong daemon or the wrong wish: the
@@ -591,7 +596,9 @@ fn the_flags_parse_and_prime_is_dispatched_with_its_deadline() {
             base,
             guest_binary,
             deadline_secs,
+            shutdown_secs,
         }) => {
+            assert_eq!(*shutdown_secs, 60);
             assert_eq!(base, Path::new("b"));
             assert_eq!(guest_binary, Path::new("g"));
             assert_eq!(*deadline_secs, DEFAULT_DEADLINE.as_secs());
@@ -669,4 +676,56 @@ fn the_flags_parse_and_prime_is_dispatched_with_its_deadline() {
         &mut err,
     );
     assert_eq!(format!("{code:?}"), "ExitCode(unix_exit_status(1))");
+}
+
+/// Catches a forced stop of a guest that was only slow: at the deadline the guest is first
+/// asked to shut down, and one that does is not force-stopped (its disk is flushed); the
+/// run is still a timeout error, since it did not power off by itself in time.
+#[test]
+fn a_guest_still_up_at_the_deadline_is_asked_to_shut_down_before_it_is_stopped() {
+    let work = work_with_base("prime-slow");
+    let sys = FakeSystem::new();
+    let steps = all_ok();
+    sys.script(Script::booted().with_guest_file(&steps[0].0, &steps[0].1));
+    let r = prime(&prime_ctx(&sys, &work), SHORT);
+    assert_eq!(r.status, ReportStatus::Error, "{r:?}");
+    assert!(r.reason.expect("reason").starts_with("timeout:"));
+    assert_eq!(r.details["outcome"], "timeout");
+    assert_eq!(r.details["stop"]["how"], "guest shut down (requestStop)");
+}
+
+/// Catches `--shutdown-secs` going nowhere: its default is 60 and a given value parses.
+#[test]
+fn the_wait_for_a_requested_shutdown_is_a_flag_with_a_default() {
+    for (extra, want) in [(vec![], 60), (vec!["--shutdown-secs", "5"], 5)] {
+        let mut argv = vec![
+            "kbf-vmm",
+            "image",
+            "prime",
+            "--base",
+            "b",
+            "--guest-binary",
+            "g",
+        ];
+        argv.extend(extra);
+        let cli = Cli::try_parse_from(argv).expect("parse");
+        match &cli.command {
+            Cmd::Image(ImageCmd::Prime { shutdown_secs, .. }) => assert_eq!(*shutdown_secs, want),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(
+        Cli::try_parse_from([
+            "kbf-vmm",
+            "image",
+            "prime",
+            "--base",
+            "b",
+            "--guest-binary",
+            "g",
+            "--shutdown-secs",
+            "0"
+        ])
+        .is_err()
+    );
 }
