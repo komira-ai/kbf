@@ -14,7 +14,7 @@ use kbf_server::api::FRONTEND_DRAIN;
 use kbf_server::drain::Phase;
 use tonic::{Code, Status, Streaming};
 
-use super::retire::{Member, Pair, bearer, exchange, execute_refused, polled, queued, readyz};
+use super::retire::{Member, Pair, bearer, exchange, execute_refusal, polled, queued, readyz};
 use super::*;
 
 /// The longest a test waits for an event: a bound that only a hang reaches.
@@ -176,14 +176,27 @@ async fn until_executing(ops: &mut Streaming<Operation>) {
 /// frontend refuses it UNAVAILABLE and sends the REAPI listener GOAWAY in the same step, so
 /// on the connection `client` already holds it surfaces as UNAVAILABLE from the service or
 /// as CANCELLED when the GOAWAY got there first (as in
-/// `an_open_execute_survives_stop_until_its_action_is_done`). Any other code, or an Execute
-/// that is answered, fails.
+/// `an_open_execute_survives_stop_until_its_action_is_done`), or as INTERNAL when the
+/// connection the GOAWAY closed ended the call (the HTTP/2 layer reports a closed connection
+/// that way; the status then names the connection). Any other code, an INTERNAL that is not
+/// the connection closing, or an Execute that is answered, fails.
 async fn assert_refused_after_the_wait(client: &Client, job: &Job) {
-    let refused = execute_refused(client, job).await;
+    let refused = execute_refusal(client, job).await;
+    let refused = refused.expect("a new Execute is refused after the wait");
     assert!(
-        matches!(refused, Some(Code::Unavailable | Code::Cancelled)),
+        is_a_refusal(&refused),
         "a new Execute was not refused after the wait: {refused:?}"
     );
+}
+
+/// Whether `status` is how the frontend's refusal of new work after the wait reaches a client:
+/// UNAVAILABLE from the service, CANCELLED by the GOAWAY, or the connection the GOAWAY closed.
+fn is_a_refusal(status: &tonic::Status) -> bool {
+    match status.code() {
+        Code::Unavailable | Code::Cancelled => true,
+        Code::Internal => status.message().contains("connection"),
+        _ => false,
+    }
 }
 
 /// Asserts that in the wait the frontend answers `/readyz` 503 at once and serves on: a
