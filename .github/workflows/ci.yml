@@ -169,7 +169,7 @@ jobs:
       # was lost mid-test). Remove toolchains the image preinstalls that this job never
       # uses; the Postgres service container's image is not touched.
       - name: Free disk before (report)
-        run: df -h / /mnt
+        run: df -h /
       - name: Remove preinstalled toolchains this job does not use
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/powershell /usr/share/swift /usr/local/lib/node_modules
       # Images the runner preloads and this job never runs; the Postgres service container's
@@ -185,16 +185,12 @@ jobs:
       - run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --version
       - name: Install cargo-nextest (pinned version and checksum)
         run: cargo "+$COVERAGE_TOOLCHAIN" xtask fetch --url "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/cargo-nextest-$NEXTEST_VERSION-x86_64-unknown-linux-gnu.tar.gz" --sha256 "$NEXTEST_SHA256" --out "$HOME/.cargo/bin/cargo-nextest" --extract tar.gz --member cargo-nextest
-      # The instrumented workspace build (target/llvm-cov-target, about 59 GB with the tests'
-      # temporary files under it) plus the restored target/debug (about 50 GB) filled the root
-      # disk: the run measured 120 GB free before the tests and 5.6 GB after, below the 5%
-      # floor kbf-server's file store refuses to write under, and about 30 tests failed with
-      # "Unavailable(Store(Transport(Full ...". The runner's second disk, mounted at /mnt,
-      # takes the instrumented build and, with it, the tests' temporary files
-      # (CARGO_TARGET_TMPDIR sits under the target directory). It is bind-mounted over
-      # target/llvm-cov-target, so every path, the cache's included, stays the same.
-      # The checks run first and fail with the disk named, so a short disk reads as
-      # "runner out of disk" and not as test failures.
+      # The `test` job's cache key began with the prefix `cargo-<os>-<arch>-test-`, and beta.yml's
+      # `test-x86` job saves a cache under `cargo-<os>-<arch>-test-x86-` (its non-instrumented
+      # workspace build, about 53 GB once restored). The restore-key prefix matched it, so the
+      # root disk held that cache and the instrumented build (about 59 GB): 120 GB free before
+      # the tests, 5.6 GB after, under the 5% floor of the file store, and about 30 tests failed
+      # with "Unavailable(Store(Transport(Full ...". The key below is this job's own.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
@@ -202,8 +198,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+          key: cargo-coverage-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-coverage-${{ runner.os }}-${{ runner.arch }}-
       # The cache holds target/, and a push run left the WORKSPACE's instrumented test binaries
       # and coverage profiles in target/llvm-cov-target. `llvm-cov report` reads every
       # instrumented binary and profile there, so a run that restored them merged a binary built
@@ -211,8 +207,6 @@ jobs:
       # ('profile file is not compatible'). `llvm-cov clean --workspace` removes the workspace's
       # own artifacts and profiles and keeps the dependencies' builds, which are what the cache
       # is for.
-      - name: Disk use under target after the cache restore (report)
-        run: du -xhd 2 target
       - name: Drop the workspace's coverage artifacts the cache restored
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
       # nextest runs a process per test, so a test's line coverage must not rest on another
@@ -228,6 +222,12 @@ jobs:
       # `--features tierstore/s3` puts the object store library's S3 backend (off by default; the
       # crate's own tests turn it on through `server`) into the run whichever way they are built,
       # so its tests count toward the 99% of tierstore.
+      # The instrumented build (about 59 GB measured), the tests' temporary files under it and
+      # the file store's 5% free-space floor (about 7.5 GB on this disk) need the room below.
+      # Short here means the restored cache or the image grew: the step says so and stops,
+      # instead of about 30 tests failing with "Full".
+      - name: Refuse early when the disk is short for the tests (80 GiB free)
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --path . --min-free-gb 80
       - name: Run the fast tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
@@ -236,13 +236,10 @@ jobs:
       # which directories grew (the instrumented build, the tests' own temporary files).
       - name: Free disk after the tests (report)
         if: ${{ always() }}
-        run: df -h / /mnt target/llvm-cov-target
+        run: df -h /
       - name: Disk use under target after the tests (report)
         if: ${{ always() }}
         run: du -xhd 2 target
-      - name: The big files under target/debug after the tests (report)
-        if: ${{ always() }}
-        run: du -xah --time --threshold=400M target/debug
       # No step below runs Postgres tests on their own: they are in the run above, which
       # fails any of them when KBF_TEST_POSTGRES_URL (set for the job) names no server.
       - name: Report
