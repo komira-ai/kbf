@@ -930,6 +930,36 @@ impl<R: Runtime> Harness<R> {
         .await
     }
 
+    /// [`Self::with_pack_reads`], the daemon also setting `commit` from each Welcome
+    /// ([`Daemon::with_pack_writes`]), so that its heartbeats carry the write counts too.
+    pub async fn with_pack_counts(
+        name: &str,
+        runtime: Arc<R>,
+        packs: PackCounter,
+        commit: PackCommit,
+    ) -> Self {
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let configure = |config: &mut DaemonConfig| {
+            config.recheck_every = Duration::from_millis(20);
+        };
+        Self::build_all(
+            name,
+            runtimes,
+            runtime,
+            Duration::from_secs(40),
+            configure,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(packs),
+            Some(commit),
+        )
+        .await
+    }
+
     /// Starts a server and a daemon that sets `commit` from each Welcome
     /// ([`Daemon::with_pack_writes`]).
     pub async fn with_pack_commit(name: &str, runtime: Arc<R>, commit: PackCommit) -> Self {

@@ -50,6 +50,10 @@ pub enum Gate {
     /// helper event timed, CPU and disk writes sampled, the clones kept for `image
     /// harvest` (give `--guest-binary` and `--keep`).
     E1,
+    /// The iOS simulator inside a guest: first launch of Xcode, a runtime added, a device
+    /// created, booted and photographed, one result frame per step (give `--guest-binary`;
+    /// the base needs `image setup --xcode --sim-runtime`).
+    E3,
     /// Whether a root offline write into a guest volume works.
     P0,
     /// The third-VM limit error, and the slot after SIGKILL of a helper.
@@ -95,6 +99,20 @@ pub struct ProbeArgs {
     /// `image harvest` can read the guest's disk.
     #[arg(long)]
     pub keep: bool,
+    /// E3 only: which guests to run, one after the other: `on` (a graphics device, the
+    /// default, unless `--headless`), `off` (none) or `both` (`off` first, then `on`).
+    #[arg(long, value_enum)]
+    pub graphics: Option<Graphics>,
+}
+
+/// The guests `probe e3` runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum Graphics {
+    On,
+    Off,
+    /// Without graphics first, then with.
+    Both,
 }
 
 #[derive(Debug, Args)]
@@ -119,9 +137,18 @@ pub enum ImageCmd {
         /// The new bundle directory; it must not exist.
         #[arg(long)]
         out: PathBuf,
-        /// The guest disk's size.
+        /// The guest disk's size. Xcode, its simulator runtimes and a simulator need far
+        /// more than the default; `image setup --xcode` refuses a disk that is too small.
         #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u64).range(32..=4096))]
         disk_gib: u64,
+        /// The guest's CPU count (default: what the restore image needs, at least 2). A
+        /// value below the restore image's minimum is refused. The base records it.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(2..=64))]
+        cpus: Option<u32>,
+        /// The guest's memory in MiB (default: what the restore image needs, at least
+        /// 4096). A value below the restore image's minimum is refused. The base records it.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(4096..=524_288))]
+        memory_mib: Option<u64>,
         /// As root, write the Setup Assistant marker and the probe launch daemons into
         /// the installed image (probe P0's question).
         #[arg(long)]
@@ -140,6 +167,30 @@ pub enum ImageCmd {
         /// The `kbf-guest` for macOS to copy onto the guest's disk; the mount daemon runs it.
         #[arg(long)]
         guest_binary: Option<PathBuf>,
+        /// An Xcode.app to clone into the guest's /Applications/Xcode.app (a copy-on-write
+        /// clone where the filesystems allow, else a copy; owner root:wheel). The guest
+        /// disk needs the room: the free space is checked first. A symbolic link in the
+        /// app is copied as a link when its target stays inside the app, else refused.
+        #[arg(long)]
+        xcode: Option<PathBuf>,
+        /// A simulator runtime to stage under /private/var/kbf-sim/runtimes: a disk image
+        /// (`<name>.dmg`, a file) or an exported bundle (`<name>.exportedBundle`, a directory,
+        /// what `xcodebuild -downloadPlatform iOS -exportPath` writes). Repeat the flag for
+        /// several (at most 8, with different names); the directory then holds exactly these
+        /// (a setup that names none empties it). The report records each image's name, size
+        /// and SHA-256, and each bundle's files with a SHA-256 for each.
+        #[arg(long = "sim-runtime", value_name = "DMG_OR_BUNDLE")]
+        sim_runtimes: Vec<PathBuf>,
+        /// An app bundle (`<name>.app`, built for the iOS simulator, with an Info.plist) to
+        /// stage under /private/var/kbf-sim/apps for `probe e3` to install and launch; copied
+        /// by the same rules as --xcode. The directory then holds exactly this app.
+        #[arg(long)]
+        sim_app: Option<PathBuf>,
+        /// Copy symbolic links inside Xcode.app (or the app) whose target leaves the app (an absolute
+        /// path elsewhere, or more `..` than the link is deep) as links, and list them in
+        /// the report. Without this flag such a link is refused.
+        #[arg(long)]
+        allow_external_links: bool,
     },
     /// As root, copy a fixed allowlist of diagnostics (the probe daemons' logs, the local
     /// marker, the unified log's data files, crash reports) out of a stopped guest's disk

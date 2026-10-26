@@ -20,6 +20,44 @@ pub const MACHINE_ID: &str = "machine-identifier";
 /// The four file names, in the order they are cloned.
 pub const FILES: [&str; 4] = [DISK, AUX, HARDWARE_MODEL, MACHINE_ID];
 
+/// The file in a base bundle's directory that records the sizes the base was built with.
+/// It is not one of [`FILES`]: a clone does not copy it, a run reads it from the base.
+pub const SIZING: &str = "sizing.json";
+
+/// The sizes `image base` was asked for. `None` keeps what the restore image needs (at
+/// least 2 CPUs and 4 GiB of memory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sizing {
+    pub disk_gib: u64,
+    pub cpus: Option<u32>,
+    pub memory_mib: Option<u64>,
+}
+
+/// The sizes a base bundle was built with, as `sizing.json` records them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Recorded {
+    pub cpus: u32,
+    pub memory_mib: u64,
+    pub disk_gib: u64,
+}
+
+/// Writes the sizes the install used into the base bundle `dir`.
+///
+/// # Errors
+/// The file could not be written.
+pub fn record_sizing(dir: &Path, sizing: &Recorded) -> io::Result<()> {
+    let text = serde_json::to_string_pretty(sizing).map_err(io::Error::other)?;
+    std::fs::write(dir.join(SIZING), format!("{text}\n"))
+}
+
+/// The sizes recorded in the base bundle `dir`; `None` for a base built before the record
+/// existed, or whose record cannot be read.
+#[must_use]
+pub fn recorded_sizing(dir: &Path) -> Option<Recorded> {
+    let text = std::fs::read_to_string(dir.join(SIZING)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// What a clone does with the machine identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Identity {

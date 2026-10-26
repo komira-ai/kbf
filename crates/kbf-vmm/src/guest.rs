@@ -507,6 +507,24 @@ pub fn offline_payload_from(binary: &Path) -> Result<Vec<OfflineFile>, String> {
     Ok(offline_payload(Some(bytes)))
 }
 
+/// The label of the root daemon that runs the iOS simulator probe (`kbf-guest sim`) once
+/// per boot. Its log is `/var/log/<label>.log`, which the harvest reads.
+pub const SIM_LABEL: &str = "com.kbf.sim";
+
+/// The launch daemon of the simulator probe, written by `image setup` when it stages Xcode,
+/// a runtime or an app (a base without those has no daemon, so no other probe starts it).
+/// It runs from the guest's own disk like the others, once per boot, as root; the
+/// deadlines are the defaults of `kbf-guest sim`.
+#[must_use]
+pub fn sim_payload() -> Vec<OfflineFile> {
+    let args = guest_args(&["sim", "--vsock-port", &VSOCK_PORT.to_string()]);
+    vec![OfflineFile {
+        path: format!("Library/LaunchDaemons/{SIM_LABEL}.plist"),
+        contents: daemon_plist(SIM_LABEL, None, &args, None, false).into_bytes(),
+        mode: 0o644,
+    }]
+}
+
 /// The reason `image base --offline-setup` and `image setup` give when no guest binary was
 /// named: the mount daemon runs a copy of it from the guest's own disk.
 pub const NEEDS_GUEST_BINARY: &str = "needs --guest-binary: the guest's mount daemon runs a copy of kbf-guest from the guest's own disk (the copy on the share cannot be reached before the share is mounted)";
@@ -803,6 +821,37 @@ mod tests {
         assert_eq!(plist.matches("<string>").count(), 6, "{plist}");
         assert_eq!(SHUTDOWN_PORT, 5001);
         assert_ne!(SHUTDOWN_PORT, VSOCK_PORT);
+    }
+
+    /// Catches a simulator daemon that runs as a user (it needs root for the first launch
+    /// and the runtime add), runs from the share (not mounted when launchd loads it), is
+    /// restarted for ever (a failed run would repeat for hours), runs a shell, or is part of
+    /// the payload of every base (the other probes would start the simulator too).
+    #[test]
+    fn the_simulator_daemon_is_root_once_from_the_guest_disk_and_not_in_the_base_payload() {
+        let files = sim_payload();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "Library/LaunchDaemons/com.kbf.sim.plist");
+        assert_eq!(files[0].mode, 0o644);
+        let plist = plist_of(&files, SIM_LABEL);
+        assert!(
+            holds(&[
+                plist.contains("<string>com.kbf.sim</string>"),
+                plist.contains(&format!("<string>{BOOTSTRAP}</string>")),
+                plist.contains("<string>sim</string>"),
+                plist.contains("<string>--vsock-port</string>"),
+                plist.contains(&format!("<string>{VSOCK_PORT}</string>")),
+                plist.contains("<key>RunAtLoad</key>"),
+                plist.contains("<string>/var/log/com.kbf.sim.log</string>"),
+                !plist.contains("UserName"),
+                !plist.contains("KeepAlive"),
+                !plist.contains(GUEST_SHARE),
+            ]),
+            "{plist}"
+        );
+        assert_eq!(plist.matches("<string>").count(), 6, "{plist}");
+        let base = offline_payload(Some(Vec::new()));
+        assert!(base.iter().all(|f| !f.path.contains("com.kbf.sim")));
     }
 
     /// Catches a binary read from the wrong place or a missing file that is not reported.

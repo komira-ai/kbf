@@ -5,6 +5,8 @@ This page says what `crates/kbf-proxy` is and does now. The design it serves is
 that described the removed machinery are gone and their numbers (6, 13 and 15 onward) are not
 reused.
 
+The recommended way to update a frontend without failing a build is a load balancer in front of several frontends: [frontends-behind-a-load-balancer.md](../deploy/frontends-behind-a-load-balancer.md).
+
 The proxy is a plain load balancer over frontends that run on their own (the `[[proxy.frontend]]`
 tables, section 9). The two-slot supervision of frontend children was removed from the installer
 and from this crate: the slots and the gate (`slot`), the hold queue (`hold`), the routing of a

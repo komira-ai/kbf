@@ -495,6 +495,43 @@ fn the_wire_counts_are_the_planes_counts() {
     assert_eq!(PackReadCounts::from(stats), want);
 }
 
+/// Asserts that the wire write counts are the plane's write counts, each in its own field: the
+/// twelve are told apart by their values.
+#[test]
+fn the_wire_write_counts_are_the_planes_write_counts() {
+    let stats = WriteStats {
+        packs: 1,
+        packed: 2,
+        packed_bytes: 3,
+        fallbacks: FallbackStats {
+            off: 4,
+            unfit: 5,
+            unsupported: 6,
+            refused: 7,
+            store: 8,
+            record: 9,
+            index: 10,
+        },
+        missing_indexed: 11,
+        missing_unasked: 12,
+    };
+    let want = PackWriteCounts {
+        packs: 1,
+        packed: 2,
+        packed_bytes: 3,
+        fallback_off: 4,
+        fallback_unfit: 5,
+        fallback_unsupported: 6,
+        fallback_refused: 7,
+        fallback_store: 8,
+        fallback_record: 9,
+        fallback_index: 10,
+        missing_indexed: 11,
+        missing_unasked: 12,
+    };
+    assert_eq!(PackWriteCounts::from(stats), want);
+}
+
 /// Asserts the counts' text, which the plane logs when it is dropped.
 #[test]
 fn the_counts_are_spelled_for_the_log() {

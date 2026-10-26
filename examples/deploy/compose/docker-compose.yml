@@ -1,0 +1,89 @@
+# Example: Envoy and two kbf frontends in front of one shared Postgres state store.
+# See docs/deploy/frontends-behind-a-load-balancer.md.
+#
+# NOT in this file, on purpose:
+#   - the object store (the cold store). It is configured on the storage nodes
+#     (--cold-store), not on the frontends.
+#   - the storage nodes and the build daemons. They run on bare metal and dial this
+#     compose host's published ports 8980 (Buck2) and 8981 (worker listener) by the
+#     farm's DNS name. The frontends dial one storage node (`storage` in the
+#     frontend toml files) and learn the rest from the farm's storage map.
+#
+# This is a wiring example for trying the shape, not a production deployment.
+#
+# Before `docker compose up`, make these (none is shipped here):
+#   ./tls/      reapi.pem, reapi.key        the REAPI certificate, covering the name clients dial
+#               worker.pem, worker.key      the worker listener's certificate, same name
+#               farm-ca.pem                 the CA that signs node and frontend certificates
+#               storage-client.pem, .key    the frontend's certificate toward storage
+#   ./secrets/  operator-token              32+ characters, owned by the container's user,
+#                                           mode 0600 or 0400 (kbf refuses to start otherwise)
+# and load the frontend image (an OCI tarball per linux arch, the frontend image
+# release asset, see docs/artifacts.md):  docker load -i <tarball>
+
+services:
+  envoy:
+    image: envoyproxy/envoy:v1.31.0
+    volumes:
+      - ../envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - "8980:8980"   # REAPI, TCP passthrough to the frontends
+      - "8981:8981"   # worker listener, TCP passthrough (mutual TLS reaches the frontend)
+      # 8982 (operator API) and 9901 (Envoy admin) are deliberately not published.
+    depends_on:
+      - frontend-a
+      - frontend-b
+
+  frontend-a:
+    # The frontend image release asset, loaded with `docker image load`, is tagged
+    # kbf-frontend:<commit> (docs/artifacts.md). Its entrypoint runs `kbf --mode=frontend`
+    # and its default arguments read /etc/kbf/kbf.toml, mounted below.
+    image: kbf-frontend:${KBF_COMMIT:?set KBF_COMMIT to the release commit}
+    volumes:
+      - ./frontend-a.toml:/etc/kbf/kbf.toml:ro
+      - ./tls:/etc/kbf/tls:ro
+      - ./secrets:/etc/kbf/secrets:ro
+    # A stop drains: the frontend keeps its open Execute streams until their actions
+    # finish. Compose kills a container 10 s after SIGTERM unless told otherwise, and
+    # that fails every action still running. Give it at least your longest action.
+    stop_grace_period: 1h
+    stop_signal: SIGTERM
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend-b:
+    image: kbf-frontend:${KBF_COMMIT:?set KBF_COMMIT to the release commit}
+    volumes:
+      - ./frontend-b.toml:/etc/kbf/kbf.toml:ro
+      - ./tls:/etc/kbf/tls:ro
+      - ./secrets:/etc/kbf/secrets:ro
+    stop_grace_period: 1h
+    stop_signal: SIGTERM
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # The shared state store. Both frontends use the same database; the first one to
+  # start writes the `shared-writers` marker and neither fences the other.
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: kbf
+      POSTGRES_DB: kbf
+      # kbf refuses a password in --state-store and its client does not use TLS to
+      # Postgres, so this example lets any peer on the compose network in as `kbf`.
+      # That is for trying the shape only. Outside a lab, reach Postgres by a local
+      # socket, or on a network only the frontends can reach, with the role
+      # authorized by address.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kbf -d kbf"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+volumes:
+  postgres-data:

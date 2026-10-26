@@ -32,6 +32,7 @@ fn new(pack_reads: Option<worker::PackReadCounts>) -> worker::Heartbeat {
         report_hash: vec![7; 32],
         running: vec![worker::LeaseId { term: 2, seq: 9 }],
         pack_reads,
+        pack_writes: None,
     }
 }
 

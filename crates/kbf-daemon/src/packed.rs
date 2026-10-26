@@ -37,7 +37,8 @@
 //!
 //! The counts of what was served and why a read went elsewhere are [`PackStats`], logged when
 //! the last plane and [`PackCounter`] counting into them are dropped. A daemon given the counter
-//! ([`crate::Daemon::with_pack_reads`]) sends the totals in every heartbeat.
+//! ([`crate::Daemon::with_pack_reads`]) sends the read totals in every heartbeat, and the write
+//! totals too when it also writes packs ([`crate::Daemon::with_pack_writes`]).
 
 use std::fmt;
 use std::sync::Arc;
@@ -48,7 +49,7 @@ use futures::future::BoxFuture;
 use kbf_objstore::ObjectStore;
 use kbf_pack::{Blob, Fetch, ReadError, Reader, blob_digest};
 use kbf_proto::reapi::Digest;
-use kbf_proto::worker::PackReadCounts;
+use kbf_proto::worker::{PackReadCounts, PackWriteCounts};
 use kbf_state::BlobDigest;
 use kbf_transfer::cas::{Cas, CasError, Chunks, Intake, label};
 use kbf_transfer::{Record, Spool};
@@ -140,6 +141,26 @@ impl From<PackStats> for PackReadCounts {
             unasked: stats.unasked,
             lost: stats.lost,
             damaged: stats.damaged,
+        }
+    }
+}
+
+impl From<WriteStats> for PackWriteCounts {
+    fn from(stats: WriteStats) -> Self {
+        let by = stats.fallbacks;
+        Self {
+            packs: stats.packs,
+            packed: stats.packed,
+            packed_bytes: stats.packed_bytes,
+            fallback_off: by.off,
+            fallback_unfit: by.unfit,
+            fallback_unsupported: by.unsupported,
+            fallback_refused: by.refused,
+            fallback_store: by.store,
+            fallback_record: by.record,
+            fallback_index: by.index,
+            missing_indexed: stats.missing_indexed,
+            missing_unasked: stats.missing_unasked,
         }
     }
 }

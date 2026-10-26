@@ -213,6 +213,20 @@ fn worker_messages_round_trip() {
                 lost: 3,
                 damaged: 4,
             }),
+            pack_writes: Some(worker::PackWriteCounts {
+                packs: 1,
+                packed: 2,
+                packed_bytes: 3,
+                fallback_off: 4,
+                fallback_unfit: 5,
+                fallback_unsupported: 6,
+                fallback_refused: 7,
+                fallback_store: 8,
+                fallback_record: 9,
+                fallback_index: 10,
+                missing_indexed: 11,
+                missing_unasked: 12,
+            }),
         })),
     };
     let back = DaemonMessage::decode(heartbeat.encode_to_vec().as_slice()).expect("decode");

@@ -50,8 +50,9 @@
 //! as it reads them are stored by `C`, not packed.
 //!
 //! **Counts** are [`WriteStats`] (part of [`super::PackStats`]), logged with the read counts when
-//! the plane is dropped. Sending them in the heartbeat is a follow-up: the proto carries read
-//! counts only.
+//! the plane is dropped. A daemon that writes packs
+//! ([`crate::Daemon::with_pack_writes`]) also sends them in every heartbeat
+//! (`Heartbeat.pack_writes`), read from the [`super::PackCounter`] its plane counts into.
 
 use std::collections::BTreeSet;
 use std::fmt;
