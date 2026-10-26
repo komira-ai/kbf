@@ -308,9 +308,6 @@ impl State {
     /// Writes the changed summaries and the floors not yet written; `now` skips the wait
     /// for the write-behind interval.
     pub(super) fn write_behind(&mut self, now: bool) {
-        if self.learned.off() || self.fenced {
-            return;
-        }
         let rows = if now {
             self.learned.due_now()
         } else {
