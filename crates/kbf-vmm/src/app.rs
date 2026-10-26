@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::cli::{BenchArgs, Cli, Cmd, Common, ImageCmd, ProbeArgs};
-use crate::image::BaseArgs;
+use crate::image::{BaseArgs, SetupArgs};
 use crate::probe::{Ctx, Timing};
 use crate::report::{Report, Status};
 use crate::system::System;
@@ -83,6 +83,8 @@ pub fn run(
             sha256,
             out,
             disk_gib,
+            cpus,
+            memory_mib,
             offline_setup,
             guest_binary,
         }) => image::base(
@@ -92,13 +94,28 @@ pub fn run(
                 sha256: sha256.clone(),
                 out: out.clone(),
                 disk_gib: *disk_gib,
+                cpus: *cpus,
+                memory_mib: *memory_mib,
                 offline_setup: *offline_setup,
                 guest_binary: guest_binary.clone(),
             },
         ),
-        Cmd::Image(ImageCmd::Setup { base, guest_binary }) => {
-            image::setup(sys, base, guest_binary.as_deref())
-        }
+        Cmd::Image(ImageCmd::Setup {
+            base,
+            guest_binary,
+            xcode,
+            sim_runtimes,
+            allow_external_links,
+        }) => image::setup(
+            sys,
+            base,
+            &SetupArgs {
+                guest_binary: guest_binary.clone(),
+                xcode: xcode.clone(),
+                sim_runtimes: sim_runtimes.clone(),
+                allow_external_links: *allow_external_links,
+            },
+        ),
         Cmd::Image(ImageCmd::Harvest { bundle, out }) => image::harvest(sys, bundle, out),
     };
     let failed = report.status == Status::Error;

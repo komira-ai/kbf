@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::bundle::Sizing;
 use crate::spec::{Event, VmSpec};
 
 /// What waiting for a VM helper's next event found.
@@ -111,6 +112,13 @@ pub trait System {
     /// # Errors
     /// A step failed; the message names it.
     fn offline_write(&self, disk: &Path, files: &[OfflineFile]) -> Result<Value, String>;
+    /// Attaches the raw disk image `disk`, stages Xcode and the simulator runtimes of
+    /// `plan` into its Data volume as root (`stage::execute`), detaches, and returns what
+    /// was staged.
+    ///
+    /// # Errors
+    /// A step failed or the volume is too small; the message names it.
+    fn offline_stage(&self, disk: &Path, plan: &crate::stage::Plan) -> Result<Value, String>;
     /// Attaches the raw disk image `disk` read-only, copies the harvest allowlist out of
     /// its Data volume into the new directory `out`, detaches, and returns the manifest.
     ///
@@ -127,12 +135,12 @@ pub trait System {
     /// # Errors
     /// The download failed.
     fn fetch(&self, url: &str, dest: &Path) -> Result<(), String>;
-    /// Installs macOS from the restore image `ipsw` into a new bundle at `out`, with a
-    /// disk of `disk_gib` GiB.
+    /// Installs macOS from the restore image `ipsw` into a new bundle at `out`, sized as
+    /// `sizing` says.
     ///
     /// # Errors
     /// The restore image is unusable for this host or the install failed.
-    fn install_image(&self, ipsw: &Path, out: &Path, disk_gib: u64) -> Result<Value, String>;
+    fn install_image(&self, ipsw: &Path, out: &Path, sizing: &Sizing) -> Result<Value, String>;
     /// The helper mode (`vm-run`): runs the VM `spec` describes until stdin closes, printing
     /// [`Event`]s as JSON lines on stdout.
     ///

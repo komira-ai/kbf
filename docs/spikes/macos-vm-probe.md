@@ -555,6 +555,47 @@ fallback did, `force-stopped ...` when neither did), `stop.vsock_acked` and
 `shutdown-command` event, and `/var/log/com.kbf.probe.shutdown.log` in the harvest shows
 the listener's `bind` result and each connection.
 
+## E3: Xcode and simulator runtimes in the guest image
+
+The iOS simulator probe needs Xcode and a simulator runtime inside the guest. The base is
+sized for it when it is built, and `image setup` stages the two inputs as root while the
+guest is off:
+
+```sh
+sudo $D/kbf-vmm image base --ipsw <ipsw> --sha256 <digest> --out $W/base \
+  --cpus 6 --memory-mib 16384 --disk-gib 200
+sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest \
+  --xcode /Applications/Xcode.app --sim-runtime ~/Downloads/iOS_27_Simulator_Runtime.dmg \
+  | tee $W/e3-setup.json
+```
+
+- `--cpus`, `--memory-mib` and `--disk-gib` default to what they were before (the restore
+  image's minimums, at least 2 CPUs and 4096 MiB, and 64 GiB). A value below the restore
+  image's minimum is refused. The sizes the install used are written to `sizing.json` in
+  the base bundle.
+- `--xcode` clones the app into the guest's `/Applications/Xcode.app`. The guest disk is on
+  another volume than the app, so in practice this is a file-by-file copy (a tree clone is
+  tried first). Everything becomes owned by root:wheel; the setuid, setgid and sticky bits
+  are dropped; extended attributes follow `std::fs::copy`. The new copy is built under a
+  staging name and renamed into place, so a failed run never leaves a half Xcode.app under
+  the real name, and a rerun replaces the earlier copy.
+- A symbolic link in the app is recreated, never followed, when its target stays inside the
+  app: relative with the `..` components first and no more than the link is deep, or an
+  absolute path into `/Applications/Xcode.app`. Any other link, a socket, a pipe or a
+  device is refused before the disk is touched. `--allow-external-links` copies such links
+  as links and lists them in the report.
+- `--sim-runtime` (repeatable, at most 8, each named `<name>.dmg` with letters, digits,
+  `.`, `_`, `-`) copies the image to `/private/var/kbf-sim/runtimes/<name>.dmg` while
+  hashing it; the directory then holds exactly the runtimes of the latest setup. The report
+  records each one's name, size and SHA-256.
+- The free space of the guest's Data volume is read first. If Xcode and the runtimes plus
+  4 GiB of headroom do not fit, nothing is written and the error says what is needed, what
+  is free and to rebuild the base with a larger `--disk-gib`.
+- What was staged is also written into the guest as `/private/var/kbf-sim/staged.json`.
+- Every directory the copy writes through on the guest volume must be a plain directory; a
+  link or a file in the way is an error, so a guest that ran earlier cannot redirect the
+  root copy.
+
 ## What to send back
 
 Everything the commands wrote, including each helper's log (the cause of a VM that did

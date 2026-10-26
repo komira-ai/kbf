@@ -10,7 +10,7 @@ use std::time::Duration;
 use kbf_testkit::dir::TestDir;
 use serde_json::{Value, json};
 
-use crate::bundle::FILES;
+use crate::bundle::{FILES, Sizing};
 use crate::spec::{Event, LIMIT_EXCEEDED, VmSpec};
 use crate::system::{OfflineFile, Poll, Signature, System, VmProcess};
 
@@ -250,7 +250,9 @@ pub struct FakeSystem {
     pub fetch_body: RefCell<Vec<u8>>,
     pub fetched: RefCell<Vec<String>>,
     pub install: RefCell<Result<Value, String>>,
-    pub installs: RefCell<Vec<(PathBuf, PathBuf, u64)>>,
+    pub installs: RefCell<Vec<(PathBuf, PathBuf, Sizing)>>,
+    pub stage: RefCell<Result<Value, String>>,
+    pub stage_calls: RefCell<Vec<(PathBuf, crate::stage::Plan)>>,
     pub helper: RefCell<Result<(), String>>,
     pub helper_specs: RefCell<Vec<VmSpec>>,
     next_pid: Cell<u32>,
@@ -284,7 +286,11 @@ impl FakeSystem {
             fetch: RefCell::new(Ok(())),
             fetch_body: RefCell::new(b"ipsw-bytes".to_vec()),
             fetched: RefCell::new(Vec::new()),
-            install: RefCell::new(Ok(json!({"macos_version": "27.0.0"}))),
+            install: RefCell::new(Ok(
+                json!({"macos_version": "27.0.0", "cpus": 2, "memory_mib": 4096}),
+            )),
+            stage: RefCell::new(Ok(json!({"xcode": null, "runtimes": null}))),
+            stage_calls: RefCell::new(Vec::new()),
             installs: RefCell::new(Vec::new()),
             helper: RefCell::new(Ok(())),
             helper_specs: RefCell::new(Vec::new()),
@@ -419,6 +425,12 @@ impl System for FakeSystem {
         ));
         self.offline.borrow().clone()
     }
+    fn offline_stage(&self, disk: &Path, plan: &crate::stage::Plan) -> Result<Value, String> {
+        self.stage_calls
+            .borrow_mut()
+            .push((disk.to_owned(), plan.clone()));
+        self.stage.borrow().clone()
+    }
     fn offline_harvest(&self, disk: &Path, out: &Path) -> Result<Value, String> {
         self.harvest_calls
             .borrow_mut()
@@ -436,10 +448,10 @@ impl System for FakeSystem {
         }
         r
     }
-    fn install_image(&self, ipsw: &Path, out: &Path, disk_gib: u64) -> Result<Value, String> {
+    fn install_image(&self, ipsw: &Path, out: &Path, sizing: &Sizing) -> Result<Value, String> {
         self.installs
             .borrow_mut()
-            .push((ipsw.to_owned(), out.to_owned(), disk_gib));
+            .push((ipsw.to_owned(), out.to_owned(), *sizing));
         self.install.borrow().clone()
     }
     fn run_vm_helper(&self, spec: &VmSpec) -> Result<(), String> {

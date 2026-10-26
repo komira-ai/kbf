@@ -1,0 +1,877 @@
+//! Tests of `stage`: the plan of an Xcode.app and runtime images, and writing a plan into
+//! a fake Data volume (a temporary directory). Nothing here needs root or macOS; ownership
+//! and the tree clone are replaced through [`Env`].
+
+use std::cell::RefCell;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+
+use crate::fake::{holds, tmp};
+use crate::stage::*;
+
+/// The SHA-256 of the bytes `hello`.
+const HELLO: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+fn write(path: &Path, text: &str, mode: u32) {
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+    std::fs::write(path, text).expect("write");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+fn link(target: &str, at: &Path) {
+    std::fs::create_dir_all(at.parent().expect("parent")).expect("dirs");
+    std::os::unix::fs::symlink(target, at).expect("symlink");
+}
+
+/// A small Xcode.app: a tool, a plist, a framework with the usual version links.
+fn fake_xcode(dir: &Path) -> PathBuf {
+    let app = dir.join("Xcode.app");
+    write(
+        &app.join("Contents/Developer/usr/bin/xcodebuild"),
+        "tool",
+        0o755,
+    );
+    write(&app.join("Contents/Info.plist"), "plist", 0o644);
+    write(
+        &app.join("Contents/Frameworks/A.framework/Versions/A/lib"),
+        "lib!",
+        0o644,
+    );
+    link(
+        "A",
+        &app.join("Contents/Frameworks/A.framework/Versions/Current"),
+    );
+    link(
+        "Versions/Current/lib",
+        &app.join("Contents/Frameworks/A.framework/lib"),
+    );
+    link("../Info.plist", &app.join("Contents/Developer/Info.plist"));
+    app
+}
+
+fn err_of(r: Result<XcodePlan, StageError>) -> String {
+    r.expect_err("refused").to_string()
+}
+
+/// Catches a plan that lists a file before its directory (the copy would fail), loses a
+/// size, counts a link as a file, or follows a link instead of recording its target.
+#[test]
+fn the_plan_of_an_app_lists_directories_first_with_sizes_and_link_targets() {
+    let dir = tmp("stage-plan");
+    let app = fake_xcode(&dir);
+    let p = plan_xcode(&app, false).expect("plan");
+    assert_eq!(
+        p.bytes,
+        ("tool".len() + "plist".len() + "lib!".len()) as u64
+    );
+    let seen: Vec<String> = p
+        .nodes
+        .iter()
+        .map(|n| match n {
+            Node::Dir { rel, .. } => format!("d {}", rel.display()),
+            Node::File { rel, bytes, .. } => format!("f {} {bytes}", rel.display()),
+            Node::Link { rel, target } => format!("l {} -> {}", rel.display(), target.display()),
+        })
+        .collect();
+    let at = |s: &str| {
+        seen.iter()
+            .position(|x| x == s)
+            .unwrap_or_else(|| panic!("{s} in {seen:?}"))
+    };
+    assert!(at("d Contents") < at("f Contents/Info.plist 5"));
+    assert!(
+        at("d Contents/Frameworks/A.framework/Versions/A")
+            < at("f Contents/Frameworks/A.framework/Versions/A/lib 4")
+    );
+    assert!(holds(&[
+        seen.contains(&"l Contents/Frameworks/A.framework/Versions/Current -> A".to_owned()),
+        seen.contains(&"l Contents/Frameworks/A.framework/lib -> Versions/Current/lib".to_owned()),
+        seen.contains(&"l Contents/Developer/Info.plist -> ../Info.plist".to_owned()),
+    ]));
+    assert!(p.external_links.is_empty());
+    // The same tree gives the same plan, in the same order.
+    assert_eq!(plan_xcode(&app, false).expect("again"), p);
+}
+
+/// Catches modes copied with the setuid, setgid or sticky bits.
+#[test]
+fn modes_drop_the_setuid_setgid_and_sticky_bits() {
+    let dir = tmp("stage-modes");
+    let app = fake_xcode(&dir);
+    let tool = app.join("Contents/Developer/usr/bin/xcodebuild");
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o6755)).expect("chmod");
+    let p = plan_xcode(&app, false).expect("plan");
+    let mode = p.nodes.iter().find_map(|n| match n {
+        Node::File { rel, mode, .. } if rel.ends_with("xcodebuild") => Some(*mode),
+        _ => None,
+    });
+    assert_eq!(mode, Some(0o755));
+}
+
+/// Catches an `--xcode` that is a link (its target could be anything), a directory that
+/// is not an Xcode.app, a plain file, and a missing path.
+#[test]
+fn the_app_itself_must_be_a_real_xcode_directory() {
+    let dir = tmp("stage-root");
+    let app = fake_xcode(&dir);
+    link("Xcode.app", &dir.join("Alias.app"));
+    assert_eq!(
+        plan_xcode(&dir.join("Alias.app"), false),
+        Err(StageError::Symlink(dir.join("Alias.app")))
+    );
+    std::fs::create_dir_all(dir.join("Empty.app/Contents")).expect("empty");
+    assert!(err_of(plan_xcode(&dir.join("Empty.app"), false)).contains("not an Xcode.app"));
+    write(&dir.join("file.app"), "x", 0o644);
+    assert!(err_of(plan_xcode(&dir.join("file.app"), false)).contains("not an Xcode.app"));
+    assert!(err_of(plan_xcode(&dir.join("none.app"), false)).contains("stat"));
+    // A tool that is itself a link does not count as the tool.
+    std::fs::remove_file(app.join("Contents/Developer/usr/bin/xcodebuild")).expect("rm");
+    link(
+        "/usr/bin/true",
+        &app.join("Contents/Developer/usr/bin/xcodebuild"),
+    );
+    assert!(err_of(plan_xcode(&app, true)).contains("not an Xcode.app"));
+}
+
+/// Catches a link rule that lets a target out of the app: an absolute path elsewhere, one
+/// into the app that climbs out with `..`, more `..` than the link is deep, or a `..` after a
+/// name (which climbs out through a link the name goes through); and one that refuses a
+/// link that stays inside.
+#[test]
+fn a_link_target_must_stay_inside_the_app() {
+    let inside = |t: &str, depth: usize| stays_inside(Path::new(t), depth);
+    for ok in [
+        ("A", 0),
+        ("Versions/Current/lib", 3),
+        ("../Info.plist", 1),
+        ("../../x", 2),
+        (".", 0),
+        ("./a", 0),
+        ("/Applications/Xcode.app/Contents/lib", 0),
+        ("/Applications/Xcode.app", 5),
+    ] {
+        assert!(inside(ok.0, ok.1), "{ok:?}");
+    }
+    for bad in [
+        ("..", 0),
+        ("../x", 0),
+        ("../../x", 1),
+        ("a/../..", 5),
+        ("a/..", 5),
+        ("", 3),
+        ("/usr/lib/x", 3),
+        ("/Applications/Xcode.appx/x", 0),
+        ("/Applications/Xcode.app/../../etc", 0),
+        ("/", 0),
+    ] {
+        assert!(!inside(bad.0, bad.1), "{bad:?}");
+    }
+}
+
+/// Catches an escaping link that is copied by default, one whose refusal does not name the
+/// link, the target and the flag, and a flag that does not list what it let through.
+#[test]
+fn an_escaping_link_is_refused_unless_allowed_and_then_listed() {
+    let dir = tmp("stage-escape");
+    let app = fake_xcode(&dir);
+    link("/usr/share/man", &app.join("Contents/Developer/usr/man"));
+    let e = err_of(plan_xcode(&app, false));
+    assert!(
+        holds(&[
+            e.contains("Contents/Developer/usr/man"),
+            e.contains("/usr/share/man"),
+            e.contains("--allow-external-links"),
+        ]),
+        "{e}"
+    );
+    let p = plan_xcode(&app, true).expect("allowed");
+    assert_eq!(
+        p.external_links,
+        vec![(
+            PathBuf::from("Contents/Developer/usr/man"),
+            PathBuf::from("/usr/share/man")
+        )]
+    );
+    // Too many `..` for the link's depth is an escape too.
+    let dir2 = tmp("stage-escape2");
+    let app2 = fake_xcode(&dir2);
+    link("../../../../..", &app2.join("Contents/up"));
+    assert!(err_of(plan_xcode(&app2, false)).contains("leaves the app"));
+}
+
+/// Catches a socket or other special file being skipped silently or copied as a file.
+#[test]
+fn a_special_file_is_refused() {
+    let dir = tmp("stage-special");
+    let app = fake_xcode(&dir);
+    let _socket = std::os::unix::net::UnixListener::bind(app.join("Contents/s")).expect("socket");
+    let e = err_of(plan_xcode(&app, true));
+    assert!(e.contains("Contents/s") && e.contains("socket"), "{e}");
+}
+
+/// Catches a walk with no depth bound.
+#[test]
+fn a_tree_nested_past_the_depth_limit_is_refused() {
+    let dir = tmp("stage-deep");
+    let app = fake_xcode(&dir);
+    let mut deep = app.join("Contents");
+    for _ in 0..=MAX_DEPTH {
+        deep.push("d");
+    }
+    std::fs::create_dir_all(&deep).expect("deep");
+    assert!(err_of(plan_xcode(&app, false)).contains("deeper than"));
+}
+
+/// Catches a runtime name that could climb out of the runtime directory or hide there, a
+/// link or directory taken for the image, a repeated name, and a list without a bound.
+#[test]
+fn runtimes_are_plain_dmg_files_with_distinct_safe_names() {
+    let dir = tmp("stage-runtimes");
+    write(&dir.join("iOS_27.dmg"), "hello", 0o644);
+    write(&dir.join("watchOS-27.0.dmg"), "hello!", 0o644);
+    let ok = plan_runtimes(&[dir.join("iOS_27.dmg"), dir.join("watchOS-27.0.dmg")]).expect("ok");
+    assert_eq!(
+        ok.iter()
+            .map(|r| (r.name.as_str(), r.bytes))
+            .collect::<Vec<_>>(),
+        vec![("iOS_27.dmg", 5), ("watchOS-27.0.dmg", 6)]
+    );
+    assert_eq!(plan_runtimes(&[]), Ok(Vec::new()));
+    for bad in [
+        "a b.dmg",
+        "x.dmg.zip",
+        ".dmg",
+        ".hidden.dmg",
+        "semi;colon.dmg",
+        "ü.dmg",
+        "plain",
+    ] {
+        write(&dir.join(bad), "x", 0o644);
+        assert_eq!(
+            plan_runtimes(&[dir.join(bad)]),
+            Err(StageError::BadRuntimeName(dir.join(bad))),
+            "{bad}"
+        );
+    }
+    link("iOS_27.dmg", &dir.join("link.dmg"));
+    assert_eq!(
+        plan_runtimes(&[dir.join("link.dmg")]),
+        Err(StageError::Symlink(dir.join("link.dmg")))
+    );
+    std::fs::create_dir(dir.join("dir.dmg")).expect("dir");
+    assert_eq!(
+        plan_runtimes(&[dir.join("dir.dmg")]),
+        Err(StageError::NotRegular(dir.join("dir.dmg")))
+    );
+    write(&dir.join("other/iOS_27.dmg"), "z", 0o644);
+    assert_eq!(
+        plan_runtimes(&[dir.join("iOS_27.dmg"), dir.join("other/iOS_27.dmg")]),
+        Err(StageError::DuplicateRuntime("iOS_27.dmg".into()))
+    );
+    let many: Vec<PathBuf> = (0..=MAX_RUNTIMES).map(|_| dir.join("iOS_27.dmg")).collect();
+    assert_eq!(plan_runtimes(&many), Err(StageError::TooManyRuntimes));
+    assert!(plan_runtimes(&[dir.join("missing.dmg")]).is_err());
+}
+
+/// What a test replaces of the host: the free space, whether the tree clone works, and the
+/// paths ownership was set on.
+struct Harness {
+    free: u64,
+    clone_ok: bool,
+    chowned: RefCell<Vec<PathBuf>>,
+    clones: RefCell<u32>,
+}
+
+impl Harness {
+    fn new(free: u64) -> Self {
+        Self {
+            free,
+            clone_ok: false,
+            chowned: RefCell::new(Vec::new()),
+            clones: RefCell::new(0),
+        }
+    }
+
+    fn run(&self, volume: &Path, plan: &Plan) -> Result<Value, String> {
+        let free = |_: &Path| Ok(self.free);
+        let clone = |src: &Path, dst: &Path| {
+            *self.clones.borrow_mut() += 1;
+            // A failed clone can leave part of the tree behind.
+            std::fs::create_dir(dst)?;
+            std::fs::write(dst.join("junk"), "left over")?;
+            if !self.clone_ok {
+                return Err(std::io::Error::from_raw_os_error(libc::EXDEV));
+            }
+            std::fs::remove_dir_all(dst)?;
+            copy_tree(src, dst)
+        };
+        let chown = |p: &Path| {
+            self.chowned.borrow_mut().push(p.to_owned());
+            Ok(())
+        };
+        execute(
+            volume,
+            plan,
+            &Env {
+                free_bytes: &free,
+                clone_tree: &clone,
+                chown_root: &chown,
+            },
+        )
+    }
+}
+
+/// A tree copy as a clone would make: same entries, same link targets.
+fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(dst)?;
+    for e in std::fs::read_dir(src)? {
+        let e = e?;
+        let (s, d) = (e.path(), dst.join(e.file_name()));
+        let ft = e.file_type()?;
+        if ft.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(&s)?, &d)?;
+        } else if ft.is_dir() {
+            copy_tree(&s, &d)?;
+        } else {
+            std::fs::copy(&s, &d)?;
+        }
+    }
+    Ok(())
+}
+
+const GIB: u64 = 1 << 30;
+
+fn volume_in(dir: &Path) -> PathBuf {
+    let v = dir.join("volume");
+    std::fs::create_dir_all(v.join("private/var")).expect("volume");
+    v
+}
+
+/// Lists every entry under `root` as `kind path [detail]`, sorted, for comparing trees.
+fn listing(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, at: &Path, out: &mut Vec<String>) {
+        let mut entries: Vec<_> = std::fs::read_dir(at)
+            .expect("dir")
+            .map(|e| e.expect("e"))
+            .collect();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for e in entries {
+            let p = e.path();
+            let rel = p.strip_prefix(root).expect("rel").display().to_string();
+            let meta = std::fs::symlink_metadata(&p).expect("meta");
+            if meta.file_type().is_symlink() {
+                out.push(format!(
+                    "l {rel} -> {}",
+                    std::fs::read_link(&p).expect("l").display()
+                ));
+            } else if meta.is_dir() {
+                out.push(format!("d {rel} {:o}", meta.permissions().mode() & 0o777));
+                walk(root, &p, out);
+            } else {
+                out.push(format!(
+                    "f {rel} {:o} {}",
+                    meta.permissions().mode() & 0o777,
+                    std::fs::read_to_string(&p).expect("text")
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// Catches a copy that drops a file, a mode, a directory or a link, replaces a link by what
+/// it points at, leaves the staging directory behind, skips the ownership of some entry, or
+/// does not recover from a clone that failed half way.
+#[test]
+fn xcode_is_copied_entry_for_entry_when_the_clone_is_refused() {
+    let dir = tmp("stage-copy");
+    let app = fake_xcode(&dir);
+    let volume = volume_in(&dir);
+    let plan = plan(Some(&app), &[], false).expect("plan");
+    let h = Harness::new(100 * GIB);
+    let out = h.run(&volume, &plan).expect("execute");
+    assert_eq!(*h.clones.borrow(), 1);
+    assert_eq!(out["xcode"]["method"], "copy");
+    assert_eq!(
+        listing(&volume.join("Applications/Xcode.app")),
+        listing(&app)
+    );
+    // Directory modes are final (the read-only case is covered below).
+    assert_eq!(
+        std::fs::metadata(
+            volume.join("Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild")
+        )
+        .expect("meta")
+        .permissions()
+        .mode()
+            & 0o777,
+        0o755
+    );
+    let apps = listing(&volume.join("Applications"));
+    assert!(apps.iter().all(|l| !l.contains("kbf-staging")), "{apps:?}");
+    assert!(!volume.join("Applications/.Xcode.app.kbf-staging").exists());
+    // Every entry of the copy (made under the staging name, before the rename), the app
+    // directory and `Applications` itself were handed to root.
+    let owned = h.chowned.borrow();
+    for node in &plan.xcode.as_ref().expect("xcode").nodes {
+        let want = volume
+            .join("Applications/.Xcode.app.kbf-staging")
+            .join(match node {
+                Node::Dir { rel, .. } | Node::File { rel, .. } | Node::Link { rel, .. } => rel,
+            });
+        assert!(owned.contains(&want), "{}", want.display());
+    }
+    assert!(owned.contains(&volume.join("Applications/.Xcode.app.kbf-staging")));
+    assert!(owned.contains(&volume.join("Applications")));
+}
+
+/// Catches a copy that cannot write into a directory whose final mode is read-only, and a
+/// final mode that is not applied.
+#[test]
+fn a_read_only_directory_is_filled_and_then_closed() {
+    let dir = tmp("stage-ro");
+    let app = fake_xcode(&dir);
+    let ro = app.join("Contents/Frameworks");
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+    let volume = volume_in(&dir);
+    let plan = plan(Some(&app), &[], false).expect("plan");
+    Harness::new(100 * GIB)
+        .run(&volume, &plan)
+        .expect("execute");
+    let mode = std::fs::metadata(volume.join("Applications/Xcode.app/Contents/Frameworks"))
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o555);
+    // Let the temporary directory be removed.
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::set_permissions(
+        volume.join("Applications/Xcode.app/Contents/Frameworks"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("chmod");
+}
+
+/// Catches a tree clone result that is not used, per-file copying after a good clone, and
+/// ownership skipped on the clone path (a clone keeps the host user as owner).
+#[test]
+fn a_tree_clone_is_used_when_it_works_and_owned_by_root_afterwards() {
+    let dir = tmp("stage-clone");
+    let app = fake_xcode(&dir);
+    let volume = volume_in(&dir);
+    let plan = plan(Some(&app), &[], false).expect("plan");
+    let mut h = Harness::new(100 * GIB);
+    h.clone_ok = true;
+    let out = h.run(&volume, &plan).expect("execute");
+    assert_eq!(out["xcode"]["method"], "clone");
+    assert_eq!(
+        listing(&volume.join("Applications/Xcode.app")),
+        listing(&app)
+    );
+    assert!(
+        h.chowned
+            .borrow()
+            .contains(&volume.join("Applications/.Xcode.app.kbf-staging/Contents/Info.plist"))
+    );
+    assert!(h.chowned.borrow().contains(
+        &volume.join("Applications/.Xcode.app.kbf-staging/Contents/Developer/Info.plist")
+    ));
+}
+
+/// Catches an old Xcode.app that stays beside the new one, and a leftover staging
+/// directory of an earlier failed run that breaks the next one.
+#[test]
+fn a_rerun_replaces_the_previous_copy_and_a_failed_runs_leftovers() {
+    let dir = tmp("stage-rerun");
+    let app = fake_xcode(&dir);
+    let volume = volume_in(&dir);
+    write(
+        &volume.join("Applications/Xcode.app/old-file"),
+        "old",
+        0o644,
+    );
+    write(
+        &volume.join("Applications/.Xcode.app.kbf-staging/half"),
+        "half",
+        0o644,
+    );
+    let plan = plan(Some(&app), &[], false).expect("plan");
+    Harness::new(100 * GIB)
+        .run(&volume, &plan)
+        .expect("execute");
+    assert!(!volume.join("Applications/Xcode.app/old-file").exists());
+    assert!(!volume.join("Applications/.Xcode.app.kbf-staging").exists());
+    assert_eq!(
+        listing(&volume.join("Applications/Xcode.app")),
+        listing(&app)
+    );
+}
+
+/// Catches a space check that is missing, off by one at the boundary, counts only part of
+/// the bytes (the runtimes), writes anything before refusing, or gives an error that does
+/// not say what is needed, what is free, or what to do.
+#[test]
+fn staging_that_does_not_fit_is_refused_before_anything_is_written() {
+    let dir = tmp("stage-space");
+    let app = fake_xcode(&dir);
+    write(&dir.join("rt.dmg"), "hello", 0o644);
+    let plan = plan(Some(&app), &[dir.join("rt.dmg")], false).expect("plan");
+    assert_eq!(plan.bytes(), 4 + 5 + 4 + 5);
+    let volume = volume_in(&dir);
+    let tight = plan.bytes() + HEADROOM_BYTES;
+    let e = Harness::new(tight - 1)
+        .run(&volume, &plan)
+        .expect_err("too small");
+    assert!(
+        holds(&[
+            e.contains("not enough room"),
+            e.contains("--disk-gib"),
+            e.contains("4.0 GiB headroom"),
+            e.contains("free"),
+        ]),
+        "{e}"
+    );
+    assert!(!volume.join("Applications").exists());
+    assert!(!volume.join("private/var/kbf-sim").exists());
+    Harness::new(tight)
+        .run(&volume, &plan)
+        .expect("exactly enough");
+    // Only the runtimes need room when only they are staged.
+    let only_rt = tmp("stage-space-rt");
+    write(&only_rt.join("big.dmg"), "hello", 0o644);
+    let mut p = crate::stage::plan(None, &[only_rt.join("big.dmg")], false).expect("plan");
+    p.runtimes[0].bytes = 9 * GIB;
+    let v = volume_in(&only_rt);
+    let e = Harness::new(12 * GIB)
+        .run(&v, &p)
+        .expect_err("9 GiB + 4 GiB > 12 GiB");
+    assert!(e.contains("9.0 GiB"), "{e}");
+}
+
+/// Catches a write through a link on the guest volume: a guest could plant `Applications`
+/// or the staging directory as a link to somewhere else, and the root copy would follow.
+#[test]
+fn a_link_where_the_volume_needs_a_directory_is_not_written_through() {
+    let dir = tmp("stage-link");
+    let app = fake_xcode(&dir);
+    write(&dir.join("rt.dmg"), "hello", 0o644);
+    let plan = plan(Some(&app), &[dir.join("rt.dmg")], false).expect("plan");
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("elsewhere");
+
+    let volume = volume_in(&dir);
+    link(elsewhere.to_str().expect("p"), &volume.join("Applications"));
+    let e = Harness::new(100 * GIB)
+        .run(&volume, &plan)
+        .expect_err("link");
+    assert!(e.contains("not a plain directory"), "{e}");
+    assert!(std::fs::read_dir(&elsewhere).expect("dir").next().is_none());
+
+    let volume2 = dir.join("volume2");
+    std::fs::create_dir_all(volume2.join("private/var")).expect("v2");
+    link(
+        elsewhere.to_str().expect("p"),
+        &volume2.join("private/var/kbf-sim"),
+    );
+    let plan_rt = crate::stage::plan(None, &[dir.join("rt.dmg")], false).expect("plan");
+    let e = Harness::new(100 * GIB)
+        .run(&volume2, &plan_rt)
+        .expect_err("link");
+    assert!(e.contains("not a plain directory"), "{e}");
+    assert!(std::fs::read_dir(&elsewhere).expect("dir").next().is_none());
+
+    // A staging directory planted as a link is removed as a link, not followed.
+    let volume3 = dir.join("volume3");
+    std::fs::create_dir_all(volume3.join("Applications")).expect("v3");
+    link(
+        elsewhere.to_str().expect("p"),
+        &volume3.join("Applications/.Xcode.app.kbf-staging"),
+    );
+    let plan_x = crate::stage::plan(Some(&app), &[], false).expect("plan");
+    Harness::new(100 * GIB)
+        .run(&volume3, &plan_x)
+        .expect("execute");
+    assert!(std::fs::read_dir(&elsewhere).expect("dir").next().is_none());
+}
+
+/// Catches a runtime copy that is not what was hashed, records the wrong name, size or
+/// digest, leaves the image group- or world-writable, keeps a runtime of an earlier setup,
+/// or follows a link in the runtime directory when clearing it.
+#[test]
+fn runtimes_are_staged_hashed_and_replace_the_earlier_set() {
+    let dir = tmp("stage-rt");
+    write(&dir.join("iOS.dmg"), "hello", 0o600);
+    let volume = volume_in(&dir);
+    let outside = dir.join("outside");
+    write(&outside, "keep me", 0o644);
+    let rt_dir = volume.join("private/var/kbf-sim/runtimes");
+    write(&rt_dir.join("old.dmg"), "old", 0o644);
+    link(outside.to_str().expect("p"), &rt_dir.join("planted.dmg"));
+    let plan = plan(None, &[dir.join("iOS.dmg")], false).expect("plan");
+    let h = Harness::new(100 * GIB);
+    let out = h.run(&volume, &plan).expect("execute");
+    let r = &out["runtimes"][0];
+    assert_eq!(
+        (
+            r["name"].as_str(),
+            r["bytes"].as_u64(),
+            r["sha256"].as_str(),
+            r["dest"].as_str()
+        ),
+        (
+            Some("iOS.dmg"),
+            Some(5),
+            Some(HELLO),
+            Some("/private/var/kbf-sim/runtimes/iOS.dmg")
+        )
+    );
+    assert_eq!(listing(&rt_dir), vec!["f iOS.dmg 644 hello".to_owned()]);
+    assert_eq!(
+        std::fs::read_to_string(&outside).expect("outside"),
+        "keep me"
+    );
+    assert!(h.chowned.borrow().contains(&rt_dir.join("iOS.dmg")));
+    assert!(out["xcode"].is_null());
+    assert_eq!(out["manifest"], "/private/var/kbf-sim/staged.json");
+}
+
+/// Catches a source that changes between the plan and the copy being staged anyway, for a
+/// runtime and for a file of Xcode.app, and a half-built Xcode.app being renamed into place.
+#[test]
+fn a_source_that_changed_since_the_plan_is_an_error_and_xcode_is_not_installed() {
+    let dir = tmp("stage-changed");
+    write(&dir.join("iOS.dmg"), "hello", 0o644);
+    let volume = volume_in(&dir);
+    let mut plan = plan(None, &[dir.join("iOS.dmg")], false).expect("plan");
+    plan.runtimes[0].bytes = 6;
+    let e = Harness::new(100 * GIB)
+        .run(&volume, &plan)
+        .expect_err("changed");
+    assert!(e.contains("changed while it was copied"), "{e}");
+
+    let dir = tmp("stage-changed-x");
+    let app = fake_xcode(&dir);
+    let volume = volume_in(&dir);
+    let mut plan = crate::stage::plan(Some(&app), &[], false).expect("plan");
+    for n in &mut plan.xcode.as_mut().expect("x").nodes {
+        if let Node::File { bytes, rel, .. } = n
+            && rel.ends_with("Info.plist")
+        {
+            *bytes += 1;
+        }
+    }
+    let e = Harness::new(100 * GIB)
+        .run(&volume, &plan)
+        .expect_err("changed");
+    assert!(e.contains("changed while it was copied"), "{e}");
+    assert!(!volume.join("Applications/Xcode.app").exists());
+}
+
+/// Catches a manifest that is missing, differs from the report, is writable by others, or
+/// names a path of the host.
+#[test]
+fn the_manifest_on_the_volume_records_what_was_staged() {
+    let dir = tmp("stage-manifest");
+    let app = fake_xcode(&dir);
+    write(&dir.join("iOS.dmg"), "hello", 0o644);
+    let volume = volume_in(&dir);
+    let plan = plan(Some(&app), &[dir.join("iOS.dmg")], false).expect("plan");
+    let out = Harness::new(100 * GIB)
+        .run(&volume, &plan)
+        .expect("execute");
+    let path = volume.join("private/var/kbf-sim/staged.json");
+    let text = std::fs::read_to_string(&path).expect("manifest");
+    let m: Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(m["runtimes"], out["runtimes"]);
+    assert_eq!(m["xcode"], out["xcode"]);
+    assert_eq!(m["xcode"]["dest"], "/Applications/Xcode.app");
+    assert_eq!(m["xcode"]["files"], 3);
+    assert_eq!(m["xcode"]["symlinks"], 3);
+    assert!(!text.contains(dir.to_str().expect("p")), "{text}");
+    assert_eq!(
+        std::fs::metadata(&path).expect("m").permissions().mode() & 0o777,
+        0o644
+    );
+    // The report adds the space it saw.
+    assert_eq!(out["free_bytes_before"], 100 * GIB);
+    assert_eq!(out["needed_bytes"], plan.bytes());
+}
+
+/// Catches a free-space reading that is zero or an error on a real directory, and no error
+/// for a path that does not exist.
+#[test]
+fn the_free_space_of_a_real_directory_is_read() {
+    let dir = tmp("stage-free");
+    assert!(crate::hostfs::free_bytes(&dir).expect("statvfs") > 0);
+    assert!(crate::hostfs::free_bytes(&dir.join("none")).is_err());
+}
+
+mod setup_flow {
+    use super::*;
+    use crate::fake::{FakeSystem, work_with_base};
+    use crate::image::{SetupArgs, setup};
+    use crate::report::Status;
+
+    fn root() -> FakeSystem {
+        let sys = FakeSystem::new();
+        sys.uid.set(0);
+        sys
+    }
+
+    /// Catches a staging run that is not root, writes into a directory that is not a
+    /// bundle, or reaches the disk without a single thing to do.
+    #[test]
+    fn staging_needs_root_a_bundle_and_something_to_stage() {
+        let work = work_with_base("stage-setup-pre");
+        let base = work.join("base");
+        let app = fake_xcode(&work);
+        let args = SetupArgs {
+            xcode: Some(app),
+            ..SetupArgs::default()
+        };
+        let user = FakeSystem::new();
+        assert_eq!(setup(&user, &base, &args).status, Status::NeedsManual);
+        assert!(user.stage_calls.borrow().is_empty());
+        let sys = root();
+        assert_eq!(setup(&sys, &work.join("none"), &args).status, Status::Error);
+        let r = setup(&sys, &base, &SetupArgs::default());
+        assert_eq!(r.status, Status::NeedsManual);
+        assert!(sys.stage_calls.borrow().is_empty() && sys.offline_calls.borrow().is_empty());
+    }
+
+    /// Catches `--xcode` and `--sim-runtime` not reaching the volume writer, the staging
+    /// going to another disk, a plan that differs from what was named, and a request that
+    /// also writes the daemons not doing both in order (daemons, then the staging).
+    #[test]
+    fn xcode_and_runtimes_are_staged_onto_the_bases_disk() {
+        let work = work_with_base("stage-setup");
+        let base = work.join("base");
+        let app = fake_xcode(&work);
+        write(&work.join("iOS.dmg"), "hello", 0o644);
+        let sys = root();
+        let args = SetupArgs {
+            xcode: Some(app.clone()),
+            sim_runtimes: vec![work.join("iOS.dmg")],
+            ..SetupArgs::default()
+        };
+        let r = setup(&sys, &base, &args);
+        assert_eq!(r.status, Status::Ok, "{r:?}");
+        // Staging alone writes no daemons and needs no guest binary.
+        assert!(sys.offline_calls.borrow().is_empty());
+        let calls = sys.stage_calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, base.join("disk.img"));
+        assert_eq!(calls[0].1.xcode.as_ref().expect("x").source, app);
+        assert_eq!(calls[0].1.runtimes[0].name, "iOS.dmg");
+        assert!(r.details["offline_setup"].is_null());
+        assert_eq!(
+            r.details["staged"],
+            serde_json::json!({"xcode": null, "runtimes": null})
+        );
+        drop(calls);
+
+        let bin = work.join("guest-src");
+        std::fs::write(&bin, "bin").expect("bin");
+        let both = SetupArgs {
+            guest_binary: Some(bin),
+            ..args
+        };
+        let r = setup(&sys, &base, &both);
+        assert_eq!(r.status, Status::Ok, "{r:?}");
+        assert_eq!(
+            (
+                sys.offline_calls.borrow().len(),
+                sys.stage_calls.borrow().len()
+            ),
+            (1, 2)
+        );
+        assert!(!r.details["offline_setup"].is_null());
+    }
+
+    /// Catches a refusal that comes after the daemons were already written to the disk, and
+    /// the refusals that do not reach the report: an escaping link, a link as the app, a
+    /// bad runtime name.
+    #[test]
+    fn a_refused_input_writes_nothing_to_the_disk() {
+        let work = work_with_base("stage-setup-refuse");
+        let base = work.join("base");
+        let app = fake_xcode(&work);
+        link("/etc", &app.join("Contents/etc"));
+        let bin = work.join("guest-src");
+        std::fs::write(&bin, "bin").expect("bin");
+        write(&work.join("bad name.dmg"), "x", 0o644);
+        let sys = root();
+        let cases = [
+            (
+                SetupArgs {
+                    xcode: Some(app.clone()),
+                    guest_binary: Some(bin.clone()),
+                    ..SetupArgs::default()
+                },
+                "leaves the app",
+            ),
+            (
+                SetupArgs {
+                    xcode: Some(work.join("none.app")),
+                    guest_binary: Some(bin.clone()),
+                    ..SetupArgs::default()
+                },
+                "stat",
+            ),
+            (
+                SetupArgs {
+                    sim_runtimes: vec![work.join("bad name.dmg")],
+                    guest_binary: Some(bin),
+                    ..SetupArgs::default()
+                },
+                "<name>.dmg",
+            ),
+        ];
+        for (args, want) in cases {
+            let r = setup(&sys, &base, &args);
+            assert_eq!(r.status, Status::Error);
+            assert!(r.reason.expect("reason").contains(want));
+        }
+        assert!(sys.offline_calls.borrow().is_empty());
+        assert!(sys.stage_calls.borrow().is_empty());
+        // With the flag the same app is accepted.
+        let allowed = SetupArgs {
+            xcode: Some(app),
+            allow_external_links: true,
+            ..SetupArgs::default()
+        };
+        assert_eq!(setup(&sys, &base, &allowed).status, Status::Ok);
+        let calls = sys.stage_calls.borrow();
+        assert_eq!(
+            calls[0].1.xcode.as_ref().expect("x").external_links.len(),
+            1
+        );
+    }
+
+    /// Catches a volume that is too small or an attach that fails being reported as
+    /// success.
+    #[test]
+    fn a_staging_failure_is_an_error_naming_the_cause() {
+        let work = work_with_base("stage-setup-fail");
+        let base = work.join("base");
+        let app = fake_xcode(&work);
+        let sys = root();
+        *sys.stage.borrow_mut() = Err("not enough room on the guest's Data volume".into());
+        let args = SetupArgs {
+            xcode: Some(app),
+            ..SetupArgs::default()
+        };
+        let r = setup(&sys, &base, &args);
+        assert_eq!(r.status, Status::Error);
+        let reason = r.reason.expect("reason");
+        assert!(
+            reason.contains("staging:") && reason.contains("not enough room"),
+            "{reason}"
+        );
+    }
+}

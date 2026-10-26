@@ -279,6 +279,10 @@ impl System for RealSystem {
         offline::write(disk, files)
     }
 
+    fn offline_stage(&self, disk: &Path, plan: &crate::stage::Plan) -> Result<Value, String> {
+        offline::stage(disk, plan)
+    }
+
     fn offline_harvest(&self, disk: &Path, out: &Path) -> Result<Value, String> {
         offline::harvest(disk, out)
     }
@@ -312,8 +316,13 @@ impl System for RealSystem {
         }
     }
 
-    fn install_image(&self, ipsw: &Path, out: &Path, disk_gib: u64) -> Result<Value, String> {
-        vz::install::install(ipsw, out, disk_gib)
+    fn install_image(
+        &self,
+        ipsw: &Path,
+        out: &Path,
+        sizing: &crate::bundle::Sizing,
+    ) -> Result<Value, String> {
+        vz::install::install(ipsw, out, sizing)
     }
 
     fn run_vm_helper(&self, spec: &VmSpec) -> Result<(), String> {

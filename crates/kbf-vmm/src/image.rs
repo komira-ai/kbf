@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::bundle::{self, Recorded, Sizing};
 use crate::guest;
 use crate::report::Report;
 use crate::system::System;
@@ -99,6 +100,10 @@ pub struct BaseArgs {
     pub sha256: String,
     pub out: PathBuf,
     pub disk_gib: u64,
+    /// Guest CPUs; `None` keeps what the restore image needs.
+    pub cpus: Option<u32>,
+    /// Guest memory in MiB; `None` keeps what the restore image needs.
+    pub memory_mib: Option<u64>,
     /// After the install, write the probe launch daemons and the Setup Assistant marker
     /// into the image as root.
     pub offline_setup: bool,
@@ -228,11 +233,31 @@ pub fn base(sys: &dyn System, args: &BaseArgs) -> Report {
             .to_string(),
         );
     }
-    let installed = match sys.install_image(&staged, &args.out, args.disk_gib) {
+    let sizing = Sizing {
+        disk_gib: args.disk_gib,
+        cpus: args.cpus,
+        memory_mib: args.memory_mib,
+    };
+    let installed = match sys.install_image(&staged, &args.out, &sizing) {
         Ok(v) => v,
         Err(e) => return fail(format!("install: {e}")),
     };
     let _ = std::fs::remove_file(&staged);
+    // What the installer settled on (the flags, or the restore image's needs), for the
+    // runs that clone this base.
+    let recorded = installed["cpus"]
+        .as_u64()
+        .and_then(|c| u32::try_from(c).ok())
+        .zip(installed["memory_mib"].as_u64())
+        .map(|(cpus, memory_mib)| Recorded {
+            cpus,
+            memory_mib,
+            disk_gib: args.disk_gib,
+        });
+    // A failed write does not throw away an install that took an hour; it is reported.
+    let sizing_error = recorded
+        .and_then(|r| bundle::record_sizing(&args.out, &r).err())
+        .map(|e| format!("write {}: {e}", bundle::SIZING));
     let offline = args.offline_setup.then(|| {
         let binary = args
             .guest_binary
@@ -252,6 +277,7 @@ pub fn base(sys: &dyn System, args: &BaseArgs) -> Report {
         "bundle": args.out,
         "restore_image_sha256": actual,
         "install": installed,
+        "sizing_record_error": sizing_error,
         "offline_setup": offline_json,
     });
     match failed {
@@ -271,9 +297,24 @@ pub fn base(sys: &dyn System, args: &BaseArgs) -> Report {
     }
 }
 
-/// `image setup`: the offline write (P0) into an existing base bundle.
+/// What `image setup` was asked.
+#[derive(Debug, Clone, Default)]
+pub struct SetupArgs {
+    /// The `kbf-guest` for macOS the offline write copies onto the guest's disk.
+    pub guest_binary: Option<PathBuf>,
+    /// An Xcode.app to clone into the guest's `/Applications`.
+    pub xcode: Option<PathBuf>,
+    /// Simulator runtime disk images to stage at the fixed guest path.
+    pub sim_runtimes: Vec<PathBuf>,
+    /// Copy Xcode symbolic links that leave the app, as links.
+    pub allow_external_links: bool,
+}
+
+/// `image setup`: the offline write (P0) into an existing base bundle, and the staging of
+/// Xcode and simulator runtimes when they are named. The staging plan is made, and its
+/// refusals are raised, before anything is written to the disk.
 #[must_use]
-pub fn setup(sys: &dyn System, base: &Path, guest_binary: Option<&Path>) -> Report {
+pub fn setup(sys: &dyn System, base: &Path, args: &SetupArgs) -> Report {
     let probe = "image-setup";
     if sys.uid() != 0 {
         return Report::needs_manual(
@@ -285,21 +326,49 @@ pub fn setup(sys: &dyn System, base: &Path, guest_binary: Option<&Path>) -> Repo
     if let Err(e) = crate::bundle::check(base) {
         return Report::error(probe, e.to_string());
     }
-    let Some(binary) = guest_binary else {
-        return Report::needs_manual(probe, guest::NEEDS_GUEST_BINARY, json!({"bundle": base}));
-    };
-    let payload = match guest::offline_payload_from(binary) {
+    let staging = match crate::stage::plan(
+        args.xcode.as_deref(),
+        &args.sim_runtimes,
+        args.allow_external_links,
+    ) {
         Ok(p) => p,
-        Err(e) => return Report::error(probe, e),
+        Err(e) => return Report::error(probe, e.to_string()),
     };
-    match sys.offline_write(&base.join(crate::bundle::DISK), &payload) {
-        Ok(observed) => Report::ok(
-            probe,
-            format!("the probe launch daemons are in {}", base.display()),
-            json!({"bundle": base, "offline_setup": observed}),
-        ),
-        Err(e) => Report::error(probe, format!("offline setup: {e}")),
+    if args.guest_binary.is_none() && staging.is_empty() {
+        return Report::needs_manual(probe, guest::NEEDS_GUEST_BINARY, json!({"bundle": base}));
     }
+    let disk = base.join(crate::bundle::DISK);
+    let written = match args.guest_binary.as_deref() {
+        None => None,
+        Some(binary) => {
+            let payload = match guest::offline_payload_from(binary) {
+                Ok(p) => p,
+                Err(e) => return Report::error(probe, e),
+            };
+            match sys.offline_write(&disk, &payload) {
+                Ok(observed) => Some(observed),
+                Err(e) => return Report::error(probe, format!("offline setup: {e}")),
+            }
+        }
+    };
+    let staged = if staging.is_empty() {
+        None
+    } else {
+        match sys.offline_stage(&disk, &staging) {
+            Ok(observed) => Some(observed),
+            Err(e) => return Report::error(probe, format!("staging: {e}")),
+        }
+    };
+    let what = match (&written, &staged) {
+        (Some(_), Some(_)) => "the probe launch daemons and the staged Xcode inputs are",
+        (None, Some(_)) => "the staged Xcode inputs are",
+        _ => "the probe launch daemons are",
+    };
+    Report::ok(
+        probe,
+        format!("{what} in {}", base.display()),
+        json!({"bundle": base, "offline_setup": written, "staged": staged}),
+    )
 }
 
 /// `image harvest`: copies the allowlisted diagnostics out of a kept clone's disk into the
@@ -352,8 +421,17 @@ mod tests {
             sha256: sha.to_owned(),
             out: dir.join("out"),
             disk_gib: 64,
+            cpus: None,
+            memory_mib: None,
             offline_setup: false,
             guest_binary: None,
+        }
+    }
+
+    fn with_binary(binary: Option<&Path>) -> SetupArgs {
+        SetupArgs {
+            guest_binary: binary.map(Path::to_owned),
+            ..SetupArgs::default()
         }
     }
 
@@ -484,7 +562,7 @@ mod tests {
         assert_eq!(r.details["install"]["macos_version"], "27.0.0");
         assert!(r.details["offline_setup"].is_null());
         let installs = sys.installs.borrow();
-        assert_eq!((installs.len(), installs[0].2), (1, 64));
+        assert_eq!((installs.len(), installs[0].2.disk_gib), (1, 64));
         assert!(sys.offline_calls.borrow().is_empty());
     }
 
@@ -669,7 +747,7 @@ mod tests {
         sys.uid.set(0);
         let bin = work.join("guest-src");
         std::fs::write(&bin, "bin").expect("bin");
-        let r = setup(&sys, &base_dir, Some(&bin));
+        let r = setup(&sys, &base_dir, &with_binary(Some(&bin)));
         assert_eq!(r.status, Status::Ok);
         let calls = sys.offline_calls.borrow();
         assert_eq!(calls.len(), 1);
@@ -693,25 +771,25 @@ mod tests {
         let sys = FakeSystem::new();
         let bin = work.join("guest-src");
         std::fs::write(&bin, "bin").expect("bin");
-        let r = setup(&sys, &base_dir, Some(&bin));
+        let r = setup(&sys, &base_dir, &with_binary(Some(&bin)));
         assert_eq!(r.status, Status::NeedsManual);
         assert!(r.reason.expect("reason").contains("root"));
         assert!(sys.offline_calls.borrow().is_empty());
         sys.uid.set(0);
-        let r = setup(&sys, &work.join("none"), Some(&bin));
+        let r = setup(&sys, &work.join("none"), &with_binary(Some(&bin)));
         assert_eq!(r.status, Status::Error);
         assert!(sys.offline_calls.borrow().is_empty());
-        let r = setup(&sys, &base_dir, None);
+        let r = setup(&sys, &base_dir, &with_binary(None));
         assert_eq!(r.status, Status::NeedsManual);
         assert!(r.reason.expect("reason").contains("--guest-binary"));
-        let r = setup(&sys, &base_dir, Some(&work.join("missing")));
+        let r = setup(&sys, &base_dir, &with_binary(Some(&work.join("missing"))));
         assert_eq!(r.status, Status::Error);
         assert!(sys.offline_calls.borrow().is_empty());
-        let r = setup(&sys, &base_dir, Some(&bin));
+        let r = setup(&sys, &base_dir, &with_binary(Some(&bin)));
         assert_eq!(r.status, Status::Ok);
         assert_eq!(sys.offline_calls.borrow()[0].0, base_dir.join("disk.img"));
         *sys.offline.borrow_mut() = Err("no volume".into());
-        let r = setup(&sys, &base_dir, Some(&bin));
+        let r = setup(&sys, &base_dir, &with_binary(Some(&bin)));
         assert_eq!(r.status, Status::Error);
         assert!(r.reason.expect("reason").contains("no volume"));
     }
