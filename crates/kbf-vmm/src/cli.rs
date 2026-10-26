@@ -115,6 +115,11 @@ pub enum Graphics {
     Both,
 }
 
+/// A user name `--guest-user` accepts.
+fn parse_guest_user(name: &str) -> Result<String, String> {
+    kbf_guest::mkuser::check_name(name).map(|()| name.to_owned())
+}
+
 #[derive(Debug, Args)]
 pub struct BenchArgs {
     #[command(flatten)]
@@ -191,6 +196,31 @@ pub enum ImageCmd {
         /// the report. Without this flag such a link is refused.
         #[arg(long)]
         allow_external_links: bool,
+        /// The one non-admin user the guest is to have, with auto-login, so that the
+        /// simulator's user steps have a session (a short name: lowercase letters, digits,
+        /// `-`, `_`). Stages a launch daemon that creates it in the first boot, which
+        /// `image prime` runs; until then the simulator probe waits for it. Needs the
+        /// `kbf-guest` the guest disk holds (from this or an earlier setup with
+        /// `--guest-binary`).
+        #[arg(long, value_name = "NAME", value_parser = parse_guest_user)]
+        guest_user: Option<String>,
+    },
+    /// Boot the base bundle itself, as the console user and with graphics, so that the
+    /// guest creates its user (`image setup --guest-user`) and powers itself off; the
+    /// result frames go to `<base>/prime-results`. Afterwards every clone of the base
+    /// boots into that user's session. Run again, it finds the user ready and stops the
+    /// guest at once.
+    Prime {
+        /// The base bundle directory (set up with `--guest-user`).
+        #[arg(long)]
+        base: PathBuf,
+        /// A `kbf-guest` built for macOS, copied into the folder shared with the guest.
+        #[arg(long)]
+        guest_binary: PathBuf,
+        /// How long to wait for the guest to power off before it is stopped and the run is
+        /// reported as a timeout.
+        #[arg(long, default_value_t = 1200, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+        deadline_secs: u64,
     },
     /// As root, copy a fixed allowlist of diagnostics (the probe daemons' logs, the local
     /// marker, the unified log's data files, crash reports) out of a stopped guest's disk

@@ -13,6 +13,13 @@
 //!    the device type), `simctl create`, `boot`, `bootstatus -b`, an optional app
 //!    (`install`, `launch`), `simctl io screenshot`, and `simctl shutdown`.
 //!
+//! # Whose session
+//! The user steps run as the user `kbf-guest mkuser` recorded in
+//! [`simpaths::USER_READY`] (`image setup --guest-user`, `image prime`), once that user is at
+//! the console; another user at the console is not used. With no record they run as
+//! whoever owns the console. A guest that is to have a user ([`simpaths::USER_WANTED`]) and
+//! has none yet runs nothing: the summary says to prime.
+//!
 //! # No hang, no guess
 //! Every command has a deadline from [`Config`] and is killed (with its process group) when
 //! it passes; the step is then `timeout`. A step runs only when the steps it needs
@@ -554,6 +561,10 @@ pub trait SimHost {
     fn app_bundles(&self) -> Vec<String>;
     /// The user logged in at the console, if there is one.
     fn console_user(&self) -> Option<ConsoleUser>;
+    /// The user `kbf-guest mkuser` recorded as ready ([`simpaths::USER_READY`]), if any.
+    fn ready_user(&self) -> Option<String>;
+    /// The user `image setup --guest-user` asked for ([`simpaths::USER_WANTED`]), if any.
+    fn wanted_user(&self) -> Option<String>;
     /// Makes [`OUT_DIR`] writable by the console user.
     ///
     /// # Errors
@@ -666,6 +677,9 @@ struct Run<'a> {
     cfg: &'a Config,
     log: &'a mut dyn Write,
     undelivered: Vec<String>,
+    /// The user whose session the user steps need (the one `mkuser` recorded); `None`: the
+    /// console owner, whoever it is.
+    user_name: Option<String>,
 }
 
 impl<'a> Run<'a> {
@@ -675,6 +689,7 @@ impl<'a> Run<'a> {
             cfg,
             log,
             undelivered: Vec::new(),
+            user_name: None,
         }
     }
 
@@ -698,11 +713,20 @@ impl<'a> Run<'a> {
     }
 }
 
-/// Waits for the console user, counting pauses: `None` when none appeared in time.
-fn wait_console_user(host: &dyn SimHost, wait: Duration) -> Option<ConsoleUser> {
+/// Waits for the console user, counting pauses: `None` when none appeared in time. With
+/// `expected`, only that user counts (another user at the console is not waited on to leave:
+/// the wait runs its course).
+fn wait_console_user(
+    host: &dyn SimHost,
+    wait: Duration,
+    expected: Option<&str>,
+) -> Option<ConsoleUser> {
     let mut waited = Duration::ZERO;
     loop {
-        if let Some(u) = host.console_user() {
+        if let Some(u) = host
+            .console_user()
+            .filter(|u| expected.is_none_or(|e| u.name == e))
+        {
             return Some(u);
         }
         if waited >= wait {
@@ -745,6 +769,23 @@ pub fn run(host: &dyn SimHost, cfg: &Config, log: &mut dyn Write) -> SummaryFram
             Some("sim runs as root".into()),
         );
     }
+    // A guest that is to have a user but has none yet has no session to run the user steps
+    // in: running the root ones would only import the runtimes into the base for nothing.
+    let ready = host.ready_user();
+    if ready.is_none()
+        && let Some(wanted) = host.wanted_user()
+    {
+        return finish(
+            &mut r,
+            &[],
+            &State::default(),
+            None,
+            Some(format!(
+                "the guest user {wanted} does not exist yet: run `kbf-vmm image prime` on this base first"
+            )),
+        );
+    }
+    r.user_name = ready;
     let inputs = Inputs {
         runtimes: host
             .runtime_images()
@@ -870,15 +911,23 @@ fn execute(
     };
     f.argv.clone_from(&argv);
     let command = if step.who == Who::User {
-        let found = user.get_or_insert_with(|| wait_console_user(host, cfg.console_wait));
+        let expected = r.user_name.as_deref();
+        let found = user.get_or_insert_with(|| wait_console_user(host, cfg.console_wait, expected));
         match found {
             Some(u) => as_user(u, &argv),
             None => {
                 f.status = Status::Error;
-                f.note = Some(format!(
-                    "no user was logged in at the console within {} s",
-                    cfg.console_wait.as_secs()
-                ));
+                f.note = Some(match expected {
+                    None => format!(
+                        "no user was logged in at the console within {} s",
+                        cfg.console_wait.as_secs()
+                    ),
+                    Some(name) => format!(
+                        "the user {name} (recorded by mkuser) was not logged in at the console within {} s; the console owner is {}",
+                        cfg.console_wait.as_secs(),
+                        host.console_user().map_or("nobody".to_owned(), |u| u.name)
+                    ),
+                });
                 return;
             }
         }

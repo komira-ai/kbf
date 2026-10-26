@@ -12,6 +12,13 @@ pub const RUNTIME_DIR: &str = "/private/var/kbf-sim/runtimes";
 pub const APP_DIR: &str = "/private/var/kbf-sim/apps";
 /// What the setup staged (names, sizes, SHA-256 of each runtime), as JSON.
 pub const MANIFEST: &str = "/private/var/kbf-sim/staged.json";
+/// Written by `image setup --guest-user <name>`: the name of the user the guest is to have
+/// (one line). While it exists and [`USER_READY`] does not, the simulator probe runs nothing
+/// (there is no session for it yet): `image prime` creates the user first.
+pub const USER_WANTED: &str = "/private/var/kbf-sim/user-wanted";
+/// Written by `kbf-guest mkuser` once the user exists with auto-login set up: the name of
+/// the user (one line). The simulator probe runs its user steps as this user.
+pub const USER_READY: &str = "/private/var/kbf-sim/user-ready";
 
 #[cfg(test)]
 mod tests {
@@ -22,11 +29,18 @@ mod tests {
     /// these by dropping the leading slash).
     #[test]
     fn the_staging_paths_are_absolute_and_the_simulator_ones_share_a_directory() {
-        for p in [XCODE_APP, RUNTIME_DIR, APP_DIR, MANIFEST] {
+        for p in [
+            XCODE_APP,
+            RUNTIME_DIR,
+            APP_DIR,
+            MANIFEST,
+            USER_WANTED,
+            USER_READY,
+        ] {
             assert!(p.starts_with('/'), "{p}");
             assert!(!p.ends_with('/'), "{p}");
         }
-        for p in [RUNTIME_DIR, APP_DIR, MANIFEST] {
+        for p in [RUNTIME_DIR, APP_DIR, MANIFEST, USER_WANTED, USER_READY] {
             assert!(p.starts_with("/private/var/kbf-sim/"), "{p}");
         }
     }

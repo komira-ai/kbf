@@ -54,6 +54,11 @@ struct Fake {
     root: bool,
     runtimes: Vec<String>,
     apps: Vec<String>,
+    /// The user `mkuser` recorded as ready, and the one `image setup --guest-user` asked for.
+    ready: Option<String>,
+    wanted: Option<String>,
+    /// The name of the console user, once there is one.
+    console_name: String,
     /// The console user appears once this many pauses have been made; never when `None`.
     user_after_pauses: Option<u32>,
     /// `(text the command line contains, outcome)`; the first match answers, else exit 0.
@@ -84,6 +89,9 @@ impl Fake {
             root: true,
             runtimes: vec!["iOS_27.dmg".to_owned()],
             apps: Vec::new(),
+            ready: None,
+            wanted: None,
+            console_name: "kbf".to_owned(),
             user_after_pauses: Some(0),
             answers: RefCell::new(answers),
             ran: RefCell::new(Vec::new()),
@@ -135,8 +143,14 @@ impl SimHost for Fake {
             .filter(|n| self.pauses.get() >= *n)
             .map(|_| ConsoleUser {
                 uid: 501,
-                name: "kbf".to_owned(),
+                name: self.console_name.clone(),
             })
+    }
+    fn ready_user(&self) -> Option<String> {
+        self.ready.clone()
+    }
+    fn wanted_user(&self) -> Option<String> {
+        self.wanted.clone()
     }
     fn prepare_out_dir(&self) -> Result<(), String> {
         self.out_dir_made.set(true);
@@ -1433,4 +1447,91 @@ fn a_run_imports_the_staged_bundle_and_ignores_names_the_host_did_not_stage() {
         names.contains(&"sim-step-05-runtime-import-b_27.exportedBundle.json".to_owned()),
         "{names:?}"
     );
+}
+
+/// Catches the user steps running as whoever owns the console when `mkuser` recorded a user:
+/// the wrapper must name the recorded user and its uid, and every user step must use it.
+#[test]
+fn the_user_steps_run_as_the_user_mkuser_recorded() {
+    let mut host = Fake::new();
+    host.ready = Some("kbfuser".to_owned());
+    host.console_name = "kbfuser".to_owned();
+    let summary = go(&host);
+    assert!(summary.ok, "{summary:?}");
+    let user_steps: Vec<String> = host
+        .commands()
+        .into_iter()
+        .filter(|c| c.starts_with("/bin/launchctl asuser"))
+        .collect();
+    assert!(user_steps.len() >= 6, "{user_steps:?}");
+    assert!(
+        user_steps
+            .iter()
+            .all(|c| c.starts_with("/bin/launchctl asuser 501 /usr/bin/sudo -u kbfuser -H -- ")),
+        "{user_steps:?}"
+    );
+    // Without a record, the console owner is used, whoever it is.
+    let host = Fake::new();
+    assert!(go(&host).ok);
+    assert!(
+        host.commands()
+            .iter()
+            .any(|c| c.starts_with("/bin/launchctl asuser 501 /usr/bin/sudo -u kbf -H -- "))
+    );
+}
+
+/// Catches a recorded user whose session never comes (another user at the console): the
+/// wait is bounded, no user step runs as the wrong user, and the note names both users.
+#[test]
+fn another_user_at_the_console_is_not_the_recorded_user() {
+    let mut host = Fake::new();
+    host.ready = Some("kbfuser".to_owned());
+    host.console_name = "someoneelse".to_owned();
+    let c = Config::from(&args(&["--console-wait-secs", "2"]));
+    let summary = run(&host, &c, &mut Vec::new());
+    assert!(!summary.ok);
+    assert_eq!(host.pauses.get(), 2);
+    assert!(!host.commands().iter().any(|c| c.contains("sudo")));
+    let frames = host.step_frames();
+    let first = frames
+        .iter()
+        .find(|f| f.step == "list-runtimes")
+        .expect("step");
+    assert_eq!(first.status, Status::Error);
+    let note = first.note.as_deref().expect("note");
+    assert!(
+        note.contains("kbfuser") && note.contains("someoneelse") && note.contains("2 s"),
+        "{note}"
+    );
+    // The root steps do not need a session.
+    assert_eq!(
+        frames
+            .iter()
+            .find(|f| f.step == "first-launch")
+            .map(|f| f.status),
+        Some(Status::Ok)
+    );
+}
+
+/// Catches a run in a guest that is to have a user and has none yet: it must run nothing
+/// (the root steps would import the runtimes into the base for nothing) and tell the host
+/// to prime; with the user ready, or no user wanted, it runs.
+#[test]
+fn a_wanted_user_that_is_not_ready_stops_the_run_before_any_command() {
+    let mut host = Fake::new();
+    host.wanted = Some("kbfuser".to_owned());
+    let summary = go(&host);
+    assert!(host.ran.borrow().is_empty());
+    assert!(!summary.ok && summary.steps.is_empty());
+    let note = summary.note.as_deref().expect("note");
+    assert!(
+        note.contains("kbfuser") && note.contains("image prime"),
+        "{note}"
+    );
+    assert_eq!(host.sent.borrow().len(), 1);
+    assert_eq!(host.sent.borrow()[0].name, SUMMARY_NAME);
+
+    host.ready = Some("kbfuser".to_owned());
+    host.console_name = "kbfuser".to_owned();
+    assert!(go(&host).ok);
 }

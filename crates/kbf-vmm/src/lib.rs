@@ -18,6 +18,7 @@ pub mod harvest;
 pub mod hostfs;
 pub mod image;
 pub mod matrix;
+pub mod prime;
 pub mod probe;
 pub mod report;
 pub mod sampler;
@@ -46,6 +47,8 @@ mod e3_tests;
 mod fake;
 #[cfg(test)]
 mod gates_tests;
+#[cfg(test)]
+mod prime_tests;
 #[cfg(test)]
 mod probe_tests;
 #[cfg(test)]

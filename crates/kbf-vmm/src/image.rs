@@ -354,6 +354,9 @@ pub struct SetupArgs {
     pub sim_app: Option<PathBuf>,
     /// Copy Xcode symbolic links that leave the app, as links.
     pub allow_external_links: bool,
+    /// The user the guest is to have (`kbf-guest mkuser` creates it in the boot `image prime`
+    /// runs).
+    pub guest_user: Option<String>,
 }
 
 /// `image setup`: the offline write (P0) into an existing base bundle, and the staging of
@@ -381,7 +384,12 @@ pub fn setup(sys: &dyn System, base: &Path, args: &SetupArgs) -> Report {
         Ok(p) => p,
         Err(e) => return Report::error(probe, e.to_string()),
     };
-    if args.guest_binary.is_none() && staging.is_empty() {
+    let user_files = match args.guest_user.as_deref().map(guest::mkuser_payload) {
+        None => Vec::new(),
+        Some(Ok(files)) => files,
+        Some(Err(e)) => return Report::error(probe, format!("--guest-user: {e}")),
+    };
+    if args.guest_binary.is_none() && staging.is_empty() && user_files.is_empty() {
         return Report::needs_manual(probe, guest::NEEDS_GUEST_BINARY, json!({"bundle": base}));
     }
     let disk = base.join(crate::bundle::DISK);
@@ -397,7 +405,8 @@ pub fn setup(sys: &dyn System, base: &Path, args: &SetupArgs) -> Report {
     if !staging.is_empty() {
         files.extend(guest::sim_payload());
     }
-    // At least one of the two was given: the check above refused the rest.
+    files.extend(user_files);
+    // At least one of the three was given: the check above refused the rest.
     let written = match sys.offline_write(&disk, &files) {
         Ok(observed) => observed,
         Err(e) => return Report::error(probe, format!("offline setup: {e}")),
@@ -413,12 +422,22 @@ pub fn setup(sys: &dyn System, base: &Path, args: &SetupArgs) -> Report {
     let what = match (args.guest_binary.is_some(), staged.is_some()) {
         (true, true) => "the probe launch daemons and the staged Xcode inputs are",
         (false, true) => "the simulator launch daemon and the staged Xcode inputs are",
-        _ => "the probe launch daemons are",
+        (true, false) => "the probe launch daemons are",
+        (false, false) => "the user-creating launch daemon is",
     };
     Report::ok(
         probe,
         format!("{what} in {}", base.display()),
-        json!({"bundle": base, "offline_setup": written, "staged": staged}),
+        json!({
+            "bundle": base,
+            "offline_setup": written,
+            "staged": staged,
+            "guest_user": args.guest_user,
+            "next": args.guest_user.as_ref().map(|_| format!(
+                "run `kbf-vmm image prime --base {} --guest-binary <kbf-guest>` as the console user to create the user, then `probe e3`",
+                base.display()
+            )),
+        }),
     )
 }
 

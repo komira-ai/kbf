@@ -643,14 +643,89 @@ sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest \
   later on an existing path opens it without following a link; ownership is `lchown`. A
   directory the stage creates on the way is given mode 0755 explicitly, whatever the umask.
 
+### The guest's user: setup, prime
+
+A guest built by `image base` and `image setup` has no user account. Its processes run as
+`nobody` in the system session, and the simulator's user steps (which need an Aqua session)
+have nothing to run in. `image setup --guest-user <name>` and `image prime` give the guest
+the one user the design calls for (`docs/design/macos-vm-guests.md`): a standard
+(non-admin) account with auto-login, with sleep, the screen saver and its lock, and the
+update checks off. The order is always:
+
+1. `image base` (as root), then
+2. `image setup` (as root) with `--xcode`, `--sim-runtime` and `--guest-user <name>`,
+3. `image prime` (as the console user): boots the **base itself**, once, so that the user is
+   created in it,
+4. `probe e3` (as the console user): its clones boot directly into the user's session.
+
+`--guest-user` stages a one-shot root launch daemon, `com.kbf.mkuser` (from the guest's own
+disk, like the other daemons), and `/private/var/kbf-sim/user-wanted`, which holds the name.
+While `user-wanted` exists and `user-ready` does not, `kbf-guest sim` runs nothing and
+says to prime (the root steps would only import the runtimes into the base). The name is a
+short name: it starts with a lowercase letter and holds lowercase letters, digits, `-` and
+`_` (at most 31 bytes); `root`, `nobody`, `daemon`, `admin`, `guest` and `wheel` are refused.
+Setup alone does not run the daemon: it needs the `kbf-guest` the guest disk holds (this
+setup's `--guest-binary` or an earlier one).
+
+`kbf-guest mkuser --name <name>` runs these steps, one command (or file write) each, in
+order, each a frame `mkuser-step-NN-<step>.json` of the same shape as the simulator's
+(`step`, `argv`, `status`, `exit`, `ms`, the 8 KiB tails), then `mkuser-summary.json`:
+
+| step | what |
+|---|---|
+| `add-user` | `sysadminctl -addUser <name> -fullName <name> -password <generated> -home /Users/<name>` (no `-admin`: a standard user). If the user exists already: `set-password`, `dscl . -passwd /Users/<name> <generated>` |
+| `home` | `createhomedir -c -u <name>` |
+| `kcpassword` | writes `/etc/kcpassword`, mode 0600, root: the password XORed with the fixed 11-byte key, zero-padded to a multiple of 12 bytes |
+| `autologin` | `defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser -string <name>` |
+| `pmset` | `pmset -a sleep 0 displaysleep 0 disksleep 0` |
+| `screensaver-idle`, `screensaver-lock` | as the user: `defaults -currentHost write com.apple.screensaver idleTime -int 0`; `defaults write com.apple.screensaver askForPassword -int 0` |
+| `updates-check`, `updates-download`, `updates-os`, `updates-critical` | `defaults write /Library/Preferences/com.apple.SoftwareUpdate` `AutomaticCheckEnabled`, `AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`, `CriticalUpdateInstall`, each `-bool false` |
+| `ready-marker` | writes `/private/var/kbf-sim/user-ready` (the name), only when every other step succeeded |
+
+The password is 11 random bytes from the guest's `/dev/urandom`, as 22 hex digits. It is
+never sent to the host and never logged: a frame's `argv` shows `<withheld>` in its place,
+and an occurrence of it in an output tail is replaced by `[redacted]`. It is in the
+guest-side argument list of `sysadminctl` (or `dscl`) for the moment that command runs, so
+another process of the guest could read it then; and it is in `/etc/kcpassword`, which is
+an obfuscation (the key is fixed and documented), not encryption: root-only mode 0600 is the
+protection. The account belongs to a throwaway guest and holds no credential of the farm.
+
+When every step is done the daemon powers the guest off (`/sbin/shutdown -h now`), so the
+base's disk is flushed. It does so after a failed run too (the next `prime` starts the steps
+again; no marker is left). If `user-ready` names the user already, the daemon does nothing,
+sends a summary with `already_ready`, and does not power off: `image prime` then shuts the
+guest down itself.
+
+```sh
+# as root; $RUNTIME is a <name>.dmg or a <name>.exportedBundle; --sim-app is optional
+sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest \
+  --xcode /Applications/Xcode.app --sim-runtime $RUNTIME [--sim-app $APP.app] \
+  --guest-user kbfsim | tee $W/e3-setup.json
+# as the console user, from Terminal on the Mac: a few minutes, with a graphics window
+$D/kbf-vmm image prime --base $W/base --guest-binary $D/kbf-guest [--deadline-secs 1200] \
+  | tee $W/e3-prime.json
+```
+
+`image prime` boots the base itself (not a clone) with a graphics device and the vsock
+channel, collects the frames into `<base>/prime-results` (a directory only the host user can
+read, written through the same checked sink as the probes' results), and waits for the guest
+to power off, at most `--deadline-secs` (default 1200). A guest still running then is
+stopped and the run is reported as a **timeout** (an error; the base's disk may not be
+flushed; run prime again). The report has `outcome` (`powered-off`, `already-ready`,
+`timeout`, `vm-ended-early`), every `steps` frame, `problems`, the `summary`, `stop`, the
+helper's `trace` and `next`. It is an error unless the summary says `ok` and the guest
+powered off (or was ready already). Run `prime` once per base; it changes the base's disk, so
+rebuild or re-prime if the user's name changes.
+
 ### Running the simulator probe
 
 ```sh
-# once, as root, after `image base --cpus --memory-mib --disk-gib` (see above); --sim-app
-# is optional: an app built for the simulator (<name>.app); $RUNTIME is a <name>.dmg or a
-# <name>.exportedBundle
+# once, as root, after `image base --cpus --memory-mib --disk-gib` (see above), `image setup`
+# with --guest-user and `image prime` (the section above); --sim-app is optional: an app
+# built for the simulator (<name>.app); $RUNTIME is a <name>.dmg or a <name>.exportedBundle
 sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest \
-  --xcode /Applications/Xcode.app --sim-runtime $RUNTIME [--sim-app $APP.app]
+  --xcode /Applications/Xcode.app --sim-runtime $RUNTIME [--sim-app $APP.app] --guest-user kbfsim
+$D/kbf-vmm image prime --base $W/base --guest-binary $D/kbf-guest
 # as the console user, from Terminal on the Mac: hours on a first run
 $D/kbf-vmm probe e3 --work-dir $W --guest-binary $D/kbf-guest [--keep] [--graphics both|on|off] | tee $W/e3.json
 ```
@@ -678,8 +753,11 @@ group):
 | `shutdown` | user | `simctl shutdown <udid>` | 120 s |
 
 "User" means the guest's auto-login user, in that user's session
-(`launchctl asuser <uid> sudo -u <name> -H -- <command>`). The user steps wait up to 300 s
-for that user to be logged in at the console and fail, saying so, if nobody is.
+(`launchctl asuser <uid> sudo -u <name> -H -- <command>`). With `--guest-user` that is the
+user recorded in `/private/var/kbf-sim/user-ready`; the steps wait up to 300 s for that
+user to be at the console, and fail, saying who is there instead, if it is anyone else. A
+guest with no record uses whoever owns the console, and the steps fail, saying so, if
+nobody is.
 
 Each step sends the host one frame, `sim-step-NN-<step>.json`, as it ends: the step, its
 command, `status` (`ok`, `failed` for a non-zero exit or a signal, `timeout`, `error` for a

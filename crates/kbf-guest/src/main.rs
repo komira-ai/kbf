@@ -13,7 +13,8 @@
 //! (src/mount.rs), and `probe-diag`, which says what a root process sees of the share
 //! and which write step is refused (src/diag.rs), and `shutdown-listen`, the root daemon
 //! that shuts the guest down when the host asks over virtio-socket (src/shutdown.rs), and
-//! `sim`, the root daemon that runs the iOS simulator probe (src/sim.rs).
+//! `sim`, the root daemon that runs the iOS simulator probe (src/sim.rs), and `mkuser`, the
+//! root daemon that creates the guest's user once (src/mkuser.rs).
 
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
@@ -22,6 +23,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use kbf_guest::diag;
 use kbf_guest::frame::Kind;
+use kbf_guest::mkuser;
 use kbf_guest::mount;
 use kbf_guest::probe;
 use kbf_guest::server::{Agent, Config, HELLO_TIMEOUT};
@@ -85,6 +87,17 @@ enum Cmd {
     /// LaunchDaemon, once per boot; the steps that need a user session run as the console
     /// user through `launchctl asuser`.
     Sim(sim::SimArgs),
+    /// Create the guest's one user (a standard account with auto-login, no sleep or lock),
+    /// send the host one frame per step, and power the guest off. Runs as root, as a
+    /// LaunchDaemon, once per boot; it does nothing when the user is recorded as ready.
+    Mkuser(mkuser::MkUserArgs),
+}
+
+/// The hosts the root daemons of the simulator setup run against (`None`: not a macOS guest).
+#[derive(Clone, Copy, Default)]
+struct Guests<'a> {
+    sim: Option<&'a dyn sim::SimHost>,
+    mkuser: Option<&'a dyn mkuser::MkUserHost>,
 }
 
 fn main() -> ExitCode {
@@ -102,7 +115,10 @@ fn run(cli: Cli, root: Result<(), String>) -> ExitCode {
         real_mounter().as_deref(),
         real_diagnoser().as_deref(),
         real_shutdown_daemon().as_deref(),
-        real_sim_host().as_deref(),
+        Guests {
+            sim: real_sim_host().as_deref(),
+            mkuser: real_mkuser_host().as_deref(),
+        },
     )
 }
 
@@ -114,7 +130,7 @@ fn run_with(
     mounter: Option<&dyn mount::Mounter>,
     diagnoser: Option<&dyn diag::DiagHost>,
     daemon: Option<&dyn shutdown::Daemon>,
-    sim_host: Option<&dyn sim::SimHost>,
+    guests: Guests<'_>,
 ) -> ExitCode {
     if !matches!(
         cli.command,
@@ -124,6 +140,7 @@ fn run_with(
             | Cmd::ProbeDiag(_)
             | Cmd::ShutdownListen { .. }
             | Cmd::Sim(_)
+            | Cmd::Mkuser(_)
     ) && let Err(e) = root
     {
         eprintln!("{e}");
@@ -155,7 +172,8 @@ fn run_with(
         Cmd::MountShare(args) => mount_cmd(mounter, &args),
         Cmd::ProbeDiag(args) => diag_cmd(diagnoser, &args),
         Cmd::ShutdownListen { port } => shutdown_cmd(daemon, port),
-        Cmd::Sim(args) => sim_cmd(sim_host, &args),
+        Cmd::Sim(args) => sim_cmd(guests.sim, &args),
+        Cmd::Mkuser(args) => mkuser_cmd(guests.mkuser, &args),
     }
 }
 
@@ -181,6 +199,49 @@ fn sim_cmd(host: Option<&dyn sim::SimHost>, args: &sim::SimArgs) -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// Creates the guest's user with `host` (`None`: not a macOS guest, refuse with 2). Exits 0
+/// when the host got the summary and the user is ready (made now, or before), 1 when a step
+/// failed, the run could not start or the summary never arrived.
+fn mkuser_cmd(host: Option<&dyn mkuser::MkUserHost>, args: &mkuser::MkUserArgs) -> ExitCode {
+    let Some(host) = host else {
+        eprintln!("kbf-guest: mkuser runs inside a macOS guest");
+        return ExitCode::from(2);
+    };
+    let done = mkuser::run(
+        host,
+        &mkuser::Config::from(args),
+        &args.name,
+        &mut std::io::stderr(),
+    );
+    let sent = !done
+        .summary
+        .undelivered
+        .iter()
+        .any(|n| n == mkuser::SUMMARY_NAME);
+    if done.summary.ok && sent {
+        return ExitCode::SUCCESS;
+    }
+    eprintln!(
+        "kbf-guest: mkuser: the user is not ready ({})",
+        done.summary
+            .note
+            .as_deref()
+            .unwrap_or("see the step frames the host received")
+    );
+    ExitCode::FAILURE
+}
+
+/// The host `mkuser` uses: the real guest on macOS, nothing elsewhere.
+#[cfg(target_os = "macos")]
+fn real_mkuser_host() -> Option<Box<dyn mkuser::MkUserHost>> {
+    Some(Box::new(kbf_guest::mkuser_host::RealMkUserHost::new()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn real_mkuser_host() -> Option<Box<dyn mkuser::MkUserHost>> {
+    None
 }
 
 /// The host `sim` uses: the real guest on macOS, nothing elsewhere.
@@ -466,7 +527,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    None
+                    Guests::default()
                 ),
                 ExitCode::SUCCESS
             );
@@ -492,7 +553,15 @@ mod tests {
             "/w",
         ];
         assert_eq!(
-            run_with(cli(&g), refusal(), Some(&h()), None, None, None, None),
+            run_with(
+                cli(&g),
+                refusal(),
+                Some(&h()),
+                None,
+                None,
+                None,
+                Guests::default()
+            ),
             ExitCode::SUCCESS
         );
         let r = [
@@ -503,7 +572,15 @@ mod tests {
             "p",
         ];
         assert_eq!(
-            run_with(cli(&r), refusal(), Some(&h()), None, None, None, None),
+            run_with(
+                cli(&r),
+                refusal(),
+                Some(&h()),
+                None,
+                None,
+                None,
+                Guests::default()
+            ),
             ExitCode::SUCCESS
         );
         let text = std::fs::read_to_string(&guest).expect("guest result");
@@ -514,7 +591,15 @@ mod tests {
                 .contains("\"session\"")
         );
         assert_eq!(
-            run_with(cli(&r), refusal(), None, None, None, None, None),
+            run_with(
+                cli(&r),
+                refusal(),
+                None,
+                None,
+                None,
+                None,
+                Guests::default()
+            ),
             ExitCode::from(2)
         );
     }
@@ -543,7 +628,15 @@ mod tests {
             "--delay-ms=0",
         ];
         let go = |m: Option<&dyn mount::Mounter>| {
-            run_with(cli(&args), refusal(), None, m, None, None, None)
+            run_with(
+                cli(&args),
+                refusal(),
+                None,
+                m,
+                None,
+                None,
+                Guests::default(),
+            )
         };
         assert_eq!(go(Some(&M(true))), ExitCode::SUCCESS);
         assert_eq!(go(Some(&M(false))), ExitCode::FAILURE);
@@ -595,7 +688,15 @@ mod tests {
         let control = format!("--control-dir={}", dir.join("none").display());
         let args = ["probe-diag", share.as_str(), control.as_str()];
         let go = |d: Option<&dyn diag::DiagHost>| {
-            run_with(cli(&args), refusal(), None, None, d, None, None)
+            run_with(
+                cli(&args),
+                refusal(),
+                None,
+                None,
+                d,
+                None,
+                Guests::default(),
+            )
         };
         assert_eq!(go(Some(&D)), ExitCode::SUCCESS);
         assert_eq!(go(None), ExitCode::from(2));
@@ -619,7 +720,7 @@ mod tests {
     fn shutdown_listen_runs_as_root_on_its_port_and_fails_loud() {
         let refusal = || Err("kbf-guest refuses to run as root".to_owned());
         let go = |args: &[&str], d: Option<&dyn shutdown::Daemon>| {
-            run_with(cli(args), refusal(), None, None, None, d, None)
+            run_with(cli(args), refusal(), None, None, None, d, Guests::default())
         };
         let ok = Dm(None, std::cell::Cell::new(0));
         assert_eq!(go(&["shutdown-listen"], Some(&ok)), ExitCode::SUCCESS);
@@ -642,6 +743,12 @@ mod tests {
     }
 
     impl sim::SimHost for S {
+        fn ready_user(&self) -> Option<String> {
+            None
+        }
+        fn wanted_user(&self) -> Option<String> {
+            None
+        }
         fn is_root(&self) -> bool {
             self.root
         }
@@ -703,7 +810,18 @@ mod tests {
     fn sim_runs_as_root_and_exits_by_whether_the_host_got_its_summary() {
         let root = || Err("kbf-guest refuses to run as root".to_owned());
         let go = |host: Option<&dyn sim::SimHost>| {
-            run_with(cli(&["sim"]), root(), None, None, None, None, host)
+            run_with(
+                cli(&["sim"]),
+                root(),
+                None,
+                None,
+                None,
+                None,
+                Guests {
+                    sim: host,
+                    mkuser: None,
+                },
+            )
         };
         assert_eq!(
             go(Some(&S {
@@ -727,5 +845,90 @@ mod tests {
             ExitCode::FAILURE
         );
         assert_eq!(go(None), ExitCode::from(2));
+    }
+    /// A `mkuser` host on which every command works.
+    struct Mk {
+        root: bool,
+        up: bool,
+        ready: Option<String>,
+    }
+
+    impl mkuser::MkUserHost for Mk {
+        fn is_root(&self) -> bool {
+            self.root
+        }
+        fn user_exists(&self, _: &str) -> bool {
+            false
+        }
+        fn ready_user(&self) -> Option<String> {
+            self.ready.clone()
+        }
+        fn random_bytes(&self, n: usize) -> Result<Vec<u8>, String> {
+            Ok(vec![7; n])
+        }
+        fn write_file(&self, _: &str, _: &[u8], _: u32) -> Result<(), String> {
+            Ok(())
+        }
+        fn run(&self, _: &[String], _: std::time::Duration) -> sim::Outcome {
+            sim::Outcome {
+                ended: sim::Ended::Exited(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                cut: false,
+                ms: 1,
+            }
+        }
+        fn send(
+            &self,
+            _: u32,
+            _: &kbf_guest::frame::Frame,
+        ) -> Result<(), kbf_guest::frame::SendError> {
+            if self.up {
+                Ok(())
+            } else {
+                Err(kbf_guest::frame::SendError::Unavailable("no".into()))
+            }
+        }
+        fn pause(&self, _: std::time::Duration) {}
+    }
+
+    /// Catches `mkuser` refused as root (it is a root daemon), run off macOS without the
+    /// refusal, a run with no `--name`, and an exit status that does not follow whether the
+    /// user is ready and the host got the summary (launchd and the host both read it).
+    #[test]
+    fn mkuser_runs_as_root_and_exits_by_whether_the_user_is_ready_and_reported() {
+        let root = || Err("kbf-guest refuses to run as root".to_owned());
+        let go = |args: &[&str], host: Option<&dyn mkuser::MkUserHost>| {
+            run_with(
+                cli(args),
+                root(),
+                None,
+                None,
+                None,
+                None,
+                Guests {
+                    sim: None,
+                    mkuser: host,
+                },
+            )
+        };
+        let args = ["mkuser", "--name", "kbfuser"];
+        let m = |root, up, ready: Option<&str>| Mk {
+            root,
+            up,
+            ready: ready.map(str::to_owned),
+        };
+        assert_eq!(go(&args, Some(&m(true, true, None))), ExitCode::SUCCESS);
+        assert_eq!(
+            go(&args, Some(&m(true, true, Some("kbfuser")))),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(go(&args, Some(&m(true, false, None))), ExitCode::FAILURE);
+        assert_eq!(go(&args, Some(&m(false, true, None))), ExitCode::FAILURE);
+        assert_eq!(
+            go(&["mkuser", "--name", "Root"], Some(&m(true, true, None))),
+            ExitCode::FAILURE
+        );
+        assert_eq!(go(&args, None), ExitCode::from(2));
     }
 }

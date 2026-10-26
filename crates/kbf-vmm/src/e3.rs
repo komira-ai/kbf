@@ -80,7 +80,7 @@ impl Received {
 }
 
 /// The names in `dir`, sorted; empty when it cannot be read.
-fn names(dir: &Path) -> Vec<String> {
+pub(crate) fn names(dir: &Path) -> Vec<String> {
     let mut found: Vec<String> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.filter_map(Result::ok)
@@ -318,7 +318,7 @@ fn one_line(arm: &Value) -> String {
     let name = arm["name"].as_str().unwrap_or_default();
     if arm["steps_received"] == json!(0) {
         return format!(
-            "{name} ({kind}): no step frame arrived (is the base set up with `image setup --xcode --sim-runtime`?)"
+            "{name} ({kind}): no step frame arrived (is the base set up with `image setup --xcode --sim-runtime`, and, with `--guest-user`, primed with `image prime`?)"
         );
     }
     let problems: Vec<&str> = arm["problems"]

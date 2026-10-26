@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::frame::{Frame, SendError};
+use crate::mkuser_host::recorded_user;
 use crate::probe::Host;
 use crate::probe_host::SystemHost;
 use crate::sim::{ConsoleUser, OUT_DIR, Outcome, SCREENSHOT_PATH, SimHost};
@@ -97,6 +98,14 @@ impl SimHost for RealSimHost {
             uid,
             name: user_name(uid)?,
         })
+    }
+
+    fn ready_user(&self) -> Option<String> {
+        recorded_user(simpaths::USER_READY)
+    }
+
+    fn wanted_user(&self) -> Option<String> {
+        recorded_user(simpaths::USER_WANTED)
     }
 
     fn prepare_out_dir(&self) -> Result<(), String> {
