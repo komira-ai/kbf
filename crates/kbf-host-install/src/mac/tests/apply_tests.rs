@@ -119,6 +119,11 @@ fn the_daemon_is_bootstrapped_only_after_it_is_gone() {
         1
     );
     assert!(lines[lines.len() - 2].starts_with("bootstrap"));
+    assert_eq!(
+        fx.clock.sleeps(),
+        [fx.host.tuning.poll; 3],
+        "one pause after each look that still found the service"
+    );
 }
 
 /// The apply is done only on the welcomed line of the NEW process, counted from where the
@@ -143,7 +148,9 @@ fn only_the_new_processs_welcome_counts() {
 }
 
 /// A new release that does not log `welcomed` is rolled back: the links go back, the old
-/// release is bootstrapped, and the status says so.
+/// release is bootstrapped, and the status says so. The wait for the line is the tuning's
+/// `welcome` in polls (60 pauses of 2 ms in 120 ms), and the rollback, welcomed at once,
+/// pauses no more.
 #[test]
 fn a_daemon_that_is_not_welcomed_is_rolled_back() {
     let fx = Fx::new("mac-apply-notwelcome");
@@ -159,6 +166,7 @@ fn a_daemon_that_is_not_welcomed_is_rolled_back() {
     assert_eq!(sim.daemon_bootouts.get(), 2);
     assert!(sim.loaded.borrow().contains(DAEMON_LABEL));
     assert!(!fx.host.stage().exists());
+    assert_eq!(fx.clock.sleeps(), [fx.host.tuning.poll; 60]);
 }
 
 /// A bootstrap that fails: the previous release is bootstrapped again.
@@ -219,7 +227,8 @@ fn a_rollback_that_fails_is_said() {
 }
 
 /// A daemon that cannot be booted out stops the apply before its bootstrap, and a launchctl
-/// that cannot run does the same.
+/// that cannot run does the same. The wait for the service to go is the tuning's `gone` in
+/// polls (30 pauses of 2 ms in 60 ms), once for the apply and once for the rollback.
 #[test]
 fn a_daemon_that_will_not_go_stops_the_apply() {
     let fx = Fx::new("mac-apply-stuck");
@@ -232,6 +241,7 @@ fn a_daemon_that_will_not_go_stops_the_apply() {
     );
     assert_eq!(sim.daemon_bootstraps.get(), 0);
     assert_eq!(current(&fx).as_deref(), Some(OLD));
+    assert_eq!(fx.clock.sleeps(), [fx.host.tuning.poll; 30 + 30]);
 
     let fx = Fx::new("mac-apply-nolaunchctl");
     let sim = fx.sim();
@@ -520,7 +530,9 @@ fn audit_tail(fx: &Fx) -> serde_json::Value {
 
 /// A `welcomed` line is not enough: the daemon must be running the release that was
 /// started. A daemon whose process still executes the old file is rolled back, and a
-/// rollback that is welcomed but runs another file is not a rollback.
+/// rollback that is welcomed but runs another file is not a rollback. The wait for the
+/// process is the tuning's `gone` in polls (30 pauses of 2 ms in 60 ms): once for a release
+/// that is not running, and once more for a rollback that is not either.
 #[test]
 fn a_welcomed_daemon_must_run_the_release_that_was_started() {
     let fx = Fx::new("mac-apply-wrongrelease");
@@ -537,6 +549,7 @@ fn a_welcomed_daemon_must_run_the_release_that_was_started() {
         2,
         "the old release was started again"
     );
+    assert_eq!(fx.clock.sleeps(), [fx.host.tuning.poll; 30]);
 
     let fx = Fx::new("mac-apply-wrongrollback");
     let sim = fx.sim();
@@ -547,6 +560,7 @@ fn a_welcomed_daemon_must_run_the_release_that_was_started() {
         apply(&fx, &sim),
         (1, "failed:wrong_release:rollback_failed\n".to_owned())
     );
+    assert_eq!(fx.clock.sleeps(), [fx.host.tuning.poll; 30 + 30]);
 }
 
 /// The old release is checked to be root's before the daemon is stopped for the rollback.

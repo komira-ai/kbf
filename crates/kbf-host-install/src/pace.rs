@@ -22,6 +22,14 @@ pub struct Pace {
     pub sleep: Box<dyn Fn(Duration)>,
 }
 
+impl std::fmt::Debug for Pace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pace")
+            .field("poll", &self.poll)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Pace {
     /// The clock of the machine.
     pub fn real() -> Self {
