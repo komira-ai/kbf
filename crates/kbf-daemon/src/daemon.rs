@@ -402,6 +402,13 @@ impl Daemon {
         self.pack_reads.as_ref()
     }
 
+    /// The handle [`Self::with_pack_writes`] was given; `None` for a daemon that sets none from
+    /// its Welcomes.
+    #[must_use]
+    pub const fn pack_writes(&self) -> Option<&PackCommit> {
+        self.pack_commit.as_ref()
+    }
+
     /// This daemon process's instance id (`Hello.instance_id`), drawn when it was built.
     #[must_use]
     pub fn instance_id(&self) -> &str {

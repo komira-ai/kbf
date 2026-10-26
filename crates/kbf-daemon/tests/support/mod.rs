@@ -1065,8 +1065,10 @@ impl<R: Runtime> Harness<R> {
             daemon = daemon.with_pack_reads(packs);
             assert!(daemon.pack_reads().is_some());
         }
+        assert!(daemon.pack_writes().is_none());
         if let Some(commit) = commit {
             daemon = daemon.with_pack_writes(commit);
+            assert!(daemon.pack_writes().is_some());
         }
         let daemon = match drain {
             Some((signals, Some(deadline))) => tokio::spawn(daemon.run_draining(signals, deadline)),
