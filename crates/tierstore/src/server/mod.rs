@@ -118,11 +118,17 @@ mod xml;
 #[cfg(test)]
 mod auth_tests;
 #[cfg(test)]
+mod body_stall_tests;
+#[cfg(test)]
 mod completion_tests;
+#[cfg(test)]
+mod drain_tests;
 #[cfg(test)]
 mod idle_tests;
 #[cfg(test)]
 mod ops_tests;
+#[cfg(test)]
+mod pipes;
 #[cfg(test)]
 mod reply_tests;
 #[cfg(test)]
@@ -139,9 +145,12 @@ mod time_tests;
 mod xml_tests;
 
 use std::convert::Infallible;
+use std::future::poll_fn;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -152,7 +161,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 
 use crate::{Backend, Clock};
@@ -245,6 +255,38 @@ const REFUSING: u8 = 2;
 /// How long [`Server::serve`] waits after a failed accept before the next.
 const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 
+/// Where [`Server::serve`] takes its connections from: the listener of a socket, and in the
+/// tests a channel of pipes, which a test runs on a paused clock.
+trait Incoming {
+    /// The byte stream of a connection.
+    type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
+
+    /// Takes the next connection, once there is one, with the address of its peer.
+    fn poll_incoming(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<(Self::Stream, SocketAddr)>>;
+}
+
+impl Incoming for TcpListener {
+    type Stream = tokio::net::TcpStream;
+
+    fn poll_incoming(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<(tokio::net::TcpStream, SocketAddr)>> {
+        self.poll_accept(cx)
+    }
+}
+
+/// Waits a moment when an accept failed, so that a listener that keeps failing is not asked
+/// again at once.
+async fn pause_after(failed: bool) {
+    if failed {
+        tokio::time::sleep(ACCEPT_PAUSE).await;
+    }
+}
+
 /// The S3 front of a [`Backend`].
 pub struct Server {
     backend: Arc<dyn Backend>,
@@ -256,7 +298,7 @@ pub struct Server {
     inflight: AtomicUsize,
     /// The connections that are open.
     open: AtomicUsize,
-    /// Notified whenever a request ends or a connection closes.
+    /// Notified whenever a request begins or ends or a connection opens or closes.
     idle: Notify,
     /// Set once, when the drain has waited for the requests in flight: the connections finish
     /// the answers they are sending and close.
@@ -270,6 +312,7 @@ struct Flight<'a>(&'a Server);
 impl<'a> Flight<'a> {
     fn enter(server: &'a Server) -> Self {
         server.inflight.fetch_add(1, Ordering::SeqCst);
+        server.idle.notify_waiters();
         Self(server)
     }
 }
@@ -287,6 +330,7 @@ struct Connected(Arc<Server>);
 impl Connected {
     fn enter(server: &Arc<Server>) -> Self {
         server.open.fetch_add(1, Ordering::SeqCst);
+        server.idle.notify_waiters();
         Self(Arc::clone(server))
     }
 }
@@ -349,12 +393,17 @@ impl Server {
     /// Serves the connections of `listener` until the drain has run its course (see the module
     /// docs): the drain begins when [`Server::begin_drain`] is called.
     pub async fn serve(self: &Arc<Self>, listener: TcpListener) -> Drained {
+        self.serve_from(listener).await
+    }
+
+    /// [`Server::serve`] over any source of connections: the tests serve pipes.
+    async fn serve_from<I>(self: &Arc<Self>, mut incoming: I) -> Drained
+    where
+        I: Incoming + Send,
+    {
         loop {
             tokio::select! {
-                accepted = listener.accept() => match accepted {
-                    Ok((stream, peer)) => self.connection(stream, peer),
-                    Err(_) => tokio::time::sleep(ACCEPT_PAUSE).await,
-                },
+                () = self.accept_one(&mut incoming) => {}
                 () = self.drain_requested.notified() => break,
             }
         }
@@ -362,15 +411,28 @@ impl Server {
         tokio::pin!(wait);
         loop {
             tokio::select! {
-                accepted = listener.accept() => match accepted {
-                    Ok((stream, peer)) => self.connection(stream, peer),
-                    Err(_) => tokio::time::sleep(ACCEPT_PAUSE).await,
-                },
+                () = self.accept_one(&mut incoming) => {}
                 () = &mut wait => break,
             }
         }
         self.phase.store(REFUSING, Ordering::SeqCst);
-        drop(listener);
+        drop(incoming);
+        self.finish_by_deadline().await
+    }
+
+    /// Takes the next connection `incoming` gives and serves it; after an accept that failed,
+    /// waits a moment.
+    async fn accept_one<I: Incoming>(self: &Arc<Self>, incoming: &mut I) {
+        let accepted = poll_fn(|cx| incoming.poll_incoming(cx)).await;
+        let failed = accepted
+            .map(|(stream, peer)| self.connection(stream, peer))
+            .is_err();
+        pause_after(failed).await;
+    }
+
+    /// Waits as [`Server::finish`] does, for [`ServerConfig::drain_deadline`] at most, and says
+    /// how many requests that deadline cut.
+    async fn finish_by_deadline(&self) -> Drained {
         let finished = tokio::time::timeout(self.config.drain_deadline, self.finish());
         match finished.await {
             Ok(()) => Drained { abandoned: 0 },
@@ -415,7 +477,10 @@ impl Server {
 
     /// Serves one connection on a task of its own, which ends with the connection, or after the
     /// drain has closed it.
-    fn connection(self: &Arc<Self>, stream: TcpStream, peer: SocketAddr) {
+    fn connection<S>(self: &Arc<Self>, stream: S, peer: SocketAddr)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let server = Arc::clone(self);
         let service = service_fn(move |request| {
             let server = Arc::clone(&server);

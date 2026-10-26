@@ -14,8 +14,6 @@ use tierstore::server::cli::{Cli, run};
 use tokio::sync::oneshot;
 
 use crate::files::{BIN_KEY_ID, BIN_SECRET, Files, with};
-use crate::signer::{Request, now, sign};
-use crate::stalled::Stalled;
 
 fn store(addr: SocketAddr) -> S3Store {
     let config = S3Config {
@@ -124,51 +122,8 @@ async fn run_serves_until_it_is_stopped() {
         store.put_new(&k, body, None).await.unwrap();
         let first = ByteRange::new(0, 2).unwrap();
         assert_eq!(store.get_range(&k, first).await.unwrap(), "in");
-        tokio::time::sleep(Duration::from_millis(200)).await;
         stop.send(()).unwrap();
     };
     let (drained, ()) = tokio::join!(running, driving);
     assert_eq!(drained.unwrap(), Drained { abandoned: 0 });
-}
-
-/// Asserts that `run` reports the requests it cut at the deadline: a request that is still in
-/// flight when the deadline passes is counted in the drain it returns.
-#[tokio::test]
-async fn run_counts_the_requests_the_deadline_cut() {
-    let files = Files::new("run-cut");
-    let extra = ["--drain-lb-wait", "20ms", "--drain-deadline", "200ms"];
-    let cli = parse(files.flags(&extra));
-    let (stop, stopped) = oneshot::channel::<()>();
-    let (told, addr) = oneshot::channel::<SocketAddr>();
-    let running = run(
-        &cli,
-        async move {
-            let _ = stopped.await;
-        },
-        move |bound| {
-            let _ = told.send(bound);
-        },
-    );
-    let driving = async {
-        let addr = addr.await.unwrap();
-        let body = b"0123456789";
-        let host = addr.to_string();
-        let request = Request {
-            method: "PUT",
-            host: &host,
-            path: "/tier-bucket/k",
-            query: &[],
-            headers: &[("if-none-match", "*")],
-            body,
-            stamp: &now(),
-        };
-        let headers = sign(&request, BIN_KEY_ID, BIN_SECRET);
-        let stalled = Stalled::open(addr, &headers, "/tier-bucket/k", body, 4).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        stop.send(()).unwrap();
-        stalled
-    };
-    let (drained, stalled) = tokio::join!(running, driving);
-    assert_eq!(drained.unwrap(), Drained { abandoned: 1 });
-    drop(stalled);
 }
