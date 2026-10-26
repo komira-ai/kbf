@@ -211,9 +211,12 @@ fn a_helper_that_dies_ends_the_run_and_is_counted() {
     }
     let mut c = ctx(&sys, &work);
     c.timing.guest_timeout = std::time::Duration::from_secs(60);
-    let began = std::time::Instant::now();
     let r = bench::run(&c, 1);
-    assert!(began.elapsed() < std::time::Duration::from_secs(30));
+    assert!(
+        sys.clock.now() < c.timing.guest_timeout,
+        "the run waited out the guest timeout: the clock reads {:?}",
+        sys.clock.now()
+    );
     assert_eq!(r.details["warm"]["failed_runs"], 1);
     assert!(
         r.details["warm"]["failures"][0]
