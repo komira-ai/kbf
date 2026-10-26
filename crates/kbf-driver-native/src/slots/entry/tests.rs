@@ -1240,6 +1240,35 @@ fn the_home_is_emptied_past_a_refusal_and_an_empty_kept_directory_is_no_error() 
     assert!(!home.join("Library/y").exists());
 }
 
+/// Catches an empty that failed and drops the directories it kept from the error output:
+/// the caller reads the kept set from whichever of the two it gets, so a failed empty
+/// must name them on both.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_failed_home_empty_names_the_directories_it_kept_on_the_error_output_too() {
+    use kbf_mac_session::sweep::pretend_unremovable;
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipped: root removes from a read-only directory");
+        return;
+    }
+    let dir = tree("empty-home-failed-kept");
+    let home = dir.path().join("home");
+    fs::create_dir_all(home.join("Library/Preferences")).expect("dirs");
+    fs::create_dir_all(home.join("locked")).expect("dirs");
+    fs::write(home.join("locked/f"), "x").expect("file");
+    // The owner can open it, so the empty does not give it the permission back, and the
+    // file in it cannot be removed.
+    fs::set_permissions(home.join("locked"), fs::Permissions::from_mode(0o500)).expect("chmod");
+    pretend_unremovable(&["Preferences"]);
+    let (code, out, err) = call(EMPTY_HOME, &home);
+    pretend_unremovable(&[]);
+    fs::set_permissions(home.join("locked"), fs::Permissions::from_mode(0o700)).expect("chmod");
+    let kept = vec![home.join("Library/Preferences")];
+    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(kept_from(&out), kept, "{out}");
+    assert_eq!(kept_from(&err), kept, "{err}");
+}
+
 #[test]
 fn the_kept_directories_are_read_from_the_lines_that_name_them() {
     assert_eq!(

@@ -102,7 +102,7 @@ impl Drop for Keeper {
 mod tests {
     use super::*;
     use std::process::Command;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     /// A `sleep 300` leading a process group of its own.
     fn group() -> Child {
@@ -113,15 +113,15 @@ mod tests {
             .expect("sleep")
     }
 
-    /// A shell leading a process group of its own that waits for its stdin to close (or
-    /// a line), then exits 0: one that was signalled instead ends by the signal.
+    /// A `cat` leading a process group of its own that waits for its stdin to close,
+    /// then exits 0: one that was signalled instead ends by the signal.
     fn gated() -> Child {
-        Command::new("sh")
-            .args(["-c", "read line; exit 0"])
+        Command::new("cat")
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
             .process_group(0)
             .spawn()
-            .expect("sh")
+            .expect("cat")
     }
 
     /// Lets a [`gated`] child finish and reaps it: its exit code, `None` when a signal
@@ -143,12 +143,13 @@ mod tests {
 
     /// Whether `child` exits within `within`; reaps it if so.
     fn exits(child: &mut Child, within: Duration) -> bool {
-        let deadline = Instant::now() + within;
-        while Instant::now() < deadline {
+        let step = Duration::from_millis(10);
+        // A count of looks, not a read of the clock: the give-up is the number of looks.
+        for _ in 0..(within.as_millis() / step.as_millis()) {
             if child.try_wait().expect("wait").is_some() {
                 return true;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(step);
         }
         false
     }

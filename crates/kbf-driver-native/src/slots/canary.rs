@@ -1544,14 +1544,20 @@ mod tests {
             .expect("runtime");
         let cancel = Arc::new(AtomicBool::new(false));
         let work_cancel = Arc::clone(&cancel);
-        let (started_tx, started) = tokio::sync::oneshot::channel::<()>();
+        let (started_tx, mut started) = tokio::sync::mpsc::unbounded_channel::<()>();
         let (ended_tx, ended) = mpsc::channel::<bool>();
         let work = async move {
             let _ = tokio::task::spawn_blocking(move || {
-                let _ = started_tx.send(());
-                let give_up = std::time::Instant::now() + Duration::from_secs(30);
-                while !work_cancel.load(Ordering::SeqCst) && std::time::Instant::now() < give_up {
-                    std::thread::yield_now();
+                // Says it started on every step until the flag is set, so the wait is
+                // dropped only after the work was running and the flag was still clear. At
+                // most 30 s of steps: a flag that never comes ends the loop and the
+                // test's asserts report it.
+                for _ in 0..30_000 {
+                    if work_cancel.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let _ = started_tx.send(());
+                    std::thread::sleep(Duration::from_millis(1));
                 }
                 let _ = ended_tx.send(work_cancel.load(Ordering::SeqCst));
             })
@@ -1561,7 +1567,7 @@ mod tests {
         // drop it.
         rt.block_on(async {
             tokio::select! {
-                _ = started => {}
+                _ = started.recv() => {}
                 _ = until_killed(work, &cancel, std::future::pending::<Option<()>>()) => {
                     panic!("the work ended by itself")
                 }

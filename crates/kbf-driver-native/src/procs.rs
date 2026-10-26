@@ -801,9 +801,9 @@ mod tests {
     fn a_group_seen_empty_is_not_signalled_by_its_id() {
         use std::os::unix::process::CommandExt as _;
         // Waits for its stdin to close and exits 0 by itself: a signal shows as how it ended.
-        let mut other = std::process::Command::new("/bin/sh")
-            .args(["-c", "read line; exit 0"])
+        let mut other = std::process::Command::new("cat")
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
             .process_group(0)
             .spawn()
             .expect("spawn");
