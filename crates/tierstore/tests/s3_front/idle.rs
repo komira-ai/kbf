@@ -2,6 +2,7 @@
 //! other tests of the idle limit, of bodies and of answers, are in the crate, on a paused clock
 //! over in-memory pipes (`src/server/body_stall_tests.rs`, `src/server/drain_tests.rs`).
 
+//! The slow but steady reader is in `src/server/slow_reader_tests.rs`.
 use std::time::Duration;
 
 use bytes::Bytes;

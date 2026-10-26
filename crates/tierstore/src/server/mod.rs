@@ -138,6 +138,8 @@ mod role_tests;
 #[cfg(test)]
 mod server_tests;
 #[cfg(test)]
+mod slow_reader_tests;
+#[cfg(test)]
 mod testing;
 #[cfg(test)]
 mod time_tests;
