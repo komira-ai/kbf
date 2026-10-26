@@ -157,7 +157,8 @@ pub enum ImageCmd {
         xcode: Option<PathBuf>,
         /// A simulator runtime disk image (`<name>.dmg`) to stage under
         /// /private/var/kbf-sim/runtimes. Repeat the flag for several (at most 8, with
-        /// different file names); the directory then holds exactly these. The report
+        /// different file names); the directory then holds exactly these (a setup that names none
+        /// empties it). The report
         /// records each one's name, size and SHA-256.
         #[arg(long = "sim-runtime", value_name = "DMG")]
         sim_runtimes: Vec<PathBuf>,

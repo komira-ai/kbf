@@ -299,6 +299,9 @@ struct Harness {
     chown_fails_at: Option<usize>,
     chowned: RefCell<Vec<PathBuf>>,
     clones: RefCell<u32>,
+    /// What a clone does to the tree it made, after it made it (the host tree changed
+    /// under the clone, or the clone kept a bit).
+    after_clone: Option<fn(&Path)>,
 }
 
 impl Harness {
@@ -310,6 +313,7 @@ impl Harness {
             chown_fails_at: None,
             chowned: RefCell::new(Vec::new()),
             clones: RefCell::new(0),
+            after_clone: None,
         }
     }
 
@@ -330,7 +334,9 @@ impl Harness {
                 return Err(std::io::Error::from_raw_os_error(libc::EXDEV));
             }
             std::fs::remove_dir_all(dst)?;
-            copy_tree(src, dst)
+            copy_tree(src, dst)?;
+            self.after_clone.iter().for_each(|f| f(dst));
+            Ok(())
         };
         let chown = |p: &Path| {
             let n = self.chowned.borrow().len();
@@ -1228,4 +1234,161 @@ fn the_links_let_through_by_the_flag_are_listed_in_the_staging_report() {
         out["xcode"]["external_links"],
         serde_json::json!([{"path": "Contents/Developer/man", "target": "/usr/share/man"}])
     );
+}
+
+/// Catches a tree clone that keeps the setuid, setgid or sticky bit of the host tree (the
+/// plan's modes are written on the file-by-file path only).
+#[test]
+fn a_cloned_tree_has_no_setuid_setgid_or_sticky_bit() {
+    let dir = tmp("stage-clone-modes");
+    let app = fake_xcode(&dir);
+    let tool = app.join("Contents/Developer/usr/bin/xcodebuild");
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o6755)).expect("chmod");
+    let sticky = app.join("Contents/Frameworks");
+    std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).expect("chmod");
+    let plan = plan(Some(&app), &[], false).expect("plan");
+    let volume = volume_in(&dir);
+    let mut h = Harness::new(100 * GIB);
+    h.clone_ok = true;
+    let out = h.run(&volume, &plan).expect("execute");
+    assert_eq!(out["xcode"]["method"], "clone");
+    let mode = |p: &str| {
+        std::fs::metadata(volume.join("Applications/Xcode.app").join(p))
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+    assert_eq!(
+        (
+            mode("Contents/Developer/usr/bin/xcodebuild"),
+            mode("Contents/Frameworks")
+        ),
+        (0o755, 0o777)
+    );
+}
+
+/// A change made to a cloned tree.
+type Mutation = fn(&Path);
+
+/// Catches a clone of a tree that is not the planned one being installed: a link out of the
+/// app, a new file, a new socket, a file replaced by a link, or a changed size. Nothing is
+/// put under the real name.
+#[test]
+fn a_cloned_tree_that_differs_from_the_plan_is_refused() {
+    let cases: [(&str, Mutation); 5] = [
+        ("escaping link", |t| {
+            link("/etc", &t.join("Contents/escape"));
+        }),
+        ("new file", |t| write(&t.join("Contents/new"), "new", 0o644)),
+        ("new socket", |t| {
+            std::os::unix::net::UnixListener::bind(t.join("Contents/sock")).expect("bind");
+        }),
+        ("file became a link", |t| {
+            let f = t.join("Contents/Info.plist");
+            std::fs::remove_file(&f).expect("rm");
+            link("/etc/hostname", &f);
+        }),
+        ("size changed", |t| {
+            write(&t.join("Contents/Info.plist"), "plist plus", 0o644);
+        }),
+    ];
+    for (name, after) in cases {
+        let dir = tmp("stage-clone-diff");
+        let app = fake_xcode(&dir);
+        let volume = volume_in(&dir);
+        let plan = plan(Some(&app), &[], false).expect("plan");
+        let mut h = Harness::new(100 * GIB);
+        h.clone_ok = true;
+        h.after_clone = Some(after);
+        let e = h.run(&volume, &plan).expect_err(name);
+        assert!(
+            e.contains("cloned tree does not match the plan"),
+            "{name}: {e}"
+        );
+        assert!(!volume.join("Applications/Xcode.app").exists(), "{name}");
+    }
+}
+
+/// Catches a link planted in the clone that the plan accepted being treated as a reason to
+/// refuse (an allowed external link is in the plan and in the clone alike).
+#[test]
+fn a_clone_with_the_links_the_plan_accepted_is_installed() {
+    let dir = tmp("stage-clone-ext");
+    let app = fake_xcode(&dir);
+    link("/usr/lib/outside", &app.join("Contents/outside"));
+    let plan = plan(Some(&app), &[], true).expect("plan");
+    let volume = volume_in(&dir);
+    let mut h = Harness::new(100 * GIB);
+    h.clone_ok = true;
+    let out = h.run(&volume, &plan).expect("execute");
+    assert_eq!(out["xcode"]["method"], "clone");
+    assert_eq!(
+        std::fs::read_link(volume.join("Applications/Xcode.app/Contents/outside")).expect("l"),
+        Path::new("/usr/lib/outside")
+    );
+}
+
+/// Catches a file swapped for a link after the plan being read through the link as root: the
+/// link points at a file of the same size, so only the refusal to follow it stops the copy.
+#[test]
+fn a_file_swapped_for_a_link_after_the_plan_is_not_copied() {
+    let dir = tmp("stage-swap");
+    let app = fake_xcode(&dir);
+    let secret = dir.join("secret");
+    write(&secret, "plist", 0o600);
+    let plan = plan(Some(&app), &[], false).expect("plan");
+    let victim = app.join("Contents/Info.plist");
+    std::fs::remove_file(&victim).expect("rm");
+    link(secret.to_str().expect("p"), &victim);
+    let volume = volume_in(&dir);
+    let e = Harness::new(100 * GIB)
+        .run(&volume, &plan)
+        .expect_err("swapped");
+    assert!(e.starts_with("copy ") && e.contains("Info.plist"), "{e}");
+    assert!(!volume.join("Applications/Xcode.app").exists());
+    let staged = volume.join("Applications/.Xcode.app.kbf-staging/Contents/Info.plist");
+    assert!(
+        std::fs::read_to_string(staged).map_or(true, |t| t != "plist"),
+        "the target of the link was copied"
+    );
+}
+
+/// Catches a file swapped for a directory after the plan being accepted by the open (a
+/// directory opens for reading) and failing only inside the copy.
+#[test]
+fn a_file_swapped_for_a_directory_after_the_plan_is_refused_as_not_regular() {
+    let dir = tmp("stage-swap-dir");
+    let app = fake_xcode(&dir);
+    let plan = plan(Some(&app), &[], false).expect("plan");
+    let victim = app.join("Contents/Info.plist");
+    std::fs::remove_file(&victim).expect("rm");
+    std::fs::create_dir(&victim).expect("dir");
+    let e = Harness::new(100 * GIB)
+        .run(&volume_in(&dir), &plan)
+        .expect_err("swapped");
+    assert!(e.contains("no longer the regular file"), "{e}");
+}
+
+/// Catches a setup that names no runtime leaving the runtimes of an earlier setup in place
+/// (the guest installs what it finds) and a manifest that still lists them.
+#[test]
+fn a_setup_without_runtimes_clears_the_earlier_ones() {
+    let dir = tmp("stage-no-rt");
+    write(&dir.join("iOS.dmg"), "hello", 0o644);
+    let app = fake_xcode(&dir);
+    let volume = volume_in(&dir);
+    let h = Harness::new(100 * GIB);
+    let first = plan(Some(&app), &[dir.join("iOS.dmg")], false).expect("plan");
+    h.run(&volume, &first).expect("first");
+    let rt_dir = volume.join("private/var/kbf-sim/runtimes");
+    assert_eq!(listing(&rt_dir).len(), 1);
+    let second = plan(Some(&app), &[], false).expect("plan");
+    let out = h.run(&volume, &second).expect("second");
+    assert!(listing(&rt_dir).is_empty(), "{:?}", listing(&rt_dir));
+    assert_eq!(out["runtimes"], serde_json::json!([]));
+    let manifest =
+        std::fs::read_to_string(volume.join("private/var/kbf-sim/staged.json")).expect("manifest");
+    let m: Value = serde_json::from_str(&manifest).expect("json");
+    assert_eq!(m["runtimes"], serde_json::json!([]));
 }
