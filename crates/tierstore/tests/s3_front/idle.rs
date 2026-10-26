@@ -1,5 +1,5 @@
 //! The idle timeout of bodies and answers over real connections: a client that stalls in the
-//! middle of a body, one that is slow but steady, one that stops reading an answer, and a drain
+//! middle of a body, one that sends a body slowly, one that stops reading an answer, and a drain
 //! that meets them.
 
 use std::time::{Duration, Instant};
@@ -11,7 +11,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::drain::{put_headers, until_in_flight};
 use crate::raw::call;
-use crate::stalled::{Stalled, read_answer, send_get, status_of};
+use crate::stalled::{Stalled, send_get, status_of};
 use crate::support::{BUCKET, Harness};
 
 /// The idle timeout of the servers of these tests.
@@ -173,22 +173,5 @@ async fn a_drain_does_not_wait_past_the_idle_time_for_a_client_that_stalled() {
     assert!(h.hot_mem.get("k", None).await.is_err());
 }
 
-/// Asserts that a client that reads its answer slowly but steadily is served: a get of an object
-/// that the socket buffers cannot hold is read in pieces with waits shorter than the idle time,
-/// and the whole takes longer than the idle time.
-#[tokio::test]
-async fn a_client_that_reads_slowly_but_steadily_gets_the_whole_answer() {
-    let h = start().await;
-    put_big(&h).await;
-    let mut stream = send_get(&h, "big").await;
-    let started = Instant::now();
-    let mut total = 0;
-    let mut buffer = vec![0_u8; 1 << 20];
-    for _ in 0..6 {
-        tokio::time::sleep(IDLE / 3).await;
-        total += stream.read(&mut buffer).await.unwrap();
-    }
-    assert!(started.elapsed() > IDLE);
-    total += read_answer(&mut stream).await.len();
-    assert!(total > BIG);
-}
+// The slow but steady reader is tested on virtual time, in `src/server/slow_reader_tests.rs`:
+// `a_client_that_reads_slowly_but_steadily_gets_the_whole_answer_over_many_idle_times`.

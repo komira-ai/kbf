@@ -33,9 +33,9 @@ pub fn status_of(answer: &str) -> u16 {
 }
 
 /// The receive buffer of the connection of [`send_get`]. A small fixed one, so that what the
-/// server can send ahead of the reader, and how soon a read lets it send more, do not depend on
-/// how large the host lets a socket's buffer grow (a host with 32 MiB receive buffers held back
-/// a slow but steady reader's answer past the idle time).
+/// server can send ahead of the reader does not depend on how large the host lets a socket's
+/// buffer grow (a host with 32 MiB receive buffers would not hold back the answer that the tests
+/// of an unread answer need held back).
 const GET_RECEIVE_BUFFER: u32 = 256 << 10;
 
 /// Sends a signed get of `key` on a connection of its own, which closes after the answer, and
