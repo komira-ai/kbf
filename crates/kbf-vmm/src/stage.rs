@@ -23,8 +23,12 @@
 //!   copy. The file-by-file copy writes the plan's modes and opens each source without
 //!   following a link, refusing one that is no longer a regular file. A tree clone copies
 //!   the live tree, so it is walked again afterwards, refused unless it holds exactly the
-//!   plan's entries (kinds, link targets, file sizes), and given the plan's modes. Extended
-//!   attributes are not copied by the file-by-file path.
+//!   plan's entries (kinds, link targets, file sizes), and given the plan's modes.
+//! - Extended attributes (code signatures of files that are not Mach-O, resource forks,
+//!   Finder info) are kept by both ways of building the copy, except `com.apple.quarantine`:
+//!   the file-by-file copy copies them from each source (macOS only; the xattr module),
+//!   the clone carries them and has the quarantine mark removed from every node. Off macOS
+//!   attributes are out of scope.
 //! - An app bundle (`--sim-app`) is copied by the same rules as Xcode.app into
 //!   `/private/var/kbf-sim/apps/<name>.app`, which then holds exactly that app.
 //! - A runtime is one regular file named `<name>.dmg`, copied byte for byte while its
@@ -40,6 +44,7 @@ use serde_json::{Value, json};
 
 use crate::guest::remove_leftover;
 use crate::image;
+use crate::xattr;
 
 /// The most entries (files, directories, links) one Xcode.app may hold.
 pub const MAX_ENTRIES: usize = 2_000_000;
@@ -602,11 +607,10 @@ pub(crate) fn copy_file(src: &Path, dst: &Path, mode: u32, bytes: u64) -> Result
         .mode(0o600)
         .open(dst)
         .map_err(|e| fail(&e))?;
-    let copied = io::copy(&mut from, &mut to)
-        .and_then(|n| {
-            std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode)).map(|()| n)
-        })
-        .map_err(|e| fail(&e))?;
+    let copied = io::copy(&mut from, &mut to).map_err(|e| fail(&e))?;
+    // The attributes carry part of the code signature of a file that is not a Mach-O.
+    xattr::copy_fd(&from, &to, src).map_err(|e| fail(&e))?;
+    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode)).map_err(|e| fail(&e))?;
     if copied == bytes {
         Ok(())
     } else {
@@ -687,8 +691,11 @@ fn verify_clone(x: &TreePlan, staging: &Path) -> Result<(), String> {
         )));
     }
     let mut dir_modes = vec![(staging.to_owned(), 0o755)];
+    // The clone carries the attributes of the app; all but the quarantine mark stay.
+    xattr::strip_quarantine(staging)?;
     for node in &x.nodes {
         let at = staging.join(node.rel());
+        xattr::strip_quarantine(&at)?;
         match node {
             Node::Dir { mode, .. } => dir_modes.push((at, *mode)),
             Node::File { mode, .. } => chmod(&at, *mode)?,
@@ -709,18 +716,23 @@ fn build_tree(x: &TreePlan, staging: &Path, env: &Env<'_>) -> Result<&'static st
     // A failed clone may leave part of the tree: start from nothing.
     remove_leftover(staging);
     mkdir(staging, 0o700)?;
+    xattr::copy_nofollow(&x.source, staging)?;
     let mut dir_modes = vec![(staging.to_owned(), 0o755)];
     for node in &x.nodes {
         let dst = staging.join(node.rel());
         match node {
             Node::Dir { mode, .. } => {
                 mkdir(&dst, 0o700)?;
+                xattr::copy_nofollow(&x.source.join(node.rel()), &dst)?;
                 dir_modes.push((dst, *mode));
             }
             Node::File {
                 src, mode, bytes, ..
             } => copy_file(src, &dst, *mode, *bytes)?,
-            Node::Link { target, .. } => link(target, &dst)?,
+            Node::Link { target, .. } => {
+                link(target, &dst)?;
+                xattr::copy_nofollow(&x.source.join(node.rel()), &dst)?;
+            }
         }
     }
     apply_modes(dir_modes)?;
