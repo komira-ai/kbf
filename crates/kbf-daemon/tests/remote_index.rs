@@ -19,7 +19,9 @@ use kbf_objstore::{Capabilities, MemoryStore};
 use kbf_pack::{Blob, PackKeys, Packer, PackerConfig, Reader, ReaderConfig, WriterKind};
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::pack_index_server::{PackIndex as PackIndexRpc, PackIndexServer};
-use kbf_proto::worker::{PackLocateRequest, PackLocateResponse};
+use kbf_proto::worker::{
+    CommitPackRequest, CommitPackResponse, PackLocateRequest, PackLocateResponse,
+};
 use kbf_server::Peers;
 use kbf_server::pack_locate::PackLocateService;
 use kbf_state::pack_index::memory::MemoryPackIndex;
@@ -77,6 +79,14 @@ impl PackIndexRpc for Frontend {
             Mode::Refuse(code) => Err(Status::new(code, "scripted")),
             Mode::Empty => Ok(Response::new(PackLocateResponse::default())),
         }
+    }
+
+    /// This frontend takes no commits: these tests are of the reads.
+    async fn commit_pack(
+        &self,
+        _: Request<CommitPackRequest>,
+    ) -> Result<Response<CommitPackResponse>, Status> {
+        Err(Status::unimplemented("this frontend takes no commits"))
     }
 }
 

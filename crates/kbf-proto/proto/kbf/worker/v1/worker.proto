@@ -288,6 +288,11 @@ message Welcome {
   // by no map. A daemon keeps the newest map it was sent, whichever message brought it,
   // and ignores one that is not newer than the one it holds.
   kbf.map.v1.Map map = 4;
+  // True when this frontend takes `kbf.worker.v1.PackIndex/CommitPack`: it has the pack index
+  // and the pack store, and checks a sample of the blobs of a pack before it records the pack.
+  // A daemon should send CommitPack only to a frontend that says so; false (also from a
+  // frontend that predates the field) leaves the daemon on the member path.
+  bool pack_commit = 5;
 }
 
 // The storage map changed. Sent on the session each time the frontend's map changes,

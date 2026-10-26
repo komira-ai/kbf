@@ -50,7 +50,9 @@
 //!
 //! **Packs** are off unless `--pack-store-endpoint` is given (`pack_flags` has the flags and
 //! what they need): client uploads are then kept in packs ([`kbf_front::Packs`]); without it
-//! no object store is built or contacted and the frontend serves exactly as it did.
+//! no object store is built or contacted and the frontend serves exactly as it did. With the
+//! pack index too, the frontend takes a daemon's `CommitPack` (it must read the pack to check it)
+//! and says so in `Welcome.pack_commit`.
 //!
 //! **Readiness** (`GET /readyz`, `grpc.health.v1`) fails when the storage node does not
 //! answer an action-cache lookup within `--readyz-store-timeout-ms`, when the state store (if
@@ -903,15 +905,19 @@ impl<'a> Prepared<'a> {
             peers.clone(),
         );
         let cold_store = cold_store(members.clone(), &peers, delivery.as_ref());
-        // Only with `--pack-index`: otherwise a daemon's Locate is UNIMPLEMENTED.
-        let locate = crate::pack_locate::service(pack_index.as_ref(), &peers);
+        // Only with `--pack-index`: otherwise a daemon's Locate is UNIMPLEMENTED; and its
+        // CommitPack too is UNIMPLEMENTED without the pack store, which checks the pack.
+        let commits = pack_flags::commits(packs.as_ref(), flags.packs.as_ref());
+        let committing = crate::pack_locate::commit_served(pack_index.as_ref(), commits.as_ref());
+        let locate = crate::pack_locate::service(pack_index.as_ref(), &peers, commits);
         let sessions = WorkerService::new(
             Arc::clone(&farm),
             peers,
             listeners.heartbeat_interval,
             listeners.hello_wait,
         )
-        .with_host_floor(listeners.vm_host_floor);
+        .with_host_floor(listeners.vm_host_floor)
+        .with_pack_commit(committing);
         // Daemons are sent the members' map: Welcome.map and a MapUpdate at each bump.
         let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
         let worker_service = WorkerServer::new(sessions)

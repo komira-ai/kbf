@@ -41,7 +41,8 @@ pub struct PackMetrics {
     /// Writes that failed because the store or the index could not take the packs. A blob that
     /// is not its digest is the client's, and is not counted.
     pub write_failures: Counter,
-    /// Digests asked of the index by FindMissingBlobs.
+    /// Digests asked of the index by FindMissingBlobs and by the checks of an action's inputs and
+    /// of an action result's blobs.
     pub asked: Counter,
     /// Of those, the digests the index had.
     pub found: Counter,
@@ -65,6 +66,12 @@ pub struct PackMetrics {
     /// Uploads ended DEADLINE_EXCEEDED because no byte of their body arrived for
     /// `--pack-upload-idle-timeout`.
     pub upload_idle_timeouts: Counter,
+    /// Packs a daemon stored that were recorded in the index by `CommitPack`.
+    pub commits: Counter,
+    /// Commits of a pack that were refused, and nothing was recorded: the pack is not in the
+    /// store, a sampled blob is not its digest, the name or the list is not one a daemon may
+    /// commit, or the pack was recorded before with other contents.
+    pub commit_rejects: Counter,
 }
 
 impl PackMetrics {
@@ -111,7 +118,7 @@ impl PackMetrics {
             ),
             (
                 "kbf_pack_find_missing_asked_total",
-                "Digests FindMissingBlobs asked of the pack index",
+                "Digests asked of the pack index by FindMissingBlobs and by action checks",
                 &self.asked,
             ),
             (
@@ -163,6 +170,17 @@ impl PackMetrics {
                 "kbf_pack_upload_idle_timeouts_total",
                 "Uploads ended because no byte of their body arrived within the idle timeout",
                 &self.upload_idle_timeouts,
+            ),
+            (
+                "kbf_pack_commits_total",
+                "Packs a daemon stored that CommitPack recorded in the pack index",
+                &self.commits,
+            ),
+            (
+                "kbf_pack_commit_rejects_total",
+                "Commits of a pack refused, nothing recorded: the pack was not in the store, a \
+                 sampled blob was not its digest, or the commit was not one a daemon may make",
+                &self.commit_rejects,
             ),
         ];
         for (name, help, counter) in counters {

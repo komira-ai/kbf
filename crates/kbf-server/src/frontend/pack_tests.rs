@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use kbf_objstore::s3::fake::FakeS3;
@@ -205,6 +206,64 @@ async fn a_frontend_without_the_pack_flags_keeps_nothing_in_packs() {
     let text = scrape(api).await;
     assert!(!text.contains("kbf_pack_"), "{text}");
     served.abort();
+}
+
+/// Whether the `Welcome` that the worker listener at `worker` sends a daemon says that the
+/// frontend takes `CommitPack`.
+async fn welcome_says_commit(worker: SocketAddr) -> bool {
+    let entry = |key: &str, value: &str| Capability {
+        key: key.to_owned(),
+        value: value.to_owned(),
+    };
+    let hello = Hello {
+        protocol_version: 1,
+        node_id: "node-a".to_owned(),
+        capabilities: vec![
+            entry("os", "linux"),
+            entry("arch", "x86_64"),
+            entry("cpus", "1"),
+            entry("mem_gib", "1"),
+            entry("drivers", "fake"),
+        ],
+        ..Hello::default()
+    };
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    let first = DaemonMessage {
+        message: Some(daemon_message::Message::Hello(hello)),
+    };
+    tx.unbounded_send(first).expect("the stream is open");
+    let endpoint = Endpoint::from_shared(format!("http://{worker}")).expect("endpoint");
+    let channel = endpoint.connect().await.expect("connects");
+    let session = WorkerClient::new(channel).session(rx).await;
+    let mut inbound = session.expect("a session").into_inner();
+    let wait = Duration::from_secs(30);
+    let message = tokio::time::timeout(wait, inbound.message()).await;
+    let message = message.expect("a message in time").expect("a message");
+    match message.expect("the stream stays open").message {
+        Some(server_message::Message::Welcome(welcome)) => welcome.pack_commit,
+        other => panic!("expected Welcome, got {other:?}"),
+    }
+}
+
+/// Asserts that a frontend tells its daemons in `Welcome` that it takes `CommitPack` when it has
+/// the pack index and the pack store, and does not when it has the index alone: it could not read
+/// a pack to check it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn welcome_says_a_frontend_takes_commits_only_with_the_pack_store() {
+    let s3 = FakeS3::start().await;
+    let dir = scratch_dir("pack-welcome");
+    let with = flags_of(&pack_flags(s3.endpoint(), dir.path()));
+    let with = started(&with, Some(index())).expect("starts");
+    let without = started(&flags_of(&[]), Some(index())).expect("starts");
+    let (with_addr, without_addr) = (with.worker, without.worker);
+    let served = [tokio::spawn(with.serve()), tokio::spawn(without.serve())];
+
+    assert!(welcome_says_commit(with_addr).await);
+    assert!(!welcome_says_commit(without_addr).await);
+
+    for task in served {
+        task.abort();
+    }
 }
 
 /// A daemon's session on a worker listener: the stream it sends on and the one it listens on.

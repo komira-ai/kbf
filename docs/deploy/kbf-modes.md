@@ -63,10 +63,29 @@ nodes. A read, the client's and Execute's own, looks in the index first and fetc
 blob's bytes from its pack with a ranged request, hashes them, and serves them (a pack that
 holds other bytes than the digest names is never served); a blob the index lacks is read
 from the storage nodes as before. A blob over 64 MiB and a compressed blob are not packed.
+The closure check of the action cache counts a blob as held when the index has it: the check
+of a result a daemon reports, and of every hit (Execute's and a client's `GetActionResult`),
+works out what the result names (its output files, standard streams and the files of its
+output trees) and asks the index first and the storage nodes for the rest, so an output that
+is only in a pack satisfies it; the entry handed to the nodes names only the blobs they hold.
+A result with an output that neither holds is refused on a write and is a miss on a hit. On a
+routed farm a client's `GetActionResult` asks each blob's primary node only (as
+`FindMissingBlobs` does), where Execute's check also tries the blob's other owners, so right
+after a map change a client may see a miss for a result that Execute still hits, and runs the
+action again. With no pack flags the nodes check the entry alone, as before.
 `--pack-bytes` (default 32 MiB) is the length at which a pack is closed, `--pack-writer`
 (default `frontend`) names the frontend in its pack keys, `--pack-store-region` (default
 `us-east-1`) is the signing region, and `--pack-cache-dir` with `--pack-cache-bytes` keeps
-the blobs read from packs on a local disk. At start the frontend checks that the store
+the blobs read from packs on a local disk. A daemon that writes packs itself commits them
+to the frontend (`kbf.worker.v1.PackIndex/CommitPack`, the daemon role only, and only a
+frontend with the pack index and these flags takes it; `Welcome.pack_commit` tells the
+daemon whether this one does): the frontend reads the pack's last byte (and refuses a pack
+that is longer than the commit says), refuses a commit whose blobs add up to more bytes than
+the pack, and re-hashes `--pack-commit-sample` blobs of it, reading each in ranges of at
+most 8 MiB (default 2; at most 16384, which checks every blob; 0
+checks none and trusts the daemon, whose bad blob is then caught only when it is first read)
+before it records the pack, refuses a writer that is not the calling node, and counts the
+refusals (`kbf_pack_commit_rejects_total`). At start the frontend checks that the store
 refuses to replace an object, and does not serve if it does not. `GET /metrics` gains the
 `kbf_pack_*` families. Left out, no object store is built or contacted and the frontend
 serves exactly as before. A daemon reads a blob that is only in a pack with `--pack-read`

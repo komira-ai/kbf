@@ -46,7 +46,9 @@
 //! - an `Offer` from a daemon is not read: offers go the other way.
 //!
 //! A server given a [`MapSource`] ([`WorkerService::with_map`]) names its map in
-//! `Welcome`, and sends a `MapUpdate` each time the source's map changes.
+//! `Welcome`, and sends a `MapUpdate` each time the source's map changes. A server that serves
+//! `PackIndex/CommitPack` ([`WorkerService::with_pack_commit`]) says so in
+//! `Welcome.pack_commit`; a daemon that writes packs commits them only to one that does.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -98,6 +100,8 @@ pub struct WorkerService {
     map: MapFeed,
     /// The oldest and the newest `Hello` version a session accepts.
     protocols: (u32, u32),
+    /// Whether `Welcome` says this frontend takes `PackIndex/CommitPack` (`Welcome.pack_commit`).
+    pack_commit: bool,
 }
 
 impl WorkerService {
@@ -118,6 +122,7 @@ impl WorkerService {
             host_floor: HostFloor::DEFAULT,
             map: MapFeed::NONE,
             protocols: (OLDEST_PROTOCOL_VERSION, PROTOCOL_VERSION),
+            pack_commit: false,
         }
     }
 
@@ -136,6 +141,15 @@ impl WorkerService {
     #[must_use]
     pub const fn with_host_floor(mut self, floor: HostFloor) -> Self {
         self.host_floor = floor;
+        self
+    }
+
+    /// The service telling each daemon, in `Welcome.pack_commit`, whether this frontend takes
+    /// `kbf.worker.v1.PackIndex/CommitPack` (`on`): a daemon that writes packs commits them only
+    /// to a frontend that says so. Off for a service built without it.
+    #[must_use]
+    pub const fn with_pack_commit(mut self, on: bool) -> Self {
+        self.pack_commit = on;
         self
     }
 
@@ -190,6 +204,7 @@ impl Worker for WorkerService {
                 .unwrap_or(u64::MAX),
             epoch: self.farm.lease_epoch(),
             map: self.map.welcome_map(),
+            pack_commit: self.pack_commit,
         }));
         let (outbound, responses) = mpsc::unbounded_channel();
         let capacity = reported.capacity;
