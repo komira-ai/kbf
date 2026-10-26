@@ -59,6 +59,18 @@ pub fn watch(
     every: Duration,
     apply: Apply,
 ) -> JoinHandle<()> {
+    watch_between(part, apps, probe, move || std::thread::sleep(every), apply)
+}
+
+/// [`watch`] with the wait between two surveys made by `between`, which a test replaces
+/// with a wait for its own signal.
+fn watch_between(
+    part: DriverPart,
+    apps: PathBuf,
+    probe: Probe,
+    mut between: impl FnMut() + Send + 'static,
+    apply: Apply,
+) -> JoinHandle<()> {
     let mut last = xcode::not_surveyed(&apps);
     tracing::info!(
         apps = %apps.display(),
@@ -77,7 +89,7 @@ pub fn watch(
                 part.send(apply(&now));
                 last = now;
             }
-            std::thread::sleep(every);
+            between();
             if part.is_closed() {
                 return;
             }
@@ -158,7 +170,6 @@ mod tests {
     use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
 
     use kbf_daemon::DriverWatch;
     use kbf_proto::worker::XcodeState;
@@ -167,18 +178,38 @@ mod tests {
     use super::*;
     use crate::xcode::tests::{NOT_AGREED, act_fake, link_xcodebuild, scratch, set_rules};
 
+    /// How a test drives the watch: it surveys when told to, and says when it has
+    /// applied what it found and is waiting to be told again.
+    struct Ticker {
+        tick: std::sync::mpsc::Sender<()>,
+        idle: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Ticker {
+        /// Waits until the watch has surveyed and applied what it found, and is waiting
+        /// for the next tick.
+        fn settled(&self) {
+            self.idle.recv().expect("the watch runs");
+        }
+
+        /// Lets the watch survey once more, and waits until it has applied that survey.
+        fn survey_again(&self) {
+            self.tick.send(()).expect("the watch runs");
+            self.settled();
+        }
+    }
+
     /// [`super::watch`] as the node starts it, its part the only one of its driver
-    /// watch: returns what the daemon takes, and the thread. The tests below read the
-    /// daemon's channel as one that starts with the not-surveyed report already seen,
-    /// so the thread's first application waits until that report is marked seen (the
-    /// thread could otherwise send its first survey before, and the mark would hide
-    /// it).
+    /// watch, with the wait between two surveys the test's [`Ticker`]: returns what the
+    /// daemon takes, and the thread. The tests below read the daemon's channel as one
+    /// that starts with the not-surveyed report already seen, so the thread's first
+    /// application waits until that report is marked seen (the thread could otherwise
+    /// send its first survey before, and the mark would hide it).
     fn watch(
         apps: PathBuf,
         probe: Probe,
-        every: Duration,
         apply: Apply,
-    ) -> (watch::Receiver<DriverReport>, JoinHandle<()>) {
+    ) -> (watch::Receiver<DriverReport>, JoinHandle<()>, Ticker) {
         let (driver, mut reports) = DriverWatch::new();
         let part = driver.part(SOURCE).expect("the xcode part");
         let (seen, wait) = std::sync::mpsc::channel::<()>();
@@ -190,19 +221,26 @@ mod tests {
             }
             apply(xcodes)
         });
-        let thread = super::watch(part, apps, probe, every, gated);
+        let (tick, ticked) = std::sync::mpsc::channel::<()>();
+        let (idle_now, idle) = std::sync::mpsc::channel::<()>();
+        // Once the test drops its ticker, the wait ends and the thread looks at whether
+        // the daemon is still there.
+        let between = move || {
+            let _ = idle_now.send(());
+            let _ = ticked.recv();
+        };
+        let thread = super::watch_between(part, apps, probe, between, gated);
         reports.borrow_and_update();
         let _ = seen.send(());
-        (reports, thread)
+        (reports, thread, Ticker { tick, idle })
     }
 
-    /// The next report the watch sends, waited for up to 20 s.
-    fn next(reports: &mut watch::Receiver<DriverReport>) -> DriverReport {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !reports.has_changed().expect("the watch runs") {
-            assert!(Instant::now() < deadline, "no new report");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+    /// The report the watch has sent since the last one read.
+    fn changed(reports: &mut watch::Receiver<DriverReport>) -> DriverReport {
+        assert!(
+            reports.has_changed().expect("the watch runs"),
+            "no new report"
+        );
         reports.borrow_and_update().clone()
     }
 
@@ -327,23 +365,27 @@ mod tests {
                 xcodes: xcodes.iter().map(Xcode::status).collect(),
             }
         });
-        let every = Duration::from_millis(50);
-        let (mut reports, thread) = watch(apps, probe, every, apply);
+        let (mut reports, thread, ticker) = watch(apps, probe, apply);
         let state = |report: &DriverReport| report.xcodes[0].state();
-        let first = next(&mut reports);
+        ticker.settled();
+        let first = changed(&mut reports);
         assert_eq!(state(&first), XcodeState::LicenseNotAccepted);
         assert_eq!(first.entries, []);
 
         set_rules(&xcodebuild, &accepted);
-        let fixed = next(&mut reports);
+        ticker.survey_again();
+        let fixed = changed(&mut reports);
         assert_eq!(state(&fixed), XcodeState::Ready);
         assert_eq!(fixed.entries, [("xcode".to_owned(), "16C5032a".to_owned())]);
         // Unchanged surveys send nothing.
-        std::thread::sleep(every * 6);
+        for _ in 0..6 {
+            ticker.survey_again();
+        }
         assert!(!reports.has_changed().expect("the watch runs"));
 
         set_rules(&xcodebuild, &not_accepted);
-        let broken = next(&mut reports);
+        ticker.survey_again();
+        let broken = changed(&mut reports);
         assert_eq!(state(&broken), XcodeState::LicenseNotAccepted);
         assert_eq!(broken.entries, []);
         let states: Vec<Vec<State>> = applied
@@ -363,6 +405,7 @@ mod tests {
         );
 
         drop(reports);
+        drop(ticker);
         thread
             .join()
             .expect("the thread ends once the daemon is gone");
@@ -410,18 +453,21 @@ mod tests {
                 xcodes: xcodes.iter().map(Xcode::status).collect(),
             }
         });
-        let every = Duration::from_millis(50);
-        let (mut reports, thread) = watch(apps, probe, every, apply);
+        let (mut reports, thread, ticker) = watch(apps, probe, apply);
+        ticker.settled();
         assert_eq!(
-            next(&mut reports).xcodes[0].state(),
+            changed(&mut reports).xcodes[0].state(),
             XcodeState::LicenseNotAccepted
         );
-        std::thread::sleep(every * 10);
+        for _ in 0..10 {
+            ticker.survey_again();
+        }
         assert!(!reports.has_changed().expect("the watch runs"));
         // The Xcodes not surveyed yet, then the first survey.
         assert_eq!(*applied.lock().expect("applied"), 2);
 
         drop(reports);
+        drop(ticker);
         thread
             .join()
             .expect("the thread ends once the daemon is gone");
@@ -467,20 +513,17 @@ mod tests {
                 xcodes: xcodes.iter().map(Xcode::status).collect(),
             }
         });
-        let every = Duration::from_millis(50);
-        let (mut reports, thread) = watch(apps, probe, every, apply);
-        next(&mut reports);
+        let (mut reports, thread, ticker) = watch(apps, probe, apply);
+        ticker.settled();
+        changed(&mut reports);
         let retarget = dir.join("Applications/Xcode_16.app.new");
         std::os::unix::fs::symlink(&two, &retarget).expect("new link");
         std::fs::rename(&retarget, &link).expect("retarget");
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !reports.has_changed().expect("the watch runs") {
-            assert!(
-                Instant::now() < deadline,
-                "the moved DEVELOPER_DIR was not applied"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        ticker.survey_again();
+        assert!(
+            reports.has_changed().expect("the watch runs"),
+            "the moved DEVELOPER_DIR was not applied"
+        );
         let ready = |app: &PathBuf| {
             BTreeMap::from([("16C5032a".to_owned(), app.join("Contents/Developer"))])
         };
@@ -490,6 +533,7 @@ mod tests {
         );
 
         drop(reports);
+        drop(ticker);
         thread
             .join()
             .expect("the thread ends once the daemon is gone");
@@ -533,11 +577,9 @@ mod tests {
                 xcodes: xcodes.iter().map(Xcode::status).collect(),
             }
         });
-        let started = Instant::now();
-        // An hour: only the first survey can change the report in this test.
-        let (mut reports, thread) = watch(apps.clone(), probe, Duration::from_secs(3600), apply);
-        let returned = started.elapsed();
-        assert!(returned < Duration::from_secs(1), "watch took {returned:?}");
+        // The watch returns while the first survey is held up by the fake `xcodebuild`
+        // (it answers only once `go` exists), so the report it holds is the not-surveyed one.
+        let (mut reports, thread, ticker) = watch(apps.clone(), probe, apply);
         let pending = reports.borrow_and_update().clone();
         assert_eq!(pending.entries, []);
         assert_eq!(pending.xcodes.len(), 1, "{pending:?}");
@@ -546,14 +588,14 @@ mod tests {
         assert_eq!(status.state(), XcodeState::NotSurveyed);
         assert!(status.reason.contains("not surveyed yet"), "{status:?}");
         assert_eq!(status.fix, "");
-        std::thread::sleep(Duration::from_millis(300));
         assert!(
             !reports.has_changed().expect("the watch runs"),
             "surveyed early"
         );
 
         std::fs::write(&go, "").expect("go");
-        let surveyed = next(&mut reports);
+        ticker.settled();
+        let surveyed = changed(&mut reports);
         assert_eq!(surveyed.xcodes[0].state(), XcodeState::Ready);
         assert_eq!(
             surveyed.entries,
@@ -567,6 +609,7 @@ mod tests {
             .collect();
         assert_eq!(states, [[State::NotSurveyed], [State::Ready]]);
         drop(reports);
+        drop(ticker);
         drop(thread);
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
