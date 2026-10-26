@@ -692,10 +692,11 @@ fn verify_clone(x: &TreePlan, staging: &Path) -> Result<(), String> {
     }
     let mut dir_modes = vec![(staging.to_owned(), 0o755)];
     // The clone carries the attributes of the app; all but the quarantine mark stay.
-    xattr::strip_quarantine(staging)?;
+    std::iter::once(staging.to_owned())
+        .chain(x.nodes.iter().map(|n| staging.join(n.rel())))
+        .try_for_each(|at| xattr::strip_quarantine(&at))?;
     for node in &x.nodes {
         let at = staging.join(node.rel());
-        xattr::strip_quarantine(&at)?;
         match node {
             Node::Dir { mode, .. } => dir_modes.push((at, *mode)),
             Node::File { mode, .. } => chmod(&at, *mode)?,
@@ -716,25 +717,30 @@ fn build_tree(x: &TreePlan, staging: &Path, env: &Env<'_>) -> Result<&'static st
     // A failed clone may leave part of the tree: start from nothing.
     remove_leftover(staging);
     mkdir(staging, 0o700)?;
-    xattr::copy_nofollow(&x.source, staging)?;
     let mut dir_modes = vec![(staging.to_owned(), 0o755)];
     for node in &x.nodes {
         let dst = staging.join(node.rel());
         match node {
             Node::Dir { mode, .. } => {
                 mkdir(&dst, 0o700)?;
-                xattr::copy_nofollow(&x.source.join(node.rel()), &dst)?;
                 dir_modes.push((dst, *mode));
             }
             Node::File {
                 src, mode, bytes, ..
             } => copy_file(src, &dst, *mode, *bytes)?,
-            Node::Link { target, .. } => {
-                link(target, &dst)?;
-                xattr::copy_nofollow(&x.source.join(node.rel()), &dst)?;
-            }
+            Node::Link { target, .. } => link(target, &dst)?,
         }
     }
+    // The attributes of the app, of each directory and of each link (a file's were copied
+    // with its bytes), once everything exists.
+    std::iter::once((x.source.clone(), staging.to_owned()))
+        .chain(
+            x.nodes
+                .iter()
+                .filter(|n| !matches!(n, Node::File { .. }))
+                .map(|n| (x.source.join(n.rel()), staging.join(n.rel()))),
+        )
+        .try_for_each(|(from, to)| xattr::copy_nofollow(&from, &to))?;
     apply_modes(dir_modes)?;
     Ok("copy")
 }
