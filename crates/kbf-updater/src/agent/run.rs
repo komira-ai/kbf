@@ -80,6 +80,9 @@ pub struct Agent {
     status: Shared,
     /// The target that failed last, and when.
     failed: Mutex<Option<(Version, Duration)>>,
+    /// Why the host was last reported unhealthy, so a reason is logged once and not on every
+    /// heartbeat.
+    unhealthy: Mutex<Option<String>>,
 }
 
 impl Agent {
@@ -91,6 +94,7 @@ impl Agent {
             world,
             status: Shared::new(status),
             failed: Mutex::new(None),
+            unhealthy: Mutex::new(None),
         }
     }
 
@@ -101,6 +105,20 @@ impl Agent {
 
     fn log(&self, line: &str) {
         (self.world.log)(line);
+    }
+
+    /// Log why the host is not healthy when the reason is not the one logged last, and log once
+    /// when it is healthy again (`None`).
+    fn log_health(&self, reason: Option<String>) {
+        let mut last = self.unhealthy.lock().unwrap_or_else(|e| e.into_inner());
+        if *last == reason {
+            return;
+        }
+        match &reason {
+            Some(reason) => self.log(&format!("the host is not healthy: {reason}")),
+            None => self.log("the host is healthy again"),
+        }
+        *last = reason;
     }
 
     /// Run until `stop`: finish an update the helper is in the middle of, heartbeat, and update
@@ -131,7 +149,7 @@ impl Agent {
         match self.world.local.query() {
             Ok(state) => self.note(&state),
             Err(e) => {
-                self.log(&format!("the host helper does not answer: {e}"));
+                self.log_health(Some(format!("the host helper does not answer: {e}")));
                 self.status.update(|s| s.health = wire::Health::Unhealthy);
             }
         }
@@ -143,13 +161,22 @@ impl Agent {
             .clone()
             .or_else(|| state.commit.as_deref().and_then(version_of_commit));
         let Some(running) = running else {
+            self.log_health(Some(
+                "the host helper reports neither a version nor a known commit".to_owned(),
+            ));
             self.status.update(|s| s.health = wire::Health::Unhealthy);
             return;
         };
-        let healthy = matches!(
-            self.world.health.check(&self.host, &running),
-            Ok(Health::Healthy)
-        );
+        let reason = match self.world.health.check(&self.host, &running) {
+            Ok(Health::Healthy) => None,
+            Ok(Health::Waiting(why)) => Some(format!("not yet healthy on {running}: {why}")),
+            Ok(Health::Abandoned(why)) => {
+                Some(format!("will not become healthy on {running}: {why}"))
+            }
+            Err(e) => Some(format!("the health check of {running} failed: {e}")),
+        };
+        let healthy = reason.is_none();
+        self.log_health(reason);
         self.status.update(|s| {
             s.version = running;
             s.health = if healthy {
