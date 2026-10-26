@@ -244,7 +244,7 @@ async fn a_malformed_heartbeat_is_a_bad_request() {
 /// Catches: a client that sends a head and then no body holding the request open for ever,
 /// on either surface: after the patience the request is a bad request, nothing is noted and
 /// no state is set (the control call does not need a token to be held up either).
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_body_that_never_arrives_is_a_bad_request() {
     let rig = Rig::new("http-stalled");
     let who = updater("d1", "daemon");
