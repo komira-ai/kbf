@@ -275,8 +275,31 @@ fn name_verify(routes: Vec<Route>) -> Vec<Route> {
         .collect()
 }
 
+/// The one `POST` of `/v1/enroll/nodes/{target}` is the adoption `{id}:adopt`, split the same
+/// way (the router takes one parameter to a segment and no text after it).
+const ADOPT_ROUTE: &str = "/v1/enroll/nodes/{}";
+
+/// Renames the `POST` of `ADOPT_ROUTE` to `POST ADOPT_ROUTE:adopt`.
+fn name_adopt(routes: Vec<Route>) -> Vec<Route> {
+    let post = ("POST".to_string(), ADOPT_ROUTE.to_string());
+    assert!(
+        routes.contains(&post),
+        "the router has no `POST {ADOPT_ROUTE}` any more: update this guard"
+    );
+    routes
+        .into_iter()
+        .map(|r| {
+            if r == post {
+                ("POST".to_string(), format!("{ADOPT_ROUTE}:adopt"))
+            } else {
+                r
+            }
+        })
+        .collect()
+}
+
 /// The exact number of `(method, path)` routes, verbs expanded. A new route moves it.
-const ROUTES: usize = 54;
+const ROUTES: usize = 55;
 
 fn server_routes() -> Vec<Route> {
     let mut files = Vec::new();
@@ -294,7 +317,7 @@ fn server_routes() -> Vec<Route> {
         ["cordon", "drain", "uncordon"],
         "write_request accepts other verbs: the guard and the documents need a row each"
     );
-    let mut routes = name_verify(expand_verbs(routes, &verbs));
+    let mut routes = name_adopt(name_verify(expand_verbs(routes, &verbs)));
     routes.sort();
     routes.dedup();
     routes
