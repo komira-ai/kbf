@@ -306,6 +306,9 @@ pub struct SetupArgs {
     pub xcode: Option<PathBuf>,
     /// Simulator runtime disk images to stage at the fixed guest path.
     pub sim_runtimes: Vec<PathBuf>,
+    /// An app bundle (`<name>.app`, built for the simulator) to stage for the simulator
+    /// probe to install and launch.
+    pub sim_app: Option<PathBuf>,
     /// Copy Xcode symbolic links that leave the app, as links.
     pub allow_external_links: bool,
 }
@@ -326,9 +329,10 @@ pub fn setup(sys: &dyn System, base: &Path, args: &SetupArgs) -> Report {
     if let Err(e) = crate::bundle::check(base) {
         return Report::error(probe, e.to_string());
     }
-    let staging = match crate::stage::plan(
+    let staging = match crate::stage::plan_with_app(
         args.xcode.as_deref(),
         &args.sim_runtimes,
+        args.sim_app.as_deref(),
         args.allow_external_links,
     ) {
         Ok(p) => p,
@@ -338,17 +342,24 @@ pub fn setup(sys: &dyn System, base: &Path, args: &SetupArgs) -> Report {
         return Report::needs_manual(probe, guest::NEEDS_GUEST_BINARY, json!({"bundle": base}));
     }
     let disk = base.join(crate::bundle::DISK);
-    let written = match args.guest_binary.as_deref() {
-        None => None,
-        Some(binary) => {
-            let payload = match guest::offline_payload_from(binary) {
-                Ok(p) => p,
-                Err(e) => return Report::error(probe, e),
-            };
-            match sys.offline_write(&disk, &payload) {
-                Ok(observed) => Some(observed),
-                Err(e) => return Report::error(probe, format!("offline setup: {e}")),
-            }
+    // The simulator probe's daemon goes in with whatever else is written, and only when
+    // something is staged for it to use.
+    let mut files = Vec::new();
+    if let Some(binary) = args.guest_binary.as_deref() {
+        match guest::offline_payload_from(binary) {
+            Ok(p) => files.extend(p),
+            Err(e) => return Report::error(probe, e),
+        }
+    }
+    if !staging.is_empty() {
+        files.extend(guest::sim_payload());
+    }
+    let written = if files.is_empty() {
+        None
+    } else {
+        match sys.offline_write(&disk, &files) {
+            Ok(observed) => Some(observed),
+            Err(e) => return Report::error(probe, format!("offline setup: {e}")),
         }
     };
     let staged = if staging.is_empty() {

@@ -18,6 +18,8 @@
 //!   `--allow-external-links`, and then it is listed in the report. Hard links become
 //!   separate files. A fifo, socket or device is refused. Owners become root:wheel; the
 //!   setuid, setgid and sticky bits are dropped.
+//! - An app bundle (`--sim-app`) is copied by the same rules as Xcode.app into
+//!   `/private/var/kbf-sim/apps/<name>.app`, which then holds exactly that app.
 //! - A runtime is one regular file named `<name>.dmg`, copied byte for byte while its
 //!   SHA-256 is computed.
 
@@ -38,20 +40,24 @@ pub const MAX_ENTRIES: usize = 2_000_000;
 pub const MAX_DEPTH: usize = 64;
 /// The longest runtime file name: the guest derives the names of its result frames from it,
 /// and a frame name is limited to 100 bytes.
-pub const MAX_RUNTIME_NAME_BYTES: usize = 64;
+pub const MAX_RUNTIME_NAME_BYTES: usize = kbf_guest::sim::MAX_STAGED_NAME_BYTES;
 /// The most runtimes one setup stages.
 pub const MAX_RUNTIMES: usize = 8;
 /// Free space that must remain on the volume after the copy: the guest writes to its
 /// Data volume while it boots, and Xcode's first launch expands what it installs.
 pub const HEADROOM_BYTES: u64 = 4 << 30;
-/// The name Xcode.app is built under inside `Applications` before it is renamed.
-const STAGING_NAME: &str = ".Xcode.app.kbf-staging";
 
 /// Why a plan could not be made or a stage could not be done.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum StageError {
     #[error("{0} is not an Xcode.app directory (it needs Contents/Developer/usr/bin/xcodebuild)")]
     NotXcode(PathBuf),
+    #[error("{0} is not an app bundle (a directory named <name>.app with an Info.plist)")]
+    NotApp(PathBuf),
+    #[error(
+        "{0}: an app must be named <name>.app, at most {MAX_RUNTIME_NAME_BYTES} bytes, with name made of letters, digits, '.', '_' or '-' (no '..')"
+    )]
+    BadAppName(PathBuf),
     #[error("{0} is a symbolic link; name the real path")]
     Symlink(PathBuf),
     #[error(
@@ -106,9 +112,9 @@ impl Node {
     }
 }
 
-/// Xcode.app as it will be copied.
+/// A directory tree (Xcode.app, or an app bundle) as it will be copied.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct XcodePlan {
+pub struct TreePlan {
     pub source: PathBuf,
     pub nodes: Vec<Node>,
     /// The sum of the file sizes.
@@ -126,23 +132,33 @@ pub struct RuntimePlan {
     pub bytes: u64,
 }
 
+/// An app bundle for the simulator to install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppPlan {
+    /// The bundle's directory name (`<name>.app`), also its name in the guest.
+    pub name: String,
+    pub tree: TreePlan,
+}
+
 /// Everything one `image setup` stages.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Plan {
-    pub xcode: Option<XcodePlan>,
+    pub xcode: Option<TreePlan>,
     pub runtimes: Vec<RuntimePlan>,
+    pub app: Option<AppPlan>,
 }
 
 impl Plan {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.xcode.is_none() && self.runtimes.is_empty()
+        self.xcode.is_none() && self.runtimes.is_empty() && self.app.is_none()
     }
 
     /// The bytes the copy writes.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.xcode.as_ref().map_or(0, |x| x.bytes)
+            + self.app.as_ref().map_or(0, |a| a.tree.bytes)
             + self.runtimes.iter().map(|r| r.bytes).sum::<u64>()
     }
 }
@@ -152,11 +168,12 @@ fn io_err(what: &str, path: &Path, e: &io::Error) -> StageError {
 }
 
 /// Whether the link target `target`, found at `depth` directories below the app's root,
-/// stays inside the app. Only leading `..` components count, and no more than `depth` of
+/// stays inside the tree (whose own path in the guest is `guest_root`, which an absolute
+/// target may name). Only leading `..` components count, and no more than `depth` of
 /// them: a `..` after a name could climb out through a link that name goes through.
-pub(crate) fn stays_inside(target: &Path, depth: usize) -> bool {
+pub(crate) fn stays_inside(target: &Path, depth: usize, guest_root: &str) -> bool {
     if target.has_root() {
-        return target.starts_with(simpaths::XCODE_APP)
+        return target.starts_with(guest_root)
             && !target.components().any(|c| c == Component::ParentDir);
     }
     let mut up = 0usize;
@@ -175,6 +192,8 @@ pub(crate) fn stays_inside(target: &Path, depth: usize) -> bool {
 
 struct Walk {
     root: PathBuf,
+    /// Where the tree will be in the guest.
+    guest_root: String,
     allow_external: bool,
     nodes: Vec<Node>,
     bytes: u64,
@@ -204,7 +223,7 @@ impl Walk {
             if ft.is_symlink() {
                 let target =
                     std::fs::read_link(&path).map_err(|e| io_err("readlink", &path, &e))?;
-                if !stays_inside(&target, depth) {
+                if !stays_inside(&target, depth, &self.guest_root) {
                     if !self.allow_external {
                         return Err(StageError::EscapingLink { path, target });
                     }
@@ -252,12 +271,36 @@ fn kind_of(ft: &std::fs::FileType) -> &'static str {
     }
 }
 
+/// Walks the tree at `app` (a real directory) into a plan; its path in the guest is
+/// `guest_root`.
+fn plan_tree(
+    app: &Path,
+    guest_root: &str,
+    allow_external_links: bool,
+) -> Result<TreePlan, StageError> {
+    let mut walk = Walk {
+        root: app.to_owned(),
+        guest_root: guest_root.to_owned(),
+        allow_external: allow_external_links,
+        nodes: Vec::new(),
+        bytes: 0,
+        external: Vec::new(),
+    };
+    walk.dir(Path::new(""), 0)?;
+    Ok(TreePlan {
+        source: app.to_owned(),
+        nodes: walk.nodes,
+        bytes: walk.bytes,
+        external_links: walk.external,
+    })
+}
+
 /// Reads Xcode.app at `app` into a plan.
 ///
 /// # Errors
 /// `app` is a link or not an Xcode.app, or something in it is refused (see the module
 /// documentation), or it is too large to walk.
-pub fn plan_xcode(app: &Path, allow_external_links: bool) -> Result<XcodePlan, StageError> {
+pub fn plan_xcode(app: &Path, allow_external_links: bool) -> Result<TreePlan, StageError> {
     let meta = std::fs::symlink_metadata(app).map_err(|e| io_err("stat", app, &e))?;
     if meta.file_type().is_symlink() {
         return Err(StageError::Symlink(app.to_owned()));
@@ -267,35 +310,39 @@ pub fn plan_xcode(app: &Path, allow_external_links: bool) -> Result<XcodePlan, S
     if !meta.is_dir() || !is_tool {
         return Err(StageError::NotXcode(app.to_owned()));
     }
-    let mut walk = Walk {
-        root: app.to_owned(),
-        allow_external: allow_external_links,
-        nodes: Vec::new(),
-        bytes: 0,
-        external: Vec::new(),
-    };
-    walk.dir(Path::new(""), 0)?;
-    Ok(XcodePlan {
-        source: app.to_owned(),
-        nodes: walk.nodes,
-        bytes: walk.bytes,
-        external_links: walk.external,
-    })
+    plan_tree(app, simpaths::XCODE_APP, allow_external_links)
+}
+
+/// Reads the app bundle at `app` (a simulator build: a directory `<name>.app` with an
+/// `Info.plist`) into a plan.
+///
+/// # Errors
+/// `app` is a link, not an app bundle, has a name the guest path cannot carry, or
+/// something in it is refused.
+pub fn plan_app(app: &Path, allow_external_links: bool) -> Result<AppPlan, StageError> {
+    let meta = std::fs::symlink_metadata(app).map_err(|e| io_err("stat", app, &e))?;
+    if meta.file_type().is_symlink() {
+        return Err(StageError::Symlink(app.to_owned()));
+    }
+    let name = app
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| kbf_guest::sim::name_ok(n, ".app"))
+        .ok_or_else(|| StageError::BadAppName(app.to_owned()))?
+        .to_owned();
+    let plist = std::fs::symlink_metadata(app.join("Info.plist")).is_ok_and(|m| m.is_file());
+    if !meta.is_dir() || !plist {
+        return Err(StageError::NotApp(app.to_owned()));
+    }
+    let tree = plan_tree(app, &kbf_guest::sim::app_path(&name), allow_external_links)?;
+    Ok(AppPlan { name, tree })
 }
 
 /// A runtime's file name when it is `<name>.dmg` with a name of letters, digits, `.`, `_`
 /// and `-` only (the name becomes a path in the guest).
 fn runtime_name(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
-    let stem = name.strip_suffix(".dmg")?;
-    let ok = !stem.is_empty()
-        && !stem.starts_with('.')
-        && !name.contains("..")
-        && name.len() <= MAX_RUNTIME_NAME_BYTES
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
-    ok.then(|| name.to_owned())
+    kbf_guest::sim::name_ok(name, ".dmg").then(|| name.to_owned())
 }
 
 /// Reads the runtime disk images at `paths` into plans.
@@ -339,11 +386,25 @@ pub fn plan(
     runtimes: &[PathBuf],
     allow_external_links: bool,
 ) -> Result<Plan, StageError> {
+    plan_with_app(xcode, runtimes, None, allow_external_links)
+}
+
+/// [`plan`] with an app bundle for the simulator to install.
+///
+/// # Errors
+/// As [`plan`] and [`plan_app`].
+pub fn plan_with_app(
+    xcode: Option<&Path>,
+    runtimes: &[PathBuf],
+    app: Option<&Path>,
+    allow_external_links: bool,
+) -> Result<Plan, StageError> {
     Ok(Plan {
         xcode: xcode
             .map(|a| plan_xcode(a, allow_external_links))
             .transpose()?,
         runtimes: plan_runtimes(runtimes)?,
+        app: app.map(|a| plan_app(a, allow_external_links)).transpose()?,
     })
 }
 
@@ -402,9 +463,10 @@ fn check_space(volume: &Path, plan: &Plan, env: &Env<'_>) -> Result<(u64, u64), 
     let need = plan.bytes();
     if free < need.saturating_add(HEADROOM_BYTES) {
         return Err(format!(
-            "not enough room on the guest's Data volume: staging needs {} (Xcode {}, runtimes {}) plus {} headroom, and {} is free; rebuild the base with a larger --disk-gib",
+            "not enough room on the guest's Data volume: staging needs {} (Xcode and app {}, runtimes {}) plus {} headroom, and {} is free; rebuild the base with a larger --disk-gib",
             gib(need),
-            gib(plan.xcode.as_ref().map_or(0, |x| x.bytes)),
+            gib(plan.xcode.as_ref().map_or(0, |x| x.bytes)
+                + plan.app.as_ref().map_or(0, |a| a.tree.bytes)),
             gib(plan.runtimes.iter().map(|r| r.bytes).sum()),
             gib(HEADROOM_BYTES),
             gib(free)
@@ -413,9 +475,9 @@ fn check_space(volume: &Path, plan: &Plan, env: &Env<'_>) -> Result<(u64, u64), 
     Ok((free, need))
 }
 
-/// Builds the plan's Xcode.app at `staging` (which does not exist): a tree clone when the
+/// Builds the plan's tree at `staging` (which does not exist): a tree clone when the
 /// host can, else file by file. Returns the method used.
-fn build_xcode(x: &XcodePlan, staging: &Path, env: &Env<'_>) -> Result<&'static str, String> {
+fn build_tree(x: &TreePlan, staging: &Path, env: &Env<'_>) -> Result<&'static str, String> {
     if (env.clone_tree)(&x.source, staging).is_ok() {
         return Ok("clone");
     }
@@ -458,15 +520,38 @@ fn build_xcode(x: &XcodePlan, staging: &Path, env: &Env<'_>) -> Result<&'static 
     Ok("copy")
 }
 
-fn stage_xcode(volume: &Path, x: &XcodePlan, env: &Env<'_>) -> Result<Value, String> {
-    let dest = on_volume(volume, simpaths::XCODE_APP);
-    let parent = dest.parent().ok_or("Xcode.app has no parent")?;
+/// Builds `tree` under a staging name beside `dest_abs` (its guest path) and renames it into
+/// place; the other entries of the directory are removed when `only` (the directory then
+/// holds exactly this tree).
+fn stage_tree(
+    volume: &Path,
+    tree: &TreePlan,
+    dest_abs: &str,
+    only: bool,
+    env: &Env<'_>,
+) -> Result<Value, String> {
+    let dest = on_volume(volume, dest_abs);
+    let parent = dest.parent().ok_or("the tree has no parent")?;
     ensure_dir(volume, parent, env)?;
-    let staging = parent.join(STAGING_NAME);
+    let name = dest
+        .file_name()
+        .ok_or("the tree has no name")?
+        .to_string_lossy();
+    let staging = parent.join(format!(".{}.kbf-staging", name.trim_start_matches('.')));
     remove_leftover(&staging);
-    let method = build_xcode(x, &staging, env)?;
+    if only {
+        let entries =
+            std::fs::read_dir(parent).map_err(|e| format!("read {}: {e}", parent.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("read {}: {e}", parent.display()))?;
+            if entry.file_name().to_string_lossy() != name {
+                remove_leftover(&entry.path());
+            }
+        }
+    }
+    let method = build_tree(tree, &staging, env)?;
     (env.chown_root)(&staging).map_err(|e| format!("chown {}: {e}", staging.display()))?;
-    for node in &x.nodes {
+    for node in &tree.nodes {
         let p = staging.join(node.rel());
         (env.chown_root)(&p).map_err(|e| format!("chown {}: {e}", p.display()))?;
     }
@@ -474,15 +559,15 @@ fn stage_xcode(volume: &Path, x: &XcodePlan, env: &Env<'_>) -> Result<Value, Str
     remove_leftover(&dest);
     std::fs::rename(&staging, &dest)
         .map_err(|e| format!("rename {} -> {}: {e}", staging.display(), dest.display()))?;
-    let count = |f: fn(&Node) -> bool| x.nodes.iter().filter(|n| f(n)).count();
+    let count = |f: fn(&Node) -> bool| tree.nodes.iter().filter(|n| f(n)).count();
     Ok(json!({
-        "dest": simpaths::XCODE_APP,
+        "dest": dest_abs,
         "method": method,
-        "bytes": x.bytes,
+        "bytes": tree.bytes,
         "files": count(|n| matches!(n, Node::File { .. })),
         "dirs": count(|n| matches!(n, Node::Dir { .. })),
         "symlinks": count(|n| matches!(n, Node::Link { .. })),
-        "external_links": x.external_links.iter()
+        "external_links": tree.external_links.iter()
             .map(|(p, t)| json!({"path": p, "target": t}))
             .collect::<Vec<_>>(),
     }))
@@ -542,15 +627,26 @@ pub fn execute(volume: &Path, plan: &Plan, env: &Env<'_>) -> Result<Value, Strin
     let xcode = plan
         .xcode
         .as_ref()
-        .map(|x| stage_xcode(volume, x, env))
+        .map(|x| stage_tree(volume, x, simpaths::XCODE_APP, false, env))
+        .transpose()?;
+    // The app directory then holds exactly this app: the guest installs what it finds.
+    let app = plan
+        .app
+        .as_ref()
+        .map(|a| {
+            let dest = kbf_guest::sim::app_path(&a.name);
+            stage_tree(volume, &a.tree, &dest, true, env).map(|mut v| {
+                v["name"] = json!(a.name);
+                v
+            })
+        })
         .transpose()?;
     let runtimes = if plan.runtimes.is_empty() {
         None
     } else {
         Some(stage_runtimes(volume, &plan.runtimes, env)?)
     };
-    let manifest =
-        json!({"xcode": xcode, "runtimes": runtimes.clone().unwrap_or_else(|| json!([]))});
+    let manifest = json!({"xcode": xcode, "app": app, "runtimes": runtimes.clone().unwrap_or_else(|| json!([]))});
     let path = on_volume(volume, simpaths::MANIFEST);
     let parent = path.parent().ok_or("the manifest has no parent")?;
     ensure_dir(volume, parent, env)?;
@@ -563,6 +659,7 @@ pub fn execute(volume: &Path, plan: &Plan, env: &Env<'_>) -> Result<Value, Strin
         "free_bytes_before": free,
         "needed_bytes": need,
         "xcode": xcode,
+        "app": app,
         "runtimes": runtimes,
         "manifest": simpaths::MANIFEST,
     }))

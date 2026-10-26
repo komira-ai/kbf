@@ -28,6 +28,9 @@ pub struct Timing {
     pub sample_every: Duration,
     /// How long to wait for a guest to shut down when asked, before the VM is force-stopped.
     pub shutdown_timeout: Duration,
+    /// How long `probe e3` waits for the simulator run to end: longer than the guest's own
+    /// deadlines add up to, so that the guest gives up on a step first and says which.
+    pub sim_timeout: Duration,
 }
 
 impl Timing {
@@ -41,6 +44,7 @@ impl Timing {
             retry_window: Duration::from_secs(60),
             sample_every: Duration::from_secs(10),
             shutdown_timeout: Duration::from_secs(60),
+            sim_timeout: Duration::from_secs(4 * 3600),
         }
     }
 
@@ -55,6 +59,7 @@ impl Timing {
             retry_window: z,
             sample_every: Duration::from_millis(2),
             shutdown_timeout: z,
+            sim_timeout: z,
         }
     }
 }
