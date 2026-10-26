@@ -292,9 +292,8 @@ fn run_from(root: PathBuf, args: &RunArgs, me: &Path, watch: FileIdentity) -> Re
     Ok(())
 }
 
-/// The longest the wrapped `kbf boot-check` gets: 120 s, the `TimeoutStartSec=` of
-/// `kbf-frontend.service` (the other mode units keep systemd's default start timeout, which
-/// ends the start sooner). The check bounds its own waits (a connect, a lock).
+/// The longest the wrapped `kbf boot-check` gets: 120 s. The check bounds its own waits (a
+/// connect, a lock).
 const BOOT_CHECK_WAIT: Duration = Duration::from_secs(120);
 
 /// What the wrapper says of a `kbf` that exits 2, the status clap ends with for a verb it does
