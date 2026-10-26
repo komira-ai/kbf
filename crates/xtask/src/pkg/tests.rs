@@ -557,8 +557,16 @@ fn the_same_inputs_give_the_same_package_wherever_and_whenever_they_are_built() 
     let a = built("same-a");
     // Another directory, files written later, the trust files in the other order.
     let dir = scratch("same-b");
-    std::thread::sleep(std::time::Duration::from_millis(1100));
     let mut f = files(&dir, BINARY_BYTES);
+    // Years apart from the first tree's, set and not waited for.
+    let later = std::time::UNIX_EPOCH + std::time::Duration::from_secs(4_000_000_000);
+    for file in [&f.binary, &f.plist, &f.trust[0], &f.trust[1]] {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(file)
+            .and_then(|h| h.set_modified(later))
+            .expect("set the modification time");
+    }
     f.trust.reverse();
     build_with(&f, "1.2.3", &dir.join("deeper").join("out")).unwrap();
     let b = std::fs::read(dir.join("deeper/out").join(pkg_name("1.2.3"))).unwrap();
