@@ -1019,7 +1019,10 @@ fn flags_the_package_kbf_refuses_stop_the_plan() {
     for apply in [false, true] {
         let (code, out, err) = mig.run(apply);
         assert_eq!(code, 2, "{out} {err}");
-        assert!(err.contains("the package's kbf refuses the flags"), "{err}");
+        assert!(
+            err.contains("the package's kbf does not accept the flags"),
+            "{err}"
+        );
         assert!(err.contains("unexpected argument '--meta-dir'"), "{err}");
         assert!(!out.contains("+ "), "{out}");
     }
@@ -1137,36 +1140,34 @@ fn a_start_that_narrows_a_directory_is_rolled_back_with_the_mode_restored_first(
 }
 
 /// A hand-placed unit that is active for a moment and then fails is not "back and running":
-/// the way back looks at the unit again, and says the state it saw.
+/// the way back looks at the unit again, and says the state it saw (or that it was not active,
+/// when the look said nothing).
 #[test]
 fn a_unit_put_back_that_does_not_stay_active_is_a_failure_with_its_state() {
     both(|format| {
-        let mig = Mig::new("mig-crash-loop", format);
-        mig.rig.net.borrow_mut().kbf_commit = Some("b".repeat(40));
-        {
-            let mut net = mig.rig.net.borrow_mut();
-            // The packaged unit is active (the forward wait), then the hand-placed one is for
-            // two looks and is restarting after.
-            net.active_script = [
-                (0, "active\n"),
-                (0, "active\n"),
-                (0, "active\n"),
-                (3, "activating\n"),
-            ]
-            .map(|(code, said)| (code, said.to_owned()))
-            .into();
+        for (said, state) in [("activating\n", "activating"), ("", "not active")] {
+            let mig = Mig::new("mig-crash-loop", format);
+            {
+                let mut net = mig.rig.net.borrow_mut();
+                net.kbf_commit = Some("b".repeat(40));
+                // The packaged unit is active (the forward wait), then the hand-placed one is
+                // for two looks, and fails after.
+                net.active_script = [(0, "active\n"), (0, "active\n"), (0, "active\n"), (3, said)]
+                    .map(|(code, said)| (code, said.to_owned()))
+                    .into();
+            }
+            let (code, out, err) = mig.run(true);
+            assert_eq!(code, 1, "{out} {err}");
+            assert!(err.contains("reports commit"), "{err}");
+            assert!(err.contains("putting it back failed"), "{err}");
+            assert!(
+                err.contains(&format!("did not stay active: it is {state}")),
+                "{err}"
+            );
+            assert!(!err.contains("is back and running"), "{err}");
+            // The old layout is whole, for the operator to try again.
+            assert!(mig.releases().join(A).join("kbf").exists());
         }
-        let (code, out, err) = mig.run(true);
-        assert_eq!(code, 1, "{out} {err}");
-        assert!(err.contains("reports commit"), "{err}");
-        assert!(err.contains("putting it back failed"), "{err}");
-        assert!(
-            err.contains("did not stay active: it is activating"),
-            "{err}"
-        );
-        assert!(!err.contains("is back and running"), "{err}");
-        // The old layout is whole, for the operator to try again.
-        assert!(mig.releases().join(A).join("kbf").exists());
     });
 }
 
@@ -1208,4 +1209,150 @@ fn a_second_run_on_a_node_with_the_package_installed_migrates() {
         assert_eq!(mig.rig.installed(), Some(a_version()));
         assert!(!mig.releases().exists());
     });
+}
+
+/// A node that has none of its directories yet has nothing to keep: the plan says nothing of
+/// them and the move goes through.
+#[test]
+fn a_node_with_none_of_its_directories_has_nothing_to_keep() {
+    both(|format| {
+        let mig = Mig::new("mig-no-dirs", format);
+        for dir in ["var/lib/kbf/cold", "var/lib/kbf", "var/lib/kbf-meta"] {
+            fs::remove_dir(mig.rig.root.join(dir)).unwrap();
+        }
+        let (code, out, err) = mig.run(false);
+        assert_eq!((code, err.as_str()), (0, ""), "{out}");
+        assert!(!out.contains(" keeps mode"), "{out}");
+        assert!(
+            out.contains("DRY-RUN: install the verified package"),
+            "{out}"
+        );
+        assert!(!out.contains("put back any of"), "{out}");
+        let (code, out, err) = mig.run(true);
+        assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    });
+}
+
+/// A name of the node's that is a file, not a directory, is refused.
+#[test]
+fn a_node_directory_that_is_a_file_is_refused() {
+    let mig = Mig::new("mig-dir-file", Format::Deb);
+    fs::remove_dir(mig.node_dir("/var/lib/kbf-meta")).unwrap();
+    fs::write(mig.node_dir("/var/lib/kbf-meta"), b"x").unwrap();
+    let (code, out, err) = mig.run(false);
+    assert_eq!(code, 2, "{out} {err}");
+    assert!(
+        err.contains("/var/lib/kbf-meta is not a directory"),
+        "{err}"
+    );
+}
+
+/// Which directories the flags name: the data directory (the default for the modes that run
+/// containers), `--meta-dir` and a local cold store, absolute and once each; in the `--name=value`
+/// and `--name value` forms; a flag whose name only starts with one of them is not it.
+#[test]
+fn the_node_directories_are_the_ones_its_flags_name() {
+    let flags = |w: &[&str]| w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    let dirs = |w: &[&str], mode: &str| node_dirs(&flags(w), mode);
+    let path = |p: &str| PathBuf::from(p);
+    assert_eq!(
+        dirs(&["--cold-store=file:///c", "--meta-dir", "/m"], "storage"),
+        [path("/m")]
+            .into_iter()
+            .chain([path("/c")])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        dirs(
+            &["--data-dir=/d", "--meta-dir=/d", "--data-dirx=/e"],
+            "daemon"
+        ),
+        [path("/d")]
+    );
+    assert_eq!(dirs(&[], "daemon"), [path("/var/lib/kbf")]);
+    assert_eq!(
+        dirs(
+            &["--meta-dir=relative", "--cold-store=s3://bucket/p"],
+            "storage"
+        ),
+        Vec::<PathBuf>::new()
+    );
+}
+
+/// Only a mode that runs containers needs its data directory reachable.
+#[test]
+fn only_a_container_mode_needs_the_data_directory_searchable() {
+    let mig = Mig::new("mig-modes", Format::Deb);
+    fs::set_permissions(mig.node_dir("/var/lib"), fs::Permissions::from_mode(0o750)).unwrap();
+    let flags = ["--mode=storage".to_owned()];
+    assert!(record_dirs(&mig.place, &flags, "storage").is_ok());
+    assert!(record_dirs(&mig.place, &flags, "daemon").is_err());
+}
+
+/// What the packaged unit would do to the node's directories, read from its text: its
+/// `[Service]` only, the list emptied by an empty assignment, a mode in octal.
+#[test]
+fn the_packaged_units_state_directories_are_read_as_systemd_reads_them() {
+    let mig = Mig::new("mig-state-dirs", Format::Deb);
+    let unit = "[Unit]\nStateDirectory=ignored\n[Service]\nStateDirectory=gone\nStateDirectory=\n\
+                StateDirectory=kbf kbf-meta\nStateDirectoryMode=0700\nStateDirectoryMode=zz\nUser=kbf\nno assignment here\n";
+    let said = state_dir_changes(unit, &mig.place);
+    assert_eq!(
+        said.iter().map(|l| &l[..48]).collect::<Vec<_>>(),
+        [
+            "the package's unit would set /var/lib/kbf from m",
+            "the package's unit would set /var/lib/kbf-meta f"
+        ]
+    );
+    assert!(said[0].contains("from mode 0755 to 0700"), "{said:?}");
+    assert!(state_dir_changes("[Service]\nStateDirectory=missing\n", &mig.place).is_empty());
+}
+
+/// Directories that cannot be put back are said, by name.
+#[test]
+fn directories_that_cannot_be_put_back_are_said() {
+    let mig = Mig::new("mig-gone", Format::Deb);
+    let dir = Dir {
+        path: mig.node_dir("/var/lib/gone"),
+        shown: PathBuf::from("/var/lib/gone"),
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+    };
+    let said = restore_all(&[dir.clone(), dir]).unwrap_err();
+    assert_eq!(said.matches("/var/lib/gone:").count(), 2, "{said}");
+}
+
+/// A start that removes a directory fails the check; going back cannot restore it, and the
+/// operator is told which.
+#[test]
+fn a_directory_the_start_removes_is_said_when_going_back() {
+    let mig = Mig::new("mig-removed", Format::Deb);
+    mig.rig.net.borrow_mut().remove_on_restart = Some(mig.node_dir("/var/lib/kbf-meta"));
+    let (code, out, err) = mig.run(true);
+    assert_eq!(code, 1, "{out} {err}");
+    assert!(err.contains("the start changed /var/lib/kbf-meta"), "{err}");
+    assert!(err.contains("putting it back failed"), "{err}");
+    assert!(
+        err.contains("putting the directories back: /var/lib/kbf-meta"),
+        "{err}"
+    );
+}
+
+/// A package that cannot be unpacked, or whose kbf cannot be run, is refused before anything
+/// changes.
+#[test]
+fn a_package_that_cannot_be_unpacked_or_run_is_refused() {
+    for (broken, says) in [
+        ("unpack-fails", "unpacking the package: exit status Some(2)"),
+        ("kbf-cannot-run", "cannot start the package's kbf"),
+    ] {
+        let mig = Mig::new("mig-unpack", Format::Deb);
+        mig.rig.net.borrow_mut().broken.insert(broken);
+        let (code, out, err) = mig.run(true);
+        assert_eq!(code, 2, "{broken}: {out} {err}");
+        assert!(err.contains(says), "{broken}: {err}");
+        assert_eq!(mig.rig.installed(), None);
+        assert!(mig.rig.work().is_empty());
+    }
 }

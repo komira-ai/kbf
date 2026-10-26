@@ -282,17 +282,13 @@ impl Dir {
 
     /// Put the mode and owner back if they are not what they were.
     fn restore(&self) -> Result<(), String> {
+        if self.unchanged() {
+            return Ok(());
+        }
         let at = |e: std::io::Error| format!("{}: {e}", self.shown.display());
-        let meta = fs::metadata(&self.path).map_err(at)?;
-        if (meta.uid(), meta.gid()) != (self.uid, self.gid) {
-            std::os::unix::fs::chown(&self.path, Some(self.uid), Some(self.gid)).map_err(at)?;
-        }
+        std::os::unix::fs::chown(&self.path, Some(self.uid), Some(self.gid)).map_err(at)?;
         // After the owner: a change of owner can clear mode bits.
-        let meta = fs::metadata(&self.path).map_err(at)?;
-        if meta.mode() & 0o7777 != self.mode {
-            fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode)).map_err(at)?;
-        }
-        Ok(())
+        fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode)).map_err(at)
     }
 
     /// Whether it has the mode and owner it had.
@@ -554,8 +550,8 @@ fn record_dirs(place: &Place, flags: &[String], mode: &str) -> Result<Vec<Dir>, 
                 gid: meta.gid(),
             }),
             Ok(_) => return refused(format!("{} is not a directory", shown.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return refused(format!("{}: {e}", shown.display())),
+            // Not there (or not to be looked into): nothing of the node's to keep.
+            Err(_) => {}
         }
     }
     if let Some(data) = data_dir(flags, mode) {
@@ -614,62 +610,46 @@ fn check_package(
         );
         return Ok(notes);
     };
-    let step = |what: &str, e: String| Refused(format!("{what}: {e}"));
+    let made = |e: std::io::Error| Refused(format!("the package check: {e}"));
     fs::create_dir(&unpacked)
         .and_then(|()| fs::set_permissions(&unpacked, fs::Permissions::from_mode(0o755)))
-        .map_err(|e| step("unpacking the package", e.to_string()))?;
-    match host.runner.run(&unpack) {
-        Ok(exec) if exec.success() => {}
-        Ok(exec) => {
-            return Err(step(
-                "unpacking the package",
-                format!("exit status {:?}: {}", exec.code, exec.stderr_text().trim()),
-            ));
-        }
-        Err(e) => return Err(step("unpacking the package", e.to_string())),
-    }
+        .map_err(made)?;
+    ran(&*host.runner, &unpack, "unpacking the package").map_err(Refused)?;
     // An empty kbf.toml: the flags are read alone, whatever file the host has.
     let empty = copies.dir().join("empty.toml");
     fs::write(&empty, b"")
         .and_then(|()| fs::set_permissions(&empty, fs::Permissions::from_mode(0o644)))
-        .map_err(|e| step("the package check", e.to_string()))?;
-    let binary = unpacked.join("usr/bin/kbf");
-    if !binary.is_file() {
-        return refused("the package has no usr/bin/kbf");
-    }
+        .map_err(made)?;
     let mut args = flags.to_vec();
     args.push(format!("--config={}", empty.display()));
     args.push("--help".to_owned());
-    let parsed = host.runner.run(&Cmd {
-        program: binary.display().to_string(),
+    let parse = Cmd {
+        program: unpacked.join("usr/bin/kbf").display().to_string(),
         args,
         timeout: Some(PARSE_TIMEOUT),
         run_as: Some(who),
         stdout_max: Some(4096),
         ..Cmd::default()
-    });
-    match parsed {
-        Ok(exec) if exec.success() => notes.push(
-            "the package's kbf reads the flags of the drop-in (run with --help last: nothing starts)"
-                .to_owned(),
-        ),
-        Ok(exec) => {
-            let said = exec.stderr_text();
-            return refused(format!(
-                "the package's kbf refuses the flags the drop-in would give it (exit status {:?}): {}",
-                exec.code,
-                said.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim()
-            ));
-        }
-        Err(e) => return refused(format!("running the package's kbf: {e}")),
-    }
+    };
+    ran(
+        &*host.runner,
+        &parse,
+        "the package's kbf does not accept the flags the drop-in gives it",
+    )
+    .map_err(Refused)?;
+    notes.push(
+        "the package's kbf reads the flags of the drop-in (run with --help last: nothing starts)"
+            .to_owned(),
+    );
     // What the packaged unit would do to the directories, if the drop-in did not clear it.
     let unit_file = unpacked
         .join("usr/lib/systemd/system")
         .join(config.unit.as_str());
-    if let Ok(text) = fs::read_to_string(&unit_file) {
-        notes.extend(state_dir_changes(&text, place));
-    }
+    notes.extend(
+        fs::read_to_string(unit_file)
+            .map(|text| state_dir_changes(&text, place))
+            .unwrap_or_default(),
+    );
     Ok(notes)
 }
 
@@ -722,10 +702,10 @@ fn reported_commit(runner: &dyn Runner) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Carry out one step.
-fn apply(step: &Step, host: &PackageHost, config: &Config, place: &Place) -> Result<(), String> {
-    let runner = &*host.runner;
-    let ran = |cmd: &Cmd, what: &str| match runner.run(cmd) {
+/// Run `cmd`; why not, in a line that starts with `what`, when it cannot be run or does not
+/// exit 0.
+fn ran(runner: &dyn Runner, cmd: &Cmd, what: &str) -> Result<crate::runner::Exec, String> {
+    match runner.run(cmd) {
         Ok(exec) if exec.success() => Ok(exec),
         Ok(exec) => Err(format!(
             "{what}: exit status {:?}: {}",
@@ -733,7 +713,13 @@ fn apply(step: &Step, host: &PackageHost, config: &Config, place: &Place) -> Res
             exec.stderr_text().trim()
         )),
         Err(e) => Err(format!("{what}: {e}")),
-    };
+    }
+}
+
+/// Carry out one step.
+fn apply(step: &Step, host: &PackageHost, config: &Config, place: &Place) -> Result<(), String> {
+    let runner = &*host.runner;
+    let ran = |cmd: &Cmd, what: &str| ran(runner, cmd, what);
     match step {
         Step::Install { file, dirs } => {
             ran(&config.format.install(file), "installing the package")?;

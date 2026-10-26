@@ -151,6 +151,8 @@ pub(crate) struct Net {
     /// A directory set to a mode by the first restart, as the packaged unit's
     /// `StateDirectoryMode=` does.
     pub(crate) narrow_on_restart: Option<(PathBuf, u32)>,
+    /// A (then empty) directory the first restart removes.
+    pub(crate) remove_on_restart: Option<PathBuf>,
     /// A directory set to a mode by the next installation.
     pub(crate) narrow_on_install: Option<(PathBuf, u32)>,
 }
@@ -213,6 +215,9 @@ impl Runner for Sim {
         match name.as_str() {
             "kbf" if cmd.args.last().is_some_and(|a| a == "--help") => {
                 net.events.push("parse-only".to_owned());
+                if net.broken.contains("kbf-cannot-run") {
+                    return Err(io::Error::other("cannot start the package's kbf"));
+                }
                 // Its parser: a word that is no flag is an unexpected argument.
                 let word = cmd.args.iter().find(|a| !a.starts_with('-'));
                 match (&net.kbf_refuses, word) {
@@ -248,6 +253,9 @@ impl Runner for Sim {
                     }
                     if let Some((dir, mode)) = net.narrow_on_restart.take() {
                         fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+                    }
+                    if let Some(dir) = net.remove_on_restart.take() {
+                        fs::remove_dir(dir).unwrap();
                     }
                     if net.restart_fails_once.remove(&last) {
                         exec(5, "", "failed once")
@@ -367,6 +375,9 @@ impl Runner for Sim {
             }
             "dpkg-deb" if cmd.args[0] == "--extract" => {
                 net.events.push("unpack".to_owned());
+                if net.broken.contains("unpack-fails") {
+                    return exec(2, "", "dpkg-deb: error: not a package");
+                }
                 let into = PathBuf::from(&cmd.args[2]);
                 let bin = into.join("usr/bin");
                 let units = into.join("usr/lib/systemd/system");
@@ -513,6 +524,7 @@ impl Rig {
             watch_dir: None,
             narrow_on_restart: None,
             narrow_on_install: None,
+            remove_on_restart: None,
         }));
         let calls = Rc::new(RefCell::new(Vec::new()));
         let gh_exit = Rc::new(RefCell::new(0));
