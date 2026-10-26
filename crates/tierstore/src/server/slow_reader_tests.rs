@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
-use tokio::time::{Instant, sleep};
+use tokio::time::sleep;
 
 use crate::Backend;
 
@@ -61,14 +61,15 @@ fn body_start(received: &[u8]) -> usize {
 }
 
 /// Asserts that a client that reads its answer a chunk at a time, with a wait of half the idle
-/// time between chunks, is served whole: the answer is 200 and the object byte for byte, though
-/// the pipe holds a sixty-fourth of the object and the whole takes more than ten times the idle
-/// time. Each wait is shorter than the idle time, so the server is never left with a write that nobody
-/// takes for the idle time.
+/// time on the paused clock between chunks, is served whole: the answer is 200 and the object
+/// byte for byte, though the pipe holds a sixty-fourth of the object, so the answer needs more
+/// than twenty of those waits (more than ten idle times in all). Each wait is shorter than the
+/// idle time, so the server is never left with a write that nobody takes for the idle time.
+/// Nothing here measures time: the waits are counted.
 #[tokio::test(start_paused = true)]
 async fn a_client_that_reads_slowly_but_steadily_gets_the_whole_answer_over_many_idle_times() {
     let mut client = open_get().await;
-    let started = Instant::now();
+    let mut waits = 0_u32;
     let mut received = Vec::new();
     let mut chunk = vec![0_u8; CHUNK];
     loop {
@@ -78,14 +79,16 @@ async fn a_client_that_reads_slowly_but_steadily_gets_the_whole_answer_over_many
         }
         received.extend_from_slice(&chunk[..read]);
         sleep(IDLE / 2).await;
+        waits += 1;
     }
     assert!(received.starts_with(b"HTTP/1.1 200"));
     let start = body_start(&received);
     assert!(received[start..] == object()[..]);
-    assert!(started.elapsed() > IDLE * 10, "{:?}", started.elapsed());
+    assert!(waits > 20, "{waits}");
 }
 
-/// Asserts that a client that reads one chunk and then waits twice the idle time without reading is
+/// Asserts that a client that reads one chunk and then waits twice the idle time (on the paused
+/// clock) without reading is
 /// cut: the connection ends with a part of the object, so the idle time applies to this path, and
 /// the slow reader above is not served only because nothing here is ever cut.
 #[tokio::test(start_paused = true)]
