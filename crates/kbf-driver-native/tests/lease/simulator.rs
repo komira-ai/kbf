@@ -536,9 +536,10 @@ async fn a_simulator_xcode_never_lists_fails_the_lease_saying_so() {
 }
 
 /// Catches a wait that costs a lease whose simulator Xcode lists at once: one look,
-/// no pause before it or after it. The pause between looks is a minute here, and the
-/// run must end within the harness's 30 s. Catches: a pause before the first
-/// look (red: the run times out).
+/// no pause before it or after it. The pause between looks is a minute here, longer
+/// than the harness's bound on a run (40 s), so the run ending at all means no pause
+/// came before the look; the look count and the calls show it was the only one.
+/// Catches: a pause before the first look (red: the run times out).
 #[tokio::test]
 async fn a_simulator_listed_at_once_adds_no_wait() {
     let dir = scratch("sim-listed-at-once");
@@ -546,10 +547,8 @@ async fn a_simulator_listed_at_once_adds_no_wait() {
     let (config, xcrun) = listing_config(&dir, "", minute * 2, minute);
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    let started = std::time::Instant::now();
     let result = run(&rt, &cas, 1, &asks(Spec::act("exit 0"), DEVICE_TYPE)).await;
     assert_eq!(result.expect("ran").exit_code, 0);
-    assert!(started.elapsed() < minute, "{:?}", started.elapsed());
     assert_eq!(looks(&xcrun), 1);
     assert_eq!(calls(&xcrun), lease_calls(1, &[]));
 }
@@ -733,29 +732,24 @@ async fn a_kill_during_the_wait_for_the_boot_ends_it() {
 
 /// Catches a `bootstatus` that stalls (a boot with a data migration took up to 2 min
 /// 46 s) holding the wait for as long as it likes: each try has [`Listing::look`] to
-/// answer (200 ms here) and is killed after it. The fake's `bootstatus` sleeps 5 s.
-/// Catches: the try given the `simctl` answer time (red: the run takes the
-/// 5 s).
+/// answer (200 ms here) and is killed after it. The fake's `bootstatus` sleeps ten
+/// minutes, far past the harness's bound on a run (40 s), so the run ending with the
+/// failure below means the try was cut. Catches: the try given the `simctl` answer
+/// time (red: the run times out).
 #[tokio::test]
 async fn a_boot_that_does_not_answer_is_cut_and_the_wait_still_ends() {
     let dir = scratch("sim-boot-stalls");
-    let extra = "simctl bootstatus * -b\t-\tsleep 5\n";
+    let extra = "simctl bootstatus * -b\t-\tsleep 600\n";
     let (mut config, xcrun) = listing_config(&dir, extra, PROMPT, Duration::from_millis(10));
     config.simulator_listing.boot = Duration::from_millis(500);
     config.simulator_listing.look = Duration::from_millis(200);
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    let started = std::time::Instant::now();
     let outcome = run(&rt, &cas, 1, &asks(Spec::act("exit 0"), DEVICE_TYPE)).await;
     let Err(RuntimeError::Failed(why)) = &outcome else {
         panic!("{outcome:?}");
     };
     assert!(why.contains("no answer within 200ms"), "{why}");
-    assert!(
-        started.elapsed() < Duration::from_secs(4),
-        "{:?}",
-        started.elapsed()
-    );
     assert!(boots_in(&log_of(&xcrun)) > 1);
     assert!(no_leases(&config));
 }
@@ -881,12 +875,14 @@ async fn a_populated_listing_without_the_udid_is_not_listed() {
 /// hosted runner) holding the wait for as long as it likes: each look has
 /// [`Listing::look`] to answer (200 ms here) and is killed after it, counted as not
 /// listed, so the wait ends near [`Listing::within`] with the lease failed saying the
-/// look did not answer. The fake's look sleeps 5 s. Catches: the look given the
-/// `simctl` answer time instead of [`Listing::look`] (red: the run takes the 5 s).
+/// look did not answer. The fake's look sleeps ten minutes, far past the harness's
+/// bound on a run (40 s), so the run ending with the failure below means the look was
+/// cut. Catches: the look given the `simctl` answer time instead of
+/// [`Listing::look`] (red: the run times out).
 #[tokio::test]
 async fn a_look_that_does_not_answer_is_cut_and_the_wait_still_ends() {
     let dir = scratch("sim-look-stalls");
-    let extra = format!("{SHOW}\t-\tsleep 5\n");
+    let extra = format!("{SHOW}\t-\tsleep 600\n");
     let (mut config, xcrun) = listing_config(
         &dir,
         &extra,
@@ -896,17 +892,11 @@ async fn a_look_that_does_not_answer_is_cut_and_the_wait_still_ends() {
     config.simulator_listing.look = Duration::from_millis(200);
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    let started = std::time::Instant::now();
     let outcome = run(&rt, &cas, 1, &asks(Spec::act("exit 0"), DEVICE_TYPE)).await;
     let Err(RuntimeError::Failed(why)) = &outcome else {
         panic!("{outcome:?}");
     };
     assert!(why.contains("no answer within 200ms"), "{why}");
-    assert!(
-        started.elapsed() < Duration::from_secs(4),
-        "{:?}",
-        started.elapsed()
-    );
     assert_eq!(calls(&xcrun), lease_calls(1, &[]));
     assert!(no_leases(&config));
 }
@@ -1261,12 +1251,26 @@ fn stalled_listing(dir: &Path, once: bool) -> String {
     )
 }
 
+/// Runs `work` on a thread of its own and waits at most 30 s for what it returns: `None`
+/// where it did not return. A hang guard only: a thread that never returns is left
+/// behind, so the test fails instead of holding the test process.
+async fn bounded<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (done, answer) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(work());
+    });
+    tokio::time::timeout(PROMPT * 3, answer)
+        .await
+        .ok()
+        .and_then(Result::ok)
+}
+
 /// A rule for the fake `xcrun`: `simctl list devices -j` does not answer until the
-/// test makes `gate` (it gives up, and fails, after 25 s).
+/// test makes `gate` (it gives up, and fails, after 120 s).
 fn gated_listing(dir: &Path, gate: &Path) -> String {
     let list = dir.join("bin").join("devices.json");
     format!(
-        "simctl list devices -j\t-\twait-for {} 25 ; cat {}\n",
+        "simctl list devices -j\t-\twait-for {} 120 ; cat {}\n",
         gate.display(),
         list.display()
     )
@@ -1276,26 +1280,25 @@ fn gated_listing(dir: &Path, gate: &Path) -> String {
 /// stalled CoreSimulatorService answers nothing for minutes, so a start that sweeps
 /// the left simulators before it returns is held for as long, and a start that gives
 /// up after one cap-long try leaves the booted device booted for good. The fake's
-/// listing does not answer (and the cap is 30 s) until the test lets it: `new` must
-/// return at once, with the sweep still waiting and the owed file in place; then the
+/// listing does not answer (and the cap is 120 s) until the test lets it: `new` must
+/// return while it waits (within the harness's 30 s, far under the cap), with the sweep still waiting and the owed file in place; then the
 /// device is deleted, the owed file removed, and the sweep reports it is done.
-/// Catches: the sweep run inside `new` (red: `new` takes the 30 s cap and the
-/// "returns at once" assertion fails); the owed file removed before the sweep ends
+/// Catches: the sweep run inside `new` (red: `new` does not return and the bound
+/// on it fails); the owed file removed before the sweep ends
 /// (red: the file is gone while the listing waits).
 #[tokio::test]
 async fn the_start_returns_while_the_left_simulators_are_swept_in_the_background() {
     let dir = scratch("sim-sweep-bg");
     let gate = dir.join("gate");
     let (mut config, xcrun) = stalled_start(&dir, &gated_listing(&dir, &gate));
-    config.simulator_answer = Duration::from_secs(30);
+    config.simulator_answer = Duration::from_secs(120);
     let cas = Arc::new(MemoryCas::default());
-    let started = std::time::Instant::now();
-    let rt = runtime(config.clone(), &cas);
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "the start returned after {:?}, not waiting for the listing",
-        started.elapsed()
-    );
+    let rt = bounded({
+        let (config, cas) = (config.clone(), Arc::clone(&cas));
+        move || runtime(config, &cas)
+    })
+    .await
+    .expect("the start returned while the listing still waited");
     assert!(
         !rt.wait_for_simulator_sweep(Duration::from_millis(100)),
         "the sweep is still waiting for the listing"
@@ -1472,14 +1475,15 @@ async fn a_sweep_directory_that_cannot_be_made_keeps_the_debt() {
 
 /// Catches: a runtime that is dropped while its sweep waits to try again leaving the
 /// thread to run its tries on (or the drop waiting for them): the tries are an hour
-/// apart here and every one fails, so the drop must end the wait, not sit through it.
-/// Catches: the pause ignoring the stop (red: the drop takes the minute).
+/// apart here and every one fails, so the drop must end the wait, not sit through it
+/// (the drop is bounded at 30 s, far under the hour). Catches: the pause ignoring the
+/// stop (red: the drop does not return and the bound fails).
 #[tokio::test]
 async fn dropping_the_runtime_ends_the_sweeps_wait_for_its_next_try() {
     let dir = scratch("sim-sweep-drop");
     let (mut config, xcrun) = fake_config(&dir, "");
     config.xcrun = dir.join("no-xcrun");
-    config.simulator_retry = Duration::from_secs(60);
+    config.simulator_retry = Duration::from_secs(3600);
     std::fs::create_dir_all(&config.scratch).expect("scratch");
     std::fs::write(config.scratch.join(PENDING), b"").expect("owed");
     let cas = Arc::new(MemoryCas::default());
@@ -1488,13 +1492,9 @@ async fn dropping_the_runtime_ends_the_sweeps_wait_for_its_next_try() {
         !rt.wait_for_simulator_sweep(Duration::from_millis(200)),
         "the sweep waits for its second try"
     );
-    let started = std::time::Instant::now();
-    drop(rt);
-    assert!(
-        started.elapsed() < Duration::from_secs(30),
-        "the drop took {:?}",
-        started.elapsed()
-    );
+    bounded(move || drop(rt))
+        .await
+        .expect("the drop ends the sweep's wait");
     assert!(config.scratch.join(PENDING).is_file(), "the debt stays");
     assert_eq!(calls(&xcrun), [""; 0]);
 }
