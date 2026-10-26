@@ -633,3 +633,153 @@ fn the_e3_gate_parses_and_graphics_belongs_to_it_alone() {
     assert!(String::from_utf8_lossy(&out).contains("e3 probe only"));
     assert!(sys.starts.borrow().is_empty());
 }
+
+fn step_with(
+    index: usize,
+    id: &str,
+    status: Status,
+    exit: Option<i32>,
+    signal: Option<i32>,
+) -> (String, String) {
+    let (name, body) = step(index, id, status, exit);
+    let mut v: Value = serde_json::from_str(&body).expect("json");
+    v["signal"] = json!(signal);
+    (name, v.to_string())
+}
+
+/// Catches a step killed by a signal, or failed without a code or signal, being named by
+/// something else: the problems list says which.
+#[test]
+fn a_step_killed_by_a_signal_is_named_with_the_signal() {
+    let work = work_with_base("e3-signal");
+    let sys = FakeSystem::new();
+    sys.script(guest_sending(&[
+        step_with(0, "xcode-select", Status::Failed, None, Some(9)),
+        step_with(1, "license", Status::Failed, None, None),
+        summary(false, 0),
+    ]));
+    let r = e3(&guest_ctx(&sys, &work), Graphics::On);
+    assert_eq!(
+        arm(&r, 0)["problems"],
+        json!(["xcode-select (signal 9)", "license (failed)"])
+    );
+}
+
+/// Catches a guest that ends by itself (the helper exits, or the VM fails to start) making
+/// the probe wait out the simulator timeout, ask a dead guest to shut down, or report it
+/// as having stayed up.
+#[test]
+fn a_guest_that_ends_on_its_own_ends_the_wait_and_is_not_asked_to_shut_down() {
+    use crate::system::Poll;
+    let work = work_with_base("e3-ended");
+    let sys = FakeSystem::new();
+    sys.script(Script::booted().then(Poll::Gone {
+        code: Some(1),
+        signal: None,
+    }));
+    let mut c = guest_ctx(&sys, &work);
+    // A wait that only the guest's end can finish.
+    c.timing.sim_timeout = std::time::Duration::from_secs(600);
+    let r = e3(&c, Graphics::On);
+    let a = arm(&r, 0);
+    assert_eq!(
+        (a["stayed_up"].as_bool(), a["stop"].is_null()),
+        (Some(false), true),
+        "{a}"
+    );
+
+    let work = work_with_base("e3-failed-start");
+    let sys = FakeSystem::new();
+    sys.script(Script::failing("no display", None));
+    let mut c = guest_ctx(&sys, &work);
+    c.timing.sim_timeout = std::time::Duration::from_secs(600);
+    let r = e3(&c, Graphics::On);
+    let a = arm(&r, 0);
+    assert_eq!(
+        (a["started_ms"].is_null(), a["stayed_up"].as_bool()),
+        (true, Some(false)),
+        "{a}"
+    );
+    assert_eq!(a["steps_received"], 0);
+}
+
+/// Catches a screenshot that cannot be written being reported as written, and one that
+/// replaces nothing: a file of an earlier run is replaced, a missing directory is an error
+/// naming the path.
+#[test]
+fn the_picture_is_written_over_an_earlier_one_and_a_failed_write_is_reported() {
+    use crate::e3::{picture_json, write_picture};
+    let dir = crate::fake::tmp("e3-picture");
+    let frame = json!({"format": "jpeg", "bytes": 4, "base64": base64::engine::general_purpose::STANDARD.encode([0xFF, 0xD8, 0xFF, 1])});
+    let path = dir.join("shot.jpg");
+    std::fs::write(&path, "older and longer than the new picture").expect("old");
+    let j = picture_json(&frame, &path);
+    assert_eq!(
+        (j["bytes"].as_u64(), j["jpeg_signature"].as_bool()),
+        (Some(4), Some(true)),
+        "{j}"
+    );
+    assert_eq!(std::fs::read(&path).expect("shot"), [0xFF, 0xD8, 0xFF, 1]);
+    let bad = picture_json(&frame, &dir.join("none/shot.jpg"));
+    assert!(bad["written"].is_null() && bad["bytes"] == 4, "{bad}");
+    assert!(
+        bad["error"].as_str().expect("error").starts_with("write "),
+        "{bad}"
+    );
+    assert!(write_picture(&dir.join("none/x"), b"x").is_err());
+}
+
+/// Catches `probe e3` reached through the gate table giving the wrong graphics device: the
+/// default follows `--headless`.
+#[test]
+fn the_gate_table_starts_e3_with_graphics_unless_headless() {
+    use crate::cli::Gate;
+    for graphics in [true, false] {
+        let work = work_with_base("e3-gate");
+        let sys = FakeSystem::new();
+        sys.script(guest_sending(&all_ok()));
+        let mut c = guest_ctx(&sys, &work);
+        c.graphics = graphics;
+        let r = crate::gates::run(&c, Gate::E3, None);
+        assert_eq!(r.probe, "e3");
+        assert_eq!(sys.starts.borrow()[0].0.graphics, graphics);
+    }
+}
+
+/// Catches `--graphics` being ignored when the gate is asked for through the command line.
+#[test]
+fn the_command_line_graphics_mode_reaches_the_probe() {
+    use crate::cli::Cli;
+    use clap::Parser;
+    let work = work_with_base("e3-cli");
+    let bin = work.join("kbf-guest-src");
+    std::fs::write(&bin, "bin").expect("bin");
+    let sys = FakeSystem::new();
+    sys.script(guest_sending(&all_ok()));
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let cli = Cli::parse_from([
+        "kbf-vmm",
+        "probe",
+        "e3",
+        "--work-dir",
+        work.to_str().expect("p"),
+        "--guest-binary",
+        bin.to_str().expect("p"),
+        "--graphics",
+        "off",
+    ]);
+    let _ = crate::app::run(
+        cli,
+        Some(&sys),
+        crate::probe::Timing::instant(),
+        &mut out,
+        &mut err,
+    );
+    let line: Value = serde_json::from_slice(&out).expect("one json line");
+    assert_eq!(
+        (line["probe"].as_str(), line["status"].as_str()),
+        (Some("e3"), Some("ok")),
+        "{line}"
+    );
+    assert!(!sys.starts.borrow()[0].0.graphics);
+}

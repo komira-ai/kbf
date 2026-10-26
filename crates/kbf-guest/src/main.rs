@@ -663,15 +663,20 @@ mod tests {
         fn read_screenshot(&self, _: usize) -> Result<Vec<u8>, String> {
             Ok(vec![1, 2, 3])
         }
-        fn run(&self, _: &[String], _: std::time::Duration) -> sim::Outcome {
+        fn run(&self, argv: &[String], _: std::time::Duration) -> sim::Outcome {
+            let line = argv.join(" ");
+            let stdout = if line.contains("list runtimes") {
+                r#"{"runtimes":[{"identifier":"com.apple.CoreSimulator.SimRuntime.iOS-27-0","version":"27.0","isAvailable":true}]}"#
+            } else if line.contains("list devicetypes") {
+                r#"{"devicetypes":[{"identifier":"t","name":"iPhone 16"}]}"#
+            } else if line.contains("simctl create") {
+                "6F3A1B2C-0D4E-4F5A-8B6C-7D8E9F0A1B2C\n"
+            } else {
+                ""
+            };
             sim::Outcome {
                 ended: sim::Ended::Exited(0),
-                stdout: format!(
-                    "{}{}",
-                    r#"{"runtimes":[{"identifier":"com.apple.CoreSimulator.SimRuntime.iOS-27-0","version":"27.0","isAvailable":true}],"devicetypes":[{"identifier":"t","name":"iPhone 16"}]}"#,
-                    "\n6F3A1B2C-0D4E-4F5A-8B6C-7D8E9F0A1B2C\n"
-                )
-                .into_bytes(),
+                stdout: stdout.as_bytes().to_vec(),
                 stderr: Vec::new(),
                 cut: false,
                 ms: 1,
@@ -685,7 +690,7 @@ mod tests {
             if self.up {
                 Ok(())
             } else {
-                Err(kbf_guest::frame::SendError::Refused("no".into()))
+                Err(kbf_guest::frame::SendError::Unavailable("no".into()))
             }
         }
         fn pause(&self, _: std::time::Duration) {}

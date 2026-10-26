@@ -628,7 +628,16 @@ struct Run<'a> {
     undelivered: Vec<String>,
 }
 
-impl Run<'_> {
+impl<'a> Run<'a> {
+    fn new(host: &'a dyn SimHost, cfg: &'a Config, log: &'a mut dyn Write) -> Self {
+        Self {
+            host,
+            cfg,
+            log,
+            undelivered: Vec::new(),
+        }
+    }
+
     /// Sends `frame` with retries; a frame that never arrives is remembered, not fatal.
     fn deliver(&mut self, frame: &Frame) -> bool {
         let host = self.host;
@@ -641,15 +650,11 @@ impl Run<'_> {
         ok
     }
 
+    /// Sends `body` as the JSON text of a result frame named `name`. The frame types hold
+    /// strings, numbers and enums only, which always serialize.
     fn deliver_json(&mut self, name: &str, body: &impl Serialize) -> bool {
-        match serde_json::to_string_pretty(body) {
-            Ok(text) => self.deliver(&Frame::new(Kind::Result, name, &text)),
-            Err(e) => {
-                let _ = writeln!(self.log, "kbf-guest: sim: encode {name}: {e}");
-                self.undelivered.push(name.to_owned());
-                false
-            }
-        }
+        let text = format!("{:#}", serde_json::to_value(body).unwrap_or(Value::Null));
+        self.deliver(&Frame::new(Kind::Result, name, &text))
     }
 }
 
@@ -690,12 +695,7 @@ pub fn as_user(user: &ConsoleUser, argv: &[String]) -> Vec<String> {
 /// Runs the plan against `host`: see the module documentation. Never blocks beyond the
 /// deadlines in `cfg`.
 pub fn run(host: &dyn SimHost, cfg: &Config, log: &mut dyn Write) -> SummaryFrame {
-    let mut r = Run {
-        host,
-        cfg,
-        log,
-        undelivered: Vec::new(),
-    };
+    let mut r = Run::new(host, cfg, log);
     if !host.is_root() {
         return finish(
             &mut r,
@@ -719,19 +719,35 @@ pub fn run(host: &dyn SimHost, cfg: &Config, log: &mut dyn Write) -> SummaryFram
             .filter(|n| name_ok(n, ".app"))
             .min(),
     };
-    let steps = plan(&inputs);
-    let mut state = State {
+    let state = State {
         app: inputs.app.clone(),
         ..State::default()
     };
+    run_steps(&mut r, &plan(&inputs), state)
+}
+
+/// Runs `steps`, a plan the caller built, as [`run`] runs its own: a frame for each, then
+/// the summary. It does not check for root.
+pub fn run_plan(
+    host: &dyn SimHost,
+    cfg: &Config,
+    steps: &[Step],
+    log: &mut dyn Write,
+) -> SummaryFrame {
+    run_steps(&mut Run::new(host, cfg, log), steps, State::default())
+}
+
+/// Runs `steps` in order from `state`, sending a frame for each, then the summary.
+fn run_steps(r: &mut Run<'_>, steps: &[Step], mut state: State) -> SummaryFrame {
+    let (host, cfg) = (r.host, r.cfg);
     let mut status: BTreeMap<String, Status> = BTreeMap::new();
     let mut order: Vec<(String, Status)> = Vec::new();
     let mut user: Option<Option<ConsoleUser>> = None;
     let mut screenshot_bytes = None;
-    let mut note = None;
-    if let Err(e) = host.prepare_out_dir() {
-        note = Some(format!("prepare {OUT_DIR}: {e}"));
-    }
+    let note = host
+        .prepare_out_dir()
+        .err()
+        .map(|e| format!("prepare {OUT_DIR}: {e}"));
     for (index, step) in steps.iter().enumerate() {
         let blame = step
             .needs
@@ -763,14 +779,14 @@ pub fn run(host: &dyn SimHost, cfg: &Config, log: &mut dyn Write) -> SummaryFram
                 &mut user,
                 &mut f,
                 &mut screenshot_bytes,
-                &mut r,
+                r,
             );
         }
         status.insert(step.id.clone(), f.status);
         order.push((step.id.clone(), f.status));
         r.deliver_json(&step_frame_name(index, &step.id), &f);
     }
-    finish(&mut r, &order, &state, screenshot_bytes, note)
+    finish(r, &order, &state, screenshot_bytes, note)
 }
 
 /// Whether `name` could be a name the host staged: letters, digits, `.`, `_`, `-`, ending

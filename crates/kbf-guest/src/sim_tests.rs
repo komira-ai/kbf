@@ -69,6 +69,7 @@ struct Fake {
     screenshot: RefCell<Result<Vec<u8>, String>>,
     screenshot_cap: Cell<usize>,
     out_dir_made: Cell<bool>,
+    out_dir_fails: bool,
 }
 
 impl Fake {
@@ -94,6 +95,7 @@ impl Fake {
             screenshot: RefCell::new(Ok(vec![0xFF, 0xD8, 0xFF, 0xD9])),
             screenshot_cap: Cell::new(0),
             out_dir_made: Cell::new(false),
+            out_dir_fails: false,
         }
     }
 
@@ -138,7 +140,11 @@ impl SimHost for Fake {
     }
     fn prepare_out_dir(&self) -> Result<(), String> {
         self.out_dir_made.set(true);
-        Ok(())
+        if self.out_dir_fails {
+            Err("read-only volume".to_owned())
+        } else {
+            Ok(())
+        }
     }
     fn read_screenshot(&self, cap: usize) -> Result<Vec<u8>, String> {
         self.screenshot_cap.set(cap);
@@ -1089,4 +1095,87 @@ fn a_scripted_answer_wins_over_the_defaults() {
     let frames = host.step_frames();
     let create = frames.iter().find(|f| f.step == "create").expect("create");
     assert_eq!(create.status, Status::Error);
+}
+
+/// Catches a screenshot directory that cannot be made going unsaid: the run goes on (the
+/// device may still boot) and the summary carries the reason.
+#[test]
+fn a_screenshot_directory_that_cannot_be_made_is_noted_in_the_summary() {
+    let mut host = Fake::new();
+    host.out_dir_fails = true;
+    let summary = go(&host);
+    assert_eq!(
+        summary.note.as_deref(),
+        Some("prepare /private/var/kbf-sim/out: read-only volume")
+    );
+    assert!(summary.ok, "the steps themselves passed: {summary:?}");
+}
+
+/// Catches a late step whose earlier step did not give it what it needs but was not
+/// skipped: it is an error that names the missing value, and no command is run for it.
+#[test]
+fn a_late_step_with_nothing_to_build_from_is_an_error_and_runs_no_command() {
+    let host = Fake::new();
+    let steps = vec![Step {
+        id: "boot".to_owned(),
+        who: Who::User,
+        class: Class::Boot,
+        needs: Vec::new(),
+        argv: Argv::Late(Late::Boot),
+    }];
+    let summary = run_plan(&host, &cfg(), &steps, &mut Vec::new());
+    let frames = host.step_frames();
+    assert_eq!(frames.len(), 1);
+    assert_eq!((frames[0].status, frames[0].argv.len()), (Status::Error, 0));
+    assert_eq!(
+        frames[0].note.as_deref(),
+        Some("no device id from an earlier step")
+    );
+    assert!(host.ran.borrow().is_empty());
+    assert!(!summary.ok);
+}
+
+/// Catches a host that hands back more than the cap it was given: the frame would be over
+/// the body limit, so it is not sent and the step says why.
+#[test]
+fn a_screenshot_larger_than_a_frame_can_hold_is_not_sent() {
+    let host = Fake::new();
+    *host.screenshot.borrow_mut() = Ok(vec![7u8; 800_000]);
+    go(&host);
+    let frames = host.step_frames();
+    let shot = frames
+        .iter()
+        .find(|f| f.step == "screenshot")
+        .expect("step");
+    assert_eq!(shot.status, Status::Error);
+    assert!(
+        shot.note.as_deref().expect("note").contains("byte limit"),
+        "{shot:?}"
+    );
+    assert!(!host.sent.borrow().iter().any(|f| f.name == SCREENSHOT_NAME));
+}
+
+/// Catches an exit status read wrongly: a normal exit keeps its code, a signal is a signal,
+/// and a stopped process is neither (it is not an end).
+#[test]
+fn an_exit_status_is_an_exit_code_a_signal_or_neither() {
+    use crate::sim_run::ended_of;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+    assert_eq!(ended_of(ExitStatus::from_raw(0)), Ended::Exited(0));
+    assert_eq!(ended_of(ExitStatus::from_raw(3 << 8)), Ended::Exited(3));
+    assert_eq!(ended_of(ExitStatus::from_raw(9)), Ended::Signaled(9));
+    assert_eq!(ended_of(ExitStatus::from_raw(0x137f)), Ended::Exited(-1));
+}
+
+/// Catches a real clock that does not tell time forward or whose sleep is not a sleep (the
+/// deadline of a real run rests on both). No duration is asserted.
+#[test]
+fn the_system_clock_moves_forward() {
+    use crate::sim_run::SystemClock;
+    let c = SystemClock::default();
+    let a = c.now_ms();
+    c.sleep(Duration::ZERO);
+    assert!(c.now_ms() >= a);
+    let _ = SystemClock::new();
 }

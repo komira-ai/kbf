@@ -354,13 +354,10 @@ pub fn setup(sys: &dyn System, base: &Path, args: &SetupArgs) -> Report {
     if !staging.is_empty() {
         files.extend(guest::sim_payload());
     }
-    let written = if files.is_empty() {
-        None
-    } else {
-        match sys.offline_write(&disk, &files) {
-            Ok(observed) => Some(observed),
-            Err(e) => return Report::error(probe, format!("offline setup: {e}")),
-        }
+    // At least one of the two was given: the check above refused the rest.
+    let written = match sys.offline_write(&disk, &files) {
+        Ok(observed) => observed,
+        Err(e) => return Report::error(probe, format!("offline setup: {e}")),
     };
     let staged = if staging.is_empty() {
         None
@@ -370,9 +367,9 @@ pub fn setup(sys: &dyn System, base: &Path, args: &SetupArgs) -> Report {
             Err(e) => return Report::error(probe, format!("staging: {e}")),
         }
     };
-    let what = match (&written, &staged) {
-        (Some(_), Some(_)) => "the probe launch daemons and the staged Xcode inputs are",
-        (None, Some(_)) => "the staged Xcode inputs are",
+    let what = match (args.guest_binary.is_some(), staged.is_some()) {
+        (true, true) => "the probe launch daemons and the staged Xcode inputs are",
+        (false, true) => "the simulator launch daemon and the staged Xcode inputs are",
         _ => "the probe launch daemons are",
     };
     Report::ok(
@@ -575,6 +572,23 @@ mod tests {
         let installs = sys.installs.borrow();
         assert_eq!((installs.len(), installs[0].2.disk_gib), (1, 64));
         assert!(sys.offline_calls.borrow().is_empty());
+    }
+
+    /// Catches a failure to write the size record throwing away an install that took an
+    /// hour, or going unreported: the bundle stays and the details say what failed.
+    #[test]
+    fn a_size_record_that_cannot_be_written_is_reported_and_the_bundle_stays() {
+        let dir = tmp("image-sizing-fail");
+        let sys = FakeSystem::new();
+        // A directory where the record goes, so that writing the file fails whoever runs this.
+        *sys.after_install.borrow_mut() = Some(Box::new(|out| {
+            std::fs::create_dir(out.join("sizing.json")).expect("dir")
+        }));
+        let r = base(&sys, &args(&dir, &ipsw_file(&dir), HELLO));
+        assert_eq!(r.status, Status::Ok, "{r:?}");
+        let e = r.details["sizing_record_error"].as_str().expect("error");
+        assert!(e.starts_with("write sizing.json: "), "{e}");
+        assert!(dir.join("out").exists());
     }
 
     /// Catches an installer failure reported as success.

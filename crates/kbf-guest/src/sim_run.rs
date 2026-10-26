@@ -7,7 +7,7 @@
 use std::io::Read;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -85,20 +85,21 @@ impl Capture {
         let (tx, done) = mpsc::channel();
         let into = Arc::clone(&shared);
         thread::spawn(move || {
-            if let Some(mut r) = pipe {
+            // The pipe is there when the child was started with one; a missing one reads as empty.
+            pipe.into_iter().for_each(|mut r| {
                 let mut buf = [0u8; 16 * 1024];
                 loop {
                     match r.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            let Ok(mut c) = into.lock() else { break };
+                            let mut c = into.lock().unwrap_or_else(PoisonError::into_inner);
                             let room = MAX_CAPTURE_BYTES - c.bytes.len();
                             c.bytes.extend_from_slice(&buf[..n.min(room)]);
                             c.cut |= n > room;
                         }
                     }
                 }
-            }
+            });
             let _ = tx.send(());
         });
         Self { shared, done }
@@ -107,10 +108,8 @@ impl Capture {
     /// What was read, once the pipe closed or [`DRAIN`] passed.
     fn finish(&self) -> (Vec<u8>, bool) {
         let _ = self.done.recv_timeout(DRAIN);
-        self.shared
-            .lock()
-            .map(|c| (c.bytes.clone(), c.cut))
-            .unwrap_or_default()
+        let c = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        (c.bytes.clone(), c.cut)
     }
 }
 
@@ -162,23 +161,14 @@ impl<C: Clock> ProcessRunner<C> {
         );
         let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
         let ended = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    break match (status.code(), status.signal()) {
-                        (Some(code), _) => Ended::Exited(code),
-                        (None, Some(sig)) => Ended::Signaled(sig),
-                        (None, None) => Ended::Exited(-1),
-                    };
-                }
-                Ok(None) if elapsed(&self.clock) >= deadline_ms => {
+            // A wait that fails reads as "still running": the deadline then ends the command.
+            match child.try_wait().unwrap_or(None) {
+                Some(status) => break ended_of(status),
+                None if elapsed(&self.clock) >= deadline_ms => {
                     kill_group(&mut child);
                     break Ended::TimedOut;
                 }
-                Ok(None) => self.clock.sleep(POLL),
-                Err(e) => {
-                    kill_group(&mut child);
-                    break Ended::SpawnFailed(format!("wait for {program}: {e}"));
-                }
+                None => self.clock.sleep(POLL),
             }
         };
         let ms = elapsed(&self.clock);
@@ -193,49 +183,54 @@ impl<C: Clock> ProcessRunner<C> {
     }
 }
 
+/// How a command ended, from its exit status.
+#[must_use]
+pub fn ended_of(status: std::process::ExitStatus) -> Ended {
+    match (status.code(), status.signal()) {
+        (Some(code), _) => Ended::Exited(code),
+        (None, Some(sig)) => Ended::Signaled(sig),
+        // Stopped, not ended; a command is not run under a debugger.
+        (None, None) => Ended::Exited(-1),
+    }
+}
+
 /// Kills the child's process group and reaps the child.
 fn kill_group(child: &mut Child) {
-    if let Ok(pid) = i32::try_from(child.id()) {
-        // SAFETY: `killpg` takes a process group id and a signal; the child was started as the
-        // leader of its own group, so this reaches it and what it started, nothing else.
-        unsafe { libc::killpg(pid, libc::SIGKILL) };
-    }
+    // A process id fits `pid_t`; the largest value names no group, so a failed conversion
+    // kills nothing but the child itself below.
+    let pid = libc::pid_t::try_from(child.id()).unwrap_or(libc::pid_t::MAX);
+    // SAFETY: `killpg` takes a process group id and a signal; the child was started as the
+    // leader of its own group, so this reaches it and what it started, nothing else.
+    unsafe { libc::killpg(pid, libc::SIGKILL) };
     let _ = child.kill();
     let _ = child.wait();
 }
 
 /// Reads the file at `path` when it is a regular file of at most `cap` bytes; a link, a
-/// pipe, a device or a larger file is an error and nothing is read from it.
+/// pipe, a device or a larger file is an error (at most `cap` + 1 bytes are read).
 ///
 /// # Errors
 /// Why the file was not read.
 pub fn read_regular(path: &std::path::Path, cap: usize) -> Result<Vec<u8>, String> {
     use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|e| format!("open {}: {e}", path.display()))?;
-    let meta = file
-        .metadata()
-        .map_err(|e| format!("stat {}: {e}", path.display()))?;
-    if !meta.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
+    let read = || -> std::io::Result<Option<Vec<u8>>> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        if !file.metadata()?.is_file() {
+            return Ok(None);
+        }
+        let mut bytes = Vec::new();
+        // One byte past the cap tells a file over it from one exactly at it.
+        file.take(cap as u64 + 1).read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
+    };
+    match read().map_err(|e| format!("read {}: {e}", path.display()))? {
+        None => Err(format!("{} is not a regular file", path.display())),
+        Some(bytes) if bytes.len() > cap => {
+            Err(format!("{} is over the {cap} byte cap", path.display()))
+        }
+        Some(bytes) => Ok(bytes),
     }
-    if meta.len() > cap as u64 {
-        return Err(format!(
-            "{} is {} bytes, over the {cap} byte cap",
-            path.display(),
-            meta.len()
-        ));
-    }
-    let mut bytes = Vec::new();
-    // One byte past the cap: a file that grew since the stat is caught.
-    file.take(cap as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    if bytes.len() > cap {
-        return Err(format!("{} grew past the {cap} byte cap", path.display()));
-    }
-    Ok(bytes)
 }

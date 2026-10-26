@@ -122,17 +122,16 @@ pub fn decode_screenshot(frame: &Value) -> Result<Picture, String> {
 
 /// Writes `bytes` to the new file `path` (any file of ours from an earlier run is replaced;
 /// a link is not followed), readable by the owner only.
-fn write_picture(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_picture(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     guest::remove_leftover(path);
-    let mut f = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(path)
-        .map_err(|e| format!("create {}: {e}", path.display()))?;
-    f.write_all(bytes)
+        .and_then(|mut f| f.write_all(bytes))
         .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
@@ -197,9 +196,7 @@ fn start_arm(ctx: &Ctx<'_>, name: &str, graphics: bool) -> Result<(Vm, Arm), Str
 fn observe(ctx: &Ctx<'_>, vm: &mut Vm, arm: &mut Arm) {
     let began = Instant::now();
     loop {
-        if vm.ended.is_none() {
-            vm.watch(ctx.timing.tick, ctx.timing.tick, false);
-        }
+        vm.watch(ctx.timing.tick, ctx.timing.tick, false);
         arm.received.look(&arm.share.received);
         if arm.received.summary.is_some()
             || vm.ended.is_some()
@@ -244,8 +241,7 @@ fn problems(received: &Received) -> Vec<String> {
             },
             Status::Timeout => format!("{} (timeout)", f.step),
             Status::Error => format!("{} (error)", f.step),
-            Status::Skipped => format!("{} (skipped)", f.step),
-            Status::Ok => String::new(),
+            Status::Skipped | Status::Ok => format!("{} (skipped)", f.step),
         })
         .collect()
 }
@@ -289,23 +285,28 @@ fn arm_json(ctx: &Ctx<'_>, vm: &Vm, arm: &Arm, picture: &Value) -> Value {
     })
 }
 
-/// Decodes and writes the screenshot the guest sent; what happened, as JSON.
-fn save_picture(ctx: &Ctx<'_>, arm: &Arm) -> Value {
-    let Some(frame) = &arm.received.screenshot else {
-        return Value::Null;
-    };
+/// Decodes the screenshot frame and writes the picture to `path`; what happened, as JSON.
+pub(crate) fn picture_json(frame: &Value, path: &Path) -> Value {
     match decode_screenshot(frame) {
         Err(e) => json!({"written": null, "error": e}),
-        Ok(p) => {
-            let path = ctx.work.join(format!("{}-screenshot.jpg", arm.name));
-            match write_picture(&path, &p.bytes) {
-                Ok(()) => {
-                    json!({"written": path, "bytes": p.bytes.len(), "jpeg_signature": p.jpeg})
-                }
-                Err(e) => json!({"written": null, "bytes": p.bytes.len(), "error": e}),
-            }
-        }
+        Ok(p) => match write_picture(path, &p.bytes) {
+            Ok(()) => json!({"written": path, "bytes": p.bytes.len(), "jpeg_signature": p.jpeg}),
+            Err(e) => json!({"written": null, "bytes": p.bytes.len(), "error": e}),
+        },
     }
+}
+
+/// The screenshot the guest sent, written next to the clones; what happened, as JSON.
+fn save_picture(ctx: &Ctx<'_>, arm: &Arm) -> Value {
+    arm.received
+        .screenshot
+        .as_ref()
+        .map_or(Value::Null, |frame| {
+            picture_json(
+                frame,
+                &ctx.work.join(format!("{}-screenshot.jpg", arm.name)),
+            )
+        })
 }
 
 fn one_line(arm: &Value) -> String {
