@@ -678,7 +678,11 @@ order, each a frame `mkuser-step-NN-<step>.json` of the same shape as the simula
 | `kcpassword` | writes `/etc/kcpassword`, mode 0600, root: the password XORed with the fixed 11-byte key, zero-padded to a multiple of 12 bytes |
 | `autologin` | `defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser -string <name>` |
 | `pmset` | `pmset -a sleep 0 displaysleep 0 disksleep 0` |
-| `screensaver-idle`, `screensaver-lock` | as the user: `defaults -currentHost write com.apple.screensaver idleTime -int 0`; `defaults write com.apple.screensaver askForPassword -int 0` |
+| `hw-uuid` | `ioreg -rd1 -c IOPlatformExpertDevice`; the step keeps the `IOPlatformUUID` (8-4-4-4-12 hex digits, else the step fails) |
+| `prefs-dirs` | makes `/Users/<name>/Library`, `.../Library/Preferences` and `.../Library/Preferences/ByHost` if missing, each owned by the user, mode 0700; a link or a file in the way is refused (opened without following links) |
+| `screensaver-idle`, `screensaver-lock` | the user has never logged in, so no preferences service runs for it and `defaults <domain>` (or `sudo -u <name> defaults`) cannot write. These write the files **by path, as root**: `defaults write /Users/<name>/Library/Preferences/ByHost/com.apple.screensaver.<IOPlatformUUID> idleTime -int 0` and `defaults write /Users/<name>/Library/Preferences/com.apple.screensaver askForPassword -int 0` |
+| `screensaver-own` | gives both `.plist` files to the user (its primary group), mode 0600, through the open handle (links refused) |
+| `loginwindow-idle` | `defaults write /Library/Preferences/com.apple.screensaver loginWindowIdleTime -int 0` |
 | `updates-check`, `updates-download`, `updates-os`, `updates-critical` | `defaults write /Library/Preferences/com.apple.SoftwareUpdate` `AutomaticCheckEnabled`, `AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`, `CriticalUpdateInstall`, each `-bool false` |
 | `ready-marker` | writes `/private/var/kbf-sim/user-ready` (the name), only when every other step succeeded |
 

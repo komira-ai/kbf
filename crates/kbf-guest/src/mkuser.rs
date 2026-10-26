@@ -11,7 +11,10 @@
 //! 2. create the home directory (`createhomedir`);
 //! 3. write `/etc/kcpassword` (the obfuscated password, [`kcpassword`]), mode 0600, owned
 //!    by root, and set `autoLoginUser` in the login window's preferences;
-//! 4. turn off sleep, the screen saver and its lock, and the update checks;
+//! 4. turn off sleep, the screen saver and its lock (the user's preference files are
+//!    written by path, as root, then given to the user: the new user has never logged in,
+//!    so no preferences service runs for it and `defaults <domain>` cannot write), the
+//!    login window's idle time, and the update checks;
 //! 5. write [`simpaths::USER_READY`] with the user's name.
 //!
 //! Then the guest is powered off (`/sbin/shutdown -h now`), so that the base's disk is
@@ -80,7 +83,10 @@ const DSCL: &str = "/usr/bin/dscl";
 const CREATEHOMEDIR: &str = "/usr/sbin/createhomedir";
 const DEFAULTS: &str = "/usr/bin/defaults";
 const PMSET: &str = "/usr/bin/pmset";
-const SUDO: &str = "/usr/bin/sudo";
+const IOREG: &str = "/usr/sbin/ioreg";
+const SCREENSAVER: &str = "com.apple.screensaver";
+/// The system-wide screen saver preferences (the login window's idle time).
+const SYSTEM_SCREENSAVER: &str = "/Library/Preferences/com.apple.screensaver";
 const LOGINWINDOW: &str = "/Library/Preferences/com.apple.loginwindow";
 const SOFTWAREUPDATE: &str = "/Library/Preferences/com.apple.SoftwareUpdate";
 /// The key `kcpassword` is obfuscated with (the documented, fixed one).
@@ -142,6 +148,10 @@ pub fn password_from(random: &[u8]) -> String {
 pub enum Arg {
     Text(String),
     Password,
+    /// The path of a user's per-host preference file (`<dir>/<domain>.<hardware UUID><ext>`),
+    /// given the directory, the domain and the extension; the UUID comes from the
+    /// `hw-uuid` step.
+    ByHost(String, String, String),
 }
 
 /// What a step does.
@@ -149,6 +159,13 @@ pub enum Arg {
 pub enum Action {
     /// Run a command.
     Run(Vec<Arg>),
+    /// Run `ioreg` and keep the hardware UUID its output names.
+    ReadHardwareUuid(Vec<String>),
+    /// Make these directories (each below the user's home) if missing, owned by the user,
+    /// with `mode`; a link or a file where one is wanted is refused.
+    MakeDirs(Vec<String>, u32),
+    /// Give these files to the user, with `mode`; a link or a missing file is refused.
+    GiveFiles(Vec<Arg>, u32),
     /// Write `/etc/kcpassword`.
     WriteKcpassword,
     /// Write [`simpaths::USER_READY`].
@@ -181,6 +198,10 @@ fn step(id: &str, needs: &[&str], action: Action) -> Step {
 #[must_use]
 pub fn plan(name: &str, exists: bool) -> Vec<Step> {
     let home = format!("/Users/{name}");
+    let library = format!("{home}/Library");
+    let prefs = format!("{library}/Preferences");
+    let byhost = format!("{prefs}/ByHost");
+    let lock_domain = format!("{prefs}/{SCREENSAVER}");
     let user_step = if exists { "set-password" } else { "add-user" };
     let make_user = if exists {
         let mut argv = text(&[DSCL, ".", "-passwd", &home]);
@@ -198,11 +219,6 @@ pub fn plan(name: &str, exists: bool) -> Vec<Step> {
         argv.push(Arg::Password);
         argv.extend(text(&["-home", &home]));
         step(user_step, &[], Action::Run(argv))
-    };
-    let as_user = |extra: &[&str]| {
-        let mut v = vec![SUDO, "-u", name, "-H", "--", DEFAULTS];
-        v.extend_from_slice(extra);
-        Action::Run(text(&v))
     };
     let system = |domain: &str, key: &str| {
         Action::Run(text(&[DEFAULTS, "write", domain, key, "-bool", "false"]))
@@ -242,27 +258,65 @@ pub fn plan(name: &str, exists: bool) -> Vec<Step> {
             ])),
         ),
         step(
-            "screensaver-idle",
+            "hw-uuid",
+            &[],
+            Action::ReadHardwareUuid(
+                [IOREG, "-rd1", "-c", "IOPlatformExpertDevice"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            ),
+        ),
+        step(
+            "prefs-dirs",
             &["home"],
-            as_user(&[
-                "-currentHost",
-                "write",
-                "com.apple.screensaver",
-                "idleTime",
-                "-int",
-                "0",
+            Action::MakeDirs(vec![library, prefs, byhost.clone()], 0o700),
+        ),
+        step(
+            "screensaver-idle",
+            &["prefs-dirs", "hw-uuid"],
+            Action::Run(vec![
+                Arg::Text(DEFAULTS.to_owned()),
+                Arg::Text("write".to_owned()),
+                Arg::ByHost(byhost.clone(), SCREENSAVER.to_owned(), String::new()),
+                Arg::Text("idleTime".to_owned()),
+                Arg::Text("-int".to_owned()),
+                Arg::Text("0".to_owned()),
             ]),
         ),
         step(
             "screensaver-lock",
-            &["home"],
-            as_user(&[
+            &["prefs-dirs"],
+            Action::Run(text(&[
+                DEFAULTS,
                 "write",
-                "com.apple.screensaver",
+                &lock_domain,
                 "askForPassword",
                 "-int",
                 "0",
-            ]),
+            ])),
+        ),
+        step(
+            "screensaver-own",
+            &["screensaver-idle", "screensaver-lock"],
+            Action::GiveFiles(
+                vec![
+                    Arg::Text(format!("{lock_domain}.plist")),
+                    Arg::ByHost(byhost, SCREENSAVER.to_owned(), ".plist".to_owned()),
+                ],
+                0o600,
+            ),
+        ),
+        step(
+            "loginwindow-idle",
+            &[],
+            Action::Run(text(&[
+                DEFAULTS,
+                "write",
+                SYSTEM_SCREENSAVER,
+                "loginWindowIdleTime",
+                "-int",
+                "0",
+            ])),
         ),
         step(
             "updates-check",
@@ -292,6 +346,8 @@ pub fn plan(name: &str, exists: bool) -> Vec<Step> {
                 "pmset",
                 "screensaver-idle",
                 "screensaver-lock",
+                "screensaver-own",
+                "loginwindow-idle",
                 "updates-check",
                 "updates-download",
                 "updates-os",
@@ -358,6 +414,14 @@ pub trait MkUserHost {
     /// # Errors
     /// The file could not be written.
     fn write_file(&self, path: &str, bytes: &[u8], mode: u32) -> Result<(), String>;
+    /// Makes the directory `path` (its parent is there) if it is missing, then gives it to
+    /// the user `user` (the user's primary group) with `mode`; with `file`, `path` must be a
+    /// regular file already. A link, or anything of the other kind, is refused and nothing
+    /// is followed.
+    ///
+    /// # Errors
+    /// Why it could not.
+    fn give_to_user(&self, path: &str, user: &str, mode: u32, file: bool) -> Result<(), String>;
     /// Runs `argv` (no shell) and waits for it, at most `deadline`.
     fn run(&self, argv: &[String], deadline: Duration) -> Outcome;
     /// One attempt to send `frame` to the host on `port` and read the reply.
@@ -501,27 +565,54 @@ fn execute(
     cfg: &Config,
     name: &str,
     password: &str,
+    uuid: &mut Option<String>,
     s: &Step,
     f: &mut StepFrame,
 ) {
+    let known = uuid.clone();
+    // An argument as shown in a frame (`shown`) or as run; a per-host path needs the UUID.
+    let arg = |a: &Arg, shown: bool| match a {
+        Arg::Text(t) => Some(t.clone()),
+        Arg::Password => Some(if shown { WITHHELD } else { password }.to_owned()),
+        Arg::ByHost(dir, domain, ext) => {
+            known.as_deref().map(|u| format!("{dir}/{domain}.{u}{ext}"))
+        }
+    };
     match &s.action {
         Action::Run(args) => {
-            f.argv = args
-                .iter()
-                .map(|a| match a {
-                    Arg::Text(t) => t.clone(),
-                    Arg::Password => WITHHELD.to_owned(),
-                })
-                .collect();
-            let argv: Vec<String> = args
-                .iter()
-                .map(|a| match a {
-                    Arg::Text(t) => t.clone(),
-                    Arg::Password => password.to_owned(),
-                })
-                .collect();
+            let shown: Option<Vec<String>> = args.iter().map(|a| arg(a, true)).collect();
+            let argv: Option<Vec<String>> = args.iter().map(|a| arg(a, false)).collect();
+            let (Some(shown), Some(argv)) = (shown, argv) else {
+                f.status = Status::Error;
+                f.note = Some("the hardware UUID is not known".to_owned());
+                return;
+            };
+            f.argv = shown;
             let out = host.run(&argv, cfg.quick);
             record(f, &out, cfg, password);
+        }
+        Action::ReadHardwareUuid(argv) => {
+            f.argv.clone_from(argv);
+            let out = host.run(argv, cfg.quick);
+            record(f, &out, cfg, "");
+            if f.status == Status::Ok {
+                *uuid = parse_platform_uuid(&String::from_utf8_lossy(&out.stdout));
+                if uuid.is_none() {
+                    f.status = Status::Error;
+                    f.note = Some("ioreg named no IOPlatformUUID".to_owned());
+                }
+            }
+        }
+        Action::MakeDirs(paths, mode) => give(host, f, name, paths, *mode, false),
+        Action::GiveFiles(args, mode) => {
+            let paths: Option<Vec<String>> = args.iter().map(|a| arg(a, false)).collect();
+            match paths {
+                Some(p) => give(host, f, name, &p, *mode, true),
+                None => {
+                    f.status = Status::Error;
+                    f.note = Some("the hardware UUID is not known".to_owned());
+                }
+            }
         }
         Action::WriteKcpassword => {
             f.argv = vec![
@@ -554,6 +645,52 @@ fn execute(
             );
         }
     }
+}
+
+/// The hardware UUID `ioreg -rd1 -c IOPlatformExpertDevice` names: the value of its
+/// `"IOPlatformUUID" = "..."` line, when that is the usual 8-4-4-4-12 hex digits (so that it
+/// is safe in a file name).
+#[must_use]
+pub fn parse_platform_uuid(ioreg: &str) -> Option<String> {
+    ioreg.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("\"IOPlatformUUID\"")?;
+        let value = rest.trim_start().strip_prefix('=')?.trim();
+        let uuid = value.strip_prefix('"')?.strip_suffix('"')?;
+        let groups: Vec<&str> = uuid.split('-').collect();
+        let shape = [8, 4, 4, 4, 12];
+        let good = groups.len() == shape.len()
+            && groups
+                .iter()
+                .zip(shape)
+                .all(|(g, n)| g.len() == n && g.bytes().all(|b| b.is_ascii_hexdigit()));
+        good.then(|| uuid.to_owned())
+    })
+}
+
+/// Gives each of `paths` to `user`; stops at the first that cannot be.
+fn give(
+    host: &dyn MkUserHost,
+    f: &mut StepFrame,
+    user: &str,
+    paths: &[String],
+    mode: u32,
+    file: bool,
+) {
+    f.argv = ["give", if file { "file" } else { "dir" }, user]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .chain([mode_text(mode)])
+        .chain(paths.iter().cloned())
+        .collect();
+    for p in paths {
+        if let Err(e) = host.give_to_user(p, user, mode, file) {
+            f.status = Status::Error;
+            f.note = Some(format!("give {p} to {user}: {e}"));
+            return;
+        }
+    }
+    f.status = Status::Ok;
+    f.exit = Some(0);
 }
 
 fn write(host: &dyn MkUserHost, f: &mut StepFrame, path: &str, bytes: &[u8], mode: u32) {
@@ -624,11 +761,12 @@ pub fn run(host: &dyn MkUserHost, cfg: &Config, name: &str, log: &mut dyn Write)
     summary.created = !exists;
     let steps = plan(name, exists);
     let mut status: BTreeMap<String, Status> = BTreeMap::new();
+    let mut uuid: Option<String> = None;
     for (index, s) in steps.iter().enumerate() {
         let blame = s.needs.iter().find(|n| status.get(*n) != Some(&Status::Ok));
         let mut f = blank_frame(index, s, blame, cfg);
         if blame.is_none() {
-            execute(host, cfg, name, &password, s, &mut f);
+            execute(host, cfg, name, &password, &mut uuid, s, &mut f);
         }
         status.insert(s.id.clone(), f.status);
         summary.steps.push((s.id.clone(), f.status));

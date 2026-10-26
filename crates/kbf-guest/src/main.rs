@@ -869,10 +869,18 @@ mod tests {
         fn write_file(&self, _: &str, _: &[u8], _: u32) -> Result<(), String> {
             Ok(())
         }
-        fn run(&self, _: &[String], _: std::time::Duration) -> sim::Outcome {
+        fn give_to_user(&self, _: &str, _: &str, _: u32, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn run(&self, argv: &[String], _: std::time::Duration) -> sim::Outcome {
+            let ioreg = argv.first().is_some_and(|a| a.ends_with("/ioreg"));
             sim::Outcome {
                 ended: sim::Ended::Exited(0),
-                stdout: Vec::new(),
+                stdout: if ioreg {
+                    b"\"IOPlatformUUID\" = \"1A2B3C4D-0000-4EEF-8123-ABCDEF012345\"\n".to_vec()
+                } else {
+                    Vec::new()
+                },
                 stderr: Vec::new(),
                 cut: false,
                 ms: 1,

@@ -52,9 +52,12 @@ pub fn recorded_user(path: &str) -> Option<String> {
 
 /// Whether the system has a user called `name`.
 fn has_user(name: &str) -> bool {
-    let Ok(c_name) = CString::new(name) else {
-        return false;
-    };
+    user_ids(name).is_some()
+}
+
+/// The user id and the primary group id of the user called `name`.
+fn user_ids(name: &str) -> Option<(u32, u32)> {
+    let c_name = CString::new(name).ok()?;
     let mut buf = vec![0u8; 4096];
     let mut pwd = std::mem::MaybeUninit::<libc::passwd>::zeroed();
     let mut found: *mut libc::passwd = std::ptr::null_mut();
@@ -70,7 +73,43 @@ fn has_user(name: &str) -> bool {
             &mut found,
         )
     };
-    rc == 0 && !found.is_null()
+    if rc != 0 || found.is_null() {
+        return None;
+    }
+    // SAFETY: `found` is non-null, so `getpwnam_r` filled `pwd`.
+    let pwd = unsafe { pwd.assume_init() };
+    Some((pwd.pw_uid, pwd.pw_gid))
+}
+
+/// Makes `path` (a directory when `file` is false) if missing, and gives it to `user` with
+/// `mode`. The path is opened without following a link and the owner and mode are set on
+/// the open handle, so a link planted there is refused, not followed.
+fn give(path: &str, user: &str, mode: u32, file: bool) -> Result<(), String> {
+    let (uid, gid) = user_ids(user).ok_or_else(|| format!("no user {user}"))?;
+    let p = Path::new(path);
+    if !file
+        && std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    {
+        std::fs::create_dir(p).map_err(|e| format!("create {path}: {e}"))?;
+    }
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(p)
+        .map_err(|e| format!("open {path}: {e}"))?;
+    let meta = handle.metadata().map_err(|e| format!("stat {path}: {e}"))?;
+    if file != meta.is_file() || (!file && !meta.is_dir()) {
+        return Err(format!(
+            "{path} is not a {}",
+            if file { "regular file" } else { "directory" }
+        ));
+    }
+    std::os::unix::fs::fchown(&handle, Some(uid), Some(gid))
+        .map_err(|e| format!("chown {path}: {e}"))?;
+    handle
+        .set_permissions(std::fs::Permissions::from_mode(mode))
+        .map_err(|e| format!("chmod {path}: {e}"))?;
+    Ok(())
 }
 
 impl MkUserHost for RealMkUserHost {
@@ -119,6 +158,10 @@ impl MkUserHost for RealMkUserHost {
             let _ = std::fs::remove_file(&part);
         }
         written.map_err(|e| format!("write {}: {e}", path.display()))
+    }
+
+    fn give_to_user(&self, path: &str, user: &str, mode: u32, file: bool) -> Result<(), String> {
+        give(path, user, mode, file)
     }
 
     fn run(&self, argv: &[String], deadline: Duration) -> crate::sim::Outcome {

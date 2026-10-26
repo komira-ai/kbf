@@ -18,6 +18,15 @@ const RANDOM: [u8; 11] = [
 ];
 /// `RANDOM` as the password: lowercase hex.
 const PASSWORD: &str = "00010a0f107f80abcdefff";
+/// The hardware UUID the fake `ioreg` names.
+const UUID: &str = "1A2B3C4D-0000-4EEF-8123-ABCDEF012345";
+
+/// What `ioreg -rd1 -c IOPlatformExpertDevice` prints, in the part that matters.
+fn ioreg_text(uuid: &str) -> String {
+    format!(
+        "+-o Root  <class IORegistryEntry>\n  +-o VirtualMac2,1  <class IOPlatformExpertDevice>\n    {{\n      \"IOPlatformSerialNumber\" = \"ZZ0\"\n      \"IOPlatformUUID\" = \"{uuid}\"\n      \"manufacturer\" = <\"Apple Inc.\">\n    }}\n"
+    )
+}
 
 /// What the host was asked, in the order it was asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +34,8 @@ enum Call {
     Random(usize),
     Run(Vec<String>),
     Write(String, Vec<u8>, u32),
+    /// `(path, user, mode, file)`
+    Give(String, String, u32, bool),
     Send(String),
 }
 
@@ -37,6 +48,8 @@ struct Fake {
     answers: RefCell<Vec<(String, Outcome)>>,
     /// Paths whose write fails.
     write_fails: Option<String>,
+    /// Paths that cannot be given to the user.
+    give_fails: Option<String>,
     calls: RefCell<Vec<Call>>,
     sent: RefCell<Vec<Frame>>,
     down: bool,
@@ -62,6 +75,7 @@ impl Fake {
             random: Ok(RANDOM.to_vec()),
             answers: RefCell::new(Vec::new()),
             write_fails: None,
+            give_fails: None,
             calls: RefCell::new(Vec::new()),
             sent: RefCell::new(Vec::new()),
             down: false,
@@ -138,14 +152,29 @@ impl MkUserHost for Fake {
             Ok(())
         }
     }
+    fn give_to_user(&self, path: &str, user: &str, mode: u32, file: bool) -> Result<(), String> {
+        self.calls
+            .borrow_mut()
+            .push(Call::Give(path.to_owned(), user.to_owned(), mode, file));
+        if self.give_fails.as_deref() == Some(path) {
+            Err("is a link".to_owned())
+        } else {
+            Ok(())
+        }
+    }
     fn run(&self, argv: &[String], _deadline: Duration) -> Outcome {
         self.calls.borrow_mut().push(Call::Run(argv.to_vec()));
         let line = argv.join(" ");
+        let default = if line.contains("/ioreg") {
+            out(Ended::Exited(0), &ioreg_text(UUID), "")
+        } else {
+            out(Ended::Exited(0), "", "")
+        };
         self.answers
             .borrow()
             .iter()
             .find(|(text, _)| line.contains(text.as_str()))
-            .map_or_else(|| out(Ended::Exited(0), "", ""), |(_, o)| o.clone())
+            .map_or(default, |(_, o)| o.clone())
     }
     fn send(&self, _port: u32, frame: &Frame) -> Result<(), SendError> {
         self.calls.borrow_mut().push(Call::Send(frame.name.clone()));
@@ -185,11 +214,12 @@ fn ids(steps: &[Step]) -> Vec<&str> {
 
 fn shown(steps: &[Step], id: &str) -> Vec<String> {
     match &steps.iter().find(|s| s.id == id).expect(id).action {
-        Action::Run(a) => a
+        Action::Run(a) | Action::GiveFiles(a, _) => a
             .iter()
             .map(|a| match a {
                 Arg::Text(t) => t.clone(),
                 Arg::Password => "<PW>".to_owned(),
+                Arg::ByHost(d, n, e) => format!("<{d}/{n}.UUID{e}>"),
             })
             .collect(),
         other => panic!("{id} is {other:?}"),
@@ -219,8 +249,12 @@ fn the_plan_creates_a_standard_user_then_auto_login_then_the_marker() {
             "kcpassword",
             "autologin",
             "pmset",
+            "hw-uuid",
+            "prefs-dirs",
             "screensaver-idle",
             "screensaver-lock",
+            "screensaver-own",
+            "loginwindow-idle",
             "updates-check",
             "updates-download",
             "updates-os",
@@ -234,10 +268,13 @@ fn the_plan_creates_a_standard_user_then_auto_login_then_the_marker() {
             assert!(at < i, "{} needs {need}, which comes later", s.id);
         }
     }
-    // The marker is last and waits for everything but the two it follows through others.
+    // The marker is last and waits for every step but the five it follows through others.
     let last = steps.last().expect("steps");
     assert_eq!(last.action, Action::WriteReady);
-    assert_eq!(last.needs.len(), steps.len() - 3);
+    assert_eq!(last.needs.len(), steps.len() - 5);
+    for through in ["add-user", "kcpassword", "hw-uuid", "prefs-dirs"] {
+        assert!(!last.needs.contains(&through.to_owned()), "{through}");
+    }
     assert_eq!(
         shown(&steps, "add-user"),
         strs(&[
@@ -281,27 +318,87 @@ fn the_plan_creates_a_standard_user_then_auto_login_then_the_marker() {
             "0"
         ])
     );
+    // The user's preferences are written by path, as root: no `sudo -u`, no domain name.
+    let prefs = format!("{}/Library/Preferences", home());
     assert_eq!(
         shown(&steps, "screensaver-idle"),
         strs(&[
-            "/usr/bin/sudo",
-            "-u",
-            "kbfuser",
-            "-H",
-            "--",
             "/usr/bin/defaults",
-            "-currentHost",
             "write",
-            "com.apple.screensaver",
+            &format!("<{prefs}/ByHost/com.apple.screensaver.UUID>"),
             "idleTime",
             "-int",
             "0"
         ])
     );
     assert_eq!(
-        shown(&steps, "screensaver-lock").last().map(String::as_str),
-        Some("0")
+        shown(&steps, "screensaver-lock"),
+        strs(&[
+            "/usr/bin/defaults",
+            "write",
+            &format!("{prefs}/com.apple.screensaver"),
+            "askForPassword",
+            "-int",
+            "0"
+        ])
     );
+    assert_eq!(
+        steps
+            .iter()
+            .find(|s| s.id == "hw-uuid")
+            .expect("hw-uuid")
+            .action,
+        Action::ReadHardwareUuid(strs(&[
+            "/usr/sbin/ioreg",
+            "-rd1",
+            "-c",
+            "IOPlatformExpertDevice"
+        ]))
+    );
+    assert_eq!(
+        shown(&steps, "loginwindow-idle"),
+        strs(&[
+            "/usr/bin/defaults",
+            "write",
+            "/Library/Preferences/com.apple.screensaver",
+            "loginWindowIdleTime",
+            "-int",
+            "0"
+        ])
+    );
+    assert_eq!(
+        shown(&steps, "screensaver-own"),
+        strs(&[
+            &format!("{prefs}/com.apple.screensaver.plist"),
+            &format!("<{prefs}/ByHost/com.apple.screensaver.UUID.plist>"),
+        ])
+    );
+    let sa = |id: &str| steps.iter().find(|s| s.id == id).expect(id);
+    assert_eq!(
+        sa("prefs-dirs").action,
+        Action::MakeDirs(
+            vec![
+                format!("{}/Library", home()),
+                prefs.clone(),
+                format!("{prefs}/ByHost")
+            ],
+            0o700
+        )
+    );
+    assert!(matches!(
+        sa("screensaver-own").action,
+        Action::GiveFiles(_, 0o600)
+    ));
+    assert_eq!(sa("screensaver-idle").needs, ["prefs-dirs", "hw-uuid"]);
+    assert_eq!(sa("screensaver-lock").needs, ["prefs-dirs"]);
+    assert_eq!(
+        sa("screensaver-own").needs,
+        ["screensaver-idle", "screensaver-lock"]
+    );
+    assert_eq!(sa("prefs-dirs").needs, ["home"]);
+    // Nothing runs as the user: its session does not exist yet.
+    assert!(!steps.iter().any(|s| matches!(&s.action, Action::Run(a)
+        if a.contains(&Arg::Text("/usr/bin/sudo".to_owned())))));
     for (id, key) in [
         ("updates-check", "AutomaticCheckEnabled"),
         ("updates-download", "AutomaticDownload"),
@@ -438,7 +535,7 @@ fn a_good_run_sends_a_frame_per_step_without_the_password_then_powers_off() {
     assert!(done.summary.ok && done.summary.created && !done.summary.already_ready);
     assert_eq!(done.power_off_started, Some(true));
     let frames = host.step_frames();
-    assert_eq!(frames.len(), 12);
+    assert_eq!(frames.len(), 16);
     assert!(
         frames
             .iter()
@@ -502,7 +599,7 @@ fn a_good_run_sends_a_frame_per_step_without_the_password_then_powers_off() {
     let s = host.summary();
     assert!(s.ok && s.created && s.powering_off && !s.already_ready);
     assert_eq!(s.user, "kbfuser");
-    assert_eq!(s.steps.len(), 12);
+    assert_eq!(s.steps.len(), 16);
     assert!(s.steps.iter().all(|(_, st)| *st == Status::Ok));
 }
 
@@ -568,15 +665,23 @@ fn a_failed_step_skips_what_needs_it_leaves_no_marker_and_still_powers_off() {
         "home",
         "kcpassword",
         "autologin",
+        "prefs-dirs",
         "screensaver-idle",
         "screensaver-lock",
+        "screensaver-own",
         "ready-marker",
     ] {
         assert_eq!(by(id).status, Status::Skipped, "{id}");
         assert!(by(id).skipped_because.is_some(), "{id}");
     }
     // What needs nothing still runs.
-    for id in ["pmset", "updates-check", "updates-critical"] {
+    for id in [
+        "pmset",
+        "hw-uuid",
+        "loginwindow-idle",
+        "updates-check",
+        "updates-critical",
+    ] {
         assert_eq!(by(id).status, Status::Ok, "{id}");
     }
     assert!(host.writes().is_empty());
@@ -696,7 +801,7 @@ fn frames_that_cannot_be_delivered_are_listed_and_the_run_still_ends() {
     let done = go(&host);
     assert!(done.summary.ok, "the steps themselves worked");
     assert_eq!(done.power_off_started, Some(true));
-    assert_eq!(done.summary.undelivered.len(), 13);
+    assert_eq!(done.summary.undelivered.len(), 17);
     assert_eq!(
         done.summary.undelivered.last().map(String::as_str),
         Some(SUMMARY_NAME)
@@ -759,4 +864,227 @@ fn the_marker_is_written_where_the_simulator_probe_reads_it() {
     go(&host);
     assert_eq!(host.writes()[1].0, simpaths::USER_READY);
     assert_eq!(KCPASSWORD_PATH, "/etc/kcpassword");
+}
+
+/// Catches a ByHost file named for the wrong machine, or a user step that gets ahead of the
+/// files it needs: a good run reads the UUID, makes the three directories (in order, parent
+/// first, mode 0700, for the user), writes both plists by path, and only then gives the two
+/// plists (0600) to the user. Also that the ioreg tail goes in the frame and the UUID is not
+/// treated as a secret.
+#[test]
+fn the_user_preferences_are_written_by_path_and_then_given_to_the_user() {
+    let host = Fake::new();
+    let done = go(&host);
+    assert!(done.summary.ok);
+    let prefs = format!("{}/Library/Preferences", home());
+    let ran = host.commands();
+    let at = |needle: &str| ran.iter().position(|c| c.contains(needle)).expect(needle);
+    assert_eq!(
+        ran[at("idleTime")],
+        format!(
+            "/usr/bin/defaults write {prefs}/ByHost/com.apple.screensaver.{UUID} idleTime -int 0"
+        )
+    );
+    assert_eq!(
+        ran[at("askForPassword")],
+        format!("/usr/bin/defaults write {prefs}/com.apple.screensaver askForPassword -int 0")
+    );
+    assert!(at("ioreg") < at("idleTime"));
+    assert!(
+        !ran.iter()
+            .any(|c| c.contains("sudo") || c.contains("-currentHost"))
+    );
+    let gives: Vec<Call> = host
+        .calls
+        .borrow()
+        .iter()
+        .filter(|c| matches!(c, Call::Give(..)))
+        .cloned()
+        .collect();
+    let g = |p: String, mode, file| Call::Give(p, "kbfuser".to_owned(), mode, file);
+    assert_eq!(
+        gives,
+        [
+            g(format!("{}/Library", home()), 0o700, false),
+            g(prefs.clone(), 0o700, false),
+            g(format!("{prefs}/ByHost"), 0o700, false),
+            g(format!("{prefs}/com.apple.screensaver.plist"), 0o600, true),
+            g(
+                format!("{prefs}/ByHost/com.apple.screensaver.{UUID}.plist"),
+                0o600,
+                true
+            ),
+        ]
+    );
+    // Dirs are made before the writes, the files are given after them.
+    let calls = host.calls.borrow();
+    let pos = |pred: &dyn Fn(&Call) -> bool| calls.iter().position(pred).expect("a call");
+    let first_dir = pos(&|c| matches!(c, Call::Give(_, _, _, false)));
+    let idle = pos(&|c| matches!(c, Call::Run(a) if a.join(" ").contains("idleTime")));
+    let lock = pos(&|c| matches!(c, Call::Run(a) if a.join(" ").contains("askForPassword")));
+    let first_file = pos(&|c| matches!(c, Call::Give(_, _, _, true)));
+    assert!(first_dir < idle && first_dir < lock);
+    assert!(idle < first_file && lock < first_file);
+    drop(calls);
+    let frames = host.step_frames();
+    let by = |id: &str| frames.iter().find(|f| f.step == id).expect(id);
+    assert!(by("hw-uuid").stdout.contains(UUID));
+    assert_eq!(
+        by("prefs-dirs").argv[..4],
+        ["give", "dir", "kbfuser", "0700"]
+    );
+    assert_eq!(
+        by("screensaver-own").argv[..4],
+        ["give", "file", "kbfuser", "0600"]
+    );
+    assert!(by("screensaver-idle").argv[2].contains(UUID));
+    assert!(by("screensaver-own").argv[5].ends_with(&format!("{UUID}.plist")));
+}
+
+/// Catches an ioreg parse that accepts what is not a UUID (a name that could escape the
+/// directory, a short one), takes another key's value, or misses the real line: good,
+/// missing, malformed.
+#[test]
+fn the_hardware_uuid_is_read_from_the_ioreg_line_and_only_when_well_formed() {
+    assert_eq!(
+        parse_platform_uuid(&ioreg_text(UUID)).as_deref(),
+        Some(UUID)
+    );
+    assert_eq!(
+        parse_platform_uuid(&ioreg_text(&UUID.to_lowercase())).as_deref(),
+        Some(UUID.to_lowercase().as_str())
+    );
+    // Missing: no line, other keys only, an empty output, a key that only contains the name.
+    for text in [
+        String::new(),
+        "\"IOPlatformSerialNumber\" = \"ZZ0\"\n".to_owned(),
+        format!("\"NotIOPlatformUUID\" = \"{UUID}\"\n"),
+        format!("\"IOPlatformUUID\" {UUID}\n"),
+        format!("\"IOPlatformUUID\" = {UUID}\n"),
+    ] {
+        assert_eq!(parse_platform_uuid(&text), None, "{text:?}");
+    }
+    // Malformed: wrong length or groups, a non-hex digit, a path.
+    for bad in [
+        "",
+        "1A2B3C4D",
+        "1A2B3C4D-0000-4EEF-8123-ABCDEF01234",
+        "1A2B3C4D-0000-4EEF-8123-ABCDEF0123456",
+        "1A2B3C4D-0000-4EEF-8123-ABCDEF01234G",
+        "1A2B3C4D00004EEF8123ABCDEF012345",
+        "../../etc/passwd",
+        "1A2B3C4D-0000-4EEF-8123-ABCDEF01/345",
+    ] {
+        assert_eq!(parse_platform_uuid(&ioreg_text(bad)), None, "{bad:?}");
+    }
+}
+
+/// Catches a UUID that cannot be read being papered over: with a missing or malformed UUID,
+/// or a failing ioreg, `hw-uuid` fails, the by-host write and the ownership step do not run,
+/// the marker is skipped, and the lock step (which needs no UUID) still does its work.
+#[test]
+fn no_hardware_uuid_means_no_by_host_file_and_no_marker() {
+    for (answer, status) in [
+        (out(Ended::Exited(0), "no uuid here\n", ""), Status::Error),
+        (
+            out(Ended::Exited(0), &ioreg_text("not-a-uuid"), ""),
+            Status::Error,
+        ),
+        (out(Ended::Exited(1), "", "ioreg: nope"), Status::Failed),
+    ] {
+        let host = Fake::new();
+        host.answer("/ioreg", answer);
+        let done = go(&host);
+        assert!(!done.summary.ok);
+        let frames = host.step_frames();
+        let by = |id: &str| frames.iter().find(|f| f.step == id).expect(id);
+        assert_eq!(by("hw-uuid").status, status);
+        assert_eq!(by("screensaver-idle").status, Status::Skipped);
+        assert_eq!(
+            by("screensaver-idle").skipped_because.as_deref(),
+            Some("hw-uuid")
+        );
+        assert_eq!(by("screensaver-lock").status, Status::Ok);
+        assert_eq!(by("screensaver-own").status, Status::Skipped);
+        assert_eq!(by("ready-marker").status, Status::Skipped);
+        assert!(!host.commands().iter().any(|c| c.contains("idleTime")));
+        assert!(host.writes().iter().all(|w| w.0 != simpaths::USER_READY));
+        assert_eq!(done.power_off_started, Some(true));
+    }
+    let host = Fake::new();
+    host.answer("/ioreg", out(Ended::Exited(0), "no uuid\n", ""));
+    go(&host);
+    let frames = host.step_frames();
+    let note = frames[5].note.as_deref().expect("a note");
+    assert!(note.contains("IOPlatformUUID"), "{note}");
+}
+
+/// Catches a failed ownership change being reported as success, and its dependents running:
+/// a directory that cannot be given (a link) stops the preference writes; a plist that
+/// cannot be given fails `screensaver-own`; either way no marker is written, and the guest
+/// is still powered off. The note says which path and why.
+#[test]
+fn a_path_that_cannot_be_given_to_the_user_fails_the_step_and_skips_the_marker() {
+    let prefs = format!("{}/Library/Preferences", home());
+    for (path, failed, skipped) in [
+        (
+            format!("{prefs}/ByHost"),
+            "prefs-dirs",
+            vec!["screensaver-idle", "screensaver-lock", "screensaver-own"],
+        ),
+        (
+            format!("{prefs}/com.apple.screensaver.plist"),
+            "screensaver-own",
+            vec![],
+        ),
+        (
+            format!("{prefs}/ByHost/com.apple.screensaver.{UUID}.plist"),
+            "screensaver-own",
+            vec![],
+        ),
+    ] {
+        let mut host = Fake::new();
+        host.give_fails = Some(path.clone());
+        let done = go(&host);
+        assert!(!done.summary.ok, "{path}");
+        let frames = host.step_frames();
+        let by = |id: &str| frames.iter().find(|f| f.step == id).expect(id);
+        assert_eq!(by(failed).status, Status::Error, "{path}");
+        let note = by(failed).note.as_deref().expect("a note");
+        assert!(note.contains(&path) && note.contains("is a link"), "{note}");
+        for id in &skipped {
+            assert_eq!(by(id).status, Status::Skipped, "{id}");
+        }
+        assert_eq!(by("ready-marker").status, Status::Skipped);
+        assert!(host.writes().iter().all(|w| w.0 != simpaths::USER_READY));
+        assert_eq!(done.power_off_started, Some(true));
+    }
+}
+
+/// Catches a failed preference write (a `defaults` that exits 1, as in a guest with no
+/// session) leaving the marker behind: the marker is skipped naming the step, the files
+/// are not given, and the run still powers off.
+#[test]
+fn a_failed_preference_write_skips_the_ownership_step_and_the_marker() {
+    for key in ["idleTime", "askForPassword", "loginWindowIdleTime"] {
+        let host = Fake::new();
+        host.answer(key, out(Ended::Exited(1), "", "Could not write domain"));
+        let done = go(&host);
+        assert!(!done.summary.ok, "{key}");
+        let frames = host.step_frames();
+        let by = |id: &str| frames.iter().find(|f| f.step == id).expect(id);
+        assert_eq!(by("ready-marker").status, Status::Skipped, "{key}");
+        assert!(host.writes().iter().all(|w| w.0 != simpaths::USER_READY));
+        if key != "loginWindowIdleTime" {
+            assert_eq!(by("screensaver-own").status, Status::Skipped, "{key}");
+            assert!(
+                !host
+                    .calls
+                    .borrow()
+                    .iter()
+                    .any(|c| matches!(c, Call::Give(_, _, _, true)))
+            );
+        }
+        assert_eq!(done.power_off_started, Some(true));
+    }
 }
