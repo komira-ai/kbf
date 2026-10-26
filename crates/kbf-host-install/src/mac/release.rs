@@ -24,10 +24,13 @@ pub const PREFIX_LEN: usize = 12;
 /// How many hex digits a commit has.
 pub const COMMIT_LEN: usize = 40;
 
-/// The 12 hex digits after the last `+g` of `version`, when the version ends there or goes
-/// on with `-<revision>`.
+/// The commit digits a version carries: after its last `+`, an optional `g` and exactly 12
+/// lower-case hex digits, then the end or `-<revision>`. A binary says `0.1.0+g<12 hex>`; a
+/// deb of the same build says `0.1.0+<12 hex>`. The two cannot be confused: `g` is not a
+/// hex digit.
 pub fn commit_prefix(version: &str) -> Option<&str> {
-    let (_, after) = version.rsplit_once("+g")?;
+    let (_, build) = version.rsplit_once('+')?;
+    let after = build.strip_prefix('g').unwrap_or(build);
     let (prefix, rest) = after.split_at_checked(PREFIX_LEN)?;
     let hex = prefix.bytes().all(is_hex);
     (hex && (rest.is_empty() || rest.starts_with('-'))).then_some(prefix)

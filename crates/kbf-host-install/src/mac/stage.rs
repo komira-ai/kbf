@@ -100,8 +100,9 @@ fn stage_inner(
     channel: &MacChannel,
     version: &Version,
 ) -> Result<Staged, Outcome> {
-    let prefix = release::commit_prefix(version.as_str())
-        .ok_or_else(|| verify_failed("the version carries no commit (+g and 12 hex digits)"))?;
+    let prefix = release::commit_prefix(version.as_str()).ok_or_else(|| {
+        verify_failed("the version carries no commit (+g or +, then 12 hex digits)")
+    })?;
     let pick = pick_release(host, channel, prefix)?;
     let token = match &channel.source {
         Source::Github {
