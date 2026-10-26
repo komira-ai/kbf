@@ -2,7 +2,7 @@
 # a host, built once per commit (docs/artifacts.md): kbf (all five modes, `kbf --version
 # --json` says what it is), kbf-daemon, kbf-server, kbf-deploy, kbf-host-install, kbf-updater,
 # kbf-signer and tierstore (built with its `server` feature) for linux-x86_64 and linux-arm64,
-# and kbf, kbf-deploy, kbf-installer, kbf-host-install and kbf-updater for darwin-arm64 (each
+# and kbf, kbf-deploy, kbf-installer, kbf-host-install, kbf-updater and kbf-mac-provision for darwin-arm64 (each
 # signed ad hoc with the hardened runtime; a Mac runs `kbf daemon`). Each comes as a
 # tarball with a CycloneDX SBOM; one SHA256SUMS covers a commit's files. The kbf of each
 # platform also comes with `kbf-<commit>-<platform>.version.json`, the exact bytes its
@@ -137,7 +137,7 @@ jobs:
       # library once for both, with the installer's `proxy` feature, and `kbf` would link the proxy
       # (crates/kbf-integration-test/tests/layering.rs checks the tree of `-p kbf-cli` alone).
       - run: cargo build --locked --release --target "$TARGET" -p kbf-cli --bin kbf
-      - run: cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-installer -p kbf-host-install -p kbf-updater --bin kbf-deploy --bin kbf-installer --bin kbf-host-install --bin kbf-updater
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-installer -p kbf-host-install -p kbf-updater -p kbf-mac-provision --bin kbf-deploy --bin kbf-installer --bin kbf-host-install --bin kbf-updater --bin kbf-mac-provision
       - name: Sign kbf ad hoc with the hardened runtime, and check it
         run: cargo xtask sign-darwin "target/$TARGET/release/kbf" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
       - name: Sign kbf-deploy ad hoc with the hardened runtime, and check it
@@ -148,6 +148,8 @@ jobs:
         run: cargo xtask sign-darwin "target/$TARGET/release/kbf-host-install" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
       - name: Sign kbf-updater ad hoc with the hardened runtime, and check it
         run: cargo xtask sign-darwin "target/$TARGET/release/kbf-updater" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
+      - name: Sign kbf-mac-provision ad hoc with the hardened runtime, and check it
+        run: cargo xtask sign-darwin "target/$TARGET/release/kbf-mac-provision" --minos "$MACOSX_DEPLOYMENT_TARGET" --summary "$GITHUB_STEP_SUMMARY"
       - name: The signed kbf names the commit and a release build
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
       - name: The signed kbf-installer names the commit and a release build
@@ -169,6 +171,8 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf-host-install" --sbom crates/kbf-host-install/kbf-host-install_bin.cdx.json --platform darwin-arm64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf-updater
         run: cargo xtask package --binary "target/$TARGET/release/kbf-updater" --sbom crates/kbf-updater/kbf-updater_bin.cdx.json --platform darwin-arm64 --commit "$GITHUB_SHA" --out dist
+      - name: Package kbf-mac-provision
+        run: cargo xtask package --binary "target/$TARGET/release/kbf-mac-provision" --sbom crates/kbf-mac-provision/kbf-mac-provision_bin.cdx.json --platform darwin-arm64 --commit "$GITHUB_SHA" --out dist
       - name: Check the packaged kbf's signature, and run it
         run: cargo xtask darwin-asset "dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz" kbf
       - name: Check the packaged kbf-deploy's signature, and run it
@@ -179,6 +183,8 @@ jobs:
         run: cargo xtask darwin-asset "dist/kbf-host-install-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-host-install
       - name: Check the packaged kbf-updater's signature, and run it
         run: cargo xtask darwin-asset "dist/kbf-updater-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-updater
+      - name: Check the packaged kbf-mac-provision's signature, and run it
+        run: cargo xtask darwin-asset "dist/kbf-mac-provision-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-mac-provision
       - name: The packaged kbf names the commit and a release build
         run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz" "$GITHUB_SHA"
       - name: The packaged kbf-installer names the commit and a release build
@@ -978,6 +984,10 @@ jobs:
         with:
           subject-path: dist/kbf-updater-${{ github.sha }}-darwin-arm64.tar.gz
           sbom-path: dist/kbf-updater-${{ github.sha }}-darwin-arm64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/kbf-mac-provision-${{ github.sha }}-darwin-arm64.tar.gz
+          sbom-path: dist/kbf-mac-provision-${{ github.sha }}-darwin-arm64.cdx.json
       # Each tarball is also attested as its own subject; see attest-linux.
       - id: provenance-kbf-darwin-arm64
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -1019,6 +1029,14 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-kbf-updater-darwin-arm64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/kbf-updater-${GITHUB_SHA}-darwin-arm64.tar.gz.sigstore.json"
+      - id: provenance-kbf-mac-provision-darwin-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-mac-provision-${{ github.sha }}-darwin-arm64.tar.gz
+      - name: Name the bundle of kbf-mac-provision for darwin-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-mac-provision-darwin-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-mac-provision-${GITHUB_SHA}-darwin-arm64.tar.gz.sigstore.json"
       - id: provenance-kbf-installer-pkg-darwin-arm64
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:

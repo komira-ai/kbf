@@ -9,8 +9,8 @@
 //!
 //! - **The release set.** The `cargo xtask package` lines of the workflow name exactly
 //!   [`ASSETS`] (binary and platform): `kbf`, `kbf-host-install` and `kbf-updater` for the
-//!   three platforms (a Mac runs the host agent), `kbf-installer` for macOS only (its Linux
-//!   package is the `kbf` package's now), `kbf-daemon`, `kbf-server`, `kbf-deploy`,
+//!   three platforms (a Mac runs the host agent), `kbf-installer` and `kbf-mac-provision` for macOS only (its Linux
+//!   package is the `kbf` package's now; a Mac is provisioned by `kbf-mac-provision`), `kbf-daemon`, `kbf-server`, `kbf-deploy`,
 //!   `kbf-signer` and `tierstore` for Linux, `kbf-deploy` for macOS (a Mac runs
 //!   `kbf daemon`; there is no darwin `kbf-daemon`). Each one's SBOM attestation is
 //!   [`crate::attested_assets`]' business, and its provenance bundle
@@ -82,6 +82,7 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-installer", "darwin-arm64"),
     ("kbf-host-install", "darwin-arm64"),
     ("kbf-updater", "darwin-arm64"),
+    ("kbf-mac-provision", "darwin-arm64"),
     ("kbf", "linux-x86_64"),
     ("kbf-daemon", "linux-x86_64"),
     ("kbf-server", "linux-x86_64"),
