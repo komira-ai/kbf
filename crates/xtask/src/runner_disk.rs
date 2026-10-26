@@ -1,117 +1,64 @@
-//! `runner-disk`: the check that the hosted runner's disks have the room the coverage run
+//! `runner-disk`: the check that the hosted runner's disk has the room the coverage run
 //! needs, before it starts.
 //!
-//! The instrumented workspace build and the tests' temporary files outgrew the root disk of a
-//! hosted runner, and the file store refuses to write below 5% free, so about thirty tests
-//! failed with "Full" and the log never said the runner was out of disk. The `test` job
-//! puts the build on the runner's second disk and runs this first: it names the disk that is
-//! short and by how much, or that the second disk is not a separate disk at all.
+//! The instrumented workspace build and the tests' temporary files, on top of a cache that
+//! restored a second build of the workspace, ran the runner's disk below the 5% free-space
+//! floor of the file store, so about thirty tests failed with "Full" and the log never said
+//! the runner was out of disk. The `test` job runs this before the tests: it names the disk
+//! and how much it has against what the run needs.
 
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use clap::Args as ClapArgs;
 
 use crate::Error;
 
-/// A gibibyte, the unit of the flags (and of `df -h`).
+/// A gibibyte, the unit of the flag (and of `df -h`).
 const GIB: u64 = 1 << 30;
 
 /// Flags of `runner-disk`.
 #[derive(Debug, ClapArgs)]
 pub struct Args {
-    /// The second disk's mount point (`/mnt` on a hosted Linux runner).
+    /// A path on the disk to check (the workspace).
     #[arg(long)]
-    pub disk: PathBuf,
-    /// The least free space the second disk may have, in GiB.
+    pub path: PathBuf,
+    /// The least free space that disk may have, in GiB.
     #[arg(long)]
-    pub disk_min_free_gb: u64,
-    /// The root disk's mount point.
-    #[arg(long, default_value = "/")]
-    pub root: PathBuf,
-    /// The least free space the root disk may have, in GiB.
-    #[arg(long)]
-    pub root_min_free_gb: u64,
+    pub min_free_gb: u64,
 }
 
-/// What is known of one disk: the device it is, and the bytes free to an ordinary user.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Disk {
-    /// The device number of the directory.
-    pub device: u64,
-    /// Bytes available to a non-root user.
-    pub free_bytes: u64,
-}
-
-/// Read `path`'s device and free space.
-pub fn probe(path: &Path) -> Result<Disk, Error> {
-    let what = || format!("disk {}", path.display());
-    let meta = std::fs::metadata(path).map_err(Error::spawn(what()))?;
+/// The bytes free to an ordinary user on the disk `path` is on.
+pub fn free_bytes(path: &Path) -> Result<u64, Error> {
     let stat = rustix::fs::statvfs(path).map_err(|e| Error::Spawn {
-        what: what(),
+        what: format!("disk {}", path.display()),
         why: e.to_string(),
     })?;
-    Ok(Disk {
-        device: meta.dev(),
-        free_bytes: stat.f_bavail.saturating_mul(stat.f_frsize),
+    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
+/// Why `free` bytes at `path` are short of `min_gb` GiB: `None` when they are enough.
+pub fn problem(path: &Path, free: u64, min_gb: u64) -> Option<String> {
+    (free < min_gb.saturating_mul(GIB)).then(|| {
+        format!(
+            "runner out of disk: the disk of {} has {} GiB free and the tests need {min_gb} GiB \
+             (the instrumented build, the tests' temporary files and the file store's 5% floor); \
+             something on the runner, or in the restored cache, grew",
+            path.display(),
+            free / GIB,
+        )
     })
 }
 
-/// Every reason the two disks are not enough, in the order a reader fixes them: `second` is
-/// the disk at `second_path`, which must be a different device from `root`'s and have at
-/// least `second_min_gb` GiB free; `root` must have `root_min_gb`.
-pub fn problems(
-    root: &Disk,
-    second: &Disk,
-    second_path: &Path,
-    root_min_gb: u64,
-    second_min_gb: u64,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    if root.device == second.device {
-        out.push(format!(
-            "runner out of disk: {} is not a separate disk on this runner, so the instrumented \
-             build has no second disk to go on",
-            second_path.display()
-        ));
-    }
-    if second.free_bytes < second_min_gb * GIB {
-        out.push(format!(
-            "runner out of disk: {} has {} GiB free and the instrumented build needs {second_min_gb} GiB",
-            second_path.display(),
-            second.free_bytes / GIB,
-        ));
-    }
-    if root.free_bytes < root_min_gb * GIB {
-        out.push(format!(
-            "runner out of disk: the root disk has {} GiB free and the restored cache and the other builds need {root_min_gb} GiB",
-            root.free_bytes / GIB,
-        ));
-    }
-    out
-}
-
-/// Check both disks: one line saying how much each has, or every reason it is short.
+/// Check the disk: one line saying how much it has, or why it is short.
 pub fn run(args: &Args) -> Result<Vec<String>, Error> {
-    let root = probe(&args.root)?;
-    let second = probe(&args.disk)?;
-    let found = problems(
-        &root,
-        &second,
-        &args.disk,
-        args.root_min_free_gb,
-        args.disk_min_free_gb,
-    );
-    if !found.is_empty() {
-        return Err(Error::Refused(found));
+    let free = free_bytes(&args.path)?;
+    if let Some(said) = problem(&args.path, free, args.min_free_gb) {
+        return Err(Error::Refused(vec![said]));
     }
     Ok(vec![format!(
-        "disks: {} GiB free on {} (needs {}), {} GiB free on {} (needs {})",
-        second.free_bytes / GIB,
-        args.disk.display(),
-        args.disk_min_free_gb,
-        root.free_bytes / GIB,
-        args.root.display(),
-        args.root_min_free_gb,
+        "disk of {}: {} GiB free (needs {})",
+        args.path.display(),
+        free / GIB,
+        args.min_free_gb
     )])
 }

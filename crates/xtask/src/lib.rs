@@ -83,9 +83,8 @@
 //!   with its line in `SHA256SUMS.<platform>`. The release set holds it for every `kbf`
 //!   tarball (`verify-assets sums`, `release check`), because only a runner of a platform
 //!   can run its binary.
-//! - `runner-disk --disk <path> --disk-min-free-gb <n> --root-min-free-gb <n> [--root <path>]`
-//!   ([`runner_disk`]): exit 1 naming the disk when the second disk is not a separate disk or
-//!   either disk has less free space than the coverage run needs.
+//! - `runner-disk --path <path> --min-free-gb <n>` ([`runner_disk`]): exit 1 naming the disk
+//!   when the disk of `<path>` has less free space than the coverage run needs.
 //! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
 //!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
 //!   unit.
@@ -191,7 +190,7 @@ enum Verb {
     DeployFarm(deploy_farm::Args),
     /// Prove the farm after a deploy with a remote-only Buck2 build of a small project.
     ProveFarm(prove_farm::Args),
-    /// Check that the runner's root disk and second disk have the room the coverage run needs.
+    /// Check that the runner's disk has the room the coverage run needs.
     RunnerDisk(runner_disk::Args),
     /// Refuse a row the budget file gains against `--base`.
     BudgetDiff {
