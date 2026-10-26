@@ -245,14 +245,30 @@ impl StateStoreUri {
     /// filesystem or is not a state store; or the generation row of a Postgres store cannot
     /// be set to the marker.
     pub fn open(&self) -> Result<StateStore, StateError> {
+        self.try_open().map_err(OpenFailure::into_error)
+    }
+
+    /// [`StateStoreUri::open`], with a failure told by what a caller does about it: a Postgres
+    /// server that is not up yet ([`OpenFailure::NotUp`]) can be waited for
+    /// ([`kbf_state::postgres::OpenError`] says which failures those are), every other
+    /// failure ([`OpenFailure::Refused`]) is a refusal no wait changes. A SQLite store is
+    /// always a refusal: its file is on this host, and what stops its open (a lock another
+    /// process holds, a path that is not a database) does not pass.
+    ///
+    /// This blocks, as [`StateStoreUri::open`] does.
+    ///
+    /// # Errors
+    /// [`OpenFailure`], with the [`StateError`] of [`StateStoreUri::open`].
+    pub fn try_open(&self) -> Result<StateStore, OpenFailure> {
         let store = match self {
             Self::Sqlite(path) => {
                 tracing::warn!("{SQLITE_REMOVED}");
-                open_sqlite(path)?
+                open_sqlite(path).map_err(OpenFailure::Refused)?
             }
             Self::Postgres(url) => {
                 let store = open_postgres(url)?;
-                kbf_state::share(store.as_ref()).map_err(open_error)?;
+                kbf_state::share(store.as_ref())
+                    .map_err(|e| OpenFailure::Refused(open_error(e)))?;
                 store
             }
         };
@@ -263,6 +279,25 @@ impl StateStoreUri {
             members: MembershipConfig::default(),
             history: None,
         })
+    }
+}
+
+/// Why a state store did not open, by what a caller does about it.
+#[derive(Debug)]
+pub enum OpenFailure {
+    /// The Postgres server is not up yet; opening again later can succeed.
+    NotUp(StateError),
+    /// A refusal that waiting does not change.
+    Refused(StateError),
+}
+
+impl OpenFailure {
+    /// The error, as [`StateStoreUri::open`] gives it.
+    #[must_use]
+    pub fn into_error(self) -> StateError {
+        match self {
+            Self::NotUp(e) | Self::Refused(e) => e,
+        }
     }
 }
 
@@ -331,9 +366,13 @@ fn open_error(why: impl fmt::Display) -> StateError {
 /// (`synchronous_commit` is not on: `PostgresStore::open` checks every connection), and
 /// creates the tables if they are not there. The errors name the setting or the failed
 /// step, never the URL.
-fn open_postgres(url: &PostgresUrl) -> Result<Arc<dyn Store>, StateError> {
-    let store = kbf_state::postgres::PostgresStore::open(&url.config).map_err(open_error)?;
-    Ok(Arc::new(store))
+fn open_postgres(url: &PostgresUrl) -> Result<Arc<dyn Store>, OpenFailure> {
+    use kbf_state::postgres::OpenError;
+    match kbf_state::postgres::PostgresStore::try_open(&url.config) {
+        Ok(store) => Ok(Arc::new(store)),
+        Err(OpenError::NotUp(e)) => Err(OpenFailure::NotUp(open_error(e))),
+        Err(OpenError::Refused(e)) => Err(OpenFailure::Refused(open_error(e))),
+    }
 }
 
 fn open_sqlite(path: &Path) -> Result<Arc<dyn Store>, StateError> {

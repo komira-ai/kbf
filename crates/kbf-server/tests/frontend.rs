@@ -808,6 +808,30 @@ async fn a_sqlite_state_store_starts_and_is_held() {
     served.abort();
 }
 
+/// A start over a Postgres store whose socket does not exist, with `--state-store-wait-secs=0`,
+/// is refused at once with the store's own error, as it was before the
+/// flag. Catches a window of 0 that waits, and a start that is not wired to the flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_postgres_store_not_up_is_refused_at_once_with_a_window_of_zero() {
+    let dir = scratch_dir("postgres-not-up");
+    let store = format!("--state-store=postgres:///kbf?host={}", dir.display());
+    let f = flags(&[
+        "--storage=http://127.0.0.1:1",
+        &store,
+        "--state-store-wait-secs=0",
+    ])
+    .expect("parses");
+    assert_eq!(f.state_store_wait, Duration::ZERO);
+    let refused = start_frontend(&f, || Ok(pending::<()>()))
+        .err()
+        .expect("nothing listens on the socket");
+    let said = refused.to_string();
+    assert!(
+        said.starts_with("the state store cannot be opened: "),
+        "{said}"
+    );
+}
+
 /// The `opkey/` rows of the SQLite state store at `path`, once the frontend that held it
 /// has stopped.
 async fn size_key_rows(path: &std::path::Path) -> Vec<String> {

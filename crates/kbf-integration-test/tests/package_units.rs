@@ -632,15 +632,16 @@ fn violations(name: &str, text: &str) -> Vec<String> {
                 format!("start timeout {start_timeout:?} is not finite"),
             );
         }
-        // Catches a start timeout shorter than the bind retry's budget plus the checks
-        // before it: kbf waits up to 90 s for a listen address (kbf#998), and systemd would
-        // kill that start mid-retry.
+        // Catches a start timeout shorter than the state store wait (300 s by default) plus the
+        // bind retry's budget and the checks: kbf waits up to 300 s for a state store that is
+        // not up yet and up to 90 s for a listen address (kbf#998), and systemd would kill
+        // that start mid-wait instead of letting it end with exit 1.
         let seconds = start_timeout.and_then(|t| t.trim_end_matches('s').parse::<u64>().ok());
-        if start_timeout.is_some_and(|t| t != "infinity") && seconds.is_none_or(|s| s < 120) {
+        if start_timeout.is_some_and(|t| t != "infinity") && seconds.is_none_or(|s| s < 420) {
             v(
                 "notify",
                 format!(
-                    "start timeout {start_timeout:?} is below 120 s (the 90 s bind budget and the checks)"
+                    "start timeout {start_timeout:?} is below 420 s (the 300 s state store wait, the 90 s bind budget and the checks)"
                 ),
             );
         }
@@ -1008,7 +1009,7 @@ const DEFECTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-frontend.service",
-        "\nTimeoutStartSec=120\n",
+        "\nTimeoutStartSec=420\n",
         "\nTimeoutStartSec=60\n",
         "notify",
     ),

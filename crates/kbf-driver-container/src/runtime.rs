@@ -53,15 +53,16 @@ use crate::container::{
 use crate::image::{ImageCheckError, ImageRef, PROPERTY};
 use crate::input_phases::{InputPhases, millis};
 use crate::keeper::Keeper;
+use crate::logs::{Logs, STDERR, STDOUT, store_both};
 use crate::numa::{Pin, Placement, Placer};
 use crate::oci::{Oci, OciConfig};
-use crate::outputs::{OutputLimits, collect_log};
+use crate::outputs::{OutputLimits, collect};
 use crate::program;
 use crate::remove::remove_tree;
 use crate::running::Running;
 use crate::tree::{
-    TreeError, check_relative, collect, fetch_message, materialize_cached, materialize_phased,
-    output_paths, prepare_outputs, refuse_hidden_working_directory,
+    TreeError, check_relative, fetch_message, materialize_cached, materialize_phased, output_paths,
+    prepare_outputs, refuse_hidden_working_directory,
 };
 
 /// The driver name in the node report.
@@ -532,8 +533,8 @@ impl<C: Cas> ContainerRuntime<C> {
             .create(&spec)
             .await
             .map_err(RuntimeError::Failed)?;
-        let stdout_path = lease.dir.join("stdout");
-        let stderr_path = lease.dir.join("stderr");
+        let stdout_path = lease.dir.join(STDOUT);
+        let stderr_path = lease.dir.join(STDERR);
         let cap = memory_max(work.resources.memory_bytes);
         let swap_kill = self.config.swap_kill;
         let threshold = swap_kill.threshold(work.resources.memory_bytes);
@@ -559,7 +560,7 @@ impl<C: Cas> ContainerRuntime<C> {
                 () = child.wait() => {}
                 () = tokio::time::sleep(timeout) => {
                     self.stop_container(&lease.name, &lease.cgroup, child).await;
-                    return Err(self.timed_out(cas, &lease.name, &stdout_path, &stderr_path).await);
+                    return Err(self.timed_out(cas, &lease.name, &lease.dir).await);
                 }
                 Ok(by) = &mut *stop => {
                     *killer = Some(by);
@@ -641,7 +642,12 @@ impl<C: Cas> ContainerRuntime<C> {
         };
         let upload = async {
             // Each output file is hashed once, then sent from where it is as whole
-            // segments.
+            // segments, with stdout and stderr in the same call when the store has no
+            // intake.
+            let logs = Logs {
+                dir: &lease.dir,
+                max: self.config.outputs.max_stdio_bytes,
+            };
             collect(
                 cas,
                 &spec.upper,
@@ -649,18 +655,11 @@ impl<C: Cas> ContainerRuntime<C> {
                 &spec.working_directory,
                 &outputs,
                 self.config.outputs,
+                Some(&logs),
                 &mut result,
             )
             .await
-            .map_err(outputs_error)?;
-            let max = self.config.outputs.max_stdio_bytes;
-            for (path, slot) in [
-                (&stdout_path, &mut result.stdout_digest),
-                (&stderr_path, &mut result.stderr_digest),
-            ] {
-                *slot = Some(collect_log(cas, path, max).await.map_err(outputs_error)?);
-            }
-            Ok(())
+            .map_err(outputs_error)
         };
         upload_within(self.config.upload_deadline, upload).await?;
         clock.output_upload_completed_timestamp = now();
@@ -713,23 +712,14 @@ impl<C: Cas> ContainerRuntime<C> {
     }
 
     /// [`RuntimeError::TimedOut`] with what the stopped action wrote to stdout and
-    /// stderr, each stored within the stdio limit (REAPI's partial result). A log past
-    /// the limit, or one that cannot be stored, is left out: the answer is still the
-    /// timeout.
-    async fn timed_out(
-        &self,
-        cas: &C::Lease,
-        name: &str,
-        stdout: &Path,
-        stderr: &Path,
-    ) -> RuntimeError {
+    /// stderr, each stored within the stdio limit (REAPI's partial result), in one
+    /// [`Cas::put_records`] when the store has no intake. A log past the limit, or one that
+    /// cannot be stored, is left out: the answer is still the timeout.
+    async fn timed_out(&self, cas: &C::Lease, name: &str, dir: &Path) -> RuntimeError {
         let max = self.config.outputs.max_stdio_bytes;
-        let mut logs = [None, None];
-        for (path, slot) in [stdout, stderr].into_iter().zip(&mut logs) {
-            match collect_log(cas, path, max).await {
-                Ok(digest) => *slot = Some(digest),
-                Err(e) => tracing::warn!(lease = %name, "timed out; its log is left out: {e}"),
-            }
+        let (logs, problems) = store_both(cas, &Logs { dir, max }).await;
+        for e in problems {
+            tracing::warn!(lease = %name, "timed out; its log is left out: {e}");
         }
         let [stdout, stderr] = logs;
         RuntimeError::TimedOut { stdout, stderr }

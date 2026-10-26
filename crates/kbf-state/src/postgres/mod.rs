@@ -40,6 +40,7 @@ pub mod boot;
 mod conn;
 #[cfg(feature = "test-database")]
 mod database;
+mod not_up;
 mod pack_index;
 mod reach;
 pub mod schema;
@@ -60,6 +61,7 @@ use postgres::types::ToSql;
 pub use backend::PostgresBackend;
 #[cfg(feature = "test-database")]
 pub use database::{TestDatabase, test_database};
+pub use not_up::OpenError;
 pub use pack_index::PostgresPackIndex;
 pub use reach::{Unreached, reach};
 use session::{Edge, Pool, RangeShape, Session};
@@ -394,13 +396,23 @@ impl PostgresStore {
     /// (`synchronous_commit` is not on), or holds no schema or one outside the supported
     /// range (one line saying which and what to run).
     pub fn open(config: &PostgresConfig) -> Result<PostgresStore, StoreError> {
+        Self::try_open(config).map_err(OpenError::into_store)
+    }
+
+    /// [`PostgresStore::open`], with a failure told by what a caller does about it: a server
+    /// that is not up yet ([`OpenError::NotUp`]) can be waited for, any other
+    /// ([`OpenError::Refused`]) cannot.
+    ///
+    /// # Errors
+    /// [`OpenError`], as for [`PostgresStore::open`].
+    pub fn try_open(config: &PostgresConfig) -> Result<PostgresStore, OpenError> {
         let pool = Pool::open(
             config.pg.clone(),
             config.schema.clone(),
             config.max_connections,
             config.supported,
         )
-        .map_err(Fail::into_store)?;
+        .map_err(OpenError::from)?;
         Ok(PostgresStore {
             pool,
             config: config.clone(),
