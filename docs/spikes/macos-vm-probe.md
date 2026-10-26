@@ -576,7 +576,10 @@ sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest \
 - `--xcode` clones the app into the guest's `/Applications/Xcode.app`. The guest disk is on
   another volume than the app, so in practice this is a file-by-file copy (a tree clone is
   tried first). Everything becomes owned by root:wheel; the setuid, setgid and sticky bits
-  are dropped on both paths. The file-by-file copy writes the planned modes and opens each
+  are dropped on both paths, and so are group and world write (a source 0775 is staged
+  0755, 0666 is 0644; owner bits and the others are kept; a bundle's runtime files are
+  fixed at 0644 and its directories at 0755). The file-by-file copy writes the planned modes
+  and opens each
   source without following a link, refusing a file that is no longer a regular file. A tree
   clone copies the live tree, so it is walked again afterwards: it is refused unless it
   holds exactly the planned entries (same kinds, link targets and file sizes) and then gets
@@ -596,7 +599,8 @@ sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest \
   rather than being skipped (a skipped part of a signature would leave an Xcode that fails
   validation). Attributes are macOS-only code; other systems copy none. The new
   copy is built under a staging name and renamed into place, so a failed run never leaves a
-  half Xcode.app under the real name. A rerun removes the earlier copy and then renames the
+  half Xcode.app under the real name; when the build or a check fails, the staging tree is
+  removed as well. A rerun removes the earlier copy and then renames the
   new one in (a run that dies between the two leaves no Xcode.app), and it holds both
   copies until then, so the free-space check, which counts the earlier copy as used, needs
   room for both.
@@ -616,7 +620,13 @@ sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest \
   when its target stays inside the bundle; a socket, pipe or device refused; not
   `--allow-external-links`), counted in the free-space check, and copied file by file to
   `/private/var/kbf-sim/runtimes/<name>.exportedBundle`, each file hashed while it is
-  copied; directories become 0755, files 0644, owner root:wheel. The directory then holds
+  copied; directories become 0755, files 0644, owner root:wheel. An image is opened without
+  following a link and without blocking on a pipe, and must be a regular file. Each runtime
+  is built in `/private/var/kbf-sim/.runtimes.kbf-staging` (beside the runtime directory,
+  not in it, since the guest lists the directory) and renamed in when complete; if a build
+  fails, that directory is removed, so no partial runtime is ever listed. At most the planned
+  size of a file is copied (one byte more is read), and a source that grew or shrank fails
+  the stage. The runtime directory then holds
   exactly the runtimes of the latest setup (a setup that names none empties it). The report
   and `staged.json` record an image's kind, name, size and SHA-256, and a bundle's kind,
   name, total size and a list of `{path, bytes, sha256}` for each file.
@@ -626,7 +636,12 @@ sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest \
 - What was staged is also written into the guest as `/private/var/kbf-sim/staged.json`.
 - Every directory the copy writes through on the guest volume must be a plain directory; a
   link or a file in the way is an error, so a guest that ran earlier cannot redirect the
-  root copy.
+  root copy. A leftover in the way (an earlier Xcode.app, a runtime, a staging name,
+  `staged.json`) is removed without following a link, and a removal that fails (a file the
+  guest made immutable) stops the stage with an error naming the path. Files are created
+  exclusively (`staged.json` included) and their mode is set on the open file; a mode set
+  later on an existing path opens it without following a link; ownership is `lchown`. A
+  directory the stage creates on the way is given mode 0755 explicitly, whatever the umask.
 
 ## What to send back
 
