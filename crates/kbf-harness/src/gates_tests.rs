@@ -256,6 +256,33 @@ fn the_execute_error_counter_is_a_delta() {
     assert_eq!(failed(&run), ["execute_errors"]);
 }
 
+/// Asserts that the execute-errors gate reads the sum of the frontend's `cause` series, and
+/// goes red when any one of them moves, a client abort included (no cause is a pass).
+///
+/// Catches: a gate that reads one cause only, or that excuses `client_abort`. Mutant: read
+/// only the `status` series: the other two cases go red.
+#[test]
+fn any_one_execute_error_cause_moving_fails_the_gate() {
+    let series = |cause: &str| format!("{EXECUTE_ERRORS}{{cause=\"{cause}\"}}");
+    let causes = ["status", "client_abort", "dropped"];
+    let quiet = || {
+        let mut run = pass();
+        for s in &mut run.scrapes.samples {
+            s.series.remove(EXECUTE_ERRORS);
+            for cause in causes {
+                s.series.insert(series(cause), 0.0);
+            }
+        }
+        run
+    };
+    assert_eq!(failed(&quiet()), Vec::<String>::new());
+    for moved in causes {
+        let mut run = quiet();
+        run.scrapes.samples[10].series.insert(series(moved), 1.0);
+        assert_eq!(failed(&run), ["execute_errors"], "{moved}");
+    }
+}
+
 #[test]
 fn an_absent_metric_fails_its_gate_in_the_first_scrape_and_in_a_later_one() {
     // Catches: an absent series read as zero, so a metric the frontend stops exporting

@@ -3,6 +3,8 @@
 //! an operation's stages.
 
 mod common;
+#[path = "execution/error_causes.rs"]
+mod error_causes_tests;
 #[path = "execution/platform.rs"]
 mod platform_tests;
 #[path = "execution/refuse_platform.rs"]
@@ -809,7 +811,9 @@ async fn execute_is_measured_phase_by_phase() {
     let text = farm.cache.metrics().render();
     for family in [
         "kbf_execute_requests_total 2",
-        "kbf_execute_errors_total 0",
+        r#"kbf_execute_errors_total{cause="client_abort"} 0"#,
+        r#"kbf_execute_errors_total{cause="dropped"} 0"#,
+        r#"kbf_execute_errors_total{cause="status"} 0"#,
         "kbf_execute_in_flight 0",
         "kbf_execute_queued 0",
         "kbf_execute_prepare_seconds_count 1",

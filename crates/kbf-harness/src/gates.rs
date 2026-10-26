@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::scrape::{Sample, Scrapes};
 
-/// The failed-Execute counter (no by-class counter exists yet).
+/// The failed-Execute counter: the sum of its `cause` series (status, client_abort, dropped).
 pub const EXECUTE_ERRORS: &str = "kbf_execute_errors_total";
 /// Blobs marked lost now.
 pub const LOST_BLOBS: &str = "kbf_cache_lost_blobs";

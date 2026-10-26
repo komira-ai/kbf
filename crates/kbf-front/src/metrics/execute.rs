@@ -12,10 +12,82 @@
 //! Recording takes no lock and allocates nothing: a stream holds one `Arc` of these
 //! metrics and each observation is a few relaxed atomic adds, like the CAS metrics.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 
+use kbf_tls::Liveness;
+
 use super::{Counter, Families, Gauge, Histogram, Unit};
+
+/// Why an Execute ended without its done operation. Every end that is not an answer has
+/// exactly one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorCause {
+    /// The call ended with a gRPC error status: refused, not authorized, a bad request,
+    /// inputs missing, the scheduler's refusal, or a stream the server ended.
+    Status,
+    /// The client reset the stream and its connection stayed: it gave the call up.
+    ClientAbort,
+    /// The stream was dropped and the client did not say so: its connection was lost, or
+    /// the front cannot tell (no connection to ask). A platform failure, never counted
+    /// as an abort.
+    Dropped,
+}
+
+impl ErrorCause {
+    /// Every cause, in the order of the exposition.
+    pub const ALL: [Self; 3] = [Self::ClientAbort, Self::Dropped, Self::Status];
+
+    /// The value of the `cause` label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::ClientAbort => "client_abort",
+            Self::Dropped => "dropped",
+        }
+    }
+}
+
+/// The error counter of Execute: one series per [`ErrorCause`], all always rendered.
+#[derive(Debug, Default)]
+pub struct ErrorCounts([Counter; 3]);
+
+impl ErrorCounts {
+    /// The calls that ended in `cause`.
+    #[must_use]
+    pub fn of(&self, cause: ErrorCause) -> u64 {
+        self.0[cause as usize].get()
+    }
+
+    /// The calls that ended in any cause.
+    #[must_use]
+    pub fn get(&self) -> u64 {
+        self.0.iter().map(Counter::get).sum()
+    }
+
+    fn add(&self, cause: ErrorCause) {
+        self.0[cause as usize].add(1);
+    }
+
+    fn render(&self, out: &mut Families) {
+        let name = "kbf_execute_errors_total";
+        out.head(
+            name,
+            "counter",
+            "Execute calls that ended in an error status or were dropped before their done operation, by cause: status, client_abort (the client reset the stream), dropped (the stream was dropped and the client did not say so)",
+        );
+        for cause in ErrorCause::ALL {
+            let _ = writeln!(
+                out.0,
+                "{name}{{cause=\"{}\"}} {}",
+                cause.label(),
+                self.of(cause)
+            );
+        }
+    }
+}
 
 /// Everything the front measures about Execute and WaitExecution.
 #[derive(Debug)]
@@ -23,9 +95,9 @@ pub struct ExecuteMetrics {
     /// Execute calls ended: answered, failed or dropped by their caller.
     pub requests: Counter,
     /// Execute calls that ended in an error status, or were dropped before the done
-    /// operation. A call whose operation finished with a failed `ExecuteResponse` is
-    /// not one: its gRPC call succeeded.
-    pub errors: Counter,
+    /// operation, by [`ErrorCause`]. A call whose operation finished with a failed
+    /// `ExecuteResponse` is not one: its gRPC call succeeded.
+    pub errors: ErrorCounts,
     /// Execute and WaitExecution streams open: begun and not yet ended.
     pub in_flight: Gauge,
     /// Operation streams alive: one per Execute or WaitExecution whose call became a
@@ -63,7 +135,7 @@ impl Default for ExecuteMetrics {
     fn default() -> Self {
         Self {
             requests: Counter::default(),
-            errors: Counter::default(),
+            errors: ErrorCounts::default(),
             in_flight: Gauge::default(),
             open_executions: Gauge::default(),
             started: Counter::default(),
@@ -89,6 +161,8 @@ impl ExecuteMetrics {
             phase: now,
             counted: true,
             ok: false,
+            failed: false,
+            connection: None,
             queued: false,
             streaming: false,
         }
@@ -106,6 +180,8 @@ impl ExecuteMetrics {
             phase: now,
             counted: false,
             ok: false,
+            failed: false,
+            connection: None,
             queued: false,
             streaming: false,
         }
@@ -118,11 +194,7 @@ impl ExecuteMetrics {
             "Execute calls ended: answered, failed or dropped by their caller",
             self.requests.get(),
         );
-        out.counter(
-            "kbf_execute_errors_total",
-            "Execute calls that ended in an error status or were dropped before their done operation",
-            self.errors.get(),
-        );
+        self.errors.render(out);
         out.gauge(
             "kbf_execute_in_flight",
             "Execute and WaitExecution streams open",
@@ -184,6 +256,10 @@ pub struct OpenExecute {
     /// `in_flight`).
     counted: bool,
     ok: bool,
+    /// Whether the call ended with an error status ([`Self::fail`]).
+    failed: bool,
+    /// The caller's connection, if the front can ask about it.
+    connection: Option<Liveness>,
     /// Whether this stream is in the `queued` gauge.
     queued: bool,
     /// Whether this stream is in the `open_executions` gauge.
@@ -238,6 +314,30 @@ impl OpenExecute {
         }
     }
 
+    /// The call ended, or will end, with an error status.
+    pub const fn fail(&mut self) {
+        self.failed = true;
+    }
+
+    /// Records the caller's connection, which tells a client's abort from a lost
+    /// connection if the stream is dropped.
+    pub fn connection(&mut self, connection: Option<Liveness>) {
+        self.connection = connection;
+    }
+
+    /// Why the call ended in error, if it did not end answered: an error status is one; a
+    /// stream dropped on a connection that is still there is the client's abort; any other
+    /// drop, a connection gone or none to ask, is `Dropped`.
+    fn cause(&self) -> ErrorCause {
+        if self.failed {
+            return ErrorCause::Status;
+        }
+        match &self.connection {
+            Some(connection) if !connection.is_gone() => ErrorCause::ClientAbort,
+            _ => ErrorCause::Dropped,
+        }
+    }
+
     /// Marks the call answered without error.
     pub const fn ok(&mut self) {
         self.ok = true;
@@ -256,7 +356,7 @@ impl Drop for OpenExecute {
         if self.counted {
             self.metrics.requests.add(1);
             if !self.ok {
-                self.metrics.errors.add(1);
+                self.metrics.errors.add(self.cause());
             }
             self.metrics.total.since(self.started);
         }

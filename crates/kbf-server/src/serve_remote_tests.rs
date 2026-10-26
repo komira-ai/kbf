@@ -215,6 +215,7 @@ async fn worker(peer: &str, claims: &[(&str, String)]) -> (Code, String) {
             remote_addr: Some(addr(peer)),
         },
         certs: None,
+        live: kbf_tls::Liveness::default(),
     };
     let incoming = stream::unfold((socket, info), |(socket, info)| async move {
         let accepted = socket.accept().await.map(|(io, _real)| Conn {
