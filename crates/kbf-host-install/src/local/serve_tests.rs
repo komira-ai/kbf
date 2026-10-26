@@ -212,6 +212,24 @@ fn the_socket_is_0600_and_binds_only_where_it_is_safe() {
         fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    // The directory it was made in is gone, a leftover of an earlier start does not stop it,
+    // and a socket that cannot be made leaves nothing behind. The process umask (which every
+    // thread shares) was never what made the file private.
+    let staging = run.join(crate::local::serve::STAGING);
+    fs::create_dir(&staging).unwrap();
+    fs::write(staging.join("old"), "left by a start that died").unwrap();
+    let again = bind(&trust(&dir), &socket, ids).unwrap();
+    assert!(!staging.exists());
+    assert_eq!(fs::metadata(&socket).unwrap().mode() & 0o7777, 0o600);
+    drop(again);
+    let long = run.join("x".repeat(200));
+    assert!(bind(&trust(&dir), &long, ids).is_err());
+    assert!(!staging.exists());
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        let umask = status.lines().find_map(|l| l.strip_prefix("Umask:"));
+        assert_ne!(umask.map(str::trim), Some("0177"), "{status}");
+    }
+
     // A path with no directory, a directory that is not there, and a socket path whose
     // account cannot be given it.
     assert!(bind(&trust(&dir), Path::new("/"), ids).is_err());

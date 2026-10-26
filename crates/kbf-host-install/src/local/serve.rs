@@ -36,7 +36,7 @@
 //! cannot be opened. A revert is never held back by it.
 
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt, chown};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt, chown};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -225,7 +225,7 @@ pub fn passwd_ids(passwd: &str, name: &str) -> Option<(u32, u32)> {
 
 /// Bind the socket at `path` for the account `ids`: its directory is `trust`'s and closed
 /// to others, a stale socket file is removed (anything else in the way is not), the file is
-/// made with mode 0600 and owned by the account.
+/// made with mode 0600 and owned by the account. The process umask is never changed.
 ///
 /// # Errors
 /// Why the socket cannot be made.
@@ -246,13 +246,35 @@ pub fn bind(trust: &Trust, path: &Path, ids: (u32, u32)) -> io::Result<UnixListe
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    // Nobody can connect between the bind and the chown: the file is 0600 and root's.
-    let before = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o177));
-    let listener = UnixListener::bind(path);
-    rustix::process::umask(before);
-    let listener = listener?;
-    chown(path, Some(ids.0), Some(ids.1))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    // Nobody can connect between the bind and the chown: the file is made inside a directory
+    // of mode 0700 that is root's, then given its owner and mode, then moved into place. The
+    // process umask is not touched: it belongs to every thread, and a thread that makes a
+    // directory while it is 0o177 makes one that nobody can enter.
+    let staging = parent.join(STAGING);
+    match std::fs::remove_dir_all(&staging) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+    let made = bind_staged(&staging, path, ids);
+    let _ = std::fs::remove_dir_all(&staging);
+    made
+}
+
+/// The name, in the socket's directory, of the private directory a socket is made in.
+pub(super) const STAGING: &str = ".bind";
+
+/// Bind the socket in `staging` (private to this process), give it its owner and mode 0600,
+/// and move it to `path`.
+fn bind_staged(staging: &Path, path: &Path, ids: (u32, u32)) -> io::Result<UnixListener> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("the socket has no name"))?;
+    let made = staging.join(name);
+    let listener = UnixListener::bind(&made)?;
+    chown(&made, Some(ids.0), Some(ids.1))?;
+    std::fs::set_permissions(&made, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&made, path)?;
     Ok(listener)
 }
 
