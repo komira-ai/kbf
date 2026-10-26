@@ -646,11 +646,13 @@ mod tests {
         assert_eq!(metrics.inflight_bytes(), 60);
         assert_eq!(metrics.upload_waits.get(), 1);
         let held = in_flight::process().current();
-        if std::env::var_os("NEXTEST").is_some() {
-            assert_eq!(held, 10, "the bytes that arrived, not the 60 claimed");
-        } else {
-            assert!(held >= 10, "{held}");
-        }
+        // Alone in the process (cargo-nextest) the gauge holds only this test's bytes.
+        let most = std::env::var_os("NEXTEST").map_or(u64::MAX, |_| 10);
+        let arrived = 10..=most;
+        assert!(
+            arrived.contains(&held),
+            "{held}: the 10 that arrived, not the 60 claimed"
+        );
         assert!(!waiting_upload.is_finished());
 
         tokio::time::advance(IDLE - Duration::from_secs(1)).await;
