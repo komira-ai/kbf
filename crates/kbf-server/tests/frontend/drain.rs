@@ -177,9 +177,9 @@ async fn until_executing(ops: &mut Streaming<Operation>) {
 /// on the connection `client` already holds it surfaces as UNAVAILABLE from the service or
 /// as CANCELLED when the GOAWAY got there first (as in
 /// `an_open_execute_survives_stop_until_its_action_is_done`), or as INTERNAL when the
-/// connection the GOAWAY closed ended the call (the HTTP/2 layer reports a closed connection
-/// that way; the status then names the connection). Any other code, an INTERNAL that is not
-/// the connection closing, or an Execute that is answered, fails.
+/// frontend's GOAWAY (NO_ERROR) ended the call on that connection ([`GOAWAY_NO_ERROR`]). Any
+/// other code, any other INTERNAL (a GOAWAY with an error, a connection that failed), or an
+/// Execute that is answered, fails, and the whole status is printed.
 async fn assert_refused_after_the_wait(client: &Client, job: &Job) {
     let refused = execute_refusal(client, job).await;
     let refused = refused.expect("a new Execute is refused after the wait");
@@ -189,12 +189,17 @@ async fn assert_refused_after_the_wait(client: &Client, job: &Job) {
     );
 }
 
+/// How the HTTP/2 layer words a call ended by the peer's GOAWAY with NO_ERROR, the code the
+/// frontend's drain sends: the only INTERNAL that is a refusal after the wait.
+const GOAWAY_NO_ERROR: &str = "connection error received: not a result of an error";
+
 /// Whether `status` is how the frontend's refusal of new work after the wait reaches a client:
-/// UNAVAILABLE from the service, CANCELLED by the GOAWAY, or the connection the GOAWAY closed.
+/// UNAVAILABLE from the service, CANCELLED by the GOAWAY, or a call the GOAWAY (NO_ERROR)
+/// ended.
 fn is_a_refusal(status: &tonic::Status) -> bool {
     match status.code() {
         Code::Unavailable | Code::Cancelled => true,
-        Code::Internal => status.message().contains("connection"),
+        Code::Internal => status.message().contains(GOAWAY_NO_ERROR),
         _ => false,
     }
 }
