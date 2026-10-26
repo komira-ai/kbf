@@ -505,6 +505,12 @@ async fn a_part_is_on_the_wire_before_its_stream_has_ended() {
 /// a store that takes the whole part and never answers, and one that answers 500 and never
 /// sends the error it promised, each fail as a transport error that says no byte arrived
 /// within the request timeout, and not as the refusal of the store or an error of the body.
+///
+/// It uses the real clock, and that is deliberate: the stalled leg is a real socket, where
+/// tokio's paused clock cannot be used, and nothing races: the peer never sends, so the cut
+/// always comes whatever the load, and the test checks only the outcome, never how long it
+/// took. That progress resets the time is proved on a clock the test drives, in `src/s3/parts.rs`
+/// (`the_watchdog_sees_progress_in_a_poll_or_a_wait_for_the_source`).
 #[tokio::test]
 async fn a_request_that_makes_no_progress_is_cut_as_a_timeout() {
     let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
