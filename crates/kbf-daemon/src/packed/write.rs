@@ -532,7 +532,7 @@ pub(super) async fn load(group: &[Record]) -> Result<Vec<Blob>, CasError> {
 ///
 /// # Errors
 /// [`CasError::Read`] when a chunk cannot be read; [`CasError::Corrupt`] when the chunks
-/// together are longer than the digest says (shorter ones are caught when the blob is packed).
+/// together are longer than the digest says (shorter ones are caught by the hash of the bytes).
 pub(super) async fn gather(digest: &Digest, chunks: Chunks) -> Result<Vec<u8>, CasError> {
     let blob = label(digest);
     let size = usize::try_from(digest.size_bytes).unwrap_or(0);

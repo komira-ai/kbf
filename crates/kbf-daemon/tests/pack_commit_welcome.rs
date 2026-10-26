@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kbf_daemon::{Event, FakeRuntime, PackCommit};
+use kbf_proto::worker::{Welcome, server_message};
 use support::{Harness, PROMPT};
 
 /// Asserts that the handle is off until a Welcome says the frontend takes commits, on after
@@ -40,4 +41,28 @@ async fn welcomed(h: &mut Harness<FakeRuntime>) {
         })
         .await;
     assert!(seen.is_some(), "a Welcome was taken");
+}
+
+/// Asserts that a Welcome the daemon refuses does not turn the handle on, though it says the
+/// frontend takes commits: one of an unacceptable protocol version, and one with a heartbeat
+/// interval of zero. The daemon opens another stream after each refusal, which is how the test
+/// knows the Welcome was judged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_welcome_leaves_the_pack_commit_handle_alone() {
+    let commit = PackCommit::new();
+    let runtime = Arc::new(FakeRuntime::new(Duration::ZERO));
+    let mut h = Harness::with_pack_commit("pack-commit-refused", runtime, commit.clone()).await;
+    let mut peer = h.session().await;
+    peer.hello().await;
+    for (protocol_version, heartbeat_interval_ms) in [(2, 100), (1, 0)] {
+        peer.send(server_message::Message::Welcome(Welcome {
+            protocol_version,
+            heartbeat_interval_ms,
+            pack_commit: true,
+            ..Welcome::default()
+        }));
+        peer = h.session().await;
+        peer.hello().await;
+        assert!(!commit.enabled(), "version {protocol_version}");
+    }
 }

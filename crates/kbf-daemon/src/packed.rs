@@ -463,6 +463,11 @@ impl<C: Cas> Cas for PackedCas<C> {
             return C::put_chunks(&self.inner, digest, chunks).await;
         };
         let bytes = gather(&digest, chunks).await?;
+        // The packer hashes a blob only when it packs it, not when the index has it already or
+        // cannot be asked, and a put that falls back must not return a digest it was not given.
+        if blob_digest(&bytes) != wanted {
+            return Err(CasError::Corrupt(label(&digest), "other bytes".to_owned()));
+        }
         let blob = Blob {
             digest: wanted,
             bytes: Bytes::from(bytes),

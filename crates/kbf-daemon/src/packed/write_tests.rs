@@ -8,7 +8,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use futures::StreamExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
@@ -459,6 +459,76 @@ async fn a_put_does_not_return_before_its_commit() {
     assert!(rig.index.has(&digest_of(b"gated")));
 }
 
+/// A rig with an in-flight budget of 16 bytes.
+fn tight_rig() -> Rig {
+    let settings = WriteSettings {
+        inflight_bytes: 16,
+        ..WriteSettings::default()
+    };
+    Rig::with(settings, true)
+}
+
+/// Whether the whole in-flight budget (16 bytes) can be taken now.
+fn budget_is_free(rig: &Rig) -> bool {
+    let writes = rig.cas.writes.as_ref().expect("a plane that writes");
+    writes
+        .room(16)
+        .now_or_never()
+        .is_some_and(|room| room.is_some())
+}
+
+/// Asserts that the in-flight budget is given back when a put is done, and that a blob exactly
+/// the size of the budget fits it: with a budget of 16 bytes, two puts of 16 bytes in a row are
+/// both committed in packs (a put that kept its bytes would leave the second waiting for ever),
+/// and the whole budget is free after each.
+#[tokio::test]
+async fn the_budget_is_given_back_when_a_put_is_done() {
+    let rig = tight_rig();
+    rig.cas.put(vec![1; 16]).await.expect("first");
+    assert!(budget_is_free(&rig), "given back after the first put");
+    rig.cas.put(vec![2; 16]).await.expect("second");
+    assert!(budget_is_free(&rig), "given back after the second put");
+    assert_eq!(rig.index.commits(), 2);
+    assert_eq!(rig.under.calls(), Vec::<&str>::new());
+    assert_eq!(rig.writes().fallbacks.unfit, 0);
+    rig.assert_in_a_pack(&[2; 16]).await;
+}
+
+/// Asserts that a put holds its bytes of the budget until its commit is done, and that a put
+/// behind it waits for them: with the first commit held, the budget cannot be taken and the
+/// second put has stored no pack and sent no commit; once the commit is released both puts are
+/// committed in packs of their own and the budget is free. (No clock: the held commit is the
+/// only thing the first put waits for.)
+#[tokio::test]
+async fn a_put_waits_for_the_puts_ahead_to_give_bytes_back() {
+    let rig = tight_rig();
+    let entered = Arc::new(Notify::new());
+    let (release, hold) = channel();
+    rig.index.hold_next_commit(Arc::clone(&entered), hold);
+    let cas = Arc::clone(&rig.cas);
+    let first = tokio::spawn(async move { cas.put(vec![1; 16]).await });
+    entered.notified().await;
+    assert!(!budget_is_free(&rig), "held while the commit is");
+    let cas = Arc::clone(&rig.cas);
+    let second = tokio::spawn(async move { cas.put(vec![2; 16]).await });
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!second.is_finished(), "the second put went ahead");
+    assert_eq!(
+        rig.store.written().len(),
+        1,
+        "only the first pack is stored"
+    );
+    assert_eq!(rig.index.commits(), 1, "and only the first is committed");
+    release.send(()).expect("the commit is waiting");
+    first.await.expect("joined").expect("first");
+    second.await.expect("joined").expect("second");
+    assert_eq!(rig.index.commits(), 2);
+    assert_eq!(rig.writes().packs, 2);
+    assert!(budget_is_free(&rig));
+}
+
 /// Asserts the layering of `missing` when the plane writes packs: the plane underneath is asked
 /// only about the digests the index lacks, not at all when the index has every one, and a digest
 /// that is not SHA-256 (which the index cannot hold) goes to it too; the answer is the plane
@@ -771,6 +841,29 @@ async fn bytes_that_are_not_their_digest_are_refused() {
         (stats.packs, stats.fallbacks),
         (0, FallbackStats::default())
     );
+}
+
+/// Asserts that `put_chunks` of bytes that are not the digest named for them is `Corrupt` when
+/// the packer does not hash them either: the index cannot be asked which blobs it lacks (the
+/// packer fails before it hashes anything) and the index has the digest named already (the
+/// packer skips the blob). The plane underneath is not written, and nothing is returned for a
+/// digest the bytes do not have.
+#[tokio::test]
+async fn chunks_that_are_not_their_digest_are_refused_whatever_the_index_says() {
+    let rig = Rig::new();
+    let digest = digest_of(b"abcd");
+    rig.index.lookups_fail.store(true, Ordering::SeqCst);
+    let result = rig.cas.put_chunks(digest.clone(), chunks(&[b"abXd"])).await;
+    assert!(matches!(result, Err(CasError::Corrupt(..))), "{result:?}");
+
+    rig.index.lookups_fail.store(false, Ordering::SeqCst);
+    rig.cas.put(b"abcd".to_vec()).await.expect("put");
+    assert!(rig.index.has(&digest));
+    let result = rig.cas.put_chunks(digest, chunks(&[b"abXd"])).await;
+    assert!(matches!(result, Err(CasError::Corrupt(..))), "{result:?}");
+    assert_eq!(rig.under.calls(), Vec::<&str>::new());
+    assert_eq!(rig.index.commits(), 1);
+    assert!(budget_is_free(&rig), "the room is given back");
 }
 
 /// Asserts the handle's transitions: off until a `Welcome`
