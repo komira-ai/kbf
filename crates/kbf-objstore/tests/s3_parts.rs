@@ -5,7 +5,7 @@
 
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -461,6 +461,7 @@ async fn a_completion_answered_without_an_etag_is_a_protocol_error() {
 /// Asserts that a part is on the wire before its stream has ended, which is the reason it is
 /// streamed: the server has the first piece, and only then does the stream go on to give the
 /// last, so a request that held the whole part before it sent any of it would wait for ever.
+/// The 60 s `timeout` around the call only stops that hang; the test does not wait for it.
 #[tokio::test]
 async fn a_part_is_on_the_wire_before_its_stream_has_ended() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -494,7 +495,7 @@ async fn a_part_is_on_the_wire_before_its_stream_has_ended() {
     let store = store(&endpoint, CONDITIONAL, Duration::from_secs(30));
     let k = key("streamed");
     let sending = store.upload_part_stream(&k, "u-1", 1, 12, body);
-    let sent = tokio::time::timeout(Duration::from_secs(20), sending).await;
+    let sent = tokio::time::timeout(Duration::from_secs(60), sending).await;
     let tag = sent.expect("the part was held back").unwrap();
     assert_eq!(tag, "\"streamed\"");
     assert_eq!(serving.await.unwrap(), b"AAAABBBBCCCC");
@@ -502,7 +503,8 @@ async fn a_part_is_on_the_wire_before_its_stream_has_ended() {
 
 /// Asserts that a request that makes no progress is cut after a `request_timeout` without any:
 /// a store that takes the whole part and never answers, and one that answers 500 and never
-/// sends the error it promised, each fail as a timeout and not before the time is up.
+/// sends the error it promised, each fail as a transport error that says no byte arrived
+/// within the request timeout, and not as the refusal of the store or an error of the body.
 #[tokio::test]
 async fn a_request_that_makes_no_progress_is_cut_as_a_timeout() {
     let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -524,34 +526,47 @@ async fn a_request_that_makes_no_progress_is_cut_as_a_timeout() {
     let k = key("k");
     for endpoint in [silent_at, hung_at] {
         let store = store(&endpoint, CONDITIONAL, Duration::from_millis(200));
-        let began = Instant::now();
         let sent = store.upload_part_stream(&k, "u-1", 1, 3, pieces(&["abc"]));
         let error = sent.await.unwrap_err();
-        assert!(error.to_string().contains("timed out"), "{error}");
-        assert!(began.elapsed() >= Duration::from_millis(200));
+        let transport = matches!(error, ObjectStoreError::Transport(_));
+        assert!(transport, "{error:?}");
+        let text = error.to_string();
+        let stalled = "no byte arrived within the request timeout";
+        assert!(text.contains(stalled), "{text}");
     }
 }
 
-/// Asserts that a source that is slow to give a piece is not a stalled request: the part is
-/// stored although the source takes three times the `request_timeout` to give its second
-/// piece, since the wait is for the source, whose own limit is its owner's.
+/// Asserts that a source that is slow to give a piece is not a stalled request: the source
+/// gives its first piece and then holds its second until the test has seen the request wait
+/// for it (the source has been asked for the piece), then lets it go only after three times
+/// the request timeout has passed; the part is then stored whole, with the tag of all its
+/// bytes. The wait is for the source, whose own limit is its owner's. The clock is paused
+/// once the upload is created, so the wait is virtual time and takes no real time, and the
+/// 60 s `timeout` around the call is virtual too: it only stops a hang.
 #[tokio::test]
 async fn a_slow_source_does_not_stall_the_request() {
     let s3 = FakeS3::start().await;
     let store = store(s3.endpoint(), CONDITIONAL, Duration::from_millis(200));
     let k = key("slow");
     let id = store.create_multipart(&k).await.unwrap();
-    let late = async {
-        tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::time::pause();
+    let (asked, on_source) = oneshot::channel::<()>();
+    let (release, gate) = oneshot::channel::<()>();
+    let late = async move {
+        asked.send(()).unwrap();
+        gate.await.unwrap();
         ok("cd")
     };
     let body = stream::once(async { ok("ab") }).chain(stream::once(late));
-    let began = Instant::now();
-    let tag = store
-        .upload_part_stream(&k, &id, 1, 4, body.boxed())
-        .await
-        .unwrap();
-    assert!(began.elapsed() >= Duration::from_millis(600));
-    assert_eq!(tag, part_etag(b"abcd"));
+    let sending = store.upload_part_stream(&k, &id, 1, 4, body.boxed());
+    let letting_go = async move {
+        on_source.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        release.send(()).unwrap();
+    };
+    let both = futures::future::join(sending, letting_go);
+    let done = tokio::time::timeout(Duration::from_secs(60), both).await;
+    let (sent, ()) = done.expect("the part was held back");
+    assert_eq!(sent.unwrap(), part_etag(b"abcd"));
     assert_eq!(s3.stats().parts, 1);
 }
