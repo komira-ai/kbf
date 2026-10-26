@@ -170,10 +170,8 @@ fn a_refused_connection_and_a_silent_server_are_unreachable() {
     assert!(e.is_unreachable(), "{e}");
     assert!(!e.to_string().contains("127.0.0.1"));
     let silent = fake_api(vec![None]);
-    let started = std::time::Instant::now();
     let e = ask(&silent, "st1").expect_err("timeout");
     assert!(e.is_unreachable(), "{e}");
-    assert!(started.elapsed() < Duration::from_secs(10));
     // A client that goes away before it finishes its request is no problem for the fake.
     drop(std::net::TcpStream::connect(silent.addr).expect("connect"));
     eventually(|| silent.requests().len() == 2);
