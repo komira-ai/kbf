@@ -519,11 +519,6 @@ async fn a_drain_ends_only_the_streams_of_operations_that_can_never_start() {
     next(&mut waited).await.expect("healthy").expect("waiting");
     let gone = next(&mut waited).await.expect_err("second stream on it");
     assert_eq!(gone.code(), Code::Unavailable, "{gone:?}");
-    for n in [0, 2, 3] {
-        let quiet =
-            tokio::time::timeout(std::time::Duration::from_millis(300), streams[n].message());
-        assert!(quiet.await.is_err(), "stream {n} spoke or ended");
-    }
 
     let mut late = wait(1)
         .await
@@ -535,6 +530,13 @@ async fn a_drain_ends_only_the_streams_of_operations_that_can_never_start() {
         .expect("first operation");
     let gone = next(&mut late).await.expect_err("opened during the drain");
     assert_eq!(gone.code(), Code::Unavailable, "{gone:?}");
+
+    // The drain has ended every stream it ends (the waiting operation's three, above and
+    // just now), so a stream of an operation that can still start is untouched by now.
+    for n in [0, 2, 3] {
+        let quiet = futures::FutureExt::now_or_never(streams[n].message());
+        assert!(quiet.is_none(), "stream {n} spoke or ended: {quiet:?}");
+    }
 
     for n in [0, 2, 3] {
         script.set(n, Stage::Done(Finished::Ran(Box::default())));
