@@ -12,7 +12,7 @@ fn io_error() -> io::Error {
 /// One of every case, by its expected code.
 fn every_case() -> Vec<(&'static str, Refusal)> {
     let untrusted = |fault| Refusal::Untrusted {
-        path: "/usr/share/kbf-installer/trust/gh".into(),
+        path: "/usr/share/kbf/trust/gh".into(),
         fault,
     };
     let settings = |fault| Refusal::Settings {

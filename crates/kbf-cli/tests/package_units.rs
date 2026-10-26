@@ -6,7 +6,9 @@
 //! - a package unit for a mode `kbf` does not have (the files and `kbf_cli::names::MODES`
 //!   drifting apart);
 //! - a unit whose
-//!   `ExecStart=` or `ExecStartPre=` `kbf` line is a command line `kbf <mode>` refuses.
+//!   `ExecStart=` or `ExecStartPre=` `kbf` line is a command line `kbf <mode>` refuses;
+//! - a unit whose `kbf boot-check` line is not the one `kbf boot-check` takes, for the unit's
+//!   own mode, as the first `ExecStartPre=` and as root.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -32,19 +34,37 @@ fn units() -> Vec<(String, String)> {
     out
 }
 
-/// The `kbf` command lines of the unit (`ExecStart=` and `ExecStartPre=` that run the
-/// installer's `kbf`), as words after the program.
-fn kbf_lines(text: &str) -> Vec<Vec<String>> {
+/// Every `kbf` command line of the unit (`ExecStart=` and `ExecStartPre=` that run the
+/// package's `kbf`), as words after the program.
+fn exec_lines(text: &str) -> Vec<Vec<String>> {
     text.lines()
         .filter_map(|l| {
             let v = l
                 .strip_prefix("ExecStart=")
                 .or_else(|| l.strip_prefix("ExecStartPre="))?;
-            let mut w = v.split_whitespace().map(str::to_owned);
+            let mut w = v
+                .trim_start_matches('+')
+                .split_whitespace()
+                .map(str::to_owned);
             let program = w.next()?;
             program.ends_with("/kbf").then(|| w.collect())
         })
         .collect()
+}
+
+/// The command lines of the unit that start a mode or check it (`--mode=<mode> ...`): the
+/// unit's `kbf` lines but its `boot-check`.
+fn kbf_lines(text: &str) -> Vec<Vec<String>> {
+    let mut lines = exec_lines(text);
+    lines.retain(|w| w.first().is_none_or(|word| word != "boot-check"));
+    lines
+}
+
+/// The `kbf boot-check` command lines of the unit, as words after the program.
+fn boot_check_lines(text: &str) -> Vec<Vec<String>> {
+    let mut lines = exec_lines(text);
+    lines.retain(|w| w.first().is_some_and(|word| word == "boot-check"));
+    lines
 }
 
 /// Catches a package unit for a mode `kbf` lacks, and a mode of `kbf` with no unit.
@@ -54,6 +74,39 @@ fn the_package_has_a_unit_for_each_kbf_mode() {
     let mut want: Vec<String> = MODES.iter().map(|m| m.name.to_owned()).collect();
     want.sort();
     assert_eq!(have, want);
+}
+
+/// Asserts that every mode unit runs `kbf boot-check` exactly once, as root (`+`) and as the
+/// first `ExecStartPre=`, for its own mode and with no other flag, and that `kbf`'s own parser
+/// takes the line and reads the unit's mode and the default `installer.toml` from it.
+#[test]
+fn each_package_unit_runs_one_boot_check_for_its_own_mode_that_kbfs_own_parser_takes() {
+    let mut checked = 0;
+    for (mode, text) in units() {
+        let flag = format!("--mode={mode}");
+        let want = [["boot-check", flag.as_str()]];
+        assert_eq!(boot_check_lines(&text), want, "{mode}");
+        let first = text
+            .lines()
+            .find_map(|l| l.strip_prefix("ExecStartPre="))
+            .expect("a start check");
+        let line = format!("+/usr/bin/kbf boot-check {flag}");
+        assert_eq!(first, line, "{mode}");
+        let argv = ["kbf", "boot-check", flag.as_str()].map(OsString::from);
+        if mode == kbf_cli::names::ALL_IN_ONE {
+            // The unit is kept for one release; `kbf` refuses the mode it names.
+            let e = kbf_cli::boot_check::parse(&argv).expect_err("refused");
+            assert!(e.to_string().contains(kbf_cli::ALL_IN_ONE_REMOVED), "{e}");
+            checked += 1;
+            continue;
+        }
+        let parsed = kbf_cli::boot_check::parse(&argv).unwrap_or_else(|e| panic!("{mode}: {e}"));
+        assert_eq!(parsed.mode, mode);
+        let default = Path::new(kbf_cli::boot_check::DEFAULT_INSTALLER_CONFIG);
+        assert_eq!(parsed.installer_config, default, "{mode}");
+        checked += 1;
+    }
+    assert_eq!(checked, MODES.len(), "a mode unit was not checked");
 }
 
 /// Catches a unit command line `kbf <mode>` refuses: every `kbf` line of a package unit
@@ -69,6 +122,18 @@ fn each_package_unit_command_line_parses_with_kbfs_own_parser() {
     let config = frontend_config(&dir);
     for (mode, text) in units() {
         let lines = kbf_lines(&text);
+        if mode == kbf_cli::names::ALL_IN_ONE {
+            // The unit is kept for one release; `kbf` refuses the mode it names.
+            for line in lines {
+                let argv: Vec<OsString> = std::iter::once("kbf".to_owned())
+                    .chain(line)
+                    .map(OsString::from)
+                    .collect();
+                let e = kbf_cli::parse_from(argv).expect_err("refused");
+                assert!(e.to_string().contains(kbf_cli::ALL_IN_ONE_REMOVED), "{e}");
+            }
+            continue;
+        }
         assert!(
             lines.len() >= 2,
             "{mode}: fewer kbf lines than a check and a start"
@@ -133,9 +198,8 @@ fn argv_with(words: &[String], config: &Path) -> Vec<OsString> {
 /// Catches the plain frontend unit's command lines (`kbf-frontend.service`, for a host
 /// without the proxy) that `kbf`'s own parser refuses: both the `--check` line and the
 /// start, with the host's `kbf.toml` replaced by one that stands for the frontend, must
-/// parse to the frontend, the start not as a check. The defects, planted in the unit's
-/// own start line, must each be refused by that parser: a mode that does not exist, and
-/// `--instance` without `--handover-socket` (kbf refuses it).
+/// parse to the frontend, the start not as a check. A mode that does not exist, put in the
+/// unit's own start line, must be refused by that parser.
 #[test]
 fn the_plain_frontend_unit_command_lines_parse_with_kbfs_own_parser() {
     let (_, text) = units()
@@ -164,9 +228,5 @@ fn the_plain_frontend_unit_command_lines_parse_with_kbfs_own_parser() {
     assert!(
         refused(&|w| w[0] = "--mode=no-such-mode".into()),
         "an unknown mode parsed"
-    );
-    assert!(
-        refused(&|w| w.push("--instance=a".into())),
-        "--instance without --handover-socket parsed"
     );
 }

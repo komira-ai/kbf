@@ -19,6 +19,8 @@ bytes.workspace = true
 futures.workspace = true
 hex.workspace = true
 hmac.workspace = true
+# The body of a part streamed to the store (`s3::parts`).
+http-body.workspace = true
 # The segment footer format, read back by `footers`.
 kbf-segments.workspace = true
 # `Digest`, the key of a segment's index.
@@ -37,6 +39,7 @@ tracing.workspace = true
 # Loopback ports nothing can take (kbf_testkit::port).
 kbf-testkit.workspace = true
 clap.workspace = true
+http.workspace = true
 kbf-objstore = { workspace = true, features = ["testkit"] }
 tokio = { workspace = true, features = ["macros", "net", "io-util", "rt-multi-thread", "test-util"] }
 

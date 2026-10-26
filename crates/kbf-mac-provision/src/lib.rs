@@ -28,6 +28,8 @@
 //! - [`launchd`]: the LaunchDaemon property list the profile renders, the account it
 //!   runs as (`daemon_user`), and the restart.
 //! - `pool`: the lease-user pool `kbf-pool-<i>` and the volume its homes are on.
+//! - `vm_user`: the standing VM user `kbf-vm`, its password file, and auto-login as it.
+//! - `updater_user`: the updater agent's account `_kbf-updater` and the directories it writes.
 //! - [`record`]: the settings as `apply` first found them, and `revert`.
 //! - [`cli`]: flags and exit statuses.
 //!
@@ -42,7 +44,11 @@ pub mod profile;
 pub mod record;
 
 mod accounts;
+mod directory;
 mod pattern;
 mod pool;
 mod software;
 mod sshd;
+mod updater_user;
+
+pub mod vm_user;

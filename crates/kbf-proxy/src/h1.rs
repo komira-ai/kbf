@@ -15,10 +15,10 @@
 //!   protocols.
 //! - **Looks like HTTP/2.** The target becomes absolute (`http://<host>/path`, from `Host`)
 //!   and the connection-level headers an h2 hop may not carry are dropped, so the request
-//!   goes through the same route, auth, hold and upstream code as one that came over h2.
+//!   goes through the same route, auth and upstream code as one that came over h2.
 //!
-//! A held request stops hyper reading the next one on its connection (one request is in
-//! flight at a time), and at the hold's bound it is answered `503` with `Retry-After`.
+//! A request in flight stops hyper reading the next one on its connection (one request is in
+//! flight at a time).
 
 use http::header::{self, HeaderName};
 use http::uri::{Authority, Parts, Scheme};

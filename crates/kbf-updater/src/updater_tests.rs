@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use crate::api::{ErrorCode, Hosts, Phase, Roll, RollRequest, RollState};
 use crate::fakes::{
-    Event, FakeClock, FakeHealth, FakeInstaller, FakeSafeToStop, Log, safe, unsafe_because,
+    Event, FakeClock, FakeDrain, FakeFrontend, FakeHealth, FakeInstaller, FakeSafeToStop, Log,
+    safe, unsafe_because,
 };
 use crate::inventory::Inventory;
 use crate::ports::{Health, PortError, Stop};
@@ -22,7 +23,7 @@ pub(crate) fn inventory() -> Inventory {
     Inventory::parse(&format!(
         "st1 st1.farm.example storage {KEY}\n\
          fe  fe.farm.example frontend {KEY}\n\
-         dm  dm.farm.example daemon {KEY}\n\
+         dm  dm.farm.example daemon {KEY} dm-node\n\
          st2 st2.farm.example storage {KEY}\n"
     ))
     .expect("inventory")
@@ -49,8 +50,10 @@ pub(crate) struct Rig {
     pub log: Log,
     pub stop: FakeSafeToStop,
     pub inst: FakeInstaller,
+    pub drain: FakeDrain,
     pub health: FakeHealth,
     pub clock: FakeClock,
+    pub front: FakeFrontend,
 }
 
 impl Rig {
@@ -67,8 +70,10 @@ impl Rig {
             dir,
             stop: FakeSafeToStop::new(&log),
             inst: FakeInstaller::new(&log),
+            drain: FakeDrain::new(&log),
             health: FakeHealth::new(&log),
             clock: FakeClock::new(),
+            front: FakeFrontend::new(&log),
             log,
         }
     }
@@ -77,8 +82,10 @@ impl Rig {
         Ports {
             safe: Box::new(self.stop.clone()),
             installer: Box::new(self.inst.clone()),
+            drain: Box::new(self.drain.clone()),
             health: Box::new(self.health.clone()),
             clock: Box::new(self.clock.clone()),
+            frontend: Box::new(self.front.clone()),
         }
     }
 
@@ -91,7 +98,12 @@ impl Rig {
     }
 
     pub fn open_with(&self, store: RollStore) -> Updater {
-        match Updater::open(inventory(), store, self.ports(), Timing::default()) {
+        self.open_inventory(inventory(), store)
+    }
+
+    /// An updater over `inventory` in place of the standard one.
+    pub fn open_inventory(&self, inventory: Inventory, store: RollStore) -> Updater {
+        match Updater::open(inventory, store, self.ports(), Timing::default()) {
             Ok(u) => u,
             Err(e) => panic!("open: {e}"),
         }
@@ -120,13 +132,17 @@ fn failure_code(roll: &Roll) -> ErrorCode {
 }
 
 fn e(s: &str) -> Event {
-    // `ck:` check, `in:` install, `hl:` health, `qy:` query.
+    // `ck:` check, `in:` install, `hl:` health, `qy:` query, `dr:` drain (600 s), `ls:` read the
+    // node's leases, `ud:` undrain.
     let (kind, alias) = s.split_once(':').expect("kind:alias");
     let a = alias.to_owned();
     match kind {
         "ck" => Event::Check(a),
         "in" => Event::Install(a, "2.0".to_owned()),
         "hl" => Event::Health(a),
+        "dr" => Event::Drain(a, 600),
+        "ls" => Event::Leases(a),
+        "ud" => Event::Undrain(a),
         _ => Event::Query(a),
     }
 }
@@ -138,7 +154,9 @@ fn events(list: &[&str]) -> Vec<Event> {
 /// Catches an order that is not "the frontend first, then one host at a time, each fully
 /// healthy before the next is asked about": the exact call sequence of a clean roll. The
 /// frontend has no safe-to-stop; every node has one, immediately before its install, which
-/// is also the re-check after the previous host.
+/// is also the re-check after the previous host. A daemon host's node id is asked first, and
+/// its node is drained (600 s) and its leases read before the install, then undrained once the
+/// host is healthy (a held check, then a check for serving).
 #[test]
 fn a_clean_roll_goes_frontend_first_then_one_host_at_a_time() {
     let rig = Rig::new("clean");
@@ -155,8 +173,8 @@ fn a_clean_roll_goes_frontend_first_then_one_host_at_a_time() {
     assert_eq!(
         rig.log.events(),
         events(&[
-            "in:fe", "hl:fe", "ck:st1", "in:st1", "hl:st1", "ck:dm", "in:dm", "hl:dm", "ck:st2",
-            "in:st2", "hl:st2",
+            "in:fe", "hl:fe", "ck:st1", "in:st1", "hl:st1", "qy:dm", "ck:dm", "dr:dm", "ls:dm",
+            "in:dm", "hl:dm", "ud:dm", "hl:dm", "ck:st2", "in:st2", "hl:st2",
         ])
     );
     assert_eq!(
@@ -312,7 +330,15 @@ fn the_first_failure_stops_the_roll_and_no_later_host_is_touched() {
             }
         }
         assert_eq!(roll.hosts[at].attempts, 1);
-        assert_eq!(roll.hosts[at].detail.as_deref(), Some("dpkg: lock held"));
+        let note = if *failing == "dm" {
+            "; node dm-node (dm) is left drained"
+        } else {
+            ""
+        };
+        assert_eq!(
+            roll.hosts[at].detail,
+            Some(format!("dpkg: lock held{note}"))
+        );
         assert_eq!(
             rig.log.touching(failing).last(),
             Some(&e(&format!("in:{failing}")))

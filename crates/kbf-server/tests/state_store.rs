@@ -24,8 +24,8 @@ use kbf_state::fake::{Fake, Flaw};
 use kbf_state::postgres::{Flaw as PgFlaw, PostgresBackend, PostgresStore};
 use kbf_state::sqlite::{Options, SqliteStore};
 use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, Fenced, ManualClock, Revision, ScanPage, ScanRange,
-    Store, StoreError, StoreTime, Txn, Versioned,
+    Changes, Commit, CommitStats, Conflict, ManualClock, Revision, ScanPage, ScanRange, Store,
+    StoreError, StoreTime, Txn, Versioned,
 };
 use kbf_types::{
     ActionKey, Digest, DigestFunction, LeaseId, LeaseKind, MemoryRun, OperationId, Qos, Resources,
@@ -187,7 +187,7 @@ impl Flaky {
         }
     }
 
-    /// Another writer holds a newer generation: every write fails `Fenced`.
+    /// The store refuses writes as a superseded handle's: every write fails `Fenced`.
     fn set_fenced(&self) {
         self.fenced.store(true, Ordering::SeqCst);
     }
@@ -366,17 +366,9 @@ impl Disk {
         }))
     }
 
-    /// A farm over the store that holds the writer generation after the newest one, as a
-    /// process started over the file does ([`kbf_state::Fenced`]): once another farm takes
-    /// the next one, every write of this farm fails and none lands.
-    fn generation_farm(&self) -> TestFarm {
-        self.generation_farm_bounded(kbf_sched::MEMORY_FLOORS)
-    }
-
-    /// [`Disk::generation_farm`], keeping at most `bound` memory floors.
-    fn generation_farm_bounded(&self, bound: usize) -> TestFarm {
+    /// [`Disk::farm`] with `EpochPolicy::Keep`, keeping at most `bound` memory floors.
+    fn farm_bounded(&self, bound: usize) -> TestFarm {
         let store: Arc<dyn Store> = self.store.clone();
-        let fenced = Fenced::take(store, None).expect("the next generation");
         Farm::new(
             Arc::new(Cache::memory()),
             kbf_sched::UNSERVABLE_WAIT,
@@ -384,7 +376,7 @@ impl Disk {
         )
         .with_memory_floors(bound)
         .with_state(Some(StateStore {
-            store: Arc::new(fenced),
+            store,
             epoch: EpochPolicy::Keep,
             members: Default::default(),
             history: None,
@@ -1243,6 +1235,7 @@ fn listeners() -> Listeners {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -1859,20 +1852,20 @@ async fn a_stale_record_in_the_feed_does_not_drop_a_written_answers_detail() {
     assert_eq!(row, Finished::Failed(status), "the row is what was sent");
 }
 
-/// Catches: a finish written past the generation fence: the farm that a successor has
-/// fenced takes the worker's result, and its transaction (the operation's rows removed,
-/// the result put) must be refused as a whole. The store keeps the operation's lease and
-/// op rows and no result; the successor's recovery owns them.
+/// Asserts that a finish is not written when the store refuses the farm's writes as a
+/// superseded handle's: the farm takes the worker's result, and its transaction (the
+/// operation's rows removed, the result put) is refused as a whole. The store keeps the
+/// operation's lease and op rows and no result.
 #[tokio::test(start_paused = true)]
 async fn a_fenced_farm_cannot_finish_an_operation() {
     let disk = Disk::new();
-    let old = disk.generation_farm();
+    let old = disk.farm(EpochPolicy::Keep);
     let (_, mut inbox) = register(&old);
     submit(&old, request(1)).expect("submitted");
     let [lease] = starts(&mut inbox)[..] else {
         panic!("one lease expected");
     };
-    let _successor = disk.generation_farm();
+    disk.store.set_fenced();
     assert!(
         !accepted(&old, lease).await,
         "a fenced farm took the result"

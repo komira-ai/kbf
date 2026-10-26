@@ -5,24 +5,69 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use kbf_testkit::dir::TestDir;
 use serde_json::{Value, json};
 
-use crate::bundle::FILES;
+use crate::bundle::{FILES, Sizing};
 use crate::spec::{Event, LIMIT_EXCEEDED, VmSpec};
-use crate::system::{OfflineFile, Poll, Signature, System, VmProcess};
+use crate::system::{Clock, OfflineFile, Poll, Signature, System, VmProcess};
+
+/// A clock that moves only when something passes time: a quiet poll, a wait for the helper
+/// to exit, a pause. Every fake helper of one [`FakeSystem`] shares it, so a wait of a
+/// minute costs nothing and always ends at the same reading.
+#[derive(Debug, Default)]
+pub struct FakeClock(AtomicU64);
+
+impl FakeClock {
+    /// What the clock reads.
+    pub fn now(&self) -> Duration {
+        Duration::from_nanos(self.0.load(Ordering::SeqCst))
+    }
+
+    /// Moves the clock on by `d`.
+    pub fn advance(&self, d: Duration) {
+        let nanos = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        self.0.fetch_add(nanos, Ordering::SeqCst);
+    }
+}
+
+impl Clock for FakeClock {
+    fn now(&self) -> Duration {
+        FakeClock::now(self)
+    }
+    fn pause(&self, d: Duration) {
+        self.advance(d);
+    }
+}
 
 /// What one scripted helper does.
 #[derive(Clone)]
 pub struct Script {
     /// Answers to `poll`, in order; then `Quiet`.
     pub events: Vec<Poll>,
-    /// Files the "guest" writes into `<automount>/results/` as soon as the helper starts.
+    /// Files the "guest" delivers as soon as the helper starts: over vsock into the spec's
+    /// results directory when it has one (as a real guest does), else into
+    /// `<automount>/results/`.
     pub guest_files: Vec<(String, String)>,
+    /// Files the "guest" writes into the share's `results/` directory whatever the spec
+    /// says (the fallback path, or a guest faking a frame).
+    pub share_files: Vec<(String, String)>,
+    /// Files delivered like `guest_files` but only once the helper has been polled this many
+    /// times: a guest whose frames arrive one after another.
+    pub late_files: Vec<(u32, String, String)>,
     /// Whether the helper exits after `request_stop`.
     pub exits_on_stop: bool,
+    /// Whether the guest obeys a shutdown request (the helper then exits by itself).
+    pub obeys_shutdown: bool,
+    /// What the helper reports about its vsock `shutdown` command when asked to shut the
+    /// guest down: whether the guest acked, and why not. `None`: nothing is reported.
+    pub shutdown_command: Option<(bool, String)>,
+    /// How long after the shutdown request an obeying guest takes to stop.
+    pub gone_after: Duration,
     /// What the helper's log tail says.
     pub log: Option<String>,
 }
@@ -33,7 +78,12 @@ impl Script {
         Self {
             events: vec![Poll::Event(Event::Started { ms: 100 })],
             guest_files: Vec::new(),
+            share_files: Vec::new(),
+            late_files: Vec::new(),
             exits_on_stop: true,
+            obeys_shutdown: true,
+            shutdown_command: None,
+            gone_after: Duration::ZERO,
             log: None,
         }
     }
@@ -52,7 +102,12 @@ impl Script {
                 code: code.map(str::to_owned),
             })],
             guest_files: Vec::new(),
+            share_files: Vec::new(),
+            late_files: Vec::new(),
             exits_on_stop: true,
+            obeys_shutdown: true,
+            shutdown_command: None,
+            gone_after: Duration::ZERO,
             log: None,
         }
     }
@@ -60,6 +115,45 @@ impl Script {
     /// Adds a file the guest writes.
     pub fn with_guest_file(mut self, name: &str, body: &str) -> Self {
         self.guest_files.push((name.to_owned(), body.to_owned()));
+        self
+    }
+
+    /// Adds a file the guest writes into the share's `results/` directory itself.
+    pub fn with_share_file(mut self, name: &str, body: &str) -> Self {
+        self.share_files.push((name.to_owned(), body.to_owned()));
+        self
+    }
+
+    /// Adds a frame the guest delivers after the helper has been polled `polls` times.
+    pub fn delivering_after(mut self, polls: u32, name: &str, body: &str) -> Self {
+        self.late_files
+            .push((polls, name.to_owned(), body.to_owned()));
+        self
+    }
+
+    /// A guest whose daemon acks the vsock `shutdown` command (and then, unless it is
+    /// also [`deaf`](Self::deaf), shuts down).
+    pub fn acking_shutdown(mut self) -> Self {
+        self.shutdown_command = Some((true, "acked".to_owned()));
+        self
+    }
+
+    /// A guest whose daemon does not answer the vsock command (`why` is the helper's
+    /// reason); the helper falls back to the stop request.
+    pub fn unreachable_by_vsock(mut self, why: &str) -> Self {
+        self.shutdown_command = Some((false, why.to_owned()));
+        self
+    }
+
+    /// A guest that takes `after` to stop once asked to shut down.
+    pub fn stopping_after(mut self, after: Duration) -> Self {
+        self.gone_after = after;
+        self
+    }
+
+    /// A guest that ignores a shutdown request.
+    pub fn deaf(mut self) -> Self {
+        self.obeys_shutdown = false;
         self
     }
 
@@ -79,9 +173,19 @@ impl Script {
 pub struct FakeProc {
     pid: u32,
     events: VecDeque<Poll>,
+    /// Frames still to arrive: the poll count they are due at, where, and what.
+    late: Vec<(u32, PathBuf, String)>,
+    polls: u32,
     killed: bool,
     stop_asked: bool,
+    shutdown_asked: bool,
     exits_on_stop: bool,
+    obeys_shutdown: bool,
+    shutdown_command: Option<(bool, String)>,
+    gone_after: Duration,
+    /// When the shutdown was requested.
+    shutdown_at: Duration,
+    clock: Arc<FakeClock>,
     log: Option<String>,
 }
 
@@ -93,6 +197,15 @@ impl VmProcess for FakeProc {
         self.pid
     }
     fn poll(&mut self, wait: Duration) -> Poll {
+        self.polls += 1;
+        let polls = self.polls;
+        self.late.retain(|(due, path, body)| {
+            let arrived = polls >= *due;
+            if arrived {
+                std::fs::write(path, body).expect("late guest file");
+            }
+            !arrived
+        });
         if self.killed {
             return Poll::Gone {
                 code: None,
@@ -100,18 +213,38 @@ impl VmProcess for FakeProc {
             };
         }
         self.events.pop_front().unwrap_or_else(|| {
-            std::thread::sleep(wait.min(Duration::from_millis(1)));
+            self.clock.advance(wait);
             Poll::Quiet
         })
     }
     fn kill9(&mut self) {
         self.killed = true;
     }
+    fn request_shutdown(&mut self) {
+        self.shutdown_asked = true;
+        self.shutdown_at = self.clock.now();
+        if let Some((acked, detail)) = self.shutdown_command.take() {
+            self.events.push_back(Poll::Event(Event::ShutdownCommand {
+                acked,
+                detail,
+                ms: 1,
+            }));
+        }
+    }
     fn request_stop(&mut self) {
         self.stop_asked = true;
     }
-    fn wait_gone(&mut self, _wait: Duration) -> bool {
-        self.killed || (self.stop_asked && self.exits_on_stop)
+    fn wait_gone(&mut self, wait: Duration) -> bool {
+        if self.killed || (self.stop_asked && self.exits_on_stop) {
+            return true;
+        }
+        if !(self.shutdown_asked && self.obeys_shutdown) {
+            return false;
+        }
+        let since = |c: &FakeClock| c.now().saturating_sub(self.shutdown_at);
+        let left = self.gone_after.saturating_sub(since(&self.clock));
+        self.clock.advance(left.min(wait));
+        since(&self.clock) >= self.gone_after
     }
 }
 
@@ -128,6 +261,10 @@ pub struct FakeSystem {
     /// Runs after each successful clone with the destination path.
     pub after_clone: RefCell<Option<CloneHook>>,
     pub cloned: RefCell<Vec<(PathBuf, PathBuf)>>,
+    /// Every path `clear_immutable` was asked about, in order.
+    pub unflagged: RefCell<Vec<PathBuf>>,
+    /// Makes `clear_immutable` fail.
+    pub unflag_fails: Cell<bool>,
     pub identity: RefCell<Result<Vec<u8>, String>>,
     pub uid: Cell<u32>,
     pub ppid: Cell<u32>,
@@ -138,14 +275,23 @@ pub struct FakeSystem {
     pub sig: RefCell<Result<Signature, String>>,
     pub offline: RefCell<Result<Value, String>>,
     pub offline_calls: RefCell<Vec<(PathBuf, Vec<String>)>>,
+    pub harvest: RefCell<Result<Value, String>>,
+    pub harvest_calls: RefCell<Vec<(PathBuf, PathBuf)>>,
+    pub table: RefCell<Result<String, String>>,
     pub fetch: RefCell<Result<(), String>>,
     pub fetch_body: RefCell<Vec<u8>>,
     pub fetched: RefCell<Vec<String>>,
     pub install: RefCell<Result<Value, String>>,
-    pub installs: RefCell<Vec<(PathBuf, PathBuf, u64)>>,
+    pub installs: RefCell<Vec<(PathBuf, PathBuf, Sizing)>>,
+    /// Runs after each install with the bundle directory.
+    pub after_install: RefCell<Option<CloneHook>>,
+    pub stage: RefCell<Result<Value, String>>,
+    pub stage_calls: RefCell<Vec<(PathBuf, crate::stage::Plan)>>,
     pub helper: RefCell<Result<(), String>>,
     pub helper_specs: RefCell<Vec<VmSpec>>,
     next_pid: Cell<u32>,
+    /// The time the probes read: see [`FakeClock`].
+    pub clock: Arc<FakeClock>,
 }
 
 impl FakeSystem {
@@ -158,6 +304,8 @@ impl FakeSystem {
             clone_budget: Cell::new(None),
             after_clone: RefCell::new(None),
             cloned: RefCell::new(Vec::new()),
+            unflagged: RefCell::new(Vec::new()),
+            unflag_fails: Cell::new(false),
             identity: RefCell::new(Ok(b"fresh-id".to_vec())),
             uid: Cell::new(501),
             ppid: Cell::new(1234),
@@ -168,14 +316,23 @@ impl FakeSystem {
             sig: RefCell::new(Ok(good_signature())),
             offline: RefCell::new(Ok(json!({"written": 5}))),
             offline_calls: RefCell::new(Vec::new()),
+            harvest: RefCell::new(Ok(json!({"copied": []}))),
+            harvest_calls: RefCell::new(Vec::new()),
+            table: RefCell::new(Ok(String::new())),
             fetch: RefCell::new(Ok(())),
             fetch_body: RefCell::new(b"ipsw-bytes".to_vec()),
             fetched: RefCell::new(Vec::new()),
-            install: RefCell::new(Ok(json!({"macos_version": "27.0.0"}))),
+            install: RefCell::new(Ok(
+                json!({"macos_version": "27.0.0", "cpus": 2, "memory_mib": 4096}),
+            )),
+            stage: RefCell::new(Ok(json!({"xcode": null, "runtimes": null}))),
+            stage_calls: RefCell::new(Vec::new()),
             installs: RefCell::new(Vec::new()),
+            after_install: RefCell::new(None),
             helper: RefCell::new(Ok(())),
             helper_specs: RefCell::new(Vec::new()),
             next_pid: Cell::new(1000),
+            clock: Arc::new(FakeClock::default()),
         }
     }
 
@@ -195,6 +352,18 @@ pub fn good_signature() -> Signature {
 }
 
 impl System for FakeSystem {
+    fn clock(&self) -> Arc<dyn Clock> {
+        self.clock.clone()
+    }
+
+    fn clear_immutable(&self, path: &Path) -> io::Result<()> {
+        self.unflagged.borrow_mut().push(path.to_owned());
+        if self.unflag_fails.get() {
+            return Err(io::Error::other("EPERM"));
+        }
+        Ok(())
+    }
+
     fn clonefile(&self, src: &Path, dst: &Path) -> io::Result<()> {
         let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if *self.clone_fails_on.borrow() == Some(name) {
@@ -228,21 +397,45 @@ impl System for FakeSystem {
             .borrow_mut()
             .pop_front()
             .unwrap_or_else(Script::booted);
-        if let Some(dir) = &spec.automount_dir {
-            for (name, body) in &script.guest_files {
-                let path = dir.join("results").join(name);
-                std::fs::create_dir_all(path.parent().expect("parent")).expect("results dir");
+        let write = |dir: &Path, files: &[(String, String)]| {
+            for (name, body) in files {
+                let path = dir.join(name);
+                std::fs::create_dir_all(dir).expect("results dir");
                 std::fs::write(path, body).expect("guest file");
             }
+        };
+        let mut late = Vec::new();
+        if let Some(dir) = &spec.automount_dir {
+            let share = dir.join("results");
+            write(&share, &script.share_files);
+            match &spec.results_dir {
+                Some(received) => write(received, &script.guest_files),
+                None => write(&share, &script.guest_files),
+            }
+            let into = spec.results_dir.clone().unwrap_or(share);
+            std::fs::create_dir_all(&into).expect("results dir");
+            late = script
+                .late_files
+                .iter()
+                .map(|(n, name, body)| (*n, into.join(name), body.clone()))
+                .collect();
         }
         let pid = self.next_pid.get();
         self.next_pid.set(pid + 1);
         Ok(Box::new(FakeProc {
             pid,
             events: script.events.into(),
+            late,
+            polls: 0,
             killed: false,
             stop_asked: false,
+            shutdown_asked: false,
             exits_on_stop: script.exits_on_stop,
+            obeys_shutdown: script.obeys_shutdown,
+            shutdown_command: script.shutdown_command,
+            gone_after: script.gone_after,
+            shutdown_at: self.clock.now(),
+            clock: self.clock.clone(),
             log: script.log,
         }))
     }
@@ -275,6 +468,21 @@ impl System for FakeSystem {
         ));
         self.offline.borrow().clone()
     }
+    fn offline_stage(&self, disk: &Path, plan: &crate::stage::Plan) -> Result<Value, String> {
+        self.stage_calls
+            .borrow_mut()
+            .push((disk.to_owned(), plan.clone()));
+        self.stage.borrow().clone()
+    }
+    fn offline_harvest(&self, disk: &Path, out: &Path) -> Result<Value, String> {
+        self.harvest_calls
+            .borrow_mut()
+            .push((disk.to_owned(), out.to_owned()));
+        self.harvest.borrow().clone()
+    }
+    fn process_table(&self) -> Result<String, String> {
+        self.table.borrow().clone()
+    }
     fn fetch(&self, url: &str, dest: &Path) -> Result<(), String> {
         self.fetched.borrow_mut().push(url.to_owned());
         let r = self.fetch.borrow().clone();
@@ -283,10 +491,13 @@ impl System for FakeSystem {
         }
         r
     }
-    fn install_image(&self, ipsw: &Path, out: &Path, disk_gib: u64) -> Result<Value, String> {
+    fn install_image(&self, ipsw: &Path, out: &Path, sizing: &Sizing) -> Result<Value, String> {
         self.installs
             .borrow_mut()
-            .push((ipsw.to_owned(), out.to_owned(), disk_gib));
+            .push((ipsw.to_owned(), out.to_owned(), *sizing));
+        if let Some(hook) = &*self.after_install.borrow() {
+            hook(out);
+        }
         self.install.borrow().clone()
     }
     fn run_vm_helper(&self, spec: &VmSpec) -> Result<(), String> {
@@ -324,6 +535,9 @@ pub fn ctx<'a>(sys: &'a FakeSystem, work: &Path) -> crate::probe::Ctx<'a> {
         work: work.to_owned(),
         base: work.join("base"),
         guest_binary: None,
+        keep: false,
+        graphics: false,
+        matrix: false,
         timing: crate::probe::Timing::instant(),
     }
 }

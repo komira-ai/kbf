@@ -8,6 +8,14 @@
 //!   advisories`, kept in one GitHub issue (opened, updated, or commented on and closed when
 //!   none remain) instead of failing a pull request. Exit 0 whatever it found; 1 when
 //!   cargo-deny or `gh` failed. `advisories.yml` runs it daily and on every push to `main`.
+//! - `deploy-farm --url <url> --version <v> [--deadline-min 60] [--stall-min 20]` ([`deploy_farm`]): after a
+//!   release is published, set it as the update coordinator's desired version (CI's OIDC token)
+//!   and wait until the farm converges; exit 1 when it is blocked, stalled or out of time. An
+//!   empty `--url` prints a notice and exits 0.
+//! - `prove-farm --address <grpc url> --instance <name> --tls <true|false> --properties <k=v,...> --buck2 <path>
+//!   --project <dir> --nonce <text>` ([`prove_farm`]): after the deploy, build a small Buck2 project against the
+//!   farm, remote only, and exit 1 unless some action ran remotely and none locally. An empty `--address` prints a
+//!   notice and exits 0.
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
 //!   row the working tree's budget file has and `<rev>`'s does not is refused, unless
 //!   git sees the row's path renamed from a path `<rev>` has a row for. CI runs
@@ -27,23 +35,26 @@
 //!   ([`installer_tarball`]): the files the Debian package ships, at the same paths and
 //!   modes (one list, [`pkg_linux::files`]), in a tarball that is the same bytes on every
 //!   runner, for `packaging/install.sh`.
-//! - `pkg-config`, `pkg-build`, `pkg-install-test` ([`pkg_linux`], [`pkg_install`]): the
-//!   `kbf-installer` deb and rpm and the `kbf` deb and rpm (`/usr/bin/kbf` and the units of
-//!   the modes): the nfpm configuration of both from the inputs, a package built twice to
-//!   prove the bytes, and, for `kbf-installer`, an install, remove and purge in a container.
-//! - `pkg-trust` and `pkg-asset` ([`pkg_trust`], [`pkg_asset`]): the trust directory of the
-//!   package from the pinned `gh`, `gh`'s trusted root and the branch the package is
-//!   attested on, and the built deb as the release asset
-//!   `kbf-installer-<commit>-<platform>.deb`, refused unless it holds the binary of the
-//!   attested tarball and trusts the branch it is attested for, and holds nothing of the
-//!   `kbf` package.
+//! - `pkg-config`, `pkg-build`, `pkg-install-test`, `pkg-upgrade-test` ([`pkg_linux`],
+//!   [`pkg_install`], [`pkg_upgrade`]): the `kbf` deb and rpm (`/usr/bin/kbf`, the units of
+//!   the modes and `kbf.slice`, the sysusers, tmpfiles and needrestart files, and the trust
+//!   directory): the nfpm configuration from the inputs, a package built twice to prove the
+//!   bytes, an install, remove and purge in a container, and the upgrade of a host that has
+//!   the `kbf-installer` deb of the release before.
+//! - `pkg-trust` ([`pkg_trust`]): the trust directory of the packages from the pinned `gh`,
+//!   `gh`'s trusted root and the branch the package is attested on.
 //! - `pkg-kbf-asset` ([`pkg_kbf_asset`]): the `kbf` deb as the release asset
 //!   `kbf-<commit>-<platform>.deb`, refused unless its `/usr/bin/kbf` is the `kbf` of the
-//!   attested tarball, it depends on `kbf-installer` of its own version or later and replaces
-//!   `kbf-installer`, and it holds the units of the modes and nothing else.
-//! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf-installer` package
+//!   attested tarball, it replaces and breaks the old `kbf-installer`, it holds the units
+//!   of the modes, the slice, the sysusers and tmpfiles files, the drop-in and a trust
+//!   directory that trusts the branch it is attested for, and nothing else.
+//! - `pkg-image-asset` ([`pkg_image_asset`]): the frontend or coordinator OCI image tarball as the
+//!   release asset `kbf-<service>-image-<commit>-<platform>.oci.tar`, refused unless its program
+//!   is the attested `kbf` (frontend) or the built `kbf-coordinator`, it runs as a user that is
+//!   not root with the service's entrypoint, and it is built for the platform.
+//! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf` package
 //!   carries, in the one form a deb and an rpm put in the same order, and the most a package
-//!   that carries a kbf release may weigh. `pkg-config` and `pkg-asset` take them up with
+//!   that carries a kbf release may weigh. `pkg-config` and `pkg-kbf-asset` take them up with
 //!   the release.
 //! - `pkg-macos-asset` and `pkg-macos-install-test` ([`pkg_macos_asset`],
 //!   [`pkg_macos_install`]): the Mac `.pkg` as the release asset
@@ -72,14 +83,14 @@
 //!   with its line in `SHA256SUMS.<platform>`. The release set holds it for every `kbf`
 //!   tarball (`verify-assets sums`, `release check`), because only a runner of a platform
 //!   can run its binary.
+//! - `runner-disk --path <path> --min-free-gb <n>` ([`runner_disk`]): exit 1 naming the disk
+//!   when the disk of `<path>` has less free space than the coverage run needs.
 //! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
 //!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
 //!   unit.
 //! - `sudo-test -p <package> --test <name> [--sudo <path>] [-- <test args>]`
 //!   ([`sudo_test`]): one integration test target built as this user, then its
 //!   `#[ignore]` tests run as root through `sudo -n`.
-//! - `proxy-loom` ([`proxy_loom`]): the loom models of kbf-proxy's slot and gate, built under
-//!   `--cfg kbf_loom` in their own target directory.
 //!
 //! Exit status: 0 when the check passed, 1 when it failed (one reason per line on
 //! stderr), 2 on a usage error.
@@ -97,12 +108,14 @@ pub mod build_commit;
 pub mod bundles;
 pub mod crun_tests;
 pub mod darwin;
+pub mod deploy_farm;
 pub mod entitlements;
 pub mod fetch;
 pub mod installer_tarball;
 pub mod package;
 pub mod pkg;
 pub mod pkg_asset;
+pub mod pkg_image_asset;
 pub mod pkg_install;
 pub mod pkg_kbf_asset;
 pub mod pkg_linux;
@@ -111,9 +124,11 @@ pub mod pkg_macos_asset;
 pub mod pkg_macos_install;
 pub mod pkg_size;
 pub mod pkg_trust;
+pub mod pkg_upgrade;
 pub mod pkg_version;
-pub mod proxy_loom;
+pub mod prove_farm;
 pub mod release;
+pub mod runner_disk;
 pub mod sudo_test;
 pub mod sums;
 pub mod version_facts;
@@ -170,11 +185,29 @@ enum Verb {
     BuildCommit(BuildCommit),
     /// Keep the advisories `cargo deny` reports in one GitHub issue.
     Advisories(advisories::Args),
+    /// Set a published release as the farm's desired version on the update coordinator and
+    /// wait for the farm to converge.
+    DeployFarm(deploy_farm::Args),
+    /// Prove the farm after a deploy with a remote-only Buck2 build of a small project.
+    ProveFarm(prove_farm::Args),
+    /// Check that the runner's disk has the room the coverage run needs.
+    RunnerDisk(runner_disk::Args),
     /// Refuse a row the budget file gains against `--base`.
     BudgetDiff {
         /// The revision to compare with (on a pull request, the base branch).
         #[arg(long)]
         base: String,
+    },
+    /// Append `SOURCE_DATE_EPOCH=<seconds>`, the committer time of `--commit`, to `--output`
+    /// (on Actions, `GITHUB_ENV`), so a later step builds an image that carries the commit's
+    /// time and no clock of the build's.
+    SourceDateEpoch {
+        /// The commit (`$GITHUB_SHA`), 12 to 40 lowercase hex digits.
+        #[arg(long)]
+        commit: String,
+        /// The file to append the line to.
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Download a pinned file, check its SHA-256 and install it (mode 0755).
     Fetch {
@@ -244,17 +277,13 @@ enum Verb {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Write the nfpm configuration and the file listing of the kbf-installer packages, and of
-    /// the kbf packages in `<out>/kbf`.
+    /// Write the nfpm configuration and the file listing of the kbf packages.
     PkgConfig {
-        /// The kbf-installer binary.
-        #[arg(long)]
-        binary: PathBuf,
         /// The kbf binary the kbf packages carry at `/usr/bin/kbf` (mode 0755).
         #[arg(long)]
         kbf: PathBuf,
-        /// The directory of `kbf-*.service` files: the units of the modes go in the kbf
-        /// packages, the others in the kbf-installer packages.
+        /// The directory of unit files: the kbf packages take the units of the modes and
+        /// `kbf.slice` from it.
         #[arg(long)]
         units: PathBuf,
         /// The directory of the three trust files.
@@ -279,8 +308,7 @@ enum Verb {
         /// Take the version from this binary's `--version` (`<version>+<12 of the commit>`).
         #[arg(long)]
         version_of: Option<PathBuf>,
-        /// The directory `nfpm.yaml` and `listing.txt` go in; created when missing. The kbf
-        /// package's pair goes in `<out>/kbf`.
+        /// The directory `nfpm.yaml` and `listing.txt` go in; created when missing.
         #[arg(long)]
         out: PathBuf,
     },
@@ -299,7 +327,7 @@ enum Verb {
         #[arg(long, default_value_t = pkg_linux::SOURCE_DATE_EPOCH)]
         source_date_epoch: u64,
     },
-    /// Write the trust directory of the kbf-installer packages: the pinned `gh`, the
+    /// Write the trust directory of the packages: the pinned `gh`, the
     /// Sigstore trusted root, and an `installer.conf` trusting the branch given.
     PkgTrust {
         /// The pinned `gh` program (copied, mode 0755).
@@ -315,9 +343,11 @@ enum Verb {
         #[arg(long)]
         out: PathBuf,
     },
-    /// The kbf-installer deb as a release asset, refused unless it holds the attested
-    /// binary and trusts the branch it is attested for.
-    PkgAsset {
+    /// The kbf deb as a release asset, refused unless its `/usr/bin/kbf` is the attested
+    /// `kbf`, it replaces and breaks the old kbf-installer, and it holds the units of the
+    /// modes, the slice, the sysusers and tmpfiles files and a trust directory that trusts
+    /// the branch it is attested for, and nothing else.
+    PkgKbfAsset {
         /// The deb nfpm built, or the directory holding the one (with `--verify-only`: the
         /// asset itself).
         #[arg(long)]
@@ -328,9 +358,9 @@ enum Verb {
         /// The commit it was built from (`$GITHUB_SHA`).
         #[arg(long)]
         commit: String,
-        /// The `kbf-installer-<commit>-<platform>.tar.gz` whose binary the deb must hold.
+        /// The `kbf-<commit>-<platform>.tar.gz` whose `kbf` the deb must hold.
         #[arg(long)]
-        binary_tarball: PathBuf,
+        kbf_tarball: PathBuf,
         /// The branch the deb must trust, and is attested for (`$GITHUB_REF`).
         #[arg(long)]
         expect_ref: String,
@@ -348,23 +378,30 @@ enum Verb {
         #[arg(long)]
         verify_only: bool,
     },
-    /// The kbf deb as a release asset, refused unless its `/usr/bin/kbf` is the attested
-    /// `kbf`, it depends on the kbf-installer of its own version or later and replaces it,
-    /// and it holds the units of the modes and nothing else.
-    PkgKbfAsset {
-        /// The deb nfpm built, or the directory holding the one (with `--verify-only`: the
-        /// asset itself).
+    /// The frontend or coordinator OCI image tarball as a release asset, refused unless its
+    /// program is the attested `kbf` (or the built `kbf-coordinator`), its entrypoint is the
+    /// service's, it runs as a user that is not root and it is built for the platform.
+    PkgImageAsset {
+        /// The image tarball `docker buildx build --output type=docker,oci-mediatypes=true` wrote (with
+        /// `--verify-only`: the asset itself).
         #[arg(long)]
-        package: PathBuf,
+        image: PathBuf,
+        /// The service the image runs.
+        #[arg(long, value_enum)]
+        service: pkg_image_asset::Image,
         /// The platform it was built for (`linux-x86_64`, `linux-arm64`).
         #[arg(long, value_enum)]
         platform: package::Platform,
         /// The commit it was built from (`$GITHUB_SHA`).
         #[arg(long)]
         commit: String,
-        /// The `kbf-<commit>-<platform>.tar.gz` whose `kbf` the deb must hold.
-        #[arg(long)]
-        kbf_tarball: PathBuf,
+        /// The frontend's `kbf-<commit>-<platform>.tar.gz` whose `kbf` the image must hold.
+        #[arg(long, conflicts_with = "binary")]
+        kbf_tarball: Option<PathBuf>,
+        /// The coordinator's `kbf-coordinator` the image must hold (it has no tarball; not
+        /// with `--verify-only`, where the build's file is not at hand).
+        #[arg(long, conflicts_with = "verify_only")]
+        binary: Option<PathBuf>,
         /// The directory the asset and its line of `SHA256SUMS.<platform>` go in.
         #[arg(
             long,
@@ -372,12 +409,15 @@ enum Verb {
             conflicts_with = "verify_only"
         )]
         out: Option<PathBuf>,
-        /// Only check `--package`, which must be named as the asset; write nothing.
+        /// Only check `--image`, which must be named as the asset; write nothing.
         #[arg(long)]
         verify_only: bool,
     },
     /// Install a package into a fresh container and check it never starts or enables.
     PkgInstallTest {
+        /// The package's name, as the package manager knows it (`kbf`).
+        #[arg(long)]
+        name: String,
         /// The package, or the directory holding the one package of its format.
         #[arg(long)]
         package: PathBuf,
@@ -397,6 +437,29 @@ enum Verb {
         /// contain: `<program> <argument>..::<text>` (the command exits 0).
         #[arg(long)]
         probe: Vec<pkg_install::Probe>,
+        /// The docker program.
+        #[arg(long, default_value = "docker")]
+        docker: PathBuf,
+    },
+    /// Take the kbf deb over a host that has the kbf-installer deb and the kbf deb of the
+    /// release before, in a fresh container, and check the files change hands and the users
+    /// are kept.
+    PkgUpgradeTest {
+        /// The kbf-installer deb of the release before.
+        #[arg(long)]
+        old_installer: PathBuf,
+        /// The kbf deb of the release before.
+        #[arg(long)]
+        old_kbf: PathBuf,
+        /// The kbf deb of this release, or the directory holding the one deb.
+        #[arg(long)]
+        package: PathBuf,
+        /// The `listing.txt` of `pkg-config`.
+        #[arg(long)]
+        listing: PathBuf,
+        /// The directory holding the Dockerfile of the container.
+        #[arg(long)]
+        image_dir: PathBuf,
         /// The docker program.
         #[arg(long, default_value = "docker")]
         docker: PathBuf,
@@ -475,9 +538,6 @@ enum Verb {
         #[arg(long, default_value = "sudo")]
         sudo: PathBuf,
     },
-    /// Run the loom models of kbf-proxy's slot and gate (`--cfg kbf_loom`, its own target
-    /// directory, release mode).
-    ProxyLoom,
     /// Build one integration test target, then run its ignored tests as root.
     SudoTest {
         /// The package the target is in.
@@ -806,6 +866,49 @@ fn git_stdout(root: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
     Ok(out.stdout)
 }
 
+/// The `source-date-epoch` verb: appends `SOURCE_DATE_EPOCH=<committer time>` of `commit`,
+/// as `root` holds it, to `output`, and returns the line.
+fn source_date_epoch(root: &Path, commit: &str, output: &Path) -> Result<String, Error> {
+    if !build_commit::is_commit(commit) {
+        return Err(Error::NotACommit(commit.to_owned()));
+    }
+    let said = git_stdout(root, &["show", "-s", "--format=%ct", commit])?;
+    let seconds = String::from_utf8_lossy(&said).trim().to_owned();
+    let line = format!("SOURCE_DATE_EPOCH={seconds}");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output)
+        .map_err(Error::spawn(format!("open {}", output.display())))?;
+    std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes())
+        .map_err(Error::spawn(format!("append to {}", output.display())))?;
+    Ok(line)
+}
+
+/// What the image of `service` must hold, from the flags: the frontend wants `--kbf-tarball`
+/// always, the coordinator wants `--binary` unless only verifying.
+fn image_reference<'a>(
+    service: pkg_image_asset::Image,
+    tarball: Option<&'a Path>,
+    binary: Option<&'a Path>,
+    verify_only: bool,
+) -> Result<Option<pkg_image_asset::Reference<'a>>, Error> {
+    use pkg_image_asset::{Image, Reference};
+    match (service, tarball, binary, verify_only) {
+        (Image::Frontend, Some(t), None, _) => Ok(Some(Reference::KbfTarball(t))),
+        (Image::Coordinator, None, Some(b), false) => Ok(Some(Reference::Binary(b))),
+        (Image::Coordinator, None, None, true) => Ok(None),
+        (Image::Frontend, ..) => Err(Error::Failed(
+            "the frontend image is checked against --kbf-tarball, and only that".to_owned(),
+        )),
+        (Image::Coordinator, ..) => Err(Error::Failed(
+            "the coordinator image is checked against --binary (not with --verify-only, \
+             which makes the other checks alone)"
+                .to_owned(),
+        )),
+    }
+}
+
 /// The budget file as `rev` holds it, read with `git show` in `root`.
 fn budget_at(root: &Path, rev: &str) -> Result<String, Error> {
     let spec = format!("{rev}:{}", budget::BUDGET);
@@ -886,14 +989,19 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             test: &test,
             args: &args,
         }),
-        Verb::ProxyLoom => proxy_loom::run(&cargo_program(), &root),
         Verb::CrunTests { sudo } => crun_tests::run(&crun_tests::CrunTests {
             cargo: &cargo_program(),
             sudo: &sudo,
             root: &root,
         }),
         Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
+        Verb::DeployFarm(args) => deploy_farm::run(&args),
+        Verb::ProveFarm(args) => prove_farm::run(&args),
+        Verb::RunnerDisk(args) => runner_disk::run(&args),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
+        Verb::SourceDateEpoch { commit, output } => {
+            source_date_epoch(&root, &commit, &output).map(|line| vec![line])
+        }
         Verb::Fetch {
             url,
             sha256,
@@ -936,7 +1044,6 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             &out,
         ),
         Verb::PkgConfig {
-            binary,
             kbf,
             units,
             trust,
@@ -955,7 +1062,6 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             };
             pkg_linux::write_config(
                 &pkg_linux::Inputs {
-                    binary: &binary,
                     kbf: &kbf,
                     units: &units,
                     trust: &trust,
@@ -987,34 +1093,13 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             source_ref,
             out,
         } => pkg_trust::write(&gh, &trusted_root, &source_ref, &out),
-        Verb::PkgAsset {
-            package,
-            platform,
-            commit,
-            binary_tarball,
-            expect_ref,
-            gh,
-            out,
-            verify_only,
-        } => pkg_asset::asset(
-            &pkg_asset::sole(&package, "deb")?,
-            &commit,
-            &match (&out, verify_only) {
-                (Some(out), false) => pkg_asset::Mode::Add(out),
-                _ => pkg_asset::Mode::VerifyOnly,
-            },
-            &pkg_asset::Check {
-                platform,
-                binary_tarball: &binary_tarball,
-                expect_ref: &expect_ref,
-                gh: gh.as_deref(),
-            },
-        ),
         Verb::PkgKbfAsset {
             package,
             platform,
             commit,
             kbf_tarball,
+            expect_ref,
+            gh,
             out,
             verify_only,
         } => pkg_kbf_asset::asset(
@@ -1027,8 +1112,40 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             &pkg_kbf_asset::Check {
                 platform,
                 kbf_tarball: &kbf_tarball,
+                expect_ref: &expect_ref,
+                gh: gh.as_deref(),
             },
         ),
+        Verb::PkgImageAsset {
+            image,
+            service,
+            platform,
+            commit,
+            kbf_tarball,
+            binary,
+            out,
+            verify_only,
+        } => {
+            let reference = image_reference(
+                service,
+                kbf_tarball.as_deref(),
+                binary.as_deref(),
+                verify_only,
+            )?;
+            pkg_image_asset::asset(
+                &image,
+                &commit,
+                &match (&out, verify_only) {
+                    (Some(out), false) => pkg_asset::Mode::Add(out),
+                    _ => pkg_asset::Mode::VerifyOnly,
+                },
+                &pkg_image_asset::Check {
+                    image: service,
+                    platform,
+                    reference,
+                },
+            )
+        }
         Verb::PkgMacosAsset {
             package,
             commit,
@@ -1057,6 +1174,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         #[cfg(not(target_os = "macos"))]
         Verb::PkgMacosInstallTest { .. } => Err(darwin::needs_macos("pkg-macos-install-test")),
         Verb::PkgInstallTest {
+            name,
             package,
             format,
             listing,
@@ -1067,6 +1185,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         } => pkg_install::run(
             &mut pkg_install::process(&docker),
             &pkg_install::InstallTest {
+                name: &name,
                 package: &pkg_asset::sole(
                     &package,
                     match format {
@@ -1080,6 +1199,24 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 gates: &gate,
                 probes: &probe,
                 container: &format!("kbf-pkg-test-{}", std::process::id()),
+            },
+        ),
+        Verb::PkgUpgradeTest {
+            old_installer,
+            old_kbf,
+            package,
+            listing,
+            image_dir,
+            docker,
+        } => pkg_upgrade::run(
+            &mut pkg_install::process(&docker),
+            &pkg_upgrade::UpgradeTest {
+                old_installer: &old_installer,
+                old_kbf: &old_kbf,
+                package: &pkg_asset::sole(&package, "deb")?,
+                listing: &listing,
+                image_dir: &image_dir,
+                container: &format!("kbf-pkg-upgrade-{}", std::process::id()),
             },
         ),
         Verb::Pkg(PkgVerb::Build {

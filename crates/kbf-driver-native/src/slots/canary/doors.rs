@@ -11,9 +11,10 @@ use std::io::{self, Read as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::{Fs, Op, Seen};
+use crate::pace::{Pace, Wall};
 
 /// `BOOTSTRAP_NOT_PRIVILEGED`: launchd (or the sandbox in its place) refused the
 /// name.
@@ -89,6 +90,11 @@ pub fn run(program: &str, args: &[String]) -> io::Result<Out> {
 /// # Errors
 /// The program could not be started.
 pub fn run_within(program: &str, args: &[String], within: Duration) -> io::Result<Out> {
+    run_paced(&Wall::new(), program, args, within)
+}
+
+/// [`run_within`] with the deadline read on `pace`.
+fn run_paced(pace: &dyn Pace, program: &str, args: &[String], within: Duration) -> io::Result<Out> {
     let (mut reader, writer) = io::pipe()?;
     let mut child = Command::new(program)
         .args(args)
@@ -103,17 +109,17 @@ pub fn run_within(program: &str, args: &[String], within: Duration) -> io::Resul
         let _ = reader.read_to_end(&mut bytes);
         let _ = send.send(bytes);
     });
-    let started = Instant::now();
+    let started = pace.now();
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break Some(status);
         }
-        if started.elapsed() > within {
+        if pace.now().saturating_sub(started) > within {
             let _ = child.kill();
             let _ = child.wait();
             break None;
         }
-        std::thread::sleep(Duration::from_millis(5));
+        pace.pause(Duration::from_millis(5));
     };
     let bytes = read
         .recv_timeout(Duration::from_secs(1))
@@ -281,12 +287,63 @@ pub fn sandbox_denies(operation: &str) -> io::Result<bool> {
     }
     /// `SANDBOX_FILTER_NONE`: the operation alone, no object.
     const FILTER_NONE: c_int = 0;
+    /// `SANDBOX_CHECK_NO_REPORT`: a denial found by the check is not logged as a violation.
+    const NO_REPORT: c_int = 0x4000_0000;
     let operation = CString::new(operation).map_err(io::Error::other)?;
     // SAFETY: `operation` is a NUL-terminated string that outlives the call, the filter
-    // `SANDBOX_FILTER_NONE` takes no further argument, and the pid is our own.
-    let answer = unsafe { sandbox_check(libc::getpid(), operation.as_ptr(), FILTER_NONE) };
+    // `SANDBOX_FILTER_NONE` takes no further argument (the report flag is a modifier of the
+    // filter word), and the pid is our own.
+    let answer =
+        unsafe { sandbox_check(libc::getpid(), operation.as_ptr(), FILTER_NONE | NO_REPORT) };
     let errno = io::Error::last_os_error();
     read_sandbox_answer(answer, errno)
+}
+
+/// Whether this process's sandbox denies `operation` on `path` (`sandbox_check` with a
+/// path filter). The profile is asked, not the file system: the answer does not depend
+/// on whether `path` exists, nor on a data-vault protection that refuses a user anyway.
+///
+/// # Errors
+/// The operation name or the path cannot be passed; elsewhere there is no sandbox to ask.
+#[cfg(target_os = "macos")]
+pub fn sandbox_denies_path(operation: &str, path: &std::path::Path) -> io::Result<bool> {
+    use std::ffi::{CString, c_char, c_int};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    unsafe extern "C" {
+        fn sandbox_check(pid: libc::pid_t, operation: *const c_char, filter: c_int, ...) -> c_int;
+    }
+    /// `SANDBOX_FILTER_PATH`: the object is a path, passed as a C string.
+    const FILTER_PATH: c_int = 1;
+    /// `SANDBOX_CHECK_NO_REPORT`: a denial found by the check is not logged as a violation.
+    const NO_REPORT: c_int = 0x4000_0000;
+    let operation = CString::new(operation).map_err(io::Error::other)?;
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // SAFETY: `operation` and `path` are NUL-terminated strings that outlive the call, the
+    // filter `SANDBOX_FILTER_PATH` takes exactly one `const char *` after it, and the pid
+    // is our own.
+    let answer = unsafe {
+        sandbox_check(
+            libc::getpid(),
+            operation.as_ptr(),
+            FILTER_PATH | NO_REPORT,
+            path.as_ptr(),
+        )
+    };
+    let errno = io::Error::last_os_error();
+    read_sandbox_answer(answer, errno)
+}
+
+/// Whether this process's sandbox denies `operation` on `path`.
+///
+/// # Errors
+/// Always: there is no sandbox to ask off a Mac.
+#[cfg(not(target_os = "macos"))]
+pub fn sandbox_denies_path(_operation: &str, _path: &std::path::Path) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the sandbox can be asked on macOS only",
+    ))
 }
 
 /// What `sandbox_check` answered: 1 denied, 0 allowed, anything else (it answers -1
@@ -328,6 +385,25 @@ pub fn ls_open(fs: &dyn Fs) -> Seen {
         Ok(false) => Seen::Allowed,
         Err(e) => Seen::Failed(e.to_string()),
     }
+}
+
+/// Asks the sandbox whether this process may read or write each of the protected stores
+/// ([`crate::network::PROTECTED_STORES`]): refused only if every one of the four
+/// questions is denied. As for `lsopen`, the question is asked of the profile instead of
+/// opening a folder: the stores are data-vault folders that refuse a user whatever the
+/// profile says, and may not exist on a fresh Mac, so an open would be refused with the
+/// rule dropped as with it kept.
+pub fn read_protected(fs: &dyn Fs) -> Seen {
+    for store in crate::network::PROTECTED_STORES {
+        for operation in ["file-read-data", "file-write-data"] {
+            match fs.sandbox_denies_path(operation, Path::new(store)) {
+                Ok(true) => {}
+                Ok(false) => return Seen::Allowed,
+                Err(e) => return Seen::Failed(e.to_string()),
+            }
+        }
+    }
+    Seen::Refused(Refusal::Sandbox(1))
 }
 
 /// Mounts a `devfs` on the new directory `mount`, which a user may do on a directory
@@ -427,6 +503,7 @@ pub fn bootstrap(fs: &dyn Fs, job: &Path) -> Seen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pace::Manual;
 
     /// Catches a `sandbox_check` that failed (-1, or any answer but 0 and 1) read as a
     /// denial, which would let the `lsopen` canary pass with its rule removed.
@@ -493,11 +570,22 @@ mod tests {
             run_within("/bin/ls", &["/nonexistent/kbf-door".into()], TOOL_WITHIN).expect("ls");
         assert!(out.code.is_some_and(|c| c != 0), "{out:?}");
         assert!(out.text.contains("kbf-door"), "{out:?}");
-        let started = Instant::now();
-        let slow =
-            run_within("/bin/sleep", &["30".into()], Duration::from_millis(100)).expect("sleep");
-        assert!(started.elapsed() < Duration::from_secs(10));
+        // The deadline is read on the test's clock: a `sleep 30` cannot exit before it runs
+        // out, and the test does not wait for it.
+        let pace = Manual::default();
+        let slow = run_paced(
+            &pace,
+            "/bin/sleep",
+            &["30".into()],
+            Duration::from_millis(100),
+        )
+        .expect("sleep");
         assert_eq!(slow.code, None);
+        assert_eq!(
+            pace.now(),
+            Duration::from_millis(105),
+            "killed at the first look past 100 ms"
+        );
         assert!(slow.text.contains("killed"), "{slow:?}");
         assert!(run("/nonexistent/tool", &[]).is_err());
     }

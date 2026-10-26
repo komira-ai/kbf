@@ -10,7 +10,9 @@
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Sender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::pace::{Pace, Wall};
 
 /// How long a killed tool is waited for before it is given up as not gone.
 pub(crate) const KILL_WAIT: Duration = Duration::from_secs(5);
@@ -26,16 +28,16 @@ pub(crate) type Output = (ExitStatus, Vec<u8>, Vec<u8>);
 /// a tool that has not exited by then is killed and the call fails, and so does a tool
 /// that exited but left a process holding its output open.
 pub(crate) fn run_within(command: &mut Command, within: Duration) -> Result<Output, String> {
-    run_bounded(command, within, KILL_WAIT)
+    run_paced(&Wall::new(), command, within, KILL_WAIT)
 }
 
-/// [`run_within`] with the wait after a kill given.
-pub(crate) fn run_bounded(
+/// [`run_within`] on the clock `pace`, with the wait after a kill given.
+pub(crate) fn run_paced(
+    pace: &dyn Pace,
     command: &mut Command,
     within: Duration,
     kill_wait: Duration,
 ) -> Result<Output, String> {
-    let until = Instant::now() + within;
     let mut child = command
         .env_clear()
         .stdin(Stdio::null())
@@ -51,17 +53,53 @@ pub(crate) fn run_bounded(
         sender.clone(),
     );
     drain(child.stderr.take().expect("stderr is piped"), 1, sender);
-    let Some(status) = poll_exit(&mut child, until) else {
+    finish(pace, &mut child, &receiver, (within, kill_wait))
+}
+
+/// A process that can be looked at and killed: a [`Child`], or a stand-in in a test.
+pub(crate) trait Waited {
+    /// The status, once the process has exited.
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>>;
+    fn kill(&mut self) -> std::io::Result<()>;
+}
+
+impl Waited for Child {
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        Child::try_wait(self)
+    }
+    fn kill(&mut self) -> std::io::Result<()> {
+        Child::kill(self)
+    }
+}
+
+/// The part of a call after the tool has started: waits for its exit until `within` has
+/// passed on `pace` (killing it then, and waiting `kill_wait` more for it to go), then
+/// for both streams on `receiver` until the same time.
+fn finish(
+    pace: &dyn Pace,
+    child: &mut dyn Waited,
+    receiver: &mpsc::Receiver<(usize, Vec<u8>)>,
+    (within, kill_wait): (Duration, Duration),
+) -> Result<Output, String> {
+    let until = pace.now() + within;
+    let Some(status) = poll_exit(pace, child, until) else {
         let _ = child.kill();
-        let reaped = poll_exit(&mut child, Instant::now() + kill_wait).is_some();
+        let reaped = poll_exit(pace, child, pace.now() + kill_wait).is_some();
         return Err(timeout_message(within, reaped));
     };
     let mut streams: [Vec<u8>; 2] = Default::default();
     for _ in 0..2 {
-        let left = until.saturating_duration_since(Instant::now());
-        let (which, bytes) = receiver.recv_timeout(left).map_err(|_| {
-            format!("its output was not closed within {within:?} (a process it started holds it)")
-        })?;
+        let (which, bytes) = loop {
+            match receiver.try_recv() {
+                Ok(got) => break got,
+                Err(mpsc::TryRecvError::Empty) if pace.now() < until => pace.pause(POLL),
+                Err(_) => {
+                    return Err(format!(
+                        "its output was not closed within {within:?} (a process it started holds it)"
+                    ));
+                }
+            }
+        };
         streams[which] = bytes;
     }
     let [out, err] = streams;
@@ -78,13 +116,17 @@ fn timeout_message(within: Duration, reaped: bool) -> String {
     }
 }
 
-/// Waits for `child` to exit until `until`; its status, or `None` if it has not exited
-/// by then (or cannot be waited for).
-pub(crate) fn poll_exit(child: &mut Child, until: Instant) -> Option<ExitStatus> {
+/// Waits for `child` to exit until `pace` reads `until`; its status, or `None` if it has
+/// not exited by then (or cannot be waited for).
+pub(crate) fn poll_exit(
+    pace: &dyn Pace,
+    child: &mut dyn Waited,
+    until: Duration,
+) -> Option<ExitStatus> {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Some(status),
-            Ok(None) if Instant::now() < until => std::thread::sleep(POLL),
+            Ok(None) if pace.now() < until => pace.pause(POLL),
             _ => return None,
         }
     }

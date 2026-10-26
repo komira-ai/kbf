@@ -141,11 +141,14 @@ fn a_trusted_file_with_bad_content_is_refused_with_the_parsers_reason() {
     assert_eq!(why(read(&exec)), "invalid: installer.toml: it is not UTF-8");
 }
 
-/// Asserts that a trusted file written by an earlier build, with the `[proxy]` table and the
-/// release-source keys it carries, is read without a refusal: the keys are still understood.
+/// Asserts that a trusted file written by an earlier build, with the `[proxy]` table (the slot
+/// table of the removed two-slot supervision included) and the release-source keys it carries,
+/// is read without a refusal: the keys are still understood, so the fetcher goes on reading the
+/// file of a host whose proxy table has not been edited yet.
 #[test]
 fn a_trusted_file_with_the_proxy_table_and_the_release_source_keys_is_read() {
-    let text = include_str!("../../tests/golden/all_in_one/installer.toml");
+    let text = include_str!("../../../kbf-setup/tests/golden/all_in_one/installer.toml");
+    assert!(text.contains("\n[proxy.upstream]\n"));
     let got = read(&host(text)).expect("trusted");
     assert_eq!(got, InstallerToml::parse(text).expect("parses"));
     assert!(got.proxy.is_some());

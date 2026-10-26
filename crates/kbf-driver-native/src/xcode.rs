@@ -52,7 +52,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::pace::{Pace, Wall};
 
 use kbf_daemon::RuntimeError;
 use kbf_proto::reapi::{Action, Command, Platform};
@@ -673,11 +675,21 @@ const POLL: Duration = Duration::from_millis(10);
 /// at once, and a process the program leaves holding it (or one that inherited it
 /// anyway) cannot hold the answer back.
 pub(crate) fn output_within(
+    command: std::process::Command,
+    within: Duration,
+    dir: &Path,
+) -> io::Result<Output> {
+    output_paced(&Wall::new(), command, within, dir)
+}
+
+/// [`output_within`] with the deadline read, and the waits made, on `pace`.
+pub(crate) fn output_paced(
+    pace: &dyn Pace,
     mut command: std::process::Command,
     within: Duration,
     dir: &Path,
 ) -> io::Result<Output> {
-    let deadline = Instant::now() + within;
+    let deadline = pace.now() + within;
     let stdout = output_file(dir)?;
     let stderr = output_file(dir)?;
     command
@@ -686,8 +698,8 @@ pub(crate) fn output_within(
         .stderr(stderr.try_clone()?);
     let mut child = loop {
         match command.spawn() {
-            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline => {
-                std::thread::sleep(POLL);
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && pace.now() < deadline => {
+                pace.pause(POLL);
             }
             spawned => break spawned?,
         }
@@ -696,7 +708,7 @@ pub(crate) fn output_within(
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if Instant::now() >= deadline {
+        if pace.now() >= deadline {
             let _ = child.kill();
             child.wait()?;
             return Err(io::Error::new(
@@ -704,7 +716,7 @@ pub(crate) fn output_within(
                 format!("no answer within {within:?}; killed"),
             ));
         }
-        std::thread::sleep(POLL);
+        pace.pause(POLL);
     };
     Ok(Output {
         status,

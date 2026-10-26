@@ -44,10 +44,15 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::identity::{Peers, presented};
 
-/// Admits the call `request` is, as the module docs say, or says why not (and logs it).
-async fn admit<T>(peers: &Peers, request: &Request<T>, call: &'static str) -> Result<(), Status> {
+/// Admits the call `request` is, as the module docs say, and answers the node its certificate
+/// names; or says why not (and logs it).
+pub(crate) async fn admit<T>(
+    peers: &Peers,
+    request: &Request<T>,
+    call: &'static str,
+) -> Result<String, Status> {
     let admitted = peers.admit_call(&presented(request.extensions())).await;
-    admitted.map(drop).inspect_err(|refused| {
+    admitted.inspect_err(|refused| {
         let (code, reason) = (refused.code(), refused.message());
         tracing::warn!(call, ?code, reason, "blob call refused");
     })

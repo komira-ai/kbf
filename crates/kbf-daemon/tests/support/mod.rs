@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use kbf_daemon::{
-    Clock, Daemon, DaemonConfig, DriverReport, Event, FakeRuntime, Moment, NodeReport, Runtime,
-    Runtimes, TlsFiles,
+    Clock, Daemon, DaemonConfig, DriverReport, Event, FakeRuntime, Moment, NodeReport, PackCommit,
+    PackCounter, Runtime, Runtimes, TlsFiles,
 };
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{
@@ -192,6 +192,16 @@ impl Peer {
     /// as a server that predates the field.
     pub fn welcome_every(&self, interval: Duration) {
         self.welcome_with(interval, 0);
+    }
+
+    /// A Welcome that says whether this frontend takes pack commits.
+    pub fn welcome_pack_commit(&self, takes_commits: bool) {
+        self.send(server_message::Message::Welcome(Welcome {
+            protocol_version: 1,
+            heartbeat_interval_ms: INTERVAL.as_millis() as u64,
+            pack_commit: takes_commits,
+            ..Welcome::default()
+        }));
     }
 
     /// A Welcome that names lease epoch `epoch` (0: none).
@@ -894,6 +904,87 @@ impl<R: Runtime> Harness<R> {
         .await
     }
 
+    /// Starts a server and a daemon running leases through `runtime` that put the counts
+    /// of `packs` in every heartbeat ([`Daemon::with_pack_reads`]). It checks the fence
+    /// every 20 ms.
+    pub async fn with_pack_reads(name: &str, runtime: Arc<R>, packs: PackCounter) -> Self {
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let configure = |config: &mut DaemonConfig| {
+            config.recheck_every = Duration::from_millis(20);
+        };
+        Self::build_all(
+            name,
+            runtimes,
+            runtime,
+            Duration::from_secs(40),
+            configure,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(packs),
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::with_pack_reads`], the daemon also setting `commit` from each Welcome
+    /// ([`Daemon::with_pack_writes`]), so that its heartbeats carry the write counts too.
+    pub async fn with_pack_counts(
+        name: &str,
+        runtime: Arc<R>,
+        packs: PackCounter,
+        commit: PackCommit,
+    ) -> Self {
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let configure = |config: &mut DaemonConfig| {
+            config.recheck_every = Duration::from_millis(20);
+        };
+        Self::build_all(
+            name,
+            runtimes,
+            runtime,
+            Duration::from_secs(40),
+            configure,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(packs),
+            Some(commit),
+        )
+        .await
+    }
+
+    /// Starts a server and a daemon that sets `commit` from each Welcome
+    /// ([`Daemon::with_pack_writes`]).
+    pub async fn with_pack_commit(name: &str, runtime: Arc<R>, commit: PackCommit) -> Self {
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let configure = |config: &mut DaemonConfig| {
+            config.recheck_every = Duration::from_millis(20);
+        };
+        Self::build_all(
+            name,
+            runtimes,
+            runtime,
+            Duration::from_secs(40),
+            configure,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(commit),
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn build_with(
         name: &str,
@@ -907,6 +998,40 @@ impl<R: Runtime> Harness<R> {
         pressure: Option<(tokio::sync::watch::Receiver<Option<f64>>, f64)>,
         map: Option<Arc<kbf_mapsync::MapHolder>>,
         drain: Option<(mpsc::UnboundedReceiver<()>, Option<Duration>)>,
+    ) -> Self {
+        Self::build_all(
+            name,
+            runtimes,
+            runtime,
+            fence_after,
+            configure,
+            clock,
+            driver,
+            phase,
+            pressure,
+            map,
+            drain,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_all(
+        name: &str,
+        runtimes: Runtimes,
+        runtime: Arc<R>,
+        fence_after: Duration,
+        configure: impl FnOnce(&mut DaemonConfig),
+        clock: Option<Arc<dyn Clock>>,
+        driver: Option<tokio::sync::watch::Receiver<DriverReport>>,
+        phase: Option<tokio::sync::watch::Receiver<kbf_types::NodePhase>>,
+        pressure: Option<(tokio::sync::watch::Receiver<Option<f64>>, f64)>,
+        map: Option<Arc<kbf_mapsync::MapHolder>>,
+        drain: Option<(mpsc::UnboundedReceiver<()>, Option<Duration>)>,
+        packs: Option<PackCounter>,
+        commit: Option<PackCommit>,
     ) -> Self {
         let pki = pki(name);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -964,6 +1089,16 @@ impl<R: Runtime> Harness<R> {
         }
         if let Some(holder) = map {
             daemon = daemon.with_map(holder);
+        }
+        assert!(daemon.pack_reads().is_none());
+        if let Some(packs) = packs {
+            daemon = daemon.with_pack_reads(packs);
+            assert!(daemon.pack_reads().is_some());
+        }
+        assert!(daemon.pack_writes().is_none());
+        if let Some(commit) = commit {
+            daemon = daemon.with_pack_writes(commit);
+            assert!(daemon.pack_writes().is_some());
         }
         let daemon = match drain {
             Some((signals, Some(deadline))) => tokio::spawn(daemon.run_draining(signals, deadline)),

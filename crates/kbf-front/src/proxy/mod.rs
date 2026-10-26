@@ -31,6 +31,12 @@
 //! members); `kbf-server --storage` still gives them its local cache. **Mutual TLS** to the nodes is the channel the proxy is given
 //! (`kbf-server`'s `frontend` module builds it); the proxy dials nothing itself.
 //!
+//! **Packs.** Given [`Packs`] ([`Proxy::with_packs`]), a client's uploads are written to an
+//! object store as packs and recorded in the pack index before they are acknowledged, and the
+//! reads and FindMissingBlobs look in the index first; what the index does not hold is asked
+//! of the storage nodes as without packs (the docs of the `packed` module say what is and is
+//! not packed).
+//!
 //! **Not here yet:** GetTree.
 
 mod ac;
@@ -40,6 +46,7 @@ mod cas;
 mod meter;
 mod name;
 mod owners;
+mod packed;
 
 use std::sync::Arc;
 
@@ -51,6 +58,10 @@ use tonic::transport::Endpoint;
 
 pub use self::meter::{Direction, Meter, Method};
 pub use self::owners::{Owner, Owners};
+pub use self::packed::{
+    CommitError, DEFAULT_INFLIGHT_BYTES, DEFAULT_UPLOAD_IDLE_TIMEOUT, MAX_COMMIT_BLOBS,
+    MAX_PACKED_BLOB_BYTES, MAX_UPLOAD_IDLE_TIMEOUT, PackMetrics, PackSettings, PackStore, Packs,
+};
 use self::{ac::ProxyActionCache, bytestream::RawByteStream, cas::ProxyCas};
 use crate::MAX_MESSAGE_BYTES;
 
@@ -60,6 +71,7 @@ pub struct Proxy {
     owners: Owners,
     authorizers: Arc<Authorizers>,
     meter: Arc<Meter>,
+    packs: Option<Packs>,
 }
 
 impl Proxy {
@@ -70,7 +82,16 @@ impl Proxy {
             owners,
             authorizers,
             meter: Arc::default(),
+            packs: None,
         }
+    }
+
+    /// This proxy, with the blobs a client uploads kept in `packs` and the reads and
+    /// FindMissingBlobs looking there first. `None` is the proxy as it is without them.
+    #[must_use]
+    pub fn with_packs(mut self, packs: Option<Packs>) -> Self {
+        self.packs = packs;
+        self
     }
 
     /// A proxy to the one storage node at `endpoint`, connected when first used.
@@ -92,15 +113,18 @@ impl Proxy {
         let cas = ProxyCas {
             owners: self.owners.clone(),
             authorizers: Arc::clone(&self.authorizers),
+            packs: self.packs.clone(),
         };
         let action_cache = ProxyActionCache {
             owners: self.owners.clone(),
             authorizers: Arc::clone(&self.authorizers),
+            packs: self.packs.clone(),
         };
         let bytestream = RawByteStream {
             owners: self.owners.clone(),
             authorizers: Arc::clone(&self.authorizers),
             meter: Arc::clone(&self.meter),
+            packs: self.packs.clone(),
         };
         Routes::new(
             ContentAddressableStorageServer::new(cas)

@@ -19,8 +19,9 @@
 //!   once and checked.
 //! - `source = "github"` fetches the release from the repository's GitHub releases
 //!   ([`super::fetch`]), as `nobody`; what it fetches is copied once and checked like the
-//!   files of a `dir`. `token_file` (root's alone to write) holds a token for the public
-//!   API, which `gh api` needs to run at all.
+//!   files of a `dir`. `token_file` is optional: root's alone to write, it holds a token
+//!   for the public API that raises the rate limit of the listing; without one the listing
+//!   is unauthenticated.
 //! - `sums` is optional. The trust anchor is the build attestation, which every release
 //!   must pass whether or not the channel has sums. When the channel sets `sums`, it is an
 //!   extra freeze list: the pinned `SHA256SUMS` of the releases the channel offers, root's

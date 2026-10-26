@@ -137,8 +137,8 @@ async fn version_of(dir: &Path) -> MachineVersion {
 /// starts its epochs, and any counter it keeps, from 1 again). The node registers
 /// (member 7, boot 1), writes, loses its directory, registers again (the state store
 /// gives boot 2) and writes into the same conditional bucket: every write succeeds and
-/// the two key sets are disjoint, under the root, not the logs' prefixes. Mutant seen
-/// red: the writer's boot taken from a fresh local `AllocEpoch` (both starts name
+/// the two key sets are disjoint, under the root, not the logs' prefixes. Catches:
+/// the writer's boot taken from a fresh local `AllocEpoch` (both starts name
 /// boot 1, and the second start's first PUT is refused).
 #[tokio::test]
 async fn a_wiped_node_never_reuses_its_keys() {
@@ -204,7 +204,7 @@ async fn a_registration_the_log_cannot_take_refuses_the_open() {
 /// Catches a stale boot from a real [`open_registered`] (the frontend's state store
 /// restored from an older copy, so its counter hands out a boot the log has set) that
 /// does not exit as not ready, which the units' `RestartPreventExitStatus=2` leaves down
-/// for good (mutant: the `StaleWriter` arm of [`crate::StartFailure`] removed). And that
+/// for good (defect: the `StaleWriter` arm of [`crate::StartFailure`] removed). And that
 /// the restart it asks for recovers: the next registration's boot, one past, opens the
 /// same log, so a gap of N boots takes N restarts.
 #[tokio::test]
@@ -339,7 +339,7 @@ fn a_node_owes_a_rebuild_until_it_is_done() {
     assert!(!catch_up_for(true).is_catching_up());
 }
 
-// ---- unit U0 of docs/design/frontend-proxy.md, section 11: a node meets a FRESH state store
+// ---- a node meets a FRESH state store (docs/deploy/kbf-units.md, "the nodes' boots")
 
 /// A frontend over a store with nothing in it: the fresh Postgres of the design.
 fn fresh_frontend() -> crate::members::Members {

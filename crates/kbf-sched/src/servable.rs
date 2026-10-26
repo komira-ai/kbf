@@ -272,6 +272,27 @@ impl Servable {
         ))
     }
 
+    /// The cordoned or not serving live workers that could run `request` (serve its kind,
+    /// satisfy its platform, fit its size): the ones [`Verdict::Cordoned`] names. Empty
+    /// when none could.
+    pub(crate) fn cordoned_could(
+        workers: &BTreeMap<WorkerId, Worker>,
+        cordons: &Cordons,
+        now: FarmTime,
+        request: &Request,
+    ) -> Vec<WorkerId> {
+        Self::new(workers, cordons, now)
+            .cordoned
+            .into_iter()
+            .filter(|name| {
+                let w = &workers[name];
+                serves(&w.caps, request.kind)
+                    && request.needs.matches(&w.caps)
+                    && w.capacity.fits(&request.resources)
+            })
+            .collect()
+    }
+
     /// [`Self::verdict`] over the workers placement may use.
     fn uncordoned_verdict(
         &mut self,

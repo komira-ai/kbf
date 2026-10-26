@@ -13,6 +13,8 @@ enum Defect {
     NotInstalled,
     WrongDepends,
     PodmanDepends,
+    /// The package depends on `crun` (a plain `dpkg --install` would not configure it).
+    HasDepends,
     MaintainerScript,
     WrongOwner,
     WrongBytes,
@@ -24,6 +26,8 @@ enum Defect {
     UnitNamesMissingGroup,
     DirNotMade,
     GateIgnored,
+    /// The unit's condition never holds, file or not.
+    GateNeverHolds,
     GateRunsWithoutFile,
     RemoveKeepsFile,
     RemoveDeletesConfig,
@@ -31,6 +35,8 @@ enum Defect {
     RemoveDeletesUser,
     PurgeDeletesConfig,
     PurgeLeavesRecord,
+    PurgeKeepsConffile,
+    RpmRemoveKeepsConffile,
     BuildFails,
     GhWrongVersion,
     GhNotRunnable,
@@ -45,7 +51,11 @@ struct World {
     users_made: bool,
     installed: bool,
     purged: bool,
+    /// The package is a deb: dpkg keeps a conffile on remove.
+    deb: bool,
     started: BTreeSet<String>,
+    /// The journal: the unit and the line.
+    journal: Vec<(String, String)>,
     log: Vec<String>,
 }
 
@@ -85,13 +95,15 @@ fn entry_dir(dst: &str) -> Entry {
 
 fn entries() -> Vec<Entry> {
     vec![
-        entry_file("/usr/bin/kbf-installer", 0o755, "binary"),
+        entry_file("/usr/bin/kbf", 0o755, "binary"),
         entry_file("/usr/lib/systemd/system/kbf-node.service", 0o644, "node"),
         entry_file("/usr/lib/systemd/system/kbf.slice", 0o644, "slice"),
         // A directory a package may own under the unit directory: it is not read for
         // accounts (it has no bytes).
         entry_dir("/usr/lib/systemd/system/kbf-node.service.d"),
-        entry_dir("/usr/share/kbf-installer"),
+        entry_dir("/usr/share/kbf"),
+        // A conffile: dpkg keeps it on remove and deletes it on purge.
+        entry_file("/etc/needrestart/conf.d/kbf.conf", 0o644, "conffile"),
     ]
 }
 
@@ -104,7 +116,9 @@ impl World {
             users_made: false,
             installed: false,
             purged: false,
+            deb: true,
             started: BTreeSet::new(),
+            journal: Vec::new(),
             log: Vec::new(),
         }
     }
@@ -135,6 +149,11 @@ impl World {
                 ok: self.installed,
                 ..ok("")
             },
+            ["dpkg-query", "-W", "-f=${Depends}", _] => ok(if self.is(Defect::HasDepends) {
+                "crun"
+            } else {
+                ""
+            }),
             ["dpkg-query", ..] => ok(if self.is(Defect::WrongDepends) {
                 "crun, systemd"
             } else if self.is(Defect::PodmanDepends) {
@@ -142,13 +161,18 @@ impl World {
             } else {
                 "crun, uidmap, systemd, ca-certificates"
             }),
-            ["rpm", "-qR", _] => ok(
-                "crun\nshadow-utils\nsystemd\nca-certificates\nrpmlib(CompressedFileNames) <= 3.0.4-1\n",
-            ),
-            ["find", ..] => ok(if self.is(Defect::MaintainerScript) {
-                "kbf-installer.list\nkbf-installer.postinst\n"
+            ["rpm", "-qR", _] => ok(if self.is(Defect::HasDepends) {
+                "crun\nrpmlib(CompressedFileNames) <= 3.0.4-1\n"
             } else {
-                "kbf-installer.list\nkbf-installer.md5sums\n"
+                "rpmlib(CompressedFileNames) <= 3.0.4-1\n"
+            }),
+            ["rpm", "-q", "--recommends", _] => {
+                ok("crun\nshadow-utils\nsystemd\nca-certificates\n")
+            }
+            ["find", ..] => ok(if self.is(Defect::MaintainerScript) {
+                "kbf.list\nkbf.postinst\n"
+            } else {
+                "kbf.list\nkbf.md5sums\n"
             }),
             ["rpm", "-q", "--scripts", _] => ok(if self.is(Defect::MaintainerScript) {
                 "postinstall scriptlet\n"
@@ -187,9 +211,16 @@ impl World {
             }),
             ["systemctl", "start", unit] => {
                 self.started.insert((*unit).to_owned());
+                self.journal_start(unit);
                 ok("")
             }
-            ["systemctl", "show", unit, ..] => self.show(unit),
+            ["journalctl", "--sync"] => ok(""),
+            ["journalctl", "-u", unit, ..] => ok(&self
+                .journal
+                .iter()
+                .filter(|(u, _)| u == unit)
+                .map(|(_, l)| format!("{l}\n"))
+                .collect::<String>()),
             ["systemd-sysusers"] => {
                 self.users_made = true;
                 ok("")
@@ -245,12 +276,18 @@ impl World {
 
     fn remove(&mut self, purge: bool) -> Out {
         if !self.installed {
-            return fail("E: Unable to locate package kbf-installer");
+            return fail("E: Unable to locate package kbf");
         }
         self.installed = false;
         self.purged = purge;
         for e in &self.entries {
-            if !(self.defect == Defect::RemoveKeepsFile && e.dst.ends_with("kbf-installer")) {
+            let conffile = e.dst.starts_with("/etc/");
+            let keeps = (self.defect == Defect::RemoveKeepsFile && e.dst == "/usr/bin/kbf")
+                // dpkg keeps a conffile until the purge.
+                || (conffile && self.deb && !purge)
+                || (conffile && purge && self.is(Defect::PurgeKeepsConffile))
+                || (conffile && !self.deb && self.is(Defect::RpmRemoveKeepsConffile));
+            if !keeps {
                 self.files.remove(&e.dst);
             }
         }
@@ -331,25 +368,40 @@ impl World {
         ok(&text)
     }
 
-    fn show(&self, unit: &str) -> Out {
+    /// What systemd writes to the journal for a start of `unit`: the line of a start the
+    /// condition skips, or `Starting` and `Started` once the condition holds. The unit exits at
+    /// once, as the stand-in for `kbf` does, so it is inactive again when the start returns (and
+    /// `systemctl show -p ConditionResult` of it says `no` whatever the file holds).
+    fn journal_start(&mut self, unit: &str) {
         // The gate: the unit's condition holds when its file exists.
         let path = if unit.contains("node") {
             "/etc/kbf/kbf.toml"
         } else {
             "/etc/kbf/installer.toml"
         };
-        let holds = self.files.contains(path)
+        let holds = (self.files.contains(path) && !self.is(Defect::GateNeverHolds))
             || self.is(Defect::GateIgnored)
-            || (self.is(Defect::GateRunsWithoutFile) && !self.files.contains(path));
-        let ran = if self.is(Defect::GateRunsWithoutFile) {
-            "Mon 2026-01-01 00:00:00 UTC"
+            || self.is(Defect::GateRunsWithoutFile);
+        let lines: Vec<String> = if holds {
+            vec![
+                format!("Starting {unit} - the unit..."),
+                format!("Started {unit} - the unit."),
+            ]
         } else {
-            ""
+            // Each distro's systemd words the skip its own way.
+            vec![if self.deb {
+                format!(
+                    "{unit} - the unit was skipped because of an unmet condition check (ConditionPathExists={path})."
+                )
+            } else {
+                format!(
+                    "{unit} - the unit skipped, unmet condition check ConditionPathExists={path}"
+                )
+            }]
         };
-        ok(&format!(
-            "ConditionResult={}\nExecMainStartTimestamp={ran}\n",
-            if holds { "yes" } else { "no" }
-        ))
+        for line in lines {
+            self.journal.push((unit.to_owned(), line));
+        }
     }
 
     /// `getent <database> <name>`: the accounts sysusers makes are in `passwd` (the
@@ -392,7 +444,7 @@ fn gates() -> Vec<Gate> {
 
 fn probes() -> Vec<Probe> {
     vec![
-        "/usr/share/kbf-installer/trust/gh --version::gh version 2.102.0"
+        "/usr/share/kbf/trust/gh --version::gh version 2.102.0"
             .parse()
             .expect("probe"),
     ]
@@ -413,13 +465,16 @@ fn run_with(format: Format, defect: Defect) -> (World, Result<Vec<String>, Error
     // empty listing is no entries).
     let listing = dir.join("listing.txt");
     std::fs::write(&listing, pkg_linux::listing(&entries())).expect("listing");
-    let world = std::cell::RefCell::new(World::new(defect));
+    let mut model = World::new(defect);
+    model.deb = format == Format::Deb;
+    let world = std::cell::RefCell::new(model);
     let gates = gates();
     let probes = probes();
     let result = run(
         &mut |args| Ok(world.borrow_mut().docker(args)),
         &InstallTest {
-            package: Path::new("/p/kbf-installer.pkg"),
+            name: "kbf",
+            package: Path::new("/p/kbf.pkg"),
             format,
             listing: &listing,
             image_dir: Path::new("/p/image"),
@@ -449,7 +504,7 @@ fn a_package_that_does_everything_the_contract_says_passes_in_both_formats() {
         assert!(ran("remove"));
         // The container and its image are removed whatever happened.
         assert_eq!(world.log[world.log.len() - 2], "rm -f c1");
-        assert!(world.log[world.log.len() - 1].starts_with("rmi kbf-installer-test-c1"));
+        assert!(world.log[world.log.len() - 1].starts_with("rmi kbf-test-c1"));
         // Nothing the test runs starts a unit on its own: it only starts the gated ones
         // it asks to.
         assert_eq!(world.started.len(), 2);
@@ -463,7 +518,11 @@ fn the_unit_account_check_reads_unit_files_and_skips_directories() {
     for format in [Format::Deb, Format::Rpm] {
         let (world, result) = run_with(format, Defect::None);
         result.unwrap_or_else(|e| panic!("{format:?}: {e}"));
-        let cats: Vec<&String> = world.log.iter().filter(|l| l.contains(" cat ")).collect();
+        let cats: Vec<&String> = world
+            .log
+            .iter()
+            .filter(|l| l.starts_with("exec c1 cat "))
+            .collect();
         assert_eq!(
             cats,
             [
@@ -477,18 +536,28 @@ fn the_unit_account_check_reads_unit_files_and_skips_directories() {
 
 #[test]
 fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
-    let cases: [(Format, Defect, &str); 19] = [
+    let cases: [(Format, Defect, &str); 22] = [
         (
             Format::Deb,
             Defect::NotInstalled,
             "the package is not installed after install",
         ),
-        (Format::Deb, Defect::WrongDepends, "dependencies:"),
+        (Format::Deb, Defect::WrongDepends, "recommendations:"),
+        (
+            Format::Deb,
+            Defect::HasDepends,
+            "dependencies: \"crun\", not \"\"",
+        ),
+        (
+            Format::Rpm,
+            Defect::HasDepends,
+            "dependencies: \"crun\", not \"\"",
+        ),
         (Format::Deb, Defect::PodmanDepends, "podman"),
         (
             Format::Deb,
             Defect::MaintainerScript,
-            "maintainer scripts: \"kbf-installer.postinst\"",
+            "maintainer scripts: \"kbf.postinst\"",
         ),
         (
             Format::Rpm,
@@ -498,13 +567,9 @@ fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
         (
             Format::Deb,
             Defect::WrongOwner,
-            "/usr/bin/kbf-installer: \"kbf:root:755:regular file\"",
+            "/usr/bin/kbf: \"kbf:root:755:regular file\"",
         ),
-        (
-            Format::Deb,
-            Defect::WrongBytes,
-            "/usr/bin/kbf-installer sha256",
-        ),
+        (Format::Deb, Defect::WrongBytes, "/usr/bin/kbf sha256"),
         (
             Format::Deb,
             Defect::UnitEnabled,
@@ -539,17 +604,22 @@ fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
         (
             Format::Deb,
             Defect::GateIgnored,
-            "kbf-node.service without /etc/kbf/kbf.toml: ConditionResult",
+            "kbf-node.service without /etc/kbf/kbf.toml: its start was not skipped by its condition",
+        ),
+        (
+            Format::Deb,
+            Defect::GateNeverHolds,
+            "kbf-node.service with /etc/kbf/kbf.toml: it did not begin to start",
         ),
         (
             Format::Deb,
             Defect::GateRunsWithoutFile,
-            "kbf-installer.service without /etc/kbf/installer.toml: ExecMainStartTimestamp",
+            "kbf-installer.service without /etc/kbf/installer.toml: it began to start",
         ),
         (
             Format::Deb,
             Defect::RemoveKeepsFile,
-            "/usr/bin/kbf-installer is still there after remove",
+            "/usr/bin/kbf is still there after remove",
         ),
         (
             Format::Deb,
@@ -574,6 +644,16 @@ fn remove_and_purge_must_leave_the_users_and_the_operators_files() {
     assert!(text.contains("remove deleted the user kbf"), "{text}");
     let text = problems(Format::Deb, Defect::PurgeDeletesConfig);
     assert!(text.contains("purge deleted /etc/kbf/kbf.toml"), "{text}");
+    let text = problems(Format::Deb, Defect::PurgeKeepsConffile);
+    assert!(
+        text.contains("/etc/needrestart/conf.d/kbf.conf is still there after purge"),
+        "{text}"
+    );
+    let text = problems(Format::Rpm, Defect::RpmRemoveKeepsConffile);
+    assert!(
+        text.contains("/etc/needrestart/conf.d/kbf.conf is still there after remove"),
+        "{text}"
+    );
     let text = problems(Format::Deb, Defect::PurgeLeavesRecord);
     assert!(
         text.contains("status is \"deinstall ok config-files\" after purge"),
@@ -625,6 +705,7 @@ fn a_listing_that_is_not_there_is_an_error_before_docker_runs() {
     let err = run(
         &mut never,
         &InstallTest {
+            name: "kbf",
             package: Path::new("/p"),
             format: Format::Deb,
             listing: Path::new("/nonexistent/listing.txt"),
@@ -658,13 +739,15 @@ fn a_probe_runs_in_the_container_and_its_output_must_hold_the_text() {
     assert!(
         world
             .log
-            .contains(&"exec c1 /usr/share/kbf-installer/trust/gh --version".to_owned()),
+            .contains(&"exec c1 /usr/share/kbf/trust/gh --version".to_owned()),
         "{:#?}",
         world.log
     );
     let got = problems(Format::Deb, Defect::GhNotRunnable);
     assert!(
-        got.contains("`/usr/share/kbf-installer/trust/gh --version` failed in the container: exec format error"),
+        got.contains(
+            "`/usr/share/kbf/trust/gh --version` failed in the container: exec format error"
+        ),
         "{got}"
     );
     let got = problems(Format::Deb, Defect::GhWrongVersion);
@@ -677,12 +760,10 @@ fn a_probe_runs_in_the_container_and_its_output_must_hold_the_text() {
 #[test]
 fn a_probe_is_a_command_and_the_text_it_must_print() {
     // Catches: a probe with no text (it would pass on any output) or no command.
-    let p: Probe = "kbf-installer --version --json::abc123"
-        .parse()
-        .expect("probe");
-    assert_eq!(p.argv, ["kbf-installer", "--version", "--json"]);
+    let p: Probe = "kbf --version --json::abc123".parse().expect("probe");
+    assert_eq!(p.argv, ["kbf", "--version", "--json"]);
     assert_eq!(p.contains, "abc123");
-    for bad in ["kbf-installer --version", "::text", "gh --version::"] {
+    for bad in ["kbf --version", "::text", "gh --version::"] {
         assert!(bad.parse::<Probe>().is_err(), "{bad:?}");
     }
 }

@@ -4,10 +4,12 @@
 
 use std::io;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::bundle::Sizing;
 use crate::spec::{Event, VmSpec};
 
 /// What waiting for a VM helper's next event found.
@@ -23,6 +25,42 @@ pub enum Poll {
     },
 }
 
+/// The time the probes read and pass. The real one is the monotonic clock and a thread
+/// sleep; the fake one is a counter that only moves when something passes time, so a test
+/// of a wait gets the same answer on any host at any load.
+pub trait Clock: Send + Sync {
+    /// Time since an origin fixed when the clock was made; never goes back.
+    fn now(&self) -> Duration;
+    /// Lets `d` pass: the real clock sleeps, the fake one advances.
+    fn pause(&self, d: Duration);
+}
+
+/// The monotonic clock.
+#[derive(Debug)]
+pub struct RealClock(Instant);
+
+impl RealClock {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Instant::now())
+    }
+}
+
+impl Default for RealClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for RealClock {
+    fn now(&self) -> Duration {
+        self.0.elapsed()
+    }
+    fn pause(&self, d: Duration) {
+        std::thread::sleep(d);
+    }
+}
+
 /// A running VM helper process.
 pub trait VmProcess {
     fn pid(&self) -> u32;
@@ -30,6 +68,10 @@ pub trait VmProcess {
     fn poll(&mut self, wait: Duration) -> Poll;
     /// SIGKILL: the helper gets no chance to stop its VM.
     fn kill9(&mut self);
+    /// Asks the guest to shut down (the helper keeps running until the guest has stopped,
+    /// then exits). Without a guest that obeys, [`request_stop`](Self::request_stop) is
+    /// still needed.
+    fn request_shutdown(&mut self);
     /// Closes the helper's stdin, which makes it force-stop its VM (the guest is not asked
     /// to shut down) and exit.
     fn request_stop(&mut self);
@@ -61,11 +103,22 @@ pub struct Signature {
 }
 
 pub trait System {
+    /// The clock the probes wait by. Every call may return a new clock with its own origin:
+    /// only differences between readings of one clock mean anything.
+    fn clock(&self) -> Arc<dyn Clock> {
+        Arc::new(RealClock::new())
+    }
     /// `clonefile(2)`: a copy-on-write copy of the file `src` at `dst`.
     ///
     /// # Errors
     /// The call failed (`EXDEV` across volumes, `ENOTSUP` off APFS, `EEXIST`).
     fn clonefile(&self, src: &Path, dst: &Path) -> io::Result<()>;
+    /// Clears the user-immutable flag (`uchg`) on `path`, which a clone of a sealed base
+    /// keeps; a path without the flag is left alone. The caller owns `path`.
+    ///
+    /// # Errors
+    /// The file could not be examined or the flag could not be cleared.
+    fn clear_immutable(&self, path: &Path) -> io::Result<()>;
     /// The data representation of a new `VZMacMachineIdentifier`.
     ///
     /// # Errors
@@ -101,17 +154,35 @@ pub trait System {
     /// # Errors
     /// A step failed; the message names it.
     fn offline_write(&self, disk: &Path, files: &[OfflineFile]) -> Result<Value, String>;
+    /// Attaches the raw disk image `disk`, stages Xcode and the simulator runtimes of
+    /// `plan` into its Data volume as root (`stage::execute`), detaches, and returns what
+    /// was staged.
+    ///
+    /// # Errors
+    /// A step failed or the volume is too small; the message names it.
+    fn offline_stage(&self, disk: &Path, plan: &crate::stage::Plan) -> Result<Value, String>;
+    /// Attaches the raw disk image `disk` read-only, copies the harvest allowlist out of
+    /// its Data volume into the new directory `out`, detaches, and returns the manifest.
+    ///
+    /// # Errors
+    /// A step failed; the message names it.
+    fn offline_harvest(&self, disk: &Path, out: &Path) -> Result<Value, String>;
+    /// The process table as text, one `pid cputime command` row per line (`ps`).
+    ///
+    /// # Errors
+    /// The table could not be read.
+    fn process_table(&self) -> Result<String, String>;
     /// Downloads `url` to `dest`.
     ///
     /// # Errors
     /// The download failed.
     fn fetch(&self, url: &str, dest: &Path) -> Result<(), String>;
-    /// Installs macOS from the restore image `ipsw` into a new bundle at `out`, with a
-    /// disk of `disk_gib` GiB.
+    /// Installs macOS from the restore image `ipsw` into a new bundle at `out`, sized as
+    /// `sizing` says.
     ///
     /// # Errors
     /// The restore image is unusable for this host or the install failed.
-    fn install_image(&self, ipsw: &Path, out: &Path, disk_gib: u64) -> Result<Value, String>;
+    fn install_image(&self, ipsw: &Path, out: &Path, sizing: &Sizing) -> Result<Value, String>;
     /// The helper mode (`vm-run`): runs the VM `spec` describes until stdin closes, printing
     /// [`Event`]s as JSON lines on stdout.
     ///

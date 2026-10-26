@@ -590,7 +590,7 @@ async fn an_old_key_is_used_while_its_refresh_is_under_way() {
     assert!(refresh.await.expect("joined").is_ok());
 }
 
-/// The allow-list of the gamma deploy (docs/design/frontend-proxy.md, section 4a), whose job
+/// The allow-list of the gamma deploy (docs/design/updates.md, section 5.1), whose job
 /// runs from a `workflow_run` of the release workflow on main: its token says `workflow_run`.
 const GAMMA: &str = r#"
 [remote_operator]

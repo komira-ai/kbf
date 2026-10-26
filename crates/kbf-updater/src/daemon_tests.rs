@@ -14,6 +14,7 @@ use crate::daemon::{
     parse_operator_url, run_config, start, start_with, stderr_sink,
 };
 use crate::fakes::{Event, FakeClock, FakeHealth, FakeInstaller, FakeSafeToStop, Log};
+use crate::inventory::{Host, Member, Role};
 use crate::listener::{Activation, Listen};
 use crate::record::RollStore;
 use crate::server::{Recent, Settings};
@@ -73,7 +74,6 @@ fn the_flags_are_required_and_exact() {
         (cfg.proxy_uid, cfg.inventory_owner, cfg.operator_api.port()),
         (993, 0, 8080)
     );
-    assert_eq!(cfg.operator_proxy_auth_file, None);
     assert_eq!(
         (
             cfg.ssh_key_file.to_str(),
@@ -175,16 +175,14 @@ fn the_socket_is_a_flag_or_an_activated_descriptor_and_never_both() {
     );
 }
 
-/// Catches the optional proxy secret file being unread or required.
+/// Asserts that `--operator-proxy-auth-file`, the flag of the secret a frontend behind the
+/// proxy asked for, is an unknown argument now: the roll sends no such secret.
 #[test]
-fn the_operator_proxy_auth_file_is_an_optional_flag() {
+fn the_operator_proxy_auth_file_flag_is_gone() {
     let with = [&FLAGS[..], &["--operator-proxy-auth-file", "/p"]].concat();
-    let cfg = parse(&with).expect("flags");
     assert_eq!(
-        cfg.operator_proxy_auth_file
-            .as_deref()
-            .and_then(|p| p.to_str()),
-        Some("/p")
+        parse(&with).expect_err("gone"),
+        "unknown argument --operator-proxy-auth-file"
     );
 }
 
@@ -228,6 +226,136 @@ fn the_ssh_timeouts_are_optional_flags_in_seconds() {
             );
         }
     }
+}
+
+/// Catches a drain deadline that is not a flag, that defaults to something else than 600 s,
+/// that takes a non-number, or that may be zero (a drain that waits for nothing is no
+/// drain): the flag sets only the deadline.
+#[test]
+fn the_drain_deadline_is_an_optional_flag_of_at_least_a_second() {
+    assert_eq!(parse(&FLAGS).expect("flags").drain_deadline.as_secs(), 600);
+    let with = [&FLAGS[..], &["--drain-deadline-secs", "90"]].concat();
+    let cfg = parse(&with).expect("deadline");
+    assert_eq!(
+        (
+            cfg.drain_deadline.as_secs(),
+            cfg.ssh_command_timeout.as_secs()
+        ),
+        (90, 900)
+    );
+    for bad in ["soon", "-1", "1.5", ""] {
+        let with = [&FLAGS[..], &["--drain-deadline-secs", bad]].concat();
+        assert_eq!(
+            parse(&with).expect_err(bad),
+            "--drain-deadline-secs must be a number of seconds"
+        );
+    }
+    let zero = [&FLAGS[..], &["--drain-deadline-secs", "0"]].concat();
+    assert_eq!(
+        parse(&zero).expect_err("zero"),
+        "--drain-deadline-secs must be at least 1"
+    );
+}
+
+/// Catches the two bounds of a Mac's apply not being flags: both are optional, default to a
+/// 5 s poll and a 600 s deadline, take a number of seconds, and may not be zero (a poll with
+/// no interval spins; a deadline of nothing fails every apply). Each sets only itself.
+#[test]
+fn the_apply_poll_and_deadline_are_optional_flags_of_at_least_a_second() {
+    let cfg = parse(&FLAGS).expect("flags");
+    assert_eq!(
+        (cfg.apply_poll.as_secs(), cfg.apply_deadline.as_secs()),
+        (5, 600)
+    );
+    let with = [&FLAGS[..], &["--apply-poll-secs", "2"]].concat();
+    let cfg = parse(&with).expect("poll");
+    assert_eq!(
+        (cfg.apply_poll.as_secs(), cfg.apply_deadline.as_secs()),
+        (2, 600)
+    );
+    let with = [&FLAGS[..], &["--apply-deadline-secs=90"]].concat();
+    let cfg = parse(&with).expect("deadline");
+    assert_eq!(
+        (cfg.apply_poll.as_secs(), cfg.apply_deadline.as_secs()),
+        (5, 90)
+    );
+    for flag in ["--apply-poll-secs", "--apply-deadline-secs"] {
+        for bad in ["soon", "-1", "1.5", ""] {
+            let with = [&FLAGS[..], &[flag, bad]].concat();
+            assert_eq!(
+                parse(&with).expect_err(bad),
+                format!("{flag} must be a number of seconds")
+            );
+        }
+        let zero = [&FLAGS[..], &[flag, "0"]].concat();
+        assert_eq!(
+            parse(&zero).expect_err("zero"),
+            format!("{flag} must be at least 1")
+        );
+    }
+}
+
+/// Asserts that the two bounds of a frontend member's drain without a proxy are optional flags
+/// that default to 30 s of readiness of the other members and 1200 s for the member to exit,
+/// take a number of seconds, may not be zero (a window of nothing waits for nothing; a deadline
+/// of nothing fails every drain), and that each sets only itself.
+#[test]
+fn the_peer_ready_and_frontend_drain_deadline_are_optional_flags_of_at_least_a_second() {
+    let cfg = parse(&FLAGS).expect("flags");
+    assert_eq!(cfg.peer_ready.as_secs(), 30);
+    assert_eq!(cfg.frontend_drain_deadline.as_secs(), 1200);
+    let with = [&FLAGS[..], &["--peer-ready-secs", "7"]].concat();
+    let cfg = parse(&with).expect("peers");
+    assert_eq!(cfg.peer_ready.as_secs(), 7);
+    assert_eq!(cfg.frontend_drain_deadline.as_secs(), 1200);
+    let with = [&FLAGS[..], &["--frontend-drain-deadline-secs=90"]].concat();
+    let cfg = parse(&with).expect("deadline");
+    assert_eq!(cfg.peer_ready.as_secs(), 30);
+    assert_eq!(cfg.frontend_drain_deadline.as_secs(), 90);
+    for flag in ["--peer-ready-secs", "--frontend-drain-deadline-secs"] {
+        for bad in ["soon", "-1", "1.5", ""] {
+            let with = [&FLAGS[..], &[flag, bad]].concat();
+            assert_eq!(
+                parse(&with).expect_err(bad),
+                format!("{flag} must be a number of seconds")
+            );
+        }
+        let zero = [&FLAGS[..], &[flag, "0"]].concat();
+        assert_eq!(
+            parse(&zero).expect_err("zero"),
+            format!("{flag} must be at least 1")
+        );
+    }
+}
+
+/// Asserts that each of the flags below reaches the roll's timing: the drain deadline, the apply
+/// poll and deadline, the wait for the other members and the deadline of a member's drain, and
+/// that the rest of the timing is the default.
+#[test]
+fn the_flags_set_the_timing_of_the_roll() {
+    let with = [
+        &FLAGS[..],
+        &[
+            "--drain-deadline-secs=7",
+            "--apply-poll-secs=3",
+            "--apply-deadline-secs=11",
+            "--peer-ready-secs=13",
+            "--frontend-drain-deadline-secs=17",
+        ],
+    ]
+    .concat();
+    let t = crate::daemon::timing(&parse(&with).expect("flags"));
+    assert_eq!(
+        (
+            t.drain_deadline.as_secs(),
+            t.apply_poll.as_secs(),
+            t.apply_deadline.as_secs()
+        ),
+        (7, 3, 11)
+    );
+    assert_eq!(t.peer_ready.as_secs(), 13);
+    assert_eq!(t.frontend_drain.as_secs(), 17);
+    assert_eq!(t.poll, Timing::default().poll);
 }
 
 /// Catches the settings of the installer reaching it unchecked: a key path that is no file, a
@@ -313,6 +441,17 @@ fn the_operator_api_must_be_a_loopback_address() {
     }
 }
 
+/// Asserts that `--proxy-admin`, the flag of the pool step this roll once had, is an unknown
+/// argument now.
+#[test]
+fn the_proxy_admin_flag_is_gone() {
+    let with = [&FLAGS[..], &["--proxy-admin", "http://127.0.0.1:18090"]].concat();
+    assert_eq!(
+        parse(&with).expect_err("gone"),
+        "unknown argument --proxy-admin"
+    );
+}
+
 /// A config over a scratch directory with `inventory` and a good token file.
 fn config(name: &str, inventory: &str, api: &FakeApi) -> Config {
     let dir = scratch(name);
@@ -326,12 +465,16 @@ fn config(name: &str, inventory: &str, api: &FakeApi) -> Config {
         proxy_uid: own_uid(),
         operator_api: api.addr,
         token_file: file(&dir, "token", TOKEN, 0o600),
-        operator_proxy_auth_file: None,
         ssh_key_file: file(&dir, "id_updater", KEY_TEXT, 0o600),
         ssh_user: "kbf".to_owned(),
         channel: "stable".to_owned(),
         ssh_connect_timeout: Duration::from_secs(5),
         ssh_command_timeout: Duration::from_secs(30),
+        drain_deadline: Duration::from_secs(600),
+        apply_poll: Duration::from_secs(5),
+        apply_deadline: Duration::from_secs(600),
+        peer_ready: Duration::from_secs(30),
+        frontend_drain_deadline: Duration::from_secs(1200),
     }
 }
 
@@ -367,7 +510,17 @@ impl Exec for FakeSsh {
     }
 }
 
-/// The timing of a test: a roll that cannot go on fails within a second.
+/// The ports of the binary with `ssh` standing in for the real program and the clock the
+/// test's: a bound of a roll passes as the roll sleeps, not as the wall clock moves.
+fn ports_with_ssh(cfg: &Config, ssh: &Arc<FakeSsh>) -> Ports {
+    Ports {
+        clock: Box::new(FakeClock::new()),
+        ..build_ports_with_exec(cfg, ssh.clone()).expect("ports")
+    }
+}
+
+/// The bounds of a test: short, on the clock of [`ports_with_ssh`], so that a roll that cannot
+/// go on fails after its polls and no time at all.
 fn quick() -> Timing {
     Timing {
         poll: Duration::from_millis(10),
@@ -377,6 +530,11 @@ fn quick() -> Timing {
         healthy_frontend: Duration::from_millis(300),
         healthy_storage: Duration::from_millis(300),
         healthy_daemon: Duration::from_millis(300),
+        drain_deadline: Duration::from_millis(300),
+        apply_poll: Duration::from_millis(10),
+        apply_deadline: Duration::from_millis(300),
+        peer_ready: Duration::from_millis(30),
+        frontend_drain: Duration::from_millis(300),
     }
 }
 
@@ -384,7 +542,7 @@ fn quick() -> Timing {
 fn start_with_ssh(cfg: &Config, ssh: &Arc<FakeSsh>) -> Daemon {
     start_with(
         cfg,
-        build_ports_with_exec(cfg, ssh.clone()).expect("ports"),
+        ports_with_ssh(cfg, ssh),
         quick(),
         Settings::new(cfg.proxy_uid),
         stderr_sink(),
@@ -410,13 +568,14 @@ fn post(socket: &std::path::Path) -> (u16, Value) {
     call(socket, "POST", "/v1/updater/rolls", &body.to_string())
 }
 
-/// Catches ssh being run for a frontend: with the binary's own ports, an all-hosts roll
-/// (frontend, storage, daemon) is accepted (202) and FAILS at the frontend, before its
-/// installer, with the drain control reason in the failure. The recording `Exec` is never
-/// called (the recorded calls are empty), no later host is asked about (the fake operator API sees
-/// no request at all) and the later hosts stay pending.
+/// Asserts that ssh is never run for a frontend that is no pool member: with the binary's own
+/// ports, an all-hosts roll (frontend, storage, daemon) is accepted (202) and fails at the
+/// frontend, before its installer, with the reason that says to list an instance and a base in
+/// the failure. The recording `Exec` is never called (the recorded calls are empty), no later
+/// host is asked about (the fake operator API sees no request at all) and the later hosts stay
+/// pending.
 #[test]
-fn an_all_hosts_roll_never_runs_ssh_for_a_frontend() {
+fn an_all_hosts_roll_never_runs_ssh_for_a_frontend_that_is_no_member() {
     let api = fake_api(vec![Some(http(
         200,
         "{\"safe\":true,\"reasons\":[],\"planned_down\":false}",
@@ -439,7 +598,7 @@ fn an_all_hosts_roll_never_runs_ssh_for_a_frontend() {
         ("fe", ErrorCode::SwapAbandoned)
     );
     assert!(
-        failure.detail.contains("kbf-proxy drain control"),
+        failure.detail.contains("instance=<name> and base=<port>"),
         "{}",
         failure.detail
     );
@@ -481,7 +640,7 @@ fn a_node_is_installed_over_ssh_with_the_configured_user_key_and_channel() {
     let audit = Lines::default();
     let daemon = start_with(
         &cfg,
-        build_ports_with_exec(&cfg, ssh.clone()).expect("ports"),
+        ports_with_ssh(&cfg, &ssh),
         quick(),
         Settings::new(cfg.proxy_uid),
         audit.sink(),
@@ -530,11 +689,11 @@ fn a_node_is_installed_over_ssh_with_the_configured_user_key_and_channel() {
     daemon.wait();
 }
 
-/// Catches a host that is not a frontend, storage or daemon being accepted: the inventory
-/// refuses the line (a Mac host, or any other role, is not rolled by this updater), so the
-/// updater does not start and no ssh runs.
+/// Catches a role that is not frontend, storage, daemon or mac-daemon being accepted: the
+/// inventory refuses the line (`mac` alone is not a role), so the updater does not start and
+/// no ssh runs.
 #[test]
-fn a_mac_host_is_refused_by_the_inventory() {
+fn an_unknown_role_is_refused_by_the_inventory() {
     let api = fake_api(vec![Some(http(200, "{}"))]);
     for role in ["mac", "macos", "homebrew"] {
         let cfg = config(
@@ -544,11 +703,54 @@ fn a_mac_host_is_refused_by_the_inventory() {
         );
         let e = start(&cfg).err().expect(role);
         assert!(
-            e.starts_with("inventory ") && e.contains("is not frontend, storage or daemon"),
+            e.starts_with("inventory ")
+                && e.contains("is not frontend, storage, daemon or mac-daemon"),
             "{e}"
         );
         assert!(!sock(&cfg).exists());
     }
+}
+
+/// Asserts that an inventory that lists frontend pool members starts, whatever flags there are
+/// for a proxy (none), and that an inventory without members starts as before.
+#[test]
+fn pool_members_start_without_any_proxy_flag() {
+    let api = fake_api(vec![Some(http(200, "{}"))]);
+    let members = "fe-a fe.farm.example frontend KEY instance=a base=18000\n\
+                   fe-b fe.farm.example frontend KEY instance=b base=18010\n";
+    let cfg = config("members", members, &api);
+    let daemon = start(&cfg).expect("start");
+    daemon.stopper().stop();
+    daemon.wait();
+    let plain = config("no-members", "st1 st1.farm.example storage KEY\n", &api);
+    let daemon = start(&plain).expect("start without members");
+    daemon.stopper().stop();
+    daemon.wait();
+}
+
+/// Asserts that the binary's frontend port is the member's own operator API, asked with the
+/// token.
+#[test]
+fn the_binarys_frontend_port_reaches_the_member() {
+    let operator = fake_api(vec![Some(http(200, "{\"commit\":\"0123456789ab\"}"))]);
+    let cfg = config("pool", "st1 st1.farm.example storage KEY\n", &operator);
+    let ports = build_ports(&cfg).expect("ports");
+    let host = Host {
+        alias: "fe-a".to_owned(),
+        address: "fe.farm.example".to_owned(),
+        role: Role::Frontend,
+        host_key: KEY.to_owned(),
+        node_id: None,
+        member: Some(Member {
+            instance: "a".to_owned(),
+            base_port: operator.addr.port() - 2,
+        }),
+    };
+    let commit = ports.frontend.commit(&host);
+    assert_eq!(commit, Ok("0123456789ab".to_owned()));
+    let asked = operator.requests().remove(0);
+    assert!(asked.starts_with("GET /healthz HTTP/1.1\r\n"));
+    assert!(asked.contains(&format!("Bearer {TOKEN}")), "{asked}");
 }
 
 /// Catches start-up that goes on over something wrong: an inventory that is not owned by the
@@ -609,8 +811,10 @@ fn the_driver_loop_audits_what_it_cannot_drive_and_goes_on() {
     let ports = Ports {
         safe: Box::new(FakeSafeToStop::new(&log)),
         installer: Box::new(FakeInstaller::new(&log)),
+        drain: Box::new(crate::fakes::FakeDrain::new(&log)),
         health: Box::new(FakeHealth::new(&log)),
         clock: Box::new(FakeClock::new()),
+        frontend: Box::new(crate::fakes::FakeFrontend::new(&log)),
     };
     let updater = Updater::open(
         crate::inventory::Inventory::load(&cfg.inventory, own_uid()).expect("inventory"),

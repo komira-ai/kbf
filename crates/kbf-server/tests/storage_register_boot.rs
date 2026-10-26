@@ -47,6 +47,7 @@ fn frontend() -> (SocketAddr, Arc<Hooked>) {
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -109,7 +110,7 @@ fn joiner(worker: SocketAddr) -> Joiner {
 }
 
 /// Catches: a joiner that does not put its log's report in the registration it sends
-/// (mutants: `last_boot: 0` and `last_member_id: 0` in `Joiner::register`, or no
+/// (defect: `last_boot: 0` and `last_member_id: 0` in `Joiner::register`, or no
 /// `with_last_boot`). A node whose log last wrote as member 1 at boot 4 registers with a
 /// fresh store and is answered member 1 at boot 5; without the report it is boot 1.
 #[tokio::test]
@@ -124,7 +125,7 @@ async fn a_joiner_registers_with_the_member_and_boot_its_log_last_wrote_as() {
     assert_eq!((none.member_id, none.boot), (1, 1), "no report, no raise");
 }
 
-/// Catches: a node that does not send its log's report when it starts (mutant: no
+/// Catches: a node that does not send its log's report when it starts (defect: no
 /// `.with_last_boot(last)` in `open_cache`). The node runs against one frontend, so its log
 /// holds member 1 at boot 1 (the cold store is another directory: the first node still holds
 /// its lock); the frontend's store is then lost and the node starts against a

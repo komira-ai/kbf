@@ -59,6 +59,7 @@ fn listeners() -> Listeners {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -89,7 +90,6 @@ fn start(state: Option<StateStore>) -> Server {
         listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         token: Some(token()),
         local_cache: None,
-        releases: None,
     };
     let bound = bind_server_with_state(
         Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory()),
@@ -203,7 +203,7 @@ async fn an_operator_promotes_a_joining_member() {
 
 /// Catches: the member write skipping a gate the node writes pass: no token, a wrong
 /// token, a browser's `Origin`, or a body that is not JSON must each be refused, and the
-/// member must stay `Joining`. Mutant: the `gate` call removed from `set_member_state`
+/// member must stay `Joining`. Catches: the `gate` call removed from `set_member_state`
 /// turns the first three red.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_member_write_is_refused_without_the_gates() {

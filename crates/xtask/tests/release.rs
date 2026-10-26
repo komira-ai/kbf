@@ -1532,7 +1532,7 @@ fn publish_refuses_a_set_hash_that_is_not_a_hash() {
     assert_eq!(code, Some(2), "{err}");
 }
 
-/// The deb of `platform` named `name`, added to `dist` as `pkg-asset` and the attest job
+/// The deb of `platform` named `name`, added to `dist` as `pkg-kbf-asset` and the attest job
 /// leave it: the file, its line in `SHA256SUMS`, and its bundle when `bundle`.
 fn add_deb(dist: &Path, name: &str, bundle: bool) {
     let bytes = format!("{name} bytes");
@@ -1573,6 +1573,106 @@ fn check_accepts_the_installer_package_of_the_commit_with_its_bundle() {
              bundles: each of the 3 tarballs and 2 package(s) has one provenance bundle\n"
         )
     );
+}
+
+fn image(commit: &str, platform: &str) -> String {
+    format!("kbf-frontend-image-{commit}-{platform}.oci.tar")
+}
+
+#[test]
+fn check_accepts_the_frontend_image_of_each_linux_arch_with_its_bundle() {
+    // Catches: an `.oci.tar` in SHA256SUMS refused as "not an asset of <commit>" (the release
+    // of the first main push that lists an image fails), accepted with no bundle, and the
+    // bundles line not counting the image as a package.
+    let root = scratch("check-image");
+    let dist = dist(&root, COMMIT);
+    add_deb(&dist, &image(COMMIT, "linux-x86_64"), true);
+    add_deb(&dist, &image(COMMIT, "linux-arm64"), true);
+    let (code, out, err) = check(&dist, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(
+        out,
+        format!(
+            "sums: 8 files match; the flipped copy does not\n\
+             names: every listed file is an asset of {COMMIT}\n\
+             bundles: each of the 3 tarballs and 2 package(s) has one provenance bundle\n"
+        )
+    );
+    let root = scratch("check-image-no-bundle");
+    let held = dist_without_bundle(&root);
+    let (code, out, err) = check(&held.0, COMMIT);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!(
+            "xtask: {}: no provenance bundle {}.sigstore.json\n",
+            held.1, held.1
+        )
+    );
+}
+
+#[test]
+fn check_accepts_the_coordinator_image_of_each_linux_arch_and_refuses_it_on_the_mac() {
+    // Catches: `kbf-coordinator-image-...oci.tar` refused as "not an asset of <commit>" (the
+    // release of the first main push that lists it fails), accepted with no bundle, or
+    // accepted for the Mac, which builds no container image.
+    let root = scratch("check-coordinator-image");
+    let listed = dist(&root, COMMIT);
+    for platform in ["linux-x86_64", "linux-arm64"] {
+        add_deb(
+            &listed,
+            &format!("kbf-coordinator-image-{COMMIT}-{platform}.oci.tar"),
+            true,
+        );
+    }
+    let (code, out, err) = check(&listed, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(
+        out.contains("bundles: each of the 3 tarballs and 2 package(s) has one provenance bundle"),
+        "{out}"
+    );
+    let mac = format!("kbf-coordinator-image-{COMMIT}-darwin-arm64.oci.tar");
+    let root = scratch("check-coordinator-image-mac");
+    let held = dist(&root, COMMIT);
+    add_deb(&held, &mac, true);
+    let (code, out, err) = check(&held, COMMIT);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(err, format!("xtask: {mac}: not an asset of {COMMIT}\n"));
+}
+
+/// A `dist` of the commit with the x86_64 frontend image listed and no bundle for it: the
+/// directory and the image's name.
+fn dist_without_bundle(root: &Path) -> (PathBuf, String) {
+    let dist = dist(root, COMMIT);
+    let name = image(COMMIT, "linux-x86_64");
+    add_deb(&dist, &name, false);
+    (dist, name)
+}
+
+#[test]
+fn check_refuses_a_frontend_image_of_another_commit_arch_or_name() {
+    // Catches: an image accepted for another commit's build, for an architecture the release
+    // does not build (an unknown one, or the Mac's, which has no container image), under a
+    // binary name that is not the frontend image's, or with no commit in its name at all.
+    for foreign in [
+        image(OTHER, "linux-arm64"),
+        image(COMMIT, "linux-riscv"),
+        image(COMMIT, "darwin-arm64"),
+        format!("kbf-daemon-{COMMIT}-linux-arm64.oci.tar"),
+        format!("-{COMMIT}-linux-arm64.oci.tar"),
+        "kbf-frontend-image-linux-arm64.oci.tar".to_owned(),
+    ] {
+        let root = scratch("check-image-foreign");
+        let dist = dist(&root, COMMIT);
+        add_deb(&dist, &foreign, true);
+        let (code, out, err) = check(&dist, COMMIT);
+        assert_eq!(code, Some(1), "{foreign}: {out}");
+        assert_eq!(
+            err,
+            format!("xtask: {foreign}: not an asset of {COMMIT}\n"),
+            "{foreign}"
+        );
+    }
 }
 
 #[test]

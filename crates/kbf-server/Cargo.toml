@@ -31,6 +31,8 @@ kbf-enroll-registry.workspace = true
 kbf-mdm-api.workspace = true
 kbf-meta.workspace = true
 kbf-objstore.workspace = true
+# The pack keys, the read cache and the errors of the frontend's packs (frontend/pack_flags.rs).
+kbf-pack.workspace = true
 # The certificate's names, serial and key hash a deny entry is compared with (identity.rs,
 # members_rpc.rs): the one reader the storage service uses too.
 kbf-peer.workspace = true
@@ -72,6 +74,8 @@ zeroize.workspace = true
 [dev-dependencies]
 # The node's client of `kbf.enroll.v1`, run against the real enroll listener (tests/enroll_node.rs).
 kbf-enroll.workspace = true
+# The host's updater, run against the same listener (tests/enroll_updater.rs).
+kbf-updater.workspace = true
 # An S3 service on loopback that refuses any other key pair (tests/cold_apply.rs).
 kbf-objstore = { workspace = true, features = ["testkit"] }
 # Loopback ports nothing can take (kbf_testkit::port), and the test Postgres server's URL
@@ -83,12 +87,7 @@ hyper-util = { workspace = true, features = ["tokio"] }
 # A test certificate's public-key hash and names, read independently of kbf-peer.
 x509-parser.workspace = true
 kbf-segments.workspace = true
-# The node's update client the offer tests hand the offers to (tests/update_offers.rs).
-kbf-update.workspace = true
-# The proxy's `ChildAdmin`, run against the admin and operator ports of two managed
-# frontends (tests/frontend/managed/admin_client.rs).
-kbf-installer.workspace = true
-# The deterministic simulation kernel's seeded random stream (tests/sim_rollout.rs).
+# The deterministic simulation kernel's seeded random stream (src/machine.rs, tests/invocations_paging.rs).
 kbf-sim.workspace = true
 # The in-memory state store (src/start.rs, src/frontend, src/farm/durable and tests/), and a
 # Postgres database of its own for a test (tests/state_store_postgres.rs).

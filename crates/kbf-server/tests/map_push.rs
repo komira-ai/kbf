@@ -62,6 +62,7 @@ fn listeners() -> Listeners {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -216,7 +217,7 @@ fn registrant(i: u32) -> Registrant {
 /// Catches a server with a state store that sends daemons no map (the members' map is
 /// the one it holds, with no source given): a daemon that connects before any storage node
 /// registered is welcomed with none and is sent the first map when a node registers,
-/// and a daemon that connects later is welcomed with the members' map. Mutant: a server
+/// and a daemon that connects later is welcomed with the members' map. Catches: a server
 /// that takes no map from its members.
 #[tokio::test]
 async fn a_server_with_a_state_store_sends_daemons_its_members_map() {

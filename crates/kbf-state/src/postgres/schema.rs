@@ -2,8 +2,10 @@
 //! check a kbf process makes before it serves.
 //!
 //! `kbf-installer` owns the schema. Its `setup` creates it and every update applies the new
-//! release's migrations before the new child starts ([`apply`]). kbf never creates or
-//! changes a table: [`PostgresStore::open`](super::PostgresStore::open) judges the version
+//! release's migrations before the new child starts ([`apply`]); `kbf boot-check` applies
+//! this build's before a unit of the kbf package starts it ([`super::boot`]). The kbf that
+//! serves never creates or changes a table:
+//! [`PostgresStore::open`](super::PostgresStore::open) judges the version
 //! once, on its first connection, and refuses with one line when it is outside what the
 //! binary supports. The check runs at start only: a child that is serving keeps its pooled
 //! and new connections when the installer migrates under it.
@@ -47,7 +49,14 @@ use super::{PostgresConfig, describe};
 pub const MIN_SUPPORTED: u32 = 1;
 
 /// The migrations shipped in this build: version, name, file.
-const EMBEDDED: [(u32, &str, &str); 1] = [(1, "state", include_str!("migrations/0001_state.sql"))];
+const EMBEDDED: [(u32, &str, &str); 2] = [
+    (1, "state", include_str!("migrations/0001_state.sql")),
+    (
+        2,
+        "pack_index",
+        include_str!("migrations/0002_pack_index.sql"),
+    ),
+];
 
 /// Taken (transaction-scoped) by every schema change: the installer's `apply` and `setup`
 /// serialise on it, so two installers racing apply a migration once. The key is

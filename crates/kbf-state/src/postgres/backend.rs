@@ -11,9 +11,10 @@ use std::time::Duration;
 
 use super::conn::Conn;
 use super::schema;
-use super::{Flaw, PostgresConfig, PostgresStore};
+use super::{Flaw, PostgresConfig, PostgresPackIndex, PostgresStore};
 use crate::clock::ManualClock;
 use crate::conformance::Backend;
+use crate::pack_index::conformance::PackBackend;
 use crate::{Conflict, Store, Txn};
 
 /// How long [`PostgresBackend::commit_out_of_order`] waits, in polls of 5 ms, for the
@@ -94,6 +95,21 @@ impl Drop for PostgresBackend {
                 let _ = client.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"));
             }
         });
+    }
+}
+
+/// The pack index of a new schema of its own, opened as the conformance suite asks.
+impl PackBackend for PostgresBackend {
+    type Index = PostgresPackIndex;
+
+    fn open_index(&self, clock: Arc<ManualClock>) -> PostgresPackIndex {
+        PostgresPackIndex::open(&self.fresh_config())
+            .expect("the test database opens")
+            .with_clock(clock)
+    }
+
+    fn reconnect(&self, index: &PostgresPackIndex) -> PostgresPackIndex {
+        index.reconnect().expect("the test database reopens")
     }
 }
 

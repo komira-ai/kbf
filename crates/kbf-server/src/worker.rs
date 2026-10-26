@@ -25,7 +25,9 @@
 //!   ([`crate::farm::ACK_WINDOW`]). A lease it lists that the
 //!   scheduler no longer holds on the node is sent a `Cancel` (issue #23). A lease it
 //!   leaves out that was lost to a restart past its farm reruns answers the
-//!   operation's callers;
+//!   operation's callers. The pack-read counts it carries, if any, are kept as the node's
+//!   newest for `/metrics` ([`Farm::note_pack_reads`]), and so are its pack-write counts
+//!   ([`Farm::note_pack_writes`]);
 //! - a `Result` the deny list now refuses ends the stream, so it never reaches the
 //!   action cache. Otherwise it is accepted only from the node holding the
 //!   operation's current lease, and only if the action it names (if any) is the one
@@ -45,11 +47,9 @@
 //! - an `Offer` from a daemon is not read: offers go the other way.
 //!
 //! A server given a [`MapSource`] ([`WorkerService::with_map`]) names its map in
-//! `Welcome`, and sends a `MapUpdate` each time the source's map changes. A server given
-//! [`Offers`] ([`WorkerService::with_offers`]) sends each node an `UpdateOffer` for its
-//! platform right after `Welcome` (when a complete release is desired for it) and again at
-//! each change; a node on a platform no release is built for is sent none. The platform is
-//! read from the first `Hello`.
+//! `Welcome`, and sends a `MapUpdate` each time the source's map changes. A server that serves
+//! `PackIndex/CommitPack` ([`WorkerService::with_pack_commit`]) says so in
+//! `Welcome.pack_commit`; a daemon that writes packs commits them only to one that does.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -71,7 +71,6 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::farm::{Farm, Outbound, Reported, StreamId};
 use crate::identity::{PeerCert, Peers, presented};
 use crate::map_push::MapFeed;
-use crate::release::offers::{OfferFeed, Offers, platform_of};
 
 /// The `kbf.worker.v1` version this server speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -97,10 +96,13 @@ pub struct WorkerService {
     peers: Peers,
     heartbeat_interval: Duration,
     hello_wait: Duration,
+    /// What a node that reports VM slots keeps for itself ([`capacity`]).
+    host_floor: HostFloor,
     map: MapFeed,
-    offers: OfferFeed,
     /// The oldest and the newest `Hello` version a session accepts.
     protocols: (u32, u32),
+    /// Whether `Welcome` says this frontend takes `PackIndex/CommitPack` (`Welcome.pack_commit`).
+    pack_commit: bool,
 }
 
 impl WorkerService {
@@ -118,9 +120,10 @@ impl WorkerService {
             peers,
             heartbeat_interval,
             hello_wait,
+            host_floor: HostFloor::DEFAULT,
             map: MapFeed::NONE,
-            offers: OfferFeed::NONE,
             protocols: (OLDEST_PROTOCOL_VERSION, PROTOCOL_VERSION),
+            pack_commit: false,
         }
     }
 
@@ -134,18 +137,28 @@ impl WorkerService {
         self
     }
 
+    /// The service keeping `floor` of the CPUs and memory of each node that reports VM
+    /// slots for the node itself ([`capacity`]).
+    #[must_use]
+    pub const fn with_host_floor(mut self, floor: HostFloor) -> Self {
+        self.host_floor = floor;
+        self
+    }
+
+    /// The service telling each daemon, in `Welcome.pack_commit`, whether this frontend takes
+    /// `kbf.worker.v1.PackIndex/CommitPack` (`on`): a daemon that writes packs commits them only
+    /// to a frontend that says so. Off for a service built without it.
+    #[must_use]
+    pub const fn with_pack_commit(mut self, on: bool) -> Self {
+        self.pack_commit = on;
+        self
+    }
+
     /// The service sending the storage map `map` holds to each daemon: in `Welcome`, and
     /// in a `MapUpdate` each time it changes.
     #[must_use]
     pub fn with_map(mut self, map: Arc<dyn MapSource>) -> Self {
         self.map = MapFeed::new(map);
-        self
-    }
-
-    /// The service sending each node the `UpdateOffer` `offers` gives its platform.
-    #[must_use]
-    pub fn with_offers(mut self, offers: Arc<Offers>) -> Self {
-        self.offers = OfferFeed::new(offers);
         self
     }
 }
@@ -177,7 +190,7 @@ impl Worker for WorkerService {
             return Err(Status::invalid_argument("Hello has no node_id"));
         }
         self.peers.admit(peer.as_ref(), &hello.node_id).await?;
-        let mut reported = reported(&hello).map_err(Status::invalid_argument)?;
+        let mut reported = reported(&hello, self.host_floor).map_err(Status::invalid_argument)?;
         // The stream speaks what `Welcome` names, which a newer daemon's `Hello` may exceed.
         reported.protocol = Some(version);
         let worker = WorkerId::new(hello.node_id);
@@ -192,10 +205,10 @@ impl Worker for WorkerService {
                 .unwrap_or(u64::MAX),
             epoch: self.farm.lease_epoch(),
             map: self.map.welcome_map(),
+            pack_commit: self.pack_commit,
         }));
         let (outbound, responses) = mpsc::unbounded_channel();
         let capacity = reported.capacity;
-        let platform = platform_of(&reported.caps);
         let stream = self.farm.register(
             &worker,
             instance,
@@ -207,7 +220,6 @@ impl Worker for WorkerService {
         tracing::info!(%worker, ?capacity, "worker registered");
         // After `register`, which queued the `Welcome`: the first update follows it.
         self.map.push(changes, &outbound);
-        self.offers.push(platform, &outbound);
         let session = Session {
             map: self.map.clone(),
             farm: Arc::clone(&self.farm),
@@ -215,6 +227,7 @@ impl Worker for WorkerService {
             peer,
             worker,
             stream,
+            host_floor: self.host_floor,
         };
         tokio::spawn(session.serve(inbound, outbound));
         Ok(Response::new(Box::pin(stream::unfold(
@@ -253,6 +266,7 @@ struct Session {
     peer: Option<PeerCert>,
     worker: WorkerId,
     stream: StreamId,
+    host_floor: HostFloor,
 }
 
 impl Session {
@@ -298,7 +312,7 @@ impl Session {
                 self.peers
                     .admit(self.peer.as_ref(), worker.as_str())
                     .await?;
-                match reported(&hello) {
+                match reported(&hello, self.host_floor) {
                     Ok(reported) => farm.resize(worker, stream, reported),
                     Err(e) => tracing::warn!(%worker, error = %e, "a resent Hello ignored"),
                 }
@@ -308,6 +322,10 @@ impl Session {
                 self.peers
                     .admit(self.peer.as_ref(), worker.as_str())
                     .await?;
+                // Before the acknowledgement below, so a daemon that has been acknowledged
+                // has its counts on `/metrics`.
+                farm.note_pack_reads(worker, stream, beat.pack_reads);
+                farm.note_pack_writes(worker, stream, beat.pack_writes);
                 let running = beat
                     .running
                     .iter()
@@ -384,9 +402,9 @@ pub(crate) fn message(message: server_message::Message) -> ServerMessage {
 ///
 /// # Errors
 /// Any of the three is malformed.
-pub fn reported(hello: &Hello) -> Result<Reported, String> {
+pub fn reported(hello: &Hello, floor: HostFloor) -> Result<Reported, String> {
     Ok(Reported {
-        capacity: capacity(hello)?,
+        capacity: capacity(hello, floor)?,
         caps: caps(hello)?,
         phase: phase(hello)?,
         protocol: named_protocol(hello.protocol_version),
@@ -423,24 +441,69 @@ pub fn phase(hello: &Hello) -> Result<NodePhase, String> {
     })
 }
 
-/// What placement may book on a node: its `cpus` and `mem_gib` entries, and its `gpu`
-/// entry (0 when absent: a daemon that does not detect GPUs has none to book). Its
+/// The most macOS guests one Mac runs at once (Apple's limit); a node's `vm.slots` is
+/// clamped to it.
+pub const MAX_VM_SLOTS: u64 = 2;
+
+/// What a node that reports VM slots keeps for the host itself: subtracted from its
+/// capacity so that guests cannot take the host's own share of cores and memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostFloor {
+    /// CPU, in thousandths of a core.
+    pub cpu_millis: u64,
+    /// Memory, in bytes.
+    pub memory_bytes: u64,
+}
+
+impl HostFloor {
+    /// The floor of `cpus` cores and `mem_gib` GiB.
+    #[must_use]
+    pub const fn new(cpus: u64, mem_gib: u64) -> Self {
+        Self {
+            cpu_millis: cpus.saturating_mul(1_000),
+            memory_bytes: mem_gib.saturating_mul(1 << 30),
+        }
+    }
+
+    /// 2 cores and 8 GiB.
+    pub const DEFAULT: Self = Self::new(2, 8);
+}
+
+impl Default for HostFloor {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// What placement may book on a node: its `cpus` and `mem_gib` entries, its `gpu` entry
+/// (0 when absent: a daemon that does not detect GPUs has none to book) and its
+/// `vm.slots` entry (0 when absent), clamped to [`MAX_VM_SLOTS`]. Its
 /// `action_slots` entry, when reported (it counts the usable slots, busy ones
 /// included), caps how many Action and VM leases it holds at once
-/// (`Resources::leases`); a node that reports none has no cap. v0 books
-/// the whole machine; the protected floors (planned,
-/// `docs/design/capabilities.md#planned`) are subtracted once they are
-/// reported.
+/// (`Resources::leases`); a node that reports none has no cap. A node that reports
+/// at least one VM slot gives up `floor` of its CPUs and memory to the host; any other
+/// node books the whole machine. The other protected floors (planned,
+/// `docs/design/capabilities.md#planned`) are subtracted once they are reported.
 ///
 /// # Errors
 /// `cpus` or `mem_gib` is missing; an entry is repeated or not a whole number.
-pub fn capacity(hello: &Hello) -> Result<Resources, String> {
+pub fn capacity(hello: &Hello, floor: HostFloor) -> Result<Resources, String> {
     let required = |key| entry(&hello.capabilities, key)?.ok_or_else(|| missing(key));
     let cpus = required("cpus")?;
     let mem_gib = required("mem_gib")?;
     let gpus = entry(&hello.capabilities, "gpu")?.unwrap_or(0);
-    let booked =
-        Resources::new(cpus.saturating_mul(1_000), mem_gib.saturating_mul(1 << 30)).with_gpus(gpus);
+    let vms = entry(&hello.capabilities, "vm.slots")?
+        .unwrap_or(0)
+        .min(MAX_VM_SLOTS);
+    let mut cpu_millis = cpus.saturating_mul(1_000);
+    let mut memory_bytes = mem_gib.saturating_mul(1 << 30);
+    if vms > 0 {
+        cpu_millis = cpu_millis.saturating_sub(floor.cpu_millis);
+        memory_bytes = memory_bytes.saturating_sub(floor.memory_bytes);
+    }
+    let booked = Resources::new(cpu_millis, memory_bytes)
+        .with_gpus(gpus)
+        .with_vms(vms);
     // The entry counts usable slots, those running a lease included: it is a cap on the
     // leases held, not a count of the free ones.
     Ok(match entry(&hello.capabilities, "action_slots")? {

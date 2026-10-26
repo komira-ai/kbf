@@ -28,11 +28,11 @@
 //!   memory runs of its kills for memory, the farm runs it used, the nodes placement
 //!   avoids for it and the leases given up as not started ([`kbf_sched::Fate`]), written
 //!   in the transaction of every requeue that follows a fault (whole, so the newest row
-//!   is the whole state) and deleted with the operation's other rows. A successor (after
-//!   a handover or a crash) books the next rung and spends the budgets that are left
-//!   instead of starting over. A store with no row for an operation books and counts as
-//!   it did before the row existed; a row written before the budgets were (version 1)
-//!   carries none of them;
+//!   is the whole state) and deleted with the operation's other rows. A successor (another
+//!   frontend that takes the operation up, or a restart after a crash) books the next rung
+//!   and spends the budgets that are left instead of starting over. A store with no row for
+//!   an operation books and counts as it did before the row existed; a row written before
+//!   the budgets were (version 1) carries none of them;
 //! - `floor/<instance>/<action>`: a memory floor, the least memory a fresh submission of
 //!   the action books ([`kbf_sched::Floor`]): the ask and a stamp that orders the raises,
 //!   written in the transaction of the requeue that raises it, deleted in the one that
@@ -88,9 +88,12 @@
 //!   format is needed: a store from that time reads as one whose blocks are spent. The
 //!   epoch row is created with an absent-only write, and a frontend that loses that race
 //!   reads the other's;
-//! - `meta/generation`: the writer generation ([`kbf_state::Fenced`]); every write of the
-//!   scheduler is checked against it. Operation names do not carry it: a farm over a store
-//!   names its operations `operations/<id>`, and the ids are the store's.
+//! - `meta/generation`: the writer generation of a store an older build that takes
+//!   generations opened, or the marker [`kbf_state::SHARED_WRITERS`] that a start puts there
+//!   when the frontends share the store and none takes a generation. A write of the
+//!   scheduler is then checked by the rows it read, not by a generation. Operation names do
+//!   not carry it: a farm over a store names its operations `operations/<id>`, and the ids
+//!   are the store's.
 //!
 //! Several frontends may share one store. Each change of the rows above to an operation
 //! (a grant, a lease given up, a result, a refusal) is one transaction that is conditional
@@ -150,7 +153,9 @@ use kbf_sched::{
     DaemonInstance, Fate, Floor, FloorChange, KeyFloor, Recovered, RecoveredLease, Request,
     Requeue, RequeueReason,
 };
-use kbf_state::{Cond, Conflict, GENERATION, Store, StoreError, Txn, Version, Versioned};
+use kbf_state::{
+    Cond, Conflict, GENERATION, SHARED_WRITERS, Store, StoreError, Txn, Version, Versioned,
+};
 use kbf_types::{
     ControlRecord, Digest, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, WaiterId, WorkerId,
 };
@@ -876,24 +881,6 @@ impl Durable {
         self.commit(txn)
     }
 
-    /// The unfinished operations that run `action` (of `instance`, if given): at most one
-    /// per instance, since a twin joins the operation that is running.
-    pub(super) fn operations_of(
-        &self,
-        instance: Option<&str>,
-        action: &Digest,
-    ) -> Result<Vec<OperationId>, StateError> {
-        let mut found = Vec::new();
-        for (key, row) in self.scan_known("op/")? {
-            let request = request_row(&key, &row)?;
-            let named = instance.is_none_or(|instance| request.key.instance == instance);
-            if named && request.key.action == *action {
-                found.push(parse_operation(&key, "op/")?);
-            }
-        }
-        Ok(found)
-    }
-
     /// Where `operation` stands. The reads are separate, so a finish may land between
     /// them: `done/` is read again when the operation's rows are gone, and a finish (one
     /// transaction) leaves its result by then.
@@ -1085,11 +1072,17 @@ impl Durable {
         self.commit(renewed)
     }
 
-    /// The writer generation the store holds, if it has one (a store opened by
-    /// [`crate::StateStoreUri::open`] always does).
+    /// The writer generation the store holds, if it holds one: a store with no generation
+    /// row, and one that holds the marker of shared frontends (a Postgres store opened by
+    /// [`crate::StateStoreUri::open`]), hold none.
     fn generation(&self) -> Result<Option<u64>, StateError> {
-        let row = self.store.get(GENERATION)?;
-        row.map(|row| number(GENERATION, &row)).transpose()
+        let Some(row) = self.store.get(GENERATION)? else {
+            return Ok(None);
+        };
+        if row.value == SHARED_WRITERS {
+            return Ok(None);
+        }
+        number(GENERATION, &row).map(Some)
     }
 
     /// How `operation` ended, if its `done/` row is still there.
@@ -1537,6 +1530,9 @@ impl State {
         });
         self.stages.insert(waiter, watch::channel(Stage::Queued).0);
         if let Some(grant) = &op.lease {
+            // A recovered operation that holds a lease has been started: if it is queued
+            // again, its streams read `WaitingKept`.
+            self.ever_started.insert(op.operation);
             let stamp = Stamp {
                 queued: now,
                 started: now,
@@ -1566,9 +1562,11 @@ impl State {
         let stored = durable.load()?;
         // The farm hands out `operations/<id>` names, whose ids are the store's. The machine's
         // term is the one of the old form, `operations/{term}-{waiter}`, which the farm still
-        // answers for a caller it holds: it carries the writer generation, not the epoch, so a
-        // kept epoch does not let a process answer a name another one wrote (issue #154). A
-        // store handed in without a fence has no generation, and the epoch is the term.
+        // answers for a caller it holds: it carries the writer generation when the store has
+        // one, so a kept epoch does not let a process answer a name another one wrote (issue
+        // #154). A store with none (a store with no generation row, or one holding the shared
+        // marker) gives the epoch as the term. The farm gives out no name of the old form
+        // over a store, so no client holds one for two frontends of a store to answer.
         self.machine = FarmMachine::new(durable.generation()?.unwrap_or(epoch));
         let now = SystemTime::now();
         let mut recovered = Vec::new();

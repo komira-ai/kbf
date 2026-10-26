@@ -59,9 +59,9 @@ fn the_kbf_package_is_built_and_made_an_asset_for_the_commit_and_tarball_it_name
         "has --kbf-tarball \"dist/kbf-installer-$GITHUB_SHA-linux-x86_64.tar.gz\", not `dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz`",
     );
     change(
-        "--package target/pkg/kbf-out",
         "--package target/pkg/out",
-        "has --package \"target/pkg/out\", not `target/pkg/kbf-out`",
+        "--package target/pkg/kbf-out",
+        "has --package \"target/pkg/kbf-out\", not `target/pkg/out`",
     );
     change(
         "--out dist",
@@ -73,11 +73,11 @@ fn the_kbf_package_is_built_and_made_an_asset_for_the_commit_and_tarball_it_name
         "\n        if: always()\n        run:",
         "the kbf package of `linux-x86_64` is made an asset under `if:` or `continue-on-error:`",
     );
-    let build = "      - name: Build kbf\n        run: cargo xtask pkg-build --nfpm n --config target/pkg/kbf/nfpm.yaml --out target/pkg/kbf-out\n";
+    let build = "      - name: Build kbf\n        run: cargo xtask pkg-build --nfpm n --config target/pkg/nfpm.yaml --out target/pkg/out\n";
     let missing = "is made an asset without `cargo xtask pkg-build` of the kbf configuration in a step before";
     names(&good().replacen(build, "", 1), &[missing]);
-    let installers = build.replace("target/pkg/kbf/nfpm.yaml", "target/pkg/nfpm.yaml");
-    names(&good().replacen(build, &installers, 1), &[missing]);
+    let elsewhere = build.replace("target/pkg/nfpm.yaml", "target/pkg/other/nfpm.yaml");
+    names(&good().replacen(build, &elsewhere, 1), &[missing]);
     let without = good().replacen(build, "", 1);
     let after = without.replacen(&step, &format!("{step}{build}"), 1);
     names(&after, &[missing]);
@@ -132,4 +132,16 @@ fn the_verify_job_checks_the_signed_kbf_package_with_its_tarball_and_commit() {
     let (head, tail) = early.split_once("  verify-linux:\n").expect("verify-linux");
     let tail = tail.replacen("    steps:\n", &format!("    steps:\n{step}"), 1);
     names(&format!("{head}  verify-linux:\n{tail}"), &[wanted]);
+    // The check is of the branch the job verifies: `$GITHUB_REF`, not a literal, not the
+    // build job's variable, and not left out.
+    for expect in [
+        "--expect-ref refs/heads/main",
+        "--expect-ref \"$PKG_SOURCE_REF\"",
+        "",
+    ] {
+        let to = step.replace(" --expect-ref \"$GITHUB_REF\"", &format!(" {expect}"));
+        let w = good().replacen(&step, &to, 1);
+        assert_ne!(w, good());
+        names(&w, &[wanted]);
+    }
 }

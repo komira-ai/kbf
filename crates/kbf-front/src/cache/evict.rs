@@ -274,7 +274,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
 mod tests {
     use super::*;
 
-    /// Catches an object whose length its write never records (mutants: `written`
+    /// Catches an object whose length its write never records (defect: `written`
     /// records only the use; a write after a use keeps the unknown length), which an
     /// evictor then never picks; and recency recorded while it is off.
     #[test]

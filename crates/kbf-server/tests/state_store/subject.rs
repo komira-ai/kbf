@@ -108,7 +108,7 @@ fn assert_subject_named(lines: &[String]) {
 #[test]
 fn a_handed_over_operation_keeps_its_mnemonic_and_target() {
     let disk = Disk::new();
-    let old = disk.generation_farm();
+    let old = disk.farm(EpochPolicy::Keep);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .start_paused(true)
@@ -116,7 +116,7 @@ fn a_handed_over_operation_keeps_its_mnemonic_and_target() {
         .expect("a runtime");
     runtime.block_on(async { submit_described(&old) });
     old.fence();
-    let successor = disk.generation_farm();
+    let successor = disk.farm(EpochPolicy::Keep);
     assert_subject_named(&usage_lines(&successor));
 }
 
@@ -124,10 +124,10 @@ fn a_handed_over_operation_keeps_its_mnemonic_and_target() {
 #[test]
 fn a_crashed_operation_keeps_its_mnemonic_and_target() {
     let mut disk = Disk::new();
-    let old = disk.generation_farm();
+    let old = disk.farm(EpochPolicy::Keep);
     submit_described(&old);
     disk.crash(old);
-    let successor = disk.generation_farm();
+    let successor = disk.farm(EpochPolicy::Keep);
     assert_subject_named(&usage_lines(&successor));
 }
 
@@ -137,7 +137,7 @@ fn a_crashed_operation_keeps_its_mnemonic_and_target() {
 #[test]
 fn a_taken_over_operation_without_a_subject_row_logs_the_empty_shape() {
     let mut disk = Disk::new();
-    let old = disk.generation_farm();
+    let old = disk.farm(EpochPolicy::Keep);
     submit_described(&old);
     disk.crash(old);
     let keys: Vec<String> = disk
@@ -155,7 +155,7 @@ fn a_taken_over_operation_without_a_subject_row_logs_the_empty_shape() {
         .expect("the row removed");
     assert_eq!(disk.rows("subject/"), 0);
     assert_eq!(disk.rows("op/"), 1);
-    let successor = disk.generation_farm();
+    let successor = disk.farm(EpochPolicy::Keep);
     let lines = usage_lines(&successor);
     let [line] = lines.as_slice() else {
         panic!("one usage line expected: {lines:?}");
@@ -174,7 +174,7 @@ fn a_taken_over_operation_without_a_subject_row_logs_the_empty_shape() {
 #[tokio::test(start_paused = true)]
 async fn the_subject_row_goes_when_the_operation_finishes() {
     let disk = Disk::new();
-    let farm = disk.generation_farm();
+    let farm = disk.farm(EpochPolicy::Keep);
     let (_, mut inbox) = register(&farm);
     submit_described(&farm);
     assert_eq!(disk.rows("subject/"), 1, "a submission left no subject row");

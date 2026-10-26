@@ -4,6 +4,7 @@
 mod support;
 
 use kbf_proto::worker::{Capability, Hello};
+use kbf_server::HostFloor;
 use kbf_server::worker::capacity;
 use kbf_types::Resources;
 use support::{FakeDaemon, Job, done, hello, output, ran};
@@ -26,11 +27,11 @@ fn hello_with_gpus(node: &str, gpus: &str) -> Hello {
 #[test]
 fn capacity_reads_the_gpu_entry() {
     assert_eq!(
-        capacity(&hello_with_gpus("g", "2")),
+        capacity(&hello_with_gpus("g", "2"), HostFloor::default()),
         Ok(Resources::new(4_000, 8 * GIB).with_gpus(2))
     );
     assert_eq!(
-        capacity(&hello("c", 4, 8)),
+        capacity(&hello("c", 4, 8), HostFloor::default()),
         Ok(Resources::new(4_000, 8 * GIB))
     );
     let mut twice = hello_with_gpus("g", "1");
@@ -39,7 +40,7 @@ fn capacity_reads_the_gpu_entry() {
         value: "1".to_owned(),
     });
     for bad in [twice, hello_with_gpus("g", "one")] {
-        let refused = capacity(&bad).expect_err("refused");
+        let refused = capacity(&bad, HostFloor::default()).expect_err("refused");
         assert!(refused.contains("gpu"), "{refused}");
     }
 }
@@ -276,21 +277,26 @@ fn hello_with_slots(node: &str, slots: &str) -> Hello {
 #[test]
 fn capacity_reads_the_action_slots_entry() {
     assert_eq!(
-        capacity(&hello_with_slots("m", "2")),
+        capacity(&hello_with_slots("m", "2"), HostFloor::default()),
         Ok(Resources::new(4_000, 8 * GIB).with_lease_cap(2))
     );
     assert_eq!(
-        capacity(&hello_with_slots("m", "0")),
+        capacity(&hello_with_slots("m", "0"), HostFloor::default()),
         Ok(Resources::new(4_000, 8 * GIB).with_lease_cap(0))
     );
-    assert_eq!(capacity(&hello("c", 4, 8)).unwrap().leases, None);
+    assert_eq!(
+        capacity(&hello("c", 4, 8), HostFloor::default())
+            .unwrap()
+            .leases,
+        None
+    );
     let mut twice = hello_with_slots("m", "1");
     twice.capabilities.push(Capability {
         key: "action_slots".to_owned(),
         value: "1".to_owned(),
     });
     for bad in [twice, hello_with_slots("m", "two")] {
-        let refused = capacity(&bad).expect_err("refused");
+        let refused = capacity(&bad, HostFloor::default()).expect_err("refused");
         assert!(refused.contains("action_slots"), "{refused}");
     }
 }

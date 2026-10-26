@@ -19,7 +19,7 @@ const ALL_REFUSALS: [(Refusal, &str); 10] = [
     (Refusal::FetchFailed, "fetch_failed"),
 ];
 
-const ALL_FAILURES: [(FailureCode, &str); 9] = [
+const ALL_FAILURES: [(FailureCode, &str); 11] = [
     (FailureCode::AuditUnavailable, "audit_unavailable"),
     (FailureCode::QueryFailed, "query_failed"),
     (
@@ -32,6 +32,8 @@ const ALL_FAILURES: [(FailureCode, &str); 9] = [
     (FailureCode::VerifyFailed, "verify_failed"),
     (FailureCode::Busy, "busy"),
     (FailureCode::LockUnavailable, "lock_unavailable"),
+    (FailureCode::RestartFailed, "restart_failed"),
+    (FailureCode::RestartTimeout, "restart_timeout"),
 ];
 
 /// Catches a renamed code: the codes are the contract with the updater.
@@ -189,6 +191,19 @@ fn audit_fields() {
 #[test]
 fn stderr_detail_is_cleaned_and_bounded() {
     assert_eq!(Outcome::Refused(Refusal::BadCommand).stderr_detail(), None);
+    // A refusal with its reason: the same line, status and audit fields as without, and the
+    // reason (cleaned) on stderr.
+    let why = Outcome::RefusedBecause(Refusal::FetchFailed, "slow\x1b down".into());
+    assert_eq!(why.stderr_detail().as_deref(), Some("slow? down"));
+    assert_eq!(why.exit_code(), 2);
+    assert_eq!(
+        why.json_line(),
+        Outcome::Refused(Refusal::FetchFailed).json_line()
+    );
+    assert_eq!(
+        why.audit_fields(),
+        Outcome::Refused(Refusal::FetchFailed).audit_fields()
+    );
     assert_eq!(
         Outcome::Installed {
             version: "1".into()
@@ -324,6 +339,24 @@ fn other_lines_are_not_a_units_answer() {
     ] {
         assert_eq!(Outcome::from_unit_line(line), None, "{line:?}");
     }
+}
+
+/// Asserts that a restart answers with the `restarted` line naming the unit, exit status 0,
+/// the audit outcome `restarted` and no stderr detail, and that the line is not the answer
+/// of an install unit.
+#[test]
+fn the_restarted_answer() {
+    let restarted = Outcome::Restarted {
+        unit: "kbf-frontend@a1.service".into(),
+    };
+    assert_eq!(
+        restarted.json_line(),
+        r#"{"result":"restarted","unit":"kbf-frontend@a1.service"}"#
+    );
+    assert_eq!(restarted.exit_code(), 0);
+    assert_eq!(restarted.audit_fields(), ("restarted", None));
+    assert_eq!(restarted.stderr_detail(), None);
+    assert_eq!(Outcome::from_unit_line(&restarted.json_line()), None);
 }
 
 /// A Mac's two answers have their own lines, which the Linux ones never are: the apply

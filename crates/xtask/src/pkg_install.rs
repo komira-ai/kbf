@@ -1,26 +1,29 @@
-//! `pkg-install-test --package <file> --format deb|rpm --listing <file> --image-dir <dir>
-//! --gate <unit>=<path>.. [--probe '<command>::<text>'].. [--docker <program>]`: installs the `kbf-installer` package
-//! into a fresh container with systemd as PID 1 and checks what the contract promises of
-//! it (docs/design/kbf-installer.md, sections 3 and 7; packaging/linux/README.md).
+//! `pkg-install-test --name <package> --package <file> --format deb|rpm --listing <file>
+//! --image-dir <dir> --gate <unit>=<path>.. [--probe '<command>::<text>'].. [--docker <program>]`:
+//! installs the `kbf` package into a fresh container with systemd as PID 1 and checks what the
+//! contract promises of it (docs/design/kbf-installer.md, sections 3 and 7;
+//! packaging/linux/README.md).
 //!
 //! The container is built from `<image-dir>/Dockerfile` and run with `--privileged`.
 //! After the package manager installs the package:
 //!
-//! 1. its dependencies are exactly the ones this crate lists, and it has no maintainer
-//!    script (nothing can start or enable anything);
+//! 1. it has no dependency, its recommendations are exactly the ones this crate lists, and it
+//!    has no maintainer script (nothing can start or enable anything);
 //! 2. every entry of the listing is at its path, `root:root`, with its mode and bytes;
 //! 3. every packaged unit is `disabled` or `static` and none is active;
 //! 4. after `systemd-sysusers` and `systemd-tmpfiles --create` (what a boot, and
-//!    `kbf-installer setup`, do) the three users exist with no login shell and the three
+//!    `kbf setup`, do) the three users exist with no login shell and the three
 //!    directories exist, `root:root` 0755;
-//! 5. each `--gate` unit does not start without its file, and its condition passes once
-//!    the file exists;
+//! 5. each `--gate` unit does not start without its file (the journal says its condition
+//!    skipped the start), and begins to start once the file exists;
 //! 6. each `--probe` command exits 0 in the container and prints its text: the packaged
 //!    `gh` runs on the container's architecture, the binary names the commit.
 //!
-//! Remove must delete every packaged path and keep `/etc/kbf` and the installer tree
-//! (a file `setup` would have written) and the users; a purge (deb only, of a package
-//! installed again) must do the same and drop the package's record. The container is removed whatever the result.
+//! Remove must delete every packaged path (but a deb's conffiles, its files under `/etc`,
+//! which dpkg keeps until a purge) and keep `/etc/kbf` and the installer tree (a file
+//! `setup` would have written) and the users; a purge (deb only, of a package installed
+//! again) must delete every packaged path, conffiles included, keep the same files, and
+//! drop the package's record. The container is removed whatever the result.
 //!
 //! Every command is one `docker` argv run through a closure ([`Docker`]), so the checks
 //! are tested against a model of the container; [`process`] runs the real program.
@@ -49,9 +52,10 @@ pub enum Format {
 }
 
 impl Format {
-    /// The dependencies the package must list, as the contract says them (and not as
+    /// The recommendations the package must list, as the contract says them (and not as
     /// `pkg_linux` does: a check that read `pkg_linux`'s lists would pass whatever they held).
-    fn depends(self) -> &'static [&'static str] {
+    /// It must list no dependency at all.
+    fn recommends(self) -> &'static [&'static str] {
         match self {
             Format::Deb => &["crun", "uidmap", "systemd", "ca-certificates"],
             Format::Rpm => &["crun", "shadow-utils", "systemd", "ca-certificates"],
@@ -66,26 +70,34 @@ impl Format {
         }
     }
 
-    /// The command that prints the dependencies.
-    fn depends_command(self) -> &'static [&'static str] {
+    /// The command that prints the dependencies of the package `name`.
+    fn depends_command(self, name: &str) -> Vec<&str> {
         match self {
-            Format::Deb => &["dpkg-query", "-W", "-f=${Depends}", pkg_linux::NAME],
-            Format::Rpm => &["rpm", "-qR", pkg_linux::NAME],
+            Format::Deb => vec!["dpkg-query", "-W", "-f=${Depends}", name],
+            Format::Rpm => vec!["rpm", "-qR", name],
         }
     }
 
-    /// The command that prints the package's maintainer scripts, one per line.
-    fn scripts_command(self) -> &'static [&'static str] {
+    /// The command that prints the recommendations of the package `name`.
+    fn recommends_command(self, name: &str) -> Vec<&str> {
         match self {
-            Format::Deb => &[
+            Format::Deb => vec!["dpkg-query", "-W", "-f=${Recommends}", name],
+            Format::Rpm => vec!["rpm", "-q", "--recommends", name],
+        }
+    }
+
+    /// The command that prints the maintainer scripts of the package `name`, one per line.
+    fn scripts_command<'a>(self, name: &'a str, pattern: &'a str) -> Vec<&'a str> {
+        match self {
+            Format::Deb => vec![
                 "find",
                 "/var/lib/dpkg/info",
                 "-name",
-                "kbf-installer.*",
+                pattern,
                 "-printf",
                 "%f\\n",
             ],
-            Format::Rpm => &["rpm", "-q", "--scripts", pkg_linux::NAME],
+            Format::Rpm => vec!["rpm", "-q", "--scripts", name],
         }
     }
 
@@ -102,14 +114,14 @@ impl Format {
             .collect()
     }
 
-    /// Whether the package is installed.
-    fn installed(self, c: &mut Container) -> Result<bool, Error> {
+    /// Whether the package `name` is installed.
+    fn installed(self, c: &mut Container, name: &str) -> Result<bool, Error> {
         match self {
             Format::Deb => {
-                let status = c.say(&["dpkg-query", "-W", "-f=${Status}", pkg_linux::NAME])?;
+                let status = c.say(&["dpkg-query", "-W", "-f=${Status}", name])?;
                 Ok(status == "install ok installed")
             }
-            Format::Rpm => c.ok(&["rpm", "-q", pkg_linux::NAME]),
+            Format::Rpm => c.ok(&["rpm", "-q", name]),
         }
     }
 }
@@ -163,53 +175,57 @@ impl FromStr for Probe {
 }
 
 /// A running container.
-struct Container<'a, 'b> {
+pub(crate) struct Container<'a, 'b> {
     docker: &'a mut Docker<'b>,
     name: String,
 }
 
-impl Container<'_, '_> {
+impl<'a, 'b> Container<'a, 'b> {
+    /// The running container `name`, once it has finished booting: `--wait` returns when
+    /// boot is over, `running`, or `degraded` when some unrelated unit of the image failed.
+    pub(crate) fn booted(docker: &'a mut Docker<'b>, name: &str) -> Result<Self, Error> {
+        let mut c = Container {
+            docker,
+            name: name.to_owned(),
+        };
+        c.exec(&["systemctl", "is-system-running", "--wait"])?;
+        Ok(c)
+    }
+
     /// `docker exec <name> <args>`.
-    fn exec(&mut self, args: &[&str]) -> Result<Out, Error> {
+    pub(crate) fn exec(&mut self, args: &[&str]) -> Result<Out, Error> {
         let mut argv = vec!["exec", &self.name];
         argv.extend_from_slice(args);
         (self.docker)(&argv)
     }
 
     /// The trimmed output of `args`, whether or not it succeeded.
-    fn say(&mut self, args: &[&str]) -> Result<String, Error> {
+    pub(crate) fn say(&mut self, args: &[&str]) -> Result<String, Error> {
         Ok(self.exec(args)?.stdout.trim().to_owned())
     }
 
     /// Whether `args` succeeded.
-    fn ok(&mut self, args: &[&str]) -> Result<bool, Error> {
+    pub(crate) fn ok(&mut self, args: &[&str]) -> Result<bool, Error> {
         Ok(self.exec(args)?.ok)
     }
 
     /// `args` must succeed; otherwise the problem is `what` and its stderr.
-    fn must(&mut self, what: &str, args: &[&str], problems: &mut Vec<String>) -> Result<(), Error> {
+    pub(crate) fn must(
+        &mut self,
+        what: &str,
+        args: &[&str],
+        problems: &mut Vec<String>,
+    ) -> Result<(), Error> {
         let out = self.exec(args)?;
         if !out.ok {
             problems.push(format!("{what} failed: {}", out.stderr.trim()));
         }
         Ok(())
     }
-
-    /// The properties `systemctl show` prints for `unit`.
-    fn show(&mut self, unit: &str) -> Result<BTreeMap<String, String>, Error> {
-        let mut args = vec!["systemctl", "show", unit];
-        args.extend(["-p", "ConditionResult", "-p", "ExecMainStartTimestamp"]);
-        let shown = self.say(&args)?;
-        Ok(shown
-            .lines()
-            .filter_map(|l| l.split_once('='))
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-            .collect())
-    }
 }
 
 /// A problem unless `got` is `want`.
-fn eq(problems: &mut Vec<String>, what: &str, got: &str, want: &str) {
+pub(crate) fn eq(problems: &mut Vec<String>, what: &str, got: &str, want: &str) {
     if got != want {
         problems.push(format!("{what}: {got:?}, not {want:?}"));
     }
@@ -228,40 +244,59 @@ fn names(text: &str) -> Vec<String> {
     names
 }
 
+/// What the journal says of the starts of `unit` since boot: how many the condition skipped and how
+/// many began (`Starting ...`, which systemd logs only once the conditions hold). A skipped start
+/// is the line that says `unmet condition check`, which both systemds in the test images write:
+/// Ubuntu's 255 `... was skipped because of an unmet condition check (...)`, Fedora's 259
+/// `... skipped, unmet condition check ...`. (Not the message id: a skipped start is logged with
+/// the id of a started one, `JOB_RESULT=done`.)
+///
+/// The journal and not `systemctl show -p ConditionResult`: systemd reports `no` for a unit that
+/// is inactive again, and a unit whose program ends at once (the test's stand-in for `kbf`, or a
+/// real one that fails) is inactive again before `show` runs.
+fn starts(c: &mut Container, unit: &str) -> Result<(usize, usize), Error> {
+    c.exec(&["journalctl", "--sync"])?;
+    let log = c.say(&["journalctl", "-u", unit, "-o", "cat", "--no-pager"])?;
+    let skipped = log
+        .lines()
+        .filter(|l| l.contains("unmet condition check"))
+        .count();
+    let begun = log.lines().filter(|l| l.starts_with("Starting ")).count();
+    Ok((skipped, begun))
+}
+
 /// The unit `gate` names, started without and then with its file.
 fn gate(c: &mut Container, g: &Gate, problems: &mut Vec<String>) -> Result<(), Error> {
     let unit = &g.unit;
-    // A start the condition skips succeeds; the properties say what happened.
+    // A start the condition skips succeeds; the journal says what happened.
     c.exec(&["rm", "-f", &g.path])?;
     c.exec(&["systemctl", "start", unit])?;
-    let shown = c.show(unit)?;
-    let got = |k: &str| shown.get(k).map_or("", String::as_str).to_owned();
-    eq(
-        problems,
-        &format!("{unit} without {}: ConditionResult", g.path),
-        &got("ConditionResult"),
-        "no",
-    );
-    eq(
-        problems,
-        &format!("{unit} without {}: ExecMainStartTimestamp", g.path),
-        &got("ExecMainStartTimestamp"),
-        "",
-    );
+    let (skipped, begun) = starts(c, unit)?;
+    if skipped == 0 {
+        problems.push(format!(
+            "{unit} without {}: its start was not skipped by its condition",
+            g.path
+        ));
+    }
+    if begun != 0 {
+        problems.push(format!("{unit} without {}: it began to start", g.path));
+    }
     c.must(
         "creating the gate file",
         &["install", "-D", "-m", "0644", "/dev/null", &g.path],
         problems,
     )?;
     c.exec(&["systemctl", "start", unit])?;
-    let shown = c.show(unit)?;
-    let got = |k: &str| shown.get(k).map_or("", String::as_str).to_owned();
-    eq(
-        problems,
-        &format!("{unit} with {}: ConditionResult", g.path),
-        &got("ConditionResult"),
-        "yes",
-    );
+    let (skipped_again, begun_again) = starts(c, unit)?;
+    if skipped_again != skipped {
+        problems.push(format!(
+            "{unit} with {}: its start was skipped by its condition again",
+            g.path
+        ));
+    }
+    if begun_again == 0 {
+        problems.push(format!("{unit} with {}: it did not begin to start", g.path));
+    }
     // The unit may have started or failed on what comes after its condition; either
     // way it must not stay.
     c.exec(&["systemctl", "stop", unit])?;
@@ -270,7 +305,7 @@ fn gate(c: &mut Container, g: &Gate, problems: &mut Vec<String>) -> Result<(), E
 }
 
 /// The path of `e` in the container must be what the listing says.
-fn entry(c: &mut Container, e: &Entry, problems: &mut Vec<String>) -> Result<(), Error> {
+pub(crate) fn entry(c: &mut Container, e: &Entry, problems: &mut Vec<String>) -> Result<(), Error> {
     let kind = if e.sha256.is_some() {
         "regular file"
     } else {
@@ -310,14 +345,22 @@ fn kept(c: &mut Container, after: &str, problems: &mut Vec<String>) -> Result<()
     Ok(())
 }
 
-/// Every packaged path must be gone.
+/// Whether `after` deletes the packaged path `e`. A deb's `remove` keeps the package's
+/// conffiles, its files under `/etc` (nfpm's `config|noreplace`), as dpkg does, and its
+/// `purge` deletes them; an rpm's `remove` deletes an unchanged config file.
+fn deletes(format: Format, after: &str, e: &Entry) -> bool {
+    !(format == Format::Deb && after == "remove" && e.dst.starts_with("/etc/"))
+}
+
+/// Every packaged path that `after` deletes must be gone.
 fn gone(
     c: &mut Container,
     entries: &[Entry],
+    format: Format,
     after: &str,
     problems: &mut Vec<String>,
 ) -> Result<(), Error> {
-    for e in entries {
+    for e in entries.iter().filter(|e| deletes(format, after, e)) {
         if c.ok(&["test", "-e", &e.dst])? {
             problems.push(format!("{} is still there after {after}", e.dst));
         }
@@ -327,7 +370,7 @@ fn gone(
 
 /// Where the package is copied to in the container: apt takes only a path that ends
 /// in `.deb`, so the file keeps its name.
-fn inside(package: &Path) -> String {
+pub(crate) fn inside(package: &Path) -> String {
     format!(
         "/var/tmp/{}",
         package.file_name().unwrap_or_default().to_string_lossy()
@@ -344,19 +387,26 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
         &[manager, yes, "install", &inside(t.package)],
         &mut problems,
     )?;
-    if !format.installed(c)? {
+    if !format.installed(c, t.name)? {
         problems.push("the package is not installed after install".to_owned());
     }
-    let depends = names(&c.say(format.depends_command())?);
-    let mut want: Vec<String> = format.depends().iter().map(|d| (*d).to_owned()).collect();
+    let depends = names(&c.say(&format.depends_command(t.name))?);
+    eq(&mut problems, "dependencies", &depends.join(" "), "");
+    let recommends = names(&c.say(&format.recommends_command(t.name))?);
+    let mut want: Vec<String> = format
+        .recommends()
+        .iter()
+        .map(|d| (*d).to_owned())
+        .collect();
     want.sort();
     eq(
         &mut problems,
-        "dependencies",
-        &depends.join(" "),
+        "recommendations",
+        &recommends.join(" "),
         &want.join(" "),
     );
-    let scripts = format.scripts(&c.say(format.scripts_command())?);
+    let pattern = format!("{}.*", t.name);
+    let scripts = format.scripts(&c.say(&format.scripts_command(t.name, &pattern))?);
     eq(&mut problems, "maintainer scripts", &scripts.join(" "), "");
     for e in entries {
         entry(c, e, &mut problems)?;
@@ -486,27 +536,21 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
         &["install", "-m", "0640", "/dev/null", "/etc/kbf/kbf.toml"],
         &mut problems,
     )?;
-    c.must(
-        "remove",
-        &[manager, yes, "remove", pkg_linux::NAME],
-        &mut problems,
-    )?;
-    gone(c, entries, "remove", &mut problems)?;
+    c.must("remove", &[manager, yes, "remove", t.name], &mut problems)?;
+    gone(c, entries, format, "remove", &mut problems)?;
     kept(c, "remove", &mut problems)?;
     if format == Format::Deb {
-        // A removed package without conffiles is gone, so purge acts on a fresh install.
+        // A removed deb keeps its conffiles (its record says config-files), so purge acts
+        // on a fresh install and must delete them.
         c.must(
             "reinstall",
             &[manager, yes, "install", &inside(t.package)],
             &mut problems,
         )?;
-        c.must(
-            "purge",
-            &[manager, yes, "purge", pkg_linux::NAME],
-            &mut problems,
-        )?;
+        c.must("purge", &[manager, yes, "purge", t.name], &mut problems)?;
+        gone(c, entries, format, "purge", &mut problems)?;
         kept(c, "purge", &mut problems)?;
-        let status = c.say(&["dpkg-query", "-W", "-f=${Status}", pkg_linux::NAME])?;
+        let status = c.say(&["dpkg-query", "-W", "-f=${Status}", t.name])?;
         if !(status.is_empty() || status.ends_with("not-installed")) {
             problems.push(format!("the package's status is {status:?} after purge"));
         }
@@ -516,6 +560,8 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
 
 /// What `pkg-install-test` is given.
 pub struct InstallTest<'a> {
+    /// The package's name, as the package manager knows it.
+    pub name: &'a str,
     pub package: &'a Path,
     pub format: Format,
     pub listing: &'a Path,
@@ -528,7 +574,7 @@ pub struct InstallTest<'a> {
 }
 
 /// `docker <args>` must succeed.
-fn must(docker: &mut Docker, args: &[&str]) -> Result<(), Error> {
+pub(crate) fn must(docker: &mut Docker, args: &[&str]) -> Result<(), Error> {
     let out = docker(args)?;
     if out.ok {
         return Ok(());
@@ -540,18 +586,23 @@ fn must(docker: &mut Docker, args: &[&str]) -> Result<(), Error> {
     )))
 }
 
-/// The container up, the checks run in it.
-fn session(docker: &mut Docker, t: &InstallTest, entries: &[Entry]) -> Result<Vec<String>, Error> {
-    let image = format!("{}-test-{}", pkg_linux::NAME, t.container);
+/// The image built from `image_dir` as `image`, and a privileged container `container` of it
+/// with systemd as PID 1.
+pub(crate) fn up(
+    docker: &mut Docker,
+    image_dir: &Path,
+    image: &str,
+    container: &str,
+) -> Result<(), Error> {
     must(
         docker,
-        &["build", "-t", &image, &t.image_dir.to_string_lossy()],
+        &["build", "-t", image, &image_dir.to_string_lossy()],
     )?;
     let up = [
         "run",
         "-d",
         "--name",
-        t.container,
+        container,
         "--privileged",
         "--cgroupns=host",
         "--tmpfs",
@@ -560,18 +611,18 @@ fn session(docker: &mut Docker, t: &InstallTest, entries: &[Entry]) -> Result<Ve
         "/tmp",
         "-v",
         "/sys/fs/cgroup:/sys/fs/cgroup:rw",
-        &image,
+        image,
     ];
-    must(docker, &up)?;
+    must(docker, &up)
+}
+
+/// The container up, the checks run in it.
+fn session(docker: &mut Docker, t: &InstallTest, entries: &[Entry]) -> Result<Vec<String>, Error> {
+    let image = format!("{}-test-{}", t.name, t.container);
+    up(docker, t.image_dir, &image, t.container)?;
     let target = format!("{}:{}", t.container, inside(t.package));
     must(docker, &["cp", &t.package.to_string_lossy(), &target])?;
-    let mut c = Container {
-        docker,
-        name: t.container.to_owned(),
-    };
-    // `--wait` returns once boot is over: `running`, or `degraded` when some unrelated
-    // unit of the image failed.
-    c.exec(&["systemctl", "is-system-running", "--wait"])?;
+    let mut c = Container::booted(docker, t.container)?;
     checks(&mut c, t, entries)
 }
 
@@ -585,7 +636,7 @@ pub fn run(docker: &mut Docker, t: &InstallTest) -> Result<Vec<String>, Error> {
     let result = session(docker, t, &entries);
     // The container and its image are not needed after the run, whatever its result.
     let _ = docker(&["rm", "-f", t.container]);
-    let _ = docker(&["rmi", &format!("{}-test-{}", pkg_linux::NAME, t.container)]);
+    let _ = docker(&["rmi", &format!("{}-test-{}", t.name, t.container)]);
     let problems = result?;
     if problems.is_empty() {
         return Ok(vec![format!(

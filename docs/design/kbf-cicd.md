@@ -9,6 +9,15 @@ After the cutover, `main` is the only integration branch and the workflows know 
 decisions (section 13) are history as written, and are kept as such; the statements about what
 the workflows do now say `main`.
 
+**The frontend update.** Where this page plans a frontend update as a handover (a new instance
+beside the old one behind Envoy, the old one relaying its open streams: B2, B8, B11, M5, the walk
+back, the gate on `kbf_frontend_relay_untraced`), that mechanism was removed and kbf runs no
+Envoy. A frontend of a pool behind `kbf-proxy` is rolled one at a time by `kbf-updater`: drained
+at the proxy, retired (`POST /v1/frontend/retire`), installed, restarted and put back
+(`docs/design/frontend-proxy.md` section 4). The series `kbf_frontend_relay_untraced` and
+`kbf_handover_*` are no longer emitted, so a row or gate of the plan that reads them is not built
+and cannot be.
+
 ## 0. The plan in one page
 
 Every merge runs a **beta**: GitHub Actions stands up a whole farm on loopback (a frontend, three storage-and-daemon nodes,
@@ -101,7 +110,7 @@ Where kbf differs, and why:
    gates are built (section 5.2); the verdict over gamma's metrics is Planned (section 7).
 5. **Code is not shared.** kci is Mojo on Buck2; kbf is Rust with `xtask`. The stage file is plain data checked by a Rust lint.
 6. **kci's DEPLOY step** (a cloud resource graph apply) does not describe restarting kbf processes on a host. The
-   deploy here is the frontend update of `frontend-proxy.md`, then the pull updater's node steps.
+   deploy here is the frontend update (a roll of the pool, `frontend-proxy.md` section 4), then the pull updater's node steps.
 
 ### 2.1 The stage file [P]
 
@@ -315,7 +324,7 @@ scenario (the mutant is listed; a gate never seen red is not a gate).
 | B5 | `kill_a_storage_node` | `SIGKILL` of one storage-and-daemon node mid-build, restart it | the loss of a blob owned once; a write with no failover (depends on #939) |
 | B6 | `kill_a_daemon` | `SIGKILL` of the plain daemon with a lease in flight | a Farm-class failure reaching the client as an action exit code (`failure-classes.md`) |
 | B7 | `kill_frontend_cold` | the crash matrix, wired as a required job (#900) | each case's own defect |
-| B8 | `roll_all_in_one` | the all-in-one process updated by the same handover (`aio-handover.md`) | a second update path for the small topology |
+| B8 | `roll_all_in_one` | the all-in-one process updated by the same handover (a design that was never built and is removed; an all-in-one host is updated by a restart) | a second update path for the small topology |
 | B9 | `mixed_versions` | N and N-1 in both directions, with and without a build in flight (section 9) | a made-required field; a repurposed field |
 | B10 | `rollback_walks_back` | after B4, set the desired commit to N-1 under a higher generation and walk back (T16) | rollback restarting the frontend |
 | B11 | `rollback_mid_roll` | a rollback (desired set to the older commit) issued (a) after the first node step and (b) after the frontend handover, from that half-rolled state, with a build in flight; N and N-1 mixed in the reverse order | a walk back that assumes a clean farm; a node mid-step abandoned instead of finished or reverted |
@@ -325,10 +334,10 @@ The gate expressions common to B1 to B6, B8 and B10, read from the scraped metri
 - **0 failed actions.** Every action of every build in the load ended with its own exit code, none with a farm-class
   failure. The measure: the builds' event logs, and `kbf_execute_errors_total` delta equal to the number of actions the
   scenario failed on purpose (zero here). Today that counter has no cause label, so a dropped connection cannot be
-  told from a client abort except through `kbf_frontend_relay_untraced`. **[F]** A failed-actions-by-class counter is a
+  told from a client abort (the series `kbf_frontend_relay_untraced` that once told them is gone). **[F]** A failed-actions-by-class counter is a
   missing piece (section 12, M10); until it exists the gate is: event logs show zero failed actions **and**
   `kbf_execute_errors_total` delta is zero.
-- **0 builds lost to a handover**: `kbf_frontend_relay_untraced` is 0 at every scrape.
+- **0 builds lost to a handover**: (not built: `kbf_frontend_relay_untraced` is gone, see the note at the top).
 - **0 lost blobs**: `kbf_cache_lost_blobs` is 0 at every scrape, and the delta of `kbf_cache_blob_losses_total` (a counter
   that never falls) is 0 over the scenario. The gauge alone can fall back to 0 after a loss.
 - **Under-replicated blobs back to 0**: `under_replicated_blobs` is 0 within the settle window after each node step
@@ -395,12 +404,12 @@ only when both builds state `meta_log` (in `kbf --version --json`) and `meta_log
 
 ### 5.2 The deploy is a test
 
-The deploy (`kbf-installer deploy`, `gamma-deploy.md`) runs on the real farm with real builds in flight: it updates the
-frontend through the proxy's update API first (`frontend-proxy.md` sections 4, 5 and 9: a swap that drops no stream, a
-bake, then the new frontend offers the commit), and then watches the pull updater roll the nodes, one storage node at a
+The deploy (the retired `kbf-installer deploy`, `gamma-deploy.md`) runs on the real farm with real builds in flight: it updates the
+frontend first (`frontend-proxy.md` section 4: a roll that drains, retires, installs, restarts and
+undrains one frontend at a time), and then watches the pull updater roll the nodes, one storage node at a
 time. The deploy is a test because it is checked as one:
 
-- **No build failed from a dropped connection**: `kbf_frontend_relay_untraced` is 0 at every scrape of the deploy, and every
+- **No build failed from a dropped connection**: every
   build that was in flight at any point of the deploy (the deploy records the invocation ids at its start and at every
   step) finished without a farm-class failure (`failure-classes.md`: a farm problem never reaches the client as an action
   exit code). The invocations record carries the failure class **[F: `crates/kbf-invocation`]**.

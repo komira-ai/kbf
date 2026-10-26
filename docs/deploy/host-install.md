@@ -4,6 +4,47 @@
 a version of the `kbf` package. It is not a command anyone types: sshd runs it as the forced
 command of one key, and it does only what the allowlist on that host permits.
 
+## Getting the binary
+
+A release carries `kbf-host-install` as a tarball per platform, built, signed and attested by
+the same run as every other asset ([../artifacts.md](../artifacts.md)):
+
+| Host | Asset |
+|---|---|
+| Linux, x86_64 | `kbf-host-install-<commit>-linux-x86_64.tar.gz` |
+| Linux, arm64 | `kbf-host-install-<commit>-linux-arm64.tar.gz` |
+| macOS, Apple silicon | `kbf-host-install-<commit>-darwin-arm64.tar.gz` (ad hoc signed with the hardened runtime) |
+
+No package ships it: neither the `kbf` nor the `kbf-installer` deb installs it, so a Linux
+host gets it from the tarball too. Each tarball holds one member, `kbf-host-install`. Its
+`<commit>` is the commit of the release the host is on or going to. The updater,
+`kbf-updater`, is the same kind of asset for the operator's Linux box and for a Mac's host agent
+(`kbf-updater-<commit>-linux-<arch>.tar.gz` and `kbf-updater-<commit>-darwin-arm64.tar.gz`, one
+member `kbf-updater`; the Mac one is ad hoc signed with the hardened runtime).
+
+Fetch the tarball with its bundle and check the bundle before the binary is placed anywhere
+(the flags are those of [../artifacts.md](../artifacts.md#provenance-bundles-verifying-a-tarball-offline)):
+
+```text
+gh release download <tag> --repo komira-ai/kbf \
+  --pattern 'kbf-host-install-<commit>-<platform>.tar.gz*' --pattern SHA256SUMS --dir dl
+gh attestation trusted-root > dl/trusted_root.jsonl
+cd dl && sha256sum --check --strict --ignore-missing SHA256SUMS      # shasum -a 256 -c on a Mac
+gh attestation verify kbf-host-install-<commit>-<platform>.tar.gz \
+  --bundle kbf-host-install-<commit>-<platform>.tar.gz.sigstore.json \
+  --custom-trusted-root trusted_root.jsonl --repo komira-ai/kbf \
+  --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml \
+  --cert-oidc-issuer https://token.actions.githubusercontent.com \
+  --source-ref refs/heads/main --source-digest <commit> \
+  --predicate-type https://slsa.dev/provenance/v1 --deny-self-hosted-runners
+tar -xzf kbf-host-install-<commit>-<platform>.tar.gz kbf-host-install
+```
+
+Place the binary at the path the key or the Mac section below names, as root, in directories
+only root can write. `kbf-host-install --version` prints `kbf-host-install <package version>`
+and does nothing else: it is the one argument the program takes outside the Mac's two
+internal ones, and what the release uses to check the signed Mac binary runs.
+
 ## The key
 
 The updater's ssh key is installed in root's `authorized_keys` as
@@ -15,7 +56,7 @@ from="203.0.113.10",restrict,command="/usr/libexec/kbf/kbf-host-install" ssh-ed2
 `from=` is the address the updater connects from. `restrict` turns off forwarding, a
 terminal and the rest. `command=` runs this program whatever the client asked for; the
 client's request arrives only in `SSH_ORIGINAL_COMMAND`. The program reads nothing from its
-arguments or standard input.
+arguments or standard input (bar `--version`, above).
 
 One more entry point exists, and it is not reachable over ssh: an install runs this same
 program again inside a systemd unit (see below), with the request in the variable
@@ -23,18 +64,22 @@ program again inside a systemd unit (see below), with the request in the variabl
 `SSH_ORIGINAL_COMMAND`, `SSH_CONNECTION`, `SSH_CLIENT` and `SSH_TTY` is set; in an ssh session it
 is ignored, and the program handles `SSH_ORIGINAL_COMMAND` as usual.
 
-## The two requests
+## The three requests
 
 The whole string must be one of these, with single spaces and nothing before or after:
 
 ```text
 install kbf=<version> from <channel>
+restart frontend=<name>
 query
 ```
 
 - `<version>` is `[0-9][0-9A-Za-z.+~-]*`, at most 128 bytes, without an epoch (no `:`), and a
   version `dpkg` itself accepts (so `1.0-` is refused).
 - `<channel>` is `[a-z0-9][a-z0-9-]{0,31}`.
+- `<name>` is `-`, which names the unit `kbf-frontend.service`, or an instance name
+  `[a-z][a-z0-9-]{0,31}`, which names `kbf-frontend@<name>.service`. The unit string is built
+  from the checked name alone; no other unit can be named, and nothing is expanded.
 - The package is always `kbf`.
 
 Anything else is refused: exit status 2, and no process is started.
@@ -114,6 +159,35 @@ The unit (this program again, as root, with the fixed environment) does the inst
 No shell runs anywhere: every process is started with an explicit argument vector and an
 environment of `PATH`, `LANG=C` and `DEBIAN_FRONTEND=noninteractive` alone.
 
+## What a restart does
+
+A package install restarts no `kbf` unit, so a client that has installed a new version asks for
+the restart of the one frontend unit it rolls, after the install. Linux only: a Mac refuses
+the request as `bad_command` (it has no such unit).
+
+The process sshd starts does all of it, and holds the install lock (`flock` on
+`/run/kbf-host-install.lock`) from before the first command until it answers, so while it runs a
+restart and an install do not overlap: an install that finds the lock held is `busy`, and so is a
+restart.
+
+1. Opens the audit log; fails (`audit_unavailable`) if it cannot, and runs nothing.
+2. Takes the lock without waiting; if another install or restart holds it (or it cannot be
+   opened), answers `failed` with reason `busy` (`lock_unavailable`) and runs nothing.
+3. Runs `systemctl restart -- <unit>` (killed after 120 seconds). A start failure or an exit
+   status but 0 is `failed` with reason `restart_failed`, and the detail on stderr holds the
+   exit status and what `systemctl` wrote.
+4. Runs `systemctl is-active -- <unit>` (each look killed after 10 seconds) every half second
+   until it exits 0, which it does for the states `active` and `reloading` (`activating` does
+   not count).
+   A unit that is not active 120 seconds after the restart returned is `failed` with reason
+   `restart_timeout`. Otherwise the answer is `restarted`, naming the unit.
+
+The restart does not read the channel allowlist. Nothing in the program notices a dropped ssh
+connection: it goes on with the restart and the wait (at most about 250 seconds in all),
+holds the lock until then, and its answer is lost, so a restart asked for again in that time is
+`busy`. If something outside ends the process, the lock goes with it and systemd carries on with
+the restart. Either way the client asks the host again after that bound.
+
 ## The answer
 
 One JSON line on stdout.
@@ -122,6 +196,7 @@ One JSON line on stdout.
 |---|---|---|
 | install, done | `{"result":"installed","installed_version":"...","unit_state":"finished"}` | 0 |
 | install, same version | `{"result":"already_installed","installed_version":"...","unit_state":"not_run"}` | 0 |
+| restart, done | `{"result":"restarted","unit":"kbf-frontend@<name>.service"}` (`kbf-frontend.service` for `-`) | 0 |
 | query | `{"result":"query","installed_version":"..."\|null,"running_commit":"..."\|null,"node_id":"..."\|null,"in_progress":true\|false}` | 0 |
 | refused | `{"result":"refused","reason":"<code>"}` | 2 |
 | failed | `{"result":"failed","reason":"<code>"}`, detail on stderr | 3 |
@@ -130,9 +205,11 @@ Refusal codes: `bad_command`, `channel_not_allowed`, `config_invalid`, `config_u
 `channel_unsigned`, `key_untrusted`, `channel_insecure`, and, on a Mac, for a channel whose source
 is GitHub, `unknown_release`, `ambiguous_release` and `fetch_failed`. Failure codes:
 `audit_unavailable`, `query_failed`, `installed_version_invalid`, `package_state_unclean`,
-`update_failed`, `install_failed`, `verify_failed`, `busy`, `lock_unavailable`.
+`update_failed`, `install_failed`, `verify_failed`, `busy`, `lock_unavailable`, and for a restart
+`restart_failed` and `restart_timeout`.
 
-Every line has a `result`: `installed`, `already_installed`, `query`, `refused` or `failed`.
+Every line has a `result`: `installed`, `already_installed`, `restarted`, `query`, `refused` or
+`failed`.
 
 `installed_version` of a query is the version dpkg reports when `kbf` is cleanly installed,
 and null when it is not installed or dpkg flags an error on the package (the updater then
@@ -147,7 +224,8 @@ acts on one host among several compares it with the id it expects before it does
 `in_progress` is true when any of three things holds, and false only when none does: the
 install lock `/run/kbf-host-install.lock` is held (probed, then let go at once; the process
 that does the work holds it from before it reads the package database until it ends, so the
-gap between the two apt steps is covered); a `kbf-host-install-*` unit is listed by
+gap between the two apt steps is covered; a running restart holds it too, so `in_progress` is
+true during one); a `kbf-host-install-*` unit is listed by
 `systemctl list-units` in the state `active`, `activating`, `deactivating` or `reloading`; or
 some process holds the dpkg frontend lock (read from `/proc/locks`; nothing is locked or
 waited for). If the listing itself fails, the query fails (`query_failed`) and does not
@@ -157,16 +235,17 @@ guess.
 
 Every invocation, refused ones included, appends one JSON line to
 `/var/log/kbf-host-install.log` (created root-owned, mode 0600, never through a symbolic
-link): the time, the verb, the version, the channel, the outcome and the reason. On a Mac the
+link): the time, the verb (`install`, `restart` or `query`), the version, the channel, the
+outcome and the reason, and, on the line of a restart, the `unit`. On a Mac the
 apply job appends one more line when it ends: verb `apply`, the version, outcome `applied` or
 `failed`, and `result`, the status line (`done`, `failed:not_welcomed:rolled_back`, ...). A request
-that was not understood is recorded escaped and cut at 200 characters. An install is not
-started when the log cannot be opened.
+that was not understood is recorded escaped and cut at 200 characters. An install or a restart
+is not started when the log cannot be opened.
 
 ## On a Mac
 
-A Mac takes the same two requests (`install kbf=<version> from <channel>` and `query`) and
-answers in the same shape, but it installs the attested release tarball
+A Mac takes the same `install kbf=<version> from <channel>` and `query` requests (a `restart`
+is refused as `bad_command`) and answers in the same shape, but it installs the attested release tarball
 `kbf-<commit>-darwin-arm64.tar.gz` (not a package), into the kit layout, and restarts the
 daemon's launchd job on it. The program is the same binary; the platform picks the Mac side.
 Nothing here is a Homebrew formula or a `kbf-installer` order.
@@ -200,7 +279,7 @@ and `query` reports it as `installed_version`.
 
 Everything below is done once, as an administrator with `sudo`; this program does none of it.
 
-1. The binary is `/usr/local/libexec/kbf/kbf-host-install`, `root:wheel` 0755, in directories
+1. The binary is the `kbf-host-install` of the verified darwin-arm64 release tarball ([Getting the binary](#getting-the-binary)), placed at `/usr/local/libexec/kbf/kbf-host-install`, `root:wheel` 0755, in directories
    (`/usr/local`, `libexec`, `kbf`) that group and others cannot write. An install checks this
    before it does anything else and refuses with `config_unsafe` when the program or one of
    those directories is not root's or is writable by group or others (some Intel Homebrew
@@ -235,7 +314,7 @@ Everything below is done once, as an administrator with `sudo`; this program doe
 
    [channels.online]                   # a channel on GitHub instead of a directory
    source = "github"
-   token_file = "/usr/local/etc/kbf/host-install/github.token"   # optional; see below
+   token_file = "/usr/local/etc/kbf/host-install/github.token"   # optional: a higher rate limit; see below
    ```
 
    A channel takes its releases from a `dir` or from `source = "github"`, never both (the
@@ -402,13 +481,16 @@ release: the install fetches the release itself, as `nobody`, from the GitHub re
 everything after it). The build attestation is still the only trust anchor; the listing and the
 download only bring the bytes. A directory channel stays for a Mac that cannot reach GitHub.
 
-What the install does, in this order, with the pinned `gh`, run as `nobody` (the same privilege
-drop as the attestation check) in a directory that `nobody` owns inside the stage, with its
-own `HOME`:
+What the install does, in this order, with the system `curl` (listing) and the pinned `gh`
+(download), both run as `nobody` (the same privilege drop as the attestation check) in a
+directory that `nobody` owns inside the stage, with its own `HOME`:
 
-1. lists the repository's releases with `gh api`, 100 a page, newest first, page after page until
-   a page is empty, and at most 30 pages (an empty page ends it; a short one does not); never only the latest, so a rollback to an old release
-   works;
+1. lists the repository's releases with `/usr/bin/curl` from the public REST endpoint
+   `https://api.github.com/repos/komira-ai/kbf/releases?per_page=100&page=N`, with no token. The
+   flags are fixed: no configuration file (`-q` first), HTTPS only, no redirect, an HTTP error
+   fails the command, a time limit, a size limit, and an empty environment. It is 100 a page, newest first, page
+   after page until a page is empty, and at most 30 pages (an empty page ends it; a short one
+   does not); never only the latest, so a rollback to an old release works;
 2. finds the asset named `kbf-<40 hex>-darwin-arm64.tar.gz` whose commit starts with the 12 hex
    digits of the version, across all the pages read. None is `unknown_release`; assets of two
    different commits are `ambiguous_release`; the same commit in two releases is one release (the
@@ -434,25 +516,322 @@ launchd, and no stage left behind.
 - Outbound HTTPS to GitHub: `api.github.com` and `github.com`, and the host GitHub serves
   release assets from. The child's environment is cleared, so no proxy variable reaches `gh`;
   a Mac that can reach GitHub only through a proxy cannot use this source.
-- A token for the API. `gh api` refuses to run without one (`gh release download` does not), so
-  a channel names a `token_file`: a file that is root's alone to write (checked like the allowlist)
-  holding a GitHub token, one line of letters, digits, `_` and `-`. It needs no scope: the repository is
-  public and the token only has to exist. The root process reads it and gives it to `gh` as `GH_TOKEN`
-  for the listing and the download, and never to the attestation check. Without one the listing
-  fails and the install is `fetch_failed`.
+- No token. The listing and the download of a public repository need none, and by default
+  no secret is on the Mac.
+- Optionally, a token for a higher rate limit. A channel may name a `token_file`: a file that is
+  root's alone to write (checked like the allowlist) holding a GitHub token, one line of letters,
+  digits, `_` and `-`. It needs no scope: the repository is public. The root process reads it and
+  sends it to `curl` as an `Authorization` header in a configuration on `curl`'s standard input
+  (never in its arguments, which every user can read), and gives it to `gh release download` as
+  `GH_TOKEN`; the attestation check never gets it.
+- The system `curl` that macOS ships, `/usr/bin/curl`, which must be root's and not writable by
+  others (checked like the pinned `gh`, and only for a GitHub channel: a directory channel never
+  runs it).
 
 #### The residuals
 
-- The token is a credential on the Mac. It can read public data only, but it is an account's token,
-  and `nobody`'s `gh` process holds it in its environment while it runs.
+- A token, when a channel names one, is a credential on the Mac. It can read public data only,
+  but it is an account's token; `nobody`'s `curl` process holds it in memory and `gh release
+  download` in its environment while they run. Without a `token_file` there is none.
 - The listing is read through GitHub's API and is not itself trusted: it can only choose among
   releases (an old attested release is installable, as with a directory) or withhold one (the
   install fails). What it picks must still pass the attestation for the full commit.
-- A request costs one API call per 100 releases plus the download's, against GitHub's rate limit
-  for the token (or the address, without one). A listing of about 3000 releases or more does not
+- Without a token GitHub's API allows 60 requests an hour per IP address, shared by every
+  machine behind the same address. One install costs one request per 100 releases listed (a
+  repository with fewer than 100 releases: one request for the releases and one for the empty
+  page that ends the listing, so two), and the download is not counted against the API limit.
+  Past the limit GitHub answers 403, and the install is `fetch_failed` with nothing staged:
+  retry later (the limit resets within the hour), or name a `token_file`, which raises it to
+  the token's own. A listing of about 3000 releases or more does not
   show its oldest releases, so whoever can publish many releases can make a rollback to an old
   one fail (`fetch_failed`); it cannot make a wrong release install.
 - The size limit is watched about every 10 ms, so a fast download can write a little past it
   before it is killed; the copy then refuses the file, and the stage is removed.
 - A channel with `sums` pins the commit and the tarball's hash, and needs an edit of the sums file
   for each new release; the point of this source is a channel without them.
+
+## The local socket
+
+`kbf-host-install --serve` is the program's other door, for the agent mode of `kbf-updater`
+([kbf-updater.md](kbf-updater.md#the-agent-mode), [../design/updates.md](../design/updates.md)).
+It serves a unix socket instead of the ssh forced command, which stays as described above and
+is not changed. It does one host's A/B: put the next release beside the one that runs, switch to
+it on trial, keep it or go back.
+
+```text
+kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N]
+                 [--layout installer|deb|rpm] (--restart-unit UNIT... | --frontend-container)
+```
+
+- `--socket`: an absolute path. The program binds it itself (a `umask` of 0177, then a `chown`
+  to the account), mode 0600, in a directory that is root's and that others cannot write. A
+  stale socket file is replaced; a file of another kind in the way is an error.
+- `--socket-user`: the one account that may connect. On Linux it is looked up in `/etc/passwd`,
+  on a Mac with `dscl`; root is refused.
+- `--window-secs`: how long a release on trial has to be confirmed, 120 to 1800 (default 600).
+- `--layout`: how a Linux host keeps its releases. `installer` (the default) is the hand-placed
+  layout of `kbf-installer`, described under "On Linux". `deb` and `rpm` are a host whose units
+  are the `kbf` package's and run `/usr/bin/kbf`, updated by installing that package ("On a Linux
+  daemon host that runs the package"). A Mac takes none.
+- `--restart-unit`: on Linux, a unit that runs the release (`kbf-<name>.service` or
+  `kbf-<name>@<instance>.service`), repeated for each; at least one is required, unless the host
+  serves a frontend container. A Mac restarts the daemon's launchd job and takes none.
+- `--frontend-container`: a Linux host whose frontend runs as a container, not as units: the
+  release is the frontend's image and the switch recreates the container
+  ([A frontend container](#a-frontend-container)). Not given with `--restart-unit`, nor with
+  `--layout deb` or `rpm`.
+- `--frontend-config PATH` (with `--frontend-container`): the absolute path of the container's
+  configuration, default `/etc/kbf/host-install-frontend.toml`. See "Two frontends on one host".
+
+Nothing else is configured by a flag or the environment: the files this program reads as root are
+constants, as above. The units and jobs that start it are in
+[`packaging/host-agent`](../../packaging/host-agent/README.md).
+
+### The five requests
+
+One line in, one JSON line out, one connection at a time. The same grammar for the version and
+the channel as the forced command's (single spaces, no control byte; no path or URL anywhere).
+
+```text
+query
+install kbf=<version> from <channel>
+switch kbf=<version>
+confirm kbf=<version>
+revert
+```
+
+| request | does |
+|---|---|
+| `install` | looks `<version>` up in the channel, fetches the release **on the host**, verifies it, and lays it out beside the one that runs. No link moves and nothing restarts. The same version asked again is answered from what is laid out; the version the host runs already is answered at once (`current: true`) and teaches the host its version text |
+| `switch` | puts the laid-out release in place **on trial**: the pending marker, with its deadline, is written before the first link moves; then the links move and the units restart on it. A unit that does not come up puts the host back at once |
+| `confirm` | keeps the release on trial. Asked again after it was answered, the answer is the same |
+| `revert` | goes back to the release that ran, now |
+| `query` | what runs, what is on trial and until when, how the last update ended, and whether another install, switch or restart is running |
+
+Answers: `staged` (`version`, `commit`, `current`), `switched` (`version`, `commit`,
+`deadline_unix`), `confirmed`, `reverted` (`version`, the release the host is back on, when it
+knows its text), `query` (`commit`, `version`, `node_id`, `pending`, `last`, `busy`), and
+`{"result":"refused","reason":CODE}` (nothing ran) or `{"result":"failed","reason":CODE}` with a
+code from a closed set: `bad_command`, `channel_not_allowed`, `config_invalid`, `config_unsafe`,
+`unknown_release`, `ambiguous_release`, `fetch_failed`, `verify_failed`, `pending`, `not_staged`,
+`nothing_pending`, `no_current`, `busy`, `stage_failed`, `switch_failed`, `revert_failed`,
+`state_unavailable`, `audit_unavailable`, `peer_not_ready`, `runtime_failed`. The detail of a refusal goes to the journal, cleaned,
+never to the line.
+
+### The revert is this program's
+
+A release on trial has a deadline, in wall-clock seconds, on disk with the marker. The program
+checks it about five times a second between connections: a release that nobody confirmed by its
+deadline is put back by this program, **needing nothing of the release on trial to run**, the
+updater to be alive, or the host to have stayed up. The first check after a start is the same
+check, so a host that rebooted with a release on trial goes back at once if the deadline passed
+while it was down, and waits out what is left of the window if it did not. A revert that
+cannot be done (the units will not start on the release that ran) leaves the marker, and the next
+check tries again.
+
+Every request but `query` is audited like a forced-command request (verb `stage`, `switch`,
+`confirm` or `revert`), and the install, the switch and the confirm are not run when the audit log
+cannot be opened. A revert is never held back by it. The install lock is the same file as the
+forced command's, so the two never overlap.
+
+### On Linux
+
+(A host whose frontend is a container is [below](#a-frontend-container).)
+
+The release goes in the layout of `kbf-installer` ([host-releases.md](host-releases.md)):
+`/var/lib/kbf-installer/releases/<commit>`, the `current` and `previous` links, and the
+installer's `state.json`, which is also where the pending marker lives (`pending_confirm`, with
+the deadline). A host that was set up by hand with `kbf-deploy host install` has all of it; a host
+with no `current` release has nothing to go back to and is refused (`no_current`). The channels
+are in `/etc/kbf/host-install-releases.toml`, in the format of the Mac's allowlist below (a
+channel whose `source = "github"`; the ssh path's `host-install.toml` is the apt channels' and is
+not read):
+
+```toml
+[channels.stable]
+source = "github"
+```
+
+`install` lists the repository's releases, downloads `kbf-<commit>-linux-<arch>.tar.gz` and its
+bundle as the installer's unprivileged user, copies them once into the installer's scratch, and
+runs the installer's verify pipeline over the copy with the pinned `gh` and trusted root
+([host-releases.md](host-releases.md#what-is-trusted)): the attestation must be of this
+repository's `artifacts.yml` on a hosted runner, for the full commit, on the channel's branch; the
+tarball must hold the one executable of this CPU; and the binary run as the unprivileged user must
+say it is that commit. Nothing is fetched when the trust files are not root's. A release whose
+`protocol` or `state_schema` is newer than this program's `kbf-installer` understands is refused
+(the installer's rule, `verify_failed`): put the newer installer on the host first.
+
+### On a Linux daemon host that runs the package
+
+With `--layout deb` (or `rpm`) the host's units are the packaged ones
+([packaging/linux](../../packaging/linux/README.md)), which run `/usr/bin/kbf`. No release is laid
+out beside the running one and no link moves: the update is two installations of a package file,
+with the trial recorded first. The same five requests apply, with the same answers and codes, and
+the same channels file as above. The package and a record of it live in the program's state
+directory (`/var/lib/kbf-host-install`: `package.json` and `packages/`, root's, 0600 and 0700).
+
+| request | does |
+|---|---|
+| `install` | fetches the release's `kbf-<commit>-linux-<cpu>.deb` (or `.rpm`), its `.sigstore.json` bundle and the release's `SHA256SUMS` as the installer's unprivileged user, copies them once as root, and checks the copy, offline, before it keeps anything: the sha256 `SHA256SUMS` lists for the file; `gh attestation verify` (this repository's `artifacts.yml` on a hosted runner, for the full commit, on the channel's branch, with the pinned `gh` and trusted root); and the package manager's own reading of the file (`dpkg-deb --field`, `rpm --query --package`): the package `kbf`, for this CPU, at the version asked for. Nothing is installed, restarted or recorded |
+| `switch` | checks the kept file's sha256 again; reads the installed version from the package database; keeps a verified copy of the package that runs (the one kept already, or the release of that version fetched and checked the same way); writes the trial, with its deadline, naming that copy; then installs the new file (`dpkg --force-confold --install`, or `rpm --upgrade --oldpackage --replacepkgs`: one file, no repository, no dependency resolution) and restarts each `--restart-unit` and waits for it. A package that fails to install, or a unit that does not come up, puts the previous package back at once |
+| `confirm` | ends the trial and forgets every kept file but the new package and the one before it |
+| `revert` | and the deadline: installs the kept copy of the package that ran (fetching and checking it again if the file is gone or changed), ends the trial, restarts the units |
+| `query` | as above; `commit` is the commit of the package this host kept, else the 12 digits of the installed version, else the version text |
+
+A rollback is an installation of an older version and is never refused: `dpkg` downgrades by itself
+and `rpm` is told `--oldpackage`. The deadline is on disk before the package manager is asked for
+anything, so a restart of this program or a reboot finds the trial and goes back once the deadline
+has passed, as for the other layout. A going back that fails (the package manager cannot install the
+kept file) leaves the trial, and the next try finds it. The audit log and the install lock are the
+same as above.
+
+The release publishes a deb for each CPU. It does not publish an rpm yet, so on an rpm host an
+`install` is `unknown_release` until it does; the code path is the same.
+
+A node that was set up by hand moves to this layout once, with
+`kbf-host-install --migrate-to-package` ([native-package-migration.md](native-package-migration.md)).
+
+### A frontend container
+
+With `--frontend-container` the release is the frontend's image
+(`kbf-frontend-image-<commit>-linux-<arch>.oci.tar`, [artifacts.md](../artifacts.md#the-frontend-image-oci))
+and the runtime is Docker. The five requests are the same, so the pending marker, its deadline and
+the revert at the deadline are the same. The host needs `docker` at `/usr/bin/docker`, the channels
+file above (the image is fetched from the same releases), the installer's trust files (the pinned
+`gh` and trusted root), and a root-owned `/etc/kbf/host-install-frontend.toml`, which describes the
+container ([the example](../../packaging/host-agent/linux/host-install-frontend.toml)):
+
+| key | meaning |
+|---|---|
+| `name`, `restart` | the container's name and Docker's restart policy (`always`, `unless-stopped`, `on-failure[:N]`). `no` is refused: nothing else starts the container, so it would stay down after a reboot of the host or of Docker |
+| `network`, `user` | optional: `--network` and `--user` |
+| `group_add` | optional: a list of numeric group ids as quoted strings (`["990"]`), each passed as `--group-add <gid>` after `--user`, on the container a switch makes and on the old one put back. Each is decimal digits only, from 1 to 4294967295: no name, sign, space or `0`, and `config_invalid` otherwise. A frontend that reaches `kbf-signer`'s socket through the signer's `--client-group` needs that group's id here, or a recreated container can no longer sign |
+| `ports`, `mounts`, `command` | `--publish` and `--volume` entries, and the flags after the image; each entry is one argument, never a shell word |
+| `api` | where this host reaches the frontend's operator API (a published port, or the host's own listen address under `network = "host"`), for `/readyz` and `/healthz` |
+| `drain_token_file` | the operator token as a path **inside** the container |
+| `peers` | optional: the other frontends' operator APIs this host can reach |
+| `drain_secs` | optional (default 180, at most 1800): how long a drain is waited for |
+| `ready_secs` | optional (default 90, 10 to 600): how long a new container has to be ready |
+
+`group_add` is written into the record only when it is set, so that a host that sets none writes
+the record it always did and an older helper still reads it. **A host that sets `group_add` must
+settle (confirm) or revert any release on trial before the helper is rolled back to a version
+without `group_add`**: that version refuses a record with a key it does not know, and could not run
+the deadline revert.
+
+A switch has to fit `--window-secs`: `drain_secs` + 30 (the stop) + `ready_secs` is checked against
+it (`config_invalid` when it does not).
+
+**install** fetches the image, its attestation bundle and the release's `SHA256SUMS` as the
+installer's unprivileged user, copies them once into a directory of root's, and checks, before the
+runtime sees the file: the copy's sha256 is the one `SHA256SUMS` lists for the image (and the one
+the channel's pinned `sums` list, if it has some), and `gh attestation verify` accepts the copy
+offline for the full commit on the channel's branch, from `artifacts.yml` on a hosted runner. Only
+then is the image loaded (`docker image load`), and its id recorded in `frontend.json` (root's,
+0600, in `/var/lib/kbf-host-install`). Containers are made from that id, never from a tag. A
+release that fails the check changes nothing: nothing is loaded and nothing is stopped.
+
+**switch**, in this order:
+
+1. it refuses (`peer_not_ready`) if any of `peers` does not answer `/readyz` with 200, before
+   anything is written. This program can see only its own host and these peers; without `peers`
+   the coordinator's order (one frontend at a time, never the last ready one) is the guard;
+2. the pending marker is written to `frontend.json` with its deadline, the images of both
+   releases and a copy of the configuration;
+3. the restart policy is set to `no` (a drained frontend exits by itself, and must not be brought
+   back as the old release);
+4. the frontend is asked to drain through its own operator API: `docker exec` runs
+   `/usr/bin/kbf cluster drain --frontend --token-file <drain_token_file>` in the container, where
+   the API is on loopback ([api.md](../api.md#get-v1frontenddrain-and-post-v1frontenddrain)):
+   `/readyz` answers 503 and the work it has finishes;
+5. it waits until the container has ended (a drained frontend exits when it is idle) or
+   `drain_secs` is out, and then stops it (`docker stop`, 30 s) and removes it;
+6. the new container is made from the new image with **the configuration of step 2, byte for
+   byte**: `docker run --detach --name <name> --restart <restart> [--network] [--user]
+   [--group-add]... [--publish]... [--volume]... <image id> <command>...`;
+7. it waits up to `ready_secs` for `/readyz` to answer 200 and `/healthz` to name the release's
+   commit.
+
+When any step fails, the container is removed and made again from the **old** image id with the
+same configuration, waited for the same way (on the old commit), the marker is cleared, and the
+switch answers `failed` (`switch_failed`). If the old container cannot be made again either,
+the answer is `revert_failed` and the marker stays: the deadline, or a `revert`, tries again.
+
+Four things to know when you set it up:
+
+- **`peers` is the only guard this program has against taking down the last ready frontend.**
+  Without it nothing here looks at another frontend, and only the coordinator's order protects
+  you. List every other frontend's operator API this host can reach; the example file's address
+  is a documentation address to replace.
+- **The operator API must be reachable on the published port.** `api` is a published port on the
+  bridge network, so the frontend inside the container must listen on a non-loopback address
+  (not `--api-listen 127.0.0.1:...`), or `/readyz` is never seen and every switch fails. Writes
+  still require a loopback peer, which Docker's NAT does not give an outside caller; the drain
+  runs inside the container, where the peer is loopback.
+- **On the host network** (`network = "host"`, passed as `docker run --network host`), the
+  container shares the host's network. Give no `ports`: there is nothing to publish. The helper does not refuse
+  `ports` here; it passes them on as `--publish`, and Docker ignores them on the host network. `api` is then the operator listen address on the host itself, so
+  `--api-listen 127.0.0.1:...` works, and writes from a loopback peer are accepted. The other
+  frontend listeners are the host's own ports.
+- **The health the updater's agent reports is what the last switch saw.** It comes from the
+  release this program recorded as current, which `switch` sets after `/readyz` answered 200 on
+  the target commit. It is not a probe made at each heartbeat: a container that crashes later is
+  reported healthy until the next switch or the host's own supervision (Docker's restart policy)
+  deals with it.
+
+**confirm** clears the marker and forgets the old image. **revert**, which the deadline also
+calls (so a host that rebooted in the middle of a switch is put back when the first check after the
+start finds the deadline passed), removes whatever container there is and makes the old one again
+from the copy of the configuration in the marker, not from the file as it is now.
+A revert looks for the old image **before** it removes anything: if the image is gone, it fails
+(`revert_failed`) and the container that runs is left as it is, and so is a switch that fails
+readiness and cannot go back. Do not run `docker image prune -a` or `docker system prune -a`
+while a release is on trial (a plain `docker image prune` is safe: the old image keeps its tag).
+
+Before the first switch the release that runs is read from the container's image reference
+(`kbf-frontend:<commit>`, the name `docker image load` gives it); make the first container from the
+image of a release with the same options as the file. A container that already exists, made by hand
+from `kbf-frontend:<commit>`, is adopted the same way: write a file that describes it (its name,
+network, user, groups, mounts, ports and command) and the first switch starts from the image it
+runs, with nothing recorded before.
+
+#### Two frontends on one host
+
+A host that runs a frontend container for each of two names (for example `kbf-fe-a` and
+`kbf-fe-b`) runs one helper per container, each its own unit with its own file and socket:
+
+```text
+kbf-host-install --serve --socket /run/kbf-host-install/fe-a.sock --socket-user kbf-updater \
+  --frontend-container --frontend-config /etc/kbf/host-install-frontend-a.toml
+```
+
+A helper started with a `--frontend-config` other than the default keeps its files under the name
+of the container in that file. **Per helper**, in `/var/lib/kbf-host-install`: the record
+`frontend-<name>.json` and the A/B state `state-frontend-<name>.json`; the install lock
+`/run/kbf-host-install-frontend-<name>.lock`; and the download and check directories under the
+installer's work directory (`<commit-prefix>.<name>.fetch`, `<commit>.<name>.check`). **Shared** by all
+helpers: the audit log (append-only, safe to share) and Docker's image store. Two helpers for two
+containers therefore share no record, pending marker, lock or download, and the deadline revert of
+one cannot touch the other's container. The helper for the default file keeps `frontend.json`,
+`state.json`, the host's install lock and the plain directory names, as before. A named helper does
+**not** take the host's install lock (`/run/kbf-host-install.lock`) that the installer and the
+other paths take; it serializes only with itself. The name is read when the helper starts; a file
+that names another container afterwards is refused with `config_invalid` until the helper is
+restarted. Give the helpers different `--socket`
+paths (and different `--socket-user`s, or the same one with a socket each). Each file lists the
+other frontend in `peers`.
+
+The helper makes each container with the mounts its own file lists, and shares nothing between
+the two. So each file must give its frontend its own state directory and, when
+`--history-objects` is a `file://` directory, its own history directory. The file store locks
+`LOCK` in that directory (`crates/kbf-objstore/src/fs_store.rs:294-304`), so a second frontend on
+the same directory fails to start.
+
+### On a Mac
+
+The release is checked and laid out by the same code as the ssh path's install (above), into the
+kit tree, with the channels of the same `host-install.toml`. The swap is the apply job's: the links,
+then a restart of the daemon's job that must say it was welcomed, and the old release started again
+if it does not. The pending marker is `pending.json` in the work directory, root's and 0600, and
+holds the links as they were.

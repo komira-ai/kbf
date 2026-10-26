@@ -48,19 +48,44 @@ pub fn packaged(workflow: &str) -> Result<Vec<(String, String)>, String> {
     Ok(found)
 }
 
-/// The platform of every `cargo xtask pkg-asset` line in the workflow's `run:` steps that
-/// makes the `kbf-installer` deb an asset (it has no `--verify-only`: that one only checks
-/// the file the attest job signed), in file order. An error names a line without
-/// `--platform`.
-pub fn packaged_debs(workflow: &str) -> Result<Vec<String>, String> {
-    deb_platforms(workflow, "pkg-asset")
-}
-
 /// The platform of every `cargo xtask pkg-kbf-asset` line in the workflow's `run:` steps that
 /// makes the `kbf` deb an asset (it has no `--verify-only`: that one only checks the file the
 /// attest job signed), in file order. An error names a line without `--platform`.
 pub fn packaged_kbf_debs(workflow: &str) -> Result<Vec<String>, String> {
     deb_platforms(workflow, "pkg-kbf-asset")
+}
+
+/// The (service, platform) of every `cargo xtask pkg-image-asset` line in the workflow's `run:`
+/// steps that makes an image an asset (it has no `--verify-only`), in file order: `service` is
+/// the word after `--service` (`frontend` or `coordinator`). The asset is
+/// `kbf-<service>-image-<commit>-<platform>.oci.tar`. An error names a line without `--service`
+/// or `--platform`.
+pub fn packaged_images(workflow: &str) -> Result<Vec<(String, String)>, String> {
+    let prefix = "cargo xtask pkg-image-asset ";
+    let mut found = Vec::new();
+    for step in workflows::run_steps(workflow)? {
+        for line in step.script.lines().map(str::trim_start) {
+            let Some(args) = line.strip_prefix(prefix) else {
+                continue;
+            };
+            let words: Vec<&str> = args.split_whitespace().collect();
+            if words.contains(&"--verify-only") {
+                continue;
+            }
+            let flag = |f: &str| {
+                let at = words.iter().position(|w| *w == f)?;
+                words.get(at + 1).map(|v| v.trim_matches('"').to_owned())
+            };
+            let (Some(service), Some(platform)) = (flag("--service"), flag("--platform")) else {
+                return Err(format!(
+                    "{}/{}: a pkg-image-asset line without --service and --platform: {line}",
+                    step.job, step.step
+                ));
+            };
+            found.push((service, platform));
+        }
+    }
+    Ok(found)
 }
 
 /// The platform of every `cargo xtask <verb>` line of the `run:` steps without

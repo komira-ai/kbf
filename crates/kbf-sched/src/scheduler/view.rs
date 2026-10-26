@@ -17,6 +17,28 @@ impl Scheduler {
         op.unservable.as_ref().map(|u| u.reason.as_str())
     }
 
+    /// The request `operation` was submitted with, if the scheduler holds it.
+    #[must_use]
+    pub fn request(&self, operation: OperationId) -> Option<&Request> {
+        self.ops.get(&operation).map(|op| &op.request)
+    }
+
+    /// The cordoned (or not serving) live workers that could run `operation` if placement
+    /// could use them: the ones a "every worker that can run it is cordoned" reason names.
+    /// Empty when `operation` is unknown or no such worker could.
+    #[must_use]
+    pub fn cordoned_could(&self, operation: OperationId) -> Vec<WorkerId> {
+        let Some(op) = self.ops.get(&operation) else {
+            return Vec::new();
+        };
+        crate::servable::Servable::cordoned_could(
+            &self.workers,
+            &self.cordons,
+            self.now,
+            &op.request,
+        )
+    }
+
     /// Where `operation` is, if it exists: it was submitted, and is unfinished or
     /// finished less than the finished retention ago.
     #[must_use]

@@ -1,0 +1,145 @@
+# Example Envoy configuration: a load balancer in front of two kbf frontends.
+# See docs/deploy/frontends-behind-a-load-balancer.md.
+#
+# This is an example, not a production file. It does not terminate TLS: both kbf
+# listeners are passed through as TCP, so
+#   - Buck2 verifies the frontend's REAPI certificate itself, and
+#   - daemons and storage nodes present their client certificates to the frontend
+#     (mutual TLS on the worker port, end to end).
+# The certificates the frontends load must therefore cover the name clients dial.
+#
+# Names frontend-a and frontend-b are the compose service names; replace them with
+# the frontends' DNS names. Ports are kbf's defaults: 8980 REAPI, 8981 worker
+# listener, 8982 operator API (health checks only).
+
+static_resources:
+  listeners:
+    # REAPI: Buck2 -> frontend. TCP passthrough, so the frontend ends TLS.
+    # (The alternative is an HTTP/2 listener that ends TLS here; it needs a
+    # certificate for the farm's name on Envoy and no total timeout on gRPC
+    # streams, since an Execute stream lives as long as its action.)
+    - name: reapi
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8980 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: reapi
+                cluster: frontends_reapi
+                # 0s switches the idle timeout off. The default is one hour, and
+                # an Execute stream can be quiet for longer while its action runs.
+                # The frontends send an HTTP/2 PING every 30 s by default
+                # (--http2-keepalive-interval-secs), which also keeps NATs awake.
+                idle_timeout: 0s
+
+    # Worker listener: daemons and storage nodes -> frontend. TCP passthrough is
+    # required here: the frontend asks the peer for a client certificate
+    # (--worker-client-ca) and reads its role from it. If Envoy ended TLS on this
+    # port the frontend would see no certificate and refuse every call.
+    - name: worker
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8981 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: worker
+                cluster: frontends_worker
+                # A daemon's session is one connection that lasts for as long as
+                # the daemon runs; never time it out here.
+                idle_timeout: 0s
+
+  clusters:
+    - name: frontends_reapi
+      type: STRICT_DNS            # re-resolves the names, so a replaced container is found
+      connect_timeout: 3s
+      lb_policy: LEAST_REQUEST    # for TCP this picks the host with the fewest active connections
+      # TCP keepalive on the upstream hop, so a frontend that vanished without a
+      # FIN (a host failure) is noticed instead of holding the connection open.
+      upstream_connection_options:
+        tcp_keepalive:
+          keepalive_time: 30
+          keepalive_interval: 10
+          keepalive_probes: 3
+      # Active health check: ask each frontend's operator API for /readyz.
+      # /readyz answers 200 when the frontend is ready and 503 from the moment a
+      # drain begins (SIGTERM, SIGINT or POST /v1/frontend/drain), so a frontend
+      # that is being replaced stops getting new connections here. /healthz would
+      # not do: it stays 200 during a drain.
+      health_checks:
+        - timeout: 1s
+          interval: 1s
+          unhealthy_threshold: 2    # two 503s in a row take a frontend out ...
+          healthy_threshold: 2      # ... and two 200s put it back
+          # The check goes to the operator API port, not the traffic port.
+          alt_port: 8982
+          http_health_check:
+            path: /readyz
+            # Each /readyz makes one read of the store: keep the interval at a
+            # second or more.
+      # Outlier detection catches a frontend that is up and ready but whose
+      # connections fail (for TCP, a failed connect counts as a 5xx).
+      outlier_detection:
+        consecutive_5xx: 3
+        interval: 5s
+        base_ejection_time: 30s
+        # With two frontends, 50 means at most one is ejected at a time, so a
+        # bad run of failures can never leave the farm with no upstream.
+        max_ejection_percent: 50
+      # Do NOT close open connections when a host fails its health check
+      # (this is the default; it is written down because it matters). A
+      # draining frontend fails /readyz on purpose and must keep its open
+      # Execute streams until their actions are done. Closing them fails builds.
+      close_connections_on_host_health_failure: false
+      load_assignment:
+        cluster_name: frontends_reapi
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: frontend-a, port_value: 8980 } }
+              - endpoint:
+                  address: { socket_address: { address: frontend-b, port_value: 8980 } }
+
+    - name: frontends_worker
+      type: STRICT_DNS
+      connect_timeout: 3s
+      lb_policy: LEAST_REQUEST
+      upstream_connection_options:
+        tcp_keepalive:
+          keepalive_time: 30
+          keepalive_interval: 10
+          keepalive_probes: 3
+      # Same check as above: the worker port of a draining frontend is still up
+      # (daemons keep reporting results to it), but new sessions should go to a
+      # frontend that is not draining.
+      health_checks:
+        - timeout: 1s
+          interval: 1s
+          unhealthy_threshold: 2
+          healthy_threshold: 2
+          alt_port: 8982
+          http_health_check:
+            path: /readyz
+      outlier_detection:
+        consecutive_5xx: 3
+        interval: 5s
+        base_ejection_time: 30s
+        max_ejection_percent: 50
+      close_connections_on_host_health_failure: false
+      load_assignment:
+        cluster_name: frontends_worker
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: frontend-a, port_value: 8981 } }
+              - endpoint:
+                  address: { socket_address: { address: frontend-b, port_value: 8981 } }
+
+# Envoy's own admin interface: loopback only, never published. It shows each
+# upstream's health (GET /clusters) while you test a drain.
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }

@@ -31,7 +31,7 @@ use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 
 use super::channel::{MacChannel, Source};
-use super::fetch::{FetchError, Fetcher, Limits};
+use super::fetch::{AssetKind, FetchError, Fetcher, Limits};
 use super::layout::{BINARY, DAEMON_USER, MacHost, UNPRIVILEGED_USER};
 use super::release::{self, PickError};
 use super::tools;
@@ -40,6 +40,7 @@ use crate::host::fail;
 use crate::outcome::{FailureCode, Outcome};
 use crate::request::Version;
 use crate::runner::{Exec, Identity, Runner};
+use crate::trust::Trust;
 use crate::trust::nofollow;
 
 /// The workflow of the repository ([`release::REPO`]) whose attestation is accepted.
@@ -99,17 +100,19 @@ fn stage_inner(
     channel: &MacChannel,
     version: &Version,
 ) -> Result<Staged, Outcome> {
-    let prefix = release::commit_prefix(version.as_str())
-        .ok_or_else(|| verify_failed("the version carries no commit (+g and 12 hex digits)"))?;
+    let prefix = release::commit_prefix(version.as_str()).ok_or_else(|| {
+        verify_failed("the version carries no commit (+g or +, then 12 hex digits)")
+    })?;
     let pick = pick_release(host, channel, prefix)?;
     let token = match &channel.source {
         Source::Github {
             token_file: Some(file),
-        } => Some(read_token(host, file)?),
+        } => Some(read_token(&host.trust, file).map_err(Outcome::Refused)?),
         _ => None,
     };
     // The pinned tools are root's, or nothing from them is believed.
-    for tool in [&host.gh, &host.trusted_root] {
+    let lister = matches!(channel.source, Source::Github { .. }).then_some(&host.curl);
+    for tool in [&host.gh, &host.trusted_root].into_iter().chain(lister) {
         host.trust.check_file(tool).map_err(|e| {
             Outcome::Refused(match refusal(e) {
                 crate::outcome::Refusal::ConfigUnsafe => crate::outcome::Refusal::KeyUntrusted,
@@ -253,11 +256,8 @@ fn pick_failed(e: PickError, whence: &str, github: bool) -> Outcome {
 
 /// The token for the API in `file`, which is root's alone to write: one line of letters,
 /// digits, `_` and `-`.
-fn read_token(host: &MacHost, file: &Path) -> Result<String, Outcome> {
-    let text = host
-        .trust
-        .read(file)
-        .map_err(|e| Outcome::Refused(refusal(e)))?;
+pub(crate) fn read_token(trust: &Trust, file: &Path) -> Result<String, crate::outcome::Refusal> {
+    let text = trust.read(file).map_err(refusal)?;
     let token = text.trim();
     let plain = !token.is_empty()
         && token.len() <= 255
@@ -267,7 +267,7 @@ fn read_token(host: &MacHost, file: &Path) -> Result<String, Outcome> {
     if plain {
         Ok(token.to_owned())
     } else {
-        Err(Outcome::Refused(crate::outcome::Refusal::ConfigInvalid))
+        Err(crate::outcome::Refusal::ConfigInvalid)
     }
 }
 
@@ -296,7 +296,10 @@ fn fetch_release(
     make_home(&scratch, nobody)?;
     let tuning = &host.tuning;
     let fetcher = Fetcher {
+        platform: release::PLATFORM,
+        asset: AssetKind::Tarball,
         runner,
+        curl: &host.curl,
         gh: &host.gh,
         who: nobody,
         home,
@@ -312,12 +315,12 @@ fn fetch_release(
     set_mode(&stage, 0o711)?;
     let fetched = fetcher.fetch(want, &scratch);
     set_mode(&stage, 0o700)?;
-    let commit = fetched.map_err(|e| {
-        Outcome::Refused(match e {
-            FetchError::Unknown => Refusal::UnknownRelease,
-            FetchError::Ambiguous => Refusal::AmbiguousRelease,
-            FetchError::Failed(_) => Refusal::FetchFailed,
-        })
+    let commit = fetched.map_err(|e| match e {
+        FetchError::Unknown => Outcome::Refused(Refusal::UnknownRelease),
+        FetchError::Ambiguous => Outcome::Refused(Refusal::AmbiguousRelease),
+        FetchError::Failed(why) | FetchError::RateLimited(why) => {
+            Outcome::RefusedBecause(Refusal::FetchFailed, why)
+        }
     })?;
     let fetch_failed = |_: String| Outcome::Refused(Refusal::FetchFailed);
     copy_in(

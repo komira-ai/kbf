@@ -1,5 +1,6 @@
 use std::io::Read as _;
 use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -85,12 +86,40 @@ fn served_with(name: &str, check: Arc<Scripted>) -> Served {
 
 /// A helper served on a socket, its boot reset done if `reset`.
 fn served_from(name: &str, check: Arc<Scripted>, reset: bool) -> Served {
+    served_vm(name, check, reset, None)
+}
+
+/// [`served_from`] on a Mac whose VM user is `vm_user`, if any.
+fn served_vm(name: &str, check: Arc<Scripted>, reset: bool, vm_user: Option<&str>) -> Served {
+    served_in(
+        name,
+        check,
+        reset,
+        vm_user,
+        UidRange::new(me(), me() + 1).unwrap(),
+    )
+}
+
+/// [`served_vm`] with the lease users' uid `range`.
+fn served_in(
+    name: &str,
+    check: Arc<Scripted>,
+    reset: bool,
+    vm_user: Option<&str>,
+    range: UidRange,
+) -> Served {
     trace();
     let dir = scratch(&format!("server-{name}"));
     std::fs::create_dir(dir.join("Users")).unwrap();
     let host = FakeHost::default();
+    if vm_user.is_some() {
+        // What provisioning wrote: 64 hex digits, mode 0400.
+        let file = dir.join("vm-user-password");
+        std::fs::write(&file, "ab".repeat(32)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+    }
     let settings = Settings {
-        range: UidRange::new(me(), me() + 1).unwrap(),
+        range,
         gid: my_gid(),
         homes: dir.join("Users"),
         schedules: SweepPlan {
@@ -105,6 +134,8 @@ fn served_from(name: &str, check: Arc<Scripted>, reset: bool) -> Served {
         serial: "S".to_owned(),
         session: SessionPaths::under(&dir),
         scan: crate::scan::ScanSettings::under(&dir),
+        image: crate::helper::ImageSettings::under(&dir),
+        vm_user: vm_user.map(|name| crate::lease::VmUser::new(name).unwrap()),
     };
     let ledger = Ledger::open(&dir.join("ledger")).unwrap();
     let helper = Arc::new(Helper::new(Box::new(host.clone()), settings, ledger));
@@ -182,6 +213,156 @@ fn the_switch_and_the_reset_work_over_the_socket() {
     let log = served.host.state().log.clone();
     let restarts = log.iter().filter(|call| call.contains("reboot userspace"));
     assert_eq!(restarts.count(), 2, "{log:#?}");
+}
+
+/// Catches: the VM user's verbs answered with the wrong reply over the socket, a refusal
+/// taken by the client as success, or a Mac with no VM user answering them.
+#[test]
+fn the_role_verbs_work_over_the_socket() {
+    let refused = |result: Result<(), ClientError>, says: &str| match result {
+        Err(ClientError::Refused(why)) => assert!(why.contains(says), "{why}"),
+        other => panic!("{other:?}"),
+    };
+    let null = std::fs::File::open("/dev/null").unwrap();
+    let fds = [null.as_fd(), null.as_fd(), null.as_fd(), null.as_fd()];
+    let none = served("role-none", Ok(()));
+    refused(none.client.role_session_ready().map(drop), "no VM user");
+    refused(none.client.role_kill_uid(), "no VM user");
+    refused(
+        none.client.role_run(&argv(), &[], fds).map(drop),
+        "no VM user",
+    );
+
+    let served = served_vm("role", Scripted::fixed(Ok(())), true, Some("kbf-vm"));
+    let client = &served.client;
+    refused(client.role_session_ready().map(drop), "has no account");
+    served.host.state().users.insert(
+        "kbf-vm".to_owned(),
+        crate::helper::NewUser {
+            name: "kbf-vm".to_owned(),
+            uid: me() + 10,
+            gid: my_gid(),
+            home: served.dir.join("Users/kbf-vm"),
+            admin: false,
+        },
+    );
+    assert!(!client.role_session_ready().unwrap());
+    refused(
+        client.role_run(&argv(), &[], fds).map(drop),
+        "does not exist",
+    );
+    served
+        .host
+        .state()
+        .domains
+        .insert(format!("gui/{}", me() + 10));
+    assert!(client.role_session_ready().unwrap());
+    client.role_kill_uid().unwrap();
+    // The session switch rests at the VM user, over the socket.
+    client.session_idle().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(served.dir.join("session-intent")).unwrap(),
+        "vm\n"
+    );
+}
+
+/// Catches: the image verbs answered with the wrong reply over the socket, a refusal
+/// taken by the client as success, or a report lost on the way.
+#[test]
+fn the_image_verbs_work_over_the_socket() {
+    // The VM user is this test's own account, the one a test can hand a file to.
+    let range = UidRange::new(me() + 100, me() + 101).unwrap();
+    let served = served_in(
+        "image",
+        Scripted::fixed(Ok(())),
+        true,
+        Some("kbf-vm"),
+        range,
+    );
+    let client = &served.client;
+    let image = crate::helper::ImageSettings::under(&served.dir);
+    let refused = |result: Result<String, ClientError>, says: &str| match result {
+        Err(ClientError::Refused(why)) => assert!(why.contains(says), "{why}"),
+        other => panic!("{other:?}"),
+    };
+    refused(
+        client.image_setup("/elsewhere/b"),
+        "not inside the staging directory",
+    );
+    refused(
+        client.image_harvest("/elsewhere/b", "/elsewhere/o"),
+        "inside neither",
+    );
+    std::fs::create_dir(&image.dir).unwrap();
+    std::fs::create_dir(&image.staging).unwrap();
+    for program in [&image.vmm, &image.guest] {
+        std::fs::write(program, "program").unwrap();
+        std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::set_permissions(&image.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bundle = image.staging.join("clone");
+    std::fs::create_dir(&bundle).unwrap();
+    std::fs::write(bundle.join("disk.img"), "d").unwrap();
+    let dir = |name: &str| image.dir.join(name).display().to_string();
+    let staged = |name: &str| image.staging.join(name).display().to_string();
+    // Not the VM user's account yet: setup is refused before it takes the bundle.
+    refused(client.image_setup(&staged("clone")), "has no account");
+    served.host.state().users.insert(
+        "kbf-vm".to_owned(),
+        crate::helper::NewUser {
+            name: "kbf-vm".to_owned(),
+            uid: me(),
+            gid: my_gid(),
+            home: served.dir.join("Users/kbf-vm"),
+            admin: false,
+        },
+    );
+    let setup = format!(
+        "{} image setup --base {} --guest-binary {}",
+        image.vmm.display(),
+        dir("clone"),
+        image.guest.display()
+    );
+    served.host.state().answers.insert(
+        setup,
+        crate::autologin::CommandOutput {
+            success: true,
+            stdout: "{\"setup\":1}".to_owned(),
+            stderr: String::new(),
+        },
+    );
+    assert_eq!(
+        client.image_setup(&staged("clone")).unwrap(),
+        "{\"setup\":1}"
+    );
+    assert!(image.dir.join("clone").is_dir());
+    assert!(bundle.exists(), "the original is left alone");
+    served.host.state().answers.insert(
+        format!(
+            "{} image harvest --bundle {} --out {}/files",
+            image.vmm.display(),
+            dir("clone"),
+            dir("out")
+        ),
+        crate::autologin::CommandOutput {
+            success: true,
+            stdout: "{\"harvest\":2}".to_owned(),
+            stderr: String::new(),
+        },
+    );
+    assert_eq!(
+        client.image_harvest(&dir("clone"), &dir("out")).unwrap(),
+        "{\"harvest\":2}"
+    );
+    assert!(image.dir.join("out").is_dir());
+    refused(
+        client.image_harvest(&dir("clone"), &dir("out")),
+        "making out in the images directory",
+    );
+}
+
+fn argv() -> Vec<String> {
+    vec!["/usr/bin/true".to_owned()]
 }
 
 /// Catches: the leak scan's verbs answered with the wrong reply over the socket, a
@@ -443,24 +624,36 @@ fn a_caller_that_sends_nothing_is_dropped() {
 }
 
 /// Catches: a timeout per read only, under which a caller that sends one byte at a
-/// time, each within the timeout, holds a thread for as long as it likes. Here each
-/// byte comes 100 ms after the last, well within the 400 ms; the 24 bytes would take
-/// 2.4 s, and the request is refused at 400 ms.
+/// time, each within the timeout, holds a thread for as long as it likes. The caller
+/// sends the 24 bytes of a frame, and each byte moves the connection's clock on by
+/// 100 ms; the request is due 400 ms after the hello, so it is refused at the deadline
+/// however the bytes and the reads interleave, and a per-read timeout would instead
+/// read the whole frame and answer "bad request".
 #[test]
 fn a_caller_that_drips_its_request_is_dropped_at_the_deadline() {
     use std::io::Write as _;
-    use std::time::Instant;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     trace();
     let dir = scratch("server-drip");
     let helper = quiet_helper(&dir);
     let (caller_end, helper_end) = UnixStream::pair().unwrap();
     let check = Scripted::fixed(Ok(()));
+    let clock = Arc::new(AtomicU64::new(0));
+    let helper_clock = clock.clone();
+    // Told at the helper's first reading of the clock, which starts the 400 ms: the
+    // caller sends nothing before that, so the deadline cannot start late.
+    let (started, started_rx) = std::sync::mpsc::channel();
     let served = std::thread::spawn(move || {
-        connection(
+        connection_on(
             &helper_end,
             &helper,
             check.as_ref(),
             Duration::from_millis(400),
+            &|| {
+                let _ = started.send(());
+                Duration::from_millis(helper_clock.load(Ordering::SeqCst))
+            },
         );
     });
     let hello = proto::recv::<Reply>(caller_end.as_fd(), 0)
@@ -468,12 +661,12 @@ fn a_caller_that_drips_its_request_is_dropped_at_the_deadline() {
         .unwrap()
         .0;
     assert!(matches!(hello, Reply::Hello { .. }), "{hello:?}");
-    let start = Instant::now();
     let mut dripper = caller_end.try_clone().unwrap();
     let drip = std::thread::spawn(move || {
+        started_rx.recv().expect("the helper read the clock");
         // A frame of 20 bytes, then those bytes; the helper hangs up partway.
         for byte in [0, 0, 0, 20].into_iter().chain([b'x'; 20]) {
-            std::thread::sleep(Duration::from_millis(100));
+            clock.fetch_add(100, Ordering::SeqCst);
             if dripper.write_all(&[byte]).is_err() {
                 return;
             }
@@ -482,12 +675,10 @@ fn a_caller_that_drips_its_request_is_dropped_at_the_deadline() {
     let (reply, _) = proto::recv::<Reply>(caller_end.as_fd(), 0)
         .unwrap()
         .unwrap();
-    let waited = start.elapsed();
     assert!(
         matches!(&reply, Reply::Refused { reason } if reason.contains("deadline")),
         "{reply:?}"
     );
-    assert!(waited < Duration::from_millis(1500), "{waited:?}");
     served.join().unwrap();
     drop(caller_end);
     drip.join().unwrap();
@@ -531,6 +722,15 @@ fn the_client_reports_unexpected_replies_and_hangups() {
         Some(Reply::Killed),
         Some(Reply::SessionReady { ready: true }),
         Some(Reply::Killed),
+        // The role verbs: a reply of the wrong kind each.
+        Some(Reply::Killed),
+        Some(Reply::SessionReady { ready: true }),
+        Some(Reply::Killed),
+        Some(Reply::Started { pid: 9 }),
+        Some(Reply::Exited {
+            code: Some(3),
+            signal: None,
+        }),
     ];
     std::thread::spawn(move || {
         // First a helper that answers the connection with something other than Hello.
@@ -577,6 +777,12 @@ fn the_client_reports_unexpected_replies_and_hangups() {
     assert!(unexpected(running.wait().map(drop)).contains("Killed"));
     assert!(client.session_ready("1.1").unwrap());
     assert!(unexpected(client.session_ready("1.1").map(drop)).contains("Killed"));
+    assert!(unexpected(client.role_session_ready().map(drop)).contains("Killed"));
+    assert!(unexpected(client.role_kill_uid()).contains("SessionReady"));
+    assert!(unexpected(client.role_run(&[], &[], fds).map(drop)).contains("Killed"));
+    let running = client.role_run(&[], &[], fds).unwrap();
+    assert_eq!(running.pid, 9);
+    assert_eq!(running.wait().unwrap().code, Some(3));
     let refused = ClientError::Refused("why".to_owned());
     assert_eq!(refused.to_string(), "kbf-mac-session refused: why");
     let gone = Client::new(dir.join("no-socket"));
@@ -608,6 +814,8 @@ fn serve_returns_when_accept_fails() {
             serial: "S".to_owned(),
             session: SessionPaths::under(&dir),
             scan: crate::scan::ScanSettings::under(&dir),
+            image: crate::helper::ImageSettings::under(&dir),
+            vm_user: None,
         };
         Arc::new(Helper::new(Box::new(FakeHost::default()), settings, ledger))
     };
@@ -662,6 +870,8 @@ fn quiet_helper(dir: &Path) -> Helper {
         serial: "S".to_owned(),
         session: SessionPaths::under(dir),
         scan: crate::scan::ScanSettings::under(dir),
+        image: crate::helper::ImageSettings::under(dir),
+        vm_user: None,
     };
     Helper::new(Box::new(FakeHost::default()), settings, ledger)
 }

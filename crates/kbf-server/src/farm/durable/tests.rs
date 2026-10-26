@@ -889,8 +889,9 @@ fn a_result_row_that_is_not_a_result_is_refused_naming_it() {
     );
 }
 
-/// Catches: a generation read from a row that is not there as 0 (a farm over an unfenced
-/// store names its operations by the epoch, as before) or one that is read wrong.
+/// Asserts that the generation is the stored number, and none when the store has no row (a
+/// farm over an unfenced store names its operations by the epoch, as before) or holds the
+/// marker of shared frontends; and that a row that is neither is refused as corrupt.
 #[test]
 fn the_generation_is_the_stored_number_or_none() {
     let store = Flaky::new();
@@ -898,6 +899,14 @@ fn the_generation_is_the_stored_number_or_none() {
     assert_eq!(durable.generation().expect("read"), None);
     put(&store, GENERATION, 42u64.to_be_bytes().to_vec());
     assert_eq!(durable.generation().expect("read"), Some(42));
+    put(&store, GENERATION, SHARED_WRITERS.to_vec());
+    assert_eq!(durable.generation().expect("read"), None);
+    put(&store, GENERATION, vec![1, 2, 3]);
+    let refused = durable.generation().expect_err("junk");
+    assert!(
+        matches!(&refused, StateError::Corrupt { key, .. } if key == GENERATION),
+        "{refused:?}"
+    );
 }
 
 /// Catches: an operator's cordon or drain not kept (a successor process would offer
@@ -2211,6 +2220,7 @@ fn farm_over(store: &Arc<Flaky>, mode: crate::LearnedSizes) -> Farm {
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
     )
+    .with_wall_epoch(u64::from(today()) * 86_400_000)
     .with_learned_sizes(mode, 4 << 30)
     .with_state(Some(crate::StateStore {
         store,
@@ -2221,12 +2231,9 @@ fn farm_over(store: &Arc<Flaky>, mode: crate::LearnedSizes) -> Farm {
     .expect("a farm over the store")
 }
 
+/// The day the farms of these tests are built on (their wall clock is fixed to it).
 fn today() -> u32 {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("after the epoch")
-        .as_secs();
-    u32::try_from(secs / 86_400).expect("a day")
+    20_000
 }
 
 /// Catches: `off` reading the size rows a `shadow` farm left (it must not even scan them: a

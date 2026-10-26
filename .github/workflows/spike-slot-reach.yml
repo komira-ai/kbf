@@ -141,6 +141,15 @@ jobs:
       - run: rustup toolchain install
       - name: The slot clean and its mutants, on real users (root)
         run: cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture
+      # The test binary, for a run of it on a Mac Studio: a launch daemon without Full
+      # Disk Access, which the hosted runner's agent is not.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: slot-clean-test-darwin-arm64
+          path: target/debug/deps/slot_clean-*
+          retention-days: 14
+          if-no-files-found: error
 
   # SIGTERM before SIGKILL (crates/kbf-driver-native/tests/slot_term.rs): a pool lease whose
   # workload keeps POSIX shared memory and semaphores through a tracker process, ended while
@@ -180,6 +189,32 @@ jobs:
       - run: rustup toolchain install
       - name: The profile canaries and the weakened profiles, on real users (root)
         run: cargo xtask sudo-test -p kbf-driver-native --test slot_canary -- --test-threads=1 --nocapture
+
+  # The GPU state of a pool lease (crates/kbf-driver-native/tests/slot_gpu_clean.rs): a Metal run
+  # as a pool user, a second process holding its device, then the clean, and a check that none of
+  # it is left. The same command as the native-macos job of beta.yml runs after a push to main.
+  slot-gpu-clean:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: A pool lease's Metal state and the clean (root, real users)
+        run: cargo xtask sudo-test -p kbf-driver-native --test slot_gpu_clean -- --test-threads=1 --nocapture
+      # The test binary the step above built, for a run by hand on a Mac with no Rust
+      # toolchain (it still needs root, swiftc and a Metal device).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: slot-gpu-test-darwin-arm64
+          path: target/debug/deps/slot_gpu_clean-*
+          retention-days: 14
+          if-no-files-found: error
 
   # The assertion that a pool user holds nothing a lease left
   # (crates/kbf-driver-native/tests/slot_assert.rs): a clean user is green at every look,
@@ -221,3 +256,21 @@ jobs:
         run: cargo test -p kbf-daemon --lib --locked -- this_mac_reports_its_gpu --nocapture
       - name: The GPU under the slot profile, on real users (root)
         run: cargo xtask sudo-test -p kbf-driver-native --test slot_gpu -- --test-threads=1 --nocapture
+
+  # kbf-mac-provision on a real Mac, as root (crates/kbf-mac-provision/tests/as_root.rs), with
+  # the pool test that feeds `dscl .` a batch on standard input and reads `dscl -readall`. The
+  # same command as the native-macos job of beta.yml runs after a push to main.
+  mac-provision:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sw_vers
+      - run: uname -m
+      - run: rustup toolchain install
+      - name: The provisioning verbs and the pool batch on real directory records (root)
+        run: cargo xtask sudo-test -p kbf-mac-provision --test as_root -- --test-threads=1 --nocapture

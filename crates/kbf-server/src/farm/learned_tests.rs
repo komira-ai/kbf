@@ -659,6 +659,31 @@ fn a_decay_row_the_store_refuses_is_written_at_a_later_tick() {
     assert_eq!(row_ask(&rows), Some(8 * GIB), "written at the next tick");
 }
 
+/// The write-behind of the size summaries, asked for before the interval has passed,
+/// writes the changed summaries to the store at once; a tick before that writes none, and
+/// a second ask with nothing changed writes nothing.
+#[test]
+fn write_behind_now_writes_the_changed_summaries_at_once() {
+    let rows = store();
+    let mut killed = killed_farm(rows.clone(), &rows);
+    let held = |rows: &Arc<Fake>| -> Vec<(String, Vec<u8>)> {
+        rows.scan_prefix("est/")
+            .expect("scan")
+            .into_iter()
+            .map(|(k, row)| (k, row.value))
+            .collect()
+    };
+    killed.quiet_runs(0, 1);
+    let before = held(&rows);
+    killed.farm.lock().flush_learned();
+    assert_eq!(held(&rows), before, "the interval has not passed");
+    killed.farm.write_behind_now();
+    let written = held(&rows);
+    assert_ne!(written, before, "the changed summary is written");
+    killed.farm.write_behind_now();
+    assert_eq!(held(&rows), written, "nothing changed since");
+}
+
 /// With a newer writer holding the store nothing is written, but the scheduler's floor is
 /// lowered all the same.
 #[test]

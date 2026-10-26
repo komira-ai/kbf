@@ -19,6 +19,7 @@ use sha2::{Digest as _, Sha256};
 
 mod golden;
 mod pool;
+pub mod vm;
 pub use golden::{golden_config, golden_plist, golden_plist_as};
 
 /// The example profile the tests start from.
@@ -93,6 +94,20 @@ pub struct State {
     /// and change nothing when they start with one of these, as a `pmset -a` or a
     /// `defaults write` refused by the system.
     pub fails: Vec<String>,
+    /// A `dscl .` fed commands exits 1 and runs none of them.
+    pub stdin_fails: bool,
+    /// A `dscl .` fed commands skips each line that has one of these in it, as for a
+    /// command it refuses, runs the others, and exits 1.
+    pub stdin_rejects: Vec<String>,
+    /// A `dscl .` fed commands skips each line that has one of these in it, prints a
+    /// `DS Error` line for it, runs the others, and exits 0.
+    pub stdin_ds_errors: Vec<String>,
+    /// `dscl . -readall` exits 1 and prints nothing.
+    pub readall_fails: bool,
+    /// `dscl . -readall` exits 0 and prints nothing.
+    pub readall_empty: bool,
+    /// Directories that cannot be made.
+    pub mkdir_fails: Vec<String>,
     /// Calls that, starting with one of these, exit 0 and change nothing.
     pub no_effect: Vec<String>,
     /// Mounted volumes `diskutil info` reports: mount point, file system personality.
@@ -104,6 +119,15 @@ pub struct State {
     pub spotlight_off: BTreeSet<String>,
     /// Paths `tmutil isexcluded` reports excluded.
     pub backup_excluded: BTreeSet<String>,
+    /// The password `dscl` was given for each record (a path under `/Users`), by its
+    /// `passwd` command.
+    pub passwords: BTreeMap<String, String>,
+    /// How many times the random source was read: each read differs from the others.
+    pub random_reads: u8,
+    /// The random source cannot be read.
+    pub random_fails: bool,
+    /// The random source gives one byte fewer than asked.
+    pub random_short: bool,
 }
 
 impl State {
@@ -145,6 +169,8 @@ pub struct FakeMac {
     /// The programs' state; the programs `apply` runs change it.
     pub state: RefCell<State>,
     pub log: RefCell<Vec<String>>,
+    /// The text each program run with input was fed, in order.
+    pub inputs: RefCell<Vec<String>>,
     /// The test profile, made when the Mac is: a drift of the files it pins (an Xcode
     /// `.xip`, the probe) does not change it.
     profile: String,
@@ -202,6 +228,7 @@ impl FakeMac {
             root: root.to_str().unwrap().to_owned(),
             state: RefCell::new(state),
             log: RefCell::new(Vec::new()),
+            inputs: RefCell::new(Vec::new()),
             profile: String::new(),
         };
         mac.write(
@@ -360,6 +387,8 @@ impl FakeMac {
                 }
             })
             .collect();
+        // The tests' pool: 4 users from uid 700 (the profile's own default is 100 from 61000).
+        text.push_str("pool_users=4\npool_first_uid=700\n");
         let file_sha = |p: &str| sha256_hex(&fs::read(self.path(p)).unwrap());
         text.push_str(&format!(
             "xcode=17A000:/Applications/Xcode-26.6.app/Contents/Developer:{}\n",
@@ -392,6 +421,7 @@ impl FakeMac {
             "defaults read ",
             "dscl . -read ",
             "dscl . -list ",
+            "dscl . -readall ",
             "dseditgroup -o checkmember ",
             "systemsetup -get",
             "socketfilterfw --getglobalstate",
@@ -447,6 +477,11 @@ impl FakeMac {
             ("defaults", ["write", domain, key, "-bool", value @ ("true" | "false")]) => {
                 let domain = self.strip_root(domain).to_owned();
                 s.default_set(&domain, key, bit(value));
+                done(true)
+            }
+            ("defaults", ["write", domain, key, "-string", value]) => {
+                let domain = self.strip_root(domain).to_owned();
+                s.default_set(&domain, key, value);
                 done(true)
             }
             ("defaults", ["delete", domain, key]) => {
@@ -531,10 +566,13 @@ impl FakeMac {
                 s.spotlight_off.insert(self.strip_root(volume).into());
                 done(true)
             }
-            ("tmutil", ["addexclusion", path]) => {
+            // Measured on macOS 27: without `-v` the call succeeds and `isexcluded`
+            // still says [Included] for a volume mount point; only `-v` excludes it.
+            ("tmutil", ["addexclusion", "-v", path]) => {
                 s.backup_excluded.insert(self.strip_root(path).into());
                 done(true)
             }
+            ("tmutil", ["addexclusion", _]) => done(true),
             ("dseditgroup", ["-o", "edit", "-d", user, "-t", "user", group]) => {
                 let record = format!("/Groups/{group}");
                 let members: Vec<String> = s
@@ -548,6 +586,25 @@ impl FakeMac {
                             .collect()
                     });
                 s.attr(&record, "GroupMembership", &members.join(" "));
+                // The user's `GeneratedUID` goes from `GroupMembers` too.
+                let guid = s
+                    .records
+                    .get(&format!("/Users/{user}"))
+                    .and_then(|a| a.iter().find(|(k, _)| k == "GeneratedUID"))
+                    .map(|(_, v)| v.clone());
+                if let Some(guid) = guid {
+                    let kept: Vec<String> = s
+                        .records
+                        .get(&record)
+                        .and_then(|a| a.iter().find(|(k, _)| k == "GroupMembers"))
+                        .map_or_else(Vec::new, |(_, v)| {
+                            v.split_whitespace()
+                                .filter(|m| *m != guid)
+                                .map(str::to_owned)
+                                .collect()
+                        });
+                    s.attr(&record, "GroupMembers", &kept.join(" "));
+                }
                 done(true)
             }
             _ => None,
@@ -598,6 +655,35 @@ impl FakeMac {
                             _ => out.push_str(&format!("{a}: {v}\n")),
                         }
                     }
+                }
+                ok(out)
+            }
+            ("dscl", [".", "-readall", ..]) if s.readall_fails => no(""),
+            ("dscl", [".", "-readall", ..]) if s.readall_empty => ok(String::new()),
+            ("dscl", [".", "-readall", dir, attrs @ ..]) => {
+                let prefix = format!("{dir}/");
+                let mut out = String::new();
+                for (record, found) in &s.records {
+                    let Some(name) = record.strip_prefix(&prefix) else {
+                        continue;
+                    };
+                    // Other names of the record are kept as a `RecordName` attribute.
+                    let others = found
+                        .iter()
+                        .find(|(k, _)| k == "RecordName")
+                        .map_or("", |(_, v)| v.as_str());
+                    out.push_str(&format!("RecordName: {name} {others}\n"));
+                    for a in attrs.iter().filter(|a| **a != "RecordName") {
+                        let Some((_, v)) = found.iter().find(|(k, _)| k == a) else {
+                            continue;
+                        };
+                        match *a {
+                            "AuthenticationAuthority" => out.push_str(&format!("{a}:\n {v}\n")),
+                            "IsHidden" => out.push_str(&format!("dsAttrTypeNative:{a}: {v}\n")),
+                            _ => out.push_str(&format!("{a}: {v}\n")),
+                        }
+                    }
+                    out.push_str("-\n");
                 }
                 ok(out)
             }
@@ -774,6 +860,75 @@ impl Host for FakeMac {
         }
     }
 
+    /// `dscl .` fed commands runs them in order, as dscl's interactive mode does:
+    /// `create RECORD [ATTR VALUE]` and `delete RECORD ATTR`. The log gets one entry for
+    /// the process, and `inputs` the text it was fed.
+    fn run_with_input(&self, program: &str, args: &[&str], input: &str) -> io::Result<Output> {
+        let name = program.rsplit('/').next().unwrap();
+        self.log
+            .borrow_mut()
+            .push(format!("{name} {} <stdin", args.join(" ")));
+        self.inputs.borrow_mut().push(input.to_owned());
+        if (name, args) != ("dscl", &["."][..]) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no fake for {program} {args:?} with input"),
+            ));
+        }
+        let mut s = self.state.borrow_mut();
+        if s.stdin_fails {
+            return Ok(Output {
+                success: false,
+                stdout: String::new(),
+            });
+        }
+        let rejects = s.stdin_rejects.clone();
+        let ds_errors = s.stdin_ds_errors.clone();
+        let mut rejected = false;
+        let mut printed = String::new();
+        for line in input.lines() {
+            if ds_errors.iter().any(|r| line.contains(r.as_str())) {
+                printed.push_str("<main> DS Error: -14136 (eDSRecordNotFound)\n");
+                continue;
+            }
+            if rejects.iter().any(|r| line.contains(r.as_str())) {
+                rejected = true;
+                continue;
+            }
+            match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+                ["create", record] => {
+                    s.records.entry((*record).into()).or_default();
+                }
+                ["create", record, attr, value] => s.attr(record, attr, value),
+                ["delete", record, attr] => {
+                    if let Some(attrs) = s.records.get_mut(*record) {
+                        attrs.retain(|(a, _)| a != attr);
+                    }
+                }
+                // Like dscl's: a hash of the password is kept, and the record is
+                // given an authority; the fake keeps the password itself to be asked.
+                ["passwd", record, password] => {
+                    if s.records.contains_key(*record) {
+                        s.attr(
+                            record,
+                            "AuthenticationAuthority",
+                            ";ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2>",
+                        );
+                        s.attr(record, "Password", "********");
+                        s.passwords.insert((*record).into(), (*password).into());
+                    } else {
+                        rejected = true;
+                    }
+                }
+                other => panic!("the fake dscl cannot run {other:?}"),
+            }
+        }
+        Ok(Output {
+            success: !rejected,
+            stdout: printed,
+        })
+    }
+
     fn lstat(&self, path: &str) -> Option<Stat> {
         let mut stat = Stat::of(&fs::symlink_metadata(self.path(path)).ok()?);
         if let Some(&(uid, gid)) = self.state.borrow().owners.get(path) {
@@ -804,6 +959,9 @@ impl Host for FakeMac {
 
     fn mkdir(&self, path: &str) -> io::Result<()> {
         self.log.borrow_mut().push(format!("mkdir {path}"));
+        if self.state.borrow().mkdir_fails.iter().any(|d| d == path) {
+            return Err(io::Error::other("cannot make it"));
+        }
         fs::create_dir_all(self.path(path))
     }
 
@@ -857,6 +1015,21 @@ impl Host for FakeMac {
 
     fn pause(&self, seconds: u64) {
         self.log.borrow_mut().push(format!("sleep {seconds}"));
+    }
+
+    /// Bytes that differ from one read to the next, and are not zero.
+    fn random(&self, len: usize) -> io::Result<Vec<u8>> {
+        self.log.borrow_mut().push(format!("random {len}"));
+        let mut s = self.state.borrow_mut();
+        if s.random_fails {
+            return Err(io::Error::other("no random source"));
+        }
+        s.random_reads += 1;
+        let seed = s.random_reads;
+        let len = if s.random_short { len - 1 } else { len };
+        Ok((0..len)
+            .map(|i| seed.wrapping_mul(37).wrapping_add(i as u8 * 3 + 1))
+            .collect())
     }
 }
 

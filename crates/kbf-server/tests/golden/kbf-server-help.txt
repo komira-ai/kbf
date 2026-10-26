@@ -70,9 +70,6 @@ Options:
       --api-token-file <API_TOKEN_FILE>
           A file holding the token operator API writes (cordon, drain, uncordon) must present as `Authorization: Bearer <token>`. It must be owned by the server's user with mode 0600 or 0400, or the server refuses to start; run the server as a user other than the daemon's, whose builds could read it. Without it, writes are refused
 
-      --releases-dir <DIR>
-          The release store (`docs/design/pull-updates.md`, section 6): a directory where the tarballs of a release and their build attestations are kept, uploaded with `PUT /v1/releases/{commit}/{platform}/{name}` on the operator API (which needs the token) and fetched by the nodes through `ReleaseService.Fetch` on the worker listener, behind its mutual TLS. Made if missing. Without it every update endpoint answers 503 saying so
-
       --invocations-open
           Serves the build pages (`GET /v1/invocations/{id}` and below) and the blob route (`GET /v1/blobs/{digest}`) on the operator API to every caller the REAPI policy accepts, with no `invocations` or `blobs` key in the policy file (`docs/design/invocations.md` section 4.3): it fills in `allow` for whichever of the two keys the file leaves out. Without it, and without the keys, those routes answer 404. Pages and blobs hold build outputs and logs: give it only for a listener that only trusted people reach
 
@@ -121,6 +118,16 @@ Options:
           
           [default: 4 16 32]
 
+      --vm-host-floor-cpus <VM_HOST_FLOOR_CPUS>
+          The cores a node that reports VM slots (`vm.slots`) keeps for the host itself: subtracted from the CPUs placement may book on it, so that guests cannot take the host's own share. A node that reports none books the whole machine
+          
+          [default: 2]
+
+      --vm-host-floor-mem-gib <VM_HOST_FLOOR_MEM_GIB>
+          The memory, in GiB, a node that reports VM slots (`vm.slots`) keeps for the host itself, subtracted as `--vm-host-floor-cpus` subtracts cores
+          
+          [default: 8]
+
       --learned-sizes <LEARNED_SIZES>
           What the farm does with `kbf-estimator`, which predicts an action's memory from what its earlier runs used. `off` calls it never. `shadow` shows it every attempt that finishes and logs, for every new operation, a `size estimate:` line with what it would book, and counts how the attempts fall against its estimates (`kbf_estimator_shadow_total`); it books exactly what `off` books. `on` is `shadow` plus one change to a booking: a kill at an action's own memory limit leaves a floor under the action's key (instance, platform class, instrument and shape), which every later digest of the key, queued or new, books at least, strictly below the memory of the largest node that could run it. The floor falls only by the estimator's decay: it halves once the key has run 256 times and 7 days have passed without an own-limit kill or a sample above half of it, and a floor that falls to the first rung or below is dropped; a kill raises it again. Only an action whose memory the client did not name, on a platform that pins the OS, is keyed. The size summaries and the keys are kept in the state store, in rows of their own that a release without this flag never reads; `off` neither reads nor deletes the summaries, and ignores the keys. The memory a floor raised a queued operation to is not stored: a restart, or a rollback to `off`, books such an operation at its submitted memory until it ends
 
@@ -137,7 +144,7 @@ Options:
           [default: 60]
 
       --shutdown-timeout-secs <SHUTDOWN_TIMEOUT_SECS>
-          How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done. Buck2 never recovers a stream that breaks mid-action, so the default, 0, is no deadline; set one at least as long as the longest action. When it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off)
+          How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done; the exception is a stream whose operation was never started and that no worker on this frontend can run (say every capable worker is cordoned) and no other frontend can take, which ends UNAVAILABLE as the drain begins, since that action would fail at the deadline anyway (Buck2 retries only the opening of a call). The operation stays queued. On a frontend over a state store, `--drain-deadline` bounds the wait in any case; this flag bounds it earlier. Buck2 never recovers a stream that breaks mid-action, so the default, 0, is no deadline; set one at least as long as the longest action. When it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off)
           
           [default: 0]
 
@@ -280,6 +287,9 @@ Options:
           
           [default: true]
           [possible values: true, false]
+
+      --pack-index
+          Opens the pack index at start: the tables in the Postgres state store that say which pack holds each blob and where. A frontend given `--pack-store-endpoint` reads and writes them; without it nothing does, and the flag only checks that the store can hold them. Needs `--state-store` as a `postgres://` URL whose schema has the pack tables (`kbf-installer setup` makes them); a `sqlite://` store is refused. Left out, no pack table is touched
 
       --history-index-root <ROOT>
           Where history's index rows live in the state store: `ui/`, or `<prefix>ui/` for a prefix that ends in `/`, so that one state store can hold several farms' history apart. Left out, it is `ui/`. Needs `--history-objects`

@@ -343,6 +343,8 @@ async fn a_start_names_the_newest_heartbeat_taken_and_the_window() {
         seq: 1,
         report_hash: Vec::new(),
         running: running.to_vec(),
+        pack_reads: None,
+        pack_writes: None,
     }));
     daemon
         .expect("the late heartbeat's ack", |m| match m {

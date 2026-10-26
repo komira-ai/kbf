@@ -9,6 +9,8 @@
 //! - `GET /v1/enroll/nodes`: every node in the registry ([`NodeList`]).
 //! - `POST /v1/enroll/nodes/{id}/revoke`: revokes a node and writes its deny rows
 //!   ([`NodeRevoked`]).
+//! - `POST /v1/enroll/nodes/{id}:adopt`: records a node provisioned before enrollment, with
+//!   no certificate ([`AdoptRequest`] in, the node as the listing shows it out).
 //!
 //! **Every route, a GET included, passes the operator write gate** ([`crate::api::gate`]:
 //! loopback peer, no `Origin`, the bearer token, `Content-Type: application/json`), because
@@ -32,18 +34,20 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use kbf_enroll_registry::{
-    NodeState, RegistryError, TokenSpec, create_token, list_nodes, list_tokens, revoke_node,
-    revoke_token,
+    NodeState, RegistryError, TokenSpec, adopt_node, canonical_addr, create_token, list_nodes,
+    list_tokens, revoke_node, revoke_token,
 };
 use kbf_state::{Store, StoreError};
 use kbf_types::enroll_api::{
     NodeInfo, NodeList, NodeRevoked, TokenCreate, TokenCreated, TokenInfo, TokenList, TokenRevoked,
 };
-use kbf_types::{NodeId, RoleSet, Token, TokenId, TokenSecret};
+use kbf_types::{HostRole, NodeId, RoleSet, Token, TokenId, TokenSecret};
 use serde::{Deserialize, Serialize};
 
+use super::service::{advertise_refused, node_id_refused};
 use super::{PinSource, Random};
 use crate::api::{error, gate, json};
+use crate::members::Members;
 use crate::proxy_auth::Caller;
 use crate::token::ApiToken;
 
@@ -63,6 +67,12 @@ pub struct EnrollApi {
     store: Arc<dyn Store>,
     pins: Arc<dyn PinSource>,
     random: Arc<dyn Random>,
+    /// The membership, refreshed at once after a node revoke; `None` leaves that to the
+    /// sweeper's next beat.
+    members: Option<Arc<Members>>,
+    /// The names this frontend serves: no node adopted here may be called one, or advertise
+    /// one, as no enrollment may.
+    frontend_names: Vec<String>,
 }
 
 impl EnrollApi {
@@ -73,7 +83,26 @@ impl EnrollApi {
             store,
             pins,
             random,
+            members: None,
+            frontend_names: Vec::new(),
         }
+    }
+
+    /// The API refusing, for an adopted node, the id and the advertise host that enrollment
+    /// refuses for the names this frontend serves.
+    #[must_use]
+    pub fn with_frontend_names(mut self, names: &[String]) -> Self {
+        self.frontend_names = names.iter().map(|n| n.to_ascii_lowercase()).collect();
+        self
+    }
+
+    /// The API refreshing `members` right after a node revoke, as `POST /v1/denied` does,
+    /// so the map storage nodes follow carries the new deny rows at once and not at the
+    /// next sweep.
+    #[must_use]
+    pub fn with_members(mut self, members: Option<Arc<Members>>) -> Self {
+        self.members = members;
+        self
     }
 }
 
@@ -99,6 +128,7 @@ impl From<RegistryError> for Failure {
         match e {
             RegistryError::Invalid(why) => Self::new(StatusCode::BAD_REQUEST, why),
             RegistryError::NotFound => Self::new(StatusCode::NOT_FOUND, "not found"),
+            RegistryError::AlreadyExists(why) => Self::new(StatusCode::CONFLICT, why),
             RegistryError::Corrupt(_) => Self::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "a stored enrollment row is unreadable",
@@ -146,7 +176,7 @@ impl EnrollState {
     }
 }
 
-/// The five routes. `token` is the operator API token the gate checks; `enroll` is what
+/// The six routes. `token` is the operator API token the gate checks; `enroll` is what
 /// they call, `None` when this server has no enrollment. Serve them with
 /// `into_make_service_with_connect_info`, as [`crate::api::router`] is.
 pub fn routes(token: Option<ApiToken>, enroll: Option<Arc<EnrollApi>>) -> Router {
@@ -155,6 +185,9 @@ pub fn routes(token: Option<ApiToken>, enroll: Option<Arc<EnrollApi>>) -> Router
         .route("/v1/enroll/tokens/{id}", delete(revoke_token_route))
         .route(NODES, get(nodes))
         .route("/v1/enroll/nodes/{id}/revoke", post(revoke_node_route))
+        // The router takes one parameter to a segment and no text after it, so the segment is
+        // `{id}:adopt` whole and the handler splits it.
+        .route("/v1/enroll/nodes/{id_and_verb}", post(adopt_node_route))
         .with_state(Arc::new(EnrollState { token, enroll }))
 }
 
@@ -268,6 +301,42 @@ pub(crate) async fn revoke_node_route(
     answer(blocking(move || revoke_node_by_id(&api, &id)).await)
 }
 
+/// The body of an adopt: the roles the node holds and, for a storage node, the `host:port`
+/// it advertises.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdoptRequest {
+    roles: Vec<String>,
+    #[serde(default)]
+    advertise: String,
+}
+
+pub(crate) async fn adopt_node_route(
+    State(state): State<Arc<EnrollState>>,
+    peer: Caller,
+    Path(id_and_verb): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let api = match state.admit(&peer, &headers) {
+        Ok(api) => api,
+        Err(refusal) => return *refusal,
+    };
+    let Some(id) = id_and_verb.strip_suffix(":adopt").map(str::to_owned) else {
+        return error(StatusCode::NOT_FOUND, "no such route");
+    };
+    let request: AdoptRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(e) => {
+            let why = format!(
+                "an adopt is JSON like {{\"roles\": [\"storage\"], \"advertise\": \"host:7000\"}}: {e}"
+            );
+            return error(StatusCode::BAD_REQUEST, &why);
+        }
+    };
+    answer(blocking(move || adopt_node_by_id(&api, &id, &request)).await)
+}
+
 fn bad(why: impl Into<String>) -> Failure {
     Failure::new(StatusCode::BAD_REQUEST, why)
 }
@@ -276,6 +345,7 @@ fn token_dto(info: &kbf_enroll_registry::TokenInfo) -> TokenInfo {
     TokenInfo {
         id: info.id.to_string(),
         roles: info.roles.iter().map(|r| r.name().to_owned()).collect(),
+        host_role: info.host_role.map(|role| role.name().to_owned()),
         max_uses: info.max_uses,
         uses: info.uses,
         expires_at: info.expires_at,
@@ -316,6 +386,12 @@ fn node_dto(info: &kbf_enroll_registry::NodeInfo) -> NodeInfo {
 fn make_token(api: &EnrollApi, request: TokenCreate) -> Result<TokenCreated, Failure> {
     let roles = RoleSet::from_names(request.roles.iter().map(String::as_str))
         .map_err(|e| bad(e.to_string()))?;
+    let host_role = request
+        .host_role
+        .as_deref()
+        .map(str::parse::<HostRole>)
+        .transpose()
+        .map_err(|e| bad(format!("host_role: {e}")))?;
     let node_id = request
         .node_id
         .as_deref()
@@ -324,6 +400,7 @@ fn make_token(api: &EnrollApi, request: TokenCreate) -> Result<TokenCreated, Fai
         .map_err(|e| bad(format!("node_id: {e}")))?;
     let spec = TokenSpec {
         roles,
+        host_role,
         max_uses: request.max_uses,
         ttl: request.expires_in.map(Duration::from_secs),
         node_id,
@@ -387,11 +464,42 @@ fn node_list(api: &EnrollApi) -> Result<NodeList, Failure> {
     })
 }
 
+fn adopt_node_by_id(
+    api: &EnrollApi,
+    id: &str,
+    request: &AdoptRequest,
+) -> Result<NodeInfo, Failure> {
+    let parsed = id
+        .parse::<NodeId>()
+        .map_err(|e| bad(format!("node id {id:?}: {e}")))?;
+    let roles = RoleSet::from_names(request.roles.iter().map(String::as_str))
+        .map_err(|e| bad(e.to_string()))?;
+    if node_id_refused(parsed.as_str(), &api.frontend_names) {
+        return Err(bad("that node id is a name no node may hold"));
+    }
+    let advertise = canonical_addr(&request.advertise);
+    if let Some((host, _)) = advertise.rsplit_once(':')
+        && advertise_refused(host, &api.frontend_names)
+    {
+        return Err(bad("that advertise host is not one a node may advertise"));
+    }
+    let info = adopt_node(&*api.store, &parsed, roles, &request.advertise)?;
+    Ok(node_dto(&info))
+}
+
 fn revoke_node_by_id(api: &EnrollApi, id: &str) -> Result<NodeRevoked, Failure> {
     let parsed = id
         .parse::<NodeId>()
         .map_err(|_| Failure::new(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
     let denied = revoke_node(&*api.store, &parsed, OPERATOR)?;
+    // The rows are written and every check of the worker listener and of registration reads
+    // them; the map follows at once. A failure here changes no one's admission, and the
+    // sweeper's next beat does the same, so it is logged, not returned.
+    if let Some(members) = &api.members
+        && let Err(error) = members.refresh()
+    {
+        tracing::warn!(%error, node = %parsed, "refreshing the map after a node revoke failed; the next beat does it");
+    }
     Ok(NodeRevoked {
         id: parsed.to_string(),
         denied: denied.iter().map(ToString::to_string).collect(),

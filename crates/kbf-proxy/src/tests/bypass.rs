@@ -1,5 +1,5 @@
-//! The routes the proxy answers itself, the update API, limits, the startup hold and the
-//! public `Proxy::bind` path.
+//! The routes the proxy answers itself, the update API, limits and the public `Proxy::bind`
+//! path.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::OwnedFd;
@@ -7,16 +7,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::kit::{CAPS, Rig, finish, grpc_ok, read_all, reserve_ports, script, tagged, until};
-use crate::config::{Limits, ProxyConfig, UpstreamTable};
+use super::kit::{CAPS, finish, grpc_ok, read_all, reserve_ports, script, security, tagged, until};
+use super::pool_kit::Rig;
+use crate::Proxy;
+use crate::auth::Buck2Auth;
+use crate::config::{Frontend, Limits, ProxyConfig};
 use crate::control::{NoUpdates, UpdateHandler, UpdateReply, UpdateRequest};
+use crate::metrics::Metrics;
+use crate::route::Target;
 use crate::serve::ConnLimits;
-use crate::slot::{ActiveSlot, Slot};
-use crate::{Proxy, route::Target};
+use crate::upstreams::Upstreams;
 
 #[tokio::test(start_paused = true)]
 async fn probes_and_unknown_paths_are_answered_by_the_proxy() {
-    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    let rig = Rig::start(&[tagged("a")]);
     let mut client = rig.client().await;
     let health = client.plain("GET", "/healthz", b"").await;
     assert_eq!((health.status, health.text().as_str()), (Some(200), "ok"));
@@ -24,7 +28,7 @@ async fn probes_and_unknown_paths_are_answered_by_the_proxy() {
     assert_eq!(
         ready.status,
         Some(503),
-        "readiness is the poll's, which is not running yet"
+        "readiness is the polls', which are not running yet"
     );
     let missing = client.plain("GET", "/nothing", b"").await;
     assert_eq!(
@@ -38,20 +42,15 @@ async fn probes_and_unknown_paths_are_answered_by_the_proxy() {
         Some("12"),
         "UNIMPLEMENTED, never forwarded"
     );
-    assert_eq!(rig.a.state.dispatches(), 0);
-    assert_eq!(rig.b.state.dispatches(), 0);
+    assert_eq!(rig.dispatches(), [0]);
 }
 
+/// Asserts that `GET /metrics` is plain text with the proxy's counters and the series of each
+/// member, and has none of the series of the removed two-slot supervision.
 #[tokio::test(start_paused = true)]
-async fn metrics_show_the_gate_and_the_counters() {
-    let rig = Rig::start(tagged("a"), tagged("b")).await;
+async fn metrics_show_the_counters_and_the_members() {
+    let rig = Rig::start(&[tagged("a"), tagged("b")]);
     let mut client = rig.client().await;
-    let guard = rig
-        .core
-        .slots
-        .hold(Duration::from_secs(20))
-        .expect("no hold");
-    drop(guard);
     let reply = client.plain("GET", "/metrics", b"").await;
     assert_eq!(reply.status, Some(200));
     assert!(
@@ -62,14 +61,20 @@ async fn metrics_show_the_gate_and_the_counters() {
     );
     let text = reply.text();
     for line in [
-        "kbf_proxy_hold_abandoned_total 1",
-        "kbf_proxy_held_streams 0",
         "kbf_proxy_panics_total 0",
-        "kbf_proxy_slot_open_streams{slot=\"a\"} 0",
-        "kbf_proxy_slot_open_streams{slot=\"b\"} 0",
-        "# TYPE kbf_proxy_hold_expired_total counter",
+        "# TYPE kbf_proxy_retries_total counter",
+        "kbf_proxy_member_up{member=\"a\"} 1",
+        "kbf_proxy_member_up{member=\"b\"} 1",
     ] {
         assert!(text.contains(line), "missing {line:?} in:\n{text}");
+    }
+    for gone in [
+        "kbf_proxy_hold_",
+        "kbf_proxy_held_streams",
+        "kbf_proxy_slot_open_streams",
+        "kbf_proxy_child_metrics",
+    ] {
+        assert!(!text.contains(gone), "{gone:?} is still in:\n{text}");
     }
 }
 
@@ -109,19 +114,17 @@ fn recording(
     (handler, seen, finished)
 }
 
-async fn with_updates(handler: Recording) -> Rig {
-    Rig::start_with(tagged("a"), tagged("b"), handler, Limits::default()).await
+fn with_updates(handler: Recording) -> Rig {
+    Rig::start_with(&[tagged("a")], handler, Limits::default())
 }
 
+/// Asserts that a call to the update API reaches the handler with its method, its path
+/// without the query and its body, that the handler's status, headers and body come back to the
+/// client, and that no child is asked.
 #[tokio::test(start_paused = true)]
-async fn the_update_api_calls_the_handler_even_while_the_gate_holds() {
+async fn the_update_api_calls_the_handler() {
     let (handler, seen, _) = recording(Duration::ZERO, false);
-    let rig = with_updates(handler).await;
-    let guard = rig
-        .core
-        .slots
-        .hold(Duration::from_secs(20))
-        .expect("no hold");
+    let rig = with_updates(handler);
     let reply = rig
         .client()
         .await
@@ -142,7 +145,7 @@ async fn the_update_api_calls_the_handler_even_while_the_gate_holds() {
         "the query is not passed"
     );
     assert_eq!(seen[0].body, b"{\"x\":1}");
-    drop(guard);
+    assert_eq!(rig.dispatches(), [0], "the update API is the proxy's own");
 }
 
 #[tokio::test(start_paused = true)]
@@ -150,7 +153,7 @@ async fn an_update_body_over_4096_bytes_is_refused_by_the_proxy() {
     static EXACT: [u8; 4096] = [b'a'; 4096];
     static OVER: [u8; 4097] = [b'a'; 4097];
     let (handler, seen, _) = recording(Duration::ZERO, false);
-    let rig = with_updates(handler).await;
+    let rig = with_updates(handler);
     let mut client = rig.client().await;
     assert_eq!(
         client
@@ -172,7 +175,7 @@ async fn an_update_body_over_4096_bytes_is_refused_by_the_proxy() {
 #[tokio::test(start_paused = true)]
 async fn a_slow_update_handler_gets_a_504_and_still_finishes() {
     let (handler, seen, finished) = recording(Duration::from_secs(45), false);
-    let rig = with_updates(handler).await;
+    let rig = with_updates(handler);
     let mut client = rig.client().await;
     let reply = client
         .plain("POST", "/v1/update/frontend/abort", b"{}")
@@ -192,7 +195,7 @@ async fn a_slow_update_handler_gets_a_504_and_still_finishes() {
 #[tokio::test(start_paused = true)]
 async fn a_panicking_stream_is_reset_and_counted_and_the_connection_serves_on() {
     let (handler, _, _) = recording(Duration::ZERO, true);
-    let rig = with_updates(handler).await;
+    let rig = with_updates(handler);
     let mut client = rig.client().await;
     let reply = client
         .plain("POST", "/v1/update/frontend/abort", b"{}")
@@ -203,56 +206,6 @@ async fn a_panicking_stream_is_reset_and_counted_and_the_connection_serves_on() 
     assert!(client.alive());
     let metrics = client.plain("GET", "/metrics", b"").await.text();
     assert!(metrics.contains("kbf_proxy_panics_total 1"));
-}
-
-#[tokio::test(start_paused = true)]
-async fn the_startup_hold_ends_into_nothing_if_nobody_releases_it() {
-    let (slots, guard) = ActiveSlot::starting(Duration::from_secs(20));
-    let rig = Rig::build(
-        tagged("a"),
-        tagged("b"),
-        NoUpdates,
-        Limits::default(),
-        slots,
-    )
-    .await;
-    let abandon = tokio::spawn({
-        let core = Arc::clone(&rig.core);
-        async move { core.abandon_startup_after(Duration::from_secs(20)).await }
-    });
-    let mut client = rig.client().await;
-    let (response, _body) = client.start(CAPS, true).await;
-    let held = tokio::spawn(finish(response));
-    until(|| rig.core.queue.held() == 1).await;
-    abandon.await.expect("timer");
-    assert_eq!(rig.core.slots.abandoned_holds(), 1);
-    assert!(!rig.core.slots.holding());
-    let reply = held.await.expect("client");
-    assert_eq!(reply.grpc_status().as_deref(), Some("14"));
-    assert!(client.unary(CAPS).await.grpc_status().as_deref() == Some("14"));
-    drop(guard);
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_released_startup_hold_is_left_alone_by_the_timer() {
-    let (slots, guard) = ActiveSlot::starting(Duration::from_secs(20));
-    let rig = Rig::build(
-        tagged("a"),
-        tagged("b"),
-        NoUpdates,
-        Limits::default(),
-        slots,
-    )
-    .await;
-    rig.core.slots.adopt(Slot::A, None);
-    rig.core.slots.release_into(Slot::A).expect("A is open");
-    rig.core
-        .abandon_startup_after(Duration::from_secs(20))
-        .await;
-    assert_eq!(rig.core.slots.abandoned_holds(), 0);
-    assert_eq!(rig.core.slots.active(), Some(Slot::A));
-    assert_eq!(rig.client().await.unary(CAPS).await.text(), "a");
-    drop(guard);
 }
 
 #[test]
@@ -304,7 +257,7 @@ async fn a_connection_over_a_limit_is_closed() {
         max_connections_per_ip: 1,
         ..Limits::default()
     };
-    let rig = Rig::start_with(tagged("a"), tagged("b"), NoUpdates, limits).await;
+    let rig = Rig::start_with(&[tagged("a")], NoUpdates, limits);
     let ip = |n| IpAddr::V4(Ipv4Addr::new(192, 0, 2, n));
     let mut first = rig.client_from(ip(1)).await;
     assert_eq!(first.unary(CAPS).await.text(), "a");
@@ -319,30 +272,35 @@ async fn a_connection_over_a_limit_is_closed() {
     // A closed connection frees its place.
     drop(second);
     drop(first);
-    until(|| rig.core.slots.open_streams() == 0).await;
+    until(|| rig.core.open_streams() == 0).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(served(&rig, ip(3)).await);
 }
 
+/// Asserts that every target of every member has a port of its own on the loopback address, so
+/// that no two members, and no two listeners of one member, share one.
 #[test]
-fn every_slot_and_target_has_its_own_loopback_port() {
-    let table = UpstreamTable { base_port: 18_000 };
+fn every_member_and_target_has_its_own_loopback_port() {
+    let frontend = |name: &str, base_port: u16| Frontend {
+        name: name.to_owned(),
+        base_port,
+    };
+    let members = Upstreams::new(&[frontend("a", 18_000), frontend("b", 18_010)]);
     let mut seen = std::collections::BTreeSet::new();
-    for slot in Slot::ALL {
+    for index in 0..members.len() {
         for target in [
             Target::Reapi,
             Target::Worker,
             Target::Operator,
             Target::Enroll,
         ] {
-            let addr = crate::pool::upstream_addr(table, slot, target);
+            let addr = crate::pool::member_addr(members.base(index), target);
             assert!(addr.ip().is_loopback(), "{addr}");
             assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
             assert!(seen.insert(addr.port()), "{addr} repeats");
         }
-        assert!(seen.insert(table.admin_port(slot)));
     }
-    assert_eq!(seen.len(), 10);
+    assert_eq!(seen.len(), 8);
 }
 
 /// The files of a proxy: certificates, tokens, a secret, a config over them.
@@ -352,6 +310,8 @@ pub(super) struct Files {
     pub(super) dir: std::path::PathBuf,
 }
 
+/// The files of a proxy over members `a` at `base` and `b` ten ports above it, with the keys of
+/// `[proxy]` in `extra`.
 pub(super) fn files(name: &str, base: u16, extra: &str) -> Files {
     use super::pki::Pki;
     use crate::scratch::{scratch, write_file};
@@ -372,13 +332,14 @@ pub(super) fn files(name: &str, base: u16, extra: &str) -> Files {
          server_key_file = {:?}\n\
          client_ca_file = {:?}\n\
          proxy_auth_file = {:?}\n\
-         hold_max_s = 600\n\
          {extra}\n\
-         [upstream]\nbase_port = {base}\n",
+         [[frontend]]\nname = \"a\"\nbase_port = {base}\n\
+         [[frontend]]\nname = \"b\"\nbase_port = {}\n",
         paths.certs[0].cert,
         paths.certs[0].key,
         paths.client_ca,
         dir.join("proxy-auth"),
+        base + 10,
     ))
     .expect("a valid table");
     Files { pki, config, dir }
@@ -393,16 +354,15 @@ fn listener() -> (std::net::TcpListener, std::net::SocketAddr) {
 /// `kbf-proxy` through its public entry points, on its own runtime, real sockets and the real
 /// clock: TLS in, a certificate's identity to the child, and the bearer mode enforced.
 #[test]
-fn bind_run_hold_release_and_shutdown() {
+fn bind_run_and_shutdown() {
     let (base, mut listeners) = reserve_ports();
     let (socket, public) = listener();
     let files = files("bind-run", base, "buck2_auth = \"bearer\"");
+    let mut config = files.config.clone();
+    config.frontend.truncate(1);
     let client = files.pki.client(&["node-3.farm"], Some("daemon"));
-    let (handle, runner) = Proxy::bind(files.config.clone(), OwnedFd::from(socket)).expect("bind");
-    assert!(handle.slots().holding(), "starts holding, to adopt");
+    let (handle, runner) = Proxy::bind(config, OwnedFd::from(socket)).expect("bind");
     let serving = std::thread::spawn(move || runner.run(NoUpdates));
-    let guard = handle.startup_hold().expect("the startup hold, once");
-    assert!(handle.startup_hold().is_none());
 
     handle.runtime().block_on(async {
         let child = super::kit::start_child_on(listeners.drain(..3).collect(), tagged("real"));
@@ -412,19 +372,7 @@ fn bind_run_hold_release_and_shutdown() {
         let (response, mut body) = client.start(CAPS, false).await;
         body.send_data(bytes::Bytes::from_static(b"x"), true)
             .expect("body");
-        let waiting = tokio::spawn(finish(response));
-        // Held until the supervisor adopts the child and releases.
-        eventually(|| handle.snapshot().held == 1).await;
-        assert_eq!(handle.open_streams(), 1);
-        assert_eq!(handle.expire(), 0, "nothing is past its bound");
-        handle.slots().adopt(Slot::A, None);
-        handle.slots().release_into(Slot::A).expect("A is open");
-        drop(guard);
-        assert_eq!(waiting.await.expect("client").text(), "real");
-        let snapshot = handle.snapshot();
-        assert_eq!(snapshot.active, Some(Slot::A));
-        assert!(!snapshot.holding && !snapshot.ready);
-        assert_eq!(snapshot.holds_abandoned, 0);
+        assert_eq!(finish(response).await.text(), "real");
         assert_eq!(child.state.dispatches(), 1);
         let seen = child.state.headers_of(CAPS);
         let node = seen[0]
@@ -455,8 +403,6 @@ fn bind_run_hold_release_and_shutdown() {
 
 /// The secret file is created on the first start and read on the next, and the handle says
 /// which; the admin headers carry it, and a reload of unchanged files succeeds.
-///
-/// Kills: a handle that reports `Existing` for a file it wrote; admin calls without the secret.
 #[test]
 fn bind_reports_where_the_secret_came_from() {
     use crate::identity::SecretOrigin;
@@ -482,9 +428,6 @@ fn bind_reports_where_the_secret_came_from() {
 }
 
 /// A proxy does not start on a file it cannot use, and says which.
-///
-/// Kills: a bind that starts without TLS, without the operator token, or on an open secret;
-/// one that creates the secret file before the files that can still refuse it.
 #[test]
 fn bind_refuses_files_it_cannot_use() {
     use crate::scratch::write_file;
@@ -496,8 +439,8 @@ fn bind_refuses_files_it_cannot_use() {
         let files = files(name, 20_000, &format!("buck2_auth = \"{mode}\""));
         damage(&files);
         let refusal = bind(&files).expect_err(name).to_string();
-        // A start that fails leaves no new secret for a child to read and the supervisor to
-        // adopt; only the file the test itself wrote is there.
+        // A start that fails leaves no new secret for a child to read; only the file the
+        // test itself wrote is there.
         assert_eq!(files.dir.join("proxy-auth").exists(), name == "open-secret");
         refusal
     };
@@ -525,6 +468,21 @@ fn bind_refuses_files_it_cannot_use() {
     bind(&files).expect("mtls reads no Buck2 key");
 }
 
+/// Asserts that a config with no `[[frontend]]` table is refused at bind as invalid input, before
+/// anything is read or made: the proxy balances over frontends and has nothing to serve without
+/// one.
+#[test]
+fn bind_refuses_a_config_without_frontends() {
+    let files = files("bind-no-frontends", 20_000, "");
+    let mut config = files.config.clone();
+    config.frontend.clear();
+    let (socket, _) = listener();
+    let refusal = Proxy::bind(config, OwnedFd::from(socket)).expect_err("no frontends");
+    assert_eq!(refusal.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(refusal.to_string().contains("[[frontend]]"), "{refusal}");
+    assert!(!files.dir.join("proxy-auth").exists());
+}
+
 async fn eventually(mut done: impl FnMut() -> bool) {
     for _ in 0..5_000 {
         if done() {
@@ -542,13 +500,13 @@ async fn shutdown_sends_the_one_goaway_and_lets_a_stream_finish() {
         tokio::time::sleep(Duration::from_secs(2)).await;
         grpc_ok(&mut call.respond, "finished");
     });
-    let rig = Rig::start(a, tagged("b")).await;
+    let rig = Rig::start(&[a]);
     let mut client = rig.client().await;
     let (response, mut body) = client.start(CAPS, false).await;
     body.send_data(bytes::Bytes::from_static(b"x"), true)
         .expect("body");
     let open = tokio::spawn(finish(response));
-    until(|| rig.a.state.dispatches() == 1).await;
+    until(|| rig.a().state.dispatches() == 1).await;
     assert!(client.alive(), "no GOAWAY before the shutdown");
     rig.shutdown();
     let reply = open.await.expect("client");
@@ -559,14 +517,18 @@ async fn shutdown_sends_the_one_goaway_and_lets_a_stream_finish() {
 
 #[tokio::test(start_paused = true)]
 async fn an_accept_that_keeps_failing_backs_off_and_shutdown_still_ends_it() {
-    let table = UpstreamTable { base_port: 18_000 };
+    let members = Upstreams::new(&[Frontend {
+        name: "a".to_owned(),
+        base_port: 18_000,
+    }]);
     let net = Arc::new(super::kit::MemNet::default());
     let core = crate::core::Core::new(
-        table,
+        members,
         Limits::default(),
-        ActiveSlot::new(),
         net.connector(),
-        super::kit::security(crate::auth::Buck2Auth::None),
+        security(Buck2Auth::None),
+        Arc::new(Metrics::default()),
+        true,
     );
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let serving = tokio::spawn(crate::serve::serve(
@@ -585,9 +547,9 @@ async fn an_accept_that_keeps_failing_backs_off_and_shutdown_still_ends_it() {
 
 #[tokio::test(start_paused = true)]
 async fn a_refusal_of_a_grpc_call_is_a_grpc_response() {
-    let rig = Rig::start(tagged("a"), tagged("b")).await;
-    drop(rig.core.slots.hold(Duration::from_secs(20)).expect("hold"));
-    // The hold ended into nothing: no frontend is active.
+    let rig = Rig::start(&[tagged("a")]);
+    assert!(rig.members.set_draining("a", true));
+    // No member takes the stream: no frontend is active.
     let reply = rig.client().await.unary(CAPS).await;
     assert_eq!(reply.grpc_status().as_deref(), Some("14"), "{reply:?}");
     assert_eq!(
@@ -598,4 +560,40 @@ async fn a_refusal_of_a_grpc_call_is_a_grpc_response() {
         Some("application/grpc"),
         "a client that cannot read the answer sees a malformed response, not UNAVAILABLE"
     );
+}
+
+/// Asserts that with `max_streams` at 1 a second stream that comes while the first is open is
+/// answered `UNAVAILABLE` at once and is never given to a child, that the refusal is counted,
+/// and that a third stream is served once the first has ended and given its place back.
+#[tokio::test(start_paused = true)]
+async fn a_stream_refused_at_the_stream_limit_is_answered_at_once() {
+    let limits = Limits {
+        max_streams: 1,
+        ..Limits::default()
+    };
+    let slow = script(|mut call| async move {
+        read_all(&mut call.body).await;
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        grpc_ok(&mut call.respond, "late");
+    });
+    let rig = Rig::start_with(&[slow], NoUpdates, limits);
+    let mut client = rig.client().await;
+    let (first, mut body) = client.start(CAPS, false).await;
+    body.send_data(bytes::Bytes::from_static(b"x"), true)
+        .expect("body");
+    let first = tokio::spawn(finish(first));
+    until(|| rig.a().state.dispatches() == 1).await;
+    let second = client.unary(CAPS).await;
+    assert_eq!(second.status, Some(200));
+    assert_eq!(second.grpc_status().as_deref(), Some("14"), "{second:?}");
+    assert!(second.body.is_empty(), "{second:?}");
+    assert_eq!(rig.core.metrics.streams_refused.load(Ordering::Acquire), 1);
+    assert_eq!(
+        rig.a().state.dispatches(),
+        1,
+        "the refused stream reached no child"
+    );
+    assert_eq!(first.await.expect("client").text(), "late");
+    until(|| rig.core.open_streams() == 0).await;
+    assert_eq!(client.unary(CAPS).await.text(), "late");
 }

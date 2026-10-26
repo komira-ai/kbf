@@ -32,12 +32,6 @@
 //!   never replaces the stored header with a fresh count. A header row that did not
 //!   commit is written again from the writer's state, and its invocation held until
 //!   one does: a closed invocation gets no later chunk to carry it.
-//! - **A superseded writer.** Once another process holds the state store's generation
-//!   (`StoreError::Fenced`), a batch is sent as two transactions: the rows this writer may
-//!   still write around the fence (`IndexRoot::permit`: its own chunk and header rows and
-//!   the inserts) and the rest, which the fence refuses and which are dropped and counted
-//!   as any refused index row is. The first refusal costs the step no transaction, so a
-//!   last step before a stop writes the rows that may land.
 //! - **Catalog and status rows.** A run of a shape the writer has not seen puts the
 //!   shape's `ui/shape` row once; a run of a test shape adds to its `ui/status` row by
 //!   read-modify-write with the by-status entry in the same transaction (see
@@ -53,7 +47,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use kbf_objstore::{ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
-use kbf_state::{Cond, StoreError, Txn, Versioned};
+use kbf_state::{Cond, Txn, Versioned};
 use prost::Message;
 
 use crate::container::{self, Encoded, Footer, Header};
@@ -249,12 +243,6 @@ struct Core {
     /// The last stream block refill failed: the next step spends its budget on rows,
     /// so a counter that keeps failing never starves them.
     refill_failed: bool,
-    /// A transaction was refused as fenced: another process holds the state store's
-    /// generation. From then on a batch is sent as two transactions, the rows this
-    /// writer may still write ([`IndexRoot::permit`](crate::IndexRoot::permit)) and
-    /// the rest, so the refusal of the shared rows does not take the pointer rows of a
-    /// chunk down with it.
-    fenced: bool,
 }
 
 impl<O: ObjectStore> Writer<O> {
@@ -290,7 +278,6 @@ impl<O: ObjectStore> Writer<O> {
                 drops: Drops::default(),
                 index_failed: false,
                 refill_failed: false,
-                fenced: false,
             },
         }
     }
@@ -388,9 +375,7 @@ impl<O: ObjectStore> Writer<O> {
             if batch.is_empty() {
                 return;
             }
-            for part in self.core.parts(batch) {
-                budget = self.apply(part, budget).await;
-            }
+            budget = self.apply(batch, budget).await;
         }
     }
 
@@ -418,16 +403,6 @@ impl<O: ObjectStore> Writer<O> {
                     let at = owner[conflict.index.min(owner.len() - 1)];
                     let (key, _) = batch.remove(at);
                     self.core.conflicted(&key);
-                }
-                Err(StoreError::Fenced) if self.core.fence_seen() => {
-                    // Refused whole, which wrote nothing and costs the step nothing: the
-                    // rows come back, and the next try (in this step, if it has budget
-                    // left, so a last step before a stop gets there too) sends the ones
-                    // this writer may still write on their own.
-                    for (key, row) in batch {
-                        self.core.enqueue(key, row);
-                    }
-                    return budget + 1;
                 }
                 Err(_) => {
                     self.core.index_failed = true;
@@ -501,30 +476,6 @@ impl<O: ObjectStore> Writer<O> {
 }
 
 impl Core {
-    /// Notes a fenced refusal and says whether it is the first one of a writer that can
-    /// still write rows of its own: the batch is then tried again, split. A refusal of a
-    /// writer with nothing exempt, or of a batch already split, is a failed write.
-    fn fence_seen(&mut self) -> bool {
-        let first = !self.fenced && self.index.is_exempting();
-        self.fenced = true;
-        first
-    }
-
-    /// `batch` as the transactions it is sent in: one, or after a fenced refusal two,
-    /// the rows this writer may write around the fence first, then the rest.
-    fn parts(&self, batch: Vec<(String, Row)>) -> Vec<Vec<(String, Row)>> {
-        if !self.fenced {
-            return vec![batch];
-        }
-        let (own, rest): (Vec<_>, Vec<_>) = batch
-            .into_iter()
-            .partition(|(key, row)| row.permitted(key, &|op| self.index.exempts(op)));
-        [own, rest]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect()
-    }
-
     /// Takes the queued events into the invocations' chunks.
     fn take_events(&mut self, now_ms: u64) {
         self.minter.forget_before(Day::from_ms(now_ms));

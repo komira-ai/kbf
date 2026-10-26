@@ -39,8 +39,7 @@ The SQLite file is never changed by any of them.
 
 1. **Find the setting.** The frontend takes `--state-store` from the `state-store` key under
    `[scheduler]` in its `kbf.toml` (on a host set up by `kbf-installer setup`,
-   `/etc/kbf/kbf.toml`; on an all-in-one host, `/etc/kbf/frontend.toml`, the frontend's own
-   file), or from a `--state-store=sqlite://<path>` flag on the command line in the unit file
+   `/etc/kbf/kbf.toml`, an all-in-one host's included), or from a `--state-store=sqlite://<path>` flag on the command line in the unit file
    or in a drop-in of it (`/etc/systemd/system/<unit>.d/*.conf`). **A flag on the command line
    overrides the key.** Look in both places: `systemctl cat <unit>` shows the unit and its
    drop-ins, and `kbf.toml` shows the key. If the command line has `--state-store=`, that
@@ -50,10 +49,10 @@ The SQLite file is never changed by any of them.
    file it is given; a cutover of the key while the flag is on the command line changes
    nothing the frontend reads.
 
-   **Take out `--handover-socket` first.** A frontend that hands over (a `handover-socket`
-   key under `[handover]` in its `kbf.toml`, or a `--handover-socket` flag) refuses a
-   `postgres://` store and does not start. The tool does not look for it: remove it by hand
-   before the dry run.
+   **Take out `--handover-socket` anyway.** The frontend no longer hands over: a
+   `handover-socket` key under `[handover]` in its `kbf.toml`, or a `--handover-socket` flag,
+   is accepted and ignored with a warning, and it no longer stops a `postgres://` store from
+   starting. The tool does not look for it: remove it by hand so the warning goes.
 
    The dry run below names the file and the old and new value of the setting; it refuses a
    file whose setting does not name the state file you are copying.
@@ -141,6 +140,52 @@ Builds that were accepted in that time are not known to the rolled-back frontend
 clients must send them again. After a rollback the Postgres store still holds the copy: to
 cut over again, drop its schema and set it up again first, because the copy refuses a store
 that holds data.
+
+## Moving to frontends that share the store
+
+A frontend of this release that opens a Postgres store takes no writer generation. It makes
+sure the store's `meta/generation` row holds the marker `shared-writers` instead, and any
+number of frontends can then open the same database and serve at once: none fences another.
+A frontend of an earlier release took the next generation at every start and checked it on
+every write, so a second one over the same database stopped the first.
+
+**This is a cold cutover, and it happens at the first start of this release on a database.**
+The marker is written once, by whichever frontend opens first; frontends that open together
+agree (the write is conditional on the row they read), and a store that already holds the
+marker is left as it is. Do it in this order:
+
+1. **Stop every frontend of an earlier release that uses the database**: each `kbf frontend`
+   and `kbf all-in-one` unit, and any process of an earlier release started with
+   `--admin-listen` (a candidate waiting for a takeover included). Check that each unit says
+   `inactive`.
+2. **Back up the database** (the `kbf_state` schema). The marker is not undone by going back to
+   an earlier binary: see "If a frontend of an earlier release is started" below. The backup
+   is the way back.
+3. **Start the first frontend of this release.** Its open replaces the generation row (an
+   8-byte number, or no row on a new database; a database copied by `kbf-state-copy` carries
+   the SQLite file's number) with the marker. The epoch is not touched, so the daemons that
+   reconnect keep the leases they hold.
+4. **Start the others.** They find the marker and write nothing to the row.
+
+**If a frontend of an earlier release is started after the marker is written**, it does not
+start: it reads the row as `the generation row is not an 8-byte number` and exits. One that is
+still running when the marker is written is refused by the store at its next write
+(`state store fenced`) and stops serving; this is why step 1 comes first, so that no build is
+cut short by it. To go back to an earlier release, restore the backup of step 2 (the writes
+made since are lost, as after a rollback above).
+
+A frontend of this release serves no admin port and has no takeover: it holds no generation
+to hand over.
+
+**The proxy's slot supervision was removed.** It started every child as a candidate
+(`--await-takeover`) and then called `takeover`. A frontend of this release accepts and
+ignores `--await-takeover` and serves no admin calls, and the proxy of this release refuses
+a `[proxy.upstream]` table. Run each frontend over a Postgres store under its own unit,
+without `--await-takeover`, give the proxy a `[[proxy.frontend]]` table for each, and update
+them one at a time with `kbf-updater` ([kbf-updater.md](kbf-updater.md)).
+
+A SQLite state file is held by one process. This release writes no generation to it; a
+number an earlier release left in it is not changed.
 
 ## What the cutover does, and what it refuses
 

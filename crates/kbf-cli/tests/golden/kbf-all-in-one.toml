@@ -129,9 +129,10 @@ reapi-max-streams = 10000
 # Retired: no longer read, the release poller was removed. Accepted and ignored for one release
 # (not in --help)
 # release-poll-repo = "OWNER/NAME"
-# The release store (`docs/design/pull-updates.md`, section 6): a directory where the tarballs of a release and their build attestations are kept, uploaded with `PUT /v1/releases/{commit}/{platform}/{name}` on the operator API (which needs the token) and fetched by the nodes through `ReleaseService.Fetch` on the worker listener, behind its mutual TLS. Made if missing. Without it every update endpoint answers 503 saying so
+# Retired: no longer read, the release store was removed; a directory left there is not touched. Accepted and ignored for one release
+# (not in --help)
 # releases-dir = "DIR"
-# How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done. Buck2 never recovers a stream that breaks mid-action, so the default, 0, is no deadline; set one at least as long as the longest action. When it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off)
+# How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done; the exception is a stream whose operation was never started and that no worker on this frontend can run (say every capable worker is cordoned) and no other frontend can take, which ends UNAVAILABLE as the drain begins, since that action would fail at the deadline anyway (Buck2 retries only the opening of a call). The operation stays queued. On a frontend over a state store, `--drain-deadline` bounds the wait in any case; this flag bounds it earlier. Buck2 never recovers a stream that breaks mid-action, so the default, 0, is no deadline; set one at least as long as the longest action. When it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off)
 shutdown-timeout-secs = 0
 # How often, in seconds, a TLS listener looks at its certificate, key and client CA files (the `--*-tls-cert`, `--*-tls-key` and `--*-client-ca` flags). A change is applied to the next TLS handshake, with no restart and without ending a connection already open: renew a certificate by replacing the files. Files that do not make a working configuration (unreadable, not PEM, a key that is not the certificate's, an expired certificate, a renewal caught between its two writes) are logged and counted in `kbf_tls_reloads_total{outcome="rejected"}`, and the previous files keep serving; the next look finds them whole and applies them. The files must be good at start
 tls-reload-interval-secs = 30
@@ -196,6 +197,26 @@ segment-upload-streams = 16
 # How many segment uploads of one action's outputs are in flight at once: the server checks and stages one upload while the next are sending (`docs/design/write-path.md`, section 4.1). Their `PutRange` calls still take permits of `--transfer-in-flight`'s uploads' share
 segment-uploads-in-flight = 4
 
+[packs]
+# Reads the blobs of a lease from the packs of the farm's object store before the storage nodes: the daemon asks the frontend where a blob lies (over the connection to `--cas`; for `kbf storage-and-daemon`, which has none, over one to the first `--server`), reads that range of that pack and checks it against the digest. A blob the frontend does not locate, and a frontend that serves no locations (it was started without `--pack-index`), leave the read where it was, and outputs are stored where they were. A pack that is gone, or whose bytes are not the digest, fails the read. Needs `--pack-store-endpoint`, `--pack-store-bucket` and `--pack-store-credentials-file`. Refused by `kbf all-in-one` and by `kbf storage-and-daemon` started without `--frontend`, whose daemon half reads blobs in-process. Left out, no object store is built or contacted and every blob is read as it always was
+pack-read = false
+# The most bytes of blobs `--pack-read-cache-dir` holds
+# pack-read-cache-bytes = "BYTES"
+# A directory this process owns where the blobs read from packs are kept, one file each, checked by digest on every read; the least recently used are removed to stay within `--pack-read-cache-bytes`. The daemon's input cache already keeps blobs by digest, so left out nothing more is kept. Needs `--pack-read-cache-bytes`
+# pack-read-cache-dir = "DIR"
+# The bucket of `--pack-store-endpoint` that holds the packs, under the keys `cas/`. Needs `--pack-read`
+# pack-store-bucket = "BUCKET"
+# A file with the key pair for `--pack-store-endpoint`, as JSON `{"access_key_id": "...", "secret_access_key": "..."}`, readable by its owner alone (mode 0600 or 0400): a key that may read the objects under `cas/` and write none (`--pack-write` has a key of its own). The secret is never a flag: a command line is world-readable. Needs `--pack-read`
+# pack-store-credentials-file = "PATH"
+# The S3-compatible object store the packs are kept in, as `http://host:port`. The daemon reads packs from it, and with `--pack-write` writes them. Needs `--pack-read`
+# pack-store-endpoint = "URL"
+# The region the requests to `--pack-store-endpoint` are signed for; `us-east-1` if left out
+pack-store-region = "us-east-1"
+# A file with the key pair `--pack-write` writes with, in the form of `--pack-store-credentials-file`: a key that may create objects under `cas/` (it also deletes the one it creates to check the store at start, and if it may not, that object is left for garbage collection). The secret is never a flag. Needs `--pack-write`
+# pack-store-write-credentials-file = "PATH"
+# Writes the outputs of a lease into packs: many blobs in one object of the pack store, written with a create-only request, then committed to the frontend (`CommitPack`), which records them before the put is acknowledged. Used only while the frontend says it takes commits (it has `--pack-index` and the pack store flags); a blob that cannot be packed is stored where it was. At start the daemon checks that the store refuses to replace an object, and refuses to start if it does not. Needs `--pack-read` and `--pack-store-write-credentials-file`. Left out, outputs are stored as they always were
+pack-write = false
+
 [scheduler]
 # The OS and architecture, as `<os>/<arch>` (`linux` or `macos`; `x86_64` or `arm64`), of an action whose platform names no OS, no architecture and no ISA level, so that it is not given to whichever node sorts first, a Mac among them. Not applied to an action that asks for `xcode` or an iOS device, which only a Mac reports. `none` applies no default: such an action runs on any node that fits. Placement only: the action's digest and cache key do not change
 default-platform = "linux/x86_64"
@@ -209,6 +230,8 @@ input-tree-cache-bytes = 268435456
 input-tree-cache-entries = 1048576
 # The most Directory blobs the input check reads from the store at once, across all Executes
 input-tree-reads-in-flight = 64
+# Opens the pack index at start: the tables in the Postgres state store that say which pack holds each blob and where. A frontend given `--pack-store-endpoint` reads and writes them; without it nothing does, and the flag only checks that the store can hold them. Needs `--state-store` as a `postgres://` URL whose schema has the pack tables (`kbf-installer setup` makes them); a `sqlite://` store is refused. Left out, no pack table is touched
+pack-index = false
 # How often, in seconds, every open Execute and WaitExecution stream is sent its operation again (same name, not done, current stage), so a load balancer's idle timeout never cuts a long action. 0 sends none
 progress-interval-secs = 30
 # How long, in milliseconds, `GET /readyz` on the operator API and the REAPI listener's `grpc.health.v1` service wait for the object store to answer their read-only probe before they answer not ready
@@ -217,6 +240,10 @@ readyz-store-timeout-ms = 2000
 # state-store = "URI"
 # How long, in seconds, queued work waits while no connected daemon can run it (none satisfies its platform, or none that does is large enough) before it is refused FAILED_PRECONDITION. The wait restarts whenever one can
 unservable-wait-secs = 300
+# The cores a node that reports VM slots (`vm.slots`) keeps for the host itself: subtracted from the CPUs placement may book on it, so that guests cannot take the host's own share. A node that reports none books the whole machine
+vm-host-floor-cpus = 2
+# The memory, in GiB, a node that reports VM slots (`vm.slots`) keeps for the host itself, subtracted as `--vm-host-floor-cpus` subtracts cores
+vm-host-floor-mem-gib = 8
 
 [storage-client]
 # Proxy mode (`docs/design/architecture-v2.md`, section 7): the URL of a storage node (`kbf storage`), such as `http://127.0.0.1:8990`. The REAPI listener then answers a client's CAS, ByteStream and action-cache calls from that node, passing ByteStream through without holding a blob. The local stores are still opened: Execution and the worker listener use them (`kbf frontend` is this mode without them: Execution reads the node too). Plain text (`http://`) only here; `kbf frontend` takes the flags of the mutual TLS to the node. Without it, the server answers those calls itself

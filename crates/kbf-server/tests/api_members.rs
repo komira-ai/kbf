@@ -58,6 +58,7 @@ fn listeners() -> Listeners {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -89,7 +90,6 @@ fn start(state: Option<StateStore>) -> Server {
         listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         token: None,
         local_cache: None,
-        releases: None,
     };
     let bound = bind_server_with_state(
         Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory()),
@@ -633,10 +633,10 @@ async fn members_is_read_like_nodes_and_takes_no_write() {
 }
 
 /// The reads of `(update/desired, deny/)` the server makes by itself as it starts, with no
-/// release store: nothing reads `update/desired`, and the sweeper's refresh reads `deny/`
-/// ([`looks::Looks`]). A test that arms a fault first
+/// release store: nothing reads `update/desired`, and `deny/` is read twice: by the refresh the
+/// start makes before it serves, and by the sweeper's first refresh ([`looks::Looks`]). A test that arms a fault first
 /// waits for them; the test at the end holds the numbers.
-const START_LOOKS: (usize, usize) = (0, 1);
+const START_LOOKS: (usize, usize) = (0, 2);
 
 /// A server whose state store is the hooked fake, which the test makes fail.
 fn failing(hooked: &Arc<Hooked>) -> Server {
@@ -725,4 +725,59 @@ async fn the_server_reads_the_store_by_itself_only_at_start() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(looks.seen(), START_LOOKS);
     assert_eq!(every_read.load(Ordering::SeqCst), at_start);
+}
+
+/// Catches: a store written by an older build, which holds `update/*` rows of every kind it
+/// wrote (the run and its counter, the policy, hosts, the places in use, an order counter and
+/// a proposal), that the server cannot start on or reads and changes: the server starts over
+/// it, answers, and leaves every update row exactly as it was. The routes that read the run
+/// are gone, so they answer 404 rather than from the rows.
+#[tokio::test]
+async fn a_store_holding_old_update_rows_starts_serves_and_leaves_them_alone() {
+    let hooked = Hooked::new();
+    let old: [(&str, &[u8]); 8] = [
+        ("update/desired", &[0x08, 0x01, 0x12, 0x02, 0x76, 0x32]),
+        ("update/generation", &[0x03]),
+        ("update/order/0000000000000001", &[]),
+        (
+            "update/proposed/0123456789abcdef0123456789abcdef01234567",
+            &[0x0a, 0x02, 0x76, 0x32],
+        ),
+        ("update/policy", &[0x08, 0x01, 0x20, 0x02]),
+        (
+            "update/slot",
+            &[0x0a, 0x08, 0x0a, 0x02, 0x73, 0x31, 0x10, 0x05, 0x18, 0x01],
+        ),
+        ("update/host/s1", &[0x08, 0x0d, 0x10, 0x09, 0x30, 0x07]),
+        ("update/host/d1", &[0x08, 0x01]),
+    ];
+    for (key, bytes) in old {
+        hooked
+            .fake
+            .txn(Txn::new().put(key, bytes.to_vec(), Cond::Absent))
+            .expect("store")
+            .expect("a new row");
+    }
+    let looks = looks::Looks::count(&hooked);
+    let server = failing(&hooked);
+    looks.done(START_LOOKS).await;
+    assert_eq!(members(server.api).await, empty());
+    for gone in ["/v1/update", "/v1/update/desired", "/v1/update/pause"] {
+        let (code, _, body) = http(server.api, "GET", gone, "").await;
+        assert_eq!(code, 404, "{gone}: {body}");
+    }
+    let mut held: Vec<(String, Vec<u8>)> = hooked
+        .fake
+        .scan_prefix("update/")
+        .expect("scan")
+        .into_iter()
+        .map(|(key, row)| (key, row.value))
+        .collect();
+    let mut want: Vec<(String, Vec<u8>)> = old
+        .iter()
+        .map(|(key, bytes)| ((*key).to_owned(), bytes.to_vec()))
+        .collect();
+    held.sort();
+    want.sort();
+    assert_eq!(held, want);
 }

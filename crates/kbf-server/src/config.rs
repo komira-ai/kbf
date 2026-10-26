@@ -14,7 +14,7 @@ use clap::{Parser, ValueEnum};
 use kbf_front::WriteConfig;
 use kbf_objstore::Capabilities;
 use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
-use kbf_tls::{TlsError, TlsFiles, TlsSource};
+use kbf_tls::{Alpn, TlsError, TlsFiles, TlsSource};
 
 use kbf_auth::{AllowAuthorizer, Authorizer, Policy, PolicyError};
 use kbf_front::SegmentsConfig;
@@ -26,6 +26,7 @@ use crate::proxy_auth::{ProxySecret, ProxySecretError};
 use crate::serve::{Api, Behind, Listeners, StreamTiming, WorkerTls};
 use crate::stores::{S3Uri, StoreFlags, StoreUri, Stores, StoresError};
 use crate::token::{ApiToken, TokenFileError};
+use crate::worker::HostFloor;
 
 /// The default of `--tls-reload-interval-secs`.
 const DEFAULT_TLS_RELOAD_SECS: u64 = 30;
@@ -198,14 +199,6 @@ pub struct Args {
     /// are refused.
     #[arg(long, requires = "api_listen")]
     pub api_token_file: Option<PathBuf>,
-    /// The release store (`docs/design/pull-updates.md`, section 6): a directory where the
-    /// tarballs of a release and their build attestations are kept, uploaded with
-    /// `PUT /v1/releases/{commit}/{platform}/{name}` on the operator API (which needs the
-    /// token) and fetched by the nodes through `ReleaseService.Fetch` on the worker
-    /// listener, behind its mutual TLS. Made if missing. Without it every update endpoint
-    /// answers 503 saying so.
-    #[arg(long, value_name = "DIR", requires = "api_listen")]
-    pub releases_dir: Option<PathBuf>,
     /// Serves the build pages (`GET /v1/invocations/{id}` and below) and the blob route
     /// (`GET /v1/blobs/{digest}`) on the operator API to every caller the REAPI policy
     /// accepts, with no `invocations` or `blobs` key in the policy file
@@ -310,6 +303,15 @@ pub struct Args {
         default_values_t = kbf_sched::MemoryLadder::DEFAULT_GIB
     )]
     pub memory_ladder_gib: Vec<u64>,
+    /// The cores a node that reports VM slots (`vm.slots`) keeps for the host itself:
+    /// subtracted from the CPUs placement may book on it, so that guests cannot take the
+    /// host's own share. A node that reports none books the whole machine.
+    #[arg(long, default_value_t = 2)]
+    pub vm_host_floor_cpus: u64,
+    /// The memory, in GiB, a node that reports VM slots (`vm.slots`) keeps for the host
+    /// itself, subtracted as `--vm-host-floor-cpus` subtracts cores.
+    #[arg(long, default_value_t = 8)]
+    pub vm_host_floor_mem_gib: u64,
     /// What the farm does with `kbf-estimator`, which predicts an action's memory from
     /// what its earlier runs used. `off` calls it never. `shadow` shows it every attempt
     /// that finishes and logs, for every new operation, a `size estimate:` line with what
@@ -339,8 +341,13 @@ pub struct Args {
     pub finished_retention_secs: u64,
     /// How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to
     /// finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and
-    /// sends GOAWAY, and every open Execute and WaitExecution stream stays open until
-    /// its action is done. Buck2 never recovers a stream that breaks mid-action, so the
+    /// sends GOAWAY, and every open Execute and WaitExecution stream stays open until its
+    /// action is done; the exception is a stream whose operation was never started and
+    /// that no worker on this frontend can run (say every capable worker is cordoned) and
+    /// no other frontend can take, which ends UNAVAILABLE as the drain begins, since that
+    /// action would fail at the deadline anyway (Buck2 retries only the opening of a call). The operation stays queued. On a
+    /// frontend over a state store, `--drain-deadline` bounds the wait in any case; this
+    /// flag bounds it earlier. Buck2 never recovers a stream that breaks mid-action, so the
     /// default, 0, is no deadline; set one at least as long as the longest action. When
     /// it runs out, the open streams end UNAVAILABLE (a client still uploading is cut
     /// off).
@@ -581,9 +588,9 @@ pub struct Args {
     /// Build history: `--history-objects` and `--history-index-root`.
     #[command(flatten)]
     pub history: crate::history::HistoryFlags,
-    /// The retired release poller's flags: accepted, hidden, ignored.
+    /// The retired release poller's and release store's flags: accepted, hidden, ignored.
     #[command(flatten)]
-    pub release_poll: crate::retired::RetiredPollFlags,
+    pub retired_release: crate::retired::RetiredReleaseFlags,
     /// Serves the web UI on the operator API (`--api-listen`): read-only pages under `/ui`
     /// (`docs/design/kbf-ui-v1.md`). On by default; `--ui=false` turns it off, and `/ui` is
     /// then a `404`. The UI is open: it asks for no login or certificate, and it shows
@@ -602,6 +609,14 @@ pub struct Args {
         value_name = "BOOL"
     )]
     pub ui: bool,
+    /// Opens the pack index at start: the tables in the Postgres state store that say which
+    /// pack holds each blob and where. A frontend given `--pack-store-endpoint` reads and
+    /// writes them; without it nothing does, and the flag only checks that the store can hold
+    /// them. Needs `--state-store` as a `postgres://` URL whose schema has the pack tables
+    /// (`kbf-installer setup` makes them); a `sqlite://` store is refused. Left out, no pack
+    /// table is touched
+    #[arg(long)]
+    pub pack_index: bool,
 }
 
 /// This server in the tier registry. A farm runs one server today
@@ -645,13 +660,6 @@ pub enum ConfigError {
          --worker-client-ca) or --proxy-auth-file"
     )]
     DenyListWithoutIdentity,
-    /// The release store's directory cannot be made.
-    #[error("--releases-dir {dir}: {source}", dir = dir.display())]
-    Releases {
-        dir: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     /// The REAPI policy file cannot be read.
     #[error("--reapi-auth-policy: read {path}: {source}")]
     PolicyRead {
@@ -782,7 +790,9 @@ impl Args {
             &self.worker_client_ca,
         ) {
             (Some(cert), Some(key), Some(ca)) => Some(WorkerTls {
-                server: TlsSource::files(
+                // HTTP/1.1 as well as h2: a host's updater makes its node calls over it
+                // (`crate::node_self`).
+                server: TlsSource::files_alpn(
                     "worker",
                     TlsFiles {
                         cert: cert.clone(),
@@ -790,6 +800,7 @@ impl Args {
                         client_ca: Some(ca.clone()),
                     },
                     reload,
+                    Alpn::H2AndHttp1,
                 )?,
                 deny_list: deny_list.clone(),
             }),
@@ -821,6 +832,7 @@ impl Args {
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
             default_platform: self.default_platform,
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
+            vm_host_floor: HostFloor::new(self.vm_host_floor_cpus, self.vm_host_floor_mem_gib),
             learned_sizes: self.learned_sizes,
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {
@@ -944,21 +956,10 @@ impl Args {
             .map(ApiToken::from_file)
             .transpose()?;
         let local_cache = self.local_cache.clone();
-        let releases = self
-            .releases_dir
-            .as_deref()
-            .map(|dir| crate::release::ReleaseStore::open(dir, crate::release::Limits::default()))
-            .transpose()
-            .map_err(|source| ConfigError::Releases {
-                dir: self.releases_dir.clone().unwrap_or_default(),
-                source,
-            })?
-            .map(Arc::new);
         Ok(Some(Api {
             listen,
             token,
             local_cache,
-            releases,
         }))
     }
 

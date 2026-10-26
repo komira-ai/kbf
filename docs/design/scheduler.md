@@ -294,7 +294,8 @@ result for one. What the code does today:
 A frontend schedules onto the daemons connected to it, and the store decides, by the
 conditional writes above, which frontend runs an operation. Each frontend also looks at the
 store every `INTAKE_POLL` (200 ms) to learn what the others did. A farm with no state store,
-one a handover fenced, and one whose store cannot be read do nothing at a poll.
+one a retire fenced (`POST /v1/frontend/retire`), and one whose store cannot be read do
+nothing at a poll.
 
 - **A start.** A starting frontend takes up the operations that wait for a lease and none
   that holds one: the lease belongs to the frontend its node is connected to, and is taken
@@ -317,7 +318,7 @@ one a handover fenced, and one whose store cannot be read do nothing at a poll.
   for the finished retention, as the callers of an operation this frontend finished do.
   Callers who all cancelled are not followed. An operation the store has no trace of (its
   `done/` row outlived the retention) leaves its callers waiting and is reported as an
-  untraced operation, as for a handover.
+  untraced operation, as for the callers of a retired frontend.
 - **Joining.** A request for an action the store holds an operation of (its `inflight/`
   row) joins that operation. If it is queued, or holds a lease on a node this frontend owns,
   the frontend takes it up and the request is a caller of its own scheduler. If it holds a
@@ -381,8 +382,7 @@ A client that submitted through one frontend can ask any other for the result.
   Any other answers from the store: the `op/` and `queue/` rows say it is queued or running
   (executing, once a lease is held), and the `done/` row holds its result. The channel the
   answer is made on is looked at again at every intake poll (`Progress`, the look
-  `Farm::follow` and the handover's `Handed::look` make for the callers of an operation they
-  did not run), until it shows the result, and is dropped when no stream or call holds it. A
+  `Farm::follow` makes for the callers of an operation it did not run), until it shows the result, and is dropped when no stream or call holds it. A
   store that cannot be read, or has no trace of the operation, answers NOT_FOUND.
 - **Whose result it is.** A call is authorized against the instance name the operation was
   submitted under, and a `done/` row holds only the response. The transaction that finishes
@@ -399,8 +399,18 @@ A client that submitted through one frontend can ask any other for the result.
   `WaitExecution`. It is the only call of the `Operations` service the server serves; the
   others are UNIMPLEMENTED.
 
-Not done yet: a frontend still takes the writer generation at its start, so a second
-frontend over the store supersedes the first.
+**No frontend takes the writer generation.** A frontend that opens a Postgres store
+(`StateStoreUri::open`) writes the marker `kbf_state::SHARED_WRITERS` to `meta/generation`
+instead (an absent-only write for a store with no row, a write conditional on the version read
+for one that holds a generation, nothing for one that holds the marker), so any number of
+frontends open the store and none fences another. The marker is not eight bytes, so a build
+that takes generations reads the row as corrupt and refuses to start on the store; the writes
+of such a build that is still running are refused by the marker. The scheduler's writes are
+kept apart by the rows they read, as the sections above say. The move from generations to the
+marker is a cold cutover: every frontend that takes generations is stopped before the first one
+that does not is started (see
+[the state-store cutover](../deploy/state-store-cutover.md#moving-to-frontends-that-share-the-store)).
+A SQLite file is held by one process, so only one frontend can open it, and it takes no generation either.
 
 ### Node phases
 

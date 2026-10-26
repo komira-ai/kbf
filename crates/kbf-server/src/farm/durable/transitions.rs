@@ -338,6 +338,29 @@ impl Durable {
         }
     }
 
+    /// The capabilities and capacity of every daemon the session rows list that is not in
+    /// `connected` (the nodes of this frontend): the daemons of the other frontends of the
+    /// state store, each renewed by the frontend it is connected to.
+    ///
+    /// # Errors
+    /// The store cannot be read, or a session row is not a daemon's registration.
+    pub(super) fn remote_sessions(
+        &self,
+        connected: &std::collections::BTreeSet<WorkerId>,
+    ) -> Result<Vec<(kbf_caps::NodeCaps, kbf_types::Resources)>, StateError> {
+        let mut remote = Vec::new();
+        for (key, row) in self.store.scan_prefix(SESSION)? {
+            if connected.contains(&WorkerId::new(&key[SESSION.len()..])) {
+                continue;
+            }
+            let FarmInput::WorkerUp { capacity, caps, .. } = decode(&key, &row.value)? else {
+                return Err(corrupt(&key, "not a daemon registration"));
+            };
+            remote.push((caps, capacity));
+        }
+        Ok(remote)
+    }
+
     /// Whether a daemon session in the store, of any frontend, could run `request`: the
     /// session rows hold each connected daemon's capabilities and capacity, written by the
     /// frontend it is connected to, and expire unless that frontend renews them. An

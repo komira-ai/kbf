@@ -161,6 +161,7 @@ fn start_with_prefix(prefix: &str) -> Server {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -194,7 +195,6 @@ fn start_on(prefix: &str, listeners: Listeners) -> Server {
         listen: loopback,
         token: None,
         local_cache: None,
-        releases: None,
     };
     let (stop, stopped) = oneshot::channel::<()>();
     let shutdown = async move {

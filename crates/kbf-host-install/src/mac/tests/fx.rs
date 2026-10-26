@@ -162,6 +162,7 @@ impl Fx {
         write(&host.daemon_plist, 0o644, b"<plist/>");
         write(&host.daemon_config, 0o644, b"mode = \"daemon\"\n");
         write(&host.gh, 0o755, b"gh");
+        write(&host.curl, 0o755, b"curl");
         write(&host.trusted_root, 0o644, b"{}");
 
         let channel_dir = dir.join("channel");
@@ -339,7 +340,7 @@ pub struct Sim {
     /// The answer to `sudo`.
     pub sudo: RefCell<Option<io::Result<Exec>>>,
     pub before: RefCell<Option<Hook>>,
-    /// GitHub: the pages of the releases listing (the JSON `gh api` prints, one text per
+    /// GitHub: the pages of the releases listing (the JSON the API prints, one text per
     /// page), and the files each release (by tag) has, by asset name.
     pub pages: RefCell<Vec<String>>,
     pub assets: RefCell<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
@@ -511,9 +512,48 @@ impl Sim {
 }
 
 impl Sim {
-    /// `gh api repos/<repo>/releases?per_page=N&page=P`: page P of the scripted listing, an
-    /// empty one past the last.
-    fn gh_api(&self, cmd: &Cmd) -> io::Result<Exec> {
+    /// `curl --include ... --url https://api.github.com/repos/<repo>/releases?per_page=N&page=P`:
+    /// the response with page P of the scripted listing, an empty one past the last. The
+    /// broken kinds are answers of GitHub with a status that is not 200 ("list-http": a 500;
+    /// "list-rate": the exhausted rate limit as the API prints it, with the reset time;
+    /// "list-rate-wait": a secondary limit, which asks for a wait; "list-rate-message": a
+    /// 403 that only the message says is a limit; "list-forbidden": a 403 that is not one;
+    /// "list-interim": a `100 Continue` before the page) and "list-nohttp", which is no
+    /// response at all.
+    fn curl_list(&self, cmd: &Cmd) -> io::Result<Exec> {
+        let response = |status: &str, headers: &str, body: &str| {
+            exec(0, &format!("HTTP/2 {status}\r\n{headers}\r\n{body}"), "")
+        };
+        if self.is_broken("list-http") {
+            return response("500 ", "", "{\"message\":\"Server Error\"}");
+        }
+        if self.is_broken("list-rate") {
+            return response(
+                "403 ",
+                "x-ratelimit-limit: 60\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: 1790000000\r\n",
+                "{\"message\":\"API rate limit exceeded for your address.\"}",
+            );
+        }
+        if self.is_broken("list-rate-wait") {
+            return response("429 ", "Retry-After: 60\r\n", "{}");
+        }
+        if self.is_broken("list-rate-message") {
+            return response(
+                "403 ",
+                "x-ratelimit-remaining: 12\r\n",
+                "{\"message\":\"You have exceeded a secondary rate limit.\"}",
+            );
+        }
+        if self.is_broken("list-forbidden") {
+            return response(
+                "403 ",
+                "x-ratelimit-remaining: 12\r\n",
+                "{\"message\":\"Forbidden\"}",
+            );
+        }
+        if self.is_broken("list-nohttp") {
+            return exec(0, "<html>not a response</html>", "");
+        }
         if self.is_broken("list-timeout") {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -524,15 +564,30 @@ impl Sim {
             return exec(1, "", "error connecting to api.github.com");
         }
         if self.is_broken("list-junk") {
-            return exec(0, "<html>not json</html>", "");
+            return response("200 ", "", "<html>not json</html>");
         }
-        let page: usize = cmd.args[1]
+        let page: usize = cmd
+            .args
+            .last()
+            .expect("the url")
             .rsplit("page=")
             .next()
             .and_then(|n| n.parse().ok())
             .expect("a page number");
         let pages = self.pages.borrow();
-        exec(0, pages.get(page - 1).map_or("[]", String::as_str), "")
+        let interim = if self.is_broken("list-interim") {
+            "HTTP/1.1 100 Continue\r\n\r\n"
+        } else {
+            ""
+        };
+        exec(
+            0,
+            &format!(
+                "{interim}HTTP/2 200 \r\ncontent-type: application/json\r\n\r\n{}",
+                pages.get(page - 1).map_or("[]", String::as_str)
+            ),
+            "",
+        )
     }
 
     /// `gh release download <tag> --repo R --pattern A --pattern B --dir D`: writes the
@@ -662,9 +717,7 @@ impl Runner for Sim {
                 .borrow_mut()
                 .take()
                 .unwrap_or_else(|| Err(io::Error::other("no sudo reply"))),
-            program if Path::new(program) == self.host.gh && first == Some("api") => {
-                self.gh_api(cmd)
-            }
+            program if Path::new(program) == self.host.curl => self.curl_list(cmd),
             program if Path::new(program) == self.host.gh && first == Some("release") => {
                 self.gh_download(cmd)
             }

@@ -186,7 +186,7 @@ pub(crate) struct Accepted {
 pub(crate) enum Acceptor {
     /// The TLS terminator: what the proxy runs with.
     Tls(Arc<TlsReloader>),
-    /// HTTP/2 in the clear, for the tests that exercise routing, holding and auth and need no
+    /// HTTP/2 in the clear, for the tests that exercise routing and auth and need no
     /// handshake; the identity it gives every connection is the one the test wants a
     /// verified certificate to have had. It is not compiled into the binary.
     #[cfg(test)]

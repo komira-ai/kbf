@@ -188,7 +188,9 @@ fn a_scan_that_reads_each_row_on_its_own_fails_c8() {
     c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanReadsPerRow));
 }
 
-// The two error types say what failed.
+/// Asserts that each error says what failed: a conflict names its operation and key, a
+/// failure carries the backend's words, and a refusal as superseded says the handle is no
+/// longer the writer.
 #[test]
 fn errors_say_what_failed() {
     let conflict = kbf_state::Conflict {
@@ -201,4 +203,8 @@ fn errors_say_what_failed() {
     );
     let failure = kbf_state::StoreError::Failed("disk full".to_owned());
     assert_eq!(failure.to_string(), "state store failure: disk full");
+    assert_eq!(
+        kbf_state::StoreError::Fenced.to_string(),
+        "state store fenced: this handle is no longer the writer"
+    );
 }

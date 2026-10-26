@@ -9,8 +9,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::kit::{CAPS, Rig, Script, read_all, script};
+use super::kit::{CAPS, Script, read_all, script};
 use super::pki::client_config;
+use super::pool_kit::Rig;
 use super::secure::{connect_tls, tls_rig};
 use crate::auth::Buck2Auth;
 
@@ -52,10 +53,10 @@ fn page(seen: &Seen) -> Script {
     })
 }
 
-/// A plain rig whose children are [`page`]s; `/ui` is served only if `ui` (the `ui` key of the
+/// A plain rig whose child is a [`page`]; `/ui` is served only if `ui` (the `ui` key of the
 /// `[proxy]` table).
-async fn rig(seen: &Seen, ui: bool) -> Rig {
-    let rig = Rig::start(page(seen), page(&Seen::default())).await;
+fn rig(seen: &Seen, ui: bool) -> Rig {
+    let rig = Rig::start(&[page(seen)]);
     rig.core.ui.store(ui, Ordering::Release);
     rig
 }
@@ -73,7 +74,7 @@ fn recorded(seen: &Seen) -> Vec<(String, String)> {
 #[tokio::test(start_paused = true)]
 async fn the_ui_is_open_and_reaches_the_child_whole() {
     let seen = Seen::default();
-    let rig = rig(&seen, true).await;
+    let rig = rig(&seen, true);
     let mut client = rig.client().await;
     client.bearer = None;
     let targets = [
@@ -112,13 +113,13 @@ async fn the_ui_is_open_and_reaches_the_child_whole() {
 #[tokio::test(start_paused = true)]
 async fn each_browser_is_known_to_the_child_by_its_own_address() {
     let seen = Seen::default();
-    let rig = rig(&seen, true).await;
+    let rig = rig(&seen, true);
     for (ip, path) in [("192.0.2.10", "/ui/runs/a"), ("198.51.100.4", "/ui/runs/b")] {
         let mut client = rig.client_from(ip.parse().expect("an address")).await;
         client.bearer = None;
         let reply = client.plain("GET", path, b"").await;
         assert_eq!(reply.status, Some(200), "{path}");
-        let headers = rig.a.state.headers_of(path);
+        let headers = rig.a().state.headers_of(path);
         assert_eq!(headers.len(), 1, "{path}");
         assert_eq!(
             headers[0].get("x-kbf-client-addr").map(|v| v.as_bytes()),
@@ -136,7 +137,7 @@ async fn each_browser_is_known_to_the_child_by_its_own_address() {
 #[tokio::test(start_paused = true)]
 async fn a_write_to_the_ui_is_refused_at_the_proxy() {
     let seen = Seen::default();
-    let rig = rig(&seen, true).await;
+    let rig = rig(&seen, true);
     let mut client = rig.client().await;
     client.bearer = None;
     for method in ["POST", "PUT", "DELETE", "PATCH", "OPTIONS"] {
@@ -149,7 +150,7 @@ async fn a_write_to_the_ui_is_refused_at_the_proxy() {
     }
     let with_body = client.plain("POST", "/ui/runs/r1", b"x=1").await;
     assert_eq!(with_body.status, Some(405));
-    assert_eq!(rig.a.state.dispatches(), 0);
+    assert_eq!(rig.a().state.dispatches(), 0);
     assert!(recorded(&seen).is_empty());
 }
 
@@ -160,7 +161,7 @@ async fn a_write_to_the_ui_is_refused_at_the_proxy() {
 #[tokio::test(start_paused = true)]
 async fn ui_off_is_a_404_and_leaves_the_operator_api_alone() {
     let seen = Seen::default();
-    let rig = rig(&seen, false).await;
+    let rig = rig(&seen, false);
     let mut client = rig.client().await;
     client.bearer = None;
     for target in ["/ui", "/ui/", "/ui/runs"] {
@@ -183,7 +184,7 @@ async fn ui_off_is_a_404_and_leaves_the_operator_api_alone() {
 #[tokio::test(start_paused = true)]
 async fn a_ui_path_cannot_walk_out_of_the_ui() {
     let seen = Seen::default();
-    let rig = rig(&seen, true).await;
+    let rig = rig(&seen, true);
     let mut client = rig.client().await;
     client.bearer = None;
     for target in [
@@ -242,7 +243,7 @@ async fn the_ui_being_open_opens_no_other_route() {
         "/kbf.enroll.v1.ColdStore/GetKeys",
     ];
     for mode in [Buck2Auth::None, Buck2Auth::Mtls, Buck2Auth::Bearer] {
-        let rig = Rig::start_secure(mode, super::kit::Access::Plain(None)).await;
+        let rig = Rig::start_secure(mode, super::kit::Access::Plain(None));
         let mut client = rig.client().await;
         client.bearer = None;
         for path in operator.into_iter().chain(worker) {
@@ -256,7 +257,11 @@ async fn the_ui_being_open_opens_no_other_route() {
         if mode != Buck2Auth::None {
             assert!(refused(&mut client, "POST", CAPS).await, "{mode:?} {CAPS}");
         }
-        assert_eq!(rig.a.state.dispatches(), 0, "{mode:?}: a child was reached");
+        assert_eq!(
+            rig.a().state.dispatches(),
+            0,
+            "{mode:?}: a child was reached"
+        );
     }
 }
 
@@ -286,7 +291,7 @@ async fn a_browser_with_no_certificate_reads_the_ui_over_http11() {
     assert!(status(1).starts_with("HTTP/1.1 200"), "{}", answers[1]);
     assert!(status(2).starts_with("HTTP/1.1 405"), "{}", answers[2]);
     assert!(status(3).starts_with("HTTP/1.1 401"), "{}", answers[3]);
-    assert_eq!(rig.a.state.dispatches(), 2, "the GET and the HEAD only");
+    assert_eq!(rig.a().state.dispatches(), 2, "the GET and the HEAD only");
 }
 
 async fn exchange(

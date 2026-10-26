@@ -117,6 +117,12 @@ pub trait Host {
     fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
         self.run_in(program, args, None, &[])
     }
+    /// Runs the program at `program` with `args`, its standard input fed `input` and then
+    /// closed, its standard error closed and its environment empty but for `LC_ALL=C`.
+    ///
+    /// # Errors
+    /// The program could not be started, fed or waited for.
+    fn run_with_input(&self, program: &str, args: &[&str], input: &str) -> io::Result<Output>;
     /// `lstat` of `path` on the Mac; `None` when there is nothing there.
     fn lstat(&self, path: &str) -> Option<Stat>;
     /// Writes `bytes` to the file at `path`, never through a link: it is created with
@@ -154,6 +160,12 @@ pub trait Host {
     fn remove(&self, path: &str) -> io::Result<()>;
     /// Waits `seconds` (between tries of a program that may not succeed at once).
     fn pause(&self, seconds: u64);
+    /// `len` bytes from the system's random source (the Mac's, never under
+    /// [`Host::root`]).
+    ///
+    /// # Errors
+    /// The source cannot be read.
+    fn random(&self, len: usize) -> io::Result<Vec<u8>>;
 }
 
 /// The Mac this runs on, with its `/` at `root` (`/` but in tests).
@@ -206,6 +218,35 @@ impl Host for RealHost {
         })
     }
 
+    fn run_with_input(&self, program: &str, args: &[&str], input: &str) -> io::Result<Output> {
+        let mut child = Command::new(self.on(program))
+            .args(args)
+            .env_clear()
+            .env("LC_ALL", "C")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("no stdin"))?;
+        // Fed from a thread, so that a program that prints as it reads cannot fill its
+        // output pipe while this waits for room in its input.
+        let out = std::thread::scope(|scope| {
+            let feed = scope.spawn(move || stdin.write_all(input.as_bytes()));
+            let out = child.wait_with_output();
+            // A program that exits before it has read everything closes the pipe: its
+            // status says whether that is a failure.
+            let _ = feed.join();
+            out
+        })?;
+        Ok(Output {
+            success: out.status.success(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        })
+    }
+
     fn lstat(&self, path: &str) -> Option<Stat> {
         fs::symlink_metadata(self.on(path))
             .ok()
@@ -249,6 +290,13 @@ impl Host for RealHost {
     fn pause(&self, seconds: u64) {
         std::thread::sleep(std::time::Duration::from_secs(seconds));
     }
+
+    fn random(&self, len: usize) -> io::Result<Vec<u8>> {
+        use std::io::Read as _;
+        let mut bytes = vec![0; len];
+        fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
 }
 
 /// The calls the verbs share, over a [`Host`]. Every path is a path on the Mac.
@@ -283,6 +331,25 @@ impl<'a> Mac<'a> {
             .run(program, args)
             .map(|o| o.stdout.trim_end_matches('\n').to_owned())
             .unwrap_or_default()
+    }
+
+    /// What `program args` prints on stdout, as [`Mac::out`] gives it, when it runs and
+    /// exits 0; the reason when it does not.
+    pub(crate) fn try_out(&self, program: &str, args: &[&str]) -> Result<String, String> {
+        match self.host.run(program, args) {
+            Ok(o) if o.success => Ok(o.stdout.trim_end_matches('\n').to_owned()),
+            Ok(_) => Err(format!("{program} exited non-zero")),
+            Err(e) => Err(format!("{program} did not run: {e}")),
+        }
+    }
+
+    /// Whether `program args` runs, is fed `input`, exits 0 and prints no `DS Error`
+    /// line (`dscl` reading commands from its standard input may report a refused
+    /// command on its output alone).
+    pub(crate) fn succeeds_with_input(&self, program: &str, args: &[&str], input: &str) -> bool {
+        self.host
+            .run_with_input(program, args, input)
+            .is_ok_and(|o| o.success && !o.stdout.contains("DS Error"))
     }
 
     /// Whether `program args` runs and exits 0.
@@ -409,5 +476,10 @@ impl<'a> Mac<'a> {
 
     pub(crate) fn pause(&self, seconds: u64) {
         self.host.pause(seconds);
+    }
+
+    /// `len` random bytes.
+    pub(crate) fn random(&self, len: usize) -> io::Result<Vec<u8>> {
+        self.host.random(len)
     }
 }

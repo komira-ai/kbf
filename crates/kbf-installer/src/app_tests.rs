@@ -6,7 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::cli::ProxyArgs;
+use crate::fixtures::{FakeRunner, ran};
 use crate::layout::{Layout, Platform};
+use crate::run::Ran;
 use crate::setup::raw_from;
 use crate::state::{Locked, PendingConfirm, State};
 use crate::testkit::{A, B, c, host_root_on};
@@ -174,21 +176,33 @@ fn run_defaults_its_directories_to_the_layouts_on_every_platform() {
     assert_eq!(args.orders_dir_in(&layout).as_str(), "/srv/o");
 }
 
-/// Catches the parser putting the Linux directories back as `proxy` defaults: without the flags
-/// they are unset (so the layout's apply), with them they are what was typed.
+/// Asserts that `proxy` still accepts the retired `--update-dir`, `--orders-dir` and
+/// `--kbf-binary` (a unit written before two-slot supervision was removed passes them): without
+/// the flags they are unset, with them they are what was typed.
 #[test]
-fn proxy_leaves_its_directories_to_the_layout_unless_flagged() {
+fn proxy_accepts_its_retired_flags_and_leaves_them_unset_otherwise() {
     let Verb::Proxy(args) = parse(&["proxy"]).verb else {
         panic!("proxy");
     };
-    assert_eq!((args.update_dir, args.orders_dir), (None, None));
-    let Verb::Proxy(args) =
-        parse(&["proxy", "--update-dir", "/srv/u", "--orders-dir", "/srv/o"]).verb
-    else {
+    assert_eq!(
+        (args.update_dir, args.orders_dir, args.kbf_binary),
+        (None, None, None)
+    );
+    let argv = [
+        "proxy",
+        "--update-dir",
+        "/srv/u",
+        "--orders-dir",
+        "/srv/o",
+        "--kbf-binary",
+        "/usr/bin/kbf",
+    ];
+    let Verb::Proxy(args) = parse(&argv).verb else {
         panic!("proxy");
     };
     assert_eq!(args.update_dir, Some("/srv/u".into()));
     assert_eq!(args.orders_dir, Some("/srv/o".into()));
+    assert_eq!(args.kbf_binary, Some("/usr/bin/kbf".into()));
 }
 
 /// Catches the proxy verb asking for root (it runs as the service user), a refused table
@@ -221,7 +235,7 @@ fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
 
     fs::write(
         &file,
-        "database = \"postgres:///kbf?host=/nonexistent\"\n[proxy]\noperator_token_file = \"/a\"\nserver_cert_file = \"/b\"\nserver_key_file = \"/c\"\nclient_ca_file = \"/d\"\n[proxy.upstream]\nbase_port = 18000\n",
+        "[proxy]\noperator_token_file = \"/a\"\nserver_cert_file = \"/b\"\nserver_key_file = \"/c\"\nclient_ca_file = \"/d\"\n[[proxy.frontend]]\nname = \"a\"\nbase_port = 18000\n",
     )
     .expect("write");
     let (exit, out, err) = run_as(1000, &["proxy", "--check", "--config", &path]);
@@ -287,6 +301,73 @@ fn setup_is_root_only_and_says_so_as_text_or_json() {
         (v["verb"].as_str(), v["error"].as_str()),
         (Some("setup"), Some("needs_root"))
     );
+}
+
+/// Asserts that each of the proxy's flags is refused by `setup` as a usage error (exit 2) that
+/// names the flag and says why (two-slot supervision was removed), before anything else is
+/// checked: the refusal comes to an ordinary user and to root alike, with nothing on standard
+/// output, and not as the root check's "run it with sudo".
+#[test]
+fn setup_refuses_each_proxy_flag_with_the_reason_before_it_checks_anything() {
+    let flags = [
+        "--proxy",
+        "--proxy-base-port=18000",
+        "--buck2-auth=none",
+        "--buck2-token-file=/etc/kbf/bearer",
+        "--storage-port=8990",
+    ];
+    for flag in flags {
+        let name = flag.split('=').next().unwrap_or_default();
+        for euid in [0, 1000] {
+            let (exit, out, err) = run_as(euid, &["setup", "--mode=frontend", flag]);
+            assert_eq!(exit, Exit::Usage, "{flag} as {euid}");
+            assert!(out.is_empty(), "{flag} as {euid}: {out}");
+            let start = format!("kbf-installer: setup: {name}: two-slot supervision was removed");
+            assert!(err.starts_with(&start), "{flag} as {euid}: {err}");
+            assert!(err.contains("[[proxy.frontend]]"), "{err}");
+            assert!(!err.contains("sudo"), "{flag} as {euid}: {err}");
+        }
+    }
+}
+
+/// Asserts that the refusal of the proxy's flags is one JSON object on standard output with
+/// `--json`, naming `setup`, the word `invalid_flags` and the reason, and nothing on standard
+/// error.
+#[test]
+fn the_refusal_of_a_proxy_flag_is_one_json_object_with_json() {
+    let args = ["--json", "setup", "--mode=frontend", "--proxy"];
+    let (exit, out, err) = run_as(1000, &args);
+    assert_eq!((exit, err.as_str()), (Exit::Usage, ""));
+    let v: Value = serde_json::from_str(out.trim_end()).expect("one json object");
+    assert_eq!(
+        (v["verb"].as_str(), v["error"].as_str()),
+        (Some("setup"), Some("invalid_flags"))
+    );
+    let message = v["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with("--proxy: two-slot supervision was removed"));
+}
+
+/// Asserts that the parser of `setup` still takes the proxy's flags, with their values (they are
+/// hidden from the help, which `tests/help_golden.rs` pins, and taken only to be refused), and
+/// that a command line without them gives no refusal.
+#[test]
+fn the_parser_of_setup_still_takes_the_proxy_flags() {
+    let cli = parse(&["setup", "--mode=frontend", "--proxy"]);
+    let Verb::Setup(all) = &cli.verb else {
+        panic!("not the setup verb");
+    };
+    assert!(all.proxy.proxy);
+    assert!(all.proxy.refusal().is_some());
+    let port = parse(&["setup", "--mode=frontend", "--storage-port=8990"]);
+    let Verb::Setup(all) = &port.verb else {
+        panic!("not the setup verb");
+    };
+    assert_eq!(all.proxy.storage_port, Some(8990));
+    let plain = parse(&["setup", "--mode=frontend"]);
+    let Verb::Setup(all) = &plain.verb else {
+        panic!("not the setup verb");
+    };
+    assert!(all.proxy.refusal().is_none());
 }
 
 /// Catches the steps of `setup` going to the wrong stream: they are for a person, so on
@@ -455,7 +536,7 @@ const RUN: [&str; 5] = ["run", "--passes", "1", "--unit", "kbf.service"];
 /// pass still ends, an unreadable state stops it before any pass (exit 1), and a memory file
 /// it cannot read stops the loop with the file named.
 ///
-/// Mutants planted: the pass count ignored (the test would hang); `recover` errors dropped
+/// Catches: the pass count ignored (the test would hang); `recover` errors dropped
 /// (the ruined state is then not an exit 1); the cycle error dropped (helper.json is then not
 /// reported).
 #[test]
@@ -502,8 +583,8 @@ fn run_does_its_passes_and_stops_on_a_state_it_cannot_read() {
 ///
 /// Red on main: nothing sweeps `work/`, so the directories are still there.
 ///
-/// Mutant it is meant to catch (reasoned, not run): the `recover` call dropped from `run`
-/// (red: the directories stay).
+/// Catches: the `recover` call dropped from `run`
+/// (the directories stay).
 #[test]
 fn run_removes_the_scratch_a_killed_stage_left_when_it_starts() {
     let (layout, root) = seeded("run-sweeps");
@@ -524,7 +605,7 @@ fn run_removes_the_scratch_a_killed_stage_left_when_it_starts() {
 /// Catches `run` not waiting between passes, or not stopping after the last: two passes on a
 /// host take one `PASS_INTERVAL` (the only wait, none after the last pass) and exit 0.
 ///
-/// Mutants to plant: the wait dropped (the test finishes in well under the interval); the
+/// Catches: the wait dropped (the test finishes in well under the interval); the
 /// wait taken after the last pass too (it takes two intervals).
 #[test]
 fn run_waits_one_interval_between_two_passes_and_not_after_the_last() {
@@ -542,7 +623,7 @@ fn run_waits_one_interval_between_two_passes_and_not_after_the_last() {
 /// needs root and so refuses an ordinary user (exit 1), a ruined state refuses (exit 1), and
 /// a relative root is refused for both verbs before anything is read.
 ///
-/// Mutant planted: the decision printed but the error arm returning `Ok` (the refusals
+/// Catches: the decision printed but the error arm returning `Ok` (the refusals
 /// above are then exit 0).
 #[test]
 fn boot_check_counts_a_start_and_refuses_what_it_cannot_read() {
@@ -584,20 +665,13 @@ fn boot_check_counts_a_start_and_refuses_what_it_cannot_read() {
     }
 }
 
-/// Catches a bundled host's boot check reading a state the host does not have, or letting a
-/// unit start after its database step failed. With `--kbf` and `--mode` the verb never calls
-/// `activate::boot_check` (both state files are ruined here, which is exit 5 without the
-/// flags); a daemon passes and reads nothing (no `installer.toml` is there); a frontend with
-/// no `installer.toml` fails with exit 1 and the file named; an all-in-one whose
-/// `installer.toml` names a database, and whose kbf is not a file, fails with exit 1 and the
-/// binary named; one whose `installer.toml` names no database passes; a relative root fails
-/// with exit 1 before anything is read.
-///
-/// Mutants it catches: `activate::boot_check` called on the bundled path (the ruined state is
-/// exit 5); the failure arm returning `Ok`; the mode gate removed (the daemon fails on the
-/// missing file); the root error swallowed.
+/// Asserts that a bundled host's boot check reads no state the host does not have and runs the
+/// kbf its unit names. With `--kbf` and `--mode` the verb never calls `activate::boot_check`
+/// (both state files are ruined here, which is exit 5 without the flags), and a kbf that is
+/// not a file ends the check with exit 1, the kbf named, for a mode that keeps no state in
+/// the database as for one that does.
 #[test]
-fn a_bundled_boot_check_runs_the_schema_step_and_never_reads_the_state() {
+fn a_bundled_boot_check_runs_the_kbf_it_names_and_never_reads_the_state() {
     let (layout, root) = seeded("boot-bundled");
     for file in [layout.state_file(), layout.state_backup()] {
         fs::write(layout.join(&file), b"not json").expect("ruin");
@@ -606,34 +680,83 @@ fn a_bundled_boot_check_runs_the_schema_step_and_never_reads_the_state() {
     assert_eq!(exit, Exit::NeedsOperator, "{err}");
 
     let flag = format!("--kbf={}", root.join("no-such-kbf").display());
-    let bundled = |mode: &str| on(&root, &["boot-check", flag.as_str(), mode]);
-    let (exit, err) = bundled("--mode=daemon");
-    assert_eq!(exit, Exit::Ok, "{err}");
-    let (exit, err) = bundled("--mode=frontend");
-    assert_eq!(exit, Exit::Failed, "{err}");
-    assert!(err.contains("installer.toml"), "{err}");
+    for mode in ["--mode=daemon", "--mode=frontend"] {
+        let (exit, err) = on(&root, &["boot-check", flag.as_str(), mode]);
+        assert_eq!(exit, Exit::Failed, "{mode}: {err}");
+        assert!(err.contains("cannot run"), "{mode}: {err}");
+        assert!(err.contains("no-such-kbf"), "{mode}: {err}");
+    }
+}
 
+/// Asserts that a bundled host's boot check runs `<kbf> boot-check --mode=<mode>` once, for
+/// each of the five modes, with the host's `installer.toml` under the root named by
+/// `--installer-config`, as the caller with an empty environment in `/` and for at most 120 s,
+/// and passes when it exits 0. A relative root is refused before anything is run.
+#[test]
+fn the_bundled_boot_check_runs_kbf_boot_check_for_the_mode_and_passes_when_it_does() {
+    let (layout, root) = seeded("boot-bundled-args");
     let installer_toml = layout.join(&layout.installer_toml());
-    let dir = installer_toml.parent().expect("a directory");
-    crate::testkit::mkdirs(&root, dir, 0o755);
-    let database = "database = \"postgres:///kbf?host=/nonexistent-kbf-test-socket\"\n";
-    fs::write(&installer_toml, database).expect("installer.toml");
-    let (exit, err) = bundled("--mode=all-in-one");
-    assert_eq!(exit, Exit::Failed, "{err}");
-    assert!(err.contains("no-such-kbf did not say its schema"), "{err}");
-    fs::write(&installer_toml, "release_source = \"bundled\"\n").expect("installer.toml");
-    let (exit, err) = bundled("--mode=frontend");
-    assert_eq!(exit, Exit::Ok, "{err}");
-
-    let relative = [
-        "--root",
-        "relative",
-        "boot-check",
-        "--kbf=/usr/bin/kbf",
-        "--mode=daemon",
+    let config = format!("--installer-config={}", installer_toml.display());
+    let modes = [
+        (Mode::Frontend, "frontend"),
+        (Mode::Storage, "storage"),
+        (Mode::Daemon, "daemon"),
+        (Mode::StorageAndDaemon, "storage-and-daemon"),
+        (Mode::AllInOne, "all-in-one"),
     ];
-    let (exit, _, _) = run_as(1000, &relative);
-    assert_eq!(exit, Exit::Failed);
+    for (mode, name) in modes {
+        let runner = FakeRunner::new(|_| Ok(ran(0, "", "kbf boot-check: skipped\n")));
+        let kbf = Path::new("/usr/bin/kbf");
+        bundled_boot_check(root.clone(), &runner, kbf, mode).expect("passes");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1, "{name}");
+        let spawn = &calls[0];
+        let flag = format!("--mode={name}");
+        assert_eq!(spawn.program, kbf);
+        assert_eq!(spawn.args, ["boot-check", flag.as_str(), config.as_str()]);
+        assert!(spawn.env.is_empty(), "{name}");
+        assert_eq!(spawn.cwd, Path::new("/"), "{name}");
+        assert_eq!(spawn.run_as, None, "{name}");
+        assert_eq!(spawn.timeout, Duration::from_secs(120), "{name}");
+    }
+    let runner = FakeRunner::new(|_| Ok(ran(0, "", "")));
+    let kbf = Path::new("/usr/bin/kbf");
+    let refused = bundled_boot_check("relative".into(), &runner, kbf, Mode::Daemon);
+    assert_eq!(refused.unwrap_err().exit, Exit::Failed);
+    assert!(runner.calls().is_empty());
+}
+
+/// Asserts that a bundled host's boot check ends as the kbf it ran ended: an exit status other
+/// than 0, a signal, a run past 120 s and a kbf that could not be started are each exit 1 with
+/// the kbf named and what happened, and an exit status 2 (a kbf without the verb) says to
+/// upgrade the kbf package.
+#[test]
+fn the_bundled_boot_check_fails_when_kbf_boot_check_does_not_exit_0() {
+    let (_, root) = seeded("boot-bundled-ended");
+    let mut timed_out = ran(0, "", "");
+    timed_out.timed_out = true;
+    let mut signalled = ran(0, "", "");
+    signalled.code = None;
+    let ended = |answer: Ran| FakeRunner::new(move |_| Ok(answer.clone()));
+    let cases = [
+        (ended(ran(1, "", "busy\n")), "ended with Some(1)"),
+        (ended(ran(2, "", "")), "upgrade the kbf package"),
+        (ended(signalled), "ended with None"),
+        (ended(timed_out), "did not end in 120 s"),
+        (
+            FakeRunner::new(|_| Err(std::io::ErrorKind::NotFound.into())),
+            "cannot run /usr/bin/kbf: entity not found",
+        ),
+    ];
+    let kbf = Path::new("/usr/bin/kbf");
+    for (runner, says) in cases {
+        let failure = bundled_boot_check(root.clone(), &runner, kbf, Mode::Frontend);
+        let failure = failure.unwrap_err();
+        assert_eq!(failure.exit, Exit::Failed, "{says}");
+        let why = &failure.why;
+        assert!(why.contains("/usr/bin/kbf"), "{says}: {why}");
+        assert!(why.contains(says), "{says}: {why}");
+    }
 }
 
 /// Catches the bundled flags of `boot-check` being taken singly or with a mode that does not
@@ -641,7 +764,7 @@ fn a_bundled_boot_check_runs_the_schema_step_and_never_reads_the_state() {
 /// does not have is an invalid value, neither flag is the connected host's check, and both
 /// give the path and the mode back together.
 ///
-/// Mutants it catches: either `requires` dropped from the flags; `bundled` returning a fixed
+/// Catches: either `requires` dropped from the flags; `bundled` returning a fixed
 /// mode, or `Some` for a lone `--kbf`.
 #[test]
 fn the_bundled_flags_of_boot_check_come_together_or_not_at_all() {
@@ -679,7 +802,7 @@ fn the_bundled_flags_of_boot_check_come_together_or_not_at_all() {
 /// that cannot be read, and a plain message end `failed` (1). Both of the error types a verb
 /// can end with are checked.
 ///
-/// Mutant planted: the guard dropped (every state error asks for an operator).
+/// Catches: the guard dropped (every state error asks for an operator).
 #[test]
 fn only_an_unusable_state_asks_for_an_operator() {
     use crate::helper::cycle::HelperError;
@@ -715,7 +838,7 @@ fn only_an_unusable_state_asks_for_an_operator() {
 /// watches is another file (here one that is no program), so the turn says re-exec, the
 /// loop tries to start it, and the failure is the reason it ends with (exit 1).
 ///
-/// Mutants planted: the watch never consulted; the failed start taken for a success.
+/// Catches: the watch never consulted; the failed start taken for a success.
 #[test]
 fn a_loop_whose_file_was_replaced_tries_the_new_one_and_ends_when_it_cannot_start() {
     let (_, root) = seeded("replaced");
@@ -762,7 +885,7 @@ fn sigpipe_handler() -> libc::sighandler_t {
 /// `revert` and `rollback` need the operator (5), `quiesce` is at rest (0) and a dry-run `gc`
 /// succeeds; each failure of the operator keeps its exit code through the conversion.
 ///
-/// Mutants planted: a verb dispatched to another verb's function; the refused exit folded
+/// Catches: a verb dispatched to another verb's function; the refused exit folded
 /// into failed.
 #[test]
 fn the_operators_verbs_run_through_the_dispatcher_with_their_own_exits() {
@@ -798,7 +921,7 @@ fn the_operators_verbs_run_through_the_dispatcher_with_their_own_exits() {
 /// the exit of the refusal and the program on the line; a release error keeps the exit of
 /// the release verbs.
 ///
-/// Mutants planted: the verb dispatched to `gc`; the refusal folded into the failure exit.
+/// Catches: the verb dispatched to `gc`; the refusal folded into the failure exit.
 #[test]
 fn record_release_runs_through_the_dispatcher_and_refuses_what_is_not_a_release() {
     use crate::record_release::RecordError;
@@ -840,7 +963,7 @@ fn record_release_runs_through_the_dispatcher_and_refuses_what_is_not_a_release(
 /// database (or a launchd label, which names no mode) still runs without one; and a config
 /// that cannot be read stops the service rather than starting it without the step.
 ///
-/// Mutants seen red: the unit check removed (the all-in-one unit ran its pass); the unit
+/// Catches: the unit check removed (the all-in-one unit ran its pass); the unit
 /// check matching only `kbf-frontend@` (the plain `kbf-frontend.service`, the unit setup enables on
 /// a frontend host, ran its pass without the migration);
 /// the all-in-one template (`kbf-all-in-one@1.service`) is in the test list.
@@ -926,7 +1049,7 @@ fn the_installer_config_flag_must_be_an_absolute_host_path() {
 /// the database's own error (the socket directory does not exist, so no server is needed),
 /// and one built without the flag has no step.
 ///
-/// Mutants seen red: the `set_schema_step` call removed from `build_helper`.
+/// Catches: the `set_schema_step` call removed from `build_helper`.
 #[test]
 fn run_with_an_installer_config_drives_a_helper_that_migrates_first() {
     let (_, root) = seeded("run-schema-step");
@@ -963,7 +1086,7 @@ fn run_with_an_installer_config_drives_a_helper_that_migrates_first() {
 /// `sandbox-exec`) each cannot tell, with the reason: the activation is refused
 /// (fail closed), and `run` itself still starts for them.
 ///
-/// Mutants seen red: `leases::NotWired` left in `build_helper` (the daemon's lease reads as
+/// Catches: `leases::NotWired` left in `build_helper` (the daemon's lease reads as
 /// "cannot tell"); the cgroup root taken as the real `/sys/fs/cgroup` instead of the host
 /// root's.
 #[test]
@@ -997,7 +1120,7 @@ fn run_builds_a_helper_whose_lease_source_reads_the_restarted_units_cgroup() {
 /// absolute path (the root is the sandbox flag's; a relative one is refused with its reason
 /// rather than reading from the working directory).
 ///
-/// Mutants to plant: the `Root::new` error in `under` swallowed.
+/// Catches: the `Root::new` error in `under` swallowed.
 #[test]
 fn run_with_an_installer_config_refuses_a_relative_host_root() {
     let mut argv = RUN.to_vec();
@@ -1024,7 +1147,7 @@ fn run_args(extra: &[&str]) -> RunArgs {
 /// Catches the flag ignored (the fetcher would read a file the operator did not name) and a
 /// default that is not `setup`'s file.
 ///
-/// Mutants planted: the flag's arm returning the default.
+/// Catches: the flag's arm returning the default.
 #[test]
 fn the_fetcher_reads_the_flags_installer_toml_else_the_one_setup_writes() {
     let root = || kbf_host::Root::new("/").expect("root");
@@ -1052,7 +1175,7 @@ fn the_fetcher_reads_the_flags_installer_toml_else_the_one_setup_writes() {
 /// Catches `build_helper` going back to `fetcher::NotWired` (every fetch refused with no reason
 /// to act on).
 ///
-/// Mutants planted: `Box::new(fetcher::NotWired)` in place of the host fetcher.
+/// Catches: `Box::new(fetcher::NotWired)` in place of the host fetcher.
 #[test]
 fn run_builds_its_helper_with_the_host_fetcher_not_the_unwired_one() {
     let (_, root) = seeded("run-fetcher");
@@ -1087,7 +1210,7 @@ fn write_kbf_toml(layout: &Layout, text: &str) {
 /// `setup` enabled for the `mode` of the host's kbf.toml, one per mode, and a flag still
 /// wins over the file.
 ///
-/// Mutants planted: `named_service` ignoring the flags; the first unit of the mode taken
+/// Catches: `named_service` ignoring the flags; the first unit of the mode taken
 /// from another mode's row.
 #[test]
 fn run_without_a_service_flag_restarts_the_unit_of_the_hosts_mode() {
@@ -1138,7 +1261,7 @@ fn run_without_a_service_flag_restarts_the_unit_of_the_hosts_mode() {
 /// mode kbf does not offer (`node`), or a Mac without a label each end it with exit 2 and the
 /// reason, before any pass.
 ///
-/// Mutants planted: the platform check dropped; the unknown mode mapped to a default unit; a
+/// Catches: the platform check dropped; the unknown mode mapped to a default unit; a
 /// missing, unparseable, unreadable or mode-less kbf.toml mapped to a default unit.
 #[test]
 fn run_with_no_service_and_no_mode_to_derive_one_is_a_usage_error() {
@@ -1224,7 +1347,7 @@ fn run_with_no_service_and_no_mode_to_derive_one_is_a_usage_error() {
 /// silently absent, the very thing `run` refuses to start without): on a frontend host the
 /// target carries `/etc/kbf/installer.toml`, on a daemon host none, and a flag is kept.
 ///
-/// Mutants planted: the default dropped; the default given to every mode.
+/// Catches: the default dropped; the default given to every mode.
 #[test]
 fn a_derived_database_unit_reads_the_default_installer_toml_and_others_none() {
     let (_, root) = seeded("run-derived-config");
@@ -1290,9 +1413,10 @@ fn setup_still_takes_the_flags_of_the_release_source_and_the_first_release() {
         "--commit",
         "0123456789abcdef0123456789abcdef01234567",
     ]);
-    let Verb::Setup(args) = &cli.verb else {
+    let Verb::Setup(all) = &cli.verb else {
         panic!("not the setup verb");
     };
+    let args = &all.setup;
     assert_eq!(args.retired.release_source.as_deref(), Some("bundled"));
     assert_eq!(
         args.retired.release_url.as_deref(),
@@ -1307,9 +1431,10 @@ fn setup_still_takes_the_flags_of_the_release_source_and_the_first_release() {
     assert_eq!(args.retired.frontend_ca_sha256.as_deref(), Some("ab"));
     assert_eq!(args.retired.given().len(), 7);
     let plain = parse(&["setup", "--mode=daemon"]);
-    let Verb::Setup(args) = &plain.verb else {
+    let Verb::Setup(all) = &plain.verb else {
         panic!("not the setup verb");
     };
+    let args = &all.setup;
     let none = crate::setup::retired::RetiredFlags::default();
     assert_eq!(args.retired, none);
 }
@@ -1327,9 +1452,9 @@ fn the_retired_flags_on_the_command_line_reach_the_values_setup_runs_with() {
         "--release-url",
         "https://r.example/kbf",
     ]);
-    let Verb::Setup(args) = &cli.verb else {
+    let Verb::Setup(all) = &cli.verb else {
         panic!("not the setup verb");
     };
-    let raw = raw_from(args);
+    let raw = raw_from(&all.setup);
     assert_eq!(raw.retired.given(), ["--release-url", "--commit"]);
 }

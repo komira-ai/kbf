@@ -39,6 +39,77 @@ pub fn user_name(lease: LeaseId) -> String {
     format!("{USER_PREFIX}{}-{}", lease.term, lease.seq)
 }
 
+/// The standing VM user's account name (`--vm-user`): the one account besides the
+/// lease users that the helper starts processes as, kills the processes of and rests the
+/// Mac at.
+///
+/// Its name can never be a lease user's: a lease user is `kbf-lease-<term>-<seq>`, and
+/// every user the boot reset and `user-delete` delete is named by a ledger entry, so a
+/// name that does not start with [`USER_PREFIX`] is never among them. The name is also
+/// refused when it is the daemon's role account (`_kbf`) or root, and it is limited to
+/// lower-case letters, digits, `-` and `_` (starting with a letter), at most 31 bytes:
+/// nothing the directory service or a shell would read as more than a name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmUser(String);
+
+/// The longest account name the helper accepts.
+const MAX_NAME: usize = 31;
+/// Names the VM user may never have besides the lease users' prefix: root, and the
+/// daemon's role account.
+const RESERVED: [&str; 2] = ["root", "_kbf"];
+
+impl VmUser {
+    /// The VM user named `name`.
+    ///
+    /// # Errors
+    /// The name is empty, too long, holds a character outside `[a-z0-9_-]`, does not
+    /// start with a letter, starts with the lease users' prefix, or is reserved.
+    pub fn new(name: &str) -> Result<Self, String> {
+        let refuse = |why: &str| Err(format!("VM user name {name:?} {why}"));
+        if name.is_empty() || name.len() > MAX_NAME {
+            return refuse(&format!("is not 1 to {MAX_NAME} bytes"));
+        }
+        if !name.starts_with(|c: char| c.is_ascii_lowercase())
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+        {
+            return refuse("must start with a lower-case letter and hold only [a-z0-9_-]");
+        }
+        if name.starts_with(USER_PREFIX) {
+            return refuse(&format!(
+                "starts with {USER_PREFIX}, which only lease users have"
+            ));
+        }
+        if RESERVED.contains(&name) {
+            return refuse("is reserved");
+        }
+        Ok(Self(name.to_owned()))
+    }
+
+    /// The account name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether `uid` may be this account's: an ordinary user's uid
+    /// ([`MIN_UID`] to [`MAX_UID`]) that is not in the lease range, so a verb for the
+    /// VM user never touches a lease user's, a system account's or root's processes.
+    #[must_use]
+    pub fn admits_uid(range: UidRange, uid: u32) -> bool {
+        (MIN_UID..=MAX_UID).contains(&uid) && !range.contains(uid)
+    }
+}
+
+impl std::str::FromStr for VmUser {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, String> {
+        Self::new(name)
+    }
+}
+
 /// The uids lease users get, `first..=last`. The helper never touches a uid outside it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UidRange {
@@ -147,6 +218,51 @@ mod tests {
             "18446744073709551616.1",
         ] {
             assert!(parse_lease(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    /// Catches: a VM user name that a lease user could have (the boot reset would then
+    /// delete it), the daemon's or root's account, or a spelling the directory service
+    /// or a command line would read as more than a name.
+    #[test]
+    fn a_vm_user_name_is_never_a_lease_user_s() {
+        assert_eq!(VmUser::new("kbf-vm").unwrap().name(), "kbf-vm");
+        assert_eq!("vm1_x".parse::<VmUser>().unwrap().name(), "vm1_x");
+        assert!(VmUser::new(&"a".repeat(31)).is_ok());
+        for bad in [
+            "",
+            "kbf-lease-1-1",
+            "kbf-lease-",
+            "root",
+            "_kbf",
+            "Kbf-vm",
+            "1vm",
+            "-vm",
+            "kbf vm",
+            "kbf.vm",
+            "kbf/vm",
+            "kbf-vm\n",
+            "kbf-vm\0",
+            "kbf-vm:",
+            &"a".repeat(32),
+        ] {
+            assert!(VmUser::new(bad).is_err(), "{bad:?} was accepted");
+        }
+        // A lease user's own name, for any lease, is refused.
+        assert!(VmUser::new(&user_name(LeaseId::new(3, 41))).is_err());
+    }
+
+    /// Catches: a VM uid that is root's, a system account's, or one a lease user can
+    /// hold (a verb for the VM user would then kill a lease's processes).
+    #[test]
+    fn a_vm_uid_is_an_ordinary_uid_outside_the_lease_range() {
+        let range = UidRange::new(600, 699).unwrap();
+        assert!(VmUser::admits_uid(range, 501));
+        assert!(VmUser::admits_uid(range, 599));
+        assert!(VmUser::admits_uid(range, 700));
+        assert!(VmUser::admits_uid(range, MAX_UID));
+        for bad in [0, 1, 499, 600, 650, 699, MAX_UID + 1, u32::MAX] {
+            assert!(!VmUser::admits_uid(range, bad), "{bad} was admitted");
         }
     }
 

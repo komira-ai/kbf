@@ -427,14 +427,11 @@ async fn a_drain_keeps_open_streams_and_refuses_new_executes() {
 
     let mut open = start(&farm, &job.action).await.expect("Execute");
     next(&mut open).await.expect("healthy").expect("queued");
+    script.set(0, Stage::Executing);
+    let running = next(&mut open).await.expect("healthy").expect("executing");
+    assert_eq!(stage(&running), ExecStage::Executing as i32);
 
     closer.drain();
-    script.set(0, Stage::Executing);
-    let running = next(&mut open)
-        .await
-        .expect("the stream survives the drain")
-        .expect("executing");
-    assert_eq!(stage(&running), ExecStage::Executing as i32);
 
     let refused = start(&farm, &job.action).await.expect_err("a new Execute");
     assert_eq!(refused.code(), Code::Unavailable, "{refused:?}");
@@ -459,6 +456,93 @@ async fn a_drain_keeps_open_streams_and_refuses_new_executes() {
         let done = next(ops).await.expect(what).expect("the done operation");
         assert!(done.done, "{what}: {done:?}");
         assert_eq!(next(ops).await.expect(what), None, "{what}");
+    }
+}
+
+/// Catches a drain that ends a stream it must keep, and one that keeps a stream that can
+/// never finish. Buck2 does not recover a stream that breaks after the call opened, so
+/// only an operation that has never been started and that no worker can run
+/// (`Stage::Waiting`) is ended early. Operation 0 is plainly queued (a worker may take
+/// it), 1 is waiting with no worker and never started, 2 is running, 3 waits for a worker
+/// but had a lease once (`WaitingKept`). After `drain`, only stream 1 (and a second
+/// stream on it, and a WaitExecution opened later on it, after its first operation) ends
+/// UNAVAILABLE, naming its operation; streams 0, 2 and 3 stay silent, and each ends
+/// with its done operation when the operation is done.
+#[tokio::test]
+async fn a_drain_ends_only_the_streams_of_operations_that_can_never_start() {
+    let script = Arc::new(Script::default());
+    let (closer, closing) = kbf_front::closing();
+    let farm = Farm::with_execution_until(Arc::clone(&script), closing).await;
+    let jobs = [
+        job("queued", &[], false),
+        job("waiting", &[], false),
+        job("running", &[], false),
+        job("requeued", &[], false),
+    ];
+    for job in &jobs {
+        farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+    }
+    let mut streams = Vec::new();
+    for job in &jobs {
+        let mut ops = start(&farm, &job.action).await.expect("Execute");
+        next(&mut ops).await.expect("healthy").expect("queued");
+        streams.push(ops);
+    }
+    let farm_ref = &farm;
+    let wait = |n: usize| async move {
+        farm_ref
+            .exec()
+            .wait_execution(WaitExecutionRequest {
+                name: format!("operations/{n}"),
+            })
+            .await
+    };
+    let mut waited = wait(1).await.expect("WaitExecution").into_inner();
+    next(&mut waited).await.expect("healthy").expect("queued");
+    for (n, to) in [
+        (1, Stage::Waiting("no worker".to_owned())),
+        (2, Stage::Executing),
+        (3, Stage::WaitingKept("no worker".to_owned())),
+    ] {
+        script.set(n, to);
+        next(&mut streams[n])
+            .await
+            .expect("healthy")
+            .expect("update");
+    }
+
+    closer.drain();
+    let gone = next(&mut streams[1]).await.expect_err("waiting");
+    assert_eq!(gone.code(), Code::Unavailable, "{gone:?}");
+    assert!(gone.message().contains("operations/1"), "{gone:?}");
+    // The update that stage change sent it first, then the end.
+    next(&mut waited).await.expect("healthy").expect("waiting");
+    let gone = next(&mut waited).await.expect_err("second stream on it");
+    assert_eq!(gone.code(), Code::Unavailable, "{gone:?}");
+
+    let mut late = wait(1)
+        .await
+        .expect("WaitExecution during the drain")
+        .into_inner();
+    next(&mut late)
+        .await
+        .expect("healthy")
+        .expect("first operation");
+    let gone = next(&mut late).await.expect_err("opened during the drain");
+    assert_eq!(gone.code(), Code::Unavailable, "{gone:?}");
+
+    // The drain has ended every stream it ends (the waiting operation's three, above and
+    // just now), so a stream of an operation that can still start is untouched by now.
+    for n in [0, 2, 3] {
+        let quiet = futures::FutureExt::now_or_never(streams[n].message());
+        assert!(quiet.is_none(), "stream {n} spoke or ended: {quiet:?}");
+    }
+
+    for n in [0, 2, 3] {
+        script.set(n, Stage::Done(Finished::Ran(Box::default())));
+        let done = next(&mut streams[n]).await.expect("kept").expect("done");
+        assert!(done.done, "stream {n}: {done:?}");
+        assert_eq!(next(&mut streams[n]).await.expect("ends"), None);
     }
 }
 
@@ -499,7 +583,8 @@ impl Dispatch for Gated {
 
 /// Catches an Execute that passed the drain check and is then refused, or ended, by a
 /// drain that began while its `submit` was running: the call was taken before the
-/// drain, so its stream is kept until its action is done, like every stream open at the
+/// drain, so its stream (of an operation that runs: it joined a running twin) is kept until
+/// its action is done, like every stream with a running lease open at the
 /// drain (kbf#791: Buck2 does not recover a stream that breaks). The
 /// drain begins, and the next Execute is refused, while the first is inside `submit`.
 /// Catches: a second `closing.draining()` check after `submit` (returning UNAVAILABLE)
@@ -508,6 +593,8 @@ impl Dispatch for Gated {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_drain_that_begins_during_submit_keeps_the_stream() {
     let script = Arc::new(Script::default());
+    // The twin it joins is running, so the stream has a lease to wait for.
+    script.joined.store(true, Ordering::SeqCst);
     let (entered_tx, entered) = tokio::sync::oneshot::channel();
     let (release_tx, release) = std::sync::mpsc::channel();
     let gated = Arc::new(Gated {
@@ -534,9 +621,6 @@ async fn a_drain_that_begins_during_submit_keeps_the_stream() {
     let (opened, ()) = tokio::join!(opening, draining);
 
     let mut open = opened.expect("the Execute taken before the drain keeps its stream");
-    let queued = next(&mut open).await.expect("healthy").expect("queued");
-    assert_eq!(stage(&queued), ExecStage::Queued as i32);
-    script.set(0, Stage::Executing);
     let running = next(&mut open).await.expect("kept").expect("executing");
     assert_eq!(stage(&running), ExecStage::Executing as i32);
     script.set(0, Stage::Done(Finished::Ran(Box::default())));
@@ -592,6 +676,13 @@ async fn started_counts_the_executes_taken_and_open_executions_follows_the_strea
         "a WaitExecution is a stream, not a start"
     );
 
+    // Both streams have a running lease to wait for, so the drain keeps them.
+    script.set(0, Stage::Executing);
+    next(&mut ops).await.expect("healthy").expect("executing");
+    next(&mut waited)
+        .await
+        .expect("healthy")
+        .expect("executing");
     closer.drain();
     start(&farm, &job.action).await.expect_err("refused");
     assert_eq!(metrics.started.get(), 1, "a refused Execute was counted");

@@ -20,6 +20,44 @@ pub const MACHINE_ID: &str = "machine-identifier";
 /// The four file names, in the order they are cloned.
 pub const FILES: [&str; 4] = [DISK, AUX, HARDWARE_MODEL, MACHINE_ID];
 
+/// The file in a base bundle's directory that records the sizes the base was built with.
+/// It is not one of [`FILES`]: a clone does not copy it, a run reads it from the base.
+pub const SIZING: &str = "sizing.json";
+
+/// The sizes `image base` was asked for. `None` keeps what the restore image needs (at
+/// least 2 CPUs and 4 GiB of memory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sizing {
+    pub disk_gib: u64,
+    pub cpus: Option<u32>,
+    pub memory_mib: Option<u64>,
+}
+
+/// The sizes a base bundle was built with, as `sizing.json` records them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Recorded {
+    pub cpus: u32,
+    pub memory_mib: u64,
+    pub disk_gib: u64,
+}
+
+/// Writes the sizes the install used into the base bundle `dir`.
+///
+/// # Errors
+/// The file could not be written.
+pub fn record_sizing(dir: &Path, sizing: &Recorded) -> io::Result<()> {
+    let text = serde_json::to_string_pretty(sizing).map_err(io::Error::other)?;
+    std::fs::write(dir.join(SIZING), format!("{text}\n"))
+}
+
+/// The sizes recorded in the base bundle `dir`; `None` for a base built before the record
+/// existed, or whose record cannot be read.
+#[must_use]
+pub fn recorded_sizing(dir: &Path) -> Option<Recorded> {
+    let text = std::fs::read_to_string(dir.join(SIZING)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// What a clone does with the machine identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Identity {
@@ -42,6 +80,8 @@ pub enum BundleError {
         dst: PathBuf,
         source: io::Error,
     },
+    #[error("clear the immutable flag on {path}: {source}")]
+    Unflag { path: PathBuf, source: io::Error },
     #[error("a new machine identifier: {0}")]
     NewIdentity(String),
     #[error("write {path}: {source}")]
@@ -98,7 +138,14 @@ pub fn clone_bundle(
         }
         let (src, dst) = (base.join(file), dest.join(file));
         sys.clonefile(&src, &dst)
-            .map_err(|source| BundleError::Clone { src, dst, source })?;
+            .map_err(|source| BundleError::Clone {
+                src: src.clone(),
+                dst: dst.clone(),
+                source,
+            })?;
+        // A clone of a sealed base keeps `uchg` and the guest could not write its disk.
+        sys.clear_immutable(&dst)
+            .map_err(|source| BundleError::Unflag { path: dst, source })?;
     }
     Ok(started.elapsed())
 }
@@ -123,6 +170,32 @@ mod tests {
             "{err}"
         );
         assert!(check(&tmp("bundle-empty")).is_err());
+    }
+
+    /// Catches a clone of a sealed base (root's, `uchg`) left immutable, so the guest
+    /// could not write its disk: every cloned file is unflagged right after `clonefile`,
+    /// and the one that keeps its flag fails the clone naming the path. A fresh identity
+    /// is written, not cloned, so it has no flag to clear.
+    #[test]
+    fn every_cloned_file_loses_the_immutable_flag_of_a_sealed_base() {
+        let work = work_with_base("bundle-unflag");
+        let sys = FakeSystem::new();
+        let dest = work.join("c1");
+        clone_bundle(&sys, &work.join("base"), &dest, Identity::Keep).expect("clone");
+        let want: Vec<PathBuf> = FILES.iter().map(|f| dest.join(f)).collect();
+        assert_eq!(*sys.unflagged.borrow(), want);
+        sys.unflagged.borrow_mut().clear();
+        let fresh = work.join("c2");
+        clone_bundle(&sys, &work.join("base"), &fresh, Identity::Fresh).expect("clone");
+        assert_eq!(sys.unflagged.borrow().len(), 3);
+        assert!(!sys.unflagged.borrow().contains(&fresh.join(MACHINE_ID)));
+        sys.unflag_fails.set(true);
+        let err = clone_bundle(&sys, &work.join("base"), &work.join("c3"), Identity::Keep)
+            .expect_err("unflag");
+        assert!(matches!(err, BundleError::Unflag { .. }));
+        let text = err.to_string();
+        assert!(text.contains("c3"), "{text}");
+        assert!(text.contains("EPERM"), "{text}");
     }
 
     /// Catches a keep-identity clone that regenerates the identifier (two clones would

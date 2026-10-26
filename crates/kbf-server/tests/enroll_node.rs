@@ -100,7 +100,7 @@ async fn start_with(name: &str, limits: Limits, cert_lifetime_secs: i64) -> Farm
     let flags = flags_for(ca_dir.clone(), limits, true, cert_lifetime_secs);
     let prepared = prepare(&flags).expect("prepared");
     let (port, pin) = (prepared.local().port(), prepared.ca().pin());
-    let mut serving = prepared.serve(Arc::clone(&store)).expect("serving");
+    let mut serving = prepared.serve(Arc::clone(&store), None).expect("serving");
     let listener = std::mem::replace(&mut serving.listener, Box::pin(std::future::pending()));
     tokio::spawn(listener);
     Farm {
@@ -129,6 +129,7 @@ impl Farm {
             &secret,
             &TokenSpec {
                 roles: RoleSet::new(roles.iter().copied()).expect("roles"),
+                host_role: None,
                 max_uses: uses,
                 ttl,
                 node_id: None,
@@ -207,7 +208,9 @@ fn restart(farm: &Farm, worker_endpoint: &str) -> (u16, kbf_server::enroll::star
     let prepared = prepare(&flags).expect("prepared");
     assert_eq!(prepared.ca().pin(), farm.pin, "the same CA");
     let port = prepared.local().port();
-    let mut serving = prepared.serve(Arc::clone(&farm.store)).expect("serving");
+    let mut serving = prepared
+        .serve(Arc::clone(&farm.store), None)
+        .expect("serving");
     let listener = std::mem::replace(&mut serving.listener, Box::pin(std::future::pending()));
     tokio::spawn(listener);
     (port, serving)
@@ -530,21 +533,18 @@ async fn a_source_over_its_burst_is_rate_limited() {
     assert_eq!(list_tokens(&*farm.store).expect("tokens")[0].uses, 0);
 }
 
-/// Without `--enroll-allow-unenforced-deny` the start is refused while this build does not
-/// enforce deny rows, and nothing is made: no CA directory, no key.
+/// Without `--enroll-allow-unenforced-deny` the start succeeds: this build enforces deny
+/// rows, so the flag has nothing to accept.
 ///
-/// Catches: a listener switched on by mistake that promises a revocation storage does not
-/// enforce, and a gate checked after the CA was already written.
+/// Catches: a start that still demands the flag of every unit although revocation is
+/// enforced.
 #[tokio::test(flavor = "multi_thread")]
-async fn enroll_listen_without_the_deny_acceptance_is_refused_and_writes_nothing() {
+async fn enroll_listen_starts_without_the_deny_acceptance() {
     let dir = scratch("gate");
     let ca_dir = dir.join("ca");
-    let error = prepare(&flags(ca_dir.clone(), Limits::DEFAULT, false))
-        .err()
-        .expect("refused");
-    let text = error.to_string();
-    assert!(text.contains("--enroll-allow-unenforced-deny"), "{text}");
-    assert!(!ca_dir.exists(), "the CA directory was not made");
+    let prepared = prepare(&flags(ca_dir.clone(), Limits::DEFAULT, false)).expect("starts");
+    assert!(ca_dir.exists(), "the CA directory was made");
+    drop(prepared);
 }
 
 /// A second start on the same `--ca-dir` loads the CA the first made: the same pin, the

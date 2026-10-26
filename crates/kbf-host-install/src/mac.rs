@@ -23,8 +23,9 @@
 //!
 //! # The requests
 //!
-//! The same two as on Linux ([`crate::request`]). `<version>` is the version text of a
-//! build (`0.1.<seq>+g<12 hex>-<run>`); its 12 digits name the release.
+//! The same two as on Linux ([`crate::request`]); the third, `restart frontend=<name>`, is
+//! refused as a bad command, since a Mac has no frontend unit to restart. `<version>` is the
+//! version text of a build (`0.1.<seq>+g<12 hex>-<run>`); its 12 digits name the release.
 //!
 //! - `install kbf=<version> from <channel>`: look up the channel ([`channel`]), checks the
 //!   release and stages it ([`stage`]), then launches the apply job ([`apply`]) and
@@ -185,6 +186,8 @@ fn handle_root(
         Ok(Request::Install { version, channel }) => {
             install(host, runner, version, channel, log.is_ok())
         }
+        // A frontend unit is a Linux systemd unit: a Mac has none to restart.
+        Ok(Request::Restart { .. }) => Outcome::Refused(Refusal::BadCommand),
     };
     let (outcome_word, reason) = outcome.audit_fields();
     let (version, channel) = match &request {
@@ -199,6 +202,7 @@ fn handle_root(
         verb: request.as_ref().ok().map(Request::verb),
         version,
         channel,
+        unit: None,
         outcome: outcome_word,
         reason,
         result: None,
@@ -304,7 +308,7 @@ fn install_front(
 
 /// Root's private directory: made 0711 (others may pass through to the stage when it is
 /// opened for the checks that run as another user, and may list nothing) and trusted.
-fn ensure_work(host: &MacHost) -> Result<(), Outcome> {
+pub(crate) fn ensure_work(host: &MacHost) -> Result<(), Outcome> {
     let made = fs::create_dir(&host.work)
         .and_then(|()| fs::set_permissions(&host.work, fs::Permissions::from_mode(0o711)));
     match made {
@@ -322,7 +326,7 @@ fn ensure_work(host: &MacHost) -> Result<(), Outcome> {
 }
 
 /// The kit is there and is root's: the tree, `releases`, and the daemon's job.
-fn check_kit(host: &MacHost) -> Result<(), Outcome> {
+pub(crate) fn check_kit(host: &MacHost) -> Result<(), Outcome> {
     host.kit_trust
         .check_dir(&host.releases())
         .map_err(|e| fail(FailureCode::PackageStateUnclean, format!("releases: {e}")))?;
@@ -355,4 +359,4 @@ pub fn main_process() -> u8 {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

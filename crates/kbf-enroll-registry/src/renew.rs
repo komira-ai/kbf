@@ -9,7 +9,7 @@ use prost::Message as _;
 use crate::ATTEMPTS;
 use crate::enroll::{Enrolled, IssuedRole, cert_row, check_issued, request_hash, stored_certs};
 use crate::error::Fail;
-use crate::nodes::{NodeState, state_of};
+use crate::nodes::{NodeState, is_adopted, state_of};
 use crate::rows::{self, NodeRow, PriorRow, SerialRow};
 
 /// How far a request's `issued_at` may be from the store's clock.
@@ -72,11 +72,15 @@ fn attempt(
     let csr_hash = request_hash(&pairs);
     for _ in 0..ATTEMPTS {
         let now = rows::seconds(store.now());
-        let key = rows::node_key(req.node_id);
+        let key = rows::row_key(asked, req.node_id);
         let node =
             rows::fetch::<NodeRow>(store, &key, "node")?.ok_or(RefusalReason::UnknownNode)?;
         if state_of(&node.row)? == NodeState::Revoked {
             return Err(RefusalReason::NodeRevoked.into());
+        }
+        if is_adopted(&node.row) {
+            // An adopted node holds no certificate from this registry: nothing to renew.
+            return Err(RefusalReason::UnknownNode.into());
         }
         let held = stored_certs(&node.row)?;
         let newest = held.iter().map(|c| c.not_after).max().unwrap_or(0);

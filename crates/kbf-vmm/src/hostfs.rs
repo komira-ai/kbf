@@ -148,6 +148,34 @@ pub fn chown_tree(path: &Path, uid: u32, gid: u32) -> Result<(), String> {
     }
 }
 
+/// The bytes an unprivileged writer can still write on the filesystem holding `path`
+/// (`statvfs`: available blocks times the fragment size).
+///
+/// # Errors
+/// `statvfs` failed.
+pub fn free_bytes(path: &Path) -> io::Result<u64> {
+    let c = cstring(path)?;
+    let mut st = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: `c` is a NUL-terminated path and `st` is a statvfs buffer.
+    cvt(unsafe { libc::statvfs(c.as_ptr(), st.as_mut_ptr()) })?;
+    // SAFETY: `statvfs` succeeded, so `st` is initialised.
+    let st = unsafe { st.assume_init() };
+    // The field widths differ by platform; both are counts that fit in 64 bits.
+    #[allow(clippy::useless_conversion, clippy::unnecessary_cast)]
+    Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+/// Makes `path` owned by uid 0 and gid 0. A symbolic link is changed itself, never what
+/// it points at.
+///
+/// # Errors
+/// `lchown` failed (not root, or the path does not exist).
+pub fn lchown_root(path: &Path) -> io::Result<()> {
+    let c = cstring(path)?;
+    // SAFETY: `c` is a NUL-terminated path; `lchown` does not follow a final link.
+    cvt(unsafe { libc::lchown(c.as_ptr(), 0, 0) }).map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

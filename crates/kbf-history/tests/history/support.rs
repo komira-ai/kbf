@@ -343,11 +343,6 @@ impl Store for Index {
     fn now(&self) -> StoreTime {
         self.inner.now()
     }
-
-    /// The store's own handle, past this double's planted failures.
-    fn own_keys(&self, permit: kbf_state::Permit) -> Option<Arc<dyn Store>> {
-        self.inner.own_keys(permit)
-    }
 }
 
 /// Runs each job on a thread of its own, as a server's blocking pool would, and counts
@@ -439,29 +434,6 @@ impl Life {
             queue,
             writer_id: WriterId(writer),
         }
-    }
-
-    /// A life whose index writes the rows of its own writer around the store's fence
-    /// ([`HistoryIndex::exempting`]), over `index` (a store that has a fence to go
-    /// around, or not).
-    pub fn start_exempting(
-        objects: &Objects,
-        index: &Arc<Index>,
-        writer: u64,
-        limits: Limits,
-    ) -> Life {
-        let mut life = Life::start(objects, index, writer, limits);
-        let history = life.history_index().exempting(WriterId(writer));
-        life.writer = Writer::new(
-            objects.clone(),
-            root(),
-            history,
-            WriterId(writer),
-            life.minter.clone(),
-            life.queue.clone(),
-            limits,
-        );
-        life
     }
 
     pub fn fresh(limits: Limits) -> Life {

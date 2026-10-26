@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::autologin::CommandOutput;
-use crate::helper::{Host, LiveProcess, NewUser};
+use crate::helper::{Account, Host, LiveProcess, NewUser};
 
 /// The fake clock's time.
 pub(crate) const NOW: u64 = 1_800_000_000;
@@ -42,7 +42,7 @@ pub(crate) struct State {
     pub(crate) pauses: usize,
     /// Calls that fail, by name ("uid_taken", "make_home", "create_user",
     /// "delete_user", "domain_exists", "bootout gui", "kill_all", "live_processes",
-    /// "command", "reset_password", "boot_session").
+    /// "command", "reset_password", "boot_session", "account").
     pub(crate) fail: BTreeSet<&'static str>,
     /// What `command` answers, by the command's text (`program arg ...`). A command
     /// with no answer succeeds and prints nothing, except `fdesetup isactive`, which
@@ -57,8 +57,44 @@ pub(crate) struct State {
     /// Runs with each command's text before it is answered: a change on the host
     /// between two of the helper's steps.
     pub(crate) on_command: Option<Hook>,
+    /// Whether `chflags` on the fake host has the effect `uchg` has: a file with the flag
+    /// cannot be unlinked, and neither can a directory that holds one. Modelled by taking
+    /// the write permission off the parent of each flagged path until `nouchg`.
+    pub(crate) enforce_uchg: bool,
+    /// The paths `chflags` has set `uchg` on.
+    pub(crate) immutable: BTreeSet<PathBuf>,
     /// The launchd domains that exist (`gui/<uid>` once a login has completed).
     pub(crate) domains: BTreeSet<String>,
+}
+
+impl State {
+    /// The effect of a successful `chflags -h uchg|nouchg <paths>` when `enforce_uchg` is
+    /// on: the parent of every path with the flag loses its write permission (so nothing
+    /// in it can be unlinked, and a flagged directory cannot be removed from its parent)
+    /// until the last flag under it is cleared.
+    fn chflags(&mut self, args: &[&str]) {
+        let flag = args[1];
+        for path in &args[2..] {
+            self.set_flag(PathBuf::from(path), flag == "uchg");
+        }
+    }
+
+    /// Sets or clears `uchg` on `path` (and its effect, when `enforce_uchg` is on).
+    fn set_flag(&mut self, path: PathBuf, on: bool) {
+        use std::os::unix::fs::PermissionsExt as _;
+        if on {
+            self.immutable.insert(path.clone());
+        } else {
+            self.immutable.remove(&path);
+        }
+        if self.enforce_uchg {
+            let parent = path.parent().unwrap();
+            let held = self.immutable.iter().any(|p| p.parent() == Some(parent));
+            let mode = std::fs::metadata(parent).unwrap().permissions().mode();
+            let mode = if held { mode & !0o222 } else { mode | 0o200 };
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
 }
 
 /// The fake host; clones share their state.
@@ -167,11 +203,11 @@ impl Host for FakeHost {
             None => String::new(),
         };
         self.call("command", format!("command {text}{seen}"))?;
-        let state = self.state();
+        let mut state = self.state();
         if let Some(hook) = &state.on_command {
             hook(&text);
         }
-        Ok(match state.answers.get(&text) {
+        let output = match state.answers.get(&text) {
             Some(answer) => answer.clone(),
             None if text == "/usr/bin/fdesetup isactive" => CommandOutput {
                 success: false,
@@ -187,13 +223,56 @@ impl Host for FakeHost {
                 success: true,
                 ..CommandOutput::default()
             },
-        })
+        };
+        if output.success && program == crate::helper::CHFLAGS {
+            state.chflags(args);
+        }
+        Ok(output)
+    }
+
+    fn account(&self, name: &str) -> io::Result<Option<Account>> {
+        self.call("account", format!("account {name}"))?;
+        Ok(self.state().users.get(name).map(|user| Account {
+            uid: user.uid,
+            gid: user.gid,
+        }))
     }
 
     /// The password is `pw-<name>`.
     fn reset_password(&self, name: &str) -> io::Result<String> {
         self.call("reset_password", format!("reset_password {name}"))?;
         Ok(format!("pw-{name}"))
+    }
+
+    /// A real copy of the bytes into a new file (mode 0644, owned by the test).
+    fn clone_file(
+        &self,
+        src: std::os::fd::BorrowedFd<'_>,
+        dir: std::os::fd::BorrowedFd<'_>,
+        name: &str,
+    ) -> io::Result<()> {
+        self.call("clone_file", format!("clone_file {name}"))?;
+        let flags = rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::EXCL
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC;
+        let to = rustix::fs::openat(dir, name, flags, rustix::fs::Mode::from_raw_mode(0o644))?;
+        let mut from = std::fs::File::from(src.try_clone_to_owned()?);
+        io::copy(&mut from, &mut std::fs::File::from(to))?;
+        // A clone of a file with `uchg` has it too.
+        let (source, target) = (fd_path(&src), fd_path(&dir).join(name));
+        let mut state = self.state();
+        if state.immutable.contains(&source) {
+            state.set_flag(target, true);
+        }
+        Ok(())
+    }
+
+    fn clear_user_flags(&self, file: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+        self.call("clear_user_flags", "clear_user_flags".to_owned())?;
+        self.state().set_flag(fd_path(&file), false);
+        Ok(())
     }
 
     fn boot_session(&self) -> io::Result<String> {
@@ -216,11 +295,35 @@ impl Host for FakeHost {
     }
 }
 
+/// The path an open descriptor names: `/proc` on Linux, `F_GETPATH` on macOS (which
+/// answers the path with its links resolved; [`scratch`] is already resolved).
+fn fd_path(fd: &impl std::os::fd::AsFd) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = rustix::fs::getpath(fd).unwrap();
+        PathBuf::from(std::ffi::OsStr::from_bytes(path.as_bytes()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use std::os::fd::AsRawFd as _;
+        std::fs::read_link(format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd())).unwrap()
+    }
+}
+
 /// A fresh scratch directory for one test. Under `/tmp` with a short name, not the
 /// per-user temporary folder: a socket path on macOS holds at most 104 bytes, and
 /// macOS's per-user temporary folder alone takes about 50.
+///
+/// Under the resolved `/tmp` (`/private/tmp` on macOS), so a path the tests hand a
+/// command is the one `F_GETPATH` answers for the same file. In the user's own group:
+/// a new entry takes its directory's group on macOS and `/tmp` is `wheel`'s, which a
+/// test user cannot give a file to, as the helper does when it gives a bundle back.
 pub(crate) fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
-    kbf_testkit::dir::TestDir::under("/tmp", &format!("kms-{name}"))
+    let root = std::fs::canonicalize("/tmp").unwrap();
+    let dir = kbf_testkit::dir::TestDir::under(root, &format!("kms-{name}"));
+    std::os::unix::fs::chown(dir.path(), None, Some(rustix::process::getgid().as_raw())).unwrap();
+    dir
 }
 
 /// Shows tracing output in test logs, so the log statements' arguments run.

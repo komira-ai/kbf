@@ -27,6 +27,7 @@ pub(super) struct Racing {
     landings: Mutex<Vec<(String, Txn)>>,
     down: AtomicBool,
     lease_scans: AtomicUsize,
+    session_scans: AtomicUsize,
     /// Rows whose key starts with one of these cannot be read.
     unreadable: Mutex<Vec<String>>,
 }
@@ -40,8 +41,14 @@ impl Racing {
             landings: Mutex::new(Vec::new()),
             down: AtomicBool::new(false),
             lease_scans: AtomicUsize::new(0),
+            session_scans: AtomicUsize::new(0),
             unreadable: Mutex::new(Vec::new()),
         })
+    }
+
+    /// How many times every `session/` row has been read by a scan.
+    pub(super) fn session_scans(&self) -> usize {
+        self.session_scans.load(Ordering::SeqCst)
     }
 
     /// How many times every `lease/` row has been read by a scan.
@@ -107,6 +114,8 @@ impl Store for Racing {
         self.unreadable(prefix)?;
         let scans = &self.lease_scans;
         scans.fetch_add(usize::from(prefix == "lease/"), Ordering::SeqCst);
+        self.session_scans
+            .fetch_add(usize::from(prefix == "session/"), Ordering::SeqCst);
         self.inner.scan_prefix(prefix)
     }
 

@@ -16,10 +16,10 @@ use crate::layout::Platform;
 use crate::run::{Ran, RunAs, Runner, Spawn};
 
 /// The trust directory of a Linux host, and the files in it.
-pub const TRUST_DIR: &str = "/usr/share/kbf-installer/trust";
-pub const GH_PATH: &str = "/usr/share/kbf-installer/trust/gh";
-pub const TRUSTED_ROOT_PATH: &str = "/usr/share/kbf-installer/trust/trusted_root.jsonl";
-pub const SETTINGS_PATH: &str = "/usr/share/kbf-installer/trust/installer.conf";
+pub const TRUST_DIR: &str = "/usr/share/kbf/trust";
+pub const GH_PATH: &str = "/usr/share/kbf/trust/gh";
+pub const TRUSTED_ROOT_PATH: &str = "/usr/share/kbf/trust/trusted_root.jsonl";
+pub const SETTINGS_PATH: &str = "/usr/share/kbf/trust/installer.conf";
 
 pub const COMMIT: &str = "0f4a3825305cc79733ef098eae9725948eb5d6db";
 pub const OTHER: &str = "1111111111111111111111111111111111111111";
@@ -77,12 +77,6 @@ pub fn version_json(commit: &str, profile: &str) -> String {
     )
 }
 
-/// As [`version_json`], for a build that also prints its full commit as `commit_full`.
-pub fn version_json_full(commit: &str, profile: &str) -> String {
-    let more = format!(",\"commit_full\":\"{commit}\"}}");
-    version_json(commit, profile).replacen('}', &more, 1)
-}
-
 /// The paths of the trust list and every directory above them, as a bootstrap leaves
 /// them: root's, 0755 (files 0755 and 0644).
 pub fn trusted_host() -> FakeExec {
@@ -93,7 +87,13 @@ pub fn trusted_host() -> FakeExec {
 pub fn trusted_host_on(platform: Platform) -> FakeExec {
     let (parents, dir, gh, root_file): (&[&str], &str, String, String) = match platform {
         Platform::Linux => (
-            &["/usr", "/usr/share", "/usr/share/kbf-installer"],
+            &[
+                "/usr",
+                "/usr/share",
+                "/usr/share/kbf",
+                // The seed directory is still under the installer's own (`Layout::seed_dir`).
+                "/usr/share/kbf-installer",
+            ],
             TRUST_DIR,
             GH_PATH.to_owned(),
             TRUSTED_ROOT_PATH.to_owned(),

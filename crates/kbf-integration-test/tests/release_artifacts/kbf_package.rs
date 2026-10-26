@@ -1,23 +1,33 @@
-//! The `kbf` package in the pinned release set (docs/artifacts.md): `/usr/bin/kbf` and the
-//! units of the modes are a deb and an rpm of their own, `kbf`, which depends on the
-//! `kbf-installer` package of the same version (each mode unit runs the installer's
-//! `boot-check`). Each Linux job builds both packages from the one configuration step and
-//! makes the deb an asset, `kbf-<commit>-<platform>.deb`; no pull request run attests it, so a
-//! step that goes missing would turn `main` red or release a deb nobody checked. [`rules`]
-//! reads the workflow and names a job that:
+//! The `kbf` package in the pinned release set (docs/artifacts.md): `/usr/bin/kbf`, the units
+//! of the modes, `kbf.slice`, the users and directories they run with, the needrestart
+//! drop-in and the trust directory (the pinned `gh`, the Sigstore trusted root and the
+//! branches whose attestations are trusted) are a deb and an rpm of their own, `kbf`. Each
+//! Linux job builds both from one configuration step and makes the deb an asset,
+//! `kbf-<commit>-<platform>.deb`; no pull request run attests it, so a step that goes missing
+//! would turn `main` red or release a deb nobody checked. [`rules`] reads the workflow and
+//! names a job that:
 //!
 //! - does not make the `kbf` deb an asset exactly once (`cargo xtask pkg-kbf-asset`,
 //!   [`PACKAGES`]), or makes it for another platform than its own;
 //! - gives that line another commit, platform, `--kbf-tarball` (the tarball of this job's
 //!   `kbf`, which `build-commit check-asset` has checked), directory of the package or output
-//!   directory than the ones the rules name, or runs it under `if:` or `continue-on-error:`;
-//! - runs it before `pkg-build` of the `kbf` configuration or before `build-commit
-//!   check-asset` of the `kbf` tarball, or either under `if:` or `continue-on-error:`;
+//!   directory than the ones the rules name, no pinned `gh` to compare the package's with, an
+//!   `--expect-ref` other than the job's `PKG_SOURCE_REF` (the package trusts and is attested
+//!   for that branch and no other, never a literal ref), or runs it under `if:` or
+//!   `continue-on-error:`;
+//! - runs it before `pkg-build` of the configuration, before `build-commit check-asset` of the
+//!   `kbf` tarball, before `pkg-trust --source-ref "$PKG_SOURCE_REF"`, before the install test
+//!   (`pkg-install-test --name kbf --format deb`) or before the upgrade test
+//!   (`pkg-upgrade-test` of the same package), or any of them under `if:` or
+//!   `continue-on-error:`;
 //! - writes the configuration (`pkg-config`) without `--kbf` naming the `kbf` it packages (a
 //!   package of another build's `kbf` has the same file name);
+//! - fetches a tool or a deb whose `--sha256` is not a workflow variable holding 64 lowercase
+//!   hex digits, or has no `PKG_SOURCE_REF` set to [`PKG_SOURCE_REF_EXPR`];
 //!
 //! and names the verify job when it does not run `pkg-kbf-asset --verify-only` on each signed
-//! deb, with its tarball and commit, in an unconditional step after the attestation check.
+//! deb, with its tarball, the commit and `--expect-ref "$GITHUB_REF"`, in an unconditional step
+//! after the attestation check.
 
 use super::*;
 
@@ -25,8 +35,8 @@ use super::*;
 const VERB: &str = "cargo xtask pkg-kbf-asset ";
 
 /// Where `pkg-config` writes the `kbf` package's configuration, and `pkg-build` its packages.
-const CONFIG: &str = "target/pkg/kbf/nfpm.yaml";
-const BUILT: &str = "target/pkg/kbf-out";
+const CONFIG: &str = "target/pkg/nfpm.yaml";
+const BUILT: &str = "target/pkg/out";
 
 /// The `--binary` of a line that packages the `kbf`.
 fn packaged_kbf(line: &str) -> Option<&str> {
@@ -89,6 +99,7 @@ fn build_job(workflow: &str, platform: &str, out: &mut Vec<String>) -> Result<()
         ("--platform", platform),
         ("--kbf-tarball", tarball.as_str()),
         ("--package", BUILT),
+        ("--expect-ref", "$PKG_SOURCE_REF"),
         ("--out", "dist"),
     ] {
         if flag(&words, name) != Some(want) {
@@ -97,6 +108,11 @@ fn build_job(workflow: &str, platform: &str, out: &mut Vec<String>) -> Result<()
                 flag(&words, name).unwrap_or("(none)")
             ));
         }
+    }
+    if flag(&words, "--gh").is_none() {
+        out.push(format!(
+            "`cargo xtask pkg-kbf-asset` in `{platform}` is not given the pinned gh (`--gh`) to compare the package's with"
+        ));
     }
     // The package is built first, in a step that cannot be skipped.
     let built = first(&steps, 0, |l| {
@@ -116,6 +132,71 @@ fn build_job(workflow: &str, platform: &str, out: &mut Vec<String>) -> Result<()
         _ => out.push(format!(
             "{who} is made an asset without {build} in a step before"
         )),
+    }
+    // The trust directory names the branch, and the package is installed and upgraded to before
+    // it is an asset, each in a step that cannot be skipped.
+    let ordered =
+        |found: Option<(usize, &workflows::Step)>, what: &str, out: &mut Vec<String>| match found {
+            Some((at, step)) if at < asset_at && !step.conditional => {}
+            Some((at, _)) if at < asset_at => out.push(format!(
+                "{who}: {what} is under `if:` or `continue-on-error:`"
+            )),
+            _ => out.push(format!(
+                "{who} is made an asset without {what} in a step before"
+            )),
+        };
+    ordered(
+        first(&steps, 0, |l| {
+            args(l, "cargo xtask pkg-trust ")
+                .is_some_and(|a| flag(&a, "--source-ref") == Some("$PKG_SOURCE_REF"))
+        }),
+        "`cargo xtask pkg-trust --source-ref \"$PKG_SOURCE_REF\"`",
+        out,
+    );
+    ordered(
+        first(&steps, 0, |l| {
+            args(l, "cargo xtask pkg-install-test ").is_some_and(|a| {
+                flag(&a, "--name") == Some("kbf")
+                    && flag(&a, "--format") == Some("deb")
+                    && flag(&a, "--package") == Some(BUILT)
+            })
+        }),
+        "`cargo xtask pkg-install-test --name kbf --format deb` of the kbf package",
+        out,
+    );
+    ordered(
+        first(&steps, 0, |l| {
+            args(l, "cargo xtask pkg-upgrade-test ").is_some_and(|a| {
+                flag(&a, "--package") == Some(BUILT)
+                    && flag(&a, "--old-installer").is_some()
+                    && flag(&a, "--old-kbf").is_some()
+            })
+        }),
+        "`cargo xtask pkg-upgrade-test` of the kbf package over the previous release's debs",
+        out,
+    );
+    for step in &steps {
+        for line in lines(step) {
+            let pkg = line.starts_with("cargo xtask pkg-trust ")
+                || line.starts_with("cargo xtask pkg-kbf-asset ");
+            if pkg && line.contains("refs/heads/") {
+                out.push(format!(
+                    "`{platform}`: `{line}` names a literal branch: the package trusts and is attested for `$PKG_SOURCE_REF` and no other"
+                ));
+            }
+        }
+    }
+    fetch_pins(workflow, platform, &steps, out);
+    let env = workflows::job_env(workflow, platform)?;
+    let got = env
+        .iter()
+        .find(|(k, _)| k == PKG_SOURCE_REF)
+        .map(|(_, v)| v.as_str());
+    if got != Some(PKG_SOURCE_REF_EXPR) {
+        out.push(format!(
+            "the job `{platform}` has {PKG_SOURCE_REF}: {}, not exactly `{PKG_SOURCE_REF_EXPR}`",
+            got.unwrap_or("(none)")
+        ));
     }
     // (A kbf tarball never checked at all is `identity`'s to name; here, one checked too late.)
     let checked = first(&steps, 0, |l| {
@@ -157,12 +238,13 @@ fn verify_job(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
                     && flag(&a, "--kbf-tarball") == Some(tarball.as_str())
                     && flag(&a, "--platform") == Some(platform)
                     && flag(&a, "--commit") == Some("$GITHUB_SHA")
+                    && flag(&a, "--expect-ref") == Some("$GITHUB_REF")
             })
         });
         let checked = found.is_some_and(|(at, step)| at > verified_at && !step.conditional);
         if !checked {
             out.push(format!(
-                "`verify-linux` does not run `cargo xtask pkg-kbf-asset --verify-only` on `{deb}` in an unconditional step after the attestation check, so the kbf package that was signed is not the one checked"
+                "`verify-linux` does not run `cargo xtask pkg-kbf-asset --verify-only` on `{deb}` (with `--expect-ref \"$GITHUB_REF\"`) in an unconditional step after the attestation check, so the kbf package that was signed is not the one checked"
             ));
         }
     }

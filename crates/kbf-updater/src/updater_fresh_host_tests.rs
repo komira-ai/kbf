@@ -1,7 +1,5 @@
 //! A fresh host (nothing installed) and the announcement of each install to the health port.
 
-use std::sync::{Arc, Mutex};
-
 use crate::api::{Phase, RollState};
 use crate::fakes::Event;
 use crate::ports::{Installed, PortError};
@@ -130,51 +128,4 @@ fn a_silent_install_on_a_fresh_host_is_repeated_once() {
             Event::Health("st1".into())
         ]
     );
-}
-
-/// Catches an adapter that is not told when an install begins: the health port hears of every
-/// install call, before the call (the adapter notes the time to tell the swap of this install
-/// from an earlier one), including the repeat after a silent answer.
-#[test]
-fn the_health_port_hears_of_every_install_before_it_begins() {
-    let rig = Rig::new("announce");
-    rig.inst.script_install(
-        "fe",
-        vec![Err(PortError::unreachable("ssh: connection reset"))],
-        Ok(()),
-    );
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let (sink, health) = (Arc::clone(&seen), rig.health.clone());
-    rig.inst.on_install(move |h| {
-        sink.lock()
-            .expect("lock")
-            .push((h.alias.clone(), health.installing_calls().len()));
-    });
-    let u = rig.open();
-    assert_eq!(rig.roll(&u).state, RollState::Done);
-    let seen = seen.lock().expect("lock").clone();
-    assert_eq!(
-        seen,
-        [
-            ("fe".to_owned(), 1),
-            ("fe".to_owned(), 2),
-            ("st1".to_owned(), 3),
-            ("dm".to_owned(), 4),
-            ("st2".to_owned(), 5),
-        ]
-    );
-    assert_eq!(
-        rig.health.installing_calls(),
-        ["fe", "fe", "st1", "dm", "st2"]
-    );
-}
-
-/// Catches the health port not being told that a host is done: it hears of each host once it
-/// reached `Done`, in roll order, and of no host that did not.
-#[test]
-fn the_health_port_hears_of_each_host_that_is_done() {
-    let rig = Rig::new("settled");
-    let u = rig.open();
-    assert_eq!(rig.roll(&u).state, RollState::Done);
-    assert_eq!(rig.health.settled_calls(), ["fe", "st1", "dm", "st2"]);
 }

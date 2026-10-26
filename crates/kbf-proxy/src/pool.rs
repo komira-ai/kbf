@@ -1,5 +1,5 @@
-//! The upstream pool: prior-knowledge HTTP/2 over loopback to the children, one pool per
-//! (slot, generation, target).
+//! The upstream pool: prior-knowledge HTTP/2 over loopback to the members, one pool per
+//! (member address, target).
 //!
 //! Built on h2's own client, not hyper's, because the child's advertised
 //! `MAX_CONCURRENT_STREAMS` is on h2's `SendRequest` and not on hyper's. A pick reserves a
@@ -9,14 +9,13 @@
 //! cap, and waiters wake on "a stream freed or a dial finished", so a release does not make
 //! thousands of tasks dial together.
 //!
-//! A pool is keyed by the slot's generation ([`crate::slot::Permit::generation`]): a slot that
-//! was retired and opened again is a new child, and the first stream after the restart never
-//! meets a connection of the dead process.
+//! A member is a process that runs on its own, so its pools are keyed by where it listens:
+//! (base address, target). They are made when first asked for and kept.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -29,27 +28,23 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
 
-use crate::config::UpstreamTable;
 use crate::keepalive;
 use crate::limits::h2_client_builder;
 use crate::metrics::Metrics;
 use crate::replay::Failure;
 use crate::route::Target;
-use crate::slot::Slot;
 
-/// Connections per (slot, generation, target).
+/// Connections per (member, target).
 pub(crate) const MAX_CONNECTIONS: usize = 256;
 /// Connects in flight at once per pool.
 pub(crate) const MAX_DIALS: usize = 16;
 /// The child's listener must accept within this, or the stream fails `UNAVAILABLE`.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Where a child listens: always loopback, whatever the table says.
-pub(crate) const fn upstream_addr(table: UpstreamTable, slot: Slot, target: Target) -> SocketAddr {
-    SocketAddr::new(
-        std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
-        table.port(slot, target),
-    )
+/// Where a pool member listens for `target`: the target's port offset from the member's base
+/// address.
+pub(crate) fn member_addr(base: SocketAddr, target: Target) -> SocketAddr {
+    SocketAddr::new(base.ip(), base.port() + target.offset())
 }
 
 #[derive(Debug)]
@@ -286,43 +281,35 @@ impl TargetPool {
     }
 }
 
-/// A pool's key: the slot's name, its generation, the target's port offset.
-type PoolKey = (&'static str, u64, u16);
+/// A pool member's pool key: the address its listeners start at, the target's port offset.
+type MemberKey = (SocketAddr, u16);
 
-/// Every pool, by (slot, generation, target).
+/// Every pool, by (member address, target).
 pub(crate) struct Pool {
-    table: UpstreamTable,
     metrics: Arc<Metrics>,
     connector: Connector,
-    pools: Mutex<HashMap<PoolKey, Arc<TargetPool>>>,
+    members: Mutex<HashMap<MemberKey, Arc<TargetPool>>>,
 }
 
 impl Pool {
-    pub(crate) fn new(table: UpstreamTable, metrics: Arc<Metrics>, connector: Connector) -> Self {
+    pub(crate) fn new(metrics: Arc<Metrics>, connector: Connector) -> Self {
         Self {
-            table,
             metrics,
             connector,
-            pools: Mutex::new(HashMap::new()),
+            members: Mutex::new(HashMap::new()),
         }
     }
 
-    /// The pool of `target` in `slot` at `generation`. Asking for a generation drops the pools
-    /// of the slot's earlier generations, and with them their connections, once their streams
-    /// finish: a restarted child never meets the old process's connections.
-    pub(crate) fn target(&self, slot: Slot, generation: u64, target: Target) -> Arc<TargetPool> {
-        let mut pools = self.pools.lock().unwrap_or_else(PoisonError::into_inner);
-        pools.retain(|(s, g, _), _| *s != slot.name() || *g >= generation);
-        Arc::clone(
-            pools
-                .entry((slot.name(), generation, target.offset()))
-                .or_insert_with(|| {
-                    TargetPool::new(
-                        upstream_addr(self.table, slot, target),
-                        Arc::clone(&self.metrics),
-                        Arc::clone(&self.connector),
-                    )
-                }),
-        )
+    /// The pool of `target` on the pool member whose listeners start at `base`.
+    pub(crate) fn member(&self, base: SocketAddr, target: Target) -> Arc<TargetPool> {
+        let mut pools = self.members.lock().unwrap_or_else(PoisonError::into_inner);
+        let make = || {
+            TargetPool::new(
+                member_addr(base, target),
+                Arc::clone(&self.metrics),
+                Arc::clone(&self.connector),
+            )
+        };
+        Arc::clone(pools.entry((base, target.offset())).or_insert_with(make))
     }
 }

@@ -94,7 +94,7 @@ fn every_open_of_either_store_keeps_the_epoch() {
 }
 
 /// Catches: the password of a URL printed by anything that prints the flags (`Debug` of
-/// `Args` is logged), and the handover's store identity carrying it to the other process.
+/// `Args` is logged), and the store identity carrying it to another process.
 /// A URL with user information, a `password` parameter, and both.
 #[test]
 fn a_postgres_urls_password_is_in_neither_its_debug_text_nor_its_identity() {
@@ -140,9 +140,6 @@ fn an_unreachable_postgres_store_refuses_the_open_without_the_password() {
     assert!(matches!(&refused, StateError::Open(_)), "{refused:?}");
     let said = format!("{refused} {refused:?}");
     assert!(!said.contains("hunter2"), "{said}");
-    let after = uri.open_after_handover(1).err().expect("nothing listens");
-    assert!(matches!(&after, StateError::Open(_)), "{after:?}");
-    assert!(!format!("{after} {after:?}").contains("hunter2"));
 }
 
 /// A fresh directory for `name`, removed when it drops.
@@ -179,86 +176,18 @@ fn a_sqlite_value_opens_its_file_and_holds_it() {
     uri.open().expect("free once the first is gone");
 }
 
-/// Catches: a store opened without the writer fence (a handle left over from an earlier
-/// writer could still write after its successor started): every open takes the next
-/// generation of the file, and once another writer takes the one after it, every write
-/// through the first handle fails.
+/// Asserts that opening a SQLite store writes no generation row, however often it is opened
+/// (the file's exclusive lock is what keeps it to one process), and that the identity of a
+/// SQLite store is its file.
 #[test]
-fn every_open_takes_the_next_writer_generation_and_fences_the_one_before() {
-    use kbf_state::{Cond, Fenced, GENERATION, StoreError, Txn};
+fn a_sqlite_open_writes_no_generation_row_and_the_store_is_named_by_its_file() {
     let dir = scratch("generation");
     let uri = StateStoreUri::Sqlite(dir.join("state.db"));
-    let generation = |state: &StateStore| {
-        let row = state.store.get(GENERATION).expect("read").expect("a row");
-        u64::from_be_bytes(row.value.try_into().expect("8 bytes"))
-    };
-    let first = uri.open().expect("opened");
-    assert_eq!(generation(&first), 1);
-    drop(first);
-    let second = uri.open().expect("opened again");
-    assert_eq!(generation(&second), 2);
-    let write = || Txn::new().put("k", "v", Cond::Any);
-    second
-        .store
-        .txn(write())
-        .expect("the holder writes")
-        .expect("commits");
-    Fenced::take(Arc::clone(&second.store), Some(2)).expect("a successor");
-    assert_eq!(second.store.txn(write()).unwrap_err(), StoreError::Fenced);
-    drop(second);
-}
-
-/// Catches: a successor that takes a store it was not told about, and one that does not
-/// keep the epoch: opened after a handover it takes only the generation it expects (a
-/// restored or swapped file, or a file another writer has taken since, is refused and
-/// nothing is written), and it keeps the epoch of the store (so the daemons that
-/// reconnect keep the runs of their leases), as every open does. The path it names is the
-/// file.
-#[test]
-fn a_store_opened_after_a_handover_expects_its_generation_and_keeps_the_epoch() {
-    use kbf_state::GENERATION;
-    let dir = scratch("handover");
-    let uri = StateStoreUri::Sqlite(dir.join("state.db"));
     assert_eq!(uri.identity(), dir.join("state.db"));
-    let holder = uri.open().expect("opened");
-    assert_eq!(holder.epoch, EpochPolicy::Keep);
-    drop(holder);
-
-    let generation = |state: &StateStore| {
-        let row = state.store.get(GENERATION).expect("read").expect("a row");
-        u64::from_be_bytes(row.value.try_into().expect("8 bytes"))
-    };
-    let refused = uri
-        .open_after_handover(7)
-        .err()
-        .expect("not the generation");
-    assert!(
-        matches!(&refused, StateError::Open(why) if why.contains("generation 1, not the expected 7")),
-        "{refused:?}"
-    );
-    let successor = uri
-        .open_after_handover(1)
-        .expect("the generation it was told");
-    assert_eq!(successor.epoch, EpochPolicy::Keep);
-    assert_eq!(generation(&successor), 2);
-}
-
-/// Catches: a scheduler that opened a store with a generation row it cannot read taking
-/// the file anyway.
-#[test]
-fn a_generation_row_that_is_not_a_number_refuses_the_open() {
-    use kbf_state::{Cond, GENERATION, Txn};
-    let dir = scratch("generation-corrupt");
-    let file = dir.join("state.db");
-    let uri = StateStoreUri::Sqlite(file);
-    let store = uri.open().expect("opened");
-    let junk = Txn::new().put(GENERATION, "junk", Cond::Any);
-    // The holder's own write goes through its fence; the row is then not a number.
-    store.store.txn(junk).expect("store").expect("put");
-    drop(store);
-    let refused = uri.open().err().expect("junk");
-    assert!(matches!(refused, StateError::Open(_)), "{refused:?}");
-    assert!(refused.to_string().contains("generation"), "{refused}");
+    for _ in 0..2 {
+        let state = uri.open().expect("opened");
+        assert_eq!(state.store.get(kbf_state::GENERATION).expect("read"), None);
+    }
 }
 
 /// Catches: the scheduler's state (every operation's request, every lease) readable by
@@ -350,6 +279,39 @@ fn the_flag_takes_a_sqlite_path_or_a_postgres_socket_url_and_defaults_to_none() 
     }
 }
 
+/// Asserts that `--pack-index` is off by default and then needs no store, that given it names
+/// the Postgres state store the index would be opened on, and that the three ways it cannot be
+/// honoured are told apart: no state store, a SQLite one, and a Postgres one nothing listens on.
+#[test]
+fn the_pack_index_flag_is_off_by_default_and_needs_a_postgres_state_store() {
+    let off = Args::try_parse_from(["kbf-server"]).expect("no flag");
+    assert!(!off.pack_index);
+    assert!(off.pack_index_url().expect("no flag").is_none());
+    assert!(off.open_pack_index().expect("no flag").is_none());
+    let mut args = Args::try_parse_from(["kbf-server", "--pack-index"]).expect("the flag");
+    assert!(args.pack_index);
+    let refused = args.open_pack_index().err().expect("no state store");
+    assert!(matches!(refused, PackIndexFlagError::NeedsStateStore));
+    let said = refused.to_string();
+    assert!(said.contains("needs --state-store"), "{said}");
+    args.state_store = Some(StateStoreUri::Sqlite(PathBuf::from("/x.db")));
+    let refused = args.open_pack_index().err().expect("SQLite");
+    assert!(matches!(refused, PackIndexFlagError::NeedsPostgres));
+    let said = refused.to_string();
+    assert!(said.contains("not SQLite"), "{said}");
+    args.state_store = Some(StateStoreUri::local_postgres());
+    let url = args.pack_index_url().expect("a Postgres store");
+    assert!(url.is_some());
+    let dir = scratch("pack-index-no-socket");
+    let text = format!("postgres://kbf:hunter2@/kbf?host={}", dir.display());
+    args.state_store = Some(parse(&text).expect("parses"));
+    let refused = args.open_pack_index().err().expect("nothing listens");
+    assert!(matches!(refused, PackIndexFlagError::Open(_)));
+    let said = refused.to_string();
+    assert!(said.starts_with("--pack-index: "), "{said}");
+    assert!(!said.contains("hunter2"), "{said}");
+}
+
 /// Catches: a refused `--state-store` that quotes its value back. clap echoes the value of
 /// any parser's refusal (`invalid value '...'`), the command line is world-readable, and
 /// the error goes to stderr and the journal. Each value holds a password in a form a
@@ -384,100 +346,4 @@ fn a_refused_state_store_never_echoes_its_value() {
     ])
     .expect_err("not UTF-8");
     assert!(!refused.to_string().contains("hunter2"), "{refused}");
-}
-
-fn fake() -> Arc<dyn Store> {
-    use kbf_state::ManualClock;
-    use kbf_state::fake::{Fake, Flaw};
-    Arc::new(Fake::with_flaw(
-        Arc::new(ManualClock::default()),
-        Flaw::None,
-    ))
-}
-
-/// Catches: a candidate that can write (its reader accepts a transaction or a reap), one
-/// that moves the generation before it is told to take it, and a takeover that does not
-/// check the generation it is told to expect (it would fence a holder it was not told
-/// about) or that does not keep the epoch.
-#[test]
-fn a_candidate_reads_writes_nothing_and_takes_exactly_the_generation_it_expects() {
-    use kbf_state::{Cond, Txn};
-    let inner = fake();
-    let holder = Fenced::take(Arc::clone(&inner), None).expect("the first generation");
-    let candidate = Candidate::over(Arc::clone(&inner));
-    assert_eq!(candidate.generation().expect("read"), 1);
-
-    let reader = candidate.reader();
-    assert!(reader.get(GENERATION).expect("reads").is_some());
-    let write = Txn::new().put("probe", b"x".to_vec(), Cond::Any);
-    assert!(reader.txn(write).is_err(), "the reader wrote");
-    assert!(reader.reap_expired().is_err());
-    assert!(inner.get("probe").expect("read").is_none());
-    assert_eq!(
-        candidate.generation().expect("read"),
-        1,
-        "nothing was taken"
-    );
-
-    let refused = candidate.take_over(7).err().expect("not the generation");
-    assert!(refused.to_string().contains("generation 1"), "{refused}");
-    assert_eq!(candidate.generation().expect("read"), 1);
-
-    let state = candidate.take_over(1).expect("takes generation 1");
-    assert_eq!(state.epoch, EpochPolicy::Keep);
-    assert_eq!(candidate.generation().expect("read"), 2);
-    let stale = Txn::new().put("probe", b"x".to_vec(), Cond::Any);
-    assert!(
-        matches!(holder.txn(stale), Err(StoreError::Fenced)),
-        "the old holder was not fenced"
-    );
-}
-
-/// Catches: a reader that answers from nothing (every read of the candidate's handle is
-/// the store's), a store with no generation reported as anything but 0, a generation row
-/// that is not a number taken for one, and a candidate over a SQLite file that makes the
-/// file anything but held (a second open is refused) and unwritten (the generation stays
-/// 0, no writer took one).
-#[test]
-fn a_candidate_reader_passes_reads_through_and_a_sqlite_candidate_holds_the_file() {
-    use kbf_state::{Cond, Revision, ScanRange, Txn};
-    let inner = fake();
-    let candidate = Candidate::over(Arc::clone(&inner));
-    assert_eq!(candidate.generation().expect("read"), 0, "no writer yet");
-    inner
-        .txn(Txn::new().put("a/1", b"x".to_vec(), Cond::Any))
-        .expect("write")
-        .expect("applied");
-    let reader = candidate.reader();
-    assert_eq!(reader.scan_prefix("a/").expect("scan").len(), 1);
-    let page = reader
-        .scan_range(ScanRange::new(
-            "a/",
-            std::num::NonZeroUsize::new(10).expect("nonzero"),
-        ))
-        .expect("a range");
-    assert_eq!(page.rows.len(), 1);
-    assert_eq!(reader.changes(Revision(0), 10).expect("feed").rows.len(), 1);
-    assert_eq!(reader.commit_stats(), inner.commit_stats());
-    assert_eq!(reader.now(), inner.now());
-    inner
-        .txn(Txn::new().put(GENERATION, b"abc".to_vec(), Cond::Any))
-        .expect("write")
-        .expect("applied");
-    let corrupt = candidate.generation().expect_err("not eight bytes");
-    assert!(matches!(corrupt, StateError::Corrupt { .. }), "{corrupt:?}");
-
-    let dir = scratch("candidate");
-    let uri = StateStoreUri::Sqlite(dir.join("state.db"));
-    let waiting = uri.open_candidate().expect("opened");
-    assert_eq!(
-        waiting.generation().expect("read"),
-        0,
-        "a candidate took one"
-    );
-    let refused = uri.open().err().expect("held by the candidate");
-    assert!(
-        matches!(&refused, StateError::Open(why) if why.contains("another kbf process")),
-        "{refused:?}"
-    );
 }

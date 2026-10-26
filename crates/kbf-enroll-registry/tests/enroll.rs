@@ -13,7 +13,7 @@ use common::{
 use kbf_enroll_registry::{
     NodeState, TokenInfo, deny_rows, list_nodes, list_tokens, request_hash, revoke_node,
 };
-use kbf_state::{Cond, Fenced, Txn};
+use kbf_state::{Cond, Txn};
 use kbf_types::{RefusalReason, Role};
 
 use RefusalReason as R;
@@ -737,24 +737,20 @@ fn a_lost_race_is_decided_again_on_fresh_rows() {
     assert_eq!(list_nodes(&*env.store).expect("nodes").len(), 1);
 }
 
-// Catches a handle that lost the writer role getting anything done, from a cached row or
-// a read that still works: its enroll answers NotSigner and the successor sees nothing.
+/// Asserts that a store that refuses the enroll's write as written by a superseded handle
+/// (`StoreError::Fenced`) enrolls nothing: the answer is NotSigner, the token is not spent
+/// and no row lands.
 #[test]
 fn a_fenced_handle_enrolls_nothing() {
     let env = fake();
-    let stale = Fenced::take(env.store.clone(), None).expect("take");
-    let fresh = Fenced::take(env.store.clone(), Some(1)).expect("take");
     make_token(&env, 1, &spec(&[Daemon], 2));
     let now = env.now();
     let req = Req::new(1, "n1", &[Daemon]);
+    let stale = Wrap::new(env.store.clone(), Mode::Fenced);
     let stale_answer = req.run(&stale, &mut || Ok(issue(&[Daemon], 1, now)));
     assert_eq!(stale_answer, Err(R::NotSigner));
     assert_eq!(token(&env, 1).uses, 0);
     nothing_landed(&env);
-    // The current handle is fine.
-    req.run(&fresh, &mut || Ok(issue(&[Daemon], 1, now)))
-        .expect("enroll");
-    assert_eq!(token(&env, 1).uses, 1);
 }
 
 // Catches store trouble answered as anything but "try again": a backend failure on a read

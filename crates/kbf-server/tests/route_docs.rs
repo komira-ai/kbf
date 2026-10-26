@@ -275,8 +275,31 @@ fn name_verify(routes: Vec<Route>) -> Vec<Route> {
         .collect()
 }
 
+/// The one `POST` of `/v1/enroll/nodes/{target}` is the adoption `{id}:adopt`, split the same
+/// way (the router takes one parameter to a segment and no text after it).
+const ADOPT_ROUTE: &str = "/v1/enroll/nodes/{}";
+
+/// Renames the `POST` of `ADOPT_ROUTE` to `POST ADOPT_ROUTE:adopt`.
+fn name_adopt(routes: Vec<Route>) -> Vec<Route> {
+    let post = ("POST".to_string(), ADOPT_ROUTE.to_string());
+    assert!(
+        routes.contains(&post),
+        "the router has no `POST {ADOPT_ROUTE}` any more: update this guard"
+    );
+    routes
+        .into_iter()
+        .map(|r| {
+            if r == post {
+                ("POST".to_string(), format!("{ADOPT_ROUTE}:adopt"))
+            } else {
+                r
+            }
+        })
+        .collect()
+}
+
 /// The exact number of `(method, path)` routes, verbs expanded. A new route moves it.
-const ROUTES: usize = 63;
+const ROUTES: usize = 55;
 
 fn server_routes() -> Vec<Route> {
     let mut files = Vec::new();
@@ -294,7 +317,7 @@ fn server_routes() -> Vec<Route> {
         ["cordon", "drain", "uncordon"],
         "write_request accepts other verbs: the guard and the documents need a row each"
     );
-    let mut routes = name_verify(expand_verbs(routes, &verbs));
+    let mut routes = name_adopt(name_verify(expand_verbs(routes, &verbs)));
     routes.sort();
     routes.dedup();
     routes
@@ -471,4 +494,15 @@ fn the_ui_design_names_no_route_the_server_dropped() {
         !text.contains("update/hosts"),
         "docs/design/kbf-ui-v1.md names `update/hosts`, a route the server no longer serves"
     );
+}
+
+#[test]
+fn the_rollout_rules_cite_no_removed_desired_route_or_moved_file() {
+    let text = fs::read_to_string(root().join("docs/design/frontend-proxy.md")).unwrap();
+    for stale in ["update/age.rs", "returns 409 otherwise"] {
+        assert!(
+            !text.contains(stale),
+            "docs/design/frontend-proxy.md still says `{stale}`: the desired-release route is gone and the age check lives in release/age.rs"
+        );
+    }
 }

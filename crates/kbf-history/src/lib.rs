@@ -12,9 +12,9 @@
 //!   [`Family`]s, object keys and, under an [`IndexRoot`], index row keys.
 //! - [`HistoryIndex`]: the state store under its [`IndexRoot`], every blocking call run
 //!   through an [`Offload`] (the server's blocking pool, or [`Inline`]).
-//! - [`RowKind`] and [`IndexRoot::permit`]: which kind of row a `ui/` key is (a writer's
-//!   own, an insert, or shared by every writer) and which a process may write once another
-//!   holds the state store's generation.
+//! - [`RowKind`] and [`Ownership`]: which kind of row a `ui/` key is (a writer's own, an
+//!   insert, or shared by every writer) and who may write it once another process holds the
+//!   state store's generation.
 //! - [`records`]: run, hit and outcome records, tails, command renderings and the
 //!   failed-run section, each with its `instance`; the index row values.
 //! - [`run_id`]: time-ordered [`RunId`]s, stream blocks and the fallback range.

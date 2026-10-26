@@ -25,10 +25,12 @@ path = "src/bin/kbf-guest-act.rs"
 test = false
 
 [dependencies]
+base64.workspace = true
 clap.workspace = true
 hex.workspace = true
 kbf-testkit.workspace = true
 libc.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 subtle.workspace = true
 thiserror.workspace = true

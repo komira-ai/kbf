@@ -58,6 +58,7 @@ fn listeners() -> Listeners {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -88,7 +89,6 @@ fn start(state: Option<StateStore>) -> Server {
         listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         token: Some(token()),
         local_cache: None,
-        releases: None,
     };
     let bound = bind_server_with_state(
         Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory()),
@@ -177,7 +177,7 @@ fn deny_body(entry: &str, reason: &str) -> String {
 /// differently from how it was added takes the serial off at a new generation, and a second
 /// removal is 404.
 ///
-/// Mutants seen red: the handlers not refreshing (the generation is the old one);
+/// Catches: the handlers not refreshing (the generation is the old one);
 /// `DELETE` adding instead of removing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_operator_denies_an_entry_and_takes_it_off_again() {
@@ -273,7 +273,7 @@ async fn an_operator_denies_an_entry_and_takes_it_off_again() {
 /// `POST` and on `DELETE`, and nothing may be listed afterwards (or removed from a list that
 /// has an entry).
 ///
-/// Mutants seen red: the `gate` call removed from `deny_entry`; the same from `allow_entry`.
+/// Catches: the `gate` call removed from `deny_entry`; the same from `allow_entry`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_deny_list_write_is_refused_without_the_gates() {
     let (server, other) = served();
@@ -315,7 +315,7 @@ async fn a_deny_list_write_is_refused_without_the_gates() {
 /// yet another case takes it off. Were it stored as typed, the removal would answer 404 and
 /// leave the node denied, or two spellings would be two entries to take off.
 ///
-/// Mutant seen red: `entry_of` leaving a node id as typed.
+/// Catches: `entry_of` leaving a node id as typed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_node_id_is_one_entry_whatever_its_case() {
     let (server, other) = served();

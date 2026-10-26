@@ -24,10 +24,15 @@ kbf-invocation.workspace = true
 kbf-map.workspace = true
 kbf-meta.workspace = true
 kbf-objstore.workspace = true
+# The packing client: the write rule, the reader and the read cache of the frontend's packs
+# (`proxy::packed`).
+kbf-pack.workspace = true
 kbf-proto.workspace = true
 kbf-route.workspace = true
 kbf-sched.workspace = true
 kbf-segments.workspace = true
+# `PackIndex` and `BlobDigest`: where the packs' blobs are found (`proxy::packed`).
+kbf-state.workspace = true
 kbf-storage.workspace = true
 kbf-store.workspace = true
 kbf-tier.workspace = true
@@ -45,6 +50,8 @@ tracing.workspace = true
 kbf-front = { workspace = true, features = ["testkit"] }
 # The loopback S3 service (`s3::fake`) the large-blob tests flush to.
 kbf-objstore = { workspace = true, features = ["testkit"] }
+# The in-memory pack index the pack tests record packs in.
+kbf-state = { workspace = true, features = ["test-support"] }
 # The REAPI service definitions, read from kbf-proto's vendored files, so the
 # authorization test (tests/auth.rs) covers every method the routes serve.
 protox.workspace = true

@@ -73,6 +73,8 @@ mod handover;
 mod learning;
 mod named;
 mod nodes;
+mod pack_reads;
+mod pack_writes;
 mod phase;
 mod record;
 pub mod sched_view;
@@ -81,7 +83,7 @@ pub use durable::{
     ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, ID_BLOCK, INTAKE_POLL, ORPHAN_WAIT,
     OWNER_CACHE_TTL, SESSION_RENEWAL, StateError,
 };
-pub use handover::UNTRACED_LOOKS;
+pub use handover::FOLLOW_EVERY;
 pub use phase::Reported;
 
 use self::ack::{Verdict, refusal};
@@ -120,6 +122,18 @@ pub fn process_term() -> u64 {
 
 /// Where the server sends a worker's messages: the outbound half of its stream.
 pub type Outbound = mpsc::UnboundedSender<Result<ServerMessage, Status>>;
+
+/// A test's check of the callers' stages at the point a `Start` is about to be sent.
+#[cfg(test)]
+pub(crate) type StartHook = Box<dyn Fn(Vec<Stage>)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Called with the stage of each caller of the operation just before a `Start` is sent,
+    /// by tests that check what is true at that point.
+    pub(crate) static BEFORE_START: std::cell::RefCell<Option<StartHook>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Names one worker stream, so messages from a replaced stream can be told apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -258,6 +272,17 @@ struct State {
     finished_retention: Duration,
     /// The channel of each caller the machine keeps, forgotten with its record.
     stages: BTreeMap<WaiterId, watch::Sender<Stage>>,
+    /// The operations a `Start` was sent for, marked before the `Start` leaves and never
+    /// cleared while the scheduler holds the operation: a drain ends the streams of an
+    /// operation that waits for a worker only if it is not in here.
+    ever_started: BTreeSet<OperationId>,
+    /// The nodes the drain cordoned itself when it closed this farm's intake
+    /// ([`State::hold_placements`]), as opposed to an operator's cordon: an operation
+    /// that waits only for these is queued, not stuck, since the other frontends take it.
+    drain_held: BTreeSet<WorkerId>,
+    /// The operations the scheduler says no live worker can run now, with its reason: the
+    /// ones whose stage [`State::stage_for`] decides again when what it depends on changes.
+    stuck: BTreeMap<OperationId, String>,
     next_stream: u64,
     /// The newest stream of each node the machine has registered.
     links: BTreeMap<WorkerId, Link>,
@@ -314,13 +339,14 @@ struct State {
     /// A handover took the work from this farm ([`Farm::fence`]): it feeds the scheduler
     /// nothing and queues nothing.
     fenced: bool,
+    /// A drain closed this farm's intake ([`Farm::close_intake`]): it takes in no queued
+    /// work of the other frontends and places none on its nodes, and goes on with what it
+    /// holds.
+    closed: bool,
     /// For each operation this farm's callers wait on ([`Farm::follow`]) that the last
-    /// looks found neither unfinished nor ended, how many looks in a row. Only reported
-    /// (`kbf_frontend_relay_untraced`): no look count ends a caller's wait.
+    /// looks found neither unfinished nor ended, how many looks in a row. Only logged:
+    /// no look count ends a caller's wait.
     untraced_kept: BTreeMap<OperationId, u32>,
-    /// The same for the operations relays follow ([`kbf_front::Handed::look`]), until
-    /// the relay lets go of them.
-    untraced_relayed: BTreeMap<OperationId, u32>,
     /// The learned-sizes shadow ([`crate::learned`]); off unless `--learned-sizes`
     /// says otherwise.
     learned: Learned,
@@ -333,6 +359,12 @@ struct State {
     /// hold, shown what the state store says of it at each intake poll while a ticket holds
     /// the channel ([`State::follow_watched`]).
     watched: BTreeMap<OperationId, watch::Sender<Stage>>,
+    /// The pack-read counts on the newest heartbeat of each node that sent any
+    /// ([`Farm::note_pack_reads`]).
+    pack_reads: BTreeMap<WorkerId, worker::PackReadCounts>,
+    /// The pack-write counts on the newest heartbeat of each node that sent any
+    /// ([`Farm::note_pack_writes`]).
+    pack_writes: BTreeMap<WorkerId, worker::PackWriteCounts>,
 }
 
 /// How many committed records the farm holds for a state store that refuses them.
@@ -414,6 +446,9 @@ impl Farm {
                 machine: FarmMachine::new(term),
                 finished_retention,
                 stages: BTreeMap::new(),
+                ever_started: BTreeSet::new(),
+                drain_held: BTreeSet::new(),
+                stuck: BTreeMap::new(),
                 next_stream: 0,
                 links: BTreeMap::new(),
                 paused: BTreeSet::new(),
@@ -432,14 +467,26 @@ impl Farm {
                 session_ok: BTreeMap::new(),
                 unclaimed: BTreeMap::new(),
                 fenced: false,
+                closed: false,
                 untraced_kept: BTreeMap::new(),
-                untraced_relayed: BTreeMap::new(),
                 learned: Learned::new(LearnedSizes::Off, 0, 0),
                 unwritten_floors: Vec::new(),
                 intake: Intake::default(),
                 watched: BTreeMap::new(),
+                pack_reads: BTreeMap::new(),
+                pack_writes: BTreeMap::new(),
             }),
         }
+    }
+
+    /// This farm, built at wall-clock time `unix_ms` (milliseconds since the Unix epoch)
+    /// instead of now: the day its size summaries age by. Set before
+    /// [`Farm::with_learned_sizes`].
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_wall_epoch(mut self, unix_ms: u64) -> Self {
+        self.epoch_unix_ms = unix_ms;
+        self
     }
 
     /// This farm, with learned sizes `mode` (`--learned-sizes`) over a first rung of
@@ -511,6 +558,14 @@ impl Farm {
         state.learned.publish(&metrics.estimator_shadow);
     }
 
+    /// Writes the changed size summaries to the state store now, as the tick does once
+    /// the write-behind interval has passed: for a test that would otherwise wait out
+    /// the interval.
+    #[doc(hidden)]
+    pub fn write_behind_now(&self) {
+        self.lock().write_behind(true);
+    }
+
     /// Operations waiting in the scheduler's queue for a lease, now (read under the
     /// scheduler's lock, not the gauge `/metrics` serves, which is a tick old).
     #[must_use]
@@ -554,13 +609,6 @@ impl Farm {
     #[must_use]
     pub fn open_executions(&self) -> u64 {
         self.cache.metrics().execute.open_executions.get()
-    }
-
-    /// Execute and WaitExecution calls this process forwards to its successor, open now
-    /// (`kbf_handover_relays_open`): each keeps a handed-over frontend alive.
-    #[must_use]
-    pub fn relays_open(&self) -> u64 {
-        self.cache.metrics().handover_relays_open.get()
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -1302,6 +1350,7 @@ impl State {
     /// placement follows at once), and carries out the effects in order. Returns the
     /// answers, for the caller to deliver once the lock is released.
     fn carry_out(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
+        self.hold_placements(now);
         self.watch_store(now);
         self.claim_pending(now);
         self.reserve_seqs();
@@ -1312,6 +1361,7 @@ impl State {
             event,
             Event::Tick | Event::Heartbeat { .. } | Event::Report { .. }
         );
+        let event = self.held_event(event);
         let mut effects: VecDeque<Effect> = self.sched.apply(Input::new(now, event)).into();
         effects.extend(self.sched.apply(Input::new(now, Event::Tick)));
         self.log_requeues();
@@ -1435,6 +1485,8 @@ impl State {
         let forgotten = self.machine.forget_dropped(held);
         self.answered
             .retain(|_, operation| sched.state(*operation).is_some());
+        self.ever_started
+            .retain(|operation| sched.state(*operation).is_some());
         for id in forgotten {
             self.stages.remove(&id);
         }
@@ -1527,7 +1579,23 @@ impl State {
     /// `Start` names the newest heartbeat taken on the worker's stream and the window
     /// after it in which the daemon may still act on the `Start` (issue #23).
     fn start(&mut self, start: StartLease) {
+        // Marked, and its callers shown executing, before the `Start` leaves: a stream
+        // that reads the stage later never sees an operation that has a `Start` in
+        // flight as one that cannot start.
+        self.ever_started.insert(start.operation);
+        let waiters = self.sched.waiters(start.operation).unwrap_or_default();
+        for stage in waiters.iter().filter_map(|id| self.stages.get(id)) {
+            stage.send_replace(Stage::Executing);
+        }
         let heartbeat_seq = self.links.get(&start.worker).map_or(0, |l| l.newest_beat);
+        #[cfg(test)]
+        BEFORE_START.with(|hook| {
+            if let Some(hook) = &*hook.borrow() {
+                let waiters = self.sched.waiters(start.operation).unwrap_or_default();
+                let stages = waiters.iter().filter_map(|id| self.stages.get(id));
+                hook(stages.map(|stage| stage.borrow().clone()).collect());
+            }
+        });
         self.send_for(&start.worker, start.operation, |_| {
             server_message::Message::Start(Start {
                 lease_id: Some(wire_lease(start.lease)),
@@ -1540,10 +1608,6 @@ impl State {
                 device_id: start.device.clone().unwrap_or_default(),
             })
         });
-        let waiters = self.sched.waiters(start.operation).unwrap_or_default();
-        for stage in waiters.iter().filter_map(|id| self.stages.get(id)) {
-            stage.send_replace(Stage::Executing);
-        }
         let now = SystemTime::now();
         // An operation with a `Start` has its first waiter (see `send_for`).
         let queued = self
@@ -1564,26 +1628,72 @@ impl State {
 
     /// Tells an operation's callers why it waits, or that it no longer waits for a
     /// worker that can run it. Logged, so an operator sees it too.
-    fn waiting(&self, waiting: &Waiting) {
+    fn waiting(&mut self, waiting: &Waiting) {
         let operation = waiting.operation;
         let stage = match &waiting.reason {
             Some(why) => {
                 tracing::warn!(%operation, reason = %why, "no live worker can run the operation");
-                Stage::Waiting(why.clone())
+                self.stuck.insert(operation, why.clone());
+                self.stage_for(operation, why)
             }
             None => {
                 tracing::info!(%operation, "a live worker can run the operation again");
+                self.stuck.remove(&operation);
                 Stage::Queued
             }
         };
-        // A caller that joins a waiting operation is told again; the others, who
-        // already know, see no repeated update.
+        self.show(operation, &stage);
+    }
+
+    /// The stage of `operation`, which no live worker of this frontend can run now (`why`).
+    /// `Waiting` means its streams can be ended by a drain: it was never started and can
+    /// never start here. Not that when it has run (`WaitingKept`); when another frontend
+    /// has a worker that could run it and takes it once this one stands down
+    /// (`WaitingKept`); or when the only thing between it and a worker is this drain's own
+    /// cordon, with the intake closed (`Queued`: it is queued for the other frontends like
+    /// any queued work). Held by an operator's cordon (alone, or beside the drain's) or by
+    /// no worker at all, with no other frontend to take it, it can never start.
+    fn stage_for(&self, operation: OperationId, why: &str) -> Stage {
+        let cordoned = self.sched.cordoned_could(operation);
+        let only_drain = !cordoned.is_empty()
+            && cordoned
+                .iter()
+                .all(|worker| self.drain_held.contains(worker));
+        let elsewhere = self.sched.request(operation).is_some_and(|request| {
+            let remote = &self.intake.remote;
+            remote
+                .iter()
+                .any(|(caps, capacity)| request.runnable_on(caps, capacity))
+        });
+        if self.ever_started.contains(&operation) || elsewhere {
+            Stage::WaitingKept(why.to_owned())
+        } else if only_drain {
+            Stage::Queued
+        } else {
+            Stage::Waiting(why.to_owned())
+        }
+    }
+
+    /// Decides again the stage of every operation that waits for a worker, after the
+    /// daemons of the other frontends were read.
+    fn republish_stuck(&mut self) {
+        let alive: BTreeSet<OperationId> = self.sched.queued().collect();
+        self.stuck.retain(|operation, _| alive.contains(operation));
+        for (operation, why) in self.stuck.clone() {
+            let stage = self.stage_for(operation, &why);
+            self.show(operation, &stage);
+        }
+    }
+
+    /// Shows `stage` to the callers of `operation`. A caller that joins a waiting
+    /// operation is told again; the others, who already know, see no repeated update.
+    fn show(&self, operation: OperationId, stage: &Stage) {
         let waiters = self.sched.waiters(operation).unwrap_or_default();
         for channel in waiters.iter().filter_map(|id| self.stages.get(id)) {
             channel.send_if_modified(|now| {
-                let changed = *now != stage;
+                let changed = *now != *stage;
                 if changed {
-                    now.clone_from(&stage);
+                    now.clone_from(stage);
                 }
                 changed
             });

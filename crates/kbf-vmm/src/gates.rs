@@ -13,7 +13,7 @@ use crate::report::Report;
 use crate::spec::{LIMIT_EXCEEDED, TaggedShare, VmSpec};
 
 /// A report for a base bundle that is not there, or `None` when it is.
-fn base_missing(ctx: &Ctx<'_>, probe: &str) -> Option<Report> {
+pub(crate) fn base_missing(ctx: &Ctx<'_>, probe: &str) -> Option<Report> {
     bundle::check(&ctx.base).err().map(|e| {
         Report::needs_manual(
             probe,
@@ -23,13 +23,17 @@ fn base_missing(ctx: &Ctx<'_>, probe: &str) -> Option<Report> {
     })
 }
 
-/// Stops every VM and removes its clone and share directories.
-fn clean(ctx: &Ctx<'_>, vms: &mut [Vm]) {
+/// Stops every VM and removes its clone and share directories, unless `--keep` asked for
+/// them to stay.
+pub(crate) fn clean(ctx: &Ctx<'_>, vms: &mut [Vm]) {
     for vm in vms.iter_mut() {
         vm.stop(&ctx.timing);
     }
+    if ctx.keep {
+        return;
+    }
     for vm in vms.iter() {
-        for suffix in ["", "-share", "-tagged"] {
+        for suffix in ["", "-share", "-tagged", "-results"] {
             let _ = std::fs::remove_dir_all(ctx.work.join(format!("{}{suffix}", vm.name)));
         }
     }
@@ -37,17 +41,17 @@ fn clean(ctx: &Ctx<'_>, vms: &mut [Vm]) {
 
 /// Which guest-to-host channel devices a probe VM gets.
 #[derive(Debug, Clone, Copy)]
-struct Channels {
+pub(crate) struct Channels {
     vsock: bool,
     console: bool,
 }
 
 impl Channels {
-    const NONE: Self = Self {
+    pub(crate) const NONE: Self = Self {
         vsock: false,
         console: false,
     };
-    const VSOCK: Self = Self {
+    pub(crate) const VSOCK: Self = Self {
         vsock: true,
         console: false,
     };
@@ -59,14 +63,30 @@ impl Channels {
 
 /// Points `spec` at `share`: the automount share and the tagged share, and the channel
 /// devices asked for.
-fn attach_share(spec: &mut VmSpec, share: &Share, channels: Channels) {
+pub(crate) fn attach_share(spec: &mut VmSpec, share: &Share, channels: Channels) {
     spec.automount_dir = Some(share.dir.clone());
-    spec.tagged = Some(TaggedShare {
-        tag: guest::TAG.to_owned(),
-        path: share.tagged.clone(),
-    });
+    // The guest daemons mount `SHARE_TAG` (the share directory itself, a tag the system
+    // does not mount on its own); `TAG` is the empty directory the probe mounts to answer
+    // G3. The automount tag is never mounted by hand: the system owns that device.
+    spec.tagged = vec![
+        TaggedShare {
+            tag: guest::SHARE_TAG.to_owned(),
+            path: share.dir.clone(),
+            multiple_name: None,
+            read_only: false,
+        },
+        TaggedShare {
+            tag: guest::TAG.to_owned(),
+            path: share.tagged.clone(),
+            multiple_name: None,
+            read_only: false,
+        },
+    ];
     if channels.vsock {
         spec.vsock_ports = vec![guest::VSOCK_PORT];
+        // The guest sends its results and markers on that port; the helper writes them into
+        // the host's private directory, never into the share the guest can write.
+        spec.results_dir = Some(share.received.clone());
     }
     if channels.console {
         spec.console_ports = vec![guest::CONSOLE_NAME.to_owned()];
@@ -74,7 +94,7 @@ fn attach_share(spec: &mut VmSpec, share: &Share, channels: Channels) {
 }
 
 /// Starts a clone of the base with a share and the channel devices asked for.
-fn start_guest_clone(
+pub(crate) fn start_guest_clone(
     ctx: &Ctx<'_>,
     name: &str,
     identity: Identity,
@@ -95,7 +115,7 @@ fn start_guest_clone(
 fn guest_userspace_ms(ctx: &Ctx<'_>, vm: &mut Vm, share: &Share) -> Option<f64> {
     let marker = share.results().join(guest::READY_SYSTEM);
     vm.wait_file(&marker, ctx.timing.guest_timeout, ctx.timing.tick)
-        .map(|_| vm.began.elapsed().as_secs_f64() * 1000.0)
+        .map(|_| vm.since_spawn().as_secs_f64() * 1000.0)
 }
 
 /// Starts `count` clones of `prefix` with `identity` at once and judges each. "Booted"
@@ -159,9 +179,12 @@ fn clone_arm(
         "vms": boots
             .iter()
             .zip(&userspace)
-            .map(|(b, u)| {
+            .zip(&vms)
+            .map(|((b, u), vm)| {
                 let mut j = b.json();
                 j["guest_marker_ms"] = json!(u);
+                // Every helper event with its time, and why the wait ended early, if it did.
+                j["trace"] = vm.trace_json();
                 j
             })
             .collect::<Vec<_>>(),
@@ -250,7 +273,13 @@ fn guest_session(
             true,
         ));
     }
-    let run = guest::collect(ctx, &mut vm, &share, wanted);
+    // Over vsock the answer is in the host's own directory; otherwise in the share.
+    let from = if channels.vsock {
+        share.received.clone()
+    } else {
+        share.results()
+    };
+    let run = guest::collect(ctx, &mut vm, &from, wanted);
     clean(ctx, std::slice::from_mut(&mut vm));
     Ok((run, boot, have_binary))
 }
@@ -561,9 +590,18 @@ pub fn p0(ctx: &Ctx<'_>) -> Report {
     if let Err(e) = bundle::clone_bundle(ctx.sys, &ctx.base, &dest, Identity::Keep) {
         return Report::error("p0", e.to_string());
     }
-    let written = ctx
-        .sys
-        .offline_write(&dest.join(bundle::DISK), &guest::offline_payload());
+    let payload = match &ctx.guest_binary {
+        Some(bin) => guest::offline_payload_from(bin),
+        None => Ok(guest::offline_payload(None)),
+    };
+    let payload = match payload {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dest);
+            return Report::error("p0", e);
+        }
+    };
+    let written = ctx.sys.offline_write(&dest.join(bundle::DISK), &payload);
     let boot = match (&written, ctx.guest_binary.is_some()) {
         (Ok(_), true) => boot_for_payload(ctx, &dest),
         (Ok(_), false) => json!({
@@ -646,6 +684,15 @@ pub fn run(ctx: &Ctx<'_>, gate: Gate, run_as: Option<u32>) -> Report {
         Gate::G2 => g2(ctx),
         Gate::G3 => g3(ctx),
         Gate::G5 => g5(ctx, run_as),
+        Gate::E1 => crate::e1::e1(ctx),
+        Gate::E3 => crate::e3::e3(
+            ctx,
+            if ctx.graphics {
+                crate::cli::Graphics::On
+            } else {
+                crate::cli::Graphics::Off
+            },
+        ),
         Gate::P0 => p0(ctx),
         Gate::P2 => p2(ctx),
         Gate::P6 => p6(ctx),

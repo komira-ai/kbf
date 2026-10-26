@@ -5,26 +5,27 @@
 //! The packages ship these files disabled, with no rendering: kbf-installer's own unit and the
 //! proxy units (the kbf-installer package), and each mode's unit, the frontend's included (the
 //! kbf package, which runs `/usr/bin/kbf`), gated on `/etc/kbf/kbf.toml`
-//! (`ConditionPathExists=`), on `kbf-installer boot-check --kbf=/usr/bin/kbf --mode=<mode>` and
-//! on `kbf --mode=<mode> --check` (both `ExecStartPre=`; `ExecCondition=` would skip a failed
-//! check silently).
-//! The rules are held here, over the unit parser (`kbf_unitfile`) the docs check uses, each with the defect it catches, and `MUTANTS`
+//! (`ConditionPathExists=`), on `kbf boot-check --mode=<mode>` and on `kbf --mode=<mode> --check`
+//! (both `ExecStartPre=`; `ExecCondition=` would skip a failed check silently).
+//! The rules are held here, over the unit parser (`kbf_unitfile`) the docs check uses, each with the defect it catches, and `DEFECTS`
 //! plants one defect per rule in a copy of the real file and requires that rule to name
-//! it. `every_rule_has_a_mutant` fails when a rule is added with no mutant, so no rule
+//! it. `every_rule_has_a_defect` fails when a rule is added with no defect, so no rule
 //! can be one that cannot fail.
 //!
 //! Catches:
 //! - a unit missing a rule that its mode needs (`restart`, `stop`, `kill-mode`,
 //!   `delegate`, `credential`, `caps`, `swap`, `oom`, `cpuset`, user, slice,
 //!   `LimitNOFILE`), each named below;
-//! - a unit that runs a program other than `/usr/bin/kbf` and the installer's binary,
-//!   another mode than its name, a `--config` or any flag the contract does not give it;
+//! - a unit that runs a program other than `/usr/bin/kbf` and the installer's binary (the
+//!   installer's own unit and the proxy's), another mode than its name, a `--config` or any
+//!   flag the contract does not give it;
 //! - kbf-installer's own unit running anything but `run`, or gating its start on a step that is
 //!   not built; the verbs every unit and the macOS property list name exist, and the runtime
 //!   units' program is `/usr/bin/kbf`: `package_installer_verbs.rs`;
 //! - a unit that starts without its gate (`ConditionPathExists=`, the two checks, in
 //!   order), or whose gate is `ExecCondition=` or a `-`-prefixed command that ignores a
-//!   failure, or whose `boot-check` names another kbf or another mode than the unit's;
+//!   failure, or whose `boot-check` is not `kbf boot-check` for the unit's own mode, run as
+//!   root;
 //! - kbf-installer's own unit losing a hardening key or its place before the runtime units;
 //! - a kbf-deploy placeholder (`@KEY@`, `<value>`) left in a file that is not rendered;
 //! - a file added or removed without this test being told.
@@ -64,12 +65,12 @@ const FILES: [&str; 9] = [
     "kbf.slice",
 ];
 
-/// The runtime units kbf-installer starts before (`Before=` of its unit).
-const RUNTIME: [&str; 6] = [
+/// The runtime units kbf-installer starts before (`Before=` of its unit). The proxy is not one:
+/// it runs no release.
+const RUNTIME: [&str; 5] = [
     "kbf-all-in-one.service",
     "kbf-daemon.service",
     "kbf-frontend.service",
-    "kbf-proxy.service",
     "kbf-storage-and-daemon.service",
     "kbf-storage.service",
 ];
@@ -296,8 +297,9 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     }
 
     // Every program the unit runs is a package's own file: the kbf-installer package replaces
-    // /usr/bin/kbf-installer, the kbf package replaces /usr/bin/kbf. Only the two root checks
-    // carry a `+`; a `-` would ignore a failed gate, and `!`, `@`, `:` change the sandbox.
+    // /usr/bin/kbf-installer, the kbf package replaces /usr/bin/kbf. Only the root check
+    // (`kbf boot-check`) carries a `+`; a `-` would ignore a failed gate, and `!`, `@`, `:`
+    // change the sandbox.
     // The proxy's reload is the one `ExecReload` a unit may have, and it runs a program outside
     // the packages' files (`/bin/kill`): `proxy-reload` pins its exact text, so the generic
     // exec and reload rules skip that one key there.
@@ -309,7 +311,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         .map(|d| (d.key.as_str(), trim(&d.value)))
         .collect();
     for (key, value) in &execs {
-        let plus_ok = value.starts_with(&format!("+{INSTALLER} boot-check"));
+        let plus_ok = value.starts_with(&format!("+{KBF} boot-check"));
         if value.starts_with(['-', '!', '@', ':']) || (value.starts_with('+') && !plus_ok) {
             v("exec-prefix", format!("{key}={value}"));
         }
@@ -418,11 +420,13 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     for (key, value) in &execs {
         let mut words = value.trim_start_matches('+').split_whitespace();
         let mut after_config = false;
+        // The root check's word is `boot-check`; the rule `gate-check` pins the line it is in.
+        let verb = *key == "ExecStartPre";
         if words.next().is_some_and(|p| p.ends_with("/kbf"))
             && let Some(w) = words.find(|w| {
                 // `--config FILE` takes its value as the next word.
                 let is_value = std::mem::replace(&mut after_config, *w == "--config");
-                !w.starts_with('-') && !is_value
+                !(w.starts_with('-') || is_value || (verb && *w == "boot-check"))
             })
         {
             v(
@@ -439,10 +443,11 @@ fn violations(name: &str, text: &str) -> Vec<String> {
             format!("ExecStart= flags are {flags:?}, not {allowed:?}"),
         );
     }
-    // Catches a start without the two checks, in this order: boot-check first (root, brings the
-    // state database to the schema the kbf at /usr/bin/kbf needs, for the mode the unit runs),
-    // then the mode's own `--check`. Written as ExecStartPre=, so a failure fails the unit.
-    let boot = format!("+{INSTALLER} boot-check --kbf={KBF} --mode={mode}");
+    // Catches a start without the two checks, in this order: boot-check first (root, `kbf
+    // boot-check` brings the state database to the schema the kbf at /usr/bin/kbf needs, for the
+    // mode the unit runs), then the mode's own `--check`. Written as ExecStartPre=, so a failure
+    // fails the unit.
+    let boot = format!("+{KBF} boot-check --mode={mode}");
     let check = format!("{KBF} --mode={mode} --check");
     let mut want: Vec<&str> = vec![boot.as_str()];
     want.push(check.as_str());
@@ -648,8 +653,8 @@ fn violations(name: &str, text: &str) -> Vec<String> {
 
     if plain {
         // Catches a plain frontend that still carries the handover model: a template, an
-        // instance (kbf refuses --instance without --handover-socket), a control socket,
-        // a RuntimeDirectory= for it, a `%i`. Read over every line of the unit's commands.
+        // instance and a control socket (flags kbf still accepts, ignores and warns of), a
+        // RuntimeDirectory= for it, a `%i`. Read over every line of the unit's commands.
         if name.contains('@') {
             v("proxyless", "a template unit".into());
         }
@@ -836,7 +841,7 @@ fn the_kbf_modes_are_exactly_the_five() {
     want.sort_unstable();
     assert_eq!(want.len(), 5);
     assert_eq!(modes_in(&FILES), want);
-    // The mutants: a unit for a mode that does not exist, and one unit fewer.
+    // The defects: a unit for a mode that does not exist, and one unit fewer.
     let mut extra = FILES.to_vec();
     extra.push("kbf-node.service");
     assert_ne!(modes_in(&extra), want, "an extra mode unit must not pass");
@@ -868,7 +873,7 @@ fn the_installers_run_and_cache_directories_are_made_by_tmpfiles() {
 
 /// One defect per rule, planted in a copy of the real file: `(file, from, to, rule)`.
 /// `to` replaces the first `from`; the rule named must report the copy.
-const MUTANTS: &[(&str, &str, &str, &str)] = &[
+const DEFECTS: &[(&str, &str, &str, &str)] = &[
     (
         "kbf-storage.service",
         "After=network-online.target\n",
@@ -913,7 +918,7 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-daemon.service",
-        "ExecStartPre=+/usr/bin/kbf-installer boot-check --kbf=/usr/bin/kbf --mode=daemon\n",
+        "ExecStartPre=+/usr/bin/kbf boot-check --mode=daemon\n",
         "",
         "gate-check",
     ),
@@ -1274,7 +1279,7 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-frontend.service",
-        "ExecStartPre=+/usr/bin/kbf-installer boot-check --kbf=/usr/bin/kbf --mode=frontend\n",
+        "ExecStartPre=+/usr/bin/kbf boot-check --mode=frontend\n",
         "",
         "gate-check",
     ),
@@ -1346,47 +1351,49 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
-/// Catches a rule in `RULES` that would pass a unit with its defect: each mutant must be
+/// Catches a rule in `RULES` that would pass a unit with its defect: each defect must be
 /// reported by the rule it names, and the unmutated file by none.
 #[test]
 fn each_planted_defect_is_reported_by_its_rule() {
-    for (file, from, to, rule) in MUTANTS {
+    for (file, from, to, rule) in DEFECTS {
         let text = read(file);
         assert!(
             text.contains(from),
-            "{file}: the mutant's `{from}` is not in the file"
+            "{file}: the defect's `{from}` is not in the file"
         );
-        let mutant = text.replacen(from, to, 1);
-        assert_ne!(mutant, text);
-        let found = violations(file, &mutant);
+        let broken = text.replacen(from, to, 1);
+        assert_ne!(broken, text);
+        let found = violations(file, &broken);
         assert!(
             rules_of(&found).contains(rule),
-            "{file}: mutant `{from}` -> `{to}` was not reported by rule {rule}: {found:?}"
+            "{file}: defect `{from}` -> `{to}` was not reported by rule {rule}: {found:?}"
         );
     }
 }
 
 /// Asserts that the `gate-check` rule reports each of the five mode units whose `boot-check`
-/// is not `--kbf=/usr/bin/kbf --mode=<the unit's mode>`: one with neither flag, one that names
-/// the `kbf` of the earlier layout's release tree, and one that names the mode of another unit.
+/// is not `+/usr/bin/kbf boot-check --mode=<the unit's mode>`: one with no mode, one that is
+/// the installer's `boot-check` of the earlier packages, one that names the mode of another
+/// unit and one that does not run as root.
 #[test]
-fn a_boot_check_that_names_another_kbf_or_mode_fails_the_gate_check_of_every_mode_unit() {
+fn a_boot_check_other_than_kbfs_for_the_units_mode_fails_the_gate_check_of_every_mode_unit() {
     let mut checked = 0;
     for name in FILES.iter().filter(|n| mode_of(n).is_some()) {
         let mode = mode_of(name).expect("a mode unit");
         let text = read(name);
-        let right = format!("boot-check --kbf={KBF} --mode={mode}\n");
+        let right = format!("+{KBF} boot-check --mode={mode}\n");
         assert!(text.contains(&right), "{name}: no `{right}`");
-        let tree = "/var/lib/kbf-installer/releases/current/kbf";
+        let earlier = format!("+{INSTALLER} boot-check --kbf={KBF} --mode={mode}\n");
         let other = if mode == "daemon" {
             "storage"
         } else {
             "daemon"
         };
         for wrong in [
-            "boot-check\n".to_owned(),
-            format!("boot-check --kbf={tree} --mode={mode}\n"),
-            format!("boot-check --kbf={KBF} --mode={other}\n"),
+            format!("+{KBF} boot-check\n"),
+            earlier,
+            format!("+{KBF} boot-check --mode={other}\n"),
+            format!("{KBF} boot-check --mode={mode}\n"),
         ] {
             let changed = text.replacen(&right, &wrong, 1);
             let found = violations(name, &changed);
@@ -1410,8 +1417,8 @@ fn a_daemon_stop_timeout_must_exceed_the_drain_deadline() {
     let text = read(name);
     let shipped = "\nTimeoutStopSec=660\n";
     assert!(text.contains(shipped));
-    let stop = |mutant: &str| {
-        violations(name, mutant)
+    let stop = |broken: &str| {
+        violations(name, broken)
             .into_iter()
             .filter(|f| f.starts_with("stop:"))
             .count()
@@ -1452,17 +1459,63 @@ fn units_that_host_the_daemon_signal_only_the_main_process_on_stop() {
     }
 }
 
-/// Catches a rule with no mutant (a check that cannot be shown to fail), and a mutant
+/// Catches a rule with no defect (a check that cannot be shown to fail), and a defect
 /// for a rule that does not exist.
 #[test]
-fn every_rule_has_a_mutant() {
+fn every_rule_has_a_defect() {
     for rule in RULES {
         assert!(
-            MUTANTS.iter().any(|m| m.3 == rule),
-            "rule {rule} has no mutant"
+            DEFECTS.iter().any(|m| m.3 == rule),
+            "rule {rule} has no defect"
         );
     }
-    for m in MUTANTS {
-        assert!(RULES.contains(&m.3), "mutant names no rule: {}", m.3);
+    for m in DEFECTS {
+        assert!(RULES.contains(&m.3), "defect names no rule: {}", m.3);
+    }
+}
+
+/// Asserts that every unit `setup` enables on a Linux host, for each mode it takes, is a unit
+/// the `kbf` deb ships. The deb's files are the plan `cargo xtask pkg-config` writes from the
+/// real packaging directory (not a list here); the units `setup` enables are `mode_units`,
+/// which `kbf-setup`'s own tests hold to the `systemctl enable` commands it runs.
+///
+/// Catches: `setup` enabling a unit no package carries (the installer's or the proxy's, which
+/// the deb no longer ships), which would fail the last step of `kbf setup --apply` on a fresh
+/// host that has only the `kbf` deb.
+#[test]
+fn setup_enables_only_units_the_kbf_deb_ships() {
+    use clap::ValueEnum;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux");
+    let at = |rel: &str| -> PathBuf { root.join(rel) };
+    let plan = xtask::pkg_linux::kbf_plan(&xtask::pkg_linux::Inputs {
+        kbf: &at("units/kbf-daemon.service"),
+        units: &at("units"),
+        trust: &at("testdata/trust"),
+        sysusers: &at("sysusers.d/kbf-installer.conf"),
+        tmpfiles: &at("tmpfiles.d/kbf-installer.conf"),
+        needrestart: &at("needrestart/kbf.conf"),
+        platform: xtask::package::Platform::LinuxX86_64,
+        version: "0.0.0+ci",
+    })
+    .expect("the real packaging directory is a plan");
+    let shipped: Vec<&str> = plan
+        .iter()
+        .filter_map(|e| {
+            e.dst
+                .strip_prefix(&format!("{}/", xtask::pkg_linux::UNIT_DIR))
+        })
+        .collect();
+    assert!(shipped.contains(&"kbf-daemon.service"), "{shipped:?}");
+    let modes = kbf_installer::cli::Mode::value_variants();
+    assert_eq!(modes.len(), 5, "every mode is checked");
+    for mode in modes {
+        let units = kbf_installer::setup::plan::mode_units(*mode);
+        assert!(!units.is_empty(), "{mode:?}");
+        for unit in units {
+            assert!(
+                shipped.contains(unit),
+                "setup enables {unit} for {mode:?}, which the kbf deb does not ship: {shipped:?}"
+            );
+        }
     }
 }

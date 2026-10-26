@@ -27,6 +27,15 @@
 //!   lease the session switch's intent record names (`session-idle` first).
 //! - The first `user-create` closes the baseline window, and makes a dirty scan's
 //!   verdict stale (`reboot-dirty` then needs a new scan).
+//! - The standing VM user ([`role`], `--vm-user`) is the one account besides lease users
+//!   the helper acts on. Its verbs (`role-run`, `role-session-ready`, `role-kill-uid`)
+//!   take no lease: the account is looked up by its configured name, and its uid must be
+//!   an ordinary uid outside the lease range. `role-run` and `role-session-ready` answer
+//!   for the GUI session only while no lease holds it.
+//! - The image verbs ([`image`]: `image-setup`, `image-harvest`) run the one installed
+//!   `kbf-vmm` as root on a bundle directly inside the staging or images directory, with
+//!   argv the helper builds; the caller names only the bundle (and the output directory).
+//!   A base the setup built stays root's, sealed.
 //! - Every verb but `boot-reset` is refused until the boot reset has succeeded.
 //!
 //! The mutating verbs run one at a time (one lock around the ledger), and `run` holds
@@ -43,18 +52,21 @@ use std::time::SystemTime;
 use kbf_types::LeaseId;
 use rustix::fs::{CWD, Gid, Mode, OFlags, Uid};
 
-use crate::autologin::{CommandOutput, SessionPaths, read_intent};
+use crate::autologin::{CommandOutput, Intent, SessionPaths, read_intent};
 use crate::grant::{self, Expect, GrantKeys};
-use crate::lease::{UidRange, parse_lease, user_name};
+use crate::lease::{UidRange, VmUser, parse_lease, user_name};
 use crate::ledger::{Entry, Ledger};
 use crate::proto::{Reply, Request, Session};
 use crate::scan::ScanSettings;
 use crate::spawn::{self, Spawn};
 use crate::sweep::{SweepPlan, sweep};
 
+mod image;
 mod leak;
+mod role;
 mod switch;
 
+pub use image::{CHFLAGS, ImageSettings};
 pub use switch::Reset;
 
 /// How many times `kill-uid` kills and looks again before it gives up.
@@ -126,18 +138,48 @@ pub trait Host: Send + Sync {
     /// # Errors
     /// The program could not be started or waited for.
     fn command(&self, program: &str, args: &[&str]) -> io::Result<CommandOutput>;
+    /// The account record named `name`; `None` when there is none.
+    ///
+    /// # Errors
+    /// The directory could not be asked.
+    fn account(&self, name: &str) -> io::Result<Option<Account>>;
     /// Gives the user `name` a fresh random password and returns it, for
     /// `/etc/kcpassword`; no one else is told it.
     ///
     /// # Errors
     /// There is no such user, or the password could not be set.
     fn reset_password(&self, name: &str) -> io::Result<String>;
+    /// Clones the open file `src` as the new file `name` in the directory `dir`: a
+    /// copy-on-write copy (macOS: `fclonefileat` with `CLONE_NOOWNCOPY`) with a new inode,
+    /// owned by the caller, so a descriptor someone holds on `src` reaches nothing of it.
+    ///
+    /// # Errors
+    /// `name` exists, the volume cannot clone, or the copy failed.
+    fn clone_file(
+        &self,
+        src: std::os::fd::BorrowedFd<'_>,
+        dir: std::os::fd::BorrowedFd<'_>,
+        name: &str,
+    ) -> io::Result<()>;
+    /// Clears every user flag (`uchg` among them) of the open file `file` (macOS:
+    /// `fchflags(fd, 0)`), as root. A clone of a flagged file is flagged.
+    ///
+    /// # Errors
+    /// The flags could not be cleared.
+    fn clear_user_flags(&self, file: std::os::fd::BorrowedFd<'_>) -> io::Result<()>;
     /// This boot's identifier (macOS: `kern.bootsessionuuid`), for the baseline
     /// window.
     ///
     /// # Errors
     /// The kernel did not say.
     fn boot_session(&self) -> io::Result<String>;
+}
+
+/// The ids of an account record the helper did not create (the VM user's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Account {
+    pub uid: u32,
+    pub gid: u32,
 }
 
 /// A live process of a lease uid, as a refusal names it.
@@ -194,8 +236,15 @@ pub struct Settings {
     pub serial: String,
     /// Where the session switch keeps its state.
     pub session: SessionPaths,
+    /// The standing VM user, when this Mac is provisioned for VMs: the Mac rests at it
+    /// (`session-idle`) and the `role-*` verbs act for it. `None` for a Mac that serves
+    /// whole-machine leases only, which rests at the login window.
+    pub vm_user: Option<VmUser>,
     /// What the leak scan looks at, and where it keeps its baseline and window.
     pub scan: ScanSettings,
+    /// The images directory and the installed programs of `image-setup` and
+    /// `image-harvest`.
+    pub image: ImageSettings,
 }
 
 /// What a request comes to.
@@ -217,6 +266,9 @@ pub struct Helper {
     /// Set, under the ledger's lock, when the last scan came back dirty and no lease
     /// user was created since: the one state `reboot-dirty` is accepted in.
     dirty: AtomicBool,
+    /// Held while an image verb runs: one at a time, apart from the ledger's lock, which
+    /// a minutes-long `kbf-vmm` must not hold back the other verbs with.
+    images: Mutex<()>,
 }
 
 impl Helper {
@@ -228,6 +280,7 @@ impl Helper {
             ledger: Mutex::new(ledger),
             reset_done: AtomicBool::new(false),
             dirty: AtomicBool::new(false),
+            images: Mutex::new(()),
         }
     }
 
@@ -253,7 +306,12 @@ impl Helper {
                     .run_in(&lease, argv, env, fds, session)
                     .map_or_else(refused, Outcome::Running);
             }
-            _ if !fds.is_empty() => Err("only run takes descriptors".to_owned()),
+            Request::RoleRun { argv, env } => {
+                return self
+                    .role_run(argv, env, fds)
+                    .map_or_else(refused, Outcome::Running);
+            }
+            _ if !fds.is_empty() => Err("only run and role-run take descriptors".to_owned()),
             Request::UserCreate { lease, grant } => self
                 .user_create(&lease, grant.as_deref())
                 .map(|uid| Reply::Created { uid }),
@@ -265,6 +323,16 @@ impl Helper {
                 self.session_login(&lease).map(|()| Reply::Restarting)
             }
             Request::SessionIdle => self.session_idle().map(|()| Reply::Restarting),
+            Request::RoleSessionReady => self
+                .role_session_ready()
+                .map(|ready| Reply::SessionReady { ready }),
+            Request::RoleKillUid => self.role_kill_uid().map(|()| Reply::Killed),
+            Request::ImageSetup { bundle } => self
+                .image_setup(&bundle)
+                .map(|report| Reply::Imaged { report }),
+            Request::ImageHarvest { bundle, out } => self
+                .image_harvest(&bundle, &out)
+                .map(|report| Reply::Imaged { report }),
             Request::SessionReady { lease } => self
                 .session_ready(&lease)
                 .map(|ready| Reply::SessionReady { ready }),
@@ -448,7 +516,7 @@ impl Helper {
     /// Whether `lease`, whose user has `uid`, holds the GUI session and its domain is
     /// up; refused when the intent record does not name it.
     fn gui_up(&self, lease: LeaseId, uid: u32) -> Result<bool, String> {
-        if read_intent(&self.settings.session.intent)? != Some(lease) {
+        if read_intent(&self.settings.session.intent)? != Some(Intent::Lease(lease)) {
             return Err(format!(
                 "lease {lease} does not hold the GUI session; session-login first"
             ));
@@ -478,18 +546,24 @@ impl Helper {
     /// [`Self::kill_uid`], with the ledger's lock held.
     fn kill_locked(&self, ledger: &Ledger, lease: LeaseId) -> Result<(), String> {
         let uid = self.live_uid(ledger, lease)?;
+        self.kill_account(&user_name(lease), uid)?;
+        tracing::info!(lease = %lease, uid, "no process of the lease user is left");
+        Ok(())
+    }
+
+    /// Boots out the GUI and user domains of `uid` and kills every process of it, as
+    /// [`Self::kill_uid`] describes, for the account `name`.
+    fn kill_account(&self, name: &str, uid: u32) -> Result<(), String> {
         for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
             if let Err(why) = self.host.bootout(&domain) {
-                tracing::debug!(lease = %lease, "launchctl bootout {domain}: {why}");
+                tracing::debug!("launchctl bootout {domain}: {why}");
             }
         }
         self.kill_rounds(uid)?;
         // Swept only once nothing of the user runs (the sweep's contract).
-        let schedules = Self::sweep_all(&self.settings.schedules, &user_name(lease), uid);
+        let schedules = Self::sweep_all(&self.settings.schedules, name, uid);
         self.kill_rounds(uid)?;
-        let removed = schedules?;
-        tracing::info!(lease = %lease, uid, removed, "no process of the lease user is left");
-        Ok(())
+        schedules.map(drop)
     }
 
     /// Kills every process of `uid` until none is left, for at most [`KILL_ROUNDS`].
@@ -536,7 +610,7 @@ impl Helper {
         if ledger.get(lease).is_some_and(|entry| entry.deleted) {
             return Ok(false);
         }
-        if read_intent(&self.settings.session.intent)? == Some(lease) {
+        if read_intent(&self.settings.session.intent)? == Some(Intent::Lease(lease)) {
             return Err(format!(
                 "lease {lease} holds the GUI session (auto-login); session-idle first"
             ));

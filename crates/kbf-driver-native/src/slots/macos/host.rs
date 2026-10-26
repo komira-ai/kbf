@@ -4,14 +4,13 @@
 //! [`crate::slots::domain`] and [`crate::slots::crash`], tested on every platform.
 //!
 //! - C1 is [`domain::end`] over a real `launchctl`: the domains `user/<uid>` and
-//!   `gui/<uid>` booted out whole, then `launchctl print user/<uid>` polled until only
-//!   launchd's own jobs are left. A job is launchd's own when its plist lies in the
-//!   sealed system folders ([`probe::OWN_PLISTS`]), never by its label, which a lease
-//!   chooses. The crontab, `at` jobs and the shared places are swept by uid with
+//!   `gui/<uid>` booted out whole. After it **no `launchctl` verb is run on either
+//!   domain**: a root `print` makes a missing `user/<uid>` again, with launchd's agents
+//!   running in it as the uid. What is left is read from the process table by uid. The
+//!   crontab, `at` jobs and the shared places are swept by uid with
 //!   `kbf_mac_session::sweep`, which never follows a link and stays on one filesystem.
-//! - The check reads, never removes. Processes that launchd lists as running one of
-//!   its own agents are not counted ([`leftover_processes`]): launchd starts them again
-//!   as the uid on demand after the kill.
+//! - The check reads, never removes. Every process of the uid is counted
+//!   ([`leftover_processes`]).
 //! - Not reached: Background Task Management entries (macOS removes none for one uid).
 //! - Disk images: every image `hdiutil info -plist` says the uid attached is detached
 //!   (`hdiutil detach -force`), then every mount under the home or the entry is unmounted
@@ -19,11 +18,16 @@
 //! - System V IPC: every message queue, shared memory segment and semaphore set
 //!   `ipcs` lists with the user as owner or creator is removed (`ipcrm`). POSIX named
 //!   semaphores and shared memory are not reached: macOS lists them nowhere.
-//! - C6 clears the flags on the home and the entry **first** (`sweep::clear_flags` opens
-//!   each root and clears it before it looks below), removes ACLs of the uid's entries
-//!   (`find -x ... -user <uid> -exec chmod -N`, so a hard link to another owner's file
-//!   keeps its ACL) and sets the owner's `u+rwx`. C7 then empties the home, whoever owns
-//!   what is in it, and the entry, keeping `0`, `C`, `T` and `X` ([`probe::SKELETON`]).
+//! - C6 clears the flags on the home **first** (`sweep::clear_flags` opens each root and
+//!   clears it before it looks below), removes ACLs of the uid's entries (`find -x ...
+//!   -user <uid> -exec chmod -N`, so a hard link to another owner's file keeps its ACL)
+//!   and sets the owner's `u+rwx`. C7 then empties the home, whoever owns what is in it.
+//! - The `/var/folders` entry is cleaned **as the slot's uid**, never as root
+//!   ([`crate::slots::entry`]): the daemon is a launch daemon without Full Disk Access,
+//!   and root cannot clear the flags or ACLs of the entry's `0`, `C`, `T` and `X` nor
+//!   list them, while their owner can. C6 does for the entry what it does for the home,
+//!   by a child that drops to the uid; C7 empties the entry that way, keeping `0`, `C`,
+//!   `T` and `X` ([`probe::SKELETON`]); the check looks at it that way too.
 //! - C10 gives the home back to the user, mode 0700, no flags (made anew if it is gone),
 //!   and the entry's roots what they had when the slot was resolved
 //!   ([`super::Entry`]), without a lock or `hidden`.
@@ -31,7 +35,7 @@
 //! The user is never deleted or made again: a step that fails leaves the user dirty
 //! (`clean.rs`).
 
-use std::io::{self, Read as _};
+use std::io;
 use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
@@ -46,7 +50,7 @@ use super::Ready;
 use crate::slots::assertion;
 use crate::slots::clean::{Left, Os, Step};
 use crate::slots::domain::{self, Launchd, Said};
-use crate::slots::{crash, probe};
+use crate::slots::{crash, entry, probe};
 
 const HDIUTIL: &str = "/usr/bin/hdiutil";
 const DISKUTIL: &str = "/usr/sbin/diskutil";
@@ -57,8 +61,7 @@ const CHMOD: &str = "/bin/chmod";
 const IPCS: &str = "/usr/bin/ipcs";
 const IPCRM: &str = "/usr/bin/ipcrm";
 
-/// How long a `launchctl` that was killed, or has exited, is waited for to be reaped and
-/// its output read.
+/// How long a `launchctl` that was killed is waited for to be reaped.
 const READ_GRACE: Duration = Duration::from_secs(2);
 
 /// The wait between the check's two looks.
@@ -79,9 +82,9 @@ pub struct MacSlot<'a> {
     /// The uids of the pool's users: C9 does not walk a folder one of them owns a
     /// directory on the path of.
     pub pool: std::ops::RangeInclusive<u32>,
-    /// What this clean has judged of launchd's services ([`probe::OwnLabels`]); a clean
-    /// reads each service's plist once.
-    pub(super) judged: probe::OwnLabels,
+    /// The daemon's binary: the `/var/folders` entry is cleaned by it, as the slot's user
+    /// ([`entry`]).
+    pub(super) program: &'a Path,
 }
 
 /// `launchctl`, run for real: each call is killed at its alarm.
@@ -89,36 +92,24 @@ struct Launchctl;
 
 impl Launchd for Launchctl {
     fn run(&self, args: &[&str], alarm: Duration) -> Said {
+        // Nothing is read: no verb run here prints anything the clean needs.
         let child = Command::new(uid::LAUNCHCTL)
             .args(args)
             .env_clear()
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn();
         let mut child = match child {
             Ok(child) => child,
             Err(why) => return Said::Missing(why.to_string()),
         };
-        // Read as it is written: a domain's listing is larger than a pipe holds. The reader
-        // reports through a channel, so no wait for it is unbounded.
-        let stdout = child.stdout.take();
-        let (sent, received) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut text = Vec::new();
-            if let Some(mut stdout) = stdout {
-                let _ = stdout.read_to_end(&mut text);
-            }
-            let _ = sent.send(text);
-        });
         let give_up = Instant::now() + alarm;
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    let text = received.recv_timeout(READ_GRACE).unwrap_or_default();
                     return Said::Exited {
                         code: status.code().unwrap_or(-1),
-                        stdout: String::from_utf8_lossy(&text).into_owned(),
                     };
                 }
                 Ok(None) if Instant::now() < give_up => {
@@ -179,34 +170,37 @@ impl Os for MacSlot<'_> {
                 }
                 joined(failed)
             }
-            Step::Flags => {
-                let mut failed = Vec::new();
-                // The roots first, inside `clear_flags`, then below them.
-                for root in [&ready.home, &ready.folders] {
-                    failed.extend(sweep::clear_flags(root, user.uid).errors);
-                    if let Err(why) = remove_acls(root, user.uid) {
-                        failed.push(why);
-                    }
-                }
-                joined(failed)
-            }
-            Step::Contents => {
-                let mut failed = sweep::empty(&ready.home, user.uid).errors;
-                failed.extend(
-                    sweep::empty_keeping(&ready.folders, user.uid, &probe::SKELETON).errors,
-                );
-                joined(failed)
-            }
+            Step::Flags => entry::flags_step(
+                &self.as_uid(),
+                (&ready.home, &ready.folders),
+                // The home, as root, the root first, then below it.
+                &mut |home| {
+                    let mut failed = sweep::clear_flags(home, user.uid).errors;
+                    failed.extend(remove_acls(home, user.uid).err());
+                    failed
+                },
+                &mut run_child,
+            ),
+            Step::Contents => entry::contents_step(
+                &self.as_uid(),
+                (&ready.home, &ready.folders),
+                &mut run_child,
+            )
+            .map(|kept| {
+                *ready
+                    .kept
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = kept;
+            }),
             Step::Shared => complete(&sweep::sweep(&probe::shared_plan(), &user.name, user.uid)),
             Step::Crashes => joined(crash::sweep(&crash_dirs(), &self.crash_scope())),
-            Step::Restore => restore(ready),
+            Step::Restore => restore(ready, &self.as_uid()),
             Step::Look => {
                 for look in 0..2 {
                     if look > 0 {
                         std::thread::sleep(probe::SCAN_PAUSE);
                     }
-                    let pids = uid::processes(user.uid).map_err(|e| e.to_string())?;
-                    let left = not_launchds_own(pids, user.uid, &self.judged);
+                    let left = uid::processes(user.uid).map_err(|e| e.to_string())?;
                     if !left.is_empty() {
                         return Err(format!("processes {:?}", named(&left)));
                     }
@@ -220,27 +214,16 @@ impl Os for MacSlot<'_> {
         let user = &self.ready.user;
         let mut left = Vec::new();
         let mut note = |step, what: String| left.push(Left { step, what });
-        // The processes first, then the services: a process started in between is in
-        // neither list, never in the first alone.
-        let pids = uid::processes(user.uid);
-        let services = services_of(user.uid, &self.judged);
-        match pids.map(|pids| not_launchds_own_in(pids, &services)) {
+        // The process table, by uid, and nothing from launchd: a `launchctl print` of
+        // the uid's domain makes it again (see [`domain`]), and a domain that is made
+        // runs launchd's agents as the uid.
+        match uid::processes(user.uid) {
             Ok(pids) => {
                 if !pids.is_empty() {
                     note(Step::Kill, format!("processes {:?}", named(&pids)));
                 }
             }
             Err(why) => note(Step::Kill, format!("processes: {why}")),
-        }
-        let jobs: Vec<&str> = (services.iter())
-            .filter(|s| !s.own)
-            .map(|s| s.label.as_str())
-            .collect();
-        if !jobs.is_empty() {
-            note(
-                Step::Bootout,
-                format!("jobs in user/{}: {jobs:?}", user.uid),
-            );
         }
         for (step, plan) in [
             (Step::Schedules, SweepPlan::macos_schedules()),
@@ -263,35 +246,17 @@ impl Os for MacSlot<'_> {
             Ok(objects) => note(Step::Ipc, format!("{objects:?}")),
             Err(why) => note(Step::Ipc, why),
         }
-        if let Err(why) = home_is_empty(self.ready) {
+        if let Err(why) = home_is_empty(self.ready, &self.as_uid()) {
             note(Step::Contents, why);
         }
-        match list(&self.ready.folders) {
-            Ok(names) => {
-                for name in names
-                    .iter()
-                    .filter(|n| !probe::SKELETON.contains(&n.as_str()))
-                {
-                    note(
-                        Step::Contents,
-                        format!("{}: {name}", self.ready.folders.display()),
-                    );
-                }
-                for folder in names
-                    .iter()
-                    .filter(|n| probe::SKELETON.contains(&n.as_str()))
-                {
-                    let folder = self.ready.folders.join(folder);
-                    let entries = list(&folder);
-                    if !matches!(&entries, Ok(names) if names.is_empty()) {
-                        note(Step::Contents, format!("{}: {entries:?}", folder.display()));
-                    }
+        // As the uid: root cannot look inside the entry's folders.
+        match entry::left(&self.as_uid(), &self.ready.folders, &mut run_child) {
+            Ok(lines) => {
+                for line in lines {
+                    note(Step::Contents, line);
                 }
             }
-            Err(why) => note(
-                Step::Contents,
-                format!("{}: {why}", self.ready.folders.display()),
-            ),
+            Err(why) => note(Step::Contents, why),
         }
         let crashes = crash::found(&crash_dirs(), &self.crash_scope());
         if !crashes.is_empty() {
@@ -309,6 +274,15 @@ impl Os for MacSlot<'_> {
 }
 
 impl MacSlot<'_> {
+    /// The slot's user, as [`entry`] runs the `/var/folders` entry's clean.
+    fn as_uid(&self) -> entry::AsUid<'_> {
+        entry::AsUid {
+            program: self.program,
+            uid: self.ready.user.uid,
+            gid: self.ready.user.gid,
+        }
+    }
+
     /// C9's scope: this slot's uid, and the pool's.
     fn crash_scope(&self) -> crash::Scope {
         crash::Scope {
@@ -323,13 +297,9 @@ impl MacSlot<'_> {
     /// launchd's own agents, which launchd starts again on demand.
     fn kill(&self) -> Result<(), String> {
         let uid = self.ready.user.uid;
-        let mut scan = || {
-            let pids = uid::processes(uid).map_err(|e| e.to_string())?;
-            if pids.is_empty() {
-                return Ok(pids);
-            }
-            Ok(not_launchds_own(pids, uid, &self.judged))
-        };
+        // The domain is gone (C1) and nothing prints it, so launchd runs no agent of the
+        // uid: every process the table lists is the lease's.
+        let mut scan = || uid::processes(uid).map_err(|e| e.to_string());
         let round = super::term_uid(
             uid,
             self.grace.min(self.within),
@@ -360,8 +330,9 @@ pub(super) fn crash_dirs() -> Vec<PathBuf> {
 }
 
 /// C10: the home the user's (made anew where it is gone), mode 0700, no flags; the
-/// entry's root and folders as they were found at the start, with no lock or `hidden`.
-fn restore(ready: &Ready) -> Result<(), String> {
+/// entry's four folders narrowed to the system's modes, as the uid (see [`entry::restore`]). The flags
+/// and ACLs of the entry and its folders are the system's and are never touched.
+fn restore(ready: &Ready, me: &entry::AsUid<'_>) -> Result<(), String> {
     let (uid, gid) = (ready.user.uid, ready.user.gid);
     let mut failed = Vec::new();
     let home = match open_dir(&ready.home) {
@@ -372,41 +343,31 @@ fn restore(ready: &Ready) -> Result<(), String> {
     if let Err(why) = home {
         failed.push(format!("{}: {why}", ready.home.display()));
     }
-    match open_dir(&ready.folders) {
-        Ok(root) => {
-            if let Err(why) = set_flags(&root, probe::kept_flags(ready.entry.flags)) {
-                failed.push(format!("{}: {why}", ready.folders.display()));
-            }
-        }
-        Err(why) => failed.push(format!("{}: {why}", ready.folders.display())),
-    }
-    for (name, folder_gid, flags) in &ready.entry.folders {
-        let path = ready.folders.join(name);
-        let result = match open_dir(&path) {
-            Ok(dir) => own(&dir, (uid, *folder_gid, 0o700), probe::kept_flags(*flags)),
-            // The system makes it again, as the user, when it is next asked for.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        };
-        if let Err(why) = result {
-            failed.push(format!("{}: {why}", path.display()));
-        }
-    }
+    failed.extend(entry::restore(me, &ready.folders, &mut run_child).err());
     joined(failed)
 }
 
-/// Whether the entry's root and folders are as C10 leaves them.
+/// Whether the entry's four folders are as C10 leaves them: the pool user's, and no wider
+/// than the system makes them (`0` and `X` 0755, `C` and `T` 0700).
 fn entry_is_restored(ready: &Ready) -> Result<(), String> {
-    let root = rustix::fs::lstat(&ready.folders)
-        .map_err(|e| format!("{}: {e}", ready.folders.display()))?;
-    if probe::unrestored(root.st_flags) {
-        return Err(format!(
-            "{}: flags {:#x}",
-            ready.folders.display(),
-            root.st_flags
-        ));
+    let mut wrong = Vec::new();
+    for name in probe::SKELETON {
+        let path = ready.folders.join(name);
+        // One the system has not made yet is made, as the user, when it is asked for.
+        let Ok(meta) = rustix::fs::lstat(&path) else {
+            continue;
+        };
+        let has = (meta.st_uid, u32::from(meta.st_mode));
+        if probe::folder_fix(has, ready.user.uid, probe::folder_ceiling(name)) != (false, None) {
+            wrong.push(format!(
+                "{}: owner {} mode {:o}",
+                path.display(),
+                has.0,
+                has.1 & 0o7777
+            ));
+        }
     }
-    Ok(())
+    joined(wrong)
 }
 
 /// The mounts under the home or the entry, unmounted (`diskutil unmount force`, then
@@ -454,6 +415,28 @@ fn remove_acls(root: &Path, uid: u32) -> Result<(), String> {
             "-x", &root, "-user", &uid, "!", "-type", "l", "-exec", CHMOD, "-N", "{}", "+",
         ],
     )
+}
+
+/// [`entry::Run`], for real: `program` with `args`, a plain environment and no input;
+/// what it printed, or why it failed (its status and what it said, the first 4000
+/// characters of it).
+pub(super) fn run_child(program: &Path, args: &[std::ffi::OsString]) -> Result<String, String> {
+    let out = Command::new(program)
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("{}: {e}", program.display()))?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+    }
+    let said = String::from_utf8_lossy(&out.stderr);
+    Err(format!(
+        "{}: {}: {}",
+        program.display(),
+        out.status,
+        said.trim().chars().take(4000).collect::<String>()
+    ))
 }
 
 /// Whether a sweep was complete.
@@ -542,7 +525,7 @@ fn ipc_of(name: &str, uid: u32) -> Result<Vec<(Ipc, String)>, String> {
 }
 
 /// Whether the home is an empty directory of the user's, mode 0700, without flags.
-fn home_is_empty(ready: &Ready) -> Result<(), String> {
+fn home_is_empty(ready: &Ready, me: &entry::AsUid<'_>) -> Result<(), String> {
     let home = &ready.home;
     let want = (ready.user.uid, ready.user.gid, 0o700, 0);
     let found = rustix::fs::lstat(home)
@@ -561,9 +544,16 @@ fn home_is_empty(ready: &Ready) -> Result<(), String> {
             home.display()
         ));
     }
-    match list(home) {
-        Ok(names) if names.is_empty() => Ok(()),
-        entries => Err(format!("{}: {entries:?}", home.display())),
+    // As the uid: root without Full Disk Access cannot look inside the home's `Library`.
+    let kept = ready
+        .kept
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    match entry::left_home(me, (home, &kept), &mut run_child) {
+        Ok(lines) if lines.is_empty() => Ok(()),
+        Ok(lines) => Err(format!("{}: {lines:?}", home.display())),
+        Err(why) => Err(why),
     }
 }
 
@@ -585,12 +575,21 @@ fn open_dir(path: &Path) -> io::Result<OwnedFd> {
 fn own(dir: &OwnedFd, (uid, gid, mode): (u32, u32, u32), flags: u32) -> io::Result<()> {
     set_flags(dir, flags)?;
     strip_xattrs(dir)?;
-    rustix::fs::fchown(
-        dir,
-        Some(rustix::fs::Uid::from_raw(uid)),
-        Some(rustix::fs::Gid::from_raw(gid)),
-    )?;
-    rustix::fs::fchmod(dir, Mode::from_raw_mode(mode as _))?;
+    // Only what differs is changed: the entry's folders are the user's already after the
+    // uid-side clean, and root, with no Full Disk Access, may not change them.
+    let now = rustix::fs::fstat(dir)?;
+    let has = (now.st_uid, now.st_gid, u32::from(now.st_mode));
+    let (owner, mode_differs) = probe::ownership_to_change(has, (uid, gid, mode));
+    if owner {
+        rustix::fs::fchown(
+            dir,
+            Some(rustix::fs::Uid::from_raw(uid)),
+            Some(rustix::fs::Gid::from_raw(gid)),
+        )?;
+    }
+    if mode_differs {
+        rustix::fs::fchmod(dir, Mode::from_raw_mode(mode as _))?;
+    }
     Ok(())
 }
 
@@ -634,21 +633,18 @@ fn make_home(home: &Path, uid: u32, gid: u32) -> io::Result<()> {
     kbf_mac_session::helper::make_home(parent, name, uid, gid)
 }
 
-/// The processes of `uid`, by effective or real uid ([`uid::processes`]), that a lease
-/// could have left: all but those launchd lists as running one of its own agents in
-/// `user/<uid>` ([`Service::own`]). launchd starts those again on demand after the kill
-/// (`distnoted`, measured on the CI runner), as the uid: fresh processes, holding
-/// nothing of a lease.
+/// The processes of `uid`, by effective or real uid ([`uid::processes`]). Nothing is
+/// subtracted and launchd is not asked: after the clean's bootout the domain is gone and
+/// a print of it would make it again ([`domain`]).
 ///
 /// # Errors
 /// The process table could not be read.
 pub fn leftover_processes(uid: u32) -> io::Result<Vec<i32>> {
-    let pids = uid::processes(uid)?;
-    Ok(not_launchds_own(pids, uid, &probe::OwnLabels::default()))
+    uid::processes(uid)
 }
 
 /// The processes of `uid` that `launchctl print user/<uid>` lists as running one of
-/// launchd's own agents ([`Service::own`]); read before a domain's bootout, which
+/// launchd's own agents; read before a domain's bootout, which
 /// empties the list. Nothing is listed when no process of the uid is alive.
 pub(crate) fn launchds_own(uid: u32) -> Vec<i32> {
     let judged = probe::OwnLabels::default();
@@ -658,10 +654,7 @@ pub(crate) fn launchds_own(uid: u32) -> Vec<i32> {
         || {
             // The process table could not be read: every service launchd lists as
             // running its own agent, as before the table was read first.
-            (services_of(uid, &judged).into_iter())
-                .filter(|s| s.own)
-                .filter_map(|s| s.pid)
-                .collect()
+            own_service_pids(uid, &judged)
         },
     )
 }
@@ -682,53 +675,26 @@ fn own_pids(uid: u32, pids: &[i32], judged: &probe::OwnLabels) -> Vec<i32> {
     )
 }
 
-/// `pids` without those launchd lists as running one of its own agents.
-fn not_launchds_own(mut pids: Vec<i32>, uid: u32, judged: &probe::OwnLabels) -> Vec<i32> {
-    let own = own_pids(uid, &pids, judged);
-    pids.retain(|pid| !own.contains(pid));
-    pids
-}
-
-/// `pids` without those `services` lists as running one of launchd's own agents.
-fn not_launchds_own_in(mut pids: Vec<i32>, services: &[Service]) -> Vec<i32> {
-    pids.retain(|pid| !services.iter().any(|s| s.own && s.pid == Some(*pid)));
-    pids
-}
-
-/// One service of a launchd domain, as `launchctl print` lists it.
-struct Service {
-    /// Its process, while it runs.
-    pid: Option<i32>,
-    label: String,
-    /// Whether it is one of launchd's own per-user agents, which launchd loads into
-    /// every user domain, which the domain's bootout leaves loaded, and which it starts
-    /// again on demand: its plist is in one of [`probe::OWN_PLISTS`]. A job a lease
-    /// bootstrapped or submitted is not, whatever its label: its plist is the lease's
-    /// (or it has none).
-    own: bool,
-}
-
 /// The longest one `launchctl print` is waited for.
 const PRINT_WITHIN: Duration = Duration::from_secs(5);
 
-/// The longest all the prints of one [`services_of`] are waited for together.
+/// The longest all the prints of one look are waited for together.
 const SERVICES_WITHIN: Duration = Duration::from_secs(15);
 
-/// The services `launchctl print user/<uid>` lists: none when the domain is gone (or
-/// cannot be printed, or the print does not answer in time, which the kill and the other
-/// checks then stand in for). Each is printed on its own for its plist's path
-/// ([`Service::own`]), once for `judged`; one not printed in time is not launchd's own.
-fn services_of(uid: u32, judged: &probe::OwnLabels) -> Vec<Service> {
+/// The processes of the services `launchctl print user/<uid>` lists that are launchd's
+/// own (their plist is in one of [`probe::OWN_PLISTS`], never judged by the label, which
+/// a lease chooses): none when the domain is gone (or cannot be printed, or the print
+/// does not answer in time). Each is printed on its own for its plist's path, once for
+/// `judged`; one not printed in time is not launchd's own.
+fn own_service_pids(uid: u32, judged: &probe::OwnLabels) -> Vec<i32> {
     let give_up = Instant::now() + SERVICES_WITHIN;
     let Some(domain) = launchctl_print(&format!("user/{uid}"), PRINT_WITHIN) else {
         return Vec::new();
     };
     probe::listed_services(&domain)
         .into_iter()
-        .map(|(pid, label)| {
-            let own = judged.is_own(&label, pid, || is_own_service(uid, &label, give_up));
-            Service { pid, label, own }
-        })
+        .filter(|(pid, label)| judged.is_own(label, *pid, || is_own_service(uid, label, give_up)))
+        .filter_map(|(pid, _)| pid)
         .collect()
 }
 

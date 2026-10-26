@@ -89,6 +89,7 @@ fn listeners() -> Listeners {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -110,7 +111,6 @@ fn start_with(token: Option<ApiToken>) -> Server {
         listen: loopback(),
         token,
         local_cache: None,
-        releases: None,
     };
     let bound = bind_server_with_api(cache(), listeners, Some(api), shutdown).expect("bind");
     let (reapi, worker, api) = (
@@ -368,6 +368,7 @@ async fn an_api_address_in_use_is_refused() {
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -381,7 +382,6 @@ async fn an_api_address_in_use_is_refused() {
         listen: addr,
         token: None,
         local_cache: None,
-        releases: None,
     };
     let refused = bind_server_with_api(cache(), listeners, Some(api), std::future::pending());
     let Err(ServeError::Bind { addr: at, .. }) = refused else {

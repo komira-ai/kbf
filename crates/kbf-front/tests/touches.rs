@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use kbf_front::{Cache, MemoryMetaLog, MetaLog, MetaLogError, TouchConfig, VerifiedBlob};
-use kbf_meta::{Applied, Command, MetaState, Retention, Role, Touch};
+use kbf_meta::{Applied, BlobAnswer, Command, MetaState, Retention, Role, Touch};
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
 use kbf_proto::reapi::ActionResult;
 use kbf_types::{Digest, FarmTime};
@@ -111,6 +111,16 @@ impl HeldLog {
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .filter(|c| kind(c) == Kind::Collect)
+            .count()
+    }
+
+    /// How many commits of any kind but a touch have been asked for so far.
+    fn commits_but_touches(&self) -> usize {
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|c| kind(c) != Kind::Touch)
             .count()
     }
 
@@ -321,6 +331,63 @@ async fn a_touch_whose_commit_fails_is_committed_later() {
     let touches = log.touches();
     assert_eq!(touches.len(), 3, "two refused, one applied: {touches:?}");
     assert!(touches.iter().all(|t| t == &BTreeSet::from([blob])));
+}
+
+/// Asserts that storing a blob the index already holds, while the log answers the touch
+/// of that blob with another command's outcome, succeeds and does not store the blob
+/// again: the blob is still held, only its touch is not recorded. The one touch commit
+/// is asked for, and no commit of any other kind follows it.
+#[tokio::test]
+async fn a_touch_answered_with_another_outcome_leaves_the_stored_blob_held() {
+    let cache = cache().await;
+    let log = cache.meta();
+    let blob = store(&cache, "stored twice").await;
+    assert!(log.touches().is_empty(), "the first store touched nothing");
+
+    // A blob stored the same day needs no touch; five days on, a store asks for one.
+    cache.tick(days(5)).await.expect("tick");
+    // The tick is a commit of its own; count from after it.
+    let before = log.commits_but_touches();
+    log.fail_next_touches(1);
+    let again = VerifiedBlob::hashed(Bytes::from_static(b"stored twice"));
+    cache.store_blobs(vec![again]).await.expect("store again");
+
+    assert_eq!(log.touches(), [BTreeSet::from([blob])], "one touch asked");
+    assert_eq!(log.commits_but_touches(), before, "stored again");
+    assert!(cache.find_missing(&[blob]).await.expect("find").is_empty());
+}
+
+/// Asserts that storing a blob the index holds, while a collection removes that blob
+/// after the store found it and before the log applied its touch, stores the blob
+/// again: the log answers the touch with the blob as lost, so the store does not take
+/// it for held. The one touch commit is asked for, and the blob is held afterwards.
+#[tokio::test]
+async fn a_blob_collected_before_its_touch_is_stored_again() {
+    let cache = Arc::new(cache().await);
+    let log = cache.meta();
+    let blob = store(&cache, "collected under the store").await;
+    cache.tick(days(5)).await.expect("tick");
+    log.hold(Kind::Touch);
+    let again = VerifiedBlob::hashed(Bytes::from_static(b"collected under the store"));
+    let storing = tokio::spawn({
+        let cache = Arc::clone(&cache);
+        async move { cache.store_blobs(vec![again]).await }
+    });
+    // The store found the blob in the index; its touch commit is held.
+    within(log.entered.notified()).await;
+    // Untouched since day 0, the blob has expired by day 30.
+    log.inner
+        .commit(Command::Tick(days(30)))
+        .await
+        .expect("tick");
+    log.inner.commit(Command::Collect).await.expect("collect");
+    let gone = log.inner.query(move |s| s.blob(&blob)).await;
+    assert!(matches!(gone, Ok(BlobAnswer::Absent)), "collected");
+    log.release_all();
+    within(storing).await.expect("join").expect("store again");
+
+    assert_eq!(log.touches(), [BTreeSet::from([blob])], "one touch asked");
+    assert!(cache.find_missing(&[blob]).await.expect("find").is_empty());
 }
 
 /// Catches (defect "collect without committing pending touches"): a collection that

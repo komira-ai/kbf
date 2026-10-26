@@ -148,6 +148,19 @@ pub enum ErrorCode {
     HealthTimeout,
     /// The host's swap was abandoned.
     SwapAbandoned,
+    /// A daemon host is not the node the inventory lists for it, or lists none; nothing was
+    /// drained.
+    NodeIdentity,
+    /// The frontend could not drain the host's node, or did not answer; the node may be left
+    /// drained. For a frontend member: it did not exit within the bound
+    /// and is left draining (a drain it would not accept is not said to be left draining; one it
+    /// did not answer is said to be possibly draining).
+    DrainFailed,
+    /// The host runs the target, but the frontend could not return its node to placement; the
+    /// node is left drained.
+    UndrainFailed,
+    /// The host could not restart a frontend member's unit; the member is left draining.
+    RestartFailed,
 }
 
 impl ErrorCode {
@@ -169,7 +182,11 @@ impl ErrorCode {
             | ErrorCode::SafeToStopUnavailable
             | ErrorCode::InstallFailed
             | ErrorCode::HealthTimeout
-            | ErrorCode::SwapAbandoned => 500,
+            | ErrorCode::SwapAbandoned
+            | ErrorCode::NodeIdentity
+            | ErrorCode::DrainFailed
+            | ErrorCode::UndrainFailed
+            | ErrorCode::RestartFailed => 500,
         }
     }
 }
@@ -224,6 +241,13 @@ impl RollState {
 }
 
 /// Where one host is in its turn.
+///
+/// The last four phases are a frontend pool member's (see [`crate::inventory::Member`]): the
+/// turn goes `pending`, `draining`, `installing`, `restarting`, `waiting_healthy`, `done`.
+/// `retiring` and `undraining` belong to a turn that an earlier build took at a proxy; a record
+/// that holds one is still read, and the roll refuses to go on from it. The phases were added to
+/// the set after the others, and a record written before them holds none of them and reads as
+/// it did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
@@ -233,6 +257,14 @@ pub enum Phase {
     WaitingHealthy,
     Done,
     Failed,
+    /// A member has been told to drain itself and is waited for until it has exited.
+    Draining,
+    /// Only in a record of an earlier build: the member was retiring at a proxy.
+    Retiring,
+    /// The member's unit is restarted on the new package.
+    Restarting,
+    /// Only in a record of an earlier build: the member was being put back at a proxy.
+    Undraining,
 }
 
 /// One host of a roll.
@@ -386,6 +418,10 @@ mod tests {
             (ErrorCode::InstallFailed, "install_failed", 500),
             (ErrorCode::HealthTimeout, "health_timeout", 500),
             (ErrorCode::SwapAbandoned, "swap_abandoned", 500),
+            (ErrorCode::NodeIdentity, "node_identity", 500),
+            (ErrorCode::DrainFailed, "drain_failed", 500),
+            (ErrorCode::UndrainFailed, "undrain_failed", 500),
+            (ErrorCode::RestartFailed, "restart_failed", 500),
         ];
         for (c, name, status) in all {
             assert_eq!(

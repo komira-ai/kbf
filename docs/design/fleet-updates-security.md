@@ -321,6 +321,76 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 >   is killed and deleted as `kill-uid` and `user-delete` do. A reset that fails
 >   part-way names each failure and can be repeated. It restarts nothing: a stale
 >   session's processes end with `kill-uid`'s bootout of `gui/<uid>`.
+> - **The standing VM user.** A Mac provisioned for macOS guest VMs starts the helper with
+>   `--vm-user <name>` (never a `kbf-lease-` name, `root` or `_kbf`; the flag is refused
+>   at start otherwise). The account is made by provisioning, not by the helper, and is
+>   outside the ledger, so the boot reset and `user-delete` can never reach it.
+>   `session-idle` then rests the Mac at that user: it reads the user's password from
+>   the root-only file `kbf-mac-provision` wrote once (`vm-user-password` in the state
+>   directory: 64 lowercase hex digits, a regular file, not a link, root's, mode 0400;
+>   `kbf-mac-session` duplicates that rule and `kbf-mac-provision` owns it, so the two
+>   change together), writes `/etc/kcpassword` from it when that differs, sets
+>   `autoLoginUser`, writes the intent record `vm` last (so a failure part-way leaves a lease's record guarding its user) and
+>   restarts (FileVault must be off, as for `session-login`). A repeat while the record
+>   is `vm`, `autoLoginUser` is the VM user and `gui/<uid>` exists restarts nothing, so
+>   running VMs survive it. The boot reset keeps that rest when `autoLoginUser` names the
+>   VM user and the record is `vm` or absent; any other session, including a `vm` record
+>   over some other auto-login, is cleared as before. Only provisioning may name the
+>   account: the helper does not check for an admin or human account beyond the uid
+>   range, and `role-kill-uid` and `session-idle` act on whatever account is named. A
+>   Mac restarted mid-lease rests at the login window until the daemon calls
+>   `session-idle` after `boot-reset`. The leak scan's baseline for such a Mac must be
+>   recorded while it rests at the VM user. The helper never makes or resets the VM
+>   user's password (a missing or invalid file fails `session-idle`, naming the path and
+>   saying to run `kbf-mac-provision apply`), so the password is set once at
+>   provisioning and never rotated and the account's login keychain is never stranded
+>   by a reset. What is still open, measured by E2 on a Mac: whether automatic login
+>   unlocks the login keychain at all. `--vm-user` stays unset until then.
+>   `session-login <lease>` still switches away from the VM user. Three verbs act for
+>   the VM user: `role-run` (a process in its `gui/<uid>` domain, refused until the
+>   domain exists and while a lease holds the session), `role-session-ready` (false
+>   while a lease holds the session) and `role-kill-uid` (ends the session with the
+>   processes). Its uid is read from the directory each time and must be an ordinary
+>   uid outside the lease range. That VMs and a whole-machine lease never run together
+>   on one Mac is the daemon's rule: it drains VMs before `session-login`.
+> - **The image verbs** `image-setup <bundle>` and `image-harvest <bundle> <out>` are the two
+>   root-only steps of building a guest image (`kbf-vmm image setup`, which writes the guest's
+>   Data volume offline, and `kbf-vmm image harvest`, a read-only attach), so the daemon runs
+>   them and no one needs `sudo`. Two directories: `--staging-dir`, which the VM user owns and
+>   `kbf-vmm image base --out` builds a new bundle in (and keeps clones in), and `--images-dir`,
+>   which is root's, closed to group and others (the helper refuses it otherwise, sticky bit
+>   or not), and holds sealed bases and harvest output. The program is `--vmm` (default the
+>   kit's `current/kbf-vmm`) and the guest binary is `--guest-binary`; each must be a regular
+>   file, root's and writable by no one else, and a request carries no program and no argument
+>   but the paths (the wire refuses unknown fields). A path must be a name directly inside the
+>   directory it belongs to, compared by component (`..`, a longer path and a lookalike sibling
+>   are refused); the helper builds the path it passes on from the configured directory and
+>   that name.
+>   `image-setup` never takes the user's inodes. A measured Mac showed that a write descriptor
+>   the user opened before root's chown, chmod and `uchg` keeps writing through all three, so
+>   taking the bundle in place cannot stop a user who holds a descriptor or a mapping on its
+>   disk image (and root's chown of a `uchg` file fails). The helper opens each file of the
+>   staging bundle without following a link (plain files with one link only, at most 16
+>   entries) and clones it (`fclonefileat`, O(1) on APFS, new inodes) into a new directory it
+>   makes in the images directory: root's, 0700. It runs `kbf-vmm` on that copy (root attaches
+>   a disk image the user built; that is inherent, and the copy defeats changes after the
+>   copy was made, not what was in it) and seals the copy: it stays root's, directory 0750 and
+>   files 0640 with the VM user's primary group, and root sets `uchg` on the files and then the
+>   directory. The user's original is left alone. The VM user clones the base through its group
+>   (a non-root `clonefile` of a root-owned 0640 base works, the clone keeps the flag, the user
+>   can clear it only on its own copy) and `kbf-vmm`'s clone step clears `uchg` on each clone.
+>   A clone of a flagged file is flagged too (measured), so every clone's user flags are cleared
+>   right after it is made. A failure removes the copy, clearing `uchg` first (an immutable file
+>   cannot be unlinked) and removing every entry in it, including what `kbf-vmm` wrote, so no
+>   failure leaves a base in the images directory (an entry that is not a regular file is left
+>   and named in the error). `image-harvest` reads a kept clone in
+>   staging, whose inodes are the user's: the bundle is taken first (opened without following a
+>   link, made root's and 0700 through the descriptor, the name checked again, every file made
+>   root's, anything but plain single-link files refused) and given back with its owners and
+>   modes; that is acceptable because harvest only reads, but a user holding a descriptor can
+>   change what is read while it is read. A sealed base in the images directory is read as it
+>   is (root's and closed already). The helper makes `<out>` itself (new, root's, 0700) in the
+>   images directory and has `kbf-vmm` write `<out>/files`.
 > - Every program the switch and the scan run (`defaults`, `launchctl`, `fdesetup`,
 >   `sfltool`) goes through the host's command runner with an empty environment, so
 >   the unit tests fake each one and nothing in CI restarts: the macOS CI job runs the

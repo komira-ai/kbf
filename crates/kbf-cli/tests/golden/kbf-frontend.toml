@@ -17,13 +17,13 @@ ca-dev-file-signer = false
 # ca-dir = "DIR"
 # The socket of the kbf-signer process that holds the CA key (production). This process holds no CA key.
 # ca-signer = "SOCKET"
-# Allow --enroll-listen although this build's storage does not enforce the deny rows a node revocation writes: a revoked node is refused renewal at once but storage serves it until its certificate expires.
+# Does nothing: this build enforces the deny rows a node revocation writes, so --enroll-listen needs no acceptance. Still accepted so existing units start; it will be removed in a later release.
 enroll-allow-unenforced-deny = false
 # What --cas is for a daemon-only node, told to every node. Empty: none.
 # enroll-cas-endpoint = "URL"
 # How long the certificates the CA issues live (3600 to 2592000); a node renews at half. The signer's own --lifetime-secs must be at least this.
 enroll-cert-lifetime-secs = 604800
-# Serve kbf.enroll.v1 (Enroll and Renew) on this address, over TLS with the frontend's own certificate from the CA. Off unless given. It needs --state-store, --ca-dir, --frontend-name, and --ca-signer (or, for development, --ca-dev-file-signer). While this build does not enforce deny rows in storage it also needs --enroll-allow-unenforced-deny.
+# Serve kbf.enroll.v1 (Enroll and Renew) on this address, over TLS with the frontend's own certificate from the CA. Off unless given. It needs --state-store, --ca-dir, --frontend-name, and --ca-signer (or, for development, --ca-dev-file-signer).
 # enroll-listen = "ADDR"
 # Calls the listener works on at once, from all sources; the next is refused `rate limited`.
 enroll-max-in-flight = 64
@@ -39,27 +39,38 @@ enroll-rate-per-minute = 60
 # frontend-name = []
 
 [handover]
-# Serve the admin calls (GET role, POST quiesce, resume, takeover, stand-down) on this loopback address. Anything that is not a loopback address is refused at start: the calls move the scheduler's role. With --proxy-auth-file every call must present the proxy's secret (x-kbf-proxy-auth) or is refused 403; without it the calls take no credential, which is for a host with no proxy. Needs --state-store.
+# Retired: no longer read, the handover was removed. Accepted and ignored for one release
+# (not in --help)
 # admin-listen = "ADDR"
-# Open the state store without taking its generation, bump no epoch and run no scheduler, reconciler or worker listener: serve /readyz, the health service and GetCapabilities until `POST takeover` makes this process the writer. Needs --admin-listen. A SQLite state file is held by one process (an exclusive lock), so a candidate cannot run beside the process that holds it: side by side needs the Postgres store.
+# Retired: no longer read, the handover was removed. Accepted and ignored for one release
+# (not in --help)
 await-takeover = false
-# The time between two of Envoy's health checks of a frontend (the cluster's `interval`).
-envoy-check-interval-ms = 1000
-# How long Envoy's health check waits for an answer (the cluster's `timeout`).
-envoy-check-timeout-ms = 1000
-# How many of Envoy's checks in a row must fail before it stops choosing a frontend (`unhealthy_threshold`). The three give the settle: a frontend waits interval x threshold + timeout + interval before it goes not ready (Envoy has then seen the successor) and again before it exits (Envoy then sends it nothing).
-envoy-unhealthy-threshold = 2
-# How often a frontend that has handed over looks in the state store for the results of the Execute and WaitExecution streams it kept open.
-handover-follow-interval-ms = 200
-# The DNS name the REAPI certificate of the other instance carries. A frontend whose REAPI listener has a certificate forwards the calls it still receives after a handover over TLS to the successor, verified against --storage-ca and this name; without it such a frontend refuses a handover.
+# Retired: no longer read, the handover was removed. Accepted and ignored for one release
+# (not in --help)
+# envoy-check-interval-ms = "MILLISECONDS"
+# Retired: no longer read, the handover was removed. Accepted and ignored for one release
+# (not in --help)
+# envoy-check-timeout-ms = "MILLISECONDS"
+# Retired: no longer read, the handover was removed. Accepted and ignored for one release
+# (not in --help)
+# envoy-unhealthy-threshold = "N"
+# Retired: no longer read, the handover was removed. Accepted and ignored for one release
+# (not in --help)
+# handover-follow-interval-ms = "MILLISECONDS"
+# Retired: no longer read, the handover was removed. Accepted and ignored for one release
+# (not in --help)
 # handover-peer-name = "DNS_NAME"
-# The longest a frontend that hands over waits for the Execute calls between their request and their queueing, and the results being taken, before it stands down anyway.
-handover-quiesce-secs = 10
-# The control socket of a handover (mode 0600, this user only). A frontend serving binds it; one started while another serves on the same --state-store (and the other --instance) binds its own listeners, asks the other to hand over its scheduler state and its daemons, and takes them without failing a build. The other goes not ready once Envoy has seen the new one, forwards the calls Envoy still sends it, and exits when it holds nothing.
+# Retired: no longer read, the handover was removed. Accepted and ignored for one release
+# (not in --help)
+# handover-quiesce-secs = "SECONDS"
+# Retired: no longer read, the handover was removed. Accepted and ignored for one release
+# (not in --help)
 # handover-socket = "PATH"
-# How long after it has handed over a frontend waits for its successor to serve. If the successor does not (or its control connection closes), the frontend goes not ready itself, so Envoy answers cleanly instead of choosing a frontend that can start nothing new.
-handover-watchdog-secs = 15
-# Which of the two instances this is. Instance a listens where --listen, --worker-listen and --api-listen say, instance b ten ports above each (port 0 stays 0): the two blocks Envoy's configuration names. A handover goes to the other instance; without --instance a frontend refuses one.
+# Retired: no longer read, the handover was removed. Accepted and ignored for one release
+# (not in --help)
+# handover-watchdog-secs = "SECONDS"
+# Retired: no longer read, the handover was removed. Accepted and ignored for one release
+# (not in --help)
 # instance = "a|b"
 
 [history]
@@ -73,6 +84,10 @@ invocation-memory = 268435456
 [listener]
 # The operator API listener (HTTP/JSON under `/v1`). Off unless given. Reads are open to whoever reaches it: bind it where only operators do
 # api-listen = "API_LISTEN"
+# The longest, in seconds, a drain (a stop signal or `POST /v1/frontend/drain`) waits for the open executions to finish after it has refused new ones; a stop always ends by then, unless `--shutdown-timeout-secs` ends it earlier. The one stream that does not wait is that of an operation that was never started, that no worker on this frontend can run and that no other frontend can take: it ends UNAVAILABLE as the drain begins, since that action would fail at the deadline anyway (Buck2 retries only the opening of a call), and the operation stays queued for the other frontends. Executions still open at the deadline are ended UNAVAILABLE, the daemons' worker streams end and the process exits. Buck2 does not recover a stream that breaks mid-action, so an action that runs longer than this fails: update in a quiet window, or set it above the longest action. At least 1.
+drain-deadline = 900
+# How long, in seconds, a drain (a stop signal or `POST /v1/frontend/drain`) keeps serving everything after `/readyz` has begun to answer 503, so that the load balancer's health check sees it before any call is refused: at least its check interval times its unhealthy threshold, and the time its routes take to change. Then new Execute calls are refused UNAVAILABLE and every listener is sent GOAWAY. 0 goes on at once. The container's stop timeout must exceed this and --drain-deadline.
+drain-lb-wait = 10
 # How often, in seconds, the REAPI and worker listeners send an HTTP/2 PING on a quiet connection. 0 sends none (and `--http2-keepalive-timeout-secs` is unused)
 http2-keepalive-interval-secs = 30
 # How long, in seconds, a PING may go unanswered before the connection is closed
@@ -87,9 +102,9 @@ reapi-max-streams = 10000
 # release-poll-refs = []
 # Retired: no longer read, the release poller was removed. Accepted and ignored for one release
 # release-poll-repo = "OWNER/NAME"
-# The release store (`docs/design/pull-updates.md`, section 6): a directory where the tarballs of a release and their build attestations are kept, uploaded with `PUT /v1/releases/{commit}/{platform}/{name}` on the operator API (which needs the token) and fetched by the nodes through `ReleaseService.Fetch` on the worker listener, behind its mutual TLS. Made if missing. Without it every update endpoint answers 503 saying so
+# Retired: no longer read, the release store was removed; a directory left there is not touched. Accepted and ignored for one release
 # releases-dir = "DIR"
-# How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done. Buck2 never recovers a stream that breaks mid-action, so the default, 0, is no deadline; set one at least as long as the longest action. When it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off)
+# How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done; the exception is a stream whose operation was never started and that no worker on this frontend can run (say every capable worker is cordoned) and no other frontend can take, which ends UNAVAILABLE as the drain begins, since that action would fail at the deadline anyway (Buck2 retries only the opening of a call). The operation stays queued. On a frontend over a state store, `--drain-deadline` bounds the wait in any case; this flag bounds it earlier. Buck2 never recovers a stream that breaks mid-action, so the default, 0, is no deadline; set one at least as long as the longest action. When it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off)
 shutdown-timeout-secs = 0
 # How often, in seconds, a TLS listener looks at its certificate, key and client CA files (the `--*-tls-cert`, `--*-tls-key` and `--*-client-ca` flags). A change is applied to the next TLS handshake, with no restart and without ending a connection already open: renew a certificate by replacing the files. Files that do not make a working configuration (unreadable, not PEM, a key that is not the certificate's, an expired certificate, a renewal caught between its two writes) are logged and counted in `kbf_tls_reloads_total{outcome="rejected"}`, and the previous files keep serving; the next look finds them whole and applies them. The files must be good at start
 tls-reload-interval-secs = 30
@@ -112,6 +127,30 @@ learned-sizes = "off"
 # The memory rungs of an action, in GiB, ascending and each at least 1. The first is what an action that names no size (`kbf-book-mem-gib`) books. An action that passes its own memory limit runs again on the next rung above what it booked, and after the last on a whole host: the memory of the largest node that could run it, so that no other lease fits there. A rung not below that node's memory is skipped for the whole host. An action that does finish keeps its rung: later runs of it start there
 memory-ladder-gib = [4, 16, 32]
 
+[packs]
+# The length, in bytes, at which a pack of client uploads is closed: the blobs of one batch or upload that do not fit are written as the next pack. Used only with `--pack-store-endpoint`
+pack-bytes = 33554432
+# The most bytes of blobs `--pack-cache-dir` holds
+# pack-cache-bytes = "BYTES"
+# A directory this process owns where the blobs read from packs are kept, one file each, checked by digest on every read; the least recently used are removed to stay within `--pack-cache-bytes`. Left out, nothing is kept
+# pack-cache-dir = "DIR"
+# How many blobs of each pack a daemon commits this frontend reads back from the pack store and checks against their digests before it records the pack, spread over the pack from a start that its name picks (the same commit is always checked at the same blobs). A pack with fewer blobs is checked whole, and 16384, the most blobs a pack holds, checks every blob. 0 checks no blob and trusts the daemon: a blob that is not its digest is then caught only when it is first read. The last byte of the pack is read in any case, so a pack that is not stored is always refused. Used only with `--pack-store-endpoint`
+pack-commit-sample = 2
+# The most bytes of client uploads into packs this frontend holds in flight at once, at least 67108864 (the largest blob that is packed, so that no upload is refused for its size) and at most 4294967295. Each upload takes its blob's size as soon as its resource name has arrived, before it reads on, and gives it back when it ends; one that finds the rest taken waits its turn, so a burst of uploads is slowed down, not failed. The bound counts blob bytes, not the memory of the process: a batch upload is decoded before it waits, so the bytes it holds meanwhile are not counted, and reads are not counted. Used only with `--pack-store-endpoint`
+pack-inflight-bytes = 1073741824
+# The bucket of `--pack-store-endpoint` that holds the packs, under the keys `cas/f/<--pack-writer>/<start>/<sequence>`
+# pack-store-bucket = "BUCKET"
+# A file with the key pair for `--pack-store-endpoint`, as JSON `{"access_key_id": "...", "secret_access_key": "..."}`, readable by its owner alone (mode 0600 or 0400). The secret is never a flag: a command line is world-readable
+# pack-store-credentials-file = "PATH"
+# Keeps the blobs clients upload in packs (many blobs in one object) in this S3-compatible object store, as `http://host:port`: a pack is written with a create-only request and recorded in the pack index before the upload is acknowledged, and a read asks the index first and fetches only the blob's bytes from its pack. A blob the index lacks is read from the storage nodes as before, and a blob over 64 MiB and any compressed blob still go to them. At start the frontend checks that the store refuses to replace an object and does not serve if it does not. Needs `--pack-index`, `--pack-store-bucket` and `--pack-store-credentials-file`. Daemons read blobs from the storage nodes only, so a farm must not enable this before they can read a blob that is only in a pack. Left out, no pack store is built or contacted and blobs go where they always did
+# pack-store-endpoint = "URL"
+# The region the requests to `--pack-store-endpoint` are signed for
+pack-store-region = "us-east-1"
+# How long, in seconds, a ByteStream upload into packs may go without a byte of its body arriving before it is ended DEADLINE_EXCEEDED and gives back its bytes, so that a client that stops sending cannot hold room for ever. The time before its resource name has arrived is not counted. An upload that keeps sending, however slowly, is never cut and keeps its bytes until it ends, so `--pack-inflight-bytes` is the only bound on that. At least 1, at most 86400. Used only with `--pack-store-endpoint`
+pack-upload-idle-timeout = 30
+# The name of this frontend in the keys of its packs and in the pack index's record of who wrote each: give each frontend of a farm one of its own. Used only with `--pack-store-endpoint`
+pack-writer = "frontend"
+
 [scheduler]
 # The OS and architecture, as `<os>/<arch>` (`linux` or `macos`; `x86_64` or `arm64`), of an action whose platform names no OS, no architecture and no ISA level, so that it is not given to whichever node sorts first, a Mac among them. Not applied to an action that asks for `xcode` or an iOS device, which only a Mac reports. `none` applies no default: such an action runs on any node that fits. Placement only: the action's digest and cache key do not change
 default-platform = "linux/x86_64"
@@ -119,6 +158,8 @@ default-platform = "linux/x86_64"
 finished-retention-secs = 60
 # The heartbeat interval daemons are asked for, in milliseconds, at most half the window in which a daemon may act on a `Start` (each `Start` names the newest heartbeat the server took, so a longer interval would leave it too little)
 heartbeat-interval-ms = 5000
+# Opens the pack index at start: the tables in the Postgres state store that say which pack holds each blob and where. A frontend given `--pack-store-endpoint` reads and writes them; without it nothing does, and the flag only checks that the store can hold them. Needs `--state-store` as a `postgres://` URL whose schema has the pack tables (`kbf-installer setup` makes them); a `sqlite://` store is refused. Left out, no pack table is touched
+pack-index = false
 # How often, in seconds, every open Execute and WaitExecution stream is sent its operation again (same name, not done, current stage), so a load balancer's idle timeout never cuts a long action. 0 sends none
 progress-interval-secs = 30
 # How long, in milliseconds, `GET /readyz` on the operator API and the REAPI listener's `grpc.health.v1` service wait for the object store to answer their read-only probe before they answer not ready
@@ -127,6 +168,10 @@ readyz-store-timeout-ms = 2000
 # state-store = "URI"
 # How long, in seconds, queued work waits while no connected daemon can run it (none satisfies its platform, or none that does is large enough) before it is refused FAILED_PRECONDITION. The wait restarts whenever one can
 unservable-wait-secs = 300
+# The cores a node that reports VM slots (`vm.slots`) keeps for the host itself: subtracted from the CPUs placement may book on it, so that guests cannot take the host's own share. A node that reports none books the whole machine
+vm-host-floor-cpus = 2
+# The memory, in GiB, a node that reports VM slots (`vm.slots`) keeps for the host itself, subtracted as `--vm-host-floor-cpus` subtracts cores
+vm-host-floor-mem-gib = 8
 
 [storage-client]
 # Proxy mode (`docs/design/architecture-v2.md`, section 7): the URL of a storage node (`kbf storage`), such as `http://127.0.0.1:8990`. The REAPI listener then answers a client's CAS, ByteStream and action-cache calls from that node, passing ByteStream through without holding a blob. The local stores are still opened: Execution and the worker listener use them (`kbf frontend` is this mode without them: Execution reads the node too). Plain text (`http://`) only here; `kbf frontend` takes the flags of the mutual TLS to the node. Without it, the server answers those calls itself

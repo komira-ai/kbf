@@ -78,6 +78,14 @@ fn the_flags_default_to_the_design() {
     assert_eq!(args.lease_gid, STAFF_GID);
     assert_eq!(args.homes, PathBuf::from("/Users"));
     assert_eq!(args.grant_keys, None);
+    assert_eq!(args.images_dir, PathBuf::from("/var/db/kbf-vm/images"));
+    assert_eq!(args.staging_dir, PathBuf::from("/var/db/kbf-vm/staging"));
+    assert_eq!(args.vmm, PathBuf::from("/usr/local/kbf/current/kbf-vmm"));
+    assert_eq!(
+        args.guest_binary,
+        PathBuf::from("/usr/local/kbf/current/kbf-guest")
+    );
+    assert_eq!(args.vm_user, None);
     assert_eq!(args.kcpassword, PathBuf::from("/etc/kcpassword"));
     assert_eq!(
         args.loginwindow,
@@ -94,6 +102,50 @@ fn the_flags_default_to_the_design() {
         ])
         .is_err()
     );
+}
+
+/// Catches: image flags that do not reach the helper's settings (the verbs would act in
+/// the default directory with the default programs whatever the Mac is set up with).
+#[test]
+fn the_image_flags_reach_the_settings() {
+    let args = Args::parse_from([
+        "kbf-mac-session",
+        "--daemon-requirement",
+        "r",
+        "--images-dir",
+        "/i",
+        "--staging-dir",
+        "/s",
+        "--vmm",
+        "/k/kbf-vmm",
+        "--guest-binary",
+        "/k/kbf-guest",
+    ]);
+    let image = args.image_settings();
+    assert_eq!(image.dir, PathBuf::from("/i"));
+    assert_eq!(image.staging, PathBuf::from("/s"));
+    assert_eq!(image.vmm, PathBuf::from("/k/kbf-vmm"));
+    assert_eq!(image.guest, PathBuf::from("/k/kbf-guest"));
+}
+
+/// Catches: a VM user flag that takes a lease user's name (the boot reset deletes lease
+/// users), root or the daemon's account, or ignores the name it was given.
+#[test]
+fn the_vm_user_flag_takes_a_name_no_lease_user_can_have() {
+    let parse = |name: &str| {
+        Args::try_parse_from([
+            "kbf-mac-session",
+            "--daemon-requirement",
+            "r",
+            "--vm-user",
+            name,
+        ])
+    };
+    let args = parse("kbf-vm").unwrap();
+    assert_eq!(args.vm_user.unwrap().name(), "kbf-vm");
+    for bad in ["kbf-lease-1-1", "root", "_kbf", "", "Kbf vm"] {
+        assert!(parse(bad).is_err(), "{bad:?} was accepted");
+    }
 }
 
 /// Catches: a start-up that skips the state directory's privacy or the socket's

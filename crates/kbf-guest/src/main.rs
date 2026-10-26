@@ -9,16 +9,25 @@
 //! `session` prints the launchd session type and exits; it is how CI checks what a
 //! LaunchAgent and a LaunchDaemon see. Every subcommand refuses to run as root except
 //! `probe-guest` and `probe-ready`, which record what each user can do in a guest
-//! (src/probe.rs).
+//! (src/probe.rs), and `mount-share`, the root mount daemon's bounded virtiofs mount
+//! (src/mount.rs), and `probe-diag`, which says what a root process sees of the share
+//! and which write step is refused (src/diag.rs), and `shutdown-listen`, the root daemon
+//! that shuts the guest down when the host asks over virtio-socket (src/shutdown.rs), and
+//! `sim`, the root daemon that runs the iOS simulator probe (src/sim.rs).
 
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use kbf_guest::diag;
+use kbf_guest::frame::Kind;
+use kbf_guest::mount;
 use kbf_guest::probe;
 use kbf_guest::server::{Agent, Config, HELLO_TIMEOUT};
 use kbf_guest::session;
+use kbf_guest::shutdown;
+use kbf_guest::sim;
 use kbf_guest::wire::TOKEN_LEN;
 
 /// The agent inside a VM guest: runs one command per boot for the host.
@@ -56,6 +65,26 @@ enum Cmd {
     /// Write a marker file once the guest has reached this point (the share mounted, a
     /// process running). Runs as any user, root included.
     ProbeReady(probe::ReadyArgs),
+    /// Mount a virtiofs tag at a mount point, trying a bounded number of times; logs each
+    /// failure to stderr and exits non-zero when none worked. Runs as any user, root
+    /// included (the guest's mount daemon is root).
+    MountShare(mount::MountArgs),
+    /// Print, as JSON on stdout, what the process is and sees of the mounted share and
+    /// which file operation on it is refused. Runs as any user, root included.
+    ProbeDiag(diag::DiagArgs),
+    /// Listen on a virtio-socket port for the host's `shutdown` command and shut the guest
+    /// down cleanly (`/sbin/shutdown -h now`). Runs as root, as a LaunchDaemon; exits 0
+    /// after the shutdown was started and non-zero when the listener fails.
+    ShutdownListen {
+        /// The guest vsock port to listen on.
+        #[arg(long, default_value_t = shutdown::PORT)]
+        port: u32,
+    },
+    /// Run the iOS simulator probe (Xcode first launch, a runtime added, a device created,
+    /// booted and photographed) and send one frame per step to the host. Runs as root, as a
+    /// LaunchDaemon, once per boot; the steps that need a user session run as the console
+    /// user through `launchctl asuser`.
+    Sim(sim::SimArgs),
 }
 
 fn main() -> ExitCode {
@@ -66,13 +95,36 @@ fn main() -> ExitCode {
 /// ([`session::refuse_root_here`]): then it says why on stderr and exits 2, with
 /// nothing run and nothing created.
 fn run(cli: Cli, root: Result<(), String>) -> ExitCode {
-    run_with(cli, root, real_probe_host().as_deref())
+    run_with(
+        cli,
+        root,
+        real_probe_host().as_deref(),
+        real_mounter().as_deref(),
+        real_diagnoser().as_deref(),
+        real_shutdown_daemon().as_deref(),
+        real_sim_host().as_deref(),
+    )
 }
 
 /// [`run`] with the host the probe subcommands ask (`None`: not a macOS guest).
-fn run_with(cli: Cli, root: Result<(), String>, host: Option<&dyn probe::Host>) -> ExitCode {
-    if !matches!(cli.command, Cmd::ProbeGuest(_) | Cmd::ProbeReady(_))
-        && let Err(e) = root
+fn run_with(
+    cli: Cli,
+    root: Result<(), String>,
+    host: Option<&dyn probe::Host>,
+    mounter: Option<&dyn mount::Mounter>,
+    diagnoser: Option<&dyn diag::DiagHost>,
+    daemon: Option<&dyn shutdown::Daemon>,
+    sim_host: Option<&dyn sim::SimHost>,
+) -> ExitCode {
+    if !matches!(
+        cli.command,
+        Cmd::ProbeGuest(_)
+            | Cmd::ProbeReady(_)
+            | Cmd::MountShare(_)
+            | Cmd::ProbeDiag(_)
+            | Cmd::ShutdownListen { .. }
+            | Cmd::Sim(_)
+    ) && let Err(e) = root
     {
         eprintln!("{e}");
         return ExitCode::from(2);
@@ -94,9 +146,127 @@ fn run_with(cli: Cli, root: Result<(), String>, host: Option<&dyn probe::Host>) 
                 ExitCode::FAILURE
             }
         },
-        Cmd::ProbeGuest(args) => probe_cmd(host, &args.out, |h| probe::probe_guest(h, &args)),
-        Cmd::ProbeReady(args) => probe_cmd(host, &args.out, |h| probe::probe_ready(h, &args)),
+        Cmd::ProbeGuest(args) => probe_cmd(host, &args.out, Kind::Result, args.vsock_port, |h| {
+            probe::probe_guest(h, &args)
+        }),
+        Cmd::ProbeReady(args) => probe_cmd(host, &args.out, Kind::Ready, args.vsock_port, |h| {
+            probe::probe_ready(h, &args)
+        }),
+        Cmd::MountShare(args) => mount_cmd(mounter, &args),
+        Cmd::ProbeDiag(args) => diag_cmd(diagnoser, &args),
+        Cmd::ShutdownListen { port } => shutdown_cmd(daemon, port),
+        Cmd::Sim(args) => sim_cmd(sim_host, &args),
     }
+}
+
+/// Runs the iOS simulator probe with `host` (`None`: not a macOS guest, refuse with 2).
+/// Exits 0 when the run ended and the host got its summary, whatever the steps' verdicts
+/// (the host reads them from the frames), 1 when it was not root or the summary never
+/// arrived.
+fn sim_cmd(host: Option<&dyn sim::SimHost>, args: &sim::SimArgs) -> ExitCode {
+    let Some(host) = host else {
+        eprintln!("kbf-guest: sim runs inside a macOS guest");
+        return ExitCode::from(2);
+    };
+    let summary = sim::run(host, &sim::Config::from(args), &mut std::io::stderr());
+    let sent = !summary.undelivered.iter().any(|n| n == sim::SUMMARY_NAME);
+    if summary.steps.is_empty() || !sent {
+        eprintln!(
+            "kbf-guest: sim: no run to report ({})",
+            summary
+                .note
+                .as_deref()
+                .unwrap_or("the summary frame did not reach the host")
+        );
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// The host `sim` uses: the real guest on macOS, nothing elsewhere.
+#[cfg(target_os = "macos")]
+fn real_sim_host() -> Option<Box<dyn sim::SimHost>> {
+    Some(Box::new(kbf_guest::sim_host::RealSimHost::new()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn real_sim_host() -> Option<Box<dyn sim::SimHost>> {
+    None
+}
+
+/// Runs the shutdown listener with `daemon` (`None`: not a macOS guest, refuse with 2).
+fn shutdown_cmd(daemon: Option<&dyn shutdown::Daemon>, port: u32) -> ExitCode {
+    let Some(daemon) = daemon else {
+        eprintln!("kbf-guest: shutdown-listen runs inside a macOS guest");
+        return ExitCode::from(2);
+    };
+    match daemon.run(port, &mut std::io::stderr()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("kbf-guest: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The daemon `shutdown-listen` runs: the real guest on macOS, nothing elsewhere.
+#[cfg(target_os = "macos")]
+fn real_shutdown_daemon() -> Option<Box<dyn shutdown::Daemon>> {
+    Some(Box::new(kbf_guest::shutdown_host::SystemDaemon))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn real_shutdown_daemon() -> Option<Box<dyn shutdown::Daemon>> {
+    None
+}
+
+/// Diagnoses the share with `diagnoser` (`None`: not a macOS guest, refuse with 2).
+fn diag_cmd(diagnoser: Option<&dyn diag::DiagHost>, args: &diag::DiagArgs) -> ExitCode {
+    let Some(diagnoser) = diagnoser else {
+        eprintln!("kbf-guest: probe-diag runs inside a macOS guest");
+        return ExitCode::from(2);
+    };
+    let report = diag::diagnose(diagnoser, args);
+    diag::emit(&report, &args.share, &mut std::io::stdout());
+    diag::deliver(diagnoser, args.vsock_port, &report, &mut std::io::stderr());
+    ExitCode::SUCCESS
+}
+
+/// The diagnoser `probe-diag` uses: the real guest on macOS, nothing elsewhere.
+#[cfg(target_os = "macos")]
+fn real_diagnoser() -> Option<Box<dyn diag::DiagHost>> {
+    Some(Box::new(kbf_guest::probe_host::SystemHost))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn real_diagnoser() -> Option<Box<dyn diag::DiagHost>> {
+    None
+}
+
+/// Mounts the share `args` names with `mounter` (`None`: not a macOS guest, refuse with 2).
+fn mount_cmd(mounter: Option<&dyn mount::Mounter>, args: &mount::MountArgs) -> ExitCode {
+    let Some(mounter) = mounter else {
+        eprintln!("kbf-guest: mount-share runs inside a macOS guest");
+        return ExitCode::from(2);
+    };
+    match mount::mount_share(mounter, args, &mut std::io::stderr()) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("kbf-guest: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The mounter `mount-share` uses: the real guest on macOS, nothing elsewhere.
+#[cfg(target_os = "macos")]
+fn real_mounter() -> Option<Box<dyn mount::Mounter>> {
+    Some(Box::new(kbf_guest::probe_host::SystemHost))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn real_mounter() -> Option<Box<dyn mount::Mounter>> {
+    None
 }
 
 /// The host the probes ask: the real guest on macOS, nothing elsewhere.
@@ -110,22 +280,27 @@ fn real_probe_host() -> Option<Box<dyn probe::Host>> {
     None
 }
 
-/// Runs a probe against `host` and writes its answer to `out`; `None` for the host means
-/// this is not a macOS guest: refuse with 2.
+/// Runs a probe against `host` and delivers its answer as `kind`: over vsock `port` first,
+/// into `out` in the share when that fails (every attempt is logged on stderr); `None` for
+/// the host means this is not a macOS guest: refuse with 2.
 fn probe_cmd(
     host: Option<&dyn probe::Host>,
     out: &std::path::Path,
+    kind: Kind,
+    port: u32,
     run: impl FnOnce(&dyn probe::Host) -> Result<serde_json::Value, String>,
 ) -> ExitCode {
     let Some(host) = host else {
         eprintln!("kbf-guest: the probe subcommands run inside a macOS guest");
         return ExitCode::from(2);
     };
+    eprintln!("{}", probe::started_line(host, out));
     let written = run(host).and_then(|v| {
-        probe::write_result(out, &v).map_err(|e| format!("write {}: {e}", out.display()))
+        probe::deliver(host, port, kind, out, &v, &mut std::io::stderr())
+            .map_err(|e| format!("write {}: {e}", out.display()))
     });
     match written {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kbf-guest: {e}");
             ExitCode::FAILURE
@@ -198,11 +373,16 @@ mod tests {
     }
 
     fn h() -> H {
-        H(std::cell::Cell::new(false))
+        H(std::cell::Cell::new(false), false)
     }
 
-    /// A host that answers every question.
-    struct H(std::cell::Cell<bool>);
+    /// A host whose vsock acknowledges every frame.
+    fn h_acking() -> H {
+        H(std::cell::Cell::new(false), true)
+    }
+
+    /// A host that answers every question; the flag is whether its vsock works.
+    struct H(std::cell::Cell<bool>, bool);
 
     impl probe::Host for H {
         fn ids(&self) -> (u32, u32) {
@@ -219,6 +399,17 @@ mod tests {
         }
         fn vsock(&self, _: u32) -> serde_json::Value {
             serde_json::json!(null)
+        }
+        fn send_frame(
+            &self,
+            _: u32,
+            _: &kbf_guest::frame::Frame,
+        ) -> Result<(), kbf_guest::frame::SendError> {
+            if self.1 {
+                Ok(())
+            } else {
+                Err(kbf_guest::frame::SendError::Unavailable("no device".into()))
+            }
         }
         fn console(&self, _: &str) -> serde_json::Value {
             serde_json::json!(null)
@@ -241,17 +432,47 @@ mod tests {
         let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-guest-main-ok");
         let out = dir.join("r.json");
         let ok = |_: &dyn probe::Host| Ok(serde_json::json!({"k": 1}));
-        assert_eq!(probe_cmd(Some(&h()), &out, ok), ExitCode::SUCCESS);
+        let go = |host: Option<&dyn probe::Host>,
+                  out: &std::path::Path,
+                  run: fn(&dyn probe::Host) -> Result<serde_json::Value, String>| {
+            probe_cmd(host, out, Kind::Result, 5000, run)
+        };
+        assert_eq!(go(Some(&h()), &out, ok), ExitCode::SUCCESS);
         assert!(out.exists());
         assert_eq!(
-            probe_cmd(Some(&h()), &out, |_| Err("no".into())),
+            go(Some(&h()), &out, |_| Err("no".into())),
             ExitCode::FAILURE
         );
-        assert_eq!(
-            probe_cmd(Some(&h()), &dir.join("x/r.json"), ok),
-            ExitCode::FAILURE
-        );
-        assert_eq!(probe_cmd(None, &out, ok), ExitCode::from(2));
+        assert_eq!(go(Some(&h()), &dir.join("x/r.json"), ok), ExitCode::FAILURE);
+        assert_eq!(go(None, &out, ok), ExitCode::from(2));
+    }
+
+    /// Catches a probe that writes into the share although the host acknowledged its
+    /// answer over vsock (both markers and results), and one that exits non-zero then.
+    #[test]
+    fn probes_deliver_over_vsock_and_leave_the_share_alone() {
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-guest-main-vsock");
+        let refusal = || Err("kbf-guest refuses to run as root".to_owned());
+        let guest = dir.join("g.json");
+        let ready = dir.join("r.json");
+        let g = ["probe-guest", "--out", guest.to_str().expect("p")];
+        let r = ["probe-ready", "--out", ready.to_str().expect("p")];
+        for args in [&g[..], &r[..]] {
+            assert_eq!(
+                run_with(
+                    cli(args),
+                    refusal(),
+                    Some(&h_acking()),
+                    None,
+                    None,
+                    None,
+                    None
+                ),
+                ExitCode::SUCCESS
+            );
+        }
+        assert!(!guest.exists());
+        assert!(!ready.exists());
     }
 
     /// Catches a probe subcommand refused as root (it must run as any user: the root
@@ -270,7 +491,10 @@ mod tests {
             "--wait-path",
             "/w",
         ];
-        assert_eq!(run_with(cli(&g), refusal(), Some(&h())), ExitCode::SUCCESS);
+        assert_eq!(
+            run_with(cli(&g), refusal(), Some(&h()), None, None, None, None),
+            ExitCode::SUCCESS
+        );
         let r = [
             "probe-ready",
             "--out",
@@ -278,7 +502,10 @@ mod tests {
             "--wait-process",
             "p",
         ];
-        assert_eq!(run_with(cli(&r), refusal(), Some(&h())), ExitCode::SUCCESS);
+        assert_eq!(
+            run_with(cli(&r), refusal(), Some(&h()), None, None, None, None),
+            ExitCode::SUCCESS
+        );
         let text = std::fs::read_to_string(&guest).expect("guest result");
         assert!(text.contains("\"uid\": 1"), "{text}");
         assert!(
@@ -286,6 +513,219 @@ mod tests {
                 .expect("ready result")
                 .contains("\"session\"")
         );
-        assert_eq!(run_with(cli(&r), refusal(), None), ExitCode::from(2));
+        assert_eq!(
+            run_with(cli(&r), refusal(), None, None, None, None, None),
+            ExitCode::from(2)
+        );
+    }
+
+    /// A mounter that works or fails as told.
+    struct M(bool);
+
+    impl mount::Mounter for M {
+        fn mount(&self, _: &str, _: &std::path::Path) -> Result<(), String> {
+            if self.0 { Ok(()) } else { Err("busy".into()) }
+        }
+        fn pause(&self, _: std::time::Duration) {}
+    }
+
+    /// Catches `mount-share` refused as root (the mount daemon is root), a failed mount
+    /// that exits 0 (the ready marker would then never come and nothing would say why),
+    /// and a run where there is no guest that does not exit 2.
+    #[test]
+    fn mount_share_runs_as_root_and_fails_loud() {
+        let refusal = || Err("kbf-guest refuses to run as root".to_owned());
+        let args = [
+            "mount-share",
+            "--tag=t",
+            "--mountpoint=/m",
+            "--attempts=2",
+            "--delay-ms=0",
+        ];
+        let go = |m: Option<&dyn mount::Mounter>| {
+            run_with(cli(&args), refusal(), None, m, None, None, None)
+        };
+        assert_eq!(go(Some(&M(true))), ExitCode::SUCCESS);
+        assert_eq!(go(Some(&M(false))), ExitCode::FAILURE);
+        assert_eq!(go(None), ExitCode::from(2));
+    }
+
+    /// A diagnoser that answers everything with null.
+    struct D;
+
+    impl diag::DiagHost for D {
+        fn run(&self, _: &str, _: &[&str]) -> serde_json::Value {
+            serde_json::json!(null)
+        }
+        fn ids(&self) -> serde_json::Value {
+            serde_json::json!(null)
+        }
+        fn exists(&self, _: &std::path::Path) -> bool {
+            true
+        }
+        fn pause(&self, _: std::time::Duration) {}
+        fn vsock_round_trip(&self, _: u32) -> serde_json::Value {
+            serde_json::json!(null)
+        }
+        fn mount_cycle(
+            &self,
+            _: &str,
+            _: &std::path::Path,
+            _: &dyn Fn(&std::path::Path) -> serde_json::Value,
+        ) -> serde_json::Value {
+            serde_json::json!(null)
+        }
+        fn send_frame(
+            &self,
+            _: u32,
+            _: &kbf_guest::frame::Frame,
+        ) -> Result<(), kbf_guest::frame::SendError> {
+            Ok(())
+        }
+    }
+
+    /// Catches `probe-diag` refused as root (it is run by a root daemon), a diagnosis that
+    /// fails the process (the report is the answer, a refused write is not an error), and
+    /// a run where there is no guest that does not exit 2.
+    #[test]
+    fn probe_diag_runs_as_root_and_always_reports() {
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-guest-main-diag");
+        let refusal = || Err("kbf-guest refuses to run as root".to_owned());
+        let share = format!("--share={}", dir.join("none").display());
+        let control = format!("--control-dir={}", dir.join("none").display());
+        let args = ["probe-diag", share.as_str(), control.as_str()];
+        let go = |d: Option<&dyn diag::DiagHost>| {
+            run_with(cli(&args), refusal(), None, None, d, None, None)
+        };
+        assert_eq!(go(Some(&D)), ExitCode::SUCCESS);
+        assert_eq!(go(None), ExitCode::from(2));
+    }
+
+    /// A shutdown daemon that works or fails as told, recording the port it was given.
+    struct Dm(Option<&'static str>, std::cell::Cell<u32>);
+
+    impl shutdown::Daemon for Dm {
+        fn run(&self, port: u32, _: &mut dyn std::io::Write) -> Result<(), String> {
+            self.1.set(port);
+            self.0.map_or(Ok(()), |e| Err(e.to_owned()))
+        }
+    }
+
+    /// Catches `shutdown-listen` refused as root (it is a root daemon: `shutdown` needs
+    /// root), a listener failure that exits 0 (launchd would not restart it and the host
+    /// would never get an ack), the port flag ignored, and a run where there is no guest
+    /// that does not exit 2.
+    #[test]
+    fn shutdown_listen_runs_as_root_on_its_port_and_fails_loud() {
+        let refusal = || Err("kbf-guest refuses to run as root".to_owned());
+        let go = |args: &[&str], d: Option<&dyn shutdown::Daemon>| {
+            run_with(cli(args), refusal(), None, None, None, d, None)
+        };
+        let ok = Dm(None, std::cell::Cell::new(0));
+        assert_eq!(go(&["shutdown-listen"], Some(&ok)), ExitCode::SUCCESS);
+        assert_eq!(ok.1.get(), 5001);
+        assert_eq!(
+            go(&["shutdown-listen", "--port=6000"], Some(&ok)),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(ok.1.get(), 6000);
+        let bad = Dm(Some("bind failed"), std::cell::Cell::new(0));
+        assert_eq!(go(&["shutdown-listen"], Some(&bad)), ExitCode::FAILURE);
+        assert_eq!(go(&["shutdown-listen"], None), ExitCode::from(2));
+    }
+
+    /// A simulator host with nothing staged: every command succeeds, the screenshot is a
+    /// few bytes, and the vsock acknowledges (or not).
+    struct S {
+        root: bool,
+        up: bool,
+    }
+
+    impl sim::SimHost for S {
+        fn is_root(&self) -> bool {
+            self.root
+        }
+        fn runtime_images(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn app_bundles(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn console_user(&self) -> Option<sim::ConsoleUser> {
+            Some(sim::ConsoleUser {
+                uid: 501,
+                name: "u".to_owned(),
+            })
+        }
+        fn prepare_out_dir(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn read_screenshot(&self, _: usize) -> Result<Vec<u8>, String> {
+            Ok(vec![1, 2, 3])
+        }
+        fn run(&self, argv: &[String], _: std::time::Duration) -> sim::Outcome {
+            let line = argv.join(" ");
+            let stdout = if line.contains("list runtimes") {
+                r#"{"runtimes":[{"identifier":"com.apple.CoreSimulator.SimRuntime.iOS-27-0","version":"27.0","isAvailable":true}]}"#
+            } else if line.contains("list devicetypes") {
+                r#"{"devicetypes":[{"identifier":"t","name":"iPhone 16"}]}"#
+            } else if line.contains("simctl create") {
+                "6F3A1B2C-0D4E-4F5A-8B6C-7D8E9F0A1B2C\n"
+            } else {
+                ""
+            };
+            sim::Outcome {
+                ended: sim::Ended::Exited(0),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+                cut: false,
+                ms: 1,
+            }
+        }
+        fn send(
+            &self,
+            _: u32,
+            _: &kbf_guest::frame::Frame,
+        ) -> Result<(), kbf_guest::frame::SendError> {
+            if self.up {
+                Ok(())
+            } else {
+                Err(kbf_guest::frame::SendError::Unavailable("no".into()))
+            }
+        }
+        fn pause(&self, _: std::time::Duration) {}
+    }
+
+    /// Catches `sim` being refused as root (it is a root daemon, so the refusal that guards
+    /// the agent must not apply), run off macOS, or reporting success without a summary the
+    /// host received or when it was not root.
+    #[test]
+    fn sim_runs_as_root_and_exits_by_whether_the_host_got_its_summary() {
+        let root = || Err("kbf-guest refuses to run as root".to_owned());
+        let go = |host: Option<&dyn sim::SimHost>| {
+            run_with(cli(&["sim"]), root(), None, None, None, None, host)
+        };
+        assert_eq!(
+            go(Some(&S {
+                root: true,
+                up: true
+            })),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            go(Some(&S {
+                root: true,
+                up: false
+            })),
+            ExitCode::FAILURE
+        );
+        assert_eq!(
+            go(Some(&S {
+                root: false,
+                up: true
+            })),
+            ExitCode::FAILURE
+        );
+        assert_eq!(go(None), ExitCode::from(2));
     }
 }

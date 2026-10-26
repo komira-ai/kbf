@@ -37,7 +37,7 @@ fn shape(pieces: &[(Record, u64, u64)]) -> Vec<(u8, u64, u64)> {
         .collect()
 }
 
-/// Catches an upload cut at every segment (mutant: one upload per segment) and a
+/// Catches an upload cut at every segment (such as one upload per segment) and a
 /// segment over its limit: blobs past one segment's limit fill several segments of
 /// one upload, each within the limit.
 #[test]
@@ -69,7 +69,7 @@ fn uploads_stay_under_both_caps() {
 
 /// Catches the cap that lost 14,244 outputs to one failed upload: a cold output set of
 /// 300 MiB in 1.5 MiB blobs is cut into uploads of at most `SEGMENT_UPLOAD_BYTES`, so one
-/// failed upload puts at most that much at risk (mutant: the old 1 GiB cap, one upload).
+/// failed upload puts at most that much at risk (such as the old 1 GiB cap, one upload).
 #[test]
 fn a_large_output_set_is_many_small_uploads() {
     let uploads = plan(
@@ -156,7 +156,7 @@ fn coalescing_joins_close_blobs_of_one_object() {
     );
 }
 
-/// Catches an empty segment, or an empty upload, sent to the server (mutants: the
+/// Catches an empty segment, or an empty upload, sent to the server (such as the
 /// segment closed at the upload cap pushed whether or not it holds a record; the last
 /// segment or upload pushed when empty): when a blob closes a full segment and also
 /// passes the upload's byte cap, the new upload starts with that blob and no empty
@@ -226,11 +226,11 @@ impl Cas for Lying {
     }
 }
 
-/// Catches a stored blob trusted without checking the store's answer (mutant: the
+/// Catches a stored blob trusted without checking the store's answer (such as the
 /// comparison of `put`'s digest dropped): `put_each` stores a small blob, and one over
 /// a megabyte streamed through `put_chunks`, while the store answers their digests,
 /// and fails as corrupt, naming the blob, through a store that answers another digest.
-/// Also catches a blob over a megabyte read whole (mutant: every blob sent by `put`):
+/// Also catches a blob over a megabyte read whole (such as every blob sent by `put`):
 /// only that one reaches `put_chunks`.
 /// One store type throughout, so one instantiation of `put_each` runs all of it.
 #[tokio::test]

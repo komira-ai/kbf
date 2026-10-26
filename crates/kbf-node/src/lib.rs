@@ -34,6 +34,13 @@
 //! lease's input files from, and the shared input trees. Their budgets
 //! come from the filesystem, not from flags; `--data-max-bytes` only lowers them.
 //!
+//! With `--pack-read` (off by default; `pack_read`) the data plane of `kbf daemon` and of the
+//! daemon half of `kbf storage-and-daemon` with a frontend reads blobs from the packs of the
+//! farm's object store first, finding them through the frontend's pack index; a blob it does
+//! not locate is read where it always was, and outputs are stored where they were.
+//! With `--pack-write` as well (off by default; `pack_read`) it writes its outputs into packs
+//! while the frontend takes pack commits.
+//!
 //! The log goes to stderr, in color only when stderr is a terminal: under launchd or
 //! systemd it is a file or a journal, where escape codes are noise (issue #170). The
 //! daemon does not rotate it; the service manager that owns stderr does. systemd's
@@ -152,6 +159,8 @@ pub struct Cli {
     output_upload_deadline_secs: u64,
     #[command(flatten)]
     transfer: transfer::TransferArgs,
+    #[command(flatten)]
+    pack_read: pack_read::PackReadArgs,
     /// The cgroup lease cgroups are made under, from the cgroup root (container). Left
     /// out, the daemon sets up its own cgroup, which its systemd unit must delegate
     /// (`Delegate=yes`): it moves itself into a `supervisor` leaf there and makes
@@ -313,7 +322,7 @@ pub struct Cli {
     /// action runs as one of `kbf-pool-0` .. `kbf-pool-<N-1>`, one lease per user at a
     /// time, as kbf-mac-provision makes them (`pool_users`). Required of a root daemon,
     /// which runs no action as root; refused for any other.
-    #[arg(long, requires = "pool_first_uid", value_parser = clap::value_parser!(u32).range(1..=64))]
+    #[arg(long, requires = "pool_first_uid", value_parser = clap::value_parser!(u32).range(1..=100))]
     pool_users: Option<u32>,
     /// The uid of `kbf-pool-0`, and the group id of all the pool users (`pool_first_uid`
     /// in kbf-mac-provision's profile); at least 600.
@@ -586,6 +595,10 @@ impl NodeHandle {
 /// checks fail ([`ImageUnusable`] among them, for which [`exit_code`] answers 2), or
 /// the node cannot be detected.
 pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
+    // With `--pack-read`, the same plane with its reads going to the packs first.
+    if let Some(settings) = cli.pack_read.settings() {
+        return pack_read::start(cli, settings);
+    }
     // The map the frontend pushes lands in `maps`: the daemon fills it, the data plane
     // routes by it.
     let maps = Arc::new(MapHolder::new());
@@ -600,11 +613,15 @@ pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
 /// storage-and-daemon` with a frontend): the data plane routes every blob by the map the
 /// frontend sends, the blobs of `local` in-process and the others over TLS to their
 /// owners ([`kbf_daemon::member_cas`]). There is no `--cas` leg: with no map held a call
-/// fails UNAVAILABLE and writes nothing.
+/// fails UNAVAILABLE and writes nothing. With `--pack-read` reads ask the packs first
+/// (`pack_read`), the frontend over a connection to the first `--server`.
 ///
 /// # Errors
 /// As [`start`].
 pub fn start_member(cli: &Cli, local: LocalMember) -> Result<NodeHandle, Error> {
+    if let Some(settings) = cli.pack_read.settings() {
+        return pack_read::start_member(cli, local, settings);
+    }
     let maps = Arc::new(MapHolder::new());
     let held = Arc::clone(&maps);
     let own = local.addr().to_owned();
@@ -626,6 +643,7 @@ pub fn start_with<C: Cas>(
     cli: &Cli,
     plane: impl Fn(&Cli) -> Result<Arc<C>, Error> + 'static,
 ) -> Result<NodeHandle, Error> {
+    cli.pack_read.refuse_in_process()?;
     start_over(cli, None, move |cli, _| plane(cli))
 }
 
@@ -1287,6 +1305,7 @@ mod container {
 
 mod data_dir;
 mod instance;
+mod pack_read;
 mod retired;
 mod run;
 mod transfer;
@@ -1556,7 +1575,7 @@ mod tests {
         for one in ["--pool-users=2", "--pool-first-uid=700"] {
             assert!(pooled(&[one]).is_err(), "{one} alone");
         }
-        for count in ["0", "65"] {
+        for count in ["0", "101"] {
             assert!(pooled(&[&format!("--pool-users={count}"), "--pool-first-uid=700"]).is_err());
         }
         let root = pooled(&["--pool-users=1", "--pool-first-uid=0"]).expect("flags");

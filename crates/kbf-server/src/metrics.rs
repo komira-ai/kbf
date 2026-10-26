@@ -25,6 +25,7 @@ use kbf_objstore::ObjectStore;
 use kbf_storage::local_cache::{Fill, LocalCache};
 use kbf_tls::TlsSource;
 
+use crate::farm::Farm;
 use crate::listen::{Binder, Socket};
 use crate::members::Members;
 use crate::proxy_auth::Caller;
@@ -35,12 +36,14 @@ use crate::start::AbortOnDrop;
 pub const TEXT_FORMAT: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// What a scrape adds to the cache's own metrics: the node's one cache's fill if the
-/// process has one, and build history's counters if the server keeps history. Not
-/// generic: nothing here depends on the cache.
+/// process has one, build history's counters if the server keeps history, and the pack
+/// reads the daemons report if the process has a farm. Not generic: nothing here depends on
+/// the cache.
 #[derive(Clone)]
 struct Extras {
     local: Option<Arc<LocalCache>>,
     history: Option<Arc<crate::history::Stats>>,
+    farm: Option<Arc<Farm>>,
 }
 
 impl Extras {
@@ -51,6 +54,9 @@ impl Extras {
         }
         if let Some(history) = self.history {
             history.render(out);
+        }
+        if let Some(farm) = self.farm {
+            crate::pack_daemon_metrics::render_farm(out, &farm);
         }
     }
 }
@@ -75,14 +81,16 @@ impl<M, O> Clone for Sources<M, O> {
 }
 
 /// The `/metrics` route over `cache`'s metrics, `local`'s fill, when the server keeps
-/// build history its counters, the storage health of `members` and the reloads of the
-/// listeners' `tls` files.
+/// build history its counters, the storage health of `members`, the reloads of the
+/// listeners' `tls` files and, given the `farm` its daemons register with, the pack reads
+/// they report.
 pub fn router<M, O>(
     cache: Arc<Cache<M, O>>,
     local: Option<Arc<LocalCache>>,
     history: Option<Arc<crate::history::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
+    farm: Option<Arc<Farm>>,
 ) -> Router
 where
     M: MetaLog,
@@ -92,7 +100,11 @@ where
         .route("/metrics", get(metrics::<M, O>))
         .with_state(Sources {
             cache,
-            extras: Extras { local, history },
+            extras: Extras {
+                local,
+                history,
+                farm,
+            },
             members,
             tls: tls.into(),
         })
@@ -150,7 +162,7 @@ impl NodeMetrics {
         M: MetaLog,
         O: ObjectStore + 'static,
     {
-        let routes = router(cache, local, None, None, tls.into_iter().collect());
+        let routes = router(cache, local, None, None, tls.into_iter().collect(), None);
         // `pending` is its stop, so it ends only when the task is aborted; an error of
         // the accept loop has nothing to be reported to.
         // The node is not behind the proxy: no secret, so `gate_requests` admits a direct caller.

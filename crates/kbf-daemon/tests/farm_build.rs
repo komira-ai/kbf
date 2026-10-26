@@ -198,6 +198,7 @@ async fn build(pki: &Pki, owner: &Node, pushes_map: bool, scratch: &std::path::P
         unservable_wait: Duration::from_secs(300),
         default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: Duration::from_secs(60),
         shutdown_timeout: Duration::from_secs(10),
@@ -341,7 +342,7 @@ async fn execute(reapi: tonic::transport::Channel, action: Digest) -> ActionResu
 /// Catches blob bytes crossing the frontend in map mode. The input (1 MiB) is fetched
 /// from the owner and the output (512 KiB) stored at it, so the daemon's CAS connection
 /// to the frontend is never made, and the session between them, which carries the lease
-/// and its result, carries far less than one blob. Mutant: the plane always on the
+/// and its result, carries far less than one blob. Catches: the plane always on the
 /// frontend's side (the map ignored) puts the blobs on the CAS connection and fails here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn with_a_map_the_frontend_carries_no_blob_bytes() {

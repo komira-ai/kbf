@@ -2,9 +2,9 @@
 //! keeps for a re-dispatch, and the pump that carries them upstream.
 //!
 //! Flow control is plain here. A request body is read frame by frame, and hyper returns the
-//! client its credit only as each frame is read: a held stream never reads, so it returns
-//! nothing and the client stops at one window. A response body returns credit upstream as
-//! each frame is handed to hyper.
+//! client its credit only as each frame is read: a stream that is not read returns nothing and
+//! the client stops at one window. A response body returns credit upstream as each frame is
+//! handed to hyper.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -28,18 +28,18 @@ use crate::pool::Reservation;
 use crate::replay::{Failure, REPLAY_BYTES, ReplayBuffer, may_retry};
 use crate::reply::unavailable_trailers;
 use crate::route::Idle;
-use crate::slot::Permit;
+use crate::upstreams::MemberPermit;
 
 /// A response body that failed after its headers went out.
 #[derive(Debug, thiserror::Error)]
 #[error("the upstream stream failed")]
 pub(crate) struct BodyError;
 
-/// What a stream holds for its whole life: its slot permit and its upstream stream. It drops
-/// when the last of its two halves (the response body, the request pump) is done, never at
-/// the downstream END_STREAM.
+/// What a stream holds for its whole life: its place on a member and its upstream stream. It
+/// drops when the last of its two halves (the response body, the request pump) is done, never
+/// at the downstream END_STREAM.
 pub(crate) struct Lifetime {
-    _permit: Permit,
+    _permit: MemberPermit,
     _reservation: Reservation,
     /// Set by the response half when it gives up: the request pump resets the upstream stream.
     cancel: Notify,
@@ -49,7 +49,7 @@ pub(crate) struct Lifetime {
 
 impl Lifetime {
     pub(crate) fn new(
-        permit: Permit,
+        permit: MemberPermit,
         reservation: Reservation,
         count: Arc<StreamCount>,
     ) -> Arc<Self> {
@@ -243,9 +243,6 @@ enum Kept {
 /// The most frames kept for a replay. A request that has more is not replayed.
 const MAX_KEPT_FRAMES: usize = 64;
 
-/// The most frames [`Source::peek`] reads before a stream is dispatched.
-const MAX_PEEK_FRAMES: usize = 8;
-
 /// What the pump does next.
 enum Next {
     /// A frame, and whether it is the last the request has (the client ended the stream with
@@ -310,46 +307,10 @@ impl Source {
         may_retry(path, failure, &self.state().buffer, attempts)
     }
 
-    /// Reads the upstream's first response head: true if it is the fenced answer (the window
-    /// stays open for [`Source::may_retry`]), else the request may have had an effect and the
-    /// window is closed for good. See [`ReplayBuffer::on_first_response`].
-    pub(crate) fn on_first_response(&self, headers: &HeaderMap, end_stream: bool) -> bool {
-        self.state().buffer.on_first_response(headers, end_stream)
-    }
-
-    /// Closes the window: the request is never replayed again.
+    /// Closes the window: the upstream answered, so the request may have had an effect and is
+    /// never replayed again.
     pub(crate) fn close_window(&self) {
         self.state().buffer.close();
-    }
-
-    /// Reads the start of the request without sending it, until `decided` says the bytes read
-    /// are enough, the request ends or [`MAX_PEEK_FRAMES`] frames are read; returns the DATA
-    /// bytes read. A request with no body at all is not read. A trailers frame ends the read,
-    /// and so does a body that failed (the reset that fails it also drops the stream's task).
-    ///
-    /// Nothing is taken from the request: every frame read is kept, so the pump replays it
-    /// first and the upstream sees the request whole, and a read that is dropped (the caller
-    /// bounds the wait) has lost nothing, since a frame is kept in the same step it is read.
-    /// A frame is kept while the replay window is open and has room, and it has both here: the
-    /// window is fresh, at most [`MAX_PEEK_FRAMES`] frames are read (well under
-    /// [`MAX_KEPT_FRAMES`]), and `decided` stops the read after a few hundred bytes, so what
-    /// is read is that plus one frame (16 KB at most), under [`REPLAY_BYTES`].
-    pub(crate) async fn peek(&self, decided: fn(&[u8]) -> bool) -> Vec<u8> {
-        let mut cursor = 0;
-        let mut head = Vec::new();
-        if self.bodiless() {
-            return head;
-        }
-        for _ in 0..MAX_PEEK_FRAMES {
-            let Next::Frame(Kept::Data(data), last) = self.next(&mut cursor).await else {
-                break;
-            };
-            head.extend_from_slice(&data);
-            if last | decided(&head) {
-                break;
-            }
-        }
-        head
     }
 
     /// The next frame for an attempt whose position is `cursor`: a kept one first, then the

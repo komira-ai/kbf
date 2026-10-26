@@ -11,12 +11,11 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_host::{HostExec, HostPath, Root};
 
 use crate::activate;
-use crate::boot_schema;
 use crate::cli::{BootArgs, Cli, Mode, RunArgs, ServiceArgs, Verb};
 use crate::database::Database;
 use crate::exit::Exit;
@@ -31,6 +30,7 @@ use crate::host_mode;
 use crate::layout::{Layout, Platform};
 use crate::proxy_verb;
 use crate::release::ReleaseError;
+use crate::run::{Runner, Spawn, SystemRunner};
 use crate::setup;
 
 /// Why a verb failed and the exit it ends with: `Failed`, or `NeedsOperator` when only an
@@ -116,7 +116,7 @@ fn now() -> u64 {
 fn host(root: PathBuf) -> Result<(Layout, HostExec), String> {
     let root = Root::new(root).map_err(|e| e.to_string())?;
     Ok((
-        Layout::new(root.clone(), Platform::current()),
+        Layout::new(root.clone(), Platform::current()).with_trust_fallback(),
         HostExec::new(root),
     ))
 }
@@ -292,23 +292,62 @@ fn run_from(root: PathBuf, args: &RunArgs, me: &Path, watch: FileIdentity) -> Re
     Ok(())
 }
 
+/// The longest the wrapped `kbf boot-check` gets: 120 s, the `TimeoutStartSec=` of
+/// `kbf-frontend.service` (the other mode units keep systemd's default start timeout, which
+/// ends the start sooner). The check bounds its own waits (a connect, a lock).
+const BOOT_CHECK_WAIT: Duration = Duration::from_secs(120);
+
+/// What the wrapper says of a `kbf` that exits 2, the status clap ends with for a verb it does
+/// not know: the answer of a kbf of before `kbf boot-check`.
+const NO_VERB: &str = "ended with 2, which is how a kbf without the boot-check verb answers: \
+                       upgrade the kbf package";
+
 /// `boot-check` on a bundled host (the unit passed `--kbf` and `--mode`): the host has no
-/// release and no state, so [`activate::boot_check`] is never called; the database is
-/// brought to the schema `kbf` declares, for the modes that keep their state in it, and any
-/// failure ends the check non-zero so that the unit does not start.
-fn bundled_boot_check(root: PathBuf, kbf: &Path, mode: Mode) -> Result<(), Failure> {
+/// release and no state, so [`activate::boot_check`] is never called. The schema step is
+/// `kbf boot-check`'s now (the kbf package's units run it themselves); this runs
+/// `<kbf> boot-check --mode=<mode> --installer-config=<the host's installer.toml>`, shows what
+/// it said, and ends as it ended, so that a unit of the earlier packages, which still names
+/// this verb, starts only on a database its kbf can use. It needs a `kbf` that has the verb
+/// (an older one exits 2, which is [`NO_VERB`]), so the kbf package is upgraded with the
+/// installer or before it. It stays for one release.
+fn bundled_boot_check(
+    root: PathBuf,
+    runner: &dyn Runner,
+    kbf: &Path,
+    mode: Mode,
+) -> Result<(), Failure> {
     let (layout, _) = host(root)?;
     let installer_toml = layout.join(&layout.installer_toml());
-    let runner = crate::run::SystemRunner;
-    let said = boot_schema::before_start(&runner, &installer_toml, kbf, mode)
-        .map_err(|why| Failure::from(format!("boot check: {why}")))?;
-    eprintln!("kbf-installer: boot check: {said}");
-    Ok(())
+    let ran = runner
+        .run(&Spawn {
+            program: kbf.to_owned(),
+            args: vec![
+                "boot-check".into(),
+                format!("--mode={}", setup::validate::mode_name(mode)).into(),
+                format!("--installer-config={}", installer_toml.display()).into(),
+            ],
+            env: Vec::new(),
+            cwd: "/".into(),
+            run_as: None,
+            timeout: BOOT_CHECK_WAIT,
+        })
+        .map_err(|e| format!("boot check: cannot run {}: {}", kbf.display(), e.kind()))?;
+    eprint!("{}", String::from_utf8_lossy(&ran.stderr));
+    let ended = match (ran.timed_out, ran.code) {
+        (false, Some(0)) => return Ok(()),
+        (true, _) => format!("did not end in {} s", BOOT_CHECK_WAIT.as_secs()),
+        (false, Some(2)) => NO_VERB.to_owned(),
+        (false, other) => format!("ended with {other:?}"),
+    };
+    Err(Failure::from(format!(
+        "boot check: {} boot-check {ended}",
+        kbf.display()
+    )))
 }
 
 fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), Failure> {
     if let Some((kbf, mode)) = args.bundled() {
-        return bundled_boot_check(root, kbf, mode);
+        return bundled_boot_check(root, &SystemRunner, kbf, mode);
     }
     let (layout, mut exec) = host(root)?;
     let mut out = Vec::new();
@@ -452,7 +491,7 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         );
     }
     if let Verb::Proxy(args) = &cli.verb {
-        return match proxy_verb::run(args, &root_of(cli)) {
+        return match proxy_verb::run(args) {
             Ok(()) => Exit::Ok,
             Err(e) => say(
                 e.exit(),
@@ -462,10 +501,15 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         };
     }
     let result = match &cli.verb {
-        // `setup` checks for root itself and prints its steps ahead of its own result.
+        // `setup` checks for root itself and prints its steps ahead of its own result. The
+        // proxy's flags are refused first, from the flags alone: two-slot supervision was
+        // removed, so a run that gives one reads and changes nothing.
         Verb::Setup(args) => {
+            if let Some(refusal) = args.proxy.refusal() {
+                return finish_setup(cli.json, Err(refusal), &[], out, err);
+            }
             let mut steps = Vec::new();
-            let result = setup::cli(root_of(cli), args, cli.apply, &mut steps);
+            let result = setup::cli(root_of(cli), &args.setup, cli.apply, &mut steps);
             return finish_setup(cli.json, result, &steps, out, err);
         }
         Verb::Run(args) => run(root_of(cli), args),

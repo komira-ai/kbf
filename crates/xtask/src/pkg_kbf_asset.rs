@@ -1,20 +1,31 @@
 //! `pkg-kbf-asset --package <deb> --platform <platform> --commit <sha> --kbf-tarball <file>
-//! (--out <dir> | --verify-only)`: the `kbf` deb as a release asset,
-//! `kbf-<commit>-<platform>.deb`, and the checks that tie it to the bytes the attestation
-//! covers. (The `kbf-installer` deb is [`crate::pkg_asset`]'s.)
+//! --expect-ref refs/heads/<branch> [--gh <program>] (--out <dir> | --verify-only)`: the `kbf`
+//! deb as a release asset, `kbf-<commit>-<platform>.deb`, and the checks that tie it to the
+//! bytes the attestation covers.
 //!
-//! The deb is opened as [`crate::pkg_asset`] opens one and refused unless:
+//! The deb is opened ([`crate::pkg_asset::open`]) and refused unless:
 //!
-//! - its control file says the architecture of `--platform`, the package `kbf`, a
-//!   dependency on `kbf-installer (>= <its own version>)`, because each mode unit runs the
-//!   installer's `boot-check` before it starts `kbf`, and that it `Replaces: kbf-installer`,
-//!   because the units of the modes were files of the installer's deb and dpkg refuses to
-//!   unpack a package over files another package owns;
+//! - its control file says the architecture of `--platform`, the package `kbf`, the
+//!   recommendations and suggestions of [`crate::pkg_linux`], no `Depends`, `Pre-Depends`,
+//!   `Breaks` or `Conflicts` at all (a host updates it with a plain `dpkg --install`, which
+//!   resolves nothing: a dependency the host lacks leaves it unconfigured, and a `Breaks` of the
+//!   installer makes dpkg refuse on a host that has it), and that it `Replaces` the
+//!   `kbf-installer` packages older than the first version that has none
+//!   ([`KBF_DEB_REPLACES`]): the units, `kbf.slice`, the sysusers and tmpfiles files, the
+//!   needrestart drop-in and the trust files were files of the installer's deb, and dpkg refuses
+//!   to unpack a package over files another package owns unless the control file says so;
 //! - `usr/bin/kbf` is byte for byte the `kbf` inside `--kbf-tarball`, the tarball
 //!   `build-commit check-asset` has already shown names the commit: the deb carries the
 //!   bytes the build identified, not others. It is mode 0755;
-//! - it holds the unit of every mode ([`crate::pkg_linux::KBF_UNITS`]) in
-//!   `usr/lib/systemd/system`, mode 0644, and no other file.
+//! - it holds the unit of every mode ([`crate::pkg_linux::KBF_UNITS`]) and `kbf.slice` in
+//!   `usr/lib/systemd/system`, the sysusers.d and tmpfiles.d files and the needrestart
+//!   drop-in, all mode 0644;
+//! - its trust directory `usr/share/kbf/trust` holds the pinned `gh` (mode 0755, and byte for
+//!   byte `--gh`, the program the job downloaded and checked by SHA-256, when given), the
+//!   Sigstore trusted root and an `installer.conf` that is exactly `SOURCE_REFS=` and
+//!   `--expect-ref` ([`crate::pkg_asset::trust_problems`]): a deb built on `main` trusts
+//!   `main` and a deb built on a feature branch trusts that branch, never the reverse;
+//! - it holds no other file.
 //!
 //! Then, without `--verify-only`, it copies the deb to `<out>/kbf-<commit>-<platform>.deb`
 //! and appends its line to `<out>/SHA256SUMS.<platform>` ([`crate::sums`]), refusing a deb
@@ -27,7 +38,10 @@ use std::path::Path;
 use crate::Error;
 use crate::package::Platform;
 use crate::pkg_asset::{self, Mode};
-use crate::pkg_linux::{self, KBF_DEB_REPLACES, KBF_NAME, KBF_PATH, KBF_UNITS, UNIT_DIR};
+use crate::pkg_linux::{
+    DEB_RECOMMENDS, DEB_SUGGESTS, KBF_DEB_REPLACES, KBF_NAME, KBF_PATH, KBF_UNITS,
+    NEEDRESTART_PATH, SLICE, SYSUSERS_PATH, TMPFILES_PATH, TRUST_DIR, TRUST_FILES, UNIT_DIR,
+};
 
 /// The file name of the asset.
 pub fn file_name(commit: &str, platform: Platform) -> String {
@@ -39,6 +53,10 @@ pub struct Check<'a> {
     pub platform: Platform,
     /// The `kbf-<commit>-<platform>.tar.gz` the deb's `kbf` must equal.
     pub kbf_tarball: &'a Path,
+    /// The branch the deb must trust: `refs/heads/<branch>`.
+    pub expect_ref: &'a str,
+    /// The pinned `gh` the deb's must equal, when the job has it.
+    pub gh: Option<&'a Path>,
 }
 
 /// The value of the control field that starts a line with `name` (such as `Depends: `).
@@ -56,16 +74,34 @@ fn holds(list: &str, want: &str) -> bool {
     list.split(',').any(|d| squashed(d) == squashed(want))
 }
 
-/// The path of the unit `unit` in a data tarball (no leading slash).
-fn unit_path(unit: &str) -> String {
-    format!("{}/{unit}", UNIT_DIR.trim_start_matches('/'))
+/// The path of the file `dst` of the package in a data tarball (no leading slash).
+fn member_path(dst: &str) -> String {
+    dst.trim_start_matches('/').to_owned()
+}
+
+/// The paths of the trust files, as a data tarball names them.
+fn trust_paths() -> Vec<String> {
+    TRUST_FILES
+        .map(|(n, _)| member_path(&format!("{TRUST_DIR}/{n}")))
+        .to_vec()
+}
+
+/// The regular files of the package other than `usr/bin/kbf` and the trust files (which
+/// [`pkg_asset::trust_problems`] holds to their modes and contents), as a data tarball names
+/// them, each with the mode it has: the units, the slice, and the sysusers, tmpfiles and
+/// needrestart files.
+fn other_files() -> Vec<(String, u32)> {
+    let units = KBF_UNITS.into_iter().chain([SLICE]);
+    let units = units.map(|u| (member_path(&format!("{UNIT_DIR}/{u}")), 0o644));
+    let single = [SYSUSERS_PATH, TMPFILES_PATH, NEEDRESTART_PATH].map(|p| (member_path(p), 0o644));
+    units.chain(single).collect()
 }
 
 /// What is wrong with `deb` (the bytes of the package) as the `kbf` package for `c`: one
 /// line per problem, none when it meets every check above.
 ///
 /// # Errors
-/// The tarball `c` names cannot be read.
+/// A file `c` names cannot be read.
 pub fn problems(deb: &[u8], c: &Check) -> Result<Vec<String>, Error> {
     let mut problems = Vec::new();
     let Some(opened) = pkg_asset::open(deb, c.platform, &mut problems) else {
@@ -78,38 +114,45 @@ pub fn problems(deb: &[u8], c: &Check) -> Result<Vec<String>, Error> {
             package.unwrap_or("(none)")
         ));
     }
-    let version = field(&opened.control, "Version: ").unwrap_or_default();
-    let depends = field(&opened.control, "Depends: ").unwrap_or_default();
-    let want = pkg_linux::kbf_depends_deb(version);
-    if !holds(depends, &want) {
-        problems.push(format!(
-            "control says Depends {depends:?}, which does not hold {want:?}"
-        ));
-    }
-    let replaces = field(&opened.control, "Replaces: ").unwrap_or_default();
-    for want in KBF_DEB_REPLACES {
-        if !holds(replaces, want) {
+    for name in ["Depends", "Pre-Depends", "Breaks", "Conflicts"] {
+        let got = field(&opened.control, &format!("{name}: ")).unwrap_or_default();
+        if !got.trim().is_empty() {
             problems.push(format!(
-                "control says Replaces {replaces:?}, which does not hold {want:?}"
+                "control says {name} {got:?}, but the kbf package has none: a plain `dpkg --install` resolves nothing"
             ));
+        }
+    }
+    for (name, wanted) in [
+        ("Recommends", &DEB_RECOMMENDS[..]),
+        ("Suggests", &DEB_SUGGESTS[..]),
+        ("Replaces", &KBF_DEB_REPLACES[..]),
+    ] {
+        let got = field(&opened.control, &format!("{name}: ")).unwrap_or_default();
+        for want in wanted {
+            if !holds(got, want) {
+                problems.push(format!(
+                    "control says {name} {got:?}, which does not hold {want:?}"
+                ));
+            }
         }
     }
     let path = KBF_PATH.trim_start_matches('/');
     let binary = pkg_asset::binary_problems(opened.file(path), path, KBF_NAME, c.kbf_tarball)?;
     problems.extend(binary);
-    for unit in KBF_UNITS {
-        let path = unit_path(unit);
-        let Some(m) = opened.file(&path) else {
-            problems.push(format!("holds no {path}"));
-            continue;
-        };
-        if m.mode != 0o644 {
-            problems.push(format!("{path} has mode {:04o}, not 0644", m.mode));
+    let others = other_files();
+    for (path, mode) in &others {
+        match opened.file(path) {
+            None => problems.push(format!("holds no {path}")),
+            Some(m) if m.mode != *mode => {
+                problems.push(format!("{path} has mode {:04o}, not {mode:04o}", m.mode));
+            }
+            Some(_) => {}
         }
     }
-    let shipped = pkg_asset::kbf_package_paths();
+    problems.extend(pkg_asset::trust_problems(&opened, c.expect_ref, c.gh)?);
+    let trust = trust_paths();
     for m in &opened.files {
-        if !shipped.contains(&m.path) {
+        if m.path != path && !trust.contains(&m.path) && !others.iter().any(|(p, _)| *p == m.path) {
             problems.push(format!(
                 "holds {}, which the kbf package does not ship",
                 m.path
@@ -125,9 +168,10 @@ pub fn problems(deb: &[u8], c: &Check) -> Result<Vec<String>, Error> {
 /// The commit is not one, the deb is refused, or a file cannot be read or written.
 pub fn asset(deb: &Path, commit: &str, mode: &Mode, c: &Check) -> Result<Vec<String>, Error> {
     let said = format!(
-        "a {} package of the kbf in {}",
+        "a {} package of the kbf in {}, trusting {}",
         c.platform.name(),
-        c.kbf_tarball.display()
+        c.kbf_tarball.display(),
+        c.expect_ref
     );
     let name = file_name(commit, c.platform);
     let found = |bytes: &[u8]| problems(bytes, c);

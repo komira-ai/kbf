@@ -8,14 +8,15 @@
 //! has a bound so a lost wake-up fails the test and does not hang it.
 #![cfg(feature = "postgres")]
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use kbf_state::postgres::{Flaw, PostgresBackend, PostgresConfig, PostgresStore, schema};
-use kbf_state::{Cond, Revision, Store, StoreError, Txn, Version};
+use kbf_state::{Cond, Revision, Store, StoreError, Txn};
+use kbf_testkit::database::{CatalogGuard, batch_execute_retrying, ddl};
 use postgres::{Client, NoTls};
 
 const BOUND: Duration = Duration::from_secs(60);
@@ -97,30 +98,28 @@ fn as_user(url: &str, user: &str) -> String {
 }
 
 /// A role that may log in, create schemas, and hold at most `limit` connections. The
-/// URL is the test URL as that role.
+/// URL is the test URL as that role. Role names are one per test, and the roles of all the
+/// tests of a run are made on one server by processes running at once, so the DDL goes
+/// through the guard of the shared catalogs (see `kbf_testkit::database`).
 fn limited_role(admin: &mut Client, name: &str, limit: i32) -> String {
-    // Two roles granted on one database at once fail with "tuple concurrently updated".
-    static CATALOG: Mutex<()> = Mutex::new(());
-    let _one_at_a_time = CATALOG.lock().unwrap_or_else(PoisonError::into_inner);
+    let _catalog = CatalogGuard::take();
     let dropped = admin
         .query("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&name])
         .expect("roles")
         .len();
     if dropped > 0 {
-        admin
-            .batch_execute(&format!("DROP OWNED BY {name}; DROP ROLE {name}"))
-            .expect("drops the role of an earlier run");
+        let remove = format!("DROP OWNED BY {name}; DROP ROLE {name}");
+        batch_execute_retrying(admin, &remove).expect("drops the role of an earlier run");
     }
     let database: String = admin
         .query_one("SELECT current_database()", &[])
         .expect("database")
         .get(0);
-    admin
-        .batch_execute(&format!(
-            "CREATE ROLE {name} LOGIN CONNECTION LIMIT {limit}; \
-             GRANT CREATE ON DATABASE \"{database}\" TO {name}"
-        ))
-        .expect("creates the role");
+    let create = format!(
+        "CREATE ROLE {name} LOGIN CONNECTION LIMIT {limit}; \
+         GRANT CREATE ON DATABASE \"{database}\" TO {name}"
+    );
+    batch_execute_retrying(admin, &create).expect("creates the role");
     as_user(&url(), name)
 }
 
@@ -360,29 +359,10 @@ fn a_connection_the_server_refuses_does_not_take_a_pool_slot() {
     assert!(store.get("held").expect("reads").is_some());
 }
 
-// Catches a liveness lock that reports a connection the server refused as held: the
-// holder connection is the store's own and the role's limit refuses it, so the call must
-// fail with the server's words and not hand out a guard.
+/// Asserts that a reap with nothing due answers 0, with a row due answers 1 and then 0, and
+/// leaves a row that is not due.
 #[test]
-fn a_liveness_lock_whose_connection_is_refused_is_an_error() {
-    let mut admin = admin();
-    let url = limited_role(&mut admin, "kbf_fault_hold", 1);
-    let config = limited_config(&url, "kbf_fault_hold_schema");
-    wait_for_no_backend_of(&mut admin, "kbf_fault_hold");
-    // Only this first open is retried; the refusal the test is about comes after it.
-    let store = open_when_the_slot_is_free(&config, &AtomicU64::new(0));
-    let Err(StoreError::Failed(why)) = store.hold_liveness(1) else {
-        panic!("the holder connection is over the role's limit");
-    };
-    assert!(why.contains("too many connections"), "{why}");
-}
-
-// Catches a reap that counts or syncs when it deleted nothing, one that skips a due row,
-// and a guarded reap that runs past a precondition that failed: a reap with nothing due
-// answers 0, with a row due answers 1, and a guard that does not hold answers the
-// conflict and deletes nothing.
-#[test]
-fn a_reap_answers_what_it_deleted_and_a_guard_that_fails_deletes_nothing() {
+fn a_reap_answers_what_it_deleted() {
     let backend = PostgresBackend::new(&url(), Flaw::None);
     let store = PostgresStore::open(&config(&backend)).expect("opens");
     assert_eq!(store.reap_expired().expect("reaps"), 0, "nothing is due");
@@ -396,25 +376,6 @@ fn a_reap_answers_what_it_deleted_and_a_guard_that_fails_deletes_nothing() {
         .expect("commits");
     assert_eq!(store.reap_expired().expect("reaps"), 1, "due1 goes");
     assert_eq!(store.reap_expired().expect("reaps"), 0, "it went once");
-    assert_eq!(
-        store.reap_expired_if("none", Cond::Absent).expect("reaps"),
-        Ok(0),
-        "a guard that holds over nothing due"
-    );
-    store
-        .txn(Txn::new().put_ttl("due2", "d", Duration::ZERO, Cond::Any))
-        .expect("store")
-        .expect("commits");
-    let conflict = store
-        .reap_expired_if("keep", Cond::Version(Version(u64::MAX >> 1)))
-        .expect("reaps")
-        .expect_err("keep is not at that version");
-    assert_eq!((conflict.index, conflict.key.as_str()), (0, "keep"));
-    assert_eq!(
-        store.reap_expired_if("none", Cond::Absent).expect("reaps"),
-        Ok(1),
-        "the due row goes under a guard that holds"
-    );
     assert!(store.get("keep").expect("reads").is_some());
 }
 
@@ -615,12 +576,10 @@ fn an_open_refused_for_the_roles_limit_is_retried_until_the_slot_is_free() {
 #[test]
 fn an_open_refused_for_another_reason_is_not_retried() {
     let mut admin = admin();
-    let url = limited_role(&mut admin, "kbf_slot_other", 1);
-    let config = limited_config(&url, "kbf_slot_other_schema");
+    let role_url = limited_role(&mut admin, "kbf_slot_other", 1);
+    let config = limited_config(&role_url, "kbf_slot_other_schema");
     wait_for_no_backend_of(&mut admin, "kbf_slot_other");
-    admin
-        .batch_execute("ALTER ROLE kbf_slot_other NOLOGIN")
-        .expect("revokes the login");
+    ddl(&url(), "ALTER ROLE kbf_slot_other NOLOGIN").expect("revokes the login");
     let refusals = AtomicU64::new(0);
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         open_when_the_slot_is_free(&config, &refusals)

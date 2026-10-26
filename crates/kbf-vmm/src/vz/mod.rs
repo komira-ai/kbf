@@ -11,6 +11,9 @@
 //!   thread, copied by the VM at creation, released when the builder returns.
 //! - `Observer` (delegate): retained by `Running` (the framework holds delegates weakly).
 //! - `VZVirtioSocketListener`: retained by `Running` (the device holds it weakly).
+//! - `VZVirtioSocketConnection`: retained by the thread that serves it (inside a `Shared`,
+//!   which only drops it) until the connection ends; its descriptor is read and written
+//!   but never closed by us.
 //! - Pipe file descriptors of console ports: the helper owns both ends; the guest-facing
 //!   `NSFileHandle`s are created with `closeOnDealloc: false`, and the helper closes the
 //!   descriptors when it exits.

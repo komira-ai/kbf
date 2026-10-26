@@ -1,16 +1,16 @@
 # kbf build farm, all in one process: `kbf --mode=all-in-one`.
 # Static unit: shipped by the kbf package (installed under /usr/lib/systemd/system/),
 # disabled, with no rendering and no @PLACEHOLDER@ in it. It starts only once
-# /etc/kbf/kbf.toml exists (ConditionPathExists=), after kbf-installer's `boot-check` (which
-# brings the state database to the schema the kbf at --kbf declares, for the modes that keep
-# state in it, and fails the start if it cannot) and `kbf --mode=<mode> --check` (which prints
-# every missing prerequisite and exits 2). The checks are ExecStartPre=, not ExecCondition=:
-# ExecCondition= skips the start silently on exit 1 to 254, and a unit that cannot start must
-# fail where an operator sees it. kbf reads /etc/kbf/kbf.toml itself: no --config. The
-# binary is /usr/bin/kbf, the kbf package's own file; only the package manager replaces it,
-# and the kbf package depends on the kbf-installer package that holds boot-check. Per-host
-# values (MemoryMin=, ports, certificates, the cold store) are kbf.toml's, or a drop-in
-# kbf-installer writes from it.
+# /etc/kbf/kbf.toml exists (ConditionPathExists=), after `kbf boot-check` (which brings the
+# state database named by the `database` key of /etc/kbf/installer.toml to the schema this
+# kbf declares, for the modes that keep state in it, and fails the start if it cannot) and
+# `kbf --mode=<mode> --check` (which prints every missing prerequisite and exits 2). The
+# checks are ExecStartPre=, not ExecCondition=: ExecCondition= skips the start silently on
+# exit 1 to 254, and a unit that cannot start must fail where an operator sees it. kbf reads
+# /etc/kbf/kbf.toml itself: no --config. The binary is /usr/bin/kbf, the kbf package's own
+# file; only the package manager replaces it, and the schema step is that same file, so the
+# kbf package needs no other package for it. Per-host values (MemoryMin=, ports,
+# certificates, the cold store) are kbf.toml's, or a drop-in kbf-installer writes from it.
 #
 # TRUSTED, SINGLE BOX OR DEVELOPMENT ONLY. Builds run in the process that holds the
 # farm's state and its cold store, as one user. The container driver runs each action
@@ -45,7 +45,7 @@ CPUWeight=300
 # No MemorySwapMax=: leases may swap, and they live in this unit's cgroup.
 # The single box's cold store is a directory beside the daemon's data, so the unit
 # holds no cold-store key (package-test rule `credential`).
-ExecStartPre=+/usr/bin/kbf-installer boot-check --kbf=/usr/bin/kbf --mode=all-in-one
+ExecStartPre=+/usr/bin/kbf boot-check --mode=all-in-one
 # `--check` validates kbf.toml and what a restart cannot change (a file, a user, a flag)
 # and exits 2 for those. Anything that can become ready later (a listen address, a peer,
 # a DNS name, a mount) is not refused here: it exits 75 (not ready, restarted), so a check

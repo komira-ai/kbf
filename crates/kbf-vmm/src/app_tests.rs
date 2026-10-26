@@ -2,6 +2,7 @@
 
 use clap::Parser;
 use serde_json::Value;
+use std::path::PathBuf;
 
 use crate::app::run;
 use crate::cli::{Cli, Cmd, Gate, ImageCmd};
@@ -182,10 +183,12 @@ fn image_base_passes_its_arguments_and_a_refusal_exits_1() {
             "--disk-gib",
             "80",
             "--offline-setup",
+            "--guest-binary",
+            ipsw.to_str().expect("p"),
         ],
     );
     assert_eq!(code, OK, "{out}");
-    assert_eq!(sys.installs.borrow()[0].2, 80);
+    assert_eq!(sys.installs.borrow()[0].2.disk_gib, 80);
     assert_eq!(sys.offline_calls.borrow().len(), 1);
     let other = dir.join("c");
     let (code, out, _) = go(
@@ -250,6 +253,7 @@ fn the_command_line_parses_gates_in_any_case_and_defaults_to_twenty_runs() {
         ("g3", Gate::G3),
         ("P5", Gate::G5),
         ("g5", Gate::G5),
+        ("E1", Gate::E1),
         ("p0", Gate::P0),
         ("P2", Gate::P2),
         ("p6", Gate::P6),
@@ -292,9 +296,33 @@ fn image_setup_runs_the_offline_write_and_disk_size_is_bounded() {
         "needs-manual"
     );
     sys.uid.set(0);
+    // Without the guest binary nothing is written: the mount daemon would have nothing to run.
     let (code, out, _) = go(Some(&sys), &args);
     assert_eq!(code, OK, "{out}");
+    let v: Value = serde_json::from_str(&out).expect("json");
+    assert!(
+        v["reason"].as_str().expect("r").contains("--guest-binary"),
+        "{out}"
+    );
+    assert!(sys.offline_calls.borrow().is_empty());
+    let bin = work.join("guest-src");
+    std::fs::write(&bin, "bin").expect("bin");
+    let with = [
+        "image",
+        "setup",
+        "--base",
+        base.to_str().expect("p"),
+        "--guest-binary",
+        bin.to_str().expect("p"),
+    ];
+    let (code, out, _) = go(Some(&sys), &with);
+    assert_eq!(code, OK, "{out}");
     assert_eq!(sys.offline_calls.borrow()[0].0, base.join("disk.img"));
+    assert!(
+        sys.offline_calls.borrow()[0]
+            .1
+            .contains(&"usr/local/libexec/kbf-guest".to_owned())
+    );
     for bad in ["0", "31", "4097", "-1"] {
         assert!(
             Cli::try_parse_from([
@@ -333,4 +361,251 @@ fn image_setup_runs_the_offline_write_and_disk_size_is_bounded() {
             "{good}"
         );
     }
+}
+
+/// Catches the default dropping the graphics device (a headless guest crash-loops its
+/// window server), `--headless` not reaching the pair (E1's first arm is headless either
+/// way), `--keep` not reaching the probe context (the clones would be removed), and a
+/// harvest whose two paths are swapped on the way to the system.
+#[test]
+fn e1_flags_and_the_harvest_verb_reach_their_steps() {
+    let work = work_with_base("app-e1");
+    let sys = FakeSystem::new();
+    let bin = work.join("guest-src");
+    std::fs::write(&bin, "bin").expect("bin");
+    let (code, out, _) = go(
+        Some(&sys),
+        &[
+            "probe",
+            "e1",
+            "--work-dir",
+            work.to_str().expect("p"),
+            "--guest-binary",
+            bin.to_str().expect("p"),
+            "--keep",
+        ],
+    );
+    assert_eq!(code, OK, "{out}");
+    let v: Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(v["probe"], "e1");
+    assert_eq!(v["details"]["clones_kept"], true);
+    let graphics: Vec<bool> = sys
+        .starts
+        .borrow()
+        .iter()
+        .map(|(s, _)| s.graphics)
+        .collect();
+    assert_eq!(graphics, [false, true]);
+    // The share matrix is on by default.
+    assert!(sys.starts.borrow().iter().all(|(s, _)| s.tagged.len() > 2));
+    assert!(work.join("e1-x").is_dir());
+    let cli = Cli::parse_from(["kbf-vmm", "probe", "e1", "--work-dir", "w"]);
+    assert!(matches!(&cli.command, Cmd::Probe(a) if !a.common.headless && !a.keep));
+    let cli = Cli::parse_from(["kbf-vmm", "probe", "e1", "--work-dir", "w", "--headless"]);
+    assert!(matches!(&cli.command, Cmd::Probe(a) if a.common.headless));
+    assert!(
+        Cli::try_parse_from(["kbf-vmm", "probe", "e1", "--work-dir", "w", "--graphics"]).is_err()
+    );
+    // `--headless` reaches the context of every command that builds one.
+    let work2 = work_with_base("app-headless");
+    let sys2 = FakeSystem::new();
+    let (code, out, _) = go(
+        Some(&sys2),
+        &[
+            "probe",
+            "e1",
+            "--work-dir",
+            work2.to_str().expect("p"),
+            "--guest-binary",
+            bin.to_str().expect("p"),
+            "--headless",
+            "--no-matrix",
+        ],
+    );
+    assert_eq!(code, OK, "{out}");
+    assert!(sys2.starts.borrow().iter().all(|(s, _)| !s.graphics));
+    assert!(
+        sys2.starts
+            .borrow()
+            .iter()
+            .all(|(s, _)| s.tagged.len() == 2),
+        "no matrix"
+    );
+    let bundle = work.join("e1-x");
+    let harvested = work.join("h");
+    sys.uid.set(0);
+    let (code, out, _) = go(
+        Some(&sys),
+        &[
+            "image",
+            "harvest",
+            "--bundle",
+            bundle.to_str().expect("p"),
+            "--out",
+            harvested.to_str().expect("p"),
+        ],
+    );
+    assert_eq!(code, OK, "{out}");
+    assert_eq!(
+        sys.harvest_calls.borrow()[0],
+        (bundle.join("disk.img"), harvested)
+    );
+}
+
+/// Catches sizing and staging flags that do not parse, bounds that let a nonsense size
+/// through (the installer would then fail hours in), a repeatable `--sim-runtime` that
+/// keeps only one value, and a default that changed.
+#[test]
+fn the_sizing_and_staging_flags_parse_with_bounds() {
+    let base = |extra: &[&str]| {
+        let mut v = vec![
+            "kbf-vmm", "image", "base", "--ipsw", "a", "--sha256", "b", "--out", "c",
+        ];
+        v.extend_from_slice(extra);
+        Cli::try_parse_from(v)
+    };
+    let cli = base(&["--cpus", "6", "--memory-mib", "16384", "--disk-gib", "200"]).expect("parse");
+    assert!(matches!(
+        &cli.command,
+        Cmd::Image(ImageCmd::Base {
+            cpus: Some(6),
+            memory_mib: Some(16384),
+            disk_gib: 200,
+            ..
+        })
+    ));
+    let cli = base(&[]).expect("parse");
+    assert!(matches!(
+        &cli.command,
+        Cmd::Image(ImageCmd::Base {
+            cpus: None,
+            memory_mib: None,
+            disk_gib: 64,
+            ..
+        })
+    ));
+    for bad in [
+        ["--cpus", "0"],
+        ["--cpus", "1"],
+        ["--cpus", "65"],
+        ["--memory-mib", "0"],
+        ["--memory-mib", "4095"],
+        ["--memory-mib", "524289"],
+        ["--cpus", "x"],
+    ] {
+        assert!(base(&bad).is_err(), "{bad:?}");
+    }
+    let cli = Cli::try_parse_from([
+        "kbf-vmm",
+        "image",
+        "setup",
+        "--base",
+        "b",
+        "--xcode",
+        "/x/Xcode.app",
+        "--sim-runtime",
+        "a.dmg",
+        "--sim-runtime",
+        "b.dmg",
+        "--allow-external-links",
+    ])
+    .expect("parse");
+    match &cli.command {
+        Cmd::Image(ImageCmd::Setup {
+            xcode,
+            sim_runtimes,
+            allow_external_links,
+            guest_binary,
+            ..
+        }) => {
+            assert_eq!(xcode.as_deref(), Some(std::path::Path::new("/x/Xcode.app")));
+            assert_eq!(
+                sim_runtimes,
+                &[PathBuf::from("a.dmg"), PathBuf::from("b.dmg")]
+            );
+            assert!(*allow_external_links && guest_binary.is_none());
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Catches the sizing flags and the recorded sizes not reaching the installer: the
+/// installer must get exactly what was asked, and the base must record what it settled on.
+#[test]
+fn image_base_passes_the_sizes_to_the_installer_and_records_them() {
+    let work = crate::fake::tmp("app-sizing");
+    let ipsw = work.join("r.ipsw");
+    std::fs::write(&ipsw, "hello").expect("ipsw");
+    let sys = FakeSystem::new();
+    *sys.install.borrow_mut() =
+        Ok(serde_json::json!({"macos_version": "27.0.0", "cpus": 6, "memory_mib": 16384}));
+    let out = work.join("out");
+    let (code, text, _) = go(
+        Some(&sys),
+        &[
+            "image",
+            "base",
+            "--ipsw",
+            ipsw.to_str().expect("p"),
+            "--sha256",
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            "--out",
+            out.to_str().expect("p"),
+            "--cpus",
+            "6",
+            "--memory-mib",
+            "16384",
+            "--disk-gib",
+            "200",
+        ],
+    );
+    assert_eq!(code, OK, "{text}");
+    let sizing = sys.installs.borrow()[0].2;
+    assert_eq!(
+        (sizing.cpus, sizing.memory_mib, sizing.disk_gib),
+        (Some(6), Some(16384), 200)
+    );
+    let recorded = crate::bundle::recorded_sizing(&out).expect("recorded");
+    assert_eq!(
+        (recorded.cpus, recorded.memory_mib, recorded.disk_gib),
+        (6, 16384, 200)
+    );
+    // Without flags the installer is told to keep the restore image's needs.
+    let out2 = work.join("out2");
+    let (code, text, _) = go(
+        Some(&sys),
+        &[
+            "image",
+            "base",
+            "--ipsw",
+            ipsw.to_str().expect("p"),
+            "--sha256",
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            "--out",
+            out2.to_str().expect("p"),
+        ],
+    );
+    assert_eq!(code, OK, "{text}");
+    let sizing = sys.installs.borrow()[1].2;
+    assert_eq!(
+        (sizing.cpus, sizing.memory_mib, sizing.disk_gib),
+        (None, None, 64)
+    );
+}
+
+/// Catches a size record that cannot be read back, one that parses garbage, and a base
+/// without a record being treated as an error (bases built before the record exist).
+#[test]
+fn a_bases_recorded_sizes_round_trip_and_an_old_base_has_none() {
+    let dir = crate::fake::tmp("app-recorded");
+    assert_eq!(crate::bundle::recorded_sizing(&dir), None);
+    let r = crate::bundle::Recorded {
+        cpus: 4,
+        memory_mib: 8192,
+        disk_gib: 120,
+    };
+    crate::bundle::record_sizing(&dir, &r).expect("write");
+    assert_eq!(crate::bundle::recorded_sizing(&dir), Some(r));
+    std::fs::write(dir.join(crate::bundle::SIZING), "{\"cpus\": \"many\"}").expect("bad");
+    assert_eq!(crate::bundle::recorded_sizing(&dir), None);
 }

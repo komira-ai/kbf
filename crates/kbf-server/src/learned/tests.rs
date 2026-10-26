@@ -631,6 +631,24 @@ fn dirty_keys_are_written_behind_in_batches() {
     assert_eq!(learned.due().len(), BATCH);
 }
 
+/// Catches: `due_now` waiting for the write-behind interval like `due` (a test or a
+/// shutdown left with unwritten summaries), and `due_now` leaving the keys dirty or
+/// handing the same rows over twice.
+#[test]
+fn due_now_hands_over_the_changed_summaries_before_the_interval_has_passed() {
+    let mut learned = shadow();
+    learned.observe(&success(MIB), &bounds());
+    learned.clock(FarmTime::from_millis(FLUSH_EVERY_MS - 1));
+    assert_eq!(learned.due(), Vec::new(), "the interval has not passed");
+    let rows = learned.due_now();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, key());
+    assert_eq!(learned.due_now(), Vec::new(), "nothing changed since");
+    learned.clock(FarmTime::from_millis(2 * FLUSH_EVERY_MS));
+    assert_eq!(learned.due(), Vec::new(), "nor later");
+    assert_eq!(shadow().due_now(), Vec::new(), "nothing was ever changed");
+}
+
 /// Catches: a sweep at start (nothing is stale yet), none ever, one at every tick, and a
 /// sweep that leaves stale summaries in memory.
 #[test]

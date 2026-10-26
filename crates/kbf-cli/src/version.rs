@@ -4,10 +4,9 @@
 //! check and the artifacts workflow, `cargo xtask build-commit check --json`, read
 //! them), sorted by name:
 //!
-//! - `admin_protocol`: the version of the admin calls of `kbf --mode frontend` and of the
-//!   `role` answer ([`kbf_server::managed::ADMIN_PROTOCOL`]). It is the versioned contract
-//!   between the proxy and the child processes it starts: `GET role`, `POST quiesce`,
-//!   `resume`, `takeover` and `stand-down` (`docs/api.md`);
+//! - `admin_protocol`: the version of the admin calls and of the `role` answer
+//!   ([`ADMIN_PROTOCOL`], fixed at 1: a frontend no longer serves the calls, and the field
+//!   stays for the readers of the version line);
 //! - `commit`: the first 12 hex digits of the commit built, or `unknown` for a build
 //!   with no git checkout ([`kbf_server::BUILD_COMMIT`]);
 //! - `commit_full`: the 40 hex digits of the commit built ([`kbf_server::BUILD_COMMIT_FULL`]).
@@ -36,8 +35,10 @@
 //!   which holds only part of the history, or a source archive with no git), and nothing is
 //!   newer than 0. A build before this field prints none;
 //! - `state_schema`: the newest Postgres state schema this binary embeds a migration for
-//!   ([`kbf_state::postgres::schema::latest`]); `kbf-installer` migrates the database to it
-//!   before this release starts;
+//!   ([`kbf_state::postgres::schema::latest`]); `kbf boot-check` ([`crate::boot_check`]) reads
+//!   the same number and migrates the database to it before a unit starts this binary, and
+//!   `kbf-installer` migrates to it before it activates this release on a host that keeps
+//!   releases;
 //! - `version`: the package version.
 //!
 //! Only the two words `--version --json`, in either order and nothing else, ask for it;
@@ -49,6 +50,10 @@ use serde_json::{Map, Value};
 
 /// The Cargo profile this binary was built with: `release` or `debug`.
 pub const PROFILE: &str = env!("KBF_BUILD_PROFILE");
+
+/// The `admin_protocol` the version line prints. The admin port is gone from the frontend;
+/// the field stays at the version it had, for the readers of the version line.
+pub const ADMIN_PROTOCOL: u32 = 1;
 
 /// How far this build relays what its host's installer reports to the frontend: at level 1 it
 /// reads `available` and `release_source` from the installer's `status.json` and sends them in
@@ -82,10 +87,7 @@ pub fn identity() -> Value {
 fn identity_for(commit_full: &str) -> Value {
     // Inserted in the order they print: sorted, whatever map `serde_json` is built with.
     let mut fields = Map::new();
-    fields.insert(
-        "admin_protocol".to_owned(),
-        kbf_server::managed::ADMIN_PROTOCOL.into(),
-    );
+    fields.insert("admin_protocol".to_owned(), ADMIN_PROTOCOL.into());
     fields.insert("commit".to_owned(), kbf_server::BUILD_COMMIT.into());
     if !commit_full.is_empty() {
         fields.insert("commit_full".to_owned(), commit_full.into());

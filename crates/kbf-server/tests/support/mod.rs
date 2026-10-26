@@ -25,8 +25,9 @@ use kbf_proto::reapi::{
     Platform, batch_update_blobs_request, platform,
 };
 use kbf_proto::worker::{
-    Capability, DaemonMessage, Heartbeat, Hello, LeaseId, LeaseOffer, NodeStatus, ResultAck,
-    ServerMessage, Start, daemon_message, server_message, worker_client::WorkerClient,
+    Capability, DaemonMessage, Heartbeat, Hello, LeaseId, LeaseOffer, NodeStatus, PackReadCounts,
+    PackWriteCounts, ResultAck, ServerMessage, Start, daemon_message, server_message,
+    worker_client::WorkerClient,
 };
 use kbf_server::token::ApiToken;
 use kbf_server::{
@@ -186,7 +187,26 @@ pub struct Cell {
     pub recorder: kbf_front::Recorder,
     /// The server's frontend drain.
     pub drain: Arc<kbf_server::Drain>,
+    /// The server's farm, whose tick and write-behind a test can run by hand.
+    farm: std::sync::Weak<kbf_server::farm::Farm>,
     client: Client,
+}
+
+impl Cell {
+    fn farm(&self) -> Arc<kbf_server::farm::Farm> {
+        self.farm.upgrade().expect("the farm is serving")
+    }
+
+    /// One tick of the farm now: what the timer does every `tick`, so that the gauges and
+    /// counters `/metrics` serves are published when this returns.
+    pub async fn tick(&self) {
+        self.farm().tick().await;
+    }
+
+    /// The farm's write-behind of its size summaries to the state store, now.
+    pub fn write_behind(&self) {
+        self.farm().write_behind_now();
+    }
 }
 
 impl Drop for Cell {
@@ -354,7 +374,6 @@ impl Cell {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             token: None,
             local_cache: None,
-            releases: None,
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         Self::serve_with_map(
@@ -382,7 +401,6 @@ impl Cell {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             token: Some(api_token()),
             local_cache: None,
-            releases: None,
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         Self::serve_with_map(
@@ -453,7 +471,6 @@ impl Cell {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             token: Some(api_token()),
             local_cache: None,
-            releases: None,
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let cache = Self::cold_cache(&store, None).await;
@@ -623,6 +640,7 @@ impl Cell {
             unservable_wait: wait,
             default_platform,
             memory_ladder: ladder,
+            vm_host_floor: kbf_server::HostFloor::default(),
             learned_sizes: learned,
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),
@@ -665,7 +683,7 @@ impl Cell {
                 let _ = stopped_tx.send(());
             })
             .expect("a server thread");
-        let (reapi, worker, api, recorder, drain) = bound_rx.await.expect("the server binds");
+        let (reapi, worker, api, recorder, drain, farm) = bound_rx.await.expect("the server binds");
         Self {
             cache,
             store,
@@ -676,6 +694,7 @@ impl Cell {
             stopped: Some(stopped),
             recorder,
             drain,
+            farm,
             client: Client::connect(reapi, worker).await,
         }
     }
@@ -689,6 +708,7 @@ type Started = (
     Option<SocketAddr>,
     kbf_front::Recorder,
     Arc<kbf_server::Drain>,
+    std::sync::Weak<kbf_server::farm::Farm>,
 );
 
 /// Says where `bound` listens on `addresses`, then serves it until it stops.
@@ -703,6 +723,7 @@ async fn run(
         bound.api,
         recorder,
         Arc::clone(&bound.drain),
+        bound.farm.clone(),
     ));
     bound.serving.await.expect("serve");
 }
@@ -1121,19 +1142,49 @@ impl FakeDaemon {
     /// Sends a heartbeat listing `running` and returns whether it was acknowledged
     /// within [`QUIET`].
     pub async fn heartbeat(&mut self, running: &[LeaseId]) -> bool {
+        let seq = self.beat(running, None);
+        self.expect_within(QUIET, ack_of(seq)).await.is_some()
+    }
+
+    /// Sends a heartbeat listing `running` and carrying the pack-read counts `pack_reads`, and
+    /// waits for its acknowledgement for as long as [`PROMPT`], a bound on failure only.
+    pub async fn beat_acked(&mut self, running: &[LeaseId], pack_reads: Option<PackReadCounts>) {
+        let seq = self.beat(running, pack_reads);
+        self.expect("HeartbeatAck", ack_of(seq)).await;
+    }
+
+    /// [`Self::beat_acked`] with the pack-write counts `pack_writes` too.
+    pub async fn beat_counted_acked(
+        &mut self,
+        pack_reads: Option<PackReadCounts>,
+        pack_writes: Option<PackWriteCounts>,
+    ) {
+        let seq = self.beat_with(&[], pack_reads, pack_writes);
+        self.expect("HeartbeatAck", ack_of(seq)).await;
+    }
+
+    /// Sends a heartbeat with the next sequence number; the number.
+    fn beat(&mut self, running: &[LeaseId], pack_reads: Option<PackReadCounts>) -> u64 {
+        self.beat_with(running, pack_reads, None)
+    }
+
+    /// [`Self::beat`] carrying the pack-write counts `pack_writes` too.
+    fn beat_with(
+        &mut self,
+        running: &[LeaseId],
+        pack_reads: Option<PackReadCounts>,
+        pack_writes: Option<PackWriteCounts>,
+    ) -> u64 {
         self.seq += 1;
         let seq = self.seq;
         self.send(daemon_message::Message::Heartbeat(Heartbeat {
             seq,
             report_hash: Vec::new(),
             running: running.to_vec(),
+            pack_reads,
+            pack_writes,
         }));
-        self.expect_within(QUIET, |m| match m {
-            server_message::Message::HeartbeatAck(a) if a.seq == seq => Some(()),
-            _ => None,
-        })
-        .await
-        .is_some()
+        seq
     }
 
     /// Sends `result` and returns the server's acknowledgement.
@@ -1145,6 +1196,14 @@ impl FakeDaemon {
             _ => None,
         })
         .await
+    }
+}
+
+/// Picks the `HeartbeatAck` of the heartbeat numbered `seq`.
+fn ack_of(seq: u64) -> impl FnMut(&server_message::Message) -> Option<()> {
+    move |m| match m {
+        server_message::Message::HeartbeatAck(a) if a.seq == seq => Some(()),
+        _ => None,
     }
 }
 

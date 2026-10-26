@@ -2,12 +2,16 @@
 
 use kbf_map::DenyEntry;
 use kbf_state::{Cond, Store, Txn};
-use kbf_types::{NodeId, RoleSet};
+use kbf_types::{HostRole, NodeId, Role, RoleSet};
 use prost::Message as _;
 
 use crate::ATTEMPTS;
+use crate::enroll::advertise_of;
 use crate::error::{Corrupt, RegistryError};
-use crate::rows::{self, DENY_PREFIX, DenyRow, NODE_PREFIX, NodeRow, STATE_ACTIVE, STATE_REVOKED};
+use crate::rows::{
+    self, CertRow, DENY_PREFIX, DenyRow, NODE_PREFIX, NodeRow, OwnerRow, STATE_ACTIVE,
+    STATE_REVOKED,
+};
 
 /// Whether a node may renew and enroll.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,15 +35,15 @@ pub struct NodeInfo {
     pub advertise: String,
     /// Its zone label.
     pub zone: String,
-    /// The token it enrolled with.
+    /// The token it enrolled with; `adopted` for a node adopted without one.
     pub token_id: String,
-    /// That token's label when it enrolled.
+    /// That token's label when it enrolled; `adopted` for an adopted node.
     pub token_label: String,
     /// Store-clock seconds of its enrollment.
     pub created_at: u64,
     /// Store-clock seconds of its last renewal.
     pub last_renewed_at: Option<u64>,
-    /// When its newest certificate expires.
+    /// When its newest certificate expires; 0 for an adopted node, which holds none.
     pub not_after: u64,
     /// Store-clock seconds of its revocation.
     pub revoked_at: Option<u64>,
@@ -70,6 +74,97 @@ fn node_info(id: NodeId, row: &NodeRow) -> Result<NodeInfo, Corrupt> {
     })
 }
 
+/// The `token_id` and `token_label` of a node adopted into the registry without a token.
+pub const ADOPTED: &str = "adopted";
+
+/// Whether `row` was written by [`adopt_node`]: no token made it, and its `certs` are
+/// placeholders.
+pub(crate) fn is_adopted(row: &NodeRow) -> bool {
+    row.token_id == ADOPTED
+}
+
+/// What an adopted row holds in `certs` for each role: the role, a key hash of 32 zero bytes,
+/// no serial, no certificate and `not_after` 0. A frontend from before adoption derives a
+/// row's roles and expiry from `certs` alone and cannot read a row that has none, so the
+/// placeholder keeps the row readable there: no expiry logic treats a certificate expired at
+/// 0 as live, no deny row is written for its empty serial, and the zero key hash (which no
+/// key has) is the only `spki-sha256` entry a revoke writes.
+fn placeholder_cert(role: &str) -> CertRow {
+    CertRow {
+        role: role.to_owned(),
+        spki_sha256: vec![0; 32],
+        ..CertRow::default()
+    }
+}
+
+/// Records a node that was provisioned before enrollment, so the registry knows its id and
+/// the storage address it advertises (the join of storage health and of safe-to-stop goes
+/// through that address). One transaction writes the same `enroll/node/<id>` row an
+/// enrollment writes, active, with `token_id` and `token_label` [`ADOPTED`] and no
+/// certificate: no serial, no key and no renewal (a renewal of it is refused as
+/// [`kbf_types::RefusalReason::UnknownNode`]); a revoke denies the node id alone. The
+/// address is stored as [`crate::canonical_addr`] spells it. Returns the row as
+/// [`list_nodes`] shows it.
+///
+/// # Errors
+/// [`RegistryError::Invalid`] for the role `updater`, a storage node without a
+/// well-formed `host:port` or another node with one; [`RegistryError::AlreadyExists`] for an
+/// id the registry holds (revoked ones included) or an address another node holds; the store
+/// failing; [`RegistryError::Contended`].
+pub fn adopt_node(
+    store: &dyn Store,
+    id: &NodeId,
+    roles: RoleSet,
+    advertise: &str,
+) -> Result<NodeInfo, RegistryError> {
+    if roles.contains(Role::Updater) {
+        return Err(RegistryError::Invalid(
+            "a host's updater enrolls; it cannot be adopted",
+        ));
+    }
+    let advertise = advertise_of(roles, advertise).map_err(|_| {
+        RegistryError::Invalid(
+            "a storage node needs a host:port advertise address; any other must give none",
+        )
+    })?;
+    let node_key = rows::node_key(id);
+    for _ in 0..ATTEMPTS {
+        if store.get(&node_key)?.is_some() {
+            return Err(RegistryError::AlreadyExists(
+                "the node id is in the registry",
+            ));
+        }
+        let mut txn = Txn::new();
+        if let Some(host) = &advertise {
+            let key = rows::advertise_key(host);
+            if store.get(&key)?.is_some() {
+                return Err(RegistryError::AlreadyExists(
+                    "another node holds the advertise address",
+                ));
+            }
+            let owner = OwnerRow {
+                node_id: id.to_string(),
+                role: Role::Storage.name().to_owned(),
+            };
+            txn = txn.put(key, owner.encode_to_vec(), Cond::Absent);
+        }
+        let row = NodeRow {
+            advertise: advertise.clone().unwrap_or_default(),
+            token_id: ADOPTED.to_owned(),
+            token_label: ADOPTED.to_owned(),
+            state: STATE_ACTIVE,
+            created_at: rows::seconds(store.now()),
+            certs: roles.iter().map(|r| placeholder_cert(r.name())).collect(),
+            ..NodeRow::default()
+        };
+        let txn = txn.put(&node_key, row.encode_to_vec(), Cond::Absent);
+        if store.txn(txn)?.is_ok() {
+            return Ok(node_info(id.clone(), &row)?);
+        }
+    }
+    Err(RegistryError::Contended)
+}
+
 /// Every node, by id, revoked ones included.
 ///
 /// # Errors
@@ -97,6 +192,22 @@ pub fn node_state(store: &dyn Store, id: &NodeId) -> Result<Option<NodeState>, R
     Ok(read.map(|read| state_of(&read.row)).transpose()?)
 }
 
+/// What the host `id` runs, as its updater enrolled: `None` for an id that has no updater
+/// row. A renewal asks it, to issue the certificate the host already holds.
+///
+/// # Errors
+/// The store failing; a row that does not decode.
+pub fn updater_host_role(
+    store: &dyn Store,
+    id: &NodeId,
+) -> Result<Option<HostRole>, RegistryError> {
+    let read = rows::fetch::<NodeRow>(store, &rows::updater_key(id), "node")?;
+    Ok(read
+        .map(|read| crate::tokens::host_role_of(read.row.host_role.as_deref(), "node"))
+        .transpose()?
+        .flatten())
+}
+
 /// The `deny/` keys that end a node's certificates: its unexpired serials (current and
 /// earlier), the hash of each key, and with `with_node` the node id itself.
 pub(crate) fn deny_keys(id: &NodeId, row: &NodeRow, now: u64, with_node: bool) -> Vec<String> {
@@ -114,8 +225,11 @@ pub(crate) fn deny_keys(id: &NodeId, row: &NodeRow, now: u64, with_node: bool) -
             .filter(|(_, not_after)| *not_after > now)
             .map(|(serial, _)| rows::deny_serial_key(serial)),
     );
-    for cert in &row.certs {
-        keys.push(rows::deny_spki_key(&cert.spki_sha256));
+    // An adopted row's placeholders hold no key.
+    if !is_adopted(row) {
+        for cert in &row.certs {
+            keys.push(rows::deny_spki_key(&cert.spki_sha256));
+        }
     }
     keys
 }
@@ -141,35 +255,52 @@ pub(crate) fn entry_of(key: &str) -> Result<DenyEntry, Corrupt> {
         .ok_or(Corrupt("deny key"))
 }
 
-/// Revokes a node in one transaction: its row becomes `Revoked` (its id is burned), and
+/// Revokes a host in one transaction: its node row becomes `Revoked` (its id is burned) and
 /// deny rows are written for the node id, every unexpired serial it holds or held and the
-/// hash of each of its keys. Returns the entries written.
+/// hash of each of its keys. The host's updater row, when it has one, is revoked in the same
+/// transaction with its serials and keys denied, so its renewal is refused; an updater with
+/// no node row is revoked alone and burns no id. Returns the entries written.
 ///
 /// # Errors
-/// [`RegistryError::NotFound`] for an unknown node; [`RegistryError::Invalid`] for a node
-/// already revoked; the store failing; [`RegistryError::Contended`].
+/// [`RegistryError::NotFound`] for a host with neither row; [`RegistryError::Invalid`] for a
+/// host with nothing left to revoke; the store failing; [`RegistryError::Contended`].
 pub fn revoke_node(
     store: &dyn Store,
     id: &NodeId,
     by: &str,
 ) -> Result<Vec<DenyEntry>, RegistryError> {
-    let key = rows::node_key(id);
+    let node_key = rows::node_key(id);
+    let updater_key = rows::updater_key(id);
     for _ in 0..ATTEMPTS {
-        let read = rows::fetch::<NodeRow>(store, &key, "node")?.ok_or(RegistryError::NotFound)?;
-        if state_of(&read.row)? == NodeState::Revoked {
-            return Err(RegistryError::Invalid("the node is already revoked"));
+        let node = rows::fetch::<NodeRow>(store, &node_key, "node")?;
+        let updater = rows::fetch::<NodeRow>(store, &updater_key, "node")?;
+        if node.is_none() && updater.is_none() {
+            return Err(RegistryError::NotFound);
         }
         let now = rows::seconds(store.now());
-        let mut row = read.row;
-        let keys = deny_keys(id, &row, now, true);
-        row.state = STATE_REVOKED;
-        row.revoked_at = Some(now);
-        row.revoked_by = by.to_owned();
-        let mut txn = Txn::new().put(&key, row.encode_to_vec(), Cond::Version(read.version));
-        // The id stays burned, the address does not: another node may take it.
-        if !row.advertise.is_empty() {
-            txn = txn.delete(rows::advertise_key(&row.advertise), Cond::Any);
+        let mut txn = Txn::new();
+        let mut keys = Vec::new();
+        for (key, read, with_node) in [(&node_key, node, true), (&updater_key, updater, false)] {
+            let Some(read) = read else { continue };
+            if state_of(&read.row)? == NodeState::Revoked {
+                continue;
+            }
+            let mut row = read.row;
+            keys.extend(deny_keys(id, &row, now, with_node));
+            row.state = STATE_REVOKED;
+            row.revoked_at = Some(now);
+            row.revoked_by = by.to_owned();
+            txn = txn.put(key, row.encode_to_vec(), Cond::Version(read.version));
+            // The id stays burned, the address does not: another node may take it.
+            if !row.advertise.is_empty() {
+                txn = txn.delete(rows::advertise_key(&row.advertise), Cond::Any);
+            }
         }
+        if keys.is_empty() {
+            return Err(RegistryError::Invalid("the node is already revoked"));
+        }
+        keys.sort();
+        keys.dedup();
         let txn = with_deny_rows(txn, &keys, now, by, "revoked");
         if store.txn(txn)?.is_ok() {
             return keys.iter().map(|k| Ok(entry_of(k)?)).collect();
@@ -207,4 +338,52 @@ pub fn deny_rows(store: &dyn Store) -> Result<Vec<DenyRecord>, RegistryError> {
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use kbf_state::ManualClock;
+    use kbf_state::fake::{Fake, Flaw};
+    use kbf_types::Role;
+
+    use super::*;
+
+    // Pins the row's compatibility with a frontend from before adoption, which derives a row's
+    // roles and expiry from `certs` alone, decodes each key hash as 32 bytes, and on a revoke
+    // writes a deny row for every key hash and every serial that has not expired: the roles
+    // read from `certs` are the adopted ones, the expiry is 0, and a revoke by that logic
+    // writes keys `entry_of` can read and none for a serial.
+    #[test]
+    fn an_adopted_row_reads_as_before_adoption_for_roles_expiry_and_revoke() {
+        let store = Fake::with_flaw(Arc::new(ManualClock::default()), Flaw::None);
+        let id: NodeId = "s1".parse().expect("id");
+        let roles = RoleSet::new([Role::Storage, Role::Daemon]).expect("roles");
+        adopt_node(&store, &id, roles, "s1.example:7000").expect("adopt");
+        let row = rows::fetch::<NodeRow>(&store, &rows::node_key(&id), "node")
+            .expect("read")
+            .expect("row")
+            .row;
+        let names: Vec<String> = row.certs.iter().map(|c| c.role.clone()).collect();
+        assert_eq!(rows::role_set(&names, "node").expect("roles"), roles);
+        assert_eq!(row.certs.iter().map(|c| c.not_after).max(), Some(0));
+        assert!(row.certs.iter().all(|c| c.spki_sha256.len() == 32));
+        let mut old_keys = vec![rows::deny_node_key(&id)];
+        old_keys.extend(
+            row.certs
+                .iter()
+                .filter(|c| c.not_after > 1)
+                .map(|c| rows::deny_serial_key(&c.serial)),
+        );
+        old_keys.extend(
+            row.certs
+                .iter()
+                .map(|c| rows::deny_spki_key(&c.spki_sha256)),
+        );
+        for key in &old_keys {
+            entry_of(key).expect("a deny key the deny list reads");
+        }
+        assert!(old_keys.iter().all(|k| !k.starts_with("deny/serial/")));
+    }
 }

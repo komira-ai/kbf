@@ -42,11 +42,12 @@ use crate::members_rpc::MembershipService;
 use crate::object_store::delivery::Delivery;
 use crate::proxy_auth::{ProxyAuthLayer, ProxySecret, gate_requests};
 use crate::state_store::StateStore;
+use crate::stop::Stop;
 use crate::store_config::service::ColdStoreService;
 use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
 use crate::ui_mount::bind_server_with_options;
-use crate::worker::WorkerService;
+use crate::worker::{HostFloor, WorkerService};
 use crate::worker_roles::WorkerRolesLayer;
 use kbf_mapsync::MapSource;
 use kbf_proto::kbf::enroll::v1::cold_store_server::ColdStoreServer;
@@ -86,6 +87,10 @@ pub struct Listeners {
     /// books, the others are what it climbs through when it passes its own memory
     /// limit, before a whole host (`--memory-ladder-gib`).
     pub memory_ladder: MemoryLadder,
+    /// What a node that reports VM slots keeps for the host: its CPUs and memory,
+    /// subtracted from what placement may book on it (`--vm-host-floor-cpus`,
+    /// `--vm-host-floor-mem-gib`).
+    pub vm_host_floor: HostFloor,
     /// Whether the farm shows `kbf-estimator` what finished (`--learned-sizes`).
     pub learned_sizes: crate::LearnedSizes,
     /// How long a finished operation is kept after its callers are answered, in which
@@ -141,7 +146,7 @@ impl Default for StreamTiming {
 
 /// How long, after the shutdown timeout ends the open streams UNAVAILABLE, the server
 /// waits for the clients to take it before it stops.
-const CLOSE_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 /// The worker listener's mutual TLS: every daemon's certificate must name its node
 /// (see [`crate::identity`]).
@@ -177,9 +182,6 @@ pub struct Api {
     /// daemon whose input cache shares the disk with this server's store
     /// (`kbf all-in-one`).
     pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
-    /// The release store (`--releases-dir`), whose upload route is mounted here and whose
-    /// `ReleaseService` the worker listener serves. `None`: the update endpoints answer 503.
-    pub releases: Option<Arc<crate::release::ReleaseStore>>,
 }
 
 /// Why the server could not start or stopped.
@@ -204,9 +206,9 @@ pub enum ServeError {
     /// The storage map could not be read from the state store.
     #[error("storage map: {0}")]
     Map(#[from] MembershipError),
-    /// A frontend that was handing its work to a successor could not stand down.
-    #[error("handover: {0}")]
-    Handover(String),
+    /// The pack store does not refuse to replace an object, or cannot be written to.
+    #[error("--pack-store-endpoint: {0}")]
+    Packs(String),
 }
 
 /// A server that is listening: the addresses it bound, and the future that serves
@@ -231,6 +233,10 @@ pub struct Bound<F> {
     /// The invocation records the serving future builds, which the build pages read
     /// ([`crate::http_invocations`]); tests feed it events.
     pub recorder: Recorder,
+    /// The farm the serving future ticks, not owned here (it goes when serving ends);
+    /// tests drive its tick and write-behind by hand instead of waiting for the timer.
+    #[doc(hidden)]
+    pub farm: std::sync::Weak<Farm>,
 }
 
 /// Aborts its task when dropped.
@@ -290,6 +296,34 @@ where
     }
 }
 
+/// [`serve_api`] for an operator API that is sent GOAWAY and goes on answering. When
+/// `goaway` is fired every connection open is sent GOAWAY and finishes the requests it is
+/// answering, while the listener keeps accepting: a second server takes over the socket
+/// (`listeners` are two handles on one, [`crate::listen::Socket::http_pair`]) and serves
+/// until `stop`, so that a drain stays readable (`GET /v1/frontend/drain`, `/readyz`) until
+/// the process ends. A connection accepted in the moment of the change may be sent GOAWAY at
+/// once. The first server ends only at `goaway`, so what ends the operator API fires `goaway`
+/// as well as `stop`. Without a listener it only waits for `stop`.
+pub(crate) async fn serve_api_goaway(
+    listeners: Option<(tokio::net::TcpListener, tokio::net::TcpListener)>,
+    routes: axum::Router,
+    goaway: Stop,
+    stop: impl Future<Output = ()> + Send + 'static,
+    proxy: Option<Arc<ProxySecret>>,
+) -> std::io::Result<()> {
+    let Some((first, second)) = listeners else {
+        stop.await;
+        return Ok(());
+    };
+    let before = serve_api(Some(first), routes.clone(), goaway.fired(), proxy.clone());
+    let after = async {
+        goaway.fired().await;
+        serve_api(Some(second), routes, stop, proxy).await
+    };
+    let (before, after) = tokio::join!(before, after);
+    before.and(after)
+}
+
 /// Turns Nagle's algorithm off on a connection the operator API accepted, as [`bind`]
 /// does for the gRPC listeners. The call fails only on a socket that is already
 /// unusable, whose connection then fails on its own, so its error is not kept.
@@ -329,6 +363,9 @@ pub(crate) fn worker_peers(
 ) -> (WorkerListener, Peers, Option<TlsSource>) {
     let secret = behind.map(|behind| Arc::clone(&behind.secret));
     let proxy = ProxyAuthLayer::new(secret);
+    // HTTP/1.1 is accepted beside h2 for the node calls of a host's updater
+    // (`crate::node_self`); the role table refuses every other call that is not gRPC.
+    let server = server.accept_http1(true);
     match (tls, behind) {
         (Some(tls), _) => (
             server
@@ -336,6 +373,7 @@ pub(crate) fn worker_peers(
                 .layer(WorkerRolesLayer::new(Admission::Certified)),
             Peers::Certified {
                 deny_list: tls.deny_list,
+                denied_rows: None,
             },
             Some(tls.server),
         ),
@@ -345,6 +383,7 @@ pub(crate) fn worker_peers(
                 .layer(WorkerRolesLayer::new(Admission::Certified)),
             Peers::Certified {
                 deny_list: behind.deny_list.clone(),
+                denied_rows: None,
             },
             None,
         ),
@@ -410,10 +449,21 @@ pub(crate) fn members_of(
 ) -> Option<Arc<Members>> {
     let state = state?;
     let members = Members::new(Arc::clone(&state.store), state.members);
-    Some(Arc::new(match handoff {
+    let members = Arc::new(match handoff {
         Some(handoff) => members.with_handoff(handoff),
         None => members,
-    }))
+    });
+    // One refresh before any listener serves, so the worker listener has the deny rows from
+    // its first call and a restart does not bounce every daemon until the sweeper's first
+    // beat. A failure is loud and the start goes on: the sweeper tries again every beat.
+    if let Err(error) = members.refresh() {
+        tracing::error!(
+            %error,
+            "the first membership refresh failed: the worker listener refuses every call \
+             until a refresh reads the deny rows"
+        );
+    }
+    Some(members)
 }
 
 /// The storage map daemons are sent: `explicit` if a caller gave one, else the members'
@@ -474,7 +524,7 @@ pub(crate) fn cold_store(
 
 fn admitted(peers: &Peers) -> (Admission, Option<DenyList>) {
     match peers {
-        Peers::Certified { deny_list } => (Admission::Certified, deny_list.clone()),
+        Peers::Certified { deny_list, .. } => (Admission::Certified, deny_list.clone()),
         Peers::Unauthenticated => (Admission::Open, None),
     }
 }
@@ -750,10 +800,9 @@ where
     // Storage nodes register with a frontend that has a state store to keep them in.
     let members = members_of(state.as_ref(), None);
     let map = map_of(map, members.as_ref())?;
-    // The update rows live in the same store, whose handle is shared.
-    let update_rows = state
-        .as_ref()
-        .map(|s| crate::update::Rows::new(Arc::clone(&s.store)));
+    // The API reads the same store, whose handle is shared.
+    let api_store = state.as_ref().map(|s| Arc::clone(&s.store));
+    let node_store = api_store.clone();
     let farm = Arc::new(farm.with_state(state)?);
     // One start, one bind budget: the three listeners wait for a late interface together.
     let binder = Binder::new();
@@ -767,6 +816,8 @@ where
         listeners.worker_tls,
         proxy.as_ref(),
     );
+    // The rows a revocation writes, beside the file: a revoked daemon is refused here.
+    let peers = peers.with_denied_rows(members.clone());
     let tls_sources: Vec<TlsSource> = listeners
         .reapi_tls
         .iter()
@@ -776,8 +827,8 @@ where
     let reapi_incoming = Incoming::new(reapi_incoming, listeners.reapi_tls);
     let worker_incoming = Incoming::new(worker_incoming, worker_tls);
     let probe_timeout = listeners.store_probe_timeout;
-    let (api_listen, token, local, releases) = api.map_or((None, None, None, None), |api| {
-        (Some(api.listen), api.token, api.local_cache, api.releases)
+    let (api_listen, token, local) = api.map_or((None, None, None), |api| {
+        (Some(api.listen), api.token, api.local_cache)
     });
     // One line: a `?` alone on its own line is a never-taken error region, a missed
     // line in the coverage ratchet (it counts lines per generic copy, best copy wins).
@@ -795,25 +846,18 @@ where
         history: history.as_ref().map(crate::history::History::reads),
         budget,
     };
-    let offers =
-        crate::release::offers::offers_of(releases.clone(), update_rows.clone(), listeners.tick);
     let api_routes = crate::api::router(
         Arc::clone(&farm),
         token.clone(),
         Arc::clone(&drain),
+        // A server with no frontend role has nothing to retire: its retire routes answer 409.
+        Arc::default(),
         members.clone(),
-        update_rows.clone(),
+        api_store,
         // A server with no frontend role has no enrollment.
         None,
     )
     .merge(crate::verbs::routes(token.clone(), members.clone()))
-    .merge(crate::release::router(releases.clone(), token.clone()))
-    .merge(crate::release::desired::router(
-        releases.clone(),
-        update_rows,
-        token,
-        Arc::clone(&farm),
-    ))
     .merge(crate::health::routes(&checks, &farm, members.as_ref()))
     .merge(crate::metrics::router(
         Arc::clone(&cache),
@@ -821,6 +865,7 @@ where
         history.as_ref().map(crate::history::History::stats),
         members.clone(),
         tls_sources,
+        Some(Arc::clone(&farm)),
     ));
     // The storage health, if there are members: no branch in this generic function.
     let api_routes = members.iter().fold(api_routes, |routes, members| {
@@ -862,18 +907,22 @@ where
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let membership = membership(members.clone(), &peers, None);
+    // The four calls a host's updater makes about its own node.
+    let node_calls = crate::node_self::routes(
+        Arc::clone(&farm),
+        members.clone(),
+        node_store,
+        peers.clone(),
+    );
     let sessions = WorkerService::new(
         Arc::clone(&farm),
         peers,
         listeners.heartbeat_interval,
         listeners.hello_wait,
-    );
+    )
+    .with_host_floor(listeners.vm_host_floor);
     // The map, if there is one: no branch in this generic function.
     let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
-    // The offers, if there are a release store and a state store: no branch here either.
-    let sessions = offers
-        .into_iter()
-        .fold(sessions, WorkerService::with_offers);
     let worker_service = WorkerServer::new(sessions)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -919,6 +968,7 @@ where
     .add_service(health);
 
     let stopper = Arc::clone(&drain);
+    let farm_handle = Arc::downgrade(&farm);
     let serving = async move {
         // A task of its own: applying events never delays the tick or an accept loop,
         // and they never delay it. It stops when the serving future does.
@@ -933,8 +983,8 @@ where
                 let _ = goaway.await;
             });
         let worker_serve = worker_server
+            .add_routes(node_calls)
             .add_service(worker_service)
-            .add_service(crate::release::service(releases))
             .add_service(worker_blobs)
             .add_service(worker_cas)
             .add_service(worker_segments)
@@ -1002,6 +1052,7 @@ where
         drain,
         serving,
         recorder,
+        farm: farm_handle,
     })
 }
 

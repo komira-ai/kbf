@@ -1,6 +1,7 @@
 //! The roll API on a unix socket.
 //!
-//! The only peer is kbf-proxy, and the trust boundary is narrow on purpose:
+//! The only peer is the front door that forwards operators' requests (the user
+//! `--proxy-uid` names), and the trust boundary is narrow on purpose:
 //!
 //! - A connection whose `SO_PEERCRED` uid is not the configured proxy uid is closed without a
 //!   byte read or written ([`peer_allowed`]).
@@ -23,13 +24,14 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::json;
 
 use crate::Updater;
 use crate::api::{ApiError, ErrorCode, Roll, RollRequest};
 use crate::http::{ReadError, Request, read_request, write_response};
+use crate::ports::{Clock, SystemClock};
 
 /// Where one audit line goes. The binary writes it to stderr (the journal).
 pub type AuditSink = Arc<dyn Fn(&str) + Send + Sync>;
@@ -49,7 +51,7 @@ const AUDIT_FIELD_MAX: usize = 256;
 const RECENT_MAX: usize = 16;
 
 /// What the server needs to know besides the updater.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Settings {
     /// The one uid whose connections are served.
     pub proxy_uid: u32,
@@ -60,6 +62,8 @@ pub struct Settings {
     pub request_deadline: Duration,
     /// Connections served at once; the next one is closed unread.
     pub max_connections: usize,
+    /// The time the request deadline is read from: the system's, but for a test.
+    pub clock: Arc<dyn Clock>,
 }
 
 impl Settings {
@@ -69,6 +73,7 @@ impl Settings {
             io_timeout: Duration::from_secs(10),
             request_deadline: Duration::from_secs(30),
             max_connections: 16,
+            clock: Arc::new(SystemClock::new()),
         }
     }
 }
@@ -138,7 +143,9 @@ fn peer_uid(_stream: &UnixStream) -> Option<u32> {
 struct Deadline<'a> {
     stream: &'a UnixStream,
     per_read: Duration,
-    end: Instant,
+    clock: &'a dyn Clock,
+    /// The reading of `clock` at which the request is out of time.
+    end: Duration,
 }
 
 impl Deadline<'_> {
@@ -152,14 +159,14 @@ impl Deadline<'_> {
 
 impl std::io::Read for Deadline<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let left = self.end.saturating_duration_since(Instant::now());
+        let left = self.end.saturating_sub(self.clock.now());
         if left.is_zero() {
             return Err(Deadline::exceeded());
         }
         self.stream
             .set_read_timeout(Some(left.min(self.per_read)))?;
         let read = (&*self.stream).read(buf);
-        if read.is_err() && Instant::now() >= self.end {
+        if read.is_err() && self.clock.now() >= self.end {
             return Err(Deadline::exceeded());
         }
         read
@@ -278,7 +285,8 @@ impl Server {
         let mut reader = Deadline {
             stream: &stream,
             per_read: self.settings.io_timeout,
-            end: Instant::now() + self.settings.request_deadline,
+            clock: &*self.settings.clock,
+            end: self.settings.clock.now() + self.settings.request_deadline,
         };
         let (request, answer) = match read_request(&mut reader) {
             Ok(request) => {

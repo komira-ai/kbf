@@ -59,13 +59,20 @@ pub const OPTIONAL: &[&str] = &[
     "xcode_xip_dir",
     "pool_users",
     "pool_first_uid",
+    "vm_user_uid",
+    "updater_user",
+    "updater_id",
     "kbf_volume",
     "kbf_cache",
     "daemon_user",
 ];
 
 /// How many lease users the pool has when the profile does not say.
-pub const POOL_USERS: u32 = 4;
+pub const POOL_USERS: u32 = 100;
+/// The most lease users a pool has.
+pub const MAX_POOL_USERS: u64 = 100;
+/// The uid of `kbf-pool-0` and the gid of `kbfpool` when the profile does not say.
+pub const POOL_FIRST_UID: u32 = 61000;
 /// The volume the pool's homes, the scratch root and the cache are on when the profile
 /// does not say.
 pub const VOLUME: &str = "/Volumes/kbf";
@@ -166,6 +173,10 @@ pub struct Profile {
     pub pool_users: u32,
     /// `pool_first_uid`: the uid of `kbf-pool-0` and the gid of group `kbfpool`.
     pub pool_first_uid: u32,
+    /// `vm_user_uid`: the uid of the standing VM user `kbf-vm`, when the profile has one.
+    pub vm_user_uid: Option<u32>,
+    /// `updater_id`: the id of the updater's account, when the profile fixes it.
+    pub updater_id: Option<u32>,
     /// `kbf_volume`: the mount point of the volume.
     pub volume: String,
     /// `daemon_user`: the account kbf-daemon's job runs as.
@@ -418,9 +429,11 @@ impl Profile {
         want("filevault", |v| v == "on" || v == "off", "on or off")?;
         want(
             "autologin",
-            |v| v == "off",
-            "off (kbf-mac-session alone sets a lease user, during a lease)",
+            |v| v == "off" || v == "vm",
+            "off or vm (kbf-mac-session alone sets a lease user, during a lease)",
         )?;
+        let vm_user_uid = vm_user_uid(&values, role_id)?;
+        let updater_id = updater_id(&values, role_id, vm_user_uid)?;
         want(
             "simulator_runtimes",
             |v| v == "none",
@@ -456,6 +469,8 @@ impl Profile {
             lease_uids: range,
             pool_users,
             pool_first_uid,
+            vm_user_uid,
+            updater_id,
             volume,
             daemon_user,
             time_max_offset_ms,
@@ -477,9 +492,9 @@ fn value<'a>(values: &'a BTreeMap<&'static str, String>, key: &str) -> &'a str {
     values.get(key).map_or("", String::as_str)
 }
 
-/// `pool_users` (1 to 64, default [`POOL_USERS`]) and `pool_first_uid` (default the
-/// uid after `lease_uids`, and never below 600): the pool's uids are at least 600, at
-/// most 65535, and outside `lease_uids`.
+/// `pool_users` (1 to [`MAX_POOL_USERS`], default [`POOL_USERS`]) and `pool_first_uid`
+/// (default [`POOL_FIRST_UID`]): the pool's uids are at least 600, at most 65535, and
+/// outside `lease_uids`.
 fn pool(
     values: &BTreeMap<&'static str, String>,
     lease: &RangeInclusive<u64>,
@@ -490,11 +505,11 @@ fn pool(
         v => Some(v)
             .filter(|v| pattern::number(v))
             .and_then(|v| v.parse::<u64>().ok())
-            .filter(|n| (1..=64).contains(n))
-            .ok_or_else(|| invalid("pool_users", v, "a number from 1 to 64"))?,
+            .filter(|n| (1..=MAX_POOL_USERS).contains(n))
+            .ok_or_else(|| invalid("pool_users", v, "a number from 1 to 100"))?,
     };
     let first = match get("pool_first_uid") {
-        "" => lease.end().saturating_add(1).max(600),
+        "" => u64::from(POOL_FIRST_UID),
         v => Some(v)
             .filter(|v| pattern::number(v))
             .and_then(|v| v.parse::<u64>().ok())
@@ -518,6 +533,92 @@ fn pool(
     }
     // Both are at most 65535.
     Ok((n as u32, first as u32))
+}
+
+/// The first and last uid of the standing VM user: below 500, so the account is hidden
+/// from the login window like a role account, and above the ids macOS keeps.
+pub(crate) const VM_USER_UIDS: RangeInclusive<u32> = 450..=499;
+
+/// `vm_user_uid` (a number from 450 to 499, not `role_id`; unset: the profile has no VM
+/// user). A VM user logs in automatically, which FileVault forbids, so the profile may
+/// not say `filevault=on` with one; and `autologin=vm` needs one.
+fn vm_user_uid(
+    values: &BTreeMap<&'static str, String>,
+    role_id: u32,
+) -> Result<Option<u32>, ProfileError> {
+    let get = |key| value(values, key);
+    let uid = match get("vm_user_uid") {
+        "" => None,
+        v => Some(
+            Some(v)
+                .filter(|v| pattern::number(v))
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|u| VM_USER_UIDS.contains(u))
+                .ok_or_else(|| invalid("vm_user_uid", v, "a number from 450 to 499"))?,
+        ),
+    };
+    match uid {
+        Some(uid) if uid == role_id => Err(ProfileError::Invalid(format!(
+            "vm_user_uid: {uid} is role_id"
+        ))),
+        Some(_) if get("filevault") == "on" => Err(ProfileError::Invalid(
+            "vm_user_uid: filevault=on: the VM user logs in automatically, which FileVault forbids"
+                .into(),
+        )),
+        None if get("autologin") == "vm" => Err(ProfileError::Invalid(
+            "autologin: vm needs vm_user_uid".into(),
+        )),
+        _ => Ok(uid),
+    }
+}
+
+/// The ids of the updater's account: hidden, like a role account's.
+pub(crate) const UPDATER_IDS: RangeInclusive<u32> = 200..=499;
+
+/// `updater_user` (unset, or `_kbf-updater`, the name the agent's property list runs as)
+/// and `updater_id` (a number from 200 to 499, not `role_id` or `vm_user_uid`; unset,
+/// `apply` picks one; it needs `updater_user`).
+fn updater_id(
+    values: &BTreeMap<&'static str, String>,
+    role_id: u32,
+    vm_user_uid: Option<u32>,
+) -> Result<Option<u32>, ProfileError> {
+    let get = |key| value(values, key);
+    let name = crate::updater_user::NAME;
+    match (get("updater_user"), get("updater_id")) {
+        ("", "") => return Ok(None),
+        ("", _) => {
+            return Err(ProfileError::Invalid(
+                "updater_id: needs updater_user".into(),
+            ));
+        }
+        (user, _) if user != name => {
+            return Err(invalid(
+                "updater_user",
+                user,
+                &format!("{name}, the account the updater agent's property list runs as"),
+            ));
+        }
+        (_, "") => return Ok(None),
+        _ => {}
+    }
+    let v = get("updater_id");
+    let id = Some(v)
+        .filter(|v| pattern::number(v))
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|u| UPDATER_IDS.contains(u))
+        .ok_or_else(|| invalid("updater_id", v, "a number from 200 to 499"))?;
+    if id == role_id {
+        Err(ProfileError::Invalid(format!(
+            "updater_id: {id} is role_id"
+        )))
+    } else if Some(id) == vm_user_uid {
+        Err(ProfileError::Invalid(format!(
+            "updater_id: {id} is vm_user_uid"
+        )))
+    } else {
+        Ok(Some(id))
+    }
 }
 
 /// `kbf_volume` (`/Volumes/<name>`, default [`VOLUME`]), `kbf_cache` (an absolute

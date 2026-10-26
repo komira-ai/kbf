@@ -1,9 +1,9 @@
 //! Shared value types for kbf: the content digest (function, hash, size), an image named
 //! by manifest digest, platform properties, QoS levels, lease identifiers and kinds, node
 //! phases, farm time, the vocabulary of scheduled work (operations, workers, request
-//! vectors, control-log records), and the `StateMachine` trait and `Effect` enum that the
-//! pure cores implement and emit, the fleet rollout record with its per-node steps, and the
-//! enrollment vocabulary (tokens, node ids, roles, the reasons a frontend refuses a node).
+//! vectors, control-log records), the `StateMachine` trait and `Effect` enum that the
+//! pure cores implement and emit, and the enrollment vocabulary (tokens, node ids, roles,
+//! the reasons a frontend refuses a node).
 //!
 //! This is a pure crate: no async runtime, network, clock, randomness or hashed
 //! collections. The layering test in `kbf-integration-test` and the lists in `clippy.toml` enforce it.
@@ -15,6 +15,7 @@
 mod digest;
 mod enroll;
 pub mod enroll_api;
+mod host_role;
 mod image;
 mod lease;
 pub mod object_store_api;
@@ -23,7 +24,6 @@ mod phase;
 mod platform;
 mod qos;
 mod release;
-mod rollout;
 mod state;
 mod time;
 mod version;
@@ -34,16 +34,13 @@ pub use enroll::{
     CaPin, NodeId, NodeIdError, PartFault, RefusalCode, RefusalReason, Role, RoleError, RoleSet,
     RoleSetError, Token, TokenError, TokenId, TokenSecret,
 };
+pub use host_role::{HostRole, HostRoleError};
 pub use image::{ImageError, ImageRef};
 pub use lease::{LeaseId, LeaseKind};
 pub use phase::NodePhase;
 pub use platform::{Platform, PlatformError};
 pub use qos::{CustomQos, Qos, QosError};
 pub use release::ReleasePlatform;
-pub use rollout::{
-    Actor, IllegalStep, NodeProgress, NodeStep, Rollout, RolloutId, RolloutState, Selector,
-    Strategy, StrategyError,
-};
 pub use state::{Effect, StateMachine};
 pub use time::FarmTime;
 pub use version::{Supported, TooNew, VERSION_CAP, Version, VersionFault, understood};

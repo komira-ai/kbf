@@ -4,16 +4,14 @@
 //! frontend presents a certificate that names its role and verifies the node's against
 //! its CA and the host in the `--storage` URL (docs/design/architecture-v2.md, section 9),
 //! over a real node (`kbf_server::storage_node`), the proxy's raw HTTP/2 path (ByteStream)
-//! and its tonic path (FindMissing, the action cache), and the certificate rules of the
-//! membership service on its worker listener (`frontend/membership_tls.rs`).
+//! and its tonic path (FindMissing, the action cache), the certificate rules of the
+//! membership service on its worker listener (`frontend/membership_tls.rs`), and the drain
+//! sequence of a frontend over a state store (`frontend/drain.rs`).
 
 mod support;
 
-#[path = "frontend/handover.rs"]
-mod handover;
-
-#[path = "frontend/managed.rs"]
-mod managed;
+#[path = "frontend/drain.rs"]
+mod drain;
 
 #[path = "frontend/membership_tls.rs"]
 mod membership_tls;
@@ -21,8 +19,17 @@ mod membership_tls;
 #[path = "frontend/object_stores.rs"]
 mod object_stores;
 
+#[path = "frontend/pack_locate.rs"]
+mod pack_locate;
+
 #[path = "frontend/proxy_auth.rs"]
 mod proxy_auth;
+
+#[path = "frontend/ready.rs"]
+mod ready;
+
+#[path = "frontend/retire.rs"]
+mod retire;
 
 use std::future::pending;
 use std::net::SocketAddr;
@@ -833,7 +840,7 @@ async fn a_frontend_over_external_storage_keeps_the_size_key_in_its_state_store(
         let url = format!("--storage=http://{}", node.addr);
         let store = format!("--state-store=sqlite://{}", state.display());
         let sizes = format!("--learned-sizes={mode}");
-        let f = flags(&[&url, &store, &sizes]).expect("flags");
+        let f = flags(&[&url, &store, &sizes, "--drain-lb-wait=0"]).expect("flags");
         let front = Front::start(&f).await;
         let client = front.client().await;
         let job = Job::new("keyed", &[]);
@@ -1226,102 +1233,30 @@ async fn the_api_listener_serves_metrics_in_the_prometheus_text_format() {
     assert!(body.contains("# TYPE "), "{body}");
 }
 
-/// Catches `--releases-dir` accepted without an operator API: the store is filled by `PUT
-/// /v1/releases/...` on that API, so a store with nowhere to be written would be a silent
-/// no-op. Both `kbf frontend` and `kbf-server` refuse the flag without `--api-listen`.
+/// The retired `--releases-dir` is accepted by `kbf frontend` and `kbf-server` with or
+/// without an operator API, and is hidden from `--help`: an old unit that carries it must
+/// still parse after the store is gone.
 ///
-/// Catches: `requires = "api_listen"` dropped from the flag.
+/// Catches: the flag deleted (an old unit stops starting), `requires = "api_listen"` left on
+/// it, or the flag shown in `--help` as a live setting.
 #[test]
-fn releases_dir_needs_the_operator_api() {
-    let refused = frontend::command().try_get_matches_from([
-        "frontend",
-        "--storage=http://127.0.0.1:1",
-        "--releases-dir=/x",
-    ]);
-    let e = refused.expect_err("no --api-listen");
-    assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-    let server =
-        kbf_server::Args::command().try_get_matches_from(["kbf-server", "--releases-dir=/x"]);
-    let e = server.expect_err("no --api-listen");
-    assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-    // With the API it parses.
+fn the_retired_releases_dir_parses_without_an_operator_api_and_is_hidden() {
     frontend::command()
         .try_get_matches_from([
             "frontend",
             "--storage=http://127.0.0.1:1",
-            "--api-listen=127.0.0.1:0",
             "--releases-dir=/x",
         ])
-        .expect("parses");
-}
-
-/// Catches a frontend that takes `--releases-dir` and does not mount the release store: a
-/// tarball put on its operator API with the token comes back through `ReleaseService.Fetch`
-/// on its worker listener, and a put without the token is refused.
-///
-/// Catches: the router not merged in `frontend.rs`; the service not added to its
-/// worker server.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_frontend_with_a_releases_dir_serves_the_release_store() {
-    use kbf_proto::update::FetchRequest;
-    use kbf_proto::update::release_service_client::ReleaseServiceClient;
-    use sha2::{Digest, Sha256};
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let dir = scratch_dir("frontend-releases");
-    let token = "kbf-test-token-0123456789abcdef0123456789";
-    let token_file = dir.join("token");
-    std::fs::write(&token_file, format!("{token}\n")).expect("token");
-    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-    let node = Node::start().await;
-    let front = Front::start(
-        &flags(&[
-            &format!("--storage=http://{}", node.addr),
-            &format!("--api-token-file={}", token_file.display()),
-            &format!("--releases-dir={}", dir.join("releases").display()),
-        ])
-        .expect("parses"),
-    )
-    .await;
-    let commit = "0123456789abcdef0123456789abcdef01234567";
-    let tarball = b"a tarball".to_vec();
-    let put = |auth: bool| {
-        let (api, tarball) = (front.api, tarball.clone());
-        async move {
-            let mut stream = TcpStream::connect(api).await.expect("connect");
-            let auth = if auth {
-                format!("Authorization: Bearer {token}\r\n")
-            } else {
-                String::new()
-            };
-            let head = format!(
-                "PUT /v1/releases/{commit}/linux-x86_64/kbf HTTP/1.1\r\nHost: kbf\r\n{auth}Connection: close\r\nContent-Length: {}\r\n\r\n",
-                tarball.len()
-            );
-            stream.write_all(head.as_bytes()).await.expect("write");
-            stream.write_all(&tarball).await.expect("write");
-            let mut response = String::new();
-            stream.read_to_string(&mut response).await.expect("read");
-            response[9..12].parse::<u16>().expect("a status")
-        }
-    };
-    assert_eq!(put(false).await, 401);
-    assert_eq!(put(true).await, 201);
-    let mut client = ReleaseServiceClient::connect(format!("http://{}", front.worker))
-        .await
-        .expect("connect");
-    let mut stream = client
-        .fetch(FetchRequest {
-            sha256: hex::encode(Sha256::digest(&tarball)),
-        })
-        .await
-        .expect("fetch")
-        .into_inner();
-    let mut got = Vec::new();
-    while let Some(chunk) = stream.message().await.expect("chunk") {
-        got.extend_from_slice(&chunk.data);
-    }
-    assert_eq!(got, tarball);
+        .expect("the frontend still parses it");
+    kbf_server::Args::command()
+        .try_get_matches_from(["kbf-server", "--releases-dir=/x"])
+        .expect("the server still parses it");
+    let command = kbf_server::Args::command();
+    let arg = command
+        .get_arguments()
+        .find(|a| a.get_long() == Some("releases-dir"))
+        .expect("the flag exists");
+    assert!(arg.is_hide_set());
 }
 
 /// Catches a frontend whose operator API does not serve `GET /v1/denied`: the route is
@@ -1575,7 +1510,7 @@ async fn a_listen_address_that_is_taken_is_a_refused_start_naming_it() {
 /// Catches a `kbf frontend` that lacks what `kbf-server` has for its drain: the operator
 /// endpoint (`GET`/`POST /v1/frontend/drain`, one shared `Drain`), its counts of open
 /// streams and queued operations, and `Drain::close` (the second stop signal's action).
-/// An Execute waits for a worker: the status reads one stream and one queued operation;
+/// An Execute runs on a node: the status reads one stream and no queued operation;
 /// a `POST` with the token drains (`/readyz` 503); a close ends the stream UNAVAILABLE
 /// and the serving future. Catches: the frontend's API router given a
 /// drain that is not the one its serving future drains.
@@ -1591,11 +1526,15 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     let token_flag = format!("--api-token-file={}", path.display());
     let (_stop, stopped) = oneshot::channel::<()>();
-    let handle = start_frontend(&flags(&[&url, &token_flag]).expect("flags"), || {
-        Ok(async move {
-            let _ = stopped.await;
-        })
-    })
+    let heartbeat = "--heartbeat-interval-ms=100";
+    let handle = start_frontend(
+        &flags(&[&url, &token_flag, heartbeat]).expect("flags"),
+        || {
+            Ok(async move {
+                let _ = stopped.await;
+            })
+        },
+    )
     .expect("starts");
     let (reapi, worker, api) = (handle.reapi, handle.worker, handle.api.expect("an API"));
     let drain = handle.drain();
@@ -1605,6 +1544,15 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
     client.upload(&job.blobs()).await;
     let mut ops = client.execute(&job.action).await;
     ops.message().await.expect("healthy").expect("QUEUED");
+    // A node takes the lease, so the stream has a running action: the drain keeps it.
+    let mut daemon = client.daemon("node-a", 4, 8).await;
+    daemon.start().await;
+    loop {
+        let op = ops.message().await.expect("healthy").expect("EXECUTING");
+        if support::stage(&op) == kbf_proto::reapi::execution_stage::Value::Executing as i32 {
+            break;
+        }
+    }
 
     let call = |token: Option<&'static str>, post: bool| async move {
         tokio::task::spawn_blocking(move || {
@@ -1621,7 +1569,12 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
         .expect("the call runs")
     };
     let status = call(None, false).await;
-    let want = serde_json::json!({"draining": false, "open_executions": 1, "queued_operations": 1});
+    let want = serde_json::json!({
+        "draining": false,
+        "phase": "serving",
+        "open_executions": 1,
+        "queued_operations": 0
+    });
     assert_eq!(
         serde_json::from_str::<Value>(&status.body).expect("JSON"),
         want
@@ -1638,7 +1591,8 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
         .expect("the stream ends after a close")
         .expect_err("with an error");
     assert_eq!(ended.code(), tonic::Code::Unavailable, "{ended:?}");
-    drop(ops);
+    assert!(ended.message().contains("shutting down"), "{ended:?}");
+    drop((ops, daemon));
     drop(client);
     tokio::time::timeout(Duration::from_secs(30), served)
         .await

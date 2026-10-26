@@ -218,7 +218,7 @@ impl Release {
             .collect()
     }
 
-    /// Adds the `kbf-installer` deb of `platform` as `pkg-asset` leaves it: the file in
+    /// Adds a deb of `platform` as `pkg-kbf-asset` leaves it: the file in
     /// `dist` (distinct bytes: an attestation covers a digest), listed in `SHA256SUMS`
     /// (sorted by name, as `sums assemble` leaves it).
     fn add_deb(&self, platform: &str) -> String {

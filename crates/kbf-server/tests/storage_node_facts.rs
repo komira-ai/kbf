@@ -61,6 +61,7 @@ fn frontend() -> (SocketAddr, Members) {
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         memory_ladder: kbf_server::MemoryLadder::default(),
+        vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -190,7 +191,7 @@ fn serve(seen: &Arc<Recorder>) -> SocketAddr {
 /// version once instead of at each call, or says 0 for what it cannot say. A joiner given
 /// `RUNS` and a handle at version 1 registers saying `RUNS`, 1 and its commit; after the
 /// handle moves to 4, its next beat says 4; a joiner given no log says neither number (absent,
-/// not 0) and still says its commit. Mutants: `log_version` read when the joiner is built;
+/// not 0) and still says its commit. Catches: `log_version` read when the joiner is built;
 /// `runs_log` or `log_version` a constant; `log_facts` answering `Some` without a log.
 #[tokio::test]
 async fn a_joiner_says_what_its_node_runs_and_where_its_log_is_at_every_call() {

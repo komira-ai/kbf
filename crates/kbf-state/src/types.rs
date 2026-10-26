@@ -210,9 +210,9 @@ pub enum StoreError {
     /// The backend could not complete the call; the text says why.
     #[error("state store failure: {0}")]
     Failed(String),
-    /// This handle is no longer the store's writer: a newer one took the generation
-    /// ([`crate::Fenced`]), or the backend gave up the writer role
-    /// ([`crate::Store::demote`]). Nothing was written; no retry on this handle can succeed.
+    /// This handle is no longer the store's writer. Nothing was written; no retry on this
+    /// handle can succeed. No store in this crate returns it any more; the readers of
+    /// [`StoreError`] still map it.
     #[error("state store fenced: this handle is no longer the writer")]
     Fenced,
 }

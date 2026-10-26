@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use kbf_types::{CaPin, NodeId, Role};
+use kbf_types::{CaPin, HostRole, NodeId, Role};
 use rcgen::string::Ia5String;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -45,6 +45,19 @@ pub struct NodeCert<'a> {
     /// here (a lower-case DNS name, or an address); whether the host is allowed is the
     /// caller's policy.
     pub advertise: Option<&'a str>,
+}
+
+/// The certificate asked for a host's updater: the node's one DNS name, the role `updater`
+/// and the host's role in a second URI, `urn:kbf:host-role:<name>`
+/// (`docs/design/updates.md`, section 5).
+#[derive(Clone, Copy, Debug)]
+pub struct UpdaterCert<'a> {
+    /// The host: the certificate's one DNS name (and its subject, which nothing reads).
+    pub node_id: &'a NodeId,
+    /// What the host runs, which the coordinator limits and orders it by.
+    pub host_role: HostRole,
+    /// The updater's key, from a request that proved possession.
+    pub key: &'a PublicKey,
 }
 
 /// A certificate the authority built.
@@ -330,7 +343,19 @@ impl Authority {
     /// # Errors
     /// [`CaError`].
     pub fn load_dir_owned_by(dir: &Path, policy: Policy, uid: u32) -> Result<Self, CaError> {
-        let signer = FileSigner::load_owned_by(dir, uid)?;
+        Self::load_with(dir, policy, FileSigner::load_owned_by(dir, uid)?)
+    }
+
+    /// Loads the CA directory of the running account when the directory is shared with a
+    /// group (`FileSigner::load_in_shared_dir`): the key is as private as ever.
+    ///
+    /// # Errors
+    /// [`CaError`].
+    pub fn load_dir_shared(dir: &Path, policy: Policy) -> Result<Self, CaError> {
+        Self::load_with(dir, policy, FileSigner::load_in_shared_dir(dir)?)
+    }
+
+    fn load_with(dir: &Path, policy: Policy, signer: FileSigner) -> Result<Self, CaError> {
         let pem = keyfile::read_public(&dir.join(Self::CERT_FILE))?;
         let bundle = Bundle::from_pem(&pem)?;
         Self::import(Arc::new(signer), policy, &bundle.certs()[0])
@@ -414,13 +439,17 @@ impl Authority {
     ///
     /// # Errors
     /// [`CaError`]: a clock or time the policy refuses, a name that is not a name, an
-    /// advertise host for a daemon, or a signer that fails.
+    /// advertise host for a daemon, the role `updater` (see [`Authority::issue_updater`]), or a
+    /// signer that fails.
     pub fn issue_node(
         &self,
         cert: &NodeCert<'_>,
         now: i64,
         entropy: &mut dyn Entropy,
     ) -> Result<Issued, CaError> {
+        if cert.role == Role::Updater {
+            return Err(CaError::NotANodeRole);
+        }
         let id = cert.node_id.as_str();
         let mut names = vec![SanType::DnsName(ia5(id)?)];
         if let Some(host) = cert.advertise {
@@ -436,7 +465,7 @@ impl Authority {
                 ExtendedKeyUsagePurpose::ServerAuth,
                 ExtendedKeyUsagePurpose::ClientAuth,
             ],
-            Role::Daemon => vec![ExtendedKeyUsagePurpose::ClientAuth],
+            Role::Daemon | Role::Updater => vec![ExtendedKeyUsagePurpose::ClientAuth],
         };
         self.sign_leaf(
             Leaf {
@@ -464,6 +493,71 @@ impl Authority {
         now: i64,
         entropy: &mut dyn Entropy,
     ) -> Result<Issued, CaError> {
+        let ekus = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        self.issue_named("frontend", names, ekus, key, now, entropy)
+    }
+
+    /// The update coordinator's own certificate (role `coordinator`, serverAuth only: it
+    /// serves its hosts' updaters and calls nobody) for `names`, DNS names or addresses. Not
+    /// reachable from a token.
+    ///
+    /// # Errors
+    /// [`CaError`].
+    pub fn issue_coordinator(
+        &self,
+        names: &[&str],
+        key: &PublicKey,
+        now: i64,
+        entropy: &mut dyn Entropy,
+    ) -> Result<Issued, CaError> {
+        let ekus = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        self.issue_named("coordinator", names, ekus, key, now, entropy)
+    }
+
+    /// A host's updater certificate (role `updater`, clientAuth only: it dials the
+    /// coordinator and nobody dials it).
+    ///
+    /// # Errors
+    /// [`CaError`]: a clock or time the policy refuses, a node id that is not a name, or a
+    /// signer that fails.
+    pub fn issue_updater(
+        &self,
+        cert: &UpdaterCert<'_>,
+        now: i64,
+        entropy: &mut dyn Entropy,
+    ) -> Result<Issued, CaError> {
+        let id = cert.node_id.as_str();
+        let host_role = SanType::URI(ia5(&format!(
+            "{}{}",
+            HostRole::URI_PREFIX,
+            cert.host_role.name()
+        ))?);
+        self.sign_leaf(
+            Leaf {
+                key: cert.key,
+                common_name: id,
+                role: "updater",
+                names: vec![SanType::DnsName(ia5(id)?), host_role],
+                ekus: vec![ExtendedKeyUsagePurpose::ClientAuth],
+            },
+            now,
+            entropy,
+        )
+    }
+
+    /// A certificate with `role` for the host names in `names`.
+    fn issue_named(
+        &self,
+        role: &str,
+        names: &[&str],
+        ekus: Vec<ExtendedKeyUsagePurpose>,
+        key: &PublicKey,
+        now: i64,
+        entropy: &mut dyn Entropy,
+    ) -> Result<Issued, CaError> {
         let Some(first) = names.first() else {
             return Err(CaError::NoNames);
         };
@@ -475,12 +569,9 @@ impl Authority {
             Leaf {
                 key,
                 common_name: first,
-                role: "frontend",
+                role,
                 names: names_san,
-                ekus: vec![
-                    ExtendedKeyUsagePurpose::ServerAuth,
-                    ExtendedKeyUsagePurpose::ClientAuth,
-                ],
+                ekus,
             },
             now,
             entropy,

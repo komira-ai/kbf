@@ -4,11 +4,11 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod support;
 use kbf_testkit::dir::TestDir;
-use support::{BUSY_WAIT, output_unbusy};
+use support::{BUSY_POLL, BUSY_WAIT, output_unbusy, output_unbusy_on};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
@@ -94,20 +94,24 @@ fn a_stub_held_open_for_writing_is_busy_to_a_plain_run() {
 
 #[test]
 fn a_busy_stub_runs_once_the_descriptor_closes() {
-    // Catches: a run that gives up on the first ETXTBSY (the coverage job's failure).
+    // Catches: a run that gives up on the first ETXTBSY (the coverage job's failure), and
+    // a run that returns before the stub was free. The descriptor is closed by the
+    // first pause between two tries, so the run must pause, try again and then succeed.
     let (stub, held, _own) = held_open("busy-closes");
-    let closer = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(150));
-        drop(held);
-    });
-    let started = Instant::now();
-    let out = output_unbusy(Command::new(&stub).arg("late"), BUSY_WAIT).expect("run once free");
-    assert!(
-        started.elapsed() >= Duration::from_millis(100),
-        "ran while it was still held"
-    );
+    let mut held = Some(held);
+    let mut pauses = 0;
+    let out = output_unbusy_on(
+        Command::new(&stub).arg("late"),
+        BUSY_WAIT,
+        || Duration::ZERO,
+        |_| {
+            pauses += 1;
+            drop(held.take());
+        },
+    )
+    .expect("run once free");
+    assert_eq!(pauses, 1, "one pause, then the free stub ran");
     assert_eq!(out.stdout, b"kbf-installer-stub late\n");
-    closer.join().expect("closer");
 }
 
 #[test]
@@ -116,37 +120,49 @@ fn an_error_that_is_not_busy_is_returned_at_once() {
     // whole wait instead of failing), which only the busy case may do.
     let _missing_own = scratch("not-busy");
     let missing = _missing_own.join("no-such-program");
-    let started = Instant::now();
-    let err = output_unbusy(&mut Command::new(&missing), Duration::from_secs(3))
-        .expect_err("no such program");
+    let err = output_unbusy_on(
+        &mut Command::new(&missing),
+        Duration::from_secs(3),
+        || Duration::ZERO,
+        |_| panic!("retried a program that is not busy"),
+    )
+    .expect_err("no such program");
     assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
-    assert!(
-        started.elapsed() < Duration::from_millis(1500),
-        "retried a program that is not busy: {:?}",
-        started.elapsed()
-    );
 }
 
 #[test]
 fn a_stub_that_stays_busy_fails_with_busy_at_the_deadline() {
-    // Catches: a retry with no end (the test would hang), and one that hides the error
-    // it gave up on. The run is in a thread so that a loop without a deadline fails
-    // this test instead of hanging the suite.
+    // Catches: a retry with no end (the test would hang), one that gives up before the
+    // deadline, and one that hides the error it gave up on. The clock is virtual: each
+    // pause moves it by the pause, so the deadline is reached after wait / pause tries.
+    // The run is in a thread so that a loop without a deadline fails this test instead
+    // of hanging the suite.
     let (stub, _held, _own) = held_open("busy-forever");
+    let wait = Duration::from_millis(200);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let started = Instant::now();
-        let result = output_unbusy(&mut Command::new(&stub), Duration::from_millis(200));
-        let _ = tx.send((result.map(|_| ()), started.elapsed()));
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let pauses = std::cell::Cell::new(0u32);
+        let result = output_unbusy_on(
+            &mut Command::new(&stub),
+            wait,
+            || clock.get(),
+            |d| {
+                pauses.set(pauses.get() + 1);
+                clock.set(clock.get() + d);
+            },
+        );
+        let _ = tx.send((result.map(|_| ()), pauses.get()));
     });
-    let (result, took) = rx
+    let (result, pauses) = rx
         .recv_timeout(Duration::from_secs(20))
         .expect("the retry has a deadline");
     let err = result.expect_err("still busy");
     assert_eq!(err.kind(), io::ErrorKind::ExecutableFileBusy, "{err}");
-    assert!(
-        took >= Duration::from_millis(200),
-        "gave up early: {took:?}"
+    assert_eq!(
+        BUSY_POLL * pauses,
+        wait,
+        "paused until the deadline and not past it"
     );
 }
 

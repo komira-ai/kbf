@@ -166,7 +166,7 @@ impl Pki {
             ));
         }
         params.extended_key_usages = match how.role {
-            Role::Daemon => vec![ExtendedKeyUsagePurpose::ClientAuth],
+            Role::Daemon | Role::Updater => vec![ExtendedKeyUsagePurpose::ClientAuth],
             Role::Storage => vec![
                 ExtendedKeyUsagePurpose::ServerAuth,
                 ExtendedKeyUsagePurpose::ClientAuth,

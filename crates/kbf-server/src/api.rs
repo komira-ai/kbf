@@ -33,12 +33,21 @@
 //!   is a DNS name, written in lower case (a certificate's names are compared up to ASCII
 //!   case); one that is an IP address or has a colon is `400`, since it would name nothing.
 //!
-//! - `GET /v1/frontend/drain`: whether the frontend is draining, the Execute and
-//!   WaitExecution streams open and the operations queued ([`DrainStatus`]).
-//!   `POST /v1/frontend/drain` begins the drain ([`crate::drain`]) and answers the same
-//!   status: new Execute calls are refused, `/readyz` goes false, the REAPI listener is
-//!   sent GOAWAY, open streams run until their action is done, and the server exits
-//!   when they have. It is not undone: a drained frontend is restarted.
+//! - `GET /v1/frontend/drain`: whether the frontend is draining and in which phase, the
+//!   Execute and WaitExecution streams open and the operations queued ([`DrainStatus`]).
+//!   `POST /v1/frontend/drain` begins the drain and answers the same status. A frontend over
+//!   a state store runs the drain sequence ([`crate::sequence`]): `/readyz` goes false at
+//!   once while everything is still served, new Execute calls are refused after
+//!   `--drain-lb-wait`, every listener is sent GOAWAY, open executions run until they
+//!   are done or `--drain-deadline` (but the streams of operations that were never started
+//!   and that no worker on this frontend can run and no other frontend can take end
+//!   UNAVAILABLE when the drain begins), and the process exits 0. Any other server drains at
+//!   once ([`crate::drain`]): new Execute calls are refused, `/readyz` goes false, the REAPI
+//!   listener is sent GOAWAY, open streams run until their action is done, and the server
+//!   exits when they have. It is not undone: a drained frontend is restarted.
+//!
+//! - `GET /v1/frontend/retire` reads the retire mode of a frontend over a state store, and
+//!   `POST /v1/frontend/retire` begins it ([`crate::retire`]); any other server answers `409`.
 //!
 //! - `POST /v1/epoch/bump`: raises the epoch the state store holds by one ([`Farm::bump_epoch`])
 //!   and answers `{"previous", "epoch", "serving"}`. A frontend reads the stored epoch when
@@ -65,7 +74,7 @@
 //! (the peer address and what the proxy layer decided), never the `x-kbf-*` headers, which
 //! the layer removes.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::Router;
@@ -76,20 +85,21 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use kbf_map::{DenyEntry, Map, MemberId, MemberState};
-use kbf_state::StoreError;
+use kbf_state::{Store, StoreError};
 use kbf_types::WorkerId;
 use serde::{Deserialize, Serialize};
 
-use crate::drain::{Drain, DrainStatus};
+use crate::drain::{Drain, DrainStatus, Phase};
 use crate::enroll::api::EnrollApi;
 use crate::farm::{EpochBump, Farm, NodeAction, StateError};
 use crate::fleet::ProtocolSummary;
 use crate::members::{Members, MembershipError};
 use crate::proxy_auth::{Caller, Trust};
+use crate::retire::Retire;
 use crate::token::ApiToken;
-use crate::update::Rows;
 
 mod node_detail;
+mod retire;
 mod safe_to_stop;
 
 pub use safe_to_stop::{Verdict, safe_to_stop_path};
@@ -103,6 +113,9 @@ pub const DRAIN_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 /// The path of the frontend's drain: `GET` reads it, `POST` begins it.
 pub const FRONTEND_DRAIN: &str = "/v1/frontend/drain";
+
+/// The path of the frontend's retire: `GET` reads it, `POST` begins it.
+pub const FRONTEND_RETIRE: &str = "/v1/frontend/retire";
 
 /// The path of `POST /v1/epoch/bump`.
 pub const EPOCH_BUMP: &str = "/v1/epoch/bump";
@@ -145,16 +158,20 @@ struct ApiState {
     farm: Arc<Farm>,
     token: Option<ApiToken>,
     drain: Arc<Drain>,
+    /// What `POST /v1/frontend/retire` begins: set once by a frontend over a state store,
+    /// empty (the routes answer 409) on any other server.
+    retire: Arc<OnceLock<Retire>>,
     members: Option<Arc<Members>>,
-    /// The update rows `safe_to_stop` reads (`None`: no state store).
-    update: Option<Rows>,
+    /// The state store `safe_to_stop` reads the enrolled storage members from (`None`: no
+    /// state store).
+    store: Option<Arc<dyn Store>>,
 }
 
 /// The API's routes over `farm`; writes need `token`, and without one are refused.
 /// `drain` is what `POST /v1/frontend/drain` begins; `members` is what
 /// `GET /v1/members` reads and `POST /v1/members/{id}` changes (the same value the
-/// `Membership` service registers into). `update` is where the update rows are read
-/// for `safe_to_stop`. `enroll` is what the `/v1/enroll/...` routes
+/// `Membership` service registers into). `store` is the state store `safe_to_stop`
+/// reads. `enroll` is what the `/v1/enroll/...` routes
 /// call ([`crate::enroll::api`]); `None` when this server has no enrollment, which those
 /// routes answer, behind the gate, with 404.
 /// Writes read the peer address from
@@ -163,8 +180,9 @@ pub fn router(
     farm: Arc<Farm>,
     token: Option<ApiToken>,
     drain: Arc<Drain>,
+    retire: Arc<OnceLock<Retire>>,
     members: Option<Arc<Members>>,
-    update: Option<Rows>,
+    store: Option<Arc<dyn Store>>,
     enroll: Option<Arc<EnrollApi>>,
 ) -> Router {
     let enrollment = crate::enroll::api::routes(token.clone(), enroll);
@@ -177,13 +195,15 @@ pub fn router(
         .route("/v1/members/{id}/safe-to-stop", get(safe_to_stop::check))
         .route(DENIED, post(deny_entry).delete(allow_entry))
         .route(FRONTEND_DRAIN, get(drain_status).post(begin_drain))
+        .route(FRONTEND_RETIRE, get(retire::status).post(retire::begin))
         .route(EPOCH_BUMP, post(bump_epoch))
         .with_state(Arc::new(ApiState {
             farm,
             token,
             drain,
+            retire,
             members,
-            update,
+            store,
         }))
         .merge(enrollment)
         .merge(scheduler)
@@ -191,8 +211,10 @@ pub fn router(
 
 /// The drain as it is now.
 fn status(api: &ApiState) -> DrainStatus {
+    let phase = api.drain.phase();
     DrainStatus {
-        draining: api.drain.is_draining(),
+        draining: phase != Phase::Serving,
+        phase,
         open_executions: api.farm.open_executions(),
         queued_operations: api.farm.queued_operations(),
     }
@@ -202,7 +224,7 @@ async fn drain_status(State(api): State<Arc<ApiState>>) -> Response {
     json(StatusCode::OK, &status(&api))
 }
 
-/// The body a frontend drain may carry: none, or `{}`.
+/// The body a frontend drain or retire may carry: none, or `{}`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NoBody {}
@@ -222,7 +244,12 @@ async fn begin_drain(
         let why = format!("a frontend drain takes no body, or {{}}: {e}");
         return error(StatusCode::BAD_REQUEST, &why);
     }
-    if api.drain.begin() {
+    // A frontend over a state store runs the drain sequence; any other server drains at once.
+    let began = match api.retire.get() {
+        Some(retire) => retire.drain(),
+        None => api.drain.begin(),
+    };
+    if began {
         tracing::info!("frontend drain begun by the operator API");
     }
     json(StatusCode::OK, &status(&api))
@@ -544,7 +571,7 @@ fn member_answer(
 }
 
 /// The status a failed member write answers with.
-const fn member_failure(e: &MembershipError) -> StatusCode {
+pub(crate) const fn member_failure(e: &MembershipError) -> StatusCode {
     match e {
         MembershipError::NotRegistered(_) => StatusCode::NOT_FOUND,
         MembershipError::NotSettable(_) => StatusCode::BAD_REQUEST,
@@ -838,17 +865,27 @@ pub fn write_request(
     let action = match verb {
         "cordon" => NodeAction::Cordon,
         "uncordon" => NodeAction::Uncordon,
-        "drain" if body.is_empty() => NodeAction::Drain(DRAIN_DEADLINE),
-        "drain" => {
-            let drain: DrainBody = serde_json::from_slice(body).map_err(|e| {
-                let why = format!("a drain body is {{\"deadline_secs\": N}}: {e}");
-                (StatusCode::BAD_REQUEST, why)
-            })?;
-            NodeAction::Drain(Duration::from_secs(drain.deadline_secs))
-        }
+        "drain" => drain_action(body)?,
         _ => return Err(unknown()),
     };
     Ok((WorkerId::new(node), action))
+}
+
+/// The drain a request body asks for: [`DRAIN_DEADLINE`] for no body, else the
+/// `{"deadline_secs": N}` it holds.
+///
+/// # Errors
+/// 400 for a body that is not `{"deadline_secs": N}`.
+pub(crate) fn drain_action(body: &[u8]) -> Result<NodeAction, (StatusCode, String)> {
+    if body.is_empty() {
+        return Ok(NodeAction::Drain(DRAIN_DEADLINE));
+    }
+    serde_json::from_slice::<DrainBody>(body)
+        .map(|drain| NodeAction::Drain(Duration::from_secs(drain.deadline_secs)))
+        .map_err(|e| {
+            let why = format!("a drain body is {{\"deadline_secs\": N}}: {e}");
+            (StatusCode::BAD_REQUEST, why)
+        })
 }
 
 /// Whether a `Content-Type` value is `application/json`, in any case, with or without
@@ -873,12 +910,6 @@ pub(crate) fn error(code: StatusCode, why: &str) -> Response {
         answer.headers_mut().insert(WWW_AUTHENTICATE, bearer);
     }
     answer
-}
-
-/// [`error`] with a stable machine `code` beside the text, for a refusal a program tells from
-/// the other answers of one status.
-pub(crate) fn error_coded(status: StatusCode, why: &str, code: &str) -> Response {
-    json(status, &serde_json::json!({ "error": why, "code": code }))
 }
 
 #[cfg(test)]

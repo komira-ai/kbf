@@ -2,7 +2,8 @@ use std::fs;
 
 use kbf_testkit::dir::TestDir;
 
-use super::{flock_held, held, table_holds, wait_lockable};
+use super::{flock_held, held, table_holds, wait_lockable, wait_lockable_paced};
+use crate::pace::fake::Fake;
 
 const TABLE: &str = "\
 1: POSIX  ADVISORY  WRITE 812 08:01:131075 0 EOF
@@ -122,21 +123,53 @@ fn an_unreadable_lock_is_held() {
 }
 
 /// The test helper waits for a holder to let go, and returns at once when there is none or
-/// no file.
+/// no file: it pauses between looks, gets the lock the look after the holder lets go, and
+/// makes no pause when nothing holds it.
 #[test]
 fn wait_lockable_waits_for_a_holder() {
     let dir = TestDir::under(std::env::temp_dir(), "locks-wait");
     let path = dir.join("install.lock");
-    wait_lockable(&path);
+    let clock = Fake::new();
+    wait_lockable_paced(&path, &clock.pace());
+    assert!(clock.sleeps().is_empty(), "no file, nothing to wait for");
+
     let holder = fs::File::create(&path).unwrap();
     holder.lock().unwrap();
-    let started = std::time::Instant::now();
-    let releaser = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(80));
-        holder.unlock().unwrap();
+    // The holder lets go while the helper pauses for the third time.
+    let holder = std::cell::RefCell::new(Some(holder));
+    let clock = Fake::new();
+    clock.on_sleep(move |n| {
+        if n == 3 {
+            holder.borrow_mut().take().unwrap().unlock().unwrap();
+        }
     });
-    wait_lockable(&path);
-    assert!(started.elapsed() >= std::time::Duration::from_millis(70));
-    releaser.join().unwrap();
+    wait_lockable_paced(&path, &clock.pace());
+    assert_eq!(
+        clock.sleeps(),
+        [std::time::Duration::from_millis(10); 3],
+        "three pauses, then the lock was free"
+    );
     assert!(!flock_held(&path));
+
+    let free = Fake::new();
+    wait_lockable_paced(&path, &free.pace());
+    assert!(
+        free.sleeps().is_empty(),
+        "a lock nobody holds is had at once"
+    );
+}
+
+/// A lock that is never let go is looked at 500 times, 10 ms apart, and left for the caller's
+/// own assertion: the helper gives up and returns.
+#[test]
+fn wait_lockable_gives_up_on_a_lock_that_stays() {
+    let dir = TestDir::under(std::env::temp_dir(), "locks-wait-stays");
+    let path = dir.join("install.lock");
+    let holder = fs::File::create(&path).unwrap();
+    holder.lock().unwrap();
+    let clock = Fake::new();
+    wait_lockable_paced(&path, &clock.pace());
+    assert_eq!(clock.sleeps().len(), 500);
+    assert!(flock_held(&path));
+    drop(holder);
 }

@@ -55,29 +55,6 @@ pub struct EnrollFlags {
     pub renew_every: Option<std::time::Duration>,
 }
 
-impl EnrollFlags {
-    /// What a handover compares between the frontend serving and its successor: the
-    /// flags that decide which CA is served, from where and on which address. The
-    /// listener's address is the one the flags name (`instance`'s port shift taken off),
-    /// since the two instances listen ten ports apart on purpose. The limits, the names,
-    /// the certificate lifetime and the node settings may differ: a successor is how they
-    /// are changed.
-    #[must_use]
-    pub fn handover_key(&self, instance: Option<crate::handover::Instance>) -> String {
-        let port = instance.map_or(self.listen.port(), |i| i.base_port(self.listen.port()));
-        let signer = match &self.signer {
-            SignerChoice::External(socket) => format!("signer {}", socket.display()),
-            SignerChoice::DevFile => "dev-file-signer".to_owned(),
-        };
-        format!(
-            "enroll-listen {}:{port}\nca-dir {}\n{signer}\nallow-unenforced-deny {}",
-            self.listen.ip(),
-            self.ca_dir.display(),
-            self.allow_unenforced_deny,
-        )
-    }
-}
-
 fn flag(id: &'static str, long: &'static str, value: &'static str, help: &'static str) -> Arg {
     Arg::new(id)
         .long(long)
@@ -99,8 +76,7 @@ pub fn args() -> Vec<Arg> {
                 "Serve kbf.enroll.v1 (Enroll and Renew) on this address, over TLS with the \
                  frontend's own certificate from the CA. Off unless given. It needs \
                  --state-store, --ca-dir, --frontend-name, and --ca-signer (or, for \
-                 development, --ca-dev-file-signer). While this build does not enforce \
-                 deny rows in storage it also needs --enroll-allow-unenforced-deny.",
+                 development, --ca-dev-file-signer).",
             ),
         flag(
             CA_DIR,
@@ -180,9 +156,9 @@ pub fn args() -> Vec<Arg> {
             .action(ArgAction::SetTrue)
             .requires(LISTEN)
             .help(
-                "Allow --enroll-listen although this build's storage does not enforce the \
-                 deny rows a node revocation writes: a revoked node is refused renewal at \
-                 once but storage serves it until its certificate expires.",
+                "Does nothing: this build enforces the deny rows a node revocation writes, \
+                 so --enroll-listen needs no acceptance. Still accepted so existing units \
+                 start; it will be removed in a later release.",
             ),
         flag(
             WORKER,

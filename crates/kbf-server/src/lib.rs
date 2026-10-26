@@ -26,16 +26,16 @@
 //!   same listener, on by default (`--ui=false` turns it off), the read-only, open web UI under
 //!   `/ui` ([`ui_mount`]), whose reads are bounded per caller ([`read_limit`]).
 //! - A drain of the frontend ([`drain`]) that a stop signal or `POST /v1/frontend/drain`
-//!   begins, a second signal escalates, and `kbf cluster` calls through [`api_client`].
-//! - Rollouts ([`rollout`]): the record's store (in memory for now) and the driver that
-//!   cordons, drains and hands drained nodes their update, as far as `updating`.
+//!   begins, a second signal escalates, and `kbf cluster` calls through [`api_client`]. A
+//!   frontend over a state store runs it as a sequence that works behind any load balancer
+//!   ([`sequence`]): not ready first, then refusing and GOAWAY, then the open executions
+//!   run out, then the process exits.
 //! - Node rolling ([`update`]): the durable rows and facts of a split-mode update
 //!   (`docs/design/split-mode-updates.md`, sections 2.6 to 2.11). Nothing picks hosts or
 //!   steps them: updates are OS packages, driven by `kbf-updater`.
 //! - The MDM gate ([`mdm`]): the server's verbs at `kbf-mdm-gate` (inventory, enforce
 //!   and withdraw a macOS build, install an allowlisted profile; no erase), a client
-//!   over mutual TLS, and the polling of an update's DDM progress. Not yet called by
-//!   the rollout driver.
+//!   over mutual TLS, and the polling of an update's DDM progress. Nothing calls it yet.
 //! - Build history ([`history`]): off unless `--history-objects` is given, each attempt and
 //!   cache hit of an invocation a client named is recorded in an object store, off the
 //!   path of the call it belongs to, with a run id the build pages name the run by. It
@@ -90,7 +90,6 @@ pub mod fleet;
 pub mod front_maps;
 pub mod frontend;
 pub mod grpc_health;
-pub mod handover;
 pub mod health;
 mod health_summary;
 pub mod history;
@@ -105,7 +104,6 @@ mod listen;
 mod local;
 pub mod log_file;
 pub mod machine;
-pub mod managed;
 mod map_push;
 pub mod mdm;
 pub mod members;
@@ -114,26 +112,38 @@ mod memory;
 pub mod metrics;
 mod missing;
 pub mod node_map;
+pub mod node_self;
+mod notify;
 pub mod object_store;
+mod pack_daemon_metrics;
+pub mod pack_locate;
 pub mod proxy_auth;
 pub mod raft_log;
 mod ram_drain;
 pub mod read_limit;
+mod ready;
 mod rebuild;
 pub mod release;
 pub mod replication;
+pub mod retire;
 pub mod retired;
-pub mod rollout;
 mod run_record;
+pub mod sequence;
 pub mod serve;
 #[cfg(test)]
+mod serve_goaway_tests;
+#[cfg(test)]
 mod serve_remote_tests;
+#[cfg(test)]
+mod serve_start_tests;
 mod size_key;
 pub mod stamp;
+mod stand;
 mod start;
 mod start_exit;
 mod startup_pass;
 pub mod state_store;
+mod stop;
 pub mod storage_gate;
 pub mod storage_half;
 pub mod storage_health;
@@ -146,13 +156,11 @@ mod test_dir;
 mod timeout;
 pub mod token;
 pub mod ui_mount;
-pub mod update;
 pub mod update_status;
 pub mod verbs;
 pub mod vitals;
 pub mod worker;
 pub mod worker_roles;
-pub mod write_rules;
 pub mod write_tier;
 
 pub use config::{Args, ConfigError, Role, SERVER, s3_store};
@@ -179,9 +187,10 @@ pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_in
 pub use start_exit::{
     NOT_READY, REFUSED, STALE_WRITER_HINT, StartFailure, hint as start_hint, said as start_said,
 };
-pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
+pub use state_store::{PackIndexFlagError, StateStore, StateStoreUri, StateStoreUriError};
 pub use streams::{StreamArgs, StreamLimits};
 pub use ui_mount::bind_server_with_options;
+pub use worker::HostFloor;
 pub use worker::WorkerService;
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build

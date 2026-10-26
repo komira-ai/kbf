@@ -11,12 +11,15 @@
 //! read them.
 //!
 //! One of them (`a_real_release_is_fetched_as_nobody_and_verified`) goes to GitHub: it lists
-//! the repository's releases with the pinned-style `gh` as `nobody`, fetches the newest
-//! release that has a darwin tarball through the same code the install uses, and runs the real
-//! `gh attestation verify` on it with the production bindings, offline. The workflow leaves a
-//! token for the API in `/private/var/tmp/kbf-real-fetch-token`; the test gets the Sigstore
-//! trusted root from `gh` and, for the case that no release has been published yet, the
-//! newest attested build of `main`.
+//! the repository's releases with the system `/usr/bin/curl` as `nobody` (the install's own
+//! listing), fetches the newest release that has a darwin tarball through the same code the
+//! install uses, and runs the real `gh attestation verify` on it with the production
+//! bindings, offline. The workflow leaves its own token in
+//! `/private/var/tmp/kbf-real-fetch-token`; the test passes it to the listing and the
+//! download as a channel's `token_file` does, because the anonymous quota of a hosted
+//! runner's address is shared with others. The root `gh` calls (the Sigstore trusted root
+//! and, for the case that no release has been published, the newest attested build of
+//! `main`) use it too. One more listing is made with no token, as a check of that path.
 //!
 //! Each test captures first and asserts after, so a parser that does not read the real
 //! output still leaves the output to look at.
@@ -32,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use kbf_host_install::mac_tools::{
     Cmd, Exec, Identity, Runner, SystemRunner,
-    fetch::{FetchError, Fetcher, Limits, MAX_PAGES},
+    fetch::{AssetKind, FetchError, Fetcher, Limits, MAX_PAGES, page_body},
     release, tools,
 };
 use kbf_testkit::dir::TestDir;
@@ -535,8 +538,8 @@ fn print_of_the_systems_own_services_is_read_at_the_top_level() {
 
 // ---- the fetch from GitHub, and the real attestation check ----
 
-/// Where the workflow left a token for the GitHub API (the sudo that runs these tests clears
-/// the environment).
+/// Where the workflow left a token for the test's own `gh` calls as root (the sudo that runs
+/// these tests clears the environment). The install's listing and download do not get it.
 const TOKEN_FILE: &str = "/private/var/tmp/kbf-real-fetch-token";
 
 /// `gh` as root, with the workflow's token and a home of its own.
@@ -610,7 +613,15 @@ fn darwin_commits(page: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// The code the install uses lists the repository's releases as `nobody` and fetches the
+/// The status line and headers of what `curl --include` printed, for a message.
+fn response_head(stdout: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stdout);
+    text.split("\r\n\r\n").next().unwrap_or_default().to_owned()
+}
+
+/// The code the install uses lists the repository's releases with the system `curl`, as
+/// `nobody` and with the workflow's token (the channel's `token_file`: the shared address of a
+/// hosted runner has no anonymous quota to rely on), and fetches the
 /// newest one that has a darwin tarball, picked by the first 12 digits of its commit; the
 /// real `gh attestation verify` accepts the fetched tarball with the production bindings,
 /// offline and as `nobody`, and refuses it for another commit, another signer workflow, and
@@ -619,7 +630,9 @@ fn darwin_commits(page: &serde_json::Value) -> Vec<String> {
 /// verification runs on the newest attested build of `main` (its workflow artifact); the
 /// capture `fetch_mode` says which of the two happened, and a workflow warning is printed for
 /// the second. A repository that has published any release but none with a darwin tarball
-/// fails the test.
+/// fails the test. One more listing is made with no token: it must work, or be GitHub's rate
+/// limit with `x-ratelimit-remaining: 0`, which is a workflow warning; any other answer
+/// fails. The response head of that listing is printed either way.
 #[test]
 #[ignore = "needs a Mac, root and the network: cargo xtask sudo-test"]
 fn a_real_release_is_fetched_as_nobody_and_verified() {
@@ -651,12 +664,15 @@ fn a_real_release_is_fetched_as_nobody_and_verified() {
     fs::write(&root_copy, &trusted.stdout).unwrap();
     fs::set_permissions(&root_copy, fs::Permissions::from_mode(0o644)).unwrap();
 
-    let fetcher = Fetcher {
+    let fetcher_with = |token| Fetcher {
+        platform: "darwin-arm64",
+        asset: AssetKind::Tarball,
         runner: &SystemRunner,
+        curl: Path::new("/usr/bin/curl"),
         gh: &gh,
         who: ids,
         home: &home,
-        token: Some(token),
+        token,
         limits: Limits {
             tool: LIMIT,
             download: Duration::from_secs(600),
@@ -664,6 +680,44 @@ fn a_real_release_is_fetched_as_nobody_and_verified() {
             bundle_max: 256 * 1024,
         },
     };
+
+    // With no token: the listing works, or GitHub says the quota of this address is used up.
+    let anonymous = run(&fetcher_with(None).list_cmd(1));
+    capture("releases_page1_anonymous", &anonymous);
+    assert!(
+        anonymous.success(),
+        "curl: {} {}",
+        anonymous.code.unwrap_or(-1),
+        anonymous.stderr_text()
+    );
+    println!(
+        "anonymous listing, response head:\n{}",
+        response_head(&anonymous.stdout)
+    );
+    match page_body(&anonymous.stdout) {
+        Ok(body) => {
+            let listing: serde_json::Value = serde_json::from_slice(body).unwrap();
+            assert!(listing.is_array(), "the anonymous listing is not a list");
+            println!("anonymous listing: it works");
+        }
+        Err(FetchError::RateLimited(why))
+            if anonymous
+                .stdout_text()
+                .to_ascii_lowercase()
+                .contains("x-ratelimit-remaining: 0") =>
+        {
+            println!(
+                "::warning title=host-install-mac::the anonymous listing was refused, the quota of this runner address is used up ({why}); the listing with the workflow token is what is tested"
+            );
+        }
+        Err(other) => panic!(
+            "the anonymous listing: {other:?}\n{}",
+            response_head(&anonymous.stdout)
+        ),
+    }
+
+    // Everything below goes through the channel's `token_file`.
+    let fetcher = fetcher_with(Some(token));
 
     // The newest release with a darwin tarball, from the real listing.
     let mut newest = None;
@@ -673,8 +727,11 @@ fn a_real_release_is_fetched_as_nobody_and_verified() {
         if page == 1 {
             capture("releases_page1", &exec);
         }
-        assert!(exec.success(), "gh api: {}", exec.stderr_text());
-        let listing: serde_json::Value = serde_json::from_slice(&exec.stdout).unwrap();
+        assert!(exec.success(), "curl: {}", exec.stderr_text());
+        let body = page_body(&exec.stdout).unwrap_or_else(|e| {
+            panic!("the listing: {e:?}\n{}", response_head(&exec.stdout));
+        });
+        let listing: serde_json::Value = serde_json::from_slice(body).unwrap();
         newest = darwin_commits(&listing).into_iter().next();
         let count = listing.as_array().map_or(0, Vec::len);
         published += listing
@@ -683,6 +740,7 @@ fn a_real_release_is_fetched_as_nobody_and_verified() {
             .flatten()
             .filter(|release| release["draft"] != true)
             .count();
+        println!("real listing, page {page}: {count} releases, with the workflow token");
         if newest.is_some() || count < 100 {
             break;
         }
@@ -691,6 +749,7 @@ fn a_real_release_is_fetched_as_nobody_and_verified() {
     let (tarball, bundle, commit) = if let Some(commit) = newest {
         fs::create_dir_all(out_dir()).unwrap();
         fs::write(out_dir().join("fetch_mode"), "release\n").unwrap();
+        println!("fetch_mode release");
         let prefix = &commit[..release::PREFIX_LEN];
         let fetched = fetcher.fetch(prefix, &scratch).expect("the fetch");
         assert_eq!(fetched, commit);

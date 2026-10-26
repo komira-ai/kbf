@@ -23,16 +23,13 @@ route stays local, and the last column says why.
 - **policy**: the REAPI authentication policy and `invocations.getAuthorizer`; off (404) without
   them.
 - **none**: health and metrics, which need no credentials.
-- **admin**: the admin port (`--admin-listen`), a separate listener that binds loopback only
-  and carries no credential; the calls move the scheduler's role ([../api.md](../api.md), "The
-  admin calls").
 
 ## 1. Routes, one row each
 
 Every row is one method and one path. A router `.route(` call that serves two methods has a row
 per method; a custom method (`:cordon`) has a row per verb. The sources of the router are
 `crates/kbf-server/src/{api,release/http,storage_health,health,metrics,http_blobs,
-http_invocations,http_sched,http_history,enroll/api,managed/http,ui_mount}.rs` and `frontend.rs`, where they are merged.
+http_invocations,http_sched,http_history,enroll/api,node_self,ui_mount}.rs` and `frontend.rs`, where they are merged.
 
 ### Cluster
 
@@ -40,6 +37,7 @@ http_invocations,http_sched,http_history,enroll/api,managed/http,ui_mount}.rs` a
 |---|---|---|---|
 | cluster status (nodes, software, placement) | `GET /v1/nodes` | [F] | open |
 | one node (capacity, booked, free, leases) | `GET /v1/nodes/{node}` | [F] | open |
+| a storage host's own member and the storage numbers (its updater, on the worker listener) | `GET /v1/nodes/{node}/storage-health` | [F] | the `updater` certificate of that node, over mutual TLS ([../api.md](../api.md), "Own-node calls of a host's updater") |
 | list members of the storage map | `GET /v1/members` | [F] | open |
 | leases the scheduler holds (paged, by node) | `GET /v1/leases` | [F] | open |
 | the queue: depth, ages, why work waits | `GET /v1/queue` | [F] | open |
@@ -53,21 +51,19 @@ http_invocations,http_sched,http_history,enroll/api,managed/http,ui_mount}.rs` a
 | list the denied entries | `GET /v1/denied` | [N] unit F | write |
 | frontend drain status | `GET /v1/frontend/drain` | [F] | open |
 | begin the frontend's drain | `POST /v1/frontend/drain` | [F] | write |
+| frontend retire status | `GET /v1/frontend/retire` | [F] | open |
+| retire the frontend (stop its intake and worker streams, keep its callers) | `POST /v1/frontend/retire` | [F] | write |
 | raise the stored epoch (after a restore from a backup) | `POST /v1/epoch/bump` | [F] | write |
 | storage health (under-replicated blobs) | `GET /v1/storage` | [F] | open |
 
 There is no rebalance verb: handoff of data between members is not built, and none is invented
 here **[D]**.
 
-### Admin port (a separate loopback listener, `--admin-listen`)
+### Admin port (removed)
 
-| Verb | Method and route | Status | Gate |
-|---|---|---|---|
-| the role of this process (candidate, active, quiesced, stood-down) | `GET /v1/admin/role` | [F] | admin |
-| stop scheduling, assigning and requeueing | `POST /v1/admin/quiesce` | [F] | admin |
-| undo a quiesce | `POST /v1/admin/resume` | [F] | admin |
-| a candidate takes the generation | `POST /v1/admin/takeover` | [F] | admin |
-| end worker streams after a takeover elsewhere | `POST /v1/admin/stand-down` | [F] | admin |
+A frontend serves no admin port: `GET /v1/admin/role` and the `quiesce`, `resume`, `takeover`
+and `stand-down` posts are gone with `--admin-listen` ([../api.md](../api.md), "The admin calls
+(removed)").
 
 ### Enrollment
 
@@ -80,6 +76,7 @@ All of these answer 404 until enrollment is wired into the frontend (#1055 **[V]
 | revoke a token | `DELETE /v1/enroll/tokens/{id}` | [F] | full |
 | list enrolled nodes | `GET /v1/enroll/nodes` | [F] | full |
 | revoke an enrolled node | `POST /v1/enroll/nodes/{id}/revoke` | [F] | full |
+| adopt a node provisioned before enrollment | `POST /v1/enroll/nodes/{id}:adopt` | [F] | full |
 
 ### Object store
 
@@ -102,20 +99,12 @@ All answer 404 when the feature is off.
 
 | Verb | Method and route | Status | Gate |
 |---|---|---|---|
-| upload a release file | `PUT /v1/releases/{commit}/{platform}/{name}` | [F] | write, no content-type gate |
-| list releases | `GET /v1/releases` | [F] | open |
-| describe a release (its files by digest; the `releases/<commit>.json` of a `url` source) | `GET /v1/releases/{commit}` | [F] | open |
-| read the desired release, releases, policy | `GET /v1/update` | [V] #976, #985 | open |
-| set the desired release (also a rollback: an older commit, a higher generation) | `POST /v1/update/desired` | [V] #976 | write |
-| preview what a commit would change | `GET /v1/update/plan` | [V] #985 (design) | open |
-| pause updates | `POST /v1/update/pause` | [V] #976 | write |
-| resume updates | `POST /v1/update/resume` | [V] #976 | write |
 | the frontend's own update order, read | `GET /v1/update/frontend` | [V] #1062 | open |
 | the frontend's own update order, write | `POST /v1/update/frontend` | [V] #1062 | write |
 
-There is no separate rollback route. There is no update-policy route (`POST /v1/update/policy`
-is named in the pull-updates design and has no code), no image-pull verb and no CA-rotation
-route on this branch: all three are out of scope of the object-store series (Q5).
+The server keeps no desired-release routes (`GET /v1/update`, `POST /v1/update/desired`,
+`pause`, `resume`): updates are OS packages installed by `kbf-updater`. There is no image-pull
+verb and no CA-rotation route on this branch: both are out of scope of the object-store series (Q5).
 
 ### Reads of builds
 
@@ -176,7 +165,7 @@ section 8) and is not an operator verb of the farm.
 | install, update, roll back, confirm, revert, gc, status and check of a host | `kbf-installer` (#1048, #1051, #1082, #1083) **[V]** | root and host-local; the installer is the root tool, and `setup` mints the first token |
 | the rollout controller | `kbf-deploy rollout`, #803, #970 **[V]** | a host state machine; installer territory |
 | start a mode, `--check` | `kbf <mode>` **[F]** | the local runtime; it installs nothing |
-| frontend handover, enroll, `kbf node` | `kbf frontend handover`, `kbf enroll`, `kbf node` **[F]** | replaced by the installer's side-by-side children (#1054, #1062) and removed by #1049 **[V]** |
+| frontend handover, enroll, `kbf node` | `kbf frontend handover`, `kbf enroll`, `kbf node` **[F]** | removed: a frontend is updated by a roll of the `kbf-proxy` pool, driven by `kbf-updater` (`frontend-proxy.md` section 4) **[V]** |
 | render, check, install units, swap, verify certificate (the `envoy render, check, apply` verbs are retired: no Envoy) | `kbf-deploy` **[F]** | become installer logic and package units; root |
 | `mdm`, `minio`, `pilot`, `erase-request` | `kbf-deploy` **[F]** | leave the product (distribution.md section 8); an erase request is signed with a security key on the operator's machine |
 | `kbf cluster status`, `drain`, `undrain`, `member`, `denied`, `epoch-bump`, `object-store status\|audit\|connection\|bind\|unbind\|verify` | the `kbf` CLI **[F]** (the last two groups: unit G1) | a thin client of the routes above, no logic |

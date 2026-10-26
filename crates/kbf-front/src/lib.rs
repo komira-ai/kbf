@@ -29,7 +29,10 @@
 //! **The proxy.** [`Proxy`] answers a client's CAS, ByteStream and action-cache calls from
 //! storage nodes instead of the cache ([`routes_proxied`]; `kbf-server --storage`):
 //! ByteStream as a raw HTTP/2 pass-through that never holds a blob, the rest at the
-//! tonic level. See the `proxy` module for what it keeps and what it does not do yet.
+//! tonic level. See the `proxy` module for what it keeps and what it does not do yet. Given
+//! [`Packs`], the proxy writes a client's uploads into packs in an object store and finds them
+//! through the pack index ([`Proxy::with_packs`]), and so does the backend Execute reads
+//! through ([`Backend::remote_over`], [`Backend::routed_over`]).
 //!
 //! **The backend.** Execute reads the store through a [`Backend`], a cache in this
 //! process, a storage node ([`Backend::remote`]) or the storage nodes of a map
@@ -72,7 +75,6 @@ pub mod metrics;
 mod operations;
 mod proxy;
 mod recorder;
-mod relay;
 mod request_metadata;
 mod routed;
 mod segments;
@@ -124,13 +126,15 @@ pub use crate::execution::{
 pub use crate::input_tree::{ENTRY_OVERHEAD, InputTreeConfig};
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
 pub use crate::operations::OperationsService;
-pub use crate::proxy::{Direction, Meter, Method, Owner, Owners, Proxy};
+pub use crate::proxy::{
+    CommitError, DEFAULT_INFLIGHT_BYTES, DEFAULT_UPLOAD_IDLE_TIMEOUT, Direction, MAX_COMMIT_BLOBS,
+    MAX_PACKED_BLOB_BYTES, MAX_UPLOAD_IDLE_TIMEOUT, Meter, Method, Owner, Owners, PackMetrics,
+    PackSettings, PackStore, Packs, Proxy,
+};
 pub use crate::recorder::{
     ActionLabel, DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording,
     Tap, listing, owner, wall_now,
 };
-pub use crate::relay::{Handed, Relay, Successor};
-
 pub use crate::request_metadata::{
     CallMetadata, HEADER as REQUEST_METADATA_HEADER, Invalid, InvocationId, MAX_HEADER_BYTES,
     MAX_ID_BYTES, MAX_TEXT_BYTES, Read, ReadRequestMetadata, RequestMetadataLayer, Text,
@@ -327,94 +331,15 @@ pub fn routes_proxied<D>(
 where
     D: Dispatch,
 {
-    proxied(
-        proxy,
-        backend.into(),
-        dispatch,
-        streams,
-        authorizers,
-        recorder,
-        defaults,
-        |execution, _, _| execution,
-    )
-}
-
-/// What a frontend that may hand its roles to a successor forwards its `Execute` and
-/// `WaitExecution` calls with once it has ([`Relay`]).
-pub struct Relaying {
-    /// Whether the frontend has handed its roles over.
-    pub farm: Arc<dyn Handed>,
-    /// The successor's channel, named when the successor says who it is.
-    pub successor: Successor,
-    /// How often a relay that fell back to the state store looks in it.
-    pub follow_every: std::time::Duration,
-}
-
-/// [`routes_proxied`] with the `Execution` service behind a [`Relay`]: calls are the
-/// wrapped service's until `relaying.farm` has handed over, and the successor's after.
-#[allow(clippy::too_many_arguments)] // `routes_proxied`'s seven, and the relay's.
-pub fn routes_relayed<D>(
-    proxy: &Proxy,
-    backend: impl Into<Backend>,
-    dispatch: Arc<D>,
-    streams: OpenStreams,
-    authorizers: Arc<Authorizers>,
-    recorder: &Recorder,
-    defaults: Defaults,
-    relaying: Relaying,
-) -> Routes
-where
-    D: Dispatch,
-{
-    let backend = backend.into();
-    let counted = backend.clone();
-    proxied(
-        proxy,
-        backend,
-        dispatch,
-        streams,
-        authorizers,
-        recorder,
-        defaults,
-        move |execution, closing, progress| {
-            let streams = OpenStreams { closing, progress };
-            Relay::new(execution, relaying.farm, relaying.successor, counted)
-                .with_streams(streams)
-                .following_every(relaying.follow_every)
-        },
-    )
-}
-
-/// The routes of [`routes_proxied`], the `Execution` service made by `wrap` from the
-/// service and the two halves of the open streams' wiring.
-#[allow(clippy::too_many_arguments)] // `routes_proxied`'s seven, and the wrap.
-fn proxied<D, E>(
-    proxy: &Proxy,
-    backend: Backend,
-    dispatch: Arc<D>,
-    streams: OpenStreams,
-    authorizers: Arc<Authorizers>,
-    recorder: &Recorder,
-    defaults: Defaults,
-    wrap: impl FnOnce(ExecutionService<D>, Closing, Progress) -> E,
-) -> Routes
-where
-    D: Dispatch,
-    E: kbf_proto::reapi::execution_server::Execution,
-{
     let OpenStreams { closing, progress } = streams;
     let operations = OperationsService::new(Arc::clone(&dispatch), Arc::clone(&authorizers));
-    let service = ExecutionService::with_authorizers(
-        backend,
-        dispatch,
-        closing.clone(),
-        Arc::clone(&authorizers),
-    )
-    .recording(recorder.clone())
-    .with_progress(progress.clone())
-    .with_default_memory(defaults.memory)
-    .with_default_platform(defaults.platform);
-    let execution = ExecutionServer::new(wrap(service, closing, progress))
+    let service =
+        ExecutionService::with_authorizers(backend, dispatch, closing, Arc::clone(&authorizers))
+            .recording(recorder.clone())
+            .with_progress(progress)
+            .with_default_memory(defaults.memory)
+            .with_default_platform(defaults.platform);
+    let execution = ExecutionServer::new(service)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let capabilities = CapabilitiesService::new(true, authorizers);
