@@ -57,6 +57,35 @@ async fn hash_log(logs: &Logs<'_>, name: &'static str) -> Result<Record, TreeErr
     hashed.ok_or_else(|| limit(&shown, Exceeded::Stdio, max))
 }
 
+/// Before the outputs are sent: into a store with no intake (`plain`), [`add_to`] the
+/// outputs' `records`; otherwise nothing. The choice is made here and in [`after_outputs`],
+/// not in the caller, so that every line of the caller runs whatever the store.
+pub(crate) async fn with_outputs(
+    records: &mut Vec<Record>,
+    logs: Option<&Logs<'_>>,
+    plain: bool,
+    result: &mut ActionResult,
+) -> Result<(), TreeError> {
+    let Some(logs) = logs.filter(|_| plain) else {
+        return Ok(());
+    };
+    add_to(records, logs, result).await
+}
+
+/// After the outputs are sent: into a store with an intake (not `plain`), each log
+/// [`through_intake`]; otherwise nothing, since [`with_outputs`] sent them.
+pub(crate) async fn after_outputs(
+    cas: &impl Cas,
+    logs: Option<&Logs<'_>>,
+    plain: bool,
+    result: &mut ActionResult,
+) -> Result<(), TreeError> {
+    let Some(logs) = logs.filter(|_| !plain) else {
+        return Ok(());
+    };
+    through_intake(cas, logs, result).await
+}
+
 /// Hashes both logs of `logs`, sets `result`'s stdout and stderr digests, and adds their
 /// records to `records` (a blob `records` holds already, or the other log, once only).
 /// The first log that cannot be hashed is the error.

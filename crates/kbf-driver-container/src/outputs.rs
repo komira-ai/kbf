@@ -71,7 +71,7 @@ use rustix::io::Errno;
 
 use crate::cas::FileBlob;
 use crate::hashing::{Digested, Job, Outcome, hash_all, read_through};
-use crate::logs::{Logs, add_to, missing_only, through_intake};
+use crate::logs::{Logs, after_outputs, missing_only, with_outputs};
 use crate::tree::{Exceeded, TreeError, check_relative};
 
 /// How much output one action may leave. An action past a limit fails with
@@ -453,9 +453,7 @@ pub(crate) async fn collect(
     let mut blobs = assemble(listing, &digested, &jobs, &upper_fd, result);
     let taken = digested.iter().filter(|d| d.taken).count();
     let plain = intake.is_none();
-    if let Some(logs) = logs.filter(|_| plain) {
-        add_to(&mut blobs, logs, result).await?;
-    }
+    with_outputs(&mut blobs, logs, plain, result).await?;
     let finishing = Instant::now();
     finish(intake).await?;
     let take_ms = finishing.elapsed().as_millis() as u64;
@@ -468,9 +466,7 @@ pub(crate) async fn collect(
     let sending = blobs.len();
     let stored = Instant::now();
     cas.put_records(blobs).await?;
-    if let Some(logs) = logs.filter(|_| !plain) {
-        through_intake(cas, logs, result).await?;
-    }
+    after_outputs(cas, logs, plain, result).await?;
     tracing::info!(
         files,
         blobs = count,

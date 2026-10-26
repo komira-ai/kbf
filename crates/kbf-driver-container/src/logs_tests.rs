@@ -3,11 +3,12 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use kbf_daemon::cas::{Cas, CasError, Chunks, Record, digest_of, label, proto_digest};
+use kbf_daemon::cas::{Cas, CasError, Chunks, Intake, Record, digest_of, label, proto_digest};
 use kbf_daemon::cpu_pool::CpuPool;
 use kbf_proto::reapi::{ActionResult, Digest};
 
 use crate::cas::MemoryCas;
+use crate::intake_tests::{Intaking, Recording};
 use crate::logs::{Logs, STDERR, STDOUT, store_both};
 use crate::outputs::{OutputLimits, collect};
 use crate::tree::{Exceeded, TreeError};
@@ -17,25 +18,38 @@ fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
     crate::unit_dir(&format!("logs-{name}"))
 }
 
-/// A store with no intake (like the transfer engine and a daemon's packed store) that
-/// records the digest labels of every `put_records` call and counts the blobs stored one
-/// at a time. It answers `missing` from what it holds.
+/// A store with no intake (like the transfer engine and a daemon's packed store), or with
+/// the recording intake of [`Plain::with_intake`], that records the digest labels of every
+/// `put_records` call and counts the blobs stored one at a time. It answers `missing` from
+/// what it holds. Both kinds are one type, so each function generic over the store runs
+/// every branch under one instantiation (the coverage gate counts a generic by its best).
 struct Plain {
-    cas: MemoryCas,
+    cas: Arc<MemoryCas>,
     groups: Mutex<Vec<Vec<String>>>,
     singles: AtomicUsize,
     /// Fails every `put_records`.
     fail: bool,
+    intake: Option<Arc<Recording>>,
 }
 
 impl Plain {
     fn new(fail: bool) -> Self {
         Self {
-            cas: MemoryCas::new(),
+            cas: Arc::new(MemoryCas::new()),
             groups: Mutex::default(),
             singles: AtomicUsize::new(0),
             fail,
+            intake: None,
         }
+    }
+
+    /// A store whose intake takes every file into its memory store, and the intake's
+    /// record of what it took.
+    fn with_intake() -> (Self, Arc<Recording>) {
+        let mut plain = Self::new(false);
+        let recording = Recording::new(Arc::clone(&plain.cas), false);
+        plain.intake = Some(Arc::clone(&recording));
+        (plain, recording)
     }
 
     fn groups(&self) -> Vec<Vec<String>> {
@@ -86,6 +100,11 @@ impl Cas for Plain {
             return Err(CasError::Write("records".to_owned(), "refused".to_owned()));
         }
         self.cas.put_records(records).await
+    }
+
+    fn intake(&self) -> Option<Arc<dyn Intake>> {
+        let recording = Arc::clone(self.intake.as_ref()?);
+        Some(Arc::new(Intaking(recording)))
     }
 }
 
@@ -206,22 +225,21 @@ async fn a_log_past_the_limit_is_refused_and_nothing_is_sent() {
 /// finished there, nothing reaches `put_chunks`, and the digests are the logs'.
 #[tokio::test]
 async fn with_an_intake_the_logs_go_through_it() {
-    use crate::intake_tests::Taker;
     let (upper, lease) = action("intake", b"to stdout", b"to stderr");
-    let taker = Taker::new(false);
-    let result = run(&taker, &upper, &lease, 100).await.expect("collected");
+    let (cas, recording) = Plain::with_intake();
+    let result = run(&cas, &upper, &lease, 100).await.expect("collected");
     let (out, err) = (digest_of(b"to stdout"), digest_of(b"to stderr"));
     assert_eq!(result.stdout_digest, Some(out.clone()));
     assert_eq!(result.stderr_digest, Some(err.clone()));
-    let finished: Vec<String> = taker
-        .recording
-        .finished()
-        .into_iter()
-        .map(|f| f.0)
-        .collect();
+    let finished: Vec<String> = recording.finished().into_iter().map(|f| f.0).collect();
     assert!(finished.contains(&label(&out)), "{finished:?}");
     assert!(finished.contains(&label(&err)), "{finished:?}");
-    assert!(taker.put().is_empty(), "{:?}", taker.put());
+    assert_eq!(
+        cas.groups().concat(),
+        Vec::<String>::new(),
+        "no blob sent in a call"
+    );
+    assert_eq!(cas.singles(), 0);
 }
 
 /// Asserts that a timed-out action's two logs are stored in one `put_records` call, and
@@ -271,7 +289,6 @@ async fn the_timeout_path_stores_both_logs_in_one_call() {
 /// one call that stores them fails; and that with an intake each goes through it.
 #[tokio::test]
 async fn the_timeout_path_leaves_logs_out_when_the_store_fails_and_uses_the_intake() {
-    use crate::intake_tests::Taker;
     let lease = scratch("timeout-fail");
     std::fs::write(lease.join(STDOUT), b"partial").expect("write");
     std::fs::write(lease.join(STDERR), b"more").expect("write");
@@ -283,19 +300,24 @@ async fn the_timeout_path_leaves_logs_out_when_the_store_fails_and_uses_the_inta
     assert_eq!(found, [None, None]);
     assert!(matches!(problems[..], [TreeError::Cas(_)]), "{problems:?}");
 
-    let taker = Taker::new(false);
-    let (found, problems) = store_both(&taker, &logs).await;
+    let (cas, _) = Plain::with_intake();
+    let (found, problems) = store_both(&cas, &logs).await;
     assert_eq!(
         found,
         [Some(digest_of(b"partial")), Some(digest_of(b"more"))]
     );
     assert!(problems.is_empty(), "{problems:?}");
-    assert!(taker.put().is_empty(), "{:?}", taker.put());
+    assert_eq!(
+        cas.groups().concat(),
+        Vec::<String>::new(),
+        "no blob sent in a call"
+    );
+    assert_eq!(cas.singles(), 0);
     let short = Logs {
         dir: &lease,
         max: 5,
     };
-    let (found, problems) = store_both(&taker, &short).await;
+    let (found, problems) = store_both(&cas, &short).await;
     assert_eq!(found[0], None);
     assert_eq!(problems.len(), 1);
 }
