@@ -403,6 +403,45 @@ fn a_vm_that_ends_in_an_error_is_not_a_power_off() {
     assert_eq!(r.details["outcome"], "vm-ended-early");
 }
 
+/// Catches a guest that reaches the `stopped` state (the framework's state change, not its
+/// stop event) being taken for a failed boot: it is the guest's own power-off, and an
+/// `error` state is not.
+#[test]
+fn a_vm_that_goes_to_state_stopped_is_a_power_off_and_one_in_error_is_not() {
+    for (state, status, outcome) in [
+        ("stopped", ReportStatus::Ok, "powered-off"),
+        ("error", ReportStatus::Error, "vm-ended-early"),
+    ] {
+        let work = work_with_base(&format!("prime-state-{state}"));
+        let sys = FakeSystem::new();
+        let mut script = powering_off(&all_ok());
+        script.events.pop();
+        sys.script(script.then(Poll::Event(Event::State {
+            state: state.into(),
+            ms: 50,
+        })));
+        let r = prime(&prime_ctx(&sys, &work), LONG);
+        assert_eq!(r.status, status, "{state}: {r:?}");
+        assert_eq!(r.details["outcome"], outcome, "{state}");
+    }
+}
+
+/// Catches a summary that is not ok with every step frame fine (nothing to list) losing
+/// the guest's own note: the reason repeats the note, not an empty list.
+#[test]
+fn a_summary_that_is_not_ok_with_no_failed_step_gives_the_guests_note() {
+    let work = work_with_base("prime-notok-note");
+    let sys = FakeSystem::new();
+    let mut frames = all_ok();
+    frames.pop();
+    frames.push(summary(false, false, n_steps()));
+    sys.script(powering_off(&frames));
+    let r = prime(&prime_ctx(&sys, &work), LONG);
+    assert_eq!(r.status, ReportStatus::Error, "{r:?}");
+    let reason = r.reason.expect("reason");
+    assert!(reason.contains("a step failed"), "{reason}");
+}
+
 /// Catches a helper that cannot be started leaving the share directories behind (the next
 /// run removes them, but a failure should not litter the base), or being reported as a
 /// timeout or a success.
