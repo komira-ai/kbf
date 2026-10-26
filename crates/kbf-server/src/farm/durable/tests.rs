@@ -2220,6 +2220,7 @@ fn farm_over(store: &Arc<Flaky>, mode: crate::LearnedSizes) -> Farm {
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
     )
+    .with_wall_epoch(u64::from(today()) * 86_400_000)
     .with_learned_sizes(mode, 4 << 30)
     .with_state(Some(crate::StateStore {
         store,
@@ -2230,12 +2231,9 @@ fn farm_over(store: &Arc<Flaky>, mode: crate::LearnedSizes) -> Farm {
     .expect("a farm over the store")
 }
 
+/// The day the farms of these tests are built on (their wall clock is fixed to it).
 fn today() -> u32 {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("after the epoch")
-        .as_secs();
-    u32::try_from(secs / 86_400).expect("a day")
+    20_000
 }
 
 /// Catches: `off` reading the size rows a `shadow` farm left (it must not even scan them: a
