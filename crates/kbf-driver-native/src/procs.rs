@@ -800,8 +800,10 @@ mod tests {
     #[test]
     fn a_group_seen_empty_is_not_signalled_by_its_id() {
         use std::os::unix::process::CommandExt as _;
-        let mut other = std::process::Command::new("/bin/sleep")
-            .arg("300")
+        // Waits for its stdin to close and exits 0 by itself: a signal shows as how it ended.
+        let mut other = std::process::Command::new("/bin/sh")
+            .args(["-c", "read line; exit 0"])
+            .stdin(std::process::Stdio::piped())
             .process_group(0)
             .spawn()
             .expect("spawn");
@@ -810,11 +812,9 @@ mod tests {
         let mut t = Tracker::new(pid, me);
         assert!(t.members(&[]).is_empty(), "seen empty");
         kill_all(&t, &[]);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let alive = other.try_wait().expect("try_wait").is_none();
-        other.kill().expect("kill");
-        other.wait().expect("reap");
-        assert!(alive, "the group was signalled by its id");
+        drop(other.stdin.take());
+        let status = other.wait().expect("reap");
+        assert_eq!(status.code(), Some(0), "the group was signalled by its id");
     }
 
     /// Catches: a snapshot that misses this very process or reads its parent wrong,

@@ -309,12 +309,13 @@ impl Gate {
         keeper: KeeperFor,
         wait: std::time::Duration,
     ) -> io::Result<Spawned> {
-        let give_up = std::time::Instant::now() + wait;
+        // Tokio's clock, so that a test on a paused one runs the wait without waiting.
+        let give_up = tokio::time::Instant::now() + wait;
         loop {
             match self.spawn(command, record, keeper) {
                 Err(e)
                     if e.raw_os_error() == Some(libc::ETXTBSY)
-                        && std::time::Instant::now() < give_up =>
+                        && tokio::time::Instant::now() < give_up =>
                 {
                     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                 }
@@ -761,7 +762,7 @@ mod tests {
     /// descriptor is open, `spawn_unbusy` waits for it to close and runs the program,
     /// and it gives up with ETXTBSY if the descriptor outlives `wait`.
     #[cfg(target_os = "linux")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_busy_program_is_waited_for() {
         let dir = dir("busy");
         let record = dir.join("lease-1-3");

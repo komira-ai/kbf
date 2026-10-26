@@ -147,6 +147,7 @@ pub mod home;
 mod keeper;
 pub mod mounts;
 pub mod network;
+mod pace;
 pub mod procs;
 mod program;
 mod record;
