@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_daemon::{LocalMember, MapHolder, PackedCas, RemoteIndex};
+use kbf_daemon::{LocalMember, MapHolder, PackCounter, PackedCas, RemoteIndex};
 use kbf_objstore::Capabilities;
 use kbf_objstore::s3::{Credentials, S3Config, S3Store};
 use kbf_pack::{ReadCache, Reader, ReaderConfig};
@@ -180,11 +180,13 @@ impl PackReadArgs {
 pub(crate) fn start(cli: &Cli, settings: PackRead) -> Result<NodeHandle, Error> {
     let maps = Arc::new(MapHolder::new());
     let held = Arc::clone(&maps);
+    let counter = PackCounter::default();
+    let counted = counter.clone();
     let node = start_over(cli, Some(Arc::clone(&maps)), move |cli, liveness| {
         let plane = farm(cli, &held, liveness);
-        plane.and_then(|(plane, _)| over(cli, &settings, plane, transfer::endpoint))
+        plane.and_then(|(plane, _)| over(cli, &settings, plane, transfer::endpoint, &counted))
     })?;
-    Ok(node.checking_reach(maps, None))
+    Ok(counting(node, counter).checking_reach(maps, None))
 }
 
 /// [`super::start_member`] for `--pack-read`: the daemon half's data plane is the node's member
@@ -198,15 +200,24 @@ pub(crate) fn start_member(
     let maps = Arc::new(MapHolder::new());
     let held = Arc::clone(&maps);
     let own = local.addr().to_owned();
+    let counter = PackCounter::default();
+    let counted = counter.clone();
     let node = start_over(cli, Some(Arc::clone(&maps)), move |cli, liveness| {
         let plane = member(cli, &held, &local, liveness);
-        plane.and_then(|plane| over(cli, &settings, plane, transfer::server_endpoint))
+        plane.and_then(|plane| over(cli, &settings, plane, transfer::server_endpoint, &counted))
     })?;
-    Ok(node.checking_reach(maps, Some(own)))
+    Ok(counting(node, counter).checking_reach(maps, Some(own)))
+}
+
+/// `node`, its daemon putting the counts of `counter` in every heartbeat: the plane counts
+/// into `counter` as reads are made, so a heartbeat before the first read says zeros.
+fn counting(mut node: NodeHandle, counter: PackCounter) -> NodeHandle {
+    node.daemon = node.daemon.with_pack_reads(counter);
+    node
 }
 
 /// `plane`, its reads going to the packs `settings` names first, the frontend asked over the
-/// connection `locate` makes.
+/// connection `locate` makes, counting into `counter`.
 ///
 /// # Errors
 /// The credentials file, the endpoint, the bucket, the read cache's directory or the TLS
@@ -216,8 +227,10 @@ fn over<C: Cas>(
     settings: &PackRead,
     plane: Arc<C>,
     locate: Locate,
+    counter: &PackCounter,
 ) -> Result<Arc<PackedCas<C>>, Error> {
-    pack_reader(cli, settings, locate).map(|packs| Arc::new(PackedCas::new(plane, packs)))
+    let packs = pack_reader(cli, settings, locate)?;
+    Ok(Arc::new(PackedCas::with_counter(plane, packs, counter)))
 }
 
 /// The reader of the packs of `settings`, logged as the one the plane reads with. Not generic,

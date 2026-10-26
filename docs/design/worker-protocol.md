@@ -336,7 +336,12 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
 - `report_hash`, equal to the newest `Hello`'s, so the server can notice a changed
   report without receiving it again (comparing it is **planned**);
 - `running`: every lease the daemon holds, meaning leases running now **and** leases
-  whose `Result` the server has not acknowledged yet.
+  whose `Result` the server has not acknowledged yet;
+- `pack_reads` (optional): the counts of the daemon's pack reads since its process started
+  (`PackReadCounts`: `served`, `served_bytes`, `elsewhere`, `unasked`, `lost`, `damaged`),
+  present only on a daemon started with `--pack-read`. A daemon without the flag, and one built
+  before the field, send none, and a server built before it skips the field. The server keeps the
+  newest of each node for `GET /metrics` (`kbf_pack_daemon_*`, [api.md](../api.md#get-metrics)).
 
 The server acknowledges a heartbeat with `HeartbeatAck { seq }`, but only one from the
 node's newest stream. A heartbeat from a replaced stream is dropped unacknowledged, so

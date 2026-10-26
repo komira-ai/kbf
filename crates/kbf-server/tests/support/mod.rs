@@ -25,8 +25,8 @@ use kbf_proto::reapi::{
     Platform, batch_update_blobs_request, platform,
 };
 use kbf_proto::worker::{
-    Capability, DaemonMessage, Heartbeat, Hello, LeaseId, LeaseOffer, NodeStatus, ResultAck,
-    ServerMessage, Start, daemon_message, server_message, worker_client::WorkerClient,
+    Capability, DaemonMessage, Heartbeat, Hello, LeaseId, LeaseOffer, NodeStatus, PackReadCounts,
+    ResultAck, ServerMessage, Start, daemon_message, server_message, worker_client::WorkerClient,
 };
 use kbf_server::token::ApiToken;
 use kbf_server::{
@@ -1141,19 +1141,28 @@ impl FakeDaemon {
     /// Sends a heartbeat listing `running` and returns whether it was acknowledged
     /// within [`QUIET`].
     pub async fn heartbeat(&mut self, running: &[LeaseId]) -> bool {
+        let seq = self.beat(running, None);
+        self.expect_within(QUIET, ack_of(seq)).await.is_some()
+    }
+
+    /// Sends a heartbeat listing `running` and carrying the pack-read counts `pack_reads`, and
+    /// waits for its acknowledgement for as long as [`PROMPT`], a bound on failure only.
+    pub async fn beat_acked(&mut self, running: &[LeaseId], pack_reads: Option<PackReadCounts>) {
+        let seq = self.beat(running, pack_reads);
+        self.expect("HeartbeatAck", ack_of(seq)).await;
+    }
+
+    /// Sends a heartbeat with the next sequence number; the number.
+    fn beat(&mut self, running: &[LeaseId], pack_reads: Option<PackReadCounts>) -> u64 {
         self.seq += 1;
         let seq = self.seq;
         self.send(daemon_message::Message::Heartbeat(Heartbeat {
             seq,
             report_hash: Vec::new(),
             running: running.to_vec(),
+            pack_reads,
         }));
-        self.expect_within(QUIET, |m| match m {
-            server_message::Message::HeartbeatAck(a) if a.seq == seq => Some(()),
-            _ => None,
-        })
-        .await
-        .is_some()
+        seq
     }
 
     /// Sends `result` and returns the server's acknowledgement.
@@ -1165,6 +1174,14 @@ impl FakeDaemon {
             _ => None,
         })
         .await
+    }
+}
+
+/// Picks the `HeartbeatAck` of the heartbeat numbered `seq`.
+fn ack_of(seq: u64) -> impl FnMut(&server_message::Message) -> Option<()> {
+    move |m| match m {
+        server_message::Message::HeartbeatAck(a) if a.seq == seq => Some(()),
+        _ => None,
     }
 }
 

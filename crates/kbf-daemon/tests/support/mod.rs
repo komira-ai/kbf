@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use kbf_daemon::{
-    Clock, Daemon, DaemonConfig, DriverReport, Event, FakeRuntime, Moment, NodeReport, Runtime,
-    Runtimes, TlsFiles,
+    Clock, Daemon, DaemonConfig, DriverReport, Event, FakeRuntime, Moment, NodeReport, PackCounter,
+    Runtime, Runtimes, TlsFiles,
 };
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{
@@ -894,6 +894,31 @@ impl<R: Runtime> Harness<R> {
         .await
     }
 
+    /// Starts a server and a daemon running leases through `runtime` that put the counts
+    /// of `packs` in every heartbeat ([`Daemon::with_pack_reads`]). It checks the fence
+    /// every 20 ms.
+    pub async fn with_pack_reads(name: &str, runtime: Arc<R>, packs: PackCounter) -> Self {
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let configure = |config: &mut DaemonConfig| {
+            config.recheck_every = Duration::from_millis(20);
+        };
+        Self::build_all(
+            name,
+            runtimes,
+            runtime,
+            Duration::from_secs(40),
+            configure,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(packs),
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn build_with(
         name: &str,
@@ -907,6 +932,38 @@ impl<R: Runtime> Harness<R> {
         pressure: Option<(tokio::sync::watch::Receiver<Option<f64>>, f64)>,
         map: Option<Arc<kbf_mapsync::MapHolder>>,
         drain: Option<(mpsc::UnboundedReceiver<()>, Option<Duration>)>,
+    ) -> Self {
+        Self::build_all(
+            name,
+            runtimes,
+            runtime,
+            fence_after,
+            configure,
+            clock,
+            driver,
+            phase,
+            pressure,
+            map,
+            drain,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_all(
+        name: &str,
+        runtimes: Runtimes,
+        runtime: Arc<R>,
+        fence_after: Duration,
+        configure: impl FnOnce(&mut DaemonConfig),
+        clock: Option<Arc<dyn Clock>>,
+        driver: Option<tokio::sync::watch::Receiver<DriverReport>>,
+        phase: Option<tokio::sync::watch::Receiver<kbf_types::NodePhase>>,
+        pressure: Option<(tokio::sync::watch::Receiver<Option<f64>>, f64)>,
+        map: Option<Arc<kbf_mapsync::MapHolder>>,
+        drain: Option<(mpsc::UnboundedReceiver<()>, Option<Duration>)>,
+        packs: Option<PackCounter>,
     ) -> Self {
         let pki = pki(name);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -964,6 +1021,11 @@ impl<R: Runtime> Harness<R> {
         }
         if let Some(holder) = map {
             daemon = daemon.with_map(holder);
+        }
+        assert!(daemon.pack_reads().is_none());
+        if let Some(packs) = packs {
+            daemon = daemon.with_pack_reads(packs);
+            assert!(daemon.pack_reads().is_some());
         }
         let daemon = match drain {
             Some((signals, Some(deadline))) => tokio::spawn(daemon.run_draining(signals, deadline)),

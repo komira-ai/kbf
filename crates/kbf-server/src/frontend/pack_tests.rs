@@ -9,19 +9,24 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::Arc;
 
+use futures::channel::mpsc::{UnboundedSender, unbounded};
 use kbf_objstore::s3::fake::FakeS3;
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_proto::reapi::{
     self, BatchReadBlobsRequest, BatchUpdateBlobsRequest, FindMissingBlobsRequest,
     batch_update_blobs_request,
 };
+use kbf_proto::worker::{
+    Capability, DaemonMessage, Heartbeat, Hello, PackReadCounts, ServerMessage, daemon_message,
+    server_message, worker_client::WorkerClient,
+};
 use kbf_state::pack_index::memory::MemoryPackIndex;
 use kbf_state::{BlobDigest, ManualClock, PackIndex};
 use kbf_types::Digest;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
-use tonic::Code;
 use tonic::transport::{Channel, Endpoint};
+use tonic::{Code, Streaming};
 
 use super::{FrontendFlags, FrontendHandle, Prepared, boxed, command, parse};
 use crate::test_dir::scratch_dir;
@@ -199,6 +204,135 @@ async fn a_frontend_without_the_pack_flags_keeps_nothing_in_packs() {
     assert!(located[0].is_none());
     let text = scrape(api).await;
     assert!(!text.contains("kbf_pack_"), "{text}");
+    served.abort();
+}
+
+/// A daemon's session on a worker listener: the stream it sends on and the one it listens on.
+struct Daemon {
+    tx: UnboundedSender<DaemonMessage>,
+    inbound: Streaming<ServerMessage>,
+    seq: u64,
+}
+
+impl Daemon {
+    /// A session for `node` at `addr`, past its Hello and the server's Welcome.
+    async fn open(addr: SocketAddr, node: &str) -> Self {
+        let capability = |key: &str, value: &str| Capability {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        };
+        let hello = Hello {
+            protocol_version: 1,
+            node_id: node.to_owned(),
+            capabilities: vec![
+                capability("cpus", "4"),
+                capability("mem_gib", "8"),
+                capability("arch", "x86_64"),
+                capability("os", "linux"),
+                capability("drivers", "fake"),
+            ],
+            instance_id: format!("{node}-daemon"),
+            ..Hello::default()
+        };
+        let endpoint = Endpoint::from_shared(format!("http://{addr}")).expect("endpoint");
+        let channel = endpoint.connect().await.expect("connects");
+        let (tx, rx) = unbounded();
+        let first = DaemonMessage {
+            message: Some(daemon_message::Message::Hello(hello)),
+        };
+        tx.unbounded_send(first).expect("queued");
+        let response = WorkerClient::new(channel).session(rx).await;
+        let mut inbound = response.expect("a session").into_inner();
+        let welcome = inbound
+            .message()
+            .await
+            .expect("healthy")
+            .expect("a message");
+        let ok = matches!(welcome.message, Some(server_message::Message::Welcome(_)));
+        assert!(ok, "{welcome:?}");
+        Self {
+            tx,
+            inbound,
+            seq: 0,
+        }
+    }
+
+    /// Sends a heartbeat carrying `pack_reads` and waits for the server's acknowledgement of it.
+    async fn beat(&mut self, pack_reads: Option<PackReadCounts>) {
+        self.seq += 1;
+        let beat = Heartbeat {
+            seq: self.seq,
+            pack_reads,
+            ..Heartbeat::default()
+        };
+        let message = DaemonMessage {
+            message: Some(daemon_message::Message::Heartbeat(beat)),
+        };
+        self.tx.unbounded_send(message).expect("queued");
+        loop {
+            let received = self.inbound.message().await;
+            let message = received.expect("healthy").expect("a message");
+            if let Some(server_message::Message::HeartbeatAck(ack)) = message.message {
+                assert_eq!(ack.seq, self.seq);
+                return;
+            }
+        }
+    }
+}
+
+/// Asserts that a frontend puts the pack-read counts its daemons send on their heartbeats on
+/// `GET /metrics`, as the `kbf_pack_daemon_*` counters of the node that sent them: none of them
+/// is there before a daemon has sent any, a node that sent none has no sample, the newest counts
+/// of a node are the ones shown, and a node whose next heartbeat carries none loses its samples.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_exports_the_pack_reads_its_daemons_report() {
+    let flags = flags_of(&[]);
+    let handle = started(&flags, Some(index())).expect("starts");
+    let (worker, api) = (handle.worker, handle.api.expect("the operator API"));
+    let served = tokio::spawn(handle.serve());
+    let text = scrape(api).await;
+    assert!(!text.contains("kbf_pack_daemon_"), "{text}");
+
+    let mut reading = Daemon::open(worker, "node-a").await;
+    let mut plain = Daemon::open(worker, "node-b").await;
+    let counts = PackReadCounts {
+        served: 5,
+        served_bytes: 4096,
+        elsewhere: 2,
+        unasked: 1,
+        lost: 3,
+        damaged: 4,
+    };
+    reading.beat(Some(counts)).await;
+    plain.beat(None).await;
+    let text = scrape(api).await;
+    for (family, want) in [
+        ("served", 5),
+        ("served_bytes", 4096),
+        ("elsewhere", 2),
+        ("unasked", 1),
+        ("lost", 3),
+        ("damaged", 4),
+    ] {
+        let header = format!("# TYPE kbf_pack_daemon_{family}_total counter\n");
+        assert!(text.contains(&header), "{header}{text}");
+        let sample = format!("kbf_pack_daemon_{family}_total{{node=\"node-a\"}} {want}\n");
+        assert!(text.contains(&sample), "{sample}{text}");
+    }
+    assert!(!text.contains("node=\"node-b\""), "{text}");
+
+    let newer = PackReadCounts {
+        served: 6,
+        ..counts
+    };
+    reading.beat(Some(newer)).await;
+    let text = scrape(api).await;
+    let sample = "kbf_pack_daemon_served_total{node=\"node-a\"} 6\n";
+    assert!(text.contains(sample), "{text}");
+
+    reading.beat(None).await;
+    let text = scrape(api).await;
+    assert!(!text.contains("kbf_pack_daemon_"), "{text}");
     served.abort();
 }
 

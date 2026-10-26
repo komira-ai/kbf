@@ -336,6 +336,32 @@ message Heartbeat {
   // this set must also include leases whose result is not yet acknowledged.
   // Issue #25: only the first Hello of a stream registers the worker again.
   repeated LeaseId running = 3;
+  // What this daemon's pack reads did since the daemon process started. Present only
+  // when the daemon reads packs (`--pack-read`): a daemon that does not, or one built
+  // before the field, sends none, and a server built before it skips the field.
+  PackReadCounts pack_reads = 4;
+}
+
+// The counts of a daemon's pack reads, cumulative since the daemon process started (they
+// start again from 0 when it restarts). Each read of a blob by digest (for a lease's
+// action, input tree or input files) adds 1 to exactly one of served, elsewhere, unasked,
+// lost and damaged; served_bytes adds the bytes of a served blob.
+message PackReadCounts {
+  // Reads answered from a pack.
+  uint64 served = 1;
+  // The bytes of the blobs those reads returned.
+  uint64 served_bytes = 2;
+  // Reads of a blob no pack holds (or that is not asked of the packs), or from a
+  // frontend that serves no locations: the read went to the storage nodes, as it did
+  // before packs.
+  uint64 elsewhere = 3;
+  // Reads that went to the storage nodes because the packs could not be asked (the
+  // index or the object store failed).
+  uint64 unasked = 4;
+  // Reads that failed because the pack the index points at is gone or too short.
+  uint64 lost = 5;
+  // Reads that failed because the bytes in the pack are not the digest.
+  uint64 damaged = 6;
 }
 
 // The server's acknowledgement of a Heartbeat.
