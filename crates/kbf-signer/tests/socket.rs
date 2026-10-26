@@ -105,6 +105,42 @@ fn a_certificate_signed_through_the_socket_verifies_against_the_root() {
     );
 }
 
+// Catches: enrolling an updater failing in production custody: the certificate the
+// authority builds for each host role is signed through the real signer socket, verifies
+// under the root, and carries the role, the host role and the node.
+#[test]
+fn an_updater_certificate_for_each_host_role_is_signed_through_the_socket() {
+    let ca = make_ca("updater");
+    let socket = serve(&ca, euid());
+    let client = Arc::new(SocketSigner::connect(&socket, Route::Node).expect("connect"));
+    let authority = Authority::import(client, Policy::default(), &ca.root).expect("authority");
+    let id = "host-a".parse().expect("id");
+    for (n, host_role) in kbf_types::HostRole::ALL.into_iter().enumerate() {
+        let key = support::fresh_key();
+        let issued = authority
+            .issue_updater(
+                &kbf_ca::UpdaterCert {
+                    node_id: &id,
+                    host_role,
+                    key: &key,
+                },
+                NOW,
+                &mut Stream(20 + n as u64),
+            )
+            .unwrap_or_else(|e| panic!("{host_role}: {e:?}"));
+        let (_, leaf) = X509Certificate::from_der(&issued.der).expect("leaf");
+        let (_, root) = X509Certificate::from_der(&ca.root).expect("root");
+        leaf.verify_signature(Some(root.public_key()))
+            .expect("verifies under the root");
+        let san = format!("{:?}", leaf.subject_alternative_name().expect("san"));
+        assert!(san.contains("urn:kbf:role:updater"), "{san}");
+        assert!(
+            san.contains(&format!("urn:kbf:host-role:{}", host_role.name())),
+            "{san}"
+        );
+    }
+}
+
 // Catches: the frontend's own certificate unreachable (the frontend route), and the
 // frontend route used to mint a node certificate.
 #[test]
