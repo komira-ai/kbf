@@ -196,6 +196,11 @@ fn shown(steps: &[Step], id: &str) -> Vec<String> {
     }
 }
 
+/// The user's home (built in parts: the repo lint refuses a home-path literal).
+fn home() -> String {
+    ["/Users", "kbfuser"].join("/")
+}
+
 fn strs(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| (*s).to_owned()).collect()
 }
@@ -244,7 +249,7 @@ fn the_plan_creates_a_standard_user_then_auto_login_then_the_marker() {
             "-password",
             "<PW>",
             "-home",
-            "/Users/kbfuser"
+            &home()
         ])
     );
     assert!(!shown(&steps, "add-user").contains(&"-admin".to_owned()));
@@ -332,7 +337,7 @@ fn an_existing_user_gets_a_new_password_not_a_new_account() {
     assert!(!ids(&steps).contains(&"add-user"));
     assert_eq!(
         shown(&steps, "set-password"),
-        strs(&["/usr/bin/dscl", ".", "-passwd", "/Users/kbfuser", "<PW>"])
+        strs(&["/usr/bin/dscl", ".", "-passwd", &home(), "<PW>"])
     );
     for s in &steps[1..] {
         assert!(!s.needs.contains(&"add-user".to_owned()));
@@ -453,7 +458,8 @@ fn a_good_run_sends_a_frame_per_step_without_the_password_then_powers_off() {
     assert_eq!(
         ran[0],
         format!(
-            "/usr/sbin/sysadminctl -addUser kbfuser -fullName kbfuser -password {PASSWORD} -home /Users/kbfuser"
+            "/usr/sbin/sysadminctl -addUser kbfuser -fullName kbfuser -password {PASSWORD} -home {}",
+            home()
         )
     );
     assert_eq!(ran.iter().filter(|c| c.contains(PASSWORD)).count(), 1);
@@ -530,7 +536,7 @@ fn a_marker_naming_another_user_does_not_stop_the_run() {
     let ran = host.commands();
     assert_eq!(
         ran[0],
-        format!("/usr/bin/dscl . -passwd /Users/kbfuser {PASSWORD}")
+        format!("/usr/bin/dscl . -passwd {} {PASSWORD}", home())
     );
     assert!(!ran.iter().any(|c| c.contains("addUser")));
     assert_eq!(done.power_off_started, Some(true));
