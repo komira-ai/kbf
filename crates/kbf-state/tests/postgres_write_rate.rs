@@ -90,8 +90,11 @@ const PINNED_INSTANCE: &str = "6d61696e";
 /// How long the `done/` and `doneof/` rows are kept (the farm's floor for them).
 const DONE_TTL: Duration = Duration::from_secs(600);
 
-/// How long the writers of a run work at most: far more than a run takes.
-const RUN_LIMIT: Duration = Duration::from_secs(120);
+/// The hang guard of the measurement alone: far more than a run takes. A run that reaches
+/// it has hung (a lost write that nothing will finish), and the measurement panics saying
+/// so. The gated test has no such limit: its writers stop when every operation is finished
+/// or a writer has failed.
+const HANG_GUARD: Duration = Duration::from_secs(120);
 
 /// A page of the change feed that holds every row of a run.
 const FEED_PAGE: usize = 100_000;
@@ -293,12 +296,13 @@ struct Job {
     failed: AtomicBool,
     /// The writer that won the claim of each operation.
     claims: Mutex<BTreeMap<u64, usize>>,
-    /// When the writers give up, so that a lost write fails the run and does not hang it.
-    deadline: Instant,
+    /// When the writers give up as hung ([`HANG_GUARD`]); `None` in the gated test, whose
+    /// writers stop only when every operation is finished or one has failed.
+    hang_guard: Option<Instant>,
 }
 
 impl Job {
-    fn new(each: usize, writers: usize) -> Job {
+    fn new(each: usize, writers: usize, hang_guard: Option<Duration>) -> Job {
         Job {
             each,
             total: each * writers,
@@ -306,17 +310,21 @@ impl Job {
             finished: AtomicUsize::new(0),
             failed: AtomicBool::new(false),
             claims: Mutex::new(BTreeMap::new()),
-            deadline: Instant::now() + RUN_LIMIT,
+            hang_guard: hang_guard.map(|limit| Instant::now() + limit),
         }
     }
 
-    /// Whether the writers still have work: an operation is unfinished, none failed and the
-    /// time of the run is not out.
+    /// Whether the writers still have work: an operation is unfinished, none failed and,
+    /// in the measurement, the hang guard has not run out.
     fn open(&self) -> bool {
         let done = self.finished.load(Ordering::SeqCst) >= self.total;
         let failed = self.failed.load(Ordering::SeqCst);
-        let late = Instant::now() >= self.deadline;
-        !(done | failed | late)
+        !(done | failed | self.hung())
+    }
+
+    /// Whether the hang guard has run out: never in the gated test.
+    fn hung(&self) -> bool {
+        self.hang_guard.is_some_and(|at| Instant::now() >= at)
     }
 
     /// Notes that `writer` won the claim of `op`.
@@ -398,11 +406,17 @@ struct Report {
 }
 
 /// Runs `operations` through `frontends` frontends of `writers` threads each. `operations`
-/// is cut down to a multiple of the threads.
-fn run(frontends: usize, writers: usize, operations: usize) -> Report {
+/// is cut down to a multiple of the threads. With a `hang_guard`, a run still unfinished
+/// when it runs out panics as hung.
+fn run(
+    frontends: usize,
+    writers: usize,
+    operations: usize,
+    hang_guard: Option<Duration>,
+) -> Report {
     let rig = Rig::new(frontends);
     let threads = frontends * writers;
-    let job = Job::new(operations / threads, threads);
+    let job = Job::new(operations / threads, threads, hang_guard);
     let started = Instant::now();
     let all: Vec<Seen> = thread::scope(|scope| {
         let spawned: Vec<_> = (0..threads)
@@ -418,6 +432,14 @@ fn run(frontends: usize, writers: usize, operations: usize) -> Report {
             .collect()
     });
     let elapsed = started.elapsed();
+    let finished = job.finished.load(Ordering::SeqCst);
+    if finished < job.total {
+        assert!(
+            !job.hung(),
+            "the run hung: {finished} of {} operations finished when the hang guard ran out",
+            job.total
+        );
+    }
     let mut seen = Seen::default();
     for one in all {
         seen.latencies.extend(one.latencies);
@@ -506,7 +528,12 @@ impl Report {
 fn the_write_rate_of_one_two_and_three_frontends() {
     println!("target: {TARGET_WRITES_PER_SECOND} writes/s in bursts (not asserted)");
     for frontends in FRONTENDS {
-        let report = run(frontends, WRITERS_PER_FRONTEND, MEASURED_OPERATIONS);
+        let report = run(
+            frontends,
+            WRITERS_PER_FRONTEND,
+            MEASURED_OPERATIONS,
+            Some(HANG_GUARD),
+        );
         report.assert_finished();
         report.print();
     }
@@ -535,7 +562,7 @@ fn a_lost_claim_writes_nothing_and_three_frontends_finish_every_operation_once()
     let by_op = first.scan_prefix("lease-by-op/").expect("the store scans");
     assert_eq!(by_op.len(), 1);
 
-    let report = run(3, 2, 30);
+    let report = run(3, 2, 30, None);
     report.assert_finished();
     // The measurement's own report, so that the code it runs stays covered and compiling.
     report.print();
