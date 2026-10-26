@@ -65,6 +65,10 @@ pub enum Op {
     /// Ask the sandbox whether Launch Services may open an application (`sandbox_check`
     /// of `lsopen`).
     LsOpen,
+    /// Ask the sandbox whether the protected stores
+    /// ([`crate::network::PROTECTED_STORES`]) may be read or written (`sandbox_check` of
+    /// `file-read-data` and `file-write-data` on each).
+    ReadProtected,
     /// Mount a `devfs` on a directory of the lease (`mount(2)`).
     Mount,
     /// Bootstrap a `Background` `KeepAlive` launchd agent whose file is in the lease
@@ -81,7 +85,7 @@ impl Op {
                 &[Refusal::Errno(libc::EPERM), Refusal::Errno(libc::EACCES)]
             }
             Self::MachRegister => &[Refusal::Kern(doors::BOOTSTRAP_NOT_PRIVILEGED)],
-            Self::LsOpen => &[Refusal::Sandbox(1)],
+            Self::LsOpen | Self::ReadProtected => &[Refusal::Sandbox(1)],
             Self::Mount => &[Refusal::Errno(libc::EPERM)],
             Self::LaunchdBootstrap => &[Refusal::Bootstrap(doors::BOOTSTRAP_IO_ERROR)],
         }
@@ -120,6 +124,11 @@ pub const CANARIES: &[Canary] = &[
         name: "lsopen",
         deny: "(deny lsopen)",
         op: Op::LsOpen,
+    },
+    Canary {
+        name: "read-protected",
+        deny: crate::network::PROTECTED_DENY,
+        op: Op::ReadProtected,
     },
     Canary {
         name: "file-mount",
@@ -173,6 +182,12 @@ pub trait Fs {
     /// # Errors
     /// The question cannot be asked on this platform.
     fn sandbox_denies(&self, operation: &str) -> io::Result<bool>;
+    /// Whether the sandbox of this process denies `operation` on `path` (`sandbox_check`
+    /// with a path filter).
+    ///
+    /// # Errors
+    /// The question cannot be asked on this platform.
+    fn sandbox_denies_path(&self, operation: &str, path: &Path) -> io::Result<bool>;
     /// Mounts a `devfs` on the directory `dir` (`mount(2)`).
     ///
     /// # Errors
@@ -239,6 +254,10 @@ impl Fs for RealFs {
         doors::sandbox_denies(operation)
     }
 
+    fn sandbox_denies_path(&self, operation: &str, path: &Path) -> io::Result<bool> {
+        doors::sandbox_denies_path(operation, path)
+    }
+
     fn mount_devfs(&self, dir: &Path) -> io::Result<()> {
         doors::mount_devfs(dir)
     }
@@ -290,6 +309,7 @@ pub fn probe(fs: &dyn Fs, op: Op, lease: &Path) -> Seen {
         }
         Op::MachRegister => return doors::mach_register(fs),
         Op::LsOpen => return doors::ls_open(fs),
+        Op::ReadProtected => return doors::read_protected(fs),
         Op::Mount => return doors::mount(fs, &lease.join(MOUNT_NAME)),
         Op::LaunchdBootstrap => return doors::bootstrap(fs, &lease.join(JOB_NAME)),
     };
@@ -581,6 +601,9 @@ mod tests {
         kern: i32,
         /// What the sandbox is asked: denies, allows, or cannot be asked.
         denies: Option<bool>,
+        /// What the sandbox is asked about a path: the operations it denies on the paths
+        /// (an operation not listed is allowed), or `None` when it cannot be asked.
+        path_denies: Option<&'static [&'static str]>,
         /// What mounting a `devfs` answers.
         mount: Answer,
         /// What unmounting answers.
@@ -597,6 +620,7 @@ mod tests {
                 out: Out::default(),
                 kern: 0,
                 denies: Some(false),
+                path_denies: Some(&[]),
                 mount: || Ok(()),
                 unmount: || Ok(()),
                 no_tools: false,
@@ -651,6 +675,16 @@ mod tests {
             self.note(format!("sandbox_denies {operation}"));
             self.denies.ok_or_else(|| io::Error::other("cannot ask"))
         }
+        fn sandbox_denies_path(&self, operation: &str, path: &Path) -> io::Result<bool> {
+            self.note(format!(
+                "sandbox_denies_path {operation} {}",
+                path.display()
+            ));
+            let denied = self
+                .path_denies
+                .ok_or_else(|| io::Error::other("cannot ask"))?;
+            Ok(denied.contains(&operation))
+        }
         fn mount_devfs(&self, dir: &Path) -> io::Result<()> {
             self.note(format!("mount_devfs {}", dir.display()));
             (self.mount)()
@@ -692,6 +726,10 @@ mod tests {
             (Op::MachRegister, World::Broken) => fake.kern = 1102,
             (Op::LsOpen, World::Shut) => fake.denies = Some(true),
             (Op::LsOpen, World::Broken) => fake.denies = None,
+            (Op::ReadProtected, World::Shut) => {
+                fake.path_denies = Some(&["file-read-data", "file-write-data"]);
+            }
+            (Op::ReadProtected, World::Broken) => fake.path_denies = None,
             (Op::Mount, World::Shut) => fake.mount = || errno(libc::EPERM),
             (Op::Mount, World::Broken) => fake.mount = || errno(libc::ENOENT),
             (Op::LaunchdBootstrap, World::Shut) => {
@@ -834,6 +872,45 @@ mod tests {
         let (seen, _) = calls(Op::LsOpen, World::Shut);
         assert_eq!(seen, Seen::Refused(Refusal::Sandbox(1)));
 
+        let (seen, got) = calls(Op::ReadProtected, World::Open);
+        assert_eq!(
+            (seen, got),
+            (
+                Seen::Allowed,
+                vec![
+                    "sandbox_denies_path file-read-data /private/var/protected/sfanalytics"
+                        .to_owned()
+                ]
+            ),
+            "the first question answered allowed ends the probe"
+        );
+        let (seen, got) = calls(Op::ReadProtected, World::Shut);
+        assert_eq!(seen, Seen::Refused(Refusal::Sandbox(1)));
+        assert_eq!(got.len(), 4, "{got:?}");
+        for store in crate::network::PROTECTED_STORES {
+            for operation in ["file-read-data", "file-write-data"] {
+                assert!(
+                    got.contains(&format!("sandbox_denies_path {operation} {store}")),
+                    "{operation} {store}: {got:?}"
+                );
+            }
+        }
+
+        // A store that is read-denied and not write-denied (or the reverse) is an open door.
+        for only in ["file-read-data", "file-write-data"] {
+            let mut half = world(Op::ReadProtected, World::Open);
+            half.path_denies = Some(if only == "file-read-data" {
+                &["file-read-data"]
+            } else {
+                &["file-write-data"]
+            });
+            assert_eq!(
+                probe(&half, Op::ReadProtected, lease),
+                Seen::Allowed,
+                "{only}"
+            );
+        }
+
         let mount = "/lease/.kbf-canary-mount";
         let (seen, got) = calls(Op::Mount, World::Open);
         assert_eq!(seen, Seen::Allowed);
@@ -933,6 +1010,7 @@ mod tests {
         for op in [
             Op::MachRegister,
             Op::LsOpen,
+            Op::ReadProtected,
             Op::Mount,
             Op::LaunchdBootstrap,
         ] {
@@ -969,7 +1047,7 @@ mod tests {
         let seen = probe(&fake, Op::LaunchdBootstrap, lease);
         assert!(matches!(seen, Seen::Failed(_)), "{seen:?}");
         #[cfg(not(target_os = "macos"))]
-        for op in [Op::MachRegister, Op::LsOpen] {
+        for op in [Op::MachRegister, Op::LsOpen, Op::ReadProtected] {
             let seen = probe(&RealFs, op, lease);
             assert!(matches!(seen, Seen::Failed(_)), "{op:?}: {seen:?}");
         }
@@ -1011,6 +1089,7 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         for off_a_mac in [
             RealFs.sandbox_denies("lsopen").map(drop),
+            RealFs.sandbox_denies_path("file-read-data", dir).map(drop),
             RealFs.mount_devfs(dir),
             RealFs.unmount(dir),
         ] {
@@ -1130,6 +1209,7 @@ mod tests {
         let exact = |name: &str| row(name).op.refusals();
         assert_eq!(exact("mach-register"), [Refusal::Kern(1100)]);
         assert_eq!(exact("lsopen"), [Refusal::Sandbox(1)]);
+        assert_eq!(exact("read-protected"), [Refusal::Sandbox(1)]);
         assert_eq!(exact("file-mount"), [Refusal::Errno(libc::EPERM)]);
         assert_eq!(exact("launchd-bootstrap"), [Refusal::Bootstrap(5)]);
     }
@@ -1449,46 +1529,56 @@ mod tests {
 
     /// Catches blocking work that goes on after the future waiting for it was dropped (the
     /// runtime shutting down, or a panic unwinding through the poll): the drop sets the
-    /// cancel flag, so the work records no step after the one in flight. A run that
-    /// finishes does not leave the flag set (the canaries reuse it after the hand-over).
-    /// Catches the drop guard being removed.
+    /// cancel flag, so the work ends by it. A run that finishes does not leave the flag
+    /// set (the canaries reuse it after the hand-over). Catches the drop guard being
+    /// removed. The wait is dropped once the work has started, by a `select!` that takes
+    /// another branch, and the work is waited for by its own signal when it ends; it
+    /// would otherwise run to its 30 s safety bound and be seen not to have been
+    /// cancelled.
     #[test]
     fn a_dropped_wait_stops_the_blocking_work_too() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::{Arc, Mutex};
+        use std::sync::{Arc, mpsc};
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
             .build()
             .expect("runtime");
-        let steps = Arc::new(Mutex::new(0_u32));
         let cancel = Arc::new(AtomicBool::new(false));
-        let (work_steps, work_cancel) = (Arc::clone(&steps), Arc::clone(&cancel));
+        let work_cancel = Arc::clone(&cancel);
+        let (started_tx, mut started) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (ended_tx, ended) = mpsc::channel::<bool>();
         let work = async move {
             let _ = tokio::task::spawn_blocking(move || {
-                while !work_cancel.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(20));
-                    *work_steps.lock().expect("steps") += 1;
+                // Says it started on every step until the flag is set, so the wait is
+                // dropped only after the work was running and the flag was still clear. At
+                // most 30 s of steps: a flag that never comes ends the loop and the
+                // test's asserts report it.
+                for _ in 0..30_000 {
+                    if work_cancel.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let _ = started_tx.send(());
+                    std::thread::sleep(Duration::from_millis(1));
                 }
+                let _ = ended_tx.send(work_cancel.load(Ordering::SeqCst));
             })
             .await;
         };
-        // The wait is dropped by the timeout, as a shutdown or a panic would drop it.
-        let ended = rt.block_on(async {
-            tokio::time::timeout(
-                Duration::from_millis(70),
-                until_killed(work, &cancel, std::future::pending::<Option<()>>()),
-            )
-            .await
+        // The wait is dropped when the work has started, as a shutdown or a panic would
+        // drop it.
+        rt.block_on(async {
+            tokio::select! {
+                _ = started.recv() => {}
+                _ = until_killed(work, &cancel, std::future::pending::<Option<()>>()) => {
+                    panic!("the work ended by itself")
+                }
+            }
         });
-        assert!(ended.is_err(), "the wait was not dropped");
         assert!(
             cancel.load(Ordering::SeqCst),
             "the drop did not set the flag"
         );
-        let at_drop = *steps.lock().expect("steps");
-        std::thread::sleep(Duration::from_millis(150));
         assert!(
-            *steps.lock().expect("steps") <= at_drop + 1,
+            ended.recv().expect("the work ended"),
             "work went on after the wait was dropped"
         );
         let finished = AtomicBool::new(false);

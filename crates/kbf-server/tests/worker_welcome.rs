@@ -87,6 +87,55 @@ async fn a_server_speaking_one_to_three_welcomes_the_lesser_version() {
     assert_eq!(welcomed(addr, 0).await, Err(Code::FailedPrecondition));
 }
 
+/// A service over an empty farm that says `on` in `Welcome.pack_commit`, on a port of its own.
+fn serve_saying(on: bool) -> std::net::SocketAddr {
+    let farm = Arc::new(Farm::new(
+        Arc::new(Cache::memory()),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    ));
+    let service = WorkerService::new(
+        farm,
+        Peers::Unauthenticated,
+        support::INTERVAL,
+        Duration::from_secs(5),
+    );
+    let service = service.with_pack_commit(on);
+    let incoming =
+        tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = incoming.local_addr().expect("address");
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(WorkerServer::new(service))
+            .serve_with_incoming(incoming),
+    );
+    addr
+}
+
+/// The `pack_commit` of the `Welcome` that the server at `addr` sends a daemon.
+async fn says_commit(addr: std::net::SocketAddr) -> bool {
+    let first = daemon_message::Message::Hello(hello_of(1));
+    let mut daemon = FakeDaemon::open(addr, first).await.expect("opened");
+    daemon
+        .expect("Welcome", |m| match m {
+            Message::Welcome(w) => Some(w.pack_commit),
+            _ => None,
+        })
+        .await
+}
+
+/// Asserts that `Welcome` says whether the frontend takes `CommitPack`: false from a service that
+/// was not told it does (the plain server of a cell among them), true from one that was, so that
+/// a daemon that writes packs commits only to a frontend that can check them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn welcome_says_whether_the_frontend_takes_commits() {
+    let cell = Cell::start().await;
+
+    assert!(!says_commit(cell.worker_addr).await);
+    assert!(!says_commit(serve_saying(false)).await);
+    assert!(says_commit(serve_saying(true)).await);
+}
+
 /// Catches: a node recorded as speaking the version its `Hello` named, not the one
 /// `Welcome` named: a daemon whose `Hello` names 5 against a server speaking 3 is
 /// answered 3, and `GET /v1/nodes` (`Farm::node_view`) must say 3, not 5, or the

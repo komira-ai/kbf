@@ -84,7 +84,10 @@ deny list cannot be read, `INVALID_ARGUMENT` otherwise). A stream that sends no 
 with the server's newest, not refused, and a daemon accepts a `Welcome` from the oldest
 version it speaks up to the one its `Hello` named),
 the heartbeat interval in milliseconds, and its **lease epoch** (see
-[Server restarts and the lease epoch](#server-restarts-and-the-lease-epoch)).
+[Server restarts and the lease epoch](#server-restarts-and-the-lease-epoch)), and, in
+`Welcome.pack_commit` (field 5, additive), whether the frontend takes
+`kbf.worker.v1.PackIndex/CommitPack` (see [below](#blobs-on-the-worker-listener)): false
+from a frontend without the pack index and the pack store, and from one that predates the field.
 
 **Only the first `Hello` of a stream registers the node.** It opens a new session, and
 from then on every `Start` for this node goes to this stream. A `Hello` resent on the
@@ -315,6 +318,36 @@ the objects holding them ([write-path.md](write-path.md#4-segment-upload-the-dae
 An upload belongs to the connection that began it: a call naming it on another
 connection is `NOT_FOUND`.
 
+A frontend started with `--pack-index` also serves `kbf.worker.v1.PackIndex/Locate` to the
+daemon role (`pack_index.proto`): for up to 1000 digests, in order, where each blob lies in a
+pack (the pack, the offset and the length) or that the index has no row for it. A daemon
+started with `--pack-read` reads the blobs it finds that way from the object store and hashes
+them; it reads every other blob where it did before. Admitted by the same rule as the blob
+calls. A frontend without `--pack-index` does not register the service: the call is
+`UNIMPLEMENTED`. More than 1000 digests, or a digest that is not SHA-256, is
+`INVALID_ARGUMENT`; an index that cannot be read is `UNAVAILABLE`.
+
+With the pack store flags too, the frontend serves `kbf.worker.v1.PackIndex/CommitPack` to the
+daemon role: a daemon that writes its outputs into packs stores a pack in the object store with
+a create-only write and then commits it, naming the pack (`cas/d/<node>/<boot>/<sequence>`), its
+size, its blobs with their offsets, and itself as the writer. The write rule is that a pack is
+stored first and recorded after, so a row of the index never points at a pack that is not
+stored. The frontend refuses a commit whose writer is not the node the caller's certificate
+names (`PERMISSION_DENIED`: a daemon commits only its own packs), a name outside the writer's
+prefix or a list that cannot be a pack's, such as blobs that add up to more bytes than the pack
+(`INVALID_ARGUMENT`), and a pack that is not in the store or is not as long as the commit says
+(`FAILED_PRECONDITION`). It reads the pack's last byte (not its footer) and
+re-hashes a sample of the listed blobs by ranged reads of at most 8 MiB each
+(`--pack-commit-sample`, default 2, chosen from the commit alone so
+that the same commit is always checked at the same blobs); a blob that is not its digest
+refuses the commit (`INVALID_ARGUMENT`) and nothing is recorded; the refusal is counted
+(`kbf_pack_commit_rejects_total`) and logged. The record is idempotent on the pack's name: a
+commit sent again is answered `created: false`, and one with other contents is
+`ALREADY_EXISTS`. A store or an index that cannot answer is `UNAVAILABLE`, and the daemon sends
+the commit again. A frontend without the pack store flags answers `UNIMPLEMENTED`, and says in
+`Welcome.pack_commit` whether it takes the call: a daemon commits only to a frontend that says
+so, and a frontend of the previous release sends nothing there (the field is additive).
+
 Not checked: that the node is registered or connected, or that it reads only the
 inputs of leases it holds. A certificate the deny list does not refuse can read any
 blob whose digest it names, and write blobs.
@@ -327,7 +360,12 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
 - `report_hash`, equal to the newest `Hello`'s, so the server can notice a changed
   report without receiving it again (comparing it is **planned**);
 - `running`: every lease the daemon holds, meaning leases running now **and** leases
-  whose `Result` the server has not acknowledged yet.
+  whose `Result` the server has not acknowledged yet;
+- `pack_reads` (optional): the counts of the daemon's pack reads since its process started
+  (`PackReadCounts`: `served`, `served_bytes`, `elsewhere`, `unasked`, `lost`, `damaged`),
+  present only on a daemon started with `--pack-read`. A daemon without the flag, and one built
+  before the field, send none, and a server built before it skips the field. The server keeps the
+  newest of each node for `GET /metrics` (`kbf_pack_daemon_*`, [api.md](../api.md#get-metrics)).
 
 The server acknowledges a heartbeat with `HeartbeatAck { seq }`, but only one from the
 node's newest stream. A heartbeat from a replaced stream is dropped unacknowledged, so

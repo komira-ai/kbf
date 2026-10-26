@@ -8,6 +8,7 @@ use kbf_types::HostRole;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 
+use super::container_health::ContainerHealth;
 use super::coordinator::{HttpsCoordinator, TlsFiles};
 use super::enroll::frontend_url;
 use super::flags::Config;
@@ -23,8 +24,8 @@ use crate::operator::OperatorApi;
 use crate::ports::{Drain, Health, HealthCheck, PortError, SystemClock};
 use crate::version::Version;
 
-/// A host whose node is never drained (a storage host): the drain and the undrain are done
-/// already, and it holds no leases.
+/// A host whose node is never drained (a frontend host that runs no daemon): the frontend's own
+/// drain is the helper's, and there is no node to give back.
 pub struct NoDrain;
 
 impl Drain for NoDrain {
@@ -54,12 +55,6 @@ pub struct NoCredential(pub &'static str);
 pub const NO_CREDENTIAL: &str = "this agent was given neither --frontend (to drain its node with \
      its own certificate) nor an operator API credential, so it cannot drain its node and \
      updates nothing";
-
-/// Why a storage host's agent without a token refuses: the frontend lets a host's certificate
-/// reach its own node's calls, and a storage host's health is read from routes that are not those.
-pub const STORAGE_NEEDS_TOKEN: &str = "a storage host's health is read from the operator API, \
-     which a host's certificate cannot reach; give --operator-api and --token-file, or update \
-     it with the roll";
 
 impl HealthCheck for NoCredential {
     fn refusal(&self, _host: &Host) -> Option<String> {
@@ -96,10 +91,9 @@ type NodePorts = (Arc<dyn Drain>, Arc<dyn HealthCheck>);
 /// frontend:
 ///
 /// - the operator token (`--operator-api`, `--token-file`), the opt-in fallback, if it was given;
-/// - else the host's own certificate through the frontend's proxy (`--frontend`): the drain of
-///   a daemon or Mac, and the node's status for its health. A storage host is never drained,
-///   and its health is read from routes the certificate cannot reach, so it refuses
-///   ([`STORAGE_NEEDS_TOKEN`]);
+/// - else the host's own certificate on the frontend's worker listener (`--frontend`): the drain of
+///   the node, and the node's status for a daemon's health or its own storage view for a
+///   storage host's ([`NodeHealth::for_updater`]);
 /// - else the refusals of [`NoCredential`].
 pub(super) fn node_ports(
     cfg: &Config,
@@ -109,11 +103,7 @@ pub(super) fn node_ports(
 ) -> Result<NodePorts, String> {
     let installer = || Arc::new(LocalInstaller(local.clone()));
     if let Some(api) = &cfg.node_api {
-        let api = OperatorApi::new(
-            api.addr,
-            api.token_file.clone(),
-            api.proxy_auth_file.clone(),
-        )?;
+        let api = OperatorApi::new(api.addr, api.token_file.clone())?;
         let drain = drain_for(role, &api);
         let health = Arc::new(NodeHealth::with_api(api, installer()));
         return Ok((drain, health));
@@ -124,12 +114,9 @@ pub(super) fn node_ports(
             Arc::new(NoCredential(NO_CREDENTIAL)),
         ));
     };
-    if role == Role::Storage {
-        return Ok((no_drain(), Arc::new(NoCredential(STORAGE_NEEDS_TOKEN))));
-    }
     let api = OperatorApi::as_updater(frontend.clone(), cfg.files.clone(), identity.clone());
     let drain = drain_for(role, &api);
-    let health = Arc::new(NodeHealth::with_api(api, installer()));
+    let health = Arc::new(NodeHealth::for_updater(api, installer()));
     Ok((drain, health))
 }
 
@@ -146,20 +133,22 @@ pub fn identity_of_files(files: &TlsFiles) -> Result<Identity, String> {
     identity_of(leaf.as_ref()).map_err(|e| format!("{}: {e}", files.cert.display()))
 }
 
-/// The drain of a host of `role`: none for a storage host (the roll never drains one, a daemon
-/// on it included), the frontend's cordon, drain and uncordon for the rest.
+/// The drain of a host of `role`: the frontend's cordon, drain and uncordon of its node. A
+/// storage host may run a daemon too (`storage-and-daemon`), which its restart would cut off
+/// from its leases, so it drains that if the frontend knows the node, and has nothing to drain
+/// if it does not ([`NodeDrain::if_present`]).
 pub fn drain_for(role: Role, api: &OperatorApi) -> Arc<dyn Drain> {
     if role == Role::Storage {
-        no_drain()
+        Arc::new(NodeDrain::if_present(api.clone()))
     } else {
         Arc::new(NodeDrain::with_api(api.clone()))
     }
 }
 
 /// The renewer of the certificate in the state directory, if the agent was given one
-/// (`--state-dir`, which comes with `--frontend`).
+/// (`--state-dir`, which comes with `--enroll-frontend`).
 fn renewer_for(cfg: &Config) -> Result<Option<Arc<dyn Renewer>>, String> {
-    let (Some(dir), Some(frontend)) = (&cfg.state_dir, &cfg.frontend) else {
+    let (Some(dir), Some(frontend)) = (&cfg.state_dir, &cfg.enroll_frontend) else {
         return Ok(None);
     };
     let store = Store::open(dir).map_err(|e| e.to_string())?;
@@ -188,29 +177,58 @@ pub(super) fn unix_now() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
+/// The drain and the health of a frontend host, which the helper runs as a container
+/// (`docs/deploy/host-install.md`, "A frontend container"):
+///
+/// - the frontend itself is drained by the helper, inside the A/B, through the frontend's own
+///   operator API, so the agent drains nothing on its behalf;
+/// - the node of a daemon the host also runs is drained and given back only when the agent was
+///   told which node it is (`--daemon-node`), by the way [`node_ports`] gives the daemon of a
+///   host;
+/// - the health is what the helper says runs: its switch returned only after the container
+///   answered `/readyz` with 200 and `/healthz` named the release's commit.
+pub(super) fn frontend_ports(
+    cfg: &Config,
+    identity: &Identity,
+    local: &Arc<SocketLocal>,
+) -> Result<NodePorts, String> {
+    let drain = match &cfg.daemon_node {
+        Some(_) => node_ports(cfg, identity, Role::Daemon, local)?.0,
+        None => no_drain(),
+    };
+    let health = Arc::new(ContainerHealth::new(Arc::new(LocalInstaller(
+        local.clone(),
+    ))));
+    Ok((drain, health))
+}
+
 /// The agent of this host, with the real ports.
 ///
 /// # Errors
-/// Why not: no releases for this platform, a certificate that is no updater's or is a
-/// frontend's (a frontend is updated by the roll, not yet by the agent), files that do not make
-/// a TLS configuration, or an operator API client whose token files are not usable.
+/// Why not: no releases for this platform, a certificate that is no updater's, files that do
+/// not make a TLS configuration, an operator API client whose token files are not usable, or
+/// `--daemon-node` given to an agent whose certificate is not a frontend's.
 pub fn build(cfg: &Config) -> Result<Agent, String> {
     let platform = host_platform().ok_or("kbf has no release for this platform")?;
     let identity = identity_of_files(&cfg.files)?;
     let role = match identity.role {
-        HostRole::Frontend => {
-            return Err(
-                "this certificate is a frontend's: a frontend is updated by the roll, \
-                        not by the agent"
-                    .to_owned(),
-            );
-        }
+        HostRole::Frontend => Role::Frontend,
         HostRole::Storage => Role::Storage,
         HostRole::Daemon => Role::Daemon,
         HostRole::MacDaemon => Role::MacDaemon,
     };
+    if cfg.daemon_node.is_some() && role != Role::Frontend {
+        return Err(
+            "--daemon-node is for the agent of a frontend host that also runs a \
+                    daemon: another host's node is its certificate's"
+                .to_owned(),
+        );
+    }
     super::coordinator::client_config(&cfg.files).map_err(|e| e.to_string())?;
-    let node_id = identity.node_id.to_string();
+    let node_id = cfg
+        .daemon_node
+        .clone()
+        .unwrap_or_else(|| identity.node_id.to_string());
     let host = Host {
         alias: node_id.clone(),
         address: "localhost".to_owned(),
@@ -220,7 +238,11 @@ pub fn build(cfg: &Config) -> Result<Agent, String> {
         member: None,
     };
     let local = Arc::new(SocketLocal::new(&cfg.helper_socket, Limits::default()));
-    let (drain, health) = node_ports(cfg, &identity, host.role, &local)?;
+    let (drain, health) = if role == Role::Frontend {
+        frontend_ports(cfg, &identity, &local)?
+    } else {
+        node_ports(cfg, &identity, host.role, &local)?
+    };
     let renewer = renewer_for(cfg)?;
     let coordinator = Arc::new(
         HttpsCoordinator::new(cfg.coordinator.clone(), cfg.files.clone()).bound_to(identity),

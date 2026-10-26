@@ -335,6 +335,39 @@ mod tests {
         WorkerId::new("host-1")
     }
 
+    /// The storage half of an adopted node (a registry row with no certificate) is the member
+    /// at its address, and a node adopted with no storage role has none. Catches
+    /// `storage_half` (safe-to-stop) losing a node that was adopted, not enrolled.
+    #[test]
+    fn storage_half_finds_the_member_of_an_adopted_node() {
+        use kbf_types::Role;
+        let clock = std::sync::Arc::new(kbf_state::ManualClock::default());
+        let store = kbf_state::fake::Fake::with_flaw(clock, kbf_state::fake::Flaw::None);
+        let roles = |of: &[Role]| kbf_types::RoleSet::new(of.iter().copied()).expect("roles");
+        let id = |text: &str| text.parse().expect("node id");
+        let members = look(vec![
+            member(1, "s1.example:7000"),
+            member(2, "s2.example:7000"),
+        ]);
+        assert!(storage_half(&store, &host(), &members).is_err());
+        kbf_enroll_registry::adopt_node(
+            &store,
+            &id("host-1"),
+            roles(&[Role::Storage]),
+            "S2.example:7000",
+        )
+        .expect("adopt");
+        kbf_enroll_registry::adopt_node(&store, &id("host-2"), roles(&[Role::Daemon]), "")
+            .expect("adopt");
+        let half = storage_half(&store, &host(), &members).expect("linked");
+        assert_eq!(half.map(|m| m.id), Some(MemberId(2)));
+        assert!(
+            storage_half(&store, &WorkerId::new("host-2"), &members)
+                .expect("no storage half")
+                .is_none()
+        );
+    }
+
     /// A host is linked to the member whose address it advertised, and to no other.
     /// Catches `link` comparing the wrong things or joining the first member regardless.
     #[test]

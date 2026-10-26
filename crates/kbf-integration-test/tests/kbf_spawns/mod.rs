@@ -19,6 +19,8 @@
 /// Helpers that start `kbf` with the test's own settings file. Key: the path.
 pub const FLAGGED: &[&str] = &[
     "crates/kbf-cli/tests/host_rules.rs",
+    "crates/kbf-cli/tests/storage_and_daemon.rs",
+    "crates/kbf-cli/tests/storage_and_daemon_behind_frontend.rs",
     "crates/kbf-cli/tests/storage_process.rs",
     "crates/kbf-harness/src/farm.rs",
     "crates/kbf-integration-test/tests/proxy_support/mod.rs",
@@ -28,7 +30,6 @@ pub const FLAGGED: &[&str] = &[
 /// `kbf-cli`, each with its own runner and several of them testing the default path or a
 /// named `--config` on purpose. Each is to be ported to the flag, one file at a time.
 pub const ALLOWANCE: &[&str] = &[
-    "crates/kbf-cli/tests/all_in_one.rs",
     "crates/kbf-cli/tests/beta_b0.rs",
     "crates/kbf-cli/tests/beta_b0_killed.rs",
     "crates/kbf-cli/tests/beta_b0_red.rs",
@@ -43,7 +44,6 @@ pub const ALLOWANCE: &[&str] = &[
     "crates/kbf-cli/tests/node_process.rs",
     "crates/kbf-cli/tests/preflight.rs",
     "crates/kbf-cli/tests/rehearsal_in_a_box.rs",
-    "crates/kbf-cli/tests/storage_and_daemon.rs",
 ];
 
 /// The call a [`FLAGGED`] file must keep.

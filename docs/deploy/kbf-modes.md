@@ -39,6 +39,143 @@ before it listens on anything, and `kbf --mode=frontend --check` exits 2 the sam
 the TLS flags the frontend keeps the farm's storage map and routes every call by it;
 `--storage` is then only the bootstrap node.
 
+`--pack-index` (off by default; the `pack-index` key of `[scheduler]` in `kbf.toml`) opens
+the pack index at start: two tables of the Postgres state store (`pack` and `blob`) that
+say which pack holds each blob and where. The worker listener then answers a daemon's
+`kbf.worker.v1.PackIndex/Locate` from the index (daemon certificates only; without the flag
+the service is not registered and the call is UNIMPLEMENTED). Unless the frontend is also
+given the pack store flags below, nothing else reads or writes them. It needs a
+`postgres://` state store whose schema
+has the tables, which `kbf-installer setup` and the update step create, and a `sqlite://`
+state store is refused with a line that says so (exit 2). With the flag off no pack table is
+touched. The tables are an additive schema step: a kbf of the previous release keeps running
+on the migrated schema.
+
+**Packs** (off by default; the `[packs]` table of `kbf.toml`). With
+`--pack-store-endpoint` (an `http://host:port` S3-compatible object store),
+`--pack-store-bucket` and `--pack-store-credentials-file` (JSON
+`{"access_key_id": "...", "secret_access_key": "..."}`, mode 0600 or 0400; the secret is never
+a flag), and `--pack-index`, the frontend keeps the blobs clients upload in packs: many blobs
+in one object, written to the store with a create-only request and recorded in the pack
+index before the upload is acknowledged (a failed write answers UNAVAILABLE; packs finished
+before the failure stay recorded, and the client sends the rest again). FindMissingBlobs asks the index and then, for the digests it lacks, the storage
+nodes. A read, the client's and Execute's own, looks in the index first and fetches only the
+blob's bytes from its pack with a ranged request, hashes them, and serves them (a pack that
+holds other bytes than the digest names is never served); a blob the index lacks is read
+from the storage nodes as before. A blob over 64 MiB and a compressed blob are not packed.
+The closure check of the action cache counts a blob as held when the index has it: the check
+of a result a daemon reports, and of every hit (Execute's and a client's `GetActionResult`),
+works out what the result names (its output files, standard streams and the files of its
+output trees) and asks the index first and the storage nodes for the rest, so an output that
+is only in a pack satisfies it; the entry handed to the nodes names only the blobs they hold.
+A result with an output that neither holds is refused on a write and is a miss on a hit. On a
+routed farm a client's `GetActionResult` asks each blob's primary node only (as
+`FindMissingBlobs` does), where Execute's check also tries the blob's other owners, so right
+after a map change a client may see a miss for a result that Execute still hits, and runs the
+action again. With no pack flags the nodes check the entry alone, as before.
+`--pack-bytes` (default 32 MiB) is the length at which a pack is closed, `--pack-writer`
+(default `frontend`) names the frontend in its pack keys, `--pack-store-region` (default
+`us-east-1`) is the signing region, and `--pack-cache-dir` with `--pack-cache-bytes` keeps
+the blobs read from packs on a local disk. A daemon that writes packs itself commits them
+to the frontend (`kbf.worker.v1.PackIndex/CommitPack`, the daemon role only, and only a
+frontend with the pack index and these flags takes it; `Welcome.pack_commit` tells the
+daemon whether this one does): the frontend reads the pack's last byte (and refuses a pack
+that is longer than the commit says), refuses a commit whose blobs add up to more bytes than
+the pack, and re-hashes `--pack-commit-sample` blobs of it, reading each in ranges of at
+most 8 MiB (default 2; at most 16384, which checks every blob; 0
+checks none and trusts the daemon, whose bad blob is then caught only when it is first read)
+before it records the pack, refuses a writer that is not the calling node, and counts the
+refusals (`kbf_pack_commit_rejects_total`). At start the frontend checks that the store
+refuses to replace an object, and does not serve if it does not. `GET /metrics` gains the
+`kbf_pack_*` families. Left out, no object store is built or contacted and the frontend
+serves exactly as before. A daemon reads a blob that is only in a pack with `--pack-read`
+(below).
+
+The uploads into packs share a bound on the bytes they hold in flight,
+`--pack-inflight-bytes` (default 1 GiB, at least 64 MiB, the largest blob that is packed, so
+that no upload is refused for its size; at most 4294967295): an upload takes its blob's size as
+soon as its resource name has arrived, before it reads on, and gives it back when it ends, and
+one that finds the bound spent waits its turn, so a burst of uploads is slowed down and none is
+failed for it (`kbf_pack_upload_waits_total` counts the waits, `kbf_pack_inflight_bytes` and
+`kbf_pack_inflight_peak_bytes` the bytes taken). The bound counts blob bytes, not the memory of
+the process. A `BatchUpdateBlobs` is decoded before its handler runs, so the bytes it holds
+while it waits are not counted, and it has no idle timeout; reads are not counted either (a
+read holds one blob, at most 64 MiB, or one batch). `--pack-upload-idle-timeout` (default 30
+seconds, at most a day) ends a ByteStream upload that gets no byte of its body for that long
+with `DEADLINE_EXCEEDED`: it stores and records nothing, gives its bytes back, and is logged
+and counted (`kbf_pack_upload_idle_timeouts_total`). The time before the resource name has
+arrived is not counted, so a client that never sends it is not cut by this timeout. An upload
+that keeps sending, however slowly, is never cut and keeps its bytes until it ends, so
+`--pack-inflight-bytes` is the only bound on that. A client that claims a blob and sends
+nothing holds only its reservation, never a buffer of the claimed size. Both flags are
+accepted and ignored without `--pack-store-endpoint`.
+
+A daemon reads from the packs with `--pack-read` (off by default; the `[packs]` table of
+`kbf.toml`), which needs `--pack-store-endpoint`, `--pack-store-bucket` and
+`--pack-store-credentials-file` (a JSON key pair, mode 0600 or 0400, of a key that may read
+`cas/` and write nothing; `--pack-store-region` defaults to `us-east-1`). Its reads ask the
+frontend where a blob lies, read that range of the pack from the object store and check it
+against the digest. A blob the frontend does not locate, and a frontend without
+`--pack-index`, leave the read where it was (the storage nodes), as does a frontend of the
+previous release, which answers PERMISSION_DENIED (logged once, then once more after a
+read that was answered, and counted as `unasked`); `missing`, uploads and every
+other call are unchanged, so without `--pack-write` the daemon still uploads its outputs to the storage members.
+A pack that is gone or whose bytes are not the digest fails the read. Each read asks for one
+blob: one `Locate` call and one ranged request, with at most 16 asking at once. A blob of
+more than 64 MiB is read where it was before, as a read from a pack holds the whole blob in
+memory, outside the transfer budget (`--transfer-bytes-in-flight`). `--pack-read-cache-dir` with
+`--pack-read-cache-bytes` adds a cache of the blobs read from packs (the daemon's input
+cache already keeps blobs by digest, so it is off by default). `kbf daemon` asks over its
+connection to `--cas`. `kbf storage-and-daemon` with a `--frontend` reads packs too, over
+its member plane: its daemon half asks over a connection to the first `--server`, the
+frontend's worker listener that its session is made to, with the certificate the session
+presents. That certificate has the `daemon` role, the only one the listener lets call
+`Locate` (the node's storage half has a certificate of its own, with the `storage` role, and
+does not call it), so no role table changes. The flags are the same, with the same fallbacks,
+errors and bounds; reads of the local member's blobs and of the others' are alike packed
+reads first, and the outputs still go to the members. `kbf all-in-one` and
+`kbf storage-and-daemon` without a `--frontend` read blobs in-process from a store that is
+the whole farm, with no frontend to ask and no pack index, and refuse the flag. Counts of
+what was read from packs, elsewhere, lost and damaged are logged when the daemon stops
+(`pack reads: ...`), and a lost or damaged blob is logged when it is found.
+
+A daemon writes its outputs into packs with `--pack-write` (off by default; the `[packs]`
+table of `kbf.toml`), which needs `--pack-read` and `--pack-store-write-credentials-file`, a
+key pair file of the same form as `--pack-store-credentials-file` but of a key that may
+create objects under `cas/` (the read key stays read-only; the endpoint, the bucket and the
+region are the ones of `--pack-read`). Refused at parse time without either, naming the flag
+that is missing. At start the daemon checks that the store refuses to replace an object and
+does not start if it does not or if the store cannot be reached for the check; its packs are
+named `cas/d/<--node-id>/<boot>/<n>`, where the boot is new on every start. Packs are written
+only while the frontend says it takes `CommitPack` (its `Welcome` carries `pack_commit`: it
+has `--pack-index` and the pack store flags); until then, and after a frontend of the
+previous release answers UNIMPLEMENTED, the outputs go to the storage members as before. A put
+is acknowledged only after its pack is stored and the frontend has recorded it; a blob that
+cannot be packed, or a pack that cannot be committed, is written to the storage members
+instead. The counts are logged when the daemon stops (`pack writes: ...`); they are not yet
+on the heartbeat. `kbf all-in-one` and `kbf storage-and-daemon` without a `--frontend` refuse
+`--pack-read`, and with it `--pack-write`.
+
+The same counts ride every heartbeat of a daemon that has `--pack-read` (since the daemon
+process started; a daemon without the flag sends none), and the frontend its session is on
+exports the newest of each node on `GET /metrics` as `kbf_pack_daemon_served_total{node}`,
+`kbf_pack_daemon_served_bytes_total{node}`, `kbf_pack_daemon_elsewhere_total{node}`,
+`kbf_pack_daemon_unasked_total{node}`, `kbf_pack_daemon_lost_total{node}` and
+`kbf_pack_daemon_damaged_total{node}` ([api.md](../api.md#get-metrics) has what each counts
+and what a gone node shows). They are the gate for moving a farm to packs: the legacy reads
+are the frontend's `kbf_pack_read_fallbacks_total` plus the sum over nodes of
+`kbf_pack_daemon_elsewhere_total`, which must have stopped rising, and
+`kbf_pack_daemon_unasked_total` must stay flat (a rising one is the packs being skipped), and
+`kbf_pack_daemon_lost_total` and `kbf_pack_daemon_damaged_total` must stay 0. Reads of blobs
+over 64 MiB and of digests that are not SHA-256 are never asked of the packs and always count in
+`kbf_pack_daemon_elsewhere_total`, so the sum stops rising apart from those. A daemon is counted
+by the frontend its session is on, so the sums are taken over every frontend of the farm.
+
+The blobs the storage members flushed before the frontends wrote packs are in no pack the
+index knows, so a read of one still goes to the members. `kbf-pack-adopt`, an operator tool and
+a binary of its own, indexes those segments where they lie, with no byte copied and nothing
+written to the object store: [pack-adopt.md](pack-adopt.md) gives the order to run it in.
+
 **`storage`.** It serves the storage service over gRPC and nothing else: no REAPI, no
 scheduler, no operator API (only `GET /metrics`, on `--metrics-listen`, off unless given).
 It has no state store; it reaches one only through a frontend. Without `--frontend` it is a
@@ -54,7 +191,8 @@ process: the daemon half reads and writes the node's own storage through calls, 
 no socket between. Linux only, container driver only. With `--frontend` the node registers
 and the daemon routes each blob by the frontend's map: a blob this node owns goes in-process,
 any other goes over mutual TLS to its owner. Without `--frontend` the node is the whole
-farm.
+farm. With `--frontend`, `--pack-read` makes the daemon half read blobs from the packs first
+(see "Packs" above).
 
 ### The one-port proxy
 
@@ -83,7 +221,8 @@ a frontend or all-in-one host, the state database's schema, and the mode's units
 enrollment token and enrolls itself at its first start. A `frontend` or `all-in-one` host
 does not enroll; its certificates and addresses are the operator's, and `setup` takes them as
 flags. A host from the packages can run the same verb as `kbf setup --mode=<mode>` (without the
-proxy's flags). Details: [kbf-installer-setup.md](kbf-installer-setup.md).
+proxy's flags). Details: [kbf-installer-setup.md](kbf-installer-setup.md). A frontend can also run as
+a container image, with no installer: [containers.md](containers.md).
 
 ## Ports and who dials whom
 
@@ -230,12 +369,12 @@ disks and CPUs, and `daemon` on hosts that only build.
   `storage-and-daemon` refuse any driver but `container`, so a Mac is never one of those. Its
   `kbf.toml` is rendered by `kbf-mac-provision`. See
   [kbf-installer-setup.md](kbf-installer-setup.md) for the verbs.
-- **The frontend is one process.** Frontends over one Postgres store share it and none
-  fences another, but a SQLite file is held by one process, and the proxy no longer swaps a
-  new frontend in for an old one (its two slots were removed; the swap took a generation,
-  which a Postgres store does not hold: see
-  [state-store-cutover.md](state-store-cutover.md)). A frontend that is down schedules
-  nothing.
+- **A frontend is one process; several may share a store.** Frontends over one Postgres
+  store share it and none fences another (see
+  [state-store-cutover.md](state-store-cutover.md)); a SQLite file is held by one process, so
+  only one frontend can use it. A farm with one frontend schedules nothing while it is down;
+  with several behind the proxy, the others carry on, and a frontend is updated by a roll
+  ([kbf-updater.md](kbf-updater.md)).
 - **A `storage-and-daemon` host is for a trusted network.** Its unit runs as the build user,
   which can read the cold store's key from the process's environment, as `all-in-one`'s user
   can read the farm's state. Hosts that must not share a user with a key run `daemon` and
@@ -271,7 +410,8 @@ the `Planned:` paragraph.
    `storage` or `daemon`, as `urn:kbf:role:<role>`). The frontend runs the enrollment
    listener: `--enroll-listen`, `--ca-dir`, `--frontend-name` (repeatable) and `--ca-signer`
    (the socket of the `kbf-signer` process that holds the CA key; `--ca-dev-file-signer` is
-   for development). The operator makes a token with `POST /v1/enroll/tokens`, and a node
+   for development; a frontend that runs as another account than the signer needs the
+   signer's `--client-group`, see the signer's socket in [api.md](../api.md)). The operator makes a token with `POST /v1/enroll/tokens`, and a node
    enrolls with it at its first start and renews at half of its certificate's life (7 days by
    default, `--enroll-cert-lifetime-secs`). A node host needs no hand-issued certificate. The
    table of what each certificate must contain is in [kbf-units.md](kbf-units.md).
@@ -317,7 +457,7 @@ leases they held before. Copying a joining member's slice to it
 
 | mode | on SIGTERM or SIGINT | what bounds it |
 |---|---|---|
-| `frontend` | drains | `--shutdown-timeout-secs` (0 by default: no deadline); a second signal |
+| `frontend` | drains, by the sequence below | `--drain-lb-wait` (10 s by default) and `--drain-deadline` (900 s by default); `--shutdown-timeout-secs` (0 by default: no deadline); a second signal |
 | `all-in-one` | the frontend half drains; the daemon half does not | as `frontend`; the daemon half stops when the server half has |
 | `storage` | stops | none of its own |
 | `daemon` | drains | `--drain-deadline-secs` (600 by default); a second signal |
@@ -325,14 +465,22 @@ leases they held before. Copying a joining member's slice to it
 
 **The frontend.** Buck2 does not recover an Execute stream that breaks after it started, so
 a stop that cuts a stream fails its action. On the first signal, or on
-`POST /v1/frontend/drain` (`kbf cluster drain --frontend --token-file F`), the frontend turns
-`/readyz` to 503, refuses each new Execute with `UNAVAILABLE` (which Buck2 retries), sends GOAWAY on
-the REAPI listener, and keeps every open Execute and WaitExecution stream until its action
-is done. It exits 0 once the REAPI connections have closed. The worker listener and the
-operator API stay up until then, so daemons go on reporting results. A second signal, or
-`--shutdown-timeout-secs` running out, ends the open streams `UNAVAILABLE` and stops the
-server. Under systemd that needs `TimeoutStopSec=infinity`; the units that `kbf-deploy`
-renders set it.
+`POST /v1/frontend/drain` (`kbf cluster drain --frontend --token-file F`), the frontend
+(which has a state store) takes itself out of any load balancer in five steps
+([kbf-units.md](kbf-units.md#draining-a-frontend-behind-a-load-balancer)): `/readyz` turns to
+503 while everything is still served; after `--drain-lb-wait` it refuses each new Execute with
+`UNAVAILABLE` (which Buck2 retries), takes no more work from the state store, and sends
+GOAWAY on the REAPI, worker and operator API listeners; it keeps every open Execute and
+WaitExecution stream until its action is done, at most `--drain-deadline`, except a stream
+whose operation was never started, that no worker on this frontend can run and that no
+other frontend can take, which ends `UNAVAILABLE` at the end of the load balancer wait (the
+action would fail at the deadline anyway); then it ends the
+worker streams and the streams left `UNAVAILABLE` and exits 0. `GET /v1/frontend/drain`
+reports the phase. A second signal skips the waits, and `--shutdown-timeout-secs` running
+out does the same. A frontend with no state store (a test setup) drains at once: `/readyz`
+503, new Execute calls refused, GOAWAY on the REAPI listener, and exit 0 once the REAPI
+connections have closed. Under systemd that needs `TimeoutStopSec=infinity`; the units that
+`kbf-deploy` renders set it.
 
 **`all-in-one`.** The process has the frontend's drain and no drain of its own for builds.
 `--drain-deadline-secs` is used by `daemon` and `storage-and-daemon`, and `all-in-one` stops
@@ -365,4 +513,6 @@ maintenance without stopping it, `kbf cluster drain <node>`.
   single host.
 - [linux-build-host.md](linux-build-host.md): what a Linux build host installs and gives
   the daemon.
+- [pack-adopt.md](pack-adopt.md): indexing the segments the storage members already hold into
+  the pack index, in place.
 - The operator API, with its gates, in [api.md](../api.md).

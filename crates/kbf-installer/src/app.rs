@@ -116,7 +116,7 @@ fn now() -> u64 {
 fn host(root: PathBuf) -> Result<(Layout, HostExec), String> {
     let root = Root::new(root).map_err(|e| e.to_string())?;
     Ok((
-        Layout::new(root.clone(), Platform::current()),
+        Layout::new(root.clone(), Platform::current()).with_trust_fallback(),
         HostExec::new(root),
     ))
 }

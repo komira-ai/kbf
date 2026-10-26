@@ -72,6 +72,15 @@
 //! **Compression.** A gRPC-compressed message hides the name, so a call whose first
 //! message is compressed, or that names a `grpc-encoding` other than `identity`, is
 //! INVALID_ARGUMENT.
+//!
+//! **Packs.** Given packs, a Read of a blob the pack index holds is answered from its pack
+//! (a blob it lacks is passed on as above), and a Write of a plain blob within the packs'
+//! bound is received whole, hashed and packed: the exceptions to "no payload byte is
+//! collected" above, which hold one blob. Such a Write first takes its blob's size from the
+//! room that the uploads into packs share once the name has been read, and waits for it while
+//! they hold it all; it is ended DEADLINE_EXCEEDED if, once it has the room, no byte of its
+//! body arrives for the idle timeout (the `packed` module has the rules). Every other call is
+//! passed through as before.
 
 use std::convert::Infallible;
 use std::future::{Future, poll_fn};
@@ -91,6 +100,7 @@ use tonic::{Code, Status};
 
 use super::body::{Guard, Pass, Probe, Upload, collect, compressed, name_in};
 use super::owners::{Owner, Owners, no_storage};
+use super::packed::{self, Packs};
 use super::{Direction, Meter, Method, name};
 
 /// The raw ByteStream service.
@@ -99,6 +109,8 @@ pub(super) struct RawByteStream {
     pub owners: Owners,
     pub authorizers: Arc<Authorizers>,
     pub meter: Arc<Meter>,
+    /// The blobs read from and written to packs when there are some (the `packed` module).
+    pub packs: Option<Packs>,
 }
 
 impl NamedService for RawByteStream {
@@ -138,8 +150,8 @@ fn unreachable_node(owner: &Owner, error: &dyn std::fmt::Display) -> Status {
 struct Unanswered {
     /// What the client is told if the round is the last.
     status: Status,
-    /// Whether an owner was away (the map has none to ask, or one failed UNAVAILABLE), so
-    /// that another round may find the blob where this one could not.
+    /// Whether an owner was away (down in the map, or it failed with anything but
+    /// NOT_FOUND), so that another round may find the blob where this one could not.
     away: bool,
 }
 
@@ -169,6 +181,15 @@ impl RawByteStream {
             self.write(&parts, body).await
         } else {
             self.unary(&parts, body, method).await
+        }
+    }
+
+    /// The packs, if there are any and an upload named `name` of the blob `digest` is theirs:
+    /// the blob is within their bound and the name is not that of compressed bytes.
+    fn packs_for(&self, name: &str, digest: &Digest) -> Option<&Packs> {
+        match &self.packs {
+            Some(packs) if packed::applies(packs, name, digest) => Some(packs),
+            _ => None,
         }
     }
 
@@ -206,6 +227,10 @@ impl RawByteStream {
         // What was read to find the name is the part of the upload that can be sent again.
         upload.seal();
         let resource = self.authorized(parts, Method::Write, &name).await?;
+        if let Some(packs) = self.packs_for(&name, &resource.digest) {
+            let body = Body::new(up);
+            return packed::write_stream(packs, body, &name, resource.digest).await;
+        }
         // The upload waits for an owner while it can be sent whole: nothing of it but the
         // frames above has been read from the client.
         let mut waiting = self.owners.waiting();
@@ -314,15 +339,21 @@ impl RawByteStream {
         // The status of an upload is the writer's alone, and not held.
         if method != Method::Read {
             let owners = [self.owners.writer(&resource.digest)?];
-            let answered = self.ask_all(&owners, parts, &request, method).await;
+            let answered = self.ask_all(&owners, None, parts, &request, method).await;
             return answered.map_err(|unanswered| unanswered.status);
+        }
+        if let Some(packs) = &self.packs {
+            let answered = packed::read_stream(packs, &name, &resource.digest, &request).await?;
+            if let Some(response) = answered {
+                return Ok(response);
+            }
         }
         // A read asks every owner in turn, and while none answers and one is away, again
         // after a pause, against the placement as it is by then.
         let mut waiting = self.owners.waiting();
         loop {
-            let owners = self.owners.for_digest(&resource.digest);
-            let unanswered = match self.ask_all(&owners, parts, &request, method).await {
+            let (owners, down) = self.owners.placed(&resource.digest);
+            let unanswered = match self.ask_all(&owners, down, parts, &request, method).await {
                 Ok(response) => return Ok(response),
                 Err(unanswered) => unanswered,
             };
@@ -337,28 +368,37 @@ impl RawByteStream {
     }
 
     /// The first answer of `owners`, asked in turn. NOT_FOUND is the answer only if every
-    /// owner said it: an owner that could not say (down, broken) may hold the blob, so the
-    /// first of those is what the client is told, as the router does for a whole-blob read.
+    /// owner the map names said it: an owner that could not say (`down` in the map and so
+    /// not asked, or failed any way but NOT_FOUND) may hold the blob, so the first of those
+    /// is what the client is told, as the router does for a whole-blob read.
     async fn ask_all(
         &self,
         owners: &[Owner],
+        down: Option<Status>,
         parts: &http::request::Parts,
         request: &Bytes,
         method: Method,
     ) -> Result<http::Response<Body>, Unanswered> {
-        let (mut failure, mut missed) = (None, None);
-        // No owner at all (every one is down in the map, or the map is lost for the moment)
-        // is an owner away too.
-        let mut away = owners.is_empty();
+        let (mut failure, mut missed) = (down, None);
+        // An owner down in the map, or no owner at all (the map is lost for the moment),
+        // is an owner away.
+        let mut away = failure.is_some() || owners.is_empty();
         for owner in owners {
             match self.ask(owner, parts, request, method).await {
                 Ok(response) => return Ok(response),
                 Err(status) if next_owner_may_answer(status.code()) => {
                     tracing::warn!(node = owner.id(), %status, "storage node failed before its first byte");
-                    away |= status.code() == Code::Unavailable;
+                    away |= status.code() != Code::NotFound;
                     if status.code() == Code::NotFound {
                         missed = Some(status);
                     } else {
+                        // An owner that did not answer is away: the client is told so
+                        // (UNAVAILABLE, and it retries), whatever the node failed with.
+                        let status = if status.code() == Code::Unavailable {
+                            status
+                        } else {
+                            unreachable_node(owner, &status.message())
+                        };
                         failure.get_or_insert(status);
                     }
                 }

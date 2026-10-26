@@ -86,13 +86,10 @@ Related: [operator-verbs.md](operator-verbs.md) (every operator verb and its rou
   `crates/kbf-server/src/api.rs`, `gate`]**. The enrollment routes apply all of it to a GET
   too, answer `Cache-Control: no-store`, answer 404 when the feature is off and 409 on a
   fenced frontend (the object-store routes have no fence: section 18) **[F: `crates/kbf-server/src/enroll/api.rs`]**. This ADR copies that shape.
-- **Both frontend children serve at once.** Under the ruling of section 18, an old and a new
-  frontend child run side by side on one Postgres behind the reverse proxy bundled in
-  `kbf-installer`. Remote operators reach the API through a TLS-terminating proxy, whose
-  connections arrive from loopback and pass the gate **[F: `docs/api.md`, "Through a reverse
-  proxy"]**.
-- **Handover compares enrollment flags.** The open #1064 makes a frontend handover refuse a
-  successor whose enrollment flags differ from the holder's **[V: open pull request]**.
+- **Several frontends serve at once.** Under the ruling of section 18, the frontends of a host
+  share one Postgres behind the `kbf-proxy` bundled in `kbf-installer`. Remote operators reach the
+  API through a TLS-terminating proxy, whose connections arrive from loopback and pass the gate
+  **[F: `docs/api.md`, "Through a reverse proxy"]**.
 
 ## 3. Vocabulary
 
@@ -117,7 +114,7 @@ Each is an engineering default pending the owner; the question is in section 14.
 | D3 | Node keys are in memory only. A node without `--cold-store` defers its open until the registration arrives, after the order is verified and `/readyz` says what a node with no store reports. | Q3 |
 | D4 | The frontend log route is cut from this work. | Q4 |
 | D5 | Out of scope: update policy, image pull (no source verb exists), meta-backup (an installer and root verb), CA rotation (its own unit). | Q5 |
-| D6 | The secret file is host-local, readable by both frontend children, with versioned names. No writer baton and no `not_writer`. One token, loopback gate, no operator and admin split. | Q6 |
+| D6 | The secret file is host-local, readable by every frontend of the host, with versioned names. No writer baton and no `not_writer`. One token, loopback gate, no operator and admin split. | Q6 |
 | D7 | Store identity is immutable after the first bind; moving stores is a later migration verb. | Q7 |
 | D8 | A node with a `--cold-store` flag keeps running on it and reports `identity_mismatch` if the registered identity differs. | Q8 |
 
@@ -196,7 +193,7 @@ store: `objstore/conn`, `bind`, `gen`, `audit` and `ack` are key prefixes, not t
 this work adds no table and no column. `kbf-installer` creates and migrates the schema; `kbf`
 creates or alters nothing at start and refuses a schema version it does not support. Should a
 unit truly need a schema change, it ships as a `kbf-installer` forward migration, expand-first,
-that the old frontend child running beside the new one tolerates, and the lead is told first.
+that a frontend of the previous build running beside a new one tolerates, and the lead is told first.
 
 One atomic multi-key transaction per mutation covers the row, the generation bump and the
 audit row, compare-and-set on the generation. A PUT that changes nothing writes an audit row
@@ -230,8 +227,8 @@ filesystem backup of the host or the installer must exclude `<secrets dir>`; the
 documentation names the exclusion, and the installer's backup list is checked for it **[V]**.
 
 **Acks** are the `objstore/ack/{member}` rows above: short-TTL rows in the existing store,
-written by heartbeats with compare-and-set. They survive a frontend restart and a proxy switch
-to the other child, so a switch does not reset convergence. An expired row is "not heard from",
+written by heartbeats with compare-and-set. They survive a frontend restart and a node's move
+to another frontend, so neither resets convergence. An expired row is "not heard from",
 so `converged` is false until the node beats again: never a false converged.
 
 ## 7. Delivery
@@ -261,12 +258,11 @@ so `converged` is false until the node beats again: never a false converged.
   matches, the registration supplies the keys only.
 - **A bad credential** reaching a node reports `probe_failed`; a node that already had a store
   keeps it.
-- **No fence.** The proxy forwards every stream to the active child, so registration writes and
-  `GetStoreConfig` reach that child only; the old child is read-only for scheduling and may
-  write its own metadata. There is no writer role to lose, and a child that is not active
-  holds no state the active one lacks. Generation bumps are compare-and-set in Postgres, and a secret
-  file is written whole under a new versioned name, so a reader in the other child never sees
-  a partial file.
+- **No fence.** The proxy forwards each stream to one frontend of the pool, so registration
+  writes and `GetStoreConfig` reach whichever it picked. There is no writer role to lose, and a
+  frontend holds no state the others lack. Generation bumps are compare-and-set in Postgres, and
+  a secret file is written whole under a new versioned name, so a reader in another frontend
+  never sees a partial file.
 - **Who is calling.** The proxy terminates TLS and verifies mutual TLS, so a node's identity
   (node id and role) may arrive from the proxy and not from the child's own TLS peer (#1095).
   The per-call check above therefore sits behind one function, "who is calling", and nothing
@@ -312,7 +308,7 @@ and applies the keys. When the open is deferred, `cold_store` and the node's ref
 | the node | keys never on disk, in argv or in the environment; a scan of the temp dir and the arguments |
 | the state database, the audit rows, `Debug` output | never hold the secret |
 | a sentinel scan that passes vacuously | each scan first asserts the sentinel **is** in the secret file, then that it is nowhere else |
-| the daemon wire | `Welcome`, `MapUpdate`, `Session` and the daemon heartbeat carry no store field; the daemon crates link no object-store client **[F: `crates/kbf-integration-test/tests/layering.rs`, `crates/kbf-proto/tests/daemon_wire.rs`]** |
+| the daemon wire | `Welcome`, `MapUpdate`, `Session` and the daemon heartbeat carry no store field; apart from the read-only key of `--pack-read`, the daemon builds no cold store: its crates cannot reach `kbf-front`, `kbf-server` or `ureq` **[F: `crates/kbf-integration-test/tests/layering.rs`, `crates/kbf-proto/tests/daemon_wire.rs`]** |
 
 ## 10. The probe is a request from the frontend to an operator's endpoint
 
@@ -323,7 +319,7 @@ total timeout, a size bound on what it reads, and sends nothing but the probe ob
 not follow redirects. The target is not restricted to a public address, because a private farm's
 store is private; the token is what authorises it **[D]**.
 
-## 11. Flags, the feature switch and handover
+## 11. Flags and the feature switch
 
 Configuration is flags **[D]**. Names are defaults pending the code:
 
@@ -331,9 +327,8 @@ Configuration is flags **[D]**. Names are defaults pending the code:
   feature on; without it every `/v1/object-stores/*` route answers 404 behind the gate. One
   flag, not a boolean beside a path that could disagree.
 
-The frontend handover compares enrollment flags between holder and successor (#1064). These
-flags join that comparison, and the successor must be able to read the secrets directory: a
-handover whose successor lacks it is refused, tested.
+Each frontend of a host has the flag of its own, and the directory must be readable by every one
+of them: a frontend started without it answers 404 on these routes.
 
 ## 12. Failure modes
 
@@ -345,7 +340,7 @@ handover whose successor lacks it is refused, tested.
 | frontend down at node boot | the node cannot open a registered store (keys are memory-only); it retries with backoff and serves hot only |
 | bad credential reaching a node | `probe_failed`; a node that had a store keeps it |
 | revoked or denied node | `PERMISSION_DENIED` on its next call; keys it already holds are not recalled, so the operator rotates after revoking |
-| two frontend children at once | the proxy forwards to the active child, which takes registration writes; Postgres compare-and-set arbitrates the generation; versioned secret files are never partial |
+| several frontends at once | the proxy forwards each stream to one of them, and any may take a registration write; Postgres compare-and-set arbitrates the generation; versioned secret files are never partial |
 | concurrent operators | `expect_generation` compare-and-set; otherwise last writer wins and both are audited |
 | Postgres restored from an older backup | generation lower than a node's: the node refetches on a difference (section 7) |
 | a node on an older build | `unsupported`, counted separately |
@@ -392,7 +387,7 @@ proxy. Until answered, the operator documentation says not to forward it.
 - **Q5 "Every remaining verb".** Update policy and image pull have no source verb on the
   branch. Default: out of scope until one exists; meta-backup stays an installer and root
   verb; CA rotation stays its own unit. Confirm.
-- **Q6 Token and proxy.** Default: the secret file is host-local and both frontend children read
+- **Q6 Token and proxy.** Default: the secret file is host-local and every frontend of the host reads
   it; the one-token loopback gate stays. May the installer's proxy carry secret-bearing routes
   (section 13)? Multiple hosts need a shared secret store (#966 section 14.8), still open.
 - **Q7 Immutable identity.** Moving to a different store is then a migration with no verb.
@@ -461,17 +456,17 @@ lives in the handlers.
 - **Postgres only.** SQLite is dropped; Postgres is a runtime dependency of the frontend and
   the all-in-one. Rows, generation and audit go through the `kbf-state` store on Postgres;
   tests use its fake or Postgres. Every "state store" above means that.
-- **No writer baton.** The old and new frontend children share one Postgres under the proxy
-  bundled in `kbf-installer`, and the proxy forwards to the active child. `not_writer` and any
-  fence gating of these routes are removed. The secret file is host-local and readable by both
-  children; writes are atomic with versioned names.
+- **No writer baton.** The frontends of a host share one Postgres under the proxy bundled in
+  `kbf-installer`, and the proxy forwards each stream to one of them. `not_writer` and any
+  fence gating of these routes are removed. The secret file is host-local and readable by every
+  frontend of the host; writes are atomic with versioned names.
 - **The frontend updates first**, then triggers node updates, so nodes accept an N+1 frontend
   (section 7).
 - **No Envoy.** Earlier mentions of the proxy mean the installer's.
-- **The proxy forwards to the active child.** Registration writes reach that child only, and
-  the old child is read-only for scheduling (it may write its own metadata). Acks are rows in
-  the shared store, so a switch keeps convergence. The word "both serve" in earlier sections
-  means "either may be the one the proxy picks", not that two children take writes at once.
+- **The proxy forwards each stream to one frontend.** A registration write reaches the frontend
+  the proxy picked, and writes go through the shared store, so every frontend sees them. Acks are
+  rows in the shared store, so a restart or a roll keeps convergence. The word "both serve" in
+  earlier sections means "any frontend of the host may be the one the proxy picks".
 - **Schema.** Rows in the existing store only; see the schema rule in section 6.
 - **Identity.** One "who is calling" function, whose source may be the proxy (section 7).
 - **No state migration:** a fresh Postgres. **A second update is rejected while one runs.**

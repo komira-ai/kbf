@@ -13,12 +13,14 @@
 //!   `subject-path` exactly `dist/<tarball>` (not a glob or a list, which would make
 //!   one bundle for several tarballs). A step for a tarball no job of that group
 //!   packages is named too.
-//! - **The packages.** The `kbf-installer` deb that `cargo xtask pkg-asset` lists as an
-//!   asset ([`attested_assets::packaged_debs`]), the `kbf` deb that `cargo xtask
-//!   pkg-kbf-asset` lists ([`attested_assets::packaged_kbf_debs`]) and the Mac `.pkg` that
-//!   `cargo xtask pkg-macos-asset` lists ([`attested_assets::packaged_macos_pkgs`]) are
-//!   held to the same two rules, as `dist/kbf-installer-<commit>-<platform>.deb` (`.pkg`),
-//!   `dist/kbf-<commit>-<platform>.deb` and their `.deb.sigstore.json` (`.pkg.sigstore.json`).
+//! - **The packages.** The `kbf` deb that `cargo xtask pkg-kbf-asset` lists
+//!   ([`attested_assets::packaged_kbf_debs`]) and the Mac `.pkg` that `cargo xtask
+//!   pkg-macos-asset` lists ([`attested_assets::packaged_macos_pkgs`]) are held to the same
+//!   two rules, as `dist/kbf-<commit>-<platform>.deb` and `dist/kbf-installer-<commit>-<platform>.pkg`
+//!   and their `.deb.sigstore.json` (`.pkg.sigstore.json`).
+//!   So are the frontend and coordinator images that `cargo xtask pkg-image-asset` lists
+//!   ([`attested_assets::packaged_images`]), as `dist/kbf-<service>-image-<commit>-<platform>.oci.tar`
+//!   and its `.oci.tar.sigstore.json`.
 //! - **Its bundle's name.** The step after it sets `BUNDLE` to that step's
 //!   `bundle-path` output and copies it to `dist/<tarball>.sigstore.json` (the action
 //!   leaves it in a temporary directory under a name that is the same for every
@@ -97,17 +99,27 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
     if packaged.is_empty() {
         return Err("no `cargo xtask package` line in any `run:` step".to_owned());
     }
-    // The packages: (binary, platform, extension), the installer's deb and the `kbf` deb of a
-    // Linux job and the installer's `.pkg` of the macOS one.
+    // The packages: (binary, platform, extension), the `kbf` deb of a Linux job and the
+    // installer's `.pkg` of the macOS one.
     let mut packages: Vec<(&str, String, &str)> = Vec::new();
-    for platform in attested_assets::packaged_debs(artifacts)? {
-        packages.push(("kbf-installer", platform, "deb"));
-    }
     for platform in attested_assets::packaged_kbf_debs(artifacts)? {
         packages.push(("kbf", platform, "deb"));
     }
     for platform in attested_assets::packaged_macos_pkgs(artifacts)? {
         packages.push(("kbf-installer", platform, "pkg"));
+    }
+    // The images are held to the same rules, as `dist/kbf-<service>-image-<commit>-<platform>.oci.tar`.
+    for (service, platform) in attested_assets::packaged_images(artifacts)? {
+        let name = match service.as_str() {
+            "frontend" => "kbf-frontend-image",
+            "coordinator" => "kbf-coordinator-image",
+            other => {
+                return Err(format!(
+                    "`pkg-image-asset --service {other}`: not an image of the release set"
+                ));
+            }
+        };
+        packages.push((name, platform, "oci.tar"));
     }
     let groups: BTreeSet<&str> = packaged
         .iter()

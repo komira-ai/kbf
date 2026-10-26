@@ -81,6 +81,8 @@ async fn a_frontend_with_enroll_listen_enrolls_a_node_with_a_token_from_its_api(
         "--ca-dev-file-signer".to_owned(),
         "--enroll-allow-unenforced-deny".to_owned(),
         "--frontend-name=localhost".to_owned(),
+        // Stopped at the end of the test: no load balancer to wait for.
+        "--drain-lb-wait=0".to_owned(),
     ]);
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let handle = start_frontend(&f, || {
@@ -213,31 +215,28 @@ async fn a_serving_frontend_replaces_the_enroll_listeners_certificate() {
     serving.abort();
 }
 
-/// `--enroll-listen` without `--enroll-allow-unenforced-deny` is refused while deny rows
-/// are not enforced; the frontend start returns that refusal (the enroll preparation runs
-/// before any listener is bound, so nothing serves).
+/// `--enroll-listen` starts without `--enroll-allow-unenforced-deny`: this build enforces
+/// the deny rows a revocation writes, so there is nothing to accept. With the flag it
+/// starts too (the flag does nothing).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_frontend_start_returns_the_enroll_gate_refusal() {
-    let dir = scratch("gate");
-    let f = flags(&[
-        format!("--state-store=sqlite://{}", dir.join("state.db").display()),
-        "--enroll-listen=127.0.0.1:0".to_owned(),
-        format!("--ca-dir={}", dir.join("ca").display()),
-        "--ca-dev-file-signer".to_owned(),
-        "--frontend-name=localhost".to_owned(),
-    ]);
-    let err = start_frontend(&f, || Ok(pending::<()>()))
-        .err()
-        .expect("the gate refuses")
-        .to_string();
-    assert!(
-        err.contains("--enroll-allow-unenforced-deny"),
-        "unexpected error: {err}"
-    );
-    assert!(
-        !dir.join("ca").exists(),
-        "nothing is written before the gate passes"
-    );
+async fn a_frontend_starts_enroll_listen_without_the_deny_acceptance() {
+    for (name, extra) in [
+        ("accept-none", None),
+        ("accept-flag", Some("--enroll-allow-unenforced-deny")),
+    ] {
+        let dir = scratch(name);
+        let mut argv = vec![
+            format!("--state-store=sqlite://{}", dir.join("state.db").display()),
+            "--enroll-listen=127.0.0.1:0".to_owned(),
+            format!("--ca-dir={}", dir.join("ca").display()),
+            "--ca-dev-file-signer".to_owned(),
+            "--frontend-name=localhost".to_owned(),
+        ];
+        argv.extend(extra.map(str::to_owned));
+        let handle = start_frontend(&flags(&argv), || Ok(pending::<()>())).expect("starts");
+        assert!(handle.enroll.is_some(), "the enroll listener is bound");
+        assert!(dir.join("ca").exists(), "the CA was made");
+    }
 }
 
 /// The enroll registry lives in the state store, so a start with an enroll listener and no

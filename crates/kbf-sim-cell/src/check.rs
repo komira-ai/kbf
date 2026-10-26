@@ -44,9 +44,9 @@
 //!     counts exactly the staged bytes.
 //! 13. **Drained** (invariant F). At the end no object is left staged.
 //!
-//! One more, of all-in-one (its design, kbf#657, sections 7.4 and 8),
-//! in [`Kind::WholeProcess`] runs, where the daemon half stores each output before it
-//! reports and dies with the server:
+//! One more, of a storage-and-daemon node (docs/design/architecture-v2.md, sections 1
+//! and 10), in [`Kind::WholeProcess`] runs, where the daemon half stores each output
+//! before it reports and dies with the process that holds the store and the log:
 //!
 //! 14. **Answered with outputs.** Every action a client has been answered for has an
 //!     action-cache entry the server serves (a hit, so its result blob is indexed), at

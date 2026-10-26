@@ -23,15 +23,17 @@
 //! guest marker time is good to about 0.6 s; the host is otherwise idle, so every time is
 //! a lower bound for a host that is compiling.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use crate::bundle::{self, Identity};
+use crate::gates::{Channels, attach_share};
 use crate::guest::{self, Share};
 use crate::probe::{Ctx, Step, Vm};
 use crate::report::{Report, summary_json};
-use crate::spec::{TaggedShare, VmSpec};
+use crate::spec::VmSpec;
+use crate::system::Clock;
 
 /// One run's measurements in milliseconds; `None` is a marker that never appeared.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -61,7 +63,13 @@ struct Markers {
 
 /// When each marker first showed up, in ms after `t0`. Existence is checked without
 /// following links (the share is guest-writable).
-fn await_markers(ctx: &Ctx<'_>, vm: &mut Vm, share: &Share, t0: Instant) -> Markers {
+fn await_markers(
+    ctx: &Ctx<'_>,
+    clock: &dyn Clock,
+    vm: &mut Vm,
+    share: &Share,
+    t0: Duration,
+) -> Markers {
     let dir = share.results();
     let mut seen = Markers {
         system: None,
@@ -70,9 +78,9 @@ fn await_markers(ctx: &Ctx<'_>, vm: &mut Vm, share: &Share, t0: Instant) -> Mark
         failure: None,
     };
     let grace = ctx.timing.tick * 10;
-    let mut core_done: Option<Instant> = None;
+    let mut core_done: Option<Duration> = None;
     loop {
-        let now = ms(t0.elapsed());
+        let now = ms(clock.now().saturating_sub(t0));
         for (slot, name) in [
             (&mut seen.system, guest::READY_SYSTEM),
             (&mut seen.login, guest::READY_LOGIN),
@@ -83,10 +91,11 @@ fn await_markers(ctx: &Ctx<'_>, vm: &mut Vm, share: &Share, t0: Instant) -> Mark
             }
         }
         if seen.system.is_some() && seen.login.is_some() && core_done.is_none() {
-            core_done = Some(Instant::now());
+            core_done = Some(clock.now());
         }
-        let out_of_time = t0.elapsed() >= ctx.timing.guest_timeout;
-        let aqua_over = core_done.is_some_and(|t| seen.aqua.is_some() || t.elapsed() >= grace);
+        let out_of_time = clock.now().saturating_sub(t0) >= ctx.timing.guest_timeout;
+        let aqua_over = core_done
+            .is_some_and(|t| seen.aqua.is_some() || clock.now().saturating_sub(t) >= grace);
         if out_of_time || aqua_over {
             return seen;
         }
@@ -99,7 +108,7 @@ fn await_markers(ctx: &Ctx<'_>, vm: &mut Vm, share: &Share, t0: Instant) -> Mark
 
 /// Removes a run's directories.
 fn remove(ctx: &Ctx<'_>, name: &str) {
-    for suffix in ["", "-share", "-tagged"] {
+    for suffix in ["", "-share", "-tagged", "-results"] {
         let _ = std::fs::remove_dir_all(ctx.work.join(format!("{name}{suffix}")));
     }
 }
@@ -141,19 +150,17 @@ fn one_run(ctx: &Ctx<'_>, name: &str, cold: bool) -> Result<Run, String> {
     let clone = bundle::clone_bundle(ctx.sys, &ctx.base, &dest, Identity::Keep)
         .map_err(|e| e.to_string())?;
     let mut spec = VmSpec::minimal(dest);
-    spec.automount_dir = Some(share.dir.clone());
-    spec.tagged = Some(TaggedShare {
-        tag: guest::TAG.to_owned(),
-        path: share.tagged.clone(),
-    });
-    let t0 = Instant::now();
+    spec.graphics = ctx.graphics;
+    attach_share(&mut spec, &share, Channels::NONE);
+    let clock = ctx.sys.clock();
+    let t0 = clock.now();
     let started = ctx.spawn_retrying(name, &spec)?;
     let mut vm = started.vm;
-    let running = ms(t0.elapsed());
-    let seen = await_markers(ctx, &mut vm, &share, t0);
-    let stop_at = Instant::now();
+    let running = ms(clock.now().saturating_sub(t0));
+    let seen = await_markers(ctx, &*clock, &mut vm, &share, t0);
+    let stop_at = clock.now();
     vm.stop(&ctx.timing);
-    let stop_to_exit = ms(stop_at.elapsed());
+    let stop_to_exit = ms(clock.now().saturating_sub(stop_at));
     remove(ctx, name);
     Ok(Run {
         clone: ms(clone),

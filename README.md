@@ -16,10 +16,10 @@ kbf is written in Rust. Its programs are named `kbf-*`:
   processes (`--driver native`), with its process tree, memory and network
   watched by the daemon.
 
-`kbf` is a new binary with the modes `frontend`, `storage`, `daemon`, `storage-and-daemon`
-and `all-in-one`, chosen with `kbf --mode=<mode>` (or `mode = "..."` in `/etc/kbf/kbf.toml`);
+`kbf` is a new binary with the modes `frontend`, `storage`, `daemon`, `storage-and-daemon`,
+chosen with `kbf --mode=<mode>` (or `mode = "..."` in `/etc/kbf/kbf.toml`);
 the programs above remain.
-Smoke test: `kbf --mode=all-in-one --help`
+Smoke test: `kbf --mode=storage-and-daemon --help`
 
 ## Status
 
@@ -47,6 +47,9 @@ open web UI: how to reach it, how to turn it off, and what it exposes.
 is the recommended deployment: several frontends behind a load balancer, bare-metal nodes,
 one object store, and a live update that drains one frontend at a time (Envoy and compose
 examples in [examples/deploy](examples/deploy)).
+[docs/deploy/containers.md](docs/deploy/containers.md) runs the frontend and the update
+coordinator as container images: the attested archives, their import without a registry, and
+the files each one is given.
 
 ## Contributing
 

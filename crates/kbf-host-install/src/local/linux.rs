@@ -54,7 +54,7 @@ use super::backend::{Backend, Fault, Pending};
 use super::units::restart_and_wait;
 use crate::host::Host;
 use crate::mac::channel::{MacAllowlist, Source};
-use crate::mac::fetch::{FetchError, Fetcher, Limits};
+use crate::mac::fetch::{AssetKind, FetchError, Fetcher, Limits};
 use crate::mac::stage::read_token;
 use crate::outcome::Refusal;
 use crate::plan::Wait;
@@ -70,6 +70,9 @@ pub const ALLOWLIST: &str = "/etc/kbf/host-install-releases.toml";
 /// The most a release's tarball may be, in bytes.
 pub const TARBALL_MAX: u64 = 512 * 1024 * 1024;
 
+/// The most a frontend image may be, in bytes.
+pub const IMAGE_MAX: u64 = 1024 * 1024 * 1024;
+
 /// The programs and the time limits of a stage.
 #[derive(Debug, Clone)]
 pub struct Tools {
@@ -81,6 +84,8 @@ pub struct Tools {
     pub download: Duration,
     /// The largest tarball taken in.
     pub tarball_max: u64,
+    /// The largest frontend image taken in.
+    pub image_max: u64,
 }
 
 impl Tools {
@@ -90,6 +95,7 @@ impl Tools {
             tool: Duration::from_secs(60),
             download: Duration::from_secs(900),
             tarball_max: TARBALL_MAX,
+            image_max: IMAGE_MAX,
         }
     }
 }
@@ -116,6 +122,8 @@ pub struct Linux<E: Exec> {
     pub(crate) allowlist: PathBuf,
     pub(crate) units: Vec<Unit>,
     pub(crate) restart_wait: Wait,
+    /// The clock the wait is counted on.
+    pub(crate) pace: crate::pace::Pace,
     /// `systemctl`, `curl` and `gh release download`.
     pub(crate) runner: Box<dyn Runner>,
     /// `gh attestation verify` and the probe, the installer's way.
@@ -123,18 +131,72 @@ pub struct Linux<E: Exec> {
     pub(crate) tools: Tools,
     /// Who owns the files of a stage: root, on a host.
     pub(crate) owner: Owner,
+    /// The name of the frontend container this helper serves, when it has a configuration
+    /// file of its own: it is part of the names of the scratch and check directories, so that
+    /// two helpers staging at once never remove each other's download.
+    pub(crate) scratch_tag: Option<String>,
 }
 
-fn commit_id(commit: &str) -> Result<CommitId, Fault> {
+pub(super) fn commit_id(commit: &str) -> Result<CommitId, Fault> {
     CommitId::new(commit).map_err(|e| Fault::failed(Code::StateUnavailable, e.to_string()))
 }
 
-fn state_fault(e: impl std::fmt::Display) -> Fault {
+pub(super) fn state_fault(e: impl std::fmt::Display) -> Fault {
     Fault::failed(Code::StateUnavailable, e.to_string())
 }
 
+/// The scratch directory `<work>/<prefix>.fetch` (and its `home`) that the unprivileged user
+/// `who` fetches into, made new and owned by it; `work` is made, readable by all, if it is not
+/// there.
+pub(super) fn fetch_scratch_in(work: &Path, prefix: &str, who: Identity) -> Result<PathBuf, Fault> {
+    let stage_failed = |e: io::Error| Fault::failed(Code::StageFailed, format!("scratch: {e}"));
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(work)
+        .map_err(stage_failed)?;
+    let scratch = work.join(format!("{prefix}.fetch"));
+    match fs::remove_dir_all(&scratch) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(stage_failed(e)),
+        _ => {}
+    }
+    for (dir, mode) in [(scratch.clone(), 0o700), (scratch.join("home"), 0o700)] {
+        fs::create_dir(&dir)
+            .and_then(|()| fs::set_permissions(&dir, fs::Permissions::from_mode(mode)))
+            .and_then(|()| std::os::unix::fs::chown(&dir, Some(who.uid), Some(who.gid)))
+            .map_err(stage_failed)?;
+    }
+    Ok(scratch)
+}
+
+/// The refusal a fetch that found nothing, or could not fetch, is.
+pub(super) fn fetch_fault(e: FetchError) -> Fault {
+    match e {
+        FetchError::Unknown => Fault::refused(Code::UnknownRelease, "no release has that commit"),
+        FetchError::Ambiguous => {
+            Fault::refused(Code::AmbiguousRelease, "two releases have that commit")
+        }
+        FetchError::Failed(why) | FetchError::RateLimited(why) => {
+            Fault::refused(Code::FetchFailed, why)
+        }
+    }
+}
+
+/// What [`Linux::prepare`] read: everything a fetch and its check need.
+pub(super) struct Prepared {
+    /// The version's 12 hex digits.
+    pub(super) prefix: String,
+    /// The token of the channel for the GitHub API, if it names one.
+    pub(super) token: Option<String>,
+    pub(super) settings: Settings,
+    /// The unprivileged user the fetch runs as.
+    pub(super) who: Identity,
+    /// The channel's pinned sums, if it has some.
+    pub(super) sums: Option<PathBuf>,
+}
+
 /// The refusal of the allowlist or of a channel, as the socket tells it.
-fn config_fault(refusal: Refusal) -> Fault {
+pub(super) fn config_fault(refusal: Refusal) -> Fault {
     let code = match refusal {
         Refusal::ChannelNotAllowed => Code::ChannelNotAllowed,
         Refusal::ConfigUnsafe | Refusal::KeyUntrusted => Code::ConfigUnsafe,
@@ -146,7 +208,7 @@ fn config_fault(refusal: Refusal) -> Fault {
 impl<E: Exec> Linux<E> {
     fn restart_units(&self) -> Result<(), String> {
         for unit in &self.units {
-            restart_and_wait(&*self.runner, unit, self.restart_wait)?;
+            restart_and_wait(&*self.runner, unit, self.restart_wait, &self.pace)?;
         }
         Ok(())
     }
@@ -166,34 +228,28 @@ impl<E: Exec> Linux<E> {
     }
 
     /// The scratch directory the unprivileged user fetches into, owned by it.
-    fn fetch_scratch(&self, prefix: &str, who: Identity) -> Result<PathBuf, Fault> {
-        let stage_failed = |e: io::Error| Fault::failed(Code::StageFailed, format!("scratch: {e}"));
+    pub(super) fn fetch_scratch(&self, prefix: &str, who: Identity) -> Result<PathBuf, Fault> {
         let work = self.layout.join(&self.layout.work_dir());
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o755)
-            .create(&work)
-            .map_err(stage_failed)?;
-        let scratch = work.join(format!("{prefix}.fetch"));
-        match fs::remove_dir_all(&scratch) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(stage_failed(e)),
-            _ => {}
-        }
-        for (dir, mode) in [(scratch.clone(), 0o700), (scratch.join("home"), 0o700)] {
-            fs::create_dir(&dir)
-                .and_then(|()| fs::set_permissions(&dir, fs::Permissions::from_mode(mode)))
-                .and_then(|()| std::os::unix::fs::chown(&dir, Some(who.uid), Some(who.gid)))
-                .map_err(stage_failed)?;
-        }
-        Ok(scratch)
+        fetch_scratch_in(&work, &self.tagged(prefix), who)
     }
 
-    /// Fetch and verify the release; the commit.
-    fn fetch_and_verify(&self, version: &Version, channel: &Channel) -> Result<String, Fault> {
+    /// `name`, with this helper's tag if it has one: `<name>.<tag>`.
+    pub(super) fn tagged(&self, name: &str) -> String {
+        match &self.scratch_tag {
+            Some(tag) => format!("{name}.{tag}"),
+            None => name.to_owned(),
+        }
+    }
+
+    /// What a fetch needs of the root-owned configuration, read once: the channel's source
+    /// and branch, the token for the listing, the settings of the installer and the user the
+    /// fetch runs as. Nothing is fetched that cannot be checked: the pinned `gh` and the
+    /// trusted root are root's, or this host does not believe what they would say.
+    pub(super) fn prepare(&self, version: &Version, channel: &Channel) -> Result<Prepared, Fault> {
         let prefix = crate::mac::release::commit_prefix(version.as_str()).ok_or_else(|| {
             Fault::refused(
                 Code::UnknownRelease,
-                "the version carries no commit (+g and 12 hex digits)",
+                "the version carries no commit (+g or +, then 12 hex digits)",
             )
         })?;
         let trust: &Trust = &self.host.trust;
@@ -217,8 +273,6 @@ impl<E: Exec> Linux<E> {
                 .narrowed_to(std::slice::from_ref(&channel.source_ref))
                 .map_err(|e| Fault::refused(Code::ConfigInvalid, e.to_string()))?
         };
-        // Nothing is fetched that cannot be checked: the pinned `gh` and the trusted root are
-        // root's, or this host does not believe what they would say.
         GhCheck::pinned(&self.layout, &settings)
             .check_trust(&*self.trust)
             .map_err(verify_refused)?;
@@ -226,8 +280,26 @@ impl<E: Exec> Linux<E> {
             uid: settings.run_as.uid,
             gid: settings.run_as.gid,
         };
-        let scratch = self.fetch_scratch(prefix, who)?;
-        let result = self.download_and_verify(prefix, token.as_deref(), &settings, who, &scratch);
+        Ok(Prepared {
+            prefix: prefix.to_owned(),
+            token,
+            settings,
+            who,
+            sums: channel.sums,
+        })
+    }
+
+    /// Fetch and verify the release; the commit.
+    fn fetch_and_verify(&self, version: &Version, channel: &Channel) -> Result<String, Fault> {
+        let prepared = self.prepare(version, channel)?;
+        let scratch = self.fetch_scratch(&prepared.prefix, prepared.who)?;
+        let result = self.download_and_verify(
+            &prepared.prefix,
+            prepared.token.as_deref(),
+            &prepared.settings,
+            prepared.who,
+            &scratch,
+        );
         let _ = fs::remove_dir_all(&scratch);
         result
     }
@@ -245,6 +317,7 @@ impl<E: Exec> Linux<E> {
         let home = scratch.join("home");
         let fetcher = Fetcher {
             platform: &platform,
+            asset: AssetKind::Tarball,
             runner: &*self.runner,
             curl: &self.tools.curl,
             gh: &gh,
@@ -258,17 +331,7 @@ impl<E: Exec> Linux<E> {
                 bundle_max: BUNDLE_CAP,
             },
         };
-        let commit = fetcher.fetch(prefix, scratch).map_err(|e| match e {
-            FetchError::Unknown => {
-                Fault::refused(Code::UnknownRelease, "no release has that commit")
-            }
-            FetchError::Ambiguous => {
-                Fault::refused(Code::AmbiguousRelease, "two releases have that commit")
-            }
-            FetchError::Failed(why) | FetchError::RateLimited(why) => {
-                Fault::refused(Code::FetchFailed, why)
-            }
-        })?;
+        let commit = fetcher.fetch(prefix, scratch).map_err(fetch_fault)?;
         let id = commit_id(&commit)?;
         let partial = Partial::create(&self.layout, &id, self.owner)
             .map_err(|e| Fault::failed(Code::StageFailed, e.to_string()))?;
@@ -333,9 +396,9 @@ fn policy(max_component: u64) -> Policy {
 }
 
 /// What was copied: its length and sha256.
-struct Copied {
-    len: u64,
-    sha256: String,
+pub(super) struct Copied {
+    pub(super) len: u64,
+    pub(super) sha256: String,
 }
 
 /// Open the untrusted file `src` without following a symbolic link, and accept it only as a
@@ -358,13 +421,20 @@ fn open_plain(src: &Path, cap: u64) -> io::Result<File> {
 /// Copy the untrusted file `src` to the new file `dst` (root's, 0600) through the open
 /// descriptor, hashing what is copied (see [`open_plain`]). A file that grew since it was
 /// looked at is cut at `cap`; the digest then names the cut bytes, which no attestation lists.
-fn copy_hashing(src: &Path, dst: &Path, cap: u64) -> io::Result<Copied> {
+pub(super) fn copy_hashing(src: &Path, dst: &Path, cap: u64) -> io::Result<Copied> {
+    copy_hashing_mode(src, dst, cap, 0o600)
+}
+
+/// [`copy_hashing`] into a file of mode `mode`.
+pub(super) fn copy_hashing_mode(src: &Path, dst: &Path, cap: u64, mode: u32) -> io::Result<Copied> {
     let file = open_plain(src, cap)?;
     let mut out = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .mode(mode)
         .open(dst)?;
+    // The mode is exactly `mode`, whatever the umask.
+    out.set_permissions(fs::Permissions::from_mode(mode))?;
     let mut capped = file.take(cap);
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024];
@@ -388,7 +458,7 @@ fn copy_hashing(src: &Path, dst: &Path, cap: u64) -> io::Result<Copied> {
 }
 
 /// The text of the untrusted file `src` (see [`open_plain`]).
-fn read_capped(src: &Path, cap: u64) -> io::Result<String> {
+pub(super) fn read_capped(src: &Path, cap: u64) -> io::Result<String> {
     let mut text = String::new();
     open_plain(src, cap)?.take(cap).read_to_string(&mut text)?;
     Ok(text)
@@ -491,7 +561,7 @@ impl<E: Exec> Backend for Linux<E> {
 /// The host as it is: the real `exec` and runners, this program's own paths.
 pub fn production(units: Vec<Unit>) -> Linux<kbf_host::HostExec> {
     let root = Root::host();
-    let layout = Layout::new(root.clone(), Platform::current());
+    let layout = Layout::new(root.clone(), Platform::current()).with_trust_fallback();
     Linux {
         layout,
         exec: RefCell::new(kbf_host::HostExec::new(root.clone())),
@@ -500,9 +570,11 @@ pub fn production(units: Vec<Unit>) -> Linux<kbf_host::HostExec> {
         allowlist: PathBuf::from(ALLOWLIST),
         units,
         restart_wait: crate::plan::ACTIVE_WAIT,
+        pace: crate::pace::Pace::real(),
         runner: Box::new(crate::runner::SystemRunner),
         installer_runner: Box::new(kbf_installer::run::SystemRunner),
         tools: Tools::production(),
         owner: Owner { uid: 0, gid: 0 },
+        scratch_tag: None,
     }
 }

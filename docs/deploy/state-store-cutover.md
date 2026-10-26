@@ -177,12 +177,12 @@ made since are lost, as after a rollback above).
 A frontend of this release serves no admin port and has no takeover: it holds no generation
 to hand over.
 
-**The proxy's slot supervision does not work over a Postgres store.** It starts every child
-as a candidate (`--await-takeover`) and then calls `takeover`, to start a frontend at boot or
-to swap one in for another. A frontend of this release accepts and ignores `--await-takeover`
-and serves no admin calls, so the child is never brought up and a swap fails before it stops
-the old one. Run a frontend over a Postgres store under its own unit, without
-`--await-takeover`, and start and stop it there.
+**The proxy's slot supervision was removed.** It started every child as a candidate
+(`--await-takeover`) and then called `takeover`. A frontend of this release accepts and
+ignores `--await-takeover` and serves no admin calls, and the proxy of this release refuses
+a `[proxy.upstream]` table. Run each frontend over a Postgres store under its own unit,
+without `--await-takeover`, give the proxy a `[[proxy.frontend]]` table for each, and update
+them one at a time with `kbf-updater` ([kbf-updater.md](kbf-updater.md)).
 
 A SQLite state file is held by one process. This release writes no generation to it; a
 number an earlier release left in it is not changed.

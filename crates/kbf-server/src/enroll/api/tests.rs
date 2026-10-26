@@ -126,6 +126,7 @@ enum Route {
     RevokeToken(String),
     Nodes,
     RevokeNode(String),
+    Adopt(String, String),
 }
 
 impl Route {
@@ -136,6 +137,7 @@ impl Route {
             Route::RevokeToken(token.to_owned()),
             Route::Nodes,
             Route::RevokeNode(node.to_owned()),
+            Route::Adopt("a1".to_owned(), r#"{"roles":["daemon"]}"#.to_owned()),
         ]
     }
 }
@@ -151,6 +153,16 @@ async fn call(state: &Arc<EnrollState>, route: &Route, peer: SocketAddr, h: Head
         Route::Nodes => nodes(st, Caller::direct(peer), h).await,
         Route::RevokeNode(id) => {
             revoke_node_route(st, Caller::direct(peer), Path(id.clone()), h, Bytes::new()).await
+        }
+        Route::Adopt(id, body) => {
+            adopt_node_route(
+                st,
+                Caller::direct(peer),
+                Path(format!("{id}:adopt")),
+                h,
+                Bytes::from(body.clone()),
+            )
+            .await
         }
     }
 }
@@ -425,6 +437,10 @@ async fn every_route_is_behind_the_operator_gate() {
         nodes.iter().all(|n| n.revoked_at.is_none()),
         "a refused revoke revoked a node"
     );
+    assert!(
+        nodes.iter().all(|n| n.id.as_str() != "a1"),
+        "a refused adopt adopted a node"
+    );
 
     // The same calls with every gate passed are answered: the refusals above are the gate's.
     for route in &routes {
@@ -522,6 +538,119 @@ async fn a_node_revoke_writes_deny_rows_and_burns_the_id() {
     };
     assert_eq!(with("{}").await.status(), StatusCode::NOT_FOUND);
     assert_eq!(with(r#"{"x":1}"#).await.status(), StatusCode::BAD_REQUEST);
+}
+
+async fn adopt(state: &Arc<EnrollState>, id: &str, body: &str) -> Response {
+    ok(state, &Route::Adopt(id.to_owned(), body.to_owned())).await
+}
+
+// Catches an adopt that answers something other than the row the listing shows, one that
+// takes a node id or an address twice, one that accepts a request the sibling routes would
+// refuse (unknown field, bad JSON, no roles, a storage node with no address, a loopback
+// address, a name this frontend serves), and a refused adopt that leaves a row behind.
+#[tokio::test]
+async fn adopt_answers_the_row_and_refuses_what_enrollment_refuses() {
+    let store = fake();
+    let state = state_with(
+        Some(ApiToken::for_tests(BEARER)),
+        Some(
+            api(
+                store.clone(),
+                Arc::new(Counting(AtomicU8::new(0))),
+                Ok(ca_pin()),
+            )
+            .with_frontend_names(&["Front.Example".to_owned()]),
+        ),
+    );
+    let good = r#"{"roles":["storage","daemon"],"advertise":"S1.Example:7000"}"#;
+    let (code, row): (_, kbf_types::enroll_api::NodeInfo) =
+        json(adopt(&state, "s1", good).await).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(
+        (row.id.as_str(), row.state.as_str(), row.advertise.as_str()),
+        ("s1", "active", "s1.example:7000")
+    );
+    assert_eq!(row.roles, ["storage", "daemon"]);
+    assert_eq!((row.token_id.as_str(), row.not_after), ("adopted", 0));
+    let (_, listed): (_, NodeList) = json(ok(&state, &Route::Nodes).await).await;
+    assert_eq!(listed.nodes, vec![row]);
+
+    for (id, body, want) in [
+        ("s1", r#"{"roles":["daemon"]}"#, StatusCode::CONFLICT),
+        ("s2", good, StatusCode::CONFLICT),
+        (
+            "s2",
+            r#"{"roles":["storage"],"advertise":"s2.example:7000","x":1}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+        ("s2", "{", StatusCode::BAD_REQUEST),
+        ("s2", "", StatusCode::BAD_REQUEST),
+        (
+            "s2",
+            r#"{"advertise":"s2.example:7000"}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+        ("s2", r#"{"roles":[]}"#, StatusCode::BAD_REQUEST),
+        ("s2", r#"{"roles":["storage"]}"#, StatusCode::BAD_REQUEST),
+        (
+            "s2",
+            r#"{"roles":["storage"],"advertise":"s2.example"}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "s2",
+            r#"{"roles":["daemon"],"advertise":"s2.example:7000"}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+        ("s2", r#"{"roles":["updater"]}"#, StatusCode::BAD_REQUEST),
+        (
+            "s2",
+            r#"{"roles":["storage"],"advertise":"127.0.0.1:7000"}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "s2",
+            r#"{"roles":["storage"],"advertise":"localhost:7000"}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "s2",
+            r#"{"roles":["storage"],"advertise":"FRONT.example:7000"}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+        ("N_2", r#"{"roles":["daemon"]}"#, StatusCode::BAD_REQUEST),
+        (
+            "localhost",
+            r#"{"roles":["daemon"]}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "front.example",
+            r#"{"roles":["daemon"]}"#,
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let (code, text) = text(adopt(&state, id, body).await).await;
+        assert_eq!(code, want, "{id} {body}: {text}");
+    }
+    assert_eq!(
+        list_nodes(&*store).expect("nodes").len(),
+        1,
+        "a refused adopt left a row"
+    );
+
+    // A stale handle's adopt lands nothing and is told so, as a stale revoke is.
+    let stale = state_with(
+        Some(ApiToken::for_tests(BEARER)),
+        Some(api(
+            Arc::new(WritesFenced(store.clone())),
+            Arc::new(Counting(AtomicU8::new(9))),
+            Ok(ca_pin()),
+        )),
+    );
+    let (code, _) = text(adopt(&stale, "s3", r#"{"roles":["daemon"]}"#).await).await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert_eq!(list_nodes(&*store).expect("nodes").len(), 1);
 }
 
 /// Asserts that a store that refuses every write as one of a superseded handle

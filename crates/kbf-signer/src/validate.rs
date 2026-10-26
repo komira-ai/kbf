@@ -2,6 +2,7 @@
 //! to-be-signed structure itself, not on what the frontend says it meant.
 
 use kbf_ca::{Policy, PublicKey};
+use kbf_types::HostRole;
 use x509_parser::oid_registry::{
     OID_SIG_ECDSA_WITH_SHA256, OID_X509_EXT_AUTHORITY_KEY_IDENTIFIER,
     OID_X509_EXT_BASIC_CONSTRAINTS, OID_X509_EXT_EXTENDED_KEY_USAGE, OID_X509_EXT_KEY_USAGE,
@@ -18,7 +19,8 @@ const DIGITAL_SIGNATURE: u16 = 1;
 /// Which door the request came through. The route fixes the role a certificate may carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
-    /// A certificate for an enrolled node: role `storage` or `daemon`.
+    /// A certificate for an enrolled node: role `storage` or `daemon`, or a host's `updater`
+    /// (with its host-role URI).
     Node,
     /// The frontend's own certificate: role `frontend`.
     Frontend,
@@ -63,7 +65,8 @@ pub enum Refusal {
     /// An extension the table does not have.
     #[error("an extension the table does not have")]
     Extension,
-    /// Not exactly one role URI the route may carry.
+    /// Not exactly one role URI the route may carry (or, for `updater`, that and one host-role
+    /// URI naming a host role).
     #[error("not exactly one role URI this route may carry")]
     RoleUri,
     /// The `frontend` role on the node route.
@@ -120,7 +123,7 @@ pub fn check_tbs(
         return Err(Refusal::KeyUsage);
     }
 
-    // Names: any number of DNS names and addresses, and the one role URI.
+    // Names: any number of DNS names and addresses, and the role URI (an updater's two).
     let san = t
         .subject_alternative_name()
         .ok()
@@ -136,14 +139,20 @@ pub fn check_tbs(
             _ => return Err(Refusal::Name),
         }
     }
-    let [uri] = uris[..] else {
-        return Err(Refusal::RoleUri);
+    // One role URI; an updater's certificate has a second, naming its host's role.
+    let role = match uris[..] {
+        [uri] => match uri.strip_prefix(ROLE_URI_PREFIX) {
+            // An updater without its host role is not a shape.
+            Some("updater") | None => return Err(Refusal::RoleUri),
+            Some(role) => role,
+        },
+        [a, b] if route == Route::Node => updater_role(a, b)?,
+        _ => return Err(Refusal::RoleUri),
     };
-    let role = uri.strip_prefix(ROLE_URI_PREFIX).ok_or(Refusal::RoleUri)?;
     // Whether the role serves (serverAuth), and whether it names only its node.
     let (server, single) = match (route, role) {
         (Route::Node, "storage") | (Route::Frontend, "frontend") => (true, false),
-        (Route::Node, "daemon") => (false, true),
+        (Route::Node, "daemon" | "updater") => (false, true),
         (Route::Node, "frontend") => return Err(Refusal::FrontendRole),
         _ => return Err(Refusal::RoleUri),
     };
@@ -168,6 +177,24 @@ pub fn check_tbs(
         return Err(Refusal::ExtendedKeyUsage);
     }
     Ok(())
+}
+
+/// The role of a certificate with two URIs: `updater`, with exactly one `host-role` URI
+/// that names a host role, in either order. Anything else is refused.
+fn updater_role<'a>(a: &'a str, b: &'a str) -> Result<&'a str, Refusal> {
+    let (role, host) = if a.starts_with(HostRole::URI_PREFIX) {
+        (b, a)
+    } else {
+        (a, b)
+    };
+    let host = host
+        .strip_prefix(HostRole::URI_PREFIX)
+        .ok_or(Refusal::RoleUri)?;
+    host.parse::<HostRole>().map_err(|_| Refusal::RoleUri)?;
+    match role.strip_prefix(ROLE_URI_PREFIX) {
+        Some(role @ "updater") => Ok(role),
+        _ => Err(Refusal::RoleUri),
+    }
 }
 
 /// The extensions of the table for an end-entity certificate.

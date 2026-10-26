@@ -14,18 +14,18 @@
 //!
 //! The order, C1 to C11 ([`Step::code`]):
 //!
-//! 1. [`Step::Bootout`]: end the slot's launchd domains, whole, and wait until the domain
-//!    lists nothing of the lease's.
+//! 1. [`Step::Bootout`]: end the slot's launchd domains, whole. No `launchctl` verb is run
+//!    on them afterwards: a root `print` makes a gone domain again.
 //! 2. [`Step::Schedules`]: the uid's crontab and `at` jobs, before the kill: no job
 //!    starts after it.
 //! 3. [`Step::Kill`]: every process of the uid.
 //! 4. [`Step::Images`]: the disk images and volumes the uid mounted.
 //! 5. [`Step::Ipc`]: the System V IPC objects.
 //! 6. [`Step::Flags`]: the user flags, ACLs and modes that would stop the removal,
-//!    **roots first**: the home and the `/var/folders` entry themselves, then what is
-//!    below them.
-//! 7. [`Step::Contents`]: the home emptied; the entry's `0`, `C`, `T` and `X` emptied and
-//!    kept, anything else in the entry removed.
+//!    **roots first**: the home, then what is below it, as root; the `/var/folders`
+//!    entry the same way but **as the slot's uid** (root cannot do it there).
+//! 7. [`Step::Contents`]: the home emptied; the entry's `0`, `C`, `T` and `X` emptied (as
+//!    the slot's uid) and kept, anything else in the entry removed.
 //! 8. [`Step::Shared`]: the uid's files in the shared places.
 //! 9. [`Step::Crashes`]: the crash reports about the uid.
 //! 10. [`Step::Restore`]: the home and the entry's folders back to the owner, mode and
@@ -44,8 +44,9 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Step {
     /// C1. The slot's launchd domains `user/<uid>` and `gui/<uid>` booted out whole (no
-    /// job by its label), then waited for: launchd starts no `KeepAlive` or on-demand job
-    /// of the uid again, and the domain lists only launchd's own.
+    /// job by its label): launchd starts no `KeepAlive` or on-demand job of the uid again.
+    /// It is the last thing run on either domain: a root `launchctl print` of a gone
+    /// `user/<uid>` makes it again, with launchd's agents running in it as the uid.
     Bootout,
     /// C2. The uid's crontab and `at` jobs, before the kill: no job starts after it.
     Schedules,

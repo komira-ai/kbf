@@ -3,6 +3,8 @@
 
 use roxmltree::{Document, Node};
 
+use super::tagged::{StampedObject, StampedPage};
+use super::times;
 use crate::types::Token;
 use crate::{ListPage, ListToken, ObjectInfo, ObjectKey, ObjectStoreError};
 
@@ -22,8 +24,51 @@ pub(crate) fn error_code_message(body: &[u8]) -> (String, String) {
     )
 }
 
+/// An object of a ListObjectsV2 answer, with the text of the fields only a stamped listing
+/// reads.
+struct Entry {
+    key: ObjectKey,
+    size: u64,
+    modified: Option<String>,
+}
+
 /// A ListObjectsV2 answer as a [`ListPage`].
 pub(crate) fn list_page(body: &[u8]) -> Result<ListPage, ObjectStoreError> {
+    let (entries, next) = list_result(body)?;
+    let objects = entries
+        .into_iter()
+        .map(|entry| ObjectInfo {
+            key: entry.key,
+            size: entry.size,
+        })
+        .collect();
+    Ok(ListPage { objects, next })
+}
+
+/// A ListObjectsV2 answer as a [`StampedPage`]: every object must carry a readable
+/// `<LastModified>`.
+pub(crate) fn stamped_page(body: &[u8]) -> Result<StampedPage, ObjectStoreError> {
+    let (entries, next) = list_result(body)?;
+    let mut objects = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let modified = entry.modified.as_deref().and_then(times::iso8601_millis);
+        let modified_millis = modified.ok_or_else(|| {
+            ObjectStoreError::Protocol(format!(
+                "ListObjectsV2 answer: {}: missing or bad <LastModified>",
+                entry.key
+            ))
+        })?;
+        objects.push(StampedObject {
+            key: entry.key,
+            size: entry.size,
+            modified_millis,
+        });
+    }
+    Ok(StampedPage { objects, next })
+}
+
+/// The objects and the next token of a ListObjectsV2 answer.
+fn list_result(body: &[u8]) -> Result<(Vec<Entry>, Option<ListToken>), ObjectStoreError> {
     let bad = |what: String| ObjectStoreError::Protocol(format!("ListObjectsV2 answer: {what}"));
     let text = std::str::from_utf8(body).map_err(|e| bad(e.to_string()))?;
     let doc = Document::parse(text).map_err(|e| bad(e.to_string()))?;
@@ -31,14 +76,19 @@ pub(crate) fn list_page(body: &[u8]) -> Result<ListPage, ObjectStoreError> {
     if root.tag_name().name() != "ListBucketResult" {
         return Err(bad(format!("root element is <{}>", root.tag_name().name())));
     }
-    let mut objects = Vec::new();
+    let mut entries = Vec::new();
     for c in root.children().filter(|n| is_named(*n, "Contents")) {
         let key = child_text(c, "Key").ok_or_else(|| bad("<Contents> without <Key>".into()))?;
         let key = ObjectKey::new(key).map_err(|e| bad(format!("listed key: {e}")))?;
         let size = child_text(c, "Size")
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| bad(format!("{key}: missing or bad <Size>")))?;
-        objects.push(ObjectInfo { key, size });
+        let modified = child_text(c, "LastModified").map(str::to_owned);
+        entries.push(Entry {
+            key,
+            size,
+            modified,
+        });
     }
     let truncated = match child_text(root, "IsTruncated") {
         Some("true") => true,
@@ -50,7 +100,7 @@ pub(crate) fn list_page(body: &[u8]) -> Result<ListPage, ObjectStoreError> {
         (true, _) => return Err(bad("truncated without <NextContinuationToken>".into())),
         (false, _) => None,
     };
-    Ok(ListPage { objects, next })
+    Ok((entries, next))
 }
 
 /// The `UploadId` of a CreateMultipartUpload answer.
@@ -71,12 +121,27 @@ pub(crate) fn upload_id(body: &[u8]) -> Result<String, ObjectStoreError> {
 
 /// The body of CompleteMultipartUpload: each part's number and ETag, in order.
 pub(crate) fn complete_request(etags: &[String]) -> String {
+    complete_document((1..).zip(etags.iter().map(String::as_str)))
+}
+
+/// The body of CompleteMultipartUpload for parts a caller numbers itself: each part's number
+/// and ETag, in the order given.
+pub(crate) fn complete_parts_request(parts: &[(u32, String)]) -> String {
+    complete_document(parts.iter().map(numbered))
+}
+
+/// A part a caller numbered, as a number and an ETag.
+fn numbered(part: &(u32, String)) -> (u64, &str) {
+    (u64::from(part.0), part.1.as_str())
+}
+
+/// A CompleteMultipartUpload document naming these parts, a number and an ETag each.
+fn complete_document<'a>(parts: impl Iterator<Item = (u64, &'a str)>) -> String {
     let mut out =
         String::from("<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
-    for (i, etag) in etags.iter().enumerate() {
+    for (number, etag) in parts {
         out.push_str(&format!(
-            "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
-            i + 1,
+            "<Part><PartNumber>{number}</PartNumber><ETag>{}</ETag></Part>",
             escape(etag)
         ));
     }
@@ -85,15 +150,19 @@ pub(crate) fn complete_request(etags: &[String]) -> String {
 }
 
 /// A CompleteMultipartUpload answer of 200: success only if it is a
-/// `CompleteMultipartUploadResult`. S3 answers 200 and then an `<Error>` when the
-/// completion fails after the answer started.
-pub(crate) fn complete_answer(body: &[u8]) -> Result<(), ObjectStoreError> {
+/// `CompleteMultipartUploadResult`, and then the `ETag` of the object it names, quotes
+/// included, if it names one. S3 answers 200 and then an `<Error>` when the completion fails
+/// after the answer started.
+pub(crate) fn complete_answer(body: &[u8]) -> Result<Option<String>, ObjectStoreError> {
     let text = std::str::from_utf8(body).unwrap_or_default();
-    let root = Document::parse(text)
-        .ok()
-        .map(|doc| doc.root_element().tag_name().name().to_owned());
-    match root.as_deref() {
-        Some("CompleteMultipartUploadResult") => Ok(()),
+    let doc = Document::parse(text).ok();
+    let root = doc.as_ref().map(Document::root_element);
+    let name = root.map(|root| root.tag_name().name().to_owned());
+    match name.as_deref() {
+        Some("CompleteMultipartUploadResult") => {
+            let etag = root.and_then(|root| child_text(root, "ETag"));
+            Ok(etag.map(|etag| etag.trim().to_owned()))
+        }
         Some("Error") => {
             let (code, message) = error_code_message(body);
             Err(ObjectStoreError::Service {
@@ -204,7 +273,10 @@ mod tests {
         let done = format!(
             "<CompleteMultipartUploadResult {NS}><ETag>\"x-2\"</ETag></CompleteMultipartUploadResult>"
         );
-        assert!(complete_answer(done.as_bytes()).is_ok());
+        let etag = complete_answer(done.as_bytes()).unwrap();
+        assert_eq!(etag.as_deref(), Some("\"x-2\""));
+        let bare = format!("<CompleteMultipartUploadResult {NS}/>");
+        assert_eq!(complete_answer(bare.as_bytes()).unwrap(), None);
         let late = b"<Error><Code>InternalError</Code><Message>m</Message></Error>";
         let late = complete_answer(late).err().map(|e| e.to_string());
         assert_eq!(late.as_deref(), Some("store answered 200 InternalError: m"));
@@ -212,6 +284,22 @@ mod tests {
             complete_answer(b""),
             Err(ObjectStoreError::Protocol(_))
         ));
+    }
+
+    /// Asserts that a completion names the parts by the numbers the caller gave, in the order
+    /// given and not by position, with the ETags escaped.
+    #[test]
+    fn a_completion_names_parts_by_their_own_numbers() {
+        let body = complete_parts_request(&[(2, "\"a\"".into()), (5, "b&c".into())]);
+        assert!(
+            body.contains(
+                "<Part><PartNumber>2</PartNumber><ETag>\"a\"</ETag></Part>\
+                 <Part><PartNumber>5</PartNumber><ETag>b&amp;c</ETag></Part>"
+            ),
+            "{body}"
+        );
+        assert!(body.starts_with("<CompleteMultipartUpload "), "{body}");
+        assert!(body.ends_with("</CompleteMultipartUpload>"), "{body}");
     }
 
     /// Catches: an error body read without its code, which callers match on.
@@ -293,5 +381,46 @@ mod tests {
         assert_eq!(page.objects.len(), 1);
         assert_eq!(page.objects[0].key.as_str(), "p/a");
         assert_eq!(page.objects[0].size, 7);
+    }
+
+    /// Asserts that a stamped page carries each object's key, size and time of last write in
+    /// milliseconds, and the next token as a plain page does.
+    #[test]
+    fn a_stamped_page_carries_the_times_of_last_write() {
+        let body = format!(
+            "<ListBucketResult {NS}><IsTruncated>true</IsTruncated>\
+             <NextContinuationToken>t2</NextContinuationToken>\
+             <Contents><Key>p/a</Key><LastModified>2009-10-12T17:50:30.000Z</LastModified>\
+             <ETag>\"x\"</ETag><Size>3</Size></Contents>\
+             <Contents><Key>p/b</Key><LastModified>1970-01-01T00:00:01.500Z</LastModified>\
+             <Size>0</Size></Contents></ListBucketResult>"
+        );
+        let page = stamped_page(body.as_bytes()).unwrap();
+        assert_eq!(page.next, Some(ListToken(Token::Continue("t2".into()))));
+        let got: Vec<_> = page
+            .objects
+            .iter()
+            .map(|o| (o.key.as_str(), o.size, o.modified_millis))
+            .collect();
+        assert_eq!(got, [("p/a", 3, 1_255_369_830_000), ("p/b", 0, 1_500)]);
+        assert_eq!(list_page(body.as_bytes()).unwrap().objects.len(), 2);
+    }
+
+    /// Asserts that a stamped page is a protocol error, naming the key, when an object has no
+    /// `<LastModified>` or one that is not a time, and that an answer that is not a listing
+    /// is refused as it is for a plain page.
+    #[test]
+    fn a_stamped_page_without_readable_times_is_a_protocol_error() {
+        for modified in ["", "<LastModified>yesterday</LastModified>"] {
+            let body = format!(
+                "<ListBucketResult><Contents><Key>p/a</Key>{modified}<Size>1</Size>\
+                 </Contents></ListBucketResult>"
+            );
+            let err = stamped_page(body.as_bytes()).unwrap_err();
+            assert!(matches!(err, ObjectStoreError::Protocol(_)), "{err:?}");
+            let why = "p/a: missing or bad <LastModified>";
+            assert!(err.to_string().contains(why), "{err}");
+        }
+        assert!(stamped_page(b"not xml").is_err());
     }
 }

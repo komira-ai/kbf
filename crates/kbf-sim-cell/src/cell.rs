@@ -62,8 +62,9 @@ pub enum Kind {
     /// A tier whose budget holds little beyond its staged blocks, so flushed copies
     /// are evicted while reads of them are in flight.
     TierEviction,
-    /// All-in-one: daemon 0 is the daemon half of the server's process, and one or two
-    /// kills of that process take both halves down mid-build; both start again.
+    /// A storage-and-daemon node: daemon 0 is the daemon half of the server's process (the
+    /// cell's server holds the store and the metadata log), and one or two kills of that
+    /// process take both halves down mid-build; both start again.
     WholeProcess,
 }
 

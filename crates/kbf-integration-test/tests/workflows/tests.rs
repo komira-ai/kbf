@@ -578,12 +578,12 @@ fn contents_write_needs_a_job_that_runs_only_for_a_release_push_to_main() {
 fn a_release_tag_job_gets_no_other_write_scope() {
     // Catches: the tag-push exception read as "any write scope" (signing provenance
     // from a tag, or writing packages or workflow runs), or `contents` matched loosely.
-    for p in ["{id-token: write}", "{attestations: write}"] {
-        refused(
-            &format!("    runs-on: ubuntu-latest\n{TAG_PUSH_IF}    permissions: {p}\n"),
-            &format!("is exactly `{SIGNING_PUSH_ONLY}`"),
-        );
-    }
+    refused(
+        &format!(
+            "    runs-on: ubuntu-latest\n{TAG_PUSH_IF}    permissions: {{attestations: write}}\n"
+        ),
+        &format!("is exactly `{SIGNING_PUSH_ONLY}`"),
+    );
     for p in [
         "{packages: write}",
         "{actions: write}",
@@ -596,6 +596,40 @@ fn a_release_tag_job_gets_no_other_write_scope() {
             "a job's `permissions`",
         );
     }
+}
+
+#[test]
+fn id_token_write_is_also_allowed_for_a_release_push_to_main_and_nothing_wider() {
+    // Catches: the deploy step's OIDC token refused where the release workflow needs it, and
+    // the exception taken beyond its one scope and its one condition: `attestations` stays
+    // with the signing push, `id-token` stays refused for any other condition (a release
+    // condition that is loosened, the main-ref condition, none), and a level other than
+    // `write` is no grant.
+    clean(&workflow(&format!(
+        "    runs-on: ubuntu-latest\n{TAG_PUSH_IF}    permissions: {{contents: read, id-token: write}}\n"
+    )));
+    refused(
+        &format!(
+            "    runs-on: ubuntu-latest\n{TAG_PUSH_IF}    permissions: {{attestations: write}}\n"
+        ),
+        &format!("is exactly `{SIGNING_PUSH_ONLY}`"),
+    );
+    for cond in [
+        "",
+        MAIN_REF_IF,
+        "    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' }}\n",
+    ] {
+        refused(
+            &format!("    runs-on: ubuntu-latest\n{cond}    permissions: {{id-token: write}}\n"),
+            &format!(
+                "`id-token: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}`"
+            ),
+        );
+    }
+    refused(
+        &format!("    runs-on: ubuntu-latest\n{TAG_PUSH_IF}    permissions: {{id-token: admin}}\n"),
+        "a job's `permissions`",
+    );
 }
 
 /// The `if:` line under which a job may write issues, as the lint requires it.

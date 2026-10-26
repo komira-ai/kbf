@@ -1,7 +1,26 @@
-//! An S3 service on loopback, for tests (feature `testkit`): PUT, ranged GET, and
+//! An S3 service on loopback, for tests (feature `testkit`): PUT, GET (whole or one range),
+//! HEAD, ListObjectsV2 (prefix, `max-keys`, `continuation-token`, `start-after`), and
 //! multipart upload (create, parts, complete, abort), with S3's rules on
 //! part sizes enforced at completion and conditional writes (`If-None-Match: *`) on a
-//! PUT and a completion, and DELETE of a plain object.
+//! PUT and a completion, a PUT that replaces an object only if it has the entity tag in
+//! `If-Match` (412 for another tag, 404 if there is no object), and DELETE of a plain object.
+//!
+//! Every object has a time of last write: the system clock until a test sets one
+//! ([`FakeS3::set_time`]), in whole seconds as S3 keeps them. The entity tag of an object is
+//! the quoted hex MD5 of its bytes, as S3 makes it for an object written by one PUT. It is
+//! worked out when a HEAD asks for it and for a PUT that carries `If-Match` (an object of
+//! many GiB of zeros is held compactly, and hashing it at every PUT would cost what the
+//! compact form saves), so a HEAD of an object that does not fit in memory is not for this
+//! service. The tag of a part depends on its bytes alone ([`part_etag`]; it is not an MD5,
+//! which a part of many MiB of zeros would cost the same), and the tag of an object made of
+//! parts is, as on S3, not the MD5 of its bytes: it is the quoted hex MD5 of the tags of the
+//! parts, a dash and the number of parts. The answer to the completion names it, and so does
+//! a HEAD.
+//!
+//! An upload is known by its id and its key: a part, a completion or an abort that names
+//! the id of an upload with another key finds no upload, as on S3 (`NoSuchUpload`, 404 for a
+//! part or an abort and 400 for a completion). The 5 MiB that every part but the last must
+//! have can be lowered ([`FakeS3::set_min_part_bytes`]) for a test that sends small parts.
 //!
 //! It keeps what a test asks about: the uploads begun and not yet completed or aborted
 //! ([`FakeS3::incomplete_uploads`]), how many single PUTs and parts it took and the
@@ -14,16 +33,23 @@
 //! is refused 403, as a real store refuses a wrong key.
 
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use md5::{Digest, Md5};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::sigv4::{Request as Signed, Signer};
+use super::sigv4::{Request as Signed, Signer, Utc};
+use super::times::MONTHS;
 use super::{Credentials, S3Config, S3Store};
 use crate::{Capabilities, ObjectKey};
+
+/// The weekday names of an HTTP date, from Thursday: the day of the epoch.
+const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
 
 /// The runs bytes are cut into when kept: a run of all zeros is only counted.
 const RUN: usize = 64 << 10;
@@ -134,6 +160,74 @@ impl State {
         let at = self.failures.iter().position(|f| *f == failure);
         at.map(|i| self.failures.remove(i)).is_some()
     }
+
+    /// Keeps `kept` under `key`, stamped with the time of the service, with the entity tag
+    /// `joined` if it is made of parts and the tag of its bytes if not.
+    fn store(&mut self, key: String, kept: Kept, joined: Option<String>) {
+        let modified = self.time.unwrap_or_else(system_seconds);
+        let stored = Stored {
+            kept,
+            modified,
+            joined,
+        };
+        self.objects.insert(key, stored);
+    }
+}
+
+/// The second the system clock says.
+fn system_seconds() -> u64 {
+    let since = SystemTime::now().duration_since(UNIX_EPOCH);
+    since.map_or(0, |since| since.as_secs())
+}
+
+/// The entity tag S3 gives an object written by one PUT: the quoted hex MD5 of its bytes.
+fn etag_of(kept: &Kept) -> String {
+    let digest = Md5::digest(kept.read(0, kept.len));
+    format!("\"{}\"", hex::encode(digest))
+}
+
+/// The entity tag this service gives a part: quoted, and a hash of the bytes that is
+/// worked out from the runs they are kept in, so that a run of zeros costs its length and
+/// not its bytes.
+fn part_tag(kept: &Kept) -> String {
+    let mut hasher = DefaultHasher::new();
+    for run in &kept.runs {
+        match run {
+            Ok(bytes) => {
+                1_u8.hash(&mut hasher);
+                bytes.hash(&mut hasher);
+            }
+            Err(zeros) => {
+                0_u8.hash(&mut hasher);
+                zeros.hash(&mut hasher);
+            }
+        }
+    }
+    format!("\"{:016x}\"", hasher.finish())
+}
+
+/// The entity tag this service gives a part of these bytes, quotes included: the same for
+/// the same bytes, and another for other bytes.
+#[must_use]
+pub fn part_etag(bytes: &[u8]) -> String {
+    part_tag(&Kept::of(bytes))
+}
+
+/// `Sun, 06 Nov 1994 08:49:37 GMT`, the form of a `Last-Modified` header.
+fn http_date(seconds: u64) -> String {
+    let utc = Utc::of(UNIX_EPOCH + Duration::from_secs(seconds), false);
+    let weekday = WEEKDAYS[((seconds / 86_400) % 7) as usize];
+    let month = MONTHS[utc.month as usize - 1];
+    format!(
+        "{weekday}, {:02} {month} {:04} {:02}:{:02}:{:02} GMT",
+        utc.day, utc.year, utc.hour, utc.minute, utc.second
+    )
+}
+
+/// `2009-10-12T17:50:30.000Z`, the form of a `<LastModified>` of a listing.
+fn iso_date(seconds: u64) -> String {
+    let utc = Utc::of(UNIX_EPOCH + Duration::from_secs(seconds), false);
+    utc.iso8601().replace('Z', ".000Z")
 }
 
 /// One multipart upload in progress.
@@ -143,9 +237,28 @@ struct Upload {
     parts: BTreeMap<u32, (String, Kept)>,
 }
 
+/// An object held, with the second it was last written.
+#[derive(Debug)]
+struct Stored {
+    kept: Kept,
+    modified: u64,
+    /// The entity tag of an object made of parts; none for an object of one PUT.
+    joined: Option<String>,
+}
+
+impl Stored {
+    /// The entity tag of the object.
+    fn etag(&self) -> String {
+        self.joined.clone().unwrap_or_else(|| etag_of(&self.kept))
+    }
+}
+
 #[derive(Debug, Default)]
 struct State {
-    objects: BTreeMap<String, Kept>,
+    objects: BTreeMap<String, Stored>,
+    /// The second objects are stamped with, when a test set one ([`FakeS3::set_time`]); the
+    /// system clock's otherwise.
+    time: Option<u64>,
     uploads: BTreeMap<String, Upload>,
     next: u64,
     failures: Vec<Failure>,
@@ -155,6 +268,9 @@ struct State {
     credentials: Option<(String, String)>,
     /// The signing regions of the requests so far.
     regions: std::collections::BTreeSet<String>,
+    /// The least size of a part that is not the last of its upload, when a test set one
+    /// ([`FakeS3::set_min_part_bytes`]); [`super::MIN_PART_BYTES`] otherwise.
+    min_part: Option<u64>,
     /// The next AbortMultipartUpload is to be held ([`FakeS3::hold_next_abort`]).
     hold_abort: bool,
     /// AbortMultipartUpload requests held and not yet dropped.
@@ -244,6 +360,13 @@ impl FakeS3 {
         self.lock().failures.push(failure);
     }
 
+    /// From now on takes a part of at least `bytes` bytes where S3 takes one of 5 MiB or
+    /// more: every part of an upload but the last has to be that large when the upload is
+    /// completed. For a test that sends parts of a few bytes.
+    pub fn set_min_part_bytes(&self, bytes: u64) {
+        self.lock().min_part = Some(bytes);
+    }
+
     /// Holds the next AbortMultipartUpload request unanswered and unhandled: the
     /// request is read, then waits for its caller to close the connection (it went
     /// away) and is dropped, never having reached the store. Once.
@@ -273,7 +396,13 @@ impl FakeS3 {
     /// The length of the object under `key`, if there is one.
     #[must_use]
     pub fn object_len(&self, key: &ObjectKey) -> Option<u64> {
-        self.lock().objects.get(key.as_str()).map(|k| k.len)
+        self.lock().objects.get(key.as_str()).map(|o| o.kept.len)
+    }
+
+    /// From now on stamps the objects it takes with this time, in seconds since the Unix
+    /// epoch, instead of the system clock's.
+    pub fn set_time(&self, seconds: u64) {
+        self.lock().time = Some(seconds);
     }
 
     /// Every request so far, as `METHOD /path?query`.
@@ -375,7 +504,13 @@ fn parse_head(head: &str) -> Option<Request> {
 }
 
 fn answer(status: &str, headers: &[(&str, String)], body: &[u8]) -> Vec<u8> {
-    let mut out = format!("HTTP/1.1 {status}\r\ncontent-length: {}\r\n", body.len());
+    answer_sized(status, body.len() as u64, headers, body)
+}
+
+/// An answer whose `content-length` is `length`: a HEAD gives the length of the body it
+/// leaves out.
+fn answer_sized(status: &str, length: u64, headers: &[(&str, String)], body: &[u8]) -> Vec<u8> {
+    let mut out = format!("HTTP/1.1 {status}\r\ncontent-length: {length}\r\n");
     for (name, value) in headers {
         out.push_str(&format!("{name}: {value}\r\n"));
     }
@@ -439,12 +574,15 @@ fn handle(state: &mut State, request: &Request) -> Vec<u8> {
                 state.take(Failure::Part(number)),
                 state.take(Failure::NoEtag),
             );
-            let upload = state.uploads.get_mut(&id).filter(|_| !failed);
-            let Some(upload) = upload else {
+            if failed {
                 return error("500 Internal Server Error", "InternalError");
+            }
+            let upload = state.uploads.get_mut(&id).filter(|up| up.key == key);
+            let Some(upload) = upload else {
+                return error("404 Not Found", "NoSuchUpload");
             };
-            let etag = format!("\"{id}-{number}-{body_len}\"");
             let kept = Kept::of(&request.body);
+            let etag = part_tag(&kept);
             upload.parts.insert(number, (etag.clone(), kept));
             state.stats.parts += 1;
             let headers = if no_etag {
@@ -456,27 +594,53 @@ fn handle(state: &mut State, request: &Request) -> Vec<u8> {
         }
         ("POST", None, Some(id), None) => complete(state, &id, &key, conditional, &request.body),
         ("DELETE", None, Some(id), None) => {
-            if state.take(Failure::Abort) || state.uploads.remove(&id).is_none() {
+            if state.take(Failure::Abort) {
                 return error("500 Internal Server Error", "InternalError");
             }
+            let known = state.uploads.get(&id).is_some_and(|up| up.key == key);
+            if !known {
+                return error("404 Not Found", "NoSuchUpload");
+            }
+            state.uploads.remove(&id);
             state.stats.aborted += 1;
             answer("204 No Content", &[], b"")
         }
-        ("PUT", None, None, None) => {
-            if conditional && state.objects.contains_key(&key) {
-                return error("412 Precondition Failed", "PreconditionFailed");
-            }
-            state.objects.insert(key, Kept::of(&request.body));
-            state.stats.single_puts += 1;
-            answer("200 OK", &[], b"")
-        }
+        ("PUT", None, None, None) => put_object(state, key, conditional, request),
         ("DELETE", None, None, None) => {
             state.objects.remove(&key);
             answer("204 No Content", &[], b"")
         }
+        ("GET", None, None, None) if key.is_empty() => list(state, request),
         ("GET", None, None, None) => get(state, &key, request.headers.get("range")),
+        ("HEAD", None, None, None) => head(state, &key),
         _ => error("501 Not Implemented", "NotImplemented"),
     }
+}
+
+/// A PUT of a whole object: refused 412 if `conditional` (`If-None-Match: *`) and the key
+/// exists, or if it carries `If-Match` and the object has another entity tag (404 if there is
+/// no object). The answer to a PUT with `If-Match` carries the new object's entity tag.
+fn put_object(state: &mut State, key: String, conditional: bool, request: &Request) -> Vec<u8> {
+    let expected = request.headers.get("if-match");
+    if let Some(expected) = expected {
+        let Some(stored) = state.objects.get(&key) else {
+            return error("404 Not Found", "NoSuchKey");
+        };
+        if stored.etag() != *expected {
+            return error("412 Precondition Failed", "PreconditionFailed");
+        }
+    }
+    if conditional && state.objects.contains_key(&key) {
+        return error("412 Precondition Failed", "PreconditionFailed");
+    }
+    let kept = Kept::of(&request.body);
+    let headers = match expected {
+        Some(_) => vec![("etag", etag_of(&kept))],
+        None => vec![],
+    };
+    state.store(key, kept, None);
+    state.stats.single_puts += 1;
+    answer("200 OK", &headers, b"")
 }
 
 /// The region in `AWS4-HMAC-SHA256 Credential=<id>/<date>/<region>/s3/aws4_request, ..`.
@@ -563,10 +727,11 @@ fn unescape(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// The object an upload's completion names: its parts, in the order the body lists
-/// them, each with its ETag and every one but the last at least 5 MiB; or the S3 error
-/// code that refuses it.
-fn assemble(upload: &Upload, body: &[u8]) -> Result<Kept, &'static str> {
+/// The object an upload's completion names, and its entity tag: its parts, in the order the
+/// body lists them, each with its ETag and every one but the last at least `min_part` bytes;
+/// or the S3 error code that refuses it. The entity tag is the quoted hex MD5 of the tags
+/// of the parts, a dash and the number of parts.
+fn assemble(upload: &Upload, body: &[u8], min_part: u64) -> Result<(Kept, String), &'static str> {
     let text = String::from_utf8_lossy(body);
     let doc = roxmltree::Document::parse(&text).map_err(|_| "MalformedXML")?;
     let field = |part: roxmltree::Node<'_, '_>, name: &str| {
@@ -583,23 +748,30 @@ fn assemble(upload: &Upload, body: &[u8]) -> Result<Kept, &'static str> {
         })
         .collect();
     let mut object = Kept::default();
+    let mut tags = Md5::new();
     for (i, (number, etag)) in named.iter().enumerate() {
         let kept = number.and_then(|n| upload.parts.get(&n));
         let kept = kept
             .filter(|(e, _)| Some(e) == etag.as_ref())
             .ok_or("InvalidPart")?;
-        let small = i + 1 < named.len() && kept.1.len < super::MIN_PART_BYTES;
+        let small = i + 1 < named.len() && kept.1.len < min_part;
         (!small).then_some(()).ok_or("EntityTooSmall")?;
         object.extend(&kept.1);
+        tags.update(kept.0.as_bytes());
     }
-    Ok(object)
+    let joined = format!("\"{}-{}\"", hex::encode(tags.finalize()), named.len());
+    Ok((object, joined))
 }
 
 /// CompleteMultipartUpload ([`assemble`]); conditional on `If-None-Match: *`.
 fn complete(state: &mut State, id: &str, key: &str, conditional: bool, body: &[u8]) -> Vec<u8> {
+    let min_part = state.min_part.unwrap_or(super::MIN_PART_BYTES);
     let upload = state.uploads.get(id).filter(|u| u.key == key);
-    let object = match upload.ok_or("NoSuchUpload").and_then(|u| assemble(u, body)) {
-        Ok(object) => object,
+    let assembled = upload
+        .ok_or("NoSuchUpload")
+        .and_then(|u| assemble(u, body, min_part));
+    let (object, joined) = match assembled {
+        Ok(assembled) => assembled,
         Err(code) => return error("400 Bad Request", code),
     };
     if state.take(Failure::CompleteLate) {
@@ -613,20 +785,79 @@ fn complete(state: &mut State, id: &str, key: &str, conditional: bool, body: &[u
         return error("412 Precondition Failed", "PreconditionFailed");
     }
     state.uploads.remove(id);
-    state.objects.insert(key.to_owned(), object);
+    state.store(key.to_owned(), object, Some(joined.clone()));
     state.stats.completed += 1;
-    let done =
-        "<CompleteMultipartUploadResult><ETag>\"done\"</ETag></CompleteMultipartUploadResult>";
+    let done = format!(
+        "<CompleteMultipartUploadResult><ETag>{joined}</ETag>\
+         </CompleteMultipartUploadResult>"
+    );
     answer("200 OK", &[], done.as_bytes())
 }
 
-/// A GET of one `bytes=first-last` range (the S3 store asks for nothing else).
+/// A HEAD: the size, entity tag and time of last write of an object, and no body.
+fn head(state: &State, key: &str) -> Vec<u8> {
+    let Some(stored) = state.objects.get(key) else {
+        return answer("404 Not Found", &[], b"");
+    };
+    let headers = [
+        ("etag", stored.etag()),
+        ("last-modified", http_date(stored.modified)),
+    ];
+    answer_sized("200 OK", stored.kept.len, &headers, b"")
+}
+
+/// A ListObjectsV2: at most `max-keys` of the keys under `prefix` that sort after the
+/// continuation token (the last key of the page before) or, without one, after
+/// `start-after`.
+fn list(state: &State, request: &Request) -> Vec<u8> {
+    let query = |name: &str| request.query.get(name).map(|value| unescape(value));
+    let prefix = query("prefix").unwrap_or_default();
+    let max_keys: usize = query("max-keys")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    let token = query("continuation-token");
+    let after = token.or_else(|| query("start-after"));
+    let after = after.as_deref().unwrap_or("");
+    let matching: Vec<(&String, &Stored)> = state
+        .objects
+        .iter()
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .filter(|(key, _)| key.as_str() > after)
+        .collect();
+    let page = &matching[..matching.len().min(max_keys)];
+    let mut body = String::from("<ListBucketResult>");
+    for (key, stored) in page {
+        body.push_str(&format!(
+            "<Contents><Key>{key}</Key><Size>{}</Size>\
+             <LastModified>{}</LastModified></Contents>",
+            stored.kept.len,
+            iso_date(stored.modified)
+        ));
+    }
+    let more = page.last().filter(|_| matching.len() > page.len());
+    let tail = match more {
+        Some((last, _)) => format!(
+            "<IsTruncated>true</IsTruncated>\
+             <NextContinuationToken>{last}</NextContinuationToken>"
+        ),
+        None => "<IsTruncated>false</IsTruncated>".to_owned(),
+    };
+    body.push_str(&tail);
+    body.push_str("</ListBucketResult>");
+    answer("200 OK", &[], body.as_bytes())
+}
+
+/// A GET of the whole object, or of one `bytes=first-last` range.
 fn get(state: &State, key: &str, range: Option<&String>) -> Vec<u8> {
-    let Some(object) = state.objects.get(key) else {
+    let Some(stored) = state.objects.get(key) else {
         return error("404 Not Found", "NoSuchKey");
     };
+    let object = &stored.kept;
+    let Some(range) = range else {
+        return answer("200 OK", &[], &object.read(0, object.len));
+    };
     let parsed = range
-        .and_then(|r| r.strip_prefix("bytes="))
+        .strip_prefix("bytes=")
         .and_then(|r| r.split_once('-'))
         .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)));
     let Some((first, last)) = parsed.filter(|(f, l)| f < &object.len && f <= l) else {
@@ -681,5 +912,47 @@ mod tests {
         assert_eq!(kept.runs[0].as_ref().err(), Some(&(3 * RUN as u64 + 1)));
         assert_eq!(kept.len, 3 * RUN as u64 + 1);
         assert_eq!(kept.read(RUN as u64 - 1, RUN as u64 + 1), [0, 0]);
+    }
+
+    /// Asserts that a time is written in the two forms S3 writes it in: the HTTP date, to
+    /// the weekday (the documented example, and the epoch, a Thursday), and the ISO form
+    /// of a listing with its milliseconds.
+    #[test]
+    fn times_are_written_as_s3_writes_them() {
+        assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(iso_date(1_255_369_830), "2009-10-12T17:50:30.000Z");
+    }
+
+    /// Asserts that the tag of a part is quoted and depends on the bytes of the part and
+    /// nothing else: the same for the same bytes, another for other bytes, for zeros of
+    /// another length, and for the same number of zeros with a one in another place.
+    #[test]
+    fn the_tag_of_a_part_depends_on_its_bytes() {
+        let tag = part_etag(b"hello ");
+        assert_eq!(tag, part_etag(b"hello "));
+        assert_ne!(tag, part_etag(b"HELLO "));
+        assert!(tag.starts_with('"'), "{tag}");
+        assert!(tag.ends_with('"'), "{tag}");
+        assert_eq!(tag.trim_matches('"').len(), 16);
+        let zeros = |n: usize| part_etag(&vec![0_u8; n]);
+        assert_eq!(zeros(3 * RUN), zeros(3 * RUN));
+        assert_ne!(zeros(3 * RUN), zeros(3 * RUN + 1));
+        let mut shifted = vec![0_u8; 2 * RUN];
+        shifted[RUN] = 1;
+        let mut other = vec![0_u8; 2 * RUN];
+        other[RUN + 1] = 1;
+        assert_ne!(part_etag(&shifted), part_etag(&other));
+    }
+
+    /// Asserts that the entity tag is the quoted hex MD5 of the bytes (the tag S3 gives an
+    /// object of one PUT), and does not depend on the runs the bytes are kept in.
+    #[test]
+    fn the_entity_tag_is_the_quoted_md5_of_the_bytes() {
+        let whole = Kept::of(b"abc");
+        assert_eq!(etag_of(&whole), "\"900150983cd24fb0d6963f7d28e17f72\"");
+        let mut joined = Kept::of(b"a");
+        joined.extend(&Kept::of(b"bc"));
+        assert_eq!(etag_of(&joined), etag_of(&whole));
     }
 }

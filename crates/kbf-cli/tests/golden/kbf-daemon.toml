@@ -135,6 +135,26 @@ segment-upload-streams = 16
 # How many segment uploads of one action's outputs are in flight at once: the server checks and stages one upload while the next are sending (`docs/design/write-path.md`, section 4.1). Their `PutRange` calls still take permits of `--transfer-in-flight`'s uploads' share
 segment-uploads-in-flight = 4
 
+[packs]
+# Reads the blobs of a lease from the packs of the farm's object store before the storage nodes: the daemon asks the frontend where a blob lies (over the connection to `--cas`; for `kbf storage-and-daemon`, which has none, over one to the first `--server`), reads that range of that pack and checks it against the digest. A blob the frontend does not locate, and a frontend that serves no locations (it was started without `--pack-index`), leave the read where it was, and outputs are stored where they were. A pack that is gone, or whose bytes are not the digest, fails the read. Needs `--pack-store-endpoint`, `--pack-store-bucket` and `--pack-store-credentials-file`. Refused by `kbf all-in-one` and by `kbf storage-and-daemon` started without `--frontend`, whose daemon half reads blobs in-process. Left out, no object store is built or contacted and every blob is read as it always was
+pack-read = false
+# The most bytes of blobs `--pack-read-cache-dir` holds
+# pack-read-cache-bytes = "BYTES"
+# A directory this process owns where the blobs read from packs are kept, one file each, checked by digest on every read; the least recently used are removed to stay within `--pack-read-cache-bytes`. The daemon's input cache already keeps blobs by digest, so left out nothing more is kept. Needs `--pack-read-cache-bytes`
+# pack-read-cache-dir = "DIR"
+# The bucket of `--pack-store-endpoint` that holds the packs, under the keys `cas/`. Needs `--pack-read`
+# pack-store-bucket = "BUCKET"
+# A file with the key pair for `--pack-store-endpoint`, as JSON `{"access_key_id": "...", "secret_access_key": "..."}`, readable by its owner alone (mode 0600 or 0400): a key that may read the objects under `cas/` and write none (`--pack-write` has a key of its own). The secret is never a flag: a command line is world-readable. Needs `--pack-read`
+# pack-store-credentials-file = "PATH"
+# The S3-compatible object store the packs are kept in, as `http://host:port`. The daemon reads packs from it, and with `--pack-write` writes them. Needs `--pack-read`
+# pack-store-endpoint = "URL"
+# The region the requests to `--pack-store-endpoint` are signed for; `us-east-1` if left out
+pack-store-region = "us-east-1"
+# A file with the key pair `--pack-write` writes with, in the form of `--pack-store-credentials-file`: a key that may create objects under `cas/` (it also deletes the one it creates to check the store at start, and if it may not, that object is left for garbage collection). The secret is never a flag. Needs `--pack-write`
+# pack-store-write-credentials-file = "PATH"
+# Writes the outputs of a lease into packs: many blobs in one object of the pack store, written with a create-only request, then committed to the frontend (`CommitPack`), which records them before the put is acknowledged. Used only while the frontend says it takes commits (it has `--pack-index` and the pack store flags); a blob that cannot be packed is stored where it was. At start the daemon checks that the store refuses to replace an object, and refuses to start if it does not. Needs `--pack-read` and `--pack-store-write-credentials-file`. Left out, outputs are stored as they always were
+pack-write = false
+
 [storage-client]
 # The longest, in milliseconds, that dialling a storage node may take: for its TCP connection and for its TLS handshake each. Must be 1 to 3600000 (one hour)
 storage-dial-timeout-ms = 10000

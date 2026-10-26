@@ -31,14 +31,20 @@ pub fn flock_held(lock_file: &Path) -> bool {
     !matches!(file.try_lock_shared(), Ok(()))
 }
 
-/// For tests: wait (up to 5 s) until nobody holds or shares the `flock` on `lock_file`, so
-/// that an exclusive lock can be had. A process another test thread starts copies every open
-/// descriptor until it execs, and a lock lives as long as any copy of the descriptor does, so
-/// a lock this test has dropped can outlive the drop by a moment. (The program itself starts
-/// nothing while it holds or probes a lock.) A lock that never goes is left for the caller's
-/// own assertion to report.
+/// For tests: wait (up to 500 looks, 10 ms apart: 5 s) until nobody holds or shares the
+/// `flock` on `lock_file`, so that an exclusive lock can be had. A process another test thread
+/// starts copies every open descriptor until it execs, and a lock lives as long as any copy of
+/// the descriptor does, so a lock this test has dropped can outlive the drop by a moment. (The
+/// program itself starts nothing while it holds or probes a lock.) A lock that never goes is
+/// left for the caller's own assertion to report.
 #[cfg(test)]
 pub fn wait_lockable(lock_file: &Path) {
+    wait_lockable_paced(lock_file, &crate::pace::Pace::real());
+}
+
+/// [`wait_lockable`] on the clock `pace` pauses with.
+#[cfg(test)]
+pub fn wait_lockable_paced(lock_file: &Path, pace: &crate::pace::Pace) {
     use std::time::Duration;
 
     let Ok(file) = OpenOptions::new().read(true).open(lock_file) else {
@@ -48,7 +54,7 @@ pub fn wait_lockable(lock_file: &Path) {
         if file.try_lock().is_ok() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        (pace.sleep)(Duration::from_millis(10));
     }
 }
 

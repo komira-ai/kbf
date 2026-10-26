@@ -10,11 +10,12 @@ use kbf_testkit::dir::TestDir;
 use kbf_types::HostRole;
 
 use super::build::{
-    NO_CREDENTIAL, NoCredential, NoDrain, build, drain_for, identity_of_files, no_drain, run_agent,
+    NO_CREDENTIAL, NoCredential, build, drain_for, frontend_ports, identity_of_files, run_agent,
     run_config, unix_now,
 };
 use super::coordinator::{Endpoint, TlsFiles};
 use super::flags::{Config, NodeApi, Timing};
+use super::local::{Limits, SocketLocal};
 use super::pki::{Pki, write_files};
 use super::run::Stop;
 use super::status::host_platform;
@@ -45,11 +46,12 @@ impl Rig {
             channel: "stable".to_owned(),
             helper_socket: dir.join("no-helper.sock"),
             frontend: None,
+            enroll_frontend: None,
             state_dir: None,
+            daemon_node: None,
             node_api: Some(NodeApi {
                 addr: "127.0.0.1:1".parse().unwrap(),
                 token_file: token,
-                proxy_auth_file: None,
             }),
             timing: Timing {
                 heartbeat: Duration::from_millis(20),
@@ -114,25 +116,26 @@ fn the_identity_comes_from_the_certificate() {
     );
 }
 
-/// An agent is built for a storage, daemon or Mac host; a frontend's certificate is refused (the
-/// roll updates frontends), and so are files that make no TLS configuration and an operator token
-/// file the API client does not accept.
+/// An agent is built for a storage, daemon, Mac or frontend host; files that make no TLS
+/// configuration and an operator token file the API client does not accept are refused.
 #[test]
-fn an_agent_is_built_for_every_host_but_a_frontend() {
+fn an_agent_is_built_for_every_kind_of_host() {
     assert!(
         host_platform().is_some(),
         "tests run where kbf has releases"
     );
-    for role in [HostRole::Storage, HostRole::Daemon, HostRole::MacDaemon] {
+    for role in [
+        HostRole::Storage,
+        HostRole::Daemon,
+        HostRole::MacDaemon,
+        HostRole::Frontend,
+    ] {
         let rig = Rig::new("bd-built", role);
         let agent = build(&rig.config).unwrap_or_else(|e| panic!("{role}: {e}"));
         let status = agent.status();
         assert_eq!(status.version, Version::parse("0").unwrap());
         assert_eq!(status.health, crate::wire::Health::Unhealthy);
     }
-    let rig = Rig::new("bd-frontend", HostRole::Frontend);
-    let err = build(&rig.config).err().unwrap();
-    assert!(err.contains("frontend"), "{err}");
 
     let mut rig = Rig::new("bd-nofiles", HostRole::Daemon);
     std::fs::write(&rig.config.files.ca, "").unwrap();
@@ -150,31 +153,21 @@ fn an_agent_is_built_for_every_host_but_a_frontend() {
     assert!(build(&rig.config).is_err());
 }
 
-/// A storage host's node is never drained (the roll never drains one, a daemon on it
-/// included): its drain, its leases and its undrain are done already. A daemon host's node is
-/// drained through the frontend, which here cannot be reached.
+/// Every host's node is drained through the frontend, a storage host's too (it may run a
+/// daemon): with the frontend out of reach, the drain of a storage host fails as a daemon's
+/// does and is not taken for done.
 #[test]
-fn a_storage_host_is_not_drained_and_a_daemon_host_is() {
+fn every_host_is_drained_through_the_frontend() {
     let rig = Rig::new("bd-drain", HostRole::Daemon);
     let node = rig.config.node_api.clone().unwrap();
-    let api = OperatorApi::new(node.addr, node.token_file, None)
+    let api = OperatorApi::new(node.addr, node.token_file)
         .unwrap()
         .with_timeout(Duration::from_millis(200));
-    let storage = drain_for(Role::Storage, &api);
-    let h = host(Role::Storage);
-    assert_eq!(storage.drain(&h, Duration::from_secs(1)), Ok(()));
-    assert_eq!(storage.leases(&h), Ok(0));
-    assert_eq!(storage.undrain(&h), Ok(()));
-    assert_eq!(NoDrain.leases(&h), Ok(0));
-    assert_eq!(no_drain().undrain(&h), Ok(()));
-
-    for role in [Role::Daemon, Role::MacDaemon] {
-        let daemon = drain_for(role, &api);
+    for role in [Role::Storage, Role::Daemon, Role::MacDaemon] {
+        let drain = drain_for(role, &api);
         let h = host(role);
-        assert!(
-            daemon.drain(&h, Duration::from_secs(1)).is_err(),
-            "{role:?}"
-        );
+        assert!(drain.drain(&h, Duration::from_secs(1)).is_err(), "{role:?}");
+        assert!(drain.undrain(&h).is_err(), "{role:?}");
     }
 }
 
@@ -192,11 +185,12 @@ fn the_process_runs_until_stopped_and_says_why_it_cannot_start() {
     });
     assert_eq!((code, text.as_str()), (0, ""));
 
-    let frontend = Rig::new("bd-run-fe", HostRole::Frontend);
-    let (code, text) = run_config(&frontend.config, |_| unreachable!("not started"));
+    let mut broken = Rig::new("bd-run-broken", HostRole::Frontend);
+    broken.config.files.cert = broken.dir.join("absent.pem");
+    let (code, text) = run_config(&broken.config, |_| unreachable!("not started"));
     assert_eq!(code, 1);
     assert!(
-        text.starts_with("kbf-updater: ") && text.contains("frontend"),
+        text.starts_with("kbf-updater: ") && text.contains("absent.pem"),
         "{text}"
     );
 }
@@ -302,8 +296,10 @@ fn an_agent_with_a_state_directory_renews_what_it_was_enrolled_with() {
         channel: "stable".to_owned(),
         helper_socket: dir.join("no-helper.sock"),
         frontend: Some(Endpoint::parse("localhost:1").unwrap()),
+        enroll_frontend: Some(Endpoint::parse("localhost:1").unwrap()),
         state_dir: Some(state.clone()),
         node_api: None,
+        daemon_node: None,
         timing: Timing {
             heartbeat: Duration::from_millis(20),
             ..Timing::DEFAULT
@@ -322,4 +318,45 @@ fn an_agent_with_a_state_directory_renews_what_it_was_enrolled_with() {
     std::fs::remove_file(state.join("pki/node.json")).unwrap();
     let err = build(&config).err().unwrap();
     assert!(err.contains("kbf-updater enroll"), "{err}");
+}
+
+/// A frontend host's agent drains no node unless it was told the host runs a daemon (and
+/// then drains that node through the frontend, which here cannot be reached); its health is the
+/// helper's, never the roll's; `--daemon-node` is refused for any other host, and its node is
+/// the daemon's.
+#[test]
+fn a_frontend_hosts_agent_drains_a_node_only_when_the_host_runs_a_daemon() {
+    let rig = Rig::new("bd-fe-ports", HostRole::Frontend);
+    let local = Arc::new(SocketLocal::new(
+        &rig.config.helper_socket,
+        Limits::default(),
+    ));
+    let identity = identity_of_files(&rig.config.files).unwrap();
+    let h = host(Role::Frontend);
+
+    let (drain, health) = frontend_ports(&rig.config, &identity, &local).unwrap();
+    assert_eq!(drain.drain(&h, Duration::from_secs(1)), Ok(()));
+    assert_eq!(drain.leases(&h), Ok(0));
+    assert_eq!(drain.undrain(&h), Ok(()));
+    assert_eq!(health.refusal(&h), None);
+
+    let mut with_daemon = rig.config.clone();
+    with_daemon.daemon_node = Some("d1".to_owned());
+    let (drain, _) = frontend_ports(&with_daemon, &identity, &local).unwrap();
+    assert!(drain.drain(&h, Duration::from_secs(1)).is_err());
+    // The agent is built.
+    assert!(build(&with_daemon).is_ok());
+
+    // No credential at all for a daemon's drain: the refusal says so, as for any host.
+    let mut bare = with_daemon.clone();
+    bare.node_api = None;
+    let (drain, _) = frontend_ports(&bare, &identity, &local).unwrap();
+    assert!(drain.drain(&h, Duration::from_secs(1)).is_err());
+
+    for role in [HostRole::Storage, HostRole::Daemon, HostRole::MacDaemon] {
+        let mut other = Rig::new("bd-fe-flag", role);
+        other.config.daemon_node = Some("d1".to_owned());
+        let err = build(&other.config).err().unwrap();
+        assert!(err.contains("--daemon-node"), "{role}: {err}");
+    }
 }

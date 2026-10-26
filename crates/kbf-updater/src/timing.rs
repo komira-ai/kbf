@@ -29,6 +29,15 @@ pub struct Timing {
     /// How long a Mac host's apply may take, from the answer `apply_started` (or from a
     /// restart that resumes the wait), to be `done` for the target.
     pub apply_deadline: Duration,
+    /// For a frontend member rolled without a proxy: how long every other member must answer
+    /// `/readyz` 200 without a miss before the member is drained. The wait for that window,
+    /// which a miss restarts, is given this and [`Timing::healthy_frontend`] on top.
+    pub peer_ready: Duration,
+    /// For a frontend member rolled without a proxy: how long the member is given, from the
+    /// start of its own drain, to exit. It must be longer than the longest execution that a
+    /// member may have open, which the drain waits for: the frontend in this tree puts no bound
+    /// on a drain that its endpoint began.
+    pub frontend_drain: Duration,
 }
 
 impl Default for Timing {
@@ -44,6 +53,8 @@ impl Default for Timing {
             drain_deadline: Duration::from_secs(600),
             apply_poll: Duration::from_secs(5),
             apply_deadline: Duration::from_secs(600),
+            peer_ready: Duration::from_secs(30),
+            frontend_drain: Duration::from_secs(1200),
         }
     }
 }

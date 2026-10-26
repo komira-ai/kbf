@@ -1,8 +1,10 @@
 //! An [`ObjectStore`] over the S3 REST API: path-style addressing, SigV4 signing,
 //! plain HTTP.
 //!
-//! Written against S3 as MinIO and RustFS serve it. It signs every payload (the store
-//! checks the body against the signed hash), refuses a ranged read answered with
+//! Written against S3 as MinIO and RustFS serve it. It signs every payload it has (the store
+//! checks the body against the signed hash; a part streamed from a source, whose hash is
+//! not known when the request is signed, is sent with `UNSIGNED-PAYLOAD`, see `parts.rs`),
+//! refuses a ranged read answered with
 //! anything but the exact range asked for, and deletes the exact object version on a
 //! store with Object Lock, so a retained object is refused rather than hidden behind a
 //! delete marker.
@@ -11,25 +13,40 @@
 //! upload (`multipart.rs`): parts of [`part_size`] sent one at a time, each held in
 //! memory only while it is sent, and the upload aborted on any failure.
 //!
+//! Beyond the trait, [`S3Store`] has the calls an object used for coordination needs
+//! (`tagged.rs`): [`S3Store::head`] (size, entity tag, time of last write),
+//! [`S3Store::get_all`], [`S3Store::put_if_match`] (`If-Match`) and
+//! [`S3Store::list_stamped`] (a listing with the time of last write).
+//!
+//! A caller that drives a multipart upload itself has the four calls one at a time
+//! (`parts.rs`): [`S3Store::create_multipart`], [`S3Store::upload_part_stream`] (the part
+//! is sent as it is read from a stream, never held whole), [`S3Store::complete_multipart`]
+//! and [`S3Store::abort_multipart`].
+//!
 //! Not built yet: TLS (an `https` endpoint is refused).
 
 #[cfg(feature = "testkit")]
 pub mod fake;
 mod multipart;
+mod parts;
 mod sigv4;
+mod tagged;
+mod times;
 mod xml;
 
 pub use multipart::{
     MAX_PART_BYTES, MAX_PARTS, MIN_PART_BYTES, MULTIPART_THRESHOLD, PART_BYTES, part_size,
 };
+pub use tagged::{ObjectHead, StampedObject, StampedPage};
 
 use std::fmt;
+use std::future::Future;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use md5::Md5;
 use reqwest::header::{AUTHORIZATION, CONTENT_RANGE};
 use reqwest::{Method, Response, StatusCode, Url};
@@ -46,10 +63,11 @@ use sigv4::{EMPTY_SHA256, Request, Signer, Utc};
 pub const WAIT_RETRY: Duration = Duration::from_millis(250);
 
 /// How many times a ranged read is sent again after its transport failed (not timed
-/// out): a connection the store, or the path to it, closed after the request went out
-/// ("connection closed before message completed") says nothing of the next one, and a
-/// pooled connection closed while idle fails this way. A read is idempotent. Three
-/// sends in all.
+/// out by kbf or by a limit of the client): a connection the store, or the path to it,
+/// closed after the request went out ("connection closed before message completed")
+/// says nothing of the next one, a pooled connection closed while idle fails this way,
+/// and so does one the kernel gave up on after the request went out (`ETIMEDOUT`,
+/// "Connection timed out", mid-body). A read is idempotent. Three sends in all.
 pub const READ_RETRIES: u32 = 2;
 
 /// The wait before the first resend of a read; each resend waits twice the one before.
@@ -58,14 +76,59 @@ const READ_RETRY_WAIT: Duration = Duration::from_millis(50);
 /// Whether a failed read may be sent again: it failed in transport and not by running
 /// out of time (a store that is `request_timeout` slow stays slow, and a resend would
 /// multiply the wait of a read that cannot succeed).
+///
+/// Two timeouts are not that. After the request went out, the kernel giving up on a
+/// dead connection (`ETIMEDOUT`) says nothing of the store, and a fresh connection may
+/// well answer; reqwest's `is_timeout` is true for it, as it is for any `io::Error` of
+/// kind `TimedOut` in the cause chain, so that chain is searched. Before the request
+/// went out (`is_connect`) every timeout stays refused: the client's connect limit also
+/// ends as such an `io::Error`, and a store that does not answer a connect in time is
+/// slow or down, not a dead connection. So are [`Stalled`] and the per-request limit
+/// this module sets on the client, which put no such `io::Error` in the chain.
 fn is_retryable(e: &ObjectStoreError) -> bool {
     match e {
-        ObjectStoreError::Transport(cause) => cause
-            .downcast_ref::<reqwest::Error>()
-            .is_none_or(|r| !r.is_timeout()),
+        ObjectStoreError::Transport(cause) => {
+            if cause.is::<Stalled>() {
+                return false;
+            }
+            match cause.downcast_ref::<reqwest::Error>() {
+                Some(r) if r.is_connect() => !r.is_timeout(),
+                Some(r) => os_timed_out(r) || !r.is_timeout(),
+                None => true,
+            }
+        }
         _ => false,
     }
 }
+
+/// Whether an `io::Error` of kind `TimedOut` (the kernel's `ETIMEDOUT` on a dead
+/// connection) is anywhere in the causes of `e`.
+fn os_timed_out(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = e.source();
+    while let Some(err) = source {
+        if err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
+/// A read that got no byte from the store for `request_timeout`: no answer, or a body
+/// that stopped arriving.
+#[derive(Debug)]
+struct Stalled;
+
+impl fmt::Display for Stalled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("operation timed out: no byte arrived within the request timeout")
+    }
+}
+
+impl std::error::Error for Stalled {}
 
 /// An access key pair. `Debug` never shows the secret.
 #[derive(Clone)]
@@ -110,13 +173,17 @@ pub struct S3Config {
     pub capabilities: Capabilities,
     /// Limit on opening a connection.
     pub connect_timeout: Duration,
-    /// Limit on a whole request, body included, for a request with no body or a small one.
+    /// Limit on a whole request, body included, for a request with no body or a small
+    /// one. A ranged read is limited differently: it may take as long as it needs while
+    /// bytes keep arriving, and fails when the answer, or the next piece of the body,
+    /// takes longer than this to arrive.
     pub request_timeout: Duration,
     /// The slowest rate, in bytes a second, at which a request body may reach the
     /// store: a request with a body may take `request_timeout` plus the body's length
     /// at this rate. `None` gives every request `request_timeout` however large its
     /// body. A store shared with other tenants can take minutes over one large PUT; a
-    /// flat limit cuts it however steadily it progresses.
+    /// flat limit cuts it however steadily it progresses. Reads do not use this rate:
+    /// they are limited by progress (see `request_timeout`), which needs no length.
     pub min_body_rate: Option<NonZeroU64>,
 }
 
@@ -197,7 +264,7 @@ impl S3Store {
         if !valid_bucket(&config.bucket) {
             return Err(S3ConfigError::Bucket(config.bucket));
         }
-        let client = store_client_builder(config.connect_timeout, config.request_timeout)
+        let client = store_client_builder(config.connect_timeout)
             .build()
             .map_err(S3ConfigError::Client)?;
         let conn = Conn {
@@ -231,22 +298,19 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Test gap: reqwest cannot read the idle timeout back from a builder, so no test
 /// proves `S3Store::new` uses this function; the tests prove the constant and that
 /// `client_builder` applies the timeout it is given.
-fn store_client_builder(
-    connect_timeout: Duration,
-    request_timeout: Duration,
-) -> reqwest::ClientBuilder {
-    client_builder(connect_timeout, request_timeout, POOL_IDLE_TIMEOUT)
+fn store_client_builder(connect_timeout: Duration) -> reqwest::ClientBuilder {
+    client_builder(connect_timeout, POOL_IDLE_TIMEOUT)
 }
 
-/// A client builder with the given limits and idle pool timeout.
+/// A client builder with the given limits and idle pool timeout. `request_timeout` is
+/// not a client-wide limit: that would bound the whole of a long read. Each request
+/// sets its own (`Conn::send`, `Conn::send_read`).
 fn client_builder(
     connect_timeout: Duration,
-    request_timeout: Duration,
     pool_idle_timeout: Duration,
 ) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(connect_timeout)
-        .timeout(request_timeout)
         .pool_idle_timeout(pool_idle_timeout)
 }
 
@@ -262,30 +326,89 @@ impl Conn {
         ))
     }
 
-    /// Signs and sends one request. `key` of `None` addresses the bucket.
+    /// Signs and sends one request, limited as a whole to [`Conn::timeout_for`] its
+    /// body. `key` of `None` addresses the bucket.
     async fn send(
         &self,
         method: Method,
         key: Option<&ObjectKey>,
         query: &[(&str, String)],
-        mut headers: Vec<(&'static str, String)>,
+        headers: Vec<(&'static str, String)>,
         body: Bytes,
     ) -> Result<Response, ObjectStoreError> {
+        let req = self
+            .signed(method, key, query, headers, &body)
+            .timeout(self.timeout_for(body.len()));
+        let req = if body.is_empty() { req } else { req.body(body) };
+        req.send().await.map_err(transport)
+    }
+
+    /// Signs and sends a GET with no whole-request limit: the answer's headers must
+    /// arrive within `request_timeout`; the body is then read with [`Conn::within`] a
+    /// piece at a time.
+    async fn send_read(
+        &self,
+        key: &ObjectKey,
+        headers: Vec<(&'static str, String)>,
+    ) -> Result<Response, ObjectStoreError> {
+        let req = self.signed(Method::GET, Some(key), &[], headers, &Bytes::new());
+        self.within(req.send()).await?.map_err(transport)
+    }
+
+    /// Runs `step`, failing as a stalled read if it takes longer than `request_timeout`.
+    async fn within<T>(&self, step: impl Future<Output = T>) -> Result<T, ObjectStoreError> {
+        tokio::time::timeout(self.request_timeout, step)
+            .await
+            .map_err(|_| ObjectStoreError::Transport(Arc::new(Stalled)))
+    }
+
+    /// The whole body of a 2xx answer, read a piece at a time: it may take as long as
+    /// it needs while a piece arrives within `request_timeout` of the one before.
+    async fn read_body(&self, mut resp: Response) -> Result<Bytes, ObjectStoreError> {
+        let mut body = BytesMut::new();
+        while let Some(piece) = self.within(resp.chunk()).await?.map_err(transport)? {
+            body.extend_from_slice(&piece);
+        }
+        Ok(body.freeze())
+    }
+
+    /// The signed request, with no limit set and no body attached.
+    fn signed(
+        &self,
+        method: Method,
+        key: Option<&ObjectKey>,
+        query: &[(&str, String)],
+        headers: Vec<(&'static str, String)>,
+        body: &[u8],
+    ) -> reqwest::RequestBuilder {
+        // PERF: hashing a 128 MiB segment takes a fraction of a second on this task's
+        // thread; move it off the runtime if upload latency shows it.
+        let payload = if body.is_empty() {
+            EMPTY_SHA256.to_owned()
+        } else {
+            hex::encode(Sha256::digest(body))
+        };
+        self.signed_payload(method, key, query, headers, &payload)
+    }
+
+    /// The signed request for a body whose hex SHA-256 is `payload` (or `UNSIGNED-PAYLOAD`),
+    /// with no limit set and no body attached.
+    fn signed_payload(
+        &self,
+        method: Method,
+        key: Option<&ObjectKey>,
+        query: &[(&str, String)],
+        mut headers: Vec<(&'static str, String)>,
+        payload: &str,
+    ) -> reqwest::RequestBuilder {
         // `ObjectKey` holds only unreserved characters and `/`, so the path needs no
         // encoding and is signed exactly as sent.
         let path = match key {
             Some(k) => format!("/{}/{}", self.bucket, k.as_str()),
             None => format!("/{}", self.bucket),
         };
-        // PERF: hashing a 128 MiB segment takes a fraction of a second on this task's
-        // thread; move it off the runtime if upload latency shows it.
-        let payload = if body.is_empty() {
-            EMPTY_SHA256.to_owned()
-        } else {
-            hex::encode(Sha256::digest(&body))
-        };
         let amz_date = Utc::of(SystemTime::now(), false).amz();
-        headers.push(("x-amz-content-sha256", payload.clone()));
+        headers.push(("x-amz-content-sha256", payload.to_owned()));
         headers.push(("x-amz-date", amz_date.clone()));
         let authorization = Signer {
             access_key_id: &self.credentials.access_key_id,
@@ -299,7 +422,7 @@ impl Conn {
                 path: &path,
                 query,
                 headers: &headers,
-                payload_sha256: &payload,
+                payload_sha256: payload,
             },
             &amz_date,
         );
@@ -315,11 +438,7 @@ impl Conn {
         for (name, value) in headers {
             req = req.header(name, value);
         }
-        req = req.timeout(self.timeout_for(body.len()));
-        if !body.is_empty() {
-            req = req.body(body);
-        }
-        req.send().await.map_err(transport)
+        req
     }
 }
 
@@ -385,16 +504,7 @@ impl S3Store {
         range: ByteRange,
     ) -> Result<Bytes, ObjectStoreError> {
         let header = format!("bytes={}-{}", range.offset(), range.last());
-        let resp = self
-            .conn
-            .send(
-                Method::GET,
-                Some(key),
-                &[],
-                vec![("range", header)],
-                Bytes::new(),
-            )
-            .await?;
+        let resp = self.conn.send_read(key, vec![("range", header)]).await?;
         match resp.status() {
             StatusCode::PARTIAL_CONTENT => {}
             StatusCode::OK => {
@@ -409,14 +519,14 @@ impl S3Store {
                     range,
                 });
             }
-            _ => return Err(failure(resp).await),
+            _ => return Err(self.conn.within(failure(resp)).await?),
         }
         let content_range = resp
             .headers()
             .get(CONTENT_RANGE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let body = resp.bytes().await.map_err(transport)?;
+        let body = self.conn.read_body(resp).await?;
         check_partial(content_range.as_deref(), range, body.len())
             .map_err(|why| ObjectStoreError::Protocol(format!("ranged read of {key}: {why}")))?;
         Ok(body)
@@ -540,6 +650,19 @@ impl ObjectStore for S3Store {
         after: Option<&ListToken>,
         max_keys: PageSize,
     ) -> Result<ListPage, ObjectStoreError> {
+        let body = self.list_body(prefix, after, max_keys).await?;
+        xml::list_page(&body)
+    }
+}
+
+impl S3Store {
+    /// The body of the answer to one ListObjectsV2 request.
+    async fn list_body(
+        &self,
+        prefix: &KeyPrefix,
+        after: Option<&ListToken>,
+        max_keys: PageSize,
+    ) -> Result<Bytes, ObjectStoreError> {
         let mut query = vec![
             ("list-type", "2".to_owned()),
             ("prefix", prefix.as_str().to_owned()),
@@ -559,8 +682,7 @@ impl ObjectStore for S3Store {
         if resp.status() != StatusCode::OK {
             return Err(failure(resp).await);
         }
-        let body = resp.bytes().await.map_err(transport)?;
-        xml::list_page(&body)
+        resp.bytes().await.map_err(transport)
     }
 }
 
@@ -712,7 +834,7 @@ mod tests {
         });
         let limit = Duration::from_secs(5);
         // Reuse: a long idle timeout keeps the connection across two requests.
-        let keeping = client_builder(limit, limit, Duration::from_secs(60))
+        let keeping = client_builder(limit, Duration::from_secs(60))
             .build()
             .unwrap();
         keeping.get(&url).send().await.unwrap();
@@ -723,7 +845,7 @@ mod tests {
             "a fresh connection is reused"
         );
         // Expiry: a short idle timeout and a wait far above it replace the connection.
-        let dropping = client_builder(limit, limit, Duration::from_millis(100))
+        let dropping = client_builder(limit, Duration::from_millis(100))
             .build()
             .unwrap();
         dropping.get(&url).send().await.unwrap();
@@ -735,6 +857,278 @@ mod tests {
             3,
             "an idle connection was kept"
         );
+    }
+
+    /// What a scripted store sends for a ranged read of `len` bytes.
+    #[derive(Clone, Copy)]
+    enum Script {
+        /// Headers, then the body in `pieces` pieces `every` apart.
+        Steady { pieces: usize, every: Duration },
+        /// Headers, half the body, then nothing.
+        StallsInBody,
+        /// Nothing at all after the request.
+        Silent,
+        /// A 500 whose body is promised and never sent.
+        StallsInError,
+    }
+
+    /// A one-object store on loopback that answers every request as `script` says and
+    /// counts the requests it took. The timings only set up a slow or a stalled body.
+    async fn scripted(len: usize, script: Script) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&taken);
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                tokio::spawn({
+                    let count = Arc::clone(&count);
+                    async move {
+                        let mut seen = Vec::new();
+                        let mut buf = [0u8; 4096];
+                        while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match sock.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => seen.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let head = format!(
+                            "HTTP/1.1 206 Partial Content\r\ncontent-length: {len}\r\n\
+                             content-range: bytes 0-{}/{len}\r\n\r\n",
+                            len - 1
+                        );
+                        match script {
+                            Script::Silent => std::future::pending::<()>().await,
+                            Script::StallsInError => {
+                                let _ = sock
+                                    .write_all(b"HTTP/1.1 500 Oops\r\ncontent-length: 100\r\n\r\n")
+                                    .await;
+                                std::future::pending::<()>().await;
+                            }
+                            Script::StallsInBody => {
+                                let _ = sock.write_all(head.as_bytes()).await;
+                                let _ = sock.write_all(&vec![7u8; len / 2]).await;
+                                std::future::pending::<()>().await;
+                            }
+                            Script::Steady { pieces, every } => {
+                                let _ = sock.write_all(head.as_bytes()).await;
+                                for _ in 0..pieces {
+                                    tokio::time::sleep(every).await;
+                                    let _ = sock.write_all(&vec![7u8; len / pieces]).await;
+                                }
+                                // Keep the connection open until the client is done.
+                                let _ = sock.read(&mut buf).await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (endpoint, taken)
+    }
+
+    fn short_limit_store(endpoint: &str) -> S3Store {
+        let mut c = config(endpoint, "kbf-test");
+        c.request_timeout = Duration::from_millis(200);
+        S3Store::new(c).unwrap()
+    }
+
+    fn key() -> ObjectKey {
+        ObjectKey::new("obj").unwrap()
+    }
+
+    /// Catches: a read cut by a limit on the whole request: a body that arrives
+    /// steadily, for several times `request_timeout` in all, must come back whole.
+    #[tokio::test]
+    async fn a_ranged_read_that_keeps_progressing_outlasts_the_request_timeout() {
+        let len = 1000;
+        let (endpoint, taken) = scripted(
+            len,
+            Script::Steady {
+                pieces: 20,
+                every: Duration::from_millis(50),
+            },
+        )
+        .await;
+        let got = short_limit_store(&endpoint)
+            .get_range(&key(), r(0, len as u64))
+            .await
+            .unwrap();
+        assert_eq!(got.as_ref(), vec![7u8; len].as_slice());
+        assert_eq!(taken.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Catches: a stalled body that is never cut, or cut but reported as a plain
+    /// transport failure and sent again: it fails as a timeout, after one request.
+    #[tokio::test]
+    async fn a_ranged_read_whose_body_stops_fails_as_a_timeout_and_is_not_resent() {
+        let (endpoint, taken) = scripted(1000, Script::StallsInBody).await;
+        let err = short_limit_store(&endpoint)
+            .get_range(&key(), r(0, 1000))
+            .await
+            .unwrap_err();
+        assert!(!is_retryable(&err));
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert_eq!(taken.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Catches: the wait for the answer's headers left unbounded once the whole-request
+    /// limit is gone.
+    #[tokio::test]
+    async fn a_ranged_read_with_no_answer_fails_as_a_timeout() {
+        let (endpoint, taken) = scripted(10, Script::Silent).await;
+        let err = short_limit_store(&endpoint)
+            .get_range(&key(), r(0, 10))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert_eq!(taken.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Catches: an error answer whose body never arrives holding the read forever.
+    #[tokio::test]
+    async fn an_error_body_that_stops_fails_as_a_timeout() {
+        let (endpoint, _) = scripted(10, Script::StallsInError).await;
+        let err = short_limit_store(&endpoint)
+            .get_range(&key(), r(0, 10))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    /// The error reqwest gives for a response whose body delivers a few bytes and then
+    /// fails with `kind`, read as `get_range_once` reads one, wrapped as it wraps it.
+    async fn body_error(kind: std::io::ErrorKind) -> (ObjectStoreError, bool) {
+        struct Failing {
+            kind: std::io::ErrorKind,
+            sent: bool,
+        }
+        impl http_body::Body for Failing {
+            type Data = Bytes;
+            type Error = std::io::Error;
+            fn poll_frame(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+                let sent = std::mem::replace(&mut self.sent, true);
+                std::task::Poll::Ready(Some(if sent {
+                    Err(std::io::Error::from(self.kind))
+                } else {
+                    Ok(http_body::Frame::data(Bytes::from_static(b"part")))
+                }))
+            }
+        }
+        let body = reqwest::Body::wrap(Failing { kind, sent: false });
+        let mut resp = reqwest::Response::from(http::Response::new(body));
+        let first = resp.chunk().await.unwrap();
+        assert_eq!(first.as_deref(), Some(&b"part"[..]));
+        let e = resp.chunk().await.unwrap_err();
+        let timeout = e.is_timeout();
+        (transport(e), timeout)
+    }
+
+    /// Catches: a read whose connection the kernel timed out mid-body (`ETIMEDOUT`,
+    /// which reqwest also reports as `is_timeout`) never sent again, failing a large
+    /// download that a fresh connection would finish; and the same for a failure that
+    /// is no timeout at all being refused.
+    #[tokio::test]
+    async fn a_body_cut_by_an_os_level_timeout_is_resent() {
+        let (e, timeout) = body_error(std::io::ErrorKind::TimedOut).await;
+        assert!(timeout, "reqwest must call this a timeout: {e:?}");
+        assert!(is_retryable(&e));
+        let (e, timeout) = body_error(std::io::ErrorKind::ConnectionReset).await;
+        assert!(!timeout);
+        assert!(is_retryable(&e));
+    }
+
+    /// Catches: the client's own connect limit, which ends as an `io::Error` of kind
+    /// `TimedOut` in the chain, taken for a dead connection and sent again; and a
+    /// refused connection taken for a timeout.
+    // Linux drops a SYN when the accept queue is full; BSD and macOS may reset instead.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_connect_that_times_out_is_not_resent_but_a_refused_one_is() {
+        // A listener whose accept queue is full drops the next SYN: the connect hangs.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
+        let _listener = socket.listen(1).unwrap();
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let filler = tokio::net::TcpSocket::new_v4().unwrap();
+            if let Ok(Ok(c)) =
+                tokio::time::timeout(Duration::from_millis(200), filler.connect(addr)).await
+            {
+                held.push(c);
+            }
+        }
+        let client = client_builder(Duration::from_millis(100), POOL_IDLE_TIMEOUT)
+            .build()
+            .unwrap();
+        let e = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(e.is_connect(), "{e:?}");
+        assert!(e.is_timeout(), "{e:?}");
+        assert!(!is_retryable(&transport(e)));
+
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gone = closed.local_addr().unwrap();
+        drop(closed);
+        let e = client
+            .get(format!("http://{gone}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(e.is_connect(), "{e:?}");
+        assert!(!e.is_timeout(), "{e:?}");
+        assert!(is_retryable(&transport(e)));
+    }
+
+    /// Catches: every non-connect reqwest error sent again, including the client's own
+    /// per-request limit, which ends a read against a store that accepts and never
+    /// answers and would multiply the wait of a read that cannot succeed.
+    #[tokio::test]
+    async fn a_request_that_exceeds_its_client_timeout_is_not_resent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _silent = tokio::spawn(async move {
+            let held = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(held);
+        });
+        let e = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .timeout(Duration::from_millis(100))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(e.is_timeout(), "{e:?}");
+        assert!(!e.is_connect(), "{e:?}");
+        assert!(!is_retryable(&transport(e)));
+    }
+
+    /// Catches: this module's own stall treated as worth a resend.
+    #[test]
+    fn a_stall_is_not_resent() {
+        assert!(!is_retryable(&ObjectStoreError::Transport(Arc::new(
+            Stalled
+        ))));
+    }
+
+    /// Catches: a transport error of the timeout kind from reqwest, or this module's
+    /// own stall, treated as worth a resend; and any other transport error as not.
+    #[test]
+    fn only_a_stall_or_timeout_is_not_resent() {
+        let stalled = ObjectStoreError::Transport(Arc::new(Stalled));
+        assert!(!is_retryable(&stalled));
+        let reset = ObjectStoreError::Transport(Arc::new(std::io::Error::other("reset")));
+        assert!(is_retryable(&reset));
     }
 
     fn config(endpoint: &str, bucket: &str) -> S3Config {

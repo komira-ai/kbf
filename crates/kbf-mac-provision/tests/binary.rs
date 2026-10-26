@@ -136,7 +136,7 @@ fn check_on_an_empty_root_fails_and_exits_1() {
         "{out}"
     );
     assert!(out.ends_with(" fail\n"), "{out}");
-    assert_eq!(out.lines().count(), 32, "{out}");
+    assert_eq!(out.lines().count(), 34, "{out}");
 }
 
 /// Catches: `check` exiting 1 when every item it checks passes.

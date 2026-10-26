@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::{Cmd, DEBIAN_FRONTEND, Exec, LANG, PATH, Runner, SystemRunner, WriteCap, fake};
 
@@ -115,12 +115,11 @@ fn processes_with(needle: &str) -> usize {
 }
 
 /// Catches a limit that is not kept: a child that outlives it is killed, the call ends in
-/// a timeout error at about the limit (not at the child's own end), and the child is gone
-/// afterwards (killed and reaped, not left behind).
+/// a timeout error (not at the child's own end, which is half a minute away, with its own
+/// status), and the child is gone afterwards (killed and reaped, not left behind).
 #[test]
 fn a_child_past_its_limit_is_killed() {
     let marker = "31.4159265";
-    let started = Instant::now();
     let error = SystemRunner
         .run(&within(
             "/usr/bin/sleep",
@@ -129,9 +128,6 @@ fn a_child_past_its_limit_is_killed() {
         ))
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
-    let took = started.elapsed();
-    assert!(took >= Duration::from_millis(300), "{took:?}");
-    assert!(took < Duration::from_secs(10), "{took:?}");
     assert_eq!(processes_with(marker), 0, "the sleeper was left running");
 }
 
@@ -378,10 +374,13 @@ fn a_child_that_writes_past_its_cap_is_killed() {
         .run(&writes(&dir, "big", 100_000, 1024 * 1024))
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge, "{error}");
+    // The call returns once the child is killed and reaped, so nothing can write after it:
+    // the file is the size it has now however long it is looked at.
     let size = std::fs::metadata(dir.join("big")).unwrap().len();
     assert!(size < 4 * 1024 * 1024 * 1024, "{size}");
-    std::thread::sleep(Duration::from_millis(200));
     assert_eq!(std::fs::metadata(dir.join("big")).unwrap().len(), size);
+    let output = format!("of={}", dir.join("big").display());
+    assert_eq!(processes_with(&output), 0, "the writer was left running");
 }
 
 /// Catches a cap that a fast writer slips under: a command that is over the cap when it

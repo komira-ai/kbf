@@ -43,6 +43,17 @@
 //! opened and probed by `/readyz`; a `sqlite://` one starts and logs that SQLite is
 //! removed in the next release ([`crate::StateStoreUri::open`]).
 //!
+//! **The pack index** is off unless `--pack-index` is given (the flag's help has its rules).
+//! The started frontend carries it ([`FrontendHandle::pack_index`]) and its worker listener
+//! answers daemons' `kbf.worker.v1.PackIndex/Locate` from it ([`crate::pack_locate`]); without
+//! the flag that service is not registered.
+//!
+//! **Packs** are off unless `--pack-store-endpoint` is given (`pack_flags` has the flags and
+//! what they need): client uploads are then kept in packs ([`kbf_front::Packs`]); without it
+//! no object store is built or contacted and the frontend serves exactly as it did. With the
+//! pack index too, the frontend takes a daemon's `CommitPack` (it must read the pack to check it)
+//! and says so in `Welcome.pack_commit`.
+//!
 //! **Readiness** (`GET /readyz`, `grpc.health.v1`) fails when the storage node does not
 //! answer an action-cache lookup within `--readyz-store-timeout-ms`, when the state store (if
 //! configured) does not answer a read, and when the storage map is not loaded (always
@@ -58,6 +69,13 @@
 //! (`--handover-*`, `--instance`, `--envoy-*`, `--admin-listen`, `--await-takeover`) are
 //! still accepted so a unit or `kbf.toml` written before the removal starts; they do
 //! nothing, each one given logs a warning ([`RetiredHandoverFlags`]).
+//!
+//! **Draining.** A frontend over a state store is taken out of any load balancer by the
+//! drain sequence of [`crate::sequence`], which `POST /v1/frontend/drain` and a stop signal
+//! begin alike: `/readyz` answers 503 at once while everything is still served,
+//! `--drain-lb-wait` later new Execute calls are refused and every listener is sent GOAWAY,
+//! the open executions run until they are done or `--drain-deadline`, and the process exits
+//! 0. Without a state store (tests) the drain is the plain one of [`crate::drain`].
 //!
 //! **Not served here:** the worker listener's `ByteStream`, CAS and `Segments` (a
 //! daemon's blob traffic; daemons reach storage directly once the map reaches them,
@@ -83,12 +101,13 @@ use futures::FutureExt as _;
 use futures::future::{AbortHandle, Abortable, BoxFuture};
 use kbf_auth::AuthenticateLayer;
 use kbf_front::{
-    Backend, MAX_MESSAGE_BYTES, Owner, Owners, Proxy, RECORDER_CHANNEL, Recorder,
+    Backend, MAX_MESSAGE_BYTES, Owner, Owners, Packs, Proxy, RECORDER_CHANNEL, Recorder,
     RequestMetadataLayer, Routed,
 };
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
 use kbf_proto::worker::worker_server::WorkerServer;
 use kbf_route::{DEFAULT_HOLD, Hold, TlsNodes};
+use kbf_state::PackIndex;
 use kbf_storage::Storage;
 use kbf_storage::service::RemoteStorage;
 use kbf_threads::Topology;
@@ -96,6 +115,7 @@ use kbf_tls::TlsSource;
 use tonic::service::Routes;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server};
 
+pub use self::pack_flags::{PackFlagError, PackFlags};
 use crate::drain::Drain;
 use crate::enroll::flags::EnrollFlags;
 use crate::enroll::start as enroll_start;
@@ -110,9 +130,10 @@ use crate::proxy_auth::ProxyAuthLayer;
 use crate::ready::Ready;
 use crate::retire::Retire;
 use crate::retired::RetiredHandoverFlags;
+use crate::sequence::{DrainTiming, Sequence, stopped};
 use crate::serve::{
-    AbortOnDrop, ServeError, cold_store, drain_and_stop, flow_control, keepalive, log_state,
-    map_of, members_of, membership, serve_api, stop_api, sweeping, worker_peers,
+    AbortOnDrop, ServeError, cold_store, flow_control, keepalive, log_state, map_of, members_of,
+    membership, serve_api_goaway, stop_api, sweeping, worker_peers,
 };
 use crate::stand::{QUIESCE_WAIT, Stand};
 use crate::start::{Escalation, escalating, interruptions};
@@ -158,6 +179,7 @@ pub const ALLOWED: &[&str] = &[
     "shutdown_timeout_secs",
     "invocation_memory",
     "state_store",
+    "pack_index",
     "member_ttl_secs",
     "member_dwell_secs",
     "history_objects",
@@ -199,9 +221,15 @@ pub struct FrontendFlags {
     /// filled ([`crate::members::Members::with_handoff`]); `None` without the flag, where only
     /// an operator promotes one.
     pub handoff: Option<Handoff>,
+    /// `--drain-lb-wait` and `--drain-deadline`: the two waits of the drain sequence a
+    /// frontend over a state store runs ([`crate::sequence`]).
+    pub drain: DrainTiming,
     /// The flags of the removed handover and admin port, which are accepted and ignored
     /// ([`RetiredHandoverFlags`]).
     pub retired: RetiredHandoverFlags,
+    /// `--pack-store-endpoint` and its companions: the blobs clients upload are kept in packs
+    /// in an object store. `None` without the endpoint, where nothing is packed.
+    pub packs: Option<PackFlags>,
 }
 
 /// The long names of the flags of [`Args`] that `kbf frontend` hides and refuses by name
@@ -253,6 +281,8 @@ pub fn command() -> Command {
     ))
     .args(crate::enroll::flags::args())
     .args(handoff::args())
+    .args(drain_flags::args())
+    .args(pack_flags::args())
     .arg(
         Arg::new(SECRETS_DIR)
             .long("object-store-secrets-dir")
@@ -296,6 +326,9 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         )));
     }
     let server = Args::from_arg_matches(m)?;
+    if let Err(why) = server.pack_index_url() {
+        return Err(refuse(why.to_string()));
+    }
     let enroll = crate::enroll::flags::from_matches(m).map_err(refuse)?;
     let storage = server
         .storage()
@@ -315,7 +348,9 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         enroll,
         object_store_secrets_dir: m.get_one::<PathBuf>(SECRETS_DIR).cloned(),
         handoff: handoff::from_matches(m),
+        drain: drain_flags::from_matches(m),
         retired: RetiredHandoverFlags::from_arg_matches(m)?,
+        packs: pack_flags::from_matches(m),
     })
 }
 
@@ -454,9 +489,31 @@ pub struct FrontendHandle {
     background: Vec<BoxFuture<'static, ()>>,
     /// Tells the service manager the frontend serves, once its probes pass.
     ready: Ready,
+    /// The pack index `--pack-index` opened, if the flag was given.
+    pack_index: Option<Arc<dyn PackIndex>>,
+    /// The packs `--pack-store-endpoint` describes, if the flag was given.
+    packs: Option<Packs>,
+    /// The count of intake polls the farm has run to the end ([`Farm::intake_polls`]).
+    intake_polls: tokio::sync::watch::Receiver<u64>,
 }
 
 impl FrontendHandle {
+    /// The count of intake polls this frontend's farm has run to the end
+    /// ([`Farm::intake_polls`]), told as each completes: a caller waits for polls by this
+    /// event and not by time.
+    #[must_use]
+    pub fn intake_polls(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.intake_polls.clone()
+    }
+
+    /// The pack index `--pack-index` opened on the Postgres state store, or `None` without the
+    /// flag. The worker listener's `PackIndex` service answers daemons from it, and with the
+    /// pack store flags too, the frontend writes and reads it.
+    #[must_use]
+    pub fn pack_index(&self) -> Option<Arc<dyn PackIndex>> {
+        self.pack_index.clone()
+    }
+
     /// The frontend's drain ([`Drain`]): `POST /v1/frontend/drain` begins it, and the
     /// shutdown future given to [`start_frontend`] does.
     #[must_use]
@@ -489,11 +546,17 @@ impl FrontendHandle {
 
     /// Serves every listener until the shutdown future given to [`start_frontend`]
     /// completes and the open Execute streams finish or `--shutdown-timeout-secs` runs
-    /// out (the drain `kbf-server` runs: [`crate::serve::drain_and_stop`]).
+    /// out (the drain `kbf-server` runs: [`crate::serve::drain_and_stop`]); or, over a state
+    /// store, until the drain sequence of [`crate::sequence`] is over, which the shutdown
+    /// future and `POST /v1/frontend/drain` begin alike.
     ///
     /// # Errors
-    /// A listener fails while serving.
+    /// A listener fails while serving; or the pack store does not refuse to replace an object
+    /// (or cannot be written to), which is checked before anything is served.
     pub async fn serve(self) -> Result<(), ServeError> {
+        if let Some(packs) = &self.packs {
+            packs.check_create_only().await.map_err(ServeError::Packs)?;
+        }
         let tasks = self
             .background
             .into_iter()
@@ -534,7 +597,10 @@ pub fn checks(
 type Shutdown = Box<dyn FnOnce() -> io::Result<Pin<Box<dyn Future<Output = ()> + Send>>>>;
 
 /// Binds the frontend the flags describe. Nothing is opened but the state store (if
-/// given), and the storage node is dialed when first used.
+/// given), the pack index (`--pack-index`) and the packs (`--pack-store-endpoint`): for the
+/// packs the credentials file is read, the cache directory made and the S3 client built, and
+/// nothing is sent to the pack store until [`FrontendHandle::serve`] checks it. The storage
+/// node is dialed when first used.
 ///
 /// `shutdown` is called once, after the flags are checked and before anything is bound,
 /// and returns the future whose completion stops the frontend; the binary's is
@@ -542,7 +608,10 @@ type Shutdown = Box<dyn FnOnce() -> io::Result<Pin<Box<dyn Future<Output = ()> +
 ///
 /// # Errors
 /// A flag the frontend refuses, a TLS file that cannot be read, a state store that
-/// cannot be opened, a listener that cannot be bound, or a `shutdown` that fails.
+/// cannot be opened, pack flags that cannot be opened (a credentials file that is missing or
+/// readable by others, an endpoint the store client does not take, a writer name a key cannot
+/// hold, a cache directory that cannot be made), a listener that cannot be bound, or a
+/// `shutdown` that fails.
 pub fn start_frontend<S, F>(
     flags: &FrontendFlags,
     shutdown: S,
@@ -570,13 +639,14 @@ fn bind_frontend(
     shutdown: Shutdown,
 ) -> Result<FrontendHandle, Box<dyn Error>> {
     let prepared = Prepared::new(flags)?;
+    let pack_index = flags.server.open_pack_index()?;
     let state = flags
         .server
         .state_store
         .as_ref()
         .map(crate::StateStoreUri::open)
         .transpose()?;
-    prepared.start(state, shutdown)
+    prepared.start(state, pack_index, shutdown)
 }
 
 /// A frontend's start up to the state store: everything the flags decide that needs no
@@ -653,10 +723,12 @@ impl<'a> Prepared<'a> {
         })
     }
 
-    /// Opens everything over `state` and serves on the listeners bound.
+    /// Opens everything over `state` and serves on the listeners bound. The `pack_index`
+    /// (`--pack-index`) is opened already; the handle carries it.
     fn start(
         self,
         state: Option<crate::StateStore>,
+        pack_index: Option<Arc<dyn PackIndex>>,
         shutdown: Shutdown,
     ) -> Result<FrontendHandle, Box<dyn Error>> {
         let Self {
@@ -680,6 +752,7 @@ impl<'a> Prepared<'a> {
         let storage = Arc::new(RemoteStorage::new(channel.clone(), 0));
         let state_store = store_of(state.as_ref());
         let routed = routed_of(members.as_ref(), flags, &storage)?;
+        let packs = pack_flags::open(flags.packs.as_ref(), pack_index.as_ref())?;
         let checks = Arc::new(checks(
             Arc::clone(&readiness),
             storage.clone(),
@@ -688,8 +761,8 @@ impl<'a> Prepared<'a> {
             timeout,
         ));
         let backend = match &routed {
-            Some(routed) => Backend::routed(Arc::clone(routed), storage),
-            None => Backend::remote(storage),
+            Some(routed) => Backend::routed_over(Arc::clone(routed), storage, packs.clone()),
+            None => Backend::remote_over(storage, packs.clone()),
         };
         // A failed run's logs are read from the storage node, under a budget of this
         // frontend's own: it serves no blob route to share one with.
@@ -726,6 +799,8 @@ impl<'a> Prepared<'a> {
             listeners.worker_tls,
             proxy.as_ref(),
         );
+        // The rows a revocation writes, beside the file: a revoked daemon is refused here.
+        let peers = peers.with_denied_rows(members.clone());
         let tls_sources: Vec<TlsSource> = listeners
             .reapi_tls
             .iter()
@@ -736,6 +811,9 @@ impl<'a> Prepared<'a> {
         let (drain, goaway) = Drain::new(closer, Arc::clone(&readiness));
         let drain = Arc::new(drain);
         let worker_stop = Stop::new();
+        // Sends the operator API's connections GOAWAY when the drain sequence refuses new
+        // work; the listener goes on accepting ([`serve_api_goaway`]).
+        let api_stop = Stop::new();
         let Bound {
             reapi,
             worker,
@@ -749,7 +827,7 @@ impl<'a> Prepared<'a> {
         drain.begins().closes(reapi_latch);
         let (worker_incoming, worker_latch) = worker.grpc(worker_tls)?;
         worker_stop.closes(worker_latch);
-        let api_listener = api_socket.map(Socket::http).transpose()?;
+        let api_listeners = api_socket.map(Socket::http_pair).transpose()?;
         let token = api.and_then(|api| api.token);
         // The enroll listener (which is closed the moment the drain begins, like the
         // others) and the operator API's enrollment routes, which need the CA's pin: both
@@ -760,7 +838,7 @@ impl<'a> Prepared<'a> {
                 let store = state_store
                     .clone()
                     .ok_or("--enroll-listen needs --state-store: the registry lives in it")?;
-                prepared.serve(store)
+                prepared.serve(store, members.clone())
             })
             .transpose()?;
         let (enroll_api, enroll_serve, enroll_renewal, enroll_tls) = match enrolled {
@@ -804,6 +882,8 @@ impl<'a> Prepared<'a> {
             history.as_ref().map(crate::history::History::stats),
             members.clone(),
             tls_sources,
+            packs.clone(),
+            Arc::clone(&farm),
         ));
         // The storage health, if there are members.
         let api_routes = members.iter().fold(api_routes, |routes, members| {
@@ -817,14 +897,27 @@ impl<'a> Prepared<'a> {
         )
         .layer(ProxyAuthLayer::new(proxy_secret.clone()));
         let membership = membership(members.clone(), &peers, delivery.as_ref());
+        // The four calls a host's updater makes about its own node.
+        let node_calls = crate::node_self::routes(
+            Arc::clone(&farm),
+            members.clone(),
+            state_store.clone(),
+            peers.clone(),
+        );
         let cold_store = cold_store(members.clone(), &peers, delivery.as_ref());
+        // Only with `--pack-index`: otherwise a daemon's Locate is UNIMPLEMENTED; and its
+        // CommitPack too is UNIMPLEMENTED without the pack store, which checks the pack.
+        let commits = pack_flags::commits(packs.as_ref(), flags.packs.as_ref());
+        let committing = crate::pack_locate::commit_served(pack_index.as_ref(), commits.as_ref());
+        let locate = crate::pack_locate::service(pack_index.as_ref(), &peers, commits);
         let sessions = WorkerService::new(
             Arc::clone(&farm),
             peers,
             listeners.heartbeat_interval,
             listeners.hello_wait,
         )
-        .with_host_floor(listeners.vm_host_floor);
+        .with_host_floor(listeners.vm_host_floor)
+        .with_pack_commit(committing);
         // Daemons are sent the members' map: Welcome.map and a MapUpdate at each bump.
         let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
         let worker_service = WorkerServer::new(sessions)
@@ -835,6 +928,7 @@ impl<'a> Prepared<'a> {
         let authorizers = Arc::new(policy.authorizers);
         let bootstrap = Owner::new(&flags.storage.uri().to_string(), channel);
         let proxy = Proxy::new(proxy_owners(routed, bootstrap), Arc::clone(&authorizers));
+        let proxy = proxy.with_packs(packs.clone());
         let streams = kbf_front::OpenStreams { closing, progress };
         let reapi_routes = kbf_front::routes_proxied(
             &proxy,
@@ -871,31 +965,49 @@ impl<'a> Prepared<'a> {
             sweeper,
             wait: QUIESCE_WAIT,
         });
-        // Set once, here: nothing has called the retire route before the listeners serve.
-        let _ = stand.map(|stand| retire.set(Retire::new(stand)));
+        // Set once, here: nothing has called the retire or the drain route before the
+        // listeners serve. A frontend over a state store drains by the sequence of
+        // [`crate::sequence`], and its stop signal begins it.
+        if let Some(stand) = stand {
+            let sequence = Sequence::new(stand.clone(), api_stop.clone(), flags.drain);
+            let _ = retire.set(Retire::new(stand, sequence));
+        }
         background.extend(enroll_renewal);
 
+        let intake_polls = farm.intake_polls();
         let shutdown = shutdown()?;
         let stopper = Arc::clone(&drain);
         let serving = async move {
             let history = crate::history::spawn(history);
             let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
-            let reapi_serve = reapi_server
+            let reapi_listening = reapi_server
                 .add_routes(reapi_routes)
                 .serve_with_incoming_shutdown(reapi_incoming, async {
                     let _ = goaway.await;
                 });
+            // A drain sequence ends with its own last step (the worker streams end
+            // UNAVAILABLE), not when the REAPI listener has nothing left to answer.
+            let reapi_serve = async {
+                let served = reapi_listening.await;
+                if stopper.is_sequenced() {
+                    stopper.sequence_finished().await;
+                }
+                served
+            };
             let worker_stopped = worker_stop.fired();
             let worker_serve = worker_server
+                .add_routes(node_calls)
                 .add_service(worker_service)
                 .add_optional_service(membership)
                 .add_optional_service(cold_store)
+                .add_optional_service(locate)
                 .serve_with_incoming_shutdown(worker_incoming, worker_stopped);
             // Told when the REAPI listener is done (see `serve::stop_api`).
             let (api_stop_when_done, api_stopped) = tokio::sync::oneshot::channel::<()>();
-            let api_serve = serve_api(
-                api_listener,
+            let api_serve = serve_api_goaway(
+                api_listeners,
                 api_routes,
+                api_stop.clone(),
                 async {
                     let _ = api_stopped.await;
                 },
@@ -913,10 +1025,15 @@ impl<'a> Prepared<'a> {
             };
             // What the other frontends of a shared state store did (`Farm::intake`).
             let intaking = farm.poll_intake();
+            // The stop signal: the drain sequence of a frontend over a state store, else the
+            // plain drain.
             let stopping = async {
                 shutdown.await;
-                drain_and_stop(&stopper, listeners.shutdown_timeout).await;
+                stopped(&stopper, &retire, listeners.shutdown_timeout).await;
             };
+            // The drain sequence begun by `POST /v1/frontend/drain` ends the frontend too;
+            // never, when none runs.
+            let drained = stopper.sequence_finished();
             let mut reapi_done = false;
             // A listener that ends without an error does not end the frontend: the worker
             // listener ends when a retire stops it, and the frontend goes on answering the
@@ -934,8 +1051,12 @@ impl<'a> Prepared<'a> {
                 () = intaking => Ok(()),
                 () = ticker.run() => Ok(()),
                 () = stopping => Ok(()),
+                () = drained => Ok(()),
             };
             if reapi_done {
+                // The operator API ends with the REAPI listener: its connections are sent
+                // GOAWAY, finish what they answer, and it stops (`serve::stop_api`).
+                api_stop.fire();
                 stop_api(api_stop_when_done, api_serve).await;
             }
             crate::history::finish(history).await;
@@ -964,6 +1085,9 @@ impl<'a> Prepared<'a> {
                 checks,
                 notify: None,
             },
+            pack_index,
+            packs,
+            intake_polls,
         })
     }
 }
@@ -1012,23 +1136,28 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
 }
 
 /// `GET /metrics`: what the service counts, in the Prometheus text format, history's
-/// counters when it keeps history, the storage health of `members` when there are any, and
-/// the reloads of the listeners' `tls` files.
+/// counters when it keeps history, the storage health of `members` when there are any, the
+/// reloads of the listeners' `tls` files, the counters of the `packs` when there are any, and
+/// the pack reads the daemons of `farm` report.
 fn metrics_route(
     backend: Backend,
     history: Option<Arc<crate::history::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
+    packs: Option<Packs>,
+    farm: Arc<Farm>,
 ) -> axum::Router {
     let tls = Arc::new(tls);
     let render = move || {
         let (backend, members, tls) = (backend.clone(), members.clone(), Arc::clone(&tls));
-        let history = history.clone();
+        let (history, packs, farm) = (history.clone(), packs.clone(), Arc::clone(&farm));
         async move {
             let mut text = backend.render_metrics();
             if let Some(history) = history {
                 history.render(&mut text);
             }
+            Packs::render_metrics_of(packs.as_ref(), &mut text);
+            crate::pack_daemon_metrics::render(&mut text, &farm.pack_reads());
             crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);
             ([(CONTENT_TYPE, crate::metrics::TEXT_FORMAT)], text)
@@ -1087,7 +1216,11 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
     })
 }
 
+mod drain_flags;
 mod handoff;
+mod pack_flags;
 
+#[cfg(test)]
+mod pack_tests;
 #[cfg(test)]
 mod tests;

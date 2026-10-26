@@ -1,8 +1,10 @@
-//! Probe P0: a root offline write into the Data volume of a guest's disk image.
+//! Probe P0: a root offline write into the Data volume of a guest's disk image, and
+//! `image harvest`, the read-only copy of a fixed allowlist out of it.
 //!
-//! The raw image is attached with `hdiutil` (ownership honoured), the volume that holds
-//! `private/var/db` is found among the mounts, files are written and read back, and the
-//! image is detached again. macOS only; the guest must be off.
+//! The raw image is attached with `hdiutil` (ownership honoured), the Data volume is
+//! found among the mounts by what each volume is (`volume`), files are written and read
+//! back (or the allowlist is copied out), and the image is detached again. macOS only;
+//! the guest must be off.
 
 use std::io::Cursor;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -12,6 +14,7 @@ use std::process::{Command, Stdio};
 use serde_json::{Value, json};
 
 use crate::system::OfflineFile;
+use crate::volume;
 
 /// What `hdiutil attach -plist` reported.
 #[derive(Debug, PartialEq, Eq)]
@@ -69,12 +72,6 @@ pub fn whole_disk(output: &[u8]) -> Option<String> {
     (!digits.is_empty()).then(|| format!("/dev/disk{digits}"))
 }
 
-/// The mount that is the Data volume: the one holding `private/var/db`.
-#[must_use]
-pub fn data_volume(mounts: &[PathBuf]) -> Option<&PathBuf> {
-    mounts.iter().find(|m| m.join("private/var/db").is_dir())
-}
-
 fn run(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     let out = Command::new(program)
         .args(args)
@@ -111,25 +108,28 @@ fn put(root: &Path, f: &OfflineFile) -> Result<Value, String> {
     }))
 }
 
-/// Attaches `disk`, writes `files` into its Data volume, and detaches.
-///
-/// # Errors
-/// A step failed; the image is detached whenever the attach worked.
-pub fn write(disk: &Path, files: &[OfflineFile]) -> Result<Value, String> {
+/// Attaches `disk` (read-only when `readonly`), runs `f` on the Data volume, and detaches.
+/// Returns what `f` returned with the attach facts added.
+fn with_data_volume(
+    disk: &Path,
+    readonly: bool,
+    f: impl FnOnce(&Path) -> Result<Value, String>,
+) -> Result<Value, String> {
     let disk_s = disk.to_string_lossy();
-    let out = run(
-        "/usr/bin/hdiutil",
-        &[
-            "attach",
-            "-imagekey",
-            "diskimage-class=CRawDiskImage",
-            "-owners",
-            "on",
-            "-nobrowse",
-            "-plist",
-            &disk_s,
-        ],
-    )?;
+    let mut args = vec![
+        "attach",
+        "-imagekey",
+        "diskimage-class=CRawDiskImage",
+        "-owners",
+        "on",
+        "-nobrowse",
+        "-plist",
+    ];
+    if readonly {
+        args.push("-readonly");
+    }
+    args.push(&disk_s);
+    let out = run("/usr/bin/hdiutil", &args)?;
     let attach = match parse_attach(&out) {
         Ok(a) => a,
         Err(e) => {
@@ -147,19 +147,11 @@ pub fn write(disk: &Path, files: &[OfflineFile]) -> Result<Value, String> {
             });
         }
     };
-    let result = (|| {
-        let root = data_volume(&attach.mounts).ok_or_else(|| {
-            format!(
-                "no mounted volume holds private/var/db (mounts: {:?}, devices: {:?})",
-                attach.mounts, attach.entries
-            )
-        })?;
-        let written = files
-            .iter()
-            .map(|f| put(root, f))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok::<_, String>(json!({"data_volume": root, "written": written}))
-    })();
+    let result = volume::data_volume(&attach.mounts).and_then(|root| {
+        let mut observed = f(&root)?;
+        observed["data_volume"] = json!(root);
+        Ok::<_, String>(observed)
+    });
     let detached = run("/usr/bin/hdiutil", &["detach", "-force", &attach.device]);
     let mut observed = result?;
     observed["attached"] = json!(attach.entries);
@@ -169,6 +161,66 @@ pub fn write(disk: &Path, files: &[OfflineFile]) -> Result<Value, String> {
         observed["detach_error"] = json!(e);
     }
     Ok(observed)
+}
+
+/// Attaches `disk`, writes `files` into its Data volume, and detaches.
+///
+/// # Errors
+/// A step failed; the image is detached whenever the attach worked.
+pub fn write(disk: &Path, files: &[OfflineFile]) -> Result<Value, String> {
+    with_data_volume(disk, false, |root| {
+        let written = files
+            .iter()
+            .map(|f| put(root, f))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(json!({"written": written}))
+    })
+}
+
+/// Attaches `disk`, stages Xcode and the simulator runtimes of `plan` into its Data
+/// volume as root, and detaches.
+///
+/// # Errors
+/// A step failed (the message says which); the image is detached whenever the attach worked.
+pub fn stage(disk: &Path, plan: &crate::stage::Plan) -> Result<Value, String> {
+    with_data_volume(disk, false, |root| {
+        let env = crate::stage::Env {
+            free_bytes: &crate::hostfs::free_bytes,
+            clone_tree: &clone_tree,
+            chown_root: &crate::hostfs::lchown_root,
+            remove: &crate::stage::remove_path,
+        };
+        Ok(json!({"staged": crate::stage::execute(root, plan, &env)?}))
+    })
+}
+
+/// `clonefile(2)` of a whole directory tree, not following a link at `src`. It fails with
+/// `EXDEV` when `dst` is on another volume, which is the usual case for a guest disk.
+fn clone_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let to_c = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_encoded_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    };
+    let (s, d) = (to_c(src)?, to_c(dst)?);
+    // SAFETY: both are NUL-terminated paths; `CLONE_NOFOLLOW` (1) clones a link as a link.
+    if unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), 1) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Attaches `disk` read-only, copies the allowlist from its Data volume into the new
+/// directory `out`, and detaches.
+///
+/// # Errors
+/// A step failed; the image is detached whenever the attach worked.
+pub fn harvest(disk: &Path, out: &Path) -> Result<Value, String> {
+    with_data_volume(disk, true, |root| {
+        Ok(
+            json!({"harvest": crate::harvest::copy_allowlist(root, out, &crate::harvest::Limits::DEFAULT)?}),
+        )
+    })
 }
 
 #[cfg(test)]

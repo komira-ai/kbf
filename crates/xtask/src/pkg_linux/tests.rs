@@ -4,14 +4,20 @@ use std::os::unix::fs::MetadataExt;
 use super::*;
 use kbf_testkit::dir::TestDir;
 
-mod kbf_tests;
-
 /// An empty directory of its own for one test, removed when it drops.
 fn scratch(name: &str) -> TestDir {
     let beside = std::env::current_exe().expect("test binary");
     let deps = beside.parent().expect("deps");
     TestDir::under(deps.join("xtask-pkg-unit"), name)
 }
+
+/// The units in `packaging/linux/units` that no package carries: the retired installer's and
+/// proxy's. A unit added to that directory is the `kbf` package's or is named here.
+const NOT_PACKAGED: [&str; 3] = [
+    "kbf-installer.service",
+    "kbf-proxy.service",
+    "kbf-proxy.socket",
+];
 
 /// The inputs a package is built from, in `dir`.
 struct Tree {
@@ -22,11 +28,11 @@ impl Tree {
     fn new(name: &str) -> Tree {
         let dir = scratch(name);
         let t = Tree { dir };
-        t.put("kbf-installer", "binary");
         t.put("kbf", "kbf binary");
-        t.put("units/kbf-node.service", "node unit");
-        t.put("units/kbf-installer.service", "installer unit");
-        for unit in KBF_UNITS {
+        for unit in KBF_UNITS.into_iter().chain([SLICE]) {
+            t.put(&format!("units/{unit}"), unit);
+        }
+        for unit in NOT_PACKAGED {
             t.put(&format!("units/{unit}"), unit);
         }
         for (n, _) in TRUST_FILES {
@@ -48,7 +54,6 @@ impl Tree {
         // The leaked paths live as long as the test.
         let at = |rel: &str| -> &'static Path { Box::leak(self.dir.join(rel).into_boxed_path()) };
         Inputs {
-            binary: at("kbf-installer"),
             kbf: at("kbf"),
             units: at("units"),
             trust: at("trust"),
@@ -68,30 +73,61 @@ fn refused(r: Result<Vec<Entry>, Error>) -> String {
     }
 }
 
+/// The path of `packaging/linux` in the repository.
+fn packaging() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux")
+}
+
+/// The inputs made of the repository's real packaging files (and the stand-in trust files).
+fn real_inputs(root: &Path) -> Inputs<'_> {
+    let at = |rel: &str| -> &'static Path { Box::leak(root.join(rel).into_boxed_path()) };
+    Inputs {
+        kbf: at("units/kbf-daemon.service"),
+        units: at("units"),
+        trust: at("testdata/trust"),
+        sysusers: at("sysusers.d/kbf-installer.conf"),
+        tmpfiles: at("tmpfiles.d/kbf-installer.conf"),
+        needrestart: at("needrestart/kbf.conf"),
+        platform: Platform::LinuxX86_64,
+        version: "0.0.0+ci",
+    }
+}
+
+/// Asserts that the package holds the runtime, the units of the modes, the slice, the users and
+/// directories they run with, the needrestart drop-in and the trust directory, each at its mode,
+/// and holds nothing else.
 #[test]
 fn the_plan_is_the_contract_paths_with_their_modes() {
     let t = Tree::new("plan");
-    let got: Vec<(String, u32, bool)> = plan(&t.inputs())
+    let got: Vec<(String, u32, bool)> = kbf_plan(&t.inputs())
         .expect("plan")
         .into_iter()
         .map(|e| (e.dst, e.mode, e.sha256.is_some()))
         .collect();
     let want = [
         ("/etc/needrestart/conf.d/kbf.conf", 0o644, true),
-        ("/usr/bin/kbf-installer", 0o755, true),
-        ("/usr/lib/systemd/system/kbf-installer.service", 0o644, true),
-        ("/usr/lib/systemd/system/kbf-node.service", 0o644, true),
-        ("/usr/lib/sysusers.d/kbf-installer.conf", 0o644, true),
-        ("/usr/lib/tmpfiles.d/kbf-installer.conf", 0o644, true),
-        ("/usr/share/kbf-installer", 0o755, false),
-        ("/usr/share/kbf-installer/trust", 0o755, false),
-        ("/usr/share/kbf-installer/trust/gh", 0o755, true),
-        ("/usr/share/kbf-installer/trust/installer.conf", 0o644, true),
+        ("/usr/bin/kbf", 0o755, true),
         (
-            "/usr/share/kbf-installer/trust/trusted_root.jsonl",
+            "/usr/lib/systemd/system/kbf-all-in-one.service",
             0o644,
             true,
         ),
+        ("/usr/lib/systemd/system/kbf-daemon.service", 0o644, true),
+        ("/usr/lib/systemd/system/kbf-frontend.service", 0o644, true),
+        (
+            "/usr/lib/systemd/system/kbf-storage-and-daemon.service",
+            0o644,
+            true,
+        ),
+        ("/usr/lib/systemd/system/kbf-storage.service", 0o644, true),
+        ("/usr/lib/systemd/system/kbf.slice", 0o644, true),
+        ("/usr/lib/sysusers.d/kbf.conf", 0o644, true),
+        ("/usr/lib/tmpfiles.d/kbf.conf", 0o644, true),
+        ("/usr/share/kbf", 0o755, false),
+        ("/usr/share/kbf/trust", 0o755, false),
+        ("/usr/share/kbf/trust/gh", 0o755, true),
+        ("/usr/share/kbf/trust/installer.conf", 0o644, true),
+        ("/usr/share/kbf/trust/trusted_root.jsonl", 0o644, true),
     ];
     let want: Vec<(String, u32, bool)> = want
         .iter()
@@ -100,26 +136,55 @@ fn the_plan_is_the_contract_paths_with_their_modes() {
     assert_eq!(got, want);
 }
 
+/// Asserts that the retired installer is not in the package: not its binary, not its proxy's or
+/// its own units, though the unit directory holds them, and not its share directory.
+#[test]
+fn the_plan_leaves_out_the_installer_its_units_and_its_directory() {
+    let t = Tree::new("no-installer");
+    let dsts: Vec<String> = kbf_plan(&t.inputs())
+        .expect("plan")
+        .into_iter()
+        .map(|e| e.dst)
+        .collect();
+    for unit in NOT_PACKAGED {
+        let dst = format!("{UNIT_DIR}/{unit}");
+        assert!(!dsts.contains(&dst), "{dst} in {dsts:?}");
+    }
+    for dst in &dsts {
+        assert!(!dst.contains("kbf-installer"), "{dst}");
+    }
+}
+
+/// Asserts that the plan refuses what the package does not ship, each with its reason, and
+/// that it names every problem at once.
 #[test]
 fn the_plan_refuses_what_the_package_does_not_ship() {
     // Each case changes the tree in one way and names what the refusal must say.
     type Change = fn(&Tree) -> Inputs<'_>;
-    let cases: [(&str, Change, &str); 11] = [
+    let cases: [(&str, Change, &str); 12] = [
         (
-            "a unit not named kbf-*.service",
+            "a missing kbf",
             |t| {
-                t.put("units/other.service", "x");
+                std::fs::remove_file(t.dir.join("kbf")).expect("rm");
                 t.inputs()
             },
-            "other.service: a package unit is named kbf-*.service or kbf-*.socket",
+            "/kbf: No such file or directory",
         ),
         (
-            "a unit that is a timer",
+            "a missing mode unit",
             |t| {
-                t.put("units/kbf-gc.timer", "x");
+                std::fs::remove_file(t.dir.join("units/kbf-daemon.service")).expect("rm");
                 t.inputs()
             },
-            "kbf-gc.timer: a package unit is named kbf-*.service or kbf-*.socket",
+            "unit file kbf-daemon.service is missing",
+        ),
+        (
+            "a missing slice",
+            |t| {
+                std::fs::remove_file(t.dir.join("units/kbf.slice")).expect("rm");
+                t.inputs()
+            },
+            "unit file kbf.slice is missing",
         ),
         (
             "a directory among the units",
@@ -128,15 +193,6 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
                 t.inputs()
             },
             "is not a regular file",
-        ),
-        (
-            "no unit",
-            |t| {
-                std::fs::remove_file(t.dir.join("units/kbf-node.service")).expect("rm");
-                std::fs::remove_file(t.dir.join("units/kbf-installer.service")).expect("rm");
-                t.inputs()
-            },
-            "no unit files in",
         ),
         (
             "a missing trust file",
@@ -155,12 +211,12 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
             "extra.pem: the package ships no trust file of that name",
         ),
         (
-            "a missing binary",
+            "a missing sysusers file",
             |t| {
-                std::fs::remove_file(t.dir.join("kbf-installer")).expect("rm");
+                std::fs::remove_file(t.dir.join("sysusers.conf")).expect("rm");
                 t.inputs()
             },
-            "kbf-installer",
+            "/sysusers.conf: No such file or directory",
         ),
         (
             "a unit directory that is not there",
@@ -170,6 +226,15 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
                 i
             },
             "/nonexistent/units cannot be read as a directory",
+        ),
+        (
+            "a trust directory that is not there",
+            |t| {
+                let mut i = t.inputs();
+                i.trust = Path::new("/nonexistent/trust");
+                i
+            },
+            "/nonexistent/trust cannot be read as a directory",
         ),
         (
             "a version with a space",
@@ -201,44 +266,42 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
     ];
     for (n, (what, change, says)) in cases.iter().enumerate() {
         let t = Tree::new(&format!("refuse-{n}"));
-        let text = refused(plan(&change(&t)));
+        let text = refused(kbf_plan(&change(&t)));
         assert!(text.contains(says), "{what}: {text}");
     }
-}
-
-#[test]
-fn the_plan_collects_every_problem() {
     let t = Tree::new("collects");
-    t.put("units/other.service", "x");
+    std::fs::remove_file(t.dir.join("units/kbf-daemon.service")).expect("rm");
+    std::fs::remove_file(t.dir.join("units/kbf-storage.service")).expect("rm");
     std::fs::remove_file(t.dir.join("trust/gh")).expect("rm");
-    let text = refused(plan(&t.inputs()));
-    assert_eq!(text.lines().count(), 2, "{text}");
+    let text = refused(kbf_plan(&t.inputs()));
+    assert_eq!(text.lines().count(), 3, "{text}");
 }
 
+/// Asserts that the configuration is named `kbf`, recommends what the installer's package
+/// depended on (deb and rpm) and depends on nothing, suggests Postgres, runs no script, lists its files as root's, and carries the
+/// version and architecture it is given.
 #[test]
 fn the_config_has_the_contract_dependencies_no_script_and_root_files() {
     let t = Tree::new("config");
-    let entries = plan(&t.inputs()).expect("plan");
-    let text = config(
-        Package::Installer,
-        &entries,
-        Platform::LinuxX86_64,
-        "1.2.3+ci",
-    );
+    let entries = kbf_plan(&t.inputs()).expect("plan");
+    let text = config(&entries, Platform::LinuxX86_64, "1.2.3+ci");
+    assert!(text.contains("name: \"kbf\"\n"), "{text}");
     assert!(text.contains("arch: \"amd64\""), "{text}");
     assert!(text.contains("version: \"1.2.3+ci\""), "{text}");
     assert!(
         text.contains(
-            "depends:\n  - \"crun\"\n  - \"uidmap\"\n  - \"systemd\"\n  - \"ca-certificates\"\n"
+            "recommends:\n  - \"crun\"\n  - \"uidmap\"\n  - \"systemd\"\n  - \"ca-certificates\"\n"
         ),
         "{text}"
     );
     assert!(
         text.contains(
-            "overrides:\n  rpm:\n    depends:\n      - \"crun\"\n      - \"shadow-utils\""
+            "overrides:\n  rpm:\n    recommends:\n      - \"crun\"\n      - \"shadow-utils\""
         ),
         "{text}"
     );
+    // No dependency of either kind: a plain `dpkg --install` resolves nothing.
+    assert!(!text.contains("depends"), "{text}");
     assert!(text.contains("buildhost: \"kbf-build\""), "{text}");
     for banned in [
         "podman",
@@ -255,7 +318,7 @@ fn the_config_has_the_contract_dependencies_no_script_and_root_files() {
         entries.len()
     );
     assert!(
-        text.contains("  - dst: \"/usr/bin/kbf-installer\"\n    src: "),
+        text.contains("  - dst: \"/usr/bin/kbf\"\n    src: "),
         "{text}"
     );
     assert!(
@@ -267,27 +330,50 @@ fn the_config_has_the_contract_dependencies_no_script_and_root_files() {
         "{text}"
     );
     assert!(
-        text.contains("  - dst: \"/usr/share/kbf-installer/trust\"\n    type: \"dir\"\n"),
+        text.contains("  - dst: \"/usr/share/kbf/trust\"\n    type: \"dir\"\n"),
         "{text}"
     );
-    let arm = config(Package::Installer, &entries, Platform::LinuxArm64, "1.2.3");
+    let arm = config(&entries, Platform::LinuxArm64, "1.2.3");
     assert!(arm.contains("arch: \"arm64\""), "{arm}");
+}
+
+/// Asserts that the deb replaces every `kbf-installer` below the bound, which is how a plain
+/// `dpkg --install` unpacks over its files, that it does not break it (dpkg would refuse on a host
+/// that has it), that the rpm names neither, and that the bound is above every version of the
+/// installer that was published (`0.1.0+<commit>`).
+#[test]
+fn the_deb_replaces_the_old_installer_and_breaks_it_not_and_the_rpm_names_it_not() {
+    let t = Tree::new("relations");
+    let entries = kbf_plan(&t.inputs()).expect("plan");
+    let text = config(&entries, Platform::LinuxX86_64, "1.2.3+ci");
+    assert!(
+        text.contains("  deb:\n    replaces:\n      - \"kbf-installer (<< 0.1.1)\"\n"),
+        "{text}"
+    );
+    for banned in ["breaks", "conflicts"] {
+        assert!(!text.contains(banned), "{banned} in {text}");
+    }
+    assert_eq!(text.matches("replaces").count(), 1, "{text}");
+    assert_eq!(text.matches("kbf-installer").count(), 1, "{text}");
+    assert_eq!(KBF_DEB_REPLACES, ["kbf-installer (<< 0.1.1)"]);
+    assert_eq!(INSTALLER_RETIRED_FROM, "0.1.1");
+    // The rpm's own sections do not mention the installer: the lines under `rpm:`.
+    let rpm = text.split("\nrpm:\n").nth(1).expect("rpm section");
+    assert!(!rpm.contains("kbf-installer"), "{rpm}");
 }
 
 #[test]
 fn the_config_is_the_same_text_for_the_same_inputs() {
     let t = Tree::new("same-config");
     let a = config(
-        Package::Installer,
-        &plan(&t.inputs()).expect("plan"),
+        &kbf_plan(&t.inputs()).expect("plan"),
         Platform::LinuxX86_64,
         "1.0.0",
     );
     // A touched source changes nothing in the text.
     stamp(&sources(&a).expect("sources"), 42).expect("stamp");
     let b = config(
-        Package::Installer,
-        &plan(&t.inputs()).expect("plan"),
+        &kbf_plan(&t.inputs()).expect("plan"),
         Platform::LinuxX86_64,
         "1.0.0",
     );
@@ -297,12 +383,9 @@ fn the_config_is_the_same_text_for_the_same_inputs() {
 #[test]
 fn the_listing_round_trips() {
     let t = Tree::new("listing");
-    let entries = plan(&t.inputs()).expect("plan");
+    let entries = kbf_plan(&t.inputs()).expect("plan");
     let text = listing(&entries);
-    assert!(
-        text.contains("dir 0755 /usr/share/kbf-installer -\n"),
-        "{text}"
-    );
+    assert!(text.contains("dir 0755 /usr/share/kbf -\n"), "{text}");
     let parsed = parse_listing(&text).expect("parse");
     assert_eq!(parsed.len(), entries.len());
     for (p, e) in parsed.iter().zip(&entries) {
@@ -326,29 +409,43 @@ fn a_listing_line_that_is_not_one_is_refused() {
     }
 }
 
-/// Asserts that `write_config` writes the configuration and the listing of each package, the
-/// `kbf-installer` pair in the directory it is given and the `kbf` pair in `kbf` below it, says
-/// so once per file, and that each listing is the entries of its own package.
+/// Asserts that `write_config` writes the configuration and the listing of the package in the
+/// directory it is given, says so once per file, and that the listing is the entries of the
+/// package.
 #[test]
-fn write_config_writes_both_files_of_both_packages_and_says_so() {
+fn write_config_writes_both_files_and_says_so() {
     let t = Tree::new("write");
     let out = t.dir.join("out/nested");
     let printed = write_config(&t.inputs(), &out).expect("write");
-    assert_eq!(printed.len(), 4);
+    assert_eq!(printed.len(), 2);
     let yaml = std::fs::read_to_string(out.join("nfpm.yaml")).expect("yaml");
     let entries = parse_listing(&std::fs::read_to_string(out.join("listing.txt")).expect("l"))
         .expect("listing");
-    assert!(yaml.contains(&entries[0].dst));
-    assert!(yaml.contains("name: \"kbf-installer\""), "{yaml}");
-    let kbf_yaml = std::fs::read_to_string(out.join("kbf/nfpm.yaml")).expect("kbf yaml");
-    let kbf_listing = std::fs::read_to_string(out.join("kbf/listing.txt")).expect("kbf listing");
-    let kbf_entries = parse_listing(&kbf_listing).expect("kbf listing");
-    assert!(kbf_yaml.contains("name: \"kbf\""), "{kbf_yaml}");
-    assert_eq!(kbf_entries.len(), 1 + KBF_UNITS.len());
-    assert_eq!(kbf_entries[0].dst, KBF_PATH);
+    assert!(yaml.contains("name: \"kbf\""), "{yaml}");
+    assert_eq!(entries.len(), kbf_plan(&t.inputs()).expect("plan").len());
+    assert!(entries.iter().any(|e| e.dst == KBF_PATH));
+    for e in &entries {
+        assert!(yaml.contains(&e.dst), "{} in {yaml}", e.dst);
+    }
     for line in &printed {
         assert!(line.starts_with("wrote "), "{line}");
     }
+}
+
+/// Asserts that a unit directory without the unit of a mode is refused, naming it, and that
+/// nothing is written.
+#[test]
+fn write_config_refuses_a_missing_mode_unit_and_writes_nothing() {
+    let t = Tree::new("write-no-mode-unit");
+    std::fs::remove_file(t.dir.join("units/kbf-daemon.service")).expect("rm");
+    let out = t.dir.join("out");
+    let err = write_config(&t.inputs(), &out).expect_err("a unit is missing");
+    let text = err.to_string();
+    assert!(
+        text.contains("unit file kbf-daemon.service is missing"),
+        "{text}"
+    );
+    assert!(!out.exists());
 }
 
 #[test]
@@ -366,7 +463,7 @@ fn write_config_reports_a_directory_it_cannot_make_and_a_file_it_cannot_write() 
 
 #[test]
 fn the_real_sysusers_and_tmpfiles_files_say_what_the_contract_says() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux");
+    let root = packaging();
     let lines = |name: &str| -> Vec<Vec<String>> {
         std::fs::read_to_string(root.join(name))
             .expect("file")
@@ -375,7 +472,19 @@ fn the_real_sysusers_and_tmpfiles_files_say_what_the_contract_says() {
             .map(|l| l.split_whitespace().map(str::to_owned).collect())
             .collect()
     };
-    let entries = lines("sysusers.d/kbf-installer.conf");
+    let all = lines("sysusers.d/kbf-installer.conf");
+    // The signer's socket group: made, with the signer (which gives files to it) and the
+    // frontend's user (which connects as a member) in it, and no other member.
+    let (entries, others): (Vec<_>, Vec<_>) = all.into_iter().partition(|f| f[0] == "u");
+    let want_others: Vec<Vec<String>> = [
+        ["g", "kbf-signer-clients", "-"],
+        ["m", "kbf-signer", "kbf-signer-clients"],
+        ["m", "kbf-server", "kbf-signer-clients"],
+    ]
+    .iter()
+    .map(|f| f.iter().map(|x| (*x).to_owned()).collect())
+    .collect();
+    assert_eq!(others, want_others);
     // Design section 3: `kbf-signer` owns the CA key and has no home, no login and a
     // system id with a group of its own name; there is no `kbf-verify` user.
     let signer: Vec<&Vec<String>> = entries.iter().filter(|f| f[1] == "kbf-signer").collect();
@@ -422,27 +531,42 @@ fn the_real_sysusers_and_tmpfiles_files_say_what_the_contract_says() {
     assert_eq!(dirs, want);
 }
 
+/// Asserts that the repository's own unit directory, sysusers, tmpfiles and needrestart files,
+/// with the stand-in trust files, are a plan: the files the nfpm configuration is written from.
 #[test]
-fn the_fixtures_make_a_plan_with_the_real_files() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux");
-    let binary = root.join("testdata/units/kbf-node.service");
-    let plan = plan(&Inputs {
-        binary: &binary,
-        kbf: &binary,
-        units: &root.join("testdata/units"),
-        trust: &root.join("testdata/trust"),
-        sysusers: &root.join("sysusers.d/kbf-installer.conf"),
-        tmpfiles: &root.join("tmpfiles.d/kbf-installer.conf"),
-        needrestart: &root.join("needrestart/kbf.conf"),
-        platform: Platform::LinuxX86_64,
-        version: "0.0.0+ci",
-    })
-    .expect("the fixtures are a plan");
-    assert!(plan.iter().any(|e| e.dst.ends_with("kbf-node.service")));
+fn the_real_files_make_a_plan() {
+    let root = packaging();
+    let plan = kbf_plan(&real_inputs(&root)).expect("the real files are a plan");
+    assert!(plan.iter().any(|e| e.dst.ends_with("kbf-frontend.service")));
     assert!(
         plan.iter()
-            .any(|e| e.dst.ends_with("kbf-installer.service"))
+            .any(|e| e.dst == "/usr/lib/systemd/system/kbf.slice")
     );
+}
+
+/// Asserts that the trust directory the package installs is the one the hosts read: the Linux
+/// layout of `kbf_setup`, whose `Layout` every verifier asks, with the same three file names.
+#[test]
+fn the_trust_directory_is_the_one_the_layout_reads() {
+    use kbf_host::path::Root;
+    use kbf_installer::layout::{Layout, Platform as Host};
+    let layout = Layout::new(Root::new("/").expect("absolute"), Host::Linux);
+    assert_eq!(layout.trust_dir().as_str(), TRUST_DIR);
+    let names: Vec<String> = [layout.gh(), layout.trusted_root(), layout.settings()]
+        .iter()
+        .map(|p| p.as_str().to_owned())
+        .collect();
+    let packaged: Vec<String> = TRUST_FILES
+        .iter()
+        .map(|(n, _)| format!("{TRUST_DIR}/{n}"))
+        .collect();
+    for name in &names {
+        assert!(
+            packaged.contains(name),
+            "{name} is not packaged: {packaged:?}"
+        );
+    }
+    assert_eq!(names.len(), packaged.len());
 }
 
 /// The environment and arguments of one call of the model.
@@ -668,54 +792,48 @@ fn the_nfpm_process_gets_the_given_environment_and_nothing_else() {
     assert!(!fails(&[], &[]).expect("false").ok);
 }
 
-/// Asserts that the two packages together ship exactly the files of `packaging/linux/units`:
-/// a unit added there is packaged, and nothing else is.
+/// Asserts that the package ships the mode units and the slice of `packaging/linux/units`, and
+/// that what it leaves out is exactly [`NOT_PACKAGED`]: a unit added to the directory is
+/// packaged or is named there.
 #[test]
-fn the_packages_ship_exactly_the_units_directory() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux");
-    let held = |dir: &str| -> Vec<String> {
-        let mut v: Vec<String> = std::fs::read_dir(root.join(dir))
-            .expect("units directory")
-            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-            .collect();
-        v.sort();
-        v
-    };
-    let units = held("units");
-    assert!(
-        units.iter().any(|n| n == "kbf-installer.service"),
-        "{units:?}"
-    );
-    let inputs = Inputs {
-        binary: &root.join("units/kbf-installer.service"),
-        kbf: &root.join("units/kbf-daemon.service"),
-        units: &root.join("units"),
-        trust: &root.join("testdata/trust"),
-        sysusers: &root.join("sysusers.d/kbf-installer.conf"),
-        tmpfiles: &root.join("tmpfiles.d/kbf-installer.conf"),
-        needrestart: &root.join("needrestart/kbf.conf"),
-        platform: Platform::LinuxX86_64,
-        version: "0.0.0+ci",
-    };
-    let units_of = |entries: Vec<Entry>| -> Vec<String> {
-        entries
-            .iter()
-            .filter_map(|e| e.dst.strip_prefix(&format!("{UNIT_DIR}/")))
-            .map(str::to_owned)
-            .collect()
-    };
-    let installer = units_of(plan(&inputs).expect("the real units are a plan"));
-    let kbf = units_of(kbf_plan(&inputs).expect("the real units hold the mode units"));
-    let mut shipped = [installer, kbf].concat();
-    shipped.sort();
-    assert_eq!(shipped, units);
+fn the_package_ships_the_units_directory_but_the_retired_ones() {
+    let root = packaging();
+    let mut held: Vec<String> = std::fs::read_dir(root.join("units"))
+        .expect("units directory")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    held.sort();
+    for unit in NOT_PACKAGED {
+        assert!(held.iter().any(|n| n == unit), "{unit} in {held:?}");
+    }
+    let shipped: Vec<String> = kbf_plan(&real_inputs(&root))
+        .expect("the real units are a plan")
+        .iter()
+        .filter_map(|e| {
+            e.dst
+                .strip_prefix(&format!("{UNIT_DIR}/"))
+                .map(str::to_owned)
+        })
+        .collect();
+    let mut left_out: Vec<String> = held
+        .iter()
+        .filter(|n| !shipped.contains(n))
+        .cloned()
+        .collect();
+    left_out.sort();
+    let mut want: Vec<String> = NOT_PACKAGED.iter().map(|n| (*n).to_owned()).collect();
+    want.sort();
+    assert_eq!(left_out, want);
+    for unit in KBF_UNITS.into_iter().chain([SLICE]) {
+        assert!(shipped.iter().any(|n| n == unit), "{unit} in {shipped:?}");
+    }
 }
 
-/// The kbf-installer package depends on no Envoy: Envoy runs on frontend hosts only, and a
-/// hard dependency would put it on every node.
+/// The package depends on no Envoy: Envoy runs on frontend hosts only, and a hard dependency
+/// would put it on every node.
 #[test]
-fn no_dependency_of_either_package_names_envoy() {
-    for dep in DEB_DEPENDS.iter().chain(RPM_DEPENDS.iter()) {
+fn no_dependency_of_the_package_names_envoy() {
+    for dep in DEB_RECOMMENDS.iter().chain(RPM_RECOMMENDS.iter()) {
         assert!(!dep.to_lowercase().contains("envoy"), "{dep}");
     }
 }
@@ -726,10 +844,10 @@ fn no_dependency_of_either_package_names_envoy() {
 /// (the frontend operator is not told what to install).
 #[test]
 fn postgres_is_suggested_not_required() {
-    for dep in DEB_DEPENDS.iter().chain(RPM_DEPENDS.iter()) {
+    for dep in DEB_RECOMMENDS.iter().chain(RPM_RECOMMENDS.iter()) {
         assert!(!dep.to_lowercase().contains("postgres"), "{dep}");
     }
-    let cfg = config(Package::Installer, &[], Platform::LinuxX86_64, "0.0.0+ci");
+    let cfg = config(&[], Platform::LinuxX86_64, "0.0.0+ci");
     let top: Vec<&str> = cfg.lines().collect();
     let at = |key: &str| top.iter().position(|l| *l == key).expect(key);
     assert!(
@@ -740,49 +858,10 @@ fn postgres_is_suggested_not_required() {
         cfg.contains("    suggests:\n      - \"postgresql-server\"\n"),
         "the rpm suggests postgresql-server: {cfg}"
     );
-    assert!(!cfg.contains("recommends"), "{cfg}");
-}
-
-/// The slice is the one non-`.service` unit; any other name is still refused.
-#[test]
-fn a_unit_that_is_neither_a_service_nor_the_slice_is_refused() {
-    let t = Tree::new("slice");
-    t.put("units/kbf.slice", "[Slice]");
-    assert!(plan(&t.inputs()).is_ok(), "the slice is packaged");
-    t.put("units/kbf-x.timer", "[Timer]");
-    let got = refused(plan(&t.inputs()));
-    assert!(got.contains("kbf-x.timer"), "{got}");
-    assert!(!got.contains("kbf.slice:"), "{got}");
-}
-
-/// A `kbf-*.socket` is packaged beside its service, in the same directory and mode.
-#[test]
-fn a_socket_unit_is_packaged_beside_the_services_with_the_same_mode() {
-    let t = Tree::new("socket");
-    t.put("units/kbf-x.socket", "[Socket]");
-    t.put("units/other.socket", "[Socket]");
-    let got = refused(plan(&t.inputs()));
-    assert!(
-        got.contains("other.socket: a package unit is named"),
-        "{got}"
-    );
-    assert!(!got.contains("kbf-x.socket:"), "{got}");
-    std::fs::remove_file(t.dir.join("units/other.socket")).expect("rm");
-    let entries = plan(&t.inputs()).expect("a socket is a plan");
-    let find = |n: &str| {
-        entries
-            .iter()
-            .find(|e| e.dst.ends_with(&format!("/{n}")))
-            .map(|e| (e.dst.clone(), e.mode))
-            .expect(n)
-    };
-    let (sock, sock_mode) = find("kbf-x.socket");
-    let (svc, svc_mode) = find("kbf-node.service");
-    assert_eq!(sock_mode, svc_mode);
-    assert_eq!(
-        sock.rsplit_once('/').map(|p| p.0),
-        svc.rsplit_once('/').map(|p| p.0)
-    );
+    // Nor recommended: apt installs recommended packages by default.
+    let recommended = cfg.split("recommends:").nth(1).expect("recommends");
+    let recommended = recommended.split("suggests:").next().expect("section");
+    assert!(!recommended.contains("postgres"), "{cfg}");
 }
 
 #[test]
@@ -797,12 +876,14 @@ fn unit_accounts_reads_user_and_group_lines_only() {
     );
 }
 
+/// Every account a unit the package ships names is made by the package's sysusers file: the
+/// packaged units only, since the retired installer's and proxy's name users of their own.
 #[test]
 fn every_user_and_group_a_packaged_unit_names_is_made_by_sysusers() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux");
+    let root = packaging();
     let mut seen = 0;
-    for e in std::fs::read_dir(root.join("units")).expect("units") {
-        let path = e.expect("entry").path();
+    for name in KBF_UNITS.into_iter().chain([SLICE]) {
+        let path = root.join("units").join(name);
         let text = std::fs::read_to_string(&path).expect("unit");
         for (_, account) in unit_accounts(&text) {
             seen += 1;
@@ -842,25 +923,14 @@ fn needrestart_skips(text: &str, unit: &str) -> bool {
 
 #[test]
 fn the_package_holds_the_needrestart_drop_in_as_a_0644_config_file() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux");
-    let plan = plan(&Inputs {
-        binary: &root.join("units/kbf-installer.service"),
-        kbf: &root.join("units/kbf-installer.service"),
-        units: &root.join("units"),
-        trust: &root.join("testdata/trust"),
-        sysusers: &root.join("sysusers.d/kbf-installer.conf"),
-        tmpfiles: &root.join("tmpfiles.d/kbf-installer.conf"),
-        needrestart: &root.join("needrestart/kbf.conf"),
-        platform: Platform::LinuxX86_64,
-        version: "0.0.0+ci",
-    })
-    .expect("the real files are a plan");
+    let root = packaging();
+    let plan = kbf_plan(&real_inputs(&root)).expect("the real files are a plan");
     let e = plan
         .iter()
         .find(|e| e.dst == "/etc/needrestart/conf.d/kbf.conf")
         .expect("the drop-in is packaged");
     assert_eq!((e.mode, e.sha256.is_some()), (0o644, true));
-    let yaml = config(Package::Installer, &plan, Platform::LinuxX86_64, "0.0.0+ci");
+    let yaml = config(&plan, Platform::LinuxX86_64, "0.0.0+ci");
     let at = yaml
         .find("dst: \"/etc/needrestart/conf.d/kbf.conf\"")
         .expect("in the nfpm configuration");

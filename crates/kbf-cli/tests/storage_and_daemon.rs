@@ -116,6 +116,8 @@ fn node_flags(dir: &Path, worker: SocketAddr) -> Vec<String> {
         "--reconnect-ms=50".to_owned(),
         format!("--data-dir={}", at("data")),
         format!("--id-files={}", id_files(dir).display()),
+        // Not the host's own /etc/kbf/kbf.toml.
+        kbf_testkit::config::flag(dir),
     ]
 }
 
@@ -423,6 +425,52 @@ fn a_start_either_half_refuses_says_which() {
     assert_eq!(code, Some(2), "{err}");
     assert!(out.starts_with("kbf-storage "), "{out}");
     assert!(err.contains("kbf storage-and-daemon: daemon: "), "{err}");
+
+    // A cold store that cannot be made is the storage half's refusal, as `kbf storage`
+    // gives it: 2, before the daemon half starts.
+    let cold = ["--cold-store=file:///proc/nonexistent/cold".to_owned()];
+    let flags: Vec<String> = replaced(node_flags(&dir, worker), &cold)
+        .into_iter()
+        .chain(runtime)
+        .collect();
+    let (code, out, err) = refused(&flags, &host);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("kbf storage-and-daemon: storage: "), "{err}");
+    assert!(out.is_empty(), "{out}");
+}
+
+/// Catches a driver other than the container driver accepted (the daemon half is the
+/// container driver's only): the native driver is a usage error, exit 2, said so, and no
+/// start line.
+#[test]
+fn a_driver_other_than_container_is_a_usage_error() {
+    let dir = scratch("native");
+    let worker: SocketAddr = "127.0.0.1:1".parse().expect("address");
+    let native = ["--driver=native".to_owned()];
+    let flags = replaced(node_flags(&dir, worker), &native);
+    let (code, out, err) = refused(&flags, &[]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("container driver only"), "{err}");
+    assert!(out.is_empty(), "{out}");
+}
+
+/// Catches the daemon's helper re-execs dispatched after the flags are read, or not at
+/// all: run with keeper arguments that name no mode, as a driver never runs it, the
+/// binary answers as the keeper does (its usage line, exit 2), not with clap's error
+/// about the flags it lacks, and starts no node (no start line on stdout).
+#[test]
+fn the_binary_answers_as_a_keeper_before_it_reads_its_flags() {
+    let out = Command::new(BIN)
+        .args(["__keeper", "groups"])
+        .output()
+        .expect("spawn");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.starts_with("kbf-keeper: usage: __keeper group"),
+        "{stderr}"
+    );
+    assert!(out.stdout.is_empty(), "a node started");
 }
 
 /// Catches a SIGTERM that arrives while the node is still starting killing the process by
@@ -447,18 +495,10 @@ fn a_sigterm_while_the_node_is_still_starting_stops_it_cleanly() {
         &["write-lines", "$UPPER/out/file.txt", "a file"],
     );
     let worker: SocketAddr = "127.0.0.1:1".parse().expect("address");
-    // An empty file, so that a host's own /etc/kbf/kbf.toml is not read.
-    let config = dir.join("empty.toml");
-    std::fs::write(&config, "").expect("write");
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-    }
     // Port 1 refuses, and the registration retries until the frontend answers.
     let flags: Vec<String> = node_flags(&dir, worker)
         .into_iter()
         .chain(["--frontend=http://127.0.0.1:1".to_owned()])
-        .chain([format!("--config={}", config.display())])
         .collect();
     let mut child = Command::new(BIN)
         .args(&flags)

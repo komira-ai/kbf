@@ -323,6 +323,13 @@ impl Map {
     }
 
     fn read_members(&self, digest: &Digest) -> Vec<&Member> {
+        let mut order = self.read_candidates(digest);
+        order.retain(|m| m.state != MemberState::Down);
+        order
+    }
+
+    /// The owners of `digest` in the order a read would try them, `Down` ones included.
+    fn read_candidates(&self, digest: &Digest) -> Vec<&Member> {
         let r = usize::from(self.r);
         let settled: Vec<&Member> = self
             .ranked(digest)
@@ -331,16 +338,22 @@ impl Map {
             .take(r)
             .collect();
         let mut order: Vec<&Member> = Vec::new();
-        for m in settled
-            .into_iter()
-            .chain(self.write_members(digest))
-            .filter(|m| m.state != MemberState::Down)
-        {
+        for m in settled.into_iter().chain(self.write_members(digest)) {
             if !order.iter().any(|seen| seen.id == m.id) {
                 order.push(m);
             }
         }
         order
+    }
+
+    /// The owners of `digest` that [`Map::read_order`] leaves out because they are `Down`.
+    /// They may hold the blob, so a read that no other owner served cannot call it missing
+    /// while one of them is down: it is for the caller to wait for them.
+    #[must_use]
+    pub fn down_owners(&self, digest: &Digest) -> Vec<&Member> {
+        let mut owners = self.read_candidates(digest);
+        owners.retain(|m| m.state == MemberState::Down);
+        owners
     }
 
     /// [`Map::read_order`], then the previous generation's read order without the members

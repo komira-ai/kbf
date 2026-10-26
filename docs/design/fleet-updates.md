@@ -339,7 +339,7 @@ The full rules are S3 and S4 of
   `kbf-daemon` (S4.3).
 - **Auto-login is off at rest.** `kbf-daemon` is a LaunchDaemon and needs no login
   session, so there is no idle user. On every boot, before the daemon may send
-  `Hello`, `kbf-mac-session` clears auto-login and removes any leftover lease user, so
+  `Hello`, `kbf-mac-session` clears auto-login (with `--vm-user`, it keeps a rest at the VM user instead) and removes any leftover lease user, so
   a Mac that lost power mid-lease never comes back logged in as a dead lease user.
 
 ## 6. Version skew and routing
@@ -703,7 +703,7 @@ start without the helper's socket), so a Mac without it never receives a
    Command's environment, stdout and stderr captured, a wall-clock timeout, and its
    outputs read back as the native driver reads them;
 3. moves the node to `restoring`: `kill-uid`, the lease directory removed,
-   `session-idle` (auto-login cleared, the same restart back to the login window),
+   `session-idle` (auto-login cleared, the same restart back to the login window; with `--vm-user` it rests at the VM user instead, see the [security design](fleet-updates-security.md)),
    `user-delete`; only then does the lease report its action's outcome.
 
 Every lease takes this path, GUI or not: a whole-machine lease is the Mac's alone, and

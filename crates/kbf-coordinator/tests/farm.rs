@@ -169,8 +169,10 @@ async fn bad_clients_do_not_stop_the_listener() {
 
 /// Catches: a certificate the farm CA renewed not being picked up without a restart: after
 /// the files are replaced, new handshakes present the new certificate; and files that do not
-/// make a configuration leave the one in use.
-#[tokio::test]
+/// make a configuration leave the one in use. Time is paused, so the reload interval passes
+/// whenever the test waits; the test waits on what the listeners present and on the
+/// reloader's own counters.
+#[tokio::test(start_paused = true)]
 async fn a_renewed_coordinator_certificate_is_served_without_a_restart() {
     let pki = Arc::new(Pki::new());
     let dir = Arc::new(kbf_testkit::dir::TestDir::under(
@@ -188,24 +190,31 @@ async fn a_renewed_coordinator_certificate_is_served_without_a_restart() {
     let renewed = pki.coordinator();
     std::fs::write(dir.path().join("coordinator.key"), renewed.key_pem()).expect("written");
     std::fs::write(dir.path().join("coordinator.pem"), renewed.cert_pem()).expect("written");
-    let mut now = before.clone();
-    for _ in 0..100 {
-        now = presented(&farm, farm.bound.control).await;
-        if now != before {
-            break;
+    let hang_guard = std::time::Instant::now();
+    for addr in [farm.bound.control, farm.bound.heartbeat] {
+        while presented(&farm, addr).await != renewed.der {
+            assert!(
+                hang_guard.elapsed() < Duration::from_secs(60),
+                "the renewed certificate was never presented"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+    assert_ne!(renewed.der, before);
+    let rejected = farm.tls.0.reloads().rejected;
+    std::fs::write(dir.path().join("coordinator.pem"), "garbage").expect("written");
+    while farm.tls.0.reloads().rejected == rejected {
+        assert!(
+            hang_guard.elapsed() < Duration::from_secs(60),
+            "the garbage was never looked at"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(now, renewed.der, "the renewed certificate is presented");
-    assert_ne!(now, before);
-    std::fs::write(dir.path().join("coordinator.pem"), "garbage").expect("written");
-    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         presented(&farm, farm.bound.heartbeat).await,
         renewed.der,
         "the one in use stays"
     );
-    assert!(farm.tls.0.reloads().rejected >= 1);
 }
 
 /// The leaf a listener presents to a client that trusts the farm CA.

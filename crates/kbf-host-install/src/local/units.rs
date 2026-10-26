@@ -1,9 +1,7 @@
 //! Restarting the units a release runs under: `systemctl restart`, then a look every
 //! interval until the unit says it is active or the wait is over.
 
-use std::thread;
-use std::time::Instant;
-
+use crate::pace::Pace;
 use crate::plan::{self, Wait};
 use crate::request::Unit;
 use crate::runner::Runner;
@@ -13,7 +11,12 @@ use crate::runner::Runner;
 /// # Errors
 /// Why not, in a line for the log: the restart failed, or the unit was not active within
 /// the wait.
-pub fn restart_and_wait(runner: &dyn Runner, unit: &Unit, wait: Wait) -> Result<(), String> {
+pub fn restart_and_wait(
+    runner: &dyn Runner,
+    unit: &Unit,
+    wait: Wait,
+    pace: &Pace,
+) -> Result<(), String> {
     let restart = plan::restart_unit(unit);
     match runner.run(&restart) {
         Ok(exec) if exec.success() => {}
@@ -27,7 +30,7 @@ pub fn restart_and_wait(runner: &dyn Runner, unit: &Unit, wait: Wait) -> Result<
         }
         Err(e) => return Err(format!("systemctl restart {}: {e}", unit.as_str())),
     }
-    let deadline = Instant::now() + wait.timeout;
+    let deadline = (pace.now)() + wait.timeout;
     loop {
         let active = runner
             .run(&plan::unit_active(unit))
@@ -35,13 +38,13 @@ pub fn restart_and_wait(runner: &dyn Runner, unit: &Unit, wait: Wait) -> Result<
         if active {
             return Ok(());
         }
-        if Instant::now() >= deadline {
+        if (pace.now)() >= deadline {
             return Err(format!(
                 "{} was not active {} seconds after the restart",
                 unit.as_str(),
                 wait.timeout.as_secs()
             ));
         }
-        thread::sleep(wait.interval);
+        (pace.sleep)(wait.interval);
     }
 }

@@ -25,6 +25,9 @@
 //! - [`phases`]: where each lease's time went, logged when it ends (`lease phases:`)
 //!   and sent as [`Event::LeaseEnded`].
 //! - [`cas`]: the [`Cas`] trait (from `kbf-transfer`).
+//! - [`packed`] and [`remote_index`]: with `--pack-read`, a data plane that reads blobs from
+//!   the packs of the farm's object store first ([`PackedCas`]), finding them through the
+//!   frontend's pack index ([`RemoteIndex`]); a blob not in a pack is read where it always was.
 //! - `cache` (Linux): the node's input cache, which the container driver links input
 //!   files from (`docs/design/worker-cache.md`).
 //! - [`clock`]: the suspend-counting [`Clock`] the fence reads (issue #78).
@@ -61,10 +64,12 @@ mod local;
 mod map;
 #[cfg(target_os = "linux")]
 pub mod numa;
+pub mod packed;
 pub mod phases;
 mod plane;
 pub mod pressure;
 pub mod reach;
+pub mod remote_index;
 pub mod report;
 pub mod runtime;
 pub mod runtimes;
@@ -99,9 +104,14 @@ pub use kbf_route::{DEFAULT_HOLD, Liveness};
 #[cfg(target_os = "linux")]
 pub use local::{LOCAL_DRIVER, LocalRuntime};
 pub use map::{HeldMaps, REFETCH_WITHIN};
+pub use packed::{
+    DEFAULT_WRITE_INFLIGHT_BYTES, FallbackStats, PackCommit, PackCounter, PackReads, PackStats,
+    PackWriter, PackedCas, WriteSettings, WriteStats,
+};
 pub use plane::{
     FarmCas, FarmLease, LocalMember, StorageNodes, member_cas, member_cas_with_hold, storage_nodes,
 };
+pub use remote_index::RemoteIndex;
 pub use report::{Capacity, NodeReport};
 pub use runtime::{FakeRuntime, Runtime, RuntimeError, UPLOAD_DEADLINE, Work, upload_within};
 pub use runtimes::{KindServedTwice, Runtimes};

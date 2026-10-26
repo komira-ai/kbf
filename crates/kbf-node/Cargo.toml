@@ -18,15 +18,24 @@ path = "src/main.rs"
 clap.workspace = true
 kbf-daemon.workspace = true
 kbf-driver-native.workspace = true
+# The S3 client the daemon reads packs with, and its read-only key (`pack_read`).
+kbf-objstore.workspace = true
 kbf-outputs.workspace = true
+# The packing client's reader and read cache (`pack_read`).
+kbf-pack.workspace = true
 kbf-threads.workspace = true
 kbf-transfer.workspace = true
 kbf-types.workspace = true
+# The key pair file of `--pack-store-credentials-file` (`pack_read`).
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# The wipe of the credentials file's text once it is read (`pack_read`). Only that text: the
+# parsed key pair lives as long as the object-store client holds it, and is not wiped.
+zeroize.workspace = true
 
 # The container driver runs rootless `crun` under cgroup v2, and builds on Linux only.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -45,7 +54,6 @@ kbf-server.workspace = true
 libc.workspace = true
 prost.workspace = true
 rcgen.workspace = true
-serde_json.workspace = true
 # A layer tar for the `__unpack-layers` helper test (tests/binary/cache.rs).
 tar.workspace = true
 # What the unit tests give the daemon to run: kbf-testkit's act verbs and its fake

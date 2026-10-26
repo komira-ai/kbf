@@ -633,10 +633,10 @@ async fn members_is_read_like_nodes_and_takes_no_write() {
 }
 
 /// The reads of `(update/desired, deny/)` the server makes by itself as it starts, with no
-/// release store: nothing reads `update/desired`, and the sweeper's refresh reads `deny/`
-/// ([`looks::Looks`]). A test that arms a fault first
+/// release store: nothing reads `update/desired`, and `deny/` is read twice: by the refresh the
+/// start makes before it serves, and by the sweeper's first refresh ([`looks::Looks`]). A test that arms a fault first
 /// waits for them; the test at the end holds the numbers.
-const START_LOOKS: (usize, usize) = (0, 1);
+const START_LOOKS: (usize, usize) = (0, 2);
 
 /// A server whose state store is the hooked fake, which the test makes fail.
 fn failing(hooked: &Arc<Hooked>) -> Server {

@@ -102,7 +102,7 @@ impl Drop for Keeper {
 mod tests {
     use super::*;
     use std::process::Command;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     /// A `sleep 300` leading a process group of its own.
     fn group() -> Child {
@@ -111,6 +111,24 @@ mod tests {
             .process_group(0)
             .spawn()
             .expect("sleep")
+    }
+
+    /// A `cat` leading a process group of its own that waits for its stdin to close,
+    /// then exits 0: one that was signalled instead ends by the signal.
+    fn gated() -> Child {
+        Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("cat")
+    }
+
+    /// Lets a [`gated`] child finish and reaps it: its exit code, `None` when a signal
+    /// ended it.
+    fn release(child: &mut Child) -> Option<i32> {
+        drop(child.stdin.take());
+        child.wait().expect("wait").code()
     }
 
     fn pid(child: &Child) -> i32 {
@@ -125,12 +143,13 @@ mod tests {
 
     /// Whether `child` exits within `within`; reaps it if so.
     fn exits(child: &mut Child, within: Duration) -> bool {
-        let deadline = Instant::now() + within;
-        while Instant::now() < deadline {
+        let step = Duration::from_millis(10);
+        // A count of looks, not a read of the clock: the give-up is the number of looks.
+        for _ in 0..(within.as_millis() / step.as_millis()) {
             if child.try_wait().expect("wait").is_some() {
                 return true;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(step);
         }
         false
     }
@@ -158,18 +177,19 @@ mod tests {
 
     /// Catches a keeper that kills on anything but end-of-file, and one whose drop
     /// (the daemon dismissing it at the end of a lease) signals the group: the group
-    /// lives on, while the daemon holds the pipe and after the keeper is dropped.
+    /// lives on, while the daemon holds the pipe and after the keeper is dropped. The
+    /// action waits for the test to let it go and then exits 0 by itself, so a signal
+    /// at any point before that shows as the way it ended.
     #[test]
     fn a_dropped_keeper_kills_nothing() {
-        let mut action = group();
+        let mut action = gated();
         let keeper = Keeper::join(pid(&action)).expect("keeper");
-        let held = !exits(&mut action, Duration::from_millis(200));
         drop(keeper);
-        let alive = !exits(&mut action, Duration::from_millis(200));
-        let _ = action.kill();
-        let _ = action.wait();
-        assert!(held, "killed while held");
-        assert!(alive, "dropping the keeper killed the group");
+        assert_eq!(
+            release(&mut action),
+            Some(0),
+            "the keeper signalled the group"
+        );
     }
 
     /// Catches a keeper that a service manager's SIGTERM (or a SIGHUP, a SIGINT) stops
@@ -184,12 +204,11 @@ mod tests {
             // SAFETY: kill(2) on the keeper, this process's unreaped child.
             assert_eq!(unsafe { libc::kill(keeper_pid, signal) }, 0);
         }
-        let alive = !exits(&mut keeper.child, Duration::from_millis(300));
+        // A keeper a signal had ended would not end the group at end-of-file.
         keeper.orphan();
         let ended = exits(&mut action, Duration::from_secs(5));
         let _ = action.kill();
         let _ = action.wait();
-        assert!(alive, "a stop signal ended the keeper");
         assert!(ended, "the action outlived its keeper's pipe");
     }
 

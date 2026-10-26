@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::cli::{BenchArgs, Cli, Cmd, Common, ImageCmd, ProbeArgs};
-use crate::image::BaseArgs;
+use crate::image::{BaseArgs, SetupArgs};
 use crate::probe::{Ctx, Timing};
 use crate::report::{Report, Status};
 use crate::system::System;
@@ -20,7 +20,12 @@ fn name_of(cmd: &Cmd) -> &'static str {
     }
 }
 
-fn context<'a>(sys: &'a dyn System, common: &Common, timing: Timing) -> Result<Ctx<'a>, String> {
+fn context<'a>(
+    sys: &'a dyn System,
+    common: &Common,
+    timing: Timing,
+    keep: bool,
+) -> Result<Ctx<'a>, String> {
     std::fs::create_dir_all(&common.work_dir)
         .map_err(|e| format!("create {}: {e}", common.work_dir.display()))?;
     // Absolute, because a helper started as another user need not share the directory.
@@ -31,19 +36,22 @@ fn context<'a>(sys: &'a dyn System, common: &Common, timing: Timing) -> Result<C
         work,
         base,
         guest_binary: common.guest_binary.clone(),
+        keep,
+        graphics: !common.headless,
+        matrix: !common.no_matrix,
         timing,
     })
 }
 
 fn probe(sys: &dyn System, args: &ProbeArgs, timing: Timing) -> Report {
-    match context(sys, &args.common, timing) {
+    match context(sys, &args.common, timing, args.keep) {
         Ok(ctx) => gates::run(&ctx, args.gate, args.run_as_uid),
         Err(e) => Report::error("probe", e),
     }
 }
 
 fn bench_cmd(sys: &dyn System, args: &BenchArgs, timing: Timing) -> Report {
-    match context(sys, &args.common, timing) {
+    match context(sys, &args.common, timing, false) {
         Ok(ctx) => bench::run(&ctx, args.runs),
         Err(e) => Report::error("probe-bench", e),
     }
@@ -75,7 +83,10 @@ pub fn run(
             sha256,
             out,
             disk_gib,
+            cpus,
+            memory_mib,
             offline_setup,
+            guest_binary,
         }) => image::base(
             sys,
             &BaseArgs {
@@ -83,10 +94,29 @@ pub fn run(
                 sha256: sha256.clone(),
                 out: out.clone(),
                 disk_gib: *disk_gib,
+                cpus: *cpus,
+                memory_mib: *memory_mib,
                 offline_setup: *offline_setup,
+                guest_binary: guest_binary.clone(),
             },
         ),
-        Cmd::Image(ImageCmd::Setup { base }) => image::setup(sys, base),
+        Cmd::Image(ImageCmd::Setup {
+            base,
+            guest_binary,
+            xcode,
+            sim_runtimes,
+            allow_external_links,
+        }) => image::setup(
+            sys,
+            base,
+            &SetupArgs {
+                guest_binary: guest_binary.clone(),
+                xcode: xcode.clone(),
+                sim_runtimes: sim_runtimes.clone(),
+                allow_external_links: *allow_external_links,
+            },
+        ),
+        Cmd::Image(ImageCmd::Harvest { bundle, out }) => image::harvest(sys, bundle, out),
     };
     let failed = report.status == Status::Error;
     let _ = writeln!(out, "{}", report.on_host(sys.host_facts()).to_line());

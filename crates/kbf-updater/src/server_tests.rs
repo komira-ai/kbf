@@ -39,8 +39,6 @@ fn prepare(name: &str, proxy_uid: u32) -> Config {
         proxy_uid,
         operator_api: "127.0.0.1:1".parse().expect("addr"),
         token_file: dir.join("unused"),
-        operator_proxy_auth_file: None,
-        proxy_admin: None,
         ssh_key_file: dir.join("unused-key"),
         ssh_user: "kbf".to_owned(),
         channel: "stable".to_owned(),
@@ -49,6 +47,8 @@ fn prepare(name: &str, proxy_uid: u32) -> Config {
         drain_deadline: std::time::Duration::from_secs(600),
         apply_poll: std::time::Duration::from_secs(5),
         apply_deadline: std::time::Duration::from_secs(600),
+        peer_ready: std::time::Duration::from_secs(30),
+        frontend_drain_deadline: std::time::Duration::from_secs(1200),
     }
 }
 
@@ -93,7 +93,6 @@ impl Farm {
             drain: Box::new(crate::fakes::FakeDrain::new(&log)),
             health: Box::new(health),
             clock: Box::new(clock),
-            pool: Box::new(crate::fakes::FakePool::new(&log)),
             frontend: Box::new(crate::fakes::FakeFrontend::new(&log)),
         };
         let settings = tune(Settings::new(cfg.proxy_uid));
@@ -591,7 +590,6 @@ fn bare_server(name: &str) -> (Server, std::sync::mpsc::Receiver<String>, Lines)
         drain: Box::new(crate::fakes::FakeDrain::new(&log)),
         health: Box::new(FakeHealth::new(&log)),
         clock: Box::new(FakeClock::new()),
-        pool: Box::new(crate::fakes::FakePool::new(&log)),
         frontend: Box::new(crate::fakes::FakeFrontend::new(&log)),
     };
     let updater = crate::Updater::open(
@@ -655,25 +653,73 @@ fn a_replayed_post_queues_nothing_for_the_driver() {
     assert!(audit.all().iter().all(|l| l["event"] != "driver_gone"));
 }
 
+/// A clock that counts the times it is read and moves only when the test moves it, so that a
+/// test can wait for the server to have read it, rather than for a time to pass.
+#[derive(Clone, Default)]
+struct CountedClock(Arc<(Mutex<(Duration, usize)>, std::sync::Condvar)>);
+
+impl CountedClock {
+    fn advance(&self, d: Duration) {
+        locked(&self.0.0).0 += d;
+    }
+
+    /// Block until the clock has been read `n` times. The limit is a hang guard: it is
+    /// never what the test waits for.
+    fn wait_reads(&self, n: usize) {
+        let (state, changed) = &*self.0;
+        let mut guard = locked(state);
+        while guard.1 < n {
+            let (next, timeout) = changed
+                .wait_timeout(guard, Duration::from_secs(30))
+                .expect("clock lock");
+            assert!(
+                !timeout.timed_out(),
+                "the clock was read {} times, not {n}",
+                next.1
+            );
+            guard = next;
+        }
+    }
+}
+
+impl crate::ports::Clock for CountedClock {
+    fn now(&self) -> Duration {
+        let (state, changed) = &*self.0;
+        let mut guard = locked(state);
+        guard.1 += 1;
+        changed.notify_all();
+        guard.0
+    }
+
+    fn sleep(&self, d: Duration) {
+        self.advance(d);
+    }
+}
+
 /// Catches a sender that stays under the per-read timeout with every byte holding a
-/// connection for ever: a valid request sent a byte at a time, each well inside the read
-/// timeout, is cut off by the deadline on the whole request, and the audit says so; a
-/// deadline of zero cuts it off before the first read. A request that arrives in time is
-/// still served.
+/// connection for ever: a valid request sent a byte at a time, the clock moving 40 s
+/// between bytes, is cut off by the deadline of 300 s on the whole request, and the audit
+/// says so; a deadline of zero cuts it off before the first read. A request that arrives in
+/// time is still served. The clock is the test's: each byte is sent once the server has
+/// read the clock for the read that takes it, and nothing waits for time to pass.
 #[test]
 fn a_slow_sender_is_cut_off_by_the_request_deadline() {
+    // The clock's seconds are the test's; a read still waits at most `io_timeout` for real.
+    let clock = CountedClock::default();
     let farm = Farm::with("deadline", own_uid(), |mut s| {
         s.io_timeout = Duration::from_secs(5);
-        s.request_deadline = Duration::from_millis(300);
+        s.request_deadline = Duration::from_secs(300);
+        s.clock = Arc::new(clock.clone());
         s
     });
     let request = raw("GET", "/v1/updater/rolls", &[], "");
     let mut slow = UnixStream::connect(&farm.socket).expect("connect");
-    for byte in request.as_bytes() {
-        if std::io::Write::write_all(&mut slow, &[*byte]).is_err() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(40));
+    // The connection reads the clock once for its deadline and once per read; the byte
+    // is sent after the read that waits for it has looked at the clock.
+    for (sent, byte) in request.as_bytes().iter().take(8).enumerate() {
+        clock.wait_reads(sent + 2);
+        clock.advance(Duration::from_secs(40));
+        std::io::Write::write_all(&mut slow, &[*byte]).expect("write");
     }
     let lost = farm.audit.events("connection_lost", 1);
     let why = lost[0]["why"].as_str().expect("why");
@@ -731,7 +777,6 @@ fn a_running_roll_found_at_start_is_resumed() {
             drain: Box::new(crate::fakes::FakeDrain::new(&log)),
             health: Box::new(FakeHealth::new(&log)),
             clock: Box::new(FakeClock::new()),
-            pool: Box::new(crate::fakes::FakePool::new(&log)),
             frontend: Box::new(crate::fakes::FakeFrontend::new(&log)),
         };
         let updater = crate::Updater::open(

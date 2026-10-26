@@ -1,0 +1,43 @@
+# kbf-host-install's local socket on a host whose frontend runs as a container
+# (docs/deploy/host-install.md, "A frontend container"). It is kbf-host-local.service for a
+# frontend: instead of restarting units it loads the release's image, drains the running
+# container through the frontend's own operator API, recreates it from the new image with the
+# same run configuration, and puts the old image back when the new one is not ready or not
+# confirmed by its deadline. The run configuration is /etc/kbf/host-install-frontend.toml
+# (host-install-frontend.toml, here, is an example).
+#
+# Use this unit or kbf-host-local.service on a host, not both: the socket is the same.
+# A host with two frontend containers runs one copy of this unit per container, each with its own
+# --socket, --frontend-config file and (so) its own record: see "Two frontends on one host" in
+# the document above.
+[Unit]
+Description=kbf-host-install, the local socket of this host's update agent (frontend container)
+Documentation=https://github.com/komira-ai/kbf/blob/main/docs/deploy/host-install.md
+After=local-fs.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+# Root, on purpose: it runs docker, which is root's, and writes root's state. The socket is the
+# access control: mode 0600, owned by the one account named here.
+User=root
+ExecStart=/usr/libexec/kbf/kbf-host-install --serve --socket /run/kbf-host-install/local.sock --socket-user kbf-updater --window-secs 600 --frontend-container
+RuntimeDirectory=kbf-host-install
+RuntimeDirectoryMode=0755
+StateDirectory=kbf-host-install
+StateDirectoryMode=0700
+# A pending release is on disk, so a restart of this program, like a reboot, finds it and goes
+# back at once if its deadline has passed.
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

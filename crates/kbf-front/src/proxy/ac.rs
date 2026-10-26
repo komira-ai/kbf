@@ -1,5 +1,7 @@
 //! `ActionCache` through the frontend: a lookup is the owner's `ActionStore.Get`, which
-//! applies the closure check; no client writes.
+//! applies the closure check of the blobs the owner holds; given [`Packs`], the hit is checked
+//! again against the pack index and the nodes (`packed::held`), as an entry's blobs may be in
+//! packs. No client writes.
 
 use std::sync::Arc;
 
@@ -9,6 +11,7 @@ use kbf_proto::reapi::{ActionResult, GetActionResultRequest, UpdateActionResultR
 use tonic::{Request, Response, Status};
 
 use super::owners::Owners;
+use super::packed::{Packs, held};
 use crate::wire;
 
 /// The `ActionCache` service over the storage nodes. GetActionResult is authorized by
@@ -16,12 +19,13 @@ use crate::wire;
 pub(super) struct ProxyActionCache {
     pub owners: Owners,
     pub authorizers: Arc<Authorizers>,
+    pub packs: Option<Packs>,
 }
 
 #[tonic::async_trait]
 impl ActionCache for ProxyActionCache {
-    /// The owner's answer: a hit only if the entry passes its closure check, else
-    /// NOT_FOUND.
+    /// The owner's answer: a hit only if the entry passes its closure check (and, with packs,
+    /// the index or the nodes hold every blob its result names), else NOT_FOUND.
     async fn get_action_result(
         &self,
         request: Request<GetActionResultRequest>,
@@ -38,7 +42,12 @@ impl ActionCache for ProxyActionCache {
         .await?;
         wire::check_digest_function(request.digest_function)?;
         let action = wire::digest(request.action_digest.as_ref())?;
-        match self.owners.action_result(&action).await? {
+        let hit = self.owners.action_result(&action).await?;
+        let hit = match &self.packs {
+            Some(packs) => held(packs, &self.owners, hit).await?,
+            None => hit,
+        };
+        match hit {
             Some((_, result)) => Ok(Response::new(result)),
             None => Err(Status::not_found(format!(
                 "no usable action-cache entry for {action}"

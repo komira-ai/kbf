@@ -40,7 +40,9 @@
 //! - **Orphans.** A lease whose node has no session anywhere is requeued after
 //!   [`ORPHAN_WAIT`] (the `sweep` module).
 //!
-//! A frontend that is fenced for a handover, or whose store cannot be read, does nothing.
+//! A frontend that is fenced by a retire or a drain's close, or whose store cannot be read, does
+//! nothing. One whose intake is closed by a drain ([`Farm::close_intake`]) takes in no operation
+//! of the others' queue and does the rest.
 
 use std::collections::BTreeSet;
 
@@ -93,6 +95,12 @@ pub(in crate::farm) struct Intake {
     orphan_wait: Duration,
     /// The stored epoch, if it is past the one this frontend serves.
     epoch_ahead: Option<u64>,
+    /// The daemons connected to the other frontends of the state store (capabilities and
+    /// capacity), as the `session/` rows listed at the last poll: an in-memory view of
+    /// whether another frontend has a worker that could take this one's queued work.
+    pub(in crate::farm) remote: Vec<(kbf_caps::NodeCaps, kbf_types::Resources)>,
+    /// How many polls have run to the end ([`Farm::intake_polls`]).
+    polls: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for Intake {
@@ -105,6 +113,8 @@ impl Default for Intake {
             orphans: BTreeMap::new(),
             orphan_wait: ORPHAN_WAIT,
             epoch_ahead: None,
+            remote: Vec::new(),
+            polls: tokio::sync::watch::Sender::new(0),
         }
     }
 }
@@ -214,7 +224,7 @@ impl Farm {
     /// state store queued, forgets what they took, answers the callers of what they
     /// finished, applies the cordons and floors they set, and requeues the leases of nodes
     /// no frontend hears. Cheap when nothing changed. A farm with no state store, and one a
-    /// handover fenced, do nothing; so does one whose store cannot be read.
+    /// retire fenced, do nothing; so does one whose store cannot be read.
     ///
     /// Placement follows at the next tick.
     pub fn intake(&self) {
@@ -230,6 +240,16 @@ impl Farm {
             tick.tick().await;
             self.intake();
         }
+    }
+
+    /// How many intake polls have run to the end, as a count that tells each poll as it
+    /// completes: a poll of a fenced farm counts (it ends at once, having taken nothing in),
+    /// and one that could not read the store does not. A test waits for polls by this event
+    /// instead of for a time. Poll `n + 2` of a count read at `n` began after the read, so
+    /// it saw everything written before it.
+    #[must_use]
+    pub fn intake_polls(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.lock().intake.polls.subscribe()
     }
 
     /// The epoch the state store holds, if it is past the one this frontend serves, as the
@@ -254,6 +274,7 @@ impl State {
     /// [`Farm::intake`] under the lock.
     pub(in crate::farm) fn take_intake(&mut self, now: FarmTime, served: u64) {
         if self.fenced {
+            self.count_poll();
             return;
         }
         let mut polled = None;
@@ -272,6 +293,43 @@ impl State {
         self.apply_cordons(now, polled.cordons, polled.at);
         self.apply_floors(&polled.floors, &polled.key_floors);
         self.sweep_orphans();
+        self.look_at_remote_sessions();
+        self.count_poll();
+    }
+
+    /// Counts one poll that ran to the end ([`Farm::intake_polls`]).
+    fn count_poll(&self) {
+        self.intake
+            .polls
+            .send_modify(|polls| *polls = polls.saturating_add(1));
+    }
+
+    /// Reads the daemons of the other frontends from the `session/` rows, and tells the
+    /// callers of the operations that wait for a worker whether one of them could run it
+    /// ([`State::republish_stuck`]). Nothing needs the list unless an operation waits, so
+    /// with none the scan is skipped (a scan on top of the orphan sweep's, five times a
+    /// second). Accepted staleness: when an operation first waits, the list may be up to
+    /// one poll old, and the next poll's republish corrects its stage.
+    fn look_at_remote_sessions(&mut self) {
+        if self.stuck.is_empty() {
+            self.intake.remote.clear();
+            return;
+        }
+        let connected: BTreeSet<WorkerId> = self
+            .links
+            .iter()
+            .filter(|(_, link)| !link.outbound.is_closed())
+            .map(|(worker, _)| worker.clone())
+            .collect();
+        let mut remote = None;
+        self.durably("a session look", |d| {
+            remote = Some(d.remote_sessions(&connected)?);
+            Ok(())
+        });
+        if let Some(remote) = remote {
+            self.intake.remote = remote;
+            self.republish_stuck();
+        }
     }
 
     /// Reports the stored epoch `stored` once when it is past `served`.
@@ -301,9 +359,12 @@ impl State {
         for operation in held {
             self.reconcile(operation, queued.get(&operation).copied());
         }
-        for (&operation, &version) in queued {
-            if !self.known_operation(operation) {
-                self.take_in(operation, version);
+        // A farm whose intake is closed ([`Farm::close_intake`]) takes in nothing new.
+        if !self.closed {
+            for (&operation, &version) in queued {
+                if !self.known_operation(operation) {
+                    self.take_in(operation, version);
+                }
             }
         }
         self.intake
@@ -317,7 +378,8 @@ impl State {
     /// No row: another frontend took it, and it leaves the scheduler; unless the scheduler
     /// gave a lease of it up and the store has not taken the requeue yet, when the row is
     /// still to come. A row that is not the one read before: the operation was granted and
-    /// queued again, and is taken in again with the rows of now.
+    /// queued again, and is taken in again with the rows of now, unless the intake is closed:
+    /// then it is only handed off.
     fn reconcile(&mut self, operation: OperationId, row: Option<Version>) {
         let Some(version) = row else {
             if !self.requeue_pending(operation) {
@@ -328,7 +390,9 @@ impl State {
         let before = self.intake.queue_seen.insert(operation, version);
         if before.is_some_and(|before| before != version) {
             self.hand_off(operation);
-            self.take_in(operation, version);
+            if !self.closed {
+                self.take_in(operation, version);
+            }
         }
     }
 

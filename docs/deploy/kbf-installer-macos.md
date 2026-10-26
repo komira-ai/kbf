@@ -14,7 +14,7 @@ The paths are in one place, `crates/kbf-setup/src/layout.rs` (re-exported as `kb
 | installer tree (releases, links) | `/var/lib/kbf-installer` | `/usr/local/kbf-installer` |
 | installer state (`state.json`, `status.json`, `orders/`) | the installer tree | `/var/db/kbf-installer` |
 | lock | `/run/kbf-installer/lock` | `/var/run/kbf-installer/lock` |
-| trust directory | `/usr/share/kbf-installer/trust` | `/usr/local/kbf-installer/trust` |
+| trust directory | `/usr/share/kbf/trust` (until v0.0.9 also read at `/usr/share/kbf-installer/trust`, when the first is absent) | `/usr/local/kbf-installer/trust` |
 | configuration directory | `/etc/kbf` | `/usr/local/etc/kbf` |
 | `kbf.toml`, `installer.toml` | in the configuration directory | in the configuration directory |
 | enrollment token, operator token | `/etc/kbf/enroll.token`, `/etc/kbf/api-token` | `/usr/local/etc/kbf/enroll.token`, `/usr/local/etc/kbf/api-token` |
@@ -64,7 +64,10 @@ restarts to ten seconds and writes to `/Library/Logs/kbf-installer/kbf-installer
 ## A new Mac
 
 1. **Install the package** as above.
-2. **Provision the host.** `kbf-mac-provision apply --profile FILE` (as root) fixes the host
+2. **Provision the host.** `kbf-mac-provision apply --profile FILE` (as root; the binary is the release asset
+   `kbf-mac-provision-<commit>-darwin-arm64.tar.gz`, one member, verified like every tarball in
+   [../artifacts.md](../artifacts.md); the `mac-provision-darwin-arm64` artifact of the `mac-provision`
+   workflow holds a signed build of any commit, for a change not yet released) fixes the host
    settings and renders the worker profile: it writes `/usr/local/etc/kbf/kbf.toml` and the daemon
    job's plist, and starts the job. It is the one writer of the daemon's `kbf.toml` on
    a Mac. The `kbf.toml` it renders has no `update-dir` or `orders-dir`; a file that still has them

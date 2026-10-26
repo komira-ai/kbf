@@ -1288,3 +1288,400 @@ fn only_plan_and_verify_download_from_another_run() {
         red(&found, &format!("a download of `{job}` names a `run-id`"));
     }
 }
+
+#[test]
+fn gamma_runs_after_publish_with_the_run_token_and_no_write_scope() {
+    // Catches: the gamma stage starting before the release is published or without the
+    // run's conditions, holding a write scope or a token other than the OIDC one, or
+    // dropping the environment whose name the coordinator's allow-list can require.
+    red(
+        &plant("gamma", "needs: [plan, publish]\n", "needs: [plan]\n"),
+        "the job `gamma` needs",
+    );
+    red(
+        &plant("gamma", "needs: [plan, publish]\n", "needs: [plan, bump]\n"),
+        "the job `gamma` needs",
+    );
+    red(
+        &plant("gamma", "      contents: read\n", "      contents: write\n"),
+        "the job `gamma` holds `contents: write`",
+    );
+    red(
+        &plant(
+            "gamma",
+            "      id-token: write\n",
+            "      id-token: write\n      packages: write\n",
+        ),
+        "the job `gamma` holds `packages: write`",
+    );
+    red(
+        &plant("gamma", "      id-token: write\n", "      id-token: read\n"),
+        "the job `gamma` holds the scopes",
+    );
+    red(
+        &plant("gamma", "    environment: release\n", ""),
+        "the job `gamma` has environment",
+    );
+    red(
+        &plant(
+            "gamma",
+            "needs.plan.outputs.pipeline != 'true' }}",
+            "needs.plan.outputs.pipeline != 'false' }}",
+        ),
+        "the job `gamma` has `if:",
+    );
+    red(
+        &plant("gamma", "github.event.workflow_run.event == 'push' && ", ""),
+        "the job `gamma` has `if:",
+    );
+}
+
+#[test]
+fn gamma_reads_the_coordinators_address_from_the_variable_alone() {
+    // Catches: an address written in the workflow, the variable read by another job, a
+    // secret in the gamma job, and the verb given anything but the variable and the
+    // planned version.
+    red(
+        &plant(
+            "gamma",
+            "COORDINATOR_URL: ${{ vars.KBF_COORDINATOR_URL }}",
+            "COORDINATOR_URL: https://coordinator.example:8443",
+        ),
+        "writes an address",
+    );
+    red(
+        &plant(
+            "gamma",
+            "COORDINATOR_URL: ${{ vars.KBF_COORDINATOR_URL }}",
+            "COORDINATOR_URL: ${{ secrets.KBF_COORDINATOR_URL }}",
+        ),
+        "reads a secret",
+    );
+    red(
+        &plant(
+            "gamma",
+            "COORDINATOR_URL: ${{ vars.KBF_COORDINATOR_URL }}",
+            "COORDINATOR_URL: ${{ vars.OTHER }}",
+        ),
+        "does not set `COORDINATOR_URL:",
+    );
+    red(
+        &plant(
+            "bump",
+            "          VERSION: ${{ needs.plan.outputs.version }}\n",
+            "          VERSION: ${{ needs.plan.outputs.version }}\n          URL: ${{ vars.KBF_COORDINATOR_URL }}\n",
+        ),
+        "the job `bump` reads `vars.KBF_COORDINATOR_URL`",
+    );
+    red(
+        &plant("gamma", "--url \"$COORDINATOR_URL\"", "--url \"$VERSION\""),
+        "not given `--url $COORDINATOR_URL`",
+    );
+    red(
+        &plant(
+            "gamma",
+            "--ca-pem \"$COORDINATOR_CA\"",
+            "--ca-pem \"$VERSION\"",
+        ),
+        "not given `--ca-pem $COORDINATOR_CA`",
+    );
+    red(
+        &plant(
+            "gamma",
+            "COORDINATOR_CA: ${{ vars.KBF_COORDINATOR_CA }}",
+            "COORDINATOR_CA: ${{ vars.OTHER }}",
+        ),
+        "does not set `COORDINATOR_CA:",
+    );
+    red(
+        &plant("gamma", "--version \"$VERSION\"", "--version \"$COMMIT\""),
+        "not given `--version $VERSION`",
+    );
+    red(
+        &plant(
+            "gamma",
+            "VERSION: ${{ needs.plan.outputs.version }}",
+            "VERSION: 1.1.1",
+        ),
+        "does not set `VERSION:",
+    );
+    red(
+        &plant("gamma", "cargo xtask deploy-farm ", "cargo xtask other "),
+        "does not run `cargo xtask deploy-farm`",
+    );
+}
+
+#[test]
+fn the_network_join_of_gamma_uses_the_run_token_and_variables_only() {
+    // Catches: a secret given to the join (the job would hold more than the run token), an
+    // input added or changed, the join under another condition or unconditional (a farm
+    // without a tailnet would fail every release), the join moved before the build (the
+    // build's scripts would see the network) or after the verb, an `env:` on it, a second
+    // join, and the action used by another job.
+    let join = "          oauth-client-id: ${{ vars.TS_CLIENT_ID }}\n";
+    red(
+        &plant(
+            "gamma",
+            join,
+            "          oauth-client-id: ${{ vars.TS_CLIENT_ID }}\n          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}\n",
+        ),
+        "reads a secret",
+    );
+    red(
+        &plant(
+            "gamma",
+            join,
+            "          oauth-client-id: ${{ vars.TS_CLIENT_ID }}\n          authkey: ${{ vars.TS_KEY }}\n",
+        ),
+        "not exactly",
+    );
+    red(
+        &plant("gamma", "tags: tag:ci", "tags: tag:ci,tag:admin"),
+        "not exactly",
+    );
+    red(
+        &plant(
+            "gamma",
+            "audience: ${{ vars.TS_AUDIENCE }}",
+            "audience: ${{ vars.OTHER }}",
+        ),
+        "not exactly",
+    );
+    red(
+        &plant(
+            "gamma",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
+            "        if: ${{ vars.OTHER != '' }}\n",
+        ),
+        "is under `if:`",
+    );
+    red(
+        &plant(
+            "gamma",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
+            "",
+        ),
+        "not under exactly `if:",
+    );
+    let step = "      - name: Join the farm's Tailscale network\n";
+    let real = real();
+    let start = real.find(step).expect("the join step");
+    let end = start
+        + real[start..]
+            .find("      # The version is the release's;")
+            .expect("the next comment");
+    let block = &real[start..end];
+    // The build line of `gamma` (other jobs build xtask too): the last one before the join.
+    let build = "      - run: cargo build -p xtask --locked\n";
+    let at = real[..start].rfind(build).expect("gamma's build of xtask");
+    let moved = [&real[..at], block, &real[at..start], &real[end..]].concat();
+    red(
+        &problems(&moved).expect("the planted workflow is read"),
+        "not after `cargo build -p xtask`",
+    );
+    // After the verb: the join moved to the end of the file, which is the end of `gamma`.
+    let late = [&real[..start], &real[end..], block].concat();
+    red(
+        &problems(&late).expect("the planted workflow is read"),
+        "before `cargo xtask deploy-farm`",
+    );
+    red(
+        &plant(
+            "gamma",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n        env:\n          TS_AUTHKEY: ${{ vars.TS_KEY }}\n",
+        ),
+        "has an `env:`",
+    );
+    let twice = real.replacen(block, &format!("{block}{block}"), 1);
+    red(
+        &problems(&twice).expect("the planted workflow is read"),
+        "times, not once",
+    );
+    red(
+        &plant(
+            "bump",
+            "      - uses: actions/checkout@",
+            &format!(
+                "      - uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0\n{}",
+                "      - uses: actions/checkout@"
+            ),
+        ),
+        "the job `bump` uses `tailscale/github-action@`",
+    );
+}
+
+#[test]
+fn the_gamma_steps_are_not_skipped_by_a_condition_of_its_own() {
+    // Catches: the unset variable turned into a skipped step (which would show no notice) by
+    // an `if:` on the step; the lint of every job's steps refuses it.
+    red(
+        &plant(
+            "gamma",
+            "      - name: Set this release as the farm's desired version, and wait for the farm to converge\n",
+            "      - name: Set this release as the farm's desired version, and wait for the farm to converge\n        if: ${{ vars.KBF_COORDINATOR_URL != '' }}\n",
+        ),
+        "a step of `gamma`",
+    );
+}
+
+const PROOF_NAME: &str = "      - name: Prove the farm with a remote-only Buck2 build\n";
+
+#[test]
+fn the_proof_runs_once_after_deploy_farm_and_is_not_skipped() {
+    // Catches: the proof missing (a release with no proof of the farm), run before the
+    // deploy (it would prove the previous release), twice, under an `if:` (an unset
+    // `FARM_ADDRESS` would skip the step and show no notice), or run without the pinned
+    // Buck2 fetched before it.
+    red(
+        &plant("gamma", "cargo xtask prove-farm ", "cargo xtask other "),
+        "does not run `cargo xtask prove-farm`",
+    );
+    red(
+        &plant(
+            "gamma",
+            PROOF_NAME,
+            &format!("{PROOF_NAME}        if: ${{{{ vars.FARM_ADDRESS != '' }}}}\n"),
+        ),
+        "a step of `gamma`",
+    );
+    red(
+        &plant(
+            "gamma",
+            PROOF_NAME,
+            &format!("{PROOF_NAME}        if: ${{{{ vars.FARM_ADDRESS != '' }}}}\n"),
+        ),
+        "is under a condition",
+    );
+    let real = real();
+    let start = real
+        .find("      # The proof. The farm now runs")
+        .expect("proof");
+    let block = &real[start..];
+    let before = real
+        .find("      # The version is the release's;")
+        .expect("deploy-farm");
+    let moved = [&real[..before], block, &real[before..start]].concat();
+    red(
+        &problems(&moved).expect("the planted workflow is read"),
+        "runs before `cargo xtask deploy-farm`",
+    );
+    let verb = real.find(PROOF_NAME).expect("proof step");
+    let twice = [&real[..verb], &real[verb..], &real[verb..]].concat();
+    red(
+        &problems(&twice).expect("the planted workflow is read"),
+        "times, not once",
+    );
+    red(
+        &plant("gamma", "--sha256 \"$BUCK2_SHA256\"", "--sha256 \"$OTHER\""),
+        "does not fetch Buck2",
+    );
+}
+
+#[test]
+fn the_proof_reads_the_farm_variables_and_the_nonce_through_env_alone() {
+    // Catches: a farm address written in the job (as a URL or a bare grpc address), a
+    // secret in the job, a variable other than the four, a fifth `env:` entry, the verb given
+    // something other than the variable it is named for, a nonce that is not this run's id
+    // and attempt (a cached run would prove nothing), and another job reading a `FARM_`
+    // variable.
+    red(
+        &plant(
+            "gamma",
+            "FARM_ADDRESS: ${{ vars.FARM_ADDRESS }}",
+            "FARM_ADDRESS: grpc://farm.example:8980",
+        ),
+        "writes a farm address",
+    );
+    red(
+        &plant(
+            "gamma",
+            "FARM_ADDRESS: ${{ vars.FARM_ADDRESS }}",
+            "FARM_ADDRESS: ${{ vars.FARM_ADDRESS }}\n          FARM_URL: https://farm.example",
+        ),
+        "writes an address",
+    );
+    red(
+        &plant(
+            "gamma",
+            "FARM_TLS: ${{ vars.FARM_TLS }}",
+            "FARM_TLS: ${{ secrets.FARM_TLS }}",
+        ),
+        "reads a secret",
+    );
+    for (key, var) in FARM_VARS {
+        red(
+            &plant(
+                "gamma",
+                &format!("{key}: {var}"),
+                &format!("{key}: ${{{{ vars.OTHER }}}}"),
+            ),
+            &format!("does not set `{key}:"),
+        );
+    }
+    red(
+        &plant(
+            "gamma",
+            "NONCE: ${{ github.run_id }}-${{ github.run_attempt }}",
+            "NONCE: ${{ github.run_id }}",
+        ),
+        "does not set `NONCE:",
+    );
+    red(
+        &plant(
+            "gamma",
+            "NONCE: ${{ github.run_id }}-${{ github.run_attempt }}",
+            "NONCE: ${{ github.run_id }}-${{ github.run_attempt }}\n          EXTRA: ${{ vars.OTHER }}",
+        ),
+        "`env:` entries",
+    );
+    for (flag, var) in [
+        ("--address", "FARM_ADDRESS"),
+        ("--instance", "FARM_INSTANCE"),
+        ("--tls", "FARM_TLS"),
+        ("--properties", "FARM_PROPERTIES"),
+        ("--nonce", "NONCE"),
+    ] {
+        red(
+            &plant(
+                "gamma",
+                &format!("{flag} \"${var}\""),
+                &format!("{flag} \"$VERSION\""),
+            ),
+            &format!("not given `{flag} ${var}`"),
+        );
+    }
+    red(
+        &plant(
+            "gamma",
+            "--project crates/kbf-integration-test/gamma/buck2",
+            "--project crates/kbf-integration-test/beta/buck2",
+        ),
+        "not given `--project",
+    );
+    red(
+        &plant(
+            "bump",
+            "          VERSION: ${{ needs.plan.outputs.version }}\n",
+            "          VERSION: ${{ needs.plan.outputs.version }}\n          ADDRESS: ${{ vars.FARM_ADDRESS }}\n",
+        ),
+        "the job `bump` reads a `FARM_` variable",
+    );
+}
+
+#[test]
+fn the_buck2_fetch_step_takes_its_pins_from_the_job_env_alone() {
+    // Catches: a step-level `env:` on the fetch step that overrides the checksum or the
+    // version, which would fetch a Buck2 the pins lint never compared with beta.yml's.
+    let fetch = "      - name: Fetch buck2 (pinned version, checked by SHA-256)\n";
+    for key in ["BUCK2_SHA256", "BUCK2_VERSION"] {
+        red(
+            &plant(
+                "gamma",
+                fetch,
+                &format!("{fetch}        env:\n          {key}: other\n"),
+            ),
+            "Buck2 fetch step of `gamma` has an `env:`",
+        );
+    }
+}

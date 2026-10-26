@@ -13,6 +13,13 @@ use serde::{Deserialize, Serialize};
 pub struct TaggedShare {
     pub tag: String,
     pub path: PathBuf,
+    /// When set, the share is a multiple-directory share that lists `path` under this name;
+    /// otherwise a single-directory share.
+    #[serde(default)]
+    pub multiple_name: Option<String>,
+    /// Whether the guest may write to it.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// One VM to run, from a bundle on disk (see `bundle`). There is no network device: the
@@ -28,12 +35,18 @@ pub struct VmSpec {
     /// A directory the guest finds under its automount share, `/Volumes/My Shared Files`,
     /// in a folder named `kbf`.
     pub automount_dir: Option<PathBuf>,
-    /// A directory shared under a custom virtiofs tag the guest must mount itself.
-    pub tagged: Option<TaggedShare>,
+    /// Directories shared under custom virtiofs tags (never the automount tag, which the
+    /// system mounts itself) that the guest must mount itself.
+    pub tagged: Vec<TaggedShare>,
     /// Vsock ports the host listens on; each guest connection is an [`Event::Vsock`].
     pub vsock_ports: Vec<u32>,
     /// Console port names; bytes the guest writes to one are an [`Event::Console`].
     pub console_ports: Vec<String>,
+    /// When set, the frames a guest sends on the vsock ports are written into this
+    /// directory (`sink`): the host's results directory, where the probes look for files.
+    /// Without it a connection is only counted and closed.
+    #[serde(default)]
+    pub results_dir: Option<PathBuf>,
 }
 
 impl VmSpec {
@@ -46,9 +59,10 @@ impl VmSpec {
             memory_mib: 4096,
             graphics: false,
             automount_dir: None,
-            tagged: None,
+            tagged: Vec::new(),
             vsock_ports: Vec::new(),
             console_ports: Vec::new(),
+            results_dir: None,
         }
     }
 }
@@ -67,8 +81,19 @@ pub enum Event {
     Vsock { port: u32 },
     /// The guest wrote `text` to a console port.
     Console { port: String, text: String },
-    /// The VM stopped after the parent closed the helper's stdin.
+    /// The VM stopped: the guest shut down after a shutdown request, or the parent closed
+    /// the helper's stdin and the VM was force-stopped.
     Stopped { ms: u64 },
+    /// The helper sent the guest the `shutdown` command over vsock (`guest_command`) and
+    /// this is how it went. `acked`: the guest's daemon answered `ack`, so the guest is
+    /// shutting itself down and the helper waits for it; otherwise `detail` says why not
+    /// and the helper has fallen back to the framework's stop request (the guest's
+    /// power-button request).
+    ShutdownCommand {
+        acked: bool,
+        detail: String,
+        ms: u64,
+    },
     /// A call failed. `code` is the Virtualization.framework error code name when there is
     /// one (`VirtualMachineLimitExceeded`).
     Error {
@@ -94,6 +119,12 @@ impl Event {
     }
 }
 
+/// The line the parent writes to the helper's stdin to ask the guest to shut down. The
+/// helper sends the guest the `shutdown` command over vsock first and falls back to the
+/// framework's stop request when no ack comes; it then waits for the guest to stop.
+/// Closing the stdin instead force-stops the VM.
+pub const SHUTDOWN_COMMAND: &str = "shutdown";
+
 /// The error code name the helper uses when a start is refused for the two-guest limit.
 pub const LIMIT_EXCEEDED: &str = "VirtualMachineLimitExceeded";
 
@@ -118,6 +149,11 @@ mod tests {
                 text: "hi\n".into(),
             },
             Event::Stopped { ms: 4 },
+            Event::ShutdownCommand {
+                acked: false,
+                detail: "connect: refused".into(),
+                ms: 5,
+            },
             Event::Error {
                 stage: "start".into(),
                 message: "m".into(),
@@ -138,18 +174,40 @@ mod tests {
         assert!(Event::parse(r#"{"event":"unknown"}"#).is_err());
     }
 
+    /// Catches a spec file written before `results_dir` existed no longer loading, and a
+    /// default that attaches a sink nobody asked for.
+    #[test]
+    fn a_spec_without_a_results_dir_still_loads_with_none() {
+        let text = serde_json::to_string(&VmSpec::minimal("/b".into())).expect("json");
+        let mut v: serde_json::Value = serde_json::from_str(&text).expect("value");
+        v.as_object_mut().expect("object").remove("results_dir");
+        let s: VmSpec = serde_json::from_value(v).expect("old spec");
+        assert_eq!(s.results_dir, None);
+    }
+
     /// Catches a spec that loses a field on its way to the helper's file.
     #[test]
     fn a_spec_round_trips_through_json() {
         let mut s = VmSpec::minimal("/b".into());
         s.graphics = true;
         s.automount_dir = Some("/share".into());
-        s.tagged = Some(TaggedShare {
-            tag: "t".into(),
-            path: "/t".into(),
-        });
+        s.tagged = vec![
+            TaggedShare {
+                tag: "t".into(),
+                path: "/t".into(),
+                multiple_name: None,
+                read_only: false,
+            },
+            TaggedShare {
+                tag: "u".into(),
+                path: "/u".into(),
+                multiple_name: Some("m".into()),
+                read_only: true,
+            },
+        ];
         s.vsock_ports = vec![5000];
         s.console_ports = vec!["kbf.probe".into()];
+        s.results_dir = Some("/share/results".into());
         let text = serde_json::to_string(&s).expect("json");
         assert_eq!(serde_json::from_str::<VmSpec>(&text).expect("parse"), s);
     }

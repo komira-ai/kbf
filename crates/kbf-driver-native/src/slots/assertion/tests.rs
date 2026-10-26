@@ -59,10 +59,6 @@ fn clean_lines(probe: Probe) -> Vec<&'static str> {
     match probe {
         Probe::Entry => vec![". owned by 61001:20 mode 700 flags 0x0"],
         Probe::Record => vec!["UniqueID=61001", "id uid=61001(u) gid=20(staff)"],
-        Probe::Services => vec![
-            "com.apple.cfprefsd.xpc.agent\t/System/Library/LaunchAgents/com.apple.cfprefsd.xpc.agent.plist\t/usr/sbin/cfprefsd",
-            "com.apple.distnoted.xpc.agent\t/System/Library/LaunchAgents/com.apple.distnoted.xpc.agent.plist\t",
-        ],
         _ => Vec::new(),
     }
 }
@@ -90,7 +86,7 @@ fn processes_are_found_by_real_effective_or_saved_uid() {
     let procs = parse_ps(PS).expect("parsed");
     assert_eq!(procs.len(), 7);
     assert_eq!(
-        uid_processes(&procs, 61001, &[]),
+        uid_processes(&procs, 61001),
         lines(&[
             "61001 /bin/sleep",
             "61002 /usr/bin/su",
@@ -98,7 +94,7 @@ fn processes_are_found_by_real_effective_or_saved_uid() {
             "61005 /x/effective only"
         ])
     );
-    assert!(uid_processes(&procs, 61005, &[]).is_empty());
+    assert!(uid_processes(&procs, 61005).is_empty());
     assert!(parse_ps("").is_err(), "an empty table is a failed read");
     assert!(parse_ps("12 x 0 0 S /bin/sh").is_err());
     assert!(parse_ps("12 0 0").is_err());
@@ -109,52 +105,17 @@ fn processes_are_found_by_real_effective_or_saved_uid() {
     );
 }
 
-/// Catches launchd's own agents counted as a lease's processes (they start again on
-/// demand as the uid after every kill): the pids of own services are left out, and only
-/// those.
+/// Catches launchd's own agents left out of a lease's processes by a filter that needs a
+/// `launchctl print` of the uid's domain, which makes a gone domain (and these agents in
+/// it) again: every process of the uid is listed, `distnoted` too.
 #[test]
-fn launchds_own_processes_are_not_the_leases() {
+fn every_process_of_the_uid_is_listed_launchds_agents_too() {
     let procs = parse_ps(PS).expect("parsed");
-    assert!(uid_processes(&procs, 501, &[345]).is_empty());
     assert_eq!(
-        uid_processes(&procs, 501, &[]),
+        uid_processes(&procs, 501),
         lines(&["345 /usr/libexec/distnoted"])
     );
-    assert_eq!(uid_processes(&procs, 61001, &[61001]).len(), 3);
-}
-
-fn job(label: &str, pid: Option<i32>, own: bool) -> Job {
-    Job {
-        pid,
-        label: label.to_owned(),
-        plist: Some(format!("/System/Library/LaunchAgents/{label}.plist")),
-        program: None,
-        own,
-    }
-}
-
-/// Catches a job judged by its label (a lease can name its agent `com.apple.x`): the
-/// judgement is the job's `own`, which the reader takes from its plist path, so a
-/// foreign job labelled like launchd's is listed and an own one is not; the pids of own
-/// services are those the processes probe leaves out.
-#[test]
-fn a_job_is_launchds_own_by_its_plist_not_its_label() {
-    let jobs = [
-        job("com.apple.cfprefsd.xpc.agent", Some(77), true),
-        job("com.apple.kbf-fresh", Some(88), false),
-        job("kbf.fresh", None, false),
-    ];
-    assert_eq!(
-        foreign_jobs(&jobs),
-        lines(&["job com.apple.kbf-fresh (pid 88)", "job kbf.fresh"])
-    );
-    assert_eq!(own_pids(&jobs), vec![77]);
-    assert_eq!(
-        own_services(&jobs),
-        lines(&[
-            "com.apple.cfprefsd.xpc.agent\t/System/Library/LaunchAgents/com.apple.cfprefsd.xpc.agent.plist\t"
-        ])
-    );
+    assert_eq!(uid_processes(&procs, 61001).len(), 4);
 }
 
 const IPCS: &str = "\
@@ -371,8 +332,11 @@ fn the_entry_keeps_its_four_folders_empty_and_nothing_else() {
         lines(&[
             ". owned by 61001:20 mode 755 flags 0x0",
             ". 0 mode 700",
+            ". 0 flags 0x0",
             ". C mode 700",
+            ". C flags 0x0",
             ". T mode 700",
+            ". T flags 0x0",
         ])
     );
     let full = (
@@ -405,13 +369,15 @@ fn the_entry_keeps_its_four_folders_empty_and_nothing_else() {
         lines(&[
             ". owned by 61001:20 mode 755 flags 0x0",
             ". T mode 700",
+            ". T flags 0x0",
             "T: entry leak",
             "stray: not part of the entry",
             "Z: not part of the entry",
             ". 0 mode 700",
             "0: owned by 0",
+            ". 0 flags 0x0",
             ". C mode 700",
-            "C: flags 0x2",
+            ". C flags 0x2",
         ])
     );
 }
@@ -440,7 +406,6 @@ fn the_directory_record_is_read_by_attribute() {
 fn a_baseline_is_recorded_only_of_a_clean_user_and_every_probe() {
     let snapshot = baseline();
     assert_eq!(snapshot.lines(Probe::Record).map(Vec::len), Some(2));
-    assert!(snapshot.lines(Probe::Services).is_some());
     for probe in ALL {
         assert!(snapshot.lines(probe).is_some(), "{probe}");
     }
@@ -496,7 +461,7 @@ fn a_recorded_baseline_holds_facts_and_not_a_wrong_state() {
         ],
     );
     let base = record(&user).expect("facts are recorded");
-    assert!(assert(&user, Some(&base), &ALL, (&|| false, None)).is_empty());
+    assert!(assert(&user, Some(&base), &ALL, (&|| false, &|| false)).is_empty());
     // The attribute gone and a new one are both differences.
     let now = Fake::clean();
     now.set(
@@ -515,7 +480,7 @@ fn a_recorded_baseline_holds_facts_and_not_a_wrong_state() {
             &now,
             Some(&base),
             &[Probe::Home, Probe::Entry],
-            (&|| false, None)
+            (&|| false, &|| false)
         ),
         lines(&[
             "home: + xattr kbf.new",
@@ -534,109 +499,24 @@ fn a_stopped_check_reads_no_further_probe() {
         reads.set(reads.get() + 1);
         reads.get() > 2
     };
-    let red = assert(&Fake::clean(), Some(&base), &CHEAP, (&stopped, None));
+    let red = assert(&Fake::clean(), Some(&base), &CHEAP, (&stopped, &|| false));
     assert_eq!(reads.get(), 3);
-    assert_eq!(red, lines(&["ipc: not read, the check was stopped"]));
+    assert_eq!(red, lines(&["mounts: not read, the check was stopped"]));
 }
 
-/// Catches a job told to be launchd's own by a line of text it can write, or by a path
-/// that only looks like a system one: the plist must really lie under the system folder
-/// (a `..` or a link out of it does not), be owned by the system's owner and not
-/// writable by others, and carry the job's label (a real system path put in a job's
-/// description does not make it that service). XML and binary plists are both read.
+/// Catches a comparison that tolerates too much: a clean user reads clean against its
+/// baseline, while a process, an IPC object, a mount, a dirty home, a changed record, a
+/// changed entry root and an owned file each make a red line of their own.
 #[test]
-fn a_plist_is_launchds_own_only_by_the_file_it_names() {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
-    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-driver-native-plist");
-    let base = std::fs::canonicalize(dir.path()).expect("the directory");
-    let (system, outside) = (base.join("system"), base.join("outside"));
-    std::fs::create_dir_all(&system).expect("system");
-    std::fs::create_dir_all(&outside).expect("outside");
-    let owner = std::fs::metadata(&base).expect("meta").uid();
-    let roots = [format!("{}/", system.display())];
-    let roots: Vec<&str> = roots.iter().map(String::as_str).collect();
-    let xml = |label: &str| {
-        format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string></dict></plist>"
-        )
-    };
-    let write = |path: &Path, text: &str, mode: u32| {
-        std::fs::write(path, text).expect("plist");
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("mode");
-        path.to_string_lossy().into_owned()
-    };
-    let good = write(&system.join("a.plist"), &xml("com.apple.a"), 0o644);
-    assert!(own_plist(&good, "com.apple.a", &roots, owner));
-    // Another label: a system path in a job's description does not make it that service.
-    assert!(!own_plist(&good, "kbf.job", &roots, owner));
-    // Outside the folder, by `..` and by a link.
-    let outer = write(&outside.join("b.plist"), &xml("com.apple.b"), 0o644);
-    assert!(own_plist(
-        &outer,
-        "com.apple.b",
-        &[&format!("{}/", outside.display())],
-        owner
-    ));
-    assert!(!own_plist(&outer, "com.apple.b", &roots, owner));
-    let dotdot = format!("{}/../outside/b.plist", system.display());
-    assert!(!own_plist(&dotdot, "com.apple.b", &roots, owner));
-    symlink(&outer, system.join("link.plist")).expect("link");
-    let linked = system.join("link.plist").to_string_lossy().into_owned();
-    assert!(!own_plist(&linked, "com.apple.b", &roots, owner));
-    // Owned by another, writable by the group or others, missing, not a plist.
-    assert!(!own_plist(&good, "com.apple.a", &roots, owner + 1));
-    let group = write(&system.join("g.plist"), &xml("com.apple.g"), 0o664);
-    assert!(!own_plist(&group, "com.apple.g", &roots, owner));
-    let other = write(&system.join("o.plist"), &xml("com.apple.o"), 0o646);
-    assert!(!own_plist(&other, "com.apple.o", &roots, owner));
-    let missing = format!("{}/missing.plist", system.display());
-    assert!(!own_plist(&missing, "x", &roots, owner));
-    let junk = write(&system.join("j.plist"), "not a plist", 0o644);
-    assert!(!own_plist(&junk, "x", &roots, owner));
-    let empty = write(
-        &system.join("e.plist"),
-        "<plist version=\"1.0\"><dict/></plist>",
-        0o644,
-    );
-    assert!(!own_plist(&empty, "x", &roots, owner));
-    // A binary plist is read as well.
-    let mut dict = plist::Dictionary::new();
-    dict.insert(
-        "Label".to_owned(),
-        plist::Value::String("com.apple.bin".to_owned()),
-    );
-    let binary = system.join("bin.plist");
-    plist::Value::Dictionary(dict)
-        .to_file_binary(&binary)
-        .expect("binary");
-    let binary = binary.to_string_lossy().into_owned();
-    assert!(own_plist(&binary, "com.apple.bin", &roots, owner));
-}
-
-/// Catches a comparison that tolerates nothing launchd varies (a pid, a service loaded
-/// on demand, a service that was not loaded yet) and one that tolerates too much: the
-/// services differ from the baseline's and the user is still clean, while a foreign job,
-/// a process, an IPC object, a mount, a dirty home, a changed record, a changed entry
-/// root and an owned file each make a red line of their own.
-#[test]
-fn the_comparison_tolerates_launchds_services_and_nothing_a_lease_can_make() {
+fn the_comparison_tolerates_nothing_a_lease_can_make() {
     let base = baseline();
-    let now = Fake::clean();
-    now.set(
-        Probe::Services,
-        &["com.apple.other.agent\t/System/x.plist\t"],
-    );
-    assert!(
-        assert(&now, Some(&base), &ALL, (&|| false, None)).is_empty(),
-        "launchd's own services vary"
-    );
-    let cases: [(Probe, &[&str], &str); 8] = [
+    assert!(assert(&Fake::clean(), Some(&base), &ALL, (&|| false, &|| false)).is_empty());
+    let cases: [(Probe, &[&str], &str); 7] = [
         (
             Probe::Processes,
             &["9 /bin/sleep"],
             "processes: + 9 /bin/sleep",
         ),
-        (Probe::Domain, &["job kbf.x"], "launchd: + job kbf.x"),
         (Probe::Ipc, &["s 300"], "ipc: + s 300"),
         (Probe::Mounts, &["mounted /m"], "mounts: + mounted /m"),
         (Probe::Home, &["entry a"], "home: + entry a"),
@@ -659,12 +539,12 @@ fn the_comparison_tolerates_launchds_services_and_nothing_a_lease_can_make() {
     for (probe, found, line) in cases {
         let now = Fake::clean();
         now.set(probe, found);
-        let red = assert(&now, Some(&base), &ALL, (&|| false, None));
+        let red = assert(&now, Some(&base), &ALL, (&|| false, &|| false));
         assert!(red.contains(&line.to_owned()), "{probe}: {red:?}");
     }
     let now = Fake::clean();
     now.set(Probe::Record, &["id uid=61001(u) gid=20(staff)"]);
-    let red = assert(&now, Some(&base), &[Probe::Record], (&|| false, None));
+    let red = assert(&now, Some(&base), &[Probe::Record], (&|| false, &|| false));
     assert_eq!(
         red,
         lines(&["record: - UniqueID=61001"]),
@@ -672,7 +552,7 @@ fn the_comparison_tolerates_launchds_services_and_nothing_a_lease_can_make() {
     );
     let now = Fake::clean();
     now.set(Probe::Entry, &[". owned by 61001:20 mode 700 flags 0x2"]);
-    let red = assert(&now, Some(&base), &[Probe::Entry], (&|| false, None));
+    let red = assert(&now, Some(&base), &[Probe::Entry], (&|| false, &|| false));
     assert_eq!(
         red,
         lines(&[
@@ -690,7 +570,7 @@ fn a_probe_that_cannot_run_or_has_no_baseline_is_red() {
     for probe in ALL {
         let now = Fake::clean();
         now.fail(probe, "boom");
-        let red = assert(&now, Some(&base), &[probe], (&|| false, None));
+        let red = assert(&now, Some(&base), &[probe], (&|| false, &|| false));
         assert_eq!(red.len(), 1, "{probe}: {red:?}");
         assert!(
             red[0].starts_with(&format!("{probe}: cannot run")),
@@ -702,7 +582,7 @@ fn a_probe_that_cannot_run_or_has_no_baseline_is_red() {
         &Fake::clean(),
         None,
         &[Probe::Home, Probe::Entry, Probe::Record, Probe::Ipc],
-        (&|| false, None),
+        (&|| false, &|| false),
     );
     assert_eq!(
         red,
@@ -712,18 +592,19 @@ fn a_probe_that_cannot_run_or_has_no_baseline_is_red() {
             "record: no baseline to compare with"
         ])
     );
-    assert!(assert(&Fake::clean(), None, &[Probe::Ipc], (&|| false, None)).is_empty());
+    assert!(assert(&Fake::clean(), None, &[Probe::Ipc], (&|| false, &|| false)).is_empty());
 }
 
 /// Catches a cheap subset that leaves out one of the probes a slot is handed over with
-/// (processes, launchd's jobs, IPC, mounts, the home and the entry), one that runs the
-/// slow walks of the shared places at every lease, and a full list that misses a probe
-/// or reads one twice.
+/// (processes, IPC, mounts, the home and the entry), one that runs the slow walks of the
+/// shared places at every lease, a full list that misses a probe or reads one twice, and
+/// a probe that asks launchd about the uid (a `launchctl print` of a gone `user/<uid>`
+/// makes it again): none of the probes is named for launchd, and the slot-ready check, which
+/// runs [`CHEAP`], has nothing that could.
 #[test]
 fn the_cheap_probes_are_the_hand_over_ones_and_all_probes_are_read_once() {
     for probe in [
         Probe::Processes,
-        Probe::Domain,
         Probe::Ipc,
         Probe::Mounts,
         Probe::Home,
@@ -731,7 +612,7 @@ fn the_cheap_probes_are_the_hand_over_ones_and_all_probes_are_read_once() {
     ] {
         assert!(CHEAP.contains(&probe), "{probe}");
     }
-    assert_eq!(CHEAP.len(), 6);
+    assert_eq!(CHEAP.len(), 5);
     for probe in [Probe::Shared, Probe::Schedules, Probe::Record] {
         assert!(!CHEAP.contains(&probe));
     }
@@ -739,7 +620,12 @@ fn the_cheap_probes_are_the_hand_over_ones_and_all_probes_are_read_once() {
     all.sort();
     all.dedup();
     assert_eq!(all.len(), ALL.len());
-    assert_eq!(all.len(), 10);
+    assert_eq!(all.len(), 8);
+    let names: Vec<String> = ALL.iter().map(ToString::to_string).collect();
+    assert!(
+        !names.iter().any(|n| n == "launchd" || n == "services"),
+        "{names:?}"
+    );
 }
 
 /// A slot of a book whose clean runs the assertion against a world a test controls.
@@ -756,7 +642,7 @@ impl Slotted for Slot {
 fn asserted_book(world: &Arc<Fake>, base: &Arc<Snapshot>) -> Arc<Book<Slot>> {
     let (world, base) = (Arc::clone(world), Arc::clone(base));
     let cleaner: Cleaner<Slot> = Arc::new(move |_: &Slot| {
-        let red = assert(world.as_ref(), Some(&base), &ALL, (&|| false, None));
+        let red = assert(world.as_ref(), Some(&base), &ALL, (&|| false, &|| false));
         if red.is_empty() {
             Outcome::Clean
         } else {
@@ -805,7 +691,7 @@ async fn a_slot_that_fails_the_assertion_at_slot_ready_is_set_aside() {
     let (index, permit) = book.take().await.expect("a slot");
     // What a lease finds at slot-ready: a mount that was not there at the clean.
     world.set(Probe::Mounts, &["mounted /private/var/folders/x/T/vol"]);
-    let red = assert(world.as_ref(), Some(&base), &CHEAP, (&|| false, None));
+    let red = assert(world.as_ref(), Some(&base), &CHEAP, (&|| false, &|| false));
     assert_eq!(
         red,
         lines(&["mounts: + mounted /private/var/folders/x/T/vol"])
@@ -823,62 +709,6 @@ async fn a_slot_that_fails_the_assertion_at_slot_ready_is_set_aside() {
     assert_eq!(book.count(), 2);
 }
 
-const SERVICE: &str = "com.apple.cfprefsd.xpc.agent";
-const PLIST: &str = "/System/Library/LaunchAgents/com.apple.cfprefsd.xpc.agent.plist";
-const PROGRAM: &str = "/usr/sbin/cfprefsd";
-
-/// Catches a job of a baseline label taken as launchd's own with no look at its plist
-/// (a lease that boots out a service and submits its own job under the label): the
-/// plist path and the program must be the baseline's, and the file check must pass for
-/// the path; a label the baseline does not have is judged by the file alone; a job with
-/// no plist is never launchd's.
-#[test]
-fn a_baseline_label_is_launchds_own_only_with_its_plist_and_program() {
-    let known = vec![service_line(SERVICE, Some(PLIST), Some(PROGRAM))];
-    let accepts = |_: &str| true;
-    let refuses = |_: &str| false;
-    let judge = |plist, program, on_file: &dyn Fn(&str) -> bool| {
-        is_own_job((SERVICE, plist, program), &known, on_file)
-    };
-    // The same plist and program, and the file is launchd's: own.
-    assert!(judge(Some(PLIST), Some(PROGRAM), &accepts));
-    // The same path, but the file is not launchd's (replaced, or written by the lease).
-    assert!(!judge(Some(PLIST), Some(PROGRAM), &refuses));
-    // A different plist path, even a system-looking one that passes the file check.
-    assert!(!judge(
-        Some("/System/Library/LaunchAgents/other.plist"),
-        Some(PROGRAM),
-        &accepts
-    ));
-    // The same plist but a different program.
-    assert!(!judge(Some(PLIST), Some("/tmp/x/cfprefsd"), &accepts));
-    assert!(!judge(Some(PLIST), None, &accepts));
-    // A submitted job has no plist.
-    assert!(!judge(None, Some(PROGRAM), &accepts));
-    // A label the baseline did not note: the file alone decides.
-    let other = |plist, on_file: &dyn Fn(&str) -> bool| {
-        is_own_job(("com.apple.new", plist, None), &known, on_file)
-    };
-    assert!(other(Some("/System/new.plist"), &accepts));
-    assert!(!other(Some("/System/new.plist"), &refuses));
-    assert!(!other(None, &accepts));
-    // A label that is the start of a noted one is not that service.
-    let longer = format!("{SERVICE}.more");
-    assert!(!is_own_job(
-        (&longer, Some(PLIST), Some(PROGRAM)),
-        &known,
-        &refuses
-    ));
-}
-
-/// Catches a service line that does not tell a missing program from a path: the line
-/// has the label, plist and program, a missing one empty.
-#[test]
-fn a_service_line_holds_label_plist_and_program() {
-    assert_eq!(service_line("a", Some("/p"), Some("/q")), "a\t/p\t/q");
-    assert_eq!(service_line("a", None, None), "a\t\t");
-}
-
 /// Catches an extended attribute whose value changed under the same name going unseen:
 /// the line holds the value, in hex.
 #[test]
@@ -892,7 +722,7 @@ fn an_extended_attribute_line_holds_its_value() {
     let now = Fake::clean();
     now.set(Probe::Home, &["xattr n=32"]);
     assert_eq!(
-        assert(&now, Some(&base), &[Probe::Home], (&|| false, None)),
+        assert(&now, Some(&base), &[Probe::Home], (&|| false, &|| false)),
         lines(&["home: + xattr n=32", "home: - xattr n=31"])
     );
 }
@@ -903,35 +733,33 @@ fn baseline_with_home(home: &[&str]) -> Snapshot {
     record(&fake).expect("a baseline")
 }
 
-/// A reader that takes `pause` for each probe it reads.
-struct Slow(Fake, Duration);
+/// A reader that counts the probes it reads.
+struct Counting(Fake, std::cell::Cell<usize>);
 
-impl Reader for Slow {
+impl Reader for Counting {
     fn read(&self, probe: Probe) -> Result<Lines, String> {
-        std::thread::sleep(self.1);
+        self.1.set(self.1.get() + 1);
         self.0.read(probe)
     }
 }
 
 /// Catches a check with no total budget: a probe not begun when the budget is used is not
 /// read, and the result is red and says why; with room left every probe is read; a probe
-/// that began is read in full.
+/// that began is read in full. The budget is used up once the first probe has been read.
 #[test]
 fn a_check_that_runs_out_of_time_is_red() {
     let base = baseline();
-    let slow = Slow(Fake::clean(), Duration::from_millis(60));
-    let now = std::time::Instant::now();
-    let red = assert(
-        &slow,
-        Some(&base),
-        &CHEAP,
-        (&|| false, Some(now + Duration::from_millis(30))),
-    );
+    let reader = Counting(Fake::clean(), std::cell::Cell::new(0));
+    let used_up = || reader.1.get() >= 1;
+    let red = assert(&reader, Some(&base), &CHEAP, (&|| false, &used_up));
     // The first probe began in time and was read in full; the second was not begun.
+    assert_eq!(red, lines(&["ipc: not read, the check ran out of time"]));
+    assert_eq!(reader.1.get(), 1);
+    let reader = Counting(Fake::clean(), std::cell::Cell::new(0));
+    assert!(assert(&reader, Some(&base), &CHEAP, (&|| false, &|| false)).is_empty());
     assert_eq!(
-        red,
-        lines(&["launchd: not read, the check ran out of time"])
+        reader.1.get(),
+        CHEAP.len(),
+        "with room left every probe is read"
     );
-    let room = Some(std::time::Instant::now() + Duration::from_secs(60));
-    assert!(assert(&slow, Some(&base), &CHEAP, (&|| false, room)).is_empty());
 }

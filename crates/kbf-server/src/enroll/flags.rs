@@ -76,8 +76,7 @@ pub fn args() -> Vec<Arg> {
                 "Serve kbf.enroll.v1 (Enroll and Renew) on this address, over TLS with the \
                  frontend's own certificate from the CA. Off unless given. It needs \
                  --state-store, --ca-dir, --frontend-name, and --ca-signer (or, for \
-                 development, --ca-dev-file-signer). While this build does not enforce \
-                 deny rows in storage it also needs --enroll-allow-unenforced-deny.",
+                 development, --ca-dev-file-signer).",
             ),
         flag(
             CA_DIR,
@@ -157,9 +156,9 @@ pub fn args() -> Vec<Arg> {
             .action(ArgAction::SetTrue)
             .requires(LISTEN)
             .help(
-                "Allow --enroll-listen although this build's storage does not enforce the \
-                 deny rows a node revocation writes: a revoked node is refused renewal at \
-                 once but storage serves it until its certificate expires.",
+                "Does nothing: this build enforces the deny rows a node revocation writes, \
+                 so --enroll-listen needs no acceptance. Still accepted so existing units \
+                 start; it will be removed in a later release.",
             ),
         flag(
             WORKER,

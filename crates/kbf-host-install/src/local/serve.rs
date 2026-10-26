@@ -1,7 +1,9 @@
 //! The local socket: a unix socket, mode 0600, owned by the one account that may use it.
 //!
 //! ```text
-//! kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N] [--restart-unit UNIT]...
+//! kbf-host-install --serve --socket PATH --socket-user NAME [--window-secs N]
+//!                   [--layout installer|deb|rpm]
+//!                   (--restart-unit UNIT... | --frontend-container [--frontend-config PATH])
 //! ```
 //!
 //! The program binds the socket itself (a umask of 0177, then a chown to the account), in a
@@ -17,7 +19,18 @@
 //! `--window-secs` is how long a release on trial has to be confirmed (120 to 1800, default
 //! 600). `--restart-unit` names a unit that runs the release (repeatable; a Linux host
 //! needs one at least, and a Mac restarts the daemon's job). The paths this program reads as
-//! root are constants, as they are for the ssh path; no flag moves them.
+//! root are constants, as they are for the ssh path; no flag moves them. `--frontend-container`
+//! serves a frontend that runs as a container instead of units ([`super::frontend`]); it takes
+//! no `--restart-unit`.
+//! `--frontend-config` names the container's configuration (default
+//! `/etc/kbf/host-install-frontend.toml`); with another file, the helper keeps its record, its
+//! A/B state and its lock under names made from the container's name, so that a host runs one
+//! helper, with its own `--socket`, per container.
+//!
+//! `--layout` says how a Linux host keeps its releases: `installer` (the default) is the
+//! hand-placed layout of `kbf-installer` (`releases/<commit>` with the links `current` and
+//! `previous`); `deb` and `rpm` are a host whose units run the `kbf` package's `/usr/bin/kbf`,
+//! updated by installing that package ([`super::package`]). A Mac takes none.
 //!
 //! Every request but `query` and `revert` is audited, and is not run when the audit log
 //! cannot be opened. A revert is never held back by it.
@@ -27,13 +40,14 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt, chown};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::answer::{Answer, Code};
 use super::backend::Backend;
 use super::core::Ab;
 use super::request::{LocalRequest, MAX_LINE_LEN};
 use crate::audit::{self, Audit};
+use crate::pace::{Now, Pace};
 use crate::request::{BadCommand, Unit};
 use crate::trust::Trust;
 
@@ -50,7 +64,31 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const REVERT_RETRY: Duration = Duration::from_secs(30);
 
 pub const USAGE: &str = "usage: kbf-host-install --serve --socket PATH --socket-user NAME \
-[--window-secs N] [--restart-unit UNIT]...\n";
+[--window-secs N] [--layout installer|deb|rpm] \
+(--restart-unit UNIT... | --frontend-container [--frontend-config PATH])\n";
+
+/// How a host keeps the releases it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layout {
+    /// The hand-placed layout of `kbf-installer` (a Mac's kit tree is its counterpart).
+    #[default]
+    Installer,
+    /// The `kbf` package, as a `.deb`.
+    Deb,
+    /// The `kbf` package, as an `.rpm`.
+    Rpm,
+}
+
+impl Layout {
+    fn named(name: &str) -> Option<Self> {
+        match name {
+            "installer" => Some(Self::Installer),
+            "deb" => Some(Self::Deb),
+            "rpm" => Some(Self::Rpm),
+            _ => None,
+        }
+    }
+}
 
 /// The settings of a served socket, from the flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +96,12 @@ pub struct ServeConfig {
     pub socket: PathBuf,
     pub user: String,
     pub window_secs: u64,
+    pub layout: Layout,
     pub units: Vec<Unit>,
+    /// The host runs the frontend as a container, not as units.
+    pub frontend_container: bool,
+    /// The frontend container's configuration file.
+    pub frontend_config: PathBuf,
 }
 
 impl ServeConfig {
@@ -71,13 +114,22 @@ impl ServeConfig {
         let mut socket = None;
         let mut user = None;
         let mut window = None;
+        let mut layout = None;
         let mut units = Vec::new();
+        let mut frontend_container = false;
+        let mut frontend_config = None;
         let mut rest = args.iter();
         while let Some(arg) = rest.next() {
             let (name, inline) = match arg.split_once('=') {
                 Some((name, value)) => (name, Some(value.to_owned())),
                 None => (arg.as_str(), None),
             };
+            if name == "--frontend-container" {
+                if inline.is_some() || std::mem::replace(&mut frontend_container, true) {
+                    return Err("--frontend-container takes no value and is given once".to_owned());
+                }
+                continue;
+            }
             let value = match inline {
                 Some(value) => value,
                 None => rest
@@ -96,6 +148,8 @@ impl ServeConfig {
                 "--socket" => once(&mut socket)?,
                 "--socket-user" => once(&mut user)?,
                 "--window-secs" => once(&mut window)?,
+                "--layout" => once(&mut layout)?,
+                "--frontend-config" => once(&mut frontend_config)?,
                 "--restart-unit" => {
                     units.push(Unit::service(&value).map_err(|BadCommand| {
                         format!("--restart-unit {value:?} is not a kbf unit")
@@ -117,11 +171,38 @@ impl ServeConfig {
                 .ok_or("--window-secs must be a number from 120 to 1800")?,
             None => DEFAULT_WINDOW_SECS,
         };
+        if frontend_container && !units.is_empty() {
+            return Err(
+                "--frontend-container and --restart-unit are not given together".to_owned(),
+            );
+        }
+        let layout = match layout {
+            Some(name) => Layout::named(&name).ok_or("--layout must be installer, deb or rpm")?,
+            None => Layout::default(),
+        };
+        if frontend_container && layout != Layout::Installer {
+            return Err(
+                "--frontend-container and --layout deb or rpm are not given together".to_owned(),
+            );
+        }
+        let frontend_config = match frontend_config {
+            Some(_) if !frontend_container => {
+                return Err("--frontend-config needs --frontend-container".to_owned());
+            }
+            Some(path) if !Path::new(&path).is_absolute() => {
+                return Err("--frontend-config must be an absolute path".to_owned());
+            }
+            Some(path) => PathBuf::from(path),
+            None => PathBuf::from(super::frontend::config::CONFIG),
+        };
         Ok(Self {
             socket,
             user,
             window_secs,
+            layout,
             units,
+            frontend_container,
+            frontend_config,
         })
     }
 }
@@ -182,6 +263,8 @@ pub struct Serving<'a, B: Backend> {
     pub audit: &'a Path,
     /// Where the log of what happened goes (stderr, in production).
     pub log: &'a dyn Fn(&str),
+    /// The clock of the loop's pauses and of a client's window.
+    pub pace: &'a Pace,
 }
 
 impl<B: Backend> Serving<'_, B> {
@@ -189,7 +272,7 @@ impl<B: Backend> Serving<'_, B> {
     pub fn serve_one(&self, stream: UnixStream) {
         let _ = stream.set_nonblocking(false);
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-        let line = read_line(&stream, IO_TIMEOUT);
+        let line = read_line(&stream, IO_TIMEOUT, &self.pace.now);
         let answer = self.answer(line.as_deref());
         let mut writer = &stream;
         let wrote = writeln!(writer, "{}", answer.json_line()).and_then(|()| writer.flush());
@@ -285,14 +368,14 @@ impl<B: Backend> Serving<'_, B> {
     /// Serve until `stop` is set: the connections, and the ticks between them.
     pub fn run(&self, listener: &UnixListener, stop: &AtomicBool) -> io::Result<()> {
         listener.set_nonblocking(true)?;
-        let mut hold_revert_until = Instant::now();
+        let mut hold_revert_until = Duration::ZERO;
         while !stop.load(Ordering::Relaxed) {
-            if Instant::now() >= hold_revert_until && self.tick() {
-                hold_revert_until = Instant::now() + REVERT_RETRY;
+            if (self.pace.now)() >= hold_revert_until && self.tick() {
+                hold_revert_until = (self.pace.now)() + REVERT_RETRY;
             }
             match listener.accept() {
                 Ok((stream, _)) => self.serve_one(stream),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(IDLE),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => (self.pace.sleep)(IDLE),
                 Err(e) => return Err(e),
             }
         }
@@ -303,13 +386,13 @@ impl<B: Backend> Serving<'_, B> {
 /// The first line the client sent, within [`MAX_LINE_LEN`] bytes and within `window` in all
 /// (a client that trickles bytes is cut off, not waited for), without its end; none when it
 /// sent none in time, a longer one, or text that is not UTF-8.
-pub(super) fn read_line(stream: &UnixStream, window: Duration) -> Option<String> {
-    let end = Instant::now() + window;
+pub(super) fn read_line(stream: &UnixStream, window: Duration, now: &Now) -> Option<String> {
+    let end = now() + window;
     let mut line = Vec::new();
     let mut chunk = [0u8; 64];
     loop {
         // A zero timeout is an error: a deadline that has passed ends the wait there.
-        let left = end.saturating_duration_since(Instant::now());
+        let left = end.saturating_sub(now());
         let got = stream
             .set_read_timeout(Some(left))
             .and_then(|()| (&*stream).read(&mut chunk))

@@ -1473,3 +1473,49 @@ fn every_rule_has_a_defect() {
         assert!(RULES.contains(&m.3), "defect names no rule: {}", m.3);
     }
 }
+
+/// Asserts that every unit `setup` enables on a Linux host, for each mode it takes, is a unit
+/// the `kbf` deb ships. The deb's files are the plan `cargo xtask pkg-config` writes from the
+/// real packaging directory (not a list here); the units `setup` enables are `mode_units`,
+/// which `kbf-setup`'s own tests hold to the `systemctl enable` commands it runs.
+///
+/// Catches: `setup` enabling a unit no package carries (the installer's or the proxy's, which
+/// the deb no longer ships), which would fail the last step of `kbf setup --apply` on a fresh
+/// host that has only the `kbf` deb.
+#[test]
+fn setup_enables_only_units_the_kbf_deb_ships() {
+    use clap::ValueEnum;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux");
+    let at = |rel: &str| -> PathBuf { root.join(rel) };
+    let plan = xtask::pkg_linux::kbf_plan(&xtask::pkg_linux::Inputs {
+        kbf: &at("units/kbf-daemon.service"),
+        units: &at("units"),
+        trust: &at("testdata/trust"),
+        sysusers: &at("sysusers.d/kbf-installer.conf"),
+        tmpfiles: &at("tmpfiles.d/kbf-installer.conf"),
+        needrestart: &at("needrestart/kbf.conf"),
+        platform: xtask::package::Platform::LinuxX86_64,
+        version: "0.0.0+ci",
+    })
+    .expect("the real packaging directory is a plan");
+    let shipped: Vec<&str> = plan
+        .iter()
+        .filter_map(|e| {
+            e.dst
+                .strip_prefix(&format!("{}/", xtask::pkg_linux::UNIT_DIR))
+        })
+        .collect();
+    assert!(shipped.contains(&"kbf-daemon.service"), "{shipped:?}");
+    let modes = kbf_installer::cli::Mode::value_variants();
+    assert_eq!(modes.len(), 5, "every mode is checked");
+    for mode in modes {
+        let units = kbf_installer::setup::plan::mode_units(*mode);
+        assert!(!units.is_empty(), "{mode:?}");
+        for unit in units {
+            assert!(
+                shipped.contains(unit),
+                "setup enables {unit} for {mode:?}, which the kbf deb does not ship: {shipped:?}"
+            );
+        }
+    }
+}

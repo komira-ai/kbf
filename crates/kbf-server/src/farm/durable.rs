@@ -28,11 +28,11 @@
 //!   memory runs of its kills for memory, the farm runs it used, the nodes placement
 //!   avoids for it and the leases given up as not started ([`kbf_sched::Fate`]), written
 //!   in the transaction of every requeue that follows a fault (whole, so the newest row
-//!   is the whole state) and deleted with the operation's other rows. A successor (after
-//!   a handover or a crash) books the next rung and spends the budgets that are left
-//!   instead of starting over. A store with no row for an operation books and counts as
-//!   it did before the row existed; a row written before the budgets were (version 1)
-//!   carries none of them;
+//!   is the whole state) and deleted with the operation's other rows. A successor (another
+//!   frontend that takes the operation up, or a restart after a crash) books the next rung
+//!   and spends the budgets that are left instead of starting over. A store with no row for
+//!   an operation books and counts as it did before the row existed; a row written before
+//!   the budgets were (version 1) carries none of them;
 //! - `floor/<instance>/<action>`: a memory floor, the least memory a fresh submission of
 //!   the action books ([`kbf_sched::Floor`]): the ask and a stamp that orders the raises,
 //!   written in the transaction of the requeue that raises it, deleted in the one that
@@ -1530,6 +1530,9 @@ impl State {
         });
         self.stages.insert(waiter, watch::channel(Stage::Queued).0);
         if let Some(grant) = &op.lease {
+            // A recovered operation that holds a lease has been started: if it is queued
+            // again, its streams read `WaitingKept`.
+            self.ever_started.insert(op.operation);
             let stamp = Stamp {
                 queued: now,
                 started: now,

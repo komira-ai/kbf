@@ -15,6 +15,7 @@ use super::owner::{owner_key, pair_row};
 use super::owner_tests::{grant, overwrite, remove, value_of};
 use super::transition_tests::{answer, ending, requeue, rows, subject};
 use super::*;
+use crate::farm::NodeAction;
 
 pub(super) type Inbox = mpsc::UnboundedReceiver<Result<ServerMessage, Status>>;
 
@@ -288,6 +289,52 @@ async fn an_operation_queued_again_by_another_frontend_is_taken_in_again() {
     assert_eq!(farm.lock().intake.following(), 0);
     farm.intake();
     assert_eq!(farm.lock().sched.losses(OperationId(5000)), Some(1));
+}
+
+/// Asserts that a farm whose intake is closed, which holds an operation queued whose queue
+/// row is then a newer write than the one read, hands the operation off and does not take it
+/// in again.
+#[tokio::test(start_paused = true)]
+async fn a_closed_farm_does_not_take_an_operation_queued_again_back_in() {
+    let store = Racing::new();
+    let farm = farm_over(&store);
+    queue_on(&durable_over(&store), 5000);
+    farm.intake();
+    assert_eq!(unfinished(&farm), [OperationId(5000)]);
+    farm.close_intake();
+
+    overwrite(&store, "queue/0000000000001388", Vec::new());
+    farm.intake();
+
+    assert!(unfinished(&farm).is_empty(), "a closed farm took it in");
+    assert_eq!(rows(&store, "queue/"), 1, "the store lost the operation");
+}
+
+/// Asserts that an uncordon on a farm whose intake is closed ([`Farm::close_intake`]) does
+/// not place work on the node: the node stays cordoned and is given nothing, and an uncordon
+/// on a farm whose intake is open places the queued work on the node at once.
+#[tokio::test(start_paused = true)]
+async fn an_uncordon_on_a_closed_farm_places_nothing() {
+    let store = Racing::new();
+    let (open, closed) = (farm_over(&store), farm_over(&store));
+    let (node_open, node_closed) = (WorkerId::new("node-open"), WorkerId::new("node-closed"));
+    let mut inbox_open = register(&open, "node-open");
+    let mut inbox_closed = register(&closed, "node-closed");
+    for (farm, node) in [(&open, &node_open), (&closed, &node_closed)] {
+        farm.place(node, NodeAction::Cordon).expect("a known node");
+    }
+    closed.close_intake();
+    let _waiting = (caller(&open, 1), caller(&closed, 2));
+
+    open.place(&node_open, NodeAction::Uncordon)
+        .expect("a known node");
+    closed
+        .place(&node_closed, NodeAction::Uncordon)
+        .expect("a known node");
+
+    assert_eq!(starts(&mut inbox_open), 1, "an open farm placed nothing");
+    assert_eq!(starts(&mut inbox_closed), 0, "a closed farm placed work");
+    assert!(closed.lock().sched.cordon(&node_closed).is_some());
 }
 
 /// Asserts that a queued operation another frontend granted after the poll read the queue is
@@ -636,6 +683,45 @@ async fn the_poll_looks_at_the_store_every_interval() {
     running.abort();
 }
 
+/// Asserts that the count of intake polls goes up by one for each poll that runs to the end
+/// and is told to its receiver, and does not move for a poll that cannot read the store or
+/// for a farm with no state store; and that a poll of a fenced farm, and one of a closed
+/// intake, count too.
+#[tokio::test(start_paused = true)]
+async fn the_count_of_intake_polls_follows_the_polls_that_ran_to_the_end() {
+    let none = Farm::new(
+        Arc::new(Cache::memory()),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
+    let stateless = none.intake_polls();
+    none.intake();
+    assert_eq!(*stateless.borrow(), 0, "a stateless farm polled");
+
+    let store = Racing::new();
+    let farm = farm_over(&store);
+    let mut polls = farm.intake_polls();
+    assert_eq!(*polls.borrow_and_update(), 0);
+    farm.intake();
+    assert!(polls.has_changed().expect("the farm is alive"));
+    assert_eq!(*polls.borrow_and_update(), 1);
+    farm.intake();
+    assert_eq!(*polls.borrow_and_update(), 2);
+
+    overwrite(&store, "queue/zz", Vec::new());
+    farm.intake();
+    assert_eq!(*polls.borrow(), 2, "a poll that read nothing was counted");
+    remove(&store, "queue/zz");
+
+    farm.fence();
+    farm.intake();
+    assert_eq!(*polls.borrow(), 3, "a fenced farm's poll was not counted");
+    farm.resume();
+    farm.close_intake();
+    farm.intake();
+    assert_eq!(*polls.borrow(), 4, "a closed intake did not count");
+}
+
 /// Asserts that the poll reports a stored epoch past the one this frontend serves, and
 /// reports none when they are the same.
 #[tokio::test(start_paused = true)]
@@ -676,6 +762,57 @@ async fn a_poll_requeues_the_lease_of_a_node_no_frontend_hears() {
     assert_eq!(starts(&mut inbox), 1, "the requeued operation did not run");
 }
 
+/// Asserts that a farm whose intake is closed ([`Farm::close_intake`]) takes in no operation
+/// another frontend queued, and that the store still holds the operation for the others.
+#[tokio::test(start_paused = true)]
+async fn a_farm_whose_intake_is_closed_takes_no_queued_operation_in() {
+    let store = Racing::new();
+    let farm = farm_over(&store);
+    queue_on(&durable_over(&store), 5000);
+    farm.close_intake();
+
+    farm.intake();
+
+    assert!(unfinished(&farm).is_empty(), "a closed farm took work in");
+    assert_eq!(rows(&store, "queue/"), 1, "the store lost the operation");
+}
+
+/// Asserts that a farm whose intake is closed places nothing on its nodes (those it has and
+/// one that registers later) and leaves the operation it holds queued, which another
+/// frontend takes in and runs, and that it takes the result of the lease it holds, so that
+/// an execution that is running finishes where it started. The other frontend's nodes are
+/// placed work as before.
+#[tokio::test(start_paused = true)]
+async fn a_farm_whose_intake_is_closed_places_nothing_and_finishes_what_it_holds() {
+    let store = Racing::new();
+    let (a, b) = (farm_over(&store), farm_over(&store));
+    let node = WorkerId::new("node-a");
+    let mut inbox_a = register(&a, "node-a");
+    let mut inbox_b = register(&b, "node-b");
+    let running = caller(&a, 1);
+    a.tick().await;
+    assert_eq!(starts(&mut inbox_a), 1, "the first operation did not start");
+    let views = a.lease_views(None);
+    let [view] = &views.leases[..] else {
+        panic!("one lease expected");
+    };
+    let lease = view.lease;
+    a.close_intake();
+    let mut late = register(&a, "node-late");
+    let waiting = caller(&a, 2);
+    a.tick().await;
+    assert_eq!(starts(&mut inbox_a), 0, "a node was placed work");
+    assert_eq!(starts(&mut late), 0, "a later node was placed work");
+    assert_eq!(a.queued_operations(), 1);
+    assert!(!matches!(*waiting.stage.borrow(), Stage::Done(_)));
+
+    b.intake();
+    b.tick().await;
+    assert_eq!(starts(&mut inbox_b), 1, "the other frontend ran nothing");
+    a.report(&node, invalid(lease)).await;
+    assert_eq!(done_with(&running), "test");
+}
+
 /// Asserts that a farm with a daemon connected does not requeue the lease of that daemon
 /// whatever the store says of its session, however short the wait.
 #[tokio::test(start_paused = true)]
@@ -691,4 +828,83 @@ async fn a_connected_daemons_lease_is_never_swept() {
 
     assert_eq!(rows(&store, "lease/"), 1);
     assert_eq!(farm.lock().intake.orphans_seen(), 0);
+}
+
+/// A request no node of these tests is large enough for.
+fn too_big() -> kbf_sched::Request {
+    let mut big = request(9);
+    big.resources = Resources::new(64_000, 1 << 30);
+    big
+}
+
+fn queue(farm: &Farm, request: kbf_sched::Request) -> kbf_front::Ticket {
+    farm.submit(Submission {
+        request,
+        call: None,
+        described: Described::default(),
+        evidence: Default::default(),
+    })
+    .expect("queued")
+}
+
+/// Asserts what the intake poll's look at the other frontends' daemons does, while an
+/// operation waits for a worker: a node this frontend holds is not listed as another's,
+/// one whose stream has closed is (its session row is there), a row that cannot be read
+/// leaves the list as it was, and an operation the scheduler refused after the unservable
+/// wait is no longer decided again, which empties the list.
+#[tokio::test(start_paused = true)]
+async fn the_poll_lists_a_closed_stream_as_remote_and_forgets_refused_operations() {
+    let store = Racing::new();
+    let farm = farm_over(&store);
+    let inbox = register(&farm, "node-a");
+    let ticket = queue(&farm, too_big());
+    farm.tick().await;
+    assert!(
+        !farm.lock().stuck.is_empty(),
+        "{:?}",
+        *ticket.stage.borrow()
+    );
+    farm.intake();
+    assert!(farm.lock().intake.remote.is_empty(), "a held node");
+    drop(inbox);
+    farm.intake();
+    assert_eq!(farm.lock().intake.remote.len(), 1, "a closed stream");
+    // A session row that cannot be read leaves the list as it was.
+    store
+        .txn(Txn::new().put("session/zz", vec![0xff], Cond::Any))
+        .expect("store")
+        .expect("put");
+    farm.intake();
+    assert_eq!(farm.lock().intake.remote.len(), 1, "a corrupt row");
+    store
+        .txn(Txn::new().delete("session/zz", Cond::Any))
+        .expect("store")
+        .expect("delete");
+
+    tokio::time::sleep(kbf_sched::UNSERVABLE_WAIT + Duration::from_secs(1)).await;
+    farm.tick().await;
+    farm.intake();
+    assert!(matches!(*ticket.stage.borrow(), Stage::Done(_)));
+    assert!(farm.lock().stuck.is_empty());
+    // The next poll finds nothing waiting and drops the list.
+    farm.intake();
+    assert!(farm.lock().intake.remote.is_empty(), "nothing waits");
+}
+
+/// Asserts that a poll reads the `session/` rows once, for the orphan sweep, while no
+/// operation waits for a worker, and a second time for the other frontends' daemons while
+/// one does: the second scan is only worth its load when something needs its answer.
+#[test]
+fn a_poll_with_nothing_waiting_reads_the_session_rows_only_for_the_sweep() {
+    let store = Racing::new();
+    let farm = farm_over(&store);
+    let _inbox = register(&farm, "node-a");
+    let before = store.session_scans();
+    farm.intake();
+    assert_eq!(store.session_scans() - before, 1, "nothing waits");
+
+    let _ticket = queue(&farm, too_big());
+    let before = store.session_scans();
+    farm.intake();
+    assert_eq!(store.session_scans() - before, 2, "an operation waits");
 }

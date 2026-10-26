@@ -8,7 +8,7 @@
 //!
 //! **Upstream** a PING goes to every child connection every [`UPSTREAM_INTERVAL`]. It keeps a
 //! quiet loopback connection warm and tells the pool when a child has stopped answering. An
-//! unanswered PING does not close the connection: a quiesce or a database takeover can stall
+//! unanswered PING does not close the connection: a loaded or restarting frontend can stall
 //! a loopback child for longer than [`UPSTREAM_ACK`] and its streams are still good. It marks
 //! the connection *suspect* (the pool puts no new stream on it) until the PING is answered,
 //! and only [`UPSTREAM_BACKSTOP`] without an answer ends it.
@@ -70,9 +70,10 @@ mod tests {
 
     use super::*;
 
-    /// Catches a suspicion that is never lifted: a child that answers a PING late (a quiesce
-    /// that ended) is used for new streams again, and a stream parked at the pool's cap is woken. The server end is not polled for 60 s, so
-    /// it reads the PING of 30 s, and answers it, only then.
+    /// Catches a suspicion that is never lifted: a child that answers a PING late (a stall
+    /// that ended) is used for new streams again, and a stream parked at the pool's cap is
+    /// woken. The server end is not polled for 60 s, so it reads the PING of 30 s, and
+    /// answers it, only then.
     #[tokio::test(start_paused = true)]
     async fn a_late_answer_clears_the_suspicion() {
         let (near, far) = tokio::io::duplex(1 << 16);

@@ -1,6 +1,6 @@
 //! What a node's report of its metadata log's last member and boot does to the member id and
-//! boot the store gives it (`kbf_server::members::LastBoot`, `docs/design/frontend-proxy-u0.md`
-//! section (e)). Every test runs on the fake store.
+//! boot the store gives it (`kbf_server::members::LastBoot`, `docs/deploy/kbf-units.md`, "A new
+//! or restored state store, and the nodes' boots"). Every test runs on the fake store.
 
 #[path = "support/hooked.rs"]
 mod hooked;

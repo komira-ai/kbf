@@ -175,13 +175,30 @@ mod tests {
     }
 
     /// Catches a timeout that does not kill: a child that sleeps for a minute is stopped
-    /// within the bound, and the call says so.
+    /// when the limit is up, and the call says so. The sleep is given a length no other
+    /// process has (its own id as the decimals), so the test can look in `/proc` and see
+    /// the child is gone, not only that the call returned. The call is in a thread so
+    /// that a run which waits the child out fails the test instead of the suite's patience.
     #[test]
     fn a_slow_child_is_killed_at_the_timeout() {
-        let started = Instant::now();
-        let got = SystemExec.run(&spawn("/bin/sleep", &["60"], 200, 4096));
+        let length = format!("60.{}", std::process::id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let args = [length.clone()];
+        std::thread::spawn(move || {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let _ = tx.send(SystemExec.run(&spawn("/bin/sleep", &args, 300, 4096)));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the call returns without waiting the child out");
         assert_eq!(got, Err(ExecError::Timeout));
-        assert!(started.elapsed() < Duration::from_secs(20));
+        let wanted = format!("sleep\0{length}\0");
+        let alive = std::fs::read_dir("/proc")
+            .expect("/proc")
+            .flatten()
+            .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
+            .any(|c| String::from_utf8_lossy(&c).ends_with(&wanted));
+        assert!(!alive, "the child is still running");
     }
 
     /// Catches stdout that is not capped: an endless writer is killed once it passes the cap

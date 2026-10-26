@@ -64,6 +64,8 @@ const GROUPS: &[(&str, &[&str])] = &[
         &[
             "advertise-addr",
             "api-listen",
+            "drain-deadline",
+            "drain-lb-wait",
             "http2-keepalive-interval-secs",
             "http2-keepalive-timeout-secs",
             "listen",
@@ -106,6 +108,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "input-tree-cache-bytes",
             "input-tree-cache-entries",
             "input-tree-reads-in-flight",
+            "pack-index",
             "progress-interval-secs",
             "readyz-store-timeout-ms",
             "state-store",
@@ -194,6 +197,30 @@ const GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("log", &["log-dir", "log-files", "log-max-bytes"]),
+    (
+        // Blobs in packs: the frontend's (`kbf_server::frontend`'s `pack_flags`; `pack-index`,
+        // which they need, stays with the scheduler's state store) and the daemon's reads of
+        // them (`kbf_node`'s `pack_read`). The `pack-store-*` keys name the object store in both.
+        "packs",
+        &[
+            "pack-bytes",
+            "pack-cache-bytes",
+            "pack-cache-dir",
+            "pack-commit-sample",
+            "pack-inflight-bytes",
+            "pack-read",
+            "pack-read-cache-bytes",
+            "pack-read-cache-dir",
+            "pack-store-bucket",
+            "pack-store-credentials-file",
+            "pack-store-endpoint",
+            "pack-store-region",
+            "pack-store-write-credentials-file",
+            "pack-upload-idle-timeout",
+            "pack-write",
+            "pack-writer",
+        ],
+    ),
     (
         // Not `enroll` or `frontend`: those tables are the enrollment client's own.
         "enroll-service",

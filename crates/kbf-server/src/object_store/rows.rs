@@ -1,7 +1,7 @@
 //! The rows, their keys and their codec.
 //!
 //! Every row is a hand-derived `prost` message, not a generated one, so that a binary
-//! reading a row written by a newer binary (a handover runs both against one store)
+//! reading a row written by a newer binary (a roll runs both against one store)
 //! ignores the fields it does not know instead of refusing the row. Numbers are never
 //! reused. There is no field for a secret or a digest of one in any row.
 

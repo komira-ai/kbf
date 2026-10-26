@@ -20,7 +20,8 @@ use kbf_proto::reapi::{
 };
 use kbf_proto::worker::{
     self, Capability, DaemonMessage, Hello, LeaseId, NodePhase, Phase, Result as WorkerResult,
-    ServerMessage, Start, daemon_message, server_message, worker_server::WorkerServer,
+    ServerMessage, Start, daemon_message, pack_index_server::PackIndexServer, server_message,
+    worker_server::WorkerServer,
 };
 use prost::Message;
 use tonic::server::NamedService;
@@ -96,6 +97,38 @@ fn services_have_their_upstream_names() {
         <HealthServer<()> as NamedService>::NAME,
         "grpc.health.v1.Health"
     );
+    assert_eq!(
+        <PackIndexServer<()> as NamedService>::NAME,
+        "kbf.worker.v1.PackIndex"
+    );
+}
+
+/// Asserts that a pack location survives an encode/decode round trip, and that the empty one
+/// (the wire default) is a blob that is not located: a frontend that answers `Default` for a
+/// digest it has no row for says so.
+#[test]
+fn pack_locations_round_trip_and_the_default_is_not_located() {
+    let answer = worker::PackLocateResponse {
+        locations: vec![
+            worker::PackLocation {
+                located: true,
+                pack: "cas/d/node-1/boot/0000000000000001".to_owned(),
+                offset: 4096,
+                length: 12,
+            },
+            worker::PackLocation::default(),
+        ],
+    };
+    let bytes = answer.encode_to_vec();
+    let back = worker::PackLocateResponse::decode(bytes.as_slice()).expect("decode");
+    assert_eq!(back, answer);
+    assert!(!back.locations[1].located);
+    let request = worker::PackLocateRequest {
+        digests: vec![digest(&"ab".repeat(32), 12)],
+    };
+    let bytes = request.encode_to_vec();
+    let back = worker::PackLocateRequest::decode(bytes.as_slice()).expect("decode");
+    assert_eq!(back, request);
 }
 
 #[test]
@@ -172,6 +205,14 @@ fn worker_messages_round_trip() {
             seq: 11,
             report_hash: vec![7; 32],
             running: vec![LeaseId { term: 2, seq: 9 }],
+            pack_reads: Some(worker::PackReadCounts {
+                served: 5,
+                served_bytes: 4096,
+                elsewhere: 2,
+                unasked: 1,
+                lost: 3,
+                damaged: 4,
+            }),
         })),
     };
     let back = DaemonMessage::decode(heartbeat.encode_to_vec().as_slice()).expect("decode");

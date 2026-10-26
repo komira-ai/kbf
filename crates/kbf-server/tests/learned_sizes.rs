@@ -8,7 +8,6 @@ mod support;
 
 use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 
 use kbf_front::metrics::{ShadowBucket, ShadowLevel};
 use kbf_proto::reapi::{Action, Command, Directory, FileNode, Platform, platform};
@@ -156,17 +155,6 @@ fn tally(cell: &Cell, level: ShadowLevel, bucket: ShadowBucket) -> u64 {
     cell.cache.metrics().estimator_shadow.get(level, bucket)
 }
 
-/// Waits (the farm publishes on its tick) until `what` holds.
-async fn until(what: &str, mut holds: impl FnMut() -> bool) {
-    for _ in 0..200 {
-        if holds() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("{what}");
-}
-
 /// Catches: `shadow` booking the estimate (the
 /// first six `Start`s would show 1 GiB, not 4), `shadow` not logging it, the estimate at
 /// five samples not being the 1 GiB the quiet runs earn and different from the 4 GiB
@@ -204,11 +192,10 @@ async fn shadow_books_the_default_and_logs_what_it_would_book() {
         5,
         "level=l2 memory_mib=1024 cpu_millis=1000 default_mib=4096 floor_mib=0",
     );
-    until("the tally follows the buckets", || {
-        tally(&cell, ShadowLevel::None, ShadowBucket::Cold) == 2
-            && tally(&cell, ShadowLevel::L2, ShadowBucket::Covered) == 4
-    })
-    .await;
+    // The farm publishes its counts on its tick.
+    cell.tick().await;
+    assert_eq!(tally(&cell, ShadowLevel::None, ShadowBucket::Cold), 2);
+    assert_eq!(tally(&cell, ShadowLevel::L2, ShadowBucket::Covered), 4);
     assert_eq!(tally(&cell, ShadowLevel::L2, ShadowBucket::WouldOom), 0);
 }
 
@@ -231,8 +218,8 @@ async fn off_calls_nothing() {
         .await;
         assert_eq!(booked, 4 * GIB);
     }
-    // Two ticks of the farm after the last result.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A tick of the farm after the last result publishes what it counted.
+    cell.tick().await;
     assert_eq!(estimates(argv), Vec::<String>::new());
     for level in [ShadowLevel::L1, ShadowLevel::L2, ShadowLevel::None] {
         for bucket in [
@@ -292,14 +279,10 @@ async fn only_actions_that_pin_the_os_and_ask_no_gpu_are_asked_about() {
     let _no_os = submit("compile no os", &[]).await;
     let _gpu = submit("compile gpu", &[("OSFamily", "linux"), ("gpu", "1")]).await;
     let _control = submit("compile control", LINUX).await;
-    until("the control is asked about", || {
-        estimates("compile control").len() == 1
-    })
-    .await;
-    until("the skips are counted", || {
-        skipped("no_os") == 1 && skipped("kind") == 1
-    })
-    .await;
+    assert_eq!(estimates("compile control").len(), 1);
+    cell.tick().await;
+    assert_eq!(skipped("no_os"), 1);
+    assert_eq!(skipped("kind"), 1);
     assert_eq!(estimates("compile no os"), Vec::<String>::new());
     assert_eq!(estimates("compile gpu"), Vec::<String>::new());
     // Nothing of the three has a node: the control is asked about with no bound.
@@ -319,7 +302,7 @@ async fn a_mac_action_is_asked_about_with_or_without_a_mac_node() {
     let first = job(argv, "a", &mac);
     cell.upload(&first.blobs()).await;
     let _first = cell.execute(&first.action).await;
-    until("asked with no Mac node", || estimates(argv).len() == 1).await;
+    assert_eq!(estimates(argv).len(), 1, "asked with no Mac node");
 
     let hello = support::hello_on("node-mac", 4, 8, &[("os", "macos"), ("arch", "arm64")]);
     let _mac_node = FakeDaemon::connect(cell.worker_addr, hello)
@@ -328,7 +311,7 @@ async fn a_mac_action_is_asked_about_with_or_without_a_mac_node() {
     let second = job(argv, "b", &mac);
     cell.upload(&second.blobs()).await;
     let _second = cell.execute(&second.action).await;
-    until("asked with a Mac node", || estimates(argv).len() == 2).await;
+    assert_eq!(estimates(argv).len(), 2, "asked with a Mac node");
 }
 
 /// Catches: a size the client named not passed as a hint (the line would say 1 GiB
@@ -408,10 +391,8 @@ async fn results_are_learned_in_the_order_they_commit() {
     );
     done(&mut slow_ops).await;
     done(&mut quick_ops).await;
-    until("both results are counted", || {
-        tally(&cell, ShadowLevel::L2, ShadowBucket::Censored) == 1
-    })
-    .await;
+    cell.tick().await;
+    assert_eq!(tally(&cell, ShadowLevel::L2, ShadowBucket::Censored), 1);
     assert_eq!(tally(&cell, ShadowLevel::None, ShadowBucket::Cold), 2);
 }
 
@@ -530,7 +511,7 @@ async fn a_kill_with_no_usage_still_teaches_the_estimator() {
         .report(killed_bare(start.lease_id, MemoryKill::OwnLimit))
         .await;
     assert!(ack.accepted);
-    until("the kill is in the store", || !rows(&store).is_empty()).await;
+    assert!(!rows(&store).is_empty(), "the kill is in the store");
     assert!(floor_in(&rows(&store)) >= 16 * GIB);
     let rerun = daemon.start().await;
     let result = with_usage(output(&cell, "bare", 0).await, &usage(MIB));
@@ -559,7 +540,7 @@ async fn a_kill_that_ends_the_operation_is_written_at_once() {
             .accepted
     );
     done(&mut ops).await;
-    until("the kill is in the store", || !rows(&store).is_empty()).await;
+    assert!(!rows(&store).is_empty(), "the kill is in the store");
 }
 
 /// Catches: a kill by the node (not by the action's own limit) teaching the estimator a
@@ -583,13 +564,9 @@ async fn a_node_pressure_kill_sets_no_floor() {
     let result = with_usage(output(&cell, "pressure", 0).await, &usage(MIB));
     assert!(daemon.report(ran(rerun.lease_id, &result)).await.accepted);
     done(&mut ops).await;
-    // Past the write-behind interval the success's summary is in the store.
-    for _ in 0..400 {
-        if !rows(&store).is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    // The write-behind of the success's summary, run now instead of when its interval is
+    // up.
+    cell.write_behind();
     let held = rows(&store);
     assert!(!held.is_empty(), "the write-behind has run");
     for row in &held {

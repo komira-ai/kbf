@@ -29,7 +29,7 @@ route stays local, and the last column says why.
 Every row is one method and one path. A router `.route(` call that serves two methods has a row
 per method; a custom method (`:cordon`) has a row per verb. The sources of the router are
 `crates/kbf-server/src/{api,release/http,storage_health,health,metrics,http_blobs,
-http_invocations,http_sched,http_history,enroll/api,ui_mount}.rs` and `frontend.rs`, where they are merged.
+http_invocations,http_sched,http_history,enroll/api,node_self,ui_mount}.rs` and `frontend.rs`, where they are merged.
 
 ### Cluster
 
@@ -37,6 +37,7 @@ http_invocations,http_sched,http_history,enroll/api,ui_mount}.rs` and `frontend.
 |---|---|---|---|
 | cluster status (nodes, software, placement) | `GET /v1/nodes` | [F] | open |
 | one node (capacity, booked, free, leases) | `GET /v1/nodes/{node}` | [F] | open |
+| a storage host's own member and the storage numbers (its updater, on the worker listener) | `GET /v1/nodes/{node}/storage-health` | [F] | the `updater` certificate of that node, over mutual TLS ([../api.md](../api.md), "Own-node calls of a host's updater") |
 | list members of the storage map | `GET /v1/members` | [F] | open |
 | leases the scheduler holds (paged, by node) | `GET /v1/leases` | [F] | open |
 | the queue: depth, ages, why work waits | `GET /v1/queue` | [F] | open |
@@ -75,6 +76,7 @@ All of these answer 404 until enrollment is wired into the frontend (#1055 **[V]
 | revoke a token | `DELETE /v1/enroll/tokens/{id}` | [F] | full |
 | list enrolled nodes | `GET /v1/enroll/nodes` | [F] | full |
 | revoke an enrolled node | `POST /v1/enroll/nodes/{id}/revoke` | [F] | full |
+| adopt a node provisioned before enrollment | `POST /v1/enroll/nodes/{id}:adopt` | [F] | full |
 
 ### Object store
 
@@ -163,7 +165,7 @@ section 8) and is not an operator verb of the farm.
 | install, update, roll back, confirm, revert, gc, status and check of a host | `kbf-installer` (#1048, #1051, #1082, #1083) **[V]** | root and host-local; the installer is the root tool, and `setup` mints the first token |
 | the rollout controller | `kbf-deploy rollout`, #803, #970 **[V]** | a host state machine; installer territory |
 | start a mode, `--check` | `kbf <mode>` **[F]** | the local runtime; it installs nothing |
-| frontend handover, enroll, `kbf node` | `kbf frontend handover`, `kbf enroll`, `kbf node` **[F]** | replaced by the installer's side-by-side children (#1054, #1062) and removed by #1049 **[V]** |
+| frontend handover, enroll, `kbf node` | `kbf frontend handover`, `kbf enroll`, `kbf node` **[F]** | removed: a frontend is updated by a roll of the `kbf-proxy` pool, driven by `kbf-updater` (`frontend-proxy.md` section 4) **[V]** |
 | render, check, install units, swap, verify certificate (the `envoy render, check, apply` verbs are retired: no Envoy) | `kbf-deploy` **[F]** | become installer logic and package units; root |
 | `mdm`, `minio`, `pilot`, `erase-request` | `kbf-deploy` **[F]** | leave the product (distribution.md section 8); an erase request is signed with a security key on the operator's machine |
 | `kbf cluster status`, `drain`, `undrain`, `member`, `denied`, `epoch-bump`, `object-store status\|audit\|connection\|bind\|unbind\|verify` | the `kbf` CLI **[F]** (the last two groups: unit G1) | a thin client of the routes above, no logic |

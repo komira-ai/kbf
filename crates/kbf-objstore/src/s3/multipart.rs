@@ -14,10 +14,11 @@
 //! [`MIN_PART_BYTES`], none is over [`MAX_PART_BYTES`], and an object has at most
 //! [`MAX_PARTS`] parts.
 
+use std::fmt;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use reqwest::{Method, StatusCode};
+use reqwest::{Method, Response, StatusCode};
 
 use super::{Conn, failure, transport, xml};
 use crate::body::Parts;
@@ -121,8 +122,8 @@ impl Drop for Upload {
     }
 }
 
-/// CreateMultipartUpload.
-async fn create(conn: &Arc<Conn>, key: &ObjectKey) -> Result<Upload, ObjectStoreError> {
+/// CreateMultipartUpload: the id of the new upload.
+pub(super) async fn create_id(conn: &Conn, key: &ObjectKey) -> Result<String, ObjectStoreError> {
     let query = [("uploads", String::new())];
     let resp = conn
         .send(Method::POST, Some(key), &query, Vec::new(), Bytes::new())
@@ -131,10 +132,16 @@ async fn create(conn: &Arc<Conn>, key: &ObjectKey) -> Result<Upload, ObjectStore
         return Err(failure(resp).await);
     }
     let body = resp.bytes().await.map_err(transport)?;
+    xml::upload_id(&body)
+}
+
+/// CreateMultipartUpload, as an upload that aborts itself if it is dropped open.
+async fn create(conn: &Arc<Conn>, key: &ObjectKey) -> Result<Upload, ObjectStoreError> {
+    let id = create_id(conn, key).await?;
     Ok(Upload {
         conn: Arc::clone(conn),
         key: key.clone(),
-        id: xml::upload_id(&body)?,
+        id,
         open: true,
     })
 }
@@ -174,6 +181,15 @@ async fn upload_part(
     if resp.status() != StatusCode::OK {
         return Err(failure(resp).await);
     }
+    part_etag(&resp, &upload.key, number)
+}
+
+/// The ETag in the answer to the upload of part `number` of `key`.
+pub(super) fn part_etag(
+    resp: &Response,
+    key: &ObjectKey,
+    number: impl fmt::Display,
+) -> Result<String, ObjectStoreError> {
     let etag = resp
         .headers()
         .get(reqwest::header::ETAG)
@@ -181,25 +197,35 @@ async fn upload_part(
         .filter(|v| !v.is_empty())
         .map(str::to_owned);
     etag.ok_or_else(|| {
-        ObjectStoreError::Protocol(format!(
-            "part {number} of {} answered without an ETag",
-            upload.key
-        ))
+        ObjectStoreError::Protocol(format!("part {number} of {key} answered without an ETag"))
     })
 }
 
 /// CompleteMultipartUpload, conditional as `put_new` is when the store claims it. S3
 /// may answer 200 with an `<Error>` body: that is a failure too.
 async fn complete(upload: &Upload, etags: &[String]) -> Result<(), ObjectStoreError> {
-    let conn = &upload.conn;
+    let request = xml::complete_request(etags);
+    let complete = complete_with(&upload.conn, &upload.key, &upload.id, request);
+    complete.await?;
+    Ok(())
+}
+
+/// CompleteMultipartUpload of the upload `id` of `key` with this request body, conditional as
+/// `complete` is. Gives the `ETag` of the object, quotes included, if the answer has one.
+pub(super) async fn complete_with(
+    conn: &Conn,
+    key: &ObjectKey,
+    id: &str,
+    request: String,
+) -> Result<Option<String>, ObjectStoreError> {
     let mut headers = vec![("content-type", "application/xml".to_owned())];
     if conn.capabilities.conditional_put {
         headers.push(("if-none-match", "*".to_owned()));
     }
-    let query = [("uploadId", upload.id.clone())];
-    let body = Bytes::from(xml::complete_request(etags));
+    let query = [("uploadId", id.to_owned())];
+    let body = Bytes::from(request);
     let resp = conn
-        .send(Method::POST, Some(&upload.key), &query, headers, body)
+        .send(Method::POST, Some(key), &query, headers, body)
         .await?;
     match resp.status() {
         StatusCode::OK => {
@@ -207,7 +233,7 @@ async fn complete(upload: &Upload, etags: &[String]) -> Result<(), ObjectStoreEr
             xml::complete_answer(&body)
         }
         // Asked only of a store that claims conditional writes.
-        StatusCode::PRECONDITION_FAILED => Err(ObjectStoreError::AlreadyExists(upload.key.clone())),
+        StatusCode::PRECONDITION_FAILED => Err(ObjectStoreError::AlreadyExists(key.clone())),
         _ => Err(failure(resp).await),
     }
 }

@@ -1,368 +1,385 @@
-# Frontend zero-drop update: bundled proxy, per-stream swap, Postgres side by side
+# Frontends behind kbf-proxy: a pool on one shared state store
 
-> **Retired in part.** The installer's two-slot supervision of the proxy's frontend children
-> (the swap, the takeover, the handover driver, the update API at `/v1/update/frontend` and
-> the `kbf-installer update` client) was removed: `kbf-installer proxy` serves a pool of
-> frontends that run on their own (`[[proxy.frontend]]` tables) and refuses the `upstream`
-> table. Passages below that describe that supervision are history.
+This page says what the code does now. A host's public port belongs to `kbf-proxy`, which
+balances over frontends that run on their own; the frontends share one Postgres state store;
+a frontend is updated by taking it out of the pool, retiring it, restarting it and putting it
+back, one at a time. The crate's API and the decisions behind it are in
+[kbf-proxy-api.md](kbf-proxy-api.md).
 
 The recommended way to update a frontend without failing a build is a load balancer in front of several frontends: [frontends-behind-a-load-balancer.md](../deploy/frontends-behind-a-load-balancer.md).
 
-Status: design for review, 2026-10-18, revised to the owner's answers of that date. Written against `origin/feature/arch-v2`. Claims about code that I did not re-read are listed in section 14 and must be checked by the unit that depends on them (unit U0 does the first ones).
+Removed, and not described here any more: the proxy's two-slot supervision of frontend children
+(starting, adopting, swapping them, the hold of new streams during a swap, the routing of a
+`WaitExecution` by the old child's term, the update API at `/v1/update/frontend` and the
+`kbf-installer update` client), the handover between two frontends of one host (the control
+socket, the takeover and the stand-down, the writer generation and its fence, the relay of calls
+to the successor, the staged readiness, the wait for Envoy's health check) and the admin port a
+frontend served for them. The flags that turned them on are still accepted and do nothing: each
+one given logs a warning (`docs/api.md`, "The admin calls (removed)"). The sections are numbered
+as they were, so that a citation of section 3, 9 or 11 still finds its topic; the numbers of the
+sections that described the removed machinery are not reused.
 
 ## 1. Decisions
 
-1. **One public port per frontend host** (above 1024), owned by `kbf-proxy`, shipped in the `kbf-installer` package as the `kbf-installer proxy` verb. It is a separate unprivileged service (user `kbf-server`, the frontend's own; the first draft said `kbf`), not part of the root helper.
-2. **The proxy terminates TLS for everything on that port**: REAPI, operator API and worker sessions. It verifies a client certificate when one is presented (farm CA, role URI, node id in SAN, EKU), and forwards every stream to the ACTIVE child over loopback with the verified identity (node id, role) as metadata. Routing is per HTTP/2 stream and never sends GOAWAY to a client. No daemon or node release is a prerequisite.
-3. **Children are plain `kbf --mode frontend` processes** that the proxy starts as its own processes and supervises, on loopback ports at fixed per-slot offsets. They trust identity metadata only from the proxy (section 3).
-4. **Side by side on Postgres means one writer for scheduling.** The store-wide generation fence decides who schedules. The old child is read-only for scheduling, may write only its own metadata (section 8), and finishes its open streams from `done/` rows.
-5. **Update order is frontend first.** The swap updates the frontend; the storage nodes and daemons take their release from the host's packages, and the swap sends the new frontend no desired release. An N+1 frontend must serve N nodes (section 9).
-6. **SQLite is dropped with no state migration.** The farm starts fresh on Postgres; cached blobs live on storage nodes and are unaffected (section 11).
-7. **One update at a time** (the API rejects a second). **The proxy updates only with the package**, waiting for idle by default (section 10). **All-in-one** is stop then start, with the proxy holding new streams in between (section 5a).
+1. **One public port per frontend host** (above 1024), owned by `kbf-proxy`, shipped in the
+   `kbf-installer` package as the `kbf-installer proxy` verb. It is a separate unprivileged
+   service (user `kbf-server`, the frontend's own), not part of the root helper.
+2. **The proxy terminates TLS for everything on that port**: REAPI, the operator API and worker
+   sessions. It verifies a client certificate when one is presented (farm CA, role URI, node id
+   in the SAN, EKU), and forwards every stream over loopback to a frontend of its pool with the
+   verified identity (node id, role) as metadata. Routing is per HTTP/2 stream and never sends
+   GOAWAY to a client in a roll or a drain (the proxy's own GOAWAY comes only on its shutdown
+   and on a flood-limit trip: `kbf-proxy-api.md` section 10).
+3. **Frontends are plain `kbf --mode=frontend` processes that run on their own**, each under a
+   unit of its own, on loopback ports at fixed offsets from the `base_port` of its
+   `[[proxy.frontend]]` table. The proxy starts, adopts, restarts and swaps none of them. A
+   frontend trusts identity metadata only from the proxy (section 3).
+4. **Frontends share one Postgres state store and none fences another.** A frontend that opens
+   the store takes no writer generation (section 11); its scheduler writes are conditional on
+   the rows it read, so any number of frontends serve at once, and each takes up the work the
+   store shows it (`docs/design/scheduler.md`, "Frontends that share work").
+5. **An update is a roll, one frontend at a time**, driven by `kbf-updater` through each
+   member's own operator API, not through the proxy: the member drains itself, is installed,
+   restarted and waited for (section 4). The updater does not call the proxy's admin API.
+   Nothing is held, queued or swapped.
+6. **An `all-in-one` process is not a member the updater rolls**: it serves its own storage and
+   daemon, and the pool is of `kbf --mode=frontend` processes. A proxy in front of it is the
+   operator's.
+7. **The state store is Postgres** (section 11).
 
 ## 2. Process model on a frontend host
 
 | Process | User | Listens | Job |
 |---|---|---|---|
-| `kbf-installer run` (root helper) | root | nothing | Verifies and stages releases under `/var/lib/kbf-installer/releases/<commit>/`, reads `orders/`, spawns the unprivileged fetch child. Contract unchanged. |
-| `kbf-installer proxy` (`kbf-proxy.service` + `.socket`) | `kbf-server` | the public port, from systemd socket activation (`O_CLOEXEC`) | TLS, client-certificate identity, routing, hold, update API, child supervision, open-stream accounting. |
-| `kbf --mode frontend`, slot `a` or `b` | `kbf-server` | loopback ports at slot offsets; admin calls on a separate loopback port | The frontend. Plain h2, identity from the proxy only. |
-| Postgres | `postgres` | Unix socket | Shared state (section 11). |
+| `kbf-installer run` (root helper) | root | nothing | Acts on the orders of the pull update path. It starts, stops and updates no frontend: a frontend's binary is `/usr/bin/kbf`, which the package manager replaces. |
+| `kbf-installer proxy` (`kbf-proxy.service` and `.socket`) | `kbf-server` | the public port, from systemd socket activation | TLS, client-certificate identity, routing, the pool and its admin API, open-stream accounting. |
+| `kbf --mode=frontend`, one unit each | `kbf-server` | loopback ports at its `base_port` offsets | A frontend. Plain h2, identity from the proxy only. |
+| Postgres | `postgres` | Unix socket | The shared state (section 11). |
 
-- **The proxy runs as the unprivileged `kbf-server` user** (the frontend's: the children it starts hold the state store and run as that user, as `kbf-frontend@.service` does) and is installed by the kbf-installer package. Only the root part of kbf-installer stages verified releases. The root helper keeps its "no socket, no network" property; the proxy talks to it only through the `kbf`-owned `orders/` directory and `status.json` (the existing spool contract). No new control socket.
-- **Public address.** The packaged `kbf-proxy.socket` listens on port 8980. `[proxy] listen` in `installer.toml` moves it: `kbf-installer setup` writes the drop-in `kbf-proxy.socket.d/listen.conf` (empty `ListenStream=`, then the address) and never restarts the socket; the operator runs `systemctl daemon-reload` and `systemctl restart kbf-proxy.socket`. The proxy itself ignores the key: it takes the socket systemd hands it.
-- **Doc change:** `kbf-installer.md` "no installer network listener" becomes "the root helper has no listener; the `proxy` verb is a separate unprivileged service". Hardening applies per service.
-- **Order to the root half (decided).** The proxy writes a `frontend_update` record into `orders/` carrying only `{order_id, epoch, generation, verb, commit, window_s}` (well under the 4096-byte limit). It carries no components, no attestation and no expected facts: the proxy has no release store. The root half asks the `release_source` in `installer.toml` (a `url` source on a frontend host) what that commit holds (`<base>/releases/<commit>.json` on a `url` source, `ReleaseService.Describe` on a `frontend` source: [kbf-installer.md](kbf-installer.md) section 5, "Describing a release"), fetches the tarball and its attestation bundle by digest, runs the existing verify pipeline and the `--version --json` probe, and **stages without flipping**. Facts (`protocol`, `min_protocol`, `state_schema`, `profile`) appear in `status.json` under `staged{}`; the proxy runs the R1/R4 gate on them. The record cannot name a path or URL, a stolen token can deploy only a signed release, and a downgrade needs `rollback: true` and is recorded.
-- **Supervision.**
-  - Children are not killed when the proxy dies (`KillMode=process`; verify with a real `systemctl restart kbf-proxy`). A restarted proxy adopts them using a `pidfd`, the recorded start time and `/proc/<pid>/exe`, never the bare pid.
-  - Liveness of the generation holder is a Postgres session advisory lock on its dedicated connection. It is released on death, so "the holder is dead" is not a guess from a pid.
-  - **GC pin (decided).** The proxy writes nothing to pin. The root half's `gc` keeps `current`, `previous`, the staged release, and any release directory that a live process's `/proc/<pid>/exe` resolves into (scanned at each `gc`). A running child and the rollback target (`previous`, or the old child's release before confirm) are therefore safe without cooperation. Frontend swaps are Linux-only in this design.
-  - **Boot and `current` (decided).** The proxy has no slots and never writes `current`, `slots/` or `status.json`. Children run `releases/<sha>/kbf` directly (0755). After a reboot the proxy starts `installed_commit` read from `status.json` (0644) as a cold start with an epoch bump (section 8), and fails safe if that release is missing, its `kbf` is not executable, or it has no `VERIFIED` marker (a release the installer did not install).
-  - **Cold start (built).** With no adoptable child and no update in flight, the proxy keeps the startup hold, runs the release's forward migration (the verb's hook is `DbMigrator` on the `installer.toml` database; the schema comes from the release's own `--version --json`; a refusal is an attempt that failed as `migration-failed` and starts nothing), starts `releases/<sha>/kbf` in slot A as a candidate (its pid record is written before the ready wait, so a proxy that dies in between adopts it rather than starting a second), waits for the child's operator `/readyz`, makes it take the generation (no live holder, so the epoch is bumped) and releases the held streams into it. `/readyz` of the proxy is 503 until then. Nothing else is picked: no `releases/current`, no other commit.
-    - **Retries.** A failed attempt (no release recorded, binary missing, not verified, migration, spawn, exit before ready, not ready in 120 s, takeover refused) stops what it started (SIGKILL only for a process that never answered ready, SIGTERM for one a takeover may have reached), waits 2 s, doubling to 30 s, and tries again; ten attempts in all. Then it gives up with the last reason and the streams stay held (`UNAVAILABLE` after `hold_max`) until the proxy is restarted, since a release that failed ten times needs a person.
-    - **What is visible.** Every state change is a log line and the last one replaces `boot.json` in the proxy's state directory: `state` (`starting`, `retrying`, `serving`, `gave-up`), `attempt`, `attempts`, `reason` (a fixed word: `no-installed-release`, `status-unreadable`, `binary-missing`, `binary-not-executable`, `release-not-verified`, `migration-failed`, `spawn-failed`, `exited-before-ready`, `not-ready`, `takeover-failed`, `release-failed`), `fix` (the operator's one line, when it is theirs) and `next_try_s`. No value from the host is in a reason. The update API (U8b) will serve the same record.
-    - **Restart.** A child the proxy started before it restarted is adopted, not duplicated: an active one at once, a candidate (the proxy stopped between its start and its takeover) after it takes the generation. A record whose pid is gone, or is alive with another start time or another executable (a reused pid), is not adopted and nothing is signalled; the cold start overwrites it.
-    - **Hand-placed releases.** A release put on a host by hand has no `VERIFIED` marker and no `state.json`, so `status.json` names nothing and the cold start refuses (`no-installed-release`). `kbf-installer --apply record-release --commit <sha>` fixes it: it checks that `releases/<sha>` and `kbf` are plain, owned by root, not group- or world-writable, that `kbf` and its directory are world-executable (the child does not run as root) and `kbf` is the executable this host runs, then writes the marker and makes the release `current` (refused if the host has another current release). It does not fetch, attest or run the binary: the operator vouches for the commit. `status.json` follows on the installer service's next cycle; restart `kbf-proxy` if its boot already gave up.
-    - **Slot.** Always A: after a reboot nothing runs and no slot is remembered.
-  - Hardening: `OOMScoreAdjust=-900` for the proxy, high `LimitNOFILE`, bounded buffers, header-list caps, h2 rapid-reset and CONTINUATION-flood limits, `catch_unwind` per connection, fuzzed h2 and TLS paths.
+- **The proxy runs as the unprivileged `kbf-server` user**, the frontends' own, so that they can
+  read the secret it writes. The root helper keeps its "no socket, no network" property, and the
+  proxy and the helper exchange nothing.
+- **Public address.** The packaged `kbf-proxy.socket` listens on port 8980. `[proxy] listen` in
+  `installer.toml` moved it: `kbf-installer setup` wrote the drop-in
+  `kbf-proxy.socket.d/listen.conf` (empty `ListenStream=`, then the address) and never restarted
+  the socket. No release ships the socket now, and `setup` writes no drop-in. The proxy itself ignores the key: it takes the socket systemd hands it.
+- **The identity secret.** The proxy writes a 32-byte file under `/run/kbf-proxy/` (tmpfs, so per
+  boot; `RuntimeDirectoryPreserve=yes`, so it survives a restart of the proxy). A frontend is
+  given the file with `--proxy-auth-file` and reads it when it starts.
+- **Order of units.** The proxy needs no order against the frontends: it polls each one's
+  `/readyz` once a second and sends nothing to a frontend that is not ready while another is.
+- Hardening: `OOMScoreAdjust=-900` for the proxy, a high `LimitNOFILE`, bounded buffers,
+  header-list caps, h2 rapid-reset and CONTINUATION-flood limits, a `catch_unwind` per
+  connection.
 
 ## 3. TLS, identity and per-stream routing
 
-**One TLS terminator, one port, the server certificate chosen by SNI.** There is no ALPN demux and no passthrough: every connection is terminated here. The proxy holds a list of server certificates, each with the DNS names it is served for, and presents the one whose name is in the ClientHello's server name (names compare case-insensitively). A ClientHello with no server name, or one nobody configured, gets the certificate the configuration marks `default`; the default is never implied by position. So a Buck2 client that asks for the public name is served the public certificate and verifies it against the public roots, while a farm node that asks for the farm-internal name is served the certificate of the farm CA that it verifies. Which certificates, names and default: section 9 of [kbf-proxy-api.md](kbf-proxy-api.md). ALPN is `h2`, `http/1.1`; reloaded on SIGHUP (the whole list, the keys and the client CA as one unit, or nothing); 0-RTT off. The proxy requests a client certificate that is optional at the handshake; this does not depend on the name the client used.
+**One TLS terminator, one port, the server certificate chosen by SNI.** There is no ALPN demux
+and no passthrough: every connection is terminated here. The proxy holds a list of server
+certificates, each with the DNS names it is served for, and presents the one whose name is in
+the ClientHello's server name (names compare case-insensitively). A ClientHello with no server
+name, or one nobody configured, gets the certificate the configuration marks `default`; the
+default is never implied by position. So a Buck2 client that asks for the public name is served
+the public certificate and verifies it against the public roots, while a farm node that asks for
+the farm-internal name is served the certificate of the farm CA that it verifies. Which
+certificates, names and default: section 9 of [kbf-proxy-api.md](kbf-proxy-api.md). ALPN is
+`h2`, `http/1.1`; 0-RTT is off. The proxy requests a client certificate that is optional at the
+handshake; this does not depend on the name the client used.
 
-**Certificate reload.** `systemctl reload kbf-proxy` runs `/bin/kill -HUP $MAINPID` (`ExecReload=` in the unit). The proxy re-reads every server certificate, key and the client CA together, builds the whole configuration, and swaps it in only if all three make a working one (a certificate already expired is refused). Handshakes that start afterwards use the new one; an open connection and its streams keep the configuration they were accepted under and are not cut. The work runs on the blocking pool; signals that arrive during a reload coalesce. SIGHUP never stops the proxy. A rejected file keeps the old configuration, adds one to `kbf_proxy_tls_reload_failed_total` and writes one line to the journal that names the failure; `systemctl reload` still exits 0, because the signal is asynchronous, so a renewal hook that must know checks the counter or the served certificate. There is no retry: a certificate and key renewed in two writes fail as a mismatch until the signal that follows the second write, so the hook signals after both files are in place.
-- A presented certificate is verified against the farm CA with the existing checks: role URI, node id in SAN, EKU (client auth). A certificate that fails is a handshake failure, not anonymous.
-- **Per path class (installer.toml):** worker and storage-node paths (`/kbf.worker.*`, `Membership`) require a verified certificate with a worker or storage role, else `UNAUTHENTICATED`. REAPI and Buck2 auth is configurable: `buck2_auth = "none"` (network-level, for example Tailscale), `"bearer"` (an API-key header, constant-time compare), or `"mtls"` (verified certificate required). Operator paths take the operator token, and `/v1/update/frontend*` takes the update credential (section 4).
-- **The web UI (`/ui`, `/ui/...`) is open** (ruling 2026-10-20: no auth for now): no certificate and no token are asked for, and only `GET` and `HEAD` pass (any other method is a 405 at the proxy). It is forwarded to the active child's operator listener like an operator call (held during a swap), a path that is not plain segments under it (`..`, `.`, an empty segment, an encoded dot or slash) is a 404, and the `[proxy]` key `ui = false` makes `/ui` a 404. The class is its own: every `/v1` path, `/metrics`, the update API, the worker and the REAPI paths keep the class they had. The proxy adds no security header to a UI answer; the server's pass through unchanged.
+**Certificate reload.** `systemctl reload kbf-proxy` runs `/bin/kill -HUP $MAINPID`
+(`ExecReload=` in the unit). The proxy re-reads every server certificate, key and the client CA
+together, builds the whole configuration, and swaps it in only if all three make a working one
+(a certificate already expired is refused). Handshakes that start afterwards use the new one; an
+open connection and its streams keep the configuration they were accepted under and are not cut.
+The work runs on the blocking pool; signals that arrive during a reload coalesce. SIGHUP never
+stops the proxy. A rejected file keeps the old configuration, adds one to
+`kbf_proxy_tls_reload_failed_total` and writes one line to the journal that names the failure;
+`systemctl reload` still exits 0, because the signal is asynchronous, so a renewal hook that must
+know checks the counter or the served certificate. There is no retry: a certificate and key
+renewed in two writes fail as a mismatch until the signal that follows the second write, so the
+hook signals after both files are in place.
+
+- A presented certificate is verified against the farm CA with the existing checks: role URI,
+  node id in the SAN, EKU (client auth). A certificate that fails is a handshake failure, not
+  anonymous.
+- **Per path class:** worker and storage-node paths (`/kbf.worker.*`, `Membership`) require a
+  verified certificate with a worker or storage role, else `UNAUTHENTICATED`. REAPI and Buck2
+  auth is configurable: `buck2_auth = "none"` (network-level, for example an overlay network),
+  `"bearer"` (an API-key header, constant-time compare), or `"mtls"` (verified certificate
+  required). Operator paths take the operator token.
+- **The web UI (`/ui`, `/ui/...`) is open**: no certificate and no token are asked for, and only
+  `GET` and `HEAD` pass (any other method is a 405 at the proxy). It is forwarded to a
+  frontend's operator listener like an operator call, a path that is not plain segments under
+  it (`..`, `.`, an empty segment, an encoded dot or slash) is a 404, and the `[proxy]` key
+  `ui = false` makes `/ui` a 404. The class is its own: every `/v1` path, `/metrics`, the worker
+  and the REAPI paths keep the class they had. The proxy adds no security header to a UI answer;
+  the server's pass through unchanged.
 - mTLS therefore authenticates who (which node, which role), not only "trusted".
 
-**Identity to the child.** The proxy strips every inbound `x-kbf-*` header, then sets `x-kbf-node-id`, `x-kbf-role` (from the verified certificate; absent when none), `x-kbf-node-ips`, `x-kbf-client-addr` and `x-kbf-proxy-auth`, a per-boot secret.
-- **`x-kbf-node-ips`** (additive; the farm's storage nodes register as `<ip>:8983`, so the child needs the address the certificate names, not only its DNS name). The IP subjectAltNames of the **verified leaf certificate** (never an intermediate), as canonical text (IPv6 compressed), sorted, each once, comma separated with no space: `192.0.2.1` or `192.0.2.1,fd00::1`. At most 16 addresses; a leaf that names more is refused at the proxy like one with two DNS names. Set only with a verified certificate and only when the leaf names at least one address; absent otherwise; always stripped from the inbound request like every `x-kbf-*`. The child believes it under the same conditions as `x-kbf-node-id` (loopback peer, secret) and refuses the call `PERMISSION_DENIED` if it is empty, repeated, oversized, or has any element that is not a canonical address, never reading it in part. `Membership` covers an IP host by exact address equality with those addresses (an IPv4-mapped IPv6 address is not its IPv4 address). **Skew fails closed:** an old proxy sends no header, so a new child sees no addresses and refuses a registration by IP as before; a new proxy's header meets an old child, which strips the unknown `x-kbf-*` and registers nothing by IP as before.
-- **`x-kbf-client-addr`** (additive). The address the client connected to the proxy from, as canonical IP text (an IPv4-mapped IPv6 address unmapped), no port, set on every forwarded request, with or without a certificate. It is the proxy's own reading of the connection, never a client's header (the inbound one is stripped like every `x-kbf-*`). It exists so a child's per-caller bound can tell browsers apart: an open `/ui` request carries no node id, and every browser otherwise connects, as far as the child sees, from the proxy. The child believes it only under the conditions of `x-kbf-node-id` (loopback peer, secret). **Skew:** an old proxy sends none (the child falls back to the peer address); a new proxy's header meets an old child, which strips the unknown `x-kbf-*`.
-- The secret is 32 random bytes in a `0600` file under `/run/kbf-proxy/` (tmpfs, so per boot, and it survives a proxy restart so adopted children keep working). It is read at child start. Not argv, not env.
-- A child accepts identity headers only from a loopback peer that presents the secret (constant-time compare). Otherwise it ignores them and treats the caller as anonymous, so a local process without the secret cannot claim a node id. The child's own `Hello.node_id` check compares against `x-kbf-node-id` instead of the peer certificate.
-- The child's side of this contract (the flag, the gates, what is refused, and the limits) is `docs/api.md`, ["Who may write"](../api.md#who-may-write), section "Behind the farm's proxy".
-- Later alternative (U6): children on a Unix socket in a `kbf`-only directory, trusting `SO_PEERCRED`. It removes the secret, not the headers.
-- **Operator-API trust.** Any "Who may write" gate in `docs/api.md` that relies on "peer is loopback" is open to the public once a proxy forwards. Making those gates identity-header- or token-based is a **hard prerequisite of the proxy merging** (U4a).
-- **Pre-stream limits.** "No timeouts" applies to streams, not to the front door. There are handshake, preface and header timeouts (about 10 s), connection and per-IP caps, and rate limiting before any token check.
+**Identity to the child.** The proxy strips every inbound `x-kbf-*` header, then sets
+`x-kbf-node-id`, `x-kbf-role` (from the verified certificate; absent when none),
+`x-kbf-node-ips`, `x-kbf-client-addr` and `x-kbf-proxy-auth`, a per-boot secret.
 
-**Routing.** The six REAPI paths, ByteStream and `google.longrunning.Operations` (GetOperation) go to the REAPI port, worker and `Membership` paths to the worker port, and `/v1/update/frontend*` is served by the proxy. Every other `/v1/*` path (including `/v1/update/desired`, `/pause`, `/resume` and `GET /v1/update`, which the proxy still forwards and the server answers 404) goes to the operator port. An operator call waits in the bounded hold queue while a swap holds, like any backend stream, and is answered 503 at the bound. `/metrics` is the proxy's own series followed by the active child's operator `/metrics` (never held; the proxy's series alone if the child gives nothing). `/healthz` and `/readyz` are the proxy's view: 200 only if a child is active and ready.
+- **`x-kbf-node-ips`** (additive; the farm's storage nodes register as `<ip>:8983`, so the child
+  needs the address the certificate names, not only its DNS name). The IP subjectAltNames of the
+  **verified leaf certificate** (never an intermediate), as canonical text (IPv6 compressed),
+  sorted, each once, comma separated with no space: `192.0.2.1` or `192.0.2.1,fd00::1`. At most
+  16 addresses; a leaf that names more is refused at the proxy like one with two DNS names. Set
+  only with a verified certificate and only when the leaf names at least one address; absent
+  otherwise; always stripped from the inbound request like every `x-kbf-*`. The child believes
+  it under the same conditions as `x-kbf-node-id` (loopback peer, secret) and refuses the call
+  `PERMISSION_DENIED` if it is empty, repeated, oversized, or has any element that is not a
+  canonical address, never reading it in part. `Membership` covers an IP host by exact address
+  equality with those addresses (an IPv4-mapped IPv6 address is not its IPv4 address). **Skew
+  fails closed:** an old proxy sends no header, so a new child sees no addresses and refuses a
+  registration by IP as before; a new proxy's header meets an old child, which strips the
+  unknown `x-kbf-*` and registers nothing by IP as before.
+- **`x-kbf-client-addr`** (additive). The address the client connected to the proxy from, as
+  canonical IP text (an IPv4-mapped IPv6 address unmapped), no port, set on every forwarded
+  request, with or without a certificate. It is the proxy's own reading of the connection, never
+  a client's header (the inbound one is stripped like every `x-kbf-*`). It exists so a child's
+  per-caller bound can tell browsers apart: an open `/ui` request carries no node id, and every
+  browser otherwise connects, as far as the child sees, from the proxy. The child believes it
+  only under the conditions of `x-kbf-node-id` (loopback peer, secret). **Skew:** an old proxy
+  sends none (the child falls back to the peer address); a new proxy's header meets an old
+  child, which strips the unknown `x-kbf-*`.
+- The secret is 32 random bytes in a `0600` file under `/run/kbf-proxy/`, read by the child at
+  start. Not argv, not env.
+- A child accepts identity headers only from a loopback peer that presents the secret
+  (constant-time compare). Otherwise it ignores them and treats the caller as anonymous, so a
+  local process without the secret cannot claim a node id. The child's own `Hello.node_id` check
+  compares against `x-kbf-node-id` instead of the peer certificate.
+- The child's side of this contract (the flag, the gates, what is refused, and the limits) is
+  `docs/api.md`, ["Who may write"](../api.md#who-may-write), section "Behind the farm's proxy".
+- **Operator-API trust.** A "Who may write" gate that relied on "peer is loopback" would be open
+  to the public once a proxy forwards. Behind the proxy a write is refused unless it arrives with
+  the proxy's secret and passes every other gate, the operator token included.
+- **Pre-stream limits.** "No timeouts" applies to streams, not to the front door. There are
+  handshake, preface and header timeouts (about 10 s), connection and per-IP caps, and rate
+  limiting of wrong tokens before any hashing.
 
-**`WaitExecution` by term (the one call routed by what it says).** For a child with no state store, or for a name of the old form, an operation's name is `operations/{term}-{waiter}`, and the term is the writer generation of the child that named it; the child answers `NOT_FOUND` to a name of another term, on purpose (#154). (A child over a state store names an operation `operations/<id>`: see "Names without a term" below.) A `WaitExecution` that reconnects after a swap names the old child's term, so the active child would not find it. While the old child lives, the proxy therefore binds a `/build.bazel.remote.execution.v2.Execution/WaitExecution` call whose operation name carries the old child's term to the old child (any open slot that is not the active one and whose child has that term); everything else is routed as before, to the active child:
-- *No other path is read.* Only `WaitExecution` has its request read ahead. Every other call is dispatched at its headers, and its message is never looked at.
-- *What is read.* The first length-prefixed message of the request body, `WaitExecutionRequest` field 1 (`name`, a string), parsed by the plain function `term::probe` and bound by `ActiveSlot::bind_preferring`. The read keeps what it reads as part of the request (the replay buffer, `replay.rs`), so the child is sent the request whole. It is bounded: at most 8 frames, a message of at most 512 bytes, and `PEEK_FOR` (2 s) for the message to arrive. A message that is compressed (flag byte not 0), longer than the cap, not whole in time, not a protobuf `name` of the shape `operations/{term}-{waiter}` in canonical decimal, or absent (no body, or trailers first) is not routed by: the stream goes to the active child, which is today's behaviour.
-- *Where the term comes from.* From the child itself. Once a second the proxy asks each open slot's admin port for `GET /v1/admin/role` (with the proxy secret, like every admin call) and keeps the `held_generation` of the answer, recorded with the slot's generation so that a slot opened again (a new child) inherits nothing. `held_generation` is the generation the child took, which is the term its farm machine names operations with. A child that does not answer keeps the term it last gave; a candidate (`null`) or a child that cannot read its store (`0`) has none; an answer of another `admin_protocol` is not read. The term is learned within a poll interval (1 s) of a child taking the generation, plus up to 3 s if the child is slow to answer, long before it is the old one. This reads the one field of the frozen `role` answer (section 10) and adds no new admin verb: the only call is the read-only `GET role`, once a second per open slot. The child's own answer was chosen over the supervisor's slot record, which also reads `held_generation` but would need the installer to push it into the proxy's slots (a change in `kbf-installer`, and a second path to keep right), and over the first operation name a child returns, which does not exist when the old child has answered none yet.
-- *The hold.* The slot is chosen when the stream is bound, after any hold, by the children as they are then: a `WaitExecution` held by a swap binds, when the hold ends, to the old child if its name carries the old term.
-- *After the old child retires.* Its slot is closed, so a stream cannot bind to it: the name goes to the active child, which answers `NOT_FOUND` as before. Nothing is added to the retire rule: a stream bound to the old child holds a permit on its slot like any other, so the old child retires only when it has none and reports no open stream. A retry after a failure before the old child's response head (a refused connect, a GOAWAY, `REFUSED_STREAM`, a fenced answer) looks the slot up again and goes to the old child again while it lives; the attempt cap bounds it to one retry.
-- *Not covered.* A term the proxy has not learned yet (a child that took the generation less than a poll ago, then swapped out at once) is the active child's. A `WaitExecution` for an operation of an older child than the old one is the active child's too.
-- *Names without a term.* A child over a state store names its operations `operations/<id>` (`docs/design/scheduler.md`, "Results across frontends"). Such a name has no dash and no term, so `term::probe` does not route by it: the stream goes to the active child, and any child answers it from the store's rows, the old one included.
+**Routing.** The six REAPI paths, ByteStream and `google.longrunning.Operations` (GetOperation)
+go to the REAPI port of a frontend, worker and `Membership` paths to its worker port, the
+enrollment service to its enrollment port, and every other `/v1/*` and `/ui` path to its
+operator port. A path that matches nothing is answered by the proxy and never forwarded.
+`/v1/update/frontend*` is a path of the proxy's own: once the operator token is checked, the
+built-in handler answers 503, because the proxy has no update API. `/metrics` is the proxy's own
+series (the pool's members among them); `/healthz` and `/readyz` are the proxy's view, `/readyz`
+being 200 while some frontend is up and ready.
 
-**Binding rule.** A client stream binds to the slot that was current when its headers arrived, until the stream closes (the one exception is the `WaitExecution` above, which binds to the old child's slot when its name says the operation is that child's). The bind and the count are one step: the proxy takes a permit together with the slot load. Retire needs all permits of the old slot and "not current". One Buck2 connection therefore carries pre-switch streams to the old child and post-switch streams to the new one. Needs a stress test, and a loom test of the permit.
+**Placement.** A stream is placed on one frontend of the pool when its headers arrive, by one
+pick under the pool's lock: the frontend with the fewest streams open among those that are up
+(not draining) and ready. It stays there until it closes, so one Buck2 connection carries streams
+to several frontends. A `WaitExecution` is routed like any call: an operation's name over a
+state store is `operations/<id>`, which every frontend answers from the store's rows
+(`docs/design/scheduler.md`, "Results across frontends"). The retry rules, the keepalive, the
+flow control and what is done with a child's GOAWAY and resets are section 10 of
+[kbf-proxy-api.md](kbf-proxy-api.md).
 
-**Properties kept from the Envoy spec** (the 45 checks in `envoy/failure.rs` become the proxy test list):
-- No route timeout, no max stream duration. Idle timeout 0 for Execute and WaitExecution, 7200 s elsewhere.
-- **Dead peers.** Downstream PING keepalive (30 s interval, 20 s ack). It closes only dead peers, never a live stream, so it fits the no-timeout ruling. It is what keeps a half-open client from holding the drain open for ever.
-- Retry only before the first upstream response, only on connect failure or REFUSED_STREAM, and only while a bounded replay buffer (the first 64 KB window) still holds the request. Never retry ByteStream.
-- Flow control is per stream. Windows are capped per connection and stream. A client RST is propagated upstream. An upstream reset mid-stream becomes a gRPC `UNAVAILABLE` trailer, not a bare RST.
-- A child GOAWAY (the drain endpoint) stops new streams on that upstream connection. It is never forwarded to a client.
-- Upstream pools open more connections instead of queueing behind long streams. A stream queued on a pool of slot A still counts as bound to A. Test with 5000 held streams plus unary latency.
-- A child health failure does not touch open streams.
+## 4. Updating a frontend
 
-**Fenced-not-committed.** A request whose headers went to the old child just before the flip can reach an enqueue that returns `Fenced`. The child returns a distinct trailers-only "fenced, nothing committed" status only when it is certain nothing committed. The proxy then re-dispatches the buffered request to the active slot. Enqueue is idempotent by request id (section 8), because the proxy cannot always know.
+`kbf-updater` rolls the members of a pool one at a time, before every other host, through each
+member's operator API on loopback at `127.0.0.1:<base + 2>`, and never when the member is the
+last one serving. The proxy is not asked to drain, retire or undrain anything; it stops sending
+to a member whose `/readyz` answers 503 and sends to it again when it answers 200. The steps are
+those of [../deploy/kbf-updater.md](../deploy/kbf-updater.md), "What a roll does with a frontend
+pool member", which is the authority; in short:
 
-## 4. Update API (served by the proxy)
-```
-POST /v1/update/frontend  {commit, request_id, nodes: true, rollback: false, source: "staged"?}
-  202 {update_id, phase}; same request_id returns the same update_id
-  409 another update is open, an old child is still draining, or commit == running
-  409 incompatible {rule}; 422 commit not complete for this platform
-  409 source_refused: a fetch on a host whose release_source is bundled; a staged update
-      with rollback or with nodes. 422 not_staged: the package does not carry that commit
-GET  /v1/update/frontend
-  {update_id, from, to, phase, since, active_slot, restart_pending,
-   rollback_allowed, rollback_blocked_reason,
-   old: {open_streams, oldest_stream_age_s (proxy counts, worker sessions included), open_executions, queued_operations (child reports)}, new: {open_streams},
-   failure: {step, reason} | null, source: "staged"?}
-POST /v1/update/frontend/abort        before "switching"
-POST /v1/update/frontend/rollback     after "switched" while the old child lives and no node updated
-POST /v1/update/frontend/force-retire explicit, needs a reason, counts dropped streams, never automatic
-```
+1. **Peers ready.** Every other member answers `/readyz` 200 for a window in a row.
+2. **Drain.** `POST /v1/frontend/drain` on the member (`docs/api.md`): `/readyz` 503, no new
+   work, GOAWAY on its listeners, a wait for the open executions, and its exit. The updater
+   waits for the exit, or for the drain status to report the phase `closing`.
+3. **Install and restart.** The package is installed on the host (once per host), and the
+   frontend's unit, `kbf-frontend@<name>.service` (`kbf-frontend.service` for the member named
+   `-`), is restarted (`restart frontend=<name>` of `kbf-host-install`). A stop drains: the
+   unit has `TimeoutStopSec=infinity` ([../deploy/kbf-units.md](../deploy/kbf-units.md)).
+4. **Ready.** The updater waits until the member's `/readyz` answers 200 and its `/healthz`
+   reports the commit of the target.
 
-`source` says where the update's release comes from: `fetch` (the default: the installer fetches from the source it is configured with) or `staged` (the release the host's package carries, which the installer tells in `available`). It is written only when it is `staged`, in the request, the status, the request map, `update.json` and the order, and the word `fetch` is read as the default, so the bytes of an update that fetches are what they have always been and a client that sends no `source` works against any proxy. The API refuses a source the host cannot take before it saves or writes anything (the 409 and 422 above); a staged update takes no `nodes` yet.
+An earlier build of the updater drained a member at the proxy, waited for its streams, called
+`POST /v1/frontend/retire` and undrained it at the end. That roll is superseded by the one
+above; the frontend still serves the retire route (`docs/api.md`), and the updater no longer
+calls it.
 
-`active_slot` is the slot of the child that is **serving** now: the old child's until the switch, the new child's from `switched` on, the old child's again after a rollback, an abort or a revert. It is not the candidate's slot while the candidate starts, and it is `null` while no update is known. `kbf-installer deploy` follows the frontend with it (its gates read the serving child's operator port, `base_port + slot offset + 2`, and the child that handed over while it drains: that one, not its successor, reports `kbf_frontend_relay_untraced`). The supervisor that fills it in is U7b's; the API only passes it on, and `proxy/api/tests.rs` pins the values per phase.
+**What each party sees.** Buck2 builds in flight keep their `Execute` and `WaitExecution`
+streams: the member's drain refuses new calls and lets the open executions finish, and the
+calls it still holds when it exits are answered from the store. New calls go to the other
+frontends. Daemons redial and
+keep the runs of their leases: the epoch is the store's, and a frontend that starts keeps it.
+An operator's cordon or drain is a row in the store, so every frontend holds it.
 
+**What a roll does not carry.** Counters restart at 0 in the restarted process (use `rate()` or
+`increase()` over a sum of processes). The views kept in memory (`GET /v1/nodes`, `/v1/leases`,
+`/v1/queue`) list what is connected to that process, and a restarted frontend lists a daemon
+only after it reconnects. An invocation record is built by a process's own recorder from the
+events its own farm sent, and no row of the state store carries it: a build that one frontend
+recorded is not found through `/v1` or the UI on another, and the callers of that build are
+answered from the `done/` rows all the same (the test
+`a_successors_recorder_has_no_record_of_a_build_but_its_caller_is_answered` pins it).
+`action shape:` is logged again, once per key, by the restarted process, and the timer of the
+unservable wait starts again. Two refused writes are not retried: when the store refuses the
+rows of a committed record (an `Effect::Commit`) the farm logs it and drops the effects that
+depended on it, and when it refuses the `done/` row of a finished operation the farm logs it
+and answers its callers from memory; the other frontend recovers such an operation from the
+rows it finds (the lease it was granted, or no result). Only a refused requeue is written
+again (`flush_unsettled`). A kill whose store write was not acknowledged before a crash costs
+at most one extra run or one extra budget step. The memory an operation is booked is the
+highest rung it was raised to; a booking from the last measured peak plus a buffer is not
+built (learned sizes run in shadow and change no booking).
 
-Phases: `accepted, fetching, verifying, staged, preflight, starting, ready, holding, quiescing, switching, switched, baking, nodes, draining, done`, plus `failed` and `rolled_back`.
+**When a step fails**, the roll stops and the frontend is named as draining or not serving in
+the updater's detail; the updater does not start another until an operator has fixed it and
+started a new roll. What the
+operator does is in [../deploy/kbf-updater.md](../deploy/kbf-updater.md).
 
-- **One update at a time (decided).** A second `POST` while one is open, or while an old child drains, gets 409. `force-retire` is the escape.
-- **Staging deadline (decided).** An accepted update that the installer has not staged within 15 minutes of the order being written ends `failed` with `failure{step: stage, reason: timeout}`, and the proxy writes a `revert` for that commit, so a stage the root half may still perform is dropped and the next `frontend_update` is not refused `frontend_busy`. The deadline is configurable, from 1 s to just under the 1800 s an order lives in the spool, and a fetch under way does not move it. A release found staged is used however late. If the `revert` cannot be written the update stays open and the write is tried again. A refusal ends an update with its own word only when `status.json` names the order it answers; any other end of the wait is this deadline.
-- **One state machine, one actor.** All API calls go through a single mutex or actor. Test: fire `POST`, `abort` and `rollback` at once.
-- **State of record (decided).** Facts come from two sources: the installer boundary (`orders/`, `status.json`) for fetch, verify and `installed_commit`, and the Postgres generation holder plus `GET role` for who is active. The store wins any disagreement. Intent comes from one small file, `update.json` in the proxy state dir (`/var/lib/kbf-proxy/`, `kbf:kbf` 0700), written by temp, fsync, rename on every phase change. It holds `update_id`, `request_id`, `from`, `to`, `nodes`, `rollback`, `phase`, `phase_started_wall`, `bake_started_wall`, `nodes_posted`, `old_slot`, `new_slot` and the last 64 `request_id -> update_id` pairs. On restart the proxy reads it, checks it against the facts, and resumes at its phase. If it is missing or corrupt the proxy refuses new updates (`409 state_lost`), leaves both children as the generation holder says, and shows the status red. Test a kill between fsync and the 202.
-- **Auth.** Now: the **operator token**, the same one that guards the operator API (`Authorization: Bearer`, constant-time compare). `setup` creates it as `/etc/kbf/api-token` (32 random bytes hex, 0600, owned by the frontend's user `kbf-server`, only on frontend and all-in-one hosts, never overwritten); `installer.toml` key `[proxy] operator_token_file` points at it. Worker and storage paths use mTLS (section 3); Buck2 auth is separate (`buck2_auth`), rate limited before any hashing, never in a query string or a log. Remote trigger: GitHub OIDC (#1088, `kbf-oidc`) is a second credential for exactly two calls, `POST /v1/update/desired` and `POST /v1/update/frontend`, and only when `[proxy] remote_operator_file` names an allow-list (off by default; section 4a). It sits behind the one function: `Security::authorize_call` tries the operator token first and looks at an OIDC token only for those two calls.
+## 5. Failure behaviour
 
-### 4a. Remote trigger by GitHub OIDC (#1088)
-
-Off unless `[proxy] remote_operator_file` points at a TOML file with a `[remote_operator]` table. There is no other listener: the proxy's one public port serves it, so TLS, the connection limits and the failure limit are the proxy's. TLS is not made mandatory by this; the issuer's keys are fetched over https from the issuer named in the allow-list (the host's root certificates).
-
-A request is admitted by OIDC only if all hold: the method and path are exactly `POST /v1/update/desired` or `POST /v1/update/frontend` with no query string (every other path, including `abort`, `rollback`, `force-retire`, `pause`, `resume` and every `GET`, needs the operator token); the address has not presented too many wrong credentials (the `FailureLimit` of section 3, which a refused token counts against); the bearer is a compact JWS and not the operator token; and `kbf-oidc` accepts it. The token is spent by the first request that passes the verifier, whatever the update API then says.
-
-Where the call goes is where the operator's goes. `/v1/update/frontend` is the update handler of section 4 as it is. `/v1/update/desired` is forwarded to the active child's operator listener with `Authorization: Bearer <operator token>` in place of the OIDC token (the child's write gate takes the operator token and nothing else, and the OIDC token goes no further than the proxy). A key outage at the issuer is 503; every other refusal is 401 with no reason in the body, and a log line with the reason name (never a claim value).
-
-Claims the verifier requires, in the order it checks them (`crates/kbf-oidc/src/lib.rs` is the authority):
-
-| claim | must be | set by |
-|---|---|---|
-| header `alg` | `RS256`; no `jku`, `x5u`, `jwk`, `x5c`, `crit`, `zip`; a `kid` that names a key of the issuer's JWKS (RSA, 2048 bits or more) | fixed |
-| signature | holds under that key | fixed |
-| `iss` | exactly `issuer` (`https://`, no trailing slash; the keys are discovered under it) | `issuer` (required) |
-| `aud` | exactly `audience`, as a string or a one-element array | `audience` (required) |
-| `exp`, `nbf`, `iat` | now within 60 s leeway; `exp - iat` at most `max_token_lifetime_secs` (default 600, at most 3600) | `max_token_lifetime_secs` |
-| `repository_id` | exactly the digits | `repository_id` (required) |
-| `repository` | exactly, if the file names it | `repository` |
-| `job_workflow_ref` | one of the list, each `owner/repo/.github/workflows/<file>@<ref>` | `job_workflow_ref` (required, at least one) |
-| `ref` | one of `refs`, if any are listed | `refs` |
-| `environment` | one of `environments`, if any are listed; when both lists are given both must match | `environments` (`refs` or `environments` is required) |
-| `event_name` | one of `event_names` (default `push`, `workflow_dispatch`; never a `pull_request*` event) | `event_names` |
-| `runner_environment` | exactly (default `github-hosted`) | `runner_environment` |
-| `jti` | present, at most 256 bytes, not seen before (remembered until `exp` plus 60 s; a full memory of 10,000 refuses new tokens) | fixed |
-
-The issuer's keys are fetched on the first token and again when a token names an unknown `kid` (at most every 30 s), and a key set older than one hour is fetched again by the next token, so a key the issuer withdrew stops verifying within the hour. If that fetch fails the keys held stay in use (an issuer outage does not stop deploys; the cost is that a withdrawn key is trusted until a fetch succeeds), and a failed first fetch is a 503. A token whose key is held never waits for a fetch that is under way.
-
-Example, the gamma deploy (RETIRED: `gamma.yml` is deleted and gamma moves to kbf-updater; the example stays as a `workflow_run` token shape) (`gamma.yml`, which runs from a `workflow_run` of the release workflow on main, so its token's `event_name` is `workflow_run`). `/etc/kbf/remote-ci.toml`:
-
-```toml
-[remote_operator]
-issuer = "https://token.actions.githubusercontent.com"
-audience = "<the audience the job asks for>"
-repository_id = "<numeric id of komira-ai/kbf>"
-repository = "komira-ai/kbf"
-job_workflow_ref = ["komira-ai/kbf/.github/workflows/gamma.yml@refs/heads/main"]
-environments = ["gamma"]
-event_names = ["workflow_run"]
-# runner_environment: the default, github-hosted
-```
-
-The ref pin stays meaningful for a `workflow_run` job: GitHub runs it from the copy of the workflow on the default branch, so `job_workflow_ref` names `@refs/heads/main` whatever branch triggered the release run, and a copy of `gamma.yml` on another branch is a different `job_workflow_ref` and is refused. `pull_request_target` (fork code with secrets) is not in `event_names` and the file is refused if it lists any `pull_request*` event.
-
-Listing `workflow_run` trusts the workflow's own guard. The token says only that `gamma.yml` on main ran from some `workflow_run`. It does not say which event started the upstream release run, so the proxy cannot check that. `gamma.yml`'s `if:` requires the upstream run to be a `push` to main of this repository; that condition is what keeps a run started any other way from deploying. Today the gamma deploy calls `kbf-installer deploy --offer` over ssh and presents no token, so this file is the form for when it moves to OIDC. That switch also needs `id-token: write` on the deploy job, which kbf's workflow lint allows only in the attest jobs, so a lint change goes with it.
-
-`sub` is not matched: its form is GitHub's to change, and `repository_id` with `job_workflow_ref` say the same exactly. There is no `setup` flag for the key yet: write `remote_operator_file = "/etc/kbf/remote-ci.toml"` under `[proxy]` by hand (a `setup` rerun keeps it: the key is read and written back with the rest of `installer.toml`); `kbf-installer proxy --check` reads the file. A CI job asks for the token with audience `audience` (`ACTIONS_ID_TOKEN_REQUEST_URL` with `&audience=`) and sends it as `Authorization: Bearer`; a repeated `POST /v1/update/frontend` carries the same `request_id`, as with the operator token.
-
-## 5. Swap sequence (frontend host)
-
-Each step records its phase, then acts, and every action is idempotent, so a crash resumes.
-
-1. **Accept and preflight.** No update in flight, commit not running, `orders/` writable, active child answers. Answer 202.
-2. **Stage** through a `frontend_update` order (section 2): the root half fetches, verifies and probes, then stages without flipping. A failure changes nothing. The proxy starts the candidate from `releases/<sha>/kbf`. The flip comes at step 8, as a `confirm` order.
-3. **Compatibility gate** (section 9): run `releases/<commit>/kbf --version --json`, apply R1 and R4. Refusal is `409 incompatible` naming the rule, before any process starts.
-   **Migrate** (`preflight`, still before any candidate exists; on an all-in-one host after the old process has stopped): the proxy's `DbMigrator` brings the state database to the `state_schema` of the staged release (**Migration** in section 8). A refusal ends the update `failed` at step `migrate` with the old child still serving (all-in-one: restarted) and the staged release dropped.
-4. **Start candidate** in the idle slot with `--await-takeover`, as a child of the proxy. It opens Postgres and only checks the schema version: kbf never alters a table, the migration already ran (**Migration** in section 8). It never bumps the epoch, never takes the generation, and runs no reconciler, scheduler or worker listener. If it exits in 30 s or is not ready in 120 s, kill it, `failed`. The old child is untouched.
-5. **Readiness.** `/readyz`, a `grpc.health.v1` check, and one synthetic `GetCapabilities` through the candidate.
-6. **Hold, quiesce, takeover, swap** (`holding`, `quiescing`, `switching`). The only step with a hold.
-   1. **Hold new streams.** The proxy accepts them and reads their headers but opens nothing to a backend. It does not grant more flow-control window (the per-stream initial window is capped at 64 KB, so at most that is buffered per stream), and the queue is bounded. The limit is `hold_max` (frontend default 15 s, longer than the takeover limit of 10 s). Held streams are released to a slot only after takeover has resolved either way.
-      - **Bypass.** `/v1/update/frontend*`, `/healthz`, `/readyz` and `/metrics` are never held (otherwise `abort` would deadlock); the proxy reads the request head to decide. On HTTP/1.1 there is no multiplexing: the proxy stops reading further requests on that connection until released and, at `hold_max`, answers `503` with `Retry-After`.
-   2. **Quiesce the old child:** it stops scheduling, assigning and requeueing and flushes. It does not wait for running work (that is followed from `done/`). Budget: **3 s** to quiesce, 10 s to take over, 2 s slack, inside the 15 s `hold_max`. A quiesce over 3 s counts as a failed switch (Failure below). An `Assign` is sent only after its lease write commits (section 7). This closes the window in which A assigns while B already holds the generation.
-   3. `takeover` on the candidate: it takes the generation (atomically, section 8), reloads all state from the store, starts reconciler, scheduler and worker listener.
-   4. The proxy swaps the active slot atomically and releases the hold into the new child. Journal `switched`.
-   - **Hold expiry.** After `hold_max` the proxy fails each still-held stream with gRPC `UNAVAILABLE` (retryable) and increments `kbf_proxy_hold_expired_total`. Metrics: `kbf_proxy_held_streams`, `kbf_proxy_hold_seconds`. Expiry does not abort the update.
-   - **Failure.** If takeover fails or exceeds 10 s, the proxy first kills the candidate (it never served; `pidfd`), then reads the generation row and roles, and only then tells the old child to resume. The old child resumes from the store, not from warm memory. Phase `failed`, step `switch`.
-7. **Stand down the old child.** It ends its worker streams with `UNAVAILABLE "connect again"`; the redial is a new stream that the proxy routes to the new child (no connection to close, since nothing is passed through). It keeps serving open Execute and WaitExecution streams from `done/` rows through the follower, with no GOAWAY and no timeout. A `WaitExecution` that reconnects after the swap with an operation name of its term is routed to it, while it lives (section 3, "`WaitExecution` by term"). ByteStream and CAS data-path calls continue (section 8). The relay-to-successor in `relay.rs` is turned off, because the proxy routes new streams: one mechanism only. The `done/` follower stays.
-8. **Bake** (default 5 min, from `bake_started_wall`). The proxy watches the new child. v1 has **no automatic rollback while the proxy runs** (a proxy restart that finds a failed switch before the confirm rolls back, section 6; the confirm has landed when the root's `current` names the new commit, which the restarted proxy reads from `status.json` `installed_commit`); the status shows a red child and the operator runs `rollback`: the proxy sends `stand-down` to the new child and `resume` to the old one, which fully reloads and re-takes the generation. It is refused once any node updated; the swap tells no node, so that holds only for a record an earlier build of the proxy wrote, and the rollback window of a new update stays open through the drain. When bake passes, the proxy sends a `confirm` order naming the staged commit; the root half flips `previous` then `current` (state first). On rollback or abort it sends `revert`, which drops the staged release; `current` was never touched. For this verb the root half does not check `/proc/<MainPID>/exe` (there is no unit); it checks that the named commit is the staged one and that no node-activation swap is pending. Self-confirm by a compromised release is the residual KI section 10 already accepts.
-9. **Nodes.** The swap sends the new child nothing for the nodes: it goes from the bake to step 10, whatever `nodes` says. The nodes take their release from the host's packages. The phase `nodes` and the failure step `nodes` stay in the vocabulary so that an `update.json` an earlier build wrote still reads; a restart that finds that phase goes on to step 10. Node cordon and drain count open streams from either frontend (test: drain a node that has a stream via the old child).
-10. **Drain and retire.** When the proxy's count on the old slot is 0 and the old child reports `open_streams == 0` and `open_sessions == 0`, the proxy sends SIGTERM and never SIGKILL. No timeout. A stuck stream stays visible in status. `releases/` keeps the previous release.
-
-**Hard limit.** A follower that cannot read the store for `DONE_FLOOR` (600 s) can lose a result. The old child fails that stream with `UNAVAILABLE`. Add the metric `kbf_follow_oldest_age_s`.
-
-### 5a. All-in-one swap
-
-One process owns both frontend and storage, so two cannot run side by side. The same proxy and hold step apply, with stop then start:
-1. Stage, verify and compatibility-check as above (steps 1 to 3). The proxy holds new streams (6.1, `hold_max` default 300 s).
-2. The old all-in-one `quiesce`s: it stops taking new actions, finishes its running ones, and releases its storage and its Postgres generation.
-3. The old process exits. The proxy starts the new child, waits for ready, and feeds it the held streams.
-4. A stream still held at `hold_max` gets `UNAVAILABLE` and a metric tick; the update keeps going, because running actions may legitimately outlast the hold. `abort` before the old process exits resumes it.
-Open streams of the old process end when it exits; Execute clients retry and attach to the same op row (section 7).
-
-## 6. Crash behavior
-
-| Crash point | Result |
+| What fails | Result |
 |---|---|
-| Steps 1-3 | No child started. Proxy restarts, reads `update.json` and `status.json`, resumes or fails the order. An update still waiting for the stage is taken up again with the deadline it had (kept with its `request_id`); past it, the update fails on the first look and the `revert` is written. |
-| Steps 4-5, candidate dies | One respawn, then `failed`. On proxy restart the old child is adopted as active and the candidate (never took the generation) is killed. |
-| Step 6 before takeover returns | On restart ask both children `GET role`; the generation holder is active. The hold is in memory and vanishes. |
-| Step 6 after takeover, before the swap | The generation holder is active. The other child gets stand-down. |
-| Old child dies while draining | Its open streams are lost. Unavoidable. Results in `done/` stay. The update continues. |
-| New child dies during bake (proxy up) | If the old child is alive, the operator rolls back; the proxy does not. |
-| Proxy crash during bake | New proxy reads `update.json`, adopts both children, continues bake from `bake_started_wall` (an expired bake passes at once). The restart also checks the store: if the new child, the recorded-active one, is dead or does not hold the generation while the old child lives, the switch failed behind the proxy's back. This is **automatic rollback**, before the confirm only: the proxy records `rolling_back` and `failure{step: switch}` first, then holds, resumes the old child, drops the staged release, and retires the new child (nothing to signal if it is dead; SIGTERM once idle, never SIGKILL). The update ends `failed` with step `switch`, not `rolled_back`, which stays the operator's answer. |
-| Proxy crash, both children dead (after the switch) | Nobody serves. The proxy starts the recorded-active release (the new one) again in its slot, records the process before it waits, waits for ready, and makes it take the generation: a cold start with an epoch bump (section 8). The gate then releases into that slot. A crash in between repeats this: the recorded process is adopted. If the new release cannot start or take over, the update ends `failed`, step `restart`. Before the switch the old release is the one started, and the update ends `failed`, step `restart`. |
-| Proxy crash after the confirm landed (the root's `current` names the new commit) | The boundary is the root, not `update.json`: a restarted proxy at `baking` or later reads `installed_commit` from `status.json`, and the confirm landed iff it equals the update's `to`. That holds for a crash after the root flipped and before `update.json` recorded it (phase still `baking`, with `nodes` true or false). The store wins: the restart never rolls back and neither bakes nor confirms again. A dead new child is started again as above while a live old child is told to stand down and drains; a live new child that does not hold the generation takes over after the old child stands down. The old child is then retired like any other (SIGTERM once idle). The update ends `done`. If that start or takeover fails, `failed`, step `restart`, and the staged release stays. If `update.json` and the root disagree the root wins and the restart notes it: a `failure{step: confirm}` left by an earlier try is cleared when the root holds the new commit, and a phase of `nodes` or later with `current` still naming the old commit is treated as before the confirm (the rollback above). If `status.json` cannot be read, the proxy guesses nothing: the update ends `failed`, step `restart`, with both children as they are, no rollback and no signal. |
-| Proxy crash in the phase `nodes` of an `update.json` an earlier build wrote | The restart goes on to the drain; nothing is sent to the nodes. |
-| Proxy crash during draining | The proxy keeps waiting on the old child's `open_executions`; the old child's proxied streams were already cut by the crash. |
-| Proxy crash | systemd restarts it, socket activation queues new connections. **All client streams through the proxy are cut**, including streams to the old child. A hold in progress is lost (clients retry). Main residual risk of a single front door. Measure it with systemd restart counts and child-side "peer vanished" counters; the proxy cannot count its own crash. |
-| Root installer crash | Not in the data path. Resumes from `orders/`. |
-| Postgres restarts | See ambiguous commits, section 8. Pin `postgresql` restarts out of the unattended-upgrade window or order them with the update. |
+| A frontend dies | Its open streams end, as for any crash. The proxy's poll finds it not ready within a second and sends nothing to it while another frontend is ready. The queue and the leases are in the store, so the others take them up; daemons that were connected to it redial. systemd restarts the unit (`Restart=on-failure`). |
+| The state store is unreachable | A frontend's `/readyz` fails on the store and the proxy prefers a frontend that is ready. A pool whose probes all fail still serves. |
+| The proxy dies | Every client stream through it is cut, including streams to frontends that go on running. systemd restarts it, and socket activation keeps the port, so new connections wait in the accept queue. The frontends keep running and their secret survives. This is the main residual risk of a single front door; it is the reason the proxy changes only with a package. |
+| The root helper dies | Not in the data path. |
 
-## 7. Daemon and storage-node sessions across the swap
+## 9. Compatibility between releases
 
-- A `Worker.Session` is one h2 stream that the proxy routes to the active child. At the flip the old child ends its worker streams with `UNAVAILABLE`, and the daemon's redial is routed to the new child like any new stream. The verified node id is re-sent with each stream, so the new child needs no shared session state. Test: the daemon's second Session is served by the new child over the same TCP connection.
-- **Assign after commit.** A child sends an assignment only after its lease write committed.
-- **Completions.** A child never acknowledges a completion before its commit. The daemon keeps unacked completions and resends them on the new session. The ack follows the commit: the farm acknowledges a `Result` once its record is written, and the daemon forgets a `Result` only on that ack, keeping at most 1024 unacknowledged (`worker-protocol.md`). The new child accepts a completion for a lease granted under the previous session, keyed by lease id, first valid writer wins. There is no separate attempt: a re-grant of an operation gets a new lease id, so a completion of an earlier attempt names a lease the farm no longer holds and is refused as stale. Test: kill the session between send and ack; the result is neither lost nor duplicated.
-- **Reconnect grace.** After takeover the new child does not expire leases of daemons that have not yet redialed. The grace is tied to lease expiry and node heartbeat, not a bare constant (initial value 30 s, configurable). Lease-fenced results (the lease id is the attempt) make a long partition safe: the late result is rejected, not run twice. A daemon with no session and no lease abandons its work.
-- A redial of a known instance is a continuation (`predecessor_instance_id`), not a stale-stream drop. Needs a test, not an assumption.
-- **Execute retry after a cut stream.** Buck2 re-sends Execute. In-flight dedup is a store op row keyed by (instance, action digest), so a new Execute attaches to the existing op, on either child. Test: Execute, kill the proxy, Execute again, assert exactly one run.
-- Storage-node `Membership` and register calls take the same route. Both children may dial nodes during a drain, so a test checks that storage nodes assume no singleton frontend.
+A roll updates the frontends first, and the nodes take their release from their hosts'
+packages, so a frontend of release N+1 serves nodes of release N.
 
-## 8. Postgres side by side
-
-**Fencing must be atomic with the write.** A separate SELECT of the generation before a write lets A pass, B take, and A still commit. Each fenced write does the check inside its transaction (`SELECT gen ... FOR SHARE`, or `UPDATE ... WHERE gen = $1`). After the first `Fenced` the child sets a sticky flag: it stops scheduling, assigning and requeueing, never retries, and does not exit. Test: hold A's transaction open, take over on B, assert A's commit fails or B's takeover waits.
-
-**Who may write which keys during a swap.** Key families below are the names I expect; U0 confirms them against the store.
-
-| Key family | Old child (after takeover) | New child | Why no conflict |
-|---|---|---|---|
-| `lease/`, `lease-by-op/`, `owner/`, `op/` (queue, claim, requeue, assignment state), `epoch`, generation row | none (fenced) | writes | Every write checks the generation in its transaction; the old child's sticky flag stops it after the first `Fenced`. |
-| `inflight/<hex instance>/<action digest>` (the pin of the operation that runs an action) | none (fenced) | writes | Scheduler-owned and fenced like `op/`: written in the transaction that queues the operation, removed in the one that finishes it. The `<hex instance>` is the instance name of the request (the action's cache instance, any name a client sends), not the writing child's own instance id, so the own-instance-key rule below does not apply to it. |
-| Member map, cordons, `update/*`, `desired`, release index, reconciler and controller state | none (fenced) | writes | Same fence. |
-| History index rows of the calls the old child still serves: a chunk row `ui/ichunk/<inv>/<writer>/<seq>` and a header row `ui/invid/<inv>/<writer>`, where `<writer>` is `WriterId::from_instance` of the child's instance id (U0 found no `history/<instance_id>/` or `log/<instance_id>/` rows: history and logs are objects, and the store holds only this index) | writes, unchecked, only in the form the writer writes them | never writes under the old id | The writer id is a function of the process's instance id, so the new child never owns an old child's keys. Each writer keeps a header row of its own, counting its own records, and a reader adds the rows of every writer up, so no row has two writers and nothing is read-modify-written across processes. A chunk row is created and never replaced, so a retry cannot clash. |
-| History inserts that are the same row from either child: `ui/stream/<day>/<stream>/<open ms>`, `ui/obj/<family>/<day>/<name>`, `ui/inv/<instance>/<list ms>/<inv>` | insert, unchecked | insert, unchecked | Insert-only (`Cond::Absent`) and unique by allocation: a stream row's key holds a stream id taken from a counter block or from a process's own fallback range, an object row's key a run id, and no two processes are given the same one (fallback ids start at a point drawn from the writer id, see `Minter::for_writer`); the list entry has an empty value, so the same entry from two writers is one row. Each child puts a list entry at the time of its own first record; the reader shows the one the merged header names and the other is stale. |
-| History rows every writer shares: the stream counter `ui/streams`, `ui/shape/`, `ui/status/`, `ui/statusx/` | none (fenced): its refill of the counter fails and minting takes a fallback stream id; its shape and status writes are dropped and counted as `stage="index"` | writes | Counters and read-modify-write rows would lose an update with two writers. The old child's runs after a takeover leave their shape and status updates to the next generation. |
-| `done/` rows, and the `doneof/` row beside each (the instance name and action of a result) | reads only | writes | The old child follows them to finish its streams, and to answer a client that asks for an operation by name. |
-| CAS blob ownership, ByteStream metadata | idempotent inserts | idempotent inserts | Content-keyed, the same value from either writer. |
-
-The rule in code: a child after `Fenced` or `stand-down` may write only keys carrying its own instance id, plus the unique-by-allocation inserts and the content-keyed data path (`inflight/` carries the request's instance, not the child's, and is fenced with the scheduler rows). A history writer writes through a handle (`kbf_state::OwnKeys`) that sends a transaction around the fence only if every operation of it is one the writer's permit names, and every other transaction through the fence. There is no heartbeat row (`frontend/<instance_id>`): an earlier text of this table guessed one.
-
-**Fence scope.** Scheduler, lease, requeue, reconcile, controller, `update/*` and `desired` writes are fenced. The rows above marked "appends"/"idempotent inserts" are exempt so streams on A do not fail mid-flight after takeover. A `QueryWriteStatus` for an upload that B does not know returns `committed_size = 0` so the client restarts cleanly.
-
-**Idempotent state writes.** Every state write has a unique key and is safe to retry, because a connection that dies after COMMIT leaves the outcome unknown. Test: restart Postgres under 200 streams; no errors, no duplicate runs.
-
-**Epoch rule.**
-- Takeover from a live holder keeps the epoch.
-- A cold start (no live holder) bumps it. This includes the restart that starts the new release again because its child died (section 6); the old child, stood down, holds nothing and does not count as a live holder.
-- A candidate's open and migrations never bump.
-- A rollback takeover is allowed only when the holder is alive and agrees, or demonstrably dead (advisory lock gone). The proxy never asks two children to take the generation at once.
-- Takeover is a full state reload, so a rolled-back child sees the member map, cordons, `desired` and release index that the other child changed. Test: B mutates, roll back, A sees it.
-
-**Schema.** Release N+1 may only expand (additive) while N runs; N+2 may contract. In v1 this is a review rule plus a cross-version CI test, not a `min_reader` table. Rolling back past a contract is not supported and the docs say so. Size `max_connections` for two children plus migrations; use `CREATE INDEX CONCURRENTLY`, avoid table rewrites.
-
-**Migration (decided).** The operator provides the Postgres server and database; `installer.toml` says where (`database`, a `postgres://` URL). kbf-installer creates the schema at `setup` and brings it forward before the new child starts; kbf never alters a table; old and new children run side by side on the same database. The real `Migrator` is `migrator::DbMigrator`; the `Migrator` trait did not change. **`DbMigrator` is wired into the cold start** (`Boot.migrator` is `supervisor::host_migrator`): before the installed release's child starts, the database is brought to the `state_schema` that release declares. `status.json` has the staged release's facts, and the installed release's only until the root half restarts, so the cold start asks the release's own `--version --json` (as the proxy's user, empty environment, 10 s) and requires it to be that commit's release build; one that will not say refuses as `schema_unknown`. A refusal is logged with its word on each attempt (`migration-failed` in `boot.json`, with the operator's fix) and nothing is started. **No database configured:** the proxy refuses to start (`kbf-installer proxy` and `--check` exit 2), not a no-op migration: a frontend or all-in-one host runs on Postgres, so the missing key is a configuration error to fix before any release runs; tests use an explicit fake, never a missing key. On an all-in-one host the cold start has no old process, so its order is the same: migrate, then start. The swap's `Ports.migrator` has no production caller yet (the verb serves no update API until U8b); the same `DbMigrator` is what it will be handed.
-- **Where the migrations live: in the installer, not in the release.** They are the SQL files embedded in this installer build (`crates/kbf-state/src/postgres/migrations/`, the same set `setup` and the root half's `activate` apply), and the release says only which version it needs (`state_schema` in `--version --json`, staged in `status.json`). A schema bump therefore needs the kbf-installer package updated first; a release that needs more than the installer embeds is refused as `installer_too_old`. This departs from carrying SQL in the attested release, for two reasons. (1) One source: `setup` on a fresh database, the root half and the proxy would otherwise have three ways to learn the schema, and a fresh `setup` would need a release to exist. (2) Authority: SQL from a release runs with the operator's database role; keeping it in the package the operator installed keeps the update channel able to name a version number and nothing else (the expand lint reads text and is a review guard, not a security boundary). The cost is real and accepted: a release that adds a table ships the installer package first (KI section 8 already says a state schema bump needs an installer that knows it).
-- **Order and safety.** The `schema_version` table records every applied migration. Each runs in its own transaction with its row, under one transaction-scoped advisory lock (`hashtext('kbf-state-schema')`), so two installers cannot race: the second waits, finds the row, and skips. Migrations are forward-only and numbered from 1 without a gap. The first line of each file marks it `expand` or `contract`; an update runs `expand` only (additive: the lint refuses `DROP`, `RENAME`, `TRUNCATE`, `DELETE`, a type change, `SET NOT NULL` and the other breaking forms), and a release that needs a pending `contract` step, or an unmarked file, is refused as `not_additive` before anything runs. Running again changes nothing. Every lock wait (the schema lock and the locks of the migration's own DDL) ends after 30 s: `database_busy`, that migration rolled back. A migration that fails rolls back its own transaction (earlier additive ones stay, which the old child tolerates).
-- **A rollback of the installer package is refused (intended).** An installer that embeds fewer migrations than the database has (`DatabaseAhead`, word `installer_too_old`) refuses: it cannot know whether the rows above its set are expand steps, so it does not guess. This does not refuse rolling back a *release* under a current installer: the database being ahead of what that release needs is a no-op, and the older kbf starts on the newer schema because everything above its range is expand (its start check accepts it). Downgrading the package means updating it to one that embeds the database's newest migration.
-- **A failure leaves the old child serving.** The swap records `failure{step: migrate, reason: "<word>: <why>"}`, starts nothing, reverts the staged release, and ends `failed`. The words never change: `not_staged`, `installer_too_old`, `not_additive`, `schema_invalid`, `database_busy`, `migration_failed`, `database_error`. The reason carries the server's message for a failed migration and fixed words for an unreachable server.
-- **Credentials.** The database is the one `installer.toml` names, read by the proxy's installer half, as the role in that URL (peer authentication on the local socket is the default). The URL carries no password: the reader refuses one, because the file is world-readable and the kbf child accepts none either; so there is no secret file, and nothing secret to put in argv or a message. The URL is never logged, never put in argv and never quoted: `PostgresConfig`'s `Debug` omits the connection settings, and an unreachable server is reported in fixed words. The server's own refusal of a connection (`FATAL: role "x" does not exist`, `database "y" does not exist`, a `pg_hba` rejection quoting host, user and database) is reduced to its SQLSTATE (`database_error: ... (SQLSTATE 28000)`) in the schema code's errors; the store's own `describe()` keeps the verbatim text for its paths, which do not feed `failure.reason`. Server text about a migration's own statements is kept (it names that migration's objects). The lock wait (30 s) and the connect limit (10 s) are pinned by tests. **A separate migration role is not supported:** the installer and the child connect as the same role, which therefore owns the schema's objects. Supporting one later needs a second key (`installer.toml`), `ALTER DEFAULT PRIVILEGES` so that the child role can use what the migration role creates, and a test that the child cannot alter a table.
-
-**Not provided.** Full concurrency (per-session `session_gen`, batch pull-claim, a `draining` role, per-host generations) is sized L to XL in `split-mode-updates.md` and is deferred. `Store::demote` has no Postgres implementation and none is written, because the fence refuses the old child's writes. **Mandatory test:** a result committed through frontend B reaches a waiter on frontend A.
-## 9. Frontend-first order and compatibility
-
-The frontend host updates via section 5. The swap sends the new child no desired release; the nodes take their release from the host's packages. `kbf-installer deploy` waits on `GET /v1/update/frontend` reaching `done` and no longer posts node updates itself; it then watches `GET /v1/nodes` until every node it saw before the swap is on the commit, since the new frontend lists only the nodes that have reconnected to it (`docs/design/gamma-deploy.md`).
-
-| Rule | Statement | Enforced by |
+| Rule | Statement | Held by |
 |---|---|---|
-| R1 | The new frontend accepts every protocol from `min_protocol` up. A release never raises `min_protocol` in the release that introduces new behavior. | Preflight: `new.min_protocol <= oldest_protocol` of the active child's `/v1/nodes` and `/v1/members` (R1's input, below). |
-| R4 | Node updates are driven only by the generation holder. The server no longer has a desired release or `POST /v1/update/desired` (it answers 404), so the rule has no route to bind until node updates are driven again. | The store's generation fence refuses a superseded holder's writes; no task of this build drives the node updates (the update controller was removed), so the holder rule has no runner to bind until one returns. The age check on the build `seq` (`kbf --version --json`) remains in `release/age.rs` and `release/target_seq.rs`; no route calls it now. |
-| C1 | Shipped daemons check `Welcome.protocol_version == PROTOCOL_VERSION`, which cannot be fixed in old daemons. | The N+1 frontend sends `Welcome.protocol_version = min(hello protocol, own)` (`negotiate`, `crates/kbf-server/src/worker.rs`). The cross-version test (below) runs a daemon built from the pinned commit of release N against the tip's frontend. |
+| R1 | The new frontend accepts every protocol from `min_protocol` up. A release never raises `min_protocol` in the release that introduces new behavior. | The worker handshake (`negotiate`, `crates/kbf-server/src/worker.rs`) and the cross-version test below. The server reports the inputs (`oldest_protocol`, `protocol_unknown`), and no frontend compares them before a roll. |
+| R4 | A release offered to move to must not be older than the running build, by build `seq` (`kbf --version --json`, never by the text of a commit); a rollback skips the check. | `release/age.rs` in `kbf-server`, a pure decision on two builds' seqs. No route calls it now. |
+| C1 | Shipped daemons check `Welcome.protocol_version == PROTOCOL_VERSION`, which cannot be fixed in old daemons. | The N+1 frontend sends `Welcome.protocol_version = min(hello protocol, own)` (`negotiate`). The cross-version test runs a daemon built from the pinned commit of release N against the tip's frontend. |
 
-**R1's input.** `GET /v1/nodes` and `GET /v1/members` each carry `oldest_protocol`, the least `protocol` among the entries that name one, and `protocol_unknown`, how many name none; the unknown are never folded into the oldest (`docs/api.md`). A daemon's `protocol` is the version the `Welcome` of its newest stream named (the lesser of its first `Hello`'s and the newest the server speaks) and stays after the stream closes, so `/v1/nodes` counts every daemon the child has registered, connected or not. A member's is the version its registration named; a `down` member's row has expired with its heartbeats and a row written before the field existed names none, so both are unknown. `/v1/nodes` lists no daemon that has not connected to this process (an empty list right after a swap is not "no nodes"; `/v1/members` is read from the store and has no such gap), and the check itself (`CompatGate`) is not made by the server.
+**R1's input.** `GET /v1/nodes` and `GET /v1/members` each carry `oldest_protocol`, the least
+`protocol` among the entries that name one, and `protocol_unknown`, how many name none; the
+unknown are never folded into the oldest (`docs/api.md`). A daemon's `protocol` is the version
+the `Welcome` of its newest stream named (the lesser of its first `Hello`'s and the newest the
+server speaks) and stays after the stream closes, so `/v1/nodes` counts every daemon the process
+has registered, connected or not. A member's is the version its registration named; a `down`
+member's row has expired with its heartbeats and a row written before the field existed names
+none, so both are unknown. `/v1/nodes` lists no daemon that has not connected to this process
+(an empty list right after a restart is not "no nodes"; `/v1/members` is read from the store and
+has no such gap).
 
-Stated limits, written in the docs rather than enforced in v1: the member-map floor is not set by an operator. A fresh map starts at the oldest protocol the frontend accepts (`OLDEST_PROTOCOL`, not its own newest `PROTOCOL`, which would lock N nodes out) and every later map carries `max(stored floor, OLDEST_PROTOCOL)`; `register` judges a node against that floor, read from the store, and not against a constant (tests: `a_fresh_stores_first_map_floor_is_the_oldest_protocol_the_build_accepts`, `members_floor`). Storage nodes do not enforce `Map::min_protocol` today. The floor never falls: a frontend rolled back to a build with a lower oldest keeps the stored floor, which is the flag day named next. An operator-set floor waits for R1 to read the members' protocols. Rollback across a protocol bump after nodes updated is a flag day (stop nodes, downgrade, start); several frontend hosts need a minimum-over-hosts rule, deferred with multi-host.
+Stated limits, written in the docs rather than enforced: the member-map floor is not set by an
+operator. A fresh map starts at the oldest protocol the frontend accepts (`OLDEST_PROTOCOL`, not
+its own newest `PROTOCOL`, which would lock N nodes out) and every later map carries
+`max(stored floor, OLDEST_PROTOCOL)`; `register` judges a node against that floor, read from the
+store, and not against a constant (tests: `a_build_as_shipped_floors_its_first_map_at_its_oldest_protocol`,
+`members_floor`). Storage nodes do not enforce `Map::min_protocol` today. The floor never falls:
+a frontend rolled back to a build with a lower oldest keeps the stored floor, which is the flag
+day named next. Rollback across a protocol bump after nodes updated is a flag day (stop nodes,
+downgrade, start).
 
-**Cross-version test.** `kbf-cell cross-version` (`crates/kbf-integration-test/src/cross_version.rs`) runs a frontend (`kbf-server`) from one directory of binaries and a daemon (`kbf-daemon --driver fake`) from another over the real worker protocol (handshake, registration and heartbeats; no work is offered), on loopback over mutual TLS. `--server-dir` and `--daemon-dir` each hold `kbf` and their binary; `--installer-dir` names the release whose installer is on the hosts. The `cross-version` job of `beta.yml` (a push to main, not the pull-request gate) builds the tip and release N, the commit `OLD_COMMIT` names, and runs both directions: an N+1 frontend with N daemons, and an N frontend with N+1 daemons, the installer of N+1 in both. A published release is not needed to have an N: a build of a pinned commit is one. Its steps, in order, each bounded by `--wait`:
+**Cross-version test.** `kbf-cell cross-version` (`crates/kbf-integration-test/src/cross_version.rs`)
+runs a frontend (`kbf-server`) from one directory of binaries and a daemon (`kbf-daemon --driver
+fake`) from another over the real worker protocol (handshake, registration and heartbeats; no work
+is offered), on loopback over mutual TLS. `--server-dir` and `--daemon-dir` each hold `kbf` and
+their binary; `--installer-dir` names the release whose installer is on the hosts. The
+`cross-version` job of `beta.yml` (a push to main, not the pull-request gate) builds the tip and
+release N, the commit `OLD_COMMIT` names, and runs both directions: an N+1 frontend with N
+daemons, and an N frontend with N+1 daemons, the installer of N+1 in both. A published release is
+not needed to have an N: a build of a pinned commit is one. Its steps, in order, each bounded by
+`--wait`:
 
-1. Each directory's `kbf --version --json` states `min_protocol`, `protocol` and `state_schema`, and the `kbf-server` or `kbf-daemon` beside it names the same commit (a directory that mixes two builds fails). The builds must be compatible, as the handshake makes them: the server refuses a `Hello` below its `min_protocol` and answers any other with the lesser of the `Hello`'s version and its own `protocol`, and a daemon takes a `Welcome` from the oldest version it speaks up to the one it sent (`negotiate`, and `welcome::acceptable` in `kbf-daemon`). So the daemon's `protocol` must be at least the server's `min_protocol` (R1: a release that raises `min_protocol` past a shipped daemon fails here), and the server's `protocol` at least the daemon's `min_protocol`. A daemon newer than its frontend is compatible, and is welcomed at the frontend's newest. A server from before `negotiate` clamped a newer `Hello` refuses such a daemon: release N must be a commit that has it.
-2. The installer goes first. The installer of `--installer-dir`'s release must be able to stage both builds: `kbf_installer::stage::understood`, the check the installer's staging applies, refuses a release that declares a `protocol`, `min_protocol` or `state_schema` above what the installer understands (`installer_too_old`). An installer never updates itself, so a kbf that raises one of the three can only follow its installer; the reverse order fails. What an installer understands is what the `kbf` of its release declares (the installer's `supported()` is raised with the release; `the_installer_understands_what_kbf_declares` pins that it is never below it). Without `--installer-dir` the order is not checked and the run says so.
-3. A probe `Hello` over the same mutual TLS as a daemon: at the daemon's protocol it is welcomed as the lesser of that and the server's `protocol`; one above the server's `protocol` is welcomed as the server's `protocol`; one below its `min_protocol` is refused FAILED_PRECONDITION naming the version.
-4. `kbf-daemon` logs `welcomed` (when it does not, the failure carries the `reason=` of the daemon's own log: the facts come from `kbf --version --json`, which reports the server's constants, so a daemon whose own range differs is told apart only there). The session is then held for eight heartbeat intervals (the server runs with `--heartbeat-interval-ms 250`): the daemon must stay up, and neither log may say a heartbeat went unacknowledged, the session ended, or a message did not parse (a heartbeat whose shape changed without a version bump passes the handshake and fails here).
-5. `GET /v1/nodes` lists the node connected, at the session's protocol when the entry carries one.
+1. Each directory's `kbf --version --json` states `min_protocol`, `protocol` and `state_schema`,
+   and the `kbf-server` or `kbf-daemon` beside it names the same commit (a directory that mixes
+   two builds fails). The builds must be compatible, as the handshake makes them: the server
+   refuses a `Hello` below its `min_protocol` and answers any other with the lesser of the
+   `Hello`'s version and its own `protocol`, and a daemon takes a `Welcome` from the oldest
+   version it speaks up to the one it sent (`negotiate`, and `welcome::acceptable` in
+   `kbf-daemon`). So the daemon's `protocol` must be at least the server's `min_protocol` (R1: a
+   release that raises `min_protocol` past a shipped daemon fails here), and the server's
+   `protocol` at least the daemon's `min_protocol`. A daemon newer than its frontend is
+   compatible, and is welcomed at the frontend's newest. A server from before `negotiate` clamped
+   a newer `Hello` refuses such a daemon: release N must be a commit that has it.
+2. The installer goes first. The installer of `--installer-dir`'s release must be able to stage
+   both builds: `kbf_installer::stage::understood`, the check the installer's staging applies,
+   refuses a release that declares a `protocol`, `min_protocol` or `state_schema` above what the
+   installer understands (`installer_too_old`). An installer never updates itself, so a kbf that
+   raises one of the three can only follow its installer; the reverse order fails. What an
+   installer understands is what the `kbf` of its release declares (the installer's `supported()`
+   is raised with the release; `the_installer_understands_what_kbf_declares` pins that it is
+   never below it). Without `--installer-dir` the order is not checked and the run says so.
+3. A probe `Hello` over the same mutual TLS as a daemon: at the daemon's protocol it is welcomed
+   as the lesser of that and the server's `protocol`; one above the server's `protocol` is
+   welcomed as the server's `protocol`; one below its `min_protocol` is refused
+   FAILED_PRECONDITION naming the version.
+4. `kbf-daemon` logs `welcomed` (when it does not, the failure carries the `reason=` of the
+   daemon's own log: the facts come from `kbf --version --json`, which reports the server's
+   constants, so a daemon whose own range differs is told apart only there). The session is then
+   held for eight heartbeat intervals (the server runs with `--heartbeat-interval-ms 250`): the
+   daemon must stay up, and neither log may say a heartbeat went unacknowledged, the session
+   ended, or a message did not parse (a heartbeat whose shape changed without a version bump
+   passes the handshake and fails here).
+5. `GET /v1/nodes` lists the node connected, at the session's protocol when the entry carries
+   one.
 
-While every build declares the same numbers (all 1 today) a pair cannot be incompatible, the order cannot fail, and the lower edge of the window is protocol 0, which any server refuses: the run says each is not exercised. The cell's own checks run in the pull-request gate against fakes (`crates/kbf-integration-test/tests/cross_version.rs`), each red on the defect it names: a raised `min_protocol`, a daemon whose oldest is past the server's newest, a mixed directory, a server that refuses a newer daemon or welcomes it at a version it does not speak, an installer older than the kbf it stages in each of the three numbers, for the frontend's build and for the daemon's, a session that logs a heartbeat gap, an ended session or a message that did not parse. Not covered yet: any message after the heartbeat (`Start`, `Result`, `NodeStatus`, `UpdateStatus`: the cell offers no work, so the fake driver never runs an action), the real `kbf-installer` binary (an installer's numbers are modelled by its release's `kbf --version --json`, and an old installer's `supported()` is assumed equal to that), and the first-crossing case of a daemon whose certificate carries no role (re-enrolment).
+While every build declares the same numbers (all 1 today) a pair cannot be incompatible, the
+order cannot fail, and the lower edge of the window is protocol 0, which any server refuses: the
+run says each is not exercised. The cell's own checks run in the pull-request gate against fakes
+(`crates/kbf-integration-test/tests/cross_version.rs`). Not covered yet: any message after the
+heartbeat (`Start`, `Result`, `NodeStatus`, `UpdateStatus`: the cell offers no work, so the fake
+driver never runs an action), the real `kbf-installer` binary (an installer's numbers are
+modelled by its release's `kbf --version --json`, and an old installer's `supported()` is assumed
+equal to that), and the first-crossing case of a daemon whose certificate carries no role
+(re-enrolment).
 
-**First crossing.** The first update to a release with this layout cannot be a swap. It is a stop and start with a fresh Postgres (section 11), done by installing the kbf and kbf-proxy packages (package-update design; the `kbf-installer migrate` verb is deleted) without any state copy.
+**First crossing.** The first update to a release with this layout cannot be a roll. It is a
+cold cutover: stop every frontend of an earlier release, then start this one
+([../deploy/state-store-cutover.md](../deploy/state-store-cutover.md), "Moving to frontends
+that share the store"; the database is kept). A SQLite or fresh store is section 11.
 
-## 10. The proxy's own update
+## 11. Postgres and the shared state store
 
-- `kbf-installer` updates only by apt or brew. The package installs a new binary and does not restart the running proxy; `GET /v1/update/frontend` shows `restart_pending: true` while the running proxy is not the installed binary (compared by file identity; no marker, no maintainer script).
-- **Decided:** `kbf-installer restart-proxy` waits for zero open streams by default (`--now` overrides). Socket activation keeps the listening socket, so new connections wait in the accept queue, and children keep running and are adopted.
-- **What is dropped with `--now`:** every open client stream through the old proxy, including worker sessions (daemons redial in seconds). Buck2 does not recover a broken stream, so a build in flight fails. Acceptable because the proxy changes with package releases, not kbf releases. A hot restart with `SO_REUSEPORT` is possible and is not planned.
-- **Frozen contract** between proxy and children: ports, `/readyz`, the identity headers (`x-kbf-node-id`, `x-kbf-role`, `x-kbf-node-ips`, `x-kbf-client-addr`, `x-kbf-proxy-auth`; a header is added only additively, old on one side meets new on the other as in section 3), and the admin calls `takeover`, `quiesce`, `stand-down`, `resume`, `role`, versioned as `admin_protocol` in `kbf --version --json` (replacing `handover_protocol` from #1054). `resume` (built in U2) is the inverse of `quiesce`/`stand-down` while the process lives: full reload from the store, then re-take of the generation if the holder is dead or agrees. The proxy sends it on takeover failure, `abort` and rollback. The proxy itself reads one field of the `role` answer, `held_generation`, once a second per open slot: it is the term of the child's operation names, and the proxy routes a `WaitExecution` by it (section 3). A child that renames or drops the field, or whose operation names stop carrying the generation it took, breaks that routing without an error, so a change to either raises `admin_protocol`. The three crash points the U7 proof names: before takeover returns, after takeover before the swap, and the old child dying while draining.
+**Placement.** One Postgres from the OS package per frontend host, on a Unix socket only,
+database `kbf` and role `kbf-server`, peer authentication (no password in argv or env), URL
+`postgres:///kbf?host=/run/postgresql&user=kbf-server`. `synchronous_commit` stays on and the
+store checks it at open. `kbf-installer` has `Suggests: postgresql`, not `Depends`: the package is
+shared by node hosts, and apt installs `Recommends` by default; `setup --mode=frontend|all-in-one`
+refuses clearly when no server answers. `setup --mode=frontend|all-in-one` with no `--database`
+creates that role and database as the server's superuser over the socket (peer, no password;
+`--create-local-database` does the same for a URL given); it never edits `pg_hba.conf` or
+`pg_ident.conf`, prints the exact lines to add and refuses, naming the missing rule, when the
+server does not admit a login (`docs/deploy/kbf-installer-setup.md`, "The state database").
+Off-host Postgres (client TLS) is out of scope. A `sqlite://` URI still starts in this release
+and logs a warning that SQLite is removed in the next; a SQLite file is held by one process, so
+a second frontend over it is refused.
 
-## 11. Postgres, SQLite removal, fresh start
+**Shared writers.** A frontend that opens a Postgres store calls `kbf_state::share`, which leaves
+the row `meta/generation` holding the marker `shared-writers` (`kbf_state::SHARED_WRITERS`): an
+absent-only write for a store with no row, a write conditional on the version read for a row that
+holds a generation, nothing for a row that holds the marker, so frontends that open the store
+together agree. The marker is not eight bytes, so a build that takes generations reads the row as
+corrupt and refuses to start on the store. No frontend takes or checks a generation, and the
+writes of a scheduler are kept apart by the rows they read. The move from generations to the
+marker is a cold cutover: every frontend of an earlier release is stopped before the first one of
+this release is started ([../deploy/state-store-cutover.md](../deploy/state-store-cutover.md#moving-to-frontends-that-share-the-store)).
 
-**Placement.** One Postgres from the OS package per frontend host, on a Unix socket only, database `kbf` and role `kbf-server`, peer authentication (no password in argv or env), URL `postgres:///kbf?host=/run/postgresql&user=kbf-server`. `synchronous_commit` stays on and the store checks it at open. `kbf-installer` has `Suggests: postgresql`, not `Depends`: the package is shared by node hosts, and apt installs `Recommends` by default; `setup --mode=frontend|all-in-one` refuses clearly when no server answers. `setup --mode=frontend|all-in-one` with no `--database` creates that role and database as the server's superuser over the socket (peer, no password; `--create-local-database` does the same for a URL given); it never edits `pg_hba.conf` or `pg_ident.conf`, prints the exact lines to add and refuses, naming the missing rule, when the server does not admit a login (`docs/deploy/kbf-installer-setup.md`, "The state database"). Off-host Postgres (client TLS) is out of scope until a second frontend host is planned. All-in-one gets the same dependency; the SQLite default and `STATE_FILE` go away.
+**Epoch.** A frontend that starts keeps the stored epoch, and so does a second frontend over
+the same store; only `POST /v1/epoch/bump` raises it (`docs/api.md`). Ids are reserved in blocks
+in the store, so a restarted or second frontend never hands out an id another took.
 
-**Backup.** Postgres is a runtime dependency the operator provides, so its backup and restore are the operator's: kbf ships no backup timer and no backup or restore verb. A host that an earlier build set up with `kbf-backup.timer` has it disabled by `setup`.
+**Rows.** The rows are documented where they are written: the scheduler's (`op/`, `queue/`,
+`lease/`, `done/`, `cordon/` and the `meta/` counters among them) in
+`crates/kbf-server/src/farm/durable.rs`, membership in `crates/kbf-server/src/members.rs`,
+enrollment in `crates/kbf-enroll-registry`, and the history index (`ui/`) in `crates/kbf-history`.
 
-**No migration (decided).** The current state is dropped and the farm starts fresh on Postgres. There is no `kbf state migrate`. Cached blobs live on storage nodes and are unaffected.
-- **What the owner loses:** the member map and enrollment (nodes enroll again), cordons, `desired`, the release index, run history and `done/` rows. In-flight work is dropped, so the cutover is drain-then-stop: no running builds. U0 checks that a storage node re-registers its existing blobs without re-upload, and that the member-map floor of a fresh store does not lock out N nodes (section 9).
-- **Epoch:** a fresh store starts a new epoch; daemons discard old-epoch work, and nothing is running.
-- **Order.** U0 verifies. U1/U2 wire Postgres (at the tip `kbf-units.md` says Postgres is "not wired yet", the `state-store` rule refuses `postgres://`, and there is no `Store::demote`) and run the whole test matrix on both backends. The farm cutover is a held script (dry run by default, never forcing) that needs the owner's go per host: stop, install Postgres, start the new layout, re-enroll nodes. Rollback before cutover is restarting the SQLite unit; the file is untouched, and a Postgres row is never copied back.
-- **Delete SQLite last (U3b)**, once the farm runs on Postgres and the owner confirms there is no second host. `Store::demote` and the baton go in that unit. `rusqlite` leaves `cargo tree`.
+**Schema.** `kbf boot-check`, the first `ExecStartPre=` of the frontend and all-in-one units,
+brings the state database to the schema the build embeds (`state_schema` of `kbf --version
+--json`) with expand-only migrations, each in its own transaction under one advisory lock, and
+refuses the start when it cannot. A database already at that schema, or past it, is left alone.
+Frontends of two builds run side by side during a roll, so release N+1 may only expand the
+schema while N runs. Every lock wait ends after 30 seconds. The connection URL is never logged.
 
-## 12. PR plan
+**Backup.** Postgres is a runtime dependency the operator provides, so its backup and restore are
+the operator's: kbf ships no backup timer and no backup or restore verb. A host that an earlier
+build set up with `kbf-backup.timer` has it disabled by `setup`.
 
-Owners are left blank. Order: U0, then U1/U2, U3a and the farm cutover, then U4a, U4b, U5, U7a, U8a, U7b, U8b, U9, then merge #1091, then U7c, U3b. U7a and U8a build against traits and fakes and can start now.
-
-**Installer PRs these units need** (KI section 9): P1 skeleton and golden fixtures (#1048), P2 layout and state schema 2 (#1053), P4 `orders/` reader and status writer (#1037), P5 `run` with gc (#1051), P8 verify pipeline (#1050), P7 fetch child and URL source (#1084). U7b and U8b need all six merged; U7a and U8a need none.
-
-| Unit | Content (crate/files) | Depends on | Proof |
-|---|---|---|---|
-| U0 | Verify first (report plus a failing test per false assumption): `Fenced` survivable in reconciler and requeue; Unix-socket URI parses; `Store` key families as in section 8; atomic fence; blobs re-register after a fresh store. | none | Everything below depends on it. |
-| U1 | Postgres in `kbf-server` and `kbf-all-in-one`: `StateStoreUri::Postgres`, `kbf-deploy` unit rule, flags, epoch rule, `synchronous_commit` check. | U0 | `frontend`, `state_store`, `history` tests on both backends; a CI job and image exist or are added. |
-| U2 | `kbf-server`: `--await-takeover`, `takeover`, `quiesce`, `stand-down`, `role`; atomic fence and sticky flag; own-instance-key write rule; full reload; idempotent writes. | U1 | Two children on real Postgres: 50 Executes on A, takeover on B, all finish through A. Mutants: skip the generation take; assign before commit; non-atomic fence; old child writes a foreign key. Each must go red. |
-| U3a | `kbf-installer` / `kbf-deploy`: held fresh-start cutover script (no state copy). | U1 | Dry run on a copy of the layout; node re-enroll check. |
-| U4a | `kbf-server`: accept `x-kbf-node-id`/`role` only from loopback with the per-boot secret; bind `Hello.node_id` to it; identity- or token-based write gates. | U0 | Header without secret ignored; forged node id refused; direct non-loopback call refused. |
-| U4b | `kbf-proxy` library and `proxy` verb, static upstream table: TLS termination, optional client cert and role checks, Buck2 auth modes, per-stream routing, permits, hold gate, keepalive, replay buffer. | U4a | Fake upstreams: 200 streams on A, flip to B, every A stream completes with no GOAWAY or RST. Idle 3 h under paused time not closed. ByteStream not retried after the first frame. Hold: 1000 held streams buffer at most the window, expire to `UNAVAILABLE`. Mutants: GOAWAY on flip, per-connection routing, trusting an inbound `x-kbf-node-id`, a window with no active child. |
-| U5 | `kbf-daemon`, storage node, `kbf-server`: resend unacked completions; lease-fenced results; `Welcome` echoes min protocol. | U0 | Real released-N fixture against N+1; kill the session between send and ack. |
-| U6 (later) | Children on Unix sockets with `SO_PEERCRED` instead of loopback ports and secret. | U4b | Socket-path and peer-uid tests. |
-| U7a | `kbf-installer`: supervisor and swap core behind `ChildControl`, `OrderWriter` and `Clock` traits, `update.json`, hold/quiesce/takeover/resume logic, rollback. | U2 | Fake-child tests for every phase and the three crash points; mutants: swap before takeover resolves, resume without reload, lost `update.json`. |
-| U7b | `kbf-installer`: real child control and adoption, units, socket, postinst marker, all-in-one stop/hold/start, `frontend_update`/`confirm`/`revert` orders. | U7a, U4b, P1, P2, P4, P5, P7, P8 | Soak (below) and an all-in-one swap with 200 held streams fed to the new child. |
-| U7c | Deletions: `EnvoyCheck`, the `Type=notify` handshake, `kbf-cli/src/handover.rs`, relay-to-successor in `kbf-server`, leftovers in `kbf-front`. Rewrites `frontend/handover.rs` and `frontend_drain.rs`. | U7b, #1091 | Grep and `cargo tree` show none remain; server tests pass. |
-| U8a | `kbf-installer`: update API actor, operator-token auth, idempotency, status, rate limits, routes behind traits. | U4b (types only) | Auth matrix; 409 and 422; idempotent `request_id`; concurrent call test. |
-| U8b | `kbf-installer`: wire U8a to `orders/`, `status.json` and the proxy; `force-retire`; OIDC seam (#1088: `kbf-oidc`, section 4a). | U8a, U7b, P1, P2, P4 | End to end on fake children and a fixture spool. |
-| U9 | R1 and R4 gates, controller generation gate, member-map floor fix, `deploy` default, cross-version test. | U2, U8 | Planted `min_protocol` raise red; two controllers without the gate red. |
-| U3b | Delete SQLite, `STATE_FILE`, baton, `Store::demote`. | farm on Postgres | `rusqlite` gone from `cargo tree`. |
-| U12 | Docs: `frontend-handover.md`, `aio-handover.md`, `kbf-installer.md`, `split-mode-updates.md`, `architecture-v2.md`, `kbf-units.md`, `kbf-modes.md`. | all | Wording matches code. |
-
-**Cut from v1 (seams only):** off-host Postgres and client TLS, `min_reader` table, auto-rollback, a crash-point harness at every phase, hot proxy restart, multi-host rule.
-
-**Soak** (in `kbf-integration-test`, on the farm, real child processes; run by U4b and U7b): 200 concurrent streams on one h2 connection (held Execute and WaitExecution, ByteStream with checksums, unary) plus worker sessions with client certificates. Mid-run, the full swap. Assert: every pre-flip stream ends OK with the right payload; every post-flip stream is served by the new child (child id in a response header); the node id seen by the child equals the certificate's; no GOAWAY seen by the client; client errors and dropped-stream counters are 0; an Execute outliving stand-down by 11 minutes completes; daemons reconnect with the same epoch and keep leases; the old child exits only after its last stream; exactly one run per action. Mutants that must go red: route per connection; retire on a 5 s timer; GOAWAY at flip; promote or retire with a window that has no active child; drop the reconnect grace.
-
-## 13. Existing PRs
-
-| PR | Verdict |
-|---|---|
-| #970 controller (merged) | Keep. Gains the generation and desired-commit gate (U9). |
-| #976 update routes (draft) | Keep. The proxy forwards them. |
-| #1037 order spool | Keep and land first: `orders/` is the proxy-to-root channel and gates U7b. |
-| #1062 `POST /v1/update/frontend` in kbf-server | Obsolete. Close after confirming nothing is stacked on its branch. |
-| #1054 slots and `frontend_update` | Change. Slots and `pending_confirm` for frontends go away; confirm and undo become the `confirm`/`revert` orders sent by the proxy supervisor; `handover_protocol` becomes `admin_protocol`. Do not merge as is. Name the salvageable tests first. |
-| #1047 gamma `deploy` | Change. Targets the proxy route, frontend-first, no `--order`. Stacked on #1039: read it first. |
-| #1083 `migrate` | Deleted (s12 plan PR #8): adoption = installing the packages; the first crossing is a stop and start on a fresh Postgres, no state copy. |
-| #1091 drop Envoy unit | Keep, but blocked until U4b to U7b land, or a host has no front door. Mark it so nobody merges it. |
-| #1088 GitHub OIDC | Keep, reworked on this seam: `kbf-oidc` plus `remote_operator_file` in the proxy, for the two update calls only (section 4a). It no longer adds a `kbf-server` listener or a Kubernetes design. |
-| Merged #937, #930, #984, #1042 | Drain endpoint and `done/` follower stay. Baton, `EnvoyCheck`, the +10 block and `kbf-cli frontend handover` are deleted (U7, U3b). |
-
-## 14. Open questions
-
-None blocking. Decided by the owner on 2026-10-18: proxy terminates all TLS (no ALPN/SNI prerequisite), unprivileged proxy, all-in-one hold, old child scheduling-read-only, SQLite dropped with a fresh start, one update at a time, proxy restarts only with package upgrades (idle wait by default), frontend-first order.
-
-**Not verified (U0 and the owning unit check these):** the atomicity and survivability of `Fenced`; the Postgres Unix-socket URI; the key family names in section 8 and a `Store` key scan; `predecessor_instance_id` continuation; hyper http2 features in the lockfile; the existing "Who may write" model and #1088; the `daemon.rs` `Welcome` check and `members.rs` floor behavior; that storage nodes re-register blobs on a fresh store; the CI Postgres job.
+**No state migration.** The state of a SQLite frontend is moved once, in a cold cutover with the
+frontend stopped, by `kbf-state-copy` ([../deploy/state-store-cutover.md](../deploy/state-store-cutover.md)),
+or the farm starts fresh on Postgres: cached blobs live on storage nodes and are unaffected. A
+fresh store loses the member map and enrollment (nodes enroll again), cordons, the run history and
+the `done/` rows; in-flight work is dropped, so a cutover is drain, then stop.

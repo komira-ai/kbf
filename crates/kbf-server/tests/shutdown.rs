@@ -18,10 +18,12 @@ use futures::channel::mpsc;
 use kbf_proto::google::bytestream::WriteRequest;
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::google::longrunning::Operation;
+use kbf_proto::reapi::execution_stage::Value as ExecStage;
 use kbf_proto::reapi::{ExecuteOperationMetadata, WaitExecutionRequest};
 use prost::Message;
-use support::{Blob, Client, Job, PROMPT};
+use support::{Blob, Client, FakeDaemon, Job, PROMPT, stage};
 use tonic::Code;
+use tonic::Streaming;
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-server");
 
@@ -138,31 +140,23 @@ impl Drop for Running {
 /// Catches issue #168: a server that dies on SIGTERM (no handler), or stops serving
 /// at once, so an open Execute or WaitExecution stream fails on the client with
 /// UNKNOWN (an h2 error) instead of UNAVAILABLE; and one that does not exit 0 promptly
-/// once the streams are ended. The deadline is 1 s here (the default is none). No daemon is connected, so the operation waits,
-/// with the reason that no live worker can run it, until the signal; the test signals
-/// only once it has seen that reason, so the run is the same every time.
+/// once the streams are ended. The deadline is 1 s here (the default is none). The
+/// operation is running on a node's lease that never reports, so the drain keeps both
+/// streams until the deadline closes them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sigterm_ends_open_execute_streams_unavailable() {
-    let (mut server, reapi, worker) = Running::start(&["--shutdown-timeout-secs", "1"]);
+    let (mut server, reapi, worker) = Running::start(&[
+        "--shutdown-timeout-secs",
+        "1",
+        "--heartbeat-interval-ms",
+        "100",
+    ]);
     let client = Client::connect(reapi, worker).await;
     let job = Job::new("open across a SIGTERM", &[]);
-    client.upload(&job.blobs()).await;
-    let mut executed = client.execute(&job.action).await;
-    let queued = loop {
-        let op = tokio::time::timeout(PROMPT, executed.message())
-            .await
-            .expect("an update in time")
-            .expect("healthy")
-            .expect("an update");
-        if waits_for_a_worker(&op) {
-            break op;
-        }
-    };
+    let (mut executed, _daemon, name) = run_on_a_node(&client, &job).await;
     let mut waited = client
         .exec()
-        .wait_execution(WaitExecutionRequest {
-            name: queued.name.clone(),
-        })
+        .wait_execution(WaitExecutionRequest { name })
         .await
         .expect("WaitExecution")
         .into_inner();
@@ -170,7 +164,7 @@ async fn sigterm_ends_open_execute_streams_unavailable() {
         .await
         .expect("an update in time")
         .expect("healthy")
-        .expect("waiting");
+        .expect("executing");
 
     server.terminate();
     for (what, stream) in [("Execute", &mut executed), ("WaitExecution", &mut waited)] {
@@ -194,16 +188,15 @@ async fn sigterm_ends_open_execute_streams_unavailable() {
     assert!(status.success(), "kbf-server exited with {status}");
 }
 
-/// Catches (kbf#791): a SIGTERM that ends open streams or exits while an
-/// action is in flight (Buck2 never reconnects, so the action would fail). With no
-/// deadline (the default) the stream stays open and the server keeps running after the
-/// signal; here it is still there after a pause and nothing has been sent on it. The
-/// defect it catches is the signal handler closing the streams as it drains.
+/// Catches a stop that holds for an operation that has never started and that no worker
+/// can run: with no deadline (the default) and no worker connected, SIGTERM ends the
+/// stream UNAVAILABLE at once (naming why) and the server exits 0 with no second signal.
+/// The client's connection stays open throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sigterm_keeps_an_open_stream_when_there_is_no_deadline() {
+async fn sigterm_ends_a_queued_stream_at_once_and_the_server_exits() {
     let (mut server, reapi, worker) = Running::start(&[]);
     let client = Client::connect(reapi, worker).await;
-    let job = Job::new("kept across a SIGTERM", &[]);
+    let job = Job::new("queued across a SIGTERM", &[]);
     client.upload(&job.blobs()).await;
     let mut executed = client.execute(&job.action).await;
     loop {
@@ -218,8 +211,57 @@ async fn sigterm_keeps_an_open_stream_when_there_is_no_deadline() {
     }
 
     server.terminate();
-    let quiet = tokio::time::timeout(Duration::from_secs(1), executed.message()).await;
-    assert!(quiet.is_err(), "the stream ended or spoke: {quiet:?}");
+    let ended = tokio::time::timeout(PROMPT, executed.message())
+        .await
+        .expect("the queued stream ends after SIGTERM")
+        .expect_err("it ends with an error");
+    assert_eq!(ended.code(), Code::Unavailable, "{ended:?}");
+    assert!(ended.message().contains("never started"), "{ended:?}");
+    let status = server.exited(PROMPT).await;
+    assert!(status.success(), "kbf-server exited with {status}");
+    drop(client);
+}
+
+/// Catches (kbf#791): a SIGTERM that ends open streams or exits while an
+/// action is in flight (Buck2 never reconnects, so the action would fail). With no
+/// deadline (the default) the stream of an operation with a running lease stays open and
+/// the server keeps running after the signal; once the server reports the drain begun
+/// (`/readyz` 503) and counts the stream as still open, nothing has been sent on it. The
+/// defect it catches is the signal handler closing the streams as it drains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_keeps_a_running_stream_when_there_is_no_deadline() {
+    use futures::FutureExt as _;
+
+    let (mut server, line) = Running::start_line(&[
+        "--api-listen",
+        "127.0.0.1:0",
+        "--heartbeat-interval-ms",
+        "100",
+    ]);
+    let (reapi, worker, operator) = (
+        address(&line, "reapi="),
+        address(&line, "worker="),
+        address(&line, "api="),
+    );
+    let client = Client::connect(reapi, worker).await;
+    let job = Job::new("kept across a SIGTERM", &[]);
+    let (mut executed, _daemon, _) = run_on_a_node(&client, &job).await;
+
+    server.terminate();
+    not_ready(operator).await;
+    let drain = api(operator, None, "GET", "/v1/frontend/drain").await;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&drain.body).expect("JSON"),
+        serde_json::json!({
+            "draining": true,
+            "phase": "draining",
+            "open_executions": 1,
+            "queued_operations": 0
+        }),
+        "the drain began and the stream is still open"
+    );
+    let quiet = executed.message().now_or_never();
+    assert!(quiet.is_none(), "the stream ended or spoke: {quiet:?}");
     assert!(
         server.0.try_wait().expect("try_wait").is_none(),
         "the server exited"
@@ -266,6 +308,8 @@ async fn zero_turns_progress_off() {
         "0",
         "--http2-keepalive-interval-secs",
         "0",
+        "--heartbeat-interval-ms",
+        "100",
     ]);
     let client = Client::connect(reapi, worker).await;
     let job = Job::new("idle without progress", &[]);
@@ -281,10 +325,23 @@ async fn zero_turns_progress_off() {
             break;
         }
     }
-    let quiet = tokio::time::timeout(Duration::from_secs(2), executed.message()).await;
-    assert!(quiet.is_err(), "an update with progress off: {quiet:?}");
+    // A worker taking the operation is the next thing the server can say on this
+    // stream; a progress update sent before it would be the operation queued again.
+    let mut daemon = client.daemon("node-a", 4, 8).await;
+    daemon.start().await;
+    let op = tokio::time::timeout(PROMPT, executed.message())
+        .await
+        .expect("an update in time")
+        .expect("healthy")
+        .expect("an update");
+    assert_eq!(
+        stage(&op),
+        ExecStage::Executing as i32,
+        "an update with progress off: {op:?}"
+    );
     // Stopped by a signal, not killed, so the run's coverage is written.
     drop(executed);
+    drop(daemon);
     drop(client);
     server.terminate();
     let status = server.exited(PROMPT).await;
@@ -354,6 +411,26 @@ async fn the_worker_listener_pings_an_idle_connection() {
     server.stop().await;
 }
 
+/// Executes `job` on a fake daemon's node, which takes the lease and never reports: the
+/// stream is open and its operation has a running lease. Returns the stream (read up to
+/// its EXECUTING update), the daemon, which the caller keeps alive, and the operation's name.
+async fn run_on_a_node(client: &Client, job: &Job) -> (Streaming<Operation>, FakeDaemon, String) {
+    client.upload(&job.blobs()).await;
+    let mut daemon = client.daemon("node-a", 4, 8).await;
+    let mut executed = client.execute(&job.action).await;
+    daemon.start().await;
+    loop {
+        let op = tokio::time::timeout(PROMPT, executed.message())
+            .await
+            .expect("an update in time")
+            .expect("healthy")
+            .expect("an update");
+        if stage(&op) == ExecStage::Executing as i32 {
+            return (executed, daemon, op.name);
+        }
+    }
+}
+
 /// Whether `op` is queued with the reason no live worker can run it.
 fn waits_for_a_worker(op: &Operation) -> bool {
     let any = op.metadata.as_ref().expect("metadata");
@@ -368,7 +445,17 @@ fn waits_for_a_worker(op: &Operation) -> bool {
 /// not handed to the server fails too); and a stop that does not wait for it at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stuck_upload_is_cut_off_at_the_shutdown_timeout() {
-    let (mut server, reapi, worker) = Running::start(&["--shutdown-timeout-secs", "1"]);
+    let (mut server, line) = Running::start_line(&[
+        "--shutdown-timeout-secs",
+        "1",
+        "--api-listen",
+        "127.0.0.1:0",
+    ]);
+    let (reapi, worker, operator) = (
+        address(&line, "reapi="),
+        address(&line, "worker="),
+        address(&line, "api="),
+    );
     let client = Client::connect(reapi, worker).await;
     let blob = Blob::new("a partial upload");
     let (chunks, requests) = mpsc::unbounded();
@@ -388,21 +475,23 @@ async fn a_stuck_upload_is_cut_off_at_the_shutdown_timeout() {
         .await
         .expect("connect");
     let upload = tokio::spawn(async move { bytestream.write(requests).await });
-    // Nothing tells the client the server has read the first part; the stream has a
-    // moment to reach it (on loopback it takes well under a millisecond).
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The server counts the bytes of a Write as each message arrives: 4 is the first
+    // part read, and the call is held open waiting for the rest.
+    bytes_counted(operator, "kbf_bytestream_write_bytes_total", 4).await;
     assert!(!upload.is_finished(), "the partial upload was answered");
     assert!(!client.holds(&blob).await, "part of a blob is held");
 
-    let stopped = Instant::now();
     server.terminate();
     let status = server.exited(PROMPT).await;
     assert!(status.success(), "kbf-server exited with {status}");
-    let took = stopped.elapsed();
-    assert!(
-        took >= Duration::from_secs(1),
-        "stopped after {took:?}, before the 1 s shutdown timeout"
-    );
+    // The stop cut the call off: the upload ends with an error, not an answer. How long
+    // the stop waits for it is the shutdown timeout, covered on a paused clock in
+    // `sequence/tests.rs`.
+    let ended = tokio::time::timeout(PROMPT, upload)
+        .await
+        .expect("the upload ends once the server is gone")
+        .expect("the upload task");
+    ended.expect_err("a partial upload cannot be answered");
     drop(chunks);
 }
 
@@ -449,15 +538,39 @@ async fn not_ready(addr: SocketAddr) {
     }
 }
 
+/// Waits until the counter `series` on `GET /metrics` reads `at_least`.
+async fn bytes_counted(addr: SocketAddr, series: &str, at_least: u64) {
+    let deadline = Instant::now() + PROMPT;
+    loop {
+        let metrics = api(addr, None, "GET", "/metrics").await;
+        let read = metrics.body.lines().find_map(|l| {
+            l.strip_prefix(series)?
+                .strip_prefix(' ')?
+                .parse::<u64>()
+                .ok()
+        });
+        if read.is_some_and(|n| n >= at_least) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{series} still {read:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Catches a second SIGTERM that is swallowed (the handler of the first is all there
 /// is): systemd, an operator or the rollout that waited out its drain sends another to
 /// end the drain, and with no shutdown timeout (the default) nothing else would.
 /// The first SIGTERM drains and the stream is kept (the status names it: one stream
-/// open, one operation queued); the second ends the stream UNAVAILABLE and the server
-/// exits 0. The defect it catches is `serve_escalating` not spawning the escalation.
+/// open, none queued: the operation runs on a node); the second ends the stream
+/// UNAVAILABLE and the server exits 0. The defect it catches is `serve_escalating` not spawning the escalation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_sigterm_ends_the_drain() {
-    let (mut server, line) = Running::start_line(&["--api-listen", "127.0.0.1:0"]);
+    let (mut server, line) = Running::start_line(&[
+        "--api-listen",
+        "127.0.0.1:0",
+        "--heartbeat-interval-ms",
+        "100",
+    ]);
     let (reapi, worker, operator) = (
         address(&line, "reapi="),
         address(&line, "worker="),
@@ -465,26 +578,20 @@ async fn a_second_sigterm_ends_the_drain() {
     );
     let client = Client::connect(reapi, worker).await;
     let job = Job::new("ended by a second signal", &[]);
-    client.upload(&job.blobs()).await;
-    let mut executed = client.execute(&job.action).await;
-    loop {
-        let op = tokio::time::timeout(PROMPT, executed.message())
-            .await
-            .expect("an update in time")
-            .expect("healthy")
-            .expect("an update");
-        if waits_for_a_worker(&op) {
-            break;
-        }
-    }
+    let (mut executed, _daemon, _) = run_on_a_node(&client, &job).await;
 
     server.terminate();
     not_ready(operator).await;
     let drain = api(operator, None, "GET", "/v1/frontend/drain").await;
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&drain.body).expect("JSON"),
-        serde_json::json!({"draining": true, "open_executions": 1, "queued_operations": 1}),
-        "the first signal drains and keeps the stream"
+        serde_json::json!({
+            "draining": true,
+            "phase": "draining",
+            "open_executions": 1,
+            "queued_operations": 0
+        }),
+        "the first signal drains and keeps the stream of a running operation"
     );
 
     server.terminate();
@@ -509,8 +616,14 @@ async fn a_second_sigterm_ends_the_drain() {
 async fn the_drain_endpoint_drains_the_binary_and_it_exits_when_the_streams_are_done() {
     let (token, _token_dir, path) = token_file("endpoint");
     let path = path.display().to_string();
-    let (mut server, line) =
-        Running::start_line(&["--api-listen", "127.0.0.1:0", "--api-token-file", &path]);
+    let (mut server, line) = Running::start_line(&[
+        "--api-listen",
+        "127.0.0.1:0",
+        "--api-token-file",
+        &path,
+        "--heartbeat-interval-ms",
+        "100",
+    ]);
     let (reapi, worker, operator) = (
         address(&line, "reapi="),
         address(&line, "worker="),
@@ -518,18 +631,7 @@ async fn the_drain_endpoint_drains_the_binary_and_it_exits_when_the_streams_are_
     );
     let client = Client::connect(reapi, worker).await;
     let job = Job::new("drained in the binary", &[]);
-    client.upload(&job.blobs()).await;
-    let mut executed = client.execute(&job.action).await;
-    loop {
-        let op = tokio::time::timeout(PROMPT, executed.message())
-            .await
-            .expect("an update in time")
-            .expect("healthy")
-            .expect("an update");
-        if waits_for_a_worker(&op) {
-            break;
-        }
-    }
+    let (executed, _daemon, _) = run_on_a_node(&client, &job).await;
 
     let begun = api(operator, Some(&token), "POST", "/v1/frontend/drain").await;
     assert_eq!(begun.status, 200, "{begun:?}");
@@ -541,7 +643,12 @@ async fn the_drain_endpoint_drains_the_binary_and_it_exits_when_the_streams_are_
     let drain = api(operator, None, "GET", "/v1/frontend/drain").await;
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&drain.body).expect("JSON"),
-        serde_json::json!({"draining": true, "open_executions": 1, "queued_operations": 1}),
+        serde_json::json!({
+            "draining": true,
+            "phase": "draining",
+            "open_executions": 1,
+            "queued_operations": 0
+        }),
         "the refused Execute was queued"
     );
     assert!(

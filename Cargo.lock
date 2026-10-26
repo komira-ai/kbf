@@ -1340,50 +1340,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kbf-all-in-one"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "clap",
- "futures",
- "kbf-cas-conformance",
- "kbf-daemon",
- "kbf-driver-container",
- "kbf-front",
- "kbf-harness",
- "kbf-meta",
- "kbf-node",
- "kbf-objstore",
- "kbf-outputs",
- "kbf-proto",
- "kbf-segments",
- "kbf-server",
- "kbf-storage",
- "kbf-testkit",
- "kbf-threads",
- "kbf-transfer",
- "kbf-types",
- "libc",
- "prost",
- "rcgen",
- "rustix",
- "tokio",
- "tonic",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "kbf-all-in-one-test"
-version = "0.1.0"
-dependencies = [
- "kbf-harness",
- "kbf-testkit",
- "kbf-transfer",
- "tokio",
-]
-
-[[package]]
 name = "kbf-auth"
 version = "0.1.0"
 dependencies = [
@@ -1483,7 +1439,6 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
- "kbf-all-in-one",
  "kbf-ca",
  "kbf-cas-conformance",
  "kbf-daemon",
@@ -1500,6 +1455,7 @@ dependencies = [
  "kbf-setup",
  "kbf-state",
  "kbf-storage",
+ "kbf-storage-and-daemon",
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
@@ -1571,15 +1527,18 @@ dependencies = [
  "hex",
  "kbf-auth",
  "kbf-caps",
+ "kbf-cas-conformance",
  "kbf-front",
  "kbf-map",
  "kbf-mapsync",
  "kbf-meta",
  "kbf-objstore",
+ "kbf-pack",
  "kbf-proto",
  "kbf-route",
  "kbf-segments",
  "kbf-server",
+ "kbf-state",
  "kbf-storage",
  "kbf-store",
  "kbf-testkit",
@@ -1776,6 +1735,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-farm-test"
+version = "0.1.0"
+dependencies = [
+ "kbf-harness",
+ "kbf-testkit",
+ "kbf-transfer",
+ "tokio",
+]
+
+[[package]]
 name = "kbf-front"
 version = "0.1.0"
 dependencies = [
@@ -1790,10 +1759,12 @@ dependencies = [
  "kbf-map",
  "kbf-meta",
  "kbf-objstore",
+ "kbf-pack",
  "kbf-proto",
  "kbf-route",
  "kbf-sched",
  "kbf-segments",
+ "kbf-state",
  "kbf-storage",
  "kbf-store",
  "kbf-testkit",
@@ -1831,6 +1802,7 @@ dependencies = [
  "hex",
  "kbf-testkit",
  "libc",
+ "serde",
  "serde_json",
  "subtle",
  "thiserror",
@@ -2167,7 +2139,9 @@ dependencies = [
  "kbf-front",
  "kbf-integration-test",
  "kbf-map",
+ "kbf-objstore",
  "kbf-outputs",
+ "kbf-pack",
  "kbf-proto",
  "kbf-server",
  "kbf-testkit",
@@ -2184,6 +2158,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -2196,6 +2171,8 @@ dependencies = [
  "futures",
  "hex",
  "hmac 0.13.0",
+ "http",
+ "http-body",
  "kbf-objstore",
  "kbf-segments",
  "kbf-testkit",
@@ -2247,6 +2224,43 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "kbf-pack"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "hex",
+ "kbf-objstore",
+ "kbf-segments",
+ "kbf-state",
+ "kbf-testkit",
+ "kbf-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "kbf-pack-adopt"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "kbf-objstore",
+ "kbf-pack",
+ "kbf-segments",
+ "kbf-state",
+ "kbf-testkit",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -2384,6 +2398,7 @@ dependencies = [
  "kbf-mdm-api",
  "kbf-meta",
  "kbf-objstore",
+ "kbf-pack",
  "kbf-peer",
  "kbf-proto",
  "kbf-raft",
@@ -2545,6 +2560,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-storage-and-daemon"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "futures",
+ "kbf-cas-conformance",
+ "kbf-daemon",
+ "kbf-driver-container",
+ "kbf-front",
+ "kbf-harness",
+ "kbf-meta",
+ "kbf-node",
+ "kbf-objstore",
+ "kbf-outputs",
+ "kbf-proto",
+ "kbf-segments",
+ "kbf-server",
+ "kbf-storage",
+ "kbf-testkit",
+ "kbf-threads",
+ "kbf-transfer",
+ "kbf-types",
+ "libc",
+ "prost",
+ "rcgen",
+ "rustix",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "kbf-store"
 version = "0.1.0"
 dependencies = [
@@ -2695,6 +2744,7 @@ dependencies = [
  "clap",
  "dispatch2",
  "hex",
+ "kbf-guest",
  "kbf-testkit",
  "libc",
  "objc2",
@@ -4370,6 +4420,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tierstore"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "bytes",
+ "clap",
+ "crc32c",
+ "crc32fast",
+ "futures",
+ "hex",
+ "hmac 0.13.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "kbf-objstore",
+ "kbf-testkit",
+ "md-5",
+ "percent-encoding",
+ "reqwest",
+ "ring",
+ "roxmltree",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "tierstore",
+ "tokio",
 ]
 
 [[package]]

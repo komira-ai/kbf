@@ -19,7 +19,7 @@
 //! archive), so no version is made of it: a package of an unknown place in the history must
 //! not be ranked at all, and `0.1.0+g...` would rank it, below every counted build of the series.
 //!
-//! This module only names the version. `pkg-config` and `pkg-asset` use it when the package
+//! This module only names the version. `pkg-config` and `pkg-kbf-asset` use it when the package
 //! carries a release; until then they keep the version of the installer binary.
 //! `tests/pkg_version.rs` holds the two orders to the algorithms of dpkg and rpm.
 

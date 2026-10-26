@@ -398,10 +398,9 @@ fn setup_creates_the_schema_over_a_real_server() {
         apply: false,
         no_start: true,
     });
-    assert!(
-        dry.contains("dry run: would create the schema at version 1"),
-        "{dry}"
-    );
+    let latest = kbf_state::postgres::schema::latest();
+    let would = format!("dry run: would create the schema at version {latest}");
+    assert!(dry.contains(&would), "{dry}");
     let none = client
         .query(
             "SELECT 1 FROM pg_namespace WHERE nspname = 'kbf_state'",
@@ -410,9 +409,10 @@ fn setup_creates_the_schema_over_a_real_server() {
         .expect("catalog");
     assert!(none.is_empty(), "the dry run created the schema");
     let made = say(APPLY);
-    assert!(made.contains("created the schema at version 1"), "{made}");
+    let created = format!("created the schema at version {latest}");
+    assert!(made.contains(&created), "{made}");
     client
-        .query_one("SELECT version FROM kbf_state.schema_version", &[])
+        .query_one("SELECT max(version) FROM kbf_state.schema_version", &[])
         .expect("the version row");
     let again = say(APPLY);
     assert!(again.contains("nothing to apply"), "{again}");

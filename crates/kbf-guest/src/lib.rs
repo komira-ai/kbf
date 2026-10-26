@@ -11,6 +11,11 @@
 //! - [`client`]: the host side.
 //! - [`session`]: the launchd session type `Ready` reports, and the root refusal.
 //!
+//! - [`mount`]: `mount-share`, the guest's own bounded virtiofs mount.
+//! - [`frame`]: the frames probe results and ready markers travel in over virtio-socket.
+//! - [`shutdown`]: the root daemon that listens on a virtio-socket port for the host's
+//!   `shutdown` command and shuts the guest down cleanly.
+//! - [`simpaths`]: where `kbf-vmm image setup` stages Xcode and the simulator runtimes.
 //! - [`probe`]: the probe modes `kbf-vmm probe g2` and `g3` read, which run as any user.
 //!
 //! It serves a Unix socket. The virtio socket a VM gives it, the relay through
@@ -18,10 +23,18 @@
 //! not built.
 
 pub mod client;
+pub mod diag;
+pub mod frame;
+pub mod mount;
 pub mod probe;
 #[cfg(target_os = "macos")]
 pub mod probe_host;
 pub mod run;
 pub mod server;
 pub mod session;
+pub mod shutdown;
+#[cfg(target_os = "macos")]
+pub mod shutdown_host;
+pub mod simpaths;
+pub mod vsock;
 pub mod wire;

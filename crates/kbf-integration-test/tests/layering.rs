@@ -30,19 +30,23 @@
 //!   frontend and the daemon both link it, and neither may pull in the other's code
 //!   through it;
 //! - a daemon crate (`DAEMON_ONLY`: `kbf-node`, the `kbf-daemon` binary's library, and
-//!   `kbf-daemon` beneath it) depending, directly or through another crate, on the object
-//!   store client, a crate that holds one, or a standalone HTTP client one could be
-//!   written over (`COLD_STORE_CLIENT`); and a walk that cannot see the client (the
-//!   client crate renamed, or the server no longer reaching it), which would make that
-//!   check pass vacuously. A daemon-only node holds no cold-store credential and reaches
-//!   bytes only through storage (docs/design/architecture-v2.md, section 9). What this
-//!   pins is the daemon's code: the daemon crates cannot name an object-store client, so
-//!   the separate `kbf-daemon` binary links none. It does not pin the binary a
-//!   daemon-only node runs. The deployed `kbf daemon` is the `kbf` binary (`kbf-cli`),
-//!   which links `kbf-server` and `kbf-objstore` for its other modes (`JOINERS`). For
-//!   that binary the protection is that it is given no credential: its unit loads no
-//!   environment file or systemd credential (kbf-deploy's `linux/modes_tests.rs`), and no
-//!   daemon flag names a store or reads an environment variable (kbf-cli's tests);
+//!   `kbf-daemon` beneath it) depending, directly or through another crate, on a crate that
+//!   holds the cold store behind its cache, or on a standalone HTTP client one could be
+//!   written over (`COLD_STORE_CLIENT`); and a walk that cannot see those crates (renamed,
+//!   or the server no longer reaching the front), which would make that check pass
+//!   vacuously. A daemon-only node holds no cold-store credential and reaches bytes
+//!   through storage (docs/design/architecture-v2.md, section 9). The one exception is
+//!   `--pack-read` (`kbf_daemon::packed`): a daemon reads the packs of the farm's object
+//!   store with a key that may read `cas/` and write nothing, in a file named by a flag,
+//!   so the daemon crates now reach the object store client (`kbf-objstore`) and the HTTP
+//!   client it is written over (`reqwest`), and the check no longer refuses them. What this
+//!   pins is the daemon's code: the daemon crates cannot build the cold store of a
+//!   frontend or a storage node. The deployed `kbf daemon` is the `kbf` binary
+//!   (`kbf-cli`), which links `kbf-server` for its other modes (`JOINERS`). For that
+//!   binary the protection is that it is given no credential in its environment: its unit
+//!   loads no environment file or systemd credential (kbf-deploy's `linux/modes_tests.rs`),
+//!   and no daemon flag names a store or reads an environment variable, but the seven
+//!   `--pack-read` flags, which take a key file and never a secret (kbf-cli's tests);
 //! - the front-door proxy library (`kbf-proxy`) depending, directly or through another crate,
 //!   on a child's, the installer's or the runtime's crates (`PROXY_MUST_NOT_REACH`); and any
 //!   file of `kbf-installer/src` outside `MAY_NAME_THE_PROXY`, the root helper first of all,
@@ -52,7 +56,20 @@
 //!   `SETUP_MAY_NAME_THE_PROXY` naming `kbf_proxy`;
 //! - the `kbf` binary (`kbf-cli`) linking the proxy: `kbf setup` is built on the setup library
 //!   without its `proxy` feature (`kbf-installer` turns it on), so the tree of
-//!   `cargo build -p kbf-cli` holds `kbf-setup` and no `kbf-proxy`.
+//!   `cargo build -p kbf-cli` holds `kbf-setup` and no `kbf-proxy`;
+//! - the packing client (`kbf-pack`) depending, directly or through another crate, on the
+//!   frontend, the server, the storage node or the daemon (`PACK_MUST_NOT_REACH`); and a walk
+//!   that cannot see `kbf-objstore` beneath it, which would make that check pass vacuously;
+//! - the pack adoption tool (`kbf-pack-adopt`) depending, directly or through another crate, on
+//!   a crate of `PACK_MUST_NOT_REACH`, so that the operator binary never links the frontend, the
+//!   server or the daemon; and a walk that cannot see `kbf-pack` beneath it;
+//! - the hot/cold object store library (`tierstore`) depending, directly or through another
+//!   crate, on any other crate of this workspace, which would stop it from moving to a
+//!   repository of its own (its `s3` feature, off by default, adds the S3 client of
+//!   `kbf-objstore`, and so does its `server` feature, which the `tierstore` binary needs;
+//!   the check reads the tree of the crate built alone, so the features that its own tests
+//!   turn on do not count); and a walk that cannot see its dependencies, which would make
+//!   that check pass vacuously.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -277,7 +294,7 @@ fn pure_modules_deny_the_clippy_lists() {
 
 /// The crates allowed to depend on both the server and the node library: the combined
 /// binary and the one `kbf` binary.
-const JOINERS: &[&str] = &["kbf-all-in-one", "kbf-cli"];
+const JOINERS: &[&str] = &["kbf-storage-and-daemon", "kbf-cli"];
 
 /// What the server library's normal dependencies must not reach: the daemon side. The
 /// server stores and schedules; it never moves blobs as a client.
@@ -410,25 +427,70 @@ fn the_coordinator_and_the_updater_hold_no_ca_code() {
     );
 }
 
+/// A host's updater has no tie to the front-door proxy (`kbf-proxy`, which is being retired):
+/// the frontend serves the updater's calls itself (`kbf_server::node_self`), and the roll no
+/// longer drains a pool. The crate's normal closure holds no `kbf-proxy`, its manifest names
+/// none (the dev-dependencies the closure walk does not see), and no source or test file of it
+/// names the crate or its identity headers.
+#[test]
+fn the_updater_has_no_tie_to_the_proxy() {
+    let g = load_graph();
+    let (_, root) = g.members.get("kbf-updater").expect("a workspace member");
+    assert!(root.is_some(), "kbf-updater must have a library target");
+    let violations = reaches(&g, "kbf-updater", &["kbf-proxy"]);
+    assert!(
+        violations.is_empty(),
+        "kbf-updater reaches the proxy:\n{}",
+        violations.join("\n")
+    );
+    // The walk proves something: a crate that does link the proxy is seen to reach it.
+    assert!(
+        !reaches(&g, "kbf-installer", &["kbf-proxy"]).is_empty(),
+        "the installer's closure must reach kbf-proxy, or this walk proves nothing"
+    );
+
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kbf-updater");
+    let manifest = std::fs::read_to_string(base.join("Cargo.toml")).expect("the manifest");
+    assert!(
+        !manifest.contains("kbf-proxy") && !manifest.contains("kbf_proxy"),
+        "kbf-updater's Cargo.toml names the proxy"
+    );
+    let mut files = Vec::new();
+    rust_files(&base, &base.join("src"), &mut files);
+    rust_files(&base, &base.join("tests"), &mut files);
+    assert!(
+        files.iter().any(|f| f == "src/agent/build.rs") && files.iter().any(|f| f == "src/lib.rs"),
+        "kbf-updater's files were not found under {}",
+        base.display()
+    );
+    for file in &files {
+        let text =
+            std::fs::read_to_string(base.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        for word in ["kbf-proxy", "kbf_proxy"] {
+            assert!(!text.contains(word), "{file} names {word}");
+        }
+    }
+}
+
 /// The daemon crates: the daemon's code, which the `kbf-daemon` binary is and which
 /// `kbf daemon` runs inside the `kbf` binary, with the drivers, which `kbf-node` names
 /// and so are in its closure.
 const DAEMON_ONLY: &[&str] = &["kbf-node", "kbf-daemon"];
 
-/// What a daemon crate's normal dependencies must not reach: the object store client
-/// (`kbf-objstore`, which signs S3 requests), the crates that hold the cold store behind
-/// their cache and build it from a cold-store URI (`kbf-front`, `kbf-server`), and the
-/// standalone HTTP clients an S3 client could be written over (`reqwest`, which
-/// `kbf-objstore` is written over, and `ureq`). `hyper-util` is not listed: tonic's
-/// channel, which the daemon dials the server with, is built on its client.
-const COLD_STORE_CLIENT: &[&str] = &["kbf-objstore", "kbf-front", "kbf-server", "reqwest", "ureq"];
+/// What a daemon crate's normal dependencies must not reach: the crates that hold the cold
+/// store behind their cache and build it from a cold-store URI (`kbf-front`, `kbf-server`),
+/// and a standalone HTTP client an S3 client could be written over (`ureq`). The object
+/// store client (`kbf-objstore`) and the `reqwest` it is written over are not listed since
+/// `--pack-read`: a daemon reads packs with it (the module docs). `hyper-util` is not listed
+/// either: tonic's channel, which the daemon dials the server with, is built on its client.
+const COLD_STORE_CLIENT: &[&str] = &["kbf-front", "kbf-server", "ureq"];
 
 #[test]
 fn a_daemon_cannot_build_a_cold_store_client() {
     let g = load_graph();
     // Every name the check looks for is a package of the graph, and the walk sees the
-    // client where it is linked: the server builds its cold store from it. Without
-    // these, a renamed or misspelled crate would pass the check below.
+    // crate where it is linked: the server holds the front, which builds the cold store.
+    // Without these, a renamed or misspelled crate would pass the check below.
     for name in COLD_STORE_CLIENT {
         assert!(
             g.names.values().any(|n| n == *name),
@@ -436,8 +498,8 @@ fn a_daemon_cannot_build_a_cold_store_client() {
         );
     }
     assert!(
-        !reaches(&g, "kbf-server", &["kbf-objstore"]).is_empty(),
-        "the server's closure must reach kbf-objstore, or this walk proves nothing"
+        !reaches(&g, "kbf-server", &["kbf-front"]).is_empty(),
+        "the server's closure must reach kbf-front, or this walk proves nothing"
     );
     let violations: Vec<String> = DAEMON_ONLY
         .iter()
@@ -445,8 +507,9 @@ fn a_daemon_cannot_build_a_cold_store_client() {
         .collect();
     assert!(
         violations.is_empty(),
-        "a daemon crate reaches an object-store client (a daemon-only node holds no \
-         cold-store credential, docs/design/architecture-v2.md section 9):\n{}",
+        "a daemon crate reaches a crate that builds the cold store or a standalone HTTP \
+         client (a daemon-only node holds no cold-store credential, \
+         docs/design/architecture-v2.md section 9):\n{}",
         violations.join("\n")
     );
 }
@@ -481,11 +544,123 @@ fn route_reaches_neither_the_frontend_nor_the_daemon() {
     );
 }
 
+/// What the packing client's normal dependencies must not reach: the frontend's scheduler and
+/// authorization, the server and the storage node, and the daemon's side. A frontend and a
+/// daemon (`--pack-read`) use the packing client; a path to either side's code would make the
+/// other link it. Wiring it into the daemon changed `COLD_STORE_CLIENT`, as `kbf-pack` is
+/// written over `kbf-objstore`.
+const PACK_MUST_NOT_REACH: &[&str] = &[
+    "kbf-sched",
+    "kbf-auth",
+    "kbf-front",
+    "kbf-server",
+    "kbf-storage",
+    "kbf-transfer",
+    "kbf-node",
+    "kbf-daemon",
+    "kbf-cli",
+];
+
+/// Asserts that the packing client (`kbf-pack`) reaches neither the frontend nor the daemon,
+/// and that the walk sees the object store client it is written over, so the check does not
+/// pass on an empty walk.
+#[test]
+fn pack_reaches_neither_the_frontend_nor_the_daemon() {
+    let g = load_graph();
+    let (_, root) = g
+        .members
+        .get("kbf-pack")
+        .expect("kbf-pack is a workspace member");
+    assert!(root.is_some(), "kbf-pack must have a library target");
+    assert!(
+        !reaches(&g, "kbf-pack", &["kbf-objstore"]).is_empty(),
+        "kbf-pack's closure must reach kbf-objstore, or this walk proves nothing"
+    );
+    let violations = reaches(&g, "kbf-pack", PACK_MUST_NOT_REACH);
+    assert!(
+        violations.is_empty(),
+        "kbf-pack reaches a frontend or daemon crate:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Asserts that the pack adoption tool (`kbf-pack-adopt`), an operator binary of its own,
+/// reaches none of the crates the packing client may not (`PACK_MUST_NOT_REACH`), and that the
+/// walk sees the packing client beneath it, so the check does not pass on an empty walk.
+#[test]
+fn pack_adopt_reaches_neither_the_frontend_nor_the_daemon() {
+    let g = load_graph();
+    let (_, root) = g
+        .members
+        .get("kbf-pack-adopt")
+        .expect("kbf-pack-adopt is a workspace member");
+    assert!(root.is_some(), "kbf-pack-adopt must have a library target");
+    assert!(
+        !reaches(&g, "kbf-pack-adopt", &["kbf-pack"]).is_empty(),
+        "kbf-pack-adopt's closure must reach kbf-pack, or this walk proves nothing"
+    );
+    let violations = reaches(&g, "kbf-pack-adopt", PACK_MUST_NOT_REACH);
+    assert!(
+        violations.is_empty(),
+        "kbf-pack-adopt reaches a frontend or daemon crate:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Asserts that the normal dependencies of the object store library (`tierstore`), direct
+/// and through other crates, include no other crate of this workspace, and that the walk
+/// sees its dependencies (it reaches `tokio`), so the check does not pass on an empty walk.
+/// The tree is that of `cargo build -p tierstore`, with the features the crate has by default:
+/// its `s3` feature, which adds `kbf-objstore`, is off in it, and so is `server`, which turns
+/// `s3` on for the `tierstore` binary. It is not the graph of `cargo metadata`, which has the
+/// features of the whole workspace, where the tests of `tierstore` turn `server` on.
+#[test]
+fn tierstore_reaches_no_other_workspace_crate() {
+    let g = load_graph();
+    let (_, root) = g
+        .members
+        .get("tierstore")
+        .expect("tierstore is a workspace member");
+    assert!(root.is_some(), "tierstore must have a library target");
+    let linked = linked_by("tierstore");
+    assert!(
+        linked.contains("tokio"),
+        "tierstore's tree must hold tokio, or this walk proves nothing: {linked:?}"
+    );
+    let violations: Vec<&str> = g
+        .members
+        .keys()
+        .map(String::as_str)
+        .filter(|name| *name != "tierstore")
+        .filter(|name| linked.contains(*name))
+        .collect();
+    assert!(
+        violations.is_empty(),
+        "tierstore links another crate of this workspace: {violations:?}"
+    );
+}
+
+/// Asserts that the tree of `cargo build -p tierstore --features s3` holds `kbf-objstore` (the
+/// S3 client that `S3Backend` adapts) and that of `--features server` holds it too, so that the
+/// check above sees the edge it guards, and that `server` turns `s3` on.
+#[test]
+fn tierstore_links_the_s3_client_only_with_its_s3_or_server_feature() {
+    let bare = linked_by("tierstore");
+    assert!(
+        !bare.contains("kbf-objstore"),
+        "without a feature: {bare:?}"
+    );
+    for features in ["s3", "server"] {
+        let linked = linked_with("tierstore", features);
+        assert!(linked.contains("kbf-objstore"), "{features}: {linked:?}");
+    }
+}
+
 /// What the front-door proxy library's normal dependencies must not reach
 /// (docs/design/kbf-proxy-api.md, sections 1 and 11). The proxy routes bytes: it never
 /// decodes a child's protocol (`kbf-proto`), runs none of the frontend, storage or node code
 /// (`kbf-server`, `kbf-front`, `kbf-storage`, `kbf-node`, `kbf-daemon`, the binaries
-/// `kbf-cli` and `kbf-all-in-one`), and does not know the installer, its host plan or its
+/// `kbf-cli` and `kbf-storage-and-daemon`), and does not know the installer, its host plan or its
 /// update types (`kbf-installer`, `kbf-setup`, `kbf-host`, `kbf-update`, `kbf-deploy`): the
 /// admin calls to a child are the installer's, through a trait that lives there (the proxy
 /// makes none), and the installer and the setup library depend on the proxy, not the other way
@@ -502,7 +677,7 @@ const PROXY_MUST_NOT_REACH: &[&str] = &[
     "kbf-node",
     "kbf-daemon",
     "kbf-cli",
-    "kbf-all-in-one",
+    "kbf-storage-and-daemon",
     "kbf-proto",
 ];
 
@@ -678,10 +853,21 @@ fn the_setup_library_names_the_proxy_only_where_it_keeps_the_table() {
 /// workspace (the installer turns the setup library's `proxy` feature on for everyone), this
 /// resolves the features of the one package, as building it alone does.
 fn linked_by(package: &str) -> BTreeSet<String> {
+    tree(package, &[])
+}
+
+/// As [`linked_by`], with these features of the package on (`cargo tree --features`).
+fn linked_with(package: &str, features: &str) -> BTreeSet<String> {
+    tree(package, &["--features", features])
+}
+
+/// The names `cargo tree` prints for the normal edges of `package`, with these extra arguments.
+fn tree(package: &str, extra: &[&str]) -> BTreeSet<String> {
     let cargo = std::env::var("CARGO").expect("CARGO is set when cargo runs a test");
     let out = Command::new(cargo)
         .args(["tree", "--locked", "--edges", "normal", "--prefix", "none"])
         .args(["--format", "{p}", "--package", package])
+        .args(extra)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("run cargo tree");
