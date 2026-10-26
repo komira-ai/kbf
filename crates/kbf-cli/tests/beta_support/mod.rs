@@ -283,7 +283,7 @@ impl Drop for Stopped {
 /// `kbf-beta b0 --fault shrink-every-cap`'s to show red, with the real Buck2 of the workflow, for
 /// the lost-blob gates; `failed_actions_by_class` is turned red by the gate tests of kbf-harness
 /// (a series fed to it) and its count by `kbf-server/tests/failed_actions_metric.rs`.
-pub(crate) const RED_IN_A_SCENARIO: [(&str, Option<&str>); 12] = [
+pub(crate) const RED_IN_A_SCENARIO: &[(&str, Option<&str>)] = &[
     (
         "builds_run",
         Some("a_load_that_runs_no_build_fails_the_builds_run_gate"),
