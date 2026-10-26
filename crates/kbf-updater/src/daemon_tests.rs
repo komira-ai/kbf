@@ -510,7 +510,17 @@ impl Exec for FakeSsh {
     }
 }
 
-/// The timing of a test: a roll that cannot go on fails within a second.
+/// The ports of the binary with `ssh` standing in for the real program and the clock the
+/// test's: a bound of a roll passes as the roll sleeps, not as the wall clock moves.
+fn ports_with_ssh(cfg: &Config, ssh: &Arc<FakeSsh>) -> Ports {
+    Ports {
+        clock: Box::new(FakeClock::new()),
+        ..build_ports_with_exec(cfg, ssh.clone()).expect("ports")
+    }
+}
+
+/// The bounds of a test: short, on the clock of [`ports_with_ssh`], so that a roll that cannot
+/// go on fails after its polls and no time at all.
 fn quick() -> Timing {
     Timing {
         poll: Duration::from_millis(10),
@@ -532,7 +542,7 @@ fn quick() -> Timing {
 fn start_with_ssh(cfg: &Config, ssh: &Arc<FakeSsh>) -> Daemon {
     start_with(
         cfg,
-        build_ports_with_exec(cfg, ssh.clone()).expect("ports"),
+        ports_with_ssh(cfg, ssh),
         quick(),
         Settings::new(cfg.proxy_uid),
         stderr_sink(),
@@ -630,7 +640,7 @@ fn a_node_is_installed_over_ssh_with_the_configured_user_key_and_channel() {
     let audit = Lines::default();
     let daemon = start_with(
         &cfg,
-        build_ports_with_exec(&cfg, ssh.clone()).expect("ports"),
+        ports_with_ssh(&cfg, &ssh),
         quick(),
         Settings::new(cfg.proxy_uid),
         audit.sink(),

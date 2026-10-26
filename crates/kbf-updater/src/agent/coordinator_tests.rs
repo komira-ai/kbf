@@ -145,7 +145,23 @@ fn one(config: &Arc<ServerConfig>, tcp: TcpStream, answer: Plan) -> Seen {
             let _ = tls.write_all(&bytes);
             let _ = tls.flush();
         }
-        Plan::Silent => std::thread::sleep(Duration::from_millis(400)),
+        // Hold the connection until the client has hung up on it; the 5 s read timeout of
+        // this connection is only a hang guard, and `client_left` says it was not what ended
+        // the wait.
+        Plan::Silent => {
+            seen.client_left = loop {
+                match tls.read(&mut chunk) {
+                    Ok(0) => break true,
+                    Ok(_) => {}
+                    Err(e) => {
+                        break !matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        );
+                    }
+                }
+            };
+        }
         Plan::Trickle => {
             for byte in b"HTTP/1.1 200 OK\r\nX-Slow: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy".iter()
             {
@@ -388,7 +404,8 @@ fn a_coordinator_that_is_not_there_or_does_not_answer_is_unreachable() {
     let slow = rig.client(addr).with_timeout(Duration::from_millis(100));
     let err = slow.heartbeat(&beat()).unwrap_err();
     assert!(matches!(err, CoordinatorError::Unreachable(_)), "{err:?}");
-    server.join().unwrap();
+    // It was the client that gave up on the silent server, not the server that hung up.
+    assert!(server.join().unwrap()[0].client_left);
 
     // A name that is no host's.
     let nowhere = HttpsCoordinator::new(

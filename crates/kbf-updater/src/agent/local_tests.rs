@@ -355,9 +355,26 @@ fn a_helper_that_is_gone_or_silent_is_unreachable() {
     let d = dir("lc-slow");
     let listener = UnixListener::bind(d.join("slow.sock")).unwrap();
     let hold = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        std::thread::sleep(Duration::from_millis(500));
-        drop(stream);
+        let (mut stream, _) = listener.accept().unwrap();
+        // Say nothing, and hold the connection until the client hangs up on it (the read
+        // timeout here is only a hang guard).
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut sink = [0_u8; 64];
+        // Whether the client hung up (and the wait did not run out its guard).
+        loop {
+            match std::io::Read::read(&mut stream, &mut sink) {
+                Ok(0) => break true,
+                Ok(_) => {}
+                Err(e) => {
+                    break !matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    );
+                }
+            }
+        }
     });
     let quick = Limits {
         other: Duration::from_millis(100),
@@ -367,7 +384,10 @@ fn a_helper_that_is_gone_or_silent_is_unreachable() {
         SocketLocal::new(&d.join("slow.sock"), quick).query(),
         Err(LocalError::Unreachable(_))
     ));
-    hold.join().unwrap();
+    assert!(
+        hold.join().unwrap(),
+        "the client gave up on the silent helper before the helper's guard ran out"
+    );
 
     for error in [
         LocalError::Unreachable("x".into()),
