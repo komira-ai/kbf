@@ -576,9 +576,16 @@ sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest \
 - `--xcode` clones the app into the guest's `/Applications/Xcode.app`. The guest disk is on
   another volume than the app, so in practice this is a file-by-file copy (a tree clone is
   tried first). Everything becomes owned by root:wheel; the setuid, setgid and sticky bits
-  are dropped; extended attributes follow `std::fs::copy`. The new copy is built under a
-  staging name and renamed into place, so a failed run never leaves a half Xcode.app under
-  the real name, and a rerun replaces the earlier copy.
+  are dropped on both paths. The file-by-file copy writes the planned modes and opens each
+  source without following a link, refusing a file that is no longer a regular file. A tree
+  clone copies the live tree, so it is walked again afterwards: it is refused unless it
+  holds exactly the planned entries (same kinds, link targets and file sizes) and then gets
+  the planned modes. Extended attributes are not copied by the file-by-file path. The new
+  copy is built under a staging name and renamed into place, so a failed run never leaves a
+  half Xcode.app under the real name. A rerun removes the earlier copy and then renames the
+  new one in (a run that dies between the two leaves no Xcode.app), and it holds both
+  copies until then, so the free-space check, which counts the earlier copy as used, needs
+  room for both.
 - A symbolic link in the app is recreated, never followed, when its target stays inside the
   app: relative with the `..` components first and no more than the link is deep, or an
   absolute path into `/Applications/Xcode.app`. Any other link, a socket, a pipe or a
@@ -586,7 +593,8 @@ sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest \
   as links and lists them in the report.
 - `--sim-runtime` (repeatable, at most 8, each named `<name>.dmg` with letters, digits,
   `.`, `_`, `-`) copies the image to `/private/var/kbf-sim/runtimes/<name>.dmg` while
-  hashing it; the directory then holds exactly the runtimes of the latest setup. The report
+  hashing it; the directory then holds exactly the runtimes of the latest setup (a setup that names none
+  empties it). The report
   records each one's name, size and SHA-256.
 - The free space of the guest's Data volume is read first. If Xcode and the runtimes plus
   4 GiB of headroom do not fit, nothing is written and the error says what is needed, what

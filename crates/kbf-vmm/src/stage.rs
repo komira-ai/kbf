@@ -6,7 +6,9 @@
 //! [`execute`] writes a plan into a mounted Data volume: it checks the free space first,
 //! checks that every directory it writes through is a real directory of the volume (a
 //! symbolic link planted by an earlier guest is not followed), builds Xcode.app beside its
-//! final name and renames it into place, and copies the runtimes while hashing them. Both
+//! final name and renames it into place (the previous copy is removed first), and replaces
+//! the runtimes while hashing them (the runtime directory ends holding exactly the plan's
+//! runtimes, none when the plan has none). Both
 //! are plain Rust over directories, so the tests run them on a fake volume; the attach and
 //! detach around [`execute`] are `offline::stage` (macOS only).
 //!
@@ -17,7 +19,12 @@
 //!   path into the staged copy itself; any other link is refused unless the operator passed
 //!   `--allow-external-links`, and then it is listed in the report. Hard links become
 //!   separate files. A fifo, socket or device is refused. Owners become root:wheel; the
-//!   setuid, setgid and sticky bits are dropped.
+//!   setuid, setgid and sticky bits are dropped. This holds for both ways of building the
+//!   copy. The file-by-file copy writes the plan's modes and opens each source without
+//!   following a link, refusing one that is no longer a regular file. A tree clone copies
+//!   the live tree, so it is walked again afterwards, refused unless it holds exactly the
+//!   plan's entries (kinds, link targets, file sizes), and given the plan's modes. Extended
+//!   attributes are not copied by the file-by-file path.
 //! - An app bundle (`--sim-app`) is copied by the same rules as Xcode.app into
 //!   `/private/var/kbf-sim/apps/<name>.app`, which then holds exactly that app.
 //! - A runtime is one regular file named `<name>.dmg`, copied byte for byte while its
@@ -571,13 +578,35 @@ fn check_space(volume: &Path, plan: &Plan, env: &Env<'_>) -> Result<(u64, u64), 
 }
 
 /// Copies the file `src` to the new file `dst` with `mode`, and checks that `bytes` were
-/// copied (the file is the one that was planned).
+/// copied (the file is the one that was planned). `src` is opened without following a link
+/// (and without blocking on a pipe) and the open file is checked to be a regular file, so a
+/// file swapped for a link or another kind after the plan is refused, not read as root.
 pub(crate) fn copy_file(src: &Path, dst: &Path, mode: u32, bytes: u64) -> Result<(), String> {
-    let copied = std::fs::copy(src, dst)
+    use std::os::unix::fs::OpenOptionsExt;
+    let fail =
+        |e: &dyn std::fmt::Display| format!("copy {} -> {}: {e}", src.display(), dst.display());
+    let mut from = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(src)
+        .map_err(|e| fail(&e))?;
+    if !from.metadata().map_err(|e| fail(&e))?.is_file() {
+        return Err(format!(
+            "{} is no longer the regular file that was planned",
+            src.display()
+        ));
+    }
+    let mut to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dst)
+        .map_err(|e| fail(&e))?;
+    let copied = io::copy(&mut from, &mut to)
         .and_then(|n| {
             std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode)).map(|()| n)
         })
-        .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+        .map_err(|e| fail(&e))?;
     if copied == bytes {
         Ok(())
     } else {
@@ -601,10 +630,80 @@ pub(crate) fn apply_modes(dirs: Vec<(PathBuf, u32)>) -> Result<(), String> {
         .try_for_each(|(dir, mode)| chmod(&dir, mode))
 }
 
+/// What a node is, without where its bytes come from: for comparing a tree on the volume
+/// with the plan.
+fn shape(n: &Node) -> (&Path, u8, Option<&Path>, u64) {
+    match n {
+        Node::Dir { rel, .. } => (rel, 0, None, 0),
+        Node::File { rel, bytes, .. } => (rel, 1, None, *bytes),
+        Node::Link { rel, target } => (rel, 2, Some(target), 0),
+    }
+}
+
+/// Holds a cloned tree to the plan. The clone copies the live host tree, not the plan, so
+/// the tree at `staging` is walked again (nothing followed): it must hold exactly the plan's
+/// entries (same kinds, link targets and file sizes; so no link, special file or entry the
+/// plan did not accept, and nothing past the plan's entry count), and every mode is then set
+/// to the plan's, which drops the setuid, setgid and sticky bits.
+fn verify_clone(x: &TreePlan, staging: &Path) -> Result<(), String> {
+    let mismatch = |why: String| {
+        format!(
+            "the cloned tree does not match the plan (the app changed since it was planned): {why}"
+        )
+    };
+    let mut walk = Walk {
+        root: staging.to_owned(),
+        guest_root: simpaths::XCODE_APP.to_owned(),
+        limits: Limits {
+            max_entries: x.nodes.len().saturating_add(1),
+            max_depth: MAX_DEPTH,
+        },
+        // A link the plan accepted is in the plan; any other is a difference below.
+        allow_external: true,
+        nodes: Vec::new(),
+        bytes: 0,
+        external: Vec::new(),
+    };
+    walk.dir(Path::new(""), 0)
+        .map_err(|e| mismatch(e.to_string()))?;
+    let differs = walk.nodes.len() != x.nodes.len()
+        || walk
+            .nodes
+            .iter()
+            .zip(&x.nodes)
+            .any(|(a, b)| shape(a) != shape(b));
+    if differs {
+        let at = walk
+            .nodes
+            .iter()
+            .zip(&x.nodes)
+            .find(|(a, b)| shape(a) != shape(b))
+            .map_or(Path::new(""), |(a, _)| a.rel());
+        return Err(mismatch(format!(
+            "{} entries cloned, {} planned, first difference at {}",
+            walk.nodes.len(),
+            x.nodes.len(),
+            at.display()
+        )));
+    }
+    let mut dir_modes = vec![(staging.to_owned(), 0o755)];
+    for node in &x.nodes {
+        let at = staging.join(node.rel());
+        match node {
+            Node::Dir { mode, .. } => dir_modes.push((at, *mode)),
+            Node::File { mode, .. } => chmod(&at, *mode)?,
+            Node::Link { .. } => {}
+        }
+    }
+    apply_modes(dir_modes)
+}
+
 /// Builds the plan's tree at `staging` (which does not exist): a tree clone when the host
-/// can, else file by file. Returns the method used.
+/// can (checked against the plan afterwards, see [`verify_clone`]), else file by file.
+/// Returns the method used.
 fn build_tree(x: &TreePlan, staging: &Path, env: &Env<'_>) -> Result<&'static str, String> {
     if (env.clone_tree)(&x.source, staging).is_ok() {
+        verify_clone(x, staging)?;
         return Ok("clone");
     }
     // A failed clone may leave part of the tree: start from nothing.
@@ -680,7 +779,9 @@ fn stage_tree(
     for node in &tree.nodes {
         chown(env, &staging.join(node.rel()))?;
     }
-    // The finished copy replaces a previous one in a single rename.
+    // The finished copy replaces a previous one: the old tree is removed, then the new one
+    // is renamed into place (a directory cannot be renamed over a full one). A run that dies
+    // between the two leaves no Xcode.app, never a half one.
     remove_leftover(&dest);
     rename(&staging, &dest)?;
     let count = |f: fn(&Node) -> bool| tree.nodes.iter().filter(|n| f(n)).count();
@@ -734,7 +835,9 @@ fn stage_runtimes(volume: &Path, runtimes: &[RuntimePlan], env: &Env<'_>) -> Res
 /// # Errors
 /// Not enough free space (named, with the sizes), a link or file where a directory must
 /// be, a source that changed since the plan, or an I/O error. Nothing already staged is
-/// rolled back; Xcode.app is renamed into place only once complete.
+/// rolled back; Xcode.app is renamed into place only once complete. A rerun holds the
+/// previous Xcode.app and the new one side by side until the rename, so the free-space check
+/// (which counts the previous copy as used) asks for room for both.
 pub fn execute(volume: &Path, plan: &Plan, env: &Env<'_>) -> Result<Value, String> {
     let (free, need) = check_space(volume, plan, env)?;
     let xcode = plan
@@ -754,12 +857,9 @@ pub fn execute(volume: &Path, plan: &Plan, env: &Env<'_>) -> Result<Value, Strin
             })
         })
         .transpose()?;
-    let runtimes = if plan.runtimes.is_empty() {
-        None
-    } else {
-        Some(stage_runtimes(volume, &plan.runtimes, env)?)
-    };
-    let manifest = json!({"xcode": xcode, "app": app, "runtimes": runtimes.clone().unwrap_or_else(|| json!([]))});
+    // Always: a setup that names no runtime clears the earlier ones.
+    let runtimes = stage_runtimes(volume, &plan.runtimes, env)?;
+    let manifest = json!({"xcode": xcode, "app": app, "runtimes": runtimes});
     let rel = Path::new(simpaths::MANIFEST.trim_start_matches('/'));
     ensure_dir(volume, rel.parent().unwrap_or(Path::new("")), env)?;
     let path = volume.join(rel);
