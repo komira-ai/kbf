@@ -608,7 +608,8 @@ $D/kbf-vmm probe e3 --work-dir $W --guest-binary $D/kbf-guest [--keep] [--graphi
 ```
 
 Staging also installs one more launch daemon, `com.kbf.sim`, which runs `kbf-guest sim` as
-root once per boot. A base that has it runs the simulator steps on every boot, E1 included.
+root once per boot from the copy of `kbf-guest` on the guest's disk: pass `--guest-binary` in
+this setup or have passed it in an earlier one, or the daemon has nothing to run. A base that has it runs the simulator steps on every boot, E1 included.
 The steps, in order, each one command with its own deadline (the flags of the daemon, with
 the defaults shown; a command still running at its deadline is killed with its process
 group):
