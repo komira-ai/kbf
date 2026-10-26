@@ -38,6 +38,7 @@ pub mod shutdown;
 #[cfg(target_os = "macos")]
 pub mod shutdown_host;
 pub mod sim;
+pub mod sim_choose;
 #[cfg(target_os = "macos")]
 pub mod sim_host;
 pub mod sim_run;
