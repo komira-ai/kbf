@@ -625,7 +625,9 @@ mod tests {
     /// timeout has passed since its last byte, and not before; that it stores and records
     /// nothing, is counted, and gives back its bytes, so that an upload that was waiting for
     /// the room is admitted then and is stored. Asserts also that the upload counts the bytes it
-    /// holds as the 10 that arrived, not the 60 it claimed.
+    /// holds as the 10 that arrived, not the 60 it claimed: exactly under cargo-nextest, where
+    /// this test has the process to itself; from below under `cargo test`, where other tests in
+    /// the process hold bytes in the same gauge.
     #[tokio::test(start_paused = true)]
     async fn a_stalled_upload_is_cut_and_its_room_goes_to_the_one_waiting() {
         let packs = packs_for(100);
@@ -643,7 +645,12 @@ mod tests {
         let metrics = packs.metrics();
         assert_eq!(metrics.inflight_bytes(), 60);
         assert_eq!(metrics.upload_waits.get(), 1);
-        assert_eq!(in_flight::process().current(), 10);
+        let held = in_flight::process().current();
+        if std::env::var_os("NEXTEST").is_some() {
+            assert_eq!(held, 10, "the bytes that arrived, not the 60 claimed");
+        } else {
+            assert!(held >= 10, "{held}");
+        }
         assert!(!waiting_upload.is_finished());
 
         tokio::time::advance(IDLE - Duration::from_secs(1)).await;
