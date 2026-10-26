@@ -5,7 +5,9 @@
 //! ([`crate::frame`], port 5000, like every probe), then one summary frame:
 //!
 //! 1. as root: `xcode-select -s`, `xcodebuild -license accept`, `xcodebuild -runFirstLaunch`,
-//!    and `xcrun simctl runtime add <dmg>` for each runtime image the host staged;
+//!    and for each runtime the host staged `xcrun simctl runtime add <dmg>` (a `.dmg`) or
+//!    `xcodebuild -importPlatform <bundle>` (a `.exportedBundle`, what
+//!    `xcodebuild -downloadPlatform -exportPath` writes);
 //! 2. in the session of the guest's auto-login user (`launchctl asuser <uid> sudo -u <user>`):
 //!    `simctl list runtimes -j` and `list devicetypes -j` (the output picks the runtime and
 //!    the device type), `simctl create`, `boot`, `bootstatus -b`, an optional app
@@ -60,6 +62,9 @@ pub const SCREENSHOT_MAX_BYTES: usize = 700_000;
 /// The longest name of a staged runtime image or app, in bytes: it becomes part of a result
 /// frame's name, which the host limits to 100.
 pub const MAX_STAGED_NAME_BYTES: usize = 64;
+/// The suffix of a staged runtime that is an exported platform bundle (a directory), not a
+/// disk image (`.dmg`).
+pub const BUNDLE_SUFFIX: &str = ".exportedBundle";
 /// The most output a command's capture keeps (more is dropped, and the step says so).
 pub const MAX_CAPTURE_BYTES: usize = 4 << 20;
 
@@ -191,17 +196,23 @@ pub fn plan(inputs: &Inputs) -> Vec<Step> {
     ];
     let mut adds = Vec::new();
     for name in &inputs.runtimes {
-        let id = format!("runtime-add-{name}");
-        steps.push(fixed(
-            Root,
-            RuntimeAdd,
-            &id,
-            &["first-launch"],
-            &[XCRUN, "simctl", "runtime", "add", &runtime_path(name)],
-        ));
+        // An image is added, a bundle is imported; both are slow and share one deadline.
+        let path = runtime_path(name);
+        let (id, argv) = if name.ends_with(BUNDLE_SUFFIX) {
+            (
+                format!("runtime-import-{name}"),
+                vec![XCODEBUILD, "-importPlatform", &path],
+            )
+        } else {
+            (
+                format!("runtime-add-{name}"),
+                vec![XCRUN, "simctl", "runtime", "add", &path],
+            )
+        };
+        steps.push(fixed(Root, RuntimeAdd, &id, &["first-launch"], &argv));
         adds.push(id);
     }
-    // The runtimes are listed once every staged one has been added.
+    // The runtimes are listed once every staged one has been added or imported.
     let after_adds: Vec<&str> = if adds.is_empty() {
         vec!["first-launch"]
     } else {
@@ -709,7 +720,7 @@ pub fn run(host: &dyn SimHost, cfg: &Config, log: &mut dyn Write) -> SummaryFram
         runtimes: host
             .runtime_images()
             .into_iter()
-            .filter(|n| name_ok(n, ".dmg"))
+            .filter(|n| name_ok(n, ".dmg") || name_ok(n, BUNDLE_SUFFIX))
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect(),

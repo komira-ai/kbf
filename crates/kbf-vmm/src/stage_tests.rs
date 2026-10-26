@@ -13,6 +13,9 @@ use crate::fake::{holds, tmp};
 use crate::stage::link as stage_link;
 use crate::stage::*;
 
+#[path = "stage_bundle_tests.rs"]
+mod bundle;
+
 #[cfg(target_os = "macos")]
 #[path = "stage_xattr_tests.rs"]
 mod xattr;

@@ -173,12 +173,13 @@ pub enum ImageCmd {
         /// app is copied as a link when its target stays inside the app, else refused.
         #[arg(long)]
         xcode: Option<PathBuf>,
-        /// A simulator runtime disk image (`<name>.dmg`) to stage under
-        /// /private/var/kbf-sim/runtimes. Repeat the flag for several (at most 8, with
-        /// different file names); the directory then holds exactly these (a setup that names none
-        /// empties it). The report
-        /// records each one's name, size and SHA-256.
-        #[arg(long = "sim-runtime", value_name = "DMG")]
+        /// A simulator runtime to stage under /private/var/kbf-sim/runtimes: a disk image
+        /// (`<name>.dmg`, a file) or an exported bundle (`<name>.exportedBundle`, a directory,
+        /// what `xcodebuild -downloadPlatform iOS -exportPath` writes). Repeat the flag for
+        /// several (at most 8, with different names); the directory then holds exactly these
+        /// (a setup that names none empties it). The report records each image's name, size
+        /// and SHA-256, and each bundle's files with a SHA-256 for each.
+        #[arg(long = "sim-runtime", value_name = "DMG_OR_BUNDLE")]
         sim_runtimes: Vec<PathBuf>,
         /// An app bundle (`<name>.app`, built for the iOS simulator, with an Info.plist) to
         /// stage under /private/var/kbf-sim/apps for `probe e3` to install and launch; copied

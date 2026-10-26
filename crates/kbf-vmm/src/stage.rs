@@ -31,8 +31,15 @@
 //!   attributes are out of scope.
 //! - An app bundle (`--sim-app`) is copied by the same rules as Xcode.app into
 //!   `/private/var/kbf-sim/apps/<name>.app`, which then holds exactly that app.
-//! - A runtime is one regular file named `<name>.dmg`, copied byte for byte while its
-//!   SHA-256 is computed.
+//! - A runtime is either one regular file named `<name>.dmg`, copied byte for byte while its
+//!   SHA-256 is computed, or a directory named `<name>.exportedBundle` (what
+//!   `xcodebuild -downloadPlatform -exportPath` writes). A bundle is planned with the same
+//!   walk as Xcode.app (nothing followed; regular files and directories; a link only when
+//!   its target stays inside the bundle, whose guest path is under the runtime directory;
+//!   no `--allow-external-links` for it; a fifo, socket or device refused), counted in the
+//!   free-space check, and copied file by file with each file hashed while it is copied.
+//!   The report and `staged.json` record the bundle as a manifest of relative path, size and
+//!   SHA-256 per file. Modes are normalized (directories 0755, files 0644), owners root:wheel.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -98,8 +105,10 @@ pub enum StageError {
     TooDeep(PathBuf, usize),
     #[error("{0} is not a regular file")]
     NotRegular(PathBuf),
+    #[error("{0} is not a directory (a <name>.exportedBundle is a directory)")]
+    NotDirectory(PathBuf),
     #[error(
-        "{0}: a runtime must be named <name>.dmg, at most {MAX_RUNTIME_NAME_BYTES} bytes, with name made of letters, digits, '.', '_' or '-' (no '..')"
+        "{0}: a runtime must be named <name>.dmg (a file) or <name>.exportedBundle (a directory), at most {MAX_RUNTIME_NAME_BYTES} bytes, with name made of letters, digits, '.', '_' or '-' (no '..')"
     )]
     BadRuntimeName(PathBuf),
     #[error("two runtimes are named {0}; each --sim-runtime needs its own file name")]
@@ -149,13 +158,37 @@ pub struct TreePlan {
     pub external_links: Vec<(PathBuf, PathBuf)>,
 }
 
-/// One runtime disk image as it will be copied.
+/// What a staged runtime is, from its name's suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeKind {
+    /// A disk image, one file (`<name>.dmg`).
+    Dmg,
+    /// An exported platform, a directory (`<name>.exportedBundle`).
+    Bundle,
+}
+
+impl RuntimeKind {
+    /// The word the report and `staged.json` use.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dmg => "dmg",
+            Self::Bundle => "bundle",
+        }
+    }
+}
+
+/// One runtime (a disk image or an exported bundle) as it will be copied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePlan {
-    /// The file name, which is also the name in the guest.
+    /// The file or directory name, which is also the name in the guest.
     pub name: String,
+    pub kind: RuntimeKind,
     pub src: PathBuf,
+    /// The size of the image, or the sum of the file sizes of the bundle.
     pub bytes: u64,
+    /// What a bundle holds, in the order of [`TreePlan`]; empty for an image.
+    pub nodes: Vec<Node>,
 }
 
 /// An app bundle for the simulator to install.
@@ -414,17 +447,25 @@ pub fn plan_app(app: &Path, allow_external_links: bool) -> Result<AppPlan, Stage
     Ok(AppPlan { name, tree })
 }
 
-/// A runtime's file name when it is `<name>.dmg` with a name of letters, digits, `.`, `_`
-/// and `-` only (the name becomes a path in the guest).
-fn runtime_name(path: &Path) -> Option<String> {
+/// A runtime's name and kind when it is `<name>.dmg` or `<name>.exportedBundle` with a name
+/// of letters, digits, `.`, `_` and `-` only (the name becomes a path in the guest).
+fn runtime_name(path: &Path) -> Option<(String, RuntimeKind)> {
     let name = path.file_name()?.to_str()?;
-    kbf_guest::sim::name_ok(name, ".dmg").then(|| name.to_owned())
+    let kind = if kbf_guest::sim::name_ok(name, ".dmg") {
+        RuntimeKind::Dmg
+    } else if kbf_guest::sim::name_ok(name, kbf_guest::sim::BUNDLE_SUFFIX) {
+        RuntimeKind::Bundle
+    } else {
+        return None;
+    };
+    Some((name.to_owned(), kind))
 }
 
-/// Reads the runtime disk images at `paths` into plans.
+/// Reads the runtimes at `paths` (disk images and exported bundles) into plans.
 ///
 /// # Errors
-/// Too many, a path that is a link or not a regular file, a name the guest path cannot
+/// Too many, a path that is a link, a `.dmg` that is not a regular file, a bundle that is not
+/// a directory or holds something the Xcode.app walk refuses, a name the guest path cannot
 /// carry, or two of one name.
 pub fn plan_runtimes(paths: &[PathBuf]) -> Result<Vec<RuntimePlan>, StageError> {
     if paths.len() > MAX_RUNTIMES {
@@ -433,21 +474,42 @@ pub fn plan_runtimes(paths: &[PathBuf]) -> Result<Vec<RuntimePlan>, StageError> 
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for p in paths {
-        let name = runtime_name(p).ok_or_else(|| StageError::BadRuntimeName(p.clone()))?;
+        let (name, kind) = runtime_name(p).ok_or_else(|| StageError::BadRuntimeName(p.clone()))?;
         let meta = std::fs::symlink_metadata(p).map_err(|e| io_err("stat", p, &e))?;
         if meta.file_type().is_symlink() {
             return Err(StageError::Symlink(p.clone()));
         }
-        if !meta.is_file() {
-            return Err(StageError::NotRegular(p.clone()));
-        }
+        let (bytes, nodes) = match kind {
+            RuntimeKind::Dmg if !meta.is_file() => {
+                return Err(StageError::NotRegular(p.clone()));
+            }
+            RuntimeKind::Dmg => (meta.len(), Vec::new()),
+            RuntimeKind::Bundle if !meta.is_dir() => {
+                return Err(StageError::NotDirectory(p.clone()));
+            }
+            RuntimeKind::Bundle => {
+                let mut walk = Walk {
+                    root: p.clone(),
+                    guest_root: format!("{}/{name}", simpaths::RUNTIME_DIR),
+                    limits: Limits::DEFAULT,
+                    allow_external: false,
+                    nodes: Vec::new(),
+                    bytes: 0,
+                    external: Vec::new(),
+                };
+                walk.dir(Path::new(""), 0)?;
+                (walk.bytes, walk.nodes)
+            }
+        };
         if !seen.insert(name.clone()) {
             return Err(StageError::DuplicateRuntime(name));
         }
         out.push(RuntimePlan {
             name,
+            kind,
             src: p.clone(),
-            bytes: meta.len(),
+            bytes,
+            nodes,
         });
     }
     Ok(out)
@@ -587,6 +649,28 @@ fn check_space(volume: &Path, plan: &Plan, env: &Env<'_>) -> Result<(u64, u64), 
 /// (and without blocking on a pipe) and the open file is checked to be a regular file, so a
 /// file swapped for a link or another kind after the plan is refused, not read as root.
 pub(crate) fn copy_file(src: &Path, dst: &Path, mode: u32, bytes: u64) -> Result<(), String> {
+    copy_file_with(src, dst, mode, bytes, false).map(|_| ())
+}
+
+/// [`copy_file`] that also returns the SHA-256 of the bytes copied.
+pub(crate) fn copy_file_hashed(
+    src: &Path,
+    dst: &Path,
+    mode: u32,
+    bytes: u64,
+) -> Result<String, String> {
+    copy_file_with(src, dst, mode, bytes, true).map(Option::unwrap_or_default)
+}
+
+fn copy_file_with(
+    src: &Path,
+    dst: &Path,
+    mode: u32,
+    bytes: u64,
+    hash: bool,
+) -> Result<Option<String>, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
     use std::os::unix::fs::OpenOptionsExt;
     let fail =
         |e: &dyn std::fmt::Display| format!("copy {} -> {}: {e}", src.display(), dst.display());
@@ -607,12 +691,26 @@ pub(crate) fn copy_file(src: &Path, dst: &Path, mode: u32, bytes: u64) -> Result
         .mode(0o600)
         .open(dst)
         .map_err(|e| fail(&e))?;
-    let copied = io::copy(&mut from, &mut to).map_err(|e| fail(&e))?;
+    let (copied, sha256) = if hash {
+        let (mut hasher, mut buf, mut total) = (Sha256::new(), vec![0u8; 1 << 20], 0u64);
+        loop {
+            let n = from.read(&mut buf).map_err(|e| fail(&e))?;
+            if n == 0 {
+                break;
+            }
+            to.write_all(&buf[..n]).map_err(|e| fail(&e))?;
+            hasher.update(&buf[..n]);
+            total += n as u64;
+        }
+        (total, Some(hex::encode(hasher.finalize())))
+    } else {
+        (io::copy(&mut from, &mut to).map_err(|e| fail(&e))?, None)
+    };
     // The attributes carry part of the code signature of a file that is not a Mach-O.
     xattr::copy_fd(&from, &to, src).map_err(|e| fail(&e))?;
     std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode)).map_err(|e| fail(&e))?;
     if copied == bytes {
-        Ok(())
+        Ok(sha256)
     } else {
         Err(format!(
             "{} changed while it was copied ({bytes} bytes planned, {copied} copied)",
@@ -691,10 +789,11 @@ fn verify_clone(x: &TreePlan, staging: &Path) -> Result<(), String> {
         )));
     }
     let mut dir_modes = vec![(staging.to_owned(), 0o755)];
-    // The clone carries the attributes of the app; all but the quarantine mark stay.
+    // The clone carries the attributes of the app; all but the quarantine mark and the macl
+    // list stay.
     std::iter::once(staging.to_owned())
         .chain(x.nodes.iter().map(|n| staging.join(n.rel())))
-        .try_for_each(|at| xattr::strip_quarantine(&at))?;
+        .try_for_each(|at| xattr::strip_skipped(&at))?;
     for node in &x.nodes {
         let at = staging.join(node.rel());
         match node {
@@ -816,6 +915,37 @@ fn stage_tree(
     }))
 }
 
+/// Builds the bundle `r` at `dst` (which does not exist): directories 0755, files 0644,
+/// each file hashed while it is copied, everything owned by root. Returns the manifest, one
+/// entry per file.
+fn stage_bundle(r: &RuntimePlan, dst: &Path, env: &Env<'_>) -> Result<Vec<Value>, String> {
+    mkdir(dst, 0o700)?;
+    let mut dirs = vec![(dst.to_owned(), 0o755)];
+    let mut files = Vec::new();
+    for node in &r.nodes {
+        let at = dst.join(node.rel());
+        match node {
+            Node::Dir { .. } => {
+                mkdir(&at, 0o700)?;
+                dirs.push((at, 0o755));
+            }
+            Node::File {
+                rel, src, bytes, ..
+            } => {
+                let sha256 = copy_file_hashed(src, &at, 0o644, *bytes)?;
+                files.push(json!({"path": rel, "bytes": bytes, "sha256": sha256}));
+            }
+            Node::Link { target, .. } => link(target, &at)?,
+        }
+    }
+    apply_modes(dirs)?;
+    chown(env, dst)?;
+    r.nodes
+        .iter()
+        .try_for_each(|n| chown(env, &dst.join(n.rel())))?;
+    Ok(files)
+}
+
 fn stage_runtimes(volume: &Path, runtimes: &[RuntimePlan], env: &Env<'_>) -> Result<Value, String> {
     let rel = Path::new(simpaths::RUNTIME_DIR.trim_start_matches('/'));
     let dir = volume.join(rel);
@@ -826,6 +956,18 @@ fn stage_runtimes(volume: &Path, runtimes: &[RuntimePlan], env: &Env<'_>) -> Res
     for r in runtimes {
         let dst = dir.join(&r.name);
         remove_leftover(&dst);
+        let dest = format!("{}/{}", simpaths::RUNTIME_DIR, r.name);
+        if r.kind == RuntimeKind::Bundle {
+            let files = stage_bundle(r, &dst, env)?;
+            staged.push(json!({
+                "name": r.name,
+                "kind": r.kind.as_str(),
+                "bytes": r.bytes,
+                "files": files,
+                "dest": dest,
+            }));
+            continue;
+        }
         let sha256 = image::stage(&r.src, &dst).map_err(|e| e.to_string())?;
         let size = file_len(&dst)?;
         if size != r.bytes {
@@ -839,9 +981,10 @@ fn stage_runtimes(volume: &Path, runtimes: &[RuntimePlan], env: &Env<'_>) -> Res
         chown(env, &dst)?;
         staged.push(json!({
             "name": r.name,
+            "kind": r.kind.as_str(),
             "bytes": size,
             "sha256": sha256,
-            "dest": format!("{}/{}", simpaths::RUNTIME_DIR, r.name),
+            "dest": dest,
         }));
     }
     Ok(Value::Array(staged))

@@ -1286,3 +1286,97 @@ fn the_system_clock_moves_forward() {
     assert!(c.now_ms() >= a);
     let _ = SystemClock::new();
 }
+
+/// Catches an exported bundle added with `simctl runtime add` (which takes an image), an image
+/// imported with `-importPlatform`, an import that is not a root step after first launch, one
+/// the listing does not wait for, one on a deadline of its own, and a frame name for the
+/// longest bundle name that the host's sink would refuse.
+#[test]
+fn a_bundle_runtime_is_imported_and_an_image_is_added() {
+    let steps = plan(&Inputs {
+        runtimes: vec!["a.dmg".into(), "b_27.exportedBundle".into()],
+        app: None,
+    });
+    assert_eq!(
+        ids(&steps)[3..6],
+        [
+            "runtime-add-a.dmg",
+            "runtime-import-b_27.exportedBundle",
+            "list-runtimes"
+        ]
+    );
+    let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        fixed_argv(&steps, "runtime-import-b_27.exportedBundle"),
+        s(&[
+            "/usr/bin/xcodebuild",
+            "-importPlatform",
+            "/private/var/kbf-sim/runtimes/b_27.exportedBundle"
+        ])
+    );
+    assert_eq!(
+        fixed_argv(&steps, "runtime-add-a.dmg")[..4],
+        s(&["/usr/bin/xcrun", "simctl", "runtime", "add"])[..]
+    );
+    let import = &steps[4];
+    assert_eq!(import.needs, ["first-launch"]);
+    assert_eq!((import.who, import.class), (Who::Root, Class::RuntimeAdd));
+    let list = steps
+        .iter()
+        .find(|s| s.id == "list-runtimes")
+        .expect("list");
+    assert_eq!(
+        list.needs,
+        ["runtime-add-a.dmg", "runtime-import-b_27.exportedBundle"]
+    );
+    // The same class as an add: one deadline, from one flag.
+    assert_eq!(import.class, Class::RuntimeAdd);
+
+    let longest = format!(
+        "{}{BUNDLE_SUFFIX}",
+        "n".repeat(MAX_STAGED_NAME_BYTES - BUNDLE_SUFFIX.len())
+    );
+    assert!(name_ok(&longest, BUNDLE_SUFFIX));
+    let steps = plan(&Inputs {
+        runtimes: vec![longest],
+        app: Some("A.app".into()),
+    });
+    for (i, st) in steps.iter().enumerate() {
+        assert!(step_frame_name(i, &st.id).len() <= 100, "{}", st.id);
+    }
+}
+
+/// Catches the run importing a bundle through the add step or the reverse, using a bundle name
+/// the host did not stage (bad characters, wrong case of the suffix, no name), the
+/// two runtimes of one run not both reaching a command, and a frame not named for the import.
+#[test]
+fn a_run_imports_the_staged_bundle_and_ignores_names_the_host_did_not_stage() {
+    let mut host = Fake::new();
+    host.runtimes = vec![
+        "a.dmg".into(),
+        "b_27.exportedBundle".into(),
+        "bad name.exportedBundle".into(),
+        ".exportedBundle".into(),
+        "x.exportedbundle".into(),
+        "b_27.exportedBundle".into(),
+    ];
+    let summary = go(&host);
+    assert!(summary.ok);
+    let cmds = host.commands();
+    assert_eq!(
+        cmds[3],
+        "/usr/bin/xcrun simctl runtime add /private/var/kbf-sim/runtimes/a.dmg"
+    );
+    assert_eq!(
+        cmds[4],
+        "/usr/bin/xcodebuild -importPlatform /private/var/kbf-sim/runtimes/b_27.exportedBundle"
+    );
+    assert_eq!(cmds.iter().filter(|c| c.contains("import")).count(), 1);
+    assert_eq!(cmds.iter().filter(|c| c.contains("runtime add")).count(), 1);
+    assert_eq!(host.ran.borrow()[4].1.as_secs(), 1800);
+    let names: Vec<String> = host.sent.borrow().iter().map(|f| f.name.clone()).collect();
+    assert!(
+        names.contains(&"sim-step-05-runtime-import-b_27.exportedBundle.json".to_owned()),
+        "{names:?}"
+    );
+}

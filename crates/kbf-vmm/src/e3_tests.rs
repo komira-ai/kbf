@@ -541,10 +541,17 @@ fn the_stop_is_asked_over_vsock_and_the_report_says_how_it_went() {
 #[test]
 fn the_frames_of_the_largest_plan_fit_the_sinks_name_and_file_limits() {
     use kbf_guest::sim::{Inputs, max_frames, plan};
+    // Both kinds, at the longest name each may have (the import step's id is longer than the
+    // add step's).
     let longest = |i: usize| {
+        let suffix = if i.is_multiple_of(2) {
+            ".dmg"
+        } else {
+            kbf_guest::sim::BUNDLE_SUFFIX
+        };
         format!(
-            "{i}{}.dmg",
-            "n".repeat(kbf_guest::sim::MAX_STAGED_NAME_BYTES - 5)
+            "{i}{}{suffix}",
+            "n".repeat(kbf_guest::sim::MAX_STAGED_NAME_BYTES - 1 - suffix.len())
         )
     };
     let steps = plan(&Inputs {

@@ -4,13 +4,23 @@
 //! not a Mach-O the signature lives in `com.apple.cs.CodeDirectory`,
 //! `com.apple.cs.CodeRequirements`, `com.apple.cs.CodeSignature` and the like, and
 //! `com.apple.ResourceFork` and `com.apple.FinderInfo` can matter to the app too. The
-//! file-by-file copy therefore copies every attribute of a node it recreates, except
-//! [`QUARANTINE`]; the tree clone carries them by itself and has the same one removed
-//! afterwards. Both ways of building Xcode.app end with the same attributes.
+//! file-by-file copy therefore copies every attribute of a node it recreates, except the two
+//! in [`SKIPPED`] ([`QUARANTINE`] and [`MACL`]); the tree clone carries them by itself and
+//! has the same two removed afterwards. Both ways of building Xcode.app end with the same
+//! attributes. (Measured on a farm Mac, an App Store Xcode carries, apart from these, only
+//! `com.apple.appstore.*` attributes on the app root, which are copied.)
 //!
 //! `com.apple.quarantine` is left out because it marks a file as downloaded: the guest
 //! would ask Gatekeeper about Xcode on first launch, and a headless guest cannot answer.
 //! The operator installed this Xcode; the guest must not treat it as fetched.
+//!
+//! `com.apple.macl` is left out because it is a per-machine access list: macOS keeps it
+//! SIP-protected, so not even root can write it, and the list of apps allowed to open the
+//! file means nothing on another machine. Trying to copy it would fail the stage on the app
+//! root. On the clone path its removal is attempted like the quarantine mark's; if macOS
+//! refuses to remove it (EPERM or EACCES), that one refusal is ignored, because the guest
+//! ignores a list that is not its own. Any other attribute that cannot be read or written
+//! still fails the stage.
 //!
 //! A file's attributes are copied between the open files (the source was opened without
 //! following a link and checked to be a regular file), so they are the attributes of the
@@ -35,6 +45,11 @@ use std::path::Path;
 
 /// The attribute that marks a file as downloaded; never copied, removed from a clone.
 pub(crate) const QUARANTINE: &str = "com.apple.quarantine";
+/// The per-machine, SIP-protected access list; never copied, removal from a clone is tried
+/// and a refusal is ignored.
+pub(crate) const MACL: &str = "com.apple.macl";
+/// The attributes that are not carried into the guest.
+pub(crate) const SKIPPED: [&str; 2] = [QUARANTINE, MACL];
 /// The longest attribute name list (all names, NUL-terminated) read from one node.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) const MAX_NAMES_BYTES: usize = 1 << 20;
@@ -60,10 +75,18 @@ pub(crate) fn name_list(list: &[u8]) -> Result<Vec<&CStr>, String> {
     Ok(names)
 }
 
-/// Whether the attribute `name` is copied: all but [`QUARANTINE`].
+/// Whether the attribute `name` is copied: all but those in [`SKIPPED`].
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn copied(name: &CStr) -> bool {
-    name.to_bytes() != QUARANTINE.as_bytes()
+    !SKIPPED.iter().any(|s| name.to_bytes() == s.as_bytes())
+}
+
+/// Whether a failed removal of the attribute `name` (errno `errno`) is ignored: only macOS
+/// refusing to remove [`MACL`] (EPERM or EACCES, because SIP protects it). Anything else
+/// fails the stage.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn removal_refusal_is_ignored(name: &str, errno: Option<i32>) -> bool {
+    name == MACL && matches!(errno, Some(libc::EPERM | libc::EACCES))
 }
 
 /// Refuses a length of `what` above `max`.
@@ -79,7 +102,7 @@ pub(crate) fn check_len(what: &str, len: usize, max: usize) -> Result<(), String
 }
 
 /// Copies the attributes of the open file `src` (at `src_path`, for messages) to the open
-/// file `dst`, all but [`QUARANTINE`].
+/// file `dst`, all but those in [`SKIPPED`].
 ///
 /// # Errors
 /// An attribute could not be read or written, or is larger than the bounds allow.
@@ -111,24 +134,29 @@ pub(crate) fn copy_nofollow_with(src: &Path, dst: &Path, max_value: usize) -> Re
         .map_err(|e| format!("extended attributes of {}: {e}", src.display()))
 }
 
-/// Removes [`QUARANTINE`] from `path` itself (a link is not followed); absent is fine.
+/// Removes the attributes in [`SKIPPED`] from `path` itself (a link is not followed); absent
+/// is fine, and so is macOS refusing to remove [`MACL`] (see [`removal_refusal_is_ignored`]).
 ///
 /// # Errors
-/// The attribute exists and could not be removed.
+/// An attribute exists and could not be removed, other than that refusal.
 #[cfg(target_os = "macos")]
-pub(crate) fn strip_quarantine(path: &Path) -> Result<(), String> {
-    let (p, name) = (sys::cstr(path)?, sys::cstr(Path::new(QUARANTINE))?);
-    // SAFETY: both are NUL-terminated; `XATTR_NOFOLLOW` acts on a final link itself.
-    let rc = unsafe { libc::removexattr(p.as_ptr(), name.as_ptr(), libc::XATTR_NOFOLLOW) };
-    if rc == 0 {
-        return Ok(());
+pub(crate) fn strip_skipped(path: &Path) -> Result<(), String> {
+    let p = sys::cstr(path)?;
+    for attr in SKIPPED {
+        let name = sys::cstr(Path::new(attr))?;
+        // SAFETY: both are NUL-terminated; `XATTR_NOFOLLOW` acts on a final link itself.
+        let rc = unsafe { libc::removexattr(p.as_ptr(), name.as_ptr(), libc::XATTR_NOFOLLOW) };
+        if rc == 0 {
+            continue;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::ENOATTR)
+            && !removal_refusal_is_ignored(attr, e.raw_os_error())
+        {
+            return Err(format!("remove {attr} from {}: {e}", path.display()));
+        }
     }
-    let e = std::io::Error::last_os_error();
-    if e.raw_os_error() == Some(libc::ENOATTR) {
-        Ok(())
-    } else {
-        Err(format!("remove {QUARANTINE} from {}: {e}", path.display()))
-    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -145,7 +173,7 @@ pub(crate) fn copy_nofollow(_src: &Path, _dst: &Path) -> Result<(), String> {
 
 #[cfg(not(target_os = "macos"))]
 #[allow(clippy::unnecessary_wraps)]
-pub(crate) fn strip_quarantine(_path: &Path) -> Result<(), String> {
+pub(crate) fn strip_skipped(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -229,7 +257,7 @@ mod sys {
         }
     }
 
-    /// Copies every attribute of `from` but the quarantine mark to `to`; a value above
+    /// Copies every attribute of `from` but those in [`SKIPPED`] to `to`; a value above
     /// `max_value` is refused.
     pub(super) fn copy(from: At<'_>, to: At<'_>, max_value: usize) -> Result<(), String> {
         let total = list(from, std::ptr::null_mut(), 0).map_err(|e| format!("list: {e}"))?;
@@ -276,13 +304,23 @@ mod tests {
         assert!(name_list(b"a\0\0b\0").is_err());
     }
 
-    /// Catches a quarantine mark that is copied, and a signature attribute or a lookalike
-    /// that is dropped.
+    /// Catches a quarantine mark or a macl list that is copied (the stage would then fail on
+    /// the app root, where root cannot write macl), and a signature attribute, an App Store
+    /// attribute or a lookalike that is dropped.
     #[test]
-    fn only_the_quarantine_mark_is_left_out() {
+    fn only_the_quarantine_mark_and_the_macl_list_are_left_out() {
         let kept = |n: &str| copied(&CString::new(n).expect("name"));
+        assert_eq!(SKIPPED, ["com.apple.quarantine", "com.apple.macl"]);
         assert!(!kept("com.apple.quarantine"));
+        assert!(!kept("com.apple.macl"));
         for n in [
+            "com.apple.appstore.metadata",
+            "com.apple.appstore.store_cohort",
+            "com.apple.appstore.storefront",
+            "com.apple.appstore.vendor_name",
+            "com.apple.macl2",
+            "com.apple.mac",
+            "com.apple.macL",
             "com.apple.cs.CodeDirectory",
             "com.apple.cs.CodeRequirements",
             "com.apple.cs.CodeSignature",
@@ -293,6 +331,23 @@ mod tests {
         ] {
             assert!(kept(n), "{n}");
         }
+    }
+
+    /// Catches a refusal to remove macl that fails the stage, and the same leniency spreading
+    /// to the quarantine mark, to another attribute or to another error (a failed removal of
+    /// anything else must stay fatal).
+    #[test]
+    fn only_a_refused_removal_of_macl_is_ignored() {
+        for e in [libc::EPERM, libc::EACCES] {
+            assert!(removal_refusal_is_ignored(MACL, Some(e)));
+            assert!(!removal_refusal_is_ignored(QUARANTINE, Some(e)));
+            assert!(!removal_refusal_is_ignored(
+                "com.apple.cs.CodeSignature",
+                Some(e)
+            ));
+        }
+        assert!(!removal_refusal_is_ignored(MACL, Some(libc::EIO)));
+        assert!(!removal_refusal_is_ignored(MACL, None));
     }
 
     /// Catches a bound that is off by one, in either direction.
@@ -311,6 +366,6 @@ mod tests {
         let f = std::fs::File::create(dir.join("f")).expect("file");
         assert!(copy_fd(&f, &f, Path::new("f")).is_ok());
         assert!(copy_nofollow(&dir, &dir).is_ok());
-        assert!(strip_quarantine(&dir).is_ok());
+        assert!(strip_skipped(&dir).is_ok());
     }
 }
