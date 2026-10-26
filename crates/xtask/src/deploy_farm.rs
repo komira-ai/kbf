@@ -179,6 +179,13 @@ impl Plan {
     }
 }
 
+/// The time the wait reads and spends: `now` is the time since some fixed start, `sleep`
+/// waits for the duration it is given. A test passes a virtual clock whose `sleep` moves `now`.
+pub struct Clock<'a> {
+    pub now: Box<dyn Fn() -> Duration + 'a>,
+    pub sleep: Box<dyn Fn(Duration) + 'a>,
+}
+
 /// The runner's token service.
 #[derive(Clone, Debug)]
 pub struct TokenService {
@@ -281,6 +288,25 @@ pub fn deploy(
     roots: &Roots<'_>,
     out: &mut impl Write,
 ) -> Result<(), Error> {
+    let start = Instant::now();
+    let clock = Clock {
+        now: Box::new(|| start.elapsed()),
+        sleep: Box::new(std::thread::sleep),
+    };
+    deploy_on(plan, service, roots, &clock, out)
+}
+
+/// [`deploy`] on a clock it is given.
+///
+/// # Errors
+/// [`Error`]: anything but `converged`.
+pub fn deploy_on(
+    plan: &Plan,
+    service: &TokenService,
+    roots: &Roots<'_>,
+    clock: &Clock<'_>,
+    out: &mut impl Write,
+) -> Result<(), Error> {
     if !plan.url.starts_with("https://") || plan.url[8..].contains('/') {
         return Err(Error::Url(plan.url.clone()));
     }
@@ -299,6 +325,7 @@ pub fn deploy(
         coordinator: agent(roots.coordinator),
         plan,
         service,
+        clock,
     };
     let baseline =
         Read::of(&client.send_retrying(out, READ_BASELINE, CONVERGENCE_PATH, None, plan)?)?.live();
@@ -310,7 +337,7 @@ pub fn deploy(
     client.send_retrying(out, SET_DESIRED, DESIRED_PATH, Some(&body), plan)?;
     log(out, &format!("desired version {} set", plan.version))?;
 
-    let started = Instant::now();
+    let started = (clock.now)();
     let mut changed = started;
     let mut last: Option<(String, Value)> = None;
     loop {
@@ -329,20 +356,20 @@ pub fn deploy(
                 let now = (read.state, answer["roles"].clone());
                 if last.as_ref() != Some(&now) {
                     last = Some(now);
-                    changed = Instant::now();
+                    changed = (clock.now)();
                 }
             }
             Err(e @ Error::Refused { .. }) => return Err(e),
             Err(e) => log(out, &format!("the read failed, trying again: {e}"))?,
         }
-        let elapsed = started.elapsed();
+        let elapsed = (clock.now)().saturating_sub(started);
         if elapsed >= plan.deadline {
             return Err(Error::Deadline(plan.deadline.as_secs()));
         }
-        if changed.elapsed() >= plan.stall {
+        if (clock.now)().saturating_sub(changed) >= plan.stall {
             return Err(Error::Stalled(plan.stall.as_secs()));
         }
-        std::thread::sleep(plan.every.min(plan.deadline - elapsed));
+        (clock.sleep)(plan.every.min(plan.deadline - elapsed));
     }
 }
 
@@ -358,6 +385,7 @@ struct Client<'a> {
     coordinator: ureq::Agent,
     plan: &'a Plan,
     service: &'a TokenService,
+    clock: &'a Clock<'a>,
 }
 
 impl Client<'_> {
@@ -382,7 +410,7 @@ impl Client<'_> {
                         &format!("the call failed, trying again: {what}: {why}"),
                     )?;
                     attempt += 1;
-                    std::thread::sleep(plan.every);
+                    (self.clock.sleep)(plan.every);
                 }
                 other => return other,
             }
