@@ -112,12 +112,14 @@ pub enum Served {
 /// A reader that fails once its deadline has passed, whatever the stream does.
 struct Deadline<'a, S> {
     inner: &'a mut S,
-    until: Instant,
+    /// Time since an origin: the monotonic clock in the daemon, a counter in a test.
+    now: &'a dyn Fn() -> Duration,
+    until: Duration,
 }
 
 impl<S: Read> Read for Deadline<'_, S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if Instant::now() >= self.until {
+        if (self.now)() >= self.until {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "the frame did not arrive within its deadline",
@@ -129,15 +131,18 @@ impl<S: Read> Read for Deadline<'_, S> {
 
 /// [`handle_within`] with [`FRAME_DEADLINE`].
 pub fn handle<S: Read + Write, R: Runner>(stream: &mut S, runner: &R) -> Served {
-    handle_within(stream, runner, FRAME_DEADLINE)
+    let origin = Instant::now();
+    handle_within(stream, runner, FRAME_DEADLINE, &|| origin.elapsed())
 }
 
 /// Answers the one frame on `stream`, which has `deadline` to arrive: acknowledges the
-/// shutdown command and runs it, or refuses.
+/// shutdown command and runs it, or refuses. `now` reads the clock the deadline is
+/// measured on.
 pub fn handle_within<S: Read + Write, R: Runner>(
     stream: &mut S,
     runner: &R,
     deadline: Duration,
+    now: &dyn Fn() -> Duration,
 ) -> Served {
     let refuse = |stream: &mut S, name: &str, why: String| {
         // Best effort: the peer may be gone.
@@ -146,7 +151,8 @@ pub fn handle_within<S: Read + Write, R: Runner>(
     };
     let mut reader = Deadline {
         inner: &mut *stream,
-        until: Instant::now() + deadline,
+        now,
+        until: now() + deadline,
     };
     match read_frame_within(&mut reader, MAX_COMMAND_FRAME_BYTES) {
         Ok(Some(frame)) if frame == Frame::new(Kind::Shutdown, NAME, "") => {
@@ -189,7 +195,7 @@ pub fn serve<I: Incoming, R: Runner>(
 mod tests {
     use super::*;
     use crate::frame::FrameError;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::io::Cursor;
     use std::rc::Rc;
@@ -426,10 +432,11 @@ mod tests {
     /// the deadline the read fails, the peer is refused, and nothing runs.
     #[test]
     fn a_frame_that_arrives_too_slowly_is_refused_and_nothing_runs() {
-        struct Drip(Cursor<Vec<u8>>, Rc<RefCell<Vec<u8>>>);
+        /// Every read takes 10 ms of the test's clock, not of the wall clock.
+        struct Drip(Cursor<Vec<u8>>, Rc<RefCell<Vec<u8>>>, Rc<Cell<Duration>>);
         impl Read for Drip {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                std::thread::sleep(Duration::from_millis(10));
+                self.2.set(self.2.get() + Duration::from_millis(10));
                 self.0.read(&mut buf[..1])
             }
         }
@@ -443,17 +450,24 @@ mod tests {
             }
         }
         let written = Rc::new(RefCell::new(Vec::new()));
-        let mut p = Drip(Cursor::new(encode_bytes(&command())), written.clone());
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let now = || clock.get();
+        let frame = encode_bytes(&command());
+        assert!(
+            frame.len() > 10,
+            "the frame takes more than the 100 ms deadline"
+        );
+        let mut p = Drip(Cursor::new(frame.clone()), written.clone(), clock.clone());
         let runner = Fake::new(&written);
-        let served = handle_within(&mut p, &runner, Duration::from_millis(100));
+        let served = handle_within(&mut p, &runner, Duration::from_millis(100), &now);
         assert_eq!(
             served,
             Served::Refused("stream error: the frame did not arrive within its deadline".into())
         );
         assert!(runner.calls.borrow().is_empty());
         // The same frame at the same pace is served when the deadline allows it.
-        let mut p = Drip(Cursor::new(encode_bytes(&command())), written.clone());
-        let served = handle_within(&mut p, &runner, Duration::from_secs(30));
+        let mut p = Drip(Cursor::new(frame), written.clone(), clock.clone());
+        let served = handle_within(&mut p, &runner, Duration::from_secs(30), &now);
         assert_eq!(served, Served::Shutdown { acked: true });
     }
 
