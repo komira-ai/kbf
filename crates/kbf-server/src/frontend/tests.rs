@@ -32,7 +32,7 @@ fn readyz_probes_the_store_that_was_opened() {
 }
 
 /// The flags of a frontend, from `more` on top of a storage node and listeners.
-fn parsed(more: &[&str]) -> Result<super::FrontendFlags, clap::Error> {
+pub(super) fn parsed(more: &[&str]) -> Result<super::FrontendFlags, clap::Error> {
     let mut argv = vec![
         "frontend",
         "--storage=http://127.0.0.1:1",

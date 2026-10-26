@@ -41,7 +41,9 @@
 //! entry points here still start without one, with the scheduler's state in memory and
 //! the same warning as `kbf-server`'s, for the tests that need none. A store given is
 //! opened and probed by `/readyz`; a `sqlite://` one starts and logs that SQLite is
-//! removed in the next release ([`crate::StateStoreUri::open`]).
+//! removed in the next release ([`crate::StateStoreUri::open`]). A Postgres store that is not up
+//! yet is waited for, up to `--state-store-wait-secs` (`state_wait` has the rules): a start
+//! that uses the window up exits 1, every refusal exits 2.
 //!
 //! **The pack index** is off unless `--pack-index` is given (the flag's help has its rules).
 //! The started frontend carries it ([`FrontendHandle::pack_index`]) and its worker listener
@@ -224,6 +226,9 @@ pub struct FrontendFlags {
     /// `--drain-lb-wait` and `--drain-deadline`: the two waits of the drain sequence a
     /// frontend over a state store runs ([`crate::sequence`]).
     pub drain: DrainTiming,
+    /// `--state-store-wait-secs`: how long the start waits for a state store that is not up
+    /// yet before it gives up and exits 1. Zero does not wait.
+    pub state_store_wait: Duration,
     /// The flags of the removed handover and admin port, which are accepted and ignored
     /// ([`RetiredHandoverFlags`]).
     pub retired: RetiredHandoverFlags,
@@ -282,6 +287,7 @@ pub fn command() -> Command {
     .args(crate::enroll::flags::args())
     .args(handoff::args())
     .args(drain_flags::args())
+    .args(state_wait::args())
     .args(pack_flags::args())
     .arg(
         Arg::new(SECRETS_DIR)
@@ -349,6 +355,7 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         object_store_secrets_dir: m.get_one::<PathBuf>(SECRETS_DIR).cloned(),
         handoff: handoff::from_matches(m),
         drain: drain_flags::from_matches(m),
+        state_store_wait: state_wait::from_matches(m),
         retired: RetiredHandoverFlags::from_arg_matches(m)?,
         packs: pack_flags::from_matches(m),
     })
@@ -639,13 +646,15 @@ fn bind_frontend(
     shutdown: Shutdown,
 ) -> Result<FrontendHandle, Box<dyn Error>> {
     let prepared = Prepared::new(flags)?;
-    let pack_index = flags.server.open_pack_index()?;
+    // The flag's own refusals come before the wait for the store, as they did before it.
+    flags.server.pack_index_url()?;
     let state = flags
         .server
         .state_store
         .as_ref()
-        .map(crate::StateStoreUri::open)
+        .map(|uri| state_wait::open(uri, flags.state_store_wait))
         .transpose()?;
+    let pack_index = flags.server.open_pack_index()?;
     prepared.start(state, pack_index, shutdown)
 }
 
@@ -1188,7 +1197,8 @@ fn start_line(
 }
 
 /// `kbf frontend`: the logs, a runtime the thread flags size, the start line on stdout,
-/// and serving until SIGINT or SIGTERM. Exit 2 for a start the frontend refuses.
+/// and serving until SIGINT or SIGTERM. Exit 2 for a start the frontend refuses, 1 for a state store that stayed unreachable
+/// for `--state-store-wait-secs`.
 #[must_use]
 pub fn run(flags: &FrontendFlags) -> ExitCode {
     crate::log_file::init(&flags.server);
@@ -1196,8 +1206,19 @@ pub fn run(flags: &FrontendFlags) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kbf frontend: {e}");
-            ExitCode::from(2)
+            exit_of(e.as_ref())
         }
+    }
+}
+
+/// The exit code of a start that failed: 1 for a state store still not reachable when
+/// `--state-store-wait-secs` ran out (a start that was not refused, so a unit that
+/// prevents a restart on exit 2 retries it), 2 for every refusal.
+fn exit_of(e: &(dyn Error + 'static)) -> ExitCode {
+    if e.is::<state_wait::NotReached>() {
+        ExitCode::from(1)
+    } else {
+        ExitCode::from(2)
     }
 }
 
@@ -1219,8 +1240,11 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
 mod drain_flags;
 mod handoff;
 mod pack_flags;
+mod state_wait;
 
 #[cfg(test)]
 mod pack_tests;
+#[cfg(test)]
+mod state_wait_tests;
 #[cfg(test)]
 mod tests;

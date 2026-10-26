@@ -39,7 +39,11 @@ StartLimitIntervalSec=0
 # returns only when the frontend can take the builds.
 Type=notify
 NotifyAccess=main
-TimeoutStartSec=120
+# The start counts the two checks below, the wait of up to 300 s for a state store that is not
+# up yet (--state-store-wait-secs, whose default is 300) and the 90 s bind budget for a listen
+# address that appears late: 420 s covers them, and a frontend that waited out its window
+# ends with exit 1 (restarted) rather than being killed at the timeout.
+TimeoutStartSec=420
 # Not the daemon's user: the frontend holds the state store and the operator token.
 # kbf-server, not kbf: the user builds run as must not read the state store, the operator
 # token or the keys.

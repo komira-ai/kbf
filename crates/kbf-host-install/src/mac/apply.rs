@@ -30,8 +30,6 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
-use std::thread::sleep;
-use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -172,15 +170,15 @@ fn loaded(host: &MacHost, runner: &dyn Runner, label: &str) -> bool {
 /// `launchctl bootout` returns before the service is gone, and a `bootstrap` in that gap
 /// fails with an input/output error.
 fn wait_gone(host: &MacHost, runner: &dyn Runner, label: &str) -> bool {
-    let deadline = Instant::now() + host.tuning.gone;
+    let deadline = (host.pace.now)() + host.tuning.gone;
     loop {
         if !loaded(host, runner, label) {
             return true;
         }
-        if Instant::now() >= deadline {
+        if (host.pace.now)() >= deadline {
             return false;
         }
-        sleep(host.tuning.poll);
+        (host.pace.sleep)(host.tuning.poll);
     }
 }
 
@@ -402,30 +400,30 @@ fn restart(host: &MacHost, runner: &dyn Runner, commit: &str) -> Result<(), &'st
 
 /// Wait, for at most the tuning's `gone`, until the daemon runs the release `commit`.
 fn wait_running(host: &MacHost, runner: &dyn Runner, commit: &str) -> bool {
-    let deadline = Instant::now() + host.tuning.gone;
+    let deadline = (host.pace.now)() + host.tuning.gone;
     loop {
         if kit::running_commit(host, runner).as_deref() == Some(commit) {
             return true;
         }
-        if Instant::now() >= deadline {
+        if (host.pace.now)() >= deadline {
             return false;
         }
-        sleep(host.tuning.poll);
+        (host.pace.sleep)(host.tuning.poll);
     }
 }
 
 /// Wait, for at most the tuning's `welcome`, for the `welcomed` line the new daemon writes
 /// once the frontend has taken it in. Only what the log gained since `offset` counts.
 fn wait_welcomed(host: &MacHost, offset: u64) -> bool {
-    let deadline = Instant::now() + host.tuning.welcome;
+    let deadline = (host.pace.now)() + host.tuning.welcome;
     loop {
         if is_welcomed(&log_since(&host.err_log, offset)) {
             return true;
         }
-        if Instant::now() >= deadline {
+        if (host.pace.now)() >= deadline {
             return false;
         }
-        sleep(host.tuning.poll);
+        (host.pace.sleep)(host.tuning.poll);
     }
 }
 

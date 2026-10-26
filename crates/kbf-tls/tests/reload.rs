@@ -431,6 +431,7 @@ fn request_helpers_read_the_connection_info() {
             remote_addr: Some(addr),
         },
         certs: Some(Arc::new(vec![der.clone()])),
+        live: kbf_tls::Liveness::default(),
     });
     assert_eq!(peer_certs(&request).expect("chain")[0], der);
     assert_eq!(remote_addr(&request), Some(addr));
@@ -566,4 +567,31 @@ async fn a_source_offers_h2_only_unless_made_to_offer_http1_too() {
     files.install(&new);
     assert_eq!(watched.reload(), Outcome::Applied);
     assert_eq!(offered(&watched), both);
+}
+
+/// Asserts that a connection is live while its peer is there and gone once the peer
+/// closes, and that a request carries the connection's own flag.
+///
+/// Kills: a liveness that is never set; one set by an open connection's reads (so a
+/// reset stream on a live connection is read as a lost connection); one that a peer's
+/// close does not set, so a dropped connection is read as a client's abort.
+#[tokio::test]
+async fn a_connection_is_gone_when_its_peer_closes() {
+    let mut server = echo(tcp(), None);
+    let mut peer = TcpStream::connect(server.addr).await.expect("connect");
+    let info = server.infos.recv().await.expect("the connection");
+    peer.write_all(b"ping").await.expect("write");
+    let mut back = [0u8; 4];
+    peer.read_exact(&mut back).await.expect("echo");
+    assert!(!info.live.is_gone(), "a connection that is being used");
+
+    let mut request = tonic::Request::new(());
+    request.extensions_mut().insert(info.clone());
+    let seen = kbf_tls::liveness(&request).expect("the connection's flag");
+    assert!(!seen.is_gone());
+
+    drop(peer);
+    until("the close is seen", || info.live.is_gone()).await;
+    assert!(seen.is_gone(), "the request's flag is the connection's");
+    assert!(kbf_tls::liveness(&tonic::Request::new(())).is_none());
 }

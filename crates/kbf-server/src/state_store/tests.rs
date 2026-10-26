@@ -347,3 +347,25 @@ fn a_refused_state_store_never_echoes_its_value() {
     .expect_err("not UTF-8");
     assert!(!refused.to_string().contains("hunter2"), "{refused}");
 }
+
+/// A Postgres store whose socket is not there yet is `NotUp`, which a start waits for,
+/// and a SQLite path that cannot be a database is `Refused`, which it does not. Catches
+/// the two sorts swapped, or both reported as one.
+#[test]
+fn a_store_not_up_is_told_from_a_store_refused() {
+    let dir = crate::test_dir::short_dir("state-store-not-up");
+    let url = format!(
+        "postgres:///kbf?host={}",
+        dir.path().join("absent").display()
+    );
+    let not_up = parse(&url).expect("a socket URL").try_open().err();
+    assert!(matches!(not_up, Some(OpenFailure::NotUp(_))), "{not_up:?}");
+
+    // A directory is not a database file.
+    let sqlite = StateStoreUri::Sqlite(dir.path().to_path_buf());
+    let refused = sqlite.try_open().err();
+    assert!(
+        matches!(refused, Some(OpenFailure::Refused(_))),
+        "{refused:?}"
+    );
+}
