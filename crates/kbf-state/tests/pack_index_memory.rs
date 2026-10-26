@@ -42,3 +42,28 @@ fn each_refusal_says_what_it_refused() {
     let said = PackIndexError::from(failed).to_string();
     assert_eq!(said, "state store failure: disk full");
 }
+
+/// Asserts that the errors a repeat of the call cannot change are final, each says what it
+/// refused, and the errors that may pass (a store failure, a schema migrated meanwhile) are not.
+#[test]
+fn a_refusal_is_final_and_a_failure_may_pass() {
+    let refusals = [
+        PackIndexError::Invalid("the pack key is empty"),
+        PackIndexError::Conflict {
+            key: "cas/d/n1/1/1".to_owned(),
+        },
+        PackIndexError::TooMany { given: 2, max: 1 },
+        PackIndexError::Unsupported,
+        PackIndexError::Refused("not allowed".to_owned()),
+    ];
+    for refusal in refusals {
+        assert!(refusal.is_final(), "{refusal}");
+    }
+    let said = PackIndexError::Unsupported.to_string();
+    assert_eq!(said, "pack index: the index takes no such call");
+    let said = PackIndexError::Refused("not allowed".to_owned()).to_string();
+    assert_eq!(said, "pack index: refused: not allowed");
+    assert!(!PackIndexError::NotMigrated.is_final());
+    let failed = StoreError::Failed("disk full".to_owned());
+    assert!(!PackIndexError::from(failed).is_final());
+}

@@ -3,6 +3,8 @@
 use std::os::unix::fs::PermissionsExt as _;
 
 use clap::Parser as _;
+use kbf_objstore::MemoryStore;
+use kbf_pack::{PackKeys, WriterKind};
 use kbf_proto::reapi::Digest;
 use kbf_server::storage_half::StorageHalf;
 use kbf_transfer::CasError;
@@ -109,6 +111,7 @@ fn the_flags_reach_the_settings() {
         region: "eu-west-1".to_owned(),
         credentials: PathBuf::from("/keys.json"),
         cache: Some((PathBuf::from("/var/cache/packs"), 4096)),
+        write: None,
     };
     assert_eq!(settings, Some(expected));
     let plain = parse(&ON).expect("flags").pack_read;
@@ -174,7 +177,7 @@ fn a_key_pair_file_of_its_owner_alone_is_read() {
     let dir = scratch("pack-read-keys");
     for (name, mode) in [("rw.json", 0o600), ("r.json", 0o400)] {
         let path = keys(&dir, name, &pair(), mode);
-        let credentials = read_credentials(&path).expect(name);
+        let credentials = read_credentials(&path, "--pack-store-credentials-file").expect(name);
         let shown = format!("{credentials:?}");
         assert!(shown.contains("AKIAEXAMPLE"), "{shown}");
         assert!(!shown.contains(SECRET), "{shown}");
@@ -191,7 +194,8 @@ fn a_key_pair_file_that_cannot_be_used_is_refused_without_the_secret() {
     let dir = scratch("pack-read-refused");
     for mode in [0o640, 0o604, 0o644, 0o666, 0o660] {
         let path = keys(&dir, "open.json", &pair(), mode);
-        let failed = read_credentials(&path).expect_err("others read it");
+        let failed =
+            read_credentials(&path, "--pack-store-credentials-file").expect_err("others read it");
         let said = failed.to_string();
         assert!(said.contains(&path.display().to_string()), "{said}");
         assert!(said.contains(&format!("mode {mode:04o}")), "{said}");
@@ -226,12 +230,15 @@ fn a_key_pair_file_that_cannot_be_used_is_refused_without_the_secret() {
         ),
     ];
     for path in &broken {
-        let said = read_credentials(path).expect_err("unusable").to_string();
+        let said = read_credentials(path, "--pack-store-credentials-file")
+            .expect_err("unusable")
+            .to_string();
         assert!(said.starts_with("--pack-store-credentials-file "), "{said}");
         assert!(said.contains(&path.display().to_string()), "{said}");
         assert!(!said.contains(SECRET), "{said}");
     }
-    let array = read_credentials(&broken[3]).expect_err("an array");
+    let array =
+        read_credentials(&broken[3], "--pack-store-credentials-file").expect_err("an array");
     assert!(array.to_string().ends_with(NOT_KEYS), "{array}");
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
@@ -247,41 +254,45 @@ async fn the_reader_is_built_from_the_settings_or_refused_by_flag() {
     let path = keys(&dir, "keys.json", &pair(), 0o600);
     let cli = daemon(&dir, &on(&path));
     let settings = cli.pack_read.settings().expect("on");
-    assert!(reader(&cli, &settings, transfer::endpoint).is_ok());
-    assert!(reader(&cli, &settings, transfer::server_endpoint).is_ok());
+    let with = |locate: Locate| index(&cli, locate).expect("the index");
+    assert!(reader(&settings, with(transfer::endpoint)).is_ok());
+    assert!(reader(&settings, with(transfer::server_endpoint)).is_ok());
     let cache = dir.join("cache");
     let cached = PackRead {
         cache: Some((cache.clone(), 1 << 20)),
         ..settings.clone()
     };
-    assert!(reader(&cli, &cached, transfer::endpoint).is_ok());
+    assert!(reader(&cached, with(transfer::endpoint)).is_ok());
     assert!(cache.is_dir(), "the cache's directory was made");
 
-    let refused = |settings: &PackRead, cli: &Cli| {
-        let built = reader(cli, settings, transfer::endpoint);
+    let refused = |settings: &PackRead| {
+        let built = reader(settings, with(transfer::endpoint));
         built.err().expect("refused").to_string()
     };
     let tls = PackRead {
         endpoint: "https://127.0.0.1:9".to_owned(),
         ..settings.clone()
     };
-    let said = refused(&tls, &cli);
+    let said = refused(&tls);
     assert!(said.starts_with("--pack-store-endpoint: "), "{said}");
     let blocked = PackRead {
         cache: Some((path.clone(), 1 << 20)),
         ..settings.clone()
     };
-    let said = refused(&blocked, &cli);
+    let said = refused(&blocked);
     assert!(said.starts_with("--pack-read-cache-dir: "), "{said}");
     let unreadable = PackRead {
         credentials: dir.join("nothing.json"),
         ..settings.clone()
     };
-    let said = refused(&unreadable, &cli);
+    let said = refused(&unreadable);
     assert!(said.starts_with("--pack-store-credentials-file "), "{said}");
     let mut without_cas = daemon(&dir, &on(&path));
     without_cas.cas = None;
-    let said = refused(&settings, &without_cas);
+    let said = index(&without_cas, transfer::endpoint)
+        .err()
+        .expect("refused")
+        .to_string();
     assert!(said.contains("--cas is required"), "{said}");
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
@@ -354,7 +365,7 @@ async fn the_plane_counts_into_the_counter_it_is_given() {
     let settings = cli.pack_read.settings().expect("on");
     let counter = PackCounter::default();
     let empty = Arc::new(Empty);
-    let plane = over(&cli, &settings, empty, transfer::endpoint, &counter);
+    let plane = over(&cli, &settings, empty, transfer::endpoint, &counter, None);
     let plane = plane.expect("the plane");
     let digest = Digest {
         hash: "not-hex".to_owned(),
@@ -473,5 +484,225 @@ fn the_frontend_is_asked_over_the_first_server() {
     cli.daemon.servers = Vec::new();
     let said = transfer::server_endpoint(&cli).expect_err("none");
     assert_eq!(said.to_string(), "--server is required");
+    kbf_outputs::remove_tree(&dir).expect("clean");
+}
+
+/// The flags that turn the packs on and writing to them on, over the key pair files `read` and
+/// `write`.
+fn writing(read: &Path, write: &Path) -> Vec<String> {
+    let mut flags = on(read);
+    flags.push("--pack-write".to_owned());
+    flags.push(format!(
+        "--pack-store-write-credentials-file={}",
+        write.display()
+    ));
+    flags
+}
+
+/// Asserts that writing packs is off by default: `--pack-write` is false, no write key file is
+/// given, and the settings of a daemon that reads packs ask for no write.
+#[test]
+fn packs_are_not_written_by_default() {
+    let args = parse(&[]).expect("flags").pack_read;
+    assert!(!args.pack_write);
+    assert_eq!(args.pack_store_write_credentials_file, None);
+    let read = parse(&ON).expect("flags").pack_read;
+    assert_eq!(read.settings().expect("on").write, None);
+}
+
+/// Asserts the refusals of `--pack-write`: it is refused without `--pack-read`, naming it, and
+/// without the key file it writes with, naming that; the key file is refused without
+/// `--pack-write`; with all of them the key file reaches the settings.
+#[test]
+fn pack_write_needs_pack_read_and_its_own_key_file() {
+    let said = |flags: &[&str]| parse(flags).expect_err("refused").to_string();
+    let alone = said(&[
+        "--pack-write",
+        "--pack-store-write-credentials-file=/w.json",
+    ]);
+    assert!(alone.contains("--pack-read"), "{alone}");
+    let mut no_key = ON.to_vec();
+    no_key.push("--pack-write");
+    let said_no_key = said(&no_key);
+    assert!(
+        said_no_key.contains("--pack-store-write-credentials-file"),
+        "{said_no_key}"
+    );
+    let mut no_write = ON.to_vec();
+    no_write.push("--pack-store-write-credentials-file=/w.json");
+    let said_no_write = said(&no_write);
+    assert!(said_no_write.contains("--pack-write"), "{said_no_write}");
+    let mut all = ON.to_vec();
+    all.extend([
+        "--pack-write",
+        "--pack-store-write-credentials-file=/w.json",
+    ]);
+    let args = parse(&all).expect("flags").pack_read;
+    assert!(args.pack_write);
+    let settings = args.settings().expect("on");
+    assert_eq!(settings.write, Some(PathBuf::from("/w.json")));
+}
+
+/// Asserts that a start with `--pack-write` builds the writer: a write key file that cannot be
+/// used stops the start with `--pack-store-write-credentials-file` and the file named, and a
+/// store that cannot be reached for the create-only check stops it naming `--pack-write`. The
+/// read key file is not the one that was refused.
+#[test]
+fn a_daemon_that_writes_packs_is_refused_by_the_writer_it_builds() {
+    let dir = scratch("pack-write-start");
+    tls_files(&dir);
+    let read = keys(&dir, "read.json", &pair(), 0o600);
+    let write = keys(&dir, "write.json", &pair(), 0o600);
+    let open = keys(&dir, "open.json", &pair(), 0o644);
+
+    let cli = daemon(&dir, &writing(&read, &open));
+    let said = crate::start(&cli).err().expect("refused").to_string();
+    assert!(
+        said.starts_with("--pack-store-write-credentials-file "),
+        "{said}"
+    );
+    assert!(said.contains("open.json"), "{said}");
+
+    let cli = daemon(&dir, &writing(&read, &write));
+    let said = crate::start(&cli).err().expect("refused").to_string();
+    assert!(said.starts_with("--pack-write: the pack store"), "{said}");
+    kbf_outputs::remove_tree(&dir).expect("clean");
+}
+
+/// Asserts that the daemon `start` makes is given a commit handle to set from its `Welcome`s
+/// only when writing packs is asked for: not by `start` without `--pack-write`, and by
+/// `counting` with the `Write` of settings that ask for it.
+#[test]
+fn a_daemon_is_given_the_commit_handle_only_with_pack_write() {
+    let dir = scratch("pack-write-handle");
+    tls_files(&dir);
+    let read = keys(&dir, "read.json", &pair(), 0o600);
+    let node = crate::start(&daemon(&dir, &on(&read))).expect("starts");
+    assert!(node.daemon.pack_writes().is_none());
+
+    let settings = PackRead {
+        write: Some(PathBuf::from("/w.json")),
+        ..parse(&ON).expect("flags").pack_read.settings().expect("on")
+    };
+    let write = Write::of(&settings).expect("asked for");
+    let commit = write.commit.clone();
+    let node = counting(node, PackCounter::default(), Some(write));
+    let given = node.daemon.pack_writes().cloned();
+    drop(node);
+    let given = given.expect("given the handle");
+    commit.welcomed(true);
+    assert!(given.enabled(), "it is the handle the plane is given");
+    assert!(
+        Write::of(&PackRead {
+            write: None,
+            ..settings
+        })
+        .is_none()
+    );
+    kbf_outputs::remove_tree(&dir).expect("clean");
+}
+
+/// Asserts the check at start: a store that claims create-only writes gives a writer, and one
+/// that does not (the default capabilities) is refused naming `--pack-write`.
+#[tokio::test]
+async fn the_writer_is_built_over_a_store_that_refuses_to_replace_objects() {
+    let dir = scratch("pack-write-over");
+    tls_files(&dir);
+    let read = keys(&dir, "read.json", &pair(), 0o600);
+    let cli = daemon(&dir, &on(&read));
+    let keys = || PackKeys::new(WriterKind::Daemon, "n1", "boot1").expect("keys");
+    let create_only = Capabilities {
+        conditional_put: true,
+        object_lock: false,
+    };
+    let index = || index(&cli, transfer::endpoint).expect("the index");
+    let store = Arc::new(MemoryStore::new(create_only));
+    assert!(writer_over(store, index(), keys()).await.is_ok());
+    let store = Arc::new(MemoryStore::new(Capabilities::default()));
+    let said = writer_over(store, index(), keys())
+        .await
+        .err()
+        .expect("refused");
+    assert!(
+        said.to_string().starts_with("--pack-write: the pack store"),
+        "{said}"
+    );
+    kbf_outputs::remove_tree(&dir).expect("clean");
+}
+
+/// Asserts that a node id a pack key cannot hold is refused naming `--node-id`, before the store
+/// is contacted, and that the name of a start ends with the process id.
+#[tokio::test]
+async fn a_node_id_that_cannot_name_packs_is_refused() {
+    let dir = scratch("pack-write-name");
+    tls_files(&dir);
+    let read = keys(&dir, "read.json", &pair(), 0o600);
+    let write = keys(&dir, "write.json", &pair(), 0o600);
+    let mut cli = daemon(&dir, &writing(&read, &write));
+    cli.daemon.node_id = "a/b".to_owned();
+    let index = index(&cli, transfer::endpoint).expect("the index");
+    let store = Arc::new(MemoryStore::new(Capabilities::default()));
+    let said = pack_writer(&cli, store, index).err().expect("refused");
+    assert!(said.to_string().starts_with("--node-id: "), "{said}");
+    assert!(boot_id().ends_with(&format!("-{:x}", std::process::id())));
+    kbf_outputs::remove_tree(&dir).expect("clean");
+}
+
+/// Asserts that the plane `over_store` makes with a write is given the writer and its handle: the
+/// store is made from the settings and the write key file, and a put while the handle is off is
+/// counted as a write that went to the plane underneath (the plane has no writer otherwise, and
+/// counts none), and fails as that plane does.
+#[tokio::test]
+async fn the_plane_over_a_write_is_given_the_writer_and_its_handle() {
+    let dir = scratch("pack-write-plane");
+    tls_files(&dir);
+    let read = keys(&dir, "read.json", &pair(), 0o600);
+    let write = keys(&dir, "write.json", &pair(), 0o600);
+    let cli = daemon(&dir, &writing(&read, &write));
+    let settings = cli.pack_read.settings().expect("on");
+    let asked = Write::of(&settings).expect("asked for");
+    let create_only = Capabilities {
+        conditional_put: true,
+        object_lock: false,
+    };
+    // The check at start blocks on the runtime, which tokio refuses on a thread running tasks.
+    let built = tokio::task::spawn_blocking(move || {
+        let made = std::cell::Cell::new(None);
+        let make = |_: &PackRead, file: &Path| {
+            made.set(Some(file.to_path_buf()));
+            Ok(Arc::new(MemoryStore::new(create_only)))
+        };
+        let counter = PackCounter::default();
+        let plane = Arc::new(Empty);
+        let built = over_store(
+            &cli,
+            &settings,
+            Arc::clone(&plane),
+            transfer::endpoint,
+            &counter,
+            Some(&asked),
+            make,
+        );
+        let refused =
+            |_: &PackRead, _: &Path| -> Result<Arc<MemoryStore>, Error> { Err("no".into()) };
+        let none = over_store(
+            &cli,
+            &settings,
+            plane,
+            transfer::endpoint,
+            &counter,
+            Some(&asked),
+            refused,
+        );
+        let none = none.err().map(|e| e.to_string());
+        (built.ok(), made.take(), none)
+    });
+    let (plane, made, none) = built.await.expect("joined");
+    assert_eq!(made, Some(write.clone()));
+    assert_eq!(none.as_deref(), Some("no"));
+    let plane = plane.expect("the plane");
+    let put = plane.put(b"output".to_vec()).await;
+    assert!(matches!(put, Err(CasError::Unavailable(..))), "{put:?}");
+    assert_eq!(plane.stats().writes.fallbacks.off, 1);
     kbf_outputs::remove_tree(&dir).expect("clean");
 }

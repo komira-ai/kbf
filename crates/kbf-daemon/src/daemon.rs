@@ -105,7 +105,7 @@ use crate::connect::{
 use crate::contact::Contact;
 use crate::lease::{Done, Leases, failure, lease_id, proto_lease_id};
 use crate::map::{MapLink, map_asked};
-use crate::packed::PackCounter;
+use crate::packed::{PackCommit, PackCounter};
 use crate::phases::LeasePhases;
 use crate::pressure;
 use crate::report::NodeReport;
@@ -261,6 +261,9 @@ pub struct Daemon {
     /// The counts of the pack reads of the data plane, if it reads packs; see
     /// [`Self::with_pack_reads`].
     pack_reads: Option<PackCounter>,
+    /// The handle the frontend's Welcome turns pack writes on and off with, if the data plane
+    /// writes packs; see [`Self::with_pack_writes`].
+    pack_commit: Option<PackCommit>,
     /// The suspend-counting clock that contact and the Start window read.
     clock: Arc<dyn Clock>,
     /// This daemon process's `Hello.instance_id`, the same on every stream it opens.
@@ -356,6 +359,7 @@ impl Daemon {
             epoch: None,
             granted: BTreeMap::new(),
             pack_reads: None,
+            pack_commit: None,
             clock: Arc::new(SystemClock),
             instance: instance_id(),
             predecessor: String::new(),
@@ -382,11 +386,27 @@ impl Daemon {
         self
     }
 
+    /// Sets `commit` from every Welcome (`Welcome.pack_commit`): the data plane that writes packs
+    /// ([`crate::PackedCas::with_writes`], given the same handle) writes them only while the
+    /// frontend says it takes commits. Without it a Welcome sets nothing.
+    #[must_use]
+    pub fn with_pack_writes(mut self, commit: PackCommit) -> Self {
+        self.pack_commit = Some(commit);
+        self
+    }
+
     /// The counter [`Self::with_pack_reads`] was given; `None` for a daemon whose
     /// Heartbeats carry no counts.
     #[must_use]
     pub const fn pack_reads(&self) -> Option<&PackCounter> {
         self.pack_reads.as_ref()
+    }
+
+    /// The handle [`Self::with_pack_writes`] was given; `None` for a daemon that sets none from
+    /// its Welcomes.
+    #[must_use]
+    pub const fn pack_writes(&self) -> Option<&PackCommit> {
+        self.pack_commit.as_ref()
     }
 
     /// This daemon process's instance id (`Hello.instance_id`), drawn when it was built.
@@ -886,6 +906,9 @@ impl Daemon {
                 "heartbeat interval {interval:?} does not fit the fence time {:?}",
                 self.contact.fence_after()
             )));
+        }
+        if let Some(commit) = &self.pack_commit {
+            commit.welcomed(w.pack_commit);
         }
         Ok((interval, (w.epoch != 0).then_some(w.epoch), w.map))
     }

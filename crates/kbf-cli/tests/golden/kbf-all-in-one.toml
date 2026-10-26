@@ -206,12 +206,16 @@ pack-read = false
 # pack-read-cache-dir = "DIR"
 # The bucket of `--pack-store-endpoint` that holds the packs, under the keys `cas/`. Needs `--pack-read`
 # pack-store-bucket = "BUCKET"
-# A file with the key pair for `--pack-store-endpoint`, as JSON `{"access_key_id": "...", "secret_access_key": "..."}`, readable by its owner alone (mode 0600 or 0400): a key that may read the objects under `cas/` and write none. The secret is never a flag: a command line is world-readable. Needs `--pack-read`
+# A file with the key pair for `--pack-store-endpoint`, as JSON `{"access_key_id": "...", "secret_access_key": "..."}`, readable by its owner alone (mode 0600 or 0400): a key that may read the objects under `cas/` and write none (`--pack-write` has a key of its own). The secret is never a flag: a command line is world-readable. Needs `--pack-read`
 # pack-store-credentials-file = "PATH"
-# The S3-compatible object store the packs are kept in, as `http://host:port`. The daemon only reads from it. Needs `--pack-read`
+# The S3-compatible object store the packs are kept in, as `http://host:port`. The daemon reads packs from it, and with `--pack-write` writes them. Needs `--pack-read`
 # pack-store-endpoint = "URL"
 # The region the requests to `--pack-store-endpoint` are signed for; `us-east-1` if left out
 pack-store-region = "us-east-1"
+# A file with the key pair `--pack-write` writes with, in the form of `--pack-store-credentials-file`: a key that may create objects under `cas/` (it also deletes the one it creates to check the store at start, and if it may not, that object is left for garbage collection). The secret is never a flag. Needs `--pack-write`
+# pack-store-write-credentials-file = "PATH"
+# Writes the outputs of a lease into packs: many blobs in one object of the pack store, written with a create-only request, then committed to the frontend (`CommitPack`), which records them before the put is acknowledged. Used only while the frontend says it takes commits (it has `--pack-index` and the pack store flags); a blob that cannot be packed is stored where it was. At start the daemon checks that the store refuses to replace an object, and refuses to start if it does not. Needs `--pack-read` and `--pack-store-write-credentials-file`. Left out, outputs are stored as they always were
+pack-write = false
 
 [scheduler]
 # The OS and architecture, as `<os>/<arch>` (`linux` or `macos`; `x86_64` or `arm64`), of an action whose platform names no OS, no architecture and no ISA level, so that it is not given to whichever node sorts first, a Mac among them. Not applied to an action that asks for `xcode` or an iOS device, which only a Mac reports. `none` applies no default: such an action runs on any node that fits. Placement only: the action's digest and cache key do not change

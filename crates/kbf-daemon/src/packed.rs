@@ -18,10 +18,11 @@
 //!   [`CasError::Corrupt`], and is logged and counted. Nothing falls back to `C` for these: the
 //!   index says the blob is in a pack, and a bad pack is for the operator to know.
 //!
-//! **Everything else is `C`'s, unchanged**: [`Cas::missing`], [`Cas::put`], [`Cas::put_chunks`],
-//! [`Cas::put_records`], [`Cas::put_spool`] and [`Cas::intake`]. `missing` is not answered from
-//! the index: a daemon's outputs go to the storage members as they did, and a blob the index
-//! holds is not thereby held where the closure check looks (the check is the frontend's).
+//! **Writes** are `C`'s, unchanged, unless the plane was built to write packs
+//! ([`PackedCas::with_writes`]): then [`Cas::put`], [`Cas::put_chunks`], [`Cas::put_records`] and
+//! [`Cas::put_spool`] go into packs, and [`Cas::missing`] asks the index first (the `write`
+//! module docs have the write rule, the fallbacks and the counts). [`Cas::intake`] is always
+//! `C`'s.
 //!
 //! The Cas has no call that reads many blobs, so each read asks the index about one blob: one
 //! `Locate` call and one ranged request. A lease's input tree is fetched by many concurrent
@@ -45,7 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use kbf_objstore::ObjectStore;
-use kbf_pack::{Fetch, ReadError, Reader};
+use kbf_pack::{Blob, Fetch, ReadError, Reader, blob_digest};
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::PackReadCounts;
 use kbf_state::BlobDigest;
@@ -54,6 +55,12 @@ use kbf_transfer::{Record, Spool};
 use kbf_types::LeaseId;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::Semaphore;
+
+pub use self::write::{
+    DEFAULT_WRITE_INFLIGHT_BYTES, FallbackStats, PackCommit, PackWriter, WriteSettings, WriteStats,
+};
+use self::write::{Room, Stored, WriteCounts, Writes, gather, groups, load, packable};
+use crate::remote_index::wire;
 
 /// The most reads of a plane, its leases' included, that ask the packs at once. Each holds a
 /// thread of the runtime's blocking pool until the frontend answers, and that pool is shared
@@ -110,6 +117,8 @@ pub struct PackStats {
     pub lost: u64,
     /// Reads that failed because the bytes in the pack are not the digest.
     pub damaged: u64,
+    /// What the plane wrote into packs, and what it wrote elsewhere instead.
+    pub writes: WriteStats,
 }
 
 impl fmt::Display for PackStats {
@@ -160,6 +169,7 @@ struct Counts {
     damaged: AtomicU64,
     /// Whether the last read that asked the packs could not (and it was logged as a warning).
     failing: AtomicBool,
+    writes: WriteCounts,
 }
 
 impl Counts {
@@ -172,6 +182,7 @@ impl Counts {
             unasked: get(&self.unasked),
             lost: get(&self.lost),
             damaged: get(&self.damaged),
+            writes: self.writes.stats(),
         }
     }
 }
@@ -180,6 +191,7 @@ impl Drop for Counts {
     fn drop(&mut self) {
         let stats = self.stats();
         tracing::info!("pack reads: {stats}");
+        tracing::info!("pack writes: {}", stats.writes);
     }
 }
 
@@ -204,6 +216,8 @@ pub struct PackedCas<C: Cas> {
     packs: Arc<dyn PackReads>,
     counts: Arc<Counts>,
     asking: Arc<Semaphore>,
+    /// What this plane writes packs with; `None` for a plane that only reads them.
+    writes: Option<Writes>,
 }
 
 impl<C: Cas> PackedCas<C> {
@@ -222,7 +236,18 @@ impl<C: Cas> PackedCas<C> {
             packs,
             counts: Arc::clone(&counter.0),
             asking: Arc::new(Semaphore::new(MAX_ASKING)),
+            writes: None,
         }
+    }
+
+    /// This plane, its outputs written into packs by `writer` while `commit` is on (the `write`
+    /// module docs). `commit` is the handle the daemon sets from each `Welcome`
+    /// ([`crate::Daemon::with_pack_writes`]); a plane given a handle nothing turns on writes no
+    /// pack.
+    #[must_use]
+    pub fn with_writes(mut self, writer: Arc<PackWriter>, commit: PackCommit) -> Self {
+        self.writes = Some(Writes::new(writer, commit));
+        self
     }
 
     /// What this plane, and every plane made from it, has done so far.
@@ -248,6 +273,63 @@ impl<C: Cas> PackedCas<C> {
                 %error,
                 "pack reads: the packs could not be asked; reading the blobs as before"
             );
+        }
+    }
+
+    /// What writes `blobs` packs: the writer, if the plane has one and the frontend takes
+    /// commits. A plane that has one and may not use it counts the `blobs` as written
+    /// elsewhere, because the capability is off.
+    fn writing(&self, blobs: usize) -> Option<&Writes> {
+        let writes = self.writes.as_ref()?;
+        if writes.enabled() {
+            return Some(writes);
+        }
+        self.counts.writes.off(blobs);
+        None
+    }
+
+    /// The room for the blob `digest` names, if it is a blob a pack takes and the budget can
+    /// hold it; otherwise the blob is counted as written elsewhere, because it does not fit.
+    async fn blob_room(
+        &self,
+        writes: &Writes,
+        digest: Option<BlobDigest>,
+    ) -> Option<(BlobDigest, Room)> {
+        let found = match digest.filter(|digest| packable(digest.size)) {
+            Some(digest) => writes.room(digest.size).await.map(|room| (digest, room)),
+            None => None,
+        };
+        if found.is_none() {
+            self.counts.writes.unfit(1);
+        }
+        found
+    }
+
+    /// `bytes` of room for `blobs` blobs; if the budget cannot hold them, they are counted as
+    /// written elsewhere, because they do not fit.
+    async fn room(&self, writes: &Writes, bytes: u64, blobs: usize) -> Option<Room> {
+        let room = writes.room(bytes).await;
+        if room.is_none() {
+            self.counts.writes.unfit(blobs);
+        }
+        room
+    }
+
+    /// Whether `blobs` are now in committed packs (`room` counts their bytes): `false` when
+    /// the plane underneath is to write them.
+    ///
+    /// # Errors
+    /// [`CasError::Corrupt`] when a blob's bytes are not its digest.
+    async fn packed(
+        &self,
+        writes: &Writes,
+        blobs: Vec<Blob>,
+        room: Room,
+    ) -> Result<bool, CasError> {
+        match writes.store(blobs, room, &self.counts.writes).await {
+            Stored::Packed => Ok(true),
+            Stored::Elsewhere => Ok(false),
+            Stored::Refused(error) => Err(error),
         }
     }
 
@@ -332,6 +414,7 @@ impl<C: Cas> Cas for PackedCas<C> {
             packs: Arc::clone(&self.packs),
             counts: Arc::clone(&self.counts),
             asking: Arc::clone(&self.asking),
+            writes: self.writes.clone(),
         }
     }
 
@@ -354,23 +437,101 @@ impl<C: Cas> Cas for PackedCas<C> {
     }
 
     async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {
-        C::put(&self.inner, bytes).await
+        let Some(writes) = self.writing(1) else {
+            return C::put(&self.inner, bytes).await;
+        };
+        let found = self.blob_room(writes, Some(blob_digest(&bytes))).await;
+        let Some((digest, room)) = found else {
+            return C::put(&self.inner, bytes).await;
+        };
+        let blob = Blob {
+            digest,
+            bytes: Bytes::from(bytes),
+        };
+        if self.packed(writes, vec![blob.clone()], room).await? {
+            return Ok(wire(&digest));
+        }
+        C::put(&self.inner, blob.bytes.to_vec()).await
     }
 
     async fn put_chunks(&self, digest: Digest, chunks: Chunks) -> Result<Digest, CasError> {
-        C::put_chunks(&self.inner, digest, chunks).await
+        let Some(writes) = self.writing(1) else {
+            return C::put_chunks(&self.inner, digest, chunks).await;
+        };
+        let found = self.blob_room(writes, blob_of(&digest)).await;
+        let Some((wanted, room)) = found else {
+            return C::put_chunks(&self.inner, digest, chunks).await;
+        };
+        let bytes = gather(&digest, chunks).await?;
+        // The packer hashes a blob only when it packs it, not when the index has it already or
+        // cannot be asked, and a put that falls back must not return a digest it was not given.
+        if blob_digest(&bytes) != wanted {
+            return Err(CasError::Corrupt(label(&digest), "other bytes".to_owned()));
+        }
+        let blob = Blob {
+            digest: wanted,
+            bytes: Bytes::from(bytes),
+        };
+        if self.packed(writes, vec![blob.clone()], room).await? {
+            return Ok(digest);
+        }
+        C::put(&self.inner, blob.bytes.to_vec()).await
     }
 
     async fn missing(&self, digests: &[Digest]) -> Vec<Digest> {
-        C::missing(&self.inner, digests).await
+        let Some(writes) = self.writes.as_ref().filter(|writes| writes.enabled()) else {
+            return C::missing(&self.inner, digests).await;
+        };
+        let asked: Vec<BlobDigest> = digests.iter().filter_map(blob_of).collect();
+        let count = asked.len();
+        let answer = writes.lacking(asked).await;
+        self.counts.writes.answered(count, digests.len(), &answer);
+        let lacking: Vec<Digest> = match &answer {
+            // The index has the blobs it did not list; the plane underneath is asked about the
+            // rest, and about the digests the index does not know (not SHA-256).
+            Ok(lacking) => digests
+                .iter()
+                .filter(|digest| blob_of(digest).is_none_or(|blob| lacking.contains(&blob)))
+                .cloned()
+                .collect(),
+            Err(_) => digests.to_vec(),
+        };
+        if lacking.is_empty() {
+            return lacking;
+        }
+        C::missing(&self.inner, &lacking).await
     }
 
     async fn put_records(&self, records: Vec<Record>) -> Result<(), CasError> {
-        C::put_records(&self.inner, records).await
+        let Some(writes) = self.writing(records.len()) else {
+            return C::put_records(&self.inner, records).await;
+        };
+        let (large, small): (Vec<Record>, Vec<Record>) = records
+            .into_iter()
+            .partition(|record| !packable(record.digest.size_bytes));
+        self.counts.writes.unfit(large.len());
+        for group in groups(small, writes.group_bytes()) {
+            let bytes = group.iter().map(|record| record.digest.size_bytes).sum();
+            let Some(room) = self.room(writes, bytes, group.len()).await else {
+                C::put_records(&self.inner, group).await?;
+                continue;
+            };
+            let blobs = load(&group).await?;
+            if !self.packed(writes, blobs, room).await? {
+                C::put_records(&self.inner, group).await?;
+            }
+        }
+        if large.is_empty() {
+            return Ok(());
+        }
+        C::put_records(&self.inner, large).await
     }
 
     async fn put_spool(&self, spool: Arc<Spool>) -> Result<(), CasError> {
-        C::put_spool(&self.inner, spool).await
+        if self.writing(spool.records().len()).is_none() {
+            return C::put_spool(&self.inner, spool).await;
+        }
+        self.put_records(spool.outgoing()).await
     }
 
     fn intake(&self) -> Option<Arc<dyn Intake>> {
@@ -382,5 +543,9 @@ impl<C: Cas> Cas for PackedCas<C> {
     }
 }
 
+mod write;
+
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod write_tests;

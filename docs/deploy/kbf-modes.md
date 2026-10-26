@@ -119,7 +119,7 @@ against the digest. A blob the frontend does not locate, and a frontend without
 `--pack-index`, leave the read where it was (the storage nodes), as does a frontend of the
 previous release, which answers PERMISSION_DENIED (logged once, then once more after a
 read that was answered, and counted as `unasked`); `missing`, uploads and every
-other call are unchanged, so the daemon still uploads its outputs to the storage members.
+other call are unchanged, so without `--pack-write` the daemon still uploads its outputs to the storage members.
 A pack that is gone or whose bytes are not the digest fails the read. Each read asks for one
 blob: one `Locate` call and one ranged request, with at most 16 asking at once. A blob of
 more than 64 MiB is read where it was before, as a read from a pack holds the whole blob in
@@ -138,6 +138,23 @@ reads first, and the outputs still go to the members. `kbf all-in-one` and
 the whole farm, with no frontend to ask and no pack index, and refuse the flag. Counts of
 what was read from packs, elsewhere, lost and damaged are logged when the daemon stops
 (`pack reads: ...`), and a lost or damaged blob is logged when it is found.
+
+A daemon writes its outputs into packs with `--pack-write` (off by default; the `[packs]`
+table of `kbf.toml`), which needs `--pack-read` and `--pack-store-write-credentials-file`, a
+key pair file of the same form as `--pack-store-credentials-file` but of a key that may
+create objects under `cas/` (the read key stays read-only; the endpoint, the bucket and the
+region are the ones of `--pack-read`). Refused at parse time without either, naming the flag
+that is missing. At start the daemon checks that the store refuses to replace an object and
+does not start if it does not or if the store cannot be reached for the check; its packs are
+named `cas/d/<--node-id>/<boot>/<n>`, where the boot is new on every start. Packs are written
+only while the frontend says it takes `CommitPack` (its `Welcome` carries `pack_commit`: it
+has `--pack-index` and the pack store flags); until then, and after a frontend of the
+previous release answers UNIMPLEMENTED, the outputs go to the storage members as before. A put
+is acknowledged only after its pack is stored and the frontend has recorded it; a blob that
+cannot be packed, or a pack that cannot be committed, is written to the storage members
+instead. The counts are logged when the daemon stops (`pack writes: ...`); they are not yet
+on the heartbeat. `kbf all-in-one` and `kbf storage-and-daemon` without a `--frontend` refuse
+`--pack-read`, and with it `--pack-write`.
 
 The same counts ride every heartbeat of a daemon that has `--pack-read` (since the daemon
 process started; a daemon without the flag sends none), and the frontend its session is on

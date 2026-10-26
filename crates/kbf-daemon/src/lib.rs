@@ -104,7 +104,10 @@ pub use kbf_route::{DEFAULT_HOLD, Liveness};
 #[cfg(target_os = "linux")]
 pub use local::{LOCAL_DRIVER, LocalRuntime};
 pub use map::{HeldMaps, REFETCH_WITHIN};
-pub use packed::{PackCounter, PackReads, PackStats, PackedCas};
+pub use packed::{
+    DEFAULT_WRITE_INFLIGHT_BYTES, FallbackStats, PackCommit, PackCounter, PackReads, PackStats,
+    PackWriter, PackedCas, WriteSettings, WriteStats,
+};
 pub use plane::{
     FarmCas, FarmLease, LocalMember, StorageNodes, member_cas, member_cas_with_hold, storage_nodes,
 };

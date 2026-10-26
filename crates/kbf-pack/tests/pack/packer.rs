@@ -7,7 +7,7 @@ use kbf_objstore::{ByteRange, ObjectStore};
 use kbf_pack::{Blob, Fetch, PackError, Packer, PackerConfig, ReaderConfig, check_create_only};
 use kbf_segments::SegmentReader;
 use kbf_segments::layout::footer_len;
-use kbf_state::{MAX_BATCH, PackIndex};
+use kbf_state::{MAX_BATCH, PackIndex, PackIndexError};
 
 use crate::support::{FaultyStore, Rig, blob, digests, filler, keys, limits, pack_all, pack_key};
 
@@ -533,4 +533,28 @@ fn the_default_limits_are_the_ones_documented() {
     assert_eq!(config.max_blobs, 16_384);
     assert_eq!(config.put_attempts, 3);
     assert_eq!(kbf_pack::FRONTEND_PACK_BYTES, 32 << 20);
+}
+
+/// Asserts that a record the index refuses is not tried again, as a repeat gets the same answer:
+/// the call fails after one record with the refusal as the source, the pack is left for
+/// garbage collection, and the next call writes and records a new pack.
+#[tokio::test]
+async fn a_refused_record_is_not_tried_again() {
+    let rig = Rig::new();
+    rig.index.refuse_record(1);
+    let packer = rig.packer(PackerConfig::default());
+    let x = blob("x");
+
+    let error = packer.pack(vec![x.clone()]).await.unwrap_err();
+
+    let PackError::Record { source, .. } = &error else {
+        panic!("a record error: {error}");
+    };
+    assert_eq!(source, &PackIndexError::Refused("scripted".to_owned()));
+    assert_eq!(rig.index.held_at_record(), [true]);
+    assert!(rig.store.holds(&pack_key(0)).await);
+
+    let again = pack_all(&packer, &[x]).await;
+
+    assert_eq!(again.packs[0].key, pack_key(1));
 }
