@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use kbf_daemon::{
-    Clock, Daemon, DaemonConfig, DriverReport, Event, FakeRuntime, Moment, NodeReport, PackCounter,
-    Runtime, Runtimes, TlsFiles,
+    Clock, Daemon, DaemonConfig, DriverReport, Event, FakeRuntime, Moment, NodeReport, PackCommit,
+    PackCounter, Runtime, Runtimes, TlsFiles,
 };
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{
@@ -192,6 +192,16 @@ impl Peer {
     /// as a server that predates the field.
     pub fn welcome_every(&self, interval: Duration) {
         self.welcome_with(interval, 0);
+    }
+
+    /// A Welcome that says whether this frontend takes pack commits.
+    pub fn welcome_pack_commit(&self, takes_commits: bool) {
+        self.send(server_message::Message::Welcome(Welcome {
+            protocol_version: 1,
+            heartbeat_interval_ms: INTERVAL.as_millis() as u64,
+            pack_commit: takes_commits,
+            ..Welcome::default()
+        }));
     }
 
     /// A Welcome that names lease epoch `epoch` (0: none).
@@ -915,6 +925,32 @@ impl<R: Runtime> Harness<R> {
             None,
             None,
             Some(packs),
+            None,
+        )
+        .await
+    }
+
+    /// Starts a server and a daemon that sets `commit` from each Welcome
+    /// ([`Daemon::with_pack_writes`]).
+    pub async fn with_pack_commit(name: &str, runtime: Arc<R>, commit: PackCommit) -> Self {
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let configure = |config: &mut DaemonConfig| {
+            config.recheck_every = Duration::from_millis(20);
+        };
+        Self::build_all(
+            name,
+            runtimes,
+            runtime,
+            Duration::from_secs(40),
+            configure,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(commit),
         )
         .await
     }
@@ -946,6 +982,7 @@ impl<R: Runtime> Harness<R> {
             map,
             drain,
             None,
+            None,
         )
         .await
     }
@@ -964,6 +1001,7 @@ impl<R: Runtime> Harness<R> {
         map: Option<Arc<kbf_mapsync::MapHolder>>,
         drain: Option<(mpsc::UnboundedReceiver<()>, Option<Duration>)>,
         packs: Option<PackCounter>,
+        commit: Option<PackCommit>,
     ) -> Self {
         let pki = pki(name);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1026,6 +1064,9 @@ impl<R: Runtime> Harness<R> {
         if let Some(packs) = packs {
             daemon = daemon.with_pack_reads(packs);
             assert!(daemon.pack_reads().is_some());
+        }
+        if let Some(commit) = commit {
+            daemon = daemon.with_pack_writes(commit);
         }
         let daemon = match drain {
             Some((signals, Some(deadline))) => tokio::spawn(daemon.run_draining(signals, deadline)),

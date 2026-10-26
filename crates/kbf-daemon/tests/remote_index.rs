@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use kbf_daemon::cas::{Cas, CasError, digest_of, label};
-use kbf_daemon::{PackedCas, RemoteIndex};
+use kbf_daemon::{PackCommit, PackWriter, PackedCas, RemoteIndex, WriteSettings};
 use kbf_objstore::{Capabilities, MemoryStore};
 use kbf_pack::{Blob, PackError, PackKeys, Packer, PackerConfig, Reader, ReaderConfig, WriterKind};
 use kbf_proto::reapi::Digest;
@@ -528,4 +528,44 @@ async fn a_located_blob_in_a_lost_pack_fails_the_read() {
         "{failed:?}"
     );
     assert_eq!(cas.stats().lost, 1);
+}
+
+/// Asserts that a plane that writes packs over the daemon's index commits the pack through the
+/// frontend as the node, with the digests and offsets of its blobs, before the put returns and
+/// without the plane underneath being asked to store the blob; and that a frontend that answers
+/// the commit UNIMPLEMENTED has the blob stored by the plane underneath, which the put returns
+/// the digest of, and turns writing off for the plane (the next put sends no commit).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plane_commits_through_the_frontend_until_it_is_unimplemented() {
+    let world = World::new().await;
+    let remote: Arc<dyn PackIndex> = world.remote.clone();
+    let keys = PackKeys::new(WriterKind::Daemon, "node1", "boot2").expect("keys");
+    let store = Arc::clone(&world.store);
+    let writer = PackWriter::new(store, remote, keys, WriteSettings::default()).expect("writer");
+    let commit = PackCommit::new();
+    commit.welcomed(true);
+    let (underneath, plane) = world.plane();
+    let plane = plane.with_writes(Arc::new(writer), commit.clone());
+
+    let digest = plane.put(b"committed".to_vec()).await.expect("put");
+    assert_eq!(digest, digest_of(b"committed"));
+    let [sent] = &world.frontend.commits()[..] else {
+        panic!("one commit");
+    };
+    assert_eq!(sent.writer, "node1");
+    assert!(sent.pack.starts_with("cas/d/node1/boot2/"), "{}", sent.pack);
+    let [packed] = &sent.blobs[..] else {
+        panic!("one blob");
+    };
+    assert_eq!(packed.digest, Some(digest));
+    assert_eq!(underneath.puts(), 0);
+
+    world.frontend.set_commit(Some(Code::Unimplemented));
+    let refused = plane.put(b"refused".to_vec()).await.expect("put");
+    assert_eq!(underneath.blob(&refused), Some(b"refused".to_vec()));
+    assert_eq!(world.frontend.commits().len(), 2);
+    assert!(!commit.enabled());
+    plane.put(b"after".to_vec()).await.expect("put");
+    assert_eq!(world.frontend.commits().len(), 2);
+    assert_eq!(underneath.puts(), 2);
 }

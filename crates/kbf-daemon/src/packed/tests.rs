@@ -482,6 +482,7 @@ fn the_wire_counts_are_the_planes_counts() {
         unasked: 1,
         lost: 3,
         damaged: 4,
+        writes: WriteStats::default(),
     };
     let want = PackReadCounts {
         served: 5,
@@ -504,6 +505,7 @@ fn the_counts_are_spelled_for_the_log() {
         unasked: 1,
         lost: 3,
         damaged: 4,
+        writes: WriteStats::default(),
     };
     assert_eq!(
         stats.to_string(),
