@@ -300,10 +300,7 @@ mod tests {
     fn a_length_above_the_bound_is_refused_and_one_at_it_is_not() {
         assert!(check_len("v", 10, 10).is_ok());
         let e = check_len("the attribute x", 11, 10).expect_err("over");
-        assert!(
-            e.contains("the attribute x") && e.contains("11") && e.contains("10"),
-            "{e}"
-        );
+        assert_eq!(e, "the attribute x is 11 bytes, more than the 10 allowed");
     }
 
     /// Catches a non-macOS build that fails on a node because it cannot read attributes.
