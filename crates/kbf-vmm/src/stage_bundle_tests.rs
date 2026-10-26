@@ -7,7 +7,7 @@ use super::*;
 const CRYPTEX: &str = "1973223a21d99bbbe64bbe6d31aca7aeb155664eead280132676bc6695a79a37";
 
 /// A small exported bundle: metadata, and a restore directory with an image and a link.
-fn fake_bundle(dir: &Path, name: &str) -> PathBuf {
+pub(super) fn fake_bundle(dir: &Path, name: &str) -> PathBuf {
     let b = dir.join(name);
     write(&b.join("ExportedMetadata.plist"), "meta", 0o600);
     write(&b.join("Restore/090-cryptex.dmg"), "cryptex", 0o444);
@@ -228,7 +228,8 @@ fn a_bundle_is_copied_with_a_manifest_of_path_and_sha256_per_file() {
         "iOS_27.exportedBundle/Restore/090-cryptex.dmg",
         "iOS_27.exportedBundle/Restore/latest.dmg",
     ] {
-        assert!(owned.contains(&rt_dir.join(p)), "{p}");
+        let built = rt_dir.with_file_name(".runtimes.kbf-staging").join(p);
+        assert!(owned.contains(&built), "{p}");
     }
 }
 

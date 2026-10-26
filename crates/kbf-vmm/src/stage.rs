@@ -12,6 +12,23 @@
 //! are plain Rust over directories, so the tests run them on a fake volume; the attach and
 //! detach around [`execute`] are `offline::stage` (macOS only).
 //!
+//! The volume is written as root and an earlier guest boot may have tampered with it (it can
+//! plant links and make files immutable), so:
+//! - What is in the way is removed without following a link. A removal that fails (an
+//!   immutable file) stops the stage with an error naming the path; it is never ignored.
+//! - A file is created exclusively and its mode is set on the open file, never by path
+//!   (`staged.json` included); a directory made for a path that is missing is given its mode
+//!   explicitly, so the result does not depend on the umask; a mode set after the fact opens
+//!   the path without following a link and changes the open file. Ownership is `lchown`.
+//! - A tree or a runtime is built under a staging name (`.Xcode.app.kbf-staging` beside
+//!   Xcode.app, `.runtimes.kbf-staging` beside the runtime directory) and renamed into place
+//!   when complete. When the build or a check fails, the staging name is removed, so the
+//!   guest never sees a partial tree and never lists a partial runtime.
+//! - A file is copied at most as long as it was planned (one byte more is read to see that a
+//!   source grew); a source that grew or shrank is an error.
+//! - Planned modes lose group and world write (a source 0775 is staged 0755, 0666 is 0644);
+//!   owners and the other bits are kept, setuid, setgid and sticky are dropped.
+//!
 //! What is copied and what is not:
 //! - Xcode.app is copied as regular files, directories and symbolic links, never following
 //!   a link. A link is recreated only when its target stays inside the app (relative, with
@@ -43,13 +60,12 @@
 
 use std::collections::BTreeSet;
 use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use kbf_guest::simpaths;
 use serde_json::{Value, json};
 
-use crate::guest::remove_leftover;
 use crate::image;
 use crate::xattr;
 
@@ -312,7 +328,8 @@ impl Walk {
             }
             let (child_rel, path) = (rel.join(&entry.name), here.join(&entry.name));
             let meta = &entry.meta;
-            let mode = meta.permissions().mode() & 0o777;
+            // Group and world write are dropped (and setuid, setgid and sticky with them).
+            let mode = meta.permissions().mode() & 0o755;
             if let Some(target) = entry.target {
                 if !stays_inside(&target, depth, &self.guest_root) {
                     if !self.allow_external {
@@ -554,6 +571,39 @@ pub struct Env<'a> {
     pub clone_tree: &'a dyn Fn(&Path, &Path) -> io::Result<()>,
     /// Makes the path (a link itself, never what it points to) owned by root:wheel.
     pub chown_root: &'a dyn Fn(&Path) -> io::Result<()>,
+    /// Removes whatever is at the path (a link itself, a directory with its contents); a
+    /// path that is not there is fine. [`remove_path`] is the real one.
+    pub remove: &'a dyn Fn(&Path) -> io::Result<()>,
+}
+
+/// Removes whatever is at `path` without following a link: a directory goes with its
+/// contents, a path that is not there is not an error. This is [`Env::remove`] for a real
+/// volume (a file the guest made immutable fails here, and the stage then stops).
+///
+/// # Errors
+/// The path cannot be examined or removed.
+pub fn remove_path(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+    }
+}
+
+/// Removes what is at `path`; a removal that fails is an error naming the path, because the
+/// stage must not write through, or leave beside its own files, what it could not remove.
+pub(crate) fn remove_existing(env: &Env<'_>, path: &Path) -> Result<(), String> {
+    (env.remove)(path).map_err(|e| format!("remove {}: {e}", path.display()))
+}
+
+/// `err` (why a build failed), plus what it cost to remove the partial copy at `path`: the
+/// guest must never find a partial tree.
+fn discard(env: &Env<'_>, path: &Path, err: String) -> String {
+    match remove_existing(env, path) {
+        Ok(()) => err,
+        Err(e) => format!("{err}; and the partial copy could not be removed: {e}"),
+    }
 }
 
 /// The guest-absolute path `abs` as a path under the volume root.
@@ -561,9 +611,15 @@ fn on_volume(volume: &Path, abs: &str) -> PathBuf {
     volume.join(abs.trim_start_matches('/'))
 }
 
-/// `chmod` of `path` to `mode`.
+/// `fchmod` of what is at `path` to `mode`: the path is opened without following a link
+/// (and without blocking on a pipe), so a link there is an error and never changes the mode
+/// of what it points to.
 pub(crate) fn chmod(path: &Path, mode: u32) -> Result<(), String> {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .and_then(|f| f.set_permissions(std::fs::Permissions::from_mode(mode)))
         .map_err(|e| format!("chmod {}: {e}", path.display()))
 }
 
@@ -581,24 +637,28 @@ pub(crate) fn mkdir(path: &Path, mode: u32) -> Result<(), String> {
         .map_err(|e| format!("create {}: {e}", path.display()))
 }
 
-/// Writes `text` to `path` (any file there is replaced) with `mode`.
-pub(crate) fn write_text(path: &Path, text: &str, mode: u32) -> Result<(), String> {
-    remove_leftover(path);
-    std::fs::write(path, text)
-        .and_then(|()| std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)))
+/// Writes `text` to the new file `path` with `mode`. What is there is removed first (a
+/// removal that fails is the error); the file is then created exclusively (`O_EXCL`, which
+/// does not follow a link, with `O_NOFOLLOW` as well) and its mode is set on the open file.
+pub(crate) fn write_text(env: &Env<'_>, path: &Path, text: &str, mode: u32) -> Result<(), String> {
+    use std::io::Write;
+    remove_existing(env, path)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut f| {
+            f.write_all(text.as_bytes())?;
+            f.set_permissions(std::fs::Permissions::from_mode(mode))
+        })
         .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-/// The size of the file at `path`.
-pub(crate) fn file_len(path: &Path) -> Result<u64, String> {
-    std::fs::metadata(path)
-        .map(|m| m.size())
-        .map_err(|e| format!("stat {}: {e}", path.display()))
-}
-
 /// Makes sure every directory on the way to `rel` (a path under `volume`) is a real
-/// directory, creating the missing ones (root, 0755). A link or a file in the way is an
-/// error.
+/// directory, creating the missing ones (root, mode 0755 whatever the umask is). A link or a
+/// file in the way is an error.
 pub(crate) fn ensure_dir(volume: &Path, rel: &Path, env: &Env<'_>) -> Result<(), String> {
     let mut at = volume.to_owned();
     for c in rel.components() {
@@ -613,6 +673,7 @@ pub(crate) fn ensure_dir(volume: &Path, rel: &Path, env: &Env<'_>) -> Result<(),
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 mkdir(&at, 0o755)?;
+                chmod(&at, 0o755)?;
                 chown(env, &at)?;
             }
             Err(e) => return Err(format!("stat {}: {e}", at.display())),
@@ -691,10 +752,12 @@ fn copy_file_with(
         .mode(0o600)
         .open(dst)
         .map_err(|e| fail(&e))?;
+    // One byte more than planned is read, so a source that grew is seen and not copied whole.
+    let mut reader = (&mut from).take(bytes.saturating_add(1));
     let (copied, sha256) = if hash {
         let (mut hasher, mut buf, mut total) = (Sha256::new(), vec![0u8; 1 << 20], 0u64);
         loop {
-            let n = from.read(&mut buf).map_err(|e| fail(&e))?;
+            let n = reader.read(&mut buf).map_err(|e| fail(&e))?;
             if n == 0 {
                 break;
             }
@@ -704,19 +767,24 @@ fn copy_file_with(
         }
         (total, Some(hex::encode(hasher.finalize())))
     } else {
-        (io::copy(&mut from, &mut to).map_err(|e| fail(&e))?, None)
+        (io::copy(&mut reader, &mut to).map_err(|e| fail(&e))?, None)
     };
+    if copied != bytes {
+        let seen = if copied > bytes {
+            "it grew past that".to_owned()
+        } else {
+            format!("{copied} copied")
+        };
+        return Err(format!(
+            "{} changed while it was copied ({bytes} bytes planned, {seen})",
+            src.display()
+        ));
+    }
     // The attributes carry part of the code signature of a file that is not a Mach-O.
     xattr::copy_fd(&from, &to, src).map_err(|e| fail(&e))?;
-    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode)).map_err(|e| fail(&e))?;
-    if copied == bytes {
-        Ok(sha256)
-    } else {
-        Err(format!(
-            "{} changed while it was copied ({bytes} bytes planned, {copied} copied)",
-            src.display()
-        ))
-    }
+    to.set_permissions(std::fs::Permissions::from_mode(mode))
+        .map_err(|e| fail(&e))?;
+    Ok(sha256)
 }
 
 /// Makes `dst` a symbolic link to `target`.
@@ -814,7 +882,7 @@ fn build_tree(x: &TreePlan, staging: &Path, env: &Env<'_>) -> Result<&'static st
         return Ok("clone");
     }
     // A failed clone may leave part of the tree: start from nothing.
-    remove_leftover(staging);
+    remove_existing(env, staging)?;
     mkdir(staging, 0o700)?;
     let mut dir_modes = vec![(staging.to_owned(), 0o755)];
     for node in &x.nodes {
@@ -850,18 +918,43 @@ pub(crate) fn rename(from: &Path, to: &Path) -> Result<(), String> {
         .map_err(|e| format!("rename {} -> {}: {e}", from.display(), to.display()))
 }
 
-/// Removes every entry of `dir` that `keep` does not accept (a link is removed, not followed).
-pub(crate) fn clear_except(dir: &Path, keep: &dyn Fn(&Path) -> bool) -> Result<(), String> {
+/// Removes every entry of `dir` that `keep` does not accept (a link is removed, not followed;
+/// a removal that fails is an error).
+pub(crate) fn clear_except(
+    env: &Env<'_>,
+    dir: &Path,
+    keep: &dyn Fn(&Path) -> bool,
+) -> Result<(), String> {
     let present = std::fs::read_dir(dir)
         .and_then(|rd| {
             rd.map(|e| e.map(|e| e.path()))
                 .collect::<io::Result<Vec<_>>>()
         })
         .map_err(|e| format!("read {}: {e}", dir.display()))?;
-    for path in present.iter().filter(|p| !keep(p)) {
-        remove_leftover(path);
+    present
+        .iter()
+        .filter(|p| !keep(p))
+        .try_for_each(|path| remove_existing(env, path))
+}
+
+/// Builds `tree` at `staging`, hands it to root and renames it to `dest`.
+fn build_and_place(
+    tree: &TreePlan,
+    staging: &Path,
+    dest: &Path,
+    env: &Env<'_>,
+) -> Result<&'static str, String> {
+    let method = build_tree(tree, staging, env)?;
+    chown(env, staging)?;
+    for node in &tree.nodes {
+        chown(env, &staging.join(node.rel()))?;
     }
-    Ok(())
+    // The finished copy replaces a previous one: the old tree is removed, then the new one
+    // is renamed into place (a directory cannot be renamed over a full one). A run that dies
+    // between the two leaves no Xcode.app, never a half one.
+    remove_existing(env, dest)?;
+    rename(staging, dest)?;
+    Ok(method)
 }
 
 /// Builds `tree` under a staging name beside `dest_abs` (its guest path) and renames it into
@@ -887,20 +980,13 @@ fn stage_tree(
     );
     ensure_dir(volume, parent, env)?;
     let staging = volume.join(parent).join(format!(".{name}.kbf-staging"));
-    remove_leftover(&staging);
+    remove_existing(env, &staging)?;
     if only {
-        clear_except(&volume.join(parent), &|p| p.ends_with(&name))?;
+        clear_except(env, &volume.join(parent), &|p| p.ends_with(&name))?;
     }
-    let method = build_tree(tree, &staging, env)?;
-    chown(env, &staging)?;
-    for node in &tree.nodes {
-        chown(env, &staging.join(node.rel()))?;
-    }
-    // The finished copy replaces a previous one: the old tree is removed, then the new one
-    // is renamed into place (a directory cannot be renamed over a full one). A run that dies
-    // between the two leaves no Xcode.app, never a half one.
-    remove_leftover(&dest);
-    rename(&staging, &dest)?;
+    // Whatever fails below, the partial tree is removed: the guest never sees it.
+    let method =
+        build_and_place(tree, &staging, &dest, env).map_err(|e| discard(env, &staging, e))?;
     let count = |f: fn(&Node) -> bool| tree.nodes.iter().filter(|n| f(n)).count();
     Ok(json!({
         "dest": dest_abs,
@@ -946,48 +1032,64 @@ fn stage_bundle(r: &RuntimePlan, dst: &Path, env: &Env<'_>) -> Result<Vec<Value>
     Ok(files)
 }
 
+/// Builds the runtime `r` at `dst` (which does not exist) and returns its report entry.
+fn stage_runtime(r: &RuntimePlan, dst: &Path, env: &Env<'_>) -> Result<Value, String> {
+    let dest = format!("{}/{}", simpaths::RUNTIME_DIR, r.name);
+    if r.kind == RuntimeKind::Bundle {
+        let files = stage_bundle(r, dst, env)?;
+        return Ok(json!({
+            "name": r.name,
+            "kind": r.kind.as_str(),
+            "bytes": r.bytes,
+            "files": files,
+            "dest": dest,
+        }));
+    }
+    let sha256 = image::stage_exact(&r.src, dst, r.bytes).map_err(|e| e.to_string())?;
+    chmod(dst, 0o644)?;
+    chown(env, dst)?;
+    Ok(json!({
+        "name": r.name,
+        "kind": r.kind.as_str(),
+        "bytes": r.bytes,
+        "sha256": sha256,
+        "dest": dest,
+    }))
+}
+
+/// Builds each runtime in `staging` (beside the runtime directory, never inside it) and
+/// renames it into `dir` once complete, so a name in `dir` is always a whole runtime.
+fn place_runtimes(
+    dir: &Path,
+    staging: &Path,
+    runtimes: &[RuntimePlan],
+    env: &Env<'_>,
+) -> Result<Value, String> {
+    // The directory holds exactly this setup's runtimes: the guest installs what it finds.
+    clear_except(env, dir, &|p| runtimes.iter().any(|r| p.ends_with(&r.name)))?;
+    remove_existing(env, staging)?;
+    mkdir(staging, 0o700)?;
+    let mut staged = Vec::new();
+    for r in runtimes {
+        let built = staging.join(&r.name);
+        staged.push(stage_runtime(r, &built, env)?);
+        let dst = dir.join(&r.name);
+        remove_existing(env, &dst)?;
+        rename(&built, &dst)?;
+    }
+    remove_existing(env, staging)?;
+    Ok(Value::Array(staged))
+}
+
 fn stage_runtimes(volume: &Path, runtimes: &[RuntimePlan], env: &Env<'_>) -> Result<Value, String> {
     let rel = Path::new(simpaths::RUNTIME_DIR.trim_start_matches('/'));
     let dir = volume.join(rel);
     ensure_dir(volume, rel, env)?;
-    // The directory holds exactly this setup's runtimes: the guest installs what it finds.
-    clear_except(&dir, &|p| runtimes.iter().any(|r| p.ends_with(&r.name)))?;
-    let mut staged = Vec::new();
-    for r in runtimes {
-        let dst = dir.join(&r.name);
-        remove_leftover(&dst);
-        let dest = format!("{}/{}", simpaths::RUNTIME_DIR, r.name);
-        if r.kind == RuntimeKind::Bundle {
-            let files = stage_bundle(r, &dst, env)?;
-            staged.push(json!({
-                "name": r.name,
-                "kind": r.kind.as_str(),
-                "bytes": r.bytes,
-                "files": files,
-                "dest": dest,
-            }));
-            continue;
-        }
-        let sha256 = image::stage(&r.src, &dst).map_err(|e| e.to_string())?;
-        let size = file_len(&dst)?;
-        if size != r.bytes {
-            return Err(format!(
-                "{} changed while it was copied ({} bytes planned, {size} copied)",
-                r.src.display(),
-                r.bytes
-            ));
-        }
-        chmod(&dst, 0o644)?;
-        chown(env, &dst)?;
-        staged.push(json!({
-            "name": r.name,
-            "kind": r.kind.as_str(),
-            "bytes": size,
-            "sha256": sha256,
-            "dest": dest,
-        }));
-    }
-    Ok(Value::Array(staged))
+    let staging = volume
+        .join(rel.parent().unwrap_or(Path::new("")))
+        .join(".runtimes.kbf-staging");
+    // Whatever fails, the runtime being built is removed: the guest never sees a partial one.
+    place_runtimes(&dir, &staging, runtimes, env).map_err(|e| discard(env, &staging, e))
 }
 
 /// Writes `plan` into the Data volume mounted at `volume`, and returns what was staged
@@ -995,8 +1097,9 @@ fn stage_runtimes(volume: &Path, runtimes: &[RuntimePlan], env: &Env<'_>) -> Res
 ///
 /// # Errors
 /// Not enough free space (named, with the sizes), a link or file where a directory must
-/// be, a source that changed since the plan, or an I/O error. Nothing already staged is
-/// rolled back; Xcode.app is renamed into place only once complete. A rerun holds the
+/// be, something that cannot be removed, a source that changed since the plan, or an I/O
+/// error. Nothing already staged is rolled back, but a tree or runtime that failed part way is
+/// removed; Xcode.app and each runtime are renamed into place only once complete. A rerun holds the
 /// previous Xcode.app and the new one side by side until the rename, so the free-space check
 /// (which counts the previous copy as used) asks for room for both.
 pub fn execute(volume: &Path, plan: &Plan, env: &Env<'_>) -> Result<Value, String> {
@@ -1024,7 +1127,7 @@ pub fn execute(volume: &Path, plan: &Plan, env: &Env<'_>) -> Result<Value, Strin
     let rel = Path::new(simpaths::MANIFEST.trim_start_matches('/'));
     ensure_dir(volume, rel.parent().unwrap_or(Path::new("")), env)?;
     let path = volume.join(rel);
-    write_text(&path, &format!("{manifest:#}\n"), 0o644)?;
+    write_text(env, &path, &format!("{manifest:#}\n"), 0o644)?;
     chown(env, &path)?;
     Ok(json!({
         "free_bytes_before": free,

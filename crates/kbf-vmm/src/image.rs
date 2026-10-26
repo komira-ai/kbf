@@ -139,22 +139,53 @@ pub const STAGED: &str = "restore.ipsw";
 
 /// Copies `src` to the new file `dst` (`O_EXCL`, mode 0600) and returns the SHA-256 of
 /// the bytes copied. The installer is handed `dst`, never `src`, so the file that was
-/// hashed is the file that is installed even if `src` changes after this returns.
+/// hashed is the file that is installed even if `src` changes after this returns. `src` is
+/// opened without following a link and without blocking on a pipe, and the open file must be
+/// a regular file.
 ///
 /// # Errors
-/// `src` cannot be read or `dst` cannot be written.
+/// `src` cannot be read or is not a regular file, or `dst` cannot be written.
 pub fn stage(src: &Path, dst: &Path) -> Result<String, ImageError> {
+    copy_hashed(src, dst, None)
+}
+
+/// [`stage`] for a file of a known size: at most `bytes` are copied (one more is read, to
+/// see that the file grew), and a file that grew or shrank is an error.
+///
+/// # Errors
+/// As [`stage`], or the file is not `bytes` long.
+pub(crate) fn stage_exact(src: &Path, dst: &Path, bytes: u64) -> Result<String, ImageError> {
+    copy_hashed(src, dst, Some(bytes))
+}
+
+fn copy_hashed(src: &Path, dst: &Path, planned: Option<u64>) -> Result<String, ImageError> {
     let io_err =
         |what: &str, p: &Path, e: io::Error| ImageError::Io(format!("{what} {}: {e}", p.display()));
-    let mut from = File::open(src).map_err(|e| io_err("read", src, e))?;
+    let from = File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(src)
+        .map_err(|e| io_err("read", src, e))?;
+    if !from
+        .metadata()
+        .map_err(|e| io_err("read", src, e))?
+        .is_file()
+    {
+        return Err(ImageError::Io(format!(
+            "read {}: not a regular file",
+            src.display()
+        )));
+    }
     let mut to = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(dst)
         .map_err(|e| io_err("create", dst, e))?;
+    let mut from = from.take(planned.map_or(u64::MAX, |b| b.saturating_add(1)));
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
+    let mut total = 0u64;
     loop {
         let n = from
             .read(&mut buf)
@@ -164,6 +195,18 @@ pub fn stage(src: &Path, dst: &Path) -> Result<String, ImageError> {
             break;
         }
         hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    if let Some(bytes) = planned.filter(|b| *b != total) {
+        return Err(ImageError::Io(format!(
+            "{} changed while it was copied ({bytes} bytes planned, {})",
+            src.display(),
+            if total > bytes {
+                "it grew past that".to_owned()
+            } else {
+                format!("{total} copied")
+            }
+        )));
     }
     Ok(hex::encode(hasher.finalize()))
 }
@@ -701,6 +744,35 @@ mod tests {
     /// Catches a copy that is not byte-for-byte what was hashed, one that overwrites a
     /// file, and an installer that is handed the caller's path instead of the private
     /// copy (the caller's file could change after the digest check).
+    /// Catches a copy of a source that is a link (read as root from wherever it points) or a
+    /// pipe (the copy would wait for a writer), and a size-checked copy of a file that grew or
+    /// shrank.
+    #[test]
+    fn a_source_must_be_a_regular_file_and_a_planned_size_is_held() {
+        let dir = tmp("image-stage-source");
+        let src = dir.join("src.dmg");
+        std::fs::write(&src, "hello").expect("src");
+        let text = |r: Result<String, ImageError>| r.unwrap_err().to_string();
+        let link = dir.join("link.dmg");
+        std::os::unix::fs::symlink(&src, &link).expect("link");
+        assert!(text(stage(&link, &dir.join("d1"))).contains("read"));
+        let fifo = dir.join("fifo.dmg");
+        let c = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(fifo.as_os_str()))
+            .expect("path");
+        // SAFETY: `c` is a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        assert!(text(stage(&fifo, &dir.join("d2"))).contains("not a regular file"));
+        assert_eq!(stage_exact(&src, &dir.join("d3"), 5).expect("exact"), HELLO);
+        let grew = text(stage_exact(&src, &dir.join("d4"), 3));
+        assert!(
+            grew.contains("(3 bytes planned, it grew past that)"),
+            "{grew}"
+        );
+        assert_eq!(std::fs::metadata(dir.join("d4")).expect("d4").len(), 4);
+        let shrank = text(stage_exact(&src, &dir.join("d5"), 9));
+        assert!(shrank.contains("(9 bytes planned, 5 copied)"), "{shrank}");
+    }
+
     #[test]
     fn the_installer_gets_a_private_copy_of_the_checked_bytes() {
         let dir = tmp("image-stage");
@@ -717,8 +789,8 @@ mod tests {
         let text = |r: Result<String, ImageError>| r.unwrap_err().to_string();
         assert!(text(stage(&src, &dst)).contains("create"));
         assert!(text(stage(&dir.join("no"), &dir.join("d2"))).contains("read"));
-        // A directory opens but cannot be read: the copy error names the source.
-        assert!(text(stage(&dir, &dir.join("d3"))).contains("copy"));
+        // A directory opens but is not a regular file.
+        assert!(text(stage(&dir, &dir.join("d3"))).contains("not a regular file"));
 
         let sys = FakeSystem::new();
         let a = args(&dir, &src.to_string_lossy(), HELLO);

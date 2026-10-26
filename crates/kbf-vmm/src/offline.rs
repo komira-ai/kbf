@@ -188,6 +188,7 @@ pub fn stage(disk: &Path, plan: &crate::stage::Plan) -> Result<Value, String> {
             free_bytes: &crate::hostfs::free_bytes,
             clone_tree: &clone_tree,
             chown_root: &crate::hostfs::lchown_root,
+            remove: &crate::stage::remove_path,
         };
         Ok(json!({"staged": crate::stage::execute(root, plan, &env)?}))
     })

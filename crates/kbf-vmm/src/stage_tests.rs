@@ -16,6 +16,9 @@ use crate::stage::*;
 #[path = "stage_bundle_tests.rs"]
 mod bundle;
 
+#[path = "stage_tamper_tests.rs"]
+mod tamper;
+
 #[cfg(target_os = "macos")]
 #[path = "stage_xattr_tests.rs"]
 mod xattr;
@@ -309,6 +312,10 @@ struct Harness {
     /// What a clone does to the tree it made, after it made it (the host tree changed
     /// under the clone, or the clone kept a bit).
     after_clone: Option<fn(&Path)>,
+    /// The n-th (from 0) removal of a path ending in the name fails, as a file the guest made
+    /// immutable does.
+    unremovable: Option<(&'static str, usize)>,
+    removals: RefCell<usize>,
 }
 
 impl Harness {
@@ -321,6 +328,8 @@ impl Harness {
             chowned: RefCell::new(Vec::new()),
             clones: RefCell::new(0),
             after_clone: None,
+            unremovable: None,
+            removals: RefCell::new(0),
         }
     }
 
@@ -354,6 +363,18 @@ impl Harness {
                 Ok(())
             }
         };
+        let remove = |p: &Path| {
+            if let Some((name, n)) = self.unremovable
+                && p.ends_with(name)
+            {
+                let seen = *self.removals.borrow();
+                *self.removals.borrow_mut() += 1;
+                if seen == n {
+                    return Err(std::io::Error::other("Operation not permitted"));
+                }
+            }
+            remove_path(p)
+        };
         execute(
             volume,
             plan,
@@ -361,6 +382,7 @@ impl Harness {
                 free_bytes: &free,
                 clone_tree: &clone,
                 chown_root: &chown,
+                remove: &remove,
             },
         )
     }
@@ -678,7 +700,14 @@ fn runtimes_are_staged_hashed_and_replace_the_earlier_set() {
         std::fs::read_to_string(&outside).expect("outside"),
         "keep me"
     );
-    assert!(h.chowned.borrow().contains(&rt_dir.join("iOS.dmg")));
+    // Ownership is given where the runtime is built; the rename keeps it.
+    assert!(
+        h.chowned.borrow().contains(
+            &rt_dir
+                .with_file_name(".runtimes.kbf-staging")
+                .join("iOS.dmg")
+        )
+    );
     assert!(out["xcode"].is_null());
     assert_eq!(out["manifest"], "/private/var/kbf-sim/staged.json");
 }
@@ -1219,6 +1248,7 @@ fn the_host_calls_report_what_failed() {
         free_bytes: &ok_free,
         clone_tree: &no_clone,
         chown_root: &env_failing,
+        remove: &remove_path,
     };
     assert!(chmod(&missing, 0o755).unwrap_err().starts_with("chmod "));
     assert!(chown(&env, &missing).unwrap_err().starts_with("chown "));
@@ -1229,12 +1259,10 @@ fn the_host_calls_report_what_failed() {
             .starts_with("create ")
     );
     assert!(
-        write_text(&missing, "t", 0o644)
+        write_text(&env, &missing, "t", 0o644)
             .unwrap_err()
             .starts_with("write ")
     );
-    assert!(file_len(&missing).unwrap_err().starts_with("stat "));
-    assert_eq!(file_len(&dir.join("exists")), Ok(1));
     assert!(
         rename(&missing, &dir.join("b"))
             .unwrap_err()
@@ -1256,7 +1284,7 @@ fn the_host_calls_report_what_failed() {
         e.contains("changed while it was copied (7 bytes planned, 1 copied)"),
         "{e}"
     );
-    write_text(&dir.join("t"), "text", 0o600).expect("write");
+    write_text(&env, &dir.join("t"), "text", 0o600).expect("write");
     assert_eq!(std::fs::read_to_string(dir.join("t")).expect("t"), "text");
     stage_link(Path::new("target"), &dir.join("l")).expect("link");
     assert!(
@@ -1291,6 +1319,7 @@ fn a_directory_that_cannot_be_examined_or_created_is_an_error() {
         free_bytes: &free,
         clone_tree: &clone,
         chown_root: &chown,
+        remove: &remove_path,
     };
     let lock = |p: &Path, mode| {
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).expect("chmod")
@@ -1539,7 +1568,7 @@ fn a_cloned_tree_has_no_setuid_setgid_or_sticky_bit() {
             mode("Contents/Developer/usr/bin/xcodebuild"),
             mode("Contents/Frameworks")
         ),
-        (0o755, 0o777)
+        (0o755, 0o755)
     );
 }
 
