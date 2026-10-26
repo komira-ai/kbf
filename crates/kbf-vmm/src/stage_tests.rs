@@ -13,6 +13,10 @@ use crate::fake::{holds, tmp};
 use crate::stage::link as stage_link;
 use crate::stage::*;
 
+#[cfg(target_os = "macos")]
+#[path = "stage_xattr_tests.rs"]
+mod xattr;
+
 /// The SHA-256 of the bytes `hello`.
 const HELLO: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 

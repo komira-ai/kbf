@@ -580,7 +580,15 @@ sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest \
   source without following a link, refusing a file that is no longer a regular file. A tree
   clone copies the live tree, so it is walked again afterwards: it is refused unless it
   holds exactly the planned entries (same kinds, link targets and file sizes) and then gets
-  the planned modes. Extended attributes are not copied by the file-by-file path. The new
+  the planned modes. Both paths keep extended attributes (the code signature of a file that
+  is not a Mach-O lives in `com.apple.cs.*` attributes; resource forks and Finder info can
+  matter too) except `com.apple.quarantine`, which would make the guest treat Xcode as
+  downloaded: the file-by-file copy copies every attribute of a file (between the open
+  files), a directory and a link (the link itself, not what it points at) except that one,
+  and the clone, which carries them, has the quarantine mark removed from every node. An
+  attribute list above 1 MiB or a value above 64 MiB fails the stage, naming the path,
+  rather than being skipped (a skipped part of a signature would leave an Xcode that fails
+  validation). Attributes are macOS-only code; other systems copy none. The new
   copy is built under a staging name and renamed into place, so a failed run never leaves a
   half Xcode.app under the real name. A rerun removes the earlier copy and then renames the
   new one in (a run that dies between the two leaves no Xcode.app), and it holds both

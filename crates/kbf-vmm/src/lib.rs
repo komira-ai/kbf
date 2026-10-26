@@ -26,6 +26,7 @@ pub mod spec;
 pub mod stage;
 pub mod system;
 pub mod volume;
+mod xattr;
 
 #[cfg(target_os = "macos")]
 mod offline;
