@@ -728,10 +728,10 @@ does not skip the check: the beta is red ("not run" is not "passed").
 ## 11. Metrics the stages read
 
 Exist **[F]**: `kbf_cache_lost_blobs`, `kbf_cache_blob_losses_total`, `kbf_execute_requests_total`, `kbf_execute_errors_total{cause}` (status, client_abort, dropped; M11),
-`kbf_execute_in_flight`, `kbf_execute_queued_seconds` (histogram), `kbf_frontend_relay_untraced`, the write-tier series.
+`kbf_execute_in_flight`, `kbf_execute_queued_seconds` (histogram), `kbf_find_missing_seconds` (histogram, no labels beyond `le`), `kbf_frontend_relay_untraced`, the write-tier series.
 Open pull requests **[open]**: `under_replicated_blobs`, open writes, repair debt, planned-down (#912, #913, #914).
 **[missing]**: failed actions by class (M10), a process boot counter and a membership-state
-gauge (M13), a `FindMissingBlobs` latency histogram (M14).
+gauge (M13).
 
 ## 12. Missing pieces and the issues to file
 
@@ -753,7 +753,7 @@ one issue with one done criterion. "Blocked by" names open pull requests or othe
 | M11 | Metric: Execute errors by cause | client abort distinguished from dropped | |  #952 |
 | M12 | Release workflow: tag check (the tag names the commit, on main; no signing key; no verdict gates), approval environment, notes | a tag naming another commit or off main fails `verify`; a tag with no record, or a failed one, passes | M7, M9, M19 |  #953 |
 | M13 | Metrics: process boot counter and membership-state gauge | both exported; gates read them | |  #954 |
-| M14 | Metric: `FindMissingBlobs` latency histogram | histogram exported; latency gate added | |  #955 |
+| M14 | Metric: `FindMissingBlobs` latency histogram | histogram exported (`kbf_find_missing_seconds`, done); latency gate (not yet added): the `latency-p99` gate will read `Metrics::quantile`, soft band 1.5x to 3x of the beta baseline; `quantile` reads one cumulative scrape (lifetime), so the gate needs the delta of the cumulative buckets between window start and end, not yet implemented, and a quantile in the `+Inf` bucket reads absent (red); no gate is registered yet (pending the M9 producer) | M9 |  #955 |
 | M15 | Updater walk-back: automatic desired-commit set on a red hard gate, mid-roll behaviour, not-reversible flags (B10, B11) | B10 and B11 green | M6, M7 |  #956 |
 | M16 | Fetch and verify the previous release for N-1 | N-1 resolved, or the fallback of section 3 | |  #957 |
 | M17 | Stage file and lint (stages, no `pull_request`, `id-token` only in `attest`) | lint red on each planted violation | |  #958 |
