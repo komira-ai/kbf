@@ -557,6 +557,7 @@ fn the_frames_of_the_largest_plan_fit_the_sinks_name_and_file_limits() {
     let steps = plan(&Inputs {
         runtimes: (0..crate::stage::MAX_RUNTIMES).map(longest).collect(),
         app: Some("App.app".to_owned()),
+        tests: Some("T.xctestrun".to_owned()),
     });
     let mut names: Vec<String> = steps
         .iter()
@@ -564,6 +565,7 @@ fn the_frames_of_the_largest_plan_fit_the_sinks_name_and_file_limits() {
         .map(|(i, s)| step_frame_name(i, &s.id))
         .collect();
     names.push(SCREENSHOT_NAME.to_owned());
+    names.push(kbf_guest::sim_xctest::XCTEST_NAME.to_owned());
     names.push(SUMMARY_NAME.to_owned());
     for n in &names {
         assert_eq!(crate::sink::check_name(n), Ok(()), "{n}");
@@ -814,3 +816,6 @@ fn a_second_guest_that_cannot_start_keeps_the_first_guests_results() {
     assert_eq!(arms[0]["name"], "e3-off");
     assert_eq!(arms[0]["summary"]["ok"], true, "{:?}", arms[0]);
 }
+
+#[path = "e3_xctest_tests.rs"]
+mod xctest;

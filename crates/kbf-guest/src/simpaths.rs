@@ -10,6 +10,9 @@ pub const XCODE_APP: &str = "/Applications/Xcode.app";
 pub const RUNTIME_DIR: &str = "/private/var/kbf-sim/runtimes";
 /// The directory holding app bundles the setup staged for the simulator to install.
 pub const APP_DIR: &str = "/private/var/kbf-sim/apps";
+/// The directory holding the UI tests the setup staged: the `Build/Products` tree of an
+/// `xcodebuild build-for-testing` (one `*.xctestrun` file and the built apps beside it).
+pub const TESTS_DIR: &str = "/private/var/kbf-sim/tests";
 /// What the setup staged (names, sizes, SHA-256 of each runtime), as JSON.
 pub const MANIFEST: &str = "/private/var/kbf-sim/staged.json";
 /// Written by `image setup --guest-user <name>`: the name of the user the guest is to have
@@ -33,6 +36,7 @@ mod tests {
             XCODE_APP,
             RUNTIME_DIR,
             APP_DIR,
+            TESTS_DIR,
             MANIFEST,
             USER_WANTED,
             USER_READY,
@@ -40,7 +44,14 @@ mod tests {
             assert!(p.starts_with('/'), "{p}");
             assert!(!p.ends_with('/'), "{p}");
         }
-        for p in [RUNTIME_DIR, APP_DIR, MANIFEST, USER_WANTED, USER_READY] {
+        for p in [
+            RUNTIME_DIR,
+            APP_DIR,
+            TESTS_DIR,
+            MANIFEST,
+            USER_WANTED,
+            USER_READY,
+        ] {
             assert!(p.starts_with("/private/var/kbf-sim/"), "{p}");
         }
     }

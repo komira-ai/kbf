@@ -19,6 +19,7 @@ use std::time::Instant;
 
 use base64::Engine as _;
 use kbf_guest::sim::{SCREENSHOT_NAME, STEP_PREFIX, SUMMARY_NAME, Status, StepFrame, SummaryFrame};
+use kbf_guest::sim_xctest::{XCTEST_NAME, XcTestFrame};
 use serde_json::{Value, json};
 
 use crate::bundle::{self, Identity, Recorded};
@@ -38,6 +39,8 @@ struct Received {
     steps: BTreeMap<String, StepFrame>,
     summary: Option<SummaryFrame>,
     screenshot: Option<Value>,
+    /// The UI tests' counts (`sim-xctest.json`).
+    xctest: Option<XcTestFrame>,
     /// Frames that were there and could not be read: name and why.
     unreadable: Vec<(String, String)>,
     /// Names already read: a frame is made whole by a rename, so it is read once.
@@ -49,8 +52,8 @@ impl Received {
     /// been read yet. Each is read without following a link and within a size cap.
     fn look(&mut self, dir: &Path) {
         for name in names(dir) {
-            let wanted =
-                name.starts_with(STEP_PREFIX) || name == SUMMARY_NAME || name == SCREENSHOT_NAME;
+            let wanted = name.starts_with(STEP_PREFIX)
+                || [SUMMARY_NAME, SCREENSHOT_NAME, XCTEST_NAME].contains(&name.as_str());
             if !wanted || self.seen.contains(&name) {
                 continue;
             }
@@ -64,6 +67,8 @@ impl Received {
             };
             let parsed = if name == SUMMARY_NAME {
                 serde_json::from_str(&text).map(|s| self.summary = Some(s))
+            } else if name == XCTEST_NAME {
+                serde_json::from_str(&text).map(|x| self.xctest = Some(x))
             } else if name == SCREENSHOT_NAME {
                 serde_json::from_str(&text).map(|v| self.screenshot = Some(v))
             } else {
@@ -267,6 +272,7 @@ fn arm_json(ctx: &Ctx<'_>, vm: &Vm, arm: &Arm, picture: &Value) -> Value {
         "summary": r.summary,
         "summary_received": r.summary.is_some(),
         "screenshot": picture,
+        "xctest": r.xctest,
         "unreadable_frames": r.unreadable.iter().map(|(n, e)| json!({"frame": n, "error": e})).collect::<Vec<_>>(),
         "stop": arm.stop.as_ref().map(|stop| json!({
             "how": stop.how.name(),
@@ -333,8 +339,17 @@ fn one_line(arm: &Value) -> String {
     } else {
         ", no summary (the run did not end)"
     };
+    let tests = arm["xctest"].as_object().map_or_else(String::new, |x| {
+        let n = |k: &str| x.get(k).and_then(Value::as_u64).unwrap_or(0);
+        format!(
+            ", UI tests {} passed, {} failed, {} skipped",
+            n("passed"),
+            n("failed"),
+            n("skipped")
+        )
+    });
     format!(
-        "{name} ({kind}): {} of {} steps ok{}, {shot}{summary}",
+        "{name} ({kind}): {} of {} steps ok{}, {shot}{tests}{summary}",
         arm["steps_ok"],
         arm["steps_received"],
         if problems.is_empty() {

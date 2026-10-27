@@ -135,6 +135,7 @@ pub fn run(
             xcode,
             sim_runtimes,
             sim_app,
+            sim_tests,
             allow_external_links,
             guest_user,
         }) => image::setup(
@@ -145,6 +146,7 @@ pub fn run(
                 xcode: xcode.clone(),
                 sim_runtimes: sim_runtimes.clone(),
                 sim_app: sim_app.clone(),
+                sim_tests: sim_tests.clone(),
                 allow_external_links: *allow_external_links,
                 guest_user: guest_user.clone(),
             },

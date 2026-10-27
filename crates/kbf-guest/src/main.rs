@@ -758,6 +758,15 @@ mod tests {
         fn app_bundles(&self) -> Vec<String> {
             Vec::new()
         }
+        fn xctest_entries(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn clear_result_bundle(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn result_bundle_present(&self) -> bool {
+            true
+        }
         fn console_user(&self) -> Option<sim::ConsoleUser> {
             Some(sim::ConsoleUser {
                 uid: 501,

@@ -719,10 +719,11 @@ sends a summary with `already_ready`, and does not power off: `image prime` then
 guest down itself.
 
 ```sh
-# as root; $RUNTIME is a <name>.dmg or a <name>.exportedBundle; --sim-app is optional
+# as root; $RUNTIME is a <name>.dmg or a <name>.exportedBundle; --sim-app and --sim-tests
+# are optional (UI tests in the guest's simulator: see below)
 sudo $D/kbf-vmm image setup --base $W/base --guest-binary $D/kbf-guest \
   --xcode /Applications/Xcode.app --sim-runtime $RUNTIME [--sim-app $APP.app] \
-  --guest-user kbfsim | tee $W/e3-setup.json
+  [--sim-tests $DD/Build/Products] --guest-user kbfsim | tee $W/e3-setup.json
 # as the console user, from Terminal on the Mac: a few minutes, with a graphics window
 $D/kbf-vmm image prime --base $W/base --guest-binary $D/kbf-guest [--deadline-secs 1200] \
   | tee $W/e3-prime.json
@@ -774,6 +775,8 @@ group):
 | `boot`, `bootstatus` | user | `simctl boot <udid>`, `simctl bootstatus <udid> -b` | 600 s |
 | `app-id`, `install`, `launch` | user | with `--sim-app`: the bundle id from `Info.plist` (letters, digits, `.`, `-`, `_`, at most 255 bytes), `simctl install`, `simctl launch` | 120 s, 600 s, 600 s |
 | `screenshot` | user | `simctl io <udid> screenshot --type=jpeg` | 120 s |
+| `xctest` | user | with `--sim-tests`: `xcodebuild test-without-building -xctestrun <staged>.xctestrun -destination id=<udid> -resultBundlePath /private/var/kbf-sim/out/tests.xcresult` | 1800 s (`--xctest-secs`) |
+| `xctest-summary` | user | `xcrun xcresulttool get test-results summary --path /private/var/kbf-sim/out/tests.xcresult` | 120 s |
 | `shutdown` | user | `simctl shutdown <udid>` | 120 s |
 
 "User" means the guest's auto-login user, in that user's session
@@ -782,6 +785,51 @@ user recorded in `/private/var/kbf-sim/user-ready`; the steps wait up to 300 s f
 user to be at the console, and fail, saying who is there instead, if it is anyone else. A
 guest with no record uses whoever owns the console, and the steps fail, saying so, if
 nobody is.
+
+### UI tests in the guest's simulator
+
+`image setup --sim-tests <dir>` stages a build of UI tests, and the `xctest` steps run it on
+the device the probe booted. The order, with the repository's fixture
+(`tools/spike/macos/fixtures`, scheme `IOSFixture`, whose UI test target is
+`IOSFixtureUITests`):
+
+1. On the Mac that builds the base, with the same Xcode as the one cloned into the guest
+   (the `.xctestrun` and the built products name the SDK they were built with), build the
+   tests without running them. `$DD` is a new directory:
+
+   ```sh
+   xcodebuild build-for-testing -project tools/spike/macos/fixtures/IOSFixture.xcodeproj \
+     -scheme IOSFixture -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+     -derivedDataPath $DD CODE_SIGNING_ALLOWED=NO
+   ```
+
+   `$DD/Build/Products` then holds one `*.xctestrun` and `Debug-iphonesimulator/` (the app and
+   `IOSFixtureUITests-Runner.app`).
+2. As root, stage that directory with the rest (after `image base`, before `image prime`):
+   add `--sim-tests $DD/Build/Products` to the `image setup` command above. It is copied by the
+   rules of `--sim-app` (nothing followed; a link that leaves the tree, a fifo, socket or
+   device is refused; exactly one `*.xctestrun` at the top, with a name of letters, digits,
+   `.`, `_` and `-`, at most 64 bytes) to `/private/var/kbf-sim/tests`, counted in the free
+   space check, and recorded in `staged.json` with the SHA-256 of every file. The directory
+   holds exactly this build: a setup that names no `--sim-tests` removes the earlier one.
+3. `image prime`, then `probe e3` as above.
+
+The tests run after `launch` (after `bootstatus` when no app is staged) and after the
+`screenshot`; `shutdown` does not wait for them. `xctest` is `failed` when a test fails
+(`xcodebuild` exits 65) and `timeout` when it passes its own deadline. `xctest-summary`
+runs once `xctest` has run, failed or not, and is `skipped` when `xctest` was skipped, timed
+out or could not start. Its step frame carries no stdout. The host gets the counts in
+`sim-xctest.json`: `result`, `passed`, `failed`, `skipped`, `expected_failures`, `total`,
+and for each failed test (at most 50, then `omitted` counts the rest) its name (at most 256
+bytes) and the first failure message (at most 512 bytes). The summary of `xcresulttool`
+names the failed tests only, so passed and skipped tests are counted, not named. The
+result bundle stays in `/private/var/kbf-sim/out/tests.xcresult` on the clone (`--keep`,
+then `image harvest`). `probe e3` prints these counts as `xctest` under each arm and, in
+its one line, as `UI tests N passed, N failed, N skipped`. Before `xctest` runs, the guest removes any `tests.xcresult` already in the out directory
+(a link is removed, not followed; a removal that fails fails the step), and `xctest-summary`
+is an error when no bundle exists after `xctest`, so an old bundle is never summarized as
+this run's. The `xcresulttool` form is the one
+Xcode prints JSON for by default; it is not run with `--format json`.
 
 Each step sends the host one frame, `sim-step-NN-<step>.json`, as it ends: the step, its
 command, `status` (`ok`, `failed` for a non-zero exit or a signal, `timeout`, `error` for a
