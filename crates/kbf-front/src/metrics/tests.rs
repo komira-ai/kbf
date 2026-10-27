@@ -415,3 +415,105 @@ fn the_shadow_totals_print_each_level_and_bucket_under_its_own_label() {
     assert!(skips.contains(&r#"kbf_estimator_shadow_skipped_total{reason="no_os"} 4"#));
     assert!(skips.contains(&r#"kbf_estimator_shadow_skipped_total{reason="kind"} 0"#));
 }
+
+/// Asserts that each cause of an Execute's end bumps its own series and no other: an
+/// error status (also when the connection is gone), a stream dropped on a connection that
+/// is still there, one dropped on a lost connection, and one dropped with no connection
+/// to ask; that an answered call bumps none; and that the causes and the answers add up
+/// to the requests.
+///
+/// Catches: two causes swapped, a status read as a drop, a drop with no connection read
+/// as an abort, and an answer counted as an error: the abort and dropped arms of
+/// `OpenExecute::cause` swapped, `is_gone` tested the wrong way round, `failed` ignored.
+#[test]
+fn each_end_of_an_execute_has_its_own_cause() {
+    use kbf_tls::Liveness;
+
+    let metrics = Arc::new(ExecuteMetrics::default());
+    let by = |m: &ExecuteMetrics| {
+        [
+            ErrorCause::Status,
+            ErrorCause::ClientAbort,
+            ErrorCause::Dropped,
+        ]
+        .map(|c| m.errors.of(c))
+    };
+
+    let live = Liveness::default();
+    let mut aborted = metrics.execute();
+    aborted.connection(Some(live.clone()));
+    drop(aborted);
+    assert_eq!(by(&metrics), [0, 1, 0], "a reset on a live connection");
+
+    let mut failed = metrics.execute();
+    failed.connection(Some(live.clone()));
+    failed.fail();
+    drop(failed);
+    assert_eq!(by(&metrics), [1, 1, 0], "an error status");
+
+    let mut answered = metrics.execute();
+    answered.connection(Some(live.clone()));
+    answered.ok();
+    drop(answered);
+    assert_eq!(by(&metrics), [1, 1, 0], "an answer is no error");
+
+    let mut unasked = metrics.execute();
+    unasked.connection(None);
+    drop(unasked);
+    assert_eq!(by(&metrics), [1, 1, 1], "no connection to ask");
+
+    let mut lost = metrics.execute();
+    lost.connection(Some(live.clone()));
+    live.mark_gone();
+    drop(lost);
+    assert_eq!(by(&metrics), [1, 1, 2], "a lost connection");
+
+    let mut failed_and_lost = metrics.execute();
+    failed_and_lost.connection(Some(live));
+    failed_and_lost.fail();
+    drop(failed_and_lost);
+    assert_eq!(
+        by(&metrics),
+        [2, 1, 2],
+        "a status wins over a lost connection"
+    );
+
+    assert_eq!(metrics.errors.get(), 5);
+    assert_eq!(
+        metrics.requests.get(),
+        metrics.errors.get() + 1,
+        "one answer"
+    );
+}
+
+/// Asserts that the exposition has one series per cause, in a fixed order, at 0 before any
+/// error, with the labels spelled as the dashboards and the gate read them.
+///
+/// Catches: a cause series absent until first bumped (an absent series would read as a
+/// bug to the gate), a renamed label value, an unlabeled series left beside them, and
+/// a cause series rendered only when non-zero.
+#[test]
+fn every_cause_is_rendered_from_the_start() {
+    let metrics = Arc::new(ExecuteMetrics::default());
+    let mut out = Families(String::new());
+    metrics.render(&mut out);
+    assert_eq!(
+        lines(&out.0, "kbf_execute_errors_total"),
+        [
+            r#"kbf_execute_errors_total{cause="client_abort"} 0"#,
+            r#"kbf_execute_errors_total{cause="dropped"} 0"#,
+            r#"kbf_execute_errors_total{cause="status"} 0"#,
+        ]
+    );
+    drop(metrics.execute());
+    let mut out = Families(String::new());
+    metrics.render(&mut out);
+    assert_eq!(
+        lines(&out.0, "kbf_execute_errors_total{"),
+        [
+            r#"kbf_execute_errors_total{cause="client_abort"} 0"#,
+            r#"kbf_execute_errors_total{cause="dropped"} 1"#,
+            r#"kbf_execute_errors_total{cause="status"} 0"#,
+        ]
+    );
+}

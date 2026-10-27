@@ -22,6 +22,52 @@ pub struct HandPlaced {
     pub carried: Vec<(&'static str, String)>,
 }
 
+impl HandPlaced {
+    /// The flags the packaged unit gives `/usr/bin/kbf` for a unit of the mode `mode`: the
+    /// node's own, with the mode named by `--mode=` and by nothing else.
+    ///
+    /// `kbf` takes the mode as `--mode=<mode>` or, in its older spelling, as the first word
+    /// after the program (`kbf storage-and-daemon --cold-store=...`), and refuses both
+    /// together ("the mode is given twice") and the word anywhere but first ("unexpected
+    /// argument"). A hand-placed unit may use the word, and the packaged unit names the mode with
+    /// `--mode=`: a first word that is the mode is dropped, one that is another word is
+    /// refused, as is a `--mode` of another mode. A unit that names no mode gets `--mode=`.
+    ///
+    /// # Errors
+    /// What stops the move, in one line.
+    pub fn flags(&self, mode: &str, unit: &str) -> Result<Vec<String>, String> {
+        let mut flags = self.args.clone();
+        if flags.first().is_some_and(|w| !w.starts_with('-')) {
+            let word = flags.remove(0);
+            if word != mode {
+                return Err(format!(
+                    "the unit runs the mode word {word:?}, which is not the mode of {unit}"
+                ));
+            }
+        }
+        let mut named = false;
+        let mut words = flags.iter();
+        while let Some(word) = words.next() {
+            let given = match word.strip_prefix("--mode") {
+                Some("") => words.next().map(String::as_str),
+                Some(rest) if rest.starts_with('=') => rest.strip_prefix('='),
+                _ => continue,
+            };
+            named = true;
+            if given != Some(mode) {
+                return Err(format!(
+                    "the unit runs --mode={}, which is not the mode of {unit}",
+                    given.unwrap_or_default()
+                ));
+            }
+        }
+        if !named {
+            flags.insert(0, format!("--mode={mode}"));
+        }
+        Ok(flags)
+    }
+}
+
 /// The directives carried as they are, besides the account.
 const CARRIED: [&str; 4] = [
     "SupplementaryGroups",

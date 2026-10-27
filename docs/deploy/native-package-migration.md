@@ -63,7 +63,8 @@ Both the plan and `--apply` do these, and change nothing:
    that runs the `kbf` of a release under `/var/lib/kbf-installer/releases`. Its flags are plain
    words (letters, digits and `_ . / : = @ + , ~ - ? &`, so a cold-store URL with a query is
    carried as it is): whitespace, a quote, a backslash, a `$`, a `%`, a `;` or the like in a flag stops the move, and the line says
-   which word. A `--mode=` it gives must be the mode of the unit's name.
+   which word. The mode it gives, as `--mode=` (or `--mode MODE`) or as the older first word after the
+   program (`kbf storage-and-daemon --cold-store=...`), must be the mode of the unit's name.
 3. No drop-in `10-node-flags.conf` and no `<unit>.hand-placed` file is there already.
 4. The package in `--dir` is the package of that commit and passes every check an update's package
    passes: the sha256 `SHA256SUMS` lists for it, `gh attestation verify` offline (this repository's
@@ -71,6 +72,19 @@ Both the plan and `--apply` do these, and change nothing:
    unprivileged user), and the package manager's own reading of the file (`dpkg-deb --field` or
    `rpm --query --package`): the package `kbf`, for this CPU, whose version names the commit the node
    runs. A package that fails any of them is never installed.
+5. A deb is unpacked into the checks' own directory (removed with them), and its `kbf` is run on the
+   flags the drop-in would give it, as the unprivileged user, with an empty `kbf.toml` and `--help`
+   last: `kbf` reads every flag before it prints help and starts nothing. A flag it refuses (for
+   example "unexpected argument") stops the move. An rpm is not unpacked: the plan says so, and the
+   flags follow the same rule alone.
+6. The directories the node's flags name (`--data-dir`, which is `/var/lib/kbf` when a daemon unit
+   gives none, `--meta-dir` and a `--cold-store=file://` path) that exist are recorded with their mode
+   and owner. For a unit that runs containers (`daemon`, `storage-and-daemon`, `all-in-one`), every
+   directory from `/` down to the data directory must be searchable by others, which the container
+   runtime needs; a closed one stops the move and the line names it (`chmod o+x` it first: the move
+   keeps the modes it finds and chooses none). For a deb the plan also prints which directories the
+   packaged unit's `StateDirectory=` and `StateDirectoryMode=` would change (the packaged unit sets
+   `/var/lib/kbf` to 0750) and that the drop-in keeps them.
 
 ## What it does
 
@@ -79,18 +93,25 @@ In this order. A failure at any step stops the program with status 1; a refusal 
 1. The package manager installs the verified file (`dpkg --install` or `rpm --upgrade
    --oldpackage --replacepkgs`; the one file, no repository, no network). The packaged units are
    installed disabled under `/usr/lib/systemd/system`, behind the hand-placed unit, so nothing
-   changes for the running node.
+   changes for the running node. A recorded directory whose mode or owner the install changed is
+   put back. (Installing the same version again, as on a node that was moved and put back, is
+   the same command.)
 2. Writes the drop-in `/etc/systemd/system/<unit>.d/10-node-flags.conf`.
 3. Renames `/etc/systemd/system/<unit>` to `<unit>.hand-placed`, so the packaged unit takes its
    place, and runs `systemctl daemon-reload`.
 4. Restarts the unit and waits until it is active.
-5. Checks: the unit's main process runs `/usr/bin/kbf` (`/proc/<MainPID>/exe`), and
-   `/usr/bin/kbf --version --json` reports the commit the node ran.
+5. Checks: the unit's main process runs `/usr/bin/kbf` (`/proc/<MainPID>/exe`),
+   `/usr/bin/kbf --version --json` reports the commit the node ran, and the recorded directories
+   have the mode and owner they had.
 6. Only then removes the old layout, `/var/lib/kbf-installer/releases`.
 
 If step 2, 3, 4 or 5 fails, the program puts the hand-placed unit back (removes the drop-in, renames
-the unit back, rereads, restarts) and says so; the old layout is still whole at that point, because
-step 6 has not run. The package stays installed; it runs nothing. A step 6 that fails leaves a node
+the unit back, rereads, puts the recorded directories back to their mode and owner, restarts) and
+then watches the unit for 30 seconds, looking once a second. It says "the hand-placed unit is back
+and running" only if the unit stayed active the whole time; a unit that is active for a moment and
+fails again (it is restarted by its `Restart=`) is reported as "putting it back failed", with the
+state it was seen in. The old layout is still whole at that point, because step 6 has not run. The
+package stays installed; it runs nothing, and running the move again installs it once more. A step 6 that fails leaves a node
 that runs the package and a directory to remove by hand.
 
 ## How the node's flags carry over
@@ -118,6 +139,7 @@ ConditionPathExists=
 [Service]
 User=kbf
 Environment=RUST_LOG=info
+StateDirectory=
 ExecStart=
 ExecStart=/usr/bin/kbf --mode=storage-and-daemon --cold-store=file:///var/lib/kbf/cold --meta-dir=/var/lib/kbf-meta
 ExecStartPre=
@@ -125,8 +147,14 @@ ExecStartPre=+/usr/bin/kbf boot-check --mode=storage-and-daemon
 ExecStartPre=/usr/bin/kbf --mode=storage-and-daemon --cold-store=file:///var/lib/kbf/cold --meta-dir=/var/lib/kbf-meta --check
 ```
 
-- `ExecStart=` is the node's own, with the program replaced by `/usr/bin/kbf`. If the unit gave no
-  `--mode`, the mode of the unit's name is added.
+- `ExecStart=` is the node's own, with the program replaced by `/usr/bin/kbf`. The mode is named by
+  `--mode=` alone, because `kbf` refuses the older first word after `--mode=`: if the unit gave
+  the mode as that word (`kbf storage-and-daemon --cold-store=...`), the word is dropped; if it
+  gave no mode, the mode of the unit's name is added. The same flags are on the `--check` below.
+- `StateDirectory=` is cleared. The packaged unit has `StateDirectory=kbf` and
+  `StateDirectoryMode=0750`, which makes systemd set `/var/lib/kbf` to 0750 (and own it for the
+  unit's user) at every start, closing it to the container runtime. The node's directories are
+  the node's and keep the mode they have.
 - `ExecStartPre=` is cleared and given again as the packaged unit has it (`boot-check`, then
   `--check`), with the node's flags on the `--check`, because `--check` without flags would read a
   `kbf.toml` the node does not have.

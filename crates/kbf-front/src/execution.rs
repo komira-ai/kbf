@@ -106,6 +106,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::future::Either;
 use futures::{Stream, stream};
 use kbf_auth::{Authorizers, authorize};
 use kbf_caps::FromPlatformError;
@@ -590,22 +591,39 @@ where
             ));
         }
         let mut window = Presubmit::begin(self.cache.metrics());
-        let open = self.cache.metrics().execute.execute();
+        let mut open = self.cache.metrics().execute.execute();
+        open.connection(kbf_tls::liveness(&request));
         self.cache.metrics().execute.started.add(1);
         let caller = kbf_auth::metadata(&request);
         let call = crate::request_metadata::call_metadata(&request);
         let request = request.into_inner();
         let instance = request.instance_name.as_str();
-        authorize(&*self.authorizers.execute, &caller, EXECUTE, instance).await?;
+        authorize(&*self.authorizers.execute, &caller, EXECUTE, instance)
+            .await
+            .inspect_err(|_| open.fail())?;
         let span = tracing::info_span!(
             "execute",
             instance,
             caller = %caller.public_display(),
             invocation = call.invocation_display()
         );
-        self.execute_authorized(request, &call, &caller, &mut window, open)
+        let answered = self
+            .execute_authorized(request, &call, &caller, &mut window, &mut open)
             .instrument(span)
-            .await
+            .await;
+        match answered {
+            Ok(Either::Left(ticket)) => Ok(Response::new(operations(
+                ticket,
+                self.closing.clone(),
+                self.progress.clone(),
+                open,
+            ))),
+            Ok(Either::Right(cached)) => Ok(cached),
+            Err(status) => {
+                open.fail();
+                Err(status)
+            }
+        }
     }
 
     async fn wait_execution(
@@ -636,17 +654,17 @@ impl<D> ExecutionService<D>
 where
     D: Dispatch,
 {
-    /// Execute, once authorized: an action-cache hit, or the operation's stream. `open`
-    /// is the call's metrics guard (started before authorization); it ends with the
-    /// call on an error or a cache hit, and with the stream otherwise.
+    /// Execute, once authorized: an action-cache hit (`Right`), or the ticket of the
+    /// submitted operation (`Left`), which the caller makes a stream. `open` is the call's
+    /// metrics guard (started before authorization); a cache hit marks it answered.
     async fn execute_authorized(
         &self,
         request: ExecuteRequest,
         metadata: &CallMetadata,
         caller: &AuthenticationMetadata,
         window: &mut Presubmit<'_>,
-        mut open: OpenExecute,
-    ) -> Result<Response<OperationStream>, Status> {
+        open: &mut OpenExecute,
+    ) -> Result<Either<Ticket, Response<OperationStream>>, Status> {
         wire::check_digest_function(request.digest_function)?;
         let action = wire::digest(request.action_digest.as_ref())?;
         window.action = action.to_string();
@@ -681,7 +699,9 @@ where
                 true,
             );
             open.ok();
-            return Ok(Response::new(Box::pin(stream::iter([Ok(done)]))));
+            return Ok(Either::Right(Response::new(Box::pin(stream::iter([Ok(
+                done,
+            )])))));
         }
         let instance = request.instance_name;
         let (mut submission, command) = self.submission(instance.clone(), action, window).await?;
@@ -699,12 +719,7 @@ where
             .observe_duration(window.submit);
         let ticket = submitted?;
         tracing::debug!(%action, operation = %ticket.name, "submitted");
-        Ok(Response::new(operations(
-            ticket,
-            self.closing.clone(),
-            self.progress.clone(),
-            open,
-        )))
+        Ok(Either::Left(ticket))
     }
 }
 
@@ -1311,6 +1326,7 @@ fn operations(
                     () = progress.tick() => None,
                 };
                 if let Some(why) = gone {
+                    open.fail();
                     return Some((Err(Status::unavailable(why)), None));
                 }
             }

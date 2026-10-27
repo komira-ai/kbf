@@ -1066,15 +1066,51 @@ fn gamma_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         &format!("${{{{ {COORDINATOR_URL_VAR} }}}}"),
         out,
     );
+    // The release's tag is not what the hosts report; the version given is the one the
+    // farm-version step derived from the release's own facts.
     env_is(
         job,
         step,
         "VERSION",
-        "${{ needs.plan.outputs.version }}",
+        "${{ steps.farm-version.outputs.version }}",
         out,
     );
+    farm_version(&steps, at, out);
     prove_farm(&steps, at, out);
     Ok(())
+}
+
+/// The step of `gamma` that derives the version `deploy-farm` is given (at `farm_at`): the
+/// hosts' form, `<version>+g<commit>`, read from the release's version facts by
+/// `release farm-version` for this run's commit, before the deploy, under the id the deploy
+/// step reads it by.
+fn farm_version(steps: &[workflows::Step], farm_at: usize, out: &mut Vec<String>) {
+    let job = GAMMA;
+    let verb = "cargo xtask release farm-version";
+    let Some((at, step, words)) = run_of(job, steps, "cargo xtask release farm-version ", out)
+    else {
+        return;
+    };
+    if at > farm_at {
+        out.push(format!(
+            "`{verb}` runs after `cargo xtask deploy-farm`: the deploy would be given another version"
+        ));
+    }
+    if step.id.as_deref() != Some("farm-version") {
+        out.push(format!(
+            "the step that runs `{verb}` does not have `id: farm-version`"
+        ));
+    }
+    if step.condition.is_some() || step.conditional {
+        out.push(format!(
+            "`{verb}` is under a condition: the deploy step reads its output"
+        ));
+    }
+    flag_is(&words, verb, "--commit", "$COMMIT", out);
+    flag_is(&words, verb, "--output", "$GITHUB_OUTPUT", out);
+    flag_is(&words, verb, "--repo", "$GITHUB_REPOSITORY", out);
+    flag_is(&words, verb, "--tag", "$TAG", out);
+    env_is(GAMMA, step, "TAG", "${{ needs.plan.outputs.tag }}", out);
 }
 
 /// The proof step of `gamma`: Buck2 fetched as `beta.yml` does, then one unconditional

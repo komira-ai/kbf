@@ -163,6 +163,23 @@ impl Format {
         }
     }
 
+    /// Unpack the files of the package `file` into the directory `into`, which is there, without
+    /// installing anything; none for a format this program does not unpack (an rpm).
+    pub fn unpack(self, file: &Path, into: &Path) -> Option<Cmd> {
+        match self {
+            Self::Deb => Some(cmd(
+                DPKG_DEB,
+                &[
+                    "--extract",
+                    &file.display().to_string(),
+                    &into.display().to_string(),
+                ],
+                LOOK,
+            )),
+            Self::Rpm => None,
+        }
+    }
+
     /// Ask what the package file `file` is.
     pub fn inspect(self, file: &Path) -> Cmd {
         match self {

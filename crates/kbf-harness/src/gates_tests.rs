@@ -264,6 +264,112 @@ fn the_execute_error_counter_is_a_delta() {
     assert_eq!(failed(&run), ["execute_errors"]);
 }
 
+/// Asserts that the execute-errors gate reads the sum of the frontend's `cause` series, and
+/// goes red when any one of them moves, a client abort included (no cause is a pass).
+///
+/// Catches: a gate that reads one cause only, or that excuses `client_abort` (reading
+/// only the `status` series, say).
+#[test]
+fn any_one_execute_error_cause_moving_fails_the_gate() {
+    let series = |cause: &str| format!("{EXECUTE_ERRORS}{{cause=\"{cause}\"}}");
+    let causes = ["status", "client_abort", "dropped"];
+    let quiet = || {
+        let mut run = pass();
+        for s in &mut run.scrapes.samples {
+            s.series.remove(EXECUTE_ERRORS);
+            for cause in causes {
+                s.series.insert(series(cause), 0.0);
+            }
+        }
+        run
+    };
+    assert_eq!(failed(&quiet()), Vec::<String>::new());
+    for moved in causes {
+        let mut run = quiet();
+        run.scrapes.samples[10].series.insert(series(moved), 1.0);
+        assert_eq!(failed(&run), ["execute_errors"], "{moved}");
+    }
+}
+
+/// The detail of the execute-errors gate of `run`.
+fn execute_errors_detail(run: &Run) -> String {
+    gates(run)
+        .into_iter()
+        .find(|g| g.name == "execute_errors")
+        .and_then(|g| g.detail)
+        .expect("detail")
+}
+
+/// Asserts that a red execute-errors gate names how each cause series moved, so the
+/// report says whether platform errors or client aborts turned it red, and that the
+/// verdict is still the sum's.
+///
+/// Catches: a detail that gives only the summed delta, with the per-series part left out
+/// of `execute_errors_gate`.
+#[test]
+fn a_red_execute_errors_gate_names_the_causes_that_moved() {
+    let series = |cause: &str| format!("{EXECUTE_ERRORS}{{cause=\"{cause}\"}}");
+    let mut run = pass();
+    for s in &mut run.scrapes.samples {
+        s.series.remove(EXECUTE_ERRORS);
+        for cause in ["status", "client_abort", "dropped"] {
+            s.series.insert(series(cause), 0.0);
+        }
+    }
+    run.scrapes.samples[10]
+        .series
+        .insert(series("client_abort"), 2.0);
+    assert_eq!(failed(&run), ["execute_errors"]);
+    let detail = execute_errors_detail(&run);
+    assert!(
+        detail.contains(&format!("{} +2", series("client_abort"))),
+        "{detail}"
+    );
+    assert!(
+        detail.contains(&format!("{} +0", series("status"))),
+        "{detail}"
+    );
+    assert!(
+        detail.contains(&format!("{} +0", series("dropped"))),
+        "{detail}"
+    );
+}
+
+/// Asserts that a gate that could not be measured (a series absent from a scrape, too few
+/// scrapes) keeps its own reason as the detail, with no per-series part; and that a cause
+/// series missing from the last scrape only is left out of the part of the others.
+///
+/// Catches: a per-series part made of series that cannot be read, as when an absent last
+/// value is treated as 0.
+#[test]
+fn an_unmeasured_execute_errors_gate_has_no_per_series_part() {
+    let mut run = pass();
+    run.scrapes.samples[10].series.remove(EXECUTE_ERRORS);
+    let detail = execute_errors_detail(&run);
+    assert!(detail.contains("absent"), "{detail}");
+    assert!(!detail.contains("by series"), "{detail}");
+    run.scrapes.samples.truncate(1);
+    let detail = execute_errors_detail(&run);
+    assert!(!detail.contains("by series"), "{detail}");
+
+    let mut run = pass();
+    let (a, b) = (
+        format!("{EXECUTE_ERRORS}{{cause=\"a\"}}"),
+        format!("{EXECUTE_ERRORS}{{cause=\"b\"}}"),
+    );
+    for s in &mut run.scrapes.samples {
+        s.series.remove(EXECUTE_ERRORS);
+        s.series.insert(a.clone(), 0.0);
+    }
+    run.scrapes.samples[0].series.insert(b.clone(), 0.0);
+    run.scrapes.samples[5..]
+        .iter_mut()
+        .for_each(|s| _ = s.series.insert(a.clone(), 1.0));
+    let detail = execute_errors_detail(&run);
+    assert!(detail.contains(&format!("{a} +1")), "{detail}");
+    assert!(!detail.contains(&b), "{detail}");
+}
+
 #[test]
 fn an_absent_metric_fails_its_gate_in_the_first_scrape_and_in_a_later_one() {
     // Catches: an absent series read as zero, so a metric the frontend stops exporting
