@@ -33,6 +33,8 @@ kbf-meta.workspace = true
 kbf-objstore.workspace = true
 # The pack keys, the read cache and the errors of the frontend's packs (frontend/pack_flags.rs).
 kbf-pack.workspace = true
+# `PostgresPackIndex`, which `--pack-index` opens (state_store.rs), and `PackIndex` itself.
+kbf-pack-index = { workspace = true, features = ["postgres"] }
 # The certificate's names, serial and key hash a deny entry is compared with (identity.rs,
 # members_rpc.rs): the one reader the storage service uses too.
 kbf-peer.workspace = true
@@ -91,6 +93,7 @@ kbf-segments.workspace = true
 kbf-sim.workspace = true
 # The in-memory state store (src/start.rs, src/frontend, src/farm/durable and tests/), and a
 # Postgres database of its own for a test (tests/state_store_postgres.rs).
+kbf-pack-index = { workspace = true, features = ["test-database", "test-support"] }
 kbf-state = { workspace = true, features = ["test-database", "test-support"] }
 # fcntl and kill for the test that holds the server at its start line (tests/binary.rs).
 libc.workspace = true

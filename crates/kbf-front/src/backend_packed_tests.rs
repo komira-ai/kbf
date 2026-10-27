@@ -7,11 +7,12 @@ use std::time::Duration;
 use kbf_meta::{ActionWriteError, Closure};
 use kbf_objstore::{Capabilities, MemoryStore};
 use kbf_pack::{PackKeys, WriterKind};
-use kbf_proto::reapi::{OutputDirectory, OutputFile};
-use kbf_state::pack_index::memory::MemoryPackIndex;
-use kbf_state::{
-    BlobDigest, Location, ManualClock, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
+use kbf_pack_index::memory::MemoryPackIndex;
+use kbf_pack_index::{
+    BlobDigest, Location, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
 };
+use kbf_proto::reapi::{OutputDirectory, OutputFile};
+use kbf_state::ManualClock;
 use prost::Message as _;
 
 use super::*;

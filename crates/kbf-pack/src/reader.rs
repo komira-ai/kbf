@@ -15,7 +15,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream;
 use kbf_objstore::{ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
-use kbf_state::{BlobDigest, MAX_BATCH, PackIndex, PackIndexError};
+use kbf_pack_index::{BlobDigest, MAX_BATCH, PackIndex, PackIndexError};
 
 use crate::blocking::offload;
 use crate::cache::ReadCache;

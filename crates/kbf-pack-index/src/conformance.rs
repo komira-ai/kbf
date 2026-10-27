@@ -11,11 +11,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use super::{
+use crate::{
     BlobDigest, Location, MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo,
     Recorded, micros_of,
 };
-use crate::clock::{Clock, ManualClock};
+use kbf_state::{Clock, ManualClock};
 
 /// Makes indexes for the suite.
 pub trait PackBackend {

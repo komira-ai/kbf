@@ -12,23 +12,23 @@
 use std::thread;
 use std::time::Duration;
 
-use kbf_state::pack_index::conformance::{
+use kbf_pack_index::conformance::{
     p1_record_and_locate, p2_record_is_idempotent, p3_conflicting_record_is_refused,
     p4_first_location_is_kept, p5_batches_of_a_thousand, p6_touch_changes_only_the_touch_time,
     p7_dead_packs_and_unreferenced_keys, p8_concurrent_records_all_succeed,
     p9_a_pack_that_cannot_exist_is_refused, p10_concurrent_records_of_one_pack_agree,
 };
+use kbf_pack_index::postgres::{PostgresPackBackend, PostgresPackIndex};
+use kbf_pack_index::schema::{self as pack_schema, test_database};
+use kbf_pack_index::{BlobDigest, NewPack, PackBlob, PackIndex, PackIndexError};
 use kbf_state::postgres::schema::{self, Kind};
-use kbf_state::postgres::{
-    Flaw, PostgresBackend, PostgresConfig, PostgresPackIndex, PostgresStore, TestDatabase,
-    test_database,
-};
-use kbf_state::{BlobDigest, Cond, NewPack, PackBlob, PackIndex, PackIndexError, Store, Txn};
+use kbf_state::postgres::{PostgresConfig, PostgresStore, TestDatabase};
+use kbf_state::{Cond, Store, Txn};
 use postgres::error::SqlState;
 use postgres::{Client, NoTls};
 
 /// The migration that makes the pack tables.
-const PACK_MIGRATION: u32 = 2;
+const PACK_MIGRATION: u32 = pack_schema::VERSION;
 
 fn url() -> String {
     kbf_testkit::database::server_url()
@@ -41,8 +41,8 @@ fn url_setting(name: &str, value: &str) -> String {
     format!("{base}{sep}options=-c%20{name}%3D{value}")
 }
 
-fn backend() -> PostgresBackend {
-    PostgresBackend::new(&url(), Flaw::None)
+fn backend() -> PostgresPackBackend {
+    PostgresPackBackend::new(&url())
 }
 
 fn put(store: &PostgresStore, key: &str) {
@@ -166,7 +166,7 @@ fn p10_two_connections_record_the_same_pack_at_once() {
 /// if a record waited for the head; nothing here measures time.
 #[test]
 fn recording_packs_goes_through_while_a_state_transaction_holds_the_head() {
-    let backend = PostgresBackend::new(&url_setting("lock_timeout", "30000"), Flaw::None);
+    let backend = PostgresPackBackend::new(&url_setting("lock_timeout", "30000"));
     let config = backend.fresh_config();
     let store = PostgresStore::open(&config).expect("opens");
     let index = PostgresPackIndex::open(&config).expect("opens");
@@ -203,7 +203,7 @@ fn recording_packs_goes_through_while_a_state_transaction_holds_the_head() {
 fn a_schema_without_the_pack_tables_is_refused_until_the_installer_has_run() {
     let db = TestDatabase::empty();
     let config = PostgresConfig::parse(&db.url()).expect("parses");
-    schema::apply(&config, &schema::embedded(), 1).expect("the first migration only");
+    schema::apply(&config, &pack_schema::embedded(), 1).expect("the first migration only");
     let opened = PostgresPackIndex::open(&config);
     let refused = opened.err().expect("no tables");
     assert_eq!(refused, PackIndexError::NotMigrated);
@@ -212,7 +212,8 @@ fn a_schema_without_the_pack_tables_is_refused_until_the_installer_has_run() {
     let sql = "SELECT to_regclass('kbf_state.pack')::text";
     let found: Option<String> = client.query_one(sql, &[]).expect("catalog").get(0);
     assert_eq!(found, None);
-    schema::apply(&config, &schema::embedded(), schema::latest()).expect("the installer's step");
+    schema::apply(&config, &pack_schema::embedded(), pack_schema::latest())
+        .expect("the installer's step");
     assert!(PostgresPackIndex::open(&config).is_ok());
 }
 
@@ -275,16 +276,16 @@ fn first_columns(client: &mut Client) -> Vec<Vec<(String, String)>> {
 fn the_pack_migration_only_adds_and_the_serving_child_keeps_working() {
     let db = TestDatabase::empty();
     let config = PostgresConfig::parse(&db.url()).expect("parses");
-    schema::apply(&config, &schema::embedded(), 1).expect("the first release is installed");
+    schema::apply(&config, &pack_schema::embedded(), 1).expect("the first release is installed");
     let first = config.clone().with_supported_schema(1, 1);
     let child = PostgresStore::open(&first).expect("child 1 starts");
     put(&child, "before");
     let mut client = Client::connect(&db.url(), NoTls).expect("connects");
     let old = first_columns(&mut client);
-    let out = schema::apply(&config, &schema::embedded(), PACK_MIGRATION).expect("the step");
+    let out = schema::apply(&config, &pack_schema::embedded(), PACK_MIGRATION).expect("the step");
     assert_eq!((out.from, out.to), (Some(1), PACK_MIGRATION));
     assert_eq!(out.ran, vec![PACK_MIGRATION]);
-    let migration = schema::embedded().remove(1);
+    let migration = pack_schema::embedded().remove(1);
     assert_eq!(migration.version(), PACK_MIGRATION);
     assert_eq!(migration.kind(), Kind::Expand);
     thread::scope(|scope| {
