@@ -73,6 +73,9 @@ struct Captured {
 /// for as long as it lives; what was read by then is kept and the run goes on.
 pub const DRAIN: Duration = Duration::from_secs(2);
 
+/// The most reads of a stream handed to its sink before the deadline is looked at.
+const BATCH: usize = 512;
+
 /// A thread reading one pipe into a shared buffer.
 struct Capture {
     shared: Arc<Mutex<Captured>>,
@@ -233,10 +236,13 @@ impl<C: Clock> ProcessRunner<C> {
         });
         let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
         let ended = loop {
-            let mut busy = false;
-            while let Ok(chunk) = rx.try_recv() {
+            // At most [`BATCH`] reads per turn, so that a command that writes faster than the
+            // sink counts still meets its deadline; a full batch lets the clock move.
+            let mut taken = 0;
+            while taken < BATCH {
+                let Ok(chunk) = rx.try_recv() else { break };
                 sink(&chunk);
-                busy = true;
+                taken += 1;
             }
             match child.try_wait().unwrap_or(None) {
                 Some(status) => break ended_of(status),
@@ -244,14 +250,15 @@ impl<C: Clock> ProcessRunner<C> {
                     kill_group(&mut child);
                     break Ended::TimedOut;
                 }
-                None if busy => {}
+                None if taken > 0 && taken < BATCH => {}
                 None => self.clock.sleep(POLL),
             }
         };
         let ms = elapsed(&self.clock);
-        // What is left in the pipe: until it closes, or until nothing comes for [`DRAIN`] (a
+        // What is left in the pipe: until it closes, or until [`DRAIN`] has passed in all (a
         // daemon the command started can hold the pipe open).
-        while let Ok(chunk) = rx.recv_timeout(DRAIN) {
+        let end = Instant::now() + DRAIN;
+        while let Ok(chunk) = rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
             sink(&chunk);
         }
         Streamed { ended, ms }
