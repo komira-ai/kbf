@@ -746,8 +746,11 @@ async fn the_desired_call_takes_a_service_and_refuses_an_unknown_one() {
 #[tokio::test]
 async fn a_service_the_token_may_not_set_is_a_403() {
     let mut rig = Rig::new("http-forbidden");
-    rig.coordinator = Rig::start(&rig.dir, &rig.clock)
-        .with_services(crate::services::Services::parse("ci_services = []\n").expect("services"));
+    let list = format!(
+        "{}services = [\"other\"]\n",
+        kbf_oidc::testkit::config_text(kbf_oidc::testkit::STATIC_ISSUER)
+    );
+    rig.coordinator = Rig::start_with_allow_list(&rig.dir, &rig.clock, &list);
     let body = r#"{"version":"2.0","min_up":{"storage":1,"frontend":1}}"#;
     let (code, body) = call(
         &rig,
