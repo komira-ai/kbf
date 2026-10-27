@@ -218,7 +218,7 @@ fn a_channel_of_an_untrusted_repository_is_refused_with_its_reason() {
         (2, "channel_not_allowed".into())
     );
     assert!(
-        answer.err.contains("owner/other") && answer.err.contains("trusted_repositories"),
+        answer.err.contains("owner/other") && answer.err.contains("trusted_workflows"),
         "{}",
         answer.err
     );

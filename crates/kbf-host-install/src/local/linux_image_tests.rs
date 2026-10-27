@@ -420,7 +420,7 @@ fn an_image_of_another_repository_is_attested_by_its_own_workflow() {
     rig.offer_good_image();
     put(
         &rig.dir.join("releases.toml"),
-        channel("trusted_repositories = [\"owner/other\"]\n"),
+        channel("trusted_workflows = [\"owner/other/.github/workflows/release.yml\"]\n"),
     );
     let fetched = rig.backend.fetch(&version(), &stable()).unwrap();
     assert_eq!(fetched.commit, COMMIT);

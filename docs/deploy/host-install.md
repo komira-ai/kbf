@@ -559,7 +559,7 @@ repository's `artifacts.yml`, and names its files `kbf-<commit>-...`. A channel 
 `source = "github"` may name its own:
 
 ```toml
-trusted_repositories = ["owner/other"]    # top level, before the first [channels.*]; empty by default
+trusted_workflows = ["owner/other/.github/workflows/release.yml"]   # top level, before the first [channels.*]; empty by default
 
 [channels.other]
 source = "github"
@@ -579,17 +579,21 @@ artifact_prefix = "other"                 # optional; "kbf" is the default
   It is lower-case letters, digits and `-`, and goes only with `source = "github"` and no `sums`
   (a directory's file names and a sums file are kbf's).
 - A string that is not safe to put in a URL or an argument of `gh` makes the file `config_invalid`
-  when it is read, so no channel of the file is usable.
-- **A repository other than `komira-ai/kbf` is refused when the channel is used**, unless the same
-  file lists it in `trusted_repositories`. The answer is `channel_not_allowed`, and the words on
-  stderr (the socket's `detail`) name the channel and the repository. Trusting another repository's
-  workflow to sign what this host installs is the operator's act, on a file that must be root's
-  alone to write like the rest of the allowlist; nothing trusts one by default, and
-  `trusted_repositories` is empty when the key is absent.
+  when it is read, so no channel of the file is usable. So does an entry of `trusted_workflows`
+  that is not `owner/name/.github/workflows/<file>.yml`.
+- **Any signer other than exactly `komira-ai/kbf` with `.github/workflows/artifacts.yml` is
+  refused when the channel is used**, unless the same file lists that exact workflow in the
+  top-level `trusted_workflows`. This holds for another workflow of `komira-ai/kbf` too (a channel
+  naming its `ci.yml` needs the entry), and an entry for one workflow does not trust the other
+  workflows of its repository. The answer is `channel_not_allowed`, and the words on stderr (the
+  socket's `detail`) name the channel and the workflow. Trusting a workflow to sign what this host
+  installs is the operator's act, on a file that must be root's alone to write like the rest of
+  the allowlist; nothing trusts one by default, and `trusted_workflows` is empty when the key is
+  absent.
 - The other rules of the check do not change: the attestation must come from a GitHub-hosted
   runner, name the full commit, the channel's branch, and a subject whose sha256 is the file's,
   and be checked offline by the pinned `gh` and trusted root. The former `komira-ai/komira-build-farm`
-  name is accepted for the `komira-ai/kbf` pair only; for any other pair `gh` is asked once.
+  name is accepted for the `komira-ai/kbf` default pair only; for any other pair `gh` is asked once.
 - Only the signer, the listing and the file names are the channel's. What is checked about the
   contents (the tarball holds the one `kbf` executable, a package is named `kbf`) is unchanged.
 

@@ -56,6 +56,30 @@ pub fn is_repository(text: &str) -> bool {
     owner_ok && name_ok
 }
 
+/// Whether `workflow` is a `.yml` or `.yaml` file of letters, digits and `. _ -` directly under
+/// `<repository>/.github/workflows/`.
+pub fn is_workflow_of(repository: &str, workflow: &str) -> bool {
+    let file = workflow
+        .strip_prefix(repository)
+        .and_then(|rest| rest.strip_prefix("/.github/workflows/"));
+    let stem = file
+        .and_then(|f| f.strip_suffix(".yml").or_else(|| f.strip_suffix(".yaml")))
+        .unwrap_or("");
+    is_repository(repository)
+        && !stem.is_empty()
+        && !stem.starts_with(['-', '.'])
+        && stem
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+/// Whether `text` is `owner/name/.github/workflows/<file>.yml`: a signer workflow, as the
+/// allowlist's `trusted_workflows` names one.
+pub fn is_signer_workflow(text: &str) -> bool {
+    text.split_once("/.github/workflows/")
+        .is_some_and(|(repository, _)| is_workflow_of(repository, text))
+}
+
 impl Origin {
     /// kbf's own repository, workflow and file names.
     pub fn kbf() -> Self {
@@ -78,18 +102,7 @@ impl Origin {
                 "{repository:?} is not a repository (owner/name of letters, digits and . _ -)"
             ));
         }
-        let file = workflow
-            .strip_prefix(repository)
-            .and_then(|rest| rest.strip_prefix("/.github/workflows/"));
-        let stem = file
-            .and_then(|f| f.strip_suffix(".yml").or_else(|| f.strip_suffix(".yaml")))
-            .unwrap_or("");
-        let workflow_ok = !stem.is_empty()
-            && !stem.starts_with(['-', '.'])
-            && stem
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
-        if !workflow_ok {
+        if !is_workflow_of(repository, workflow) {
             return Err(format!(
                 "{workflow:?} is not a workflow file under {repository}/.github/workflows/"
             ));
@@ -137,9 +150,10 @@ impl Origin {
         signers
     }
 
-    /// Whether the repository is kbf's own, which no allow-list has to name.
-    pub fn is_kbf_repository(&self) -> bool {
-        self.repository == REPO
+    /// Whether the signer is exactly kbf's own repository and workflow, which no allow-list
+    /// has to name.
+    pub fn is_kbf_signer(&self) -> bool {
+        self.repository == REPO && self.workflow == WORKFLOW
     }
 }
 

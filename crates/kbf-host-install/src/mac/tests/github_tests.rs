@@ -1160,10 +1160,11 @@ fn a_channel_of_another_repository_does_not_accept_kbfs_former_name() {
 }
 
 /// The allowlist parses a channel of another repository and refuses it when it is used,
-/// unless the same file lists the repository in `trusted_repositories`; kbf's own repository
-/// needs no listing, and a listing of another repository does not help.
+/// unless the same file lists its exact workflow in `trusted_workflows`; kbf's own signer
+/// needs no listing, and a listing of another workflow (of the same repository or another)
+/// does not help.
 #[test]
-fn another_repository_is_refused_at_use_unless_the_allowlist_trusts_it() {
+fn another_signer_is_refused_at_use_unless_the_allowlist_trusts_it() {
     let fx = Fx::new("mac-gh-trust");
     let channel_text = format!(
         "[channels.stable]\nsource = \"github\"\nrepository = \"{OTHER}\"\nsigner_workflow = \"{OTHER_WORKFLOW}\"\n"
@@ -1175,26 +1176,32 @@ fn another_repository_is_refused_at_use_unless_the_allowlist_trusts_it() {
     assert_eq!(error.refusal(), Refusal::ChannelNotAllowed);
     let words = error.to_string();
     assert!(
-        words.contains("stable") && words.contains(OTHER) && words.contains("trusted_repositories"),
+        words.contains("stable")
+            && words.contains(OTHER_WORKFLOW)
+            && words.contains("trusted_workflows"),
         "{words}"
     );
 
     let list = whole_allowlist(
         &fx,
-        &format!("trusted_repositories = [\"owner/unrelated\"]\n{channel_text}"),
+        &format!(
+            "trusted_workflows = [\"owner/unrelated/.github/workflows/release.yml\", \"{OTHER}/.github/workflows/other.yml\"]\n{channel_text}"
+        ),
     )
     .unwrap();
     assert_eq!(refused(&list).refusal(), Refusal::ChannelNotAllowed);
 
     let list = whole_allowlist(
         &fx,
-        &format!("trusted_repositories = [\"owner/unrelated\", \"{OTHER}\"]\n{channel_text}"),
+        &format!(
+            "trusted_workflows = [\"owner/unrelated/.github/workflows/release.yml\", \"{OTHER_WORKFLOW}\"]\n{channel_text}"
+        ),
     )
     .unwrap();
     let channel = list.channel(&fx.host.trust, &stable()).unwrap();
     assert_eq!(channel.origin, other_origin());
 
-    // kbf's own repository is never refused, with or without a listing.
+    // kbf's own signer is never refused, with or without a listing.
     let list = whole_allowlist(&fx, "[channels.stable]\nsource = \"github\"\n").unwrap();
     assert_eq!(
         list.channel(&fx.host.trust, &stable()).unwrap().origin,
@@ -1280,10 +1287,19 @@ fn a_bad_repository_workflow_or_prefix_makes_the_allowlist_invalid() {
             fx.sums.display()
         ),
     ));
-    for trusted in ["\"owner\"", "\"a/b/c\"", "\"-o/n\"", "1", "\"\""] {
+    for trusted in [
+        "\"owner/other\"",
+        "\"owner/other/.github/workflows/\"",
+        "\"owner/other/.github/workflows/a.sh\"",
+        "\"owner/other/.github/workflows/sub/a.yml\"",
+        "\"-o/n/.github/workflows/a.yml\"",
+        "\"x/.github/workflows/a.yml\"",
+        "1",
+        "\"\"",
+    ] {
         bad.push((
             format!("trusted {trusted}"),
-            format!("trusted_repositories = [{trusted}]\n{}", with("")),
+            format!("trusted_workflows = [{trusted}]\n{}", with("")),
         ));
     }
     for (why, text) in &bad {
@@ -1302,7 +1318,7 @@ fn a_bad_repository_workflow_or_prefix_makes_the_allowlist_invalid() {
         with(
             "repository = \"Owner-1/na.me_2\"\nsigner_workflow = \"Owner-1/na.me_2/.github/workflows/a-b_c.v2.yaml\"\n",
         ),
-        format!("trusted_repositories = []\n{}", with("")),
+        format!("trusted_workflows = []\n{}", with("")),
     ] {
         assert!(whole_allowlist(&fx, &text).is_ok(), "{text}");
     }
@@ -1349,4 +1365,13 @@ fn another_workflow_of_kbfs_repository_is_refused_at_use() {
     let error = list.channel(&fx.host.trust, &stable()).unwrap_err();
     assert_eq!(error.refusal(), Refusal::ChannelNotAllowed);
     assert!(error.to_string().contains("ci.yml"), "{error}");
+
+    // Listing that exact workflow allows it; listing the repository's default does not.
+    let channel_text = "[channels.stable]\nsource = \"github\"\nrepository = \"komira-ai/kbf\"\nsigner_workflow = \"komira-ai/kbf/.github/workflows/ci.yml\"\n";
+    let other = "trusted_workflows = [\"komira-ai/kbf/.github/workflows/artifacts.yml\"]\n";
+    let list = whole_allowlist(&fx, &format!("{other}{channel_text}")).unwrap();
+    assert!(list.channel(&fx.host.trust, &stable()).is_err());
+    let own = "trusted_workflows = [\"komira-ai/kbf/.github/workflows/ci.yml\"]\n";
+    let list = whole_allowlist(&fx, &format!("{own}{channel_text}")).unwrap();
+    assert!(list.channel(&fx.host.trust, &stable()).is_ok());
 }

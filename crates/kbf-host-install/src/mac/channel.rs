@@ -11,8 +11,8 @@
 //! source = "github"
 //! token_file = "/usr/local/etc/kbf/host-install/github.token"   # optional
 //!
-//! # A channel of another product (the allow-list must name its repository):
-//! trusted_repositories = ["owner/other"]  # top level, before the first [channels.*]
+//! # A channel of another product (the allow-list must name its workflow):
+//! trusted_workflows = ["owner/other/.github/workflows/release.yml"]  # top level, before the first [channels.*]
 //! [channels.other]
 //! source = "github"
 //! repository = "owner/other"
@@ -41,10 +41,10 @@
 //!   are listed from and the workflow whose attestation is believed; `artifact_prefix` is
 //!   the start of the release files' names (a `source = "github"` channel without `sums`
 //!   only: the names of a directory and of sums are kbf's). Absent, they are kbf's, so a
-//!   file without them means what it always meant. Any repository but kbf's is parsed and
-//!   refused when the channel is used, unless the top-level `trusted_repositories` of the
-//!   same root-owned file names it ([`ChannelError::UntrustedRepository`]); it is empty by
-//!   default.
+//!   file without them means what it always meant. Any signer workflow but kbf's own
+//!   (`komira-ai/kbf`'s `artifacts.yml`) is parsed and refused when the channel is used,
+//!   unless the top-level `trusted_workflows` of the same root-owned file names that exact
+//!   workflow ([`ChannelError::UntrustedSigner`]); it is empty by default.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::release::{ARTIFACT_PREFIX, Origin, REPO, WORKFLOW, is_repository};
+use super::release::{ARTIFACT_PREFIX, Origin, REPO, WORKFLOW, is_signer_workflow};
 use crate::config::refusal;
 use crate::outcome::Refusal;
 use crate::request::Channel;
@@ -86,9 +86,9 @@ pub struct MacChannel {
 pub enum ChannelError {
     /// A refusal of the allowlist or of the channel's files.
     Refused(Refusal),
-    /// The channel names a repository other than kbf's that `trusted_repositories` does not
-    /// list.
-    UntrustedRepository { channel: String, repository: String },
+    /// The channel names a signer workflow other than kbf's own that `trusted_workflows`
+    /// does not list.
+    UntrustedSigner { channel: String, workflow: String },
 }
 
 impl ChannelError {
@@ -96,7 +96,7 @@ impl ChannelError {
     pub fn refusal(&self) -> Refusal {
         match self {
             Self::Refused(refusal) => *refusal,
-            Self::UntrustedRepository { .. } => Refusal::ChannelNotAllowed,
+            Self::UntrustedSigner { .. } => Refusal::ChannelNotAllowed,
         }
     }
 }
@@ -111,12 +111,9 @@ impl fmt::Display for ChannelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Refused(refusal) => write!(f, "the allowlist: {}", refusal.code()),
-            Self::UntrustedRepository {
-                channel,
-                repository,
-            } => write!(
+            Self::UntrustedSigner { channel, workflow } => write!(
                 f,
-                "channel {channel} names repository {repository}, which trusted_repositories in the allowlist does not list"
+                "channel {channel} names signer workflow {workflow}, which trusted_workflows in the allowlist does not list"
             ),
         }
     }
@@ -126,7 +123,7 @@ impl fmt::Display for ChannelError {
 #[serde(deny_unknown_fields)]
 struct File {
     #[serde(default)]
-    trusted_repositories: Vec<String>,
+    trusted_workflows: Vec<String>,
     channels: BTreeMap<String, Entry>,
 }
 
@@ -146,7 +143,7 @@ struct Entry {
 /// The parsed allowlist.
 #[derive(Debug)]
 pub struct MacAllowlist {
-    trusted_repositories: Vec<String>,
+    trusted_workflows: Vec<String>,
     channels: BTreeMap<String, Entry>,
 }
 
@@ -174,11 +171,11 @@ impl MacAllowlist {
                 && entry.source_ref.as_deref().is_none_or(is_branch_ref)
                 && origin_of(entry).is_some()
         });
-        if !well_formed || !file.trusted_repositories.iter().all(|r| is_repository(r)) {
+        if !well_formed || !file.trusted_workflows.iter().all(|w| is_signer_workflow(w)) {
             return Err(Refusal::ConfigInvalid);
         }
         Ok(Self {
-            trusted_repositories: file.trusted_repositories,
+            trusted_workflows: file.trusted_workflows,
             channels: file.channels,
         })
     }
@@ -187,23 +184,23 @@ impl MacAllowlist {
     ///
     /// # Errors
     /// [`ChannelError::Refused`] with [`Refusal::ChannelNotAllowed`], [`Refusal::ConfigUnsafe`]
-    /// or [`Refusal::ConfigInvalid`]; [`ChannelError::UntrustedRepository`] for a repository
-    /// other than kbf's that `trusted_repositories` does not name.
+    /// or [`Refusal::ConfigInvalid`]; [`ChannelError::UntrustedSigner`] for a signer workflow
+    /// other than kbf's own that `trusted_workflows` does not name.
     pub fn channel(&self, trust: &Trust, name: &Channel) -> Result<MacChannel, ChannelError> {
         let entry = self
             .channels
             .get(name.as_str())
             .ok_or(Refusal::ChannelNotAllowed)?;
         let origin = origin_of(entry).ok_or(Refusal::ConfigInvalid)?;
-        if !origin.is_kbf_repository()
+        if !origin.is_kbf_signer()
             && !self
-                .trusted_repositories
+                .trusted_workflows
                 .iter()
-                .any(|trusted| trusted == origin.repository())
+                .any(|w| w == origin.workflow())
         {
-            return Err(ChannelError::UntrustedRepository {
+            return Err(ChannelError::UntrustedSigner {
                 channel: name.as_str().to_owned(),
-                repository: origin.repository().to_owned(),
+                workflow: origin.workflow().to_owned(),
             });
         }
         if let Some(sums) = &entry.sums {

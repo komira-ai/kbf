@@ -957,7 +957,7 @@ fn a_channel_of_another_repository_signs_its_packages_by_its_own_workflow() {
         let rig = Rig::new("other-repo", format);
         put(
             &rig.dir.join("releases.toml"),
-            channel("trusted_repositories = [\"owner/other\"]\n"),
+            channel("trusted_workflows = [\"owner/other/.github/workflows/release.yml\"]\n"),
         );
         rig.stage(&new_version()).unwrap();
         let calls = rig.calls.borrow();

@@ -522,11 +522,11 @@ const OTHER_REPO: &str = "owner/other";
 const OTHER_WORKFLOW: &str = "owner/other/.github/workflows/release.yml";
 
 /// The channels file of a `stable` channel for the repository `owner/other`, with
-/// `trusted` as the file's `trusted_repositories` (none: the key is absent).
+/// `trusted` as the file's `trusted_workflows` (none: the key is absent).
 fn other_channels(trusted: Option<&[&str]>) -> String {
     let list = trusted.map_or_else(String::new, |names| {
         let quoted: Vec<String> = names.iter().map(|n| format!("\"{n}\"")).collect();
-        format!("trusted_repositories = [{}]\n", quoted.join(", "))
+        format!("trusted_workflows = [{}]\n", quoted.join(", "))
     });
     format!(
         "{list}[channels.stable]\nsource = \"github\"\nrepository = \"{OTHER_REPO}\"\nsigner_workflow = \"{OTHER_WORKFLOW}\"\nartifact_prefix = \"other\"\n"
@@ -547,21 +547,26 @@ fn flag_value(args: &[String], flag: &str) -> String {
 }
 
 /// A channel for a repository other than kbf's is read, and refused when it is used, unless the
-/// same file lists the repository in `trusted_repositories`. The refusal is
-/// `channel_not_allowed`, its words name the channel, the repository and the key, and nothing is
-/// fetched, run or left behind. A list that names other repositories does not help.
+/// same file lists its workflow in `trusted_workflows`. The refusal is
+/// `channel_not_allowed`, its words name the channel, the workflow and the key, and nothing is
+/// fetched, run or left behind. A list that names other workflows (another repository's, or another file of this one) does not help.
 #[test]
 fn a_channel_of_another_repository_is_refused_unless_the_file_trusts_it() {
     for trusted in [
         None,
         Some(&[][..]),
-        Some(&["owner/unrelated", "owner/Other"][..]),
+        Some(
+            &[
+                "owner/unrelated/.github/workflows/release.yml",
+                "owner/other/.github/workflows/other.yml",
+            ][..],
+        ),
     ] {
         let rig = Rig::new("untrusted-repo");
         put(&rig.dir.join("releases.toml"), other_channels(trusted));
         let fault = rig.stage().unwrap_err();
         assert!(refused(Code::ChannelNotAllowed)(&fault), "{fault:?}");
-        for word in ["stable", OTHER_REPO, "trusted_repositories"] {
+        for word in ["stable", OTHER_REPO, "trusted_workflows"] {
             assert!(fault.detail.contains(word), "{word}: {}", fault.detail);
         }
         assert!(rig.calls.borrow().is_empty(), "nothing was fetched");
@@ -579,7 +584,7 @@ fn a_trusted_channel_is_listed_downloaded_and_attested_under_its_own_names() {
     let rig = Rig::new("trusted-repo");
     put(
         &rig.dir.join("releases.toml"),
-        other_channels(Some(&[OTHER_REPO])),
+        other_channels(Some(&[OTHER_WORKFLOW])),
     );
     rig.offer_as("other", COMMIT, &tar_gz(&[file("kbf", &binary("b"))]));
     assert_eq!(rig.stage().unwrap(), COMMIT);
@@ -633,7 +638,7 @@ fn kbfs_former_name_is_accepted_for_kbfs_channel_only() {
     let rig = Rig::new("former-name-other");
     put(
         &rig.dir.join("releases.toml"),
-        other_channels(Some(&[OTHER_REPO])),
+        other_channels(Some(&[OTHER_WORKFLOW])),
     );
     rig.offer_as("other", COMMIT, &tar_gz(&[file("kbf", &binary("b"))]));
     *rig.gh_exit.borrow_mut() = 1;
@@ -648,7 +653,7 @@ fn kbfs_former_name_is_accepted_for_kbfs_channel_only() {
 #[test]
 fn a_bad_repository_or_workflow_in_the_channels_file_is_config_invalid() {
     let good = format!(
-        "trusted_repositories = [\"{OTHER_REPO}\"]\n[channels.stable]\nsource = \"github\"\nrepository = \"{OTHER_REPO}\"\nsigner_workflow = \"{OTHER_WORKFLOW}\"\n"
+        "trusted_workflows = [\"{OTHER_WORKFLOW}\"]\n[channels.stable]\nsource = \"github\"\nrepository = \"{OTHER_REPO}\"\nsigner_workflow = \"{OTHER_WORKFLOW}\"\n"
     );
     for (why, text) in [
         (
@@ -675,7 +680,7 @@ fn a_bad_repository_or_workflow_in_the_channels_file_is_config_invalid() {
         ),
         (
             "a trusted entry that is no repository",
-            good.replace(&format!("[\"{OTHER_REPO}\"]"), "[\"other\"]"),
+            good.replace(&format!("[\"{OTHER_WORKFLOW}\"]"), "[\"other\"]"),
         ),
         (
             "an unknown key",
