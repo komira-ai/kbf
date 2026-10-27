@@ -328,6 +328,28 @@ mod tests {
         let _ = scratch.file("f").regenerate(&runs(&[("a b", "one")]));
     }
 
+    /// Catches: a run with no name, which would write a line of only its family.
+    #[test]
+    #[should_panic(expected = "no whitespace")]
+    fn an_empty_name_is_refused() {
+        let scratch = Scratch::new("empty.txt");
+        let _ = scratch.file("f").regenerate(&runs(&[("", "one")]));
+    }
+
+    /// Catches: a blank line or a comment (a person's note in the file) read as a run,
+    /// or refused.
+    #[test]
+    fn blank_and_comment_lines_are_skipped() {
+        let scratch = Scratch::new("blank.txt");
+        let file = scratch.file("f");
+        let golden = runs(&[("a", "one")]);
+        file.regenerate(&golden).unwrap();
+        let path = scratch.path();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("# a note\n\n{text}\n")).unwrap();
+        assert_eq!(file.check(&golden), Ok(()));
+    }
+
     /// Catches: `assert_matches` returning on a mismatch.
     #[test]
     #[should_panic(expected = "do not match")]
