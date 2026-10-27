@@ -382,11 +382,15 @@ async fn started(name: &str, state: &str) -> Rig {
 async fn hosts_that_beat_before_the_ordered_one_reports_are_not_ordered() {
     let rig = started("svc-order-one", ONE_STORAGE).await;
     let c = &rig.coordinator;
-    let replies: Vec<Reply> = ["s1", "s2", "s3"]
+    let replies: Vec<kbf_updater::wire::ServiceReply> = ["s1", "s2", "s3"]
         .iter()
         .map(|h| c.heartbeat(storage(h), beat("1.0")))
         .collect();
-    assert_eq!(replies, [Reply::Nothing, update("2.0"), Reply::Nothing]);
+    assert_eq!(
+        replies,
+        [Reply::Nothing, update("2.0"), Reply::Nothing]
+            .map(Into::<kbf_updater::wire::ServiceReply>::into)
+    );
     assert_eq!(c.heartbeat(storage("s1"), beat("1.0")), Reply::Nothing);
     assert_eq!(c.heartbeat(storage("s3"), beat("1.0")), Reply::Nothing);
 }
@@ -606,4 +610,121 @@ async fn a_token_sets_only_the_services_its_entry_names() {
         .await;
     assert!(matches!(set, Err(SetError::Forbidden)));
     rig.set(STATE).await;
+}
+
+const SERVICES_ONE_AT_A_TIME: &str = "ci_services = [\"kbf\", \"other\"]\n[[service]]\nname = \"other\"\n[service.roles.daemon]\nmax_updating = 1\nmin_up = 0\n";
+
+/// A beat of a new updater: kbf at `kbf`, `other` at `other`.
+fn new_beat(kbf: &str, other: &str) -> kbf_updater::wire::Heartbeat {
+    let mut b = beat(kbf);
+    b.services = Some(vec![service_beat(other)]);
+    b
+}
+
+fn service_beat(running: &str) -> kbf_updater::wire::ServiceBeat {
+    let b = beat(running);
+    kbf_updater::wire::ServiceBeat {
+        name: "other".to_owned(),
+        version: b.version,
+        health: b.health,
+        last_update: None,
+        updating: None,
+    }
+}
+
+fn update_of(service: &str, target: &str) -> kbf_updater::wire::ServiceReply {
+    kbf_updater::wire::ServiceReply::Update {
+        service: Some(service.to_owned()),
+        version: version(target),
+    }
+}
+
+async fn services_rig(name: &str) -> Rig {
+    let mut rig = Rig::new(name);
+    with_services(&mut rig, SERVICES_ONE_AT_A_TIME);
+    rig.set(STATE).await;
+    rig.set(OTHER).await;
+    rig.at(2_000);
+    rig
+}
+
+/// Behaviour: a host that sends `services` is ordered a service in the reply shape that
+/// names it, and its service beat is recorded as that service's state of the host: while d1
+/// reports `other` updating, d2 (one slot) is told nothing, and when d1 is done d2 is told.
+#[tokio::test]
+async fn a_new_updater_is_ordered_a_service_and_its_beat_is_recorded() {
+    let rig = services_rig("svc-wire-order").await;
+    let c = &rig.coordinator;
+    assert_eq!(
+        c.heartbeat(who("d1", HostRole::Daemon), new_beat("2.0", "1.0")),
+        update_of("other", "3.0")
+    );
+    let mut busy = new_beat("2.0", "1.0");
+    busy.services.as_mut().expect("services")[0].updating = Some(version("3.0"));
+    c.heartbeat(who("d1", HostRole::Daemon), busy);
+    assert_eq!(
+        c.heartbeat(who("d2", HostRole::Daemon), new_beat("2.0", "1.0")),
+        kbf_updater::wire::ServiceReply::Nothing
+    );
+    c.heartbeat(who("d1", HostRole::Daemon), new_beat("2.0", "3.0"));
+    assert_eq!(
+        c.heartbeat(who("d2", HostRole::Daemon), new_beat("2.0", "1.0")),
+        update_of("other", "3.0")
+    );
+}
+
+/// Behaviour: one order per reply, kbf first. A host behind on both is told kbf in the old
+/// shape; while that order stands it is told nothing for `other`; once it runs kbf's version
+/// it is told `other`.
+#[tokio::test]
+async fn kbf_is_ordered_before_a_service_and_one_order_per_reply() {
+    let rig = services_rig("svc-wire-first").await;
+    let c = &rig.coordinator;
+    let host = || who("d1", HostRole::Daemon);
+    assert_eq!(c.heartbeat(host(), new_beat("1.0", "1.0")), update("2.0"));
+    assert_eq!(
+        c.heartbeat(host(), new_beat("1.0", "1.0")),
+        update("2.0"),
+        "asked again before it reports, it is told the same"
+    );
+    assert_eq!(
+        c.heartbeat(host(), new_beat("2.0", "1.0")),
+        update_of("other", "3.0")
+    );
+}
+
+/// Behaviour: a host that sent no `services` is never named a service, even
+/// when other hosts are ordered `other` and it is behind on it; and entries for a service nobody
+/// defined, or one that does not run on the host's role, are ignored (not recorded, not
+/// ordered).
+#[tokio::test]
+async fn only_an_updater_that_announced_a_service_is_ordered_it() {
+    let rig = services_rig("svc-wire-old").await;
+    let c = &rig.coordinator;
+    let host = || who("d1", HostRole::Daemon);
+    assert_eq!(
+        c.heartbeat(host(), new_beat("2.0", "1.0")),
+        update_of("other", "3.0")
+    );
+    assert_eq!(
+        c.heartbeat(who("d3", HostRole::Daemon), beat("2.0")),
+        kbf_updater::wire::ServiceReply::Nothing,
+        "an old updater is a kbf-only host"
+    );
+    assert_eq!(
+        c.heartbeat(host(), beat("2.0")),
+        kbf_updater::wire::ServiceReply::Nothing,
+        "the latest beat says what the host is: it announces nothing now"
+    );
+    let mut stray = new_beat("2.0", "1.0");
+    stray.services.as_mut().expect("services")[0].name = "unheard-of".to_owned();
+    assert_eq!(
+        c.heartbeat(who("d4", HostRole::Daemon), stray),
+        kbf_updater::wire::ServiceReply::Nothing
+    );
+    assert_eq!(
+        c.heartbeat(who("s1", HostRole::Storage), new_beat("2.0", "1.0")),
+        kbf_updater::wire::ServiceReply::Nothing,
+        "other does not run on storage hosts"
+    );
 }

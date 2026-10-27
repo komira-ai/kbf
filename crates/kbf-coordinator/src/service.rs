@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_oidc::{Refusal, Verified, Verifier};
-use kbf_updater::wire::{Heartbeat, Reply};
+use kbf_updater::wire::{Heartbeat, Reply, ServiceReply};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
@@ -148,22 +148,47 @@ impl Coordinator {
     }
 
     /// Notes a heartbeat from `who` and answers it. With no desired state set, nothing.
-    pub fn heartbeat(&self, who: Identity, beat: Heartbeat) -> Reply {
+    ///
+    /// The top-level fields are `kbf`. Each entry of `services` is noted as that service's
+    /// heartbeat of the host, if the coordinator manages the service and runs it on the
+    /// host's role (any other entry is ignored). `kbf` is decided first, then the host's
+    /// services in the order it listed them, and the first order is the reply: one update
+    /// per reply. A host that sent no `services` is answered about `kbf` alone, in the
+    /// shape it has always read.
+    pub fn heartbeat(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
         let now = (self.clock)();
         let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
+        let announced = beat.services.clone().unwrap_or_default();
+        let platform = beat.platform;
         fleet.record(who.node_id.clone(), who.role, beat, now);
-        let reply = decide_in(
-            &self.services,
-            &self.desired.all(),
-            KBF,
-            &fleet,
-            &who.node_id,
-            now,
-        );
-        if let Reply::Update { version } = &reply {
-            fleet.order(KBF, who.node_id, version.clone(), now);
+        for one in &announced {
+            let runs_here = self
+                .services
+                .get(&one.name)
+                .is_some_and(|def| def.roles.contains_key(&who.role));
+            if runs_here {
+                fleet.record_in(
+                    &one.name,
+                    who.node_id.clone(),
+                    who.role,
+                    one.as_heartbeat(platform),
+                    now,
+                );
+            }
         }
-        reply
+        let desired = self.desired.all();
+        let names = std::iter::once(KBF).chain(announced.iter().map(|one| one.name.as_str()));
+        for name in names {
+            let reply = decide_in(&self.services, &desired, name, &fleet, &who.node_id, now);
+            if let Reply::Update { version } = reply {
+                fleet.order(name, who.node_id.clone(), version.clone(), now);
+                return ServiceReply::Update {
+                    service: (name != KBF).then(|| name.to_owned()),
+                    version,
+                };
+            }
+        }
+        ServiceReply::Nothing
     }
 
     /// The CI token in `bearer`, checked by the verifier.

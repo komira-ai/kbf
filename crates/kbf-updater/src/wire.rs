@@ -68,6 +68,89 @@ pub struct Heartbeat {
     /// The target of the update running now: set from the start of the A/B to its end.
     #[serde(default)]
     pub updating: Option<Version>,
+    /// What the host runs besides `kbf`, one entry per service. Absent from an updater that
+    /// does not know services: the host is a `kbf`-only host, and the coordinator never
+    /// names a service in its reply. Present (even empty) from one that does. `kbf` is never
+    /// among them: its state is the fields above, and a heartbeat that lists it, lists a
+    /// name twice, or names a service that is no service name is refused.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "services_text"
+    )]
+    pub services: Option<Vec<ServiceBeat>>,
+}
+
+/// What a host says of one service besides `kbf`: the same four facts as the top level.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceBeat {
+    /// The service's name.
+    pub name: String,
+    /// The version of it the host runs now.
+    pub version: Version,
+    /// Its health now.
+    pub health: Health,
+    /// The last update of it the host ran, if it has run one since it started.
+    #[serde(default)]
+    pub last_update: Option<UpdateResult>,
+    /// The target of the update of it running now.
+    #[serde(default)]
+    pub updating: Option<Version>,
+}
+
+impl ServiceBeat {
+    /// This service's state as a heartbeat of a host on `platform`.
+    #[must_use]
+    pub fn as_heartbeat(&self, platform: ReleasePlatform) -> Heartbeat {
+        Heartbeat {
+            platform,
+            version: self.version.clone(),
+            health: self.health,
+            last_update: self.last_update.clone(),
+            updating: self.updating.clone(),
+            services: None,
+        }
+    }
+}
+
+/// Whether `name` is a service name: lowercase letters, digits and `-`, not empty, and at
+/// most [`MAX_SERVICE_NAME`] bytes.
+#[must_use]
+pub fn is_service_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SERVICE_NAME
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The most bytes of a service name.
+pub const MAX_SERVICE_NAME: usize = 64;
+
+/// The name the top-level fields of a heartbeat, and a reply without a `service`, are about.
+pub const KBF_SERVICE: &str = "kbf";
+
+fn services_text<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Vec<ServiceBeat>>, D::Error> {
+    use serde::de::Error;
+    let Some(beats) = Option::<Vec<ServiceBeat>>::deserialize(d)? else {
+        return Ok(None);
+    };
+    for (i, beat) in beats.iter().enumerate() {
+        if !is_service_name(&beat.name) {
+            return Err(D::Error::custom("not a service name"));
+        }
+        if beat.name == KBF_SERVICE {
+            return Err(D::Error::custom(
+                "kbf is the top level of a heartbeat, not a service",
+            ));
+        }
+        if beats[..i].iter().any(|b| b.name == beat.name) {
+            return Err(D::Error::custom("a service is listed twice"));
+        }
+    }
+    Ok(Some(beats))
 }
 
 /// The coordinator's answer to a heartbeat.
@@ -84,6 +167,83 @@ pub enum Reply {
         /// The version, and nothing else of the release.
         version: Version,
     },
+}
+
+/// The reply to an updater that sent `services` in its heartbeat: [`Reply`], or an update
+/// that names a service.
+///
+/// `Update` without a service is written and read exactly as [`Reply::Update`], and
+/// `Nothing` as [`Reply::Nothing`]. An update with a `service` is a shape [`Reply`] refuses
+/// (an updater that reads only [`Reply`] fails on the extra field), so the coordinator sends
+/// it only to an updater that has sent `services`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reply", rename_all = "snake_case", try_from = "RawServiceReply")]
+pub enum ServiceReply {
+    /// Nothing to do.
+    Nothing,
+    /// Update to this version now.
+    Update {
+        /// The service to update. `None` is `kbf`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        service: Option<String>,
+        /// The version, and nothing else of the release.
+        version: Version,
+    },
+}
+
+impl From<Reply> for ServiceReply {
+    fn from(reply: Reply) -> Self {
+        match reply {
+            Reply::Nothing => Self::Nothing,
+            Reply::Update { version } => Self::Update {
+                service: None,
+                version,
+            },
+        }
+    }
+}
+
+impl PartialEq<Reply> for ServiceReply {
+    /// Whether this is that reply: the same answer about `kbf`.
+    fn eq(&self, other: &Reply) -> bool {
+        match (self, other) {
+            (Self::Nothing, Reply::Nothing) => true,
+            (
+                Self::Update {
+                    service: None,
+                    version,
+                },
+                Reply::Update { version: other },
+            ) => version == other,
+            _ => false,
+        }
+    }
+}
+
+/// A service reply as it is read.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawServiceReply {
+    reply: String,
+    service: Option<String>,
+    version: Option<Version>,
+}
+
+impl TryFrom<RawServiceReply> for ServiceReply {
+    type Error = &'static str;
+
+    fn try_from(raw: RawServiceReply) -> Result<Self, Self::Error> {
+        if raw.service.as_deref().is_some_and(|s| !is_service_name(s)) {
+            return Err("not a service name");
+        }
+        match (raw.reply.as_str(), raw.service, raw.version) {
+            ("nothing", None, None) => Ok(Self::Nothing),
+            ("update", service, Some(version)) => Ok(Self::Update { service, version }),
+            ("nothing", _, _) => Err("a reply of nothing carries no service or version"),
+            ("update", _, None) => Err("an update reply carries a version"),
+            _ => Err("not a reply: nothing or update"),
+        }
+    }
 }
 
 /// A reply as it is read, before it is checked to be one of the two.

@@ -31,6 +31,7 @@ fn beat() -> Heartbeat {
         health: Health::Healthy,
         last_update: None,
         updating: None,
+        services: None,
     }
 }
 
