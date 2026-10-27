@@ -296,7 +296,7 @@ impl World {
         for (lease, operation) in due {
             self.running.remove(&lease);
             let outcome = Outcome::Completed {
-                action_result: digest(1_000 + operation.0),
+                action_result: digest(1_000 + operation.0).into(),
             };
             self.feed(
                 t,

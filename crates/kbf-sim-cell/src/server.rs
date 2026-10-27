@@ -714,7 +714,7 @@ impl Up {
         if let (Outcome::Completed { action_result }, Some(action)) = (answer.outcome, action) {
             cx.seen.won.insert(action);
             let record = ActionRecord {
-                result: action_result,
+                result: action_result.into(),
                 closure: Closure::new(),
             };
             let put = Command::PutAction {

@@ -198,7 +198,7 @@ fn leases_filter_by_node_and_end_with_their_operation() {
         operation: first.operation,
         lease: first.lease,
         outcome: kbf_types::Outcome::Completed {
-            action_result: digest(99),
+            action_result: digest(99).into(),
         },
     });
     h.feed(Event::Committed(ControlRecord::Result(
@@ -206,7 +206,7 @@ fn leases_filter_by_node_and_end_with_their_operation() {
             lease: first.lease,
             operation: first.operation,
             outcome: kbf_types::Outcome::Completed {
-                action_result: digest(99),
+                action_result: digest(99).into(),
             },
         },
     )));

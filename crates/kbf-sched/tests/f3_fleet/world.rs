@@ -420,7 +420,7 @@ impl World {
                 operation,
                 lease,
                 outcome: Outcome::Completed {
-                    action_result: outcome_of(lease),
+                    action_result: outcome_of(lease).into(),
                 },
             });
         }

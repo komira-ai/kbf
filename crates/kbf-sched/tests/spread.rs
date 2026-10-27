@@ -178,7 +178,7 @@ impl Harness {
             operation: grant.operation,
             lease: grant.lease,
             outcome: Outcome::Completed {
-                action_result: digest(u32::MAX),
+                action_result: digest(u32::MAX).into(),
             },
         });
         let [Effect::Commit(record)] = proposed.as_slice() else {

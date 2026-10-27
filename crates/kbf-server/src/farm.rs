@@ -1042,7 +1042,7 @@ impl Farm {
                 match self.cache.prepare_action_result(&result).await {
                     Ok(record) => {
                         let outcome = Outcome::Completed {
-                            action_result: record.result,
+                            action_result: record.result.into(),
                         };
                         (
                             outcome,

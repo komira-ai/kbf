@@ -8,11 +8,10 @@
 //! operator APIs) stay in the crate root. Every item is also re-exported at the crate
 //! root, so `kbf_types::LeaseId` and `kbf_types::sched::LeaseId` are the same type.
 //!
-//! One item still names a build type: `Outcome::Completed` carries the `Digest` of the
-//! stored result, which the scheduler passes on and never reads. The work itself is named
-//! by a [`WorkKey`], a class and a dedup text; the build's `ActionKey` converts to and
-//! from one at the edges. The test at the foot of this file lists the lines of `work`
-//! that name a build type and refuses any other.
+//! The work itself is named by a [`WorkKey`], a class and a dedup text, and a completed
+//! attempt's stored result by a [`ResultRef`], an identity and a size; the build's
+//! `ActionKey` and `Digest` convert to and from them at the edges. The test at the foot
+//! of this file refuses a build name in the code of any file of the module.
 
 mod lease;
 mod phase;
@@ -31,20 +30,13 @@ pub use version::{Supported, TooNew, VERSION_CAP, Version, VersionFault, underst
 pub use work::{
     Answer, ControlRecord, Failure, FarmFault, FarmRun, FencePolicy, LeaseGrant, LostWhy,
     MemoryKill, MemoryRun, OperationId, Outcome, Refusal, RefusalRecord, Resources, ResultRecord,
-    StartLease, WaiterId, Waiting, WorkKey, WorkerId,
+    ResultRef, StartLease, WaiterId, Waiting, WorkKey, WorkerId,
 };
 
 #[cfg(test)]
 mod tests {
     /// The names this module must not use.
     const BUILD_NAMES: [&str; 3] = ["Digest", "ActionKey", "REAPI"];
-
-    /// Code lines of `work.rs` that still name a build type: the digest of a completed
-    /// attempt's stored result.
-    const ALLOWED: [&str; 2] = [
-        "use crate::{Digest, LeaseId, LeaseKind};",
-        "action_result: Digest,",
-    ];
 
     /// The non-comment lines before the unit tests of one source file.
     fn code_lines(source: &str) -> Vec<&str> {
@@ -72,16 +64,11 @@ mod tests {
             ("state.rs", include_str!("sched/state.rs")),
             ("time.rs", include_str!("sched/time.rs")),
             ("version.rs", include_str!("sched/version.rs")),
+            ("work.rs", include_str!("sched/work.rs")),
         ];
         for (file, source) in clean {
             assert_eq!(offenders(source), Vec::<&str>::new(), "{file}");
         }
-    }
-
-    #[test]
-    fn work_names_only_the_listed_build_lines() {
-        let found = offenders(include_str!("sched/work.rs"));
-        assert_eq!(found, ALLOWED);
     }
 
     #[test]

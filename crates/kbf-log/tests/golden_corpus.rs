@@ -238,7 +238,7 @@ fn corpus() -> Vec<(&'static str, LogCommand)> {
         operation: OperationId(3),
         lease: LeaseId::new(1, 2),
         outcome: Outcome::Completed {
-            action_result: d(3),
+            action_result: d(3).into(),
         },
         action_entry: Some(ActionEntry {
             action: d(4),

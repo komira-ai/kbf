@@ -296,7 +296,7 @@ impl FakeDaemon {
     /// result until its `ResultAck`.
     fn report(&mut self, lease: LeaseId, action: Digest, result: Digest) {
         let outcome = Outcome::Completed {
-            action_result: result,
+            action_result: result.into(),
         };
         self.unacked.insert(lease, (action, outcome));
         self.reported.insert(lease);

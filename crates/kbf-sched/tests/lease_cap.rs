@@ -118,7 +118,7 @@ impl Farm {
             operation: done.operation,
             lease: done.lease,
             outcome: Outcome::Completed {
-                action_result: digest(1_000_000 + done.operation.0),
+                action_result: digest(1_000_000 + done.operation.0).into(),
             },
         });
         self.secs += 1;

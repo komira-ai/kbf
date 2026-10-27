@@ -273,7 +273,8 @@ impl World {
             Outcome::Failed(Failure::NodeMemoryPressure)
         } else {
             Outcome::Completed {
-                action_result: Digest::new(DigestFunction::Sha256, [255; 32], start.lease.seq),
+                action_result: Digest::new(DigestFunction::Sha256, [255; 32], start.lease.seq)
+                    .into(),
             }
         };
         let run = op.runs.last_mut().expect("a started run");

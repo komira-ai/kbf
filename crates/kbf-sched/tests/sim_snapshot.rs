@@ -222,7 +222,7 @@ impl World {
                     operation: grant.operation,
                     lease: grant.lease,
                     outcome: Outcome::Completed {
-                        action_result: digest(1_000_000 + grant.operation.0),
+                        action_result: digest(1_000_000 + grant.operation.0).into(),
                     },
                 });
             }

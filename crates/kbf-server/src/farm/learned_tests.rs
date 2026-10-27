@@ -389,7 +389,7 @@ fn estimator_key_and_run() -> (kbf_estimator::Key, kbf_estimator::Run) {
     };
     let key = key_of("main", &platform, Basis::Cgroup, &subject).expect("a key");
     let ok = Outcome::Completed {
-        action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+        action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1).into(),
     };
     let usage = kbf_invocation::RunUsage {
         wall_micros: 2_000_000,
@@ -787,7 +787,7 @@ fn succeed(
     let report = super::Report {
         lease,
         outcome: kbf_types::Outcome::Completed {
-            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1).into(),
         },
         measured: Some(measured(peak)),
         exit_code: Some(0),
@@ -1183,7 +1183,7 @@ fn a_report_without_a_booking_or_usage_is_counted_not_shown() {
     let report = super::Report {
         lease: stranger,
         outcome: kbf_types::Outcome::Completed {
-            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1).into(),
         },
         measured: None,
         exit_code: Some(0),
@@ -1201,7 +1201,7 @@ fn a_report_without_a_booking_or_usage_is_counted_not_shown() {
     let report = super::Report {
         lease,
         outcome: kbf_types::Outcome::Completed {
-            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1).into(),
         },
         measured: None,
         exit_code: Some(0),

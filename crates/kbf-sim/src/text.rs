@@ -160,7 +160,9 @@ pub fn failure(failure: Failure) -> String {
 #[must_use]
 pub fn outcome(outcome: Outcome) -> String {
     match outcome {
-        Outcome::Completed { action_result } => format!("done({})", digest(&action_result)),
+        Outcome::Completed { action_result } => {
+            format!("done({})", digest(&Digest::from(action_result)))
+        }
         Outcome::Failed(f) => format!("failed({})", failure(f)),
     }
 }
@@ -369,7 +371,7 @@ mod tests {
         );
         assert_eq!(
             outcome(Outcome::Completed {
-                action_result: d(1)
+                action_result: d(1).into()
             }),
             format!("done(sha256:{}:7)", "01".repeat(32))
         );

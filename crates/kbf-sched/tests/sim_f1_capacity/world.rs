@@ -298,7 +298,7 @@ impl World {
                 Outcome::Failed(Failure::Timeout)
             } else {
                 Outcome::Completed {
-                    action_result: digest(1_000_000 + lease.seq),
+                    action_result: digest(1_000_000 + lease.seq).into(),
                 }
             };
             self.feed(Event::Report {
