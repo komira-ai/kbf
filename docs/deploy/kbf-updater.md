@@ -393,14 +393,22 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
 
 ### What the step does
 
-The job starts only after `rehearse` passes: on a hosted runner with systemd, a host laid out by
-hand from the release before this one (its `kbf` through its own `kbf-deploy host install`, its
-`kbf-host-install`, its package's trust files and accounts, this release's helper unit) is updated
-to this release by the real helper through its local socket, as the agent asks for it (`install`,
-`switch`, `confirm`), with the release fetched from GitHub by the helper itself
-(`crates/kbf-host-install/tests/update_rehearsal.rs`). A release that host cannot take is never
-set as the desired version. The rehearsal does not run the agent, the coordinator or a frontend's
-drain and health check.
+The job starts only after `rehearse` and `rehearse-agent` pass, on hosted runners with systemd. In
+`rehearse`, a host laid out by hand from the release before this one (its `kbf` through its own
+`kbf-deploy host install`, its `kbf-host-install`, its package's trust files and accounts, this
+release's helper unit) is updated to this release by the real helper through its local socket, as
+the agent asks for it (`install`, `switch`, `confirm`), with the release fetched from GitHub by
+the helper itself (`crates/kbf-host-install/tests/update_rehearsal.rs`). In `rehearse-agent` the
+same host is updated through the control loop of this page: this commit's coordinator, with a
+throwaway farm CA and an allow-list as above; `cargo xtask deploy-farm`, given the version that
+`cargo xtask release farm-version` prints, as the next step is; the release before this one's
+agent, helper, frontend and `kbf`, the agent heartbeating to the coordinator and reading its
+node's storage health from the frontend with its certificate alone
+(`crates/kbf-host-install/tests/update_rehearsal_agent.rs`). A release that host cannot take, or
+a version the hosts never report, is never set as the desired version. The rehearsals do not
+cover a drain of a node with leases (the host has no daemon half), the farm's Tailscale network
+or its real issuer (the issuer of the OIDC token is a stand-in on loopback, and the minimum of
+storage hosts that must stay up is 0 because the rehearsal's farm has one).
 
 The version it sets is not the release's tag. A host heartbeats `<semver>+g<12 lower-case hex
 digits of the commit>` (for example `0.1.0+g0123456789ab`); the coordinator calls a host done

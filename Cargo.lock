@@ -1887,12 +1887,18 @@ dependencies = [
 name = "kbf-host-install"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "flate2",
+ "kbf-ca",
  "kbf-host",
  "kbf-installer",
+ "kbf-oidc",
  "kbf-testkit",
+ "kbf-types",
  "kbf-update",
+ "rcgen",
  "rustix",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
