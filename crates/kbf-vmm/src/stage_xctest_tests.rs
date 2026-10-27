@@ -139,6 +139,17 @@ fn the_xctestrun_name_follows_the_name_rules() {
     }
 }
 
+/// Catches `--allow-external-links` not reaching the tests' walk through the setup's plan.
+#[test]
+fn the_external_links_flag_reaches_the_tests_plan() {
+    let dir = tmp("xt-flag-plan");
+    let p = products(&dir);
+    link("/etc", &p.join("out"));
+    assert!(plan_all(None, &[], None, Some(&p), false).is_err());
+    let plan = plan_all(None, &[], None, Some(&p), true).expect("allowed");
+    assert_eq!(plan.tests.expect("tests").tree.external_links.len(), 1);
+}
+
 /// Catches a link out of the products tree being copied (the guest would read the host's
 /// path as root), a special file being staged, the directory itself being a link or a file,
 /// and a missing path being reported without a cause.
