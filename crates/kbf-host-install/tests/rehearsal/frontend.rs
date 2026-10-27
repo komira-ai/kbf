@@ -26,8 +26,10 @@ use super::{capture, farm, out_dir, run};
 
 /// The container's name.
 pub const NAME: &str = "kbf-frontend-rehearsal";
-/// The operator API, as the helper reaches it (the host's loopback, on the host network).
-pub const API: &str = "127.0.0.1:18982";
+/// The operator API, as the helper reaches it (the host's loopback, on the host network). It is
+/// the address `kbf cluster drain` dials when it is given none, which is how the helper runs it
+/// in the container.
+pub const API: &str = "127.0.0.1:8982";
 /// Where the host's storage node listens: the `kbf` unit's `--storage-listen`.
 pub const STORAGE: &str = "127.0.0.1:8983";
 /// The account the frontend image runs as.
