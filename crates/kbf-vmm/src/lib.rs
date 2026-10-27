@@ -27,6 +27,7 @@ pub mod signature;
 pub mod sink;
 pub mod spec;
 pub mod stage;
+pub mod stage_runtime;
 pub mod stage_xctest;
 pub mod system;
 pub mod volume;
