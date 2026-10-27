@@ -431,3 +431,32 @@ fn hardening_reaches_the_old_container_after_a_failed_switch() {
         }
     }
 }
+
+/// A switch with a hardening value that is not accepted is refused as `config_invalid` and
+/// nothing is touched.
+#[test]
+fn a_bad_hardening_value_refuses_the_switch() {
+    let rig = Rig::new("bad-hardening");
+    assert!(matches!(rig.install(), Answer::Staged { .. }));
+    let before = rig.steps().len();
+    for bad in [
+        "security_opt = [\"seccomp=unconfined\"]",
+        "security_opt = [\"label=disable\"]",
+        "tmpfs = [\"tmp\"]",
+        "cap_drop = [\"all\"]",
+        "ulimits = [\"nofile=2:1\"]",
+    ] {
+        put(
+            &rig.config_path(),
+            &CONFIG.replace(
+                "user = \"65532:65532\"",
+                &format!("user = \"65532:65532\"\n{bad}"),
+            ),
+        );
+        assert!(
+            refused(crate::local::answer::Code::ConfigInvalid)(&rig.switch()),
+            "{bad}"
+        );
+    }
+    assert_eq!(rig.steps().len(), before);
+}

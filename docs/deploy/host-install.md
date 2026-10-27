@@ -756,6 +756,7 @@ container ([the example](../../packaging/host-agent/linux/host-install-frontend.
 | `name`, `restart` | the container's name and Docker's restart policy (`always`, `unless-stopped`, `on-failure[:N]`). `no` is refused: nothing else starts the container, so it would stay down after a reboot of the host or of Docker |
 | `network`, `user` | optional: `--network` and `--user` |
 | `group_add` | optional: a list of numeric group ids as quoted strings (`["990"]`), each passed as `--group-add <gid>` after `--user`, on the container a switch makes and on the old one put back. Each is decimal digits only, from 1 to 4294967295: no name, sign, space or `0`, and `config_invalid` otherwise. A frontend that reaches `kbf-signer`'s socket through the signer's `--client-group` needs that group's id here, or a recreated container can no longer sign |
+| `read_only`, `tmpfs`, `cap_drop`, `security_opt`, `ulimits` | optional hardening, so that a recreated container keeps what the first one ran with: `read_only = true` is `--read-only`; the lists are passed one `--tmpfs`, `--cap-drop`, `--security-opt` or `--ulimit` per entry, after `--user`, on the container a switch makes and on the old one put back. Each entry is one argument and must have the documented shape, or the switch is `config_invalid`. `tmpfs`: `/PATH` or `/PATH:OPTIONS` (path of letters, digits and `_ . -`, no `..`; options `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `size=N[k\|m\|g]`, `mode=`, `uid=`, `gid=`, `nr_inodes=`; not `exec`, `suid` or `dev`). `cap_drop`: `ALL` or a capital-letter name such as `NET_RAW`. `security_opt`: only `no-new-privileges`; `seccomp=`, `apparmor=`, `label=` and `no-new-privileges=false` are refused because they can loosen the container, and there is no `cap_add`. `ulimits`: `NAME=SOFT` or `NAME=SOFT:HARD` for a resource docker knows (`nofile`, `nproc`, `core`, ...), decimal digits, soft not above hard |
 | `ports`, `mounts`, `command` | `--publish` and `--volume` entries, and the flags after the image; each entry is one argument, never a shell word |
 | `api` | where this host reaches the frontend's operator API (a published port, or the host's own listen address under `network = "host"`), for `/readyz` and `/healthz` |
 | `drain_token_file` | the operator token as a path **inside** the container |
@@ -763,10 +764,11 @@ container ([the example](../../packaging/host-agent/linux/host-install-frontend.
 | `drain_secs` | optional (default 180, at most 1800): how long a drain is waited for |
 | `ready_secs` | optional (default 90, 10 to 600): how long a new container has to be ready |
 
-`group_add` is written into the record only when it is set, so that a host that sets none writes
-the record it always did and an older helper still reads it. **A host that sets `group_add` must
-settle (confirm) or revert any release on trial before the helper is rolled back to a version
-without `group_add`**: that version refuses a record with a key it does not know, and could not run
+`group_add` and the hardening keys are written into the record only when they are set, so that a host
+that sets none writes the record it always did and an older helper still reads it. **A host that sets
+`group_add` or any of `read_only`, `tmpfs`, `cap_drop`, `security_opt` and `ulimits` must settle
+(confirm) or revert any release on trial before the helper is rolled back to a version without
+them**: that version refuses a record with a key it does not know, and could not run
 the deadline revert.
 
 A switch has to fit `--window-secs`: `drain_secs` + 30 (the stop) + `ready_secs` is checked against
