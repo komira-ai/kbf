@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use super::conn::Conn;
 use super::schema;
-use super::{Flaw, PostgresConfig, PostgresPackIndex, PostgresStore};
+use super::schema::Migration;
+use super::{Flaw, PostgresConfig, PostgresStore};
 use crate::clock::ManualClock;
 use crate::conformance::Backend;
-use crate::pack_index::conformance::PackBackend;
 use crate::{Conflict, Store, Txn};
 
 /// How long [`PostgresBackend::commit_out_of_order`] waits, in polls of 5 ms, for the
@@ -28,6 +28,7 @@ static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
 pub struct PostgresBackend {
     base: PostgresConfig,
     flaw: Flaw,
+    more: Vec<Migration>,
     schemas: Mutex<Vec<String>>,
 }
 
@@ -42,8 +43,17 @@ impl PostgresBackend {
             base: PostgresConfig::parse(url)
                 .expect("the test database URL is a usable postgres:// URL"),
             flaw,
+            more: Vec::new(),
             schemas: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Puts `more`, the migrations of a crate that extends the schema ([`schema::extend`]),
+    /// after the first one in every schema this backend makes.
+    #[must_use]
+    pub fn with_migrations(mut self, more: Vec<Migration>) -> PostgresBackend {
+        self.more = more;
+        self
     }
 
     /// A configuration for a new schema, recorded for dropping.
@@ -58,7 +68,9 @@ impl PostgresBackend {
             .expect("the generated schema name is plain")
             .with_application_name(&name);
         // The installer creates the schema in a deployment; a test plays the installer.
-        schema::apply(&config, &schema::embedded(), schema::latest())
+        let set = schema::extend(schema::embedded(), self.more.clone())
+            .expect("the migrations are numbered");
+        schema::apply(&config, &set, schema::latest_of(&set))
             .expect("the test database takes the schema");
         self.schemas
             .lock()
@@ -95,21 +107,6 @@ impl Drop for PostgresBackend {
                 let _ = client.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"));
             }
         });
-    }
-}
-
-/// The pack index of a new schema of its own, opened as the conformance suite asks.
-impl PackBackend for PostgresBackend {
-    type Index = PostgresPackIndex;
-
-    fn open_index(&self, clock: Arc<ManualClock>) -> PostgresPackIndex {
-        PostgresPackIndex::open(&self.fresh_config())
-            .expect("the test database opens")
-            .with_clock(clock)
-    }
-
-    fn reconnect(&self, index: &PostgresPackIndex) -> PostgresPackIndex {
-        index.reconnect().expect("the test database reopens")
     }
 }
 

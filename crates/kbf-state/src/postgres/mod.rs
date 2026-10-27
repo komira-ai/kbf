@@ -23,9 +23,9 @@
 //! - **C7.** A batch is one transaction and one commit, however many transactions it
 //!   holds; the server's WAL flush groups commits from concurrent callers.
 //!
-//! [`PostgresPackIndex`] is the pack index (`crate::pack_index`) in two tables of its own, kept
-//! outside the key/value and feed tables and outside the commit head: it has connections of
-//! its own and takes none of the locks above.
+//! [`ExtensionPool`] is for a crate that keeps tables of its own in the schema:
+//! connections of their own, outside the commit head, taking none of the locks above.
+//! Such a crate registers its migration with [`schema::extend`].
 //!
 //! [`PostgresStore::claim`] is the claim path: read committed, rows locked
 //! `FOR UPDATE SKIP LOCKED`, each claimed through the same version compare-and-set.
@@ -40,8 +40,8 @@ pub mod boot;
 mod conn;
 #[cfg(feature = "test-database")]
 mod database;
+mod extension;
 mod not_up;
-mod pack_index;
 mod reach;
 pub mod schema;
 mod session;
@@ -59,10 +59,11 @@ use postgres::types::ToSql;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use backend::PostgresBackend;
+pub use conn::Conn;
 #[cfg(feature = "test-database")]
-pub use database::{TestDatabase, test_database};
+pub use database::{TestDatabase, test_database, test_database_with};
+pub use extension::{ExtensionPool, Loan, store_error};
 pub use not_up::OpenError;
-pub use pack_index::PostgresPackIndex;
 pub use reach::{Unreached, reach};
 use session::{Edge, Pool, RangeShape, Session};
 use tx::{Level, Row, Tx, micros};

@@ -2,7 +2,7 @@
 //!
 //! A pack is one object of an object store that holds many blobs, in the segment layout of
 //! `kbf-segments` (the blobs back to back, then a footer that indexes them). The pack index
-//! (`kbf_state::PackIndex`) maps a blob's digest to the pack, the offset and the length, so a
+//! (`kbf_pack_index::PackIndex`) maps a blob's digest to the pack, the offset and the length, so a
 //! reader asks the store for one range of one object. This crate is the client side of both:
 //!
 //! - [`Packer`] owns the **write rule**: it writes a pack to the store with a create-only

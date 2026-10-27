@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use super::{
     CONNECT_LIMIT, Kind, MIN_SUPPORTED, Migration, SchemaError, Supported, connect_settings,
-    embedded, judge, latest,
+    embedded, extend, judge, latest, latest_of,
 };
 use crate::postgres::PostgresConfig;
 
@@ -25,6 +25,52 @@ fn every_embedded_migration_is_numbered_in_order_and_expand_only() {
         assert_eq!(m.kind(), Kind::Expand, "{}", m.name());
     }
     assert!(MIN_SUPPORTED >= 1 && MIN_SUPPORTED <= latest());
+}
+
+/// A migration of a crate that extends the schema, as such a crate ships it.
+fn extra(version: u32, name: &str) -> Migration {
+    Migration::new(
+        version,
+        name,
+        "-- kbf-migration: expand\nCREATE TABLE extra_t (id bigint PRIMARY KEY);\n",
+    )
+    .expect("an additive migration lints")
+}
+
+/// Catches an extension set that is not the base followed by the extension in order: the
+/// base migrations must keep their numbers and names (an existing database has recorded them)
+/// and the extension continues the numbering; `latest_of` is the newest of the extended set.
+#[test]
+fn an_extension_continues_the_numbering_and_leaves_the_base_as_it_was() {
+    let base = embedded();
+    let set = extend(base.clone(), [extra(latest() + 1, "extra")]).expect("continues");
+    assert_eq!(&set[..base.len()], base.as_slice());
+    assert_eq!(set.len(), base.len() + 1);
+    assert_eq!(set[base.len()].name(), "extra");
+    assert_eq!(latest_of(&set), latest() + 1);
+    assert_eq!(latest_of(&[]), 0);
+}
+
+/// Catches an extension that repeats a number of the base or leaves a gap being accepted
+/// (the runner records a migration by its number, so either would skip or collide).
+#[test]
+fn an_extension_that_repeats_or_skips_a_number_is_refused() {
+    let repeated = extend(embedded(), [extra(latest(), "extra")]);
+    assert_eq!(
+        repeated,
+        Err(SchemaError::Numbering {
+            expected: latest() + 1,
+            found: latest()
+        })
+    );
+    let gap = extend(embedded(), [extra(latest() + 2, "extra")]);
+    assert_eq!(
+        gap,
+        Err(SchemaError::Numbering {
+            expected: latest() + 1,
+            found: latest() + 2
+        })
+    );
 }
 
 /// Catches an expand migration that drops or renames being accepted. Each statement is one

@@ -23,7 +23,7 @@ use kbf_meta::Retention;
 use kbf_objstore::{
     Floor, FsStore, FsStoreError, KeyPrefix, ObjectStore, objects_source, statvfs_source,
 };
-use kbf_state::PackIndex;
+use kbf_pack_index::PackIndex;
 use kbf_storage::local_cache::{HeldBytes, LocalCache};
 use kbf_store::StdFs;
 use kbf_threads::Topology;
@@ -617,7 +617,7 @@ mod tests {
     async fn a_started_server_carries_the_pack_index_the_flag_names() {
         // The test database makes and drops itself with a runtime of its own, which tokio
         // refuses on a thread that is running tasks: both happen on a thread of their own.
-        let db = std::thread::spawn(kbf_state::postgres::test_database);
+        let db = std::thread::spawn(kbf_pack_index::schema::test_database);
         let db = db.join().expect("a test database");
         let root = crate::test_dir::scratch_dir("kbf-server-pack-index");
         let mut args = Args::parse_from([

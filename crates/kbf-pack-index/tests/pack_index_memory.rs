@@ -2,9 +2,10 @@
 //! `tests/postgres_pack_index.rs` runs against Postgres), and what the pack index says when it
 //! refuses a call.
 
-use kbf_state::pack_index::conformance::run_all;
-use kbf_state::pack_index::memory::MemoryPackBackend;
-use kbf_state::{PackIndexError, StoreError};
+use kbf_pack_index::PackIndexError;
+use kbf_pack_index::conformance::run_all;
+use kbf_pack_index::memory::MemoryPackBackend;
+use kbf_state::StoreError;
 
 /// Asserts that the in-memory index passes every clause of the suite: recording and locating,
 /// idempotent and conflicting records, the first location kept, batches of a thousand, touches,

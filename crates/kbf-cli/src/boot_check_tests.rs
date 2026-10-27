@@ -10,7 +10,6 @@ use std::process::ExitCode;
 use std::rc::Rc;
 
 use clap::error::ErrorKind;
-use kbf_state::postgres::schema;
 
 use super::{
     Args, DEFAULT_INSTALLER_CONFIG, NO_DATABASE, NO_STATE, SchemaStep, command, database_in,
@@ -89,12 +88,12 @@ fn the_step_is_asked_once_for_the_schema_this_build_declares() {
     let declared = crate::version::identity()["state_schema"]
         .as_u64()
         .expect("a number");
-    assert_eq!(declared, u64::from(schema::latest()));
+    assert_eq!(declared, u64::from(kbf_pack_index::schema::latest()));
     for mode in [names::FRONTEND, names::ALL_IN_ONE] {
         let (said, asked) = migrate(mode, Ok("migrated the schema from 6 to 7"));
         let want = Ok("schema step: migrated the schema from 6 to 7".to_owned());
         assert_eq!(said, want, "{mode}");
-        assert_eq!(asked, [schema::latest()], "{mode}");
+        assert_eq!(asked, [kbf_pack_index::schema::latest()], "{mode}");
     }
 }
 
@@ -146,7 +145,7 @@ fn the_real_step_of_this_build_refuses_what_it_cannot_do() {
     let dir = scratch("real-step");
     let file = installer_toml(&dir, &format!("database = \"{DOWN_URL}\"\n"));
     let mut step = database_of(&file).expect("a usable url").expect("a step");
-    let ahead = schema::latest() + 1;
+    let ahead = kbf_pack_index::schema::latest() + 1;
     let why = step.before_start(ahead).unwrap_err();
     let wanted = format!("needs state schema {ahead}");
     assert!(why.contains(&wanted), "{why}");

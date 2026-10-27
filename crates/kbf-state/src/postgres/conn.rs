@@ -32,7 +32,7 @@ pub(super) fn off_runtime<R: Send>(f: impl FnOnce() -> R + Send) -> R {
 type Params<'a> = &'a [&'a (dyn ToSql + Sync)];
 
 /// A `postgres::Client` whose calls, and whose drop, are safe inside a runtime.
-pub(super) struct Conn {
+pub struct Conn {
     // Present until `drop`.
     client: Option<Client>,
 }
@@ -51,21 +51,34 @@ impl Conn {
             .expect("the client is present until the connection is dropped")
     }
 
-    pub(super) fn is_closed(&self) -> bool {
+    /// Whether the server closed the connection.
+    pub fn is_closed(&self) -> bool {
         self.client.as_ref().is_none_or(postgres::Client::is_closed)
     }
 
-    pub(super) fn prepare(&mut self, query: &str) -> Result<Statement, postgres::Error> {
+    /// Prepares a statement.
+    ///
+    /// # Errors
+    /// The client's error.
+    pub fn prepare(&mut self, query: &str) -> Result<Statement, postgres::Error> {
         let client = self.client();
         off_runtime(|| client.prepare(query))
     }
 
-    pub(super) fn batch_execute(&mut self, query: &str) -> Result<(), postgres::Error> {
+    /// Runs statements that take no parameters and return no rows.
+    ///
+    /// # Errors
+    /// The client's error.
+    pub fn batch_execute(&mut self, query: &str) -> Result<(), postgres::Error> {
         let client = self.client();
         off_runtime(|| client.batch_execute(query))
     }
 
-    pub(super) fn execute<T: ?Sized + ToStatement + Sync>(
+    /// Runs a statement; the number of rows it changed.
+    ///
+    /// # Errors
+    /// The client's error.
+    pub fn execute<T: ?Sized + ToStatement + Sync>(
         &mut self,
         query: &T,
         params: Params<'_>,
@@ -74,7 +87,11 @@ impl Conn {
         off_runtime(|| client.execute(query, params))
     }
 
-    pub(super) fn query<T: ?Sized + ToStatement + Sync>(
+    /// Runs a statement; its rows.
+    ///
+    /// # Errors
+    /// The client's error.
+    pub fn query<T: ?Sized + ToStatement + Sync>(
         &mut self,
         query: &T,
         params: Params<'_>,
@@ -83,7 +100,11 @@ impl Conn {
         off_runtime(|| client.query(query, params))
     }
 
-    pub(super) fn query_one<T: ?Sized + ToStatement + Sync>(
+    /// Runs a statement that returns exactly one row.
+    ///
+    /// # Errors
+    /// The client's error, and when the statement returns no row or more than one.
+    pub fn query_one<T: ?Sized + ToStatement + Sync>(
         &mut self,
         query: &T,
         params: Params<'_>,
@@ -92,7 +113,11 @@ impl Conn {
         off_runtime(|| client.query_one(query, params))
     }
 
-    pub(super) fn query_opt<T: ?Sized + ToStatement + Sync>(
+    /// Runs a statement that returns at most one row.
+    ///
+    /// # Errors
+    /// The client's error, and when the statement returns more than one row.
+    pub fn query_opt<T: ?Sized + ToStatement + Sync>(
         &mut self,
         query: &T,
         params: Params<'_>,
