@@ -78,6 +78,8 @@ hyper-util = { version = "0.1.21", default-features = false }
 # reads Cargo.lock and refuses a second source. The revision is raised by a pull request
 # of its own that runs the whole CI, never along with other changes.
 js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "2b64dc6282aac440860224cb4a1a2c791fb698f4" }
+js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "2b64dc6282aac440860224cb4a1a2c791fb698f4" }
+js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "2b64dc6282aac440860224cb4a1a2c791fb698f4" }
 md-5 = "0.11.0"
 # macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
 objc2 = "0.6.5"

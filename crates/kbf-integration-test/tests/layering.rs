@@ -72,9 +72,9 @@
 //!   the check reads the tree of the crate built alone, so the features that its own tests
 //!   turn on do not count); and a walk that cannot see its dependencies, which would make
 //!   that check pass vacuously;
-//! - the state store (`kbf-state`) depending on any other crate of this workspace (with its
-//!   test-database feature, on any but `kbf-testkit`), which would stop it from being
-//!   extracted, and the pack index (`kbf-pack-index`) depending on any but the state store;
+//! - the state store (`kbf-state`, a re-export of `js-state`) depending on any other crate of
+//!   this workspace (with its test-database feature too, which brings `js-testkit` and not
+//!   `kbf-testkit`), which would stop it from being extracted, and the pack index (`kbf-pack-index`) depending on any but the state store;
 //!   each with a walk that cannot see what it should, which would make the check vacuous.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -728,9 +728,10 @@ fn workspace_crates_beyond<'a>(
 }
 
 /// Asserts that the state store (`kbf-state`) links no other crate of this workspace, with
-/// the Postgres backend on, and with its test-database feature on only the test server's
-/// crate (`kbf-testkit`), and that the walk sees its dependencies (it reaches `postgres`), so
-/// the check does not pass on an empty walk. The store is generic: what is specific to a kbf
+/// the Postgres backend on, and with its test-database feature on (which brings the test
+/// server's crate, `js-testkit`, from the jobscheduler repository, and not `kbf-testkit`),
+/// and that the walk sees its dependencies (it reaches `postgres`), so the check does not
+/// pass on an empty walk. The store is generic: what is specific to a kbf
 /// build (the pack index, `kbf-pack-index`) depends on it and never the other way, which is
 /// what lets the store be extracted. Like the `tierstore` check, it reads the tree of the
 /// crate built alone.
@@ -754,10 +755,10 @@ fn the_state_store_links_no_build_specific_crate() {
     );
     let testing = linked_with("kbf-state", "test-database");
     assert!(
-        testing.contains("kbf-testkit"),
+        testing.contains("js-testkit"),
         "test-database must bring the test server's crate: {testing:?}"
     );
-    let violations = workspace_crates_beyond(&g, &testing, &["kbf-state", "kbf-testkit"]);
+    let violations = workspace_crates_beyond(&g, &testing, &["kbf-state"]);
     assert!(
         violations.is_empty(),
         "kbf-state with test-database links another crate of this workspace: {violations:?}"
