@@ -73,6 +73,12 @@ pub(crate) struct Fake {
     pub(crate) files: RefCell<BTreeMap<String, Vec<u8>>>,
     /// The path whose removal fails.
     pub(crate) remove_fails: Option<String>,
+    /// What the host answers to every question (the prime question).
+    pub(crate) answer: RefCell<Result<String, SendError>>,
+    /// Answers given before `answer`, one per question.
+    pub(crate) early: RefCell<std::collections::VecDeque<Result<String, SendError>>>,
+    /// The questions asked, with the port.
+    pub(crate) asked: RefCell<Vec<(u32, Frame)>>,
     /// The deadline each command was run with, with the command line.
     pub(crate) deadlines: RefCell<Vec<(String, Duration)>>,
 }
@@ -104,6 +110,9 @@ impl Fake {
             streams: RefCell::new(Vec::new()),
             files: RefCell::new(BTreeMap::new()),
             remove_fails: None,
+            answer: RefCell::new(Err(SendError::Unavailable("no host".to_owned()))),
+            early: RefCell::new(std::collections::VecDeque::new()),
+            asked: RefCell::new(Vec::new()),
             deadlines: RefCell::new(Vec::new()),
         }
     }
@@ -242,21 +251,12 @@ impl MkUserHost for Fake {
             .cloned()
             .ok_or_else(|| format!("{path}: no such file"))
     }
-    fn list_dir(&self, path: &str) -> Result<Vec<String>, String> {
-        let prefix = format!("{path}/");
-        let names: Vec<String> = self
-            .files
-            .borrow()
-            .keys()
-            .filter_map(|k| k.strip_prefix(&prefix))
-            .filter(|n| !n.contains('/'))
-            .map(str::to_owned)
-            .collect();
-        if names.is_empty() {
-            Err(format!("{path}: no such directory"))
-        } else {
-            Ok(names)
-        }
+    fn ask(&self, port: u32, frame: &Frame) -> Result<String, SendError> {
+        self.asked.borrow_mut().push((port, frame.clone()));
+        self.early
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or_else(|| self.answer.borrow().clone())
     }
     fn remove_file(&self, path: &str) -> Result<(), String> {
         self.calls.borrow_mut().push(Call::Remove(path.to_owned()));

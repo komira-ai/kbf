@@ -19,9 +19,9 @@
 //!    accept its license, run its first launch and import or add every staged runtime, each
 //!    its own step, then write [`simpaths::PRIMED`] ([`mkuser_prime`]); only when the setup
 //!    staged an Xcode;
-//!    Step 5 runs only in the base's priming boot, which the host marks with
-//!    [`simpaths::PRIME_REQUESTED`] in the share ([`mkuser_prime::look_at_share`]); the daemon
-//!    also runs in every clone's boot, where `sim` does those steps itself;
+//!    Step 5 runs only in the base's priming boot, which the host confirms when the daemon
+//!    asks it over the results channel ([`mkuser_prime::ask_host`]); the daemon also runs in
+//!    every clone's boot, where `sim` does those steps itself;
 //! 6. write [`simpaths::USER_READY`] with the user's name. It needs every step above, so a
 //!    failed import leaves no marker.
 //!
@@ -517,12 +517,12 @@ pub trait MkUserHost {
     /// No connection or reply, or the host refused the frame.
     fn send(&self, port: u32, frame: &Frame) -> Result<(), SendError>;
     fn pause(&self, d: Duration);
-    /// The names in the directory `path`. The share allows listing and nothing else that is
-    /// known to work, so this is how the share is looked at.
+    /// Sends `frame` to the host on `port` and returns the body of its `ack`: the host's
+    /// answer to a question.
     ///
     /// # Errors
-    /// The directory could not be listed (it is not there yet, or not readable).
-    fn list_dir(&self, path: &str) -> Result<Vec<String>, String>;
+    /// No connection or reply, or the host refused the frame.
+    fn ask(&self, port: u32, frame: &Frame) -> Result<String, SendError>;
     /// The regular file `path` of at most `cap` bytes (`staged.json` and the prime's record);
     /// a file that cannot be read means there is no simulator setup to run.
     ///
@@ -559,10 +559,10 @@ pub struct MkUserSummary {
     /// is an error unless it is `done` or `not_needed`. Missing in a summary from an older guest.
     #[serde(default)]
     pub root_setup: Option<mkuser_prime::RootSetup>,
-    /// What the look at the share found ([`mkuser_prime::Share`]): whether the prime request
-    /// was seen.
+    /// What the question to the host got ([`mkuser_prime::Signal`]): whether it said this is
+    /// the priming boot, and if not, why not.
     #[serde(default)]
-    pub share: Option<mkuser_prime::Share>,
+    pub signal: Option<mkuser_prime::Signal>,
 }
 
 /// How the run ended, for the exit status.
@@ -854,7 +854,7 @@ pub fn run(host: &dyn MkUserHost, cfg: &Config, name: &str, log: &mut dyn Write)
         undelivered: Vec::new(),
         note: None,
         root_setup: None,
-        share: None,
+        signal: None,
     };
     if let Err(e) = check_name(name) {
         summary.note = Some(e);
@@ -864,12 +864,12 @@ pub fn run(host: &dyn MkUserHost, cfg: &Config, name: &str, log: &mut dyn Write)
         summary.note = Some("mkuser runs as root".to_owned());
         return end(&mut r, summary, None);
     }
-    let gated = mkuser_prime::gate(host, mkuser_prime::plan_prep(host));
+    let gated = mkuser_prime::gate(host, cfg.port, mkuser_prime::plan_prep(host));
     summary.root_setup = Some(gated.root_setup);
-    summary.share = Some(gated.share);
+    summary.signal = Some(gated.signal);
     if gated.root_setup == mkuser_prime::RootSetup::Skipped {
         summary.note = Some(
-            "the simulator's root setup was not run: the prime request was not seen in the share"
+            "the simulator's root setup was not run: the host did not say this is the priming boot"
                 .to_owned(),
         );
     }
@@ -882,7 +882,7 @@ pub fn run(host: &dyn MkUserHost, cfg: &Config, name: &str, log: &mut dyn Write)
             "{} names {name}: nothing to do{}",
             simpaths::USER_READY,
             if gated.root_setup == mkuser_prime::RootSetup::Skipped {
-                "; the simulator's root setup was not run (no prime request in the share), so `sim` runs it"
+                "; the simulator's root setup was not run (the host did not say this is the priming boot), so `sim` runs it"
             } else {
                 ""
             }

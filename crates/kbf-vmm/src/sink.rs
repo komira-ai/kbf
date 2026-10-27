@@ -47,6 +47,13 @@ pub const MAX_TOTAL_BYTES: u64 = 64 << 20;
 pub const FRAME_DEADLINE: Duration = Duration::from_secs(30);
 /// The longest one read or write on a connection may block.
 pub const READ_TIMEOUT_SECS: libc::time_t = 5;
+/// The name of the frame the guest's `mkuser` sends to ask whether this is the base's priming
+/// boot (`kbf_guest::mkuser_prime::QUESTION`).
+pub const PRIME_QUESTION: &str = "prime-question";
+/// The file `image prime` makes in the results directory (which only the host can write) to
+/// say that this run is the priming one; the answer to the question is `yes` while it is
+/// there and `no` otherwise.
+pub const PRIME_MARKER: &str = ".prime-requested";
 
 /// Whether `name` is safe to make a file name of.
 ///
@@ -176,6 +183,13 @@ impl Results {
             path: path.to_owned(),
             spent: Mutex::new(Spent::default()),
         })
+    }
+
+    /// Whether `image prime` marked this run as the priming one: [`PRIME_MARKER`] is in the
+    /// directory (as a file or anything but a link followed).
+    #[must_use]
+    pub fn prime_requested(&self) -> bool {
+        open_at(self.dir.as_raw_fd(), PRIME_MARKER, libc::O_RDONLY).is_ok()
     }
 
     /// The directory's path, for messages.
@@ -391,27 +405,41 @@ fn serve_within<S: Read + Write>(
                 return served;
             }
         };
-        let reply = match results.store(&frame) {
-            Ok(path) => {
-                let _ = writeln!(
-                    log,
-                    "kbf-vmm: vsock {:?} {} -> {} ({} bytes)",
-                    frame.kind,
-                    frame.name,
-                    path.display(),
-                    frame.body.len()
-                );
-                served.stored += 1;
-                Frame::new(Kind::Ack, &frame.name, "")
-            }
-            Err(why) => {
-                let _ = writeln!(
-                    log,
-                    "kbf-vmm: vsock {:?} {:?} refused: {why}",
-                    frame.kind, frame.name
-                );
-                served.refused += 1;
-                Frame::new(Kind::Refused, &frame.name, &why)
+        // The prime question is answered and not stored: the answer is `yes` only for the
+        // run `image prime` marked, so that no other host (a probe, an older `kbf-vmm`, which
+        // acknowledge it without a body) is ever taken for the priming one.
+        let asked = frame.kind == Kind::Result && frame.name == PRIME_QUESTION;
+        let reply = if asked {
+            let answer = if results.prime_requested() {
+                "yes"
+            } else {
+                "no"
+            };
+            let _ = writeln!(log, "kbf-vmm: vsock prime question -> {answer}");
+            Frame::new(Kind::Ack, &frame.name, answer)
+        } else {
+            match results.store(&frame) {
+                Ok(path) => {
+                    let _ = writeln!(
+                        log,
+                        "kbf-vmm: vsock {:?} {} -> {} ({} bytes)",
+                        frame.kind,
+                        frame.name,
+                        path.display(),
+                        frame.body.len()
+                    );
+                    served.stored += 1;
+                    Frame::new(Kind::Ack, &frame.name, "")
+                }
+                Err(why) => {
+                    let _ = writeln!(
+                        log,
+                        "kbf-vmm: vsock {:?} {:?} refused: {why}",
+                        frame.kind, frame.name
+                    );
+                    served.refused += 1;
+                    Frame::new(Kind::Refused, &frame.name, &why)
+                }
             }
         };
         if write_frame(stream, &reply).is_err() {
@@ -1070,5 +1098,53 @@ mod tests {
         assert!(clone.try_acquire().is_none());
         drop((b, c));
         assert!(Limiter::new(0).try_acquire().is_none());
+    }
+
+    /// Catches the prime question being stored as a file (it would count against the budget
+    /// and look like a step frame), answered yes to a run `image prime` did not mark, answered
+    /// no to one it did, or the marker honoured when it is a link; and the other frames of the
+    /// connection being disturbed by it.
+    #[test]
+    fn the_prime_question_is_answered_from_the_marker_and_never_stored() {
+        let ask = |name: &str, marker: &dyn Fn(&Path)| {
+            let d = dir(name);
+            let (path, r) = open(&d);
+            marker(&path);
+            let mut pipe = Pipe::with(&[
+                Frame::new(Kind::Result, PRIME_QUESTION, ""),
+                Frame::new(Kind::Ready, "ready-login", "{}"),
+            ]);
+            let served = serve(&mut pipe, &r, &mut Vec::new());
+            assert_eq!(
+                served,
+                Served {
+                    stored: 1,
+                    refused: 0,
+                    end: End::Closed
+                }
+            );
+            let replies = pipe.replies();
+            assert_eq!(replies[1], Frame::new(Kind::Ack, "ready-login", ""));
+            assert!(!path.join(PRIME_QUESTION).exists());
+            replies[0].clone()
+        };
+        let yes = ask("prime-yes", &|p| {
+            std::fs::write(p.join(PRIME_MARKER), "").expect("marker")
+        });
+        assert_eq!(yes, Frame::new(Kind::Ack, PRIME_QUESTION, "yes"));
+        let no = ask("prime-no", &|_| ());
+        assert_eq!(no, Frame::new(Kind::Ack, PRIME_QUESTION, "no"));
+        let link = ask("prime-link", &|p| {
+            std::os::unix::fs::symlink("/etc/hosts", p.join(PRIME_MARKER)).expect("link");
+        });
+        assert_eq!(link.body, "no");
+        // Only a result frame by that name is the question: a log or a ready frame is stored.
+        let d = dir("prime-question-kind");
+        let (path, r) = open(&d);
+        std::fs::write(path.join(PRIME_MARKER), "").expect("marker");
+        let mut pipe = Pipe::with(&[Frame::new(Kind::Ready, PRIME_QUESTION, "{}")]);
+        serve(&mut pipe, &r, &mut Vec::new());
+        assert_eq!(pipe.replies()[0].body, "");
+        assert!(path.join(PRIME_QUESTION).exists());
     }
 }

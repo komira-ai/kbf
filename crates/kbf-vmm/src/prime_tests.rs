@@ -19,7 +19,7 @@ use crate::probe::Ctx;
 use crate::report::Status as ReportStatus;
 use crate::spec::Event;
 use crate::system::Poll;
-use kbf_guest::mkuser_prime::{RootSetup, Share};
+use kbf_guest::mkuser_prime::{RootSetup, Signal};
 
 const LONG: std::time::Duration = std::time::Duration::from_secs(30);
 const SHORT: std::time::Duration = std::time::Duration::from_millis(40);
@@ -66,7 +66,7 @@ fn summary(ok: bool, already_ready: bool, n: usize) -> (String, String) {
         already_ready,
         n,
         Some(RootSetup::Done),
-        Some(Share::Requested),
+        Some(Signal::Yes),
     )
 }
 
@@ -75,7 +75,7 @@ fn summary_root(
     already_ready: bool,
     n: usize,
     root_setup: Option<RootSetup>,
-    share: Option<Share>,
+    signal: Option<Signal>,
 ) -> (String, String) {
     let s = MkUserSummary {
         complete: true,
@@ -92,7 +92,7 @@ fn summary_root(
         undelivered: Vec::new(),
         note: (!ok).then(|| "a step failed".to_owned()),
         root_setup,
-        share,
+        signal,
     };
     (
         SUMMARY_NAME.to_owned(),
@@ -863,32 +863,30 @@ fn without_a_log_audit_frame_the_report_says_none_arrived_and_a_bad_one_is_liste
     );
 }
 
-/// Catches the priming boot not asking for the root setup (the guest then leaves it to `sim`
-/// on every clone), a request in any other name than the one the guest looks for, and the
-/// guest's and the host's paths for the share drifting apart.
+/// Catches the priming boot not being marked for the sink to answer yes to (the guest then
+/// leaves the root setup to `sim` on every clone), a mark in the guest's reach (the share), a
+/// mark left behind in the base afterwards, and the guest's and the sink's names for the
+/// question drifting apart.
 #[test]
-fn the_priming_boot_asks_for_the_root_setup_in_the_share() {
+fn the_priming_boot_is_marked_in_the_results_directory_and_the_mark_is_withdrawn() {
     let work = work_with_base("prime-request");
     let sys = FakeSystem::new();
     sys.script(powering_off(&all_ok()));
     let r = prime(&prime_ctx(&sys, &work), LONG);
     assert_eq!(r.status, ReportStatus::Ok, "{r:?}");
-    let seen = sys.share_at_start.borrow();
+    let seen = sys.results_at_start.borrow();
     assert_eq!(seen.len(), 1);
     assert!(
-        seen[0].contains(&"prime-requested".to_owned()),
+        seen[0].contains(&crate::sink::PRIME_MARKER.to_owned()),
         "{:?}",
         seen[0]
     );
-    assert!(seen[0].contains(&"results".to_owned()), "{:?}", seen[0]);
+    assert!(!results(&work).join(crate::sink::PRIME_MARKER).exists());
     assert_eq!(
-        kbf_guest::simpaths::PRIME_REQUESTED,
-        format!("{}/prime-requested", crate::guest::GUEST_MOUNT)
+        crate::sink::PRIME_QUESTION,
+        kbf_guest::mkuser_prime::QUESTION
     );
-    assert_eq!(
-        kbf_guest::simpaths::SHARE_RESULTS,
-        crate::guest::GUEST_RESULTS
-    );
+    assert_eq!(kbf_guest::mkuser_prime::ANSWER_YES, "yes");
 }
 
 /// Catches a guest step allowed to run longer than the host waits for the whole priming
@@ -908,38 +906,45 @@ fn no_guest_step_may_outlast_the_default_deadline() {
     }
 }
 
-/// Catches a priming boot that never saw the request being reported as a success: the guest
+/// Catches a priming boot that never got a yes being reported as a success: the guest
 /// then ran no root setup and wrote no record, every clone pays for it, and the base looks
 /// primed. A summary that says the setup was skipped, or says nothing (an older guest), is an
-/// error naming the request; one that says done, or that nothing was staged, is a success.
+/// error naming the question; one that says done, or that nothing was staged, is a success.
 #[test]
-fn a_prime_whose_guest_did_not_see_the_request_is_an_error() {
+fn a_prime_whose_guest_got_no_yes_is_an_error() {
     let ids = plan("kbfuser", false).len();
-    let run_with = |root: Option<RootSetup>, share: Option<Share>| {
+    let run_with = |root: Option<RootSetup>, signal: Option<Signal>| {
         let work = work_with_base("prime-unseen");
         let sys = FakeSystem::new();
         let mut frames = all_ok();
         frames.pop();
-        frames.push(summary_root(true, false, ids, root, share));
+        frames.push(summary_root(true, false, ids, root, signal));
         sys.script(powering_off(&frames));
         prime(&prime_ctx(&sys, &work), LONG)
     };
-    for (root, share) in [
-        (Some(RootSetup::Skipped), Some(Share::NoRequest)),
-        (Some(RootSetup::Skipped), Some(Share::NotListed)),
+    for (root, signal) in [
+        (Some(RootSetup::Skipped), Some(Signal::No)),
+        (
+            Some(RootSetup::Skipped),
+            Some(Signal::NoAnswer("x".to_owned())),
+        ),
+        (
+            Some(RootSetup::Skipped),
+            Some(Signal::Refused("no".to_owned())),
+        ),
         (None, None),
     ] {
-        let r = run_with(root, share);
+        let r = run_with(root, signal);
         assert_eq!(r.status, ReportStatus::Error, "{root:?}");
         let why = r.reason.expect("reason");
-        assert!(why.contains("did not see the prime request"), "{why}");
+        assert!(why.contains("did not get a yes"), "{why}");
         assert!(
-            why.contains("root_setup:") && why.contains("share:"),
+            why.contains("root_setup:") && why.contains("signal:"),
             "{why}"
         );
     }
     for root in [RootSetup::Done, RootSetup::NotNeeded] {
-        let r = run_with(Some(root), Some(Share::Requested));
+        let r = run_with(Some(root), Some(Signal::Yes));
         assert_eq!(r.status, ReportStatus::Ok, "{root:?} {r:?}");
     }
     // An already-ready base that did not see the request is no better.
@@ -948,22 +953,8 @@ fn a_prime_whose_guest_did_not_see_the_request_is_an_error() {
     sys.script(
         Script::booted()
             .with_guest_file(
-                &summary_root(
-                    true,
-                    true,
-                    0,
-                    Some(RootSetup::Skipped),
-                    Some(Share::NoRequest),
-                )
-                .0,
-                &summary_root(
-                    true,
-                    true,
-                    0,
-                    Some(RootSetup::Skipped),
-                    Some(Share::NoRequest),
-                )
-                .1,
+                &summary_root(true, true, 0, Some(RootSetup::Skipped), Some(Signal::No)).0,
+                &summary_root(true, true, 0, Some(RootSetup::Skipped), Some(Signal::No)).1,
             )
             .then(Poll::Event(Event::Stopped { ms: 50 })),
     );

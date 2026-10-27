@@ -719,20 +719,23 @@ password in it; zero in both, with status `ok`, means this run's log hour does n
 #### The simulator's root setup, once per base
 
 The `com.kbf.mkuser` daemon runs in every boot of the base's disk, so every clone's too, and
-nothing on the disk tells the two apart. `image prime` therefore puts an empty file,
-`prime-requested`, in the share of its boot (the share is the host's; a clone's has none), and
-the daemon runs the root setup, and powers off after it, only when it finds that file at
-`/private/var/kbf-mnt/prime-requested`. The share allows listing and, measured in a macOS 27
-guest, not reading or writing, so the daemon lists `/private/var/kbf-mnt` and looks for the
-names `results` (the share is mounted) and `prime-requested` (this is the priming boot); a
-listing that fails is "not mounted yet", and it looks at most 40 times, 3 s apart. In any other
-boot a ready user is left alone whatever the record says: no command, no power-off, and a
-summary that says `sim` runs the steps. The summary carries `root_setup` (`done`, `not_needed`
-when no Xcode was staged, or `skipped`) and `share` (`not_checked`, `not_listed`, `no_request`,
-`requested`). Because the host asked for the setup, `image prime` is an error unless
-`root_setup` is `done` or `not_needed`: a `skipped` or missing one (a guest binary older than
-this) reports that the guest did not see the prime request, instead of a success that left the
-base unprimed. A base primed before this existed therefore still works on clones, with `sim`
+nothing on the disk tells the two apart. The daemon therefore asks the host, over the results
+channel (vsock port 5000, the one every probe result travels on; reading or listing the share
+was not reliable in a real guest), whether this is the priming boot: it sends a `result` frame
+named `prime-question` and the host's `ack` carries the answer in its body. Only `image prime`
+answers `yes`: its results listener says yes while the run's results directory (which only the
+host can write) holds a marker file that `prime` makes before the start and removes after the
+stop; every other host (a probe run, an older `kbf-vmm`) acknowledges the question without
+saying yes, and the daemon takes anything but `yes` for no. A host that is not listening yet is
+tried again, at most 20 times, 3 s apart; a refusal is final. The daemon runs the root setup,
+and powers off after it, only on a yes. In any other boot a ready user is left alone whatever
+the record says: no command, no power-off, and a summary that says `sim` runs the steps. The
+summary carries `root_setup` (`done`, `not_needed` when no Xcode was staged, or `skipped`) and
+`signal` (`not_checked`, `yes`, `no`, `{"refused": "<why>"}`, or `{"no_answer": "<last error>"}`)
+so that a failure can be diagnosed. Because the host asked for the setup, `image prime` is an
+error unless `root_setup` is `done` or `not_needed`: a `skipped` or missing one (a guest binary
+older than this) reports that the host got no yes to the question, instead of a success that
+left the base unprimed. A base primed before this existed therefore still works on clones, with `sim`
 doing the root steps itself, until `image prime` is run on it again.
 
 Every clone of a primed base used to spend about 74 s in the first root steps of

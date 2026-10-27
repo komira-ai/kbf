@@ -24,6 +24,9 @@
 //! steps alone, then powers off ([`crate::mkuser`]).
 
 use serde::{Deserialize, Serialize};
+
+use crate::frame::{Frame, Kind, SendError};
+
 use serde_json::Value;
 
 use crate::mkuser::{Config, MkUserHost};
@@ -77,24 +80,29 @@ impl Prep {
     }
 }
 
-/// How many times, and how far apart, [`gate`] looks for the share before it concludes that
-/// there is none.
-pub const SHARE_POLLS: u32 = 40;
-pub const SHARE_PAUSE: std::time::Duration = std::time::Duration::from_secs(3);
+/// How many times, and how far apart, [`ask_host`] tries to reach the host before it
+/// concludes that there is no answer.
+pub const ASK_ATTEMPTS: u32 = 20;
+pub const ASK_PAUSE: std::time::Duration = std::time::Duration::from_secs(3);
+/// The name of the frame that asks the host whether this boot is the priming one.
+pub const QUESTION: &str = "prime-question";
+/// The body of the host's `ack` that says it is. Anything else says it is not.
+pub const ANSWER_YES: &str = "yes";
 
-/// What the boot's look at the share found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// What the question to the host got, as the summary reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Share {
-    /// Not looked at: the setup staged no Xcode, so there was nothing to ask for.
+pub enum Signal {
+    /// Not asked: the setup staged no Xcode, so there was nothing to ask for.
     NotChecked,
-    /// The directory never listed `results` within the wait (not mounted, or unreadable).
-    NotListed,
-    /// The share is mounted and lists no prime request: a clone's boot, or a priming boot
-    /// whose request did not arrive.
-    NoRequest,
-    /// The share is mounted and lists the prime request.
-    Requested,
+    /// The host answered yes: this is the base's priming boot.
+    Yes,
+    /// The host answered, and not yes (any other host, a clone's boot, an older host).
+    No,
+    /// The host read the question and refused it, with this reason.
+    Refused(String),
+    /// No connection or reply in [`ASK_ATTEMPTS`] tries; the text is the last error.
+    NoAnswer(String),
 }
 
 /// What became of the simulator's root setup in this run.
@@ -106,32 +114,33 @@ pub enum RootSetup {
     Done,
     /// The setup staged no Xcode: nothing to do.
     NotNeeded,
-    /// Steps were left to do and not run, because the prime request was not seen. A priming
-    /// boot that ends so did not do what the host asked.
+    /// Steps were left to do and not run, because the host did not say this is the priming
+    /// boot. A priming boot that ends so did not do what the host asked.
     Skipped,
 }
 
-/// Looks at the share: [`simpaths::SHARE_DIR`] lists `results` once it is mounted, and
-/// [`simpaths::PRIME_REQUEST_NAME`] when this is the base's priming boot. The disk is the same
-/// in the base and in every clone, so nothing on it can tell them apart; the share is the
-/// host's, and only `image prime` adds the file. The directory is listed, not stat-ed or read:
-/// listing is what the share allows in a guest. The share is mounted a little after boot, so
-/// this waits (at most [`SHARE_POLLS`] looks) for the listing; a listing that never comes is
-/// [`Share::NotListed`].
-pub fn look_at_share(host: &dyn MkUserHost) -> Share {
-    for _ in 0..SHARE_POLLS {
-        if let Ok(names) = host.list_dir(simpaths::SHARE_DIR)
-            && names.iter().any(|n| n == simpaths::RESULTS_NAME)
-        {
-            return if names.iter().any(|n| n == simpaths::PRIME_REQUEST_NAME) {
-                Share::Requested
-            } else {
-                Share::NoRequest
-            };
+/// Asks the host, over the results channel (vsock `port`), whether this is the base's priming
+/// boot. The disk is the same in the base and in every clone, so nothing on it can tell them
+/// apart; only `image prime` answers yes, and a host that does not know the question (a probe
+/// run, an older `kbf-vmm`) acknowledges it without saying yes. The channel is the one thing
+/// measured to work in every guest boot, where reading the share is not. The host may not be
+/// listening yet, so a failed try is repeated, at most [`ASK_ATTEMPTS`] times, [`ASK_PAUSE`]
+/// apart; a refusal is final.
+pub fn ask_host(host: &dyn MkUserHost, port: u32) -> Signal {
+    let question = Frame::new(Kind::Result, QUESTION, "");
+    let mut last = String::new();
+    for attempt in 1..=ASK_ATTEMPTS {
+        match host.ask(port, &question) {
+            Ok(a) if a == ANSWER_YES => return Signal::Yes,
+            Ok(_) => return Signal::No,
+            Err(SendError::Refused(why)) => return Signal::Refused(why),
+            Err(e) => last = e.to_string(),
         }
-        host.pause(SHARE_PAUSE);
+        if attempt < ASK_ATTEMPTS {
+            host.pause(ASK_PAUSE);
+        }
     }
-    Share::NotListed
+    Signal::NoAnswer(last)
 }
 
 /// The root setup as this boot is to do it.
@@ -142,24 +151,24 @@ pub struct Gated {
     /// runs the ones the record does not cover), never `mkuser`'s: it would race `sim` and
     /// power the clone off mid-probe.
     pub prep: Prep,
-    pub share: Share,
+    pub signal: Signal,
     pub root_setup: RootSetup,
 }
 
-/// Decides, from the share, whether `prep` runs in this boot.
-pub fn gate(host: &dyn MkUserHost, prep: Prep) -> Gated {
+/// Decides, from the host's answer, whether `prep` runs in this boot.
+pub fn gate(host: &dyn MkUserHost, port: u32, prep: Prep) -> Gated {
     if prep.steps.is_empty() {
         return Gated {
             prep,
-            share: Share::NotChecked,
+            signal: Signal::NotChecked,
             root_setup: RootSetup::NotNeeded,
         };
     }
-    let share = look_at_share(host);
-    if share == Share::Requested {
+    let signal = ask_host(host, port);
+    if signal == Signal::Yes {
         return Gated {
             prep,
-            share,
+            signal,
             root_setup: RootSetup::Done,
         };
     }
@@ -170,7 +179,7 @@ pub fn gate(host: &dyn MkUserHost, prep: Prep) -> Gated {
     };
     Gated {
         prep: Prep::default(),
-        share,
+        signal,
         root_setup,
     }
 }

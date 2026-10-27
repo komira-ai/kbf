@@ -7,7 +7,8 @@
 use serde_json::{Value, json};
 
 use super::*;
-use crate::mkuser_prime::{Prep, RootSetup, Share, plan_prep};
+use crate::frame::{Frame, Kind, SendError};
+use crate::mkuser_prime::{ASK_ATTEMPTS, Prep, QUESTION, RootSetup, Signal, plan_prep};
 use crate::sim_primed::{SKIPPED_NOTE, parse_staged, record_json};
 
 pub(crate) const DMG: &str = "iOS_27.dmg";
@@ -77,8 +78,8 @@ pub(crate) fn identity() -> String {
     hex::encode(VERSION_PLIST)
 }
 
-/// A fake guest booted as a clone is: the share is mounted without the prime request, and
-/// the setup staged `staged`.
+/// A fake guest booted as a clone is: the host answers the prime question with no, and the
+/// setup staged `staged`.
 pub(crate) fn clone_staged(staged: &str) -> Fake {
     let host = Fake::new();
     let mut files = host.files.borrow_mut();
@@ -87,17 +88,15 @@ pub(crate) fn clone_staged(staged: &str) -> Fake {
         simpaths::XCODE_VERSION_PLIST.to_owned(),
         VERSION_PLIST.to_vec(),
     );
-    files.insert(simpaths::SHARE_RESULTS.to_owned(), Vec::new());
     drop(files);
+    *host.answer.borrow_mut() = Ok("no".to_owned());
     host
 }
 
-/// A fake guest in the base's priming boot: as [`clone_staged`], with the prime request.
+/// A fake guest in the base's priming boot: as [`clone_staged`], with the host saying yes.
 pub(crate) fn host_staged(staged: &str) -> Fake {
     let host = clone_staged(staged);
-    host.files
-        .borrow_mut()
-        .insert(simpaths::PRIME_REQUESTED.to_owned(), Vec::new());
+    *host.answer.borrow_mut() = Ok("yes".to_owned());
     host
 }
 
@@ -533,7 +532,7 @@ fn the_worst_case_fits_the_hosts_file_budget() {
 
 /// Catches a clone's boot running the root setup and powering the clone off under the probe:
 /// the disk is the base's, so a ready user with a missing or stale record looks the same in
-/// a clone and in the base; only the prime request in the share says which boot this is. A
+/// a clone and in the base; only the host's answer to the prime question says which boot this is. A
 /// boot without it does nothing, whatever the record says: no command, no write, no
 /// power-off, no password, and a summary that says `sim` will run the steps.
 #[test]
@@ -558,7 +557,7 @@ fn a_clone_boot_never_runs_the_root_setup_or_powers_off() {
         assert_eq!(done.power_off_started, None);
         assert!(host.commands().is_empty() && host.writes().is_empty());
         assert!(host.step_frames().is_empty());
-        assert_eq!(host.pauses.get(), 0, "the share was mounted already");
+        assert_eq!(host.pauses.get(), 0, "the host answered at once");
     }
     // The record that does not match (no version.plist now) says `sim` runs the steps.
     let mut host = clone_staged(&staged_both());
@@ -573,10 +572,9 @@ fn a_clone_boot_never_runs_the_root_setup_or_powers_off() {
 }
 
 /// Catches a clone boot of a base that is not ready yet being given the root steps too (the
-/// account is made as before this existed, and nothing else), and a share that is not mounted
-/// being waited for without a bound or taken for the priming boot.
+/// account is made as before this existed, and nothing else).
 #[test]
-fn without_the_prime_request_only_the_account_steps_run_and_a_missing_share_is_waited_for_once() {
+fn without_a_yes_only_the_account_steps_run() {
     let host = clone_staged(&staged_both());
     go(&host);
     assert_eq!(
@@ -588,12 +586,6 @@ fn without_the_prime_request_only_the_account_steps_run_and_a_missing_share_is_w
     );
     assert!(prep_commands(&host).is_empty());
     assert!(host.writes().iter().all(|w| w.0 != simpaths::PRIMED));
-
-    let host = host_staged(&staged_both());
-    host.files.borrow_mut().remove(simpaths::SHARE_RESULTS);
-    go(&host);
-    assert!(prep_commands(&host).is_empty());
-    assert_eq!(host.pauses.get(), crate::mkuser_prime::SHARE_POLLS);
 }
 
 /// Catches an Xcode taken for the primed one on tree sizes alone: the record keeps the
@@ -610,58 +602,71 @@ fn the_record_keeps_the_xcode_identity_and_none_when_it_cannot_be_read() {
     assert_eq!(record["xcode_identity"], Value::Null);
 }
 
-/// Catches the summary hiding what the boot saw, which `image prime` needs to refuse a
-/// priming boot that did not do the setup it asked for: each way of ending says whether the
-/// share listed, whether the request was in it, and what became of the root setup.
+/// Catches the summary hiding what the question to the host got, which `image prime` needs
+/// to refuse a priming boot that did not do the setup it asked for, and which a person needs
+/// to see why: each answer path says what the signal was and what became of the root setup.
 #[test]
-fn the_summary_says_what_the_share_showed_and_what_became_of_the_root_setup() {
+fn the_summary_says_what_the_host_answered_and_what_became_of_the_root_setup() {
     let seen = |host: &Fake| {
         let s = go(host).summary;
-        (s.root_setup, s.share, s.ok)
+        (s.root_setup, s.signal, s.ok)
     };
-    // The priming boot: asked for, done.
+    let with = |answer: Result<String, SendError>| {
+        let host = clone_staged(&staged_both());
+        *host.answer.borrow_mut() = answer;
+        host
+    };
+    // The priming boot: the host says yes, the steps run.
     assert_eq!(
         seen(&host_staged(&staged_both())),
-        (Some(RootSetup::Done), Some(Share::Requested), true)
+        (Some(RootSetup::Done), Some(Signal::Yes), true)
     );
-    // No Xcode staged: nothing to ask for, so the share is not even looked at (no wait).
+    // No Xcode staged: nothing to ask for, so the host is not asked.
     let host = host_staged(&staged_json(&Value::Null, &[]));
     assert_eq!(
         seen(&host),
-        (Some(RootSetup::NotNeeded), Some(Share::NotChecked), true)
+        (Some(RootSetup::NotNeeded), Some(Signal::NotChecked), true)
     );
+    assert!(host.asked.borrow().is_empty());
     assert_eq!(host.pauses.get(), 0);
-    // A boot whose share lacks the request: the setup was left undone, and the run says so
-    // (the account is made, `ok`, and the summary is what `image prime` refuses).
+    // The host answers, and not yes: no (a clone's boot, another host).
     let host = clone_staged(&staged_both());
     assert_eq!(
         seen(&host),
-        (Some(RootSetup::Skipped), Some(Share::NoRequest), true)
+        (Some(RootSetup::Skipped), Some(Signal::No), true)
     );
     assert!(
         go(&host)
             .summary
             .note
-            .is_some_and(|n| n.contains("prime request was not seen"))
+            .is_some_and(|n| n.contains("did not say this is the priming boot"))
     );
-    // A share that never lists.
-    let host = host_staged(&staged_both());
-    host.files.borrow_mut().remove(simpaths::SHARE_RESULTS);
+    // The host refuses the question: final, no retry, the reason kept.
+    let host = with(Err(SendError::Refused("not a priming host".to_owned())));
     assert_eq!(
         seen(&host),
-        (Some(RootSetup::Skipped), Some(Share::NotListed), true)
+        (
+            Some(RootSetup::Skipped),
+            Some(Signal::Refused("not a priming host".to_owned())),
+            true
+        )
     );
-    // A share that cannot be listed at all (not mounted yet): the same, after the wait.
-    let host = host_staged(&staged_both());
-    for key in [simpaths::SHARE_RESULTS, simpaths::PRIME_REQUESTED] {
-        host.files.borrow_mut().remove(key);
-    }
+    assert_eq!(host.asked.borrow().len(), 1);
+    // No answer at all: every attempt is made, apart, and the last error is kept.
+    let host = with(Err(SendError::Unavailable(
+        "connect failed: errno 61".to_owned(),
+    )));
     assert_eq!(
         seen(&host),
-        (Some(RootSetup::Skipped), Some(Share::NotListed), true)
+        (
+            Some(RootSetup::Skipped),
+            Some(Signal::NoAnswer("connect failed: errno 61".to_owned())),
+            true
+        )
     );
-    assert_eq!(host.pauses.get(), crate::mkuser_prime::SHARE_POLLS);
-    // A clone of a base that is primed already has nothing left: done, whatever the share.
+    assert_eq!(host.asked.borrow().len(), ASK_ATTEMPTS as usize);
+    assert_eq!(host.pauses.get(), ASK_ATTEMPTS - 1);
+    // A clone of a base that is primed already has nothing left: done, whatever the host says.
     let first = host_staged(&staged_both());
     go(&first);
     let host = clone_staged(&staged_both());
@@ -669,10 +674,53 @@ fn the_summary_says_what_the_share_showed_and_what_became_of_the_root_setup() {
         simpaths::PRIMED.to_owned(),
         first.files.borrow()[simpaths::PRIMED].clone(),
     );
-    assert_eq!(
-        seen(&host),
-        (Some(RootSetup::Done), Some(Share::NoRequest), true)
-    );
+    assert_eq!(seen(&host), (Some(RootSetup::Done), Some(Signal::No), true));
+}
+
+/// Catches the question going to the wrong port or with the wrong frame (the host's sink
+/// answers it by kind and name), and a host that is reached late: the first tries fail, a
+/// later one answers yes, and the steps run.
+#[test]
+fn the_question_is_one_result_frame_on_the_results_port_and_is_retried_until_answered() {
+    let host = host_staged(&staged_both());
+    go(&host);
+    let asked = host.asked.borrow();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].0, 5000);
+    assert_eq!(asked[0].1, Frame::new(Kind::Result, QUESTION, ""));
+    assert_eq!(QUESTION, "prime-question");
+    drop(asked);
+
+    // The host is not listening yet for two tries, then says yes.
+    let host = host_staged(&staged_both());
+    for _ in 0..2 {
+        host.early
+            .borrow_mut()
+            .push_back(Err(SendError::Unavailable("connect failed".to_owned())));
+    }
+    let done = go(&host);
+    assert!(done.summary.ok);
+    assert_eq!(done.summary.signal, Some(Signal::Yes));
+    assert_eq!(host.asked.borrow().len(), 3);
+    assert_eq!(host.pauses.get(), 2);
+    assert_eq!(prep_commands(&host), root_commands());
+}
+
+/// Catches only the exact answer being a yes: anything else the host says (an older host
+/// acknowledges with no body) is a no.
+#[test]
+fn only_the_exact_word_yes_is_a_yes() {
+    for body in ["", "Yes", "yes ", "no", "yes!", "true"] {
+        let host = clone_staged(&staged_both());
+        *host.answer.borrow_mut() = Ok(body.to_owned());
+        let s = go(&host).summary;
+        assert_eq!(
+            (s.signal, s.root_setup),
+            (Some(Signal::No), Some(RootSetup::Skipped)),
+            "{body:?}"
+        );
+        assert!(prep_commands(&host).is_empty(), "{body:?}");
+    }
 }
 
 /// Catches an older guest's summary (no such fields) failing to read: the fields are absent
@@ -692,33 +740,7 @@ fn a_summary_without_the_new_fields_still_reads_and_says_nothing() {
     )
     .expect("json");
     v.as_object_mut().expect("object").remove("root_setup");
-    v.as_object_mut().expect("object").remove("share");
+    v.as_object_mut().expect("object").remove("signal");
     let s: MkUserSummary = serde_json::from_value(v).expect("reads");
-    assert_eq!((s.root_setup, s.share), (None, None));
-}
-
-/// Catches the request being matched by a prefix, a suffix or a part of a name: a share that
-/// lists `results` and only names that merely resemble the request (a backup of it, a longer
-/// name, a shorter one, another case) is a boot without the request, so the setup is skipped.
-#[test]
-fn only_the_exact_name_is_the_prime_request() {
-    for lookalike in [
-        "prime-requested.bak",
-        "prime-requested2",
-        "xprime-requested",
-        "prime-request",
-        "Prime-Requested",
-    ] {
-        let host = clone_staged(&staged_both());
-        host.files
-            .borrow_mut()
-            .insert(format!("{}/{lookalike}", simpaths::SHARE_DIR), Vec::new());
-        let s = go(&host).summary;
-        assert_eq!(
-            (s.share, s.root_setup),
-            (Some(Share::NoRequest), Some(RootSetup::Skipped)),
-            "{lookalike}"
-        );
-        assert!(prep_commands(&host).is_empty(), "{lookalike}");
-    }
+    assert_eq!((s.root_setup, s.signal), (None, None));
 }

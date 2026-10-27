@@ -254,8 +254,8 @@ pub type CloneHook = Box<dyn Fn(&Path)>;
 pub struct FakeSystem {
     pub scripts: RefCell<VecDeque<Script>>,
     pub starts: RefCell<Vec<(VmSpec, Option<u32>)>>,
-    /// The names in the automount directory of each start, taken as the VM starts.
-    pub share_at_start: RefCell<Vec<Vec<String>>>,
+    /// The names in the results directory of each start, taken as the VM starts.
+    pub results_at_start: RefCell<Vec<Vec<String>>>,
     pub start_error: RefCell<Option<String>>,
     pub clone_fails_on: RefCell<Option<&'static str>>,
     /// How many more `clonefile` calls succeed (`None`: all).
@@ -301,7 +301,7 @@ impl FakeSystem {
         Self {
             scripts: RefCell::new(VecDeque::new()),
             starts: RefCell::new(Vec::new()),
-            share_at_start: RefCell::new(Vec::new()),
+            results_at_start: RefCell::new(Vec::new()),
             start_error: RefCell::new(None),
             clone_fails_on: RefCell::new(None),
             clone_budget: Cell::new(None),
@@ -395,8 +395,8 @@ impl System for FakeSystem {
             return Err(e);
         }
         self.starts.borrow_mut().push((spec.clone(), run_as));
-        self.share_at_start.borrow_mut().push(
-            spec.automount_dir
+        self.results_at_start.borrow_mut().push(
+            spec.results_dir
                 .as_deref()
                 .map(crate::e3::names)
                 .unwrap_or_default(),
