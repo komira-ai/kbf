@@ -21,6 +21,7 @@
 //!
 //! Lists are `[a; b; c]`. An absent optional value is `-`.
 
+use crate::NodeId;
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmFault, FarmRun, FarmTime, FencePolicy,
     LeaseId, LeaseKind, LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Refusal, Resources,
@@ -90,6 +91,12 @@ pub fn waiter(waiter: WaiterId) -> String {
 #[must_use]
 pub fn worker(worker: &WorkerId) -> String {
     worker.as_str().to_owned()
+}
+
+/// A simulated node's name, as it is.
+#[must_use]
+pub fn node(node: &NodeId) -> String {
+    node.as_str().to_owned()
 }
 
 /// Resources, every axis named.
@@ -168,15 +175,20 @@ fn memory_run(run: &MemoryRun) -> String {
         MemoryKill::OwnLimit { cap } => format!("own_limit({cap})"),
         MemoryKill::NodePressure => "node_pressure".to_owned(),
     };
-    format!("{}:{}:{kill}", run.worker, run.booked)
+    format!("{}:{}:{kill}", worker(&run.worker), run.booked)
 }
 
 fn farm_run(run: &FarmRun) -> String {
-    format!("{}:{}", run.worker, farm_fault(run.fault))
+    format!("{}:{}", worker(&run.worker), farm_fault(run.fault))
 }
 
-/// A control record. A record kind this function does not know prints as
-/// `unknown-record` (the type is non-exhaustive, so a new kind must be added here).
+/// A control record.
+///
+/// # Panics
+///
+/// On a record kind this function does not know. `ControlRecord` is non-exhaustive, so
+/// the compiler cannot ask for the new arm; the panic does, the first time a trace
+/// carries the kind, instead of two kinds sharing one spelling and one hash.
 #[must_use]
 pub fn record(record: &ControlRecord) -> String {
     match record {
@@ -184,7 +196,7 @@ pub fn record(record: &ControlRecord) -> String {
             "lease({} {} {})",
             lease(g.lease),
             operation(g.operation),
-            g.worker
+            worker(&g.worker)
         ),
         ControlRecord::Result(r) => format!(
             "result({} {} {})",
@@ -195,7 +207,7 @@ pub fn record(record: &ControlRecord) -> String {
         ControlRecord::Refusal(r) => {
             format!("refusal({} {})", operation(r.operation), quoted(&r.reason))
         }
-        _ => "unknown-record".to_owned(),
+        other => panic!("kbf_sim::text::record has no spelling for {other:?}; add one"),
     }
 }
 
@@ -204,7 +216,7 @@ pub fn record(record: &ControlRecord) -> String {
 pub fn start(start: &StartLease) -> String {
     format!(
         "start(worker={} lease={} op={} instance={} action={} kind={} {} fence={} device={})",
-        start.worker,
+        worker(&start.worker),
         lease(start.lease),
         operation(start.operation),
         quoted(&start.key.instance),
@@ -296,6 +308,7 @@ mod tests {
         assert_eq!(operation(OperationId(4)), "op4");
         assert_eq!(waiter(WaiterId(5)), "w5");
         assert_eq!(worker(&w("node-1")), "node-1");
+        assert_eq!(node(&NodeId::from("n-2")), "n-2");
         assert_eq!(time(FarmTime::from_millis(1_500)), "1500");
         assert_eq!(
             resources(&Resources::new(1_000, 2_048)),
