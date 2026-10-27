@@ -174,6 +174,21 @@ pub struct UnknownNode(pub String);
 #[error("the state store could not be read for node {0}, which another frontend holds")]
 pub struct NodeUnread(pub String);
 
+/// An operator action on a node that was not applied.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PlaceError {
+    /// No frontend of the state store has held the node.
+    #[error(transparent)]
+    Unknown(#[from] UnknownNode),
+    /// The store could not say whether another frontend holds the node.
+    #[error(transparent)]
+    Unread(#[from] NodeUnread),
+    /// The store did not take the node's `cordon/` row: the action was not applied here
+    /// either, and the other frontend that holds the node never sees it.
+    #[error("the state store could not be written for node {0}; the action was not applied")]
+    Unwritten(String),
+}
+
 /// What an operator does to a node's placement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeAction {
@@ -830,15 +845,29 @@ impl Farm {
     ///
     /// # Errors
     /// `worker` has never registered with this frontend, and no frontend of the state store
-    /// has claimed it.
-    pub fn place(&self, worker: &WorkerId, action: NodeAction) -> Result<NodeView, UnknownNode> {
+    /// has claimed it; the store cannot say whether one has, and `worker` is not connected
+    /// here; or the store did not take the node's `cordon/` row. In the last two the action is
+    /// not applied here either: the row is written first, and the scheduler follows it.
+    pub fn place(&self, worker: &WorkerId, action: NodeAction) -> Result<NodeView, PlaceError> {
         let now = self.now();
         let mut state = self.lock();
         state.note_closed_streams();
         // A node connected to another frontend of the state store is placed too: its
         // `cordon/` row is the other frontend's to apply (the intake poll).
-        if state.machine.node(worker).is_none() && !state.known_elsewhere(worker) {
-            return Err(UnknownNode(worker.as_str().to_owned()));
+        if state.machine.node(worker).is_none() {
+            match state.known_elsewhere(worker) {
+                Some(true) => {}
+                Some(false) => return Err(UnknownNode(worker.as_str().to_owned()).into()),
+                None => return Err(NodeUnread(worker.as_str().to_owned()).into()),
+            }
+        }
+        // A drain's deadline is written on the store's clock: the frontends that apply the
+        // row have clocks of their own.
+        let written = state.durably("a cordon", |d| {
+            d.cordoned(worker, action.stored(d.store_ms()))
+        });
+        if !written {
+            return Err(PlaceError::Unwritten(worker.as_str().to_owned()));
         }
         let name = worker.clone();
         let event = match action {
@@ -851,11 +880,6 @@ impl Farm {
         };
         tracing::info!(%worker, ?action, "operator action");
         state.feed_quiet(now, event);
-        // A drain's deadline is written on the store's clock: the frontends that apply the
-        // row have clocks of their own.
-        state.durably("a cordon", |d| {
-            d.cordoned(worker, action.stored(d.store_ms()))
-        });
         Ok(self.node(&state, worker))
     }
 

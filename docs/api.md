@@ -351,8 +351,18 @@ An operator takes a node out of placement, drains it, or returns it
 - `:uncordon` (`POST /v1/nodes/{node}:uncordon`): returns the node to placement and ends any drain.
 
 The answer is the node, as `GET /v1/nodes` lists it, after the action. `404` for a
-node that never registered or an unknown verb, `400` for a drain body of another
-shape, and `401`, `403` or `415` from the gates of [Who may write](#who-may-write).
+node that no frontend of the state store has held or an unknown verb, `400` for a drain body of
+another shape, and `401`, `403` or `415` from the gates of [Who may write](#who-may-write).
+
+With a state store, a node connected to another frontend is placed through the row the
+action writes under `cordon/`, which the node's own frontend applies. `503` when the store
+cannot say whether another frontend holds a node that is not connected to the frontend
+answering (never `404`), and when the store does not take the row. In both the action is not
+applied: the row is written first, and the frontend's own scheduler follows it, so a node
+connected to the answering frontend keeps the placement it had. A `503` that follows a write
+the store did take despite the error can leave the row; read the node to see where it stands.
+The same holds for the updater's own-node `:drain` and `:uncordon` below, which a host's
+updater takes as a failed call, not as "no daemon here".
 
 A cordon names the node, not its stream: a node that reconnects (say, after a reboot)
 is still cordoned. Work that only cordoned nodes could run waits, and its callers are

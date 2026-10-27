@@ -612,11 +612,15 @@ impl State {
     }
 
     /// Whether the state store knows `worker`: a frontend has owned it. An operator may
-    /// place a node connected to another frontend through this one.
-    pub(in crate::farm) fn known_elsewhere(&self, worker: &WorkerId) -> bool {
-        let mut known = false;
+    /// place a node connected to another frontend through this one. `None` when the store
+    /// cannot say. A farm with no state store knows no node but its own.
+    pub(in crate::farm) fn known_elsewhere(&self, worker: &WorkerId) -> Option<bool> {
+        if self.durable.is_none() {
+            return Some(false);
+        }
+        let mut known = None;
         self.durably("a node look", |d| {
-            known = d.node_known(worker)?;
+            known = Some(d.node_known(worker)?);
             Ok(())
         });
         known

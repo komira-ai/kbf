@@ -1756,6 +1756,8 @@ mod named_tests;
 #[cfg(test)]
 mod owner_tests;
 #[cfg(test)]
+mod place_tests;
+#[cfg(test)]
 mod reads_tests;
 #[cfg(test)]
 mod results_tests;
