@@ -1335,3 +1335,18 @@ fn a_channel_without_the_new_keys_is_kbfs() {
         ]
     );
 }
+
+/// kbf's own repository is trusted only with its own signer workflow: a channel that names
+/// another workflow of `komira-ai/kbf` is refused when it is used, with no allow-list entry.
+#[test]
+fn another_workflow_of_kbfs_repository_is_refused_at_use() {
+    let fx = Fx::new("mac-gh-kbf-ci");
+    let list = whole_allowlist(
+        &fx,
+        "[channels.stable]\nsource = \"github\"\nrepository = \"komira-ai/kbf\"\nsigner_workflow = \"komira-ai/kbf/.github/workflows/ci.yml\"\n",
+    )
+    .unwrap();
+    let error = list.channel(&fx.host.trust, &stable()).unwrap_err();
+    assert_eq!(error.refusal(), Refusal::ChannelNotAllowed);
+    assert!(error.to_string().contains("ci.yml"), "{error}");
+}
