@@ -301,58 +301,68 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
         || farm::status(&ca_file)["quiet"] == false,
     );
 
-    // The version text the farm is told, from the command gamma uses.
-    let sums_version = run(
-        "farm_version",
-        Command::new(&xtask)
-            .args([
-                "release",
-                "farm-version",
-                "--repo",
-                rehearsal::REPO,
-                "--tag",
-                &r.to.tag,
-                "--commit",
-                new,
-            ])
-            .env("GH_TOKEN", &r.token),
+    // The version text the farm is told of a release, from the command gamma uses, and gamma's
+    // call itself (`--min-up-storage 0`: the rehearsal's farm has one storage host, which the
+    // coordinator never orders at the default of 1).
+    let version_of = |name: &str, tag: &str, commit: &str| -> String {
+        let said = run(
+            name,
+            Command::new(&xtask)
+                .args([
+                    "release",
+                    "farm-version",
+                    "--repo",
+                    rehearsal::REPO,
+                    "--tag",
+                    tag,
+                    "--commit",
+                    commit,
+                ])
+                .env("GH_TOKEN", &r.token),
+        );
+        said.lines()
+            .find_map(|l| l.strip_prefix("version="))
+            .unwrap_or_else(|| panic!("no version= line: {said}"))
+            .to_owned()
+    };
+    let deploy = |name: &str, version: &str| -> String {
+        run(
+            name,
+            Command::new(&xtask)
+                .args(["deploy-farm", "--url", &control_url, "--ca-pem", &ca_pem])
+                .args(["--version", version])
+                .args(["--min-up-storage", "0", "--min-up-frontend", "0"])
+                .args([
+                    "--every-secs",
+                    "5",
+                    "--stall-min",
+                    "15",
+                    "--deadline-min",
+                    "25",
+                ])
+                .env("ACTIONS_ID_TOKEN_REQUEST_URL", issuer.token_url())
+                .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", REQUEST_TOKEN)
+                .env("SSL_CERT_FILE", &trust),
+        )
+    };
+
+    // The farm has a desired version before this release, as the previous release's gamma left
+    // it: the host already runs release N, so the farm is converged at once, on the version
+    // text the host reports.
+    let previous = version_of("farm_version_n", &r.from.tag, old);
+    let settled = deploy("deploy_farm_n", &previous);
+    assert!(
+        settled.contains(&format!("ok: every live host runs {previous}")),
+        "{settled}"
     );
-    let desired = sums_version
-        .lines()
-        .find_map(|l| l.strip_prefix("version="))
-        .unwrap_or_else(|| panic!("no version= line: {sums_version}"))
-        .to_owned();
+
+    // Gamma for this release: tell the coordinator, and wait for the farm to converge.
+    let desired = version_of("farm_version", &r.to.tag, new);
     assert_eq!(
         desired, r.version,
         "farm-version and the version facts agree"
     );
-
-    // Gamma: tell the coordinator, and wait for the farm to converge.
-    let deployed = run(
-        "deploy_farm",
-        Command::new(&xtask)
-            .args([
-                "deploy-farm",
-                "--url",
-                &control_url,
-                "--ca-pem",
-                &ca_pem,
-                "--version",
-                &desired,
-            ])
-            .args(["--min-up-storage", "0", "--min-up-frontend", "0"])
-            .args([
-                "--every-secs",
-                "5",
-                "--stall-min",
-                "15",
-                "--deadline-min",
-                "25",
-            ])
-            .env("ACTIONS_ID_TOKEN_REQUEST_URL", issuer.token_url())
-            .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", REQUEST_TOKEN)
-            .env("SSL_CERT_FILE", &trust),
-    );
+    let deployed = deploy("deploy_farm", &desired);
     assert!(
         deployed.contains("baseline: hosts live before the deploy: storage 1"),
         "{deployed}"
@@ -381,6 +391,19 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
         &mut [&mut frontend, &mut coordinator],
         || members_active_on(new),
     );
+    // The frontend's word to the host's updater, with its certificate alone: the host's storage
+    // is a member, active on N+1, and no blob is owed a copy.
+    let health = farm::storage_health(
+        &updater_files.join("ca.pem"),
+        &updater_files.join("updater.pem"),
+        &updater_files.join("updater.key"),
+    );
+    assert_eq!(health["half"], "member", "{health}");
+    assert_eq!(health["member"]["state"], "active", "{health}");
+    assert_eq!(health["member"]["build_commit"], new.as_str(), "{health}");
+    let owed = &health["storage"]["under_replicated_blobs"];
+    assert!(owed.is_null() || *owed == 0, "{health}");
+    assert_eq!(health["storage"]["members_active"], 1, "{health}");
     assert_eq!(
         rehearsal::restarts(AGENT_UNIT),
         0,

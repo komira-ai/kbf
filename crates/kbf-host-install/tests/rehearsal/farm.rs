@@ -396,3 +396,24 @@ pub fn host_status(ca: &Path) -> Option<Value> {
         .as_array()
         .and_then(|hosts| hosts.iter().find(|h| h["node_id"] == NODE).cloned())
 }
+
+/// What the frontend tells the host's updater of the host's storage, on the worker listener
+/// with the updater's certificate alone and no token: the answer the agent judges the host's
+/// health by.
+pub fn storage_health(ca: &Path, cert: &Path, key: &Path) -> Value {
+    let worker = FRONTEND_WORKER.rsplit(':').next().unwrap();
+    let url = format!("https://localhost:{worker}/v1/nodes/{NODE}/storage-health");
+    let text = run(
+        "storage_health",
+        Command::new("curl")
+            .args(["--silent", "--show-error", "--fail-with-body"])
+            .arg("--cacert")
+            .arg(ca)
+            .arg("--cert")
+            .arg(cert)
+            .arg("--key")
+            .arg(key)
+            .arg(url),
+    );
+    serde_json::from_str(&text).unwrap()
+}
