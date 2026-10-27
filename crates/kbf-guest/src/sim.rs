@@ -14,6 +14,9 @@
 //!    devicetypes output is the fallback when the runtime lists none), `simctl create`, `boot`, `bootstatus -b`, an optional app
 //!    (`install`, `launch`), `simctl io screenshot`, and `simctl shutdown`.
 //!
+//! # Whose session
+//! See [`sim_user`](crate::sim_user): the recorded user, or the console owner.
+//!
 //! # No hang, no guess
 //! Every command has a deadline from [`Config`] and is killed (with its process group) when
 //! it passes; the step is then `timeout`. A step runs only when the steps it needs
@@ -46,6 +49,8 @@ use crate::probe::send_with_retries;
 pub use crate::sim_choose::{
     RuntimeDeviceType, choose_device_type, choose_device_type_for_runtime, choose_runtime,
 };
+pub use crate::sim_user::Wanted;
+use crate::sim_user::{unmet_wish, wait_console_user};
 use crate::simpaths;
 
 /// The prefix of a step frame's name; the host collects the frames by it.
@@ -507,6 +512,10 @@ pub trait SimHost {
     fn app_bundles(&self) -> Vec<String>;
     /// The user logged in at the console, if there is one.
     fn console_user(&self) -> Option<ConsoleUser>;
+    /// The user `kbf-guest mkuser` recorded as ready ([`simpaths::USER_READY`]), if any.
+    fn ready_user(&self) -> Option<String>;
+    /// The user `image setup --guest-user` asked for ([`simpaths::USER_WANTED`]), if any.
+    fn wanted_user(&self) -> Wanted;
     /// Makes [`OUT_DIR`] writable by the console user.
     ///
     /// # Errors
@@ -619,6 +628,9 @@ struct Run<'a> {
     cfg: &'a Config,
     log: &'a mut dyn Write,
     undelivered: Vec<String>,
+    /// The user whose session the user steps need (the one `mkuser` recorded); `None`: the
+    /// console owner, whoever it is.
+    user_name: Option<String>,
 }
 
 impl<'a> Run<'a> {
@@ -628,6 +640,7 @@ impl<'a> Run<'a> {
             cfg,
             log,
             undelivered: Vec::new(),
+            user_name: None,
         }
     }
 
@@ -648,21 +661,6 @@ impl<'a> Run<'a> {
     fn deliver_json(&mut self, name: &str, body: &impl Serialize) -> bool {
         let text = format!("{:#}", serde_json::to_value(body).unwrap_or(Value::Null));
         self.deliver(&Frame::new(Kind::Result, name, &text))
-    }
-}
-
-/// Waits for the console user, counting pauses: `None` when none appeared in time.
-fn wait_console_user(host: &dyn SimHost, wait: Duration) -> Option<ConsoleUser> {
-    let mut waited = Duration::ZERO;
-    loop {
-        if let Some(u) = host.console_user() {
-            return Some(u);
-        }
-        if waited >= wait {
-            return None;
-        }
-        host.pause(CONSOLE_POLL);
-        waited += CONSOLE_POLL;
     }
 }
 
@@ -698,6 +696,14 @@ pub fn run(host: &dyn SimHost, cfg: &Config, log: &mut dyn Write) -> SummaryFram
             Some("sim runs as root".into()),
         );
     }
+    // A guest that is to have a user but has none yet has no session to run the user steps
+    // in: running the root ones would only import the runtimes into the base for nothing.
+    let ready = host.ready_user();
+    // Fails closed: a wish that cannot be read stops the run as a wish that is not met does.
+    if let Some(why) = ready.as_ref().map_or_else(|| unmet_wish(host), |_| None) {
+        return finish(&mut r, &[], &State::default(), None, Some(why));
+    }
+    r.user_name = ready;
     let inputs = Inputs {
         runtimes: host
             .runtime_images()
@@ -823,15 +829,23 @@ fn execute(
     };
     f.argv.clone_from(&argv);
     let command = if step.who == Who::User {
-        let found = user.get_or_insert_with(|| wait_console_user(host, cfg.console_wait));
+        let expected = r.user_name.as_deref();
+        let found = user.get_or_insert_with(|| wait_console_user(host, cfg.console_wait, expected));
         match found {
             Some(u) => as_user(u, &argv),
             None => {
                 f.status = Status::Error;
-                f.note = Some(format!(
-                    "no user was logged in at the console within {} s",
-                    cfg.console_wait.as_secs()
-                ));
+                f.note = Some(match expected {
+                    None => format!(
+                        "no user was logged in at the console within {} s",
+                        cfg.console_wait.as_secs()
+                    ),
+                    Some(name) => format!(
+                        "the user {name} (recorded by mkuser) was not logged in at the console within {} s; the console owner is {}",
+                        cfg.console_wait.as_secs(),
+                        host.console_user().map_or("nobody".to_owned(), |u| u.name)
+                    ),
+                });
                 return;
             }
         }

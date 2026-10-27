@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::sim::{Ended, MAX_CAPTURE_BYTES, Outcome};
+use crate::sim::{Ended, MAX_CAPTURE_BYTES, Outcome, Wanted};
 
 /// How often a running command is looked at.
 pub const POLL: Duration = Duration::from_millis(50);
@@ -204,6 +204,29 @@ fn kill_group(child: &mut Child) {
     unsafe { libc::killpg(pid, libc::SIGKILL) };
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// What the file `path` (the guest's `user-wanted`) says: no file is [`Wanted::No`]; a file
+/// of any other kind or content than a small regular file whose first line is a valid user
+/// name (a link, a directory, a large or unreadable file, a bad name) is
+/// [`Wanted::Unreadable`], never [`Wanted::No`].
+#[must_use]
+pub fn read_wanted(path: &std::path::Path) -> Wanted {
+    if std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        return Wanted::No;
+    }
+    let bytes = match read_regular(path, 256) {
+        Ok(b) => b,
+        Err(e) => return Wanted::Unreadable(e),
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Wanted::Unreadable("not text".to_owned());
+    };
+    let name = text.lines().next().unwrap_or("").trim();
+    match crate::mkuser::check_name(name) {
+        Ok(()) => Wanted::User(name.to_owned()),
+        Err(e) => Wanted::Unreadable(e),
+    }
 }
 
 /// Reads the file at `path` when it is a regular file of at most `cap` bytes; a link, a

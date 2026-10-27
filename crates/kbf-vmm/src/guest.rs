@@ -11,6 +11,7 @@ use std::io::Read;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use kbf_guest::simpaths::USER_WANTED;
 use serde_json::Value;
 
 use crate::probe::{Ctx, Vm};
@@ -523,6 +524,40 @@ pub fn sim_payload() -> Vec<OfflineFile> {
         contents: daemon_plist(SIM_LABEL, None, &args, None, false).into_bytes(),
         mode: 0o644,
     }]
+}
+
+/// The label of the root daemon that creates the guest's user (`kbf-guest mkuser`) in the
+/// boot `image prime` runs. Its log is `/var/log/<label>.log`.
+pub const MKUSER_LABEL: &str = "com.kbf.mkuser";
+
+/// What `image setup --guest-user <name>` writes: the launch daemon that creates the user
+/// once (root, from the guest's own disk, once per boot, nothing restarts it; the guest
+/// powers itself off when it is done) and [`USER_WANTED`], which holds the name and tells the
+/// simulator probe to wait for the user instead of running without one.
+///
+/// # Errors
+/// `name` is not a valid user name.
+pub fn mkuser_payload(name: &str) -> Result<Vec<OfflineFile>, String> {
+    kbf_guest::mkuser::check_name(name)?;
+    let args = guest_args(&[
+        "mkuser",
+        "--name",
+        name,
+        "--vsock-port",
+        &VSOCK_PORT.to_string(),
+    ]);
+    Ok(vec![
+        OfflineFile {
+            path: format!("Library/LaunchDaemons/{MKUSER_LABEL}.plist"),
+            contents: daemon_plist(MKUSER_LABEL, None, &args, None, false).into_bytes(),
+            mode: 0o644,
+        },
+        OfflineFile {
+            path: USER_WANTED.trim_start_matches('/').to_owned(),
+            contents: format!("{name}\n").into_bytes(),
+            mode: 0o644,
+        },
+    ])
 }
 
 /// The reason `image base --offline-setup` and `image setup` give when no guest binary was
