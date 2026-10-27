@@ -282,7 +282,7 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
         &mut [&mut frontend, &mut coordinator],
         || {
             farm::host_status(&ca_file).is_some_and(|h| {
-                h["beat"]["version"]
+                h["version"]
                     .as_str()
                     .is_some_and(|v| v.ends_with(&format!("+g{}", &old[..12])))
             })
@@ -290,8 +290,8 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
     );
     let beat = farm::host_status(&ca_file).unwrap();
     assert_eq!(beat["role"], "storage", "{beat}");
-    assert!(beat["beat"]["updating"].is_null(), "{beat}");
-    assert!(beat["beat"]["last_update"].is_null(), "{beat}");
+    assert!(beat["updating"].is_null(), "{beat}");
+    assert!(beat["last_update"].is_null(), "{beat}");
 
     // The version text the farm is told, from the command gamma uses.
     let sums_version = run(
@@ -356,12 +356,9 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
 
     // The host runs N+1, and the coordinator's word for it is the agent's.
     let done = farm::host_status(&ca_file).unwrap();
-    assert_eq!(done["beat"]["version"], desired.as_str(), "{done}");
-    assert_eq!(
-        done["beat"]["last_update"]["outcome"], "succeeded",
-        "{done}"
-    );
-    assert!(done["beat"]["updating"].is_null(), "{done}");
+    assert_eq!(done["version"], desired.as_str(), "{done}");
+    assert_eq!(done["last_update"]["outcome"], "succeeded", "{done}");
+    assert!(done["updating"].is_null(), "{done}");
     let current = fs::read_link(Path::new(RELEASES).join("current")).unwrap();
     assert_eq!(current, Path::new(new), "the current link");
     let pid = systemctl("kbf_pid", &["show", "-p", "MainPID", "--value", KBF_UNIT]);
