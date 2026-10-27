@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::sim::{Ended, MAX_CAPTURE_BYTES, Outcome, Wanted};
+use crate::sim::{Ended, MAX_CAPTURE_BYTES, Outcome, Streamed, Wanted};
 
 /// How often a running command is looked at.
 pub const POLL: Duration = Duration::from_millis(50);
@@ -180,6 +180,81 @@ impl<C: Clock> ProcessRunner<C> {
             cut: cut_out || cut_err,
             ms,
         }
+    }
+
+    /// Like [`run`](Self::run), but the command's stdout is handed to `sink` as it is read
+    /// and kept nowhere, and its stderr is discarded (never read): for a command whose
+    /// output is large, or must not be kept. `sink` runs on the calling thread. A command
+    /// still running at `deadline` is killed with its process group.
+    pub fn stream(
+        &self,
+        argv: &[String],
+        deadline: Duration,
+        sink: &mut dyn FnMut(&[u8]),
+    ) -> Streamed {
+        let began = self.clock.now_ms();
+        let elapsed = |clock: &C| clock.now_ms().saturating_sub(began);
+        let failed = |why: String, ms: u64| Streamed {
+            ended: Ended::SpawnFailed(why),
+            ms,
+        };
+        let Some((program, args)) = argv.split_first() else {
+            return failed("an empty command".to_owned(), 0);
+        };
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = match command.spawn() {
+            Ok(c) => c,
+            Err(e) => return failed(format!("{program}: {e}"), elapsed(&self.clock)),
+        };
+        // A bounded queue: a reader ahead of the sink waits, so memory stays small.
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(256);
+        let pipe = child.stdout.take();
+        thread::spawn(move || {
+            pipe.into_iter().for_each(|mut r| {
+                let mut buf = [0u8; 16 * 1024];
+                loop {
+                    match r.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if tx.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
+        let ended = loop {
+            let mut busy = false;
+            while let Ok(chunk) = rx.try_recv() {
+                sink(&chunk);
+                busy = true;
+            }
+            match child.try_wait().unwrap_or(None) {
+                Some(status) => break ended_of(status),
+                None if elapsed(&self.clock) >= deadline_ms => {
+                    kill_group(&mut child);
+                    break Ended::TimedOut;
+                }
+                None if busy => {}
+                None => self.clock.sleep(POLL),
+            }
+        };
+        let ms = elapsed(&self.clock);
+        // What is left in the pipe: until it closes, or until nothing comes for [`DRAIN`] (a
+        // daemon the command started can hold the pipe open).
+        while let Ok(chunk) = rx.recv_timeout(DRAIN) {
+            sink(&chunk);
+        }
+        Streamed { ended, ms }
     }
 }
 

@@ -768,3 +768,78 @@ fn the_wait_for_a_requested_shutdown_is_a_flag_with_a_default() {
         .is_err()
     );
 }
+
+fn audit_frame_json(status: &str, exit: Option<i32>, counts: (u64, u64, u64)) -> (String, String) {
+    (
+        kbf_guest::mkuser_audit::AUDIT_NAME.to_owned(),
+        serde_json::json!({
+            "step": "log-audit",
+            "status": status,
+            "exit": exit,
+            "signal": null,
+            "matched_lines": counts.0,
+            "password_hits": counts.1,
+            "window_hits": counts.2,
+        })
+        .to_string(),
+    )
+}
+
+/// Catches a prime report that drops the guest's log-audit counts, reports them from the
+/// wrong fields, counts the audit frame among the steps (it is not one), or lets the audit
+/// change the verdict: the same run with a failed audit is still ok, and the counts and the
+/// audit's own status are reported as they came.
+#[test]
+fn the_log_audit_counts_are_reported_and_do_not_change_the_verdict() {
+    for (status, exit, counts) in [("ok", Some(0), (4, 2, 3)), ("failed", Some(64), (0, 0, 0))] {
+        let work = work_with_base("prime-audit");
+        let sys = FakeSystem::new();
+        let mut frames = all_ok();
+        frames.push(audit_frame_json(status, exit, counts));
+        sys.script(powering_off(&frames));
+        let r = prime(&prime_ctx(&sys, &work), LONG);
+        assert_eq!(r.status, ReportStatus::Ok, "{r:?}");
+        let d = &r.details;
+        assert!(
+            holds(&[
+                d["log_audit_received"] == true,
+                d["log_audit"]["status"] == status,
+                d["log_audit"]["exit"] == serde_json::json!(exit),
+                d["log_audit"]["matched_lines"] == counts.0,
+                d["log_audit"]["password_hits"] == counts.1,
+                d["log_audit"]["window_hits"] == counts.2,
+                d["steps_received"] == n_steps(),
+                d["problems"] == serde_json::json!([]),
+            ]),
+            "{d}"
+        );
+    }
+}
+
+/// Catches a report that invents counts when the guest sent no audit (an older guest
+/// binary), and an audit frame that is not the expected JSON being swallowed.
+#[test]
+fn without_a_log_audit_frame_the_report_says_none_arrived_and_a_bad_one_is_listed() {
+    let work = work_with_base("prime-noaudit");
+    let sys = FakeSystem::new();
+    sys.script(powering_off(&all_ok()));
+    let r = prime(&prime_ctx(&sys, &work), LONG);
+    assert_eq!(r.status, ReportStatus::Ok, "{r:?}");
+    assert_eq!(r.details["log_audit_received"], false);
+    assert!(r.details["log_audit"].is_null());
+
+    let work = work_with_base("prime-badaudit");
+    let sys = FakeSystem::new();
+    let mut frames = all_ok();
+    frames.push((
+        kbf_guest::mkuser_audit::AUDIT_NAME.to_owned(),
+        "{\"step\": 1}".to_owned(),
+    ));
+    sys.script(powering_off(&frames));
+    let r = prime(&prime_ctx(&sys, &work), LONG);
+    assert_eq!(r.details["log_audit_received"], false);
+    assert_eq!(
+        r.details["unreadable_frames"][0]["frame"],
+        "mkuser-audit.json"
+    );
+}

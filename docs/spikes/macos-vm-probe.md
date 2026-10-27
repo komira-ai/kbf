@@ -697,6 +697,21 @@ another process of the guest could read it then; and it is in `/etc/kcpassword`,
 an obfuscation (the key is fixed and documented), not encryption: root-only mode 0600 is the
 protection. The account belongs to a throwaway guest and holds no credential of the farm.
 
+Whether the guest's unified log records that password is audited inside the guest, because
+the harvest of logs to the host is an allowlist, not an archive. Just before the
+`ready-marker` (and whatever the earlier steps did) the daemon runs a root step, `log-audit`:
+`log show --last 1h --info --debug --style compact --predicate '<sysadminctl or dscl
+process, or a message with "-password" or "kcpassword">'`, and counts its entries
+(`matched_lines`); then counts, in the whole `log show --last 1h --info --debug` output, the
+lines that hold the password (`password_hits`) and the lines that hold any 8-character piece
+of it (`window_hits`). The output is read as a stream into those counters and kept nowhere:
+its frame, `mkuser-audit.json`, holds the three counts and the step's status and exit code,
+never a line of the log, never the password, and no output tail. The step is informational:
+it does not decide whether the user was made and does not gate the marker; a `log show` that
+fails is reported by status and exit code only. `image prime` prints the frame as
+`log_audit` in its JSON. A non-zero `password_hits` or `window_hits` means the log has the
+password in it; zero in both, with status `ok`, means this run's log hour does not.
+
 When every step is done the daemon powers the guest off (`/sbin/shutdown -h now`), so the
 base's disk is flushed. It does so after a failed run too (the next `prime` starts the steps
 again; no marker is left). If `user-ready` names the user already, the daemon does nothing,

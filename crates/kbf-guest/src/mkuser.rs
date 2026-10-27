@@ -36,7 +36,9 @@
 //!
 //! # Frames
 //! One `result` frame per step (`mkuser-step-NN-<step>.json`, a [`StepFrame`] like the
-//! simulator's), then `mkuser-summary.json` ([`MkUserSummary`]); the guest then powers off,
+//! simulator's), the log audit's `mkuser-audit.json` ([`AuditFrame`](crate::mkuser_audit::AuditFrame):
+//! three counts and an exit status, no text; it runs just before the ready marker and
+//! never changes `ok`), then `mkuser-summary.json` ([`MkUserSummary`]); the guest then powers off,
 //! and a power-off command that fails is reported as `mkuser-shutdown.json`. A step runs
 //! only when the steps it needs succeeded; the power-off happens whatever the steps did (a
 //! failed run leaves no marker, so the next one starts again).
@@ -52,8 +54,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::frame::{Frame, Kind, SendError};
+use crate::mkuser_audit::{AUDIT_NAME, audit};
 use crate::probe::send_with_retries;
-use crate::sim::{Ended, Outcome, Status, StepFrame, Who, tail_text};
+use crate::sim::{Ended, Outcome, Status, StepFrame, Streamed, Who, tail_text};
 use crate::simpaths;
 
 /// The prefix of every frame this sends; the host collects the frames by it.
@@ -363,6 +366,8 @@ pub fn plan(name: &str, exists: bool) -> Vec<Step> {
 pub struct Config {
     /// The deadline of each command.
     pub quick: Duration,
+    /// The deadline of each of the two `log show` passes of the log audit.
+    pub audit: Duration,
     /// How much of a command's stdout and stderr each a step frame keeps.
     pub tail_bytes: usize,
     /// The vsock port the host listens on.
@@ -381,6 +386,9 @@ pub struct MkUserArgs {
     /// The deadline of each command.
     #[arg(long, default_value_t = 120)]
     pub quick_secs: u64,
+    /// The deadline of each of the two `log show` passes of the log audit.
+    #[arg(long, default_value_t = 600)]
+    pub audit_secs: u64,
     /// How much output of each command a step frame keeps, per stream.
     #[arg(long, default_value_t = 8192)]
     pub tail_bytes: usize,
@@ -390,6 +398,7 @@ impl From<&MkUserArgs> for Config {
     fn from(a: &MkUserArgs) -> Self {
         Self {
             quick: Duration::from_secs(a.quick_secs),
+            audit: Duration::from_secs(a.audit_secs),
             tail_bytes: a.tail_bytes,
             port: a.vsock_port,
         }
@@ -424,6 +433,9 @@ pub trait MkUserHost {
     fn give_to_user(&self, path: &str, user: &str, mode: u32, file: bool) -> Result<(), String>;
     /// Runs `argv` (no shell) and waits for it, at most `deadline`.
     fn run(&self, argv: &[String], deadline: Duration) -> Outcome;
+    /// Runs `argv` (no shell) and waits for it, at most `deadline`, handing its stdout to
+    /// `sink` as it is read; nothing is kept and the stderr is discarded.
+    fn stream(&self, argv: &[String], deadline: Duration, sink: &mut dyn FnMut(&[u8])) -> Streamed;
     /// One attempt to send `frame` to the host on `port` and read the reply.
     ///
     /// # Errors
@@ -466,10 +478,11 @@ pub fn step_frame_name(index: usize, id: &str) -> String {
     format!("{STEP_PREFIX}{:02}-{id}.json", index + 1)
 }
 
-/// The most frames a run sends: every step, the summary and the power-off failure.
+/// The most frames a run sends: every step, the log audit, the summary and the power-off
+/// failure.
 #[must_use]
 pub fn max_frames() -> usize {
-    plan("u", false).len() + 2
+    plan("u", false).len() + 3
 }
 
 fn mode_text(mode: u32) -> String {
@@ -775,6 +788,11 @@ pub fn run(host: &dyn MkUserHost, cfg: &Config, name: &str, log: &mut dyn Write)
     let mut uuid: Option<String> = None;
     for (index, s) in steps.iter().enumerate() {
         let blame = s.needs.iter().find(|n| status.get(*n) != Some(&Status::Ok));
+        if s.action == Action::WriteReady {
+            // Informational: after the account steps, before the marker, whatever they did;
+            // its outcome is in its own frame, not in `steps` or `ok`.
+            r.deliver(AUDIT_NAME, &audit(host, &password, cfg.audit));
+        }
         let mut f = blank_frame(index, s, blame, cfg);
         if blame.is_none() {
             execute(host, cfg, name, &password, &mut uuid, s, &mut f);

@@ -1267,6 +1267,61 @@ fn output_past_the_capture_cap_is_dropped_and_flagged() {
     assert_eq!((out.stdout.len(), out.cut), (MAX_CAPTURE_BYTES, true));
 }
 
+fn streamed(r: &ProcessRunner<Manual>, a: &[&str]) -> (crate::sim::Streamed, Vec<u8>) {
+    let mut got = Vec::new();
+    let s = r.stream(&argv(a), LONG, &mut |c| got.extend_from_slice(c));
+    (s, got)
+}
+
+/// Catches a streaming runner that loses or keeps output, delivers the stderr, reports a
+/// non-zero exit as success, ignores the environment, or lets a missing program pass.
+#[test]
+fn the_streaming_runner_hands_stdout_to_the_sink_and_discards_stderr() {
+    let r = runner();
+    let (s, got) = streamed(&r, &["/bin/echo", "hello"]);
+    assert_eq!((s.ended, got), (Ended::Exited(0), b"hello\n".to_vec()));
+    // The stderr of a failing command is never delivered.
+    let (s, got) = streamed(&r, &["/bin/ls", "/nonexistent/dir"]);
+    assert!(matches!(s.ended, Ended::Exited(n) if n != 0));
+    assert!(got.is_empty());
+    assert_eq!(streamed(&r, &["/usr/bin/false"]).0.ended, Ended::Exited(1));
+    let (_, env) = streamed(&r, &["/usr/bin/env"]);
+    assert!(
+        String::from_utf8_lossy(&env)
+            .lines()
+            .any(|l| l == "KBF_SIM_TEST=yes")
+    );
+    let (s, _) = streamed(&r, &["/nonexistent/program"]);
+    assert!(matches!(&s.ended, Ended::SpawnFailed(m) if m.contains("/nonexistent/program")));
+    assert!(matches!(streamed(&r, &[]).0.ended, Ended::SpawnFailed(_)));
+}
+
+/// Catches a stream that stops at the capture cap (a log is far larger than a captured
+/// tail and the audit must see all of it).
+#[test]
+fn the_stream_is_not_capped_like_a_capture() {
+    let r = runner();
+    let n = MAX_CAPTURE_BYTES + 12_345;
+    let (s, got) = streamed(&r, &["/usr/bin/head", "-c", &n.to_string(), "/dev/zero"]);
+    assert_eq!(s.ended, Ended::Exited(0));
+    assert_eq!(got.len(), n);
+}
+
+/// Catches a stream that waits for a command for ever.
+#[test]
+fn a_streamed_command_still_running_at_its_deadline_is_killed() {
+    let r = runner();
+    let mut got = 0usize;
+    let s = r.stream(
+        &argv(&["/bin/sleep", "60"]),
+        Duration::from_secs(5),
+        &mut |c| got += c.len(),
+    );
+    assert_eq!(s.ended, Ended::TimedOut);
+    assert!(s.ms >= 5000, "{}", s.ms);
+    assert_eq!(got, 0);
+}
+
 /// Catches a screenshot read that follows a link, reads a directory or a larger file, or
 /// refuses one exactly at the cap.
 #[test]

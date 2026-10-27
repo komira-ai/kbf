@@ -886,6 +886,17 @@ mod tests {
                 ms: 1,
             }
         }
+        fn stream(
+            &self,
+            _: &[String],
+            _: std::time::Duration,
+            _: &mut dyn FnMut(&[u8]),
+        ) -> sim::Streamed {
+            sim::Streamed {
+                ended: sim::Ended::Exited(0),
+                ms: 1,
+            }
+        }
         fn send(
             &self,
             _: u32,

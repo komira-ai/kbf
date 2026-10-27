@@ -168,6 +168,15 @@ impl MkUserHost for RealMkUserHost {
         self.runner.run(argv, deadline)
     }
 
+    fn stream(
+        &self,
+        argv: &[String],
+        deadline: Duration,
+        sink: &mut dyn FnMut(&[u8]),
+    ) -> crate::sim::Streamed {
+        self.runner.stream(argv, deadline, sink)
+    }
+
     fn send(&self, port: u32, frame: &Frame) -> Result<(), SendError> {
         self.host.send_frame(port, frame)
     }

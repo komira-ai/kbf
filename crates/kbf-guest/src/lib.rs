@@ -29,6 +29,9 @@ pub mod client;
 pub mod diag;
 pub mod frame;
 pub mod mkuser;
+pub mod mkuser_audit;
+#[cfg(test)]
+mod mkuser_audit_tests;
 #[cfg(target_os = "macos")]
 pub mod mkuser_host;
 #[cfg(test)]
