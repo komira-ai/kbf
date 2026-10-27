@@ -769,6 +769,18 @@ fn running_against(dir: &Path) -> Vec<u32> {
     pids.filter(|pid| *pid != own).filter(named).collect()
 }
 
+/// The parent of process `pid`, if it is still there.
+fn parent_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // After the command name, which may hold spaces: the state, then the parent's pid.
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
 /// Every path under `dir`, `dir` itself left out.
 fn listing(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
@@ -819,17 +831,15 @@ async fn a_straggler_round(name: &str) {
     }
     // Never polled or dropped again, as a daemon that was killed.
     std::mem::forget(run);
-    // Only the `crun run` itself is held, by its name (`crun`): the process that
-    // re-executes itself as a memfd copy (`memfd:crun_clon`) to create the container is
-    // the container's, and the sweep's cgroup kill ends it. Stopped part-way through the
-    // container's creation it stays in uninterruptible sleep for longer than the sweep
-    // waits and keeps the lease's cgroup busy ("remove cgroup ...: Device or resource
-    // busy"), which is not what this test is about.
+    // Only the `crun run` itself is held: the daemon's child. crun forks the process that
+    // creates the container, which has the same command line and is in the lease's
+    // cgroup; the sweep's cgroup kill ends it. Stopped part-way through the container's
+    // creation it stays in uninterruptible sleep for longer than the sweep waits and keeps
+    // the lease's cgroup busy ("remove cgroup ...: Device or resource busy"), which is not
+    // what this test is about.
+    let own = std::process::id();
     let stragglers: Vec<u32> = (running_against(&cell.scratch).into_iter())
-        .filter(|pid| {
-            let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"));
-            comm.is_ok_and(|comm| comm.trim() == "crun")
-        })
+        .filter(|pid| parent_of(*pid) == Some(own))
         .collect();
     assert!(
         !stragglers.is_empty(),
