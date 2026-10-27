@@ -28,8 +28,12 @@ User=kbf
 Slice=kbf.slice
 # kbf's own state: /var/lib/kbf, created for the unit's user by systemd; kbf-installer never
 # touches it.
+# Mode 0711, not 0750: systemd applies StateDirectoryMode= at every start, and the container
+# driver refuses to start unless every directory down to its lease directories can be searched
+# by others (its container ids are not the kbf user's). Others get search (x) only: they
+# cannot list or read /var/lib/kbf.
 StateDirectory=kbf
-StateDirectoryMode=0750
+StateDirectoryMode=0711
 # The daemon manages its own cgroup: supervisor/ for itself, actions/ for builds.
 # Delegate=yes delegates cpuset with cpu, memory and pids: --lease-placement=numa-node
 # pins each lease to one NUMA node with it (package-test rule `delegate`).
