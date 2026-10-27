@@ -23,8 +23,9 @@
 //!   commit and no other, and each tarball has exactly
 //!   one provenance bundle, `<tarball>.sigstore.json`, whose one subject is that
 //!   tarball's digest ([`bundles`]), and no bundle is there for anything else.
-//! - `release farm-version --facts <file> --commit <sha> [--output <file>]` ([`farm_version`]): the
-//!   version text the farm is told to converge on, `<version>+g<commit>` as the build said it.
+//! - `release farm-version --repo <owner/name> --tag <tag> --commit <sha> [--output <file>]
+//!   [--gh <path>]` ([`farm_version`]): the version text the farm is told to converge on,
+//!   `<version>+g<commit>` as the build said it, from the release's own version facts.
 //! - `release verify <dir> --repo-dir <checkout> --tag <tag> --commit <sha> [--main-ref
 //!   <ref>] [--output <file>]` ([`verify`]): the tag names that commit, which is on main.
 //!   It reads no verdict: the tag's message is an audit record that nothing gates on, and a
