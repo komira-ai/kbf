@@ -329,6 +329,10 @@ jobs:
       - run: cargo clippy -p kbf-state --features postgres --all-targets --locked -- -D warnings
       # The write-rate measurement (tests/postgres_write_rate.rs) is read by a person, not a gate.
       - run: cargo test -p kbf-state --features postgres --locked -- --include-ignored --skip the_write_rate_of_one_two_and_three_frontends
+      # The pack index over a real schema: its conformance suite, the migration identity and an
+      # existing database the earlier runner left (crates/kbf-pack-index/tests).
+      - run: cargo clippy -p kbf-pack-index --all-features --all-targets --locked -- -D warnings
+      - run: cargo test -p kbf-pack-index --all-features --locked -- --include-ignored
       # The installer's `setup` and update step over a real schema (crates/kbf-setup/src/database_tests.rs).
       - run: 'cargo test -p kbf-setup --features proxy --locked --lib -- --include-ignored database:: setup_creates_the_schema'
       - run: 'cargo test -p kbf-installer --locked --lib --test binary -- --include-ignored database:: setup_creates_the_schema'

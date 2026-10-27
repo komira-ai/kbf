@@ -1449,6 +1449,7 @@ dependencies = [
  "kbf-host",
  "kbf-installer",
  "kbf-node",
+ "kbf-pack-index",
  "kbf-peer",
  "kbf-proto",
  "kbf-server",
@@ -1534,6 +1535,7 @@ dependencies = [
  "kbf-meta",
  "kbf-objstore",
  "kbf-pack",
+ "kbf-pack-index",
  "kbf-proto",
  "kbf-route",
  "kbf-segments",
@@ -1781,6 +1783,7 @@ dependencies = [
  "kbf-meta",
  "kbf-objstore",
  "kbf-pack",
+ "kbf-pack-index",
  "kbf-proto",
  "kbf-route",
  "kbf-sched",
@@ -1946,6 +1949,7 @@ dependencies = [
  "http",
  "kbf-host",
  "kbf-installer",
+ "kbf-pack-index",
  "kbf-proto",
  "kbf-proxy",
  "kbf-setup",
@@ -2262,6 +2266,7 @@ dependencies = [
  "futures",
  "hex",
  "kbf-objstore",
+ "kbf-pack-index",
  "kbf-segments",
  "kbf-state",
  "kbf-testkit",
@@ -2281,6 +2286,7 @@ dependencies = [
  "clap",
  "kbf-objstore",
  "kbf-pack",
+ "kbf-pack-index",
  "kbf-segments",
  "kbf-state",
  "kbf-testkit",
@@ -2289,6 +2295,18 @@ dependencies = [
  "thiserror",
  "tokio",
  "zeroize",
+]
+
+[[package]]
+name = "kbf-pack-index"
+version = "0.1.0"
+dependencies = [
+ "kbf-pack-index",
+ "kbf-state",
+ "kbf-testkit",
+ "postgres",
+ "sha2 0.11.0",
+ "thiserror",
 ]
 
 [[package]]
@@ -2427,6 +2445,7 @@ dependencies = [
  "kbf-meta",
  "kbf-objstore",
  "kbf-pack",
+ "kbf-pack-index",
  "kbf-peer",
  "kbf-proto",
  "kbf-raft",
@@ -2477,6 +2496,7 @@ dependencies = [
  "clap",
  "hex",
  "kbf-host",
+ "kbf-pack-index",
  "kbf-proxy",
  "kbf-state",
  "kbf-testkit",

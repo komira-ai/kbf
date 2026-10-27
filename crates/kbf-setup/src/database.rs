@@ -113,7 +113,7 @@ impl Database {
             return Err(DatabaseError::NoDatabase(shown.to_owned()));
         };
         let config = check_url(shown, url)?;
-        Ok(Database::new(config, schema::embedded()))
+        Ok(Database::new(config, kbf_pack_index::schema::embedded()))
     }
 
     /// A database with the given migrations (a test plays another release).

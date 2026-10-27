@@ -10,7 +10,7 @@ use crate::postgres::schema::{self, Outcome, SchemaError};
 fn step_without_a_server() -> BootStep {
     let config = PostgresConfig::parse("postgres:///kbf?host=/nonexistent-kbf-test-socket")
         .expect("a usable URL");
-    BootStep::of_this_build(config)
+    BootStep::new(config, schema::embedded(), LOCK_WAIT)
 }
 
 /// Asserts that the step of this build waits for a lock at most `LOCK_WAIT` (30 s) and holds

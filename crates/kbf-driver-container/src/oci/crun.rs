@@ -348,21 +348,24 @@ const RUN_END_PAUSE: Duration = Duration::from_millis(2);
 fn runs_with_root(root: &Path) -> Vec<rustix::process::Pid> {
     use std::os::unix::ffi::OsStrExt as _;
     let root = root.as_os_str().as_bytes();
-    let mut equals = b"--root=".to_vec();
-    equals.extend_from_slice(root);
     let entries = std::fs::read_dir("/proc").into_iter().flatten().flatten();
     let pids = entries.filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok());
     pids.filter_map(rustix::process::Pid::from_raw)
         .filter(|pid| pid.as_raw_nonzero().get().cast_unsigned() != std::process::id())
         .filter(|pid| {
             let argv = std::fs::read(format!("/proc/{}/cmdline", pid.as_raw_nonzero())).ok();
-            argv.is_some_and(|argv| {
-                let args: Vec<&[u8]> = argv.split(|b| *b == 0).collect();
-                args.windows(2).any(|w| w[0] == b"--root" && w[1] == root)
-                    || args.contains(&equals.as_slice())
-            })
+            argv.is_some_and(|argv| has_root(&argv, root))
         })
         .collect()
+}
+
+/// Whether the command line `argv` (arguments separated by NUL) has `--root <root>` or
+/// `--root=<root>`.
+fn has_root(argv: &[u8], root: &[u8]) -> bool {
+    let args: Vec<&[u8]> = argv.split(|b| *b == 0).collect();
+    let mut equals = b"--root=".to_vec();
+    equals.extend_from_slice(root);
+    args.windows(2).any(|w| w[0] == b"--root" && w[1] == root) || args.contains(&equals.as_slice())
 }
 
 /// Whether process `pid` has ended: gone, or a zombie (or dead) waiting to be reaped.
@@ -429,13 +432,17 @@ mod tests {
         assert_eq!(code_of(ExitStatus::from_raw(15)), 143);
     }
 
-    /// A process whose command line carries `--root <root>` (or the `=` form) and that
-    /// sleeps, the shape of a `crun run` on a lease's state directory.
-    fn sleeper(root_args: &[&str]) -> std::process::Child {
-        // Not the last command, so `sh` stays the process and keeps these arguments.
-        std::process::Command::new("sh")
-            .args(["-c", "sleep 600; :", "crun"])
-            .args(root_args)
+    /// A process that follows `/dev/null` for ever and names `args` after it as files that
+    /// do not exist, so its command line carries them: the shape of a `crun run` on a
+    /// lease's state directory. (The coreutils may be one multi-call binary that reads
+    /// its own name, so the name cannot be set instead.)
+    fn sleeper(args: &[&str]) -> std::process::Child {
+        use std::process::Stdio;
+        std::process::Command::new("tail")
+            .args(["-f", "/dev/null", "--"])
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .expect("spawn")
     }
@@ -444,35 +451,66 @@ mod tests {
         rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("pid")).expect("pid")
     }
 
+    /// Catches a command line read wrongly: `--root` and the path as two arguments or one,
+    /// not a longer path with the same prefix, not the path as another option's value, and
+    /// not the path alone.
+    #[test]
+    fn a_command_line_names_a_root_as_the_option_and_its_value() {
+        let root = b"/scratch/kbf-lease-1-1/crun";
+        assert!(has_root(
+            b"crun\0--root\0/scratch/kbf-lease-1-1/crun\0run\0",
+            root
+        ));
+        assert!(has_root(
+            b"crun\0--root=/scratch/kbf-lease-1-1/crun\0run",
+            root
+        ));
+        assert!(!has_root(
+            b"crun\0--root\0/scratch/kbf-lease-1-1/crun2\0run",
+            root
+        ));
+        assert!(!has_root(
+            b"crun\0--root=/scratch/kbf-lease-1-1/crun2\0run",
+            root
+        ));
+        assert!(!has_root(
+            b"crun\0--log\0/scratch/kbf-lease-1-1/crun\0run",
+            root
+        ));
+        assert!(!has_root(
+            b"crun\0/scratch/kbf-lease-1-1/crun\0--root",
+            root
+        ));
+    }
+
     /// Catches a sweep that leaves a dead daemon's `crun run` to end on its own (it writes
     /// into the lease directory on the way out, after the sweep removed it), one that
     /// returns before the process has ended, and one that kills a `crun` of another lease
-    /// (a longer path of the same prefix, or the same path as another option's value).
-    /// A stopped process is the straggler: it is not ended until it is killed.
+    /// (a longer path of the same prefix) or a process with the path as another option's
+    /// value. A stopped process is the straggler: it is not ended until it is killed.
     #[test]
     fn the_runs_of_one_lease_are_killed_and_waited_for_and_no_other() {
         let dir = Path::new("/scratch/kbf-lease-1-1");
         let root = state_dir(dir);
         let root = root.to_str().expect("utf-8");
-        let longer = format!("{root}2");
-        let mut separate = sleeper(&["--root", root]);
+        let mut run = sleeper(&["--root", root]);
         let mut joined = sleeper(&[&format!("--root={root}")]);
-        let mut other = sleeper(&["--root", &longer]);
+        let mut other = sleeper(&["--root", &format!("{root}2")]);
         let mut value = sleeper(&["--log", root]);
-        for child in [&separate, &joined] {
+        for child in [&run, &joined] {
             rustix::process::kill_process(pid_of(child), rustix::process::Signal::STOP)
                 .expect("stop");
         }
         Crun::new(PathBuf::from("crun"))
             .end_runs_blocking(dir)
             .expect("ended");
-        assert!(ended(pid_of(&separate)) && ended(pid_of(&joined)));
+        assert!(ended(pid_of(&run)) && ended(pid_of(&joined)));
         assert!(!ended(pid_of(&other)), "another lease's crun was killed");
         assert!(
             !ended(pid_of(&value)),
             "a process with the path elsewhere was killed"
         );
-        for child in [&mut separate, &mut joined, &mut other, &mut value] {
+        for child in [&mut run, &mut joined, &mut other, &mut value] {
             let _ = child.kill();
             let _ = child.wait();
         }

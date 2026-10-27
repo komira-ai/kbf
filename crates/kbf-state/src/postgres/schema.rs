@@ -29,6 +29,11 @@
 //! it is `expand`, which is what lets a release that was reverted after its successor
 //! migrated start again. A `contract` row above `max`, a version below `min`, or no schema
 //! at all is refused.
+//!
+//! **Extending.** A crate that keeps tables of its own in the schema ships its migrations
+//! (the same files, lint and `schema_version` rows) and a release puts them after this
+//! crate's with [`extend`]; the numbers and names it gives them are what an existing database
+//! has recorded, so they never change. This crate's own set is [`embedded`].
 
 use std::fmt;
 use std::time::Duration;
@@ -48,15 +53,10 @@ use super::{PostgresConfig, describe};
 /// `a_schema_behind_the_newest_but_in_range_is_accepted` pins it.
 pub const MIN_SUPPORTED: u32 = 1;
 
-/// The migrations shipped in this build: version, name, file.
-const EMBEDDED: [(u32, &str, &str); 2] = [
-    (1, "state", include_str!("migrations/0001_state.sql")),
-    (
-        2,
-        "pack_index",
-        include_str!("migrations/0002_pack_index.sql"),
-    ),
-];
+/// The migrations of this crate: version, name, file. A crate that keeps tables of its own
+/// in the schema ships its migration itself and continues the numbering ([`extend`]); the set
+/// a release runs is this one plus theirs, put together by the binary that depends on them.
+const EMBEDDED: [(u32, &str, &str); 1] = [(1, "state", include_str!("migrations/0001_state.sql"))];
 
 /// Taken (transaction-scoped) by every schema change: the installer's `apply` and `setup`
 /// serialise on it, so two installers racing apply a migration once. The key is
@@ -144,7 +144,8 @@ impl Migration {
     }
 }
 
-/// The migrations embedded in this build, in order.
+/// The migrations of this crate alone, in order. A release's set is these plus the migrations
+/// of the crates that extend the schema ([`extend`]).
 ///
 /// # Panics
 /// When an embedded file fails its own lint (a test refuses that, so a release never
@@ -157,10 +158,33 @@ pub fn embedded() -> Vec<Migration> {
         .collect()
 }
 
-/// The newest schema version this build embeds.
+/// The newest schema version of this crate's own migrations; [`latest_of`] a set that is
+/// extended.
 #[must_use]
 pub fn latest() -> u32 {
     EMBEDDED.last().map_or(0, |m| m.0)
+}
+
+/// The newest version of `set`, 0 when it is empty.
+#[must_use]
+pub fn latest_of(set: &[Migration]) -> u32 {
+    set.last().map_or(0, |m| m.version)
+}
+
+/// The migrations of `base` followed by those of `more`. The numbers are the extending
+/// crate's to fix and never change once a release has shipped them: the database records a
+/// migration by its number and name, so an applied one is recognised by both.
+///
+/// # Errors
+/// [`SchemaError::Numbering`] when the result is not numbered 1, 2, 3 in order.
+pub fn extend(
+    base: Vec<Migration>,
+    more: impl IntoIterator<Item = Migration>,
+) -> Result<Vec<Migration>, SchemaError> {
+    let mut set = base;
+    set.extend(more);
+    numbered(&set)?;
+    Ok(set)
 }
 
 /// The versions a binary runs against.
@@ -173,7 +197,8 @@ pub struct Supported {
 }
 
 impl Supported {
-    /// What this build supports.
+    /// What this crate's own migrations support ([`embedded`]); a release that extends the
+    /// set reads its own `max` from [`latest_of`].
     #[must_use]
     pub fn this_build() -> Supported {
         Supported {

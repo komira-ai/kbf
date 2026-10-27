@@ -486,13 +486,43 @@ fn retry_busy(
                 std::thread::sleep(pause);
             }
             Err(e) => {
+                let left = if e.kind() == io::ErrorKind::ResourceBusy {
+                    members(dir)
+                } else {
+                    String::new()
+                };
                 return Err(io::Error::new(
                     e.kind(),
-                    format!("remove cgroup {}: {e}", dir.display()),
+                    format!("remove cgroup {}: {e}{left}", dir.display()),
                 ));
             }
         }
     }
+}
+
+/// What still runs in `dir` or below it, for the error of a cgroup that stayed busy:
+/// each pid with its command name and state.
+fn members(dir: &Path) -> String {
+    let mut out = String::new();
+    let mut pending = vec![dir.to_owned()];
+    while let Some(d) = pending.pop() {
+        let procs = std::fs::read_to_string(d.join("cgroup.procs")).unwrap_or_default();
+        for pid in procs.split_whitespace() {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            let after = stat.split_once(" (").map_or("", |(_, rest)| rest);
+            out.push_str(&format!(
+                "; in {}: pid {pid} ({})",
+                d.display(),
+                after.trim()
+            ));
+        }
+        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                pending.push(entry.path());
+            }
+        }
+    }
+    out
 }
 
 /// One deepest-first pass of `rmdir` over `dir`; a cgroup already gone is fine.
