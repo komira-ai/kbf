@@ -228,8 +228,9 @@ fn the_role_verbs_work_over_the_socket() {
     let none = served("role-none", Ok(()));
     refused(none.client.role_session_ready().map(drop), "no VM user");
     refused(none.client.role_kill_uid(), "no VM user");
+    refused(none.client.role_reap(4242, 1, "boot-2"), "no VM user");
     refused(
-        none.client.role_run(&argv(), &[], fds).map(drop),
+        none.client.role_run(&argv(&none.dir), &[], fds).map(drop),
         "no VM user",
     );
 
@@ -248,7 +249,7 @@ fn the_role_verbs_work_over_the_socket() {
     );
     assert!(!client.role_session_ready().unwrap());
     refused(
-        client.role_run(&argv(), &[], fds).map(drop),
+        client.role_run(&argv(&served.dir), &[], fds).map(drop),
         "does not exist",
     );
     served
@@ -258,6 +259,9 @@ fn the_role_verbs_work_over_the_socket() {
         .insert(format!("gui/{}", me() + 10));
     assert!(client.role_session_ready().unwrap());
     client.role_kill_uid().unwrap();
+    // A group the table does not show: nothing to end, and the reply is `killed`.
+    client.role_reap(4242, 1, "boot-2").unwrap();
+    refused(client.role_reap(1, 1, "boot-2"), "will signal");
     // The session switch rests at the VM user, over the socket.
     client.session_idle().unwrap();
     assert_eq!(
@@ -361,8 +365,8 @@ fn the_image_verbs_work_over_the_socket() {
     );
 }
 
-fn argv() -> Vec<String> {
-    vec!["/usr/bin/true".to_owned()]
+fn argv(dir: &std::path::Path) -> Vec<String> {
+    crate::helper::ImageSettings::under(dir).vm_run_argv()
 }
 
 /// Catches: the leak scan's verbs answered with the wrong reply over the socket, a
@@ -725,6 +729,7 @@ fn the_client_reports_unexpected_replies_and_hangups() {
         // The role verbs: a reply of the wrong kind each.
         Some(Reply::Killed),
         Some(Reply::SessionReady { ready: true }),
+        Some(Reply::Created { uid: 1 }),
         Some(Reply::Killed),
         Some(Reply::Started { pid: 9 }),
         Some(Reply::Exited {
@@ -779,6 +784,7 @@ fn the_client_reports_unexpected_replies_and_hangups() {
     assert!(unexpected(client.session_ready("1.1").map(drop)).contains("Killed"));
     assert!(unexpected(client.role_session_ready().map(drop)).contains("Killed"));
     assert!(unexpected(client.role_kill_uid()).contains("SessionReady"));
+    assert!(unexpected(client.role_reap(7, 8, "boot")).contains("Created"));
     assert!(unexpected(client.role_run(&[], &[], fds).map(drop)).contains("Killed"));
     let running = client.role_run(&[], &[], fds).unwrap();
     assert_eq!(running.pid, 9);

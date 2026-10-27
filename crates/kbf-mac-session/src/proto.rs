@@ -86,9 +86,11 @@ pub enum Request {
     /// Rest the Mac, then a userspace restart: at the standing VM user when the helper
     /// has one (`--vm-user`), else at the login window (auto-login cleared).
     SessionIdle,
-    /// Start a process as the standing VM user in its GUI session, with the same four
-    /// descriptors as `run`. Refused unless the VM user's `gui/<uid>` domain is up and
-    /// no lease holds the session.
+    /// Start `kbf-vmm vm-run --spec <file>` as the standing VM user in its GUI session,
+    /// with the same four descriptors as `run`. Refused unless the argument vector is
+    /// exactly the helper's configured `kbf-vmm`, `vm-run`, `--spec` and a regular file
+    /// inside the images directory reached through no link, the VM user's `gui/<uid>`
+    /// domain is up and no lease holds the session.
     RoleRun {
         argv: Vec<String>,
         #[serde(default)]
@@ -99,6 +101,11 @@ pub enum Request {
     RoleSessionReady,
     /// End every process of the standing VM user (its session with them).
     RoleKillUid,
+    /// End the process group a `role-run` started and nothing else: `pgid` is the pid
+    /// `Started` reported, `start` that process's start time and `boot` the boot session
+    /// it ran in. The helper kills the group only while that process still leads it, is
+    /// the VM user's, and has this start time in this boot.
+    RoleReap { pgid: i32, start: u64, boot: String },
     /// As root, take the base image bundle `bundle` (a path directly inside the staging
     /// directory), move it into the images directory, write the guest's first-boot files
     /// into it (`kbf-vmm image setup`) and seal it: root's, mode 0750/0640 with the VM
@@ -760,6 +767,17 @@ mod tests {
         assert_eq!(text, r#"{"verb":"role-session-ready"}"#);
         let text = serde_json::to_string(&Request::RoleKillUid).unwrap();
         assert_eq!(text, r#"{"verb":"role-kill-uid"}"#);
+        let reap = Request::RoleReap {
+            pgid: 4242,
+            start: 1_700_000_000_123_456,
+            boot: "B0".to_owned(),
+        };
+        let text = serde_json::to_string(&reap).unwrap();
+        assert_eq!(
+            text,
+            r#"{"verb":"role-reap","pgid":4242,"start":1700000000123456,"boot":"B0"}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), reap);
         let run = Request::RoleRun {
             argv: vec!["/usr/bin/true".to_owned()],
             env: Vec::new(),

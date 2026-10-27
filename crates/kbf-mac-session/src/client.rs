@@ -173,6 +173,25 @@ impl Client {
         }
     }
 
+    /// `role-reap`: ends the process group `pgid` a `role-run` started, if its leader is
+    /// still the VM user's process with this `start` time in this `boot`; returns once
+    /// the group is empty. A group whose leader is gone or is another process now (the
+    /// pid was reused, or the Mac rebooted) is left alone and is a success.
+    ///
+    /// # Errors
+    /// The call failed or was refused.
+    pub fn role_reap(&self, pgid: i32, start: u64, boot: &str) -> Result<(), ClientError> {
+        let request = Request::RoleReap {
+            pgid,
+            start,
+            boot: boot.to_owned(),
+        };
+        match self.call(&request, &[])?.1 {
+            Reply::Killed => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// `image-setup`: as root, writes the guest's first-boot files into the base image
     /// bundle `bundle` (a path directly inside the helper's images directory) and
     /// returns what `kbf-vmm` reported.

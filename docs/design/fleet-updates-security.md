@@ -346,11 +346,15 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 >   provisioning and never rotated and the account's login keychain is never stranded
 >   by a reset. What is still open, measured by E2 on a Mac: whether automatic login
 >   unlocks the login keychain at all. `--vm-user` stays unset until then.
->   `session-login <lease>` still switches away from the VM user. Three verbs act for
->   the VM user: `role-run` (a process in its `gui/<uid>` domain, refused until the
->   domain exists and while a lease holds the session), `role-session-ready` (false
->   while a lease holds the session) and `role-kill-uid` (ends the session with the
->   processes). Its uid is read from the directory each time and must be an ordinary
+>   `session-login <lease>` still switches away from the VM user. Four verbs act for
+>   the VM user: `role-run` (one program only: the helper's installed `kbf-vmm` as
+>   `vm-run --spec <file>`, with the file a regular file inside the images directory
+>   reached through no link; it runs in the VM user's `gui/<uid>` domain, refused until
+>   the domain exists and while a lease holds the session), `role-session-ready` (false
+>   while a lease holds the session), `role-reap` (ends the process group a `role-run`
+>   started, found again by the pid the helper reported, its start time and the boot
+>   session; a recycled pid, another boot or a process that is not the VM user's is never
+>   signalled) and `role-kill-uid` (ends the session with the processes). Its uid is read from the directory each time and must be an ordinary
 >   uid outside the lease range. That VMs and a whole-machine lease never run together
 >   on one Mac is the daemon's rule: it drains VMs before `session-login`.
 > - **The image verbs** `image-setup <bundle>` and `image-harvest <bundle> <out>` are the two

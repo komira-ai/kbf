@@ -14,7 +14,7 @@ use objc2_open_directory::{ODNode, ODRecord, ODSession, kODNodeTypeLocalNodes};
 use security_framework::random::SecRandom;
 
 use crate::autologin::{self, CommandOutput};
-use crate::helper::{self, Account, Host, LiveProcess, NewUser};
+use crate::helper::{self, Account, Host, LiveProcess, NewUser, Process};
 
 const USERS: &str = "dsRecTypeStandard:Users";
 const GROUPS: &str = "dsRecTypeStandard:Groups";
@@ -261,6 +261,39 @@ impl Host for MacHost {
         Ok(pids.into_iter().filter_map(live).collect())
     }
 
+    fn processes(&self) -> io::Result<Vec<Process>> {
+        // Room for more pids than the kernel reports, so a few new ones still fit.
+        // SAFETY: a null buffer asks only for the count.
+        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut pids = vec![0 as libc::pid_t; count.unsigned_abs() as usize + 64];
+        let bytes =
+            i32::try_from(std::mem::size_of_val(pids.as_slice())).map_err(io::Error::other)?;
+        // SAFETY: the buffer holds `bytes` bytes of pids and outlives the call.
+        let wrote = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        if wrote < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        pids.truncate(wrote.unsigned_abs() as usize);
+        Ok(pids.into_iter().filter_map(process).collect())
+    }
+
+    fn kill_group(&self, pgid: i32) -> io::Result<()> {
+        // SAFETY: killpg(2) takes plain integers; the caller refused a group of 1 or less.
+        if unsafe { libc::killpg(pgid, libc::SIGKILL) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        // A group with no process left is what the caller wants.
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
     fn pause(&self) {
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -455,6 +488,35 @@ fn live(pid: libc::pid_t) -> Option<LiveProcess> {
     }
     let command = info.map_or_else(|| "?".to_owned(), |info| c_name(&info.pbi_comm));
     Some(LiveProcess { pid, command })
+}
+
+/// `pid` as the process table shows it; `None` once it is gone or its info is short.
+fn process(pid: libc::pid_t) -> Option<Process> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: `info` is a writable proc_bsdinfo of `size` bytes.
+    let wrote = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if wrote != size {
+        return None;
+    }
+    // SAFETY: the call filled the whole struct (checked above).
+    let info = unsafe { info.assume_init() };
+    Some(Process {
+        pid,
+        pgid: i32::try_from(info.pbi_pgid).ok()?,
+        uid: info.pbi_uid,
+        ruid: info.pbi_ruid,
+        start: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+        zombie: info.pbi_status == SZOMB,
+    })
 }
 
 /// A NUL-terminated name of at most `raw.len()` bytes, as text.
