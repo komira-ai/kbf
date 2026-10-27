@@ -16,6 +16,12 @@ use crate::scrape::{Sample, Scrapes, family};
 
 /// The failed-Execute counter: the sum of its `cause` series (status, client_abort, dropped).
 pub const EXECUTE_ERRORS: &str = "kbf_execute_errors_total";
+/// The counter of operations finished as failed, one series per failure class
+/// (`class="farm"` and the rest of [`FAILURE_CLASSES`]).
+pub const FAILED_ACTIONS: &str = "kbf_execute_failed_actions_total";
+/// The values of the `class` label of [`FAILED_ACTIONS`]: the four classes of
+/// docs/design/failure-classes.md, section 1.
+pub const FAILURE_CLASSES: [&str; 4] = ["farm", "request", "action", "ambiguous"];
 /// Blobs marked lost now.
 pub const LOST_BLOBS: &str = "kbf_cache_lost_blobs";
 /// Blobs ever marked lost.
@@ -82,7 +88,8 @@ pub struct Evidence<'a> {
     pub scrape_every_secs: f64,
 }
 
-/// A series' values in every scrape, or why one is missing.
+/// A series' values in every scrape, or why one is missing. `name` is a family (summed over
+/// its labels) or, with braces, one series' whole key (`name{class="farm"}`).
 fn series(scrapes: &Scrapes, name: &str) -> Result<Vec<f64>, String> {
     if scrapes.samples.len() < 2 {
         return Err(format!(
@@ -95,7 +102,12 @@ fn series(scrapes: &Scrapes, name: &str) -> Result<Vec<f64>, String> {
         .iter()
         .enumerate()
         .map(|(i, s): (usize, &Sample)| {
-            let value = s.value(name).ok_or_else(|| {
+            let read = if name.contains('{') {
+                s.series.get(name).copied()
+            } else {
+                s.value(name)
+            };
+            let value = read.ok_or_else(|| {
                 format!(
                     "{name} is absent from scrape {i} of {}",
                     scrapes.samples.len()
@@ -192,6 +204,36 @@ impl Evidence<'_> {
             ),
             Err(why) => self.row(name, Value::Null, threshold, false, Some(why)),
         }
+    }
+
+    /// The gate on the failed-action counter of every class: the delta of each class's series
+    /// over the run, which is 0 when the load caused no failure. A class whose series is absent
+    /// from any scrape fails it, as for every series.
+    fn failed_actions_gate(&self) -> Gate {
+        let mut measured = serde_json::Map::new();
+        let mut why = Vec::new();
+        for class in FAILURE_CLASSES {
+            let key = format!("{FAILED_ACTIONS}{{class=\"{class}\"}}");
+            match series(self.scrapes, &key).and_then(|values| counter_delta(&values)) {
+                Ok(delta) => {
+                    measured.insert(class.to_owned(), json!(delta));
+                    if delta != 0.0 {
+                        why.push(format!("{class}: delta {delta}"));
+                    }
+                }
+                Err(e) => {
+                    measured.insert(class.to_owned(), Value::Null);
+                    why.push(format!("{class}: {e}"));
+                }
+            }
+        }
+        self.row(
+            "failed_actions_by_class",
+            Value::Object(measured),
+            "delta 0 in every class",
+            why.is_empty(),
+            (!why.is_empty()).then(|| why.join("; ")),
+        )
     }
 
     /// The execute-errors gate: the sum of the `cause` series must not move; when it does,
@@ -311,6 +353,7 @@ impl Evidence<'_> {
                 }),
             ),
             self.execute_errors_gate(),
+            self.failed_actions_gate(),
             self.nodes_gate(
                 "lost_blobs_gauge",
                 LOST_BLOBS,

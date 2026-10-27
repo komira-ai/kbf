@@ -37,7 +37,10 @@ fn a_healthy_farm_passes_every_gate() {
     let doc = document(&args);
     assert_eq!(failed(&doc), Vec::<String>::new(), "{doc}");
     assert_eq!(doc["status"], "PASSED");
-    assert_eq!(doc["gates"].as_array().expect("gates").len(), 11);
+    assert_eq!(
+        doc["gates"].as_array().expect("gates").len(),
+        RED_IN_A_SCENARIO.len()
+    );
     assert_eq!(doc["attested"], false);
     assert_eq!(doc["runtime"]["driver"], "native");
     assert_eq!(doc["runtime"]["container"], "none (native driver)");
@@ -128,6 +131,10 @@ fn the_loss_gates_read_every_storage_nodes_series() {
     assert!(
         series.contains("kbf_execute_errors_total"),
         "the frontend's own series are read"
+    );
+    assert!(
+        series.contains("kbf_execute_failed_actions_total{class=\\\"farm\\\"}"),
+        "the frontend's failed actions by class are read"
     );
     assert!(
         !series.contains("kbf_cache_lost_blobs"),

@@ -56,6 +56,10 @@ fn the_reader_reads_the_frontends_own_page() {
     let series = parse(golden).expect("the frontend's page");
     let sample = Sample { at: 0.0, series };
     assert_eq!(sample.value(crate::gates::EXECUTE_ERRORS), Some(0.0));
+    for class in crate::gates::FAILURE_CLASSES {
+        let key = format!("{}{{class=\"{class}\"}}", crate::gates::FAILED_ACTIONS);
+        assert_eq!(sample.series.get(&key), Some(&0.0), "{key}");
+    }
     assert!(sample.value("kbf_execute_requests_total").is_some());
     assert!(sample.value("kbf_storage_health_known").is_some());
     assert_eq!(sample.value(crate::gates::LOST_BLOBS), None);

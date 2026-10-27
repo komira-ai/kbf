@@ -8,8 +8,16 @@ use crate::scrape::Scrapes;
 
 /// A scrape of the frontend: it holds no cache, so it carries no lost-blob series.
 fn sample(at: f64, execute_errors: f64) -> Sample {
-    let series = BTreeMap::from([(EXECUTE_ERRORS.to_owned(), execute_errors)]);
+    let mut series = BTreeMap::from([(EXECUTE_ERRORS.to_owned(), execute_errors)]);
+    for class in FAILURE_CLASSES {
+        series.insert(class_key(class), 0.0);
+    }
     Sample { at, series }
+}
+
+/// The key of the failed-action series of `class`, as the exposition writes it.
+fn class_key(class: &str) -> String {
+    format!("{FAILED_ACTIONS}{{class=\"{class}\"}}")
 }
 
 /// A scrape of a storage node.
@@ -116,7 +124,7 @@ fn a_healthy_run_passes_every_gate() {
     let run = pass();
     assert_eq!(failed(&run), Vec::<String>::new());
     assert!(all_pass(&gates(&run)));
-    assert_eq!(gates(&run).len(), 11);
+    assert_eq!(gates(&run).len(), 12);
 }
 
 #[test]
@@ -698,6 +706,11 @@ fn broken(name: &str) -> Run {
                 .series
                 .insert(EXECUTE_ERRORS.to_owned(), 1.0);
         }
+        "failed_actions_by_class" => {
+            run.scrapes.samples[10]
+                .series
+                .insert(class_key("farm"), 1.0);
+        }
         "lost_blobs_gauge" => run.nodes[0].1.samples[4] = node_sample(4.0, 1.0, 0.0),
         "blob_losses" => run.nodes[0].1.samples[10] = node_sample(10.0, 0.0, 1.0),
         "scrape_coverage" => run.scrapes.failed = 5,
@@ -727,5 +740,71 @@ fn every_gate_has_a_case_that_fails_it_alone() {
         assert_eq!(failed(&broken(name)), [name.as_str()], "{name}");
         assert!(seen.insert(name.clone()), "{name} is listed twice");
     }
-    assert_eq!(names.len(), 11);
+    assert_eq!(names.len(), 12);
+}
+
+#[test]
+fn a_failed_action_of_any_class_fails_the_by_class_gate_and_names_the_class() {
+    // Catches: a class left out of the gate (one that rises unseen), the delta of one class
+    // charged to another, the absolute value used (a start value of 4 read as four failures),
+    // and a detail that does not say which class rose.
+    for class in FAILURE_CLASSES {
+        let mut run = pass();
+        for s in &mut run.scrapes.samples {
+            s.series.insert(class_key(class), 4.0);
+        }
+        assert_eq!(failed(&run), Vec::<String>::new(), "{class} at a steady 4");
+        run.scrapes.samples[10].series.insert(class_key(class), 6.0);
+        assert_eq!(failed(&run), ["failed_actions_by_class"], "{class}");
+        let gate = gates(&run)
+            .into_iter()
+            .find(|g| g.name == "failed_actions_by_class")
+            .expect("gate");
+        assert_eq!(gate.measured[class], json!(2.0), "{class}");
+        let detail = gate.detail.expect("detail");
+        assert_eq!(detail, format!("{class}: delta 2"));
+    }
+}
+
+#[test]
+fn a_missing_or_reset_class_series_fails_the_by_class_gate() {
+    // Catches: a class series that the frontend stops exporting (or exports in only some
+    // scrapes) read as zero, and a restart of the frontend between scrapes (the counter
+    // falls) read as no failures.
+    for class in FAILURE_CLASSES {
+        for scrape in [0, 7] {
+            let mut run = pass();
+            run.scrapes.samples[scrape].series.remove(&class_key(class));
+            assert_eq!(
+                failed(&run),
+                ["failed_actions_by_class"],
+                "{class} {scrape}"
+            );
+            let gate = gates(&run)
+                .into_iter()
+                .find(|g| g.name == "failed_actions_by_class")
+                .expect("gate");
+            assert_eq!(gate.measured[class], Value::Null);
+            let want = format!(
+                "{class}: {} is absent from scrape {scrape}",
+                class_key(class)
+            );
+            assert!(gate.detail.expect("detail").contains(&want));
+        }
+    }
+    let mut run = pass();
+    for (i, s) in run.scrapes.samples.iter_mut().enumerate() {
+        let value = if i < 5 { 3.0 } else { 0.0 };
+        s.series.insert(class_key("farm"), value);
+    }
+    assert_eq!(failed(&run), ["failed_actions_by_class"]);
+    let gate = gates(&run)
+        .into_iter()
+        .find(|g| g.name == "failed_actions_by_class")
+        .expect("gate");
+    assert!(
+        gate.detail
+            .expect("detail")
+            .contains("farm: went down from 3 to 0")
+    );
 }
