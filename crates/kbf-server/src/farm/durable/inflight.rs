@@ -17,7 +17,7 @@ use kbf_types::ActionKey;
 
 use super::*;
 
-const INFLIGHT: &str = "inflight/";
+pub(super) const INFLIGHT: &str = "inflight/";
 
 /// How many times a submit looks again after a write finds a row in its way.
 const LOOKS: usize = 3;

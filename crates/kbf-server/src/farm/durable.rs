@@ -187,6 +187,11 @@ pub use self::sweep::ORPHAN_WAIT;
 pub const SESSION_RENEWAL: Duration = Duration::from_secs(LEASE_GRACE.as_secs() / 3);
 
 const EPOCH: &str = "meta/epoch";
+const OPERATION: &str = "op/";
+const QUEUE: &str = "queue/";
+const LOSS: &str = "loss/";
+const DONE: &str = "done/";
+const LEASE: &str = "lease/";
 const ALIVE: &str = "meta/alive";
 const NEXT_OP: &str = "meta/next_op";
 const NEXT_SEQ: &str = "meta/next_seq";
@@ -520,15 +525,15 @@ impl std::fmt::Debug for Durable {
 }
 
 fn op_key(operation: OperationId) -> String {
-    format!("op/{:016x}", operation.0)
+    format!("{OPERATION}{:016x}", operation.0)
 }
 
 fn queue_key(operation: OperationId) -> String {
-    format!("queue/{:016x}", operation.0)
+    format!("{QUEUE}{:016x}", operation.0)
 }
 
 fn loss_key(operation: OperationId) -> String {
-    format!("loss/{:016x}", operation.0)
+    format!("{LOSS}{:016x}", operation.0)
 }
 
 fn fate_key(operation: OperationId) -> String {
@@ -544,7 +549,7 @@ fn subject_key(operation: OperationId) -> String {
 }
 
 fn done_key(operation: OperationId) -> String {
-    format!("done/{:016x}", operation.0)
+    format!("{DONE}{:016x}", operation.0)
 }
 
 fn cordon_key(worker: &WorkerId) -> String {
@@ -552,7 +557,7 @@ fn cordon_key(worker: &WorkerId) -> String {
 }
 
 fn lease_key(lease: LeaseId) -> String {
-    format!("lease/{:016x}.{:016x}", lease.term, lease.seq)
+    format!("{LEASE}{:016x}.{:016x}", lease.term, lease.seq)
 }
 
 fn corrupt(key: &str, why: &str) -> StateError {

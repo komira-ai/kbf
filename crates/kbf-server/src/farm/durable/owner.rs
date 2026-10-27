@@ -35,7 +35,7 @@ use super::blocks::contended;
 use super::*;
 use crate::config::MAX_HEARTBEAT_INTERVAL_MS;
 
-const OWNER: &str = "owner/";
+pub(super) const OWNER: &str = "owner/";
 
 /// How long a frontend trusts its last look at an `owner/` row before it reads the row
 /// again to acknowledge a heartbeat. The frontend a daemon moved to waits this long beyond

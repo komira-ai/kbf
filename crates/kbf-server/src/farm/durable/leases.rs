@@ -17,7 +17,7 @@
 use super::owner::{pair_of, pair_row};
 use super::*;
 
-const LEASE_BY_OP: &str = "lease-by-op/";
+pub(super) const LEASE_BY_OP: &str = "lease-by-op/";
 
 pub(super) fn lease_by_op_key(operation: OperationId) -> String {
     format!("{LEASE_BY_OP}{:016x}", operation.0)
