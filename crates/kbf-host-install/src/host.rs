@@ -134,6 +134,8 @@ pub struct Host {
     pub(crate) self_exe: PathBuf,
     /// How long a restart waits for its unit to be active.
     pub(crate) restart_wait: plan::Wait,
+    /// How that wait tells time and pauses: the real clock here, a made-up one in tests.
+    pub(crate) pace: std::rc::Rc<crate::pace::Pace>,
     pub(crate) trust: Trust,
 }
 
@@ -150,6 +152,7 @@ impl Host {
             hostname: PathBuf::from("/proc/sys/kernel/hostname"),
             self_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from(SELF_EXE)),
             restart_wait: plan::ACTIVE_WAIT,
+            pace: std::rc::Rc::new(crate::pace::Pace::real()),
             trust: Trust::root(),
         }
     }
@@ -170,6 +173,7 @@ impl Host {
                 timeout: std::time::Duration::from_secs(30),
                 interval: std::time::Duration::from_millis(1),
             },
+            pace: std::rc::Rc::new(crate::pace::fake::Fake::new().pace()),
             trust,
         }
     }
@@ -517,12 +521,34 @@ const BUSY_DETAIL: &str = "another install or restart is running";
 
 /// Take the install lock without waiting: an advisory `flock` on a root-owned file under
 /// `/run`, opened without following a symbolic link. Held by the returned file.
-fn take_install_lock(host: &Host) -> Result<File, Outcome> {
+fn take_install_lock(host: &Host) -> Result<Lock, Outcome> {
     take_lock(&host.install_lock)
 }
 
+/// A held advisory lock. Dropping it lets the lock go with an explicit unlock, not with the
+/// close of the descriptor: a `flock` belongs to the open file description, which a process
+/// forked meanwhile shares until it execs, so a close alone can leave the lock held (and the
+/// next request refused as busy) for as long as such a child lives.
+#[derive(Debug)]
+pub(crate) struct Lock(File);
+
+impl Lock {
+    /// The locked file, for a test that copies the descriptor as a fork does.
+    #[cfg(test)]
+    pub(crate) fn file(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // Nothing to report: the lock goes with the descriptor at the latest.
+        let _ = self.0.unlock();
+    }
+}
+
 /// Take the advisory lock on the file at `path` without waiting, creating it root-only.
-pub(crate) fn take_lock(path: &std::path::Path) -> Result<File, Outcome> {
+pub(crate) fn take_lock(path: &std::path::Path) -> Result<Lock, Outcome> {
     let file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -539,7 +565,7 @@ pub(crate) fn take_lock(path: &std::path::Path) -> Result<File, Outcome> {
     // held): either way nothing may start.
     file.try_lock()
         .map_err(|_| fail(FailureCode::Busy, BUSY_DETAIL))?;
-    Ok(file)
+    Ok(Lock(file))
 }
 
 /// What a command printed to explain itself: its stderr, else its stdout.

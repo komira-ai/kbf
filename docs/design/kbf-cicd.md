@@ -334,9 +334,10 @@ The gate expressions common to B1 to B6, B8 and B10, read from the scraped metri
 - **0 failed actions.** Every action of every build in the load ended with its own exit code, none with a farm-class
   failure. The measure: the builds' event logs, and `kbf_execute_errors_total` delta equal to the number of actions the
   scenario failed on purpose (zero here). Today that counter has no cause label, so a dropped connection cannot be
-  told from a client abort (the series `kbf_frontend_relay_untraced` that once told them is gone). **[F]** A failed-actions-by-class counter is a
-  missing piece (section 12, M10); until it exists the gate is: event logs show zero failed actions **and**
-  `kbf_execute_errors_total` delta is zero.
+  told from a client abort (the series `kbf_frontend_relay_untraced` that once told them is gone). **[F]** `kbf_execute_failed_actions_total{class}` (`farm`, `request`, `action`, `ambiguous`; section 12, M10) counts operations
+  finished as failed by class, and the beta gate `failed_actions_by_class` is the delta of every class over the run: zero for
+  every class here, and a class whose series is absent fails it. The event-log gate `actions_failed` and the
+  `kbf_execute_errors_total` delta stay beside it.
 - **0 builds lost to a handover**: (not built: `kbf_frontend_relay_untraced` is gone, see the note at the top).
 - **0 lost blobs**: `kbf_cache_lost_blobs` is 0 at every scrape, and the delta of `kbf_cache_blob_losses_total` (a counter
   that never falls) is 0 over the scenario. The gauge alone can fall back to 0 after a loss.
@@ -728,12 +729,11 @@ does not skip the check: the beta is red ("not run" is not "passed").
 
 ## 11. Metrics the stages read
 
-Exist **[F]**: `kbf_cache_lost_blobs`, `kbf_cache_blob_losses_total`, `kbf_execute_requests_total`, `kbf_execute_errors_total`,
-`kbf_execute_in_flight`, `kbf_execute_queued_seconds` (histogram), `kbf_frontend_relay_untraced`, the write-tier series.
+Exist **[F]**: `kbf_cache_lost_blobs`, `kbf_cache_blob_losses_total`, `kbf_execute_requests_total`, `kbf_execute_errors_total{cause}` (status, client_abort, dropped; M11),
+`kbf_execute_failed_actions_total{class}` (M10), `kbf_execute_in_flight`, `kbf_execute_queued_seconds` (histogram), `kbf_find_missing_seconds` (histogram, no labels beyond `le`), `kbf_frontend_relay_untraced`, the write-tier series.
 Open pull requests **[open]**: `under_replicated_blobs`, open writes, repair debt, planned-down (#912, #913, #914).
 Exist: `kbf_member_state`, `kbf_members_not_active`, `kbf_member_boot` (storage members, M13).
-**[missing]**: failed actions by class (M10), execute errors by cause (M11), a boot series for the roles that are not storage members (M13),
-a `FindMissingBlobs` latency histogram (M14).
+**[missing]**: a boot series for the roles that are not storage members (M13).
 
 ## 12. Missing pieces and the issues to file
 
@@ -751,11 +751,11 @@ one issue with one done criterion. "Blocked by" names open pull requests or othe
 | M7 | `offer`: promotion by setting the desired commit, beta-result check, plan mode (no operator-signed feed) | `offer` refuses on a red or missing beta result and on an incomplete release; the generation only rises | |  #948 |
 | M8 | Gamma deploy-as-test checks: in-flight invocation record, dropped-connection and lost-blob checks, halt and walk back | a planted dropped connection fails the deploy | M6, #791, #792 |  #949 |
 | M9 | Gamma verdict producer: Planned, on a generic monitoring library over the gamma farm's metrics (the bake evaluator was removed) | an absent metric fails; a producer failure is never a pass | M10, M13 |  #950 |
-| M10 | Metric: failed actions by failure class | counter present, labelled by class | |  #951 |
+| M10 | Metric: failed actions by failure class | counter present, labelled by class | | #951 (done: exported by the frontend, read by the beta gate `failed_actions_by_class`; the gamma producer of M9 will read the same series) |
 | M11 | Metric: Execute errors by cause | client abort distinguished from dropped | |  #952 |
 | M12 | Release workflow: tag check (the tag names the commit, on main; no signing key; no verdict gates), approval environment, notes | a tag naming another commit or off main fails `verify`; a tag with no record, or a failed one, passes | M7, M9, M19 |  #953 |
 | M13 | Metrics: process boot counter and membership-state gauge | both exported; gates read them | |  #954 |
-| M14 | Metric: `FindMissingBlobs` latency histogram | histogram exported; latency gate added | |  #955 |
+| M14 | Metric: `FindMissingBlobs` latency histogram | histogram exported (`kbf_find_missing_seconds`, done); latency gate (not yet added): the `latency-p99` gate will read `Metrics::quantile`, soft band 1.5x to 3x of the beta baseline; `quantile` reads one cumulative scrape (lifetime), so the gate needs the delta of the cumulative buckets between window start and end, not yet implemented, and a quantile in the `+Inf` bucket reads absent (red); no gate is registered yet (pending the M9 producer) | M9 |  #955 |
 | M15 | Updater walk-back: automatic desired-commit set on a red hard gate, mid-roll behaviour, not-reversible flags (B10, B11) | B10 and B11 green | M6, M7 |  #956 |
 | M16 | Fetch and verify the previous release for N-1 | N-1 resolved, or the fallback of section 3 | |  #957 |
 | M17 | Stage file and lint (stages, no `pull_request`, `id-token` only in `attest`) | lint red on each planted violation | |  #958 |

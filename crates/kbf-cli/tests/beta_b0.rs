@@ -133,6 +133,10 @@ fn the_loss_gates_read_every_storage_nodes_series() {
         "the frontend's own series are read"
     );
     assert!(
+        series.contains("kbf_execute_failed_actions_total{class=\\\"farm\\\"}"),
+        "the frontend's failed actions by class are read"
+    );
+    assert!(
         !series.contains("kbf_cache_lost_blobs"),
         "the frontend holds no cache"
     );

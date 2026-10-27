@@ -279,8 +279,10 @@ impl Drop for Stopped {
 /// Every gate of B0 and the test (of tests/beta_b0.rs or tests/beta_b0_red.rs) that turns it red
 /// in a scenario over a real farm.
 /// `None` is a gate that only the real Buck2 can turn red: the stand-in's builds write nothing
-/// to the farm, so no blob can be lost. Those are `kbf-beta b0 --fault shrink-every-cap`'s
-/// to show red, with the real Buck2 of the workflow.
+/// to the farm, so no blob can be lost and no action runs on a daemon to fail. Those are
+/// `kbf-beta b0 --fault shrink-every-cap`'s to show red, with the real Buck2 of the workflow, for
+/// the lost-blob gates; `failed_actions_by_class` is turned red by the gate tests of kbf-harness
+/// (a series fed to it) and its count by `kbf-server/tests/failed_actions_metric.rs`.
 pub(crate) const RED_IN_A_SCENARIO: &[(&str, Option<&str>)] = &[
     (
         "builds_run",
@@ -298,6 +300,7 @@ pub(crate) const RED_IN_A_SCENARIO: &[(&str, Option<&str>)] = &[
         "execute_errors",
         Some("an_execute_that_fails_fails_the_execute_error_gate"),
     ),
+    ("failed_actions_by_class", None),
     ("lost_blobs_gauge", None),
     ("blob_losses", None),
     // No B0 scenario takes two members down or restarts one; the gate tests of kbf-harness

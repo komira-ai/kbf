@@ -12,7 +12,7 @@ use clap::Parser;
 
 use crate::frame::{Frame, Kind, MAX_BODY_BYTES, MAX_FRAME_BYTES, SendError, encode};
 use crate::sim::*;
-use crate::sim_run::{Clock, ProcessRunner, read_regular};
+use crate::sim_run::{Clock, ProcessRunner, read_regular, read_wanted};
 
 const UDID: &str = "6F3A1B2C-0D4E-4F5A-8B6C-7D8E9F0A1B2C";
 
@@ -27,6 +27,30 @@ const DEVICETYPES: &str = r#"{"devicetypes":[
  {"identifier":"com.apple.CoreSimulator.SimDeviceType.iPhone-15","name":"iPhone 15"},
  {"identifier":"com.apple.CoreSimulator.SimDeviceType.iPhone-16","name":"iPhone 16"},
  {"identifier":"com.apple.CoreSimulator.SimDeviceType.Apple-Watch-10","name":"Apple Watch 10"}
+]}"#;
+
+/// `simctl list runtimes -j` as Xcode 26/27 print it: each runtime lists the device types it
+/// can create, oldest first. iOS 27.0 supports no iPhone older than the iPhone 12; the
+/// unavailable iOS 28.0 entry supports a device the available one does not.
+const RUNTIMES_WITH_SUPPORT: &str = r#"{"runtimes":[
+ {"bundlePath":"/Library/Developer/CoreSimulator/Volumes/iOS_24A434/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 27.0.simruntime",
+  "buildversion":"24A434","platform":"iOS","runtimeRoot":"/x","identifier":"com.apple.CoreSimulator.SimRuntime.iOS-27-0",
+  "version":"27.0","isInternal":false,"isAvailable":true,"name":"iOS 27.0","supportedArchitectures":["arm64"],
+  "supportedDeviceTypes":[
+   {"bundlePath":"/d/iPhone 12.simdevicetype","name":"iPhone 12","identifier":"com.apple.CoreSimulator.SimDeviceType.iPhone-12","productFamily":"iPhone"},
+   {"bundlePath":"/d/iPhone 17 Pro.simdevicetype","name":"iPhone 17 Pro","identifier":"com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro","productFamily":"iPhone"},
+   {"bundlePath":"/d/iPad Air.simdevicetype","name":"iPad Air 13-inch (M3)","identifier":"com.apple.CoreSimulator.SimDeviceType.iPad-Air-13-inch-M3","productFamily":"iPad"}]},
+ {"bundlePath":"/y","buildversion":"25A1","platform":"iOS","identifier":"com.apple.CoreSimulator.SimRuntime.iOS-28-0",
+  "version":"28.0","isAvailable":false,"name":"iOS 28.0",
+  "supportedDeviceTypes":[
+   {"bundlePath":"/d/iPhone 99.simdevicetype","name":"iPhone 99","identifier":"com.apple.CoreSimulator.SimDeviceType.iPhone-99","productFamily":"iPhone"}]}
+]}"#;
+
+/// The real-guest listing whose last iPhone the iOS 27 runtime refuses to create.
+const DEVICETYPES_WITH_OLD_LAST: &str = r#"{"devicetypes":[
+ {"identifier":"com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro","name":"iPhone 17 Pro","productFamily":"iPhone"},
+ {"identifier":"com.apple.CoreSimulator.SimDeviceType.iPhone-6s-Plus","name":"iPhone 6s Plus","productFamily":"iPhone"},
+ {"identifier":"com.apple.CoreSimulator.SimDeviceType.Apple-Watch-10","name":"Apple Watch 10","productFamily":"Apple Watch"}
 ]}"#;
 
 fn ok_out(stdout: &str) -> Outcome {
@@ -54,6 +78,12 @@ struct Fake {
     root: bool,
     runtimes: Vec<String>,
     apps: Vec<String>,
+    /// The user `mkuser` recorded as ready, and the one `image setup --guest-user` asked for.
+    ready: Option<String>,
+    wanted: Option<String>,
+    wanted_unreadable: Option<String>,
+    /// The name of the console user, once there is one.
+    console_name: String,
     /// The console user appears once this many pauses have been made; never when `None`.
     user_after_pauses: Option<u32>,
     /// `(text the command line contains, outcome)`; the first match answers, else exit 0.
@@ -84,6 +114,10 @@ impl Fake {
             root: true,
             runtimes: vec!["iOS_27.dmg".to_owned()],
             apps: Vec::new(),
+            ready: None,
+            wanted: None,
+            wanted_unreadable: None,
+            console_name: "kbf".to_owned(),
             user_after_pauses: Some(0),
             answers: RefCell::new(answers),
             ran: RefCell::new(Vec::new()),
@@ -135,8 +169,18 @@ impl SimHost for Fake {
             .filter(|n| self.pauses.get() >= *n)
             .map(|_| ConsoleUser {
                 uid: 501,
-                name: "kbf".to_owned(),
+                name: self.console_name.clone(),
             })
+    }
+    fn ready_user(&self) -> Option<String> {
+        self.ready.clone()
+    }
+    fn wanted_user(&self) -> Wanted {
+        match (&self.wanted_unreadable, &self.wanted) {
+            (Some(e), _) => Wanted::Unreadable(e.clone()),
+            (None, Some(n)) => Wanted::User(n.clone()),
+            (None, None) => Wanted::No,
+        }
     }
     fn prepare_out_dir(&self) -> Result<(), String> {
         self.out_dir_made.set(true);
@@ -1432,5 +1476,280 @@ fn a_run_imports_the_staged_bundle_and_ignores_names_the_host_did_not_stage() {
     assert!(
         names.contains(&"sim-step-05-runtime-import-b_27.exportedBundle.json".to_owned()),
         "{names:?}"
+    );
+}
+
+/// Catches the user steps running as whoever owns the console when `mkuser` recorded a user:
+/// the wrapper must name the recorded user and its uid, and every user step must use it.
+#[test]
+fn the_user_steps_run_as_the_user_mkuser_recorded() {
+    let mut host = Fake::new();
+    host.ready = Some("kbfuser".to_owned());
+    host.console_name = "kbfuser".to_owned();
+    let summary = go(&host);
+    assert!(summary.ok, "{summary:?}");
+    let user_steps: Vec<String> = host
+        .commands()
+        .into_iter()
+        .filter(|c| c.starts_with("/bin/launchctl asuser"))
+        .collect();
+    assert!(user_steps.len() >= 6, "{user_steps:?}");
+    assert!(
+        user_steps
+            .iter()
+            .all(|c| c.starts_with("/bin/launchctl asuser 501 /usr/bin/sudo -u kbfuser -H -- ")),
+        "{user_steps:?}"
+    );
+    // Without a record, the console owner is used, whoever it is.
+    let host = Fake::new();
+    assert!(go(&host).ok);
+    assert!(
+        host.commands()
+            .iter()
+            .any(|c| c.starts_with("/bin/launchctl asuser 501 /usr/bin/sudo -u kbf -H -- "))
+    );
+}
+
+/// Catches a recorded user whose session never comes (another user at the console): the
+/// wait is bounded, no user step runs as the wrong user, and the note names both users.
+#[test]
+fn another_user_at_the_console_is_not_the_recorded_user() {
+    let mut host = Fake::new();
+    host.ready = Some("kbfuser".to_owned());
+    host.console_name = "someoneelse".to_owned();
+    let c = Config::from(&args(&["--console-wait-secs", "2"]));
+    let summary = run(&host, &c, &mut Vec::new());
+    assert!(!summary.ok);
+    assert_eq!(host.pauses.get(), 2);
+    assert!(!host.commands().iter().any(|c| c.contains("sudo")));
+    let frames = host.step_frames();
+    let first = frames
+        .iter()
+        .find(|f| f.step == "list-runtimes")
+        .expect("step");
+    assert_eq!(first.status, Status::Error);
+    let note = first.note.as_deref().expect("note");
+    assert!(
+        note.contains("kbfuser") && note.contains("someoneelse") && note.contains("2 s"),
+        "{note}"
+    );
+    // The root steps do not need a session.
+    assert_eq!(
+        frames
+            .iter()
+            .find(|f| f.step == "first-launch")
+            .map(|f| f.status),
+        Some(Status::Ok)
+    );
+}
+
+/// Catches a run in a guest that is to have a user and has none yet: it must run nothing
+/// (the root steps would import the runtimes into the base for nothing) and tell the host
+/// to prime; with the user ready, or no user wanted, it runs.
+#[test]
+fn a_wanted_user_that_is_not_ready_stops_the_run_before_any_command() {
+    let mut host = Fake::new();
+    host.wanted = Some("kbfuser".to_owned());
+    let summary = go(&host);
+    assert!(host.ran.borrow().is_empty());
+    assert!(!summary.ok && summary.steps.is_empty());
+    let note = summary.note.as_deref().expect("note");
+    assert!(
+        note.contains("kbfuser") && note.contains("image prime"),
+        "{note}"
+    );
+    assert_eq!(host.sent.borrow().len(), 1);
+    assert_eq!(host.sent.borrow()[0].name, SUMMARY_NAME);
+
+    host.ready = Some("kbfuser".to_owned());
+    host.console_name = "kbfuser".to_owned();
+    assert!(go(&host).ok);
+}
+
+/// Catches a wish file that cannot be read being taken for "no user wanted" (the simulator
+/// would then run its root steps in a guest that is to have a user): the run fails closed,
+/// runs nothing, and its note names the file and says why.
+#[test]
+fn a_wish_that_cannot_be_read_stops_the_run_before_any_command() {
+    let mut host = Fake::new();
+    host.wanted_unreadable = Some("is over the 256 byte cap".to_owned());
+    let summary = go(&host);
+    assert!(host.ran.borrow().is_empty());
+    assert!(!summary.ok && summary.steps.is_empty());
+    let note = summary.note.as_deref().expect("note");
+    assert!(
+        note.contains("user-wanted")
+            && note.contains("256 byte cap")
+            && note.contains("nothing was run"),
+        "{note}"
+    );
+    assert_eq!(host.sent.borrow().len(), 1);
+    // With the user ready the wish does not matter.
+    host.ready = Some("kbfuser".to_owned());
+    host.console_name = "kbfuser".to_owned();
+    assert!(go(&host).ok);
+}
+
+/// Catches `user-wanted` read as "none" when it is there: only a missing file is `No`; a good
+/// name (first line, trimmed) is the user; an empty or bad name, a link, a directory, a
+/// file over the cap and non-text are all unreadable.
+#[test]
+fn only_a_missing_wish_file_means_no_user_is_wanted() {
+    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-guest-wanted");
+    let at = |name: &str| dir.join(name);
+    assert_eq!(read_wanted(&at("absent")), Wanted::No);
+    std::fs::write(at("good"), "kbfuser\nignored\n").expect("file");
+    assert_eq!(read_wanted(&at("good")), Wanted::User("kbfuser".to_owned()));
+    std::fs::write(at("spaced"), "  kbfuser \n").expect("file");
+    assert_eq!(
+        read_wanted(&at("spaced")),
+        Wanted::User("kbfuser".to_owned())
+    );
+    std::fs::write(at("empty"), "").expect("file");
+    std::fs::write(at("bad"), "Root\n").expect("file");
+    std::fs::write(at("big"), vec![b'a'; 300]).expect("file");
+    std::fs::write(at("binary"), [0xff, 0xfe, b'\n']).expect("file");
+    std::os::unix::fs::symlink(at("good"), at("link")).expect("link");
+    std::os::unix::fs::symlink(at("absent"), at("dangling")).expect("link");
+    std::fs::create_dir(at("dir")).expect("dir");
+    for name in ["empty", "bad", "big", "binary", "link", "dangling", "dir"] {
+        assert!(
+            matches!(read_wanted(&at(name)), Wanted::Unreadable(_)),
+            "{name}: {:?}",
+            read_wanted(&at(name))
+        );
+    }
+}
+
+fn runtime_listing_run(runtimes: &str) -> (Fake, SummaryFrame) {
+    let host = Fake::new();
+    host.answer("list runtimes", ok_out(runtimes));
+    host.answer("list devicetypes", ok_out(DEVICETYPES_WITH_OLD_LAST));
+    let summary = go(&host);
+    (host, summary)
+}
+
+fn frame_of(host: &Fake, step: &str) -> StepFrame {
+    host.step_frames()
+        .into_iter()
+        .find(|f| f.step == step)
+        .expect(step)
+}
+
+/// Catches a device type taken from the global list (whose last iPhone, the 6s Plus, the new
+/// runtime refuses) instead of from the chosen runtime's `supportedDeviceTypes`; and a
+/// runtime chosen from an unavailable entry whose support list differs.
+#[test]
+fn the_device_type_comes_from_the_chosen_runtimes_supported_list() {
+    let (host, summary) = runtime_listing_run(RUNTIMES_WITH_SUPPORT);
+    assert!(summary.ok, "{summary:?}");
+    let create = host
+        .commands()
+        .into_iter()
+        .find(|c| c.contains("simctl create"))
+        .expect("create ran");
+    assert!(
+        create.ends_with(
+            "simctl create kbf-sim com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro com.apple.CoreSimulator.SimRuntime.iOS-27-0"
+        ),
+        "{create}"
+    );
+    assert_eq!(
+        summary.device_type.as_deref(),
+        Some("com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro")
+    );
+    // The frames say what was chosen and from where.
+    let note = frame_of(&host, "list-runtimes").note.expect("note");
+    assert!(
+        note.contains("iPhone-17-Pro") && note.contains("supportedDeviceTypes"),
+        "{note}"
+    );
+    let note = frame_of(&host, "list-devicetypes").note.expect("note");
+    assert!(
+        note.contains("iPhone-17-Pro") && note.contains("not used"),
+        "{note}"
+    );
+}
+
+/// Catches the pick rules of the runtime's list: the last iPhone by `productFamily` (later
+/// iPads and watches ignored), a missing `productFamily` read from the name, and the unit
+/// answers for a runtime that is not listed or has no iPhone.
+#[test]
+fn the_supported_list_rule_picks_the_last_iphone() {
+    let id = "com.apple.CoreSimulator.SimRuntime.iOS-27-0";
+    assert_eq!(
+        choose_device_type_for_runtime(RUNTIMES_WITH_SUPPORT, id),
+        Ok(RuntimeDeviceType::Chosen(
+            "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro".to_owned()
+        ))
+    );
+    let no_family = r#"{"runtimes":[{"identifier":"R","supportedDeviceTypes":[
+      {"identifier":"p1","name":"iPhone 1"},{"identifier":"p2","name":"iPhone 2"},{"identifier":"w","name":"Watch"}]}]}"#;
+    assert_eq!(
+        choose_device_type_for_runtime(no_family, "R"),
+        Ok(RuntimeDeviceType::Chosen("p2".to_owned()))
+    );
+    // A family that is not iPhone is not taken even when the name says iPhone.
+    let odd = r#"{"runtimes":[{"identifier":"R","supportedDeviceTypes":[
+      {"identifier":"p1","name":"iPhone 1","productFamily":"iPhone"},{"identifier":"x","name":"iPhone Mirror","productFamily":"Mac"}]}]}"#;
+    assert_eq!(
+        choose_device_type_for_runtime(odd, "R"),
+        Ok(RuntimeDeviceType::Chosen("p1".to_owned()))
+    );
+    assert!(
+        choose_device_type_for_runtime(RUNTIMES_WITH_SUPPORT, "nope")
+            .unwrap_err()
+            .contains("nope")
+    );
+    assert!(
+        choose_device_type_for_runtime("{", "R")
+            .unwrap_err()
+            .contains("not JSON")
+    );
+    assert!(
+        choose_device_type_for_runtime("{}", "R")
+            .unwrap_err()
+            .contains("runtimes")
+    );
+}
+
+/// Catches a runtime whose supported list holds no iPhone falling back to the global list
+/// (which would pick a device the runtime refuses): the step is an error naming the
+/// runtime, and nothing is created.
+#[test]
+fn a_runtime_supporting_no_iphone_is_an_error_naming_it() {
+    let ipads_only = r#"{"runtimes":[{"identifier":"com.apple.CoreSimulator.SimRuntime.iOS-27-0",
+      "version":"27.0","isAvailable":true,"name":"iOS 27.0","supportedDeviceTypes":[
+      {"identifier":"i","name":"iPad Pro","productFamily":"iPad"}]}]}"#;
+    let (host, summary) = runtime_listing_run(ipads_only);
+    assert!(!summary.ok);
+    let f = frame_of(&host, "list-runtimes");
+    assert_eq!(f.status, Status::Error);
+    let note = f.note.expect("note");
+    assert!(
+        note.contains("com.apple.CoreSimulator.SimRuntime.iOS-27-0"),
+        "{note}"
+    );
+    assert!(note.contains("no iPhone"), "{note}");
+    assert_eq!(frame_of(&host, "create").status, Status::Skipped);
+    assert!(!host.commands().iter().any(|c| c.contains("simctl create")));
+}
+
+/// Catches a runtime with no `supportedDeviceTypes` key failing, or the fallback not being
+/// used and not saying so: the old devicetypes rule applies and both notes say it.
+#[test]
+fn a_runtime_without_a_supported_list_falls_back_to_the_devicetypes_listing() {
+    let (host, summary) = runtime_listing_run(RUNTIMES);
+    assert!(summary.ok, "{summary:?}");
+    assert_eq!(
+        summary.device_type.as_deref(),
+        Some("com.apple.CoreSimulator.SimDeviceType.iPhone-6s-Plus")
+    );
+    let note = frame_of(&host, "list-runtimes").note.expect("note");
+    assert!(note.contains("no supportedDeviceTypes"), "{note}");
+    let note = frame_of(&host, "list-devicetypes").note.expect("note");
+    assert!(
+        note.contains("iPhone-6s-Plus") && note.contains("may not be one it supports"),
+        "{note}"
     );
 }

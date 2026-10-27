@@ -138,6 +138,13 @@ pub(crate) struct Copies {
     name: String,
 }
 
+impl Copies {
+    /// The directory the copies are in, which goes when they do.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.check.dir
+    }
+}
+
 impl PackageHost {
     fn restart_units(&self) -> Result<(), String> {
         for unit in &self.units {

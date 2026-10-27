@@ -187,7 +187,9 @@ pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_in
 pub use start_exit::{
     NOT_READY, REFUSED, STALE_WRITER_HINT, StartFailure, hint as start_hint, said as start_said,
 };
-pub use state_store::{PackIndexFlagError, StateStore, StateStoreUri, StateStoreUriError};
+pub use state_store::{
+    OpenFailure, PackIndexFlagError, StateStore, StateStoreUri, StateStoreUriError,
+};
 pub use streams::{StreamArgs, StreamLimits};
 pub use ui_mount::bind_server_with_options;
 pub use worker::HostFloor;

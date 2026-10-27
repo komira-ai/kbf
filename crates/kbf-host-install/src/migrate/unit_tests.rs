@@ -141,3 +141,61 @@ fn a_cold_store_url_with_a_query_is_carried_as_it_is() {
     let unit = parse(&text, R).unwrap();
     assert_eq!(unit.args, ["--mode=storage", flag, "--node-id", "st1"]);
 }
+
+fn flags_of(args: &str, mode: &str) -> Result<Vec<String>, String> {
+    parse(&unit(&format!("ExecStart={R}/current/kbf {args}")), R)
+        .unwrap()
+        .flags(mode, "kbf-x.service")
+}
+
+/// The mode is named by `--mode=` alone on the packaged unit: the older first-word spelling is
+/// dropped when it is the unit's mode (the package's kbf refuses the word after `--mode=`), a
+/// `--mode` of the unit's mode is kept once, and a unit that names none gets one.
+#[test]
+fn the_mode_is_named_by_the_flag_alone() {
+    let words = |w: &[&str]| w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    let cold = "--cold-store=file:///var/lib/kbf/cold";
+    assert_eq!(
+        flags_of(&format!("storage {cold}"), "storage").unwrap(),
+        words(&["--mode=storage", cold])
+    );
+    assert_eq!(
+        flags_of(&format!("storage --mode=storage {cold}"), "storage").unwrap(),
+        words(&["--mode=storage", cold])
+    );
+    assert_eq!(
+        flags_of(&format!("--mode=storage {cold}"), "storage").unwrap(),
+        words(&["--mode=storage", cold])
+    );
+    assert_eq!(
+        flags_of(&format!("--mode storage {cold}"), "storage").unwrap(),
+        words(&["--mode", "storage", cold])
+    );
+    assert_eq!(
+        flags_of(cold, "storage").unwrap(),
+        words(&["--mode=storage", cold])
+    );
+    // Only the first word is the old spelling; a flag whose name starts with `--mode` is not.
+    assert_eq!(
+        flags_of("storage --mode-x=1", "storage").unwrap(),
+        words(&["--mode=storage", "--mode-x=1"])
+    );
+}
+
+/// A mode the unit's name does not say, by word or by flag, stops the move.
+#[test]
+fn another_mode_is_refused_by_word_and_by_flag() {
+    for args in [
+        "daemon --cold-store=x",
+        "--mode=daemon --cold-store=x",
+        "--mode daemon --cold-store=x",
+        "storage --mode=daemon",
+        "bogus",
+    ] {
+        let why = flags_of(args, "storage").unwrap_err();
+        assert!(
+            why.contains("not the mode of kbf-x.service"),
+            "{args}: {why}"
+        );
+    }
+}

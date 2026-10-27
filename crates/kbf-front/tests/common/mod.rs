@@ -89,6 +89,8 @@ pub type TestCache = Cache<RaceLog, MemoryStore>;
 /// A cache served on a loopback port by this process, and a channel to it.
 pub struct Farm {
     pub cache: Arc<TestCache>,
+    /// Where the listener is.
+    pub addr: SocketAddr,
     channel: Channel,
 }
 
@@ -218,6 +220,8 @@ impl Farm {
         );
         let incoming = TcpIncoming::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
         let addr = incoming.local_addr().expect("local address");
+        // As kbf-server accepts: a connection that knows when it is gone.
+        let incoming = kbf_tls::Incoming::new(incoming, None);
         let routes = routes(Arc::clone(&cache));
         tokio::spawn(async move {
             match layer {
@@ -239,7 +243,11 @@ impl Farm {
             .connect()
             .await
             .expect("connect");
-        Self { cache, channel }
+        Self {
+            cache,
+            addr,
+            channel,
+        }
     }
 
     /// A channel to this farm's listener.

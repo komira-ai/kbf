@@ -3,13 +3,14 @@
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use crate::cli::{BenchArgs, Cli, Cmd, Common, Gate, ImageCmd, ProbeArgs};
 use crate::image::{BaseArgs, SetupArgs};
 use crate::probe::{Ctx, Timing};
 use crate::report::{Report, Status};
 use crate::system::System;
-use crate::{bench, e3, gates, image};
+use crate::{bench, e3, gates, image, prime};
 
 fn name_of(cmd: &Cmd) -> &'static str {
     match cmd {
@@ -54,6 +55,28 @@ fn probe(sys: &dyn System, args: &ProbeArgs, timing: Timing) -> Report {
         },
         Err(e) => Report::error("probe", e),
     }
+}
+
+/// `image prime`: the base is the work directory, so the share and the frames land inside it.
+fn prime_cmd(
+    sys: &dyn System,
+    base: &Path,
+    guest_binary: &Path,
+    deadline: Duration,
+    timing: Timing,
+) -> Report {
+    let work = std::path::absolute(base).unwrap_or_else(|_| base.to_owned());
+    let ctx = Ctx {
+        sys,
+        work: work.clone(),
+        base: work,
+        guest_binary: Some(guest_binary.to_owned()),
+        keep: false,
+        graphics: true,
+        matrix: false,
+        timing,
+    };
+    prime::prime(&ctx, deadline)
 }
 
 fn bench_cmd(sys: &dyn System, args: &BenchArgs, timing: Timing) -> Report {
@@ -113,6 +136,7 @@ pub fn run(
             sim_runtimes,
             sim_app,
             allow_external_links,
+            guest_user,
         }) => image::setup(
             sys,
             base,
@@ -122,6 +146,22 @@ pub fn run(
                 sim_runtimes: sim_runtimes.clone(),
                 sim_app: sim_app.clone(),
                 allow_external_links: *allow_external_links,
+                guest_user: guest_user.clone(),
+            },
+        ),
+        Cmd::Image(ImageCmd::Prime {
+            base,
+            guest_binary,
+            deadline_secs,
+            shutdown_secs,
+        }) => prime_cmd(
+            sys,
+            base,
+            guest_binary,
+            Duration::from_secs(*deadline_secs),
+            Timing {
+                shutdown_timeout: Duration::from_secs(*shutdown_secs),
+                ..timing
             },
         ),
         Cmd::Image(ImageCmd::Harvest { bundle, out }) => image::harvest(sys, bundle, out),

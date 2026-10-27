@@ -10,11 +10,9 @@
 //! systemd carries on with the restart. Either way the client asks again, and the next
 //! `query` or restart finds the unit as systemd left it.
 
-use std::thread;
-use std::time::Instant;
-
 use super::{Host, fail, step, take_install_lock};
 use crate::outcome::{FailureCode, Outcome};
+use crate::pace::Pace;
 use crate::plan;
 use crate::request::Unit;
 use crate::runner::Runner;
@@ -40,13 +38,18 @@ fn restart(
     let _lock = take_install_lock(host)?;
     let command = plan::restart_unit(unit);
     step(runner, &command, FailureCode::RestartFailed)?;
-    wait_active(runner, unit, host.restart_wait)
+    wait_active(runner, unit, host.restart_wait, &host.pace)
 }
 
 /// Ask whether `unit` is active until it says so, or `wait` is over. A look that cannot be
 /// made or that does not say `active` is a unit that is not active yet.
-fn wait_active(runner: &dyn Runner, unit: &Unit, wait: plan::Wait) -> Result<Outcome, Outcome> {
-    let deadline = Instant::now() + wait.timeout;
+fn wait_active(
+    runner: &dyn Runner,
+    unit: &Unit,
+    wait: plan::Wait,
+    pace: &Pace,
+) -> Result<Outcome, Outcome> {
+    let deadline = (pace.now)() + wait.timeout;
     loop {
         let active = runner
             .run(&plan::unit_active(unit))
@@ -56,7 +59,7 @@ fn wait_active(runner: &dyn Runner, unit: &Unit, wait: plan::Wait) -> Result<Out
                 unit: unit.as_str().to_owned(),
             });
         }
-        if Instant::now() >= deadline {
+        if (pace.now)() >= deadline {
             return Err(fail(
                 FailureCode::RestartTimeout,
                 format!(
@@ -66,6 +69,6 @@ fn wait_active(runner: &dyn Runner, unit: &Unit, wait: plan::Wait) -> Result<Out
                 ),
             ));
         }
-        thread::sleep(wait.interval);
+        (pace.sleep)(wait.interval);
     }
 }

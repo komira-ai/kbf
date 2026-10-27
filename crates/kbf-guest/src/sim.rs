@@ -9,9 +9,13 @@
 //!    `xcodebuild -importPlatform <bundle>` (a `.exportedBundle`, what
 //!    `xcodebuild -downloadPlatform -exportPath` writes);
 //! 2. in the session of the guest's auto-login user (`launchctl asuser <uid> sudo -u <user>`):
-//!    `simctl list runtimes -j` and `list devicetypes -j` (the output picks the runtime and
-//!    the device type), `simctl create`, `boot`, `bootstatus -b`, an optional app
+//!    `simctl list runtimes -j` and `list devicetypes -j` (the runtimes output picks the
+//!    runtime and, from that runtime's `supportedDeviceTypes`, the device type; the
+//!    devicetypes output is the fallback when the runtime lists none), `simctl create`, `boot`, `bootstatus -b`, an optional app
 //!    (`install`, `launch`), `simctl io screenshot`, and `simctl shutdown`.
+//!
+//! # Whose session
+//! See [`sim_user`](crate::sim_user): the recorded user, or the console owner.
 //!
 //! # No hang, no guess
 //! Every command has a deadline from [`Config`] and is killed (with its process group) when
@@ -42,6 +46,11 @@ use serde_json::{Value, json};
 
 use crate::frame::{Frame, Kind, MAX_BODY_BYTES, SendError};
 use crate::probe::send_with_retries;
+pub use crate::sim_choose::{
+    RuntimeDeviceType, choose_device_type, choose_device_type_for_runtime, choose_runtime,
+};
+pub use crate::sim_user::Wanted;
+use crate::sim_user::{unmet_wish, wait_console_user};
 use crate::simpaths;
 
 /// The prefix of a step frame's name; the host collects the frames by it.
@@ -74,7 +83,6 @@ const XCRUN: &str = "/usr/bin/xcrun";
 const PLUTIL: &str = "/usr/bin/plutil";
 const LAUNCHCTL: &str = "/bin/launchctl";
 const SUDO: &str = "/usr/bin/sudo";
-const RUNTIME_ID_PREFIX: &str = "com.apple.CoreSimulator.SimRuntime.iOS-";
 
 /// Who runs a step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,56 +339,6 @@ impl State {
     }
 }
 
-/// The version of a runtime as a comparable list of numbers (`"27.0"` -> `[27, 0]`).
-fn version_key(v: &str) -> Vec<u64> {
-    v.split('.').map(|p| p.parse().unwrap_or(0)).collect()
-}
-
-/// Picks the iOS runtime to create the device with: the newest available one.
-///
-/// # Errors
-/// The text is not `simctl list runtimes -j` output or names no available iOS runtime.
-pub fn choose_runtime(list: &str) -> Result<String, String> {
-    let v: Value = serde_json::from_str(list).map_err(|e| format!("not JSON: {e}"))?;
-    let runtimes = v["runtimes"].as_array().ok_or("no `runtimes` array")?;
-    runtimes
-        .iter()
-        .filter(|r| {
-            r["identifier"]
-                .as_str()
-                .is_some_and(|i| i.starts_with(RUNTIME_ID_PREFIX))
-                && r["isAvailable"].as_bool().unwrap_or(false)
-        })
-        .max_by_key(|r| version_key(r["version"].as_str().unwrap_or("")))
-        .and_then(|r| r["identifier"].as_str())
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            format!(
-                "no available iOS runtime among {} listed (was a runtime staged and added?)",
-                runtimes.len()
-            )
-        })
-}
-
-/// Picks the device type: the last one listed whose name starts with `iPhone` (the list
-/// is oldest first).
-///
-/// # Errors
-/// The text is not `simctl list devicetypes -j` output or lists no iPhone.
-pub fn choose_device_type(list: &str) -> Result<String, String> {
-    let v: Value = serde_json::from_str(list).map_err(|e| format!("not JSON: {e}"))?;
-    let types = v["devicetypes"]
-        .as_array()
-        .ok_or("no `devicetypes` array")?;
-    types
-        .iter()
-        .rev()
-        .find(|t| t["name"].as_str().is_some_and(|n| n.starts_with("iPhone")))
-        .and_then(|t| t["identifier"].as_str())
-        .map(str::to_owned)
-        .ok_or_else(|| format!("no iPhone among {} device types", types.len()))
-}
-
 /// The most bytes of a command's output an error note repeats; the rest is cut and the note
 /// ends with [`CUT_MARK`]. A note rides in a step frame, which must stay under
 /// [`MAX_BODY_BYTES`] whatever the command printed.
@@ -554,6 +512,10 @@ pub trait SimHost {
     fn app_bundles(&self) -> Vec<String>;
     /// The user logged in at the console, if there is one.
     fn console_user(&self) -> Option<ConsoleUser>;
+    /// The user `kbf-guest mkuser` recorded as ready ([`simpaths::USER_READY`]), if any.
+    fn ready_user(&self) -> Option<String>;
+    /// The user `image setup --guest-user` asked for ([`simpaths::USER_WANTED`]), if any.
+    fn wanted_user(&self) -> Wanted;
     /// Makes [`OUT_DIR`] writable by the console user.
     ///
     /// # Errors
@@ -666,6 +628,9 @@ struct Run<'a> {
     cfg: &'a Config,
     log: &'a mut dyn Write,
     undelivered: Vec<String>,
+    /// The user whose session the user steps need (the one `mkuser` recorded); `None`: the
+    /// console owner, whoever it is.
+    user_name: Option<String>,
 }
 
 impl<'a> Run<'a> {
@@ -675,6 +640,7 @@ impl<'a> Run<'a> {
             cfg,
             log,
             undelivered: Vec::new(),
+            user_name: None,
         }
     }
 
@@ -695,21 +661,6 @@ impl<'a> Run<'a> {
     fn deliver_json(&mut self, name: &str, body: &impl Serialize) -> bool {
         let text = format!("{:#}", serde_json::to_value(body).unwrap_or(Value::Null));
         self.deliver(&Frame::new(Kind::Result, name, &text))
-    }
-}
-
-/// Waits for the console user, counting pauses: `None` when none appeared in time.
-fn wait_console_user(host: &dyn SimHost, wait: Duration) -> Option<ConsoleUser> {
-    let mut waited = Duration::ZERO;
-    loop {
-        if let Some(u) = host.console_user() {
-            return Some(u);
-        }
-        if waited >= wait {
-            return None;
-        }
-        host.pause(CONSOLE_POLL);
-        waited += CONSOLE_POLL;
     }
 }
 
@@ -745,6 +696,14 @@ pub fn run(host: &dyn SimHost, cfg: &Config, log: &mut dyn Write) -> SummaryFram
             Some("sim runs as root".into()),
         );
     }
+    // A guest that is to have a user but has none yet has no session to run the user steps
+    // in: running the root ones would only import the runtimes into the base for nothing.
+    let ready = host.ready_user();
+    // Fails closed: a wish that cannot be read stops the run as a wish that is not met does.
+    if let Some(why) = ready.as_ref().map_or_else(|| unmet_wish(host), |_| None) {
+        return finish(&mut r, &[], &State::default(), None, Some(why));
+    }
+    r.user_name = ready;
     let inputs = Inputs {
         runtimes: host
             .runtime_images()
@@ -870,15 +829,23 @@ fn execute(
     };
     f.argv.clone_from(&argv);
     let command = if step.who == Who::User {
-        let found = user.get_or_insert_with(|| wait_console_user(host, cfg.console_wait));
+        let expected = r.user_name.as_deref();
+        let found = user.get_or_insert_with(|| wait_console_user(host, cfg.console_wait, expected));
         match found {
             Some(u) => as_user(u, &argv),
             None => {
                 f.status = Status::Error;
-                f.note = Some(format!(
-                    "no user was logged in at the console within {} s",
-                    cfg.console_wait.as_secs()
-                ));
+                f.note = Some(match expected {
+                    None => format!(
+                        "no user was logged in at the console within {} s",
+                        cfg.console_wait.as_secs()
+                    ),
+                    Some(name) => format!(
+                        "the user {name} (recorded by mkuser) was not logged in at the console within {} s; the console owner is {}",
+                        cfg.console_wait.as_secs(),
+                        host.console_user().map_or("nobody".to_owned(), |u| u.name)
+                    ),
+                });
                 return;
             }
         }
@@ -928,10 +895,8 @@ fn absorb(
 ) {
     let text = String::from_utf8_lossy(&out.stdout);
     let taken: Option<Result<String, String>> = match step.id.as_str() {
-        "list-runtimes" => Some(choose_runtime(&text).inspect(|v| state.runtime = Some(v.clone()))),
-        "list-devicetypes" => {
-            Some(choose_device_type(&text).inspect(|v| state.device_type = Some(v.clone())))
-        }
+        "list-runtimes" => Some(take_runtime(&text, state)),
+        "list-devicetypes" => Some(take_fallback_device_type(&text, state)),
         "create" => Some(parse_udid(&text).inspect(|v| state.udid = Some(v.clone()))),
         "app-id" => Some(parse_bundle_id(&text).inspect(|v| state.bundle_id = Some(v.clone()))),
         "screenshot" => Some(
@@ -949,6 +914,39 @@ fn absorb(
         }
         None => {}
     }
+}
+
+/// Takes the runtime and, from its `supportedDeviceTypes`, the device type. A runtime that
+/// lists none leaves the device type to the `list-devicetypes` step.
+fn take_runtime(text: &str, state: &mut State) -> Result<String, String> {
+    let runtime = choose_runtime(text)?;
+    state.runtime = Some(runtime.clone());
+    match choose_device_type_for_runtime(text, &runtime)? {
+        RuntimeDeviceType::Chosen(device) => {
+            state.device_type = Some(device.clone());
+            Ok(format!(
+                "{runtime} (the newest available iOS runtime) and device type {device} (the last iPhone in its supportedDeviceTypes)"
+            ))
+        }
+        RuntimeDeviceType::NotListed => Ok(format!(
+            "{runtime} (the newest available iOS runtime); it lists no supportedDeviceTypes, so the device type comes from list-devicetypes"
+        )),
+    }
+}
+
+/// Takes the device type from `list devicetypes` unless the runtime's own list already gave
+/// one, which is the only list that knows what the runtime can create.
+fn take_fallback_device_type(text: &str, state: &mut State) -> Result<String, String> {
+    if let Some(chosen) = &state.device_type {
+        return Ok(format!(
+            "the device type {chosen} from the runtime's supportedDeviceTypes (the devicetypes listing was not used)"
+        ));
+    }
+    let device = choose_device_type(text)?;
+    state.device_type = Some(device.clone());
+    Ok(format!(
+        "{device} (the last iPhone listed; the runtime gave no supportedDeviceTypes, so this may not be one it supports)"
+    ))
 }
 
 /// Reads the screenshot and sends it as a frame of its own.

@@ -12,6 +12,7 @@ use super::{Environment, Host, SELF_EXE, dispatch, handle};
 use crate::config::ChannelSource;
 use crate::locks;
 use crate::outcome::{FailureCode, Outcome, Refusal};
+use crate::pace::fake::Fake;
 use crate::plan;
 use crate::request::{Channel, Version};
 use crate::runner::Runner;
@@ -24,6 +25,8 @@ pub(super) struct Fx {
     pub(super) dir: TestDir,
     pub(super) host: Host,
     pub(super) source: PathBuf,
+    /// The time of this host's waits: it moves only when they sleep.
+    pub(super) clock: Fake,
 }
 
 pub(super) struct Answer {
@@ -49,7 +52,9 @@ impl Fx {
         let dir = TestDir::under(std::env::temp_dir(), name);
         fs::set_permissions(&*dir, fs::Permissions::from_mode(0o755)).unwrap();
         let trust = Trust::owned_by(fs::metadata(&*dir).unwrap().uid(), &dir);
-        let host = Host::for_test(&dir, trust);
+        let mut host = Host::for_test(&dir, trust);
+        let clock = Fake::new();
+        host.pace = std::rc::Rc::new(clock.pace());
         let key = dir.join("key.gpg");
         write(&key, 0o644, "key");
         let source = dir.join("candidate.sources");
@@ -69,7 +74,12 @@ impl Fx {
                 source.display()
             ),
         );
-        Self { dir, host, source }
+        Self {
+            dir,
+            host,
+            source,
+            clock,
+        }
     }
 
     pub(super) fn run(&self, runner: &dyn Runner, command: &str) -> Answer {
@@ -967,4 +977,20 @@ fn the_unit_mode_is_not_reachable_over_ssh() {
         &mut err,
     );
     assert_eq!(code, 0);
+}
+
+/// A lock is let go when it is dropped, even while another copy of its descriptor lives on.
+/// A process another thread starts has such a copy from the fork until it execs, and a plain
+/// `flock` lives as long as any copy does, so a drop could be followed by a refusal as busy
+/// for as long as that child had not yet exec'd. The `try_clone` is that copy.
+#[test]
+fn a_lock_is_let_go_at_drop_while_a_copy_of_its_descriptor_lives_on() {
+    let dir = TestDir::under(std::env::temp_dir(), "hi-lock-copy");
+    let path = dir.join("install.lock");
+    let held = super::take_lock(&path).unwrap();
+    let copy = held.file().try_clone().unwrap();
+    drop(held);
+    let again = super::take_lock(&path);
+    assert!(again.is_ok(), "busy after the drop: {:?}", again.err());
+    drop(copy);
 }

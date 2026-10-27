@@ -52,7 +52,20 @@ impl Mig {
             systemd_dir: rig.dir.join("systemd"),
             proc_dir: rig.dir.join("proc"),
             kbf: rig.dir.join("usr-bin-kbf"),
+            root: rig.root.to_path_buf(),
         };
+        // The node's directories, as a hand-placed node has them: searchable by others.
+        for dir in [
+            "var",
+            "var/lib",
+            "var/lib/kbf",
+            "var/lib/kbf/cold",
+            "var/lib/kbf-meta",
+        ] {
+            let path = rig.root.join(dir);
+            fs::create_dir_all(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         fs::create_dir(&place.systemd_dir).unwrap();
         fs::set_permissions(&place.systemd_dir, fs::Permissions::from_mode(0o755)).unwrap();
         let original = OLD_UNIT.replace("@RELEASES@", &releases.display().to_string());
@@ -114,6 +127,19 @@ impl Mig {
         self.place.systemd_dir.join(UNIT)
     }
 
+    /// A directory of the node's, as the flags name it.
+    fn node_dir(&self, shown: &str) -> PathBuf {
+        self.rig.root.join(shown.trim_start_matches('/'))
+    }
+
+    fn mode_of(&self, shown: &str) -> u32 {
+        fs::metadata(self.node_dir(shown))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
     fn drop_in(&self) -> PathBuf {
         self.place
             .systemd_dir
@@ -156,7 +182,7 @@ impl Mig {
 /// What the drop-in is for the unit above.
 const DROP_IN_TEXT: &str = "# Written by kbf-host-install --migrate-to-package: the flags this node's hand-placed\n\
 # unit gave kbf, now on the kbf package's unit and its /usr/bin/kbf.\n\
-[Unit]\nConditionPathExists=\n\n[Service]\nUser=kbf\nEnvironment=RUST_LOG=info\n\
+[Unit]\nConditionPathExists=\n\n[Service]\nUser=kbf\nEnvironment=RUST_LOG=info\nStateDirectory=\n\
 ExecStart=\nExecStart=/usr/bin/kbf --mode=storage-and-daemon --cold-store=file:///var/lib/kbf/cold --meta-dir=/var/lib/kbf-meta\n\
 ExecStartPre=\nExecStartPre=+/usr/bin/kbf boot-check --mode=storage-and-daemon\n\
 ExecStartPre=/usr/bin/kbf --mode=storage-and-daemon --cold-store=file:///var/lib/kbf/cold --meta-dir=/var/lib/kbf-meta --check\n";
@@ -172,6 +198,10 @@ fn the_dry_run_prints_the_plan_and_changes_nothing() {
         assert_eq!((code, err.as_str()), (0, ""), "{out}");
         let lines: Vec<&str> = out.lines().filter(|l| l.starts_with("DRY-RUN: ")).collect();
         assert_eq!(lines.len(), 7, "{out}");
+        assert!(
+            out.contains("checked: /var/lib/kbf keeps mode 0755"),
+            "{out}"
+        );
         assert!(lines[0].contains("install the verified package"));
         assert!(lines[1].contains("10-node-flags.conf"));
         assert!(lines[2].contains(".hand-placed"));
@@ -203,21 +233,30 @@ fn the_migration_installs_carries_the_flags_restarts_checks_and_only_then_remove
             .into_iter()
             .filter(|e| !e.starts_with("active:") && e != "download" && e != "query")
             .collect();
+        // A deb is unpacked and its kbf run on the flags (with --help last) before anything changes.
+        let unpacked: Vec<String> = if format == Format::Deb {
+            vec!["unpack".to_owned(), "parse-only".to_owned()]
+        } else {
+            Vec::new()
+        };
         assert_eq!(
             marks,
             [
-                "attest".to_owned(),
-                "inspect".to_owned(),
-                format!(
-                    "install:{}:trial=false:prev_kept=false:old={}",
-                    a_version(),
-                    format == Format::Rpm
-                ),
-                "reload".to_owned(),
-                format!("restart:{UNIT}"),
-                "show:old_layout=true".to_owned(),
-                "kbf-version".to_owned(),
+                vec!["attest".to_owned(), "inspect".to_owned()],
+                unpacked,
+                vec![
+                    format!(
+                        "install:{}:trial=false:prev_kept=false:old={}",
+                        a_version(),
+                        format == Format::Rpm
+                    ),
+                    "reload".to_owned(),
+                    format!("restart:{UNIT}"),
+                    "show:old_layout=true".to_owned(),
+                    "kbf-version".to_owned()
+                ],
             ]
+            .concat()
         );
         assert_eq!(mig.rig.installed(), Some(a_version()));
         assert_eq!(fs::read_to_string(mig.drop_in()).unwrap(), DROP_IN_TEXT);
@@ -265,7 +304,7 @@ fn the_drop_in_names_the_mode_and_the_account_the_unit_ran_as() {
         "/r",
     )
     .unwrap();
-    let text = drop_in(&old, "daemon");
+    let text = drop_in(&old, "daemon", "kbf-daemon.service").unwrap();
     assert!(text.contains("User=root\nGroup=kbf\nWorkingDirectory=/srv\nSupplementaryGroups=a b\nEnvironmentFile=/etc/kbf/env\n"), "{text}");
     assert!(text.contains("ExecStart=/usr/bin/kbf --mode=daemon --listen=0.0.0.0:8981\n"));
     assert!(
@@ -283,7 +322,7 @@ fn a_cold_store_url_with_a_query_reaches_the_drop_in_byte_for_byte() {
         "/r",
     )
     .unwrap();
-    let text = drop_in(&old, "storage");
+    let text = drop_in(&old, "storage", "kbf-storage.service").unwrap();
     assert!(
         text.contains(&format!("ExecStart=/usr/bin/kbf --mode=storage {flag}\n")),
         "{text}"
@@ -408,6 +447,14 @@ fn what_cannot_be_carried_or_verified_is_refused_and_nothing_changes() {
                 let text = m
                     .original
                     .replace("--mode=storage-and-daemon", "--mode=daemon");
+                put(&m.unit_file(), text);
+            }),
+            "not the mode of",
+        ),
+        (
+            "another-mode-word",
+            Box::new(|m| {
+                let text = m.original.replace("--mode=storage-and-daemon", "daemon");
                 put(&m.unit_file(), text);
             }),
             "not the mode of",
@@ -912,4 +959,400 @@ fn a_unit_without_a_mode_flag_gets_its_names_mode_and_a_dangling_drop_in_directo
         assert!(err.contains("putting it back failed"), "{err}");
         assert_eq!(fs::read_to_string(mig.unit_file()).unwrap(), mig.original);
     });
+}
+
+/// What a hand-placed unit that names its mode by the older first word (`kbf storage-and-daemon
+/// --cold-store=...`) is migrated to: the same drop-in as for `--mode=`, with the word gone from
+/// `ExecStart=` and from the `--check` (the package's kbf refuses a word after `--mode=`:
+/// "unexpected argument"). The plan runs the package's kbf on those flags, and the apply
+/// carries on to the end.
+#[test]
+fn a_unit_that_names_its_mode_by_the_older_word_is_migrated_without_the_word() {
+    both(|format| {
+        let mig = Mig::new("mig-word", format);
+        let text = mig
+            .original
+            .replace("--mode=storage-and-daemon", "storage-and-daemon");
+        assert!(text.contains("kbf storage-and-daemon"), "{text}");
+        put(&mig.unit_file(), &text);
+        let (code, out, err) = mig.run(false);
+        assert_eq!((code, err.as_str()), (0, ""), "{out}");
+        assert!(
+            !out.contains("storage-and-daemon storage-and-daemon"),
+            "{out}"
+        );
+        assert_eq!(fs::read_to_string(mig.unit_file()).unwrap(), text);
+        assert!(!mig.drop_in().exists());
+        assert!(!mig.rig.events().iter().any(|e| e.starts_with("install:")));
+
+        let (code, out, err) = mig.run(true);
+        assert_eq!((code, err.as_str()), (0, ""), "{out}");
+        assert_eq!(fs::read_to_string(mig.drop_in()).unwrap(), DROP_IN_TEXT);
+    });
+}
+
+/// A mode word that is not the unit's mode is refused by the plan, as a `--mode=` of another
+/// mode is.
+#[test]
+fn a_mode_word_of_another_mode_is_refused_and_nothing_changes() {
+    both(|format| {
+        let mig = Mig::new("mig-other-word", format);
+        let text = mig.original.replace("--mode=storage-and-daemon", "daemon");
+        put(&mig.unit_file(), &text);
+        for apply in [false, true] {
+            let (code, out, err) = mig.run(apply);
+            assert_eq!(code, 2, "{out} {err}");
+            assert!(err.contains("not the mode of"), "{err}");
+        }
+        assert_eq!(mig.rig.installed(), None);
+        assert!(mig.rig.restarts().is_empty());
+    });
+}
+
+/// The plan runs the package's own kbf on the drop-in's flags, and what it refuses stops the
+/// move before the package is installed or anything is written.
+#[test]
+fn flags_the_package_kbf_refuses_stop_the_plan() {
+    let mig = Mig::new("mig-kbf-refuses", Format::Deb);
+    mig.rig.net.borrow_mut().kbf_refuses =
+        Some("error: unexpected argument '--meta-dir' found\n".to_owned());
+    for apply in [false, true] {
+        let (code, out, err) = mig.run(apply);
+        assert_eq!(code, 2, "{out} {err}");
+        assert!(
+            err.contains("the package's kbf does not accept the flags"),
+            "{err}"
+        );
+        assert!(err.contains("unexpected argument '--meta-dir'"), "{err}");
+        assert!(!out.contains("+ "), "{out}");
+    }
+    let events = mig.rig.events();
+    assert!(events.iter().any(|e| e == "parse-only"), "{events:?}");
+    assert!(
+        !events.iter().any(|e| e.starts_with("install:")),
+        "{events:?}"
+    );
+    assert!(!mig.drop_in().exists());
+    assert_eq!(mig.rig.installed(), None);
+    assert!(mig.rig.work().is_empty());
+}
+
+/// An rpm is not unpacked: the plan says its kbf was not run on the flags.
+#[test]
+fn an_rpm_plan_says_the_package_kbf_was_not_run() {
+    let mig = Mig::new("mig-rpm-note", Format::Rpm);
+    let (code, out, err) = mig.run(false);
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    assert!(
+        out.contains("checked: the package is not unpacked here"),
+        "{out}"
+    );
+    assert!(!mig.rig.events().iter().any(|e| e == "parse-only"));
+}
+
+/// A node whose data directory is closed to others is refused before anything changes: the
+/// container runtime reaches the scratch directory through it, and the move keeps modes.
+#[test]
+fn a_data_directory_closed_to_others_is_refused_and_nothing_changes() {
+    both(|format| {
+        for closed in ["var/lib/kbf", "var/lib"] {
+            let mig = Mig::new("mig-closed", format);
+            fs::set_permissions(mig.rig.root.join(closed), fs::Permissions::from_mode(0o750))
+                .unwrap();
+            for apply in [false, true] {
+                let (code, out, err) = mig.run(apply);
+                assert_eq!(code, 2, "{closed}: {out} {err}");
+                assert!(err.contains("is not searchable by others"), "{err}");
+                assert!(err.contains(&format!("chmod o+x /{closed}")), "{err}");
+            }
+            assert_eq!(mig.rig.installed(), None);
+            assert!(!mig.drop_in().exists());
+        }
+    });
+}
+
+/// The plan says which directories the packaged unit would change (its `StateDirectory=` and
+/// `StateDirectoryMode=`) and that the drop-in keeps them.
+#[test]
+fn the_plan_reports_the_directory_modes_the_package_would_change() {
+    let mig = Mig::new("mig-report", Format::Deb);
+    let (code, out, err) = mig.run(false);
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    assert!(
+        out.contains(
+            "checked: the package's unit would set /var/lib/kbf from mode 0755 to 0750 \
+             (StateDirectory=); the drop-in clears StateDirectory=, so it stays"
+        ),
+        "{out}"
+    );
+    for dir in ["/var/lib/kbf", "/var/lib/kbf/cold", "/var/lib/kbf-meta"] {
+        assert!(
+            out.contains(&format!("checked: {dir} keeps mode 0755")),
+            "{out}"
+        );
+    }
+}
+
+/// An install that changes a directory of the node's gets it back its mode.
+#[test]
+fn the_node_keeps_its_directory_modes_through_the_install() {
+    both(|format| {
+        let mig = Mig::new("mig-keep-install", format);
+        mig.rig.net.borrow_mut().narrow_on_install = Some((mig.node_dir("/var/lib/kbf"), 0o750));
+        let (code, out, err) = mig.run(true);
+        assert_eq!((code, err.as_str()), (0, ""), "{out}");
+        assert_eq!(mig.mode_of("/var/lib/kbf"), 0o755);
+    });
+}
+
+/// A start that narrows a directory fails the check, and the way back puts the mode back
+/// before the hand-placed unit restarts: its container runtime needs it at that start.
+#[test]
+fn a_start_that_narrows_a_directory_is_rolled_back_with_the_mode_restored_first() {
+    both(|format| {
+        let mig = Mig::new("mig-narrowed", format);
+        {
+            let mut net = mig.rig.net.borrow_mut();
+            net.narrow_on_restart = Some((mig.node_dir("/var/lib/kbf"), 0o750));
+            net.watch_dir = Some(mig.node_dir("/var/lib/kbf"));
+        }
+        let (code, out, err) = mig.run(true);
+        assert_eq!(code, 1, "{out} {err}");
+        assert!(err.contains("the start changed /var/lib/kbf"), "{err}");
+        assert!(
+            err.contains("the hand-placed unit is back and running"),
+            "{err}"
+        );
+        let at_restart: Vec<String> = mig
+            .rig
+            .events()
+            .into_iter()
+            .filter(|e| e.starts_with("dir-mode-at-restart:"))
+            .collect();
+        // The packaged unit's start saw the mode as it was; the hand-placed unit's, too.
+        assert_eq!(
+            at_restart,
+            ["dir-mode-at-restart:755", "dir-mode-at-restart:755"]
+        );
+        assert_eq!(mig.mode_of("/var/lib/kbf"), 0o755);
+        assert_eq!(fs::read_to_string(mig.unit_file()).unwrap(), mig.original);
+    });
+}
+
+/// A hand-placed unit that is active for a moment and then fails is not "back and running":
+/// the way back looks at the unit again, and says the state it saw (or that it was not active,
+/// when the look said nothing).
+#[test]
+fn a_unit_put_back_that_does_not_stay_active_is_a_failure_with_its_state() {
+    both(|format| {
+        for (said, state) in [("activating\n", "activating"), ("", "not active")] {
+            let mig = Mig::new("mig-crash-loop", format);
+            {
+                let mut net = mig.rig.net.borrow_mut();
+                net.kbf_commit = Some("b".repeat(40));
+                // The packaged unit is active (the forward wait), then the hand-placed one is
+                // for two looks, and fails after.
+                net.active_script = [(0, "active\n"), (0, "active\n"), (0, "active\n"), (3, said)]
+                    .map(|(code, said)| (code, said.to_owned()))
+                    .into();
+            }
+            let (code, out, err) = mig.run(true);
+            assert_eq!(code, 1, "{out} {err}");
+            assert!(err.contains("reports commit"), "{err}");
+            assert!(err.contains("putting it back failed"), "{err}");
+            assert!(
+                err.contains(&format!("did not stay active: it is {state}")),
+                "{err}"
+            );
+            assert!(!err.contains("is back and running"), "{err}");
+            // The old layout is whole, for the operator to try again.
+            assert!(mig.releases().join(A).join("kbf").exists());
+        }
+    });
+}
+
+/// A hand-placed unit that stays active is back and running: the way back looks more than
+/// once.
+#[test]
+fn a_unit_put_back_that_stays_active_is_running() {
+    let mig = Mig::new("mig-stays", Format::Deb);
+    mig.rig.net.borrow_mut().kbf_commit = None;
+    let (code, _, err) = mig.run(true);
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("the hand-placed unit is back and running"),
+        "{err}"
+    );
+    let looks = mig
+        .rig
+        .events()
+        .iter()
+        .filter(|e| e.starts_with("active:"))
+        .count();
+    assert!(looks > 3, "{looks} looks");
+}
+
+/// A node that was moved and put back by an earlier run has the package installed and no
+/// drop-in: the next run installs the same file again and migrates.
+#[test]
+fn a_second_run_on_a_node_with_the_package_installed_migrates() {
+    both(|format| {
+        let mig = Mig::new("mig-second", format);
+        mig.rig.net.borrow_mut().installed = Some(a_version());
+        let (code, out, err) = mig.run(false);
+        assert_eq!((code, err.as_str()), (0, ""), "{out}");
+        assert_eq!(mig.rig.installed(), Some(a_version()));
+        let (code, out, err) = mig.run(true);
+        assert_eq!((code, err.as_str()), (0, ""), "{out}");
+        assert!(out.ends_with(&format!("migrated: {UNIT} runs the kbf package\n")));
+        assert_eq!(fs::read_to_string(mig.drop_in()).unwrap(), DROP_IN_TEXT);
+        assert_eq!(mig.rig.installed(), Some(a_version()));
+        assert!(!mig.releases().exists());
+    });
+}
+
+/// A node that has none of its directories yet has nothing to keep: the plan says nothing of
+/// them and the move goes through.
+#[test]
+fn a_node_with_none_of_its_directories_has_nothing_to_keep() {
+    both(|format| {
+        let mig = Mig::new("mig-no-dirs", format);
+        for dir in ["var/lib/kbf/cold", "var/lib/kbf", "var/lib/kbf-meta"] {
+            fs::remove_dir(mig.rig.root.join(dir)).unwrap();
+        }
+        let (code, out, err) = mig.run(false);
+        assert_eq!((code, err.as_str()), (0, ""), "{out}");
+        assert!(!out.contains(" keeps mode"), "{out}");
+        assert!(
+            out.contains("DRY-RUN: install the verified package"),
+            "{out}"
+        );
+        assert!(!out.contains("put back any of"), "{out}");
+        let (code, out, err) = mig.run(true);
+        assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    });
+}
+
+/// A name of the node's that is a file, not a directory, is refused.
+#[test]
+fn a_node_directory_that_is_a_file_is_refused() {
+    let mig = Mig::new("mig-dir-file", Format::Deb);
+    fs::remove_dir(mig.node_dir("/var/lib/kbf-meta")).unwrap();
+    fs::write(mig.node_dir("/var/lib/kbf-meta"), b"x").unwrap();
+    let (code, out, err) = mig.run(false);
+    assert_eq!(code, 2, "{out} {err}");
+    assert!(
+        err.contains("/var/lib/kbf-meta is not a directory"),
+        "{err}"
+    );
+}
+
+/// Which directories the flags name: the data directory (the default for the modes that run
+/// containers), `--meta-dir` and a local cold store, absolute and once each; in the `--name=value`
+/// and `--name value` forms; a flag whose name only starts with one of them is not it.
+#[test]
+fn the_node_directories_are_the_ones_its_flags_name() {
+    let flags = |w: &[&str]| w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    let dirs = |w: &[&str], mode: &str| node_dirs(&flags(w), mode);
+    let path = |p: &str| PathBuf::from(p);
+    assert_eq!(
+        dirs(&["--cold-store=file:///c", "--meta-dir", "/m"], "storage"),
+        [path("/m")]
+            .into_iter()
+            .chain([path("/c")])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        dirs(
+            &["--data-dir=/d", "--meta-dir=/d", "--data-dirx=/e"],
+            "daemon"
+        ),
+        [path("/d")]
+    );
+    assert_eq!(dirs(&[], "daemon"), [path("/var/lib/kbf")]);
+    assert_eq!(
+        dirs(
+            &["--meta-dir=relative", "--cold-store=s3://bucket/p"],
+            "storage"
+        ),
+        Vec::<PathBuf>::new()
+    );
+}
+
+/// Only a mode that runs containers needs its data directory reachable.
+#[test]
+fn only_a_container_mode_needs_the_data_directory_searchable() {
+    let mig = Mig::new("mig-modes", Format::Deb);
+    fs::set_permissions(mig.node_dir("/var/lib"), fs::Permissions::from_mode(0o750)).unwrap();
+    let flags = ["--mode=storage".to_owned()];
+    assert!(record_dirs(&mig.place, &flags, "storage").is_ok());
+    assert!(record_dirs(&mig.place, &flags, "daemon").is_err());
+}
+
+/// What the packaged unit would do to the node's directories, read from its text: its
+/// `[Service]` only, the list emptied by an empty assignment, a mode in octal.
+#[test]
+fn the_packaged_units_state_directories_are_read_as_systemd_reads_them() {
+    let mig = Mig::new("mig-state-dirs", Format::Deb);
+    let unit = "[Unit]\nStateDirectory=ignored\n[Service]\nStateDirectory=gone\nStateDirectory=\n\
+                StateDirectory=kbf kbf-meta\nStateDirectoryMode=0700\nStateDirectoryMode=zz\nUser=kbf\nno assignment here\n";
+    let said = state_dir_changes(unit, &mig.place);
+    assert_eq!(
+        said.iter().map(|l| &l[..48]).collect::<Vec<_>>(),
+        [
+            "the package's unit would set /var/lib/kbf from m",
+            "the package's unit would set /var/lib/kbf-meta f"
+        ]
+    );
+    assert!(said[0].contains("from mode 0755 to 0700"), "{said:?}");
+    assert!(state_dir_changes("[Service]\nStateDirectory=missing\n", &mig.place).is_empty());
+}
+
+/// Directories that cannot be put back are said, by name.
+#[test]
+fn directories_that_cannot_be_put_back_are_said() {
+    let mig = Mig::new("mig-gone", Format::Deb);
+    let dir = Dir {
+        path: mig.node_dir("/var/lib/gone"),
+        shown: PathBuf::from("/var/lib/gone"),
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+    };
+    let said = restore_all(&[dir.clone(), dir]).unwrap_err();
+    assert_eq!(said.matches("/var/lib/gone:").count(), 2, "{said}");
+}
+
+/// A start that removes a directory fails the check; going back cannot restore it, and the
+/// operator is told which.
+#[test]
+fn a_directory_the_start_removes_is_said_when_going_back() {
+    let mig = Mig::new("mig-removed", Format::Deb);
+    mig.rig.net.borrow_mut().remove_on_restart = Some(mig.node_dir("/var/lib/kbf-meta"));
+    let (code, out, err) = mig.run(true);
+    assert_eq!(code, 1, "{out} {err}");
+    assert!(err.contains("the start changed /var/lib/kbf-meta"), "{err}");
+    assert!(err.contains("putting it back failed"), "{err}");
+    assert!(
+        err.contains("putting the directories back: /var/lib/kbf-meta"),
+        "{err}"
+    );
+}
+
+/// A package that cannot be unpacked, or whose kbf cannot be run, is refused before anything
+/// changes.
+#[test]
+fn a_package_that_cannot_be_unpacked_or_run_is_refused() {
+    for (broken, says) in [
+        ("unpack-fails", "unpacking the package: exit status Some(2)"),
+        ("kbf-cannot-run", "cannot start the package's kbf"),
+    ] {
+        let mig = Mig::new("mig-unpack", Format::Deb);
+        mig.rig.net.borrow_mut().broken.insert(broken);
+        let (code, out, err) = mig.run(true);
+        assert_eq!(code, 2, "{broken}: {out} {err}");
+        assert!(err.contains(says), "{broken}: {err}");
+        assert_eq!(mig.rig.installed(), None);
+        assert!(mig.rig.work().is_empty());
+    }
 }

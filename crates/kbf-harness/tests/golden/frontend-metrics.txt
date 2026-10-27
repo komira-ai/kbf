@@ -1,6 +1,12 @@
 # The series of a running frontend's /metrics (a farm of kbf processes under the beta load), as
 # it served them; the HELP and TYPE lines and the series the tests do not read are left out.
-kbf_execute_errors_total 0
+kbf_execute_errors_total{cause="client_abort"} 0
+kbf_execute_errors_total{cause="dropped"} 0
+kbf_execute_errors_total{cause="status"} 0
+kbf_execute_failed_actions_total{class="action"} 0
+kbf_execute_failed_actions_total{class="ambiguous"} 0
+kbf_execute_failed_actions_total{class="farm"} 0
+kbf_execute_failed_actions_total{class="request"} 0
 kbf_execute_in_flight 0
 kbf_execute_queued 0
 kbf_execute_requests_total 0

@@ -1400,10 +1400,47 @@ fn gamma_reads_the_coordinators_address_from_the_variable_alone() {
     red(
         &plant(
             "gamma",
-            "VERSION: ${{ needs.plan.outputs.version }}",
+            "VERSION: ${{ steps.farm-version.outputs.version }}",
             "VERSION: 1.1.1",
         ),
         "does not set `VERSION:",
+    );
+    // The release's tag is not the version the hosts report: it never converges.
+    red(
+        &plant(
+            "gamma",
+            "VERSION: ${{ steps.farm-version.outputs.version }}",
+            "VERSION: ${{ needs.plan.outputs.version }}",
+        ),
+        "does not set `VERSION:",
+    );
+    red(
+        &plant(
+            "gamma",
+            "cargo xtask release farm-version ",
+            "cargo xtask other ",
+        ),
+        "does not run `cargo xtask release farm-version`",
+    );
+    red(
+        &plant(
+            "gamma",
+            "--commit \"$COMMIT\" --output",
+            "--commit \"$TAG\" --output",
+        ),
+        "`cargo xtask release farm-version` is not given `--commit $COMMIT`",
+    );
+    red(
+        &plant("gamma", "        id: farm-version\n", ""),
+        "does not have `id: farm-version`",
+    );
+    red(
+        &plant(
+            "gamma",
+            "--tag \"$TAG\" --commit",
+            "--tag \"$COMMIT\" --commit",
+        ),
+        "`cargo xtask release farm-version` is not given `--tag $TAG`",
     );
     red(
         &plant("gamma", "cargo xtask deploy-farm ", "cargo xtask other "),

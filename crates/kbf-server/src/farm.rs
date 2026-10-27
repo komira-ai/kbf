@@ -69,6 +69,7 @@ use tonic::{Code, Status};
 mod ack;
 mod beat;
 mod durable;
+mod failed_actions;
 mod handover;
 mod learning;
 mod named;
@@ -89,6 +90,7 @@ pub use phase::Reported;
 use self::ack::{Verdict, refusal};
 use self::durable::intake::Intake;
 use self::durable::{Durable, Held};
+use self::failed_actions::{Class, FailedActions, class_of};
 use crate::action_usage::{self, Measured, Shapes};
 use crate::fault;
 use crate::fleet::{NodeView, SoftwareView, attention_changes};
@@ -365,6 +367,9 @@ struct State {
     /// The pack-write counts on the newest heartbeat of each node that sent any
     /// ([`Farm::note_pack_writes`]).
     pack_writes: BTreeMap<WorkerId, worker::PackWriteCounts>,
+    /// The operations this process settled as failed, per class
+    /// (`kbf_execute_failed_actions_total`, [`Farm::failed_actions`]).
+    failed: FailedActions,
 }
 
 /// How many committed records the farm holds for a state store that refuses them.
@@ -475,6 +480,7 @@ impl Farm {
                 watched: BTreeMap::new(),
                 pack_reads: BTreeMap::new(),
                 pack_writes: BTreeMap::new(),
+                failed: FailedActions::default(),
             }),
         }
     }
@@ -1707,6 +1713,7 @@ impl State {
         tracing::warn!(operation = %refusal.operation, reason = %refusal.reason, "operation refused");
         self.record_refused(refusal);
         let finished = refused_as(refusal);
+        self.failed.count(Class::Farm);
         // A lease given up before the operation was refused may still be listed.
         self.machine.forget_leases(refusal.operation);
         for stage in refusal.waiters.iter().filter_map(|id| self.stages.get(id)) {
@@ -1733,6 +1740,9 @@ impl State {
             .filter_map(|id| self.stages.get(id).cloned())
             .collect();
         let reason = detail.as_ref().and_then(Detail::reason);
+        if let Some(class) = class_of(answer.outcome, detail.as_ref()) {
+            self.failed.count(class);
+        }
         let finished = finished_of(answer, detail.as_ref());
         let (stored, write) = match detail {
             Some(Detail::Ran(pending)) => {

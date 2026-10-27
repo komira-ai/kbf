@@ -15,8 +15,10 @@
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
+use crate::pace::Pace;
 use crate::trust::Trust;
 
 /// The launchd label of the daemon's job.
@@ -107,6 +109,8 @@ pub struct MacHost {
     /// For the kit tree: trusted up to the top of the kit.
     pub(crate) kit_trust: Trust,
     pub(crate) tuning: Tuning,
+    /// How the waits tell time and pause: the real clock here, a made-up one in tests.
+    pub(crate) pace: Rc<Pace>,
 }
 
 impl MacHost {
@@ -130,6 +134,7 @@ impl MacHost {
             kit_trust: Trust::root_below(&kit),
             kit,
             tuning: Tuning::production(),
+            pace: Rc::new(Pace::real()),
         }
     }
 
@@ -164,6 +169,7 @@ impl MacHost {
                 bundle_max: 4 * 1024,
                 binary_max: 16 * 1024,
             },
+            pace: Rc::new(crate::pace::fake::Fake::new().pace()),
         }
     }
 

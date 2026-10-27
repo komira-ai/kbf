@@ -17,6 +17,7 @@
 //!   `shutdown` command and shuts the guest down cleanly.
 //! - [`sim`]: the iOS simulator probe (`kbf-guest sim`), its steps, frames and deadlines;
 //!   [`sim_run`] runs one command under a deadline.
+//! - [`mkuser`]: the guest's user (`kbf-guest mkuser`), created once by `image prime`.
 //! - [`simpaths`]: where `kbf-vmm image setup` stages Xcode and the simulator runtimes.
 //! - [`probe`]: the probe modes `kbf-vmm probe g2` and `g3` read, which run as any user.
 //!
@@ -27,6 +28,11 @@
 pub mod client;
 pub mod diag;
 pub mod frame;
+pub mod mkuser;
+#[cfg(target_os = "macos")]
+pub mod mkuser_host;
+#[cfg(test)]
+mod mkuser_tests;
 pub mod mount;
 pub mod probe;
 #[cfg(target_os = "macos")]
@@ -38,11 +44,13 @@ pub mod shutdown;
 #[cfg(target_os = "macos")]
 pub mod shutdown_host;
 pub mod sim;
+pub mod sim_choose;
 #[cfg(target_os = "macos")]
 pub mod sim_host;
 pub mod sim_run;
 #[cfg(test)]
 mod sim_tests;
+pub mod sim_user;
 pub mod simpaths;
 pub mod vsock;
 pub mod wire;
