@@ -1,6 +1,5 @@
 //! What a simulated node is: a [`StateMachine`] fed by the kernel.
 
-use std::fmt::Debug;
 use std::time::Duration;
 
 use kbf_types::{FarmTime, StateMachine};
@@ -15,9 +14,14 @@ use crate::NodeId;
 /// random source of its own: `now` and `entropy` arrive in the input, so the seed decides
 /// everything. Heterogeneous clusters use an enum of node kinds as `N`.
 pub trait Node: StateMachine<Input = NodeInput<Self::Msg>> {
-    /// What nodes send each other. Its `Debug` form goes into the trace, so it must
-    /// print the same way in every process (no hashed collections inside).
-    type Msg: Clone + Debug;
+    /// What nodes send each other.
+    type Msg: Clone;
+
+    /// The message as a trace line spells it. Write every field yourself (the helpers
+    /// in [`crate::text`] spell the shared vocabulary), not through `Debug`: this text
+    /// is hashed into golden hashes, and a rename must not change it. It must print the
+    /// same way in every process (no hashed collections inside) and hold no newline.
+    fn trace_msg(msg: &Self::Msg) -> String;
 
     /// Takes the outputs queued by earlier `apply` calls, oldest first.
     fn take_outputs(&mut self) -> Vec<Output<Self::Msg>>;

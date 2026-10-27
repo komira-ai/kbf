@@ -49,6 +49,7 @@
 pub mod check;
 pub mod leader;
 pub mod log;
+pub mod text;
 pub mod worker;
 
 use std::time::Duration;
@@ -208,6 +209,10 @@ impl StateMachine for Cell {
 
 impl Node for Cell {
     type Msg = Msg;
+
+    fn trace_msg(msg: &Msg) -> String {
+        text::msg(msg)
+    }
 
     fn take_outputs(&mut self) -> Vec<Output<Msg>> {
         match self {

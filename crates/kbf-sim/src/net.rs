@@ -122,6 +122,21 @@ impl Partition {
         a == b || self.group_of(a) == self.group_of(b)
     }
 
+    /// The partition as a trace spells it: groups in the order given, separated by `|`,
+    /// each group's nodes in name order separated by `,`; `none` for no groups.
+    #[must_use]
+    pub fn trace_text(&self) -> String {
+        if self.groups.is_empty() {
+            return "none".to_owned();
+        }
+        let groups: Vec<String> = self
+            .groups
+            .iter()
+            .map(|g| g.iter().map(NodeId::as_str).collect::<Vec<_>>().join(","))
+            .collect();
+        groups.join("|")
+    }
+
     fn group_of(&self, node: &NodeId) -> Option<usize> {
         self.groups.iter().position(|g| g.contains(node))
     }
@@ -148,6 +163,15 @@ mod tests {
         assert!(p.connected(&d, &e), "unlisted nodes share a group");
         assert!(!p.connected(&d, &a));
         assert!(Partition::none().connected(&a, &c));
+    }
+
+    /// Catches: a trace line for a partition that hides a group boundary or lists a
+    /// group's nodes in an order other than by name.
+    #[test]
+    fn a_partition_has_its_own_trace_text() {
+        assert_eq!(Partition::none().trace_text(), "none");
+        let p = Partition::new([ids(&["b", "a"]), ids(&["c"])]);
+        assert_eq!(p.trace_text(), "a,b|c");
     }
 
     #[test]

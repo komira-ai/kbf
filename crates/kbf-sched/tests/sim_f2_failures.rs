@@ -35,6 +35,8 @@
 
 #[path = "sim/cell/mod.rs"]
 mod cell;
+#[path = "golden_file/mod.rs"]
+mod golden_file;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -839,6 +841,35 @@ fn a_seed_replays_exactly() {
         assert_eq!(hash(7), hash(7), "{name}");
         assert_ne!(hash(7), hash(8), "{name}");
     }
+}
+
+/// The trace hash of every scenario under each pinned seed.
+fn golden_runs() -> Vec<(String, kbf_sim::TraceHash)> {
+    let mut runs = Vec::new();
+    for name in SCENARIOS {
+        for seed in 0..3 {
+            let hash = World::run(plan(name, seed)).sim.trace_hash();
+            runs.push((format!("{name}/seed-{seed}"), hash));
+        }
+    }
+    runs
+}
+
+/// Catches: a change to the scheduler, the cell or the trace text that alters what a
+/// scenario decides, or how its trace reads, without the author meaning it: every
+/// scenario's trace under three seeds is compared with the checked-in hash.
+#[test]
+fn traces_match_their_golden_hashes() {
+    golden_file::golden("f2").assert_matches(&golden_runs());
+}
+
+/// Rewrites the F2 lines of `tests/golden/trace-hashes.txt`.
+#[test]
+#[ignore = "regenerates the golden trace hashes; run it only on purpose"]
+fn regenerate_golden_hashes() {
+    golden_file::golden("f2")
+        .regenerate(&golden_runs())
+        .unwrap();
 }
 
 /// Runs one seed of one scenario with every check:
