@@ -343,8 +343,12 @@ struct State {
     /// the operation: a copy of its `Result` is a duplicate, not an unknown lease
     /// ([`State::standing`]).
     answered: BTreeMap<LeaseId, OperationId>,
-    /// Writes given up on for good: dropped as stale or fenced, or over the cap ([`Farm::dropped_writes`]).
+    /// Writes given up on for good: dropped on a fence, for a moved node or an unencodable write, or over the cap ([`Farm::dropped_writes`]).
     write_drops: u64,
+    /// Committed records the state store refused as stale because another frontend took
+    /// the same queue row first: the designed end of a race, not a drop
+    /// ([`Farm::lost_races`]).
+    lost_races: u64,
     /// The most committed records `unwritten` holds before a new one is dropped.
     held_cap: usize,
     /// The scheduler was told the state store is unavailable ([`State::watch_store`]).
@@ -487,6 +491,7 @@ impl Farm {
                 answered: BTreeMap::new(),
                 parked: BTreeMap::new(),
                 write_drops: 0,
+                lost_races: 0,
                 held_cap: HELD_CAP,
                 store_down: false,
                 renewed: BTreeMap::new(),
@@ -600,8 +605,16 @@ impl Farm {
         self.lock().sched.queued_len() as u64
     }
 
-    /// Writes to the state store the farm gave up on for good: held effects dropped as
-    /// stale or on a fence, records over the cap.
+    /// Races with another frontend this one lost: committed records the state store
+    /// refused as stale because the other frontend's write stood (`kbf_farm_lost_races_total`).
+    /// The operation runs once, under the winner; not counted in [`Farm::dropped_writes`].
+    #[must_use]
+    pub fn lost_races(&self) -> u64 {
+        self.lock().lost_races
+    }
+
+    /// Writes to the state store the farm gave up on for good: held effects dropped on
+    /// a fence or for a node another frontend owns, records over the cap.
     #[must_use]
     pub fn dropped_writes(&self) -> u64 {
         self.lock().write_drops

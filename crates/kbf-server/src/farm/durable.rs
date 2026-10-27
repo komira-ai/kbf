@@ -405,6 +405,26 @@ mod sweep;
 mod transitions;
 
 /// The lease an effect starts, if it is a `Start`.
+/// The operations the `effects` name, comma separated, for a log line.
+fn operations_of(effects: &VecDeque<Effect>) -> String {
+    let mut operations: Vec<OperationId> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Start(start) => Some(start.operation),
+            Effect::Answer(answer) => Some(answer.operation),
+            Effect::Refuse(refusal) => Some(refusal.operation),
+            Effect::Waiting(waiting) => Some(waiting.operation),
+            Effect::Commit(_) => None,
+        })
+        .collect();
+    operations.dedup();
+    operations
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn started(effect: &Effect) -> Option<LeaseId> {
     match effect {
         Effect::Start(start) => Some(start.lease),
@@ -1212,13 +1232,27 @@ impl State {
         what: &str,
         write: impl FnOnce(&Durable) -> Result<(), StateError>,
     ) -> Attempt {
+        self.attempt_logging(what, false, write)
+    }
+
+    /// [`State::attempt`]; with `race_is_expected`, a refusal as stale is not logged here:
+    /// the caller knows it is the loss of a race with another frontend and says so itself.
+    fn attempt_logging(
+        &self,
+        what: &str,
+        race_is_expected: bool,
+        write: impl FnOnce(&Durable) -> Result<(), StateError>,
+    ) -> Attempt {
         let Some(durable) = &self.durable else {
             return Attempt::Taken;
         };
         match write(durable) {
             Ok(()) => Attempt::Taken,
             Err(error) => {
-                tracing::error!(%error, "the state store did not take {what}");
+                let race = matches!(error, StateError::Missing(_) | StateError::Conflict(_));
+                if !(race && race_is_expected) {
+                    tracing::error!(%error, "the state store did not take {what}");
+                }
                 durable.note_failure(&error);
                 match error {
                     StateError::Store(cause) if !matches!(cause, StoreError::Fenced) => {
@@ -1278,7 +1312,7 @@ impl State {
             // A try that the store applied and did not acknowledge is tried again here,
             // and finds its own work in the rows (the write says so: it is `Taken`); a
             // `Stale` is another writer's work in the way, and the effect is dropped.
-            let attempt = self.attempt("a committed record", |d| {
+            let attempt = self.attempt_logging("a committed record", true, |d| {
                 d.persist(std::slice::from_ref(&effect), ending.as_ref())
             });
             match attempt {
@@ -1292,9 +1326,19 @@ impl State {
                     return ready;
                 }
                 Attempt::Stale | Attempt::Disowned | Attempt::Dropped => {
-                    self.write_drops += 1;
-                    tracing::error!("a committed record's remaining effects were dropped");
                     let dropped = self.unwritten.pop_front().unwrap_or_default();
+                    if attempt == Attempt::Stale {
+                        // Two frontends took the same queue row and the store kept the
+                        // other's write: nothing is lost, this frontend follows the store.
+                        self.lost_races += 1;
+                        tracing::warn!(
+                            operations = %operations_of(&dropped),
+                            "another frontend won the race for the operation: this frontend's write is dropped and its placement undone"
+                        );
+                    } else {
+                        self.write_drops += 1;
+                        tracing::error!("a committed record's remaining effects were dropped");
+                    }
                     // Another frontend's work stands in its place: this one gives up what
                     // it did for the operation and follows the store. A finish dropped for
                     // another reason (the node moved to another frontend, and its daemon

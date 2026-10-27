@@ -13,7 +13,7 @@ use tonic::Code;
 use super::blocks_tests::{Racing, durable_over, farm_over, request, submit, unfinished};
 use super::owner::{owner_key, pair_row};
 use super::owner_tests::{grant, overwrite, remove, value_of};
-use super::transition_tests::{answer, ending, requeue, rows, subject};
+use super::transition_tests::{answer, ending, requeue, rows, start, subject};
 use super::*;
 use crate::farm::NodeAction;
 
@@ -377,7 +377,7 @@ async fn a_result_the_store_refuses_as_stale_is_answered_from_the_store() {
 
     farm.report(&WorkerId::new("node-a"), invalid(lease)).await;
 
-    assert_eq!(farm.dropped_writes(), 1);
+    assert_eq!(farm.lost_races(), 1);
     assert!(!matches!(*ticket.stage.borrow(), Stage::Done(_)));
     assert_eq!(farm.lock().intake.following(), 1);
     remove(&store, &op_key(operation));
@@ -440,7 +440,7 @@ async fn a_refusal_the_store_refuses_as_stale_is_answered_from_the_store() {
 
     farm.tick().await;
 
-    assert_eq!(farm.dropped_writes(), 1, "the refusal was written");
+    assert_eq!(farm.lost_races(), 1, "the refusal was written");
     assert!(!matches!(*ticket.stage.borrow(), Stage::Done(_)));
     let finished = ending("finished elsewhere");
     let result = [Effect::Answer(answer(operation.0, 0))];
@@ -937,4 +937,35 @@ fn a_poll_with_nothing_waiting_reads_the_session_rows_only_for_the_sweep() {
     let before = store.session_scans();
     farm.intake();
     assert_eq!(store.session_scans() - before, 2, "an operation waits");
+}
+
+/// Asserts that the operations a lost race names are those of every effect that has one
+/// (a start, an answer, a refusal, a wait), each once when neighbours repeat it, and that a
+/// committed record names none. Catches a log line that names nothing or the same operation
+/// twice.
+#[test]
+fn the_operations_a_lost_race_names_are_those_of_its_effects() {
+    let grant = LeaseGrant {
+        lease: LeaseId::new(5, 0),
+        operation: OperationId(9),
+        worker: WorkerId::new("node-a"),
+    };
+    let refusal = kbf_types::Refusal {
+        operation: OperationId(4),
+        waiters: Vec::new(),
+        reason: String::new(),
+    };
+    let effects = VecDeque::from([
+        Effect::Commit(ControlRecord::Lease(grant)),
+        Effect::Start(start(7, 0, "node-a")),
+        Effect::Waiting(kbf_types::Waiting {
+            operation: OperationId(3),
+            reason: None,
+        }),
+        Effect::Answer(answer(3, 1)),
+        Effect::Refuse(refusal),
+    ]);
+
+    assert_eq!(operations_of(&effects), "op-7,op-3,op-4");
+    assert_eq!(operations_of(&VecDeque::new()), "");
 }
