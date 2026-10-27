@@ -8,7 +8,11 @@
 //!   advisories`, kept in one GitHub issue (opened, updated, or commented on and closed when
 //!   none remain) instead of failing a pull request. Exit 0 whatever it found; 1 when
 //!   cargo-deny or `gh` failed. `advisories.yml` runs it daily and on every push to `main`.
-//! - `deploy-farm --url <url> --version <v> [--deadline-min 60] [--stall-min 20]` ([`deploy_farm`]): after a
+//! - `release farm-version --repo <owner/repo> --tag <tag> --commit <sha> [--output <file>]`
+//!   ([`release::farm_version`]): the version text the farm is told to converge on,
+//!   `<version>+g<12 hex digits of the commit>` as the hosts report it, read from the release's
+//!   own version facts (which `SHA256SUMS` must list); prints `version=<text>`.
+//! - `deploy-farm --url <url> --version <semver>+g<commit12> [--deadline-min 60] [--stall-min 20]` ([`deploy_farm`]): after a
 //!   release is published, set it as the update coordinator's desired version (CI's OIDC token)
 //!   and wait until the farm converges; exit 1 when it is blocked, stalled or out of time. An
 //!   empty `--url` prints a notice and exits 0.
@@ -73,7 +77,7 @@
 //!   attestations` and `release check` hold a directory to one bundle per tarball,
 //!   each that tarball's (its one subject is the tarball's digest); `verify-assets
 //!   attestations` also has `gh` verify each tarball against its bundle.
-//! - `release {locate,main-control,check,verify,notes,plan,identity,previous,fetch-previous,publish,bump-internal}` ([`release`]): a GitHub release of
+//! - `release {locate,main-control,check,verify,notes,plan,identity,farm-version,previous,fetch-previous,publish,bump-internal}` ([`release`]): a GitHub release of
 //!   the files the artifacts stage of a push run of the pipeline on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
@@ -749,6 +753,9 @@ enum ReleaseVerb {
     /// release asset `kbf-<commit>-<platform>.version.json`, refused unless it is the
     /// release build of `--commit`.
     VersionFacts(version_facts::Args),
+    /// The version text the farm's coordinator is told to converge on, `<version>+g<commit>`,
+    /// from the release's version facts.
+    FarmVersion(release::farm_version::Args),
     /// The same checks, then write the release's notes.
     Notes {
         #[command(flatten)]
@@ -1329,6 +1336,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::Release(ReleaseVerb::BumpInternal(args)) => release::bump::run(&args),
         Verb::Release(ReleaseVerb::Tag(args)) => release::tag::run(&args),
         Verb::Release(ReleaseVerb::VersionFacts(args)) => version_facts::run(&args),
+        Verb::Release(ReleaseVerb::FarmVersion(args)) => release::farm_version::run(&args),
         Verb::Release(ReleaseVerb::VerdictWrite(args)) => release::verdict_write::run(&args),
         Verb::Release(ReleaseVerb::Identity { dir, commit, out }) => {
             // The binary's unpacking place, of this process alone.

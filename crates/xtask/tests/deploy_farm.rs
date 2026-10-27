@@ -13,7 +13,7 @@ use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::{Value, json};
 use xtask::deploy_farm::{
-    Args, Clock, Error, Plan, Roots, TokenService, deploy_on, pem_roots, run_with,
+    Args, Clock, Error, Plan, Roots, TokenService, check_version, deploy_on, pem_roots, run_with,
 };
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
@@ -92,7 +92,7 @@ impl Fake {
         Plan {
             url: self.base.clone(),
             audience: self.base.clone(),
-            version: "2.0".to_owned(),
+            version: "2.0.0+g000000000002".to_owned(),
             min_up_storage: 1,
             min_up_frontend: 1,
             deadline: Duration::from_secs(30),
@@ -231,7 +231,7 @@ fn serve(script: Script) -> Fake {
 }
 
 fn farm(state: &str, updating: u64, failed: u64) -> Value {
-    json!({"desired": "2.0", "quiet": false, "state": state, "roles": [
+    json!({"desired": "2.0.0+g000000000002", "quiet": false, "state": state, "roles": [
         {"role": "storage", "at_desired": 2, "updating": updating, "failed": failed, "down": 0},
         {"role": "daemon", "at_desired": 1, "updating": 0, "failed": 0, "down": 1},
     ]})
@@ -301,7 +301,7 @@ fn the_desired_version_is_posted_then_the_farm_is_polled_to_converged() {
     let body: Value = serde_json::from_str(&posts[0].body).expect("json");
     assert_eq!(
         body,
-        json!({"version": "2.0", "min_up": {"storage": 1, "frontend": 1}})
+        json!({"version": "2.0.0+g000000000002", "min_up": {"storage": 1, "frontend": 1}})
     );
     assert_eq!(fake.requests("/v1/convergence").len(), 4);
     let tokens: Vec<String> = ["/v1/desired", "/v1/convergence"]
@@ -328,10 +328,13 @@ fn the_desired_version_is_posted_then_the_farm_is_polled_to_converged() {
         assert!(out.contains(&format!("::add-mask::tok-{n}")), "{out}");
     }
     assert!(
-        out.contains("farm: in_progress, desired 2.0 (coordinator just started)"),
+        out.contains("farm: in_progress, desired 2.0.0+g000000000002 (coordinator just started)"),
         "{out}"
     );
-    assert!(out.contains("farm: converged, desired 2.0"), "{out}");
+    assert!(
+        out.contains("farm: converged, desired 2.0.0+g000000000002"),
+        "{out}"
+    );
     assert!(out.contains("storage"), "{out}");
     assert!(out.contains("daemon"), "{out}");
 }
@@ -346,9 +349,15 @@ fn a_blocked_farm_fails_at_once_with_its_table_printed() {
         Ok(farm("converged", 0, 0)),
     ]));
     let (result, out) = run(&fake, &fake.plan());
-    assert_eq!(result, Err(Error::Blocked("2.0".to_owned())));
+    assert_eq!(
+        result,
+        Err(Error::Blocked("2.0.0+g000000000002".to_owned()))
+    );
     assert_eq!(fake.requests("/v1/convergence").len(), 3);
-    assert!(out.contains("farm: blocked, desired 2.0"), "{out}");
+    assert!(
+        out.contains("farm: blocked, desired 2.0.0+g000000000002"),
+        "{out}"
+    );
     assert!(
         out.lines()
             .any(|l| l.starts_with("storage") && l.split_whitespace().nth(3) == Some("1")),
@@ -486,10 +495,13 @@ fn a_convergence_on_another_version_is_not_this_deploys() {
     // the other version, and so does an in-progress one.
     for state in ["converged", "in_progress"] {
         let mut other = farm(state, 0, 0);
-        other["desired"] = json!("3.0");
+        other["desired"] = json!("3.0.0+g000000000003");
         let fake = serve(Script::new(vec![Ok(other)]));
         let (result, _) = run(&fake, &fake.plan());
-        assert_eq!(result, Err(Error::Superseded("3.0".to_owned())));
+        assert_eq!(
+            result,
+            Err(Error::Superseded("3.0.0+g000000000003".to_owned()))
+        );
         assert_eq!(fake.requests("/v1/convergence").len(), 2);
     }
 }
@@ -499,7 +511,7 @@ fn what_the_coordinator_prints_cannot_start_a_workflow_command() {
     // Proves: a version or role that starts with `::` or holds a line break reaches the log
     // as one plain line, so no line of the baseline or the table is a workflow command.
     let mut hostile = farm("converged", 0, 0);
-    hostile["desired"] = json!("2.0");
+    hostile["desired"] = json!("2.0.0+g000000000002");
     hostile["roles"][0]["role"] = json!("::error::boom\n::add-mask::x");
     let fake = serve(Script::after(Ok(hostile.clone()), vec![Ok(hostile)]));
     let (result, out) = run(&fake, &fake.plan());
@@ -637,7 +649,7 @@ fn a_log_that_cannot_be_written_ends_the_deploy_with_an_error() {
     // the version is set, a table, and the note that a call is tried again.
     let mask = "::add-mask::tok-0\n".len();
     let baseline = "baseline: hosts live before the deploy: storage 2, daemon 1\n".len();
-    let desired = "desired version 2.0 set\n".len();
+    let desired = "desired version 2.0.0+g000000000002 set\n".len();
     let fake = serve(Script::new(vec![Ok(farm("converged", 0, 0))]));
     let ca = [fake.ca.clone()];
     let roots = Roots {
@@ -694,10 +706,22 @@ fn a_host_that_goes_down_during_the_deploy_fails_it_though_the_farm_says_converg
     // coordinator (which answers for the hosts it hears from) says `converged`: the deploy
     // fails naming the role, the 3 expected, the 2 reached and the 1 that went down.
     let fake = serve(Script::after(
-        Ok(counts("in_progress", "1.0", &[("storage", 3, 0, 0, 0)])),
+        Ok(counts(
+            "in_progress",
+            "1.0.0+g000000000001",
+            &[("storage", 3, 0, 0, 0)],
+        )),
         vec![
-            Ok(counts("in_progress", "2.0", &[("storage", 1, 2, 0, 0)])),
-            Ok(counts("converged", "2.0", &[("storage", 2, 0, 0, 1)])),
+            Ok(counts(
+                "in_progress",
+                "2.0.0+g000000000002",
+                &[("storage", 1, 2, 0, 0)],
+            )),
+            Ok(counts(
+                "converged",
+                "2.0.0+g000000000002",
+                &[("storage", 2, 0, 0, 1)],
+            )),
         ],
     ));
     let (result, out) = run(&fake, &fake.plan());
@@ -707,14 +731,14 @@ fn a_host_that_goes_down_during_the_deploy_fails_it_though_the_farm_says_converg
             role: "storage".to_owned(),
             expected: 3,
             reached: 2,
-            version: "2.0".to_owned()
+            version: "2.0.0+g000000000002".to_owned()
         }),
         "{out}"
     );
     let message = result.expect_err("lost").to_string();
     assert!(message.contains("storage"), "{message}");
     assert!(message.contains("3 hosts were live"), "{message}");
-    assert!(message.contains("2 run 2.0"), "{message}");
+    assert!(message.contains("2 run 2.0.0+g000000000002"), "{message}");
     assert!(message.contains("1 went down"), "{message}");
 }
 
@@ -726,12 +750,12 @@ fn a_host_that_was_down_before_the_deploy_does_not_block_it() {
     let fake = serve(Script::after(
         Ok(counts(
             "in_progress",
-            "1.0",
+            "1.0.0+g000000000001",
             &[("storage", 2, 0, 0, 1), ("daemon", 0, 0, 0, 1)],
         )),
         vec![Ok(counts(
             "converged",
-            "2.0",
+            "2.0.0+g000000000002",
             &[("storage", 2, 0, 0, 1), ("daemon", 0, 0, 0, 1)],
         ))],
     ));
@@ -745,18 +769,26 @@ fn a_host_that_joins_during_the_deploy_is_fine() {
     // baseline did not list at all, pass; so does a baseline with no host at all (printed as
     // "none").
     let fake = serve(Script::after(
-        Ok(counts("in_progress", "1.0", &[("storage", 1, 0, 0, 0)])),
+        Ok(counts(
+            "in_progress",
+            "1.0.0+g000000000001",
+            &[("storage", 1, 0, 0, 0)],
+        )),
         vec![Ok(counts(
             "converged",
-            "2.0",
+            "2.0.0+g000000000002",
             &[("storage", 3, 0, 0, 0), ("frontend", 1, 0, 0, 0)],
         ))],
     ));
     let (result, out) = run(&fake, &fake.plan());
     assert_eq!(result, Ok(()), "{out}");
     let fake = serve(Script::after(
-        Ok(counts("in_progress", "1.0", &[])),
-        vec![Ok(counts("converged", "2.0", &[("storage", 1, 0, 0, 0)]))],
+        Ok(counts("in_progress", "1.0.0+g000000000001", &[])),
+        vec![Ok(counts(
+            "converged",
+            "2.0.0+g000000000002",
+            &[("storage", 1, 0, 0, 0)],
+        ))],
     ));
     let (result, out) = run(&fake, &fake.plan());
     assert_eq!(result, Ok(()), "{out}");
@@ -767,8 +799,16 @@ fn a_host_that_joins_during_the_deploy_is_fine() {
 fn a_role_that_vanishes_from_the_answer_counts_as_all_its_hosts_lost() {
     // Proves: a baseline role the final answer does not list has no host at the version.
     let fake = serve(Script::after(
-        Ok(counts("in_progress", "1.0", &[("storage", 2, 0, 0, 0)])),
-        vec![Ok(counts("converged", "2.0", &[("frontend", 1, 0, 0, 0)]))],
+        Ok(counts(
+            "in_progress",
+            "1.0.0+g000000000001",
+            &[("storage", 2, 0, 0, 0)],
+        )),
+        vec![Ok(counts(
+            "converged",
+            "2.0.0+g000000000002",
+            &[("frontend", 1, 0, 0, 0)],
+        ))],
     ));
     let (result, _) = run(&fake, &fake.plan());
     assert!(
@@ -791,12 +831,12 @@ fn the_hosts_live_before_the_deploy_are_printed_before_the_post() {
     let fake = serve(Script::after(
         Ok(counts(
             "blocked",
-            "1.0",
+            "1.0.0+g000000000001",
             &[("storage", 2, 1, 1, 5), ("frontend", 1, 0, 0, 0)],
         )),
         vec![Ok(counts(
             "converged",
-            "2.0",
+            "2.0.0+g000000000002",
             &[("storage", 4, 0, 0, 5), ("frontend", 1, 0, 0, 0)],
         ))],
     ));
@@ -804,7 +844,9 @@ fn the_hosts_live_before_the_deploy_are_printed_before_the_post() {
     assert_eq!(result, Ok(()), "{out}");
     let line = "baseline: hosts live before the deploy: storage 4, frontend 1";
     let at = out.find(line).unwrap_or_else(|| panic!("{out}"));
-    let posted = out.find("desired version 2.0 set").expect("posted");
+    let posted = out
+        .find("desired version 2.0.0+g000000000002 set")
+        .expect("posted");
     assert!(at < posted, "{out}");
 }
 
@@ -833,7 +875,7 @@ fn args_for(fake: &Fake, ca_pem: &str) -> Args {
         "--url",
         &fake.base,
         "--version",
-        "2.0",
+        "2.0.0+g000000000002",
         "--ca-pem",
         ca_pem,
         "--every-secs",
@@ -853,7 +895,10 @@ fn the_verb_trusts_the_system_roots_or_the_ca_it_is_given() {
     let lines = run_with(&args_for(&fake, ""), &fake.service(), &system, &mut out).expect("run");
     assert_eq!(
         lines,
-        [format!("ok: every live host runs 2.0 ({})", fake.base)]
+        [format!(
+            "ok: every live host runs 2.0.0+g000000000002 ({})",
+            fake.base
+        )]
     );
     let lines = run_with(
         &args_for(&fake, &fake.ca_pem),
@@ -976,7 +1021,13 @@ fn the_verb_with_an_empty_url_prints_a_notice_and_exits_0() {
     // nothing and passes, with a notice the log shows.
     for url in ["", "  "] {
         let output = Command::new(XTASK)
-            .args(["deploy-farm", "--url", url, "--version", "2.0"])
+            .args([
+                "deploy-farm",
+                "--url",
+                url,
+                "--version",
+                "2.0.0+g000000000002",
+            ])
             .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
             .output()
             .expect("run");
@@ -999,7 +1050,7 @@ fn the_verb_with_an_address_and_no_token_service_fails_and_names_the_permission(
             "--url",
             "https://127.0.0.1:9",
             "--version",
-            "2.0",
+            "2.0.0+g000000000002",
         ])
         .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
         .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
@@ -1013,7 +1064,7 @@ fn the_verb_with_an_address_and_no_token_service_fails_and_names_the_permission(
             "--url",
             "u",
             "--version",
-            "2.0",
+            "2.0.0+g000000000002",
             "--deadline-min",
             "0",
         ])
@@ -1032,7 +1083,7 @@ fn the_verb_with_a_ca_that_is_no_pem_fails_before_any_call() {
             "--url",
             "https://127.0.0.1:9",
             "--version",
-            "2.0",
+            "2.0.0+g000000000002",
             "--ca-pem",
             "junk",
         ])
@@ -1054,7 +1105,13 @@ fn the_plan_of_the_flags_is_in_seconds_and_defaults_the_audience_to_the_address(
         #[command(flatten)]
         args: xtask::deploy_farm::Args,
     }
-    let cli = Cli::parse_from(["x", "--url", "https://c.example:8443/", "--version", "2.0"]);
+    let cli = Cli::parse_from([
+        "x",
+        "--url",
+        "https://c.example:8443/",
+        "--version",
+        "2.0.0+g000000000002",
+    ]);
     let plan = Plan::of(&cli.args);
     assert_eq!(plan.url, "https://c.example:8443");
     assert_eq!(plan.audience, "https://c.example:8443/");
@@ -1062,6 +1119,98 @@ fn the_plan_of_the_flags_is_in_seconds_and_defaults_the_audience_to_the_address(
     assert_eq!(plan.stall, Duration::from_secs(1200));
     assert_eq!(plan.every, Duration::from_secs(30));
     assert_eq!((plan.min_up_storage, plan.min_up_frontend), (1, 1));
-    let cli = Cli::parse_from(["x", "--url", "u", "--version", "2.0", "--audience", "aud"]);
+    let cli = Cli::parse_from([
+        "x",
+        "--url",
+        "u",
+        "--version",
+        "2.0.0+g000000000002",
+        "--audience",
+        "aud",
+    ]);
     assert_eq!(Plan::of(&cli.args).audience, "aud");
+}
+
+#[test]
+fn only_the_form_the_hosts_report_is_a_version_to_deploy() {
+    // Proves: `<semver>+g<12 lower-case hex>` is accepted, and the release tag (what the
+    // workflow once passed, which no host reports and no installer can find a commit in), a
+    // short or long or upper-case commit, a missing `g`, a revision suffix and a text after
+    // the commit are each refused with the error that names the form.
+    for good in [
+        "0.1.0+g0123456789ab",
+        "10.20.30+gffffffffffff",
+        "1.0.0-rc.1+g000000000000",
+        "0.0.0-a-b.1+g0123456789ab",
+    ] {
+        assert_eq!(check_version(good), Ok(()), "{good}");
+    }
+    for bad in [
+        "0.0.13",
+        "2.0",
+        "",
+        "0.1.0+",
+        "0.1.0+g",
+        "0.1.0+g0123456789a",
+        "0.1.0+g0123456789abc",
+        "0.1.0+g0123456789AB",
+        "0.1.0+0123456789ab",
+        "0.1.0+g0123456789ab-1",
+        "0.1.0+g0123456789abx",
+        "0.1+g0123456789ab",
+        "01.1.0+g0123456789ab",
+        "+g0123456789ab",
+        "v0.1.0+g0123456789ab",
+        "0.1.0-+g0123456789ab",
+        "0.1.x+g0123456789ab",
+        "0.01.0+g0123456789ab",
+        "1..0+g0123456789ab",
+        "1.0.0-a..b+g0123456789ab",
+        "1.0.0-a_b+g0123456789ab",
+    ] {
+        let error = check_version(bad).expect_err(bad);
+        assert_eq!(error, Error::Version(bad.to_owned()));
+        let said = error.to_string();
+        assert!(
+            said.contains("<semver>+g<12 lower-case hex digits of the commit>"),
+            "{said}"
+        );
+    }
+}
+
+#[test]
+fn the_verb_refuses_a_tag_for_a_version_before_any_call() {
+    // Proves: `deploy-farm --version 0.0.13` (the tag form) exits 1 and names the form it
+    // needs, whether or not the coordinator's address is set, and sends nothing (the address
+    // is one nothing listens on, and there is no token service).
+    for url in ["https://127.0.0.1:9", ""] {
+        let output = Command::new(XTASK)
+            .args(["deploy-farm", "--url", url, "--version", "0.0.13"])
+            .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
+            .output()
+            .expect("run");
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let said = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            said.contains("<semver>+g<12 lower-case hex digits of the commit>"),
+            "{said}"
+        );
+    }
+}
+
+#[test]
+fn run_with_refuses_a_tag_version_without_calling_the_coordinator() {
+    // Proves: the library entry refuses too, before the first request.
+    let fake = serve(Script::new(vec![Ok(farm("converged", 0, 0))]));
+    let mut args = args_for(&fake, "");
+    args.version = "0.0.13".to_owned();
+    let mut out = Vec::new();
+    let result = run_with(
+        &args,
+        &fake.service(),
+        std::slice::from_ref(&fake.ca),
+        &mut out,
+    );
+    assert!(result.is_err());
+    assert!(fake.requests("/").is_empty(), "a request was sent");
 }

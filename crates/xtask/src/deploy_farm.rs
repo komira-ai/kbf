@@ -64,6 +64,40 @@ fn retryable(what: &str, why: &str) -> bool {
 const SET_DESIRED: &str = "set the desired version";
 const READ_BASELINE: &str = "read the farm before the deploy";
 
+/// Whether `version` is `<semver>+g<12 lower-case hex digits>`: what a host's heartbeat reports
+/// and what its installer needs to find the commit (`<major>.<minor>.<patch>`, an optional
+/// `-<pre-release>`, then `+g` and exactly 12 digits of `0-9a-f`, and nothing after).
+///
+/// # Errors
+/// [`Error::Version`] when it is not.
+pub fn check_version(version: &str) -> Result<(), Error> {
+    let bad = || Error::Version(version.to_owned());
+    let (semver, build) = version.rsplit_once('+').ok_or_else(bad)?;
+    let digits = build.strip_prefix('g').ok_or_else(bad)?;
+    let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    if digits.len() != 12 || !digits.bytes().all(hex) {
+        return Err(bad());
+    }
+    let (core, pre) = match semver.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (semver, None),
+    };
+    let number = |n: &str| {
+        !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && (n == "0" || !n.starts_with('0'))
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    let pre_ok = pre.is_none_or(|p| {
+        !p.is_empty()
+            && p.split('.')
+                .all(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    });
+    if parts.len() == 3 && parts.iter().all(|n| number(n)) && pre_ok {
+        Ok(())
+    } else {
+        Err(bad())
+    }
+}
+
 /// The path of the desired state, and of the convergence read.
 const DESIRED_PATH: &str = "/v1/desired";
 const CONVERGENCE_PATH: &str = "/v1/convergence";
@@ -79,7 +113,9 @@ pub struct Args {
     /// deploy nothing.
     #[arg(long)]
     pub url: String,
-    /// The release's version text (what the hosts' heartbeats report once they run it).
+    /// The release's version text, as the hosts' heartbeats report it once they run it:
+    /// `<semver>+g<12 lower-case hex digits of the commit>`, e.g. `0.1.0+g0123456789ab`. The
+    /// release tag (`0.0.13`) is not that text and is refused.
     #[arg(long)]
     pub version: String,
     /// The farm CA certificate (PEM text) the coordinator's certificate must chain to, instead
@@ -115,6 +151,10 @@ pub enum Error {
     NoTokenService,
     #[error("--ca-pem holds no certificate")]
     Ca,
+    #[error(
+        "--version {0:?} is not the form the hosts report: it must be <semver>+g<12 lower-case hex digits of the commit>, e.g. 0.1.0+g0123456789ab (the release tag is not that form; `release farm-version` derives it)"
+    )]
+    Version(String),
     #[error("the URL must be https://<host>[:port] with no path, got {0:?}")]
     Url(String),
     #[error("{what}: {why}")]
@@ -212,6 +252,9 @@ impl TokenService {
 /// # Errors
 /// [`crate::Error`], for every end but convergence.
 pub fn run(args: &Args) -> Result<Vec<String>, crate::Error> {
+    // Before the notice for an unset URL: a version the hosts could never report is a defect
+    // of the caller whether or not a farm is there to be told.
+    check_version(&args.version).map_err(failed)?;
     if args.url.trim().is_empty() {
         return Ok(vec![
             "::notice::the deploy step is off: the repository variable KBF_COORDINATOR_URL is not set"
@@ -238,6 +281,7 @@ pub fn run_with(
     host: &[CertificateDer<'static>],
     out: &mut impl Write,
 ) -> Result<Vec<String>, crate::Error> {
+    check_version(&args.version).map_err(failed)?;
     let plan = Plan::of(args);
     let pinned;
     let roots = Roots {

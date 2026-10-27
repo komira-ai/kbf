@@ -393,6 +393,19 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
 
 ### What the step does
 
+The version it sets is not the release's tag. A host heartbeats `<semver>+g<12 lower-case hex
+digits of the commit>` (for example `0.1.0+g0123456789ab`); the coordinator calls a host done
+when its heartbeat equals the desired version, and the host's installer finds the commit to
+install in that text. The step before it, `cargo xtask release farm-version` (one `run:` line,
+`id: farm-version`), derives that text for the release being deployed: it downloads the release's
+`SHA256SUMS` and `kbf-<commit>-linux-x86_64.version.json` (what the build printed for
+`kbf --version --json`), requires the facts to be the file `SHA256SUMS` lists and the release build
+of this commit, and prints `version=<its version>+g<its first 12 commit digits>`. The job fails
+there when it cannot. `deploy-farm` refuses a `--version` of any other form with an error that
+says which form it needs, before it calls the coordinator. Anything else that sets the
+coordinator's desired version (a `POST /v1/desired` by hand) needs the same form, or no host
+will converge on it.
+
 `cargo xtask deploy-farm` (one `run:` line):
 
 1. reads `GET /v1/convergence` once, before anything is changed, and keeps the hosts live then
@@ -400,7 +413,7 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    (`baseline: hosts live before the deploy: storage 3, frontend 2`). A 503 on this read is tried
    again like the POST. A coordinator that has just restarted (the table says so) may not have
    heard from every host yet; a host it hears from later counts as one that joined;
-2. posts `{"version": <the release's version>, "min_up": {...}}` to `/v1/desired` (the per-role
+2. posts `{"version": <the version text above>, "min_up": {...}}` to `/v1/desired` (the per-role
    limits are the coordinator's defaults), with an OIDC token for the audience that is the URL as
    written in the variable (the audience keeps a trailing `/` the variable has, which the URL
    the calls go to does not, so write the variable and the allow-list's `audience` alike). A 503
