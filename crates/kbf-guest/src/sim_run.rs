@@ -225,10 +225,10 @@ impl<C: Clock> ProcessRunner<C> {
                 loop {
                     match r.read(&mut buf) {
                         Ok(0) | Err(_) => break,
+                        // A send fails only once the stream has returned; the loop then
+                        // ends at the end of the pipe (the command's group was killed).
                         Ok(n) => {
-                            if tx.send(buf[..n].to_vec()).is_err() {
-                                break;
-                            }
+                            let _ = tx.send(buf[..n].to_vec());
                         }
                     }
                 }
