@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use super::fx::{Fx, NEW, NEW_VERSION, Sim, digest, gzip, mkdir, mode, sha256, tarball, write};
 use crate::mac::channel::{MacChannel, Source};
-use crate::mac::release::{bundle_name, tarball_name};
+use crate::mac::release::{Origin, bundle_name, tarball_name};
 use crate::mac::stage::{Staged, stage, strip_quarantine};
 use crate::outcome::{FailureCode, Outcome, Refusal};
 use crate::request::Version;
@@ -20,6 +20,7 @@ fn channel(fx: &Fx) -> MacChannel {
         source: Source::Dir(fx.channel_dir.clone()),
         sums: Some(fx.sums.clone()),
         source_ref: "refs/heads/main".into(),
+        origin: Origin::kbf(),
     }
 }
 

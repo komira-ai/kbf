@@ -195,7 +195,8 @@ fn a_release_attested_under_the_former_name_is_accepted_in_the_transition() {
 /// neither the current nor the former name is never asked for it, so the release is
 /// `not-attested` after exactly the two pinned signers.
 ///
-/// Catches: `signers` taken from the settings or the environment.
+/// Catches: `signers` taken from the environment or from a file of the host's settings
+/// (the default settings name kbf's two).
 #[test]
 fn a_third_name_is_refused() {
     let other = FakeRunner::new(|s| {
@@ -206,6 +207,45 @@ fn a_third_name_is_refused() {
     let err = verify(&verifier(&["refs/heads/main"]), &other).expect_err("refused");
     assert_eq!(err.code(), "not-attested");
     assert_eq!(other.calls().len(), 2);
+}
+
+/// Catches the settings' signer being ignored: a host whose settings name one signer (a release
+/// channel of another repository) has `gh` asked for that repository and workflow, once per
+/// ref, and never for kbf's names; a `gh` that vouches for kbf only does not accept it.
+///
+/// Catches: `pinned` building `signers` from the constants instead of the settings; the former
+/// name added to a signer that is not kbf's.
+#[test]
+fn the_settings_signer_alone_is_asked_for() {
+    let host = Layout::new(Root::new("/").expect("absolute"), Platform::Linux);
+    let mut settings = Settings::defaults(&host);
+    settings.run_as = me();
+    assert_eq!(
+        settings.signers,
+        [Signer::current(), Signer::former()],
+        "the default is kbf's two"
+    );
+    settings.signers = vec![Signer {
+        repo: "owner/other".to_owned(),
+        workflow: "owner/other/.github/workflows/release.yml".to_owned(),
+    }];
+    let v = GhCheck::pinned(&host, &settings);
+    let accepting =
+        FakeRunner::new(|s| Ok(ran(i32::from(pair(&s.args).0 != "owner/other"), "", "")));
+    verify(&v, &accepting).expect("accepted");
+    let asked: Vec<(String, String)> = accepting.calls().iter().map(|c| pair(&c.args)).collect();
+    assert_eq!(
+        asked,
+        [(
+            "owner/other".to_owned(),
+            "owner/other/.github/workflows/release.yml".to_owned()
+        )]
+    );
+
+    let kbf_only = FakeRunner::new(|s| Ok(ran(i32::from(pair(&s.args).0 != REPO), "", "")));
+    let err = verify(&v, &kbf_only).expect_err("kbf's attestation is not this channel's");
+    assert_eq!(err.code(), "not-attested");
+    assert_eq!(kbf_only.calls().len(), 1);
 }
 
 /// Catches a `gh` verdict other than success being accepted: an exit other than 0 for
