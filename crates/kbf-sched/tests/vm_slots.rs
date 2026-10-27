@@ -22,7 +22,7 @@ fn digest(n: u8) -> Digest {
 /// Operation `n` of `kind` with `resources`.
 fn request(n: u8, kind: LeaseKind, resources: Resources) -> Request {
     Request {
-        key: kbf_sim::work_key("main", digest(n)),
+        key: kbf_types::work_key("main", digest(n)),
         qos: Qos::Ci,
         kind,
         resources,

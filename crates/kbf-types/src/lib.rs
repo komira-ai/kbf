@@ -31,7 +31,7 @@ mod release;
 mod result_ref;
 pub mod sched;
 
-pub use action_key::{ActionKey, NotAnActionKey};
+pub use action_key::{ActionKey, NotAnActionKey, work_key};
 pub use digest::{Digest, DigestFunction, ParseDigestError};
 pub use enroll::{
     CaPin, NodeId, NodeIdError, PartFault, RefusalCode, RefusalReason, Role, RoleError, RoleSet,

@@ -81,7 +81,7 @@ impl Farm {
             let n = self.next;
             self.next += 1;
             let request = Request {
-                key: kbf_sim::work_key("main", digest(n)),
+                key: kbf_types::work_key("main", digest(n)),
                 qos: Qos::Ci,
                 kind,
                 resources,

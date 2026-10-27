@@ -18,7 +18,7 @@ fn digest(n: u8) -> Digest {
 }
 
 fn key(instance: &str, n: u8) -> WorkKey {
-    kbf_sim::work_key(instance, digest(n))
+    kbf_types::work_key(instance, digest(n))
 }
 
 fn request(n: u8) -> Request {

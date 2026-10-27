@@ -26,7 +26,7 @@ fn digest(n: u64) -> Digest {
 /// Action `n`, one core and 1 GiB, needing what the REAPI `platform` asks for.
 fn request(n: u64, platform: &[(&str, &str)]) -> Request {
     Request {
-        key: kbf_sim::work_key("main", digest(n)),
+        key: kbf_types::work_key("main", digest(n)),
         qos: Qos::Ci,
         kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),

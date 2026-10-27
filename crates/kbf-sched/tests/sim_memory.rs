@@ -56,7 +56,7 @@ fn rung(booked: u64) -> Option<u64> {
 }
 
 fn key(n: u8) -> WorkKey {
-    kbf_sim::work_key(
+    kbf_types::work_key(
         "main",
         Digest::new(DigestFunction::Sha256, [n; 32], u64::from(n)),
     )

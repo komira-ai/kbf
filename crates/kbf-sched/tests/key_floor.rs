@@ -23,7 +23,7 @@ const KEY: u64 = 0x5eed;
 const SEED: u64 = 0x0f41_7bd3;
 
 fn action(n: u8, instance: &str) -> WorkKey {
-    kbf_sim::work_key(
+    kbf_types::work_key(
         instance,
         Digest::new(DigestFunction::Sha256, [n; 32], u64::from(n)),
     )

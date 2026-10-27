@@ -184,7 +184,7 @@ impl World {
         self.next += 1;
         self.submitted.insert(n, (kind, qos.clone(), self.now));
         let request = Request {
-            key: kbf_sim::work_key("main", digest(n)),
+            key: kbf_types::work_key("main", digest(n)),
             qos,
             kind,
             resources: Resources::new(1_000, GIB),
