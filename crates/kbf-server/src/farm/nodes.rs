@@ -45,17 +45,27 @@ impl Farm {
     /// scheduler runs none of its work.
     ///
     /// # Errors
-    /// The node is another frontend's, and the state store could not be read.
+    /// The node is another frontend's and the state store could not be read; or the store
+    /// cannot say who holds the node, and it is not connected to this frontend.
     pub fn node_detail(&self, worker: &WorkerId) -> Result<Option<NodeDetail>, NodeUnread> {
         let now = self.now();
         let mut state = self.lock();
         state.note_closed_streams();
-        state.take_cordons(now);
-        if !state.owns_worker(now, worker) && state.known_elsewhere(worker) {
-            let stored = state.stored_detail(worker);
-            return stored
-                .map(Some)
-                .ok_or_else(|| NodeUnread(worker.as_str().to_owned()));
+        let cordons = state.take_cordons(now);
+        let unread = || NodeUnread(worker.as_str().to_owned());
+        let connected = state
+            .machine
+            .node(worker)
+            .is_some_and(|node| node.connected);
+        match state.held_elsewhere(now, worker) {
+            Some(true) => {
+                let cordon = cordons.ok_or_else(unread)?.get(worker).copied();
+                let stored = state.stored_detail(worker, cordon);
+                return stored.map(Some).ok_or_else(unread);
+            }
+            // The store cannot say who holds the node: only one connected here is answered.
+            None if !connected => return Err(unread()),
+            Some(false) | None => {}
         }
         if state.machine.node(worker).is_none() {
             return Ok(None);

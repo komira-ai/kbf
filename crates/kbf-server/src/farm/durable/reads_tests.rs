@@ -157,6 +157,34 @@ async fn a_node_another_frontend_holds_is_unreadable_when_the_store_cannot_be_re
     assert_eq!(read, Err(NodeUnread("node-b".to_owned())));
 }
 
+/// Asserts that a read of a node another frontend holds is an error when its `cordon/` row
+/// cannot be read. Catches: a node read as serving because its drain could not be seen.
+#[tokio::test(start_paused = true)]
+async fn a_node_another_frontend_holds_is_unreadable_when_its_cordon_cannot_be_read() {
+    let store = Racing::new();
+    let drained = drained_through_the_other_frontend(&store, true);
+    store.fail_reads(Some("cordon/"));
+
+    let read = drained.through.node_detail(&drained.node);
+
+    assert_eq!(read, Err(NodeUnread("node-b".to_owned())));
+}
+
+/// Asserts that a node connected to this frontend is still answered, from this frontend's
+/// own scheduler, when the store cannot be read. Catches: a frontend that refuses every read
+/// of its own nodes while its store is down.
+#[tokio::test(start_paused = true)]
+async fn a_node_connected_here_is_answered_when_the_store_cannot_be_read() {
+    let store = Racing::new();
+    let drained = drained_through_the_other_frontend(&store, true);
+    store.fail_reads(Some(""));
+
+    let read = detail(&drained.own, &drained.node).expect("a node connected here");
+
+    assert_eq!(read.leases.len(), 1);
+    assert!(read.node.connected);
+}
+
 /// Asserts that a node no frontend of the store has held is not found, on a frontend with a
 /// store. Catches: a read from the store that answers for any name.
 #[tokio::test(start_paused = true)]

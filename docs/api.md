@@ -230,8 +230,10 @@ A node connected to another frontend of the store is answered from the store: `p
 its `cordon/` row (a drain with no lease left reads as `drained`; the store does not say
 whether a drain paused), `leases` and `lease_count` are the leases the store records on it,
 `connected` is `false`, and `protocol`, `software`, `booked`, `capacity` and `free` are empty
-(they are the other frontend's to say). `503` when that store cannot be read: never the node
-with no lease.
+(they are the other frontend's to say). `503` when that store cannot be read, and when the
+store cannot say who holds a node that is not connected to the frontend answering: never "no
+such node", and never the node with no lease. A node connected to the frontend answering is
+answered from that frontend while its store cannot be read.
 
 ## Own-node calls of a host's updater
 

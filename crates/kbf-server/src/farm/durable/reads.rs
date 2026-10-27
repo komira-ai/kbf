@@ -13,22 +13,42 @@ use super::*;
 use crate::fleet::{NodeDetail, NodeView, PhaseView, PlacementView, ResourcesView};
 
 impl State {
-    /// `worker`, which another frontend holds, as the state store has it; `None` if the store
-    /// cannot be read. A drain with no lease left reads as drained, as the node's own frontend
-    /// has it; the store does not say whether a drain paused at its deadline. What the node
-    /// reported it runs and can run is its own frontend's to say: none here.
-    pub(in crate::farm) fn stored_detail(&self, worker: &WorkerId) -> Option<NodeDetail> {
-        let mut read = None;
-        self.durably("a node read", |d| {
-            let cordon = d.cordons()?.into_iter().find(|(named, _)| named == worker);
-            let leases: Vec<String> = (d.held_by(worker)?.into_iter())
-                .filter_map(|op| op.lease)
-                .map(|grant| grant.lease.to_string())
-                .collect();
-            read = Some((cordon.map(|(_, cordon)| cordon), leases));
+    /// Whether another frontend of the store holds `worker`: this frontend does not, and the
+    /// store has its `owner/` row. A farm with no state store, or one that handed its work
+    /// over, holds every node it hears from. `None` when the store cannot be read: that is
+    /// neither "held here" nor "nobody holds it".
+    pub(in crate::farm) fn held_elsewhere(&self, now: FarmTime, worker: &WorkerId) -> Option<bool> {
+        if self.fenced || self.durable.is_none() {
+            return Some(false);
+        }
+        let mut held = None;
+        self.durably("a node look", |d| {
+            held = Some(!d.owns(worker, now)? && d.node_known(worker)?);
             Ok(())
         });
-        let (cordon, leases) = read?;
+        held
+    }
+
+    /// `worker`, which another frontend holds, as the state store has it, placed as `cordon`
+    /// (its `cordon/` row, read once by the caller); `None` if the store's leases cannot be
+    /// read. A drain with no lease left reads as drained, as the node's own frontend has it;
+    /// the store does not say whether a drain paused at its deadline. What the node reported
+    /// it runs and can run is its own frontend's to say: none here.
+    pub(in crate::farm) fn stored_detail(
+        &self,
+        worker: &WorkerId,
+        cordon: Option<StoredCordon>,
+    ) -> Option<NodeDetail> {
+        let mut read = None;
+        self.durably("a node read", |d| {
+            let held = d.held_by(worker)?.into_iter().filter_map(|op| op.lease);
+            read = Some(
+                held.map(|grant| grant.lease.to_string())
+                    .collect::<Vec<_>>(),
+            );
+            Ok(())
+        });
+        let leases = read?;
         let placement = match cordon {
             None => PlacementView::Serving,
             Some(StoredCordon::Cordoned) => PlacementView::Cordoned,
