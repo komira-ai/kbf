@@ -8,7 +8,9 @@
 //! The orders it has given are kept the same way, in memory only. A host reports that it
 //! is updating on its first heartbeat after it hears the order, so until then the beats say
 //! nothing is happening; an outstanding order stands in for that report, holding the host's
-//! slot and counting the host as not up. A restart forgets the outstanding orders: the
+//! slot and counting the host as not up. Hosts and orders are kept per service; `kbf`'s
+//! heartbeat is the top-level one on the wire, so [`Fleet::record`], [`Fleet::get`] and
+//! [`Fleet::hosts`] are the `kbf` forms of the per-service calls. A restart forgets the outstanding orders: the
 //! start-up quiet period lets the hosts report first, and a host that began updating says so.
 
 use std::collections::BTreeMap;
@@ -17,6 +19,8 @@ use std::time::Duration;
 use kbf_types::{HostRole, NodeId};
 use kbf_updater::version::Version;
 use kbf_updater::wire::{Health, Heartbeat, Outcome};
+
+use crate::desired::KBF;
 
 /// A host with no heartbeat for this long is down.
 pub const DOWN_AFTER: Duration = Duration::from_secs(45);
@@ -78,8 +82,8 @@ impl Host {
 #[derive(Clone, Debug)]
 pub struct Fleet {
     started: Duration,
-    hosts: BTreeMap<NodeId, Host>,
-    orders: BTreeMap<NodeId, Order>,
+    hosts: BTreeMap<String, BTreeMap<NodeId, Host>>,
+    orders: BTreeMap<(NodeId, String), Order>,
 }
 
 impl Fleet {
@@ -105,22 +109,36 @@ impl Fleet {
         self.started
     }
 
-    /// Notes a heartbeat: the host's latest word replaces its earlier one.
-    ///
-    /// An order for the host ends when the beat shows it updating (the beat counts from
-    /// then), runs the ordered version, or reports that update failed.
+    /// Notes a `kbf` heartbeat: [`Self::record_in`] for [`KBF`].
     pub fn record(&mut self, id: NodeId, role: HostRole, beat: Heartbeat, now: Duration) {
-        if let Some(order) = self.orders.get(&id) {
+        self.record_in(KBF, id, role, beat, now);
+    }
+
+    /// Notes a heartbeat of `service`: the host's latest word about it replaces its earlier
+    /// one.
+    ///
+    /// An order for the host and service ends when the beat shows it updating (the beat
+    /// counts from then), runs the ordered version, or reports that update failed.
+    pub fn record_in(
+        &mut self,
+        service: &str,
+        id: NodeId,
+        role: HostRole,
+        beat: Heartbeat,
+        now: Duration,
+    ) {
+        let key = (id, service.to_owned());
+        if let Some(order) = self.orders.get(&key) {
             let failed = beat
                 .last_update
                 .as_ref()
                 .is_some_and(|r| r.outcome == Outcome::Failed && r.target == order.target);
             if beat.updating.is_some() || beat.version == order.target || failed {
-                self.orders.remove(&id);
+                self.orders.remove(&key);
             }
         }
-        self.hosts.insert(
-            id,
+        self.hosts.entry(key.1).or_default().insert(
+            key.0,
             Host {
                 role,
                 beat,
@@ -129,45 +147,79 @@ impl Fleet {
         );
     }
 
-    /// Notes that the host `id` was told at `now` to update to `target`. An order for the
-    /// same target that has not aged out stays as it was, so a host that asks again before it
-    /// reports is told again without its slot being held longer.
-    pub fn order(&mut self, id: NodeId, target: Version, now: Duration) {
-        if self.is_ordered(&id, now) && self.orders.get(&id).is_some_and(|o| o.target == target) {
+    /// Notes that the host `id` was told at `now` to update `service` to `target`. An order
+    /// for the same target that has not aged out stays as it was, so a host that asks again
+    /// before it reports is told again without its slot being held longer.
+    pub fn order(&mut self, service: &str, id: NodeId, target: Version, now: Duration) {
+        if self.is_ordered(service, &id, now)
+            && self
+                .orders
+                .get(&(id.clone(), service.to_owned()))
+                .is_some_and(|o| o.target == target)
+        {
             return;
         }
-        self.orders.insert(id, Order { target, at: now });
+        self.orders
+            .insert((id, service.to_owned()), Order { target, at: now });
     }
 
-    /// Whether `id` has an order outstanding at `now`.
+    /// Whether `id` has an order outstanding for `service` at `now`.
     #[must_use]
-    pub fn is_ordered(&self, id: &NodeId, now: Duration) -> bool {
+    pub fn is_ordered(&self, service: &str, id: &NodeId, now: Duration) -> bool {
         self.orders
-            .get(id)
+            .get(&(id.clone(), service.to_owned()))
             .is_some_and(|o| now.saturating_sub(o.at) < ORDER_AGE)
     }
 
-    /// Whether the host `id` holds an update slot: [`Host::holds_slot`], or an order is
+    /// Whether the host `id` is busy with a service other than `service`: one of its other
+    /// services is updating, or has an order outstanding for it. A host does one update at a
+    /// time.
+    #[must_use]
+    pub fn is_busy_besides(&self, service: &str, id: &NodeId, now: Duration) -> bool {
+        let updating = self
+            .hosts
+            .iter()
+            .filter(|(s, _)| s.as_str() != service)
+            .any(|(_, hosts)| hosts.get(id).is_some_and(|h| h.beat.updating.is_some()));
+        updating
+            || self.orders.iter().any(|((o, s), order)| {
+                o == id && s != service && now.saturating_sub(order.at) < ORDER_AGE
+            })
+    }
+
+    /// Whether the host `id` holds an update slot of `service`: [`Host::holds_slot`], or an
+    /// order is outstanding for it.
+    #[must_use]
+    pub fn holds_slot(&self, service: &str, id: &NodeId, host: &Host, now: Duration) -> bool {
+        host.holds_slot() || self.is_ordered(service, id, now)
+    }
+
+    /// Whether the host `id` counts as up for `service`: [`Host::is_up`] and no order
     /// outstanding for it.
     #[must_use]
-    pub fn holds_slot(&self, id: &NodeId, host: &Host, now: Duration) -> bool {
-        host.holds_slot() || self.is_ordered(id, now)
+    pub fn is_up(&self, service: &str, id: &NodeId, host: &Host, now: Duration) -> bool {
+        host.is_up(now) && !self.is_ordered(service, id, now)
     }
 
-    /// Whether the host `id` counts as up: [`Host::is_up`] and no order outstanding for it.
+    /// The host `id` as `service` last heard it, if it has heartbeated.
     #[must_use]
-    pub fn is_up(&self, id: &NodeId, host: &Host, now: Duration) -> bool {
-        host.is_up(now) && !self.is_ordered(id, now)
+    pub fn get_in(&self, service: &str, id: &NodeId) -> Option<&Host> {
+        self.hosts.get(service)?.get(id)
     }
 
-    /// The host `id`, if it has heartbeated.
+    /// The `kbf` host `id`.
     #[must_use]
     pub fn get(&self, id: &NodeId) -> Option<&Host> {
-        self.hosts.get(id)
+        self.get_in(KBF, id)
     }
 
-    /// Every host, by node id.
+    /// Every host that heartbeated `service`, by node id.
+    pub fn hosts_of(&self, service: &str) -> impl Iterator<Item = (&NodeId, &Host)> {
+        self.hosts.get(service).into_iter().flatten()
+    }
+
+    /// Every `kbf` host, by node id.
     pub fn hosts(&self) -> impl Iterator<Item = (&NodeId, &Host)> {
-        self.hosts.iter()
+        self.hosts_of(KBF)
     }
 }

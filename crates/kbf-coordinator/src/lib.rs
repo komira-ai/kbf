@@ -7,6 +7,7 @@
 //! - [`converge`]: whether the farm has reached the desired version, for CI to wait on;
 //! - [`decide`]: the decision as a pure function of the desired state, the fleet, the host
 //!   and the time;
+//! - [`services`]: services as data: roles, limits and the order between services;
 //! - [`service`]: the coordinator itself: heartbeats in, the desired state set by CI's OIDC
 //!   token, the status read by the operator token;
 //! - [`http`] and [`listen`]: the two HTTP surfaces and the TLS listeners under them;
@@ -23,6 +24,7 @@ pub mod http;
 pub mod identity;
 pub mod listen;
 pub mod service;
+pub mod services;
 
 #[cfg(test)]
 mod converge_tests;
@@ -34,5 +36,7 @@ mod desired_tests;
 mod http_tests;
 #[cfg(test)]
 mod service_tests;
+#[cfg(test)]
+mod services_tests;
 #[cfg(test)]
 mod testutil;
