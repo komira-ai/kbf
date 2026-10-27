@@ -1,0 +1,55 @@
+# kbf-host-install's helper units under the real systemd: the runner's privilege drop (the one
+# the helper makes to run curl as another account) made inside a transient unit that carries
+# each helper unit's own [Service] settings
+# (crates/kbf-host-install/tests/real_linux_unit.rs). A GitHub-hosted Ubuntu runner has systemd
+# and passwordless sudo, which `systemd-run` of a system unit needs; nothing here runs on any
+# other machine.
+#
+# Every raw output is uploaded as an artifact (`gh run download`).
+# It runs on a pull request that touches the crate or the units, by hand, and on a push to main.
+name: host-install-linux
+
+on:
+  pull_request:
+    paths:
+      - crates/kbf-host-install/**
+      - packaging/host-agent/linux/**
+      - .github/workflows/host-install-linux.yml
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - crates/kbf-host-install/**
+      - packaging/host-agent/linux/**
+
+permissions: {}
+
+concurrency:
+  group: host-install-linux-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  real-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: systemctl --version
+      # The real test, as root (systemd-run of a system unit, and the drop); the crate's own
+      # unit tests run in ci.yml.
+      - run: cargo xtask sudo-test -p kbf-host-install --test real_linux_unit -- --nocapture
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: host-install-linux-raw-output
+          path: target/real-linux
+          if-no-files-found: error

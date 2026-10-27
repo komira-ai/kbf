@@ -26,6 +26,13 @@ fn unit_value(text: &str, key: &str) -> String {
     found[0].to_owned()
 }
 
+/// Whether a unit names no account (no `User=` line), so systemd runs it as root by default. A
+/// unit that names one, even `User=root`, loses CAP_SETUID under its system call filter (the
+/// helper's unit says why), and the helper could not drop to another account to run a command.
+fn names_no_user(text: &str) -> bool {
+    !text.lines().any(|l| l.trim_start().starts_with("User="))
+}
+
 /// The strings of the `ProgramArguments` array of a property list.
 fn program_arguments(plist: &str) -> Vec<String> {
     let start = plist
@@ -112,7 +119,10 @@ fn the_linux_units_agree_with_the_programs_and_with_each_other() {
     let serve = ServeConfig::parse(&line[2..]).expect("the helper's flags");
     assert_eq!(serve.socket, Path::new(DEFAULT_HELPER_SOCKET));
     assert_eq!(serve.user, user, "only the agent's account may connect");
-    assert_eq!(unit_value(&helper, "User"), "root");
+    assert!(
+        names_no_user(&helper),
+        "the helper runs as root by default, with no User="
+    );
     assert_eq!(unit_value(&helper, "Restart"), "always");
     assert!(!serve.units.is_empty());
     for unit in &serve.units {
@@ -147,7 +157,10 @@ fn the_frontend_container_unit_and_its_configuration_agree_with_the_program() {
     assert!(serve.frontend_container && serve.units.is_empty());
     assert_eq!(serve.socket, Path::new(DEFAULT_HELPER_SOCKET));
     assert_eq!(serve.user, user, "only the agent's account may connect");
-    assert_eq!(unit_value(&helper, "User"), "root");
+    assert!(
+        names_no_user(&helper),
+        "the helper runs as root by default, with no User="
+    );
     assert_eq!(unit_value(&helper, "Restart"), "always");
     assert_eq!(unit_value(&helper, "StateDirectoryMode"), "0700");
     assert!(unit_value(&helper, "After").contains("docker.service"));
