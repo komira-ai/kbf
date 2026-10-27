@@ -59,17 +59,16 @@ const KBF_UNIT: &str = "kbf-rehearsal.service";
 /// The `--restart-unit` of the packaged helper unit, replaced by [`KBF_UNIT`].
 const PACKAGED_RESTART: &str = "--restart-unit kbf-daemon.service";
 const CHANNEL: &str = "stable";
+/// Where the kbf unit's storage node listens.
+const STORAGE: &str = "127.0.0.1:8983";
 const UPDATER: &str = "kbf-updater";
 /// The environment variable that carries a request to [`speak_to_the_helper`].
 const REQUEST_ENV: &str = "KBF_REHEARSAL_REQUEST";
 /// How long one request may take: an install downloads and verifies a release.
 const REQUEST_LIMIT: Duration = Duration::from_secs(900);
-/// How many times the helper's unit may restart before its socket appears: more means it
-/// fails at start, and the rehearsal stops instead of waiting for the job's limit.
+/// How many times a unit may restart before it is ready: more means it fails at start, and the
+/// rehearsal stops instead of waiting for the job's limit.
 const MAX_RESTARTS: u32 = 3;
-/// The channel's token file: the listing and the download use it, for the rate limit of a
-/// token instead of the shared runner address's.
-const CHANNEL_TOKEN: &str = "/etc/kbf/host-install-github.token";
 
 const KBF_UNIT_TEXT: &str = "\
 [Unit]
@@ -79,7 +78,7 @@ Description=kbf storage node of the update rehearsal, run from the current relea
 DynamicUser=yes
 StateDirectory=kbf-rehearsal
 WorkingDirectory=/var/lib/kbf-rehearsal
-ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=storage --cold-store=file:///var/lib/kbf-rehearsal/cold --storage-listen=127.0.0.1:8983
+ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=storage --hot-store=file:///var/lib/kbf-rehearsal/hot --cold-store=file:///var/lib/kbf-rehearsal/cold --storage-listen=127.0.0.1:8983
 Restart=on-failure
 RestartSec=2
 ";
@@ -257,6 +256,32 @@ fn systemctl(name: &str, args: &[&str]) -> String {
     run(name, Command::new("systemctl").args(args))
 }
 
+/// How many times `unit` has been restarted by systemd.
+fn restarts(unit: &str) -> u32 {
+    systemctl("restarts", &["show", "-p", "NRestarts", "--value", unit])
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// Waits until `ready` holds, and stops the rehearsal when `unit` restarts more than
+/// [`MAX_RESTARTS`] times first: it fails at start, and would never be ready.
+fn until(unit: &str, mut ready: impl FnMut() -> bool) {
+    while !ready() {
+        let n = restarts(unit);
+        assert!(
+            n <= MAX_RESTARTS,
+            "{unit} restarted {n} times before it was ready"
+        );
+        sleep(Duration::from_secs(1));
+    }
+}
+
+/// Whether the storage node of the kbf unit accepts a connection on its port.
+fn storage_answers() -> bool {
+    std::net::TcpStream::connect(STORAGE).is_ok()
+}
+
 fn install_file(text: &str, path: &str, mode: u32) {
     fs::write(path, text).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
@@ -385,9 +410,9 @@ fn the_helper_updates_a_hand_laid_host_from_the_last_release_to_the_next() {
             .arg(HELPER),
     );
     fs::create_dir_all("/etc/kbf").unwrap();
-    install_file(&format!("{token}\n"), CHANNEL_TOKEN, 0o600);
+    // The farm's nodes name their channel the same way, with no token.
     install_file(
-        &format!("[channels.{CHANNEL}]\nsource = \"github\"\ntoken_file = \"{CHANNEL_TOKEN}\"\n"),
+        &format!("[channels.{CHANNEL}]\nsource = \"github\"\n"),
         CHANNELS,
         0o644,
     );
@@ -401,18 +426,8 @@ fn the_helper_updates_a_hand_laid_host_from_the_last_release_to_the_next() {
     systemctl("daemon_reload", &["daemon-reload"]);
     systemctl("start_kbf", &["start", KBF_UNIT]);
     systemctl("start_helper", &["start", HELPER_UNIT]);
-    while !Path::new(SOCKET).exists() {
-        let restarts = systemctl(
-            "helper_restarts",
-            &["show", "-p", "NRestarts", "--value", HELPER_UNIT],
-        );
-        let restarts: u32 = restarts.trim().parse().unwrap();
-        assert!(
-            restarts <= MAX_RESTARTS,
-            "the helper restarted {restarts} times without making {SOCKET}"
-        );
-        sleep(Duration::from_secs(1));
-    }
+    until(HELPER_UNIT, || Path::new(SOCKET).exists());
+    until(KBF_UNIT, storage_answers);
 
     // The updater's account runs a copy of this binary it can reach.
     let probe = work.join("probe");
@@ -447,10 +462,7 @@ fn the_helper_updates_a_hand_laid_host_from_the_last_release_to_the_next() {
     );
     let facts: Value = serde_json::from_str(facts.trim()).unwrap();
     assert_eq!(facts["commit_full"], new.as_str(), "{facts}");
-    assert_eq!(
-        systemctl("kbf_active", &["is-active", KBF_UNIT]).trim(),
-        "active"
-    );
+    until(KBF_UNIT, storage_answers);
     let pid = systemctl("kbf_pid", &["show", "-p", "MainPID", "--value", KBF_UNIT]);
     let exe = fs::read_link(format!("/proc/{}/exe", pid.trim())).unwrap();
     assert_eq!(
