@@ -28,6 +28,9 @@ mod proxy_auth;
 #[path = "frontend/ready.rs"]
 mod ready;
 
+#[path = "frontend/reapi_ready.rs"]
+mod reapi_ready;
+
 #[path = "frontend/retire.rs"]
 mod retire;
 

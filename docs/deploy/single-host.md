@@ -10,7 +10,7 @@ frontend are in [kbf-modes.md](kbf-modes.md). Addresses below are documentation 
 ```text
 nodes / Buck2 clients ──TLS──> 192.0.2.10:8980 REAPI    ┐
                                192.0.2.10:8981 worker   ├ Envoy (TCP passthrough, host network)
-                               192.0.2.10:8444 enroll   ┘     │ each frontend in or out by /readyz
+                               192.0.2.10:8444 enroll   ┘     │ each frontend in or out by /readyz (REAPI: /readyz/reapi)
                                        ┌──────────────────────┴───────────────┐
                               fe-a  127.0.0.1:1898x, 18444           fe-b  127.0.0.1:2898x, 28444
                                        └──── unix socket dir ───┬──────────────┘
@@ -237,15 +237,22 @@ cluster each:
 | `192.0.2.10:8981` | worker |
 | `192.0.2.10:8444` | enroll |
 
-Each cluster lists both frontends and health-checks each endpoint with `GET /readyz` on **that
-frontend's operator API port** (the check's own `health_check_config.port_value`, because the
-endpoint is the REAPI, worker or enroll port). A frontend is in the rotation while `/readyz`
+Each cluster lists both frontends and health-checks each endpoint on **that
+frontend's operator API port**: the worker and enroll clusters with `GET /readyz`, the REAPI
+cluster with `GET /readyz/reapi`, which is `/readyz` and also needs a connected worker. The REAPI
+cluster needs the stricter check because a frontend that restarted while all the nodes stayed
+on the other one is ready but cannot place an action: its Executes would wait for as long as
+it is up. The worker cluster cannot use it: a frontend with no worker gets its first one through
+that cluster. The check is per frontend and counts workers of any platform, so a frontend with
+only Linux workers still holds a macOS action; the cluster-wide answer to that is that every
+frontend has a worker of each platform you build for. The port is the check's own
+`health_check_config.port_value`, because the endpoint is the REAPI, worker or enroll port. A frontend is in the rotation while its check
 answers 200 and out while it answers 503 (`docs/api.md:1273`). A drain turns `/readyz` to 503
 first and serves on for `--drain-lb-wait` (`crates/kbf-cli/src/config.rs:68`,
 `docs/api.md:590-632`), so a balancer that checks every second sees it before a stream is cut.
 Set `close_connections_on_host_health_failure: false` so that a stream already open on a
 draining frontend is left to finish, and an `idle_timeout` of `0s` on the proxies, since a
-build's streams are long. A fragment, for the REAPI cluster:
+build's streams are long. A fragment, for the REAPI cluster (the others use `path: /readyz`):
 
 ```yaml
 clusters:
@@ -255,7 +262,7 @@ clusters:
     lb_policy: LEAST_REQUEST
     health_checks:
       - { timeout: 1s, interval: 1s, unhealthy_threshold: 2, healthy_threshold: 2,
-          http_health_check: { path: /readyz } }
+          http_health_check: { path: /readyz/reapi } }
     close_connections_on_host_health_failure: false
     load_assignment:
       cluster_name: reapi

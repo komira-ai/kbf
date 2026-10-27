@@ -1354,6 +1354,29 @@ otherwise; the body lists each failing check and why:
 `version` and `commit` are those of `GET /v1/nodes`' `server` field. Each `/readyz`
 makes one read of the store, so poll it at the interval the front needs, not faster.
 
+**`GET /readyz/reapi`**: the readiness a load balancer asks for the REAPI cluster. It is
+`/readyz` with one more check, and has the same body, status codes and (no) token. A
+frontend that answers `/readyz` with `200` but has no worker connected answers `503`:
+
+```json
+{ "ready": false, "version": "0.1.0+0123456789ab", "commit": "0123456789ab",
+  "failing": [ { "check": "no_worker", "reason": "no worker is connected to this server" } ] }
+```
+
+| Check | Fails when |
+|---|---|
+| `no_worker` | no worker has an open stream to this server, as `connected` in `GET /v1/nodes` (a node of any platform and any placement counts; a node whose stream has closed does not). Listed after the checks of `/readyz`, which this route also runs |
+
+Why it is a route of its own: an operation that none of a frontend's own workers can run
+waits on that frontend, and another frontend takes it only once this one stands down. After
+a frontend restarts, its workers may all be on the other frontend, and it would take Execute
+calls it cannot place for as long as it is up. `/readyz` itself cannot fail for this, because
+workers reach a frontend through the worker listener, which a load balancer routes by
+`/readyz` too: a frontend with no worker would never get its first. So the REAPI cluster asks
+`/readyz/reapi`, and the worker and enrollment clusters ask `/readyz`. The route does not
+look at platforms: a frontend whose workers are all Linux is in the REAPI rotation, and an
+action that needs another platform still waits there.
+
 ## `GET /v1/health`
 
 The one-screen answer to "is the farm healthy": the values other routes report, composed
