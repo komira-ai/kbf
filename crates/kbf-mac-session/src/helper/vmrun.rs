@@ -12,6 +12,15 @@
 //! link to a file elsewhere from being named; the check is made once, before the start,
 //! and `kbf-vmm` opens the file as the VM user, so what it reads is what that user could
 //! read anyway.
+//!
+//! The check limits where the spec is, not what it says: a caller that can write the file
+//! after the check (a daemon-owned directory inside the images directory) can have
+//! `kbf-vmm` open any disk the VM user can read. That is a power the VM user's own
+//! files already give, not a way to root.
+//!
+//! The caller passes no environment: `kbf-vmm` needs none, and a name such as
+//! `DYLD_INSERT_LIBRARIES` or `PATH` would reach a process that runs as the VM user.
+//! [`no_environment`] refuses a request that carries any.
 
 use std::os::fd::OwnedFd;
 use std::path::{Component, Path};
@@ -46,6 +55,21 @@ impl Helper {
             ));
         }
         check_spec(&self.settings.image.dir, spec)
+    }
+}
+
+/// Refuses a `role-run` that carries environment variables: the process gets only the
+/// ones the helper sets (`HOME`, `USER`, `LOGNAME`).
+///
+/// # Errors
+/// Names the first variable (its name only).
+pub(super) fn no_environment(env: &[(String, String)]) -> Result<(), String> {
+    match env.first() {
+        None => Ok(()),
+        Some((name, _)) => Err(format!(
+            "role-run takes no environment; got {} variable(s), the first {name:?}",
+            env.len()
+        )),
     }
 }
 
