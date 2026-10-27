@@ -393,6 +393,15 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
 
 ### What the step does
 
+The job starts only after `rehearse` passes: on a hosted runner with systemd, a host laid out by
+hand from the release before this one (its `kbf` through its own `kbf-deploy host install`, its
+`kbf-host-install`, its package's trust files and accounts, this release's helper unit) is updated
+to this release by the real helper through its local socket, as the agent asks for it (`install`,
+`switch`, `confirm`), with the release fetched from GitHub by the helper itself
+(`crates/kbf-host-install/tests/update_rehearsal.rs`). A release that host cannot take is never
+set as the desired version. The rehearsal does not run the agent, the coordinator or a frontend's
+drain and health check.
+
 The version it sets is not the release's tag. A host heartbeats `<semver>+g<12 lower-case hex
 digits of the commit>` (for example `0.1.0+g0123456789ab`); the coordinator calls a host done
 when its heartbeat equals the desired version, and the host's installer finds the commit to

@@ -1290,16 +1290,67 @@ fn only_plan_and_verify_download_from_another_run() {
 }
 
 #[test]
+fn the_rehearsal_runs_after_publish_read_only_under_the_release_condition() {
+    // Catches: the rehearsal starting before the release it updates to is published, holding
+    // a write scope or the OIDC token, or running for a pipeline run that cuts no release.
+    red(
+        &plant("rehearse", "needs: [plan, publish]\n", "needs: [plan]\n"),
+        "the job `rehearse` needs",
+    );
+    red(
+        &plant(
+            "rehearse",
+            "      contents: read\n",
+            "      contents: write\n",
+        ),
+        "the job `rehearse` holds `contents: write`",
+    );
+    red(
+        &plant(
+            "rehearse",
+            "      contents: read\n",
+            "      contents: read\n      id-token: write\n",
+        ),
+        "the job `rehearse` holds `id-token: write`",
+    );
+    red(
+        &plant(
+            "rehearse",
+            " && needs.plan.outputs.pipeline != 'true' }}",
+            " }}",
+        ),
+        "rehearse",
+    );
+}
+
+#[test]
 fn gamma_runs_after_publish_with_the_run_token_and_no_write_scope() {
     // Catches: the gamma stage starting before the release is published or without the
     // run's conditions, holding a write scope or a token other than the OIDC one, or
     // dropping the environment whose name the coordinator's allow-list can require.
     red(
-        &plant("gamma", "needs: [plan, publish]\n", "needs: [plan]\n"),
+        &plant(
+            "gamma",
+            "needs: [plan, publish, rehearse]\n",
+            "needs: [plan, rehearse]\n",
+        ),
         "the job `gamma` needs",
     );
     red(
-        &plant("gamma", "needs: [plan, publish]\n", "needs: [plan, bump]\n"),
+        &plant(
+            "gamma",
+            "needs: [plan, publish, rehearse]\n",
+            "needs: [plan, bump, rehearse]\n",
+        ),
+        "the job `gamma` needs",
+    );
+    // Catches: the gamma stage telling the farm about a release no host was updated to.
+    red(
+        &plant(
+            "gamma",
+            "needs: [plan, publish, rehearse]\n",
+            "needs: [plan, publish]\n",
+        ),
         "the job `gamma` needs",
     );
     red(
