@@ -95,6 +95,7 @@ impl Fake {
             version: "2.0.0+g000000000002".to_owned(),
             min_up_storage: 1,
             min_up_frontend: 1,
+            require_coordinator_current: false,
             deadline: Duration::from_secs(30),
             stall: Duration::from_secs(30),
             every: Duration::from_secs(1),
@@ -1213,4 +1214,115 @@ fn run_with_refuses_a_tag_version_without_calling_the_coordinator() {
     );
     assert!(result.is_err());
     assert!(fake.requests("/").is_empty(), "a request was sent");
+}
+
+/// The baseline read of a farm whose coordinator says it was built from `commit`.
+fn reporting(commit: Option<&str>) -> Result<Value, u16> {
+    let mut read = farm("converged", 0, 0);
+    if let Some(commit) = commit {
+        read["commit"] = json!(commit);
+    }
+    Ok(read)
+}
+
+/// The deploy with `require_coordinator_current` as given, against a coordinator whose
+/// baseline read reports `commit`; the release is `...0002`.
+fn with_coordinator(commit: Option<&str>, require: bool) -> (Fake, Result<(), Error>, String) {
+    let fake = serve(Script::after(
+        reporting(commit),
+        vec![Ok(farm("converged", 0, 0))],
+    ));
+    let mut plan = fake.plan();
+    plan.require_coordinator_current = require;
+    let (result, out) = run(&fake, &plan);
+    (fake, result, out)
+}
+
+#[test]
+fn a_coordinator_on_another_commit_stops_a_deploy_that_requires_it_current_before_the_post() {
+    // Proves: with the requirement on, a coordinator that reports another commit than the
+    // release's fails with both commits and the pointer to the docs, and the desired version
+    // is never posted.
+    let (fake, result, out) = with_coordinator(Some("0123456789ab"), true);
+    let error = result.expect_err(&out);
+    assert_eq!(
+        error,
+        Error::CoordinatorBehind {
+            coordinator: "0123456789ab".to_owned(),
+            release: "000000000002".to_owned(),
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "the coordinator runs 0123456789ab, the release is 000000000002: update the coordinator first (docs/deploy/kbf-updater.md, Updating the coordinator)"
+    );
+    assert!(fake.requests("/v1/desired").is_empty(), "{out}");
+}
+
+#[test]
+fn a_coordinator_on_the_release_commit_proceeds_when_it_is_required_current() {
+    // Proves: the same commit passes the requirement, is said in the log, and the deploy
+    // runs to convergence.
+    let (fake, result, out) = with_coordinator(Some("000000000002"), true);
+    assert_eq!(result, Ok(()), "{out}");
+    assert!(
+        out.contains("the coordinator runs the release's commit 000000000002"),
+        "{out}"
+    );
+    assert_eq!(fake.requests("/v1/desired").len(), 1);
+}
+
+#[test]
+fn a_coordinator_that_reports_no_commit_gets_a_notice_and_the_deploy_proceeds() {
+    // Proves: an older coordinator (no `commit` key) and one built without a checkout
+    // (`unknown`) are noted when the requirement is on, and neither stops the deploy.
+    for reported in [None, Some("unknown")] {
+        let (fake, result, out) = with_coordinator(reported, true);
+        assert_eq!(result, Ok(()), "{reported:?}: {out}");
+        assert!(
+            out.contains("::notice::the coordinator reports no build commit"),
+            "{reported:?}: {out}"
+        );
+        assert_eq!(fake.requests("/v1/desired").len(), 1);
+    }
+}
+
+#[test]
+fn without_the_requirement_a_coordinator_on_another_commit_is_only_said() {
+    // Proves: with the requirement off the commits are printed and the deploy proceeds, and a
+    // coordinator that reports no commit adds no notice.
+    let (fake, result, out) = with_coordinator(Some("0123456789ab"), false);
+    assert_eq!(result, Ok(()), "{out}");
+    assert!(
+        out.contains("the coordinator runs 0123456789ab, the release is 000000000002"),
+        "{out}"
+    );
+    assert_eq!(fake.requests("/v1/desired").len(), 1);
+    let (_, result, out) = with_coordinator(None, false);
+    assert_eq!(result, Ok(()), "{out}");
+    assert!(!out.contains("build commit"), "{out}");
+}
+
+#[test]
+fn the_flag_turns_the_requirement_on_and_is_off_by_default() {
+    // Proves: `--require-coordinator-current` reaches the plan, and without it the plan does
+    // not require it.
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: Args,
+    }
+    let fake = serve(Script::new(vec![]));
+    let off = args_for(&fake, "");
+    assert!(!Plan::of(&off).require_coordinator_current);
+    let on = Cli::parse_from([
+        "x",
+        "--url",
+        &fake.base,
+        "--version",
+        "2.0.0+g000000000002",
+        "--require-coordinator-current",
+    ]);
+    assert!(Plan::of(&on.args).require_coordinator_current);
 }
