@@ -868,6 +868,11 @@ fn sweep(engine: &Arc<Oci>, config: &ContainerConfig) -> Result<(), String> {
         tracing::warn!(lease = %name, "removing a lease a previous daemon left");
         let mut lease = Lease::named(engine, config, name);
         lease.created = true;
+        // Before the clean removes the directory: the `crun run` of the dead daemon, not
+        // this process's child, would write into it again as it ends.
+        if let Err(why) = engine.end_runs(&lease.dir) {
+            errors.push(why);
+        }
         if let Err(why) = lease.clean_blocking() {
             errors.push(why);
         }
