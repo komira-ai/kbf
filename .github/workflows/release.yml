@@ -50,6 +50,11 @@
 # rehearse a host laid out by hand from the release before this one is updated to this one by
 #          the real helper under the real systemd, as the farm's hosts will be
 #          (crates/kbf-host-install/tests/update_rehearsal.rs). gamma needs it. Read-only.
+# rehearse-agent
+#          the same host is updated through the whole control loop the farm uses: the real
+#          coordinator of this commit, `cargo xtask deploy-farm` with the version `release
+#          farm-version` prints, and the real agent and frontend of the release before this one
+#          (crates/kbf-host-install/tests/update_rehearsal_agent.rs). gamma needs it. Read-only.
 # gamma    the gamma stage. Sets the published release as the desired version on the farm's
 #          update coordinator and waits for the farm to converge (cargo xtask deploy-farm); it
 #          passes with a notice when the repository variable KBF_COORDINATOR_URL is unset. Then
@@ -444,6 +449,41 @@ jobs:
         run: printf '%s\n' "$TAG" > /var/tmp/kbf-update-rehearsal.to
       - run: cargo xtask sudo-test -p kbf-host-install --test update_rehearsal -- --exact the_helper_updates_a_hand_laid_host_from_the_last_release_to_the_next --nocapture
 
+  # The rehearsal of the control loop, which the gamma stage needs too: the host of the rehearsal
+  # above is updated by the real agent that the real coordinator of this commit orders, after
+  # `cargo xtask deploy-farm` told that coordinator "desired = this release" with the version text
+  # `cargo xtask release farm-version` prints, as the gamma stage does below; the farm's frontend
+  # is the release before this one, and only the issuer of the OIDC token is a stand-in
+  # (crates/kbf-host-install/tests/update_rehearsal_agent.rs). A release whose version the hosts
+  # never report, or whose coordinator and agent do not agree, stops here. It holds
+  # `contents: read` and no secret, as the rehearsal above.
+  rehearse-agent:
+    needs: [plan, publish]
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: Token file of the rehearsal, readable by its owner alone
+        run: install -m 0600 /dev/null /var/tmp/kbf-update-rehearsal.token
+      - name: Token of the rehearsal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" > /var/tmp/kbf-update-rehearsal.token
+      - name: The release the rehearsal updates to
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: printf '%s\n' "$TAG" > /var/tmp/kbf-update-rehearsal.to
+      - name: The coordinator of this commit
+        run: cargo build --locked -p kbf-coordinator
+      - run: cargo xtask sudo-test -p kbf-host-install --test update_rehearsal_agent -- --exact the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release --nocapture
+
   # The gamma stage, the last step of a release: tell the farm's update coordinator "desired =
   # this release" and wait until the farm converges (docs/deploy/kbf-updater.md, "Turn on the gamma stage"). It
   # runs only after the release is published, holds no write scope and no secret, and holds the
@@ -455,7 +495,7 @@ jobs:
   # job's timeout), and a farm that is blocked, stalled or out of time fails the job; the
   # release stays published whatever this job says.
   gamma:
-    needs: [plan, publish, rehearse]
+    needs: [plan, publish, rehearse, rehearse-agent]
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.plan.outputs.code == 'true' && needs.plan.outputs.pipeline != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90

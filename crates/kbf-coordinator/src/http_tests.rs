@@ -746,8 +746,11 @@ async fn the_desired_call_takes_a_service_and_refuses_an_unknown_one() {
 #[tokio::test]
 async fn a_service_the_token_may_not_set_is_a_403() {
     let mut rig = Rig::new("http-forbidden");
-    rig.coordinator = Rig::start(&rig.dir, &rig.clock)
-        .with_services(crate::services::Services::parse("ci_services = []\n").expect("services"));
+    let list = format!(
+        "{}services = [\"other\"]\n",
+        kbf_oidc::testkit::config_text(kbf_oidc::testkit::STATIC_ISSUER)
+    );
+    rig.coordinator = Rig::start_with_allow_list(&rig.dir, &rig.clock, &list);
     let body = r#"{"version":"2.0","min_up":{"storage":1,"frontend":1}}"#;
     let (code, body) = call(
         &rig,
@@ -761,7 +764,7 @@ async fn a_service_the_token_may_not_set_is_a_403() {
     assert_eq!(status(&rig).await["desired"], Value::Null);
 }
 
-const SERVICES_TEXT: &str = "ci_services = [\"kbf\", \"other\"]\n[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n";
+const SERVICES_TEXT: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n";
 
 const NEW_GOLDEN_BEAT: &str = concat!(
     r#"{"platform":"linux-x86_64","version":"0.0.19+g123456abcdef-1","health":"healthy","#,
@@ -776,7 +779,11 @@ const NEW_GOLDEN_BEAT: &str = concat!(
 #[tokio::test]
 async fn a_service_order_goes_only_to_an_updater_that_sent_services() {
     let mut rig = Rig::new("http-services");
-    rig.coordinator = Rig::start(&rig.dir, &rig.clock)
+    let list = format!(
+        "{}services = [\"kbf\", \"other\"]\n",
+        kbf_oidc::testkit::config_text(kbf_oidc::testkit::STATIC_ISSUER)
+    );
+    rig.coordinator = Rig::start_with_allow_list(&rig.dir, &rig.clock, &list)
         .with_services(crate::services::Services::parse(SERVICES_TEXT).expect("services"));
     for body in [
         r#"{"version":"0.0.19+g123456abcdef-1","min_up":{"storage":1,"frontend":1}}"#,

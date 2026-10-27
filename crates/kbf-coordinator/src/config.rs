@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use kbf_oidc::{HttpsKeys, OidcConfig, Roots, Verifier};
+use kbf_oidc::{AllowList, HttpsKeys, Roots, Verifier};
 use kbf_tls::{TlsFiles, TlsSource};
 use tokio::net::TcpListener;
 
@@ -109,8 +109,8 @@ pub struct Parts {
 pub fn build(cli: &Cli) -> Result<Parts, Error> {
     let operator_token = kbf_updater::secret::read_token(&cli.operator_token_file)
         .map_err(|why| format!("--operator-token-file: {why}"))?;
-    let oidc = OidcConfig::from_file(&cli.oidc_config)?;
-    let keys = HttpsKeys::new(&oidc.issuer, Roots::System, KEY_FETCH_TIMEOUT)?;
+    let oidc = AllowList::from_file(&cli.oidc_config)?;
+    let keys = HttpsKeys::new(&oidc.entries()[0].issuer, Roots::System, KEY_FETCH_TIMEOUT)?;
     let verifier = Verifier::new(oidc, Arc::new(keys), KEY_REFETCH, kbf_oidc::system_clock());
     let desired = DesiredStore::open(&cli.state_file)?;
     let services = match &cli.services_file {

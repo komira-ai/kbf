@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use kbf_oidc::testkit::{STATIC_ISSUER, good_claims, keys, mint, mint_with, static_verifier};
+use kbf_oidc::testkit::{
+    STATIC_ISSUER, config_text, good_claims, keys, mint, mint_with, static_verifier,
+};
 use kbf_types::HostRole;
 use kbf_updater::wire::{Outcome, Reply};
 use serde_json::json;
@@ -555,16 +557,24 @@ fn with_services(rig: &mut Rig, text: &str) {
 
 const OTHER_SERVICE: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\n";
 
+/// The testkit's single table with `services` appended to it.
+fn single_table(services: &str) -> String {
+    format!("{}{services}\n", config_text(STATIC_ISSUER))
+}
+
 /// Catches: a defined service that cannot be set, or one the file does not define that can:
-/// with `other` defined CI sets it (the status lists it beside kbf's), the heartbeat of a
-/// kbf host is still answered from kbf alone, and a service nobody defined is refused.
+/// with `other` defined and the entry naming it CI sets it (the status lists it beside
+/// kbf's), the heartbeat of a kbf host is still answered from kbf alone, and a service
+/// nobody defined is refused.
 #[tokio::test]
 async fn ci_sets_a_defined_service_and_kbf_is_unchanged() {
     let mut rig = Rig::new("svc-defined");
-    with_services(
-        &mut rig,
-        &format!("ci_services = [\"kbf\", \"other\"]\n{OTHER_SERVICE}"),
-    );
+    rig.coordinator = Rig::start_with_allow_list(
+        &rig.dir,
+        &rig.clock,
+        &single_table("services = [\"kbf\", \"other\"]"),
+    )
+    .with_services(Services::parse(OTHER_SERVICE).expect("services"));
     rig.set(OTHER).await;
     rig.set(STATE).await;
     let status = rig.coordinator.status(Some(OPERATOR)).expect("status");
@@ -583,36 +593,24 @@ async fn ci_sets_a_defined_service_and_kbf_is_unchanged() {
     assert!(matches!(set, Err(SetError::Invalid(_))));
 }
 
-/// Catches: a token that may set a service it was not given: with the allow-list naming
-/// only `other`, kbf is refused (and its state does not change) while `other` is set; with
-/// no list only kbf may be set.
+/// Catches: a single-table allow-list that means more than kbf, or less: it sets kbf, and a
+/// defined service the table does not name is a 403 that changes nothing.
 #[tokio::test]
-async fn a_token_sets_only_the_services_its_entry_names() {
-    let mut rig = Rig::new("svc-forbidden");
-    with_services(
-        &mut rig,
-        &format!("ci_services = [\"other\"]\n{OTHER_SERVICE}"),
-    );
-    let set = rig
-        .coordinator
-        .set_desired(Some(&ci_token()), STATE.as_bytes())
-        .await;
-    assert!(matches!(set, Err(SetError::Forbidden)));
-    assert!(SetError::Forbidden.to_string().contains("may not"));
-    rig.set(OTHER).await;
-    let status = rig.coordinator.status(Some(OPERATOR)).expect("status");
-    assert!(status.desired.is_none() && status.services.len() == 1);
-
+async fn a_single_table_sets_kbf_and_is_refused_for_another_service() {
+    let mut rig = Rig::new("svc-single");
     with_services(&mut rig, OTHER_SERVICE);
     let set = rig
         .coordinator
         .set_desired(Some(&ci_token()), OTHER.as_bytes())
         .await;
     assert!(matches!(set, Err(SetError::Forbidden)));
+    assert!(SetError::Forbidden.to_string().contains("may not"));
+    let status = rig.coordinator.status(Some(OPERATOR)).expect("status");
+    assert!(status.desired.is_none() && status.services.is_empty());
     rig.set(STATE).await;
 }
 
-const SERVICES_ONE_AT_A_TIME: &str = "ci_services = [\"kbf\", \"other\"]\n[[service]]\nname = \"other\"\n[service.roles.daemon]\nmax_updating = 1\nmin_up = 0\n";
+const SERVICES_ONE_AT_A_TIME: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmax_updating = 1\nmin_up = 0\n";
 
 /// A beat of a new updater: kbf at `kbf`, `other` at `other`.
 fn new_beat(kbf: &str, other: &str) -> kbf_updater::wire::Heartbeat {
@@ -641,7 +639,12 @@ fn update_of(service: &str, target: &str) -> kbf_updater::wire::ServiceReply {
 
 async fn services_rig(name: &str) -> Rig {
     let mut rig = Rig::new(name);
-    with_services(&mut rig, SERVICES_ONE_AT_A_TIME);
+    rig.coordinator = Rig::start_with_allow_list(
+        &rig.dir,
+        &rig.clock,
+        &single_table("services = [\"kbf\", \"other\"]"),
+    )
+    .with_services(Services::parse(SERVICES_ONE_AT_A_TIME).expect("services"));
     rig.set(STATE).await;
     rig.set(OTHER).await;
     rig.at(2_000);
@@ -727,4 +730,76 @@ async fn only_an_updater_that_announced_a_service_is_ordered_it() {
         kbf_updater::wire::ServiceReply::Nothing,
         "other does not run on storage hosts"
     );
+}
+
+const SERVER_AGENT: &str = "[[service]]\nname = \"js-server\"\n[service.roles.daemon]\n\
+    [[service]]\nname = \"js-agent\"\n[service.roles.daemon]\n";
+
+fn body_for(service: &str) -> String {
+    format!(r#"{{"service":"{service}","version":"3.0","min_up":{{"storage":0,"frontend":0}}}}"#)
+}
+
+fn entry_b_token() -> String {
+    let mut claims = good_claims(STATIC_ISSUER);
+    claims["repository_id"] = json!("777");
+    claims["job_workflow_ref"] =
+        json!("komira-ai/other/.github/workflows/release.yml@refs/heads/main");
+    mint(&keys()[0], &claims)
+}
+
+/// Catches: services leaking between entries, or one entry's services ignored. Entry A
+/// names `kbf` and entry B `js-server` and `js-agent`: A's token sets kbf and gets a 403 for
+/// js-server; B's token sets js-server and js-agent and gets a 403 for kbf; a token no entry
+/// admits is refused as before, and each refusal leaves the state as it was.
+#[tokio::test]
+async fn each_entry_sets_only_its_own_services() {
+    let mut rig = Rig::new("svc-entries");
+    let list = format!(
+        "{}services = [\"kbf\"]\n\n[[remote_operator]]\nissuer = \"{STATIC_ISSUER}\"\n\
+         audience = \"kbf-gamma\"\nrepository_id = \"777\"\n\
+         job_workflow_ref = [\"komira-ai/other/.github/workflows/release.yml@refs/heads/main\"]\n\
+         refs = [\"refs/heads/main\"]\nservices = [\"js-server\", \"js-agent\"]\n",
+        config_text(STATIC_ISSUER).replace("[remote_operator]", "[[remote_operator]]"),
+    );
+    rig.coordinator = Rig::start_with_allow_list(&rig.dir, &rig.clock, &list)
+        .with_services(Services::parse(SERVER_AGENT).expect("services"));
+    let c = &rig.coordinator;
+
+    let a = ci_token();
+    assert!(matches!(
+        c.set_desired(Some(&a), body_for("js-server").as_bytes())
+            .await,
+        Err(SetError::Forbidden)
+    ));
+    let a = ci_token();
+    c.set_desired(Some(&a), STATE.as_bytes())
+        .await
+        .expect("A sets kbf");
+
+    let b = entry_b_token();
+    assert!(matches!(
+        c.set_desired(Some(&b), STATE.as_bytes()).await,
+        Err(SetError::Forbidden)
+    ));
+    for service in ["js-server", "js-agent"] {
+        let b = entry_b_token();
+        c.set_desired(Some(&b), body_for(service).as_bytes())
+            .await
+            .expect("B sets its service");
+    }
+
+    let mut stranger = good_claims(STATIC_ISSUER);
+    stranger["repository_id"] = json!("999");
+    let stranger = mint(&keys()[0], &stranger);
+    let refused = c.set_desired(Some(&stranger), STATE.as_bytes()).await;
+    assert!(
+        matches!(refused, Err(SetError::Unauthorized(_))),
+        "{refused:?}"
+    );
+
+    let status = c.status(Some(OPERATOR)).expect("status");
+    assert_eq!(status.desired.expect("kbf").version.as_str(), "2.0");
+    assert_eq!(status.services["js-server"].version.as_str(), "3.0");
+    assert_eq!(status.services["js-agent"].version.as_str(), "3.0");
+    assert_eq!(status.services.len(), 3);
 }

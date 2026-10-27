@@ -222,7 +222,7 @@ impl Coordinator {
         );
         let (service, desired) =
             Desired::parse_request_for(body, |name| self.services.get(name).is_some())?;
-        if !self.services.ci_may_set(&service) {
+        if !verified.services.contains(&service) {
             return Err(SetError::Forbidden);
         }
         self.desired.set(&service, desired.clone())?;
