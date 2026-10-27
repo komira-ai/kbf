@@ -278,12 +278,23 @@ impl Crun {
         let pids = runs_with_root(&state_dir(lease));
         for pid in &pids {
             // Already gone, or not ours to signal: the wait below says which.
-            let _ = rustix::process::kill_process(*pid, rustix::process::Signal::KILL);
+            let sent = rustix::process::kill_process(*pid, rustix::process::Signal::KILL);
+            eprintln!("DIAG kill {pid:?}: {sent:?}");
         }
         wait_ended(&pids, RUN_END_LIMIT, RUN_END_PAUSE).map_err(|left| {
             let shown: Vec<_> = left
                 .iter()
-                .map(|p| p.as_raw_nonzero().to_string())
+                .map(|p| {
+                    let raw = p.as_raw_nonzero();
+                    let status = std::fs::read_to_string(format!("/proc/{raw}/status"));
+                    let head: String = status
+                        .unwrap_or_default()
+                        .lines()
+                        .take(10)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    format!("{raw} [{head}]")
+                })
                 .collect();
             format!(
                 "crun run (pid {}) still runs {RUN_END_LIMIT:?} after it was killed",
