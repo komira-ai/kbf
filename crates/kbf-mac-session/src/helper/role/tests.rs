@@ -14,7 +14,7 @@ const VM: &str = "kbf-vm";
 const PW: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// The VM user's uid: an ordinary one above the rig's lease range (`me()` to `me()+3`).
-fn vm_uid() -> u32 {
+pub(in crate::helper) fn vm_uid() -> u32 {
     me() + 10
 }
 
@@ -46,7 +46,7 @@ fn put_password(rig: &Rig, text: &str) {
 
 /// A rig on a Mac with the VM user `kbf-vm` and its account, its boot reset done, the
 /// fake host logging the intent record at every command.
-fn vm_rig(name: &str) -> Rig {
+pub(in crate::helper) fn vm_rig(name: &str) -> Rig {
     let rig = rig_vm_with(name, range(), None, Some(VM));
     put_password(&rig, PW);
     rig.helper.boot_reset(&[]).unwrap();
@@ -91,8 +91,10 @@ fn auto_login_is(rig: &Rig, user: &str) {
     answer(rig, read, true, &format!("{user}\n"), "");
 }
 
-fn argv() -> Vec<String> {
-    vec!["/usr/bin/true".to_owned()]
+/// What `role-run` accepts: `kbf-vmm vm-run --spec <file>` with the file in the images
+/// directory.
+fn argv(rig: &Rig) -> Vec<String> {
+    crate::helper::ImageSettings::under(&rig.dir).vm_run_argv()
 }
 
 fn gui_up(rig: &Rig) {
@@ -118,7 +120,7 @@ fn the_role_verbs_need_a_configured_vm_user() {
     let none = "no VM user is configured";
     assert!(rig.helper.role_session_ready().unwrap_err().contains(none));
     assert!(rig.helper.role_kill_uid().unwrap_err().contains(none));
-    let run = rig.helper.role_run(argv(), Vec::new(), fds(&rig.dir));
+    let run = rig.helper.role_run(argv(&rig), Vec::new(), fds(&rig.dir));
     assert!(run.unwrap_err().contains(none));
     assert_eq!(log(&rig), Vec::<String>::new());
 }
@@ -146,7 +148,7 @@ fn the_role_verbs_refuse_an_account_they_must_not_act_on() {
             rig.helper.role_session_ready().unwrap_err(),
             rig.helper.role_kill_uid().unwrap_err(),
             rig.helper
-                .role_run(argv(), Vec::new(), fds(&rig.dir))
+                .role_run(argv(&rig), Vec::new(), fds(&rig.dir))
                 .unwrap_err(),
         ] {
             assert!(
@@ -214,7 +216,7 @@ fn a_role_run_waits_for_the_vm_user_s_session() {
     let uid = vm_uid();
     let refused = |rig: &Rig| {
         rig.helper
-            .role_run(argv(), Vec::new(), fds(&rig.dir))
+            .role_run(argv(rig), Vec::new(), fds(&rig.dir))
             .unwrap_err()
     };
     let error = refused(&rig);
@@ -226,7 +228,25 @@ fn a_role_run_waits_for_the_vm_user_s_session() {
     );
     // Malformed requests are refused before anything is asked.
     log(&rig);
-    let few = rig.helper.role_run(argv(), Vec::new(), Vec::new());
+    for name in [
+        "DYLD_INSERT_LIBRARIES",
+        "LD_PRELOAD",
+        "PATH",
+        "TMPDIR",
+        "ANYTHING",
+    ] {
+        let env = vec![(name.to_owned(), "/x".to_owned())];
+        let error = rig
+            .helper
+            .role_run(argv(&rig), env, fds(&rig.dir))
+            .unwrap_err();
+        assert!(
+            error.contains("role-run takes no environment"),
+            "{name}: {error}"
+        );
+        assert!(error.contains(name), "{error}");
+    }
+    let few = rig.helper.role_run(argv(&rig), Vec::new(), Vec::new());
     assert!(few.unwrap_err().contains("got 0 descriptors"));
     let empty = rig.helper.role_run(Vec::new(), Vec::new(), fds(&rig.dir));
     assert!(empty.unwrap_err().contains("empty"));
@@ -249,7 +269,7 @@ fn a_role_run_waits_for_the_vm_user_s_session() {
     {
         let error = refused(&rig);
         assert!(
-            error.starts_with("starting /usr/bin/true: a GUI session exists only on macOS"),
+            error.contains("a GUI session exists only on macOS"),
             "{error}"
         );
     }
@@ -271,8 +291,17 @@ fn a_role_run_waits_for_the_vm_user_s_session() {
         }
     );
     rig.host.state().domains.clear();
+    let with_env = Request::RoleRun {
+        argv: argv(&rig),
+        env: vec![("DYLD_INSERT_LIBRARIES".to_owned(), "/x".to_owned())],
+    };
+    let refused = reply(with_env, fds(&rig.dir));
+    assert!(
+        matches!(&refused, Reply::Refused { reason } if reason.contains("takes no environment")),
+        "{refused:?}"
+    );
     let run = Request::RoleRun {
-        argv: argv(),
+        argv: argv(&rig),
         env: Vec::new(),
     };
     let reply = reply(run, fds(&rig.dir));

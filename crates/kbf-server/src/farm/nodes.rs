@@ -4,7 +4,7 @@
 use kbf_sched::Cordon;
 use kbf_types::{FarmTime, WorkerId};
 
-use super::{Farm, State};
+use super::{Farm, NodeUnread, State};
 use crate::fleet::{
     NodeDetail, NodeView, NodesView, PhaseView, PlacementView, ResourcesView, needs_attention,
 };
@@ -35,11 +35,41 @@ impl Farm {
     }
 
     /// `worker` as `GET /v1/nodes/{id}` answers: its list entry, what it reported it can
-    /// run, what is left of that, and its leases; `None` if it has not registered.
-    pub fn node_detail(&self, worker: &WorkerId) -> Option<NodeDetail> {
+    /// run, what is left of that, and its leases; `None` if neither this frontend nor the
+    /// state store knows it.
+    ///
+    /// A drain or cordon may have been written through another frontend of the store, and
+    /// the read may land on any frontend: the `cordon/` rows are taken up first, as an intake
+    /// poll does, so the node's own frontend shows them at once; and a node another frontend
+    /// holds is answered from the store (`State::stored_detail`), since this frontend's
+    /// scheduler runs none of its work.
+    ///
+    /// # Errors
+    /// The node is another frontend's and the state store could not be read; or the store
+    /// cannot say who holds the node, and it is not connected to this frontend.
+    pub fn node_detail(&self, worker: &WorkerId) -> Result<Option<NodeDetail>, NodeUnread> {
+        let now = self.now();
         let mut state = self.lock();
         state.note_closed_streams();
-        state.machine.node(worker)?;
+        let cordons = state.take_cordons(now);
+        let unread = || NodeUnread(worker.as_str().to_owned());
+        let connected = state
+            .machine
+            .node(worker)
+            .is_some_and(|node| node.connected);
+        match state.held_elsewhere(now, worker) {
+            Some(true) => {
+                let cordon = cordons.ok_or_else(unread)?.get(worker).copied();
+                let stored = state.stored_detail(worker, cordon);
+                return stored.map(Some).ok_or_else(unread);
+            }
+            // The store cannot say who holds the node: only one connected here is answered.
+            None if !connected => return Err(unread()),
+            Some(false) | None => {}
+        }
+        if state.machine.node(worker).is_none() {
+            return Ok(None);
+        }
         let node = self.node(&state, worker);
         let capacity = state.sched.capacity(worker).unwrap_or_default();
         let booked = state.sched.booked(worker).unwrap_or_default();
@@ -49,12 +79,12 @@ impl Farm {
             .iter()
             .map(ToString::to_string)
             .collect();
-        Some(NodeDetail {
+        Ok(Some(NodeDetail {
             node,
             capacity: ResourcesView::of(capacity),
             free: ResourcesView::of(capacity.saturating_sub(booked)),
             leases,
-        })
+        }))
     }
 
     /// One node's view; `worker` is registered, and every closed stream noted

@@ -168,6 +168,12 @@ pub struct Farm {
 #[error("no node {0} has registered")]
 pub struct UnknownNode(pub String);
 
+/// A read of a node another frontend of the state store holds, when the store could not be
+/// read ([`Farm::node_detail`]).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the state store could not be read for node {0}, which another frontend holds")]
+pub struct NodeUnread(pub String);
+
 /// What an operator does to a node's placement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeAction {

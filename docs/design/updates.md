@@ -99,6 +99,25 @@ environments = ["<a protected environment>"]
 # runner_environment: the default, github-hosted
 ```
 
+**Several entries.** The file may instead hold several `[[remote_operator]]` entries, each with the keys above (a file never has both `[remote_operator]` and `[[remote_operator]]`). A token is admitted by the first entry whose every check passes, and only that entry's `services` apply: `services` is a list of service names the token may set the desired version of, `["kbf"]` when the entry names none. `Verified` carries the matching entry's place in the file and its services, so the caller authorizes per service. A token no entry admits is refused with the first entry's reason. The file is refused at load if entries name different issuers (the keys are one issuer's), or if two entries have the same `repository_id` and share a `job_workflow_ref`. A file with a single `[remote_operator]` table means what it always meant (one entry, services `["kbf"]`). The list form is read by `kbf_oidc::AllowList`; `OidcConfig` reads the single table only.
+
+```toml
+[[remote_operator]]
+issuer = "https://token.actions.githubusercontent.com"
+audience = "<audience>"
+repository_id = "<id of komira-ai/kbf>"
+job_workflow_ref = ["komira-ai/kbf/.github/workflows/release.yml@refs/heads/main"]
+environments = ["release"]
+
+[[remote_operator]]
+issuer = "https://token.actions.githubusercontent.com"
+audience = "<audience>"
+repository_id = "<id of the other repository>"
+job_workflow_ref = ["<owner>/<repo>/.github/workflows/release.yml@refs/heads/main"]
+environments = ["release"]
+services = ["<that repository's services>"]
+```
+
 A CI job asks for the token with its audience (`ACTIONS_ID_TOKEN_REQUEST_URL` with `&audience=`) and sends it as `Authorization: Bearer`. For a workflow that GitHub starts from a `workflow_run`, `job_workflow_ref` names the copy of the workflow on the default branch, and `event_names` must list `workflow_run`; the token does not say which event started the upstream run, so the workflow's own `if:` is what keeps a run started any other way from calling.
 
 ## 6. Failures

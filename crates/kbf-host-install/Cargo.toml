@@ -46,6 +46,15 @@ rustix = { workspace = true, features = ["net"] }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 kbf-host = { workspace = true, features = ["testkit"] }
 kbf-installer = { workspace = true, features = ["testkit"] }
+# The update rehearsal of the agent and the coordinator (tests/update_rehearsal_agent.rs): a
+# throwaway farm CA and the certificates it issues, and the stand-in for GitHub's OIDC issuer
+# (the testkit's keys and token minter).
+base64.workspace = true
+kbf-ca.workspace = true
+kbf-oidc = { workspace = true, features = ["testkit"] }
+kbf-types.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
 
 [lints]
 workspace = true

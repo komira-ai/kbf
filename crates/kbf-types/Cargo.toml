@@ -9,7 +9,7 @@ publish.workspace = true
 
 [dependencies]
 serde.workspace = true
-# `Version::parse` reads the report of `kbf --version --json` (crates/kbf-types/src/version.rs).
+# `Version::parse` reads the report of `kbf --version --json` (crates/kbf-types/src/sched/version.rs).
 serde_json.workspace = true
 thiserror.workspace = true
 # The wipe-on-drop of `object_store_api::Secret`.
