@@ -12,7 +12,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::sim::{Argv, Class, Late, Step, Who};
+use crate::frame::MAX_BODY_BYTES;
+use crate::sim::{Argv, Class, Late, SimHost, Step, Who};
 use crate::simpaths;
 
 /// The name of the frame that carries the counts.
@@ -121,6 +122,62 @@ pub struct XcTestFrame {
     pub omitted: u64,
 }
 
+/// What must hold before a test step runs. `xctest` first removes any result bundle already
+/// at [`RESULT_PATH`] (xcodebuild refuses to write over one, and the summary would then
+/// describe the old run); `xctest-summary` needs a bundle there, which only this run's
+/// `xctest` can have made.
+///
+/// # Errors
+/// The earlier bundle could not be removed, or there is no bundle to summarize.
+pub fn check_before(host: &dyn SimHost, step: &str) -> Result<(), String> {
+    match step {
+        XCTEST_STEP => host
+            .clear_result_bundle()
+            .map_err(|e| format!("could not remove an earlier {RESULT_PATH}: {e}")),
+        SUMMARY_STEP if !host.result_bundle_present() => Err(format!(
+            "{RESULT_PATH} does not exist: xctest wrote no result bundle"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Removes the directory `path` and what it holds without following a link: a link there is
+/// removed itself. A path that is not there is fine.
+///
+/// # Errors
+/// The path cannot be examined or removed.
+pub fn remove_no_follow(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path).map_err(|e| e.to_string()),
+        Ok(_) => std::fs::remove_file(path).map_err(|e| e.to_string()),
+    }
+}
+
+/// Whether `path` is a real directory (a link to one is not).
+#[must_use]
+pub fn is_real_dir(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+/// `frame` with failed tests dropped from the end (and counted in `omitted`) until its JSON
+/// is at most `limit` bytes. The caps on names and messages keep a frame far under
+/// [`MAX_BODY_BYTES`] even when every character is escaped, so this only guards that.
+#[must_use]
+pub fn fit(mut frame: XcTestFrame, limit: usize) -> XcTestFrame {
+    while !frame.failures.is_empty()
+        && serde_json::to_string(&frame).map_or(usize::MAX, |t| t.len()) > limit
+    {
+        frame.failures.pop();
+        frame.omitted += 1;
+    }
+    frame
+}
+
+/// The limit [`fit`] is given: the frame body limit.
+pub const FRAME_LIMIT: usize = MAX_BODY_BYTES;
+
 /// `text` cut to at most `max` bytes at a character boundary; whether it was cut.
 fn cap(text: &str, max: usize) -> (String, bool) {
     if text.len() <= max {
@@ -155,9 +212,12 @@ pub fn parse_summary(text: &str, cut: bool) -> Result<XcTestFrame, String> {
         count(&v, "skippedTests")?,
     );
     let expected_failures = v["expectedFailures"].as_u64().unwrap_or(0);
-    let total = v["totalTestCount"]
-        .as_u64()
-        .unwrap_or(passed + failed + skipped + expected_failures);
+    let total = v["totalTestCount"].as_u64().unwrap_or_else(|| {
+        passed
+            .saturating_add(failed)
+            .saturating_add(skipped)
+            .saturating_add(expected_failures)
+    });
     let mut failures: Vec<Failure> = Vec::new();
     let mut omitted = std::collections::BTreeSet::new();
     for f in v["testFailures"].as_array().into_iter().flatten() {

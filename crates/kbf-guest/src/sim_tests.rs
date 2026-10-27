@@ -105,6 +105,13 @@ struct Fake {
     screenshot_cap: Cell<usize>,
     out_dir_made: Cell<bool>,
     out_dir_fails: bool,
+    /// A result bundle from an earlier run is there; the tests' run writes one unless
+    /// `no_bundle_written`.
+    stale_bundle: Cell<bool>,
+    no_bundle_written: bool,
+    clear_fails: bool,
+    /// How many commands had run when the bundle was cleared.
+    cleared_at: Cell<Option<usize>>,
 }
 
 impl Fake {
@@ -136,6 +143,10 @@ impl Fake {
             screenshot_cap: Cell::new(0),
             out_dir_made: Cell::new(false),
             out_dir_fails: false,
+            stale_bundle: Cell::new(false),
+            no_bundle_written: false,
+            clear_fails: false,
+            cleared_at: Cell::new(None),
         }
     }
 
@@ -172,6 +183,23 @@ impl SimHost for Fake {
     }
     fn xctest_entries(&self) -> Vec<String> {
         self.tests.clone()
+    }
+    fn clear_result_bundle(&self) -> Result<(), String> {
+        if self.clear_fails {
+            return Err("Operation not permitted".to_owned());
+        }
+        self.cleared_at.set(Some(self.ran.borrow().len()));
+        self.stale_bundle.set(false);
+        Ok(())
+    }
+    fn result_bundle_present(&self) -> bool {
+        self.stale_bundle.get()
+            || (!self.no_bundle_written
+                && self
+                    .ran
+                    .borrow()
+                    .iter()
+                    .any(|(a, _)| a.iter().any(|x| x == "test-without-building")))
     }
     fn console_user(&self) -> Option<ConsoleUser> {
         self.user_after_pauses

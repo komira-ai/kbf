@@ -10,6 +10,7 @@ use crate::probe::Host;
 use crate::probe_host::SystemHost;
 use crate::sim::{ConsoleUser, OUT_DIR, Outcome, SCREENSHOT_PATH, SimHost, Wanted};
 use crate::sim_run::{ProcessRunner, SystemClock, read_regular, read_wanted};
+use crate::sim_xctest;
 use crate::simpaths;
 
 pub struct RealSimHost {
@@ -90,6 +91,14 @@ impl SimHost for RealSimHost {
 
     fn xctest_entries(&self) -> Vec<String> {
         names_in(simpaths::TESTS_DIR)
+    }
+
+    fn clear_result_bundle(&self) -> Result<(), String> {
+        sim_xctest::remove_no_follow(Path::new(sim_xctest::RESULT_PATH))
+    }
+
+    fn result_bundle_present(&self) -> bool {
+        sim_xctest::is_real_dir(Path::new(sim_xctest::RESULT_PATH))
     }
 
     fn console_user(&self) -> Option<ConsoleUser> {

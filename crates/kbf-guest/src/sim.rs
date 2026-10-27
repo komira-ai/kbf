@@ -491,6 +491,14 @@ pub trait SimHost {
     fn app_bundles(&self) -> Vec<String>;
     /// The names of the entries in [`simpaths::TESTS_DIR`].
     fn xctest_entries(&self) -> Vec<String>;
+    /// Removes the result bundle of the tests ([`sim_xctest::RESULT_PATH`]) without following
+    /// a link; one that is not there is fine.
+    ///
+    /// # Errors
+    /// It is there and could not be removed.
+    fn clear_result_bundle(&self) -> Result<(), String>;
+    /// Whether the result bundle is there, as a real directory.
+    fn result_bundle_present(&self) -> bool;
     /// The user logged in at the console, if there is one.
     fn console_user(&self) -> Option<ConsoleUser>;
     /// The user `kbf-guest mkuser` recorded as ready ([`simpaths::USER_READY`]), if any.
@@ -822,6 +830,11 @@ fn execute(
         }
     };
     f.argv.clone_from(&argv);
+    if let Err(e) = sim_xctest::check_before(host, &step.id) {
+        f.status = Status::Error;
+        f.note = Some(e);
+        return;
+    }
     let command = if step.who == Who::User {
         let expected = r.user_name.as_deref();
         let found = user.get_or_insert_with(|| wait_console_user(host, cfg.console_wait, expected));
@@ -919,7 +932,10 @@ fn absorb(
 
 /// Reads the summary the step printed and sends the counts as a frame of their own.
 fn send_xctest(out: &Outcome, r: &mut Run<'_>) -> Result<String, String> {
-    let frame = sim_xctest::parse_summary(&String::from_utf8_lossy(&out.stdout), out.cut)?;
+    let frame = sim_xctest::fit(
+        sim_xctest::parse_summary(&String::from_utf8_lossy(&out.stdout), out.cut)?,
+        sim_xctest::FRAME_LIMIT,
+    );
     let note = format!(
         "{} passed, {} failed, {} skipped, sent as {}",
         frame.passed,

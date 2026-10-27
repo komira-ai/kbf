@@ -825,7 +825,10 @@ bytes) and the first failure message (at most 512 bytes). The summary of `xcresu
 names the failed tests only, so passed and skipped tests are counted, not named. The
 result bundle stays in `/private/var/kbf-sim/out/tests.xcresult` on the clone (`--keep`,
 then `image harvest`). `probe e3` prints these counts as `xctest` under each arm and, in
-its one line, as `UI tests N passed, N failed, N skipped`. The `xcresulttool` form is the one
+its one line, as `UI tests N passed, N failed, N skipped`. Before `xctest` runs, the guest removes any `tests.xcresult` already in the out directory
+(a link is removed, not followed; a removal that fails fails the step), and `xctest-summary`
+is an error when no bundle exists after `xctest`, so an old bundle is never summarized as
+this run's. The `xcresulttool` form is the one
 Xcode prints JSON for by default; it is not run with `--format json`.
 
 Each step sends the host one frame, `sim-step-NN-<step>.json`, as it ends: the step, its

@@ -539,3 +539,132 @@ fn an_echoed_note_is_cut_at_a_character_boundary() {
     assert!(note.len() <= MAX_ECHO_BYTES + CUT_MARK.len());
     assert_eq!(crate::sim_parse::echo("short"), "short");
 }
+
+/// Catches a result bundle of an earlier run left where xcodebuild is to write one (it
+/// refuses, and the old counts would be reported as this run's): it is removed before the
+/// tests start, not after.
+#[test]
+fn an_earlier_result_bundle_is_removed_before_the_tests_run() {
+    let host = staged(SUMMARY_PASSED);
+    host.stale_bundle.set(true);
+    let summary = go(&host);
+    assert!(summary.ok, "{:?}", summary.steps);
+    let cmds = host.commands();
+    let at = cmds
+        .iter()
+        .position(|c| c.contains("test-without-building"))
+        .expect("tests ran");
+    assert_eq!(host.cleared_at.get(), Some(at));
+}
+
+/// Catches the summary of a bundle this run did not write: xcodebuild failing before it
+/// wrote one (with an older bundle on disk) must not report the old counts.
+#[test]
+fn a_run_that_wrote_no_bundle_does_not_summarize_an_old_one() {
+    let mut host = staged(SUMMARY_FAILED);
+    host.stale_bundle.set(true);
+    host.no_bundle_written = true;
+    host.answer("test-without-building", exited(70, "xcodebuild: error"));
+    let summary = go(&host);
+    let frames = host.step_frames();
+    assert_eq!(step_of(&frames, "xctest").status, Status::Failed);
+    let s = step_of(&frames, "xctest-summary");
+    assert_eq!(s.status, Status::Error);
+    assert!(s.note.expect("note").contains("wrote no result bundle"));
+    assert!(host.commands().iter().all(|c| !c.contains("xcresulttool")));
+    assert!(xctest_frame(&host).is_none() && !summary.ok);
+}
+
+/// Catches a bundle that cannot be removed being ignored: the tests must not run over it.
+#[test]
+fn a_result_bundle_that_cannot_be_removed_fails_the_step_and_runs_nothing() {
+    let mut host = staged(SUMMARY_PASSED);
+    host.clear_fails = true;
+    go(&host);
+    let frames = host.step_frames();
+    let t = step_of(&frames, "xctest");
+    assert_eq!(t.status, Status::Error);
+    assert!(t.note.expect("note").contains("Operation not permitted"));
+    assert_eq!(
+        step_of(&frames, "xctest-summary")
+            .skipped_because
+            .as_deref(),
+        Some("xctest")
+    );
+    assert!(
+        host.commands()
+            .iter()
+            .all(|c| !c.contains("test-without-building"))
+    );
+}
+
+/// Catches a removal that follows a link (it would delete what the link names), leaves part
+/// of a bundle, or fails on a path that is not there.
+#[test]
+fn the_result_bundle_is_removed_without_following_links() {
+    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-guest-xt-rm");
+    std::fs::create_dir_all(dir.join("keep")).expect("dirs");
+    std::fs::write(dir.join("keep/precious"), "x").expect("write");
+    let bundle = dir.join("tests.xcresult");
+    std::fs::create_dir_all(bundle.join("Data")).expect("bundle");
+    std::fs::write(bundle.join("Data/f"), "x").expect("file");
+    assert!(xt::is_real_dir(&bundle));
+    xt::remove_no_follow(&bundle).expect("removed");
+    assert!(!bundle.exists());
+    xt::remove_no_follow(&bundle).expect("absent is fine");
+
+    std::os::unix::fs::symlink(dir.join("keep"), &bundle).expect("link");
+    assert!(!xt::is_real_dir(&bundle));
+    xt::remove_no_follow(&bundle).expect("link removed");
+    assert!(std::fs::symlink_metadata(&bundle).is_err());
+    assert!(dir.join("keep/precious").exists());
+
+    std::fs::write(&bundle, "a file").expect("file");
+    xt::remove_no_follow(&bundle).expect("file removed");
+    assert!(!bundle.exists());
+}
+
+/// Catches a total computed with `+` from counts a hostile result could make overflow.
+#[test]
+fn huge_counts_do_not_overflow_the_total() {
+    let max = u64::MAX;
+    let text = format!(
+        r#"{{"passedTests":{max},"failedTests":{max},"skippedTests":{max},"expectedFailures":{max}}}"#
+    );
+    let f = xt::parse_summary(&text, false).expect("parse");
+    assert_eq!((f.total, f.passed), (max, max));
+}
+
+/// Catches a frame of 50 control-character-heavy failures (each character escaped to six
+/// bytes in JSON) outgrowing the body limit, and a frame that is too large not being
+/// shortened by dropping failures from the end.
+#[test]
+fn the_worst_case_frame_fits_the_body_limit_and_an_oversized_one_is_shortened() {
+    let name = "\u{1}".repeat(1000);
+    let msg = "\u{1f}".repeat(1000);
+    let failures: Vec<serde_json::Value> = (0..200)
+        .map(|i| {
+            serde_json::json!({
+                "testIdentifierString": format!("{i:03}{name}"),
+                "failureText": msg,
+            })
+        })
+        .collect();
+    let text = serde_json::json!({
+        "passedTests": 0, "failedTests": 200, "skippedTests": 0, "testFailures": failures,
+    })
+    .to_string();
+    let f = xt::parse_summary(&text, false).expect("parse");
+    assert_eq!(f.failures.len(), xt::MAX_LISTED);
+    let size = serde_json::to_string(&f).expect("json").len();
+    assert!(size < MAX_BODY_BYTES / 2, "{size}");
+    assert_eq!(xt::fit(f.clone(), xt::FRAME_LIMIT), f);
+    let small = xt::fit(f.clone(), 10_000);
+    assert!(serde_json::to_string(&small).expect("json").len() <= 10_000);
+    assert!(small.failures.len() < f.failures.len());
+    assert_eq!(
+        small.failures.len() as u64 + small.omitted,
+        f.failures.len() as u64 + f.omitted
+    );
+    assert_eq!(small.failures, f.failures[..small.failures.len()]);
+}
