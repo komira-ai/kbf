@@ -452,10 +452,7 @@ fn check_coordinator(
     reported: Option<&str>,
     out: &mut dyn Write,
 ) -> Result<(), Error> {
-    let release = plan
-        .version
-        .rsplit_once("+g")
-        .map_or("", |(_, commit)| commit);
+    let release = plan.version.rsplit("+g").next().unwrap_or_default();
     let Some(coordinator) = reported.filter(|c| is_commit(c)) else {
         let line = "::notice::the coordinator reports no build commit (an older build): not checking that it is current";
         return if plan.require_coordinator_current {
