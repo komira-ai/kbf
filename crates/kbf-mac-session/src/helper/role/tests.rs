@@ -228,6 +228,24 @@ fn a_role_run_waits_for_the_vm_user_s_session() {
     );
     // Malformed requests are refused before anything is asked.
     log(&rig);
+    for name in [
+        "DYLD_INSERT_LIBRARIES",
+        "LD_PRELOAD",
+        "PATH",
+        "TMPDIR",
+        "ANYTHING",
+    ] {
+        let env = vec![(name.to_owned(), "/x".to_owned())];
+        let error = rig
+            .helper
+            .role_run(argv(&rig), env, fds(&rig.dir))
+            .unwrap_err();
+        assert!(
+            error.contains("role-run takes no environment"),
+            "{name}: {error}"
+        );
+        assert!(error.contains(name), "{error}");
+    }
     let few = rig.helper.role_run(argv(&rig), Vec::new(), Vec::new());
     assert!(few.unwrap_err().contains("got 0 descriptors"));
     let empty = rig.helper.role_run(Vec::new(), Vec::new(), fds(&rig.dir));
@@ -273,6 +291,15 @@ fn a_role_run_waits_for_the_vm_user_s_session() {
         }
     );
     rig.host.state().domains.clear();
+    let with_env = Request::RoleRun {
+        argv: argv(&rig),
+        env: vec![("DYLD_INSERT_LIBRARIES".to_owned(), "/x".to_owned())],
+    };
+    let refused = reply(with_env, fds(&rig.dir));
+    assert!(
+        matches!(&refused, Reply::Refused { reason } if reason.contains("takes no environment")),
+        "{refused:?}"
+    );
     let run = Request::RoleRun {
         argv: argv(&rig),
         env: Vec::new(),

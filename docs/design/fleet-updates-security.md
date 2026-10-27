@@ -349,7 +349,9 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 >   `session-login <lease>` still switches away from the VM user. Four verbs act for
 >   the VM user: `role-run` (one program only: the helper's installed `kbf-vmm` as
 >   `vm-run --spec <file>`, with the file a regular file inside the images directory
->   reached through no link; it runs in the VM user's `gui/<uid>` domain, refused until
+>   reached through no link, and no environment variables; the check limits where the spec
+>   is, not what it says, so a caller that can rewrite it afterwards can point the VM
+>   user's `kbf-vmm` at any file that user can read; it runs in the VM user's `gui/<uid>` domain, refused until
 >   the domain exists and while a lease holds the session), `role-session-ready` (false
 >   while a lease holds the session), `role-reap` (ends the process group a `role-run`
 >   started, found again by the pid the helper reported, its start time and the boot

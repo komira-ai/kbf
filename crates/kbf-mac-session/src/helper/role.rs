@@ -102,6 +102,7 @@ impl Helper {
     ) -> Result<Child, String> {
         spawn::check(&argv, &env)?;
         self.check_vm_run(&argv)?;
+        super::vmrun::no_environment(&env)?;
         let count = fds.len();
         let [stdin, stdout, stderr, cwd]: [OwnedFd; 4] = fds.try_into().map_err(|_| {
             format!(
