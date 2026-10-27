@@ -9,6 +9,8 @@
 //! - a pure crate that depends, directly or through another crate, on a forbidden
 //!   crate (tokio, tonic, hyper, reqwest, the rand family, getrandom, mio, socket2);
 //! - a pure crate that depends on a kbf crate outside the pure set;
+//! - a pure crate that reaches a crate taken from a git repository other than the ones
+//!   listed in `PURE_GIT_CRATES` (today `js-sizing`, which `kbf-estimator` re-exports);
 //! - a pure crate whose `lib.rs` no longer denies the `clippy.toml` lists, which would
 //!   silently switch off the clock, sleep, network and `HashMap` checks for it;
 //! - a pure crate renamed or removed, which would otherwise make every check above
@@ -112,9 +114,20 @@ const PURE_MODULES: &[&str] = &["kbf-server/src/machine.rs"];
 
 const DENY_ATTR: &str = "#![deny(clippy::disallowed_methods, clippy::disallowed_types)]";
 
+/// The crates of other repositories (taken by `git` dependency, `source` beginning
+/// `git+`) that a pure crate may reach, with the one repository each may come from.
+/// `kbf-estimator` re-exports `js-sizing`, which has no dependencies of its own; a
+/// further git crate in a pure crate's tree is a decision, so it is listed here by name.
+const PURE_GIT_CRATES: &[(&str, &str)] = &[(
+    "js-sizing",
+    "git+https://github.com/komira-ai/jobscheduler?rev=",
+)];
+
 struct Graph {
     /// Package id to package name.
     names: BTreeMap<String, String>,
+    /// Package id to the package's `source` (`None` for a workspace path crate).
+    sources: BTreeMap<String, Option<String>>,
     /// Package id to the ids of its normal dependencies.
     normal: BTreeMap<String, Vec<String>>,
     /// Workspace member name to (package id, path of its library root).
@@ -136,8 +149,10 @@ fn load_graph() -> Graph {
     let meta: Value = serde_json::from_slice(&out.stdout).expect("cargo metadata emits JSON");
 
     let mut names = BTreeMap::new();
+    let mut sources = BTreeMap::new();
     for pkg in meta["packages"].as_array().expect("packages") {
         let id = pkg["id"].as_str().expect("package id").to_owned();
+        sources.insert(id.clone(), pkg["source"].as_str().map(str::to_owned));
         names.insert(id, pkg["name"].as_str().expect("package name").to_owned());
     }
 
@@ -189,6 +204,7 @@ fn load_graph() -> Graph {
 
     Graph {
         names,
+        sources,
         normal,
         members,
     }
@@ -234,6 +250,44 @@ fn pure_crates_have_no_impure_dependencies() {
         "pure crates reach impure crates:\n{}",
         violations.join("\n")
     );
+}
+
+#[test]
+fn pure_crates_take_git_crates_only_from_the_list() {
+    let g = load_graph();
+    let mut violations = Vec::new();
+    let mut seen = BTreeSet::new();
+    for &pure in PURE {
+        let (id, _) = g
+            .members
+            .get(pure)
+            .unwrap_or_else(|| panic!("{pure} is not a workspace member"));
+        for (dep, chain) in normal_closure(&g, id) {
+            let Some(source) = g.sources[&dep].as_deref().filter(|s| s.starts_with("git+")) else {
+                continue;
+            };
+            let name = g.names[&dep].as_str();
+            seen.insert(name.to_owned());
+            let allowed = PURE_GIT_CRATES
+                .iter()
+                .any(|(n, prefix)| *n == name && source.starts_with(prefix));
+            if !allowed {
+                violations.push(format!("{chain} ({source})"));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "pure crates reach git crates outside PURE_GIT_CRATES:\n{}",
+        violations.join("\n")
+    );
+    // The list is not vacuous: kbf-estimator reaches js-sizing through its shim.
+    for (name, _) in PURE_GIT_CRATES {
+        assert!(
+            seen.contains(*name),
+            "{name} is in PURE_GIT_CRATES but no pure crate reaches it"
+        );
+    }
 }
 
 #[test]
