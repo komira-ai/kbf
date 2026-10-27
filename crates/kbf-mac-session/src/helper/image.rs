@@ -108,6 +108,21 @@ impl ImageSettings {
         }
     }
 
+    /// The argument vector `role-run` accepts under [`Self::under`]'s paths: the
+    /// installed `kbf-vmm` as `vm-run --spec` a spec file made in the images directory.
+    #[cfg(test)]
+    pub(crate) fn vm_run_argv(&self) -> Vec<String> {
+        let spec = self.dir.join("clones").join("spec.json");
+        std::fs::create_dir_all(spec.parent().unwrap()).unwrap();
+        std::fs::write(&spec, "{}").unwrap();
+        vec![
+            self.vmm.display().to_string(),
+            "vm-run".to_owned(),
+            "--spec".to_owned(),
+            spec.display().to_string(),
+        ]
+    }
+
     /// The one name `path` has directly inside `root` (`label` names it in an error).
     ///
     /// # Errors

@@ -217,11 +217,23 @@ the list:
 
 `{id}` is the node id as `POST /v1/nodes/{node}:cordon` takes it, percent-encoded as one
 path segment. `404` with `{"error": "no_node"}` for a node that has not registered since
-this server started, and for an id that ends in `:cordon`, `:drain` or `:uncordon`: that
+this server started and that no frontend of its state store holds, and for an id that ends in
+`:cordon`, `:drain` or `:uncordon`: that
 is a write's path, and a read of it is never a node (an id that holds another colon,
 `host:8080`, is read as it is). A path below the node (`/v1/nodes/{id}/...`) is `404`.
 The node's recent failed runs are not here: they are `GET /v1/runs?node=` with
 `--history-objects`.
+
+With a state store, a cordon or drain written through another frontend is read at once,
+wherever the read lands: the server takes up the store's `cordon/` rows before it answers.
+A node connected to another frontend of the store is answered from the store: `placement` is
+its `cordon/` row (a drain with no lease left reads as `drained`; the store does not say
+whether a drain paused), `leases` and `lease_count` are the leases the store records on it,
+`connected` is `false`, and `protocol`, `software`, `booked`, `capacity` and `free` are empty
+(they are the other frontend's to say). `503` when that store cannot be read, and when the
+store cannot say who holds a node that is not connected to the frontend answering: never "no
+such node", and never the node with no lease. A node connected to the frontend answering is
+answered from that frontend while its store cannot be read.
 
 ## Own-node calls of a host's updater
 
