@@ -1753,6 +1753,8 @@ mod named_tests;
 #[cfg(test)]
 mod owner_tests;
 #[cfg(test)]
+mod reads_tests;
+#[cfg(test)]
 mod results_tests;
 #[cfg(test)]
 mod submit_tests;
