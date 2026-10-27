@@ -191,6 +191,16 @@ pub enum ImageCmd {
         /// by the same rules as --xcode. The directory then holds exactly this app.
         #[arg(long)]
         sim_app: Option<PathBuf>,
+        /// The UI tests to stage under /private/var/kbf-sim/tests: the `Build/Products`
+        /// directory of `xcodebuild build-for-testing -project <p> -scheme <s> -sdk
+        /// iphonesimulator -destination 'generic/platform=iOS Simulator' -derivedDataPath
+        /// <dd> CODE_SIGNING_ALLOWED=NO` (`<dd>/Build/Products`), which holds exactly one
+        /// `*.xctestrun` and the built apps. Copied by the same rules as --sim-app (links
+        /// that leave the tree as for --allow-external-links), each file hashed in the report.
+        /// `probe e3` then runs the tests after launching the app. The directory then holds
+        /// exactly these tests (a setup that names none removes the earlier ones).
+        #[arg(long, value_name = "PRODUCTS_DIR")]
+        sim_tests: Option<PathBuf>,
         /// Copy symbolic links inside Xcode.app (or the app) whose target leaves the app (an absolute
         /// path elsewhere, or more `..` than the link is deep) as links, and list them in
         /// the report. Without this flag such a link is refused.

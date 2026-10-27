@@ -19,6 +19,9 @@ mod bundle;
 #[path = "stage_tamper_tests.rs"]
 mod tamper;
 
+#[path = "stage_xctest_tests.rs"]
+mod xctest;
+
 #[cfg(target_os = "macos")]
 #[path = "stage_xattr_tests.rs"]
 mod xattr;

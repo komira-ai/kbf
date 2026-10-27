@@ -5,6 +5,8 @@
 
 use serde_json::Value;
 
+use crate::sim::State;
+
 const RUNTIME_ID_PREFIX: &str = "com.apple.CoreSimulator.SimRuntime.iOS-";
 
 /// The version of a runtime as a comparable list of numbers (`"27.0"` -> `[27, 0]`).
@@ -107,4 +109,37 @@ pub fn choose_device_type_for_runtime(
                 supported.len()
             )
         })
+}
+
+/// Takes the runtime and, from its `supportedDeviceTypes`, the device type. A runtime that
+/// lists none leaves the device type to the `list-devicetypes` step.
+pub(crate) fn take_runtime(text: &str, state: &mut State) -> Result<String, String> {
+    let runtime = choose_runtime(text)?;
+    state.runtime = Some(runtime.clone());
+    match choose_device_type_for_runtime(text, &runtime)? {
+        RuntimeDeviceType::Chosen(device) => {
+            state.device_type = Some(device.clone());
+            Ok(format!(
+                "{runtime} (the newest available iOS runtime) and device type {device} (the last iPhone in its supportedDeviceTypes)"
+            ))
+        }
+        RuntimeDeviceType::NotListed => Ok(format!(
+            "{runtime} (the newest available iOS runtime); it lists no supportedDeviceTypes, so the device type comes from list-devicetypes"
+        )),
+    }
+}
+
+/// Takes the device type from `list devicetypes` unless the runtime's own list already gave
+/// one, which is the only list that knows what the runtime can create.
+pub(crate) fn take_fallback_device_type(text: &str, state: &mut State) -> Result<String, String> {
+    if let Some(chosen) = &state.device_type {
+        return Ok(format!(
+            "the device type {chosen} from the runtime's supportedDeviceTypes (the devicetypes listing was not used)"
+        ));
+    }
+    let device = choose_device_type(text)?;
+    state.device_type = Some(device.clone());
+    Ok(format!(
+        "{device} (the last iPhone listed; the runtime gave no supportedDeviceTypes, so this may not be one it supports)"
+    ))
 }

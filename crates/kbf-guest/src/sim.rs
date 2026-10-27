@@ -12,7 +12,9 @@
 //!    `simctl list runtimes -j` and `list devicetypes -j` (the runtimes output picks the
 //!    runtime and, from that runtime's `supportedDeviceTypes`, the device type; the
 //!    devicetypes output is the fallback when the runtime lists none), `simctl create`, `boot`, `bootstatus -b`, an optional app
-//!    (`install`, `launch`), `simctl io screenshot`, and `simctl shutdown`.
+//!    (`install`, `launch`), `simctl io screenshot`, optionally the UI tests staged by
+//!    `image setup --sim-tests` (`xctest`, `xctest-summary`: [`crate::sim_xctest`]), and
+//!    `simctl shutdown`.
 //!
 //! # Whose session
 //! See [`sim_user`](crate::sim_user): the recorded user, or the console owner.
@@ -49,8 +51,13 @@ use crate::probe::send_with_retries;
 pub use crate::sim_choose::{
     RuntimeDeviceType, choose_device_type, choose_device_type_for_runtime, choose_runtime,
 };
+use crate::sim_choose::{take_fallback_device_type, take_runtime};
+pub use crate::sim_parse::{
+    CUT_MARK, MAX_BUNDLE_ID_BYTES, MAX_ECHO_BYTES, parse_bundle_id, parse_udid,
+};
 pub use crate::sim_user::Wanted;
 use crate::sim_user::{unmet_wish, wait_console_user};
+use crate::sim_xctest;
 use crate::simpaths;
 
 /// The prefix of a step frame's name; the host collects the frames by it.
@@ -100,6 +107,8 @@ pub enum Class {
     FirstLaunch,
     RuntimeAdd,
     Boot,
+    /// The UI tests.
+    XcTest,
 }
 
 /// A step's argument list, some of which only earlier output can give.
@@ -119,6 +128,8 @@ pub enum Late {
     Launch,
     Screenshot,
     Shutdown,
+    /// `xcodebuild test-without-building` of the staged `.xctestrun`.
+    XcTest,
 }
 
 /// One command of the run.
@@ -129,6 +140,9 @@ pub struct Step {
     pub class: Class,
     /// The steps that must have succeeded.
     pub needs: Vec<String>,
+    /// The steps that must have run to an end (succeeded or failed; not skipped, timed out
+    /// or unbuildable): a step that reads what a failing step leaves.
+    pub ran: Vec<String>,
     pub argv: Argv,
 }
 
@@ -140,6 +154,8 @@ pub struct Inputs {
     pub runtimes: Vec<String>,
     /// The `.app` directory name staged in [`simpaths::APP_DIR`], if any.
     pub app: Option<String>,
+    /// The `.xctestrun` file name staged in [`simpaths::TESTS_DIR`], if any.
+    pub tests: Option<String>,
 }
 
 fn fixed(who: Who, class: Class, id: &str, needs: &[&str], argv: &[&str]) -> Step {
@@ -148,6 +164,7 @@ fn fixed(who: Who, class: Class, id: &str, needs: &[&str], argv: &[&str]) -> Ste
         who,
         class,
         needs: needs.iter().map(|s| (*s).to_owned()).collect(),
+        ran: Vec::new(),
         argv: Argv::Fixed(argv.iter().map(|s| (*s).to_owned()).collect()),
     }
 }
@@ -158,6 +175,7 @@ fn late(class: Class, id: &str, needs: &[&str], which: Late) -> Step {
         who: Who::User,
         class,
         needs: needs.iter().map(|s| (*s).to_owned()).collect(),
+        ran: Vec::new(),
         argv: Argv::Late(which),
     }
 }
@@ -274,6 +292,14 @@ pub fn plan(inputs: &Inputs) -> Vec<Step> {
     }
     // A failed install or launch still leaves a booted device worth a picture.
     steps.push(late(Quick, "screenshot", &["bootstatus"], Late::Screenshot));
+    if inputs.tests.is_some() {
+        let after = if inputs.app.is_some() {
+            "launch"
+        } else {
+            "bootstatus"
+        };
+        steps.extend(sim_xctest::steps(after));
+    }
     steps.push(late(Quick, "shutdown", &["boot"], Late::Shutdown));
     steps
 }
@@ -286,6 +312,8 @@ pub struct State {
     pub udid: Option<String>,
     pub bundle_id: Option<String>,
     pub app: Option<String>,
+    /// The `.xctestrun` to run.
+    pub xctestrun: Option<String>,
 }
 
 impl State {
@@ -335,73 +363,11 @@ impl State {
                 SCREENSHOT_PATH,
             ]),
             Late::Shutdown => io(&["shutdown", Self::need(&self.udid, "device id")?]),
+            Late::XcTest => sim_xctest::test_argv(
+                Self::need(&self.xctestrun, "staged .xctestrun")?,
+                Self::need(&self.udid, "device id")?,
+            ),
         })
-    }
-}
-
-/// The most bytes of a command's output an error note repeats; the rest is cut and the note
-/// ends with [`CUT_MARK`]. A note rides in a step frame, which must stay under
-/// [`MAX_BODY_BYTES`] whatever the command printed.
-pub const MAX_ECHO_BYTES: usize = 512;
-/// The longest bundle identifier accepted, in bytes.
-pub const MAX_BUNDLE_ID_BYTES: usize = 255;
-/// What replaces the part of echoed output that was cut.
-pub const CUT_MARK: &str = "...[cut]";
-
-/// `text` cut to at most [`MAX_ECHO_BYTES`] bytes (at a character boundary), with
-/// [`CUT_MARK`] after what is kept when something was cut.
-fn echo(text: &str) -> String {
-    if text.len() <= MAX_ECHO_BYTES {
-        return text.to_owned();
-    }
-    let mut end = MAX_ECHO_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{CUT_MARK}", &text[..end])
-}
-
-/// The UDID `simctl create` printed: its last non-empty line, as 8-4-4-4-12 hex digits.
-///
-/// # Errors
-/// There is no such line. The error repeats at most [`MAX_ECHO_BYTES`] bytes of it.
-pub fn parse_udid(stdout: &str) -> Result<String, String> {
-    let line = stdout
-        .lines()
-        .map(str::trim)
-        .rfind(|l| !l.is_empty())
-        .ok_or("simctl create printed nothing")?;
-    let groups: Vec<&str> = line.split('-').collect();
-    let shape = [8usize, 4, 4, 4, 12];
-    let ok = groups.len() == shape.len()
-        && groups
-            .iter()
-            .zip(shape)
-            .all(|(g, n)| g.len() == n && g.bytes().all(|b| b.is_ascii_hexdigit()));
-    if ok {
-        Ok(line.to_owned())
-    } else {
-        Err(format!("not a device id: {:?}", echo(line)))
-    }
-}
-
-/// The bundle identifier `plutil -extract ... raw` printed.
-///
-/// # Errors
-/// It is empty, longer than [`MAX_BUNDLE_ID_BYTES`], or holds anything but letters, digits,
-/// `.`, `-` and `_` (the id is put in the commands that install and launch the app, and in
-/// a frame's note). The error repeats at most [`MAX_ECHO_BYTES`] bytes of it.
-pub fn parse_bundle_id(stdout: &str) -> Result<String, String> {
-    let id = stdout.trim();
-    let ok = !id.is_empty()
-        && id.len() <= MAX_BUNDLE_ID_BYTES
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
-    if !ok {
-        Err(format!("not a bundle identifier: {:?}", echo(id)))
-    } else {
-        Ok(id.to_owned())
     }
 }
 
@@ -412,6 +378,7 @@ pub struct Config {
     pub first_launch: Duration,
     pub runtime_add: Duration,
     pub boot: Duration,
+    pub xctest: Duration,
     /// How long the run waits for the auto-login user, counted in [`CONSOLE_POLL`] pauses.
     pub console_wait: Duration,
     /// How much of a command's stdout and stderr each a step frame keeps.
@@ -431,6 +398,7 @@ impl Config {
             Class::FirstLaunch => self.first_launch,
             Class::RuntimeAdd => self.runtime_add,
             Class::Boot => self.boot,
+            Class::XcTest => self.xctest,
         }
     }
 }
@@ -453,6 +421,9 @@ pub struct SimArgs {
     /// The deadline of boot, bootstatus, install and launch.
     #[arg(long, default_value_t = 600)]
     pub boot_secs: u64,
+    /// The deadline of the UI tests (`xcodebuild test-without-building`).
+    #[arg(long, default_value_t = 1800)]
+    pub xctest_secs: u64,
     /// How long to wait for the auto-login user's session.
     #[arg(long, default_value_t = 300)]
     pub console_wait_secs: u64,
@@ -468,6 +439,7 @@ impl From<&SimArgs> for Config {
             first_launch: Duration::from_secs(a.first_launch_secs),
             runtime_add: Duration::from_secs(a.runtime_add_secs),
             boot: Duration::from_secs(a.boot_secs),
+            xctest: Duration::from_secs(a.xctest_secs),
             console_wait: Duration::from_secs(a.console_wait_secs),
             tail_bytes: a.tail_bytes,
             port: a.vsock_port,
@@ -517,6 +489,8 @@ pub trait SimHost {
     fn runtime_images(&self) -> Vec<String>;
     /// The names of the entries in [`simpaths::APP_DIR`].
     fn app_bundles(&self) -> Vec<String>;
+    /// The names of the entries in [`simpaths::TESTS_DIR`].
+    fn xctest_entries(&self) -> Vec<String>;
     /// The user logged in at the console, if there is one.
     fn console_user(&self) -> Option<ConsoleUser>;
     /// The user `kbf-guest mkuser` recorded as ready ([`simpaths::USER_READY`]), if any.
@@ -626,8 +600,10 @@ pub fn max_frames(n_runtimes: usize) -> usize {
     let inputs = Inputs {
         runtimes: (0..n_runtimes).map(|i| format!("r{i}.dmg")).collect(),
         app: Some("a.app".to_owned()),
+        tests: Some("t.xctestrun".to_owned()),
     };
-    plan(&inputs).len() + 2
+    // The screenshot, the UI tests' counts and the summary have frames of their own.
+    plan(&inputs).len() + 3
 }
 
 struct Run<'a> {
@@ -724,9 +700,15 @@ pub fn run(host: &dyn SimHost, cfg: &Config, log: &mut dyn Write) -> SummaryFram
             .into_iter()
             .filter(|n| name_ok(n, ".app"))
             .min(),
+        tests: host
+            .xctest_entries()
+            .into_iter()
+            .filter(|n| name_ok(n, sim_xctest::XCTESTRUN_SUFFIX))
+            .min(),
     };
     let state = State {
         app: inputs.app.clone(),
+        xctestrun: inputs.tests.clone(),
         ..State::default()
     };
     run_steps(&mut r, &plan(&inputs), state)
@@ -758,7 +740,12 @@ fn run_steps(r: &mut Run<'_>, steps: &[Step], mut state: State) -> SummaryFrame 
         let blame = step
             .needs
             .iter()
-            .find(|n| status.get(*n) != Some(&Status::Ok));
+            .find(|n| status.get(*n) != Some(&Status::Ok))
+            .or_else(|| {
+                step.ran
+                    .iter()
+                    .find(|n| !matches!(status.get(*n), Some(Status::Ok | Status::Failed)))
+            });
         let mut f = StepFrame {
             step: step.id.clone(),
             index: index + 1,
@@ -863,7 +850,13 @@ fn execute(
     f.ms = out.ms;
     let (stdout, cut_out) = tail_text(&out.stdout, cfg.tail_bytes);
     let (stderr, cut_err) = tail_text(&out.stderr, cfg.tail_bytes);
-    f.stdout = stdout;
+    // The summary of the UI tests goes in a frame of its own, in few fields; the step frame
+    // does not repeat what the result bundle printed.
+    f.stdout = if step.id == sim_xctest::SUMMARY_STEP {
+        String::new()
+    } else {
+        stdout
+    };
     f.stderr = stderr;
     f.stdout_truncated = cut_out || out.cut;
     f.stderr_truncated = cut_err || out.cut;
@@ -906,6 +899,7 @@ fn absorb(
         "list-devicetypes" => Some(take_fallback_device_type(&text, state)),
         "create" => Some(parse_udid(&text).inspect(|v| state.udid = Some(v.clone()))),
         "app-id" => Some(parse_bundle_id(&text).inspect(|v| state.bundle_id = Some(v.clone()))),
+        sim_xctest::SUMMARY_STEP => Some(send_xctest(out, r)),
         "screenshot" => Some(
             send_screenshot(host, r)
                 .inspect(|n| *screenshot_bytes = Some(*n))
@@ -923,37 +917,21 @@ fn absorb(
     }
 }
 
-/// Takes the runtime and, from its `supportedDeviceTypes`, the device type. A runtime that
-/// lists none leaves the device type to the `list-devicetypes` step.
-fn take_runtime(text: &str, state: &mut State) -> Result<String, String> {
-    let runtime = choose_runtime(text)?;
-    state.runtime = Some(runtime.clone());
-    match choose_device_type_for_runtime(text, &runtime)? {
-        RuntimeDeviceType::Chosen(device) => {
-            state.device_type = Some(device.clone());
-            Ok(format!(
-                "{runtime} (the newest available iOS runtime) and device type {device} (the last iPhone in its supportedDeviceTypes)"
-            ))
-        }
-        RuntimeDeviceType::NotListed => Ok(format!(
-            "{runtime} (the newest available iOS runtime); it lists no supportedDeviceTypes, so the device type comes from list-devicetypes"
-        )),
+/// Reads the summary the step printed and sends the counts as a frame of their own.
+fn send_xctest(out: &Outcome, r: &mut Run<'_>) -> Result<String, String> {
+    let frame = sim_xctest::parse_summary(&String::from_utf8_lossy(&out.stdout), out.cut)?;
+    let note = format!(
+        "{} passed, {} failed, {} skipped, sent as {}",
+        frame.passed,
+        frame.failed,
+        frame.skipped,
+        sim_xctest::XCTEST_NAME
+    );
+    if r.deliver_json(sim_xctest::XCTEST_NAME, &frame) {
+        Ok(note)
+    } else {
+        Err("the UI tests' frame never reached the host".to_owned())
     }
-}
-
-/// Takes the device type from `list devicetypes` unless the runtime's own list already gave
-/// one, which is the only list that knows what the runtime can create.
-fn take_fallback_device_type(text: &str, state: &mut State) -> Result<String, String> {
-    if let Some(chosen) = &state.device_type {
-        return Ok(format!(
-            "the device type {chosen} from the runtime's supportedDeviceTypes (the devicetypes listing was not used)"
-        ));
-    }
-    let device = choose_device_type(text)?;
-    state.device_type = Some(device.clone());
-    Ok(format!(
-        "{device} (the last iPhone listed; the runtime gave no supportedDeviceTypes, so this may not be one it supports)"
-    ))
 }
 
 /// Reads the screenshot and sends it as a frame of its own.

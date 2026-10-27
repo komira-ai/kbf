@@ -48,6 +48,8 @@
 //!   attributes are out of scope.
 //! - An app bundle (`--sim-app`) is copied by the same rules as Xcode.app into
 //!   `/private/var/kbf-sim/apps/<name>.app`, which then holds exactly that app.
+//! - The UI tests (`--sim-tests`, see `stage_xctest`) are a products directory copied file by
+//!   file, with each file hashed, into `/private/var/kbf-sim/tests`.
 //! - A runtime is either one regular file named `<name>.dmg`, copied byte for byte while its
 //!   SHA-256 is computed, or a directory named `<name>.exportedBundle` (what
 //!   `xcodebuild -downloadPlatform -exportPath` writes). A bundle is planned with the same
@@ -131,6 +133,8 @@ pub enum StageError {
     DuplicateRuntime(String),
     #[error("more than {MAX_RUNTIMES} --sim-runtime")]
     TooManyRuntimes,
+    #[error(transparent)]
+    Tests(crate::stage_xctest::TestsError),
     #[error("{0}")]
     Io(String),
 }
@@ -156,7 +160,7 @@ pub enum Node {
 }
 
 impl Node {
-    fn rel(&self) -> &Path {
+    pub(crate) fn rel(&self) -> &Path {
         match self {
             Self::Dir { rel, .. } | Self::File { rel, .. } | Self::Link { rel, .. } => rel,
         }
@@ -221,12 +225,17 @@ pub struct Plan {
     pub xcode: Option<TreePlan>,
     pub runtimes: Vec<RuntimePlan>,
     pub app: Option<AppPlan>,
+    /// The UI tests (`--sim-tests`).
+    pub tests: Option<crate::stage_xctest::TestsPlan>,
 }
 
 impl Plan {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.xcode.is_none() && self.runtimes.is_empty() && self.app.is_none()
+        self.xcode.is_none()
+            && self.runtimes.is_empty()
+            && self.app.is_none()
+            && self.tests.is_none()
     }
 
     /// The bytes the copy writes.
@@ -234,11 +243,12 @@ impl Plan {
     pub fn bytes(&self) -> u64 {
         self.xcode.as_ref().map_or(0, |x| x.bytes)
             + self.app.as_ref().map_or(0, |a| a.tree.bytes)
+            + self.tests.as_ref().map_or(0, |t| t.tree.bytes)
             + self.runtimes.iter().map(|r| r.bytes).sum::<u64>()
     }
 }
 
-fn io_err(what: &str, path: &Path, e: &io::Error) -> StageError {
+pub(crate) fn io_err(what: &str, path: &Path, e: &io::Error) -> StageError {
     StageError::Io(format!("{what} {}: {e}", path.display()))
 }
 
@@ -410,7 +420,7 @@ pub fn plan_xcode_within(
 
 /// Walks the tree at `app` (a real directory) into a plan; its path in the guest is
 /// `guest_root`.
-fn plan_tree(
+pub(crate) fn plan_tree(
     app: &Path,
     guest_root: &str,
     allow_external_links: bool,
@@ -554,12 +564,29 @@ pub fn plan_with_app(
     app: Option<&Path>,
     allow_external_links: bool,
 ) -> Result<Plan, StageError> {
+    plan_all(xcode, runtimes, app, None, allow_external_links)
+}
+
+/// [`plan_with_app`] with the products directory of the UI tests.
+///
+/// # Errors
+/// As [`plan_with_app`] and [`crate::stage_xctest::plan_tests`].
+pub fn plan_all(
+    xcode: Option<&Path>,
+    runtimes: &[PathBuf],
+    app: Option<&Path>,
+    tests: Option<&Path>,
+    allow_external_links: bool,
+) -> Result<Plan, StageError> {
     Ok(Plan {
         xcode: xcode
             .map(|a| plan_xcode(a, allow_external_links))
             .transpose()?,
         runtimes: plan_runtimes(runtimes)?,
         app: app.map(|a| plan_app(a, allow_external_links)).transpose()?,
+        tests: tests
+            .map(|t| crate::stage_xctest::plan_tests(t, allow_external_links))
+            .transpose()?,
     })
 }
 
@@ -599,7 +626,7 @@ pub(crate) fn remove_existing(env: &Env<'_>, path: &Path) -> Result<(), String> 
 
 /// `err` (why a build failed), plus what it cost to remove the partial copy at `path`: the
 /// guest must never find a partial tree.
-fn discard(env: &Env<'_>, path: &Path, err: String) -> String {
+pub(crate) fn discard(env: &Env<'_>, path: &Path, err: String) -> String {
     match remove_existing(env, path) {
         Ok(()) => err,
         Err(e) => format!("{err}; and the partial copy could not be removed: {e}"),
@@ -607,7 +634,7 @@ fn discard(env: &Env<'_>, path: &Path, err: String) -> String {
 }
 
 /// The guest-absolute path `abs` as a path under the volume root.
-fn on_volume(volume: &Path, abs: &str) -> PathBuf {
+pub(crate) fn on_volume(volume: &Path, abs: &str) -> PathBuf {
     volume.join(abs.trim_start_matches('/'))
 }
 
@@ -693,10 +720,11 @@ fn check_space(volume: &Path, plan: &Plan, env: &Env<'_>) -> Result<(u64, u64), 
     let need = plan.bytes();
     if free < need.saturating_add(HEADROOM_BYTES) {
         return Err(format!(
-            "not enough room on the guest's Data volume: staging needs {} (Xcode and app {}, runtimes {}) plus {} headroom, and {} is free; rebuild the base with a larger --disk-gib",
+            "not enough room on the guest's Data volume: staging needs {} (Xcode, app and tests {}, runtimes {}) plus {} headroom, and {} is free; rebuild the base with a larger --disk-gib",
             gib(need),
             gib(plan.xcode.as_ref().map_or(0, |x| x.bytes)
-                + plan.app.as_ref().map_or(0, |a| a.tree.bytes)),
+                + plan.app.as_ref().map_or(0, |a| a.tree.bytes)
+                + plan.tests.as_ref().map_or(0, |t| t.tree.bytes)),
             gib(plan.runtimes.iter().map(|r| r.bytes).sum()),
             gib(HEADROOM_BYTES),
             gib(free)
@@ -1123,7 +1151,9 @@ pub fn execute(volume: &Path, plan: &Plan, env: &Env<'_>) -> Result<Value, Strin
         .transpose()?;
     // Always: a setup that names no runtime clears the earlier ones.
     let runtimes = stage_runtimes(volume, &plan.runtimes, env)?;
-    let manifest = json!({"xcode": xcode, "app": app, "runtimes": runtimes});
+    // Always, like the runtimes: a setup that names no tests removes the earlier ones.
+    let tests = crate::stage_xctest::stage_tests(volume, plan.tests.as_ref(), env)?;
+    let manifest = json!({"xcode": xcode, "app": app, "tests": tests, "runtimes": runtimes});
     let rel = Path::new(simpaths::MANIFEST.trim_start_matches('/'));
     ensure_dir(volume, rel.parent().unwrap_or(Path::new("")), env)?;
     let path = volume.join(rel);
@@ -1134,6 +1164,7 @@ pub fn execute(volume: &Path, plan: &Plan, env: &Env<'_>) -> Result<Value, Strin
         "needed_bytes": need,
         "xcode": xcode,
         "app": app,
+        "tests": tests,
         "runtimes": runtimes,
         "manifest": simpaths::MANIFEST,
     }))

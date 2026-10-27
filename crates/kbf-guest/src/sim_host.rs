@@ -88,6 +88,10 @@ impl SimHost for RealSimHost {
         names_in(simpaths::APP_DIR)
     }
 
+    fn xctest_entries(&self) -> Vec<String> {
+        names_in(simpaths::TESTS_DIR)
+    }
+
     fn console_user(&self) -> Option<ConsoleUser> {
         // The owner of /dev/console is the user logged in at the console; root when nobody is.
         let uid = std::fs::metadata("/dev/console").ok()?.uid();

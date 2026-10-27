@@ -14,6 +14,9 @@ use crate::frame::{Frame, Kind, MAX_BODY_BYTES, MAX_FRAME_BYTES, SendError, enco
 use crate::sim::*;
 use crate::sim_run::{Clock, ProcessRunner, read_regular, read_wanted};
 
+#[path = "sim_xctest_tests.rs"]
+mod xctest;
+
 const UDID: &str = "6F3A1B2C-0D4E-4F5A-8B6C-7D8E9F0A1B2C";
 
 const RUNTIMES: &str = r#"{"runtimes":[
@@ -78,6 +81,8 @@ struct Fake {
     root: bool,
     runtimes: Vec<String>,
     apps: Vec<String>,
+    /// The entries of the staged tests directory.
+    tests: Vec<String>,
     /// The user `mkuser` recorded as ready, and the one `image setup --guest-user` asked for.
     ready: Option<String>,
     wanted: Option<String>,
@@ -114,6 +119,7 @@ impl Fake {
             root: true,
             runtimes: vec!["iOS_27.dmg".to_owned()],
             apps: Vec::new(),
+            tests: Vec::new(),
             ready: None,
             wanted: None,
             wanted_unreadable: None,
@@ -163,6 +169,9 @@ impl SimHost for Fake {
     }
     fn app_bundles(&self) -> Vec<String> {
         self.apps.clone()
+    }
+    fn xctest_entries(&self) -> Vec<String> {
+        self.tests.clone()
     }
     fn console_user(&self) -> Option<ConsoleUser> {
         self.user_after_pauses
@@ -255,6 +264,7 @@ fn the_plan_runs_the_root_steps_then_the_user_steps_in_order() {
     let steps = plan(&Inputs {
         runtimes: vec!["a.dmg".into(), "b.dmg".into()],
         app: None,
+        ..Inputs::default()
     });
     assert_eq!(
         ids(&steps),
@@ -328,6 +338,7 @@ fn an_app_adds_its_identifier_install_and_launch_before_the_screenshot() {
     let steps = plan(&Inputs {
         runtimes: Vec::new(),
         app: Some("Demo.app".into()),
+        ..Inputs::default()
     });
     assert_eq!(
         ids(&steps),
@@ -373,6 +384,7 @@ fn late_arguments_come_from_what_earlier_steps_found() {
         Late::Launch,
         Late::Screenshot,
         Late::Shutdown,
+        Late::XcTest,
     ] {
         assert!(empty.resolve(which).is_err(), "{which:?}");
     }
@@ -382,6 +394,7 @@ fn late_arguments_come_from_what_earlier_steps_found() {
         udid: Some(UDID.into()),
         bundle_id: Some("com.example.App".into()),
         app: Some("Demo.app".into()),
+        xctestrun: None,
     };
     let line = |w| state.resolve(w).expect("resolve").join(" ");
     assert_eq!(
@@ -927,6 +940,7 @@ fn the_largest_step_frame_and_every_frame_name_fit_the_limits() {
     let steps = plan(&Inputs {
         runtimes: vec![longest.clone()],
         app: Some("A.app".into()),
+        ..Inputs::default()
     });
     for (i, s) in steps.iter().enumerate() {
         let name = step_frame_name(i, &s.id);
@@ -944,10 +958,11 @@ fn the_largest_step_frame_and_every_frame_name_fit_the_limits() {
         max_frames(0),
         plan(&Inputs {
             runtimes: vec![],
-            app: Some("a.app".into())
+            app: Some("a.app".into()),
+            tests: Some("a.xctestrun".into()),
         })
         .len()
-            + 2
+            + 3
     );
 }
 
@@ -1463,6 +1478,7 @@ fn a_late_step_with_nothing_to_build_from_is_an_error_and_runs_no_command() {
         who: Who::User,
         class: Class::Boot,
         needs: Vec::new(),
+        ran: Vec::new(),
         argv: Argv::Late(Late::Boot),
     }];
     let summary = run_plan(&host, &cfg(), &steps, &mut Vec::new());
@@ -1531,6 +1547,7 @@ fn a_bundle_runtime_is_imported_and_an_image_is_added() {
     let steps = plan(&Inputs {
         runtimes: vec!["a.dmg".into(), "b_27.exportedBundle".into()],
         app: None,
+        ..Inputs::default()
     });
     assert_eq!(
         ids(&steps)[3..6],
@@ -1575,6 +1592,7 @@ fn a_bundle_runtime_is_imported_and_an_image_is_added() {
     let steps = plan(&Inputs {
         runtimes: vec![longest],
         app: Some("A.app".into()),
+        ..Inputs::default()
     });
     for (i, st) in steps.iter().enumerate() {
         assert!(step_frame_name(i, &st.id).len() <= 100, "{}", st.id);

@@ -352,6 +352,9 @@ pub struct SetupArgs {
     /// An app bundle (`<name>.app`, built for the simulator) to stage for the simulator
     /// probe to install and launch.
     pub sim_app: Option<PathBuf>,
+    /// The `Build/Products` directory of a `build-for-testing` (UI tests) to stage for the
+    /// simulator probe to run.
+    pub sim_tests: Option<PathBuf>,
     /// Copy Xcode symbolic links that leave the app, as links.
     pub allow_external_links: bool,
     /// The user the guest is to have (`kbf-guest mkuser` creates it in the boot `image prime`
@@ -375,10 +378,11 @@ pub fn setup(sys: &dyn System, base: &Path, args: &SetupArgs) -> Report {
     if let Err(e) = crate::bundle::check(base) {
         return Report::error(probe, e.to_string());
     }
-    let staging = match crate::stage::plan_with_app(
+    let staging = match crate::stage::plan_all(
         args.xcode.as_deref(),
         &args.sim_runtimes,
         args.sim_app.as_deref(),
+        args.sim_tests.as_deref(),
         args.allow_external_links,
     ) {
         Ok(p) => p,
