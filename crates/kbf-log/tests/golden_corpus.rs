@@ -68,7 +68,8 @@ fn request<const N: usize>(qos: Qos, kind: LeaseKind, needs: [(&str, &str); N]) 
         key: ActionKey {
             instance: "i".to_owned(),
             action: d(3),
-        },
+        }
+        .into(),
         qos,
         kind,
         resources: Resources::new(1, 2),

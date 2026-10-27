@@ -37,7 +37,7 @@ use kbf_caps::NodeCaps;
 use kbf_sched::fence::{LEASE_GRACE, START_GRACE};
 use kbf_sched::{Event, Input, OpState, Request, Scheduler};
 use kbf_types::{
-    ActionKey, ControlRecord, Effect, LeaseId, OperationId, Outcome, Qos, Resources, WaiterId,
+    ControlRecord, Effect, LeaseId, OperationId, Outcome, Qos, Resources, WaiterId, WorkKey,
     WorkerId,
 };
 
@@ -209,7 +209,7 @@ impl State {
 
 #[derive(Clone, Debug)]
 struct ShadowOp {
-    key: ActionKey,
+    key: WorkKey,
     qos: Qos,
     resources: Axes,
     need: usize,
@@ -283,8 +283,8 @@ pub struct Checker {
     ops: BTreeMap<OperationId, ShadowOp>,
     next_op: u64,
     queue: BTreeSet<QueueKey>,
-    in_flight: BTreeMap<ActionKey, OperationId>,
-    finished_keys: BTreeSet<ActionKey>,
+    in_flight: BTreeMap<WorkKey, OperationId>,
+    finished_keys: BTreeSet<WorkKey>,
     held: BTreeMap<LeaseId, Held>,
     last_lease: Option<LeaseId>,
     reported: BTreeMap<LeaseId, Outcome>,

@@ -8,9 +8,11 @@
 //! operator APIs) stay in the crate root. Every item is also re-exported at the crate
 //! root, so `kbf_types::LeaseId` and `kbf_types::sched::LeaseId` are the same type.
 //!
-//! One item still names a build type: `work` carries `ActionKey` (and with it a
-//! `Digest`) in `StartLease` and `Outcome`. The test at the foot of this file lists
-//! those lines and refuses any other.
+//! One item still names a build type: `Outcome::Completed` carries the `Digest` of the
+//! stored result, which the scheduler passes on and never reads. The work itself is named
+//! by a [`WorkKey`], a class and a dedup text; the build's `ActionKey` converts to and
+//! from one at the edges. The test at the foot of this file lists the lines of `work`
+//! that name a build type and refuses any other.
 
 mod lease;
 mod phase;
@@ -27,9 +29,9 @@ pub use state::{Effect, StateMachine};
 pub use time::FarmTime;
 pub use version::{Supported, TooNew, VERSION_CAP, Version, VersionFault, understood};
 pub use work::{
-    ActionKey, Answer, ControlRecord, Failure, FarmFault, FarmRun, FencePolicy, LeaseGrant,
-    LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Refusal, RefusalRecord, Resources,
-    ResultRecord, StartLease, WaiterId, Waiting, WorkerId,
+    Answer, ControlRecord, Failure, FarmFault, FarmRun, FencePolicy, LeaseGrant, LostWhy,
+    MemoryKill, MemoryRun, OperationId, Outcome, Refusal, RefusalRecord, Resources, ResultRecord,
+    StartLease, WaiterId, Waiting, WorkKey, WorkerId,
 };
 
 #[cfg(test)]
@@ -37,14 +39,11 @@ mod tests {
     /// The names this module must not use.
     const BUILD_NAMES: [&str; 3] = ["Digest", "ActionKey", "REAPI"];
 
-    /// Code lines of `work.rs` that still name a build type. A later change removes
-    /// `ActionKey` from the scheduling types and empties this list.
-    const ALLOWED: [&str; 5] = [
+    /// Code lines of `work.rs` that still name a build type: the digest of a completed
+    /// attempt's stored result.
+    const ALLOWED: [&str; 2] = [
         "use crate::{Digest, LeaseId, LeaseKind};",
-        "pub struct ActionKey {",
-        "pub action: Digest,",
         "action_result: Digest,",
-        "pub key: ActionKey,",
     ];
 
     /// The non-comment lines before the unit tests of one source file.

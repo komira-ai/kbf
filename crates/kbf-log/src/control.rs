@@ -17,7 +17,7 @@ use kbf_proto::kbf::log::v1 as proto;
 use kbf_sched::{DaemonInstance, Request};
 use kbf_types::{
     ActionKey, ControlRecord, Digest, Failure, FarmTime, LeaseGrant, LeaseId, LeaseKind, LostWhy,
-    OperationId, Outcome, Qos, RefusalRecord, Resources, ResultRecord, WorkerId,
+    OperationId, Outcome, Qos, RefusalRecord, Resources, ResultRecord, WorkKey, WorkerId,
 };
 use proto::farm_input::Input as P;
 
@@ -346,10 +346,11 @@ fn node_caps(caps: &NodeCaps) -> proto::NodeCaps {
 }
 
 fn request(r: &Request) -> Result<proto::Request, EncodeError> {
+    let key = ActionKey::try_from(&r.key).map_err(|_| EncodeError::WorkKey)?;
     Ok(proto::Request {
         key: Some(proto::ActionKey {
-            instance: r.key.instance.clone(),
-            action: Some(digest(&r.key.action)?),
+            instance: key.instance,
+            action: Some(digest(&key.action)?),
         }),
         qos: Some(qos(&r.qos)),
         kind: lease_kind(r.kind).into(),
@@ -611,10 +612,10 @@ fn from_request(r: proto::Request) -> Result<Request, DecodeError> {
     };
     let needs = kbf_caps::Request::parse(r.needs.iter().map(|p| (&*p.key, &*p.value)))?;
     Ok(Request {
-        key: ActionKey {
+        key: WorkKey::from(ActionKey {
             instance: key.instance,
             action: required_digest(key.action, "ActionKey.action")?,
-        },
+        }),
         qos: from_qos(r.qos.ok_or(DecodeError::Missing("Request.qos"))?)?,
         kind,
         resources: from_resources(r.resources, "Request.resources")?,

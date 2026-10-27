@@ -159,7 +159,7 @@ impl State {
         let Some(basis) = basis_of_os(platform.os_family) else {
             return;
         };
-        if let Ok(key) = key_of(&op.request.key.instance, &platform, basis, subject) {
+        if let Ok(key) = key_of(&op.action.instance, &platform, basis, subject) {
             self.learned.register(&key, size_key);
         }
     }

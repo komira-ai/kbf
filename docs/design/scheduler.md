@@ -71,8 +71,9 @@ operations and those finished within the retention. Over a state store a name ou
 the scheduler's copy: any server answers it from the store's `done/` row, which is kept at
 least ten minutes ([Results across frontends](#results-across-frontends)).
 
-**In-flight dedup.** Operations are keyed by `ActionKey`: the REAPI instance name and
-the action digest. A new request whose key matches an unfinished operation joins it
+**In-flight dedup.** Operations are keyed by a `WorkKey`, a class and a dedup text the
+scheduler treats as opaque. For a build the class is the REAPI instance name and the
+dedup text the action digest (`ActionKey` converts to and from it). A new request whose key matches an unfinished operation joins it
 as another waiter instead of queueing a second run, if the request is *joinable*:
 hermetic and not `do_not_cache`. The same digest under another instance name is
 different work and never joins. A more urgent caller that joins raises the

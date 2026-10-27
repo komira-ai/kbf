@@ -2,9 +2,9 @@
 //! request for an action already queued attaches to that operation, whichever process
 //! queued it and whether or not this one saw the write land.
 //!
-//! The key is the request's dedup key ([`ActionKey`]), the instance name in hexadecimal
+//! The key is the request's dedup key ([`WorkKey`]), the instance name in hexadecimal
 //! (the name may hold any character, a `/` too), `/`, and the action's digest as
-//! `<hash>/<size>`; the value is the operation's id, 8 bytes big-endian. It is written
+//! `<hash>/<size>` (the key's dedup text); the value is the operation's id, 8 bytes big-endian. It is written
 //! in the transaction that queues the operation, put only if absent, and removed in the
 //! one that finishes it ([`Durable::unpin`]). A request that is not joinable
 //! ([`Request::joinable`]) has no row: its runs are not interchangeable.
@@ -13,7 +13,7 @@
 //! already; a caller's retry after a cut stream or a lost acknowledgement names the same
 //! action and so finds the same row, with no request id to carry through the front.
 
-use kbf_types::ActionKey;
+use kbf_types::WorkKey;
 
 use super::*;
 
@@ -31,13 +31,13 @@ pub(super) enum Submitted {
     Joined(Box<StoredOperation>),
 }
 
-fn inflight_key(key: &ActionKey) -> String {
+fn inflight_key(key: &WorkKey) -> String {
     let instance: String = key
-        .instance
+        .class
         .bytes()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    format!("{INFLIGHT}{instance}/{}", key.action)
+    format!("{INFLIGHT}{instance}/{}", key.dedup)
 }
 
 impl Durable {
@@ -126,6 +126,7 @@ impl Durable {
             return Ok(None);
         };
         let request = request_row(&key, &row)?;
+        let action = action_of_request(&key, &request)?;
         let lease = match known {
             Some(grant) => Some(grant),
             None => self.lease_of(operation)?,
@@ -156,6 +157,7 @@ impl Durable {
         Ok(Some(StoredOperation {
             operation,
             request,
+            action,
             lease,
             losses,
             fate,
