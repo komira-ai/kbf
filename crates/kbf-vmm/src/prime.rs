@@ -24,13 +24,13 @@
 //! base's disk, and so every clone's, is the same and the daemon runs in every boot, so the
 //! daemon asks the host over the results channel (vsock) whether this is the priming boot. The
 //! host's sink answers `yes` only while this run's results directory holds a marker that
-//! `prime` makes before the start and removes after the stop; any other host answers no. Run
+//! `prime` makes before the start and removes on every way out (a drop guard); any other host answers no. Run
 //! on a base whose user is ready already and whose root setup is done, the guest says so and
 //! stays up; the host then shuts it down at once. The host asked for the setup, so a summary
 //! that does not say `root_setup` was `done` or `not_needed` (the guest got no yes, or is too
 //! old to say) is an error, never a success, and `summary.signal` says what the question got.
 //! When the user is ready but the root setup is not (a base primed earlier, or restaged
-//! those steps alone and powers off. A clone's boot of such a base leaves them to `sim`.
+//! since), the guest runs those steps alone and powers off. A clone's boot of such a base leaves them to `sim`.
 //!
 //! The base is changed by this run (a user is added to its disk): it is the one verb of the
 //! probes that writes to the base. A run that did not end in a power-off may leave the
@@ -38,7 +38,7 @@
 //! daemon's steps again (it is idempotent).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use kbf_guest::mkuser::{FRAME_PREFIX, MkUserSummary, SHUTDOWN_NAME, SUMMARY_NAME};
@@ -173,14 +173,22 @@ fn remove_share(ctx: &Ctx<'_>) {
 
 /// Marks this run as the priming one in the results directory (which only the host can
 /// write): the sink answers the guest's question `yes` while the marker is there.
-fn request_prime(share: &Share) -> Result<(), String> {
+/// The mark is taken away when the returned guard is dropped: on every way out of `prime`
+/// (a start that fails, a panic included), not only after a run to its end.
+pub(crate) fn request_prime(share: &Share) -> Result<Mark, String> {
     let path = share.received.join(crate::sink::PRIME_MARKER);
-    std::fs::write(&path, b"").map_err(|e| format!("write {}: {e}", path.display()))
+    std::fs::write(&path, b"").map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(Mark(path))
 }
 
-/// Takes the mark away once the guest is stopped.
-fn withdraw_prime(share: &Share) {
-    let _ = std::fs::remove_file(share.received.join(crate::sink::PRIME_MARKER));
+/// The marker file of a priming run; removed on drop.
+#[derive(Debug)]
+pub(crate) struct Mark(PathBuf);
+
+impl Drop for Mark {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Starts the base itself with the share and the results channel.
@@ -302,8 +310,11 @@ pub fn prime(ctx: &Ctx<'_>, deadline: Duration) -> Report {
     // The base's disk is every clone's: the host's answer to the guest's question, which is
     // yes only while this marker is in the results directory, is what tells the guest that
     // this boot, and no other, is the priming one.
-    let share = match guest::prepare_share(ctx, "prime").and_then(|s| request_prime(&s).map(|()| s))
-    {
+    let mut mark = None;
+    let share = match guest::prepare_share(ctx, "prime").and_then(|s| {
+        mark = Some(request_prime(&s)?);
+        Ok(s)
+    }) {
         Ok(s) => s,
         Err(e) => return Report::error(PROBE, e),
     };
@@ -334,7 +345,8 @@ pub fn prime(ctx: &Ctx<'_>, deadline: Duration) -> Report {
     // Reap the helper in every case; a no-op when it has gone.
     vm.stop(&ctx.timing);
     remove_share(ctx);
-    withdraw_prime(&share);
+    // The mark goes before the report lists the results directory.
+    drop(mark);
     let stop = stop_json(how, &vm);
     let d = details(
         ctx,

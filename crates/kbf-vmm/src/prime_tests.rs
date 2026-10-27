@@ -474,6 +474,36 @@ fn a_helper_that_cannot_start_is_an_error_and_leaves_no_share() {
     assert!(r.reason.expect("reason").contains("no helper"));
     assert!(!work.join("base/prime-share").exists());
     assert!(!work.join("base/prime-tagged").exists());
+    // The priming mark is not left behind by a run that never started.
+    assert!(!results(&work).join(crate::sink::PRIME_MARKER).exists());
+}
+
+/// Catches the priming mark outliving its run on a way out the normal path does not take: the
+/// guard removes it when dropped, a panic's unwinding included, and a missing file is fine.
+#[test]
+fn the_priming_mark_is_removed_when_its_guard_is_dropped_even_by_a_panic() {
+    let dir = tmp("prime-mark");
+    let share = crate::guest::Share {
+        dir: dir.join("s"),
+        tagged: dir.join("t"),
+        received: dir.to_path_buf(),
+    };
+    let marker = dir.join(crate::sink::PRIME_MARKER);
+    let mark = crate::prime::request_prime(&share).expect("mark");
+    assert!(marker.exists());
+    drop(mark);
+    assert!(!marker.exists());
+    let r = std::panic::catch_unwind(|| {
+        let _mark = crate::prime::request_prime(&share).expect("mark");
+        assert!(dir.join(crate::sink::PRIME_MARKER).exists());
+        panic!("a bug between the mark and the end");
+    });
+    assert!(r.is_err());
+    assert!(!marker.exists());
+    // Dropped after the file is gone already: nothing to say.
+    let mark = crate::prime::request_prime(&share).expect("mark");
+    std::fs::remove_file(&marker).expect("rm");
+    drop(mark);
 }
 
 /// Catches the host trusting what the guest wrote: a frame that is not valid JSON must not
