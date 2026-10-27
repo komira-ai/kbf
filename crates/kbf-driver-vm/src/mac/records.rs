@@ -43,6 +43,8 @@ const MAX_BYTES: u64 = 256;
 pub struct Swept {
     /// The groups it had the helper end.
     pub reaped: Vec<Record>,
+    /// The groups the helper would not end, with why: their records stay for the next start.
+    pub failed: Vec<(Record, String)>,
     /// How many records it removed without ending anything.
     pub stale: usize,
 }
@@ -103,12 +105,13 @@ fn write_new(file: &Path, text: &str) -> io::Result<()> {
     file.sync_all()
 }
 
-/// The records of earlier daemons: ends the runs they name that are still the same
+/// The records of earlier daemons (the caller owns the directory, see
+/// [`crate::mac::owner`]): ends the runs they name that are still the same
 /// processes in this boot, and removes every record it has dealt with.
 ///
 /// # Errors
-/// The directory cannot be read, this boot or the process table cannot be read, or the
-/// helper failed to end a run (its record stays, and the daemon should not start).
+/// The directory cannot be read, or this boot or the process table cannot be read. A run
+/// the helper fails to end is not an error: see [`Swept::failed`].
 pub fn sweep<S: VmSession>(dir: &Path, session: &S) -> io::Result<Swept> {
     let mut swept = Swept::default();
     let entries = match std::fs::read_dir(dir) {
@@ -139,7 +142,17 @@ pub fn sweep<S: VmSession>(dir: &Path, session: &S) -> io::Result<Swept> {
         };
         if record.boot == boot && session.process_start(record.pgid)? == Some(record.start) {
             tracing::warn!(pgid = record.pgid, "ending a VM run an earlier daemon left");
-            session.reap(&record)?;
+            // A refusal (the helper finds the process not the VM user's, say) is the same
+            // at every start: failing here would lock the daemon out until someone
+            // removed the record by hand. The record stays, and the run is tried again.
+            if let Err(why) = session.reap(&record) {
+                tracing::error!(
+                    pgid = record.pgid,
+                    "the helper would not end a left VM run: {why}"
+                );
+                swept.failed.push((record, why.to_string()));
+                continue;
+            }
             swept.reaped.push(record);
         } else {
             tracing::info!(file = %file.display(), "the run a record names is gone");

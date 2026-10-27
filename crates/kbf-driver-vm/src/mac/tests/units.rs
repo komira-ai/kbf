@@ -253,8 +253,8 @@ fn the_sweep_ends_the_recorded_run_and_nothing_else() {
 }
 
 /// Catches: a sweep that stops the daemon over nothing (no directory yet), one that
-/// goes on after a failure it cannot recover from (the helper could not end a run: its
-/// record must stay for the next try), and a kernel question that failed read as "no".
+/// goes on after a failure it cannot recover from, and a kernel question that failed read
+/// as "no".
 #[test]
 fn the_sweep_fails_loudly_when_it_cannot_account_for_a_run() {
     let dir = dir("sweep-fail");
@@ -270,9 +270,6 @@ fn the_sweep_fails_loudly_when_it_cannot_account_for_a_run() {
     std::fs::create_dir_all(&runs).unwrap();
     std::fs::write(runs.join("a"), record(500, 1000, "boot-1").line()).unwrap();
     session.leave_process(500, 1000);
-    session.fail("reap");
-    assert!(records::sweep(&runs, &session).is_err());
-    assert_eq!(names(&runs), ["a"]);
     session.heal();
     session.fail("process_start");
     assert!(records::sweep(&runs, &session).is_err());

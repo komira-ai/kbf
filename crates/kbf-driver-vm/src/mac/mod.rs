@@ -32,7 +32,8 @@
 //! (`role-reap`) and waits [`MacConfig::reap_grace`]. A daemon that dies closes the
 //! control pipe with its descriptors: the same stop, with nobody left to wait.
 //!
-//! At [`MacVmHost::new`] the records of earlier daemons are swept ([`records::sweep`]).
+//! At [`MacVmHost::new`] the daemon takes the state directory ([`owner`]: a second live
+//! daemon on it is refused) and sweeps the records of earlier daemons ([`records::sweep`]).
 //!
 //! Not yet: the relay to the guest agent. `kbf-vmm vm-run` serves only its events on
 //! stdout and a stop on stdin, so the real session's `connect` answers "unsupported"; the
@@ -57,6 +58,7 @@ use crate::host::{HostError, VmHost, VmSpec};
 
 #[cfg(target_os = "macos")]
 pub mod client;
+pub mod owner;
 pub mod pipes;
 pub mod records;
 pub mod session;
@@ -191,6 +193,8 @@ pub struct MacVmHost<S: VmSession> {
     config: MacConfig,
     runs: Mutex<BTreeMap<String, Run>>,
     swept: Swept,
+    /// Held for the host's life: no other daemon sweeps or runs on this state directory.
+    _owner: owner::Owner,
     /// The monitor and reader threads, for a test to wait for.
     #[cfg(test)]
     monitors: Mutex<Vec<std::thread::JoinHandle<()>>>,
@@ -199,12 +203,19 @@ pub struct MacVmHost<S: VmSession> {
 impl<S: VmSession> MacVmHost<S> {
     /// A host over `session`, after ending the runs earlier daemons left.
     ///
+    /// A run an earlier daemon left that the helper refuses to end does not stop the
+    /// daemon: it stays in [`Swept::failed`] with its record, is tried again at the next
+    /// start, and the framework's own limit covers the slot it may still hold.
+    ///
     /// # Errors
-    /// The records cannot be swept: the daemon should not start with VMs it cannot
-    /// account for.
+    /// `WouldBlock` when another live daemon owns the state directory (its records are
+    /// not ours to sweep); the records cannot be read, or this boot or the process table
+    /// cannot be read.
     pub fn new(config: MacConfig, session: S) -> io::Result<Self> {
+        let owner = owner::Owner::take(&config.state)?;
         let swept = records::sweep(&config.runs(), &session)?;
         Ok(Self {
+            _owner: owner,
             session: Arc::new(session),
             config,
             runs: Mutex::new(BTreeMap::new()),

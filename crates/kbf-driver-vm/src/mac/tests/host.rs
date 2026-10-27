@@ -419,3 +419,70 @@ fn a_vmm_path_that_is_not_text_is_refused() {
     assert!(rig.both_slots_free());
     assert!(rig.records().is_empty());
 }
+
+/// Catches: a helper that refuses to end a left run (certain every time, when the process
+/// is not the VM user's) failing `new`, so the daemon could never start until someone
+/// deleted the record by hand; and the record being dropped, so the run is forgotten.
+#[test]
+fn a_run_the_helper_will_not_end_does_not_lock_the_daemon_out() {
+    let session = FakeSession::new();
+    session.leave_process(777, 5555);
+    session.fail("reap");
+    let dir = super::dir("sweep-refused");
+    let config = super::config(&dir);
+    std::fs::create_dir_all(config.runs()).unwrap();
+    let left = Record {
+        pgid: 777,
+        start: 5555,
+        boot: "boot-1".to_owned(),
+    };
+    std::fs::write(config.runs().join("lease-1-1"), left.line()).unwrap();
+    let host = crate::mac::MacVmHost::new(config.clone(), session.clone()).unwrap();
+    assert!(host.swept().reaped.is_empty());
+    assert_eq!(host.swept().failed.len(), 1);
+    assert_eq!(host.swept().failed[0].0, left);
+    assert!(session.alive(777));
+    assert!(config.runs().join("lease-1-1").is_file());
+    drop(host);
+    // The next start tries again, and ends it once the helper will.
+    session.heal();
+    let host = crate::mac::MacVmHost::new(config.clone(), session.clone()).unwrap();
+    assert_eq!(host.swept().reaped, [left]);
+    assert!(!session.alive(777));
+    assert!(!config.runs().join("lease-1-1").exists());
+}
+
+/// Catches: a second daemon on the same state directory finding the first one's live
+/// record and having the helper kill its running VM (and deleting its traces).
+#[test]
+fn a_second_daemon_on_one_state_directory_leaves_the_first_ones_vms_alone() {
+    let rig = rig("two-daemons");
+    rig.host.start(&rig.spec("lease-1-1")).unwrap();
+    assert_eq!(rig.records(), ["lease-1-1"]);
+    let second = crate::mac::MacVmHost::new(super::config(&rig.dir), rig.session.clone());
+    let why = second.err().expect("the directory is owned");
+    assert_eq!(why.kind(), std::io::ErrorKind::WouldBlock, "{why}");
+    assert!(why.to_string().contains("one daemon per Mac"), "{why}");
+    assert_eq!(rig.session.count("reap"), 0);
+    assert!(rig.session.alive(pid(0)));
+    assert_eq!(rig.records(), ["lease-1-1"]);
+    assert!(!rig.session.saw_eof(upid(0)));
+    let Rig {
+        session, host, dir, ..
+    } = rig;
+    // Once the first daemon is gone, its record is the next one's to sweep.
+    drop(host);
+    session.wait_eof(upid(0));
+    let next = crate::mac::MacVmHost::new(super::config(&dir), session.clone());
+    assert!(next.is_ok());
+    drop(next);
+}
+
+/// Catches: an ownership lock that cannot be taken at all (a state path that is a file).
+#[test]
+fn a_state_directory_that_cannot_be_made_is_an_error() {
+    let dir = super::dir("owner-bad");
+    std::fs::write(dir.path().join("state"), "").unwrap();
+    let config = super::config(&dir);
+    assert!(crate::mac::MacVmHost::new(config, FakeSession::new()).is_err());
+}

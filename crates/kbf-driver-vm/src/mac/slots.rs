@@ -3,9 +3,10 @@
 //!
 //! A start takes one slot before it asks the helper or the framework for anything, and
 //! gives it back only after its run has ended. The lock is `flock(2)` on a file of its
-//! own per slot, so it also counts the VMs of another daemon on the same Mac, and a
-//! daemon that dies releases its slots with its descriptors (its runs are ended by the
-//! next start's reap, or have already stopped with the control pipe).
+//! own per slot. One daemon owns a state directory ([`crate::mac::owner`]), so the locks
+//! count its VMs; a daemon that dies releases its slots with its descriptors (its runs are
+//! ended by the next start's reap, or have already stopped with the control pipe, and until
+//! then the framework's own limit is what refuses a third).
 
 use std::fs::{File, OpenOptions};
 use std::io;
