@@ -10,7 +10,7 @@
 //!   crate (tokio, tonic, hyper, reqwest, the rand family, getrandom, mio, socket2);
 //! - a pure crate that depends on a kbf crate outside the pure set;
 //! - a pure crate that reaches a crate taken from a git repository other than the ones
-//!   listed in `PURE_GIT_CRATES` (today `js-sizing`, which `kbf-estimator` re-exports);
+//!   listed in `PURE_GIT_CRATES` (today `js-sizing` and `js-caps`, which `kbf-estimator` and `kbf-caps` re-export);
 //! - a pure crate whose `lib.rs` no longer denies the `clippy.toml` lists, which would
 //!   silently switch off the clock, sleep, network and `HashMap` checks for it;
 //! - a pure crate renamed or removed, which would otherwise make every check above
@@ -120,12 +120,19 @@ const DENY_ATTR: &str = "#![deny(clippy::disallowed_methods, clippy::disallowed_
 
 /// The crates of other repositories (taken by `git` dependency, `source` beginning
 /// `git+`) that a pure crate may reach, with the one repository each may come from.
-/// `kbf-estimator` re-exports `js-sizing`, which has no dependencies of its own; a
-/// further git crate in a pure crate's tree is a decision, so it is listed here by name.
-const PURE_GIT_CRATES: &[(&str, &str)] = &[(
-    "js-sizing",
-    "git+https://github.com/komira-ai/jobscheduler?rev=",
-)];
+/// `kbf-estimator` re-exports `js-sizing`, which has no dependencies of its own, and
+/// `kbf-caps` re-exports `js-caps`, which depends only on `thiserror`; a further git
+/// crate in a pure crate's tree is a decision, so it is listed here by name.
+const PURE_GIT_CRATES: &[(&str, &str)] = &[
+    (
+        "js-caps",
+        "git+https://github.com/komira-ai/jobscheduler?rev=",
+    ),
+    (
+        "js-sizing",
+        "git+https://github.com/komira-ai/jobscheduler?rev=",
+    ),
+];
 
 struct Graph {
     /// Package id to package name.
@@ -285,7 +292,7 @@ fn pure_crates_take_git_crates_only_from_the_list() {
         "pure crates reach git crates outside PURE_GIT_CRATES:\n{}",
         violations.join("\n")
     );
-    // The list is not vacuous: kbf-estimator reaches js-sizing through its shim.
+    // The list is not vacuous: kbf-estimator and kbf-caps reach theirs through their shims.
     for (name, _) in PURE_GIT_CRATES {
         assert!(
             seen.contains(*name),
