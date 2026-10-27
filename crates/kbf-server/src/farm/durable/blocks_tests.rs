@@ -30,6 +30,8 @@ pub(super) struct Racing {
     session_scans: AtomicUsize,
     /// Rows whose key starts with one of these cannot be read.
     unreadable: Mutex<Vec<String>>,
+    /// Transactions that name a row whose key starts with one of these are refused.
+    unwritable: Mutex<Vec<String>>,
 }
 
 impl Racing {
@@ -43,6 +45,7 @@ impl Racing {
             lease_scans: AtomicUsize::new(0),
             session_scans: AtomicUsize::new(0),
             unreadable: Mutex::new(Vec::new()),
+            unwritable: Mutex::new(Vec::new()),
         })
     }
 
@@ -73,6 +76,13 @@ impl Racing {
         unreadable.extend(prefix.map(str::to_owned));
     }
 
+    /// Writes to the rows under `prefix` fail from now on, or work again (`None`).
+    pub(super) fn fail_writes(&self, prefix: Option<&str>) {
+        let mut unwritable = self.unwritable.lock().expect("lock");
+        unwritable.clear();
+        unwritable.extend(prefix.map(str::to_owned));
+    }
+
     fn unreadable(&self, key: &str) -> Result<(), StoreError> {
         let unreadable = self.unreadable.lock().expect("lock");
         let failing = unreadable.iter().any(|prefix| key.starts_with(prefix));
@@ -91,6 +101,16 @@ impl Store for Racing {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
         if self.down.load(Ordering::SeqCst) {
             return Err(StoreError::Failed("the store is down".to_owned()));
+        }
+        let refused = self.unwritable.lock().expect("lock");
+        let writes_refused = batch
+            .iter()
+            .flat_map(Txn::ops)
+            .filter_map(|op| op.key_cond())
+            .any(|(key, _)| refused.iter().any(|prefix| key.starts_with(prefix)));
+        drop(refused);
+        if writes_refused {
+            return Err(StoreError::Failed("the row cannot be written".to_owned()));
         }
         let names = |key: &str| {
             let mut ops = batch.iter().flat_map(Txn::ops);
