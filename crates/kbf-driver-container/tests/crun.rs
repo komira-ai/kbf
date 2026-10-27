@@ -797,9 +797,17 @@ fn listing(dir: &Path) -> Vec<PathBuf> {
 #[tokio::test]
 #[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn a_crun_run_that_outlives_the_sweep_leaves_nothing_in_the_scratch_directory() {
+    // Several rounds: a sweep that failed on a lease cgroup that stayed busy showed up
+    // once in hosted CI.
+    for round in 0..5 {
+        a_straggler_round(&format!("straggler-{round}")).await;
+    }
+}
+
+async fn a_straggler_round(name: &str) {
     use rustix::process::{Pid, Signal, kill_process};
 
-    let cell = Cell::new("straggler");
+    let cell = Cell::new(name);
     let action = store_action(&cell.cas, &sh("sleep 300"));
     let work = cell.work(1, action, Resources::default());
     let runtime = Arc::clone(&cell.runtime);
