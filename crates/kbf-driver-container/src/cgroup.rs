@@ -806,6 +806,31 @@ mod tests {
         assert_eq!(killed_at(&samples[..4], 8 * MIB), None);
     }
 
+    /// Catches a reclaim at the cap whose swap-out spans two samples being credited to
+    /// the host. The kernel counts one `max` event when a charge at the cap first
+    /// fails, then swaps pages out for a few hundred milliseconds with no further
+    /// event; a sample that lands inside that window sees `max` already counted and
+    /// the swap still rising. Seen on a runner at 50 ms: `max` 1 from 24 MB to 241 MB
+    /// of swap, and on a failed run `max` 1 across the rise from under the threshold
+    /// to 439 MB, then `max` 1241 with swap flat (the buffer was all out already).
+    #[test]
+    fn swap_rising_in_the_sample_after_the_first_max_event_is_the_leases_own() {
+        let samples = [
+            (0, 0),
+            (1, 100 * MIB),
+            (1, 439 * MIB),
+            (1241, 441 * MIB),
+            (2211, 441 * MIB),
+        ];
+        assert_eq!(killed_at(&samples, 128 * MIB), Some(2));
+        // Two samples after the event is host swap again, and a rise with no event at
+        // all in the previous sample is the host's.
+        let samples = [(1, 0), (1, MIB), (1, 439 * MIB)];
+        assert_eq!(killed_at(&samples, 128 * MIB), None);
+        let samples = [(0, 0), (0, 439 * MIB), (1, 440 * MIB)];
+        assert_eq!(killed_at(&samples, 128 * MIB), None);
+    }
+
     /// Catches a share reset when the lease's `max` events pause (a lease pressing its
     /// cap into swap in bursts never killed), and swap the host moves during the pause
     /// counted as the lease's. The lease pushes 5 MiB at its cap, pauses (`max` flat)
