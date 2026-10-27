@@ -7,7 +7,7 @@
 use serde_json::{Value, json};
 
 use super::*;
-use crate::mkuser_prime::{Prep, plan_prep};
+use crate::mkuser_prime::{Prep, RootSetup, Share, plan_prep};
 use crate::sim_primed::{SKIPPED_NOTE, parse_staged, record_json};
 
 pub(crate) const DMG: &str = "iOS_27.dmg";
@@ -608,4 +608,91 @@ fn the_record_keeps_the_xcode_identity_and_none_when_it_cannot_be_read() {
     let record: Value =
         serde_json::from_slice(&host.files.borrow()[simpaths::PRIMED]).expect("json");
     assert_eq!(record["xcode_identity"], Value::Null);
+}
+
+/// Catches the summary hiding what the boot saw, which `image prime` needs to refuse a
+/// priming boot that did not do the setup it asked for: each way of ending says whether the
+/// share listed, whether the request was in it, and what became of the root setup.
+#[test]
+fn the_summary_says_what_the_share_showed_and_what_became_of_the_root_setup() {
+    let seen = |host: &Fake| {
+        let s = go(host).summary;
+        (s.root_setup, s.share, s.ok)
+    };
+    // The priming boot: asked for, done.
+    assert_eq!(
+        seen(&host_staged(&staged_both())),
+        (Some(RootSetup::Done), Some(Share::Requested), true)
+    );
+    // No Xcode staged: nothing to ask for, so the share is not even looked at (no wait).
+    let host = host_staged(&staged_json(&Value::Null, &[]));
+    assert_eq!(
+        seen(&host),
+        (Some(RootSetup::NotNeeded), Some(Share::NotChecked), true)
+    );
+    assert_eq!(host.pauses.get(), 0);
+    // A boot whose share lacks the request: the setup was left undone, and the run says so
+    // (the account is made, `ok`, and the summary is what `image prime` refuses).
+    let host = clone_staged(&staged_both());
+    assert_eq!(
+        seen(&host),
+        (Some(RootSetup::Skipped), Some(Share::NoRequest), true)
+    );
+    assert!(
+        go(&host)
+            .summary
+            .note
+            .is_some_and(|n| n.contains("prime request was not seen"))
+    );
+    // A share that never lists.
+    let host = host_staged(&staged_both());
+    host.files.borrow_mut().remove(simpaths::SHARE_RESULTS);
+    assert_eq!(
+        seen(&host),
+        (Some(RootSetup::Skipped), Some(Share::NotListed), true)
+    );
+    // A share that cannot be listed at all (not mounted yet): the same, after the wait.
+    let host = host_staged(&staged_both());
+    for key in [simpaths::SHARE_RESULTS, simpaths::PRIME_REQUESTED] {
+        host.files.borrow_mut().remove(key);
+    }
+    assert_eq!(
+        seen(&host),
+        (Some(RootSetup::Skipped), Some(Share::NotListed), true)
+    );
+    assert_eq!(host.pauses.get(), crate::mkuser_prime::SHARE_POLLS);
+    // A clone of a base that is primed already has nothing left: done, whatever the share.
+    let first = host_staged(&staged_both());
+    go(&first);
+    let host = clone_staged(&staged_both());
+    host.files.borrow_mut().insert(
+        simpaths::PRIMED.to_owned(),
+        first.files.borrow()[simpaths::PRIMED].clone(),
+    );
+    assert_eq!(
+        seen(&host),
+        (Some(RootSetup::Done), Some(Share::NoRequest), true)
+    );
+}
+
+/// Catches an older guest's summary (no such fields) failing to read: the fields are absent
+/// there, which the host then treats as an error rather than a success.
+#[test]
+fn a_summary_without_the_new_fields_still_reads_and_says_nothing() {
+    let host = host_staged(&staged_both());
+    go(&host);
+    let mut v: Value = serde_json::from_str(
+        &host
+            .sent
+            .borrow()
+            .iter()
+            .find(|f| f.name == SUMMARY_NAME)
+            .expect("summary")
+            .body,
+    )
+    .expect("json");
+    v.as_object_mut().expect("object").remove("root_setup");
+    v.as_object_mut().expect("object").remove("share");
+    let s: MkUserSummary = serde_json::from_value(v).expect("reads");
+    assert_eq!((s.root_setup, s.share), (None, None));
 }

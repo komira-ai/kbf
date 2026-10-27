@@ -242,8 +242,21 @@ impl MkUserHost for Fake {
             .cloned()
             .ok_or_else(|| format!("{path}: no such file"))
     }
-    fn exists(&self, path: &str) -> bool {
-        self.files.borrow().contains_key(path)
+    fn list_dir(&self, path: &str) -> Result<Vec<String>, String> {
+        let prefix = format!("{path}/");
+        let names: Vec<String> = self
+            .files
+            .borrow()
+            .keys()
+            .filter_map(|k| k.strip_prefix(&prefix))
+            .filter(|n| !n.contains('/'))
+            .map(str::to_owned)
+            .collect();
+        if names.is_empty() {
+            Err(format!("{path}: no such directory"))
+        } else {
+            Ok(names)
+        }
     }
     fn remove_file(&self, path: &str) -> Result<(), String> {
         self.calls.borrow_mut().push(Call::Remove(path.to_owned()));

@@ -19,6 +19,7 @@ use crate::probe::Ctx;
 use crate::report::Status as ReportStatus;
 use crate::spec::Event;
 use crate::system::Poll;
+use kbf_guest::mkuser_prime::{RootSetup, Share};
 
 const LONG: std::time::Duration = std::time::Duration::from_secs(30);
 const SHORT: std::time::Duration = std::time::Duration::from_millis(40);
@@ -60,6 +61,22 @@ fn step(index: usize, id: &str, status: Status, exit: Option<i32>) -> (String, S
 }
 
 fn summary(ok: bool, already_ready: bool, n: usize) -> (String, String) {
+    summary_root(
+        ok,
+        already_ready,
+        n,
+        Some(RootSetup::Done),
+        Some(Share::Requested),
+    )
+}
+
+fn summary_root(
+    ok: bool,
+    already_ready: bool,
+    n: usize,
+    root_setup: Option<RootSetup>,
+    share: Option<Share>,
+) -> (String, String) {
     let s = MkUserSummary {
         complete: true,
         user: "kbfuser".to_owned(),
@@ -74,6 +91,8 @@ fn summary(ok: bool, already_ready: bool, n: usize) -> (String, String) {
         powering_off: !already_ready,
         undelivered: Vec::new(),
         note: (!ok).then(|| "a step failed".to_owned()),
+        root_setup,
+        share,
     };
     (
         SUMMARY_NAME.to_owned(),
@@ -887,4 +906,67 @@ fn no_guest_step_may_outlast_the_default_deadline() {
     for d in [c.quick, c.audit, c.first_launch, c.runtime_add] {
         assert!(d <= DEFAULT_DEADLINE, "{d:?}");
     }
+}
+
+/// Catches a priming boot that never saw the request being reported as a success: the guest
+/// then ran no root setup and wrote no record, every clone pays for it, and the base looks
+/// primed. A summary that says the setup was skipped, or says nothing (an older guest), is an
+/// error naming the request; one that says done, or that nothing was staged, is a success.
+#[test]
+fn a_prime_whose_guest_did_not_see_the_request_is_an_error() {
+    let ids = plan("kbfuser", false).len();
+    let run_with = |root: Option<RootSetup>, share: Option<Share>| {
+        let work = work_with_base("prime-unseen");
+        let sys = FakeSystem::new();
+        let mut frames = all_ok();
+        frames.pop();
+        frames.push(summary_root(true, false, ids, root, share));
+        sys.script(powering_off(&frames));
+        prime(&prime_ctx(&sys, &work), LONG)
+    };
+    for (root, share) in [
+        (Some(RootSetup::Skipped), Some(Share::NoRequest)),
+        (Some(RootSetup::Skipped), Some(Share::NotListed)),
+        (None, None),
+    ] {
+        let r = run_with(root, share);
+        assert_eq!(r.status, ReportStatus::Error, "{root:?}");
+        let why = r.reason.expect("reason");
+        assert!(why.contains("did not see the prime request"), "{why}");
+        assert!(
+            why.contains("root_setup:") && why.contains("share:"),
+            "{why}"
+        );
+    }
+    for root in [RootSetup::Done, RootSetup::NotNeeded] {
+        let r = run_with(Some(root), Some(Share::Requested));
+        assert_eq!(r.status, ReportStatus::Ok, "{root:?} {r:?}");
+    }
+    // An already-ready base that did not see the request is no better.
+    let work = work_with_base("prime-unseen-ready");
+    let sys = FakeSystem::new();
+    sys.script(
+        Script::booted()
+            .with_guest_file(
+                &summary_root(
+                    true,
+                    true,
+                    0,
+                    Some(RootSetup::Skipped),
+                    Some(Share::NoRequest),
+                )
+                .0,
+                &summary_root(
+                    true,
+                    true,
+                    0,
+                    Some(RootSetup::Skipped),
+                    Some(Share::NoRequest),
+                )
+                .1,
+            )
+            .then(Poll::Event(Event::Stopped { ms: 50 })),
+    );
+    let r = prime(&prime_ctx(&sys, &work), LONG);
+    assert_eq!(r.status, ReportStatus::Error, "{r:?}");
 }

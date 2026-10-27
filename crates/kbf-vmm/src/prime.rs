@@ -23,7 +23,9 @@
 //! The guest runs the root setup only in this boot: the host puts a request file in the share
 //! (a clone's share has none), because the base's disk, and so every clone's, is the same and
 //! the daemon runs in every boot. Run on a base whose user is ready already and whose root setup
-//! is done, the guest says so and stays up; the host then shuts it down at once. When the user
+//! is done, the guest says so and stays up; the host then shuts it down at once. The host asked
+//! for the setup, so a summary that does not say `root_setup` was `done` or `not_needed` (the
+//! guest did not see the request, or is too old to say) is an error, never a success. When the user
 //! is ready but the root setup is not (a base primed earlier, or restaged since), the guest runs
 //! those steps alone and powers off. A clone's boot of such a base leaves them to `sim`.
 //!
@@ -38,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use kbf_guest::mkuser::{FRAME_PREFIX, MkUserSummary, SHUTDOWN_NAME, SUMMARY_NAME};
 use kbf_guest::mkuser_audit::{AUDIT_NAME, AuditFrame};
+use kbf_guest::mkuser_prime::RootSetup;
 use kbf_guest::sim::{Status, StepFrame};
 use serde_json::{Value, json};
 
@@ -167,10 +170,7 @@ fn remove_share(ctx: &Ctx<'_>) {
 
 /// Puts the prime request in the share (empty, new, mode 0644).
 fn request_prime(share: &Share) -> Result<(), String> {
-    let name = Path::new(kbf_guest::simpaths::PRIME_REQUESTED)
-        .file_name()
-        .unwrap_or_default();
-    let path = share.dir.join(name);
+    let path = share.dir.join(kbf_guest::simpaths::PRIME_REQUEST_NAME);
     std::fs::write(&path, b"").map_err(|e| format!("write {}: {e}", path.display()))
 }
 
@@ -367,6 +367,21 @@ pub fn prime(ctx: &Ctx<'_>, deadline: Duration) -> Report {
             ),
             d,
         ),
+        (_, Some(s))
+            if !matches!(
+                s.root_setup,
+                Some(RootSetup::Done | RootSetup::NotNeeded)
+            ) =>
+        {
+            failed(
+                format!(
+                    "the guest did not see the prime request, so the simulator's root setup was not run (root_setup: {}, share: {}); the base is not primed for clones. Run `prime` again; if it repeats, the share is not listing the request (see `summary` and `trace`)",
+                    s.root_setup.map_or("missing: a guest binary older than this check".to_owned(), |r| format!("{r:?}")),
+                    s.share.map_or("missing".to_owned(), |x| format!("{x:?}")),
+                ),
+                d,
+            )
+        }
         (Outcome::AlreadyReady, Some(s)) => Report::ok(
             PROBE,
             format!("user {} was ready already; the guest was shut down", s.user),

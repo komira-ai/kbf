@@ -722,10 +722,17 @@ The `com.kbf.mkuser` daemon runs in every boot of the base's disk, so every clon
 nothing on the disk tells the two apart. `image prime` therefore puts an empty file,
 `prime-requested`, in the share of its boot (the share is the host's; a clone's has none), and
 the daemon runs the root setup, and powers off after it, only when it finds that file at
-`/private/var/kbf-mnt/prime-requested` (it waits, at most 40 looks 3 s apart, for the share to
-be mounted; a share that never comes is not a priming boot). In any other boot a ready user is
-left alone whatever the record says: no command, no power-off, and a summary that says `sim`
-runs the steps. A base primed before this existed therefore still works on clones, with `sim`
+`/private/var/kbf-mnt/prime-requested`. The share allows listing and, measured in a macOS 27
+guest, not reading or writing, so the daemon lists `/private/var/kbf-mnt` and looks for the
+names `results` (the share is mounted) and `prime-requested` (this is the priming boot); a
+listing that fails is "not mounted yet", and it looks at most 40 times, 3 s apart. In any other
+boot a ready user is left alone whatever the record says: no command, no power-off, and a
+summary that says `sim` runs the steps. The summary carries `root_setup` (`done`, `not_needed`
+when no Xcode was staged, or `skipped`) and `share` (`not_checked`, `not_listed`, `no_request`,
+`requested`). Because the host asked for the setup, `image prime` is an error unless
+`root_setup` is `done` or `not_needed`: a `skipped` or missing one (a guest binary older than
+this) reports that the guest did not see the prime request, instead of a success that left the
+base unprimed. A base primed before this existed therefore still works on clones, with `sim`
 doing the root steps itself, until `image prime` is run on it again.
 
 Every clone of a primed base used to spend about 74 s in the first root steps of

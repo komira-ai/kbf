@@ -924,8 +924,8 @@ mod tests {
         fn read_file(&self, _: &str, _: usize) -> Result<Vec<u8>, String> {
             Err("no files".to_owned())
         }
-        fn exists(&self, _: &str) -> bool {
-            false
+        fn list_dir(&self, _: &str) -> Result<Vec<String>, String> {
+            Err("no share".to_owned())
         }
         fn remove_file(&self, _: &str) -> Result<(), String> {
             Ok(())

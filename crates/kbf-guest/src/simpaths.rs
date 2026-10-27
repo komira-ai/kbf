@@ -27,6 +27,11 @@ pub const USER_WANTED: &str = "/private/var/kbf-sim/user-wanted";
 pub const USER_READY: &str = "/private/var/kbf-sim/user-ready";
 /// Where the host's share directory is mounted in the guest, and its `results` directory
 /// (there once the mount is up; `kbf-vmm` pins both against its own constants).
+pub const SHARE_DIR: &str = "/private/var/kbf-mnt";
+/// The name of the `results` directory in the share's listing (there once it is mounted).
+pub const RESULTS_NAME: &str = "results";
+/// The name of the prime request in the share's listing.
+pub const PRIME_REQUEST_NAME: &str = "prime-requested";
 pub const SHARE_RESULTS: &str = "/private/var/kbf-mnt/results";
 /// A file `image prime` puts in the share of the base's priming boot, and of no other boot:
 /// the base's disk, and so every clone's, is the same, so only the host can say that this boot
@@ -56,6 +61,7 @@ mod tests {
             USER_WANTED,
             USER_READY,
             PRIMED,
+            SHARE_DIR,
         ] {
             assert!(p.starts_with('/'), "{p}");
             assert!(!p.ends_with('/'), "{p}");
@@ -71,5 +77,12 @@ mod tests {
         ] {
             assert!(p.starts_with("/private/var/kbf-sim/"), "{p}");
         }
+    }
+
+    /// Catches the listing names and the paths drifting apart.
+    #[test]
+    fn the_share_names_are_the_ends_of_the_share_paths() {
+        assert_eq!(SHARE_RESULTS, format!("{SHARE_DIR}/{RESULTS_NAME}"));
+        assert_eq!(PRIME_REQUESTED, format!("{SHARE_DIR}/{PRIME_REQUEST_NAME}"));
     }
 }

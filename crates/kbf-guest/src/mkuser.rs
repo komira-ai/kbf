@@ -20,7 +20,7 @@
 //!    its own step, then write [`simpaths::PRIMED`] ([`mkuser_prime`]); only when the setup
 //!    staged an Xcode;
 //!    Step 5 runs only in the base's priming boot, which the host marks with
-//!    [`simpaths::PRIME_REQUESTED`] in the share ([`mkuser_prime::is_prime_boot`]); the daemon
+//!    [`simpaths::PRIME_REQUESTED`] in the share ([`mkuser_prime::look_at_share`]); the daemon
 //!    also runs in every clone's boot, where `sim` does those steps itself;
 //! 6. write [`simpaths::USER_READY`] with the user's name. It needs every step above, so a
 //!    failed import leaves no marker.
@@ -517,8 +517,12 @@ pub trait MkUserHost {
     /// No connection or reply, or the host refused the frame.
     fn send(&self, port: u32, frame: &Frame) -> Result<(), SendError>;
     fn pause(&self, d: Duration);
-    /// Whether anything is at `path` (a link counts, and is not followed).
-    fn exists(&self, path: &str) -> bool;
+    /// The names in the directory `path`. The share allows listing and nothing else that is
+    /// known to work, so this is how the share is looked at.
+    ///
+    /// # Errors
+    /// The directory could not be listed (it is not there yet, or not readable).
+    fn list_dir(&self, path: &str) -> Result<Vec<String>, String>;
     /// The regular file `path` of at most `cap` bytes (`staged.json` and the prime's record);
     /// a file that cannot be read means there is no simulator setup to run.
     ///
@@ -551,6 +555,14 @@ pub struct MkUserSummary {
     /// Names of the frames that never reached the host.
     pub undelivered: Vec<String>,
     pub note: Option<String>,
+    /// What became of the simulator's root setup ([`mkuser_prime::RootSetup`]); `image prime`
+    /// is an error unless it is `done` or `not_needed`. Missing in a summary from an older guest.
+    #[serde(default)]
+    pub root_setup: Option<mkuser_prime::RootSetup>,
+    /// What the look at the share found ([`mkuser_prime::Share`]): whether the prime request
+    /// was seen.
+    #[serde(default)]
+    pub share: Option<mkuser_prime::Share>,
 }
 
 /// How the run ended, for the exit status.
@@ -841,6 +853,8 @@ pub fn run(host: &dyn MkUserHost, cfg: &Config, name: &str, log: &mut dyn Write)
         powering_off: false,
         undelivered: Vec::new(),
         note: None,
+        root_setup: None,
+        share: None,
     };
     if let Err(e) = check_name(name) {
         summary.note = Some(e);
@@ -850,7 +864,16 @@ pub fn run(host: &dyn MkUserHost, cfg: &Config, name: &str, log: &mut dyn Write)
         summary.note = Some("mkuser runs as root".to_owned());
         return end(&mut r, summary, None);
     }
-    let (prep, deferred) = mkuser_prime::gate(host, mkuser_prime::plan_prep(host));
+    let gated = mkuser_prime::gate(host, mkuser_prime::plan_prep(host));
+    summary.root_setup = Some(gated.root_setup);
+    summary.share = Some(gated.share);
+    if gated.root_setup == mkuser_prime::RootSetup::Skipped {
+        summary.note = Some(
+            "the simulator's root setup was not run: the prime request was not seen in the share"
+                .to_owned(),
+        );
+    }
+    let prep = gated.prep;
     let ready = host.ready_user().as_deref() == Some(name);
     if ready && !prep.needed() {
         summary.ok = true;
@@ -858,8 +881,8 @@ pub fn run(host: &dyn MkUserHost, cfg: &Config, name: &str, log: &mut dyn Write)
         summary.note = Some(format!(
             "{} names {name}: nothing to do{}",
             simpaths::USER_READY,
-            if deferred {
-                "; the simulator's root setup is not recorded, and this is not the priming boot, so `sim` runs it"
+            if gated.root_setup == mkuser_prime::RootSetup::Skipped {
+                "; the simulator's root setup was not run (no prime request in the share), so `sim` runs it"
             } else {
                 ""
             }

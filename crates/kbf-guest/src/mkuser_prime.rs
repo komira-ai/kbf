@@ -23,6 +23,7 @@
 //! A guest whose user is ready already but whose record does not cover everything runs these
 //! steps alone, then powers off ([`crate::mkuser`]).
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::mkuser::{Config, MkUserHost};
@@ -81,30 +82,96 @@ impl Prep {
 pub const SHARE_POLLS: u32 = 40;
 pub const SHARE_PAUSE: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Whether this boot is the base's priming one: the host put [`simpaths::PRIME_REQUESTED`] in
-/// the share. The disk is the same in the base and in every clone, so nothing on it can tell
-/// them apart; the share is the host's, and only `image prime` adds the file. The share is
-/// mounted a little after boot, so this waits (at most [`SHARE_POLLS`] looks) for it; a share
-/// that never comes is a boot that is not the priming one.
-pub fn is_prime_boot(host: &dyn MkUserHost) -> bool {
+/// What the boot's look at the share found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Share {
+    /// Not looked at: the setup staged no Xcode, so there was nothing to ask for.
+    NotChecked,
+    /// The directory never listed `results` within the wait (not mounted, or unreadable).
+    NotListed,
+    /// The share is mounted and lists no prime request: a clone's boot, or a priming boot
+    /// whose request did not arrive.
+    NoRequest,
+    /// The share is mounted and lists the prime request.
+    Requested,
+}
+
+/// What became of the simulator's root setup in this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootSetup {
+    /// The steps ran (the summary's `ok` says whether they all succeeded), or the record
+    /// covered all of them already.
+    Done,
+    /// The setup staged no Xcode: nothing to do.
+    NotNeeded,
+    /// Steps were left to do and not run, because the prime request was not seen. A priming
+    /// boot that ends so did not do what the host asked.
+    Skipped,
+}
+
+/// Looks at the share: [`simpaths::SHARE_DIR`] lists `results` once it is mounted, and
+/// [`simpaths::PRIME_REQUEST_NAME`] when this is the base's priming boot. The disk is the same
+/// in the base and in every clone, so nothing on it can tell them apart; the share is the
+/// host's, and only `image prime` adds the file. The directory is listed, not stat-ed or read:
+/// listing is what the share allows in a guest. The share is mounted a little after boot, so
+/// this waits (at most [`SHARE_POLLS`] looks) for the listing; a listing that never comes is
+/// [`Share::NotListed`].
+pub fn look_at_share(host: &dyn MkUserHost) -> Share {
     for _ in 0..SHARE_POLLS {
-        if host.exists(simpaths::SHARE_RESULTS) {
-            return host.exists(simpaths::PRIME_REQUESTED);
+        if let Ok(names) = host.list_dir(simpaths::SHARE_DIR)
+            && names.iter().any(|n| n == simpaths::RESULTS_NAME)
+        {
+            return if names.iter().any(|n| n == simpaths::PRIME_REQUEST_NAME) {
+                Share::Requested
+            } else {
+                Share::NoRequest
+            };
         }
         host.pause(SHARE_PAUSE);
     }
-    false
+    Share::NotListed
 }
 
-/// `prep` when this is the priming boot (or there is nothing to do); else nothing, and
-/// whether something was left undone. A clone's boot runs `mkuser` too, and the root steps
-/// are then `sim`'s (it runs the ones the record does not cover), never `mkuser`'s: it would
-/// race `sim` and power the clone off mid-probe.
-pub fn gate(host: &dyn MkUserHost, prep: Prep) -> (Prep, bool) {
-    if prep.steps.is_empty() || is_prime_boot(host) {
-        (prep, false)
+/// The root setup as this boot is to do it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gated {
+    /// The steps to run: `prep` when this is the priming boot (or there is nothing to do),
+    /// else none. A clone's boot runs `mkuser` too, and the root steps are then `sim`'s (it
+    /// runs the ones the record does not cover), never `mkuser`'s: it would race `sim` and
+    /// power the clone off mid-probe.
+    pub prep: Prep,
+    pub share: Share,
+    pub root_setup: RootSetup,
+}
+
+/// Decides, from the share, whether `prep` runs in this boot.
+pub fn gate(host: &dyn MkUserHost, prep: Prep) -> Gated {
+    if prep.steps.is_empty() {
+        return Gated {
+            prep,
+            share: Share::NotChecked,
+            root_setup: RootSetup::NotNeeded,
+        };
+    }
+    let share = look_at_share(host);
+    if share == Share::Requested {
+        return Gated {
+            prep,
+            share,
+            root_setup: RootSetup::Done,
+        };
+    }
+    let root_setup = if prep.needed() {
+        RootSetup::Skipped
     } else {
-        (Prep::default(), prep.needed())
+        RootSetup::Done
+    };
+    Gated {
+        prep: Prep::default(),
+        share,
+        root_setup,
     }
 }
 
