@@ -181,8 +181,8 @@ impl Durable {
     /// Every queued operation, with the version of its `queue/` row.
     fn queued(&self) -> Result<BTreeMap<OperationId, Version>, StateError> {
         let mut queued = BTreeMap::new();
-        for (key, row) in self.store.scan_prefix("queue/")? {
-            queued.insert(parse_operation(&key, "queue/")?, row.version);
+        for (key, row) in self.store.scan_prefix(QUEUE)? {
+            queued.insert(parse_operation(&key, QUEUE)?, row.version);
         }
         Ok(queued)
     }

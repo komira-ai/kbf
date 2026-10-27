@@ -685,13 +685,13 @@ impl Durable {
     /// first ids to hand out.
     pub(super) fn load(&self) -> Result<Stored, StateError> {
         let mut leases = std::collections::BTreeMap::new();
-        for (key, row) in self.scan_known_logged("lease/")? {
+        for (key, row) in self.scan_known_logged(LEASE)? {
             let grant = lease_row(&key, &row)?;
             leases.insert(grant.operation, grant);
         }
         let mut losses = std::collections::BTreeMap::new();
-        for (key, row) in self.store.scan_prefix("loss/")? {
-            let operation = parse_operation(&key, "loss/")?;
+        for (key, row) in self.store.scan_prefix(LOSS)? {
+            let operation = parse_operation(&key, LOSS)?;
             let count = u32::try_from(number(&key, &row)?)
                 .map_err(|_| corrupt(&key, "not a loss count"))?;
             losses.insert(operation, count);
@@ -764,9 +764,9 @@ impl Durable {
             next = floor.stamp.saturating_add(1);
         }
         let mut operations = Vec::new();
-        for (key, row) in self.scan_known_logged("op/")? {
+        for (key, row) in self.scan_known_logged(OPERATION)? {
             let request = request_row(&key, &row)?;
-            let operation = parse_operation(&key, "op/")?;
+            let operation = parse_operation(&key, OPERATION)?;
             let lease = leases.remove(&operation);
             operations.push(StoredOperation {
                 operation,

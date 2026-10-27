@@ -25,18 +25,21 @@
 //! to make it.
 //!
 //! `tests/golden/farm-rows/scheduler-variants.txt` holds the rows of a second store, written
-//! the same way, for the values the first leaves out: every `Qos` and every `LeaseKind` in an
-//! `op/` row, the `done/` row of an answer for every `Failure` (the way a failure reaches the
-//! store is the result its callers are told), the `done/` row of a refusal, and a cordon on a
-//! node that has a session. Each enumeration below is a chain written as an exhaustive match,
+//! the same way, for the values the first leaves out: one `op/` row for every `Qos` and one
+//! for every `LeaseKind` (the same rows: the kinds take turns across the levels, so it is not
+//! a row for each pair), the `done/` row of an answer for every `Failure` (the way a failure
+//! reaches the store is the result its callers are told), the `done/` row of a refusal, and a
+//! cordon on a node that has a session. Each enumeration below is a chain written as an
+//! exhaustive match,
 //! so a variant added to one of these types does not compile until it is placed in its chain,
 //! and then it has rows in the file or fails the comparison.
 //!
 //! Not rows, by what the writer reads:
 //!
-//! - `RequeueReason`: the give-up writes the same rows whatever the reason; the reason only
-//!   decides the loss count and the floors that the caller passes in
-//!   (`a_requeue_reason_is_not_a_row`).
+//! - `RequeueReason`: for the same loss count and floors, the give-up writes the same rows
+//!   whatever the reason (`a_requeue_reason_is_not_a_row` shows it). The caller derives the
+//!   `loss/` and `floor/` rows from the reason, so those rows are in the first file as the
+//!   caller's parameters, not as a value of the reason.
 //! - `FencePolicy` and the `device` of a `StartLease`: the grant writes a `LeaseGrant` (lease,
 //!   operation, worker) and nothing of the start (`a_start_writes_the_grant_and_nothing_of_it`).
 //! - `Effect::Commit` and `Effect::Waiting`: persisting them writes nothing
@@ -453,6 +456,39 @@ fn assert_rows(store: &Fake, golden: &str) {
     }
 }
 
+/// Catches: a key constant of the scheduler that `KINDS` lacks (a new kind of row the file
+/// is never asked to hold), a kind listed twice, and a list that holds a kind no constant
+/// names. The constants of `durable.rs` are read from its source; the five others live in
+/// the modules and `kbf-state` that own them and are named in `KINDS`.
+#[test]
+fn the_kinds_list_is_the_key_constants() {
+    const ELSEWHERE: usize = 5;
+    let mut sorted = KINDS.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), KINDS.len(), "a kind listed twice");
+    let mut found = 0;
+    for line in include_str!("../durable.rs").lines() {
+        let Some(rest) = line.strip_prefix("const ") else {
+            continue;
+        };
+        let Some((_, value)) = rest.split_once(": &str = \"") else {
+            continue;
+        };
+        let value = value.trim_end_matches("\";");
+        assert!(
+            KINDS.contains(&value),
+            "{value} is a key constant not in KINDS"
+        );
+        found += 1;
+    }
+    assert_eq!(
+        found + ELSEWHERE,
+        KINDS.len(),
+        "KINDS names a constant that is gone"
+    );
+}
+
 /// Catches: a file that lost a kind of row (the test above would then pass on a scenario
 /// that no longer writes it), and a row of a kind no key constant names.
 #[test]
@@ -489,6 +525,14 @@ fn every_qos() -> Vec<Qos> {
         Qos::Ci => Some(Qos::Batch),
         Qos::Batch => Some(Qos::custom("tenant-a", 150).expect("a level")),
         Qos::Custom(_) => None,
+    })
+}
+
+fn every_lease_kind() -> Vec<LeaseKind> {
+    chain(LeaseKind::Action, |kind| match kind {
+        LeaseKind::Action => Some(LeaseKind::WholeMachine),
+        LeaseKind::WholeMachine => Some(LeaseKind::Vm),
+        LeaseKind::Vm => None,
     })
 }
 
@@ -540,8 +584,8 @@ fn writes_rows(effect: &Effect) -> bool {
     }
 }
 
-/// A second store, for the values the first leaves out: an operation for each `Qos`, each
-/// with a kind of lease; an answer for each `Failure`; a refusal; and a cordon on `node-a`,
+/// A second store, for the values the first leaves out: an operation for each `Qos`, the
+/// kinds of lease taking turns (so each kind has one, not each pair); an answer for each `Failure`; a refusal; and a cordon on `node-a`,
 /// which has a session.
 fn written_variants() -> Arc<Fake> {
     let (store, durable) = opened();
@@ -555,7 +599,7 @@ fn written_variants() -> Arc<Fake> {
     };
 
     // Held on their leases: the `op/` and `lease/` rows stay.
-    let kinds = LeaseKind::ALL.into_iter().cycle();
+    let kinds = every_lease_kind().into_iter().cycle();
     for (qos, kind) in every_qos().into_iter().zip(kinds) {
         let (operation, seq, tag) = next();
         let held = Request {
@@ -624,8 +668,9 @@ fn the_variants_store_holds_a_row_for_each_variant() {
 }
 
 /// Catches: a give-up that writes something of its reason, so that two reasons leave
-/// different rows. The reason decides what the caller passes (the loss count, the floors),
-/// and the rows are the same for all of them: the golden files hold those parameters' rows.
+/// different rows. The reason decides what the caller passes (the loss count, the floors);
+/// given the same loss count and floors (none here), the rows are the same for every reason.
+/// The golden files hold the rows those parameters make.
 #[test]
 fn a_requeue_reason_is_not_a_row() {
     let rows = |reason| {
