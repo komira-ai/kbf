@@ -657,7 +657,8 @@ update checks off. The order is always:
 3. `image prime` (as the console user, not root: a guest needs a session; it writes to the base, so
    the console user must be able to write the base directory: hand it over, for example with
    `sudo chown -R $(id -un) $W/base`, after `setup`): boots the **base itself**, once, so that the
-   user is created in it,
+   user is created in it and the simulator's root setup (Xcode selected, license accepted, first
+   launch, every staged runtime imported or added) is done in it,
 4. `probe e3` (as the console user): its clones boot directly into the user's session.
 
 `--guest-user` stages a one-shot root launch daemon, `com.kbf.mkuser` (from the guest's own
@@ -686,7 +687,10 @@ order, each a frame `mkuser-step-NN-<step>.json` of the same shape as the simula
 | `screensaver-own` | gives both `.plist` files to the user (its primary group), mode 0600, through the open handle (links refused) |
 | `loginwindow-idle` | `defaults write /Library/Preferences/com.apple.screensaver loginWindowIdleTime -int 0` |
 | `updates-check`, `updates-download`, `updates-os`, `updates-critical` | `defaults write /Library/Preferences/com.apple.SoftwareUpdate` `AutomaticCheckEnabled`, `AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`, `CriticalUpdateInstall`, each `-bool false` |
-| `ready-marker` | writes `/private/var/kbf-sim/user-ready` (the name), only when every other step succeeded |
+| `prime-reset` | removes `/private/var/kbf-sim/primed.json`, so that a run that stops part way never leaves a record that claims more than was done. Only when the setup staged an Xcode (see below) |
+| `xcode-select`, `license`, `first-launch`, `runtime-add-<name>.dmg`, `runtime-import-<name>.exportedBundle` | the root steps of the simulator probe (the table below), with the same commands, one frame each, in the probe's order. `first-launch` and each runtime have the deadlines `--first-launch-secs` and `--runtime-add-secs` (1800 s each); the others the quick one (120 s). A step the earlier record covers is not run (see below) |
+| `prime-record` | writes `/private/var/kbf-sim/primed.json`, mode 0644 |
+| `ready-marker` | writes `/private/var/kbf-sim/user-ready` (the name), only when every other step succeeded, `prime-record` included: a runtime that fails to import leaves no marker, so a half-primed base is never used |
 
 The password is 11 random bytes from the guest's `/dev/urandom`, as 22 hex digits. It is
 never sent to the host and never logged: a frame's `argv` shows `<withheld>` in its place,
@@ -712,11 +716,48 @@ fails is reported by status and exit code only. `image prime` prints the frame a
 `log_audit` in its JSON. A non-zero `password_hits` or `window_hits` means the log has the
 password in it; zero in both, with status `ok`, means this run's log hour does not.
 
+#### The simulator's root setup, once per base
+
+Every clone of a primed base used to spend about 74 s in the first root steps of
+`kbf-guest sim`, which only need to happen once per base. Measured on a real farm Mac over 20
+clones: `xcodebuild -license accept` 40.5 s, `xcodebuild -runFirstLaunch` 16.2 s, and
+`xcodebuild -importPlatform <bundle>` (or `xcrun simctl runtime add <dmg>`) 17.6 s. They now
+run in the base's priming boot, as root, before the ready marker, and a clone skips them.
+A setup that staged no Xcode (`staged.json` missing, or `"xcode": null`) has nothing to
+prime: the daemon adds none of these steps and writes no record, and `sim` runs its root
+steps as it always did.
+
+`primed.json` records what was done: `version` (1), `xcode_path`, `xcode` (the Xcode entry
+of `staged.json`: its path, sizes and file counts), and `runtimes`, one object per runtime
+with its `name`, the `action` (`add` for an image, `import` for a bundle) and `staged`, the
+runtime's entry of `staged.json` (kind, size, and the SHA-256 of the image or of every file of
+the bundle). It is written only after every root step succeeded.
+
+`kbf-guest sim` on a clone reads `staged.json` and `primed.json` and skips a root step when
+the record covers it: for `xcode-select`, `license` and `first-launch` the record's Xcode
+entry equals the staged one; for a runtime step the record's entry for that runtime name
+equals the staged one. The decision is per step. A skipped step keeps its place in the list
+(same ids, same order, same dependencies, so the e3 report reads as before): its frame is
+`ok`, names the command it would have run, has no exit code, `ms` 0, and the note
+`skipped: done at prime`. The steps still run, as before, when the record is missing,
+unreadable, of another version or for another Xcode path; when `staged.json` is missing; and
+for each step whose entry differs: a runtime added or restaged after the prime (other bytes,
+another file in a bundle), or another Xcode tree. An Xcode restaged identically (same entry)
+counts as the primed one: the entry holds sizes and counts, not a hash of the tree.
+
+Priming an already primed base again is cheap: `prime` on a base whose user is ready runs
+only the root steps above (no account step, no password), reports the ones the record covers
+as skipped, imports only what is new, rewrites the record and powers the guest off. When the
+record covers everything it does nothing, as before, and `image prime` shuts the guest down.
+A base primed before this existed (a ready user and no record) is brought up to date the same
+way by running `image prime` on it again. The prime's default `--deadline-secs` (1200) has to
+cover the imports: raise it for large runtimes.
+
 When every step is done the daemon powers the guest off (`/sbin/shutdown -h now`), so the
 base's disk is flushed. It does so after a failed run too (the next `prime` starts the steps
-again; no marker is left). If `user-ready` names the user already, the daemon does nothing,
-sends a summary with `already_ready`, and does not power off: `image prime` then shuts the
-guest down itself.
+again; no marker is left). If `user-ready` names the user already and nothing of the root setup
+is left to do, the daemon does nothing, sends a summary with `already_ready`, and does not
+power off: `image prime` then shuts the guest down itself.
 
 ```sh
 # as root; $RUNTIME is a <name>.dmg or a <name>.exportedBundle; --sim-app and --sim-tests
@@ -760,7 +801,9 @@ root once per boot from the copy of `kbf-guest` on the guest's disk: pass `--gue
 this setup or have passed it in an earlier one, or the daemon has nothing to run. A base that has it runs the simulator steps on every boot, E1 included.
 The steps, in order, each one command with its own deadline (the flags of the daemon, with
 the defaults shown; a command still running at its deadline is killed with its process
-group):
+group). The five root steps (`xcode-select` to `runtime-import`) are not run when the base's
+priming boot did them (see "The simulator's root setup, once per base" above): the frames are
+`ok` with the note `skipped: done at prime`.
 
 | step | runs as | command | deadline |
 |---|---|---|---|

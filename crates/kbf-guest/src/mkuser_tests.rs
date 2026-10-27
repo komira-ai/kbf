@@ -4,6 +4,7 @@
 //! nothing waits on a clock.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use clap::Parser;
@@ -12,6 +13,9 @@ use crate::frame::{Frame, SendError};
 use crate::mkuser::*;
 use crate::sim::{Ended, Outcome, Status, StepFrame, Streamed};
 use crate::simpaths;
+
+#[path = "mkuser_prime_tests.rs"]
+pub(crate) mod prime;
 
 const RANDOM: [u8; 11] = [
     0x00, 0x01, 0x0a, 0x0f, 0x10, 0x7f, 0x80, 0xab, 0xcd, 0xef, 0xff,
@@ -43,6 +47,8 @@ pub(crate) enum Call {
     Send(String),
     /// A streamed command (the log audit's).
     Stream(Vec<String>),
+    /// A file removed.
+    Remove(String),
 }
 
 pub(crate) struct Fake {
@@ -63,6 +69,12 @@ pub(crate) struct Fake {
     /// `(text the command line contains, ended, stdout chunks)`; the first match answers,
     /// else exit 0 and no output.
     pub(crate) streams: RefCell<Vec<StreamScript>>,
+    /// The files of the guest `read_file` finds; a write puts its bytes here too.
+    pub(crate) files: RefCell<BTreeMap<String, Vec<u8>>>,
+    /// The path whose removal fails.
+    pub(crate) remove_fails: Option<String>,
+    /// The deadline each command was run with, with the command line.
+    pub(crate) deadlines: RefCell<Vec<(String, Duration)>>,
 }
 
 pub(crate) fn out(ended: Ended, stdout: &str, stderr: &str) -> Outcome {
@@ -90,6 +102,9 @@ impl Fake {
             down: false,
             pauses: Cell::new(0),
             streams: RefCell::new(Vec::new()),
+            files: RefCell::new(BTreeMap::new()),
+            remove_fails: None,
+            deadlines: RefCell::new(Vec::new()),
         }
     }
 
@@ -159,6 +174,9 @@ impl MkUserHost for Fake {
         if self.write_fails.as_deref() == Some(path) {
             Err("read-only volume".to_owned())
         } else {
+            self.files
+                .borrow_mut()
+                .insert(path.to_owned(), bytes.to_vec());
             Ok(())
         }
     }
@@ -172,9 +190,10 @@ impl MkUserHost for Fake {
             Ok(())
         }
     }
-    fn run(&self, argv: &[String], _deadline: Duration) -> Outcome {
+    fn run(&self, argv: &[String], deadline: Duration) -> Outcome {
         self.calls.borrow_mut().push(Call::Run(argv.to_vec()));
         let line = argv.join(" ");
+        self.deadlines.borrow_mut().push((line.clone(), deadline));
         let default = if line.contains("/ioreg") {
             out(Ended::Exited(0), &ioreg_text(UUID), "")
         } else {
@@ -214,6 +233,22 @@ impl MkUserHost for Fake {
     }
     fn pause(&self, _d: Duration) {
         self.pauses.set(self.pauses.get() + 1);
+    }
+    fn read_file(&self, path: &str, cap: usize) -> Result<Vec<u8>, String> {
+        self.files
+            .borrow()
+            .get(path)
+            .filter(|b| b.len() <= cap)
+            .cloned()
+            .ok_or_else(|| format!("{path}: no such file"))
+    }
+    fn remove_file(&self, path: &str) -> Result<(), String> {
+        self.calls.borrow_mut().push(Call::Remove(path.to_owned()));
+        if self.remove_fails.as_deref() == Some(path) {
+            return Err("Operation not permitted".to_owned());
+        }
+        self.files.borrow_mut().remove(path);
+        Ok(())
     }
 }
 
@@ -876,6 +911,10 @@ fn the_defaults_and_the_flags_make_the_config() {
     let c = Config::from(&args(&[]));
     assert_eq!((c.quick.as_secs(), c.tail_bytes, c.port), (120, 8192, 5000));
     assert_eq!(c.audit.as_secs(), 600);
+    assert_eq!(
+        (c.first_launch.as_secs(), c.runtime_add.as_secs()),
+        (1800, 1800)
+    );
     let c = Config::from(&args(&[
         "--quick-secs",
         "7",
@@ -885,7 +924,15 @@ fn the_defaults_and_the_flags_make_the_config() {
         "6000",
         "--audit-secs",
         "11",
+        "--first-launch-secs",
+        "13",
+        "--runtime-add-secs",
+        "17",
     ]));
+    assert_eq!(
+        (c.first_launch.as_secs(), c.runtime_add.as_secs()),
+        (13, 17)
+    );
     assert_eq!((c.quick.as_secs(), c.tail_bytes, c.port), (7, 9, 6000));
     assert_eq!(c.audit.as_secs(), 11);
     assert_eq!(args(&[]).name, "kbfuser");

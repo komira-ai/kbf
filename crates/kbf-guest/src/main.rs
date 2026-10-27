@@ -810,6 +810,9 @@ mod tests {
             }
         }
         fn pause(&self, _: std::time::Duration) {}
+        fn read_file(&self, _: &str, _: usize) -> Result<Vec<u8>, String> {
+            Err("no files".to_owned())
+        }
     }
 
     /// Catches `sim` being refused as root (it is a root daemon, so the refusal that guards
@@ -918,6 +921,12 @@ mod tests {
             }
         }
         fn pause(&self, _: std::time::Duration) {}
+        fn read_file(&self, _: &str, _: usize) -> Result<Vec<u8>, String> {
+            Err("no files".to_owned())
+        }
+        fn remove_file(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     /// Catches `mkuser` refused as root (it is a root daemon), run off macOS without the

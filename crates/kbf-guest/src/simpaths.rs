@@ -22,6 +22,11 @@ pub const USER_WANTED: &str = "/private/var/kbf-sim/user-wanted";
 /// Written by `kbf-guest mkuser` once the user exists with auto-login set up: the name of
 /// the user (one line). The simulator probe runs its user steps as this user.
 pub const USER_READY: &str = "/private/var/kbf-sim/user-ready";
+/// Written by `kbf-guest mkuser` in the base's priming boot once the root setup of the
+/// simulator (Xcode selected, license accepted, first launch, every staged runtime imported or
+/// added) is done: what was done, as JSON ([`crate::sim_primed`]). `kbf-guest sim` on a clone
+/// skips the root steps this record covers.
+pub const PRIMED: &str = "/private/var/kbf-sim/primed.json";
 
 #[cfg(test)]
 mod tests {
@@ -40,6 +45,7 @@ mod tests {
             MANIFEST,
             USER_WANTED,
             USER_READY,
+            PRIMED,
         ] {
             assert!(p.starts_with('/'), "{p}");
             assert!(!p.ends_with('/'), "{p}");
@@ -51,6 +57,7 @@ mod tests {
             MANIFEST,
             USER_WANTED,
             USER_READY,
+            PRIMED,
         ] {
             assert!(p.starts_with("/private/var/kbf-sim/"), "{p}");
         }

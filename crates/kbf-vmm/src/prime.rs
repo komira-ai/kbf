@@ -14,8 +14,16 @@
 //! password; `kbf_guest::mkuser_audit`; informational, it never changes the verdict), and what to run next. A clone of the base made afterwards boots into the
 //! user's session.
 //!
-//! Run on a base whose user is ready already, the guest says so and stays up; the host then
-//! shuts it down at once.
+//! The same boot also runs the simulator's root setup, so that no clone repeats it: the guest's
+//! `mkuser` steps `xcode-select`, `license`, `first-launch` and each runtime's add or import
+//! come before the ready marker, and `primed.json` records them (`kbf_guest::sim_primed`). They
+//! are steps like the user's, so they are in `steps` and `problems` of the report, and a
+//! failed one leaves no ready marker. Their time counts against `--deadline-secs`.
+//!
+//! Run on a base whose user is ready already and whose root setup is done, the guest says so
+//! and stays up; the host then shuts it down at once. When the user is ready but the root setup
+//! is not (a base primed earlier, or restaged since), the guest runs those steps alone and
+//! powers off.
 //!
 //! The base is changed by this run (a user is added to its disk): it is the one verb of the
 //! probes that writes to the base. A run that did not end in a power-off may leave the

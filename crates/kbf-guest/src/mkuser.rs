@@ -15,14 +15,23 @@
 //!    written by path, as root, then given to the user: the new user has never logged in,
 //!    so no preferences service runs for it and `defaults <domain>` cannot write), the
 //!    login window's idle time, and the update checks;
-//! 5. write [`simpaths::USER_READY`] with the user's name.
+//! 5. as root, the simulator's root setup that a clone would otherwise repeat: select Xcode,
+//!    accept its license, run its first launch and import or add every staged runtime, each
+//!    its own step, then write [`simpaths::PRIMED`] ([`mkuser_prime`]); only when the setup
+//!    staged an Xcode;
+//! 6. write [`simpaths::USER_READY`] with the user's name. It needs every step above, so a
+//!    failed import leaves no marker.
 //!
 //! Then the guest is powered off (`/sbin/shutdown -h now`), so that the base's disk is
 //! flushed and every clone made from it boots into the user's Aqua session.
 //!
 //! # Idempotent
-//! When [`simpaths::USER_READY`] names the user, nothing is done and the guest is not
-//! powered off: the summary says `already_ready`, and `image prime` stops the guest itself.
+//! When [`simpaths::USER_READY`] names the user and the simulator's root setup is done too
+//! (or there is none), nothing is done and the guest is not powered off: the summary says
+//! `already_ready`, and `image prime` stops the guest itself. When the user is ready but the
+//! record does not cover every staged thing (a base primed before this existed, or restaged
+//! since), only the steps of step 5 run, those the record covers are reported skipped, and
+//! the guest powers off.
 //!
 //! # The password
 //! The password is generated here, from the guest's random source, and is used in exactly
@@ -55,8 +64,9 @@ use serde_json::Value;
 
 use crate::frame::{Frame, Kind, SendError};
 use crate::mkuser_audit::{AUDIT_NAME, audit};
+use crate::mkuser_prime::{self, Prep, PrepStep};
 use crate::probe::send_with_retries;
-use crate::sim::{Ended, Outcome, Status, StepFrame, Streamed, Who, tail_text};
+use crate::sim::{Class, Ended, Outcome, Status, StepFrame, Streamed, Who, tail_text};
 use crate::simpaths;
 
 /// The prefix of every frame this sends; the host collects the frames by it.
@@ -173,6 +183,12 @@ pub enum Action {
     WriteKcpassword,
     /// Write [`simpaths::USER_READY`].
     WriteReady,
+    /// One root command of the simulator probe, run here once ([`mkuser_prime`]).
+    Prep(PrepStep),
+    /// Remove [`simpaths::PRIMED`].
+    PrimeReset,
+    /// Write [`simpaths::PRIMED`].
+    PrimeRecord(Value),
 }
 
 /// One step of the run.
@@ -200,6 +216,35 @@ fn step(id: &str, needs: &[&str], action: Action) -> Step {
 /// needs only steps before it.
 #[must_use]
 pub fn plan(name: &str, exists: bool) -> Vec<Step> {
+    plan_with(name, exists, &Prep::default())
+}
+
+/// The steps that run the simulator's root setup ([`mkuser_prime`]); none when `prep` has
+/// nothing to do.
+#[must_use]
+pub fn prep_steps(prep: &Prep) -> Vec<Step> {
+    let Some(record) = prep.record.as_ref().filter(|_| !prep.steps.is_empty()) else {
+        return Vec::new();
+    };
+    let mut steps = vec![step(mkuser_prime::RESET, &[], Action::PrimeReset)];
+    steps.extend(prep.steps.iter().map(|p| Step {
+        id: p.id.clone(),
+        needs: p.needs.clone(),
+        action: Action::Prep(p.clone()),
+    }));
+    let all = prep.ids();
+    let before: Vec<&str> = all[..all.len() - 1].iter().map(String::as_str).collect();
+    steps.push(step(
+        mkuser_prime::RECORD,
+        &before,
+        Action::PrimeRecord(record.clone()),
+    ));
+    steps
+}
+
+/// [`plan`] with the simulator's root setup before the ready marker, which then needs it.
+#[must_use]
+pub fn plan_with(name: &str, exists: bool, prep: &Prep) -> Vec<Step> {
     let home = format!("/Users/{name}");
     let library = format!("{home}/Library");
     let prefs = format!("{library}/Preferences");
@@ -226,7 +271,7 @@ pub fn plan(name: &str, exists: bool) -> Vec<Step> {
     let system = |domain: &str, key: &str| {
         Action::Run(text(&[DEFAULTS, "write", domain, key, "-bool", "false"]))
     };
-    vec![
+    let mut steps = vec![
         make_user,
         step(
             "home",
@@ -341,24 +386,26 @@ pub fn plan(name: &str, exists: bool) -> Vec<Step> {
             &[],
             system(SOFTWAREUPDATE, "CriticalUpdateInstall"),
         ),
-        step(
-            "ready-marker",
-            &[
-                "home",
-                "autologin",
-                "pmset",
-                "screensaver-idle",
-                "screensaver-lock",
-                "screensaver-own",
-                "loginwindow-idle",
-                "updates-check",
-                "updates-download",
-                "updates-os",
-                "updates-critical",
-            ],
-            Action::WriteReady,
-        ),
-    ]
+    ];
+    steps.extend(prep_steps(prep));
+    let mut marker_needs = vec![
+        "home",
+        "autologin",
+        "pmset",
+        "screensaver-idle",
+        "screensaver-lock",
+        "screensaver-own",
+        "loginwindow-idle",
+        "updates-check",
+        "updates-download",
+        "updates-os",
+        "updates-critical",
+    ];
+    if !prep.steps.is_empty() {
+        marker_needs.push(mkuser_prime::RECORD);
+    }
+    steps.push(step("ready-marker", &marker_needs, Action::WriteReady));
+    steps
 }
 
 /// The deadlines and caps of a run.
@@ -368,10 +415,27 @@ pub struct Config {
     pub quick: Duration,
     /// The deadline of each of the two `log show` passes of the log audit.
     pub audit: Duration,
+    /// The deadline of `xcodebuild -runFirstLaunch`.
+    pub first_launch: Duration,
+    /// The deadline of each runtime import or add.
+    pub runtime_add: Duration,
     /// How much of a command's stdout and stderr each a step frame keeps.
     pub tail_bytes: usize,
     /// The vsock port the host listens on.
     pub port: u32,
+}
+
+impl Config {
+    /// The deadline of a command of `class` (the classes of the simulator probe's root
+    /// steps; any other is a quick one).
+    #[must_use]
+    pub fn deadline(&self, class: Class) -> Duration {
+        match class {
+            Class::FirstLaunch => self.first_launch,
+            Class::RuntimeAdd => self.runtime_add,
+            _ => self.quick,
+        }
+    }
 }
 
 /// `mkuser`'s arguments (the flags of the launch daemon).
@@ -389,6 +453,12 @@ pub struct MkUserArgs {
     /// The deadline of each of the two `log show` passes of the log audit.
     #[arg(long, default_value_t = 600)]
     pub audit_secs: u64,
+    /// The deadline of `xcodebuild -runFirstLaunch` in the simulator's root setup.
+    #[arg(long, default_value_t = 1800)]
+    pub first_launch_secs: u64,
+    /// The deadline of each runtime import or add in the simulator's root setup.
+    #[arg(long, default_value_t = 1800)]
+    pub runtime_add_secs: u64,
     /// How much output of each command a step frame keeps, per stream.
     #[arg(long, default_value_t = 8192)]
     pub tail_bytes: usize,
@@ -399,6 +469,8 @@ impl From<&MkUserArgs> for Config {
         Self {
             quick: Duration::from_secs(a.quick_secs),
             audit: Duration::from_secs(a.audit_secs),
+            first_launch: Duration::from_secs(a.first_launch_secs),
+            runtime_add: Duration::from_secs(a.runtime_add_secs),
             tail_bytes: a.tail_bytes,
             port: a.vsock_port,
         }
@@ -442,6 +514,18 @@ pub trait MkUserHost {
     /// No connection or reply, or the host refused the frame.
     fn send(&self, port: u32, frame: &Frame) -> Result<(), SendError>;
     fn pause(&self, d: Duration);
+    /// The regular file `path` of at most `cap` bytes (`staged.json` and the prime's record);
+    /// a file that cannot be read means there is no simulator setup to run.
+    ///
+    /// # Errors
+    /// It is missing, not a regular file, larger than `cap`, or unreadable.
+    fn read_file(&self, path: &str, cap: usize) -> Result<Vec<u8>, String>;
+    /// Removes the file `path` (a link is removed, not followed); one that is not there is
+    /// fine.
+    ///
+    /// # Errors
+    /// It is there and could not be removed.
+    fn remove_file(&self, path: &str) -> Result<(), String>;
 }
 
 /// The frame that ends the run.
@@ -533,7 +617,7 @@ fn blank_frame(index: usize, step: &Step, blame: Option<&String>, cfg: &Config) 
 }
 
 /// Fills `f` from how the command `out` ended; the password never gets in.
-fn record(f: &mut StepFrame, out: &Outcome, cfg: &Config, password: &str) {
+pub(crate) fn record(f: &mut StepFrame, out: &Outcome, cfg: &Config, password: &str) {
     f.ms = out.ms;
     // The whole capture is cleaned before the tail is taken: a cut made first could split the
     // password, and a part of it is not matched. When the capture itself was cut (at its cap),
@@ -653,6 +737,9 @@ fn execute(
                 0o600,
             );
         }
+        Action::Prep(p) => mkuser_prime::run_step(host, cfg, p, password, f),
+        Action::PrimeReset => mkuser_prime::reset(host, f),
+        Action::PrimeRecord(v) => mkuser_prime::write_record(host, f, v),
         Action::WriteReady => {
             f.argv = vec![
                 "write".to_owned(),
@@ -758,7 +845,9 @@ pub fn run(host: &dyn MkUserHost, cfg: &Config, name: &str, log: &mut dyn Write)
         summary.note = Some("mkuser runs as root".to_owned());
         return end(&mut r, summary, None);
     }
-    if host.ready_user().as_deref() == Some(name) {
+    let prep = mkuser_prime::plan_prep(host);
+    let ready = host.ready_user().as_deref() == Some(name);
+    if ready && !prep.needed() {
         summary.ok = true;
         summary.already_ready = true;
         summary.note = Some(format!(
@@ -767,23 +856,36 @@ pub fn run(host: &dyn MkUserHost, cfg: &Config, name: &str, log: &mut dyn Write)
         ));
         return end(&mut r, summary, None);
     }
-    let password = match host.random_bytes(PASSWORD_BYTES) {
-        Ok(b) if b.len() == PASSWORD_BYTES => password_from(&b),
-        Ok(b) => {
-            summary.note = Some(format!(
-                "the random source gave {} bytes, not {PASSWORD_BYTES}",
-                b.len()
-            ));
-            return end(&mut r, summary, Some(true));
-        }
-        Err(e) => {
-            summary.note = Some(format!("no random bytes: {e}"));
-            return end(&mut r, summary, Some(true));
+    // A user that is ready needs no password; only the simulator's root setup is left.
+    let password = if ready {
+        String::new()
+    } else {
+        match host.random_bytes(PASSWORD_BYTES) {
+            Ok(b) if b.len() == PASSWORD_BYTES => password_from(&b),
+            Ok(b) => {
+                summary.note = Some(format!(
+                    "the random source gave {} bytes, not {PASSWORD_BYTES}",
+                    b.len()
+                ));
+                return end(&mut r, summary, Some(true));
+            }
+            Err(e) => {
+                summary.note = Some(format!("no random bytes: {e}"));
+                return end(&mut r, summary, Some(true));
+            }
         }
     };
     let exists = host.user_exists(name);
-    summary.created = !exists;
-    let steps = plan(name, exists);
+    summary.created = !exists && !ready;
+    let steps = if ready {
+        summary.note = Some(format!(
+            "{} names {name}: only the simulator's root setup was run",
+            simpaths::USER_READY
+        ));
+        prep_steps(&prep)
+    } else {
+        plan_with(name, exists, &prep)
+    };
     let mut status: BTreeMap<String, Status> = BTreeMap::new();
     let mut uuid: Option<String> = None;
     for (index, s) in steps.iter().enumerate() {

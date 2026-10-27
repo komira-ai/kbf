@@ -34,6 +34,7 @@ pub mod mkuser_audit;
 mod mkuser_audit_tests;
 #[cfg(target_os = "macos")]
 pub mod mkuser_host;
+pub mod mkuser_prime;
 #[cfg(test)]
 mod mkuser_tests;
 pub mod mount;
@@ -51,6 +52,7 @@ pub mod sim_choose;
 #[cfg(target_os = "macos")]
 pub mod sim_host;
 pub mod sim_parse;
+pub mod sim_primed;
 pub mod sim_run;
 #[cfg(test)]
 mod sim_tests;
