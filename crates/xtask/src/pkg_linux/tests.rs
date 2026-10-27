@@ -38,6 +38,13 @@ impl Tree {
         for (n, _) in TRUST_FILES {
             t.put(&format!("trust/{n}"), n);
         }
+        t.put("kbf-host-install", "kbf-host-install binary");
+        t.put("kbf-updater", "kbf-updater binary");
+        for unit in HOST_AGENT_UNITS {
+            t.put(&format!("host-agent/{unit}"), unit);
+        }
+        t.put("host-agent/kbf-updater.conf", "u kbf-updater");
+        t.put("host-agent/host-install-frontend.toml", "not packaged");
         t.put("sysusers.conf", "u kbf");
         t.put("tmpfiles.conf", "d /x");
         t.put("needrestart.conf", "# n");
@@ -56,6 +63,9 @@ impl Tree {
         Inputs {
             kbf: at("kbf"),
             units: at("units"),
+            host_install: at("kbf-host-install"),
+            updater: at("kbf-updater"),
+            host_agent: at("host-agent"),
             trust: at("trust"),
             sysusers: at("sysusers.conf"),
             tmpfiles: at("tmpfiles.conf"),
@@ -78,12 +88,21 @@ fn packaging() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux")
 }
 
+/// The path of `packaging/host-agent/linux` in the repository.
+fn host_agent_dir() -> &'static Path {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/host-agent/linux");
+    Box::leak(path.into_boxed_path())
+}
+
 /// The inputs made of the repository's real packaging files (and the stand-in trust files).
 fn real_inputs(root: &Path) -> Inputs<'_> {
     let at = |rel: &str| -> &'static Path { Box::leak(root.join(rel).into_boxed_path()) };
     Inputs {
         kbf: at("units/kbf-daemon.service"),
         units: at("units"),
+        host_install: at("units/kbf-daemon.service"),
+        updater: at("units/kbf-daemon.service"),
+        host_agent: host_agent_dir(),
         trust: at("testdata/trust"),
         sysusers: at("sysusers.d/kbf-installer.conf"),
         tmpfiles: at("tmpfiles.d/kbf-installer.conf"),
@@ -115,14 +134,33 @@ fn the_plan_is_the_contract_paths_with_their_modes() {
         ("/usr/lib/systemd/system/kbf-daemon.service", 0o644, true),
         ("/usr/lib/systemd/system/kbf-frontend.service", 0o644, true),
         (
+            "/usr/lib/systemd/system/kbf-host-local-frontend.service",
+            0o644,
+            true,
+        ),
+        (
+            "/usr/lib/systemd/system/kbf-host-local.service",
+            0o644,
+            true,
+        ),
+        (
             "/usr/lib/systemd/system/kbf-storage-and-daemon.service",
             0o644,
             true,
         ),
         ("/usr/lib/systemd/system/kbf-storage.service", 0o644, true),
+        (
+            "/usr/lib/systemd/system/kbf-updater-agent.service",
+            0o644,
+            true,
+        ),
         ("/usr/lib/systemd/system/kbf.slice", 0o644, true),
+        ("/usr/lib/sysusers.d/kbf-updater.conf", 0o644, true),
         ("/usr/lib/sysusers.d/kbf.conf", 0o644, true),
         ("/usr/lib/tmpfiles.d/kbf.conf", 0o644, true),
+        ("/usr/libexec/kbf", 0o755, false),
+        ("/usr/libexec/kbf/kbf-host-install", 0o755, true),
+        ("/usr/libexec/kbf/kbf-updater", 0o755, true),
         ("/usr/share/kbf", 0o755, false),
         ("/usr/share/kbf/trust", 0o755, false),
         ("/usr/share/kbf/trust/gh", 0o755, true),
@@ -161,7 +199,7 @@ fn the_plan_leaves_out_the_installer_its_units_and_its_directory() {
 fn the_plan_refuses_what_the_package_does_not_ship() {
     // Each case changes the tree in one way and names what the refusal must say.
     type Change = fn(&Tree) -> Inputs<'_>;
-    let cases: [(&str, Change, &str); 12] = [
+    let cases: [(&str, Change, &str); 18] = [
         (
             "a missing kbf",
             |t| {
@@ -209,6 +247,56 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
                 t.inputs()
             },
             "extra.pem: the package ships no trust file of that name",
+        ),
+        (
+            "a missing kbf-host-install",
+            |t| {
+                std::fs::remove_file(t.dir.join("kbf-host-install")).expect("rm");
+                t.inputs()
+            },
+            "/kbf-host-install: No such file or directory",
+        ),
+        (
+            "a missing kbf-updater",
+            |t| {
+                std::fs::remove_file(t.dir.join("kbf-updater")).expect("rm");
+                t.inputs()
+            },
+            "/kbf-updater: No such file or directory",
+        ),
+        (
+            "a missing host agent unit",
+            |t| {
+                std::fs::remove_file(t.dir.join("host-agent/kbf-updater-agent.service"))
+                    .expect("rm");
+                t.inputs()
+            },
+            "host agent file kbf-updater-agent.service is missing",
+        ),
+        (
+            "a missing host helper unit",
+            |t| {
+                std::fs::remove_file(t.dir.join("host-agent/kbf-host-local.service")).expect("rm");
+                t.inputs()
+            },
+            "host agent file kbf-host-local.service is missing",
+        ),
+        (
+            "a missing agent sysusers file",
+            |t| {
+                std::fs::remove_file(t.dir.join("host-agent/kbf-updater.conf")).expect("rm");
+                t.inputs()
+            },
+            "host agent file kbf-updater.conf is missing",
+        ),
+        (
+            "a host agent directory that is not there",
+            |t| {
+                let mut i = t.inputs();
+                i.host_agent = Path::new("/nonexistent/host-agent");
+                i
+            },
+            "/nonexistent/host-agent cannot be read as a directory",
         ),
         (
             "a missing sysusers file",
@@ -970,5 +1058,100 @@ fn the_needrestart_override_leaves_other_units_to_needrestart() {
         text.lines()
             .any(|l| l == "$nrconf{override_rc}{qr(^kbf[-.@])} = 0;"),
         "the override sets the restart choice to 0 (never)"
+    );
+}
+
+/// The host agent in the package: the helper and the agent are programs at the paths the units
+/// name, and the three units and the account's sysusers file are the repository's files, byte
+/// for byte, with nothing else of the directory (its example configuration) in the package.
+#[test]
+fn the_package_carries_the_host_agent_units_unchanged_and_the_programs_they_run() {
+    let root = packaging();
+    let plan = kbf_plan(&real_inputs(&root)).expect("the real files are a plan");
+    let dir = host_agent_dir();
+    for (name, dst) in HOST_AGENT_UNITS
+        .map(|n| (n, format!("{UNIT_DIR}/{n}")))
+        .into_iter()
+        .chain([(AGENT_SYSUSERS_FILE, AGENT_SYSUSERS_PATH.to_owned())])
+    {
+        let entry = plan.iter().find(|e| e.dst == dst).expect(&dst);
+        let bytes = std::fs::read(dir.join(name)).expect("the repository's file");
+        assert_eq!(entry.sha256, Some(Sha256::of(&bytes)), "{dst}");
+        assert_eq!(entry.mode, 0o644, "{dst}");
+    }
+    assert!(
+        !plan
+            .iter()
+            .any(|e| e.dst.contains("host-install-frontend.toml")),
+        "the example configuration is not packaged"
+    );
+    // Every program an `ExecStart=` of those units runs is a file the package carries.
+    let carried: Vec<&str> = [HOST_INSTALL_PATH, UPDATER_PATH].to_vec();
+    let mut seen = Vec::new();
+    for name in HOST_AGENT_UNITS {
+        let text = std::fs::read_to_string(dir.join(name)).expect("unit");
+        let exec = text
+            .lines()
+            .find_map(|l| l.strip_prefix("ExecStart="))
+            .expect("an ExecStart=");
+        let program = exec.split(' ').next().expect("a program");
+        assert!(carried.contains(&program), "{name} runs {program}");
+        seen.push(program.to_owned());
+    }
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen, [HOST_INSTALL_PATH, UPDATER_PATH]);
+}
+
+/// The agent's account is made by the sysusers file the package carries for it, and the helper's
+/// socket is given to that account: the units' `User=` and `--socket-user` name the one account
+/// the file declares.
+#[test]
+fn the_account_of_the_agent_units_is_the_one_the_agent_sysusers_file_makes() {
+    let dir = host_agent_dir();
+    let sysusers = std::fs::read_to_string(dir.join(AGENT_SYSUSERS_FILE)).expect("sysusers");
+    let made: Vec<&str> = sysusers
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.strip_prefix("u "))
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    assert_eq!(made, ["kbf-updater"]);
+    let agent = std::fs::read_to_string(dir.join("kbf-updater-agent.service")).expect("unit");
+    assert_eq!(
+        unit_accounts(&agent),
+        [("User", "kbf-updater".to_owned())],
+        "the agent runs as the account the file makes"
+    );
+    for name in ["kbf-host-local.service", "kbf-host-local-frontend.service"] {
+        let text = std::fs::read_to_string(dir.join(name)).expect("unit");
+        assert!(text.contains("--socket-user kbf-updater"), "{name}");
+        assert!(unit_accounts(&text).is_empty(), "{name} runs as root");
+    }
+}
+
+/// A package whose scripts could restart a unit would restart the helper in the middle of the
+/// switch that installs it: the configuration names no script of any kind.
+#[test]
+fn the_config_with_the_host_agent_names_no_maintainer_script() {
+    let t = Tree::new("agent-config");
+    let entries = kbf_plan(&t.inputs()).expect("plan");
+    let text = config(&entries, Platform::LinuxX86_64, "1.2.3+ci");
+    for key in [
+        "scripts",
+        "preinstall",
+        "postinstall",
+        "preremove",
+        "postremove",
+    ] {
+        assert!(!text.contains(key), "{key} in {text}");
+    }
+    assert!(
+        text.contains("dst: \"/usr/libexec/kbf/kbf-host-install\""),
+        "{text}"
+    );
+    assert!(
+        text.contains("type: \"dir\"\n    file_info: {mode: 0755"),
+        "{text}"
     );
 }

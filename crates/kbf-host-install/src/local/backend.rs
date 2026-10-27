@@ -113,6 +113,12 @@ pub trait Backend {
     /// The marker could not be cleared; the release stays on trial.
     fn confirm(&self, pending: &Pending) -> Result<(), Fault>;
 
+    /// Called once, after a confirm has been kept and recorded and before it is answered: a
+    /// platform that must restart its own programs on the new release asks for it here. It
+    /// cannot fail the confirm, which is already kept; a request that did not work is the
+    /// platform's to log. Nothing by default.
+    fn confirmed(&self) {}
+
     /// Go back to the release that ran before the one on trial: the links, the restart, and
     /// the marker cleared. Needs nothing of the release on trial to run.
     ///

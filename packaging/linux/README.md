@@ -31,6 +31,13 @@ installer-tarball`, which no release publishes, still place them under it.)
   `kbf-frontend.service`, `kbf-storage-and-daemon.service` and `kbf-storage.service`
   (`KBF_UNITS`), and `kbf.slice` (`SLICE`), in `/usr/lib/systemd/system` (0644). `cargo xtask
   pkg-config` fails when the unit directory lacks one;
+- the host's update agent (`packaging/host-agent`): `/usr/libexec/kbf/kbf-host-install` and
+  `/usr/libexec/kbf/kbf-updater` (0755, the release's own builds), the units
+  `kbf-host-local.service`, `kbf-host-local-frontend.service` and `kbf-updater-agent.service`
+  (`HOST_AGENT_UNITS`, byte for byte the files of `packaging/host-agent/linux`, not enabled), and
+  `/usr/lib/sysusers.d/kbf-updater.conf` (the `kbf-updater` account). The package has no
+  maintainer script, so installing it restarts nothing: the helper restarts the agent and itself
+  when it confirms the update (`docs/deploy/host-install.md`);
 - `/usr/share/kbf/trust/`: `gh` (0755), `trusted_root.jsonl`, `installer.conf` (0644). The
   directories above it, `/usr/share/kbf` and the trust directory, are the package's too;
 - `/usr/lib/sysusers.d/kbf.conf` (the users and the group) and `/usr/lib/tmpfiles.d/kbf.conf` (the
@@ -166,6 +173,8 @@ cargo xtask pkg-config --kbf <kbf> --units packaging/linux/units \
   --sysusers packaging/linux/sysusers.d/kbf-installer.conf \
   --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf \
   --needrestart packaging/linux/needrestart/kbf.conf \
+  --host-install target/release/kbf-host-install --updater target/release/kbf-updater \
+  --host-agent packaging/host-agent/linux \
   --platform linux-x86_64 --version <v> --out <dir>
       # <dir>/nfpm.yaml and listing.txt
 cargo xtask pkg-build --nfpm <nfpm> --config <dir>/nfpm.yaml --out <pkgs>

@@ -118,6 +118,27 @@ pub fn restart_unit(unit: &Unit) -> Cmd {
     }
 }
 
+/// Seconds `systemctl daemon-reload` may run before it is killed.
+pub const RELOAD_TIMEOUT_SECS: u64 = 120;
+
+/// Read the unit files again: `systemctl daemon-reload`.
+pub fn daemon_reload() -> Cmd {
+    Cmd {
+        timeout: Some(Duration::from_secs(RELOAD_TIMEOUT_SECS)),
+        ..cmd(SYSTEMCTL, &["daemon-reload"])
+    }
+}
+
+/// Queue a restart of `unit` and return at once: `systemctl restart --no-block`. For a program
+/// that restarts itself (and the program that talks to it), which cannot wait for its own
+/// restart. The runner kills it after [`IS_ACTIVE_TIMEOUT_SECS`]; it only queues a job.
+pub fn restart_unit_no_block(unit: &Unit) -> Cmd {
+    Cmd {
+        timeout: Some(Duration::from_secs(IS_ACTIVE_TIMEOUT_SECS)),
+        ..cmd(SYSTEMCTL, &["restart", "--no-block", "--", unit.as_str()])
+    }
+}
+
 /// Ask whether `unit` is active: the exit status is 0 for `active` and `reloading`, and not
 /// for `activating` (a unit that is starting), `inactive` or `failed`. The runner kills it after
 /// [`IS_ACTIVE_TIMEOUT_SECS`].

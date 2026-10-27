@@ -307,7 +307,7 @@ jobs:
       - name: The packaged kbf names the commit and a release build
         run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" "$GITHUB_SHA"
       # The kbf package (packaging/linux/README.md): this job's `kbf` at /usr/bin/kbf, the real units
-      # of the modes and kbf.slice, the sysusers and tmpfiles files, and a trust directory of the
+      # of the modes and kbf.slice, the host agent (this job's kbf-host-install and kbf-updater and their units), the sysusers and tmpfiles files, and a trust directory of the
       # pinned gh, the Sigstore trusted root and an installer.conf that trusts the branch this
       # commit is attested on (`PKG_SOURCE_REF`: the pushed branch on a push). nfpm builds it twice
       # and the bytes must match; a fresh Ubuntu container installs, runs and removes it, and takes
@@ -330,7 +330,7 @@ jobs:
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
       - name: Write the nfpm configuration
-        run: cargo xtask pkg-config --kbf "target/$TARGET/release/kbf" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --platform linux-x86_64 --version-of "target/$TARGET/release/kbf" --out target/pkg
+        run: cargo xtask pkg-config --kbf "target/$TARGET/release/kbf" --units packaging/linux/units --host-install "target/$TARGET/release/kbf-host-install" --updater "target/$TARGET/release/kbf-updater" --host-agent packaging/host-agent/linux --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --platform linux-x86_64 --version-of "target/$TARGET/release/kbf" --out target/pkg
       - name: Build the deb and the rpm of kbf, each twice
         run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/nfpm.yaml --out target/pkg/out
       - name: Install, run, remove and purge the deb in a fresh Ubuntu container
@@ -472,7 +472,7 @@ jobs:
       - name: The packaged kbf names the commit and a release build
         run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" "$GITHUB_SHA"
       # The kbf package (packaging/linux/README.md): this job's `kbf` at /usr/bin/kbf, the real units
-      # of the modes and kbf.slice, the sysusers and tmpfiles files, and a trust directory of the
+      # of the modes and kbf.slice, the host agent (this job's kbf-host-install and kbf-updater and their units), the sysusers and tmpfiles files, and a trust directory of the
       # pinned gh, the Sigstore trusted root and an installer.conf that trusts the branch this
       # commit is attested on (`PKG_SOURCE_REF`: the pushed branch on a push). nfpm builds it twice
       # and the bytes must match; a fresh Ubuntu container installs, runs and removes it, and takes
@@ -495,7 +495,7 @@ jobs:
       - name: Write the package's trust directory
         run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
       - name: Write the nfpm configuration
-        run: cargo xtask pkg-config --kbf "target/$TARGET/release/kbf" --units packaging/linux/units --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --platform linux-arm64 --version-of "target/$TARGET/release/kbf" --out target/pkg
+        run: cargo xtask pkg-config --kbf "target/$TARGET/release/kbf" --units packaging/linux/units --host-install "target/$TARGET/release/kbf-host-install" --updater "target/$TARGET/release/kbf-updater" --host-agent packaging/host-agent/linux --trust target/pkg-trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --needrestart packaging/linux/needrestart/kbf.conf --platform linux-arm64 --version-of "target/$TARGET/release/kbf" --out target/pkg
       - name: Build the deb and the rpm of kbf, each twice
         run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/nfpm.yaml --out target/pkg/out
       - name: Install, run, remove and purge the deb in a fresh Ubuntu container

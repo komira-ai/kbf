@@ -1,14 +1,21 @@
 # The host agent: units and jobs
 
-The files an operator places to run a host's update agent (`docs/design/updates.md`). Nothing
-here is in a package yet: the binaries are release assets (`docs/deploy/host-install.md`,
-"Getting the binary"), and these files go beside them.
+The files a host's update agent runs from (`docs/design/updates.md`). On Linux the `kbf` deb
+(`packaging/linux`) carries the three units and the sysusers file below, byte for byte, in
+`/usr/lib/systemd/system` and `/usr/lib/sysusers.d/kbf-updater.conf`, and the two programs they
+run, `/usr/libexec/kbf/kbf-host-install` and `/usr/libexec/kbf/kbf-updater`: a release updates the
+helper, the agent and their units together, and a confirmed update restarts the agent and the
+helper (`docs/deploy/host-install.md`, "On a Linux daemon host that runs the package"). The
+package does not enable or start them: the operator enables the one this host needs. The example
+configuration (`host-install-frontend.toml`) and the Mac files are not packaged. A host without
+the package places the programs from the release assets (`docs/deploy/host-install.md`, "Getting
+the binary") and these files beside them.
 
 | file | what |
 |---|---|
 | `linux/kbf-host-local-frontend.service`, `linux/host-install-frontend.toml` | the same socket for a host whose frontend is a container (`--frontend-container`), and an example of its `/etc/kbf/host-install-frontend.toml`; use this unit or the next, not both |
 | `linux/kbf-host-local.service` | `kbf-host-install --serve`, as root: the local socket (`/run/kbf-host-install/local.sock`, mode 0600, owned by `kbf-updater`) that stages a release, switches to it on trial, and goes back by itself at the deadline |
-| `linux/kbf-host-local.service` on a host that runs the `kbf` package | add `--layout deb` (or `rpm`) to its `--serve` line: the update is then an installation of the attested package (`docs/deploy/host-install.md`, "On a Linux daemon host that runs the package"); a hand-placed host moves once with `kbf-host-install --migrate-to-package` (`docs/deploy/native-package-migration.md`) |
+| `linux/kbf-host-local.service` on a host that runs the `kbf` package | add `--layout deb` (or `rpm`) to its `--serve` line, in a drop-in (`systemctl edit`) so that an upgrade of the package keeps it: the update is then an installation of the attested package (`docs/deploy/host-install.md`, "On a Linux daemon host that runs the package"); a hand-placed host moves once with `kbf-host-install --migrate-to-package` (`docs/deploy/native-package-migration.md`) |
 | `linux/kbf-updater-agent.service` | `kbf-updater agent`, as `kbf-updater`: the heartbeat to the coordinator and the host's A/B through that socket |
 | `linux/kbf-updater.conf` | the sysusers.d entry of the `kbf-updater` account (no login, no home) |
 | `enroll-example.txt` | the enrollment command, as the tests read it |

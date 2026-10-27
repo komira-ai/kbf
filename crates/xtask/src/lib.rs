@@ -290,6 +290,16 @@ enum Verb {
         /// `kbf.slice` from it.
         #[arg(long)]
         units: PathBuf,
+        /// The kbf-host-install binary the kbf packages carry at `/usr/libexec/kbf/kbf-host-install`.
+        #[arg(long)]
+        host_install: PathBuf,
+        /// The kbf-updater binary the kbf packages carry at `/usr/libexec/kbf/kbf-updater`.
+        #[arg(long)]
+        updater: PathBuf,
+        /// The host agent's directory (`packaging/host-agent/linux`): the kbf packages take its
+        /// three units and its sysusers file from it.
+        #[arg(long)]
+        host_agent: PathBuf,
         /// The directory of the three trust files.
         #[arg(long)]
         trust: PathBuf,
@@ -1053,6 +1063,9 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::PkgConfig {
             kbf,
             units,
+            host_install,
+            updater,
+            host_agent,
             trust,
             sysusers,
             tmpfiles,
@@ -1071,6 +1084,9 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 &pkg_linux::Inputs {
                     kbf: &kbf,
                     units: &units,
+                    host_install: &host_install,
+                    updater: &updater,
+                    host_agent: &host_agent,
                     trust: &trust,
                     sysusers: &sysusers,
                     tmpfiles: &tmpfiles,

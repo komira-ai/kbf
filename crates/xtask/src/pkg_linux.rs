@@ -48,6 +48,25 @@ pub const KBF_UNITS: [&str; 5] = [
     "kbf-storage-and-daemon.service",
     "kbf-storage.service",
 ];
+/// The directory of the programs the units run besides `kbf`: the `ExecStart=` of the host
+/// agent's units.
+pub const LIBEXEC_DIR: &str = "/usr/libexec/kbf";
+/// Where the local-socket helper goes (`ExecStart=` of `kbf-host-local.service`).
+pub const HOST_INSTALL_PATH: &str = "/usr/libexec/kbf/kbf-host-install";
+/// Where the update agent goes (`ExecStart=` of `kbf-updater-agent.service`).
+pub const UPDATER_PATH: &str = "/usr/libexec/kbf/kbf-updater";
+/// The units of the host's update agent, which the `kbf` package carries beside the units of the
+/// modes. The operator enables the one this host needs (`kbf-host-local.service` or
+/// `kbf-host-local-frontend.service`, and `kbf-updater-agent.service`).
+pub const HOST_AGENT_UNITS: [&str; 3] = [
+    "kbf-host-local-frontend.service",
+    "kbf-host-local.service",
+    "kbf-updater-agent.service",
+];
+/// The name of the sysusers file of the agent's account, in the host agent's directory.
+pub const AGENT_SYSUSERS_FILE: &str = "kbf-updater.conf";
+/// Where it goes (`systemd-sysusers`).
+pub const AGENT_SYSUSERS_PATH: &str = "/usr/lib/sysusers.d/kbf-updater.conf";
 /// The first version no `kbf-installer` package has: every deb that was published is
 /// `0.1.0+<commit>`. The deb of `kbf` replaces the installer packages below it, so that a later
 /// package of that name (there is none) would not be.
@@ -182,6 +201,14 @@ pub struct Inputs<'a> {
     /// The directory of unit files: the package takes the units of the modes
     /// ([`KBF_UNITS`]) and the slice ([`SLICE`]) from it, and no other.
     pub units: &'a Path,
+    /// The `kbf-host-install` binary, which the package carries at [`HOST_INSTALL_PATH`].
+    pub host_install: &'a Path,
+    /// The `kbf-updater` binary, which the package carries at [`UPDATER_PATH`].
+    pub updater: &'a Path,
+    /// The host agent's directory (`packaging/host-agent/linux`): the package takes the units
+    /// of [`HOST_AGENT_UNITS`] and the sysusers file [`AGENT_SYSUSERS_FILE`] from it, and no other
+    /// file (its example configuration is not packaged).
+    pub host_agent: &'a Path,
     /// The directory of the three trust files.
     pub trust: &'a Path,
     /// The sysusers.d file.
@@ -285,7 +312,8 @@ fn input_problems(i: &Inputs) -> Vec<String> {
 
 /// Everything the `kbf` package installs, sorted by path: the `kbf` binary, the units of the
 /// modes ([`KBF_UNITS`]) and the slice, which the unit directory must hold, the sysusers,
-/// tmpfiles and needrestart files, and the trust directory with its three files.
+/// tmpfiles and needrestart files, the trust directory with its three files, and the host
+/// agent: its two programs, its three units and the sysusers file of its account.
 ///
 /// # Errors
 /// [`Error::Refused`] with every problem with the inputs.
@@ -301,6 +329,14 @@ pub fn kbf_plan(i: &Inputs) -> Result<Vec<Entry>, Error> {
             i.needrestart,
             &mut problems,
         ),
+        file(
+            HOST_INSTALL_PATH.to_owned(),
+            0o755,
+            i.host_install,
+            &mut problems,
+        ),
+        file(UPDATER_PATH.to_owned(), 0o755, i.updater, &mut problems),
+        dir(LIBEXEC_DIR),
         dir(SHARE_DIR),
         dir(TRUST_DIR),
     ];
@@ -316,6 +352,18 @@ pub fn kbf_plan(i: &Inputs) -> Result<Vec<Entry>, Error> {
             src,
             &mut problems,
         ));
+    }
+    let agent = files_in(i.host_agent, &mut problems);
+    for (name, dst) in HOST_AGENT_UNITS
+        .map(|n| (n, format!("{UNIT_DIR}/{n}")))
+        .into_iter()
+        .chain([(AGENT_SYSUSERS_FILE, AGENT_SYSUSERS_PATH.to_owned())])
+    {
+        let Some((_, src)) = agent.iter().find(|(n, _)| *n == name) else {
+            problems.push(format!("host agent file {name} is missing"));
+            continue;
+        };
+        entries.push(file(dst, 0o644, src, &mut problems));
     }
     let mut trust = files_in(i.trust, &mut problems);
     for (name, mode) in TRUST_FILES {
