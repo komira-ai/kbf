@@ -57,7 +57,7 @@ pub const TARGETS: &[Target] = &[
     },
     Target {
         name: "crun_memory",
-        nocapture: true,
+        nocapture: false,
     },
     Target {
         name: "crun_killed",

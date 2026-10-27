@@ -232,7 +232,8 @@ async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
     let work = cell.work(1, action, Resources::new(1000, 16 * MIB));
     let logs = Logs::capture();
     let mut first = tokio::spawn(async move { runtime.run(work).await });
-    // What the lease looked like each second, for the failure message.
+    // What the lease looked like at each change of its swap or events, sampled every
+    // 50 ms (a reclaim at the cap swaps for a few hundred ms), for the failure message.
     let lease = cell.cgroup.join(cell.name(1));
     let mut seen = Vec::new();
     let mut last_key = String::new();
@@ -241,7 +242,8 @@ async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
             outcome = &mut first => break outcome.expect("join"),
             () = tokio::time::sleep(Duration::from_millis(50)) => {
                 let now = state(&lease);
-                let key = now.split("memory.current").nth(1).map(|s| s.split_once(',').map_or(String::new(), |x| x.1.to_owned())).unwrap_or_default();
+                // Every change of swap or events, not of RAM (which moves by pages).
+                let key = now.split_once(", ").map(|(_, rest)| rest.to_owned()).unwrap_or_default();
                 if key != last_key {
                     seen.push(format!("{:?}: {}", started.elapsed(), now));
                     last_key = key;
@@ -250,7 +252,6 @@ async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
         }
     };
     let took = started.elapsed();
-    println!("TRACE\n{}", seen.join("\n"));
     assert_swap_kill(
         &outcome,
         &logs.text(),
