@@ -1638,7 +1638,15 @@ impl State {
         let operation = waiting.operation;
         let stage = match &waiting.reason {
             Some(why) => {
-                tracing::warn!(%operation, reason = %why, "no live worker can run the operation");
+                if self.runnable_elsewhere(operation) {
+                    tracing::info!(
+                        %operation,
+                        reason = %why,
+                        "no worker of this frontend can run the operation; another frontend can"
+                    );
+                } else {
+                    tracing::warn!(%operation, reason = %why, "no live worker can run the operation");
+                }
                 self.stuck.insert(operation, why.clone());
                 self.stage_for(operation, why)
             }
@@ -1651,27 +1659,37 @@ impl State {
         self.show(operation, &stage);
     }
 
+    /// Whether a daemon session of another frontend, as the last intake poll listed them,
+    /// could run `operation`. Its work is taken by that frontend's intake, which takes the
+    /// queued operations it did not enqueue.
+    fn runnable_elsewhere(&self, operation: OperationId) -> bool {
+        self.sched.request(operation).is_some_and(|request| {
+            self.intake
+                .remote
+                .iter()
+                .any(|(caps, capacity)| request.runnable_on(caps, capacity))
+        })
+    }
+
     /// The stage of `operation`, which no live worker of this frontend can run now (`why`).
-    /// `Waiting` means its streams can be ended by a drain: it was never started and can
-    /// never start here. Not that when it has run (`WaitingKept`); when another frontend
-    /// has a worker that could run it and takes it once this one stands down
-    /// (`WaitingKept`); or when the only thing between it and a worker is this drain's own
-    /// cordon, with the intake closed (`Queued`: it is queued for the other frontends like
-    /// any queued work). Held by an operator's cordon (alone, or beside the drain's) or by
-    /// no worker at all, with no other frontend to take it, it can never start.
+    /// A worker of another frontend can run it when that frontend's intake takes the queued
+    /// operation; this frontend follows the state store until then. What each stage means
+    /// to a caller:
+    ///
+    /// - `WaitingKept`: a drain keeps its streams. The operation has started before, or a
+    ///   daemon session of another frontend could run it.
+    /// - `Queued`: the only thing between it and a worker is this drain's own cordon, with
+    ///   the intake closed, so it is queued for the other frontends like any queued work.
+    /// - `Waiting`: a drain ends its streams. It never started, no daemon session of
+    ///   another frontend could run it, and it is held by an operator's cordon (alone, or
+    ///   beside the drain's) or by no worker at all.
     fn stage_for(&self, operation: OperationId, why: &str) -> Stage {
         let cordoned = self.sched.cordoned_could(operation);
         let only_drain = !cordoned.is_empty()
             && cordoned
                 .iter()
                 .all(|worker| self.drain_held.contains(worker));
-        let elsewhere = self.sched.request(operation).is_some_and(|request| {
-            let remote = &self.intake.remote;
-            remote
-                .iter()
-                .any(|(caps, capacity)| request.runnable_on(caps, capacity))
-        });
-        if self.ever_started.contains(&operation) || elsewhere {
+        if self.ever_started.contains(&operation) || self.runnable_elsewhere(operation) {
             Stage::WaitingKept(why.to_owned())
         } else if only_drain {
             Stage::Queued
