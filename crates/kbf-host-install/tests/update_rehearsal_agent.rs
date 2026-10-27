@@ -362,7 +362,7 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
         desired, r.version,
         "farm-version and the version facts agree"
     );
-    let deployed = deploy("deploy_farm", &desired);
+    let deployed = deploy("deploy_farm", &r.to.tag);
     assert!(
         deployed.contains("baseline: hosts live before the deploy: storage 1"),
         "{deployed}"
