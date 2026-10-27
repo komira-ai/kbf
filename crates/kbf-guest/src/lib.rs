@@ -21,9 +21,8 @@
 //! - [`simpaths`]: where `kbf-vmm image setup` stages Xcode and the simulator runtimes.
 //! - [`probe`]: the probe modes `kbf-vmm probe g2` and `g3` read, which run as any user.
 //!
-//! It serves a Unix socket. The virtio socket a VM gives it, the relay through
-//! `kbf-vmm`, the image that installs it and the VM driver that calls it are planned and
-//! not built.
+//! It serves a Unix socket. `kbf-driver-vm` is the host side that calls it (over its
+//! fake host's socket pair).
 
 pub mod client;
 pub mod diag;
