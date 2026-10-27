@@ -17,9 +17,12 @@ After=local-fs.target
 
 [Service]
 Type=simple
-# Root, on purpose: it moves releases under /var/lib/kbf-installer and restarts units. The
-# socket is the access control: mode 0600, owned by the one account named here.
-User=root
+# Root, on purpose: it moves releases under /var/lib/kbf-installer and restarts units. The socket is the access control: mode 0600, owned by the one
+# account named here. Root is systemd's default, so the unit names no User=: with User= set,
+# even to root, and a system call filter in place (RestrictRealtime=, LockPersonality= and
+# ProtectKernelModules= each add one), systemd takes CAP_SETUID from the process, and with
+# NoNewPrivileges= nothing gives it back. The program then cannot drop to another account to
+# run curl, and every release fetch fails (tests/real_linux_unit.rs of kbf-host-install).
 ExecStart=/usr/libexec/kbf/kbf-host-install --serve --socket /run/kbf-host-install/local.sock --socket-user kbf-updater --window-secs 600 --restart-unit kbf-daemon.service
 # systemd makes /run/kbf-host-install (root's, 0755) and its state directory.
 RuntimeDirectory=kbf-host-install
