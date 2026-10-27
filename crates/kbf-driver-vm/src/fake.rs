@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Cursor, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -47,6 +47,8 @@ pub struct FakeHost {
     wrong_token: bool,
     /// Holds `clone_image` before it copies anything, if set.
     clone_gate: Option<CloneHold>,
+    /// How many guest messages [`FakeHost::mute_after_start`] has withheld.
+    withheld: Arc<AtomicUsize>,
     state: Mutex<State>,
 }
 
@@ -130,7 +132,7 @@ pub struct FakeStream {
 impl Read for FakeStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self.inner.read(buf) {
-            Ok(0) if !buf.is_empty() && self.tap.expired.load(Ordering::SeqCst) => {
+            Ok(0) if self.tap.expired.load(Ordering::SeqCst) => {
                 Err(io::ErrorKind::WouldBlock.into())
             }
             read => read,
@@ -212,6 +214,7 @@ impl FakeHost {
             stops_ok: usize::MAX,
             wrong_token: false,
             clone_gate: None,
+            withheld: Arc::new(AtomicUsize::new(0)),
             state: Mutex::new(State::default()),
         }
     }
@@ -283,6 +286,13 @@ impl FakeHost {
     pub fn failing_stops_after(mut self, ok: usize) -> Self {
         self.stops_ok = ok;
         self
+    }
+
+    /// How many messages a guest sent after `Started` that [`FakeHost::mute_after_start`]
+    /// kept from the driver: the report, once the command ended.
+    #[must_use]
+    pub fn withheld(&self) -> usize {
+        self.withheld.load(Ordering::SeqCst)
     }
 
     /// Every spec started, in order, refused ones included.
@@ -472,7 +482,7 @@ impl VmHost for FakeHost {
             Silence::AfterStart => {
                 let (relay, agent_end) = UnixStream::pair()?;
                 booted.open.push(agent_end.try_clone()?);
-                mute_after_started(guest, relay)?;
+                mute_after_started(guest, relay, Arc::clone(&self.withheld))?;
                 agent_end
             }
         };
@@ -498,7 +508,11 @@ impl VmHost for FakeHost {
 
 /// Relays between `host` (the host's side) and `agent` (the agent's): everything the
 /// host sends, and what the agent sends up to and including `Started`; nothing after.
-fn mute_after_started(host: UnixStream, agent: UnixStream) -> io::Result<()> {
+fn mute_after_started(
+    host: UnixStream,
+    agent: UnixStream,
+    withheld: Arc<AtomicUsize>,
+) -> io::Result<()> {
     let (mut host_in, mut agent_out) = (host.try_clone()?, agent.try_clone()?);
     std::thread::spawn(move || {
         let _ = io::copy(&mut host_in, &mut agent_out);
@@ -508,7 +522,9 @@ fn mute_after_started(host: UnixStream, agent: UnixStream) -> io::Result<()> {
     std::thread::spawn(move || {
         let mut started = false;
         while let Ok(frame) = read_frame(&mut agent_in) {
-            if !started {
+            if started {
+                withheld.fetch_add(1, Ordering::SeqCst);
+            } else {
                 started = matches!(GuestMsg::decode(&frame), Ok(GuestMsg::Started { .. }));
                 let _ = write_frame(&mut host_out, &frame);
             }
@@ -538,4 +554,28 @@ fn copy_dir(from: &Path, to: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches a fake stream whose shutdown does not end the guest's side (a reader
+    /// blocked on the other end would never return when a VM stops), and one that does
+    /// not take a clone's shutdown for its own: every handle shares the one socket.
+    #[test]
+    fn a_shutdown_of_a_fake_stream_ends_the_other_end() {
+        let (driver_end, mut guest_end) = UnixStream::pair().expect("pair");
+        let stream = FakeStream {
+            inner: driver_end,
+            tap: Arc::new(Tap::default()),
+        };
+        let clone = stream.try_clone().expect("a clone");
+
+        clone.shutdown().expect("shut down");
+
+        let mut read = Vec::new();
+        assert_eq!(guest_end.read_to_end(&mut read).expect("an end"), 0);
+        assert!(Arc::ptr_eq(&stream.tap, &clone.tap));
+    }
 }

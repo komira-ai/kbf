@@ -136,6 +136,9 @@ async fn a_silent_guest_ends_the_lease_after_the_grace() {
         let driver = Arc::clone(&driver);
         tokio::spawn(async move { driver.run(work(1, action)).await })
     };
+    // The command ran and its report was sent, and the host withheld it: the guest did
+    // not hang before reporting, the report just never reaches the driver.
+    until("the report is withheld", || host.withheld() > 0).await;
     until("the watchdog is armed", || !clock.sleeps().is_empty()).await;
     assert_eq!(clock.sleeps(), [timeout + config.report_grace]);
 
