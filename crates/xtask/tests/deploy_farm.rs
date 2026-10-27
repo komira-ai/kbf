@@ -1288,13 +1288,14 @@ fn a_coordinator_that_reports_no_commit_gets_a_notice_and_the_deploy_proceeds() 
 }
 
 #[test]
-fn without_the_requirement_a_coordinator_on_another_commit_is_only_said() {
-    // Proves: with the requirement off the commits are printed and the deploy proceeds, and a
-    // coordinator that reports no commit adds no notice.
+fn without_the_requirement_a_coordinator_on_another_commit_warns_and_the_deploy_proceeds() {
+    // Proves: with the requirement off a different commit is a GitHub warning annotation
+    // line and the deploy proceeds, and a coordinator that reports no commit adds no notice.
     let (fake, result, out) = with_coordinator(Some("0123456789ab"), false);
     assert_eq!(result, Ok(()), "{out}");
     assert!(
-        out.contains("the coordinator runs 0123456789ab, the release is 000000000002"),
+        out.lines().any(|l| l
+            == "::warning title=coordinator not current::the coordinator runs 0123456789ab, the release is 000000000002: update the coordinator first (docs/deploy/kbf-updater.md, Updating the coordinator)"),
         "{out}"
     );
     assert_eq!(fake.requests("/v1/desired").len(), 1);

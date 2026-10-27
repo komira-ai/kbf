@@ -12,7 +12,8 @@
 //!    desired version, updating or failed; not `down`) are the baseline, per role, and are
 //!    printed. Its `commit` (the build the coordinator runs) is compared with the release's;
 //!    with `--require-coordinator-current` a different one ends the verb before anything is
-//!    set, and a coordinator that reports none is noted and trusted.
+//!    set, a different one without the flag is a `::warning` annotation and the deploy goes
+//!    on, and a coordinator that reports none is noted and trusted.
 //! 3. `POST /v1/desired` with the version and the minimums, authenticated by a GitHub
 //!    Actions OIDC token whose audience is the coordinator (`--audience`, by default the URL).
 //! 4. `GET /v1/convergence` every `--every-secs`, with a fresh token each time (a token is
@@ -475,7 +476,9 @@ fn check_coordinator(
     }
     log(
         out,
-        &format!("the coordinator runs {coordinator}, the release is {release}"),
+        &format!(
+            "::warning title=coordinator not current::the coordinator runs {coordinator}, the release is {release}: update the coordinator first (docs/deploy/kbf-updater.md, Updating the coordinator)"
+        ),
     )
 }
 

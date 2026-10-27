@@ -362,7 +362,8 @@ commit before it sets anything and fails when it is not the release's:
 the coordinator runs 0123456789ab, the release is 89abcdef0123: update the coordinator first (docs/deploy/kbf-updater.md, Updating the coordinator)
 ```
 
-A coordinator that reports no commit gets a notice and the deploy goes on, so a farm whose
+Without the flag, a different commit is a `coordinator not current` warning annotation on the run
+summary (the same text) and the deploy goes on. A coordinator that reports no commit gets a notice and the deploy goes on, so a farm whose
 coordinator is older than this field keeps working. The rule is equality, not order: a
 coordinator newer than the release (a rollback of the hosts) also fails; leave the variable unset
 for such a deploy. The variable is the operator's to set for the releases that need it.
@@ -418,7 +419,7 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    | `TS_CLIENT_ID`, `TS_AUDIENCE` | optional, for a coordinator reachable only on a Tailscale network: the client id and audience of the Tailscale trust credential (workload identity federation) that CI jobs join the network with, as `tag:ci`. It must trust this repository's `release` environment (the token's subject is `repo:<owner>/<repo>:environment:release`), and the network's policy must let `tag:ci` reach the control listener. With `TS_CLIENT_ID` and `KBF_COORDINATOR_URL` set, the job joins as an ephemeral node with the run's OIDC token, after the build and before the verb; no secret is involved. `TS_CLIENT_ID` or `KBF_COORDINATOR_URL` unset: the step is skipped (`TS_AUDIENCE` must be set with `TS_CLIENT_ID`) |
    | `FARM_ADDRESS`, `FARM_INSTANCE`, `FARM_TLS`, `FARM_LINUX_X86_64_PROPERTIES` | optional, for the proof below: the farm's REAPI address as `grpc://<host>:<port>` (also when TLS is on), its instance name (empty: the empty instance), `true` or `false` for TLS, and the platform properties of the Linux x86-64 workers as a comma-separated `key=value` list, such as `OSFamily=linux,ISA=x86-64`. `FARM_ADDRESS` unset or empty: the proof is off |
    | `KBF_MIN_UP_STORAGE`, `KBF_MIN_UP_FRONTEND` | optional: the storage hosts and frontends that must stay up while others update (default 1 each). The operator picks the storage number so that every blob stays readable |
-   | `KBF_REQUIRE_COORDINATOR_CURRENT` | optional: `true` makes the step fail before it sets anything when the coordinator runs another commit than the release ([Updating the coordinator](#updating-the-coordinator)). Unset: the commits are printed and the step goes on |
+   | `KBF_REQUIRE_COORDINATOR_CURRENT` | optional: `true` makes the step fail before it sets anything when the coordinator runs another commit than the release ([Updating the coordinator](#updating-the-coordinator)). Unset: a different commit is a warning annotation on the run and the step goes on |
 
 ### What the step does
 
