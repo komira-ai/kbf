@@ -166,6 +166,9 @@ fn download(token: &str, tag: &str, dir: &Path, names: &[String]) {
         cmd.args(["-p", name]);
     }
     run(&format!("download_{tag}"), &mut cmd);
+    if names.is_empty() {
+        return;
+    }
     let checked = run(
         &format!("sha256_{tag}"),
         Command::new("sha256sum")
