@@ -81,6 +81,30 @@ mod tests {
         }
     }
 
+    /// The length of the raw string literal (`r"..."`, `r#"..."#`, `br"..."`) that starts
+    /// at `chars[i]`, or `None` when no raw string starts there (an identifier that
+    /// ends in `r` or `b`, a raw identifier such as `r#type`). A raw string has no
+    /// escapes: it ends at the first `"` followed by as many `#` as it opened with, or
+    /// at the end of the source when there is none.
+    fn raw_string_len(chars: &[char], i: usize) -> Option<usize> {
+        if i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') {
+            return None;
+        }
+        let r = if chars[i] == 'b' { i + 1 } else { i };
+        if chars.get(r) != Some(&'r') {
+            return None;
+        }
+        let hashes = chars[r + 1..].iter().take_while(|&&x| x == '#').count();
+        let open = r + 1 + hashes;
+        if chars.get(open) != Some(&'"') {
+            return None;
+        }
+        let close = chars[open + 1..]
+            .windows(hashes + 1)
+            .position(|w| w[0] == '"' && w[1..].iter().all(|&x| x == '#'));
+        Some(close.map_or(chars.len() - i, |p| open + 1 + p + hashes + 1 - i))
+    }
+
     /// Two copies of `source` with `//` comments (doc comments included) and `/* */`
     /// comments (nested ones too) removed; line breaks inside a block comment are kept
     /// so line structure survives. The first copy leaves string and character
@@ -128,6 +152,14 @@ mod tests {
                 block = 1;
                 i += 2;
             } else if let Some(len) = (c == '\'').then(|| char_literal_len(&chars, i)).flatten() {
+                for &x in &chars[i..i + len] {
+                    put(&mut kept, &mut shape, x, blank(x));
+                }
+                i += len;
+            } else if let Some(len) = matches!(c, 'r' | 'b')
+                .then(|| raw_string_len(&chars, i))
+                .flatten()
+            {
                 for &x in &chars[i..i + len] {
                     put(&mut kept, &mut shape, x, blank(x));
                 }
@@ -202,12 +234,43 @@ mod tests {
         names
     }
 
-    /// Whether `source` has a `#[path]` attribute in code, which would point a module
-    /// at a file the directory listing does not show.
+    /// The text between the brackets of every attribute, outer (`#[..]`) or inner
+    /// (`#![..]`), in `shape` (literals blanked), with any spacing after the `#`, `!`
+    /// and `[`. Brackets nest; an attribute never closed runs to the end.
+    fn attribute_bodies(shape: &str) -> Vec<&str> {
+        let mut bodies = Vec::new();
+        for (at, _) in shape.match_indices('#') {
+            let rest = shape[at + 1..].trim_start();
+            let rest = rest.strip_prefix('!').unwrap_or(rest).trim_start();
+            let Some(rest) = rest.strip_prefix('[') else {
+                continue;
+            };
+            let mut depth = 1_usize;
+            let end = rest
+                .find(|c| {
+                    match c {
+                        '[' => depth += 1,
+                        ']' => depth -= 1,
+                        _ => {}
+                    }
+                    depth == 0
+                })
+                .unwrap_or(rest.len());
+            bodies.push(&rest[..end]);
+        }
+        bodies
+    }
+
+    /// Whether `source` has an attribute in code that names `path`, however spaced,
+    /// inner or outer, or wrapped in `cfg_attr`. Such an attribute would point a module
+    /// at a file the directory listing does not show. Any attribute that mentions the
+    /// word counts: refusing too much is the safe side.
     fn has_path_attribute(source: &str) -> bool {
-        code_lines(source)
-            .iter()
-            .any(|line| line.contains("#[path"))
+        let (_, shape) = scan(source);
+        attribute_bodies(&shape).iter().any(|body| {
+            body.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|word| word == "path")
+        })
     }
 
     /// What a directory listing of `(file name, is a directory)` entries contributes: the
@@ -391,6 +454,64 @@ let after: Digest;
     fn a_path_attribute_is_found_in_code_and_not_in_comments() {
         assert!(has_path_attribute("#[path = \"x.rs\"]\nmod x;\n"));
         assert!(!has_path_attribute("// #[path = \"x.rs\"]\nmod x;\n"));
+    }
+
+    #[test]
+    fn a_path_attribute_is_found_however_it_is_spelled() {
+        // The old check looked for the text `#[path` on one line.
+        assert!(has_path_attribute("#[ path = \"x.rs\" ]\nmod x;\n"));
+        assert!(has_path_attribute("# [\n  path = \"x.rs\"]\nmod x;\n"));
+        assert!(has_path_attribute("#![path = \"x.rs\"]\n"));
+        assert!(has_path_attribute(
+            "#[cfg_attr(unix, path = \"x.rs\")]\nmod x;\n"
+        ));
+        assert!(has_path_attribute("#[a([b]), path = \"x.rs\"]\nmod x;\n"));
+        assert!(has_path_attribute("#[path"));
+        // Not attributes, or no `path` word in code.
+        assert!(!has_path_attribute(
+            "let s = \"#[path = 1]\"; # x\n#[cfg_attr(unix, derive(Debug))]\n"
+        ));
+        assert!(!has_path_attribute("#[doc = \"path\"]\n#[pathway]\n"));
+    }
+
+    #[test]
+    fn a_raw_string_is_one_literal_whatever_it_holds() {
+        // A quote inside the raw string ended the old literal early, so `/*` opened a
+        // block comment that swallowed the code after it.
+        let hidden = "let s = r#\"x\" /* \"#;\nlet a: Digest;\n";
+        assert_eq!(offenders(hidden), ["let a: Digest;"]);
+        let bytes = "let b = br#\"a\" /* \"#;\nlet z: u8;\n";
+        assert_eq!(
+            code_lines(bytes),
+            ["let b = br#\"a\" /* \"#;", "let z: u8;"]
+        );
+        // Unbalanced braces in a raw string left the old test item open to the end.
+        let braces = "#[cfg(test)]\nmod tests {\n    const R: &str = r##\"a\"#{\"##;\n}\nlet after: Digest;\n";
+        assert_eq!(offenders(braces), ["let after: Digest;"]);
+        // A backslash before the closing quote is no escape in a raw string, so the old
+        // scan ended the test item early and reported its code.
+        let slash = "#[cfg(test)]\nmod tests {\n    const R: &str = r\"\\\"; const X: &str = \"}\";\n    fn t() { let f: Digest; }\n}\nlet after: Digest;\n";
+        assert_eq!(offenders(slash), ["let after: Digest;"]);
+        // A raw string is code to the reader of names: its text is still reported.
+        assert_eq!(
+            offenders("let s = r#\"a Digest\"#;\n"),
+            ["let s = r#\"a Digest\"#;"]
+        );
+    }
+
+    #[test]
+    fn a_name_that_only_looks_like_a_raw_string_is_plain_code() {
+        // Ends in `r` or `_r`, a raw identifier, bare `r` and `b`, a raw string that is
+        // the first thing in the source, one never closed, and a `"` the `#`s do not match.
+        let source = "bar\"{\"; a_r\"}\"; let r#type = 1; let r = b; r#\"a\"#; r#\"abc";
+        assert_eq!(code_lines(source), [source]);
+        assert_eq!(code_lines("r##\"a\"#"), ["r##\"a\"#"]);
+    }
+
+    #[test]
+    fn a_double_quote_character_literal_does_not_open_a_string() {
+        let source = "#[cfg(test)]\nmod tests {\n    const Q: char = '\"';\n    const B: char = '{';\n}\nlet after: Digest;\n";
+        assert_eq!(offenders(source), ["let after: Digest;"]);
     }
 
     #[test]
