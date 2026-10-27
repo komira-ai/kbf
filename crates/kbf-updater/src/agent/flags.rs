@@ -6,7 +6,7 @@
 //!                   (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
 //!                   [--frontend <dns name>:<port>] [--enroll-frontend <dns name>:<port>]
 //!                   [--operator-api http://IP:PORT --token-file FILE] [--daemon-node NODE_ID]
-//!                   [--helper-socket PATH]
+//!                   [--helper-socket PATH] [--service NAME[,SETTING=VALUE...]]...
 //!                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
 //!                   [--health-poll-secs N] [--retry-secs N]
 //! ```
@@ -43,6 +43,10 @@
 //!   instead of the updater's certificate for those calls. Without either way (no `--frontend`
 //!   and no token) the agent heartbeats and refuses every update order, before it fetches
 //!   anything. The packaged units give no token.
+//! - `--service NAME[,channel=C][,helper-socket=PATH][,drain=node|none][,ready-url=URL]`, as
+//!   many times as the host runs services besides `kbf`: the agent lists each in its heartbeat
+//!   and runs an order that names it with the service's own ports ([`ServiceConfig`]). Without
+//!   the flag the agent is a `kbf`-only agent, as before.
 //! - Times, in seconds: `--heartbeat-secs` (default 15), `--drain-deadline-secs` (600, how long
 //!   the node's leases are waited for), `--health-timeout-secs` (300, how long the release on
 //!   trial has to show healthy), `--health-poll-secs` (5) and `--retry-secs` (900, how long a
@@ -59,12 +63,13 @@ use kbf_types::Role;
 use super::coordinator::{Endpoint, TlsFiles};
 use crate::daemon::parse_operator_url;
 use crate::inventory::valid_node_id;
+use crate::wire::{KBF_SERVICE, MAX_SERVICE_NAME, is_service_name};
 
 pub const USAGE: &str = "usage: kbf-updater agent --coordinator DNSNAME:PORT --channel NAME \
 (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE) [--frontend DNSNAME:PORT] \
 [--enroll-frontend DNSNAME:PORT] \
 [--operator-api http://IP:PORT --token-file FILE] \
-[--daemon-node NODE_ID] [--helper-socket PATH] [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N] \
+[--daemon-node NODE_ID] [--helper-socket PATH] [--service NAME[,SETTING=VALUE...]]... [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N] \
 [--health-poll-secs N] [--retry-secs N]\n";
 
 const FLAGS: [&str; 17] = [
@@ -142,6 +147,38 @@ pub struct Config {
     /// The node id of the daemon a frontend host also runs, if it runs one.
     pub daemon_node: Option<String>,
     pub timing: Timing,
+    /// The services the host runs besides `kbf`, in the order they were given.
+    pub services: Vec<ServiceConfig>,
+}
+
+/// How a service's node is drained around its update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceDrain {
+    /// The node is drained through the frontend, as `kbf`'s is.
+    Node,
+    /// There is nothing to drain: the service is replaced in place.
+    None,
+}
+
+/// How a service's health is judged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServiceHealth {
+    /// By the node's health through the frontend, as `kbf`'s is.
+    Node,
+    /// Healthy when `GET path` on the loopback address answers 2xx.
+    Ready { addr: SocketAddr, path: String },
+}
+
+/// A service the host runs besides `kbf`, and the ports its A/B uses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceConfig {
+    pub name: String,
+    /// The channel of the helper's allowlist that holds the service's releases.
+    pub channel: String,
+    /// The helper that installs it, if not the agent's `--helper-socket`.
+    pub helper_socket: Option<PathBuf>,
+    pub drain: ServiceDrain,
+    pub health: ServiceHealth,
 }
 
 /// The frontend's loopback operator API and the credential for it.
@@ -198,7 +235,9 @@ fn secs(flag: &str, text: &str) -> Result<Duration, String> {
 /// # Errors
 /// What is wrong with them, in a line.
 pub fn parse_flags(args: &[String]) -> Result<Config, String> {
-    let mut found = collect(args, &FLAGS)?;
+    let (service_values, rest) = split_services(args);
+    let services = parse_services(&service_values)?;
+    let mut found = collect(&rest, &FLAGS)?;
     let mut take = |flag: &str| {
         found
             .remove(flag)
@@ -276,7 +315,119 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
         node_api,
         daemon_node,
         timing,
+        services,
     })
+}
+
+/// The values of the `--service` flags of `args` (the one flag that may be given more than once),
+/// and the arguments that are not them.
+fn split_services(args: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut values = Vec::new();
+    let mut rest = Vec::new();
+    let mut words = args.iter();
+    while let Some(word) = words.next() {
+        if let Some(value) = word.strip_prefix("--service=") {
+            values.push(value.to_owned());
+        } else if word == "--service" {
+            // A missing value is an empty one, which `parse_services` refuses.
+            values.push(words.next().cloned().unwrap_or_default());
+        } else {
+            rest.push(word.clone());
+        }
+    }
+    (values, rest)
+}
+
+/// The services the `--service` values name.
+fn parse_services(values: &[String]) -> Result<Vec<ServiceConfig>, String> {
+    let mut services: Vec<ServiceConfig> = Vec::new();
+    for value in values {
+        let service = parse_service(value)?;
+        if services.iter().any(|s| s.name == service.name) {
+            return Err(format!("--service {} is given twice", service.name));
+        }
+        services.push(service);
+    }
+    Ok(services)
+}
+
+/// One `--service` value: `NAME` and `,key=value` settings, each key at most once.
+fn parse_service(value: &str) -> Result<ServiceConfig, String> {
+    let mut parts = value.split(',');
+    let name = parts.next().unwrap_or_default();
+    if !is_service_name(name) || name == KBF_SERVICE {
+        return Err(format!(
+            "--service must start with a service name other than {KBF_SERVICE}: lowercase \
+             letters, digits and -, at most {MAX_SERVICE_NAME} bytes"
+        ));
+    }
+    let mut settings: BTreeMap<&str, &str> = BTreeMap::new();
+    for part in parts {
+        let (key, setting) = part
+            .split_once('=')
+            .ok_or_else(|| format!("--service {name}: {part:?} is not key=value"))?;
+        if settings.insert(key, setting).is_some() {
+            return Err(format!("--service {name}: {key} is given twice"));
+        }
+    }
+    let mut take = |key: &str| settings.remove(key);
+    let channel = take("channel").unwrap_or(name).to_owned();
+    if !channel_ok(&channel) {
+        return Err(format!(
+            "--service {name}: the channel must be a channel name ([a-z0-9][a-z0-9-]{{0,31}}); \
+             give one with channel="
+        ));
+    }
+    let helper_socket = take("helper-socket").map(PathBuf::from);
+    if helper_socket.as_deref().is_some_and(|p| !p.is_absolute()) {
+        return Err(format!(
+            "--service {name}: helper-socket must be an absolute path"
+        ));
+    }
+    let drain = match take("drain") {
+        None | Some("node") => ServiceDrain::Node,
+        Some("none") => ServiceDrain::None,
+        Some(_) => return Err(format!("--service {name}: drain is node or none")),
+    };
+    let health = match take("ready-url") {
+        None => ServiceHealth::Node,
+        Some(url) => {
+            let (addr, path) =
+                parse_ready_url(url).map_err(|why| format!("--service {name}: ready-url {why}"))?;
+            ServiceHealth::Ready { addr, path }
+        }
+    };
+    if let Some(key) = settings.keys().next() {
+        return Err(format!("--service {name}: unknown setting {key}"));
+    }
+    Ok(ServiceConfig {
+        name: name.to_owned(),
+        channel,
+        helper_socket,
+        drain,
+        health,
+    })
+}
+
+/// `http://<loopback ip>:<port>/<path>`: the address and the path (`/` when there is none).
+fn parse_ready_url(url: &str) -> Result<(SocketAddr, String), String> {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or("must start with http:// (the call travels in clear, on loopback)")?;
+    let (authority, path) = match rest.find('/') {
+        Some(at) => rest.split_at(at),
+        None => (rest, "/"),
+    };
+    let addr: SocketAddr = authority
+        .parse()
+        .map_err(|_| "must be http://<ip>:<port>/<path>, with an IP address")?;
+    if !addr.ip().to_canonical().is_loopback() {
+        return Err("must be a loopback address".to_owned());
+    }
+    if !path.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err("has a path with a space or a control character".to_owned());
+    }
+    Ok((addr, path.to_owned()))
 }
 
 /// The files of this host's TLS: those of `state_dir` (`kbf-updater enroll` made them), or the

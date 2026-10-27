@@ -156,6 +156,7 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
                   (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
                   [--frontend <dns name>:<port>] [--enroll-frontend <dns name>:<port>]
                   [--operator-api http://IP:PORT --token-file FILE] [--helper-socket PATH]
+                  [--service NAME[,SETTING=VALUE...]]...
                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
                   [--health-poll-secs N] [--retry-secs N]
 ```
@@ -195,6 +196,9 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
 - `--operator-api`, `--token-file`: optional, together: the full
   operator token over the frontend's loopback, an opt-in fallback used instead of the
   certificate; see the boundary below.
+- `--service NAME[,SETTING=VALUE...]`: a service the host runs besides `kbf`, given once for
+  each; see [Services besides kbf](#services-besides-kbf). Without it the agent is a
+  `kbf`-only agent.
 - Times, in seconds, 1 to 86400: `--heartbeat-secs` 15, `--drain-deadline-secs` 600,
   `--health-timeout-secs` 300, `--health-poll-secs` 5, `--retry-secs` 900.
 
@@ -267,6 +271,33 @@ The result goes in the next heartbeat. A restart of the agent in the middle find
 pending marker (`query`) and finishes the trial from step 4; nothing is fetched, drained or
 switched twice. A target that failed is not tried again before `--retry-secs`, however often
 the coordinator names it.
+
+### Services besides kbf
+
+An agent given `--service` also updates those services, with the same A/B (install, drain, switch,
+health, confirm or revert) run with the service's own ports. `NAME` is a service name (lowercase
+letters, digits and `-`, at most 64 bytes; not `kbf`), given once. The settings follow it, separated
+by commas, each at most once:
+
+| setting | meaning | default |
+|---|---|---|
+| `channel=C` | the channel of the helper's allowlist that holds the service's releases | `NAME` (it must be a channel name) |
+| `helper-socket=PATH` | the socket of the helper that installs it (absolute path) | `--helper-socket` |
+| `drain=node` or `drain=none` | `node`: the host's node is drained and given back through the frontend, as for `kbf`; `none`: nothing is drained, and no drain call is made | `node` |
+| `ready-url=http://IP:PORT/PATH` | health is `GET PATH` on that loopback address answering 2xx (the path is `/` if there is none) | the node's health through the frontend, as for `kbf` |
+
+A value holds no comma. `drain=node` and node health need `--frontend` (or the operator token), as
+`kbf` does; a service with `drain=none` and a `ready-url` needs neither. A readiness URL is checked
+for the service's word that it serves; it does not say which release answered.
+
+With no `--service`, the heartbeat is the one above with no `services` field and the reply is read
+as before. With any, the heartbeat also carries `services`: for each, its version, health, last
+update and the target of the update running now (`kbf` stays in the fields it always had), and the
+reply may name the service to update. The agent runs one A/B at a time on the host, whichever
+service it is for: an order that arrives meanwhile waits for the one running. A target that failed
+is left alone for `--retry-secs` per service: a failure of one does not hold back another. The
+agent's log lines for a service are led by its name. A restart in the middle of a service's trial
+finishes that trial first, as for `kbf`.
 
 ### Enrolling a host
 

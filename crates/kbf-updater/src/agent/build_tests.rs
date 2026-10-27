@@ -11,10 +11,10 @@ use kbf_types::HostRole;
 
 use super::build::{
     NO_CREDENTIAL, NoCredential, build, drain_for, frontend_ports, identity_of_files, run_agent,
-    run_config, unix_now,
+    run_config, service_ports, unix_now,
 };
 use super::coordinator::{Endpoint, TlsFiles};
-use super::flags::{Config, NodeApi, Timing};
+use super::flags::{Config, NodeApi, ServiceConfig, ServiceDrain, ServiceHealth, Timing};
 use super::local::{Limits, SocketLocal};
 use super::pki::{Pki, write_files};
 use super::run::Stop;
@@ -57,6 +57,7 @@ impl Rig {
                 heartbeat: Duration::from_millis(20),
                 ..Timing::DEFAULT
             },
+            services: Vec::new(),
         };
         Self { dir, pki, config }
     }
@@ -304,6 +305,7 @@ fn an_agent_with_a_state_directory_renews_what_it_was_enrolled_with() {
             heartbeat: Duration::from_millis(20),
             ..Timing::DEFAULT
         },
+        services: Vec::new(),
     };
     let agent = build(&config).expect("an agent");
     assert_eq!(agent.status().health, crate::wire::Health::Unhealthy);
@@ -359,4 +361,73 @@ fn a_frontend_hosts_agent_drains_a_node_only_when_the_host_runs_a_daemon() {
         let err = build(&other.config).err().unwrap();
         assert!(err.contains("--daemon-node"), "{role}: {err}");
     }
+}
+
+/// A service's ports are what its settings say: with a node drain and node health it drains and
+/// judges through the frontend as `kbf` does (here: an API nobody answers, so every call fails);
+/// with no drain its drain does nothing and cannot fail; with a readiness URL its health is that
+/// URL's. Its helper is its own socket if it gave one, else the agent's.
+#[test]
+fn a_services_ports_follow_its_settings() {
+    let rig = Rig::new("bd-service-ports", HostRole::Daemon);
+    let identity = identity_of_files(&rig.config.files).unwrap();
+    let h = host(Role::Daemon);
+    let target = Version::parse("0.1.7+gbbbbbbbbbbbb-3").unwrap();
+    let service = |drain, health, socket: Option<&str>| ServiceConfig {
+        name: "db".to_owned(),
+        channel: "db-ch".to_owned(),
+        helper_socket: socket.map(Into::into),
+        drain,
+        health,
+    };
+
+    let node = service_ports(
+        &rig.config,
+        &identity,
+        &h,
+        &service(ServiceDrain::Node, ServiceHealth::Node, None),
+    )
+    .unwrap();
+    assert_eq!((node.name.as_str(), node.channel.as_str()), ("db", "db-ch"));
+    assert!(node.drain.drain(&h, Duration::from_secs(1)).is_err());
+    assert!(node.health.check(&h, &target).is_err());
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut tcp, _) = listener.accept().unwrap();
+        let mut buf = [0_u8; 512];
+        let _ = tcp.read(&mut buf).unwrap();
+        tcp.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
+    });
+    let ready = service_ports(
+        &rig.config,
+        &identity,
+        &h,
+        &service(
+            ServiceDrain::None,
+            ServiceHealth::Ready {
+                addr,
+                path: "/readyz".to_owned(),
+            },
+            Some("/run/db.sock"),
+        ),
+    )
+    .unwrap();
+    assert_eq!(ready.drain.drain(&h, Duration::from_secs(1)), Ok(()));
+    assert_eq!(ready.drain.leases(&h), Ok(0));
+    assert_eq!(ready.drain.undrain(&h), Ok(()));
+    assert_eq!(
+        ready.health.check(&h, &target),
+        Ok(crate::ports::Health::Healthy)
+    );
+    server.join().unwrap();
+    // Its own helper does not exist, and the answer says so.
+    assert!(ready.local.query().is_err());
+
+    // The agent with services is built from the same flags.
+    let mut config = rig.config.clone();
+    config.services = vec![service(ServiceDrain::None, ServiceHealth::Node, None)];
+    assert!(build(&config).is_ok());
 }
