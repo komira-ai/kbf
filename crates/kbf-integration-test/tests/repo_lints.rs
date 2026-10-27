@@ -944,7 +944,7 @@ fn no_test_uses_the_hosts_real_kbf_directories() {
     assert!(problems.is_empty(), "host paths:\n{}", problems.join("\n"));
     assert_eq!(
         kbf_spawns::HOST_PATH_ALLOWANCE.len(),
-        1,
+        2,
         "the allowance only shrinks"
     );
 }

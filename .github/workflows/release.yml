@@ -434,11 +434,14 @@ jobs:
       - run: rustup toolchain install
       - name: Token file of the rehearsal, readable by its owner alone
         run: install -m 0600 /dev/null /var/tmp/kbf-update-rehearsal.token
-      - name: Token of the rehearsal, and the release it updates to
+      - name: Token of the rehearsal
         env:
           GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" > /var/tmp/kbf-update-rehearsal.token
+      - name: The release the rehearsal updates to
+        env:
           TAG: ${{ needs.plan.outputs.tag }}
-        run: printf '%s' "$GH_TOKEN" > /var/tmp/kbf-update-rehearsal.token && printf '%s\n' "$TAG" > /var/tmp/kbf-update-rehearsal.to
+        run: printf '%s\n' "$TAG" > /var/tmp/kbf-update-rehearsal.to
       - run: cargo xtask sudo-test -p kbf-host-install --test update_rehearsal -- --exact the_helper_updates_a_hand_laid_host_from_the_last_release_to_the_next --nocapture
 
   # The gamma stage, the last step of a release: tell the farm's update coordinator "desired =

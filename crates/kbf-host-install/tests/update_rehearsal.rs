@@ -59,6 +59,8 @@ const KBF_UNIT: &str = "kbf-rehearsal.service";
 /// The `--restart-unit` of the packaged helper unit, replaced by [`KBF_UNIT`].
 const PACKAGED_RESTART: &str = "--restart-unit kbf-daemon.service";
 const CHANNEL: &str = "stable";
+/// The channel's token file.
+const CHANNEL_TOKEN: &str = "/etc/kbf/host-install-github.token";
 /// Where the kbf unit's storage node listens.
 const STORAGE: &str = "127.0.0.1:8983";
 const UPDATER: &str = "kbf-updater";
@@ -198,6 +200,9 @@ impl Drop for Journal {
     fn drop(&mut self) {
         let mut cmd = Command::new("journalctl");
         cmd.args(["--no-pager", "-u", HELPER_UNIT, "-u", KBF_UNIT]);
+        if let Ok(out) = Command::new("ls").args(["-la", "/etc/kbf"]).output() {
+            capture("etc_kbf", &out);
+        }
         if let Ok(out) = cmd.output() {
             capture("journal", &out);
             if std::thread::panicking() {
@@ -413,9 +418,12 @@ fn the_helper_updates_a_hand_laid_host_from_the_last_release_to_the_next() {
             .arg(HELPER),
     );
     fs::create_dir_all("/etc/kbf").unwrap();
-    // The farm's nodes name their channel the same way, with no token.
+    // The farm's nodes name their channel the same way, without the token: a hosted runner's
+    // address shares GitHub's anonymous quota with other jobs, so the rehearsal's listing
+    // uses the run's read-only token.
+    install_file(&format!("{token}\n"), CHANNEL_TOKEN, 0o600);
     install_file(
-        &format!("[channels.{CHANNEL}]\nsource = \"github\"\n"),
+        &format!("[channels.{CHANNEL}]\nsource = \"github\"\ntoken_file = \"{CHANNEL_TOKEN}\"\n"),
         CHANNELS,
         0o644,
     );
