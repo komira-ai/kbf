@@ -235,15 +235,22 @@ async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
     // What the lease looked like each second, for the failure message.
     let lease = cell.cgroup.join(cell.name(1));
     let mut seen = Vec::new();
+    let mut last_key = String::new();
     let outcome = loop {
         tokio::select! {
             outcome = &mut first => break outcome.expect("join"),
-            () = tokio::time::sleep(Duration::from_secs(1)) => {
-                seen.push(format!("{:?}: {}", started.elapsed(), state(&lease)));
+            () = tokio::time::sleep(Duration::from_millis(50)) => {
+                let now = state(&lease);
+                let key = now.split("memory.current").nth(1).map(|s| s.split_once(',').map_or(String::new(), |x| x.1.to_owned())).unwrap_or_default();
+                if key != last_key {
+                    seen.push(format!("{:?}: {}", started.elapsed(), now));
+                    last_key = key;
+                }
             }
         }
     };
     let took = started.elapsed();
+    println!("TRACE\n{}", seen.join("\n"));
     assert_swap_kill(
         &outcome,
         &logs.text(),
