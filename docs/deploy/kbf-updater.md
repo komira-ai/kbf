@@ -400,8 +400,13 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    (`baseline: hosts live before the deploy: storage 3, frontend 2`). A 503 on this read is tried
    again like the POST. A coordinator that has just restarted (the table says so) may not have
    heard from every host yet; a host it hears from later counts as one that joined;
-2. posts `{"version": <the release's version>, "min_up": {...}}` to `/v1/desired` (the per-role
-   limits are the coordinator's defaults), with an OIDC token for the audience that is the URL as
+2. posts `{"version": <the release's version>, "min_up": {...}}` to `/v1/desired`, where the
+   version is `--version` (the plain semver, with no `+`; a version with build metadata is refused)
+   followed by `+g` and the first 12 digits of `--commit` (the 40 lower-case hex digits of the
+   released commit; anything else is refused before the first request), as in `0.0.13+g0123456789ab`.
+   The hosts' helpers read the commit they stage out of that text, and a host reports the same text
+   back once it runs the release, which is what the step compares. The per-role limits are the
+   coordinator's defaults. The call carries an OIDC token for the audience that is the URL as
    written in the variable (the audience keeps a trailing `/` the variable has, which the URL
    the calls go to does not, so write the variable and the allow-list's `audience` alike). A 503
    on the POST is tried again, up to four times;

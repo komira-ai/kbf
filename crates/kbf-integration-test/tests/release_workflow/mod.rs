@@ -1052,6 +1052,8 @@ fn gamma_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     flag_is(&words, verb, "--url", "$COORDINATOR_URL", out);
     flag_is(&words, verb, "--ca-pem", "$COORDINATOR_CA", out);
     flag_is(&words, verb, "--version", "$VERSION", out);
+    // The hosts' helpers read the commit out of the desired version text.
+    flag_is(&words, verb, "--commit", "$COMMIT", out);
     env_is(
         job,
         step,

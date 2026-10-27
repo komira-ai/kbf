@@ -1398,6 +1398,14 @@ fn gamma_reads_the_coordinators_address_from_the_variable_alone() {
         "not given `--version $VERSION`",
     );
     red(
+        &plant("gamma", " --commit \"$COMMIT\"", ""),
+        "not given `--commit $COMMIT`",
+    );
+    red(
+        &plant("gamma", "--commit \"$COMMIT\"", "--commit \"$VERSION\""),
+        "not given `--commit $COMMIT`",
+    );
+    red(
         &plant(
             "gamma",
             "VERSION: ${{ needs.plan.outputs.version }}",

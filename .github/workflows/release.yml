@@ -464,7 +464,7 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
           MIN_UP_STORAGE: ${{ vars.KBF_MIN_UP_STORAGE || '1' }}
           MIN_UP_FRONTEND: ${{ vars.KBF_MIN_UP_FRONTEND || '1' }}
-        run: cargo xtask deploy-farm --url "$COORDINATOR_URL" --ca-pem "$COORDINATOR_CA" --version "$VERSION" --min-up-storage "$MIN_UP_STORAGE" --min-up-frontend "$MIN_UP_FRONTEND"
+        run: cargo xtask deploy-farm --url "$COORDINATOR_URL" --ca-pem "$COORDINATOR_CA" --version "$VERSION" --commit "$COMMIT" --min-up-storage "$MIN_UP_STORAGE" --min-up-frontend "$MIN_UP_FRONTEND"
       # The proof. The farm now runs this release; build a small project (four `/bin/sh -c`
       # actions that depend on each other) against it with remote execution on and local off, and
       # read Buck2's own count of the actions it ran: some remote, none local. The run id and

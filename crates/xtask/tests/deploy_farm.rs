@@ -19,6 +19,10 @@ use xtask::deploy_farm::{
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const RUNNER_KEY: &str = "runner-key";
 
+/// A released commit, and the version text the verb makes of `--version 2.0` and it.
+const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+const DESIRED: &str = "2.0+g0123456789ab";
+
 /// One request the fake saw.
 #[derive(Clone, Debug)]
 struct Seen {
@@ -834,6 +838,8 @@ fn args_for(fake: &Fake, ca_pem: &str) -> Args {
         &fake.base,
         "--version",
         "2.0",
+        "--commit",
+        COMMIT,
         "--ca-pem",
         ca_pem,
         "--every-secs",
@@ -847,13 +853,18 @@ fn the_verb_trusts_the_system_roots_or_the_ca_it_is_given() {
     // Proves: with no `--ca-pem` the coordinator is trusted by the system roots given; with one
     // it is trusted by that CA instead (a CA that did not sign its certificate refuses it
     // though the system roots would have trusted it), and the verb's line says what converged.
-    let fake = serve(Script::new(vec![Ok(farm("converged", 0, 0))]));
+    let mut at_release = farm("converged", 0, 0);
+    at_release["desired"] = json!(DESIRED);
+    let fake = serve(Script::new(vec![Ok(at_release)]));
     let system = [fake.ca.clone()];
     let mut out = Vec::new();
     let lines = run_with(&args_for(&fake, ""), &fake.service(), &system, &mut out).expect("run");
     assert_eq!(
         lines,
-        [format!("ok: every live host runs 2.0 ({})", fake.base)]
+        [format!(
+            "ok: every live host runs {DESIRED} ({})",
+            fake.base
+        )]
     );
     let lines = run_with(
         &args_for(&fake, &fake.ca_pem),
@@ -976,7 +987,15 @@ fn the_verb_with_an_empty_url_prints_a_notice_and_exits_0() {
     // nothing and passes, with a notice the log shows.
     for url in ["", "  "] {
         let output = Command::new(XTASK)
-            .args(["deploy-farm", "--url", url, "--version", "2.0"])
+            .args([
+                "deploy-farm",
+                "--url",
+                url,
+                "--version",
+                "2.0",
+                "--commit",
+                COMMIT,
+            ])
             .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
             .output()
             .expect("run");
@@ -1000,6 +1019,8 @@ fn the_verb_with_an_address_and_no_token_service_fails_and_names_the_permission(
             "https://127.0.0.1:9",
             "--version",
             "2.0",
+            "--commit",
+            COMMIT,
         ])
         .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
         .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
@@ -1014,6 +1035,8 @@ fn the_verb_with_an_address_and_no_token_service_fails_and_names_the_permission(
             "u",
             "--version",
             "2.0",
+            "--commit",
+            COMMIT,
             "--deadline-min",
             "0",
         ])
@@ -1033,6 +1056,8 @@ fn the_verb_with_a_ca_that_is_no_pem_fails_before_any_call() {
             "https://127.0.0.1:9",
             "--version",
             "2.0",
+            "--commit",
+            COMMIT,
             "--ca-pem",
             "junk",
         ])
@@ -1054,14 +1079,155 @@ fn the_plan_of_the_flags_is_in_seconds_and_defaults_the_audience_to_the_address(
         #[command(flatten)]
         args: xtask::deploy_farm::Args,
     }
-    let cli = Cli::parse_from(["x", "--url", "https://c.example:8443/", "--version", "2.0"]);
-    let plan = Plan::of(&cli.args);
+    let cli = Cli::parse_from([
+        "x",
+        "--url",
+        "https://c.example:8443/",
+        "--version",
+        "2.0",
+        "--commit",
+        COMMIT,
+    ]);
+    let plan = Plan::of(&cli.args).expect("plan");
     assert_eq!(plan.url, "https://c.example:8443");
     assert_eq!(plan.audience, "https://c.example:8443/");
     assert_eq!(plan.deadline, Duration::from_secs(3600));
     assert_eq!(plan.stall, Duration::from_secs(1200));
     assert_eq!(plan.every, Duration::from_secs(30));
     assert_eq!((plan.min_up_storage, plan.min_up_frontend), (1, 1));
-    let cli = Cli::parse_from(["x", "--url", "u", "--version", "2.0", "--audience", "aud"]);
-    assert_eq!(Plan::of(&cli.args).audience, "aud");
+    let cli = Cli::parse_from([
+        "x",
+        "--url",
+        "u",
+        "--version",
+        "2.0",
+        "--commit",
+        COMMIT,
+        "--audience",
+        "aud",
+    ]);
+    assert_eq!(Plan::of(&cli.args).expect("plan").audience, "aud");
+}
+
+/// The version text as a host's helper reads the commit out of it (its grammar: after the
+/// last `+`, an optional `g`, exactly 12 lower-case hex digits, then the end or `-<revision>`).
+/// `kbf-host-install` and `kbf-updater` own the real parsers; this crate does not depend on
+/// them (the updater's closure is the daemon, tokio included), so the shape is asserted here.
+fn helper_commit(version: &str) -> Option<&str> {
+    let (_, build) = version.rsplit_once('+')?;
+    let after = build.strip_prefix('g').unwrap_or(build);
+    let (prefix, rest) = after.split_at_checked(12)?;
+    let hex = prefix
+        .bytes()
+        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    (hex && (rest.is_empty() || rest.starts_with('-'))).then_some(prefix)
+}
+
+fn parse_args(flags: &[&str]) -> Result<Args, clap::Error> {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: Args,
+    }
+    let mut all = vec!["x", "--url", "https://c.example:8443"];
+    all.extend_from_slice(flags);
+    Cli::try_parse_from(all).map(|cli| cli.args)
+}
+
+#[test]
+fn the_posted_version_is_the_semver_plus_g_and_twelve_digits_of_the_commit() {
+    // Proves: the body of the POST holds `<version>+g<first 12 of --commit>`, the farm's
+    // answer is compared with that text, and the 12 digits are the ones a helper reads as the
+    // commit (a plain semver is refused by every host path, so it could never converge).
+    let mut at_release = farm("converged", 0, 0);
+    at_release["desired"] = json!(DESIRED);
+    let fake = serve(Script::new(vec![Ok(at_release)]));
+    let args = args_for(&fake, "");
+    let plan = Plan::of(&args).expect("plan");
+    assert_eq!(plan.version, DESIRED);
+    assert_eq!(helper_commit(&plan.version), Some(&COMMIT[..12]));
+    let (result, out) = run(&fake, &plan);
+    assert_eq!(result, Ok(()), "{out}");
+    let posts = fake.requests("/v1/desired");
+    assert_eq!(posts.len(), 1);
+    let body: Value = serde_json::from_str(&posts[0].body).expect("json");
+    assert_eq!(body["version"], json!(DESIRED));
+}
+
+#[test]
+fn a_commit_that_is_not_forty_lower_case_hex_digits_is_refused_before_any_request() {
+    // Catches: a short commit, an upper-case one, a non-hex one, an over-long one and an empty
+    // one accepted (the version would carry digits no host matches), and a refusal that comes
+    // after the first call.
+    let fake = serve(Script::new(vec![Ok(farm("converged", 0, 0))]));
+    for bad in [
+        "0123456789ab",
+        &COMMIT.to_uppercase(),
+        "0123456789abcdef0123456789abcdef0123456g",
+        &format!("{COMMIT}0"),
+        "",
+    ] {
+        let args = parse_args(&["--version", "2.0", "--commit", bad]).expect("parses");
+        assert_eq!(
+            Plan::of(&args).map(|p| p.version),
+            Err(Error::Commit(bad.to_owned()))
+        );
+        let service = fake.service();
+        let system = [fake.ca.clone()];
+        let mut out = Vec::new();
+        let mut args = args_for(&fake, "");
+        args.commit = bad.to_owned();
+        let refused = run_with(&args, &service, &system, &mut out);
+        let Err(xtask::Error::Failed(why)) = refused else {
+            panic!("{bad:?} was accepted: {refused:?}");
+        };
+        assert!(why.contains("is not a full commit"), "{why}");
+    }
+    let seen = fake.seen.lock().expect("lock").len();
+    assert_eq!(seen, 0, "a request was sent for a refused commit");
+}
+
+#[test]
+fn a_run_without_commit_is_a_usage_error() {
+    // Catches: `--commit` optional (a plain semver posted again).
+    let output = Command::new(XTASK)
+        .args([
+            "deploy-farm",
+            "--url",
+            "https://127.0.0.1:9",
+            "--version",
+            "2.0",
+        ])
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--commit"));
+}
+
+#[test]
+fn a_version_that_already_carries_build_metadata_is_refused_before_any_request() {
+    // Catches: `--version 2.0+gabc...` accepted (two `+` or a commit that differs from
+    // `--commit`).
+    let fake = serve(Script::new(vec![Ok(farm("converged", 0, 0))]));
+    for bad in ["2.0+g0123456789ab", "2.0+x", "2.0-rc.1+build"] {
+        let mut args = args_for(&fake, "");
+        args.version = bad.to_owned();
+        assert_eq!(
+            Plan::of(&args).map(|p| p.version),
+            Err(Error::Metadata(bad.to_owned()))
+        );
+        let mut out = Vec::new();
+        let refused = run_with(
+            &args,
+            &fake.service(),
+            std::slice::from_ref(&fake.ca),
+            &mut out,
+        );
+        let Err(xtask::Error::Failed(why)) = refused else {
+            panic!("{bad:?} was accepted: {refused:?}");
+        };
+        assert!(why.contains("carries build metadata"), "{why}");
+    }
+    assert_eq!(fake.seen.lock().expect("lock").len(), 0);
 }

@@ -72,6 +72,10 @@ const CONVERGENCE_PATH: &str = "/v1/convergence";
 const TOKEN_URL_VAR: &str = "ACTIONS_ID_TOKEN_REQUEST_URL";
 const TOKEN_KEY_VAR: &str = "ACTIONS_ID_TOKEN_REQUEST_TOKEN";
 
+/// The digits of a full commit, and how many of them the version text carries.
+const COMMIT_LEN: usize = 40;
+const PREFIX_LEN: usize = 12;
+
 /// The flags of the verb.
 #[derive(Debug, ClapArgs)]
 pub struct Args {
@@ -79,9 +83,14 @@ pub struct Args {
     /// deploy nothing.
     #[arg(long)]
     pub url: String,
-    /// The release's version text (what the hosts' heartbeats report once they run it).
+    /// The release's semantic version, without build metadata (`0.0.13`). The version the
+    /// farm is told to run is this, `+g`, and the first 12 digits of `--commit`.
     #[arg(long)]
     pub version: String,
+    /// The released commit, 40 lower-case hex digits. The hosts' helpers read the commit they
+    /// stage from the version text, so the desired version must carry it.
+    #[arg(long)]
+    pub commit: String,
     /// The farm CA certificate (PEM text) the coordinator's certificate must chain to, instead
     /// of the system store's roots. Empty: the system store.
     #[arg(long, default_value = "", allow_hyphen_values = true)]
@@ -113,6 +122,12 @@ pub enum Error {
         "{TOKEN_URL_VAR} or {TOKEN_KEY_VAR} is not set: the job needs `permissions: id-token: write`"
     )]
     NoTokenService,
+    #[error("--commit {0:?} is not a full commit (40 lower-case hex digits)")]
+    Commit(String),
+    #[error(
+        "--version {0:?} carries build metadata (`+`): pass the plain version, the commit is added from --commit"
+    )]
+    Metadata(String),
     #[error("--ca-pem holds no certificate")]
     Ca,
     #[error("the URL must be https://<host>[:port] with no path, got {0:?}")]
@@ -163,19 +178,34 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The plan of `args`.
-    #[must_use]
-    pub fn of(args: &Args) -> Self {
-        Self {
+    /// The plan of `args`: the desired version is `<version>+g<first 12 digits of commit>`,
+    /// the form the hosts' helpers stage and report back.
+    ///
+    /// # Errors
+    /// [`Error::Commit`] when `--commit` is not 40 lower-case hex digits, [`Error::Metadata`]
+    /// when `--version` already holds a `+`.
+    pub fn of(args: &Args) -> Result<Self, Error> {
+        let commit = args.commit.as_str();
+        if commit.len() != COMMIT_LEN
+            || !commit
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(Error::Commit(args.commit.clone()));
+        }
+        if args.version.contains('+') {
+            return Err(Error::Metadata(args.version.clone()));
+        }
+        Ok(Self {
             url: args.url.trim_end_matches('/').to_owned(),
             audience: args.audience.clone().unwrap_or_else(|| args.url.clone()),
-            version: args.version.clone(),
+            version: format!("{}+g{}", args.version, &commit[..PREFIX_LEN]),
             min_up_storage: args.min_up_storage,
             min_up_frontend: args.min_up_frontend,
             deadline: Duration::from_secs(args.deadline_min * 60),
             stall: Duration::from_secs(args.stall_min * 60),
             every: Duration::from_secs(args.every_secs),
-        }
+        })
     }
 }
 
@@ -238,7 +268,7 @@ pub fn run_with(
     host: &[CertificateDer<'static>],
     out: &mut impl Write,
 ) -> Result<Vec<String>, crate::Error> {
-    let plan = Plan::of(args);
+    let plan = Plan::of(args).map_err(failed)?;
     let pinned;
     let roots = Roots {
         runner: host,
