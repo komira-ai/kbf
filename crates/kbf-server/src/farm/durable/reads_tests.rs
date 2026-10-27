@@ -7,12 +7,12 @@ use std::time::Duration;
 use super::blocks_tests::{Racing, farm_over};
 use super::intake_tests::{Inbox, caller, register};
 use super::*;
-use crate::farm::NodeAction;
+use crate::farm::{NodeAction, NodeUnread};
 use crate::fleet::{NodeDetail, PlacementView};
 
-/// The answer of `GET /v1/nodes/{id}` on `farm`.
+/// The answer of `GET /v1/nodes/{id}` on `farm`, whose store can be read.
 fn detail(farm: &Farm, node: &WorkerId) -> Option<NodeDetail> {
-    farm.node_detail(node)
+    farm.node_detail(node).expect("the store can be read")
 }
 
 /// Two frontends over one store, and a node connected to the second (`own`) that the first
@@ -113,6 +113,20 @@ async fn a_frontend_the_node_is_not_connected_to_follows_its_cordon_row() {
         .expect("the store knows the node");
     let cordoned = detail(through, node).expect("the store knows the node");
     assert_eq!(cordoned.node.placement, PlacementView::Cordoned);
+}
+
+/// Asserts that a read of a node another frontend holds is an error when the store's lease
+/// rows cannot be read, not the node with no lease. Catches: an updater that switches its node
+/// because a failed read said nothing runs on it.
+#[tokio::test(start_paused = true)]
+async fn a_node_another_frontend_holds_is_unreadable_when_its_leases_cannot_be_read() {
+    let store = Racing::new();
+    let drained = drained_through_the_other_frontend(&store, true);
+    store.fail_reads(Some("lease/"));
+
+    let read = drained.through.node_detail(&drained.node);
+
+    assert_eq!(read, Err(NodeUnread("node-b".to_owned())));
 }
 
 /// Asserts that a node no frontend of the store has held is not found, on a frontend with a

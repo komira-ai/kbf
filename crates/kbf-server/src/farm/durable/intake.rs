@@ -557,6 +557,20 @@ impl State {
         }
     }
 
+    /// Applies the `cordon/` rows as the store holds them now, as an intake poll does: a read
+    /// of a node then shows a cordon or drain another frontend wrote without waiting for the
+    /// next poll. A store that cannot be read leaves the nodes as they are.
+    pub(in crate::farm) fn take_cordons(&mut self, now: FarmTime) {
+        let mut read = None;
+        self.durably("a cordon look", |d| {
+            read = Some((d.cordons()?, d.store_ms()));
+            Ok(())
+        });
+        if let Some((rows, at)) = read {
+            self.apply_cordons(now, rows.into_iter().collect(), at);
+        }
+    }
+
     /// Puts `worker` back in the drain its `cordon/` row says, if the drain ended for want of
     /// a lease. A start takes up no leased operation, so a drain taken up at the start finds
     /// its node holding no lease and ends; the node's leases are taken up when it says
