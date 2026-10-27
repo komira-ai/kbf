@@ -10,7 +10,8 @@
 //! (a guest that is still up then is asked to shut down and, if it does not within
 //! `--shutdown-secs`, stopped by force; the run is a timeout either way), and prints one JSON
 //! object: each step with its status, exit code, time and output tail, the summary, how the
-//! guest ended, and what to run next. A clone of the base made afterwards boots into the
+//! guest ended, the counts of the guest's log audit (does its log hold the generated
+//! password; `kbf_guest::mkuser_audit`; informational, it never changes the verdict), and what to run next. A clone of the base made afterwards boots into the
 //! user's session.
 //!
 //! Run on a base whose user is ready already, the guest says so and stays up; the host then
@@ -26,6 +27,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use kbf_guest::mkuser::{FRAME_PREFIX, MkUserSummary, SHUTDOWN_NAME, SUMMARY_NAME};
+use kbf_guest::mkuser_audit::{AUDIT_NAME, AuditFrame};
 use kbf_guest::sim::{Status, StepFrame};
 use serde_json::{Value, json};
 
@@ -53,6 +55,8 @@ struct Received {
     summary: Option<MkUserSummary>,
     /// The frame the guest sends when its power-off command did not work.
     shutdown: Option<StepFrame>,
+    /// The log audit: counts of the password in the guest's log, and how the audit ended.
+    audit: Option<AuditFrame>,
     /// Frames that were there and could not be read: name and why.
     unreadable: Vec<(String, String)>,
     /// Names already read: a frame is made whole by a rename, so it is read once.
@@ -76,6 +80,8 @@ impl Received {
             };
             let parsed = if name == SUMMARY_NAME {
                 serde_json::from_str(&text).map(|s| self.summary = Some(s))
+            } else if name == AUDIT_NAME {
+                serde_json::from_str(&text).map(|f| self.audit = Some(f))
             } else if name == SHUTDOWN_NAME {
                 serde_json::from_str(&text).map(|f| self.shutdown = Some(f))
             } else {
@@ -233,6 +239,8 @@ fn details(
         "problems": received.problems(),
         "steps": received.steps.values().map(|f| serde_json::to_value(f).unwrap_or(Value::Null)).collect::<Vec<_>>(),
         "shutdown_frame": received.shutdown,
+        "log_audit": received.audit,
+        "log_audit_received": received.audit.is_some(),
         "unreadable_frames": received.unreadable.iter().map(|(n, e)| json!({"frame": n, "error": e})).collect::<Vec<_>>(),
         "stop": stop,
         "trace": vm.trace_json(),

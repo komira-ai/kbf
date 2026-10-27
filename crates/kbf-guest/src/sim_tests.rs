@@ -1267,6 +1267,143 @@ fn output_past_the_capture_cap_is_dropped_and_flagged() {
     assert_eq!((out.stdout.len(), out.cut), (MAX_CAPTURE_BYTES, true));
 }
 
+fn streamed(r: &ProcessRunner<Manual>, a: &[&str]) -> (crate::sim::Streamed, Vec<u8>) {
+    let mut got = Vec::new();
+    let s = r.stream(&argv(a), LONG, &mut |c| got.extend_from_slice(c));
+    (s, got)
+}
+
+/// Catches a streaming runner that loses or keeps output, delivers the stderr, reports a
+/// non-zero exit as success, ignores the environment, or lets a missing program pass.
+#[test]
+fn the_streaming_runner_hands_stdout_to_the_sink_and_discards_stderr() {
+    let r = runner();
+    let (s, got) = streamed(&r, &["/bin/echo", "hello"]);
+    assert_eq!((s.ended, got), (Ended::Exited(0), b"hello\n".to_vec()));
+    // The stderr of a failing command is never delivered.
+    let (s, got) = streamed(&r, &["/bin/ls", "/nonexistent/dir"]);
+    assert!(matches!(s.ended, Ended::Exited(n) if n != 0));
+    assert!(got.is_empty());
+    assert_eq!(streamed(&r, &["/usr/bin/false"]).0.ended, Ended::Exited(1));
+    let (_, env) = streamed(&r, &["/usr/bin/env"]);
+    assert!(
+        String::from_utf8_lossy(&env)
+            .lines()
+            .any(|l| l == "KBF_SIM_TEST=yes")
+    );
+    let (s, _) = streamed(&r, &["/nonexistent/program"]);
+    assert!(matches!(&s.ended, Ended::SpawnFailed(m) if m.contains("/nonexistent/program")));
+    assert!(matches!(streamed(&r, &[]).0.ended, Ended::SpawnFailed(_)));
+}
+
+/// Catches a stream that stops at the capture cap (a log is far larger than a captured
+/// tail and the audit must see all of it).
+#[test]
+fn the_stream_is_not_capped_like_a_capture() {
+    let r = runner();
+    let n = MAX_CAPTURE_BYTES + 12_345;
+    let (s, got) = streamed(&r, &["/usr/bin/head", "-c", &n.to_string(), "/dev/zero"]);
+    assert_eq!(s.ended, Ended::Exited(0));
+    assert_eq!(got.len(), n);
+}
+
+/// Catches a stream that waits for a command for ever, and a deadline that ends only the
+/// command it started: the command here starts a minute-long sleep of its own and waits for
+/// it; once the deadline passes and the stream reports a timeout, that sleep must be gone.
+#[test]
+fn a_streamed_command_at_its_deadline_is_killed_with_what_it_started() {
+    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-guest-stream-group");
+    let pid_file = dir.join("grandchild.pid");
+    let r = ProcessRunner::new(
+        AfterReady {
+            time: Cell::new(0),
+            ready: pid_file.clone(),
+        },
+        vec![(
+            "KBF_SIM_GROUP_PIDFILE".into(),
+            pid_file.display().to_string(),
+        )],
+    );
+    let me = std::env::current_exe().expect("test binary");
+    let s = r.stream(
+        &argv(&[
+            me.to_str().expect("utf-8 path"),
+            "--exact",
+            "sim_tests::group_test_helper_starts_a_sleep_and_waits",
+            "--test-threads=1",
+        ]),
+        Duration::from_secs(5),
+        &mut |_| {},
+    );
+    assert_eq!(s.ended, Ended::TimedOut);
+    assert!(s.ms >= 5000, "{}", s.ms);
+    let pid = std::fs::read_to_string(&pid_file)
+        .expect("pid")
+        .trim()
+        .to_owned();
+    let mut running = true;
+    for _ in 0..3_000 {
+        running = is_running(&pid);
+        if !running {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    if running {
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-9", &pid])
+            .status();
+    }
+    assert!(!running, "the grandchild {pid} outlived the deadline");
+}
+
+/// A clock that holds time still until the sink has been handed a megabyte, then moves it
+/// forward at once like [`Manual`]: the deadline can pass only after output was flowing.
+struct AfterBytes {
+    time: Cell<u64>,
+    seen: std::rc::Rc<Cell<usize>>,
+}
+
+impl Clock for AfterBytes {
+    fn now_ms(&self) -> u64 {
+        self.time.get()
+    }
+    fn sleep(&self, d: Duration) {
+        if self.seen.get() >= 1 << 20 {
+            self.time
+                .set(self.time.get() + u64::try_from(d.as_millis()).expect("ms"));
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// Catches a deadline that is looked at only when the sink has caught up: `yes` writes
+/// without end, faster than the sink counts, and the stream must still end in a timeout.
+/// (Without the bound on reads per turn the clock is never consulted while output flows,
+/// and this test does not end.)
+#[test]
+fn a_command_writing_faster_than_the_sink_still_meets_its_deadline() {
+    let seen = std::rc::Rc::new(Cell::new(0usize));
+    let r = ProcessRunner::new(
+        AfterBytes {
+            time: Cell::new(0),
+            seen: std::rc::Rc::clone(&seen),
+        },
+        Vec::new(),
+    );
+    // A sink that does real work per read, so that it is slower than the producer.
+    let s = r.stream(&argv(&["/usr/bin/yes"]), Duration::from_secs(1), &mut |c| {
+        for _ in 0..16 {
+            std::hint::black_box(c.iter().fold(0u8, |a, b| a ^ b));
+        }
+        seen.set(seen.get() + c.len());
+    });
+    assert_eq!(s.ended, Ended::TimedOut);
+    assert!(s.ms >= 1000, "{}", s.ms);
+    assert!(seen.get() >= 1 << 20);
+}
+
 /// Catches a screenshot read that follows a link, reads a directory or a larger file, or
 /// refuses one exactly at the cap.
 #[test]

@@ -10,14 +10,14 @@ use clap::Parser;
 
 use crate::frame::{Frame, SendError};
 use crate::mkuser::*;
-use crate::sim::{Ended, Outcome, Status, StepFrame};
+use crate::sim::{Ended, Outcome, Status, StepFrame, Streamed};
 use crate::simpaths;
 
 const RANDOM: [u8; 11] = [
     0x00, 0x01, 0x0a, 0x0f, 0x10, 0x7f, 0x80, 0xab, 0xcd, 0xef, 0xff,
 ];
 /// `RANDOM` as the password: lowercase hex.
-const PASSWORD: &str = "00010a0f107f80abcdefff";
+pub(crate) const PASSWORD: &str = "00010a0f107f80abcdefff";
 /// The hardware UUID the fake `ioreg` names.
 const UUID: &str = "1A2B3C4D-0000-4EEF-8123-ABCDEF012345";
 
@@ -28,35 +28,44 @@ fn ioreg_text(uuid: &str) -> String {
     )
 }
 
+/// A scripted streamed command: text its command line contains, how it ends, its stdout
+/// in the reads it arrives in.
+pub(crate) type StreamScript = (String, Ended, Vec<Vec<u8>>);
+
 /// What the host was asked, in the order it was asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Call {
+pub(crate) enum Call {
     Random(usize),
     Run(Vec<String>),
     Write(String, Vec<u8>, u32),
     /// `(path, user, mode, file)`
     Give(String, String, u32, bool),
     Send(String),
+    /// A streamed command (the log audit's).
+    Stream(Vec<String>),
 }
 
-struct Fake {
-    root: bool,
-    exists: bool,
-    ready: Option<String>,
-    random: Result<Vec<u8>, String>,
+pub(crate) struct Fake {
+    pub(crate) root: bool,
+    pub(crate) exists: bool,
+    pub(crate) ready: Option<String>,
+    pub(crate) random: Result<Vec<u8>, String>,
     /// `(text the command line contains, outcome)`; the first match answers, else exit 0.
-    answers: RefCell<Vec<(String, Outcome)>>,
+    pub(crate) answers: RefCell<Vec<(String, Outcome)>>,
     /// Paths whose write fails.
-    write_fails: Option<String>,
+    pub(crate) write_fails: Option<String>,
     /// Paths that cannot be given to the user.
-    give_fails: Option<String>,
-    calls: RefCell<Vec<Call>>,
-    sent: RefCell<Vec<Frame>>,
-    down: bool,
-    pauses: Cell<u32>,
+    pub(crate) give_fails: Option<String>,
+    pub(crate) calls: RefCell<Vec<Call>>,
+    pub(crate) sent: RefCell<Vec<Frame>>,
+    pub(crate) down: bool,
+    pub(crate) pauses: Cell<u32>,
+    /// `(text the command line contains, ended, stdout chunks)`; the first match answers,
+    /// else exit 0 and no output.
+    pub(crate) streams: RefCell<Vec<StreamScript>>,
 }
 
-fn out(ended: Ended, stdout: &str, stderr: &str) -> Outcome {
+pub(crate) fn out(ended: Ended, stdout: &str, stderr: &str) -> Outcome {
     Outcome {
         ended,
         stdout: stdout.as_bytes().to_vec(),
@@ -67,7 +76,7 @@ fn out(ended: Ended, stdout: &str, stderr: &str) -> Outcome {
 }
 
 impl Fake {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             root: true,
             exists: false,
@@ -80,14 +89,15 @@ impl Fake {
             sent: RefCell::new(Vec::new()),
             down: false,
             pauses: Cell::new(0),
+            streams: RefCell::new(Vec::new()),
         }
     }
 
-    fn answer(&self, text: &str, o: Outcome) {
+    pub(crate) fn answer(&self, text: &str, o: Outcome) {
         self.answers.borrow_mut().push((text.to_owned(), o));
     }
 
-    fn commands(&self) -> Vec<String> {
+    pub(crate) fn commands(&self) -> Vec<String> {
         self.calls
             .borrow()
             .iter()
@@ -98,7 +108,7 @@ impl Fake {
             .collect()
     }
 
-    fn writes(&self) -> Vec<(String, Vec<u8>, u32)> {
+    pub(crate) fn writes(&self) -> Vec<(String, Vec<u8>, u32)> {
         self.calls
             .borrow()
             .iter()
@@ -109,7 +119,7 @@ impl Fake {
             .collect()
     }
 
-    fn step_frames(&self) -> Vec<StepFrame> {
+    pub(crate) fn step_frames(&self) -> Vec<StepFrame> {
         self.sent
             .borrow()
             .iter()
@@ -118,7 +128,7 @@ impl Fake {
             .collect()
     }
 
-    fn summary(&self) -> MkUserSummary {
+    pub(crate) fn summary(&self) -> MkUserSummary {
         let sent = self.sent.borrow();
         let f = sent
             .iter()
@@ -176,6 +186,24 @@ impl MkUserHost for Fake {
             .find(|(text, _)| line.contains(text.as_str()))
             .map_or(default, |(_, o)| o.clone())
     }
+    fn stream(
+        &self,
+        argv: &[String],
+        _deadline: Duration,
+        sink: &mut dyn FnMut(&[u8]),
+    ) -> Streamed {
+        self.calls.borrow_mut().push(Call::Stream(argv.to_vec()));
+        let line = argv.join(" ");
+        let scripted = self
+            .streams
+            .borrow()
+            .iter()
+            .find(|(text, _, _)| line.contains(text.as_str()))
+            .cloned();
+        let (ended, chunks) = scripted.map_or((Ended::Exited(0), Vec::new()), |(_, e, c)| (e, c));
+        chunks.iter().for_each(|c| sink(c));
+        Streamed { ended, ms: 7 }
+    }
     fn send(&self, _port: u32, frame: &Frame) -> Result<(), SendError> {
         self.calls.borrow_mut().push(Call::Send(frame.name.clone()));
         if self.down {
@@ -204,7 +232,7 @@ fn args(extra: &[&str]) -> MkUserArgs {
     .a
 }
 
-fn go(host: &Fake) -> Finished {
+pub(crate) fn go(host: &Fake) -> Finished {
     run(host, &Config::from(&args(&[])), "kbfuser", &mut Vec::new())
 }
 
@@ -801,7 +829,7 @@ fn frames_that_cannot_be_delivered_are_listed_and_the_run_still_ends() {
     let done = go(&host);
     assert!(done.summary.ok, "the steps themselves worked");
     assert_eq!(done.power_off_started, Some(true));
-    assert_eq!(done.summary.undelivered.len(), 17);
+    assert_eq!(done.summary.undelivered.len(), 18);
     assert_eq!(
         done.summary.undelivered.last().map(String::as_str),
         Some(SUMMARY_NAME)
@@ -815,7 +843,11 @@ fn frames_that_cannot_be_delivered_are_listed_and_the_run_still_ends() {
 /// sized from it.
 #[test]
 fn every_frame_name_is_a_plain_name_within_the_host_limits() {
-    let mut names = vec![SUMMARY_NAME.to_owned(), SHUTDOWN_NAME.to_owned()];
+    let mut names = vec![
+        SUMMARY_NAME.to_owned(),
+        SHUTDOWN_NAME.to_owned(),
+        crate::mkuser_audit::AUDIT_NAME.to_owned(),
+    ];
     for (i, s) in plan("kbfuser", false).iter().enumerate() {
         names.push(step_frame_name(i, &s.id));
     }
@@ -843,6 +875,7 @@ fn every_frame_name_is_a_plain_name_within_the_host_limits() {
 fn the_defaults_and_the_flags_make_the_config() {
     let c = Config::from(&args(&[]));
     assert_eq!((c.quick.as_secs(), c.tail_bytes, c.port), (120, 8192, 5000));
+    assert_eq!(c.audit.as_secs(), 600);
     let c = Config::from(&args(&[
         "--quick-secs",
         "7",
@@ -850,8 +883,11 @@ fn the_defaults_and_the_flags_make_the_config() {
         "9",
         "--vsock-port",
         "6000",
+        "--audit-secs",
+        "11",
     ]));
     assert_eq!((c.quick.as_secs(), c.tail_bytes, c.port), (7, 9, 6000));
+    assert_eq!(c.audit.as_secs(), 11);
     assert_eq!(args(&[]).name, "kbfuser");
     assert!(W::try_parse_from(["w"]).is_err(), "--name is required");
 }

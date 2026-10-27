@@ -496,6 +496,13 @@ pub struct Outcome {
     pub ms: u64,
 }
 
+/// How a command whose stdout was streamed to a sink ended (nothing is kept).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Streamed {
+    pub ended: Ended,
+    pub ms: u64,
+}
+
 /// The console user: whose session the user steps run in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsoleUser {
