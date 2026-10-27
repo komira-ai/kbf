@@ -15,8 +15,8 @@ use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{JoinHandle, sleep};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -229,38 +229,48 @@ pub struct Sample {
 /// in what it says, in order.
 pub struct Watch {
     stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<Vec<Sample>>>,
+    seen: Arc<Mutex<Vec<Sample>>>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl Watch {
     pub fn start() -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&stop);
+        let seen = Arc::new(Mutex::new(Vec::<Sample>::new()));
+        let (flag, log) = (Arc::clone(&stop), Arc::clone(&seen));
         let thread = std::thread::spawn(move || {
-            let mut seen: Vec<Sample> = Vec::new();
             while !flag.load(Ordering::Relaxed) {
                 let sample = Sample {
                     commit: health_commit(),
                     ready: ready(),
                     draining: draining(),
                 };
-                if seen.last() != Some(&sample) {
-                    seen.push(sample);
+                let mut log = log.lock().unwrap();
+                if log.last() != Some(&sample) {
+                    log.push(sample);
                 }
+                drop(log);
                 sleep(Duration::from_millis(100));
             }
-            seen
         });
         Self {
             stop,
+            seen,
             thread: Some(thread),
         }
     }
 
-    /// Stops watching and returns what was seen, in order.
-    pub fn finish(mut self) -> Vec<Sample> {
+    /// Waits until the watch has seen the frontend of `commit` (12 digits) answer, stops
+    /// watching, and returns what was seen, in order.
+    pub fn finish_after_seeing(mut self, commit: &str) -> Vec<Sample> {
+        wait("the watch sees the new frontend", || {
+            let seen = self.seen.lock().unwrap();
+            seen.iter().any(|s| s.commit.as_deref() == Some(commit))
+        });
         self.stop.store(true, Ordering::Relaxed);
-        self.thread.take().unwrap().join().unwrap()
+        self.thread.take().unwrap().join().unwrap();
+        let mut seen = self.seen.lock().unwrap();
+        std::mem::take(&mut *seen)
     }
 }
 

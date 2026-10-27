@@ -208,13 +208,13 @@ fn the_helper_updates_a_frontend_container_from_the_last_release_to_the_next() {
     rehearsal::require_staged(&staged, &[FRONTEND_HELPER_UNIT, KBF_UNIT]);
     let (watch, events) = (Watch::start(), Events::start());
     let switched = ask(&probe, "switch", &format!("switch kbf={version}"));
-    let (seen, events) = (watch.finish(), events.finish());
+    let (old12, new12) = (&old[..12], &new[..12]);
+    let (seen, events) = (watch.finish_after_seeing(new12), events.finish());
     assert_eq!(switched["result"], "switched", "{switched}");
     assert_eq!(switched["commit"], new.as_str(), "{switched}");
 
     // N's container stood down before the switch: its operator API said `draining` and
     // `/readyz` 503, and only afterwards did N+1's commit appear.
-    let (old12, new12) = (&old[..12], &new[..12]);
     let first_new = seen
         .iter()
         .position(|s| s.commit.as_deref() == Some(new12))
