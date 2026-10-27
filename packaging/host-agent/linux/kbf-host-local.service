@@ -17,6 +17,7 @@ After=local-fs.target
 
 [Service]
 Type=simple
+User=root
 # Root, on purpose: it moves releases under /var/lib/kbf-installer and restarts units. The socket is the access control: mode 0600, owned by the one
 # account named here. Root is systemd's default, so the unit names no User=: with User= set,
 # even to root, and a system call filter in place (RestrictRealtime=, LockPersonality= and
