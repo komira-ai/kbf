@@ -393,7 +393,7 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
 
 ### What the step does
 
-The job starts only after `rehearse` and `rehearse-agent` pass, on hosted runners with systemd. In
+The job starts only after `rehearse`, `rehearse-agent` and `rehearse-frontend` pass, on hosted runners with systemd. In
 `rehearse`, a host laid out by hand from the release before this one (its `kbf` through its own
 `kbf-deploy host install`, its `kbf-host-install`, its package's trust files and accounts, this
 release's helper unit) is updated to this release by the real helper through its local socket, as
@@ -404,8 +404,15 @@ throwaway farm CA and an allow-list as above; `cargo xtask deploy-farm`, given t
 `cargo xtask release farm-version` prints, as the next step is; the release before this one's
 agent, helper, frontend and `kbf`, the agent heartbeating to the coordinator and reading its
 node's storage health from the frontend with its certificate alone
-(`crates/kbf-host-install/tests/update_rehearsal_agent.rs`). A release that host cannot take, or
-a version the hosts never report, is never set as the desired version. The rehearsals do not
+(`crates/kbf-host-install/tests/update_rehearsal_agent.rs`). In `rehearse-frontend` a host whose
+frontend is a container (`docs/deploy/host-install.md`, "A frontend container") runs the release
+before this one's frontend in Docker, and the helper under its packaged
+`kbf-host-local-frontend.service`, given a `host-install-frontend.toml`, installs this release's
+frontend image from GitHub, drains the container through the frontend's operator API, makes the
+next container with the same configuration and confirms it; a switch that fails puts the old
+container back, which the same job checks
+(`crates/kbf-host-install/tests/update_rehearsal_frontend.rs`). A release that host cannot take,
+or a version the hosts never report, is never set as the desired version. The rehearsals do not
 cover a drain of a node with leases (the host has no daemon half), the farm's Tailscale network
 or its real issuer (the issuer of the OIDC token is a stand-in on loopback, and the minimum of
 storage hosts that must stay up is 0 because the rehearsal's farm has one).
