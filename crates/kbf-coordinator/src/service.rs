@@ -197,8 +197,8 @@ impl Coordinator {
                 node_id: id.to_string(),
                 role: host.role.name(),
                 live: host.is_live(now),
-                up: host.is_up(now),
-                holds_slot: host.holds_slot(),
+                up: fleet.is_up(id, host, now),
+                holds_slot: fleet.holds_slot(id, host, now),
                 silent_secs: now.saturating_sub(host.seen).as_secs(),
                 beat: host.beat.clone(),
             })

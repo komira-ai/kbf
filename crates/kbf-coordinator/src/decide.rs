@@ -19,7 +19,8 @@
 //! 7. the hosts that would still be up without this one number at least the minimum:
 //!    `min_up.storage` for a storage host, `min_up.frontend` for a frontend, and at least
 //!    one frontend whatever the setting says. A host is up when it is live, healthy, not
-//!    updating and not under an outstanding order, so a host that has not heartbeated since a restart counts as missing.
+//!    updating and not under an outstanding order, so a host that has not heartbeated since
+//!    a restart counts as missing.
 //!
 //! The decision records nothing: the caller notes an `Update` it returns with
 //! [`Fleet::order`], under the same lock, so the next host's decision sees it. A host that

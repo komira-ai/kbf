@@ -430,8 +430,9 @@ async fn an_order_nobody_reports_ages_out() {
     c.heartbeat(storage("s1"), beat("1.0"));
     assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
     rig.at(2_100 + age - 1);
-    assert_eq!(c.heartbeat(storage("s3"), beat("1.0")), Reply::Nothing);
+    // Both beat afresh, so neither is down: only the order can refuse them.
     assert_eq!(c.heartbeat(storage("s1"), beat("1.0")), Reply::Nothing);
+    assert_eq!(c.heartbeat(storage("s3"), beat("1.0")), Reply::Nothing);
     rig.at(2_100 + age);
     assert_eq!(c.heartbeat(storage("s1"), beat("1.0")), update("2.0"));
 }
@@ -464,4 +465,39 @@ async fn a_host_that_asks_again_is_told_the_same_order() {
         c.heartbeat(storage("s2"), updating(beat("1.0"), "2.0")),
         Reply::Nothing
     );
+}
+
+/// Catches: a re-beating host extending its own hold (the order time must stay the first
+/// one), and Fleet::order restarting the clock on an order for the same target.
+#[tokio::test]
+async fn a_repeat_does_not_extend_the_hold() {
+    let rig = started("svc-order-keep-time", ONE_STORAGE).await;
+    let c = &rig.coordinator;
+    let age = ORDER_AGE.as_secs();
+    c.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    rig.at(2_100 + age - 1);
+    c.heartbeat(storage("s1"), beat("1.0"));
+    c.heartbeat(storage("s3"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    rig.at(2_100 + age);
+    assert_eq!(
+        c.heartbeat(storage("s1"), beat("1.0")),
+        update("2.0"),
+        "the order was given at the first ask; the repeat did not move it"
+    );
+}
+
+/// Catches: the operator status reading heartbeats alone, so it shows an ordered host as up
+/// and not holding a slot while the coordinator refuses others because of it.
+#[tokio::test]
+async fn the_status_shows_an_ordered_host_as_holding_a_slot() {
+    let rig = started("svc-order-status", ONE_STORAGE).await;
+    let c = &rig.coordinator;
+    c.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    let status = c.status(Some(OPERATOR)).expect("status");
+    let of = |n: &str| status.hosts.iter().find(|h| h.node_id == n).expect("host");
+    assert!(of("s2").holds_slot && !of("s2").up);
+    assert!(!of("s1").holds_slot && of("s1").up);
 }

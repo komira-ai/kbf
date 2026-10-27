@@ -102,6 +102,7 @@ A CI job asks for the token with its audience (`ACTIONS_ID_TOKEN_REQUEST_URL` wi
 - **Coordinator down**: nothing new starts. Hosts mid-update finish or revert alone.
 - **Host silent**: counts as down. When it returns it converges.
 - **Update fails**: the host is back on A and reports it. Its slot stays used until it heartbeats healthy, so a bad version stops at the role limit.
+- **Order not yet reported**: the coordinator holds the slot of a host it has told to update, and counts the host as not up, until the host's beat shows it updating, at the ordered version or failed, or the order ages out (`ORDER_AGE`). A host that asks again meanwhile is told the same order, and the hold keeps its first time. The status view shows the same slot and up counts the grants use. A coordinator restart forgets outstanding orders (they are not persisted); the quiet start and the hosts' own beats bound the gap.
 - **Coordinator restarts mid-roll**: it waits, rebuilds from heartbeats (`updating` hosts included), then continues.
 
 ## 7. Reused and deleted
