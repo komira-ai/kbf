@@ -1141,6 +1141,7 @@ fn only_the_form_the_hosts_report_is_a_version_to_deploy() {
         "0.1.0+g0123456789ab",
         "10.20.30+gffffffffffff",
         "1.0.0-rc.1+g000000000000",
+        "0.0.0-a-b.1+g0123456789ab",
     ] {
         assert_eq!(check_version(good), Ok(()), "{good}");
     }
@@ -1161,6 +1162,12 @@ fn only_the_form_the_hosts_report_is_a_version_to_deploy() {
         "+g0123456789ab",
         "v0.1.0+g0123456789ab",
         "0.1.0-+g0123456789ab",
+        "0.1.0.0+g0123456789ab",
+        "0.1.x+g0123456789ab",
+        "0.01.0+g0123456789ab",
+        "1..0+g0123456789ab",
+        "1.0.0-a..b+g0123456789ab",
+        "1.0.0-a_b+g0123456789ab",
     ] {
         let error = check_version(bad).expect_err(bad);
         assert_eq!(error, Error::Version(bad.to_owned()));
