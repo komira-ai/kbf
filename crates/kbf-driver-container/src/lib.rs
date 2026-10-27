@@ -100,6 +100,8 @@ mod runtime;
 pub mod subids;
 pub mod tree;
 pub mod unpack_layers;
+#[cfg(test)]
+mod workers_tests;
 
 // The keepers this crate's unit tests start come from the test binary.
 #[cfg(test)]
