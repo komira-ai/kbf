@@ -415,6 +415,8 @@ says which form it needs, before it calls the coordinator. Anything else that se
 coordinator's desired version (a `POST /v1/desired` by hand) needs the same form, or no host
 will converge on it.
 
+The coordinator keeps its desired state per service name, and `kbf` is the only service it accepts: `POST /v1/desired` takes an optional `service` (absent means `kbf`; any other name is a 400), and `GET /v1/status` adds `services` beside the unchanged `desired`. While `kbf` is the only service, the `--state-file` holds the single state in the form earlier coordinators wrote, so a downgrade to one of them starts on the same file; a file in the map form (`{"services": {...}}`), which a coordinator with a second service writes, is refused by an earlier build, and the operator then restores the file from before or writes `kbf`'s state alone in it.
+
 `cargo xtask deploy-farm` (one `run:` line):
 
 1. reads `GET /v1/convergence` once, before anything is changed, and keeps the hosts live then

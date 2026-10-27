@@ -1,6 +1,7 @@
 //! The coordinator: the fleet the heartbeats build, the desired state, and who may change
 //! or read either. No sockets here; [`crate::http`] maps requests onto these calls.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use subtle::ConstantTimeEq;
 
 use crate::converge::{Convergence, converge};
 use crate::decide::decide;
-use crate::desired::{Desired, DesiredError, DesiredStore, StoreError};
+use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
 use crate::fleet::Fleet;
 use crate::identity::Identity;
 
@@ -88,8 +89,10 @@ pub struct HostStatus {
 /// What an operator reads.
 #[derive(Debug, Serialize)]
 pub struct Status {
-    /// The desired state, if one was ever set.
+    /// The desired state of `kbf`, if one was ever set.
     pub desired: Option<Desired>,
+    /// The desired state of every service, by name.
+    pub services: BTreeMap<String, Desired>,
     /// The coordinator is still within its quiet period and orders nothing.
     pub quiet: bool,
     /// Every host heard from since the coordinator started, by node id.
@@ -136,7 +139,7 @@ impl Coordinator {
         let now = (self.clock)();
         let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         fleet.record(who.node_id.clone(), who.role, beat, now);
-        let Some(d) = self.desired.get() else {
+        let Some(d) = self.desired.get(KBF) else {
             return Reply::Nothing;
         };
         let reply = decide(&d, &fleet, &who.node_id, now);
@@ -175,8 +178,8 @@ impl Coordinator {
             sha = ?verified.sha,
             "desired state set by CI"
         );
-        let desired = Desired::parse(body)?;
-        self.desired.set(desired.clone())?;
+        let (service, desired) = Desired::parse_request(body)?;
+        self.desired.set(&service, desired.clone())?;
         Ok(desired)
     }
 
@@ -204,7 +207,8 @@ impl Coordinator {
             })
             .collect();
         Ok(Status {
-            desired: self.desired.get(),
+            desired: self.desired.get(KBF),
+            services: self.desired.all(),
             quiet: fleet.is_quiet(now),
             hosts,
         })
@@ -220,6 +224,6 @@ impl Coordinator {
         self.ci(bearer).await?;
         let now = (self.clock)();
         let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
-        Ok(converge(self.desired.get().as_ref(), &fleet, now))
+        Ok(converge(self.desired.get(KBF).as_ref(), &fleet, now))
     }
 }

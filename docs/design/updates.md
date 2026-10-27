@@ -25,6 +25,8 @@ Node id and role come from the certificate (section 5), not the heartbeat. The u
 
 CI sets one desired state with one OIDC-authenticated call (`kbf-oidc`): version X and per-role limits, including the minimum number of storage hosts and of frontends that must be up. The coordinator stores only that, in a small file.
 
+The coordinator keeps that desired state per service name; `kbf` is the only service it accepts. `POST /v1/desired` takes an optional `service` field (absent means `kbf`), and any other name is refused with 400. `GET /v1/status` and `GET /v1/convergence` keep their fields for `kbf`; the status adds `services`, the desired state of every service by name. The decision and the heartbeat and reply wire are unchanged. The state file is, while `kbf` is the only service, the single state itself (the format earlier builds wrote); a file of the form `{"services": {name: state}}` is read as the map, and a file of the old form is read as `kbf`'s.
+
 On each heartbeat it answers `update to X` only if all hold:
 
 - the host is behind X;
