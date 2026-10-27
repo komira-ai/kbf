@@ -103,7 +103,7 @@ The tests that need Postgres fail, and are not skipped, when no server is named.
 `KBF_TEST_POSTGRES_URL` to the URL of a server and a superuser role (the tests create and
 drop databases and roles), for example `postgres://postgres@localhost:5432/postgres`; the
 Postgres service container of `.github/workflows/ci.yml` is one. Each such test makes a
-database or a schema of its own on it (`kbf-testkit`'s `database` module makes the database)
+database or a schema of its own on it (the `database` module of `js-testkit`, which `kbf-testkit` re-exports, makes the database)
 and drops it when the test ends, so tests run in parallel and never share rows.
 
 ## No new shell or Python
