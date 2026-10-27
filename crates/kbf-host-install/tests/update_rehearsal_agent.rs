@@ -432,7 +432,7 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
         "POST",
         &format!("http://{}/v1/nodes/{}:cordon", farm::FRONTEND_API, farm::NODE),
         None,
-        None,
+        Some("{}"),
     );
     let mut looks = watch.stop();
     // The look the wait just made, which the watch may not have kept yet.
