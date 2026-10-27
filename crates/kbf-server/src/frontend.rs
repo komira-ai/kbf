@@ -173,6 +173,7 @@ pub const ALLOWED: &[&str] = &[
     "worker_max_streams",
     "unservable_wait_secs",
     "default_platform",
+    "qos_allowed",
     "memory_ladder_gib",
     "vm_host_floor_cpus",
     "vm_host_floor_mem_gib",
@@ -787,6 +788,7 @@ impl<'a> Prepared<'a> {
         let defaults = kbf_front::Defaults {
             memory: listeners.memory_ladder.first(),
             platform: listeners.default_platform,
+            qos: listeners.qos_allowed,
         };
         let durable = state.is_some();
         let farm = Farm::new(

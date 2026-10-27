@@ -1238,6 +1238,38 @@ fn the_default_platform_comes_from_its_flag() {
     }
 }
 
+/// Catches: `--qos-allowed` parsed but not handed to the listeners (an operator who
+/// narrows the list would still grant `batch`), a default list other than `ci,batch`
+/// (`interactive` must not be open to every client unless an operator says so), and a
+/// level that is none, or an empty list, accepted.
+#[test]
+fn the_qos_levels_a_header_may_name_come_from_their_flag() {
+    use clap::Parser;
+    use kbf_front::QosAllow;
+    let parse = |value: Option<&str>| {
+        let args = std::iter::once("kbf-server")
+            .chain(value.into_iter().flat_map(|v| ["--qos-allowed", v]));
+        kbf_server::Args::try_parse_from(args)
+    };
+    let allowed = |value| {
+        parse(value)
+            .expect("flags parse")
+            .listeners()
+            .expect("listeners")
+            .qos_allowed
+    };
+    assert_eq!(allowed(None), QosAllow::DEFAULT);
+    assert_eq!(allowed(Some("ci")).to_string(), "ci");
+    assert_eq!(
+        allowed(Some("ci,batch,interactive")).to_string(),
+        "ci,batch,interactive"
+    );
+    for bad in ["", "urgent", "ci,,batch", "BATCH"] {
+        let err = parse(Some(bad)).expect_err(bad);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
+    }
+}
+
 /// Catches: `--learned-sizes` not parsed into the listeners (a farm that ignores it never
 /// keys a request), a default other than `off` (the flag changes a booking only when an
 /// operator sets it), a value other than `off`, `shadow` and `on` accepted.

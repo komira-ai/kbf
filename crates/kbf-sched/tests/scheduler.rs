@@ -616,6 +616,26 @@ fn qos_orders_the_queue_and_a_join_promotes() {
     assert_eq!(g.operation, OperationId(2));
 }
 
+/// Catches: a `batch` action, queued first, started before a `ci` action queued later
+/// when there is room for one (the release build must not take the slot a pull request
+/// check is waiting for), and the batch action lost instead of waiting: it starts as
+/// soon as there is room again.
+#[test]
+fn a_queued_batch_action_is_placed_after_a_queued_ci_action() {
+    let mut h = Harness::new();
+    let at = |n: u8, qos: Qos| Request { qos, ..request(n) };
+    h.submit(1, at(1, Qos::Batch));
+    h.submit(2, at(2, Qos::Ci));
+    h.worker("a", 1_000, GIB);
+    let [first] = h.tick().try_into().unwrap();
+    assert_eq!(h.s.qos(first.operation), Some(&Qos::Ci));
+    h.commit_and_start(&first);
+    assert_eq!(h.s.queued().count(), 1, "the batch action still waits");
+    h.finish(&first, ok(2));
+    let [second] = h.tick().try_into().unwrap();
+    assert_eq!(h.s.qos(second.operation), Some(&Qos::Batch));
+}
+
 /// Catches: a committed lease that a worker the scheduler still hears from leaves out of
 /// its running set kept for good (the booking leaks and the waiters wait forever), or
 /// given up before its `Start` has been out for the Start grace, while that `Start` may

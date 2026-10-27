@@ -639,6 +639,7 @@ impl Cell {
             tick: Duration::from_millis(50),
             unservable_wait: wait,
             default_platform,
+            qos_allowed: kbf_front::QosAllow::DEFAULT,
             memory_ladder: ladder,
             vm_host_floor: kbf_server::HostFloor::default(),
             learned_sizes: learned,
