@@ -59,8 +59,6 @@ const KBF_UNIT: &str = "kbf-rehearsal.service";
 /// The `--restart-unit` of the packaged helper unit, replaced by [`KBF_UNIT`].
 const PACKAGED_RESTART: &str = "--restart-unit kbf-daemon.service";
 const CHANNEL: &str = "stable";
-/// The channel's token file.
-const CHANNEL_TOKEN: &str = "/etc/kbf/host-install-github.token";
 /// Where the kbf unit's storage node listens.
 const STORAGE: &str = "127.0.0.1:8983";
 const UPDATER: &str = "kbf-updater";
@@ -193,6 +191,18 @@ fn answer(text: &str) -> Value {
     serde_json::from_str(line).unwrap_or_else(|e| panic!("not JSON ({e}): {line}"))
 }
 
+/// What the helper logs when GitHub refuses its listing for the address's quota.
+const RATE_LIMITED: &str = "rate limited by GitHub";
+
+/// The units' journal so far.
+fn journal() -> String {
+    let out = Command::new("journalctl")
+        .args(["--no-pager", "-u", HELPER_UNIT, "-u", KBF_UNIT])
+        .output()
+        .expect("journalctl");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 /// The units' journal and the helper's state, written when the rehearsal ends, whichever way.
 struct Journal;
 
@@ -200,9 +210,6 @@ impl Drop for Journal {
     fn drop(&mut self) {
         let mut cmd = Command::new("journalctl");
         cmd.args(["--no-pager", "-u", HELPER_UNIT, "-u", KBF_UNIT]);
-        if let Ok(out) = Command::new("ls").args(["-la", "/etc/kbf"]).output() {
-            capture("etc_kbf", &out);
-        }
         if let Ok(out) = cmd.output() {
             capture("journal", &out);
             if std::thread::panicking() {
@@ -418,12 +425,10 @@ fn the_helper_updates_a_hand_laid_host_from_the_last_release_to_the_next() {
             .arg(HELPER),
     );
     fs::create_dir_all("/etc/kbf").unwrap();
-    // The farm's nodes name their channel the same way, without the token: a hosted runner's
-    // address shares GitHub's anonymous quota with other jobs, so the rehearsal's listing
-    // uses the run's read-only token.
-    install_file(&format!("{token}\n"), CHANNEL_TOKEN, 0o600);
+    // The channel as the farm's nodes name theirs: no token. (The helper takes a token of
+    // letters, digits, `_` and `-`, at most 255 bytes; the run's token is longer.)
     install_file(
-        &format!("[channels.{CHANNEL}]\nsource = \"github\"\ntoken_file = \"{CHANNEL_TOKEN}\"\n"),
+        &format!("[channels.{CHANNEL}]\nsource = \"github\"\n"),
         CHANNELS,
         0o644,
     );
@@ -458,6 +463,13 @@ fn the_helper_updates_a_hand_laid_host_from_the_last_release_to_the_next() {
         "install",
         &format!("install kbf={version} from {CHANNEL}"),
     );
+    if staged["result"] != "staged" && journal().contains(RATE_LIMITED) {
+        panic!(
+            "GitHub refused the helper's anonymous release listing: this hosted runner's address \
+             is over GitHub's quota for it, which says nothing of the release. Re-run the job. \
+             {staged}"
+        );
+    }
     assert_eq!(staged["result"], "staged", "{staged}");
     assert_eq!(staged["commit"], new.as_str(), "{staged}");
 
