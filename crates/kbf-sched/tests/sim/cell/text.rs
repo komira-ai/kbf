@@ -26,7 +26,8 @@ pub fn msg(msg: &Msg) -> String {
             stream,
             capacity,
         } => format!(
-            "hello(node={node} instance={} stream={stream} {})",
+            "hello(node={} instance={} stream={stream} {})",
+            text::worker(node),
             text::quoted(instance),
             text::resources(capacity)
         ),
