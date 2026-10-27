@@ -92,6 +92,7 @@ mod logs;
 mod logs_tests;
 pub mod numa;
 mod oci;
+mod off_worker;
 mod outputs;
 mod program;
 mod remove;

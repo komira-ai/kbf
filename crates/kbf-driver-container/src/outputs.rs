@@ -72,6 +72,7 @@ use rustix::io::Errno;
 use crate::cas::FileBlob;
 use crate::hashing::{Digested, Job, Outcome, hash_all, read_through};
 use crate::logs::{Logs, after_outputs, missing_only, with_outputs};
+use crate::off_worker::off_worker;
 use crate::tree::{Exceeded, TreeError, check_relative};
 
 /// How much output one action may leave. An action past a limit fails with
@@ -450,8 +451,19 @@ pub(crate) async fn collect(
         limits.max_bytes,
         &std::mem::take(&mut listing.shown),
     )?;
-    let mut blobs = assemble(listing, &digested, &jobs, &upper_fd, result);
     let taken = digested.iter().filter(|d| d.taken).count();
+    // Digesting every Directory message of a large tree is hashing: not on an async
+    // worker.
+    let (mut blobs, assembled) = {
+        let (jobs, upper_fd) = (Arc::clone(&jobs), Arc::clone(&upper_fd));
+        let mut entries = std::mem::take(result);
+        off_worker(move || {
+            let blobs = assemble(listing, &digested, &jobs, &upper_fd, &mut entries);
+            (blobs, entries)
+        })
+        .await
+    };
+    *result = assembled;
     let plain = intake.is_none();
     with_outputs(&mut blobs, logs, plain, result).await?;
     let finishing = Instant::now();

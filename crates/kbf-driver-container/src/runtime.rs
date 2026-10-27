@@ -56,6 +56,7 @@ use crate::keeper::Keeper;
 use crate::logs::{Logs, STDERR, STDOUT, store_both};
 use crate::numa::{Pin, Placement, Placer};
 use crate::oci::{Oci, OciConfig};
+use crate::off_worker::off_worker;
 use crate::outputs::{OutputLimits, collect};
 use crate::program;
 use crate::remove::remove_tree;
@@ -238,6 +239,8 @@ struct Prepared {
     spec: ContainerSpec,
     outputs: Vec<String>,
     timeout: Duration,
+    /// The phases of the input side so far; [`ContainerRuntime::cgroup_up`] adds the last.
+    phases: InputPhases,
 }
 
 /// Runs `action` leases in rootless `crun` containers.
@@ -445,25 +448,6 @@ impl<C: Cas> ContainerRuntime<C> {
         self.give_overlay(CONTAINER_OWNER, &lease.dir, &root, &upper, &overlay_work)
             .await?;
         phases.chown_ms = millis(started);
-        let started = Instant::now();
-        // `actions/`'s own OOM count before the lease, to say afterwards whether its
-        // limit killed the lease.
-        lease.backstop_ooms = lease.cgroup.parent_ooms().ok();
-        // The keeper, before anything runs in the cgroup: it kills the cgroup if the
-        // daemon dies.
-        let kill = lease.cgroup.dir().join("cgroup.kill");
-        let placement = (self.config.placer.as_ref()).map(|placer| {
-            placer.place_lease(work.resources.cpu_millis, work.resources.memory_bytes)
-        });
-        phases.numa_node = placement.as_ref().map(Placement::spot);
-        lease.pin = placement.and_then(Placement::into_pin);
-        let keeper = (lease.cgroup.create(work.resources, lease.pin.as_ref()))
-            .and_then(|()| Keeper::watch(&kill))
-            .map_err(|e| failed(lease.cgroup.dir(), &e))?;
-        lease.keeper = Some(keeper);
-        phases.cgroup_ms = millis(started);
-        tracing::info!(lease = %lease.name, "inputs phases: {phases}");
-
         let spec = ContainerSpec {
             name: lease.name.clone(),
             image: image.to_string(),
@@ -487,7 +471,46 @@ impl<C: Cas> ContainerRuntime<C> {
             spec,
             outputs,
             timeout,
+            phases,
         })
+    }
+
+    /// The lease's cgroup and its keeper, made last of the input side: `mkdir`, the
+    /// limits written to the cgroup's files, and a keeper process started and waited for
+    /// until it answers. All of it waits on the kernel or a child, so it runs on the
+    /// blocking pool; and it runs after the kill window of [`Self::prepare`] closes,
+    /// because a blocking task cannot be stopped and a kill that dropped it half done
+    /// would let the clean remove the cgroup before the task made it.
+    async fn cgroup_up(
+        &self,
+        work: &Work,
+        lease: &mut Lease,
+        mut phases: InputPhases,
+    ) -> Result<(), RuntimeError> {
+        let started = Instant::now();
+        // The keeper, before anything runs in the cgroup: it kills the cgroup if the
+        // daemon dies.
+        let placement = (self.config.placer.as_ref()).map(|placer| {
+            placer.place_lease(work.resources.cpu_millis, work.resources.memory_bytes)
+        });
+        phases.numa_node = placement.as_ref().map(Placement::spot);
+        lease.pin = placement.and_then(Placement::into_pin);
+        let (cgroup, pin, resources) = (lease.cgroup.clone(), lease.pin.take(), work.resources);
+        let (backstop_ooms, made, pin) = off_worker(move || {
+            // `actions/`'s own OOM count before the lease, to say afterwards whether its
+            // limit killed the lease.
+            let backstop_ooms = cgroup.parent_ooms().ok();
+            let kill = cgroup.dir().join("cgroup.kill");
+            let made = (cgroup.create(resources, pin.as_ref())).and_then(|()| Keeper::watch(&kill));
+            (backstop_ooms, made, pin)
+        })
+        .await;
+        lease.backstop_ooms = backstop_ooms;
+        lease.pin = pin;
+        lease.keeper = Some(made.map_err(|e| failed(lease.cgroup.dir(), &e))?);
+        phases.cgroup_ms = millis(started);
+        tracing::info!(lease = %lease.name, "inputs phases: {phases}");
+        Ok(())
     }
 
     /// Steps 1 to 4. `killer` receives the sender of a kill that stopped the work.
@@ -511,6 +534,7 @@ impl<C: Cas> ContainerRuntime<C> {
             spec,
             outputs,
             timeout,
+            phases,
         } = tokio::select! {
             prepared = self.prepare(cas, work, lease) => prepared?,
             Ok(by) = &mut *stop => {
@@ -518,6 +542,7 @@ impl<C: Cas> ContainerRuntime<C> {
                 return Err(RuntimeError::Killed);
             }
         };
+        self.cgroup_up(work, lease, phases).await?;
         clock.input_fetch_completed_timestamp = now();
         // Execution counts from writing the bundle: making the container is part of
         // running the command in one.
@@ -525,8 +550,11 @@ impl<C: Cas> ContainerRuntime<C> {
         // What the lease cgroup's NUMA split is while the action runs, and the usage
         // read at its end (`cgroup_usage`): `run` reads it too when the lease fails.
         lease.ran = Some(Instant::now());
-        lease.started_under =
-            Start::read(&self.config.cpu_pressure_file, work.resources.cpu_millis);
+        let (psi, millicpus) = (
+            self.config.cpu_pressure_file.clone(),
+            work.resources.cpu_millis,
+        );
+        lease.started_under = off_worker(move || Start::read(&psi, millicpus)).await;
         lease.numa = NumaSample::counting(Arc::clone(&self.numa_samples));
         lease.created = true;
         self.engine
@@ -541,10 +569,7 @@ impl<C: Cas> ContainerRuntime<C> {
         let mut started = 0;
         let ended = loop {
             started += 1;
-            let stdout =
-                std::fs::File::create(&stdout_path).map_err(|e| failed(&stdout_path, &e))?;
-            let stderr =
-                std::fs::File::create(&stderr_path).map_err(|e| failed(&stderr_path, &e))?;
+            let (stdout, stderr) = create_logs(&stdout_path, &stderr_path).await?;
             let start = self
                 .engine
                 .start(&spec, stdout, stderr)
@@ -603,7 +628,8 @@ impl<C: Cas> ContainerRuntime<C> {
         // reported no exit or could not be asked: the lease cgroup's counters do not
         // depend on `crun`'s report, so a kill they show is reported as one.
         if matches!(ended, Ok(Ended::Exited(137) | Ended::NotRun(_)) | Err(_)) {
-            match lease.cgroup.oom_outcome(cap, lease.backstop_ooms) {
+            let (cgroup, before) = (lease.cgroup.clone(), lease.backstop_ooms);
+            match off_worker(move || cgroup.oom_outcome(cap, before)).await {
                 Ok(Some(kill)) => return Err(kill),
                 Ok(None) => {}
                 Err(e) if ended == Ok(Ended::Exited(137)) => {
@@ -622,7 +648,7 @@ impl<C: Cas> ContainerRuntime<C> {
         clock.execution_completed_timestamp = now();
         // What the lease cgroup counted, while it still exists (clean removes it). The
         // result carries it beside the four numbers every runtime reports.
-        let usage = lease.usage();
+        let usage = lease.usage().await;
         clock.auxiliary_metadata = usage.iter().map(ResourceUsage::to_any).collect();
         // The upload counts from the chown, which makes the outputs readable to it.
         clock.output_upload_start_timestamp = now();
@@ -783,7 +809,7 @@ impl<C: Cas> Runtime for ContainerRuntime<C> {
         // measured too, before the clean removes its cgroup; the daemon asks for it
         // (`Runtime::failed_usage`).
         let measured = if outcome.is_err() {
-            lease.usage()
+            lease.usage().await
         } else {
             None
         };
@@ -950,10 +976,15 @@ impl Lease {
     /// What the lease cgroup counted so far, with its best NUMA sample: `None` for a
     /// lease that never got to run its container. Read once (it takes the samples);
     /// the cgroup must still exist.
-    fn usage(&mut self) -> Option<ResourceUsage> {
+    /// The cgroup's files are read on the blocking pool.
+    async fn usage(&mut self) -> Option<ResourceUsage> {
         let ran = self.ran?;
-        let cgroup = std::mem::take(&mut self.numa).finish(self.cgroup.dir());
-        Some(resource_usage(cgroup, ran.elapsed(), self.started_under))
+        let numa = std::mem::take(&mut self.numa);
+        let (dir, started_under) = (self.cgroup.dir().to_owned(), self.started_under);
+        Some(
+            off_worker(move || resource_usage(numa.finish(&dir), ran.elapsed(), started_under))
+                .await,
+        )
     }
 
     /// Steps 5 and 6, off the async threads.
@@ -1049,6 +1080,20 @@ fn private_paths(working_directory: &str, outputs: &[String]) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Creates the files the container's stdout and stderr go to, on the blocking pool.
+async fn create_logs(
+    stdout: &Path,
+    stderr: &Path,
+) -> Result<(std::fs::File, std::fs::File), RuntimeError> {
+    let (out, err) = (stdout.to_owned(), stderr.to_owned());
+    off_worker(move || {
+        let stdout = std::fs::File::create(&out).map_err(|e| failed(&out, &e))?;
+        let stderr = std::fs::File::create(&err).map_err(|e| failed(&err, &e))?;
+        Ok((stdout, stderr))
+    })
+    .await
 }
 
 /// The cache `given` opened; `None`, after a warning, when it cannot be opened. Blocking.
