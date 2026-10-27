@@ -12,5 +12,8 @@ kbf-types.workspace = true
 rand_chacha.workspace = true
 sha2.workspace = true
 
+[dev-dependencies]
+kbf-testkit.workspace = true
+
 [lints]
 workspace = true

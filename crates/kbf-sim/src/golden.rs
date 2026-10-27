@@ -185,6 +185,8 @@ impl GoldenFile {
 
 #[cfg(test)]
 mod tests {
+    use kbf_testkit::dir::TestDir;
+
     use super::*;
     use crate::Trace;
 
@@ -201,23 +203,21 @@ mod tests {
             .collect()
     }
 
-    /// A file path of its own in the temporary directory, removed when dropped.
-    struct Scratch(PathBuf);
+    /// A file path of its own, in a directory that does not exist yet and is removed
+    /// with its test.
+    struct Scratch(TestDir);
 
     impl Scratch {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("kbf-sim-golden-{}", std::process::id()));
-            Self(dir.join(name))
+            Self(TestDir::under(std::env::temp_dir(), name))
+        }
+
+        fn path(&self) -> PathBuf {
+            self.0.path().join("nested").join("trace-hashes.txt")
         }
 
         fn file(&self, family: &str) -> GoldenFile {
-            GoldenFile::new(&self.0, family, "cargo test regenerate")
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            GoldenFile::new(self.path(), family, "cargo test regenerate")
         }
     }
 
@@ -272,7 +272,7 @@ mod tests {
         one.regenerate(&runs(&[("a", "x2"), ("b", "z")])).unwrap();
         assert_eq!(one.check(&runs(&[("a", "x2"), ("b", "z")])), Ok(()));
         assert_eq!(two.check(&runs(&[("a", "y")])), Ok(()));
-        let text = std::fs::read_to_string(&scratch.0).unwrap();
+        let text = std::fs::read_to_string(scratch.path()).unwrap();
         let keys: Vec<&str> = text
             .lines()
             .filter(|l| !l.starts_with('#') && !l.starts_with("format"))
@@ -302,17 +302,18 @@ mod tests {
         let scratch = Scratch::new("damaged.txt");
         let file = scratch.file("f");
         let good = "a".repeat(64);
-        std::fs::create_dir_all(scratch.0.parent().unwrap()).unwrap();
+        let path = scratch.path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
 
-        std::fs::write(&scratch.0, format!("format 0\nf/a {good}\n")).unwrap();
+        std::fs::write(&path, format!("format 0\nf/a {good}\n")).unwrap();
         let err = file.check(&runs(&[("a", "one")])).unwrap_err();
         assert!(err.contains("trace format Some(0)"), "{err}");
 
-        std::fs::write(&scratch.0, format!("f/a {good}\n")).unwrap();
+        std::fs::write(&path, format!("f/a {good}\n")).unwrap();
         let err = file.check(&runs(&[("a", "one")])).unwrap_err();
         assert!(err.contains("trace format None"), "{err}");
 
-        std::fs::write(&scratch.0, "format 1\nf/a nothex\n").unwrap();
+        std::fs::write(&path, "format 1\nf/a nothex\n").unwrap();
         let err = file.check(&runs(&[("a", "one")])).unwrap_err();
         assert!(err.contains("cannot read the line"), "{err}");
         let refused = file.regenerate(&runs(&[("a", "one")])).unwrap_err();
