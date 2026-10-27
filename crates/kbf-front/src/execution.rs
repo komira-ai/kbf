@@ -201,7 +201,8 @@ pub enum Stage {
     Waiting(String),
     /// As [`Stage::Waiting`], but a drain keeps its streams: a lease for the operation did
     /// start once (and was lost, so it was queued again), or another frontend of the
-    /// state store has a worker that could run it and takes it once this one stands down.
+    /// state store has a worker that could run it, which that frontend's intake takes
+    /// from the store's queue.
     WaitingKept(String),
     /// A lease for it has started on a worker.
     Executing,

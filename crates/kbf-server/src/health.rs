@@ -15,9 +15,10 @@
 //!   one more, `no_worker`: at least one worker has an open stream to this server. The worker
 //!   and enrollment clusters keep asking `/readyz`, since a frontend with no worker gets its
 //!   first one through the worker listener, which the same balancer routes by that answer.
-//!   An Execute that none of this server's workers can run waits here, and another frontend
-//!   takes it only once this one stands down, so a frontend that answers Execute calls with
-//!   no worker leaves them waiting for as long as it is up.
+//!   An Execute that none of this server's workers can run is queued in the state store, and
+//!   a frontend with a worker that can run it takes it from there; it waits here for as long
+//!   as no frontend has one, so a frontend that answers Execute calls with no worker may
+//!   leave them waiting for as long as it is up.
 //!
 //! Once the server has given its roles away ([`Readiness::set_handed_over`], which a retire
 //! does: `POST /v1/frontend/retire`, `docs/api.md`) the probes are not asked and the check

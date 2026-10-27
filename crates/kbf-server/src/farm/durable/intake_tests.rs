@@ -891,6 +891,36 @@ async fn the_poll_lists_a_closed_stream_as_remote_and_forgets_refused_operations
     assert!(farm.lock().intake.remote.is_empty(), "nothing waits");
 }
 
+/// Asserts that an operation which no worker of this frontend can run, while a daemon
+/// session of another frontend could, waits as `WaitingKept`: a drain keeps its streams,
+/// since that frontend's intake takes the queued operation.
+#[tokio::test(start_paused = true)]
+async fn an_operation_another_frontends_daemon_could_run_waits_kept() {
+    let store = Racing::new();
+    let (here, there) = (farm_over(&store), farm_over(&store));
+    let _daemon = register(&there, "node-there");
+    let first = queue(&here, too_big());
+    here.tick().await;
+    here.intake();
+    assert_eq!(
+        here.lock().intake.remote.len(),
+        1,
+        "the other frontend's daemon"
+    );
+    let second = queue(&here, request(1));
+    here.tick().await;
+    assert!(
+        matches!(*second.stage.borrow(), Stage::WaitingKept(_)),
+        "{:?}",
+        *second.stage.borrow()
+    );
+    assert!(
+        matches!(*first.stage.borrow(), Stage::Waiting(_)),
+        "{:?}",
+        *first.stage.borrow()
+    );
+}
+
 /// Asserts that a poll reads the `session/` rows once, for the orphan sweep, while no
 /// operation waits for a worker, and a second time for the other frontends' daemons while
 /// one does: the second scan is only worth its load when something needs its answer.
