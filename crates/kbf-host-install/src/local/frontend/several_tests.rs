@@ -351,3 +351,83 @@ peers = ["127.0.0.1:28982"]
     assert_eq!(record["pending"]["from"], OLD);
     assert_eq!(record["pending"]["from_image"], OLD_ID);
 }
+
+fn with_hardening() -> String {
+    CONFIG.replace(
+        "user = \"65532:65532\"",
+        "user = \"65532:65532\"\nread_only = true\ntmpfs = [\"/tmp:rw,size=256m\"]\ncap_drop = [\"ALL\"]\nsecurity_opt = [\"no-new-privileges\"]\nulimits = [\"nofile=1048576:1048576\"]",
+    )
+}
+
+/// The container made for a switch and the one put back by a revert both carry the hardening
+/// of the file the switch began with, whatever the file says by then.
+#[test]
+fn hardening_reaches_the_new_container_and_the_one_put_back() {
+    let rig = Rig::with_config("hardening", &with_hardening());
+    assert!(matches!(rig.update(), Answer::Switched { .. }));
+    let fixed = |image: &str| {
+        words(&[
+            "run",
+            "--detach",
+            "--name",
+            "kbf-frontend",
+            "--restart",
+            "unless-stopped",
+            "--network",
+            "bridge",
+            "--user",
+            "65532:65532",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,size=256m",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--ulimit",
+            "nofile=1048576:1048576",
+            "--publish",
+            "127.0.0.1:8982:8982",
+            "--publish",
+            "8980:8980",
+            "--volume",
+            "/etc/kbf:/etc/kbf:ro",
+            "--volume",
+            "/var/lib/kbf:/var/lib/kbf",
+            image,
+            "--config",
+            "/etc/kbf/kbf.toml",
+        ])
+    };
+    assert_eq!(rig.world.runs().last().unwrap(), &fixed(NEW_ID));
+    put(&rig.config_path(), CONFIG);
+    assert!(matches!(rig.ask("revert"), Answer::Reverted { .. }));
+    assert_eq!(rig.world.runs().last().unwrap(), &fixed(OLD_ID));
+}
+
+/// A switch whose container fails to become ready puts the old one back with the hardening.
+#[test]
+fn hardening_reaches_the_old_container_after_a_failed_switch() {
+    let rig = Rig::with_config("hardening-fail", &with_hardening());
+    rig.world
+        .0
+        .borrow_mut()
+        .never_ready
+        .insert(NEW_ID.to_owned());
+    assert!(failed(crate::local::answer::Code::SwitchFailed)(
+        &rig.update()
+    ));
+    let runs = rig.world.runs();
+    assert_eq!(runs.len(), 2);
+    for run in &runs {
+        for flag in [
+            "--read-only",
+            "--tmpfs",
+            "--cap-drop",
+            "--security-opt",
+            "--ulimit",
+        ] {
+            assert!(run.contains(&flag.to_owned()), "{flag} in {run:?}");
+        }
+    }
+}

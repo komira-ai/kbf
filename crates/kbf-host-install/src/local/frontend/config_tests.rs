@@ -286,3 +286,55 @@ fn a_gid_that_is_not_a_plain_nonzero_number_is_refused() {
     // A number that is not quoted is not a string: refused too.
     FrontendConfig::parse(&with("group_add = [990]")).unwrap_err();
 }
+
+const HARDENING: &str = "read_only = true\ntmpfs = [\"/tmp:rw,size=256m\", \"/run\"]\ncap_drop = [\"ALL\"]\nsecurity_opt = [\"no-new-privileges\"]\nulimits = [\"nofile=1048576:1048576\", \"core=0\"]";
+
+/// The hardening keys come out as `--read-only`, `--tmpfs`, `--cap-drop`, `--security-opt` and
+/// `--ulimit` words, one argument per entry, in the order given, after `--user` and before the
+/// first `--publish`.
+#[test]
+fn hardening_keys_are_exact_argv_words() {
+    let text = with(&format!(
+        "user = \"65532:65532\"\n{HARDENING}\nports = [\"8980:8980\"]"
+    ));
+    let config = FrontendConfig::parse(&text).unwrap();
+    assert_eq!(
+        config.run.run_args("sha256:abc"),
+        [
+            "run",
+            "--detach",
+            "--name",
+            "kbf-frontend",
+            "--restart",
+            "unless-stopped",
+            "--user",
+            "65532:65532",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,size=256m",
+            "--tmpfs",
+            "/run",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--ulimit",
+            "nofile=1048576:1048576",
+            "--ulimit",
+            "core=0",
+            "--publish",
+            "8980:8980",
+            "sha256:abc"
+        ]
+    );
+    // `read_only = false` and left out are the same: no flag.
+    let args = FrontendConfig::parse(&with("read_only = false"))
+        .unwrap()
+        .run
+        .run_args("i");
+    assert!(!args.contains(&"--read-only".to_owned()));
+    assert_eq!(
+        FrontendConfig::parse(&with("")).unwrap().run.run_args("i"),
+        args
+    );
+}
