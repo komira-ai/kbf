@@ -1,15 +1,13 @@
 //! A CAS in memory, actions stored in it, and a VM driver over a fake host.
 
-#![allow(dead_code)] // Each test binary uses its own part of this module.
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::{FakeHost, VmConfig, VmDriver};
 use kbf_daemon::Work;
 use kbf_daemon::cas::{Cas, CasError, digest_of, label};
-use kbf_driver_vm::{FakeHost, VmConfig, VmDriver};
 use kbf_proto::reapi::command::EnvironmentVariable;
 use kbf_proto::reapi::platform::Property;
 use kbf_proto::reapi::{Action, Command, Digest, Directory, FileNode, Platform};
@@ -203,12 +201,21 @@ impl Spec {
     }
 }
 
+/// The directory the tests' scratch directories are made in, beside the test binary
+/// (inside the target directory).
+fn unit_root() -> PathBuf {
+    let exe = std::env::current_exe().expect("test binary");
+    exe.parent()
+        .expect("deps directory")
+        .join("kbf-driver-vm-unit")
+}
+
 /// A link to the test binary named for the act steps, made once per run of the binary
 /// (the guest runs the command by this path).
 pub fn act_path() -> String {
     static LINK: OnceLock<PathBuf> = OnceLock::new();
     LINK.get_or_init(|| {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        let dir = unit_root()
             .join("kbf-driver-vm")
             .join(format!("act-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("act directory");
@@ -224,7 +231,7 @@ pub fn act_path() -> String {
 /// A fresh scratch directory for one test, holding a golden image (`image/`, one disk
 /// file) and the driver's scratch root (`vm/`).
 pub fn scratch(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+    let dir = unit_root()
         .join("kbf-driver-vm")
         .join(format!("{name}-{}", std::process::id()));
     if std::fs::symlink_metadata(&dir).is_ok() {

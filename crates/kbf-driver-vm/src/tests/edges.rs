@@ -2,24 +2,21 @@
 //! silent guest and a slow one, a host that cannot confirm a stop, a run the daemon drops, and kills
 //! before the VM exists.
 
-kbf_testkit::act_test_hook!();
-
-mod support;
-
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::support;
+use super::support::{
+    MemoryCas, Spec, config, driver, leftovers, outputs_share, scratch, until_running, work,
+};
+use crate::FakeHost;
 use kbf_daemon::cas::{digest_of, label};
 use kbf_daemon::{Runtime, RuntimeError};
-use kbf_driver_vm::FakeHost;
 use kbf_proto::reapi::{Action, Command, Directory};
 use kbf_types::LeaseId;
 use prost::Message as _;
-use support::{
-    MemoryCas, Spec, config, driver, leftovers, outputs_share, scratch, until_running, work,
-};
 
 /// Catches an Action without a Command or an input root, or a Command without
 /// arguments, sent to a VM (or reported as the farm's, to be run again elsewhere)

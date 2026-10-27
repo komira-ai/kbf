@@ -59,6 +59,12 @@ pub mod config;
 mod driver;
 mod fake;
 pub mod host;
+#[cfg(test)]
+mod tests;
+
+// The act steps the tests' commands run come from the test binary.
+#[cfg(test)]
+kbf_testkit::act_test_hook!();
 
 pub use config::VmConfig;
 pub use driver::{DRIVER, KIND, VmDriver};

@@ -1,19 +1,15 @@
 //! The VM driver against the fake host, which runs the real `kbf-guest` agent on a Unix
 //! socket: a run end to end, and every way a lease ends leaving no VM and no clone.
 
-kbf_testkit::act_test_hook!();
-
-mod support;
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kbf_daemon::{Runtime, RuntimeError};
-use kbf_driver_vm::{FakeHost, MACOS_VM_LIMIT, MachineId};
-use support::{
+use super::support::{
     GIB, MemoryCas, Spec, config, driver, leftovers, name, outputs_share, scratch, until,
     until_running, work,
 };
+use crate::{FakeHost, MACOS_VM_LIMIT, MachineId};
+use kbf_daemon::{Runtime, RuntimeError};
 
 /// Catches a VM run that loses the command's stdout or its declared outputs, the
 /// action's environment, an input
