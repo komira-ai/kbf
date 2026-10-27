@@ -12,7 +12,8 @@
 //! A clone's `sim` skips a root step when the record covers it, that is when `staged.json`
 //! and the record both name the thing the step is about and hold the same entry for it:
 //! - `xcode-select`, `license`, `first-launch`: the Xcode entry (its path, tree sizes and
-//!   file counts) is the same;
+//!   file counts) is the same and so is the Xcode's `version.plist` (version and build), which
+//!   the record keeps as hex;
 //! - `runtime-add-<name>` and `runtime-import-<name>`: the runtime `<name>` has the same
 //!   entry (kind, size and SHA-256 of an image, or of every file of a bundle).
 //!
@@ -36,6 +37,9 @@ pub const RECORD_VERSION: u64 = 1;
 pub const SKIPPED_NOTE: &str = "skipped: done at prime";
 /// The most bytes read of `staged.json` or the record.
 pub const MAX_READ_BYTES: usize = 4 << 20;
+
+/// The most bytes read of the Xcode's `version.plist`.
+pub const MAX_IDENTITY_BYTES: usize = 16 << 10;
 
 const IMPORT_PREFIX: &str = "runtime-import-";
 const ADD_PREFIX: &str = "runtime-add-";
@@ -101,7 +105,7 @@ pub fn root_steps(staged: &Staged) -> Vec<Step> {
 /// The record of a priming boot that ran [`root_steps`] of `staged` to the end: `None` when
 /// the setup staged no Xcode (there was nothing to do).
 #[must_use]
-pub fn record_json(staged: &Staged) -> Option<Value> {
+pub fn record_json(staged: &Staged, identity: Option<&str>) -> Option<Value> {
     let xcode = staged.xcode.clone()?;
     let runtimes: Vec<Value> = staged
         .runtimes
@@ -119,6 +123,7 @@ pub fn record_json(staged: &Staged) -> Option<Value> {
         "version": RECORD_VERSION,
         "xcode_path": simpaths::XCODE_APP,
         "xcode": xcode,
+        "xcode_identity": identity,
         "runtimes": runtimes,
     }))
 }
@@ -127,6 +132,7 @@ pub fn record_json(staged: &Staged) -> Option<Value> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Record {
     xcode: Value,
+    identity: Option<String>,
     runtimes: BTreeMap<String, Value>,
 }
 
@@ -139,6 +145,10 @@ fn parse_record(text: &str) -> Result<Record, String> {
         return Err("another Xcode path".to_owned());
     }
     let xcode = v.get("xcode").cloned().ok_or("no xcode entry")?;
+    let identity = v
+        .get("xcode_identity")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let runtimes = v
         .get("runtimes")
         .and_then(Value::as_array)
@@ -151,7 +161,20 @@ fn parse_record(text: &str) -> Result<Record, String> {
             ))
         })
         .collect();
-    Ok(Record { xcode, runtimes })
+    Ok(Record {
+        xcode,
+        identity,
+        runtimes,
+    })
+}
+
+/// What says which Xcode is on the disk: the bytes of its `version.plist` (version and
+/// build), in hex. `None` when it cannot be read; the Xcode steps are then never skipped.
+pub fn xcode_identity(read: &dyn Reader) -> Option<String> {
+    read(simpaths::XCODE_VERSION_PLIST, MAX_IDENTITY_BYTES)
+        .ok()
+        .filter(|b| !b.is_empty())
+        .map(hex::encode)
 }
 
 /// Reads a file of the guest: its path and the most bytes to read.
@@ -163,6 +186,8 @@ impl<F: Fn(&str, usize) -> Result<Vec<u8>, String>> Reader for F {}
 pub struct Primed {
     staged: Option<Staged>,
     record: Option<Record>,
+    /// The identity of the Xcode on the disk now ([`xcode_identity`]).
+    identity: Option<String>,
 }
 
 impl Primed {
@@ -177,6 +202,7 @@ impl Primed {
         Self {
             staged: text(simpaths::MANIFEST).and_then(|t| parse_staged(&t).ok()),
             record: text(simpaths::PRIMED).and_then(|t| parse_record(&t).ok()),
+            identity: xcode_identity(read),
         }
     }
 
@@ -188,7 +214,9 @@ impl Primed {
         };
         match id {
             "xcode-select" | "license" | "first-launch" => {
-                staged.xcode.as_ref() == Some(&record.xcode)
+                self.identity.is_some()
+                    && self.identity == record.identity
+                    && staged.xcode.as_ref() == Some(&record.xcode)
             }
             _ => id
                 .strip_prefix(IMPORT_PREFIX)

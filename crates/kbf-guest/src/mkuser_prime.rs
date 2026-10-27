@@ -28,7 +28,8 @@ use serde_json::Value;
 use crate::mkuser::{Config, MkUserHost};
 use crate::sim::{Class, Status, StepFrame};
 use crate::sim_primed::{
-    MAX_READ_BYTES, Primed, SKIPPED_NOTE, Staged, fixed_argv, parse_staged, record_json, root_steps,
+    MAX_READ_BYTES, Primed, SKIPPED_NOTE, Staged, fixed_argv, parse_staged, record_json,
+    root_steps, xcode_identity,
 };
 use crate::simpaths;
 
@@ -75,6 +76,38 @@ impl Prep {
     }
 }
 
+/// How many times, and how far apart, [`gate`] looks for the share before it concludes that
+/// there is none.
+pub const SHARE_POLLS: u32 = 40;
+pub const SHARE_PAUSE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether this boot is the base's priming one: the host put [`simpaths::PRIME_REQUESTED`] in
+/// the share. The disk is the same in the base and in every clone, so nothing on it can tell
+/// them apart; the share is the host's, and only `image prime` adds the file. The share is
+/// mounted a little after boot, so this waits (at most [`SHARE_POLLS`] looks) for it; a share
+/// that never comes is a boot that is not the priming one.
+pub fn is_prime_boot(host: &dyn MkUserHost) -> bool {
+    for _ in 0..SHARE_POLLS {
+        if host.exists(simpaths::SHARE_RESULTS) {
+            return host.exists(simpaths::PRIME_REQUESTED);
+        }
+        host.pause(SHARE_PAUSE);
+    }
+    false
+}
+
+/// `prep` when this is the priming boot (or there is nothing to do); else nothing, and
+/// whether something was left undone. A clone's boot runs `mkuser` too, and the root steps
+/// are then `sim`'s (it runs the ones the record does not cover), never `mkuser`'s: it would
+/// race `sim` and power the clone off mid-probe.
+pub fn gate(host: &dyn MkUserHost, prep: Prep) -> (Prep, bool) {
+    if prep.steps.is_empty() || is_prime_boot(host) {
+        (prep, false)
+    } else {
+        (Prep::default(), prep.needed())
+    }
+}
+
 /// Plans the root setup from the files the setup staged.
 #[must_use]
 pub fn plan_prep(host: &dyn MkUserHost) -> Prep {
@@ -83,7 +116,11 @@ pub fn plan_prep(host: &dyn MkUserHost) -> Prep {
         .ok()
         .and_then(|b| String::from_utf8(b).ok())
         .and_then(|t| parse_staged(&t).ok());
-    let Some(record) = staged.as_ref().and_then(record_json) else {
+    let identity = xcode_identity(&read);
+    let Some(record) = staged
+        .as_ref()
+        .and_then(|s| record_json(s, identity.as_deref()))
+    else {
         return Prep::default();
     };
     let staged: Staged = staged.unwrap_or_default();

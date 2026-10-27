@@ -185,6 +185,10 @@ impl MkUserHost for RealMkUserHost {
         self.host.pause(d);
     }
 
+    fn exists(&self, path: &str) -> bool {
+        std::fs::symlink_metadata(path).is_ok()
+    }
+
     fn read_file(&self, path: &str, cap: usize) -> Result<Vec<u8>, String> {
         read_regular(Path::new(path), cap)
     }

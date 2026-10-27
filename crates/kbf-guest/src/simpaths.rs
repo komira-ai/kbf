@@ -4,6 +4,9 @@
 
 /// The Xcode the setup clones into the guest.
 pub const XCODE_APP: &str = "/Applications/Xcode.app";
+/// The Xcode's own version file (version and build): what tells one Xcode from another with
+/// the same tree sizes.
+pub const XCODE_VERSION_PLIST: &str = "/Applications/Xcode.app/Contents/version.plist";
 /// The directory holding the simulator runtimes (disk images `*.dmg` and exported bundles
 /// `*.exportedBundle`), exactly the ones
 /// the latest setup staged.
@@ -22,6 +25,13 @@ pub const USER_WANTED: &str = "/private/var/kbf-sim/user-wanted";
 /// Written by `kbf-guest mkuser` once the user exists with auto-login set up: the name of
 /// the user (one line). The simulator probe runs its user steps as this user.
 pub const USER_READY: &str = "/private/var/kbf-sim/user-ready";
+/// Where the host's share directory is mounted in the guest, and its `results` directory
+/// (there once the mount is up; `kbf-vmm` pins both against its own constants).
+pub const SHARE_RESULTS: &str = "/private/var/kbf-mnt/results";
+/// A file `image prime` puts in the share of the base's priming boot, and of no other boot:
+/// the base's disk, and so every clone's, is the same, so only the host can say that this boot
+/// is the priming one. `kbf-guest mkuser` runs the simulator's root setup only when it is there.
+pub const PRIME_REQUESTED: &str = "/private/var/kbf-mnt/prime-requested";
 /// Written by `kbf-guest mkuser` in the base's priming boot once the root setup of the
 /// simulator (Xcode selected, license accepted, first launch, every staged runtime imported or
 /// added) is done: what was done, as JSON ([`crate::sim_primed`]). `kbf-guest sim` on a clone

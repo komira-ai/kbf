@@ -7,7 +7,8 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::mkuser_tests::prime::{
-    BUNDLE, DMG, bundle_entry, dmg_entry, staged_both, staged_json, xcode_entry,
+    BUNDLE, DMG, VERSION_PLIST, bundle_entry, dmg_entry, identity, staged_both, staged_json,
+    xcode_entry,
 };
 use crate::sim_primed::{Primed, SKIPPED_NOTE};
 use crate::simpaths;
@@ -34,6 +35,7 @@ fn record_of(xcode: &Value, runtimes: &[Value]) -> String {
             "version": 1,
             "xcode_path": "/Applications/Xcode.app",
             "xcode": xcode,
+            "xcode_identity": identity(),
             "runtimes": list,
         })
     )
@@ -42,6 +44,10 @@ fn record_of(xcode: &Value, runtimes: &[Value]) -> String {
 fn host_with(staged: Option<&str>, record: Option<&str>) -> Fake {
     let mut host = Fake::new();
     host.runtimes = vec![DMG.to_owned(), BUNDLE.to_owned()];
+    host.files.insert(
+        simpaths::XCODE_VERSION_PLIST.to_owned(),
+        VERSION_PLIST.to_vec(),
+    );
     for (path, text) in [(simpaths::MANIFEST, staged), (simpaths::PRIMED, record)] {
         if let Some(t) = text {
             host.files.insert(path.to_owned(), t.as_bytes().to_vec());
@@ -325,7 +331,11 @@ fn what_the_priming_boot_wrote_is_what_the_clone_skips_on() {
     assert!(done.summary.ok);
     let mut host = Fake::new();
     host.runtimes = vec![DMG.to_owned(), BUNDLE.to_owned()];
-    for path in [simpaths::MANIFEST, simpaths::PRIMED] {
+    for path in [
+        simpaths::MANIFEST,
+        simpaths::PRIMED,
+        simpaths::XCODE_VERSION_PLIST,
+    ] {
         host.files
             .insert(path.to_owned(), mk.files.borrow()[path].clone());
     }
@@ -360,6 +370,8 @@ fn only_the_root_steps_of_the_probe_can_be_covered() {
         Primed::load(&move |path: &str, _cap: usize| {
             if path == simpaths::MANIFEST {
                 Ok(staged.clone().into_bytes())
+            } else if path == simpaths::XCODE_VERSION_PLIST {
+                Ok(VERSION_PLIST.to_vec())
             } else if path == simpaths::PRIMED {
                 Ok(record.clone().into_bytes())
             } else {
@@ -402,4 +414,50 @@ fn only_a_fixed_argument_list_is_given() {
     use crate::sim_primed::fixed_argv;
     assert_eq!(fixed_argv(Argv::Fixed(vec!["a".into()])), ["a"]);
     assert!(fixed_argv(Argv::Late(Late::Create)).is_empty());
+}
+
+/// Catches a different Xcode with the same tree sizes and file counts being taken for the
+/// primed one: the three Xcode steps run when the `version.plist` on the disk is not the one
+/// the record kept (or cannot be read), and the runtimes' steps, whose entries did not
+/// change, are still skipped.
+#[test]
+fn another_xcode_with_the_same_counts_is_not_the_primed_one() {
+    for plist in [Some(b"<plist>27B2</plist>".to_vec()), None] {
+        let mut host = host_with(Some(&staged_both()), Some(&primed_record()));
+        match plist {
+            Some(p) => {
+                host.files
+                    .insert(simpaths::XCODE_VERSION_PLIST.to_owned(), p);
+            }
+            None => {
+                host.files.remove(simpaths::XCODE_VERSION_PLIST);
+            }
+        }
+        go(&host);
+        assert_eq!(
+            root_ran(&host),
+            ["xcode-select", "-license", "-runFirstLaunch"]
+        );
+        assert_eq!(
+            note_of(&host, "runtime-add-iOS_27.dmg").1.as_deref(),
+            Some(SKIPPED_NOTE)
+        );
+    }
+    // A record with no identity (an unreadable plist at prime) covers no Xcode step either.
+    let mut record: Value = serde_json::from_str(&primed_record()).expect("json");
+    record["xcode_identity"] = Value::Null;
+    let host = host_with(Some(&staged_both()), Some(&record.to_string()));
+    go(&host);
+    assert_eq!(
+        root_ran(&host),
+        ["xcode-select", "-license", "-runFirstLaunch"]
+    );
+    // Nothing known on either side is not a match.
+    let mut host = host_with(Some(&staged_both()), Some(&record.to_string()));
+    host.files.remove(simpaths::XCODE_VERSION_PLIST);
+    go(&host);
+    assert_eq!(
+        root_ran(&host),
+        ["xcode-select", "-license", "-runFirstLaunch"]
+    );
 }

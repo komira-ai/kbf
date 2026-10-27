@@ -589,7 +589,7 @@ fn setup_with_a_guest_user_writes_the_daemon_and_the_wish_and_says_to_prime() {
 
 /// Catches the flags not parsing or not reaching the verbs: `--guest-user` with a bad name
 /// refused by the parser, `image prime` taking its base and binary, its default deadline of
-/// 20 minutes, a deadline of zero refused, and the dispatch passing all three on.
+/// an hour, a deadline of zero refused, and the dispatch passing all three on.
 #[test]
 fn the_flags_parse_and_prime_is_dispatched_with_its_deadline() {
     assert!(
@@ -644,7 +644,7 @@ fn the_flags_parse_and_prime_is_dispatched_with_its_deadline() {
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(DEFAULT_DEADLINE.as_secs(), 1200);
+    assert_eq!(DEFAULT_DEADLINE.as_secs(), 3600);
     for bad in ["0", "86401", "x"] {
         assert!(
             Cli::try_parse_from([
@@ -842,4 +842,49 @@ fn without_a_log_audit_frame_the_report_says_none_arrived_and_a_bad_one_is_liste
         r.details["unreadable_frames"][0]["frame"],
         "mkuser-audit.json"
     );
+}
+
+/// Catches the priming boot not asking for the root setup (the guest then leaves it to `sim`
+/// on every clone), a request in any other name than the one the guest looks for, and the
+/// guest's and the host's paths for the share drifting apart.
+#[test]
+fn the_priming_boot_asks_for_the_root_setup_in_the_share() {
+    let work = work_with_base("prime-request");
+    let sys = FakeSystem::new();
+    sys.script(powering_off(&all_ok()));
+    let r = prime(&prime_ctx(&sys, &work), LONG);
+    assert_eq!(r.status, ReportStatus::Ok, "{r:?}");
+    let seen = sys.share_at_start.borrow();
+    assert_eq!(seen.len(), 1);
+    assert!(
+        seen[0].contains(&"prime-requested".to_owned()),
+        "{:?}",
+        seen[0]
+    );
+    assert!(seen[0].contains(&"results".to_owned()), "{:?}", seen[0]);
+    assert_eq!(
+        kbf_guest::simpaths::PRIME_REQUESTED,
+        format!("{}/prime-requested", crate::guest::GUEST_MOUNT)
+    );
+    assert_eq!(
+        kbf_guest::simpaths::SHARE_RESULTS,
+        crate::guest::GUEST_RESULTS
+    );
+}
+
+/// Catches a guest step allowed to run longer than the host waits for the whole priming
+/// boot: with the defaults, no single step of the root setup may outlast `--deadline-secs`.
+#[test]
+fn no_guest_step_may_outlast_the_default_deadline() {
+    use clap::Parser;
+    #[derive(clap::Parser)]
+    struct W {
+        #[command(flatten)]
+        a: kbf_guest::mkuser::MkUserArgs,
+    }
+    let a = W::parse_from(["w", "--name", "kbfuser"]).a;
+    let c = kbf_guest::mkuser::Config::from(&a);
+    for d in [c.quick, c.audit, c.first_launch, c.runtime_add] {
+        assert!(d <= DEFAULT_DEADLINE, "{d:?}");
+    }
 }

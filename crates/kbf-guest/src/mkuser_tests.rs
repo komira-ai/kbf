@@ -242,6 +242,9 @@ impl MkUserHost for Fake {
             .cloned()
             .ok_or_else(|| format!("{path}: no such file"))
     }
+    fn exists(&self, path: &str) -> bool {
+        self.files.borrow().contains_key(path)
+    }
     fn remove_file(&self, path: &str) -> Result<(), String> {
         self.calls.borrow_mut().push(Call::Remove(path.to_owned()));
         if self.remove_fails.as_deref() == Some(path) {

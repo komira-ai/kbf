@@ -20,10 +20,12 @@
 //! are steps like the user's, so they are in `steps` and `problems` of the report, and a
 //! failed one leaves no ready marker. Their time counts against `--deadline-secs`.
 //!
-//! Run on a base whose user is ready already and whose root setup is done, the guest says so
-//! and stays up; the host then shuts it down at once. When the user is ready but the root setup
-//! is not (a base primed earlier, or restaged since), the guest runs those steps alone and
-//! powers off.
+//! The guest runs the root setup only in this boot: the host puts a request file in the share
+//! (a clone's share has none), because the base's disk, and so every clone's, is the same and
+//! the daemon runs in every boot. Run on a base whose user is ready already and whose root setup
+//! is done, the guest says so and stays up; the host then shuts it down at once. When the user
+//! is ready but the root setup is not (a base primed earlier, or restaged since), the guest runs
+//! those steps alone and powers off. A clone's boot of such a base leaves them to `sim`.
 //!
 //! The base is changed by this run (a user is added to its disk): it is the one verb of the
 //! probes that writes to the base. A run that did not end in a power-off may leave the
@@ -50,7 +52,7 @@ use crate::spec::VmSpec;
 const PROBE: &str = "image-prime";
 /// How long the guest has, by default, to create its user and power off (the flag
 /// `--deadline-secs` sets it).
-pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(20 * 60);
+pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(60 * 60);
 /// The directory in the base the frames are collected into (`<name>-results` of
 /// [`guest::prepare_share`] for the name `prime`).
 pub const RESULTS_DIR: &str = "prime-results";
@@ -161,6 +163,15 @@ fn remove_share(ctx: &Ctx<'_>) {
     for suffix in ["-share", "-tagged"] {
         guest::remove_leftover(&ctx.work.join(format!("prime{suffix}")));
     }
+}
+
+/// Puts the prime request in the share (empty, new, mode 0644).
+fn request_prime(share: &Share) -> Result<(), String> {
+    let name = Path::new(kbf_guest::simpaths::PRIME_REQUESTED)
+        .file_name()
+        .unwrap_or_default();
+    let path = share.dir.join(name);
+    std::fs::write(&path, b"").map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// Starts the base itself with the share and the results channel.
@@ -279,7 +290,10 @@ pub fn prime(ctx: &Ctx<'_>, deadline: Duration) -> Report {
             json!({"guest_binary": null}),
         );
     }
-    let share = match guest::prepare_share(ctx, "prime") {
+    // The base's disk is every clone's: the request file in the share is what tells the guest
+    // that this boot, and no other, is the priming one (`kbf_guest::simpaths::PRIME_REQUESTED`).
+    let share = match guest::prepare_share(ctx, "prime").and_then(|s| request_prime(&s).map(|()| s))
+    {
         Ok(s) => s,
         Err(e) => return Report::error(PROBE, e),
     };

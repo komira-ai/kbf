@@ -7,16 +7,25 @@ use kbf_guest::sim_primed::{Primed, parse_staged, record_json, root_steps};
 
 use super::*;
 
+/// The Xcode's version file as the guest sees it.
+const PLIST: &[u8] = b"<plist>27A1</plist>";
+
 /// Reads the volume's `staged.json` as the guest would and returns the ids of the root steps
 /// a record made from `recorded` (another `staged.json`) covers against it.
 fn covered(volume: &Path, recorded: &str) -> Vec<String> {
     let manifest =
         std::fs::read_to_string(volume.join("private/var/kbf-sim/staged.json")).expect("manifest");
     let staged = parse_staged(&manifest).expect("the guest parses what setup wrote");
-    let record = record_json(&parse_staged(recorded).expect("recorded")).expect("an Xcode");
+    let record = record_json(
+        &parse_staged(recorded).expect("recorded"),
+        Some(&hex::encode(PLIST)),
+    )
+    .expect("an Xcode");
     let primed = Primed::load(&|path: &str, _cap: usize| {
         if path == "/private/var/kbf-sim/staged.json" {
             Ok(manifest.clone().into_bytes())
+        } else if path == "/Applications/Xcode.app/Contents/version.plist" {
+            Ok(PLIST.to_vec())
         } else if path == "/private/var/kbf-sim/primed.json" {
             Ok(record.to_string().into_bytes())
         } else {
@@ -100,7 +109,7 @@ fn the_guest_reads_the_manifest_setup_writes_and_sees_a_restage() {
     let none = plan(None, &[dir.join("iOS_27.dmg")], false).expect("plan");
     h.run(&volume, &none).expect("no xcode");
     let staged = parse_staged(&manifest_text(&volume)).expect("parse");
-    assert!(staged.xcode.is_none() && record_json(&staged).is_none());
+    assert!(staged.xcode.is_none() && record_json(&staged, None).is_none());
 }
 
 /// Catches an Xcode restaged with another tree being taken for the primed one.

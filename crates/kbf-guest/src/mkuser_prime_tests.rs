@@ -69,12 +69,35 @@ pub(crate) fn staged_both() -> String {
     )
 }
 
-/// A fake guest whose setup staged `staged`.
-pub(crate) fn host_staged(staged: &str) -> Fake {
+/// The Xcode's `version.plist` on the fake guest, and the identity the record keeps of it.
+pub(crate) const VERSION_PLIST: &[u8] =
+    b"<plist><key>ProductBuildVersion</key><string>27A1</string></plist>";
+
+pub(crate) fn identity() -> String {
+    hex::encode(VERSION_PLIST)
+}
+
+/// A fake guest booted as a clone is: the share is mounted without the prime request, and
+/// the setup staged `staged`.
+pub(crate) fn clone_staged(staged: &str) -> Fake {
     let host = Fake::new();
+    let mut files = host.files.borrow_mut();
+    files.insert(simpaths::MANIFEST.to_owned(), staged.as_bytes().to_vec());
+    files.insert(
+        simpaths::XCODE_VERSION_PLIST.to_owned(),
+        VERSION_PLIST.to_vec(),
+    );
+    files.insert(simpaths::SHARE_RESULTS.to_owned(), Vec::new());
+    drop(files);
+    host
+}
+
+/// A fake guest in the base's priming boot: as [`clone_staged`], with the prime request.
+pub(crate) fn host_staged(staged: &str) -> Fake {
+    let host = clone_staged(staged);
     host.files
         .borrow_mut()
-        .insert(simpaths::MANIFEST.to_owned(), staged.as_bytes().to_vec());
+        .insert(simpaths::PRIME_REQUESTED.to_owned(), Vec::new());
     host
 }
 
@@ -360,7 +383,8 @@ fn the_record_names_what_was_done_and_its_write_gates_the_marker() {
         ])
     );
     let staged = parse_staged(&staged_both()).expect("staged");
-    assert_eq!(Some(record), record_json(&staged));
+    assert_eq!(record["xcode_identity"], identity());
+    assert_eq!(Some(record), record_json(&staged, Some(&identity())));
 
     let mut host = host_staged(&staged_both());
     host.write_fails = Some(simpaths::PRIMED.to_owned());
@@ -505,4 +529,83 @@ fn the_worst_case_fits_the_hosts_file_budget() {
     let host = host_staged(&staged_json(&xcode_entry(1), &entries));
     let steps = plan_with("kbfuser", false, &plan_prep(&host));
     assert!(steps.len() + 3 + 8 <= 64, "{}", steps.len());
+}
+
+/// Catches a clone's boot running the root setup and powering the clone off under the probe:
+/// the disk is the base's, so a ready user with a missing or stale record looks the same in
+/// a clone and in the base; only the prime request in the share says which boot this is. A
+/// boot without it does nothing, whatever the record says: no command, no write, no
+/// power-off, no password, and a summary that says `sim` will run the steps.
+#[test]
+fn a_clone_boot_never_runs_the_root_setup_or_powers_off() {
+    let primed = host_staged(&staged_both());
+    go(&primed);
+    let stale = primed.files.borrow()[simpaths::PRIMED].clone();
+    for record in [None, Some(stale), Some(b"{}".to_vec())] {
+        let mut host = clone_staged(&staged_both());
+        host.ready = Some("kbfuser".to_owned());
+        if let Some(r) = record {
+            host.files
+                .borrow_mut()
+                .insert(simpaths::PRIMED.to_owned(), r);
+        }
+        host.files
+            .borrow_mut()
+            .remove(simpaths::XCODE_VERSION_PLIST);
+        let done = go(&host);
+        let s = &done.summary;
+        assert!(s.ok && s.already_ready && !s.powering_off, "{s:?}");
+        assert_eq!(done.power_off_started, None);
+        assert!(host.commands().is_empty() && host.writes().is_empty());
+        assert!(host.step_frames().is_empty());
+        assert_eq!(host.pauses.get(), 0, "the share was mounted already");
+    }
+    // The record that does not match (no version.plist now) says `sim` runs the steps.
+    let mut host = clone_staged(&staged_both());
+    host.ready = Some("kbfuser".to_owned());
+    let done = go(&host);
+    assert!(
+        done.summary
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("`sim` runs it"))
+    );
+}
+
+/// Catches a clone boot of a base that is not ready yet being given the root steps too (the
+/// account is made as before this existed, and nothing else), and a share that is not mounted
+/// being waited for without a bound or taken for the priming boot.
+#[test]
+fn without_the_prime_request_only_the_account_steps_run_and_a_missing_share_is_waited_for_once() {
+    let host = clone_staged(&staged_both());
+    go(&host);
+    assert_eq!(
+        step_ids(&host),
+        plan("kbfuser", false)
+            .iter()
+            .map(|s| s.id.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(prep_commands(&host).is_empty());
+    assert!(host.writes().iter().all(|w| w.0 != simpaths::PRIMED));
+
+    let host = host_staged(&staged_both());
+    host.files.borrow_mut().remove(simpaths::SHARE_RESULTS);
+    go(&host);
+    assert!(prep_commands(&host).is_empty());
+    assert_eq!(host.pauses.get(), crate::mkuser_prime::SHARE_POLLS);
+}
+
+/// Catches an Xcode taken for the primed one on tree sizes alone: the record keeps the
+/// `version.plist` of the Xcode it primed, and the identity of an unreadable one is none.
+#[test]
+fn the_record_keeps_the_xcode_identity_and_none_when_it_cannot_be_read() {
+    let host = host_staged(&staged_both());
+    host.files
+        .borrow_mut()
+        .remove(simpaths::XCODE_VERSION_PLIST);
+    go(&host);
+    let record: Value =
+        serde_json::from_slice(&host.files.borrow()[simpaths::PRIMED]).expect("json");
+    assert_eq!(record["xcode_identity"], Value::Null);
 }

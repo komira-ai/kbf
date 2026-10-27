@@ -19,6 +19,9 @@
 //!    accept its license, run its first launch and import or add every staged runtime, each
 //!    its own step, then write [`simpaths::PRIMED`] ([`mkuser_prime`]); only when the setup
 //!    staged an Xcode;
+//!    Step 5 runs only in the base's priming boot, which the host marks with
+//!    [`simpaths::PRIME_REQUESTED`] in the share ([`mkuser_prime::is_prime_boot`]); the daemon
+//!    also runs in every clone's boot, where `sim` does those steps itself;
 //! 6. write [`simpaths::USER_READY`] with the user's name. It needs every step above, so a
 //!    failed import leaves no marker.
 //!
@@ -514,6 +517,8 @@ pub trait MkUserHost {
     /// No connection or reply, or the host refused the frame.
     fn send(&self, port: u32, frame: &Frame) -> Result<(), SendError>;
     fn pause(&self, d: Duration);
+    /// Whether anything is at `path` (a link counts, and is not followed).
+    fn exists(&self, path: &str) -> bool;
     /// The regular file `path` of at most `cap` bytes (`staged.json` and the prime's record);
     /// a file that cannot be read means there is no simulator setup to run.
     ///
@@ -845,14 +850,19 @@ pub fn run(host: &dyn MkUserHost, cfg: &Config, name: &str, log: &mut dyn Write)
         summary.note = Some("mkuser runs as root".to_owned());
         return end(&mut r, summary, None);
     }
-    let prep = mkuser_prime::plan_prep(host);
+    let (prep, deferred) = mkuser_prime::gate(host, mkuser_prime::plan_prep(host));
     let ready = host.ready_user().as_deref() == Some(name);
     if ready && !prep.needed() {
         summary.ok = true;
         summary.already_ready = true;
         summary.note = Some(format!(
-            "{} names {name}: nothing to do",
-            simpaths::USER_READY
+            "{} names {name}: nothing to do{}",
+            simpaths::USER_READY,
+            if deferred {
+                "; the simulator's root setup is not recorded, and this is not the priming boot, so `sim` runs it"
+            } else {
+                ""
+            }
         ));
         return end(&mut r, summary, None);
     }
