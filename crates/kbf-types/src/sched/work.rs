@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use crate::{Digest, LeaseId, LeaseKind};
+use crate::{LeaseId, LeaseKind};
 
 /// One operation: one execution of an action that one or more waiters are attached to.
 /// Numbered by the scheduler in submission order.
@@ -287,14 +287,48 @@ pub struct FarmRun {
     pub fault: FarmFault,
 }
 
+/// Where the result of a completed attempt is stored, as the scheduler sees it: a
+/// 32-byte identity and a size, which it keeps and hands on and never reads.
+///
+/// For a build the identity is the hash of the stored `ActionResult` and the size its
+/// length in bytes: `kbf_types::Digest` converts to and from a `ResultRef` (`From`), and
+/// the log codec writes a `ResultRef` through that conversion, so the bytes on the log
+/// and in the rows are those of the digest. Two refs order by identity, then size, as
+/// the digests do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ResultRef {
+    id: [u8; 32],
+    size: u64,
+}
+
+impl ResultRef {
+    /// The reference to the `size` bytes stored under `id`.
+    #[must_use]
+    pub const fn new(id: [u8; 32], size: u64) -> Self {
+        Self { id, size }
+    }
+
+    /// The identity of what is stored.
+    #[must_use]
+    pub const fn id(&self) -> &[u8; 32] {
+        &self.id
+    }
+
+    /// The size of what is stored, in bytes.
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+}
+
 /// How an attempt ended, as its worker reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Outcome {
-    /// The action ran to completion (a failing test is still a completion); its
-    /// `ActionResult` is stored under `action_result`.
+    /// The action ran to completion (a failing test is still a completion); its result
+    /// is stored under `action_result`.
     Completed {
-        /// The digest of the uploaded `ActionResult`.
-        action_result: Digest,
+        /// Where the uploaded result is stored.
+        action_result: ResultRef,
     },
     /// The attempt failed.
     Failed(Failure),

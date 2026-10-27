@@ -31,7 +31,8 @@ fn a_result_without_detail_that_is_no_fault_is_answered_internal() {
         lease: kbf_types::LeaseId::new(1, 0),
         waiters: Vec::new(),
         outcome: Outcome::Completed {
-            action_result: kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [1; 32], 1),
+            action_result: kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [1; 32], 1)
+                .into(),
         },
         memory_runs: Vec::new(),
         farm_runs: Vec::new(),

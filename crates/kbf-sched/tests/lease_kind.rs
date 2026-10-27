@@ -116,7 +116,7 @@ impl Harness {
             operation: grant.operation,
             lease: grant.lease,
             outcome: Outcome::Completed {
-                action_result: digest(200),
+                action_result: digest(200).into(),
             },
         });
         let [Effect::Commit(record)] = proposed.as_slice() else {

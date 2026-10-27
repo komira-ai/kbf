@@ -115,7 +115,7 @@ impl Harness {
     /// Reports `grant` done and commits the result.
     fn finish(&mut self, grant: &LeaseGrant) {
         let outcome = Outcome::Completed {
-            action_result: digest(200),
+            action_result: digest(200).into(),
         };
         let proposed = self.feed(Event::Report {
             operation: grant.operation,

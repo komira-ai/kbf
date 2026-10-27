@@ -633,7 +633,7 @@ impl World {
                 Outcome::Failed(Failure::Timeout)
             } else {
                 Outcome::Completed {
-                    action_result: digest(lease.seq << 20 | run.op.0),
+                    action_result: digest(lease.seq << 20 | run.op.0).into(),
                 }
             };
             self.check.produced(lease, outcome);

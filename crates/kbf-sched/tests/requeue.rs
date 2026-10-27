@@ -182,7 +182,7 @@ fn report(grant: &LeaseGrant) -> Event {
         operation: grant.operation,
         lease: grant.lease,
         outcome: Outcome::Completed {
-            action_result: Digest::new(DigestFunction::Sha256, [9; 32], 9),
+            action_result: Digest::new(DigestFunction::Sha256, [9; 32], 9).into(),
         },
     }
 }

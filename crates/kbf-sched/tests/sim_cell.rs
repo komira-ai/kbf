@@ -333,7 +333,7 @@ impl Worker {
         run.ended = Some(now);
         let operation = run.operation;
         let outcome = Outcome::Completed {
-            action_result: digest(1_000 + operation.0),
+            action_result: digest(1_000 + operation.0).into(),
         };
         self.unacked.insert(lease, (operation, outcome));
         self.send(Msg::Report {

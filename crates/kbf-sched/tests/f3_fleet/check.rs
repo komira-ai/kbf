@@ -586,7 +586,7 @@ impl Check {
                     // own result is a completion.
                     if r.outcome
                         != (Outcome::Completed {
-                            action_result: outcome_of(r.lease),
+                            action_result: outcome_of(r.lease).into(),
                         })
                     {
                         let fenced = Outcome::Failed(Failure::Lost(LostWhy::Fenced));
@@ -627,7 +627,7 @@ impl Check {
                         let Outcome::Completed { action_result } = a.outcome else {
                             self.fail("I5", &format!("{a:?}: no run failed"));
                         };
-                        self.ensure(action_result == outcome_of(a.lease), "I5", || {
+                        self.ensure(action_result == outcome_of(a.lease).into(), "I5", || {
                             format!("{a:?} carries another lease's outcome")
                         });
                     }

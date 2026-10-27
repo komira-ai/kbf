@@ -42,7 +42,7 @@ fn caps() -> NodeCaps {
 
 fn ok(n: u8) -> Outcome {
     Outcome::Completed {
-        action_result: digest(100 + n),
+        action_result: digest(100 + n).into(),
     }
 }
 

@@ -75,7 +75,7 @@ fn w(name: &str) -> WorkerId {
 
 fn completed(n: u64) -> Outcome {
     Outcome::Completed {
-        action_result: digest(100 + n),
+        action_result: digest(100 + n).into(),
     }
 }
 
