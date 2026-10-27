@@ -313,6 +313,9 @@ native-whole-machine`.
   server sends the `Start` again. `--daemon-user` names the daemon's own user, which the
   lease directory's access control entries keep able to read and remove what the lease
   user writes.
+- **`VmDriver`** (`kbf-driver-vm`, driver `vm`): each `vm` lease in a macOS VM of its
+  own ([macos-vms.md](macos-vms.md#what-main-has)). Not offered by `--driver` yet; on
+  `main` it runs over a fake host only.
 - **`FakeRuntime`** (driver `fake`): runs nothing and returns an empty result, for
   bring-up. It serves `action`; `FakeRuntime::serving` makes one serve another kind
   under another driver name, so a daemon with several runtimes can be tested with fakes.
