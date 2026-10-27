@@ -425,6 +425,15 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
         &mut [&mut frontend, &mut coordinator],
         || farm::seen().is_some_and(|n| n.serving() && n.connected && n.runs(new)),
     );
+    // The node is left out of placement after the update, as if the agent's undrain had not
+    // reached the frontend.
+    farm::call(
+        "cordon",
+        "POST",
+        &format!("http://{}/v1/nodes/{}:cordon", farm::FRONTEND_API, farm::NODE),
+        None,
+        None,
+    );
     let mut looks = watch.stop();
     // The look the wait just made, which the watch may not have kept yet.
     if let Some(last) = farm::seen().filter(|n| looks.last() != Some(n)) {
