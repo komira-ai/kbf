@@ -42,7 +42,11 @@
 //! (`KBF_SIM_SEEDS=<n>` sets its seeds per scenario; the default is 200.)
 
 mod check;
+#[path = "../golden_file/mod.rs"]
+mod golden_file;
 mod scenarios;
+#[path = "../trace_text/mod.rs"]
+mod trace_text;
 mod world;
 
 use scenarios::{
@@ -240,6 +244,38 @@ fn seeds_replay() {
     }
 }
 
+/// The trace hash of every scenario under each pinned seed.
+fn golden_runs() -> Vec<(String, kbf_sim::TraceHash)> {
+    let mut runs = Vec::new();
+    for name in scenarios::NAMES {
+        for seed in 0..3 {
+            let mut scenario = scenarios::by_name(name).unwrap();
+            runs.push((
+                format!("{name}/seed-{seed}"),
+                run(scenario.as_mut(), seed).trace_hash(),
+            ));
+        }
+    }
+    runs
+}
+
+/// Catches: a change to the scheduler, the world or the trace text that alters what a
+/// scenario decides, or how its trace reads, without the author meaning it: every
+/// scenario's trace under three seeds is compared with the checked-in hash.
+#[test]
+fn traces_match_their_golden_hashes() {
+    golden_file::golden("f1").assert_matches(&golden_runs());
+}
+
+/// Rewrites the F1 lines of `tests/golden/trace-hashes.txt`.
+#[test]
+#[ignore = "regenerates the golden trace hashes; run it only on purpose"]
+fn regenerate_golden_hashes() {
+    golden_file::golden("f1")
+        .regenerate(&golden_runs())
+        .unwrap();
+}
+
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
@@ -256,7 +292,7 @@ fn replay() {
     let mut scenario = scenarios::by_name(&name).expect("a scenario name, F1.1 to F1.10");
     let world = run(scenario.as_mut(), seed);
     println!(
-        "{name} seed {seed}: {} inputs, {} grants, trace {:016x}",
+        "{name} seed {seed}: {} inputs, {} grants, trace {}",
         world.inputs,
         world.check.stats.grants,
         world.trace_hash()

@@ -37,6 +37,8 @@
 //! not ended, and ended runs whose result is not yet acknowledged. The leader passes
 //! it to the scheduler.
 
+mod sim_cell_trace;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -593,6 +595,10 @@ impl StateMachine for Cell {
 
 impl Node for Cell {
     type Msg = Msg;
+
+    fn trace_msg(msg: &Msg) -> String {
+        sim_cell_trace::msg(msg)
+    }
 
     fn take_outputs(&mut self) -> Vec<Output<Msg>> {
         match self {

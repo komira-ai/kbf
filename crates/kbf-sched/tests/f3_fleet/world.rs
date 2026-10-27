@@ -12,13 +12,14 @@ use std::time::Duration;
 
 use kbf_caps::NodeCaps;
 use kbf_sched::{DaemonInstance, Event, Input, Request, Scheduler};
-use kbf_sim::{Chance, SimRng};
+use kbf_sim::{Chance, SimRng, Trace, TraceHash, text};
 use kbf_types::{
     ActionKey, Digest, DigestFunction, Effect, FarmTime, LeaseId, OperationId, Outcome, Qos,
     Resources, StateMachine, WaiterId, WorkerId,
 };
 
 use crate::check::{Check, GRACE_MS, outcome_of};
+use crate::trace_text;
 
 const GIB: u64 = 1 << 30;
 /// The unservable wait the scheduler is built with (shorter than the default, so a
@@ -141,8 +142,8 @@ pub struct World {
     pub acts: Vec<(u64, Act, Option<kbf_sched::Cordon>)>,
     /// The Mac's capabilities now (its Xcode builds change).
     mac_caps: NodeCaps,
-    /// The trace's 64-bit FNV-1a hash: every input and effect.
-    pub hash: u64,
+    /// Every input and effect, as text.
+    trace: Trace,
 }
 
 fn digest(n: u64) -> Digest {
@@ -171,7 +172,7 @@ impl World {
             swarm,
             acts: Vec::new(),
             mac_caps: mac_caps(&[OLD_XCODE]),
-            hash: 0xcbf2_9ce4_8422_2325,
+            trace: Trace::new("f3"),
         };
         for (at, act) in script {
             world.script.entry(at).or_default().push(act);
@@ -182,11 +183,9 @@ impl World {
         world
     }
 
-    fn mix(&mut self, line: &str) {
-        for b in line.bytes().chain([b'\n']) {
-            self.hash ^= u64::from(b);
-            self.hash = self.hash.wrapping_mul(0x0100_0000_01b3);
-        }
+    /// The hash of the trace so far.
+    pub fn trace_hash(&self) -> TraceHash {
+        self.trace.hash()
     }
 
     /// Feeds `event` now, checks it, and carries out its effects (committing at once).
@@ -196,13 +195,18 @@ impl World {
         while !inputs.is_empty() {
             let mut next = Vec::new();
             for input in inputs {
-                self.mix(&format!("{} {:?}", self.t, input.event));
+                self.trace.record(&format!(
+                    "{} in {}",
+                    self.t,
+                    trace_text::event(&input.event)
+                ));
                 let round = self.check.before(&input);
                 let effects = self.sched.apply(input.clone());
                 self.check
                     .after(&self.sched, &input, &effects, round.as_ref());
                 for effect in effects {
-                    self.mix(&format!("  {effect:?}"));
+                    self.trace
+                        .record(&format!("  out {}", text::effect(&effect)));
                     next.extend(self.carry_out(now, effect));
                 }
             }

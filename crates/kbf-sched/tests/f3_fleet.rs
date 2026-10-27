@@ -26,6 +26,10 @@
 
 #[path = "f3_fleet/check.rs"]
 mod check;
+#[path = "golden_file/mod.rs"]
+mod golden_file;
+#[path = "trace_text/mod.rs"]
+mod trace_text;
 #[path = "f3_fleet/world.rs"]
 mod world;
 
@@ -585,9 +589,9 @@ fn swarm_long() {
 /// replaying every scenario twice cost more than the rest of the file.
 #[test]
 fn a_seed_replays() {
-    let seven = swarm(7).hash;
-    assert_eq!(seven, swarm(7).hash);
-    assert_ne!(seven, swarm(8).hash);
+    let seven = swarm(7).trace_hash();
+    assert_eq!(seven, swarm(7).trace_hash());
+    assert_ne!(seven, swarm(8).trace_hash());
 }
 
 /// Replays one scenario and seed: `KBF_SIM_SCENARIO` and `KBF_SIM_SEED`.
@@ -604,5 +608,33 @@ fn replay() {
         .find(|(n, _)| *n == name)
         .expect("a scenario name: f3_1, f3_2, f3_3, f3_4, f3_7, f3_8 or swarm");
     let w = scenario(seed);
-    println!("{name} seed {seed}: trace hash {:016x}", w.hash);
+    println!("{name} seed {seed}: trace hash {}", w.trace_hash());
+}
+
+/// The trace hash of every scenario under each pinned seed.
+fn golden_runs() -> Vec<(String, kbf_sim::TraceHash)> {
+    let mut runs = Vec::new();
+    for (name, scenario) in SCENARIOS {
+        for seed in 0..3 {
+            runs.push((format!("{name}/seed-{seed}"), scenario(seed).trace_hash()));
+        }
+    }
+    runs
+}
+
+/// Catches: a change to the scheduler, the world or the trace text that alters what a
+/// scenario decides, or how its trace reads, without the author meaning it: every
+/// scenario's trace under three seeds is compared with the checked-in hash.
+#[test]
+fn traces_match_their_golden_hashes() {
+    golden_file::golden("f3").assert_matches(&golden_runs());
+}
+
+/// Rewrites the F3 lines of `tests/golden/trace-hashes.txt`.
+#[test]
+#[ignore = "regenerates the golden trace hashes; run it only on purpose"]
+fn regenerate_golden_hashes() {
+    golden_file::golden("f3")
+        .regenerate(&golden_runs())
+        .unwrap();
 }

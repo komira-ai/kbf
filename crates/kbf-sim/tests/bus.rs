@@ -61,6 +61,10 @@ impl StateMachine for Recorder {
 impl Node for Recorder {
     type Msg = u32;
 
+    fn trace_msg(msg: &u32) -> String {
+        format!("msg({msg})")
+    }
+
     fn take_outputs(&mut self) -> Vec<Output<u32>> {
         std::mem::take(&mut self.out)
     }
@@ -256,11 +260,51 @@ fn effects_a_node_returns_are_traced_and_change_the_hash() {
     let effects: Vec<&String> = loud.iter().filter(|l| l.contains("effects")).collect();
     assert_eq!(
         effects,
-        [
-            r#"0 effects a [Waiting(Waiting { operation: OperationId(7), reason: Some("no worker") })]"#
-        ]
+        [r#"0 effects a [waiting(op=op7 reason="no worker")]"#]
     );
     assert_ne!(quiet_hash, loud_hash);
+}
+
+/// Catches: a kernel trace line whose spelling drifts (a field dropped or reordered, a
+/// `Debug` form creeping back in): the exact text of every kind of line, the format
+/// line first, is the contract the golden hashes rest on.
+#[test]
+fn every_kind_of_kernel_line_has_its_fixed_spelling() {
+    let fixed = Faults {
+        min_delay: Duration::from_millis(10),
+        max_delay: Duration::from_millis(10),
+        ..Faults::default()
+    };
+    let mut sim = Sim::new(0, fixed).with_trace_lines();
+    sim.add_node(
+        "a",
+        Recorder::sending([(0, "b", 4), (0, "nobody", 5), (40, "b", 6)]),
+    );
+    sim.add_node("b", Recorder::default());
+    sim.partition_at(
+        FarmTime::from_millis(5),
+        Partition::new([[NodeId::from("b")], [NodeId::from("a")]]),
+    );
+    sim.partition_at(FarmTime::from_millis(30), Partition::none());
+    sim.run_until(FarmTime::from_millis(100));
+    assert_eq!(
+        sim.trace_lines().unwrap(),
+        [
+            "kbf-trace-format 1 sim",
+            "0 start a",
+            "0 start b",
+            "0 timer a tag=0",
+            "0 send #0 a->b at=10",
+            "0 timer a tag=1",
+            "0 lost #1 a->nobody unknown receiver",
+            "5 partition b|a",
+            "10 lost #0 a->b partitioned",
+            "30 partition none",
+            "40 timer a tag=2",
+            "40 send #2 a->b at=50",
+            "50 deliver #2 a->b msg(6)",
+        ]
+    );
 }
 
 /// Catches: `random_split` with fewer than two nodes panicking (an empty range for the
