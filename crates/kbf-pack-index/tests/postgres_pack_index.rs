@@ -196,6 +196,45 @@ fn recording_packs_goes_through_while_a_state_transaction_holds_the_head() {
     assert!(found.iter().all(Option::is_some));
 }
 
+/// Asserts that a commit the server refuses (a deferred constraint fails at COMMIT) is an
+/// error and not a recorded pack, that the refused pack leaves no row behind, and that the
+/// index records the same pack once the constraint is gone.
+#[test]
+fn a_commit_the_server_refuses_is_an_error_and_leaves_nothing_behind() {
+    let backend = PostgresPackBackend::new(&url());
+    let config = backend.fresh_config();
+    let _store = PostgresStore::open(&config).expect("opens");
+    let index = PostgresPackIndex::open(&config).expect("opens");
+    let schema = config.schema();
+    let mut admin = Client::connect(&url(), NoTls).expect("connects");
+    admin
+        .batch_execute(&format!(
+            "CREATE FUNCTION {schema}.refuse() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'commit refused by the test'; END $$; \
+             CREATE CONSTRAINT TRIGGER refuse AFTER INSERT ON {schema}.pack \
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION {schema}.refuse()"
+        ))
+        .expect("a trigger that fails at commit");
+    let pack = one_blob("cas/d/n1/1/1", 1);
+    let refused = index.record_pack(&pack);
+    assert!(
+        matches!(&refused, Err(PackIndexError::Store(why)) if why.to_string().contains("commit refused by the test")),
+        "{refused:?}"
+    );
+    admin
+        .batch_execute(&format!("DROP TRIGGER refuse ON {schema}.pack"))
+        .expect("removes the trigger");
+    assert_eq!(
+        index.pack(&pack.key),
+        Ok(None),
+        "the refused pack is not there"
+    );
+    let recorded = index
+        .record_pack(&pack)
+        .expect("records once the trigger is gone");
+    assert!(recorded.created);
+}
+
 /// Asserts that a state schema without the pack tables is refused with the line that says what
 /// to run, that the refusal creates nothing, and that the index opens once the installer's
 /// migration has run.
