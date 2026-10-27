@@ -146,6 +146,7 @@ default, `--ui=false` turns them off. Open: no gate, whatever the REAPI policy s
 |---|---|---|---|
 | liveness | `GET /healthz` | [F] | none |
 | readiness | `GET /readyz` | [F] | none |
+| readiness for REAPI calls (`/readyz`, and a worker is connected) | `GET /readyz/reapi` | [F] | none |
 | farm summary (ready, nodes by state, queue, leases, storage) | `GET /v1/health` | [F] | open |
 | metrics | `GET /metrics` | [F] | none |
 

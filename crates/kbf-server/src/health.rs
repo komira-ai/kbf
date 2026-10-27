@@ -11,6 +11,14 @@
 //!     timeout. The probe only reads (`get_range` of one byte), so a poll never writes
 //!     to the bucket; an absent key is an answer, and so passes.
 //!
+//! - `/readyz/reapi`: what the REAPI cluster of a load balancer asks. `/readyz`'s checks, and
+//!   one more, `no_worker`: at least one worker has an open stream to this server. The worker
+//!   and enrollment clusters keep asking `/readyz`, since a frontend with no worker gets its
+//!   first one through the worker listener, which the same balancer routes by that answer.
+//!   An Execute that none of this server's workers can run waits here, and another frontend
+//!   takes it only once this one stands down, so a frontend that answers Execute calls with
+//!   no worker leaves them waiting for as long as it is up.
+//!
 //! Once the server has given its roles away ([`Readiness::set_handed_over`], which a retire
 //! does: `POST /v1/frontend/retire`, `docs/api.md`) the probes are not asked and the check
 //! passes on `stopping` and `leader` alone: its farm is fenced and the others hold the store's
@@ -140,7 +148,7 @@ impl Readiness {
 /// One failing check of `/readyz`.
 #[derive(Serialize)]
 pub struct Failing {
-    /// `stopping`, `leader`, or the name of a probe (`store`; a frontend's `storage`,
+    /// `stopping`, `leader`, `no_worker` (`/readyz/reapi` only), or the name of a probe (`store`; a frontend's `storage`,
     /// `state_store` and `map`).
     pub check: &'static str,
     /// Why it fails.
@@ -408,8 +416,26 @@ where
 pub fn routes(checks: &Arc<Checks>, farm: &Arc<Farm>, members: Option<&Arc<Members>>) -> Router {
     let summary =
         crate::health_summary::route(Arc::clone(checks), Arc::clone(farm), members.cloned());
-    router_of(Arc::clone(checks)).merge(summary)
+    let reapi = Router::new()
+        .route(READYZ_REAPI, get(readyz_reapi))
+        .with_state(Arc::new(ReapiReady {
+            checks: Arc::clone(checks),
+            farm: Arc::clone(farm),
+        }));
+    router_of(Arc::clone(checks)).merge(summary).merge(reapi)
 }
+
+/// The path of `GET /readyz/reapi`.
+pub const READYZ_REAPI: &str = "/readyz/reapi";
+
+/// What `GET /readyz/reapi` reads.
+struct ReapiReady {
+    checks: Arc<Checks>,
+    farm: Arc<Farm>,
+}
+
+/// The check `/readyz/reapi` adds to `/readyz`'s.
+const NO_WORKER: &str = "no_worker";
 
 /// The `/healthz` and `/readyz` routes over `checks`.
 pub fn router_of(checks: Arc<Checks>) -> Router {
@@ -429,7 +455,24 @@ async fn healthz() -> Response {
 }
 
 async fn readyz(State(checks): State<Arc<Checks>>) -> Response {
-    let failing = checks.failing().await;
+    ready_answer(checks.failing().await)
+}
+
+/// `/readyz`'s answer, and `no_worker` while no worker has a connected stream here. A
+/// worker of any platform counts, whatever its placement: the rule is that this server has
+/// someone to hand an operation to at all, not that it can run every operation.
+async fn readyz_reapi(State(state): State<Arc<ReapiReady>>) -> Response {
+    let mut failing = state.checks.failing().await;
+    if !state.farm.nodes().nodes.iter().any(|node| node.connected) {
+        failing.push(Failing {
+            check: NO_WORKER,
+            reason: "no worker is connected to this server".to_owned(),
+        });
+    }
+    ready_answer(failing)
+}
+
+fn ready_answer(failing: Vec<Failing>) -> Response {
     let ready = failing.is_empty();
     let code = if ready {
         StatusCode::OK

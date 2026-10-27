@@ -64,7 +64,12 @@ static_resources:
           keepalive_time: 30
           keepalive_interval: 10
           keepalive_probes: 3
-      # Active health check: ask each frontend's operator API for /readyz.
+      # Active health check: ask each frontend's operator API for /readyz/reapi.
+      # /readyz/reapi is /readyz plus "at least one worker is connected here": a
+      # frontend that restarted while every worker stayed on the other one is
+      # ready but cannot place an Execute, which would then wait for as long as
+      # it is up. Only this cluster asks it: the worker and enroll clusters keep
+      # /readyz, because a frontend gets its first worker through them.
       # /readyz answers 200 when the frontend is ready and 503 from the moment a
       # drain begins (SIGTERM, SIGINT or POST /v1/frontend/drain), so a frontend
       # that is being replaced stops getting new connections here. /healthz would
@@ -77,8 +82,8 @@ static_resources:
           # The check goes to the operator API port, not the traffic port.
           alt_port: 8982
           http_health_check:
-            path: /readyz
-            # Each /readyz makes one read of the store: keep the interval at a
+            path: /readyz/reapi
+            # Each /readyz/reapi makes one read of the store: keep the interval at a
             # second or more.
       # Outlier detection catches a frontend that is up and ready but whose
       # connections fail (for TCP, a failed connect counts as a 5xx).

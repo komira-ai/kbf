@@ -144,6 +144,12 @@ frontend is ready and `503` when it is not, with a body that lists each failing 
 ([api.md](../api.md#get-healthz-and-get-readyz)). The checks are `stopping`, `leader`
 and `store`.
 
+The REAPI cluster asks `GET /readyz/reapi` instead: `/readyz` and, in addition, at least one
+connected worker (check `no_worker`). A frontend that restarted while every worker stayed on
+the other one would otherwise take Execute calls it cannot place, and they would wait for as
+long as it is up. The worker and enrollment clusters keep `/readyz`, since a frontend gets its
+first worker through them.
+
 **Readiness drops during a drain.** From the moment a frontend receives SIGTERM or
 SIGINT, or `POST /v1/frontend/drain` is called, `/readyz` answers `503` (`stopping`) and
 stays so until the process exits. At the same time the frontend refuses new Execute
