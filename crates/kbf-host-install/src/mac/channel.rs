@@ -20,6 +20,33 @@
 //! artifact_prefix = "other"               # optional; `kbf` is the default
 //! ```
 //!
+//! A channel of another service names it, and the same file describes the service
+//! ([`crate::service`]):
+//!
+//! ```toml
+//! trusted_workflows = ["owner/js/.github/workflows/release.yml"]
+//! [services.js-agent]
+//! artifact = "js-agent"
+//! binary = "js-agent"
+//! tree = "js-agent"
+//! units = ["js-agent.service"]
+//! [channels.js-stable]
+//! service = "js-agent"
+//! source = "github"
+//! repository = "owner/js"
+//! signer_workflow = "owner/js/.github/workflows/release.yml"
+//! artifact_prefix = "js-agent"
+//! ```
+//!
+//! A channel with no `service` is kbf's. A channel of any other service must name
+//! `repository`, `signer_workflow` and `artifact_prefix` itself (it has no default, so it can
+//! never be taken for kbf's), the prefix must be its descriptor's `artifact`, its signer
+//! workflow must be listed in `trusted_workflows` (kbf's own is not enough: kbf's workflow
+//! does not sign another service), and the service must have a descriptor. A request for a
+//! service uses only the channels of that service ([`MacAllowlist::channel_of`]); the
+//! channel of another is not allowed. A file that breaks any of this is
+//! [`Refusal::ConfigInvalid`] as a whole.
+//!
 //! A channel takes its releases from exactly one place: a `dir`, or `source = "github"`.
 //!
 //! - `dir` is where the release files are put: `kbf-<commit>-darwin-arm64.tar.gz` and its
@@ -56,6 +83,7 @@ use super::release::{ARTIFACT_PREFIX, Origin, REPO, WORKFLOW, is_signer_workflow
 use crate::config::refusal;
 use crate::outcome::Refusal;
 use crate::request::Channel;
+use crate::service::{self, Descriptor, ServiceName};
 use crate::trust::Trust;
 
 /// The branch an attestation is accepted for when the channel names none.
@@ -124,12 +152,15 @@ impl fmt::Display for ChannelError {
 struct File {
     #[serde(default)]
     trusted_workflows: Vec<String>,
+    #[serde(default)]
+    services: BTreeMap<String, service::Entry>,
     channels: BTreeMap<String, Entry>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Entry {
+    service: Option<String>,
     dir: Option<PathBuf>,
     source: Option<String>,
     token_file: Option<PathBuf>,
@@ -144,6 +175,7 @@ struct Entry {
 #[derive(Debug)]
 pub struct MacAllowlist {
     trusted_workflows: Vec<String>,
+    services: BTreeMap<String, Descriptor>,
     channels: BTreeMap<String, Entry>,
 }
 
@@ -162,8 +194,21 @@ impl MacAllowlist {
                     .to_str()
                     .is_some_and(|p| !p.chars().any(char::is_control))
         };
+        let services: Option<BTreeMap<String, Descriptor>> = file
+            .services
+            .iter()
+            .map(|(name, entry)| {
+                Descriptor::from_entry(name, entry)
+                    .ok()
+                    .map(|d| (name.clone(), d))
+            })
+            .collect();
+        let Some(services) = services else {
+            return Err(Refusal::ConfigInvalid);
+        };
         let well_formed = file.channels.iter().all(|(name, entry)| {
             Channel::new(name).is_ok()
+                && service_ok(entry, &services)
                 && entry.dir.as_deref().is_none_or(plain)
                 && entry.token_file.as_deref().is_none_or(plain)
                 && source_of(entry).is_some()
@@ -176,28 +221,55 @@ impl MacAllowlist {
         }
         Ok(Self {
             trusted_workflows: file.trusted_workflows,
+            services,
             channels: file.channels,
         })
     }
 
-    /// The channel `name`, once its pinned sums (if it has any) are known to be root's.
+    /// The descriptors of the services the file describes, by name.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn services(&self) -> impl Iterator<Item = &Descriptor> {
+        self.services.values()
+    }
+
+    /// The channel `name` of kbf, once its pinned sums (if it has any) are known to be root's.
     ///
     /// # Errors
     /// [`ChannelError::Refused`] with [`Refusal::ChannelNotAllowed`], [`Refusal::ConfigUnsafe`]
     /// or [`Refusal::ConfigInvalid`]; [`ChannelError::UntrustedSigner`] for a signer workflow
-    /// other than kbf's own that `trusted_workflows` does not name.
+    /// other than kbf's own that `trusted_workflows` does not name. The channel of another
+    /// service is not allowed here.
     pub fn channel(&self, trust: &Trust, name: &Channel) -> Result<MacChannel, ChannelError> {
+        self.channel_of(trust, name, &ServiceName::kbf())
+    }
+
+    /// The channel `name`, which must be a channel of `service`.
+    ///
+    /// # Errors
+    /// As [`MacAllowlist::channel`]; a channel of another service is
+    /// [`Refusal::ChannelNotAllowed`]. For a service other than kbf the signer workflow must
+    /// be listed in `trusted_workflows` whoever's it is.
+    pub fn channel_of(
+        &self,
+        trust: &Trust,
+        name: &Channel,
+        service: &ServiceName,
+    ) -> Result<MacChannel, ChannelError> {
         let entry = self
             .channels
             .get(name.as_str())
             .ok_or(Refusal::ChannelNotAllowed)?;
+        if service_name(entry).as_ref() != Some(service) {
+            return Err(Refusal::ChannelNotAllowed.into());
+        }
         let origin = origin_of(entry).ok_or(Refusal::ConfigInvalid)?;
-        if !origin.is_kbf_signer()
-            && !self
-                .trusted_workflows
-                .iter()
-                .any(|w| w == origin.workflow())
-        {
+        // kbf's own workflow signs kbf and nothing else: any other pair is listed.
+        let own = origin.is_kbf_signer() && service.is_kbf();
+        let listed = self
+            .trusted_workflows
+            .iter()
+            .any(|w| w == origin.workflow());
+        if !own && !listed {
             return Err(ChannelError::UntrustedSigner {
                 channel: name.as_str().to_owned(),
                 workflow: origin.workflow().to_owned(),
@@ -225,10 +297,38 @@ impl MacAllowlist {
     }
 }
 
+/// The service an entry is for: kbf when it names none; none when the name is not one.
+fn service_name(entry: &Entry) -> Option<ServiceName> {
+    match entry.service.as_deref() {
+        None => Some(ServiceName::kbf()),
+        Some(name) => ServiceName::new(name).ok(),
+    }
+}
+
+/// Whether the service an entry names is usable: kbf, or a service with a descriptor whose
+/// `artifact` is the entry's `artifact_prefix`. (That the entry names its origin is
+/// [`origin_of`]'s.)
+fn service_ok(entry: &Entry, services: &BTreeMap<String, Descriptor>) -> bool {
+    let Some(service) = service_name(entry) else {
+        return false;
+    };
+    service.is_kbf()
+        || services
+            .get(service.as_str())
+            .is_some_and(|d| entry.artifact_prefix.as_deref() == Some(d.artifact.as_str()))
+}
+
 /// The origin an entry names: kbf's when it names none. The repository and the workflow
-/// come together; a prefix goes with a GitHub channel that has no sums.
+/// come together; a prefix goes with a GitHub channel that has no sums. A channel of another
+/// service names all three: none of them has a default.
 fn origin_of(entry: &Entry) -> Option<Origin> {
     let prefix = entry.artifact_prefix.as_deref();
+    let other_service = service_name(entry).is_none_or(|service| !service.is_kbf());
+    let names_all =
+        entry.repository.is_some() && entry.signer_workflow.is_some() && prefix.is_some();
+    if other_service && !names_all {
+        return None;
+    }
     let named_files = prefix.is_some() && (entry.dir.is_some() || entry.sums.is_some());
     let prefix = prefix.unwrap_or(ARTIFACT_PREFIX);
     match (&entry.repository, &entry.signer_workflow) {

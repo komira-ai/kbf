@@ -595,9 +595,71 @@ artifact_prefix = "other"                 # optional; "kbf" is the default
   and be checked offline by the pinned `gh` and trusted root. The former `komira-ai/komira-build-farm`
   name is accepted for the `komira-ai/kbf` default pair only; for any other pair `gh` is asked once.
 - Only the signer, the listing and the file names are the channel's. What is checked about the
-  contents (the tarball holds the one `kbf` executable, a package is named `kbf`) is unchanged.
+  contents of a kbf channel's release (the tarball holds the one `kbf` executable, a package is named `kbf`) is unchanged; a channel of [another service](#a-channel-of-another-service) is held to that service's names.
 
 A file without these keys means what it meant before.
+
+### A channel of another service
+
+The helper installs releases of a service other than kbf, on the Linux local socket, when the
+channels file says which service a channel is for and describes the service. The same file:
+
+```toml
+trusted_workflows = ["owner/js/.github/workflows/release.yml"]
+
+[services.js-agent]
+artifact = "js-agent"            # the start of its release files' names
+binary = "js-agent"              # the file of the tarball that is the program
+tree = "js-agent"                # its releases are in /var/lib/<tree>
+units = ["js-agent.service"]     # restarted on a switch and on a revert
+
+[channels.js-stable]
+service = "js-agent"             # absent: kbf
+source = "github"
+repository = "owner/js"
+signer_workflow = "owner/js/.github/workflows/release.yml"
+artifact_prefix = "js-agent"
+```
+
+- **No default.** A channel whose `service` is not `kbf` must name `repository`,
+  `signer_workflow` and `artifact_prefix` itself. If any of the three is missing, the file is
+  `config_invalid`, so no channel of it is usable: a channel of another service can never be taken
+  for kbf's. The `artifact_prefix` must be the descriptor's `artifact`, `source` must be
+  `github`, and a `dir` or `sums` is not allowed (those file names are kbf's).
+- **The signer must be listed.** The channel's `signer_workflow` must be in the top-level
+  `trusted_workflows`, whoever's it is: kbf's own `artifacts.yml` does not sign another
+  service, so naming it in a channel of another service is refused too (`channel_not_allowed`,
+  as above).
+- **A request uses only its own service's channels.** kbf's requests use the channels with no
+  `service` (or `service = "kbf"`); a request for `js-agent` uses channels whose `service` is
+  `js-agent`. The channel of another service is `channel_not_allowed`.
+- **The descriptor.** Every key of `[services.<name>]` is required. `<name>` is `[a-z][a-z0-9-]*`
+  (at most 32 bytes), and `kbf` and the names that start with `kbf-` are kbf's. `artifact` is
+  lower-case letters, digits and `-`. `binary` is a plain file name (letters, digits and `. _ -`;
+  not `VERIFIED`). `tree` is the service's name, or starts with it and a dash, so a service cannot
+  write under another service's tree. Each of `units` is `<name>.service`, `<name>-<more>.service`
+  or either with an `@<instance>`, so a service cannot restart `sshd.service` or a unit of kbf.
+  A descriptor that breaks a rule makes the whole file `config_invalid`. kbf's own descriptor is
+  built in and is what everything above this section describes.
+- **The layout.** A service's releases are in the layout of kbf's, in a tree of their own:
+  `/var/lib/<tree>/releases/<commit>/<binary>`, the `current` and `previous` links beside it, the
+  installer's `state.json` and `work/` in `/var/lib/<tree>`, and the lock in
+  `/run/<tree>/lock`. The helper's own state for the service is `state-<name>.json` in
+  `/var/lib/kbf-host-install`, and its install lock `/run/kbf-host-install-<name>.lock`. Like
+  kbf's, a service needs a release that runs already (`no_current` otherwise): the first release is
+  placed by hand.
+- **What is checked about a release.** The verify pipeline is kbf's, with the service's names:
+  the tarball must hold the one file `<binary>` (and nothing else), it must be an executable of
+  this CPU, the attestation must be of the channel's repository and workflow alone (kbf's former
+  name is not tried), and the executable run as the unprivileged user with `--version --json` must
+  print the report the pipeline reads and name the release's commit. A tarball that holds `kbf`
+  instead of the service's `<binary>`, and a kbf release that holds the service's, are
+  `verify_failed`.
+- The descriptors are read from the file when a request or a check of the deadline needs them, so
+  a service added to the file is served at once and one removed from it is refused. A file that
+  cannot be trusted or read is `config_unsafe` or `config_invalid` for the service's requests,
+  and until it can be read again the deadline of a release on trial of a service is not checked.
+  On a Mac, and with `--layout deb|rpm` or `--frontend-container`, no service but kbf is served.
 
 ## The local socket
 
@@ -664,8 +726,25 @@ knows its text), `query` (`commit`, `version`, `node_id`, `pending`, `last`, `bu
 code from a closed set: `bad_command`, `channel_not_allowed`, `config_invalid`, `config_unsafe`,
 `unknown_release`, `ambiguous_release`, `fetch_failed`, `verify_failed`, `pending`, `not_staged`,
 `nothing_pending`, `no_current`, `busy`, `stage_failed`, `switch_failed`, `revert_failed`,
-`state_unavailable`, `audit_unavailable`, `peer_not_ready`, `runtime_failed`. The detail of a refusal goes to the journal, cleaned,
+`state_unavailable`, `audit_unavailable`, `peer_not_ready`, `runtime_failed`,
+`service_not_configured`. The detail of a refusal goes to the journal, cleaned,
 never to the line.
+
+A request may name the service it is for; absent means kbf, so the lines above mean what they
+always meant. The service takes the place of `kbf` in the three requests that carry a version, and
+follows `query` and `revert`:
+
+```text
+query js-agent
+install js-agent=<version> from <channel>
+switch js-agent=<version>
+confirm js-agent=<version>
+revert js-agent
+```
+
+A service the file does not describe is `service_not_configured` (nothing ran). The audit line of
+a request for a service has a `service` field; kbf's lines have none. Services are described in
+[a channel of another service](#a-channel-of-another-service).
 
 ### The revert is this program's
 

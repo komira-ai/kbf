@@ -89,3 +89,95 @@ fn the_line_limit_fits_the_longest_request() {
     assert!(longest.len() <= MAX_LINE_LEN, "{}", longest.len());
     assert!(LocalRequest::parse(&longest).is_ok());
 }
+
+use super::request::Addressed;
+
+fn service_of(text: &str) -> (String, LocalRequest) {
+    let addressed = Addressed::parse(text).unwrap();
+    (addressed.service.as_str().to_owned(), addressed.request)
+}
+
+/// Today's five lines mean kbf, and mean what they meant: the same request `LocalRequest`
+/// gives.
+#[test]
+fn todays_lines_are_kbfs() {
+    for text in [
+        "query".to_owned(),
+        "revert".to_owned(),
+        format!("install kbf={VERSION} from stable"),
+        format!("switch kbf={VERSION}"),
+        format!("confirm kbf={VERSION}"),
+    ] {
+        let (service, request) = service_of(&text);
+        assert_eq!(service, "kbf", "{text}");
+        assert_eq!(
+            format!("{request:?}"),
+            format!("{:?}", LocalRequest::parse(&text).unwrap()),
+            "{text}"
+        );
+    }
+}
+
+/// The form of another service puts its name where `kbf` is, or after `query` and `revert`;
+/// the rest of the line is the grammar of kbf's.
+#[test]
+fn a_service_is_named_where_kbf_is() {
+    let (service, request) = service_of(&format!("install js-agent={VERSION} from js-stable"));
+    assert_eq!(service, "js-agent");
+    assert!(matches!(
+        &request,
+        LocalRequest::Install { version, channel }
+            if version.as_str() == VERSION && channel.as_str() == "js-stable"
+    ));
+    let (service, request) = service_of(&format!("switch js-agent={VERSION}"));
+    assert_eq!(service, "js-agent");
+    assert!(matches!(&request, LocalRequest::Switch { version } if version.as_str() == VERSION));
+    let (service, request) = service_of(&format!("confirm js-agent={VERSION}"));
+    assert_eq!(service, "js-agent");
+    assert!(matches!(&request, LocalRequest::Confirm { version } if version.as_str() == VERSION));
+    let (service, request) = service_of("query js-agent");
+    assert_eq!(service, "js-agent");
+    assert!(matches!(request, LocalRequest::Query));
+    let (service, request) = service_of("revert js-agent");
+    assert_eq!(service, "js-agent");
+    assert!(matches!(request, LocalRequest::Revert));
+    // Naming kbf is naming kbf.
+    assert_eq!(service_of("query kbf").0, "kbf");
+    assert_eq!(service_of("revert kbf").0, "kbf");
+}
+
+/// A service form with a bad name, a bad rest, a verb that has none, or an extra part is
+/// refused, as are the ways to smuggle a second request or a path in.
+#[test]
+fn a_service_form_outside_the_grammar_is_refused() {
+    let bad = [
+        "query ".to_owned(),
+        "query Js".to_owned(),
+        "query js agent".to_owned(),
+        "query js-agent ".to_owned(),
+        "query js-agent\n".to_owned(),
+        "query js-".to_owned(),
+        "query -js".to_owned(),
+        "query ../js".to_owned(),
+        "revert js-agent now".to_owned(),
+        "revert ".to_owned(),
+        "restart js-agent=-".to_owned(),
+        "stage js-agent=1".to_owned(),
+        "install =".to_owned(),
+        "install js-agent".to_owned(),
+        format!("install JS={VERSION} from stable"),
+        format!("install js/agent={VERSION} from stable"),
+        format!("install js-agent={VERSION}"),
+        format!("install js-agent={VERSION} from ../stable"),
+        "install js-agent=-1 from stable".to_owned(),
+        format!("switch js-agent={VERSION} from stable"),
+        format!("switch js-agent={VERSION}\0"),
+        format!("confirm js-agent {VERSION}"),
+        format!("confirm  js-agent={VERSION}"),
+        format!("install kbf js-agent={VERSION} from stable"),
+        "install kbf=".to_owned(),
+    ];
+    for text in bad {
+        assert!(Addressed::parse(&text).is_err(), "{text:?}");
+    }
+}

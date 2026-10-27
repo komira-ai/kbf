@@ -9,4 +9,5 @@ mod install;
 mod pure;
 mod query;
 mod real_output;
+mod service_tests;
 mod stage_tests;

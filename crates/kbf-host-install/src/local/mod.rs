@@ -28,12 +28,15 @@ pub mod core;
 pub mod production;
 pub mod request;
 pub mod serve;
+pub mod services;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub mod units;
 
 // Compiled and tested everywhere, used by the program on Linux only.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub mod frontend;
+#[cfg(target_os = "linux")]
+pub mod hub;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "linux")]

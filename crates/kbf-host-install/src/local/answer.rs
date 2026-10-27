@@ -60,11 +60,14 @@ pub enum Code {
     PeerNotReady,
     /// The container runtime could not be asked, or did not do what it was asked.
     RuntimeFailed,
+    /// The request names a service this host's configuration does not describe (or this
+    /// helper does not serve).
+    ServiceNotConfigured,
 }
 
 impl Code {
     /// Every code.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::BadCommand,
         Self::ChannelNotAllowed,
         Self::ConfigInvalid,
@@ -85,6 +88,7 @@ impl Code {
         Self::AuditUnavailable,
         Self::PeerNotReady,
         Self::RuntimeFailed,
+        Self::ServiceNotConfigured,
     ];
 
     /// The code whose closed spelling this is.
@@ -115,6 +119,7 @@ impl Code {
             Self::AuditUnavailable => "audit_unavailable",
             Self::PeerNotReady => "peer_not_ready",
             Self::RuntimeFailed => "runtime_failed",
+            Self::ServiceNotConfigured => "service_not_configured",
         }
     }
 }

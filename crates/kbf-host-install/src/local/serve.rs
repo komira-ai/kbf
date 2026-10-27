@@ -48,10 +48,12 @@ use std::time::Duration;
 use super::answer::{Answer, Code};
 use super::backend::Backend;
 use super::core::Ab;
-use super::request::{LocalRequest, MAX_LINE_LEN};
+use super::request::{Addressed, LocalRequest, MAX_LINE_LEN};
+use super::services::Services;
 use crate::audit::{self, Audit};
 use crate::pace::{Now, Pace};
 use crate::request::{BadCommand, Unit};
+use crate::service::ServiceName;
 use crate::trust::Trust;
 
 /// The window a release on trial has to be confirmed, unless a flag says otherwise.
@@ -309,6 +311,8 @@ pub struct Serving<'a, B: Backend> {
     pub log: &'a dyn Fn(&str),
     /// The clock of the loop's pauses and of a client's window.
     pub pace: &'a Pace,
+    /// The services other than kbf, which `ab` is the backend of.
+    pub services: &'a dyn Services,
 }
 
 impl<B: Backend> Serving<'_, B> {
@@ -327,33 +331,48 @@ impl<B: Backend> Serving<'_, B> {
 
     /// Answer a request line (none: not one that was understood).
     pub fn answer(&self, line: Option<&str>) -> Answer {
-        let request = line.map_or(Err(BadCommand), LocalRequest::parse);
+        let request = line.map_or(Err(BadCommand), Addressed::parse);
         let log = Audit::open(self.trust, self.audit);
         let answer = match &request {
             Err(BadCommand) => Answer::Refused(Code::BadCommand, "not a request".to_owned()),
             // A revert goes back to the release that ran; nothing holds it back.
-            Ok(request @ (LocalRequest::Query | LocalRequest::Revert)) => self.ab.handle(request),
-            Ok(request) if log.is_err() => Answer::Failed(
+            Ok(
+                addressed @ Addressed {
+                    request: LocalRequest::Query | LocalRequest::Revert,
+                    ..
+                },
+            ) => self.dispatch(addressed),
+            Ok(addressed) if log.is_err() => Answer::Failed(
                 Code::AuditUnavailable,
                 format!(
                     "{}: the audit log cannot be opened; nothing was run",
-                    request.verb()
+                    addressed.request.verb()
                 ),
             ),
-            Ok(request) => self.ab.handle(request),
+            Ok(addressed) => self.dispatch(addressed),
         };
         self.record(request.as_ref().ok(), line, &answer, log);
         answer
     }
 
+    /// Hand the request to the one that serves its service: `ab` for kbf.
+    fn dispatch(&self, addressed: &Addressed) -> Answer {
+        if addressed.service.is_kbf() {
+            self.ab.handle(&addressed.request)
+        } else {
+            self.services.handle(&addressed.service, &addressed.request)
+        }
+    }
+
     /// Append the audit line, and tell the log what a refusal or a failure said.
     pub fn record(
         &self,
-        request: Option<&LocalRequest>,
+        addressed: Option<&Addressed>,
         line: Option<&str>,
         answer: &Answer,
         log: io::Result<Audit>,
     ) {
+        let request = addressed.map(|a| &a.request);
         if let Some(detail) = answer.log_detail() {
             let verb = request.map_or("?", LocalRequest::verb);
             (self.log)(&format!(
@@ -378,6 +397,9 @@ impl<B: Backend> Serving<'_, B> {
         let entry = audit::Entry {
             time: audit::now(),
             verb: request.map(LocalRequest::verb),
+            service: addressed
+                .filter(|a| !a.service.is_kbf())
+                .map(|a| a.service.as_str().to_owned()),
             version,
             channel,
             unit: None,
@@ -397,16 +419,35 @@ impl<B: Backend> Serving<'_, B> {
         }
     }
 
-    /// Go back, if a release on trial is past its deadline; audited like a revert. Whether it
-    /// tried and failed, so that the loop leaves it alone for a while.
+    /// Go back, for each service (kbf and the others) with a release on trial past its
+    /// deadline; audited like a revert. Whether any tried and failed, so that the loop leaves
+    /// them alone for a while.
     pub fn tick(&self) -> bool {
-        let Some(answer) = self.ab.tick() else {
-            return false;
-        };
-        (self.log)(&format!("the deadline passed: {}", answer.json_line()));
-        let log = Audit::open(self.trust, self.audit);
-        self.record(Some(&LocalRequest::Revert), None, &answer, log);
-        !matches!(answer, Answer::Reverted { .. })
+        let mut done: Vec<(ServiceName, Answer)> = Vec::new();
+        if let Some(answer) = self.ab.tick() {
+            done.push((ServiceName::kbf(), answer));
+        }
+        done.extend(self.services.tick());
+        let mut failed = false;
+        for (service, answer) in done {
+            let whose = if service.is_kbf() {
+                String::new()
+            } else {
+                format!(" ({})", service.as_str())
+            };
+            (self.log)(&format!(
+                "the deadline passed{whose}: {}",
+                answer.json_line()
+            ));
+            let log = Audit::open(self.trust, self.audit);
+            let revert = Addressed {
+                service,
+                request: LocalRequest::Revert,
+            };
+            self.record(Some(&revert), None, &answer, log);
+            failed |= !matches!(answer, Answer::Reverted { .. });
+        }
+        failed
     }
 
     /// Serve until `stop` is set: the connections, and the ticks between them.

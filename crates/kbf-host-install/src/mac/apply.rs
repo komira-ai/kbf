@@ -213,6 +213,7 @@ fn record(host: &MacHost, plan: Option<&Plan>, state: &ApplyState) {
     let entry = audit::Entry {
         time: audit::now(),
         verb: Some("apply"),
+        service: None,
         version: plan.map(|plan| plan.version.clone()),
         channel: None,
         unit: None,

@@ -80,6 +80,21 @@ pub fn is_signer_workflow(text: &str) -> bool {
         .is_some_and(|(repository, _)| is_workflow_of(repository, text))
 }
 
+/// The marker the verify pipeline writes into a release directory: a program of a release
+/// cannot be called that.
+pub const VERIFIED_MARKER: &str = "VERIFIED";
+
+/// Whether `prefix` can start the names of release files: lower-case letters, digits and `-`,
+/// at most 32 bytes, not starting with `-`.
+pub fn is_artifact_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && prefix.len() <= 32
+        && !prefix.starts_with('-')
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 impl Origin {
     /// kbf's own repository, workflow and file names.
     pub fn kbf() -> Self {
@@ -107,13 +122,7 @@ impl Origin {
                 "{workflow:?} is not a workflow file under {repository}/.github/workflows/"
             ));
         }
-        let prefix_ok = !prefix.is_empty()
-            && prefix.len() <= 32
-            && !prefix.starts_with('-')
-            && prefix
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-        if !prefix_ok {
+        if !is_artifact_prefix(prefix) {
             return Err(format!(
                 "{prefix:?} is not an artifact prefix (lower-case letters, digits and -)"
             ));

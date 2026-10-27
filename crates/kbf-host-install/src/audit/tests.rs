@@ -11,6 +11,7 @@ fn entry(outcome: &'static str) -> Entry {
     Entry {
         time: "2026-10-22T00:00:00Z".into(),
         verb: Some("install"),
+        service: None,
         version: Some("1.0-1".into()),
         channel: Some("candidate".into()),
         unit: None,

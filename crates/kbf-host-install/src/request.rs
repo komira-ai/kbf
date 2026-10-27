@@ -174,6 +174,40 @@ impl Unit {
         Ok(Self(text.to_owned()))
     }
 
+    /// A unit of the service `owner`, which the root-owned configuration names:
+    /// `<owner>.service` or `<owner>-<more>.service`, or either with an instance
+    /// (`@<instance>`, as a frontend's). The base is lower-case letters, digits and `-`, and
+    /// it starts with the owner's name, so the unit is a file name's worth of text that
+    /// cannot be taken for an option, for another kind of unit or for another service's.
+    ///
+    /// # Errors
+    /// [`BadCommand`] when `text` is not such a name.
+    pub fn owned_by(owner: &str, text: &str) -> Result<Self, BadCommand> {
+        let stem = text.strip_suffix(".service").ok_or(BadCommand)?;
+        let (base, instance) = match stem.split_once('@') {
+            Some((base, instance)) => (base, Some(instance)),
+            None => (stem, None),
+        };
+        let own = base == owner
+            || base
+                .strip_prefix(owner)
+                .and_then(|rest| rest.strip_prefix('-'))
+                .is_some_and(|more| !more.is_empty());
+        let plain = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-';
+        let base_ok =
+            own && base.len() <= MAX_SERVICE_LEN && base.bytes().all(plain) && !base.ends_with('-');
+        if !base_ok {
+            return Err(BadCommand);
+        }
+        if let Some(instance) = instance {
+            Self::frontend(instance)?;
+            if instance == "-" {
+                return Err(BadCommand);
+            }
+        }
+        Ok(Self(text.to_owned()))
+    }
+
     /// The unit name, safe as an argument and as JSON.
     pub fn as_str(&self) -> &str {
         &self.0

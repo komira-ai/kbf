@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::backend::Backend;
 use super::core::Ab;
 use super::serve::{self, Layout, ServeConfig, Serving};
+use super::services::{NoServices, Services};
 use crate::mac::layout::MacHost;
 use crate::pace::Pace;
 use crate::runner::{Runner, SystemRunner};
@@ -99,6 +100,17 @@ pub(super) fn serve_with<B: Backend>(
     place: &Place<'_>,
     stop: &AtomicBool,
 ) -> Result<(), String> {
+    serve_with_services(config, backend, place, &NoServices, stop)
+}
+
+/// [`serve_with`], with the services other than kbf served by `services`.
+pub(super) fn serve_with_services<B: Backend>(
+    config: &ServeConfig,
+    backend: B,
+    place: &Place<'_>,
+    services: &dyn Services,
+    stop: &AtomicBool,
+) -> Result<(), String> {
     let ab = Ab::new(
         backend,
         place.state_dir.join(place.state_name),
@@ -115,6 +127,7 @@ pub(super) fn serve_with<B: Backend>(
         audit: place.audit,
         log: &log,
         pace: &pace,
+        services,
     };
     serving
         .run(&listener, stop)
@@ -163,6 +176,19 @@ pub(super) fn serve_linux_with<B: Backend>(
     backend: B,
     stop: &AtomicBool,
 ) -> Result<(), String> {
+    serve_linux_with_services(config, env, trust, backend, &NoServices, stop)
+}
+
+/// [`serve_linux_with`], with the services other than kbf served by `services`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn serve_linux_with_services<B: Backend>(
+    config: &ServeConfig,
+    env: &LinuxEnv,
+    trust: &Trust,
+    backend: B,
+    services: &dyn Services,
+    stop: &AtomicBool,
+) -> Result<(), String> {
     if config.units.is_empty() && !config.frontend_container {
         return Err(
             "--restart-unit is required on a Linux host (or --frontend-container)".to_owned(),
@@ -182,7 +208,7 @@ pub(super) fn serve_linux_with<B: Backend>(
         ids,
         audit: &env.audit,
     };
-    serve_with(config, backend, &place, stop)
+    serve_with_services(config, backend, &place, services, stop)
 }
 
 /// The Linux side as the program runs it.
@@ -222,11 +248,14 @@ fn serve_linux_for(config: &ServeConfig) -> Result<(), String> {
     }
     let format = match config.layout {
         Layout::Installer => {
-            return serve_linux_with(
+            let trust = Trust::root();
+            let hub = super::hub::production(&trust, &env.state_dir, config.window_secs);
+            return serve_linux_with_services(
                 config,
                 &env,
-                &Trust::root(),
+                &trust,
                 super::linux::production(config.units.clone()),
+                &hub,
                 &AtomicBool::new(false),
             );
         }

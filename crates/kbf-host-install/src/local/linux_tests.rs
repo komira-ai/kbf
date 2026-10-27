@@ -28,12 +28,13 @@ use kbf_testkit::dir::TestDir;
 use super::answer::{Answer, Code};
 use super::backend::{Backend, Fault};
 use super::core::Ab;
-use super::linux::{Linux, Tools};
+use super::linux::{Linux, Subject, Tools};
 use super::request::LocalRequest;
 use crate::host::Host;
 use crate::plan::Wait;
 use crate::request::{Channel, Unit, Version};
 use crate::runner::{Cmd, Exec, Runner};
+use crate::service::Descriptor;
 use crate::trust::Trust;
 
 /// The backend of a rig, lent to the core, which owns the one it is given.
@@ -249,6 +250,10 @@ impl Runner for Sim {
 /// A Linux host on a scratch root: release A runs, a channel `stable` offers the release
 /// named `COMMIT`.
 struct Rig {
+    /// The tree the releases are in: `kbf-installer`, or a service's own.
+    tree: String,
+    /// The program of a release, which the tarball holds and the release directory gets.
+    program: String,
     dir: TestDir,
     layout: Layout,
     backend: Linux<ScratchHost>,
@@ -260,21 +265,51 @@ struct Rig {
     probe: Rc<RefCell<String>>,
 }
 
+/// The service a rig updates: kbf, or one a descriptor describes.
+struct Kind {
+    descriptor: Descriptor,
+    /// The text of the channels file.
+    channels: String,
+}
+
+impl Kind {
+    fn kbf() -> Self {
+        Self {
+            descriptor: Descriptor::kbf(vec![
+                Unit::service("kbf-daemon.service").unwrap(),
+                Unit::service("kbf-frontend@a.service").unwrap(),
+            ]),
+            channels: "[channels.stable]\nsource = \"github\"\n".to_owned(),
+        }
+    }
+}
+
 impl Rig {
     fn new(name: &str) -> Self {
+        Self::build(name, &Kind::kbf())
+    }
+
+    fn build(name: &str, kind: &Kind) -> Self {
+        let (tree, program) = (kind.descriptor.tree.clone(), kind.descriptor.binary.clone());
         let exec = ScratchHost::new(&format!("hi-linux-{name}"));
         for sub in [
-            "run",
-            "var/lib/kbf-installer",
-            "var/lib/kbf-installer/releases",
+            "run".to_owned(),
+            format!("var/lib/{tree}"),
+            format!("var/lib/{tree}/releases"),
         ] {
             fs::create_dir_all(exec.root.join(sub)).unwrap();
         }
-        let layout = Layout::linux(Root::new(&exec.root).unwrap());
+        let layout = if kind.descriptor.name.is_kbf() {
+            Layout::linux(Root::new(&exec.root).unwrap())
+        } else {
+            Layout::linux(Root::new(&exec.root).unwrap())
+                .with_tree(&tree, &program)
+                .unwrap()
+        };
         // Release A, running.
-        let a_dir = exec.at(&format!("/var/lib/kbf-installer/releases/{A}"));
+        let a_dir = exec.at(&format!("/var/lib/{tree}/releases/{A}"));
         fs::create_dir_all(&a_dir).unwrap();
-        fs::write(a_dir.join("kbf"), binary("a")).unwrap();
+        fs::write(a_dir.join(&program), binary("a")).unwrap();
         Locked::acquire(&layout)
             .unwrap()
             .write(&State {
@@ -282,16 +317,14 @@ impl Rig {
                 ..State::default()
             })
             .unwrap();
-        std::os::unix::fs::symlink(A, exec.at("/var/lib/kbf-installer/releases/current")).unwrap();
+        std::os::unix::fs::symlink(A, exec.at(&format!("/var/lib/{tree}/releases/current")))
+            .unwrap();
 
         let dir = TestDir::under(std::env::temp_dir(), &format!("hi-linux-host-{name}"));
         fs::set_permissions(&*dir, fs::Permissions::from_mode(0o755)).unwrap();
         let uid = fs::metadata(&*dir).unwrap().uid();
         let host = Host::for_test(&dir, Trust::owned_by(uid, &dir));
-        put(
-            &dir.join("releases.toml"),
-            "[channels.stable]\nsource = \"github\"\n",
-        );
+        put(&dir.join("releases.toml"), &kind.channels);
         put(&host.node_config, "[node]\nid = \"st1\"\n");
 
         let mut trust = trusted_host_on(Platform::Linux);
@@ -321,15 +354,13 @@ impl Rig {
         };
         let installer = installer_runner.log();
         let backend = Linux {
+            subject: Subject::of(&kind.descriptor),
             layout: layout.clone(),
             exec: RefCell::new(exec),
             trust: Box::new(trust),
             host,
             allowlist: dir.join("releases.toml"),
-            units: vec![
-                Unit::service("kbf-daemon.service").unwrap(),
-                Unit::service("kbf-frontend@a.service").unwrap(),
-            ],
+            units: kind.descriptor.units.clone(),
             restart_wait: Wait {
                 timeout: Duration::from_millis(40),
                 interval: Duration::from_millis(1),
@@ -354,6 +385,8 @@ impl Rig {
             scratch_tag: None,
         };
         let rig = Self {
+            tree,
+            program,
             dir,
             layout,
             backend,
@@ -363,7 +396,11 @@ impl Rig {
             gh_exit,
             probe,
         };
-        rig.offer(COMMIT, &tar_gz(&[file("kbf", &binary("b"))]));
+        rig.offer_as(
+            &kind.descriptor.artifact,
+            COMMIT,
+            &tar_gz(&[file(&rig.program, &binary("b"))]),
+        );
         rig
     }
 
@@ -396,7 +433,7 @@ impl Rig {
     }
 
     fn releases(&self) -> PathBuf {
-        self.root().join("var/lib/kbf-installer/releases")
+        self.root().join(format!("var/lib/{}/releases", self.tree))
     }
 
     fn state(&self) -> State {
@@ -426,7 +463,7 @@ impl Rig {
     /// state is as it was.
     fn assert_nothing_installed(&self) {
         assert!(!self.releases().join(COMMIT).exists(), "a release was made");
-        let work = self.root().join("var/lib/kbf-installer/work");
+        let work = self.root().join(format!("var/lib/{}/work", self.tree));
         let left: Vec<_> = fs::read_dir(&work)
             .map(|d| d.map(|e| e.unwrap().file_name()).collect())
             .unwrap_or_default();
@@ -1406,6 +1443,9 @@ fn the_production_host_is_the_installers_layout_and_the_programs_of_a_stage() {
     use kbf_installer::helper::leases::LeaseSource;
     assert_eq!(super::linux::NoLeases.live(), Ok(0));
 }
+
+#[path = "linux_service_tests.rs"]
+mod service;
 
 #[path = "linux_image_tests.rs"]
 mod image;
