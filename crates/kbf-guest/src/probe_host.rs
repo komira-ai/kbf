@@ -71,6 +71,18 @@ fn connect_host(port: u32) -> Result<File, ConnectError> {
     Ok(file)
 }
 
+impl SystemHost {
+    /// Sends `frame` to the host on `port` and returns the body of its `ack`: the host's
+    /// answer to a question.
+    ///
+    /// # Errors
+    /// As [`Host::send_frame`].
+    pub fn ask_frame(&self, port: u32, frame: &Frame) -> Result<String, SendError> {
+        let mut stream = connect_host(port).map_err(|e| SendError::Unavailable(e.to_string()))?;
+        frame::ask(&mut stream, frame)
+    }
+}
+
 impl Host for SystemHost {
     fn ids(&self) -> (u32, u32) {
         // SAFETY: getuid and geteuid take no arguments and cannot fail.

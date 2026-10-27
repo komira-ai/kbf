@@ -8,6 +8,8 @@
 //!    and for each runtime the host staged `xcrun simctl runtime add <dmg>` (a `.dmg`) or
 //!    `xcodebuild -importPlatform <bundle>` (a `.exportedBundle`, what
 //!    `xcodebuild -downloadPlatform -exportPath` writes);
+//!    except those the base's priming boot already did ([`sim_primed`]): a step the record
+//!    covers is reported `ok` with the note `skipped: done at prime` and not run;
 //! 2. in the session of the guest's auto-login user (`launchctl asuser <uid> sudo -u <user>`):
 //!    `simctl list runtimes -j` and `list devicetypes -j` (the runtimes output picks the
 //!    runtime and, from that runtime's `supportedDeviceTypes`, the device type; the
@@ -53,8 +55,9 @@ pub use crate::sim_choose::{
 };
 use crate::sim_choose::{take_fallback_device_type, take_runtime};
 pub use crate::sim_parse::{
-    CUT_MARK, MAX_BUNDLE_ID_BYTES, MAX_ECHO_BYTES, parse_bundle_id, parse_udid,
+    CUT_MARK, MAX_BUNDLE_ID_BYTES, MAX_ECHO_BYTES, name_ok, parse_bundle_id, parse_udid, tail_text,
 };
+use crate::sim_primed::{self, Primed};
 pub use crate::sim_user::Wanted;
 use crate::sim_user::{unmet_wish, wait_console_user};
 use crate::sim_xctest;
@@ -523,6 +526,12 @@ pub trait SimHost {
     /// No connection or reply, or the host refused the frame.
     fn send(&self, port: u32, frame: &Frame) -> Result<(), SendError>;
     fn pause(&self, d: Duration);
+    /// The regular file `path` of at most `cap` bytes (`staged.json` and the prime's record);
+    /// a file that cannot be read means nothing counts as done at prime.
+    ///
+    /// # Errors
+    /// It is missing, not a regular file, larger than `cap`, or unreadable.
+    fn read_file(&self, path: &str, cap: usize) -> Result<Vec<u8>, String>;
 }
 
 /// How a step ended.
@@ -580,21 +589,6 @@ pub struct SummaryFrame {
     pub note: Option<String>,
 }
 
-/// The last `max` bytes of `bytes` as text, cut where a character starts; whether anything
-/// was cut.
-#[must_use]
-pub fn tail_text(bytes: &[u8], max: usize) -> (String, bool) {
-    if bytes.len() <= max {
-        return (String::from_utf8_lossy(bytes).into_owned(), false);
-    }
-    let mut start = bytes.len() - max;
-    // Skip continuation bytes: the cut then falls on a character boundary of valid UTF-8.
-    while start < bytes.len() && (bytes[start] & 0xC0) == 0x80 {
-        start += 1;
-    }
-    (String::from_utf8_lossy(&bytes[start..]).into_owned(), true)
-}
-
 /// The name of the frame for step number `index` (zero-based).
 #[must_use]
 pub fn step_frame_name(index: usize, id: &str) -> String {
@@ -622,6 +616,8 @@ struct Run<'a> {
     /// The user whose session the user steps need (the one `mkuser` recorded); `None`: the
     /// console owner, whoever it is.
     user_name: Option<String>,
+    /// What the base's priming boot did ([`sim_primed`]); nothing unless [`run`] read it.
+    primed: Primed,
 }
 
 impl<'a> Run<'a> {
@@ -632,6 +628,7 @@ impl<'a> Run<'a> {
             log,
             undelivered: Vec::new(),
             user_name: None,
+            primed: Primed::default(),
         }
     }
 
@@ -695,6 +692,7 @@ pub fn run(host: &dyn SimHost, cfg: &Config, log: &mut dyn Write) -> SummaryFram
         return finish(&mut r, &[], &State::default(), None, Some(why));
     }
     r.user_name = ready;
+    r.primed = Primed::load(&|path, cap| host.read_file(path, cap));
     let inputs = Inputs {
         runtimes: host
             .runtime_images()
@@ -771,7 +769,9 @@ fn run_steps(r: &mut Run<'_>, steps: &[Step], mut state: State) -> SummaryFrame 
             note: None,
             skipped_because: blame.cloned(),
         };
-        if blame.is_none() {
+        if blame.is_none() && step.who == Who::Root && r.primed.covers(&step.id) {
+            sim_primed::mark_done(&mut f, step);
+        } else if blame.is_none() {
             execute(
                 host,
                 cfg,
@@ -788,22 +788,6 @@ fn run_steps(r: &mut Run<'_>, steps: &[Step], mut state: State) -> SummaryFrame 
         r.deliver_json(&step_frame_name(index, &step.id), &f);
     }
     finish(r, &order, &state, screenshot_bytes, note)
-}
-
-/// Whether `name` could be a name the host staged: letters, digits, `.`, `_`, `-`, ending
-/// `suffix` (`.dmg` for a runtime, `.app` for the app), no `..`, no leading dot, short. The
-/// name becomes part of a result frame's name, which the host checks too.
-#[must_use]
-pub fn name_ok(name: &str, suffix: &str) -> bool {
-    name.strip_suffix(suffix).is_some_and(|stem| {
-        !stem.is_empty()
-            && !name.starts_with('.')
-            && !name.contains("..")
-            && name.len() <= MAX_STAGED_NAME_BYTES
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    })
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -184,4 +184,19 @@ impl MkUserHost for RealMkUserHost {
     fn pause(&self, d: Duration) {
         self.host.pause(d);
     }
+
+    fn ask(&self, port: u32, frame: &Frame) -> Result<String, SendError> {
+        self.host.ask_frame(port, frame)
+    }
+
+    fn read_file(&self, path: &str, cap: usize) -> Result<Vec<u8>, String> {
+        read_regular(Path::new(path), cap)
+    }
+
+    fn remove_file(&self, path: &str) -> Result<(), String> {
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        }
+    }
 }

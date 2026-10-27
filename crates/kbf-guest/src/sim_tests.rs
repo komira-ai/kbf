@@ -14,6 +14,8 @@ use crate::frame::{Frame, Kind, MAX_BODY_BYTES, MAX_FRAME_BYTES, SendError, enco
 use crate::sim::*;
 use crate::sim_run::{Clock, ProcessRunner, read_regular, read_wanted};
 
+#[path = "sim_primed_tests.rs"]
+mod primed;
 #[path = "sim_xctest_tests.rs"]
 mod xctest;
 
@@ -112,6 +114,8 @@ struct Fake {
     clear_fails: bool,
     /// How many commands had run when the bundle was cleared.
     cleared_at: Cell<Option<usize>>,
+    /// The files of the guest `read_file` finds (`staged.json`, the prime's record).
+    files: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 impl Fake {
@@ -147,6 +151,7 @@ impl Fake {
             no_bundle_written: false,
             clear_fails: false,
             cleared_at: Cell::new(None),
+            files: std::collections::BTreeMap::new(),
         }
     }
 
@@ -253,6 +258,13 @@ impl SimHost for Fake {
     }
     fn pause(&self, _d: Duration) {
         self.pauses.set(self.pauses.get() + 1);
+    }
+    fn read_file(&self, path: &str, cap: usize) -> Result<Vec<u8>, String> {
+        self.files
+            .get(path)
+            .filter(|b| b.len() <= cap)
+            .cloned()
+            .ok_or_else(|| format!("{path}: no such file"))
     }
 }
 

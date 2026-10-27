@@ -218,8 +218,9 @@ pub enum ImageCmd {
     /// Boot the base bundle itself, as the console user and with graphics, so that the
     /// guest creates its user (`image setup --guest-user`) and powers itself off; the
     /// result frames go to `<base>/prime-results`. Afterwards every clone of the base
-    /// boots into that user's session. Run again, it finds the user ready and stops the
-    /// guest at once.
+    /// boots into that user's session. Run again on a base whose user is ready and whose simulator
+    /// root setup is done, it stops the guest at once; with part of the setup still to do (a
+    /// runtime added since), it does that part and the guest powers off.
     Prime {
         /// The base bundle directory (set up with `--guest-user`).
         #[arg(long)]
@@ -229,7 +230,7 @@ pub enum ImageCmd {
         guest_binary: PathBuf,
         /// How long to wait for the guest to power off before it is stopped and the run is
         /// reported as a timeout.
-        #[arg(long, default_value_t = 1200, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+        #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..=86_400))]
         deadline_secs: u64,
         /// How long a guest that is still up at the deadline (or already prepared) has to
         /// shut down after being asked to, before the host stops it by force. A forced stop
