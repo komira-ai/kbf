@@ -6,9 +6,12 @@
 //!                   (--restart-unit UNIT... | --frontend-container [--frontend-config PATH])
 //! ```
 //!
-//! The program binds the socket itself (a umask of 0177, then a chown to the account), in a
-//! directory that is root's and closed to others, so the file mode is the whole of who may
-//! connect. One request line in, one JSON line out ([`super::request`], [`super::answer`]),
+//! The program binds the socket itself, in a directory that is root's and closed to others:
+//! the file is made in a private directory beside the socket's (mode 0700), given its owner
+//! and mode 0600, and moved into place, so the file mode is the whole of who may connect. The
+//! process umask is never changed. The bind happens at `<directory>/.bind/s`, so the
+//! socket's directory path needs 8 bytes more within the 107 bytes a unix socket path may
+//! have (a socket name of 7 bytes or more costs nothing beyond its own path). One request line in, one JSON line out ([`super::request`], [`super::answer`]),
 //! one connection at a time: an install can take minutes, and no other request is
 //! answered meanwhile, which is the lock of the ssh path's install seen from the socket.
 //! Between connections the loop asks [`Ab::tick`], which goes back to the release that ran
@@ -227,9 +230,21 @@ pub fn passwd_ids(passwd: &str, name: &str) -> Option<(u32, u32)> {
 /// to others, a stale socket file is removed (anything else in the way is not), the file is
 /// made with mode 0600 and owned by the account. The process umask is never changed.
 ///
+/// The socket is bound at `<directory>/.bind/s` before it is moved to `path`, so that path
+/// needs room for it within the unix socket path limit (107 bytes on Linux): the directory's
+/// length plus 8, which is no more than `path` itself when the socket's name has 7 bytes or
+/// more.
+///
 /// # Errors
 /// Why the socket cannot be made.
 pub fn bind(trust: &Trust, path: &Path, ids: (u32, u32)) -> io::Result<UnixListener> {
+    // The file is moved into place by name, so only a bind at the staged path would notice a
+    // path no client could connect to.
+    if path.as_os_str().len() > SOCKET_PATH_MAX {
+        return Err(io::Error::other(format!(
+            "the socket path is longer than the {SOCKET_PATH_MAX} bytes a unix socket may have"
+        )));
+    }
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("the socket has no directory"))?;
@@ -264,13 +279,20 @@ pub fn bind(trust: &Trust, path: &Path, ids: (u32, u32)) -> io::Result<UnixListe
 /// The name, in the socket's directory, of the private directory a socket is made in.
 pub(super) const STAGING: &str = ".bind";
 
+/// The longest path a unix socket may have on Linux (`sun_path` is 108 bytes, the last one a
+/// NUL).
+const SOCKET_PATH_MAX: usize = 107;
+
+/// The name the socket has inside [`STAGING`]: a short one, so that the staged path is no
+/// longer than the socket's own when the socket's name has 7 bytes or more.
+const STAGED: &str = "s";
+
 /// Bind the socket in `staging` (private to this process), give it its owner and mode 0600,
 /// and move it to `path`.
 fn bind_staged(staging: &Path, path: &Path, ids: (u32, u32)) -> io::Result<UnixListener> {
-    let name = path
-        .file_name()
+    path.file_name()
         .ok_or_else(|| io::Error::other("the socket has no name"))?;
-    let made = staging.join(name);
+    let made = staging.join(STAGED);
     let listener = UnixListener::bind(&made)?;
     chown(&made, Some(ids.0), Some(ids.1))?;
     std::fs::set_permissions(&made, std::fs::Permissions::from_mode(0o600))?;

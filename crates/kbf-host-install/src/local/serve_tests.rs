@@ -242,6 +242,32 @@ fn the_socket_is_0600_and_binds_only_where_it_is_safe() {
     }
 }
 
+/// A socket path of the longest length a unix socket may have (107 bytes on Linux) binds: the
+/// socket is made in a private directory first, and that must not ask for more room than the
+/// path itself.
+#[test]
+fn a_socket_path_of_the_longest_length_binds() {
+    let dir = TestDir::under(std::env::temp_dir(), "sv-long");
+    fs::set_permissions(&*dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let meta = fs::metadata(&*dir).unwrap();
+    let ids = (meta.uid(), meta.gid());
+    let name = "host-install.sock";
+    let used = dir.join("r").as_os_str().len() + 1 + name.len();
+    let pad = 107_usize
+        .checked_sub(used)
+        .expect("the test directory is too deep");
+    let run = dir.join(format!("r{}", "d".repeat(pad)));
+    fs::create_dir(&run).unwrap();
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = run.join(name);
+    assert_eq!(socket.as_os_str().len(), 107);
+
+    let listener = bind(&trust(&dir), &socket, ids).unwrap();
+    assert!(UnixStream::connect(&socket).is_ok());
+    drop(listener);
+    assert!(!run.join(crate::local::serve::STAGING).exists());
+}
+
 /// Serve one request through a pair of sockets and read what came back.
 struct Wire<'a> {
     serving: &'a Serving<'a, super::core_tests::Fake>,

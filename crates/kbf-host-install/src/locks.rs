@@ -33,10 +33,10 @@ pub fn flock_held(lock_file: &Path) -> bool {
 
 /// For tests: wait (up to 500 looks, 10 ms apart: 5 s) until nobody holds or shares the
 /// `flock` on `lock_file`, so that an exclusive lock can be had. A process another test thread
-/// starts copies every open descriptor until it execs, and a lock lives as long as any copy of
-/// the descriptor does, so a lock this test has dropped can outlive the drop by a moment. (The
-/// program itself starts nothing while it holds or probes a lock.) A lock that never goes is
-/// left for the caller's own assertion to report.
+/// starts copies every open descriptor until it execs, and a plain `flock` lives as long as any
+/// copy of the descriptor does, so a lock dropped by closing its file can outlive the drop by a
+/// moment. (The install lock is not such a lock: `host::Lock` unlocks at its drop.) A
+/// lock that never goes is left for the caller's own assertion to report.
 #[cfg(test)]
 pub fn wait_lockable(lock_file: &Path) {
     wait_lockable_paced(lock_file, &crate::pace::Pace::real());
