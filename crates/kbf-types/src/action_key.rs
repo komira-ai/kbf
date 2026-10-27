@@ -123,6 +123,18 @@ mod tests {
         assert_eq!(back, by_action);
     }
 
+    /// Catches: sizes compared as numbers; the type orders by dedup text, so the same
+    /// hash with sizes 9 and 10 puts "10" before "9".
+    #[test]
+    fn work_keys_with_one_hash_order_sizes_as_text() {
+        let nine = WorkKey::from(key("a", 1, 9));
+        let ten = WorkKey::from(key("a", 1, 10));
+        assert!(ten < nine);
+        let mut both = vec![nine.clone(), ten.clone()];
+        both.sort();
+        assert_eq!(both, [ten, nine]);
+    }
+
     /// Catches: a work key that is not an action converting anyway, which would hand a
     /// made-up digest to the code that answers a client.
     #[test]
@@ -131,5 +143,52 @@ mod tests {
         let err = ActionKey::try_from(&bad).unwrap_err();
         assert!(matches!(err.0, ParseDigestError::MissingSeparator(_)));
         assert!(err.to_string().contains("not an action digest"), "{err}");
+    }
+
+    /// Catches: a dedup text that is nearly a digest being taken for an action, by each
+    /// way the digest parser refuses it (not hex, wrong length, size past `u64`, uppercase
+    /// hex, no `/`), and a valid text being refused.
+    #[test]
+    fn only_a_dedup_text_in_the_digests_own_form_is_an_action() {
+        let hash = "ab".repeat(32);
+        let refused = [
+            (
+                "non-hex hash",
+                format!("{}zz/1", "ab".repeat(31)),
+                NotAnActionKey(ParseDigestError::HashCharacter('z', 62)),
+            ),
+            (
+                "short hash",
+                format!("{}/1", "ab".repeat(31)),
+                NotAnActionKey(ParseDigestError::HashLength(62)),
+            ),
+            (
+                "long hash",
+                format!("{hash}ab/1"),
+                NotAnActionKey(ParseDigestError::HashLength(66)),
+            ),
+            (
+                "size past u64",
+                format!("{hash}/18446744073709551616"),
+                NotAnActionKey(ParseDigestError::Size("18446744073709551616".to_owned())),
+            ),
+            (
+                "uppercase hex",
+                format!("{}/1", "AB".repeat(32)),
+                NotAnActionKey(ParseDigestError::HashCharacter('A', 0)),
+            ),
+            (
+                "no separator",
+                hash.clone(),
+                NotAnActionKey(ParseDigestError::MissingSeparator(hash.clone())),
+            ),
+        ];
+        for (name, dedup, expected) in refused {
+            let got = ActionKey::try_from(&WorkKey::new("main", dedup));
+            assert_eq!(got, Err(expected), "{name}");
+        }
+        let valid = WorkKey::new("main", format!("{hash}/18446744073709551615"));
+        assert_eq!(ActionKey::try_from(&valid), Ok(key("main", 0xab, u64::MAX)));
+        assert_eq!(WorkKey::from(key("main", 0xab, u64::MAX)), valid);
     }
 }
