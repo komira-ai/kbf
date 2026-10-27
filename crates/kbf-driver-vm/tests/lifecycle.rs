@@ -15,7 +15,8 @@ use support::{
     until_running, work,
 };
 
-/// Catches a VM run that loses the command's stdout or its declared outputs, an input
+/// Catches a VM run that loses the command's stdout or its declared outputs, the
+/// action's environment, an input
 /// tree the guest cannot read from its working directory, and a lease that leaves its
 /// VM running or its clone or lease directory on disk after a clean exit.
 #[tokio::test(flavor = "multi_thread")]
@@ -29,6 +30,9 @@ async fn a_run_returns_stdout_and_outputs() {
         "cat",
         "in.txt",
         ";",
+        "env",
+        "GREETING",
+        ";",
         "mkdir",
         &format!("{out}/d"),
         ";",
@@ -37,6 +41,7 @@ async fn a_run_returns_stdout_and_outputs() {
         "made",
     ])
     .input("in.txt", b"from the inputs\n")
+    .env("GREETING", "hello")
     .outputs(&["d/a.txt"])
     .store(&cas);
 
@@ -44,7 +49,7 @@ async fn a_run_returns_stdout_and_outputs() {
 
     assert_eq!(result.exit_code, 0);
     let stdout = result.stdout_digest.as_ref().expect("stdout");
-    assert_eq!(cas.blob(stdout), b"from the inputs\n");
+    assert_eq!(cas.blob(stdout), b"from the inputs\nhello\n");
     assert_eq!(result.output_files.len(), 1, "{:?}", result.output_files);
     assert_eq!(result.output_files[0].path, "d/a.txt");
     let file = result.output_files[0].digest.as_ref().expect("digest");

@@ -496,10 +496,15 @@ fn client_error(error: ClientError) -> RuntimeError {
 
 /// `N` bytes from the OS's random source.
 fn random<const N: usize>() -> Result<[u8; N], RuntimeError> {
+    random_from(Path::new("/dev/urandom"))
+}
+
+/// `N` bytes read from `source`, a random source.
+fn random_from<const N: usize>(source: &Path) -> Result<[u8; N], RuntimeError> {
     let mut bytes = [0; N];
-    std::fs::File::open("/dev/urandom")
+    std::fs::File::open(source)
         .and_then(|mut f| f.read_exact(&mut bytes))
-        .map_err(|e| RuntimeError::Failed(format!("/dev/urandom: {e}")))?;
+        .map_err(|e| RuntimeError::Failed(format!("{}: {e}", source.display())))?;
     Ok(bytes)
 }
 
@@ -670,11 +675,8 @@ mod tests {
         assert_eq!(size(1500, 2 * GIB).ok(), Some((2, GIB)));
         assert_eq!(size(0, 2 * GIB).ok(), Some((1, GIB)));
         for memory in [0, GIB] {
-            let refused = size(6000, memory);
-            assert!(
-                matches!(refused, Err(RuntimeError::Failed(ref why)) if why.contains("none past")),
-                "{refused:?}"
-            );
+            let refused = size(6000, memory).expect_err("refused");
+            assert!(refused.to_string().contains("none past"), "{refused:?}");
         }
     }
 
@@ -741,5 +743,58 @@ mod tests {
             timeout_of(&with(-1, 0), default),
             Err(RuntimeError::Invalid(_))
         ));
+    }
+
+    /// Catches a stream that refuses its read bound taken for a guest that is not ready
+    /// yet (retried until the boot timeout) or for a panic: it is the farm's failure,
+    /// said at once and naming the stream. A Unix socket refuses a zero bound.
+    #[test]
+    fn a_stream_that_refuses_its_read_bound_fails_the_handshake() {
+        let (stream, _guest) = std::os::unix::net::UnixStream::pair().expect("pair");
+
+        let ended = handshake(stream, [0; TOKEN_LEN], Duration::ZERO, Duration::ZERO);
+
+        let why = ended.map(|_| ()).expect_err("refused").to_string();
+        assert!(why.contains("the guest's stream"), "{why}");
+    }
+
+    /// Catches a random source that cannot be read taken for a token of zeros (a guest
+    /// token anyone could guess) or a panic.
+    #[test]
+    fn an_unreadable_random_source_is_the_farms_failure() {
+        let ended: Result<[u8; 4], _> = random_from(Path::new("/nonexistent-kbf/random"));
+
+        let why = ended.expect_err("refused").to_string();
+        assert!(why.contains("/nonexistent-kbf/random"), "{why}");
+        assert_eq!(random::<16>().expect("the OS source").len(), 16);
+    }
+
+    /// Catches a panic on the blocking pool taken for a result, or one that takes the
+    /// driver's task down with it.
+    #[tokio::test]
+    async fn a_panic_on_the_blocking_pool_is_the_farms_failure() {
+        let ended: Result<(), RuntimeError> = blocking(|| panic!("boom")).await;
+
+        let why = ended.expect_err("refused").to_string();
+        assert!(why.contains("blocking task"), "{why}");
+    }
+
+    /// Catches a destroy that stops at its first failure (a clone left on disk because
+    /// the lease directory could not be removed, or the reverse) or reports success
+    /// for a removal that failed: both removals are tried, and both are named.
+    #[test]
+    fn a_destroy_tries_every_removal_and_names_each_that_failed() {
+        let base = Path::new("/nonexistent-kbf-driver-vm");
+        let parts = Parts {
+            host: Arc::new(crate::FakeHost::new()),
+            name: "lease-1-1".to_owned(),
+            dir: base.join("lease"),
+            clone: base.join("clone"),
+        };
+
+        let why = parts.destroy().expect_err("refused").to_string();
+
+        assert!(why.contains("nonexistent-kbf-driver-vm/lease"), "{why}");
+        assert!(why.contains("nonexistent-kbf-driver-vm/clone"), "{why}");
     }
 }
