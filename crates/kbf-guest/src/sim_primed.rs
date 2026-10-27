@@ -204,9 +204,7 @@ impl Primed {
 /// Fills `f` as the frame of `step`, which was not run because the prime did it: `ok`, with
 /// the command it would have run and the reason.
 pub fn mark_done(f: &mut StepFrame, step: &Step) {
-    if let Argv::Fixed(argv) = &step.argv {
-        f.argv.clone_from(argv);
-    }
+    f.argv = fixed_argv(step.argv.clone());
     f.status = Status::Ok;
     f.note = Some(SKIPPED_NOTE.to_owned());
 }

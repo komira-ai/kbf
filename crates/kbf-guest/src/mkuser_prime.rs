@@ -88,19 +88,22 @@ pub fn plan_prep(host: &dyn MkUserHost) -> Prep {
     };
     let staged: Staged = staged.unwrap_or_default();
     let old = Primed::load(&read);
-    let mut steps: Vec<PrepStep> = root_steps(&staged)
+    // The first step comes after the removal of the old record.
+    let steps: Vec<PrepStep> = root_steps(&staged)
         .into_iter()
-        .map(|s| PrepStep {
+        .enumerate()
+        .map(|(i, s)| PrepStep {
             done: old.covers(&s.id),
-            needs: s.needs,
+            needs: s
+                .needs
+                .into_iter()
+                .chain((i == 0).then(|| RESET.to_owned()))
+                .collect(),
             class: s.class,
             argv: fixed_argv(s.argv),
             id: s.id,
         })
         .collect();
-    if let Some(first) = steps.first_mut() {
-        first.needs.push(RESET.to_owned());
-    }
     Prep {
         steps,
         record: Some(record),
