@@ -111,13 +111,16 @@ impl Drop for Database {
 /// then opens on it: the unit starts on the schema it needs.
 #[test]
 fn a_database_with_no_schema_is_given_it_and_the_unit_starts() {
-    let latest = schema::latest();
+    let latest = kbf_pack_index::schema::latest();
     let created = format!("created the schema at version {latest}");
     let db = Database::new("fresh", None);
     let (code, err) = db.boot_check("frontend");
     assert_eq!(code, Some(0), "{err}");
     assert!(err.contains(&created), "{err}");
-    assert_eq!(schema::current(&db.config()), Ok(schema::latest()));
+    assert_eq!(
+        schema::current(&db.config()),
+        Ok(kbf_pack_index::schema::latest())
+    );
     PostgresStore::open(&db.config()).expect("a store opens on what the check made");
 }
 
@@ -127,7 +130,12 @@ fn a_database_with_no_schema_is_given_it_and_the_unit_starts() {
 #[test]
 fn a_database_at_the_schema_of_this_build_is_left_alone() {
     let db = Database::new("current", None);
-    schema::apply(&db.config(), &schema::embedded(), schema::latest()).expect("installed");
+    schema::apply(
+        &db.config(),
+        &kbf_pack_index::schema::embedded(),
+        kbf_pack_index::schema::latest(),
+    )
+    .expect("installed");
     let before = db.versions();
     assert!(!before.is_empty());
     let (code, err) = db.boot_check("frontend");
@@ -143,14 +151,14 @@ fn a_database_at_the_schema_of_this_build_is_left_alone() {
 #[test]
 fn a_database_ahead_by_an_expand_step_passes_the_check_and_is_left_alone() {
     let db = Database::new("ahead", None);
-    let n1 = schema::latest() + 1;
+    let n1 = kbf_pack_index::schema::latest() + 1;
     let later = Migration::new(
         n1,
         "note",
         "-- kbf-migration: expand\nALTER TABLE kv ADD COLUMN note text;",
     )
     .expect("an additive migration lints");
-    let mut set = schema::embedded();
+    let mut set = kbf_pack_index::schema::embedded();
     set.push(later);
     schema::apply(&db.config(), &set, n1).expect("the later release is installed");
     let (code, err) = db.boot_check("frontend");
@@ -167,8 +175,13 @@ fn a_database_ahead_by_an_expand_step_passes_the_check_and_is_left_alone() {
 #[test]
 fn a_contract_step_above_this_build_is_refused_when_the_store_opens() {
     let db = Database::new("contract", None);
-    let n1 = schema::latest() + 1;
-    schema::apply(&db.config(), &schema::embedded(), schema::latest()).expect("installed");
+    let n1 = kbf_pack_index::schema::latest() + 1;
+    schema::apply(
+        &db.config(),
+        &kbf_pack_index::schema::embedded(),
+        kbf_pack_index::schema::latest(),
+    )
+    .expect("installed");
     let row = format!(
         "INSERT INTO kbf_state.schema_version (version, name, kind) \
          VALUES ({n1}, 'later', 'contract')"

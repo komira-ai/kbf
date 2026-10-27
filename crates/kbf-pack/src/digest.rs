@@ -1,8 +1,8 @@
 //! Digests: the index's [`BlobDigest`] and the segment format's [`Digest`] are the same
 //! pair (SHA-256 and length); these convert between them and check bytes against one.
 
+use kbf_pack_index::BlobDigest;
 use kbf_segments::sha256;
-use kbf_state::BlobDigest;
 use kbf_types::Digest;
 
 /// The digest of `bytes`: their SHA-256 and their length.

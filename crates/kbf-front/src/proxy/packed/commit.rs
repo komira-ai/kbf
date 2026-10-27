@@ -31,8 +31,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use kbf_objstore::{ByteRange, ObjectKey, ObjectStoreError};
 use kbf_pack::blob_digest;
+use kbf_pack_index::{BlobDigest, NewPack, PackBlob, PackIndexError, Recorded};
 use kbf_segments::RecordHasher;
-use kbf_state::{BlobDigest, NewPack, PackBlob, PackIndexError, Recorded};
 
 use super::store::{Packs, from_index, offload};
 

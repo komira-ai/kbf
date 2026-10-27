@@ -1,5 +1,5 @@
 //! The pack index on Postgres: [`PostgresPackIndex`] keeps [`PackIndex`] in the `pack` and
-//! `blob` tables of the state schema (migration 2).
+//! `blob` tables of the state schema (migration 2, [`crate::schema`]).
 //!
 //! **Outside the head lock.** The index has connections of its own and its statements touch
 //! only `pack` and `blob`. A state transaction takes the commit head (`LOCK TABLE head` and
@@ -26,14 +26,18 @@ use std::time::Duration;
 
 use postgres::types::ToSql;
 
-use super::conn::Conn;
-use super::session::{Pool, Pooled};
-use super::{Fail, PostgresConfig, failed, from_time};
-use crate::clock::Clock;
-use crate::pack_index::{
+use kbf_state::Clock;
+use kbf_state::postgres::{Conn, ExtensionPool, Loan, PostgresConfig, store_error};
+
+use crate::{
     BlobDigest, Location, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo, Recorded,
-    check_batch, count, micros,
+    check_batch, count, micros, micros_of,
 };
+
+#[cfg(any(test, feature = "test-support"))]
+mod backend;
+#[cfg(any(test, feature = "test-support"))]
+pub use backend::PostgresPackBackend;
 
 /// Whether both pack tables are in the schema the session searches.
 const TABLES: &str = "SELECT to_regclass('pack') IS NOT NULL AND to_regclass('blob') IS NOT NULL";
@@ -119,6 +123,11 @@ const UNREFERENCED: &str = concat!(
     "WHERE NOT EXISTS (SELECT 1 FROM pack p WHERE p.key = k.key) ORDER BY k.ord"
 );
 
+/// A failed client call as the index reports it.
+fn failed(err: postgres::Error) -> PackIndexError {
+    PackIndexError::Store(store_error(err))
+}
+
 /// A value as the `bigint` the tables hold, saturating.
 fn big(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
@@ -182,7 +191,7 @@ fn pack_info(row: &postgres::Row, first: usize) -> PackInfo {
 
 /// The pack index in the tables of a Postgres state store.
 pub struct PostgresPackIndex {
-    pool: Pool,
+    pool: ExtensionPool,
     config: PostgresConfig,
     clock: Option<Arc<dyn Clock>>,
 }
@@ -196,20 +205,14 @@ impl PostgresPackIndex {
     /// [`PackIndexError::Store`] when the server cannot be reached or refuses the schema;
     /// [`PackIndexError::NotMigrated`] when the schema has no pack tables.
     pub fn open(config: &PostgresConfig) -> Result<PostgresPackIndex, PackIndexError> {
-        let pool = Pool::open(
-            config.pg.clone(),
-            config.schema.clone(),
-            config.max_connections,
-            config.supported,
-        )
-        .map_err(Fail::into_store)?;
+        let pool = ExtensionPool::open(config)?;
         let index = PostgresPackIndex {
             pool,
             config: config.clone(),
             clock: None,
         };
         let mut session = index.session()?;
-        let row = session.client.query_one(TABLES, &[]).map_err(failed)?;
+        let row = session.conn().query_one(TABLES, &[]).map_err(failed)?;
         let found: bool = row.get(0);
         drop(session);
         if found {
@@ -236,14 +239,13 @@ impl PostgresPackIndex {
         Ok(again)
     }
 
-    fn session(&self) -> Result<Pooled<'_>, PackIndexError> {
-        let session = self.pool.checkout().map_err(Fail::into_store)?;
-        Ok(session)
+    fn session(&self) -> Result<Loan<'_>, PackIndexError> {
+        Ok(self.pool.checkout()?)
     }
 
     /// The index's time in microseconds: the injected clock's, else the database's.
     fn now(&self, client: &mut Conn) -> Result<i64, PackIndexError> {
-        let injected = self.clock.as_ref().map(|clock| from_time(clock.now()));
+        let injected = self.clock.as_ref().map(|clock| micros_of(clock.now()));
         if let Some(at) = injected {
             return Ok(at);
         }
@@ -321,8 +323,8 @@ impl PackIndex for PostgresPackIndex {
         let blobs = pack.checked()?;
         let rows = Rows::of(&blobs);
         let mut session = self.session()?;
-        let now = self.now(&mut session.client)?;
-        let client = &mut session.client;
+        let now = self.now(session.conn())?;
+        let client = session.conn();
         client.batch_execute("BEGIN").map_err(failed)?;
         let recorded = Self::record_in(client, pack, &rows, now);
         let end = match &recorded {
@@ -330,7 +332,9 @@ impl PackIndex for PostgresPackIndex {
             Err(_) => "ROLLBACK",
         };
         let ended = client.batch_execute(end);
-        session.broken = ended.is_err();
+        if ended.is_err() {
+            session.discard();
+        }
         let recorded = recorded?;
         ended.map_err(failed)?;
         Ok(recorded)
@@ -338,7 +342,7 @@ impl PackIndex for PostgresPackIndex {
 
     fn pack(&self, key: &str) -> Result<Option<PackInfo>, PackIndexError> {
         let mut session = self.session()?;
-        let found = session.client.query_opt(FIND_PACK, &[&key]);
+        let found = session.conn().query_opt(FIND_PACK, &[&key]);
         let found = found.map_err(failed)?;
         Ok(found.map(|row| pack_info(&row, 1)))
     }
@@ -347,7 +351,7 @@ impl PackIndex for PostgresPackIndex {
         check_batch(digests.len())?;
         let (hashes, sizes) = unnest(digests);
         let mut session = self.session()?;
-        let found = session.client.query(LOCATE, &[&hashes, &sizes]);
+        let found = session.conn().query(LOCATE, &[&hashes, &sizes]);
         let found = found.map_err(failed)?;
         let mut located = vec![None; digests.len()];
         for row in &found {
@@ -365,7 +369,7 @@ impl PackIndex for PostgresPackIndex {
         check_batch(digests.len())?;
         let (hashes, sizes) = unnest(digests);
         let mut session = self.session()?;
-        let found = session.client.query(MISSING, &[&hashes, &sizes]);
+        let found = session.conn().query(MISSING, &[&hashes, &sizes]);
         let found = found.map_err(failed)?;
         let missing = found.iter().map(|row| digests[ordinal(row.get(0))]);
         Ok(missing.collect())
@@ -379,26 +383,26 @@ impl PackIndex for PostgresPackIndex {
         sorted.dedup();
         let (hashes, sizes) = unnest(&sorted);
         let mut session = self.session()?;
-        let now = self.now(&mut session.client)?;
+        let now = self.now(session.conn())?;
         let args: [&(dyn ToSql + Sync); 3] = [&hashes, &sizes, &now];
-        let touched = session.client.execute(TOUCH, &args).map_err(failed)?;
+        let touched = session.conn().execute(TOUCH, &args).map_err(failed)?;
         Ok(usize::try_from(touched).unwrap_or(usize::MAX))
     }
 
     fn dead_packs(&self, grace: Duration, limit: usize) -> Result<Vec<PackInfo>, PackIndexError> {
         let mut session = self.session()?;
-        let now = self.now(&mut session.client)?;
+        let now = self.now(session.conn())?;
         let grace = micros(grace);
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let args: [&(dyn ToSql + Sync); 3] = [&now, &grace, &limit];
-        let found = session.client.query(DEAD, &args).map_err(failed)?;
+        let found = session.conn().query(DEAD, &args).map_err(failed)?;
         Ok(found.iter().map(|row| pack_info(row, 0)).collect())
     }
 
     fn unreferenced_keys(&self, keys: &[String]) -> Result<Vec<String>, PackIndexError> {
         check_batch(keys.len())?;
         let mut session = self.session()?;
-        let found = session.client.query(UNREFERENCED, &[&keys]);
+        let found = session.conn().query(UNREFERENCED, &[&keys]);
         let found = found.map_err(failed)?;
         Ok(found.iter().map(|row| row.get(0)).collect())
     }

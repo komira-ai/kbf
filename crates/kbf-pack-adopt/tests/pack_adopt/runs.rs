@@ -6,7 +6,7 @@ use std::path::Path;
 
 use kbf_pack::{AdoptMode, AdoptReport};
 use kbf_pack_adopt::main_with_seams;
-use kbf_state::{NewPack, PackIndex};
+use kbf_pack_index::{NewPack, PackIndex};
 
 use crate::support::{BUCKET, Farm, SOCKET_URL, says, write_file};
 

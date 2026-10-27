@@ -25,9 +25,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use kbf_objstore::{ObjectKey, ObjectStore, ObjectStoreError};
+use kbf_pack_index::{
+    BlobDigest, MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError, Recorded,
+};
 use kbf_segments::layout::footer_len;
 use kbf_segments::{Footer, MAX_SEGMENT_BYTES, SegmentWriter};
-use kbf_state::{BlobDigest, MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError, Recorded};
 
 use crate::blocking::offload;
 use crate::digest::from_segment;

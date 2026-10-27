@@ -71,7 +71,11 @@
 //!   `kbf-objstore`, and so does its `server` feature, which the `tierstore` binary needs;
 //!   the check reads the tree of the crate built alone, so the features that its own tests
 //!   turn on do not count); and a walk that cannot see its dependencies, which would make
-//!   that check pass vacuously.
+//!   that check pass vacuously;
+//! - the state store (`kbf-state`) depending on any other crate of this workspace (with its
+//!   test-database feature, on any but `kbf-testkit`), which would stop it from being
+//!   extracted, and the pack index (`kbf-pack-index`) depending on any but the state store;
+//!   each with a walk that cannot see what it should, which would make the check vacuous.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -708,6 +712,80 @@ fn tierstore_links_the_s3_client_only_with_its_s3_or_server_feature() {
         let linked = linked_with("tierstore", features);
         assert!(linked.contains("kbf-objstore"), "{features}: {linked:?}");
     }
+}
+
+/// The workspace crates among `linked`, other than those in `allowed`.
+fn workspace_crates_beyond<'a>(
+    g: &'a Graph,
+    linked: &BTreeSet<String>,
+    allowed: &[&str],
+) -> Vec<&'a str> {
+    g.members
+        .keys()
+        .map(String::as_str)
+        .filter(|name| linked.contains(*name) && !allowed.contains(name))
+        .collect()
+}
+
+/// Asserts that the state store (`kbf-state`) links no other crate of this workspace, with
+/// the Postgres backend on, and with its test-database feature on only the test server's
+/// crate (`kbf-testkit`), and that the walk sees its dependencies (it reaches `postgres`), so
+/// the check does not pass on an empty walk. The store is generic: what is specific to a kbf
+/// build (the pack index, `kbf-pack-index`) depends on it and never the other way, which is
+/// what lets the store be extracted. Like the `tierstore` check, it reads the tree of the
+/// crate built alone.
+#[test]
+fn the_state_store_links_no_build_specific_crate() {
+    let g = load_graph();
+    let (_, root) = g
+        .members
+        .get("kbf-state")
+        .expect("kbf-state is a workspace member");
+    assert!(root.is_some(), "kbf-state must have a library target");
+    let alone = linked_with("kbf-state", "postgres");
+    assert!(
+        alone.contains("postgres"),
+        "kbf-state's tree must hold postgres, or this walk proves nothing: {alone:?}"
+    );
+    let violations = workspace_crates_beyond(&g, &alone, &["kbf-state"]);
+    assert!(
+        violations.is_empty(),
+        "kbf-state links another crate of this workspace: {violations:?}"
+    );
+    let testing = linked_with("kbf-state", "test-database");
+    assert!(
+        testing.contains("kbf-testkit"),
+        "test-database must bring the test server's crate: {testing:?}"
+    );
+    let violations = workspace_crates_beyond(&g, &testing, &["kbf-state", "kbf-testkit"]);
+    assert!(
+        violations.is_empty(),
+        "kbf-state with test-database links another crate of this workspace: {violations:?}"
+    );
+}
+
+/// Asserts that the pack index (`kbf-pack-index`) links no workspace crate but the state
+/// store it keeps its tables in, with its Postgres feature on, so the frontend, the daemon,
+/// the packing client and the adoption tool can all depend on it without a cycle, and that
+/// the walk sees the state store beneath it, so the check does not pass on an empty walk.
+#[test]
+fn the_pack_index_links_only_the_state_store() {
+    let g = load_graph();
+    let (_, root) = g
+        .members
+        .get("kbf-pack-index")
+        .expect("kbf-pack-index is a workspace member");
+    assert!(root.is_some(), "kbf-pack-index must have a library target");
+    let linked = linked_with("kbf-pack-index", "postgres");
+    assert!(
+        linked.contains("kbf-state"),
+        "kbf-pack-index's tree must hold kbf-state, or this walk proves nothing: {linked:?}"
+    );
+    let violations = workspace_crates_beyond(&g, &linked, &["kbf-pack-index", "kbf-state"]);
+    assert!(
+        violations.is_empty(),
+        "kbf-pack-index links another crate of this workspace: {violations:?}"
+    );
 }
 
 /// What the front-door proxy library's normal dependencies must not reach

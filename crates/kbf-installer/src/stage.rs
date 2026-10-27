@@ -257,7 +257,7 @@ pub fn supported() -> Supported {
     Supported {
         protocol: 1,
         min_protocol: 1,
-        state_schema: u64::from(kbf_state::postgres::schema::latest()),
+        state_schema: u64::from(kbf_pack_index::schema::latest()),
     }
 }
 

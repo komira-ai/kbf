@@ -15,7 +15,7 @@ use kbf_pack::{
     Blob, FRONTEND_PACK_BYTES, Fetch, PackError, PackKeys, Packed, Packer, PackerConfig, ReadCache,
     ReadError, Reader, ReaderConfig, check_create_only,
 };
-use kbf_state::{BlobDigest, MAX_BATCH, PackIndex, PackIndexError};
+use kbf_pack_index::{BlobDigest, MAX_BATCH, PackIndex, PackIndexError};
 use kbf_types::{Digest, DigestFunction};
 use tonic::Status;
 

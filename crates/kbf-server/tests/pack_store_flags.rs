@@ -10,11 +10,12 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
 use kbf_objstore::s3::fake::FakeS3;
+use kbf_pack_index::BlobDigest;
+use kbf_pack_index::schema::test_database;
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_proto::reapi::{self, BatchUpdateBlobsRequest, batch_update_blobs_request};
 use kbf_server::frontend::{self, FrontendFlags, start_frontend};
-use kbf_state::BlobDigest;
-use kbf_state::postgres::{TestDatabase, test_database};
+use kbf_state::postgres::TestDatabase;
 use kbf_testkit::dir::TestDir;
 
 /// The flags of a frontend on loopback ports over the state store at `url`, with the pack index

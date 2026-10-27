@@ -5,8 +5,8 @@
 //! lock, the one transaction per migration and the expand-only lint are those of
 //! [`schema::apply_within`]. What is here is the unit's side of it:
 //!
-//! - **Which schema.** The newest the migrations of the build embed, which for the build
-//!   itself is [`schema::latest`]: the number `kbf --version --json` prints as `state_schema`.
+//! - **Which schema.** The newest the migrations of the build embed ([`schema::latest_of`] its
+//!   set): the number `kbf --version --json` prints as `state_schema`.
 //!   Nothing is probed; a build asks its own constants.
 //! - **A bounded wait.** The step runs while systemd starts a unit, so each wait is bounded:
 //!   a connect after [`schema::CONNECT_LIMIT`] and every lock after [`LOCK_WAIT`]. A busy
@@ -34,14 +34,9 @@ pub struct BootStep {
 }
 
 impl BootStep {
-    /// The step of this build: its embedded migrations ([`schema::embedded`]) and
-    /// [`LOCK_WAIT`].
-    #[must_use]
-    pub fn of_this_build(config: PostgresConfig) -> BootStep {
-        BootStep::new(config, schema::embedded(), LOCK_WAIT)
-    }
-
-    /// A step with other migrations and another wait: a test plays another release.
+    /// A step with the migrations a release embeds (this crate's, [`schema::embedded`], and the
+    /// crates that extend them, [`schema::extend`]) and the longest to wait for a lock
+    /// ([`LOCK_WAIT`]).
     #[must_use]
     pub fn new(
         config: PostgresConfig,

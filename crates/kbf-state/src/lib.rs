@@ -22,12 +22,6 @@
 //!
 //! With the `postgres` feature, [`postgres`] is the Postgres backend.
 //!
-//! **The pack index** ([`pack_index`], [`PackIndex`]) records where each blob lies inside a
-//! pack, in tables of the Postgres schema that are outside the key/value and feed tables and
-//! outside the commit head. It is a separate typed API beside [`Store`]: a Postgres store
-//! opens one with `postgres::PostgresPackIndex`, and `pack_index::memory` (feature
-//! `test-support`) is the in-memory index; the same conformance clauses run against both.
-//!
 //! With the `test-support` feature (and in this crate's own unit tests) `conformance`
 //! states each clause as a function generic over a `conformance::Backend` factory, and
 //! `fake` is the in-memory backend, with a deliberately broken variant per clause that
@@ -39,7 +33,6 @@ pub mod clock;
 pub mod conformance;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
-pub mod pack_index;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(any(test, feature = "test-support"))]
@@ -52,10 +45,6 @@ mod types;
 use std::time::Duration;
 
 pub use clock::{Clock, ManualClock, StoreTime, SystemClock};
-pub use pack_index::{
-    BlobDigest, Location, MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo,
-    Recorded,
-};
 pub use shared::{GENERATION, SHARED_WRITERS, share};
 pub use store::Store;
 pub use types::{

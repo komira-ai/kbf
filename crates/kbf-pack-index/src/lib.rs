@@ -7,7 +7,7 @@
 //! cannot check it.
 //!
 //! [`PackIndex`] is the typed view; `postgres::PostgresPackIndex` (feature `postgres`) keeps
-//! it in tables of the Postgres state store that are outside the key/value and feed tables
+//! it in tables of the Postgres state store (migration 2, [`schema`]) that are outside the key/value and feed tables
 //! and outside the commit head, so recording blobs never takes the lock that state
 //! transactions queue on. `memory::MemoryPackIndex` (feature `test-support`) is the
 //! in-memory index, and `conformance` states the rules once for both:
@@ -29,14 +29,18 @@
 
 use std::time::Duration;
 
-#[cfg(any(test, feature = "test-support"))]
-use crate::clock::StoreTime;
-use crate::types::StoreError;
+use kbf_state::StoreError;
+#[cfg(any(test, feature = "test-support", feature = "postgres"))]
+use kbf_state::StoreTime;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod conformance;
 #[cfg(any(test, feature = "test-support"))]
 pub mod memory;
+#[cfg(feature = "postgres")]
+pub mod postgres;
+#[cfg(feature = "postgres")]
+pub mod schema;
 
 /// The most digests (or keys) one call of the index takes.
 pub const MAX_BATCH: usize = 1000;
@@ -281,7 +285,7 @@ pub(crate) fn micros(d: Duration) -> i64 {
 }
 
 /// A reading of a clock in whole microseconds.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "postgres"))]
 pub(crate) fn micros_of(time: StoreTime) -> i64 {
     micros(time.as_duration())
 }

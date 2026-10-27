@@ -94,7 +94,7 @@ fn at(s: &Scratch) -> Result<u32, SchemaError> {
 #[test]
 fn a_database_with_no_schema_gets_it_and_a_store_opens_on_it() {
     let s = Scratch::new();
-    let step = BootStep::of_this_build(s.config());
+    let step = BootStep::new(s.config(), schema::embedded(), LOCK_WAIT);
     let latest = schema::latest();
     let said = step.migrate_to(latest).expect("creates");
     let want = format!("created the schema at version {latest}");
@@ -127,7 +127,7 @@ fn a_schema_at_the_build_is_left_alone() {
     let s = Scratch::new();
     let latest = schema::latest();
     schema::apply(&s.config(), &schema::embedded(), latest).expect("installed");
-    let step = BootStep::of_this_build(s.config());
+    let step = BootStep::new(s.config(), schema::embedded(), LOCK_WAIT);
     let said = step.migrate_to(latest).expect("nothing to do");
     let want = format!("the schema is at version {latest}, nothing to apply");
     assert_eq!(said, want);
@@ -144,7 +144,7 @@ fn a_schema_ahead_of_the_build_by_an_expand_step_is_left_alone() {
     let n1 = schema::latest() + 1;
     schema::apply(&s.config(), &with(expand()), n1).expect("the later release is installed");
     assert_eq!(at(&s), Ok(n1));
-    let step = BootStep::of_this_build(s.config());
+    let step = BootStep::new(s.config(), schema::embedded(), LOCK_WAIT);
     let said = step.migrate_to(schema::latest()).expect("nothing to apply");
     assert!(said.contains("nothing to apply"), "{said}");
     assert!(!said.contains("installer"), "{said}");
@@ -166,7 +166,7 @@ fn a_contract_step_above_the_build_is_refused_when_the_store_opens() {
         s.name
     );
     client.batch_execute(&row).expect("the later release's row");
-    let step = BootStep::of_this_build(s.config());
+    let step = BootStep::new(s.config(), schema::embedded(), LOCK_WAIT);
     step.migrate_to(schema::latest()).expect("nothing to apply");
     assert_eq!(at(&s), Ok(n1));
     match PostgresStore::open(&s.config()) {
