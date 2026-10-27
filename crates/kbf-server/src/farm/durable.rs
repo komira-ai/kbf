@@ -1745,6 +1745,8 @@ impl State {
 #[cfg(test)]
 mod blocks_tests;
 #[cfg(test)]
+mod golden_tests;
+#[cfg(test)]
 mod intake_tests;
 #[cfg(test)]
 mod leases_tests;
