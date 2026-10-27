@@ -557,6 +557,25 @@ impl State {
         }
     }
 
+    /// Applies the `cordon/` rows as the store holds them now, as an intake poll does: a read
+    /// of a node then shows a cordon or drain another frontend wrote without waiting for the
+    /// next poll. Returns the rows; `None`, with the nodes left as they are, when the farm has
+    /// no store or the store cannot be read.
+    pub(in crate::farm) fn take_cordons(
+        &mut self,
+        now: FarmTime,
+    ) -> Option<BTreeMap<WorkerId, StoredCordon>> {
+        let mut read = None;
+        self.durably("a cordon look", |d| {
+            read = Some((d.cordons()?, d.store_ms()));
+            Ok(())
+        });
+        let (rows, at) = read?;
+        let rows: BTreeMap<WorkerId, StoredCordon> = rows.into_iter().collect();
+        self.apply_cordons(now, rows.clone(), at);
+        Some(rows)
+    }
+
     /// Puts `worker` back in the drain its `cordon/` row says, if the drain ended for want of
     /// a lease. A start takes up no leased operation, so a drain taken up at the start finds
     /// its node holding no lease and ends; the node's leases are taken up when it says

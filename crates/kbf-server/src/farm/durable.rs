@@ -399,6 +399,7 @@ mod leases;
 mod named;
 mod opkey;
 mod owner;
+mod reads;
 mod subject;
 mod sweep;
 mod transitions;
@@ -1752,6 +1753,8 @@ mod leases_tests;
 mod named_tests;
 #[cfg(test)]
 mod owner_tests;
+#[cfg(test)]
+mod reads_tests;
 #[cfg(test)]
 mod results_tests;
 #[cfg(test)]

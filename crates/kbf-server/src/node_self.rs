@@ -235,8 +235,9 @@ async fn status(
         Err(refused) => return refused,
     };
     match calls.farm.node_detail(&node) {
-        Some(detail) => json(StatusCode::OK, &detail),
-        None => error(StatusCode::NOT_FOUND, "no_node"),
+        Ok(Some(detail)) => json(StatusCode::OK, &detail),
+        Ok(None) => error(StatusCode::NOT_FOUND, "no_node"),
+        Err(unread) => error(StatusCode::SERVICE_UNAVAILABLE, &unread.to_string()),
     }
 }
 
