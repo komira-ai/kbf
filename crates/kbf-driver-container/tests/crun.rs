@@ -785,13 +785,15 @@ fn listing(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Catches a `crun run` that outlives the sweep of its lease and writes into the
-/// scratch directory after the sweep removed it. A restarted daemon is not the parent of
+/// Catches (the "Directory not empty" the hosted runner's crun job met when the test
+/// removed a scratch directory) a `crun run` that outlives the sweep of its lease and
+/// writes into the scratch directory after the sweep removed it. A restarted daemon is not the parent of
 /// the `crun run` its predecessor left, so its sweep deletes the container and the
 /// lease's directory without waiting for that process, which ends on its own afterwards.
-/// The straggler is held stopped (`SIGSTOP`) across the sweep and let go after it, so what
-/// it writes on the way out comes after the sweep and its `assert_clean`, as it does when
-/// it is only slow; the scratch directory must hold what it held before.
+/// The straggler is held stopped (`SIGSTOP`) across the sweep, so it is still there when
+/// the sweep returns unless the sweep ended it, and let go after, so what it writes on
+/// the way out comes after the sweep and its `assert_clean`, as it does when it is only
+/// slow: the scratch directory must hold what the sweep left.
 #[tokio::test]
 #[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn a_crun_run_that_outlives_the_sweep_leaves_nothing_in_the_scratch_directory() {
@@ -827,6 +829,10 @@ async fn a_crun_run_that_outlives_the_sweep_leaves_nothing_in_the_scratch_direct
     ContainerRuntime::new(cell.config.clone(), Arc::clone(&cell.cas)).expect("restart");
     drop(alone);
     cell.assert_clean(1);
+    let alive: Vec<_> = (running_against(&cell.scratch).into_iter())
+        .filter(|p| !support::ended(&p.to_string()))
+        .collect();
+    assert!(alive.is_empty(), "the sweep left pids {alive:?} running");
     assert!(
         listing(&cell.scratch).iter().all(|p| before.contains(p)),
         "the sweep added entries"
