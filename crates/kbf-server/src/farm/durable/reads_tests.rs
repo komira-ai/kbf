@@ -129,6 +129,34 @@ async fn a_node_another_frontend_holds_is_unreadable_when_its_leases_cannot_be_r
     assert_eq!(read, Err(NodeUnread("node-b".to_owned())));
 }
 
+/// Asserts that a read of a node another frontend holds is an error when the store cannot
+/// tell who holds it: its `owner/` row cannot be read. Catches: a frontend that takes a store
+/// it cannot read for "nobody holds the node" and answers "no such node", which a storage
+/// host's updater takes for no daemon and no lease.
+#[tokio::test(start_paused = true)]
+async fn a_node_another_frontend_holds_is_unreadable_when_its_owner_cannot_be_read() {
+    let store = Racing::new();
+    let drained = drained_through_the_other_frontend(&store, true);
+    store.fail_reads(Some("owner/"));
+
+    let read = drained.through.node_detail(&drained.node);
+
+    assert_eq!(read, Err(NodeUnread("node-b".to_owned())));
+}
+
+/// Asserts that a read of a node another frontend holds is an error when no row of the store
+/// can be read. Catches: as above, with the whole store down.
+#[tokio::test(start_paused = true)]
+async fn a_node_another_frontend_holds_is_unreadable_when_the_store_cannot_be_read() {
+    let store = Racing::new();
+    let drained = drained_through_the_other_frontend(&store, true);
+    store.fail_reads(Some(""));
+
+    let read = drained.through.node_detail(&drained.node);
+
+    assert_eq!(read, Err(NodeUnread("node-b".to_owned())));
+}
+
 /// Asserts that a node no frontend of the store has held is not found, on a frontend with a
 /// store. Catches: a read from the store that answers for any name.
 #[tokio::test(start_paused = true)]
