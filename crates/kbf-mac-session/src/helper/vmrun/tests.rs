@@ -56,12 +56,12 @@ fn nothing_but_vm_run_with_a_spec_starts() {
         argv[at] = text.to_owned();
         argv
     };
-    let sh = vec!["/bin/sh".to_owned(), "-c".to_owned(), "id".to_owned()];
+    let other = vec!["/usr/bin/id".to_owned(), "-u".to_owned()];
     let mut longer = ok.clone();
     longer.push("--extra".to_owned());
     let cases = [
         Vec::new(),
-        sh,
+        other,
         ok[..1].to_vec(),
         ok[..3].to_vec(),
         longer,
