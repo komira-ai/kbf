@@ -136,9 +136,14 @@ impl Coordinator {
         let now = (self.clock)();
         let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         fleet.record(who.node_id.clone(), who.role, beat, now);
-        self.desired
-            .get()
-            .map_or(Reply::Nothing, |d| decide(&d, &fleet, &who.node_id, now))
+        let Some(d) = self.desired.get() else {
+            return Reply::Nothing;
+        };
+        let reply = decide(&d, &fleet, &who.node_id, now);
+        if let Reply::Update { version } = &reply {
+            fleet.order(who.node_id, version.clone(), now);
+        }
+        reply
     }
 
     /// The CI token in `bearer`, checked by the verifier.
