@@ -23,8 +23,8 @@
 //! - **C7.** A batch is one transaction and one commit, however many transactions it
 //!   holds; the server's WAL flush groups commits from concurrent callers.
 //!
-//! [`ExtensionPool`] is for a crate that keeps tables of its own in the schema (the pack index
-//! is one): connections of their own, outside the commit head, taking none of the locks above.
+//! [`ExtensionPool`] is for a crate that keeps tables of its own in the schema:
+//! connections of their own, outside the commit head, taking none of the locks above.
 //! Such a crate registers its migration with [`schema::extend`].
 //!
 //! [`PostgresStore::claim`] is the claim path: read committed, rows locked
