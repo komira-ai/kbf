@@ -44,11 +44,13 @@ pub mod shutdown;
 #[cfg(target_os = "macos")]
 pub mod shutdown_host;
 pub mod sim;
+pub mod sim_choose;
 #[cfg(target_os = "macos")]
 pub mod sim_host;
 pub mod sim_run;
 #[cfg(test)]
 mod sim_tests;
+pub mod sim_user;
 pub mod simpaths;
 pub mod vsock;
 pub mod wire;

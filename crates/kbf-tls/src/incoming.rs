@@ -4,6 +4,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -35,6 +36,32 @@ pub struct ConnInfo {
     /// The certificates the client presented and the handshake verified; `None` for a
     /// plain connection or a TLS client that presented none.
     pub certs: Option<Chain>,
+    /// Whether the connection is still there; see [`Liveness`].
+    pub live: Liveness,
+}
+
+/// Whether a connection is gone, as its owner has seen it. It is set when a read finds
+/// the peer closed, when a read or a write fails on the socket (a reset, a broken pipe, a
+/// TLS failure), which happens before the HTTP/2 layer learns of it and ends the streams,
+/// and when the connection is dropped. So a stream that ends while its connection is not
+/// gone was ended by its peer on a connection that stays: a reset, not a loss. A loss the
+/// socket does not report (a half-open connection, which only a keepalive timeout finds)
+/// is set by the drop of the connection the server then closes, which can come a moment
+/// after its streams end.
+#[derive(Clone, Debug, Default)]
+pub struct Liveness(Arc<AtomicBool>);
+
+impl Liveness {
+    /// Whether the connection is gone.
+    #[must_use]
+    pub fn is_gone(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    /// Records the connection gone.
+    pub fn mark_gone(&self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 enum Io {
@@ -64,13 +91,21 @@ impl Connected for Conn {
     }
 }
 
+/// Runs `$call` on the connection's stream and marks the connection gone if it failed:
+/// a write the socket refused means the peer is lost, whatever the HTTP/2 layer has yet
+/// seen.
 macro_rules! each_io {
-    ($self:expr, $io:ident => $call:expr) => {
-        match &mut $self.get_mut().io {
+    ($self:expr, $io:ident => $call:expr) => {{
+        let this = $self.get_mut();
+        let polled = match &mut this.io {
             Io::Plain($io) => $call,
             Io::Tls($io) => $call,
+        };
+        if let Poll::Ready(Err(_)) = &polled {
+            this.info.live.mark_gone();
         }
-    };
+        polled
+    }};
 }
 
 impl AsyncRead for Conn {
@@ -79,7 +114,34 @@ impl AsyncRead for Conn {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        each_io!(self, io => Pin::new(io).poll_read(cx, buf))
+        let this = self.get_mut();
+        let room = buf.remaining();
+        let before = buf.filled().len();
+        let polled = match &mut this.io {
+            Io::Plain(io) => Pin::new(io).poll_read(cx, buf),
+            Io::Tls(io) => Pin::new(io).poll_read(cx, buf),
+        };
+        if let Poll::Ready(read) = &polled {
+            let ended = match read {
+                Err(_) => true,
+                // Ok with nothing read is the end of the stream, but only when the buffer
+                // had room: a read into no room completes the same way on a live stream.
+                Ok(()) => match room {
+                    0 => false,
+                    _ => buf.filled().len() == before,
+                },
+            };
+            if ended {
+                this.info.live.mark_gone();
+            }
+        }
+        polled
+    }
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        self.info.live.mark_gone();
     }
 }
 
@@ -174,6 +236,7 @@ impl Incoming {
                 info: ConnInfo {
                     tcp: info,
                     certs: None,
+                    live: Liveness::default(),
                 },
             });
         };
@@ -223,7 +286,11 @@ async fn handshake(
                 .map(|chain| Arc::new(chain.iter().map(|c| c.clone().into_owned()).collect()));
             Some(Conn {
                 io: Io::Tls(Box::new(tls)),
-                info: ConnInfo { tcp: info, certs },
+                info: ConnInfo {
+                    tcp: info,
+                    certs,
+                    live: Liveness::default(),
+                },
             })
         }
         Ok(Err(e)) => {
@@ -267,4 +334,14 @@ pub fn remote_addr<T>(request: &Request<T>) -> Option<SocketAddr> {
         Some(info) => info.tcp.remote_addr,
         None => request.remote_addr(),
     }
+}
+
+/// Whether the connection `request` came on is gone, as an [`Incoming`] saw it. `None` for
+/// a request that did not come through one: there is nothing to ask.
+#[must_use]
+pub fn liveness<T>(request: &Request<T>) -> Option<Liveness> {
+    request
+        .extensions()
+        .get::<ConnInfo>()
+        .map(|info| info.live.clone())
 }

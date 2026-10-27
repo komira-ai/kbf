@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use kbf_meta::Command;
 
 mod execute;
-pub use execute::{ExecuteMetrics, OpenExecute};
+pub use execute::{ErrorCause, ErrorCounts, ExecuteMetrics, OpenExecute};
 
 /// What a histogram's values are, which fixes its buckets and how they are printed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

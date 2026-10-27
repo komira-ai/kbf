@@ -4,7 +4,7 @@
 //! file, so a package that is not the one asked for is a file with other bytes.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -141,6 +141,20 @@ pub(crate) struct Net {
     pub(crate) watch: Option<PathBuf>,
     /// Release files (by the end of their names) that `gh release download` does not leave.
     pub(crate) skip_files: Vec<String>,
+    /// The answers of `systemctl is-active`, first to last: the exit status and what it prints;
+    /// once they are used up the unit is active.
+    pub(crate) active_script: VecDeque<(i32, String)>,
+    /// The package's kbf, run to read flags, refuses them with this line.
+    pub(crate) kbf_refuses: Option<String>,
+    /// A directory whose mode each restart notes in the events.
+    pub(crate) watch_dir: Option<PathBuf>,
+    /// A directory set to a mode by the first restart, as the packaged unit's
+    /// `StateDirectoryMode=` does.
+    pub(crate) narrow_on_restart: Option<(PathBuf, u32)>,
+    /// A (then empty) directory the first restart removes.
+    pub(crate) remove_on_restart: Option<PathBuf>,
+    /// A directory set to a mode by the next installation.
+    pub(crate) narrow_on_install: Option<(PathBuf, u32)>,
 }
 
 impl Net {
@@ -175,6 +189,9 @@ impl Net {
             return exec(1, "", "dpkg: error processing archive");
         }
         self.installed = Some(version);
+        if let Some((dir, mode)) = self.narrow_on_install.take() {
+            fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+        }
         exec(0, "", "")
     }
 }
@@ -196,6 +213,23 @@ impl Runner for Sim {
             .into_owned();
         let last = cmd.args.last().cloned().unwrap_or_default();
         match name.as_str() {
+            "kbf" if cmd.args.last().is_some_and(|a| a == "--help") => {
+                net.events.push("parse-only".to_owned());
+                if net.broken.contains("kbf-cannot-run") {
+                    return Err(io::Error::other("cannot start the package's kbf"));
+                }
+                // Its parser: a word that is no flag is an unexpected argument.
+                let word = cmd.args.iter().find(|a| !a.starts_with('-'));
+                match (&net.kbf_refuses, word) {
+                    (Some(line), _) => exec(2, "", line),
+                    (None, Some(word)) => exec(
+                        2,
+                        "",
+                        &format!("error: unexpected argument '{word}' found\n"),
+                    ),
+                    (None, None) => exec(0, "usage", ""),
+                }
+            }
             "kbf" => {
                 net.events.push("kbf-version".to_owned());
                 match &net.kbf_commit {
@@ -213,6 +247,16 @@ impl Runner for Sim {
             "systemctl" => match cmd.args[0].as_str() {
                 "restart" => {
                     net.events.push(format!("restart:{last}"));
+                    if let Some(dir) = &net.watch_dir {
+                        let mode = fs::metadata(dir).unwrap().mode() & 0o7777;
+                        net.events.push(format!("dir-mode-at-restart:{mode:o}"));
+                    }
+                    if let Some((dir, mode)) = net.narrow_on_restart.take() {
+                        fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+                    }
+                    if let Some(dir) = net.remove_on_restart.take() {
+                        fs::remove_dir(dir).unwrap();
+                    }
                     if net.restart_fails_once.remove(&last) {
                         exec(5, "", "failed once")
                     } else if net.restart_never.contains(&last) {
@@ -240,7 +284,10 @@ impl Runner for Sim {
                 }
                 _ => {
                     net.events.push(format!("active:{last}"));
-                    exec(0, "", "")
+                    match net.active_script.pop_front() {
+                        Some((code, said)) => exec(code, &said, ""),
+                        None => exec(0, "active\n", ""),
+                    }
                 }
             },
             "curl" => {
@@ -325,6 +372,25 @@ impl Runner for Sim {
                     Some(v) => exec(0, &format!("ii  {v}\n"), ""),
                     None => exec(1, "", "no packages found matching kbf"),
                 }
+            }
+            "dpkg-deb" if cmd.args[0] == "--extract" => {
+                net.events.push("unpack".to_owned());
+                if net.broken.contains("unpack-fails") {
+                    return exec(2, "", "dpkg-deb: error: not a package");
+                }
+                let into = PathBuf::from(&cmd.args[2]);
+                let bin = into.join("usr/bin");
+                let units = into.join("usr/lib/systemd/system");
+                fs::create_dir_all(&bin).unwrap();
+                fs::create_dir_all(&units).unwrap();
+                fs::write(bin.join("kbf"), b"the package's kbf").unwrap();
+                fs::set_permissions(bin.join("kbf"), fs::Permissions::from_mode(0o755)).unwrap();
+                fs::write(
+                    units.join("kbf-storage-and-daemon.service"),
+                    "[Service]\nUser=kbf\nStateDirectory=kbf\nStateDirectoryMode=0750\n",
+                )
+                .unwrap();
+                exec(0, "", "")
             }
             "dpkg-deb" => {
                 net.events.push("inspect".to_owned());
@@ -453,6 +519,12 @@ impl Rig {
             kbf_commit: None,
             watch: None,
             skip_files: Vec::new(),
+            active_script: VecDeque::new(),
+            kbf_refuses: None,
+            watch_dir: None,
+            narrow_on_restart: None,
+            narrow_on_install: None,
+            remove_on_restart: None,
         }));
         let calls = Rc::new(RefCell::new(Vec::new()));
         let gh_exit = Rc::new(RefCell::new(0));
