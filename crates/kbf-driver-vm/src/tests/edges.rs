@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use super::support;
 use super::support::{
-    MemoryCas, Spec, config, driver, leftovers, outputs_share, scratch, until, until_running, work,
+    MemoryCas, Spec, TestClock, config, driver, driver_on, leftovers, open_gate, outputs_share,
+    scratch, until, until_running, work,
 };
 use crate::FakeHost;
 use kbf_daemon::cas::{digest_of, label};
@@ -117,7 +118,9 @@ async fn the_command_runs_in_its_working_directory() {
 
 /// Catches a guest that hangs mid-run waited on for ever: the driver ends the lease,
 /// as the farm's, once the report is later than the action's timeout and the grace,
-/// and destroys the VM.
+/// and destroys the VM. The watchdog runs on the test's clock: it must be armed for
+/// exactly the timeout and the grace (300 ms and 200 ms), and fire when that much time
+/// has passed.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_silent_guest_ends_the_lease_after_the_grace() {
     let dir = scratch("silent");
@@ -125,13 +128,20 @@ async fn a_silent_guest_ends_the_lease_after_the_grace() {
     config.report_grace = Duration::from_millis(200);
     let host = Arc::new(FakeHost::new().mute_after_start());
     let cas = Arc::new(MemoryCas::default());
-    let driver = driver(config.clone(), &host, &cas);
-    let action = Spec::ok().timeout(Duration::from_millis(300)).store(&cas);
+    let clock = TestClock::new();
+    let driver = driver_on(config.clone(), &host, &cas, &clock);
+    let timeout = Duration::from_millis(300);
+    let action = Spec::ok().timeout(timeout).store(&cas);
+    let run = {
+        let driver = Arc::clone(&driver);
+        tokio::spawn(async move { driver.run(work(1, action)).await })
+    };
+    until("the watchdog is armed", || !clock.sleeps().is_empty()).await;
+    assert_eq!(clock.sleeps(), [timeout + config.report_grace]);
 
-    let ended = tokio::time::timeout(Duration::from_secs(5), driver.run(work(1, action)))
-        .await
-        .expect("ended after the grace");
+    clock.advance(timeout + config.report_grace);
 
+    let ended = run.await.expect("joined");
     assert!(
         matches!(ended, Err(RuntimeError::Failed(ref why)) if why.contains("no report")),
         "{ended:?}"
@@ -141,9 +151,11 @@ async fn a_silent_guest_ends_the_lease_after_the_grace() {
 }
 
 /// Catches the report watchdog armed for the grace alone (or any span shorter than the
-/// action's timeout plus the grace): a command that runs 1 s of its 5 s timeout must
-/// finish under a 300 ms grace. With the defect, every action longer than the grace (30
-/// s by default) would be ended as the farm's failure and run again elsewhere.
+/// action's timeout plus the grace): a command held for longer than the grace, inside
+/// its hour, must finish. With the defect, every action longer than the grace (30 s by
+/// default) would be ended as the farm's failure and run again elsewhere. The test reads
+/// the span the watchdog was armed for, then lets twice the grace pass on its clock and
+/// only then lets the command go.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_run_longer_than_the_grace_finishes_within_its_timeout() {
     let dir = scratch("past-grace");
@@ -151,19 +163,23 @@ async fn a_run_longer_than_the_grace_finishes_within_its_timeout() {
     config.report_grace = Duration::from_millis(300);
     let host = Arc::new(FakeHost::new());
     let cas = Arc::new(MemoryCas::default());
-    let driver = driver(config.clone(), &host, &cas);
-    let action = Spec::act(&["sleep", "1", ";", "echo", "done"])
-        .timeout(Duration::from_secs(5))
-        .store(&cas);
+    let clock = TestClock::new();
+    let driver = driver_on(config.clone(), &host, &cas, &clock);
+    let timeout = Duration::from_secs(3600);
+    let action = Spec::held(&config, 1).timeout(timeout).store(&cas);
+    let run = {
+        let driver = Arc::clone(&driver);
+        tokio::spawn(async move { driver.run(work(1, action)).await })
+    };
+    until("the watchdog is armed", || !clock.sleeps().is_empty()).await;
+    until_running(&config, 1).await;
+    assert_eq!(clock.sleeps(), [timeout + config.report_grace]);
 
-    let result = driver.run(work(1, action)).await;
+    clock.advance(config.report_grace * 2);
+    open_gate(&config, 1);
 
-    let result = result.expect("ran within its timeout");
+    let result = run.await.expect("joined").expect("ran within its timeout");
     assert_eq!(result.exit_code, 0);
-    assert_eq!(
-        cas.blob(result.stdout_digest.as_ref().expect("stdout")),
-        b"done\n"
-    );
     assert!(leftovers(&config).is_empty(), "{:?}", leftovers(&config));
 }
 
@@ -203,7 +219,7 @@ async fn a_dropped_run_destroys_its_vm() {
         Arc::new(MemoryCas::default()),
     );
     let driver = driver(config.clone(), &host, &cas);
-    let action = Spec::act(&["sleep", "30"]).store(&cas);
+    let action = Spec::held(&config, 1).store(&cas);
     let run = {
         let driver = Arc::clone(&driver);
         tokio::spawn(async move { driver.run(work(1, action)).await })
@@ -259,19 +275,17 @@ async fn a_kill_during_the_input_fetch_stops_before_the_clone() {
     let dir = scratch("kill-fetch");
     let config = config(&dir);
     let host = Arc::new(FakeHost::default());
-    let cas = Arc::new(MemoryCas::delayed(Duration::from_secs(5)));
+    let cas = Arc::new(MemoryCas::gated());
     let driver = driver(config.clone(), &host, &cas);
     let action = Spec::ok().store(&cas);
     let run = {
         let driver = Arc::clone(&driver);
         tokio::spawn(async move { driver.run(work(1, action)).await })
     };
-    // Well inside the first fetch's delay.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The fetch is held at a gate no one opens: only the kill can end the lease.
+    until("the fetch is held", || cas.held() > 0).await;
 
-    tokio::time::timeout(Duration::from_secs(2), driver.kill(LeaseId::new(1, 1)))
-        .await
-        .expect("the kill did not wait for the fetch");
+    driver.kill(LeaseId::new(1, 1)).await;
 
     let ended = run.await.expect("joined");
     assert!(matches!(ended, Err(RuntimeError::Killed)), "{ended:?}");
@@ -293,9 +307,7 @@ async fn an_unknown_kill_returns_and_an_unclonable_image_is_the_farms() {
     );
     let driver = driver(config.clone(), &host, &cas);
 
-    tokio::time::timeout(Duration::from_secs(2), driver.kill(LeaseId::new(7, 7)))
-        .await
-        .expect("returned at once");
+    driver.kill(LeaseId::new(7, 7)).await;
     let ended = driver.run(work(1, Spec::ok().store(&cas))).await;
 
     assert!(matches!(ended, Err(RuntimeError::Failed(_))), "{ended:?}");

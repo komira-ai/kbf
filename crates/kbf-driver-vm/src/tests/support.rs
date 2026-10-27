@@ -2,9 +2,11 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
 
+use crate::clock::{Clock, Sleep};
 use crate::{FakeHost, VmConfig, VmDriver};
 use kbf_daemon::Work;
 use kbf_daemon::cas::{Cas, CasError, digest_of, label};
@@ -14,25 +16,40 @@ use kbf_proto::reapi::{Action, Command, Digest, Directory, FileNode, Platform};
 use kbf_types::{LeaseId, Resources};
 use prost::Message;
 
-/// How long a test waits for something that should happen promptly.
-pub const PROMPT: Duration = Duration::from_secs(10);
-
 pub const GIB: u64 = 1 << 30;
 
-/// A CAS in memory; `delay` holds every `get` back (to kill a lease mid-fetch).
+/// A CAS in memory; a gated one holds every `get` back, for ever, and counts them (to
+/// kill a lease mid-fetch).
 #[derive(Debug, Default)]
 pub struct MemoryCas {
     blobs: Mutex<BTreeMap<String, Vec<u8>>>,
-    delay: Option<Duration>,
+    gate: Option<Gate>,
+}
+
+/// A gate no one opens: a `get` that reaches it is counted and waits.
+#[derive(Debug)]
+struct Gate {
+    held: AtomicUsize,
+    shut: tokio::sync::Semaphore,
 }
 
 impl MemoryCas {
-    /// A CAS whose every `get` waits `delay` first.
-    pub fn delayed(delay: Duration) -> Self {
+    /// A CAS whose every `get` waits at a gate that stays shut.
+    pub fn gated() -> Self {
         Self {
-            delay: Some(delay),
+            gate: Some(Gate {
+                held: AtomicUsize::new(0),
+                shut: tokio::sync::Semaphore::new(0),
+            }),
             ..Self::default()
         }
+    }
+
+    /// How many `get`s wait at the gate.
+    pub fn held(&self) -> usize {
+        self.gate
+            .as_ref()
+            .map_or(0, |gate| gate.held.load(Ordering::SeqCst))
     }
 
     pub fn insert(&self, bytes: impl Into<Vec<u8>>) -> Digest {
@@ -72,8 +89,10 @@ impl Cas for MemoryCas {
     }
 
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
-        if let Some(delay) = self.delay {
-            tokio::time::sleep(delay).await;
+        if let Some(gate) = &self.gate {
+            gate.held.fetch_add(1, Ordering::SeqCst);
+            // Shut for good: this ends only when the `get` is dropped.
+            let _ = gate.shut.acquire().await;
         }
         self.lock()
             .get(&label(digest))
@@ -108,6 +127,15 @@ impl Spec {
             argv,
             ..Self::argv(&[])
         }
+    }
+
+    /// A command of lease `1.seq` that waits until the test opens its gate
+    /// ([`open_gate`]) and then succeeds: it runs for exactly as long as the test says.
+    /// The hour it waits at most is not a time the tests depend on: it ends the
+    /// command if a test never opens the gate.
+    pub fn held(config: &VmConfig, seq: u64) -> Self {
+        let gate = gate(config, seq);
+        Self::act(&["wait-for", &gate.display().to_string(), "3600"])
     }
 
     /// An action that does nothing and succeeds.
@@ -259,6 +287,146 @@ pub fn driver(config: VmConfig, host: &Arc<FakeHost>, cas: &Arc<MemoryCas>) -> A
     Arc::new(VmDriver::new(config, Arc::clone(host), Arc::clone(cas)).expect("driver"))
 }
 
+/// A driver whose boot poll and report watchdog read `clock`.
+pub fn driver_on(
+    config: VmConfig,
+    host: &Arc<FakeHost>,
+    cas: &Arc<MemoryCas>,
+    clock: &Arc<TestClock>,
+) -> Arc<Driver> {
+    let clock = Arc::clone(clock);
+    let driver = VmDriver::with_clock(config, Arc::clone(host), Arc::clone(cas), clock);
+    Arc::new(driver.expect("driver"))
+}
+
+/// Called with the number of each pause, just before it is made.
+type OnPause = Box<dyn Fn(u32) + Send + Sync>;
+
+/// A clock whose time is a counter. A pause moves it on by the pause, at once, unless the
+/// clock is held, when the pause waits for [`TestClock::release`] and time stands still;
+/// a sleep ends when a test has moved the time to its deadline ([`TestClock::advance`]).
+/// It records every pause and the span of every sleep asked of it, so a test reads what
+/// the driver waited for instead of timing it.
+#[derive(Default)]
+pub struct TestClock {
+    state: Mutex<ClockState>,
+    released: Condvar,
+    on_pause: Mutex<Option<OnPause>>,
+}
+
+#[derive(Default)]
+struct ClockState {
+    now: Duration,
+    held: bool,
+    pauses: u32,
+    sleeps: Vec<Duration>,
+    waiting: Vec<(Duration, tokio::sync::oneshot::Sender<()>)>,
+}
+
+impl std::fmt::Debug for TestClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestClock").finish_non_exhaustive()
+    }
+}
+
+impl TestClock {
+    /// A clock on which a pause passes at once.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// A clock on which a pause waits, with time standing still, for [`release`].
+    ///
+    /// [`release`]: TestClock::release
+    pub fn held() -> Arc<Self> {
+        let clock = Self::default();
+        clock.lock().held = true;
+        Arc::new(clock)
+    }
+
+    /// Lets every pause, waiting or later, pass at once.
+    pub fn release(&self) {
+        self.lock().held = false;
+        self.released.notify_all();
+    }
+
+    /// Calls `hook` with the number of each pause just before it is made.
+    pub fn on_pause(&self, hook: impl Fn(u32) + Send + Sync + 'static) {
+        *self.on_pause.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    /// Moves time on by `by` and ends every sleep whose deadline it reaches.
+    pub fn advance(&self, by: Duration) {
+        let mut state = self.lock();
+        state.now += by;
+        let now = state.now;
+        let (due, later) = std::mem::take(&mut state.waiting)
+            .into_iter()
+            .partition(|(deadline, _)| *deadline <= now);
+        state.waiting = later;
+        for (_, wake) in due {
+            let _ = wake.send(());
+        }
+    }
+
+    /// How many pauses were made or are waiting.
+    pub fn pauses(&self) -> u32 {
+        self.lock().pauses
+    }
+
+    /// The span of every sleep asked for, in order.
+    pub fn sleeps(&self) -> Vec<Duration> {
+        self.lock().sleeps.clone()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ClockState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Clock for TestClock {
+    fn now(&self) -> Duration {
+        self.lock().now
+    }
+
+    fn pause(&self, d: Duration) {
+        let pause = {
+            let mut state = self.lock();
+            state.pauses += 1;
+            state.pauses
+        };
+        if let Some(hook) = &*self.on_pause.lock().unwrap_or_else(PoisonError::into_inner) {
+            hook(pause);
+        }
+        let mut state = self.lock();
+        while state.held {
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(state);
+        self.advance(d);
+    }
+
+    fn sleep(&self, d: Duration) -> Sleep {
+        let mut state = self.lock();
+        state.sleeps.push(d);
+        let (wake, woken) = tokio::sync::oneshot::channel();
+        let deadline = state.now + d;
+        if deadline <= state.now {
+            let _ = wake.send(());
+        } else {
+            state.waiting.push((deadline, wake));
+        }
+        Box::pin(async move {
+            if woken.await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        })
+    }
+}
+
 /// A `vm` lease booked at the default VM size: 6 cores and 17 GiB.
 pub fn work(seq: u64, action_digest: Digest) -> Work {
     Work {
@@ -293,13 +461,24 @@ pub fn leftovers(config: &VmConfig) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Waits until `done` holds, at most [`PROMPT`].
+/// Waits until `done` holds. It has no deadline: the wait is for an event the test has
+/// caused, and a test whose event never comes is ended by the test runner, not by a
+/// clock of its own. `what` names the event in the log.
 pub async fn until(what: &str, done: impl Fn() -> bool) {
-    let by = Instant::now() + PROMPT;
     while !done() {
-        assert!(Instant::now() < by, "{what}: not within {PROMPT:?}");
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tracing::debug!(what, "waiting");
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
+}
+
+/// The file whose creation lets a [`Spec::held`] command of lease `1.seq` go on.
+pub fn gate(config: &VmConfig, seq: u64) -> PathBuf {
+    PathBuf::from(outputs_share(config, seq)).join("go")
+}
+
+/// Lets the held command of lease `1.seq` go on.
+pub fn open_gate(config: &VmConfig, seq: u64) {
+    std::fs::write(gate(config, seq), b"").expect("open the gate");
 }
 
 /// Waits until lease `1.seq`'s command has started in its guest: the guest has made its

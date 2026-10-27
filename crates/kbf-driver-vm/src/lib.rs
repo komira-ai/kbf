@@ -55,6 +55,7 @@
 //! per clone, the guest's resource usage in the result, and how an action inside the
 //! guest names the outputs share (`kbf-guest`'s request carries no path for it).
 
+pub mod clock;
 pub mod config;
 mod driver;
 mod fake;
@@ -66,9 +67,10 @@ mod tests;
 #[cfg(test)]
 kbf_testkit::act_test_hook!();
 
+pub use clock::{Clock, Wall};
 pub use config::VmConfig;
 pub use driver::{DRIVER, KIND, VmDriver};
-pub use fake::{CloneGate, FakeHost, MACOS_VM_LIMIT};
+pub use fake::{CloneGate, FakeHost, FakeStream, MACOS_VM_LIMIT};
 pub use host::{HostError, MachineId, NetworkDevice, Share, VmHost, VmSpec};
 
 /// The file in the inputs share holding the per-boot token, as hex: the name

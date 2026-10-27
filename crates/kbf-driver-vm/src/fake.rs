@@ -6,20 +6,24 @@
 //! It keeps the macOS limit of two running VMs, can delay or withhold its guests'
 //! readiness, crash a running VM, silence a guest before its `Ready` or once its
 //! command has started, and fail stops; it records every spec it started and every
-//! stop it was asked for.
+//! stop it was asked for, and every `Run` the driver sent.
+//!
+//! Nothing in it reads a clock. Readiness is counted in connects, and a stream's read
+//! bound is recorded, not timed: a test says when a bound has run out
+//! ([`FakeHost::expire_read_bounds`]).
 
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Cursor, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use kbf_guest::server::{Agent, Config, HELLO_TIMEOUT};
-use kbf_guest::wire::{GuestMsg, TOKEN_LEN, read_frame, write_frame};
+use kbf_guest::server::{Agent, Config, HELLO_TIMEOUT, Stream};
+use kbf_guest::wire::{GuestMsg, HostMsg, RunRequest, TOKEN_LEN, read_frame, write_frame};
 
 use crate::host::{HostError, INPUTS_TAG, OUTPUTS_TAG, VmHost, VmSpec};
 use crate::{GUI_SESSION, TOKEN_FILE};
@@ -31,8 +35,9 @@ pub const MACOS_VM_LIMIT: usize = 2;
 #[derive(Debug)]
 pub struct FakeHost {
     limit: usize,
-    /// How long after `start` a guest can be reached; `None` for never.
-    ready_after: Option<Duration>,
+    /// How many connects find a guest still booting before one reaches it; `None` for
+    /// never.
+    ready_after: Option<usize>,
     session: String,
     /// Where guests fall silent, if anywhere.
     silence: Silence,
@@ -90,11 +95,83 @@ struct State {
     specs: Vec<VmSpec>,
     stopped: Vec<String>,
     clones: usize,
+    /// The host's end of every stream handed out, with its tap.
+    taps: Vec<(Arc<Tap>, UnixStream)>,
+}
+
+/// What a [`FakeStream`] and the host share: the read bound the driver set, whether it
+/// has run out, and everything the driver wrote.
+#[derive(Debug, Default)]
+struct Tap {
+    bound: Mutex<Option<Duration>>,
+    expired: AtomicBool,
+    sent: Mutex<Vec<u8>>,
+}
+
+impl Tap {
+    fn bound(&self) -> MutexGuard<'_, Option<Duration>> {
+        self.bound.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn sent(&self) -> MutexGuard<'_, Vec<u8>> {
+        self.sent.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The driver's end of a connection to a fake guest: a Unix socket whose read bound is
+/// only recorded. A bound that [`FakeHost::expire_read_bounds`] has run out ends a
+/// blocked read as the OS's timeout does, with `WouldBlock`.
+#[derive(Debug)]
+pub struct FakeStream {
+    inner: UnixStream,
+    tap: Arc<Tap>,
+}
+
+impl Read for FakeStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.inner.read(buf) {
+            Ok(0) if !buf.is_empty() && self.tap.expired.load(Ordering::SeqCst) => {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+            read => read,
+        }
+    }
+}
+
+impl Write for FakeStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.tap.sent().extend_from_slice(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl Stream for FakeStream {
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            inner: self.inner.try_clone()?,
+            tap: Arc::clone(&self.tap),
+        })
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        *self.tap.bound() = timeout;
+        Ok(())
+    }
+
+    fn shutdown(&self) -> io::Result<()> {
+        self.inner.shutdown(std::net::Shutdown::Both)
+    }
 }
 
 #[derive(Debug)]
 struct Booted {
-    started: Instant,
+    /// How many connects were made to it.
+    connects: usize,
     /// Hands new connections to the agent's thread; `None` once the VM crashed.
     conns: Option<mpsc::Sender<UnixStream>>,
     /// The host's end of every connection made, to end them on a stop or a crash.
@@ -129,7 +206,7 @@ impl FakeHost {
     pub fn new() -> Self {
         Self {
             limit: MACOS_VM_LIMIT,
-            ready_after: Some(Duration::ZERO),
+            ready_after: Some(0),
             session: GUI_SESSION.to_owned(),
             silence: Silence::Never,
             stops_ok: usize::MAX,
@@ -152,10 +229,11 @@ impl FakeHost {
         (self, CloneGate { entered, release })
     }
 
-    /// Guests can be reached only `after` their VM started.
+    /// Guests are still booting for the first `connects` connects to their VM, and can
+    /// be reached by the next: a boot that takes as many polls, whatever they last.
     #[must_use]
-    pub fn ready_after(mut self, after: Duration) -> Self {
-        self.ready_after = Some(after);
+    pub fn ready_after_connects(mut self, connects: usize) -> Self {
+        self.ready_after = Some(connects);
         self
     }
 
@@ -231,6 +309,45 @@ impl FakeHost {
         self.lock().clones
     }
 
+    /// The read bound each stream to a guest has now (`None` for no bound), in the order
+    /// the streams were made, clones of a stream counted once.
+    #[must_use]
+    pub fn read_bounds(&self) -> Vec<Option<Duration>> {
+        (self.lock().taps.iter())
+            .map(|(tap, _)| *tap.bound())
+            .collect()
+    }
+
+    /// Runs out the read bound of every stream that has one: a read blocked on it, now
+    /// or later, fails with `WouldBlock` as when the OS's timeout expires. A stream with
+    /// no bound is not touched.
+    pub fn expire_read_bounds(&self) {
+        for (tap, host) in &self.lock().taps {
+            if tap.bound().is_some() {
+                tap.expired.store(true, Ordering::SeqCst);
+                let _ = host.shutdown(std::net::Shutdown::Read);
+            }
+        }
+    }
+
+    /// Every `Run` the driver sent a guest, in order.
+    ///
+    /// # Panics
+    /// The driver sent a frame that is not a message.
+    #[must_use]
+    pub fn requests(&self) -> Vec<RunRequest> {
+        let mut runs = Vec::new();
+        for (tap, _) in &self.lock().taps {
+            let mut sent = Cursor::new(tap.sent().clone());
+            while let Ok(frame) = read_frame(&mut sent) {
+                if let HostMsg::Run(run) = HostMsg::decode(&frame).expect("a message") {
+                    runs.push(run);
+                }
+            }
+        }
+        runs
+    }
+
     /// Crashes the running VM `name`: every stream to its guest ends and its command is
     /// killed, as when the guest dies; the VM keeps its slot until it is stopped, and
     /// a connect to it fails, booted or not.
@@ -242,7 +359,7 @@ impl FakeHost {
             let mut state = self.lock();
             let booted = state.running.get_mut(name).expect("the VM is running");
             Booted {
-                started: booted.started,
+                connects: booted.connects,
                 conns: booted.conns.take(),
                 open: std::mem::take(&mut booted.open),
                 agent: booted.agent.take(),
@@ -258,7 +375,7 @@ impl FakeHost {
 }
 
 impl VmHost for FakeHost {
-    type Stream = UnixStream;
+    type Stream = FakeStream;
 
     fn clone_image(&self, image: &Path, clone: &Path) -> io::Result<()> {
         if let Some(hold) = &self.clone_gate {
@@ -316,7 +433,7 @@ impl VmHost for FakeHost {
         state.running.insert(
             spec.name.clone(),
             Booted {
-                started: Instant::now(),
+                connects: 0,
                 conns: Some(tx),
                 open: Vec::new(),
                 agent: Some(agent),
@@ -325,24 +442,32 @@ impl VmHost for FakeHost {
         Ok(())
     }
 
-    fn connect(&self, name: &str) -> Result<UnixStream, HostError> {
+    fn connect(&self, name: &str) -> Result<FakeStream, HostError> {
         let mut state = self.lock();
+        let state = &mut *state;
         let not_running = || io::Error::new(io::ErrorKind::NotConnected, "the VM is not running");
         let booted = state.running.get_mut(name).ok_or_else(not_running)?;
         // A crashed VM is gone, not still booting.
         let conns = booted.conns.clone().ok_or_else(not_running)?;
+        booted.connects += 1;
         match self.ready_after {
-            Some(after) if booted.started.elapsed() >= after => {}
+            Some(booting) if booted.connects > booting => {}
             _ => return Err(HostError::NotReady),
         }
         let (host, guest) = UnixStream::pair()?;
         booted.open.push(host.try_clone()?);
+        let tap = Arc::new(Tap::default());
+        let stream = FakeStream {
+            inner: host.try_clone()?,
+            tap: Arc::clone(&tap),
+        };
+        state.taps.push((tap, host));
         let guest = match self.silence {
             Silence::Never => guest,
             Silence::BeforeReady => {
                 // Held open, never served: the stream ends when the VM stops.
                 booted.open.push(guest);
-                return Ok(host);
+                return Ok(stream);
             }
             Silence::AfterStart => {
                 let (relay, agent_end) = UnixStream::pair()?;
@@ -352,7 +477,7 @@ impl VmHost for FakeHost {
             }
         };
         conns.send(guest).ok().ok_or_else(not_running)?;
-        Ok(host)
+        Ok(stream)
     }
 
     fn stop(&self, name: &str) -> io::Result<()> {

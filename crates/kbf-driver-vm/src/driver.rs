@@ -6,7 +6,7 @@ use std::io::{ErrorKind, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use kbf_daemon::cas::{Cas, CasError};
 use kbf_daemon::tree::{
@@ -23,6 +23,7 @@ use kbf_types::{LeaseId, Resources};
 use prost_types::Timestamp;
 use tokio::sync::oneshot;
 
+use crate::clock::{Clock, Wall};
 use crate::config::{HELPER_MEMORY_BYTES, VmConfig};
 use crate::host::{HostError, INPUTS_TAG, MachineId, OUTPUTS_TAG, Share, VmHost, VmSpec};
 use crate::{GUI_SESSION, TOKEN_FILE};
@@ -45,6 +46,7 @@ pub struct VmDriver<H, C> {
     config: VmConfig,
     host: Arc<H>,
     cas: Arc<C>,
+    clock: Arc<dyn Clock>,
     stops: Mutex<BTreeMap<LeaseId, oneshot::Sender<Stop>>>,
 }
 
@@ -64,6 +66,20 @@ impl<H: VmHost, C: Cas> VmDriver<H, C> {
     /// # Errors
     /// A directory could not be made, read or emptied.
     pub fn new(config: VmConfig, host: Arc<H>, cas: Arc<C>) -> std::io::Result<Self> {
+        Self::with_clock(config, host, cas, Arc::new(Wall::new()))
+    }
+
+    /// As [`VmDriver::new`], with the time the boot poll and the report watchdog read
+    /// and let pass given by `clock`.
+    ///
+    /// # Errors
+    /// A directory could not be made, read or emptied.
+    pub fn with_clock(
+        config: VmConfig,
+        host: Arc<H>,
+        cas: Arc<C>,
+        clock: Arc<dyn Clock>,
+    ) -> std::io::Result<Self> {
         for dir in [config.leases(), config.clones()] {
             std::fs::create_dir_all(&dir)?;
             for entry in std::fs::read_dir(&dir)? {
@@ -76,6 +92,7 @@ impl<H: VmHost, C: Cas> VmDriver<H, C> {
             config,
             host,
             cas,
+            clock,
             stops: Mutex::new(BTreeMap::new()),
         })
     }
@@ -189,16 +206,17 @@ impl<H: VmHost, C: Cas> VmDriver<H, C> {
         let host = Arc::clone(&self.host);
         let name = name.to_owned();
         let (timeout, poll) = (self.config.boot_timeout, self.config.boot_poll);
+        let clock = Arc::clone(&self.clock);
         blocking(move || {
-            let deadline = Instant::now() + timeout;
+            let deadline = clock.now() + timeout;
             loop {
-                let left = deadline.saturating_duration_since(Instant::now());
+                let left = deadline.saturating_sub(clock.now());
                 if left.is_zero() {
                     return Err(not_ready(timeout));
                 }
                 match host.connect(&name) {
                     Ok(stream) => return handshake(stream, token, left, timeout),
-                    Err(HostError::NotReady) => std::thread::sleep(poll.min(left)),
+                    Err(HostError::NotReady) => clock.pause(poll.min(left)),
                     Err(e) => return Err(host_error(e)),
                 }
             }
@@ -229,7 +247,7 @@ impl<H: VmHost, C: Cas> VmDriver<H, C> {
         tokio::select! {
             // A reader that panicked sends nothing; the grace below ends the lease.
             Ok(exit) = reported => exit,
-            () = tokio::time::sleep(prepared.timeout + grace) => Err(RuntimeError::Failed(
+            () = self.clock.sleep(prepared.timeout + grace) => Err(RuntimeError::Failed(
                 format!("the guest sent no report within {grace:?} past the action's timeout"),
             )),
             Ok(by) = &mut *stop => {
