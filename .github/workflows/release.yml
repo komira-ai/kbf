@@ -442,6 +442,19 @@ jobs:
       # coordinator's allow-list (this workflow, on main, for `release`) and the hosts' own
       # signature and hash checks bound what a token can do.
       - run: cargo build -p xtask --locked
+      # The version the farm is told to converge on is the one its hosts report in their
+      # heartbeats, `<version>+g<12 hex digits of the commit>` (0.1.0+g0123456789ab), which the
+      # coordinator compares with the desired version and a host's installer finds the commit in.
+      # It is not the release's tag. It is read from the facts the linux build kept of itself
+      # (kbf-<commit>-linux-x86_64.version.json, a release asset), which must be the file the
+      # release's SHA256SUMS lists and the release build of this commit; the job fails here if
+      # the facts are missing or are not.
+      - name: The version the hosts will report, from this release's version facts
+        id: farm-version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: cargo xtask release farm-version --repo "$GITHUB_REPOSITORY" --tag "$TAG" --commit "$COMMIT" --output "$GITHUB_OUTPUT"
       # When the coordinator is reachable only on a Tailscale network: join it, after the build
       # (its scripts never see that network), as an ephemeral node. Tailscale's workload identity
       # federation takes this run's OIDC token, so the job still holds no secret. The client id and
@@ -461,7 +474,7 @@ jobs:
           COORDINATOR_URL: ${{ vars.KBF_COORDINATOR_URL }}
           # The farm CA's certificate (public), which the coordinator's certificate chains to.
           COORDINATOR_CA: ${{ vars.KBF_COORDINATOR_CA }}
-          VERSION: ${{ needs.plan.outputs.version }}
+          VERSION: ${{ steps.farm-version.outputs.version }}
           MIN_UP_STORAGE: ${{ vars.KBF_MIN_UP_STORAGE || '1' }}
           MIN_UP_FRONTEND: ${{ vars.KBF_MIN_UP_FRONTEND || '1' }}
         run: cargo xtask deploy-farm --url "$COORDINATOR_URL" --ca-pem "$COORDINATOR_CA" --version "$VERSION" --min-up-storage "$MIN_UP_STORAGE" --min-up-frontend "$MIN_UP_FRONTEND"
