@@ -9,9 +9,10 @@ use serde_json::json;
 
 use crate::converge::State;
 use crate::desired::DesiredStore;
+use crate::desired::KBF;
 use crate::fleet::ORDER_AGE;
 use crate::identity::Identity;
-use crate::service::{CiRefused, Coordinator, SetError, Unauthorized};
+use crate::service::{CiRefused, ConvergenceError, Coordinator, SetError, Unauthorized};
 use crate::services::Services;
 use crate::testutil::{OPERATOR, Rig, beat, ci_token, clock_of, id, last, updating, version};
 
@@ -292,26 +293,33 @@ async fn the_convergence_is_read_with_a_ci_token_and_nothing_else() {
         (Some(OPERATOR), "malformed"),
         (Some(other.as_str()), "unknown_key"),
     ] {
-        let read = rig.coordinator.convergence(bearer).await;
+        let read = rig.coordinator.convergence(bearer, KBF).await;
         assert_eq!(
             read.map(|_| ()),
-            Err(CiRefused::Unauthorized(why)),
+            Err(ConvergenceError::Refused(CiRefused::Unauthorized(why))),
             "{bearer:?}"
         );
     }
     let long = "a".repeat(9_000);
     assert!(matches!(
-        rig.coordinator.convergence(Some(&long)).await,
-        Err(CiRefused::Unauthorized("missing"))
+        rig.coordinator.convergence(Some(&long), KBF).await,
+        Err(ConvergenceError::Refused(CiRefused::Unauthorized(
+            "missing"
+        )))
     ));
     let token = ci_token();
     rig.coordinator
-        .convergence(Some(&token))
+        .convergence(Some(&token), KBF)
         .await
         .expect("the first use is accepted");
     assert_eq!(
-        rig.coordinator.convergence(Some(&token)).await.map(|_| ()),
-        Err(CiRefused::Unauthorized("replayed"))
+        rig.coordinator
+            .convergence(Some(&token), KBF)
+            .await
+            .map(|_| ()),
+        Err(ConvergenceError::Refused(CiRefused::Unauthorized(
+            "replayed"
+        )))
     );
     assert_eq!(
         rig.coordinator.status(Some(&ci_token())).map(|_| ()),
@@ -326,16 +334,16 @@ async fn the_convergence_is_read_with_a_ci_token_and_nothing_else() {
 async fn the_convergence_follows_the_heartbeats() {
     let rig = Rig::new("svc-converge");
     rig.at(2_000);
-    let none = rig.coordinator.convergence(Some(&ci_token())).await;
+    let none = rig.coordinator.convergence(Some(&ci_token()), KBF).await;
     let none = none.expect("read");
     assert_eq!((none.desired, none.state), (None, State::InProgress));
     rig.set(STATE).await;
     let d1 = || who("d1", HostRole::Daemon);
     rig.coordinator.heartbeat(d1(), beat("1.0"));
-    let behind = rig.coordinator.convergence(Some(&ci_token())).await;
+    let behind = rig.coordinator.convergence(Some(&ci_token()), KBF).await;
     assert_eq!(behind.expect("read").state, State::InProgress);
     rig.coordinator.heartbeat(d1(), beat("2.0"));
-    let short = rig.coordinator.convergence(Some(&ci_token())).await;
+    let short = rig.coordinator.convergence(Some(&ci_token()), KBF).await;
     assert_eq!(
         short.expect("read").state,
         State::InProgress,
@@ -344,7 +352,7 @@ async fn the_convergence_follows_the_heartbeats() {
     for (name, role) in [("st1", HostRole::Storage), ("fe1", HostRole::Frontend)] {
         rig.coordinator.heartbeat(who(name, role), beat("2.0"));
     }
-    let done = rig.coordinator.convergence(Some(&ci_token())).await;
+    let done = rig.coordinator.convergence(Some(&ci_token()), KBF).await;
     let done = done.expect("read");
     assert_eq!(done.state, State::Converged);
     let daemons = done
@@ -610,7 +618,8 @@ async fn a_single_table_sets_kbf_and_is_refused_for_another_service() {
     rig.set(STATE).await;
 }
 
-const SERVICES_ONE_AT_A_TIME: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmax_updating = 1\nmin_up = 0\n";
+const SERVICES_ONE_AT_A_TIME: &str =
+    "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmax_updating = 1\nmin_up = 0\n";
 
 /// A beat of a new updater: kbf at `kbf`, `other` at `other`.
 fn new_beat(kbf: &str, other: &str) -> kbf_updater::wire::Heartbeat {
@@ -802,4 +811,79 @@ async fn each_entry_sets_only_its_own_services() {
     assert_eq!(status.services["js-server"].version.as_str(), "3.0");
     assert_eq!(status.services["js-agent"].version.as_str(), "3.0");
     assert_eq!(status.services.len(), 3);
+}
+
+const OTHER_PAIR: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 2\n";
+
+/// Behaviour: the convergence and the status of a second service come from the heartbeats
+/// that carry that service and from its own desired state. While `other` has one of its two
+/// required daemons at 3.0, kbf (all at 2.0) reads converged and `other` in progress; when
+/// the second daemon reports 3.0 `other` converges, and the status counts each service's
+/// hosts on their own. A name the coordinator does not manage is an error, and so is a
+/// read with a bad token.
+#[tokio::test]
+async fn a_second_services_convergence_and_status_come_from_its_own_hosts() {
+    let mut rig = Rig::new("svc-converge-other");
+    rig.coordinator = Rig::start_with_allow_list(
+        &rig.dir,
+        &rig.clock,
+        &single_table("services = [\"kbf\", \"other\"]"),
+    )
+    .with_services(Services::parse(OTHER_PAIR).expect("services"));
+    rig.set(r#"{"version":"2.0","min_up":{"storage":0,"frontend":0}}"#)
+        .await;
+    rig.set(OTHER).await;
+    rig.at(2_000);
+    let c = &rig.coordinator;
+    let read = |service: &'static str| async move {
+        c.convergence(Some(&ci_token()), service)
+            .await
+            .expect("read")
+    };
+    c.heartbeat(who("d1", HostRole::Daemon), new_beat("2.0", "3.0"));
+    c.heartbeat(who("d2", HostRole::Daemon), new_beat("2.0", "1.0"));
+    let kbf = read("kbf").await;
+    assert_eq!(kbf.state, State::Converged);
+    assert_eq!(kbf.roles[0].at_desired, 2);
+    let other = read("other").await;
+    assert_eq!(other.state, State::InProgress);
+    assert_eq!(other.desired.expect("desired").as_str(), "3.0");
+    assert_eq!(other.roles[0].at_desired, 1);
+    c.heartbeat(who("d2", HostRole::Daemon), new_beat("2.0", "3.0"));
+    assert_eq!(read("other").await.state, State::Converged);
+
+    let status = c.status(Some(OPERATOR)).expect("status");
+    assert_eq!(
+        status
+            .per_service
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["kbf", "other"]
+    );
+    assert_eq!(status.per_service["kbf"].roles[0].at_desired, 2);
+    assert_eq!(status.per_service["other"].roles[0].at_desired, 2);
+    assert_eq!(
+        status.per_service["other"]
+            .desired
+            .as_ref()
+            .expect("other")
+            .version
+            .as_str(),
+        "3.0"
+    );
+
+    let unknown = c.convergence(Some(&ci_token()), "nope").await;
+    assert_eq!(unknown.map(|_| ()), Err(ConvergenceError::UnknownService));
+    let refused = c.convergence(None, "other").await;
+    assert_eq!(
+        refused.map(|_| ()),
+        Err(ConvergenceError::Refused(CiRefused::Unauthorized(
+            "missing"
+        )))
+    );
+    assert_eq!(
+        ConvergenceError::UnknownService.to_string(),
+        "no such service"
+    );
 }

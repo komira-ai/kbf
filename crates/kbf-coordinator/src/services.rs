@@ -274,6 +274,11 @@ impl Services {
         Self::parse(&text)
     }
 
+    /// The names of every service the coordinator manages, in order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.defs.keys().map(String::as_str)
+    }
+
     /// The service `name`, if the coordinator manages it.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&ServiceDef> {

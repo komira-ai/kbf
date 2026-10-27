@@ -91,6 +91,7 @@ impl Fake {
     fn plan(&self) -> Plan {
         Plan {
             url: self.base.clone(),
+            service: "kbf".to_owned(),
             audience: self.base.clone(),
             version: "2.0.0+g000000000002".to_owned(),
             min_up_storage: 1,
@@ -1213,4 +1214,96 @@ fn run_with_refuses_a_tag_version_without_calling_the_coordinator() {
     );
     assert!(result.is_err());
     assert!(fake.requests("/").is_empty(), "a request was sent");
+}
+
+fn service_args(fake: &Fake, service: &str, version: &str) -> Args {
+    let mut args = args_for(fake, &fake.ca_pem);
+    args.service = service.to_owned();
+    args.version = version.to_owned();
+    args
+}
+
+#[test]
+fn another_service_is_posted_by_name_and_waited_on_by_its_own_convergence() {
+    // Proves: with `--service js-server` the POST body is kbf's body plus the service name,
+    // the baseline read and every poll ask `/v1/convergence?service=js-server` (never the
+    // bare path), a version text of the service's own form is accepted, and the run ends
+    // when that service's convergence says converged.
+    let seven = |state, updating| {
+        let mut answer = farm(state, updating, 0);
+        answer["desired"] = json!("7");
+        Ok(answer)
+    };
+    let fake = serve(Script::after(
+        seven("converged", 0),
+        vec![seven("in_progress", 1), seven("converged", 0)],
+    ));
+    let args = service_args(&fake, "js-server", "7");
+    let mut out = Vec::new();
+    let ca = [fake.ca.clone()];
+    let lines = run_with(&args, &fake.service(), &ca, &mut out).expect("converged");
+    assert_eq!(lines.len(), 1);
+    let posts = fake.requests("/v1/desired");
+    assert_eq!(posts.len(), 1);
+    let body: Value = serde_json::from_str(&posts[0].body).expect("json");
+    assert_eq!(
+        body,
+        json!({
+            "service": "js-server",
+            "version": "7",
+            "min_up": {"storage": 1, "frontend": 1}
+        })
+    );
+    let reads = fake.requests("/v1/convergence");
+    assert_eq!(reads.len(), 3);
+    assert!(
+        reads
+            .iter()
+            .all(|r| r.path == "/v1/convergence?service=js-server"),
+        "{reads:?}"
+    );
+}
+
+#[test]
+fn kbf_sends_the_request_it_always_sent() {
+    // Proves: `--service kbf`, given or defaulted, posts exactly the bytes deploy-farm
+    // posted before the flag existed (no `service` key) and reads the bare convergence path.
+    let fake = serve(Script::new(vec![Ok(farm("converged", 0, 0))]));
+    let mut args = args_for(&fake, &fake.ca_pem);
+    assert_eq!(args.service, "kbf");
+    args.service = "kbf".to_owned();
+    let mut out = Vec::new();
+    let ca = [fake.ca.clone()];
+    run_with(&args, &fake.service(), &ca, &mut out).expect("converged");
+    assert_eq!(
+        fake.requests("/v1/desired")[0].body,
+        r#"{"min_up":{"frontend":1,"storage":1},"version":"2.0.0+g000000000002"}"#
+    );
+    assert!(
+        fake.requests("/v1/convergence")
+            .iter()
+            .all(|r| r.path == "/v1/convergence")
+    );
+}
+
+#[test]
+fn a_service_name_the_coordinator_would_refuse_is_refused_before_any_call() {
+    // Proves: an empty name, upper case, a slash, a query character and a space are refused
+    // by the client, so the name can go in the query unescaped, and nothing is sent; and
+    // only kbf's version has to be of kbf's form.
+    let fake = serve(Script::new(vec![]));
+    let ca = [fake.ca.clone()];
+    for name in ["", "JS", "a/b", "a&b", "a b", "a_b"] {
+        let args = service_args(&fake, name, "7");
+        let refused = run_with(&args, &fake.service(), &ca, &mut Vec::new());
+        let Err(xtask::Error::Failed(why)) = refused else {
+            panic!("{name:?} was accepted: {refused:?}");
+        };
+        assert!(why.contains("is not a service name"), "{why}");
+    }
+    let kbf = service_args(&fake, "kbf", "7");
+    let refused = run_with(&kbf, &fake.service(), &ca, &mut Vec::new());
+    assert!(matches!(refused, Err(xtask::Error::Failed(why)) if why.contains("is not the form")));
+    assert!(fake.requests("/token").is_empty());
+    assert!(fake.requests("/v1").is_empty());
 }
