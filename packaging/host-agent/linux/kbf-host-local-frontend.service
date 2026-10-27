@@ -18,6 +18,7 @@ Wants=docker.service
 
 [Service]
 Type=simple
+User=root
 # Root, on purpose: it runs docker, which is root's, and writes root's state. The socket is the access control: mode 0600, owned by the one
 # account named here. Root is systemd's default, so the unit names no User=: with User= set,
 # even to root, and a system call filter in place (RestrictRealtime=, LockPersonality= and
