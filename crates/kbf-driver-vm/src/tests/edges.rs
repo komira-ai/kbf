@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use super::support;
 use super::support::{
-    MemoryCas, Spec, config, driver, leftovers, outputs_share, scratch, until_running, work,
+    MemoryCas, Spec, config, driver, leftovers, outputs_share, scratch, until, until_running, work,
 };
 use crate::FakeHost;
 use kbf_daemon::cas::{digest_of, label};
@@ -214,6 +214,40 @@ async fn a_dropped_run_destroys_its_vm() {
     let aborted = run.await.expect_err("aborted");
 
     assert!(aborted.is_cancelled());
+    assert!(host.running().is_empty(), "{:?}", host.running());
+    assert!(leftovers(&config).is_empty(), "{:?}", leftovers(&config));
+}
+
+/// Catches a run dropped while the blocking pool is cloning the image and starting the
+/// VM: the pool's step cannot be cancelled, so a destroy that ran at the drop found no
+/// VM and no clone, and the step then cloned and started a VM nothing owned, holding
+/// one of the two slots and the disk until the daemon restarted. The step must see the
+/// destroy and undo its work. The clone is held at a gate (an event, not a clock) while
+/// the run is aborted, then let go.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_dropped_while_its_vm_starts_leaves_no_vm() {
+    let dir = scratch("dropped-starting");
+    let config = config(&dir);
+    let (host, gate) = FakeHost::new().gated_clone();
+    let (host, cas) = (Arc::new(host), Arc::new(MemoryCas::default()));
+    let driver = driver(config.clone(), &host, &cas);
+    let action = Spec::ok().store(&cas);
+    let run = {
+        let driver = Arc::clone(&driver);
+        tokio::spawn(async move { driver.run(work(1, action)).await })
+    };
+    until("the clone is held", || gate.held()).await;
+
+    run.abort();
+    let aborted = run.await.expect_err("aborted");
+    gate.release();
+
+    assert!(aborted.is_cancelled());
+    // The step ends after the release, on the pool: wait for its undo.
+    until("the held step ended", || {
+        host.stopped().len() >= 2 && leftovers(&config).is_empty()
+    })
+    .await;
     assert!(host.running().is_empty(), "{:?}", host.running());
     assert!(leftovers(&config).is_empty(), "{:?}", leftovers(&config));
 }

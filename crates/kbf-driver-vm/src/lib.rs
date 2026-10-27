@@ -68,7 +68,7 @@ kbf_testkit::act_test_hook!();
 
 pub use config::VmConfig;
 pub use driver::{DRIVER, KIND, VmDriver};
-pub use fake::{FakeHost, MACOS_VM_LIMIT};
+pub use fake::{CloneGate, FakeHost, MACOS_VM_LIMIT};
 pub use host::{HostError, MachineId, NetworkDevice, Share, VmHost, VmSpec};
 
 /// The file in the inputs share holding the per-boot token, as hex: the name

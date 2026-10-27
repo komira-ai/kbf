@@ -12,8 +12,9 @@ use std::collections::BTreeMap;
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -39,7 +40,37 @@ pub struct FakeHost {
     stops_ok: usize,
     /// Guests expect a token other than the one the driver wrote.
     wrong_token: bool,
+    /// Holds `clone_image` before it copies anything, if set.
+    clone_gate: Option<CloneHold>,
     state: Mutex<State>,
+}
+
+/// The host's half of a [`CloneGate`].
+#[derive(Debug)]
+struct CloneHold {
+    entered: Arc<AtomicBool>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+/// The test's half of a gated `clone_image`: it says when a clone is held and lets it go.
+/// A host whose gate is dropped unreleased lets the clone go on.
+#[derive(Debug)]
+pub struct CloneGate {
+    entered: Arc<AtomicBool>,
+    release: mpsc::Sender<()>,
+}
+
+impl CloneGate {
+    /// Whether a `clone_image` is held at the gate.
+    #[must_use]
+    pub fn held(&self) -> bool {
+        self.entered.load(Ordering::SeqCst)
+    }
+
+    /// Lets the held clone, or the next, go on.
+    pub fn release(&self) {
+        let _ = self.release.send(());
+    }
 }
 
 /// Where a [`FakeHost`]'s guests stop sending.
@@ -103,8 +134,22 @@ impl FakeHost {
             silence: Silence::Never,
             stops_ok: usize::MAX,
             wrong_token: false,
+            clone_gate: None,
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// Holds every `clone_image` before it copies, until the gate releases it: a lease
+    /// caught in the blocking pool's clone-and-start step, on an event rather than a clock.
+    #[must_use]
+    pub fn gated_clone(mut self) -> (Self, CloneGate) {
+        let (release, wait) = mpsc::channel();
+        let entered = Arc::new(AtomicBool::new(false));
+        self.clone_gate = Some(CloneHold {
+            entered: Arc::clone(&entered),
+            release: Mutex::new(wait),
+        });
+        (self, CloneGate { entered, release })
     }
 
     /// Guests can be reached only `after` their VM started.
@@ -216,6 +261,15 @@ impl VmHost for FakeHost {
     type Stream = UnixStream;
 
     fn clone_image(&self, image: &Path, clone: &Path) -> io::Result<()> {
+        if let Some(hold) = &self.clone_gate {
+            hold.entered.store(true, Ordering::SeqCst);
+            // A dropped gate is a release too.
+            let _ = hold
+                .release
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recv();
+        }
         copy_dir(image, clone)?;
         self.lock().clones += 1;
         Ok(())

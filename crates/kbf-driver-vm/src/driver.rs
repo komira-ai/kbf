@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -291,14 +292,9 @@ impl<H: VmHost, C: Cas> VmDriver<H, C> {
             ],
             network: Vec::new(),
         };
-        let (host, image) = (Arc::clone(&self.host), self.config.image.clone());
+        let (provisioner, image) = (Arc::clone(&lease.parts), self.config.image.clone());
         let started = spec.clone();
-        blocking(move || {
-            host.clone_image(&image, &started.clone)
-                .map_err(failed(&started.clone))?;
-            host.start(&started).map_err(host_error)
-        })
-        .await?;
+        blocking(move || provisioner.provision(&image, &started)).await?;
 
         // The boot is not charged to the action: its timeout starts with `Run`.
         let client = tokio::select! {
@@ -363,6 +359,7 @@ impl<H: VmHost, C: Cas> Runtime for VmDriver<H, C> {
         let _registered = Registered::new(self, work.lease_id, stop_tx);
         let name = lease_name(work.lease_id);
         let lease = Lease::new(Parts {
+            destroyed: AtomicBool::new(false),
             host: Arc::clone(&self.host),
             dir: self.config.leases().join(&name),
             clone: self.config.clones().join(&name),
@@ -523,6 +520,9 @@ fn lease_name(id: LeaseId) -> String {
 
 /// What a lease has on the host: its VM, its clone and its lease directory.
 struct Parts<H> {
+    /// Set when the lease is destroyed. The clone-and-start step runs on the blocking
+    /// pool, which a dropped run cannot cancel: that step reads this to undo itself.
+    destroyed: AtomicBool,
     host: Arc<H>,
     name: String,
     dir: PathBuf,
@@ -530,6 +530,34 @@ struct Parts<H> {
 }
 
 impl<H: VmHost> Parts<H> {
+    /// Clones the image and starts the VM, on the blocking pool. A destroy that ran
+    /// meanwhile found nothing to stop and no clone to remove, so this step destroys
+    /// what it made: a dropped run must not leave a VM holding one of the two slots.
+    fn provision(&self, image: &Path, spec: &VmSpec) -> Result<(), RuntimeError> {
+        let started = self
+            .alive()
+            .and_then(|()| {
+                self.host
+                    .clone_image(image, &self.clone)
+                    .map_err(failed(&self.clone))
+            })
+            .and_then(|()| self.host.start(spec).map_err(host_error));
+        if let Err(gone) = self.alive() {
+            let undone = self.destroy();
+            tracing::warn!(vm = %self.name, ?undone, "lease destroyed while its VM started; undone");
+            return Err(gone);
+        }
+        started
+    }
+
+    fn alive(&self) -> Result<(), RuntimeError> {
+        if self.destroyed.load(Ordering::SeqCst) {
+            Err(RuntimeError::Killed)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Stops the VM, off the async threads.
     async fn stop_vm(&self) -> Result<(), RuntimeError> {
         let (host, name) = (Arc::clone(&self.host), self.name.clone());
@@ -543,6 +571,7 @@ impl<H: VmHost> Parts<H> {
     /// Stops the VM, then removes the clone and the lease directory (a removal that
     /// returns has left nothing). Every step is tried whatever an earlier one did.
     fn destroy(&self) -> Result<(), RuntimeError> {
+        self.destroyed.store(true, Ordering::SeqCst);
         let mut errors = Vec::new();
         if let Err(e) = self.host.stop(&self.name) {
             errors.push(format!("stop the VM {}: {e}", self.name));
@@ -786,6 +815,7 @@ mod tests {
     fn a_destroy_tries_every_removal_and_names_each_that_failed() {
         let base = Path::new("/nonexistent-kbf-driver-vm");
         let parts = Parts {
+            destroyed: AtomicBool::new(false),
             host: Arc::new(crate::FakeHost::new()),
             name: "lease-1-1".to_owned(),
             dir: base.join("lease"),
