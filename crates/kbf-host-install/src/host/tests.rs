@@ -978,3 +978,19 @@ fn the_unit_mode_is_not_reachable_over_ssh() {
     );
     assert_eq!(code, 0);
 }
+
+/// A lock is let go when it is dropped, even while another copy of its descriptor lives on.
+/// A process another thread starts has such a copy from the fork until it execs, and a plain
+/// `flock` lives as long as any copy does, so a drop could be followed by a refusal as busy
+/// for as long as that child had not yet exec'd. The `try_clone` is that copy.
+#[test]
+fn a_lock_is_let_go_at_drop_while_a_copy_of_its_descriptor_lives_on() {
+    let dir = TestDir::under(std::env::temp_dir(), "hi-lock-copy");
+    let path = dir.join("install.lock");
+    let held = super::take_lock(&path).unwrap();
+    let copy = held.file().try_clone().unwrap();
+    drop(held);
+    let again = super::take_lock(&path);
+    assert!(again.is_ok(), "busy after the drop: {:?}", again.err());
+    drop(copy);
+}
