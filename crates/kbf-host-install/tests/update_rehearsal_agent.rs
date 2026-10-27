@@ -293,6 +293,14 @@ fn the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release() {
     assert!(beat["updating"].is_null(), "{beat}");
     assert!(beat["last_update"].is_null(), "{beat}");
 
+    // A coordinator that has just started orders nothing and reports no host as live until its
+    // quiet start is over; the farm gamma tells has been running for long.
+    wait(
+        "the coordinator's quiet start to end",
+        &mut [&mut frontend, &mut coordinator],
+        || farm::status(&ca_file)["quiet"] == false,
+    );
+
     // The version text the farm is told, from the command gamma uses.
     let sums_version = run(
         "farm_version",
