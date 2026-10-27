@@ -11,14 +11,21 @@
 //! 4. the host did not fail an update to this very version (it is not told again; setting
 //!    another version lifts it);
 //! 5. its role has room: fewer hosts of the role hold a slot than `max_updating` allows (a
-//!    host holds a slot while updating, and after a failed update until it heartbeats
-//!    healthy);
+//!    host holds a slot while updating, after a failed update until it heartbeats healthy,
+//!    and from the order the coordinator gave it until the host reports it or the order
+//!    ages out, [`crate::fleet::ORDER_AGE`]);
 //! 6. a frontend waits for every live storage, daemon and Mac host to run the desired
 //!    version and be done updating;
 //! 7. the hosts that would still be up without this one number at least the minimum:
 //!    `min_up.storage` for a storage host, `min_up.frontend` for a frontend, and at least
-//!    one frontend whatever the setting says. A host is up when it is live, healthy and not
-//!    updating, so a host that has not heartbeated since a restart counts as missing.
+//!    one frontend whatever the setting says. A host is up when it is live, healthy, not
+//!    updating and not under an outstanding order, so a host that has not heartbeated since
+//!    a restart counts as missing.
+//!
+//! The decision records nothing: the caller notes an `Update` it returns with
+//! [`Fleet::order`], under the same lock, so the next host's decision sees it. A host that
+//! asks again while its own order is outstanding is told the same again: its own order never
+//! counts against it, and the others' slots have not changed.
 //!
 //! The reply carries the desired version and nothing else.
 
@@ -46,12 +53,7 @@ fn order(desired: &Desired, fleet: &Fleet, id: &NodeId, now: Duration) -> bool {
     let Some(host) = fleet.get(id) else {
         return false;
     };
-    let others = || {
-        fleet
-            .hosts()
-            .filter(|(other, _)| *other != id)
-            .map(|(_, h)| h)
-    };
+    let others = || fleet.hosts().filter(|(other, _)| *other != id);
     let quiet = fleet.is_quiet(now);
     let failed_here = host
         .beat
@@ -59,7 +61,7 @@ fn order(desired: &Desired, fleet: &Fleet, id: &NodeId, now: Duration) -> bool {
         .as_ref()
         .is_some_and(|r| r.outcome == Outcome::Failed && r.target == desired.version);
     let slots = others()
-        .filter(|h| h.role == host.role && h.holds_slot())
+        .filter(|(o, h)| h.role == host.role && fleet.holds_slot(o, h, now))
         .count();
     !quiet
         && host.beat.updating.is_none()
@@ -67,9 +69,9 @@ fn order(desired: &Desired, fleet: &Fleet, id: &NodeId, now: Duration) -> bool {
         && !failed_here
         && slots < desired.max_updating.of(host.role) as usize
         && (host.role != HostRole::Frontend
-            || others().all(|h| !is_pending_before_frontends(h, desired, now)))
+            || others().all(|(_, h)| !is_pending_before_frontends(h, desired, now)))
         && others()
-            .filter(|h| h.role == host.role && h.is_up(now))
+            .filter(|(o, h)| h.role == host.role && fleet.is_up(o, h, now))
             .count()
             >= required_up(desired, host.role)
 }
