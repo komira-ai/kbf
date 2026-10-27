@@ -291,7 +291,7 @@ struct Granted {
 
 /// What woke the session loop.
 enum Wake {
-    Message(ServerMessage),
+    Message(Box<ServerMessage>),
     Beat,
     Done(Box<Done>),
     Recheck,
@@ -794,7 +794,7 @@ impl Daemon {
             let wait = self.until_recheck();
             let wake = tokio::select! {
                 msg = inbound.message() => match msg? {
-                    Some(msg) => Wake::Message(msg),
+                    Some(msg) => Wake::Message(Box::new(msg)),
                     None => return Ok(()),
                 },
                 _ = beat.tick() => Wake::Beat,
@@ -814,7 +814,7 @@ impl Daemon {
                     if let Some(server_message::Message::HeartbeatAck(_)) = msg.message {
                         heard = tokio::time::Instant::now();
                     }
-                    self.on_message(msg, &tx);
+                    self.on_message(*msg, &tx);
                 }
                 Wake::Beat => {
                     seq += 1;
