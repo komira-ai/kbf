@@ -20,7 +20,7 @@ fn digest(n: u8) -> Digest {
 /// Action `n` of `kind` at `qos`, one core and 1 GiB.
 fn request(n: u8, kind: LeaseKind, qos: Qos) -> Request {
     Request {
-        key: kbf_sim::work_key("main", digest(n)),
+        key: kbf_types::work_key("main", digest(n)),
         qos,
         kind,
         resources: Resources::new(1_000, GIB),

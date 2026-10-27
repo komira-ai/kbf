@@ -199,7 +199,7 @@ impl World {
                 _ => Qos::Batch,
             };
             let request = Request {
-                key: kbf_sim::work_key("main", digest(n)),
+                key: kbf_types::work_key("main", digest(n)),
                 qos,
                 kind: LeaseKind::Action,
                 resources: Resources::new(1_000, GIB),

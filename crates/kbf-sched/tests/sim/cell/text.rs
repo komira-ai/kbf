@@ -2,6 +2,7 @@
 //! shapes of `kbf_sim::text`, never through `Debug`.
 
 use kbf_sim::text;
+use kbf_types::ResultRef;
 
 use super::Msg;
 
@@ -58,7 +59,9 @@ pub fn msg(msg: &Msg) -> String {
             "report(stream={stream} lease={} outcome={} action={})",
             text::lease(*lease),
             text::outcome(*outcome),
-            text::optional(action.as_ref(), text::digest)
+            text::optional(action.as_ref(), |digest| text::result_ref(
+                &ResultRef::from(*digest)
+            ))
         ),
         Msg::ResultAck { lease, accepted } => {
             format!(

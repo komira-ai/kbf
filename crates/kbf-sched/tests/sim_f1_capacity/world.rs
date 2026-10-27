@@ -99,7 +99,7 @@ pub fn levels() -> [Qos; 4] {
 /// A hermetic, cacheable request for action `key` under instance `main`.
 pub fn request(key: u64, qos: Qos, resources: Resources, platform: usize) -> Request {
     Request {
-        key: kbf_sim::work_key("main", digest(key)),
+        key: kbf_types::work_key("main", digest(key)),
         qos,
         kind: kbf_types::LeaseKind::Action,
         resources,

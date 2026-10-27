@@ -797,7 +797,7 @@ impl World {
             ("main", self.next_key - 1)
         };
         let request = Request {
-            key: kbf_sim::work_key(instance, digest(number)),
+            key: kbf_types::work_key(instance, digest(number)),
             qos: Qos::Ci,
             kind: kbf_types::LeaseKind::Action,
             resources,

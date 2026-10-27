@@ -44,7 +44,7 @@ fn mac() -> NodeCaps {
 /// Action `n` with `resources`, needing what the REAPI `platform` asks for.
 fn request(n: u32, resources: Resources, platform: &[(&str, &str)]) -> Request {
     Request {
-        key: kbf_sim::work_key("main", digest(n)),
+        key: kbf_types::work_key("main", digest(n)),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources,
