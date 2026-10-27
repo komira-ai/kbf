@@ -819,15 +819,16 @@ async fn a_straggler_round(name: &str) {
     }
     // Never polled or dropped again, as a daemon that was killed.
     std::mem::forget(run);
-    // Only the `crun run` itself is held: its clone in the lease's cgroup is the
-    // container's own process, which the sweep's cgroup kill ends. Stopped part-way
-    // through the container's creation, it can stay in uninterruptible sleep for seconds
-    // and keep the cgroup busy, which is not what this test is about.
-    let lease_name = cell.name(1);
+    // Only the `crun run` itself is held, by its name (`crun`): the process that
+    // re-executes itself as a memfd copy (`memfd:crun_clon`) to create the container is
+    // the container's, and the sweep's cgroup kill ends it. Stopped part-way through the
+    // container's creation it stays in uninterruptible sleep for longer than the sweep
+    // waits and keeps the lease's cgroup busy ("remove cgroup ...: Device or resource
+    // busy"), which is not what this test is about.
     let stragglers: Vec<u32> = (running_against(&cell.scratch).into_iter())
         .filter(|pid| {
-            let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"));
-            !cgroup.unwrap_or_default().contains(&lease_name)
+            let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"));
+            comm.is_ok_and(|comm| comm.trim() == "crun")
         })
         .collect();
     assert!(
