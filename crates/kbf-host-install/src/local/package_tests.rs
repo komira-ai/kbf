@@ -935,6 +935,66 @@ fn a_release_without_sums_or_bundle_is_not_taken() {
     });
 }
 
+/// A deb or rpm of a channel for a trusted repository is listed from, downloaded from and
+/// attested for that repository and its workflow, once; the same channel without the
+/// repository's listing is refused before anything is fetched.
+#[test]
+fn a_channel_of_another_repository_signs_its_packages_by_its_own_workflow() {
+    both(|format| {
+        let channel = |trusted: &str| {
+            format!(
+                "{trusted}[channels.stable]\nsource = \"github\"\nrepository = \"owner/other\"\nsigner_workflow = \"owner/other/.github/workflows/release.yml\"\n"
+            )
+        };
+        let rig = Rig::new("other-repo-refused", format);
+        put(&rig.dir.join("releases.toml"), channel(""));
+        let fault = rig.stage(&new_version()).unwrap_err();
+        assert!(refused(Code::ChannelNotAllowed)(&fault), "{fault:?}");
+        assert!(fault.detail.contains("owner/other"), "{}", fault.detail);
+        assert!(rig.calls.borrow().is_empty());
+        assert!(rig.installer.borrow().is_empty());
+
+        let rig = Rig::new("other-repo", format);
+        put(
+            &rig.dir.join("releases.toml"),
+            channel("trusted_repositories = [\"owner/other\"]\n"),
+        );
+        rig.stage(&new_version()).unwrap();
+        let calls = rig.calls.borrow();
+        let listing = calls.iter().find(|c| c.program.ends_with("curl")).unwrap();
+        assert!(
+            listing
+                .args
+                .last()
+                .unwrap()
+                .starts_with("https://api.github.com/repos/owner/other/releases?")
+        );
+        let download = calls
+            .iter()
+            .find(|c| c.args.first().map(String::as_str) == Some("release"))
+            .unwrap();
+        let at = download.args.iter().position(|a| a == "--repo").unwrap();
+        assert_eq!(download.args[at + 1], "owner/other");
+        assert!(download.args.contains(&rig.file_name(COMMIT)));
+
+        assert_eq!(rig.installer.borrow().len(), 1);
+        let verify: Vec<String> = rig.installer.borrow()[0]
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let has =
+            |flag: &str, value: &str| verify.windows(2).any(|w| w[0] == flag && w[1] == value);
+        assert!(has("--repo", "owner/other"));
+        assert!(has(
+            "--signer-workflow",
+            "owner/other/.github/workflows/release.yml"
+        ));
+        assert!(has("--source-digest", COMMIT));
+        assert!(verify.contains(&"--deny-self-hosted-runners".to_owned()));
+    });
+}
+
 /// The channel's token reaches the download as `GH_TOKEN` and no argument; a version without a
 /// commit and a channel the allowlist does not name are refused before any fetch.
 #[test]

@@ -12,7 +12,7 @@ use super::fx::{
 };
 use crate::mac::channel::{MacAllowlist, MacChannel, Source};
 use crate::mac::fetch::{FetchError, MAX_PAGE_BYTES, MAX_PAGES, PER_PAGE, page_body};
-use crate::mac::release::{bundle_name, tarball_name};
+use crate::mac::release::{Origin, bundle_name, tarball_name};
 use crate::mac::stage::{Staged, stage};
 use crate::outcome::{FailureCode, Outcome, Refusal};
 use crate::request::{Channel, Version};
@@ -90,6 +90,7 @@ fn channel(fx: &Fx, pinned: bool) -> MacChannel {
         source: Source::Github { token_file: None },
         sums: pinned.then(|| fx.sums.clone()),
         source_ref: "refs/heads/main".into(),
+        origin: Origin::kbf(),
     }
 }
 
@@ -715,6 +716,7 @@ fn a_directory_channel_never_talks_to_github() {
         source: Source::Dir(fx.channel_dir.clone()),
         sums: Some(fx.sums.clone()),
         source_ref: "refs/heads/main".into(),
+        origin: Origin::kbf(),
     };
     stage(&fx.host, &sim, &dir, &Version::new(NEW_VERSION).unwrap()).unwrap();
     assert!(curl_calls(&fx, &sim).is_empty());
@@ -741,6 +743,7 @@ fn a_writable_curl_is_refused_only_for_a_github_channel() {
         source: Source::Dir(fx.channel_dir.clone()),
         sums: Some(fx.sums.clone()),
         source_ref: "refs/heads/main".into(),
+        origin: Origin::kbf(),
     };
     stage(&fx.host, &sim, &dir, &Version::new(NEW_VERSION).unwrap()).unwrap();
 }
@@ -1080,9 +1083,255 @@ fn a_token_file_others_can_write_is_unsafe() {
     .unwrap();
     fs::set_permissions(&token, fs::Permissions::from_mode(0o666)).unwrap();
     assert_eq!(
-        list.channel(&fx.host.trust, &stable()),
+        list.channel(&fx.host.trust, &stable())
+            .map_err(|e| e.refusal()),
         Err(Refusal::ConfigUnsafe)
     );
     fs::remove_file(&token).unwrap();
     assert!(list.channel(&fx.host.trust, &stable()).is_err());
+}
+
+// ---- the channel's repository and signer workflow ----
+
+const OTHER: &str = "owner/other";
+const OTHER_WORKFLOW: &str = "owner/other/.github/workflows/release.yml";
+
+/// The whole allowlist file, top-level keys included.
+fn whole_allowlist(fx: &Fx, text: &str) -> Result<MacAllowlist, Refusal> {
+    write(&fx.host.allowlist, 0o644, text.as_bytes());
+    MacAllowlist::load(&fx.host.trust, &fx.host.allowlist)
+}
+
+fn other_origin() -> Origin {
+    Origin::new(OTHER, OTHER_WORKFLOW, "kbf").unwrap()
+}
+
+fn other_channel(fx: &Fx) -> MacChannel {
+    MacChannel {
+        origin: other_origin(),
+        ..channel(fx, false)
+    }
+}
+
+/// A channel that names a repository is listed from that repository, downloaded from it and
+/// attested for its workflow alone: `gh attestation verify` runs once, for that repository
+/// and workflow, and kbf's former name is not tried as well.
+#[test]
+fn a_channel_of_another_repository_lists_downloads_and_attests_under_its_own_names() {
+    let fx = Fx::new("mac-gh-other-repo");
+    let sim = github(&fx);
+    let staged = run(&fx, &sim, &other_channel(&fx), NEW_VERSION).unwrap();
+    assert_eq!(staged.commit, NEW);
+
+    let listed: Vec<String> = curl_calls(&fx, &sim).iter().map(url_of).collect();
+    assert_eq!(
+        listed[0],
+        "https://api.github.com/repos/owner/other/releases?per_page=100&page=1"
+    );
+    let download = &gh_calls(&fx, &sim, "release")[0];
+    let at = download.args.iter().position(|a| a == "--repo").unwrap();
+    assert_eq!(download.args[at + 1], OTHER);
+
+    let verifies = gh_calls(&fx, &sim, "attestation");
+    assert_eq!(verifies.len(), 1);
+    let args = &verifies[0].args;
+    let value_of = |flag: &str| args[args.iter().position(|a| a == flag).unwrap() + 1].clone();
+    assert_eq!(value_of("--repo"), OTHER);
+    assert_eq!(value_of("--signer-workflow"), OTHER_WORKFLOW);
+    assert!(args.iter().any(|a| a == "--deny-self-hosted-runners"));
+    assert_eq!(value_of("--source-ref"), "refs/heads/main");
+    assert_eq!(value_of("--source-digest"), NEW);
+}
+
+/// A release attested by kbf's workflow is not accepted for a channel of another repository,
+/// and the failing check is the one pair that channel names.
+#[test]
+fn a_channel_of_another_repository_does_not_accept_kbfs_former_name() {
+    let fx = Fx::new("mac-gh-other-repo-fails");
+    let sim = github(&fx);
+    sim.break_("gh");
+    let outcome = run(&fx, &sim, &other_channel(&fx), NEW_VERSION).unwrap_err();
+    assert!(
+        matches!(&outcome, Outcome::Failed(f) if f.code == FailureCode::VerifyFailed),
+        "{outcome:?}"
+    );
+    assert_eq!(gh_calls(&fx, &sim, "attestation").len(), 1);
+    assert_untouched(&fx);
+}
+
+/// The allowlist parses a channel of another repository and refuses it when it is used,
+/// unless the same file lists the repository in `trusted_repositories`; kbf's own repository
+/// needs no listing, and a listing of another repository does not help.
+#[test]
+fn another_repository_is_refused_at_use_unless_the_allowlist_trusts_it() {
+    let fx = Fx::new("mac-gh-trust");
+    let channel_text = format!(
+        "[channels.stable]\nsource = \"github\"\nrepository = \"{OTHER}\"\nsigner_workflow = \"{OTHER_WORKFLOW}\"\n"
+    );
+    let refused = |list: &MacAllowlist| list.channel(&fx.host.trust, &stable()).unwrap_err();
+
+    let list = whole_allowlist(&fx, &channel_text).unwrap();
+    let error = refused(&list);
+    assert_eq!(error.refusal(), Refusal::ChannelNotAllowed);
+    let words = error.to_string();
+    assert!(
+        words.contains("stable") && words.contains(OTHER) && words.contains("trusted_repositories"),
+        "{words}"
+    );
+
+    let list = whole_allowlist(
+        &fx,
+        &format!("trusted_repositories = [\"owner/unrelated\"]\n{channel_text}"),
+    )
+    .unwrap();
+    assert_eq!(refused(&list).refusal(), Refusal::ChannelNotAllowed);
+
+    let list = whole_allowlist(
+        &fx,
+        &format!("trusted_repositories = [\"owner/unrelated\", \"{OTHER}\"]\n{channel_text}"),
+    )
+    .unwrap();
+    let channel = list.channel(&fx.host.trust, &stable()).unwrap();
+    assert_eq!(channel.origin, other_origin());
+
+    // kbf's own repository is never refused, with or without a listing.
+    let list = whole_allowlist(&fx, "[channels.stable]\nsource = \"github\"\n").unwrap();
+    assert_eq!(
+        list.channel(&fx.host.trust, &stable()).unwrap().origin,
+        Origin::kbf()
+    );
+}
+
+/// A repository, workflow or prefix that is not safe to put in a URL or an argument of `gh`
+/// is invalid when the allowlist is read; so is a repository without a workflow, a prefix
+/// where the file names are fixed, and a trusted repository that is not one.
+#[test]
+fn a_bad_repository_workflow_or_prefix_makes_the_allowlist_invalid() {
+    let fx = Fx::new("mac-gh-bad-origin");
+    let ok_workflow = "owner/other/.github/workflows/release.yml";
+    let with = |keys: &str| format!("[channels.stable]\nsource = \"github\"\n{keys}");
+    let mut bad: Vec<(String, String)> = Vec::new();
+    for repository in [
+        "owner",
+        "owner/",
+        "/name",
+        "a/b/c",
+        "-owner/name",
+        "owner/-name",
+        "owner/.name",
+        "owner/na..me",
+        "owner/na me",
+        "owner/na;me",
+        "owner/na\"me",
+        "own_er/name",
+        "owner/name?x=1",
+        "",
+    ] {
+        bad.push((
+            format!("repository \"{repository}\""),
+            with(&format!(
+                "repository = \"{repository}\"\nsigner_workflow = \"{repository}/.github/workflows/release.yml\"\n"
+            )),
+        ));
+    }
+    for workflow in [
+        "owner/other/.github/workflows/",
+        "owner/other/.github/workflows/.yml",
+        "owner/other/.github/workflows/release.sh",
+        "owner/other/.github/workflows/sub/release.yml",
+        "owner/other/.github/workflows/../release.yml",
+        "owner/other/.github/workflows/-release.yml",
+        "owner/other/.github/workflows/re lease.yml",
+        "owner/other/.github/release.yml",
+        "owner/another/.github/workflows/release.yml",
+        "owner/other.github/workflows/release.yml",
+        "owner/other/.github/workflows/release.yml@refs/heads/main",
+        "komira-ai/kbf/.github/workflows/artifacts.yml",
+    ] {
+        bad.push((
+            format!("workflow \"{workflow}\""),
+            with(&format!(
+                "repository = \"{OTHER}\"\nsigner_workflow = \"{workflow}\"\n"
+            )),
+        ));
+    }
+    bad.push((
+        "repository alone".into(),
+        with(&format!("repository = \"{OTHER}\"\n")),
+    ));
+    bad.push((
+        "workflow alone".into(),
+        with(&format!("signer_workflow = \"{ok_workflow}\"\n")),
+    ));
+    for prefix in ["", "-x", "Kbf", "a b", "a/b", "a_b", &"a".repeat(33)] {
+        bad.push((
+            format!("prefix \"{prefix}\""),
+            with(&format!("artifact_prefix = \"{prefix}\"\n")),
+        ));
+    }
+    bad.push((
+        "prefix of a directory channel".into(),
+        "[channels.stable]\ndir = \"/d\"\nartifact_prefix = \"other\"\n".into(),
+    ));
+    bad.push((
+        "prefix of a channel with sums".into(),
+        format!(
+            "[channels.stable]\nsource = \"github\"\nsums = \"{}\"\nartifact_prefix = \"other\"\n",
+            fx.sums.display()
+        ),
+    ));
+    for trusted in ["\"owner\"", "\"a/b/c\"", "\"-o/n\"", "1", "\"\""] {
+        bad.push((
+            format!("trusted {trusted}"),
+            format!("trusted_repositories = [{trusted}]\n{}", with("")),
+        ));
+    }
+    for (why, text) in &bad {
+        assert_eq!(
+            whole_allowlist(&fx, text).err(),
+            Some(Refusal::ConfigInvalid),
+            "{why}"
+        );
+    }
+
+    // Each of the good forms, for contrast.
+    for text in [
+        with(&format!(
+            "repository = \"{OTHER}\"\nsigner_workflow = \"{ok_workflow}\"\nartifact_prefix = \"other-2\"\n"
+        )),
+        with(
+            "repository = \"Owner-1/na.me_2\"\nsigner_workflow = \"Owner-1/na.me_2/.github/workflows/a-b_c.v2.yaml\"\n",
+        ),
+        format!("trusted_repositories = []\n{}", with("")),
+    ] {
+        assert!(whole_allowlist(&fx, &text).is_ok(), "{text}");
+    }
+}
+
+/// A file without the new keys means what it always meant: kbf's repository, workflow and
+/// file names, and kbf's former name still accepted.
+#[test]
+fn a_channel_without_the_new_keys_is_kbfs() {
+    let fx = Fx::new("mac-gh-default-origin");
+    let list = whole_allowlist(&fx, "[channels.stable]\nsource = \"github\"\n").unwrap();
+    let origin = list.channel(&fx.host.trust, &stable()).unwrap().origin;
+    assert_eq!(origin.repository(), "komira-ai/kbf");
+    assert_eq!(
+        origin.workflow(),
+        "komira-ai/kbf/.github/workflows/artifacts.yml"
+    );
+    assert_eq!(origin.prefix(), "kbf");
+    assert_eq!(
+        origin.signers(),
+        [
+            (
+                "komira-ai/kbf",
+                "komira-ai/kbf/.github/workflows/artifacts.yml"
+            ),
+            (
+                "komira-ai/komira-build-farm",
+                "komira-ai/komira-build-farm/.github/workflows/artifacts.yml"
+            ),
+        ]
+    );
 }

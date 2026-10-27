@@ -6,8 +6,142 @@
 //! names of the channel's directory ([`pick_named`]), or, when the channel pins its releases,
 //! among the lines of its `SHA256SUMS` ([`pick`]).
 
-/// The repository whose releases a Mac takes, and whose workflow's attestation it accepts.
+/// The repository whose releases a channel takes unless it names another, and whose
+/// workflow's attestation it accepts.
 pub const REPO: &str = "komira-ai/kbf";
+
+/// The workflow of [`REPO`] that builds and attests the release files.
+pub const WORKFLOW: &str = "komira-ai/kbf/.github/workflows/artifacts.yml";
+
+/// The same pair under the name before the repository was renamed: a release attested then
+/// carries it, and a rollback to such a release must verify. Accepted for kbf's own
+/// repository only. Delete both once no such release is installable.
+pub const FORMER_REPO: &str = "komira-ai/komira-build-farm";
+pub const FORMER_WORKFLOW: &str = "komira-ai/komira-build-farm/.github/workflows/artifacts.yml";
+
+/// The start of every release file's name unless the channel names another.
+pub const ARTIFACT_PREFIX: &str = "kbf";
+
+/// Where a channel's releases come from and who must have signed them: the repository
+/// (which is also the one the listing is read from), the workflow whose attestation is
+/// believed, and the start of the release files' names. A channel that names none of the
+/// three has [`Origin::kbf`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    repository: String,
+    workflow: String,
+    prefix: String,
+}
+
+/// Whether `text` is `owner/name`: an owner of letters, digits and `-` (not starting with
+/// `-`) and a name of letters, digits and `. _ -` (not starting with `-` or `.`, no `..`).
+/// It goes into a URL and the arguments of `gh`, so nothing else is let through.
+pub fn is_repository(text: &str) -> bool {
+    let Some((owner, name)) = text.split_once('/') else {
+        return false;
+    };
+    let owner_ok = !owner.is_empty()
+        && owner.len() <= 39
+        && !owner.starts_with('-')
+        && owner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    let name_ok = !name.is_empty()
+        && name.len() <= 100
+        && !name.starts_with(['-', '.'])
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+    owner_ok && name_ok
+}
+
+impl Origin {
+    /// kbf's own repository, workflow and file names.
+    pub fn kbf() -> Self {
+        Self {
+            repository: REPO.to_owned(),
+            workflow: WORKFLOW.to_owned(),
+            prefix: ARTIFACT_PREFIX.to_owned(),
+        }
+    }
+
+    /// An origin, if `repository` is `owner/name`, `workflow` is a `.yml` or `.yaml` file
+    /// directly under `<repository>/.github/workflows/`, and `prefix` is lower-case letters,
+    /// digits and `-` (at most 32, not starting with `-`).
+    ///
+    /// # Errors
+    /// Which of them is not allowed, in words.
+    pub fn new(repository: &str, workflow: &str, prefix: &str) -> Result<Self, String> {
+        if !is_repository(repository) {
+            return Err(format!(
+                "{repository:?} is not a repository (owner/name of letters, digits and . _ -)"
+            ));
+        }
+        let file = workflow
+            .strip_prefix(repository)
+            .and_then(|rest| rest.strip_prefix("/.github/workflows/"));
+        let stem = file
+            .and_then(|f| f.strip_suffix(".yml").or_else(|| f.strip_suffix(".yaml")))
+            .unwrap_or("");
+        let workflow_ok = !stem.is_empty()
+            && !stem.starts_with(['-', '.'])
+            && stem
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+        if !workflow_ok {
+            return Err(format!(
+                "{workflow:?} is not a workflow file under {repository}/.github/workflows/"
+            ));
+        }
+        let prefix_ok = !prefix.is_empty()
+            && prefix.len() <= 32
+            && !prefix.starts_with('-')
+            && prefix
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !prefix_ok {
+            return Err(format!(
+                "{prefix:?} is not an artifact prefix (lower-case letters, digits and -)"
+            ));
+        }
+        Ok(Self {
+            repository: repository.to_owned(),
+            workflow: workflow.to_owned(),
+            prefix: prefix.to_owned(),
+        })
+    }
+
+    /// `owner/name`.
+    pub fn repository(&self) -> &str {
+        &self.repository
+    }
+
+    /// The signer workflow, `owner/name/.github/workflows/<file>`.
+    pub fn workflow(&self) -> &str {
+        &self.workflow
+    }
+
+    /// The start of the release files' names.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    /// The (repository, workflow) pairs an attestation of this origin's releases may name:
+    /// for kbf's own pair also its former name (the transition), else only the pair.
+    pub fn signers(&self) -> Vec<(&str, &str)> {
+        let mut signers = vec![(self.repository(), self.workflow())];
+        if self.repository == REPO && self.workflow == WORKFLOW {
+            signers.push((FORMER_REPO, FORMER_WORKFLOW));
+        }
+        signers
+    }
+
+    /// Whether the repository is kbf's own, which no allow-list has to name.
+    pub fn is_kbf_repository(&self) -> bool {
+        self.repository == REPO
+    }
+}
 
 /// The platform of a Mac's release.
 pub const PLATFORM: &str = "darwin-arm64";
@@ -57,7 +191,18 @@ pub fn commit_of_name_on<'a>(platform: &str, name: &'a str) -> Option<&'a str> {
 
 /// The commit in a release file's name `kbf-<40 hex>-<platform>.<extension>`.
 pub fn commit_of_asset_on<'a>(platform: &str, extension: &str, name: &'a str) -> Option<&'a str> {
-    name.strip_prefix("kbf-")
+    commit_of_named_asset_on(ARTIFACT_PREFIX, platform, extension, name)
+}
+
+/// [`commit_of_asset_on`] for the files of a channel whose names start with `prefix`.
+pub fn commit_of_named_asset_on<'a>(
+    prefix: &str,
+    platform: &str,
+    extension: &str,
+    name: &'a str,
+) -> Option<&'a str> {
+    name.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
         .and_then(|rest| rest.strip_suffix(&format!("-{platform}.{extension}")))
         .filter(|commit| is_commit(commit))
 }
@@ -98,7 +243,12 @@ pub fn tarball_name_on(platform: &str, commit: &str) -> String {
 
 /// The release file `kbf-<commit>-<platform>.<extension>`.
 pub fn asset_name_on(platform: &str, extension: &str, commit: &str) -> String {
-    format!("kbf-{commit}-{platform}.{extension}")
+    named_asset_on(ARTIFACT_PREFIX, platform, extension, commit)
+}
+
+/// [`asset_name_on`] for a channel whose names start with `prefix`.
+pub fn named_asset_on(prefix: &str, platform: &str, extension: &str, commit: &str) -> String {
+    format!("{prefix}-{commit}-{platform}.{extension}")
 }
 
 /// The attestation bundle of `commit`'s tarball.
