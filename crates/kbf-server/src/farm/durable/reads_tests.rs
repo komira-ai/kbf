@@ -185,6 +185,36 @@ async fn a_node_connected_here_is_answered_when_the_store_cannot_be_read() {
     assert!(read.node.connected);
 }
 
+/// Asserts that the node's own frontend still answers it, with its lease, when its cached
+/// ownership has expired and its `owner/` row cannot be read. Catches: a frontend that refuses
+/// a read of a node connected to it because the store cannot say who holds it.
+#[tokio::test(start_paused = true)]
+async fn a_node_connected_here_is_answered_when_its_owner_row_cannot_be_read() {
+    let store = Racing::new();
+    let drained = drained_through_the_other_frontend(&store, true);
+    tokio::time::advance(OWNER_CACHE_TTL + Duration::from_millis(1)).await;
+    store.fail_reads(Some("owner/"));
+
+    let read = detail(&drained.own, &drained.node).expect("a node connected here");
+
+    assert_eq!(read.leases.len(), 1);
+}
+
+/// Asserts that a frontend that handed its work over (fenced) answers a node connected to it
+/// from its own scheduler, as it holds every node it hears from. Catches: a fenced frontend
+/// that sends a read of its own node to the store.
+#[tokio::test(start_paused = true)]
+async fn a_fenced_frontend_answers_a_node_connected_to_it() {
+    let store = Racing::new();
+    let drained = drained_through_the_other_frontend(&store, true);
+    drained.own.fence();
+
+    let read = detail(&drained.own, &drained.node).expect("a node connected here");
+
+    assert_eq!(read.leases.len(), 1);
+    assert!(read.node.connected);
+}
+
 /// Asserts that a node no frontend of the store has held is not found, on a frontend with a
 /// store. Catches: a read from the store that answers for any name.
 #[tokio::test(start_paused = true)]
