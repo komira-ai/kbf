@@ -136,8 +136,9 @@ pub mod contract {
 }
 
 /// The Mac's tool command lines and the readers of what the tools print, with the runner
-/// that runs them, for the test that runs them on a real Mac (`tests/real_mac.rs`). Nothing
-/// here is for production code.
+/// that runs them, for the test that runs them on a real Mac (`tests/real_mac.rs`); the runner
+/// also for the test that makes its privilege drop inside the helper's systemd units
+/// (`tests/real_linux_unit.rs`). Nothing here is for production code.
 #[doc(hidden)]
 pub mod mac_tools {
     pub use crate::mac::{fetch, release, tools};
