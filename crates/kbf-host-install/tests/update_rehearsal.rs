@@ -363,6 +363,9 @@ fn the_helper_updates_a_hand_laid_host_from_the_last_release_to_the_next() {
     );
 
     let _journal = Journal;
+    // The hosted runner's image leaves `/usr/share` writable by everyone (0777), which the
+    // helper refuses above its trust files, as it should; a host's is 0755.
+    fs::set_permissions("/usr/share", fs::Permissions::from_mode(0o755)).unwrap();
     // The trust files and accounts of N's package, then the updater's account of this checkout.
     run(
         "trust_dir",
