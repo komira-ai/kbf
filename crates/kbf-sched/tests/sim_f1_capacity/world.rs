@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use kbf_caps::NodeCaps;
 use kbf_sched::{DaemonInstance, Event, Input, Request, Scheduler};
-use kbf_sim::{SimRng, Trace, TraceHash};
+use kbf_sim::{SimRng, Trace, TraceHash, text};
 use kbf_types::{
     ActionKey, Digest, DigestFunction, Effect, Failure, FarmTime, LeaseId, OperationId, Outcome,
     Qos, Resources, StateMachine, WaiterId, WorkerId,
@@ -228,7 +228,12 @@ impl World {
         let t = self.t;
         let line = match effect {
             Effect::Commit(kbf_types::ControlRecord::Lease(g)) => {
-                format!("{t} grant {} {} {}", g.lease.seq, g.operation.0, g.worker)
+                format!(
+                    "{t} grant {} {} {}",
+                    g.lease.seq,
+                    g.operation.0,
+                    text::worker(&g.worker)
+                )
             }
             Effect::Commit(kbf_types::ControlRecord::Refusal(r)) => {
                 format!("{t} refuse {}", r.operation.0)

@@ -10,12 +10,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use super::conformance::PackBackend;
-use super::{
+use crate::conformance::PackBackend;
+use crate::{
     BlobDigest, Location, NewPack, PackIndex, PackIndexError, PackInfo, Recorded, check_batch,
     count, micros, micros_of,
 };
-use crate::clock::{Clock, ManualClock};
+use kbf_state::{Clock, ManualClock};
 
 /// A pack index in memory. A handle made by [`MemoryPackIndex::handle`] shares the index.
 pub struct MemoryPackIndex {

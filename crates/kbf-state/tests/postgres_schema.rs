@@ -121,7 +121,7 @@ fn a_fresh_database_gets_the_schema_and_a_store_runs_on_it() {
     for row in &rows {
         assert_eq!(row.get::<_, String>(2), "expand");
     }
-    for table in ["kv", "feed", "counters", "head", "pack", "blob"] {
+    for table in ["kv", "feed", "counters", "head"] {
         s.query(&format!("SELECT count(*) FROM {table}"));
     }
     let store = PostgresStore::open(&config).expect("a store opens on the new schema");

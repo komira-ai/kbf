@@ -229,6 +229,7 @@ kbf-node = { path = "crates/kbf-node" }
 kbf-objstore = { path = "crates/kbf-objstore" }
 kbf-outputs = { path = "crates/kbf-outputs" }
 kbf-pack = { path = "crates/kbf-pack" }
+kbf-pack-index = { path = "crates/kbf-pack-index" }
 kbf-peer = { path = "crates/kbf-peer" }
 kbf-proto = { path = "crates/kbf-proto" }
 kbf-proxy = { path = "crates/kbf-proxy" }
