@@ -696,3 +696,29 @@ fn a_summary_without_the_new_fields_still_reads_and_says_nothing() {
     let s: MkUserSummary = serde_json::from_value(v).expect("reads");
     assert_eq!((s.root_setup, s.share), (None, None));
 }
+
+/// Catches the request being matched by a prefix, a suffix or a part of a name: a share that
+/// lists `results` and only names that merely resemble the request (a backup of it, a longer
+/// name, a shorter one, another case) is a boot without the request, so the setup is skipped.
+#[test]
+fn only_the_exact_name_is_the_prime_request() {
+    for lookalike in [
+        "prime-requested.bak",
+        "prime-requested2",
+        "xprime-requested",
+        "prime-request",
+        "Prime-Requested",
+    ] {
+        let host = clone_staged(&staged_both());
+        host.files
+            .borrow_mut()
+            .insert(format!("{}/{lookalike}", simpaths::SHARE_DIR), Vec::new());
+        let s = go(&host).summary;
+        assert_eq!(
+            (s.share, s.root_setup),
+            (Some(Share::NoRequest), Some(RootSetup::Skipped)),
+            "{lookalike}"
+        );
+        assert!(prep_commands(&host).is_empty(), "{lookalike}");
+    }
+}
