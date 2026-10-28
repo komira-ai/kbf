@@ -198,6 +198,13 @@ impl FarmMachine {
         id
     }
 
+    /// Records a caller that the scheduler core numbered (`id`), where
+    /// [`FarmMachine::submit`] numbers its own. A machine takes its callers from one or the
+    /// other, never both: `submit` does not skip the ids inserted here.
+    pub fn insert(&mut self, id: WaiterId, waiter: Waiter) {
+        self.waiters.insert(id, waiter);
+    }
+
     /// The caller `id`, while it is kept.
     pub fn waiter(&self, id: WaiterId) -> Option<&Waiter> {
         self.waiters.get(&id)
@@ -727,5 +734,17 @@ mod tests {
         let id = m.submit(waiter(1));
         assert_eq!(parse_stored_name(&m.name(id)), None);
         assert_eq!(m.named(&stored_name(OperationId(0))), None);
+    }
+
+    /// Asserts that a caller inserted under an id someone else chose is kept under that id
+    /// and forgotten with its finished operation like any other.
+    #[test]
+    fn a_caller_inserted_under_a_chosen_id_is_kept_and_forgotten_like_any_other() {
+        let mut m = FarmMachine::new(TERM);
+        m.insert(WaiterId(41), waiter(2));
+        assert_eq!(m.waiter(WaiterId(41)), Some(&waiter(2)));
+        m.keep_finished(OperationId(9), vec![WaiterId(41)]);
+        assert_eq!(m.forget_dropped(|_| false), vec![WaiterId(41)]);
+        assert_eq!(m.waiter(WaiterId(41)), None);
     }
 }

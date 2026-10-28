@@ -71,6 +71,7 @@
 //! capability matching, and the daemon-side `ResultAck` handling (issue #26).
 
 pub mod action_usage;
+pub mod answer;
 pub mod api;
 pub mod api_client;
 pub mod blobs;

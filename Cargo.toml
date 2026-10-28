@@ -79,6 +79,7 @@ hyper-util = { version = "0.1.21", default-features = false }
 # of its own that runs the whole CI, never along with other changes.
 js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
 js-sched = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
+js-server-core = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
 js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
 js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
 js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }

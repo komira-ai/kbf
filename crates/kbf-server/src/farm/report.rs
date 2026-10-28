@@ -3,63 +3,26 @@
 
 use kbf_front::{Finished, Stage};
 use kbf_meta::ActionRecord;
-use kbf_proto::google::rpc;
-use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::{
     self, ResultAck, ResultAckReason as Reason, ServerMessage, server_message,
 };
 use kbf_sched::Event;
 use kbf_types::{
-    Answer, Digest, Failure, FarmRun, FarmTime, LeaseId, OperationId, Outcome, WaiterId, WorkerId,
+    Answer, Digest, Failure, FarmTime, LeaseId, OperationId, Outcome, WaiterId, WorkerId,
 };
 use tokio::sync::watch;
-use tonic::Code;
 
 use super::ack::{self, Verdict, refusal};
 use super::failed_actions::class_of;
 use super::{Farm, Outbound, State, wire_lease};
 use crate::action_usage::{self, Measured};
-use crate::fault;
+use crate::answer;
+pub(super) use crate::answer::{Detail, Pending, finished_of, refused_as};
+#[cfg(test)]
+pub(super) use crate::answer::{failed, unrun};
 use crate::machine::Waiter;
 use crate::memory;
-use crate::missing;
 use crate::run_record;
-use crate::stamp::Stamp;
-
-/// An OK result and its action-cache record, from the report to the answer.
-#[derive(Debug)]
-pub(super) struct Pending {
-    pub(super) result: ActionResult,
-    pub(super) record: ActionRecord,
-}
-
-/// What a report carries beyond its scheduler outcome, from the report to the answer.
-#[derive(Debug)]
-pub(super) enum Detail {
-    /// An OK result to answer with and maybe cache.
-    Ran(Box<Pending>),
-    /// The daemon's reason the action is invalid, passed to the callers.
-    Invalid(String),
-    /// The input blobs the worker could not fetch, which the callers are asked to
-    /// upload again (`crate::missing`).
-    Missing(Vec<Digest>),
-    /// A timed-out action's partial result ([`crate::timeout`]), answered, never cached.
-    TimedOut(Box<ActionResult>),
-    /// The daemon's reason for an infrastructure failure (a missing image, a full
-    /// disk), or why an OK result could not be accepted: the callers are told only
-    /// that the farm could not run the action, and the invocation record keeps it.
-    Infra(String),
-}
-
-impl Detail {
-    /// The failure's reason text a lease's attempt records, if the report gave one.
-    fn reason(&self) -> Option<String> {
-        match self {
-            Self::Invalid(why) | Self::Infra(why) => Some(why.clone()),
-            Self::Ran(_) | Self::Missing(_) | Self::TimedOut(_) => None,
-        }
-    }
-}
 
 /// What a finished operation tells its callers, and the action-cache entry to write
 /// first, if any.
@@ -168,7 +131,8 @@ impl Farm {
             let usage = measured.as_ref().map(Measured::usage);
             run_record::of(&result, usage, stamp, self.ambient.wall())
         });
-        let (outcome, detail) = self.outcome(lease, ran_on, result).await;
+        let wall = || self.ambient.wall();
+        let (outcome, detail) = answer::outcome(&self.cache, wall, lease, ran_on, result).await;
 
         let now = self.now();
         let (answers, taken) = {
@@ -205,89 +169,6 @@ impl Farm {
             accepted,
             reason: reason as i32,
         })
-    }
-
-    /// The scheduler's outcome for a `Result`, with the cache record of an OK one, the
-    /// reason for an INVALID_ARGUMENT one, the partial result of a DEADLINE_EXCEEDED one
-    /// ([`crate::timeout`], stamped as an OK result is), or the blobs of a missing-input
-    /// one ([`missing::inputs`]). An OK result whose outputs are not all stored is an
-    /// infrastructure failure: accepting it would answer callers with files nobody can
-    /// fetch. An OK result gets the node it `ran_on` and the server's times
-    /// ([`Stamp::apply`]) before it is checked and its cache record made.
-    async fn outcome(
-        &self,
-        lease: LeaseId,
-        ran_on: (&WorkerId, Stamp),
-        result: worker::Result,
-    ) -> (Outcome, Option<Detail>) {
-        if let Some(why) = fault::lost(&result) {
-            let node = ran_on.0;
-            tracing::warn!(%lease, %node, %why, "the farm lost the run");
-            return (Outcome::Failed(Failure::Lost(why)), None);
-        }
-        if let Some(kill) = memory::killed(&result) {
-            tracing::info!(%lease, ?kill, "lease killed for memory");
-            return (Outcome::Failed(kill), None);
-        }
-        let code = result.status.as_ref().map_or(Code::Ok as i32, |s| s.code);
-        match (Code::from_i32(code), result.action_result) {
-            (Code::Ok, Some(mut result)) => {
-                let (node, stamp) = ran_on;
-                stamp.apply(&mut result, node, self.ambient.wall());
-                match self.cache.prepare_action_result(&result).await {
-                    Ok(record) => {
-                        let outcome = Outcome::Completed {
-                            action_result: record.result.into(),
-                        };
-                        (
-                            outcome,
-                            Some(Detail::Ran(Box::new(Pending { result, record }))),
-                        )
-                    }
-                    Err(e) => {
-                        tracing::warn!(%lease, error = %e, "an OK result whose outputs are not stored");
-                        let why = format!("an OK result whose outputs are not stored: {e}");
-                        (Outcome::Failed(Failure::Infra), Some(Detail::Infra(why)))
-                    }
-                }
-            }
-            (Code::DeadlineExceeded, reported) => {
-                let partial = match reported {
-                    Some(reported) => crate::timeout::partial(&self.cache, reported).await,
-                    None => None,
-                };
-                let detail = partial.map(|mut partial| {
-                    let (node, stamp) = ran_on;
-                    stamp.apply(&mut partial, node, self.ambient.wall());
-                    Detail::TimedOut(Box::new(partial))
-                });
-                (Outcome::Failed(Failure::Timeout), detail)
-            }
-            (Code::InvalidArgument, _) => {
-                let why = result.status.map(|s| s.message).unwrap_or_default();
-                (
-                    Outcome::Failed(Failure::Invalid),
-                    Some(Detail::Invalid(why)),
-                )
-            }
-            (code, _) => match result.status.as_ref().and_then(missing::inputs) {
-                Some(blobs) => {
-                    tracing::warn!(%lease, blobs = blobs.len(), "input blobs missing at the worker");
-                    (
-                        Outcome::Failed(Failure::MissingInput),
-                        Some(Detail::Missing(blobs)),
-                    )
-                }
-                None => {
-                    // The client is told only that the farm could not run the action: the
-                    // daemon's reason (a missing image, a full disk) is in this line and
-                    // in the invocation record.
-                    let why = result.status.map(|s| s.message).unwrap_or_default();
-                    tracing::warn!(%lease, node = %ran_on.0, ?code, reason = %why, "lease failed");
-                    (Outcome::Failed(Failure::Infra), Some(Detail::Infra(why)))
-                }
-            },
-        }
     }
 
     /// Writes the action-cache entry, if any, then answers the callers.
@@ -522,58 +403,5 @@ impl State {
             stages,
             ack,
         }
-    }
-}
-
-/// What the callers of the operation `answer` finishes are told, given the report's
-/// `detail` if it had one. The row the state store keeps of the result is this too, so
-/// callers and followers never differ.
-pub(super) fn finished_of(answer: &Answer, detail: Option<&Detail>) -> Finished {
-    match (detail, answer.outcome) {
-        (Some(Detail::Ran(pending)), _) => Finished::Ran(Box::new(pending.result.clone())),
-        (Some(Detail::TimedOut(partial)), Outcome::Failed(Failure::Timeout)) => {
-            let status = status(Code::DeadlineExceeded, TIMED_OUT);
-            Finished::TimedOut {
-                status,
-                partial: partial.clone(),
-            }
-        }
-        (_, Outcome::Failed(Failure::Timeout)) => failed(Code::DeadlineExceeded, TIMED_OUT),
-        (Some(Detail::Invalid(why)), _) => failed(Code::InvalidArgument, why),
-        (Some(Detail::Missing(blobs)), _) => Finished::Failed(kbf_front::missing_status(blobs)),
-        (_, Outcome::Failed(Failure::OutOfMemory)) => memory::finished(&answer.memory_runs),
-        (_, outcome) => unrun(outcome, &answer.farm_runs),
-    }
-}
-
-/// What the callers of the operation `refusal` refuses are told.
-pub(super) fn refused_as(refusal: &kbf_types::Refusal) -> Finished {
-    failed(Code::FailedPrecondition, &refusal.reason)
-}
-
-/// What the callers of a timed-out action are told.
-const TIMED_OUT: &str = "the action timed out";
-
-pub(super) fn failed(code: Code, message: &str) -> Finished {
-    Finished::Failed(status(code, message))
-}
-
-fn status(code: Code, message: &str) -> rpc::Status {
-    rpc::Status {
-        code: code as i32,
-        message: message.to_owned(),
-        details: Vec::new(),
-    }
-}
-
-/// How a result that carries no detail and is no timeout, invalid input, missing blob or
-/// memory kill is answered: a farm fault names its runs; anything else (a committed
-/// `Completed` whose worker report this process never saw) is the fixed INTERNAL.
-pub(super) fn unrun(outcome: Outcome, farm_runs: &[FarmRun]) -> Finished {
-    match outcome {
-        Outcome::Failed(Failure::NodeMemoryPressure | Failure::Lost(_) | Failure::Infra) => {
-            fault::finished(farm_runs)
-        }
-        _ => failed(Code::Internal, "the farm could not run the action"),
     }
 }

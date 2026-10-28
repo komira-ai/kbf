@@ -859,6 +859,13 @@ current) has no line: that is how a **cancelled** lease ends. Its usage is in th
 daemon's `lease phases:` line, which joins on `lease=` to the server's `lease granted`
 line, and that line names the `key` too. A report without a `ResourceUsage` has no line.
 
+On a node without lease cgroups (macOS) the CPU and memory fields come from the
+`ResourceUsage` footprint block instead: `cpu_usage_us` is the action's user plus system
+CPU time (shown only when both are known), `cpu_user_us` and `cpu_system_us` those two,
+and `mem_peak` the peak physical footprint, which is not a cgroup's `memory.peak`; the
+throttling, `parallelism` and NUMA fields are `-`. A whole-machine lease measures only its
+wall time, so its line has `wall_us` and `-` for every CPU and memory field.
+
 **The shape key.** buck2 sends no per-action identity (`action_mnemonic` and
 `target_id` are empty in its `RequestMetadata`), and the action digest changes with
 every input, so the key is read from the `Command`: the program it runs and the paths it
