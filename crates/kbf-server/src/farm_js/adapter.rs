@@ -92,7 +92,7 @@ pub struct KbfAdapter {
     pub(super) recorded: BTreeSet<OperationId>,
     pub(super) pack_reads: BTreeMap<WorkerId, worker::PackReadCounts>,
     pub(super) pack_writes: BTreeMap<WorkerId, worker::PackWriteCounts>,
-    /// The `done/` rows found unreadable and shown to callers as an error.
+    /// The unreadable `done/` rows looked at, each look counted.
     unreadable_results: u64,
 }
 
@@ -206,19 +206,29 @@ impl KbfAdapter {
         let _sent = node.map(|node| node.outbound.send(Ok(message)).is_ok());
     }
 
-    /// The result a `done/` row holds. A row that cannot be read is logged at error and
-    /// counted ([`KbfAdapter::unreadable_results`]), and is [`unreadable_result`], so that
-    /// every caller of the operation is ended with an error and none waits for a result
-    /// that will not come.
-    pub(super) fn decoded(&mut self, row: &[u8]) -> Finished {
-        Finished::from_row(row).unwrap_or_else(|error| {
-            tracing::error!(%error, "a stored result cannot be read: its callers are told so");
-            self.unreadable_results += 1;
-            unreadable_result()
-        })
+    /// The result a `done/` row holds, or `None` for a row that cannot be read, which is
+    /// logged at error and counted ([`KbfAdapter::unreadable_results`]) at each look.
+    pub(super) fn readable(&mut self, row: &[u8]) -> Option<Finished> {
+        Finished::from_row(row)
+            .inspect_err(|error| {
+                tracing::error!(%error, "a stored result cannot be read");
+                self.unreadable_results += 1;
+            })
+            .ok()
     }
 
-    /// How many `done/` rows have been found unreadable and shown to callers as an error.
+    /// The result a `done/` row holds, or [`unreadable_result`] for a row that cannot be
+    /// read (logged and counted by [`KbfAdapter::readable`]), so that the callers an
+    /// operation already has (followed, or watched by name) are ended with an error and
+    /// none waits for a result that will not come. A client that asks for the operation by
+    /// name is not given this: see `dispatch::wait`.
+    pub(super) fn decoded(&mut self, row: &[u8]) -> Finished {
+        self.readable(row).unwrap_or_else(unreadable_result)
+    }
+
+    /// How many unreadable `done/` rows the adapter has looked at, counting each look. The
+    /// adapter has no metrics hook yet, so this is a count for tests until it is given the
+    /// farm's metrics; nothing exports it.
     #[must_use]
     pub const fn unreadable_results(&self) -> u64 {
         self.unreadable_results

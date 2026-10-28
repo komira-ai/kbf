@@ -346,12 +346,18 @@ fn unreadable_result_stage() -> Stage {
     Stage::Done(failed(Code::Unavailable, message))
 }
 
+/// How many times the log says a stored result cannot be read.
+fn count_of(log: &crate::test_log::Capture) -> usize {
+    log.text().matches("a stored result cannot be read").count()
+}
+
 /// Asserts that a `done/` row the adapter cannot decode ends the callers with UNAVAILABLE
 /// ("the stored result of this operation cannot be read"), which clients retry, instead of
-/// leaving them waiting, on each of the paths that read the row: the callers a frontend
-/// follows (`show_callers`, then `followed` for the invocation record), an operation asked
-/// for by name (the store's ticket, and the watch that follows it). The row is logged at
-/// error once and counted once per look, and a readable row is not counted. The paused
+/// leaving them waiting: the callers a frontend follows (`show_callers`, then `followed`
+/// for the invocation record, which logs nothing more), and the watch that follows a name.
+/// A lookup by name is answered not found instead, so that the client sends a fresh
+/// Execute call and does not retry the name. Each look at the row logs it at error once and
+/// counts it, so two lookups by name are two logs; a readable row is not counted. The paused
 /// clock makes a hang a failed test: a stage that is not done by the time the bound passes
 /// fails it.
 #[tokio::test(start_paused = true)]
@@ -371,10 +377,7 @@ async fn an_unreadable_done_row_ends_the_caller_with_a_retryable_error_and_does_
     adapter.show_callers(&[WaiterId(0)], &CoreStage::Done(garbage.clone()));
     assert_eq!(done(stage).await, unreadable_result_stage());
     assert_eq!(adapter.unreadable_results(), 1);
-    assert_eq!(
-        log.text().matches("a stored result cannot be read").count(),
-        1
-    );
+    assert_eq!(count_of(&log), 1);
 
     // Name lookup, from the core: a finished operation whose `done/` row was overwritten.
     let store = Flaky::new();
@@ -395,17 +398,27 @@ async fn an_unreadable_done_row_ends_the_caller_with_a_retryable_error_and_does_
     let key = js_store::keys::done(OperationId(0));
     super::testing::overwrite(store.plain(), &key, garbage.clone());
     let second = rig_over(&store, kbf_front::Recorder::off());
-    let ticket = dispatch::wait(&second.core, &finished.name).expect("a ticket");
-    assert_eq!(done(ticket.stage).await, unreadable_result_stage());
+    drop(log);
+    let log = capture();
+    // A client asking by name is told not found, so that it sends a fresh Execute call: at
+    // each look the row is logged at error once and counted.
+    assert!(dispatch::wait(&second.core, &finished.name).is_none());
     assert_eq!(second.core.with(|_, a| a.unreadable_results()), 1);
+    assert_eq!(count_of(&log), 1);
+    assert!(dispatch::wait(&second.core, &finished.name).is_none());
+    assert_eq!(second.core.with(|_, a| a.unreadable_results()), 2);
+    assert_eq!(count_of(&log), 2, "per look, not per operation");
 
-    // The watch that follows a name shows the same row the same way.
+    // The watch that follows a name shows the row as an error to the callers it holds.
+    drop(log);
+    let log = capture();
     let mut adapter = super::testing::adapter();
     let watched = adapter.watch_operation(OperationId(3), &Stage::Executing);
     adapter.show_watched(OperationId(3), &CoreStage::Done(garbage.clone()));
     assert_eq!(done(watched).await, unreadable_result_stage());
     assert!(adapter.watched().is_empty(), "its result has been shown");
     assert_eq!(adapter.unreadable_results(), 1);
+    assert_eq!(count_of(&log), 1);
 
     // Followed: the invocation record ends as the caller was told.
     let (recorder, recording) = kbf_front::Recorder::new(1 << 20, 64);
@@ -414,11 +427,15 @@ async fn an_unreadable_done_row_ends_the_caller_with_a_retryable_error_and_does_
     let ticket =
         super::testing::submit_recorded(&rig, &recorder, request(1), "build-1").expect("queued");
     drop(ticket);
+    drop(log);
+    let log = capture();
     rig.core.with(|_, adapter| {
         assert!(adapter.is_recorded(OperationId(0)));
         adapter.followed(OperationId(0), &garbage);
         assert!(!adapter.is_recorded(OperationId(0)), "told");
+        assert_eq!(adapter.unreadable_results(), 0, "followed counts nothing");
     });
+    assert_eq!(count_of(&log), 0, "followed does not log the row again");
     recorder.caught_up().await;
     let key = kbf_invocation::RecordKey::owner(kbf_invocation::InvocationId::new("build-1"));
     let action = ActionKey::try_from(&request(1).key)
