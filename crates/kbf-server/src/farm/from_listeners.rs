@@ -2,10 +2,8 @@
 //! all-in-one server and the frontend both take them from, so a setting added here reaches
 //! both.
 
-use std::sync::PoisonError;
-
 use kbf_front::Backend;
-use kbf_sched::{Scheduler, WholeNodeConfig};
+use kbf_sched::WholeNodeConfig;
 
 use super::Farm;
 use crate::serve::Listeners;
@@ -35,9 +33,8 @@ impl Farm {
     #[must_use]
     pub fn with_whole_node(mut self, config: Option<WholeNodeConfig>) -> Self {
         if let Some(config) = config {
-            let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-            let sched = &mut state.engine.sched;
-            *sched = std::mem::replace(sched, Scheduler::new(self.term)).with_whole_node(config);
+            self.settings.whole_node = Some(config);
+            self.driver.set_whole_node(self.term, &self.settings);
         }
         self
     }

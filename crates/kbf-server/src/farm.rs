@@ -45,8 +45,8 @@
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::BuildHasher;
+use std::sync::MutexGuard;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_front::{Backend, Dispatch, Recorder, Stage, Submission, Ticket};
@@ -65,6 +65,7 @@ use tonic::Status;
 mod ack;
 mod ambient;
 mod beat;
+mod driver;
 pub(crate) mod durable;
 mod engine;
 mod failed_actions;
@@ -95,6 +96,7 @@ pub use node_types::{NodeAction, NodeLook, NodeUnread, PlaceError, UnknownNode};
 pub use phase::Reported;
 
 use self::ambient::Ambient;
+use self::driver::{Driver, Settings};
 use self::durable::Held;
 use self::engine::Engine;
 use self::report::{Detail, Settled, finished_of, refused_as};
@@ -166,7 +168,10 @@ pub struct Farm {
     reports: AtomicUsize,
     /// Where the wall clock and the process term come from.
     ambient: Ambient,
-    state: Mutex<State>,
+    /// What the `with_*` builders set.
+    settings: Settings,
+    /// The engine every method reaches the farm's state through.
+    driver: Driver,
 }
 
 /// The state under the farm's lock: the [`Engine`] that runs the feed loop, and the
@@ -270,7 +275,8 @@ impl Farm {
             shapes: Shapes::default(),
             reports: AtomicUsize::new(0),
             ambient,
-            state: Mutex::new(State {
+            settings: Settings::default(),
+            driver: Driver::legacy(State {
                 engine: Engine::new(sched, finished_retention, ambient),
                 side: Side::new(term, ambient),
             }),
@@ -292,9 +298,9 @@ impl Farm {
     /// none of the size summaries it holds.
     #[must_use]
     pub fn with_learned_sizes(mut self, mode: LearnedSizes, default_memory: u64) -> Self {
-        let epoch_unix_ms = self.epoch_unix_ms;
-        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-        state.side.learned = crate::learned::Learned::new(mode, default_memory, epoch_unix_ms);
+        self.settings.learned = mode;
+        self.settings.default_memory = default_memory;
+        self.driver.set_learned(self.epoch_unix_ms, &self.settings);
         self
     }
 
@@ -303,11 +309,8 @@ impl Farm {
     /// a state store over.
     #[must_use]
     pub fn with_placement_load(mut self, mode: crate::PlacementLoad) -> Self {
-        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-        let sched = &mut state.engine.sched;
-        // The scheduler is moved out and back; the stand-in is dropped at once.
-        *sched =
-            std::mem::replace(sched, Scheduler::new(self.term)).with_load_config(mode.config());
+        self.settings.placement_load = mode;
+        self.driver.set_placement_load(self.term, &self.settings);
         self
     }
 
@@ -315,8 +318,8 @@ impl Farm {
     /// (instead of [`kbf_sched::MemoryLadder::default`]).
     #[must_use]
     pub fn with_memory_ladder(mut self, ladder: MemoryLadder) -> Self {
-        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-        state.engine.sched.set_memory_ladder(ladder);
+        self.settings.ladder = ladder;
+        self.driver.set_ladder(&self.settings);
         self
     }
 
@@ -325,9 +328,8 @@ impl Farm {
     /// first. Set before the farm takes a state store over.
     #[must_use]
     pub fn with_memory_floors(mut self, bound: usize) -> Self {
-        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-        let sched = &mut state.engine.sched;
-        *sched = std::mem::replace(sched, Scheduler::new(self.term)).with_memory_floors(bound);
+        self.settings.floors = bound;
+        self.driver.set_floors(self.term, &self.settings);
         self
     }
 
@@ -336,8 +338,8 @@ impl Farm {
     /// (`docs/design/invocations.md`, section 3.4).
     #[must_use]
     pub fn recording(mut self, recorder: Recorder) -> Self {
-        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-        state.side.recorder = recorder;
+        self.settings.recorder = recorder;
+        self.driver.set_recorder(&self.settings);
         self
     }
 
@@ -401,8 +403,9 @@ impl Farm {
     /// Held-back committed records the farm keeps for a refusing state store at most.
     #[doc(hidden)]
     #[must_use]
-    pub fn with_held_cap(self, cap: usize) -> Self {
-        self.lock().engine.held_cap = cap;
+    pub fn with_held_cap(mut self, cap: usize) -> Self {
+        self.settings.held_cap = cap;
+        self.driver.set_held_cap(&self.settings);
         self
     }
 
@@ -430,8 +433,7 @@ impl Farm {
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
-        // Nothing under the lock panics midway through a change.
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        self.driver.lock()
     }
 
     /// The first `Hello` of a stream, from the daemon process `instance`: queues
