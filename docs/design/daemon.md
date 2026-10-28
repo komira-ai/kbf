@@ -282,7 +282,8 @@ native-whole-machine`.
   what `actions/` may use: `mem_gib` is the lower of MemTotal and the lowest
   `memory.max` above the leases, `cpus` the lower of the nearest
   `cpuset.cpus.effective` and the lowest `cpu.max` quota on the path. The daemon writes
-  `actions/cpu.max` itself: the CPUs it may use minus `--reserve-cpus` (default 8).
+  `actions/cpu.max` itself: the CPUs it may use minus `--reserve-cpus` (default 4 physical
+  cores: 8 logical CPUs with two threads a core, 4 with one).
   `--lease-placement=numa-node` (default `none`, which pins nothing) puts each lease on
   one NUMA node: the lease cgroup gets that node's CPUs (`cpuset.cpus`) and memory node
   (`cpuset.mems`), and the container's cgroup inherits both. The node is the one with
@@ -824,7 +825,7 @@ answering held the lease, and its slot, with no error.
 **Hashing the outputs.** The container driver reads each output file once, to hash it:
 SHA-256 for the digest, CRC-32C for the footer of the segment it is sent in. The hashing
 runs on `--cpu-threads` threads of their own (default `max(2, reserve/2)`, 4 with the
-default `--reserve-cpus` of 8; shared by all leases and apart
+default `--reserve-cpus` of 8 on a node of two threads a core; shared by all leases and apart
 from the threads that run actions), one read buffer per thread, and the listing of the
 output tree is one task of the blocking pool, not one per file. The upload then reads the
 files again, in ranges, only to send them (`--segment-uploads-in-flight` uploads at once,
