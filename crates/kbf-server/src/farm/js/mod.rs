@@ -40,6 +40,7 @@ use crate::learned::{Learned, LearnedSizes};
 use crate::state_store::StateStore;
 
 pub(crate) mod hot;
+pub(crate) mod load;
 pub(crate) mod lifecycle;
 pub(crate) mod views;
 
