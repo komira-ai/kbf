@@ -3,37 +3,31 @@
 
 use std::sync::Arc;
 
+use clap::Parser;
 use kbf_front::{Cache, Submission};
 use kbf_sched::LoadCounters;
 
 use super::*;
-use crate::PlacementLoad;
+use crate::{Args, PlacementLoad};
 
-/// A farm with one node of four cores and one action submitted to it, which the
-/// scheduler places at once. `mode` is `None` for a farm as [`Farm::new`] builds it.
-fn placed(mode: Option<PlacementLoad>, test_core: bool) -> LoadCounters {
-    let cache = Arc::new(Cache::memory());
-    let farm = if test_core {
-        Farm::for_test(
-            cache,
-            testkit::TestCore::new(
-                7,
-                0,
-                kbf_sched::UNSERVABLE_WAIT,
-                kbf_sched::FINISHED_RETENTION,
-            ),
-        )
-    } else {
-        Farm::new(
-            cache,
-            kbf_sched::UNSERVABLE_WAIT,
-            kbf_sched::FINISHED_RETENTION,
-        )
-    };
-    let farm = match mode {
-        Some(mode) => farm.with_placement_load(mode),
-        None => farm,
-    };
+fn plain() -> Farm {
+    Farm::new(
+        Arc::new(Cache::memory()),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    )
+}
+
+/// The farm a server builds from `flags`, as `serve` and `frontend` both build it.
+fn from_flags(flags: &[&str]) -> Farm {
+    let args = Args::parse_from(std::iter::once("kbf-server").chain(flags.iter().copied()));
+    let listeners = args.listeners().expect("listeners");
+    Farm::from_listeners(Arc::new(Cache::memory()), &listeners)
+}
+
+/// Gives `farm` one node of four cores and one action, which the scheduler places at
+/// once, and returns what the scheduler counted.
+fn placed(farm: &Farm) -> LoadCounters {
     let caps = kbf_caps::NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
         .expect("caps")
         .with_drivers(["container"]);
@@ -74,13 +68,34 @@ fn placed(mode: Option<PlacementLoad>, test_core: bool) -> LoadCounters {
 /// or a farm given `off` that is not on the booked rule.
 #[test]
 fn a_farm_places_by_the_rule_its_flag_names() {
-    for (name, counters) in [
-        ("Farm::new", placed(None, false)),
-        ("off", placed(Some(PlacementLoad::Off), false)),
-        ("for_test", placed(None, true)),
+    let test_core = Farm::for_test(
+        Arc::new(Cache::memory()),
+        testkit::TestCore::new(
+            7,
+            0,
+            kbf_sched::UNSERVABLE_WAIT,
+            kbf_sched::FINISHED_RETENTION,
+        ),
+    );
+    for (name, farm) in [
+        ("Farm::new", plain()),
+        ("off", plain().with_placement_load(PlacementLoad::Off)),
+        ("for_test", test_core),
     ] {
-        assert_eq!(counters.admitted, 0, "{name} admitted by load");
+        assert_eq!(placed(&farm).admitted, 0, "{name} admitted by load");
     }
-    let on = placed(Some(PlacementLoad::On), false);
-    assert_eq!(on.admitted, 1, "on did not place by load");
+    let on = plain().with_placement_load(PlacementLoad::On);
+    assert_eq!(placed(&on).admitted, 1, "on did not place by load");
+}
+
+/// Catches `serve` and `frontend` building a farm that ignores the parsed flag: both take
+/// their farm from `Farm::from_listeners`, so a flag that helper drops fails here. No flag
+/// and `off` place by the booked rule; `on` admits the one action by load.
+#[test]
+fn the_farm_a_server_builds_takes_the_parsed_flag() {
+    assert_eq!(placed(&from_flags(&[])).admitted, 0, "no flag");
+    let off = from_flags(&["--placement-load=off"]);
+    assert_eq!(placed(&off).admitted, 0, "off");
+    let on = from_flags(&["--placement-load=on"]);
+    assert_eq!(placed(&on).admitted, 1, "on");
 }

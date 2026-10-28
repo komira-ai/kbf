@@ -11,10 +11,11 @@ use serde::Serialize;
 use subtle::ConstantTimeEq;
 
 use crate::converge::{Convergence, converge};
-use crate::decide::decide;
+use crate::decide::decide_in;
 use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
 use crate::fleet::Fleet;
 use crate::identity::Identity;
+use crate::services::Services;
 
 /// The time since the coordinator started.
 pub type Clock = Arc<dyn Fn() -> Duration + Send + Sync>;
@@ -38,6 +39,10 @@ pub enum SetError {
     /// The state file could not be written.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// The services file's `ci_services` does not name this service, so CI's token may
+    /// not set it.
+    #[error("the token may not set this service")]
+    Forbidden,
 }
 
 /// Why a CI token was not accepted.
@@ -105,6 +110,7 @@ pub struct Status {
 pub struct Coordinator {
     fleet: Mutex<Fleet>,
     desired: DesiredStore,
+    services: Services,
     verifier: Arc<Verifier>,
     operator_token: String,
     clock: Clock,
@@ -130,10 +136,18 @@ impl Coordinator {
         Self {
             fleet: Mutex::new(Fleet::new(started)),
             desired,
+            services: Services::default(),
             verifier,
             operator_token,
             clock,
         }
+    }
+
+    /// The same coordinator over `services` instead of `kbf` alone.
+    #[must_use]
+    pub fn with_services(mut self, services: Services) -> Self {
+        self.services = services;
+        self
     }
 
     /// Notes a heartbeat from `who` and answers it. With no desired state set, nothing.
@@ -141,12 +155,16 @@ impl Coordinator {
         let now = (self.clock)();
         let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
         fleet.record(who.node_id.clone(), who.role, beat, now);
-        let Some(d) = self.desired.get(KBF) else {
-            return Reply::Nothing;
-        };
-        let reply = decide(&d, &fleet, &who.node_id, now);
+        let reply = decide_in(
+            &self.services,
+            &self.desired.all(),
+            KBF,
+            &fleet,
+            &who.node_id,
+            now,
+        );
         if let Reply::Update { version } = &reply {
-            fleet.order(who.node_id, version.clone(), now);
+            fleet.order(KBF, who.node_id, version.clone(), now);
         }
         reply
     }
@@ -180,7 +198,11 @@ impl Coordinator {
             sha = ?verified.sha,
             "desired state set by CI"
         );
-        let (service, desired) = Desired::parse_request(body)?;
+        let (service, desired) =
+            Desired::parse_request_for(body, |name| self.services.get(name).is_some())?;
+        if !self.services.ci_may_set(&service) {
+            return Err(SetError::Forbidden);
+        }
         self.desired.set(&service, desired.clone())?;
         Ok(desired)
     }
@@ -202,8 +224,8 @@ impl Coordinator {
                 node_id: id.to_string(),
                 role: host.role.name(),
                 live: host.is_live(now),
-                up: fleet.is_up(id, host, now),
-                holds_slot: fleet.holds_slot(id, host, now),
+                up: fleet.is_up(KBF, id, host, now),
+                holds_slot: fleet.holds_slot(KBF, id, host, now),
                 silent_secs: now.saturating_sub(host.seen).as_secs(),
                 beat: host.beat.clone(),
             })

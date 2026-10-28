@@ -37,6 +37,11 @@ impl Files {
             0o644,
         );
         put("operator.token", OPERATOR, 0o600);
+        put(
+            "services.toml",
+            "[[service]]\nname = \"other\"\n[service.roles.daemon]\n",
+            0o644,
+        );
         Self { dir, pki }
     }
 
@@ -94,7 +99,9 @@ fn with(flags: &[String], flag: &str, value: &str) -> Vec<String> {
 #[test]
 fn it_announces_its_addresses_serves_and_stops_on_sigterm() {
     let files = Files::new("bin-serve");
-    let mut child = spawn(&files.flags());
+    let mut flags = files.flags();
+    flags.extend(["--services-file".to_owned(), files.path("services.toml")]);
+    let mut child = spawn(&flags);
     let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
     let mut line = String::new();
     stdout.read_line(&mut line).expect("a start line");
@@ -199,6 +206,15 @@ fn a_start_with_a_bad_file_or_address_is_refused_with_a_reason() {
     let (code, _, err) = run(&with(&flags, "--oidc-config", &bad));
     assert_eq!(code, 1);
     assert!(err.contains("remote_operator"), "{err}");
+
+    let mut with_services = flags.clone();
+    with_services.extend(["--services-file".to_owned(), files.path("nope.toml")]);
+    let (code, _, err) = run(&with_services);
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("--services-file") && err.contains("nope.toml"),
+        "{err}"
+    );
 
     let state = files.path("state.json");
     std::fs::write(&state, "{}").expect("written");

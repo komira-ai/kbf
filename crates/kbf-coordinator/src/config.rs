@@ -23,6 +23,7 @@ use crate::desired::DesiredStore;
 use crate::http::Surface;
 use crate::listen::{CLIENT_PATIENCE, Listener, MAX_CONNECTIONS, reload_every, serve};
 use crate::service::{Clock, Coordinator};
+use crate::services::Services;
 
 /// A start-up error, for the operator.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -66,6 +67,10 @@ pub struct Cli {
     /// A file holding the operator token, mode 0600, owned by the coordinator's user.
     #[arg(long)]
     pub operator_token_file: PathBuf,
+    /// A TOML file that defines further services and names the ones CI's token may set
+    /// (`docs/design/updates.md`, section 3). Without it `kbf` is the only service.
+    #[arg(long)]
+    pub services_file: Option<PathBuf>,
     /// How often the TLS files are looked at again, in seconds.
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
     pub tls_reload_secs: u64,
@@ -108,6 +113,10 @@ pub fn build(cli: &Cli) -> Result<Parts, Error> {
     let keys = HttpsKeys::new(&oidc.issuer, Roots::System, KEY_FETCH_TIMEOUT)?;
     let verifier = Verifier::new(oidc, Arc::new(keys), KEY_REFETCH, kbf_oidc::system_clock());
     let desired = DesiredStore::open(&cli.state_file)?;
+    let services = match &cli.services_file {
+        Some(path) => Services::from_file(path).map_err(|why| format!("--services-file: {why}"))?,
+        None => Services::default(),
+    };
     let interval = Duration::from_secs(cli.tls_reload_secs);
     let files = |client_ca| TlsFiles {
         cert: cli.tls_cert.clone(),
@@ -117,12 +126,10 @@ pub fn build(cli: &Cli) -> Result<Parts, Error> {
     let origin = Instant::now();
     let clock: Clock = Arc::new(move || origin.elapsed());
     Ok(Parts {
-        coordinator: Arc::new(Coordinator::new(
-            desired,
-            Arc::new(verifier),
-            operator_token,
-            clock,
-        )),
+        coordinator: Arc::new(
+            Coordinator::new(desired, Arc::new(verifier), operator_token, clock)
+                .with_services(services),
+        ),
         heartbeat_tls: TlsSource::files("heartbeat", files(Some(cli.client_ca.clone())), interval)?,
         control_tls: TlsSource::files("control", files(None), interval)?,
         heartbeat_listen: cli.heartbeat_listen,

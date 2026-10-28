@@ -792,15 +792,7 @@ impl<'a> Prepared<'a> {
             qos: listeners.qos_allowed,
         };
         let durable = state.is_some();
-        let farm = Farm::new(
-            backend.clone(),
-            listeners.unservable_wait,
-            listeners.finished_retention,
-        )
-        .with_memory_ladder(listeners.memory_ladder.clone())
-        .with_learned_sizes(listeners.learned_sizes, listeners.memory_ladder.first())
-        .with_placement_load(listeners.placement_load)
-        .recording(recorder.clone());
+        let farm = Farm::from_listeners(backend.clone(), &listeners).recording(recorder.clone());
         let farm = Arc::new(farm.with_state(state)?);
         log_state(durable, farm.term(), farm.lease_epoch());
 

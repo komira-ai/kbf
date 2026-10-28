@@ -395,6 +395,14 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    event_names = ["workflow_run"]
    ```
 
+   `kbf-oidc` also reads several `[[remote_operator]]` entries (never mixed with the single
+   table), one per repository and workflow that may call. An entry's `services = [...]` (default
+   `["kbf"]`) lists the services a token it admits may set, and a token never gets another
+   entry's services. Entries must name the same issuer, and two entries may not share a
+   `repository_id` and a `job_workflow_ref`; such a file is refused at load. A coordinator reads
+   the list form only once it loads the file with `kbf_oidc::AllowList`; one that still uses
+   `OidcConfig` accepts the single table only.
+
    `event_names` must name `workflow_run`: the release workflow is started by the completion of
    the pipeline, and its tokens say so (the default list is `push` and `workflow_dispatch`).
    The `sha` of the token is the head of `main`, not the commit released. A token is good for one
@@ -453,7 +461,7 @@ says which form it needs, before it calls the coordinator. Anything else that se
 coordinator's desired version (a `POST /v1/desired` by hand) needs the same form, or no host
 will converge on it.
 
-The coordinator keeps its desired state per service name, and `kbf` is the only service it accepts: `POST /v1/desired` takes an optional `service` (absent means `kbf`; any other name is a 400), and `GET /v1/status` adds `services` beside the unchanged `desired`. While `kbf` is the only service, the `--state-file` holds the single state in the form earlier coordinators wrote, so a downgrade to one of them starts on the same file; a file in the map form (`{"services": {...}}`), which a coordinator with a second service writes, is refused by an earlier build, and the operator then restores the file from before or writes `kbf`'s state alone in it.
+The coordinator keeps its desired state per service name, and `kbf` is the only service it accepts unless `--services-file` defines more ([the design](../design/updates.md)): `POST /v1/desired` takes an optional `service` (absent means `kbf`; a name no file defines is a 400), and `GET /v1/status` adds `services` beside the unchanged `desired`. While `kbf` is the only service, the `--state-file` holds the single state in the form earlier coordinators wrote, so a downgrade to one of them starts on the same file; a file in the map form (`{"services": {...}}`), which a coordinator with a second service writes, is refused by an earlier build, and the operator then restores the file from before or writes `kbf`'s state alone in it.
 
 `cargo xtask deploy-farm` (one `run:` line):
 

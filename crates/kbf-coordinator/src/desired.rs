@@ -3,13 +3,14 @@
 //!
 //! CI sets it with one call: the version every host should run, how many hosts of a kind
 //! may update at once, and how many storage hosts and frontends must stay up. The store
-//! keeps one such state per service name; `kbf` is the only service the coordinator accepts
-//! and decides on. It is one small JSON file, replaced whole by a temporary file, fsync,
-//! rename and a directory fsync, so a crash leaves the old state or the new one. While `kbf`
-//! is the only service the file is the single state itself (the format earlier builds read
-//! and wrote, so a downgrade keeps working); a file with `{"services": {name: state}}` is
-//! the map. A file that cannot be read back is a refusal to start: the coordinator does not
-//! guess what an operator meant.
+//! keeps one such state per service name; a service must be `kbf` or one the services file
+//! defines (`crate::services`). Hosts are ordered only for `kbf` until their heartbeats
+//! name other services. It is one small JSON file, replaced whole by a temporary file,
+//! fsync, rename and a directory fsync, so a crash leaves the old state or the new one.
+//! While `kbf` is the only service the file is the single state itself (the format earlier
+//! builds read and wrote, so a downgrade keeps working); a file with
+//! `{"services": {name: state}}` is the map. A file that cannot be read back is a refusal
+//! to start: the coordinator does not guess what an operator meant.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -22,7 +23,8 @@ use kbf_types::HostRole;
 use kbf_updater::version::Version;
 use serde::{Deserialize, Serialize};
 
-/// The service every host runs today, and the only one a desired state may name.
+/// The service every host runs today, and the only one a desired state may name unless a
+/// services file defines more.
 pub const KBF: &str = "kbf";
 
 /// The most any count may be: a typo's order of magnitude, not a plan.
@@ -88,6 +90,18 @@ pub struct MinUp {
     pub frontend: u32,
 }
 
+impl MinUp {
+    /// The minimum for hosts of `role`: the other roles have none.
+    #[must_use]
+    pub const fn of(&self, role: HostRole) -> u32 {
+        match role {
+            HostRole::Storage => self.storage,
+            HostRole::Frontend => self.frontend,
+            HostRole::Daemon | HostRole::MacDaemon => 0,
+        }
+    }
+}
+
 /// The desired state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -133,6 +147,17 @@ impl Desired {
     /// # Errors
     /// [`DesiredError`]; [`DesiredError::UnknownService`] for any service but [`KBF`].
     pub fn parse_request(bytes: &[u8]) -> Result<(String, Self), DesiredError> {
+        Self::parse_request_for(bytes, |name| name == KBF)
+    }
+
+    /// Like [`Self::parse_request`], for the services `known` accepts.
+    ///
+    /// # Errors
+    /// [`DesiredError`]; [`DesiredError::UnknownService`] for a service `known` refuses.
+    pub fn parse_request_for(
+        bytes: &[u8],
+        known: impl Fn(&str) -> bool,
+    ) -> Result<(String, Self), DesiredError> {
         let malformed = |e: serde_json::Error| DesiredError::Malformed(e.to_string());
         let mut fields: serde_json::Map<String, serde_json::Value> =
             serde_json::from_slice(bytes).map_err(malformed)?;
@@ -141,7 +166,7 @@ impl Desired {
             Some(serde_json::Value::String(name)) => name,
             Some(_) => return Err(DesiredError::Malformed("service is not text".to_owned())),
         };
-        if service != KBF {
+        if !known(&service) {
             return Err(DesiredError::UnknownService);
         }
         let desired: Self = serde_json::from_value(fields.into()).map_err(malformed)?;

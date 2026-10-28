@@ -27,6 +27,8 @@ CI sets one desired state with one OIDC-authenticated call (`kbf-oidc`): version
 
 The coordinator keeps that desired state per service name; `kbf` is the only service it accepts. `POST /v1/desired` takes an optional `service` field (absent means `kbf`), and any other name is refused with 400. `GET /v1/status` and `GET /v1/convergence` keep their fields for `kbf`; the status adds `services`, the desired state of every service by name. The decision and the heartbeat and reply wire are unchanged. The state file is, while `kbf` is the only service, the single state itself (the format earlier builds wrote); a file of the form `{"services": {name: state}}` is read as the map, and a file of the old form is read as `kbf`'s.
 
+A service is data (`crates/kbf-coordinator/src/services.rs`): a name; the roles it runs on, each with `max_updating`, `min_up`, `never_last` and the roles of the same service it waits for; and `after`, the services whose live hosts must all run their desired version and not be updating before any host of this service is ordered. `kbf` is built in and reproduces the rules above: its frontend role is `never_last` (at least one other frontend up, whatever `min_up` says) and waits for the storage, daemon and Mac roles, and its limits come from the desired state. `--services-file` (optional; without it `kbf` is the only service) defines further services in TOML and `ci_services`, the one list of services CI's token may set (default `kbf` only; a service it does not name is refused with 403). A defined role's own `max_updating` and `min_up` replace the desired state's; `min_up = 0` allows ordering a lone host of the role. The decision runs per host and service, orders are kept per (host, service), and a host with any service updating, or with an order outstanding for another, is ordered nothing for a second: one update per host at a time. Hosts still heartbeat only `kbf`, so only `kbf` is ordered over the wire today; the multi-service rules are exercised at the decision level.
+
 On each heartbeat it answers `update to X` only if all hold:
 
 - the host is behind X;
@@ -95,6 +97,25 @@ job_workflow_ref = ["komira-ai/kbf/.github/workflows/<workflow>.yml@refs/heads/m
 environments = ["<a protected environment>"]
 # event_names: push and workflow_dispatch by default
 # runner_environment: the default, github-hosted
+```
+
+**Several entries.** The file may instead hold several `[[remote_operator]]` entries, each with the keys above (a file never has both `[remote_operator]` and `[[remote_operator]]`). A token is admitted by the first entry whose every check passes, and only that entry's `services` apply: `services` is a list of service names the token may set the desired version of, `["kbf"]` when the entry names none. `Verified` carries the matching entry's place in the file and its services, so the caller authorizes per service. A token no entry admits is refused with the first entry's reason. The file is refused at load if entries name different issuers (the keys are one issuer's), or if two entries have the same `repository_id` and share a `job_workflow_ref`. A file with a single `[remote_operator]` table means what it always meant (one entry, services `["kbf"]`). The list form is read by `kbf_oidc::AllowList`; `OidcConfig` reads the single table only.
+
+```toml
+[[remote_operator]]
+issuer = "https://token.actions.githubusercontent.com"
+audience = "<audience>"
+repository_id = "<id of komira-ai/kbf>"
+job_workflow_ref = ["komira-ai/kbf/.github/workflows/release.yml@refs/heads/main"]
+environments = ["release"]
+
+[[remote_operator]]
+issuer = "https://token.actions.githubusercontent.com"
+audience = "<audience>"
+repository_id = "<id of the other repository>"
+job_workflow_ref = ["<owner>/<repo>/.github/workflows/release.yml@refs/heads/main"]
+environments = ["release"]
+services = ["<that repository's services>"]
 ```
 
 A CI job asks for the token with its audience (`ACTIONS_ID_TOKEN_REQUEST_URL` with `&audience=`) and sends it as `Authorization: Bearer`. For a workflow that GitHub starts from a `workflow_run`, `job_workflow_ref` names the copy of the workflow on the default branch, and `event_names` must list `workflow_run`; the token does not say which event started the upstream run, so the workflow's own `if:` is what keeps a run started any other way from calling.
