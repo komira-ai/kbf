@@ -39,17 +39,21 @@ impl From<Mode> for ActionsCpuMax {
 }
 
 impl Args {
-    /// The refusal for a mode other than `auto` on a node that runs no container driver.
-    pub(crate) fn refusal(self, drivers: &[Driver]) -> Option<String> {
-        if self.actions_cpu_max == Mode::Auto || drivers.contains(&Driver::Container) {
-            return None;
+    /// Refuses a mode other than `auto` on a node that runs no container driver. Not
+    /// generic, so its refusal is one code path whatever data plane the node is built over.
+    ///
+    /// # Errors
+    /// The refusal, naming the mode.
+    pub(crate) fn refuse(self, drivers: &[Driver]) -> Result<(), String> {
+        let name = match self.actions_cpu_max {
+            Mode::Auto => return Ok(()),
+            Mode::On => "on",
+            Mode::Off => "off",
+        };
+        if drivers.contains(&Driver::Container) {
+            return Ok(());
         }
-        let name = self
-            .actions_cpu_max
-            .to_possible_value()?
-            .get_name()
-            .to_owned();
-        Some(format!(
+        Err(format!(
             "--actions-cpu-max={name} sets the CPU limit of the container driver's actions \
              cgroup: only --driver container has one (Linux only)"
         ))

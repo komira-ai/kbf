@@ -890,9 +890,7 @@ fn node_over<C: Cas>(
         )
         .into());
     }
-    if let Some(refusal) = cli.actions_cpu.refusal(&cli.drivers) {
-        return Err(refusal.into());
-    }
+    cli.actions_cpu.refuse(&cli.drivers)?;
     let mut node = Node::new(plane);
     for driver in drivers(cli) {
         match driver {
@@ -2293,11 +2291,8 @@ mod tests {
             let broken = Cli::try_parse_from(broken).expect("flags");
             let why = start_over(&broken, None, plane).err().expect("refused");
             let why = why.to_string();
-            assert!(
-                why.contains(&format!("--actions-cpu-max={mode}"))
-                    && why.contains("only --driver container"),
-                "{why}"
-            );
+            assert!(why.contains(&format!("--actions-cpu-max={mode}")), "{why}");
+            assert!(why.contains("only --driver container"), "{why}");
         }
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
