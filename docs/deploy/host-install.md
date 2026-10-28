@@ -760,7 +760,7 @@ container ([the example](../../packaging/host-agent/linux/host-install-frontend.
 | `api` | where this host reaches the frontend's operator API (a published port, or the host's own listen address under `network = "host"`), for `/readyz` and `/healthz` |
 | `drain_token_file` | the operator token as a path **inside** the container |
 | `peers` | optional: the other frontends' operator APIs this host can reach |
-| `drain_secs` | optional (default 180, at most 1800): how long a drain is waited for |
+| `drain_secs` | optional, at least 1, no upper limit. Left out (the default), a switch waits for the old container to end however long its builds take. Set, it is how long the switch waits before it gives up; it never stops, removes or replaces a container that still runs |
 | `ready_secs` | optional (default 90, 10 to 600): how long a new container has to be ready |
 
 `group_add` is written into the record only when it is set, so that a host that sets none writes
@@ -769,8 +769,8 @@ settle (confirm) or revert any release on trial before the helper is rolled back
 without `group_add`**: that version refuses a record with a key it does not know, and could not run
 the deadline revert.
 
-A switch has to fit `--window-secs`: `drain_secs` + 30 (the stop) + `ready_secs` is checked against
-it (`config_invalid` when it does not).
+The trial window (`--window-secs`) starts when the new container does, so it never counts the
+drain: only `ready_secs` is checked against it (`config_invalid` when `ready_secs` is longer).
 
 **install** fetches the image, its attestation bundle and the release's `SHA256SUMS` as the
 installer's unprivileged user, copies them once into a directory of root's, and checks, before the
@@ -786,23 +786,31 @@ release that fails the check changes nothing: nothing is loaded and nothing is s
 1. it refuses (`peer_not_ready`) if any of `peers` does not answer `/readyz` with 200, before
    anything is written. This program can see only its own host and these peers; without `peers`
    the coordinator's order (one frontend at a time, never the last ready one) is the guard;
-2. the pending marker is written to `frontend.json` with its deadline, the images of both
-   releases and a copy of the configuration;
-3. the restart policy is set to `no` (a drained frontend exits by itself, and must not be brought
+2. the restart policy is set to `no` (a drained frontend exits by itself, and must not be brought
    back as the old release);
-4. the frontend is asked to drain through its own operator API: `docker exec` runs
+3. the frontend is asked to drain through its own operator API: `docker exec` runs
    `/usr/bin/kbf cluster drain --frontend --token-file <drain_token_file>` in the container, where
    the API is on loopback ([api.md](../api.md#get-v1frontenddrain-and-post-v1frontenddrain)):
    `/readyz` answers 503 and the work it has finishes;
-5. it waits until the container has ended (a drained frontend exits when it is idle) or
-   `drain_secs` is out, and then stops it (`docker stop`, 30 s) and removes it;
-6. the new container is made from the new image with **the configuration of step 2, byte for
+4. it waits until the container has ended (a drained frontend exits when it is idle), as long as
+   that takes. With no `drain_secs` there is no deadline. A configured `drain_secs` only ends the
+   waiting: the switch fails (`switch_failed`, "still draining") and **nothing is stopped,
+   removed or replaced**. The old container keeps running and draining with its configured
+   restart policy put back, no marker is written, and the old release is current. Ask for the
+   switch again (the updater's next run does) and it drains again and waits again;
+5. only now is the pending marker written to `frontend.json`, with its deadline, the images of
+   both releases and a copy of the configuration; the ended container is stopped (`docker stop`,
+   30 s, a formality: it has ended) and removed;
+6. the new container is made from the new image with **the configuration of step 5, byte for
    byte**: `docker run --detach --name <name> --restart <restart> [--network] [--user]
-   [--group-add]... [--publish]... [--volume]... <image id> <command>...`;
+   [--group-add]... [--publish]... [--volume]... <image id> <command>...`. The deadline of the
+   trial is put on the marker as soon as it starts: `--window-secs` after the new container
+   started, however long the drain took;
 7. it waits up to `ready_secs` for `/readyz` to answer 200 and `/healthz` to name the release's
    commit.
 
-When any step fails, the container is removed and made again from the **old** image id with the
+A failure before step 5 (the drain request fails, the runtime stops answering) leaves the old
+container as it is and puts its restart policy back. When a step from 5 on fails, the container is removed and made again from the **old** image id with the
 same configuration, waited for the same way (on the old commit), the marker is cleared, and the
 switch answers `failed` (`switch_failed`). If the old container cannot be made again either,
 the answer is `revert_failed` and the marker stays: the deadline, or a `revert`, tries again.
