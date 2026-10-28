@@ -8,26 +8,27 @@ use prost::Message;
 use crate::runtime::RuntimeError;
 use crate::runtimes::AnyRuntime;
 
-/// Once the run of lease `id` has ended, asks `run` for its busiest window and puts it in
-/// the usage the lease reports: the one its result carries, or `usage`, which a failed run
-/// is reported with. A run with no window to name changes nothing.
-pub(crate) fn peak(
+/// The usage lease `id` reports once its run has ended: none for a run that succeeded (its
+/// result carries it), else what the runtime says a failed run used. The runtime is then
+/// asked for the lease's busiest window, which goes in the usage the result carries or in the
+/// failed run's usage. A run with no window to name changes nothing.
+pub(crate) fn usage_with_peak(
     run: &dyn AnyRuntime,
     id: LeaseId,
     outcome: &mut Result<ActionResult, RuntimeError>,
-    usage: &mut Option<ResourceUsage>,
-) {
-    let Some(peak) = run.take_peak_window_millicores(id) else {
-        return;
-    };
-    match outcome {
-        Ok(result) => peak_into_result(result, peak),
-        Err(_) => {
-            if let Some(usage) = usage.as_mut() {
-                set_peak(usage, peak);
+) -> Option<ResourceUsage> {
+    let mut usage = outcome.as_ref().err().and_then(|_| run.failed_usage(id));
+    if let Some(peak) = run.take_peak_window_millicores(id) {
+        match outcome {
+            Ok(result) => peak_into_result(result, peak),
+            Err(_) => {
+                if let Some(usage) = usage.as_mut() {
+                    set_peak(usage, peak);
+                }
             }
         }
     }
+    usage
 }
 
 /// `usage` saying its lease's busiest window used `peak` millicores.

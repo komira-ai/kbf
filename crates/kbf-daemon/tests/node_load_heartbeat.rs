@@ -128,7 +128,7 @@ async fn usage_of_a_lease(name: &str, runtime: Arc<Scripted>) -> Option<Resource
 /// another kind, each leaving it out), and carries the next reading that succeeds, field for
 /// field.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_reading_error_leaves_the_node_load_unset() {
+async fn a_reading_reaches_the_heartbeat_and_a_failed_one_leaves_it_unset() {
     let runtime = Arc::new(Scripted::new());
     lock(&runtime.readings).extend([
         Ok(Some(reading(1))),

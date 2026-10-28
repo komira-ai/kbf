@@ -117,8 +117,7 @@ impl Leases {
             let mut outcome = contained(run.as_ref(), id, work).await;
             // An error carries no result, so no usage: the runtime is asked for it. An
             // out-of-memory kill (the lease's own limit, or the node's) is marked.
-            let mut usage = outcome.as_ref().err().and_then(|_| run.failed_usage(id));
-            crate::lease_peak::peak(run.as_ref(), id, &mut outcome, &mut usage);
+            let usage = crate::lease_peak::usage_with_peak(run.as_ref(), id, &mut outcome);
             let oom = matches!(
                 outcome,
                 Err(RuntimeError::OutOfMemory { .. } | RuntimeError::BusyNode(_))
