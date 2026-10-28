@@ -279,7 +279,10 @@ jobs:
           name: profraw-part-${{ matrix.shard }}
           path: target/llvm-cov-target/kbf-part${{ matrix.shard }}-*.profraw
           if-no-files-found: error
-          retention-days: 1
+          # A re-run of the run (all its jobs, or the failed ones: the parts that passed keep their
+          # uploads, which the last part finds by name) uploads the same names again.
+          overwrite: true
+          retention-days: 5
       # The last part, from here on. It fails at once when another part failed, and otherwise waits
       # for the others' uploads (a part that finishes a few minutes later is the usual case).
       - name: Wait for the other parts' raw profiles
@@ -307,6 +310,7 @@ jobs:
           name: coverage
           path: target/coverage/lcov.info
           if-no-files-found: error
+          overwrite: true
       # and the cache it saves holds none of this run's workspace coverage artifacts either; one part
       # saves it (the parts restore and would save the same key)
       - if: ${{ github.event_name == 'push' && matrix.shard == 1 && steps.cargo-cache.outputs.cache-hit != 'true' }}

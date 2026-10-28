@@ -229,6 +229,9 @@ fn split_wiring(workflow: &str) -> Result<(), String> {
                 .to_owned(),
         );
     }
+    if input(&steps[upload], "overwrite") != Some("true") {
+        return Err("the upload step lacks `overwrite: true`, so a re-run of the run fails on the names its first run uploaded".to_owned());
+    }
     if input(&steps[download], "path") != Some(PROFILES)
         || input(&steps[download], "merge-multiple") != Some("true")
     {
@@ -452,7 +455,7 @@ mod split_rules {
 
     const LAST: &str = "${{ format('{0}', matrix.shard) == env.SHARDS }}";
     const HEAD: &str = "  test-shard:\n    runs-on: ubuntu-latest\n    env:\n      LLVM_PROFILE_FILE_NAME: kbf-part${{ matrix.shard }}-%p-%4m.profraw\n    steps:\n";
-    const UPLOAD: &str = "      - uses: actions/upload-artifact@abc # v7\n        with:\n          name: profraw-part-${{ matrix.shard }}\n";
+    const UPLOAD: &str = "      - uses: actions/upload-artifact@abc # v7\n        with:\n          name: profraw-part-${{ matrix.shard }}\n          overwrite: true\n";
     const WAIT: &str = "      - if: ${{ format('{0}', matrix.shard) == env.SHARDS }}\n        run: cargo xtask wait-artifacts --artifact-prefix profraw-part- --of \"$SHARDS\"\n";
     const DOWNLOAD: &str = "      - if: ${{ format('{0}', matrix.shard) == env.SHARDS }}\n        uses: actions/download-artifact@abc # v8\n        with:\n          pattern: profraw-part-*\n          path: target/llvm-cov-target\n          merge-multiple: true\n";
     const REPORT: &str = "      - if: ${{ format('{0}', matrix.shard) == env.SHARDS }}\n        run: cargo llvm-cov report --lcov\n";
@@ -568,6 +571,11 @@ mod split_rules {
                     "name: profraw-other",
                 ),
                 "the upload step's `name` does not begin with the wait step's `--artifact-prefix`",
+            ),
+            (
+                HEAD.to_owned(),
+                all.replace("          overwrite: true\n", ""),
+                "the upload step lacks `overwrite: true`, so a re-run of the run fails on the names its first run uploaded",
             ),
             (
                 HEAD.to_owned(),
