@@ -90,6 +90,7 @@ mod keeper;
 mod logs;
 #[cfg(test)]
 mod logs_tests;
+mod node_load;
 pub mod numa;
 mod oci;
 mod off_worker;
@@ -128,6 +129,7 @@ pub use delegate::{
 };
 pub use image::{ImageCheckError, ImageError, ImageRef};
 pub use input_phases::Spot;
+pub use node_load::{LoadError, MonoClock, NodeLoad};
 pub use numa::{CpuSet, LeasePlacement, NodeMemory, Pin, Placement, Placer};
 pub use oci::{OciConfig, OciError};
 pub use outputs::OutputLimits;

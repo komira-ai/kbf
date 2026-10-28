@@ -72,6 +72,7 @@ where
                 ("memory.current", "1\n"),
                 ("memory.swap.current", "0\n"),
                 ("memory.stat", "anon 1\n"),
+                ("cpu.stat", "usage_usec 1\n"),
             ] {
                 std::fs::write(dir.join(file), text).expect("file");
             }
@@ -133,6 +134,21 @@ fn the_numa_sampler_reads_off_the_async_workers() {
         blocking_threads_while_reads_wait("numa-watch", "memory.stat", |dir| async move {
             NumaSample::default().watch(&dir, Duration::ZERO).await;
         });
+    assert_eq!(
+        started, WORKERS,
+        "two reads waited at once and the blocking pool started {started} threads: \
+         the rest waited on the async workers"
+    );
+}
+
+/// Catches the node load reading the `actions/` cgroup's files on an async worker every
+/// heartbeat.
+#[test]
+fn the_node_load_reads_off_the_async_workers() {
+    let started = blocking_threads_while_reads_wait("node-load", "cpu.stat", |dir| async move {
+        let tracker = crate::node_load::LoadTracker::new(crate::node_load::process_clock());
+        let _ = tracker.reading(dir).await;
+    });
     assert_eq!(
         started, WORKERS,
         "two reads waited at once and the blocking pool started {started} threads: \

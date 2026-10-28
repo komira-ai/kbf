@@ -359,3 +359,43 @@ async fn a_lease_reports_its_booked_cpu_and_the_node_cpu_pressure_at_its_start()
     assert_eq!(usage.booked_millicpus, Some(2000));
     assert_eq!(usage.node_cpu_pressure_centi, None);
 }
+
+/// Catches the runtime reading the node load from a path other than the configured
+/// `actions/` cgroup (the parent's leading `/` joined as an absolute path), the clock
+/// given to the runtime being ignored, and a lease nobody ran having a peak.
+#[tokio::test]
+async fn the_runtime_reads_the_actions_cgroup_with_its_clock() {
+    let fake = Fake::new("node-load");
+    let actions = fake.cgroup.join("actions");
+    for (file, text) in [
+        ("cpu.stat", "usage_usec 42\nthrottled_usec 7\n"),
+        ("memory.current", "1000\n"),
+        ("memory.stat", "inactive_file 400\n"),
+        ("cpu.max", "max 100000\n"),
+    ] {
+        std::fs::write(actions.join(file), text).expect("file");
+    }
+    let runtime = kbf_driver_container::ContainerRuntime::new(
+        fake.config.clone(),
+        std::sync::Arc::clone(&fake.cas),
+    )
+    .expect("runtime")
+    .with_clock(std::sync::Arc::new(|| 9_000));
+    let load = runtime.node_load().await.expect("reading");
+    assert_eq!(
+        (
+            load.seq,
+            load.mono_usec,
+            load.cpu_usage_usec,
+            load.working_set_bytes
+        ),
+        (1, 9_000, 42, 600)
+    );
+    assert_eq!(load.throttled_usec, Some(7));
+    assert_eq!(load.pressure_some_total_usec, None);
+    assert!(!load.actions_cpu_limited && load.covered.is_empty());
+    assert_eq!(
+        runtime.take_peak_window_millicores(LeaseId { term: 1, seq: 1 }),
+        None
+    );
+}
