@@ -125,7 +125,7 @@ impl Durable {
         let Some(row) = self.store.get(&key)? else {
             return Ok(None);
         };
-        let request = request_row(&key, &row)?;
+        let request = self.request_row(&key, &row)?;
         let action = action_of_request(&key, &request)?;
         let lease = match known {
             Some(grant) => Some(grant),
@@ -141,11 +141,7 @@ impl Durable {
             Some(row) => Some(fate::decode(&row.value).map_err(|why| corrupt(&key, why))?),
             None => None,
         };
-        let key = subject_key(operation);
-        let subject = match self.store.get(&key)? {
-            Some(row) => Some(subject::decode(&row.value).map_err(|why| corrupt(&key, why))?),
-            None => None,
-        };
+        let subject = self.ext.subject(&*self.store, operation)?;
         let read = self.read_size_keys.load(Ordering::SeqCst);
         let size_key = match self.store.get(&opkey_key(operation))?.filter(|_| read) {
             Some(row) => {
@@ -175,7 +171,7 @@ impl Durable {
         let Some(row) = self.store.get(&key)? else {
             return Ok(txn);
         };
-        let request = request_row(&key, &row)?;
+        let request = self.request_row(&key, &row)?;
         let pin = inflight_key(&request.key);
         Ok(match self.store.get(&pin)? {
             Some(row) if number(&pin, &row)? == operation.0 => {

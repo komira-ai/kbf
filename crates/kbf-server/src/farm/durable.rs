@@ -143,10 +143,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime};
 
-use kbf_estimator::{Day, Summaries};
+use kbf_estimator::Day;
 use kbf_front::{Described, Finished, Stage};
+#[cfg(test)]
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
 use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{
@@ -172,6 +175,10 @@ use crate::learned::Row;
 use crate::machine::Platform;
 use crate::state_store::StateStore;
 
+use self::codec::{KbfLog, RowCodec, WorkerUp};
+#[cfg(test)]
+use self::codec::{decode, encode};
+use self::ext::{Ext, KbfRows};
 use self::inflight::Submitted;
 use self::leases::lease_by_op_key;
 use self::owner::{Owner, Ownership};
@@ -397,7 +404,9 @@ pub(super) enum Held {
 }
 
 mod blocks;
+mod codec;
 mod estimate;
+mod ext;
 mod fate;
 mod floor;
 mod inflight;
@@ -457,29 +466,37 @@ impl Ending {
         self.retention.max(DONE_FLOOR)
     }
 
-    /// `txn`, then the removal of the operation's `op/`, `queue/`, `loss/`, `fate/`,
-    /// `subject/` and `opkey/` rows and the put of its result, so one transaction carries
-    /// all of it. The `opkey/` delete is made whatever `--learned-sizes` says: an operation
+    /// [`Ending::settle_with`] with the rows of the build server.
+    #[cfg(test)]
+    fn settle(&self, txn: Txn, operation: OperationId) -> Txn {
+        self.settle_with(&KbfRows, txn, operation)
+    }
+
+    /// `txn`, then the removal of the operation's `op/`, `queue/`, `loss/`, `fate/` and
+    /// `opkey/` rows (and the rows `ext` removes, between the `fate/` and `opkey/` deletes)
+    /// and the put of its result, so one transaction carries all of it. The `opkey/` delete
+    /// is made whatever `--learned-sizes` says: an operation
     /// an `on` run queued has the row, and a later `off` run cleans it up as it ends.
     /// The result goes over whatever is there: the transaction also deletes the lease row
     /// at the version read, which no other writer can have deleted first and written a
     /// result after.
-    fn settle(&self, txn: Txn, operation: OperationId) -> Txn {
+    fn settle_with(&self, ext: &dyn Ext, txn: Txn, operation: OperationId) -> Txn {
         let txn = txn
             .delete(op_key(operation), Cond::Any)
             .delete(queue_key(operation), Cond::Any);
-        self.settle_rest(txn, operation, Cond::Any)
+        self.settle_rest(ext, txn, operation, Cond::Any)
     }
 
     /// `txn`, which already deletes the operation's `op/` and `queue/` rows at the versions
     /// it read, then the removal of the rest of its rows (its `lease-by-op/` row among
     /// them, whoever left it) and the put of its result where `done` allows:
     /// [`Cond::Absent`] for a result no other writer has put.
-    fn settle_rest(&self, txn: Txn, operation: OperationId, done: Cond) -> Txn {
+    fn settle_rest(&self, ext: &dyn Ext, txn: Txn, operation: OperationId, done: Cond) -> Txn {
         let ttl = self.ttl();
-        txn.delete(loss_key(operation), Cond::Any)
-            .delete(fate_key(operation), Cond::Any)
-            .delete(subject_key(operation), Cond::Any)
+        let txn = txn
+            .delete(loss_key(operation), Cond::Any)
+            .delete(fate_key(operation), Cond::Any);
+        ext.settled(txn, operation)
             .delete(opkey_key(operation), Cond::Any)
             .delete(lease_by_op_key(operation), Cond::Any)
             .put_ttl(done_key(operation), self.finished.to_row(), ttl, done)
@@ -489,6 +506,10 @@ impl Ending {
 /// The scheduler's handle on its state store.
 pub(super) struct Durable {
     store: Arc<dyn Store>,
+    /// What the values of the `op/`, `lease/` and `session/` rows are as bytes.
+    codec: Arc<dyn RowCodec>,
+    /// The rows only a build server has, beside the scheduler's.
+    ext: Arc<dyn Ext>,
     /// A write failed because the store could not be reached, and none has been taken
     /// since ([`State::watch_store`] tells the scheduler).
     pub(super) unreachable: AtomicBool,
@@ -570,52 +591,10 @@ fn corrupt(key: &str, why: &str) -> StateError {
     }
 }
 
-fn encode(input: FarmInput) -> Result<Vec<u8>, StateError> {
-    let batch = FarmBatch {
-        now: FarmTime::default(),
-        wall: UNIX_EPOCH,
-        inputs: vec![input],
-    };
-    Ok(kbf_log::encode(Format::V1, &LogCommand::Farm(batch))?)
-}
-
-fn decode(key: &str, bytes: &[u8]) -> Result<FarmInput, StateError> {
-    match kbf_log::decode(Format::V1, bytes) {
-        Ok(LogCommand::Farm(FarmBatch { mut inputs, .. })) if inputs.len() == 1 => {
-            Ok(inputs.remove(0))
-        }
-        // A command this build does not know has no text of its own from the decoder.
-        Ok(LogCommand::Unknown) => Err(corrupt(key, "a command this binary does not know")),
-        Ok(_) => Err(corrupt(key, "not a single scheduler input")),
-        Err(e) => Err(corrupt(key, &e.to_string())),
-    }
-}
-
-/// Whether `bytes` hold a command this binary does not know, which a later one wrote.
-fn is_unknown(bytes: &[u8]) -> bool {
-    matches!(kbf_log::decode(Format::V1, bytes), Ok(LogCommand::Unknown))
-}
-
 fn parse_operation(key: &str, prefix: &str) -> Result<OperationId, StateError> {
     let id = u64::from_str_radix(&key[prefix.len()..], 16)
         .map_err(|_| corrupt(key, "not an operation id"))?;
     Ok(OperationId(id))
-}
-
-/// The grant a `lease/` row holds.
-fn lease_row(key: &str, row: &Versioned) -> Result<LeaseGrant, StateError> {
-    match decode(key, &row.value)? {
-        FarmInput::Committed(ControlRecord::Lease(grant)) => Ok(grant),
-        _ => Err(corrupt(key, "not a lease grant")),
-    }
-}
-
-/// The request an `op/` row holds.
-fn request_row(key: &str, row: &Versioned) -> Result<Request, StateError> {
-    match decode(key, &row.value)? {
-        FarmInput::Submit(request) => Ok(request),
-        _ => Err(corrupt(key, "not a request")),
-    }
 }
 
 /// The action `request`, the one in the `op/` row `row`, runs: the key every request of
@@ -642,8 +621,23 @@ impl Durable {
         policy: EpochPolicy,
         first: u64,
     ) -> Result<(Self, u64), StateError> {
+        Self::open_with(store, policy, first, Arc::new(KbfLog), Arc::new(KbfRows))
+    }
+
+    /// [`Durable::open`], with the encoding of the row values and the rows of a build
+    /// server given: the keys and the layout of the rows are this handle's, the bytes of
+    /// the values `codec`'s, and `ext` adds its own rows to the transactions.
+    fn open_with(
+        store: Arc<dyn Store>,
+        policy: EpochPolicy,
+        first: u64,
+        codec: Arc<dyn RowCodec>,
+        ext: Arc<dyn Ext>,
+    ) -> Result<(Self, u64), StateError> {
         let durable = Self {
             store,
+            codec,
+            ext,
             unreachable: AtomicBool::new(false),
             fenced: AtomicBool::new(false),
             ops: Mutex::new(0..0),
@@ -662,7 +656,7 @@ impl Durable {
     /// or refuse. It logs nothing: a scan a request makes would repeat it per request.
     fn scan_known(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StateError> {
         let mut rows = self.store.scan_prefix(prefix)?;
-        rows.retain(|(_, row)| !is_unknown(&row.value));
+        rows.retain(|(key, row)| !self.is_unknown(key, &row.value));
         Ok(rows)
     }
 
@@ -670,7 +664,7 @@ impl Durable {
     fn scan_known_logged(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StateError> {
         let mut rows = self.store.scan_prefix(prefix)?;
         rows.retain(|(key, row)| {
-            let unknown = is_unknown(&row.value);
+            let unknown = self.is_unknown(key, &row.value);
             if unknown {
                 tracing::warn!(%key, "a row holds a command this binary does not know: skipped");
             }
@@ -695,7 +689,7 @@ impl Durable {
     pub(super) fn load(&self) -> Result<Stored, StateError> {
         let mut leases = std::collections::BTreeMap::new();
         for (key, row) in self.scan_known_logged(LEASE)? {
-            let grant = lease_row(&key, &row)?;
+            let grant = self.lease_row(&key, &row)?;
             leases.insert(grant.operation, grant);
         }
         let mut losses = std::collections::BTreeMap::new();
@@ -711,12 +705,7 @@ impl Durable {
             let fate = fate::decode(&row.value).map_err(|why| corrupt(&key, why))?;
             fates.insert(operation, fate);
         }
-        let mut subjects = std::collections::BTreeMap::new();
-        for (key, row) in self.store.scan_prefix(SUBJECT)? {
-            let operation = parse_operation(&key, SUBJECT)?;
-            let subject = subject::decode(&row.value).map_err(|why| corrupt(&key, why))?;
-            subjects.insert(operation, subject);
-        }
+        let mut subjects = self.ext.subjects(&*self.store)?;
         let read_size_keys = self.read_size_keys.load(Ordering::SeqCst);
         let mut opkeys = std::collections::BTreeMap::new();
         for (key, row) in self
@@ -754,7 +743,7 @@ impl Durable {
             .filter(|_| read_size_keys)
         {
             let (floor, name) = floor::decode_key(&row.value).map_err(|why| corrupt(&key, why))?;
-            match name.as_deref().map(estimate::parse_key) {
+            match name.as_deref().map(|name| self.ext.summary_key(name)) {
                 Some(Some(summary)) => key_names.push((floor.key, summary)),
                 Some(None) => {
                     tracing::warn!(row = %key, "a key floor names a size summary that does not parse");
@@ -774,7 +763,7 @@ impl Durable {
         }
         let mut operations = Vec::new();
         for (key, row) in self.scan_known_logged(OPERATION)? {
-            let request = request_row(&key, &row)?;
+            let request = self.request_row(&key, &row)?;
             let action = action_of_request(&key, &request)?;
             let operation = parse_operation(&key, OPERATION)?;
             let lease = leases.remove(&operation);
@@ -803,23 +792,12 @@ impl Durable {
     /// The size summaries the store holds. A row that cannot be read is skipped (and
     /// counted in the log): its action starts cold.
     pub(super) fn estimates(&self) -> Result<Vec<Row>, StateError> {
-        let mut rows = Vec::new();
-        for (key, row) in self.store.scan_prefix(ESTIMATE)? {
-            match estimate::decode(&key, &row.value) {
-                Some(row) => rows.push(row),
-                None => tracing::warn!(%key, "a size summary row cannot be read: skipped"),
-            }
-        }
-        Ok(rows)
+        self.ext.estimates(&*self.store)
     }
 
     /// Writes `rows`, size summaries, in one transaction.
     pub(super) fn put_estimates(&self, rows: &[Row]) -> Result<(), StateError> {
-        let mut txn = Txn::new();
-        for (key, summary) in rows {
-            txn = txn.put(estimate::row_key(key), estimate::encode(summary), Cond::Any);
-        }
-        self.commit(txn)
+        self.commit(self.ext.put_estimates(Txn::new(), rows))
     }
 
     /// Deletes the size summaries idle past [`kbf_estimator::STALE_DAYS`] on `today`,
@@ -829,24 +807,7 @@ impl Durable {
     /// for another call. A transaction the store refuses is logged and the rest go on. The scan
     /// reads every row (at most the estimator's key bound) whatever the cap.
     pub(super) fn sweep_estimates(&self, today: Day) -> Result<(usize, bool), StateError> {
-        let mut changes = Vec::new();
-        for (name, row) in self.store.scan_prefix(ESTIMATE)? {
-            let Some((key, summary)) = estimate::decode(&name, &row.value) else {
-                continue;
-            };
-            let mut held = Summaries::default();
-            if held.insert_encoded(&key, &summary).is_err() {
-                continue;
-            }
-            held.expire(today);
-            match held.get(&key) {
-                None => changes.push((name, None, row.version)),
-                Some(kept) if kept.encode() != summary => {
-                    changes.push((name, Some(estimate::encode(&kept.encode())), row.version));
-                }
-                Some(_) => {}
-            }
-        }
+        let changes = self.ext.stale_estimates(&*self.store, today)?;
         let left = changes.len() > SWEEP_TXNS * SWEEP_ROWS;
         let mut changed = 0;
         for chunk in changes.chunks(SWEEP_ROWS).take(SWEEP_TXNS) {
@@ -964,19 +925,14 @@ impl Durable {
         subject: &Subject,
         size_key: Option<u64>,
     ) -> Result<Txn, StateError> {
-        let value = encode(FarmInput::Submit(request.clone()))?;
+        let value = self.codec.submit(request)?;
         let mut txn = Txn::new();
         if let Some(key) = size_key {
             txn = txn.put(opkey_key(operation), opkey::encode(key), Cond::Absent);
         }
-        Ok(txn
-            .put(op_key(operation), value, Cond::Absent)
-            .put(
-                subject_key(operation),
-                subject::encode(subject),
-                Cond::Absent,
-            )
-            .put(queue_key(operation), Vec::new(), Cond::Absent))
+        let txn = txn.put(op_key(operation), value, Cond::Absent);
+        let txn = self.ext.submitted(txn, operation, subject);
+        Ok(txn.put(queue_key(operation), Vec::new(), Cond::Absent))
     }
 
     /// The value of the `keyfloor/` row of `floor`: it names the size summary `summary`
@@ -987,7 +943,7 @@ impl Durable {
         floor: &KeyFloor,
         summary: Option<&kbf_estimator::Key>,
     ) -> Result<Vec<u8>, StateError> {
-        let named = summary.map(estimate::row_key);
+        let named = summary.map(|summary| self.ext.summary_name(summary));
         let name = match named.filter(|n| n.len() <= usize::from(u16::MAX)) {
             Some(name) => Some(name),
             None => self
@@ -1054,14 +1010,14 @@ impl Durable {
         predecessor_stopped: bool,
         reported: &Reported,
     ) -> Result<(), StateError> {
-        let up = FarmInput::WorkerUp {
+        let up = WorkerUp {
             worker: worker.clone(),
             instance: instance.clone(),
             predecessor_stopped,
             capacity: reported.capacity,
             caps: reported.caps.clone(),
         };
-        let value = encode(up)?;
+        let value = self.codec.session(&up)?;
         let key = format!("{SESSION}{worker}");
         let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
         sessions.insert(worker.clone(), value.clone());
@@ -1760,6 +1716,8 @@ impl State {
 
 #[cfg(test)]
 mod blocks_tests;
+#[cfg(test)]
+mod codec_tests;
 #[cfg(test)]
 mod golden_tests;
 #[cfg(test)]
