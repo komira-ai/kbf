@@ -470,6 +470,8 @@ fn the_kinds_list_is_the_key_constants() {
     assert_eq!(sorted.len(), KINDS.len(), "a kind listed twice");
     let mut found = 0;
     for line in include_str!("../durable.rs").lines() {
+        // A constant other store code reuses is `pub(crate)`; it is a key constant all the same.
+        let line = line.strip_prefix("pub(crate) ").unwrap_or(line);
         let Some(rest) = line.strip_prefix("const ") else {
             continue;
         };
