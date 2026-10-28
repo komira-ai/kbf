@@ -183,8 +183,9 @@ fn the_version_names_the_commit_it_was_built_from() {
 }
 
 /// Catches: a start that goes on with a file it cannot use: a missing certificate, an
-/// operator token file others can read, a bad allow-list, a state file that is not a state,
-/// and an address in use each stop it with exit 1 and a reason that names the file or flag.
+/// operator token file others can read, a bad allow-list, an allow-list entry naming a
+/// service that is not defined, a state file that is not a state, and an address in use each
+/// stop it with exit 1 and a reason that names the file or flag.
 #[test]
 fn a_start_with_a_bad_file_or_address_is_refused_with_a_reason() {
     let files = Files::new("bin-refused");
@@ -213,6 +214,16 @@ fn a_start_with_a_bad_file_or_address_is_refused_with_a_reason() {
     assert_eq!(code, 1);
     assert!(
         err.contains("--services-file") && err.contains("nope.toml"),
+        "{err}"
+    );
+
+    let unknown = files.path("unknown.toml");
+    let text = kbf_oidc::testkit::config_text("https://token.example");
+    std::fs::write(&unknown, format!("{text}services = [\"kbf\", \"nope\"]\n")).expect("written");
+    let (code, _, err) = run(&with(&flags, "--oidc-config", &unknown));
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("--oidc-config") && err.contains("nope"),
         "{err}"
     );
 
