@@ -620,7 +620,6 @@ fn a_release_tag_job_gets_no_other_write_scope() {
     );
     for p in [
         "{packages: write}",
-        "{actions: write}",
         "{Contents: write}",
         "{contents: admin}",
         "write-all",
@@ -630,6 +629,11 @@ fn a_release_tag_job_gets_no_other_write_scope() {
             "a job's `permissions`",
         );
     }
+    // `actions: write` is the watch job's scope, gated on a push to main, not on a release.
+    refused(
+        &format!("    runs-on: ubuntu-latest\n{TAG_PUSH_IF}    permissions: {{actions: write}}\n"),
+        &format!("is exactly `{SIGNING_PUSH_ONLY}`"),
+    );
 }
 
 #[test]
