@@ -10,10 +10,18 @@
 # driver by accident. It is kbf's own frontend on js-server-core; the standalone pieces of the
 # jobscheduler repository (js-lease-server, js-agent) are not on the flip path and not here.
 #
-# Red by design until the change that makes a build with that feature accept `--scheduler-core js`
-# lands (cargo cannot even build the feature before that, and a server given the flag refuses to
-# start: crates/kbf-server/src/config.rs, `check_scheduler_core`). The release build keeps
-# refusing js until the flip (W) makes it available.
+# Red by design until two things land:
+#
+# 1. The change that lets release builds start with `--scheduler-core js`. The `farm-core-js`
+#    feature itself is komira-ai/kbf#1870; until a build with the feature can start the js core,
+#    a server given the flag refuses to start (crates/kbf-server/src/config.rs,
+#    `check_scheduler_core`). That change is not open yet.
+# 2. A server that reports its ACTUAL core. The gate requires the start line `scheduler core: js`
+#    and `kbf_scheduler_core{core="js"} 1` on /metrics. Today the gauge is a constant: metrics.rs
+#    renders `SchedulerCore::RUNNING`, which is the legacy core whatever the server was started
+#    with, so /metrics says `core="legacy"` even on a js farm and this gate can never pass. The
+#    flip must derive both the start line and the gauge from the farm's running driver. This
+#    workflow changes no server code.
 #
 # Not part of the pipeline yet, on purpose. A job of beta.yml or of pipeline.yml that is red
 # stops every release (no `continue-on-error` is allowed in either: tests/beta_succeeds,
@@ -22,16 +30,25 @@
 # touches the flip path (js-core-gate-pr.yml, which calls this file), or by hand, and it is
 # listed in release/stages.yml as a job of the beta stage so the stage lint keeps it honest.
 #
-# W makes it release-blocking by adding this caller job to pipeline.yml (and the stage row
-# `pipeline.yml#js-core-gate`, stage beta, to release/stages.yml), next to `beta`:
+# The flip (the change that makes the js core the farm's default) makes it release-blocking
+# without losing the pull-request check:
 #
-#   js-core-gate:
-#     needs: [artifacts]
-#     uses: ./.github/workflows/js-core-gate.yml
-#     permissions:
-#       contents: read
-#
-# and then deletes js-core-gate-pr.yml, which only exists to run it before that.
+#   - pipeline.yml gains, after `beta`, the caller job
+#       js-core-gate:
+#         needs: [beta]
+#         uses: ./.github/workflows/js-core-gate.yml
+#         permissions:
+#           contents: read
+#     (`needs: [beta]` because the pipeline lint requires each job to need exactly the one
+#     before it, and its jobs to be exactly ci, artifacts, beta, js-core-gate; each job also
+#     needs its own permissions block, which is `contents: read` here).
+#   - release/stages.yml gains the row `pipeline.yml#js-core-gate`, stage beta.
+#   - tests/pipeline_workflow (mod.rs: JOBS, STAGES, Files, called, each_check_once; tests.rs:
+#     real, plant, and a case for the new job) learns the fourth stage. The ready-to-apply diff
+#     is in the description of komira-ai/kbf#1867.
+#   - js-core-gate-pr.yml is NOT deleted. It stays, and its check `gate / m1-cell-js` is made a
+#     required status check of main next to the pipeline job, so a pull request still runs the
+#     gate before it merges (the pipeline only runs after a push to main).
 #
 # Same hosted-runner, pinning and permission rules as the other workflows
 # (crates/kbf-integration-test/tests/repo_lints.rs). The pins are copies of m1-cell's.

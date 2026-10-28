@@ -115,8 +115,8 @@ jobs:
     stage: beta
   - job: beta.yml#mixed-version
     stage: beta
-  # Red until the flip's change lands, so it is a check of its own (js-core-gate-pr.yml calls it) and
-  # pipeline.yml does not call it yet; the flip adds `pipeline.yml#js-core-gate` (js-core-gate.yml says how).
+  # Red until the change that makes the js core the farm's default lands, so it is a check of its own (js-core-gate-pr.yml calls it) and
+  # pipeline.yml does not call it yet; that change adds `pipeline.yml#js-core-gate` (js-core-gate.yml says how).
   - job: js-core-gate.yml#m1-cell-js
     stage: beta
   - job: release.yml#plan
