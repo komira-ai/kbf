@@ -668,6 +668,8 @@ fn from_record(r: proto::ControlRecord) -> Result<ControlRecord, DecodeError> {
                 lease: required_lease_id(g.lease, "LeaseGrant.lease")?,
                 operation: OperationId(g.operation),
                 worker: WorkerId::new(g.worker),
+                // The record keeps no cost.
+                cost: Default::default(),
             }),
             Record::Result(r) => ControlRecord::Result(ResultRecord {
                 lease: required_lease_id(r.lease, "ResultRecord.lease")?,

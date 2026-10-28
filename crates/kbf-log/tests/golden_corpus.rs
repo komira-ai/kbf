@@ -126,6 +126,7 @@ fn input_rows() -> Vec<(&'static str, LogCommand)> {
         lease: lease(1, 2),
         operation: OperationId(3),
         worker: w("w"),
+        cost: Default::default(),
     };
     let result = ResultRecord {
         lease: lease(1, 2),
