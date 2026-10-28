@@ -9,9 +9,7 @@
 //! metric. A floor is the crate's current coverage, floored to hundredths of a
 //! percent; it may only rise: `kbf-coverage raise` ([`raise`]) lifts floors to what a
 //! run measured and never adds or lowers one, and `kbf-coverage no-lowering` fails a
-//! pull request whose floors file is lower anywhere than its base's. When CI splits the
-//! tests over shards, `kbf-coverage merge` ([`merge`]) first adds the shards' tracefiles
-//! into the one a single run would have written, and the gate reads that.
+//! pull request whose floors file is lower anywhere than its base's.
 //!
 //! Percentages are floored to hundredths ([`Percent`]), so one uncovered line in a
 //! large crate shows as 99.99%, never as a rounded-up 100.00%. The gate compares in
@@ -20,7 +18,6 @@
 pub mod floors;
 pub mod gate;
 pub mod lcov;
-pub mod merge;
 pub mod raise;
 pub mod renames;
 

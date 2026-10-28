@@ -1,8 +1,7 @@
 //! `kbf-coverage`: prints per-crate line and branch coverage from an lcov tracefile and
 //! checks it against the 99% gate and the `coverage-floors` file (`check`, also the
 //! default when no subcommand is named), lifts floors to a measurement (`raise`), or
-//! checks that a floors file lowers none of its base's (`no-lowering`), or adds the
-//! tracefiles of sharded test runs into one (`merge`). See the library
+//! checks that a floors file lowers none of its base's (`no-lowering`). See the library
 //! docs.
 //!
 //! Exit status: 0 when every crate passes (`check`), the floors were written or need
@@ -17,7 +16,7 @@ use std::process::ExitCode;
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use kbf_coverage::floors::{self, Floors};
-use kbf_coverage::{CrateCoverage, gate, lcov, merge, raise, renames};
+use kbf_coverage::{CrateCoverage, gate, lcov, raise, renames};
 
 /// Per-crate coverage table and gate. With no subcommand, the flags are `check`'s.
 #[derive(Debug, Parser)]
@@ -37,23 +36,6 @@ enum Command {
     Raise(RaiseArgs),
     /// Fail when a floors file has a lower threshold anywhere than its base's.
     NoLowering(NoLoweringArgs),
-    /// Add the tracefiles of sharded test runs into the one a single run would write.
-    Merge(MergeArgs),
-}
-
-#[derive(Debug, Args)]
-struct MergeArgs {
-    /// A directory holding one subdirectory per shard, each with an `lcov.info` (as
-    /// `actions/download-artifact` lays out one artifact per shard).
-    #[arg(long)]
-    dir: PathBuf,
-    /// How many shards there must be. Fewer or more is refused, so a shard whose
-    /// tracefile never arrived cannot be left out of the total unnoticed.
-    #[arg(long)]
-    expect: usize,
-    /// The merged tracefile to write.
-    #[arg(long)]
-    out: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -115,7 +97,6 @@ fn main() -> ExitCode {
         (Some(Command::Check(args)), _) | (None, Some(args)) => check(&args),
         (Some(Command::Raise(args)), _) => run_raise(&args),
         (Some(Command::NoLowering(args)), _) => no_lowering(&args),
-        (Some(Command::Merge(args)), _) => run_merge(&args),
         (None, None) => Cli::command()
             .error(
                 clap::error::ErrorKind::MissingRequiredArgument,
@@ -259,37 +240,4 @@ fn no_lowering(args: &NoLoweringArgs) -> Result<bool, Box<dyn Error>> {
         eprintln!("  {l}");
     }
     Ok(false)
-}
-
-/// Adds the tracefiles under `--dir` into `--out`.
-fn run_merge(args: &MergeArgs) -> Result<bool, Box<dyn Error>> {
-    let entries =
-        std::fs::read_dir(&args.dir).map_err(|e| format!("read {}: {e}", args.dir.display()))?;
-    let mut files: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path().join("lcov.info"))
-        .filter(|f| f.is_file())
-        .collect();
-    files.sort();
-    if files.len() != args.expect {
-        return Err(format!(
-            "{} holds {} shard tracefile(s) (<shard>/lcov.info), expected {}",
-            args.dir.display(),
-            files.len(),
-            args.expect
-        )
-        .into());
-    }
-    let mut inputs = Vec::new();
-    for f in &files {
-        inputs.push((f.display().to_string(), read(f)?));
-    }
-    let merged = merge::merge(&inputs)?;
-    std::fs::write(&args.out, merged).map_err(|e| format!("write {}: {e}", args.out.display()))?;
-    println!(
-        "kbf-coverage merge: {} tracefile(s) into {}",
-        files.len(),
-        args.out.display()
-    );
-    Ok(true)
 }

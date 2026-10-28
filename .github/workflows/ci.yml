@@ -35,8 +35,8 @@ env:
   # Incremental artifacts only bloat a cached target directory (rust-cache set this too).
   CARGO_INCREMENTAL: 0
   # How many parts the fast tests run in (nextest `--partition`): the matrix of `test-shard` lists
-  # exactly 1 to this number, and `test` expects this many tracefiles to merge, so a shard missing
-  # from the matrix fails the merge instead of leaving its tests out of the coverage.
+  # exactly 1 to this number. The last part reports on all of them and waits for the others' raw
+  # profiles, so a part missing from the matrix leaves the report to nobody and fails `test`.
   SHARDS: 3
 
 jobs:
@@ -128,9 +128,11 @@ jobs:
   # One part of the fast tests and its coverage: the `pr` profile of .config/nextest.toml (every
   # test but the slow ones, which beta.yml runs) under cargo-llvm-cov, the part being a third of
   # the tests (`--partition count:<n>/3`, the matrix's `shard`). Every part builds the same
-  # instrumented workspace and writes its own tracefile; the `test` job below merges them and
-  # holds the gate. The fast set includes the Postgres tests (a throwaway server per part,
-  # below): no S3, crun, root or Mac test is in it.
+  # instrumented workspace and runs its share. A line's coverage is not the sum of the parts' lcov
+  # reports (llvm-cov counts a line once for each function it is in), so the parts' raw profiles
+  # are what is added up: the others upload theirs, and the last part waits for them, puts them
+  # beside its own and makes the one report; the `test` job below gates it. The fast set includes
+  # the Postgres tests (a throwaway server per part, below): no S3, crun, root or Mac test is in it.
   # Branch coverage (`--branch`, rustc's `-Zcoverage-options=branch`) is unstable, so this
   # job alone builds with a pinned nightly; every other job stays on the toolchain in
   # rust-toolchain.toml. The nightly may warn where stable does not, so `-D warnings` is off
@@ -140,6 +142,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # `cargo xtask wait-artifacts` lists the run's jobs and artifacts.
+      actions: read
     # Every part runs to its end, so a run reports the failures of all of them at once.
     strategy:
       fail-fast: false
@@ -168,6 +172,9 @@ jobs:
       NEXTEST_VERSION: 0.9.146
       NEXTEST_SHA256: 682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428
       SHARD: ${{ matrix.shard }}
+      # The file name of a raw profile: the part's number in it keeps the parts' files apart when
+      # the last part puts them in one directory (the process id alone repeats between machines).
+      LLVM_PROFILE_FILE_NAME: kbf-part${{ matrix.shard }}-%p-%4m.profraw
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -265,14 +272,39 @@ jobs:
         run: du -xhd 2 target
       # No step below runs Postgres tests on their own: they are in the run above, which
       # fails any of them when KBF_TEST_POSTGRES_URL (set for the job) names no server.
-      - name: Report (this part's tracefile)
+      - name: Upload this part's raw profiles
+        if: ${{ format('{0}', matrix.shard) != env.SHARDS }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: profraw-part-${{ matrix.shard }}
+          path: target/llvm-cov-target/kbf-part${{ matrix.shard }}-*.profraw
+          if-no-files-found: error
+          retention-days: 1
+      # The last part, from here on. It fails at once when another part failed, and otherwise waits
+      # for the others' uploads (a part that finishes a few minutes later is the usual case).
+      - name: Wait for the other parts' raw profiles
+        if: ${{ format('{0}', matrix.shard) == env.SHARDS }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask wait-artifacts --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" --artifact-prefix profraw-part- --job-prefix test-shard --of "$SHARDS"
+      # Into the directory `llvm-cov report` merges every `*.profraw` of.
+      - name: Download the other parts' raw profiles
+        if: ${{ format('{0}', matrix.shard) == env.SHARDS }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: profraw-part-*
+          path: target/llvm-cov-target
+          merge-multiple: true
+      - name: Report (all the parts' coverage)
+        if: ${{ format('{0}', matrix.shard) == env.SHARDS }}
         env:
           LLVM_COV_FLAGS: -skip-functions
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov report --branch --lcov --output-path target/coverage/lcov.info
-      # Each part's tracefile, for the merge in the `test` job.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - name: Upload the tracefile
+        if: ${{ format('{0}', matrix.shard) == env.SHARDS }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: coverage-shard-${{ matrix.shard }}
+          name: coverage
           path: target/coverage/lcov.info
           if-no-files-found: error
       # and the cache it saves holds none of this run's workspace coverage artifacts either; one part
@@ -288,16 +320,15 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
-  # The merge and the gate, under the name `test` that the required check has always had. It
-  # needs every part and is not skipped when one fails (`if: !cancelled()`): GitHub counts a job
-  # skipped for a failed `needs` as passing a required check, so the first step fails the job
-  # itself when any part did not succeed. Then, with the nightly toolchain that built the parts
-  # (so its `kbf-coverage` is built as before; no llvm-tools and no instrumented build here),
-  # `kbf-coverage merge` adds the parts' tracefiles into the one a single run of the fast tests
-  # would have written and the gate reads that: every crate must reach 99.00% of lines and
-  # 99.00% of branches, or the floor its line in `coverage-floors` (crates/kbf-coverage) lists
-  # for it (the crates under 99% today, each with an open issue). A floor may only rise: the
-  # last step fails a pull request whose file lowers one.
+  # The gate, under the name `test` that the required check has always had. It needs every part
+  # and is not skipped when one fails (`if: !cancelled()`): GitHub counts a job skipped for a
+  # failed `needs` as passing a required check, so the first step fails the job itself when any
+  # part did not succeed. Then it reads the tracefile the last part made from all the parts and
+  # checks it, with the nightly toolchain that built them (so `kbf-coverage` is built as before; no
+  # llvm-tools and no instrumented build here): every crate must reach 99.00% of lines and 99.00%
+  # of branches, or the floor its line in `coverage-floors` (crates/kbf-coverage) lists for it
+  # (the crates under 99% today, each with an open issue). A floor may only rise: the last step
+  # fails a pull request whose file lowers one.
   test:
     needs: test-shard
     if: ${{ !cancelled() }}
@@ -320,16 +351,12 @@ jobs:
       - run: rustup toolchain install "$COVERAGE_TOOLCHAIN" --profile minimal
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: coverage-shard-*
-          path: shards
-      # Refuses a directory that does not hold exactly SHARDS tracefiles, tracefiles that do not
-      # list the same lines and branches, and a tracefile whose totals disagree with its lines.
-      - name: Merge the parts' coverage
-        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- merge --dir shards --expect "$SHARDS" --out lcov.info
+          name: coverage
+          path: coverage
       # Fails when a crate is under its threshold; floors that could rise are printed in
       # the log and the job summary (`kbf-coverage raise` lifts them) and do not fail.
       - name: Per-crate table and 99% gate
-        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- --lcov lcov.info --root "$GITHUB_WORKSPACE" --floors coverage-floors --summary-file "$GITHUB_STEP_SUMMARY"
+        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- --lcov coverage/lcov.info --root "$GITHUB_WORKSPACE" --floors coverage-floors --summary-file "$GITHUB_STEP_SUMMARY"
       # The base's floors file, checked out beside this one; a base without one (the change
       # that adds the file) has nothing to compare, and the step says so.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -343,9 +370,3 @@ jobs:
       - name: Floors are not lower than the base's
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base-ref HEAD^1 --base base/coverage-floors --floors coverage-floors
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ !cancelled() }}
-        with:
-          name: coverage
-          path: lcov.info
-          if-no-files-found: error

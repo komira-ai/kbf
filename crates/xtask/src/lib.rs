@@ -8,6 +8,9 @@
 //!   advisories`, kept in one GitHub issue (opened, updated, or commented on and closed when
 //!   none remain) instead of failing a pull request. Exit 0 whatever it found; 1 when
 //!   cargo-deny or `gh` failed. `advisories.yml` runs it daily and on every push to `main`.
+//! - `wait-artifacts --repo <owner/repo> --run-id <id> --artifact-prefix <p> --job-prefix <p> --of <n>`
+//!   ([`wait_artifacts`]): the last part of the split coverage run waits until the other `n - 1` parts
+//!   have uploaded their artifacts (exit 1 when one of them failed, or the looks ran out).
 //! - `release farm-version --repo <owner/repo> --tag <tag> --commit <sha> [--output <file>]`
 //!   ([`release::farm_version`]): the version text the farm is told to converge on,
 //!   `<version>+g<12 hex digits of the commit>` as the hosts report it, read from the release's
@@ -136,6 +139,7 @@ pub mod runner_disk;
 pub mod sudo_test;
 pub mod sums;
 pub mod version_facts;
+pub mod wait_artifacts;
 
 /// Why a verb failed.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -189,6 +193,8 @@ enum Verb {
     BuildCommit(BuildCommit),
     /// Keep the advisories `cargo deny` reports in one GitHub issue.
     Advisories(advisories::Args),
+    /// Wait until the other parts of a split job have uploaded their artifacts.
+    WaitArtifacts(wait_artifacts::Args),
     /// Set a published release as the farm's desired version on the update coordinator and
     /// wait for the farm to converge.
     DeployFarm(deploy_farm::Args),
@@ -1002,6 +1008,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             root: &root,
         }),
         Verb::Advisories(args) => advisories::run(&args, &root, &cargo_program()),
+        Verb::WaitArtifacts(args) => wait_artifacts::run(&args, &root, &cargo_program()),
         Verb::DeployFarm(args) => deploy_farm::run(&args),
         Verb::ProveFarm(args) => prove_farm::run(&args),
         Verb::RunnerDisk(args) => runner_disk::run(&args),
