@@ -189,6 +189,7 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
+    args.check_scheduler_core()?;
     let stores = args.stores(&Statvfs)?;
     for line in stores.describe() {
         tracing::info!("{line}");
@@ -272,6 +273,7 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
+    args.check_scheduler_core()?;
     assemble(args, hot, meta, store, prefix, log, shutdown, None).await
 }
 
@@ -293,6 +295,7 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
+    tracing::info!("{}", args.scheduler_core.start_line());
     args.retired_release.warn();
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
