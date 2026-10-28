@@ -217,11 +217,23 @@ the list:
 
 `{id}` is the node id as `POST /v1/nodes/{node}:cordon` takes it, percent-encoded as one
 path segment. `404` with `{"error": "no_node"}` for a node that has not registered since
-this server started, and for an id that ends in `:cordon`, `:drain` or `:uncordon`: that
+this server started and that no frontend of its state store holds, and for an id that ends in
+`:cordon`, `:drain` or `:uncordon`: that
 is a write's path, and a read of it is never a node (an id that holds another colon,
 `host:8080`, is read as it is). A path below the node (`/v1/nodes/{id}/...`) is `404`.
 The node's recent failed runs are not here: they are `GET /v1/runs?node=` with
 `--history-objects`.
+
+With a state store, a cordon or drain written through another frontend is read at once,
+wherever the read lands: the server takes up the store's `cordon/` rows before it answers.
+A node connected to another frontend of the store is answered from the store: `placement` is
+its `cordon/` row (a drain with no lease left reads as `drained`; the store does not say
+whether a drain paused), `leases` and `lease_count` are the leases the store records on it,
+`connected` is `false`, and `protocol`, `software`, `booked`, `capacity` and `free` are empty
+(they are the other frontend's to say). `503` when that store cannot be read, and when the
+store cannot say who holds a node that is not connected to the frontend answering: never "no
+such node", and never the node with no lease. A node connected to the frontend answering is
+answered from that frontend while its store cannot be read.
 
 ## Own-node calls of a host's updater
 
@@ -339,8 +351,18 @@ An operator takes a node out of placement, drains it, or returns it
 - `:uncordon` (`POST /v1/nodes/{node}:uncordon`): returns the node to placement and ends any drain.
 
 The answer is the node, as `GET /v1/nodes` lists it, after the action. `404` for a
-node that never registered or an unknown verb, `400` for a drain body of another
-shape, and `401`, `403` or `415` from the gates of [Who may write](#who-may-write).
+node that no frontend of the state store has held or an unknown verb, `400` for a drain body of
+another shape, and `401`, `403` or `415` from the gates of [Who may write](#who-may-write).
+
+With a state store, a node connected to another frontend is placed through the row the
+action writes under `cordon/`, which the node's own frontend applies. `503` when the store
+cannot say whether another frontend holds a node that is not connected to the frontend
+answering (never `404`), and when the store does not take the row. In both the action is not
+applied: the row is written first, and the frontend's own scheduler follows it, so a node
+connected to the answering frontend keeps the placement it had. A `503` that follows a write
+the store did take despite the error can leave the row; read the node to see where it stands.
+The same holds for the updater's own-node `:drain` and `:uncordon` below, which a host's
+updater takes as a failed call, not as "no daemon here".
 
 A cordon names the node, not its stream: a node that reconnects (say, after a reboot)
 is still cordoned. Work that only cordoned nodes could run waits, and its callers are
@@ -1504,6 +1526,7 @@ caller goes away before the answer counts as an error.
 | `kbf_execute_dir_cache_hits_total`, `kbf_execute_dir_cache_misses_total`, `kbf_execute_dir_cache_merged_total` | counters | the content cache of decoded Directories behind those checks (128 MiB, least recently used out first, shared by every Execute; content is addressed by digest so it never goes stale). Hits: Directories a check took without reading, from the cache or from a read another check had open. Misses: reads a check led. Merged: of the hits, those another check's read supplied. A cached Directory is never taken for held: its digest goes to FindMissing with the check's files (`kbf_execute_dir_cache_present_checked_total` counts them), and one the store reports missing is an absent input, as for a Directory that cannot be read |
 | `kbf_execute_dir_cache_present_checked_total` | counter | cached Directories whose digests a check put to FindMissing to confirm the store still holds them (each costs a digest in a call the files already make, not a read) |
 | `kbf_execute_dir_cache_evictions_total`, `kbf_execute_dir_cache_bytes` | counter, gauge | decoded Directories pushed out of the content cache to stay within its byte bound, and the bytes it held at the end of the last check (about 1 MB for a 1000-Directory, 15k-file tree). Evictions climbing with the same trees walked again means the bound is too small for the working set |
+| `kbf_scheduler_core{core}` | gauge | the scheduler core the server runs (`--scheduler-core`): one series per core, 1 for the one running and 0 for the other. Only `legacy` is available; a server started with `--scheduler-core js` refuses to start |
 | `kbf_execute_submit_seconds`, `kbf_sched_lock_wait_seconds` | histogram | the scheduler's submit called from an Execute, and the part of it spent waiting for the scheduler's lock |
 | `kbf_sched_queued`, `kbf_sched_leases` | gauge | operations waiting for a lease, and leases granted or running on all nodes, as of the last submit or scheduler tick (at most a tick old) |
 | `kbf_bytes_in_flight`, `kbf_bytes_in_flight_peak` | gauge, gauge | bytes this process holds in memory for requests in flight now (a ByteStream Write's receive buffer or the message in hand, a Read's window, a BatchUpdateBlobs's blobs, a Segments upload's buffer, and the same on a storage node's Write), and the most it has held at once since the process started (never reset). Counted from the allocation of a buffer until the last reference to it is dropped, however the request ended. Not counted: the segment writer's own buffer, the object store's and write tier's internals, and gRPC's copies of a message. Always printed. The daemon does not serve `/metrics` yet |

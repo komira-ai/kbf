@@ -21,12 +21,12 @@ impl Farm {
         counts: Option<PackWriteCounts>,
     ) {
         let mut state = self.lock();
-        if !state.is_current(worker, stream) {
+        if !state.side.is_current(worker, stream) {
             return;
         }
         match counts {
-            Some(counts) => state.pack_writes.insert(worker.clone(), counts),
-            None => state.pack_writes.remove(worker),
+            Some(counts) => state.side.pack_writes.insert(worker.clone(), counts),
+            None => state.side.pack_writes.remove(worker),
         };
     }
 
@@ -35,6 +35,7 @@ impl Farm {
     pub fn pack_writes(&self) -> Vec<(WorkerId, PackWriteCounts)> {
         let state = self.lock();
         state
+            .side
             .pack_writes
             .iter()
             .map(|(worker, counts)| (worker.clone(), *counts))

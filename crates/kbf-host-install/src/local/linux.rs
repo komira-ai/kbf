@@ -36,7 +36,7 @@ use kbf_host::exec::Exec;
 use kbf_host::path::Root;
 use kbf_host::step::Owner;
 use kbf_installer::activate::{self, Activated, Arm};
-use kbf_installer::attest::GhCheck;
+use kbf_installer::attest::{GhCheck, Signer};
 use kbf_installer::helper::leases::LeaseSource;
 use kbf_installer::layout::{Layout, Platform};
 use kbf_installer::refusal::Refusal as InstallerRefusal;
@@ -53,8 +53,9 @@ use sha2::{Digest, Sha256};
 use super::backend::{Backend, Fault, Pending};
 use super::units::restart_and_wait;
 use crate::host::Host;
-use crate::mac::channel::{MacAllowlist, Source};
+use crate::mac::channel::{ChannelError, MacAllowlist, Source};
 use crate::mac::fetch::{AssetKind, FetchError, Fetcher, Limits};
+use crate::mac::release::Origin;
 use crate::mac::stage::read_token;
 use crate::outcome::Refusal;
 use crate::plan::Wait;
@@ -189,6 +190,8 @@ pub(super) struct Prepared {
     /// The token of the channel for the GitHub API, if it names one.
     pub(super) token: Option<String>,
     pub(super) settings: Settings,
+    /// The repository, signer workflow and file names of the channel's releases.
+    pub(super) origin: Origin,
     /// The unprivileged user the fetch runs as.
     pub(super) who: Identity,
     /// The channel's pinned sums, if it has some.
@@ -203,6 +206,29 @@ pub(super) fn config_fault(refusal: Refusal) -> Fault {
         _ => Code::ConfigInvalid,
     };
     Fault::refused(code, format!("the allowlist: {}", refusal.code()))
+}
+
+/// The refusal of a channel, as the socket tells it: the words name an untrusted repository.
+pub(crate) fn channel_fault(error: ChannelError) -> Fault {
+    let code = match error.refusal() {
+        Refusal::ChannelNotAllowed => Code::ChannelNotAllowed,
+        Refusal::ConfigUnsafe | Refusal::KeyUntrusted => Code::ConfigUnsafe,
+        _ => Code::ConfigInvalid,
+    };
+    Fault::refused(code, error.to_string())
+}
+
+/// `settings` with the signers of `origin` as the ones an attestation may name.
+pub(crate) fn signed_by(mut settings: Settings, origin: &Origin) -> Settings {
+    settings.signers = origin
+        .signers()
+        .into_iter()
+        .map(|(repo, workflow)| Signer {
+            repo: repo.to_owned(),
+            workflow: workflow.to_owned(),
+        })
+        .collect();
+    settings
 }
 
 impl<E: Exec> Linux<E> {
@@ -254,7 +280,7 @@ impl<E: Exec> Linux<E> {
         })?;
         let trust: &Trust = &self.host.trust;
         let allowlist = MacAllowlist::load(trust, &self.allowlist).map_err(config_fault)?;
-        let channel = allowlist.channel(trust, channel).map_err(config_fault)?;
+        let channel = allowlist.channel(trust, channel).map_err(channel_fault)?;
         let Source::Github { token_file } = &channel.source else {
             return Err(Fault::refused(
                 Code::ConfigInvalid,
@@ -269,9 +295,10 @@ impl<E: Exec> Linux<E> {
             |e: InstallerRefusal| Fault::refused(Code::VerifyFailed, e.to_string());
         let settings = {
             let settings = Settings::load(&*self.trust, &self.layout).map_err(verify_refused)?;
-            settings
+            let settings = settings
                 .narrowed_to(std::slice::from_ref(&channel.source_ref))
-                .map_err(|e| Fault::refused(Code::ConfigInvalid, e.to_string()))?
+                .map_err(|e| Fault::refused(Code::ConfigInvalid, e.to_string()))?;
+            signed_by(settings, &channel.origin)
         };
         GhCheck::pinned(&self.layout, &settings)
             .check_trust(&*self.trust)
@@ -284,6 +311,7 @@ impl<E: Exec> Linux<E> {
             prefix: prefix.to_owned(),
             token,
             settings,
+            origin: channel.origin,
             who,
             sums: channel.sums,
         })
@@ -296,7 +324,7 @@ impl<E: Exec> Linux<E> {
         let result = self.download_and_verify(
             &prepared.prefix,
             prepared.token.as_deref(),
-            &prepared.settings,
+            (&prepared.settings, &prepared.origin),
             prepared.who,
             &scratch,
         );
@@ -308,7 +336,7 @@ impl<E: Exec> Linux<E> {
         &self,
         prefix: &str,
         token: Option<&str>,
-        settings: &Settings,
+        (settings, origin): (&Settings, &Origin),
         who: Identity,
         scratch: &Path,
     ) -> Result<String, Fault> {
@@ -316,6 +344,7 @@ impl<E: Exec> Linux<E> {
         let gh = self.layout.join(&self.layout.gh());
         let home = scratch.join("home");
         let fetcher = Fetcher {
+            origin,
             platform: &platform,
             asset: AssetKind::Tarball,
             runner: &*self.runner,
@@ -335,8 +364,8 @@ impl<E: Exec> Linux<E> {
         let id = commit_id(&commit)?;
         let partial = Partial::create(&self.layout, &id, self.owner)
             .map_err(|e| Fault::failed(Code::StageFailed, e.to_string()))?;
-        let tarball_name = crate::mac::release::tarball_name_on(&platform, &commit);
-        let bundle_name = crate::mac::release::bundle_name_on(&platform, &commit);
+        let tarball_name = AssetKind::Tarball.name_on(origin.prefix(), &platform, &commit);
+        let bundle_name = crate::mac::release::bundle_of(&tarball_name);
         let target = partial.dl().join("kbf.tar.gz");
         let copied = copy_hashing(
             &scratch.join(&tarball_name),

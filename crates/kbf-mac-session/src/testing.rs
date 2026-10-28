@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::autologin::CommandOutput;
-use crate::helper::{Account, Host, LiveProcess, NewUser};
+use crate::helper::{Account, Host, LiveProcess, NewUser, Process};
 
 /// The fake clock's time.
 pub(crate) const NOW: u64 = 1_800_000_000;
@@ -42,7 +42,7 @@ pub(crate) struct State {
     pub(crate) pauses: usize,
     /// Calls that fail, by name ("uid_taken", "make_home", "create_user",
     /// "delete_user", "domain_exists", "bootout gui", "kill_all", "live_processes",
-    /// "command", "reset_password", "boot_session", "account").
+    /// "command", "reset_password", "boot_session", "account", "processes", "kill_group").
     pub(crate) fail: BTreeSet<&'static str>,
     /// What `command` answers, by the command's text (`program arg ...`). A command
     /// with no answer succeeds and prints nothing, except `fdesetup isactive`, which
@@ -63,6 +63,13 @@ pub(crate) struct State {
     pub(crate) enforce_uchg: bool,
     /// The paths `chflags` has set `uchg` on.
     pub(crate) immutable: BTreeSet<PathBuf>,
+    /// The process table `processes` shows (for `role-reap`).
+    pub(crate) table: Vec<Process>,
+    /// How many more `processes` calls succeed before every one fails; `None` for no
+    /// such limit.
+    pub(crate) tables_ok: Option<usize>,
+    /// How many more `kill_group` calls leave their group alive.
+    pub(crate) stubborn_groups: usize,
     /// The launchd domains that exist (`gui/<uid>` once a login has completed).
     pub(crate) domains: BTreeSet<String>,
 }
@@ -282,6 +289,29 @@ impl Host for FakeHost {
             .boot
             .clone()
             .unwrap_or_else(|| "boot-2".to_owned()))
+    }
+
+    fn processes(&self) -> io::Result<Vec<Process>> {
+        self.call("processes", "processes".to_owned())?;
+        let mut state = self.state();
+        if let Some(left) = &mut state.tables_ok {
+            if *left == 0 {
+                return Err(io::Error::other("processes ran out"));
+            }
+            *left -= 1;
+        }
+        Ok(state.table.clone())
+    }
+
+    fn kill_group(&self, pgid: i32) -> io::Result<()> {
+        self.call("kill_group", format!("kill_group {pgid}"))?;
+        let mut state = self.state();
+        if state.stubborn_groups > 0 {
+            state.stubborn_groups -= 1;
+        } else {
+            state.table.retain(|process| process.pgid != pgid);
+        }
+        Ok(())
     }
 
     fn pause(&self) {

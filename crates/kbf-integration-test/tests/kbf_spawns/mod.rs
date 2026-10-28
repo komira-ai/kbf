@@ -179,9 +179,9 @@ pub const HOST_PATH_ALLOWANCE: &[(&str, usize, &str)] = &[
         "asserts the default of `api-token-file` as a `Path` value; nothing is opened",
     ),
     (
-        "crates/kbf-host-install/tests/update_rehearsal.rs",
+        "crates/kbf-host-install/tests/rehearsal/mod.rs",
         1,
-        "the update rehearsal lays out and updates the real host layout on purpose: root, \
+        "the update rehearsals lay out and update the real host layout on purpose: root, \
          `#[ignore]`, run only through `cargo xtask sudo-test` on a throwaway hosted runner",
     ),
 ];

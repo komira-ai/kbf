@@ -9,6 +9,7 @@
 
 use std::time::Duration;
 
+use kbf_sim::golden::GoldenFile;
 use kbf_sim::{Chance, Event, Faults, Node, NodeId, NodeInput, Output, Partition, Sim, TraceHash};
 use kbf_types::{Effect, FarmTime, StateMachine};
 
@@ -22,7 +23,7 @@ enum Protocol {
     Acked,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum Msg {
     /// Increment number `seq` (1-based).
     Inc { seq: u64 },
@@ -124,6 +125,13 @@ impl StateMachine for Counter {
 impl Node for Counter {
     type Msg = Msg;
 
+    fn trace_msg(msg: &Msg) -> String {
+        match msg {
+            Msg::Inc { seq } => format!("inc(seq={seq})"),
+            Msg::Ack { seq } => format!("ack(seq={seq})"),
+        }
+    }
+
     fn take_outputs(&mut self) -> Vec<Output<Msg>> {
         std::mem::take(&mut self.out)
     }
@@ -214,4 +222,49 @@ fn acked_counter_survives_seeded_partitions_and_lossy_links() {
         let out = run(seed, Protocol::Acked, lossy(), true);
         assert!(!out.diverged(), "seed {seed}: {out:?}");
     }
+}
+
+fn golden() -> GoldenFile {
+    GoldenFile::new(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/trace-hashes.txt"),
+        "counter",
+        "cargo test -p kbf-sim -- --ignored regenerate_golden_hashes",
+    )
+}
+
+/// The counter under both protocols, a perfect network and a lossy one, a few seeds
+/// each.
+fn golden_runs() -> Vec<(String, TraceHash)> {
+    let mut runs = Vec::new();
+    for seed in 0..3 {
+        let cases = [
+            (
+                "fire-and-forget-partitioned",
+                Protocol::FireAndForget,
+                Faults::default(),
+            ),
+            ("acked-lossy-partitioned", Protocol::Acked, lossy()),
+        ];
+        for (name, protocol, faults) in cases {
+            runs.push((
+                format!("{name}/seed-{seed}"),
+                run(seed, protocol, faults, true).hash,
+            ));
+        }
+    }
+    runs
+}
+
+/// Catches: a kernel or trace-format change that moves the counter's traces without
+/// anyone meaning it to (see `GoldenFile`).
+#[test]
+fn counter_runs_match_their_golden_hashes() {
+    golden().assert_matches(&golden_runs());
+}
+
+/// Rewrites this file's lines of `tests/golden/trace-hashes.txt`.
+#[test]
+#[ignore = "regenerates the golden trace hashes; run it only on purpose"]
+fn regenerate_golden_hashes() {
+    golden().regenerate(&golden_runs()).unwrap();
 }

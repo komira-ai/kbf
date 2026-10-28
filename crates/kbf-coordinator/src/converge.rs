@@ -69,6 +69,9 @@ pub struct Convergence {
     pub state: State,
     /// The counts of every role that has a host, in role order.
     pub roles: Vec<RoleCounts>,
+    /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]): what a client
+    /// compares with a release before it orders one.
+    pub commit: &'static str,
 }
 
 fn failed_to_reach(host: &Host, desired: &Desired) -> bool {
@@ -113,6 +116,7 @@ pub fn converge(desired: Option<&Desired>, fleet: &Fleet, now: Duration) -> Conv
             quiet,
             state: State::InProgress,
             roles: Vec::new(),
+            commit: crate::BUILD_COMMIT,
         };
     };
     let roles: Vec<RoleCounts> = HostRole::ALL
@@ -147,5 +151,6 @@ pub fn converge(desired: Option<&Desired>, fleet: &Fleet, now: Duration) -> Conv
         quiet,
         state,
         roles,
+        commit: crate::BUILD_COMMIT,
     }
 }

@@ -10,7 +10,10 @@
 //!    whose operator has not set the coordinator's address, deploys nothing and fails nothing.
 //! 2. `GET /v1/convergence` once, before anything is changed: the hosts live then (at the
 //!    desired version, updating or failed; not `down`) are the baseline, per role, and are
-//!    printed.
+//!    printed. Its `commit` (the build the coordinator runs) is compared with the release's;
+//!    with `--require-coordinator-current` a different one ends the verb before anything is
+//!    set, a different one without the flag is a `::warning` annotation and the deploy goes
+//!    on, and a coordinator that reports none is noted and trusted.
 //! 3. `POST /v1/desired` with the version and the minimums, authenticated by a GitHub
 //!    Actions OIDC token whose audience is the coordinator (`--audience`, by default the URL).
 //! 4. `GET /v1/convergence` every `--every-secs`, with a fresh token each time (a token is
@@ -140,6 +143,28 @@ pub struct Args {
     /// The frontends that must stay up while others update.
     #[arg(long, default_value_t = 1)]
     pub min_up_frontend: u32,
+    /// Fail before anything is changed when the coordinator runs another commit than the
+    /// release's. Use it for a release that changes the coordinator or the wire between it
+    /// and the hosts: the coordinator must be updated first
+    /// (`docs/deploy/kbf-updater.md`, "Updating the coordinator").
+    ///
+    /// Bare, or `true`, turns it on; `false` or empty (an unset workflow variable) leaves it off.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = parse_switch
+    )]
+    pub require_coordinator_current: bool,
+}
+
+/// A switch given as text: `true` is on; `false` and the empty text are off.
+fn parse_switch(text: &str) -> Result<bool, String> {
+    match text {
+        "true" => Ok(true),
+        "" | "false" => Ok(false),
+        other => Err(format!("expected `true` or `false`, got `{other}`")),
+    }
 }
 
 /// Why the deploy did not end converged.
@@ -181,6 +206,13 @@ pub enum Error {
         reached: u64,
         version: String,
     },
+    #[error(
+        "the coordinator runs {coordinator}, the release is {release}: update the coordinator first (docs/deploy/kbf-updater.md, Updating the coordinator)"
+    )]
+    CoordinatorBehind {
+        coordinator: String,
+        release: String,
+    },
     #[error("the counts have not changed for {0} seconds")]
     Stalled(u64),
     #[error("the farm has not converged after {0} seconds")]
@@ -197,6 +229,7 @@ pub struct Plan {
     pub version: String,
     pub min_up_storage: u32,
     pub min_up_frontend: u32,
+    pub require_coordinator_current: bool,
     pub deadline: Duration,
     pub stall: Duration,
     pub every: Duration,
@@ -212,6 +245,7 @@ impl Plan {
             version: args.version.clone(),
             min_up_storage: args.min_up_storage,
             min_up_frontend: args.min_up_frontend,
+            require_coordinator_current: args.require_coordinator_current,
             deadline: Duration::from_secs(args.deadline_min * 60),
             stall: Duration::from_secs(args.stall_min * 60),
             every: Duration::from_secs(args.every_secs),
@@ -371,8 +405,10 @@ pub fn deploy_on(
         service,
         clock,
     };
-    let baseline =
-        Read::of(&client.send_retrying(out, READ_BASELINE, CONVERGENCE_PATH, None, plan)?)?.live();
+    let first =
+        Read::of(&client.send_retrying(out, READ_BASELINE, CONVERGENCE_PATH, None, plan)?)?;
+    check_coordinator(plan, first.commit.as_deref(), out)?;
+    let baseline = first.live();
     log(out, &baseline_line(&baseline))?;
     let body = json!({
         "version": plan.version,
@@ -415,6 +451,51 @@ pub fn deploy_on(
         }
         (clock.sleep)(plan.every.min(plan.deadline - elapsed));
     }
+}
+
+/// Whether the 12 characters are a commit as `--version` shows it.
+fn is_commit(text: &str) -> bool {
+    text.len() == 12
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The coordinator's own commit against the release's, before anything is set. A coordinator
+/// that reports none (an older build, or one built without a git checkout) is noted and
+/// trusted. With `plan.require_coordinator_current`, a different commit is an error.
+fn check_coordinator(
+    plan: &Plan,
+    reported: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let release = plan.version.rsplit("+g").next().unwrap_or_default();
+    let Some(coordinator) = reported.filter(|c| is_commit(c)) else {
+        let line = "::notice::the coordinator reports no build commit (an older build): not checking that it is current";
+        return if plan.require_coordinator_current {
+            log(out, line)
+        } else {
+            Ok(())
+        };
+    };
+    if coordinator == release {
+        return log(
+            out,
+            &format!("the coordinator runs the release's commit {release}"),
+        );
+    }
+    if plan.require_coordinator_current {
+        return Err(Error::CoordinatorBehind {
+            coordinator: coordinator.to_owned(),
+            release: release.to_owned(),
+        });
+    }
+    log(
+        out,
+        &format!(
+            "::warning title=coordinator not current::the coordinator runs {coordinator}, the release is {release}: update the coordinator first (docs/deploy/kbf-updater.md, Updating the coordinator)"
+        ),
+    )
 }
 
 /// One line of the log, flushed.
@@ -577,6 +658,8 @@ struct Read {
     desired: String,
     quiet: bool,
     roles: Vec<(String, [u64; 4])>,
+    /// The commit the coordinator says it was built from; none from an older build.
+    commit: Option<String>,
 }
 
 impl Read {
@@ -603,6 +686,7 @@ impl Read {
             desired: text("desired").map_or_else(|| "(none)".to_owned(), |t| plain(&t)),
             quiet: answer["quiet"].as_bool().unwrap_or(false),
             roles,
+            commit: text("commit").map(|t| plain(&t)),
         })
     }
 

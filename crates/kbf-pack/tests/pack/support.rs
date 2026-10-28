@@ -11,10 +11,11 @@ use kbf_objstore::{
     ObjectStoreError, PageSize,
 };
 use kbf_pack::{Blob, PackKeys, Packed, Packer, PackerConfig, Reader, ReaderConfig, WriterKind};
-use kbf_state::pack_index::memory::MemoryPackIndex;
-use kbf_state::{
-    BlobDigest, Location, ManualClock, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
+use kbf_pack_index::memory::MemoryPackIndex;
+use kbf_pack_index::{
+    BlobDigest, Location, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
 };
+use kbf_state::ManualClock;
 
 /// Counts an armed failure down; true while one is left.
 fn fires(armed: &AtomicU32) -> bool {

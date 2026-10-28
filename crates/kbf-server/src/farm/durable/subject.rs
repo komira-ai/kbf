@@ -16,7 +16,7 @@ use crate::action_usage::{ShapeKey, Subject, Target, TargetKind};
 const VERSION: u8 = 1;
 
 /// `subject` as a row value.
-pub(super) fn encode(subject: &Subject) -> Vec<u8> {
+pub(crate) fn encode(subject: &Subject) -> Vec<u8> {
     let mut row = vec![VERSION];
     row.extend(subject.key.bytes());
     text(&mut row, subject.cfg.as_deref());
@@ -58,7 +58,7 @@ fn put(row: &mut Vec<u8>, value: &str) {
 }
 
 /// A row value as a [`Subject`], or what is wrong with it.
-pub(super) fn decode(row: &[u8]) -> Result<Subject, &'static str> {
+pub(crate) fn decode(row: &[u8]) -> Result<Subject, &'static str> {
     let mut at = Reader(row);
     if at.take(1)? != [VERSION] {
         return Err("not a version 1 subject");

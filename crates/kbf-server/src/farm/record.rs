@@ -5,7 +5,7 @@
 //! the Execute call that queued or joined the operation, which [`Dispatch::submit`]
 //! sends before it queues anything.
 //!
-//! Only operations a recorded call waits on are told: those [`State::record_submit`]
+//! Only operations a recorded call waits on are told: those [`Side::record_submit`]
 //! noted, which a call without an invocation id, or any call with the recorder off,
 //! never is. For any other operation each seam costs a set lookup, and no event or
 //! listing is built. (The `action usage:` line, for every operation, is
@@ -19,9 +19,9 @@ use kbf_sched::Requeue;
 use kbf_types::{Answer, Digest, LeaseGrant, LeaseId, OperationId, Outcome, Refusal, StartLease};
 use tonic::Code;
 
-use super::State;
+use super::side::Side;
 
-impl State {
+impl Side {
     /// Sends the events of an Execute call answered with `name` on `operation`, the
     /// operation its request gets: the twin it joins (`joined`), or the next new one, and
     /// notes the operation as recorded. Call it before the request is fed, so the call
@@ -81,7 +81,7 @@ impl State {
 
     /// Sends what the report of `lease` measured, once the scheduler took it. Only a
     /// recorded operation's report is measured (`Farm::report` asks
-    /// [`State::is_recorded`] before it builds `run`).
+    /// [`Side::is_recorded`] before it builds `run`).
     pub(super) fn record_ran(&self, operation: OperationId, lease: LeaseId, run: Run) {
         self.recorder.emit(Event::Ran {
             operation,
