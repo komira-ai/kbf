@@ -1134,8 +1134,7 @@ impl Farm {
     /// The store cannot be read or written, or holds a row that is not one the scheduler
     /// wrote.
     pub fn with_state(mut self, state: Option<StateStore>) -> Result<Self, StateError> {
-        let state_of_farm = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-        let epoch = state_of_farm.keep_in(state)?;
+        let epoch = self.driver.state_mut().keep_in(state)?;
         self.term = epoch.unwrap_or(self.term);
         self.lease_epoch = epoch.unwrap_or(self.lease_epoch);
         Ok(self)
@@ -1151,7 +1150,7 @@ impl Farm {
     /// # Errors
     /// The store cannot be read, or the row is not a result.
     pub fn ended(&self, operation: OperationId) -> Result<Option<Finished>, StateError> {
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = self.lock();
         state
             .engine
             .durable
@@ -1168,7 +1167,7 @@ impl Farm {
     /// # Errors
     /// The store cannot be read or written, or holds no epoch.
     pub fn bump_epoch(&self) -> Result<Option<EpochBump>, StateError> {
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = self.lock();
         state
             .engine
             .durable
