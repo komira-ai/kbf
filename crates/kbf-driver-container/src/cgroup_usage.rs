@@ -26,17 +26,17 @@ pub(crate) const NUMA_EVERY: Duration = Duration::from_secs(1);
 
 /// The counters of `cpu.stat` the usage takes.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct CpuStat {
-    usage: Option<u64>,
+pub(crate) struct CpuStat {
+    pub(crate) usage: Option<u64>,
     user: Option<u64>,
     system: Option<u64>,
     periods: Option<u64>,
     throttled: Option<u64>,
-    throttled_usec: Option<u64>,
+    pub(crate) throttled_usec: Option<u64>,
 }
 
 /// The `key value` lines of `cpu.stat`: each wanted key's value that parses.
-fn cpu_stat(text: &str) -> CpuStat {
+pub(crate) fn cpu_stat(text: &str) -> CpuStat {
     let mut stat = CpuStat::default();
     for line in text.lines() {
         let mut words = line.split_whitespace();

@@ -248,3 +248,15 @@ fn the_usage_is_read_off_the_async_workers() {
         });
     assert_eq!(started, WORKERS, "{}", rest_waited(started));
 }
+
+/// Catches the node load reading the `actions/` cgroup's files on an async worker every
+/// heartbeat.
+#[test]
+fn the_node_load_reads_off_the_async_workers() {
+    let started =
+        blocking_threads_while_calls_wait("node-load", "cpu.stat", write_end, |dir| async move {
+            let tracker = crate::node_load::LoadTracker::new(crate::node_load::process_clock());
+            let _ = tracker.reading(dir).await;
+        });
+    assert_eq!(started, WORKERS, "{}", rest_waited(started));
+}

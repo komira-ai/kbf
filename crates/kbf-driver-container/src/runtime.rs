@@ -55,6 +55,7 @@ use crate::image::{ImageCheckError, ImageRef, PROPERTY};
 use crate::input_phases::{InputPhases, millis};
 use crate::keeper::Keeper;
 use crate::logs::{Logs, STDERR, STDOUT, store_both};
+use crate::node_load::{LoadError, LoadTracker, MonoClock, NodeLoad, process_clock};
 use crate::numa::{Pin, Placement, Placer};
 use crate::oci::{Oci, OciConfig};
 use crate::outputs::{OutputLimits, collect};
@@ -260,6 +261,8 @@ pub struct ContainerRuntime<C> {
     /// What the last lease's inputs cost, with the cache (a test's counter; each
     /// lease's are logged).
     last_inputs: Mutex<Option<InputStats>>,
+    /// Which leases run, since when, and the readings of the `actions/` cgroup.
+    load: LoadTracker,
 }
 
 impl<C: Cas> ContainerRuntime<C> {
@@ -285,12 +288,41 @@ impl<C: Cas> ContainerRuntime<C> {
             numa_samples: Arc::new(AtomicU64::new(0)),
             cache: None,
             last_inputs: Mutex::new(None),
+            load: LoadTracker::new(process_clock()),
         };
         sweep(&runtime.engine, &runtime.config).map_err(StartError::Sweep)?;
         if let Some(given) = runtime.config.cache.clone() {
             runtime.cache = open_cache(given);
         }
         Ok(runtime)
+    }
+
+    /// The same runtime reading time from `clock`, for tests that cannot wait.
+    #[must_use]
+    pub fn with_clock(mut self, clock: MonoClock) -> Self {
+        self.load = LoadTracker::new(clock);
+        self
+    }
+
+    /// One reading of the `actions/` cgroup (`NodeLoad`), with the leases that ran for the
+    /// whole window since the previous reading. The cgroup's files are read on the
+    /// blocking pool.
+    ///
+    /// # Errors
+    /// A file the reading needs cannot be read or does not parse.
+    pub async fn node_load(&self) -> Result<NodeLoad, LoadError> {
+        let parent = self.config.cgroup_parent.trim_start_matches('/');
+        self.load
+            .reading(self.config.cgroup_root.join(parent))
+            .await
+    }
+
+    /// The most CPU any one window between two readings used by the lease, in
+    /// millicores, once, after its run ended. `None` for a lease that ended before a
+    /// second reading of it.
+    #[must_use]
+    pub fn take_peak_window_millicores(&self, lease_id: LeaseId) -> Option<u64> {
+        self.load.take_peak(lease_id)
     }
 
     /// Whether leases link their inputs from the cache.
@@ -567,6 +599,8 @@ impl<C: Cas> ContainerRuntime<C> {
                 .map_err(RuntimeError::Failed)?;
             // The lease owns the `crun run` from here, so a dropped run's clean reaps it.
             let child = lease.start.insert(start);
+            self.load
+                .started(work.lease_id, lease.cgroup.dir().to_owned());
 
             tokio::select! {
                 // `crun run`'s status is the container's. An error waiting for it is not
@@ -858,6 +892,7 @@ impl<'a, C: Cas> Registered<'a, C> {
 
 impl<C> Drop for Registered<'_, C> {
     fn drop(&mut self) {
+        self.runtime.load.ended(self.id);
         self.runtime
             .stops
             .lock()
