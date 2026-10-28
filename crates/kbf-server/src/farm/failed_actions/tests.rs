@@ -6,7 +6,7 @@ use kbf_proto::reapi::ActionResult;
 use kbf_types::{Answer, Digest, DigestFunction, LeaseId, OperationId, Refusal};
 
 use super::*;
-use crate::farm::Pending;
+use crate::farm::report::Pending;
 
 fn farm() -> Farm {
     Farm::new(

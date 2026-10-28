@@ -422,8 +422,20 @@ fn a_joined_operation_leased_on_a_node_the_farm_does_not_own_is_followed_not_tak
     assert!(submit(&farm, 1).is_ok());
 
     let state = farm.lock();
-    assert!(state.machine.sent(kbf_types::LeaseId::new(5, 0)).is_none());
-    assert!(state.machine.sent(kbf_types::LeaseId::new(5, 1)).is_none());
+    assert!(
+        state
+            .side
+            .machine
+            .sent(kbf_types::LeaseId::new(5, 0))
+            .is_none()
+    );
+    assert!(
+        state
+            .side
+            .machine
+            .sent(kbf_types::LeaseId::new(5, 1))
+            .is_none()
+    );
     let held = state.sched.state(OperationId(0));
     assert!(held.is_none(), "the farm holds it");
     assert_eq!(state.intake.following(), 1);

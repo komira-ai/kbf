@@ -50,7 +50,11 @@ impl State {
         seq: u64,
         running: Vec<LeaseId>,
     ) -> Option<(Vec<Settled>, bool)> {
-        let link = self.links.get_mut(worker).filter(|l| l.stream == stream)?;
+        let link = self
+            .side
+            .links
+            .get_mut(worker)
+            .filter(|l| l.stream == stream)?;
         link.newest_beat = link.newest_beat.max(seq);
         let outbound = link.outbound.clone();
         let event = Event::Heartbeat {
@@ -59,11 +63,11 @@ impl State {
         };
         let answers = self.feed(now, event);
         // A node this frontend does not own is not kept alive in the store by it.
-        let owns = self.owns_worker(now, worker);
+        let owns = self.engine.owns_worker(now, worker);
         if owns {
-            self.renew_session(now, worker);
+            self.engine.renew_session(now, worker);
         }
-        for lease in self.sched.not_held(worker, &running) {
+        for lease in self.engine.sched.not_held(worker, &running) {
             tracing::info!(%worker, %lease, "a lease not held here is listed: cancelled");
             let cancel = server_message::Message::Cancel(Cancel {
                 lease_id: Some(wire_lease(lease)),
@@ -74,7 +78,7 @@ impl State {
                 message: Some(cancel),
             }));
         }
-        let acknowledged = owns && self.session_fresh(now, worker);
+        let acknowledged = owns && self.engine.session_fresh(now, worker);
         let settled = answers.iter().map(|a| self.settle(a)).collect();
         Some((settled, acknowledged))
     }

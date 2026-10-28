@@ -43,7 +43,7 @@
 //! 3. `State::take_report`: once the scheduler took the report, [`log`] writes the
 //!    line with the operation's first caller's subject, read before the report is fed
 //!    (a report that finishes the operation may drop its callers);
-//! 4. `State::offer`: the `lease granted` line names the first caller's key.
+//! 4. `Side::offer`: the `lease granted` line names the first caller's key.
 //!
 //! The key is `shape`'s; nothing else here knows how it is made.
 

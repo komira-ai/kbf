@@ -51,7 +51,7 @@ async fn a_farm_over_a_store_names_an_operation_by_its_id_and_answers_the_name()
     assert_eq!(waited.instance, "main");
     assert_eq!(waited.action, action_key(1).action);
     assert_eq!(shown(&waited), Stage::Executing);
-    assert!(farm.lock().watched.is_empty(), "the store was read");
+    assert!(farm.lock().side.watched.is_empty(), "the store was read");
     let lease = lease_of(&farm);
     farm.report(&node, invalid(lease)).await;
     assert_eq!(done_with(&waited), "test");
@@ -69,8 +69,8 @@ async fn a_name_in_the_old_form_is_answered_for_a_caller_the_process_holds() {
     let ticket = caller(&farm, 1);
     let old = {
         let state = farm.lock();
-        let id = state.machine.waiter_ids().next().expect("a caller");
-        state.machine.name(id)
+        let id = state.side.machine.waiter_ids().next().expect("a caller");
+        state.side.machine.name(id)
     };
     assert_ne!(old, ticket.name, "the farm gave a name of the old form");
 
@@ -187,7 +187,7 @@ async fn a_recorded_call_that_joined_an_operation_elsewhere_ends_with_the_operat
     let (a, b) = (farm_over(&store), farm_over(&store));
     let (recorder, recording) = kbf_front::Recorder::new(1 << 20, 64);
     tokio::spawn(recording.run());
-    b.lock().recorder = recorder.clone();
+    b.lock().side.recorder = recorder.clone();
     let node = WorkerId::new("node-a");
     let _inbox = register(&a, "node-a");
     let _leased = caller(&a, 1);
@@ -229,7 +229,7 @@ async fn a_recorded_call_that_joined_an_operation_elsewhere_ends_with_the_operat
     };
     let ended = outcome_of(&recorder, &key, &action);
     assert_eq!(ended, Some(failed));
-    assert!(b.lock().recorded.is_empty(), "the operation is noted");
+    assert!(b.lock().side.recorded.is_empty(), "the operation is noted");
 }
 
 /// Asserts that a request that joins an operation leased on a node this frontend owns takes
@@ -251,7 +251,7 @@ async fn a_request_joining_an_operation_leased_on_a_node_the_frontend_owns_takes
     assert_eq!(ticket.name, "operations/5000");
     assert_eq!(unfinished(&farm), [OperationId(5000)]);
     let state = farm.lock();
-    assert!(state.machine.sent(LeaseId::new(5, 0)).is_some());
+    assert!(state.side.machine.sent(LeaseId::new(5, 0)).is_some());
     assert!(!state.sched.queued().any(|op| op == OperationId(5000)));
     assert_eq!(state.intake.following(), 0);
 }
@@ -312,7 +312,7 @@ async fn a_watched_operation_is_followed_through_the_store_until_nobody_holds_a_
     assert_eq!(shown(&first), Stage::Executing);
     let second = farm.wait(name).expect("leased in the store");
     assert_eq!(shown(&second), Stage::Executing);
-    assert_eq!(farm.lock().watched.len(), 1, "one channel");
+    assert_eq!(farm.lock().side.watched.len(), 1, "one channel");
     let finished = ending("finished elsewhere");
     let result = [Effect::Answer(answer(5000, 0))];
     other
@@ -322,8 +322,11 @@ async fn a_watched_operation_is_followed_through_the_store_until_nobody_holds_a_
     assert_eq!(done_with(&first), "finished elsewhere");
     assert_eq!(done_with(&second), "finished elsewhere");
     farm.intake();
-    assert_eq!(farm.lock().watched.len(), 1, "a held channel dropped");
+    assert_eq!(farm.lock().side.watched.len(), 1, "a held channel dropped");
     drop((first, second));
     farm.intake();
-    assert!(farm.lock().watched.is_empty(), "an unheld channel kept");
+    assert!(
+        farm.lock().side.watched.is_empty(),
+        "an unheld channel kept"
+    );
 }

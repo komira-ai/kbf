@@ -146,7 +146,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_estimator::{Day, Summaries};
-use kbf_front::{Described, Finished, Stage};
+use kbf_front::{Finished, Stage};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
 use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{
@@ -161,16 +161,19 @@ use kbf_types::{
     WorkerId,
 };
 
-use tokio::sync::watch;
 use tonic::Status;
 
-use super::{
-    Detail, Farm, FarmMachine, Reported, Sent, Stamp, State, Waiter, finished_of, refused_as,
-};
+use super::engine::{Adapter, Engine};
+use super::{Farm, Reported, State};
+// What the tests of this module and its children name through `use super::*`.
+#[cfg(test)]
+use super::{finished_of, refused_as};
 use crate::action_usage::Subject;
 use crate::learned::Row;
-use crate::machine::Platform;
+use crate::machine::FarmMachine;
 use crate::state_store::StateStore;
+#[cfg(test)]
+use kbf_front::Described;
 
 use self::inflight::Submitted;
 use self::leases::lease_by_op_key;
@@ -384,7 +387,7 @@ impl StoredOperation {
     }
 }
 
-/// Where a request that was queued or that joined an operation is held ([`State::queue`]).
+/// Where a request that was queued or that joined an operation is held ([`Engine::queue`]).
 pub(super) enum Held {
     /// By this frontend's scheduler: the request is a caller of an operation it holds.
     Here,
@@ -490,7 +493,7 @@ impl Ending {
 pub(super) struct Durable {
     store: Arc<dyn Store>,
     /// A write failed because the store could not be reached, and none has been taken
-    /// since ([`State::watch_store`] tells the scheduler).
+    /// since ([`Engine::watch_store`] tells the scheduler).
     pub(super) unreachable: AtomicBool,
     /// A write failed because another writer holds a newer generation of the store: this
     /// scheduler was superseded and takes no more work. Never cleared; unlike an outage,
@@ -1116,7 +1119,7 @@ impl Durable {
     /// reached is an outage; a write that lost a compare-and-set, or found its row gone,
     /// is the store working; a write the store fenced means another writer holds a newer
     /// generation, which no return of the store undoes. Not generic, unlike
-    /// [`State::durably`], so every caller's runs count toward the same function.
+    /// [`Engine::durably`], so every caller's runs count toward the same function.
     fn note_failure(&self, error: &StateError) {
         if let StateError::Store(cause) = error {
             let flag = if matches!(cause, StoreError::Fenced) {
@@ -1189,6 +1192,7 @@ impl Farm {
     pub fn ended(&self, operation: OperationId) -> Result<Option<Finished>, StateError> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state
+            .engine
             .durable
             .as_ref()
             .map_or(Ok(None), |d| d.ended(operation))
@@ -1204,11 +1208,16 @@ impl Farm {
     /// The store cannot be read or written, or holds no epoch.
     pub fn bump_epoch(&self) -> Result<Option<EpochBump>, StateError> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.durable.as_ref().map(Durable::bump_epoch).transpose()
+        state
+            .engine
+            .durable
+            .as_ref()
+            .map(Durable::bump_epoch)
+            .transpose()
     }
 }
 
-impl State {
+impl Engine {
     /// Runs `write` on the state store, if the farm has one. Whether it took: a
     /// refusal is logged here, and the caller does not acknowledge what depends on it.
     pub(super) fn durably(
@@ -1219,7 +1228,7 @@ impl State {
         self.attempt(what, write) == Attempt::Taken
     }
 
-    /// [`State::durably`], telling a refusal that a later try can overcome (the store
+    /// [`Engine::durably`], telling a refusal that a later try can overcome (the store
     /// could not be reached) from one it cannot (the write is stale, or a newer writer
     /// holds the store).
     fn attempt(
@@ -1266,7 +1275,7 @@ impl State {
     /// that node, one by one, as it meets the same refusal; the effects of other nodes are
     /// written as before. Once a newer writer fences the store, everything held is dropped
     /// and nothing is written.
-    pub(super) fn release_unwritten(&mut self) -> Vec<Effect> {
+    pub(super) fn release_unwritten(&mut self, a: &mut dyn Adapter) -> Vec<Effect> {
         let mut ready = Vec::new();
         loop {
             if self.superseded() {
@@ -1278,7 +1287,7 @@ impl State {
                 // Only the held answers' details go: an answer already written and in
                 // `ready` is settled with its own after this returns.
                 for batch in std::mem::take(&mut self.unwritten) {
-                    self.forget_details(batch);
+                    self.forget_details(a, batch);
                 }
                 return ready;
             }
@@ -1289,7 +1298,7 @@ impl State {
                 self.unwritten.pop_front();
                 continue;
             };
-            let ending = self.ending(&effect);
+            let ending = self.ending(&*a, &effect);
             // A try that the store applied and did not acknowledge is tried again here,
             // and finds its own work in the rows (the write says so: it is `Taken`); a
             // `Stale` is another writer's work in the way, and the effect is dropped.
@@ -1316,11 +1325,11 @@ impl State {
                     // keeps the result for that frontend) is followed too, but its grants
                     // stay: nothing in the store says they lost.
                     if attempt == Attempt::Stale {
-                        self.lost_race(&dropped);
+                        self.lost_race(a, &dropped);
                     } else {
                         self.follow_finishes(&dropped);
                     }
-                    self.forget_details(dropped);
+                    self.forget_details(a, dropped);
                 }
             }
         }
@@ -1346,10 +1355,10 @@ impl State {
     /// Forgets the details parked for the answers among `dropped` effects, which will
     /// never be written. The details of answers the store has taken stay: they are
     /// settled after this feed's writes, whatever a later record does.
-    fn forget_details(&mut self, dropped: VecDeque<Effect>) {
+    fn forget_details(&mut self, a: &mut dyn Adapter, dropped: VecDeque<Effect>) {
         for effect in dropped {
             if let Effect::Answer(answer) = effect {
-                self.parked.remove(&answer.lease);
+                a.forget_parcel(answer.lease);
                 // Never written, so never acknowledged: the daemon keeps the result.
                 self.owed.remove(&answer.lease);
             }
@@ -1357,32 +1366,20 @@ impl State {
     }
 
     /// Forgets the detail of every report whose answer is no longer held.
-    pub(super) fn forget_parked(&mut self) {
+    pub(super) fn forget_parked(&mut self, a: &mut dyn Adapter) {
         let held = &self.unwritten;
-        let waits = |lease: &LeaseId| {
-            let answers = |e: &Effect| matches!(e, Effect::Answer(a) if a.lease == *lease);
+        let waits = |lease: LeaseId| {
+            let answers = |e: &Effect| matches!(e, Effect::Answer(a) if a.lease == lease);
             held.iter().flatten().any(answers)
         };
-        self.parked.retain(|lease, _| waits(lease));
-    }
-
-    /// Keeps `detail`, the report of `lease`, before the report is fed: the answer it
-    /// decides is written with the result it carries, in the transaction that finishes
-    /// the operation ([`State::ending`]), and settled with the same detail
-    /// ([`State::settle`]). Call [`State::forget_parked`] once the answers are settled.
-    pub(super) fn park(&mut self, lease: LeaseId, detail: Detail) {
-        self.parked.insert(lease, detail);
+        a.retain_parcels(&waits);
     }
 
     /// How the operation of `effect` ended, if the effect ends one: the row the store
     /// takes in the transaction that finishes it. An answer's is what its callers are
-    /// told ([`finished_of`], from the report's detail if one is kept).
-    fn ending(&self, effect: &Effect) -> Option<Ending> {
-        let finished = match effect {
-            Effect::Answer(answer) => finished_of(answer, self.parked.get(&answer.lease)),
-            Effect::Refuse(refusal) => refused_as(refusal),
-            Effect::Start(_) | Effect::Commit(_) | Effect::Waiting(_) => return None,
-        };
+    /// told, which the adapter decides from the report's detail if one is kept.
+    fn ending(&self, a: &dyn Adapter, effect: &Effect) -> Option<Ending> {
+        let finished = a.ending(effect)?;
         Some(Ending {
             finished,
             retention: self.finished_retention,
@@ -1426,7 +1423,7 @@ impl State {
     /// feed. A grant needs the operation's queue row, which only its requeue writes, so
     /// a requeue the store missed is made up before the grant that follows it, or that
     /// grant is refused and the operation never runs.
-    pub(super) fn settle_requeues(&mut self, given_up: &[Requeue]) {
+    pub(super) fn settle_requeues(&mut self, a: &mut dyn Adapter, given_up: &[Requeue]) {
         // What the kills among them taught the estimator, written once the requeues are.
         let mut kills = Vec::new();
         for requeue in given_up {
@@ -1451,7 +1448,11 @@ impl State {
             } else {
                 FloorChange::default()
             };
-            kills.extend(self.learned_requeue(requeue));
+            let learned = a.learned_requeue(&self.view(), requeue);
+            if let Some(lowered) = learned.lowered {
+                self.lower_key_floors(a, lowered);
+            }
+            kills.extend(learned.rows);
             // A raise makes any lowered row still waiting for the store stale: the
             // requeue writes the floor as it stands.
             if let Some(raised) = &floors.key_raised {
@@ -1469,7 +1470,7 @@ impl State {
                 let summary = floors
                     .key_raised
                     .as_ref()
-                    .and_then(|f| self.learned.summary_key(f.key));
+                    .and_then(|f| a.summary_key(f.key));
                 let floors = self.current_key_floors(floors);
                 let attempt = self.attempt("a requeue", |d| {
                     d.requeued_named(requeue, *losses, fate.as_ref(), &floors, summary.as_ref())
@@ -1485,7 +1486,7 @@ impl State {
         for requeue in given_up {
             self.intake.rewrote(requeue.operation);
         }
-        self.write_estimates(&kills);
+        self.write_estimates(a, &kills);
     }
 
     /// Whether the refusal that `record` proposes is taken back because a daemon connected
@@ -1529,40 +1530,23 @@ impl State {
     /// `op`, an operation the state store holds, as the scheduler takes it up: held for
     /// a caller of its own that no client waits on, which the next request for the
     /// action joins.
-    fn take_stored(&mut self, mut op: StoredOperation, now: SystemTime) -> Recovered {
-        let key = op.action.clone();
-        let waiter = self.machine.submit(Waiter {
-            key: key.clone(),
-            kind: op.request.kind,
-            do_not_cache: op.request.do_not_cache,
-            queued: now,
-            platform: Platform::of(&op.request.needs),
-            // A row from a writer that did not record the subject (an older build)
-            // leaves the `action usage:` line naming the empty shape.
-            usage: op
-                .subject
-                .take()
-                .unwrap_or_else(|| Subject::of(Described::default()).0),
-        });
-        self.stages.insert(waiter, watch::channel(Stage::Queued).0);
-        if let Some(grant) = &op.lease {
+    fn take_stored(
+        &mut self,
+        a: &mut dyn Adapter,
+        mut op: StoredOperation,
+        now: SystemTime,
+    ) -> Recovered {
+        let waiter = a.adopt(&mut op, now);
+        if op.lease.is_some() {
             // A recovered operation that holds a lease has been started: if it is queued
             // again, its streams read `WaitingKept`.
             self.ever_started.insert(op.operation);
-            let stamp = Stamp {
-                queued: now,
-                started: now,
-            };
-            let sent = Sent {
-                operation: op.operation,
-                action: key.action,
-                stamp,
-            };
-            self.machine.start(grant.lease, sent);
         }
         op.recovered(waiter)
     }
+}
 
+impl State {
     /// [`Farm::with_state`] on the farm's state: opens `state`, reads what it holds and
     /// takes it up. Returns the store's epoch, or `None` if there is no store. Not
     /// generic, unlike `Farm::with_state`, so every test binary's runs count toward the
@@ -1571,10 +1555,10 @@ impl State {
         let Some(StateStore { store, epoch, .. }) = state else {
             return Ok(None);
         };
-        let (durable, epoch) = Durable::open(store, epoch, self.ambient.term())?;
+        let (durable, epoch) = Durable::open(store, epoch, self.engine.ambient.term())?;
         durable
             .read_size_keys
-            .store(self.learned.keys(), Ordering::SeqCst);
+            .store(self.side.learned.keys(), Ordering::SeqCst);
         let stored = durable.load()?;
         // The farm hands out `operations/<id>` names, whose ids are the store's. The machine's
         // term is the one of the old form, `operations/{term}-{waiter}`, which the farm still
@@ -1583,24 +1567,24 @@ impl State {
         // #154). A store with none (a store with no generation row, or one holding the shared
         // marker) gives the epoch as the term. The farm gives out no name of the old form
         // over a store, so no client holds one for two frontends of a store to answer.
-        self.machine = FarmMachine::new(durable.generation()?.unwrap_or(epoch));
-        let now = self.ambient.wall();
+        self.side.machine = FarmMachine::new(durable.generation()?.unwrap_or(epoch));
+        let now = self.engine.ambient.wall();
         let mut recovered = Vec::new();
         let mut keyed = Vec::new();
         // A start takes up the operations that wait for a lease, and none that holds one:
         // the lease belongs to the frontend its node is connected to, which may be another
         // than this. A leased operation is taken up when its node says `Hello` here
-        // ([`State::claim_worker`]); if the node never does, the orphan sweep requeues it.
+        // ([`Engine::claim_worker`]); if the node never does, the orphan sweep requeues it.
         for op in stored
             .operations
             .into_iter()
             .filter(|op| op.lease.is_none())
         {
-            if let Some(size_key) = op.size_key.filter(|_| self.learned.keys()) {
+            if let Some(size_key) = op.size_key.filter(|_| self.side.learned.keys()) {
                 keyed.push((op.operation, size_key));
-                self.register_stored(&op, size_key);
+                self.side.register_stored(&op, size_key);
             }
-            recovered.push(self.take_stored(op, now));
+            recovered.push(self.engine.take_stored(&mut self.side, op, now));
         }
         // The first blocks of ids are reserved here, past everything any frontend of the
         // store reserved, and the scheduler numbers inside them from now on. Every start
@@ -1608,33 +1592,37 @@ impl State {
         // rows of the operations that used them are still there.
         let first_operation = durable.reserve_operation(OperationId(stored.next_operation))?;
         let seqs = durable.reserve_seqs(stored.next_seq)?;
-        self.sched.restore_floors(stored.floors);
-        self.sched.restore_key_floors(stored.key_floors);
+        self.engine.sched.restore_floors(stored.floors);
+        self.engine.sched.restore_key_floors(stored.key_floors);
         let stored_names = stored.key_names;
         // Off reads no size summaries and leaves them as they are.
-        if !self.learned.off() {
-            self.learned.restore(&durable.estimates()?);
+        if !self.side.learned.off() {
+            self.side.learned.restore(&durable.estimates()?);
         }
-        self.sched
+        self.engine
+            .sched
             .recover(epoch, first_operation, seqs.start, recovered);
-        self.sched.use_seq_block(seqs);
+        self.engine.sched.use_seq_block(seqs);
         // The size keys come from the store's own rows, not from the requests: only `on`
         // reads them. A recovered lease keeps the request the store holds; a key floor
         // raises only the operations queued after it.
         for (operation, key) in keyed {
-            self.sched.set_size_key(operation, key);
+            self.engine.sched.set_size_key(operation, key);
         }
         // A key whose operations have all finished still has its floor and its decay.
-        if self.learned.keys() {
+        if self.side.learned.keys() {
             for (size_key, summary) in &stored_names {
-                self.learned.register(summary, *size_key);
+                self.side.learned.register(summary, *size_key);
             }
         }
-        self.restore_cordons(stored.cordons, durable.store_ms());
-        self.durable = Some(durable);
+        self.engine
+            .restore_cordons(stored.cordons, durable.store_ms());
+        self.engine.durable = Some(durable);
         Ok(Some(epoch))
     }
+}
 
+impl Engine {
     /// Writes `request`, about to be queued, to the state store, unless it will join a
     /// twin already there, and says where it is held ([`Held`]). Not generic, unlike
     /// `Farm::submit`, so every test binary's runs count toward the same function's
@@ -1651,6 +1639,7 @@ impl State {
     /// client, who is told nothing is queued, asks again.
     pub(super) fn queue(
         &mut self,
+        a: &mut dyn Adapter,
         request: &Request,
         subject: &Subject,
         size_key: Option<u64>,
@@ -1703,7 +1692,7 @@ impl State {
                 if self.leased_elsewhere(&op, now) {
                     return Ok(Held::Elsewhere(op.operation));
                 }
-                self.take_in_stored(*op);
+                self.take_in_stored(a, *op);
             }
             None => {}
         }
@@ -1723,10 +1712,10 @@ impl State {
     /// Takes `op`, which the state store holds and the scheduler neither holds nor has
     /// finished (the caller checked), into the scheduler, held for a caller of its own that
     /// no client waits on, with the size key its row names if the learned sizes read it.
-    pub(super) fn take_in_stored(&mut self, op: StoredOperation) {
+    pub(super) fn take_in_stored(&mut self, a: &mut dyn Adapter, op: StoredOperation) {
         let operation = op.operation;
-        let stored_key = op.size_key.filter(|_| self.learned.keys());
-        let recovered = self.take_stored(op, self.ambient.wall());
+        let stored_key = op.size_key.filter(|_| a.size_keys());
+        let recovered = self.take_stored(a, op, self.ambient.wall());
         // The operation is neither in the scheduler nor finished, so `take_in` has nothing
         // to refuse.
         let taken = self.sched.take_in(recovered);

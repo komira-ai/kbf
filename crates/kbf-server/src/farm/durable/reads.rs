@@ -12,7 +12,7 @@ use kbf_types::Resources;
 use super::*;
 use crate::fleet::{NodeDetail, NodeView, PhaseView, PlacementView, ResourcesView};
 
-impl State {
+impl Engine {
     /// Whether another frontend of the store holds `worker`: this frontend does not, and the
     /// store has its `owner/` row. A farm with no state store, or one that handed its work
     /// over, holds every node it hears from. `None` when the store cannot be read: that is
