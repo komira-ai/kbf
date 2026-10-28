@@ -1,7 +1,9 @@
 //! The allow-list of the remote operator listener: who may present an OIDC token and what
 //! its claims must say. Read from the `[remote_operator]` table of a TOML file
-//! (`--remote-operator-config`, which may be `kbf.toml` itself). Every value that decides
-//! who is let in is required: there is no default issuer, audience, repository or workflow.
+//! (`--remote-operator-config`, which may be `kbf.toml` itself), or from several
+//! `[[remote_operator]]` tables, one entry each; a file never has both forms. Every value
+//! that decides who is let in is required: there is no default issuer, audience,
+//! repository or workflow.
 
 use std::path::Path;
 
@@ -35,9 +37,12 @@ pub enum ConfigError {
     Invalid(String),
 }
 
+/// The services an entry may set when it names none.
+pub const DEFAULT_SERVICES: &str = "kbf";
+
 #[derive(Debug, Deserialize)]
 struct File {
-    remote_operator: Option<Raw>,
+    remote_operator: Option<toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +61,7 @@ struct Raw {
     event_names: Option<Vec<String>>,
     runner_environment: Option<String>,
     max_token_lifetime_secs: Option<u64>,
+    services: Option<Vec<String>>,
 }
 
 /// What a token's claims must equal. Built only by [`OidcConfig::parse`], so a value of
@@ -83,6 +89,9 @@ pub struct OidcConfig {
     pub runner_environment: String,
     /// The most `exp - iat` may be.
     pub max_lifetime_secs: u64,
+    /// The services a token of this entry may set the desired version of (`["kbf"]` when
+    /// the file names none).
+    pub services: Vec<String>,
 }
 
 fn need(value: Option<String>, name: &str) -> Result<String, ConfigError> {
@@ -105,18 +114,33 @@ fn clean_list(list: Vec<String>, name: &str) -> Result<Vec<String>, ConfigError>
 }
 
 impl OidcConfig {
-    /// The allow-list of the `[remote_operator]` table in `text`.
+    /// The allow-list of the one `[remote_operator]` table in `text`.
     ///
     /// # Errors
     /// [`ConfigError`]: the text is not TOML, the table is absent or has an unknown key, or
     /// a required value is missing: `issuer` (https, no trailing slash), `audience`,
     /// `repository_id` (digits), `job_workflow_ref` (at least one) and at least one of
-    /// `refs` and `environments`.
+    /// `refs` and `environments`. Several `[[remote_operator]]` entries are refused here:
+    /// read them with [`AllowList::parse`].
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let file: File = toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        let raw = file
-            .remote_operator
-            .ok_or_else(|| ConfigError::Invalid("the [remote_operator] table is absent".into()))?;
+        let mut entries = entries_of(text)?;
+        match (entries.pop(), entries.is_empty()) {
+            (Some(one), true) => Ok(one),
+            _ => Err(ConfigError::Invalid(
+                "several [[remote_operator]] entries: read the file as an allow-list".into(),
+            )),
+        }
+    }
+
+    /// The allow-list in the file at `path`.
+    ///
+    /// # Errors
+    /// [`ConfigError`]: the file cannot be read, or [`Self::parse`] refuses it.
+    pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
+        Self::parse(&read(path)?)
+    }
+
+    fn from_raw(raw: Raw) -> Result<Self, ConfigError> {
         let issuer = need(raw.issuer, "issuer")?;
         if !issuer.starts_with("https://") || issuer.ends_with('/') || issuer.contains(['?', '#']) {
             return Err(ConfigError::Invalid(
@@ -165,6 +189,13 @@ impl OidcConfig {
                 "max_token_lifetime_secs is 1 to {MAX_LIFETIME_CEILING_SECS}"
             )));
         }
+        let services = match raw.services {
+            None => vec![DEFAULT_SERVICES.to_owned()],
+            Some(list) => clean_list(list, "services")?,
+        };
+        if services.is_empty() {
+            return Err(ConfigError::Invalid("services must not be empty".into()));
+        }
         Ok(Self {
             issuer,
             audience,
@@ -182,7 +213,97 @@ impl OidcConfig {
                 "runner_environment",
             )?,
             max_lifetime_secs,
+            services,
         })
+    }
+}
+
+fn read(path: &Path) -> Result<String, ConfigError> {
+    std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+/// The entries of `text`: the one `[remote_operator]` table, or each `[[remote_operator]]`.
+fn entries_of(text: &str) -> Result<Vec<OidcConfig>, ConfigError> {
+    let file: File = toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let raws = match file.remote_operator {
+        None => {
+            return Err(ConfigError::Invalid(
+                "the [remote_operator] table is absent".into(),
+            ));
+        }
+        Some(table @ toml::Value::Table(_)) => vec![table],
+        Some(toml::Value::Array(list)) => list,
+        Some(_) => {
+            return Err(ConfigError::Invalid(
+                "remote_operator is a table or an array of tables".into(),
+            ));
+        }
+    };
+    raws.into_iter()
+        .map(|v| {
+            let raw = v
+                .try_into::<Raw>()
+                .map_err(|e| ConfigError::Parse(e.to_string()))?;
+            OidcConfig::from_raw(raw)
+        })
+        .collect()
+}
+
+/// Every entry of the allow-list: a token is admitted by the entry it matches, and by no
+/// other. Built only by [`AllowList::parse`] or from one [`OidcConfig`], so it holds at
+/// least one entry, all of one issuer (the keys are the issuer's), and no two entries for
+/// the same repository and workflow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllowList {
+    entries: Vec<OidcConfig>,
+}
+
+impl From<OidcConfig> for AllowList {
+    fn from(entry: OidcConfig) -> Self {
+        Self {
+            entries: vec![entry],
+        }
+    }
+}
+
+impl AllowList {
+    /// The allow-list of `text`: one `[remote_operator]` table, or several
+    /// `[[remote_operator]]` entries.
+    ///
+    /// # Errors
+    /// [`ConfigError`]: [`OidcConfig::parse`]'s reasons for any entry; the file has
+    /// both forms (TOML itself refuses that) or an empty list; entries name different
+    /// issuers; or two entries share a `repository_id` and a `job_workflow_ref`.
+    pub fn parse(text: &str) -> Result<Self, ConfigError> {
+        let entries = entries_of(text)?;
+        let Some(first) = entries.first() else {
+            return Err(ConfigError::Invalid(
+                "the [[remote_operator]] list is empty".into(),
+            ));
+        };
+        if entries.iter().any(|e| e.issuer != first.issuer) {
+            return Err(ConfigError::Invalid(
+                "entries name different issuers: the keys are one issuer's".into(),
+            ));
+        }
+        for (i, a) in entries.iter().enumerate() {
+            for b in &entries[i + 1..] {
+                if a.repository_id == b.repository_id
+                    && a.job_workflow_refs
+                        .iter()
+                        .any(|w| b.job_workflow_refs.contains(w))
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "two entries for repository_id {} share a job_workflow_ref",
+                        a.repository_id
+                    )));
+                }
+            }
+        }
+        Ok(Self { entries })
     }
 
     /// The allow-list in the file at `path`.
@@ -190,10 +311,16 @@ impl OidcConfig {
     /// # Errors
     /// [`ConfigError`]: the file cannot be read, or [`Self::parse`] refuses it.
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
-            path: path.display().to_string(),
-            source,
-        })?;
-        Self::parse(&text)
+        Self::parse(&read(path)?)
+    }
+
+    /// The entries, in file order.
+    #[must_use]
+    pub fn entries(&self) -> &[OidcConfig] {
+        &self.entries
+    }
+
+    pub(crate) fn issuer(&self) -> &str {
+        self.entries.first().map_or("", |e| e.issuer.as_str())
     }
 }
