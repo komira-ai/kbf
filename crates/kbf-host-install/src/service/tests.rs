@@ -73,6 +73,18 @@ fn a_service_table_makes_its_descriptor() {
     assert_eq!(units, ["js-agent.service", "js-agent-helper@a.service"]);
 }
 
+/// A tree may have digits in it, and a name of the longest length.
+#[test]
+fn a_tree_may_have_digits_and_be_64_bytes_long() {
+    let long = format!("js-agent-{}", "a".repeat(55));
+    assert_eq!(long.len(), 64);
+    for tree in ["js-agent-2", "js-agent-v2-host", long.as_str()] {
+        let entry = entry("js-agent", "js-agent", tree, &["js-agent.service"]);
+        let d = Descriptor::from_entry("js-agent", &entry).unwrap();
+        assert_eq!(d.tree, tree);
+    }
+}
+
 /// A key left out, or one this build does not know, is a table that does not parse: nothing
 /// has a default.
 #[test]
@@ -142,6 +154,8 @@ fn a_descriptor_that_names_something_not_its_own_is_refused() {
         "js",
         "js-agent-",
         "js-agent--",
+        "js-agent-A",
+        "js-agent-a_b",
         "js-agentx",
         "JS-agent",
         "js-agent/x",

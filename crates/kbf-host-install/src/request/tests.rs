@@ -444,6 +444,8 @@ fn a_unit_owned_by_a_service_starts_with_its_name() {
         "js-agent-helper.service",
         "js-agent@a.service",
         "js-agent-helper@a-1.service",
+        "js-agent-2.service",
+        "js-agent-h2lper.service",
     ] {
         assert_eq!(Unit::owned_by("js-agent", good).unwrap().as_str(), good);
     }
@@ -454,6 +456,9 @@ fn a_unit_owned_by_a_service_starts_with_its_name() {
         "js.service",
         "js-agentx.service",
         "js-agent-.service",
+        "js-agent--.service",
+        "js-agent-A.service",
+        "js-agent-a_b.service",
         "js-agent.timer",
         "js-agent.service.service",
         "js-agent@.service",
