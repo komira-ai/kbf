@@ -1,0 +1,120 @@
+# The end-to-end gate for flipping the farm onto the jobscheduler core (js-server-core).
+#
+# It is the M1 exit test of beta.yml's `m1-cell` (MinIO, one kbf-server, one daemon, the sample
+# projects built twice each with pinned Bazel and buck2, a lease drained in flight, a planted
+# failing build; `kbf-cell m1`, crates/kbf-integration-test/src/m1.rs says exactly what is
+# checked) with two differences: the kbf-server is built with `--features kbf-server/farm-core-js`
+# and started with `--scheduler-core js --placement-load on`, and the run also requires that the
+# server logged `scheduler core: js` and reports `kbf_scheduler_core{core="js"} 1` on /metrics,
+# before the builds and after them (`--expect-scheduler-core js`), so it cannot pass on the legacy
+# driver by accident. It is kbf's own frontend on js-server-core; the standalone pieces of the
+# jobscheduler repository (js-lease-server, js-agent) are not on the flip path and not here.
+#
+# Red by design until the change that makes a build with that feature accept `--scheduler-core js`
+# lands (cargo cannot even build the feature before that, and a server given the flag refuses to
+# start: crates/kbf-server/src/config.rs, `check_scheduler_core`). The release build keeps
+# refusing js until the flip (W) makes it available.
+#
+# Not part of the pipeline yet, on purpose. A job of beta.yml or of pipeline.yml that is red
+# stops every release (no `continue-on-error` is allowed in either: tests/beta_succeeds,
+# tests/pipeline_workflow), and the fix-forward path must not wait on a change that is not
+# here. So this workflow is a check of its own: it runs for a pull request or a push to main that
+# touches the flip path (js-core-gate-pr.yml, which calls this file), or by hand, and it is
+# listed in release/stages.yml as a job of the beta stage so the stage lint keeps it honest.
+#
+# W makes it release-blocking by adding this caller job to pipeline.yml (and the stage row
+# `pipeline.yml#js-core-gate`, stage beta, to release/stages.yml), next to `beta`:
+#
+#   js-core-gate:
+#     needs: [artifacts]
+#     uses: ./.github/workflows/js-core-gate.yml
+#     permissions:
+#       contents: read
+#
+# and then deletes js-core-gate-pr.yml, which only exists to run it before that.
+#
+# Same hosted-runner, pinning and permission rules as the other workflows
+# (crates/kbf-integration-test/tests/repo_lints.rs). The pins are copies of m1-cell's.
+name: js-core-gate
+
+on:
+  workflow_call:
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  m1-cell-js:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    services:
+      minio:
+        # The digest the objstore-s3 and m1-cell jobs pin (Chainguard's build of MinIO).
+        image: cgr.dev/chainguard/minio@sha256:e7ca559d9f7c0b5f24f5f669bb92f40f3ca88d56273b808bf3a7c116c17d2ffa
+        command: server /data
+        env:
+          MINIO_ROOT_USER: kbf-ci-access
+          MINIO_ROOT_PASSWORD: kbf-ci-throwaway
+        ports:
+          - 9000:9000
+    env:
+      # A throwaway key pair for the service container, which lives only for this job.
+      AWS_ACCESS_KEY_ID: kbf-ci-access
+      AWS_SECRET_ACCESS_KEY: kbf-ci-throwaway
+      BAZEL_VERSION: 8.8.1
+      BAZEL_SHA256: 5b5bab2095065817d3416ca9a0678bd39c10c9ede432dbe8187bfe74de285160
+      BUCK2_VERSION: 2026-10-01
+      BUCK2_SHA256: 828aba01bf80e8ba50ed27d89be86efe0246b3807c3d040e1ea7b4810a55fb78
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      # The kbf-server with the js core compiled in, the cell, and kbf-act (the program the
+      # samples' `shout` action runs). The feature belongs to kbf-server; the other packages are
+      # built as m1-cell builds them.
+      - name: Build the kbf-server with the js core, and the cell
+        run: cargo build -p kbf-server -p kbf-integration-test -p kbf-testkit --bins --locked --features kbf-server/farm-core-js
+      - name: Fetch Bazel (pinned version, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/bazelbuild/bazel/releases/download/$BAZEL_VERSION/bazel-$BAZEL_VERSION-linux-x86_64" --sha256 "$BAZEL_SHA256" --out "$RUNNER_TEMP/tools/bazel"
+      - name: Fetch buck2 (pinned version, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --out "$RUNNER_TEMP/tools/buck2" --extract zst
+      - run: $RUNNER_TEMP/tools/bazel --version
+      - run: $RUNNER_TEMP/tools/buck2 --version
+      - name: Wait for MinIO, then run the store conformance suite on it
+        run: cargo run -p kbf-objstore --example s3_conformance --locked -- --endpoint http://127.0.0.1:9000 --bucket kbf-m1-conformance --create-bucket --conditional-put --wait-ready 60
+      - name: M1 cell on the js core, Bazel and buck2 twice each
+        run: target/debug/kbf-cell m1 --bin-dir target/debug --projects crates/kbf-integration-test/m1 --work "$RUNNER_TEMP/m1" --s3-endpoint http://127.0.0.1:9000 --s3-bucket kbf-m1 --bazel "$RUNNER_TEMP/tools/bazel" --buck2 "$RUNNER_TEMP/tools/buck2" --server-arg=--scheduler-core=js --server-arg=--placement-load=on --expect-scheduler-core js
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: js-core-gate-logs
+          path: ${{ runner.temp }}/m1/logs
+          if-no-files-found: warn
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}

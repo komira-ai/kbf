@@ -1,0 +1,47 @@
+# Runs js-core-gate.yml (the end-to-end gate for the farm's flip onto the jobscheduler core) for
+# a pull request or a push to main that touches what the flip path is made of, and by hand. It
+# is a check of its own and not a stage of the release pipeline: it is red until the change that
+# lets a `farm-core-js` build run `--scheduler-core js` lands, and a red stage job would stop
+# every release (js-core-gate.yml says how the flip, W, makes it release-blocking and deletes
+# this file).
+name: js-core-gate-pr
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/js-core-gate.yml
+      - .github/workflows/js-core-gate-pr.yml
+      - crates/kbf-integration-test/src/m1.rs
+      - crates/kbf-server/Cargo.toml
+      - crates/kbf-server/src/config.rs
+      - crates/kbf-server/src/scheduler_core.rs
+      - crates/kbf-server/src/scheduler_core/**
+      - crates/kbf-server/src/start.rs
+      - crates/kbf-server/src/serve.rs
+      - crates/kbf-server/src/farm_js/**
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/js-core-gate.yml
+      - .github/workflows/js-core-gate-pr.yml
+      - crates/kbf-integration-test/src/m1.rs
+      - crates/kbf-server/Cargo.toml
+      - crates/kbf-server/src/config.rs
+      - crates/kbf-server/src/scheduler_core.rs
+      - crates/kbf-server/src/scheduler_core/**
+      - crates/kbf-server/src/start.rs
+      - crates/kbf-server/src/serve.rs
+      - crates/kbf-server/src/farm_js/**
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: js-core-gate-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gate:
+    uses: ./.github/workflows/js-core-gate.yml
+    permissions:
+      contents: read

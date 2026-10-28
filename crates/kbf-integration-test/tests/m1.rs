@@ -65,7 +65,7 @@ mod fake {
         let args: Vec<String> = args.collect();
         record(&role, &args);
         let code = match role.as_str() {
-            "kbf-server" => server(),
+            "kbf-server" => server(&args),
             "kbf-cell" => daemon(),
             "buck2" => buck2(&args),
             _ => bazel(&args),
@@ -100,7 +100,13 @@ mod fake {
         0
     }
 
-    fn server() -> i32 {
+    fn server(args: &[String]) -> i32 {
+        // The start line of a server given the core, as the real one logs it.
+        if args.iter().any(|a| a == "--scheduler-core=js") && !defect("core-line-missing") {
+            eprintln!(
+                "\x1b[2mT\x1b[0m \x1b[32m INFO\x1b[0m kbf_server::start: scheduler core: js"
+            );
+        }
         if !defect("server-silent") {
             println!("kbf-server listening reapi=127.0.0.1:8980 worker=127.0.0.1:8981");
             std::io::stdout().flush().expect("flush");
@@ -369,6 +375,14 @@ fn answer(request: &Request, defect: &str, counts: &Counts) -> (&'static str, St
                 "serving"
             };
             ("200 OK", placement(state, ""))
+        }
+        ("GET", "/metrics") => {
+            let (legacy, js) = if has("gauge-legacy") { (1, 0) } else { (0, 1) };
+            let body = format!(
+                "# TYPE kbf_scheduler_core gauge\nkbf_scheduler_core{{core=\"legacy\"}} {legacy}\n\
+                 kbf_scheduler_core{{core=\"js\"}} {js}\nkbf_other 7\n"
+            );
+            ("200 OK", body)
         }
         _ => ("404 Not Found", String::new()),
     }
@@ -831,4 +845,67 @@ fn a_failing_build_without_an_event_log_fails() {
 #[test]
 fn a_bucket_left_empty_fails() {
     fails("bucket-empty", 1, "FAIL: the bucket kbf-m1 holds no object");
+}
+
+/// `kbf-cell m1` as the js-core gate runs it: the flags for the server and the core it must
+/// report.
+fn js_core_command(cell: &Cell) -> Command {
+    let mut command = cell.command(&["buck2"]);
+    command.args([
+        "--server-arg=--scheduler-core=js",
+        "--server-arg=--placement-load=on",
+        "--expect-scheduler-core",
+        "js",
+    ]);
+    command
+}
+
+/// Catches: `--server-arg` flags that do not reach `kbf-server` (in order, after the cell's
+/// own), and `--expect-scheduler-core` that does not read the start line and the gauge
+/// both before the builds and after them.
+#[test]
+fn a_server_given_the_js_core_that_reports_it_passes() {
+    let cell = Cell::new("js-core", "none");
+    let out = js_core_command(&cell).output().expect("run kbf-cell m1");
+    assert_eq!(out.status.code(), Some(0), "{}", both(&out));
+    let ok = "OK: the server runs the js scheduler core (start line and gauge)";
+    assert_eq!(text(&out.stdout).matches(ok).count(), 2, "{}", both(&out));
+    let w = cell.work();
+    let server = cell.calls("kbf-server");
+    assert_eq!(server.len(), 1);
+    let tail = format!(
+        "--api-token-file {}/api-token --scheduler-core=js --placement-load=on",
+        w.display()
+    );
+    assert!(server[0].1.ends_with(&tail), "{}", server[0].1);
+    let scrapes = cell
+        .http
+        .requests()
+        .iter()
+        .filter(|r| r.target == "/metrics")
+        .count();
+    assert_eq!(scrapes, 2);
+}
+
+/// Catches: a run that expects a core and passes when the server never logged it (the
+/// gauge alone would pass on a server that reports the core but did not start it).
+#[test]
+fn a_server_that_does_not_log_the_expected_core_fails() {
+    let cell = Cell::new("js-core-silent", "core-line-missing");
+    let out = js_core_command(&cell).output().expect("run kbf-cell m1");
+    assert_eq!(out.status.code(), Some(1), "{}", both(&out));
+    let why = "FAIL: kbf-server did not log `scheduler core: js`";
+    assert!(text(&out.stderr).contains(why), "{}", both(&out));
+    assert!(cell.calls("kbf-cell").is_empty(), "no daemon starts");
+}
+
+/// Catches: a run that expects the js core and passes on a server whose gauge says legacy
+/// (a server that logged the flag but ran the legacy driver).
+#[test]
+fn a_server_whose_gauge_says_another_core_fails() {
+    let cell = Cell::new("js-core-gauge", "gauge-legacy");
+    let out = js_core_command(&cell).output().expect("run kbf-cell m1");
+    assert_eq!(out.status.code(), Some(1), "{}", both(&out));
+    let why = "FAIL: the server does not report the js core running";
+    assert!(text(&out.stderr).contains(why), "{}", both(&out));
 }
