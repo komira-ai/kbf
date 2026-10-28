@@ -74,6 +74,7 @@
 //! Not yet: re-adopting leases after a daemon restart (one systemd unit per lease) and
 //! networked actions.
 
+mod blocking_steps;
 pub mod cas;
 mod cgroup;
 mod cgroup_usage;
