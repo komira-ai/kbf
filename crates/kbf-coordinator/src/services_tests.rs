@@ -166,6 +166,7 @@ fn a_services_file_that_cannot_work_is_refused() {
         "[service.roles.daemon]\nafter = []\n",
     );
     Services::parse(&after_kbf).expect("kbf may be waited for");
+    Services::parse(&svc("js-server2", "", role)).expect("letters, digits and - make a name");
 }
 
 /// Catches: `after` not holding the second service until the first has converged: the agent
