@@ -187,7 +187,14 @@ async fn a_parcel_that_is_not_a_subject_leaves_the_empty_shape() {
 
     rig.core.with(|_, adapter| {
         let asked = request(3);
-        adapter.adopted(OperationId(0), WaiterId(10), Some(&parcel), &asked, None, None);
+        adapter.adopted(
+            OperationId(0),
+            WaiterId(10),
+            Some(&parcel),
+            &asked,
+            None,
+            None,
+        );
         adapter.adopted(
             OperationId(0),
             WaiterId(11),
