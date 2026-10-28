@@ -978,6 +978,7 @@ fn wire_lease(lease: LeaseId) -> worker::LeaseId {
     }
 }
 
+mod from_listeners;
 #[cfg(test)]
 mod learned_tests;
 #[cfg(test)]

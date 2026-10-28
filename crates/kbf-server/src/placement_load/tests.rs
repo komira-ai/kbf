@@ -8,7 +8,7 @@ use super::PlacementLoad;
 use crate::Args;
 
 /// Catches a default other than `off` (a server started with no flag would place by load
-/// while its daemons send none), a value not parsed, a value other than the three accepted
+/// while its daemons send none), a value not parsed, a value other than the two accepted
 /// (a typo, a capital, an empty value), a flag value that does not reach the listeners that
 /// build the farm, and a variant whose flag word differs from its name in the config file.
 #[test]

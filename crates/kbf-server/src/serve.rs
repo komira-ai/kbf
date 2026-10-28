@@ -793,15 +793,7 @@ where
         platform: listeners.default_platform,
         qos: listeners.qos_allowed,
     };
-    let farm = Farm::new(
-        Arc::clone(&cache),
-        listeners.unservable_wait,
-        listeners.finished_retention,
-    )
-    .with_memory_ladder(listeners.memory_ladder.clone())
-    .with_learned_sizes(listeners.learned_sizes, listeners.memory_ladder.first())
-    .with_placement_load(listeners.placement_load)
-    .recording(recorder.clone());
+    let farm = Farm::from_listeners(Arc::clone(&cache), &listeners).recording(recorder.clone());
     let durable = state.is_some();
     // Storage nodes register with a frontend that has a state store to keep them in.
     let members = members_of(state.as_ref(), None);
