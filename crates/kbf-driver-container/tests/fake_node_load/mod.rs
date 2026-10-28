@@ -53,7 +53,7 @@ async fn a_lease_is_covered_from_the_second_reading_and_leaves_with_its_peak() {
     let fake = Fake::new("node-load-hooks");
     let actions = fake.cgroup.join("actions");
     for (file, text) in [
-        ("cpu.stat", "usage_usec 0\nthrottled_usec 3\n"),
+        ("cpu.stat", "usage_usec 4242\nthrottled_usec 3\n"),
         ("memory.current", "1000\n"),
         ("memory.stat", "inactive_file 0\nactive_file 7\n"),
         ("cpu.max", "200000 100000\n"),
@@ -148,8 +148,10 @@ async fn a_lease_is_covered_from_the_second_reading_and_leaves_with_its_peak() {
         sent.load,
         worker::NodeLoad {
             seq: second.seq + 1,
-            mono_usec: sent.load.mono_usec,
-            cpu_usage_usec: 0,
+            // The clock moves by ten on each call: the second reading took it twice (itself,
+            // then the lease's `cpu.stat`), so this reading's own call is twenty on.
+            mono_usec: second.mono_usec + 20,
+            cpu_usage_usec: 4242,
             memory_working_set_bytes: 1000,
             covered: vec![worker::LeaseId { term: 1, seq: 1 }],
             actions_cpu_limited: true,
@@ -158,7 +160,6 @@ async fn a_lease_is_covered_from_the_second_reading_and_leaves_with_its_peak() {
             memory_active_file_bytes: 7,
         }
     );
-    assert!(sent.load.mono_usec > second.mono_usec);
 
     // The lease's start is the clock when `crun run` was spawned: before the first reading
     // that held it, and the same at every reading. Its cpu is what its `cpu.stat` said at
