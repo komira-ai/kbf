@@ -234,6 +234,8 @@ input-tree-reads-in-flight = 64
 pack-index = false
 # How often, in seconds, every open Execute and WaitExecution stream is sent its operation again (same name, not done, current stage), so a load balancer's idle timeout never cuts a long action. 0 sends none
 progress-interval-secs = 30
+# The QoS levels a call may ask for with the `x-kbf-qos` request header, as a comma list of `ci`, `batch` and `interactive` (`ci` is always allowed: it is what a call with no header, or a header naming a level not on the list, gets, and that call is never refused). The level orders the queue, most urgent first: a `batch` action waits behind every queued `ci` action. It is not part of the action digest, so it does not split the cache. A client that sends no header stays at `ci`
+qos-allowed = "ci,batch"
 # How long, in milliseconds, `GET /readyz` on the operator API and the REAPI listener's `grpc.health.v1` service wait for the object store to answer their read-only probe before they answer not ready
 readyz-store-timeout-ms = 2000
 # Which core drives the farm's scheduling. `legacy`, the default, is the driver the server has always had. `js` is not available in this release: a server given it refuses to start (exit status 2) and says so. The core a server runs is logged at start and exported as `kbf_scheduler_core{core}`, 1 for it and 0 for the other

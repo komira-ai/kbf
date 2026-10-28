@@ -290,6 +290,14 @@ pub struct Args {
     /// fits. Placement only: the action's digest and cache key do not change.
     #[arg(long, default_value_t = kbf_front::DefaultPlatform::LINUX_X86_64)]
     pub default_platform: kbf_front::DefaultPlatform,
+    /// The QoS levels a call may ask for with the `x-kbf-qos` request header, as a comma
+    /// list of `ci`, `batch` and `interactive` (`ci` is always allowed: it is what a call
+    /// with no header, or a header naming a level not on the list, gets, and that call is
+    /// never refused). The level orders the queue, most urgent first: a `batch` action
+    /// waits behind every queued `ci` action. It is not part of the action digest, so it
+    /// does not split the cache. A client that sends no header stays at `ci`
+    #[arg(long, default_value_t = kbf_front::QosAllow::DEFAULT)]
+    pub qos_allowed: kbf_front::QosAllow,
     /// The memory rungs of an action, in GiB, ascending and each at least 1. The first
     /// is what an action that names no size (`kbf-book-mem-gib`) books. An action that
     /// passes its own memory limit runs again on the next rung above what it booked,
@@ -864,6 +872,7 @@ impl Args {
             tick: Duration::from_secs(1),
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
             default_platform: self.default_platform,
+            qos_allowed: self.qos_allowed,
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
             vm_host_floor: HostFloor::new(self.vm_host_floor_cpus, self.vm_host_floor_mem_gib),
             learned_sizes: self.learned_sizes,

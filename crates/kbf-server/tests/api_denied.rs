@@ -57,6 +57,7 @@ fn listeners() -> Listeners {
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
+        qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,

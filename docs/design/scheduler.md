@@ -475,9 +475,29 @@ urgency. Every level at or below `batch` is preemptible.
 
 The queue is ordered by urgency, most urgent first, then by submission order.
 
-Today the front submits every action at `ci`. Reading the level from a request header
-(`x-kbf-qos`) and from REAPI's `ExecutionPolicy.priority` is **planned**, as are
-preemption of `batch` work, and fair turns between invocations within one level.
+### Choosing a level
+
+A client names its level with the request header `x-kbf-qos: <level>` on Execute (Buck2
+sends one for each `http_headers` entry of its `[buck2_re_client]` buckconfig section).
+What the front end does with it:
+
+- No header: `ci`. A client that sends none is unchanged.
+- The header names a level on the front end's list (`--qos-allowed`, `ci,batch` by
+  default; `interactive` is accepted only when the operator adds it): that level. The
+  value is read without regard to case or surrounding spaces.
+- Anything else (a level not on the list, a value that is no level, two `x-kbf-qos`
+  headers): `ci`. The call is **not** refused. The front end logs a warning, at most a few
+  a minute, naming the value that was ignored.
+
+The level is on the operation, not in the action: it is not a platform property, so an
+action sent at `ci` and at `batch` has one digest and one action-cache entry. Queued work
+orders by urgency, so a queued `batch` action starts after every queued `ci` action; a
+caller that joins a queued twin at a more urgent level promotes it (see the tests in
+`crates/js-sched/tests/scheduler.rs` in the jobscheduler repository, where the scheduler code and its tests now live).
+
+Not built yet: reading REAPI's `ExecutionPolicy.priority`, **preemption** of `batch` work
+(a running `batch` action keeps its slot while `ci` work waits; only what is queued is
+ordered), and fair turns between invocations within one level.
 
 ## Placement
 

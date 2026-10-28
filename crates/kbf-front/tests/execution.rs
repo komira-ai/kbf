@@ -7,6 +7,8 @@ mod common;
 mod error_causes_tests;
 #[path = "execution/platform.rs"]
 mod platform_tests;
+#[path = "execution/qos.rs"]
+mod qos_tests;
 #[path = "execution/refuse_platform.rs"]
 mod refuse_platform_tests;
 
