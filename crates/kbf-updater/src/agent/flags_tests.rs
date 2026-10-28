@@ -360,7 +360,7 @@ fn a_service_flag_that_is_wrong_is_refused() {
         ),
         ("db,ready-url=http://example.com:1/", "with an IP address"),
         (
-            "db,ready-url=http://10.0.0.1:1/",
+            "db,ready-url=http://203.0.113.5:1/",
             "must be a loopback address",
         ),
         ("db,ready-url=http://127.0.0.1:1/a b", "space or a control"),
