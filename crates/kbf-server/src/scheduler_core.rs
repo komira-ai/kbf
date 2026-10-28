@@ -24,6 +24,12 @@ impl SchedulerCore {
     /// The core every server runs in this release: the only one a start accepts.
     pub const RUNNING: Self = Self::Legacy;
 
+    /// The core a `Listeners` built by a test names. Always `Legacy` in this build.
+    #[must_use]
+    pub const fn under_test() -> Self {
+        Self::Legacy
+    }
+
     /// The value the flag takes and the gauge's `core` label carries.
     #[must_use]
     pub const fn name(self) -> &'static str {

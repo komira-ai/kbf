@@ -95,6 +95,8 @@ pub struct Listeners {
     pub vm_host_floor: HostFloor,
     /// Whether the farm shows `kbf-estimator` what finished (`--learned-sizes`).
     pub learned_sizes: crate::LearnedSizes,
+    /// Which core drives the farm's scheduling (`--scheduler-core`).
+    pub scheduler_core: crate::SchedulerCore,
     /// Whether placement reads the load the nodes report (`--placement-load`).
     pub placement_load: crate::PlacementLoad,
     /// The whole-node settings of the scheduler, if on (`--whole-node-max`).

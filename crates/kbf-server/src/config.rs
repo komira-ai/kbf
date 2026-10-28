@@ -893,6 +893,7 @@ impl Args {
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
             vm_host_floor: HostFloor::new(self.vm_host_floor_cpus, self.vm_host_floor_mem_gib),
             learned_sizes: self.learned_sizes,
+            scheduler_core: self.scheduler_core,
             placement_load: self.placement_load,
             whole_node: self.whole_node.config(),
             finished_retention: Duration::from_secs(self.finished_retention_secs),
