@@ -29,6 +29,7 @@ use kbf_state::Store;
 use kbf_types::{ActionKey, LeaseId, Resources, WorkerId};
 use tokio::sync::mpsc;
 
+use crate::tape::as_written;
 pub use crate::text::{Ended, Job};
 use crate::text::{
     GIB, ended_text, lease_list, lease_text, phase_text, result_of, wire_lease_text,
@@ -51,7 +52,7 @@ impl Session {
     pub async fn start(title: &str) -> Self {
         let mut session = Self {
             farm: None,
-            t: Transcript::new(title),
+            t: Transcript::new(title, as_written),
         };
         session.farm = Some(session.build(EpochPolicy::Keep));
         let farm = session.farm();

@@ -8,17 +8,20 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use js_server_core::{Beat, Core, NodeAction as CoreAction, Stream};
+use js_store::{RowCodec as _, Value};
 use kbf_caps::NodeCaps;
 use kbf_front::{Backend, Described, Submission};
 use kbf_proto::worker::{self, ServerMessage, server_message};
 use kbf_sched::{DaemonInstance, NodePhase, Request};
 use kbf_server::action_usage::Shapes;
 use kbf_server::farm::{NodeAction, Reported};
+use kbf_server::farm_js::codec::KbfRowCodec;
 use kbf_server::farm_js::dispatch;
 use kbf_server::farm_js::open;
 use kbf_server::farm_js::{Connection, KbfAdapter, Wall};
 use kbf_server::{EpochPolicy, PlacementLoad};
 use kbf_state::Store;
+use kbf_types::sched::usage::LeaseCost;
 use kbf_types::{ActionKey, FarmTime, LeaseId, Resources, WorkerId};
 use tokio::sync::mpsc;
 
@@ -43,6 +46,27 @@ pub struct Session {
     started: tokio::time::Instant,
 }
 
+/// The value of a row as the tape writes it down: a lease row with the cost admission charged
+/// the lease taken out, and every other row as it is.
+///
+/// This is the one difference between the rows of the two drivers. The farm's own driver
+/// writes the grant of a `StartLease`, which has no cost; the core writes the grant it
+/// committed, which has. The row is read with the codec the core writes it with, the cost is
+/// set to the default and the row is written again, so everything else in it (the lease, the
+/// operation, the node) is still compared, byte for byte, with the farm's.
+pub fn without_lease_cost(key: &str, value: &[u8]) -> Vec<u8> {
+    let read = KbfRowCodec.read(key, value);
+    match read {
+        Ok(Value::Lease(mut grant) | Value::LegacyLease(mut grant))
+            if key.starts_with("lease/") =>
+        {
+            grant.cost = LeaseCost::default();
+            KbfRowCodec.lease(&grant).unwrap_or_else(|_| value.to_vec())
+        }
+        _ => value.to_vec(),
+    }
+}
+
 /// Milliseconds since `started` on tokio's clock.
 fn elapsed_ms(started: tokio::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -51,7 +75,7 @@ fn elapsed_ms(started: tokio::time::Instant) -> u64 {
 impl Session {
     /// A core over an empty store, as a first start (the store's epoch is the seed).
     pub async fn start(title: &str) -> Self {
-        let t = Transcript::new(title);
+        let t = Transcript::new(title, without_lease_cost);
         let backend: Backend = t.cache.clone().into();
         let started = tokio::time::Instant::now();
         let mut session = Self {

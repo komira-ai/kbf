@@ -10,6 +10,11 @@
 //!
 //! The golden files are the farm's: they are read from `tests/farm_core_trace/golden` and
 //! never written from here.
+//!
+//! What these scripts do not reach: the `ResultAck` the adapter's `settle` sends to a node when
+//! a result was held until its record was written (no script makes the state store refuse).
+//! `farm_js::dispatch_tests::a_held_result_is_acknowledged_and_answered_once_its_record_is_written`
+//! pins it. Nor do they read a store written by one driver with the other.
 
 #[path = "../farm_core_trace/scenarios.rs"]
 mod scenarios;
@@ -71,69 +76,17 @@ fn first_difference(want: &str, got: &str) -> Option<String> {
     ))
 }
 
-/// Whether `line` is the write of a lease row.
-fn is_lease_row(line: &str) -> bool {
-    line.trim_start().starts_with("put lease/")
-}
-
-/// The length a written row's line gives, in bytes.
-fn row_len(line: &str) -> Option<usize> {
-    let (_, rest) = line.split_once(" len=")?;
-    rest.split_once(' ')?.0.parse().ok()
-}
-
-/// `text` with the length and hash of every lease row left out.
-///
-/// The one difference between the rows of the two drivers: a lease row the core writes
-/// carries the cost admission charged the lease (a field the log's lease record has since the
-/// scheduler library was raised, which an older binary skips), and one the farm's own driver
-/// writes does not. Every other row, and every line that is not a row, is compared as it
-/// is.
-fn without_lease_costs(text: &str) -> String {
-    let lines: Vec<String> = text
-        .lines()
-        .map(
-            |line| match (is_lease_row(line), line.split_once(" len=")) {
-                (true, Some((head, rest))) => {
-                    let ttl = rest.split_once(" ttl=").map_or("", |(_, ttl)| ttl);
-                    format!("{head} ttl={ttl}")
-                }
-                _ => line.to_owned(),
-            },
-        )
-        .collect();
-    lines.join("\n") + "\n"
-}
-
-/// The lines of `got` that are not the golden file's `want`, each with its golden line.
-fn changed_lines<'a>(want: &'a str, got: &'a str) -> Vec<(&'a str, &'a str)> {
-    let pairs = want.lines().zip(got.lines());
-    pairs.filter(|(want, got)| want != got).collect()
-}
-
-/// Compares the text the core wrote for a script with the golden file of the farm: the same
-/// text but for the cost in each lease row, which only grows the row.
+/// Compares the text the core wrote for a script with the golden file of the farm, line for
+/// line. The lease rows the core writes are written down without the cost admission charged
+/// the lease (`session::without_lease_cost`); nothing else is set aside.
 fn check(name: &str, text: &str) {
     let path = golden_path(name);
     let want = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("no golden file {}: {e}", path.display()));
-    let (masked_want, masked_text) = (without_lease_costs(&want), without_lease_costs(text));
-    if let Some(difference) = first_difference(&masked_want, &masked_text) {
+    if let Some(difference) = first_difference(&want, text) {
         panic!(
             "the core did not do what the farm does in {}\n{difference}",
             path.display()
-        );
-    }
-    assert_eq!(want.lines().count(), text.lines().count());
-    for (want, got) in changed_lines(&want, text) {
-        assert!(
-            is_lease_row(want) && is_lease_row(got),
-            "{want:?} became {got:?}"
-        );
-        let (want, got) = (row_len(want), row_len(got));
-        assert!(
-            got > want,
-            "a lease row with a cost is longer: {want:?} became {got:?}"
         );
     }
 }
@@ -166,26 +119,62 @@ scripts!(
     cordon_and_drain,
 );
 
-/// Catches a mask that sets aside more than the length and hash of a lease row: the key, the
-/// condition and the time to live of the row, and every other row, are still compared.
+/// Catches a normalisation that takes out more than the cost: a lease row with a cost is
+/// written down as the same row without one, and as no other; a lease row that differs in
+/// its lease, its operation or its node stays different; every other row is written as it is.
 #[test]
-fn only_the_length_and_hash_of_a_lease_row_are_set_aside() {
-    let lease = |key: &str, len: usize, ttl: &str| {
-        format!("    put lease/{key} cond=absent len={len} sha=ab ttl={ttl}\n")
-    };
-    let masked = |text: String| without_lease_costs(&text);
+fn the_lease_row_is_written_down_without_its_cost_and_with_everything_else() {
+    use js_store::RowCodec as _;
+    use kbf_server::farm_js::codec::KbfRowCodec;
+    use kbf_types::sched::usage::LeaseCost;
+    use kbf_types::{LeaseGrant, LeaseId, OperationId, WorkerId};
 
-    assert_eq!(masked(lease("7.0", 20, "-")), masked(lease("7.0", 42, "-")));
-    assert_ne!(masked(lease("7.0", 20, "-")), masked(lease("7.1", 20, "-")));
+    let cost = LeaseCost {
+        cpu_millis: 4,
+        memory_bytes: 5,
+        limit_bytes: 6,
+        cold: true,
+        retry: true,
+        key_hash: 7,
+    };
+    let grant = |seq, operation, node: &str, cost| LeaseGrant {
+        lease: LeaseId::new(7, seq),
+        operation: OperationId(operation),
+        worker: WorkerId::new(node),
+        cost,
+    };
+    let row = |grant: &LeaseGrant| KbfRowCodec.lease(grant).expect("a lease row");
+    let key = "lease/0000000000000007.0000000000000000";
+    let written = |grant: &LeaseGrant| session::without_lease_cost(key, &row(grant));
+    let plain = grant(0, 0, "node-a", LeaseCost::default());
+
+    assert_eq!(written(&grant(0, 0, "node-a", cost)), row(&plain));
     assert_ne!(
-        masked(lease("7.0", 20, "-")),
-        masked(lease("7.0", 20, "60ms"))
+        row(&grant(0, 0, "node-a", cost)),
+        row(&plain),
+        "the cost is in the row"
     );
-    let op = |len| format!("    put op/0 cond=absent len={len} sha=ab ttl=-\n");
-    assert_ne!(masked(op(75)), masked(op(76)));
+    for other in [
+        grant(1, 0, "node-a", cost),
+        grant(0, 1, "node-a", cost),
+        grant(0, 0, "node-b", cost),
+    ] {
+        assert_ne!(written(&other), row(&plain), "{other:?}");
+    }
+    let bytes = b"not a lease row".to_vec();
+    assert_eq!(session::without_lease_cost("session/node-a", &bytes), bytes);
     assert_eq!(
-        row_len("    put lease/7.0 cond=absent len=42 sha=ab ttl=-"),
-        Some(42)
+        session::without_lease_cost(key, &bytes),
+        bytes,
+        "unreadable: as it is"
+    );
+    assert_eq!(
+        session::without_lease_cost(
+            "lease-by-op/0000000000000000",
+            &row(&grant(0, 0, "node-a", cost))
+        ),
+        row(&grant(0, 0, "node-a", cost)),
+        "only the rows of leases"
     );
 }
 

@@ -17,7 +17,7 @@ use kbf_types::LeaseId;
 use tokio::sync::{mpsc, watch};
 use tonic::Status;
 
-use crate::tape::Tape;
+use crate::tape::{Normalise, Tape, as_written};
 use crate::text::{Job, digest_of, message_text, stage_text};
 
 /// The action cache of a scripted session.
@@ -73,10 +73,11 @@ pub struct Transcript<S> {
 }
 
 impl<S: Copy> Transcript<S> {
-    /// An empty transcript of a script called `title`, over an empty store.
-    pub fn new(title: &str) -> Self {
+    /// An empty transcript of a script called `title`, over an empty store whose tape writes
+    /// values down as `normalise` says.
+    pub fn new(title: &str, normalise: Normalise) -> Self {
         Self {
-            tape: Arc::new(Tape::new()),
+            tape: Arc::new(Tape::new(normalise)),
             cache: Arc::new(Cache::memory()),
             out: vec![format!("# {title}")],
             nodes: BTreeMap::new(),
@@ -132,7 +133,7 @@ impl<S: Copy> Transcript<S> {
     pub fn restart(&mut self) {
         self.nodes.clear();
         self.watched.clear();
-        let old = std::mem::replace(&mut self.tape, Arc::new(Tape::new()));
+        let old = std::mem::replace(&mut self.tape, Arc::new(Tape::new(as_written)));
         let old = Arc::into_inner(old).expect("nothing but the dead server held the store");
         self.tape = Arc::new(old.restart());
     }
