@@ -68,30 +68,19 @@ fn placed(mode: Option<PlacementLoad>, test_core: bool) -> LoadCounters {
     farm.lock().sched.load_counters()
 }
 
-/// Catches a farm placing by load without being told to (the library's default is `on`:
-/// a scheduler built without a configuration of kbf's would admit by the load rule and
-/// count `admitted`), a `shadow` that places by the load rule or counts nothing, an `on`
-/// the scheduler never hears of, and a test farm or a farm given `off` that is not on the
-/// booked rule.
+/// Catches a farm placing by load without being told to (the library's default is to
+/// place by load: a scheduler built without a configuration of kbf's would admit by the
+/// load rule and count `admitted`), an `on` the scheduler never hears of, and a test farm
+/// or a farm given `off` that is not on the booked rule.
 #[test]
 fn a_farm_places_by_the_rule_its_flag_names() {
-    let admitted = |c: LoadCounters| c.admitted;
-    let shadowed = |c: LoadCounters| c.would_admit + c.would_block;
-
     for (name, counters) in [
         ("Farm::new", placed(None, false)),
         ("off", placed(Some(PlacementLoad::Off), false)),
         ("for_test", placed(None, true)),
     ] {
-        assert_eq!(admitted(counters), 0, "{name} admitted by load");
-        assert_eq!(shadowed(counters), 0, "{name} counted a shadow decision");
+        assert_eq!(counters.admitted, 0, "{name} admitted by load");
     }
-
-    let shadow = placed(Some(PlacementLoad::Shadow), false);
-    assert_eq!(admitted(shadow), 0, "shadow placed by load");
-    assert_eq!(shadowed(shadow), 1, "shadow counted no decision");
-
     let on = placed(Some(PlacementLoad::On), false);
-    assert_eq!(admitted(on), 1, "on did not place by load");
-    assert_eq!(shadowed(on), 0);
+    assert_eq!(on.admitted, 1, "on did not place by load");
 }

@@ -52,7 +52,7 @@ fn the_frontend_takes_placement_load_and_defaults_to_off() {
     use crate::PlacementLoad;
     let mode = |more: &[&str]| parsed(more).expect("flags").server.placement_load;
     assert_eq!(mode(&[]), PlacementLoad::Off);
-    assert_eq!(mode(&["--placement-load=shadow"]), PlacementLoad::Shadow);
+    assert_eq!(mode(&["--placement-load=off"]), PlacementLoad::Off);
     assert_eq!(mode(&["--placement-load", "on"]), PlacementLoad::On);
     assert!(parsed(&["--placement-load=load"]).is_err());
 }

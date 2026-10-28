@@ -354,8 +354,7 @@ pub struct Args {
     )]
     pub scheduler_core: crate::SchedulerCore,
     /// Whether placement reads the load the nodes report. `off`, the default, books by
-    /// the CPUs a lease asks for, as the server always has, and reads no load. `shadow`
-    /// places as `off` does and counts what the load rule would have decided. `on` admits
+    /// the CPUs a lease asks for, as the server always has, and reads no load. `on` admits
     /// and ranks nodes by the load they report and the load a lease is predicted to add;
     /// a node that reports none is charged by prediction alone
     // The text above states the default; the help golden cannot hold the whitespace-only

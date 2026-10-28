@@ -13,8 +13,6 @@ pub enum PlacementLoad {
     /// Placement books by the CPUs a lease asks for, as it always has; the load is not read.
     #[default]
     Off,
-    /// Placement is as `off`, and the scheduler counts what the load rule would have decided.
-    Shadow,
     /// Placement admits and ranks nodes by the load they report and the load a lease is
     /// predicted to add.
     On,
@@ -26,7 +24,6 @@ impl PlacementLoad {
     pub const fn mode(self) -> kbf_sched::PlacementLoad {
         match self {
             Self::Off => kbf_sched::PlacementLoad::Off,
-            Self::Shadow => kbf_sched::PlacementLoad::Shadow,
             Self::On => kbf_sched::PlacementLoad::On,
         }
     }
