@@ -144,9 +144,15 @@ fn the_check_refuses_each_way_to_turn_the_feature_on() {
     let ok = [manifest(OWNER, owner), manifest(FORWARDER, forward)];
     assert!(is_clean(&problems(&ok)), "{:?}", problems(&ok));
     let default_forward = format!("{forward}default = [\"farm-core-js\"]\n");
-    let bad = [manifest(OWNER, owner), manifest(FORWARDER, &default_forward)];
+    let bad = [
+        manifest(OWNER, owner),
+        manifest(FORWARDER, &default_forward),
+    ];
     assert_eq!(problems(&bad).len(), 1, "{:?}", problems(&bad));
-    let elsewhere = [manifest(OWNER, owner), manifest("crates/kbf-node/Cargo.toml", forward)];
+    let elsewhere = [
+        manifest(OWNER, owner),
+        manifest("crates/kbf-node/Cargo.toml", forward),
+    ];
     assert_eq!(problems(&elsewhere).len(), 1, "{:?}", problems(&elsewhere));
 
     let gone = [manifest(OWNER, "[features]\ntestkit = []\n")];
