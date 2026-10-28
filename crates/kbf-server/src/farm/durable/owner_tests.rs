@@ -423,6 +423,7 @@ fn a_store_with_owner_and_index_rows_reads_as_it_did_without_them() {
         "cordon/",
         "inflight/",
         "opkey/",
+        "opwall/",
         "keyfloor/",
         "est/",
         "meta/",

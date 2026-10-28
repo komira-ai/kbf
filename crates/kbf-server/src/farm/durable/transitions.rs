@@ -284,12 +284,19 @@ impl Durable {
         let txn = txn.delete(key.clone(), Cond::Version(row.version));
         let txn = self.unpin(txn, operation)?;
         let txn = self.noting(txn, operation, ending)?;
-        let settled = ending.settle_with(&*self.ext, txn, operation);
+        let walled = self.has_wall(operation)?;
+        let settled = ending.settle_with(&*self.ext, txn, operation, walled);
         let committed = self.commit_owned(&worker, settled);
         if matches!(committed, Err(StateError::Conflict(_))) && self.store.get(&key)?.is_none() {
             return self.end_queued(operation, ending, &key, |_| true);
         }
         committed
+    }
+
+    /// Whether the store holds an `opwall/` row for `operation`: only then does the finish
+    /// delete one.
+    fn has_wall(&self, operation: OperationId) -> Result<bool, StateError> {
+        Ok(self.store.get(&opwall_key(operation))?.is_some())
     }
 
     /// A refusal committed: the operation is finished without a lease, and its `done/`
@@ -330,7 +337,8 @@ impl Durable {
                 .delete(op, Cond::Version(unfinished.version));
             let txn = self.unpin(txn, operation)?;
             let txn = self.noting(txn, operation, ending)?;
-            let settled = ending.settle_rest(&*self.ext, txn, operation, Cond::Absent);
+            let walled = self.has_wall(operation)?;
+            let settled = ending.settle_rest(&*self.ext, txn, operation, walled, Cond::Absent);
             let committed = self.commit(settled);
             if !matches!(committed, Err(StateError::Conflict(_))) {
                 return committed;
