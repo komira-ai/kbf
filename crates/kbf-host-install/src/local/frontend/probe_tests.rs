@@ -10,24 +10,65 @@ use std::time::Duration;
 use super::probe::{Http, Probe, Reply, commit, ready};
 use crate::pace::{fake::Fake, real_now};
 
-/// A server that answers one connection with `answer`, then closes. The request it read.
-fn serve(answer: Vec<u8>) -> (SocketAddr, JoinHandle<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = Vec::new();
-        let mut byte = [0_u8; 1];
-        while !request.ends_with(b"\r\n\r\n") {
-            if stream.read(&mut byte).unwrap() == 0 {
-                break;
+/// A listener on loopback. The kernel picks the port from the range every connection on this
+/// machine draws its source ports from, and a box that has thousands of connections in
+/// `TIME_WAIT` can refuse a bind (`AddrInUse`) for a moment, so a refusal is tried again.
+fn bind() -> (TcpListener, SocketAddr) {
+    let mut tries = 0;
+    loop {
+        match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => {
+                let addr = listener.local_addr().unwrap();
+                return (listener, addr);
             }
-            request.push(byte[0]);
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tries < 100 => {
+                tries += 1;
+                thread::yield_now();
+            }
+            Err(e) => panic!("bind: {e}"),
         }
-        let _ = stream.write_all(&answer);
-        String::from_utf8(request).unwrap()
+    }
+}
+
+/// A server that answers its connections in turn, one `answer` each, then closes each. The
+/// requests it read. The listener is bound before this returns, so a client never dials a
+/// port nobody holds, and one port serves every answer of a test.
+fn serve_all(answers: Vec<Vec<u8>>) -> (SocketAddr, JoinHandle<Vec<String>>) {
+    let (listener, addr) = bind();
+    let handle = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for answer in answers {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap() == 0 {
+                    break;
+                }
+                request.push(byte[0]);
+            }
+            let _ = stream.write_all(&answer);
+            requests.push(String::from_utf8(request).unwrap());
+        }
+        requests
     });
     (addr, handle)
+}
+
+/// `GET path` at `addr` for a server that is bound: a connection that the machine reset or
+/// timed out before the server took it (the listener is bound, so only the machine's own
+/// handling of a source port that is in `TIME_WAIT` does that) is dialled again, as the
+/// program's own wait for readiness dials again. Anything else is the answer.
+fn get(addr: SocketAddr, path: &str) -> Result<Reply, String> {
+    let mut tries = 0;
+    loop {
+        let answer = http().get(addr, path);
+        let transient = |why: &str| why.contains("os error 104") || why.contains("timed out");
+        match &answer {
+            Err(why) if transient(why) && tries < 20 => tries += 1,
+            _ => return answer,
+        }
+    }
 }
 
 fn http() -> Http {
@@ -41,9 +82,11 @@ fn http() -> Http {
 /// status and the body come back as sent.
 #[test]
 fn a_get_is_sent_and_the_status_and_body_come_back() {
-    let (addr, server) =
-        serve(b"HTTP/1.1 200 OK\r\ncontent-length: 13\r\n\r\n{\"ready\":true}".to_vec());
-    let reply = http().get(addr, "/readyz").unwrap();
+    let (addr, server) = serve_all(vec![
+        b"HTTP/1.1 200 OK\r\ncontent-length: 13\r\n\r\n{\"ready\":true}".to_vec(),
+        b"HTTP/1.0 503 Service Unavailable\r\n\r\n".to_vec(),
+    ]);
+    let reply = get(addr, "/readyz").unwrap();
     assert_eq!(
         reply,
         Reply {
@@ -51,34 +94,36 @@ fn a_get_is_sent_and_the_status_and_body_come_back() {
             body: "{\"ready\":true}".to_owned()
         }
     );
+    assert_eq!(get(addr, "/readyz").unwrap().status, 503);
     assert_eq!(
         server.join().unwrap(),
-        format!("GET /readyz HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+        vec![format!("GET /readyz HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n"); 2]
     );
-
-    let (addr, _) = serve(b"HTTP/1.0 503 Service Unavailable\r\n\r\n".to_vec());
-    assert_eq!(http().get(addr, "/readyz").unwrap().status, 503);
 }
 
 /// An answer that is not an HTTP/1 response is an error, and so is a server that is not there.
 #[test]
 fn what_is_not_an_http_answer_is_an_error() {
-    for bad in [
+    let bads: Vec<Vec<u8>> = [
         &b"hello\r\n\r\n"[..],
         b"HTTP/2 200\r\n\r\n",
         b"HTTP/1.1 OK\r\n\r\n",
         b"HTTP/1.1 200 OK\r\n",
         b"HTTP/1.1 200 OK\r\n\xff\r\n\r\n",
         b"",
-    ] {
-        let (addr, _) = serve(bad.to_vec());
-        let why = http().get(addr, "/readyz").unwrap_err();
+    ]
+    .iter()
+    .map(|bad| bad.to_vec())
+    .collect();
+    let (addr, _) = serve_all(bads.clone());
+    for bad in &bads {
+        let why = get(addr, "/readyz").unwrap_err();
         assert!(why.contains("not an HTTP response"), "{bad:?}: {why}");
     }
 
-    let gone = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = gone.local_addr().unwrap();
-    drop(gone);
+    // Nothing listens on port 1 (a port that is not drawn for a source port or a test's
+    // server), so the dial is refused; it is not a port a test freed a moment ago.
+    let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
     assert!(http().get(addr, "/readyz").unwrap_err().contains("/readyz"));
 }
 
@@ -92,8 +137,7 @@ fn a_call_ends_at_its_limit_on_the_clock_it_was_given() {
 
     // A server that accepts and says nothing until the call has ended. The first reading is
     // the start of the call; the second, after the connection, is two hours later.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
+    let (listener, addr) = bind();
     let (release, released) = std::sync::mpsc::channel::<()>();
     let silent = thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
@@ -117,8 +161,7 @@ fn a_call_ends_at_its_limit_on_the_clock_it_was_given() {
 
     // One whose answer never ends (more than a read takes at a time) and has no end of head:
     // each look at the clock is twenty minutes later, so the fourth finds the hour up.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
+    let (listener, addr) = bind();
     let dripping = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let _ = stream.write_all(&[b'X'; 60 * 1024]);
@@ -147,8 +190,8 @@ fn a_call_ends_at_its_limit_on_the_clock_it_was_given() {
 fn an_answer_is_read_up_to_its_limit() {
     let mut big = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
     big.extend(std::iter::repeat_n(b'a', 200 * 1024));
-    let (addr, _) = serve(big);
-    let reply = http().get(addr, "/healthz").unwrap();
+    let (addr, _) = serve_all(vec![big]);
+    let reply = get(addr, "/healthz").unwrap();
     assert_eq!(reply.status, 200);
     assert!(reply.body.len() < 100 * 1024);
 }
