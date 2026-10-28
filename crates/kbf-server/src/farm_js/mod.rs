@@ -29,6 +29,7 @@ pub mod host;
 pub mod load;
 pub mod open;
 mod record;
+mod report_hooks;
 
 pub use adapter::{KbfAdapter, Outbound, Wall};
 pub use host::{Caller, Connection};

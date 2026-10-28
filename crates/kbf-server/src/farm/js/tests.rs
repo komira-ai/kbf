@@ -15,6 +15,7 @@ use crate::PlacementLoad;
 use crate::farm::EpochPolicy;
 use crate::state_store::StateStore;
 
+mod hot;
 mod views;
 
 fn farm() -> Farm {
