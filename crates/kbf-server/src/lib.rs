@@ -154,6 +154,8 @@ pub mod stores;
 pub mod streams;
 #[cfg(test)]
 mod test_dir;
+#[cfg(test)]
+mod test_log;
 mod timeout;
 pub mod token;
 pub mod ui_mount;

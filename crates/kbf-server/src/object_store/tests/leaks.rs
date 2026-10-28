@@ -1,9 +1,7 @@
 //! Where a secret may appear: in its file, and nowhere else. Each scan first checks the
 //! sentinel IS in the file, so a scan of the wrong place cannot pass by finding nothing.
 
-use std::io;
 use std::os::unix::fs::PermissionsExt as _;
-use std::sync::{Arc, Mutex};
 
 use kbf_types::object_store_api::BindingRole;
 use sha2::{Digest as _, Sha256};
@@ -147,31 +145,11 @@ fn nothing_the_registry_returns_or_formats_holds_the_secret() {
     }
 }
 
-#[derive(Clone, Default)]
-struct Lines(Arc<Mutex<Vec<u8>>>);
-
-impl io::Write for Lines {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 // Catches a log line (at TRACE, the most a subscriber can ask for) that carries the
 // secret or the request, on the paths that log: the removal of a file that stays behind.
 #[test]
 fn the_logs_never_hold_the_secret() {
-    let lines = Lines::default();
-    let writer = lines.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::TRACE)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let lines = crate::test_log::capture_at(tracing::Level::TRACE);
 
     let store = as_store(&fake());
     let root = scratch("leak-log");
@@ -186,7 +164,7 @@ fn the_logs_never_hold_the_secret() {
     reg.put_connection(&name("cold"), &put(SECOND)).unwrap();
     reg.delete_connection(&name("cold")).unwrap();
 
-    let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+    let text = lines.text();
     assert!(
         text.contains("unreferenced secret file"),
         "the path that logs ran: {text}"

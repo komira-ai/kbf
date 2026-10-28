@@ -1,8 +1,5 @@
 //! Unit tests of `--scheduler-core` (`super`).
 
-use std::io;
-use std::sync::{Arc, Mutex, PoisonError};
-
 use clap::error::ErrorKind;
 use clap::{Parser, ValueEnum};
 use kbf_meta::Retention;
@@ -10,6 +7,7 @@ use kbf_objstore::{Floor, FsStore};
 
 use super::{SchedulerCore, render};
 use crate::start_exit::{REFUSED, StartFailure};
+use crate::test_log::capture;
 use crate::{Args, ConfigError, RaftMetaLog, serve_with, start};
 
 /// Catches a default other than `legacy` (a server started with no flag would change
@@ -97,39 +95,6 @@ fn the_gauge_is_one_for_the_running_core_and_zero_for_the_other() {
     );
 }
 
-/// A log writer the test reads back.
-#[derive(Clone, Default)]
-struct Log(Arc<Mutex<Vec<u8>>>);
-
-impl io::Write for Log {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Log {
-    type Writer = Log;
-
-    fn make_writer(&'a self) -> Log {
-        self.clone()
-    }
-}
-
-impl Log {
-    fn text(&self) -> String {
-        let bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        String::from_utf8_lossy(&bytes).into_owned()
-    }
-}
-
 /// Catches a start that does not log the core it runs, and a refusal that comes after
 /// anything is opened. A server over a log and store the test opened logs
 /// `scheduler core: legacy` once; `js` is refused by `serve_with` before anything is
@@ -151,14 +116,7 @@ async fn a_start_logs_the_core_and_js_is_refused_before_anything_opens() {
         }
     };
     let flags = ["--listen=127.0.0.1:0", "--worker-listen=127.0.0.1:0"];
-    let log = Log::default();
-    let guard = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_writer(log.clone())
-            .with_ansi(false)
-            .finish(),
-    );
-    tracing_core::callsite::rebuild_interest_cache();
+    let log = capture();
 
     let (meta, store, prefix, id) = open("legacy").await;
     let args = Args::parse_from(["kbf-server"].into_iter().chain(flags));
@@ -211,7 +169,7 @@ async fn a_start_logs_the_core_and_js_is_refused_before_anything_opens() {
     for path in [&cold, &hot, &meta, &state, &root.join("start-log")] {
         assert!(!path.exists(), "{} was created", path.display());
     }
-    drop(guard);
+    // The `legacy` line above is in this same capture, so the absence is not an empty one.
     assert!(
         !log.text().contains("scheduler core: js"),
         "a refused core is never logged as running"
