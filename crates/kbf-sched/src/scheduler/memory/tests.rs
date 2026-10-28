@@ -293,7 +293,7 @@ const PRESSURE: Outcome = Outcome::Failed(Failure::NodeMemoryPressure);
 
 fn done() -> Outcome {
     Outcome::Completed {
-        action_result: Digest::new(DigestFunction::Sha256, [7; 32], 1),
+        action_result: Digest::new(DigestFunction::Sha256, [7; 32], 1).into(),
     }
 }
 

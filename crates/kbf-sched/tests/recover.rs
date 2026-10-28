@@ -23,7 +23,7 @@ const TERM: u64 = 7;
 
 fn request(tag: u8) -> Request {
     Request {
-        key: kbf_sim::work_key(
+        key: kbf_types::work_key(
             "main",
             Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
         ),

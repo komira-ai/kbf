@@ -32,6 +32,17 @@ fn dedup_text(action: &Digest) -> String {
     }
 }
 
+/// The key of action `action` on REAPI instance `instance`: the class is the instance
+/// name and the dedup text is the digest's text form, as the build's bridge makes it.
+#[must_use]
+pub fn work_key(instance: &str, action: Digest) -> WorkKey {
+    ActionKey {
+        instance: instance.to_owned(),
+        action,
+    }
+    .into()
+}
+
 impl From<ActionKey> for WorkKey {
     fn from(key: ActionKey) -> Self {
         Self {
@@ -81,6 +92,22 @@ mod tests {
             assert_eq!(WorkKey::from(original.clone()), work);
             assert_eq!(ActionKey::try_from(&work), Ok(original));
         }
+    }
+
+    /// Catches: a helper that builds a key the bridge reads back as another action.
+    #[test]
+    fn the_work_key_helper_reads_back_as_the_instance_and_digest() {
+        let action = Digest::new(DigestFunction::Sha256, [3; 32], 9);
+        let made = work_key("main", action);
+        assert_eq!(made.class, "main");
+        assert_eq!(made, WorkKey::from(key("main", 3, 9)));
+        assert_eq!(
+            ActionKey::try_from(&made),
+            Ok(ActionKey {
+                instance: "main".to_owned(),
+                action
+            })
+        );
     }
 
     /// Catches: a dedup text that is not the digest's own text form, which would change

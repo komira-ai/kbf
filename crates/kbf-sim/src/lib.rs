@@ -26,11 +26,9 @@ mod rng;
 mod sim;
 pub mod text;
 mod trace;
-mod work;
 
 pub use net::{Faults, NodeId, Partition};
 pub use node::{Event, Node, NodeInput, Output};
 pub use rng::{Chance, SimRng};
 pub use sim::Sim;
 pub use trace::{FORMAT_VERSION, Trace, TraceHash};
-pub use work::work_key;

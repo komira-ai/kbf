@@ -18,7 +18,7 @@ const GIB: u64 = 1 << 30;
 
 fn request() -> Request {
     Request {
-        key: kbf_sim::work_key("main", Digest::new(DigestFunction::Sha256, [7; 32], 7)),
+        key: kbf_types::work_key("main", Digest::new(DigestFunction::Sha256, [7; 32], 7)),
         qos: Qos::Ci,
         kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),
@@ -182,7 +182,7 @@ fn report(grant: &LeaseGrant) -> Event {
         operation: grant.operation,
         lease: grant.lease,
         outcome: Outcome::Completed {
-            action_result: Digest::new(DigestFunction::Sha256, [9; 32], 9),
+            action_result: Digest::new(DigestFunction::Sha256, [9; 32], 9).into(),
         },
     }
 }

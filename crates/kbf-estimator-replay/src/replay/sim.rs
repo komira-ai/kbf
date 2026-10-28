@@ -463,7 +463,7 @@ impl Sim<'_> {
             Outcome::Failed(Failure::OutOfMemory)
         } else {
             Outcome::Completed {
-                action_result: Digest::new(DigestFunction::Sha256, [0; 32], 0),
+                action_result: Digest::new(DigestFunction::Sha256, [0; 32], 0).into(),
             }
         };
         let effects = self.feed(Event::Report {

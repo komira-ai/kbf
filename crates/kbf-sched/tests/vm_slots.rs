@@ -22,7 +22,7 @@ fn digest(n: u8) -> Digest {
 /// Operation `n` of `kind` with `resources`.
 fn request(n: u8, kind: LeaseKind, resources: Resources) -> Request {
     Request {
-        key: kbf_sim::work_key("main", digest(n)),
+        key: kbf_types::work_key("main", digest(n)),
         qos: Qos::Ci,
         kind,
         resources,
@@ -124,7 +124,7 @@ impl Harness {
             operation: grant.operation,
             lease: grant.lease,
             outcome: Outcome::Completed {
-                action_result: digest(200),
+                action_result: digest(200).into(),
             },
         });
         let [Effect::Commit(record)] = proposed.as_slice() else {

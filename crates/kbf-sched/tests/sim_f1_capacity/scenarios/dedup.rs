@@ -61,7 +61,7 @@ impl Scenario for Dedup {
             let mut req = request(key, qos, Resources::new(2_000, 4 * GIB), ANY);
             match rng.below(8) {
                 0 => {
-                    req.key = kbf_sim::work_key("other", digest(key));
+                    req.key = kbf_types::work_key("other", digest(key));
                     self.other_instance += 1;
                 }
                 1 => {

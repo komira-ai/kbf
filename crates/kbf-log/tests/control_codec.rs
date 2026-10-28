@@ -221,7 +221,7 @@ impl Rng {
         ];
         if self.below(2) == 0 {
             Outcome::Completed {
-                action_result: self.digest(),
+                action_result: self.digest().into(),
             }
         } else {
             Outcome::Failed(self.pick(&failures))

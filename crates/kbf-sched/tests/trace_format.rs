@@ -36,7 +36,7 @@ fn caps() -> NodeCaps {
 
 fn request(cpu_millis: u64) -> Request {
     Request {
-        key: kbf_sim::work_key("main", digest(1)),
+        key: kbf_types::work_key("main", digest(1)),
         qos: Qos::Ci,
         kind: LeaseKind::WholeMachine,
         resources: Resources::new(cpu_millis, 2),
@@ -144,7 +144,7 @@ fn every_event_has_its_fixed_spelling() {
                 operation: OperationId(7),
                 lease: lease(),
                 outcome: Outcome::Completed {
-                    action_result: digest(2),
+                    action_result: digest(2).into(),
                 },
             },
             format!("report(op=op7 lease=1.4 outcome=done({}))", digest_text(2)),

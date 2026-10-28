@@ -263,7 +263,7 @@ pub fn result_digest(action: &Digest, lease: LeaseId) -> Digest {
 #[must_use]
 pub fn request(n: u64) -> Request {
     Request {
-        key: kbf_sim::work_key("main", action(n)),
+        key: kbf_types::work_key("main", action(n)),
         qos: Qos::Ci,
         kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),
