@@ -61,6 +61,7 @@ fn listeners() -> Listeners {
         memory_ladder: kbf_server::MemoryLadder::default(),
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
+        scheduler_core: kbf_server::SchedulerCore::under_test(),
         placement_load: kbf_server::PlacementLoad::Off,
         whole_node: None,
         finished_retention: kbf_sched::FINISHED_RETENTION,

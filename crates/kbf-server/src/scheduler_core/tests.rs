@@ -62,6 +62,24 @@ fn js_is_refused_naming_the_flag_and_exits_as_a_refused_flag_does() {
     assert_eq!(StartFailure::of(&refused).status(), REFUSED);
 }
 
+/// Catches the flag not reaching `Listeners` (a field left at a fixed value whatever the
+/// flag says), and `under_test()` naming a core other than the one this build runs.
+#[test]
+fn the_parsed_flag_reaches_the_listeners() {
+    let core = |args: &[&str]| {
+        let mut argv = vec!["kbf-server"];
+        argv.extend_from_slice(args);
+        Args::parse_from(argv)
+            .listeners()
+            .expect("listeners")
+            .scheduler_core
+    };
+    assert_eq!(core(&[]), SchedulerCore::Legacy);
+    assert_eq!(core(&["--scheduler-core=legacy"]), SchedulerCore::Legacy);
+    assert_eq!(core(&["--scheduler-core=js"]), SchedulerCore::Js);
+    assert_eq!(SchedulerCore::under_test(), SchedulerCore::RUNNING);
+}
+
 /// Catches the start line missing the core, or naming another one.
 #[test]
 fn the_start_line_names_the_core() {
