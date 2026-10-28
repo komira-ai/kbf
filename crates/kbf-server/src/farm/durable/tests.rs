@@ -748,6 +748,7 @@ fn an_unreadable_row_is_refused_naming_it() {
         lease: LeaseId::new(5, 0),
         operation: OperationId(1),
         worker: WorkerId::new("node-a"),
+        cost: Default::default(),
     })))
     .expect("encode");
     let submit = encode(FarmInput::Submit(request(1))).expect("encode");

@@ -177,6 +177,7 @@ fn golden() -> Vec<(&'static str, LogCommand, String)> {
                 lease: lease(1, 2),
                 operation: OperationId(3),
                 worker: w("w"),
+                cost: Default::default(),
             }))),
             batch_hex(21, 15, "2a0d0a0b0a040801100210031a0177"),
         ),

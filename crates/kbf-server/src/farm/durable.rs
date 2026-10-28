@@ -387,6 +387,9 @@ impl StoredOperation {
             lease: self.lease.map(|grant| RecoveredLease {
                 lease: grant.lease,
                 worker: grant.worker,
+                // The rows of this store keep no cost: the scheduler charges the lease its
+                // request.
+                cost: None,
             }),
             losses: self.losses,
             fate: self.fate,

@@ -183,14 +183,15 @@ async fn shadow_books_the_default_and_logs_what_it_would_book() {
     said(0, "fallback=Missing default_mib=4096");
     said(1, "fallback=Cold default_mib=4096");
     // From the third the estimator answers with the booking itself (it lowers from five).
+    // These runs read no CPU, so the CPU is the estimator's cold cost, two cores.
     said(
         2,
-        "level=l2 memory_mib=4096 cpu_millis=1000 default_mib=4096",
+        "level=l2 memory_mib=4096 cpu_millis=2000 default_mib=4096",
     );
     said(4, "level=l2 memory_mib=4096");
     said(
         5,
-        "level=l2 memory_mib=1024 cpu_millis=1000 default_mib=4096 floor_mib=0",
+        "level=l2 memory_mib=1024 cpu_millis=2000 default_mib=4096 floor_mib=0",
     );
     // The farm publishes its counts on its tick.
     cell.tick().await;

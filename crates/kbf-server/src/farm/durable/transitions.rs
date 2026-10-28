@@ -66,6 +66,8 @@ impl Durable {
             lease: start.lease,
             operation: start.operation,
             worker: start.worker.clone(),
+            // This store's lease rows keep no cost.
+            cost: Default::default(),
         };
         let Some(row) = self.store.get(&queued)? else {
             return self.granted_before(&grant, queued);

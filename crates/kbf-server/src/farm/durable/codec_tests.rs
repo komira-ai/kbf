@@ -34,6 +34,7 @@ fn grant() -> LeaseGrant {
         lease: LeaseId::new(5, 0),
         operation: OperationId(1),
         worker: WorkerId::new("node-a"),
+        cost: Default::default(),
     }
 }
 

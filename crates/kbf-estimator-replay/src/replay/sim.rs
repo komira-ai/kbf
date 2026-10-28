@@ -377,7 +377,11 @@ impl Sim<'_> {
         let workers: Vec<WorkerId> = self.running.keys().cloned().collect();
         for worker in workers {
             let running = self.running[&worker].iter().copied().collect();
-            let effects = self.feed(Event::Heartbeat { worker, running });
+            let effects = self.feed(Event::Heartbeat {
+                worker,
+                running,
+                load: None,
+            });
             self.apply(effects);
         }
     }
@@ -501,7 +505,7 @@ impl Sim<'_> {
             Ok(()) => samples.taken += 1,
             Err(why) => *samples.refused.entry(format!("{why:?}")).or_default() += 1,
         }
-        samples.cpu += u64::from(seen.cpu);
+        samples.cpu += u64::from(seen.cpu.entered());
     }
 
     /// An operation ended: answered, or refused. Its joined twins end with it.
