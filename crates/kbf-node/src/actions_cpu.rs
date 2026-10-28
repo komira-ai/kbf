@@ -7,7 +7,7 @@ use super::Driver;
 
 /// The flag, flattened into the command line.
 #[derive(Clone, Copy, Debug, clap::Args)]
-pub(crate) struct Args {
+pub(crate) struct ActionsCpuArgs {
     /// Whether the actions cgroup's `cpu.max` is lifted (container). `auto` follows the
     /// server's Welcome (`placement_load`): `max` when it says the farm places by measured
     /// load, the leases' CPUs (the node's minus `--reserve-cpus`) when it says otherwise or
@@ -38,7 +38,7 @@ impl From<Mode> for ActionsCpuMax {
     }
 }
 
-impl Args {
+impl ActionsCpuArgs {
     /// Refuses a mode other than `auto` on a node that runs no container driver. Not
     /// generic, so its refusal is one code path whatever data plane the node is built over.
     ///
@@ -70,7 +70,7 @@ impl Args {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     use super::*;
     use crate::Cli;
@@ -107,5 +107,12 @@ mod tests {
             let err = parse(Some(&arg)).expect_err(bad);
             assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{bad}");
         }
+    }
+
+    /// Catches a command line clap refuses at its first parse, such as two flattened flag
+    /// sets with the same group id (each derive names its group after its struct).
+    #[test]
+    fn the_node_command_line_is_well_formed() {
+        Cli::command().debug_assert();
     }
 }

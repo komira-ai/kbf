@@ -175,7 +175,7 @@ pub struct Cli {
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     actions_memory_max_gib: Option<u64>,
     #[command(flatten)]
-    actions_cpu: actions_cpu::Args,
+    actions_cpu: actions_cpu::ActionsCpuArgs,
     /// Written to the daemon's `supervisor` leaf's `memory.min` at start, in MiB
     /// (container, without `--cgroup-parent`): memory the kernel does not reclaim from
     /// the daemon while it uses no more, so builds short of memory never take it. The
