@@ -49,7 +49,7 @@ async fn a_lease_is_covered_from_the_second_reading_and_leaves_with_its_peak() {
     for (file, text) in [
         ("cpu.stat", "usage_usec 0\n"),
         ("memory.current", "1000\n"),
-        ("memory.stat", "inactive_file 0\n"),
+        ("memory.stat", "inactive_file 0\nactive_file 0\n"),
     ] {
         replace(&actions, file, text);
     }

@@ -212,7 +212,7 @@ fn the_clock_is_read_right_after_cpu_stat() {
     let dir = cgroup("load-clock-order");
     usage(&dir, 1);
     write(&dir, "memory.current", "1000\n");
-    write(&dir, "memory.stat", "inactive_file 0\n");
+    write(&dir, "memory.stat", "inactive_file 0\nactive_file 0\n");
     let moved = dir.to_path_buf();
     let ticking: MonoClock = Arc::new(move || {
         usage(&moved, 2);
