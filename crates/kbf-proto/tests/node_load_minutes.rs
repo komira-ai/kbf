@@ -175,11 +175,11 @@ fn a_record_without_a_lease_decodes_without_one() {
         ..minute()
     };
     let load = NodeLoad {
-        minutes: vec![bare.clone(), zero.clone()],
+        minutes: vec![bare, zero],
         ..NodeLoad::default()
     };
     let back = NodeLoad::decode(&load.encode_to_vec()[..]).expect("decodes");
-    assert_eq!(back.minutes, vec![bare, zero.clone()]);
+    assert_eq!(back.minutes, vec![bare, zero]);
     assert_eq!(back.vet().minutes, vec![zero]);
 }
 

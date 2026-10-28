@@ -108,15 +108,15 @@ fn minute_bounds() {
     let first = minute(1, 1, 0);
     let last = minute(1, 9, 0);
     let sent = vec![
-        first.clone(),
-        tail.clone(),
+        first,
+        tail,
         past_tail,
-        ws_at_cap.clone(),
+        ws_at_cap,
         ws_over,
-        mean_is_peak.clone(),
+        mean_is_peak,
         mean_over_peak,
         no_lease,
-        last.clone(),
+        last,
     ];
     let vetted = load(Vec::new(), Vec::new(), sent).vet();
     assert_eq!(
@@ -151,7 +151,7 @@ fn duplicates_use_the_right_key() {
     let a1 = minute(1, 5, 1);
     let a1_again = LeaseMinute {
         ws_max_bytes: 9999,
-        ..a1.clone()
+        ..a1
     };
     let a2 = minute(1, 5, 2);
     let same_seq_other_term = minute(2, 5, 1);
@@ -159,13 +159,7 @@ fn duplicates_use_the_right_key() {
     let vetted = load(
         Vec::new(),
         Vec::new(),
-        vec![
-            a1.clone(),
-            a1_again,
-            a2.clone(),
-            same_seq_other_term.clone(),
-            same_term_other_seq.clone(),
-        ],
+        vec![a1, a1_again, a2, same_seq_other_term, same_term_other_seq],
     )
     .vet();
     assert_eq!(
@@ -191,18 +185,13 @@ fn an_invalid_record_is_not_a_duplicate_and_holds_no_key() {
     let good = minute(1, 1, 0);
     let bad_repeat = LeaseMinute {
         cpu_mean_millis: 500,
-        ..good.clone()
+        ..good
     };
-    let vetted = load(
-        Vec::new(),
-        Vec::new(),
-        vec![good.clone(), bad_repeat.clone()],
-    )
-    .vet();
-    assert_eq!(vetted.minutes, vec![good.clone()]);
+    let vetted = load(Vec::new(), Vec::new(), vec![good, bad_repeat]).vet();
+    assert_eq!(vetted.minutes, vec![good]);
     assert_eq!(vetted.drops, drops(1, 0, 0));
 
-    let vetted = load(Vec::new(), Vec::new(), vec![bad_repeat, good.clone()]).vet();
+    let vetted = load(Vec::new(), Vec::new(), vec![bad_repeat, good]).vet();
     assert_eq!(vetted.minutes, vec![good]);
     assert_eq!(vetted.drops, drops(1, 0, 0));
 }
