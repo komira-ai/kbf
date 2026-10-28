@@ -24,6 +24,7 @@ use kbf_log::{
 use kbf_meta::{ActionRecord, Closure};
 use kbf_proto::kbf::log::v1 as proto;
 use kbf_sched::{DaemonInstance, Request};
+use kbf_types::sched::usage::LeaseCost;
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Failure, FarmTime, LeaseGrant, LeaseId,
     LeaseKind, LostWhy, OperationId, Outcome, Qos, QosError, RefusalRecord, Resources,
@@ -228,13 +229,28 @@ impl Rng {
         }
     }
 
+    /// A cost of any size, the default one (which a record leaves out) included now and then.
+    fn cost(&mut self) -> LeaseCost {
+        if self.below(4) == 0 {
+            return LeaseCost::default();
+        }
+        LeaseCost {
+            cpu_millis: self.number(),
+            memory_bytes: self.number(),
+            limit_bytes: self.number(),
+            cold: self.below(2) == 0,
+            retry: self.below(2) == 0,
+            key_hash: self.number(),
+        }
+    }
+
     fn record(&mut self) -> ControlRecord {
         match self.below(3) {
             0 => ControlRecord::Lease(LeaseGrant {
                 lease: self.lease(),
                 operation: OperationId(self.number()),
                 worker: self.worker(),
-                cost: Default::default(),
+                cost: self.cost(),
             }),
             1 => ControlRecord::Result(ResultRecord {
                 lease: self.lease(),

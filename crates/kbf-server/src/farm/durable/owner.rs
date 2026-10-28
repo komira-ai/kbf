@@ -64,11 +64,12 @@ pub const ACK_WINDOW: Duration = ROW_LIFE.saturating_sub(RUN_LIFE);
 
 /// How long after its last write a daemon's session row, written on schedule, is certain
 /// to be there to be read, with the wait beyond its expiry.
-const ROW_LIFE: Duration = LEASE_GRACE.saturating_add(SESSION_RENEWAL);
+pub(super) const ROW_LIFE: Duration = LEASE_GRACE.saturating_add(SESSION_RENEWAL);
 
 /// How long after its last acknowledged heartbeat a daemon may run, with twice the margin
 /// of the fence.
-const RUN_LIFE: Duration = SELF_FENCE.saturating_add(LEADER_LEASE_MARGIN.saturating_mul(2));
+pub(super) const RUN_LIFE: Duration =
+    SELF_FENCE.saturating_add(LEADER_LEASE_MARGIN.saturating_mul(2));
 
 /// The longest heartbeat interval a server is started with.
 const HEARTBEAT_MAX: Duration = Duration::from_millis(MAX_HEARTBEAT_INTERVAL_MS);
