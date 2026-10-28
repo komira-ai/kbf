@@ -16,9 +16,8 @@
 //! of each job counts (`filter=latest`), so a re-run of the failed jobs is not cancelled for
 //! the failure it is re-running.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use clap::Args as ClapArgs;
 use serde_json::Value;
@@ -186,21 +185,11 @@ fn all_jobs(gh: &Path, repo: &str, run_id: u64) -> Result<Vec<Job>, Error> {
 
 /// Cancels the run. A run that is already over or already cancelling (HTTP 409) is not an
 /// error.
-fn cancel_run(gh: &Path, repo: &str, run_id: u64) -> Result<(), Error> {
+pub fn cancel_run(gh: &Path, repo: &str, run_id: u64) -> Result<(), Error> {
     let path = cancel_path(repo, run_id);
-    let mut child = Command::new(gh)
-        .args(["api", "-X", "POST", &path, "--input", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(Error::spawn(gh.display().to_string()))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        // A write that fails means `gh` is gone; its exit status says why.
-        let _ = stdin.write_all(b"{}");
-    }
-    let out = child
-        .wait_with_output()
+    let out = Command::new(gh)
+        .args(["api", "-X", "POST", &path])
+        .output()
         .map_err(Error::spawn(gh.display().to_string()))?;
     let err = String::from_utf8_lossy(&out.stderr);
     if out.status.success() || err.contains("(HTTP 409)") {

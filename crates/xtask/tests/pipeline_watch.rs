@@ -10,7 +10,7 @@ use kbf_testkit::dir::TestDir;
 use serde_json::{Value, json};
 use xtask::Error;
 use xtask::pipeline_watch::{
-    Job, MAX_MISSES, Verdict, cancel_path, jobs_of, jobs_path, verdict, watch,
+    Job, MAX_MISSES, Verdict, cancel_path, cancel_run, jobs_of, jobs_path, verdict, watch,
 };
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
@@ -317,7 +317,7 @@ fn the_binary_cancels_the_run_when_a_job_has_failed() {
     let call: Value = serde_json::from_str(calls.trim()).expect("a call");
     assert_eq!(
         call["args"],
-        json!(["api", "-X", "POST", cancel_path(REPO, RUN), "--input", "-"])
+        json!(["api", "-X", "POST", cancel_path(REPO, RUN)])
     );
 }
 
@@ -378,6 +378,14 @@ fn the_binary_exits_zero_when_the_api_answers_nothing_it_can_use() {
         .output()
         .expect("run xtask");
     assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn a_gh_that_cannot_be_started_is_an_error_naming_it() {
+    // Catches: a cancel that reports success when `gh` was never run, so the jobs go on and
+    // nothing says why.
+    let said = cancel_run(Path::new("/nonexistent/gh"), REPO, RUN);
+    assert!(matches!(said, Err(Error::Spawn { .. })), "{said:?}");
 }
 
 #[test]
