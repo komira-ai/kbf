@@ -4,40 +4,93 @@
 //! Each function is the js arm of the [`Farm`](crate::farm::Farm) method of the same name
 //! (`farm/nodes.rs`, `farm/sched_view.rs`, `farm/pack_reads.rs`, `farm/pack_writes.rs`,
 //! `farm/failed_actions.rs`, `farm/handover.rs`, `farm.rs`), with the same arguments after
-//! `js`. They start as `todo!`; this file is filled in by the views change.
-
-// The bodies are `todo!`: the change that writes them removes this line.
-#![allow(unused_variables)]
+//! `js`. What the scheduler knows is read through [`Core::with`](js_server_core::Core::with),
+//! which holds the core's lock for the read; what the farm keeps beside it (the node
+//! registry, the update and software status, the pack counts, the failed-operation counts and
+//! what each stream said of itself) is the adapter's. A view is built by the same function
+//! as the farm's own driver's where there is one (`farm/nodes.rs`, `farm/sched_view.rs`,
+//! `fleet.rs`), so the two drivers answer alike for the same state.
+//!
+//! Where the legacy method first notes the worker streams that have closed, so does the js
+//! arm ([`KbfAdapter::note_closed_streams`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use js_server_core::View;
 use kbf_proto::update::UpdateStatus;
 use kbf_proto::worker::{NodeStatus, PackReadCounts, PackWriteCounts};
+use kbf_sched::QueueView;
 use kbf_types::{MemoryRun, OperationId, WorkerId};
 
 use super::JsFarm;
 use crate::farm::failed_actions::FailedActions;
-use crate::farm::sched_view::{LeaseViews, WholeView};
+use crate::farm::nodes::{detail_of, look_of, node_of};
+use crate::farm::sched_view::{LeaseViews, WholeView, whole_of};
 use crate::farm::{NodeLook, NodeUnread, StreamId};
+use crate::farm_js::KbfAdapter;
 use crate::fleet::{NodeDetail, NodeView, NodesView};
-use kbf_sched::QueueView;
+
+/// `worker`, which the machine knows, as the node list shows it.
+fn listed(js: &JsFarm, view: &View<'_>, adapter: &KbfAdapter, worker: &WorkerId) -> NodeView {
+    let protocol = adapter
+        .worker_facts(worker)
+        .and_then(|facts| facts.protocol);
+    node_of(
+        view.sched(),
+        adapter.machine(),
+        js.epoch_unix_ms,
+        protocol,
+        worker,
+    )
+}
 
 /// [`Farm::nodes`](crate::farm::Farm::nodes).
 pub(crate) fn nodes(js: &JsFarm) -> NodesView {
-    todo!("views: nodes")
+    let nodes = js.core.with(|view, adapter| {
+        adapter.note_closed_streams();
+        let adapter = &*adapter;
+        adapter
+            .machine()
+            .nodes()
+            .map(|worker| listed(js, view, adapter, worker))
+            .collect()
+    });
+    NodesView::of_this_build(nodes)
 }
 
 /// [`Farm::node_view`](crate::farm::Farm::node_view).
 pub(crate) fn node_view(js: &JsFarm, worker: &WorkerId) -> Option<NodeView> {
-    todo!("views: node_view")
+    js.core.with(|view, adapter| {
+        adapter.note_closed_streams();
+        let adapter = &*adapter;
+        let registered = adapter.machine().node(worker).is_some();
+        registered.then(|| listed(js, view, adapter, worker))
+    })
 }
 
 /// [`Farm::node_detail`](crate::farm::Farm::node_detail).
+///
+/// A node another frontend of the state store holds is not answered from the store: this
+/// arm answers only the nodes registered here. One not registered here is `None` when the
+/// store can be read (or the farm has none), and unread when the store cannot say and the
+/// node is not connected, as the farm's own driver answers a node nobody holds.
 pub(crate) fn node_detail(
     js: &JsFarm,
     worker: &WorkerId,
 ) -> Result<Option<NodeDetail>, NodeUnread> {
-    todo!("views: node_detail")
+    // The `cordon/` rows are taken up first, so the node's own frontend shows a drain
+    // another frontend wrote at once. The core's lock is not held across the two calls.
+    let cordons = js.core.cordons_now(js.now());
+    let readable = cordons.is_some() || js.store.is_none();
+    js.core.with(|view, adapter| {
+        adapter.note_closed_streams();
+        let adapter = &*adapter;
+        let node = adapter.machine().node(worker);
+        if !readable && !node.is_some_and(|node| node.connected) {
+            return Err(NodeUnread(worker.as_str().to_owned()));
+        }
+        Ok(node.map(|_| detail_of(listed(js, view, adapter, worker), view.sched(), worker)))
+    })
 }
 
 /// [`Farm::node_status`](crate::farm::Farm::node_status).
@@ -47,7 +100,13 @@ pub(crate) fn node_status(
     stream: StreamId,
     status: NodeStatus,
 ) -> Vec<(bool, String)> {
-    todo!("views: node_status")
+    js.core.with(|_, adapter| {
+        match adapter.current_stream(worker, stream.0) {
+            Some(stream) => adapter.report_node_status(worker, stream, status),
+            // A replaced stream's status is ignored.
+            None => Vec::new(),
+        }
+    })
 }
 
 /// [`Farm::update_status`](crate::farm::Farm::update_status).
@@ -57,67 +116,92 @@ pub(crate) fn update_status(
     stream: StreamId,
     status: UpdateStatus,
 ) -> bool {
-    todo!("views: update_status")
+    js.core.with(|_, adapter| {
+        let current = adapter.current_stream(worker, stream.0);
+        current.is_some_and(|stream| adapter.report_update_status(worker, stream, status))
+    })
 }
 
 /// [`Farm::update_look`](crate::farm::Farm::update_look).
 pub(crate) fn update_look(js: &JsFarm) -> Vec<NodeLook> {
-    todo!("views: update_look")
+    js.core.with(|view, adapter| {
+        adapter.note_closed_streams();
+        let adapter = &*adapter;
+        adapter
+            .machine()
+            .nodes()
+            .map(|worker| {
+                let facts = adapter.worker_facts(worker);
+                let identity = facts.map_or((String::new(), ""), |f| (f.os.clone(), f.arch));
+                look_of(view.sched(), adapter.machine(), identity, worker)
+            })
+            .collect()
+    })
 }
 
 /// [`Farm::queue_view`](crate::farm::Farm::queue_view).
 pub(crate) fn queue_view(js: &JsFarm) -> QueueView {
-    todo!("views: queue_view")
+    js.core.with(|view, _| view.sched().queue_snapshot())
 }
 
 /// [`Farm::whole_view`](crate::farm::Farm::whole_view).
 pub(crate) fn whole_view(js: &JsFarm) -> Option<WholeView> {
-    todo!("views: whole_view")
+    let now = js.now();
+    js.core.with(|view, _| whole_of(now, view.sched()))
 }
 
 /// [`Farm::queue_views`](crate::farm::Farm::queue_views).
 pub(crate) fn queue_views(js: &JsFarm) -> (QueueView, Option<WholeView>) {
-    todo!("views: queue_views")
+    let now = js.now();
+    js.core.with(|view, _| {
+        let sched = view.sched();
+        (sched.queue_snapshot(), whole_of(now, sched))
+    })
 }
 
 /// [`Farm::lease_views`](crate::farm::Farm::lease_views).
 pub(crate) fn lease_views(js: &JsFarm, node: Option<&WorkerId>) -> LeaseViews {
-    todo!("views: lease_views")
+    js.core.with(|view, _| LeaseViews {
+        term: view.sched().term(),
+        epoch_unix_ms: js.epoch_unix_ms,
+        leases: view.sched().lease_snapshot(node),
+    })
 }
 
 /// [`Farm::open_executions`](crate::farm::Farm::open_executions).
 pub(crate) fn open_executions(js: &JsFarm) -> u64 {
-    todo!("views: open_executions")
+    js.cache.metrics().execute.open_executions.get()
 }
 
 /// [`Farm::open_sessions`](crate::farm::Farm::open_sessions).
 pub(crate) fn open_sessions(js: &JsFarm) -> usize {
-    todo!("views: open_sessions")
+    js.core.sessions()
 }
 
 /// [`Farm::queued_operations`](crate::farm::Farm::queued_operations).
 pub(crate) fn queued_operations(js: &JsFarm) -> u64 {
-    todo!("views: queued_operations")
+    js.core.queued_operations()
 }
 
 /// [`Farm::dropped_writes`](crate::farm::Farm::dropped_writes).
 pub(crate) fn dropped_writes(js: &JsFarm) -> u64 {
-    todo!("views: dropped_writes")
+    js.core.dropped_writes()
 }
 
 /// [`Farm::failed_actions`](crate::farm::Farm::failed_actions).
 pub(crate) fn failed_actions(js: &JsFarm) -> FailedActions {
-    todo!("views: failed_actions")
+    js.core.with(|_, adapter| adapter.failed_actions())
 }
 
 /// [`Farm::memory_runs`](crate::farm::Farm::memory_runs).
 pub(crate) fn memory_runs(js: &JsFarm) -> BTreeMap<OperationId, Vec<MemoryRun>> {
-    todo!("views: memory_runs")
+    js.core
+        .with(|view, _| view.sched().memory_state().runs_by_operation())
 }
 
 /// [`Farm::avoided`](crate::farm::Farm::avoided).
 pub(crate) fn avoided(js: &JsFarm) -> BTreeMap<OperationId, BTreeSet<WorkerId>> {
-    todo!("views: avoided")
+    js.core.with(|view, _| view.sched().avoided())
 }
 
 /// [`Farm::note_pack_reads`](crate::farm::Farm::note_pack_reads).
@@ -127,12 +211,16 @@ pub(crate) fn note_pack_reads(
     stream: StreamId,
     counts: Option<PackReadCounts>,
 ) {
-    todo!("views: note_pack_reads")
+    js.core.with(|_, adapter| {
+        if let Some(stream) = adapter.current_stream(worker, stream.0) {
+            adapter.note_pack_reads(worker, stream, counts);
+        }
+    });
 }
 
 /// [`Farm::pack_reads`](crate::farm::Farm::pack_reads).
 pub(crate) fn pack_reads(js: &JsFarm) -> Vec<(WorkerId, PackReadCounts)> {
-    todo!("views: pack_reads")
+    js.core.with(|_, adapter| adapter.pack_reads())
 }
 
 /// [`Farm::note_pack_writes`](crate::farm::Farm::note_pack_writes).
@@ -142,10 +230,14 @@ pub(crate) fn note_pack_writes(
     stream: StreamId,
     counts: Option<PackWriteCounts>,
 ) {
-    todo!("views: note_pack_writes")
+    js.core.with(|_, adapter| {
+        if let Some(stream) = adapter.current_stream(worker, stream.0) {
+            adapter.note_pack_writes(worker, stream, counts);
+        }
+    });
 }
 
 /// [`Farm::pack_writes`](crate::farm::Farm::pack_writes).
 pub(crate) fn pack_writes(js: &JsFarm) -> Vec<(WorkerId, PackWriteCounts)> {
-    todo!("views: pack_writes")
+    js.core.with(|_, adapter| adapter.pack_writes())
 }
