@@ -1265,6 +1265,71 @@ fn learned_sizes_come_from_their_flag() {
     }
 }
 
+/// Asserts that admission by measured CPU is off unless asked for (`--admit-busy-percent`
+/// 0, the default), that its three flags reach the clause the scheduler is given (the
+/// percentage, the ramp, the aging bound in seconds, and the heartbeat interval that makes
+/// a reading stale), and that a percentage over 100 and a ramp or aging bound of 0 are
+/// refused at the command line. Catches a flag that is parsed and dropped, one that
+/// switches the feature on by default, and a range that lets a clause that admits nothing
+/// (or everything) through.
+#[test]
+fn cpu_admission_comes_from_its_flags() {
+    use clap::Parser;
+    let parse = |args: &[&str]| {
+        kbf_server::Args::try_parse_from(std::iter::once("kbf-server").chain(args.iter().copied()))
+    };
+    let admission = |args: &[&str]| parse(args).expect("flags parse").cpu_admission();
+    assert_eq!(admission(&[]), None);
+    assert_eq!(admission(&["--admit-busy-percent=0"]), None);
+    assert!(admission(&["--admit-busy-percent=1"]).is_some());
+    let default = admission(&["--admit-busy-percent=90"]).expect("on");
+    assert_eq!(
+        (
+            default.busy_percent,
+            default.ramp,
+            default.max_wait,
+            default.interval
+        ),
+        (
+            90,
+            kbf_sched::DEFAULT_RAMP,
+            kbf_sched::DEFAULT_MAX_WAIT,
+            std::time::Duration::from_secs(5)
+        )
+    );
+    let set = admission(&[
+        "--admit-busy-percent=100",
+        "--admit-ramp=2",
+        "--admit-max-wait=45",
+        "--heartbeat-interval-ms=2000",
+    ])
+    .expect("on");
+    assert_eq!(
+        (set.busy_percent, set.ramp, set.max_wait, set.interval),
+        (
+            100,
+            2,
+            std::time::Duration::from_secs(45),
+            std::time::Duration::from_secs(2)
+        )
+    );
+    assert_eq!(
+        parse(&["--admit-busy-percent=90"])
+            .expect("flags parse")
+            .listeners()
+            .expect("listeners")
+            .cpu_admission,
+        Some(default)
+    );
+    for bad in [
+        "--admit-busy-percent=101",
+        "--admit-ramp=0",
+        "--admit-max-wait=0",
+    ] {
+        assert!(parse(&[bad]).is_err(), "{bad} accepted");
+    }
+}
+
 /// Catches: `--memory-ladder-gib` not parsed into the listeners' ladder (a farm that
 /// ignores it books 4 GiB whatever the operator set), a default other than 4, 16 and
 /// 32 GiB, a comma that does not separate rungs, and a ladder that is not ascending

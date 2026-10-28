@@ -303,6 +303,44 @@ pub struct Args {
         default_values_t = kbf_sched::MemoryLadder::DEFAULT_GIB
     )]
     pub memory_ladder_gib: Vec<u64>,
+    /// Admission by measured CPU, off at 0 (the default). Above 0, the scheduler gives a
+    /// node a new action only while the CPU time its actions used over the daemon's last
+    /// heartbeat window is below this percentage of the node's action CPUs (what
+    /// `--reserve-cpus` leaves). Placement books one core per action by default, so a node
+    /// takes as many leases as it has cores however many threads each action starts;
+    /// this keeps a node whose cores are already used up from taking more while they are.
+    /// It delays placement and never refuses work: an action is admitted whatever the
+    /// reading when the node holds no lease, when the daemon sent no reading or the
+    /// newest is older than three heartbeat intervals (a daemon without cgroup v2, an
+    /// older daemon, a node gone quiet), when it asks for a node's whole memory, or when
+    /// it has been queued for `--admit-max-wait`. VM and whole-machine leases are not
+    /// affected. `--admit-ramp` bounds how many leases are admitted per reading.
+    #[arg(
+        long,
+        default_value_t = 0,
+        value_parser = clap::value_parser!(u32).range(0..=100)
+    )]
+    pub admit_busy_percent: u32,
+    /// With `--admit-busy-percent`: at most this many new leases per node between two of
+    /// its readings, since a reading says nothing about the leases admitted after it. The
+    /// readings come once per heartbeat interval (`--heartbeat-interval-ms`).
+    #[arg(
+        long,
+        default_value_t = kbf_sched::DEFAULT_RAMP,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub admit_ramp: u32,
+    /// With `--admit-busy-percent`: how long, in seconds, an action may be queued before it
+    /// is admitted to a node whatever its reading, so that none starves behind a busy
+    /// node. Counted in farm time from when the action was queued (a lease given up
+    /// restarts it). When a whole batch was queued together it all ages together, so keep
+    /// this above how long a node takes to work through one.
+    #[arg(
+        long,
+        default_value_t = kbf_sched::DEFAULT_MAX_WAIT.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub admit_max_wait: u64,
     /// The cores a node that reports VM slots (`vm.slots`) keeps for the host itself:
     /// subtracted from the CPUs placement may book on it, so that guests cannot take the
     /// host's own share. A node that reports none books the whole machine.
@@ -832,6 +870,7 @@ impl Args {
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
             default_platform: self.default_platform,
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
+            cpu_admission: self.cpu_admission(),
             vm_host_floor: HostFloor::new(self.vm_host_floor_cpus, self.vm_host_floor_mem_gib),
             learned_sizes: self.learned_sizes,
             finished_retention: Duration::from_secs(self.finished_retention_secs),
@@ -851,6 +890,20 @@ impl Args {
                 idle: Duration::from_secs(self.segment_upload_idle_secs),
             },
             stream_limits: self.streams.limits(),
+        })
+    }
+
+    /// The CPU admission clause `--admit-busy-percent`, `--admit-ramp` and `--admit-max-wait`
+    /// set; `None` when the percentage is 0.
+    #[must_use]
+    pub fn cpu_admission(&self) -> Option<kbf_sched::CpuAdmission> {
+        (self.admit_busy_percent > 0).then(|| {
+            kbf_sched::CpuAdmission::new(
+                self.admit_busy_percent,
+                Duration::from_millis(self.heartbeat_interval_ms),
+            )
+            .with_ramp(self.admit_ramp)
+            .with_max_wait(Duration::from_secs(self.admit_max_wait))
         })
     }
 

@@ -372,6 +372,14 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
   daemon without the flag, and one built before the field, send none, and a server built before it
   skips the field. The server keeps the newest of each node for `GET /metrics`
   (`kbf_pack_daemon_*`, [api.md](../api.md#get-metrics)).
+- `busy_millis` (optional): how busy the CPUs of the daemon's actions were over the window since
+  its previous heartbeat, in CPU-milliseconds per second (a fully used 80-CPU allowance reads
+  80000). The daemon takes it from the growth of `usage_usec` in the `cpu.stat` of the `actions/`
+  cgroup, so it is the last window's rate, not an average. Absent on the daemon's first
+  heartbeat, when the counter cannot be read or went backwards, on a daemon without a cgroup v2
+  `actions/` cgroup (macOS, the native driver), and from a daemon built before the field; a server
+  built before it skips the field. Absent means unknown, never idle. The scheduler reads it only
+  when started with `--admit-busy-percent` (see [scheduler.md](scheduler.md#placement)).
 
 The server acknowledges a heartbeat with `HeartbeatAck { seq }`, but only one from the
 node's newest stream. A heartbeat from a replaced stream is dropped unacknowledged, so

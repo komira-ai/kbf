@@ -68,6 +68,7 @@ use tonic::{Code, Status};
 
 mod ack;
 mod beat;
+mod busy;
 mod durable;
 mod failed_actions;
 mod handover;
@@ -533,6 +534,19 @@ impl Farm {
     pub fn with_memory_ladder(mut self, ladder: MemoryLadder) -> Self {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         state.sched.set_memory_ladder(ladder);
+        self
+    }
+
+    /// This farm, whose scheduler places an action on a node only while the node's CPUs
+    /// are not used up by its other work, if `admission` is given (see
+    /// [`kbf_sched::CpuAdmission`]); `None` places by bookings alone.
+    #[must_use]
+    pub fn with_cpu_admission(mut self, admission: Option<kbf_sched::CpuAdmission>) -> Self {
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if let Some(admission) = admission {
+            state.sched = std::mem::replace(&mut state.sched, Scheduler::new(self.term))
+                .with_cpu_admission(admission);
+        }
         self
     }
 

@@ -1,6 +1,8 @@
 //! The Execute join end to end, in one process: a REAPI client, the server, and a fake
 //! daemon on the worker stream. Each test drives the wire on both sides.
 
+#[path = "execute/cpu_admit.rs"]
+mod cpu_admit;
 #[path = "execute/failure_log.rs"]
 mod failure_log;
 #[path = "execute/get_operation.rs"]

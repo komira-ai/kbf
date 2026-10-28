@@ -102,6 +102,9 @@ const GROUPS: &[(&str, &[&str])] = &[
     (
         "scheduler",
         &[
+            "admit-busy-percent",
+            "admit-max-wait",
+            "admit-ramp",
             "default-platform",
             "finished-retention-secs",
             "heartbeat-interval-ms",

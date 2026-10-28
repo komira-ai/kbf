@@ -326,6 +326,8 @@ impl Session {
                 // has its counts on `/metrics`.
                 farm.note_pack_reads(worker, stream, beat.pack_reads);
                 farm.note_pack_writes(worker, stream, beat.pack_writes);
+                // Before the heartbeat, whose placement round reads it.
+                farm.note_busy(worker, stream, beat.busy_millis);
                 let running = beat
                     .running
                     .iter()

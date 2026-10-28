@@ -174,6 +174,9 @@ pub const ALLOWED: &[&str] = &[
     "unservable_wait_secs",
     "default_platform",
     "memory_ladder_gib",
+    "admit_busy_percent",
+    "admit_ramp",
+    "admit_max_wait",
     "vm_host_floor_cpus",
     "vm_host_floor_mem_gib",
     "learned_sizes",
@@ -795,6 +798,7 @@ impl<'a> Prepared<'a> {
             listeners.finished_retention,
         )
         .with_memory_ladder(listeners.memory_ladder.clone())
+        .with_cpu_admission(listeners.cpu_admission)
         .with_learned_sizes(listeners.learned_sizes, listeners.memory_ladder.first())
         .recording(recorder.clone());
         let farm = Arc::new(farm.with_state(state)?);

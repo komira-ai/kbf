@@ -252,6 +252,35 @@ impl Cell {
         Self::start_with(wait, kbf_sched::FINISHED_RETENTION).await
     }
 
+    /// A cell whose scheduler admits an action to a node by `admission`
+    /// (`--admit-busy-percent` and its companions).
+    pub async fn start_with_cpu_admission(admission: kbf_sched::CpuAdmission) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve_with_map(
+            cache,
+            store,
+            None,
+            None,
+            wait,
+            retention,
+            small_ladder(),
+            StreamLimits::DEFAULT,
+            None,
+            None,
+            kbf_front::DefaultPlatform::NONE,
+            kbf_server::LearnedSizes::Off,
+            Some(admission),
+        )
+        .await
+    }
+
+    /// Operations waiting in the farm's queue for a lease, now.
+    pub fn queued_operations(&self) -> u64 {
+        self.farm().queued_operations()
+    }
+
     /// A cell that gives an action naming no OS or architecture `default_platform`, as
     /// `--default-platform` sets it. (The other cells give it none, so that a test of
     /// the platform match sees the match.)
@@ -272,6 +301,7 @@ impl Cell {
             None,
             default_platform,
             kbf_server::LearnedSizes::Off,
+            None,
         )
         .await
     }
@@ -319,6 +349,7 @@ impl Cell {
             state,
             kbf_front::DefaultPlatform::NONE,
             mode,
+            None,
         )
         .await
     }
@@ -360,6 +391,7 @@ impl Cell {
             None,
             kbf_front::DefaultPlatform::NONE,
             kbf_server::LearnedSizes::Off,
+            None,
         )
         .await
     }
@@ -389,6 +421,7 @@ impl Cell {
             Some(state),
             kbf_front::DefaultPlatform::NONE,
             kbf_server::LearnedSizes::Off,
+            None,
         )
         .await
     }
@@ -416,6 +449,7 @@ impl Cell {
             Some(state),
             kbf_front::DefaultPlatform::NONE,
             kbf_server::LearnedSizes::Off,
+            None,
         )
         .await
     }
@@ -609,6 +643,7 @@ impl Cell {
             None,
             kbf_front::DefaultPlatform::NONE,
             kbf_server::LearnedSizes::Off,
+            None,
         )
         .await
     }
@@ -628,6 +663,7 @@ impl Cell {
         state: Option<kbf_server::StateStore>,
         default_platform: kbf_front::DefaultPlatform,
         learned: kbf_server::LearnedSizes,
+        cpu_admission: Option<kbf_sched::CpuAdmission>,
     ) -> Self {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -640,6 +676,7 @@ impl Cell {
             unservable_wait: wait,
             default_platform,
             memory_ladder: ladder,
+            cpu_admission,
             vm_host_floor: kbf_server::HostFloor::default(),
             learned_sizes: learned,
             finished_retention: retention,
@@ -1183,8 +1220,25 @@ impl FakeDaemon {
             running: running.to_vec(),
             pack_reads,
             pack_writes,
+            busy_millis: None,
         }));
         seq
+    }
+
+    /// Sends a heartbeat listing `running` and carrying the busy rate `busy_millis`, and
+    /// waits for its acknowledgement.
+    pub async fn beat_busy_acked(&mut self, running: &[LeaseId], busy_millis: u64) {
+        self.seq += 1;
+        let seq = self.seq;
+        self.send(daemon_message::Message::Heartbeat(Heartbeat {
+            seq,
+            report_hash: Vec::new(),
+            running: running.to_vec(),
+            pack_reads: None,
+            pack_writes: None,
+            busy_millis: Some(busy_millis),
+        }));
+        self.expect("HeartbeatAck", ack_of(seq)).await;
     }
 
     /// Sends `result` and returns the server's acknowledgement.

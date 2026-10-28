@@ -87,6 +87,9 @@ pub struct Listeners {
     /// books, the others are what it climbs through when it passes its own memory
     /// limit, before a whole host (`--memory-ladder-gib`).
     pub memory_ladder: MemoryLadder,
+    /// Admission by measured CPU: `None` places by bookings alone
+    /// (`--admit-busy-percent`, `--admit-ramp`, `--admit-max-wait`).
+    pub cpu_admission: Option<kbf_sched::CpuAdmission>,
     /// What a node that reports VM slots keeps for the host: its CPUs and memory,
     /// subtracted from what placement may book on it (`--vm-host-floor-cpus`,
     /// `--vm-host-floor-mem-gib`).
@@ -794,6 +797,7 @@ where
         listeners.finished_retention,
     )
     .with_memory_ladder(listeners.memory_ladder.clone())
+    .with_cpu_admission(listeners.cpu_admission)
     .with_learned_sizes(listeners.learned_sizes, listeners.memory_ladder.first())
     .recording(recorder.clone());
     let durable = state.is_some();

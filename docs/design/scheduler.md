@@ -518,6 +518,31 @@ What the code does today:
   its request large; it books the worker's whole capacity, which its `Start` carries.
   A worker is live if it was heard from within G. Matches are memoised per platform
   request and kind in a round.
+- **Admission by measured CPU** (off unless `--admit-busy-percent` is above 0). Placement books
+  one core per action, so a node takes as many actions as it has cores, however many threads
+  each starts; a node whose cores are used up by actions of 16 threads each is then asked to
+  run far more runnable threads than it has CPUs. The daemon reports how busy its actions kept
+  the CPUs over each heartbeat window (`busy_millis`, see
+  [worker-protocol.md](worker-protocol.md#heartbeat-and-heartbeatack); the last window's
+  rate, which the ramp below pairs with). On the `action` arm of `Worker::has_room`, a worker
+  with a current reading takes a new action only while `busy_millis` is below
+  `--admit-busy-percent` of its CPUs (strictly: a reading at the threshold admits nothing),
+  and at most `--admit-ramp` actions (default 8) per reading, since a reading says nothing
+  about the leases placed after it; each new reading starts the count again. It delays and
+  never refuses: the clause is not part of whether any worker could ever run a request
+  (`servable.rs`), so nothing is refused or reported unservable for it. It lets an action
+  through when it cannot judge or when waiting must end: the worker has no reading (an
+  older daemon, no cgroup v2, a new session until its first window) or its newest is older
+  than three heartbeat intervals (unknown is not busy); the worker holds no lease (this is
+  also what lets through an action at a worker's whole memory, which runs alone); or the
+  action has been queued for `--admit-max-wait` seconds (default 300) of farm time, so
+  nothing starves. VM and whole-machine leases are not actions and are placed as before. The
+  worker's load ranking (`load.rs`) does not use the reading.
+  Limits: aging is by action, so a batch queued together ages together, and aged actions
+  are placed in queue order against the bookings (a node with every core booked still runs
+  no more), so `--admit-max-wait` should exceed the time a node takes to work through a
+  batch; an action that needs one core is not told from one that starts 16 threads
+  (a follow-up could read the estimator's parallelism for it).
 - A `whole_machine` lease that fits nowhere holds one feasible worker it could run on:
   the one it held at the last round while that one still could, else the one with the
   fewest leases, then the least booked. No operation after it in queue order (less

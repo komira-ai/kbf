@@ -152,6 +152,12 @@ pack-upload-idle-timeout = 30
 pack-writer = "frontend"
 
 [scheduler]
+# Admission by measured CPU, off at 0 (the default). Above 0, the scheduler gives a node a new action only while the CPU time its actions used over the daemon's last heartbeat window is below this percentage of the node's action CPUs (what `--reserve-cpus` leaves). Placement books one core per action by default, so a node takes as many leases as it has cores however many threads each action starts; this keeps a node whose cores are already used up from taking more while they are. It delays placement and never refuses work: an action is admitted whatever the reading when the node holds no lease, when the daemon sent no reading or the newest is older than three heartbeat intervals (a daemon without cgroup v2, an older daemon, a node gone quiet), when it asks for a node's whole memory, or when it has been queued for `--admit-max-wait`. VM and whole-machine leases are not affected. `--admit-ramp` bounds how many leases are admitted per reading
+admit-busy-percent = 0
+# With `--admit-busy-percent`: how long, in seconds, an action may be queued before it is admitted to a node whatever its reading, so that none starves behind a busy node. Counted in farm time from when the action was queued (a lease given up restarts it). When a whole batch was queued together it all ages together, so keep this above how long a node takes to work through one
+admit-max-wait = 300
+# With `--admit-busy-percent`: at most this many new leases per node between two of its readings, since a reading says nothing about the leases admitted after it. The readings come once per heartbeat interval (`--heartbeat-interval-ms`)
+admit-ramp = 8
 # The OS and architecture, as `<os>/<arch>` (`linux` or `macos`; `x86_64` or `arm64`), of an action whose platform names no OS, no architecture and no ISA level, so that it is not given to whichever node sorts first, a Mac among them. Not applied to an action that asks for `xcode` or an iOS device, which only a Mac reports. `none` applies no default: such an action runs on any node that fits. Placement only: the action's digest and cache key do not change
 default-platform = "linux/x86_64"
 # How long, in seconds, a finished operation is kept after its callers are answered. Within it, WaitExecution on the operation's name streams its result (a client whose Execute stream broke gets a result the action cache does not keep, such as a failure); after it, the name is NOT_FOUND. Every operation finished within it is held in memory
