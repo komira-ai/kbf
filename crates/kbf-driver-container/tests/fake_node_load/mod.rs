@@ -83,7 +83,8 @@ async fn a_lease_is_covered_from_the_second_reading_and_leaves_with_its_peak() {
     let lease = LeaseId::new(1, 1);
     let cgroup = fake.lease_cgroup(1);
 
-    // The readings, while the lease runs: the bounds are for a test that fails.
+    // The readings, while the lease runs. Nothing waits on a deadline: a broken hook shows
+    // in the asserts below, and a hang is the test runner's to report.
     let readings = async {
         let before = runtime
             .node_load()
@@ -93,31 +94,24 @@ async fn a_lease_is_covered_from_the_second_reading_and_leaves_with_its_peak() {
         while !cgroup.join("ready").exists() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        // The reading that first has the lease: it took the clock twice, once for the
-        // reading and once for the lease's `cpu.stat`.
-        let mut first = None;
-        for _ in 0..200 {
-            let before_calls = calls.load(Ordering::SeqCst);
-            let load = runtime.node_load().await.expect("a reading");
-            if calls.load(Ordering::SeqCst) - before_calls == 2 {
-                first = Some(load);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let first = first.expect("no reading ever saw the lease start");
+        // The lease is tracked from the moment `crun run` is spawned, with no await between,
+        // and the action writes `ready` only once it runs: so the first reading after
+        // `ready` has the lease. It takes the clock twice, once for the reading and once for
+        // the lease's `cpu.stat`.
+        let before_calls = calls.load(Ordering::SeqCst);
+        let first = runtime.node_load().await.expect("a reading");
+        assert_eq!(
+            calls.load(Ordering::SeqCst) - before_calls,
+            2,
+            "the reading after the action ran did not read the lease: it was never tracked"
+        );
         replace(&cgroup, "cpu.stat", "usage_usec 5000000\n");
         let second = runtime.node_load().await.expect("the second reading");
         std::fs::write(cgroup.join("release"), "").expect("release the action");
         (first, second)
     };
     let run = runtime.run(work(1, digest, Resources::new(2000, 1 << 30)));
-    let (outcome, (first, second)): (_, (NodeLoad, NodeLoad)) =
-        tokio::time::timeout(Duration::from_secs(120), async {
-            tokio::join!(run, readings)
-        })
-        .await
-        .expect("the lease never ran");
+    let (outcome, (first, second)): (_, (NodeLoad, NodeLoad)) = tokio::join!(run, readings);
     outcome.expect("ran");
     fake.assert_clean(1);
 
