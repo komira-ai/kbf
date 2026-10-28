@@ -1369,7 +1369,7 @@ impl Engine {
     pub(super) fn forget_parked(&mut self, a: &mut dyn Adapter) {
         let held = &self.unwritten;
         let waits = |lease: LeaseId| {
-            let answers = |e: &Effect| matches!(e, Effect::Answer(a) if a.lease == lease);
+            let answers = |e: &Effect| matches!(e, Effect::Answer(ans) if ans.lease == lease);
             held.iter().flatten().any(answers)
         };
         a.retain_parcels(&waits);
