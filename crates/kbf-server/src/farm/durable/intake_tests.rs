@@ -32,6 +32,7 @@ pub(super) fn caller(farm: &Farm, tag: u8) -> kbf_front::Ticket {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     };
     farm.submit(submission).expect("submitted")
 }
@@ -844,6 +845,7 @@ fn queue(farm: &Farm, request: kbf_sched::Request) -> kbf_front::Ticket {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     })
     .expect("queued")
 }

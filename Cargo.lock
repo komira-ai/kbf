@@ -2510,6 +2510,7 @@ name = "kbf-sched"
 version = "0.1.0"
 dependencies = [
  "js-sched",
+ "js-whole",
 ]
 
 [[package]]

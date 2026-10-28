@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use kbf_types::ReleasePlatform;
 
 use crate::version::Version;
-use crate::wire::{Health, Heartbeat, UpdateResult};
+use crate::wire::{Health, Heartbeat, ServiceBeat, UpdateResult};
 
 /// The platform this build runs on, when kbf has releases for it.
 pub fn host_platform() -> Option<ReleasePlatform> {
@@ -56,6 +56,17 @@ impl Status {
             last_update: self.last_update.clone(),
             updating: self.updating.clone(),
             services: None,
+        }
+    }
+
+    /// What the host says of the service `name`, when this is that service's status.
+    pub fn service_beat(&self, name: &str) -> ServiceBeat {
+        ServiceBeat {
+            name: name.to_owned(),
+            version: self.version.clone(),
+            health: self.health,
+            last_update: self.last_update.clone(),
+            updating: self.updating.clone(),
         }
     }
 }

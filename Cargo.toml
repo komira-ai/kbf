@@ -86,6 +86,7 @@ js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4
 js-store = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
 js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
 js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
+js-whole = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
 md-5 = "0.11.0"
 # macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
 objc2 = "0.6.5"

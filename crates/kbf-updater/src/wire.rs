@@ -72,7 +72,9 @@ pub struct Heartbeat {
     /// does not know services: the host is a `kbf`-only host, and the coordinator never
     /// names a service in its reply. Present (even empty) from one that does. `kbf` is never
     /// among them: its state is the fields above, and a heartbeat that lists it, lists a
-    /// name twice, or names a service that is no service name is refused.
+    /// name twice, names a service that is no service name, or lists more than
+    /// [`MAX_SERVICES`] is not read as a [`Heartbeat`]; the coordinator reads such a
+    /// heartbeat with [`read_heartbeat`], which drops the list and keeps the rest.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -127,6 +129,11 @@ pub fn is_service_name(name: &str) -> bool {
 /// The most bytes of a service name.
 pub const MAX_SERVICE_NAME: usize = 64;
 
+/// The most services a heartbeat lists, and a services file defines. A host runs `kbf` and a
+/// handful of daemons beside it; sixteen leaves room for all of them, and a list longer than
+/// that is a mistake or an attack, not a farm.
+pub const MAX_SERVICES: usize = 16;
+
 /// The name the top-level fields of a heartbeat, and a reply without a `service`, are about.
 pub const KBF_SERVICE: &str = "kbf";
 
@@ -137,6 +144,9 @@ fn services_text<'de, D: serde::Deserializer<'de>>(
     let Some(beats) = Option::<Vec<ServiceBeat>>::deserialize(d)? else {
         return Ok(None);
     };
+    if beats.len() > MAX_SERVICES {
+        return Err(D::Error::custom("too many services"));
+    }
     for (i, beat) in beats.iter().enumerate() {
         if !is_service_name(&beat.name) {
             return Err(D::Error::custom("not a service name"));
@@ -151,6 +161,69 @@ fn services_text<'de, D: serde::Deserializer<'de>>(
         }
     }
     Ok(Some(beats))
+}
+
+/// A heartbeat as the coordinator reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeartbeatRead {
+    /// The heartbeat. When its `services` list was dropped, `services` is `None`.
+    pub beat: Heartbeat,
+    /// Why the `services` list was dropped, if it was.
+    pub services_dropped: Option<String>,
+}
+
+/// Reads a heartbeat, keeping a host whose `services` list is bad.
+///
+/// A bad list (see [`Heartbeat::services`]) is dropped and the rest is read, so the host is
+/// answered as a `kbf`-only host and its `kbf` updates go on. Anything else that is wrong
+/// with the heartbeat is an error, as for [`Heartbeat`].
+///
+/// # Errors
+/// The strict read's error: the bytes are no heartbeat, with or without their `services`.
+pub fn read_heartbeat(bytes: &[u8]) -> Result<HeartbeatRead, serde_json::Error> {
+    match serde_json::from_slice::<Heartbeat>(bytes) {
+        Ok(beat) => Ok(HeartbeatRead {
+            beat,
+            services_dropped: None,
+        }),
+        Err(why) => without_services(bytes)
+            .map(|beat| HeartbeatRead {
+                beat,
+                services_dropped: Some(why.to_string()),
+            })
+            .ok_or(why),
+    }
+}
+
+/// A [`Heartbeat`] whose `services` value is not read: it reads every other field as
+/// [`Heartbeat`] does, duplicate keys included.
+#[derive(Deserialize)]
+struct HeartbeatWithoutServices {
+    #[serde(with = "platform_text")]
+    platform: ReleasePlatform,
+    version: Version,
+    health: Health,
+    #[serde(default)]
+    last_update: Option<UpdateResult>,
+    #[serde(default)]
+    updating: Option<Version>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    services: Option<serde::de::IgnoredAny>,
+}
+
+/// The heartbeat in `bytes` with its `services` value ignored, if what is left is a
+/// heartbeat.
+fn without_services(bytes: &[u8]) -> Option<Heartbeat> {
+    let rest: HeartbeatWithoutServices = serde_json::from_slice(bytes).ok()?;
+    Some(Heartbeat {
+        platform: rest.platform,
+        version: rest.version,
+        health: rest.health,
+        last_update: rest.last_update,
+        updating: rest.updating,
+        services: None,
+    })
 }
 
 /// The coordinator's answer to a heartbeat.

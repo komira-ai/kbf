@@ -2,6 +2,7 @@
 //! or read either. No sockets here; [`crate::http`] maps requests onto these calls.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -39,8 +40,7 @@ pub enum SetError {
     /// The state file could not be written.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// The services file's `ci_services` does not name this service, so CI's token may
-    /// not set it.
+    /// The allow-list entry that admitted the token does not name this service.
     #[error("the token may not set this service")]
     Forbidden,
 }
@@ -100,6 +100,9 @@ pub struct Status {
     pub services: BTreeMap<String, Desired>,
     /// The coordinator is still within its quiet period and orders nothing.
     pub quiet: bool,
+    /// Heartbeats since the coordinator started whose `services` list was bad and was
+    /// dropped: the host was answered as a `kbf`-only host.
+    pub services_dropped: u64,
     /// Every host heard from since the coordinator started, by node id.
     pub hosts: Vec<HostStatus>,
     /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]).
@@ -114,6 +117,7 @@ pub struct Coordinator {
     verifier: Arc<Verifier>,
     operator_token: String,
     clock: Clock,
+    services_dropped: AtomicU64,
 }
 
 impl std::fmt::Debug for Coordinator {
@@ -140,6 +144,7 @@ impl Coordinator {
             verifier,
             operator_token,
             clock,
+            services_dropped: AtomicU64::new(0),
         }
     }
 
@@ -148,6 +153,14 @@ impl Coordinator {
     pub fn with_services(mut self, services: Services) -> Self {
         self.services = services;
         self
+    }
+
+    /// Counts and logs a heartbeat from `who` whose `services` list was bad and was dropped
+    /// (`why` is the reader's reason). The heartbeat itself is still answered, by
+    /// [`Self::heartbeat`], as one from a `kbf`-only host.
+    pub fn note_services_dropped(&self, who: &Identity, why: &str) {
+        self.services_dropped.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(node_id = %who.node_id, why, "dropped the services list of a heartbeat");
     }
 
     /// Notes a heartbeat from `who` and answers it. With no desired state set, nothing.
@@ -218,17 +231,23 @@ impl Coordinator {
         body: &[u8],
     ) -> Result<Desired, SetError> {
         let verified = self.ci(bearer).await?;
-        tracing::info!(
-            workflow = %verified.job_workflow_ref,
-            sha = ?verified.sha,
-            "desired state set by CI"
-        );
         let (service, desired) =
             Desired::parse_request_for(body, |name| self.services.get(name).is_some())?;
-        if !self.services.ci_may_set(&service) {
+        if !verified.services.contains(&service) {
+            tracing::warn!(
+                workflow = %verified.job_workflow_ref,
+                %service,
+                "refused a desired state: the allow-list entry does not name the service"
+            );
             return Err(SetError::Forbidden);
         }
         self.desired.set(&service, desired.clone())?;
+        tracing::info!(
+            workflow = %verified.job_workflow_ref,
+            sha = ?verified.sha,
+            %service,
+            "desired state set by CI"
+        );
         Ok(desired)
     }
 
@@ -259,6 +278,7 @@ impl Coordinator {
             desired: self.desired.get(KBF),
             services: self.desired.all(),
             quiet: fleet.is_quiet(now),
+            services_dropped: self.services_dropped.load(Ordering::Relaxed),
             hosts,
             commit: crate::BUILD_COMMIT,
         })

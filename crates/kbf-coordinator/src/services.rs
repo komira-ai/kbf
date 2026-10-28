@@ -6,11 +6,10 @@
 //! of this one is ordered. The decision reads these and branches on no service name.
 //!
 //! `kbf`'s definition is built in ([`ServiceDef::kbf`]) and cannot be redefined. A file named
-//! by `--services-file` defines further services and says which of them CI's token may set:
+//! by `--services-file` defines further services. Which of them a CI token may set is not
+//! here: the allow-list entry that admits the token says (`services = [...]`, default `kbf`).
 //!
 //! ```toml
-//! ci_services = ["kbf"]          # optional; the default is only kbf
-//!
 //! [[service]]
 //! name = "agent"
 //! after = ["server"]             # services defined earlier in the file, or kbf
@@ -26,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use kbf_types::HostRole;
+use kbf_updater::wire::{MAX_SERVICE_NAME, MAX_SERVICES, is_service_name};
 use serde::Deserialize;
 
 use crate::desired::{Desired, KBF, MAX_COUNT};
@@ -125,7 +125,6 @@ pub enum ServicesError {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawFile {
-    ci_services: Option<Vec<String>>,
     #[serde(default)]
     service: Vec<RawService>,
 }
@@ -199,13 +198,9 @@ fn service_def(
     defined: &BTreeMap<String, ServiceDef>,
 ) -> Result<ServiceDef, ServicesError> {
     let RawService { name, after, roles } = raw;
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    {
+    if !is_service_name(&name) {
         return invalid(format!(
-            "service name {name:?} is not lowercase letters, digits and -"
+            "service name {name:?} is not 1 to {MAX_SERVICE_NAME} bytes of lowercase letters, digits and -"
         ));
     }
     if name == KBF || defined.contains_key(&name) {
@@ -237,7 +232,6 @@ fn service_def(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Services {
     defs: BTreeMap<String, ServiceDef>,
-    ci: BTreeSet<String>,
 }
 
 impl Default for Services {
@@ -245,7 +239,6 @@ impl Default for Services {
     fn default() -> Self {
         Self {
             defs: BTreeMap::from([(KBF.to_owned(), ServiceDef::kbf())]),
-            ci: BTreeSet::from([KBF.to_owned()]),
         }
     }
 }
@@ -255,24 +248,19 @@ impl Services {
     ///
     /// # Errors
     /// [`ServicesError`]: the text is not TOML of the shape, a name is bad or repeated, a
-    /// service has no roles, a role name or count is unusable, an `after` names what does
-    /// not exist (or is defined later, which also forbids a cycle), or `ci_services` names an
-    /// unknown service.
+    /// service has no roles, there are more than [`MAX_SERVICES`] services, a role name or
+    /// count is unusable, or an `after` names what does not exist (or is defined later, which
+    /// also forbids a cycle).
     pub fn parse(text: &str) -> Result<Self, ServicesError> {
         let file: RawFile =
             toml::from_str(text).map_err(|e| ServicesError::Parse(e.to_string()))?;
+        if file.service.len() > MAX_SERVICES {
+            return invalid(format!("more than {MAX_SERVICES} services"));
+        }
         let mut services = Self::default();
         for raw in file.service {
             let def = service_def(raw, &services.defs)?;
             services.defs.insert(def.name.clone(), def);
-        }
-        if let Some(ci) = file.ci_services {
-            if let Some(unknown) = ci.iter().find(|s| !services.defs.contains_key(*s)) {
-                return invalid(format!(
-                    "ci_services names {unknown}, which is not a service"
-                ));
-            }
-            services.ci = ci.into_iter().collect();
         }
         Ok(services)
     }
@@ -291,11 +279,5 @@ impl Services {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&ServiceDef> {
         self.defs.get(name)
-    }
-
-    /// Whether CI's token may set the desired state of `name`.
-    #[must_use]
-    pub fn ci_may_set(&self, name: &str) -> bool {
-        self.ci.contains(name)
     }
 }

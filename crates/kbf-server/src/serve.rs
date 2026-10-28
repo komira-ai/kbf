@@ -97,6 +97,8 @@ pub struct Listeners {
     pub learned_sizes: crate::LearnedSizes,
     /// Whether placement reads the load the nodes report (`--placement-load`).
     pub placement_load: crate::PlacementLoad,
+    /// The whole-node settings of the scheduler, if on (`--whole-node-max`).
+    pub whole_node: Option<kbf_sched::WholeNodeConfig>,
     /// How long a finished operation is kept after its callers are answered, in which
     /// WaitExecution on it still streams its result; then it is NOT_FOUND.
     pub finished_retention: Duration,

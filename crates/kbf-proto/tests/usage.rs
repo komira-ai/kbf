@@ -89,6 +89,62 @@ fn the_log_fields_are_fixed_and_dashes_stand_for_absent() {
     assert!(zero.log_fields(5).contains(" cpu_throttled=0 "));
 }
 
+/// Catches a macOS lease's measurements dropped from the line (every field `-` beside a
+/// footprint block that read its processes), a cgroup's fields replaced by the
+/// footprint's where both are present, CPU time summed from one half only, a usage that
+/// measured nothing given numbers, and the Linux line changed.
+#[test]
+fn a_usage_prints_its_cgroup_else_its_footprint_else_dashes() {
+    let dashes = kbf_proto::no_cgroup_fields();
+    assert_eq!(ResourceUsage::default().log_fields(), dashes);
+    // Only the wall time measured, as a whole-machine lease reports: all dashes.
+    let wall_only = ResourceUsage {
+        wall_micros: 9,
+        ..ResourceUsage::default()
+    };
+    assert_eq!(wall_only.log_fields(), dashes);
+
+    let mac = |footprint| ResourceUsage {
+        wall_micros: 4_000_000,
+        footprint: Some(footprint),
+        basis: UsageBasis::MacFootprint.into(),
+        ..ResourceUsage::default()
+    };
+    let read = mac(FootprintUsage {
+        peak_footprint_bytes: Some(8192),
+        cpu_user_micros: Some(3_000_000),
+        cpu_system_micros: Some(1_000_000),
+        wall_micros: Some(4_000_000),
+    });
+    assert_eq!(
+        read.log_fields(),
+        "cpu_usage_us=4000000 cpu_user_us=3000000 cpu_system_us=1000000 cpu_periods=- \
+         cpu_throttled=- throttled_us=- mem_peak=8192 parallelism=1.00 numa_bytes=- numa_spread=-"
+    );
+    // A footprint block of a lease whose processes were never read.
+    let unread = mac(FootprintUsage {
+        wall_micros: Some(4_000_000),
+        ..FootprintUsage::default()
+    });
+    assert_eq!(unread.log_fields(), dashes);
+    // Half a CPU time is no CPU time.
+    let half = mac(FootprintUsage {
+        cpu_user_micros: Some(5),
+        ..FootprintUsage::default()
+    });
+    assert!(
+        half.log_fields()
+            .starts_with("cpu_usage_us=- cpu_user_us=5 cpu_system_us=- ")
+    );
+
+    // A cgroup wins over a footprint, and prints as it always has.
+    let both = ResourceUsage {
+        cgroup: Some(cpu(10)),
+        ..read
+    };
+    assert_eq!(both.log_fields(), cpu(10).log_fields(4_000_000));
+}
+
 /// Catches usage not found by its type URL (and another entry's bytes decoded as
 /// usage), and the new `cgroup` field lost on the wire: a ResourceUsage of the four
 /// original fields (as an older daemon sends it) must decode with no cgroup.

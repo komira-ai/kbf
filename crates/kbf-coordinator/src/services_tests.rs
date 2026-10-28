@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use kbf_types::HostRole::{Daemon, Frontend, MacDaemon, Storage};
-use kbf_updater::wire::Reply;
+use kbf_updater::wire::{MAX_SERVICE_NAME, MAX_SERVICES, Reply};
 
 use crate::decide::decide_in;
 use crate::desired::{Desired, KBF};
@@ -66,7 +66,6 @@ fn kbf_is_built_in_as_data() {
     assert!(frontend.never_last);
     assert_eq!(frontend.after, [Storage, Daemon, MacDaemon]);
     assert_eq!(Services::default().get(KBF), Some(&kbf));
-    assert!(Services::default().ci_may_set(KBF));
 }
 
 /// Catches: a services file that is read wrongly: the two services of the file are defined
@@ -81,10 +80,6 @@ fn a_services_file_defines_further_services() {
     assert_eq!((daemon.max_updating, daemon.min_up), (Some(2), Some(0)));
     assert!(!daemon.never_last);
     assert!(s.get(KBF).is_some() && s.get("server").is_some());
-    assert!(s.ci_may_set(KBF) && !s.ci_may_set("server"));
-
-    let only = Services::parse(&format!("ci_services = [\"server\"]\n{TWO}")).expect("parsed");
-    assert!(only.ci_may_set("server") && !only.ci_may_set(KBF));
     assert_eq!(Services::parse("").expect("empty"), Services::default());
 
     let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "services-file");
@@ -172,7 +167,11 @@ fn a_services_file_that_cannot_work_is_refused() {
         svc("b", "", role)
     );
     assert!(refusal(&later).contains("defined earlier"));
-    assert!(refusal(&format!("ci_services = [\"nope\"]\n{}", svc("a", "", role))).contains("nope"));
+    // Which services a token may set is the allow-list's: the old key is refused by name.
+    assert!(
+        refusal(&format!("ci_services = [\"kbf\"]\n{}", svc("a", "", role)))
+            .contains("ci_services")
+    );
     let after_kbf = svc(
         "a",
         "after = [\"kbf\"]",
@@ -337,4 +336,28 @@ fn a_definitions_limits_and_waits_decide_over_the_desired_state() {
     f.record_in("svc", id("d1"), Daemon, beat("2.0"), NOW);
     f.record_in("svc", id("d3"), Daemon, beat("2.0"), NOW);
     assert_eq!(ask(&s, &w, &f, "svc", "t1"), update("2.0"));
+}
+
+/// Catches: the services file's name check drifting from the wire's: a name of exactly
+/// `MAX_SERVICE_NAME` bytes is defined, one byte more is refused and the refusal says why.
+#[test]
+fn a_service_name_has_the_wires_length_cap() {
+    let role = "[service.roles.daemon]\n";
+    let svc = |name: &str| format!("[[service]]\nname = \"{name}\"\n{role}");
+    Services::parse(&svc(&"a".repeat(MAX_SERVICE_NAME))).expect("at the cap");
+    let why = refusal(&svc(&"a".repeat(MAX_SERVICE_NAME + 1)));
+    assert!(why.contains("64 bytes"), "{why}");
+}
+
+/// Catches: no cap on the services a file defines, or one off by one: exactly
+/// `MAX_SERVICES` are defined, one more is refused.
+#[test]
+fn a_services_file_defines_at_most_the_most_services() {
+    let file = |n: usize| {
+        (0..n)
+            .map(|i| format!("[[service]]\nname = \"svc-{i}\"\n[service.roles.daemon]\n"))
+            .collect::<String>()
+    };
+    Services::parse(&file(MAX_SERVICES)).expect("at the cap");
+    assert!(refusal(&file(MAX_SERVICES + 1)).contains("more than 16 services"));
 }

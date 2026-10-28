@@ -192,6 +192,7 @@ impl Session {
             call: None,
             described,
             evidence: Default::default(),
+            max_wall: None,
         });
         match submitted {
             Ok(ticket) => {

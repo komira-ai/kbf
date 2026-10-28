@@ -139,6 +139,7 @@ fn submit(farm: &Farm, tag: u8) -> Result<Ticket, Status> {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     })
 }
 

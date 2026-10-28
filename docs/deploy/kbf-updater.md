@@ -156,6 +156,7 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
                   (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
                   [--frontend <dns name>:<port>] [--enroll-frontend <dns name>:<port>]
                   [--operator-api http://IP:PORT --token-file FILE] [--helper-socket PATH]
+                  [--service NAME,helper-socket=PATH[,SETTING=VALUE...]]...
                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
                   [--health-poll-secs N] [--retry-secs N]
 ```
@@ -195,6 +196,9 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
 - `--operator-api`, `--token-file`: optional, together: the full
   operator token over the frontend's loopback, an opt-in fallback used instead of the
   certificate; see the boundary below.
+- `--service NAME,helper-socket=PATH[,SETTING=VALUE...]`: a service the host runs besides `kbf`, given once for
+  each; see [Services besides kbf](#services-besides-kbf). Without it the agent is a
+  `kbf`-only agent.
 - Times, in seconds, 1 to 86400: `--heartbeat-secs` 15, `--drain-deadline-secs` 600,
   `--health-timeout-secs` 300, `--health-poll-secs` 5, `--retry-secs` 900.
 
@@ -267,6 +271,38 @@ The result goes in the next heartbeat. A restart of the agent in the middle find
 pending marker (`query`) and finishes the trial from step 4; nothing is fetched, drained or
 switched twice. A target that failed is not tried again before `--retry-secs`, however often
 the coordinator names it.
+
+### Services besides kbf
+
+An agent given `--service` also updates those services, with the same A/B (install, drain, switch,
+health, confirm or revert) run with the service's own ports. `NAME` is a service name (lowercase
+letters, digits and `-`, at most 64 bytes; not `kbf`), given once. The settings follow it, separated
+by commas, each at most once:
+
+| setting | meaning | default |
+|---|---|---|
+| `channel=C` | the channel of the helper's allowlist that holds the service's releases | `NAME` (it must be a channel name) |
+| `helper-socket=PATH` | the socket of the helper that installs it (an absolute path with no `..`); required, one per service, and never the agent's `--helper-socket`, whose helper installs `kbf` (an install request names no service, so it would install `kbf` at the service's version) | none: required |
+| `drain=node` or `drain=none` | `node`: the host's node is drained and given back through the frontend, as for `kbf`; `none`: nothing is drained, and no drain call is made | `node` |
+| `ready-url=http://IP:PORT/PATH` | health is `GET PATH` on that loopback address answering 2xx (the path is `/` if there is none) | the node's health through the frontend, as for `kbf` |
+
+A service's helper is spoken to exactly as `kbf`'s is: `query`, and `install kbf=<version> from
+<channel>`, with the service's version and channel. The request names no service, so each service
+needs a helper of its own that installs that service when asked so; the agent refuses to start with a
+service whose socket is its own `--helper-socket`.
+
+A value holds no comma. `drain=node` and node health need `--frontend` (or the operator token), as
+`kbf` does; a service with `drain=none` and a `ready-url` needs neither. A readiness URL is checked
+for the service's word that it serves; it does not say which release answered.
+
+With no `--service`, the heartbeat is the one above with no `services` field and the reply is read
+as before. With any, the heartbeat also carries `services`: for each, its version, health, last
+update and the target of the update running now (`kbf` stays in the fields it always had), and the
+reply may name the service to update. The agent runs one A/B at a time on the host, whichever
+service it is for: an order that arrives meanwhile waits for the one running. A target that failed
+is left alone for `--retry-secs` per service: a failure of one does not hold back another. The
+agent's log lines for a service are led by its name. A restart in the middle of a service's trial
+finishes that trial first, as for `kbf`.
 
 ### Enrolling a host
 
@@ -395,13 +431,15 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    event_names = ["workflow_run"]
    ```
 
-   `kbf-oidc` also reads several `[[remote_operator]]` entries (never mixed with the single
-   table), one per repository and workflow that may call. An entry's `services = [...]` (default
-   `["kbf"]`) lists the services a token it admits may set, and a token never gets another
-   entry's services. Entries must name the same issuer, and two entries may not share a
-   `repository_id` and a `job_workflow_ref`; such a file is refused at load. A coordinator reads
-   the list form only once it loads the file with `kbf_oidc::AllowList`; one that still uses
-   `OidcConfig` accepts the single table only.
+   The coordinator loads the file with `kbf_oidc::AllowList`, so it also reads several
+   `[[remote_operator]]` entries (never mixed with the single table), one per repository and
+   workflow that may call. An entry's `services = [...]` (default `["kbf"]`) lists the services a
+   token it admits may set, and a token never gets another entry's services: setting a service the
+   admitting entry does not list is a 403 `forbidden` that changes nothing. The single table above
+   is one entry that lets CI set `kbf` only. The services must be defined (`kbf` is built in; others
+   come from `--services-file`, which no longer takes `ci_services`: such a file is refused).
+   Entries must name the same issuer, and two entries may not share a `repository_id` and a
+   `job_workflow_ref`; such a file is refused at load.
 
    `event_names` must name `workflow_run`: the release workflow is started by the completion of
    the pipeline, and its tokens say so (the default list is `push` and `workflow_dispatch`).
@@ -461,7 +499,7 @@ says which form it needs, before it calls the coordinator. Anything else that se
 coordinator's desired version (a `POST /v1/desired` by hand) needs the same form, or no host
 will converge on it.
 
-The coordinator keeps its desired state per service name, and `kbf` is the only service it accepts unless `--services-file` defines more ([the design](../design/updates.md)): `POST /v1/desired` takes an optional `service` (absent means `kbf`; a name no file defines is a 400), and `GET /v1/status` adds `services` beside the unchanged `desired`. While `kbf` is the only service, the `--state-file` holds the single state in the form earlier coordinators wrote, so a downgrade to one of them starts on the same file; a file in the map form (`{"services": {...}}`), which a coordinator with a second service writes, is refused by an earlier build, and the operator then restores the file from before or writes `kbf`'s state alone in it.
+The coordinator keeps its desired state per service name, and `kbf` is the only service it accepts unless `--services-file` defines more ([the design](../design/updates.md)): `POST /v1/desired` takes an optional `service` (absent means `kbf`; a name no file defines is a 400), and `GET /v1/status` adds `services` beside the unchanged `desired`, and `services_dropped`, the number of heartbeats whose `services` list was bad and was dropped (the host is answered as a `kbf`-only host). While `kbf` is the only service, the `--state-file` holds the single state in the form earlier coordinators wrote, so a downgrade to one of them starts on the same file; a file in the map form (`{"services": {...}}`), which a coordinator with a second service writes, is refused by an earlier build, and the operator then restores the file from before or writes `kbf`'s state alone in it.
 
 `cargo xtask deploy-farm` (one `run:` line):
 

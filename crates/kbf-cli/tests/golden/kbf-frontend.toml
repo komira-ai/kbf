@@ -178,6 +178,22 @@ unservable-wait-secs = 300
 vm-host-floor-cpus = 2
 # The memory, in GiB, a node that reports VM slots (`vm.slots`) keeps for the host itself, subtracted as `--vm-host-floor-cpus` subtracts cores
 vm-host-floor-mem-gib = 8
+# Lets a reservation start on the last worker an older ordinary request that waits could run on. Off, the request waits for another worker, so a whole-machine request never takes the only worker such a request has
+whole-node-allow-last-capable = false
+# How long, in seconds, a whole-machine request waits before it reserves a worker; until then it takes only a worker with no lease. 0, the default, reserves at once
+whole-node-drain-after-secs = 0
+# How long, in seconds, a reservation may drain its worker before it is given up (nothing running is stopped): the worker is barred to the request for `--whole-node-reserve-backoff-secs` and another is reserved. Left out, the request's longest wall time, the `timeout` of its action; an action that names none has no wall time, and without this flag its reservation is never given up
+# whole-node-drain-deadline-secs = "SECONDS"
+# The fewest workers that carry neither a reservation nor a whole-machine lease, so ordinary work always has them. 0 lets whole-machine requests take every worker
+whole-node-keep-for-ordinary = 1
+# Turns on the whole-node drain and caps for whole-machine requests (`kbf-lease` `whole_machine`), and names the most workers that may be whole at once: held by a whole-machine lease or reserved for a queued request (a request that fits nowhere reserves the worker that will empty soonest, and nothing newer is placed there). The ceiling is also at most the workers that serve whole-machine leases less `--whole-node-keep-for-ordinary`, and falls as workers leave. Left out, the scheduler books whole-machine requests as it always has, and the other `--whole-node-*` flags are refused. A request's reservation is given up at its action's timeout, and a client may send none: without `--whole-node-drain-deadline-secs` the reservation of such a request is never given up (it ends when its worker is empty), so set that flag when clients may send no timeout
+# whole-node-max = "WORKERS"
+# The most workers reserved for a queued whole-machine request that still run other leases at once: the idle capacity a drain may cost. Default 1
+whole-node-max-draining = 1
+# The reservations a request gives up before its next one has the request's longest wall time as its deadline, and so ends in a grant. Default 2
+whole-node-max-reserve-attempts = 2
+# How long, in seconds, a worker stays barred to a request after the request gave its reservation up. Default 300
+whole-node-reserve-backoff-secs = 300
 
 [storage-client]
 # Proxy mode (`docs/design/architecture-v2.md`, section 7): the URL of a storage node (`kbf storage`), such as `http://127.0.0.1:8990`. The REAPI listener then answers a client's CAS, ByteStream and action-cache calls from that node, passing ByteStream through without holding a blob. The local stores are still opened: Execution and the worker listener use them (`kbf frontend` is this mode without them: Execution reads the node too). Plain text (`http://`) only here; `kbf frontend` takes the flags of the mutual TLS to the node. Without it, the server answers those calls itself
