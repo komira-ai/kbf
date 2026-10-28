@@ -55,6 +55,7 @@ impl Status {
             health: self.health,
             last_update: self.last_update.clone(),
             updating: self.updating.clone(),
+            services: None,
         }
     }
 }

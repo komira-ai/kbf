@@ -761,6 +761,76 @@ async fn a_service_the_token_may_not_set_is_a_403() {
     assert_eq!(status(&rig).await["desired"], Value::Null);
 }
 
+const SERVICES_TEXT: &str = "ci_services = [\"kbf\", \"other\"]\n[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n";
+
+const NEW_GOLDEN_BEAT: &str = concat!(
+    r#"{"platform":"linux-x86_64","version":"0.0.19+g123456abcdef-1","health":"healthy","#,
+    r#""last_update":null,"updating":null,"services":[{"name":"other","version":"1.0","#,
+    r#""health":"healthy","last_update":null,"updating":null}]}"#
+);
+
+/// Pins the wire of a service over HTTP. With `other` set to 3.0 and kbf current, an updater
+/// that sends `services` is answered with the exact bytes of a named order, while a v0.0.18
+/// updater of the same role (its golden beat, no `services`) is answered `{"reply":"nothing"}`
+/// and never the new shape; a beat that lists kbf among its services is a 400.
+#[tokio::test]
+async fn a_service_order_goes_only_to_an_updater_that_sent_services() {
+    let mut rig = Rig::new("http-services");
+    rig.coordinator = Rig::start(&rig.dir, &rig.clock)
+        .with_services(crate::services::Services::parse(SERVICES_TEXT).expect("services"));
+    for body in [
+        r#"{"version":"0.0.19+g123456abcdef-1","min_up":{"storage":1,"frontend":1}}"#,
+        r#"{"service":"other","version":"3.0","min_up":{"storage":0,"frontend":0}}"#,
+    ] {
+        let (code, _) = raw(
+            &rig,
+            Surface::Control,
+            &None,
+            request("POST", DESIRED_PATH, Some(&ci_token()), body),
+        )
+        .await;
+        assert_eq!(code, 200);
+    }
+    rig.at(2_000);
+    let (code, old) = raw(
+        &rig,
+        Surface::Heartbeat,
+        &updater("d1", "daemon"),
+        request(
+            "POST",
+            HEARTBEAT_PATH,
+            None,
+            &GOLDEN_BEAT.replace("0.0.18+gabcdefabcdef-2", "0.0.19+g123456abcdef-1"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        (code, String::from_utf8(old).expect("text")),
+        (200, r#"{"reply":"nothing"}"#.to_owned())
+    );
+    let (code, new) = raw(
+        &rig,
+        Surface::Heartbeat,
+        &updater("d2", "daemon"),
+        request("POST", HEARTBEAT_PATH, None, NEW_GOLDEN_BEAT),
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert_eq!(
+        String::from_utf8(new).expect("text"),
+        r#"{"reply":"update","service":"other","version":"3.0"}"#
+    );
+    let kbf_inside = NEW_GOLDEN_BEAT.replace(r#""name":"other""#, r#""name":"kbf""#);
+    let (code, _) = raw(
+        &rig,
+        Surface::Heartbeat,
+        &updater("d3", "daemon"),
+        request("POST", HEARTBEAT_PATH, None, &kbf_inside),
+    )
+    .await;
+    assert_eq!(code, 400);
+}
+
 /// Catches: the status or the convergence losing a field a client already reads, or not
 /// saying which build answers: a coordinator that has seen no host and holds no desired state
 /// answers with exactly the earlier fields and one more, `commit`, the text `--version`
