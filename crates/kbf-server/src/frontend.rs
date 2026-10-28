@@ -178,6 +178,7 @@ pub const ALLOWED: &[&str] = &[
     "vm_host_floor_cpus",
     "vm_host_floor_mem_gib",
     "learned_sizes",
+    "placement_load",
     "finished_retention_secs",
     "shutdown_timeout_secs",
     "invocation_memory",
@@ -798,6 +799,7 @@ impl<'a> Prepared<'a> {
         )
         .with_memory_ladder(listeners.memory_ladder.clone())
         .with_learned_sizes(listeners.learned_sizes, listeners.memory_ladder.first())
+        .with_placement_load(listeners.placement_load)
         .recording(recorder.clone());
         let farm = Arc::new(farm.with_state(state)?);
         log_state(durable, farm.term(), farm.lease_epoch());

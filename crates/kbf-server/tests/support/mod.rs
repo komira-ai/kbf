@@ -643,6 +643,7 @@ impl Cell {
             memory_ladder: ladder,
             vm_host_floor: kbf_server::HostFloor::default(),
             learned_sizes: learned,
+            placement_load: kbf_server::PlacementLoad::Off,
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),
             streams: kbf_server::StreamTiming::default(),

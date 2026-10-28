@@ -44,6 +44,19 @@ pub(super) fn parsed(more: &[&str]) -> Result<super::FrontendFlags, clap::Error>
     super::parse(&super::command().try_get_matches_from(argv)?)
 }
 
+/// Catches a frontend that refuses `--placement-load` (scheduling runs in the frontend, so
+/// a unit file that sets it would not start), one that ignores it, and one whose default is
+/// not `off`.
+#[test]
+fn the_frontend_takes_placement_load_and_defaults_to_off() {
+    use crate::PlacementLoad;
+    let mode = |more: &[&str]| parsed(more).expect("flags").server.placement_load;
+    assert_eq!(mode(&[]), PlacementLoad::Off);
+    assert_eq!(mode(&["--placement-load=shadow"]), PlacementLoad::Shadow);
+    assert_eq!(mode(&["--placement-load", "on"]), PlacementLoad::On);
+    assert!(parsed(&["--placement-load=load"]).is_err());
+}
+
 /// All eleven flags of the removed handover and admin port, each with a value.
 const RETIRED: [&str; 11] = [
     "--handover-socket=/run/kbf/control.sock",
