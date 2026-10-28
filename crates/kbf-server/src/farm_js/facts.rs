@@ -37,14 +37,18 @@ impl KbfAdapter {
 
     /// Takes the `os` and `arch` a resent `Hello` reports. The protocol is kept: the
     /// stream's is the first `Hello`'s, which `Welcome` answered. A worker that was never
-    /// registered, or has been forgotten, gains nothing.
+    /// registered, or has been forgotten, gains nothing. The call takes no stream: the
+    /// caller ignores a resize from a replaced stream, as the farm's own driver does.
     pub(crate) fn note_resized(&mut self, worker: &WorkerId, caps: &NodeCaps) {
         if let Some(facts) = self.facts.get_mut(worker) {
             (facts.os, facts.arch) = identity(caps);
         }
     }
 
-    /// Forgets `worker`'s facts: its stream is gone for good.
+    /// Forgets `worker`'s facts: its stream is gone for good. The farm's own driver keeps a
+    /// worker's link for as long as the farm runs, so a caller that mirrors it does not
+    /// call this where that driver would keep the link: the node views would lose the
+    /// worker's `os`, `arch` and protocol.
     pub(crate) fn forget_worker(&mut self, worker: &WorkerId) {
         self.facts.remove(worker);
     }

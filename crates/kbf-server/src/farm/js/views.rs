@@ -72,8 +72,10 @@ pub(crate) fn node_view(js: &JsFarm, worker: &WorkerId) -> Option<NodeView> {
 ///
 /// A node another frontend of the state store holds is not answered from the store: this
 /// arm answers only the nodes registered here. One not registered here is `None` when the
-/// store can be read (or the farm has none), and unread when the store cannot say and the
-/// node is not connected, as the farm's own driver answers a node nobody holds.
+/// store can be read (or the farm has none), and unread when the `cordon/` rows cannot be
+/// read and the node is not connected. Only the `cordon/` read decides readability here: a
+/// node registered here but not connected, whose `owner/` or `lease/` rows cannot be read,
+/// is answered from this frontend, where the farm's own driver says it is unread.
 pub(crate) fn node_detail(
     js: &JsFarm,
     worker: &WorkerId,

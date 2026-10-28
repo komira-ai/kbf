@@ -46,6 +46,8 @@ pub struct Caller {
 
 /// The number the core gave `stream`, which the farm's `StreamId` carries. `None` if the
 /// core's stream does not print as `Stream(<number>)`, which no stream the core numbers does.
+/// A caller that registers a worker returns `StreamId(stream_number(stream)?)`: any other
+/// numbering makes every status and pack count the views take for the stream be ignored.
 #[must_use]
 pub fn stream_number(stream: Stream) -> Option<u64> {
     let shown = format!("{stream:?}");
