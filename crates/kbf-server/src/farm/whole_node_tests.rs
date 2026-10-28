@@ -8,10 +8,12 @@ use std::time::Duration;
 use clap::Parser;
 use kbf_front::{Cache, Submission};
 use kbf_sched::{Blocked, WholeReason, WholeState, WholeWait};
+use kbf_state::fake::Fake;
 use kbf_types::{LeaseKind, OperationId};
 
 use super::*;
 use crate::Args;
+use crate::state_store::StateStore;
 
 type Inbox = mpsc::UnboundedReceiver<Result<ServerMessage, tonic::Status>>;
 
@@ -23,15 +25,34 @@ fn farm_with(flags: &[&str]) -> Farm {
 }
 
 /// A farm of `nodes` workers of four cores, each serving actions and whole-machine leases.
-struct Rig {
-    farm: Farm,
+pub(super) struct Rig {
+    pub(super) farm: Farm,
     nodes: Vec<(WorkerId, StreamId, Inbox)>,
     beats: u64,
 }
 
 impl Rig {
     fn new(flags: &[&str], nodes: &[&str]) -> Self {
-        let farm = farm_with(flags);
+        Self::on(farm_with(flags), nodes)
+    }
+
+    /// [`Rig::new`] over the state store `store`: what an earlier rig over it queued is
+    /// taken up before the nodes register.
+    pub(super) fn over(flags: &[&str], nodes: &[&str], store: &Arc<Fake>) -> Self {
+        let args = Args::parse_from(std::iter::once("kbf-server").chain(flags.iter().copied()));
+        let listeners = args.listeners().expect("listeners");
+        let farm = Farm::from_listeners(Arc::new(Cache::memory()), &listeners)
+            .with_state(Some(StateStore {
+                store: store.clone(),
+                epoch: EpochPolicy::Keep,
+                members: Default::default(),
+                history: None,
+            }))
+            .expect("a farm over the store");
+        Self::on(farm, nodes)
+    }
+
+    fn on(farm: Farm, nodes: &[&str]) -> Self {
         let nodes = nodes
             .iter()
             .map(|name| {
@@ -60,7 +81,7 @@ impl Rig {
 
     /// Submits one request of `kind` named by `key`, with the wall time `wall`, and returns
     /// the operation it is queued as.
-    fn submit(&self, key: u8, kind: LeaseKind, wall: Option<Duration>) -> OperationId {
+    pub(super) fn submit(&self, key: u8, kind: LeaseKind, wall: Option<Duration>) -> OperationId {
         self.submit_needing(key, kind, wall, kbf_caps::Request::default())
     }
 
@@ -129,7 +150,7 @@ impl Rig {
     }
 
     /// Moves the clock on by `by` in steps short enough that no worker is taken for silent.
-    async fn pass(&mut self, by: Duration) {
+    pub(super) async fn pass(&mut self, by: Duration) {
         let step = Duration::from_secs(5);
         let mut left = by;
         while !left.is_zero() {
@@ -140,7 +161,7 @@ impl Rig {
         }
     }
 
-    fn whole_state(&self, operation: OperationId) -> Option<WholeState> {
+    pub(super) fn whole_state(&self, operation: OperationId) -> Option<WholeState> {
         self.farm.lock().sched.whole_state(operation)
     }
 

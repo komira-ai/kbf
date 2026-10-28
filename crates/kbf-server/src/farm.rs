@@ -750,7 +750,13 @@ impl Dispatch for Farm {
                 .key()
             })
             .flatten();
-        let held = state.admit(&submission.request, &usage, size_key, now)?;
+        let held = state.admit(
+            &submission.request,
+            &usage,
+            size_key,
+            submission.max_wall,
+            now,
+        )?;
         // The operation this submit queues or joins: the twin the scheduler holds, the one
         // another frontend leases (which the scheduler does not hold), or the next it numbers.
         let twin = state.engine.sched.twin(&submission.request);
@@ -877,10 +883,11 @@ impl State {
         request: &kbf_sched::Request,
         subject: &crate::action_usage::Subject,
         size_key: Option<u64>,
+        max_wall: Option<Duration>,
         now: FarmTime,
     ) -> Result<Held, Status> {
         self.engine
-            .admit(&mut self.side, request, subject, size_key, now)
+            .admit(&mut self.side, request, subject, size_key, max_wall, now)
     }
 
     /// [`Engine::claim_worker`] with the farm's own side.
@@ -941,5 +948,7 @@ mod placement_tests;
 mod storage_down_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod whole_node_recovery_tests;
 #[cfg(test)]
 mod whole_node_tests;

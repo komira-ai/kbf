@@ -315,12 +315,13 @@ impl Engine {
         request: &kbf_sched::Request,
         subject: &crate::action_usage::Subject,
         size_key: Option<u64>,
+        max_wall: Option<Duration>,
         now: FarmTime,
     ) -> Result<Held, Status> {
         if self.fenced {
             return Err(Status::unavailable(HANDING_OVER));
         }
-        self.queue(a, request, subject, size_key, now)
+        self.queue(a, request, subject, size_key, max_wall, now)
     }
 
     /// The callers of `operation` still waiting: not answered, and with a stream open
