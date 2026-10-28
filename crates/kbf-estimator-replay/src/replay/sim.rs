@@ -182,7 +182,9 @@ pub fn simulate(trace: &Trace, arm: Arm, params: &Params) -> Result<ArmRun, SimE
         .max()
         .unwrap_or(0);
     let ladder = MemoryLadder::from_gib(&params.ladder_gib)?;
-    let mut sched = Scheduler::new(1).recording_requeues();
+    let mut sched = Scheduler::new(1)
+        .with_load_config(kbf_server::PlacementLoad::Off.config())
+        .recording_requeues();
     sched.set_memory_ladder(ladder);
     let bounds = Bounds {
         default_memory: params.first_booking(),
