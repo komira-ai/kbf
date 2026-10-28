@@ -224,18 +224,19 @@ impl KbfAdapter {
         self.unreadable_results
     }
 
-    /// `stage` as the callers of the farm see it. `None` for a stage this server does not
-    /// know, which a later `js-server-core` may add. A `done/` row that cannot be read is
-    /// shown as [`unreadable_result`].
-    fn shown(&mut self, stage: &CoreStage) -> Option<Stage> {
-        match stage {
+    /// `stage` as the callers of the farm see it: one stage, or none for a stage this server
+    /// does not know, which a later `js-server-core` may add. A `done/` row that cannot be
+    /// read is shown as [`unreadable_result`].
+    fn shown(&mut self, stage: &CoreStage) -> std::option::IntoIter<Stage> {
+        let shown = match stage {
             CoreStage::Queued => Some(Stage::Queued),
             CoreStage::Waiting(why) => Some(Stage::Waiting(why.clone())),
             CoreStage::WaitingKept(why) => Some(Stage::WaitingKept(why.clone())),
             CoreStage::Executing => Some(Stage::Executing),
             CoreStage::Done(row) => Some(Stage::Done(self.decoded(row))),
             _ => None,
-        }
+        };
+        shown.into_iter()
     }
 
     /// The request of `operation`, as the store holds it in its `op/` row, and the action it
@@ -361,12 +362,11 @@ impl Adapter for KbfAdapter {
     /// Shows `stage` to the callers of `operation`. A caller that joins a waiting operation
     /// is told again; the others, who already know, see no repeated update.
     fn show(&mut self, view: &View<'_>, operation: OperationId, stage: &CoreStage) {
-        let Some(stage) = self.shown(stage) else {
-            return;
-        };
         let waiters = view.sched().waiters(operation).unwrap_or_default();
-        for channel in waiters.iter().filter_map(|id| self.stages.get(id)) {
-            show_on(channel, &stage);
+        for stage in self.shown(stage) {
+            for channel in waiters.iter().filter_map(|id| self.stages.get(id)) {
+                show_on(channel, &stage);
+            }
         }
     }
 
@@ -536,11 +536,10 @@ impl Adapter for KbfAdapter {
     }
 
     fn show_callers(&mut self, callers: &[WaiterId], stage: &CoreStage) {
-        let Some(stage) = self.shown(stage) else {
-            return;
-        };
-        for channel in callers.iter().filter_map(|caller| self.stages.get(caller)) {
-            show_on(channel, &stage);
+        for stage in self.shown(stage) {
+            for channel in callers.iter().filter_map(|caller| self.stages.get(caller)) {
+                show_on(channel, &stage);
+            }
         }
     }
 
@@ -565,13 +564,12 @@ impl Adapter for KbfAdapter {
     }
 
     fn show_watched(&mut self, operation: OperationId, stage: &CoreStage) {
-        let Some(stage) = self.shown(stage) else {
-            return;
-        };
         // The core asks only about operations `watched` just listed.
-        let channel = self.watched.get(&operation);
-        channel
-            .into_iter()
-            .for_each(|channel| show_on(channel, &stage));
+        for stage in self.shown(stage) {
+            let channel = self.watched.get(&operation);
+            channel
+                .into_iter()
+                .for_each(|channel| show_on(channel, &stage));
+        }
     }
 }
