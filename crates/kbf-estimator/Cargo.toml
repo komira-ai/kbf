@@ -8,6 +8,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The code lives in the jobscheduler repository, at the revision the workspace pins.
+js-sizing.workspace = true
 
 [lints]
 workspace = true
