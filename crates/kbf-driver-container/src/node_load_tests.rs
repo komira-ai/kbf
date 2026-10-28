@@ -513,7 +513,10 @@ async fn a_reading_names_each_running_lease_with_its_start_and_counters() {
     let reading = load.clone().into_reading();
     assert_eq!(reading.leases, load.leases);
     assert_eq!(reading.load.seq, 1);
-    assert_eq!(reading.load.memory_working_set_bytes, 10_485_760 - 2_097_152);
+    assert_eq!(
+        reading.load.memory_working_set_bytes,
+        10_485_760 - 2_097_152
+    );
 }
 
 /// Catches one lease's missing or garbled file failing the whole reading, a lease dropped
