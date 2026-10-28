@@ -1320,6 +1320,7 @@ impl Members {
                 MemberReport {
                     id: member.id,
                     state: member.state,
+                    boot: member.boot,
                     planned: Planned::No,
                     report: None,
                 },
@@ -1331,6 +1332,7 @@ impl Members {
                 MemberReport {
                     id,
                     state: live.member.state,
+                    boot: live.boot,
                     planned: Planned::No,
                     report: live.report,
                 },
