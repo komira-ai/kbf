@@ -50,6 +50,13 @@
 //!   them, only for an operation given one (`--learned-sizes=on`). It is in a row of its
 //!   own, not in the request, so no row of an older format changes and a binary that does
 //!   not know the prefix reads the store as it always did;
+//! - `opwall/<operation>`: the longest the operation may run, the `timeout` of its action
+//!   ([`kbf_sched::Scheduler::set_max_wall`], which the whole-node drain order and deadlines
+//!   read), written in the submission's transaction beside `op/` and `queue/` and deleted
+//!   with them, only for an operation given one. Like `opkey/` it is in a row of its own, so
+//!   no row of an older format changes, a binary that does not know the prefix reads the
+//!   store as it always did, and an operation with no row has no wall time. It is read
+//!   whatever the options: the scheduler ignores it unless the whole-node option is on;
 //! - `subject/<operation>`: what the operation's `action usage:` line says it is (the
 //!   shape key, configuration hash, target and the client's mnemonic and target hint,
 //!   [`crate::action_usage::Subject`]), written in the submission's transaction beside
@@ -211,6 +218,7 @@ const FATE: &str = "fate/";
 const FLOOR: &str = "floor/";
 const KEY_FLOOR: &str = "keyfloor/";
 const OPKEY: &str = "opkey/";
+const OPWALL: &str = "opwall/";
 pub(crate) const ESTIMATE: &str = "est/";
 /// Rows of one transaction of the size sweep, and the most transactions of one call.
 pub(super) const SWEEP_ROWS: usize = 256;
@@ -375,6 +383,8 @@ pub(super) struct StoredOperation {
     pub subject: Option<Subject>,
     /// Its size key, if the writer named one (`opkey/` row).
     pub size_key: Option<u64>,
+    /// The longest it may run, if the writer named one (`opwall/` row).
+    pub max_wall: Option<Duration>,
 }
 
 impl StoredOperation {
@@ -422,6 +432,7 @@ pub(super) mod intake;
 mod leases;
 pub(crate) mod named;
 mod opkey;
+mod opwall;
 mod owner;
 mod reads;
 pub(crate) mod subject;
@@ -506,6 +517,7 @@ impl Ending {
             .delete(fate_key(operation), Cond::Any);
         ext.settled(txn, operation)
             .delete(opkey_key(operation), Cond::Any)
+            .delete(opwall_key(operation), Cond::Any)
             .delete(lease_by_op_key(operation), Cond::Any)
             .put_ttl(done_key(operation), self.finished.to_row(), ttl, done)
     }
@@ -574,6 +586,10 @@ fn fate_key(operation: OperationId) -> String {
 
 fn opkey_key(operation: OperationId) -> String {
     format!("{OPKEY}{:016x}", operation.0)
+}
+
+fn opwall_key(operation: OperationId) -> String {
+    format!("{OPWALL}{:016x}", operation.0)
 }
 
 fn subject_key(operation: OperationId) -> String {
@@ -726,6 +742,12 @@ impl Durable {
             let size_key = opkey::decode(&row.value).map_err(|why| corrupt(&key, why))?;
             opkeys.insert(operation, size_key);
         }
+        let mut walls = std::collections::BTreeMap::new();
+        for (key, row) in self.store.scan_prefix(OPWALL)? {
+            let operation = parse_operation(&key, OPWALL)?;
+            let wall = opwall::decode(&row.value).map_err(|why| corrupt(&key, why))?;
+            walls.insert(operation, wall);
+        }
         let mut floors = Vec::new();
         for (key, row) in self.store.scan_prefix(FLOOR)? {
             let floor = floor::decode(&row.value).map_err(|why| corrupt(&key, why))?;
@@ -784,6 +806,7 @@ impl Durable {
                 fate: fates.remove(&operation),
                 subject: subjects.remove(&operation),
                 size_key: opkeys.remove(&operation),
+                max_wall: walls.remove(&operation),
             });
         }
         Ok(Stored {
@@ -897,19 +920,20 @@ impl Durable {
         request: &Request,
         subject: &Subject,
     ) -> Result<(), StateError> {
-        self.submitted_keyed(operation, request, subject, None)
+        self.submitted_keyed(operation, request, subject, None, None)
     }
 
-    /// [`Durable::submitted`], with the operation's size key, if it has one, in an
-    /// `opkey/` row of the same transaction.
+    /// [`Durable::submitted`], with the operation's size key and longest wall time, if it
+    /// has them, in an `opkey/` and an `opwall/` row of the same transaction.
     fn submitted_keyed(
         &self,
         operation: OperationId,
         request: &Request,
         subject: &Subject,
         size_key: Option<u64>,
+        max_wall: Option<Duration>,
     ) -> Result<(), StateError> {
-        self.commit(self.submission(operation, request, subject, size_key)?)
+        self.commit(self.submission(operation, request, subject, size_key, max_wall)?)
     }
 
     /// [`Durable::submitted`], with the action's in-flight row in the same transaction:
@@ -920,9 +944,10 @@ impl Durable {
         request: &Request,
         subject: &Subject,
         size_key: Option<u64>,
+        max_wall: Option<Duration>,
         (pin, cond): (&str, Cond),
     ) -> Result<(), StateError> {
-        let txn = self.submission(operation, request, subject, size_key)?;
+        let txn = self.submission(operation, request, subject, size_key, max_wall)?;
         self.commit(txn.put(pin, operation.0.to_be_bytes(), cond))
     }
 
@@ -932,11 +957,15 @@ impl Durable {
         request: &Request,
         subject: &Subject,
         size_key: Option<u64>,
+        max_wall: Option<Duration>,
     ) -> Result<Txn, StateError> {
         let value = self.codec.submit(request)?;
         let mut txn = Txn::new();
         if let Some(key) = size_key {
             txn = txn.put(opkey_key(operation), opkey::encode(key), Cond::Absent);
+        }
+        if let Some(wall) = max_wall {
+            txn = txn.put(opwall_key(operation), opwall::encode(wall), Cond::Absent);
         }
         let txn = txn.put(op_key(operation), value, Cond::Absent);
         let txn = self.ext.submitted(txn, operation, subject);
@@ -1531,6 +1560,7 @@ impl State {
         let now = self.engine.ambient.wall();
         let mut recovered = Vec::new();
         let mut keyed = Vec::new();
+        let mut walled = Vec::new();
         // A start takes up the operations that wait for a lease, and none that holds one:
         // the lease belongs to the frontend its node is connected to, which may be another
         // than this. A leased operation is taken up when its node says `Hello` here
@@ -1543,6 +1573,9 @@ impl State {
             if let Some(size_key) = op.size_key.filter(|_| self.side.learned.keys()) {
                 keyed.push((op.operation, size_key));
                 self.side.register_stored(&op, size_key);
+            }
+            if let Some(wall) = op.max_wall {
+                walled.push((op.operation, wall));
             }
             recovered.push(self.engine.take_stored(&mut self.side, op, now));
         }
@@ -1563,6 +1596,11 @@ impl State {
             .sched
             .recover(epoch, first_operation, seqs.start, recovered);
         self.engine.sched.use_seq_block(seqs);
+        // The longest each operation may run comes from the store's rows, given before the
+        // first placement round: the whole-node drain order and deadlines read it.
+        for (operation, wall) in walled {
+            self.engine.sched.set_max_wall(operation, wall);
+        }
         // The size keys come from the store's own rows, not from the requests: only `on`
         // reads them. A recovered lease keeps the request the store holds; a key floor
         // raises only the operations queued after it.
@@ -1603,6 +1641,7 @@ impl Engine {
         request: &Request,
         subject: &Subject,
         size_key: Option<u64>,
+        max_wall: Option<Duration>,
         now: FarmTime,
     ) -> Result<Held, Status> {
         if self.sched.twin(request).is_some() {
@@ -1614,7 +1653,7 @@ impl Engine {
             // The id comes from the block this frontend reserved: the operation's row
             // is put under an id no other frontend takes.
             let id = d.reserve_operation(wanted)?;
-            submitted = Some(d.submit_keyed(id, request, subject, size_key)?);
+            submitted = Some(d.submit_keyed(id, request, subject, size_key, max_wall)?);
             Ok(())
         });
         if !taken {
@@ -1671,16 +1710,21 @@ impl Engine {
 
     /// Takes `op`, which the state store holds and the scheduler neither holds nor has
     /// finished (the caller checked), into the scheduler, held for a caller of its own that
-    /// no client waits on, with the size key its row names if the learned sizes read it.
+    /// no client waits on, with the size key its row names if the learned sizes read it and
+    /// the longest wall time its row names.
     pub(super) fn take_in_stored(&mut self, a: &mut dyn Adapter, op: StoredOperation) {
         let operation = op.operation;
         let stored_key = op.size_key.filter(|_| a.size_keys());
+        let stored_wall = op.max_wall;
         let recovered = self.take_stored(a, op, self.ambient.wall());
         // The operation is neither in the scheduler nor finished, so `take_in` has nothing
         // to refuse.
         let taken = self.sched.take_in(recovered);
         if let Some(key) = stored_key {
             self.sched.set_size_key(operation, key);
+        }
+        if let Some(wall) = stored_wall {
+            self.sched.set_max_wall(operation, wall);
         }
         debug_assert!(taken, "the stored operation was already in the scheduler");
     }
@@ -1739,3 +1783,5 @@ mod timing_tests;
 mod transition_tests;
 #[cfg(test)]
 mod unknown_tests;
+#[cfg(test)]
+mod wall_intake_tests;
