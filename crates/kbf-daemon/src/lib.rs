@@ -53,6 +53,7 @@ pub mod clock;
 pub mod config;
 pub mod connect;
 mod contact;
+mod core;
 pub mod cpu_pool;
 mod daemon;
 pub mod driver_watch;
@@ -90,6 +91,7 @@ mod window;
 /// checkout (issue #170). `build.rs` embeds the commit.
 pub const DAEMON_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT"));
 
+pub use crate::core::{Event, superseded};
 pub use cas::{Cas, CasError};
 pub use clock::{Clock, Moment, SystemClock};
 pub use config::{
@@ -97,7 +99,7 @@ pub use config::{
 };
 pub use contact::{Acked, Contact};
 pub use cpu_pool::CpuPool;
-pub use daemon::{Daemon, Event, PROTOCOL_VERSION, SessionError, superseded};
+pub use daemon::{Daemon, PROTOCOL_VERSION, SessionError};
 pub use driver_watch::{DriverPart, DriverWatch};
 pub use kbf_mapsync::MapHolder;
 pub use kbf_route::{DEFAULT_HOLD, Liveness};
