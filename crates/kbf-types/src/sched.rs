@@ -458,7 +458,7 @@ let after: Digest;
 
     #[test]
     fn a_path_attribute_is_found_however_it_is_spelled() {
-        // The old check looked for the text `#[path` on one line.
+        // Any spacing, line break, inner attribute or nesting still reads as `path`.
         assert!(has_path_attribute("#[ path = \"x.rs\" ]\nmod x;\n"));
         assert!(has_path_attribute("# [\n  path = \"x.rs\"]\nmod x;\n"));
         assert!(has_path_attribute("#![path = \"x.rs\"]\n"));
@@ -476,8 +476,8 @@ let after: Digest;
 
     #[test]
     fn a_raw_string_is_one_literal_whatever_it_holds() {
-        // A quote inside the raw string ended the old literal early, so `/*` opened a
-        // block comment that swallowed the code after it.
+        // A quote inside a raw string does not end it, so `/*` there opens no block
+        // comment and the code after it is still scanned.
         let hidden = "let s = r#\"x\" /* \"#;\nlet a: Digest;\n";
         assert_eq!(offenders(hidden), ["let a: Digest;"]);
         let bytes = "let b = br#\"a\" /* \"#;\nlet z: u8;\n";
@@ -485,11 +485,11 @@ let after: Digest;
             code_lines(bytes),
             ["let b = br#\"a\" /* \"#;", "let z: u8;"]
         );
-        // Unbalanced braces in a raw string left the old test item open to the end.
+        // Unbalanced braces in a raw string do not keep a test item open.
         let braces = "#[cfg(test)]\nmod tests {\n    const R: &str = r##\"a\"#{\"##;\n}\nlet after: Digest;\n";
         assert_eq!(offenders(braces), ["let after: Digest;"]);
-        // A backslash before the closing quote is no escape in a raw string, so the old
-        // scan ended the test item early and reported its code.
+        // A backslash before the closing quote is no escape in a raw string, so the
+        // literal ends there and the test item closes where it really does.
         let slash = "#[cfg(test)]\nmod tests {\n    const R: &str = r\"\\\"; const X: &str = \"}\";\n    fn t() { let f: Digest; }\n}\nlet after: Digest;\n";
         assert_eq!(offenders(slash), ["let after: Digest;"]);
         // A raw string is code to the reader of names: its text is still reported.
