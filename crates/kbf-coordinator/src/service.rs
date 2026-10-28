@@ -39,7 +39,8 @@ pub enum SetError {
     /// The state file could not be written.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// The token's allow-list entry may not set this service.
+    /// The services file's `ci_services` does not name this service, so CI's token may
+    /// not set it.
     #[error("the token may not set this service")]
     Forbidden,
 }
