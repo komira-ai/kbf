@@ -3,7 +3,7 @@
 # It is the M1 exit test of beta.yml's `m1-cell` (MinIO, one kbf-server, one daemon, the sample
 # projects built twice each with pinned Bazel and buck2, a lease drained in flight, a planted
 # failing build; `kbf-cell m1`, crates/kbf-integration-test/src/m1.rs says exactly what is
-# checked) with two differences: the kbf-server is built with `--features kbf-server/farm-core-js`
+# checked) with two differences: the kbf-server is built with `--features farm-core-js` in a build of its own
 # and started with `--scheduler-core js --placement-load on`, and the run also requires that the
 # server logged `scheduler core: js` and reports `kbf_scheduler_core{core="js"} 1` on /metrics,
 # before the builds and after them (`--expect-scheduler-core js`), so it cannot pass on the legacy
@@ -109,8 +109,15 @@ jobs:
       # The kbf-server with the js core compiled in, the cell, and kbf-act (the program the
       # samples' `shout` action runs). The feature belongs to kbf-server; the other packages are
       # built as m1-cell builds them.
-      - name: Build the kbf-server with the js core, and the cell
-        run: cargo build -p kbf-server -p kbf-integration-test -p kbf-testkit --bins --locked --features kbf-server/farm-core-js
+      # Two invocations, the server last. One invocation naming all three packages with
+      # `--features kbf-server/farm-core-js` was tried and builds a kbf-server WITHOUT the
+      # feature (it refuses `--scheduler-core js` as "not available yet"); the feature given
+      # to a build of the server alone is what turns it on. The server is built last so
+      # nothing after it can relink its binary.
+      - name: Build the cell
+        run: cargo build -p kbf-integration-test -p kbf-testkit --bins --locked
+      - name: Build the kbf-server with the js core
+        run: cargo build -p kbf-server --bins --locked --features farm-core-js
       - name: Fetch Bazel (pinned version, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/bazelbuild/bazel/releases/download/$BAZEL_VERSION/bazel-$BAZEL_VERSION-linux-x86_64" --sha256 "$BAZEL_SHA256" --out "$RUNNER_TEMP/tools/bazel"
       - name: Fetch buck2 (pinned version, checked by SHA-256)
