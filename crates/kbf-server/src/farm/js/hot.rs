@@ -18,7 +18,7 @@ use kbf_sched::DaemonInstance;
 use kbf_types::{LeaseId, WorkerId};
 use tonic::Status;
 
-use super::JsFarm;
+use super::{JsFarm, load};
 use crate::farm::{Outbound, Reported, StreamId};
 use crate::farm_js::host::{Connection, stream_number};
 use crate::farm_js::{Wall, dispatch};
@@ -107,6 +107,10 @@ pub(crate) async fn heartbeat(
         return false;
     };
     let beat = Beat::new(seq, running);
+    let beat = match load::node_load(js, worker) {
+        Some(load) => beat.with_load(load),
+        None => beat,
+    };
     js.core
         .heartbeat(js.now(), worker, stream, beat)
         .await
