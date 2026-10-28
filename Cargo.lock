@@ -1320,7 +1320,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "js-caps"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=c9acfec5aeb45c35254585861493009e35f060d1#c9acfec5aeb45c35254585861493009e35f060d1"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=fdf68c3b96e0f201fb7106e5d894e293b0e1f674#fdf68c3b96e0f201fb7106e5d894e293b0e1f674"
 dependencies = [
  "thiserror",
 ]
@@ -1328,17 +1328,18 @@ dependencies = [
 [[package]]
 name = "js-sched"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=c9acfec5aeb45c35254585861493009e35f060d1#c9acfec5aeb45c35254585861493009e35f060d1"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=fdf68c3b96e0f201fb7106e5d894e293b0e1f674#fdf68c3b96e0f201fb7106e5d894e293b0e1f674"
 dependencies = [
  "js-caps",
  "js-sizing",
  "js-types",
+ "js-whole",
 ]
 
 [[package]]
 name = "js-sim"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=c9acfec5aeb45c35254585861493009e35f060d1#c9acfec5aeb45c35254585861493009e35f060d1"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=fdf68c3b96e0f201fb7106e5d894e293b0e1f674#fdf68c3b96e0f201fb7106e5d894e293b0e1f674"
 dependencies = [
  "js-types",
  "rand_chacha 0.10.0",
@@ -1348,12 +1349,12 @@ dependencies = [
 [[package]]
 name = "js-sizing"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=c9acfec5aeb45c35254585861493009e35f060d1#c9acfec5aeb45c35254585861493009e35f060d1"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=fdf68c3b96e0f201fb7106e5d894e293b0e1f674#fdf68c3b96e0f201fb7106e5d894e293b0e1f674"
 
 [[package]]
 name = "js-state"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=c9acfec5aeb45c35254585861493009e35f060d1#c9acfec5aeb45c35254585861493009e35f060d1"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=fdf68c3b96e0f201fb7106e5d894e293b0e1f674#fdf68c3b96e0f201fb7106e5d894e293b0e1f674"
 dependencies = [
  "js-testkit",
  "postgres",
@@ -1378,7 +1379,7 @@ dependencies = [
 [[package]]
 name = "js-testkit"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=c9acfec5aeb45c35254585861493009e35f060d1#c9acfec5aeb45c35254585861493009e35f060d1"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=fdf68c3b96e0f201fb7106e5d894e293b0e1f674#fdf68c3b96e0f201fb7106e5d894e293b0e1f674"
 dependencies = [
  "libc",
  "postgres",
@@ -1389,12 +1390,17 @@ dependencies = [
 [[package]]
 name = "js-types"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=c9acfec5aeb45c35254585861493009e35f060d1#c9acfec5aeb45c35254585861493009e35f060d1"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=fdf68c3b96e0f201fb7106e5d894e293b0e1f674#fdf68c3b96e0f201fb7106e5d894e293b0e1f674"
 dependencies = [
  "serde",
  "serde_json",
  "thiserror",
 ]
+
+[[package]]
+name = "js-whole"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=fdf68c3b96e0f201fb7106e5d894e293b0e1f674#fdf68c3b96e0f201fb7106e5d894e293b0e1f674"
 
 [[package]]
 name = "kbf-alert"
