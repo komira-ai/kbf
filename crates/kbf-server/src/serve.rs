@@ -83,6 +83,8 @@ pub struct Listeners {
     pub unservable_wait: Duration,
     /// The OS and architecture of an action that names neither (`--default-platform`).
     pub default_platform: kbf_front::DefaultPlatform,
+    /// The levels the `x-kbf-qos` header may name (`--qos-allowed`).
+    pub qos_allowed: kbf_front::QosAllow,
     /// The memory rungs of an action: the first is what an action that names no size
     /// books, the others are what it climbs through when it passes its own memory
     /// limit, before a whole host (`--memory-ladder-gib`).
@@ -787,6 +789,7 @@ where
     let defaults = kbf_front::Defaults {
         memory: listeners.memory_ladder.first(),
         platform: listeners.default_platform,
+        qos: listeners.qos_allowed,
     };
     let farm = Farm::new(
         Arc::clone(&cache),

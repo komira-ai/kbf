@@ -57,6 +57,8 @@ tracing.workspace = true
 # a start that enrolls reads.
 rustix = { workspace = true, features = ["process", "system"] }
 # The Postgres state schema version, which `kbf --version --json` reports.
+# `schema::embedded` and `latest`: the migrations a release runs (the state store's and the pack index's).
+kbf-pack-index = { workspace = true, features = ["postgres"] }
 kbf-state = { workspace = true, features = ["postgres"] }
 # `kbf setup` (src/setup.rs): the first configuration of a host from the packages. Without the
 # library's `proxy` feature, so this binary links no kbf-proxy: an installer.toml with a

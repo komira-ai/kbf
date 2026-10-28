@@ -46,7 +46,7 @@ use kbf_types::WorkerId;
 use tonic::Code;
 use tonic::service::Routes;
 
-use crate::api::{drain_action, error, json};
+use crate::api::{drain_action, error, json, placed_error};
 use crate::farm::{Farm, NodeAction};
 use crate::identity::{PeerCert, Peers, Presented};
 use crate::members::Members;
@@ -235,8 +235,9 @@ async fn status(
         Err(refused) => return refused,
     };
     match calls.farm.node_detail(&node) {
-        Some(detail) => json(StatusCode::OK, &detail),
-        None => error(StatusCode::NOT_FOUND, "no_node"),
+        Ok(Some(detail)) => json(StatusCode::OK, &detail),
+        Ok(None) => error(StatusCode::NOT_FOUND, "no_node"),
+        Err(unread) => error(StatusCode::SERVICE_UNAVAILABLE, &unread.to_string()),
     }
 }
 
@@ -263,7 +264,7 @@ async fn act(
     };
     match calls.farm.place(&node, action) {
         Ok(view) => json(StatusCode::OK, &view),
-        Err(unknown) => error(StatusCode::NOT_FOUND, &unknown.to_string()),
+        Err(refused) => placed_error(&refused),
     }
 }
 

@@ -101,6 +101,8 @@ pub struct Status {
     pub quiet: bool,
     /// Every host heard from since the coordinator started, by node id.
     pub hosts: Vec<HostStatus>,
+    /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]).
+    pub commit: &'static str,
 }
 
 /// The coordinator.
@@ -232,6 +234,7 @@ impl Coordinator {
             services: self.desired.all(),
             quiet: fleet.is_quiet(now),
             hosts,
+            commit: crate::BUILD_COMMIT,
         })
     }
 

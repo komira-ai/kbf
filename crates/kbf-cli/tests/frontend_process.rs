@@ -362,8 +362,8 @@ fn a_frontend_process_with_a_postgres_state_store_is_ready_over_the_installers_s
     assert!(made.is_empty(), "the refused start created the schema");
 
     let config = kbf_state::postgres::PostgresConfig::parse(&url).expect("the URL parses");
-    let set = kbf_state::postgres::schema::embedded();
-    kbf_state::postgres::schema::apply(&config, &set, kbf_state::postgres::schema::latest())
+    let set = kbf_pack_index::schema::embedded();
+    kbf_state::postgres::schema::apply(&config, &set, kbf_pack_index::schema::latest())
         .expect("the installer's step");
     let mut front = frontend(&node.field("storage="), &[&flag]);
     let (code, body) = get(&front.field("api="), "/readyz");

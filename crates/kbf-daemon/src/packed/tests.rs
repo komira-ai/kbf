@@ -7,8 +7,9 @@ use std::sync::{Mutex, PoisonError};
 
 use kbf_objstore::{Capabilities, MemoryStore, ObjectKey, ObjectStore as _};
 use kbf_pack::{PackKeys, Packer, PackerConfig, ReaderConfig, WriterKind, blob_digest};
-use kbf_state::pack_index::memory::MemoryPackIndex;
-use kbf_state::{ManualClock, NewPack, PackBlob, PackIndex, PackIndexError};
+use kbf_pack_index::memory::MemoryPackIndex;
+use kbf_pack_index::{NewPack, PackBlob, PackIndex, PackIndexError};
+use kbf_state::ManualClock;
 use kbf_testkit::dir::TestDir;
 use tokio::io::AsyncWriteExt as _;
 

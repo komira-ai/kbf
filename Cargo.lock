@@ -744,7 +744,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1318,6 +1318,53 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "js-caps"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "js-sched"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
+dependencies = [
+ "js-caps",
+ "js-sizing",
+ "js-types",
+]
+
+[[package]]
+name = "js-sim"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
+dependencies = [
+ "js-types",
+ "rand_chacha 0.10.0",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "js-sizing"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
+
+[[package]]
+name = "js-state"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
+dependencies = [
+ "js-testkit",
+ "postgres",
+ "rusqlite",
+ "rustix",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1326,6 +1373,27 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "js-testkit"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
+dependencies = [
+ "libc",
+ "postgres",
+ "rustix",
+ "tokio",
+]
+
+[[package]]
+name = "js-types"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -1409,7 +1477,7 @@ dependencies = [
 name = "kbf-caps"
 version = "0.1.0"
 dependencies = [
- "thiserror",
+ "js-caps",
 ]
 
 [[package]]
@@ -1449,6 +1517,7 @@ dependencies = [
  "kbf-host",
  "kbf-installer",
  "kbf-node",
+ "kbf-pack-index",
  "kbf-peer",
  "kbf-proto",
  "kbf-server",
@@ -1535,6 +1604,7 @@ dependencies = [
  "kbf-meta",
  "kbf-objstore",
  "kbf-pack",
+ "kbf-pack-index",
  "kbf-proto",
  "kbf-route",
  "kbf-segments",
@@ -1678,13 +1748,17 @@ dependencies = [
  "kbf-daemon",
  "kbf-driver-native",
  "kbf-guest",
+ "kbf-mac-session",
  "kbf-outputs",
  "kbf-proto",
  "kbf-testkit",
  "kbf-types",
+ "kbf-vmm",
+ "libc",
  "prost",
  "prost-types",
  "rustix",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",
@@ -1737,6 +1811,9 @@ dependencies = [
 [[package]]
 name = "kbf-estimator"
 version = "0.1.0"
+dependencies = [
+ "js-sizing",
+]
 
 [[package]]
 name = "kbf-estimator-replay"
@@ -1782,6 +1859,7 @@ dependencies = [
  "kbf-meta",
  "kbf-objstore",
  "kbf-pack",
+ "kbf-pack-index",
  "kbf-proto",
  "kbf-route",
  "kbf-sched",
@@ -1888,12 +1966,18 @@ dependencies = [
 name = "kbf-host-install"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "flate2",
+ "kbf-ca",
  "kbf-host",
  "kbf-installer",
+ "kbf-oidc",
  "kbf-testkit",
+ "kbf-types",
  "kbf-update",
+ "rcgen",
  "rustix",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1941,6 +2025,7 @@ dependencies = [
  "http",
  "kbf-host",
  "kbf-installer",
+ "kbf-pack-index",
  "kbf-proto",
  "kbf-proxy",
  "kbf-setup",
@@ -2257,6 +2342,7 @@ dependencies = [
  "futures",
  "hex",
  "kbf-objstore",
+ "kbf-pack-index",
  "kbf-segments",
  "kbf-state",
  "kbf-testkit",
@@ -2276,6 +2362,7 @@ dependencies = [
  "clap",
  "kbf-objstore",
  "kbf-pack",
+ "kbf-pack-index",
  "kbf-segments",
  "kbf-state",
  "kbf-testkit",
@@ -2284,6 +2371,18 @@ dependencies = [
  "thiserror",
  "tokio",
  "zeroize",
+]
+
+[[package]]
+name = "kbf-pack-index"
+version = "0.1.0"
+dependencies = [
+ "kbf-pack-index",
+ "kbf-state",
+ "kbf-testkit",
+ "postgres",
+ "sha2 0.11.0",
+ "thiserror",
 ]
 
 [[package]]
@@ -2377,10 +2476,7 @@ dependencies = [
 name = "kbf-sched"
 version = "0.1.0"
 dependencies = [
- "kbf-caps",
- "kbf-estimator",
- "kbf-sim",
- "kbf-types",
+ "js-sched",
 ]
 
 [[package]]
@@ -2422,12 +2518,14 @@ dependencies = [
  "kbf-meta",
  "kbf-objstore",
  "kbf-pack",
+ "kbf-pack-index",
  "kbf-peer",
  "kbf-proto",
  "kbf-raft",
  "kbf-route",
  "kbf-sched",
  "kbf-segments",
+ "kbf-server",
  "kbf-signer",
  "kbf-sim",
  "kbf-state",
@@ -2472,6 +2570,7 @@ dependencies = [
  "clap",
  "hex",
  "kbf-host",
+ "kbf-pack-index",
  "kbf-proxy",
  "kbf-state",
  "kbf-testkit",
@@ -2503,9 +2602,8 @@ dependencies = [
 name = "kbf-sim"
 version = "0.1.0"
 dependencies = [
+ "js-sim",
  "kbf-types",
- "rand_chacha 0.10.0",
- "sha2 0.11.0",
 ]
 
 [[package]]
@@ -2533,14 +2631,7 @@ dependencies = [
 name = "kbf-state"
 version = "0.1.0"
 dependencies = [
- "kbf-state",
- "kbf-testkit",
- "postgres",
- "rusqlite",
- "rustix",
- "thiserror",
- "tokio",
- "tracing",
+ "js-state",
 ]
 
 [[package]]
@@ -2628,11 +2719,7 @@ dependencies = [
 name = "kbf-testkit"
 version = "0.1.0"
 dependencies = [
- "kbf-testkit",
- "libc",
- "postgres",
- "rustix",
- "tokio",
+ "js-testkit",
 ]
 
 [[package]]
@@ -2700,6 +2787,7 @@ dependencies = [
 name = "kbf-types"
 version = "0.1.0"
 dependencies = [
+ "js-types",
  "serde",
  "serde_json",
  "thiserror",
@@ -3260,7 +3348,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3959,7 +4047,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4414,7 +4502,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

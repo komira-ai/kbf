@@ -278,6 +278,23 @@ fn while_kbf_is_the_only_service_the_file_is_the_old_format() {
     assert_eq!(Desired::parse(text.as_bytes()), Ok(d));
 }
 
+/// Catches: the old single-state format written for a store whose one service is not
+/// `kbf` (an earlier build would read it as `kbf`'s state): it is the map form and reads
+/// back under its own name.
+#[test]
+fn a_lone_service_other_than_kbf_is_written_in_the_map_form() {
+    let dir = dir("desired-lone-other");
+    let file = dir.path().join("desired.json");
+    let store = DesiredStore::open(&file).expect("opened");
+    let other = Desired::parse(SMALL.as_bytes()).expect("parsed");
+    store.set("other", other.clone()).expect("stored");
+    let text = fs::read_to_string(&file).expect("read");
+    assert!(text.contains("\"services\""), "{text}");
+    let again = DesiredStore::open(&file).expect("reopened");
+    assert_eq!(again.get("other"), Some(other));
+    assert_eq!(again.get(KBF), None);
+}
+
 /// Catches: the map form (written once a second service exists) losing a service on a set
 /// of another one, not surviving a restart, or being written without `kbf`'s entry: both
 /// services read back after a reopen, and a set of one leaves the other as it was.

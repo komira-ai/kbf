@@ -1,0 +1,90 @@
+# a node whose stream ended loses its lease after the grace
+> [t=0ms] start
+  farm term=7 lease_epoch=7
+  txn applied rev=1 counters=[]
+    put meta/epoch cond=absent len=8 sha=a3eb8db89fc5123c ttl=-
+  txn applied rev=2 counters=[]
+    put meta/next_op cond=absent len=8 sha=f44b28e2244100cb ttl=-
+  txn applied rev=3 counters=[]
+    put meta/next_seq cond=absent len=8 sha=f44b28e2244100cb ttl=-
+> [t=0ms] register node-a cores=4 gib=8 drivers=container
+  txn applied rev=4 counters=[]
+    put owner/node-a cond=absent len=16 sha=4ff190b4c2c573ec ttl=-
+  txn applied rev=5 counters=[]
+    put session/node-a cond=any len=70 sha=2b29556b96e9b197 ttl=60000ms
+  msg node-a welcome protocol=1 interval_ms=5000 epoch=7 pack_commit=false
+> [t=0ms] register node-b cores=4 gib=8 drivers=container
+  txn applied rev=6 counters=[]
+    put owner/node-b cond=absent len=16 sha=4ff190b4c2c573ec ttl=-
+  txn applied rev=7 counters=[]
+    put session/node-b cond=any len=70 sha=bbf330e872319459 ttl=60000ms
+  msg node-b welcome protocol=1 interval_ms=5000 epoch=7 pack_commit=false
+> [t=0ms] submit job qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket job#1 name=operations/0
+  txn applied rev=11 counters=[]
+    put op/0000000000000000 cond=absent len=75 sha=8136470751ede4ae ttl=-
+    put subject/0000000000000000 cond=absent len=14 sha=7005effc0cb0e5ed ttl=-
+    put queue/0000000000000000 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=absent len=8 sha=af5570f5a1810b7a ttl=-
+  txn applied rev=14 counters=[]
+    check owner/node-a cond=v4
+    del queue/0000000000000000 cond=v10
+    put lease/0000000000000007.0000000000000000 cond=absent len=20 sha=3c9486d0aaad3084 ttl=-
+    put lease-by-op/0000000000000000 cond=any len=16 sha=e8dd943d366caae7 ttl=-
+  msg node-a lease_offer lease=7/0 kind=action action=job
+  msg node-a start lease=7/0 kind=action action=job millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+  stage job#1 executing
+> [t=0ms] disconnect node-a
+> [t=0ms] tick
+> [t=30000ms] advance 30000ms
+> [t=30000ms] heartbeat node-b seq=1 running=[]
+  acknowledged=true
+  txn applied rev=15 counters=[]
+    put session/node-b cond=v7 len=70 sha=bbf330e872319459 ttl=60000ms
+> [t=61000ms] advance 31000ms
+> [t=61000ms] heartbeat node-b seq=2 running=[]
+  acknowledged=true
+  txn applied rev=21 counters=[]
+    check owner/node-a cond=v4
+    check op/0000000000000000 cond=v8
+    del lease/0000000000000007.0000000000000000 cond=v13
+    del lease-by-op/0000000000000000 cond=any
+    put loss/0000000000000000 cond=absent len=8 sha=cd2662154e6d76b2 ttl=-
+    put fate/0000000000000000 cond=absent len=43 sha=990ba0051ce4b50a ttl=-
+    put queue/0000000000000000 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+  txn applied rev=24 counters=[]
+    check owner/node-b cond=v6
+    del queue/0000000000000000 cond=v21
+    put lease/0000000000000007.0000000000000001 cond=absent len=22 sha=631c803e026bc98d ttl=-
+    put lease-by-op/0000000000000000 cond=any len=16 sha=4ff190b4c2c573ec ttl=-
+  txn applied rev=25 counters=[]
+    put session/node-b cond=v15 len=70 sha=bbf330e872319459 ttl=60000ms
+  msg node-b lease_offer lease=7/1 kind=action action=job
+  msg node-b start lease=7/1 kind=action action=job millicpus=1000 memory_bytes=1073741824 heartbeat_seq=2 valid_for_ms=14000 device="" job=false fence=0
+> [t=61000ms] tick
+> [t=61000ms] register node-a cores=4 gib=8 drivers=container
+  txn applied rev=26 counters=[]
+    put owner/node-a cond=v4 len=16 sha=8d91efc5106ff3a3 ttl=-
+  txn applied rev=27 counters=[]
+    put session/node-a cond=any len=70 sha=2b29556b96e9b197 ttl=60000ms
+  msg node-a welcome protocol=1 interval_ms=5000 epoch=7 pack_commit=false
+> [t=61000ms] heartbeat node-a seq=1 running=[7/0]
+  acknowledged=true
+  msg node-a cancel lease=7/0
+> [t=61000ms] result node-b lease=7/1 action=job ended=ran(exit=0)
+  ack lease=7/1 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=38 counters=[]
+    check owner/node-b cond=v6
+    del lease/0000000000000007.0000000000000001 cond=v23
+    del inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=v11
+    put doneof/0000000000000000 cond=any len=45 sha=f0fd36d49c3d8936 ttl=600000ms
+    del op/0000000000000000 cond=any
+    del queue/0000000000000000 cond=any
+    del loss/0000000000000000 cond=any
+    del fate/0000000000000000 cond=any
+    del subject/0000000000000000 cond=any
+    del opkey/0000000000000000 cond=any
+    del lease-by-op/0000000000000000 cond=any
+    put done/0000000000000000 cond=any len=54 sha=8436965fc13bf986 ttl=600000ms
+  cache job exit=0
+  stage job#1 done ran exit=0 stdout="output of job" worker="node-b" queued_ms=1900000000000 started_ms=1900000061000 completed_ms=1900000061000

@@ -74,6 +74,7 @@ mod meta_log;
 pub mod metrics;
 mod operations;
 mod proxy;
+mod qos_header;
 mod recorder;
 mod request_metadata;
 mod routed;
@@ -131,6 +132,7 @@ pub use crate::proxy::{
     MAX_PACKED_BLOB_BYTES, MAX_UPLOAD_IDLE_TIMEOUT, Meter, Method, Owner, Owners, PackMetrics,
     PackSettings, PackStore, Packs, Proxy,
 };
+pub use crate::qos_header::{BadQosAllow, QOS_HEADER, QosAllow};
 pub use crate::recorder::{
     ActionLabel, DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording,
     Tap, listing, owner, wall_now,
@@ -253,6 +255,7 @@ where
         Defaults {
             memory: DEFAULT_RESOURCES.memory_bytes,
             platform: DefaultPlatform::NONE,
+            qos: QosAllow::DEFAULT,
         },
     )
 }
@@ -266,6 +269,9 @@ pub struct Defaults {
     /// The OS and architecture of an `action` that names neither
     /// ([`ExecutionService::with_default_platform`]).
     pub platform: DefaultPlatform,
+    /// The levels the `x-kbf-qos` header may name
+    /// ([`ExecutionService::with_qos_allow`]).
+    pub qos: QosAllow,
 }
 
 /// [`routes_with_authorizers`], each call that carries an invocation id sent to
@@ -296,7 +302,8 @@ where
         .recording(recorder.clone())
         .with_progress(progress)
         .with_default_memory(defaults.memory)
-        .with_default_platform(defaults.platform),
+        .with_default_platform(defaults.platform)
+        .with_qos_allow(defaults.qos),
     )
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -338,7 +345,8 @@ where
             .recording(recorder.clone())
             .with_progress(progress)
             .with_default_memory(defaults.memory)
-            .with_default_platform(defaults.platform);
+            .with_default_platform(defaults.platform)
+            .with_qos_allow(defaults.qos);
     let execution = ExecutionServer::new(service)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);

@@ -1,7 +1,12 @@
 use kbf_front::Cache;
+use kbf_proto::worker::ResultAckReason as Reason;
+use kbf_types::{Failure, Outcome};
 use std::sync::Arc;
+use tonic::Code;
 
+use super::report::{Report, Taken, failed, unrun};
 use super::*;
+use crate::fault;
 
 /// Catches a server process that reuses an earlier process's term (issue #137:
 /// every process granted leases from `(1, 0)`), and one whose term does not order
@@ -31,7 +36,8 @@ fn a_result_without_detail_that_is_no_fault_is_answered_internal() {
         lease: kbf_types::LeaseId::new(1, 0),
         waiters: Vec::new(),
         outcome: Outcome::Completed {
-            action_result: kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [1; 32], 1),
+            action_result: kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [1; 32], 1)
+                .into(),
         },
         memory_runs: Vec::new(),
         farm_runs: Vec::new(),
@@ -100,7 +106,8 @@ fn a_report_the_scheduler_does_not_take_is_refused() {
         key: kbf_types::ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(kbf_types::DigestFunction::Sha256, [1; 32], 1),
-        },
+        }
+        .into(),
         qos: kbf_types::Qos::Ci,
         kind: kbf_types::LeaseKind::Action,
         resources: kbf_types::Resources::new(1_000, 1 << 30),
@@ -129,4 +136,40 @@ fn a_report_the_scheduler_does_not_take_is_refused() {
     assert!(answers.is_empty());
     // The lease was never granted by this process.
     assert_eq!(taken, Taken::Refused(Reason::UnknownLease));
+}
+
+/// Catches: a request whose key is not an action's being queued, which would give its
+/// callers a made-up action to be told, or panicking on it. It is refused as an invalid
+/// argument, and nothing is queued.
+#[test]
+fn a_request_keyed_by_something_other_than_an_action_is_refused() {
+    let farm = Farm::new(
+        Arc::new(Cache::memory()),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
+    let request = kbf_sched::Request {
+        key: kbf_types::WorkKey::new("main", "not a digest"),
+        qos: kbf_types::Qos::Ci,
+        kind: kbf_types::LeaseKind::Action,
+        resources: kbf_types::Resources::new(1_000, 1 << 30),
+        hermetic: true,
+        do_not_cache: false,
+        needs: kbf_caps::Request::default(),
+    };
+    let refused = farm.submit(Submission {
+        request,
+        call: None,
+        described: kbf_front::Described::default(),
+        evidence: Default::default(),
+    });
+    let Err(status) = refused else {
+        panic!("a request keyed by something other than an action was queued");
+    };
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status.message().contains("not an action digest"),
+        "{status:?}"
+    );
+    assert_eq!(farm.lock().sched.queued_len(), 0);
 }

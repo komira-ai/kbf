@@ -14,6 +14,10 @@
 //! is the daemon's rule (it drains VMs before `session-login`); this is what stops a
 //! process starting in a session that belongs to someone else.
 //!
+//! `role-run` starts one program only: the configured `kbf-vmm`, as `vm-run --spec <file>`
+//! (see [`super::vmrun`]). `role-reap` ends the process group of such a run (see
+//! [`super::reap`]).
+//!
 //! `role-kill-uid` ends the VM user's session along with its processes, so it is for
 //! a Mac that is draining; `session-idle` brings the session back.
 
@@ -84,8 +88,9 @@ impl Helper {
         Ok(if up { Gui::Up } else { Gui::Down })
     }
 
-    /// `role-run <fd-passed argv>`: starts the process as the VM user in its GUI
-    /// session. The descriptors are stdin, stdout, stderr and the working directory.
+    /// `role-run <fd-passed argv>`: starts `kbf-vmm vm-run --spec <file>` as the VM user
+    /// in its GUI session ([`Self::check_vm_run`] refuses any other argument vector).
+    /// The descriptors are stdin, stdout, stderr and the working directory.
     ///
     /// # Errors
     /// Why it was refused, or why the process did not start.
@@ -96,6 +101,8 @@ impl Helper {
         fds: Vec<OwnedFd>,
     ) -> Result<Child, String> {
         spawn::check(&argv, &env)?;
+        self.check_vm_run(&argv)?;
+        super::vmrun::no_environment(&env)?;
         let count = fds.len();
         let [stdin, stdout, stderr, cwd]: [OwnedFd; 4] = fds.try_into().map_err(|_| {
             format!(
@@ -166,4 +173,4 @@ impl Helper {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
