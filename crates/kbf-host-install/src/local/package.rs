@@ -47,7 +47,8 @@ use kbf_installer::stage::BUNDLE_CAP;
 use super::answer::Code;
 use super::backend::{Backend, Fault, Pending};
 use super::linux::{
-    Tools, config_fault, copy_hashing_mode, fetch_fault, fetch_scratch_in, read_capped, state_fault,
+    Tools, channel_fault, config_fault, copy_hashing_mode, fetch_fault, fetch_scratch_in,
+    read_capped, signed_by, state_fault,
 };
 use super::package_format::{Format, Meta, PACKAGE, SumsError, sums_entry};
 use super::package_store::{Kept, Record, Store, Trial};
@@ -55,6 +56,7 @@ use super::units::restart_and_wait;
 use crate::host::Host;
 use crate::mac::channel::{MacAllowlist, Source};
 use crate::mac::fetch::{Fetcher, Limits};
+use crate::mac::release::Origin;
 use crate::mac::release::{self, commit_prefix};
 use crate::mac::stage::read_token;
 use crate::plan::Wait;
@@ -180,10 +182,13 @@ impl PackageHost {
     /// What a fetch or a check of the channel `channel` goes by: the host's settings narrowed to
     /// the channel's branch, and the token of its API, if it names one. The pinned `gh` and the
     /// trusted root must be root's, or nothing is believed.
-    pub(crate) fn prepare(&self, channel: &Channel) -> Result<(Settings, Option<String>), Fault> {
+    pub(crate) fn prepare(
+        &self,
+        channel: &Channel,
+    ) -> Result<(Settings, Option<String>, Origin), Fault> {
         let trust = &self.host.trust;
         let allowlist = MacAllowlist::load(trust, &self.allowlist).map_err(config_fault)?;
-        let entry = allowlist.channel(trust, channel).map_err(config_fault)?;
+        let entry = allowlist.channel(trust, channel).map_err(channel_fault)?;
         let Source::Github { token_file } = &entry.source else {
             return Err(Fault::refused(
                 Code::ConfigInvalid,
@@ -198,10 +203,11 @@ impl PackageHost {
             .map_err(verify_refused)?
             .narrowed_to(std::slice::from_ref(&entry.source_ref))
             .map_err(|e| Fault::refused(Code::ConfigInvalid, e.to_string()))?;
+        let settings = signed_by(settings, &entry.origin);
         GhCheck::pinned(&self.layout, &settings)
             .check_trust(&*self.trust)
             .map_err(verify_refused)?;
-        Ok((settings, token))
+        Ok((settings, token, entry.origin))
     }
 
     /// The release `version` names, kept and verified; its commit. A file this host holds
@@ -224,14 +230,19 @@ impl PackageHost {
         if let Some((commit, _)) = held {
             return Ok(commit.clone());
         }
-        let (settings, token) = self.prepare(channel)?;
+        let (settings, token, origin) = self.prepare(channel)?;
         let who = Identity {
             uid: settings.run_as.uid,
             gid: settings.run_as.gid,
         };
         let work = self.layout.join(&self.layout.work_dir());
         let scratch = fetch_scratch_in(&work, prefix, who)?;
-        let fetched = self.fetch_and_check((&work, &scratch), version, token.as_deref(), &settings);
+        let fetched = self.fetch_and_check(
+            (&work, &scratch),
+            version,
+            token.as_deref(),
+            (&settings, &origin),
+        );
         let _ = fs::remove_dir_all(&scratch);
         let (commit, kept) = fetched?;
         record.files.insert(
@@ -252,7 +263,7 @@ impl PackageHost {
         (work, scratch): (&Path, &Path),
         version: &str,
         token: Option<&str>,
-        settings: &Settings,
+        (settings, origin): (&Settings, &Origin),
     ) -> Result<(String, String), Fault> {
         let prefix = commit_prefix(version).unwrap_or_default();
         let who = Identity {
@@ -264,6 +275,7 @@ impl PackageHost {
         let home = scratch.join("home");
         let gh = self.layout.join(&self.layout.gh());
         let fetcher = Fetcher {
+            origin,
             platform: &platform,
             asset: self.format.asset(),
             runner: &*self.runner,
@@ -283,7 +295,7 @@ impl PackageHost {
         let id =
             CommitId::new(&commit).map_err(|e| Fault::failed(Code::StageFailed, e.to_string()))?;
 
-        let file_name = release::asset_name_on(&platform, extension, &commit);
+        let file_name = release::named_asset_on(origin.prefix(), &platform, extension, &commit);
         let bundle_name = release::bundle_of(&file_name);
         let copies = self.copy_in(
             (work, &commit),

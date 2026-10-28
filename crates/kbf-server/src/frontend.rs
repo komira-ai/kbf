@@ -106,10 +106,10 @@ use kbf_front::{
     Backend, MAX_MESSAGE_BYTES, Owner, Owners, Packs, Proxy, RECORDER_CHANNEL, Recorder,
     RequestMetadataLayer, Routed,
 };
+use kbf_pack_index::PackIndex;
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
 use kbf_proto::worker::worker_server::WorkerServer;
 use kbf_route::{DEFAULT_HOLD, Hold, TlsNodes};
-use kbf_state::PackIndex;
 use kbf_storage::Storage;
 use kbf_storage::service::RemoteStorage;
 use kbf_threads::Topology;
@@ -173,10 +173,12 @@ pub const ALLOWED: &[&str] = &[
     "worker_max_streams",
     "unservable_wait_secs",
     "default_platform",
+    "qos_allowed",
     "memory_ladder_gib",
     "vm_host_floor_cpus",
     "vm_host_floor_mem_gib",
     "learned_sizes",
+    "placement_load",
     "finished_retention_secs",
     "shutdown_timeout_secs",
     "invocation_memory",
@@ -787,16 +789,10 @@ impl<'a> Prepared<'a> {
         let defaults = kbf_front::Defaults {
             memory: listeners.memory_ladder.first(),
             platform: listeners.default_platform,
+            qos: listeners.qos_allowed,
         };
         let durable = state.is_some();
-        let farm = Farm::new(
-            backend.clone(),
-            listeners.unservable_wait,
-            listeners.finished_retention,
-        )
-        .with_memory_ladder(listeners.memory_ladder.clone())
-        .with_learned_sizes(listeners.learned_sizes, listeners.memory_ladder.first())
-        .recording(recorder.clone());
+        let farm = Farm::from_listeners(backend.clone(), &listeners).recording(recorder.clone());
         let farm = Arc::new(farm.with_state(state)?);
         log_state(durable, farm.term(), farm.lease_epoch());
 

@@ -370,6 +370,35 @@ whose operator accepts the token there (anything running as the agent's account 
 given, they are used instead of the certificate. Without `--frontend` and without the token an
 agent heartbeats and refuses every update order before it fetches anything, for any host.
 
+## Updating the coordinator
+
+The coordinator is not one of the hosts it orders: it does not update itself. It is updated the
+way it was deployed ([containers.md](containers.md#run-the-coordinator-on-one-host): a new image,
+the tag changed in the unit, a restart; to go back, name the old tag). Hosts that were updating
+finish or revert on their own while it is down, and the restarted coordinator orders nothing for
+its first 30 seconds.
+
+Update it first when a release changes the coordinator or the messages between it and the
+hosts (`crates/kbf-coordinator`, `crates/kbf-updater/src/wire.rs`): a newer agent's heartbeat
+reaches an older coordinator, but a coordinator that does not know a newer rule would order the
+farm by the old one.
+
+`GET /v1/status` and `GET /v1/convergence` say which build answers, as `commit`: the 12 digits
+`kbf-coordinator --version` shows after the `+`. A coordinator built before this field, or
+without a git checkout (`unknown`), says none. With `--require-coordinator-current`
+(`KBF_REQUIRE_COORDINATOR_CURRENT=true` in the release workflow, passed as the flag's value), `deploy-farm` reads that
+commit before it sets anything and fails when it is not the release's:
+
+```text
+the coordinator runs 0123456789ab, the release is 89abcdef0123: update the coordinator first (docs/deploy/kbf-updater.md, Updating the coordinator)
+```
+
+Without the flag, a different commit is a `coordinator not current` warning annotation on the run
+summary (the same text) and the deploy goes on. A coordinator that reports no commit gets a notice and the deploy goes on, so a farm whose
+coordinator is older than this field keeps working. The rule is equality, not order: a
+coordinator newer than the release (a rollback of the hosts) also fails; leave the variable unset
+for such a deploy. The variable is the operator's to set for the releases that need it.
+
 ## Turn on the gamma stage
 
 The last job of `release.yml`, `gamma`, tells the update coordinator "desired = this release" once
@@ -397,6 +426,14 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    event_names = ["workflow_run"]
    ```
 
+   `kbf-oidc` also reads several `[[remote_operator]]` entries (never mixed with the single
+   table), one per repository and workflow that may call. An entry's `services = [...]` (default
+   `["kbf"]`) lists the services a token it admits may set, and a token never gets another
+   entry's services. Entries must name the same issuer, and two entries may not share a
+   `repository_id` and a `job_workflow_ref`; such a file is refused at load. A coordinator reads
+   the list form only once it loads the file with `kbf_oidc::AllowList`; one that still uses
+   `OidcConfig` accepts the single table only.
+
    `event_names` must name `workflow_run`: the release workflow is started by the completion of
    the pipeline, and its tokens say so (the default list is `push` and `workflow_dispatch`).
    The `sha` of the token is the head of `main`, not the commit released. A token is good for one
@@ -421,17 +458,26 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    | `TS_CLIENT_ID`, `TS_AUDIENCE` | optional, for a coordinator reachable only on a Tailscale network: the client id and audience of the Tailscale trust credential (workload identity federation) that CI jobs join the network with, as `tag:ci`. It must trust this repository's `release` environment (the token's subject is `repo:<owner>/<repo>:environment:release`), and the network's policy must let `tag:ci` reach the control listener. With `TS_CLIENT_ID` and `KBF_COORDINATOR_URL` set, the job joins as an ephemeral node with the run's OIDC token, after the build and before the verb; no secret is involved. `TS_CLIENT_ID` or `KBF_COORDINATOR_URL` unset: the step is skipped (`TS_AUDIENCE` must be set with `TS_CLIENT_ID`) |
    | `FARM_ADDRESS`, `FARM_INSTANCE`, `FARM_TLS`, `FARM_LINUX_X86_64_PROPERTIES` | optional, for the proof below: the farm's REAPI address as `grpc://<host>:<port>` (also when TLS is on), its instance name (empty: the empty instance), `true` or `false` for TLS, and the platform properties of the Linux x86-64 workers as a comma-separated `key=value` list, such as `OSFamily=linux,ISA=x86-64`. `FARM_ADDRESS` unset or empty: the proof is off |
    | `KBF_MIN_UP_STORAGE`, `KBF_MIN_UP_FRONTEND` | optional: the storage hosts and frontends that must stay up while others update (default 1 each). The operator picks the storage number so that every blob stays readable |
+   | `KBF_REQUIRE_COORDINATOR_CURRENT` | optional: `true` makes the step fail before it sets anything when the coordinator runs another commit than the release ([Updating the coordinator](#updating-the-coordinator)). Unset: a different commit is a warning annotation on the run and the step goes on |
 
 ### What the step does
 
-The job starts only after `rehearse` passes: on a hosted runner with systemd, a host laid out by
-hand from the release before this one (its `kbf` through its own `kbf-deploy host install`, its
-`kbf-host-install`, its package's trust files and accounts, this release's helper unit) is updated
-to this release by the real helper through its local socket, as the agent asks for it (`install`,
-`switch`, `confirm`), with the release fetched from GitHub by the helper itself
-(`crates/kbf-host-install/tests/update_rehearsal.rs`). A release that host cannot take is never
-set as the desired version. The rehearsal does not run the agent, the coordinator or a frontend's
-drain and health check.
+The job starts only after `rehearse` and `rehearse-agent` pass, on hosted runners with systemd. In
+`rehearse`, a host laid out by hand from the release before this one (its `kbf` through its own
+`kbf-deploy host install`, its `kbf-host-install`, its package's trust files and accounts, this
+release's helper unit) is updated to this release by the real helper through its local socket, as
+the agent asks for it (`install`, `switch`, `confirm`), with the release fetched from GitHub by
+the helper itself (`crates/kbf-host-install/tests/update_rehearsal.rs`). In `rehearse-agent` the
+same host is updated through the control loop of this page: this commit's coordinator, with a
+throwaway farm CA and an allow-list as above; `cargo xtask deploy-farm`, given the version that
+`cargo xtask release farm-version` prints, as the next step is; the release before this one's
+agent, helper, frontend and `kbf`, the agent heartbeating to the coordinator and reading its
+node's storage health from the frontend with its certificate alone
+(`crates/kbf-host-install/tests/update_rehearsal_agent.rs`). A release that host cannot take, or
+a version the hosts never report, is never set as the desired version. The rehearsals do not
+cover a drain of a node with leases (the host has no daemon half), the farm's Tailscale network
+or its real issuer (the issuer of the OIDC token is a stand-in on loopback, and the minimum of
+storage hosts that must stay up is 0 because the rehearsal's farm has one).
 
 The version it sets is not the release's tag. A host heartbeats `<semver>+g<12 lower-case hex
 digits of the commit>` (for example `0.1.0+g0123456789ab`); the coordinator calls a host done

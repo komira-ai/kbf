@@ -203,6 +203,29 @@ fn a_channel_the_allowlist_does_not_name_is_refused() {
     assert!(!fx.host.work.exists(), "a refused request touches nothing");
 }
 
+/// A channel of a repository other than kbf's is refused by the ssh path as
+/// `channel_not_allowed` with the words on stderr, unless the allowlist lists the
+/// repository; nothing runs and nothing is touched.
+#[test]
+fn a_channel_of_an_untrusted_repository_is_refused_with_its_reason() {
+    let fx = Fx::new("mac-install-untrusted");
+    let sim = fx.sim();
+    let text = "[channels.stable]\nsource = \"github\"\nrepository = \"owner/other\"\nsigner_workflow = \"owner/other/.github/workflows/release.yml\"\n";
+    write(&fx.host.allowlist, 0o644, text.as_bytes());
+    let answer = fx.handle(&sim, INSTALL);
+    assert_eq!(
+        (answer.code, reason(&answer)),
+        (2, "channel_not_allowed".into())
+    );
+    assert!(
+        answer.err.contains("owner/other") && answer.err.contains("trusted_workflows"),
+        "{}",
+        answer.err
+    );
+    assert_eq!(sim.calls.borrow().len(), 0);
+    assert!(!fx.host.work.exists(), "a refused request touches nothing");
+}
+
 /// An install is not started when the audit log cannot be opened.
 #[test]
 fn no_install_goes_unrecorded() {

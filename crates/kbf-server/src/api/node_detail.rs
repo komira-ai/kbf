@@ -37,8 +37,9 @@ pub(super) async fn one(State(api): State<Arc<ApiState>>, Path(target): Path<Str
         return error(StatusCode::NOT_FOUND, NO_NODE);
     }
     match api.farm.node_detail(&WorkerId::new(&target)) {
-        Some(detail) => json(StatusCode::OK, &detail),
-        None => error(StatusCode::NOT_FOUND, NO_NODE),
+        Ok(Some(detail)) => json(StatusCode::OK, &detail),
+        Ok(None) => error(StatusCode::NOT_FOUND, NO_NODE),
+        Err(unread) => error(StatusCode::SERVICE_UNAVAILABLE, &unread.to_string()),
     }
 }
 

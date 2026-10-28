@@ -56,6 +56,8 @@ impl Extras {
             history.render(out);
         }
         if let Some(farm) = self.farm {
+            // The farm is the legacy driver, the only core a start accepts.
+            crate::scheduler_core::render(out, crate::SchedulerCore::RUNNING);
             crate::pack_daemon_metrics::render_farm(out, &farm);
             farm.failed_actions().render(out);
         }

@@ -9,8 +9,8 @@ use kbf_objstore::{KeyPrefix, ObjectKey, ObjectStore};
 use kbf_pack::{
     AdoptConfig, AdoptMode, AdoptReport, AdoptRun, Adopter, Blob, Fetch, Problem, ProblemKind,
 };
+use kbf_pack_index::{NewPack, PackIndex};
 use kbf_segments::{MAX_SEGMENT_BYTES, SegmentWriter};
-use kbf_state::{NewPack, PackIndex};
 
 use crate::support::{FaultyStore, Rig, blob};
 

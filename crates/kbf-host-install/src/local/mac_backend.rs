@@ -168,7 +168,7 @@ impl Backend for MacBackend {
             .map_err(|r| Fault::refused(refusal_code(r), "the allowlist"))?;
         let channel = allowlist
             .channel(&host.trust, channel)
-            .map_err(|r| Fault::refused(refusal_code(r), "the allowlist"))?;
+            .map_err(|e| Fault::refused(refusal_code(e.refusal()), e.to_string()))?;
         let staged = stage::stage(host, &*self.runner, &channel, version).map_err(stage_fault)?;
         let plan = Plan {
             commit: staged.commit.clone(),

@@ -83,6 +83,7 @@ pub mod config;
 pub mod drain;
 pub mod enroll;
 pub mod farm;
+pub mod farm_js;
 mod fault;
 pub mod fill;
 mod flag_set;
@@ -117,6 +118,7 @@ mod notify;
 pub mod object_store;
 mod pack_daemon_metrics;
 pub mod pack_locate;
+pub mod placement_load;
 pub mod proxy_auth;
 pub mod raft_log;
 mod ram_drain;
@@ -128,6 +130,7 @@ pub mod replication;
 pub mod retire;
 pub mod retired;
 mod run_record;
+pub mod scheduler_core;
 pub mod sequence;
 pub mod serve;
 #[cfg(test)]
@@ -153,6 +156,8 @@ pub mod stores;
 pub mod streams;
 #[cfg(test)]
 mod test_dir;
+#[cfg(test)]
+mod test_log;
 mod timeout;
 pub mod token;
 pub mod ui_mount;
@@ -176,7 +181,9 @@ pub use kbf_tls::{TlsError, TlsFiles, TlsSource};
 pub use learned::LearnedSizes;
 pub use local::LocalStore;
 pub use node_map::NodeMap;
+pub use placement_load::PlacementLoad;
 pub use raft_log::{RaftLogError, RaftMetaLog};
+pub use scheduler_core::SchedulerCore;
 pub use serve::{
     Api, Behind, Bound, BoundStorage, Listeners, ServeError, StorageListener, StreamTiming,
     WorkerTls, bind_server, bind_server_with_api, bind_server_with_map, bind_server_with_policy,

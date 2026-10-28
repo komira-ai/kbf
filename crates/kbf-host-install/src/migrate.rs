@@ -475,13 +475,18 @@ fn plan_of(config: &Config, host: &PackageHost, place: &Place) -> Result<Planned
     }
 
     // 3. The package for that very commit passes every check.
-    let (settings, _token) = host.prepare(&config.channel)?;
+    let (settings, _token, origin) = host.prepare(&config.channel)?;
     let who = Identity {
         uid: settings.run_as.uid,
         gid: settings.run_as.gid,
     };
     let platform = format!("linux-{}", settings.arch);
-    let file_name = release::asset_name_on(&platform, config.format.asset().extension(), &commit);
+    let file_name = release::named_asset_on(
+        origin.prefix(),
+        &platform,
+        config.format.asset().extension(),
+        &commit,
+    );
     let work = host.layout.join(&host.layout.work_dir());
     let copies = host.copy_in(
         (&work, &commit),

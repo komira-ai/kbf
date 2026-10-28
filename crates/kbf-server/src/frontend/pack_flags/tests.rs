@@ -4,8 +4,8 @@ use std::os::unix::fs::PermissionsExt as _;
 
 use clap::error::ErrorKind;
 use kbf_pack::FRONTEND_PACK_BYTES;
+use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_state::ManualClock;
-use kbf_state::pack_index::memory::MemoryPackIndex;
 
 use super::*;
 use crate::frontend::{self, FrontendFlags};

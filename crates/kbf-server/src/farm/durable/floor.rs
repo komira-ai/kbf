@@ -9,29 +9,30 @@
 //! of another version is refused, not guessed at.
 
 use kbf_sched::{Floor, KeyFloor};
-use kbf_types::{ActionKey, Digest, DigestFunction};
+use kbf_types::{ActionKey, Digest, DigestFunction, WorkKey};
 
 const VERSION: u8 = 1;
 
-/// The key of `key`'s row.
-pub(super) fn row_key(key: &ActionKey) -> String {
+/// The key of `key`'s row: the key's class is the instance name and its dedup text the
+/// action's digest as `<hash>/<size>`.
+pub(super) fn row_key(key: &WorkKey) -> String {
     let instance: String = key
-        .instance
+        .class
         .bytes()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    format!("{}{instance}/{}", super::FLOOR, key.action)
+    format!("{}{instance}/{}", super::FLOOR, key.dedup)
 }
 
 /// `floor` as a row value, or `None` if its instance name is too long for it.
 pub(super) fn encode(floor: &Floor) -> Option<Vec<u8>> {
-    let instance = floor.key.instance.as_bytes();
+    let instance = floor.key.class.as_bytes();
     let mut row = vec![VERSION];
     row.extend(floor.ask.to_be_bytes());
     row.extend(floor.stamp.to_be_bytes());
     row.extend(u16::try_from(instance.len()).ok()?.to_be_bytes());
     row.extend(instance);
-    row.extend(floor.key.action.to_string().as_bytes());
+    row.extend(floor.key.dedup.as_bytes());
     Some(row)
 }
 
@@ -53,7 +54,8 @@ pub(super) fn decode(row: &[u8]) -> Result<Floor, &'static str> {
         key: ActionKey {
             instance: instance.to_owned(),
             action,
-        },
+        }
+        .into(),
         ask: u64::from_be_bytes(*ask),
         stamp: u64::from_be_bytes(*stamp),
     })
