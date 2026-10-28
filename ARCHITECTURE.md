@@ -151,7 +151,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | Crate | Pure | What it holds |
 |---|---|---|
 | `kbf-types` | yes | digests, images by manifest digest (`ImageRef`), platforms, QoS levels, lease ids, farm time, the `StateMachine` trait and `Effect` enum, `HostRole` (what a host runs, for the update coordinator) |
-| `kbf-sched` | yes | the scheduler state machine and the fence constants |
+| `kbf-sched` | yes | the scheduler state machine and the fence constants (a re-export of `js-sched`, in the jobscheduler repository) |
 | `kbf-meta` | yes | the metadata state machine: CAS index, action cache, closure check, retention |
 | `kbf-segments` | yes | the segment format and FastCDC chunking |
 | `kbf-caps` | yes | CPU capability parsing, ISA levels, request matching |

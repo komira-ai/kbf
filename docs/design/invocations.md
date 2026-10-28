@@ -42,11 +42,11 @@ Read on `main`:
   `url` is `null` until `--invocation-url-template` (PR 6). A call without an id is
   not recorded (the minted id of 2.3 comes with its link, PR 6).
 - **Per-operation state lives about a minute.** The scheduler keeps a finished operation
-  for `FINISHED_RETENTION` (60 s, `kbf-sched/src/scheduler.rs`); then WaitExecution
+  for `FINISHED_RETENTION` (60 s, `js-sched/src/scheduler.rs` (jobscheduler)); then WaitExecution
   answers NOT_FOUND. All scheduler state is in memory and is lost on restart.
   `FarmMachine` (`kbf-server/src/machine.rs`) holds the waiters, the started leases and
   the node registry beside it, with the same retention.
-- **Reruns are log lines.** `kbf-sched/src/requeue.rs` names each requeue (`Silent`,
+- **Reruns are log lines.** `js-sched/src/requeue.rs` (jobscheduler) names each requeue (`Silent`,
   `Replaced`, `Reconnected`, `NotStarted`, `SessionSwitch`, `OutOfMemory`,
   `NodeMemoryPressure`); they are drained to tracing and not stored.
 - **Results are durable, unindexed.** Every OK result, a non-zero exit included, is
