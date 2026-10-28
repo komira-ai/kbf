@@ -143,9 +143,10 @@ const DAEMON_BLOCKING_DEFAULT: usize = 64;
 /// Tokio's own cap on the blocking pool, which the server keeps.
 pub const TOKIO_BLOCKING_DEFAULT: usize = 512;
 
-/// The daemon's `--reserve-cpus` default, in logical CPUs: 4 physical cores with their
-/// hyperthreads.
-pub const DEFAULT_DAEMON_RESERVE: usize = 8;
+/// The daemon's `--reserve-cpus` default, in physical cores: 4, each with its hyperthreads.
+/// That is 8 logical CPUs where two threads share a core and 4 where each core has one
+/// thread, as on Apple silicon ([`ThreadArgs::resolve`]).
+pub const DEFAULT_DAEMON_RESERVE_CORES: usize = 4;
 
 /// The async-worker and CPU-pool sizes a reserve of `reserve` logical CPUs gives on a
 /// machine of `cores` physical cores: `max(2, reserve/4)` and `max(2, reserve/2)`,
@@ -238,8 +239,9 @@ impl PoolArgs {
 pub struct ThreadArgs {
     /// Logical CPUs the farm's own processes keep, in CPUs (hyperthreads count one
     /// each). The daemon gives its leases every CPU it may use but these, with no
-    /// pinning, and sizes its own pools from them. Default: 8 (half the CPUs on a
-    /// machine of fewer than 16). 0 is allowed; a value that leaves no CPU for leases,
+    /// pinning, and sizes its own pools from them. Default: 4 physical cores with their
+    /// hyperthreads, so 8 where two threads share a core and 4 where each core has one
+    /// (half the CPUs on a smaller machine). 0 is allowed; a value that leaves no CPU for leases,
     /// or is more than the machine has, is refused. On a host that also runs the
     /// server, this covers both; the server has no reserve flag.
     #[arg(long, value_name = "N")]
@@ -263,9 +265,9 @@ impl ThreadArgs {
     /// A reserve the machine cannot give ([`ReserveError`]).
     pub fn resolve(&self, topology: Topology) -> Result<Sizes, ReserveError> {
         let logical = topology.logical();
-        let reserve = self
-            .reserve_cpus
-            .unwrap_or_else(|| DEFAULT_DAEMON_RESERVE.min(logical / 2));
+        let reserve = self.reserve_cpus.unwrap_or_else(|| {
+            (DEFAULT_DAEMON_RESERVE_CORES * topology.threads_per_core()).min(logical / 2)
+        });
         if reserve > logical {
             return Err(ReserveError::MoreThanTheMachine { reserve, logical });
         }

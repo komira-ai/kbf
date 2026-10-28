@@ -21,6 +21,7 @@ async fn started() -> (Disk, TestFarm, Inbox, LeaseId, kbf_front::Ticket) {
             call: None,
             described: Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("submitted");
     let lease = starts(&mut inbox)[0];
@@ -150,6 +151,7 @@ fn restarted(
             call: None,
             described: Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("submitted");
     let leases = starts(&mut inbox);
@@ -159,7 +161,7 @@ fn restarted(
 /// A `Result` of `lease` that names the action of `request(tag)`.
 fn result_naming(lease: LeaseId, tag: u8) -> worker::Result {
     worker::Result {
-        action_digest: Some(kbf_front::digest_to_proto(&request(tag).key.action)),
+        action_digest: Some(kbf_front::digest_to_proto(&action_of(tag))),
         ..invalid(lease)
     }
 }

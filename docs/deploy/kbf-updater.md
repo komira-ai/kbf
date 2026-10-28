@@ -156,6 +156,7 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
                   (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
                   [--frontend <dns name>:<port>] [--enroll-frontend <dns name>:<port>]
                   [--operator-api http://IP:PORT --token-file FILE] [--helper-socket PATH]
+                  [--service NAME,helper-socket=PATH[,SETTING=VALUE...]]...
                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
                   [--health-poll-secs N] [--retry-secs N]
 ```
@@ -195,6 +196,9 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
 - `--operator-api`, `--token-file`: optional, together: the full
   operator token over the frontend's loopback, an opt-in fallback used instead of the
   certificate; see the boundary below.
+- `--service NAME,helper-socket=PATH[,SETTING=VALUE...]`: a service the host runs besides `kbf`, given once for
+  each; see [Services besides kbf](#services-besides-kbf). Without it the agent is a
+  `kbf`-only agent.
 - Times, in seconds, 1 to 86400: `--heartbeat-secs` 15, `--drain-deadline-secs` 600,
   `--health-timeout-secs` 300, `--health-poll-secs` 5, `--retry-secs` 900.
 
@@ -268,6 +272,38 @@ pending marker (`query`) and finishes the trial from step 4; nothing is fetched,
 switched twice. A target that failed is not tried again before `--retry-secs`, however often
 the coordinator names it.
 
+### Services besides kbf
+
+An agent given `--service` also updates those services, with the same A/B (install, drain, switch,
+health, confirm or revert) run with the service's own ports. `NAME` is a service name (lowercase
+letters, digits and `-`, at most 64 bytes; not `kbf`), given once. The settings follow it, separated
+by commas, each at most once:
+
+| setting | meaning | default |
+|---|---|---|
+| `channel=C` | the channel of the helper's allowlist that holds the service's releases | `NAME` (it must be a channel name) |
+| `helper-socket=PATH` | the socket of the helper that installs it (an absolute path with no `..`); required, one per service, and never the agent's `--helper-socket`, whose helper installs `kbf` (an install request names no service, so it would install `kbf` at the service's version) | none: required |
+| `drain=node` or `drain=none` | `node`: the host's node is drained and given back through the frontend, as for `kbf`; `none`: nothing is drained, and no drain call is made | `node` |
+| `ready-url=http://IP:PORT/PATH` | health is `GET PATH` on that loopback address answering 2xx (the path is `/` if there is none) | the node's health through the frontend, as for `kbf` |
+
+A service's helper is spoken to exactly as `kbf`'s is: `query`, and `install kbf=<version> from
+<channel>`, with the service's version and channel. The request names no service, so each service
+needs a helper of its own that installs that service when asked so; the agent refuses to start with a
+service whose socket is its own `--helper-socket`.
+
+A value holds no comma. `drain=node` and node health need `--frontend` (or the operator token), as
+`kbf` does; a service with `drain=none` and a `ready-url` needs neither. A readiness URL is checked
+for the service's word that it serves; it does not say which release answered.
+
+With no `--service`, the heartbeat is the one above with no `services` field and the reply is read
+as before. With any, the heartbeat also carries `services`: for each, its version, health, last
+update and the target of the update running now (`kbf` stays in the fields it always had), and the
+reply may name the service to update. The agent runs one A/B at a time on the host, whichever
+service it is for: an order that arrives meanwhile waits for the one running. A target that failed
+is left alone for `--retry-secs` per service: a failure of one does not hold back another. The
+agent's log lines for a service are led by its name. A restart in the middle of a service's trial
+finishes that trial first, as for `kbf`.
+
 ### Enrolling a host
 
 A host gets its updater certificate from the farm CA with a one-time token, with `kbf-updater enroll`:
@@ -339,6 +375,35 @@ whose operator accepts the token there (anything running as the agent's account 
 given, they are used instead of the certificate. Without `--frontend` and without the token an
 agent heartbeats and refuses every update order before it fetches anything, for any host.
 
+## Updating the coordinator
+
+The coordinator is not one of the hosts it orders: it does not update itself. It is updated the
+way it was deployed ([containers.md](containers.md#run-the-coordinator-on-one-host): a new image,
+the tag changed in the unit, a restart; to go back, name the old tag). Hosts that were updating
+finish or revert on their own while it is down, and the restarted coordinator orders nothing for
+its first 30 seconds.
+
+Update it first when a release changes the coordinator or the messages between it and the
+hosts (`crates/kbf-coordinator`, `crates/kbf-updater/src/wire.rs`): a newer agent's heartbeat
+reaches an older coordinator, but a coordinator that does not know a newer rule would order the
+farm by the old one.
+
+`GET /v1/status` and `GET /v1/convergence` say which build answers, as `commit`: the 12 digits
+`kbf-coordinator --version` shows after the `+`. A coordinator built before this field, or
+without a git checkout (`unknown`), says none. With `--require-coordinator-current`
+(`KBF_REQUIRE_COORDINATOR_CURRENT=true` in the release workflow, passed as the flag's value), `deploy-farm` reads that
+commit before it sets anything and fails when it is not the release's:
+
+```text
+the coordinator runs 0123456789ab, the release is 89abcdef0123: update the coordinator first (docs/deploy/kbf-updater.md, Updating the coordinator)
+```
+
+Without the flag, a different commit is a `coordinator not current` warning annotation on the run
+summary (the same text) and the deploy goes on. A coordinator that reports no commit gets a notice and the deploy goes on, so a farm whose
+coordinator is older than this field keeps working. The rule is equality, not order: a
+coordinator newer than the release (a rollback of the hosts) also fails; leave the variable unset
+for such a deploy. The variable is the operator's to set for the releases that need it.
+
 ## Turn on the gamma stage
 
 The last job of `release.yml`, `gamma`, tells the update coordinator "desired = this release" once
@@ -366,6 +431,16 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    event_names = ["workflow_run"]
    ```
 
+   The coordinator loads the file with `kbf_oidc::AllowList`, so it also reads several
+   `[[remote_operator]]` entries (never mixed with the single table), one per repository and
+   workflow that may call. An entry's `services = [...]` (default `["kbf"]`) lists the services a
+   token it admits may set, and a token never gets another entry's services: setting a service the
+   admitting entry does not list is a 403 `forbidden` that changes nothing. The single table above
+   is one entry that lets CI set `kbf` only. The services must be defined (`kbf` is built in; others
+   come from `--services-file`, which no longer takes `ci_services`: such a file is refused).
+   Entries must name the same issuer, and two entries may not share a `repository_id` and a
+   `job_workflow_ref`; such a file is refused at load.
+
    `event_names` must name `workflow_run`: the release workflow is started by the completion of
    the pipeline, and its tokens say so (the default list is `push` and `workflow_dispatch`).
    The `sha` of the token is the head of `main`, not the commit released. A token is good for one
@@ -390,6 +465,7 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    | `TS_CLIENT_ID`, `TS_AUDIENCE` | optional, for a coordinator reachable only on a Tailscale network: the client id and audience of the Tailscale trust credential (workload identity federation) that CI jobs join the network with, as `tag:ci`. It must trust this repository's `release` environment (the token's subject is `repo:<owner>/<repo>:environment:release`), and the network's policy must let `tag:ci` reach the control listener. With `TS_CLIENT_ID` and `KBF_COORDINATOR_URL` set, the job joins as an ephemeral node with the run's OIDC token, after the build and before the verb; no secret is involved. `TS_CLIENT_ID` or `KBF_COORDINATOR_URL` unset: the step is skipped (`TS_AUDIENCE` must be set with `TS_CLIENT_ID`) |
    | `FARM_ADDRESS`, `FARM_INSTANCE`, `FARM_TLS`, `FARM_LINUX_X86_64_PROPERTIES` | optional, for the proof below: the farm's REAPI address as `grpc://<host>:<port>` (also when TLS is on), its instance name (empty: the empty instance), `true` or `false` for TLS, and the platform properties of the Linux x86-64 workers as a comma-separated `key=value` list, such as `OSFamily=linux,ISA=x86-64`. `FARM_ADDRESS` unset or empty: the proof is off |
    | `KBF_MIN_UP_STORAGE`, `KBF_MIN_UP_FRONTEND` | optional: the storage hosts and frontends that must stay up while others update (default 1 each). The operator picks the storage number so that every blob stays readable |
+   | `KBF_REQUIRE_COORDINATOR_CURRENT` | optional: `true` makes the step fail before it sets anything when the coordinator runs another commit than the release ([Updating the coordinator](#updating-the-coordinator)). Unset: a different commit is a warning annotation on the run and the step goes on |
 
 ### What the step does
 
@@ -422,6 +498,8 @@ there when it cannot. `deploy-farm` refuses a `--version` of any other form with
 says which form it needs, before it calls the coordinator. Anything else that sets the
 coordinator's desired version (a `POST /v1/desired` by hand) needs the same form, or no host
 will converge on it.
+
+The coordinator keeps its desired state per service name, and `kbf` is the only service it accepts unless `--services-file` defines more ([the design](../design/updates.md)): `POST /v1/desired` takes an optional `service` (absent means `kbf`; a name no file defines is a 400), and `GET /v1/status` adds `services` beside the unchanged `desired`, `services_dropped`, the number of heartbeats whose `services` list was bad and was dropped (the host is answered as a `kbf`-only host), and `per_service` (below). While `kbf` is the only service, the `--state-file` holds the single state in the form earlier coordinators wrote, so a downgrade to one of them starts on the same file; a file in the map form (`{"services": {...}}`), which a coordinator with a second service writes, is refused by an earlier build, and the operator then restores the file from before or writes `kbf`'s state alone in it.
 
 `cargo xtask deploy-farm` (one `run:` line):
 
@@ -457,6 +535,33 @@ the coordinator to be past its 30 second quiet start, at least one live host, ev
 the version and none updating or failed, and `min_up` hosts of the storage and frontend roles up,
 so a coordinator that has just restarted does not report a farm it has not heard from as
 converged.
+
+`GET /v1/convergence?service=NAME` answers the same shape for another service the coordinator
+manages: the hosts counted are those whose heartbeats carry that service in `services`, the
+`desired` is that service's, and `converged` also needs, for each role the service runs on, as
+many hosts up as the service requires of the role (its role's `min_up`, at least 1 for a
+`never_last` role, else the desired state's `min_up` for that role). Without the query, or with
+`?service=kbf`, the answer is the one described above, byte for byte. A name no definition
+declares is a 404 `not_found`; a query that is not exactly `service=NAME` is a 400. Any token the
+allow-list accepts may read any service's convergence; the read changes nothing. `GET /v1/status` adds, after its
+existing keys, `per_service`: for every managed service (`kbf` included) by name,
+`{"desired": <its desired state or null>, "roles": [{"role", "at_desired", "updating",
+"failed", "down"}]}`, the counts being those of `GET /v1/convergence` for the service.
+
+`cargo xtask deploy-farm --service NAME` (default `kbf`) deploys another service the same way.
+For `kbf` the requests are the ones listed above. For another service the POST body also has
+`"service": NAME`, the baseline read and every poll are `GET /v1/convergence?service=NAME`, and
+`--version` is not checked against `kbf`'s form: it is that service's own version text, which
+must equal what its hosts report in their heartbeat (the coordinator compares the text and no
+more). The name is 1 to 64 bytes of lowercase letters, digits and `-`. `--service` takes one
+name, so a deploy of several services is one call per service. A coordinator that does not know
+services (one from before the services wire) ignores the query, so the baseline read is `kbf`'s,
+and then refuses the POST, whose `service` key it does not know: the run fails with that refusal
+and nothing is set; it never deploys `kbf` in the service's place. `cargo xtask release farm-version` stays
+the `kbf` form (`<semver>+g<12 hex digits>`, from `kbf`'s release asset). A second repository
+computes its own: the version string its binary reports and its updater puts in the service's
+heartbeat entry (`services[].version`), from that repository's own release, and passes that text
+to `--service NAME --version TEXT`.
 
 ### The proof
 

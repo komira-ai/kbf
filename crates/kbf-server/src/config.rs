@@ -290,6 +290,14 @@ pub struct Args {
     /// fits. Placement only: the action's digest and cache key do not change.
     #[arg(long, default_value_t = kbf_front::DefaultPlatform::LINUX_X86_64)]
     pub default_platform: kbf_front::DefaultPlatform,
+    /// The QoS levels a call may ask for with the `x-kbf-qos` request header, as a comma
+    /// list of `ci`, `batch` and `interactive` (`ci` is always allowed: it is what a call
+    /// with no header, or a header naming a level not on the list, gets, and that call is
+    /// never refused). The level orders the queue, most urgent first: a `batch` action
+    /// waits behind every queued `ci` action. It is not part of the action digest, so it
+    /// does not split the cache. A client that sends no header stays at `ci`
+    #[arg(long, default_value_t = kbf_front::QosAllow::DEFAULT)]
+    pub qos_allowed: kbf_front::QosAllow,
     /// The memory rungs of an action, in GiB, ascending and each at least 1. The first
     /// is what an action that names no size (`kbf-book-mem-gib`) books. An action that
     /// passes its own memory limit runs again on the next rung above what it booked,
@@ -332,6 +340,36 @@ pub struct Args {
     /// until it ends.
     #[arg(long, value_enum, default_value_t = crate::LearnedSizes::Off)]
     pub learned_sizes: crate::LearnedSizes,
+    /// Which core drives the farm's scheduling. `legacy`, the default, is the driver the
+    /// server has always had. `js` is not available in this release: a server given it
+    /// refuses to start (exit status 2) and says so. The core a server runs is logged at
+    /// start and exported as `kbf_scheduler_core{core}`, 1 for it and 0 for the other
+    // The text above states the default; the help golden cannot hold the whitespace-only
+    // line clap prints before a `[default: ...]` line.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = crate::SchedulerCore::Legacy,
+        hide_default_value = true
+    )]
+    pub scheduler_core: crate::SchedulerCore,
+    /// Whether placement reads the load the nodes report. `off`, the default, books by
+    /// the CPUs a lease asks for, as the server always has, and reads no load. `on` admits
+    /// and ranks nodes by the load they report and the load a lease is predicted to add;
+    /// a node that reports none is charged by prediction alone
+    // The text above states the default; the help golden cannot hold the whitespace-only
+    // line clap prints before a `[default: ...]` line.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = crate::PlacementLoad::Off,
+        hide_default_value = true
+    )]
+    pub placement_load: crate::PlacementLoad,
+    /// Whether whole-machine requests are run with the scheduler's whole-node drain and
+    /// caps (`--whole-node-max`), and with which settings: off unless it is given.
+    #[command(flatten)]
+    pub whole_node: crate::WholeNodeFlags,
     /// How long, in seconds, a finished operation is kept after its callers are
     /// answered. Within it, WaitExecution on the operation's name streams its result
     /// (a client whose Execute stream broke gets a result the action cache does not
@@ -704,9 +742,29 @@ pub enum ConfigError {
         #[source]
         source: PolicyError,
     },
+    /// `--scheduler-core` names a core this release does not have.
+    #[error(
+        "--scheduler-core {}: that core is not available yet in this release; run with \
+         --scheduler-core {} (the default)",
+        .0.name(),
+        crate::SchedulerCore::RUNNING.name()
+    )]
+    SchedulerCoreUnavailable(crate::SchedulerCore),
 }
 
 impl Args {
+    /// Refuses a `--scheduler-core` this release cannot run.
+    ///
+    /// # Errors
+    /// [`ConfigError::SchedulerCoreUnavailable`]: the core is `js`.
+    pub fn check_scheduler_core(&self) -> Result<(), ConfigError> {
+        if self.scheduler_core.available() {
+            Ok(())
+        } else {
+            Err(ConfigError::SchedulerCoreUnavailable(self.scheduler_core))
+        }
+    }
+
     /// The directory of the durable log file: `--log-dir`, else `log` in the hot
     /// store's directory (beside `meta`), else none.
     #[must_use]
@@ -831,9 +889,13 @@ impl Args {
             tick: Duration::from_secs(1),
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
             default_platform: self.default_platform,
+            qos_allowed: self.qos_allowed,
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
             vm_host_floor: HostFloor::new(self.vm_host_floor_cpus, self.vm_host_floor_mem_gib),
             learned_sizes: self.learned_sizes,
+            scheduler_core: self.scheduler_core,
+            placement_load: self.placement_load,
+            whole_node: self.whole_node.config(),
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {
                 0 => Duration::MAX,

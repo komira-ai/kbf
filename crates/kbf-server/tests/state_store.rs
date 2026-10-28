@@ -430,12 +430,18 @@ impl Disk {
     }
 }
 
+/// The digest of the action `request(tag)` asks to run.
+fn action_of(tag: u8) -> Digest {
+    Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag))
+}
+
 fn request(tag: u8) -> Request {
     Request {
         key: ActionKey {
             instance: "main".to_owned(),
-            action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        },
+            action: action_of(tag),
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, GIB),
@@ -451,6 +457,7 @@ fn submit(farm: &TestFarm, request: Request) -> Result<(), Status> {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     })
     .map(drop)
 }
@@ -510,6 +517,7 @@ fn invalid(lease: LeaseId) -> worker::Result {
         action_digest: None,
         memory_kill: 0,
         lost: 0,
+        job_outcome: None,
     }
 }
 
@@ -979,6 +987,7 @@ async fn the_third_lost_lease_answers_the_caller_with_the_reason() {
             call: None,
             described: Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("submitted");
     assert_eq!(starts(&mut inbox).len(), 1);
@@ -1234,9 +1243,13 @@ fn listeners() -> Listeners {
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
+        qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
+        scheduler_core: kbf_server::SchedulerCore::under_test(),
+        placement_load: kbf_server::PlacementLoad::Off,
+        whole_node: None,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         streams: kbf_server::StreamTiming::default(),
@@ -1318,6 +1331,7 @@ async fn a_finished_operation_leaves_its_result_in_the_store() {
             call: None,
             described: Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("submitted");
     let leases = starts(&mut inbox);
@@ -1351,6 +1365,7 @@ async fn a_refused_operation_leaves_its_refusal_in_the_store() {
             call: None,
             described: Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("submitted");
     assert_eq!(starts(&mut inbox).len(), 1);
@@ -1378,6 +1393,7 @@ async fn running(disk: &Disk) -> (TestFarm, kbf_front::Ticket, LeaseId) {
             call: None,
             described: Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("submitted");
     let leases = starts(&mut inbox);
@@ -1535,6 +1551,7 @@ async fn a_request_while_the_finish_is_held_does_not_retake_the_finished_operati
             call: None,
             described: Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("submitted");
     let leases = starts(&mut inbox);
@@ -1589,6 +1606,7 @@ async fn a_request_after_the_retention_of_a_held_finish_does_not_retake_the_oper
             call: None,
             described: Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("submitted");
     let leases = starts(&mut inbox);
@@ -1666,6 +1684,7 @@ async fn running_two(disk: &Disk) -> (TestFarm, [kbf_front::Ticket; 2], [LeaseId
             call: None,
             described: Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("submitted")
     });
@@ -1827,6 +1846,7 @@ async fn a_stale_record_in_the_feed_does_not_drop_a_written_answers_detail() {
                 call: None,
                 described: Described::default(),
                 evidence: Default::default(),
+                max_wall: None,
             })
             .expect("submitted")
         })
@@ -2137,6 +2157,7 @@ async fn a_kept_epoch_does_not_reuse_operation_names() {
             call: None,
             described: Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("submitted")
         .name;
@@ -2150,13 +2171,14 @@ async fn a_kept_epoch_does_not_reuse_operation_names() {
     let second = farm_over(kept);
     assert_eq!(second.lease_epoch(), epoch, "the epoch was kept");
     let same = second.wait(&name).expect("the store holds the operation");
-    assert_eq!(same.action, request(1).key.action, "another operation");
+    assert_eq!(same.action, action_of(1), "another operation");
     let other = second
         .submit(Submission {
             request: request(2),
             call: None,
             described: Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("submitted")
         .name;

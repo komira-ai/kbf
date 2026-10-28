@@ -91,10 +91,12 @@ impl Fake {
     fn plan(&self) -> Plan {
         Plan {
             url: self.base.clone(),
+            service: "kbf".to_owned(),
             audience: self.base.clone(),
             version: "2.0.0+g000000000002".to_owned(),
             min_up_storage: 1,
             min_up_frontend: 1,
+            require_coordinator_current: false,
             deadline: Duration::from_secs(30),
             stall: Duration::from_secs(30),
             every: Duration::from_secs(1),
@@ -1213,4 +1215,236 @@ fn run_with_refuses_a_tag_version_without_calling_the_coordinator() {
     );
     assert!(result.is_err());
     assert!(fake.requests("/").is_empty(), "a request was sent");
+}
+
+fn service_args(fake: &Fake, service: &str, version: &str) -> Args {
+    let mut args = args_for(fake, &fake.ca_pem);
+    args.service = service.to_owned();
+    args.version = version.to_owned();
+    args
+}
+
+#[test]
+fn another_service_is_posted_by_name_and_waited_on_by_its_own_convergence() {
+    // Proves: with `--service js-server` the POST body is kbf's body plus the service name,
+    // the baseline read and every poll ask `/v1/convergence?service=js-server` (never the
+    // bare path), a version text of the service's own form is accepted, and the run ends
+    // when that service's convergence says converged.
+    let seven = |state, updating| {
+        let mut answer = farm(state, updating, 0);
+        answer["desired"] = json!("7");
+        Ok(answer)
+    };
+    let fake = serve(Script::after(
+        seven("converged", 0),
+        vec![seven("in_progress", 1), seven("converged", 0)],
+    ));
+    let args = service_args(&fake, "js-server", "7");
+    let mut out = Vec::new();
+    let ca = [fake.ca.clone()];
+    let lines = run_with(&args, &fake.service(), &ca, &mut out).expect("converged");
+    assert_eq!(lines.len(), 1);
+    let posts = fake.requests("/v1/desired");
+    assert_eq!(posts.len(), 1);
+    let body: Value = serde_json::from_str(&posts[0].body).expect("json");
+    assert_eq!(
+        body,
+        json!({
+            "service": "js-server",
+            "version": "7",
+            "min_up": {"storage": 1, "frontend": 1}
+        })
+    );
+    let reads = fake.requests("/v1/convergence");
+    assert_eq!(reads.len(), 3);
+    assert!(
+        reads
+            .iter()
+            .all(|r| r.path == "/v1/convergence?service=js-server"),
+        "{reads:?}"
+    );
+}
+
+#[test]
+fn kbf_sends_the_request_it_always_sent() {
+    // Proves: `--service kbf`, given or defaulted, posts exactly the bytes deploy-farm
+    // posted before the flag existed (no `service` key) and reads the bare convergence path.
+    let fake = serve(Script::new(vec![Ok(farm("converged", 0, 0))]));
+    let mut args = args_for(&fake, &fake.ca_pem);
+    assert_eq!(args.service, "kbf");
+    args.service = "kbf".to_owned();
+    let mut out = Vec::new();
+    let ca = [fake.ca.clone()];
+    run_with(&args, &fake.service(), &ca, &mut out).expect("converged");
+    assert_eq!(
+        fake.requests("/v1/desired")[0].body,
+        r#"{"min_up":{"frontend":1,"storage":1},"version":"2.0.0+g000000000002"}"#
+    );
+    assert!(
+        fake.requests("/v1/convergence")
+            .iter()
+            .all(|r| r.path == "/v1/convergence")
+    );
+}
+
+#[test]
+fn a_service_name_the_coordinator_would_refuse_is_refused_before_any_call() {
+    // Proves: an empty name, upper case, a slash, a query character, a space and a name over
+    // the coordinator's 64 bytes are refused by the client, so the name can go in the query
+    // unescaped, and nothing is sent; and only kbf's version has to be of kbf's form.
+    let fake = serve(Script::new(vec![]));
+    let ca = [fake.ca.clone()];
+    let long = "a".repeat(65);
+    for name in ["", "JS", "a/b", "a&b", "a b", "a_b", long.as_str()] {
+        let args = service_args(&fake, name, "7");
+        let refused = run_with(&args, &fake.service(), &ca, &mut Vec::new());
+        let Err(xtask::Error::Failed(why)) = refused else {
+            panic!("{name:?} was accepted: {refused:?}");
+        };
+        assert!(why.contains("is not a service name"), "{why}");
+    }
+    let kbf = service_args(&fake, "kbf", "7");
+    let refused = run_with(&kbf, &fake.service(), &ca, &mut Vec::new());
+    assert!(matches!(refused, Err(xtask::Error::Failed(why)) if why.contains("is not the form")));
+    assert!(fake.requests("/token").is_empty());
+    assert!(fake.requests("/v1").is_empty());
+}
+
+/// The baseline read of a farm whose coordinator says it was built from `commit`.
+fn reporting(commit: Option<&str>) -> Result<Value, u16> {
+    let mut read = farm("converged", 0, 0);
+    if let Some(commit) = commit {
+        read["commit"] = json!(commit);
+    }
+    Ok(read)
+}
+
+/// The deploy with `require_coordinator_current` as given, against a coordinator whose
+/// baseline read reports `commit`; the release is `...0002`.
+fn with_coordinator(commit: Option<&str>, require: bool) -> (Fake, Result<(), Error>, String) {
+    let fake = serve(Script::after(
+        reporting(commit),
+        vec![Ok(farm("converged", 0, 0))],
+    ));
+    let mut plan = fake.plan();
+    plan.require_coordinator_current = require;
+    let (result, out) = run(&fake, &plan);
+    (fake, result, out)
+}
+
+#[test]
+fn a_coordinator_on_another_commit_stops_a_deploy_that_requires_it_current_before_the_post() {
+    // Proves: with the requirement on, a coordinator that reports another commit than the
+    // release's fails with both commits and the pointer to the docs, and the desired version
+    // is never posted.
+    let (fake, result, out) = with_coordinator(Some("0123456789ab"), true);
+    let error = result.expect_err(&out);
+    assert_eq!(
+        error,
+        Error::CoordinatorBehind {
+            coordinator: "0123456789ab".to_owned(),
+            release: "000000000002".to_owned(),
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "the coordinator runs 0123456789ab, the release is 000000000002: update the coordinator first (docs/deploy/kbf-updater.md, Updating the coordinator)"
+    );
+    assert!(fake.requests("/v1/desired").is_empty(), "{out}");
+}
+
+#[test]
+fn a_coordinator_on_the_release_commit_proceeds_when_it_is_required_current() {
+    // Proves: the same commit passes the requirement, is said in the log, and the deploy
+    // runs to convergence.
+    let (fake, result, out) = with_coordinator(Some("000000000002"), true);
+    assert_eq!(result, Ok(()), "{out}");
+    assert!(
+        out.contains("the coordinator runs the release's commit 000000000002"),
+        "{out}"
+    );
+    assert_eq!(fake.requests("/v1/desired").len(), 1);
+}
+
+#[test]
+fn a_coordinator_that_reports_no_commit_gets_a_notice_and_the_deploy_proceeds() {
+    // Proves: an older coordinator (no `commit` key) and one built without a checkout
+    // (`unknown`) are noted when the requirement is on, and neither stops the deploy.
+    for reported in [None, Some("unknown")] {
+        let (fake, result, out) = with_coordinator(reported, true);
+        assert_eq!(result, Ok(()), "{reported:?}: {out}");
+        assert!(
+            out.contains("::notice::the coordinator reports no build commit"),
+            "{reported:?}: {out}"
+        );
+        assert_eq!(fake.requests("/v1/desired").len(), 1);
+    }
+}
+
+#[test]
+fn without_the_requirement_a_coordinator_on_another_commit_warns_and_the_deploy_proceeds() {
+    // Proves: with the requirement off a different commit is a GitHub warning annotation
+    // line and the deploy proceeds, and a coordinator that reports no commit adds no notice.
+    let (fake, result, out) = with_coordinator(Some("0123456789ab"), false);
+    assert_eq!(result, Ok(()), "{out}");
+    assert!(
+        out.lines().any(|l| l
+            == "::warning title=coordinator not current::the coordinator runs 0123456789ab, the release is 000000000002: update the coordinator first (docs/deploy/kbf-updater.md, Updating the coordinator)"),
+        "{out}"
+    );
+    assert_eq!(fake.requests("/v1/desired").len(), 1);
+    let (_, result, out) = with_coordinator(None, false);
+    assert_eq!(result, Ok(()), "{out}");
+    assert!(!out.contains("build commit"), "{out}");
+}
+
+#[test]
+fn the_flag_turns_the_requirement_on_and_is_off_by_default() {
+    // Proves: `--require-coordinator-current` reaches the plan, and without it the plan does
+    // not require it.
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: Args,
+    }
+    let fake = serve(Script::new(vec![]));
+    let off = args_for(&fake, "");
+    assert!(!Plan::of(&off).require_coordinator_current);
+    let on = Cli::parse_from([
+        "x",
+        "--url",
+        &fake.base,
+        "--version",
+        "2.0.0+g000000000002",
+        "--require-coordinator-current",
+    ]);
+    assert!(Plan::of(&on.args).require_coordinator_current);
+    // The workflow passes the variable's text: `true` is on; empty (unset) and `false` are off.
+    for (text, want) in [("true", true), ("false", false), ("", false)] {
+        let cli = Cli::parse_from([
+            "x",
+            "--url",
+            &fake.base,
+            "--version",
+            "2.0.0+g000000000002",
+            "--require-coordinator-current",
+            text,
+        ]);
+        assert_eq!(
+            Plan::of(&cli.args).require_coordinator_current,
+            want,
+            "{text:?}"
+        );
+    }
+    let bad = Cli::try_parse_from([
+        "x",
+        "--url",
+        &fake.base,
+        "--version",
+        "2.0.0+g000000000002",
+        "--require-coordinator-current",
+        "yes",
+    ]);
+    assert!(bad.is_err());
 }

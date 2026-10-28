@@ -75,7 +75,8 @@ async fn a_silent_node_past_the_budget_answers_the_callers_on_a_tick() {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [7; 32], 7),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
@@ -89,6 +90,7 @@ async fn a_silent_node_past_the_budget_answers_the_callers_on_a_tick() {
             call: None,
             described: kbf_front::Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("queued");
     let mut seq = 0;
@@ -158,7 +160,8 @@ async fn a_node_that_drops_every_start_answers_the_callers_that_it_never_started
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [8; 32], 8),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
@@ -172,6 +175,7 @@ async fn a_node_that_drops_every_start_answers_the_callers_that_it_never_started
             call: None,
             described: kbf_front::Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("queued");
     let mut starts = 0;
@@ -211,7 +215,8 @@ async fn a_drain_with_a_lease_still_running_pauses_at_its_deadline() {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [9; 32], 9),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
@@ -225,6 +230,7 @@ async fn a_drain_with_a_lease_still_running_pauses_at_its_deadline() {
             call: None,
             described: kbf_front::Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("queued");
     assert_eq!(started(&mut responses), [0]);

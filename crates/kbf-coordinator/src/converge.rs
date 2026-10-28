@@ -27,8 +27,9 @@ use kbf_updater::version::Version;
 use kbf_updater::wire::Outcome;
 use serde::Serialize;
 
-use crate::desired::Desired;
+use crate::desired::{Desired, KBF};
 use crate::fleet::{Fleet, Host};
+use crate::services::ServiceDef;
 
 /// Where the farm stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -69,6 +70,9 @@ pub struct Convergence {
     pub state: State,
     /// The counts of every role that has a host, in role order.
     pub roles: Vec<RoleCounts>,
+    /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]): what a client
+    /// compares with a release before it orders one.
+    pub commit: &'static str,
 }
 
 fn failed_to_reach(host: &Host, desired: &Desired) -> bool {
@@ -81,10 +85,16 @@ fn failed_to_reach(host: &Host, desired: &Desired) -> bool {
             .is_some_and(|r| r.outcome == Outcome::Failed && r.target == desired.version)
 }
 
-fn counts(role: HostRole, desired: &Desired, fleet: &Fleet, now: Duration) -> RoleCounts {
+fn counts(
+    service: &str,
+    role: HostRole,
+    desired: &Desired,
+    fleet: &Fleet,
+    now: Duration,
+) -> RoleCounts {
     let mine = || {
         fleet
-            .hosts()
+            .hosts_of(service)
             .map(|(_, h)| h)
             .filter(move |h| h.role == role)
     };
@@ -103,9 +113,55 @@ fn counts(role: HostRole, desired: &Desired, fleet: &Fleet, now: Duration) -> Ro
     }
 }
 
+/// The counts of every role of `service` that has a host, in role order; none when no
+/// desired state was set.
+#[must_use]
+pub fn role_counts(
+    service: &str,
+    desired: Option<&Desired>,
+    fleet: &Fleet,
+    now: Duration,
+) -> Vec<RoleCounts> {
+    let Some(desired) = desired else {
+        return Vec::new();
+    };
+    HostRole::ALL
+        .into_iter()
+        .map(|role| counts(service, role, desired, fleet, now))
+        .filter(|c| c.at_desired + c.updating + c.failed + c.down > 0)
+        .collect()
+}
+
 /// Where the farm stands at `now` against `desired`.
 #[must_use]
 pub fn converge(desired: Option<&Desired>, fleet: &Fleet, now: Duration) -> Convergence {
+    converge_with(KBF, desired, fleet, now, |d, role| {
+        d.min_up.of(role) as usize
+    })
+}
+
+/// Where the hosts of the service `def` stand at `now` against its `desired`: like
+/// [`converge`] over the hosts that heartbeated the service, with the minimum of hosts up
+/// per role being what the service requires of the role ([`crate::services::RoleDef::required_up`]).
+#[must_use]
+pub fn converge_service(
+    def: &ServiceDef,
+    desired: Option<&Desired>,
+    fleet: &Fleet,
+    now: Duration,
+) -> Convergence {
+    converge_with(&def.name, desired, fleet, now, |d, role| {
+        def.roles.get(&role).map_or(0, |r| r.required_up(role, d))
+    })
+}
+
+fn converge_with(
+    service: &str,
+    desired: Option<&Desired>,
+    fleet: &Fleet,
+    now: Duration,
+    minimum: impl Fn(&Desired, HostRole) -> usize,
+) -> Convergence {
     let quiet = fleet.is_quiet(now);
     let Some(desired) = desired else {
         return Convergence {
@@ -113,19 +169,19 @@ pub fn converge(desired: Option<&Desired>, fleet: &Fleet, now: Duration) -> Conv
             quiet,
             state: State::InProgress,
             roles: Vec::new(),
+            commit: crate::BUILD_COMMIT,
         };
     };
-    let roles: Vec<RoleCounts> = HostRole::ALL
-        .into_iter()
-        .map(|role| counts(role, desired, fleet, now))
-        .filter(|c| c.at_desired + c.updating + c.failed + c.down > 0)
-        .collect();
-    let live = fleet.hosts().filter(|(_, h)| h.is_live(now)).count();
+    let roles = role_counts(service, Some(desired), fleet, now);
+    let live = fleet
+        .hosts_of(service)
+        .filter(|(_, h)| h.is_live(now))
+        .count();
     let at_desired: usize = roles.iter().map(|c| c.at_desired).sum();
     let clear = roles.iter().all(|c| c.updating == 0 && c.failed == 0);
     let up = |role| {
         fleet
-            .hosts()
+            .hosts_of(service)
             .filter(|(_, h)| h.role == role && h.is_up(now))
             .count()
     };
@@ -135,8 +191,9 @@ pub fn converge(desired: Option<&Desired>, fleet: &Fleet, now: Duration) -> Conv
         && live > 0
         && at_desired == live
         && clear
-        && up(HostRole::Storage) >= desired.min_up.storage as usize
-        && up(HostRole::Frontend) >= desired.min_up.frontend as usize
+        && HostRole::ALL
+            .into_iter()
+            .all(|role| up(role) >= minimum(desired, role))
     {
         State::Converged
     } else {
@@ -147,5 +204,6 @@ pub fn converge(desired: Option<&Desired>, fleet: &Fleet, now: Duration) -> Conv
         quiet,
         state,
         roles,
+        commit: crate::BUILD_COMMIT,
     }
 }

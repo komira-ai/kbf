@@ -83,8 +83,8 @@ impl Durable {
             .map(|(key, _)| key[SESSION.len()..].to_owned())
             .collect();
         let mut orphaned = BTreeSet::new();
-        for (key, row) in self.store.scan_prefix("lease/")? {
-            let grant = lease_row(&key, &row)?;
+        for (key, row) in self.store.scan_prefix(LEASE)? {
+            let grant = self.lease_row(&key, &row)?;
             if connected.contains(&grant.worker) || sessions.contains(grant.worker.as_str()) {
                 continue;
             }

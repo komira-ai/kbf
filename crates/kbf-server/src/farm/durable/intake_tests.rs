@@ -32,6 +32,7 @@ pub(super) fn caller(farm: &Farm, tag: u8) -> kbf_front::Ticket {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     };
     farm.submit(submission).expect("submitted")
 }
@@ -80,6 +81,7 @@ pub(super) fn invalid(lease: LeaseId) -> worker::Result {
         action_digest: None,
         memory_kill: 0,
         lost: 0,
+        job_outcome: None,
     }
 }
 
@@ -200,7 +202,7 @@ async fn an_operation_another_frontend_took_leaves_the_scheduler_and_its_callers
     tokio::time::advance(kbf_sched::FINISHED_RETENTION + Duration::from_secs(1)).await;
     farm.intake();
     assert_eq!(
-        farm.lock().machine.waiter_ids().count(),
+        farm.lock().side.machine.waiter_ids().count(),
         0,
         "the callers were kept for ever"
     );
@@ -843,6 +845,7 @@ fn queue(farm: &Farm, request: kbf_sched::Request) -> kbf_front::Ticket {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     })
     .expect("queued")
 }
