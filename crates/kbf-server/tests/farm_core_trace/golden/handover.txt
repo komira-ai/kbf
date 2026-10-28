@@ -1,0 +1,64 @@
+# a fenced farm takes nothing; a closed intake places nothing
+> [t=0ms] start
+  farm term=7 lease_epoch=7
+  txn applied rev=1 counters=[]
+    put meta/epoch cond=absent len=8 sha=a3eb8db89fc5123c ttl=-
+  txn applied rev=2 counters=[]
+    put meta/next_op cond=absent len=8 sha=f44b28e2244100cb ttl=-
+  txn applied rev=3 counters=[]
+    put meta/next_seq cond=absent len=8 sha=f44b28e2244100cb ttl=-
+> [t=0ms] register node-a cores=4 gib=8 drivers=container
+  txn applied rev=4 counters=[]
+    put owner/node-a cond=absent len=16 sha=4ff190b4c2c573ec ttl=-
+  txn applied rev=5 counters=[]
+    put session/node-a cond=any len=70 sha=2b29556b96e9b197 ttl=60000ms
+  msg node-a welcome protocol=1 interval_ms=5000 epoch=7 pack_commit=false
+> [t=0ms] submit held qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket held#1 name=operations/0
+  txn applied rev=9 counters=[]
+    put op/0000000000000000 cond=absent len=75 sha=8136470751ede4ae ttl=-
+    put subject/0000000000000000 cond=absent len=14 sha=424abad14dc11a46 ttl=-
+    put queue/0000000000000000 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=absent len=8 sha=af5570f5a1810b7a ttl=-
+  txn applied rev=12 counters=[]
+    check owner/node-a cond=v4
+    del queue/0000000000000000 cond=v8
+    put lease/0000000000000007.0000000000000000 cond=absent len=20 sha=3c9486d0aaad3084 ttl=-
+    put lease-by-op/0000000000000000 cond=any len=16 sha=e8dd943d366caae7 ttl=-
+  msg node-a lease_offer lease=7/0 kind=action action=held
+  msg node-a start lease=7/0 kind=action action=held millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+  stage held#1 executing
+> [t=0ms] fence
+> [t=0ms] submit refused qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  refused code=14 message="this frontend is handing its work to its successor"
+> [t=0ms] tick
+> [t=0ms] result node-a lease=7/0 action=held ended=ran(exit=0)
+  ack lease=7/0 accepted=false reason=RESULT_ACK_REASON_STALE
+> [t=0ms] resume
+> [t=0ms] result node-a lease=7/0 action=held ended=ran(exit=0)
+  ack lease=7/0 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=23 counters=[]
+    check owner/node-a cond=v4
+    del lease/0000000000000007.0000000000000000 cond=v11
+    del inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=v9
+    put doneof/0000000000000000 cond=any len=45 sha=f0fd36d49c3d8936 ttl=600000ms
+    del op/0000000000000000 cond=any
+    del queue/0000000000000000 cond=any
+    del loss/0000000000000000 cond=any
+    del fate/0000000000000000 cond=any
+    del subject/0000000000000000 cond=any
+    del opkey/0000000000000000 cond=any
+    del lease-by-op/0000000000000000 cond=any
+    put done/0000000000000000 cond=any len=59 sha=5417ef7fc4459618 ttl=600000ms
+  cache held exit=0
+  stage held#1 done ran exit=0 stdout="output of held" worker="node-a" queued_ms=1900000000000 started_ms=1900000000000 completed_ms=1900000000002
+> [t=0ms] close_intake
+> [t=0ms] submit after-close qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket after-close#1 name=operations/1
+  txn applied rev=27 counters=[]
+    put op/0000000000000001 cond=absent len=75 sha=8dfbccd9809e915d ttl=-
+    put subject/0000000000000001 cond=absent len=14 sha=20ac1a85a2ace5e8 ttl=-
+    put queue/0000000000000001 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0303030303030303030303030303030303030303030303030303030303030303/3 cond=absent len=8 sha=cd2662154e6d76b2 ttl=-
+  stage after-close#1 queued
+> [t=0ms] tick
