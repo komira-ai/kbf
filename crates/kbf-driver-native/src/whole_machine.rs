@@ -15,6 +15,12 @@
 //!    the Command's environment, stdout and stderr captured, its outputs read back
 //!    with `kbf-outputs`; a wall-clock timeout and the daemon's kill end every process
 //!    of the user (`kill-uid`). There is no memory watch: the lease books the whole Mac.
+//!    What the lease used is reported all the same ([`ResourceUsage`], so the server
+//!    writes its `action usage:` line): the action's wall time, from just before the
+//!    helper starts it to when it exits, times out or is killed, in its result or, for a
+//!    lease that ends without one, through [`Runtime::failed_usage`]. CPU time and peak
+//!    memory are not measured (the helper runs the action as the lease user, and nothing
+//!    here reads that user's processes), so they are absent, not zero.
 //! 3. **Restoring.** `kill-uid`, the lease directory removed, `session-idle` (auto-login
 //!    cleared and the same restart, back to the login window), `user-delete`. Only then
 //!    does the lease report the action's outcome.
@@ -61,6 +67,7 @@ use kbf_daemon::cas::Cas;
 use kbf_daemon::{Runtime, RuntimeError, Work};
 use kbf_outputs::OutputLimits;
 use kbf_proto::reapi::ActionResult;
+use kbf_proto::worker::ResourceUsage;
 use kbf_types::{LeaseId, LostWhy, NodePhase};
 use tokio::sync::{oneshot, watch};
 
@@ -126,6 +133,10 @@ pub struct WholeMachineRuntime<S, C> {
     /// Held while a lease or a restore runs: one at a time.
     busy: tokio::sync::Mutex<()>,
     stops: Mutex<BTreeMap<LeaseId, oneshot::Sender<Stop>>>,
+    /// What the last lease that ended without a result used, until the daemon asks
+    /// ([`Runtime::failed_usage`]); one lease runs at a time, and the daemon asks as soon
+    /// as a run fails, so one slot is all there is to keep.
+    failed: Mutex<Option<(LeaseId, ResourceUsage)>>,
 }
 
 impl<S, C> std::fmt::Debug for WholeMachineRuntime<S, C> {
@@ -191,6 +202,7 @@ impl<S: Session, C: Cas> WholeMachineRuntime<S, C> {
             phase: watch::Sender::new(phase),
             busy: tokio::sync::Mutex::new(()),
             stops: Mutex::new(BTreeMap::new()),
+            failed: Mutex::new(None),
         })
     }
 
@@ -214,6 +226,11 @@ impl<S: Session, C: Cas> WholeMachineRuntime<S, C> {
         tokio::task::spawn_blocking(move || call(&session))
             .await
             .unwrap_or_else(action::join_failed)
+    }
+
+    /// Keeps `usage` for [`Runtime::failed_usage`] of `lease`, in place of any earlier.
+    fn keep_failed(&self, lease: LeaseId, usage: ResourceUsage) {
+        *self.failed.lock().unwrap_or_else(PoisonError::into_inner) = Some((lease, usage));
     }
 
     /// Keeps `record`, or says why it could not.
@@ -404,6 +421,13 @@ impl<S: Session, C: Cas> Runtime for WholeMachineRuntime<S, C> {
             let _ = by.send(());
         }
         outcome
+    }
+
+    fn failed_usage(&self, lease_id: LeaseId) -> Option<ResourceUsage> {
+        let mut failed = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
+        failed
+            .take_if(|(lease, _)| *lease == lease_id)
+            .map(|(_, usage)| usage)
     }
 
     /// Stops a running lease and waits for its restore. A lease that is not running

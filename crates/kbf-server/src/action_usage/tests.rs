@@ -3,7 +3,7 @@
 
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::{ActionResult, ExecutedActionMetadata};
-use kbf_proto::worker::CgroupUsage;
+use kbf_proto::worker::{CgroupUsage, FootprintUsage, UsageBasis};
 
 use super::*;
 
@@ -92,6 +92,66 @@ fn the_line_names_the_hint_and_the_derived_target_apart() {
             "exit_code=0 mnemonic=- target_hint=\"//pkg:t\" wall_us=1000 {cgroup} key={} \
              cfg=7a3c1e9f0b2d4c68 target=\"cell//pkg:t\" target_kind=target outcome=oom \
              lease={lease} node=node-a",
+            subject.key
+        )
+    );
+}
+
+/// Catches: a Mac lease's line without what it used (a footprint block printed as all
+/// `-`, as a line that read only the cgroup does), no line for the lease of a runtime that
+/// measured only its wall time (the whole-machine runtime: its result carries a usage with
+/// nothing else, and the line shows it with every other field `-`), and the node's name
+/// lost from either. The results are built as the Mac runtimes send them.
+#[test]
+fn a_mac_lease_has_a_line_with_what_its_runtime_measured() {
+    let subject = Shapes::default().subject(described(&["cc"], &[]));
+    let lease = LeaseId::new(5, 2);
+    let node = WorkerId::new("mac-1");
+    let judged = Outcome::Completed {
+        action_result: kbf_types::Digest {
+            function: kbf_types::DigestFunction::Sha256,
+            hash: [0; 32],
+            size_bytes: 0,
+        }
+        .into(),
+    };
+    let line_of = |usage: &ResourceUsage| {
+        let measured = Measured::of(&report(Code::Ok, 0, Some(usage))).expect("measured");
+        line(&subject, &measured, judged, lease, &node)
+    };
+
+    let native = ResourceUsage {
+        wall_micros: 2_000_000,
+        footprint: Some(FootprintUsage {
+            peak_footprint_bytes: Some(1 << 20),
+            cpu_user_micros: Some(1_500_000),
+            cpu_system_micros: Some(500_000),
+            wall_micros: Some(2_000_000),
+        }),
+        basis: UsageBasis::MacFootprint.into(),
+        ..ResourceUsage::default()
+    };
+    assert_eq!(
+        line_of(&native),
+        format!(
+            "exit_code=0 mnemonic=- target_hint=- wall_us=2000000 cpu_usage_us=2000000 \
+             cpu_user_us=1500000 cpu_system_us=500000 cpu_periods=- cpu_throttled=- \
+             throttled_us=- mem_peak=1048576 parallelism=1.00 numa_bytes=- numa_spread=- \
+             key={} cfg=- target=- target_kind=- outcome=ok lease={lease} node=mac-1",
+            subject.key
+        )
+    );
+
+    let whole_machine = ResourceUsage {
+        wall_micros: 7,
+        ..ResourceUsage::default()
+    };
+    assert_eq!(
+        line_of(&whole_machine),
+        format!(
+            "exit_code=0 mnemonic=- target_hint=- wall_us=7 {} key={} cfg=- target=- \
+             target_kind=- outcome=ok lease={lease} node=mac-1",
+            kbf_proto::no_cgroup_fields(),
             subject.key
         )
     );
