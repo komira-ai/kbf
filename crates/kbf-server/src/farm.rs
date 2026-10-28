@@ -945,6 +945,8 @@ mod learned_tests;
 #[cfg(test)]
 mod placement_tests;
 #[cfg(test)]
+mod storage_down_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod whole_node_recovery_tests;
