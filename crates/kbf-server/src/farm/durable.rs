@@ -143,10 +143,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime};
 
 use kbf_estimator::Day;
 use kbf_front::{Described, Finished, Stage};
+#[cfg(test)]
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
 use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{
@@ -172,7 +175,9 @@ use crate::learned::Row;
 use crate::machine::Platform;
 use crate::state_store::StateStore;
 
-use self::codec::{KbfLog, RowCodec, Value, WorkerUp};
+use self::codec::{KbfLog, RowCodec, WorkerUp};
+#[cfg(test)]
+use self::codec::{decode, encode};
 use self::ext::{Ext, KbfRows};
 use self::inflight::Submitted;
 use self::leases::lease_by_op_key;
@@ -461,29 +466,37 @@ impl Ending {
         self.retention.max(DONE_FLOOR)
     }
 
+    /// [`Ending::settle_with`] with the rows of the build server.
+    #[cfg(test)]
+    fn settle(&self, txn: Txn, operation: OperationId) -> Txn {
+        self.settle_with(&KbfRows, txn, operation)
+    }
+
     /// `txn`, then the removal of the operation's `op/`, `queue/`, `loss/`, `fate/` and
-    /// `opkey/` rows and the put of its result, so one transaction carries all of it (the
-    /// rows of the build server go with it through [`Ext::settled`], which
-    /// [`Durable::settle`] adds). The `opkey/` delete is made whatever `--learned-sizes` says: an operation
+    /// `opkey/` rows (and the rows `ext` removes, between the `fate/` and `opkey/` deletes)
+    /// and the put of its result, so one transaction carries all of it. The `opkey/` delete
+    /// is made whatever `--learned-sizes` says: an operation
     /// an `on` run queued has the row, and a later `off` run cleans it up as it ends.
     /// The result goes over whatever is there: the transaction also deletes the lease row
     /// at the version read, which no other writer can have deleted first and written a
     /// result after.
-    fn settle(&self, txn: Txn, operation: OperationId) -> Txn {
+    fn settle_with(&self, ext: &dyn Ext, txn: Txn, operation: OperationId) -> Txn {
         let txn = txn
             .delete(op_key(operation), Cond::Any)
             .delete(queue_key(operation), Cond::Any);
-        self.settle_rest(txn, operation, Cond::Any)
+        self.settle_rest(ext, txn, operation, Cond::Any)
     }
 
     /// `txn`, which already deletes the operation's `op/` and `queue/` rows at the versions
     /// it read, then the removal of the rest of its rows (its `lease-by-op/` row among
     /// them, whoever left it) and the put of its result where `done` allows:
     /// [`Cond::Absent`] for a result no other writer has put.
-    fn settle_rest(&self, txn: Txn, operation: OperationId, done: Cond) -> Txn {
+    fn settle_rest(&self, ext: &dyn Ext, txn: Txn, operation: OperationId, done: Cond) -> Txn {
         let ttl = self.ttl();
-        txn.delete(loss_key(operation), Cond::Any)
-            .delete(fate_key(operation), Cond::Any)
+        let txn = txn
+            .delete(loss_key(operation), Cond::Any)
+            .delete(fate_key(operation), Cond::Any);
+        ext.settled(txn, operation)
             .delete(opkey_key(operation), Cond::Any)
             .delete(lease_by_op_key(operation), Cond::Any)
             .put_ttl(done_key(operation), self.finished.to_row(), ttl, done)
@@ -578,50 +591,6 @@ fn corrupt(key: &str, why: &str) -> StateError {
     }
 }
 
-/// `input` as the `kbf-log` encoding of a one-input batch: the bytes of a row value in
-/// [`KbfLog`].
-fn encode(input: FarmInput) -> Result<Vec<u8>, StateError> {
-    let batch = FarmBatch {
-        now: FarmTime::default(),
-        wall: UNIX_EPOCH,
-        inputs: vec![input],
-    };
-    Ok(kbf_log::encode(Format::V1, &LogCommand::Farm(batch))?)
-}
-
-/// The one scheduler input `bytes` hold, or `None` for a command this binary does not know,
-/// which a later one wrote.
-fn single(key: &str, bytes: &[u8]) -> Result<Option<FarmInput>, StateError> {
-    match kbf_log::decode(Format::V1, bytes) {
-        Ok(LogCommand::Farm(FarmBatch { mut inputs, .. })) if inputs.len() == 1 => {
-            Ok(Some(inputs.remove(0)))
-        }
-        Ok(LogCommand::Unknown) => Ok(None),
-        Ok(_) => Err(corrupt(key, "not a single scheduler input")),
-        Err(e) => Err(corrupt(key, &e.to_string())),
-    }
-}
-
-/// The input a row holds, refused if the command is one this binary does not know.
-#[cfg(test)]
-fn decode(key: &str, bytes: &[u8]) -> Result<FarmInput, StateError> {
-    // A command this build does not know has no text of its own from the decoder.
-    single(key, bytes)?.ok_or_else(|| not_known(key))
-}
-
-fn not_known(key: &str) -> StateError {
-    corrupt(key, "a command this binary does not know")
-}
-
-/// Why `value`, which a row holds, is not the `what` the reader wants.
-fn wrong(key: &str, value: &Value, what: &str) -> StateError {
-    if matches!(value, Value::Unknown) {
-        not_known(key)
-    } else {
-        corrupt(key, what)
-    }
-}
-
 fn parse_operation(key: &str, prefix: &str) -> Result<OperationId, StateError> {
     let id = u64::from_str_radix(&key[prefix.len()..], 16)
         .map_err(|_| corrupt(key, "not an operation id"))?;
@@ -689,37 +658,6 @@ impl Durable {
         let mut rows = self.store.scan_prefix(prefix)?;
         rows.retain(|(key, row)| !self.is_unknown(key, &row.value));
         Ok(rows)
-    }
-
-    /// Whether `bytes`, the value of the row `key`, hold a command this binary does not
-    /// know, which a later one wrote. A value that is malformed is not: a scan leaves it
-    /// for the reader to refuse.
-    fn is_unknown(&self, key: &str, bytes: &[u8]) -> bool {
-        matches!(self.codec.read(key, bytes), Ok(Value::Unknown))
-    }
-
-    /// The grant a `lease/` row holds.
-    fn lease_row(&self, key: &str, row: &Versioned) -> Result<LeaseGrant, StateError> {
-        match self.codec.read(key, &row.value)? {
-            Value::Lease(grant) => Ok(grant),
-            other => Err(wrong(key, &other, "not a lease grant")),
-        }
-    }
-
-    /// The request an `op/` row holds.
-    fn request_row(&self, key: &str, row: &Versioned) -> Result<Request, StateError> {
-        match self.codec.read(key, &row.value)? {
-            Value::Submit(request) => Ok(request),
-            other => Err(wrong(key, &other, "not a request")),
-        }
-    }
-
-    /// The registration a `session/` row holds.
-    fn session_row(&self, key: &str, row: &Versioned) -> Result<WorkerUp, StateError> {
-        match self.codec.read(key, &row.value)? {
-            Value::Session(up) => Ok(up),
-            other => Err(wrong(key, &other, "not a daemon registration")),
-        }
     }
 
     /// [`Durable::scan_known`], logging the key of each row it leaves out: for a start.
@@ -995,19 +933,6 @@ impl Durable {
         let txn = txn.put(op_key(operation), value, Cond::Absent);
         let txn = self.ext.submitted(txn, operation, subject);
         Ok(txn.put(queue_key(operation), Vec::new(), Cond::Absent))
-    }
-
-    /// `txn`, then the removal of the rows `operation` leaves when it ends and the put of
-    /// its result ([`Ending::settle`]), and the removal of the rows of the build server.
-    fn settle(&self, ending: &Ending, txn: Txn, operation: OperationId) -> Txn {
-        self.ext.settled(ending.settle(txn, operation), operation)
-    }
-
-    /// [`Durable::settle`], for a `txn` that already deletes the operation's `op/` and
-    /// `queue/` rows ([`Ending::settle_rest`]).
-    fn settle_rest(&self, ending: &Ending, txn: Txn, operation: OperationId, done: Cond) -> Txn {
-        let txn = ending.settle_rest(txn, operation, done);
-        self.ext.settled(txn, operation)
     }
 
     /// The value of the `keyfloor/` row of `floor`: it names the size summary `summary`

@@ -282,7 +282,8 @@ impl Durable {
         let txn = txn.delete(key.clone(), Cond::Version(row.version));
         let txn = self.unpin(txn, operation)?;
         let txn = self.noting(txn, operation, ending)?;
-        let committed = self.commit_owned(&worker, self.settle(ending, txn, operation));
+        let settled = ending.settle_with(&*self.ext, txn, operation);
+        let committed = self.commit_owned(&worker, settled);
         if matches!(committed, Err(StateError::Conflict(_))) && self.store.get(&key)?.is_none() {
             return self.end_queued(operation, ending, &key, |_| true);
         }
@@ -327,7 +328,8 @@ impl Durable {
                 .delete(op, Cond::Version(unfinished.version));
             let txn = self.unpin(txn, operation)?;
             let txn = self.noting(txn, operation, ending)?;
-            let committed = self.commit(self.settle_rest(ending, txn, operation, Cond::Absent));
+            let settled = ending.settle_rest(&*self.ext, txn, operation, Cond::Absent);
+            let committed = self.commit(settled);
             if !matches!(committed, Err(StateError::Conflict(_))) {
                 return committed;
             }

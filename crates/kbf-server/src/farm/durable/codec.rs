@@ -6,12 +6,93 @@
 //! the scheduler's own input for each, so the codec the replicated log already runs decides
 //! what a row may hold.
 
-use kbf_caps::NodeCaps;
-use kbf_log::FarmInput;
-use kbf_sched::{DaemonInstance, Request};
-use kbf_types::{ControlRecord, LeaseGrant, Resources, WorkerId};
+use std::time::UNIX_EPOCH;
 
-use super::{StateError, encode, single};
+use kbf_caps::NodeCaps;
+use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
+use kbf_sched::{DaemonInstance, Request};
+use kbf_state::Versioned;
+use kbf_types::{ControlRecord, FarmTime, LeaseGrant, Resources, WorkerId};
+
+use super::{Durable, StateError, corrupt};
+
+/// `input` as the `kbf-log` encoding of a one-input batch: the bytes of a row value in
+/// [`KbfLog`].
+pub(super) fn encode(input: FarmInput) -> Result<Vec<u8>, StateError> {
+    let batch = FarmBatch {
+        now: FarmTime::default(),
+        wall: UNIX_EPOCH,
+        inputs: vec![input],
+    };
+    Ok(kbf_log::encode(Format::V1, &LogCommand::Farm(batch))?)
+}
+
+/// The one scheduler input `bytes` hold, or `None` for a command this binary does not know,
+/// which a later one wrote.
+fn single(key: &str, bytes: &[u8]) -> Result<Option<FarmInput>, StateError> {
+    match kbf_log::decode(Format::V1, bytes) {
+        Ok(LogCommand::Farm(FarmBatch { mut inputs, .. })) if inputs.len() == 1 => {
+            Ok(Some(inputs.remove(0)))
+        }
+        Ok(LogCommand::Unknown) => Ok(None),
+        Ok(_) => Err(corrupt(key, "not a single scheduler input")),
+        Err(e) => Err(corrupt(key, &e.to_string())),
+    }
+}
+
+/// The input a row holds, refused if the command is one this binary does not know.
+#[cfg(test)]
+pub(super) fn decode(key: &str, bytes: &[u8]) -> Result<FarmInput, StateError> {
+    // A command this build does not know has no text of its own from the decoder.
+    single(key, bytes)?.ok_or_else(|| not_known(key))
+}
+
+fn not_known(key: &str) -> StateError {
+    corrupt(key, "a command this binary does not know")
+}
+
+/// Why `value`, which a row holds, is not the `what` the reader wants.
+fn wrong(key: &str, value: &Value, what: &str) -> StateError {
+    if matches!(value, Value::Unknown) {
+        not_known(key)
+    } else {
+        corrupt(key, what)
+    }
+}
+
+impl Durable {
+    /// Whether `bytes`, the value of the row `key`, hold a command this binary does not
+    /// know, which a later one wrote. A value that is malformed is not: a scan leaves it
+    /// for the reader to refuse. It reads the value as any reader does, which costs what
+    /// the decode of each row cost before the codec was a trait.
+    pub(super) fn is_unknown(&self, key: &str, bytes: &[u8]) -> bool {
+        matches!(self.codec.read(key, bytes), Ok(Value::Unknown))
+    }
+
+    /// The grant a `lease/` row holds.
+    pub(super) fn lease_row(&self, key: &str, row: &Versioned) -> Result<LeaseGrant, StateError> {
+        match self.codec.read(key, &row.value)? {
+            Value::Lease(grant) => Ok(grant),
+            other => Err(wrong(key, &other, "not a lease grant")),
+        }
+    }
+
+    /// The request an `op/` row holds.
+    pub(super) fn request_row(&self, key: &str, row: &Versioned) -> Result<Request, StateError> {
+        match self.codec.read(key, &row.value)? {
+            Value::Submit(request) => Ok(request),
+            other => Err(wrong(key, &other, "not a request")),
+        }
+    }
+
+    /// The registration a `session/` row holds.
+    pub(super) fn session_row(&self, key: &str, row: &Versioned) -> Result<WorkerUp, StateError> {
+        match self.codec.read(key, &row.value)? {
+            Value::Session(up) => Ok(up),
+            other => Err(wrong(key, &other, "not a daemon registration")),
+        }
+    }
+}
 
 /// What a daemon's registration says, as its `session/` row keeps it.
 #[derive(Debug, Clone)]
