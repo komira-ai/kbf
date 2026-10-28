@@ -53,7 +53,10 @@ pub(in crate::farm) struct LearnedRequeue {
 
 /// Everything the engine asks of the farm around it. Called under the farm's lock, so a
 /// hook neither blocks nor calls back into the engine: it sends on a channel, changes a
-/// map, writes a log line. Only the farm's own types appear here.
+/// map, writes a log line. Besides ids and the scheduler's types, the signatures still name
+/// kbf types: `Stage` (which the engine also builds, in `stage_for`), `Finished`, the learned
+/// `Row`, `StoredOperation` and the estimator's `Key`, and the engine holds `Durable`. Each
+/// becomes a type the engine owns or the consumer supplies before the engine can be shared.
 pub(in crate::farm) trait Adapter {
     /// Every node the farm has heard from, in node-id order.
     fn registered(&self) -> Vec<WorkerId>;
