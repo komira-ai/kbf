@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use kbf_daemon::Runtime;
+use kbf_daemon::{LeaseReading, LeaseUsage, NodeReading, Runtime};
 use kbf_driver_container::{MonoClock, NodeLoad};
 use kbf_proto::worker;
 use kbf_types::{LeaseId, Resources};
@@ -44,7 +44,10 @@ fn replace(dir: &Path, file: &str, text: &str) {
 /// is not covered at that reading, is at the next, and is not after the run; its peak is
 /// handed over once. Also catches the reading a heartbeat carries losing, swapping or
 /// misnaming a field: a reading through the driver's `Runtime` hook while the lease runs
-/// must hold every value of the actions cgroup's files and the covered lease.
+/// must hold every value of the actions cgroup's files and the covered lease. And catches the
+/// reading not naming the running lease with the start the tracker took and the counters
+/// of its own cgroup (its `cpu.stat`, and `memory.current` less `inactive_file`), or taking
+/// the clock a second time for the lease's memory files.
 #[tokio::test]
 async fn a_lease_is_covered_from_the_second_reading_and_leaves_with_its_peak() {
     let fake = Fake::new("node-load-hooks");
@@ -75,6 +78,8 @@ async fn a_lease_is_covered_from_the_second_reading_and_leaves_with_its_peak() {
     let spec = Spec::new(&image(), "unused");
     let action = [
         write("cpu.stat", &["usage_usec 0"]),
+        write("memory.current", &["3000"]),
+        write("memory.stat", &["inactive_file 1000", "active_file 5"]),
         write("ready", &[]),
         words(&["wait-for", "$CG/release", "600"]),
         words(&["exit", "0"]),
@@ -124,7 +129,7 @@ async fn a_lease_is_covered_from_the_second_reading_and_leaves_with_its_peak() {
         (first, second, sent)
     };
     let run = runtime.run(work(1, digest, Resources::new(2000, 1 << 30)));
-    let (outcome, (first, second, sent)): (_, (NodeLoad, NodeLoad, worker::NodeLoad)) =
+    let (outcome, (first, second, sent)): (_, (NodeLoad, NodeLoad, NodeReading)) =
         tokio::join!(run, readings);
     outcome.expect("ran");
     fake.assert_clean(1);
@@ -140,10 +145,10 @@ async fn a_lease_is_covered_from_the_second_reading_and_leaves_with_its_peak() {
     );
 
     assert_eq!(
-        sent,
+        sent.load,
         worker::NodeLoad {
             seq: second.seq + 1,
-            mono_usec: sent.mono_usec,
+            mono_usec: sent.load.mono_usec,
             cpu_usage_usec: 0,
             memory_working_set_bytes: 1000,
             covered: vec![worker::LeaseId { term: 1, seq: 1 }],
@@ -153,7 +158,28 @@ async fn a_lease_is_covered_from_the_second_reading_and_leaves_with_its_peak() {
             memory_active_file_bytes: 7,
         }
     );
-    assert!(sent.mono_usec > second.mono_usec);
+    assert!(sent.load.mono_usec > second.mono_usec);
+
+    // The lease's start is the clock when `crun run` was spawned: before the first reading
+    // that held it, and the same at every reading. Its cpu is what its `cpu.stat` said at
+    // each reading, and its working set 3000 - 1000.
+    let started = first
+        .leases
+        .first()
+        .expect("the first reading names the lease")
+        .started_usec;
+    assert!(started <= first.mono_usec);
+    let lease_at = |cpu_usage_usec| LeaseReading {
+        lease,
+        started_usec: started,
+        usage: Some(LeaseUsage {
+            cpu_usage_usec,
+            working_set_bytes: 2000,
+        }),
+    };
+    assert_eq!(first.leases, [lease_at(0)]);
+    assert_eq!(second.leases, [lease_at(5_000_000)]);
+    assert_eq!(sent.leases, [lease_at(5_000_000)]);
 
     let after = runtime.node_load().await.expect("a reading after the run");
     assert!(

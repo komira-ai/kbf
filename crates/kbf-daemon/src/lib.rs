@@ -127,7 +127,8 @@ pub use plane::{
 pub use remote_index::RemoteIndex;
 pub use report::{Capacity, NodeReport};
 pub use runtime::{
-    FakeRuntime, NodeLoadError, Runtime, RuntimeError, UPLOAD_DEADLINE, Work, upload_within,
+    FakeRuntime, LeaseReading, LeaseUsage, NodeLoadError, NodeReading, Runtime, RuntimeError,
+    UPLOAD_DEADLINE, Work, upload_within,
 };
 pub use runtimes::{KindServedTwice, Runtimes};
 pub use status::DriverReport;
