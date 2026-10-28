@@ -367,6 +367,7 @@ pub(super) fn submission(tag: u8) -> Submission {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     }
 }
 
@@ -409,6 +410,7 @@ pub(super) fn submit_recorded(
         call: Some(call),
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     };
     dispatch::submit(
         &rig.core,
