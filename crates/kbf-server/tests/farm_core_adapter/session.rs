@@ -239,6 +239,7 @@ impl Session {
             call: None,
             described,
             evidence: Default::default(),
+            max_wall: None,
         };
         match dispatch::submit(self.core(), self.now(), &self.shapes, submission) {
             Ok(ticket) => {
