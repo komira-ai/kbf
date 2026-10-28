@@ -45,6 +45,34 @@ pub fn config(
         .with_load_config(placement.config())
 }
 
+/// The core's configuration for a farm of scheduler term `term` and `settings`: [`config`],
+/// with the memory ladder and floors, the loss requeues, the whole-node drain and caps
+/// (`--whole-node-max`) if they are set, and the wait of the orphan sweep, as
+/// [`Farm::new`](crate::farm::Farm::new) and its builders give the farm's own scheduler.
+#[cfg(feature = "farm-core-js")]
+#[must_use]
+pub(crate) fn farm_config(
+    term: u64,
+    unservable_wait: Duration,
+    finished_retention: Duration,
+    settings: &crate::farm::Settings,
+) -> Config {
+    let config = self::config(
+        term,
+        unservable_wait,
+        finished_retention,
+        settings.placement_load,
+    )
+    .with_memory_ladder(settings.ladder.clone())
+    .with_memory_floors(settings.floors)
+    .with_loss_requeues(kbf_sched::LOSS_REQUEUES)
+    .with_orphan_wait(settings.orphan_wait);
+    match &settings.whole_node {
+        Some(whole) => config.with_whole_node(whole.clone()),
+        None => config,
+    }
+}
+
 /// The state store `store` as the core keeps its rows in it, and what a start does with the
 /// store's epoch.
 #[must_use]
