@@ -57,6 +57,8 @@ mod core;
 pub mod cpu_pool;
 mod daemon;
 pub mod driver_watch;
+mod extras;
+mod kbf_extras;
 pub mod keeper;
 mod lease;
 mod lease_panic;
@@ -91,7 +93,7 @@ mod window;
 /// checkout (issue #170). `build.rs` embeds the commit.
 pub const DAEMON_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT"));
 
-pub use crate::core::{Event, superseded};
+pub use crate::core::{Event, LeaseCore, superseded};
 pub use cas::{Cas, CasError};
 pub use clock::{Clock, Moment, SystemClock};
 pub use config::{
@@ -101,6 +103,8 @@ pub use contact::{Acked, Contact};
 pub use cpu_pool::CpuPool;
 pub use daemon::{Daemon, PROTOCOL_VERSION, SessionError};
 pub use driver_watch::{DriverPart, DriverWatch};
+pub use extras::{ExtraWake, NoExtras, SessionExtras};
+pub use kbf_extras::KbfExtras;
 pub use kbf_mapsync::MapHolder;
 pub use kbf_route::{DEFAULT_HOLD, Liveness};
 #[cfg(target_os = "linux")]

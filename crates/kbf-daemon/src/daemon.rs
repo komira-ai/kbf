@@ -82,9 +82,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
-use kbf_proto::kbf::map::v1 as wire;
 use kbf_proto::worker::{
-    self, DaemonMessage, Heartbeat, Hello, PackWriteCounts, Phase, ServerMessage, daemon_message,
+    self, DaemonMessage, Heartbeat, Hello, Phase, ServerMessage, Welcome, daemon_message,
     server_message, worker_client::WorkerClient,
 };
 use kbf_types::NodePhase;
@@ -99,13 +98,11 @@ use crate::connect::{
     rotate_after, unit_random,
 };
 use crate::core::{Event, LeaseCore, send};
+use crate::extras::{ExtraWake, SessionExtras};
+use crate::kbf_extras::KbfExtras;
 use crate::lease::{Done, Leases, lease_id, proto_lease_id};
-use crate::map::{MapLink, map_asked};
-use crate::packed::{PackCommit, PackCounter};
-use crate::pressure;
 use crate::report::NodeReport;
 use crate::runtimes::Runtimes;
-use crate::status::{DriverReport, Software};
 use crate::welcome;
 
 /// The `kbf.worker.v1` protocol version this daemon speaks.
@@ -153,7 +150,9 @@ impl SessionError {
 }
 
 /// A daemon: configuration, runtimes, node report and the state that outlives streams.
-pub struct Daemon {
+/// `X` answers the hooks of its session that name more than leases ([`SessionExtras`]);
+/// the default is a kbf node's.
+pub struct Daemon<X = KbfExtras> {
     config: DaemonConfig,
     /// The `--server` URLs, parsed.
     servers: Vec<Server>,
@@ -166,25 +165,6 @@ pub struct Daemon {
     base: NodeReport,
     /// What Hello carries and heartbeats hash: `base` plus the driver's newest entries.
     report: NodeReport,
-    /// What `NodeStatus` says about the operating system.
-    software: Software,
-    /// The driver's newest report, if it sends any; see [`Self::with_driver_report`].
-    driver: Option<watch::Receiver<DriverReport>>,
-    /// Every Xcode the driver's newest report names, ready or not.
-    xcodes: Vec<worker::XcodeStatus>,
-    /// The container images `NodeStatus` lists; see [`Self::with_container_images`].
-    container_images: Vec<String>,
-    /// The runtime's phase, if one reports it; see [`Self::with_phase`].
-    phase: Option<watch::Receiver<NodePhase>>,
-    /// The newest phase taken from it.
-    phase_now: NodePhase,
-    /// The memory backstop, if one is set; see [`Self::with_memory_backstop`]. Every
-    /// Hello carries `phase_now`, or [`NodePhase::MemoryPressure`] in its place while
-    /// the node is serving and the backstop has paused it.
-    pressure: Option<Backstop>,
-    /// Where the storage map of `Welcome` and `MapUpdate` goes, if the daemon routes by
-    /// one; see [`Self::with_map`].
-    map: Option<MapLink>,
     /// Whether the drain has begun, as [`Self::run_draining`] sets it; `None` for a
     /// daemon run by [`Self::run`], which never drains.
     drain: Option<watch::Receiver<bool>>,
@@ -194,25 +174,13 @@ pub struct Daemon {
     core: LeaseCore,
     /// Where the runs of `core`'s leases report their end.
     done: mpsc::UnboundedReceiver<Done>,
-    /// The counts of the pack reads of the data plane, if it reads packs; see
-    /// [`Self::with_pack_reads`].
-    pack_reads: Option<PackCounter>,
-    /// The handle the frontend's Welcome turns pack writes on and off with, if the data plane
-    /// writes packs; see [`Self::with_pack_writes`].
-    pack_commit: Option<PackCommit>,
+    /// What the node adds to the lease protocol.
+    pub(crate) extras: X,
     /// This daemon process's `Hello.instance_id`, the same on every stream it opens.
     instance: String,
     /// `Hello.predecessor_instance_id`: the daemon process whose runs this one's drivers
     /// killed before it started; empty when none is known.
     predecessor: String,
-}
-
-/// The memory backstop: the sampled pressure, the percentage above which a node that
-/// runs leases takes no more, and whether it is paused now.
-struct Backstop {
-    stall: watch::Receiver<Option<f64>>,
-    above: f64,
-    paused: bool,
 }
 
 /// What woke the session loop.
@@ -221,17 +189,14 @@ enum Wake {
     Beat,
     Done(Box<Done>),
     Recheck,
-    Driver,
-    Phase,
-    Pressure,
-    MapAsked,
+    Extra(ExtraWake),
     Drain,
 }
 
-impl Daemon {
+impl Daemon<KbfExtras> {
     /// A daemon that will connect as `config` says. Reads the TLS files now, so a
     /// missing or unreadable file fails here rather than on the first connection, and
-    /// detects the node's software ([`Software::detect`]).
+    /// detects the node's software ([`crate::status::Software::detect`]).
     ///
     /// A Start runs on the runtime of `runtimes` that serves its kind (one runtime, an
     /// `Arc<R>`, converts). The node report is `report` with a `drivers` entry for every
@@ -240,6 +205,18 @@ impl Daemon {
         config: DaemonConfig,
         runtimes: impl Into<Runtimes>,
         report: NodeReport,
+    ) -> Result<Self, ConfigError> {
+        Self::with_extras(config, runtimes, report, KbfExtras::detect())
+    }
+}
+
+impl<X: SessionExtras> Daemon<X> {
+    /// [`Daemon::new`] for a node whose session hooks are `extras`.
+    pub fn with_extras(
+        config: DaemonConfig,
+        runtimes: impl Into<Runtimes>,
+        report: NodeReport,
+        extras: X,
     ) -> Result<Self, ConfigError> {
         let runtimes = runtimes.into();
         let drivers = runtimes.drivers().into_iter().map(|d| ("drivers", d));
@@ -270,77 +247,14 @@ impl Daemon {
             welcomed: false,
             base: report.clone(),
             report,
-            software: Software::detect(),
-            driver: None,
-            xcodes: Vec::new(),
-            container_images: Vec::new(),
-            phase: None,
-            phase_now: NodePhase::Serving,
-            pressure: None,
-            map: None,
             drain: None,
             drained: Arc::new(Notify::new()),
             core,
             done,
-            pack_reads: None,
-            pack_commit: None,
+            extras,
             instance: instance_id(),
             predecessor: String::new(),
         })
-    }
-
-    /// Puts the storage map the server sends (in `Welcome`, and in each `MapUpdate`) in
-    /// `holder`, which keeps the newest and never goes back, and asks the server for a
-    /// map when the holder is waiting for a generation it does not have
-    /// ([`kbf_mapsync::MapHolder::reach`]). Without one the daemon ignores the map.
-    #[must_use]
-    pub fn with_map(mut self, holder: Arc<kbf_mapsync::MapHolder>) -> Self {
-        self.map = Some(MapLink::new(holder));
-        self
-    }
-
-    /// Puts the counts of the pack reads `counter` holds in every Heartbeat
-    /// (`Heartbeat.pack_reads`), as they stand when it is sent: the totals since this
-    /// process started, which the server shows per node. Without it a Heartbeat carries
-    /// none, as before the field existed.
-    #[must_use]
-    pub fn with_pack_reads(mut self, counter: PackCounter) -> Self {
-        self.pack_reads = Some(counter);
-        self
-    }
-
-    /// Sets `commit` from every Welcome (`Welcome.pack_commit`): the data plane that writes packs
-    /// ([`crate::PackedCas::with_writes`], given the same handle) writes them only while the
-    /// frontend says it takes commits. Given the counter of [`Self::with_pack_reads`] too, the
-    /// daemon also puts the counts of its pack writes in every Heartbeat
-    /// (`Heartbeat.pack_writes`). Without it a Welcome sets nothing and a Heartbeat carries no
-    /// write counts.
-    #[must_use]
-    pub fn with_pack_writes(mut self, commit: PackCommit) -> Self {
-        self.pack_commit = Some(commit);
-        self
-    }
-
-    /// The counter [`Self::with_pack_reads`] was given; `None` for a daemon whose
-    /// Heartbeats carry no counts.
-    #[must_use]
-    pub const fn pack_reads(&self) -> Option<&PackCounter> {
-        self.pack_reads.as_ref()
-    }
-
-    /// The counts of the pack writes for a Heartbeat: those of the counter
-    /// [`Self::with_pack_reads`] was given, and only for a daemon that also writes packs
-    /// ([`Self::with_pack_writes`]).
-    fn pack_writes_counted(&self) -> Option<PackWriteCounts> {
-        self.pack_commit.as_ref()?;
-        self.pack_reads.as_ref().map(|c| c.stats().writes.into())
-    }
-
-    /// The handle [`Self::with_pack_writes`] was given; `None` for a daemon that sets none from
-    /// its Welcomes.
-    #[must_use]
-    pub const fn pack_writes(&self) -> Option<&PackCommit> {
-        self.pack_commit.as_ref()
     }
 
     /// This daemon process's instance id (`Hello.instance_id`), drawn when it was built.
@@ -366,97 +280,27 @@ impl Daemon {
         self
     }
 
-    /// Adds `driver`'s entries to the report and its Xcodes to `NodeStatus`, now and
-    /// each time it changes (see the module documentation).
-    #[must_use]
-    pub fn with_driver_report(mut self, driver: watch::Receiver<DriverReport>) -> Self {
-        self.driver = Some(driver);
-        self.take_driver_report();
-        self
-    }
-
     /// Takes the driver's newest report, if it sends any; returns whether the node
     /// report changed.
-    fn take_driver_report(&mut self) -> bool {
-        let Some(driver) = &mut self.driver else {
-            return false;
-        };
-        let newest = driver.borrow_and_update().clone();
-        let report = self.base.clone().with_entries(newest.entries);
-        self.xcodes = newest.xcodes;
-        let changed = report != self.report;
-        self.report = report;
-        changed
-    }
-
-    /// Sends `phase`'s value in every Hello, and resends the Hello on the stream each
-    /// time it changes (see the module documentation).
-    #[must_use]
-    pub fn with_phase(mut self, phase: watch::Receiver<NodePhase>) -> Self {
-        self.phase = Some(phase);
-        self.take_phase();
-        self
+    pub(crate) fn take_driver(&mut self) -> bool {
+        self.extras.take_driver(&self.base, &mut self.report)
     }
 
     /// Takes the runtime's newest phase, if it reports one; returns whether it changed.
-    fn take_phase(&mut self) -> bool {
-        let Some(phase) = &mut self.phase else {
-            return false;
-        };
-        let newest = phase.borrow_and_update().clone();
-        let changed = newest != self.phase_now;
-        self.phase_now = newest;
-        changed
+    pub(crate) fn take_phase(&mut self) -> bool {
+        self.extras.take_phase()
     }
 
-    /// Stops taking new leases while `stall`, the node's memory stall time as a
-    /// percentage ([`crate::pressure::watch`]), is above `above` and a lease runs: the
-    /// Hello says [`NodePhase::MemoryPressure`] then, and resends when it changes (see
-    /// [`crate::pressure`]). Leases already running are not touched. A runtime's own
-    /// phase (a session switch, a quarantine) takes the place of this one.
-    #[must_use]
-    pub fn with_memory_backstop(mut self, stall: watch::Receiver<Option<f64>>, above: f64) -> Self {
-        self.pressure = Some(Backstop {
-            stall,
-            above,
-            paused: false,
-        });
-        self.take_pressure();
-        self
-    }
-
-    /// The percentage of memory stall time above which the backstop pauses this node
-    /// while it runs a lease; `None` without one ([`Self::with_memory_backstop`]).
-    #[must_use]
-    pub fn memory_backstop(&self) -> Option<f64> {
-        self.pressure.as_ref().map(|backstop| backstop.above)
-    }
-
-    /// The phase every Hello carries: the runtime's, or memory pressure in place of
-    /// serving while the backstop has the node paused.
+    /// The phase every Hello carries.
     fn phase(&self) -> NodePhase {
-        if self.core.draining && self.phase_now == NodePhase::Serving {
-            return NodePhase::Draining;
-        }
-        match &self.pressure {
-            Some(backstop) if backstop.paused && self.phase_now == NodePhase::Serving => {
-                NodePhase::MemoryPressure
-            }
-            _ => self.phase_now.clone(),
-        }
+        self.extras.hello_phase(self.core.draining)
     }
 
     /// Takes the newest pressure reading and the number of leases running; returns
     /// whether the phase a Hello carries changed.
-    fn take_pressure(&mut self) -> bool {
+    pub(crate) fn take_pressure(&mut self) -> bool {
         let leases = self.core.leases.running().len();
-        let before = self.phase();
-        let Some(backstop) = &mut self.pressure else {
-            return false;
-        };
-        let stall = *backstop.stall.borrow_and_update();
-        backstop.paused = pressure::paused(stall, backstop.above, leases);
-        self.phase() != before
+        self.extras.take_pressure(leases, self.core.draining)
     }
 
     /// Takes the drain's newest state; returns whether the phase a Hello carries
@@ -490,24 +334,10 @@ impl Daemon {
         self.check_drained();
     }
 
-    /// Lists `images` in every `NodeStatus`, sorted and each once: the container
-    /// images the driver checked present at start. Status only; they route no work.
-    #[must_use]
-    pub fn with_container_images(mut self, images: impl IntoIterator<Item = String>) -> Self {
-        let images: std::collections::BTreeSet<String> = images.into_iter().collect();
-        self.container_images = images.into_iter().collect();
-        self
-    }
-
-    /// The `NodeStatus` this node sends now: its software, every Xcode the driver's
-    /// newest report names, ready or not, and the container images it was given.
+    /// The `NodeStatus` this node sends now.
     #[must_use]
     pub fn node_status(&self) -> worker::NodeStatus {
-        worker::NodeStatus {
-            xcodes: self.xcodes.clone(),
-            container_images: self.container_images.clone(),
-            ..self.software.status(&self.report)
-        }
+        self.extras.node_status(&self.report)
     }
 
     /// Resolves server names with `resolver` instead of the operating system's. A test
@@ -664,7 +494,7 @@ impl Daemon {
         let mut client = WorkerClient::new(channel);
         let (tx, rx) = unbounded();
         // A change that arrived while no stream was up.
-        self.take_driver_report();
+        self.take_driver();
         self.take_phase();
         self.take_pressure();
         self.take_drain();
@@ -682,7 +512,7 @@ impl Daemon {
             .offline(timeout(wait, inbound.message()))
             .await
             .map_err(|_| SessionError::WelcomeTimeout(wait))??;
-        let (interval, epoch, map) = self.welcome(first)?;
+        let (interval, epoch, welcome) = self.welcome(first)?;
         self.welcomed = true;
         self.core.contact.new_stream(interval);
         self.core.window.new_stream(hello_sent);
@@ -692,7 +522,7 @@ impl Daemon {
         self.core.recheck();
         // Before any Result is resent or any Start of this stream is read.
         self.new_epoch(epoch);
-        self.new_map_stream(map);
+        self.extras.on_welcome(welcome);
         if self.core.contact.confirm(hello_sent) {
             self.core.emit(Event::ContactRestored);
         }
@@ -723,10 +553,7 @@ impl Daemon {
                 _ = beat.tick() => Wake::Beat,
                 Some(done) = self.done.recv() => Wake::Done(Box::new(done)),
                 () = sleep(wait) => Wake::Recheck,
-                Some(()) = driver_changed(self.driver.as_mut()) => Wake::Driver,
-                Some(()) = phase_changed(self.phase.as_mut()) => Wake::Phase,
-                Some(()) = pressure_changed(self.pressure.as_mut()) => Wake::Pressure,
-                () = map_asked(self.map.as_mut()) => Wake::MapAsked,
+                extra = self.extras.wake() => Wake::Extra(extra),
                 Some(()) = drain_changed(self.drain.as_mut()) => Wake::Drain,
             };
             // First, whatever woke the loop: the clock may have jumped over a suspend.
@@ -744,58 +571,40 @@ impl Daemon {
                     let now = self.core.clock.now();
                     self.core.contact.sent(seq, now);
                     self.core.window.sent(seq, now);
-                    let heartbeat = Heartbeat {
+                    let mut heartbeat = Heartbeat {
                         seq,
                         report_hash: self.report.hash().to_vec(),
                         running: self.core.listed().into_iter().map(proto_lease_id).collect(),
-                        pack_reads: self.pack_reads.as_ref().map(|c| c.stats().into()),
-                        pack_writes: self.pack_writes_counted(),
+                        ..Heartbeat::default()
                     };
+                    self.extras.heartbeat_fields(&mut heartbeat);
                     send(&tx, daemon_message::Message::Heartbeat(heartbeat));
                 }
                 Wake::Done(done) => self.core.finished(Some(&tx), *done),
                 Wake::Recheck => {}
-                Wake::Driver => {
-                    if self.take_driver_report() {
+                Wake::Extra(ExtraWake::Driver) => {
+                    if self.take_driver() {
                         send(&tx, daemon_message::Message::Hello(self.hello()));
                     }
                     send(&tx, daemon_message::Message::NodeStatus(self.node_status()));
                 }
-                Wake::Phase => {
+                Wake::Extra(ExtraWake::Phase) => {
                     if self.take_phase() {
                         tracing::info!(phase = self.phase().name(), "node phase changed");
                         send(&tx, daemon_message::Message::Hello(self.hello()));
                     }
                 }
-                // The request for a map is sent below, whatever woke the loop.
-                Wake::Pressure | Wake::MapAsked | Wake::Drain => {}
+                // The pressure is taken below, and the request for a map is sent by
+                // `after_wake`, whatever woke the loop.
+                Wake::Extra(ExtraWake::Pressure | ExtraWake::MapAsked) | Wake::Drain => {}
             }
-            self.ask_map(&tx);
+            self.extras.after_wake(&tx);
             self.settle_drain(&tx);
             // Whatever woke the loop, leases may have started or ended.
             if self.take_pressure() {
                 tracing::info!(phase = self.phase().name(), "node phase changed");
                 send(&tx, daemon_message::Message::Hello(self.hello()));
             }
-        }
-    }
-
-    /// Takes the map a `Welcome` carried, the first of a new stream: the generation the
-    /// holder waits for is asked for again on this stream, by [`Self::ask_map`]. These are
-    /// methods rather than code in [`Self::session`] so that none of it is conditional
-    /// there (the session is compiled once for each test binary, and the coverage tool
-    /// counts the lines of the copy that covers most).
-    fn new_map_stream(&mut self, map: Option<wire::Map>) {
-        if let Some(link) = self.map.as_mut() {
-            link.new_stream();
-            link.take(map);
-        }
-    }
-
-    /// Sends the `MapRequest` for a generation the holder waits for, once on a stream.
-    fn ask_map(&mut self, tx: &UnboundedSender<DaemonMessage>) {
-        if let Some(request) = self.map.as_mut().and_then(MapLink::request) {
-            send(tx, daemon_message::Message::MapRequest(request));
         }
     }
 
@@ -812,11 +621,11 @@ impl Daemon {
     }
 
     /// Checks the first server message is an acceptable Welcome; returns its interval,
-    /// the lease epoch it names (`None` for 0) and the storage map it carries.
+    /// the lease epoch it names (`None` for 0) and the Welcome itself.
     fn welcome(
         &self,
         first: Option<ServerMessage>,
-    ) -> Result<(Duration, Option<u64>, Option<wire::Map>), SessionError> {
+    ) -> Result<(Duration, Option<u64>, Welcome), SessionError> {
         let Some(server_message::Message::Welcome(w)) = first.and_then(|m| m.message) else {
             return Err(SessionError::Protocol(
                 "the first server message is not Welcome".into(),
@@ -842,28 +651,22 @@ impl Daemon {
                 self.core.contact.fence_after()
             )));
         }
-        if let Some(commit) = &self.pack_commit {
-            commit.welcomed(w.pack_commit);
-        }
-        Ok((interval, (w.epoch != 0).then_some(w.epoch), w.map))
+        Ok((interval, (w.epoch != 0).then_some(w.epoch), w))
     }
 
-    /// Takes the lease epoch a Welcome named. When it names one, every lease granted
-    /// under another is dropped: its run is killed and its Result forgotten, unsent
-    /// (issue #137). A Welcome that names none drops nothing, and a lease granted while
-    /// none was named is kept.
+    /// Takes the lease epoch a Welcome named: the node's hook first, then the core's
+    /// (see [`LeaseCore::new_epoch`]).
     fn new_epoch(&mut self, epoch: Option<u64>) {
-        if let Some(lease) = self.phase_now.switching()
-            && epoch.is_some_and(|epoch| epoch != lease.term)
-        {
-            // The server that granted it is gone: no Start for it will come again.
-            tracing::warn!(%lease, ?epoch, "the switching lease is of an earlier epoch");
-            self.core.leases.forget(lease);
-        }
+        self.extras.epoch_changed(epoch, &mut self.core);
         self.core.new_epoch(epoch);
     }
 
     fn on_message(&mut self, msg: ServerMessage, tx: &UnboundedSender<DaemonMessage>) {
+        if let Some(message) = &msg.message
+            && self.extras.on_server_message(message)
+        {
+            return;
+        }
         match msg.message {
             Some(server_message::Message::HeartbeatAck(ack)) => self.core.on_heartbeat_ack(ack.seq),
             Some(server_message::Message::LeaseOffer(offer)) => {
@@ -878,15 +681,13 @@ impl Daemon {
             Some(server_message::Message::Welcome(_)) => {
                 tracing::warn!("a second Welcome on one stream ignored");
             }
-            Some(server_message::Message::MapUpdate(update)) => {
-                if let Some(link) = &self.map {
-                    link.take(update.map);
-                }
-            }
+            // A map is the node's (`on_server_message`); a node that takes none ignores it.
             // A frontend that still offers or orders an update is answered with nothing:
             // updates are installed from packages, not over this session.
             Some(
-                server_message::Message::UpdateOffer(_) | server_message::Message::UpdateOrder(_),
+                server_message::Message::MapUpdate(_)
+                | server_message::Message::UpdateOffer(_)
+                | server_message::Message::UpdateOrder(_),
             ) => {}
             None => tracing::warn!("an empty server message ignored"),
         }
@@ -943,27 +744,10 @@ fn instance_id() -> String {
     format!("{:016x}{:016x}", half(), half())
 }
 
-/// Completes when `driver` has a report the daemon has not taken; never when there is
-/// no driver channel, or its sender is gone (`None` then disables the select arm).
-async fn driver_changed(driver: Option<&mut watch::Receiver<DriverReport>>) -> Option<()> {
-    driver?.changed().await.ok()
-}
-
 /// Completes when the drain has a state the daemon has not taken; never for a daemon
 /// that does not drain, or once its sender is gone.
 async fn drain_changed(drain: Option<&mut watch::Receiver<bool>>) -> Option<()> {
     drain?.changed().await.ok()
-}
-
-/// Completes when `phase` has a value the daemon has not taken; never without one.
-async fn phase_changed(phase: Option<&mut watch::Receiver<NodePhase>>) -> Option<()> {
-    phase?.changed().await.ok()
-}
-
-/// Completes when the memory backstop has a reading the daemon has not taken; never
-/// without one.
-async fn pressure_changed(backstop: Option<&mut Backstop>) -> Option<()> {
-    backstop?.stall.changed().await.ok()
 }
 
 /// `phase` as Hello carries it: absent for serving, as a daemon that predates the
