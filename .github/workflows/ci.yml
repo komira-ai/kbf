@@ -286,6 +286,58 @@ jobs:
           name: coverage
           path: target/coverage/lcov.info
           if-no-files-found: error
+      # The fast tests on the js scheduler core. kbf-server's test-only `farm-core-js` feature makes
+      # `SchedulerCore::under_test()` return the js core, so every farm test of the packages that
+      # reach it runs on it. Four packages link kbf-server code: kbf-server, kbf-integration-test,
+      # kbf-daemon, kbf-node. kbf-front has no kbf-server dependency (the feature does nothing
+      # there) and kbf-farm-test links none (it spawns the release binary; the `pr` profile
+      # excludes it), so neither is selected. `tierstore/s3` is left out: no selected package
+      # depends on tierstore, and its tests ran above. The `pr` profile excludes only the slow
+      # tests and the two black-box packages, so it drops nothing this run needs. This run is
+      # part of the job, so a failing js test fails the required `test` check.
+      #
+      # It runs AFTER the legacy report and gate above, which read every profile in
+      # target/llvm-cov-target: the legacy gate stays exactly the legacy numbers.
+      #
+      # Disk. Both runs share target/llvm-cov-target. The feature changes the build of kbf-server
+      # and of what depends on it; every other crate, tierstore and all dependencies are reused
+      # from the first run. The second run adds the rebuilt crates, those four packages' test
+      # binaries and its profiles: a fraction of the 59 GB workspace build, not a second one. It
+      # is not measured yet, so the next step refuses early below the room it is expected to need
+      # (25 GiB, over the 5% free-space floor of the file store) and the disk reports after say
+      # how much it took. A separate job would build the whole instrumented workspace again.
+      - name: Refuse early when the disk is short for the js run (25 GiB free)
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --path . --min-free-gb 25
+      - name: Run the fast tests on the js core under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest -p kbf-server -p kbf-integration-test -p kbf-daemon -p kbf-node --features kbf-server/farm-core-js --locked --branch --no-report --no-fail-fast --profile pr
+      - name: Free disk after the js run (report)
+        if: ${{ always() }}
+        run: df -h /
+      # REPORT ONLY until the flip PR (W): one llvm-cov report over the legacy and the js run,
+      # then the kbf-coverage table on it. The lines under cfg(feature = "farm-core-js") exist
+      # only in the js build; llvm-cov merges the profiles of every binary, so each line counts
+      # once with the hits of both runs. It must be ONE report (kbf-coverage refuses an lcov that
+      # names a source file twice). Until the js arms are filled in, their todo!() bodies are
+      # uncovered, so the merged numbers can sit under 99%: they are shown, not enforced. W
+      # removes `continue-on-error` and the legacy-only gate above, making this the gate.
+      - name: Merged legacy+js report (not a gate until the flip)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov report --branch --lcov --output-path target/coverage/lcov-merged.info
+      - name: Merged per-crate table (not a gate until the flip)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- --lcov target/coverage/lcov-merged.info --root "$GITHUB_WORKSPACE" --floors coverage-floors
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: coverage-merged
+          path: target/coverage/lcov-merged.info
+          if-no-files-found: ignore
       # and the cache it saves holds none of this run's workspace coverage artifacts either
       - if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
