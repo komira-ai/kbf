@@ -181,6 +181,28 @@ fn a_directory_of_cgroup_files_is_one_reading() {
     );
 }
 
+/// Catches the clock read before `cpu.stat` or after the memory files: each call of the
+/// clock changes the files to what a later instant would hold, so the reading holds the
+/// `cpu.stat` of before the call and the `memory.current` of after it.
+#[test]
+fn the_clock_is_read_right_after_cpu_stat() {
+    let dir = cgroup("load-clock-order");
+    usage(&dir, 1);
+    write(&dir, "memory.current", "1000\n");
+    write(&dir, "memory.stat", "inactive_file 0\n");
+    let moved = dir.to_path_buf();
+    let ticking: MonoClock = Arc::new(move || {
+        usage(&moved, 2);
+        write(&moved, "memory.current", "5000\n");
+        10
+    });
+    let load = read_load(&dir, &*ticking).expect("reading");
+    assert_eq!(
+        (load.mono_usec, load.cpu_usage_usec, load.working_set_bytes),
+        (10, 1, 5000)
+    );
+}
+
 /// Catches a working set that wraps to a huge number when the inactive file memory is more
 /// than the cgroup holds (the two files are read at different instants).
 #[test]
