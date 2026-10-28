@@ -40,8 +40,7 @@ pub enum SetError {
     /// The state file could not be written.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// The services file's `ci_services` does not name this service, so CI's token may
-    /// not set it.
+    /// The allow-list entry that admitted the token does not name this service.
     #[error("the token may not set this service")]
     Forbidden,
 }
@@ -232,17 +231,23 @@ impl Coordinator {
         body: &[u8],
     ) -> Result<Desired, SetError> {
         let verified = self.ci(bearer).await?;
-        tracing::info!(
-            workflow = %verified.job_workflow_ref,
-            sha = ?verified.sha,
-            "desired state set by CI"
-        );
         let (service, desired) =
             Desired::parse_request_for(body, |name| self.services.get(name).is_some())?;
-        if !self.services.ci_may_set(&service) {
+        if !verified.services.contains(&service) {
+            tracing::warn!(
+                workflow = %verified.job_workflow_ref,
+                %service,
+                "refused a desired state: the allow-list entry does not name the service"
+            );
             return Err(SetError::Forbidden);
         }
         self.desired.set(&service, desired.clone())?;
+        tracing::info!(
+            workflow = %verified.job_workflow_ref,
+            sha = ?verified.sha,
+            %service,
+            "desired state set by CI"
+        );
         Ok(desired)
     }
 
