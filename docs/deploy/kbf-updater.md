@@ -355,7 +355,7 @@ farm by the old one.
 `GET /v1/status` and `GET /v1/convergence` say which build answers, as `commit`: the 12 digits
 `kbf-coordinator --version` shows after the `+`. A coordinator built before this field, or
 without a git checkout (`unknown`), says none. With `--require-coordinator-current`
-(`KBF_REQUIRE_COORDINATOR_CURRENT=true` in the release workflow), `deploy-farm` reads that
+(`KBF_REQUIRE_COORDINATOR_CURRENT=true` in the release workflow, passed as the flag's value), `deploy-farm` reads that
 commit before it sets anything and fails when it is not the release's:
 
 ```text

@@ -147,8 +147,24 @@ pub struct Args {
     /// release's. Use it for a release that changes the coordinator or the wire between it
     /// and the hosts: the coordinator must be updated first
     /// (`docs/deploy/kbf-updater.md`, "Updating the coordinator").
-    #[arg(long)]
+    ///
+    /// Bare, or `true`, turns it on; `false` or empty (an unset workflow variable) leaves it off.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = parse_switch
+    )]
     pub require_coordinator_current: bool,
+}
+
+/// A switch given as text: `true` is on; `false` and the empty text are off.
+fn parse_switch(text: &str) -> Result<bool, String> {
+    match text {
+        "true" => Ok(true),
+        "" | "false" => Ok(false),
+        other => Err(format!("expected `true` or `false`, got `{other}`")),
+    }
 }
 
 /// Why the deploy did not end converged.

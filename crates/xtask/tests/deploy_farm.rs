@@ -1326,4 +1326,31 @@ fn the_flag_turns_the_requirement_on_and_is_off_by_default() {
         "--require-coordinator-current",
     ]);
     assert!(Plan::of(&on.args).require_coordinator_current);
+    // The workflow passes the variable's text: `true` is on; empty (unset) and `false` are off.
+    for (text, want) in [("true", true), ("false", false), ("", false)] {
+        let cli = Cli::parse_from([
+            "x",
+            "--url",
+            &fake.base,
+            "--version",
+            "2.0.0+g000000000002",
+            "--require-coordinator-current",
+            text,
+        ]);
+        assert_eq!(
+            Plan::of(&cli.args).require_coordinator_current,
+            want,
+            "{text:?}"
+        );
+    }
+    let bad = Cli::try_parse_from([
+        "x",
+        "--url",
+        &fake.base,
+        "--version",
+        "2.0.0+g000000000002",
+        "--require-coordinator-current",
+        "yes",
+    ]);
+    assert!(bad.is_err());
 }
