@@ -1289,12 +1289,13 @@ fn kbf_sends_the_request_it_always_sent() {
 
 #[test]
 fn a_service_name_the_coordinator_would_refuse_is_refused_before_any_call() {
-    // Proves: an empty name, upper case, a slash, a query character and a space are refused
-    // by the client, so the name can go in the query unescaped, and nothing is sent; and
-    // only kbf's version has to be of kbf's form.
+    // Proves: an empty name, upper case, a slash, a query character, a space and a name over
+    // the coordinator's 64 bytes are refused by the client, so the name can go in the query
+    // unescaped, and nothing is sent; and only kbf's version has to be of kbf's form.
     let fake = serve(Script::new(vec![]));
     let ca = [fake.ca.clone()];
-    for name in ["", "JS", "a/b", "a&b", "a b", "a_b"] {
+    let long = "a".repeat(65);
+    for name in ["", "JS", "a/b", "a&b", "a b", "a_b", long.as_str()] {
         let args = service_args(&fake, name, "7");
         let refused = run_with(&args, &fake.service(), &ca, &mut Vec::new());
         let Err(xtask::Error::Failed(why)) = refused else {

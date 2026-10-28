@@ -115,10 +115,15 @@ const CONVERGENCE_PATH: &str = "/v1/convergence";
 /// The service the coordinator runs of its own: the default of `--service`.
 const KBF: &str = "kbf";
 
+/// The most bytes of a service name, as the coordinator's wire says (`MAX_SERVICE_NAME` of
+/// `kbf_updater::wire`, which xtask does not depend on).
+const MAX_SERVICE_NAME: usize = 64;
+
 /// Whether `name` is a service name the coordinator accepts: lowercase letters, digits and
-/// `-`, at least one.
+/// `-`, 1 to [`MAX_SERVICE_NAME`] bytes (`kbf_updater::wire::is_service_name`).
 fn service_name_ok(name: &str) -> bool {
     !name.is_empty()
+        && name.len() <= MAX_SERVICE_NAME
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
@@ -210,7 +215,7 @@ pub enum Error {
         "{TOKEN_URL_VAR} or {TOKEN_KEY_VAR} is not set: the job needs `permissions: id-token: write`"
     )]
     NoTokenService,
-    #[error("--service {0:?} is not a service name: lowercase letters, digits and -")]
+    #[error("--service {0:?} is not a service name: 1 to 64 lowercase letters, digits and -")]
     Service(String),
     #[error("--ca-pem holds no certificate")]
     Ca,
