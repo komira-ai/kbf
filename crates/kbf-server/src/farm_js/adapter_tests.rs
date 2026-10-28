@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use js_server_core::{Adapter as _, Stage as CoreStage};
 use js_store::Ending;
-use kbf_front::{Described, Finished, Stage};
+use kbf_front::{Described, Stage};
 use kbf_sched::NodePhase;
 use kbf_types::{
     ActionKey, Answer, Effect, Failure, FarmTime, LeaseId, OperationId, Outcome, Refusal, WaiterId,
@@ -341,10 +341,9 @@ fn callers_are_shown_a_stage_once() {
 }
 
 /// What an unreadable `done/` row is shown as: UNAVAILABLE, which clients retry.
-fn is_unreadable_result(stage: &Stage) -> bool {
-    matches!(stage, Stage::Done(Finished::Failed(status))
-        if status.code == Code::Unavailable as i32
-            && status.message == "the stored result of this operation cannot be read")
+fn unreadable_result_stage() -> Stage {
+    let message = "the stored result of this operation cannot be read";
+    Stage::Done(failed(Code::Unavailable, message))
 }
 
 /// Asserts that a `done/` row the adapter cannot decode ends the callers with UNAVAILABLE
@@ -370,7 +369,7 @@ async fn an_unreadable_done_row_ends_the_caller_with_a_retryable_error_and_does_
     let mut adapter = adapter();
     let stage = enrolled(&mut adapter, 0, 0, 1);
     adapter.show_callers(&[WaiterId(0)], &CoreStage::Done(garbage.clone()));
-    assert!(is_unreadable_result(&done(stage).await));
+    assert_eq!(done(stage).await, unreadable_result_stage());
     assert_eq!(adapter.unreadable_results(), 1);
     assert_eq!(
         log.text().matches("a stored result cannot be read").count(),
@@ -397,14 +396,14 @@ async fn an_unreadable_done_row_ends_the_caller_with_a_retryable_error_and_does_
     super::testing::overwrite(store.plain(), &key, garbage.clone());
     let second = rig_over(&store, kbf_front::Recorder::off());
     let ticket = dispatch::wait(&second.core, &finished.name).expect("a ticket");
-    assert!(is_unreadable_result(&done(ticket.stage).await));
+    assert_eq!(done(ticket.stage).await, unreadable_result_stage());
     assert_eq!(second.core.with(|_, a| a.unreadable_results()), 1);
 
     // The watch that follows a name shows the same row the same way.
     let mut adapter = super::testing::adapter();
     let watched = adapter.watch_operation(OperationId(3), &Stage::Executing);
     adapter.show_watched(OperationId(3), &CoreStage::Done(garbage.clone()));
-    assert!(is_unreadable_result(&done(watched).await));
+    assert_eq!(done(watched).await, unreadable_result_stage());
     assert!(adapter.watched().is_empty(), "its result has been shown");
     assert_eq!(adapter.unreadable_results(), 1);
 

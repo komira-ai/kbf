@@ -427,9 +427,10 @@ async fn a_name_the_core_does_not_hold_is_answered_from_the_store() {
     let garbage = b"garbage".to_vec();
     super::testing::overwrite(store.plain(), &js_store::keys::done(op), garbage);
     let unreadable = dispatch::wait(&second.core, &finished.name).expect("a ticket");
-    assert!(
-        matches!(&*unreadable.stage.borrow(), Stage::Done(kbf_front::Finished::Failed(status))
-            if status.code == Code::Unavailable as i32),
+    let message = "the stored result of this operation cannot be read";
+    assert_eq!(
+        *unreadable.stage.borrow(),
+        Stage::Done(crate::answer::failed(Code::Unavailable, message)),
         "result unreadable: the ticket is done with UNAVAILABLE"
     );
 }
