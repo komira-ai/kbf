@@ -439,18 +439,22 @@ fn named(n: u64, started_usec: u64, cpu_usage_usec: u64, working_set_bytes: u64)
     }
 }
 
-/// What a test holds to stop a read part way: the flag that makes the clock's next call
-/// wait, the notice that the call has begun to wait, and the release.
+/// What a test holds to stop a read part way: the time the clock reads, the flag that makes
+/// the clock's next call wait, the notice that the call has begun to wait, and the release.
 struct Held {
+    now: Arc<AtomicU64>,
     armed: Arc<AtomicBool>,
     entered: tokio::sync::mpsc::UnboundedReceiver<()>,
     release: std::sync::mpsc::Sender<()>,
 }
 
-/// A clock that reads 100, except that its first call after `armed` is set tells `entered`
-/// and then waits, inside the caller, for `release`. A read on the blocking pool that calls
-/// it is held part way for exactly as long as the test says, with nothing timed.
+/// A clock that reads `now` (100 until the test sets it), except that its first call after
+/// `armed` is set tells `entered` and then waits, inside the caller, for `release`. A read
+/// on the blocking pool that calls it is held part way for exactly as long as the test
+/// says, with nothing timed.
 fn held_clock() -> (MonoClock, Held) {
+    let now = Arc::new(AtomicU64::new(100));
+    let time = Arc::clone(&now);
     let armed = Arc::new(AtomicBool::new(false));
     let (entered_tx, entered) = tokio::sync::mpsc::unbounded_channel();
     let (release, release_rx) = std::sync::mpsc::channel::<()>();
@@ -462,11 +466,12 @@ fn held_clock() -> (MonoClock, Held) {
             let waiting = release_rx.lock().expect("lock");
             waiting.recv().expect("the test releases the read");
         }
-        100
+        time.load(Ordering::SeqCst)
     });
     (
         clock,
         Held {
+            now,
             armed,
             entered,
             release,
@@ -625,15 +630,29 @@ async fn a_reading_that_is_dropped_does_not_let_a_second_start() {
 }
 
 /// Catches a lease that ended while the files were read being listed (the reading would
-/// name a lease the daemon has already finished), and its window being taken.
+/// name a lease the daemon has already finished), and a window of it being taken from the
+/// files read after it ended. Both leases have a baseline reading and have used CPU
+/// since, so a window of either would show: lease 1's is taken, and lease 2 must have none.
 #[tokio::test]
 async fn a_lease_that_ends_while_the_files_are_read_is_not_listed() {
     let actions = cgroup("load-ends-midway");
     let parent = crate::unit_dir("load-ends-midway-dirs");
     let (clock, mut held) = held_clock();
     let tracker = Arc::new(LoadTracker::new(clock));
-    tracker.started(id(1), lease_cgroup(&parent, "one", 0, 5_000, 1_000));
-    tracker.started(id(2), lease_cgroup(&parent, "two", 0, 5_000, 1_000));
+    let one = lease_cgroup(&parent, "one", 0, 5_000, 1_000);
+    let two = lease_cgroup(&parent, "two", 0, 5_000, 1_000);
+    tracker.started(id(1), one.clone());
+    tracker.started(id(2), two.clone());
+    tracker
+        .reading(actions.to_path_buf())
+        .await
+        .expect("baseline");
+
+    // A second of clock later the leases have used one and two CPU-seconds, and lease 2
+    // ends while the second reading is part way through its files.
+    usage(&one, 1_000_000);
+    usage(&two, 2_000_000);
+    held.now.store(1_000_100, Ordering::SeqCst);
     held.armed.store(true, Ordering::SeqCst);
     let reading = tokio::spawn({
         let (tracker, dir) = (Arc::clone(&tracker), actions.to_path_buf());
@@ -643,6 +662,10 @@ async fn a_lease_that_ends_while_the_files_are_read_is_not_listed() {
     tracker.ended(id(2));
     held.release.send(()).expect("release the read");
     let load = reading.await.expect("joined").expect("reading");
-    assert_eq!(load.leases, [named(1, 100, 0, 4_000)]);
+    assert_eq!(load.leases, [named(1, 100, 1_000_000, 4_000)]);
+
+    // The window that was taken is lease 1's; lease 2 ended with no window.
+    tracker.ended(id(1));
+    assert_eq!(tracker.take_peak(id(1)), Some(1_000));
     assert_eq!(tracker.take_peak(id(2)), None);
 }

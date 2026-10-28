@@ -65,8 +65,17 @@ pub struct NodeLoad {
 impl NodeLoad {
     /// The reading as the daemon takes it: the node's part as a heartbeat sends it, and
     /// the leases beside it.
-    pub(crate) fn into_reading(self) -> NodeReading {
-        let load = worker::NodeLoad {
+    pub(crate) fn into_reading(mut self) -> NodeReading {
+        let leases = std::mem::take(&mut self.leases);
+        NodeReading {
+            load: self.into_proto(),
+            leases,
+        }
+    }
+
+    /// The reading as the daemon sends it in a heartbeat.
+    pub(crate) fn into_proto(self) -> worker::NodeLoad {
+        worker::NodeLoad {
             seq: self.seq,
             mono_usec: self.mono_usec,
             cpu_usage_usec: self.cpu_usage_usec,
@@ -83,10 +92,6 @@ impl NodeLoad {
             cpu_throttled_usec: self.throttled_usec,
             cpu_pressure_some_total_usec: self.pressure_some_total_usec,
             memory_active_file_bytes: self.active_file_bytes,
-        };
-        NodeReading {
-            load,
-            leases: self.leases,
         }
     }
 }

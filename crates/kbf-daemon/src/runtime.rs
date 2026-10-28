@@ -110,8 +110,9 @@ pub struct NodeLoadError {
 /// One reading of the node's actions cgroup and of each lease that runs in it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NodeReading {
-    /// What a heartbeat carries of the node. The runtime leaves `lease_clocks` and
-    /// `minutes` empty; the daemon fills them from `leases`.
+    /// What a heartbeat carries of the node. Nothing turns `leases` into fields of this
+    /// message yet. (`NodeReading` is `PartialEq` and not `Eq` because the generated
+    /// `NodeLoad` is not `Eq`.)
     pub load: NodeLoad,
     /// Each running lease of the runtime at the reading, in lease order.
     pub leases: Vec<LeaseReading>,
@@ -140,6 +141,15 @@ pub struct LeaseReading {
 }
 
 /// What one lease's cgroup holds at a reading.
+///
+/// A lease's CPU peak is computed in two places, from different clock reads, so the two
+/// can differ in the last digits and nothing asserts them equal. The container driver
+/// takes the busiest window between a lease's own successive `cpu.stat` reads, each
+/// stamped by a clock read right after that file ([`Runtime::take_peak_window_millicores`]).
+/// A figure taken between whole readings uses the reading's `load.mono_usec`, one stamp for
+/// every lease; the leases are read one after another, so a lease's own stamp is later than
+/// the reading's by the time spent reading the files before it (tens of milliseconds with
+/// many leases).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LeaseUsage {
     /// `usage_usec` of the lease's `cpu.stat`: cumulative.

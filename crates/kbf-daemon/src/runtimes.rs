@@ -130,10 +130,9 @@ impl Runtimes {
     /// The first reading any runtime gives, in the order they were added; `Ok(None)` when
     /// none takes readings. A runtime that fails ends the search with its error.
     ///
-    /// Only that runtime's leases are in the reading, so only they get a clock and
-    /// minutes. A lease of a later runtime that also takes readings is not named (the
-    /// scheduler reads that as age 0 and charges it flat). The readings are not merged
-    /// here: the container driver is the only runtime that reads leases today.
+    /// Only that runtime's leases are in the reading. A lease of a later runtime that also
+    /// takes readings is not named in it. The readings are not merged here: the container
+    /// driver is the only runtime that reads leases today.
     pub(crate) async fn node_load(&self) -> Result<Option<NodeReading>, NodeLoadError> {
         for runtime in &self.all {
             if let Some(reading) = runtime.node_load().await? {
