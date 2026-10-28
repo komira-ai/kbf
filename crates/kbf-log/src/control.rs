@@ -417,7 +417,9 @@ fn record(r: &ControlRecord) -> Result<proto::ControlRecord, EncodeError> {
 fn outcome(o: &Outcome) -> Result<proto::Outcome, EncodeError> {
     use proto::outcome::Outcome as O;
     let o = match o {
-        Outcome::Completed { action_result } => O::Completed(digest(action_result)?),
+        Outcome::Completed { action_result } => {
+            O::Completed(digest(&Digest::from(*action_result))?)
+        }
         Outcome::Failed(f) => O::Failed(
             match f {
                 Failure::Timeout => proto::Failure::Timeout,
@@ -685,7 +687,7 @@ fn from_outcome(o: Option<proto::Outcome>, field: &'static str) -> Result<Outcom
     let o = o.ok_or(DecodeError::Missing(field))?;
     match o.outcome.ok_or(DecodeError::UnknownCommand("Outcome"))? {
         O::Completed(d) => Ok(Outcome::Completed {
-            action_result: from_digest(d, "Outcome.completed")?,
+            action_result: from_digest(d, "Outcome.completed")?.into(),
         }),
         O::Failed(f) => Ok(Outcome::Failed(match proto::Failure::try_from(f) {
             Ok(proto::Failure::Timeout) => Failure::Timeout,

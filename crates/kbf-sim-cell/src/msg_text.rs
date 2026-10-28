@@ -2,12 +2,27 @@
 //! shapes of [`kbf_sim::text`], never through `Debug`.
 
 use kbf_sim::text;
+use kbf_types::Digest;
 
 use crate::{Body, Msg};
 
+/// A content digest: `sha256:<64 hex>:<size>`.
+fn spell_digest(digest: &Digest) -> String {
+    // Indexed by the function's discriminant. A second hash function is a new entry
+    // here: until it is added, spelling a digest of it panics, which a test notices,
+    // instead of printing it under a wrong name.
+    const FUNCTIONS: [&str; 1] = ["sha256"];
+    format!(
+        "{}:{}:{}",
+        FUNCTIONS[digest.function as usize],
+        digest.hash_hex(),
+        digest.size_bytes
+    )
+}
+
 fn body(body: &Body) -> String {
     let blobs = text::list(&body.blobs, |(digest, offset)| {
-        format!("{}@{offset}", text::digest(digest))
+        format!("{}@{offset}", spell_digest(digest))
     });
     format!("body(blobs={blobs} bytes={})", body.bytes.len())
 }
@@ -16,27 +31,27 @@ impl Msg {
     /// The message as one trace line.
     pub(crate) fn trace_text(&self) -> String {
         match self {
-            Self::Upload { digest } => format!("upload({})", text::digest(digest)),
-            Self::Uploaded { digest } => format!("uploaded({})", text::digest(digest)),
-            Self::UploadFailed { digest } => format!("upload_failed({})", text::digest(digest)),
+            Self::Upload { digest } => format!("upload({})", spell_digest(digest)),
+            Self::Uploaded { digest } => format!("uploaded({})", spell_digest(digest)),
+            Self::UploadFailed { digest } => format!("upload_failed({})", spell_digest(digest)),
             Self::FindMissing { digests } => {
-                format!("find_missing({})", text::list(digests, text::digest))
+                format!("find_missing({})", text::list(digests, spell_digest))
             }
             Self::Missing { asked, missing } => format!(
                 "missing(asked={} missing={})",
-                text::list(asked, text::digest),
-                text::list(missing, text::digest)
+                text::list(asked, spell_digest),
+                text::list(missing, spell_digest)
             ),
-            Self::Execute { action } => format!("execute({})", text::digest(action)),
+            Self::Execute { action } => format!("execute({})", spell_digest(action)),
             Self::Answered { action, cached } => {
-                format!("answered({} cached={cached})", text::digest(action))
+                format!("answered({} cached={cached})", spell_digest(action))
             }
-            Self::Put { object, digest } => format!("put({object} {})", text::digest(digest)),
+            Self::Put { object, digest } => format!("put({object} {})", spell_digest(digest)),
             Self::PutDone { object, digest } => {
-                format!("put_done({object} {})", text::digest(digest))
+                format!("put_done({object} {})", spell_digest(digest))
             }
             Self::PutFailed { object, digest } => {
-                format!("put_failed({object} {})", text::digest(digest))
+                format!("put_failed({object} {})", spell_digest(digest))
             }
             Self::Flush { object, body: b } => format!("flush({object} {})", body(b)),
             Self::FlushDone { object } => format!("flush_done({object})"),
@@ -45,7 +60,7 @@ impl Msg {
                 object,
                 digest,
                 tag,
-            } => format!("get({object} {} tag={tag})", text::digest(digest)),
+            } => format!("get({object} {} tag={tag})", spell_digest(digest)),
             Self::Got { tag, held } => format!("got(tag={tag} held={held})"),
             Self::Hello {
                 stream,
@@ -81,7 +96,7 @@ impl Msg {
                 "start(stream={stream} lease={} op={} action={})",
                 text::lease(*lease),
                 text::operation(*operation),
-                text::digest(action)
+                spell_digest(action)
             ),
             Self::Report {
                 stream,
@@ -91,7 +106,7 @@ impl Msg {
             } => format!(
                 "report(stream={stream} lease={} action={} outcome={})",
                 text::lease(*lease),
-                text::digest(action),
+                spell_digest(action),
                 text::outcome(*outcome)
             ),
             Self::ResultAck { lease, accepted } => {
@@ -127,7 +142,7 @@ mod tests {
             "00".repeat(7),
             "00".repeat(16)
         );
-        assert_eq!(text::digest(&d), digest_text);
+        assert_eq!(spell_digest(&d), digest_text);
         let object = ObjectId::new(Epoch::new(2), 3);
         let lease = LeaseId { term: 1, seq: 4 };
         let obj = object.to_string();

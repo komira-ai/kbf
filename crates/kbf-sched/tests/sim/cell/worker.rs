@@ -591,7 +591,7 @@ impl Worker {
         let lease = run.lease;
         let outcome = match end {
             End::Finished => Outcome::Completed {
-                action_result: result_digest(&run.action, lease),
+                action_result: result_digest(&run.action, lease).into(),
             },
             End::Fenced
             | End::Cancelled

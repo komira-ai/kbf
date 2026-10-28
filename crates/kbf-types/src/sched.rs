@@ -8,11 +8,10 @@
 //! operator APIs) stay in the crate root. Every item is also re-exported at the crate
 //! root, so `kbf_types::LeaseId` and `kbf_types::sched::LeaseId` are the same type.
 //!
-//! One item still names a build type: `Outcome::Completed` carries the `Digest` of the
-//! stored result, which the scheduler passes on and never reads. The work itself is named
-//! by a [`WorkKey`], a class and a dedup text; the build's `ActionKey` converts to and
-//! from one at the edges. The test at the foot of this file lists the lines of `work`
-//! that name a build type and refuses any other.
+//! The work itself is named by a [`WorkKey`], a class and a dedup text, and a completed
+//! attempt's stored result by a [`ResultRef`], an identity and a size; the build's
+//! `ActionKey` and `Digest` convert to and from them at the edges. The test at the foot
+//! of this file refuses a build name in the code of any file of the module.
 
 mod lease;
 mod phase;
@@ -31,7 +30,7 @@ pub use version::{Supported, TooNew, VERSION_CAP, Version, VersionFault, underst
 pub use work::{
     Answer, ControlRecord, Failure, FarmFault, FarmRun, FencePolicy, LeaseGrant, LostWhy,
     MemoryKill, MemoryRun, OperationId, Outcome, Refusal, RefusalRecord, Resources, ResultRecord,
-    StartLease, WaiterId, Waiting, WorkKey, WorkerId,
+    ResultRef, StartLease, WaiterId, Waiting, WorkKey, WorkerId,
 };
 
 #[cfg(test)]
@@ -40,13 +39,6 @@ mod tests {
     /// lower-casing, so `Digest`, `digest::`, `REAPI`, `reapi`, `ActionKey` and
     /// `action_key` all count.
     const BUILD_NAMES: [&str; 4] = ["digest", "reapi", "actionkey", "action_key"];
-
-    /// Code lines of `work.rs` that still name a build type: the digest of a completed
-    /// attempt's stored result.
-    const ALLOWED: [&str; 2] = [
-        "use crate::{Digest, LeaseId, LeaseKind};",
-        "action_result: Digest,",
-    ];
 
     /// A line break stays a line break; any other character becomes `_`.
     fn blank(c: char) -> char {
@@ -265,19 +257,13 @@ mod tests {
     fn the_generic_files_name_no_build_type() {
         let modules = declared_modules(include_str!("sched.rs"));
         assert!(modules.iter().any(|m| m == "work"), "{modules:?}");
-        for module in modules.iter().filter(|m| *m != "work") {
+        for module in &modules {
             assert_eq!(
                 offenders(&read(module)),
                 Vec::<String>::new(),
                 "{module}.rs"
             );
         }
-    }
-
-    #[test]
-    fn work_names_only_the_listed_build_lines() {
-        let found = offenders(&read("work"));
-        assert_eq!(found, ALLOWED);
     }
 
     #[test]

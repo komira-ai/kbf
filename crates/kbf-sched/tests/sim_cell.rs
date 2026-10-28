@@ -333,7 +333,7 @@ impl Worker {
         run.ended = Some(now);
         let operation = run.operation;
         let outcome = Outcome::Completed {
-            action_result: digest(1_000 + operation.0),
+            action_result: digest(1_000 + operation.0).into(),
         };
         self.unacked.insert(lease, (operation, outcome));
         self.send(Msg::Report {
@@ -418,7 +418,7 @@ enum Cell {
 
 fn request(n: u64) -> Request {
     Request {
-        key: kbf_sim::work_key("main", digest(n)),
+        key: kbf_types::work_key("main", digest(n)),
         qos: Qos::Ci,
         kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),

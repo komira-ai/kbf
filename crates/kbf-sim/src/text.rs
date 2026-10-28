@@ -11,7 +11,7 @@
 //!
 //! | value | text |
 //! |---|---|
-//! | digest | `sha256:<64 hex>:<size>` |
+//! | stored result, or a key's digest text | `sha256:<64 hex>:<size>` |
 //! | lease | `<term>.<seq>` |
 //! | operation | `op<n>` |
 //! | waiter | `w<n>` |
@@ -23,9 +23,9 @@
 
 use crate::NodeId;
 use kbf_types::{
-    ActionKey, Answer, ControlRecord, Digest, Effect, Failure, FarmFault, FarmRun, FarmTime,
-    FencePolicy, LeaseId, LeaseKind, LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Refusal,
-    Resources, StartLease, WaiterId, Waiting, WorkKey, WorkerId,
+    Answer, ControlRecord, Effect, Failure, FarmFault, FarmRun, FarmTime, FencePolicy, LeaseId,
+    LeaseKind, LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Refusal, Resources, ResultRef,
+    StartLease, WaiterId, Waiting, WorkKey, WorkerId,
 };
 
 /// `text` in double quotes, with backslash, quote and control characters escaped as
@@ -54,29 +54,37 @@ pub fn time(at: FarmTime) -> String {
     at.as_millis().to_string()
 }
 
-/// A content digest: `sha256:<64 hex>:<size>`.
+/// A stored result: `sha256:<64 hex>:<size>`, the hash name being part of the frozen
+/// trace format.
 #[must_use]
-pub fn digest(digest: &Digest) -> String {
-    // Indexed by the function's discriminant. A second hash function is a new entry
-    // here: until it is added, spelling a digest of it panics, which a test notices,
-    // instead of printing it under a wrong name.
-    const FUNCTIONS: [&str; 1] = ["sha256"];
-    format!(
-        "{}:{}:{}",
-        FUNCTIONS[digest.function as usize],
-        digest.hash_hex(),
-        digest.size_bytes
-    )
+pub fn result_ref(stored: &ResultRef) -> String {
+    let hex: String = stored.id().iter().map(|b| format!("{b:02x}")).collect();
+    format!("sha256:{hex}:{}", stored.size())
 }
 
-/// The dedup text of a work key, spelled as the build spells it: the digest, if the
-/// text is one (`sha256:<64 hex>:<size>`), else `other:` and the quoted text.
+/// The dedup text of a work key: `sha256:<64 hex>:<size>` if the text is a digest's
+/// text form, else `other:` and the quoted text.
+///
+/// The text form is recognised textually, so this file needs no build type: 64
+/// lowercase hexadecimal characters, `/`, and a non-empty run of decimal digits that
+/// fits a `u64`. The size is written back as a number, so leading zeros do not survive.
 #[must_use]
 pub fn key_action(key: &WorkKey) -> String {
-    ActionKey::try_from(key).map_or_else(
-        |_| format!("other:{}", quoted(&key.dedup)),
-        |action| digest(&action.action),
-    )
+    match digest_parts(&key.dedup) {
+        Some((hex, size)) => format!("sha256:{hex}:{size}"),
+        None => format!("other:{}", quoted(&key.dedup)),
+    }
+}
+
+/// The hash text and the size of `text` if it is `<64 lowercase hex>/<decimal size>`.
+fn digest_parts(text: &str) -> Option<(&str, u64)> {
+    let (hex, size) = text.split_once('/')?;
+    let lower_hex = hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    // `u64::from_str` takes a leading `+`; the text form does not.
+    if !lower_hex || size.is_empty() || !size.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((hex, size.parse().ok()?))
 }
 
 /// A lease id: `<term>.<seq>`.
@@ -167,7 +175,9 @@ pub fn failure(failure: Failure) -> String {
 #[must_use]
 pub fn outcome(outcome: Outcome) -> String {
     match outcome {
-        Outcome::Completed { action_result } => format!("done({})", digest(&action_result)),
+        Outcome::Completed { action_result } => {
+            format!("done({})", result_ref(&action_result))
+        }
         Outcome::Failed(f) => format!("failed({})", failure(f)),
     }
 }
@@ -293,12 +303,18 @@ pub fn effects(effects: &[Effect]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use kbf_types::{DigestFunction, LeaseGrant, RefusalRecord, ResultRecord};
+    use kbf_types::{LeaseGrant, RefusalRecord, ResultRecord};
 
     use super::*;
 
-    fn d(n: u8) -> Digest {
-        Digest::new(DigestFunction::Sha256, [n; 32], 7)
+    fn d(n: u8) -> ResultRef {
+        ResultRef::new([n; 32], 7)
+    }
+
+    /// The key of action `n`: class `main`, the dedup text `<hash of n>/7`.
+    fn action_key(n: u8) -> WorkKey {
+        let hash = format!("{n:02x}").repeat(32);
+        WorkKey::new("main", format!("{hash}/7"))
     }
 
     fn w(name: &str) -> WorkerId {
@@ -310,11 +326,51 @@ mod tests {
     /// printed as if it were.
     #[test]
     fn a_key_spells_its_digest_or_says_it_is_not_one() {
-        let key = crate::work_key("main", d(0xab));
-        assert_eq!(key_action(&key), digest(&d(0xab)));
+        assert_eq!(
+            key_action(&action_key(0xab)),
+            format!("sha256:{}:7", "ab".repeat(32))
+        );
         assert_eq!(
             key_action(&WorkKey::new("main", "job \"7\"")),
             "other:\"job \\\"7\\\"\""
+        );
+    }
+
+    /// Catches: a dedup text that is nearly a digest's text form spelled as a digest (or
+    /// a digest's text form spelled as other), by each way it can be off, and a size
+    /// written other than as the number it is.
+    #[test]
+    fn only_a_digests_own_text_form_is_spelled_as_a_digest() {
+        let hex = "ab".repeat(32);
+        let refused = [
+            ("no separator", hex.clone()),
+            ("hash too short", format!("{}/7", &hex[2..])),
+            ("hash too long", format!("{hex}ab/7")),
+            ("uppercase hash", format!("{}/7", hex.to_uppercase())),
+            ("hash not hex", format!("{}zz/7", &hex[2..])),
+            ("empty size", format!("{hex}/")),
+            ("signed size", format!("{hex}/+7")),
+            ("negative size", format!("{hex}/-7")),
+            ("size not a number", format!("{hex}/7b")),
+            ("size past u64", format!("{hex}/18446744073709551616")),
+            ("second separator", format!("{hex}/7/8")),
+        ];
+        for (name, dedup) in refused {
+            assert_eq!(
+                key_action(&WorkKey::new("main", dedup.clone())),
+                format!("other:{}", quoted(&dedup)),
+                "{name}"
+            );
+        }
+        let largest = format!("{hex}/18446744073709551615");
+        assert_eq!(
+            key_action(&WorkKey::new("main", largest)),
+            format!("sha256:{hex}:18446744073709551615")
+        );
+        let padded = format!("{hex}/007");
+        assert_eq!(
+            key_action(&WorkKey::new("main", padded)),
+            format!("sha256:{hex}:7")
         );
     }
 
@@ -326,7 +382,17 @@ mod tests {
     /// expected strings are the format, not a recomputation.
     #[test]
     fn leaves_are_spelled_field_by_field() {
-        assert_eq!(digest(&d(0xab)), format!("sha256:{}:7", "ab".repeat(32)),);
+        assert_eq!(
+            result_ref(&d(0xab)),
+            format!("sha256:{}:7", "ab".repeat(32))
+        );
+        assert_eq!(
+            result_ref(&ResultRef::new(
+                std::array::from_fn(|i| u8::try_from(i).unwrap()),
+                u64::MAX
+            )),
+            "sha256:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f:18446744073709551615"
+        );
         assert_eq!(lease(lease_id()), "2.9");
         assert_eq!(operation(OperationId(4)), "op4");
         assert_eq!(waiter(WaiterId(5)), "w5");
@@ -423,7 +489,7 @@ mod tests {
         assert_eq!(record(&result), "result(2.9 op3 failed(timeout))");
         assert_eq!(record(&refused), "refusal(op3 \"too big\")");
 
-        let key = crate::work_key("main", d(2));
+        let key = action_key(2);
         let started = StartLease {
             worker: w("a"),
             lease: lease_id(),

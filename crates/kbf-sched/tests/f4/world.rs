@@ -633,7 +633,7 @@ impl World {
                 Outcome::Failed(Failure::Timeout)
             } else {
                 Outcome::Completed {
-                    action_result: digest(lease.seq << 20 | run.op.0),
+                    action_result: digest(lease.seq << 20 | run.op.0).into(),
                 }
             };
             self.check.produced(lease, outcome);
@@ -797,7 +797,7 @@ impl World {
             ("main", self.next_key - 1)
         };
         let request = Request {
-            key: kbf_sim::work_key(instance, digest(number)),
+            key: kbf_types::work_key(instance, digest(number)),
             qos: Qos::Ci,
             kind: kbf_types::LeaseKind::Action,
             resources,

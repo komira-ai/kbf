@@ -29,7 +29,7 @@ const INFRA: Outcome = Outcome::Failed(Failure::Infra);
 const PRESSURE: Outcome = Outcome::Failed(Failure::NodeMemoryPressure);
 
 fn key(n: u8) -> WorkKey {
-    kbf_sim::work_key(
+    kbf_types::work_key(
         "main",
         Digest::new(DigestFunction::Sha256, [n; 32], u64::from(n)),
     )
@@ -54,7 +54,7 @@ fn w(name: &str) -> WorkerId {
 
 fn ok() -> Outcome {
     Outcome::Completed {
-        action_result: Digest::new(DigestFunction::Sha256, [200; 32], 1),
+        action_result: Digest::new(DigestFunction::Sha256, [200; 32], 1).into(),
     }
 }
 

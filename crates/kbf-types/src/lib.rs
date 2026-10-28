@@ -6,9 +6,8 @@
 //! the reasons a frontend refuses a node).
 //!
 //! The crate has two parts. The `sched` module is generic: scheduling vocabulary with no
-//! REAPI and no content `Digest` (one item, the stored result of `Outcome::Completed`,
-//! still names one; a test lists it). Work is keyed there by a `WorkKey`; the build's
-//! `ActionKey` converts to and from it.
+//! REAPI and no content `Digest`. Work is keyed there by a `WorkKey` and a stored result
+//! is a `ResultRef`; the build's `ActionKey` and `Digest` convert to and from them.
 //! Everything else is specific to building. The generic items are re-exported at the
 //! root, so existing paths are unchanged.
 //!
@@ -29,9 +28,10 @@ pub mod object_store_api;
 pub mod operator_api;
 mod platform;
 mod release;
+mod result_ref;
 pub mod sched;
 
-pub use action_key::{ActionKey, NotAnActionKey};
+pub use action_key::{ActionKey, NotAnActionKey, work_key};
 pub use digest::{Digest, DigestFunction, ParseDigestError};
 pub use enroll::{
     CaPin, NodeId, NodeIdError, PartFault, RefusalCode, RefusalReason, Role, RoleError, RoleSet,
@@ -44,7 +44,7 @@ pub use release::ReleasePlatform;
 pub use sched::{
     Answer, ControlRecord, CustomQos, Effect, Failure, FarmFault, FarmRun, FarmTime, FencePolicy,
     LeaseGrant, LeaseId, LeaseKind, LostWhy, MemoryKill, MemoryRun, NodePhase, OperationId,
-    Outcome, Qos, QosError, Refusal, RefusalRecord, Resources, ResultRecord, StartLease,
+    Outcome, Qos, QosError, Refusal, RefusalRecord, Resources, ResultRecord, ResultRef, StartLease,
     StateMachine, Supported, TooNew, VERSION_CAP, Version, VersionFault, WaiterId, Waiting,
     WorkKey, WorkerId, understood,
 };

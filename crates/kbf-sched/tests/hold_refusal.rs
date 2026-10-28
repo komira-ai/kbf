@@ -18,7 +18,7 @@ const WAIT: Duration = Duration::from_secs(30);
 /// Action `tag`, one core and 1 GiB, for a worker of operating system `os`.
 fn request(tag: u8, os: &str) -> Request {
     Request {
-        key: kbf_sim::work_key(
+        key: kbf_types::work_key(
             "main",
             Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
         ),

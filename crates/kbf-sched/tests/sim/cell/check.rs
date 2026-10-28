@@ -381,7 +381,7 @@ impl Check {
             Outcome::Completed { action_result } => {
                 let action = action_of(&self.ops[&op].key);
                 let want = result_digest(&action, a.lease);
-                if action_result != want {
+                if action_result != want.into() {
                     self.fail(
                         "I5",
                         format!(

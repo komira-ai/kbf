@@ -52,7 +52,7 @@ fn cgroup(peak: Option<u64>) -> RunUsage {
 
 fn ok() -> Outcome {
     Outcome::Completed {
-        action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+        action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1).into(),
     }
 }
 
