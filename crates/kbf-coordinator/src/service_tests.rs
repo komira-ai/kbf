@@ -422,6 +422,28 @@ async fn a_failed_report_ends_the_order() {
     );
 }
 
+/// Catches: a report of an earlier success, or of a failure of some other version, ending
+/// the order of the version asked for, which would give the slot away while the ordered
+/// update is still to come.
+#[tokio::test]
+async fn a_report_of_another_update_keeps_the_order() {
+    let rig = started("svc-order-other-failed", ONE_STORAGE).await;
+    let c = &rig.coordinator;
+    c.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    for report in [
+        last(beat("1.0"), "0.9", Outcome::Succeeded),
+        last(beat("1.0"), "1.5", Outcome::Failed),
+    ] {
+        c.heartbeat(storage("s2"), report);
+        assert_eq!(
+            c.heartbeat(storage("s3"), beat("1.0")),
+            Reply::Nothing,
+            "s2 still holds the slot it was ordered"
+        );
+    }
+}
+
 /// Catches: an order for a host that never reports holding its slot for ever.
 #[tokio::test]
 async fn an_order_nobody_reports_ages_out() {

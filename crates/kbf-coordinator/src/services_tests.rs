@@ -96,6 +96,18 @@ fn a_services_file_defines_further_services() {
     assert!(missing.to_string().contains("nope.toml"));
 }
 
+/// Catches: a service name using digits or `-` being refused, as if names were letters only.
+#[test]
+fn a_service_name_may_hold_digits_and_hyphens() {
+    let text = "[[service]]\nname = \"web-2\"\n[service.roles.daemon]\nmin_up = 0\n";
+    assert!(
+        Services::parse(text)
+            .expect("parsed")
+            .get("web-2")
+            .is_some()
+    );
+}
+
 /// Catches: a services file that is accepted although it cannot work: each refusal names
 /// what is wrong (not TOML or an unknown key, a bad or repeated name, kbf redefined, no roles,
 /// a role that is not a host role, a count over the limit, a role waiting for a role the
