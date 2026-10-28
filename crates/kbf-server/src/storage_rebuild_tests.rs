@@ -565,9 +565,9 @@ async fn a_failed_rebuild_is_tried_again_and_the_node_stays_catching_up() {
     // A subscriber for the whole process: the rebuild task logs from a worker thread, which
     // a subscriber set for this thread would not reach, and a `tracing` macro evaluates its
     // fields (rebuild.rs) only where one is installed, whatever else ran in the process.
-    let _ = tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt().with_ansi(false).finish(),
-    );
+    // (`test_log` installs the one global subscriber of the test binary; a second
+    // `set_global_default` here would lose to it, or win and leave the log tests with none.)
+    crate::test_log::install();
     let frontend = Frontend::start();
     let bucket = Bucket::new();
     let old = old_segments(&bucket, 0x11, 3).await;
