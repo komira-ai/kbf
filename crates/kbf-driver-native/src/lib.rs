@@ -203,4 +203,5 @@ as_user_test_hook!();
 
 pub use cas::CasStore;
 pub use config::{DEFAULT_TERM_GRACE, MemoryPolicy, NativeConfig};
+pub use record::{Record, boot_id};
 pub use runtime::{DRIVER, KIND, NativeRuntime, SURVEY_DIR, WARM_UP_DIR};
