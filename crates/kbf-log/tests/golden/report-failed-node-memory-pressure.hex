@@ -1,0 +1,5 @@
+# Log entry `report-failed-node-memory-pressure`: the bytes of one entry of the replicated log, in format 1.
+# Pins: this value decodes from these bytes under every format, and encodes to them.
+# A change to this file needs a reason in the pull request that makes it, and the
+# file is never rewritten to match a new encoding: see tests/golden_corpus.rs.
+220e080110031a040801100222021005

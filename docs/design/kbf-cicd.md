@@ -345,10 +345,11 @@ The gate expressions common to B1 to B6, B8 and B10, read from the scraped metri
   (**[P]** 300 s in beta; tuned from B1 measurements) and at the end. It may be above 0 only between a node going out and
   the settle window ending, and never for two nodes' worth at once. The gate is **absent means failed**: if the metric is
   not exported the run is red (T12's "absent debt metric" rule). The metric is not on feature/arch-v2 yet (#912, #913).
-- **Never two members non-Active at a sampled instant**, in B1 and B4. **[missing]** There is no membership-state gauge
-  (M13). Until it exists the gate reads the node log's state transitions and the supervisor's own record.
-- **Each updated process restarted once, none other**: **[missing]** no process boot counter exists in the tree (the only
-  boot id is the kernel's, in `kbf-driver-native`; M13). Until it exists: in beta, the supervisor's process table (pid and
+- **Never two members non-Active at a sampled instant**, in B1 and B4: `kbf_members_not_active` is at most 1 in every scrape
+  of the frontend (gate `members_down_at_most_one`). Absent means failed: a membership that cannot be read leaves the series out.
+- **Each updated process restarted once, none other**: for the storage members, the growth of `kbf_member_boot{member}` over
+  the scrapes is at most the restarts allowed for each member (gate `member_restarts`; 0 in B0). **[missing]** The frontend,
+  daemon, proxy and updater have no boot series (M13): for them, in beta, the supervisor's process table (pid and
   start time per role); in gamma, the updater's phase log.
 
 B5 and B6 are expected to *pass the build*. They are not "the farm survives anything": a second unplanned loss while one
@@ -731,7 +732,8 @@ does not skip the check: the beta is red ("not run" is not "passed").
 Exist **[F]**: `kbf_cache_lost_blobs`, `kbf_cache_blob_losses_total`, `kbf_execute_requests_total`, `kbf_execute_errors_total{cause}` (status, client_abort, dropped; M11),
 `kbf_execute_failed_actions_total{class}` (M10), `kbf_execute_in_flight`, `kbf_execute_queued_seconds` (histogram), `kbf_find_missing_seconds` (histogram, no labels beyond `le`), `kbf_frontend_relay_untraced`, the write-tier series.
 Open pull requests **[open]**: `under_replicated_blobs`, open writes, repair debt, planned-down (#912, #913, #914).
-**[missing]**: a process boot counter and a membership-state gauge (M13).
+Exist: `kbf_member_state`, `kbf_members_not_active`, `kbf_member_boot` (storage members, M13).
+**[missing]**: a boot series for the roles that are not storage members (M13).
 
 ## 12. Missing pieces and the issues to file
 

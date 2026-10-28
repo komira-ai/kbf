@@ -1238,6 +1238,38 @@ fn the_default_platform_comes_from_its_flag() {
     }
 }
 
+/// Catches: `--qos-allowed` parsed but not handed to the listeners (an operator who
+/// narrows the list would still grant `batch`), a default list other than `ci,batch`
+/// (`interactive` must not be open to every client unless an operator says so), and a
+/// level that is none, or an empty list, accepted.
+#[test]
+fn the_qos_levels_a_header_may_name_come_from_their_flag() {
+    use clap::Parser;
+    use kbf_front::QosAllow;
+    let parse = |value: Option<&str>| {
+        let args = std::iter::once("kbf-server")
+            .chain(value.into_iter().flat_map(|v| ["--qos-allowed", v]));
+        kbf_server::Args::try_parse_from(args)
+    };
+    let allowed = |value| {
+        parse(value)
+            .expect("flags parse")
+            .listeners()
+            .expect("listeners")
+            .qos_allowed
+    };
+    assert_eq!(allowed(None), QosAllow::DEFAULT);
+    assert_eq!(allowed(Some("ci")).to_string(), "ci");
+    assert_eq!(
+        allowed(Some("ci,batch,interactive")).to_string(),
+        "ci,batch,interactive"
+    );
+    for bad in ["", "urgent", "ci,,batch", "BATCH"] {
+        let err = parse(Some(bad)).expect_err(bad);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
+    }
+}
+
 /// Catches: `--learned-sizes` not parsed into the listeners (a farm that ignores it never
 /// keys a request), a default other than `off` (the flag changes a booking only when an
 /// operator sets it), a value other than `off`, `shadow` and `on` accepted.
@@ -1412,32 +1444,5 @@ fn the_start_line_says_whether_the_build_pages_and_blob_reads_are_on() {
         let off = page.contains("the build pages are off");
         assert_eq!(off, !pages_on, "{case}: {page}");
         interrupt(child);
-    }
-}
-
-/// Catches: `--placement-load` not parsed into the listeners (a farm that ignores it never
-/// tells its nodes), a default other than `off` (Welcome would change for a farm that sets
-/// nothing), and a value other than `off`, `shadow` and `on` accepted.
-#[test]
-fn placement_load_comes_from_its_flag() {
-    use clap::Parser;
-    use kbf_server::PlacementLoad;
-    let parse = |args: &[&str]| {
-        kbf_server::Args::try_parse_from(std::iter::once("kbf-server").chain(args.iter().copied()))
-    };
-    let mode = |args: &[&str]| {
-        parse(args)
-            .expect("flags parse")
-            .listeners()
-            .expect("listeners")
-            .placement_load
-    };
-    assert_eq!(mode(&[]), PlacementLoad::Off);
-    assert_eq!(mode(&["--placement-load", "off"]), PlacementLoad::Off);
-    assert_eq!(mode(&["--placement-load=shadow"]), PlacementLoad::Shadow);
-    assert_eq!(mode(&["--placement-load", "on"]), PlacementLoad::On);
-    for bad in ["", "ON", "true", "yes", "1"] {
-        let err = parse(&["--placement-load", bad]).expect_err(bad);
-        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{bad}");
     }
 }

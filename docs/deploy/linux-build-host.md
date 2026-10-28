@@ -134,11 +134,12 @@ A cgroup throttled at its `cpu.max` never measures more CPU than the limit, so a
 places by the load its nodes measure (the daemon's `Heartbeat.node_load`) cannot see an
 overload through the limit above. The server says which kind of farm it is in every
 `Welcome` (`Welcome.placement_load`, [worker-protocol.md](../design/worker-protocol.md)),
-from its `--placement-load off|shadow|on` flag (a frontend and the all-in-one take it;
+from its `--placement-load off|on` flag (a frontend and the all-in-one take it;
 default `off`). It applies to every node that connects to that server, so give a pool of
 nodes the mode by pointing the pool at a server started with it. `on` sends the field as
-true; `off` and `shadow` leave it out, and the bytes of the `Welcome` are those of a server
-that predates it. The flag changes nothing else in the server: it places work as before.
+true; `off` leaves it out (absent, never false), and the bytes of the `Welcome` are those of a
+server that predates it. A node that reconnects to such a server, or to an old one, gets the
+limit of its reserve back.
 
 The daemon's `--actions-cpu-max auto|on|off` (container driver; default `auto`) decides what
 it does with the Welcome, at every connect and reconnect:

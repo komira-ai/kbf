@@ -71,8 +71,9 @@ operations and those finished within the retention. Over a state store a name ou
 the scheduler's copy: any server answers it from the store's `done/` row, which is kept at
 least ten minutes ([Results across frontends](#results-across-frontends)).
 
-**In-flight dedup.** Operations are keyed by `ActionKey`: the REAPI instance name and
-the action digest. A new request whose key matches an unfinished operation joins it
+**In-flight dedup.** Operations are keyed by a `WorkKey`, a class and a dedup text the
+scheduler treats as opaque. For a build the class is the REAPI instance name and the
+dedup text the action digest (`ActionKey` converts to and from it). A new request whose key matches an unfinished operation joins it
 as another waiter instead of queueing a second run, if the request is *joinable*:
 hermetic and not `do_not_cache`. The same digest under another instance name is
 different work and never joins. A more urgent caller that joins raises the
@@ -474,9 +475,29 @@ urgency. Every level at or below `batch` is preemptible.
 
 The queue is ordered by urgency, most urgent first, then by submission order.
 
-Today the front submits every action at `ci`. Reading the level from a request header
-(`x-kbf-qos`) and from REAPI's `ExecutionPolicy.priority` is **planned**, as are
-preemption of `batch` work, and fair turns between invocations within one level.
+### Choosing a level
+
+A client names its level with the request header `x-kbf-qos: <level>` on Execute (Buck2
+sends one for each `http_headers` entry of its `[buck2_re_client]` buckconfig section).
+What the front end does with it:
+
+- No header: `ci`. A client that sends none is unchanged.
+- The header names a level on the front end's list (`--qos-allowed`, `ci,batch` by
+  default; `interactive` is accepted only when the operator adds it): that level. The
+  value is read without regard to case or surrounding spaces.
+- Anything else (a level not on the list, a value that is no level, two `x-kbf-qos`
+  headers): `ci`. The call is **not** refused. The front end logs a warning, at most a few
+  a minute, naming the value that was ignored.
+
+The level is on the operation, not in the action: it is not a platform property, so an
+action sent at `ci` and at `batch` has one digest and one action-cache entry. Queued work
+orders by urgency, so a queued `batch` action starts after every queued `ci` action; a
+caller that joins a queued twin at a more urgent level promotes it (see the tests in
+`crates/js-sched/tests/scheduler.rs` in the jobscheduler repository, where the scheduler code and its tests now live).
+
+Not built yet: reading REAPI's `ExecutionPolicy.priority`, **preemption** of `batch` work
+(a running `batch` action keeps its slot while `ci` work waits; only what is queued is
+ordered), and fair turns between invocations within one level.
 
 ## Placement
 
@@ -532,6 +553,27 @@ What the code does today:
   makes it likelier to wait than first fit did: with eight one-core leases on two
   workers of eight cores, first fit leaves one worker empty and a six-core action runs
   at once, while spreading leaves four on each and it waits for cores to free.
+- With `--whole-node-max N` the hold above is replaced by the scheduler library's whole-node
+  drain and caps (off unless the flag is given; the settings are the farm's, since kbf has
+  one scheduler and no pools). A `whole_machine` request that fits nowhere waits
+  `--whole-node-drain-after-secs` (0), then holds the worker that will empty soonest: the
+  one whose leases' longest wall times end first, then the fewest leases, then the lowest
+  name. A wall time is the `timeout` of an action; one that names none (or zero) is taken
+  to end last. The hold is given up at its deadline,
+  `--whole-node-drain-deadline-secs` or, left out, the request's own wall time (an action
+  with no wall time and no such flag is never given up, so set the flag when clients may
+  send no timeout; it also covers an operation taken up again after a restart); the worker is then barred to the
+  request for `--whole-node-reserve-backoff-secs` (300) and another is held. After
+  `--whole-node-max-reserve-attempts` (2) give-ups the deadline is the wall time. No lease
+  is stopped. The caps: at most N workers whole (held or reserved) at once, at most
+  `--whole-node-max-draining` (1) reserved while still running leases, at least
+  `--whole-node-keep-for-ordinary` (1) workers left with neither, and no reservation on the
+  last worker an older ordinary request could run on unless
+  `--whole-node-allow-last-capable`; a request a cap stops holds nothing and queues.
+  The wall times are kept in memory: an operation taken up again after a restart has none.
+  The tuning flags need `--whole-node-max`. `Scheduler::whole_state` and `whole_summary`
+  say why a request waits; `GET /v1/queue` (a `whole_node` section) and the
+  `kbf_sched_whole_*` gauges show them, and the Queue page of the UI.
 - A request with `ios.device=1` has room only where a device the worker reports
   satisfies every `ios.device.*` attribute of the request and no lease holds it, and
   where the worker holds no other device lease (`DEVICE_LEASES_PER_WORKER` = 1, until

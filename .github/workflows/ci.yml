@@ -138,7 +138,7 @@ jobs:
       contents: read
     # A throwaway Postgres server for every test that needs one, the same container as
     # beta.yml's jobs use. KBF_TEST_POSTGRES_URL (below) names it; a test that needs it makes a
-    # database (kbf-testkit's `database`) or a schema of its own on it and drops it, and fails,
+    # database (js-testkit's `database`, which kbf-testkit re-exports) or a schema of its own on it and drops it, and fails,
     # not skips, without the variable.
     services:
       postgres:

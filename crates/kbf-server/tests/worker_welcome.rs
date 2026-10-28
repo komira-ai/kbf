@@ -196,19 +196,15 @@ async fn welcome_of(addr: std::net::SocketAddr) -> kbf_proto::worker::Welcome {
 }
 
 /// Asserts that `Welcome.placement_load` is true for `--placement-load=on` and absent (not
-/// false) for `off`, `shadow` and a service told nothing, so that a farm that does not place by
+/// false) for `off` and a service told nothing, so that a farm that does not place by
 /// measured load sends the bytes it sent before the field (the bytes of an absent field are
-/// pinned in kbf-proto's `welcome_placement_load`). Catches `shadow` sent as `on`, `off` sent
-/// as `Some(false)`, and the default being on.
+/// pinned in kbf-proto's `welcome_placement_load`). Catches `off` sent as `Some(false)` and
+/// the default being on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn welcome_says_placement_load_only_for_on() {
     let cell = Cell::start().await;
     assert_eq!(welcome_of(cell.worker_addr).await.placement_load, None);
-    for (mode, says) in [
-        (PlacementLoad::Off, None),
-        (PlacementLoad::Shadow, None),
-        (PlacementLoad::On, Some(true)),
-    ] {
+    for (mode, says) in [(PlacementLoad::Off, None), (PlacementLoad::On, Some(true))] {
         let welcome = welcome_of(serve_placing(mode)).await;
         assert_eq!(welcome.placement_load, says, "{mode:?}");
     }

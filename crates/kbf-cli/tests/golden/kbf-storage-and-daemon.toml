@@ -73,7 +73,7 @@ native-term-grace-ms = 2000
 reconnect-max-ms = 30000
 # The wait, in milliseconds, after a session ends and after the first round of connection attempts that all failed. It doubles with each further failed round
 reconnect-ms = 1000
-# Logical CPUs the farm's own processes keep, in CPUs (hyperthreads count one each). The daemon gives its leases every CPU it may use but these, with no pinning, and sizes its own pools from them. Default: 8 (half the CPUs on a machine of fewer than 16). 0 is allowed; a value that leaves no CPU for leases, or is more than the machine has, is refused. On a host that also runs the server, this covers both; the server has no reserve flag
+# Logical CPUs the farm's own processes keep, in CPUs (hyperthreads count one each). The daemon gives its leases every CPU it may use but these, with no pinning, and sizes its own pools from them. Default: 4 physical cores with their hyperthreads, so 8 where two threads share a core and 4 where each core has one (half the CPUs on a smaller machine). 0 is allowed; a value that leaves no CPU for leases, or is more than the machine has, is refused. On a host that also runs the server, this covers both; the server has no reserve flag
 # reserve-cpus = "N"
 # How many of the farm's processes on this host share the reserve: the daemon sizes its pools from `reserve / share` CPUs. Default 1
 # reserve-share = "N"

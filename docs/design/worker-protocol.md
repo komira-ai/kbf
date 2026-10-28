@@ -91,7 +91,7 @@ from a frontend without the pack index and the pack store, and from one that pre
 
 `Welcome.placement_load` (field 6, `optional bool`, additive) says the farm places by the load the
 nodes measure. A server started with `--placement-load=on` sends it as true; with `off` (the
-default) or `shadow` it leaves the field out (absent, never false), so the `Welcome` is
+default) it leaves the field out (absent, never false), so the `Welcome` is
 byte-for-byte the one of a server that predates the field. A daemon reads absent and false alike
 as off. The daemon applies it at every `Welcome`, on every stream: with `--actions-cpu-max=auto`
 (the default) it writes `max 100000` to the actions cgroup's `cpu.max` for true, so the CPU it

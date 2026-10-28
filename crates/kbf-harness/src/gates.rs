@@ -27,6 +27,13 @@ pub const LOST_BLOBS: &str = "kbf_cache_lost_blobs";
 /// Blobs ever marked lost.
 pub const BLOB_LOSSES: &str = "kbf_cache_blob_losses_total";
 
+/// Registered storage members that are not `ACTIVE`, exported only while known.
+pub const MEMBERS_NOT_ACTIVE: &str = "kbf_members_not_active";
+/// Each storage member's boot counter (`kbf_member_boot{member}`): a restart raises it.
+pub const MEMBER_BOOT: &str = "kbf_member_boot";
+/// The most members that may be down at once.
+pub const MAX_MEMBERS_DOWN: f64 = 1.0;
+
 /// The fewest of a second's scrapes that must have succeeded, as a fraction.
 pub const MIN_SCRAPE_COVERAGE: f64 = 0.9;
 
@@ -79,6 +86,9 @@ pub struct Evidence<'a> {
     pub farm_whole: &'a Result<(), String>,
     /// Whether the scenario's wall-clock bound was hit.
     pub hung: bool,
+    /// How many times each storage member may have restarted during the load (0 for a
+    /// run that restarts nothing; 1 for a rolling update).
+    pub restarts_allowed: u32,
     /// The window the load ran in, as two timestamps, and its length in seconds.
     pub load: (String, String),
     pub load_secs: f64,
@@ -137,6 +147,46 @@ fn counter_delta(v: &[f64]) -> Result<f64, String> {
         ));
     }
     Ok(v[v.len() - 1] - v[0])
+}
+
+/// The most restarts any one member shows over `scrapes`: each member's boot counter
+/// ([`MEMBER_BOOT`]) rises by one per restart, so its growth is the number of restarts.
+/// Every member of the first scrape must be in every later one; a boot that falls is an
+/// error ([`counter_delta`]), as is one that is not a finite number.
+fn member_restarts(scrapes: &Scrapes) -> Result<f64, String> {
+    let count = scrapes.samples.len();
+    if count < 2 {
+        return Err(format!("{count} scrape(s): a difference needs two"));
+    }
+    let members: Vec<&String> = scrapes.samples[0]
+        .series
+        .keys()
+        .filter(|key| crate::scrape::family(key) == MEMBER_BOOT)
+        .collect();
+    if members.is_empty() {
+        return Err(format!("{MEMBER_BOOT} is absent from scrape 0 of {count}"));
+    }
+    let mut most = 0.0;
+    for key in members {
+        let mut boots = Vec::with_capacity(count);
+        for (i, sample) in scrapes.samples.iter().enumerate() {
+            let boot = *sample
+                .series
+                .get(key)
+                .ok_or_else(|| format!("{key} is absent from scrape {i} of {count}"))?;
+            if !boot.is_finite() {
+                return Err(format!(
+                    "{key} is {boot} in scrape {i}: not a finite number"
+                ));
+            }
+            boots.push(boot);
+        }
+        most = f64::max(
+            most,
+            counter_delta(&boots).map_err(|e| format!("{key} {e}"))?,
+        );
+    }
+    Ok(most)
 }
 
 /// How each series of the family `name` grew from the first scrape to the last, as
@@ -296,6 +346,45 @@ impl Evidence<'_> {
         )
     }
 
+    /// Never more than [`MAX_MEMBERS_DOWN`] storage members out of `ACTIVE` in any scrape.
+    fn members_down_gate(&self) -> Gate {
+        let threshold = "at most 1 member not active in every scrape";
+        match series(self.scrapes, MEMBERS_NOT_ACTIVE).and_then(|v| gauge_max(&v)) {
+            Ok(most) => self.row(
+                "members_down_at_most_one",
+                json!(most),
+                threshold,
+                most <= MAX_MEMBERS_DOWN,
+                Some(format!("{MEMBERS_NOT_ACTIVE} over the scrapes")),
+            ),
+            Err(why) => self.row(
+                "members_down_at_most_one",
+                Value::Null,
+                threshold,
+                false,
+                Some(why),
+            ),
+        }
+    }
+
+    /// No storage member restarted more often than `restarts_allowed` times.
+    fn restarts_gate(&self) -> Gate {
+        let threshold = format!(
+            "at most {} restart(s) of each member",
+            self.restarts_allowed
+        );
+        match member_restarts(self.scrapes) {
+            Ok(most) => self.row(
+                "member_restarts",
+                json!(most),
+                &threshold,
+                most <= f64::from(self.restarts_allowed),
+                Some(format!("growth of {MEMBER_BOOT}, the most of any member")),
+            ),
+            Err(why) => self.row("member_restarts", Value::Null, &threshold, false, Some(why)),
+        }
+    }
+
     /// Every gate, in the order of the design.
     #[must_use]
     pub fn gates(&self) -> Vec<Gate> {
@@ -366,6 +455,8 @@ impl Evidence<'_> {
                 "delta 0 on every storage node",
                 counter_delta,
             ),
+            self.members_down_gate(),
+            self.restarts_gate(),
             self.row(
                 "scrape_coverage",
                 json!(coverage),

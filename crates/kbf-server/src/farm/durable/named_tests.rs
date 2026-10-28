@@ -3,7 +3,7 @@
 
 use kbf_types::{ActionKey, Refusal};
 
-use super::blocks_tests::{Racing, durable_over, request};
+use super::blocks_tests::{Racing, action_key, durable_over, request};
 use super::named::{decode, encode};
 use super::owner_tests::{grant, overwrite, remove, value_of};
 use super::transition_tests::{answer, ending, rows, subject};
@@ -37,7 +37,7 @@ fn named(durable: &Durable, operation: u64) -> Option<(ActionKey, Progress)> {
 /// what is wrong with it.
 #[test]
 fn a_doneof_row_is_pinned_byte_for_byte_and_refuses_what_it_cannot_read() {
-    let key = request(1).key;
+    let key = action_key(1);
     let mut row = vec![1_u8, 0, 0, 0, 0, 0, 0, 0, 1];
     row.extend([1_u8; 32]);
     row.extend(b"main");
@@ -78,7 +78,7 @@ fn a_finish_puts_the_action_beside_its_result_for_as_long() {
     );
     assert_eq!(kept, (0, 1, 1));
     let row = value_of(&store, "doneof/0000000000000004");
-    assert_eq!(row, encode(&request(1).key));
+    assert_eq!(row, encode(&action_key(1)));
     store.advance(DONE_FLOOR - Duration::from_secs(1));
     assert_eq!((rows(&store, "done/"), rows(&store, "doneof/")), (1, 1));
     store.advance(Duration::from_secs(2));
@@ -103,7 +103,7 @@ fn a_refusal_puts_the_action_beside_its_result_too() {
         .expect("refused");
 
     let found = named(&durable, 4).expect("found by name");
-    assert_eq!(found.0, request(1).key);
+    assert_eq!(found.0, action_key(1));
     assert_eq!(found.1, Progress::Ended(ending("refused").finished));
 }
 
@@ -134,7 +134,7 @@ fn a_result_with_no_action_row_is_not_found_by_name() {
 fn the_look_follows_an_operation_from_the_queue_to_its_expired_result() {
     let store = Racing::new();
     let durable = durable_over(&store);
-    let key = request(1).key;
+    let key = action_key(1);
     queued(&durable);
     assert_eq!(named(&durable, 4), Some((key.clone(), Progress::Queued)));
     grant(&durable, 4, 0, "node-a").expect("grant");

@@ -40,6 +40,9 @@
 // - ResultAck.reason: why a Result was or was not accepted. A daemon that predates it
 //   reads `accepted`; a server that predates it leaves the reason unspecified, which a
 //   daemon takes as "acknowledged: forget the Result".
+// - Start.job, Start.fence, Result.job_outcome and PHASE_TAINTED: a run of a container job
+//   and the policy for a lapse of contact. Nothing reads them yet; a peer that predates
+//   them skips the fields, and reads the phase as a quarantine.
 //
 // A Result carries no attempt number: the lease id is the attempt. A lease id is unique
 // per grant and a re-grant of the same operation gets a new one, so a Result of an
@@ -188,6 +191,10 @@ enum Phase {
   // the node in contact as usual; it is not lost and nothing is requeued. A server that
   // does not know this value reads it as a quarantine, which also takes no lease.
   PHASE_DRAINING = 5;
+  // A job run left the node unsafe for further work (`reason` says what): it takes no
+  // lease until the taint is cleared. A server that does not know this value reads it as
+  // a quarantine, which also takes no lease.
+  PHASE_TAINTED = 6;
 }
 
 message NodePhase {
@@ -522,6 +529,105 @@ message Start {
   // so a daemon that predates this field, and would drop it, is never sent one. A
   // booked device is the lease's alone until the lease ends.
   string device_id = 8;
+  // The job to run, when `kind` is `job`; unset for every other kind. Field 9 is final: it
+  // is never renumbered or reused, and a change adds a new field. A receiver that predates
+  // it skips it (so the server places a `job` only on a daemon whose Hello lists a driver
+  // that serves the kind).
+  Job job = 9;
+  // What the daemon does with the run when it loses contact with the server. Field 10 is
+  // final (see `job`). Unspecified, and any value this receiver does not know, is read as
+  // FENCE_POLICY_SELF_FENCE: the unsafe direction is the one that lets a run outlive its
+  // retry, so an unknown value never chooses it.
+  FencePolicy fence = 10;
+}
+
+// What a daemon does with a run when its contact with the server lapses.
+enum FencePolicy {
+  // Not said (a server that predates the field): read as SELF_FENCE.
+  FENCE_POLICY_UNSPECIFIED = 0;
+  // The run stops at the self-fence time after the newest acknowledged heartbeat was
+  // sent; the scheduler gives the lease up and runs it elsewhere no sooner than the lease
+  // grace after that.
+  FENCE_POLICY_SELF_FENCE = 1;
+  // The run goes on through a lapse of contact. Only for a run that is hermetic or declared
+  // idempotent, because the scheduler may run it again beside the first.
+  FENCE_POLICY_RUN_ON = 2;
+}
+
+// One job a daemon runs in a container (`Start.kind` = `job`). Field numbers are final.
+//
+// Two owners. The scheduler reads and writes `run_id`, `limits` and `gpu_indices` and
+// carries every other field as bytes it never interprets; the daemon validates all of them.
+// The booking is `Start.millicpus` and `Start.memory_bytes`, which the scheduler derives
+// from its own sizing, not from the submitter; a daemon refuses a Start whose booking is
+// zero or above `limits` (see Result.job_outcome, rule 1).
+message Job {
+  // Names the run across attempts; the Result echoes it. At most 128 bytes.
+  string run_id = 1;
+  // An OCI image reference. It may be a mutable tag: the daemon resolves it once at start,
+  // runs the digest, and reports it in JobOutcome.image_digest.
+  string image = 2;
+  // The container's argument vector, in order.
+  repeated string args = 3;
+  // The hard ceilings of the run. Unset, or a zero cpu_millis, memory_bytes or wall_ms, is
+  // refused by the daemon with no run started.
+  JobLimits limits = 4;
+  // The GPUs the scheduler picked on this node, as indices into the daemon's own device
+  // report. Each below 256, no duplicates (the daemon checks). A decoder reads packed and
+  // unpacked forms alike.
+  repeated uint32 gpu_indices = 5;
+  // The host directories made visible in the container.
+  repeated Mount mounts = 6;
+  // Unspecified is contained. The daemon refuses a value it does not know, and refuses
+  // ISOLATION_HOST unless its operator allowed it: a message from the server never chooses
+  // to run without a container.
+  Isolation isolation = 7;
+  // Free-form name and value pairs, sorted by name by the sender; names unique. A repeated
+  // pair, not a map, so equal labels encode to equal bytes. At most 64, a name at most 128
+  // bytes and a value at most 1024 (the daemon checks).
+  repeated Label labels = 8;
+  // The working directory inside the container; empty is the image's own.
+  string cwd = 9;
+}
+
+// The hard ceilings of a job: what the kernel enforces, not what the scheduler booked.
+message JobLimits {
+  // CPU, in thousandths of a CPU. The container's hard cpu.max.
+  uint64 cpu_millis = 1;
+  // Memory, in bytes. The container's memory.max; Start.memory_bytes (the booking) stays
+  // its soft limit, memory.high.
+  uint64 memory_bytes = 2;
+  // The most processes; absent is unbounded, a present value must be above 0.
+  optional uint64 pids = 3;
+  // How long one attempt may run, in milliseconds, before the daemon stops it and reports
+  // JOB_EXIT_TIMED_OUT.
+  uint64 wall_ms = 4;
+}
+
+// One host directory a job sees.
+message Mount {
+  // A name in the daemon's own table of roots, never a path.
+  string root_name = 1;
+  // The path below that root; the daemon refuses an absolute path and `..`.
+  string rel = 2;
+  // True for read-write. Absent is read-only, so a dropped flag never grants write.
+  bool writable = 3;
+}
+
+// A job's isolation.
+enum Isolation {
+  // Not said: contained.
+  ISOLATION_UNSPECIFIED = 0;
+  // In a container.
+  ISOLATION_CONTAINED = 1;
+  // On the host, without a container. Refused unless the daemon's operator allowed it.
+  ISOLATION_HOST = 2;
+}
+
+// A name and a value.
+message Label {
+  string name = 1;
+  string value = 2;
 }
 
 // The server no longer holds this lease on the daemon (it gave the lease up and the
@@ -567,6 +673,81 @@ message Result {
   // 6.5). The daemon sends it with UNAVAILABLE, which a server that predates this
   // field takes as the farm's failure. Unspecified: not lost.
   Lost lost = 6;
+  // The outcome of a `job` lease. Field 7 is final: never renumbered or reused. It is a
+  // plain field, not a oneof with action_result, so a reader of an earlier shape still
+  // sees both as before. The rules:
+  // 1. A job the daemon refuses before it ran anything (the Job fails validation, limits
+  //    are unset or zero, the booking is zero or above the limits, ISOLATION_HOST is not
+  //    allowed, an unknown isolation, or no driver serves the kind) is a Result whose
+  //    status is not OK and which has no job_outcome. Nothing ran; the server may place it
+  //    elsewhere or fail it.
+  // 2. JOB_EXIT_FAILED_TO_START is only for a run the runtime attempted (image pull or
+  //    resolve, create, start) and failed: status OK, job_outcome set, `detail` says why.
+  // 3. Status OK means the daemon handled the run to an end. For a job it carries
+  //    job_outcome and never action_result (nor action_digest); for any other kind the
+  //    reverse. A server drops, as a protocol error, a Result with job_outcome on a lease
+  //    that is not a job, or with status OK and none on a job lease, and one whose
+  //    job_outcome.run_id is not the run_id of the lease's Start.job.
+  // 4. Exactly one of exit_code and term_signal is set for JOB_EXIT_SUCCEEDED and
+  //    JOB_EXIT_FAILED; JOB_EXIT_KILLED_* set term_signal when it is known and never
+  //    exit_code; JOB_EXIT_TIMED_OUT, _OUT_OF_MEMORY, _FAILED_TO_START and _UNSPECIFIED
+  //    set neither.
+  // 5. A job lost to a fence or a daemon restart is reported as before (`lost`, status
+  //    UNAVAILABLE) with no job_outcome, and never sets memory_kill.
+  JobOutcome job_outcome = 7;
+}
+
+// How a job ended. See Result.job_outcome for when it is sent.
+message JobOutcome {
+  // The Start.job.run_id this answers.
+  string run_id = 1;
+  JobExit exit = 2;
+  // The process exited with this code. A clean exit 0 is present; absent is "did not
+  // exit". Set exactly one of this and term_signal where Result.job_outcome says so.
+  optional int32 exit_code = 3;
+  // The process died on this signal. When the runtime reports a signal death as exit
+  // 128+n, the daemon sets term_signal = n and leaves exit_code unset; a process that
+  // itself calls exit(137) is exit_code = 137. When the runtime cannot tell, exit_code
+  // stands and this is unset: never both.
+  optional int32 term_signal = 4;
+  // A short refusal code or reason, at most 1024 bytes; never data from the job's peers.
+  string detail = 5;
+  // The job's stdout and stderr, already in the CAS. Unset when it wrote none or never ran.
+  build.bazel.remote.execution.v2.Digest stdout_digest = 6;
+  build.bazel.remote.execution.v2.Digest stderr_digest = 7;
+  // Set when the daemon found the node unsafe after this run (for example the container
+  // could not be removed). The node's PHASE_TAINTED says the same for placement; on a run
+  // that has no job_outcome (fenced, lost) the phase alone says it.
+  JobTaint taint = 8;
+  // What the run used.
+  ResourceUsage usage = 9;
+  // The image the run used, resolved to `sha256:<hex>`; empty if never resolved.
+  string image_digest = 10;
+}
+
+// Why a node is tainted by a job run.
+message JobTaint {
+  string reason = 1;
+  // The check that found it, when one did.
+  optional string check = 2;
+}
+
+// How a job ended.
+enum JobExit {
+  // The daemon cannot say. A server reads it as a failure, never as success; it is also
+  // what a receiver reads for a value it does not know.
+  JOB_EXIT_UNSPECIFIED = 0;
+  JOB_EXIT_SUCCEEDED = 1;
+  JOB_EXIT_FAILED = 2;
+  // Stopped because the server cancelled or preempted the lease.
+  JOB_EXIT_KILLED_BY_SERVER = 3;
+  // Stopped at JobLimits.wall_ms.
+  JOB_EXIT_TIMED_OUT = 4;
+  JOB_EXIT_OUT_OF_MEMORY = 5;
+  // The runtime attempted to start it and could not (Result.job_outcome, rule 2).
+  JOB_EXIT_FAILED_TO_START = 6;
+  // Signalled by something other than the daemon: the node's OOM killer, an operator.
+  JOB_EXIT_KILLED_EXTERNAL = 7;
 }
 
 // How the farm lost a lease's run.

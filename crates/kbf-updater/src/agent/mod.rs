@@ -9,6 +9,7 @@
 //!   container included: [`container_health`]);
 //! - [`enroll`] and [`renew`]: the host's certificate, made once with a token and renewed by the
 //!   agent at half its life;
+//! - [`service_health`]: a service's readiness URL;
 //! - [`status`]: what the heartbeat says;
 //! - [`update`]: one host's A/B, step by step;
 //! - [`run`]: the two threads, and the wiring of the real ports ([`build`]).
@@ -20,13 +21,14 @@ pub mod flags;
 pub mod local;
 pub mod renew;
 pub mod run;
+pub mod service_health;
 pub mod status;
 pub mod update;
 
 mod build;
 
 pub use build::{NO_CREDENTIAL, NoCredential, run_agent, run_config};
-pub use run::{Agent, Stop, World};
+pub use run::{Agent, ServicePorts, Stop, World};
 
 #[cfg(test)]
 mod build_tests;
@@ -50,6 +52,8 @@ mod pki;
 mod renew_tests;
 #[cfg(test)]
 mod run_tests;
+#[cfg(test)]
+mod service_tests;
 #[cfg(test)]
 mod testing;
 #[cfg(test)]

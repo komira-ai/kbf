@@ -107,34 +107,6 @@ pub struct WorkerService {
     placement_load: Option<bool>,
 }
 
-/// What `--placement-load` says of placement by the load the nodes measure.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
-pub enum PlacementLoad {
-    /// The farm does not place by measured load. `Welcome` leaves `placement_load` out,
-    /// so its bytes are those of a server that predates the field.
-    #[default]
-    Off,
-    /// The step before `on`: the farm shows what measured load would do and places as `off`
-    /// does. `Welcome` leaves `placement_load` out.
-    Shadow,
-    /// The farm places by measured load. `Welcome.placement_load` is true: each node lifts
-    /// the CPU limit of its actions cgroup (`--actions-cpu-max=auto`).
-    On,
-}
-
-impl PlacementLoad {
-    /// What `Welcome.placement_load` carries: `Some(true)` for `on`, absent for the others
-    /// (never `Some(false)`, so a farm that does not use the field sends the bytes it
-    /// always did).
-    #[must_use]
-    pub const fn welcome(self) -> Option<bool> {
-        match self {
-            Self::On => Some(true),
-            Self::Off | Self::Shadow => None,
-        }
-    }
-}
-
 impl WorkerService {
     /// The service over `farm`, knowing its daemons as `peers`. `Welcome` asks daemons
     /// for a heartbeat every `heartbeat_interval`; a stream that sends no `Hello` within
@@ -186,9 +158,9 @@ impl WorkerService {
     }
 
     /// The service telling each daemon, in `Welcome.placement_load`, the mode of
-    /// `--placement-load`. `off` (the default) and `shadow` leave the field out.
+    /// `--placement-load`. `off` (the default) leaves the field out.
     #[must_use]
-    pub const fn with_placement_load(mut self, mode: PlacementLoad) -> Self {
+    pub const fn with_placement_load(mut self, mode: crate::PlacementLoad) -> Self {
         self.placement_load = mode.welcome();
         self
     }
@@ -475,7 +447,8 @@ pub fn phase(hello: &Hello) -> Result<NodePhase, String> {
         Ok(Phase::Quarantined) => NodePhase::Quarantined(reported.reason.clone()),
         Ok(Phase::MemoryPressure) => NodePhase::MemoryPressure,
         Ok(Phase::Draining) => NodePhase::Draining,
-        Err(_) => NodePhase::Quarantined(format!(
+        // `Tainted` is on the wire before this server acts on it: the fallback applies.
+        Ok(Phase::Tainted) | Err(_) => NodePhase::Quarantined(format!(
             "the node reports phase {}, which this server does not know",
             reported.phase
         )),
