@@ -636,9 +636,33 @@ fn a_caller_that_sends_nothing_is_dropped() {
 /// not parsed ("bad request: expected value").
 #[test]
 fn a_request_completed_after_its_deadline_is_refused_at_the_deadline() {
+    assert_eq!(
+        reply_to_a_frame_completed_at(1000),
+        Reply::Refused {
+            reason: "bad request: the deadline passed".to_owned()
+        }
+    );
+}
+
+/// Catches: a deadline that is not yet passed when the clock reads exactly the
+/// deadline (`>` where `>=` is meant). The clock reads 400 ms, the whole of the
+/// 400 ms allowed, after the frame is complete.
+#[test]
+fn a_request_completed_exactly_at_its_deadline_is_refused() {
+    assert_eq!(
+        reply_to_a_frame_completed_at(400),
+        Reply::Refused {
+            reason: "bad request: the deadline passed".to_owned()
+        }
+    );
+}
+
+/// The helper's answer to a whole frame queued in one write, with a 400 ms deadline
+/// and a clock that reads 0 ms until the frame is read and `after_ms` once it is.
+fn reply_to_a_frame_completed_at(after_ms: u64) -> Reply {
     use std::io::Write as _;
     trace();
-    let dir = scratch("server-late-frame");
+    let dir = scratch(&format!("server-late-frame-{after_ms}"));
     let helper = quiet_helper(&dir);
     let (caller_end, helper_end) = UnixStream::pair().unwrap();
     let check = Scripted::fixed(Ok(()));
@@ -655,7 +679,7 @@ fn a_request_completed_after_its_deadline_is_refused_at_the_deadline() {
         Duration::from_millis(400),
         &|| {
             let at = looks.fetch_add(1, Ordering::SeqCst);
-            Duration::from_millis(if at < 3 { 0 } else { 1000 })
+            Duration::from_millis(if at < 3 { 0 } else { after_ms })
         },
     );
     let hello = proto::recv::<Reply>(caller_end.as_fd(), 0)
@@ -663,15 +687,10 @@ fn a_request_completed_after_its_deadline_is_refused_at_the_deadline() {
         .unwrap()
         .0;
     assert!(matches!(hello, Reply::Hello { .. }), "{hello:?}");
-    let (reply, _) = proto::recv::<Reply>(caller_end.as_fd(), 0)
+    proto::recv::<Reply>(caller_end.as_fd(), 0)
         .unwrap()
-        .unwrap();
-    assert_eq!(
-        reply,
-        Reply::Refused {
-            reason: "bad request: the deadline passed".to_owned()
-        }
-    );
+        .unwrap()
+        .0
 }
 
 /// Catches: a timeout per read only, under which a caller that sends one byte at a
