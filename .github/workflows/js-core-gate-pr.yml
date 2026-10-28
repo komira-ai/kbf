@@ -15,6 +15,7 @@ on:
       - crates/kbf-front/**
       - crates/kbf-sched/**
       - crates/kbf-daemon/**
+      - crates/kbf-cli/**
       - crates/kbf-testkit/**
       - crates/kbf-integration-test/**
       - rust-toolchain.toml
@@ -29,6 +30,7 @@ on:
       - crates/kbf-front/**
       - crates/kbf-sched/**
       - crates/kbf-daemon/**
+      - crates/kbf-cli/**
       - crates/kbf-testkit/**
       - crates/kbf-integration-test/**
       - rust-toolchain.toml

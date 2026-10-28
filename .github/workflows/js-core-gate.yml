@@ -14,9 +14,20 @@
 #    `kbf_scheduler_core{core="js"} 1` on /metrics, before the builds and after them
 #    (`--expect-scheduler-core js`), so it cannot pass on the legacy driver by accident.
 #
-# Red by design until the flip lands: a frontend of the shipping binary must start on the js core
-# and serve the scenario on it. What the latest run stops at is in the description of
-# komira-ai/kbf#1867. This workflow changes no server code.
+# Red by design until the flip lands. With the `farm-core-js` feature in (komira-ai/kbf#1870:
+# kbf-cli forwards it to kbf-server, and the js farm is a todo!() arm for every method) it stops,
+# in this order:
+#
+# 1. `kbf --mode=frontend` refuses `--scheduler-core` (exit 2, "kbf frontend refuses
+#    --scheduler-core"): the frontend's flag set does not list it. The flip must let the flag
+#    through to the farm the frontend builds.
+# 2. With the flag let through, the frontend starts and then panics on the js core's first
+#    unwritten step (`not yet implemented: lifecycle: intake_polls`, crates/kbf-server/src/farm/js).
+# 3. The frontend logs no `scheduler core:` line at all (kbf-server's start path does, the
+#    frontend's does not), so the start-line check cannot pass until it does. The gauge check
+#    is not reached before 1 and 2 are fixed.
+# The same cell without any of these flags (legacy core, no core check) passes with kbf in
+# frontend mode, so the layout itself is not what is red. This workflow changes no server code.
 #
 # It is kbf's own frontend on js-server-core; the standalone pieces of the jobscheduler
 # repository (js-lease-server, js-agent) are not on the flip path and not here.
