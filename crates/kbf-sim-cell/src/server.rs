@@ -385,7 +385,9 @@ impl Server {
         };
         let up = Up {
             lease_epoch: leadership.log_id.get(),
-            sched: Scheduler::new(leadership.term).recording_requeues(),
+            sched: Scheduler::new(leadership.term)
+                .with_load_config(kbf_server::PlacementLoad::Off.config())
+                .recording_requeues(),
             machine: FarmMachine::new(leadership.term),
             log,
             stopped: false,

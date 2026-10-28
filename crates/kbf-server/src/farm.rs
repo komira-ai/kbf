@@ -287,6 +287,7 @@ impl Farm {
             |log| (log.term, log.log_id.get()),
         );
         let sched = Scheduler::new(term)
+            .with_load_config(crate::PlacementLoad::Off.config())
             .with_unservable_wait(unservable_wait)
             .with_finished_retention(finished_retention)
             .with_loss_requeues(LOSS_REQUEUES)
@@ -352,6 +353,19 @@ impl Farm {
         let epoch_unix_ms = self.epoch_unix_ms;
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         state.side.learned = crate::learned::Learned::new(mode, default_memory, epoch_unix_ms);
+        self
+    }
+
+    /// This farm, placing as `mode` says (`--placement-load`) instead of by the booked rule
+    /// ([`crate::PlacementLoad::Off`]) that [`Farm::new`] builds it with. Set before the farm takes
+    /// a state store over.
+    #[must_use]
+    pub fn with_placement_load(mut self, mode: crate::PlacementLoad) -> Self {
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let sched = &mut state.engine.sched;
+        // The scheduler is moved out and back; the stand-in is dropped at once.
+        *sched =
+            std::mem::replace(sched, Scheduler::new(self.term)).with_load_config(mode.config());
         self
     }
 
@@ -964,7 +978,10 @@ fn wire_lease(lease: LeaseId) -> worker::LeaseId {
     }
 }
 
+mod from_listeners;
 #[cfg(test)]
 mod learned_tests;
+#[cfg(test)]
+mod placement_tests;
 #[cfg(test)]
 mod tests;
