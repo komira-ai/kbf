@@ -81,8 +81,8 @@ impl Dispatch for Script {
         };
         let (tx, rx) = watch::channel(first);
         stages.push((name.clone(), tx));
-        let action = submission.request.key.action;
-        let instance = submission.request.key.instance.clone();
+        let ActionKey { instance, action } =
+            ActionKey::try_from(&submission.request.key).expect("an action's key");
         self.submitted
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -250,6 +250,7 @@ async fn execute_submits_and_streams_each_stage() {
             instance: "main".to_owned(),
             action: job.action.digest
         }
+        .into()
     );
     assert_eq!(submission.request.qos, Qos::Ci);
     assert_eq!(submission.request.resources, DEFAULT_RESOURCES);

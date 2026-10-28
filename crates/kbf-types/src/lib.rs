@@ -6,7 +6,9 @@
 //! the reasons a frontend refuses a node).
 //!
 //! The crate has two parts. The `sched` module is generic: scheduling vocabulary with no
-//! REAPI and no content `Digest` (one item, `ActionKey`, still names one; a test lists it).
+//! REAPI and no content `Digest` (one item, the stored result of `Outcome::Completed`,
+//! still names one; a test lists it). Work is keyed there by a `WorkKey`; the build's
+//! `ActionKey` converts to and from it.
 //! Everything else is specific to building. The generic items are re-exported at the
 //! root, so existing paths are unchanged.
 //!
@@ -17,6 +19,7 @@
 
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
+mod action_key;
 mod digest;
 mod enroll;
 pub mod enroll_api;
@@ -28,6 +31,7 @@ mod platform;
 mod release;
 pub mod sched;
 
+pub use action_key::{ActionKey, NotAnActionKey};
 pub use digest::{Digest, DigestFunction, ParseDigestError};
 pub use enroll::{
     CaPin, NodeId, NodeIdError, PartFault, RefusalCode, RefusalReason, Role, RoleError, RoleSet,
@@ -38,9 +42,9 @@ pub use image::{ImageError, ImageRef};
 pub use platform::{Platform, PlatformError};
 pub use release::ReleasePlatform;
 pub use sched::{
-    ActionKey, Answer, ControlRecord, CustomQos, Effect, Failure, FarmFault, FarmRun, FarmTime,
-    FencePolicy, LeaseGrant, LeaseId, LeaseKind, LostWhy, MemoryKill, MemoryRun, NodePhase,
-    OperationId, Outcome, Qos, QosError, Refusal, RefusalRecord, Resources, ResultRecord,
-    StartLease, StateMachine, Supported, TooNew, VERSION_CAP, Version, VersionFault, WaiterId,
-    Waiting, WorkerId, understood,
+    Answer, ControlRecord, CustomQos, Effect, Failure, FarmFault, FarmRun, FarmTime, FencePolicy,
+    LeaseGrant, LeaseId, LeaseKind, LostWhy, MemoryKill, MemoryRun, NodePhase, OperationId,
+    Outcome, Qos, QosError, Refusal, RefusalRecord, Resources, ResultRecord, StartLease,
+    StateMachine, Supported, TooNew, VERSION_CAP, Version, VersionFault, WaiterId, Waiting,
+    WorkKey, WorkerId, understood,
 };

@@ -35,12 +35,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use kbf_sched::fence::{HANDOVER_GRACE, LEASE_GRACE, START_GRACE};
 use kbf_sched::{DaemonInstance, Event, Input, OpState, Request, Scheduler};
 use kbf_types::{
-    ActionKey, ControlRecord, Effect, Failure, FarmTime, LeaseId, LostWhy, OperationId, Outcome,
-    Resources, WaiterId, WorkerId,
+    ControlRecord, Effect, Failure, FarmTime, LeaseId, LostWhy, OperationId, Outcome, Resources,
+    WaiterId, WorkKey, WorkerId,
 };
 
 use super::leader::term;
-use super::{Ctx, result_digest};
+use super::{Ctx, action_of, result_digest};
 
 #[derive(Clone, Debug)]
 struct Shadow {
@@ -108,7 +108,7 @@ pub struct Check {
     now: FarmTime,
     workers: BTreeMap<WorkerId, Shadow>,
     ops: BTreeMap<OperationId, Request>,
-    in_flight: BTreeMap<ActionKey, OperationId>,
+    in_flight: BTreeMap<WorkKey, OperationId>,
     next_op: u64,
     grants: BTreeMap<LeaseId, (OperationId, WorkerId)>,
     grant_times: BTreeMap<LeaseId, FarmTime>,
@@ -379,13 +379,14 @@ impl Check {
         self.stats.answered += 1;
         match a.outcome {
             Outcome::Completed { action_result } => {
-                let want = result_digest(&self.ops[&op].key.action, a.lease);
+                let action = action_of(&self.ops[&op].key);
+                let want = result_digest(&action, a.lease);
                 if action_result != want {
                     self.fail(
                         "I5",
                         format!(
                             "{op} (action {}) answered by {} with a result no run of that lease of that action produced",
-                            self.ops[&op].key.action.size_bytes, a.lease
+                            action.size_bytes, a.lease
                         ),
                     );
                 }

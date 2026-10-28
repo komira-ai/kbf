@@ -11,8 +11,8 @@ use kbf_caps::NodeCaps;
 use kbf_sched::{DaemonInstance, Event, Input, Request, Scheduler};
 use kbf_sim::{SimRng, Trace, TraceHash, text};
 use kbf_types::{
-    ActionKey, Digest, DigestFunction, Effect, Failure, FarmTime, LeaseId, OperationId, Outcome,
-    Qos, Resources, StateMachine, WaiterId, WorkerId,
+    Digest, DigestFunction, Effect, Failure, FarmTime, LeaseId, OperationId, Outcome, Qos,
+    Resources, StateMachine, WaiterId, WorkerId,
 };
 
 use crate::check::Checker;
@@ -99,10 +99,7 @@ pub fn levels() -> [Qos; 4] {
 /// A hermetic, cacheable request for action `key` under instance `main`.
 pub fn request(key: u64, qos: Qos, resources: Resources, platform: usize) -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: digest(key),
-        },
+        key: kbf_sim::work_key("main", digest(key)),
         qos,
         kind: kbf_types::LeaseKind::Action,
         resources,

@@ -82,7 +82,8 @@ impl Job {
             key: ActionKey {
                 instance: self.instance.to_owned(),
                 action: Digest::new(DigestFunction::Sha256, [self.tag; 32], 1),
-            },
+            }
+            .into(),
             qos: Qos::Ci,
             kind: self.kind,
             resources: Resources::new(1_000, 4 << 30).with_gpus(self.gpus),
@@ -1133,13 +1134,15 @@ fn a_stored_operation_is_registered_only_when_it_can_be_named() {
     });
     let (empty, _) = Subject::of(Described::default());
     let linux = kbf_caps::Request::from_platform([("OSFamily", "linux")]).unwrap();
+    let action = ActionKey {
+        instance: "main".to_owned(),
+        action: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+    };
     let stored = |needs: kbf_caps::Request, subject: Option<Subject>| StoredOperation {
         operation: kbf_types::OperationId(1),
+        action: action.clone(),
         request: kbf_sched::Request {
-            key: ActionKey {
-                instance: "main".to_owned(),
-                action: Digest::new(DigestFunction::Sha256, [1; 32], 1),
-            },
+            key: (&action).into(),
             qos: Qos::Ci,
             kind: LeaseKind::Action,
             resources: Resources::new(1_000, 4 << 30),

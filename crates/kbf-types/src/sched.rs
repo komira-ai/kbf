@@ -8,9 +8,11 @@
 //! operator APIs) stay in the crate root. Every item is also re-exported at the crate
 //! root, so `kbf_types::LeaseId` and `kbf_types::sched::LeaseId` are the same type.
 //!
-//! One item still names a build type: `work` carries `ActionKey` (and with it a
-//! `Digest`) in `StartLease` and `Outcome`. The test at the foot of this file lists
-//! those lines and refuses any other.
+//! One item still names a build type: `Outcome::Completed` carries the `Digest` of the
+//! stored result, which the scheduler passes on and never reads. The work itself is named
+//! by a [`WorkKey`], a class and a dedup text; the build's `ActionKey` converts to and
+//! from one at the edges. The test at the foot of this file lists the lines of `work`
+//! that name a build type and refuses any other.
 
 mod lease;
 mod phase;
@@ -27,9 +29,9 @@ pub use state::{Effect, StateMachine};
 pub use time::FarmTime;
 pub use version::{Supported, TooNew, VERSION_CAP, Version, VersionFault, understood};
 pub use work::{
-    ActionKey, Answer, ControlRecord, Failure, FarmFault, FarmRun, FencePolicy, LeaseGrant,
-    LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Refusal, RefusalRecord, Resources,
-    ResultRecord, StartLease, WaiterId, Waiting, WorkerId,
+    Answer, ControlRecord, Failure, FarmFault, FarmRun, FencePolicy, LeaseGrant, LostWhy,
+    MemoryKill, MemoryRun, OperationId, Outcome, Refusal, RefusalRecord, Resources, ResultRecord,
+    StartLease, WaiterId, Waiting, WorkKey, WorkerId,
 };
 
 #[cfg(test)]
@@ -39,20 +41,12 @@ mod tests {
     /// `action_key` all count.
     const BUILD_NAMES: [&str; 4] = ["digest", "reapi", "actionkey", "action_key"];
 
-    /// Code lines of `work.rs` that still name a build type. A later change removes
-    /// `ActionKey` from the scheduling types and empties this list.
-    const ALLOWED: [&str; 5] = [
+    /// Code lines of `work.rs` that still name a build type: the digest of a completed
+    /// attempt's stored result.
+    const ALLOWED: [&str; 2] = [
         "use crate::{Digest, LeaseId, LeaseKind};",
-        "pub struct ActionKey {",
-        "pub action: Digest,",
         "action_result: Digest,",
-        "pub key: ActionKey,",
     ];
-
-    /// The one code line of `sched.rs` itself that names a build type: the re-export
-    /// of the types `work` still carries.
-    const REEXPORT: &str =
-        "ActionKey, Answer, ControlRecord, Failure, FarmFault, FarmRun, FencePolicy, LeaseGrant,";
 
     /// A line break stays a line break; any other character becomes `_`.
     fn blank(c: char) -> char {
@@ -262,8 +256,9 @@ mod tests {
     }
 
     #[test]
-    fn sched_rs_names_a_build_type_only_in_its_reexport() {
-        assert_eq!(offenders(include_str!("sched.rs")), [REEXPORT]);
+    fn sched_rs_names_no_build_type() {
+        let offenders = offenders(include_str!("sched.rs"));
+        assert!(offenders.is_empty(), "{offenders:?}");
     }
 
     #[test]

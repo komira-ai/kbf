@@ -6,8 +6,8 @@ use kbf_caps::NodeCaps;
 use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{DaemonInstance, Event, Input, Request, Scheduler};
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, LeaseKind,
-    Outcome, Qos, Resources, StateMachine, WaiterId, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, LeaseKind, Outcome, Qos,
+    Resources, StateMachine, WaiterId, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -22,10 +22,7 @@ fn digest(n: u8) -> Digest {
 /// Operation `n` of `kind` with `resources`.
 fn request(n: u8, kind: LeaseKind, resources: Resources) -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: digest(n),
-        },
+        key: kbf_sim::work_key("main", digest(n)),
         qos: Qos::Ci,
         kind,
         resources,

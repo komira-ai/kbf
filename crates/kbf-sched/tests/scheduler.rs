@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use kbf_sched::{DaemonInstance, Event, FINISHED_RETENTION, Input, OpState, Request, Scheduler};
 use kbf_types::{
-    ActionKey, Answer, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmTime,
-    FencePolicy, LeaseGrant, LeaseId, OperationId, Outcome, Qos, Resources, ResultRecord,
-    StartLease, StateMachine, WaiterId, WorkerId,
+    Answer, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmTime, FencePolicy,
+    LeaseGrant, LeaseId, OperationId, Outcome, Qos, Resources, ResultRecord, StartLease,
+    StateMachine, WaiterId, WorkKey, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -17,11 +17,8 @@ fn digest(n: u8) -> Digest {
     Digest::new(DigestFunction::Sha256, [n; 32], u64::from(n))
 }
 
-fn key(instance: &str, n: u8) -> ActionKey {
-    ActionKey {
-        instance: instance.to_owned(),
-        action: digest(n),
-    }
+fn key(instance: &str, n: u8) -> WorkKey {
+    kbf_sim::work_key(instance, digest(n))
 }
 
 fn request(n: u8) -> Request {

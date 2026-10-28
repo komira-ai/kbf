@@ -14,8 +14,8 @@ use kbf_caps::NodeCaps;
 use kbf_sched::{DaemonInstance, Event, Input, Request, Scheduler};
 use kbf_sim::{Chance, SimRng, Trace, TraceHash, text};
 use kbf_types::{
-    ActionKey, Digest, DigestFunction, Effect, FarmTime, LeaseId, OperationId, Outcome, Qos,
-    Resources, StateMachine, WaiterId, WorkerId,
+    Digest, DigestFunction, Effect, FarmTime, LeaseId, OperationId, Outcome, Qos, Resources,
+    StateMachine, WaiterId, WorkerId,
 };
 
 use crate::check::{Check, GRACE_MS, outcome_of};
@@ -328,10 +328,7 @@ impl World {
                     [usize::try_from(id.0 % 3).expect("small")]
                 .clone();
                 let request = Request {
-                    key: ActionKey {
-                        instance: "main".to_owned(),
-                        action: digest(id.0),
-                    },
+                    key: kbf_sim::work_key("main", digest(id.0)),
                     qos,
                     kind: kbf_types::LeaseKind::Action,
                     resources: Resources::new(cpu, mem),

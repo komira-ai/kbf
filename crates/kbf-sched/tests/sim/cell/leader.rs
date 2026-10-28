@@ -15,7 +15,7 @@ use kbf_types::{
 };
 
 use super::check::Check;
-use super::{Ctx, Msg, Plan, TICK, log_id, request};
+use super::{Ctx, Msg, Plan, TICK, action_of, log_id, request};
 
 /// The term of the first leader process.
 pub const TERM: u64 = 1;
@@ -554,7 +554,8 @@ impl Leader {
                     self.send(log_id(), msg);
                 }
                 Effect::Start(s) => {
-                    self.started.insert(s.lease, (s.operation, s.key.action));
+                    self.started
+                        .insert(s.lease, (s.operation, action_of(&s.key)));
                     let Some((to, link)) = self.links.get(&s.worker).cloned() else {
                         continue;
                     };

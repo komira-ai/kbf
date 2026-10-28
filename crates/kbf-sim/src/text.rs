@@ -23,9 +23,9 @@
 
 use crate::NodeId;
 use kbf_types::{
-    Answer, ControlRecord, Digest, Effect, Failure, FarmFault, FarmRun, FarmTime, FencePolicy,
-    LeaseId, LeaseKind, LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Refusal, Resources,
-    StartLease, WaiterId, Waiting, WorkerId,
+    ActionKey, Answer, ControlRecord, Digest, Effect, Failure, FarmFault, FarmRun, FarmTime,
+    FencePolicy, LeaseId, LeaseKind, LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Refusal,
+    Resources, StartLease, WaiterId, Waiting, WorkKey, WorkerId,
 };
 
 /// `text` in double quotes, with backslash, quote and control characters escaped as
@@ -66,6 +66,16 @@ pub fn digest(digest: &Digest) -> String {
         FUNCTIONS[digest.function as usize],
         digest.hash_hex(),
         digest.size_bytes
+    )
+}
+
+/// The dedup text of a work key, spelled as the build spells it: the digest, if the
+/// text is one (`sha256:<64 hex>:<size>`), else `other:` and the quoted text.
+#[must_use]
+pub fn key_action(key: &WorkKey) -> String {
+    ActionKey::try_from(key).map_or_else(
+        |_| format!("other:{}", quoted(&key.dedup)),
+        |action| digest(&action.action),
     )
 }
 
@@ -219,8 +229,8 @@ pub fn start(start: &StartLease) -> String {
         worker(&start.worker),
         lease(start.lease),
         operation(start.operation),
-        quoted(&start.key.instance),
-        digest(&start.key.action),
+        quoted(&start.key.class),
+        key_action(&start.key),
         kind(start.kind),
         resources(&start.resources),
         fence(start.fence),
@@ -293,6 +303,19 @@ mod tests {
 
     fn w(name: &str) -> WorkerId {
         WorkerId::new(name)
+    }
+
+    /// Catches: a work key spelled differently from the digest it was made from (every
+    /// pinned trace line that names an action would move), and one that is not a digest
+    /// printed as if it were.
+    #[test]
+    fn a_key_spells_its_digest_or_says_it_is_not_one() {
+        let key = crate::work_key("main", d(0xab));
+        assert_eq!(key_action(&key), digest(&d(0xab)));
+        assert_eq!(
+            key_action(&WorkKey::new("main", "job \"7\"")),
+            "other:\"job \\\"7\\\"\""
+        );
     }
 
     fn lease_id() -> LeaseId {
@@ -400,10 +423,7 @@ mod tests {
         assert_eq!(record(&result), "result(2.9 op3 failed(timeout))");
         assert_eq!(record(&refused), "refusal(op3 \"too big\")");
 
-        let key = kbf_types::ActionKey {
-            instance: "main".to_owned(),
-            action: d(2),
-        };
+        let key = crate::work_key("main", d(2));
         let started = StartLease {
             worker: w("a"),
             lease: lease_id(),

@@ -12,9 +12,9 @@ use kbf_sched::{
     RequeueReason, Scheduler,
 };
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmFault, FarmRun,
-    FarmTime, LeaseId, LeaseKind, LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Qos,
-    Resources, ResultRecord, StateMachine, WaiterId, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, Failure, FarmFault, FarmRun, FarmTime, LeaseId,
+    LeaseKind, LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Qos, Resources, ResultRecord,
+    StateMachine, WaiterId, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -23,10 +23,10 @@ const TERM: u64 = 7;
 
 fn request(tag: u8) -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        },
+        key: kbf_sim::work_key(
+            "main",
+            Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
+        ),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, GIB),

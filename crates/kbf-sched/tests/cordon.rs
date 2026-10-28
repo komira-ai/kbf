@@ -5,8 +5,8 @@ use std::time::Duration;
 use kbf_caps::NodeCaps;
 use kbf_sched::{Cordon, DaemonInstance, Event, Input, OpState, Request, Scheduler};
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, OperationId,
-    Outcome, Qos, Resources, StateMachine, WaiterId, Waiting, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, OperationId, Outcome, Qos,
+    Resources, StateMachine, WaiterId, Waiting, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -17,10 +17,7 @@ fn digest(n: u8) -> Digest {
 
 fn request(n: u8) -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: digest(n),
-        },
+        key: kbf_sim::work_key("main", digest(n)),
         qos: Qos::Ci,
         kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),
