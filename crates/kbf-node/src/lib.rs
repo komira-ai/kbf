@@ -888,6 +888,24 @@ impl<C: Cas> Node<C> {
     }
 }
 
+/// `--actions-cpu-max` other than `auto` sets a limit only the container driver's actions
+/// cgroup has. Not generic, so that its refusal is one code path whatever data plane
+/// [`node_over`] is instantiated with.
+fn refuse_actions_cpu_without_container(cli: &Cli) -> Result<(), Error> {
+    match (
+        cli.actions_cpu_max,
+        cli.drivers.contains(&Driver::Container),
+    ) {
+        (ActionsCpuModeFlag::Auto, _) | (_, true) => Ok(()),
+        (mode, false) => Err(format!(
+            "--actions-cpu-max={} sets the CPU limit of the container driver's actions cgroup: \
+             only --driver container has one (Linux only)",
+            format!("{mode:?}").to_lowercase()
+        )
+        .into()),
+    }
+}
+
 /// The daemon with a runtime for each of [`drivers`], set up in that order, every one
 /// moving blobs through the one data plane `plane` makes; the native driver with the
 /// configuration `native` makes and the `xcrun` it surveys with and
@@ -920,15 +938,7 @@ fn node_over<C: Cas>(
         )
         .into());
     }
-    if cli.actions_cpu_max != ActionsCpuModeFlag::Auto && !cli.drivers.contains(&Driver::Container)
-    {
-        return Err(format!(
-            "--actions-cpu-max={} sets the CPU limit of the container driver's actions cgroup: \
-             only --driver container has one (Linux only)",
-            format!("{:?}", cli.actions_cpu_max).to_lowercase()
-        )
-        .into());
-    }
+    refuse_actions_cpu_without_container(cli)?;
     let mut node = Node::new(plane);
     for driver in drivers(cli) {
         match driver {

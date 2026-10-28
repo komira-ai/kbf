@@ -688,6 +688,37 @@ fn numa_node_placement_on_a_one_node_host_runs_unplaced() {
     assert_eq!(log.matches("; not pinned").count(), 1, "{log}");
 }
 
+/// `--actions-cpu-max=on` and `off` with a driver that runs no containers are refused,
+/// naming the flag and the driver; `auto` is taken by every driver.
+///
+/// Catches: the flag silently ignored by a driver that has no actions cgroup (an
+/// operator believes the CPU limit is lifted), and `auto`, the default, refused.
+#[test]
+fn an_actions_cpu_limit_without_the_container_driver_is_refused() {
+    let dir = tls("actions-cpu-refused");
+    let start = |mode: &str| {
+        Command::new(BIN)
+            .args(base(&dir))
+            .args([
+                "--driver=fake".to_owned(),
+                format!("--actions-cpu-max={mode}"),
+            ])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("spawn")
+    };
+    for mode in ["on", "off"] {
+        let out = start(mode);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{mode}: {stderr}");
+        assert!(
+            stderr.contains(&format!("--actions-cpu-max={mode}")),
+            "{stderr}"
+        );
+        assert!(stderr.contains("--driver container"), "{stderr}");
+    }
+}
+
 /// `--lease-placement=numa-node` with a driver that runs no containers is refused (also
 /// what macOS does: it has no container driver), naming the flag and the driver; the
 /// a value that is not a placement is a usage error.
