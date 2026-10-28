@@ -23,7 +23,10 @@
 //!   are the target the action's own `buck-out` paths name ([`Target`], issue #796),
 //!   `-` when they name none. `outcome` is [`outcome`]'s word for the scheduler's
 //!   outcome, the server's verdict: an OK run whose outputs the server cannot store
-//!   has its exit code and `outcome=infra`.
+//!   has its exit code and `outcome=infra`. The fields between `wall_us` and `key` are
+//!   the cgroup's ([`ResourceUsage::log_fields`]); a macOS lease has no cgroup, so its
+//!   CPU and `mem_peak` come from its footprint block when it read its processes, and
+//!   every one it did not measure is `-` (a whole-machine lease measures only `wall_us`).
 //! - `action shape:`, the first time this process sees a key: what the key stands for
 //!   (`key=… program="…" outputs=<n> patterns="<up to 8>…"`).
 //!
@@ -43,7 +46,7 @@
 //! 3. `State::take_report`: once the scheduler took the report, [`log`] writes the
 //!    line with the operation's first caller's subject, read before the report is fed
 //!    (a report that finishes the operation may drop its callers);
-//! 4. `State::offer`: the `lease granted` line names the first caller's key.
+//! 4. `Side::offer`: the `lease granted` line names the first caller's key.
 //!
 //! The key is `shape`'s; nothing else here knows how it is made.
 
@@ -243,12 +246,7 @@ pub fn line(
     let Measured { usage, exit_code } = measured;
     let text = |t: Option<&String>| t.map_or_else(|| "-".to_owned(), |t| format!("{t:?}"));
     let dash = |v: Option<String>| v.unwrap_or_else(|| "-".to_owned());
-    let cgroup = usage
-        .cgroup
-        .as_ref()
-        .map_or_else(kbf_proto::no_cgroup_fields, |c| {
-            c.log_fields(usage.wall_micros)
-        });
+    let cgroup = usage.log_fields();
     let target = subject.target.as_ref();
     format!(
         "exit_code={} mnemonic={} target_hint={} wall_us={} {cgroup} key={} cfg={} target={} \

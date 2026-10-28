@@ -55,6 +55,11 @@ use kbf_threads::Topology;
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    // Before the log file is opened: a refused start leaves no directory or file behind.
+    if let Err(e) = args.check_scheduler_core() {
+        eprintln!("kbf-server: {e}");
+        return ExitCode::from(2);
+    }
     kbf_server::log_file::init(&args);
     match serve(&args) {
         Ok(()) => ExitCode::SUCCESS,

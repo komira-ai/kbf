@@ -3,6 +3,7 @@
 //! drain that remembers, a health check that is told what to say, and a clock a test moves.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use super::local::{Ended, HostState, Local, LocalError, Staged, Trial};
 use crate::inventory::{Host, Role};
 use crate::ports::{Clock, Drain, Health, HealthCheck, PortError};
 use crate::version::Version;
-use crate::wire::{self, Heartbeat, Reply};
+use crate::wire::{self, Heartbeat, Reply, ServiceReply};
 
 pub const COMMIT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub const COMMIT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -341,11 +342,24 @@ pub struct FakeCoordinator {
     pub beats: Arc<Mutex<Vec<Heartbeat>>>,
     /// The reply to every heartbeat; none: nothing.
     pub answer: Arc<Mutex<Option<Result<Reply, CoordinatorError>>>>,
+    /// The replies to the heartbeats that list services, one each, in turn; nothing after.
+    pub service_script: Arc<Mutex<VecDeque<ServiceReply>>>,
+    /// How many replies of the script were handed out.
+    pub delivered: Arc<AtomicUsize>,
 }
 
 impl FakeCoordinator {
     pub fn beats(&self) -> Vec<Heartbeat> {
         lock(&self.beats).clone()
+    }
+
+    /// The replies the next heartbeats that list services get, one each.
+    pub fn script(&self, replies: Vec<ServiceReply>) {
+        *lock(&self.service_script) = replies.into();
+    }
+
+    pub fn delivered(&self) -> usize {
+        self.delivered.load(Ordering::SeqCst)
     }
 
     pub fn reply(&self, reply: Result<Reply, CoordinatorError>) {
@@ -357,5 +371,20 @@ impl Coordinator for FakeCoordinator {
     fn heartbeat(&self, beat: &Heartbeat) -> Result<Reply, CoordinatorError> {
         lock(&self.beats).push(beat.clone());
         lock(&self.answer).clone().unwrap_or(Ok(Reply::Nothing))
+    }
+
+    fn heartbeat_services(&self, beat: &Heartbeat) -> Result<ServiceReply, CoordinatorError> {
+        lock(&self.beats).push(beat.clone());
+        Ok(self.next_service_reply())
+    }
+}
+
+impl FakeCoordinator {
+    fn next_service_reply(&self) -> ServiceReply {
+        let next = lock(&self.service_script).pop_front();
+        if next.is_some() {
+            self.delivered.fetch_add(1, Ordering::SeqCst);
+        }
+        next.unwrap_or(ServiceReply::Nothing)
     }
 }

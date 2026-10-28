@@ -29,6 +29,7 @@ pub fn beat(running: &str) -> Heartbeat {
         health: Health::Healthy,
         last_update: None,
         updating: None,
+        services: None,
     }
 }
 
@@ -76,7 +77,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::future::BoxFuture;
 use kbf_oidc::testkit::{STATIC_ISSUER, config_text, good_claims, keys, mint, static_verifier};
-use kbf_oidc::{KeySource, OidcConfig, Verifier};
+use kbf_oidc::testkit::{StaticKeys, clock as oidc_clock, jwks_of};
+use kbf_oidc::{AllowList, KeySource, OidcConfig, Verifier};
 use kbf_testkit::dir::TestDir;
 
 use crate::desired::DesiredStore;
@@ -161,6 +163,25 @@ impl Rig {
         let store = DesiredStore::open(&dir.path().join("desired.json")).expect("a store");
         let (verifier, _) = static_verifier();
         Coordinator::new(store, verifier, OPERATOR.to_owned(), clock_of(clock))
+    }
+
+    /// A coordinator on the same state file whose CI tokens are checked against the
+    /// allow-list `text` (the testkit's issuer and its first key).
+    pub fn start_with_allow_list(dir: &TestDir, clock: &Arc<AtomicU64>, text: &str) -> Coordinator {
+        let store = DesiredStore::open(&dir.path().join("desired.json")).expect("a store");
+        let (oidc_now, _) = oidc_clock();
+        let verifier = Verifier::new(
+            AllowList::parse(text).expect("an allow-list"),
+            Arc::new(StaticKeys(jwks_of(&[&keys()[0]]))),
+            Duration::from_secs(30),
+            oidc_now,
+        );
+        Coordinator::new(
+            store,
+            Arc::new(verifier),
+            OPERATOR.to_owned(),
+            clock_of(clock),
+        )
     }
 
     pub fn restart(&mut self) {

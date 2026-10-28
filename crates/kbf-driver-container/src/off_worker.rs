@@ -5,7 +5,9 @@
 //! file or waits for a child process without yielding holds its worker until the kernel
 //! answers, and a cgroup file, a journal commit or a page fault can take seconds. So
 //! such work runs on tokio's blocking pool, which has threads to spare for it
-//! (`--blocking-threads`); hashing runs on the CPU pool (`kbf_daemon::cpu_pool`).
+//! (`--blocking-threads`); hashing, the digests of an action's output files and of its
+//! Directory messages, runs on the CPU pool (`kbf_daemon::cpu_pool`), which is bounded
+//! by the node's cores.
 
 /// Runs `work` on the blocking pool and returns its result. A panic in `work` panics the
 /// caller.

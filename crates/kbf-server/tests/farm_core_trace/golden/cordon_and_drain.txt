@@ -1,0 +1,133 @@
+# cordon and drain steer placement
+> [t=0ms] start
+  farm term=7 lease_epoch=7
+  txn applied rev=1 counters=[]
+    put meta/epoch cond=absent len=8 sha=a3eb8db89fc5123c ttl=-
+  txn applied rev=2 counters=[]
+    put meta/next_op cond=absent len=8 sha=f44b28e2244100cb ttl=-
+  txn applied rev=3 counters=[]
+    put meta/next_seq cond=absent len=8 sha=f44b28e2244100cb ttl=-
+> [t=0ms] register node-a cores=4 gib=8 drivers=container
+  txn applied rev=4 counters=[]
+    put owner/node-a cond=absent len=16 sha=4ff190b4c2c573ec ttl=-
+  txn applied rev=5 counters=[]
+    put session/node-a cond=any len=70 sha=2b29556b96e9b197 ttl=60000ms
+  msg node-a welcome protocol=1 interval_ms=5000 epoch=7 pack_commit=false
+> [t=0ms] register node-b cores=4 gib=8 drivers=container
+  txn applied rev=6 counters=[]
+    put owner/node-b cond=absent len=16 sha=4ff190b4c2c573ec ttl=-
+  txn applied rev=7 counters=[]
+    put session/node-b cond=any len=70 sha=bbf330e872319459 ttl=60000ms
+  msg node-b welcome protocol=1 interval_ms=5000 epoch=7 pack_commit=false
+> [t=0ms] place node-a cordon
+  placed
+  txn applied rev=8 counters=[]
+    put cordon/node-a cond=any len=1 sha=6e340b9cffb37a98 ttl=-
+> [t=0ms] submit steered qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket steered#1 name=operations/0
+  txn applied rev=12 counters=[]
+    put op/0000000000000000 cond=absent len=75 sha=8136470751ede4ae ttl=-
+    put subject/0000000000000000 cond=absent len=14 sha=ae86e8877cb562cb ttl=-
+    put queue/0000000000000000 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=absent len=8 sha=af5570f5a1810b7a ttl=-
+  txn applied rev=15 counters=[]
+    check owner/node-b cond=v6
+    del queue/0000000000000000 cond=v11
+    put lease/0000000000000007.0000000000000000 cond=absent len=20 sha=3b77b39b92b16ebd ttl=-
+    put lease-by-op/0000000000000000 cond=any len=16 sha=e8dd943d366caae7 ttl=-
+  msg node-b lease_offer lease=7/0 kind=action action=steered
+  msg node-b start lease=7/0 kind=action action=steered millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+  stage steered#1 executing
+> [t=0ms] place node-a uncordon
+  placed
+  txn applied rev=16 counters=[]
+    del cordon/node-a cond=any
+> [t=0ms] submit spread qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket spread#1 name=operations/1
+  txn applied rev=20 counters=[]
+    put op/0000000000000001 cond=absent len=75 sha=05f7624d5bfec4de ttl=-
+    put subject/0000000000000001 cond=absent len=14 sha=be6b893005f31c5f ttl=-
+    put queue/0000000000000001 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0202020202020202020202020202020202020202020202020202020202020202/2 cond=absent len=8 sha=cd2662154e6d76b2 ttl=-
+  txn applied rev=23 counters=[]
+    check owner/node-a cond=v4
+    del queue/0000000000000001 cond=v19
+    put lease/0000000000000007.0000000000000001 cond=absent len=24 sha=a8c79304565db161 ttl=-
+    put lease-by-op/0000000000000001 cond=any len=16 sha=4ff190b4c2c573ec ttl=-
+  msg node-a lease_offer lease=7/1 kind=action action=spread
+  msg node-a start lease=7/1 kind=action action=spread millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+  stage spread#1 executing
+> [t=0ms] place node-b drain 30000ms
+  placed
+  txn applied rev=24 counters=[]
+    put cordon/node-b cond=any len=9 sha=b2e568e7924b4b47 ttl=-
+> [t=0ms] submit avoids-b qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket avoids-b#1 name=operations/2
+  txn applied rev=28 counters=[]
+    put op/0000000000000002 cond=absent len=75 sha=8dfbccd9809e915d ttl=-
+    put subject/0000000000000002 cond=absent len=14 sha=15fa975d14a88c80 ttl=-
+    put queue/0000000000000002 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0303030303030303030303030303030303030303030303030303030303030303/3 cond=absent len=8 sha=cd04a4754498e06d ttl=-
+  txn applied rev=31 counters=[]
+    check owner/node-a cond=v4
+    del queue/0000000000000002 cond=v27
+    put lease/0000000000000007.0000000000000002 cond=absent len=24 sha=fe01d5e424c18e9e ttl=-
+    put lease-by-op/0000000000000002 cond=any len=16 sha=8d91efc5106ff3a3 ttl=-
+  msg node-a lease_offer lease=7/2 kind=action action=avoids-b
+  msg node-a start lease=7/2 kind=action action=avoids-b millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+  stage avoids-b#1 executing
+> [t=31000ms] advance 31000ms
+> [t=31000ms] tick
+> [t=31000ms] place node-c cordon
+  not placed: no node node-c has registered
+> [t=31000ms] result node-b lease=7/0 action=steered ended=ran(exit=0)
+  ack lease=7/0 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=42 counters=[]
+    check owner/node-b cond=v6
+    del lease/0000000000000007.0000000000000000 cond=v14
+    del inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=v12
+    put doneof/0000000000000000 cond=any len=45 sha=f0fd36d49c3d8936 ttl=600000ms
+    del op/0000000000000000 cond=any
+    del queue/0000000000000000 cond=any
+    del loss/0000000000000000 cond=any
+    del fate/0000000000000000 cond=any
+    del subject/0000000000000000 cond=any
+    del opkey/0000000000000000 cond=any
+    del lease-by-op/0000000000000000 cond=any
+    put done/0000000000000000 cond=any len=58 sha=bb06bdbd0d1e96c2 ttl=600000ms
+  cache steered exit=0
+  stage steered#1 done ran exit=0 stdout="output of steered" worker="node-b" queued_ms=1900000000000 started_ms=1900000000000 completed_ms=1900000031000
+> [t=31000ms] result node-a lease=7/1 action=spread ended=ran(exit=0)
+  ack lease=7/1 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=53 counters=[]
+    check owner/node-a cond=v4
+    del lease/0000000000000007.0000000000000001 cond=v22
+    del inflight/6d61696e/0202020202020202020202020202020202020202020202020202020202020202/2 cond=v20
+    put doneof/0000000000000001 cond=any len=45 sha=a2c1eb6cc2381e02 ttl=600000ms
+    del op/0000000000000001 cond=any
+    del queue/0000000000000001 cond=any
+    del loss/0000000000000001 cond=any
+    del fate/0000000000000001 cond=any
+    del subject/0000000000000001 cond=any
+    del opkey/0000000000000001 cond=any
+    del lease-by-op/0000000000000001 cond=any
+    put done/0000000000000001 cond=any len=61 sha=3f4cdd1bd83abc67 ttl=600000ms
+  cache spread exit=0
+  stage spread#1 done ran exit=0 stdout="output of spread" worker="node-a" queued_ms=1900000000000 started_ms=1900000000000 completed_ms=1900000031002
+> [t=31000ms] result node-a lease=7/2 action=avoids-b ended=ran(exit=0)
+  ack lease=7/2 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=64 counters=[]
+    check owner/node-a cond=v4
+    del lease/0000000000000007.0000000000000002 cond=v30
+    del inflight/6d61696e/0303030303030303030303030303030303030303030303030303030303030303/3 cond=v28
+    put doneof/0000000000000002 cond=any len=45 sha=5c262d9fe0915340 ttl=600000ms
+    del op/0000000000000002 cond=any
+    del queue/0000000000000002 cond=any
+    del loss/0000000000000002 cond=any
+    del fate/0000000000000002 cond=any
+    del subject/0000000000000002 cond=any
+    del opkey/0000000000000002 cond=any
+    del lease-by-op/0000000000000002 cond=any
+    put done/0000000000000002 cond=any len=64 sha=483bfd66e1e5c96a ttl=600000ms
+  cache avoids-b exit=0
+  stage avoids-b#1 done ran exit=0 stdout="output of avoids-b" worker="node-a" queued_ms=1900000000000 started_ms=1900000000000 completed_ms=1900000031004

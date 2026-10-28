@@ -9,6 +9,10 @@
 //! - a pure crate that depends, directly or through another crate, on a forbidden
 //!   crate (tokio, tonic, hyper, reqwest, the rand family, getrandom, mio, socket2);
 //! - a pure crate that depends on a kbf crate outside the pure set;
+//! - a pure crate that reaches a crate taken from a git repository other than the ones
+//!   listed in `PURE_GIT_CRATES` (today `js-sizing`, `js-caps`, `js-types` and `js-sim`, which
+//!   `kbf-estimator`, `kbf-caps`, `kbf-types` and `kbf-sim` re-export; `js-sched`, which `kbf-sched` re-exports,
+//!   and `js-whole`, which `js-sched` depends on);
 //! - a pure crate whose `lib.rs` no longer denies the `clippy.toml` lists, which would
 //!   silently switch off the clock, sleep, network and `HashMap` checks for it;
 //! - a pure crate renamed or removed, which would otherwise make every check above
@@ -70,9 +74,9 @@
 //!   the check reads the tree of the crate built alone, so the features that its own tests
 //!   turn on do not count); and a walk that cannot see its dependencies, which would make
 //!   that check pass vacuously;
-//! - the state store (`kbf-state`) depending on any other crate of this workspace (with its
-//!   test-database feature, on any but `kbf-testkit`), which would stop it from being
-//!   extracted, and the pack index (`kbf-pack-index`) depending on any but the state store;
+//! - the state store (`kbf-state`, a re-export of `js-state`) depending on any other crate of
+//!   this workspace (with its test-database feature too, which brings `js-testkit` and not
+//!   `kbf-testkit`), which would stop it from being extracted, and the pack index (`kbf-pack-index`) depending on any but the state store;
 //!   each with a walk that cannot see what it should, which would make the check vacuous.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -91,6 +95,12 @@ const PURE: &[&str] = &[
     "kbf-invocation",
     "kbf-map",
 ];
+
+/// The simulation kernel. It is not `PURE`: it reaches `rand_chacha` (seeded, never
+/// seeded from the system), which the purity check refuses by name. Pure crates take it
+/// as a dev-dependency only, so nothing in `PURE` reaches the `js-sim` it re-exports; the
+/// check of `PURE_GIT_CRATES` walks it as well, so that its git crates are listed too.
+const SIM_KERNEL: &[&str] = &["kbf-sim"];
 
 /// Crates that do a little file I/O (so they are not `PURE`) but are shared by every CI/CD
 /// stage and by xtask: they may reach no `FORBIDDEN` crate and no other kbf crate.
@@ -116,9 +126,45 @@ const PURE_MODULES: &[&str] = &["kbf-server/src/machine.rs"];
 
 const DENY_ATTR: &str = "#![deny(clippy::disallowed_methods, clippy::disallowed_types)]";
 
+/// The crates of other repositories (taken by `git` dependency, `source` beginning
+/// `git+`) that a pure crate may reach, with the one repository each may come from.
+/// `kbf-estimator` re-exports `js-sizing`, `kbf-caps` re-exports `js-caps`, `kbf-types`
+/// re-exports `js-types` (its `sched` module), `kbf-sim` re-exports `js-sim` and `kbf-sched`
+/// re-exports `js-sched`; `js-sched` depends on `js-whole`, the pure whole-node rules; they depend on
+/// one another and on crates.io crates only. A
+/// further git crate in a pure crate's tree is a decision, so it is listed here by name.
+const PURE_GIT_CRATES: &[(&str, &str)] = &[
+    (
+        "js-sched",
+        "git+https://github.com/komira-ai/jobscheduler?rev=",
+    ),
+    (
+        "js-caps",
+        "git+https://github.com/komira-ai/jobscheduler?rev=",
+    ),
+    (
+        "js-sim",
+        "git+https://github.com/komira-ai/jobscheduler?rev=",
+    ),
+    (
+        "js-sizing",
+        "git+https://github.com/komira-ai/jobscheduler?rev=",
+    ),
+    (
+        "js-types",
+        "git+https://github.com/komira-ai/jobscheduler?rev=",
+    ),
+    (
+        "js-whole",
+        "git+https://github.com/komira-ai/jobscheduler?rev=",
+    ),
+];
+
 struct Graph {
     /// Package id to package name.
     names: BTreeMap<String, String>,
+    /// Package id to the package's `source` (`None` for a workspace path crate).
+    sources: BTreeMap<String, Option<String>>,
     /// Package id to the ids of its normal dependencies.
     normal: BTreeMap<String, Vec<String>>,
     /// Workspace member name to (package id, path of its library root).
@@ -140,8 +186,10 @@ fn load_graph() -> Graph {
     let meta: Value = serde_json::from_slice(&out.stdout).expect("cargo metadata emits JSON");
 
     let mut names = BTreeMap::new();
+    let mut sources = BTreeMap::new();
     for pkg in meta["packages"].as_array().expect("packages") {
         let id = pkg["id"].as_str().expect("package id").to_owned();
+        sources.insert(id.clone(), pkg["source"].as_str().map(str::to_owned));
         names.insert(id, pkg["name"].as_str().expect("package name").to_owned());
     }
 
@@ -193,6 +241,7 @@ fn load_graph() -> Graph {
 
     Graph {
         names,
+        sources,
         normal,
         members,
     }
@@ -238,6 +287,44 @@ fn pure_crates_have_no_impure_dependencies() {
         "pure crates reach impure crates:\n{}",
         violations.join("\n")
     );
+}
+
+#[test]
+fn pure_crates_take_git_crates_only_from_the_list() {
+    let g = load_graph();
+    let mut violations = Vec::new();
+    let mut seen = BTreeSet::new();
+    for &pure in PURE.iter().chain(SIM_KERNEL) {
+        let (id, _) = g
+            .members
+            .get(pure)
+            .unwrap_or_else(|| panic!("{pure} is not a workspace member"));
+        for (dep, chain) in normal_closure(&g, id) {
+            let Some(source) = g.sources[&dep].as_deref().filter(|s| s.starts_with("git+")) else {
+                continue;
+            };
+            let name = g.names[&dep].as_str();
+            seen.insert(name.to_owned());
+            let allowed = PURE_GIT_CRATES
+                .iter()
+                .any(|(n, prefix)| *n == name && source.starts_with(prefix));
+            if !allowed {
+                violations.push(format!("{chain} ({source})"));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "pure crates reach git crates outside PURE_GIT_CRATES:\n{}",
+        violations.join("\n")
+    );
+    // The list is not vacuous: each entry is reached through a shim crate.
+    for (name, _) in PURE_GIT_CRATES {
+        assert!(
+            seen.contains(*name),
+            "{name} is in PURE_GIT_CRATES but no pure crate reaches it"
+        );
+    }
 }
 
 #[test]
@@ -674,9 +761,10 @@ fn workspace_crates_beyond<'a>(
 }
 
 /// Asserts that the state store (`kbf-state`) links no other crate of this workspace, with
-/// the Postgres backend on, and with its test-database feature on only the test server's
-/// crate (`kbf-testkit`), and that the walk sees its dependencies (it reaches `postgres`), so
-/// the check does not pass on an empty walk. The store is generic: what is specific to a kbf
+/// the Postgres backend on, and with its test-database feature on (which brings the test
+/// server's crate, `js-testkit`, from the jobscheduler repository, and not `kbf-testkit`),
+/// and that the walk sees its dependencies (it reaches `postgres`), so the check does not
+/// pass on an empty walk. The store is generic: what is specific to a kbf
 /// build (the pack index, `kbf-pack-index`) depends on it and never the other way, which is
 /// what lets the store be extracted. Like the `tierstore` check, it reads the tree of the
 /// crate built alone.
@@ -700,10 +788,10 @@ fn the_state_store_links_no_build_specific_crate() {
     );
     let testing = linked_with("kbf-state", "test-database");
     assert!(
-        testing.contains("kbf-testkit"),
+        testing.contains("js-testkit"),
         "test-database must bring the test server's crate: {testing:?}"
     );
-    let violations = workspace_crates_beyond(&g, &testing, &["kbf-state", "kbf-testkit"]);
+    let violations = workspace_crates_beyond(&g, &testing, &["kbf-state"]);
     assert!(
         violations.is_empty(),
         "kbf-state with test-database links another crate of this workspace: {violations:?}"

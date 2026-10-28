@@ -52,7 +52,7 @@ fn cgroup(peak: Option<u64>) -> RunUsage {
 
 fn ok() -> Outcome {
     Outcome::Completed {
-        action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+        action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1).into(),
     }
 }
 
@@ -82,7 +82,8 @@ fn start(seq: u64, kind: LeaseKind, gpus: u64) -> StartLease {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [2; 32], 2),
-        },
+        }
+        .into(),
         kind,
         resources: Resources {
             gpus,
@@ -111,6 +112,7 @@ fn estimate(memory: u64, level: Level) -> Result<Estimate, Fallback> {
         memory_bytes: memory,
         cpu_millis: 1_000,
         level,
+        life_minutes: 1,
     })
 }
 
@@ -440,9 +442,11 @@ fn the_estimate_line_says_what_would_be_booked_and_what_is() {
     let mut learned = seeded();
     let text = learned.estimate_text(&key(), &Hint::default(), &bounds());
     let shape = format!("key={:016x}", key().shape().0);
+    // The runs seeded here have no CPU reading, so the estimate takes the estimator's cold
+    // CPU, two cores.
     assert_eq!(
         text,
-        format!("{shape} level=l2 memory_mib=1024 cpu_millis=1000 default_mib=4096 floor_mib=0")
+        format!("{shape} level=l2 memory_mib=1024 cpu_millis=2000 default_mib=4096 floor_mib=0")
     );
     let hint = Hint {
         memory_bytes: Some(8 * GIB),

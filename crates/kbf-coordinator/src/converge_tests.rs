@@ -1,7 +1,8 @@
 use kbf_types::HostRole;
 use kbf_updater::wire::{Heartbeat, Outcome};
 
-use crate::converge::{Convergence, RoleCounts, State, converge};
+use crate::converge::{Convergence, RoleCounts, State, converge, converge_service, role_counts};
+use crate::services::Services;
 use crate::testutil::{beat, desired, fleet, last, secs, unhealthy, updating};
 
 const NOW: u64 = 1_000;
@@ -215,4 +216,67 @@ fn a_restarted_coordinator_does_not_report_a_vacuous_convergence() {
         &[("st1", HostRole::Storage, unhealthy(beat("2.0")))],
     );
     assert_eq!(sick.state, State::InProgress);
+}
+
+const TWO_DAEMONS: &str = "[[service]]\nname = \"agent\"\n[service.roles.daemon]\nmin_up = 2\n";
+
+/// A fleet whose hosts all heartbeated `service` at second 990: `kbf` hosts are not in it.
+fn fleet_of(service: &str, hosts: &[(&str, HostRole, Heartbeat)]) -> crate::fleet::Fleet {
+    let mut f = fleet(secs(990), &[("kbf1", HostRole::Storage, beat("9.0"))]);
+    for (name, role, b) in hosts {
+        f.record_in(
+            service,
+            crate::testutil::id(name),
+            *role,
+            b.clone(),
+            secs(990),
+        );
+    }
+    f
+}
+
+/// Behaviour: a service's convergence reads its own hosts and its own desired state, never
+/// kbf's: a kbf host at another version does not count, the role counts are the service's,
+/// the service's required hosts up come from its role definition, and a failed update to
+/// the service's desired version blocks it.
+#[test]
+fn a_service_converges_on_its_own_hosts_and_its_own_minimums() {
+    let services = Services::parse(TWO_DAEMONS).expect("services");
+    let def = services.get("agent").expect("agent");
+    let d = desired("3.0", 0, 0);
+    let one = fleet_of("agent", &[("d1", HostRole::Daemon, beat("3.0"))]);
+    let short = converge_service(def, Some(&d), &one, secs(NOW));
+    assert_eq!(short.state, State::InProgress, "two daemons must be up");
+    assert_eq!(short.desired.as_ref().expect("desired").as_str(), "3.0");
+    assert_eq!(role(&short, "daemon").at_desired, 1);
+    assert_eq!(short.roles.len(), 1, "the kbf storage host is not counted");
+    let two = fleet_of(
+        "agent",
+        &[
+            ("d1", HostRole::Daemon, beat("3.0")),
+            ("d2", HostRole::Daemon, beat("3.0")),
+        ],
+    );
+    assert_eq!(
+        converge_service(def, Some(&d), &two, secs(NOW)).state,
+        State::Converged
+    );
+    let stuck = fleet_of(
+        "agent",
+        &[
+            ("d1", HostRole::Daemon, beat("3.0")),
+            (
+                "d2",
+                HostRole::Daemon,
+                last(beat("2.0"), "3.0", Outcome::Failed),
+            ),
+        ],
+    );
+    assert_eq!(
+        converge_service(def, Some(&d), &stuck, secs(NOW)).state,
+        State::Blocked
+    );
+    let none = converge_service(def, None, &two, secs(NOW));
+    assert_eq!((none.desired, none.state), (None, State::InProgress));
+    assert!(role_counts("agent", None, &two, secs(NOW)).is_empty());
 }

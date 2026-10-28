@@ -8,9 +8,10 @@ use kbf_pack_index::schema::{self, NAME, SQL, VERSION};
 use kbf_state::postgres::schema::{self as state_schema, Kind};
 use sha2::{Digest, Sha256};
 
-/// The SHA-256 of `migrations/0002_pack_index.sql` as it was when the state store shipped it
-/// (`crates/kbf-state/src/postgres/migrations/0002_pack_index.sql`), written out so a changed
-/// byte fails here.
+/// The SHA-256 of `migrations/0002_pack_index.sql` as it was when the state store in this
+/// repository shipped it (it lived under `kbf-state`'s Postgres migrations before the store moved
+/// to jobscheduler's `js-state`, whose migrations end at `0001_state.sql`), written out so a
+/// changed byte fails here.
 const SHA256: &str = "0870c0fda5f68d6cb347bbea399f9e9b1da4d1a9179751d464a43cee6774bbc8";
 
 /// Asserts that the migration is number 2, named `pack_index`, an expand step, and that its

@@ -2,11 +2,17 @@
 //! section 3).
 //!
 //! CI sets it with one call: the version every host should run, how many hosts of a kind
-//! may update at once, and how many storage hosts and frontends must stay up. It is one
-//! small JSON file, replaced whole by a temporary file, fsync, rename and a directory fsync,
-//! so a crash leaves the old state or the new one. A file that cannot be read back is a
-//! refusal to start: the coordinator does not guess what an operator meant.
+//! may update at once, and how many storage hosts and frontends must stay up. The store
+//! keeps one such state per service name; a service must be `kbf` or one the services file
+//! defines (`crate::services`). Hosts are ordered only for `kbf` until their heartbeats
+//! name other services. It is one small JSON file, replaced whole by a temporary file,
+//! fsync, rename and a directory fsync, so a crash leaves the old state or the new one.
+//! While `kbf` is the only service the file is the single state itself (the format earlier
+//! builds read and wrote, so a downgrade keeps working); a file with
+//! `{"services": {name: state}}` is the map. A file that cannot be read back is a refusal
+//! to start: the coordinator does not guess what an operator meant.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -16,6 +22,10 @@ use std::sync::{Mutex, PoisonError};
 use kbf_types::HostRole;
 use kbf_updater::version::Version;
 use serde::{Deserialize, Serialize};
+
+/// The service every host runs today, and the only one a desired state may name unless a
+/// services file defines more.
+pub const KBF: &str = "kbf";
 
 /// The most any count may be: a typo's order of magnitude, not a plan.
 pub const MAX_COUNT: u32 = 10_000;
@@ -80,6 +90,18 @@ pub struct MinUp {
     pub frontend: u32,
 }
 
+impl MinUp {
+    /// The minimum for hosts of `role`: the other roles have none.
+    #[must_use]
+    pub const fn of(&self, role: HostRole) -> u32 {
+        match role {
+            HostRole::Storage => self.storage,
+            HostRole::Frontend => self.frontend,
+            HostRole::Daemon | HostRole::MacDaemon => 0,
+        }
+    }
+}
+
 /// The desired state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,6 +124,9 @@ pub enum DesiredError {
     /// A count is over [`MAX_COUNT`].
     #[error("a count is over {MAX_COUNT}")]
     Count,
+    /// The `service` is not one the coordinator manages.
+    #[error("no such service")]
+    UnknownService,
 }
 
 impl Desired {
@@ -112,6 +137,45 @@ impl Desired {
     pub fn parse(bytes: &[u8]) -> Result<Self, DesiredError> {
         let desired: Self =
             serde_json::from_slice(bytes).map_err(|e| DesiredError::Malformed(e.to_string()))?;
+        desired.checked()?;
+        Ok(desired)
+    }
+
+    /// The service and desired state of a `POST /v1/desired` body: the state's fields and an
+    /// optional `service` (absent means [`KBF`]).
+    ///
+    /// # Errors
+    /// [`DesiredError`]; [`DesiredError::UnknownService`] for any service but [`KBF`].
+    pub fn parse_request(bytes: &[u8]) -> Result<(String, Self), DesiredError> {
+        Self::parse_request_for(bytes, |name| name == KBF)
+    }
+
+    /// Like [`Self::parse_request`], for the services `known` accepts.
+    ///
+    /// # Errors
+    /// [`DesiredError`]; [`DesiredError::UnknownService`] for a service `known` refuses.
+    pub fn parse_request_for(
+        bytes: &[u8],
+        known: impl Fn(&str) -> bool,
+    ) -> Result<(String, Self), DesiredError> {
+        let malformed = |e: serde_json::Error| DesiredError::Malformed(e.to_string());
+        let mut fields: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(bytes).map_err(malformed)?;
+        let service = match fields.remove("service") {
+            None => KBF.to_owned(),
+            Some(serde_json::Value::String(name)) => name,
+            Some(_) => return Err(DesiredError::Malformed("service is not text".to_owned())),
+        };
+        if !known(&service) {
+            return Err(DesiredError::UnknownService);
+        }
+        let desired: Self = serde_json::from_value(fields.into()).map_err(malformed)?;
+        desired.checked()?;
+        Ok((service, desired))
+    }
+
+    fn checked(&self) -> Result<(), DesiredError> {
+        let desired = self;
         let counts = [
             desired.max_updating.frontend,
             desired.max_updating.storage,
@@ -123,8 +187,30 @@ impl Desired {
         if counts.iter().any(|&n| n > MAX_COUNT) {
             return Err(DesiredError::Count);
         }
-        Ok(desired)
+        Ok(())
     }
+}
+
+/// The state file in its map form.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Services {
+    services: BTreeMap<String, Desired>,
+}
+
+/// The services in `bytes`: a map file, or the single state of earlier builds as `kbf`'s.
+fn parse_file(bytes: &[u8]) -> Result<BTreeMap<String, Desired>, DesiredError> {
+    let is_map = serde_json::from_slice::<serde_json::Value>(bytes)
+        .is_ok_and(|v| v.get("services").is_some());
+    if !is_map {
+        return Ok(BTreeMap::from([(KBF.to_owned(), Desired::parse(bytes)?)]));
+    }
+    let file: Services =
+        serde_json::from_slice(bytes).map_err(|e| DesiredError::Malformed(e.to_string()))?;
+    for desired in file.services.values() {
+        desired.checked()?;
+    }
+    Ok(file.services)
 }
 
 /// Why the state file could not be read or written.
@@ -152,7 +238,7 @@ pub enum StoreError {
 #[derive(Debug)]
 pub struct DesiredStore {
     path: PathBuf,
-    current: Mutex<Option<Desired>>,
+    current: Mutex<BTreeMap<String, Desired>>,
     /// Held across a whole replacement, so that writers wait for each other and not readers:
     /// `current` is only locked to read or to swap, never across the file's fsyncs.
     writing: Mutex<()>,
@@ -180,14 +266,11 @@ impl DesiredStore {
     /// [`StoreError`]: the file exists and cannot be read, or holds no desired state.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let current = match fs::read(path) {
-            Ok(bytes) => {
-                let desired = Desired::parse(&bytes).map_err(|source| StoreError::Invalid {
-                    path: path.to_owned(),
-                    source,
-                })?;
-                Some(desired)
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Ok(bytes) => parse_file(&bytes).map_err(|source| StoreError::Invalid {
+                path: path.to_owned(),
+                source,
+            })?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(io_at(path)(e)),
         };
         Ok(Self {
@@ -197,34 +280,48 @@ impl DesiredStore {
         })
     }
 
-    /// The desired state now, if one was ever set.
+    /// The desired state of `service` now, if one was ever set.
     #[must_use]
-    pub fn get(&self) -> Option<Desired> {
+    pub fn get(&self, service: &str) -> Option<Desired> {
+        self.lock().get(service).cloned()
+    }
+
+    /// The desired state of every service, by name.
+    #[must_use]
+    pub fn all(&self) -> BTreeMap<String, Desired> {
         self.lock().clone()
     }
 
-    /// Replaces the desired state, in the file first and in memory only if the file holds it.
+    /// Replaces the desired state of `service` (the others stay), in the file first and in
+    /// memory only if the file holds it.
     ///
     /// # Errors
     /// [`StoreError::Io`]: the file could not be replaced; the old state stands.
-    pub fn set(&self, desired: Desired) -> Result<(), StoreError> {
+    pub fn set(&self, service: &str, desired: Desired) -> Result<(), StoreError> {
         let _writer = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
-        self.write(&desired)?;
-        *self.lock() = Some(desired);
+        let mut next = self.all();
+        next.insert(service.to_owned(), desired);
+        self.write(&next)?;
+        *self.lock() = next;
         Ok(())
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Desired>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Desired>> {
         self.current.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn write(&self, desired: &Desired) -> Result<(), StoreError> {
+    fn write(&self, services: &BTreeMap<String, Desired>) -> Result<(), StoreError> {
         let mut temp = self.path.clone().into_os_string();
         temp.push(".new");
         let temp = PathBuf::from(temp);
-        let mut text = serde_json::to_vec_pretty(desired)
-            .map_err(io::Error::from)
-            .map_err(io_at(&temp))?;
+        // Only `kbf` is the single state of earlier builds, which refuse the map form.
+        let encoded = match services.iter().collect::<Vec<_>>().as_slice() {
+            [(name, only)] if name.as_str() == KBF => serde_json::to_vec_pretty(only),
+            _ => serde_json::to_vec_pretty(&Services {
+                services: services.clone(),
+            }),
+        };
+        let mut text = encoded.map_err(io::Error::from).map_err(io_at(&temp))?;
         text.push(b'\n');
         // A leftover of a crash is replaced, never followed: the temporary file is created
         // new, owner-only.

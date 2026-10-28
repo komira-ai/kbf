@@ -1,0 +1,72 @@
+# an operator's epoch raise is taken by the next start
+> [t=0ms] start
+  farm term=7 lease_epoch=7
+  txn applied rev=1 counters=[]
+    put meta/epoch cond=absent len=8 sha=a3eb8db89fc5123c ttl=-
+  txn applied rev=2 counters=[]
+    put meta/next_op cond=absent len=8 sha=f44b28e2244100cb ttl=-
+  txn applied rev=3 counters=[]
+    put meta/next_seq cond=absent len=8 sha=f44b28e2244100cb ttl=-
+> [t=0ms] register node-a cores=4 gib=8 drivers=container
+  txn applied rev=4 counters=[]
+    put owner/node-a cond=absent len=16 sha=4ff190b4c2c573ec ttl=-
+  txn applied rev=5 counters=[]
+    put session/node-a cond=any len=70 sha=2b29556b96e9b197 ttl=60000ms
+  msg node-a welcome protocol=1 interval_ms=5000 epoch=7 pack_commit=false
+> [t=0ms] submit old qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket old#1 name=operations/0
+  txn applied rev=9 counters=[]
+    put op/0000000000000000 cond=absent len=75 sha=8136470751ede4ae ttl=-
+    put subject/0000000000000000 cond=absent len=14 sha=502b5775d6dc9db2 ttl=-
+    put queue/0000000000000000 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=absent len=8 sha=af5570f5a1810b7a ttl=-
+  txn applied rev=12 counters=[]
+    check owner/node-a cond=v4
+    del queue/0000000000000000 cond=v8
+    put lease/0000000000000007.0000000000000000 cond=absent len=20 sha=3c9486d0aaad3084 ttl=-
+    put lease-by-op/0000000000000000 cond=any len=16 sha=e8dd943d366caae7 ttl=-
+  msg node-a lease_offer lease=7/0 kind=action action=old
+  msg node-a start lease=7/0 kind=action action=old millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+  stage old#1 executing
+> [t=0ms] bump_epoch
+  epoch 7 -> 8
+  txn applied rev=13 counters=[]
+    put meta/epoch cond=v1 len=8 sha=4c0e071832d52769 ttl=-
+> [t=0ms] restart epoch=keep
+  farm term=8 lease_epoch=8
+  txn applied rev=14 counters=[]
+    put meta/next_op cond=v2 len=8 sha=7df7e25947701db9 ttl=-
+  txn applied rev=15 counters=[]
+    put meta/next_seq cond=v3 len=8 sha=7df7e25947701db9 ttl=-
+> [t=0ms] register node-a cores=4 gib=8 drivers=container
+  txn applied rev=16 counters=[]
+    put owner/node-a cond=v4 len=16 sha=8d91efc5106ff3a3 ttl=-
+  txn applied rev=17 counters=[]
+    put session/node-a cond=any len=70 sha=2b29556b96e9b197 ttl=60000ms
+  msg node-a welcome protocol=1 interval_ms=5000 epoch=8 pack_commit=false
+> [t=0ms] heartbeat node-a seq=1 running=[7/0]
+  acknowledged=true
+> [t=0ms] result node-a lease=7/0 action=old ended=ran(exit=0)
+  ack lease=7/0 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=28 counters=[]
+    check owner/node-a cond=v16
+    del lease/0000000000000007.0000000000000000 cond=v11
+    del inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=v9
+    put doneof/0000000000000000 cond=any len=45 sha=f0fd36d49c3d8936 ttl=600000ms
+    del op/0000000000000000 cond=any
+    del queue/0000000000000000 cond=any
+    del loss/0000000000000000 cond=any
+    del fate/0000000000000000 cond=any
+    del subject/0000000000000000 cond=any
+    del opkey/0000000000000000 cond=any
+    del lease-by-op/0000000000000000 cond=any
+    put done/0000000000000000 cond=any len=54 sha=cb36d47698a93e0b ttl=600000ms
+  cache old exit=0
+> [t=0ms] restart epoch=bump
+  farm term=9 lease_epoch=9
+  txn applied rev=29 counters=[]
+    put meta/epoch cond=v13 len=8 sha=5924513516a59934 ttl=-
+  txn applied rev=30 counters=[]
+    put meta/next_op cond=v14 len=8 sha=9c3cdf6c9c8e5131 ttl=-
+  txn applied rev=31 counters=[]
+    put meta/next_seq cond=v15 len=8 sha=9c3cdf6c9c8e5131 ttl=-

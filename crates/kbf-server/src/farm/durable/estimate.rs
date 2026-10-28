@@ -29,7 +29,7 @@ fn unhex(text: &str) -> Option<String> {
 }
 
 /// The key of `key`'s row.
-pub(super) fn row_key(key: &Key) -> String {
+pub(crate) fn row_key(key: &Key) -> String {
     let basis = match key.basis() {
         Basis::Cgroup => 'c',
         Basis::MacFootprint => 'm',
@@ -47,13 +47,13 @@ pub(super) fn row_key(key: &Key) -> String {
 }
 
 /// The value of a row holding the estimator's `summary`.
-pub(super) fn encode(summary: &[u8]) -> Vec<u8> {
+pub(crate) fn encode(summary: &[u8]) -> Vec<u8> {
     [&[VERSION][..], summary].concat()
 }
 
 /// The key a row key names, or `None` for one that does not parse or is not spelled the
 /// way [`row_key`] spells it (two rows could name one key).
-pub(super) fn parse_key(row_key: &str) -> Option<Key> {
+pub(crate) fn parse_key(row_key: &str) -> Option<Key> {
     let mut parts = row_key.strip_prefix(super::ESTIMATE)?.split('/');
     let instance = unhex(parts.next()?)?;
     let platform = unhex(parts.next()?)?;
@@ -81,7 +81,7 @@ pub(super) fn parse_key(row_key: &str) -> Option<Key> {
 }
 
 /// The key a row key names, and the estimator's row its value holds.
-pub(super) fn decode(row_key: &str, value: &[u8]) -> Option<(Key, Vec<u8>)> {
+pub(crate) fn decode(row_key: &str, value: &[u8]) -> Option<(Key, Vec<u8>)> {
     let (version, summary) = value.split_first()?;
     if *version != VERSION {
         return None;

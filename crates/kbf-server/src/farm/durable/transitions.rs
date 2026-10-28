@@ -66,11 +66,13 @@ impl Durable {
             lease: start.lease,
             operation: start.operation,
             worker: start.worker.clone(),
+            // This store's lease rows keep no cost.
+            cost: Default::default(),
         };
         let Some(row) = self.store.get(&queued)? else {
             return self.granted_before(&grant, queued);
         };
-        let value = encode(FarmInput::Committed(ControlRecord::Lease(grant)))?;
+        let value = self.codec.lease(&grant)?;
         let lease = lease_key(start.lease);
         let index = lease_by_op_key(start.operation);
         let txn = txn
@@ -85,7 +87,7 @@ impl Durable {
     fn granted_before(&self, grant: &LeaseGrant, queued: String) -> Result<(), StateError> {
         let key = lease_key(grant.lease);
         match self.store.get(&key)? {
-            Some(row) if lease_row(&key, &row)? == *grant => Ok(()),
+            Some(row) if self.lease_row(&key, &row)? == *grant => Ok(()),
             _ => Err(StateError::Missing(queued)),
         }
     }
@@ -277,12 +279,13 @@ impl Durable {
             return self.end_queued(operation, ending, &key, |_| true);
         };
         // The result of a lease is taken by the owner of the node that holds it.
-        let worker = lease_row(&key, &row)?.worker;
+        let worker = self.lease_row(&key, &row)?.worker;
         let txn = self.guard(Txn::new(), &worker)?;
         let txn = txn.delete(key.clone(), Cond::Version(row.version));
         let txn = self.unpin(txn, operation)?;
         let txn = self.noting(txn, operation, ending)?;
-        let committed = self.commit_owned(&worker, ending.settle(txn, operation));
+        let settled = ending.settle_with(&*self.ext, txn, operation);
+        let committed = self.commit_owned(&worker, settled);
         if matches!(committed, Err(StateError::Conflict(_))) && self.store.get(&key)?.is_none() {
             return self.end_queued(operation, ending, &key, |_| true);
         }
@@ -327,7 +330,8 @@ impl Durable {
                 .delete(op, Cond::Version(unfinished.version));
             let txn = self.unpin(txn, operation)?;
             let txn = self.noting(txn, operation, ending)?;
-            let committed = self.commit(ending.settle_rest(txn, operation, Cond::Absent));
+            let settled = ending.settle_rest(&*self.ext, txn, operation, Cond::Absent);
+            let committed = self.commit(settled);
             if !matches!(committed, Err(StateError::Conflict(_))) {
                 return committed;
             }
@@ -353,10 +357,8 @@ impl Durable {
             if connected.contains(&WorkerId::new(&key[SESSION.len()..])) {
                 continue;
             }
-            let FarmInput::WorkerUp { capacity, caps, .. } = decode(&key, &row.value)? else {
-                return Err(corrupt(&key, "not a daemon registration"));
-            };
-            remote.push((caps, capacity));
+            let up = self.session_row(&key, &row)?;
+            remote.push((up.caps, up.capacity));
         }
         Ok(remote)
     }
@@ -370,10 +372,8 @@ impl Durable {
     /// The store cannot be read, or a session row is not a daemon's registration.
     pub(super) fn session_could_run(&self, request: &Request) -> Result<bool, StateError> {
         for (key, row) in self.store.scan_prefix(SESSION)? {
-            let FarmInput::WorkerUp { capacity, caps, .. } = decode(&key, &row.value)? else {
-                return Err(corrupt(&key, "not a daemon registration"));
-            };
-            if request.runnable_on(&caps, &capacity) {
+            let up = self.session_row(&key, &row)?;
+            if request.runnable_on(&up.caps, &up.capacity) {
                 return Ok(true);
             }
         }

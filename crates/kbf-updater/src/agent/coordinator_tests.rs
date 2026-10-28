@@ -22,7 +22,7 @@ use super::coordinator::{
 use super::pki::{Leaf, Pki, write_files};
 use crate::identity::identity_of;
 use crate::version::Version;
-use crate::wire::{Health, Heartbeat, Reply};
+use crate::wire::{Health, Heartbeat, Reply, ServiceBeat, ServiceReply};
 
 fn beat() -> Heartbeat {
     Heartbeat {
@@ -31,6 +31,7 @@ fn beat() -> Heartbeat {
         health: Health::Healthy,
         last_update: None,
         updating: None,
+        services: None,
     }
 }
 
@@ -692,4 +693,59 @@ fn a_certificate_that_now_names_another_node_is_not_used() {
             "{node} {role}: {err:?}"
         );
     }
+}
+
+/// A heartbeat that lists services is posted with them, and its answer is read as a service
+/// reply: an update that names a service, one that does not, and nothing. The reader of today
+/// refuses the named one, which is why only an agent that lists services asks for the other.
+#[test]
+fn a_heartbeat_with_services_reads_a_reply_that_names_one() {
+    let rig = Rig::new("co-services");
+    let mut with_services = beat();
+    with_services.services = Some(vec![ServiceBeat {
+        name: "db".to_owned(),
+        version: Version::parse("0.1.5+gaaaaaaaaaaaa-2").unwrap(),
+        health: Health::Healthy,
+        last_update: None,
+        updating: None,
+    }]);
+    let named = r#"{"reply":"update","service":"db","version":"0.1.7+gbbbbbbbbbbbb-3"}"#;
+    let (addr, server) = rig.coordinator(vec![
+        ok(named),
+        ok(r#"{"reply":"update","version":"0.1.7+gbbbbbbbbbbbb-3"}"#),
+        ok(r#"{"reply":"nothing"}"#),
+        ok(named),
+    ]);
+    let client = rig.client(addr);
+    let target = Version::parse("0.1.7+gbbbbbbbbbbbb-3").unwrap();
+    assert_eq!(
+        client.heartbeat_services(&with_services).unwrap(),
+        ServiceReply::Update {
+            service: Some("db".to_owned()),
+            version: target.clone()
+        }
+    );
+    assert_eq!(
+        client.heartbeat_services(&with_services).unwrap(),
+        ServiceReply::Update {
+            service: None,
+            version: target
+        }
+    );
+    assert_eq!(
+        client.heartbeat_services(&with_services).unwrap(),
+        ServiceReply::Nothing
+    );
+    assert!(matches!(
+        client.heartbeat(&with_services),
+        Err(CoordinatorError::Malformed(_))
+    ));
+    let seen = server.join().unwrap().remove(0);
+    let text = String::from_utf8(seen.request).unwrap();
+    let body = text.split_once("\r\n\r\n").unwrap().1;
+    assert_eq!(
+        serde_json::from_str::<Heartbeat>(body).unwrap(),
+        with_services
+    );
+    assert!(body.contains(r#""services":[{"name":"db""#), "{body}");
 }

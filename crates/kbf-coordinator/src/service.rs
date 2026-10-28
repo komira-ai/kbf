@@ -1,19 +1,22 @@
 //! The coordinator: the fleet the heartbeats build, the desired state, and who may change
 //! or read either. No sockets here; [`crate::http`] maps requests onto these calls.
 
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_oidc::{Refusal, Verified, Verifier};
-use kbf_updater::wire::{Heartbeat, Reply};
+use kbf_updater::wire::{Heartbeat, Reply, ServiceReply};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
-use crate::converge::{Convergence, converge};
-use crate::decide::decide;
-use crate::desired::{Desired, DesiredError, DesiredStore, StoreError};
+use crate::converge::{Convergence, RoleCounts, converge, converge_service, role_counts};
+use crate::decide::decide_in;
+use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
 use crate::fleet::Fleet;
 use crate::identity::Identity;
+use crate::services::Services;
 
 /// The time since the coordinator started.
 pub type Clock = Arc<dyn Fn() -> Duration + Send + Sync>;
@@ -37,6 +40,9 @@ pub enum SetError {
     /// The state file could not be written.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// The allow-list entry that admitted the token does not name this service.
+    #[error("the token may not set this service")]
+    Forbidden,
 }
 
 /// Why a CI token was not accepted.
@@ -85,24 +91,56 @@ pub struct HostStatus {
     pub beat: Heartbeat,
 }
 
+/// One service in the status.
+#[derive(Debug, Serialize)]
+pub struct ServiceStatus {
+    /// Its desired state, if one was ever set.
+    pub desired: Option<Desired>,
+    /// The counts of every role that has a host heartbeating the service, in role order.
+    pub roles: Vec<RoleCounts>,
+}
+
+/// Why the convergence was not read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ConvergenceError {
+    /// The caller's CI token was not accepted.
+    #[error(transparent)]
+    Refused(#[from] CiRefused),
+    /// The coordinator manages no such service.
+    #[error("no such service")]
+    UnknownService,
+}
+
 /// What an operator reads.
 #[derive(Debug, Serialize)]
 pub struct Status {
-    /// The desired state, if one was ever set.
+    /// The desired state of `kbf`, if one was ever set.
     pub desired: Option<Desired>,
+    /// The desired state of every service, by name.
+    pub services: BTreeMap<String, Desired>,
     /// The coordinator is still within its quiet period and orders nothing.
     pub quiet: bool,
+    /// Heartbeats since the coordinator started whose `services` list was bad and was
+    /// dropped: the host was answered as a `kbf`-only host.
+    pub services_dropped: u64,
     /// Every host heard from since the coordinator started, by node id.
     pub hosts: Vec<HostStatus>,
+    /// Every service the coordinator manages, `kbf` included, by name: its desired state and
+    /// the counts of its hosts per role.
+    pub per_service: BTreeMap<String, ServiceStatus>,
+    /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]).
+    pub commit: &'static str,
 }
 
 /// The coordinator.
 pub struct Coordinator {
     fleet: Mutex<Fleet>,
     desired: DesiredStore,
+    services: Services,
     verifier: Arc<Verifier>,
     operator_token: String,
     clock: Clock,
+    services_dropped: AtomicU64,
 }
 
 impl std::fmt::Debug for Coordinator {
@@ -125,25 +163,71 @@ impl Coordinator {
         Self {
             fleet: Mutex::new(Fleet::new(started)),
             desired,
+            services: Services::default(),
             verifier,
             operator_token,
             clock,
+            services_dropped: AtomicU64::new(0),
         }
     }
 
+    /// The same coordinator over `services` instead of `kbf` alone.
+    #[must_use]
+    pub fn with_services(mut self, services: Services) -> Self {
+        self.services = services;
+        self
+    }
+
+    /// Counts and logs a heartbeat from `who` whose `services` list was bad and was dropped
+    /// (`why` is the reader's reason). The heartbeat itself is still answered, by
+    /// [`Self::heartbeat`], as one from a `kbf`-only host.
+    pub fn note_services_dropped(&self, who: &Identity, why: &str) {
+        self.services_dropped.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(node_id = %who.node_id, why, "dropped the services list of a heartbeat");
+    }
+
     /// Notes a heartbeat from `who` and answers it. With no desired state set, nothing.
-    pub fn heartbeat(&self, who: Identity, beat: Heartbeat) -> Reply {
+    ///
+    /// The top-level fields are `kbf`. Each entry of `services` is noted as that service's
+    /// heartbeat of the host, if the coordinator manages the service and runs it on the
+    /// host's role (any other entry is ignored). `kbf` is decided first, then the host's
+    /// services in the order it listed them, and the first order is the reply: one update
+    /// per reply. A host that sent no `services` is answered about `kbf` alone, in the
+    /// shape it has always read.
+    pub fn heartbeat(&self, who: Identity, beat: Heartbeat) -> ServiceReply {
         let now = (self.clock)();
         let mut fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
+        let announced = beat.services.clone().unwrap_or_default();
+        let platform = beat.platform;
         fleet.record(who.node_id.clone(), who.role, beat, now);
-        let Some(d) = self.desired.get() else {
-            return Reply::Nothing;
-        };
-        let reply = decide(&d, &fleet, &who.node_id, now);
-        if let Reply::Update { version } = &reply {
-            fleet.order(who.node_id, version.clone(), now);
+        for one in &announced {
+            let runs_here = self
+                .services
+                .get(&one.name)
+                .is_some_and(|def| def.roles.contains_key(&who.role));
+            if runs_here {
+                fleet.record_in(
+                    &one.name,
+                    who.node_id.clone(),
+                    who.role,
+                    one.as_heartbeat(platform),
+                    now,
+                );
+            }
         }
-        reply
+        let desired = self.desired.all();
+        let names = std::iter::once(KBF).chain(announced.iter().map(|one| one.name.as_str()));
+        for name in names {
+            let reply = decide_in(&self.services, &desired, name, &fleet, &who.node_id, now);
+            if let Reply::Update { version } = reply {
+                fleet.order(name, who.node_id.clone(), version.clone(), now);
+                return ServiceReply::Update {
+                    service: (name != KBF).then(|| name.to_owned()),
+                    version,
+                };
+            }
+        }
+        ServiceReply::Nothing
     }
 
     /// The CI token in `bearer`, checked by the verifier.
@@ -170,13 +254,23 @@ impl Coordinator {
         body: &[u8],
     ) -> Result<Desired, SetError> {
         let verified = self.ci(bearer).await?;
+        let (service, desired) =
+            Desired::parse_request_for(body, |name| self.services.get(name).is_some())?;
+        if !verified.services.contains(&service) {
+            tracing::warn!(
+                workflow = %verified.job_workflow_ref,
+                %service,
+                "refused a desired state: the allow-list entry does not name the service"
+            );
+            return Err(SetError::Forbidden);
+        }
+        self.desired.set(&service, desired.clone())?;
         tracing::info!(
             workflow = %verified.job_workflow_ref,
             sha = ?verified.sha,
+            %service,
             "desired state set by CI"
         );
-        let desired = Desired::parse(body)?;
-        self.desired.set(desired.clone())?;
         Ok(desired)
     }
 
@@ -197,29 +291,56 @@ impl Coordinator {
                 node_id: id.to_string(),
                 role: host.role.name(),
                 live: host.is_live(now),
-                up: fleet.is_up(id, host, now),
-                holds_slot: fleet.holds_slot(id, host, now),
+                up: fleet.is_up(KBF, id, host, now),
+                holds_slot: fleet.holds_slot(KBF, id, host, now),
                 silent_secs: now.saturating_sub(host.seen).as_secs(),
                 beat: host.beat.clone(),
             })
             .collect();
+        let per_service = self
+            .services
+            .names()
+            .map(|name| {
+                let desired = self.desired.get(name);
+                let roles = role_counts(name, desired.as_ref(), &fleet, now);
+                (name.to_owned(), ServiceStatus { desired, roles })
+            })
+            .collect();
         Ok(Status {
-            desired: self.desired.get(),
+            per_service,
+            desired: self.desired.get(KBF),
+            services: self.desired.all(),
             quiet: fleet.is_quiet(now),
+            services_dropped: self.services_dropped.load(Ordering::Relaxed),
             hosts,
+            commit: crate::BUILD_COMMIT,
         })
     }
 
-    /// Where the farm stands against the desired state, if `bearer` is a GitHub Actions
-    /// OIDC token the same allow-list accepts as for [`Self::set_desired`]. The operator
-    /// token is no CI token and is refused. Read-only, and each token is good once.
+    /// Where the hosts of `service` stand against its desired state, if `bearer` is a
+    /// GitHub Actions OIDC token the same allow-list accepts as for [`Self::set_desired`]
+    /// (any service may be read with any accepted token). The operator token is no CI token
+    /// and is refused. Read-only, and each token is good once.
     ///
     /// # Errors
-    /// [`CiRefused`].
-    pub async fn convergence(&self, bearer: Option<&str>) -> Result<Convergence, CiRefused> {
+    /// [`ConvergenceError`].
+    pub async fn convergence(
+        &self,
+        bearer: Option<&str>,
+        service: &str,
+    ) -> Result<Convergence, ConvergenceError> {
         self.ci(bearer).await?;
+        let def = self
+            .services
+            .get(service)
+            .ok_or(ConvergenceError::UnknownService)?;
         let now = (self.clock)();
         let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
-        Ok(converge(self.desired.get().as_ref(), &fleet, now))
+        let desired = self.desired.get(service);
+        Ok(if service == KBF {
+            converge(desired.as_ref(), &fleet, now)
+        } else {
+            converge_service(def, desired.as_ref(), &fleet, now)
+        })
     }
 }

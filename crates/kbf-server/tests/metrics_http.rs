@@ -40,9 +40,13 @@ fn start_with(local: Option<Arc<LocalCache>>) -> (SocketAddr, SocketAddr) {
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         default_platform: kbf_front::DefaultPlatform::NONE,
+        qos_allowed: kbf_front::QosAllow::DEFAULT,
         memory_ladder: kbf_server::MemoryLadder::default(),
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
+        scheduler_core: kbf_server::SchedulerCore::under_test(),
+        placement_load: kbf_server::PlacementLoad::Off,
+        whole_node: None,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         streams: kbf_server::StreamTiming::default(),
@@ -123,6 +127,10 @@ async fn metrics_count_what_the_reapi_listener_serves() {
     );
     assert_eq!(sample(&body, "kbf_bytestream_write_requests_total"), 0);
     assert!(!body.contains("kbf_local_cache"), "{body}");
+    // The scheduler core the farm runs: one series per core, 1 for the running one.
+    assert!(body.contains("# TYPE kbf_scheduler_core gauge"), "{body}");
+    assert_eq!(sample(&body, "kbf_scheduler_core{core=\"legacy\"}"), 1);
+    assert_eq!(sample(&body, "kbf_scheduler_core{core=\"js\"}"), 0);
     // The loss-mark families, read from the metadata state at the scrape.
     assert!(body.contains("# TYPE kbf_cache_lost_blobs gauge"), "{body}");
     assert!(

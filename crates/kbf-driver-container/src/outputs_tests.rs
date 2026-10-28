@@ -321,3 +321,44 @@ async fn a_log_goes_to_the_intake_in_the_read_that_hashes_it() {
     assert_eq!(declining.put(), [label(&digest)]);
     assert_eq!(declining.cas.blob(&digest), Some(b"0123456789".to_vec()));
 }
+
+/// Catches the Directory messages of the outputs being digested on an async worker (it
+/// is hashing, and a large tree has many), or on the blocking pool, which has up to 64
+/// threads and no regard for the node's cores: they are digested on the CPU pool, the
+/// one pool whose size is the node's budget for hashing. The test's runtime runs on the
+/// test's own thread, so it is the async worker here.
+#[tokio::test]
+async fn the_directory_messages_are_digested_on_the_cpu_pool() {
+    let upper = scratch("digest-pool");
+    std::fs::create_dir_all(upper.join("out/d")).expect("mkdir");
+    std::fs::write(upper.join("out/d/f"), "digest me").expect("write");
+    let pool = CpuPool::new(1);
+    let pool_thread = pool
+        .run(|| std::thread::current().id())
+        .await
+        .expect("pool thread");
+    let worker = std::thread::current().id();
+    let mut result = ActionResult::default();
+    collect(
+        &crate::cas::MemoryCas::new(),
+        &upper,
+        &pool,
+        "",
+        &["out".to_owned()],
+        OutputLimits::DEFAULT,
+        None,
+        &mut result,
+    )
+    .await
+    .expect("collect");
+    assert_eq!(result.output_directories.len(), 1);
+    let ran = ASSEMBLED_ON
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert!(!ran.contains(&worker), "the digest ran on the async worker");
+    assert!(
+        ran.contains(&pool_thread),
+        "the digest did not run on the CPU pool"
+    );
+}

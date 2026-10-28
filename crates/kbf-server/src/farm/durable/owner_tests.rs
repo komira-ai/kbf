@@ -323,6 +323,7 @@ fn a_hello_reads_the_leases_and_the_session_of_the_node_it_takes_over() {
         lease: LeaseId::new(5, 9),
         operation: OperationId(9),
         worker: node(),
+        cost: Default::default(),
     };
     let record = ControlRecord::Lease(orphan.clone());
     let row = encode(FarmInput::Committed(record)).expect("row");

@@ -79,6 +79,7 @@ fn another_grant(operation: u64, seq: u64) -> Txn {
         lease: LeaseId::new(5, seq),
         operation: OperationId(operation),
         worker: WorkerId::new("node-b"),
+        cost: Default::default(),
     };
     let value = encode(FarmInput::Committed(ControlRecord::Lease(grant))).expect("encodes");
     Txn::new()

@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 
-pub use config::{ConfigError, LEEWAY_SECS, OidcConfig};
+pub use config::{AllowList, ConfigError, DEFAULT_SERVICES, LEEWAY_SECS, OidcConfig};
 pub use https::{HttpsKeys, Roots};
 pub use keys::{KeyCache, KeySource};
 
@@ -140,6 +140,10 @@ pub struct Verified {
     pub git_ref: Option<String>,
     /// The `sha` of the commit, if the token had one.
     pub sha: Option<String>,
+    /// Which entry of the allow-list admitted the token (its place in the file, from 0).
+    pub entry: usize,
+    /// The services that entry lets the token set (`["kbf"]` when the file names none).
+    pub services: Vec<String>,
 }
 
 /// The current time in seconds since the epoch.
@@ -157,7 +161,7 @@ pub fn system_clock() -> Clock {
 
 /// Checks tokens against one allow-list.
 pub struct Verifier {
-    config: OidcConfig,
+    config: AllowList,
     keys: KeyCache,
     seen: Mutex<BTreeMap<String, u64>>,
     clock: Clock,
@@ -166,7 +170,7 @@ pub struct Verifier {
 impl std::fmt::Debug for Verifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Verifier")
-            .field("issuer", &self.config.issuer)
+            .field("issuer", &self.config.issuer())
             .finish_non_exhaustive()
     }
 }
@@ -190,17 +194,18 @@ fn is_one_of(list: &[String], value: &str) -> bool {
 }
 
 impl Verifier {
-    /// A verifier for `config` that reads keys from `source`, refetching for an unknown
-    /// `kid` at most once per `refetch_interval`, and reads time from `clock`.
+    /// A verifier for `config` (an [`AllowList`], or one [`OidcConfig`]) that reads keys from
+    /// `source`, refetching for an unknown `kid` at most once per `refetch_interval`, and
+    /// reads time from `clock`.
     #[must_use]
     pub fn new(
-        config: OidcConfig,
+        config: impl Into<AllowList>,
         source: Arc<dyn KeySource>,
         refetch_interval: Duration,
         clock: Clock,
     ) -> Self {
         Self {
-            config,
+            config: config.into(),
             keys: KeyCache::new(source, refetch_interval),
             seen: Mutex::new(BTreeMap::new()),
             clock,
@@ -219,14 +224,52 @@ impl Verifier {
             return Err(Refusal::BadSignature);
         }
         let claims = &parsed.claims;
-        let c = &self.config;
+        // The first entry that admits the token wins; when none does, the refusal is the
+        // first entry's, which for a one-entry list is the entry's own.
+        let mut first_refusal = None;
+        let mut admitted = None;
+        for (entry, c) in self.config.entries().iter().enumerate() {
+            match Self::check(c, claims, now) {
+                Ok(found) => {
+                    admitted = Some((entry, c, found));
+                    break;
+                }
+                Err(refusal) => {
+                    first_refusal.get_or_insert(refusal);
+                }
+            }
+        }
+        let Some((entry, c, (exp, workflow))) = admitted else {
+            return Err(first_refusal.unwrap_or(Refusal::Repository));
+        };
+        let jti = text(claims, "jti")?;
+        if jti.is_empty() || jti.len() > 256 {
+            return Err(Refusal::MissingClaim("jti"));
+        }
+        self.spend(jti, exp, now)?;
+        Ok(Verified {
+            jti: jti.to_owned(),
+            job_workflow_ref: workflow.to_owned(),
+            git_ref: text(claims, "ref").ok().map(str::to_owned),
+            sha: text(claims, "sha").ok().map(str::to_owned),
+            entry,
+            services: c.services.clone(),
+        })
+    }
+
+    /// The claims against one entry; returns `exp` and the workflow.
+    fn check<'a>(
+        c: &OidcConfig,
+        claims: &'a Map<String, Value>,
+        now: u64,
+    ) -> Result<(i64, &'a str), Refusal> {
         if text(claims, "iss")? != c.issuer {
             return Err(Refusal::Issuer);
         }
         if !audience_is(claims, &c.audience)? {
             return Err(Refusal::Audience);
         }
-        let exp = self.times(claims, now)?;
+        let exp = Self::times(c, claims, now)?;
         if text(claims, "repository_id")? != c.repository_id
             || c.repository
                 .as_deref()
@@ -250,21 +293,11 @@ impl Verifier {
         if text(claims, "runner_environment")? != c.runner_environment {
             return Err(Refusal::Runner);
         }
-        let jti = text(claims, "jti")?;
-        if jti.is_empty() || jti.len() > 256 {
-            return Err(Refusal::MissingClaim("jti"));
-        }
-        self.spend(jti, exp, now)?;
-        Ok(Verified {
-            jti: jti.to_owned(),
-            job_workflow_ref: workflow.to_owned(),
-            git_ref: text(claims, "ref").ok().map(str::to_owned),
-            sha: text(claims, "sha").ok().map(str::to_owned),
-        })
+        Ok((exp, workflow))
     }
 
     /// `exp`, `nbf` and `iat` against `now`; returns `exp`.
-    fn times(&self, claims: &Map<String, Value>, now: u64) -> Result<i64, Refusal> {
+    fn times(c: &OidcConfig, claims: &Map<String, Value>, now: u64) -> Result<i64, Refusal> {
         let leeway = i64::try_from(LEEWAY_SECS).unwrap_or(60);
         let now = i64::try_from(now).unwrap_or(i64::MAX);
         let (exp, iat) = (whole(claims, "exp")?, whole(claims, "iat")?);
@@ -280,7 +313,7 @@ impl Verifier {
         if iat > now.saturating_add(leeway) {
             return Err(Refusal::IssuedInFuture);
         }
-        let limit = i64::try_from(self.config.max_lifetime_secs).unwrap_or(i64::MAX);
+        let limit = i64::try_from(c.max_lifetime_secs).unwrap_or(i64::MAX);
         if exp <= iat || exp.saturating_sub(iat) > limit {
             return Err(Refusal::Lifetime);
         }
@@ -321,6 +354,8 @@ fn audience_is(claims: &Map<String, Value>, want: &str) -> Result<bool, Refusal>
 mod tests;
 #[cfg(test)]
 mod tests_edges;
+#[cfg(test)]
+mod tests_entries;
 
 #[cfg(any(test, feature = "testkit"))]
 #[allow(clippy::missing_panics_doc, clippy::missing_errors_doc)]

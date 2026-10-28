@@ -1,0 +1,87 @@
+# a run the daemon lost runs again, then is given up
+> [t=0ms] start
+  farm term=7 lease_epoch=7
+  txn applied rev=1 counters=[]
+    put meta/epoch cond=absent len=8 sha=a3eb8db89fc5123c ttl=-
+  txn applied rev=2 counters=[]
+    put meta/next_op cond=absent len=8 sha=f44b28e2244100cb ttl=-
+  txn applied rev=3 counters=[]
+    put meta/next_seq cond=absent len=8 sha=f44b28e2244100cb ttl=-
+> [t=0ms] register node-a cores=4 gib=8 drivers=container
+  txn applied rev=4 counters=[]
+    put owner/node-a cond=absent len=16 sha=4ff190b4c2c573ec ttl=-
+  txn applied rev=5 counters=[]
+    put session/node-a cond=any len=70 sha=2b29556b96e9b197 ttl=60000ms
+  msg node-a welcome protocol=1 interval_ms=5000 epoch=7 pack_commit=false
+> [t=0ms] register node-b cores=4 gib=8 drivers=container
+  txn applied rev=6 counters=[]
+    put owner/node-b cond=absent len=16 sha=4ff190b4c2c573ec ttl=-
+  txn applied rev=7 counters=[]
+    put session/node-b cond=any len=70 sha=bbf330e872319459 ttl=60000ms
+  msg node-b welcome protocol=1 interval_ms=5000 epoch=7 pack_commit=false
+> [t=0ms] submit flaky qos=ci kind=action cores_milli=1000 mem_gib=1 do_not_cache=false
+  ticket flaky#1 name=operations/0
+  txn applied rev=11 counters=[]
+    put op/0000000000000000 cond=absent len=75 sha=8136470751ede4ae ttl=-
+    put subject/0000000000000000 cond=absent len=14 sha=94cc2b4579cc70de ttl=-
+    put queue/0000000000000000 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=absent len=8 sha=af5570f5a1810b7a ttl=-
+  txn applied rev=14 counters=[]
+    check owner/node-a cond=v4
+    del queue/0000000000000000 cond=v10
+    put lease/0000000000000007.0000000000000000 cond=absent len=20 sha=3c9486d0aaad3084 ttl=-
+    put lease-by-op/0000000000000000 cond=any len=16 sha=e8dd943d366caae7 ttl=-
+  msg node-a lease_offer lease=7/0 kind=action action=flaky
+  msg node-a start lease=7/0 kind=action action=flaky millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+  stage flaky#1 executing
+> [t=0ms] result node-a lease=7/0 action=flaky ended=lost_to_restart
+  ack lease=7/0 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=18 counters=[]
+    check owner/node-a cond=v4
+    check op/0000000000000000 cond=v8
+    del lease/0000000000000007.0000000000000000 cond=v13
+    del lease-by-op/0000000000000000 cond=any
+    put fate/0000000000000000 cond=absent len=43 sha=bc98ee7e557cae09 ttl=-
+    put queue/0000000000000000 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+> [t=0ms] tick
+  txn applied rev=21 counters=[]
+    check owner/node-b cond=v6
+    del queue/0000000000000000 cond=v18
+    put lease/0000000000000007.0000000000000001 cond=absent len=22 sha=631c803e026bc98d ttl=-
+    put lease-by-op/0000000000000000 cond=any len=16 sha=4ff190b4c2c573ec ttl=-
+  msg node-b lease_offer lease=7/1 kind=action action=flaky
+  msg node-b start lease=7/1 kind=action action=flaky millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+> [t=0ms] result node-b lease=7/1 action=flaky ended=lost_to_restart
+  ack lease=7/1 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=25 counters=[]
+    check owner/node-b cond=v6
+    check op/0000000000000000 cond=v8
+    del lease/0000000000000007.0000000000000001 cond=v20
+    del lease-by-op/0000000000000000 cond=any
+    put fate/0000000000000000 cond=v17 len=61 sha=93687a370c3cac7e ttl=-
+    put queue/0000000000000000 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+> [t=0ms] tick
+  txn applied rev=28 counters=[]
+    check owner/node-a cond=v4
+    del queue/0000000000000000 cond=v25
+    put lease/0000000000000007.0000000000000002 cond=absent len=22 sha=53439693140053c0 ttl=-
+    put lease-by-op/0000000000000000 cond=any len=16 sha=8d91efc5106ff3a3 ttl=-
+  msg node-a lease_offer lease=7/2 kind=action action=flaky
+  msg node-a start lease=7/2 kind=action action=flaky millicpus=1000 memory_bytes=1073741824 heartbeat_seq=0 valid_for_ms=14000 device="" job=false fence=0
+> [t=0ms] result node-a lease=7/2 action=flaky ended=lost_to_restart
+  ack lease=7/2 accepted=true reason=RESULT_ACK_REASON_ACCEPTED
+  txn applied rev=39 counters=[]
+    check owner/node-a cond=v4
+    del lease/0000000000000007.0000000000000002 cond=v27
+    del inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=v11
+    put doneof/0000000000000000 cond=any len=45 sha=f0fd36d49c3d8936 ttl=600000ms
+    del op/0000000000000000 cond=any
+    del queue/0000000000000000 cond=any
+    del loss/0000000000000000 cond=any
+    del fate/0000000000000000 cond=any
+    del subject/0000000000000000 cond=any
+    del opkey/0000000000000000 cond=any
+    del lease-by-op/0000000000000000 cond=any
+    put done/0000000000000000 cond=any len=273 sha=a62a34f7df9ea581 ttl=600000ms
+  stage flaky#1 done failed code=13 message="kbf farm fault on node-a: the daemon restarted while the action ran, and its reruns are used up. Operator fix: find why the node's daemon restarted (its log says how it ended). Runs: 3 (node-a, daemon restarted; node-b, daemon restarted; node-a, daemon restarted)." details=[]
+> [t=0ms] tick

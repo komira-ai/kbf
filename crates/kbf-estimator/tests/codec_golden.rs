@@ -2,9 +2,12 @@
 //! little-endian fields, an FNV-1a checksum) that the state store keeps in an `est/` row
 //! and that every later build must read as the summary it was written from.
 //!
-//! `tests/golden/codec/` holds the record of each summary below as hex text, after comment
-//! lines (beginning with `#`) that say what the file pins. The summaries are built from
-//! runs of the shapes a farm records: quiet successes of several sizes on several days, an
+//! `tests/golden/codec-v2/` holds the record of each summary below as hex text, after comment
+//! lines (beginning with `#`) that say what the file pins. The summaries are synthetic: no
+//! farm data was read to make them. Each is made by feeding made-up runs to the estimator's
+//! own update path (`Summary::new` and `Summary::observe`, the calls `Summaries::observe`
+//! makes) and encoding what it holds, so a summary is a state that path can reach. The runs
+//! have the shapes a farm records: quiet successes of several sizes on several days, an
 //! own-limit kill that sets a floor, node-pressure kills, a Mac footprint and a mix of small
 //! and large runs that wraps the sample ring. This test requires, for each file:
 //!
@@ -14,20 +17,29 @@
 //!   rewrite of a row);
 //! - a record with its version byte changed, or any other byte changed, is refused.
 //!
-//! The corpus is append-only: a file that exists is never rewritten to match a new encoding,
-//! because its bytes are what an earlier build wrote. A change to a file needs a reason in
-//! the pull request that makes it. A summary without a file is written by `cargo test -p
-//! kbf-estimator --test codec_golden -- --ignored write_missing_files`, which never replaces
-//! a file.
+//! `tests/golden/codec/` holds the records the build before the version 2 record (which adds
+//! the 32-byte minute ring) wrote for the same corpus. Those files are what stores written by
+//! that build hold: this build reads each as a summary and writes it back as version 2, which
+//! reads as the same summary.
+//!
+//! Both directories are append-only: a file that exists is never rewritten to match a new
+//! encoding, because its bytes are what an earlier build wrote. A change to a file needs a
+//! reason in the pull request that makes it. A summary without a file in `codec-v2` is
+//! written by `cargo test -p kbf-estimator --test codec_golden -- --ignored
+//! write_missing_files`, which never replaces a file.
 
 use std::path::{Path, PathBuf};
 
 use kbf_estimator::{Basis, Bounds, Day, GIB, MIB, Outcome, Run, Summary};
 
 /// The version byte of the record, its first byte.
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 /// The length of the record: every field, fixed.
-const LEN: usize = 686;
+const LEN: usize = 718;
+/// The version byte of the record the build before wrote.
+const VERSION_1: u8 = 1;
+/// The length of that record: [`LEN`] without the 32 bytes of the minute ring.
+const LEN_1: usize = LEN - 32;
 
 /// A run of `outcome` that took 2 s of wall time and used `peak` bytes of a booking of 4 GiB.
 fn run(outcome: Outcome, peak: u64) -> Run {
@@ -150,6 +162,11 @@ fn corpus() -> Vec<(&'static str, Summary)> {
 }
 
 fn golden_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/codec-v2")
+}
+
+/// The files of the version 1 records.
+fn golden_dir_1() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/codec")
 }
 
@@ -167,7 +184,12 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The record in the file `name`.hex of the golden directory, without its comment lines.
 fn record(name: &str) -> Vec<u8> {
-    let path = golden_dir().join(format!("{name}.hex"));
+    record_in(&golden_dir(), name)
+}
+
+/// The record in the file `name`.hex of `dir`, without its comment lines.
+fn record_in(dir: &Path, name: &str) -> Vec<u8> {
+    let path = dir.join(format!("{name}.hex"));
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let digits: String = text.lines().filter(|line| !line.starts_with('#')).collect();
     unhex(digits.trim())
@@ -227,23 +249,60 @@ fn a_record_that_is_not_exactly_one_of_the_files_is_refused() {
     }
 }
 
-/// Asserts that the golden directory holds a file for every summary of the corpus and no
-/// other file: a file added without the summary it must decode to, and a file deleted, each
-/// fail here.
-#[test]
-fn the_golden_directory_holds_exactly_the_files_the_corpus_names() {
-    let mut found: Vec<String> = std::fs::read_dir(golden_dir())
-        .expect("the golden directory")
+/// The names of the files in `dir`, sorted.
+fn files_in(dir: &Path) -> Vec<String> {
+    let mut found: Vec<String> = std::fs::read_dir(dir)
+        .expect("a golden directory")
         .map(|entry| entry.expect("an entry").file_name())
         .map(|name| name.to_string_lossy().into_owned())
         .collect();
     found.sort();
+    found
+}
+
+/// Asserts that each golden directory holds a file for every summary of the corpus and no
+/// other file: a file added without the summary it must decode to, and a file deleted, each
+/// fail here.
+#[test]
+fn the_golden_directories_hold_exactly_the_files_the_corpus_names() {
     let mut named: Vec<String> = corpus()
         .into_iter()
         .map(|(name, _)| format!("{name}.hex"))
         .collect();
     named.sort();
-    assert_eq!(found, named);
+    assert_eq!(files_in(&golden_dir()), named);
+    assert_eq!(files_in(&golden_dir_1()), named);
+}
+
+/// Catches: a build that cannot read a record the build before it wrote (a store written by
+/// that build holds only these), and one that writes such a record back as something that
+/// does not read as the same summary: each version 1 file decodes, is written as a version 2
+/// record with the minute ring added, and that record decodes to the same summary. A version 1
+/// record with a byte changed or cut short is refused as before.
+#[test]
+fn a_version_1_record_still_reads_and_is_written_back_as_version_2() {
+    for (name, _) in corpus() {
+        let bytes = record_in(&golden_dir_1(), name);
+        assert_eq!(bytes.len(), LEN_1, "{name}: the length of the record");
+        assert_eq!(bytes[0], VERSION_1, "{name}: the version byte");
+        let read = Summary::decode(&bytes).unwrap_or_else(|| panic!("{name}: not read"));
+        let again = read.encode();
+        assert_eq!(again.len(), LEN, "{name}: written back at the new length");
+        assert_eq!(again[0], VERSION, "{name}: written back as the new version");
+        assert_eq!(
+            Summary::decode(&again),
+            Some(read),
+            "{name}: the same summary"
+        );
+        let mut flipped = bytes.clone();
+        flipped[LEN_1 / 2] ^= 0x01;
+        assert_eq!(Summary::decode(&flipped), None, "{name}: a byte changed");
+        assert_eq!(
+            Summary::decode(&bytes[..LEN_1 - 1]),
+            None,
+            "{name}: cut short"
+        );
+    }
 }
 
 /// Catches: a corpus that has lost the shapes it is there for: a floor set by a kill, both
@@ -274,6 +333,7 @@ fn write_missing_files() {
         }
         let text = format!(
             "# Size summary `{name}`: the stored record of one summary, version {VERSION}.\n\
+             # Synthetic: made-up runs fed to the estimator's update path, not farm data.\n\
              # Pins: this build encodes the summary to these bytes, decodes them to it, and\n\
              # refuses a record with any byte changed.\n\
              # A change to this file needs a reason in the pull request that makes it, and the\n\
