@@ -208,6 +208,19 @@ pub enum Event {
         /// reboot there are none), or ended with a result not yet acknowledged.
         running: Vec<LeaseId>,
     },
+    /// A worker's newest busy reading: the CPU time its actions used over its last
+    /// heartbeat window, in CPU-milliseconds per second (`Heartbeat.busy_millis`; a
+    /// heartbeat with none feeds none). Taken at the input's farm time, it replaces the
+    /// worker's earlier reading and restarts the count of leases admitted since it. Only
+    /// read when the scheduler was given a CPU admission clause
+    /// ([`crate::Scheduler::with_cpu_admission`]); does not count as hearing from the
+    /// worker, and is ignored for a worker that never registered.
+    Busy {
+        /// The worker.
+        worker: WorkerId,
+        /// CPU-milliseconds per second.
+        busy_millis: u64,
+    },
     /// The worker's phase, from each `Hello` it sends (the registration's included,
     /// fed right after its [`Event::WorkerUp`]). Counts as hearing from it. Ignored for
     /// a worker that never registered.

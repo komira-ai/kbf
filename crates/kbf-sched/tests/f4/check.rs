@@ -345,6 +345,7 @@ impl Checker {
             Event::Heartbeat { worker, running } => self.heartbeat(&worker, &running),
             // The world switches no node's session.
             Event::Phase { .. } => unreachable!("F4 feeds no node phase"),
+            Event::Busy { .. } => unreachable!("F4 feeds no busy reading"),
             Event::Submit { waiter, request } => self.submit(waiter, request),
             Event::Committed(ControlRecord::Lease(grant)) => self.lease_committed(&grant),
             Event::Committed(ControlRecord::Result(record)) => self.result_committed(&record),

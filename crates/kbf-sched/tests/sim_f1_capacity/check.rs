@@ -493,6 +493,7 @@ impl Checker {
             }
             // The world switches no node's session.
             Event::Phase { .. } => unreachable!("F1 feeds no node phase"),
+            Event::Busy { .. } => unreachable!("F1 feeds no busy reading"),
             Event::Submit { waiter, request } => self.submit(*waiter, request, effects, sched),
             Event::Committed(ControlRecord::Lease(grant)) => {
                 self.lease_committed(grant.lease, grant.operation, effects);

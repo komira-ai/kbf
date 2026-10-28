@@ -83,6 +83,7 @@
 
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
+mod admit;
 mod cordon;
 mod devices;
 pub mod fence;
@@ -93,6 +94,7 @@ mod requeue;
 mod scheduler;
 mod servable;
 
+pub use admit::{CpuAdmission, DEFAULT_MAX_WAIT, DEFAULT_RAMP, STALE_AFTER};
 pub use cordon::Cordon;
 pub use devices::DEVICE_LEASES_PER_WORKER;
 pub use fence::SelfFence;

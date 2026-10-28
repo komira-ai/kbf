@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use kbf_caps::NodeCaps;
 use kbf_types::{FarmTime, LeaseKind, NodePhase, Resources, WorkerId};
 
+use crate::admit::Gate;
 use crate::cordon::Cordons;
 use crate::input::Request;
 use crate::scheduler::Worker;
@@ -108,6 +109,10 @@ impl Servable {
     /// waits until some worker's free memory meets its request; nothing reserves a worker
     /// for it.
     ///
+    /// A worker the CPU admission clause holds back for this request (`gate`,
+    /// [`crate::admit`]) is skipped like one without room, and the placement counts
+    /// against the ramp of the one it takes.
+    ///
     /// With `not_whole` (a request a key floor raised) a worker whose memory the request
     /// equals is skipped: there it would own the host. [`Servable::roomy`] tells whether
     /// any worker is left.
@@ -123,6 +128,7 @@ impl Servable {
         reserved: &BTreeSet<WorkerId>,
         avoid: &BTreeSet<WorkerId>,
         not_whole: bool,
+        gate: &Gate<'_>,
     ) -> Option<(WorkerId, Resources, Option<String>)> {
         let at = self.matching(workers, request);
         let skip = self.avoided(at, workers, request, avoid);
@@ -133,7 +139,7 @@ impl Servable {
             .filter(|name| {
                 !reserved.contains(*name)
                     && !skip.contains(*name)
-                    && workers[*name].has_room(request)
+                    && workers[*name].has_room(request, gate)
                     && (!not_whole || !workers[*name].exclusive(request))
             })
             // The first of the least loaded: `live` is in name order.
@@ -152,6 +158,12 @@ impl Servable {
         };
         worker.booked = worker.booked.saturating_add(booked);
         worker.leases += 1;
+        if request.kind == LeaseKind::Action
+            && let Some(busy) = &mut worker.busy
+        {
+            // The reading does not know of this lease: the ramp counts it.
+            busy.admitted_one();
+        }
         let device = worker.free_device(&request.needs).map(str::to_owned);
         worker.devices.extend(device.clone());
         Some((name, booked, device))

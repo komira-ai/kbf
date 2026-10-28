@@ -315,6 +315,7 @@ impl Check {
             }
             // The fleet switches no node's session.
             Event::Phase { .. } => unreachable!("F3 feeds no node phase"),
+            Event::Busy { .. } => unreachable!("F3 feeds no busy reading"),
             Event::Submit { waiter, request } => {
                 let id = self.next_op();
                 self.ops.insert(

@@ -148,5 +148,9 @@ pub fn event(event: &Event) -> String {
             text::time(*deadline)
         ),
         Event::Uncordon { worker } => format!("uncordon(worker={})", text::worker(worker)),
+        Event::Busy {
+            worker,
+            busy_millis,
+        } => format!("busy(worker={} millis={busy_millis})", text::worker(worker)),
     }
 }

@@ -32,6 +32,7 @@ use kbf_types::{
     ResultRecord, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
 };
 
+use crate::admit::{Busy, CpuAdmission, Gate};
 use crate::cordon::Cordons;
 use crate::fence::{HANDOVER_GRACE, LEASE_GRACE};
 use crate::input::{DaemonInstance, Event, Input, Request};
@@ -183,6 +184,9 @@ pub(crate) struct Worker {
     /// worker is silent ([`crate::fence::SESSION_SWITCH_GRACE`] after that phase was
     /// first reported).
     switch_ends: FarmTime,
+    /// Its newest busy reading and the leases placed since ([`crate::admit`]); `None`
+    /// until the session's first reading.
+    pub(crate) busy: Option<Busy>,
 }
 
 impl Worker {
@@ -231,7 +235,11 @@ impl Worker {
     /// lease and its capacity holds the request. A
     /// request for an iOS device also needs a free device that satisfies it
     /// ([`Worker::free_device`]).
-    pub(crate) fn has_room(&self, request: &Request) -> bool {
+    ///
+    /// An action also waits where the CPU admission clause says so ([`crate::admit`]):
+    /// `gate` carries it, the farm time and how long the request has been queued; it
+    /// delays a placement and is not part of whether the worker could ever run it.
+    pub(crate) fn has_room(&self, request: &Request, gate: &Gate<'_>) -> bool {
         let room = match request.kind {
             LeaseKind::WholeMachine => self.leases == 0 && self.capacity.fits(&request.resources),
             // An action's memory is the cgroup limit it first runs under, not a booking:
@@ -246,6 +254,7 @@ impl Worker {
                     && request.resources.memory_bytes <= self.capacity.memory_bytes
                     && self.under_lease_cap()
                     && (!self.exclusive(request) || self.leases == 0)
+                    && gate.admits(self.busy.as_ref(), self.capacity.cpu_millis, self.leases)
             }
             // A VM's memory is a booking: the guest holds it whole for as long as it runs,
             // so what other leases hold of the node's memory keeps it out: a VM is placed
@@ -345,6 +354,8 @@ pub struct Scheduler {
     grace_until: FarmTime,
     /// How many lost leases refuse an operation ([`Scheduler::with_loss_requeues`]).
     loss_cap: u32,
+    /// Admission by measured CPU, when on ([`Scheduler::with_cpu_admission`]).
+    cpu_admission: Option<CpuAdmission>,
 }
 
 impl Scheduler {
@@ -376,7 +387,18 @@ impl Scheduler {
             store_down: false,
             grace_until: FarmTime::default(),
             loss_cap: u32::MAX,
+            cpu_admission: None,
         }
+    }
+
+    /// This scheduler placing an action on a node only while the node's CPUs are not
+    /// used up by its other work, as its daemon measures it ([`Event::Busy`]): see
+    /// [`CpuAdmission`] and [`crate::admit`] for the rule and what it lets through.
+    /// Off by default.
+    #[must_use]
+    pub const fn with_cpu_admission(mut self, admission: CpuAdmission) -> Self {
+        self.cpu_admission = Some(admission);
+        self
     }
 
     /// This scheduler, keeping a finished operation for `retention` after its waiters
@@ -595,9 +617,21 @@ impl Scheduler {
             let key_raised = op
                 .key_applied
                 .is_some_and(|a| !a.undone && a.applied == request.resources.memory_bytes);
+            let gate = Gate {
+                policy: self.cpu_admission.as_ref(),
+                now,
+                waited: now.saturating_duration_since(op.queued_at),
+            };
             let fitted = placed.len() < round
                 && servable
-                    .fit(&mut self.workers, request, &reserved, &op.avoid, key_raised)
+                    .fit(
+                        &mut self.workers,
+                        request,
+                        &reserved,
+                        &op.avoid,
+                        key_raised,
+                        &gate,
+                    )
                     .map(|(name, booked, device)| placed.push((id, name, booked, device)))
                     .is_some();
             let verdict = if fitted {
@@ -933,6 +967,8 @@ impl StateMachine for Scheduler {
                         w.caps = caps;
                         w.last_heard = now;
                         w.session += 1;
+                        // A new session's daemon measures its own windows.
+                        w.busy = None;
                     }
                     None => {
                         let mut fresh = Worker {
@@ -950,6 +986,7 @@ impl StateMachine for Scheduler {
                             stopped_process: None,
                             phase: NodePhase::Serving,
                             switch_ends: FarmTime::default(),
+                            busy: None,
                         };
                         self.adopt(&worker, &mut fresh);
                         self.workers.insert(worker, fresh);
@@ -976,6 +1013,15 @@ impl StateMachine for Scheduler {
                 }
                 None => Vec::new(),
             },
+            Event::Busy {
+                worker,
+                busy_millis,
+            } => {
+                if let Some(w) = self.workers.get_mut(&worker) {
+                    w.busy = Some(Busy::new(busy_millis, self.now));
+                }
+                Vec::new()
+            }
             Event::Phase { worker, phase } => self.take_phase(&worker, phase),
             Event::Submit { waiter, request } => self.submit(waiter, request),
             Event::Committed(ControlRecord::Lease(grant)) => {
