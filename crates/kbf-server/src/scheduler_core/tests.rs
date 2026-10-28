@@ -133,8 +133,8 @@ impl Log {
 /// Catches a start that does not log the core it runs, and a refusal that comes after
 /// anything is opened. A server over a log and store the test opened logs
 /// `scheduler core: legacy` once; `js` is refused by `serve_with` before anything is
-/// logged, and by `start` before the store flags are read (this command line has none,
-/// which `start` would refuse in its own words).
+/// logged, and by `start` before it creates any of the store, metadata, state or log
+/// paths it is given.
 #[tokio::test(flavor = "current_thread")]
 async fn a_start_logs_the_core_and_js_is_refused_before_anything_opens() {
     let root = crate::test_dir::scratch_dir("kbf-server-scheduler-core");
@@ -186,13 +186,31 @@ async fn a_start_logs_the_core_and_js_is_refused_before_anything_opens() {
     assert!(refused.to_string().starts_with("--scheduler-core js"));
     assert_eq!(StartFailure::of(&*refused).status(), REFUSED);
 
-    let args = Args::parse_from(["kbf-server", "--scheduler-core=js"]);
+    // `start` is given every path it would create; the refusal leaves none of them.
+    let (cold, hot, meta, state) = (
+        root.join("start-cold"),
+        root.join("start-hot"),
+        root.join("start-meta"),
+        root.join("start-state").join("state.db"),
+    );
+    let args = Args::parse_from([
+        "kbf-server".to_owned(),
+        "--scheduler-core=js".to_owned(),
+        format!("--cold-store=file://{}", cold.display()),
+        format!("--hot-store=file://{}", hot.display()),
+        format!("--meta-dir={}", meta.display()),
+        format!("--state-store=sqlite://{}", state.display()),
+        format!("--log-dir={}", root.join("start-log").display()),
+    ]);
     let refused = start(&args, || Ok(std::future::pending::<()>()))
         .await
         .err()
         .expect("js is refused");
     assert!(refused.to_string().starts_with("--scheduler-core js"));
     assert_eq!(StartFailure::of(&*refused).status(), REFUSED);
+    for path in [&cold, &hot, &meta, &state, &root.join("start-log")] {
+        assert!(!path.exists(), "{} was created", path.display());
+    }
     drop(guard);
     assert!(
         !log.text().contains("scheduler core: js"),

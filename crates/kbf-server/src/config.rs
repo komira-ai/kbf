@@ -336,6 +336,8 @@ pub struct Args {
     /// server has always had. `js` is not available in this release: a server given it
     /// refuses to start (exit status 2) and says so. The core a server runs is logged at
     /// start and exported as `kbf_scheduler_core{core}`, 1 for it and 0 for the other
+    // The text above states the default; the help golden cannot hold the whitespace-only
+    // line clap prints before a `[default: ...]` line.
     #[arg(
         long,
         value_enum,
