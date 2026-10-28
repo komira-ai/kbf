@@ -3,8 +3,10 @@
 //! The clocks are tokio's, paused: a wait is virtual time that passes when nothing else
 //! can run, and no test reads a clock.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use kbf_front::{Backend, Cache, CacheStorage, SegmentsConfig};
@@ -16,7 +18,12 @@ use kbf_storage::{Answer, PutStream, ReadStream, Storage, StorageError};
 use kbf_types::{Digest, Failure, LeaseId, Outcome, WorkerId};
 use tonic::Code;
 
-use crate::answer::{Detail, STORAGE_WAITS, outcome};
+use crate::answer::{Detail, Pause, outcome_pausing};
+
+/// The pause between two asks, spelled out so that a change to the constant is a change
+/// to this test: twelve pauses of five seconds a minute, ten minutes.
+const FIVE_SECONDS: Duration = Duration::from_secs(5);
+const TEN_MINUTES_OF_PAUSES: usize = 120;
 use crate::stamp::Stamp;
 
 /// The error `kbf-route` gives while every owner of an output is down.
@@ -149,12 +156,26 @@ pub(crate) fn ok_result(lease: LeaseId) -> worker::Result {
     }
 }
 
-async fn checked(store: &Arc<Flaky>) -> (Outcome, Option<Detail>) {
+/// A pause that returns at once and keeps each duration it was asked for.
+#[derive(Default)]
+struct Recorded(std::sync::Mutex<Vec<Duration>>);
+
+impl Pause for Recorded {
+    fn pause(&self, for_how_long: Duration) -> impl Future<Output = ()> + Send {
+        self.0.lock().expect("lock").push(for_how_long);
+        std::future::ready(())
+    }
+}
+
+/// The OK result of a lease checked against `store`, and the pauses it waited with.
+async fn checked(store: &Arc<Flaky>) -> (Outcome, Option<Detail>, Vec<Duration>) {
     let cache = Backend::remote(Arc::clone(store) as Arc<dyn Storage>);
     let node = WorkerId::new("node-a");
     let lease = LeaseId::new(7, 1);
-    outcome(
+    let pauses = Recorded::default();
+    let (outcome, detail) = outcome_pausing(
         &cache,
+        &pauses,
         std::time::SystemTime::now,
         lease,
         (
@@ -166,7 +187,9 @@ async fn checked(store: &Arc<Flaky>) -> (Outcome, Option<Detail>) {
         ),
         ok_result(lease),
     )
-    .await
+    .await;
+    let waited = pauses.0.lock().expect("lock").clone();
+    (outcome, detail, waited)
 }
 
 /// Catches an OK result whose check meets a store that cannot answer being failed as an
@@ -178,11 +201,16 @@ async fn an_ok_result_waits_for_a_store_that_cannot_answer() {
     let down = 3 * (1 + kbf_sched::FARM_RERUNS);
     let store = Flaky::down_for(down);
 
-    let (outcome, detail) = checked(&store).await;
+    let (outcome, detail, pauses) = checked(&store).await;
 
     assert!(matches!(outcome, Outcome::Completed { .. }), "{outcome:?}");
     assert!(matches!(detail, Some(Detail::Ran(_))), "{detail:?}");
     assert_eq!(store.asks(), down + 1, "asked until the store answered");
+    assert_eq!(
+        pauses,
+        vec![FIVE_SECONDS; down as usize],
+        "one pause per refusal"
+    );
 }
 
 /// Catches a wait with no end: a store that never answers ends the result as the
@@ -192,14 +220,19 @@ async fn an_ok_result_waits_for_a_store_that_cannot_answer() {
 async fn a_store_that_never_answers_ends_the_wait_as_an_infra_failure() {
     let store = Flaky::down_for(u32::MAX);
 
-    let (outcome, detail) = checked(&store).await;
+    let (outcome, detail, pauses) = checked(&store).await;
 
     assert_eq!(outcome, Outcome::Failed(Failure::Infra));
+    assert_eq!(
+        pauses,
+        vec![FIVE_SECONDS; TEN_MINUTES_OF_PAUSES],
+        "ten minutes of five-second pauses"
+    );
     let Some(Detail::Infra(why)) = detail else {
         panic!("no infrastructure detail: {detail:?}");
     };
     assert!(why.contains("every owner of a1b2 is down"), "{why}");
-    assert_eq!(store.asks(), 1 + STORAGE_WAITS);
+    assert_eq!(store.asks(), 1 + TEN_MINUTES_OF_PAUSES as u32);
 }
 
 /// Catches an error that is not an outage being waited for: a store that fails the check
@@ -208,11 +241,12 @@ async fn a_store_that_never_answers_ends_the_wait_as_an_infra_failure() {
 async fn an_error_that_is_no_outage_is_not_waited_for() {
     let store = Flaky::failing_with(u32::MAX, not_found);
 
-    let (outcome, detail) = checked(&store).await;
+    let (outcome, detail, pauses) = checked(&store).await;
 
     assert_eq!(outcome, Outcome::Failed(Failure::Infra));
     assert!(matches!(detail, Some(Detail::Infra(_))), "{detail:?}");
     assert_eq!(store.asks(), 1);
+    assert!(pauses.is_empty(), "{pauses:?}");
 }
 
 /// Catches a wait that accepts the result but hands on a record the store cannot commit:
@@ -220,7 +254,7 @@ async fn an_error_that_is_no_outage_is_not_waited_for() {
 #[tokio::test(start_paused = true)]
 async fn the_record_of_a_result_that_waited_is_committed() {
     let store = Flaky::down_for(2);
-    let (_, detail) = checked(&store).await;
+    let (_, detail, _) = checked(&store).await;
     let Some(Detail::Ran(pending)) = detail else {
         panic!("not accepted: {detail:?}");
     };
