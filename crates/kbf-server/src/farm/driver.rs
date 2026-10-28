@@ -136,6 +136,15 @@ impl Driver {
         Self::Legacy(Mutex::new(state))
     }
 
+    /// The core this driver is.
+    pub(super) const fn core(&self) -> crate::SchedulerCore {
+        match self {
+            Self::Legacy(_) => crate::SchedulerCore::Legacy,
+            #[cfg(feature = "farm-core-js")]
+            Self::Js(_) => crate::SchedulerCore::Js,
+        }
+    }
+
     /// The engine state, locked. A farm on the js core has none: each of its methods
     /// reaches [`Driver::Js`] first ([`js_arm!`]).
     pub(super) fn lock(&self) -> MutexGuard<'_, State> {

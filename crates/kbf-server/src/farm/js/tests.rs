@@ -126,3 +126,10 @@ fn the_builders_rebuild_the_core_and_keep_the_settings() {
     assert_eq!(js.settings.orphan_wait, Duration::from_secs(2));
     assert!(js.settings.whole_node.is_some());
 }
+
+/// Catches a farm on the js driver that names the legacy core (the gauge
+/// `kbf_scheduler_core` and anything else reading it would say so too).
+#[test]
+fn a_js_farm_names_the_js_core() {
+    assert_eq!(farm().scheduler_core(), crate::SchedulerCore::Js);
+}
