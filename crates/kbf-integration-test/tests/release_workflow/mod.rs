@@ -96,9 +96,10 @@ const BUCK2_FETCH: &str = "cargo xtask fetch --url \"https://github.com/facebook
 /// The action `gamma` joins a Tailscale network with, pinned by commit.
 const TS_ACTION: &str = "tailscale/github-action@";
 
-/// The one condition of the network join: the trust credential's client id and the
-/// coordinator's address are both set (either unset, the step is skipped).
-const TS_IF: &str = "${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}";
+/// The one condition of the network join: the trust credential's client id is set and so is
+/// one of the farm's addresses, the coordinator's (the deploy step) or the build endpoint's (the
+/// remote-only build after it); otherwise the step is skipped.
+const TS_IF: &str = "${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}";
 
 /// The inputs of the network join, all of them: workload identity federation with the run's
 /// token (the CI trust credential, `TS_CLIENT_ID` and `TS_AUDIENCE`, as `tag:ci`), so no

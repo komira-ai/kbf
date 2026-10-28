@@ -1550,7 +1550,7 @@ fn the_network_join_of_gamma_uses_the_run_token_and_variables_only() {
     red(
         &plant(
             "gamma",
-            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}\n",
             "        if: ${{ vars.OTHER != '' }}\n",
         ),
         "is under `if:`",
@@ -1558,7 +1558,7 @@ fn the_network_join_of_gamma_uses_the_run_token_and_variables_only() {
     red(
         &plant(
             "gamma",
-            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}\n",
             "",
         ),
         "not under exactly `if:",
@@ -1588,8 +1588,8 @@ fn the_network_join_of_gamma_uses_the_run_token_and_variables_only() {
     red(
         &plant(
             "gamma",
-            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
-            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n        env:\n          TS_AUTHKEY: ${{ vars.TS_KEY }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}\n        env:\n          TS_AUTHKEY: ${{ vars.TS_KEY }}\n",
         ),
         "has an `env:`",
     );
