@@ -96,8 +96,9 @@ pub fn event(event: &Event) -> String {
             capacity,
             caps: c,
         } => format!(
-            "worker_up(worker={worker} instance={} predecessor_stopped={predecessor_stopped} \
+            "worker_up(worker={} instance={} predecessor_stopped={predecessor_stopped} \
              capacity={} {})",
+            text::worker(worker),
             text::quoted(instance.as_str()),
             text::resources(capacity),
             caps(c),
@@ -107,15 +108,19 @@ pub fn event(event: &Event) -> String {
             capacity,
             caps: c,
         } => format!(
-            "capacity(worker={worker} capacity={} {})",
+            "capacity(worker={} capacity={} {})",
+            text::worker(worker),
             text::resources(capacity),
             caps(c),
         ),
         Event::Heartbeat { worker, running } => format!(
-            "heartbeat(worker={worker} running={})",
+            "heartbeat(worker={} running={})",
+            text::worker(worker),
             text::list(running, |l| text::lease(*l))
         ),
-        Event::Phase { worker, phase: p } => format!("phase(worker={worker} {})", phase(p)),
+        Event::Phase { worker, phase: p } => {
+            format!("phase(worker={} {})", text::worker(worker), phase(p))
+        }
         Event::Submit { waiter, request: r } => {
             format!("submit(waiter={} {})", text::waiter(*waiter), request(r))
         }
@@ -136,10 +141,12 @@ pub fn event(event: &Event) -> String {
             text::outcome(*outcome)
         ),
         Event::Tick => "tick".to_owned(),
-        Event::Cordon { worker } => format!("cordon(worker={worker})"),
-        Event::Drain { worker, deadline } => {
-            format!("drain(worker={worker} deadline={})", text::time(*deadline))
-        }
-        Event::Uncordon { worker } => format!("uncordon(worker={worker})"),
+        Event::Cordon { worker } => format!("cordon(worker={})", text::worker(worker)),
+        Event::Drain { worker, deadline } => format!(
+            "drain(worker={} deadline={})",
+            text::worker(worker),
+            text::time(*deadline)
+        ),
+        Event::Uncordon { worker } => format!("uncordon(worker={})", text::worker(worker)),
     }
 }

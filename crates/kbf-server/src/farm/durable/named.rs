@@ -16,7 +16,7 @@ use kbf_types::{ActionKey, DigestFunction};
 
 use super::*;
 
-const DONE_OF: &str = "doneof/";
+pub(super) const DONE_OF: &str = "doneof/";
 
 /// The version byte of a `doneof/` row.
 const VERSION: u8 = 1;

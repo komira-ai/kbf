@@ -1646,6 +1646,10 @@ impl State {
                 heartbeat_seq,
                 valid_for_ms: START_VALIDITY_MS,
                 device_id: start.device.clone().unwrap_or_default(),
+                // Nothing sets these yet: an unset fence is a self-fence, as every
+                // lease has always been.
+                job: None,
+                fence: 0,
             })
         });
         let now = SystemTime::now();

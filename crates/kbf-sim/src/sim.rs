@@ -169,11 +169,13 @@ impl<N: Node> Sim<N> {
         let t = at.as_millis();
         match event {
             Scheduled::Start { node } => {
-                self.trace.record(&format!("{t} start {node}"));
+                self.trace
+                    .record(&format!("{t} start {}", text::node(&node)));
                 self.apply(&node, Event::Start);
             }
             Scheduled::Timer { node, tag } => {
-                self.trace.record(&format!("{t} timer {node} tag={tag}"));
+                self.trace
+                    .record(&format!("{t} timer {} tag={tag}", text::node(&node)));
                 self.apply(&node, Event::Timer { tag });
             }
             Scheduled::Partition(p) => {
@@ -184,13 +186,18 @@ impl<N: Node> Sim<N> {
             Scheduled::Deliver { id, from, to, msg } => {
                 if self.partition.connected(&from, &to) {
                     self.trace.record(&format!(
-                        "{t} deliver #{id} {from}->{to} {}",
+                        "{t} deliver #{id} {}->{} {}",
+                        text::node(&from),
+                        text::node(&to),
                         N::trace_msg(&msg)
                     ));
                     self.apply(&to, Event::Message { from, msg });
                 } else {
-                    self.trace
-                        .record(&format!("{t} lost #{id} {from}->{to} partitioned"));
+                    self.trace.record(&format!(
+                        "{t} lost #{id} {}->{} partitioned",
+                        text::node(&from),
+                        text::node(&to)
+                    ));
                 }
             }
         }
@@ -231,8 +238,11 @@ impl<N: Node> Sim<N> {
         let outputs = node.take_outputs();
         if !effects.is_empty() {
             let t = self.now.as_millis();
-            self.trace
-                .record(&format!("{t} effects {id} {}", text::effects(&effects)));
+            self.trace.record(&format!(
+                "{t} effects {} {}",
+                text::node(id),
+                text::effects(&effects)
+            ));
         }
         for out in outputs {
             match out {
@@ -257,18 +267,27 @@ impl<N: Node> Sim<N> {
         self.next_msg += 1;
         let t = self.now.as_millis();
         if !self.nodes.contains_key(&to) {
-            self.trace
-                .record(&format!("{t} lost #{id} {from}->{to} unknown receiver"));
+            self.trace.record(&format!(
+                "{t} lost #{id} {}->{} unknown receiver",
+                text::node(from),
+                text::node(&to)
+            ));
             return;
         }
         if !self.partition.connected(from, &to) {
-            self.trace
-                .record(&format!("{t} lost #{id} {from}->{to} partitioned"));
+            self.trace.record(&format!(
+                "{t} lost #{id} {}->{} partitioned",
+                text::node(from),
+                text::node(&to)
+            ));
             return;
         }
         if self.rng.chance(self.faults.drop) {
-            self.trace
-                .record(&format!("{t} lost #{id} {from}->{to} dropped"));
+            self.trace.record(&format!(
+                "{t} lost #{id} {}->{} dropped",
+                text::node(from),
+                text::node(&to)
+            ));
             return;
         }
         let copies = if self.rng.chance(self.faults.duplicate) {
@@ -295,7 +314,9 @@ impl<N: Node> Sim<N> {
                 (_, true) => " duplicate reordered",
             };
             self.trace.record(&format!(
-                "{t} send #{id} {from}->{to} at={}{how}",
+                "{t} send #{id} {}->{} at={}{how}",
+                text::node(from),
+                text::node(&to),
                 at.as_millis()
             ));
             let event = Scheduled::Deliver {

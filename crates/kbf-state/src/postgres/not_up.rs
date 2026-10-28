@@ -104,7 +104,7 @@ fn not_listening(kind: io::ErrorKind) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::io::{self, Read, Write};
     use std::os::unix::net::UnixListener;
 
     use kbf_testkit::dir::TestDir;
@@ -180,5 +180,32 @@ mod tests {
         let url = format!("postgres:///kbf?host={}", dir.path().display());
         let got = open(&url);
         assert!(got.is_not_up(), "{got:?}");
+    }
+
+    /// A server that answers, asking for a password the client was not given, makes an error
+    /// with no SQLSTATE and a cause that is not an I/O error: a person's to fix, not a wait.
+    /// The server here is a socket that reads the startup packet and sends the cleartext
+    /// password request, whatever the real server's `pg_hba.conf` says.
+    #[test]
+    fn a_password_the_client_lacks_is_refused_not_waited_for() {
+        let dir = TestDir::under(std::env::temp_dir(), "kbf-state-not-up-password");
+        let listener = UnixListener::bind(dir.path().join(".s.PGSQL.5432")).expect("a socket");
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("the client connects");
+            let mut len = [0u8; 4];
+            conn.read_exact(&mut len).expect("the startup length");
+            let mut rest = vec![0u8; u32::from_be_bytes(len) as usize - 4];
+            conn.read_exact(&mut rest).expect("the startup packet");
+            // AuthenticationCleartextPassword: 'R', length 8, code 3.
+            conn.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 3])
+                .expect("the request");
+            // Hold the connection until the client gives up on it.
+            let mut sink = Vec::new();
+            let _ = conn.read_to_end(&mut sink);
+        });
+        let url = format!("postgres:///kbf?host={}", dir.path().display());
+        let got = open(&url);
+        assert!(!got.is_not_up(), "{got:?}");
+        server.join().expect("the server thread");
     }
 }

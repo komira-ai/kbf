@@ -446,6 +446,7 @@ fn finished(lease: kbf_types::LeaseId) -> kbf_proto::worker::Result {
         action_digest: None,
         memory_kill: 0,
         lost: 0,
+        job_outcome: None,
     }
 }
 
