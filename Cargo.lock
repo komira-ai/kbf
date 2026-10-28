@@ -1318,9 +1318,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "js-sim"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
+dependencies = [
+ "js-types",
+ "rand_chacha 0.10.0",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "js-sizing"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=2b64dc6282aac440860224cb4a1a2c791fb698f4#2b64dc6282aac440860224cb4a1a2c791fb698f4"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
 
 [[package]]
 name = "js-sys"
@@ -1331,6 +1341,16 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "js-types"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -2536,10 +2556,8 @@ dependencies = [
 name = "kbf-sim"
 version = "0.1.0"
 dependencies = [
- "kbf-testkit",
+ "js-sim",
  "kbf-types",
- "rand_chacha 0.10.0",
- "sha2 0.11.0",
 ]
 
 [[package]]
@@ -2734,6 +2752,7 @@ dependencies = [
 name = "kbf-types"
 version = "0.1.0"
 dependencies = [
+ "js-types",
  "serde",
  "serde_json",
  "thiserror",

@@ -10,7 +10,8 @@
 //!   crate (tokio, tonic, hyper, reqwest, the rand family, getrandom, mio, socket2);
 //! - a pure crate that depends on a kbf crate outside the pure set;
 //! - a pure crate that reaches a crate taken from a git repository other than the ones
-//!   listed in `PURE_GIT_CRATES` (today `js-sizing`, which `kbf-estimator` re-exports);
+//!   listed in `PURE_GIT_CRATES` (today `js-sizing`, `js-types` and `js-sim`, which `kbf-estimator`,
+//!   `kbf-types` and `kbf-sim` re-export);
 //! - a pure crate whose `lib.rs` no longer denies the `clippy.toml` lists, which would
 //!   silently switch off the clock, sleep, network and `HashMap` checks for it;
 //! - a pure crate renamed or removed, which would otherwise make every check above
@@ -94,6 +95,12 @@ const PURE: &[&str] = &[
     "kbf-map",
 ];
 
+/// The simulation kernel. It is not `PURE`: it reaches `rand_chacha` (seeded, never
+/// seeded from the system), which the purity check refuses by name. Pure crates take it
+/// as a dev-dependency only, so nothing in `PURE` reaches the `js-sim` it re-exports; the
+/// check of `PURE_GIT_CRATES` walks it as well, so that its git crates are listed too.
+const SIM_KERNEL: &[&str] = &["kbf-sim"];
+
 /// Crates that do a little file I/O (so they are not `PURE`) but are shared by every CI/CD
 /// stage and by xtask: they may reach no `FORBIDDEN` crate and no other kbf crate.
 const LEAF: &[&str] = &["kbf-gate"];
@@ -120,12 +127,24 @@ const DENY_ATTR: &str = "#![deny(clippy::disallowed_methods, clippy::disallowed_
 
 /// The crates of other repositories (taken by `git` dependency, `source` beginning
 /// `git+`) that a pure crate may reach, with the one repository each may come from.
-/// `kbf-estimator` re-exports `js-sizing`, which has no dependencies of its own; a
-/// further git crate in a pure crate's tree is a decision, so it is listed here by name.
-const PURE_GIT_CRATES: &[(&str, &str)] = &[(
-    "js-sizing",
-    "git+https://github.com/komira-ai/jobscheduler?rev=",
-)];
+/// `kbf-estimator` re-exports `js-sizing`, `kbf-types` re-exports `js-types` (its
+/// `sched` module) and `kbf-sim` re-exports `js-sim`; they depend on one another and on
+/// crates.io crates only. A further git crate in a pure crate's tree is a decision, so it
+/// is listed here by name.
+const PURE_GIT_CRATES: &[(&str, &str)] = &[
+    (
+        "js-sim",
+        "git+https://github.com/komira-ai/jobscheduler?rev=",
+    ),
+    (
+        "js-sizing",
+        "git+https://github.com/komira-ai/jobscheduler?rev=",
+    ),
+    (
+        "js-types",
+        "git+https://github.com/komira-ai/jobscheduler?rev=",
+    ),
+];
 
 struct Graph {
     /// Package id to package name.
@@ -261,7 +280,7 @@ fn pure_crates_take_git_crates_only_from_the_list() {
     let g = load_graph();
     let mut violations = Vec::new();
     let mut seen = BTreeSet::new();
-    for &pure in PURE {
+    for &pure in PURE.iter().chain(SIM_KERNEL) {
         let (id, _) = g
             .members
             .get(pure)
@@ -285,7 +304,7 @@ fn pure_crates_take_git_crates_only_from_the_list() {
         "pure crates reach git crates outside PURE_GIT_CRATES:\n{}",
         violations.join("\n")
     );
-    // The list is not vacuous: kbf-estimator reaches js-sizing through its shim.
+    // The list is not vacuous: each entry is reached through a shim crate.
     for (name, _) in PURE_GIT_CRATES {
         assert!(
             seen.contains(*name),
