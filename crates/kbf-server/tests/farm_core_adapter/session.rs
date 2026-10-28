@@ -11,6 +11,7 @@ use js_server_core::{Beat, Core, NodeAction as CoreAction, Stream};
 use js_store::{RowCodec as _, Value};
 use kbf_caps::NodeCaps;
 use kbf_front::{Backend, Described, Submission};
+use kbf_log::{Format, LogCommand};
 use kbf_proto::worker::{self, ServerMessage, server_message};
 use kbf_sched::{DaemonInstance, NodePhase, Request};
 use kbf_server::action_usage::Shapes;
@@ -54,17 +55,48 @@ pub struct Session {
 /// committed, which has. The row is read with the codec the core writes it with, the cost is
 /// set to the default and the row is written again, so everything else in it (the lease, the
 /// operation, the node) is still compared, byte for byte, with the farm's.
+///
+/// Writing the row again resets the batch the row is wrapped in (its farm time and wall
+/// time) to the defaults, so before that the row's batch must already have them; a row that
+/// has other times is not normalised, and the call panics naming the row.
+///
+/// The row is written again by the codec under test, so what that codec writes for a cost
+/// of no cost is compared too: a codec that wrote the cost differently (a cpu count one
+/// higher, say) writes the default cost as a cost, and every lease row then differs from the
+/// farm's, which has none. That is why a change of the cost's encoding turns the scripts
+/// red although the cost is set aside: the scripts pin that no cost is left out of the row,
+/// as the farm's rows have it. It is not a leak of the cost into another row; the cost is in
+/// the lease row only.
+///
+/// # Panics
+/// A lease row whose batch has a farm time or a wall time other than the default.
 pub fn without_lease_cost(key: &str, value: &[u8]) -> Vec<u8> {
     let read = KbfRowCodec.read(key, value);
     match read {
         Ok(Value::Lease(mut grant) | Value::LegacyLease(mut grant))
             if key.starts_with("lease/") =>
         {
+            assert_default_batch_times(key, value);
             grant.cost = LeaseCost::default();
             KbfRowCodec.lease(&grant).unwrap_or_else(|_| value.to_vec())
         }
         _ => value.to_vec(),
     }
+}
+
+/// Panics, naming `key`, unless the batch `value` is wrapped in has the default farm time and
+/// the Unix epoch for its wall time.
+fn assert_default_batch_times(key: &str, value: &[u8]) {
+    let decoded = kbf_log::decode(Format::V1, value);
+    let Ok(LogCommand::Farm(batch)) = decoded else {
+        panic!("the lease row {key} is not a batch of the scheduler's inputs");
+    };
+    assert_eq!(
+        batch.now,
+        FarmTime::default(),
+        "the lease row {key}: farm time"
+    );
+    assert_eq!(batch.wall, UNIX_EPOCH, "the lease row {key}: wall time");
 }
 
 /// Milliseconds since `started` on tokio's clock.

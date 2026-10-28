@@ -178,6 +178,50 @@ fn the_lease_row_is_written_down_without_its_cost_and_with_everything_else() {
     );
 }
 
+/// The bytes of a lease row for node-a wrapped in a batch of farm time `now` and wall time
+/// `wall`, as a codec that wrote other times would write it.
+fn lease_row_in_batch(now: kbf_types::FarmTime, wall: std::time::SystemTime) -> Vec<u8> {
+    use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
+    use kbf_types::{ControlRecord, LeaseGrant, LeaseId, OperationId, WorkerId};
+
+    let grant = LeaseGrant {
+        lease: LeaseId::new(7, 0),
+        operation: OperationId(0),
+        worker: WorkerId::new("node-a"),
+        cost: Default::default(),
+    };
+    let inputs = vec![FarmInput::Committed(ControlRecord::Lease(grant))];
+    let batch = FarmBatch { now, wall, inputs };
+    kbf_log::encode(Format::V1, &LogCommand::Farm(batch)).expect("a batch")
+}
+
+/// Catches a normalisation that hides the times a lease row's batch is written with: writing
+/// the row again resets them, so a row with another wall time or farm time is reported, naming
+/// the row, and not normalised; a row with the default times is normalised.
+#[test]
+fn a_lease_row_with_other_batch_times_is_reported_not_normalised() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let key = "lease/0000000000000007.0000000000000000";
+    let plain = lease_row_in_batch(kbf_types::FarmTime::default(), UNIX_EPOCH);
+    assert_eq!(session::without_lease_cost(key, &plain), plain);
+
+    let other_wall = lease_row_in_batch(
+        kbf_types::FarmTime::default(),
+        UNIX_EPOCH + Duration::from_secs(1),
+    );
+    let other_now = lease_row_in_batch(kbf_types::FarmTime::from_millis(5), UNIX_EPOCH);
+    for row in [other_wall, other_now] {
+        let reported = std::panic::catch_unwind(|| session::without_lease_cost(key, &row));
+        let message = reported.expect_err("reported");
+        let text = message
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(text.contains(key), "{text}");
+    }
+}
+
 /// Catches a comparison that cannot fail: equal text is no difference, and a changed or
 /// missing line is found where it is.
 #[test]
