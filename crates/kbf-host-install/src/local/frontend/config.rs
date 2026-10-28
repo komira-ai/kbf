@@ -132,6 +132,26 @@ impl RunSpec {
     }
 }
 
+/// What a described container service has instead of the frontend's fixed habits: the
+/// repository its images are loaded as, the paths its probes `GET`, and whether it is drained.
+///
+/// The frontend's own configuration has none of this (`service` is `None`, and is not written
+/// to its record), so the frontend's record is the bytes it always was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServicePart {
+    /// The images are loaded as `<repository>:<commit>`.
+    pub repository: String,
+    /// The path `GET` on `api` that must answer 2xx.
+    pub ready_path: String,
+    /// The path `GET` on `api` whose JSON `commit` must name the release, if the service has
+    /// one.
+    pub version_path: Option<String>,
+    /// Whether the container is asked to drain (`drain_token_file`, `drain_secs`) before it is
+    /// stopped.
+    pub drain: bool,
+}
+
 /// The file, checked.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -145,6 +165,9 @@ pub struct FrontendConfig {
     pub peers: Vec<SocketAddr>,
     pub drain_secs: u64,
     pub ready_secs: u64,
+    /// Set for a container service of a descriptor; the frontend's has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<ServicePart>,
 }
 
 #[derive(Deserialize)]
@@ -359,6 +382,76 @@ fn check(entry: &RunSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// The run keys as a file spells them, before they are checked.
+pub struct RawRun {
+    pub name: String,
+    pub restart: String,
+    pub network: Option<String>,
+    pub user: Option<String>,
+    pub group_add: Vec<String>,
+    pub read_only: bool,
+    pub tmpfs: Vec<String>,
+    pub cap_drop: Vec<String>,
+    pub security_opt: Vec<String>,
+    pub ulimits: Vec<String>,
+    pub ports: Vec<String>,
+    pub mounts: Vec<String>,
+    pub command: Vec<String>,
+}
+
+impl RawRun {
+    /// The run configuration these keys make.
+    ///
+    /// # Errors
+    /// The line that says which value is not one.
+    pub fn into_spec(self) -> Result<RunSpec, String> {
+        let group_add = self
+            .group_add
+            .iter()
+            .map(|g| gid(g).ok_or_else(|| format!("group_add {g:?} is not a group id from 1")))
+            .collect::<Result<_, _>>()?;
+        let run = RunSpec {
+            name: self.name,
+            restart: self.restart,
+            network: self.network,
+            user: self.user,
+            group_add,
+            read_only: self.read_only,
+            tmpfs: self.tmpfs,
+            cap_drop: self.cap_drop,
+            security_opt: self.security_opt,
+            ulimits: self.ulimits,
+            ports: self.ports,
+            mounts: self.mounts,
+            command: self.command,
+        };
+        check(&run)?;
+        Ok(run)
+    }
+}
+
+/// The drain and ready waits, with the defaults for the ones left out.
+///
+/// # Errors
+/// The line that says which is out of range.
+pub fn waits(drain: Option<u64>, ready: Option<u64>) -> Result<(u64, u64), String> {
+    let drain_secs = drain.unwrap_or(DEFAULT_DRAIN_SECS);
+    if drain_secs > 1800 {
+        return Err("drain_secs is more than 1800".to_owned());
+    }
+    let ready_secs = ready.unwrap_or(DEFAULT_READY_SECS);
+    if !(10..=600).contains(&ready_secs) {
+        return Err("ready_secs is not from 10 to 600".to_owned());
+    }
+    Ok((drain_secs, ready_secs))
+}
+
+/// Whether `text` is an absolute path without control characters (a file inside the
+/// container).
+pub fn absolute_plain(text: &str) -> bool {
+    text.starts_with('/') && plain(text)
+}
+
 fn addr(what: &str, text: &str) -> Result<SocketAddr, String> {
     text.parse()
         .map_err(|_| format!("{what} {text:?} is not an IP address and a port"))
@@ -384,17 +477,12 @@ impl FrontendConfig {
     pub fn parse(text: &str) -> Result<Self, String> {
         let file: File = toml::from_str(text).map_err(|e| e.message().to_owned())?;
         let entry = file.frontend;
-        let group_add = entry
-            .group_add
-            .iter()
-            .map(|g| gid(g).ok_or_else(|| format!("group_add {g:?} is not a group id from 1")))
-            .collect::<Result<_, _>>()?;
-        let run = RunSpec {
+        let run = RawRun {
             name: entry.name,
             restart: entry.restart,
             network: entry.network,
             user: entry.user,
-            group_add,
+            group_add: entry.group_add,
             read_only: entry.read_only,
             tmpfs: entry.tmpfs,
             cap_drop: entry.cap_drop,
@@ -403,19 +491,12 @@ impl FrontendConfig {
             ports: entry.ports,
             mounts: entry.mounts,
             command: entry.command,
-        };
-        check(&run)?;
-        if !entry.drain_token_file.starts_with('/') || !plain(&entry.drain_token_file) {
+        }
+        .into_spec()?;
+        if !absolute_plain(&entry.drain_token_file) {
             return Err("drain_token_file is not an absolute path".to_owned());
         }
-        let drain_secs = entry.drain_secs.unwrap_or(DEFAULT_DRAIN_SECS);
-        if drain_secs > 1800 {
-            return Err("drain_secs is more than 1800".to_owned());
-        }
-        let ready_secs = entry.ready_secs.unwrap_or(DEFAULT_READY_SECS);
-        if !(10..=600).contains(&ready_secs) {
-            return Err("ready_secs is not from 10 to 600".to_owned());
-        }
+        let (drain_secs, ready_secs) = waits(entry.drain_secs, entry.ready_secs)?;
         let peers = entry
             .peers
             .iter()
@@ -428,6 +509,7 @@ impl FrontendConfig {
             peers,
             drain_secs,
             ready_secs,
+            service: None,
         })
     }
 

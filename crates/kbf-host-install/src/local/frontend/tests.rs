@@ -126,6 +126,7 @@ impl Rig {
             config_file: dir.join("frontend.toml"),
             record_file: dir.join(RECORD),
             bound_name: None,
+            described: None,
             pace: world.pace(),
         }
     }

@@ -76,6 +76,8 @@ pub enum AssetKind {
     Rpm,
     /// `kbf-frontend-image-<commit>-<platform>.oci.tar`, the frontend as a container image.
     FrontendImage,
+    /// `<prefix>-image-<commit>-<platform>.oci.tar`, a container service's image.
+    ServiceImage,
 }
 
 impl AssetKind {
@@ -86,7 +88,7 @@ impl AssetKind {
             Self::Tarball => release::TARBALL_EXTENSION,
             Self::Deb => "deb",
             Self::Rpm => "rpm",
-            Self::FrontendImage => "oci.tar",
+            Self::FrontendImage | Self::ServiceImage => "oci.tar",
         }
     }
 
@@ -97,6 +99,7 @@ impl AssetKind {
             Self::FrontendImage => {
                 format!("{prefix}-frontend-image-{commit}-{platform}.oci.tar")
             }
+            Self::ServiceImage => format!("{prefix}-image-{commit}-{platform}.oci.tar"),
             _ => release::named_asset_on(prefix, platform, self.extension(), commit),
         }
     }
@@ -108,12 +111,15 @@ impl AssetKind {
         platform: &str,
         name: &'a str,
     ) -> Option<&'a str> {
-        match self {
-            Self::FrontendImage => name
-                .strip_prefix(prefix)
-                .and_then(|rest| rest.strip_prefix("-frontend-image-"))
+        let image = |infix: &str| {
+            name.strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix(infix))
                 .and_then(|rest| rest.strip_suffix(&format!("-{platform}.oci.tar")))
-                .filter(|commit| release::is_commit(commit)),
+                .filter(|commit| release::is_commit(commit))
+        };
+        match self {
+            Self::FrontendImage => image("-frontend-image-"),
+            Self::ServiceImage => image("-image-"),
             _ => release::commit_of_named_asset_on(prefix, platform, self.extension(), name),
         }
     }

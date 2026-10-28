@@ -43,22 +43,30 @@ impl Rig {
     /// The channel's GitHub offers the image of `commit`, with `sums` as its `SHA256SUMS` and
     /// `listed` as the size the listing gives the image.
     fn offer_image(&self, commit: &str, bytes: &[u8], sums: &str, listed: usize) {
+        self.offer_image_named(&image_name(commit), commit, bytes, sums, listed);
+    }
+
+    /// [`Self::offer_image`], for the image file `image` (its bundle is `<image>.sigstore.json`).
+    fn offer_image_named(
+        &self,
+        image: &str,
+        commit: &str,
+        bytes: &[u8],
+        sums: &str,
+        listed: usize,
+    ) {
+        let bundle = format!("{image}.sigstore.json");
         let tag = format!("v-{}", &commit[..8]);
         let assets = format!(
-            "{{\"name\":\"{}\",\"size\":{listed}}},{{\"name\":\"{}\",\"size\":30}},{{\"name\":\"SHA256SUMS\",\"size\":{}}}",
-            image_name(commit),
-            bundle_name(commit),
+            "{{\"name\":\"{image}\",\"size\":{listed}}},{{\"name\":\"{bundle}\",\"size\":30}},{{\"name\":\"SHA256SUMS\",\"size\":{}}}",
             sums.len()
         );
         let release = format!("{{\"tag_name\":\"{tag}\",\"draft\":false,\"assets\":[{assets}]}}");
         let mut net = self.net.borrow_mut();
         net.pages = vec![format!("[{release}]")];
         let files = net.assets.entry(tag).or_default();
-        files.insert(image_name(commit), bytes.to_vec());
-        files.insert(
-            bundle_name(commit),
-            b"{\"mediaType\":\"bundle\"}\n".to_vec(),
-        );
+        files.insert(image.to_owned(), bytes.to_vec());
+        files.insert(bundle, b"{\"mediaType\":\"bundle\"}\n".to_vec());
         files.insert("SHA256SUMS".to_owned(), sums.as_bytes().to_vec());
     }
 
@@ -453,4 +461,55 @@ fn an_image_of_another_repository_is_attested_by_its_own_workflow() {
         "--signer-workflow",
         "owner/other/.github/workflows/release.yml"
     ));
+}
+
+/// The image of a described service is named after its artifact, not the frontend's:
+/// `<artifact>-image-<commit>-linux-<arch>.oci.tar`. It is listed from and downloaded from the
+/// service's own repository, checked against the release's sums, attested for the service's own
+/// signer, kept in the service's own tree, and handed over like the frontend's.
+#[test]
+fn a_services_image_is_named_after_its_artifact_and_attested_for_its_signer() {
+    use super::service::{JS_REPO, JS_WORKFLOW, js_kind, js_stable};
+    let rig = Rig::build("image-service", &js_kind());
+    let name = format!("js-agent-image-{COMMIT}-linux-{}.oci.tar", arch_name());
+    let sums = format!("{}  {name}\n", sha(IMAGE));
+    rig.offer_image_named(&name, COMMIT, IMAGE, &sums, IMAGE.len());
+
+    let fetched = rig.backend.fetch(&version(), &js_stable()).unwrap();
+    assert_eq!(fetched.commit, COMMIT);
+    assert_eq!(fs::read(&fetched.file).unwrap(), IMAGE);
+    assert_eq!(fetched.file.file_name().unwrap().to_string_lossy(), name);
+    assert!(
+        fetched
+            .file
+            .starts_with(rig.root().join("var/lib/js-agent/work")),
+        "the copy is in the service's tree"
+    );
+
+    let download = rig
+        .calls
+        .borrow()
+        .iter()
+        .find(|c| c.args.first().map(String::as_str) == Some("release"))
+        .cloned()
+        .unwrap();
+    assert!(download.args.contains(&name));
+    assert!(download.args.contains(&format!("{name}.sigstore.json")));
+    assert!(!download.args.contains(&image_name(COMMIT)));
+    assert_eq!(super::flag_value(&download.args, "--repo"), JS_REPO);
+
+    let verify = super::spawn_args(&rig, 0);
+    assert_eq!(super::flag_value(&verify, "--repo"), JS_REPO);
+    assert_eq!(super::flag_value(&verify, "--signer-workflow"), JS_WORKFLOW);
+    assert_eq!(super::flag_value(&verify, "--source-digest"), COMMIT);
+
+    // The sums must list the service's image by that name.
+    drop(fetched);
+    let wrong = sums_for(COMMIT, IMAGE);
+    rig.offer_image_named(&name, COMMIT, IMAGE, &wrong, IMAGE.len());
+    let fault = rig.backend.fetch(&version(), &js_stable()).err().unwrap();
+    assert!(
+        fault.refused && fault.code == Code::VerifyFailed,
+        "{fault:?}"
+    );
 }

@@ -73,16 +73,27 @@ fn a_service_table_makes_its_descriptor() {
     assert_eq!(units, ["js-agent.service", "js-agent-helper@a.service"]);
 }
 
-/// A key left out, or one this build does not know, is a table that does not parse: nothing
-/// has a default.
+/// A key left out is a table that does not make a descriptor, and one this build does not know
+/// is a table that does not parse: nothing has a default.
 #[test]
 fn every_key_is_required_and_none_is_unknown() {
     for text in [
         "binary = \"a\"\ntree = \"a\"\nunits = [\"a.service\"]\n",
-        "artifact = \"a\"\ntree = \"a\"\nunits = [\"a.service\"]\n",
         "artifact = \"a\"\nbinary = \"a\"\nunits = [\"a.service\"]\n",
+    ] {
+        assert!(toml::from_str::<Entry>(text).is_err(), "{text}");
+    }
+    for text in [
+        "artifact = \"a\"\ntree = \"a\"\nunits = [\"a.service\"]\n",
         "artifact = \"a\"\nbinary = \"a\"\ntree = \"a\"\n",
+    ] {
+        let entry: Entry = toml::from_str(text).unwrap();
+        let err = Descriptor::from_entry("a", &entry).unwrap_err();
+        assert!(err.contains("required"), "{text}: {err}");
+    }
+    for text in [
         "artifact = \"a\"\nbinary = \"a\"\ntree = \"a\"\nunits = []\nextra = 1\n",
+        "kind = \"vm\"\nartifact = \"a\"\nbinary = \"a\"\ntree = \"a\"\nunits = []\n",
     ] {
         assert!(toml::from_str::<Entry>(text).is_err(), "{text}");
     }

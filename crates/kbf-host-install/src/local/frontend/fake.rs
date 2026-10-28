@@ -64,6 +64,16 @@ pub(super) struct Inner {
     pub(super) runs: Vec<Vec<String>>,
     /// The container's name and operator API when they are not the default ones.
     pub(super) serving: Option<(String, SocketAddr)>,
+    /// The repository the images are loaded as; `kbf-frontend` when none.
+    pub(super) repository: Option<String>,
+    /// The status `/readyz` answers when the frontend is ready; 200 when none.
+    pub(super) ready_status: Option<u16>,
+}
+
+impl Inner {
+    fn repo(&self) -> &str {
+        self.repository.as_deref().unwrap_or("kbf-frontend")
+    }
 }
 
 /// The world, shared by the runtime, the probe and the test.
@@ -82,9 +92,8 @@ impl World {
     pub(super) fn image(&self, commit: &str, name: &str) -> String {
         let id = format!("sha256:{name}");
         let mut inner = self.0.borrow_mut();
-        inner
-            .tags
-            .insert(format!("kbf-frontend:{commit}"), id.clone());
+        let tag = format!("{}:{commit}", inner.repo());
+        inner.tags.insert(tag, id.clone());
         inner.ids.insert(id.clone());
         inner.commit_of.insert(id.clone(), commit.to_owned());
         id
@@ -93,9 +102,10 @@ impl World {
     /// A container that runs `image` (an id from [`World::image`]), made the way `spec` says.
     pub(super) fn container(&self, spec: &RunSpec, image: &str, commit: &str) {
         let mut inner = self.0.borrow_mut();
+        let image_ref = format!("{}:{commit}", inner.repo());
         inner.container = Some(Made {
             image_id: image.to_owned(),
-            image_ref: format!("kbf-frontend:{commit}"),
+            image_ref,
             running: true,
             restart: spec.restart.clone(),
             args: spec.run_args(image),
@@ -106,12 +116,20 @@ impl World {
     /// The next `load` brings in the image of `commit`.
     pub(super) fn will_load(&self, commit: &str, name: &str) -> String {
         let id = format!("sha256:{name}");
-        self.0.borrow_mut().will_load = Some((
-            format!("kbf-frontend:{commit}"),
-            id.clone(),
-            commit.to_owned(),
-        ));
+        let mut inner = self.0.borrow_mut();
+        let tag = format!("{}:{commit}", inner.repo());
+        inner.will_load = Some((tag, id.clone(), commit.to_owned()));
         id
+    }
+
+    /// The images are loaded as `<repository>:<commit>`.
+    pub(super) fn repository(&self, repository: &str) {
+        self.0.borrow_mut().repository = Some(repository.to_owned());
+    }
+
+    /// A ready frontend answers `/readyz` with `status`.
+    pub(super) fn ready_status(&self, status: u16) {
+        self.0.borrow_mut().ready_status = Some(status);
     }
 
     /// The container is called `name` and its operator API is `api`.
@@ -262,7 +280,7 @@ impl Runtime for World {
         let running = !inner.crashes.contains(image_id);
         inner.container = Some(Made {
             image_id: image_id.to_owned(),
-            image_ref: format!("kbf-frontend:{commit}"),
+            image_ref: format!("{}:{commit}", inner.repo()),
             running,
             restart: spec.restart.clone(),
             args,
@@ -301,7 +319,11 @@ impl Probe for World {
         let ready = !inner.never_ready.contains(&c.image_id);
         Ok(match path {
             "/readyz" => Reply {
-                status: if ready { 200 } else { 503 },
+                status: if ready {
+                    inner.ready_status.unwrap_or(200)
+                } else {
+                    503
+                },
                 body: String::new(),
             },
             _ => Reply {

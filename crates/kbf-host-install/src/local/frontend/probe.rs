@@ -86,10 +86,19 @@ pub fn ready(probe: &dyn Probe, addr: SocketAddr) -> bool {
 
 /// The commit `/healthz` of the frontend at `addr` reports, if it answers 200 with one.
 pub fn commit(probe: &dyn Probe, addr: SocketAddr) -> Option<String> {
-    let reply = probe
-        .get(addr, "/healthz")
-        .ok()
-        .filter(|r| r.status == 200)?;
+    commit_at(probe, addr, "/healthz")
+}
+
+/// Whether `GET path` at `addr` answers with a 2xx status.
+pub fn answers_2xx(probe: &dyn Probe, addr: SocketAddr, path: &str) -> bool {
+    probe
+        .get(addr, path)
+        .is_ok_and(|reply| (200..300).contains(&reply.status))
+}
+
+/// The commit the JSON body of `GET path` at `addr` reports, if it answers 200 with one.
+pub fn commit_at(probe: &dyn Probe, addr: SocketAddr, path: &str) -> Option<String> {
+    let reply = probe.get(addr, path).ok().filter(|r| r.status == 200)?;
     let json: serde_json::Value = serde_json::from_str(&reply.body).ok()?;
     json.get("commit")?.as_str().map(str::to_owned)
 }

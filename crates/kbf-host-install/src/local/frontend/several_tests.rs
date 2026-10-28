@@ -137,6 +137,7 @@ fn second(rig: &Rig, world: &World, bound: Option<&str>) -> Ab<Frontend<Source, 
         config_file: rig.dir.join("second.toml"),
         record_file: rig.dir.join(&files.record),
         bound_name: bound.map(str::to_owned),
+        described: None,
         pace: world.pace(),
     };
     let clock = std::rc::Rc::clone(&rig.clock);
