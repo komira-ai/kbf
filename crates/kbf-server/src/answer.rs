@@ -6,13 +6,14 @@
 //! `js-server-core` ([`crate::farm_js`]). A change here is a change in what a caller of
 //! either is answered.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use kbf_front::{Backend, Finished};
 use kbf_meta::ActionRecord;
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker;
+use kbf_storage::StorageError;
 use kbf_types::{Answer, Digest, Failure, FarmRun, LeaseId, Outcome, Refusal, WorkerId};
 use tonic::Code;
 
@@ -64,7 +65,8 @@ impl Detail {
 /// ([`crate::timeout`], stamped as an OK result is), or the blobs of a missing-input
 /// one ([`missing::inputs`]). An OK result whose outputs are not all stored is an
 /// infrastructure failure: accepting it would answer callers with files nobody can
-/// fetch. An OK result gets the node it `ran_on` and the server's times
+/// fetch. While the store cannot answer at all (every owner of an output is down) the
+/// check is asked again, for up to ten minutes, before it fails ([`prepare`]). An OK result gets the node it `ran_on` and the server's times
 /// ([`Stamp::apply`], received when `wall` reads) before it is checked and its cache record
 /// made.
 pub async fn outcome(
@@ -88,7 +90,7 @@ pub async fn outcome(
         (Code::Ok, Some(mut result)) => {
             let (node, stamp) = ran_on;
             stamp.apply(&mut result, node, wall());
-            match cache.prepare_action_result(&result).await {
+            match prepare(cache, lease, &result).await {
                 Ok(record) => {
                     let outcome = Outcome::Completed {
                         action_result: record.result.into(),
@@ -141,6 +143,47 @@ pub async fn outcome(
                 (Outcome::Failed(Failure::Infra), Some(Detail::Infra(why)))
             }
         },
+    }
+}
+
+/// How long [`prepare`] waits between two asks of a store that cannot answer.
+pub const STORAGE_PAUSE: Duration = Duration::from_secs(5);
+
+/// How many times [`prepare`] waits [`STORAGE_PAUSE`] for a store that cannot answer: ten
+/// minutes in all. Past it the store's error is the result's, and the operation is run
+/// again as any infrastructure failure is.
+pub const STORAGE_WAITS: u32 = 120;
+
+/// [`Backend::prepare_action_result`] for the OK `result` of `lease`, asked again every
+/// [`STORAGE_PAUSE`], up to [`STORAGE_WAITS`] times, while the store cannot answer
+/// ([`StorageError::Unavailable`], such as every owner of an output being down). The
+/// action ran to completion on its node and its outputs are not at fault, so the run is
+/// not charged to the operation's farm reruns for an outage that ends in minutes: the
+/// result waits here, the lease held (the node's heartbeats list it until the result is
+/// acknowledged), and is accepted once the store answers. Any other error (an output the
+/// store lacks, a malformed result) is returned at once.
+async fn prepare(
+    cache: &Backend,
+    lease: LeaseId,
+    result: &ActionResult,
+) -> Result<ActionRecord, StorageError> {
+    let mut waited = 0;
+    loop {
+        match cache.prepare_action_result(result).await {
+            Err(StorageError::Unavailable(e)) if waited < STORAGE_WAITS => {
+                if waited == 0 {
+                    tracing::warn!(%lease, error = %e, "an OK result waits for storage to answer");
+                }
+                waited += 1;
+                tokio::time::sleep(STORAGE_PAUSE).await;
+            }
+            answer => {
+                if waited > 0 {
+                    tracing::info!(%lease, waited, "storage answered an OK result's check");
+                }
+                return answer;
+            }
+        }
     }
 }
 
