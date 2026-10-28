@@ -45,8 +45,9 @@ use kbf_types::LeaseId;
 use prost_types::Timestamp;
 use tokio::sync::oneshot;
 
+use crate::blocking_steps::{self, create_logs, make_cgroup, oom_outcome, read_start};
 use crate::cgroup::{LeaseCgroup, SwapKill, memory_max, presses_into_swap};
-use crate::cgroup_usage::{CPU_PSI, NUMA_EVERY, NumaSample, Start, resource_usage};
+use crate::cgroup_usage::{CPU_PSI, NUMA_EVERY, NumaSample, Start};
 use crate::container::{
     CONTAINER_OWNER, ContainerLimits, ContainerSpec, DAEMON_OWNER, Dirs, Ended, LEASE_PREFIX,
 };
@@ -56,7 +57,6 @@ use crate::keeper::Keeper;
 use crate::logs::{Logs, STDERR, STDOUT, store_both};
 use crate::numa::{Pin, Placement, Placer};
 use crate::oci::{Oci, OciConfig};
-use crate::off_worker::off_worker;
 use crate::outputs::{OutputLimits, collect};
 use crate::program;
 use crate::remove::remove_tree;
@@ -495,19 +495,10 @@ impl<C: Cas> ContainerRuntime<C> {
         });
         phases.numa_node = placement.as_ref().map(Placement::spot);
         lease.pin = placement.and_then(Placement::into_pin);
-        let (cgroup, pin, resources) = (lease.cgroup.clone(), lease.pin.take(), work.resources);
-        let (backstop_ooms, made, pin) = off_worker(move || {
-            // `actions/`'s own OOM count before the lease, to say afterwards whether its
-            // limit killed the lease.
-            let backstop_ooms = cgroup.parent_ooms().ok();
-            let kill = cgroup.dir().join("cgroup.kill");
-            let made = (cgroup.create(resources, pin.as_ref())).and_then(|()| Keeper::watch(&kill));
-            (backstop_ooms, made, pin)
-        })
-        .await;
-        lease.backstop_ooms = backstop_ooms;
-        lease.pin = pin;
-        lease.keeper = Some(made.map_err(|e| failed(lease.cgroup.dir(), &e))?);
+        let made = make_cgroup(lease.cgroup.clone(), work.resources, lease.pin.take()).await;
+        lease.backstop_ooms = made.backstop_ooms;
+        lease.pin = made.pin;
+        lease.keeper = Some(made.keeper.map_err(|e| failed(lease.cgroup.dir(), &e))?);
         phases.cgroup_ms = millis(started);
         tracing::info!(lease = %lease.name, "inputs phases: {phases}");
         Ok(())
@@ -554,7 +545,7 @@ impl<C: Cas> ContainerRuntime<C> {
             self.config.cpu_pressure_file.clone(),
             work.resources.cpu_millis,
         );
-        lease.started_under = off_worker(move || Start::read(&psi, millicpus)).await;
+        lease.started_under = read_start(psi, millicpus).await;
         lease.numa = NumaSample::counting(Arc::clone(&self.numa_samples));
         lease.created = true;
         self.engine
@@ -628,8 +619,7 @@ impl<C: Cas> ContainerRuntime<C> {
         // reported no exit or could not be asked: the lease cgroup's counters do not
         // depend on `crun`'s report, so a kill they show is reported as one.
         if matches!(ended, Ok(Ended::Exited(137) | Ended::NotRun(_)) | Err(_)) {
-            let (cgroup, before) = (lease.cgroup.clone(), lease.backstop_ooms);
-            match off_worker(move || cgroup.oom_outcome(cap, before)).await {
+            match oom_outcome(lease.cgroup.clone(), cap, lease.backstop_ooms).await {
                 Ok(Some(kill)) => return Err(kill),
                 Ok(None) => {}
                 Err(e) if ended == Ok(Ended::Exited(137)) => {
@@ -981,10 +971,7 @@ impl Lease {
         let ran = self.ran?;
         let numa = std::mem::take(&mut self.numa);
         let (dir, started_under) = (self.cgroup.dir().to_owned(), self.started_under);
-        Some(
-            off_worker(move || resource_usage(numa.finish(&dir), ran.elapsed(), started_under))
-                .await,
-        )
+        Some(blocking_steps::usage(dir, numa, ran, started_under).await)
     }
 
     /// Steps 5 and 6, off the async threads.
@@ -1080,20 +1067,6 @@ fn private_paths(working_directory: &str, outputs: &[String]) -> Vec<String> {
             }
         })
         .collect()
-}
-
-/// Creates the files the container's stdout and stderr go to, on the blocking pool.
-async fn create_logs(
-    stdout: &Path,
-    stderr: &Path,
-) -> Result<(std::fs::File, std::fs::File), RuntimeError> {
-    let (out, err) = (stdout.to_owned(), stderr.to_owned());
-    off_worker(move || {
-        let stdout = std::fs::File::create(&out).map_err(|e| failed(&out, &e))?;
-        let stderr = std::fs::File::create(&err).map_err(|e| failed(&err, &e))?;
-        Ok((stdout, stderr))
-    })
-    .await
 }
 
 /// The cache `given` opened; `None`, after a warning, when it cannot be opened. Blocking.
