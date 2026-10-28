@@ -45,6 +45,8 @@ mod ext_tests;
 #[cfg(test)]
 mod facts_tests;
 #[cfg(test)]
+mod failed_tests;
+#[cfg(test)]
 mod host_tests;
 #[cfg(test)]
 mod load_tests;

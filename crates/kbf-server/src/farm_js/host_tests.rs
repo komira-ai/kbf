@@ -388,3 +388,35 @@ async fn report(rig: &super::testing::Rig, result: worker::Result) -> bool {
     .expect("heard");
     ack.is_some_and(|ack| ack.accepted)
 }
+
+/// Asserts that the farm's number of a stream is the core's, that a stream is found from it
+/// only while it is the worker's newest, and that a status on a replaced stream or of a worker
+/// the core never heard is not kept. Catches: a replaced stream found by its number, which
+/// lets a restarted daemon's old stream overwrite its status.
+#[tokio::test(start_paused = true)]
+async fn a_stream_is_found_by_its_number_while_it_is_the_workers_newest() {
+    let rig = rig();
+    let old = register(&rig, "node-a", 0);
+    let new = register(&rig, "node-a", 0);
+    let (old_number, new_number) = (
+        super::host::stream_number(old.stream).expect("numbered"),
+        super::host::stream_number(new.stream).expect("numbered"),
+    );
+    let node = WorkerId::new("node-a");
+    let ghost = WorkerId::new("ghost");
+
+    rig.core.with(|_, a| {
+        assert_ne!(old_number, new_number);
+        assert_eq!(a.current_stream(&node, new_number), Some(new.stream));
+        assert_eq!(a.current_stream(&node, old_number), None);
+        assert_eq!(a.current_stream(&ghost, new_number), None);
+        let status = || kbf_proto::update::UpdateStatus::default();
+        assert!(!a.report_update_status(&node, old.stream, status()));
+        assert!(a.report_update_status(&node, new.stream, status()));
+        assert!(
+            a.report_node_status(&node, old.stream, Default::default())
+                .is_empty()
+        );
+        assert!(a.machine().node(&node).is_some_and(|n| n.update_live));
+    });
+}

@@ -28,8 +28,10 @@
 
 use kbf_proto::worker::{NodeStatus, XcodeState, XcodeStatus};
 use kbf_sched::NodePhase;
-use kbf_types::Resources;
+use kbf_types::{Resources, WorkerId};
 use serde::Serialize;
+
+use crate::machine::FarmMachine;
 
 /// One node, as `GET /v1/nodes` lists it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -388,6 +390,37 @@ pub fn attention_changes(
         .filter(|(key, _)| !has(&after, key))
         .map(|(_, item)| (false, format!("node {node}: resolved: {item}")));
     raised.chain(cleared).collect()
+}
+
+/// Keeps `status`, a `NodeStatus` of `worker` received at `received` (milliseconds since the
+/// Unix epoch), as the machine's newest of the node, and returns the attention items it
+/// raises or clears against the node's previous status, `true` for each raised; each is
+/// logged once, at `WARN` for a raise and `INFO` for a clear, under the target
+/// `kbf_server::attention`. An Xcode the status lists not surveyed yet keeps its previous
+/// item (neither cleared now nor raised again by the survey). Both drivers of the farm take
+/// a node's status through this.
+pub fn take_node_status(
+    machine: &mut FarmMachine,
+    worker: &WorkerId,
+    status: NodeStatus,
+    received: u64,
+) -> Vec<(bool, String)> {
+    let mut view = SoftwareView::new(status, received);
+    let before = machine
+        .node(worker)
+        .and_then(|n| n.status.as_ref())
+        .map_or(&[][..], |s| &s.xcodes);
+    view.hold_unsurveyed(before);
+    let changes = attention_changes(worker.as_str(), before, &view.xcodes);
+    for (raise, line) in &changes {
+        if *raise {
+            tracing::warn!(target: "kbf_server::attention", "{line}");
+        } else {
+            tracing::info!(target: "kbf_server::attention", "{line}");
+        }
+    }
+    machine.report_status(worker, view);
+    changes
 }
 
 /// The body of `GET /v1/nodes`: the server that answers, and every node registered
