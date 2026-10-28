@@ -51,3 +51,29 @@ pub trait MapSource: Send + Sync {
     /// it reads `current`.
     fn changes(&self) -> watch::Receiver<u64>;
 }
+
+/// Scratch: a function no test calls.
+pub fn scratch_uncovered(n: u64) -> u64 {
+    let mut total = 0;
+    total += n;
+    total += n * 2;
+    total += n * 3;
+    total += n * 4;
+    total += n * 5;
+    total += n * 6;
+    total += n * 7;
+    total += n * 8;
+    total += n * 9;
+    total += n * 10;
+    total += n * 11;
+    total += n * 12;
+    total += n * 13;
+    total += n * 14;
+    total += n * 15;
+    total += n * 16;
+    total += n * 17;
+    total += n * 18;
+    total += n * 19;
+    total += n * 20;
+    total
+}
