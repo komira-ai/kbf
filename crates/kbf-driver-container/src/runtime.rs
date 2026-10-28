@@ -38,9 +38,9 @@ use kbf_daemon::cache::{Cache, CacheConfig, InputStats};
 use kbf_daemon::cas::{Cas, CasError};
 use kbf_daemon::cpu_pool::{CpuPool, DEFAULT_CPU_THREADS};
 use kbf_daemon::trees::{TreeConfig, TreeLease, Trees};
-use kbf_daemon::{Runtime, RuntimeError, Work, upload_within};
+use kbf_daemon::{NodeLoadError, Runtime, RuntimeError, Work, upload_within};
 use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata, Platform};
-use kbf_proto::worker::ResourceUsage;
+use kbf_proto::worker::{self, ResourceUsage};
 use kbf_types::LeaseId;
 use prost_types::Timestamp;
 use tokio::sync::oneshot;
@@ -829,6 +829,22 @@ impl<C: Cas> Runtime for ContainerRuntime<C> {
 
     fn serves(&self, kind: &str) -> bool {
         kind == KIND
+    }
+
+    async fn node_load(&self) -> Result<Option<worker::NodeLoad>, NodeLoadError> {
+        let load = ContainerRuntime::node_load(self)
+            .await
+            .map_err(|e| NodeLoadError {
+                kind: match &e {
+                    LoadError::Read { file, .. } | LoadError::Malformed { file, .. } => file,
+                },
+                why: e.to_string(),
+            })?;
+        Ok(Some(load.into_proto()))
+    }
+
+    fn take_peak_window_millicores(&self, lease_id: LeaseId) -> Option<u64> {
+        ContainerRuntime::take_peak_window_millicores(self, lease_id)
     }
 
     async fn run(&self, work: Work) -> Result<ActionResult, RuntimeError> {

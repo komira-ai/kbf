@@ -264,6 +264,9 @@ pub struct Daemon {
     /// The handle the frontend's Welcome turns pack writes on and off with, if the data plane
     /// writes packs; see [`Self::with_pack_writes`].
     pack_commit: Option<PackCommit>,
+    /// The kinds of failed node-load reading already logged, so a read that fails on
+    /// every heartbeat is logged once.
+    load_errors: BTreeSet<&'static str>,
     /// The suspend-counting clock that contact and the Start window read.
     clock: Arc<dyn Clock>,
     /// This daemon process's `Hello.instance_id`, the same on every stream it opens.
@@ -359,6 +362,7 @@ impl Daemon {
             epoch: None,
             granted: BTreeMap::new(),
             pack_reads: None,
+            load_errors: BTreeSet::new(),
             pack_commit: None,
             clock: Arc::new(SystemClock),
             instance: instance_id(),
@@ -403,6 +407,20 @@ impl Daemon {
     #[must_use]
     pub const fn pack_reads(&self) -> Option<&PackCounter> {
         self.pack_reads.as_ref()
+    }
+
+    /// The node's load for a Heartbeat, from the runtime that takes readings. A reading
+    /// that fails leaves it unset, and is logged the first time its kind fails.
+    async fn node_load(&mut self) -> Option<worker::NodeLoad> {
+        match self.leases.node_load().await {
+            Ok(load) => load,
+            Err(error) => {
+                if self.load_errors.insert(error.kind) {
+                    tracing::warn!(%error, "node load not read: heartbeats go without it");
+                }
+                None
+            }
+        }
     }
 
     /// The counts of the pack writes for a Heartbeat: those of the counter
@@ -821,12 +839,14 @@ impl Daemon {
                     let now = self.clock.now();
                     self.contact.sent(seq, now);
                     self.window.sent(seq, now);
+                    let node_load = self.node_load().await;
                     let heartbeat = Heartbeat {
                         seq,
                         report_hash: self.report.hash().to_vec(),
                         running: self.listed().into_iter().map(proto_lease_id).collect(),
                         pack_reads: self.pack_reads.as_ref().map(|c| c.stats().into()),
                         pack_writes: self.pack_writes_counted(),
+                        node_load,
                     };
                     send(&tx, daemon_message::Message::Heartbeat(heartbeat));
                 }

@@ -73,6 +73,7 @@ mod failed_actions;
 mod handover;
 mod learning;
 mod named;
+mod node_load;
 mod nodes;
 mod pack_reads;
 mod pack_writes;
@@ -388,6 +389,9 @@ struct State {
     /// The pack-write counts on the newest heartbeat of each node that sent any
     /// ([`Farm::note_pack_writes`]).
     pack_writes: BTreeMap<WorkerId, worker::PackWriteCounts>,
+    /// What the accepted node-load readings of each node that sent any come to
+    /// ([`Farm::note_node_load`]).
+    node_loads: BTreeMap<WorkerId, node_load::Kept>,
     /// The operations this process settled as failed, per class
     /// (`kbf_execute_failed_actions_total`, [`Farm::failed_actions`]).
     failed: FailedActions,
@@ -500,6 +504,7 @@ impl Farm {
                 intake: Intake::default(),
                 watched: BTreeMap::new(),
                 pack_reads: BTreeMap::new(),
+                node_loads: BTreeMap::new(),
                 pack_writes: BTreeMap::new(),
                 failed: FailedActions::default(),
             }),

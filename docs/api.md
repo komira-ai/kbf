@@ -196,8 +196,8 @@ not made by this server.
 
 ## `GET /v1/nodes/{id}`
 
-One node: every field of its entry in `GET /v1/nodes`, and three more, a read open like
-the list:
+One node: every field of its entry in `GET /v1/nodes`, three more, and a `load` when its daemon
+has sent readings, a read open like the list:
 
 ```json
 { "node_id": "linux-1", "connected": true, "protocol": 1, "software": null,
@@ -214,6 +214,39 @@ the list:
 | `capacity` | what the node's newest `Hello` said it can run at once |
 | `free` | `capacity` less `booked` on each axis, never below zero |
 | `leases` | the leases it holds, as `term.seq`, in lease order |
+
+### Node load
+
+`load` is what the node's daemon reports of the CPU and memory its actions use, from the
+`node_load` of its heartbeats. It is shown only: nothing places a lease by it. It is left out when
+the server has accepted no reading of the node (a daemon or runtime that takes none, a failed
+read, a node another frontend holds), and it is in memory: a server restart forgets it.
+
+```json
+"load": { "measured_cpu_millicores": 2500, "memory_working_set_bytes": 1000,
+          "memory_active_file_bytes": 200, "admission_working_set_bytes": 1000,
+          "covered": ["117399224320012061.40"], "actions_cpu_limited": false,
+          "cpu_throttled_usec": 7, "cpu_pressure_some_total_usec": 12345, "stale": false }
+```
+
+| Field | Meaning |
+|---|---|
+| `measured_cpu_millicores` | the CPU the node's actions used, in thousandths of a CPU: the larger of the last two windows between accepted readings, each the cgroup's CPU time over the daemon's clock time. `null` before two windows are known, and when `stale` |
+| `memory_working_set_bytes` | the actions cgroup's `memory.current` less its inactive file pages, at the last accepted reading |
+| `memory_active_file_bytes` | the cgroup's active file pages at the last accepted reading |
+| `admission_working_set_bytes` | `memory_working_set_bytes` less the active file pages beyond a quarter of the node's `capacity` memory, never below zero: active page cache the kernel has not yet marked reclaimable must not make an idle node look full |
+| `covered` | the leases, as `term.seq`, that ran for the whole window before the last reading |
+| `actions_cpu_limited` | whether the actions cgroup has a CPU quota |
+| `cpu_throttled_usec`, `cpu_pressure_some_total_usec` | cumulative CPU throttled time and CPU pressure (`some` total), in microseconds; telemetry. Left out when the daemon could not read them |
+| `stale` | no reading was accepted for three windows (a window being the time between the last two accepted readings) |
+
+A reading is accepted only if its `seq` is above the last accepted one of the same daemon process;
+a restarted daemon starts again, and its first reading is the new baseline. A reading is dropped
+(it counts as absent, and the last accepted one stays the baseline) when its clock or CPU counter
+went back or its clock did not move, when its CPU since the last accepted reading is more than
+four cores per hardware thread of the node's `capacity`, or when its working set is more than four
+times the node's memory. A lease's busiest window is not here: it is the usage record's
+`peak_window_millicores`.
 
 `{id}` is the node id as `POST /v1/nodes/{node}:cordon` takes it, percent-encoded as one
 path segment. `404` with `{"error": "no_node"}` for a node that has not registered since

@@ -1163,6 +1163,22 @@ impl FakeDaemon {
         self.expect("HeartbeatAck", ack_of(seq)).await;
     }
 
+    /// Sends a heartbeat listing nothing and carrying the node load `load`, and waits for its
+    /// acknowledgement for as long as [`PROMPT`], a bound on failure only.
+    pub async fn beat_loaded_acked(&mut self, load: Option<kbf_proto::worker::NodeLoad>) {
+        self.seq += 1;
+        let seq = self.seq;
+        self.send(daemon_message::Message::Heartbeat(Heartbeat {
+            seq,
+            report_hash: Vec::new(),
+            running: Vec::new(),
+            pack_reads: None,
+            pack_writes: None,
+            node_load: load,
+        }));
+        self.expect("HeartbeatAck", ack_of(seq)).await;
+    }
+
     /// Sends a heartbeat with the next sequence number; the number.
     fn beat(&mut self, running: &[LeaseId], pack_reads: Option<PackReadCounts>) -> u64 {
         self.beat_with(running, pack_reads, None)
@@ -1183,6 +1199,7 @@ impl FakeDaemon {
             running: running.to_vec(),
             pack_reads,
             pack_writes,
+            node_load: None,
         }));
         seq
     }

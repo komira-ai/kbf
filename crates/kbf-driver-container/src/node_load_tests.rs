@@ -109,6 +109,28 @@ fn memory_stat_gives_inactive_file() {
     }
 }
 
+/// Catches `inactive_file` or `active_anon` read for `active_file`, and a missing or
+/// garbled line read as 0 (which would make the admission working set look larger or smaller
+/// than the cgroup's).
+#[test]
+fn memory_stat_gives_active_file() {
+    assert_eq!(parse_active_file(MEMORY_STAT), Ok(6_291_456));
+    for bad in [
+        "",
+        "inactive_file 5\nactive_anon 5\n",
+        "active_file x\n",
+        "active_file\n",
+    ] {
+        assert!(matches!(
+            parse_active_file(bad),
+            Err(LoadError::Malformed {
+                file: "memory.stat",
+                ..
+            })
+        ));
+    }
+}
+
 /// Catches `max 100000` read as a limit, a quota read as none, and a garbled file read
 /// as either.
 #[test]
@@ -167,6 +189,7 @@ fn a_directory_of_cgroup_files_is_one_reading() {
             mono_usec: 77,
             cpu_usage_usec: 5_000_000,
             working_set_bytes: 10_485_760 - 2_097_152,
+            active_file_bytes: 6_291_456,
             covered: BTreeSet::new(),
             actions_cpu_limited: false,
             throttled_usec: Some(123_456),

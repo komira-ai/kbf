@@ -75,6 +75,7 @@ impl State {
             capacity: none,
             free: none,
             leases,
+            load: None,
         })
     }
 }
