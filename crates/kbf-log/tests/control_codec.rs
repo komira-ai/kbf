@@ -234,6 +234,7 @@ impl Rng {
                 lease: self.lease(),
                 operation: OperationId(self.number()),
                 worker: self.worker(),
+                cost: Default::default(),
             }),
             1 => ControlRecord::Result(ResultRecord {
                 lease: self.lease(),

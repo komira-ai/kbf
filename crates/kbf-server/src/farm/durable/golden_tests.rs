@@ -849,3 +849,22 @@ fn every_row_of_the_file_reads_and_writes_back_the_same() {
         }
     }
 }
+
+const SUMMARY_V1: &str = include_str!("../../../tests/golden/farm-rows/size-summary-v1.txt");
+
+/// Catches: a release that cannot read the `est/` row the release before it wrote (the
+/// estimator's summary changed its stored form to version 2, with a minute ring more), and a
+/// row read but written back as something that does not read: the row of `size-summary-v1.txt`
+/// is read as the summary it holds, and what it is written back as reads as the same summary.
+#[test]
+fn a_version_1_size_summary_row_still_reads() {
+    let lines = lines_of(SUMMARY_V1);
+    assert_eq!(lines.len(), 1);
+    let (key, row) = split(&lines[0]);
+    let (named, summary) = estimate::decode(key, &row).expect("a version 1 row");
+    assert_eq!(named, size_key());
+    let read = kbf_estimator::Summary::decode(&summary).expect("a version 1 summary");
+    let again = read.encode();
+    assert_eq!(again.len(), summary.len() + 32, "the minute ring is added");
+    assert_eq!(kbf_estimator::Summary::decode(&again), Some(read));
+}

@@ -60,6 +60,8 @@ impl State {
         let event = Event::Heartbeat {
             worker: worker.clone(),
             running: running.clone(),
+            // This server's workers do not report a load yet.
+            load: None,
         };
         let answers = self.feed(now, event);
         // A node this frontend does not own is not kept alive in the store by it.
