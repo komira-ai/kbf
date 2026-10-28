@@ -220,10 +220,14 @@ mod tests {
         let text = outer.text();
         assert!(!text.contains("a debug line"), "{text}");
         assert!(!text.contains("inner debug line"), "{text}");
-        assert!(
-            text.contains("outer line") && text.contains("outer again"),
-            "{text}"
-        );
+        assert!(text.contains("outer line"), "{text}");
+        assert!(text.contains("outer again"), "{text}");
+    }
+
+    /// The writer takes a flush, as a `fmt` layer's writer may be asked for.
+    #[test]
+    fn the_writer_flushes_without_a_capture() {
+        io::Write::flush(&mut Writer).expect("a flush");
     }
 
     /// `ended` returns once a line holding the text was written, even one written before the
