@@ -353,8 +353,8 @@ fn a_running_pipeline_is_never_cancelled_and_neither_is_a_release() {
     red(
         &plant(
             "pipeline.yml",
-            "    permissions:\n      contents: read\n\n  artifacts:",
-            "    permissions:\n      contents: write\n\n  artifacts:",
+            "      contents: read\n      # The last coverage part lists the run's jobs and artifacts to wait for the others.\n      actions: read\n\n  artifacts:",
+            "      contents: write\n      # The last coverage part lists the run's jobs and artifacts to wait for the others.\n      actions: read\n\n  artifacts:",
         ),
         "the job `ci` grants the scopes",
     );
@@ -373,6 +373,14 @@ fn a_called_workflow_never_asks_for_more_than_its_caller_grants() {
             "    uses: ./.github/workflows/beta.yml\n    permissions:\n      contents: read\n",
         ),
         "the job `mixed-version` of beta.yml asks for `attestations: read`",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "      # The last coverage part lists the run's jobs and artifacts to wait for the others.\n      actions: read\n",
+            "",
+        ),
+        "the job `test-shard` of ci.yml asks for `actions: read`",
     );
     red(
         &plant(

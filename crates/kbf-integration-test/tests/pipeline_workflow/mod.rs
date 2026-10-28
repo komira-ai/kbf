@@ -23,7 +23,8 @@
 //!   release is another workflow, in a group of its own that never cancels (`release_workflow`
 //!   holds that rule), started by the success of a run of this one.
 //! - **Least privilege.** Every job has `contents: read` and nothing else but the signing
-//!   scopes of `artifacts`; a called workflow gets at most
+//!   scopes of `artifacts` and the `actions: read` of `ci` (the coverage parts wait for each
+//!   other's artifacts); a called workflow gets at most
 //!   what its caller job grants.
 
 use super::workflows;
@@ -210,6 +211,8 @@ fn permissions(text: &str, out: &mut Vec<String>) -> Result<(), String> {
                 ("attestations", "write"),
             ],
             "beta" => vec![("contents", "read"), ("attestations", "read")],
+            // The last part of the coverage run lists the run's jobs and artifacts.
+            "ci" => vec![("contents", "read"), ("actions", "read")],
             _ => vec![("contents", "read")],
         };
         let mut got: Vec<String> = have.iter().map(|(s, l)| format!("{s}: {l}")).collect();
