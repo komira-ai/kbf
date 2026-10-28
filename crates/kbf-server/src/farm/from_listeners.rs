@@ -28,6 +28,12 @@ impl Farm {
         .with_whole_node(listeners.whole_node.clone())
     }
 
+    /// The core this farm runs on, as its driver is (not as a flag says).
+    #[must_use]
+    pub const fn scheduler_core(&self) -> crate::SchedulerCore {
+        self.driver.core()
+    }
+
     /// This farm, running whole-machine requests with `config`'s whole-node drain and caps
     /// (`--whole-node-max`) if it names any, as the scheduler built by [`Farm::new`] does
     /// not. Set before the farm takes a state store over.
