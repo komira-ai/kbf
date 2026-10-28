@@ -397,10 +397,12 @@ fn a_service_flag_that_is_wrong_is_refused() {
     assert!(err.contains("service name"), "{err}");
 }
 
-/// Catches: a service updated through the agent's own helper, which installs `kbf` (an install
-/// request names no service, so kbf would be installed at the service's version). A service
-/// without `helper-socket=` is refused, and so is one whose socket is the agent's
-/// `--helper-socket`, the default one or one given; a socket of its own is read.
+/// Catches: a service updated through a helper that is not its own: the agent's, which installs
+/// `kbf` (an install request names no service, so kbf would be installed at the service's
+/// version), or another service's. A service without `helper-socket=` is refused, and so is one
+/// whose socket is the agent's `--helper-socket` (the default one or one given), one that
+/// shares another service's socket, or one whose path holds a `..` component; a socket of
+/// its own is read.
 #[test]
 fn a_service_needs_a_helper_of_its_own() {
     let err = parse_flags(&with(&["--service", "db"])).unwrap_err();
@@ -425,6 +427,23 @@ fn a_service_needs_a_helper_of_its_own() {
     ]))
     .unwrap_err();
     assert!(err.contains("helper-socket is the agent's"), "{err}");
+    let err = parse_flags(&with(&[
+        "--service",
+        "db,helper-socket=/run/one.sock",
+        "--service",
+        "cache,helper-socket=/run/one.sock",
+    ]))
+    .unwrap_err();
+    assert!(
+        err.contains("--service cache: helper-socket is also db's"),
+        "{err}"
+    );
+    let err = parse_flags(&with(&[
+        "--service",
+        "db,helper-socket=/run/x/../kbf-host-install/local.sock",
+    ]))
+    .unwrap_err();
+    assert!(err.contains("may not hold a .. component"), "{err}");
     let config = parse_flags(&with(&[
         "--helper-socket",
         "/run/h.sock",

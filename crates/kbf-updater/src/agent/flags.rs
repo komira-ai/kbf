@@ -355,6 +355,15 @@ fn parse_services(values: &[String]) -> Result<Vec<ServiceConfig>, String> {
         if services.iter().any(|s| s.name == service.name) {
             return Err(format!("--service {} is given twice", service.name));
         }
+        if let Some(other) = services
+            .iter()
+            .find(|s| s.helper_socket == service.helper_socket)
+        {
+            return Err(format!(
+                "--service {}: helper-socket is also {}'s; each service needs a helper of its own",
+                service.name, other.name
+            ));
+        }
         services.push(service);
     }
     Ok(services)
@@ -393,6 +402,14 @@ fn parse_service(value: &str) -> Result<ServiceConfig, String> {
     if !helper_socket.is_absolute() {
         return Err(format!(
             "--service {name}: helper-socket must be an absolute path"
+        ));
+    }
+    if helper_socket
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(format!(
+            "--service {name}: helper-socket may not hold a .. component"
         ));
     }
     let drain = match take("drain") {

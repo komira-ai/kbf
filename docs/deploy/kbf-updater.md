@@ -282,7 +282,7 @@ by commas, each at most once:
 | setting | meaning | default |
 |---|---|---|
 | `channel=C` | the channel of the helper's allowlist that holds the service's releases | `NAME` (it must be a channel name) |
-| `helper-socket=PATH` | the socket of the helper that installs it (absolute path); required, and never the agent's `--helper-socket`, whose helper installs `kbf` (an install request names no service, so it would install `kbf` at the service's version) | none: required |
+| `helper-socket=PATH` | the socket of the helper that installs it (an absolute path with no `..`); required, one per service, and never the agent's `--helper-socket`, whose helper installs `kbf` (an install request names no service, so it would install `kbf` at the service's version) | none: required |
 | `drain=node` or `drain=none` | `node`: the host's node is drained and given back through the frontend, as for `kbf`; `none`: nothing is drained, and no drain call is made | `node` |
 | `ready-url=http://IP:PORT/PATH` | health is `GET PATH` on that loopback address answering 2xx (the path is `/` if there is none) | the node's health through the frontend, as for `kbf` |
 
