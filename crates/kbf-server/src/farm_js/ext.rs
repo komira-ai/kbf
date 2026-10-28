@@ -22,14 +22,8 @@ use kbf_estimator::Key;
 use kbf_state::{Cond, Store, Txn};
 use kbf_types::OperationId;
 
-use crate::farm::durable::{estimate, named, subject};
+use crate::farm::durable::{ESTIMATE, SUBJECT, estimate, named, subject};
 use crate::learned::Row;
-
-/// The key prefix of the `subject/` rows.
-const SUBJECT: &str = "subject/";
-
-/// The key prefix of the `est/` rows.
-const ESTIMATE: &str = "est/";
 
 /// The rows of a build server, beside the scheduler's.
 #[derive(Debug, Clone, Copy, Default)]

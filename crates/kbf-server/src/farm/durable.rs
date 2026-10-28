@@ -211,11 +211,11 @@ const FATE: &str = "fate/";
 const FLOOR: &str = "floor/";
 const KEY_FLOOR: &str = "keyfloor/";
 const OPKEY: &str = "opkey/";
-const ESTIMATE: &str = "est/";
+pub(crate) const ESTIMATE: &str = "est/";
 /// Rows of one transaction of the size sweep, and the most transactions of one call.
 pub(super) const SWEEP_ROWS: usize = 256;
 pub(super) const SWEEP_TXNS: usize = 4;
-const SUBJECT: &str = "subject/";
+pub(crate) const SUBJECT: &str = "subject/";
 
 /// The least time a `done/` row is kept, whatever the finished retention: a process that
 /// follows an operation it did not finish needs the row for as long as a stream it kept
