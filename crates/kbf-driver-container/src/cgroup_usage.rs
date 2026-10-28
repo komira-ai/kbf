@@ -18,6 +18,8 @@ use std::time::Duration;
 
 use kbf_proto::worker::{CgroupUsage, NumaNodeBytes, ResourceUsage, UsageBasis};
 
+use crate::off_worker::off_worker;
+
 /// How often [`NumaSample::watch`] reads `memory.numa_stat` while the action runs, unless
 /// `ContainerConfig::numa_every` says otherwise.
 pub(crate) const NUMA_EVERY: Duration = Duration::from_secs(1);
@@ -140,6 +142,33 @@ fn read_u64(dir: &Path, name: &str) -> Option<u64> {
         .ok()
 }
 
+/// What one reading of a cgroup's memory files found.
+struct Sample {
+    /// Anon + swap, when both files were there.
+    anon_swap: Option<u64>,
+    /// The NUMA split, when `memory.numa_stat` could be read.
+    numa: Option<BTreeMap<u32, u64>>,
+}
+
+/// Reads the memory files of the cgroup `dir`. Blocking.
+fn read_sample(dir: &Path) -> Sample {
+    // Anon + swap is what the action touched, without the page cache `memory.peak`
+    // counts; both files must be there, or the sample is not anon + swap.
+    let anon_swap = match (
+        std::fs::read_to_string(dir.join("memory.stat"))
+            .ok()
+            .and_then(|text| anon_bytes(&text)),
+        read_u64(dir, "memory.swap.current"),
+    ) {
+        (Some(anon), Some(swap)) => Some(anon.saturating_add(swap)),
+        _ => None,
+    };
+    let numa = std::fs::read_to_string(dir.join("memory.numa_stat"))
+        .ok()
+        .map(|text| numa_stat(&text));
+    Sample { anon_swap, numa }
+}
+
 /// The NUMA split of the sample that held the most memory.
 #[derive(Debug, Default)]
 pub(crate) struct NumaSample {
@@ -164,21 +193,17 @@ impl NumaSample {
     /// Reads `memory.numa_stat` of the cgroup `dir` and keeps it if it holds more than
     /// every earlier sample (a sample that cannot be read changes nothing).
     pub(crate) fn observe(&mut self, dir: &Path) {
-        // Anon + swap is what the action touched, without the page cache `memory.peak`
-        // counts; both files must be there, or the sample is not anon + swap.
-        if let (Some(anon), Some(swap)) = (
-            std::fs::read_to_string(dir.join("memory.stat"))
-                .ok()
-                .and_then(|text| anon_bytes(&text)),
-            read_u64(dir, "memory.swap.current"),
-        ) {
-            let now = anon.saturating_add(swap);
+        self.keep(read_sample(dir));
+    }
+
+    /// Keeps `sample` if it holds more than every earlier one.
+    fn keep(&mut self, sample: Sample) {
+        if let Some(now) = sample.anon_swap {
             self.anon_swap_peak = Some(self.anon_swap_peak.map_or(now, |p| p.max(now)));
         }
-        let Ok(text) = std::fs::read_to_string(dir.join("memory.numa_stat")) else {
+        let Some(now) = sample.numa else {
             return;
         };
-        let now = numa_stat(&text);
         if let Some(counted) = &self.counted {
             counted.fetch_add(u64::from(total(&now) > 0), Ordering::Release);
         }
@@ -189,10 +214,15 @@ impl NumaSample {
 
     /// Samples every `every` (the driver passes [`NUMA_EVERY`]), for as long as it is
     /// polled.
+    ///
+    /// The files are read on the blocking pool: `memory.numa_stat` and `memory.stat` of a
+    /// busy cgroup can take the kernel a while, and this runs for every lease.
     pub(crate) async fn watch(&mut self, dir: &Path, every: Duration) {
+        let dir = dir.to_owned();
         loop {
             tokio::time::sleep(every).await;
-            self.observe(dir);
+            let at = dir.clone();
+            self.keep(off_worker(move || read_sample(&at)).await);
         }
     }
 

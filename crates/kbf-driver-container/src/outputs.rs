@@ -450,8 +450,21 @@ pub(crate) async fn collect(
         limits.max_bytes,
         &std::mem::take(&mut listing.shown),
     )?;
-    let mut blobs = assemble(listing, &digested, &jobs, &upper_fd, result);
     let taken = digested.iter().filter(|d| d.taken).count();
+    // Digesting every Directory message of a large tree is hashing: on the CPU pool, not
+    // on an async worker and not on the blocking pool, which has no bound on the cores
+    // it takes.
+    let (mut blobs, assembled) = {
+        let (jobs, upper_fd) = (Arc::clone(&jobs), Arc::clone(&upper_fd));
+        let mut entries = std::mem::take(result);
+        pool.run(move || {
+            let blobs = assemble(listing, &digested, &jobs, &upper_fd, &mut entries);
+            (blobs, entries)
+        })
+        .await
+        .map_err(io_at(&base))?
+    };
+    *result = assembled;
     let plain = intake.is_none();
     with_outputs(&mut blobs, logs, plain, result).await?;
     let finishing = Instant::now();
@@ -807,6 +820,13 @@ impl Blobs {
     }
 }
 
+#[cfg(test)]
+/// The threads [`assemble`] has run on, for the test that checks it is not an async
+/// worker's. Thread ids are never reused, so tests that run side by side do not confuse
+/// each other's.
+pub(crate) static ASSEMBLED_ON: std::sync::Mutex<Vec<std::thread::ThreadId>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Builds the entries of `result` and the blobs to store from the listing and the digests
 /// of its files: the files in job order (but those an intake took, which the intake
 /// stores), then for each output directory its Directory messages (children in
@@ -824,6 +844,11 @@ fn assemble(
         places,
         ..
     } = listing;
+    #[cfg(test)]
+    ASSEMBLED_ON
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(std::thread::current().id());
     let mut blobs = Blobs::default();
     // The digest and executable bit of each output that is a file.
     let mut files: Vec<Option<(Digest, bool)>> = vec![None; outputs.len()];

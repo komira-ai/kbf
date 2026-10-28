@@ -28,6 +28,7 @@ use kbf_daemon::RuntimeError;
 use kbf_types::Resources;
 
 use crate::numa::Pin;
+use crate::off_worker::off_worker;
 
 /// Controllers the lease hands to the container's cgroup.
 const SUBTREE: &str = "+cpu +memory +pids";
@@ -206,7 +207,9 @@ pub(crate) async fn presses_into_swap(
     let mut watch = SwapWatch::new(threshold);
     loop {
         tokio::time::sleep(every).await;
-        let Ok(now) = cgroup.pressure() else {
+        // Three file reads that can wait on the kernel: not on an async worker.
+        let reading = cgroup.clone();
+        let Ok(now) = off_worker(move || reading.pressure()).await else {
             continue;
         };
         if watch.kills(now) {
@@ -216,7 +219,7 @@ pub(crate) async fn presses_into_swap(
 }
 
 /// One lease's cgroup.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct LeaseCgroup {
     /// The directory, under the cgroup filesystem's mount.
     dir: PathBuf,

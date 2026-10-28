@@ -74,6 +74,7 @@
 //! Not yet: re-adopting leases after a daemon restart (one systemd unit per lease) and
 //! networked actions.
 
+mod blocking_steps;
 pub mod cas;
 mod cgroup;
 mod cgroup_usage;
@@ -92,6 +93,7 @@ mod logs;
 mod logs_tests;
 pub mod numa;
 mod oci;
+mod off_worker;
 mod outputs;
 mod program;
 mod remove;
@@ -100,6 +102,8 @@ mod runtime;
 pub mod subids;
 pub mod tree;
 pub mod unpack_layers;
+#[cfg(test)]
+mod workers_tests;
 
 // The keepers this crate's unit tests start come from the test binary.
 #[cfg(test)]
