@@ -72,6 +72,19 @@ postgres = "0.19.10"
 # takes plain TCP only). Both are already in the tree through axum and tonic.
 hyper = { version = "1.12.0", default-features = false }
 hyper-util = { version = "0.1.21", default-features = false }
+# The scheduler libraries moved to the jobscheduler repository (https://github.com/komira-ai/jobscheduler).
+# Every `js-*` crate is taken from this one repository at this one revision, so a type
+# (a lease id, say) is the same type in every kbf crate; a test in kbf-integration-test
+# reads Cargo.lock and refuses a second source. The revision is raised by a pull request
+# of its own that runs the whole CI, never along with other changes.
+js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "c9acfec5aeb45c35254585861493009e35f060d1" }
+js-sched = { git = "https://github.com/komira-ai/jobscheduler", rev = "c9acfec5aeb45c35254585861493009e35f060d1" }
+js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "c9acfec5aeb45c35254585861493009e35f060d1" }
+js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "c9acfec5aeb45c35254585861493009e35f060d1" }
+js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "c9acfec5aeb45c35254585861493009e35f060d1" }
+js-store = { git = "https://github.com/komira-ai/jobscheduler", rev = "c9acfec5aeb45c35254585861493009e35f060d1" }
+js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "c9acfec5aeb45c35254585861493009e35f060d1" }
+js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "c9acfec5aeb45c35254585861493009e35f060d1" }
 md-5 = "0.11.0"
 # macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
 objc2 = "0.6.5"
@@ -223,6 +236,7 @@ kbf-node = { path = "crates/kbf-node" }
 kbf-objstore = { path = "crates/kbf-objstore" }
 kbf-outputs = { path = "crates/kbf-outputs" }
 kbf-pack = { path = "crates/kbf-pack" }
+kbf-pack-index = { path = "crates/kbf-pack-index" }
 kbf-peer = { path = "crates/kbf-peer" }
 kbf-proto = { path = "crates/kbf-proto" }
 kbf-proxy = { path = "crates/kbf-proxy" }
@@ -245,6 +259,7 @@ kbf-tls = { path = "crates/kbf-tls" }
 kbf-tier = { path = "crates/kbf-tier" }
 kbf-transfer = { path = "crates/kbf-transfer" }
 kbf-types = { path = "crates/kbf-types" }
+kbf-vmm = { path = "crates/kbf-vmm" }
 kbf-ui = { path = "crates/kbf-ui" }
 kbf-unitfile = { path = "crates/kbf-unitfile" }
 kbf-update = { path = "crates/kbf-update" }

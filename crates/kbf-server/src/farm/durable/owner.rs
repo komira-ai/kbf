@@ -35,7 +35,7 @@ use super::blocks::contended;
 use super::*;
 use crate::config::MAX_HEARTBEAT_INTERVAL_MS;
 
-const OWNER: &str = "owner/";
+pub(super) const OWNER: &str = "owner/";
 
 /// How long a frontend trusts its last look at an `owner/` row before it reads the row
 /// again to acknowledge a heartbeat. The frontend a daemon moved to waits this long beyond
@@ -64,11 +64,12 @@ pub const ACK_WINDOW: Duration = ROW_LIFE.saturating_sub(RUN_LIFE);
 
 /// How long after its last write a daemon's session row, written on schedule, is certain
 /// to be there to be read, with the wait beyond its expiry.
-const ROW_LIFE: Duration = LEASE_GRACE.saturating_add(SESSION_RENEWAL);
+pub(super) const ROW_LIFE: Duration = LEASE_GRACE.saturating_add(SESSION_RENEWAL);
 
 /// How long after its last acknowledged heartbeat a daemon may run, with twice the margin
 /// of the fence.
-const RUN_LIFE: Duration = SELF_FENCE.saturating_add(LEADER_LEASE_MARGIN.saturating_mul(2));
+pub(super) const RUN_LIFE: Duration =
+    SELF_FENCE.saturating_add(LEADER_LEASE_MARGIN.saturating_mul(2));
 
 /// The longest heartbeat interval a server is started with.
 const HEARTBEAT_MAX: Duration = Duration::from_millis(MAX_HEARTBEAT_INTERVAL_MS);
@@ -255,10 +256,7 @@ impl Durable {
         let Some(row) = self.store.get(&key)? else {
             return Ok(None);
         };
-        Ok(match decode(&key, &row.value) {
-            Ok(FarmInput::WorkerUp { instance, .. }) => Some(instance),
-            _ => None,
-        })
+        Ok(self.session_row(&key, &row).ok().map(|up| up.instance))
     }
 
     fn remember_owner(&self, worker: &WorkerId, state: Ownership) {
@@ -347,7 +345,7 @@ impl Durable {
     }
 }
 
-impl State {
+impl Engine {
     /// A daemon said `Hello` here as `worker`, whose newest stream is `instance`'s: this
     /// frontend becomes its owner, takes up the leases the store holds for it that the
     /// scheduler does not hold (a drain of the node that ended at the start, for want of a
@@ -364,9 +362,10 @@ impl State {
     /// proof that they stopped.
     ///
     /// A claim the store did not take because it could not be reached is tried again, while
-    /// the node is connected, when a feed finds the store reachable ([`State::claim_pending`]).
+    /// the node is connected, when a feed finds the store reachable ([`Engine::claim_pending`]).
     pub(in crate::farm) fn claim_worker(
         &mut self,
+        a: &mut dyn Adapter,
         now: FarmTime,
         worker: &WorkerId,
         instance: &DaemonInstance,
@@ -378,7 +377,7 @@ impl State {
             // An operation the scheduler finished and retired, whose finish is not written
             // yet, is not taken in again: it would run twice.
             if !self.known_operation(op.operation) {
-                self.take_in_stored(op);
+                self.take_in_stored(a, op);
             }
         }
         self.resume_drain(now, worker);
@@ -420,15 +419,13 @@ impl State {
 
     /// Claims the nodes whose `Hello` found the state store unreachable, and whose streams
     /// are still open, if the store is reachable now. Called at the start of every feed.
-    pub(in crate::farm) fn claim_pending(&mut self, now: FarmTime) {
+    pub(in crate::farm) fn claim_pending(&mut self, a: &mut dyn Adapter, now: FarmTime) {
         if self.store_down {
             return;
         }
         for (worker, instance) in std::mem::take(&mut self.unclaimed) {
-            let link = self.links.get(&worker);
-            let open = link.is_some_and(|link| !link.outbound.is_closed());
-            if open {
-                self.claim_worker(now, &worker, &instance);
+            if a.stream_open(&worker) {
+                self.claim_worker(a, now, &worker, &instance);
             }
         }
     }

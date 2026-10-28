@@ -15,7 +15,7 @@ use kbf_state::{
 use kbf_types::{
     ActionKey, Answer, Digest, DigestFunction, Failure, FarmFault, FarmRun, FencePolicy, LeaseKind,
     LostWhy, MemoryKill, MemoryRun, Outcome, Qos, Refusal, RefusalRecord, Resources, StartLease,
-    Waiting,
+    Waiting, WorkKey,
 };
 
 use super::*;
@@ -145,7 +145,8 @@ fn request(tag: u8) -> Request {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
@@ -153,6 +154,25 @@ fn request(tag: u8) -> Request {
         do_not_cache: false,
         needs: kbf_caps::Request::default(),
     }
+}
+
+/// Catches: a request whose key is not an action's being taken as one, which would put
+/// a made-up action in the rows that name the operation's action, or a corrupt row not
+/// said to be corrupt.
+#[test]
+fn a_request_whose_key_is_not_an_action_is_a_corrupt_row() {
+    let good = request(3);
+    let action = action_of_request("op/0000000000000003", &good).expect("an action");
+    assert_eq!(WorkKey::from(&action), good.key);
+    let bad = Request {
+        key: WorkKey::new("main", "not a digest"),
+        ..good
+    };
+    let error = action_of_request("op/0000000000000003", &bad).expect_err("not an action");
+    assert!(
+        matches!(&error, StateError::Corrupt { key, .. } if key == "op/0000000000000003"),
+        "{error:?}"
+    );
 }
 
 fn start(operation: u64, seq: u64) -> StartLease {
@@ -267,6 +287,7 @@ fn a_submitted_operation_is_loaded_queued() {
             operations: vec![StoredOperation {
                 operation: OperationId(4),
                 request: request(1),
+                action: ActionKey::try_from(&request(1).key).expect("an action"),
                 lease: None,
                 losses: 0,
                 fate: None,
@@ -727,6 +748,7 @@ fn an_unreadable_row_is_refused_naming_it() {
         lease: LeaseId::new(5, 0),
         operation: OperationId(1),
         worker: WorkerId::new("node-a"),
+        cost: Default::default(),
     })))
     .expect("encode");
     let submit = encode(FarmInput::Submit(request(1))).expect("encode");
@@ -1195,7 +1217,7 @@ fn a_fate_row_that_is_not_one_is_refused() {
     }
 }
 
-fn key_of(tag: u8) -> ActionKey {
+fn key_of(tag: u8) -> WorkKey {
     request(tag).key
 }
 
@@ -1359,12 +1381,12 @@ fn a_floor_row_that_is_not_one_is_refused() {
         assert_eq!(floor::decode(&bad), Err(why));
     }
 
-    let slashed = ActionKey {
-        instance: "a/b".to_owned(),
+    let slashed = WorkKey {
+        class: "a/b".to_owned(),
         ..key_of(1)
     };
-    let split = ActionKey {
-        instance: "a".to_owned(),
+    let split = WorkKey {
+        class: "a".to_owned(),
         ..key_of(1)
     };
     assert_ne!(floor::row_key(&slashed), floor::row_key(&split));
@@ -1372,8 +1394,8 @@ fn a_floor_row_that_is_not_one_is_refused() {
     assert!(floor::row_key(&key_of(1)).starts_with("floor/"));
 
     let long = Floor {
-        key: ActionKey {
-            instance: "i".repeat(usize::from(u16::MAX) + 1),
+        key: WorkKey {
+            class: "i".repeat(usize::from(u16::MAX) + 1),
             ..key_of(1)
         },
         ..floor
@@ -2004,7 +2026,7 @@ fn farm_with_a_kill(store: &Arc<Flaky>) -> (Farm, kbf_estimator::Key) {
             .expect("grant");
     }
     let mut state = farm.lock();
-    state.learned.on_start(&start(4, 0));
+    state.side.learned.on_start(&start(4, 0));
     let mut run = kbf_estimator::Run {
         outcome: kbf_estimator::Outcome::OwnLimitKill,
         wall_us: 0,
@@ -2017,7 +2039,7 @@ fn farm_with_a_kill(store: &Arc<Flaky>) -> (Farm, kbf_estimator::Key) {
         node_cpu_pressure_permille: None,
     };
     run.peak_memory_bytes = Some(5 << 30);
-    state.learned.stage(
+    state.side.learned.stage(
         LeaseId::new(5, 0),
         Some(crate::learned::Attempt {
             key: key.clone(),
@@ -2073,6 +2095,7 @@ fn a_store_that_refuses_the_size_rows_still_settles_the_requeue() {
     store.refuse_est.store(false, Ordering::SeqCst);
     let mut state = farm.lock();
     state
+        .side
         .learned
         .clock(kbf_types::FarmTime::from_millis(10_000));
     state.flush_learned();
@@ -2112,7 +2135,7 @@ fn a_requeue_that_is_no_kill_writes_nothing_and_forgets_the_booking() {
     farm.lock().settle_requeues(&[requeue(4, 0)]);
     assert!(store.scan_prefix("est/").expect("scan").is_empty());
     assert_eq!(
-        farm.lock().learned.booking(LeaseId::new(5, 0)),
+        farm.lock().side.learned.booking(LeaseId::new(5, 0)),
         Err(crate::learned::Skip::NoBooking)
     );
 }
@@ -2278,10 +2301,10 @@ async fn off_leaves_the_size_rows_alone_and_shadow_takes_them_up() {
     store.fail_est_scan.store(true, Ordering::SeqCst);
 
     let off = farm_over(&store, crate::LearnedSizes::Off);
-    assert!(off.lock().learned.summaries().is_empty());
-    assert_eq!(off.lock().learned.calls(), 0);
+    assert!(off.lock().side.learned.summaries().is_empty());
+    assert_eq!(off.lock().side.learned.calls(), 0);
     // Hours of ticks, with something to write behind: no write-behind, no sweep.
-    off.lock().learned.observe(
+    off.lock().side.learned.observe(
         &crate::learned::Attempt {
             key: fresh.clone(),
             run: kill,
@@ -2302,7 +2325,7 @@ async fn off_leaves_the_size_rows_alone_and_shadow_takes_them_up() {
     drop(off);
 
     let shadow = farm_over(&store, crate::LearnedSizes::Shadow);
-    assert!(shadow.lock().learned.summaries().get(&fresh).is_some());
+    assert!(shadow.lock().side.learned.summaries().get(&fresh).is_some());
     assert!(store.est_scans.load(Ordering::SeqCst) >= 1);
 }
 
@@ -2334,7 +2357,7 @@ async fn shadow_writes_behind_and_sweeps_when_ticks_come() {
         },
     };
     let bounds = kbf_estimator::Bounds::default();
-    farm.lock().learned.observe(&attempt, &bounds);
+    farm.lock().side.learned.observe(&attempt, &bounds);
     farm.tick().await;
     assert_eq!(
         store.scan_prefix("est/").expect("scan").len(),
@@ -2455,11 +2478,12 @@ fn a_fenced_refusal_of_size_rows_ends_the_writing() {
     // Later ticks send nothing, and nothing is waiting to be written.
     let mut state = farm.lock();
     state
+        .side
         .learned
         .clock(kbf_types::FarmTime::from_millis(60_000));
     state.flush_learned();
     state.write_estimates(std::slice::from_ref(&row));
-    assert!(state.learned.due().is_empty());
+    assert!(state.side.learned.due().is_empty());
     drop(state);
     assert_eq!(store.est_writes.load(Ordering::SeqCst), 1);
 }

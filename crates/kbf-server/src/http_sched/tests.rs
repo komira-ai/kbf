@@ -4,13 +4,22 @@ use axum::body::Body;
 use axum::http::Request;
 use kbf_front::Cache;
 use kbf_sched::{Avoided, LeasePhase, QueueGroup, WaitingGroup};
-use kbf_types::{Digest, DigestFunction, FarmTime, OperationId, Qos};
+use kbf_types::{ActionKey, Digest, DigestFunction, FarmTime, OperationId, Qos, WorkKey};
 use tower_service::Service;
 
 use super::*;
 
 fn digest(n: u8) -> Digest {
     Digest::new(DigestFunction::Sha256, [n; 32], u64::from(n))
+}
+
+/// The key of action `digest(n)` on instance `main`.
+fn key(n: u8) -> WorkKey {
+    ActionKey {
+        instance: "main".to_owned(),
+        action: digest(n),
+    }
+    .into()
 }
 
 fn query(q: &str) -> Result<Query, String> {
@@ -93,8 +102,7 @@ fn view() -> LeaseView {
     LeaseView {
         lease: LeaseId::new(7, 3),
         operation: OperationId(12),
-        instance: "main".to_owned(),
-        action: digest(9),
+        key: key(9),
         node: kbf_types::WorkerId::new("node-a"),
         platform: "os=linux".to_owned(),
         qos: Qos::Ci,
@@ -170,13 +178,11 @@ fn the_queue_body_has_the_documented_shape() {
             reason: "none of the 2 live workers satisfies the action's platform".to_owned(),
             count: 4,
             example: OperationId(3),
-            example_instance: "main".to_owned(),
-            example_action: digest(1),
+            example_key: key(1),
         }],
         avoided: vec![Avoided {
             operation: OperationId(4),
-            instance: "main".to_owned(),
-            action: digest(2),
+            key: key(2),
             nodes: vec![kbf_types::WorkerId::new("a"), kbf_types::WorkerId::new("b")],
         }],
         avoided_total: 250,

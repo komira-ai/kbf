@@ -132,10 +132,10 @@ impl Scratch {
 }
 
 fn next_release() -> Vec<Migration> {
-    let mut set = schema::embedded();
+    let mut set = kbf_pack_index::schema::embedded();
     set.push(
         Migration::new(
-            schema::latest() + 1,
+            kbf_pack_index::schema::latest() + 1,
             "note",
             "-- kbf-migration: expand\nALTER TABLE kv ADD COLUMN note text;",
         )
@@ -159,8 +159,8 @@ fn put(store: &PostgresStore, key: &str) {
 #[test]
 fn setup_creates_the_schema_once_and_a_dry_run_creates_nothing() {
     let s = Scratch::new();
-    let latest = schema::latest();
-    let db = Database::new(s.config(), schema::embedded());
+    let latest = kbf_pack_index::schema::latest();
+    let db = Database::new(s.config(), kbf_pack_index::schema::embedded());
     assert_eq!(db.plan(), Ok((None, latest)));
     assert_eq!(
         schema::current(&s.config()),
@@ -184,9 +184,9 @@ fn setup_creates_the_schema_once_and_a_dry_run_creates_nothing() {
 #[test]
 fn the_update_step_migrates_to_what_the_release_needs_while_the_old_child_serves() {
     let s = Scratch::new();
-    let n = schema::latest();
+    let n = kbf_pack_index::schema::latest();
     let (n1, n2) = (n + 1, n + 2);
-    Database::new(s.config(), schema::embedded())
+    Database::new(s.config(), kbf_pack_index::schema::embedded())
         .setup()
         .expect("N installed");
     let child = PostgresStore::open(&s.config().with_supported_schema(1, n)).expect("child N");
@@ -351,7 +351,7 @@ fn the_real_database_answers_the_schema_ops_with_its_own_error() {
     let url = "postgres:///kbf?host=/nonexistent-kbf-test-socket";
     let db = Database::new(
         PostgresConfig::parse(url).expect("a url"),
-        schema::embedded(),
+        kbf_pack_index::schema::embedded(),
     );
     let planned = SchemaOps::plan(&db).expect_err("no server to ask");
     let applied = SchemaOps::setup(&db).expect_err("no server to apply to");
@@ -374,7 +374,7 @@ fn the_real_database_reaches_or_says_why_and_redacts_the_servers_words() {
     let url = "postgres:///kbf?host=/nonexistent-kbf-test-socket&user=kbf";
     let db = Database::new(
         PostgresConfig::parse(url).expect("a url"),
-        schema::embedded(),
+        kbf_pack_index::schema::embedded(),
     );
     assert_eq!(SchemaOps::reach(&db), Err(Unreached::NoServer));
 
@@ -404,7 +404,6 @@ mod provisioned {
     use crate::database::Database;
     use crate::setup::provision::{Connection, plan};
     use crate::setup::validate::LocalDatabase;
-    use kbf_state::postgres::schema;
     use kbf_state::postgres::{PostgresConfig, reach};
 
     /// The server `KBF_TEST_POSTGRES_URL` names, in the pieces psql takes.
@@ -555,7 +554,7 @@ mod provisioned {
 
         let config = PostgresConfig::parse(&names.url()).expect("parses");
         assert_eq!(reach(&config), Ok(()), "the role logs in to its database");
-        let database = Database::new(config, schema::embedded());
+        let database = Database::new(config, kbf_pack_index::schema::embedded());
         let first = database.setup().expect("schema");
         assert_eq!(first.from, None);
         assert!(database.setup().expect("again").ran.is_empty());

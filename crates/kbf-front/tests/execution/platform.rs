@@ -583,7 +583,10 @@ async fn needs_under(
         farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
         start(&farm, &job.action).await.expect("Execute");
         let submitted = script.submitted();
-        let digest = submitted.last().expect("submitted").request.key.action;
+        let key = &submitted.last().expect("submitted").request.key;
+        let digest = kbf_types::ActionKey::try_from(key)
+            .expect("an action's key")
+            .action;
         assert_eq!(
             digest.hash_hex(),
             job.action.proto.hash,

@@ -84,7 +84,16 @@ per-pool slots shared across rollouts, canary and soak, and the rollout steps af
 
 - **A seed is the whole input.** Every random choice comes from one `SimRng` seeded
   by the test; nothing reads a clock or the OS's entropy; every collection is ordered.
-  A run records a trace (inputs and effects, as text) and its hash.
+  A run records a trace (inputs and effects, as text) and its SHA-256 hash.
+- **Trace lines are hand-written, and the hashes are checked in.** Every trace line is
+  written field by field (`kbf_sim::text`, never `Debug`), under a first line naming
+  the format version, so renaming or moving a type cannot change a line. The hash of
+  each pinned scenario and seed is kept in `crates/kbf-sim/tests/golden/trace-hashes.txt`
+  and `crates/kbf-sched/tests/golden/trace-hashes.txt`, and an ordinary test compares
+  them. A change that only moves code must leave every hash as it is. A change that
+  alters a decision or the trace text moves them; regenerate on purpose with
+  `cargo test -p kbf-sim -- --ignored regenerate_golden_hashes` (and `-p kbf-sched`),
+  and say in the pull request why each changed line is expected.
 - **Replayable from one line.** Each sim file has `fn run(seed) -> World` and an
   ignored `replay` test that runs the seed in `KBF_SIM_SEED`. A failing check panics
   with the seed, the step, the violated invariant and the command:

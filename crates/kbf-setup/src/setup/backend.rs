@@ -3,7 +3,6 @@
 //! tested on its own.
 
 use kbf_state::postgres::PostgresConfig;
-use kbf_state::postgres::schema;
 
 use super::SetupError;
 use crate::database::{Database, SchemaOps};
@@ -25,7 +24,10 @@ impl Schemas for Postgres {
         // The client's own messages may quote the URL; none is kept.
         let config = PostgresConfig::parse(url)
             .map_err(|_| SetupError::Database("the --database URL is not usable".to_owned()))?;
-        Ok(Box::new(Database::new(config, schema::embedded())))
+        Ok(Box::new(Database::new(
+            config,
+            kbf_pack_index::schema::embedded(),
+        )))
     }
 }
 

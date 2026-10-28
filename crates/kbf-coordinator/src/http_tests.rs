@@ -877,8 +877,9 @@ const GOLDEN_STATUS: &str = concat!(
 );
 
 /// Pins: the bytes of kbf's status and convergence stay what they were. With only kbf
-/// managed, the convergence is byte for byte the old answer whether or not `?service=kbf`
-/// is given, and the status is the old answer followed by one new key, `per_service`.
+/// managed, the convergence is byte for byte the old answer followed by the build `commit`,
+/// whether or not `?service=kbf` is given, and the status is the old answer followed by the
+/// new `per_service` key and then `commit`.
 #[tokio::test]
 async fn the_kbf_status_and_convergence_bytes_are_unchanged() {
     let rig = Rig::new("http-golden-status");
@@ -903,19 +904,26 @@ async fn the_kbf_status_and_convergence_bytes_are_unchanged() {
         r#"{"platform":"linux-x86_64","version":"2.0","health":"healthy"}"#,
     )
     .await;
+    // Each answer has kept its bytes, and ends with the build commit since that was added.
+    let commit = format!(r#","commit":"{}"}}"#, crate::BUILD_COMMIT);
+    let converged = GOLDEN_CONVERGENCE
+        .strip_suffix('}')
+        .expect("an object")
+        .to_owned()
+        + &commit;
     for path in [CONVERGENCE_PATH, "/v1/convergence?service=kbf"] {
         assert_eq!(
             get_raw(&rig, path, &ci_token()).await,
-            (200, GOLDEN_CONVERGENCE.to_owned())
+            (200, converged.clone())
         );
     }
     let (code, status) = get_raw(&rig, STATUS_PATH, OPERATOR).await;
     assert_eq!(code, 200);
     let tail = concat!(
         r#","per_service":{"kbf":{"desired":{"version":"2.0","max_updating":{"frontend":1,"storage":1,"daemon":2,"mac-daemon":2},"min_up":{"storage":1,"frontend":0}},"#,
-        r#""roles":[{"role":"storage","at_desired":1,"updating":0,"failed":0,"down":0}]}}}"#
+        r#""roles":[{"role":"storage","at_desired":1,"updating":0,"failed":0,"down":0}]}}"#
     );
-    assert_eq!(status, format!("{GOLDEN_STATUS}{tail}"));
+    assert_eq!(status, format!("{GOLDEN_STATUS}{tail}{commit}"));
 }
 
 /// Behaviour: `?service=` picks the service a convergence read is about, over HTTP. With
@@ -1015,4 +1023,39 @@ async fn the_convergence_is_read_per_service_with_a_query() {
         (code, body),
         (StatusCode::NOT_FOUND, json!({"error": "not_found"}))
     );
+}
+
+/// Catches: the status or the convergence losing a field a client already reads, or not
+/// saying which build answers: a coordinator that has seen no host and holds no desired state
+/// answers with exactly the earlier fields and one more, `commit`, the text `--version`
+/// shows after the `+`.
+#[tokio::test]
+async fn the_status_and_the_convergence_say_the_build_commit_and_keep_their_fields() {
+    let rig = Rig::new("http-commit");
+    let commit = crate::BUILD_COMMIT;
+    assert!(
+        commit == "unknown"
+            || (commit.len() == 12 && commit.bytes().all(|b| b.is_ascii_hexdigit())),
+        "{commit:?}"
+    );
+    assert_eq!(
+        status(&rig).await,
+        json!({"desired": null, "services": {}, "quiet": true, "hosts": [], "per_service": {"kbf": {"desired": null, "roles": []}}, "commit": commit})
+    );
+    let (code, body) = convergence(&rig, Some(&ci_token())).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({
+            "desired": null,
+            "quiet": true,
+            "state": "in_progress",
+            "roles": [],
+            "commit": commit,
+        })
+    );
+    rig.set(STATE).await;
+    let (_, set) = convergence(&rig, Some(&ci_token())).await;
+    assert_eq!(set["commit"], commit);
+    assert_eq!(set["desired"], "2.0");
 }

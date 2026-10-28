@@ -67,8 +67,9 @@ pub struct Cli {
     /// A file holding the operator token, mode 0600, owned by the coordinator's user.
     #[arg(long)]
     pub operator_token_file: PathBuf,
-    /// A TOML file that defines further services and names the ones CI's token may set
-    /// (`docs/design/updates.md`, section 3). Without it `kbf` is the only service.
+    /// A TOML file that defines further services (`docs/design/updates.md`, section 3).
+    /// Without it `kbf` is the only service. Which of them a CI token may set is said by
+    /// the allow-list entry that admits it (`--oidc-config`).
     #[arg(long)]
     pub services_file: Option<PathBuf>,
     /// How often the TLS files are looked at again, in seconds.
@@ -105,18 +106,29 @@ pub struct Parts {
 /// are fetched on the first token.
 ///
 /// # Errors
-/// A file is missing, unreadable or refused (the text names the flag or the file).
+/// A file is missing, unreadable or refused (the text names the flag or the file), or an
+/// allow-list entry names a service that is neither `kbf` nor defined by the services file.
 pub fn build(cli: &Cli) -> Result<Parts, Error> {
     let operator_token = kbf_updater::secret::read_token(&cli.operator_token_file)
         .map_err(|why| format!("--operator-token-file: {why}"))?;
     let oidc = AllowList::from_file(&cli.oidc_config)?;
-    let keys = HttpsKeys::new(&oidc.entries()[0].issuer, Roots::System, KEY_FETCH_TIMEOUT)?;
-    let verifier = Verifier::new(oidc, Arc::new(keys), KEY_REFETCH, kbf_oidc::system_clock());
-    let desired = DesiredStore::open(&cli.state_file)?;
     let services = match &cli.services_file {
         Some(path) => Services::from_file(path).map_err(|why| format!("--services-file: {why}"))?,
         None => Services::default(),
     };
+    for (n, entry) in oidc.entries().iter().enumerate() {
+        if let Some(name) = entry.services.iter().find(|s| services.get(s).is_none()) {
+            return Err(format!(
+                "--oidc-config: entry {} names the service {name}, which is not kbf or defined \
+                 by --services-file",
+                n + 1
+            )
+            .into());
+        }
+    }
+    let keys = HttpsKeys::new(&oidc.entries()[0].issuer, Roots::System, KEY_FETCH_TIMEOUT)?;
+    let verifier = Verifier::new(oidc, Arc::new(keys), KEY_REFETCH, kbf_oidc::system_clock());
+    let desired = DesiredStore::open(&cli.state_file)?;
     let interval = Duration::from_secs(cli.tls_reload_secs);
     let files = |client_ca| TlsFiles {
         cert: cli.tls_cert.clone(),

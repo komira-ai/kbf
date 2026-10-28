@@ -106,7 +106,8 @@ fn request(tag: u8, resources: Resources) -> Request {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources,
@@ -184,6 +185,7 @@ fn result(lease: LeaseId, memory_kill: MemoryKill) -> worker::Result {
         action_digest: None,
         memory_kill: memory_kill as i32,
         lost: 0,
+        job_outcome: None,
     }
 }
 

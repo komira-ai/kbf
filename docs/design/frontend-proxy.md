@@ -225,7 +225,8 @@ rows it finds (the lease it was granted, or no result). Only a refused requeue i
 again (`flush_unsettled`). A kill whose store write was not acknowledged before a crash costs
 at most one extra run or one extra budget step. The memory an operation is booked is the
 highest rung it was raised to; a booking from the last measured peak plus a buffer is not
-built (learned sizes run in shadow and change no booking).
+built (learned sizes are off by default, `--learned-sizes off`; in `shadow` they only log and
+change no booking).
 
 **When a step fails**, the roll stops and the frontend is named as draining or not serving in
 the updater's detail; the updater does not start another until an operator has fixed it and

@@ -39,7 +39,7 @@ pub enum SetError {
     /// The state file could not be written.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// The token's allow-list entry may not set this service.
+    /// The allow-list entry that admitted the token does not name this service.
     #[error("the token may not set this service")]
     Forbidden,
 }
@@ -124,6 +124,8 @@ pub struct Status {
     /// Every service the coordinator manages, `kbf` included, by name: its desired state and
     /// the counts of its hosts per role.
     pub per_service: BTreeMap<String, ServiceStatus>,
+    /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]).
+    pub commit: &'static str,
 }
 
 /// The coordinator.
@@ -238,17 +240,23 @@ impl Coordinator {
         body: &[u8],
     ) -> Result<Desired, SetError> {
         let verified = self.ci(bearer).await?;
-        tracing::info!(
-            workflow = %verified.job_workflow_ref,
-            sha = ?verified.sha,
-            "desired state set by CI"
-        );
         let (service, desired) =
             Desired::parse_request_for(body, |name| self.services.get(name).is_some())?;
         if !verified.services.contains(&service) {
+            tracing::warn!(
+                workflow = %verified.job_workflow_ref,
+                %service,
+                "refused a desired state: the allow-list entry does not name the service"
+            );
             return Err(SetError::Forbidden);
         }
         self.desired.set(&service, desired.clone())?;
+        tracing::info!(
+            workflow = %verified.job_workflow_ref,
+            sha = ?verified.sha,
+            %service,
+            "desired state set by CI"
+        );
         Ok(desired)
     }
 
@@ -290,6 +298,7 @@ impl Coordinator {
             services: self.desired.all(),
             quiet: fleet.is_quiet(now),
             hosts,
+            commit: crate::BUILD_COMMIT,
         })
     }
 

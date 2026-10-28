@@ -10,8 +10,9 @@
 //! nothing is happening; an outstanding order stands in for that report, holding the host's
 //! slot and counting the host as not up. Hosts and orders are kept per service; `kbf`'s
 //! heartbeat is the top-level one on the wire, so [`Fleet::record`], [`Fleet::get`] and
-//! [`Fleet::hosts`] are the `kbf` forms of the per-service calls. A restart forgets the outstanding orders: the
-//! start-up quiet period lets the hosts report first, and a host that began updating says so.
+//! [`Fleet::hosts`] are the `kbf` forms of the per-service calls. A restart forgets the
+//! outstanding orders: the start-up quiet period lets the hosts report first, and a host
+//! that began updating says so.
 
 use std::collections::BTreeMap;
 use std::time::Duration;

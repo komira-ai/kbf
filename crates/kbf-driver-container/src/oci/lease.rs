@@ -169,6 +169,12 @@ impl Oci {
         self.crun.delete_blocking(&self.lease(name), name)
     }
 
+    /// Ends the `crun run` of the lease in `dir` that a dead daemon left, if it still
+    /// runs. Blocking.
+    pub(crate) fn end_runs(&self, dir: &Path) -> Result<(), String> {
+        self.crun.end_runs_blocking(dir)
+    }
+
     pub(crate) fn remove_dir(&self, dir: &Path) -> Result<(), String> {
         Ok(self.remove_dir_blocking(dir)?)
     }

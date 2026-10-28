@@ -4,12 +4,13 @@
 //! CI sets it with one call: the version every host should run, how many hosts of a kind
 //! may update at once, and how many storage hosts and frontends must stay up. The store
 //! keeps one such state per service name; a service must be `kbf` or one the services file
-//! defines (`crate::services`), and hosts are ordered only for `kbf` until they heartbeat others. It is one small JSON file, replaced whole by a temporary file, fsync,
-//! rename and a directory fsync, so a crash leaves the old state or the new one. While `kbf`
-//! is the only service the file is the single state itself (the format earlier builds read
-//! and wrote, so a downgrade keeps working); a file with `{"services": {name: state}}` is
-//! the map. A file that cannot be read back is a refusal to start: the coordinator does not
-//! guess what an operator meant.
+//! defines (`crate::services`). Hosts are ordered only for `kbf` until their heartbeats
+//! name other services. It is one small JSON file, replaced whole by a temporary file,
+//! fsync, rename and a directory fsync, so a crash leaves the old state or the new one.
+//! While `kbf` is the only service the file is the single state itself (the format earlier
+//! builds read and wrote, so a downgrade keeps working); a file with
+//! `{"services": {name: state}}` is the map. A file that cannot be read back is a refusal
+//! to start: the coordinator does not guess what an operator meant.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
