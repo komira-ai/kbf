@@ -69,7 +69,7 @@ mod ambient;
 mod beat;
 pub(crate) mod durable;
 mod engine;
-mod failed_actions;
+pub(crate) mod failed_actions;
 mod handover;
 // The core's pieces are read as the groups of methods in `js` are written.
 #[cfg(feature = "farm-core-js")]
