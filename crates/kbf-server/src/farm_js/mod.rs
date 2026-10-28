@@ -24,6 +24,7 @@ pub mod adapter;
 pub mod codec;
 pub mod dispatch;
 pub mod ext;
+mod facts;
 pub mod host;
 pub mod load;
 pub mod open;
@@ -41,6 +42,8 @@ mod codec_tests;
 mod dispatch_tests;
 #[cfg(test)]
 mod ext_tests;
+#[cfg(test)]
+mod facts_tests;
 #[cfg(test)]
 mod host_tests;
 #[cfg(test)]

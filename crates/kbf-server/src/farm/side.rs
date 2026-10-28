@@ -48,7 +48,7 @@ pub(in crate::farm) struct Link {
 }
 
 /// The `os` and `arch` entries of a node report.
-pub(in crate::farm) fn identity(caps: &kbf_caps::NodeCaps) -> (String, &'static str) {
+pub(crate) fn identity(caps: &kbf_caps::NodeCaps) -> (String, &'static str) {
     let os = caps.exact.get("os").cloned().unwrap_or_default();
     (os, caps.cpu.arch().name())
 }
