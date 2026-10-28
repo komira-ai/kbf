@@ -6,8 +6,8 @@
 //!   is read.
 //! - **Control** (TLS, no client certificate): `POST /v1/desired` with CI's OIDC token as
 //!   the bearer and the desired state as JSON; `GET /v1/status` with the operator token as
-//!   the bearer; `GET /v1/convergence` with CI's OIDC token as the bearer (the operator
-//!   token is refused there).
+//!   the bearer; `GET /v1/convergence[?service=<name>]` with CI's OIDC token as the bearer
+//!   (the operator token is refused there; no query means `kbf`).
 //!
 //! An answer is JSON, and an error is `{"error":"<code>"}` with a code from a closed set:
 //! never a claim value, a path or the text of an internal error.
@@ -23,8 +23,9 @@ use hyper::{Method, Request, Response, StatusCode};
 use kbf_updater::wire::{HEARTBEAT_PATH, HeartbeatRead, MAX_HEARTBEAT_BYTES, read_heartbeat};
 use serde::Serialize;
 
+use crate::desired::KBF;
 use crate::identity::identity_of;
-use crate::service::{CiRefused, Coordinator, SetError};
+use crate::service::{CiRefused, ConvergenceError, Coordinator, SetError};
 
 /// The path CI posts the desired state to.
 pub const DESIRED_PATH: &str = "/v1/desired";
@@ -120,12 +121,18 @@ where
             }
         }
         (Surface::Control, Method::GET, CONVERGENCE_PATH) => {
-            match coordinator.convergence(bearer(&request)).await {
+            let Some(service) = service_of(request.uri().query()) else {
+                return error(StatusCode::BAD_REQUEST, "bad_request");
+            };
+            match coordinator.convergence(bearer(&request), service).await {
                 Ok(convergence) => json(StatusCode::OK, &convergence),
-                Err(CiRefused::Unauthorized(_)) => error(StatusCode::UNAUTHORIZED, "unauthorized"),
-                Err(CiRefused::Unavailable) => {
+                Err(ConvergenceError::Refused(CiRefused::Unauthorized(_))) => {
+                    error(StatusCode::UNAUTHORIZED, "unauthorized")
+                }
+                Err(ConvergenceError::Refused(CiRefused::Unavailable)) => {
                     error(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
                 }
+                Err(ConvergenceError::UnknownService) => error(StatusCode::NOT_FOUND, "not_found"),
             }
         }
         (Surface::Heartbeat, _, HEARTBEAT_PATH)
@@ -133,6 +140,15 @@ where
             error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
         }
         _ => error(StatusCode::NOT_FOUND, "not_found"),
+    }
+}
+
+/// The service a convergence read asks for: `kbf` with no query, else the query must be
+/// exactly `service=<name>` (service names need no escaping).
+fn service_of(query: Option<&str>) -> Option<&str> {
+    match query {
+        None => Some(KBF),
+        Some(query) => query.strip_prefix("service=").filter(|n| !n.contains('&')),
     }
 }
 

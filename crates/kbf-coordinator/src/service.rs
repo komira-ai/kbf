@@ -11,7 +11,7 @@ use kbf_updater::wire::{Heartbeat, Reply, ServiceReply};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
-use crate::converge::{Convergence, converge};
+use crate::converge::{Convergence, RoleCounts, converge, converge_service, role_counts};
 use crate::decide::decide_in;
 use crate::desired::{Desired, DesiredError, DesiredStore, KBF, StoreError};
 use crate::fleet::Fleet;
@@ -91,6 +91,26 @@ pub struct HostStatus {
     pub beat: Heartbeat,
 }
 
+/// One service in the status.
+#[derive(Debug, Serialize)]
+pub struct ServiceStatus {
+    /// Its desired state, if one was ever set.
+    pub desired: Option<Desired>,
+    /// The counts of every role that has a host heartbeating the service, in role order.
+    pub roles: Vec<RoleCounts>,
+}
+
+/// Why the convergence was not read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ConvergenceError {
+    /// The caller's CI token was not accepted.
+    #[error(transparent)]
+    Refused(#[from] CiRefused),
+    /// The coordinator manages no such service.
+    #[error("no such service")]
+    UnknownService,
+}
+
 /// What an operator reads.
 #[derive(Debug, Serialize)]
 pub struct Status {
@@ -105,6 +125,9 @@ pub struct Status {
     pub services_dropped: u64,
     /// Every host heard from since the coordinator started, by node id.
     pub hosts: Vec<HostStatus>,
+    /// Every service the coordinator manages, `kbf` included, by name: its desired state and
+    /// the counts of its hosts per role.
+    pub per_service: BTreeMap<String, ServiceStatus>,
     /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]).
     pub commit: &'static str,
 }
@@ -274,7 +297,17 @@ impl Coordinator {
                 beat: host.beat.clone(),
             })
             .collect();
+        let per_service = self
+            .services
+            .names()
+            .map(|name| {
+                let desired = self.desired.get(name);
+                let roles = role_counts(name, desired.as_ref(), &fleet, now);
+                (name.to_owned(), ServiceStatus { desired, roles })
+            })
+            .collect();
         Ok(Status {
+            per_service,
             desired: self.desired.get(KBF),
             services: self.desired.all(),
             quiet: fleet.is_quiet(now),
@@ -284,16 +317,30 @@ impl Coordinator {
         })
     }
 
-    /// Where the farm stands against the desired state, if `bearer` is a GitHub Actions
-    /// OIDC token the same allow-list accepts as for [`Self::set_desired`]. The operator
-    /// token is no CI token and is refused. Read-only, and each token is good once.
+    /// Where the hosts of `service` stand against its desired state, if `bearer` is a
+    /// GitHub Actions OIDC token the same allow-list accepts as for [`Self::set_desired`]
+    /// (any service may be read with any accepted token). The operator token is no CI token
+    /// and is refused. Read-only, and each token is good once.
     ///
     /// # Errors
-    /// [`CiRefused`].
-    pub async fn convergence(&self, bearer: Option<&str>) -> Result<Convergence, CiRefused> {
+    /// [`ConvergenceError`].
+    pub async fn convergence(
+        &self,
+        bearer: Option<&str>,
+        service: &str,
+    ) -> Result<Convergence, ConvergenceError> {
         self.ci(bearer).await?;
+        let def = self
+            .services
+            .get(service)
+            .ok_or(ConvergenceError::UnknownService)?;
         let now = (self.clock)();
         let fleet = self.fleet.lock().unwrap_or_else(PoisonError::into_inner);
-        Ok(converge(self.desired.get(KBF).as_ref(), &fleet, now))
+        let desired = self.desired.get(service);
+        Ok(if service == KBF {
+            converge(desired.as_ref(), &fleet, now)
+        } else {
+            converge_service(def, desired.as_ref(), &fleet, now)
+        })
     }
 }

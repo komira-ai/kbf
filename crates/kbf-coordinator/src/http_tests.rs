@@ -17,6 +17,8 @@ use crate::http::{
 use crate::testutil::{OPERATOR, Rig, ci_token};
 
 /// How long a body has in the tests that are not about patience.
+mod services;
+
 const PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
 const STATE: &str = r#"{"version":"2.0","min_up":{"storage":1,"frontend":1}}"#;
@@ -764,140 +766,6 @@ async fn a_service_the_token_may_not_set_is_a_403() {
     assert_eq!(status(&rig).await["desired"], Value::Null);
 }
 
-const SERVICES_TEXT: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\nmin_up = 0\n";
-
-const NEW_GOLDEN_BEAT: &str = concat!(
-    r#"{"platform":"linux-x86_64","version":"0.0.19+g123456abcdef-1","health":"healthy","#,
-    r#""last_update":null,"updating":null,"services":[{"name":"other","version":"1.0","#,
-    r#""health":"healthy","last_update":null,"updating":null}]}"#
-);
-
-/// Pins the wire of a service over HTTP. With `other` set to 3.0 and kbf current, an updater
-/// that sends `services` is answered with the exact bytes of a named order, while a v0.0.18
-/// updater of the same role (its golden beat, no `services`) is answered `{"reply":"nothing"}`
-/// and never the new shape; a beat that lists kbf among its services is a 400.
-#[tokio::test]
-async fn a_service_order_goes_only_to_an_updater_that_sent_services() {
-    let mut rig = Rig::new("http-services");
-    let list = format!(
-        "{}services = [\"kbf\", \"other\"]\n",
-        kbf_oidc::testkit::config_text(kbf_oidc::testkit::STATIC_ISSUER)
-    );
-    rig.coordinator = Rig::start_with_allow_list(&rig.dir, &rig.clock, &list)
-        .with_services(crate::services::Services::parse(SERVICES_TEXT).expect("services"));
-    for body in [
-        r#"{"version":"0.0.19+g123456abcdef-1","min_up":{"storage":1,"frontend":1}}"#,
-        r#"{"service":"other","version":"3.0","min_up":{"storage":0,"frontend":0}}"#,
-    ] {
-        let (code, _) = raw(
-            &rig,
-            Surface::Control,
-            &None,
-            request("POST", DESIRED_PATH, Some(&ci_token()), body),
-        )
-        .await;
-        assert_eq!(code, 200);
-    }
-    rig.at(2_000);
-    let (code, old) = raw(
-        &rig,
-        Surface::Heartbeat,
-        &updater("d1", "daemon"),
-        request(
-            "POST",
-            HEARTBEAT_PATH,
-            None,
-            &GOLDEN_BEAT.replace("0.0.18+gabcdefabcdef-2", "0.0.19+g123456abcdef-1"),
-        ),
-    )
-    .await;
-    assert_eq!(
-        (code, String::from_utf8(old).expect("text")),
-        (200, r#"{"reply":"nothing"}"#.to_owned())
-    );
-    let (code, new) = raw(
-        &rig,
-        Surface::Heartbeat,
-        &updater("d2", "daemon"),
-        request("POST", HEARTBEAT_PATH, None, NEW_GOLDEN_BEAT),
-    )
-    .await;
-    assert_eq!(code, 200);
-    assert_eq!(
-        String::from_utf8(new).expect("text"),
-        r#"{"reply":"update","service":"other","version":"3.0"}"#
-    );
-    let kbf_inside = NEW_GOLDEN_BEAT.replace(r#""name":"other""#, r#""name":"kbf""#);
-    let (code, dropped) = raw(
-        &rig,
-        Surface::Heartbeat,
-        &updater("d3", "daemon"),
-        request("POST", HEARTBEAT_PATH, None, &kbf_inside),
-    )
-    .await;
-    assert_eq!(code, 200);
-    assert!(
-        !String::from_utf8(dropped)
-            .expect("text")
-            .contains("service")
-    );
-}
-
-/// Catches: a host losing its kbf updates over a bad services list, or a bad list going
-/// unseen: a heartbeat that lists kbf, or a name twice, is answered 200 as a kbf-only host
-/// (it is told the kbf update, in the old reply shape, and its services are not noted),
-/// `services_dropped` in the status goes up by one each time, and a heartbeat that is wrong
-/// otherwise (no version) is still 400 and not counted. The count is 0 before any.
-#[tokio::test]
-async fn a_bad_services_list_is_dropped_counted_and_the_host_still_updates() {
-    let rig = Rig::new("http-bad-services");
-    let who = updater("d1", "daemon");
-    rig.set(STATE).await;
-    rig.at(2_000);
-    assert_eq!(status(&rig).await["services_dropped"], json!(0));
-    let entry = |name: &str| format!(r#"{{"name":"{name}","version":"1.0","health":"healthy"}}"#);
-    let with = |list: &str| {
-        format!(
-            r#"{{"platform":"linux-x86_64","version":"1.0","health":"healthy","services":[{list}]}}"#
-        )
-    };
-    let kbf = with(&entry("kbf"));
-    let twice = with(&format!("{},{}", entry("other"), entry("other")));
-    for (i, body) in [kbf, twice].iter().enumerate() {
-        let (code, reply) = call(
-            &rig,
-            Surface::Heartbeat,
-            &who,
-            request("POST", HEARTBEAT_PATH, None, body),
-        )
-        .await;
-        assert_eq!(code, StatusCode::OK);
-        assert_eq!(reply, json!({"reply": "update", "version": "2.0"}));
-        assert_eq!(status(&rig).await["services_dropped"], json!(i + 1));
-    }
-    let status = status(&rig).await;
-    assert_eq!(hosts(&status), [("d1".to_owned(), "daemon".to_owned())]);
-    assert_eq!(status["hosts"][0].get("services"), None);
-    let (code, _) = call(
-        &rig,
-        Surface::Heartbeat,
-        &who,
-        request(
-            "POST",
-            HEARTBEAT_PATH,
-            None,
-            r#"{"platform":"linux-x86_64","health":"healthy","services":[]}"#,
-        ),
-    )
-    .await;
-    assert_eq!(code, StatusCode::BAD_REQUEST);
-    assert_eq!(status_count(&rig).await, json!(2));
-}
-
-async fn status_count(rig: &Rig) -> Value {
-    status(rig).await["services_dropped"].clone()
-}
-
 /// Catches: the status or the convergence losing a field a client already reads, or not
 /// saying which build answers: a coordinator that has seen no host and holds no desired state
 /// answers with exactly the earlier fields and one more, `commit`, the text `--version`
@@ -913,7 +781,7 @@ async fn the_status_and_the_convergence_say_the_build_commit_and_keep_their_fiel
     );
     assert_eq!(
         status(&rig).await,
-        json!({"desired": null, "services": {}, "quiet": true, "services_dropped": 0, "hosts": [], "commit": commit})
+        json!({"desired": null, "services": {}, "quiet": true, "services_dropped": 0, "hosts": [], "per_service": {"kbf": {"desired": null, "roles": []}}, "commit": commit})
     );
     let (code, body) = convergence(&rig, Some(&ci_token())).await;
     assert_eq!(code, StatusCode::OK);

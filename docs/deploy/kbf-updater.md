@@ -499,7 +499,7 @@ says which form it needs, before it calls the coordinator. Anything else that se
 coordinator's desired version (a `POST /v1/desired` by hand) needs the same form, or no host
 will converge on it.
 
-The coordinator keeps its desired state per service name, and `kbf` is the only service it accepts unless `--services-file` defines more ([the design](../design/updates.md)): `POST /v1/desired` takes an optional `service` (absent means `kbf`; a name no file defines is a 400), and `GET /v1/status` adds `services` beside the unchanged `desired`, and `services_dropped`, the number of heartbeats whose `services` list was bad and was dropped (the host is answered as a `kbf`-only host). While `kbf` is the only service, the `--state-file` holds the single state in the form earlier coordinators wrote, so a downgrade to one of them starts on the same file; a file in the map form (`{"services": {...}}`), which a coordinator with a second service writes, is refused by an earlier build, and the operator then restores the file from before or writes `kbf`'s state alone in it.
+The coordinator keeps its desired state per service name, and `kbf` is the only service it accepts unless `--services-file` defines more ([the design](../design/updates.md)): `POST /v1/desired` takes an optional `service` (absent means `kbf`; a name no file defines is a 400), and `GET /v1/status` adds `services` beside the unchanged `desired`, `services_dropped`, the number of heartbeats whose `services` list was bad and was dropped (the host is answered as a `kbf`-only host), and `per_service` (below). While `kbf` is the only service, the `--state-file` holds the single state in the form earlier coordinators wrote, so a downgrade to one of them starts on the same file; a file in the map form (`{"services": {...}}`), which a coordinator with a second service writes, is refused by an earlier build, and the operator then restores the file from before or writes `kbf`'s state alone in it.
 
 `cargo xtask deploy-farm` (one `run:` line):
 
@@ -535,6 +535,33 @@ the coordinator to be past its 30 second quiet start, at least one live host, ev
 the version and none updating or failed, and `min_up` hosts of the storage and frontend roles up,
 so a coordinator that has just restarted does not report a farm it has not heard from as
 converged.
+
+`GET /v1/convergence?service=NAME` answers the same shape for another service the coordinator
+manages: the hosts counted are those whose heartbeats carry that service in `services`, the
+`desired` is that service's, and `converged` also needs, for each role the service runs on, as
+many hosts up as the service requires of the role (its role's `min_up`, at least 1 for a
+`never_last` role, else the desired state's `min_up` for that role). Without the query, or with
+`?service=kbf`, the answer is the one described above, byte for byte. A name no definition
+declares is a 404 `not_found`; a query that is not exactly `service=NAME` is a 400. Any token the
+allow-list accepts may read any service's convergence; the read changes nothing. `GET /v1/status` adds, after its
+existing keys, `per_service`: for every managed service (`kbf` included) by name,
+`{"desired": <its desired state or null>, "roles": [{"role", "at_desired", "updating",
+"failed", "down"}]}`, the counts being those of `GET /v1/convergence` for the service.
+
+`cargo xtask deploy-farm --service NAME` (default `kbf`) deploys another service the same way.
+For `kbf` the requests are the ones listed above. For another service the POST body also has
+`"service": NAME`, the baseline read and every poll are `GET /v1/convergence?service=NAME`, and
+`--version` is not checked against `kbf`'s form: it is that service's own version text, which
+must equal what its hosts report in their heartbeat (the coordinator compares the text and no
+more). The name is 1 to 64 bytes of lowercase letters, digits and `-`. `--service` takes one
+name, so a deploy of several services is one call per service. A coordinator that does not know
+services (one from before the services wire) ignores the query, so the baseline read is `kbf`'s,
+and then refuses the POST, whose `service` key it does not know: the run fails with that refusal
+and nothing is set; it never deploys `kbf` in the service's place. `cargo xtask release farm-version` stays
+the `kbf` form (`<semver>+g<12 hex digits>`, from `kbf`'s release asset). A second repository
+computes its own: the version string its binary reports and its updater puts in the service's
+heartbeat entry (`services[].version`), from that repository's own release, and passes that text
+to `--service NAME --version TEXT`.
 
 ### The proof
 

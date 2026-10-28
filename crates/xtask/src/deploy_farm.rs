@@ -2,6 +2,13 @@
 //! coordinator "desired = this release" and wait until the farm converges
 //! (`docs/deploy/kbf-updater.md`, "Turn on the deploy step").
 //!
+//! `--service NAME` (default `kbf`) names the service the deploy is about. For `kbf` the
+//! requests are exactly those below. For another service the POST body also carries
+//! `"service": NAME`, and every convergence read is `GET /v1/convergence?service=NAME`, so
+//! the wait is on that service's own hosts and desired state. `--version` is then that
+//! service's own version text, as its hosts report it: the coordinator compares the text, so
+//! only `kbf`'s form (`<semver>+g<commit12>`) is checked here.
+//!
 //! The steps, each over HTTPS (the runner's token service as the system store trusts it, the
 //! coordinator as the system store does, or, with `--ca-pem`, as that CA alone does: the
 //! coordinator's certificate is the farm CA's, which no system store holds):
@@ -105,6 +112,35 @@ pub fn check_version(version: &str) -> Result<(), Error> {
 const DESIRED_PATH: &str = "/v1/desired";
 const CONVERGENCE_PATH: &str = "/v1/convergence";
 
+/// The service the coordinator runs of its own: the default of `--service`.
+const KBF: &str = "kbf";
+
+/// The most bytes of a service name, as the coordinator's wire says (`MAX_SERVICE_NAME` of
+/// `kbf_updater::wire`, which xtask does not depend on).
+const MAX_SERVICE_NAME: usize = 64;
+
+/// Whether `name` is a service name the coordinator accepts: lowercase letters, digits and
+/// `-`, 1 to [`MAX_SERVICE_NAME`] bytes (`kbf_updater::wire::is_service_name`).
+fn service_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SERVICE_NAME
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// What `args` must satisfy before anything is sent: a service name the coordinator accepts,
+/// and for `kbf` a version of the form its hosts report.
+fn check_args(args: &Args) -> Result<(), Error> {
+    if !service_name_ok(&args.service) {
+        return Err(Error::Service(args.service.clone()));
+    }
+    if args.service == KBF {
+        check_version(&args.version)?;
+    }
+    Ok(())
+}
+
 /// The variables the platform sets for a job that may ask for an OIDC token.
 const TOKEN_URL_VAR: &str = "ACTIONS_ID_TOKEN_REQUEST_URL";
 const TOKEN_KEY_VAR: &str = "ACTIONS_ID_TOKEN_REQUEST_TOKEN";
@@ -121,6 +157,11 @@ pub struct Args {
     /// release tag (`0.0.13`) is not that text and is refused.
     #[arg(long)]
     pub version: String,
+    /// The service to deploy: `kbf` (the default) or another service the coordinator manages.
+    /// For another service `--version` is that service's own version text, as its hosts
+    /// report it.
+    #[arg(long, default_value = "kbf")]
+    pub service: String,
     /// The farm CA certificate (PEM text) the coordinator's certificate must chain to, instead
     /// of the system store's roots. Empty: the system store.
     #[arg(long, default_value = "", allow_hyphen_values = true)]
@@ -174,6 +215,8 @@ pub enum Error {
         "{TOKEN_URL_VAR} or {TOKEN_KEY_VAR} is not set: the job needs `permissions: id-token: write`"
     )]
     NoTokenService,
+    #[error("--service {0:?} is not a service name: 1 to 64 lowercase letters, digits and -")]
+    Service(String),
     #[error("--ca-pem holds no certificate")]
     Ca,
     #[error(
@@ -225,6 +268,8 @@ pub enum Error {
 #[derive(Clone, Debug)]
 pub struct Plan {
     pub url: String,
+    /// The service the deploy is about; `kbf` for the farm's own.
+    pub service: String,
     pub audience: String,
     pub version: String,
     pub min_up_storage: u32,
@@ -241,6 +286,7 @@ impl Plan {
     pub fn of(args: &Args) -> Self {
         Self {
             url: args.url.trim_end_matches('/').to_owned(),
+            service: args.service.clone(),
             audience: args.audience.clone().unwrap_or_else(|| args.url.clone()),
             version: args.version.clone(),
             min_up_storage: args.min_up_storage,
@@ -249,6 +295,18 @@ impl Plan {
             deadline: Duration::from_secs(args.deadline_min * 60),
             stall: Duration::from_secs(args.stall_min * 60),
             every: Duration::from_secs(args.every_secs),
+        }
+    }
+}
+
+impl Plan {
+    /// The path of the convergence read: the coordinator's own for `kbf`, else asking for
+    /// the service by name (a name needs no escaping: [`service_name_ok`]).
+    fn convergence_path(&self) -> String {
+        if self.service == KBF {
+            CONVERGENCE_PATH.to_owned()
+        } else {
+            format!("{CONVERGENCE_PATH}?service={}", self.service)
         }
     }
 }
@@ -288,7 +346,7 @@ impl TokenService {
 pub fn run(args: &Args) -> Result<Vec<String>, crate::Error> {
     // Before the notice for an unset URL: a version the hosts could never report is a defect
     // of the caller whether or not a farm is there to be told.
-    check_version(&args.version).map_err(failed)?;
+    check_args(args).map_err(failed)?;
     if args.url.trim().is_empty() {
         return Ok(vec![
             "::notice::the deploy step is off: the repository variable KBF_COORDINATOR_URL is not set"
@@ -315,7 +373,7 @@ pub fn run_with(
     host: &[CertificateDer<'static>],
     out: &mut impl Write,
 ) -> Result<Vec<String>, crate::Error> {
-    check_version(&args.version).map_err(failed)?;
+    check_args(args).map_err(failed)?;
     let plan = Plan::of(args);
     let pinned;
     let roots = Roots {
@@ -405,15 +463,18 @@ pub fn deploy_on(
         service,
         clock,
     };
-    let first =
-        Read::of(&client.send_retrying(out, READ_BASELINE, CONVERGENCE_PATH, None, plan)?)?;
+    let read_path = plan.convergence_path();
+    let first = Read::of(&client.send_retrying(out, READ_BASELINE, &read_path, None, plan)?)?;
     check_coordinator(plan, first.commit.as_deref(), out)?;
     let baseline = first.live();
     log(out, &baseline_line(&baseline))?;
-    let body = json!({
+    let mut body = json!({
         "version": plan.version,
         "min_up": {"storage": plan.min_up_storage, "frontend": plan.min_up_frontend},
     });
+    if plan.service != KBF {
+        body["service"] = json!(plan.service);
+    }
     client.send_retrying(out, SET_DESIRED, DESIRED_PATH, Some(&body), plan)?;
     log(out, &format!("desired version {} set", plan.version))?;
 
@@ -421,7 +482,7 @@ pub fn deploy_on(
     let mut changed = started;
     let mut last: Option<(String, Value)> = None;
     loop {
-        match client.send(out, "read the convergence", CONVERGENCE_PATH, None) {
+        match client.send(out, "read the convergence", &read_path, None) {
             Ok(answer) => {
                 let read = Read::of(&answer)?;
                 log(out, &read.table())?;
