@@ -553,6 +553,26 @@ What the code does today:
   makes it likelier to wait than first fit did: with eight one-core leases on two
   workers of eight cores, first fit leaves one worker empty and a six-core action runs
   at once, while spreading leaves four on each and it waits for cores to free.
+- With `--whole-node-max N` the hold above is replaced by the scheduler library's whole-node
+  drain and caps (off unless the flag is given; the settings are the farm's, since kbf has
+  one scheduler and no pools). A `whole_machine` request that fits nowhere waits
+  `--whole-node-drain-after-secs` (0), then holds the worker that will empty soonest: the
+  one whose leases' longest wall times end first, then the fewest leases, then the lowest
+  name. A wall time is the `timeout` of an action; one that names none (or zero) is taken
+  to end last. The hold is given up at its deadline,
+  `--whole-node-drain-deadline-secs` or, left out, the request's own wall time (an action
+  with no wall time and no such flag is never given up, so set the flag when clients may
+  send no timeout; it also covers an operation taken up again after a restart); the worker is then barred to the
+  request for `--whole-node-reserve-backoff-secs` (300) and another is held. After
+  `--whole-node-max-reserve-attempts` (2) give-ups the deadline is the wall time. No lease
+  is stopped. The caps: at most N workers whole (held or reserved) at once, at most
+  `--whole-node-max-draining` (1) reserved while still running leases, at least
+  `--whole-node-keep-for-ordinary` (1) workers left with neither, and no reservation on the
+  last worker an older ordinary request could run on unless
+  `--whole-node-allow-last-capable`; a request a cap stops holds nothing and queues.
+  The wall times are kept in memory: an operation taken up again after a restart has none.
+  The tuning flags need `--whole-node-max`. `Scheduler::whole_state` and `whole_summary`
+  say why a request waits; the operator API does not show them yet.
 - A request with `ios.device=1` has room only where a device the worker reports
   satisfies every `ios.device.*` attribute of the request and no lease holds it, and
   where the worker holds no other device lease (`DEVICE_LEASES_PER_WORKER` = 1, until

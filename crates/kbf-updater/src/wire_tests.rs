@@ -1,6 +1,8 @@
 use serde_json::json;
 
-use crate::wire::{Health, Heartbeat, Outcome, Reply, ServiceReply, UpdateResult};
+use crate::wire::{
+    Health, Heartbeat, MAX_SERVICES, Outcome, Reply, ServiceReply, UpdateResult, read_heartbeat,
+};
 use kbf_types::ReleasePlatform;
 
 fn v(text: &str) -> crate::version::Version {
@@ -172,7 +174,7 @@ fn a_heartbeat_carries_its_services_and_only_when_it_has_them() {
 }
 
 /// Behaviour: a heartbeat that lists kbf (it is the top level), lists a service twice, or
-/// names a service with a character a name cannot have, or none, is refused whole.
+/// names a service with a character a name cannot have, or none, is not read as a `Heartbeat`.
 #[test]
 fn a_heartbeat_with_a_bad_services_list_is_refused() {
     let entry = |name: &str| format!(r#"{{"name":"{name}","version":"1.0","health":"healthy"}}"#);
@@ -278,4 +280,84 @@ fn a_heartbeat_with_services_is_read_by_the_struct_before_services() {
     assert_eq!(read.health, Health::Healthy);
     assert_eq!(read.last_update, None);
     assert_eq!(read.updating, None);
+}
+
+fn beat_with(names: &[String]) -> String {
+    let entries: Vec<String> = names
+        .iter()
+        .map(|n| format!(r#"{{"name":"{n}","version":"1.0","health":"healthy"}}"#))
+        .collect();
+    format!(
+        r#"{{"platform":"linux-x86_64","version":"1.0","health":"healthy","services":[{}]}}"#,
+        entries.join(",")
+    )
+}
+
+fn numbered(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("svc-{i}")).collect()
+}
+
+/// Catches: a cap on the services list that is off by one, or missing: a list of exactly
+/// `MAX_SERVICES` is read, one more is not.
+#[test]
+fn a_heartbeat_lists_at_most_the_most_services() {
+    let at = beat_with(&numbered(MAX_SERVICES));
+    let read: Heartbeat = serde_json::from_str(&at).expect("at the cap");
+    assert_eq!(read.services.map(|s| s.len()), Some(MAX_SERVICES));
+    let over = beat_with(&numbered(MAX_SERVICES + 1));
+    assert!(serde_json::from_str::<Heartbeat>(&over).is_err());
+}
+
+/// Catches: a host with a bad services list losing its kbf updates: `read_heartbeat` reads
+/// a good heartbeat as it is, and for each bad list (kbf listed, a name twice, a bad name,
+/// over the cap, an entry that is no service, a list that is no list) keeps the rest of the
+/// heartbeat with `services` dropped and says why.
+#[test]
+fn a_bad_services_list_is_dropped_and_the_rest_is_kept() {
+    let good = read_heartbeat(NEW_BEAT.as_bytes()).expect("good");
+    assert_eq!(good.services_dropped, None);
+    assert_eq!(good.beat.services.as_ref().map(Vec::len), Some(2));
+    let strict: Heartbeat = serde_json::from_str(NEW_BEAT).expect("strict");
+    assert_eq!(good.beat, strict);
+    let names = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    let mut bad = vec![
+        beat_with(&names(&["kbf"])),
+        beat_with(&names(&["other", "other"])),
+        beat_with(&names(&["Other"])),
+        beat_with(&numbered(MAX_SERVICES + 1)),
+        r#"{"platform":"linux-x86_64","version":"1.0","health":"healthy","services":[3]}"#
+            .to_owned(),
+        r#"{"platform":"linux-x86_64","version":"1.0","health":"healthy","services":"x"}"#
+            .to_owned(),
+    ];
+    bad.push(bad[0].replace(
+        r#""health":"healthy","services""#,
+        r#""health":"healthy","updating":"2.0","services""#,
+    ));
+    for text in &bad {
+        let read = read_heartbeat(text.as_bytes()).expect(text);
+        assert_eq!(read.beat.services, None, "{text}");
+        assert_eq!(read.beat.version, v("1.0"));
+        assert!(read.services_dropped.is_some(), "{text}");
+    }
+    let kept = read_heartbeat(bad.last().expect("last").as_bytes()).expect("kept");
+    assert_eq!(kept.beat.updating, Some(v("2.0")));
+}
+
+/// Catches: the lenient read accepting what is wrong beyond the services list: not JSON,
+/// not an object, a missing, bad or duplicated field, with or without a services key, is an error.
+#[test]
+fn a_heartbeat_that_is_wrong_beyond_its_services_is_still_refused() {
+    for text in [
+        "not json",
+        "[]",
+        "{}",
+        r#"{"platform":"linux-x86_64","health":"healthy"}"#,
+        r#"{"platform":"linux-x86_64","health":"healthy","services":[]}"#,
+        r#"{"platform":"linux-x86_64","version":"1","version":"2","health":"healthy","services":[]}"#,
+        r#"{"platform":"linux-x86_64","version":"1","health":"healthy","services":3,"services":[]}"#,
+        r#"{"platform":"linux-x86_64","version":"-1","health":"healthy","services":3}"#,
+    ] {
+        assert!(read_heartbeat(text.as_bytes()).is_err(), "{text}");
+    }
 }

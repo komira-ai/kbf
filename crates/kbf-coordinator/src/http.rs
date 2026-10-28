@@ -20,7 +20,7 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Body;
 use hyper::header::{AUTHORIZATION, CONTENT_TYPE};
 use hyper::{Method, Request, Response, StatusCode};
-use kbf_updater::wire::{HEARTBEAT_PATH, Heartbeat, MAX_HEARTBEAT_BYTES};
+use kbf_updater::wire::{HEARTBEAT_PATH, HeartbeatRead, MAX_HEARTBEAT_BYTES, read_heartbeat};
 use serde::Serialize;
 
 use crate::desired::KBF;
@@ -175,9 +175,17 @@ where
     };
     let beat = read(request, MAX_HEARTBEAT_BYTES, patience)
         .await
-        .and_then(|bytes| serde_json::from_slice::<Heartbeat>(&bytes).ok());
+        .and_then(|bytes| read_heartbeat(&bytes).ok());
     match beat {
-        Some(beat) => json(StatusCode::OK, &coordinator.heartbeat(identity, beat)),
+        Some(HeartbeatRead {
+            beat,
+            services_dropped,
+        }) => {
+            if let Some(why) = services_dropped {
+                coordinator.note_services_dropped(&identity, &why);
+            }
+            json(StatusCode::OK, &coordinator.heartbeat(identity, beat))
+        }
         None => error(StatusCode::BAD_REQUEST, "bad_request"),
     }
 }

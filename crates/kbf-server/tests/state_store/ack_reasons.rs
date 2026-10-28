@@ -21,6 +21,7 @@ async fn started() -> (Disk, TestFarm, Inbox, LeaseId, kbf_front::Ticket) {
             call: None,
             described: Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("submitted");
     let lease = starts(&mut inbox)[0];
@@ -150,6 +151,7 @@ fn restarted(
             call: None,
             described: Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("submitted");
     let leases = starts(&mut inbox);

@@ -199,6 +199,7 @@ fn listeners(worker_tls: WorkerTls) -> Listeners {
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
         placement_load: kbf_server::PlacementLoad::Off,
+        whole_node: None,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,

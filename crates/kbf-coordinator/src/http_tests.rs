@@ -781,7 +781,7 @@ async fn the_status_and_the_convergence_say_the_build_commit_and_keep_their_fiel
     );
     assert_eq!(
         status(&rig).await,
-        json!({"desired": null, "services": {}, "quiet": true, "hosts": [], "per_service": {"kbf": {"desired": null, "roles": []}}, "commit": commit})
+        json!({"desired": null, "services": {}, "quiet": true, "services_dropped": 0, "hosts": [], "per_service": {"kbf": {"desired": null, "roles": []}}, "commit": commit})
     );
     let (code, body) = convergence(&rig, Some(&ci_token())).await;
     assert_eq!(code, StatusCode::OK);

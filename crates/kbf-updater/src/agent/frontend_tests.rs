@@ -80,6 +80,7 @@ impl Rig {
             node_api: None,
             daemon_node: None,
             timing: Timing::DEFAULT,
+            services: Vec::new(),
         }
     }
 }

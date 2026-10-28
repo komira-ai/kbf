@@ -118,6 +118,7 @@ fn submit(farm: &Farm, request: Request) -> Result<kbf_front::Ticket, Status> {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     })
 }
 
