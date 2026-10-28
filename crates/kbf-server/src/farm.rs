@@ -65,7 +65,7 @@ use tonic::Status;
 mod ack;
 mod ambient;
 mod beat;
-mod durable;
+pub(crate) mod durable;
 mod engine;
 mod failed_actions;
 mod handover;

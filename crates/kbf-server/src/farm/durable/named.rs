@@ -21,12 +21,12 @@ pub(super) const DONE_OF: &str = "doneof/";
 /// The version byte of a `doneof/` row.
 const VERSION: u8 = 1;
 
-pub(super) fn doneof_key(operation: OperationId) -> String {
+pub(crate) fn doneof_key(operation: OperationId) -> String {
     format!("{DONE_OF}{:016x}", operation.0)
 }
 
 /// `key` as the value of a `doneof/` row.
-pub(super) fn encode(key: &ActionKey) -> Vec<u8> {
+pub(crate) fn encode(key: &ActionKey) -> Vec<u8> {
     let mut row = vec![VERSION];
     row.extend(key.action.size_bytes.to_be_bytes());
     row.extend(key.action.hash);
@@ -35,7 +35,7 @@ pub(super) fn encode(key: &ActionKey) -> Vec<u8> {
 }
 
 /// The action a `doneof/` row holds, or what is wrong with the row.
-pub(super) fn decode(row: &[u8]) -> Result<ActionKey, &'static str> {
+pub(crate) fn decode(row: &[u8]) -> Result<ActionKey, &'static str> {
     let [VERSION, rest @ ..] = row else {
         return Err("not a version 1 action row");
     };

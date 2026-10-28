@@ -15,6 +15,7 @@ use kbf_caps::{Arch, Consumable, CpuCaps, NodeCaps};
 use kbf_meta::ActionRecord;
 use kbf_proto::kbf::log::v1 as proto;
 use kbf_sched::{DaemonInstance, Request};
+use kbf_types::sched::usage::LeaseCost;
 use kbf_types::{
     ActionKey, ControlRecord, Digest, Failure, FarmTime, LeaseGrant, LeaseId, LeaseKind, LostWhy,
     OperationId, Outcome, Qos, RefusalRecord, Resources, ResultRecord, WorkKey, WorkerId,
@@ -390,6 +391,18 @@ const fn lease_id(lease: LeaseId) -> proto::LeaseId {
     }
 }
 
+/// The cost of a lease as the record keeps it.
+const fn lease_cost(cost: LeaseCost) -> proto::LeaseCost {
+    proto::LeaseCost {
+        cpu_millis: cost.cpu_millis,
+        memory_bytes: cost.memory_bytes,
+        limit_bytes: cost.limit_bytes,
+        cold: cost.cold,
+        retry: cost.retry,
+        key_hash: cost.key_hash,
+    }
+}
+
 fn record(r: &ControlRecord) -> Result<proto::ControlRecord, EncodeError> {
     use proto::control_record::Record;
     let record = match r {
@@ -397,6 +410,7 @@ fn record(r: &ControlRecord) -> Result<proto::ControlRecord, EncodeError> {
             lease: Some(lease_id(g.lease)),
             operation: g.operation.0,
             worker: g.worker.as_str().to_owned(),
+            cost: (g.cost != LeaseCost::default()).then(|| lease_cost(g.cost)),
         }),
         ControlRecord::Result(r) => Record::Result(proto::ResultRecord {
             lease: Some(lease_id(r.lease)),
@@ -657,6 +671,18 @@ fn required_lease_id(
     lease.map(from_lease_id).ok_or(DecodeError::Missing(field))
 }
 
+/// The cost a lease record holds.
+const fn from_lease_cost(cost: proto::LeaseCost) -> LeaseCost {
+    LeaseCost {
+        cpu_millis: cost.cpu_millis,
+        memory_bytes: cost.memory_bytes,
+        limit_bytes: cost.limit_bytes,
+        cold: cost.cold,
+        retry: cost.retry,
+        key_hash: cost.key_hash,
+    }
+}
+
 fn from_record(r: proto::ControlRecord) -> Result<ControlRecord, DecodeError> {
     use proto::control_record::Record;
     Ok(
@@ -668,8 +694,7 @@ fn from_record(r: proto::ControlRecord) -> Result<ControlRecord, DecodeError> {
                 lease: required_lease_id(g.lease, "LeaseGrant.lease")?,
                 operation: OperationId(g.operation),
                 worker: WorkerId::new(g.worker),
-                // The record keeps no cost.
-                cost: Default::default(),
+                cost: g.cost.map(from_lease_cost).unwrap_or_default(),
             }),
             Record::Result(r) => ControlRecord::Result(ResultRecord {
                 lease: required_lease_id(r.lease, "ResultRecord.lease")?,

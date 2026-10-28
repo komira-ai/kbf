@@ -552,6 +552,22 @@ message LeaseGrant {
   LeaseId lease = 1;
   uint64 operation = 2;
   string worker = 3;
+  // What admission charged the lease. Absent when the grant carries the default cost
+  // (a grant written before costs were kept, or one built by hand); a reader without
+  // this field skips it.
+  LeaseCost cost = 4;
+}
+
+// What admission charged one lease, as `LeaseCost` of the scheduler holds it.
+message LeaseCost {
+  uint64 cpu_millis = 1;
+  uint64 memory_bytes = 2;
+  uint64 limit_bytes = 3;
+  bool cold = 4;
+  // The lease is a rerun up the memory ladder. A row written before this field existed
+  // reads false.
+  bool retry = 5;
+  uint64 key_hash = 6;
 }
 
 // A result the scheduler accepted.
