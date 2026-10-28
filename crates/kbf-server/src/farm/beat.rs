@@ -3,6 +3,7 @@
 
 use kbf_proto::worker::{Cancel, ServerMessage, server_message};
 use kbf_sched::Event;
+use kbf_types::sched::usage::NodeLoad;
 use kbf_types::{FarmTime, LeaseId, WorkerId};
 
 use super::{Farm, Settled, State, StreamId, wire_lease};
@@ -16,6 +17,8 @@ impl Farm {
     /// lists that the scheduler no longer holds on `worker` is sent a `Cancel`. A lease it
     /// leaves out that a proven restart lost past its operation's farm reruns finishes the
     /// operation: its callers are answered (nothing is cached).
+    ///
+    /// The scheduler hears no load: see [`Farm::heartbeat_with_load`].
     pub async fn heartbeat(
         &self,
         worker: &WorkerId,
@@ -23,10 +26,25 @@ impl Farm {
         seq: u64,
         running: Vec<LeaseId>,
     ) -> bool {
+        self.heartbeat_with_load(worker, stream, seq, running, None)
+            .await
+    }
+
+    /// [`Farm::heartbeat`] carrying the node load `load` the heartbeat's reading came to
+    /// ([`Farm::note_node_load`]), which the scheduler is handed with the heartbeat, whatever
+    /// `--placement-load` says. A heartbeat of a replaced stream feeds it nothing.
+    pub async fn heartbeat_with_load(
+        &self,
+        worker: &WorkerId,
+        stream: StreamId,
+        seq: u64,
+        running: Vec<LeaseId>,
+        load: Option<NodeLoad>,
+    ) -> bool {
         let now = self.now();
         let taken = self
             .lock()
-            .take_heartbeat(now, worker, stream, seq, running);
+            .take_heartbeat(now, worker, stream, seq, running, load);
         let Some((settled, acknowledged)) = taken else {
             return false;
         };
@@ -49,6 +67,7 @@ impl State {
         stream: StreamId,
         seq: u64,
         running: Vec<LeaseId>,
+        load: Option<NodeLoad>,
     ) -> Option<(Vec<Settled>, bool)> {
         let link = self
             .side
@@ -60,8 +79,7 @@ impl State {
         let event = Event::Heartbeat {
             worker: worker.clone(),
             running: running.clone(),
-            // This server's workers do not report a load yet.
-            load: None,
+            load,
         };
         let answers = self.feed(now, event);
         // A node this frontend does not own is not kept alive in the store by it.

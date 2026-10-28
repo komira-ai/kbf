@@ -2,7 +2,9 @@
 //! /v1/queue`; [`crate::http_sched`]): copied under the farm's lock, rendered after it
 //! is released.
 
-use kbf_sched::{LeaseView, MAX_AVOIDED, QueueView, Scheduler, WholeState, WholeSummary};
+use kbf_sched::{
+    LeaseView, LoadCounters, MAX_AVOIDED, QueueView, Scheduler, WholeState, WholeSummary,
+};
 use kbf_types::{FarmTime, LeaseKind, OperationId, WorkKey, WorkerId};
 
 use super::Farm;
@@ -58,6 +60,13 @@ impl Farm {
     /// The queue now, summarised.
     pub fn queue_view(&self) -> QueueView {
         self.lock().engine.sched.queue_snapshot()
+    }
+
+    /// What the scheduler has counted about node-load readings and placements by load:
+    /// `readings_accepted` and `readings_dropped` show whether the readings the farm hands it
+    /// (see [`Farm::heartbeat_with_load`]) are taken, in every `--placement-load` mode.
+    pub fn load_counters(&self) -> LoadCounters {
+        self.lock().engine.sched.load_counters()
     }
 
     /// The whole-node view of the queue now; `None` unless the farm runs with whole-node

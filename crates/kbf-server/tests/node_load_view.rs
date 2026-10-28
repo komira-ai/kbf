@@ -6,7 +6,7 @@ mod support;
 
 use std::net::SocketAddr;
 
-use kbf_proto::worker::{LeaseId, NodeLoad};
+use kbf_proto::worker::{LeaseClock, LeaseId, LeaseMinute, NodeLoad};
 use support::Cell;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -77,4 +77,134 @@ async fn a_server_shows_the_node_load_its_daemons_report() {
         .beat_loaded_acked(Some(reading(2, 9_000_000, 9_000_000)))
         .await;
     assert_eq!(node(api, "node-a").await["load"], *load);
+}
+
+fn lease(seq: u64) -> LeaseId {
+    LeaseId { term: 3, seq }
+}
+
+fn minute(seq: u64, minute: u32) -> LeaseMinute {
+    LeaseMinute {
+        lease: Some(lease(seq)),
+        minute,
+        cpu_mean_millis: 100,
+        cpu_peak_window_millis: 200,
+        ws_max_bytes: 4_096,
+    }
+}
+
+/// Asserts that the node view counts the records the lists of a node's readings carried, each
+/// drop under its reason, and the minutes of a reading the server refused; that a heartbeat
+/// with no reading changes none of it; and that the scheduler, on the same heartbeats, is
+/// handed the accepted readings and none of the refused one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_node_view_shows_the_list_counts_and_the_scheduler_hears_accepted_readings() {
+    let cell = Cell::start_with_api().await;
+    let api = cell.api.expect("an operator API");
+    let mut daemon = cell.daemon("node-a", 8, 16).await;
+    let counts = |clocks: u64, minutes: u64, invalid: u64, refused: u64| {
+        serde_json::json!({
+            "clocks": clocks,
+            "minutes": minutes,
+            "dropped": { "invalid": invalid, "duplicate": 0, "over_cap": 0 },
+            "refused_minutes": refused,
+        })
+    };
+
+    let first = NodeLoad {
+        lease_clocks: vec![LeaseClock {
+            lease: Some(lease(4)),
+            started_mono_usec: 500_000,
+        }],
+        minutes: vec![minute(4, 0)],
+        ..reading(1, 1_000_000, 0)
+    };
+    daemon.beat_loaded_acked(Some(first)).await;
+    assert_eq!(
+        node(api, "node-a").await["load"]["lists"],
+        counts(1, 1, 0, 0)
+    );
+    assert_eq!(cell.load_counters().readings_accepted, 1);
+
+    // A minute whose mean is above its peak is dropped, alone: the other is kept.
+    let broken = LeaseMinute {
+        cpu_mean_millis: 300,
+        ..minute(4, 2)
+    };
+    let second = NodeLoad {
+        minutes: vec![minute(4, 1), broken],
+        ..reading(2, 2_000_000, 2_500_000)
+    };
+    daemon.beat_loaded_acked(Some(second)).await;
+    let view = node(api, "node-a").await;
+    assert_eq!(view["load"]["lists"], counts(1, 2, 1, 0));
+    assert_eq!(cell.load_counters().readings_accepted, 2);
+
+    // No reading: nothing changes.
+    daemon.beat_loaded_acked(None).await;
+    assert_eq!(
+        node(api, "node-a").await["load"]["lists"],
+        counts(1, 2, 1, 0)
+    );
+    assert_eq!(cell.load_counters().readings_accepted, 2);
+
+    // A repeat of the last seq is refused: its two minutes are counted, and the scheduler
+    // does not hear it.
+    let repeat = NodeLoad {
+        minutes: vec![minute(4, 3), minute(4, 4)],
+        ..reading(2, 3_000_000, 3_000_000)
+    };
+    daemon.beat_loaded_acked(Some(repeat)).await;
+    assert_eq!(
+        node(api, "node-a").await["load"]["lists"],
+        counts(1, 2, 1, 2)
+    );
+    assert_eq!(cell.load_counters().readings_accepted, 2);
+    assert_eq!(cell.load_counters().readings_dropped, 0);
+}
+
+/// Asserts that a load far past every cap, with an absent lease and a repeated one in it,
+/// costs its heartbeat nothing (it is acknowledged), that the view shows the records kept
+/// within the caps and every drop under its reason, and that the scheduler took the reading.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hostile_load_does_not_cost_the_beat_and_its_drops_are_counted() {
+    const N: u64 = 100_000;
+    let cell = Cell::start_with_api().await;
+    let api = cell.api.expect("an operator API");
+    let mut daemon = cell.daemon("node-a", 8, 16).await;
+
+    let clock = |i: u64| LeaseClock {
+        // The first names no lease, the second is the lease of the third.
+        lease: match i {
+            0 => None,
+            1 => Some(lease(2)),
+            _ => Some(lease(i)),
+        },
+        started_mono_usec: 0,
+    };
+    let hostile = NodeLoad {
+        covered: (0..N).map(lease).collect(),
+        lease_clocks: (0..N).map(clock).collect(),
+        minutes: (0..N)
+            .map(|i| minute(i / 64, u32::try_from(i % 64).expect("below 64")))
+            .collect(),
+        ..reading(1, 1_000_000, 0)
+    };
+    daemon.beat_loaded_acked(Some(hostile)).await;
+
+    let view = node(api, "node-a").await;
+    let load = &view["load"];
+    assert_eq!(load["covered"].as_array().map(Vec::len), Some(96));
+    // Kept: 64 minutes; 94 clocks (96 are looked at: one absent, one repeated). Cut off:
+    // 99,936 minutes and 99,904 each of clocks and `covered`.
+    assert_eq!(
+        load["lists"],
+        serde_json::json!({
+            "clocks": 94,
+            "minutes": 64,
+            "dropped": { "invalid": 1, "duplicate": 1, "over_cap": 299_744 },
+            "refused_minutes": 0,
+        })
+    );
+    assert_eq!(cell.load_counters().readings_accepted, 1);
 }

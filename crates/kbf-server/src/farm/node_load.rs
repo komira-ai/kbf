@@ -1,6 +1,7 @@
 //! What each node's daemon reports of its `actions/` cgroup (`Heartbeat.node_load`): the
 //! readings the server accepts, and the load it shows in the node view
-//! (`GET /v1/nodes/{id}`). Nothing here admits or ranks: it only parses, keeps and shows.
+//! (`GET /v1/nodes/{id}`). Nothing here admits or ranks: it parses, keeps and shows, and
+//! hands each accepted reading to the scheduler, which does.
 //!
 //! The accept rule, per node:
 //! - A reading is taken only if its `seq` is above the last accepted one of the same daemon
@@ -20,13 +21,29 @@
 //! - Readings are stale once the time since the last accepted one, on the farm's clock, is
 //!   above three windows (a window being the span of the newest one). A node with fewer than
 //!   two accepted readings has no window, so it is never stale and has no measured CPU.
+//!
+//! The lists of a reading (`covered`, `lease_clocks`, `minutes`) are vetted when the reading
+//! is accepted (`NodeLoad::vet` of `kbf-proto`): a record that breaks a rule, repeats an
+//! earlier one or is past the cap of its list is dropped alone and counted ([`Lists`], shown
+//! in the node view), and the heartbeat is not refused for it. The minutes of a reading the
+//! accept rule refuses are counted too, as refused, and used for nothing.
+//!
+//! An accepted reading, with its vetted lists, is converted ([`sched_load`]) and fed to the
+//! scheduler on the same heartbeat, in every `--placement-load` mode: the scheduler keeps the
+//! readings whether or not it places by them, so the feed is warm before a flip to `on`.
 
+use kbf_proto::Vetted;
 use kbf_proto::worker::NodeLoad;
 use kbf_sched::DaemonInstance;
+use kbf_types::sched::usage;
 use kbf_types::{LeaseId, Resources, WorkerId};
 
 use super::{Farm, FarmTime, StreamId};
 use crate::fleet::LoadView;
+
+mod feed;
+
+use feed::{Lists, sched_load};
 
 /// How many cores of CPU per hardware thread a window may imply before it is not believed.
 const MAX_CORES_PER_THREAD: u128 = 4;
@@ -86,6 +103,17 @@ pub(super) struct Kept {
     last: Accepted,
     /// The newest window first.
     windows: [Option<Window>; 2],
+    /// What the lists of the session's readings came to.
+    lists: Lists,
+}
+
+/// What [`Kept::take`] made of one reading.
+struct Taken {
+    /// What is kept of the node after it: the reading if it was accepted, else what was kept
+    /// before (nothing, for a reading of a new session that was refused).
+    kept: Option<Kept>,
+    /// The lists of the reading as vetted, when it was accepted; `None` when it was refused.
+    vetted: Option<Vetted>,
 }
 
 /// The window from `before` to `now`, `None` when the clock did not move forward or the
@@ -134,28 +162,33 @@ fn validate(
 }
 
 impl Kept {
-    /// Takes `reading` of `session` at `now`, if the accept rule does; returns the new state.
+    /// Takes `reading` of `session` at `now`, if the accept rule does. A reading it refuses
+    /// counts its minutes as refused on what was kept; one it takes has its lists vetted and
+    /// counted.
     fn take(
         kept: Option<Self>,
         session: &Session,
         reading: &NodeLoad,
         capacity: &Resources,
         now: FarmTime,
-    ) -> Option<Self> {
+    ) -> Taken {
         // A reading of another session starts again.
         let previous = kept.filter(|k| &k.session == session);
         if previous.as_ref().is_some_and(|k| reading.seq <= k.last.seq) {
-            return previous;
+            return Self::refused(previous, reading);
         }
         let since = validate(reading, previous.as_ref().map(|k| &k.last), capacity);
         let Ok(since) = since else {
-            return previous;
+            return Self::refused(previous, reading);
         };
         let windows = match (&previous, since) {
             (Some(k), Some(w)) => [Some(w), k.windows[0]],
             _ => [None, None],
         };
-        Some(Self {
+        let vetted = reading.vet();
+        let mut lists = previous.map_or_else(Lists::default, |k| k.lists);
+        lists.took(&vetted);
+        let kept = Self {
             session: session.clone(),
             last: Accepted {
                 seq: reading.seq,
@@ -163,7 +196,7 @@ impl Kept {
                 cpu_usage_usec: reading.cpu_usage_usec,
                 working_set_bytes: reading.memory_working_set_bytes,
                 active_file_bytes: reading.memory_active_file_bytes,
-                covered: reading
+                covered: vetted
                     .covered
                     .iter()
                     .map(|l| LeaseId::new(l.term, l.seq))
@@ -174,7 +207,24 @@ impl Kept {
                 taken: now,
             },
             windows,
-        })
+            lists,
+        };
+        Taken {
+            kept: Some(kept),
+            vetted: Some(vetted),
+        }
+    }
+
+    /// `previous` after a refused `reading`: the minutes it carried are counted, if the node
+    /// has a state to count them in.
+    fn refused(mut previous: Option<Self>, reading: &NodeLoad) -> Taken {
+        if let Some(k) = previous.as_mut() {
+            k.lists.refused(reading.minutes.len());
+        }
+        Taken {
+            kept: previous,
+            vetted: None,
+        }
     }
 
     /// Whether the last accepted reading is older than three windows at `now`.
@@ -214,6 +264,7 @@ impl Kept {
             actions_cpu_limited: last.cpu_limited,
             cpu_throttled_usec: last.throttled_usec,
             cpu_pressure_some_total_usec: last.pressure_some_total_usec,
+            lists: self.lists.view(),
             stale,
         }
     }
@@ -223,21 +274,32 @@ impl Farm {
     /// The node load on a heartbeat of `worker` on `stream`, taken if the accept rule
     /// ([module](self)) does. A heartbeat with none changes nothing: the last accepted
     /// reading ages. Ignored if `stream` was replaced.
-    pub fn note_node_load(&self, worker: &WorkerId, stream: StreamId, load: Option<&NodeLoad>) {
-        let Some(load) = load else {
-            return;
-        };
+    ///
+    /// Returns the accepted reading with its vetted lists, as the scheduler takes it, for
+    /// [`Farm::heartbeat_with_load`]; `None` when there was no reading, it was refused, or
+    /// the stream was replaced.
+    pub fn note_node_load(
+        &self,
+        worker: &WorkerId,
+        stream: StreamId,
+        load: Option<&NodeLoad>,
+    ) -> Option<usage::NodeLoad> {
+        let load = load?;
         let mut state = self.lock();
-        let Some(link) = state.side.links.get(worker).filter(|l| l.stream == stream) else {
-            return;
-        };
+        let link = state
+            .side
+            .links
+            .get(worker)
+            .filter(|l| l.stream == stream)?;
         let session = Session::of(&link.instance, stream);
         let capacity = state.engine.sched.capacity(worker).unwrap_or_default();
         let kept = state.side.node_loads.remove(worker);
         let now = self.now();
-        if let Some(next) = Kept::take(kept, &session, load, &capacity, now) {
+        let taken = Kept::take(kept, &session, load, &capacity, now);
+        if let Some(next) = taken.kept {
             state.side.node_loads.insert(worker.clone(), next);
         }
+        taken.vetted.map(|vetted| sched_load(load, &vetted))
     }
 }
 

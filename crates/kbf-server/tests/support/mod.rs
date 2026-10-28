@@ -207,6 +207,11 @@ impl Cell {
     pub fn write_behind(&self) {
         self.farm().write_behind_now();
     }
+
+    /// What the farm's scheduler has counted about node-load readings, among other things.
+    pub fn load_counters(&self) -> kbf_sched::LoadCounters {
+        self.farm().load_counters()
+    }
 }
 
 impl Drop for Cell {

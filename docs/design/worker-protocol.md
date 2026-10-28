@@ -384,7 +384,8 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
   runtime takes readings (the container runtime does); a reading that fails leaves it out (logged
   once per failing file), and a daemon or runtime without readings, or one built before the field,
   sends none. A server built before the field skips it. The server accepts and shows readings under
-  the rule of [api.md](../api.md#node-load) and places by none of them yet.
+  the rule of [api.md](../api.md#node-load) and hands each accepted reading to the scheduler, as
+  described below.
 
   Two lists of a reading say when each lease started and what each used, minute by minute:
 
@@ -415,7 +416,17 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
   and counted; vetting never fails, and a heartbeat is never refused, nor its acknowledgement
   changed, for its lists. Every list at its cap and every number at its most digits make a load of
   9,001 bytes and a heartbeat of about 11.5 KB, well under the 17 MiB a message may be. Nothing sends
-  the two lists yet and the server does not read them.
+  the two lists yet.
+
+  The server vets the lists of each reading it accepts and counts what it dropped, by reason, in
+  the node view ([api.md](../api.md#node-load): `lists`). It counts the minutes of a reading it
+  refuses under the accept rule as refused, and uses them for nothing. It hands the accepted
+  reading, with the lists that passed the vet, to the scheduler (`Event::Heartbeat.load`) on the
+  same heartbeat, under every `--placement-load` mode: the scheduler keeps the readings whether or
+  not it places by them, so the feed is warm before the flag is raised to `on`. A refused reading
+  is not handed over, and a heartbeat is acknowledged as it would be with no load. The conversion
+  is one function (`sched_load` in `kbf-server`) for every path that hands a daemon's load to the
+  scheduler. The server keeps no series of minutes and serves no route for them.
 
 The server acknowledges a heartbeat with `HeartbeatAck { seq }`, but only one from the
 node's newest stream. A heartbeat from a replaced stream is dropped unacknowledged, so
