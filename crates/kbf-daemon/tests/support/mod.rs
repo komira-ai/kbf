@@ -926,6 +926,7 @@ impl<R: Runtime> Harness<R> {
             None,
             Some(packs),
             None,
+            None,
         )
         .await
     }
@@ -956,6 +957,30 @@ impl<R: Runtime> Harness<R> {
             None,
             Some(packs),
             Some(commit),
+            None,
+        )
+        .await
+    }
+
+    /// Starts a server and a daemon whose heartbeats carry the busy rate read from the
+    /// `cpu.stat` file at `stat` ([`Daemon::with_cpu_meter`]).
+    pub async fn with_cpu_meter(name: &str, runtime: Arc<R>, stat: PathBuf) -> Self {
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        Self::build_all(
+            name,
+            runtimes,
+            runtime,
+            Duration::from_secs(40),
+            |_| {},
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(stat),
         )
         .await
     }
@@ -981,6 +1006,7 @@ impl<R: Runtime> Harness<R> {
             None,
             None,
             Some(commit),
+            None,
         )
         .await
     }
@@ -1013,6 +1039,7 @@ impl<R: Runtime> Harness<R> {
             drain,
             None,
             None,
+            None,
         )
         .await
     }
@@ -1032,6 +1059,7 @@ impl<R: Runtime> Harness<R> {
         drain: Option<(mpsc::UnboundedReceiver<()>, Option<Duration>)>,
         packs: Option<PackCounter>,
         commit: Option<PackCommit>,
+        cpu_stat: Option<PathBuf>,
     ) -> Self {
         let pki = pki(name);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1099,6 +1127,9 @@ impl<R: Runtime> Harness<R> {
         if let Some(commit) = commit {
             daemon = daemon.with_pack_writes(commit);
             assert!(daemon.pack_writes().is_some());
+        }
+        if let Some(stat) = cpu_stat {
+            daemon = daemon.with_cpu_meter(stat);
         }
         let daemon = match drain {
             Some((signals, Some(deadline))) => tokio::spawn(daemon.run_draining(signals, deadline)),

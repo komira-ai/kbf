@@ -238,6 +238,14 @@ pub fn capacity(mount: &Path, actions: &str) -> Result<Capacity, DelegateError> 
     capacity_in(&Mount(mount), actions)
 }
 
+/// The `cpu.stat` file of the `actions` cgroup under the cgroup v2 `mount`: the CPU time
+/// all the leases ever used, which the daemon samples for the busy rate its heartbeats
+/// carry (`kbf_daemon::busy`).
+#[must_use]
+pub fn cpu_stat(mount: &Path, actions: &str) -> PathBuf {
+    Mount(mount).path(actions, "cpu.stat")
+}
+
 /// Limits the leases under `actions` to `cpus` CPUs together (`actions/cpu.max`), the
 /// leases' share of the node after `--reserve-cpus`. A bandwidth limit, not pinning: the
 /// leases run on any CPU, and all of them together are throttled to `cpus` CPUs of time.

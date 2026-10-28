@@ -950,6 +950,96 @@ fn a_container_nodes_leases_get_the_cpus_minus_the_reserve() {
     );
 }
 
+/// A container node's heartbeats carry how busy its leases kept the CPUs
+/// (`Heartbeat.busy_millis`), read from the `cpu.stat` of its `actions/` cgroup: none on
+/// the first (no window yet), a positive rate on the next after the counter grew.
+///
+/// Catches the daemon never given the file (every node unmeasured, so CPU admission never
+/// applies), the file of another cgroup (the daemon's own unit would read its supervisor's
+/// work), and the rate dropped on the way to the wire. The rate's size is not asserted: the
+/// window is wall time.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the container driver is Linux-only"
+)]
+fn a_container_nodes_heartbeats_carry_the_cpu_its_leases_used() {
+    let dir = tls("busy");
+    let front = front::Front::start(&dir);
+    let ids = id_files("busy-ids", "65536");
+    let (unit, cgroup_flags) = cgroup_tree(&dir, "cpu memory pids");
+    let bin = container_bin("busy-bin");
+    let log = dir.join("daemon.log");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = Command::new(BIN)
+        .env("PATH", path)
+        .args([
+            format!("--server=https://127.0.0.1:{}", front.worker.port()),
+            "--tls-server-name=localhost".to_owned(),
+            format!("--ca-cert={}", dir.join("ca.pem").display()),
+            format!("--cert={}", dir.join("node.pem").display()),
+            format!("--key={}", dir.join("node.key").display()),
+            "--node-id=node-1".to_owned(),
+            "--driver=container".to_owned(),
+            OCI_RUNTIME.to_owned(),
+            format!("--cas=https://127.0.0.1:{}", front.worker.port()),
+            format!("--data-dir={}", dir.display()),
+            format!("--id-files={}", ids.display()),
+        ])
+        .args(cgroup_flags)
+        .stderr(std::fs::File::create(&log).expect("log file"))
+        .spawn_guarded()
+        .expect("spawn");
+    let session = front.session(PROMPT);
+    let hello = session.next(PROMPT);
+    // The daemon has set `actions/` up by its Hello; the counter of the leases under it,
+    // and of nothing else, is the one that matters.
+    let stat = |usage: u64| {
+        std::fs::write(
+            unit.join("actions/cpu.stat"),
+            format!("usage_usec {usage}\n"),
+        )
+        .expect("plant");
+    };
+    stat(1_000_000);
+    std::fs::write(unit.join("cpu.stat"), "usage_usec 99999999999999\n").expect("plant");
+    session.welcome();
+    let beat = |session: &front::Session| loop {
+        match session.next(PROMPT) {
+            Some(kbf_proto::worker::daemon_message::Message::Heartbeat(beat)) => return beat,
+            Some(_) => {}
+            None => return kbf_proto::worker::Heartbeat::default(),
+        }
+    };
+    let first = beat(&session);
+    stat(1_000_000_000_000);
+    let busy = loop {
+        let next = beat(&session);
+        if next.busy_millis.is_some() || next.seq > 20 {
+            break next;
+        }
+    };
+    let status = stop(&mut child, libc::SIGTERM);
+    let log = read(&log);
+    assert!(
+        matches!(
+            hello,
+            Some(kbf_proto::worker::daemon_message::Message::Hello(_))
+        ),
+        "{hello:?}: {log}"
+    );
+    assert_eq!(first.busy_millis, None, "{log}");
+    assert!(
+        busy.busy_millis.is_some_and(|rate| rate > 0),
+        "{busy:?}: {log}"
+    );
+    assert!(status.success(), "{status}: {log}");
+}
+
 /// Catches `--cgroup-parent` set up again by the daemon (it names a cgroup someone else
 /// made) or its cap not written: the daemon makes no `supervisor` leaf, and writes the
 /// given cgroup's `memory.max` and nothing else.

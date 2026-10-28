@@ -79,6 +79,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::hash::{BuildHasher, RandomState};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -96,7 +97,8 @@ use tokio::time::{sleep, timeout};
 use tonic::transport::Endpoint;
 
 use crate::acks;
-use crate::clock::{Clock, SystemClock};
+use crate::busy::CpuMeter;
+use crate::clock::{Clock, Moment, SystemClock};
 use crate::config::{ConfigError, DaemonConfig};
 use crate::connect::{
     Backoff, Resolve, Server, SystemResolver, Target, WARN_EVERY, WarnLimit, resolve_all,
@@ -264,6 +266,9 @@ pub struct Daemon {
     /// The handle the frontend's Welcome turns pack writes on and off with, if the data plane
     /// writes packs; see [`Self::with_pack_writes`].
     pack_commit: Option<PackCommit>,
+    /// Reads the actions cgroup's CPU counter for each Heartbeat's `busy_millis`, if the
+    /// node has such a cgroup; see [`Self::with_cpu_meter`].
+    cpu_meter: Option<CpuMeter>,
     /// The suspend-counting clock that contact and the Start window read.
     clock: Arc<dyn Clock>,
     /// This daemon process's `Hello.instance_id`, the same on every stream it opens.
@@ -360,10 +365,27 @@ impl Daemon {
             granted: BTreeMap::new(),
             pack_reads: None,
             pack_commit: None,
+            cpu_meter: None,
             clock: Arc::new(SystemClock),
             instance: instance_id(),
             predecessor: String::new(),
         })
+    }
+
+    /// Puts the CPU time the actions cgroup used since the previous Heartbeat in every
+    /// Heartbeat (`Heartbeat.busy_millis`, CPU-milliseconds per second), read from the
+    /// `cpu.stat` file at `stat` (see [`crate::busy`]). Without it a Heartbeat carries
+    /// none, which the server reads as unknown.
+    #[must_use]
+    pub fn with_cpu_meter(mut self, stat: PathBuf) -> Self {
+        self.cpu_meter = Some(CpuMeter::new(stat));
+        self
+    }
+
+    /// The busy rate for the Heartbeat sent at `now`; `None` without a meter, or when it
+    /// has no reading for the window.
+    fn busy_sample(&mut self, now: Moment) -> Option<u64> {
+        self.cpu_meter.as_mut()?.sample(now)
     }
 
     /// Puts the storage map the server sends (in `Welcome`, and in each `MapUpdate`) in
@@ -827,6 +849,7 @@ impl Daemon {
                         running: self.listed().into_iter().map(proto_lease_id).collect(),
                         pack_reads: self.pack_reads.as_ref().map(|c| c.stats().into()),
                         pack_writes: self.pack_writes_counted(),
+                        busy_millis: self.busy_sample(now),
                     };
                     send(&tx, daemon_message::Message::Heartbeat(heartbeat));
                 }

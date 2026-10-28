@@ -806,6 +806,9 @@ struct Node<C> {
     runtimes: Option<Runtimes>,
     /// What leases may use (the container driver's `actions/` cgroup).
     capacity: Capacity,
+    /// The `cpu.stat` of that cgroup, which the daemon samples for its heartbeats' busy
+    /// rate; `None` on a node whose leases run in no such cgroup.
+    cpu_stat: Option<PathBuf>,
     /// The native driver's Xcode reports.
     reports: Option<Reports>,
     /// The whole-machine runtime's phase.
@@ -829,6 +832,7 @@ impl<C: Cas> Node<C> {
         Self {
             runtimes: None,
             capacity: Capacity::default(),
+            cpu_stat: None,
             reports: None,
             phase: None,
             plane: Plane::Unmade(plane),
@@ -926,6 +930,10 @@ fn node_over<C: Cas>(
     let daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtimes, report)?
         .with_container_images(cli.images.iter().cloned())
         .with_phase(phase);
+    let daemon = node
+        .cpu_stat
+        .into_iter()
+        .fold(daemon, Daemon::with_cpu_meter);
     // One line, not a match: this function has an instance per data plane, and an arm
     // each instance never takes would be a line the coverage ratchet counts as missed.
     let daemon = maps.into_iter().fold(daemon, Daemon::with_map);
@@ -1204,6 +1212,7 @@ mod container {
         // A limit on the actions cgroup, not a pinning: any CPU, at most this many.
         kbf_driver_container::limit_cpus(mount, &parent, super::sizes(cli)?.lease_cpus() as u64)?;
         let capacity = kbf_driver_container::capacity(mount, &parent)?;
+        let cpu_stat = kbf_driver_container::cpu_stat(mount, &parent);
         tracing::info!(
             "leases may use {} CPUs and {} of memory (cgroup {parent})",
             capacity.cpus.map_or("all".to_owned(), |n| n.to_string()),
@@ -1243,6 +1252,7 @@ mod container {
         tokio::runtime::Handle::current().block_on(check_images(&runtime, &cli.images))?;
         node.add(Arc::new(runtime))?;
         node.capacity = capacity;
+        node.cpu_stat = Some(cpu_stat);
         Ok(())
     }
 

@@ -859,3 +859,18 @@ fn an_actions_cgroup_under_the_root_has_the_root_as_its_parent() {
         ]
     );
 }
+
+/// Catches the busy rate read from the wrong cgroup (the delegated parent's `cpu.stat`
+/// counts the daemon's own work, and the root's the whole host's) or a leading `/` in the
+/// cgroup name dropping the mount: the file is `cpu.stat` of `actions/`, under the mount.
+#[test]
+fn the_busy_rate_is_read_from_the_actions_cgroups_cpu_stat() {
+    assert_eq!(
+        cpu_stat(Path::new("/sys/fs/cgroup"), "kbf.slice/kbf/actions"),
+        Path::new("/sys/fs/cgroup/kbf.slice/kbf/actions/cpu.stat")
+    );
+    assert_eq!(
+        cpu_stat(Path::new("/mnt/cg"), "/actions"),
+        Path::new("/mnt/cg/actions/cpu.stat")
+    );
+}
