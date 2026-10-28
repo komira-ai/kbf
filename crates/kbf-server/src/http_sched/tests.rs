@@ -159,7 +159,7 @@ fn the_queue_body_has_the_documented_shape() {
         avoided_total: 0,
     };
     assert_eq!(
-        queue_body(&empty),
+        queue_body(&empty, None),
         json!({
             "depth": 0, "oldest_age_ms": null, "by_platform": [], "waiting": [],
             "avoided": [], "avoided_total": 0,
@@ -188,7 +188,7 @@ fn the_queue_body_has_the_documented_shape() {
         avoided_total: 250,
     };
     assert_eq!(
-        queue_body(&full),
+        queue_body(&full, None),
         json!({
             "depth": 5,
             "oldest_age_ms": 61_500,

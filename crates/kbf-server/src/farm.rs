@@ -370,6 +370,9 @@ impl Farm {
         metrics
             .sched_leases
             .set(state.engine.sched.leases_held() as u64);
+        metrics
+            .sched_whole
+            .set(state.engine.sched.whole_summary().as_ref());
         state.side.learned.publish(&metrics.estimator_shadow);
     }
 

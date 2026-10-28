@@ -20,6 +20,8 @@ use kbf_meta::Command;
 
 mod execute;
 pub use execute::{ErrorCause, ErrorCounts, ExecuteMetrics, OpenExecute};
+mod whole;
+pub use whole::WholeGauges;
 
 /// What a histogram's values are, which fixes its buckets and how they are printed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -561,6 +563,9 @@ pub struct CacheMetrics {
     pub sched_queued: Level,
     /// Leases granted or running, as of the last scheduler input.
     pub sched_leases: Level,
+    /// The whole-node caps' numbers and the requests waiting by reason; rendered only when
+    /// `--whole-node-max` is on.
+    pub sched_whole: WholeGauges,
     /// Finished attempts the learned-sizes shadow compared with its estimate, by the
     /// level the estimate came from and how the attempt fell (`kbf_estimator_shadow_total`).
     pub estimator_shadow: ShadowTotals,
@@ -632,6 +637,7 @@ impl Default for CacheMetrics {
             sched_lock_wait: Histogram::new(Unit::Seconds),
             sched_queued: Level::default(),
             sched_leases: Level::default(),
+            sched_whole: WholeGauges::default(),
             estimator_shadow: ShadowTotals::default(),
             tier_in_flight: Gauge::default(),
             tier_wait: Histogram::new(Unit::Seconds),
@@ -888,6 +894,7 @@ impl CacheMetrics {
             "Leases granted or running, as of the last scheduler input",
             self.sched_leases.get(),
         );
+        self.sched_whole.render(&mut out);
         self.estimator_shadow.render(&mut out);
         out.gauge(
             "kbf_tier_in_flight",

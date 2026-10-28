@@ -572,7 +572,8 @@ What the code does today:
   `--whole-node-allow-last-capable`; a request a cap stops holds nothing and queues.
   The wall times are kept in memory: an operation taken up again after a restart has none.
   The tuning flags need `--whole-node-max`. `Scheduler::whole_state` and `whole_summary`
-  say why a request waits; the operator API does not show them yet.
+  say why a request waits; `GET /v1/queue` (a `whole_node` section) and the
+  `kbf_sched_whole_*` gauges show them, and the Queue page of the UI.
 - A request with `ios.device=1` has room only where a device the worker reports
   satisfies every `ios.device.*` attribute of the request and no lease holds it, and
   where the worker holds no other device lease (`DEVICE_LEASES_PER_WORKER` = 1, until
