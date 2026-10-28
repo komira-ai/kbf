@@ -10,7 +10,7 @@
 //!   crate (tokio, tonic, hyper, reqwest, the rand family, getrandom, mio, socket2);
 //! - a pure crate that depends on a kbf crate outside the pure set;
 //! - a pure crate that reaches a crate taken from a git repository other than the ones
-//!   listed in `PURE_GIT_CRATES` (`js-sizing` for `kbf-estimator`; `js-sched` and its `js-caps`, `js-types` for `kbf-sched`);
+//!   listed in `PURE_GIT_CRATES` (`js-sizing` for `kbf-estimator`; `js-caps` for `kbf-caps`; `js-sched` and its `js-types` for `kbf-sched`);
 //! - a pure crate whose `lib.rs` no longer denies the `clippy.toml` lists, which would
 //!   silently switch off the clock, sleep, network and `HashMap` checks for it;
 //! - a pure crate renamed or removed, which would otherwise make every check above
@@ -300,7 +300,7 @@ fn pure_crates_take_git_crates_only_from_the_list() {
         "pure crates reach git crates outside PURE_GIT_CRATES:\n{}",
         violations.join("\n")
     );
-    // The list is not vacuous: kbf-estimator reaches js-sizing through its shim.
+    // The list is not vacuous: kbf-estimator and kbf-caps reach theirs through their shims.
     for (name, _) in PURE_GIT_CRATES {
         assert!(
             seen.contains(*name),
