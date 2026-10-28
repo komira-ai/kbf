@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use kbf_types::HostRole::{Daemon, Frontend, MacDaemon, Storage};
-use kbf_updater::wire::Reply;
+use kbf_updater::wire::{MAX_SERVICE_NAME, MAX_SERVICES, Reply};
 
 use crate::decide::decide_in;
 use crate::desired::{Desired, KBF};
@@ -325,4 +325,28 @@ fn a_definitions_limits_and_waits_decide_over_the_desired_state() {
     f.record_in("svc", id("d1"), Daemon, beat("2.0"), NOW);
     f.record_in("svc", id("d3"), Daemon, beat("2.0"), NOW);
     assert_eq!(ask(&s, &w, &f, "svc", "t1"), update("2.0"));
+}
+
+/// Catches: the services file's name check drifting from the wire's: a name of exactly
+/// `MAX_SERVICE_NAME` bytes is defined, one byte more is refused and the refusal says why.
+#[test]
+fn a_service_name_has_the_wires_length_cap() {
+    let role = "[service.roles.daemon]\n";
+    let svc = |name: &str| format!("[[service]]\nname = \"{name}\"\n{role}");
+    Services::parse(&svc(&"a".repeat(MAX_SERVICE_NAME))).expect("at the cap");
+    let why = refusal(&svc(&"a".repeat(MAX_SERVICE_NAME + 1)));
+    assert!(why.contains("64 bytes"), "{why}");
+}
+
+/// Catches: no cap on the services a file defines, or one off by one: exactly
+/// `MAX_SERVICES` are defined, one more is refused.
+#[test]
+fn a_services_file_defines_at_most_the_most_services() {
+    let file = |n: usize| {
+        (0..n)
+            .map(|i| format!("[[service]]\nname = \"svc-{i}\"\n[service.roles.daemon]\n"))
+            .collect::<String>()
+    };
+    Services::parse(&file(MAX_SERVICES)).expect("at the cap");
+    assert!(refusal(&file(MAX_SERVICES + 1)).contains("more than 16 services"));
 }

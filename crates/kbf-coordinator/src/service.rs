@@ -2,6 +2,7 @@
 //! or read either. No sockets here; [`crate::http`] maps requests onto these calls.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -99,6 +100,9 @@ pub struct Status {
     pub services: BTreeMap<String, Desired>,
     /// The coordinator is still within its quiet period and orders nothing.
     pub quiet: bool,
+    /// Heartbeats since the coordinator started whose `services` list was bad and was
+    /// dropped: the host was answered as a `kbf`-only host.
+    pub services_dropped: u64,
     /// Every host heard from since the coordinator started, by node id.
     pub hosts: Vec<HostStatus>,
 }
@@ -111,6 +115,7 @@ pub struct Coordinator {
     verifier: Arc<Verifier>,
     operator_token: String,
     clock: Clock,
+    services_dropped: AtomicU64,
 }
 
 impl std::fmt::Debug for Coordinator {
@@ -137,6 +142,7 @@ impl Coordinator {
             verifier,
             operator_token,
             clock,
+            services_dropped: AtomicU64::new(0),
         }
     }
 
@@ -145,6 +151,14 @@ impl Coordinator {
     pub fn with_services(mut self, services: Services) -> Self {
         self.services = services;
         self
+    }
+
+    /// Counts and logs a heartbeat from `who` whose `services` list was bad and was dropped
+    /// (`why` is the reader's reason). The heartbeat itself is still answered, by
+    /// [`Self::heartbeat`], as one from a `kbf`-only host.
+    pub fn note_services_dropped(&self, who: &Identity, why: &str) {
+        self.services_dropped.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(node_id = %who.node_id, why, "dropped the services list of a heartbeat");
     }
 
     /// Notes a heartbeat from `who` and answers it. With no desired state set, nothing.
@@ -256,6 +270,7 @@ impl Coordinator {
             desired: self.desired.get(KBF),
             services: self.desired.all(),
             quiet: fleet.is_quiet(now),
+            services_dropped: self.services_dropped.load(Ordering::Relaxed),
             hosts,
         })
     }
