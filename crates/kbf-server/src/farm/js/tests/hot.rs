@@ -372,7 +372,7 @@ async fn a_busy_nodes_kills_are_logged_with_their_count_and_the_reruns_run_out()
             .expect("an ack");
         assert!(ack.accepted, "kill {kills}: {ack:?}");
         if kills < 3 {
-            lease = joined.started().expect("the rerun's Start");
+            lease = rerun_start(&farm, &mut joined).await;
         }
     }
     let text = log.text();
@@ -452,4 +452,17 @@ async fn an_operation_is_named_by_its_id_and_a_name_that_is_not_one_is_not_found
     assert!(farm.wait("operations/not-a-number").is_none());
     assert!(farm.wait("operations/9999999").is_none());
     assert!(farm.wait("somewhere/else").is_none());
+}
+
+/// The `Start` of the rerun after a kill: the scheduler places it at the next tick, so the
+/// clock is moved on (paused, so no real time passes) until one is sent.
+async fn rerun_start(farm: &Farm, joined: &mut Joined) -> worker::LeaseId {
+    for _ in 0..30 {
+        farm.tick().await;
+        if let Some(lease) = joined.started() {
+            return lease;
+        }
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    }
+    panic!("no rerun was started");
 }
