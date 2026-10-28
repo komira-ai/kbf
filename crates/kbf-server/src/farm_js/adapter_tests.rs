@@ -10,11 +10,12 @@ use js_store::Ending;
 use kbf_front::{Described, Stage};
 use kbf_sched::NodePhase;
 use kbf_types::{
-    ActionKey, Answer, Effect, Failure, LeaseId, OperationId, Outcome, Refusal, WaiterId, Waiting,
-    WorkerId,
+    ActionKey, Answer, Effect, Failure, FarmTime, LeaseId, OperationId, Outcome, Refusal, WaiterId,
+    Waiting, WorkerId,
 };
 use tonic::Code;
 
+use super::dispatch;
 use super::testing::{Flaky, adapter, enrolled, register, request, rig, rig_over, submit};
 use crate::action_usage::Subject;
 use crate::answer::{Detail, failed, finished_of, refused_as};
@@ -297,7 +298,7 @@ fn the_callers_still_waiting_are_those_listening_and_not_answered() {
 
 /// Asserts that the stage the core shows for an operation reaches the callers the scheduler
 /// holds for it as the farm's own stage: waiting for a worker, waiting with the streams
-/// kept, and nothing at all for a result that cannot be read.
+/// kept.
 #[tokio::test(start_paused = true)]
 async fn the_stage_the_core_shows_reaches_the_callers_of_the_operation() {
     let rig = rig();
@@ -313,17 +314,14 @@ async fn the_stage_the_core_shows_reaches_the_callers_of_the_operation() {
         *ticket.stage.borrow_and_update(),
         Stage::WaitingKept("busy".to_owned())
     );
-    show(CoreStage::Done(b"garbage".to_vec()));
-    assert!(!ticket.stage.has_changed().expect("open"), "nothing shown");
     show(CoreStage::Executing);
     assert_eq!(*ticket.stage.borrow(), Stage::Executing);
 }
 
 /// Asserts that callers are shown a stage once: a caller the adapter does not know is
-/// skipped, a stage already shown wakes nobody, and a result the store holds that cannot be
-/// read shows nothing and says so, so that the next look at the store tries again.
+/// skipped, and a stage already shown wakes nobody.
 #[test]
-fn callers_are_shown_a_stage_once_and_an_unreadable_result_shows_nothing() {
+fn callers_are_shown_a_stage_once() {
     let mut adapter = adapter();
     let mut stage = enrolled(&mut adapter, 0, 0, 1);
     let waiting = CoreStage::Waiting("busy".to_owned());
@@ -338,12 +336,129 @@ fn callers_are_shown_a_stage_once_and_an_unreadable_result_shows_nothing() {
         !stage.has_changed().expect("open"),
         "shown again: nobody woken"
     );
-    let log = capture();
-    adapter.show_callers(&[WaiterId(0)], &CoreStage::Done(b"garbage".to_vec()));
-    assert!(!stage.has_changed().expect("open"), "nothing shown");
-    assert!(log.text().contains("a stored result cannot be read"));
     adapter.show_callers(&[WaiterId(0)], &CoreStage::Done(done_row("ended")));
     assert!(matches!(&*stage.borrow(), Stage::Done(_)));
+}
+
+/// What an unreadable `done/` row is shown as: UNAVAILABLE, which clients retry.
+fn unreadable_result_stage() -> Stage {
+    let message = "the stored result of this operation cannot be read";
+    Stage::Done(failed(Code::Unavailable, message))
+}
+
+/// How many times the log says a stored result cannot be read.
+fn count_of(log: &crate::test_log::Capture) -> usize {
+    log.text().matches("a stored result cannot be read").count()
+}
+
+/// Asserts that a `done/` row the adapter cannot decode ends the callers with UNAVAILABLE
+/// ("the stored result of this operation cannot be read"), which clients retry, instead of
+/// leaving them waiting: the callers a frontend follows (`show_callers`, then `followed`
+/// for the invocation record, which logs nothing more), and the watch that follows a name.
+/// A lookup by name is answered not found instead, so that the client sends a fresh
+/// Execute call and does not retry the name. Each look at the row logs it at error once and
+/// counts it, so two lookups by name are two logs; a readable row is not counted. The paused
+/// clock makes a hang a failed test: a stage that is not done by the time the bound passes
+/// fails it.
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_done_row_ends_the_caller_with_a_retryable_error_and_does_not_hang() {
+    let bound = Duration::from_secs(60);
+    let done = |mut stage: tokio::sync::watch::Receiver<Stage>| async move {
+        let reached = tokio::time::timeout(bound, stage.wait_for(|s| matches!(s, Stage::Done(_))));
+        let shown = reached.await.expect("the caller was ended").expect("open");
+        shown.clone()
+    };
+    let garbage = b"garbage".to_vec();
+
+    // Follow: a caller of an operation another frontend ran.
+    let log = capture();
+    let mut adapter = adapter();
+    let stage = enrolled(&mut adapter, 0, 0, 1);
+    adapter.show_callers(&[WaiterId(0)], &CoreStage::Done(garbage.clone()));
+    assert_eq!(done(stage).await, unreadable_result_stage());
+    assert_eq!(adapter.unreadable_results(), 1);
+    assert_eq!(count_of(&log), 1);
+
+    // Name lookup, from the core: a finished operation whose `done/` row was overwritten.
+    let store = Flaky::new();
+    let first = rig_over(&store, kbf_front::Recorder::off());
+    let mut node = register(&first, "node-a", 0);
+    let finished = submit(&first, 1, 0).expect("queued");
+    let lease = super::testing::started(&node.sent()).expect("started");
+    let ack = dispatch::report(
+        &first.core,
+        &first.backend,
+        &super::testing::wall(),
+        || FarmTime::from_millis(0),
+        &WorkerId::new("node-a"),
+        super::testing::ran(lease, 0),
+    )
+    .await;
+    assert!(ack.expect("admitted").is_some());
+    let key = js_store::keys::done(OperationId(0));
+    super::testing::overwrite(store.plain(), &key, garbage.clone());
+    let second = rig_over(&store, kbf_front::Recorder::off());
+    drop(log);
+    let log = capture();
+    // A client asking by name is told not found, so that it sends a fresh Execute call: at
+    // each look the row is logged at error once and counted.
+    assert!(dispatch::wait(&second.core, &finished.name).is_none());
+    assert_eq!(second.core.with(|_, a| a.unreadable_results()), 1);
+    assert_eq!(count_of(&log), 1);
+    assert!(dispatch::wait(&second.core, &finished.name).is_none());
+    assert_eq!(second.core.with(|_, a| a.unreadable_results()), 2);
+    assert_eq!(count_of(&log), 2, "per look, not per operation");
+
+    // The watch that follows a name shows the row as an error to the callers it holds.
+    drop(log);
+    let log = capture();
+    let mut adapter = super::testing::adapter();
+    let watched = adapter.watch_operation(OperationId(3), &Stage::Executing);
+    adapter.show_watched(OperationId(3), &CoreStage::Done(garbage.clone()));
+    assert_eq!(done(watched).await, unreadable_result_stage());
+    assert!(adapter.watched().is_empty(), "its result has been shown");
+    assert_eq!(adapter.unreadable_results(), 1);
+    assert_eq!(count_of(&log), 1);
+
+    // Followed: the invocation record ends as the caller was told.
+    let (recorder, recording) = kbf_front::Recorder::new(1 << 20, 64);
+    tokio::spawn(recording.run());
+    let rig = rig_over(&Flaky::new(), recorder.clone());
+    let ticket =
+        super::testing::submit_recorded(&rig, &recorder, request(1), "build-1").expect("queued");
+    drop(ticket);
+    drop(log);
+    let log = capture();
+    rig.core.with(|_, adapter| {
+        assert!(adapter.is_recorded(OperationId(0)));
+        adapter.followed(OperationId(0), &garbage);
+        assert!(!adapter.is_recorded(OperationId(0)), "told");
+        assert_eq!(adapter.unreadable_results(), 0, "followed counts nothing");
+    });
+    assert_eq!(count_of(&log), 0, "followed does not log the row again");
+    recorder.caught_up().await;
+    let key = kbf_invocation::RecordKey::owner(kbf_invocation::InvocationId::new("build-1"));
+    let action = ActionKey::try_from(&request(1).key)
+        .expect("an action")
+        .action;
+    let outcome = recorder
+        .get(&key)
+        .expect("a record")
+        .row(&action)
+        .expect("a row")
+        .outcome
+        .clone();
+    let want = kbf_invocation::Outcome::Failed {
+        code: Code::Unavailable as i32,
+        message: "the stored result of this operation cannot be read".to_owned(),
+    };
+    assert_eq!(outcome, Some(want));
+
+    // A readable row is neither logged nor counted.
+    let mut adapter = super::testing::adapter();
+    let _stage = enrolled(&mut adapter, 0, 0, 1);
+    adapter.show_callers(&[WaiterId(0)], &CoreStage::Done(done_row("ended")));
+    assert_eq!(adapter.unreadable_results(), 0);
 }
 
 /// Asserts that an operation watched by name is shown what the store says until it is done,
@@ -362,12 +477,6 @@ fn an_operation_watched_by_name_is_listed_until_it_is_done_or_nobody_holds_it() 
     adapter.show_watched(a, &CoreStage::Executing);
     assert_eq!(*ticket.borrow_and_update(), Stage::Executing);
     adapter.show_watched(OperationId(99), &CoreStage::Executing);
-    adapter.show_watched(a, &CoreStage::Done(b"garbage".to_vec()));
-    assert_eq!(
-        *ticket.borrow(),
-        Stage::Executing,
-        "an unreadable result shows nothing"
-    );
     adapter.show_watched(a, &CoreStage::Done(done_row("ended")));
     assert!(matches!(&*ticket.borrow(), Stage::Done(_)));
     assert!(adapter.watched().is_empty(), "its result has been shown");
@@ -396,8 +505,7 @@ fn callers_kept_for_a_finished_operation_are_forgotten_when_the_core_drops_it() 
 }
 
 /// Asserts that the end of an operation another frontend ran is told to the recorder once,
-/// as the callers' answer, with no lease; a result that cannot be read is not told, and the
-/// operation stays noted for the next look.
+/// as the callers' answer, with no lease.
 #[tokio::test(start_paused = true)]
 async fn the_end_of_an_operation_another_frontend_ran_is_recorded_once() {
     let (recorder, recording) = kbf_front::Recorder::new(1 << 20, 64);
@@ -414,8 +522,6 @@ async fn the_end_of_an_operation_another_frontend_ran_is_recorded_once() {
 
     rig.core.with(|_, adapter| {
         assert!(adapter.is_recorded(operation));
-        adapter.followed(operation, b"garbage");
-        assert!(adapter.is_recorded(operation), "unreadable: not told");
         adapter.followed(operation, &done_row("ended by the other frontend"));
         assert!(!adapter.is_recorded(operation), "told");
         adapter.followed(operation, &done_row("again"));

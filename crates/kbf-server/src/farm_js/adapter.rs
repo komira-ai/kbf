@@ -38,10 +38,11 @@ use kbf_types::{
     WorkerId,
 };
 use tokio::sync::watch;
+use tonic::Code;
 
 use super::codec::KbfRowCodec;
 use crate::action_usage::Subject;
-use crate::answer::{Detail, Pending, finished_of, refused_as};
+use crate::answer::{Detail, Pending, failed, finished_of, refused_as};
 use crate::farm::durable::{named, subject};
 use crate::fleet::quarantine_change;
 use crate::machine::{FarmMachine, Platform, Sent, Waiter, stored_name};
@@ -91,6 +92,8 @@ pub struct KbfAdapter {
     pub(super) recorded: BTreeSet<OperationId>,
     pub(super) pack_reads: BTreeMap<WorkerId, worker::PackReadCounts>,
     pub(super) pack_writes: BTreeMap<WorkerId, worker::PackWriteCounts>,
+    /// The unreadable `done/` rows looked at, each look counted.
+    unreadable_results: u64,
 }
 
 /// The `LeaseId` of the wire.
@@ -101,25 +104,21 @@ pub(super) fn wire_lease(lease: LeaseId) -> worker::LeaseId {
     }
 }
 
-/// `stage` as the callers of the farm see it. `None` for a stage this server does not know,
-/// which a later `js-server-core` may add, and for a `done/` row that cannot be read: the
-/// callers are shown nothing, and the next look at the store tries again.
-fn shown(stage: &CoreStage) -> Option<Stage> {
-    match stage {
-        CoreStage::Queued => Some(Stage::Queued),
-        CoreStage::Waiting(why) => Some(Stage::Waiting(why.clone())),
-        CoreStage::WaitingKept(why) => Some(Stage::WaitingKept(why.clone())),
-        CoreStage::Executing => Some(Stage::Executing),
-        CoreStage::Done(row) => decoded(row).map(Stage::Done),
-        _ => None,
-    }
+/// What the callers of an operation are told when its `done/` row cannot be read: UNAVAILABLE,
+/// which clients retry (Buck2 retries it, as it does the refusal of an Execute call while a
+/// frontend drains). The bytes are in the store and will not change, so the retry is an
+/// Execute call, which is answered from the action cache or runs the action again.
+pub(super) fn unreadable_result() -> Finished {
+    failed(
+        Code::Unavailable,
+        "the stored result of this operation cannot be read",
+    )
 }
 
-/// The result a `done/` row holds; an unreadable row is logged.
-pub(super) fn decoded(row: &[u8]) -> Option<Finished> {
-    Finished::from_row(row)
-        .inspect_err(|error| tracing::error!(%error, "a stored result cannot be read"))
-        .ok()
+/// The result a `done/` row holds, or [`unreadable_result`] for a row that cannot be read.
+/// Silent: [`KbfAdapter::decoded`] is the one that logs and counts.
+pub(super) fn ended_as(row: &[u8]) -> Finished {
+    Finished::from_row(row).unwrap_or_else(|_| unreadable_result())
 }
 
 /// Shows `stage` on `channel`, waking its watchers only if it changed.
@@ -151,6 +150,7 @@ impl KbfAdapter {
             recorded: BTreeSet::new(),
             pack_reads: BTreeMap::new(),
             pack_writes: BTreeMap::new(),
+            unreadable_results: 0,
         }
     }
 
@@ -204,6 +204,49 @@ impl KbfAdapter {
             message: Some(message),
         };
         let _sent = node.map(|node| node.outbound.send(Ok(message)).is_ok());
+    }
+
+    /// The result a `done/` row holds, or `None` for a row that cannot be read, which is
+    /// logged at error and counted ([`KbfAdapter::unreadable_results`]) at each look.
+    pub(super) fn readable(&mut self, row: &[u8]) -> Option<Finished> {
+        Finished::from_row(row)
+            .inspect_err(|error| {
+                tracing::error!(%error, "a stored result cannot be read");
+                self.unreadable_results += 1;
+            })
+            .ok()
+    }
+
+    /// The result a `done/` row holds, or [`unreadable_result`] for a row that cannot be
+    /// read (logged and counted by [`KbfAdapter::readable`]), so that the callers an
+    /// operation already has (followed, or watched by name) are ended with an error and
+    /// none waits for a result that will not come. A client that asks for the operation by
+    /// name is not given this: see `dispatch::wait`.
+    pub(super) fn decoded(&mut self, row: &[u8]) -> Finished {
+        self.readable(row).unwrap_or_else(unreadable_result)
+    }
+
+    /// How many unreadable `done/` rows the adapter has looked at, counting each look. The
+    /// adapter has no metrics hook yet, so this is a count for tests until it is given the
+    /// farm's metrics; nothing exports it.
+    #[must_use]
+    pub const fn unreadable_results(&self) -> u64 {
+        self.unreadable_results
+    }
+
+    /// `stage` as the callers of the farm see it: one stage, or none for a stage this server
+    /// does not know, which a later `js-server-core` may add. A `done/` row that cannot be
+    /// read is shown as [`unreadable_result`].
+    fn shown(&mut self, stage: &CoreStage) -> std::option::IntoIter<Stage> {
+        let shown = match stage {
+            CoreStage::Queued => Some(Stage::Queued),
+            CoreStage::Waiting(why) => Some(Stage::Waiting(why.clone())),
+            CoreStage::WaitingKept(why) => Some(Stage::WaitingKept(why.clone())),
+            CoreStage::Executing => Some(Stage::Executing),
+            CoreStage::Done(row) => Some(Stage::Done(self.decoded(row))),
+            _ => None,
+        };
+        shown.into_iter()
     }
 
     /// The request of `operation`, as the store holds it in its `op/` row, and the action it
@@ -329,12 +372,11 @@ impl Adapter for KbfAdapter {
     /// Shows `stage` to the callers of `operation`. A caller that joins a waiting operation
     /// is told again; the others, who already know, see no repeated update.
     fn show(&mut self, view: &View<'_>, operation: OperationId, stage: &CoreStage) {
-        let Some(stage) = shown(stage) else {
-            return;
-        };
         let waiters = view.sched().waiters(operation).unwrap_or_default();
-        for channel in waiters.iter().filter_map(|id| self.stages.get(id)) {
-            show_on(channel, &stage);
+        for stage in self.shown(stage) {
+            for channel in waiters.iter().filter_map(|id| self.stages.get(id)) {
+                show_on(channel, &stage);
+            }
         }
     }
 
@@ -504,11 +546,10 @@ impl Adapter for KbfAdapter {
     }
 
     fn show_callers(&mut self, callers: &[WaiterId], stage: &CoreStage) {
-        let Some(stage) = shown(stage) else {
-            return;
-        };
-        for channel in callers.iter().filter_map(|caller| self.stages.get(caller)) {
-            show_on(channel, &stage);
+        for stage in self.shown(stage) {
+            for channel in callers.iter().filter_map(|caller| self.stages.get(caller)) {
+                show_on(channel, &stage);
+            }
         }
     }
 
@@ -517,9 +558,9 @@ impl Adapter for KbfAdapter {
     }
 
     fn followed(&mut self, operation: OperationId, ended: &[u8]) {
-        if let Some(finished) = decoded(ended) {
-            self.record_followed(operation, &finished);
-        }
+        // The callers were shown this row just before (`show_callers`), which logged and
+        // counted it if it cannot be read; the recording ends as they were told.
+        self.record_followed(operation, &ended_as(ended));
     }
 
     fn watched(&mut self) -> Vec<OperationId> {
@@ -533,13 +574,12 @@ impl Adapter for KbfAdapter {
     }
 
     fn show_watched(&mut self, operation: OperationId, stage: &CoreStage) {
-        let Some(stage) = shown(stage) else {
-            return;
-        };
         // The core asks only about operations `watched` just listed.
-        let channel = self.watched.get(&operation);
-        channel
-            .into_iter()
-            .for_each(|channel| show_on(channel, &stage));
+        for stage in self.shown(stage) {
+            let channel = self.watched.get(&operation);
+            channel
+                .into_iter()
+                .for_each(|channel| show_on(channel, &stage));
+        }
     }
 }

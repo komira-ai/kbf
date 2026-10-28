@@ -378,7 +378,7 @@ async fn a_name_is_answered_through_the_first_caller_the_core_holds() {
 /// Asserts that a name the core does not hold is answered from the state store: a finished
 /// operation by its `done/` and `doneof/` rows, an operation another frontend queued by its
 /// `queue/` row (shown queued), and no ticket for an operation the store has no trace of,
-/// for one whose result cannot be read, or whose rows cannot be read.
+/// whose rows cannot be read, or whose result cannot be read.
 #[tokio::test(start_paused = true)]
 async fn a_name_the_core_does_not_hold_is_answered_from_the_store() {
     let store = Flaky::new();
@@ -427,7 +427,7 @@ async fn a_name_the_core_does_not_hold_is_answered_from_the_store() {
     super::testing::overwrite(store.plain(), &js_store::keys::done(op), garbage);
     assert!(
         dispatch::wait(&second.core, &finished.name).is_none(),
-        "result unreadable"
+        "result unreadable: not found, so the client sends a fresh Execute call"
     );
 }
 
