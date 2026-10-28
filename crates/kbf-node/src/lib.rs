@@ -174,17 +174,8 @@ pub struct Cli {
     /// its memory when that is less, and the CPUs of their cpuset.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     actions_memory_max_gib: Option<u64>,
-    /// Whether the actions cgroup's `cpu.max` is lifted (container). At start it holds the
-    /// leases' CPUs, the node's minus `--reserve-cpus`; the server's Welcome then says,
-    /// on every connect and reconnect, whether the farm places by the load the nodes
-    /// measure (`Welcome.placement_load`), which a CPU limit would hide (a cgroup throttled
-    /// at its limit never measures more than it). `auto` follows the Welcome: `cpu.max` is
-    /// `max` when it says so, and the leases' CPUs when it says otherwise or nothing; `on`
-    /// lifts the limit and `off` keeps it, whatever the Welcome says. Until the first
-    /// Welcome the limit of the start stays. The heartbeat reports what was written
-    /// (`NodeLoad.actions_cpu_limited`). Refused with a driver other than `container`.
-    #[arg(long, value_enum, default_value_t = ActionsCpuModeFlag::Auto, value_name = "auto|on|off")]
-    actions_cpu_max: ActionsCpuModeFlag,
+    #[command(flatten)]
+    actions_cpu: actions_cpu::Args,
     /// Written to the daemon's `supervisor` leaf's `memory.min` at start, in MiB
     /// (container, without `--cgroup-parent`): memory the kernel does not reclaim from
     /// the daemon while it uses no more, so builds short of memory never take it. The
@@ -339,27 +330,6 @@ pub struct Cli {
     /// in kbf-mac-provision's profile); at least 600.
     #[arg(long, requires = "pool_users")]
     pool_first_uid: Option<u32>,
-}
-
-/// `--actions-cpu-max`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum ActionsCpuModeFlag {
-    /// Follow the Welcome.
-    Auto,
-    /// No limit.
-    On,
-    /// The reserve's limit.
-    Off,
-}
-
-impl From<ActionsCpuModeFlag> for kbf_driver_container::ActionsCpuMax {
-    fn from(flag: ActionsCpuModeFlag) -> Self {
-        match flag {
-            ActionsCpuModeFlag::Auto => Self::Auto,
-            ActionsCpuModeFlag::On => Self::On,
-            ActionsCpuModeFlag::Off => Self::Off,
-        }
-    }
 }
 
 /// The drivers this binary can run leases through.
@@ -920,14 +890,8 @@ fn node_over<C: Cas>(
         )
         .into());
     }
-    if cli.actions_cpu_max != ActionsCpuModeFlag::Auto && !cli.drivers.contains(&Driver::Container)
-    {
-        return Err(format!(
-            "--actions-cpu-max={} sets the CPU limit of the container driver's actions cgroup: \
-             only --driver container has one (Linux only)",
-            format!("{:?}", cli.actions_cpu_max).to_lowercase()
-        )
-        .into());
+    if let Some(refusal) = cli.actions_cpu.refusal(&cli.drivers) {
+        return Err(refusal.into());
     }
     let mut node = Node::new(plane);
     for driver in drivers(cli) {
@@ -1267,10 +1231,7 @@ mod container {
         let mut config = ContainerConfig::new(scratch, parent);
         config.placer = placer;
         // Applied by each Welcome from here on; the limit above stands until the first.
-        config.actions_cpu = Some(kbf_driver_container::ActionsCpu {
-            mode: cli.actions_cpu_max.into(),
-            lease_cpus,
-        });
+        config.actions_cpu = Some(cli.actions_cpu.config(lease_cpus));
         config.oci.runtime = cli.oci_runtime.clone();
         config.oci.id_files = files;
         config.cgroup_root = mount.clone();
@@ -1350,6 +1311,7 @@ mod container {
     }
 }
 
+mod actions_cpu;
 mod data_dir;
 mod instance;
 mod pack_read;
@@ -2220,43 +2182,6 @@ mod tests {
     /// instantiation, which must run the map and no-map arms and the error return).
     fn plane(cli: &Cli, _: Liveness) -> Result<Arc<kbf_transfer::Transfers>, Error> {
         remote(cli)
-    }
-
-    /// `--actions-cpu-max` is `auto` unless set, takes `auto`, `on` and `off` and nothing
-    /// else, and each reaches the driver as its own mode. Catches a default other than
-    /// `auto` (a farm that does not set it would stop following the Welcome), two modes
-    /// swapped, and a value outside the three accepted.
-    #[test]
-    fn actions_cpu_max_is_parsed_strictly_and_mapped_to_its_mode() {
-        use kbf_driver_container::ActionsCpuMax;
-        let parse = |extra: Option<&str>| {
-            let mut all: Vec<String> = [
-                "kbf-daemon",
-                "--driver=fake",
-                "--server=https://127.0.0.1:1",
-                "--ca-cert=ca",
-                "--cert=cert",
-                "--key=key",
-                "--node-id=n",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-            all.extend(extra.map(str::to_owned));
-            Cli::try_parse_from(all)
-        };
-        let mode = |extra: Option<&str>| {
-            ActionsCpuMax::from(parse(extra).expect("parses").actions_cpu_max)
-        };
-        assert_eq!(mode(None), ActionsCpuMax::Auto);
-        assert_eq!(mode(Some("--actions-cpu-max=auto")), ActionsCpuMax::Auto);
-        assert_eq!(mode(Some("--actions-cpu-max=on")), ActionsCpuMax::On);
-        assert_eq!(mode(Some("--actions-cpu-max=off")), ActionsCpuMax::Off);
-        for bad in ["", "ON", "true", "max", "1"] {
-            let arg = format!("--actions-cpu-max={bad}");
-            let err = parse(Some(&arg)).expect_err(bad);
-            assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{bad}");
-        }
     }
 
     /// Starting with a retired flag logs the warning naming it, and starting without one logs

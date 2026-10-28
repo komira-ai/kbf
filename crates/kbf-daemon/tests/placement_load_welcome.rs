@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use kbf_daemon::{Runtime, RuntimeError, Work};
 use kbf_proto::reapi::ActionResult;
-use support::Harness;
+use kbf_proto::worker::{Welcome, server_message};
+use support::{Harness, INTERVAL, Peer};
 
 /// A runtime that records what it is told and runs nothing.
 #[derive(Default)]
@@ -67,10 +68,20 @@ async fn every_welcome_tells_the_runtime_the_mode() {
         let mut peer = h.session().await;
         peer.hello().await;
         assert_eq!(told.all(), expected, "nothing is told before a Welcome");
-        peer.welcome_placement_load(sent);
+        welcome_placement_load(&peer, sent);
         peer.heartbeat().await;
         expected.push(heard);
         assert_eq!(told.all(), expected, "Welcome {sent:?}");
         peer.close();
     }
+}
+
+/// A Welcome that carries `placement_load` as given (`None`: absent).
+fn welcome_placement_load(peer: &Peer, placement_load: Option<bool>) {
+    peer.send(server_message::Message::Welcome(Welcome {
+        protocol_version: 1,
+        heartbeat_interval_ms: INTERVAL.as_millis() as u64,
+        placement_load,
+        ..Welcome::default()
+    }));
 }

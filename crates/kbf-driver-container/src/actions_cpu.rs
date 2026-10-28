@@ -73,6 +73,29 @@ impl ActionsCpu {
     }
 }
 
+impl crate::ContainerConfig {
+    /// Applies the limit a Welcome that said `placement_load` calls for, if the node has a
+    /// mode, and logs what came of it. A write that fails is logged as an error and leaves
+    /// `cpu.max` as it was.
+    pub(crate) async fn welcomed(&self, placement_load: bool) {
+        let Some(cpu) = self.actions_cpu else {
+            return;
+        };
+        match cpu
+            .apply(&self.cgroup_root, &self.cgroup_parent, placement_load)
+            .await
+        {
+            Ok(true) => tracing::info!(welcome = placement_load, "actions cpu.max: no limit"),
+            Ok(false) => tracing::info!(
+                welcome = placement_load,
+                cpus = cpu.lease_cpus,
+                "actions cpu.max: the reserve's limit"
+            ),
+            Err(e) => tracing::error!("actions cpu.max not written; it stays as it was: {e}"),
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "actions_cpu_tests.rs"]
 mod tests;

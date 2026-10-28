@@ -151,7 +151,7 @@ it does with the Welcome, at every connect and reconnect:
 | `off` | the limit of `--reserve-cpus` | the limit of `--reserve-cpus` |
 
 Until the first Welcome the limit written at start stays. A reconnect to a server in another
-mode writes the other limit. A write that fails is logged at WARN and leaves `cpu.max` as it
+mode writes the other limit. A write that fails is logged as an error and leaves `cpu.max` as it
 was. The heartbeat's `actions_cpu_limited` is read from `cpu.max`, so it reports what was
 written. The daemon refuses `on` and `off` with a driver other than `container`, and the
 value is parsed strictly (anything but the three is a usage error).

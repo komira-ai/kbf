@@ -45,7 +45,6 @@ use kbf_types::LeaseId;
 use prost_types::Timestamp;
 use tokio::sync::oneshot;
 
-use crate::actions_cpu::ActionsCpu;
 use crate::blocking_steps::{self, create_logs, make_cgroup, oom_outcome, read_start};
 use crate::cgroup::{LeaseCgroup, SwapKill, memory_max, presses_into_swap};
 use crate::cgroup_usage::{CPU_PSI, NUMA_EVERY, NumaSample, Start};
@@ -113,9 +112,8 @@ pub struct ContainerConfig {
     /// Places each lease on one NUMA node (`--lease-placement=numa-node`); `None` leaves
     /// them on any CPU the daemon may use.
     pub placer: Option<Arc<Placer>>,
-    /// How the actions cgroup's CPU limit follows each Welcome (`--actions-cpu-max`);
-    /// `None` leaves `cpu.max` as it was at start.
-    pub actions_cpu: Option<ActionsCpu>,
+    /// The actions cgroup's CPU limit per Welcome (`--actions-cpu-max`); `None`: as at start.
+    pub actions_cpu: Option<crate::ActionsCpu>,
 }
 
 /// The node's input cache as the driver is given it: not opened yet.
@@ -827,21 +825,7 @@ impl<C: Cas> Runtime for ContainerRuntime<C> {
     }
 
     async fn welcomed_placement_load(&self, on: bool) {
-        let Some(cpu) = self.config.actions_cpu else {
-            return;
-        };
-        match cpu
-            .apply(&self.config.cgroup_root, &self.config.cgroup_parent, on)
-            .await
-        {
-            Ok(true) => tracing::info!(welcome = on, "actions cpu.max: no limit"),
-            Ok(false) => tracing::info!(
-                welcome = on,
-                cpus = cpu.lease_cpus,
-                "actions cpu.max: the reserve's limit"
-            ),
-            Err(e) => tracing::error!("actions cpu.max not written; it stays as it was: {e}"),
-        }
+        self.config.welcomed(on).await;
     }
 
     async fn node_load(&self) -> Result<Option<worker::NodeLoad>, NodeLoadError> {
