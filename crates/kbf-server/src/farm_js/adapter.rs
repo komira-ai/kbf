@@ -41,6 +41,7 @@ use tokio::sync::watch;
 use tonic::Code;
 
 use super::codec::KbfRowCodec;
+use super::facts::WorkerFacts;
 use crate::action_usage::Subject;
 use crate::answer::{Detail, Pending, failed, finished_of, refused_as};
 use crate::farm::durable::{named, subject};
@@ -92,6 +93,8 @@ pub struct KbfAdapter {
     pub(super) recorded: BTreeSet<OperationId>,
     pub(super) pack_reads: BTreeMap<WorkerId, worker::PackReadCounts>,
     pub(super) pack_writes: BTreeMap<WorkerId, worker::PackWriteCounts>,
+    /// What each registered worker's newest stream said of itself ([`WorkerFacts`]).
+    pub(super) facts: BTreeMap<WorkerId, WorkerFacts>,
     /// The unreadable `done/` rows looked at, each look counted.
     unreadable_results: u64,
 }
@@ -150,6 +153,7 @@ impl KbfAdapter {
             recorded: BTreeSet::new(),
             pack_reads: BTreeMap::new(),
             pack_writes: BTreeMap::new(),
+            facts: BTreeMap::new(),
             unreadable_results: 0,
         }
     }
