@@ -571,13 +571,14 @@ impl<X: SessionExtras> Daemon<X> {
                     let now = self.core.clock.now();
                     self.core.contact.sent(seq, now);
                     self.core.window.sent(seq, now);
-                    let mut heartbeat = Heartbeat {
+                    let (pack_reads, pack_writes) = self.extras.pack_counts();
+                    let heartbeat = Heartbeat {
                         seq,
                         report_hash: self.report.hash().to_vec(),
                         running: self.core.listed().into_iter().map(proto_lease_id).collect(),
-                        ..Heartbeat::default()
+                        pack_reads,
+                        pack_writes,
                     };
-                    self.extras.heartbeat_fields(&mut heartbeat);
                     send(&tx, daemon_message::Message::Heartbeat(heartbeat));
                 }
                 Wake::Done(done) => self.core.finished(Some(&tx), *done),
@@ -623,7 +624,7 @@ impl<X: SessionExtras> Daemon<X> {
     /// Checks the first server message is an acceptable Welcome; returns its interval,
     /// the lease epoch it names (`None` for 0) and the Welcome itself.
     fn welcome(
-        &self,
+        &mut self,
         first: Option<ServerMessage>,
     ) -> Result<(Duration, Option<u64>, Welcome), SessionError> {
         let Some(server_message::Message::Welcome(w)) = first.and_then(|m| m.message) else {
@@ -651,6 +652,7 @@ impl<X: SessionExtras> Daemon<X> {
                 self.core.contact.fence_after()
             )));
         }
+        self.extras.welcome_checked(&w);
         Ok((interval, (w.epoch != 0).then_some(w.epoch), w))
     }
 

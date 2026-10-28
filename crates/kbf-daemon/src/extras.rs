@@ -6,7 +6,9 @@
 use std::future::Future;
 
 use futures::channel::mpsc::UnboundedSender;
-use kbf_proto::worker::{DaemonMessage, Heartbeat, NodeStatus, Welcome, server_message};
+use kbf_proto::worker::{
+    DaemonMessage, NodeStatus, PackReadCounts, PackWriteCounts, Welcome, server_message,
+};
 use kbf_types::NodePhase;
 
 use crate::core::LeaseCore;
@@ -29,16 +31,22 @@ pub enum ExtraWake {
 /// The hooks of the session loop a node answers. Each is called from the loop at the
 /// place its name says; none may block.
 pub trait SessionExtras: Send {
-    /// The server's Welcome of a new stream was accepted: take what it carries for the
-    /// node (the map, whether the frontend takes pack commits).
+    /// The server's Welcome of a new stream passed the version and interval checks;
+    /// called before the stream counts as welcomed (before contact, the start window,
+    /// the fence recheck and the epoch change), so the node takes from it what must be
+    /// in place first (whether the frontend takes pack commits).
+    fn welcome_checked(&mut self, welcome: &Welcome);
+
+    /// The Welcome of a new stream was taken, after the epoch change: take what else it
+    /// carries for the node (the map).
     fn on_welcome(&mut self, welcome: Welcome);
 
     /// A server message arrived; returns whether the node took it (the loop then does
     /// nothing with it).
     fn on_server_message(&mut self, message: &server_message::Message) -> bool;
 
-    /// Sets what a Heartbeat carries beyond the lease protocol's fields.
-    fn heartbeat_fields(&self, heartbeat: &mut Heartbeat);
+    /// The pack read and write counts a Heartbeat carries, as they stand now.
+    fn pack_counts(&self) -> (Option<PackReadCounts>, Option<PackWriteCounts>);
 
     /// The `NodeStatus` this node sends now, for the node report `report`.
     fn node_status(&self, report: &NodeReport) -> NodeStatus;
@@ -71,18 +79,24 @@ pub trait SessionExtras: Send {
 }
 
 /// A node with nothing but leases: no map, no counters, no driver report, no phase of its
-/// own and no backstop.
+/// own and no backstop. Its `NodeStatus` is empty: the status a kbf node sends (software,
+/// Xcodes, the daemon's build) is kbf-specific, built from [`crate::status::Software`] and
+/// the build's commit.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoExtras;
 
 impl SessionExtras for NoExtras {
+    fn welcome_checked(&mut self, _: &Welcome) {}
+
     fn on_welcome(&mut self, _: Welcome) {}
 
     fn on_server_message(&mut self, _: &server_message::Message) -> bool {
         false
     }
 
-    fn heartbeat_fields(&self, _: &mut Heartbeat) {}
+    fn pack_counts(&self) -> (Option<PackReadCounts>, Option<PackWriteCounts>) {
+        (None, None)
+    }
 
     fn node_status(&self, _: &NodeReport) -> NodeStatus {
         NodeStatus::default()

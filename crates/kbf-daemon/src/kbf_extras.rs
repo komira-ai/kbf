@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use futures::channel::mpsc::UnboundedSender;
 use kbf_proto::worker::{
-    self, DaemonMessage, Heartbeat, NodeStatus, PackWriteCounts, Welcome, daemon_message,
+    self, DaemonMessage, NodeStatus, PackReadCounts, PackWriteCounts, Welcome, daemon_message,
     server_message,
 };
 use kbf_types::NodePhase;
@@ -98,10 +98,13 @@ impl KbfExtras {
 }
 
 impl SessionExtras for KbfExtras {
-    fn on_welcome(&mut self, welcome: Welcome) {
+    fn welcome_checked(&mut self, welcome: &Welcome) {
         if let Some(commit) = &self.pack_commit {
             commit.welcomed(welcome.pack_commit);
         }
+    }
+
+    fn on_welcome(&mut self, welcome: Welcome) {
         self.new_map_stream(welcome.map);
     }
 
@@ -115,9 +118,11 @@ impl SessionExtras for KbfExtras {
         true
     }
 
-    fn heartbeat_fields(&self, heartbeat: &mut Heartbeat) {
-        heartbeat.pack_reads = self.pack_reads.as_ref().map(|c| c.stats().into());
-        heartbeat.pack_writes = self.pack_writes_counted();
+    fn pack_counts(&self) -> (Option<PackReadCounts>, Option<PackWriteCounts>) {
+        (
+            self.pack_reads.as_ref().map(|c| c.stats().into()),
+            self.pack_writes_counted(),
+        )
     }
 
     /// The `NodeStatus` this node sends now: its software, every Xcode the driver's
