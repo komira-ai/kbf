@@ -1,7 +1,12 @@
 use kbf_front::Cache;
+use kbf_proto::worker::ResultAckReason as Reason;
+use kbf_types::{Failure, Outcome};
 use std::sync::Arc;
+use tonic::Code;
 
+use super::report::{Report, Taken, failed, unrun};
 use super::*;
+use crate::fault;
 
 /// Catches a server process that reuses an earlier process's term (issue #137:
 /// every process granted leases from `(1, 0)`), and one whose term does not order

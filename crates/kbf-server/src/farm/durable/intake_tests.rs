@@ -201,7 +201,7 @@ async fn an_operation_another_frontend_took_leaves_the_scheduler_and_its_callers
     tokio::time::advance(kbf_sched::FINISHED_RETENTION + Duration::from_secs(1)).await;
     farm.intake();
     assert_eq!(
-        farm.lock().machine.waiter_ids().count(),
+        farm.lock().side.machine.waiter_ids().count(),
         0,
         "the callers were kept for ever"
     );

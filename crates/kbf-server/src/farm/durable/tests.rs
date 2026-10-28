@@ -2025,7 +2025,7 @@ fn farm_with_a_kill(store: &Arc<Flaky>) -> (Farm, kbf_estimator::Key) {
             .expect("grant");
     }
     let mut state = farm.lock();
-    state.learned.on_start(&start(4, 0));
+    state.side.learned.on_start(&start(4, 0));
     let mut run = kbf_estimator::Run {
         outcome: kbf_estimator::Outcome::OwnLimitKill,
         wall_us: 0,
@@ -2038,7 +2038,7 @@ fn farm_with_a_kill(store: &Arc<Flaky>) -> (Farm, kbf_estimator::Key) {
         node_cpu_pressure_permille: None,
     };
     run.peak_memory_bytes = Some(5 << 30);
-    state.learned.stage(
+    state.side.learned.stage(
         LeaseId::new(5, 0),
         Some(crate::learned::Attempt {
             key: key.clone(),
@@ -2094,6 +2094,7 @@ fn a_store_that_refuses_the_size_rows_still_settles_the_requeue() {
     store.refuse_est.store(false, Ordering::SeqCst);
     let mut state = farm.lock();
     state
+        .side
         .learned
         .clock(kbf_types::FarmTime::from_millis(10_000));
     state.flush_learned();
@@ -2133,7 +2134,7 @@ fn a_requeue_that_is_no_kill_writes_nothing_and_forgets_the_booking() {
     farm.lock().settle_requeues(&[requeue(4, 0)]);
     assert!(store.scan_prefix("est/").expect("scan").is_empty());
     assert_eq!(
-        farm.lock().learned.booking(LeaseId::new(5, 0)),
+        farm.lock().side.learned.booking(LeaseId::new(5, 0)),
         Err(crate::learned::Skip::NoBooking)
     );
 }
@@ -2299,10 +2300,10 @@ async fn off_leaves_the_size_rows_alone_and_shadow_takes_them_up() {
     store.fail_est_scan.store(true, Ordering::SeqCst);
 
     let off = farm_over(&store, crate::LearnedSizes::Off);
-    assert!(off.lock().learned.summaries().is_empty());
-    assert_eq!(off.lock().learned.calls(), 0);
+    assert!(off.lock().side.learned.summaries().is_empty());
+    assert_eq!(off.lock().side.learned.calls(), 0);
     // Hours of ticks, with something to write behind: no write-behind, no sweep.
-    off.lock().learned.observe(
+    off.lock().side.learned.observe(
         &crate::learned::Attempt {
             key: fresh.clone(),
             run: kill,
@@ -2323,7 +2324,7 @@ async fn off_leaves_the_size_rows_alone_and_shadow_takes_them_up() {
     drop(off);
 
     let shadow = farm_over(&store, crate::LearnedSizes::Shadow);
-    assert!(shadow.lock().learned.summaries().get(&fresh).is_some());
+    assert!(shadow.lock().side.learned.summaries().get(&fresh).is_some());
     assert!(store.est_scans.load(Ordering::SeqCst) >= 1);
 }
 
@@ -2355,7 +2356,7 @@ async fn shadow_writes_behind_and_sweeps_when_ticks_come() {
         },
     };
     let bounds = kbf_estimator::Bounds::default();
-    farm.lock().learned.observe(&attempt, &bounds);
+    farm.lock().side.learned.observe(&attempt, &bounds);
     farm.tick().await;
     assert_eq!(
         store.scan_prefix("est/").expect("scan").len(),
@@ -2476,11 +2477,12 @@ fn a_fenced_refusal_of_size_rows_ends_the_writing() {
     // Later ticks send nothing, and nothing is waiting to be written.
     let mut state = farm.lock();
     state
+        .side
         .learned
         .clock(kbf_types::FarmTime::from_millis(60_000));
     state.flush_learned();
     state.write_estimates(std::slice::from_ref(&row));
-    assert!(state.learned.due().is_empty());
+    assert!(state.side.learned.due().is_empty());
     drop(state);
     assert_eq!(store.est_writes.load(Ordering::SeqCst), 1);
 }
