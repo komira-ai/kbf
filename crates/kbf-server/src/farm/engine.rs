@@ -116,7 +116,7 @@ pub(in crate::farm) trait Adapter {
     /// channels someone still watches and which have not been shown a result.
     fn watched(&mut self) -> Vec<OperationId>;
     /// Shows `stage` on the channel of the watched `operation`.
-    fn show_watched(&mut self, operation: OperationId, stage: Stage);
+    fn show_watched(&mut self, operation: OperationId, stage: &Stage);
 }
 
 /// The scheduler, the state store, and the bookkeeping between them.

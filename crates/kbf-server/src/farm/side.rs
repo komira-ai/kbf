@@ -487,9 +487,11 @@ impl Adapter for Side {
             .collect()
     }
 
-    fn show_watched(&mut self, operation: OperationId, stage: Stage) {
-        if let Some(channel) = self.watched.get(&operation) {
-            show(channel, stage);
-        }
+    fn show_watched(&mut self, operation: OperationId, stage: &Stage) {
+        // The engine asks only about operations `watched` just listed.
+        let channel = self.watched.get(&operation);
+        channel
+            .into_iter()
+            .for_each(|channel| show(channel, stage.clone()));
     }
 }

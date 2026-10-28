@@ -87,7 +87,7 @@ impl Engine {
                 Ok(())
             });
             if let Some(stage) = looked.and_then(|progress| progress.stage()) {
-                a.show_watched(operation, stage);
+                a.show_watched(operation, &stage);
             }
         }
     }
