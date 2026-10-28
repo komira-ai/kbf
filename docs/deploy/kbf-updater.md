@@ -395,6 +395,14 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    event_names = ["workflow_run"]
    ```
 
+   `kbf-oidc` also reads several `[[remote_operator]]` entries (never mixed with the single
+   table), one per repository and workflow that may call. An entry's `services = [...]` (default
+   `["kbf"]`) lists the services a token it admits may set, and a token never gets another
+   entry's services. Entries must name the same issuer, and two entries may not share a
+   `repository_id` and a `job_workflow_ref`; such a file is refused at load. A coordinator reads
+   the list form only once it loads the file with `kbf_oidc::AllowList`; one that still uses
+   `OidcConfig` accepts the single table only.
+
    `event_names` must name `workflow_run`: the release workflow is started by the completion of
    the pipeline, and its tokens say so (the default list is `push` and `workflow_dispatch`).
    The `sha` of the token is the head of `main`, not the commit released. A token is good for one
