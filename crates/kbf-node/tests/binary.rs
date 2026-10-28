@@ -973,11 +973,15 @@ fn a_container_node_given_its_actions_cgroup_writes_only_its_cap() {
         format!("--id-files={}", ids.display()),
         "--cgroup-parent=/kbf.slice/kbf-daemon.service/actions".to_owned(),
         "--actions-memory-max-gib=2".to_owned(),
+        // Taken by a container node; with no Welcome yet, the start's limit stands.
+        "--actions-cpu-max=on".to_owned(),
     ]);
     let bin = container_bin("adopted-bin");
     let status = runs_until_sigterm_with_path("adopted", &flags, Some(&bin));
     assert!(status.success(), "{status}");
     assert_eq!(read(&actions.join("memory.max")), "2147483648");
+    assert!(read(&actions.join("cpu.max")).ends_with(" 100000"));
+    assert!(!read(&actions.join("cpu.max")).starts_with("max"));
     assert!(!unit.join("supervisor").exists());
     assert!(!unit.join("cgroup.subtree_control").exists());
 }
