@@ -20,6 +20,7 @@ impl Farm {
         stream: StreamId,
         counts: Option<PackReadCounts>,
     ) {
+        js_arm!(self, views::note_pack_reads(worker, stream, counts));
         let mut state = self.lock();
         if !state.side.is_current(worker, stream) {
             return;
@@ -33,6 +34,7 @@ impl Farm {
     /// The newest pack-read counts of every node that sent any, in node-id order.
     #[must_use]
     pub fn pack_reads(&self) -> Vec<(WorkerId, PackReadCounts)> {
+        js_arm!(self, views::pack_reads());
         let state = self.lock();
         state
             .side
