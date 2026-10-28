@@ -616,11 +616,13 @@ async fn a_refused_reading_feeds_nothing_and_counts_its_minutes() {
         ("a clock that went back", three(6, 9 * SECOND)),
     ];
     for (n, (why, load)) in refused.iter().enumerate() {
-        assert!(
-            farm.note_node_load(&a, stream, Some(load)).is_none(),
-            "{why}"
-        );
-        assert!(beat(&farm, &a, stream, 2 + n as u64, load).await, "{why}");
+        let fed = farm.note_node_load(&a, stream, Some(load));
+        assert!(fed.is_none(), "{why}");
+        let seq = 2 + n as u64;
+        let acked = farm
+            .heartbeat_with_load(&a, stream, seq, Vec::new(), fed)
+            .await;
+        assert!(acked, "{why}");
     }
     assert_eq!(
         accepted(&farm),
