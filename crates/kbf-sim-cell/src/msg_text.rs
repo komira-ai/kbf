@@ -6,15 +6,13 @@ use kbf_types::Digest;
 
 use crate::{Body, Msg};
 
-/// A content digest: `sha256:<64 hex>:<size>`.
+/// A content digest: `sha256:<64 hex>:<size>`. The function's name comes from
+/// [`kbf_types::DigestFunction::name`], whose match has no wildcard, so a second hash
+/// function gets a name where it is defined.
 fn spell_digest(digest: &Digest) -> String {
-    // Indexed by the function's discriminant. A second hash function is a new entry
-    // here: until it is added, spelling a digest of it panics, which a test notices,
-    // instead of printing it under a wrong name.
-    const FUNCTIONS: [&str; 1] = ["sha256"];
     format!(
         "{}:{}:{}",
-        FUNCTIONS[digest.function as usize],
+        digest.function.name(),
         digest.hash_hex(),
         digest.size_bytes
     )

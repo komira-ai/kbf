@@ -67,10 +67,9 @@ impl Durable {
         let Some(row) = self.store.get(&key)? else {
             return Ok(txn);
         };
-        let request = request_row(&key, &row)?;
+        let request = self.request_row(&key, &row)?;
         let action = action_of_request(&key, &request)?;
-        let (row, ttl) = (encode(&action), ending.ttl());
-        Ok(txn.put_ttl(doneof_key(operation), row, ttl, Cond::Any))
+        Ok(self.ext.ended(txn, operation, &action, ending.ttl()))
     }
 
     /// The action `operation` runs or ran, and where it stands, for a client that asks for it
@@ -101,14 +100,9 @@ impl Durable {
     fn action_of(&self, operation: OperationId) -> Result<Option<ActionKey>, StateError> {
         let unfinished = op_key(operation);
         if let Some(row) = self.store.get(&unfinished)? {
-            let request = request_row(&unfinished, &row)?;
+            let request = self.request_row(&unfinished, &row)?;
             return action_of_request(&unfinished, &request).map(Some);
         }
-        let key = doneof_key(operation);
-        let Some(row) = self.store.get(&key)? else {
-            return Ok(None);
-        };
-        let decoded = decode(&row.value);
-        decoded.map(Some).map_err(|why| corrupt(&key, why))
+        self.ext.action_of(&*self.store, operation)
     }
 }

@@ -57,7 +57,7 @@ impl Durable {
         if let Some(row) = self.store.get(&index)? {
             let key = lease_key(indexed_lease(&index, &row)?);
             if let Some(held) = self.store.get(&key)? {
-                let grant = lease_row(&key, &held)?;
+                let grant = self.lease_row(&key, &held)?;
                 if grant.operation == operation {
                     return Ok(Some(grant));
                 }
@@ -70,7 +70,7 @@ impl Durable {
     fn scan_lease_of(&self, operation: OperationId) -> Result<Option<LeaseGrant>, StateError> {
         let mut lease = None;
         for (key, row) in self.scan_known(LEASE)? {
-            let grant = lease_row(&key, &row)?;
+            let grant = self.lease_row(&key, &row)?;
             if grant.operation == operation {
                 lease = Some(grant);
             }
@@ -86,7 +86,7 @@ impl Durable {
     pub(super) fn held_by(&self, worker: &WorkerId) -> Result<Vec<StoredOperation>, StateError> {
         let mut held = Vec::new();
         for (key, row) in self.scan_known(LEASE)? {
-            let grant = lease_row(&key, &row)?;
+            let grant = self.lease_row(&key, &row)?;
             if grant.worker != *worker {
                 continue;
             }

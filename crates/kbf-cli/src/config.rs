@@ -111,6 +111,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "pack-index",
             "progress-interval-secs",
             "readyz-store-timeout-ms",
+            "scheduler-core",
             "state-store",
             "state-store-wait-secs",
             "unservable-wait-secs",
