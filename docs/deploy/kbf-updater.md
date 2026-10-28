@@ -156,7 +156,7 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
                   (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
                   [--frontend <dns name>:<port>] [--enroll-frontend <dns name>:<port>]
                   [--operator-api http://IP:PORT --token-file FILE] [--helper-socket PATH]
-                  [--service NAME[,SETTING=VALUE...]]...
+                  [--service NAME,helper-socket=PATH[,SETTING=VALUE...]]...
                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
                   [--health-poll-secs N] [--retry-secs N]
 ```
@@ -196,7 +196,7 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
 - `--operator-api`, `--token-file`: optional, together: the full
   operator token over the frontend's loopback, an opt-in fallback used instead of the
   certificate; see the boundary below.
-- `--service NAME[,SETTING=VALUE...]`: a service the host runs besides `kbf`, given once for
+- `--service NAME,helper-socket=PATH[,SETTING=VALUE...]`: a service the host runs besides `kbf`, given once for
   each; see [Services besides kbf](#services-besides-kbf). Without it the agent is a
   `kbf`-only agent.
 - Times, in seconds, 1 to 86400: `--heartbeat-secs` 15, `--drain-deadline-secs` 600,
@@ -282,7 +282,7 @@ by commas, each at most once:
 | setting | meaning | default |
 |---|---|---|
 | `channel=C` | the channel of the helper's allowlist that holds the service's releases | `NAME` (it must be a channel name) |
-| `helper-socket=PATH` | the socket of the helper that installs it (absolute path) | `--helper-socket` |
+| `helper-socket=PATH` | the socket of the helper that installs it (absolute path); required, and never the agent's `--helper-socket`, whose helper installs `kbf` (an install request names no service, so it would install `kbf` at the service's version) | none: required |
 | `drain=node` or `drain=none` | `node`: the host's node is drained and given back through the frontend, as for `kbf`; `none`: nothing is drained, and no drain call is made | `node` |
 | `ready-url=http://IP:PORT/PATH` | health is `GET PATH` on that loopback address answering 2xx (the path is `/` if there is none) | the node's health through the frontend, as for `kbf` |
 

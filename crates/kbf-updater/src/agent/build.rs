@@ -275,7 +275,7 @@ pub fn build(cfg: &Config) -> Result<Agent, String> {
     .with_services(services))
 }
 
-/// The ports of `service`: its own helper socket (the agent's if it gave none), the node's drain
+/// The ports of `service`: its own helper socket, the node's drain
 /// unless it declared none, and the node's health unless it declared a readiness URL. The
 /// frontend is needed only for what the service did not replace.
 pub(super) fn service_ports(
@@ -284,8 +284,7 @@ pub(super) fn service_ports(
     host: &Host,
     service: &ServiceConfig,
 ) -> Result<ServicePorts, String> {
-    let socket = service.helper_socket.as_ref().unwrap_or(&cfg.helper_socket);
-    let local = Arc::new(SocketLocal::new(socket, Limits::default()));
+    let local = Arc::new(SocketLocal::new(&service.helper_socket, Limits::default()));
     let node = || node_ports(cfg, identity, host.role, &local);
     let drain = match service.drain {
         ServiceDrain::None => no_drain(),

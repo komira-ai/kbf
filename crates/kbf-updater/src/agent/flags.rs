@@ -6,7 +6,7 @@
 //!                   (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE)
 //!                   [--frontend <dns name>:<port>] [--enroll-frontend <dns name>:<port>]
 //!                   [--operator-api http://IP:PORT --token-file FILE] [--daemon-node NODE_ID]
-//!                   [--helper-socket PATH] [--service NAME[,SETTING=VALUE...]]...
+//!                   [--helper-socket PATH] [--service NAME,helper-socket=PATH[,SETTING=VALUE...]]...
 //!                   [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N]
 //!                   [--health-poll-secs N] [--retry-secs N]
 //! ```
@@ -43,10 +43,12 @@
 //!   instead of the updater's certificate for those calls. Without either way (no `--frontend`
 //!   and no token) the agent heartbeats and refuses every update order, before it fetches
 //!   anything. The packaged units give no token.
-//! - `--service NAME[,channel=C][,helper-socket=PATH][,drain=node|none][,ready-url=URL]`, as
+//! - `--service NAME,helper-socket=PATH[,channel=C][,drain=node|none][,ready-url=URL]`, as
 //!   many times as the host runs services besides `kbf`: the agent lists each in its heartbeat
-//!   and runs an order that names it with the service's own ports ([`ServiceConfig`]). Without
-//!   the flag the agent is a `kbf`-only agent, as before.
+//!   and runs an order that names it with the service's own ports ([`ServiceConfig`]). Each
+//!   names its own helper, which may not be the agent's `--helper-socket`: an install request
+//!   names no service, so the agent's helper would install `kbf` at the service's version.
+//!   Without the flag the agent is a `kbf`-only agent, as before.
 //! - Times, in seconds: `--heartbeat-secs` (default 15), `--drain-deadline-secs` (600, how long
 //!   the node's leases are waited for), `--health-timeout-secs` (300, how long the release on
 //!   trial has to show healthy), `--health-poll-secs` (5) and `--retry-secs` (900, how long a
@@ -69,7 +71,7 @@ pub const USAGE: &str = "usage: kbf-updater agent --coordinator DNSNAME:PORT --c
 (--state-dir DIR | --client-cert FILE --client-key FILE --ca FILE) [--frontend DNSNAME:PORT] \
 [--enroll-frontend DNSNAME:PORT] \
 [--operator-api http://IP:PORT --token-file FILE] \
-[--daemon-node NODE_ID] [--helper-socket PATH] [--service NAME[,SETTING=VALUE...]]... [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N] \
+[--daemon-node NODE_ID] [--helper-socket PATH] [--service NAME,helper-socket=PATH[,SETTING=VALUE...]]... [--heartbeat-secs N] [--drain-deadline-secs N] [--health-timeout-secs N] \
 [--health-poll-secs N] [--retry-secs N]\n";
 
 const FLAGS: [&str; 17] = [
@@ -175,8 +177,8 @@ pub struct ServiceConfig {
     pub name: String,
     /// The channel of the helper's allowlist that holds the service's releases.
     pub channel: String,
-    /// The helper that installs it, if not the agent's `--helper-socket`.
-    pub helper_socket: Option<PathBuf>,
+    /// The helper that installs it: its own, never the agent's `--helper-socket`.
+    pub helper_socket: PathBuf,
     pub drain: ServiceDrain,
     pub health: ServiceHealth,
 }
@@ -292,6 +294,13 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
     let helper_socket = found
         .remove("--helper-socket")
         .map_or_else(|| PathBuf::from(DEFAULT_HELPER_SOCKET), PathBuf::from);
+    if let Some(service) = services.iter().find(|s| s.helper_socket == helper_socket) {
+        return Err(format!(
+            "--service {}: helper-socket is the agent's --helper-socket, whose helper installs \
+             kbf; give the service its own",
+            service.name
+        ));
+    }
     let mut timing = Timing::DEFAULT;
     for (flag, slot) in [
         ("--heartbeat-secs", &mut timing.heartbeat),
@@ -378,8 +387,10 @@ fn parse_service(value: &str) -> Result<ServiceConfig, String> {
              give one with channel="
         ));
     }
-    let helper_socket = take("helper-socket").map(PathBuf::from);
-    if helper_socket.as_deref().is_some_and(|p| !p.is_absolute()) {
+    let helper_socket = PathBuf::from(take("helper-socket").ok_or_else(|| {
+        format!("--service {name}: helper-socket= is required, the socket of its own helper")
+    })?);
+    if !helper_socket.is_absolute() {
         return Err(format!(
             "--service {name}: helper-socket must be an absolute path"
         ));

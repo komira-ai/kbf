@@ -366,17 +366,17 @@ fn a_frontend_hosts_agent_drains_a_node_only_when_the_host_runs_a_daemon() {
 /// A service's ports are what its settings say: with a node drain and node health it drains and
 /// judges through the frontend as `kbf` does (here: an API nobody answers, so every call fails);
 /// with no drain its drain does nothing and cannot fail; with a readiness URL its health is that
-/// URL's. Its helper is its own socket if it gave one, else the agent's.
+/// URL's.
 #[test]
 fn a_services_ports_follow_its_settings() {
     let rig = Rig::new("bd-service-ports", HostRole::Daemon);
     let identity = identity_of_files(&rig.config.files).unwrap();
     let h = host(Role::Daemon);
     let target = Version::parse("0.1.7+gbbbbbbbbbbbb-3").unwrap();
-    let service = |drain, health, socket: Option<&str>| ServiceConfig {
+    let service = |drain, health, socket: &str| ServiceConfig {
         name: "db".to_owned(),
         channel: "db-ch".to_owned(),
-        helper_socket: socket.map(Into::into),
+        helper_socket: socket.into(),
         drain,
         health,
     };
@@ -385,7 +385,7 @@ fn a_services_ports_follow_its_settings() {
         &rig.config,
         &identity,
         &h,
-        &service(ServiceDrain::Node, ServiceHealth::Node, None),
+        &service(ServiceDrain::Node, ServiceHealth::Node, "/run/db.sock"),
     )
     .unwrap();
     assert_eq!((node.name.as_str(), node.channel.as_str()), ("db", "db-ch"));
@@ -411,7 +411,7 @@ fn a_services_ports_follow_its_settings() {
                 addr,
                 path: "/readyz".to_owned(),
             },
-            Some("/run/db.sock"),
+            "/run/db.sock",
         ),
     )
     .unwrap();
@@ -428,6 +428,10 @@ fn a_services_ports_follow_its_settings() {
 
     // The agent with services is built from the same flags.
     let mut config = rig.config.clone();
-    config.services = vec![service(ServiceDrain::None, ServiceHealth::Node, None)];
+    config.services = vec![service(
+        ServiceDrain::None,
+        ServiceHealth::Node,
+        "/run/db.sock",
+    )];
     assert!(build(&config).is_ok());
 }
