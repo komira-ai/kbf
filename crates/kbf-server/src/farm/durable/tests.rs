@@ -293,6 +293,7 @@ fn a_submitted_operation_is_loaded_queued() {
                 fate: None,
                 subject: Some(a_subject()),
                 size_key: None,
+                max_wall: None,
             }],
             floors: Vec::new(),
             key_floors: Vec::new(),
@@ -1697,7 +1698,7 @@ fn a_key_floor_is_written_with_the_requeue_and_forgotten_with_its_eviction() {
     let store = Flaky::new();
     let durable = open(&store);
     durable
-        .submitted_keyed(OperationId(1), &request(1), &a_subject(), Some(7))
+        .submitted_keyed(OperationId(1), &request(1), &a_subject(), Some(7), None)
         .expect("submit");
     durable
         .persist(&[Effect::Start(start(1, 10))], None)
@@ -1763,7 +1764,7 @@ fn a_size_key_is_a_row_of_its_own_written_with_the_submission_and_gone_with_the_
         .submitted(OperationId(1), &request(1), &a_subject())
         .expect("submit");
     durable
-        .submitted_keyed(OperationId(2), &request(1), &a_subject(), Some(7))
+        .submitted_keyed(OperationId(2), &request(1), &a_subject(), Some(7), None)
         .expect("submit");
     let opkeys: Vec<String> = keys(&store)
         .into_iter()
@@ -1822,7 +1823,7 @@ fn a_store_with_size_key_rows_reads_as_it_did_without_them() {
     let store = Flaky::new();
     let durable = open(&store);
     durable
-        .submitted_keyed(OperationId(1), &request(1), &a_subject(), Some(7))
+        .submitted_keyed(OperationId(1), &request(1), &a_subject(), Some(7), None)
         .expect("submit");
     durable
         .persist(&[Effect::Start(start(1, 10))], None)
@@ -2570,4 +2571,90 @@ fn a_summary_name_that_does_not_fit_is_left_out_of_the_row() {
     let stored = durable.load().expect("the row reads back");
     assert_eq!(stored.key_floors, vec![a_key_floor(7, 0)]);
     assert!(stored.key_names.is_empty());
+}
+
+/// Catches a wall time written apart from the submission (an operation without its wall
+/// row after a crash between them), one written for an operation that has none, one that
+/// does not come back with its operation from a load or from the look at a twin, and one
+/// that outlives the operation. A store with no `opwall/` row at all, as an earlier
+/// release wrote it, loads every operation with none.
+#[test]
+fn a_wall_time_lives_and_dies_with_its_operation() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    let wall = Duration::new(90, 500_000_000);
+    durable
+        .submitted(OperationId(1), &request(1), &a_subject())
+        .expect("submit");
+    durable
+        .submit_keyed(OperationId(2), &request(2), &a_subject(), None, Some(wall))
+        .expect("submit");
+    let walls: Vec<String> = keys(&store)
+        .into_iter()
+        .filter(|k| k.starts_with("opwall/"))
+        .collect();
+    assert_eq!(walls, ["opwall/0000000000000002"]);
+    let found: Vec<_> = durable
+        .load()
+        .expect("load")
+        .operations
+        .iter()
+        .map(|o| o.max_wall)
+        .collect();
+    assert_eq!(found, [None, Some(wall)]);
+
+    // A request for the action joins the operation, which brings its wall time with it.
+    let joined = durable
+        .submit_keyed(OperationId(3), &request(2), &a_subject(), None, None)
+        .expect("submit");
+    let Submitted::Joined(twin) = joined else {
+        panic!("not joined: {joined:?}");
+    };
+    assert_eq!(twin.max_wall, Some(wall));
+
+    durable
+        .persist(&[Effect::Start(start(2, 20))], None)
+        .expect("grant");
+    durable
+        .persist(&[Effect::Answer(answer(2, 20))], Some(&ended()))
+        .expect("finished");
+    assert!(!keys(&store).iter().any(|k| k.starts_with("opwall/")));
+}
+
+/// Catches a wall time row read as anything but what was written: another version, a row
+/// cut short or with bytes after it, nanoseconds past a second, a name that is not an
+/// operation id; and a row whose bytes moved (a store written by this release is read by
+/// the next).
+#[test]
+fn an_opwall_row_that_is_not_one_is_refused() {
+    let row = opwall::encode(Duration::new(0x0102, 0x0304_0506));
+    assert_eq!(
+        row,
+        [1, 0, 0, 0, 0, 0, 0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06]
+    );
+    assert_eq!(opwall::decode(&row), Ok(Duration::new(0x0102, 0x0304_0506)));
+    assert_eq!(
+        opwall::decode(&opwall::encode(Duration::ZERO)),
+        Ok(Duration::ZERO)
+    );
+    let mut other = row.clone();
+    other[0] = 2;
+    assert!(opwall::decode(&other).is_err());
+    for cut in 0..row.len() {
+        assert!(opwall::decode(&row[..cut]).is_err(), "{cut}");
+    }
+    let mut longer = row.clone();
+    longer.push(0);
+    assert!(opwall::decode(&longer).is_err());
+    let mut over = row.clone();
+    over[9..].copy_from_slice(&1_000_000_000_u32.to_be_bytes());
+    assert!(opwall::decode(&over).is_err());
+
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted(OperationId(1), &request(1), &a_subject())
+        .expect("submit");
+    put(&store, "opwall/not-an-id", row);
+    assert!(durable.load().is_err());
 }
