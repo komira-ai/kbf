@@ -173,7 +173,7 @@ pub(super) async fn a_refusal_loses_to_a_grant_made_by_another_frontend(backing:
     wait_out_the_unservable_wait().await;
     first.tick().await;
 
-    assert_eq!(first.dropped_writes(), 1, "the refusal was written");
+    assert_eq!(first.lost_races(), 1, "the refusal was written");
     assert_eq!((disk.rows("op/"), disk.rows("lease/")), (1, 1));
     assert_eq!(disk.rows("done/"), 0);
     assert!(finished_by(&second, &node_b, lease).await);

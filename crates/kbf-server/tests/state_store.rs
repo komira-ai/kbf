@@ -48,6 +48,8 @@ mod floors;
 mod handover;
 #[path = "state_store/intake.rs"]
 mod intake;
+#[path = "state_store/lost_race.rs"]
+mod lost_race;
 #[path = "state_store/owner.rs"]
 mod owner;
 #[path = "state_store/result_ack.rs"]
@@ -1854,7 +1856,7 @@ async fn a_stale_record_in_the_feed_does_not_drop_a_written_answers_detail() {
     };
     assert_eq!(status.code, Code::InvalidArgument as i32);
     assert_eq!(status.message, "test", "the report's detail was dropped");
-    assert!(farm.dropped_writes() >= 1, "the grant was not refused");
+    assert!(farm.lost_races() >= 1, "the grant was not refused");
     let row = farm.ended(OperationId(0)).expect("read").expect("a row");
     assert_eq!(row, Finished::Failed(status), "the row is what was sent");
 }
@@ -2017,7 +2019,7 @@ async fn a_stale_refusal_of_a_never_tried_effect_drops_it() {
         !matches!(*ticket.stage.borrow(), Stage::Done(_)),
         "a stale answer that was never written was delivered"
     );
-    assert!(farm.dropped_writes() >= 1);
+    assert!(farm.lost_races() >= 1);
     drop(starts(&mut inbox));
 }
 
