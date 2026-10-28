@@ -107,7 +107,9 @@ fn every_outcome_has_its_own_word() {
         size_bytes: 0,
     };
     let words = [
-        outcome(Outcome::Completed { action_result }),
+        outcome(Outcome::Completed {
+            action_result: action_result.into(),
+        }),
         outcome(Outcome::Failed(Failure::Timeout)),
         outcome(Outcome::Failed(Failure::Infra)),
         outcome(Outcome::Failed(Failure::Invalid)),

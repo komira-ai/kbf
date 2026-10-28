@@ -328,7 +328,7 @@ impl World {
                     [usize::try_from(id.0 % 3).expect("small")]
                 .clone();
                 let request = Request {
-                    key: kbf_sim::work_key("main", digest(id.0)),
+                    key: kbf_types::work_key("main", digest(id.0)),
                     qos,
                     kind: kbf_types::LeaseKind::Action,
                     resources: Resources::new(cpu, mem),
@@ -420,7 +420,7 @@ impl World {
                 operation,
                 lease,
                 outcome: Outcome::Completed {
-                    action_result: outcome_of(lease),
+                    action_result: outcome_of(lease).into(),
                 },
             });
         }

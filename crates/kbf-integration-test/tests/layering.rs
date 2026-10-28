@@ -10,7 +10,7 @@
 //!   crate (tokio, tonic, hyper, reqwest, the rand family, getrandom, mio, socket2);
 //! - a pure crate that depends on a kbf crate outside the pure set;
 //! - a pure crate that reaches a crate taken from a git repository other than the ones
-//!   listed in `PURE_GIT_CRATES` (today `js-sizing`, which `kbf-estimator` re-exports);
+//!   listed in `PURE_GIT_CRATES` (today `js-sizing` and `js-caps`, which `kbf-estimator` and `kbf-caps` re-export);
 //! - a pure crate whose `lib.rs` no longer denies the `clippy.toml` lists, which would
 //!   silently switch off the clock, sleep, network and `HashMap` checks for it;
 //! - a pure crate renamed or removed, which would otherwise make every check above
@@ -72,9 +72,9 @@
 //!   the check reads the tree of the crate built alone, so the features that its own tests
 //!   turn on do not count); and a walk that cannot see its dependencies, which would make
 //!   that check pass vacuously;
-//! - the state store (`kbf-state`) depending on any other crate of this workspace (with its
-//!   test-database feature, on any but `kbf-testkit`), which would stop it from being
-//!   extracted, and the pack index (`kbf-pack-index`) depending on any but the state store;
+//! - the state store (`kbf-state`, a re-export of `js-state`) depending on any other crate of
+//!   this workspace (with its test-database feature too, which brings `js-testkit` and not
+//!   `kbf-testkit`), which would stop it from being extracted, and the pack index (`kbf-pack-index`) depending on any but the state store;
 //!   each with a walk that cannot see what it should, which would make the check vacuous.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -120,12 +120,19 @@ const DENY_ATTR: &str = "#![deny(clippy::disallowed_methods, clippy::disallowed_
 
 /// The crates of other repositories (taken by `git` dependency, `source` beginning
 /// `git+`) that a pure crate may reach, with the one repository each may come from.
-/// `kbf-estimator` re-exports `js-sizing`, which has no dependencies of its own; a
-/// further git crate in a pure crate's tree is a decision, so it is listed here by name.
-const PURE_GIT_CRATES: &[(&str, &str)] = &[(
-    "js-sizing",
-    "git+https://github.com/komira-ai/jobscheduler?rev=",
-)];
+/// `kbf-estimator` re-exports `js-sizing`, which has no dependencies of its own, and
+/// `kbf-caps` re-exports `js-caps`, which depends only on `thiserror`; a further git
+/// crate in a pure crate's tree is a decision, so it is listed here by name.
+const PURE_GIT_CRATES: &[(&str, &str)] = &[
+    (
+        "js-caps",
+        "git+https://github.com/komira-ai/jobscheduler?rev=",
+    ),
+    (
+        "js-sizing",
+        "git+https://github.com/komira-ai/jobscheduler?rev=",
+    ),
+];
 
 struct Graph {
     /// Package id to package name.
@@ -285,7 +292,7 @@ fn pure_crates_take_git_crates_only_from_the_list() {
         "pure crates reach git crates outside PURE_GIT_CRATES:\n{}",
         violations.join("\n")
     );
-    // The list is not vacuous: kbf-estimator reaches js-sizing through its shim.
+    // The list is not vacuous: kbf-estimator and kbf-caps reach theirs through their shims.
     for (name, _) in PURE_GIT_CRATES {
         assert!(
             seen.contains(*name),
@@ -728,9 +735,10 @@ fn workspace_crates_beyond<'a>(
 }
 
 /// Asserts that the state store (`kbf-state`) links no other crate of this workspace, with
-/// the Postgres backend on, and with its test-database feature on only the test server's
-/// crate (`kbf-testkit`), and that the walk sees its dependencies (it reaches `postgres`), so
-/// the check does not pass on an empty walk. The store is generic: what is specific to a kbf
+/// the Postgres backend on, and with its test-database feature on (which brings the test
+/// server's crate, `js-testkit`, from the jobscheduler repository, and not `kbf-testkit`),
+/// and that the walk sees its dependencies (it reaches `postgres`), so the check does not
+/// pass on an empty walk. The store is generic: what is specific to a kbf
 /// build (the pack index, `kbf-pack-index`) depends on it and never the other way, which is
 /// what lets the store be extracted. Like the `tierstore` check, it reads the tree of the
 /// crate built alone.
@@ -754,10 +762,10 @@ fn the_state_store_links_no_build_specific_crate() {
     );
     let testing = linked_with("kbf-state", "test-database");
     assert!(
-        testing.contains("kbf-testkit"),
+        testing.contains("js-testkit"),
         "test-database must bring the test server's crate: {testing:?}"
     );
-    let violations = workspace_crates_beyond(&g, &testing, &["kbf-state", "kbf-testkit"]);
+    let violations = workspace_crates_beyond(&g, &testing, &["kbf-state"]);
     assert!(
         violations.is_empty(),
         "kbf-state with test-database links another crate of this workspace: {violations:?}"

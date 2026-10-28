@@ -1,0 +1,71 @@
+# work no node can run waits and is then refused
+> [t=0ms] start
+  farm term=7 lease_epoch=7
+  txn applied rev=1 counters=[]
+    put meta/epoch cond=absent len=8 sha=a3eb8db89fc5123c ttl=-
+  txn applied rev=2 counters=[]
+    put meta/next_op cond=absent len=8 sha=f44b28e2244100cb ttl=-
+  txn applied rev=3 counters=[]
+    put meta/next_seq cond=absent len=8 sha=f44b28e2244100cb ttl=-
+> [t=0ms] register node-a cores=4 gib=8 drivers=container
+  txn applied rev=4 counters=[]
+    put owner/node-a cond=absent len=16 sha=4ff190b4c2c573ec ttl=-
+  txn applied rev=5 counters=[]
+    put session/node-a cond=any len=70 sha=2b29556b96e9b197 ttl=60000ms
+  msg node-a welcome protocol=1 interval_ms=5000 epoch=7 pack_commit=false
+> [t=0ms] submit huge qos=ci kind=action cores_milli=1000 mem_gib=64 do_not_cache=false
+  ticket huge#1 name=operations/0
+  txn applied rev=9 counters=[]
+    put op/0000000000000000 cond=absent len=76 sha=1a9a050cb84de197 ttl=-
+    put subject/0000000000000000 cond=absent len=14 sha=5728083dce2c2380 ttl=-
+    put queue/0000000000000000 cond=absent len=0 sha=e3b0c44298fc1c14 ttl=-
+    put inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=absent len=8 sha=af5570f5a1810b7a ttl=-
+  stage huge#1 waiting "the 1 live worker(s) that satisfy the action's platform are all smaller than its request (1000 millicores, 68719476736 bytes of memory, 0 GPU(s), 0 VM slot(s))"
+> [t=0ms] tick
+> [t=50000ms] advance 50000ms
+> [t=50000ms] heartbeat node-a seq=1 running=[]
+  acknowledged=true
+  txn applied rev=10 counters=[]
+    put session/node-a cond=v5 len=70 sha=2b29556b96e9b197 ttl=60000ms
+> [t=100000ms] advance 50000ms
+> [t=100000ms] heartbeat node-a seq=2 running=[]
+  acknowledged=true
+  txn applied rev=11 counters=[]
+    put session/node-a cond=v10 len=70 sha=2b29556b96e9b197 ttl=60000ms
+> [t=150000ms] advance 50000ms
+> [t=150000ms] heartbeat node-a seq=3 running=[]
+  acknowledged=true
+  txn applied rev=12 counters=[]
+    put session/node-a cond=v11 len=70 sha=2b29556b96e9b197 ttl=60000ms
+> [t=200000ms] advance 50000ms
+> [t=200000ms] heartbeat node-a seq=4 running=[]
+  acknowledged=true
+  txn applied rev=13 counters=[]
+    put session/node-a cond=v12 len=70 sha=2b29556b96e9b197 ttl=60000ms
+> [t=250000ms] advance 50000ms
+> [t=250000ms] heartbeat node-a seq=5 running=[]
+  acknowledged=true
+  txn applied rev=14 counters=[]
+    put session/node-a cond=v13 len=70 sha=2b29556b96e9b197 ttl=60000ms
+> [t=299000ms] advance 49000ms
+> [t=299000ms] heartbeat node-a seq=6 running=[]
+  acknowledged=true
+  txn applied rev=15 counters=[]
+    put session/node-a cond=v14 len=70 sha=2b29556b96e9b197 ttl=60000ms
+> [t=299000ms] tick
+> [t=301000ms] advance 2000ms
+> [t=301000ms] heartbeat node-a seq=7 running=[]
+  acknowledged=true
+  txn applied rev=25 counters=[]
+    del queue/0000000000000000 cond=v8
+    del op/0000000000000000 cond=v6
+    del inflight/6d61696e/0101010101010101010101010101010101010101010101010101010101010101/1 cond=v9
+    put doneof/0000000000000000 cond=any len=45 sha=f0fd36d49c3d8936 ttl=600000ms
+    del loss/0000000000000000 cond=any
+    del fate/0000000000000000 cond=any
+    del subject/0000000000000000 cond=any
+    del opkey/0000000000000000 cond=any
+    del lease-by-op/0000000000000000 cond=any
+    put done/0000000000000000 cond=absent len=212 sha=48fc586b31e732c2 ttl=600000ms
+  stage huge#1 done failed code=9 message="the 1 live worker(s) that satisfy the action's platform are all smaller than its request (1000 millicores, 68719476736 bytes of memory, 0 GPU(s), 0 VM slot(s)) (waited 300 s for a worker that can run it)" details=[]
+> [t=301000ms] tick

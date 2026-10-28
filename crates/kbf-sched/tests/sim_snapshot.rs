@@ -199,7 +199,7 @@ impl World {
                 _ => Qos::Batch,
             };
             let request = Request {
-                key: kbf_sim::work_key("main", digest(n)),
+                key: kbf_types::work_key("main", digest(n)),
                 qos,
                 kind: LeaseKind::Action,
                 resources: Resources::new(1_000, GIB),
@@ -222,7 +222,7 @@ impl World {
                     operation: grant.operation,
                     lease: grant.lease,
                     outcome: Outcome::Completed {
-                        action_result: digest(1_000_000 + grant.operation.0),
+                        action_result: digest(1_000_000 + grant.operation.0).into(),
                     },
                 });
             }

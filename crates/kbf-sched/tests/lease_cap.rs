@@ -81,7 +81,7 @@ impl Farm {
             let n = self.next;
             self.next += 1;
             let request = Request {
-                key: kbf_sim::work_key("main", digest(n)),
+                key: kbf_types::work_key("main", digest(n)),
                 qos: Qos::Ci,
                 kind,
                 resources,
@@ -118,7 +118,7 @@ impl Farm {
             operation: done.operation,
             lease: done.lease,
             outcome: Outcome::Completed {
-                action_result: digest(1_000_000 + done.operation.0),
+                action_result: digest(1_000_000 + done.operation.0).into(),
             },
         });
         self.secs += 1;

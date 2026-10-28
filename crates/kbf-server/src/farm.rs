@@ -67,6 +67,7 @@ use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
 
 mod ack;
+mod ambient;
 mod beat;
 mod durable;
 mod failed_actions;
@@ -79,6 +80,11 @@ mod pack_writes;
 mod phase;
 mod record;
 pub mod sched_view;
+#[cfg(any(test, feature = "testkit"))]
+mod testkit;
+
+#[cfg(any(test, feature = "testkit"))]
+pub use testkit::TestCore;
 
 pub use durable::{
     ACK_WINDOW, DONE_FLOOR, EpochBump, EpochPolicy, ID_BLOCK, INTAKE_POLL, ORPHAN_WAIT,
@@ -88,6 +94,7 @@ pub use handover::FOLLOW_EVERY;
 pub use phase::Reported;
 
 use self::ack::{Verdict, refusal};
+use self::ambient::Ambient;
 use self::durable::intake::Intake;
 use self::durable::{Durable, Held};
 use self::failed_actions::{Class, FailedActions, class_of};
@@ -160,6 +167,8 @@ pub struct Farm {
     shapes: Shapes,
     /// `Result`s being taken now ([`Farm::report`]): a handover waits for none to be.
     reports: AtomicUsize,
+    /// Where the wall clock and the process term come from.
+    ambient: Ambient,
     state: Mutex<State>,
 }
 
@@ -286,6 +295,8 @@ impl Detail {
 
 #[derive(Debug)]
 struct State {
+    /// The farm's [`Ambient`], for the work done under the lock.
+    ambient: Ambient,
     sched: Scheduler,
     /// The callers' records, the finished operations whose callers are kept, the
     /// leases whose `Start` was sent, and the node registry.
@@ -393,6 +404,17 @@ struct State {
     failed: FailedActions,
 }
 
+/// What [`Farm::assemble`] builds a farm from.
+struct Parts {
+    cache: Backend,
+    term: u64,
+    lease_epoch: u64,
+    sched: Scheduler,
+    finished_retention: Duration,
+    ambient: Ambient,
+    epoch_unix_ms: u64,
+}
+
 /// How many committed records the farm holds for a state store that refuses them.
 const HELD_CAP: usize = 4096;
 
@@ -459,15 +481,44 @@ impl Farm {
             .with_finished_retention(finished_retention)
             .with_loss_requeues(LOSS_REQUEUES)
             .recording_requeues();
+        let epoch = tokio::time::Instant::now();
+        Self::assemble(
+            Parts {
+                cache,
+                term,
+                lease_epoch,
+                sched,
+                finished_retention,
+                ambient: Ambient::Process,
+                epoch_unix_ms: unix_ms(),
+            },
+            epoch,
+        )
+    }
+
+    /// The farm over `parts`, built at `epoch` on tokio's clock: the one place a farm's
+    /// state is made, for [`Farm::new`] and for the farm a test builds.
+    fn assemble(parts: Parts, epoch: tokio::time::Instant) -> Self {
+        let Parts {
+            cache,
+            term,
+            lease_epoch,
+            sched,
+            finished_retention,
+            ambient,
+            epoch_unix_ms,
+        } = parts;
         Self {
             cache,
             term,
             lease_epoch,
-            epoch: tokio::time::Instant::now(),
-            epoch_unix_ms: unix_ms(),
+            epoch,
+            epoch_unix_ms,
             shapes: Shapes::default(),
             reports: AtomicUsize::new(0),
+            ambient,
             state: Mutex::new(State {
+                ambient,
                 sched,
                 machine: FarmMachine::new(term),
                 finished_retention,
@@ -756,7 +807,7 @@ impl Farm {
         stream: StreamId,
         status: NodeStatus,
     ) -> Vec<(bool, String)> {
-        let received = unix_ms();
+        let received = self.ambient.unix_ms();
         let mut state = self.lock();
         if !state.is_current(worker, stream) {
             return Vec::new();
@@ -835,7 +886,7 @@ impl Farm {
     /// The wall clock as a farm time: milliseconds since the Unix epoch. The update rows
     /// store times, and a restart must not reset their origin (unlike [`Farm::now`]).
     pub fn wall_now(&self) -> FarmTime {
-        FarmTime::from_millis(unix_ms())
+        FarmTime::from_millis(self.ambient.unix_ms())
     }
 
     /// Cordons, drains or uncordons `worker` (see `kbf_sched::Cordon`), and returns
@@ -971,7 +1022,7 @@ impl Farm {
         let exit_code = action_usage::exit_code(&result);
         let run = recorded.then(|| {
             let usage = measured.as_ref().map(Measured::usage);
-            run_record::of(&result, usage, stamp, SystemTime::now())
+            run_record::of(&result, usage, stamp, self.ambient.wall())
         });
         let (outcome, detail) = self.outcome(lease, ran_on, result).await;
 
@@ -1038,11 +1089,11 @@ impl Farm {
         match (Code::from_i32(code), result.action_result) {
             (Code::Ok, Some(mut result)) => {
                 let (node, stamp) = ran_on;
-                stamp.apply(&mut result, node, SystemTime::now());
+                stamp.apply(&mut result, node, self.ambient.wall());
                 match self.cache.prepare_action_result(&result).await {
                     Ok(record) => {
                         let outcome = Outcome::Completed {
-                            action_result: record.result,
+                            action_result: record.result.into(),
                         };
                         (
                             outcome,
@@ -1063,7 +1114,7 @@ impl Farm {
                 };
                 let detail = partial.map(|mut partial| {
                     let (node, stamp) = ran_on;
-                    stamp.apply(&mut partial, node, SystemTime::now());
+                    stamp.apply(&mut partial, node, self.ambient.wall());
                     Detail::TimedOut(Box::new(partial))
                 });
                 (Outcome::Failed(Failure::Timeout), detail)
@@ -1168,7 +1219,7 @@ impl Dispatch for Farm {
             key,
             kind: submission.request.kind,
             do_not_cache: submission.request.do_not_cache,
-            queued: SystemTime::now(),
+            queued: self.ambient.wall(),
             usage,
             platform,
         });
@@ -1652,7 +1703,7 @@ impl State {
                 fence: 0,
             })
         });
-        let now = SystemTime::now();
+        let now = self.ambient.wall();
         // An operation with a `Start` has its first waiter (see `send_for`), which names
         // the action.
         let sent = self.first_waiter(start.operation).map(|(_, w)| Sent {

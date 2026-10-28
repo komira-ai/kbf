@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# `Farm::for_test`: a farm built from a chosen scheduler core, term and wall clock, so a
+# scripted session of it can be written down and compared. Test-only: a production build
+# carries none of it. This crate's own tests enable it through the dev-dependency on itself.
+testkit = []
+
 [dependencies]
 axum = { workspace = true, features = ["http1", "tokio"] }
 bytes.workspace = true
@@ -74,6 +80,8 @@ tracing-subscriber.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# `Farm::for_test`, for the scripted session in tests/farm_core_trace.
+kbf-server = { workspace = true, features = ["testkit"] }
 # The node's client of `kbf.enroll.v1`, run against the real enroll listener (tests/enroll_node.rs).
 kbf-enroll.workspace = true
 # The host's updater, run against the same listener (tests/enroll_updater.rs).
