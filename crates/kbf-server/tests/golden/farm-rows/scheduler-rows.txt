@@ -4,6 +4,8 @@
 # that does not expire) and the value as hex. A row too long for a line goes on in lines that
 # begin with two spaces. The store's clock never advances here; the small expiry offsets are
 # its ticks, one for each transaction.
+# The size summary of the `est/` row is synthetic: one made-up run fed to the estimator's update
+# path, not farm data. The values this store leaves out are in scheduler-variants.txt.
 # Pins: the key, the value and the lifetime of each kind of row, so a change to any of them,
 # or a row that is no longer written, fails the test.
 # A change to this file needs a reason in the pull request that makes it: a store written by

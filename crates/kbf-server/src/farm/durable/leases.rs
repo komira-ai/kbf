@@ -17,7 +17,7 @@
 use super::owner::{pair_of, pair_row};
 use super::*;
 
-const LEASE_BY_OP: &str = "lease-by-op/";
+pub(super) const LEASE_BY_OP: &str = "lease-by-op/";
 
 pub(super) fn lease_by_op_key(operation: OperationId) -> String {
     format!("{LEASE_BY_OP}{:016x}", operation.0)
@@ -69,7 +69,7 @@ impl Durable {
     /// The lease `operation` holds, found by reading every `lease/` row.
     fn scan_lease_of(&self, operation: OperationId) -> Result<Option<LeaseGrant>, StateError> {
         let mut lease = None;
-        for (key, row) in self.scan_known("lease/")? {
+        for (key, row) in self.scan_known(LEASE)? {
             let grant = lease_row(&key, &row)?;
             if grant.operation == operation {
                 lease = Some(grant);
@@ -85,7 +85,7 @@ impl Durable {
     /// The store cannot be read, or a row read is not one the scheduler wrote.
     pub(super) fn held_by(&self, worker: &WorkerId) -> Result<Vec<StoredOperation>, StateError> {
         let mut held = Vec::new();
-        for (key, row) in self.scan_known("lease/")? {
+        for (key, row) in self.scan_known(LEASE)? {
             let grant = lease_row(&key, &row)?;
             if grant.worker != *worker {
                 continue;
