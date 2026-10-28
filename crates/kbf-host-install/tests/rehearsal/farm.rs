@@ -503,10 +503,10 @@ impl Watch {
         let thread = std::thread::spawn(move || {
             let mut log: Vec<Seen> = Vec::new();
             while !flag.load(Ordering::Acquire) {
-                if let Some(now) = seen() {
-                    if log.last() != Some(&now) {
-                        log.push(now);
-                    }
+                if let Some(now) = seen()
+                    && log.last() != Some(&now)
+                {
+                    log.push(now);
                 }
                 sleep(Duration::from_millis(100));
             }
