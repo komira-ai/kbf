@@ -40,15 +40,17 @@ impl State {
         lease: LeaseId,
         worker: &WorkerId,
     ) -> Result<(OperationId, Digest, Stamp), Verdict> {
-        let Some(sent) = self.machine.sent(lease) else {
-            return Err(Verdict::Refused(if self.answered.contains_key(&lease) {
-                Reason::Duplicate
-            } else {
-                Reason::UnknownLease
-            }));
+        let Some(sent) = self.side.machine.sent(lease) else {
+            return Err(Verdict::Refused(
+                if self.engine.answered.contains_key(&lease) {
+                    Reason::Duplicate
+                } else {
+                    Reason::UnknownLease
+                },
+            ));
         };
         let operation = sent.operation;
-        let state = self.sched.state(operation);
+        let state = self.engine.sched.state(operation);
         // One body for both states: a guard on the alternatives would be two copies of it.
         let current = match state {
             Some(
@@ -72,7 +74,7 @@ impl State {
         if state.and_then(finished_lease) != Some(lease) {
             return Err(Verdict::Refused(Reason::Stale));
         }
-        Err(if self.finish_held(operation) {
+        Err(if self.engine.finish_held(operation) {
             Verdict::Held
         } else {
             Verdict::Refused(Reason::Duplicate)

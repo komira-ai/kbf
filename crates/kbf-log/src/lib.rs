@@ -183,6 +183,10 @@ pub enum EncodeError {
     /// A digest names a hash function the format has no value for.
     #[error("a digest names a hash function log format 1 cannot encode")]
     DigestFunction,
+    /// A request's work key is not an action's (its dedup text is not an action digest),
+    /// which is all the format has a message for.
+    #[error("a request's work key is not an action digest, which log format 1 requires")]
+    WorkKey,
     /// A control record is of a kind the format has no message for.
     #[error("a control record is of a kind log format 1 cannot encode")]
     Record,

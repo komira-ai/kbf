@@ -19,9 +19,10 @@
 //!   for a successful pipeline run and the run's own for any other (a cancelled or red pipeline
 //!   run starts this workflow too, to skip it, and must not replace a release waiting in the
 //!   group), and it never cancels.
-//! - **The gamma stage.** `gamma` needs `plan`, `publish` and `rehearse` (it runs after the release
-//!   is published and a host has been updated to it), holds `contents: read` and `id-token: write` and no secret, and reads the
-//!   coordinator's address from the repository variable `KBF_COORDINATOR_URL` alone: no address
+//! - **The gamma stage.** `gamma` needs `plan`, `publish`, `rehearse` and `rehearse-agent` (it
+//!   runs after the release is published and a host has been updated to it, by the helper alone
+//!   and through the coordinator and the agent), holds `contents: read` and `id-token: write`
+//!   and no secret, and reads the coordinator's address from the repository variable `KBF_COORDINATOR_URL` alone: no address
 //!   is written in the file and no other job reads the variable ([`COORDINATOR_URL_VAR`]). Its one
 //!   `deploy-farm` step is given the release's version and that address, and has no `if:` (an
 //!   unset variable is a notice from the verb, not a skipped step). It may join a Tailscale
@@ -67,6 +68,8 @@ const PUBLISH: &str = "publish";
 const GAMMA: &str = "gamma";
 /// The update rehearsal, which `gamma` needs.
 const REHEARSE: &str = "rehearse";
+/// The update rehearsal of the agent and the coordinator, which `gamma` needs too.
+const REHEARSE_AGENT: &str = "rehearse-agent";
 
 /// The repository variable that holds the coordinator's address, and the one environment
 /// variable of `gamma` it is read into.
@@ -93,9 +96,11 @@ const BUCK2_FETCH: &str = "cargo xtask fetch --url \"https://github.com/facebook
 /// The action `gamma` joins a Tailscale network with, pinned by commit.
 const TS_ACTION: &str = "tailscale/github-action@";
 
-/// The one condition of the network join: the trust credential's client id and the
-/// coordinator's address are both set (either unset, the step is skipped).
-const TS_IF: &str = "${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}";
+/// The one condition of the network join: the trust credential's client id is set and so is
+/// one of the farm's addresses, the coordinator's (the deploy step) or the build endpoint's (the
+/// remote-only build after it); otherwise the step is skipped.
+const TS_IF: &str =
+    "${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}";
 
 /// The inputs of the network join, all of them: workload identity federation with the run's
 /// token (the CI trust credential, `TS_CLIENT_ID` and `TS_AUDIENCE`, as `tag:ci`), so no
@@ -107,8 +112,16 @@ const TS_WITH: [(&str, &str); 3] = [
 ];
 
 /// The jobs, in file order.
-const JOBS: [&str; 8] = [
-    "plan", "verify", "tag", "notes", PUBLISH, "bump", REHEARSE, GAMMA,
+const JOBS: [&str; 9] = [
+    "plan",
+    "verify",
+    "tag",
+    "notes",
+    PUBLISH,
+    "bump",
+    REHEARSE,
+    REHEARSE_AGENT,
+    GAMMA,
 ];
 
 /// The events that start the workflow: the completion of a run of [`PIPELINE`], filtered to
@@ -169,7 +182,7 @@ const READ: &[(&str, &str)] = &[
     ("attestations", "read"),
 ];
 
-const RULES: [Rule; 8] = [
+const RULES: [Rule; 9] = [
     Rule {
         job: "plan",
         needs: &[],
@@ -220,8 +233,15 @@ const RULES: [Rule; 8] = [
         environment: None,
     },
     Rule {
+        job: REHEARSE_AGENT,
+        needs: &["plan", PUBLISH],
+        permissions: &[("contents", "read")],
+        condition: Some(RELEASE_IF),
+        environment: None,
+    },
+    Rule {
         job: GAMMA,
-        needs: &["plan", PUBLISH, REHEARSE],
+        needs: &["plan", PUBLISH, REHEARSE, REHEARSE_AGENT],
         permissions: &[("contents", "read"), ("id-token", "write")],
         condition: Some(RELEASE_IF),
         environment: Some(ENVIRONMENT),

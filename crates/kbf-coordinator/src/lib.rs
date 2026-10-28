@@ -14,6 +14,11 @@
 //!
 //! The wire types of the heartbeat and the reply are `kbf_updater::wire`.
 
+/// The commit this coordinator was built from: the 12 digits `--version` shows after the
+/// `+`, or `unknown` where the build had no git checkout. `GET /v1/status` and
+/// `GET /v1/convergence` say it as `commit`.
+pub const BUILD_COMMIT: &str = env!("KBF_BUILD_COMMIT");
+
 pub mod config;
 pub mod converge;
 pub mod decide;

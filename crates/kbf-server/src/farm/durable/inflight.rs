@@ -2,9 +2,9 @@
 //! request for an action already queued attaches to that operation, whichever process
 //! queued it and whether or not this one saw the write land.
 //!
-//! The key is the request's dedup key ([`ActionKey`]), the instance name in hexadecimal
+//! The key is the request's dedup key ([`WorkKey`]), the instance name in hexadecimal
 //! (the name may hold any character, a `/` too), `/`, and the action's digest as
-//! `<hash>/<size>`; the value is the operation's id, 8 bytes big-endian. It is written
+//! `<hash>/<size>` (the key's dedup text); the value is the operation's id, 8 bytes big-endian. It is written
 //! in the transaction that queues the operation, put only if absent, and removed in the
 //! one that finishes it ([`Durable::unpin`]). A request that is not joinable
 //! ([`Request::joinable`]) has no row: its runs are not interchangeable.
@@ -13,11 +13,11 @@
 //! already; a caller's retry after a cut stream or a lost acknowledgement names the same
 //! action and so finds the same row, with no request id to carry through the front.
 
-use kbf_types::ActionKey;
+use kbf_types::WorkKey;
 
 use super::*;
 
-const INFLIGHT: &str = "inflight/";
+pub(super) const INFLIGHT: &str = "inflight/";
 
 /// How many times a submit looks again after a write finds a row in its way.
 const LOOKS: usize = 3;
@@ -31,13 +31,13 @@ pub(super) enum Submitted {
     Joined(Box<StoredOperation>),
 }
 
-fn inflight_key(key: &ActionKey) -> String {
+fn inflight_key(key: &WorkKey) -> String {
     let instance: String = key
-        .instance
+        .class
         .bytes()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    format!("{INFLIGHT}{instance}/{}", key.action)
+    format!("{INFLIGHT}{instance}/{}", key.dedup)
 }
 
 impl Durable {
@@ -125,7 +125,8 @@ impl Durable {
         let Some(row) = self.store.get(&key)? else {
             return Ok(None);
         };
-        let request = request_row(&key, &row)?;
+        let request = self.request_row(&key, &row)?;
+        let action = action_of_request(&key, &request)?;
         let lease = match known {
             Some(grant) => Some(grant),
             None => self.lease_of(operation)?,
@@ -140,11 +141,7 @@ impl Durable {
             Some(row) => Some(fate::decode(&row.value).map_err(|why| corrupt(&key, why))?),
             None => None,
         };
-        let key = subject_key(operation);
-        let subject = match self.store.get(&key)? {
-            Some(row) => Some(subject::decode(&row.value).map_err(|why| corrupt(&key, why))?),
-            None => None,
-        };
+        let subject = self.ext.subject(&*self.store, operation)?;
         let read = self.read_size_keys.load(Ordering::SeqCst);
         let size_key = match self.store.get(&opkey_key(operation))?.filter(|_| read) {
             Some(row) => {
@@ -156,6 +153,7 @@ impl Durable {
         Ok(Some(StoredOperation {
             operation,
             request,
+            action,
             lease,
             losses,
             fate,
@@ -173,7 +171,7 @@ impl Durable {
         let Some(row) = self.store.get(&key)? else {
             return Ok(txn);
         };
-        let request = request_row(&key, &row)?;
+        let request = self.request_row(&key, &row)?;
         let pin = inflight_key(&request.key);
         Ok(match self.store.get(&pin)? {
             Some(row) if number(&pin, &row)? == operation.0 => {

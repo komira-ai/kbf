@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use kbf_objstore::s3::fake::FakeS3;
+use kbf_pack_index::memory::MemoryPackIndex;
+use kbf_pack_index::{BlobDigest, PackIndex};
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_proto::reapi::{
     self, BatchReadBlobsRequest, BatchUpdateBlobsRequest, FindMissingBlobsRequest,
@@ -21,8 +23,7 @@ use kbf_proto::worker::{
     Capability, DaemonMessage, Heartbeat, Hello, PackReadCounts, PackWriteCounts, ServerMessage,
     daemon_message, server_message, worker_client::WorkerClient,
 };
-use kbf_state::pack_index::memory::MemoryPackIndex;
-use kbf_state::{BlobDigest, ManualClock, PackIndex};
+use kbf_state::ManualClock;
 use kbf_types::Digest;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;

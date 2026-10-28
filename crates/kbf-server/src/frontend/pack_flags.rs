@@ -32,7 +32,7 @@ use kbf_front::{PackSettings, Packs};
 use kbf_objstore::Capabilities;
 use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
 use kbf_pack::{CacheError, PackError, PackKeys, ReadCache, WriterKind};
-use kbf_state::PackIndex;
+use kbf_pack_index::PackIndex;
 use zeroize::Zeroizing;
 
 use crate::pack_locate::PackCommits;

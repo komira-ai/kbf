@@ -52,7 +52,7 @@ fn cgroup(peak: Option<u64>) -> RunUsage {
 
 fn ok() -> Outcome {
     Outcome::Completed {
-        action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+        action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1).into(),
     }
 }
 
@@ -82,7 +82,8 @@ fn start(seq: u64, kind: LeaseKind, gpus: u64) -> StartLease {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [2; 32], 2),
-        },
+        }
+        .into(),
         kind,
         resources: Resources {
             gpus,

@@ -740,3 +740,38 @@ async fn the_desired_call_takes_a_service_and_refuses_an_unknown_one() {
     .await;
     assert_eq!(reply, json!({"reply": "update", "version": "2.0"}));
 }
+
+/// Catches: the status or the convergence losing a field a client already reads, or not
+/// saying which build answers: a coordinator that has seen no host and holds no desired state
+/// answers with exactly the earlier fields and one more, `commit`, the text `--version`
+/// shows after the `+`.
+#[tokio::test]
+async fn the_status_and_the_convergence_say_the_build_commit_and_keep_their_fields() {
+    let rig = Rig::new("http-commit");
+    let commit = crate::BUILD_COMMIT;
+    assert!(
+        commit == "unknown"
+            || (commit.len() == 12 && commit.bytes().all(|b| b.is_ascii_hexdigit())),
+        "{commit:?}"
+    );
+    assert_eq!(
+        status(&rig).await,
+        json!({"desired": null, "services": {}, "quiet": true, "hosts": [], "commit": commit})
+    );
+    let (code, body) = convergence(&rig, Some(&ci_token())).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({
+            "desired": null,
+            "quiet": true,
+            "state": "in_progress",
+            "roles": [],
+            "commit": commit,
+        })
+    );
+    rig.set(STATE).await;
+    let (_, set) = convergence(&rig, Some(&ci_token())).await;
+    assert_eq!(set["commit"], commit);
+    assert_eq!(set["desired"], "2.0");
+}

@@ -17,7 +17,7 @@ use kbf_sched::{
 };
 use kbf_types::{
     ActionKey, Digest, DigestFunction, Effect, Failure, FarmTime, LeaseId, LeaseKind, OperationId,
-    Outcome, Qos, Resources, StartLease, WaiterId, WorkerId,
+    Outcome, Qos, Resources, StartLease, WaiterId, WorkKey, WorkerId,
 };
 
 use super::trace::{Op, Trace, fnv};
@@ -156,7 +156,7 @@ struct Sim<'a> {
     bounds: Bounds,
     needs: kbf_caps::Request,
     /// Operations in flight, by action.
-    active: BTreeMap<ActionKey, usize>,
+    active: BTreeMap<WorkKey, usize>,
     joined: BTreeMap<usize, Vec<usize>>,
     queued_at: BTreeMap<usize, u64>,
     running: BTreeMap<WorkerId, BTreeSet<LeaseId>>,
@@ -463,7 +463,7 @@ impl Sim<'_> {
             Outcome::Failed(Failure::OutOfMemory)
         } else {
             Outcome::Completed {
-                action_result: Digest::new(DigestFunction::Sha256, [0; 32], 0),
+                action_result: Digest::new(DigestFunction::Sha256, [0; 32], 0).into(),
             }
         };
         let effects = self.feed(Event::Report {
@@ -558,7 +558,7 @@ pub fn raised_by(reason: RequeueReason) -> Option<u64> {
     }
 }
 
-fn action_key(op: &Op) -> ActionKey {
+fn action_key(op: &Op) -> WorkKey {
     let seed = fnv(format!("{}\n{}", op.instance, op.digest).as_bytes());
     let mut hash = [0_u8; 32];
     for (i, chunk) in hash.chunks_mut(8).enumerate() {
@@ -570,4 +570,5 @@ fn action_key(op: &Op) -> ActionKey {
         instance: op.instance.clone(),
         action: Digest::new(DigestFunction::Sha256, hash, 1),
     }
+    .into()
 }

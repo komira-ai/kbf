@@ -397,3 +397,60 @@ fn helpers_with_different_containers_keep_their_own_directories() {
     assert_eq!(fs::read(&first.file).unwrap(), IMAGE);
     assert!(plain.exists() && tagged.exists());
 }
+
+/// The frontend image of a channel for a trusted repository is listed from, downloaded from
+/// and attested for that repository and its workflow; without the repository's listing in the
+/// channels file the channel is refused before a fetch.
+#[test]
+fn an_image_of_another_repository_is_attested_by_its_own_workflow() {
+    let channel = |trusted: &str| {
+        format!(
+            "{trusted}[channels.stable]\nsource = \"github\"\nrepository = \"owner/other\"\nsigner_workflow = \"owner/other/.github/workflows/release.yml\"\n"
+        )
+    };
+    let rig = Rig::new("image-other-refused");
+    rig.offer_good_image();
+    put(&rig.dir.join("releases.toml"), channel(""));
+    let fault = rig.backend.fetch(&version(), &stable()).err().unwrap();
+    assert!(refused(Code::ChannelNotAllowed)(&fault), "{fault:?}");
+    assert!(rig.calls.borrow().is_empty());
+    rig.assert_nothing_kept();
+
+    let rig = Rig::new("image-other");
+    rig.offer_good_image();
+    put(
+        &rig.dir.join("releases.toml"),
+        channel("trusted_workflows = [\"owner/other/.github/workflows/release.yml\"]\n"),
+    );
+    let fetched = rig.backend.fetch(&version(), &stable()).unwrap();
+    assert_eq!(fetched.commit, COMMIT);
+    let calls = rig.calls.borrow();
+    let listing = calls.iter().find(|c| c.program.ends_with("curl")).unwrap();
+    assert!(
+        listing
+            .args
+            .last()
+            .unwrap()
+            .starts_with("https://api.github.com/repos/owner/other/releases?")
+    );
+    let download = calls
+        .iter()
+        .find(|c| c.args.first().map(String::as_str) == Some("release"))
+        .unwrap();
+    let at = download.args.iter().position(|a| a == "--repo").unwrap();
+    assert_eq!(download.args[at + 1], "owner/other");
+    assert!(download.args.contains(&image_name(COMMIT)));
+    let spawns = rig.installer.borrow().clone();
+    assert_eq!(spawns.len(), 1);
+    let args: Vec<String> = spawns[0]
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let has = |flag: &str, value: &str| args.windows(2).any(|w| w[0] == flag && w[1] == value);
+    assert!(has("--repo", "owner/other"));
+    assert!(has(
+        "--signer-workflow",
+        "owner/other/.github/workflows/release.yml"
+    ));
+}

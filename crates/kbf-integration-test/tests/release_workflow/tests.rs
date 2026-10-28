@@ -1290,37 +1290,32 @@ fn only_plan_and_verify_download_from_another_run() {
 }
 
 #[test]
-fn the_rehearsal_runs_after_publish_read_only_under_the_release_condition() {
-    // Catches: the rehearsal starting before the release it updates to is published, holding
-    // a write scope or the OIDC token, or running for a pipeline run that cuts no release.
-    red(
-        &plant("rehearse", "needs: [plan, publish]\n", "needs: [plan]\n"),
-        "the job `rehearse` needs",
-    );
-    red(
-        &plant(
-            "rehearse",
-            "      contents: read\n",
-            "      contents: write\n",
-        ),
-        "the job `rehearse` holds `contents: write`",
-    );
-    red(
-        &plant(
-            "rehearse",
-            "      contents: read\n",
-            "      contents: read\n      id-token: write\n",
-        ),
-        "the job `rehearse` holds `id-token: write`",
-    );
-    red(
-        &plant(
-            "rehearse",
-            " && needs.plan.outputs.pipeline != 'true' }}",
-            " }}",
-        ),
-        "rehearse",
-    );
+fn the_rehearsals_run_after_publish_read_only_under_the_release_condition() {
+    // Catches: a rehearsal (the helper's, and the agent's with the coordinator) starting before
+    // the release it updates to is published, holding a write scope or the OIDC token, or
+    // running for a pipeline run that cuts no release.
+    for job in ["rehearse", "rehearse-agent"] {
+        red(
+            &plant(job, "needs: [plan, publish]\n", "needs: [plan]\n"),
+            &format!("the job `{job}` needs"),
+        );
+        red(
+            &plant(job, "      contents: read\n", "      contents: write\n"),
+            &format!("the job `{job}` holds `contents: write`"),
+        );
+        red(
+            &plant(
+                job,
+                "      contents: read\n",
+                "      contents: read\n      id-token: write\n",
+            ),
+            &format!("the job `{job}` holds `id-token: write`"),
+        );
+        red(
+            &plant(job, " && needs.plan.outputs.pipeline != 'true' }}", " }}"),
+            job,
+        );
+    }
 }
 
 #[test]
@@ -1331,25 +1326,42 @@ fn gamma_runs_after_publish_with_the_run_token_and_no_write_scope() {
     red(
         &plant(
             "gamma",
-            "needs: [plan, publish, rehearse]\n",
-            "needs: [plan, rehearse]\n",
+            "needs: [plan, publish, rehearse, rehearse-agent]\n",
+            "needs: [plan, rehearse, rehearse-agent]\n",
         ),
         "the job `gamma` needs",
     );
     red(
         &plant(
             "gamma",
-            "needs: [plan, publish, rehearse]\n",
-            "needs: [plan, bump, rehearse]\n",
+            "needs: [plan, publish, rehearse, rehearse-agent]\n",
+            "needs: [plan, bump, rehearse, rehearse-agent]\n",
         ),
         "the job `gamma` needs",
     );
-    // Catches: the gamma stage telling the farm about a release no host was updated to.
+    // Catches: the gamma stage telling the farm about a release no host was updated to, by the
+    // helper alone or through the coordinator and the agent.
     red(
         &plant(
             "gamma",
-            "needs: [plan, publish, rehearse]\n",
+            "needs: [plan, publish, rehearse, rehearse-agent]\n",
             "needs: [plan, publish]\n",
+        ),
+        "the job `gamma` needs",
+    );
+    red(
+        &plant(
+            "gamma",
+            "needs: [plan, publish, rehearse, rehearse-agent]\n",
+            "needs: [plan, publish, rehearse]\n",
+        ),
+        "the job `gamma` needs",
+    );
+    red(
+        &plant(
+            "gamma",
+            "needs: [plan, publish, rehearse, rehearse-agent]\n",
+            "needs: [plan, publish, rehearse-agent]\n",
         ),
         "the job `gamma` needs",
     );
@@ -1538,7 +1550,7 @@ fn the_network_join_of_gamma_uses_the_run_token_and_variables_only() {
     red(
         &plant(
             "gamma",
-            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}\n",
             "        if: ${{ vars.OTHER != '' }}\n",
         ),
         "is under `if:`",
@@ -1546,7 +1558,7 @@ fn the_network_join_of_gamma_uses_the_run_token_and_variables_only() {
     red(
         &plant(
             "gamma",
-            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}\n",
             "",
         ),
         "not under exactly `if:",
@@ -1576,8 +1588,8 @@ fn the_network_join_of_gamma_uses_the_run_token_and_variables_only() {
     red(
         &plant(
             "gamma",
-            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n",
-            "        if: ${{ vars.TS_CLIENT_ID != '' && vars.KBF_COORDINATOR_URL != '' }}\n        env:\n          TS_AUTHKEY: ${{ vars.TS_KEY }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}\n",
+            "        if: ${{ vars.TS_CLIENT_ID != '' && (vars.KBF_COORDINATOR_URL != '' || vars.FARM_ADDRESS != '') }}\n        env:\n          TS_AUTHKEY: ${{ vars.TS_KEY }}\n",
         ),
         "has an `env:`",
     );

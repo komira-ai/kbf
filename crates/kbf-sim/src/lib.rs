@@ -3,25 +3,20 @@
 //! faults, a run loop that drives [`kbf_types::StateMachine`] nodes, and a trace whose
 //! hash identifies the run.
 //!
-//! A run is a function of its seed and its scenario: [`Sim`] reads no clock and no
-//! operating-system entropy and keeps every collection ordered, so the same seed gives
-//! the same [`TraceHash`] in any process on any platform. A failing seed is a complete
-//! bug report. The kernel depends only on `kbf-types`; pure crates use it as a
-//! dev-dependency only, and the whole-cell assembly lives in `kbf-sim-cell`.
+//! The code now lives in the `js-sim` crate of the `komira-ai/jobscheduler` repository
+//! (`crates/js-sim`), at the revision pinned in the workspace `Cargo.toml`; this crate
+//! re-exports it under its old name so that every path (`kbf_sim::Sim`,
+//! `kbf_sim::text`, `kbf_sim::golden`, ...) stays as it was. Its nodes are
+//! [`kbf_types::StateMachine`]s because `kbf_types::sched` is `js_types::sched`.
 //!
-//! The kernel holds itself to the pure-crate rules (no clock, sleep, network or hashed
-//! collections; see `clippy.toml`) because breaking any of them breaks replay.
-
+//! A run is a function of its seed and its scenario, and its [`TraceHash`] is the same in
+//! any process on any platform. `tests/determinism.rs` and `tests/toy_counter.rs` keep the
+//! hashes of their pinned runs in `tests/golden/trace-hashes.txt`, so a revision that
+//! changes a trace line fails here.
+//!
+//! It is still a pure crate (no clock, sleep, network or hashed collections): the layering
+//! test in `kbf-integration-test` and the lists in `clippy.toml` enforce it.
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+#![forbid(unsafe_code)]
 
-mod net;
-mod node;
-mod rng;
-mod sim;
-mod trace;
-
-pub use net::{Faults, NodeId, Partition};
-pub use node::{Event, Node, NodeInput, Output};
-pub use rng::{Chance, SimRng};
-pub use sim::Sim;
-pub use trace::TraceHash;
+pub use js_sim::*;

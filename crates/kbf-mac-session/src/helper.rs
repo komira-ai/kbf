@@ -36,6 +36,9 @@
 //!   `kbf-vmm` as root on a bundle directly inside the staging or images directory, with
 //!   argv the helper builds; the caller names only the bundle (and the output directory).
 //!   A base the setup built stays root's, sealed.
+//! - `role-run` starts one program, the configured `kbf-vmm`, and only as `vm-run --spec
+//!   <file>` with the file inside the images directory ([`vmrun`]). `role-reap` ends the
+//!   process group of such a run, found again by pid, start time and boot ([`reap`]).
 //! - Every verb but `boot-reset` is refused until the boot reset has succeeded.
 //!
 //! The mutating verbs run one at a time (one lock around the ledger), and `run` holds
@@ -63,8 +66,10 @@ use crate::sweep::{SweepPlan, sweep};
 
 mod image;
 mod leak;
+mod reap;
 mod role;
 mod switch;
+mod vmrun;
 
 pub use image::{CHFLAGS, ImageSettings};
 pub use switch::Reset;
@@ -173,6 +178,33 @@ pub trait Host: Send + Sync {
     /// # Errors
     /// The kernel did not say.
     fn boot_session(&self) -> io::Result<String>;
+    /// Every process in the table, zombies included.
+    ///
+    /// # Errors
+    /// The process table could not be read.
+    fn processes(&self) -> io::Result<Vec<Process>>;
+    /// Sends `SIGKILL` to the process group `pgid` (`killpg`); a group with no process
+    /// is not an error.
+    ///
+    /// # Errors
+    /// The signal could not be sent.
+    fn kill_group(&self, pgid: i32) -> io::Result<()>;
+}
+
+/// A process as the table shows it, for `role-reap`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Process {
+    pub pid: i32,
+    pub pgid: i32,
+    /// Its effective uid.
+    pub uid: u32,
+    /// Its real uid.
+    pub ruid: u32,
+    /// When it started, in microseconds of the epoch: with `pid`, it names one process
+    /// for its whole life.
+    pub start: u64,
+    /// Exited but not yet reaped: it cannot be signalled further.
+    pub zombie: bool,
 }
 
 /// The ids of an account record the helper did not create (the VM user's).
@@ -327,6 +359,9 @@ impl Helper {
                 .role_session_ready()
                 .map(|ready| Reply::SessionReady { ready }),
             Request::RoleKillUid => self.role_kill_uid().map(|()| Reply::Killed),
+            Request::RoleReap { pgid, start, boot } => {
+                self.role_reap(pgid, start, &boot).map(|()| Reply::Killed)
+            }
             Request::ImageSetup { bundle } => self
                 .image_setup(&bundle)
                 .map(|report| Reply::Imaged { report }),
