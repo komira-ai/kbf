@@ -151,6 +151,11 @@ impl Leases {
         self.runtimes.node_load().await
     }
 
+    /// Tells the runtimes what a Welcome said of placement by measured load.
+    pub(crate) async fn welcomed_placement_load(&self, on: bool) {
+        self.runtimes.welcomed_placement_load(on).await;
+    }
+
     /// Starts killing lease `id` because the server cancelled it, and returns at once.
     /// Returns whether a kill began: not for a lease that is not running or is already
     /// being cancelled. The run reports through `done` once it has stopped.

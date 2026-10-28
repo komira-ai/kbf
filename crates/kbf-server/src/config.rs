@@ -332,6 +332,17 @@ pub struct Args {
     /// until it ends.
     #[arg(long, value_enum, default_value_t = crate::LearnedSizes::Off)]
     pub learned_sizes: crate::LearnedSizes,
+    /// Whether the farm places by the load the nodes measure, the step before that
+    /// being `shadow`. It decides what `Welcome.placement_load` tells the nodes: `on` sends
+    /// true, and a node that follows it (`kbf-daemon --actions-cpu-max=auto`, the
+    /// default) lifts the CPU limit of its actions cgroup, so that the CPU it measures can
+    /// show an overload; `off` and `shadow` send nothing, and the node keeps the limit of
+    /// its `--reserve-cpus`. The flag changes nothing else in this server: it does not
+    /// change how work is placed. It applies to every node of this server, at each
+    /// connect and reconnect: to give a pool of nodes the mode, point the pool at a server
+    /// started with it.
+    #[arg(long, value_enum, default_value_t = crate::PlacementLoad::Off)]
+    pub placement_load: crate::PlacementLoad,
     /// How long, in seconds, a finished operation is kept after its callers are
     /// answered. Within it, WaitExecution on the operation's name streams its result
     /// (a client whose Execute stream broke gets a result the action cache does not
@@ -834,6 +845,7 @@ impl Args {
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
             vm_host_floor: HostFloor::new(self.vm_host_floor_cpus, self.vm_host_floor_mem_gib),
             learned_sizes: self.learned_sizes,
+            placement_load: self.placement_load,
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {
                 0 => Duration::MAX,

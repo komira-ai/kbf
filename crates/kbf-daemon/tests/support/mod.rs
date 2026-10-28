@@ -204,6 +204,16 @@ impl Peer {
         }));
     }
 
+    /// A Welcome that carries `placement_load` as given (`None`: absent).
+    pub fn welcome_placement_load(&self, placement_load: Option<bool>) {
+        self.send(server_message::Message::Welcome(Welcome {
+            protocol_version: 1,
+            heartbeat_interval_ms: INTERVAL.as_millis() as u64,
+            placement_load,
+            ..Welcome::default()
+        }));
+    }
+
     /// A Welcome that names lease epoch `epoch` (0: none).
     pub fn welcome_epoch(&self, epoch: u64) {
         self.welcome_with(INTERVAL, epoch);

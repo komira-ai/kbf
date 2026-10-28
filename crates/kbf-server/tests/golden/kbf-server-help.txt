@@ -138,6 +138,16 @@ Options:
           
           [default: off]
 
+      --placement-load <PLACEMENT_LOAD>
+          Whether the farm places by the load the nodes measure, the step before that being `shadow`. It decides what `Welcome.placement_load` tells the nodes: `on` sends true, and a node that follows it (`kbf-daemon --actions-cpu-max=auto`, the default) lifts the CPU limit of its actions cgroup, so that the CPU it measures can show an overload; `off` and `shadow` send nothing, and the node keeps the limit of its `--reserve-cpus`. The flag changes nothing else in this server: it does not change how work is placed. It applies to every node of this server, at each connect and reconnect: to give a pool of nodes the mode, point the pool at a server started with it
+
+          Possible values:
+          - off:    The farm does not place by measured load. `Welcome` leaves `placement_load` out, so its bytes are those of a server that predates the field
+          - shadow: The step before `on`: the farm shows what measured load would do and places as `off` does. `Welcome` leaves `placement_load` out
+          - on:     The farm places by measured load. `Welcome.placement_load` is true: each node lifts the CPU limit of its actions cgroup (`--actions-cpu-max=auto`)
+          
+          [default: off]
+
       --finished-retention-secs <FINISHED_RETENTION_SECS>
           How long, in seconds, a finished operation is kept after its callers are answered. Within it, WaitExecution on the operation's name streams its result (a client whose Execute stream broke gets a result the action cache does not keep, such as a failure); after it, the name is NOT_FOUND. Every operation finished within it is held in memory
           

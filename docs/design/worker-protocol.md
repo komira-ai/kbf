@@ -89,6 +89,18 @@ the heartbeat interval in milliseconds, and its **lease epoch** (see
 `kbf.worker.v1.PackIndex/CommitPack` (see [below](#blobs-on-the-worker-listener)): false
 from a frontend without the pack index and the pack store, and from one that predates the field.
 
+`Welcome.placement_load` (field 6, `optional bool`, additive) says the farm places by the load the
+nodes measure. A server started with `--placement-load=on` sends it as true; with `off` (the
+default) or `shadow` it leaves the field out (absent, never false), so the `Welcome` is
+byte-for-byte the one of a server that predates the field. A daemon reads absent and false alike
+as off. The daemon applies it at every `Welcome`, on every stream: with `--actions-cpu-max=auto`
+(the default) it writes `max 100000` to the actions cgroup's `cpu.max` for true, so the CPU it
+measures can show an overload, and the limit of its reserve (`--reserve-cpus`) otherwise; `on` and
+`off` ignore the field. The write happens off the async workers after the `Welcome` is taken and
+before the stream's first `Heartbeat`, and a failed write is logged and does not end the stream.
+Until the first `Welcome` the limit written at start stays. See
+[linux-build-host.md](../deploy/linux-build-host.md#the-limit-under-placement-by-measured-load---actions-cpu-max).
+
 **Only the first `Hello` of a stream registers the node.** It opens a new session, and
 from then on every `Start` for this node goes to this stream. A `Hello` resent on the
 same stream (the daemon's node report changed) must carry the stream's `node_id`: one

@@ -103,6 +103,36 @@ pub struct WorkerService {
     protocols: (u32, u32),
     /// Whether `Welcome` says this frontend takes `PackIndex/CommitPack` (`Welcome.pack_commit`).
     pack_commit: bool,
+    /// What `Welcome.placement_load` carries (`--placement-load`).
+    placement_load: Option<bool>,
+}
+
+/// What `--placement-load` says of placement by the load the nodes measure.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum PlacementLoad {
+    /// The farm does not place by measured load. `Welcome` leaves `placement_load` out,
+    /// so its bytes are those of a server that predates the field.
+    #[default]
+    Off,
+    /// The step before `on`: the farm shows what measured load would do and places as `off`
+    /// does. `Welcome` leaves `placement_load` out.
+    Shadow,
+    /// The farm places by measured load. `Welcome.placement_load` is true: each node lifts
+    /// the CPU limit of its actions cgroup (`--actions-cpu-max=auto`).
+    On,
+}
+
+impl PlacementLoad {
+    /// What `Welcome.placement_load` carries: `Some(true)` for `on`, absent for the others
+    /// (never `Some(false)`, so a farm that does not use the field sends the bytes it
+    /// always did).
+    #[must_use]
+    pub const fn welcome(self) -> Option<bool> {
+        match self {
+            Self::On => Some(true),
+            Self::Off | Self::Shadow => None,
+        }
+    }
 }
 
 impl WorkerService {
@@ -124,6 +154,7 @@ impl WorkerService {
             map: MapFeed::NONE,
             protocols: (OLDEST_PROTOCOL_VERSION, PROTOCOL_VERSION),
             pack_commit: false,
+            placement_load: None,
         }
     }
 
@@ -151,6 +182,14 @@ impl WorkerService {
     #[must_use]
     pub const fn with_pack_commit(mut self, on: bool) -> Self {
         self.pack_commit = on;
+        self
+    }
+
+    /// The service telling each daemon, in `Welcome.placement_load`, the mode of
+    /// `--placement-load`. `off` (the default) and `shadow` leave the field out.
+    #[must_use]
+    pub const fn with_placement_load(mut self, mode: PlacementLoad) -> Self {
+        self.placement_load = mode.welcome();
         self
     }
 
@@ -206,6 +245,7 @@ impl Worker for WorkerService {
             epoch: self.farm.lease_epoch(),
             map: self.map.welcome_map(),
             pack_commit: self.pack_commit,
+            placement_load: self.placement_load,
         }));
         let (outbound, responses) = mpsc::unbounded_channel();
         let capacity = reported.capacity;

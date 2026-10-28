@@ -1414,3 +1414,30 @@ fn the_start_line_says_whether_the_build_pages_and_blob_reads_are_on() {
         interrupt(child);
     }
 }
+
+/// Catches: `--placement-load` not parsed into the listeners (a farm that ignores it never
+/// tells its nodes), a default other than `off` (Welcome would change for a farm that sets
+/// nothing), and a value other than `off`, `shadow` and `on` accepted.
+#[test]
+fn placement_load_comes_from_its_flag() {
+    use clap::Parser;
+    use kbf_server::PlacementLoad;
+    let parse = |args: &[&str]| {
+        kbf_server::Args::try_parse_from(std::iter::once("kbf-server").chain(args.iter().copied()))
+    };
+    let mode = |args: &[&str]| {
+        parse(args)
+            .expect("flags parse")
+            .listeners()
+            .expect("listeners")
+            .placement_load
+    };
+    assert_eq!(mode(&[]), PlacementLoad::Off);
+    assert_eq!(mode(&["--placement-load", "off"]), PlacementLoad::Off);
+    assert_eq!(mode(&["--placement-load=shadow"]), PlacementLoad::Shadow);
+    assert_eq!(mode(&["--placement-load", "on"]), PlacementLoad::On);
+    for bad in ["", "ON", "true", "yes", "1"] {
+        let err = parse(&["--placement-load", bad]).expect_err(bad);
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{bad}");
+    }
+}

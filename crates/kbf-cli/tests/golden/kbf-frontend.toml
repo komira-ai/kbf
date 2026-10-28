@@ -160,6 +160,8 @@ finished-retention-secs = 60
 heartbeat-interval-ms = 5000
 # Opens the pack index at start: the tables in the Postgres state store that say which pack holds each blob and where. A frontend given `--pack-store-endpoint` reads and writes them; without it nothing does, and the flag only checks that the store can hold them. Needs `--state-store` as a `postgres://` URL whose schema has the pack tables (`kbf-installer setup` makes them); a `sqlite://` store is refused. Left out, no pack table is touched
 pack-index = false
+# Whether the farm places by the load the nodes measure, the step before that being `shadow`. It decides what `Welcome.placement_load` tells the nodes: `on` sends true, and a node that follows it (`kbf-daemon --actions-cpu-max=auto`, the default) lifts the CPU limit of its actions cgroup, so that the CPU it measures can show an overload; `off` and `shadow` send nothing, and the node keeps the limit of its `--reserve-cpus`. The flag changes nothing else in this server: it does not change how work is placed. It applies to every node of this server, at each connect and reconnect: to give a pool of nodes the mode, point the pool at a server started with it
+placement-load = "off"
 # How often, in seconds, every open Execute and WaitExecution stream is sent its operation again (same name, not done, current stage), so a load balancer's idle timeout never cuts a long action. 0 sends none
 progress-interval-secs = 30
 # How long, in milliseconds, `GET /readyz` on the operator API and the REAPI listener's `grpc.health.v1` service wait for the object store to answer their read-only probe before they answer not ready

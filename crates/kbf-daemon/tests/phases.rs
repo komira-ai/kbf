@@ -70,6 +70,7 @@ impl Farm {
             memory_ladder: kbf_server::MemoryLadder::default(),
             vm_host_floor: kbf_server::HostFloor::default(),
             learned_sizes: kbf_server::LearnedSizes::Off,
+            placement_load: kbf_server::PlacementLoad::Off,
             finished_retention: Duration::from_secs(60),
             shutdown_timeout: Duration::from_secs(10),
             streams: kbf_server::StreamTiming::default(),

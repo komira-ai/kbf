@@ -177,6 +177,7 @@ pub const ALLOWED: &[&str] = &[
     "vm_host_floor_cpus",
     "vm_host_floor_mem_gib",
     "learned_sizes",
+    "placement_load",
     "finished_retention_secs",
     "shutdown_timeout_secs",
     "invocation_memory",
@@ -926,7 +927,8 @@ impl<'a> Prepared<'a> {
             listeners.hello_wait,
         )
         .with_host_floor(listeners.vm_host_floor)
-        .with_pack_commit(committing);
+        .with_pack_commit(committing)
+        .with_placement_load(listeners.placement_load);
         // Daemons are sent the members' map: Welcome.map and a MapUpdate at each bump.
         let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
         let worker_service = WorkerServer::new(sessions)

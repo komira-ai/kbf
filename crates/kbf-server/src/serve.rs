@@ -93,6 +93,8 @@ pub struct Listeners {
     pub vm_host_floor: HostFloor,
     /// Whether the farm shows `kbf-estimator` what finished (`--learned-sizes`).
     pub learned_sizes: crate::LearnedSizes,
+    /// What `Welcome.placement_load` tells the nodes (`--placement-load`).
+    pub placement_load: crate::PlacementLoad,
     /// How long a finished operation is kept after its callers are answered, in which
     /// WaitExecution on it still streams its result; then it is NOT_FOUND.
     pub finished_retention: Duration,
@@ -920,7 +922,8 @@ where
         listeners.heartbeat_interval,
         listeners.hello_wait,
     )
-    .with_host_floor(listeners.vm_host_floor);
+    .with_host_floor(listeners.vm_host_floor)
+    .with_placement_load(listeners.placement_load);
     // The map, if there is one: no branch in this generic function.
     let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
     let worker_service = WorkerServer::new(sessions)

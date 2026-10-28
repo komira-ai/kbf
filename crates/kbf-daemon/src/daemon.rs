@@ -777,7 +777,7 @@ impl Daemon {
             .offline(timeout(wait, inbound.message()))
             .await
             .map_err(|_| SessionError::WelcomeTimeout(wait))??;
-        let (interval, epoch, map) = self.welcome(first)?;
+        let (interval, epoch, map, placement_load) = self.welcome(first)?;
         self.welcomed = true;
         self.contact.new_stream(interval);
         self.window.new_stream(hello_sent);
@@ -795,6 +795,10 @@ impl Daemon {
         self.emit(Event::Welcomed {
             heartbeat_interval: interval,
         });
+        // On every stream, so a reconnect to a server with another mode changes the limit;
+        // after contact is renewed, so a slow write cannot cost the fence, and before the
+        // first Heartbeat of the stream, which reports what was written.
+        self.leases.welcomed_placement_load(placement_load).await;
         // Before the first Heartbeat, which lists these leases (issue #26).
         for result in self.unacked.values() {
             send(&tx, daemon_message::Message::Result(result.clone()));
@@ -909,11 +913,12 @@ impl Daemon {
     }
 
     /// Checks the first server message is an acceptable Welcome; returns its interval,
-    /// the lease epoch it names (`None` for 0) and the storage map it carries.
+    /// the lease epoch it names (`None` for 0), the storage map it carries and whether it
+    /// says the farm places by measured load (absent is false).
     fn welcome(
         &self,
         first: Option<ServerMessage>,
-    ) -> Result<(Duration, Option<u64>, Option<wire::Map>), SessionError> {
+    ) -> Result<(Duration, Option<u64>, Option<wire::Map>, bool), SessionError> {
         let Some(server_message::Message::Welcome(w)) = first.and_then(|m| m.message) else {
             return Err(SessionError::Protocol(
                 "the first server message is not Welcome".into(),
@@ -942,7 +947,12 @@ impl Daemon {
         if let Some(commit) = &self.pack_commit {
             commit.welcomed(w.pack_commit);
         }
-        Ok((interval, (w.epoch != 0).then_some(w.epoch), w.map))
+        Ok((
+            interval,
+            (w.epoch != 0).then_some(w.epoch),
+            w.map,
+            w.placement_load == Some(true),
+        ))
     }
 
     /// Takes the lease epoch a Welcome named. When it names one, every lease granted
