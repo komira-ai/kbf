@@ -17,6 +17,7 @@ use kbf_caps::{Arch, Consumable, CpuCaps, NodeCaps};
 use kbf_log::{ActionEntry, Checkpoint, FarmInput, LogCommand, MachineVersion, Report, Takeover};
 use kbf_meta::{ActionRecord, Closure};
 use kbf_sched::{DaemonInstance, Request};
+use kbf_types::sched::usage::LeaseCost;
 use kbf_types::{
     ActionKey, ControlRecord, Failure, FarmTime, LeaseGrant, LeaseKind, LostWhy, OperationId,
     Outcome, Qos, RefusalRecord, Resources, ResultRecord,
@@ -177,8 +178,34 @@ fn golden() -> Vec<(&'static str, LogCommand, String)> {
                 lease: lease(1, 2),
                 operation: OperationId(3),
                 worker: w("w"),
+                cost: LeaseCost::default(),
             }))),
             batch_hex(21, 15, "2a0d0a0b0a040801100210031a0177"),
+        ),
+        (
+            // The same grant with a cost: input (2a) { lease (0a) { lease, operation,
+            // worker as above, then cost (22) { cpu_millis (08) 4, memory_bytes (10) 5,
+            // limit_bytes (18) 6, cold (20) true, retry (28) true, key_hash (30) 7 } } }.
+            // Field 4 of the grant is new: a reader without it skips the 14 bytes it adds.
+            "Committed lease with a cost",
+            batch(FarmInput::Committed(ControlRecord::Lease(LeaseGrant {
+                lease: lease(1, 2),
+                operation: OperationId(3),
+                worker: w("w"),
+                cost: LeaseCost {
+                    cpu_millis: 4,
+                    memory_bytes: 5,
+                    limit_bytes: 6,
+                    cold: true,
+                    retry: true,
+                    key_hash: 7,
+                },
+            }))),
+            batch_hex(
+                35,
+                29,
+                "2a1b0a190a040801100210031a0177220c080410051806200128013007",
+            ),
         ),
         (
             // input (2a): committed { result (12) { lease 1.2, operation 3, outcome

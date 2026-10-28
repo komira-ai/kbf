@@ -83,6 +83,7 @@ pub mod config;
 pub mod drain;
 pub mod enroll;
 pub mod farm;
+pub mod farm_js;
 mod fault;
 pub mod fill;
 mod flag_set;

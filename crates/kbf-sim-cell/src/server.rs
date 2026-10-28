@@ -639,6 +639,7 @@ impl Up {
         let event = SchedEvent::Heartbeat {
             worker: worker.clone(),
             running: running.clone(),
+            load: None,
         };
         self.feed(now, event, cx);
         let cancels: Vec<LeaseId> = self.sched.not_held(&worker, &running).collect();

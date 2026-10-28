@@ -387,6 +387,9 @@ impl StoredOperation {
             lease: self.lease.map(|grant| RecoveredLease {
                 lease: grant.lease,
                 worker: grant.worker,
+                // The rows of this store keep no cost: the scheduler charges the lease its
+                // request.
+                cost: None,
             }),
             losses: self.losses,
             fate: self.fate,
@@ -408,18 +411,20 @@ pub(super) enum Held {
 
 mod blocks;
 mod codec;
-mod estimate;
+// `estimate`, `named` and `subject` hold the formats of the build-only rows, which the
+// adapter over `js-store` (`crate::farm_js`) writes too.
+pub(crate) mod estimate;
 mod ext;
 mod fate;
 mod floor;
 mod inflight;
 pub(super) mod intake;
 mod leases;
-mod named;
+pub(crate) mod named;
 mod opkey;
 mod owner;
 mod reads;
-mod subject;
+pub(crate) mod subject;
 mod sweep;
 mod transitions;
 
@@ -1729,6 +1734,8 @@ mod submit_tests;
 mod sweep_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod timing_tests;
 #[cfg(test)]
 mod transition_tests;
 #[cfg(test)]
