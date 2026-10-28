@@ -179,6 +179,7 @@ where
         Ok(desired) => json(StatusCode::OK, &desired),
         Err(SetError::Unauthorized(_)) => error(StatusCode::UNAUTHORIZED, "unauthorized"),
         Err(SetError::Unavailable) => error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        Err(SetError::Forbidden) => error(StatusCode::FORBIDDEN, "forbidden"),
         Err(SetError::Invalid(_)) => error(StatusCode::BAD_REQUEST, "bad_request"),
         Err(SetError::Store(why)) => {
             tracing::error!(%why, "the desired state could not be stored");

@@ -10,6 +10,7 @@ use crate::desired::DesiredStore;
 use crate::fleet::ORDER_AGE;
 use crate::identity::Identity;
 use crate::service::{CiRefused, Coordinator, SetError, Unauthorized};
+use crate::services::Services;
 use crate::testutil::{OPERATOR, Rig, beat, ci_token, clock_of, id, last, updating, version};
 
 const STATE: &str = r#"{"version":"2.0","max_updating":{"daemon":1},
@@ -421,6 +422,28 @@ async fn a_failed_report_ends_the_order() {
     );
 }
 
+/// Catches: a report of an earlier success, or of a failure of some other version, ending
+/// the order of the version asked for, which would give the slot away while the ordered
+/// update is still to come.
+#[tokio::test]
+async fn a_report_of_another_update_keeps_the_order() {
+    let rig = started("svc-order-other-failed", ONE_STORAGE).await;
+    let c = &rig.coordinator;
+    c.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    for report in [
+        last(beat("1.0"), "0.9", Outcome::Succeeded),
+        last(beat("1.0"), "1.5", Outcome::Failed),
+    ] {
+        c.heartbeat(storage("s2"), report);
+        assert_eq!(
+            c.heartbeat(storage("s3"), beat("1.0")),
+            Reply::Nothing,
+            "s2 still holds the slot it was ordered"
+        );
+    }
+}
+
 /// Catches: an order for a host that never reports holding its slot for ever.
 #[tokio::test]
 async fn an_order_nobody_reports_ages_out() {
@@ -556,4 +579,70 @@ async fn an_order_for_a_new_version_replaces_the_old_one() {
         Reply::Nothing,
         "the first order would have aged out by now; the one for 3.0 has not"
     );
+}
+
+const OTHER: &str = r#"{"service":"other","version":"3.0","min_up":{"storage":0,"frontend":0}}"#;
+
+fn with_services(rig: &mut Rig, text: &str) {
+    rig.coordinator =
+        Rig::start(&rig.dir, &rig.clock).with_services(Services::parse(text).expect("services"));
+}
+
+const OTHER_SERVICE: &str = "[[service]]\nname = \"other\"\n[service.roles.daemon]\n";
+
+/// Catches: a defined service that cannot be set, or one the file does not define that can:
+/// with `other` defined CI sets it (the status lists it beside kbf's), the heartbeat of a
+/// kbf host is still answered from kbf alone, and a service nobody defined is refused.
+#[tokio::test]
+async fn ci_sets_a_defined_service_and_kbf_is_unchanged() {
+    let mut rig = Rig::new("svc-defined");
+    with_services(
+        &mut rig,
+        &format!("ci_services = [\"kbf\", \"other\"]\n{OTHER_SERVICE}"),
+    );
+    rig.set(OTHER).await;
+    rig.set(STATE).await;
+    let status = rig.coordinator.status(Some(OPERATOR)).expect("status");
+    assert_eq!(status.services["other"].version.as_str(), "3.0");
+    assert_eq!(status.desired.expect("kbf").version.as_str(), "2.0");
+    rig.at(2_000);
+    let reply = rig
+        .coordinator
+        .heartbeat(who("d1", HostRole::Daemon), beat("1.0"));
+    assert_eq!(reply, update("2.0"));
+    let unknown = OTHER.replace("other", "unknown");
+    let set = rig
+        .coordinator
+        .set_desired(Some(&ci_token()), unknown.as_bytes())
+        .await;
+    assert!(matches!(set, Err(SetError::Invalid(_))));
+}
+
+/// Catches: a token that may set a service it was not given: with the allow-list naming
+/// only `other`, kbf is refused (and its state does not change) while `other` is set; with
+/// no list only kbf may be set.
+#[tokio::test]
+async fn a_token_sets_only_the_services_its_entry_names() {
+    let mut rig = Rig::new("svc-forbidden");
+    with_services(
+        &mut rig,
+        &format!("ci_services = [\"other\"]\n{OTHER_SERVICE}"),
+    );
+    let set = rig
+        .coordinator
+        .set_desired(Some(&ci_token()), STATE.as_bytes())
+        .await;
+    assert!(matches!(set, Err(SetError::Forbidden)));
+    assert!(SetError::Forbidden.to_string().contains("may not"));
+    rig.set(OTHER).await;
+    let status = rig.coordinator.status(Some(OPERATOR)).expect("status");
+    assert!(status.desired.is_none() && status.services.len() == 1);
+
+    with_services(&mut rig, OTHER_SERVICE);
+    let set = rig
+        .coordinator
+        .set_desired(Some(&ci_token()), OTHER.as_bytes())
+        .await;
+    assert!(matches!(set, Err(SetError::Forbidden)));
+    rig.set(STATE).await;
 }

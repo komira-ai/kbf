@@ -741,6 +741,26 @@ async fn the_desired_call_takes_a_service_and_refuses_an_unknown_one() {
     assert_eq!(reply, json!({"reply": "update", "version": "2.0"}));
 }
 
+/// Pins: a token whose entry may not set the service is a 403 `forbidden` that changes
+/// nothing.
+#[tokio::test]
+async fn a_service_the_token_may_not_set_is_a_403() {
+    let mut rig = Rig::new("http-forbidden");
+    rig.coordinator = Rig::start(&rig.dir, &rig.clock)
+        .with_services(crate::services::Services::parse("ci_services = []\n").expect("services"));
+    let body = r#"{"version":"2.0","min_up":{"storage":1,"frontend":1}}"#;
+    let (code, body) = call(
+        &rig,
+        Surface::Control,
+        &None,
+        request("POST", DESIRED_PATH, Some(&ci_token()), body),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    assert_eq!(body, json!({"error": "forbidden"}));
+    assert_eq!(status(&rig).await["desired"], Value::Null);
+}
+
 /// Catches: the status or the convergence losing a field a client already reads, or not
 /// saying which build answers: a coordinator that has seen no host and holds no desired state
 /// answers with exactly the earlier fields and one more, `commit`, the text `--version`
