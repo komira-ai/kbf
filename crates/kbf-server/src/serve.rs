@@ -95,6 +95,8 @@ pub struct Listeners {
     pub vm_host_floor: HostFloor,
     /// Whether the farm shows `kbf-estimator` what finished (`--learned-sizes`).
     pub learned_sizes: crate::LearnedSizes,
+    /// Whether placement reads the load the nodes report (`--placement-load`).
+    pub placement_load: crate::PlacementLoad,
     /// How long a finished operation is kept after its callers are answered, in which
     /// WaitExecution on it still streams its result; then it is NOT_FOUND.
     pub finished_retention: Duration,
@@ -791,14 +793,7 @@ where
         platform: listeners.default_platform,
         qos: listeners.qos_allowed,
     };
-    let farm = Farm::new(
-        Arc::clone(&cache),
-        listeners.unservable_wait,
-        listeners.finished_retention,
-    )
-    .with_memory_ladder(listeners.memory_ladder.clone())
-    .with_learned_sizes(listeners.learned_sizes, listeners.memory_ladder.first())
-    .recording(recorder.clone());
+    let farm = Farm::from_listeners(Arc::clone(&cache), &listeners).recording(recorder.clone());
     let durable = state.is_some();
     // Storage nodes register with a frontend that has a state store to keep them in.
     let members = members_of(state.as_ref(), None);

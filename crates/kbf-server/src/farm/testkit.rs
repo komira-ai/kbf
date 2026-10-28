@@ -39,6 +39,7 @@ impl TestCore {
         finished_retention: Duration,
     ) -> Self {
         let sched = Scheduler::new(term)
+            .with_load_config(crate::PlacementLoad::Off.config())
             .with_unservable_wait(unservable_wait)
             .with_finished_retention(finished_retention)
             .with_loss_requeues(LOSS_REQUEUES);
