@@ -120,6 +120,7 @@ fn a_report_the_scheduler_does_not_take_is_refused() {
         call: None,
         described: kbf_front::Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     })
     .expect("submitted");
     let report = Report {
@@ -162,6 +163,7 @@ fn a_request_keyed_by_something_other_than_an_action_is_refused() {
         call: None,
         described: kbf_front::Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     });
     let Err(status) = refused else {
         panic!("a request keyed by something other than an action was queued");

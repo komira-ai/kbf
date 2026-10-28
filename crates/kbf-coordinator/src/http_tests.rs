@@ -828,14 +828,74 @@ async fn a_service_order_goes_only_to_an_updater_that_sent_services() {
         r#"{"reply":"update","service":"other","version":"3.0"}"#
     );
     let kbf_inside = NEW_GOLDEN_BEAT.replace(r#""name":"other""#, r#""name":"kbf""#);
-    let (code, _) = raw(
+    let (code, dropped) = raw(
         &rig,
         Surface::Heartbeat,
         &updater("d3", "daemon"),
         request("POST", HEARTBEAT_PATH, None, &kbf_inside),
     )
     .await;
-    assert_eq!(code, 400);
+    assert_eq!(code, 200);
+    assert!(
+        !String::from_utf8(dropped)
+            .expect("text")
+            .contains("service")
+    );
+}
+
+/// Catches: a host losing its kbf updates over a bad services list, or a bad list going
+/// unseen: a heartbeat that lists kbf, or a name twice, is answered 200 as a kbf-only host
+/// (it is told the kbf update, in the old reply shape, and its services are not noted),
+/// `services_dropped` in the status goes up by one each time, and a heartbeat that is wrong
+/// otherwise (no version) is still 400 and not counted. The count is 0 before any.
+#[tokio::test]
+async fn a_bad_services_list_is_dropped_counted_and_the_host_still_updates() {
+    let rig = Rig::new("http-bad-services");
+    let who = updater("d1", "daemon");
+    rig.set(STATE).await;
+    rig.at(2_000);
+    assert_eq!(status(&rig).await["services_dropped"], json!(0));
+    let entry = |name: &str| format!(r#"{{"name":"{name}","version":"1.0","health":"healthy"}}"#);
+    let with = |list: &str| {
+        format!(
+            r#"{{"platform":"linux-x86_64","version":"1.0","health":"healthy","services":[{list}]}}"#
+        )
+    };
+    let kbf = with(&entry("kbf"));
+    let twice = with(&format!("{},{}", entry("other"), entry("other")));
+    for (i, body) in [kbf, twice].iter().enumerate() {
+        let (code, reply) = call(
+            &rig,
+            Surface::Heartbeat,
+            &who,
+            request("POST", HEARTBEAT_PATH, None, body),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(reply, json!({"reply": "update", "version": "2.0"}));
+        assert_eq!(status(&rig).await["services_dropped"], json!(i + 1));
+    }
+    let status = status(&rig).await;
+    assert_eq!(hosts(&status), [("d1".to_owned(), "daemon".to_owned())]);
+    assert_eq!(status["hosts"][0].get("services"), None);
+    let (code, _) = call(
+        &rig,
+        Surface::Heartbeat,
+        &who,
+        request(
+            "POST",
+            HEARTBEAT_PATH,
+            None,
+            r#"{"platform":"linux-x86_64","health":"healthy","services":[]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(status_count(&rig).await, json!(2));
+}
+
+async fn status_count(rig: &Rig) -> Value {
+    status(rig).await["services_dropped"].clone()
 }
 
 /// Catches: the status or the convergence losing a field a client already reads, or not
@@ -853,7 +913,7 @@ async fn the_status_and_the_convergence_say_the_build_commit_and_keep_their_fiel
     );
     assert_eq!(
         status(&rig).await,
-        json!({"desired": null, "services": {}, "quiet": true, "hosts": [], "commit": commit})
+        json!({"desired": null, "services": {}, "quiet": true, "services_dropped": 0, "hosts": [], "commit": commit})
     );
     let (code, body) = convergence(&rig, Some(&ci_token())).await;
     assert_eq!(code, StatusCode::OK);

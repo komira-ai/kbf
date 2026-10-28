@@ -57,6 +57,7 @@ fn placed(farm: &Farm) -> LoadCounters {
         call: None,
         described: kbf_front::Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     })
     .expect("submitted");
     farm.lock().sched.load_counters()

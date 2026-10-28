@@ -212,6 +212,7 @@ async fn a_recorded_call_that_joined_an_operation_elsewhere_ends_with_the_operat
         call: Some(call),
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     };
     let joined = b.submit(submission).expect("joined");
     let key = kbf_invocation::RecordKey::owner(kbf_invocation::InvocationId::new("build-1"));
