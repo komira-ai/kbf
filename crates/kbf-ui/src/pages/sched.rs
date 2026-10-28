@@ -91,7 +91,8 @@ pub(crate) struct WholeRequest {
 #[derive(Debug, Deserialize)]
 pub(crate) struct BarredWorker {
     pub(crate) worker: String,
-    pub(crate) until_in_ms: u64,
+    /// `None` for a bar that has no end.
+    pub(crate) until_in_ms: Option<u64>,
 }
 
 /// The queued operations of one platform and QoS level.

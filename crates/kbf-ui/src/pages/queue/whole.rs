@@ -119,7 +119,10 @@ pub(super) fn whole_node(h: &mut Html, whole: &WholeNode) {
                                 h.text(", ");
                             }
                             node_link(h, &barred.worker);
-                            h.text(&format!(" for {}", age(barred.until_in_ms)));
+                            match barred.until_in_ms {
+                                Some(ms) => h.text(&format!(" for {}", age(ms))),
+                                None => h.text(" with no end"),
+                            };
                         }
                     });
                 });

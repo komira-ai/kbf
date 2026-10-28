@@ -94,7 +94,7 @@ unit in the key and times are milliseconds since the Unix epoch.
   `state` is `early` (before `--whole-node-drain-after-secs`: `may_hold_in_ms`), `holding`
   (`worker`, `held_for_ms`, `deadline_in_ms` or `null` when the hold is never given up,
   `give_ups`, `draining`: whether the worker still has leases), `barred` (`give_ups` and
-  `barred`, each worker with `until_in_ms`), `stopped`, `queued` (nothing is recorded
+  `barred`, each worker with `until_in_ms`, `null` when the bar has no end), `stopped`, `queued` (nothing is recorded
   against it: it waits for a worker; the UI says "Waiting") or `unservable` (`unservable`
   is the scheduler's text, free-form, shown as it is and not to be matched on). `reason`
   is the `waiting` key: the state's name, and for `stopped` the cap (`cap_ceiling`,

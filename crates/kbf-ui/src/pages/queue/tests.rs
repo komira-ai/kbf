@@ -381,7 +381,7 @@ fn every_cap_has_words_and_an_unknown_state_is_shown_as_sent() {
         "barred",
         json!({"give_ups": 1, "barred": [
             {"worker": "node-a", "until_in_ms": 1_000},
-            {"worker": "node-b", "until_in_ms": 2_000}]}),
+            {"worker": "node-b", "until_in_ms": null}]}),
     ));
     doc["whole_node"]["requests"] = json!(requests);
     let (_, html) = page(&with(&doc), "/ui/queue");
@@ -406,7 +406,7 @@ fn every_cap_has_words_and_an_unknown_state_is_shown_as_sent() {
     assert!(
         html.contains(
             "<a href=\"/ui/leases?node=node-a\">node-a</a> for 1.0 s, \
-             <a href=\"/ui/leases?node=node-b\">node-b</a> for 2.0 s"
+             <a href=\"/ui/leases?node=node-b\">node-b</a> with no end"
         ),
         "{html}"
     );

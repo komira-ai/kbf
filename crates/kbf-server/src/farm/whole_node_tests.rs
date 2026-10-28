@@ -848,3 +848,70 @@ async fn a_granted_whole_machine_lease_is_held_not_waiting() {
     assert_eq!(document(&rig)["whole_node"]["requests"], json!([]));
     assert!(whole_series(&rig).contains(&"kbf_sched_whole_held 1".to_owned()));
 }
+
+/// Catches a document `ceiling` taken from `--whole-node-max` instead of the scheduler's
+/// (the capable workers less those kept for ordinary work, when that is fewer): three
+/// workers, a maximum of three and one kept, so the ceiling is two.
+#[tokio::test(start_paused = true)]
+async fn the_ceiling_is_the_schedulers_not_the_setting() {
+    let mut rig = Rig::new(
+        &["--whole-node-max=3", "--whole-node-keep-for-ordinary=1"],
+        &["node-a", "node-b", "node-c"],
+    );
+    rig.beat().await;
+    let summary = agree(&rig);
+    assert_eq!((summary.ceiling, summary.max_whole_node), (2, 3));
+    let section = document(&rig);
+    assert_eq!(section["whole_node"]["ceiling"], 2);
+    assert_eq!(section["whole_node"]["max_whole_node"], 3);
+}
+
+/// Catches a hold that is never given up shown with a deadline: after
+/// `--whole-node-max-reserve-attempts` give-ups the next hold has none, which the document
+/// shows as `null` (not 0, which would read as due now), with the give-up counted.
+#[tokio::test(start_paused = true)]
+async fn a_hold_that_is_not_given_up_again_has_a_null_deadline() {
+    let mut rig = Rig::new(
+        &[
+            "--whole-node-max=1",
+            "--whole-node-keep-for-ordinary=0",
+            "--whole-node-max-reserve-attempts=1",
+            "--whole-node-reserve-backoff-secs=1",
+        ],
+        &["node-a"],
+    );
+    rig.submit(10, LeaseKind::Action, Some(Duration::from_secs(600)));
+    let whole = rig.submit(1, LeaseKind::WholeMachine, Some(Duration::from_secs(20)));
+    rig.pass(Duration::from_secs(10)).await;
+    assert_eq!(shown(&document(&rig), whole)["deadline_in_ms"], 10_000);
+    rig.pass(Duration::from_secs(50)).await;
+    let section = document(&rig);
+    let request = shown(&section, whole);
+    assert_eq!(request["state"], "holding", "{request}");
+    assert_eq!(request["give_ups"], 1);
+    assert_eq!(request["deadline_in_ms"], Value::Null);
+}
+
+/// Catches a back-off with no end shown as a number: with a back-off of the longest
+/// possible length the bar's end is the end of time, and `until_in_ms` is `null`.
+#[tokio::test(start_paused = true)]
+async fn a_bar_with_no_end_shows_a_null_until() {
+    let mut rig = Rig::new(
+        &[
+            "--whole-node-max=1",
+            "--whole-node-keep-for-ordinary=0",
+            "--whole-node-reserve-backoff-secs=18446744073709551615",
+        ],
+        &["node-a"],
+    );
+    rig.submit(10, LeaseKind::Action, Some(Duration::from_secs(600)));
+    let whole = rig.submit(1, LeaseKind::WholeMachine, Some(Duration::from_secs(20)));
+    rig.pass(Duration::from_secs(30)).await;
+    let section = document(&rig);
+    let request = shown(&section, whole);
+    assert_eq!(request["state"], "barred", "{request}");
+    assert_eq!(
+        request["barred"],
+        json!([{"worker": "node-a", "until_in_ms": null}])
+    );
+}
