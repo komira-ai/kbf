@@ -35,7 +35,8 @@ fn request(qos: Qos, kind: LeaseKind) -> Request {
         key: ActionKey {
             instance: "i".to_owned(),
             action: d(3),
-        },
+        }
+        .into(),
         qos,
         kind,
         resources: Resources::new(1, 2),

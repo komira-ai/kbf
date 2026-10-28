@@ -157,7 +157,8 @@ use kbf_state::{
     Cond, Conflict, GENERATION, SHARED_WRITERS, Store, StoreError, Txn, Version, Versioned,
 };
 use kbf_types::{
-    ControlRecord, Digest, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, WaiterId, WorkerId,
+    ActionKey, ControlRecord, Digest, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, WaiterId,
+    WorkerId,
 };
 
 use tokio::sync::watch;
@@ -353,6 +354,8 @@ impl Progress {
 pub(super) struct StoredOperation {
     pub operation: OperationId,
     pub request: Request,
+    /// The action `request` runs: its key as the server names it.
+    pub action: ActionKey,
     /// The committed lease it holds.
     pub lease: Option<LeaseGrant>,
     /// How many of its leases were lost.
@@ -616,6 +619,12 @@ fn request_row(key: &str, row: &Versioned) -> Result<Request, StateError> {
     }
 }
 
+/// The action `request`, the one in the `op/` row `row`, runs: the key every request of
+/// the server's front is made with.
+fn action_of_request(row: &str, request: &Request) -> Result<ActionKey, StateError> {
+    ActionKey::try_from(&request.key).map_err(|why| corrupt(row, &why.to_string()))
+}
+
 fn number(key: &str, row: &Versioned) -> Result<u64, StateError> {
     let bytes = <[u8; 8]>::try_from(row.value.as_slice())
         .map_err(|_| corrupt(key, "not an 8-byte number"))?;
@@ -767,11 +776,13 @@ impl Durable {
         let mut operations = Vec::new();
         for (key, row) in self.scan_known_logged(OPERATION)? {
             let request = request_row(&key, &row)?;
+            let action = action_of_request(&key, &request)?;
             let operation = parse_operation(&key, OPERATION)?;
             let lease = leases.remove(&operation);
             operations.push(StoredOperation {
                 operation,
                 request,
+                action,
                 lease,
                 losses: losses.remove(&operation).unwrap_or(0),
                 fate: fates.remove(&operation),
@@ -1520,7 +1531,7 @@ impl State {
     /// a caller of its own that no client waits on, which the next request for the
     /// action joins.
     fn take_stored(&mut self, mut op: StoredOperation, now: SystemTime) -> Recovered {
-        let key = op.request.key.clone();
+        let key = op.action.clone();
         let waiter = self.machine.submit(Waiter {
             key: key.clone(),
             kind: op.request.kind,

@@ -13,7 +13,9 @@ use kbf_state::{
     Changes, Commit, CommitStats, Conflict, ManualClock, Revision, ScanPage, ScanRange, Store,
     StoreError, StoreTime, Txn, Versioned,
 };
-use kbf_types::{ActionKey, Digest, DigestFunction, LeaseKind, OperationId, Qos, Resources};
+use kbf_types::{
+    ActionKey, Digest, DigestFunction, LeaseKind, OperationId, Qos, Resources, WorkKey,
+};
 
 use tonic::Code;
 
@@ -105,7 +107,8 @@ fn request(tag: u8) -> Request {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
@@ -255,10 +258,10 @@ fn refuse(durable: &Durable, operation: u64) {
         .expect("refuse");
 }
 
-fn pin_row(store: &LostAck, key: &ActionKey) -> Option<Vec<u8>> {
+fn pin_row(store: &LostAck, key: &WorkKey) -> Option<Vec<u8>> {
     let prefix = "inflight/";
     let rows = store.scan_prefix(prefix).expect("scan");
-    let named = key.action.to_string();
+    let named = key.dedup.clone();
     rows.into_iter()
         .find(|(row, _)| row.ends_with(&named))
         .map(|(_, row)| row.value)
@@ -289,7 +292,7 @@ fn the_finish_removes_the_pin_of_its_own_operation_only() {
     let unpinned = durable.unpin(Txn::new(), OperationId(1)).expect("unpin");
     assert_eq!(unpinned.ops().len(), 1, "the owner's finish keeps its pin");
     let other = Txn::new().put(
-        format!("inflight/6d61696e/{}", key.action),
+        format!("inflight/6d61696e/{}", key.dedup),
         9_u64.to_be_bytes(),
         Cond::Any,
     );
@@ -310,7 +313,7 @@ fn a_pin_of_a_finished_operation_is_replaced() {
     let store = LostAck::new();
     let durable = durable_over(&store);
     let stale = Txn::new().put(
-        format!("inflight/{}/{}", "6d61696e", request(1).key.action),
+        format!("inflight/{}/{}", "6d61696e", request(1).key.dedup),
         7_u64.to_be_bytes(),
         Cond::Absent,
     );
@@ -441,7 +444,7 @@ fn a_pin_that_lands_after_the_look_is_not_written_over() {
         .submission(OperationId(5), &request(1), &subject(), None)
         .expect("encode")
         .put(
-            format!("inflight/6d61696e/{}", request(1).key.action),
+            format!("inflight/6d61696e/{}", request(1).key.dedup),
             5_u64.to_be_bytes(),
             Cond::Absent,
         );
@@ -467,7 +470,7 @@ fn a_pin_or_row_that_cannot_be_trusted_is_refused() {
             .is_ok()
     );
     let pin = Txn::new().put(
-        format!("inflight/6d61696e/{}", request(1).key.action),
+        format!("inflight/6d61696e/{}", request(1).key.dedup),
         0_u64.to_be_bytes(),
         Cond::Absent,
     );

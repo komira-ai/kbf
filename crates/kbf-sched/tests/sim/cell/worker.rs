@@ -13,7 +13,7 @@ use kbf_types::{
     WorkerId,
 };
 
-use super::{GIB, HEARTBEAT, Msg, leader_id, result_digest};
+use super::{GIB, HEARTBEAT, Msg, action_of, leader_id, result_digest};
 
 /// How long a daemon waits for `Welcome` before it opens another stream.
 const WELCOME_WAIT: Duration = Duration::from_secs(10);
@@ -529,7 +529,7 @@ impl Worker {
         if matches!(took, Took::Ran | Took::Unavailable | Took::Resend) {
             self.granted
                 .entry(lease)
-                .or_insert((self.epoch, start.key.action));
+                .or_insert((self.epoch, action_of(&start.key)));
         }
         match took {
             Took::Unavailable => {
@@ -544,7 +544,7 @@ impl Worker {
                     lease,
                     incarnation,
                     operation: start.operation,
-                    action: start.key.action,
+                    action: action_of(&start.key),
                     spans: Vec::new(),
                     open: Some(now),
                     left: Duration::from_secs(secs),

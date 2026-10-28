@@ -37,9 +37,9 @@ use kbf_sched::{
 };
 
 use kbf_types::{
-    ActionKey, Answer, ControlRecord, Effect, Failure, FarmFault, FarmRun, FarmTime, FencePolicy,
-    LeaseGrant, LeaseId, LostWhy, OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources,
-    ResultRecord, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
+    Answer, ControlRecord, Effect, Failure, FarmFault, FarmRun, FarmTime, FencePolicy, LeaseGrant,
+    LeaseId, LostWhy, OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources, ResultRecord,
+    StartLease, StateMachine, WaiterId, Waiting, WorkKey, WorkerId,
 };
 
 /// The scheduler's term in every F4 run.
@@ -138,7 +138,7 @@ pub struct Checker {
     ops: Vec<Op>,
     leases: BTreeMap<LeaseId, Lease>,
     queue: BTreeSet<(Reverse<Qos>, OperationId)>,
-    in_flight: BTreeMap<ActionKey, OperationId>,
+    in_flight: BTreeMap<WorkKey, OperationId>,
     next_seq: u64,
     needs: Vec<kbf_caps::Request>,
     answered: BTreeSet<WaiterId>,

@@ -9,8 +9,8 @@ use kbf_sched::{
     DaemonInstance, Event, Input, OpState, PLACEMENT_ROUND, Request, Scheduler, UNSERVABLE_WAIT,
 };
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, OperationId,
-    Qos, Refusal, RefusalRecord, Resources, StateMachine, WaiterId, Waiting, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, OperationId, Qos, Refusal,
+    RefusalRecord, Resources, StateMachine, WaiterId, Waiting, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -26,10 +26,7 @@ fn digest(n: u64) -> Digest {
 /// Action `n`, one core and 1 GiB, needing what the REAPI `platform` asks for.
 fn request(n: u64, platform: &[(&str, &str)]) -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: digest(n),
-        },
+        key: kbf_sim::work_key("main", digest(n)),
         qos: Qos::Ci,
         kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),

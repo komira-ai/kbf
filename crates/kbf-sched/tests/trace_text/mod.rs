@@ -64,8 +64,8 @@ pub fn request(request: &Request) -> String {
     format!(
         "request(instance={} action={} qos={} kind={} {} needs=[{}] hermetic={} \
          do_not_cache={})",
-        text::quoted(&request.key.instance),
-        text::digest(&request.key.action),
+        text::quoted(&request.key.class),
+        text::key_action(&request.key),
         qos(&request.qos),
         text::kind(request.kind),
         text::resources(&request.resources),

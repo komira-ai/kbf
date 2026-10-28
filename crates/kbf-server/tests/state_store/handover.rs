@@ -377,13 +377,14 @@ async fn a_successors_recorder_has_no_record_of_a_build_but_its_caller_is_answer
     };
     let key = kbf_invocation::RecordKey::owner(kbf_invocation::InvocationId::new("build-1"));
     let asked = request(1);
+    let action = action_of(1);
     let call = kbf_front::ExecuteCall::new(
         &before,
         &metadata,
         &Default::default(),
         "main",
-        asked.key.action,
-        asked.key.action,
+        action,
+        action,
     )
     .expect("a recorded call");
 

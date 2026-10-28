@@ -10,8 +10,8 @@ use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{DaemonInstance, Event, KeyFloor, Recovered, RecoveredLease, Request, Scheduler};
 use kbf_sim::SimRng;
 use kbf_types::{
-    ActionKey, Digest, DigestFunction, Effect, Failure, FarmTime, LeaseKind, OperationId, Outcome,
-    Qos, Resources, StartLease, WaiterId, WorkerId,
+    Digest, DigestFunction, Effect, Failure, FarmTime, LeaseKind, OperationId, Outcome, Qos,
+    Resources, StartLease, WaiterId, WorkKey, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -22,11 +22,11 @@ const KEY: u64 = 0x5eed;
 /// The seed of the generated farms.
 const SEED: u64 = 0x0f41_7bd3;
 
-fn action(n: u8, instance: &str) -> ActionKey {
-    ActionKey {
-        instance: instance.to_owned(),
-        action: Digest::new(DigestFunction::Sha256, [n; 32], u64::from(n)),
-    }
+fn action(n: u8, instance: &str) -> WorkKey {
+    kbf_sim::work_key(
+        instance,
+        Digest::new(DigestFunction::Sha256, [n; 32], u64::from(n)),
+    )
 }
 
 /// Action `n` of instance `main`: one core and `memory` bytes on Linux.
@@ -230,7 +230,7 @@ fn queued_operations_pick_up_the_floor_at_placement() {
 fn another_key_and_no_key_are_unchanged() {
     let mut f = farm_with_floor_16();
     let mut other = request(2, 4 * GIB);
-    other.key.instance = "other".to_owned();
+    other.key.class = "other".to_owned();
     f.submit_keyed(2, other, KEY + 1);
     f.submit(3, request(3, 4 * GIB));
     let starts = f.tick();

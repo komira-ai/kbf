@@ -15,7 +15,7 @@ use kbf_state::{
 use kbf_types::{
     ActionKey, Answer, Digest, DigestFunction, Failure, FarmFault, FarmRun, FencePolicy, LeaseKind,
     LostWhy, MemoryKill, MemoryRun, Outcome, Qos, Refusal, RefusalRecord, Resources, StartLease,
-    Waiting,
+    Waiting, WorkKey,
 };
 
 use super::*;
@@ -145,7 +145,8 @@ fn request(tag: u8) -> Request {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
@@ -153,6 +154,25 @@ fn request(tag: u8) -> Request {
         do_not_cache: false,
         needs: kbf_caps::Request::default(),
     }
+}
+
+/// Catches: a request whose key is not an action's being taken as one, which would put
+/// a made-up action in the rows that name the operation's action, or a corrupt row not
+/// said to be corrupt.
+#[test]
+fn a_request_whose_key_is_not_an_action_is_a_corrupt_row() {
+    let good = request(3);
+    let action = action_of_request("op/0000000000000003", &good).expect("an action");
+    assert_eq!(WorkKey::from(&action), good.key);
+    let bad = Request {
+        key: WorkKey::new("main", "not a digest"),
+        ..good
+    };
+    let error = action_of_request("op/0000000000000003", &bad).expect_err("not an action");
+    assert!(
+        matches!(&error, StateError::Corrupt { key, .. } if key == "op/0000000000000003"),
+        "{error:?}"
+    );
 }
 
 fn start(operation: u64, seq: u64) -> StartLease {
@@ -267,6 +287,7 @@ fn a_submitted_operation_is_loaded_queued() {
             operations: vec![StoredOperation {
                 operation: OperationId(4),
                 request: request(1),
+                action: ActionKey::try_from(&request(1).key).expect("an action"),
                 lease: None,
                 losses: 0,
                 fate: None,
@@ -1195,7 +1216,7 @@ fn a_fate_row_that_is_not_one_is_refused() {
     }
 }
 
-fn key_of(tag: u8) -> ActionKey {
+fn key_of(tag: u8) -> WorkKey {
     request(tag).key
 }
 
@@ -1359,12 +1380,12 @@ fn a_floor_row_that_is_not_one_is_refused() {
         assert_eq!(floor::decode(&bad), Err(why));
     }
 
-    let slashed = ActionKey {
-        instance: "a/b".to_owned(),
+    let slashed = WorkKey {
+        class: "a/b".to_owned(),
         ..key_of(1)
     };
-    let split = ActionKey {
-        instance: "a".to_owned(),
+    let split = WorkKey {
+        class: "a".to_owned(),
         ..key_of(1)
     };
     assert_ne!(floor::row_key(&slashed), floor::row_key(&split));
@@ -1372,8 +1393,8 @@ fn a_floor_row_that_is_not_one_is_refused() {
     assert!(floor::row_key(&key_of(1)).starts_with("floor/"));
 
     let long = Floor {
-        key: ActionKey {
-            instance: "i".repeat(usize::from(u16::MAX) + 1),
+        key: WorkKey {
+            class: "i".repeat(usize::from(u16::MAX) + 1),
             ..key_of(1)
         },
         ..floor
