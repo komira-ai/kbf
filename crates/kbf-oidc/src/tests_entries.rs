@@ -149,6 +149,82 @@ async fn a_token_of_one_entry_cannot_borrow_the_other() {
     assert_eq!(verifier.verify(&neither).await, Err(Refusal::Repository));
 }
 
+/// A token of one entry cannot borrow the other's environment, ref or event: entry A allows
+/// only environment `gamma`, ref `refs/heads/main` and `push`; entry B only `prod`,
+/// `refs/heads/b` and `workflow_dispatch`. A token of B's repository and workflow with any
+/// one of A's three values (the rest B's own) is refused, and so is A's with one of B's;
+/// with all of its own entry's values each is admitted by that entry.
+#[tokio::test]
+async fn no_entry_lends_its_environment_ref_or_event() {
+    let fields =
+        |env: &str, event: &str| format!("environments = [\"{env}\"]\nevent_names = [\"{event}\"]");
+    let a = entry(
+        "[[remote_operator]]",
+        "4242",
+        WORKFLOW,
+        &fields("gamma", "push"),
+    );
+    let b = entry(
+        "[[remote_operator]]",
+        "777",
+        OTHER_WORKFLOW,
+        &fields("prod", "workflow_dispatch"),
+    )
+    .replace("refs = [\"refs/heads/main\"]", "refs = [\"refs/heads/b\"]");
+    let verifier = verifier(&format!("{a}{b}"));
+    let own_a = [
+        ("environment", "gamma"),
+        ("ref", "refs/heads/main"),
+        ("event_name", "push"),
+    ];
+    let own_b = [
+        ("environment", "prod"),
+        ("ref", "refs/heads/b"),
+        ("event_name", "workflow_dispatch"),
+    ];
+    let claims = |id: &'static str, wf: &'static str, values: [(&'static str, &'static str); 3]| {
+        token(move |c| {
+            c["repository_id"] = json!(id);
+            c["job_workflow_ref"] = json!(wf);
+            for (field, value) in values {
+                c[field] = json!(value);
+            }
+        })
+    };
+    let who = verifier
+        .verify(&claims("4242", WORKFLOW, own_a))
+        .await
+        .expect("a with its own values");
+    assert_eq!(who.entry, 0);
+    let who = verifier
+        .verify(&claims("777", OTHER_WORKFLOW, own_b))
+        .await
+        .expect("b with its own values");
+    assert_eq!(who.entry, 1);
+    for i in 0..3 {
+        let mut b_with_a = own_b;
+        b_with_a[i] = own_a[i];
+        assert!(
+            verifier
+                .verify(&claims("777", OTHER_WORKFLOW, b_with_a))
+                .await
+                .is_err(),
+            "b with a's {}",
+            own_a[i].0
+        );
+        let mut a_with_b = own_a;
+        a_with_b[i] = own_b[i];
+        assert!(
+            verifier
+                .verify(&claims("4242", WORKFLOW, a_with_b))
+                .await
+                .is_err(),
+            "a with b's {}",
+            own_b[i].0
+        );
+    }
+}
+
 /// A token refused by every entry does not spend its `jti`; the admitted one does.
 #[tokio::test]
 async fn only_the_admitting_entry_spends_the_jti() {
