@@ -11,10 +11,11 @@ use rustls::pki_types::pem::PemObject;
 use super::container_health::ContainerHealth;
 use super::coordinator::{HttpsCoordinator, TlsFiles};
 use super::enroll::frontend_url;
-use super::flags::Config;
+use super::flags::{Config, ServiceConfig, ServiceDrain, ServiceHealth};
 use super::local::{Limits, LocalInstaller, SocketLocal};
 use super::renew::{FrontendRenewer, Renewer};
-use super::run::{Agent, Stop, World};
+use super::run::{Agent, ServicePorts, Stop, World};
+use super::service_health::ReadyUrl;
 use super::status::{Status, host_platform};
 use crate::identity::{Identity, identity_of};
 use crate::inventory::{Host, Role};
@@ -245,7 +246,8 @@ pub fn build(cfg: &Config) -> Result<Agent, String> {
     };
     let renewer = renewer_for(cfg)?;
     let coordinator = Arc::new(
-        HttpsCoordinator::new(cfg.coordinator.clone(), cfg.files.clone()).bound_to(identity),
+        HttpsCoordinator::new(cfg.coordinator.clone(), cfg.files.clone())
+            .bound_to(identity.clone()),
     );
     let world = World {
         coordinator,
@@ -258,13 +260,47 @@ pub fn build(cfg: &Config) -> Result<Agent, String> {
         log: Arc::new(|line| eprintln!("kbf-updater: {line}")),
     };
     let unknown = Version::parse("0").map_err(|e| e.to_string())?;
+    let services = cfg
+        .services
+        .iter()
+        .map(|service| service_ports(cfg, &identity, &host, service))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Agent::new(
         host,
         cfg.channel.clone(),
         cfg.timing,
         world,
         Status::unknown(platform, unknown),
-    ))
+    )
+    .with_services(services))
+}
+
+/// The ports of `service`: its own helper socket, the node's drain
+/// unless it declared none, and the node's health unless it declared a readiness URL. The
+/// frontend is needed only for what the service did not replace.
+pub(super) fn service_ports(
+    cfg: &Config,
+    identity: &Identity,
+    host: &Host,
+    service: &ServiceConfig,
+) -> Result<ServicePorts, String> {
+    let local = Arc::new(SocketLocal::new(&service.helper_socket, Limits::default()));
+    let node = || node_ports(cfg, identity, host.role, &local);
+    let drain = match service.drain {
+        ServiceDrain::None => no_drain(),
+        ServiceDrain::Node => node()?.0,
+    };
+    let health: Arc<dyn HealthCheck> = match &service.health {
+        ServiceHealth::Ready { addr, path } => Arc::new(ReadyUrl::new(*addr, path.clone())),
+        ServiceHealth::Node => node()?.1,
+    };
+    Ok(ServicePorts {
+        name: service.name.clone(),
+        channel: service.channel.clone(),
+        local,
+        drain,
+        health,
+    })
 }
 
 /// Run `agent` until the handle given to `ready` stops it. The exit code and text of the
