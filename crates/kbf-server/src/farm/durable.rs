@@ -165,8 +165,7 @@ use tokio::sync::watch;
 use tonic::Status;
 
 use super::{
-    Detail, Farm, FarmMachine, Reported, Sent, Stamp, State, Waiter, finished_of, process_term,
-    refused_as,
+    Detail, Farm, FarmMachine, Reported, Sent, Stamp, State, Waiter, finished_of, refused_as,
 };
 use crate::action_usage::Subject;
 use crate::learned::Row;
@@ -1572,7 +1571,7 @@ impl State {
         let Some(StateStore { store, epoch, .. }) = state else {
             return Ok(None);
         };
-        let (durable, epoch) = Durable::open(store, epoch, process_term())?;
+        let (durable, epoch) = Durable::open(store, epoch, self.ambient.term())?;
         durable
             .read_size_keys
             .store(self.learned.keys(), Ordering::SeqCst);
@@ -1585,7 +1584,7 @@ impl State {
         // marker) gives the epoch as the term. The farm gives out no name of the old form
         // over a store, so no client holds one for two frontends of a store to answer.
         self.machine = FarmMachine::new(durable.generation()?.unwrap_or(epoch));
-        let now = SystemTime::now();
+        let now = self.ambient.wall();
         let mut recovered = Vec::new();
         let mut keyed = Vec::new();
         // A start takes up the operations that wait for a lease, and none that holds one:
@@ -1727,7 +1726,7 @@ impl State {
     pub(super) fn take_in_stored(&mut self, op: StoredOperation) {
         let operation = op.operation;
         let stored_key = op.size_key.filter(|_| self.learned.keys());
-        let recovered = self.take_stored(op, SystemTime::now());
+        let recovered = self.take_stored(op, self.ambient.wall());
         // The operation is neither in the scheduler nor finished, so `take_in` has nothing
         // to refuse.
         let taken = self.sched.take_in(recovered);

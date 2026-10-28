@@ -80,6 +80,8 @@ hyper-util = { version = "0.1.21", default-features = false }
 js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "4b85a7953bd701c8163be179b24e2e83d91ec61b" }
 js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "4b85a7953bd701c8163be179b24e2e83d91ec61b" }
 js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "4b85a7953bd701c8163be179b24e2e83d91ec61b" }
+js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "4b85a7953bd701c8163be179b24e2e83d91ec61b" }
+js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "4b85a7953bd701c8163be179b24e2e83d91ec61b" }
 js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "4b85a7953bd701c8163be179b24e2e83d91ec61b" }
 md-5 = "0.11.0"
 # macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.

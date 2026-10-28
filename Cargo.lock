@@ -1341,6 +1341,20 @@ version = "0.1.0"
 source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
 
 [[package]]
+name = "js-state"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
+dependencies = [
+ "js-testkit",
+ "postgres",
+ "rusqlite",
+ "rustix",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1349,6 +1363,17 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "js-testkit"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
+dependencies = [
+ "libc",
+ "postgres",
+ "rustix",
+ "tokio",
 ]
 
 [[package]]
@@ -2488,6 +2513,7 @@ dependencies = [
  "kbf-route",
  "kbf-sched",
  "kbf-segments",
+ "kbf-server",
  "kbf-signer",
  "kbf-sim",
  "kbf-state",
@@ -2593,14 +2619,7 @@ dependencies = [
 name = "kbf-state"
 version = "0.1.0"
 dependencies = [
- "kbf-state",
- "kbf-testkit",
- "postgres",
- "rusqlite",
- "rustix",
- "thiserror",
- "tokio",
- "tracing",
+ "js-state",
 ]
 
 [[package]]
@@ -2688,11 +2707,7 @@ dependencies = [
 name = "kbf-testkit"
 version = "0.1.0"
 dependencies = [
- "kbf-testkit",
- "libc",
- "postgres",
- "rustix",
- "tokio",
+ "js-testkit",
 ]
 
 [[package]]
