@@ -21,8 +21,8 @@ use crate::request::{Channel, Unit};
 use crate::service::{Descriptor, ServiceName};
 use crate::trust::Trust;
 
-const JS_REPO: &str = "owner/js";
-const JS_WORKFLOW: &str = "owner/js/.github/workflows/release.yml";
+pub(super) const JS_REPO: &str = "owner/js";
+pub(super) const JS_WORKFLOW: &str = "owner/js/.github/workflows/release.yml";
 
 fn js_descriptor() -> Descriptor {
     Descriptor {
@@ -31,6 +31,7 @@ fn js_descriptor() -> Descriptor {
         binary: "js-agent".to_owned(),
         tree: "js-agent".to_owned(),
         units: vec![Unit::owned_by("js-agent", "js-agent.service").unwrap()],
+        container: None,
     }
 }
 
@@ -45,14 +46,14 @@ fn both_channels() -> String {
     )
 }
 
-fn js_kind() -> Kind {
+pub(super) fn js_kind() -> Kind {
     Kind {
         descriptor: js_descriptor(),
         channels: both_channels(),
     }
 }
 
-fn js_stable() -> Channel {
+pub(super) fn js_stable() -> Channel {
     Channel::new("js-stable").unwrap()
 }
 
@@ -445,6 +446,50 @@ fn the_production_hub_makes_backends_by_descriptor() {
         tree: "../x".to_owned(),
         ..js_descriptor()
     };
+    let fault = (hub.make)(&bad).err().unwrap();
+    assert!(refused(Code::ConfigInvalid)(&fault), "{fault:?}");
+}
+
+/// The hub of the program makes a container service by its descriptor: the update is the
+/// container kind's (its lock is the service's own), and a descriptor that is not a container's
+/// or cannot be laid out is not made as one.
+#[test]
+fn the_production_hub_makes_a_container_service_by_its_descriptor() {
+    use crate::local::frontend::production_service;
+    let entry: crate::service::Entry = toml::from_str(
+        "kind = \"container\"\nartifact = \"js-server\"\ntree = \"js-server\"\n\
+         [container]\nname = \"js-server\"\nrestart = \"always\"\nuser = \"1000\"\n\
+         ready_url = \"http://127.0.0.1:8080/readyz\"\n",
+    )
+    .unwrap();
+    let container = Descriptor::from_entry("js-server", &entry).unwrap();
+    let hub = production(&Trust::root(), Path::new("/var/lib/kbf-host-install"), 900);
+    let backend = (hub.make)(&container).unwrap();
+    assert_eq!(
+        backend.lock_file(),
+        Path::new("/run/kbf-host-install-js-server.lock")
+    );
+
+    let service = production_service(&container).ok().unwrap();
+    assert_eq!(
+        service.record_file,
+        Path::new("/var/lib/kbf-host-install/container-js-server.json")
+    );
+    assert_eq!(service.described, container.container);
+    assert!(service.bound_name.is_none());
+
+    let not_container = production_service(&js_descriptor()).err().unwrap();
+    assert!(not_container.contains("not a container service"));
+    let bad = Descriptor {
+        tree: "../x".to_owned(),
+        ..container
+    };
+    assert!(
+        production_service(&bad)
+            .err()
+            .unwrap()
+            .contains("not usable in a layout")
+    );
     let fault = (hub.make)(&bad).err().unwrap();
     assert!(refused(Code::ConfigInvalid)(&fault), "{fault:?}");
 }

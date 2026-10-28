@@ -120,8 +120,7 @@ pub fn production(trust: &Trust, state_dir: &Path, window_secs: u64) -> Hub<'sta
     Hub {
         describe: Box::new(move || describe(&reader, &path)),
         make: Box::new(|descriptor| {
-            super::linux::production_for(descriptor)
-                .map(|linux| Box::new(linux) as Box<dyn Backend>)
+            make_production(descriptor)
                 .map_err(|why| Fault::refused(super::answer::Code::ConfigInvalid, why))
         }),
         state_dir: state_dir.to_owned(),
@@ -129,4 +128,14 @@ pub fn production(trust: &Trust, state_dir: &Path, window_secs: u64) -> Hub<'sta
         window_secs,
         clock: Rc::new(super::production::unix_now),
     }
+}
+
+/// The backend of `descriptor` as the program runs it: a container service is updated as a
+/// container ([`super::frontend::production_service`]), any other as releases of a tree.
+fn make_production<'a>(descriptor: &Descriptor) -> Result<Box<dyn Backend + 'a>, String> {
+    if descriptor.container.is_some() {
+        return super::frontend::production_service(descriptor)
+            .map(|backend| Box::new(backend) as Box<dyn Backend>);
+    }
+    super::linux::production_for(descriptor).map(|linux| Box::new(linux) as Box<dyn Backend>)
 }

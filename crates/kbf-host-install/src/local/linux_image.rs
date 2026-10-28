@@ -72,6 +72,16 @@ fn write_public(path: &Path, text: &str) -> io::Result<()> {
 }
 
 impl<E: Exec> Linux<E> {
+    /// The image asset of this backend's service: the frontend's for kbf, and
+    /// `<artifact>-image-...` for a described one.
+    fn image_kind(&self) -> AssetKind {
+        if self.subject.name.is_kbf() {
+            AssetKind::FrontendImage
+        } else {
+            AssetKind::ServiceImage
+        }
+    }
+
     fn platform(prepared: &Prepared) -> String {
         format!("linux-{}", prepared.settings.arch)
     }
@@ -83,12 +93,13 @@ impl<E: Exec> Linux<E> {
         scratch: &Path,
     ) -> Result<(String, Files), Fault> {
         let platform = Self::platform(prepared);
+        let kind = self.image_kind();
         let gh = self.layout.join(&self.layout.gh());
         let home = scratch.join("home");
         let origin = &prepared.origin;
         let fetcher = Fetcher {
             origin,
-            asset: AssetKind::FrontendImage,
+            asset: kind,
             platform: &platform,
             runner: &*self.runner,
             curl: &self.tools.curl,
@@ -107,12 +118,8 @@ impl<E: Exec> Linux<E> {
             .fetch(&prepared.prefix, scratch)
             .map_err(fetch_fault)?;
         let files = Files {
-            image: scratch.join(AssetKind::FrontendImage.name_on(
-                origin.prefix(),
-                &platform,
-                &commit,
-            )),
-            bundle: scratch.join(bundle_of(&AssetKind::FrontendImage.name_on(
+            image: scratch.join(kind.name_on(origin.prefix(), &platform, &commit)),
+            bundle: scratch.join(bundle_of(&kind.name_on(
                 origin.prefix(),
                 &platform,
                 &commit,
@@ -158,7 +165,8 @@ impl<E: Exec> Linux<E> {
     ) -> Result<FetchedImage, Fault> {
         let id = commit_id(commit)?;
         let platform = Self::platform(prepared);
-        let name = AssetKind::FrontendImage.name_on(prepared.origin.prefix(), &platform, commit);
+        let kind = self.image_kind();
+        let name = kind.name_on(prepared.origin.prefix(), &platform, commit);
         let dir = self.make_check_dir(commit, prepared.who)?;
         let fetch_failed =
             |what: &str, e: io::Error| Fault::refused(Code::FetchFailed, format!("{what}: {e}"));

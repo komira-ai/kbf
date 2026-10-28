@@ -12,6 +12,14 @@ user = "65532:65532"
 # Optional, docker --group-add: numeric gids, quoted. A frontend that reaches kbf-signer's socket
 # through the signer's --client-group needs that group here, or a recreated container cannot sign.
 # group_add = ["990"]
+# Optional hardening, so that a recreated container keeps what the first one ran with. Each entry
+# is one docker argument: --read-only, --tmpfs, --cap-drop, --security-opt, --ulimit. Options that
+# loosen the container (seccomp/apparmor/label values, tmpfs exec/suid/dev) are refused.
+# read_only = true
+# tmpfs = ["/tmp:rw,size=256m"]
+# cap_drop = ["ALL"]
+# security_opt = ["no-new-privileges"]
+# ulimits = ["nofile=1048576:1048576"]
 # docker --publish, one entry each: the REAPI, worker and operator listeners as the load balancer
 # reaches them, and the operator API on this host's loopback for /readyz and /healthz.
 ports = ["8980:8980", "8981:8981", "127.0.0.1:8982:8982"]

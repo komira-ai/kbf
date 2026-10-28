@@ -660,6 +660,7 @@ artifact_prefix = "js-agent"
   cannot be trusted or read is `config_unsafe` or `config_invalid` for the service's requests,
   and until it can be read again the deadline of a release on trial of a service is not checked.
   On a Mac, and with `--layout deb|rpm` or `--frontend-container`, no service but kbf is served.
+  A service that runs as a container is described under "A container service".
 
 ## The local socket
 
@@ -835,6 +836,7 @@ container ([the example](../../packaging/host-agent/linux/host-install-frontend.
 | `name`, `restart` | the container's name and Docker's restart policy (`always`, `unless-stopped`, `on-failure[:N]`). `no` is refused: nothing else starts the container, so it would stay down after a reboot of the host or of Docker |
 | `network`, `user` | optional: `--network` and `--user` |
 | `group_add` | optional: a list of numeric group ids as quoted strings (`["990"]`), each passed as `--group-add <gid>` after `--user`, on the container a switch makes and on the old one put back. Each is decimal digits only, from 1 to 4294967295: no name, sign, space or `0`, and `config_invalid` otherwise. A frontend that reaches `kbf-signer`'s socket through the signer's `--client-group` needs that group's id here, or a recreated container can no longer sign |
+| `read_only`, `tmpfs`, `cap_drop`, `security_opt`, `ulimits` | optional hardening, so that a recreated container keeps what the first one ran with: `read_only = true` is `--read-only`; the lists are passed one `--tmpfs`, `--cap-drop`, `--security-opt` or `--ulimit` per entry, after `--user`, on the container a switch makes and on the old one put back. Each entry is one argument and must have the documented shape, or the switch is `config_invalid`. `tmpfs`: `/PATH` or `/PATH:OPTIONS` (path of letters, digits and `_ . -`, no `..`; options `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `size=N[k\|m\|g]`, `mode=`, `uid=`, `gid=`, `nr_inodes=`; not `exec`, `suid` or `dev`). `cap_drop`: `ALL` or a capital-letter name such as `NET_RAW`. `security_opt`: only `no-new-privileges`; `seccomp=`, `apparmor=`, `label=` and `no-new-privileges=false` are refused because they can loosen the container, and there is no `cap_add`. `ulimits`: `NAME=SOFT` or `NAME=SOFT:HARD` for a resource docker knows (`nofile`, `nproc`, `core`, ...), decimal digits, soft not above hard |
 | `ports`, `mounts`, `command` | `--publish` and `--volume` entries, and the flags after the image; each entry is one argument, never a shell word |
 | `api` | where this host reaches the frontend's operator API (a published port, or the host's own listen address under `network = "host"`), for `/readyz` and `/healthz` |
 | `drain_token_file` | the operator token as a path **inside** the container |
@@ -842,10 +844,11 @@ container ([the example](../../packaging/host-agent/linux/host-install-frontend.
 | `drain_secs` | optional (default 180, at most 1800): how long a drain is waited for |
 | `ready_secs` | optional (default 90, 10 to 600): how long a new container has to be ready |
 
-`group_add` is written into the record only when it is set, so that a host that sets none writes
-the record it always did and an older helper still reads it. **A host that sets `group_add` must
-settle (confirm) or revert any release on trial before the helper is rolled back to a version
-without `group_add`**: that version refuses a record with a key it does not know, and could not run
+`group_add` and the hardening keys are written into the record only when they are set, so that a host
+that sets none writes the record it always did and an older helper still reads it. **A host that sets
+`group_add` or any of `read_only`, `tmpfs`, `cap_drop`, `security_opt` and `ulimits` must settle
+(confirm) or revert any release on trial before the helper is rolled back to a version without
+them**: that version refuses a record with a key it does not know, and could not run
 the deadline revert.
 
 A switch has to fit `--window-secs`: `drain_secs` + 30 (the stop) + `ready_secs` is checked against
@@ -955,6 +958,90 @@ the two. So each file must give its frontend its own state directory and, when
 `--history-objects` is a `file://` directory, its own history directory. The file store locks
 `LOCK` in that directory (`crates/kbf-objstore/src/fs_store.rs:294-304`), so a second frontend on
 the same directory fails to start.
+
+### A container service
+
+A service other than kbf can be a container: the channel and the five requests are the ones of
+"A channel of another service", and the update is the frontend container's (load the release's
+attested image, replace the container with one made from the same run configuration, wait until
+it is ready, keep it on trial until it is confirmed or its deadline reverts to the old image).
+The helper that serves services is the installer-layout socket helper (no
+`--frontend-container`); the frontend container kind itself serves kbf's frontend alone and
+refuses every other service. The frontend's own behaviour, files and record are unchanged.
+
+The descriptor says `kind = "container"` and has a `container` table instead of `binary` and
+`units`. All of it is in the same root-owned channels file:
+
+```toml
+[services.js-server]
+kind = "container"
+artifact = "js-server"           # the image file is js-server-image-<commit>-linux-<arch>.oci.tar
+tree = "js-server"               # scratch and checks in /var/lib/<tree>/work
+
+[services.js-server.container]
+name = "js-server"               # the service's name, or it and a dash and more
+restart = "unless-stopped"
+network = "bridge"               # optional; not "host"
+user = "65532:65532"             # required; neither part root or 0
+group_add = ["990"]              # optional
+read_only = true                 # optional, with tmpfs, cap_drop, security_opt, ulimits
+ports = ["127.0.0.1:8080:8080"]
+mounts = ["/etc/js:/etc/js:ro"]
+command = ["--config", "/etc/js/server.toml"]
+ready_url = "http://127.0.0.1:8080/readyz"      # required
+version_url = "http://127.0.0.1:8080/version"   # optional
+drain_token_file = "/etc/js/operator.token"     # optional
+drain_secs = 60                  # optional, with drain_token_file only
+ready_secs = 90                  # optional, 10 to 600
+```
+
+- **The image.** The release carries `<artifact>-image-<commit>-linux-<arch>.oci.tar` and its
+  attestation bundle beside `SHA256SUMS`, as the frontend's `kbf-frontend-image-...` does. It is
+  fetched and checked the same way (the sha256 against the release's sums and the channel's
+  pinned sums, then `gh attestation verify` offline for the channel's repository and signer,
+  the full commit, hosted runners) before the container runtime sees it. The image must be
+  tagged `<artifact>:<commit>` (the full commit), which is what `docker image load` gives it and
+  what the helper looks up.
+- **The run configuration** has the frontend configuration's keys and rules, checked when the
+  file is read: no shell words (each entry is one `docker` argument), `restart` is not `no`,
+  `security_opt` only tightens (`no-new-privileges`), `tmpfs` options cannot add `exec`, `suid`
+  or `dev`, and `group_add` is a number from 1. A service is held to more: `user` is required
+  and is not root (not `root` or `0`, in either part); `network = "host"` is refused; a mount's
+  source cannot be `/`, `/run`, `/var`, `/var/run`, `/proc`, `/sys` or `/dev`, anything under
+  `/proc`, `/sys`, `/dev`, `/run/docker`, `/var/run/docker`, `/var/lib/docker` or
+  `/var/lib/containerd`, a `.sock` file or a path with `..`; and the container's name is the
+  service's. A service cannot ask for the image's own default user or for another service's
+  container name.
+- **Readiness is a real probe.** `ready_url` is `http://`, an IP address of loopback and a port,
+  and a plain path (letters, digits, `/ _ . -`; no query, no `..`); it must answer a 2xx status
+  within `ready_secs` after the container is made, for the new container and again for the old
+  one when it is put back. `version_url`, if given, is on the same address and must answer 200 with
+  JSON whose `commit` is the first 12 or more hex digits of the release's commit; without it only
+  the 2xx is asked. A descriptor with no `ready_url` is not a descriptor: the whole file is
+  `config_invalid`.
+- **The drain** is none unless `drain_token_file` (a path inside the container) is given. With
+  it, the helper runs `/usr/bin/kbf cluster drain --frontend --token-file <file>` in the
+  container (so the image must hold that program and its operator API on loopback) and waits
+  until the container ends or `drain_secs` (default 180) is out. A single instance with no drain
+  is stopped, removed and made again. `restart` is switched to `no` before either, so that a
+  stopped container is not brought back by the runtime.
+- **The five requests** are `install`, `switch`, `confirm`, `revert` and `query` for
+  `js-server`, with the container's rules: `install` loads the image and records its id (the
+  container is made from the id that was checked, never from a tag); `switch` writes the
+  pending marker with the deadline and the descriptor's run configuration before anything is
+  stopped, and fails (`switch_failed`) with the old image back when the step or the probe fails;
+  `confirm` clears the marker and forgets the old image; `revert`, and the deadline, make the
+  container again from the old image and the configuration of the switch (a descriptor edited
+  meanwhile does not change what is put back). A switch whose drain, stop and readiness waits
+  cannot fit in the trial window is refused before anything is stopped (`config_invalid`).
+- **Its own files.** The record is `container-<name>.json` and the A/B state
+  `state-<name>.json` in `/var/lib/kbf-host-install`, the install lock
+  `/run/kbf-host-install-<name>.lock`, the download and check directories are under
+  `/var/lib/<tree>/work`. The first release is the container that runs already: its image tag
+  says which release it is, and nothing is recorded before the first switch.
+- The record holds a `service` object that a frontend's record never has. A helper from before
+  this change reads it as an unknown key and refuses it, so settle or revert any release on trial
+  before rolling the helper back.
 
 ### On a Mac
 

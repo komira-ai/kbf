@@ -905,6 +905,41 @@ fn the_running_commit_is_the_release_the_daemon_process_executes() {
 
 // ---- the files of a release ----
 
+/// A container service's image is `<prefix>-image-<commit>-<platform>.oci.tar`; it gives its
+/// commit back for its own prefix and platform only, and the frontend's image is not one.
+#[test]
+fn a_service_image_has_its_own_name_and_commit() {
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let service = AssetKind::ServiceImage;
+    let name = service.name_on("js-server", "linux-arm64", commit);
+    assert_eq!(
+        name,
+        format!("js-server-image-{commit}-linux-arm64.oci.tar")
+    );
+    assert_eq!(service.extension(), "oci.tar");
+    assert_eq!(
+        service.commit_of_name_on("js-server", "linux-arm64", &name),
+        Some(commit)
+    );
+    assert_eq!(
+        service.commit_of_name_on("other", "linux-arm64", &name),
+        None
+    );
+    assert_eq!(
+        service.commit_of_name_on("js-server", "linux-x86_64", &name),
+        None
+    );
+    let frontend = AssetKind::FrontendImage.name_on("kbf", "linux-arm64", commit);
+    assert_eq!(
+        service.commit_of_name_on("kbf", "linux-arm64", &frontend),
+        None
+    );
+    assert_eq!(
+        AssetKind::FrontendImage.commit_of_name_on("js-server", "linux-arm64", &name),
+        None
+    );
+}
+
 /// A release file is named for its kind, platform and commit, its bundle is the same name with
 /// `.sigstore.json`, and a name gives its commit back only for its own kind and platform.
 #[test]

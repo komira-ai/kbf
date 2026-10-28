@@ -88,15 +88,10 @@ impl Files {
     }
 }
 
-/// The tag the image of `commit` is loaded as.
-pub fn image_tag(commit: &str) -> String {
-    format!("{IMAGE_REPOSITORY}:{commit}")
-}
-
-/// The commit in an image reference `kbf-frontend:<commit>`.
-pub fn commit_of_ref(reference: &str) -> Option<&str> {
+/// The commit in an image reference `<repository>:<commit>`.
+pub fn commit_of_ref_in<'a>(repository: &str, reference: &'a str) -> Option<&'a str> {
     reference
-        .strip_prefix(IMAGE_REPOSITORY)?
+        .strip_prefix(repository)?
         .strip_prefix(':')
         .filter(|commit| is_commit(commit))
 }
@@ -155,6 +150,10 @@ pub struct Frontend<S: ImageSource, R: Runtime, P: Probe> {
     /// file: the files above were named after it, so a configuration that names another
     /// container is refused.
     pub bound_name: Option<String>,
+    /// The configuration of a container service, from its descriptor: set, it is the
+    /// configuration (the file `config_file` is not read), its images are loaded as
+    /// `<repository>:<commit>` and its probes are the descriptor's. The frontend has none.
+    pub described: Option<FrontendConfig>,
     pub pace: Pace,
 }
 
@@ -182,7 +181,18 @@ fn drain_argv(config: &FrontendConfig) -> Vec<String> {
 }
 
 impl<S: ImageSource, R: Runtime, P: Probe> Frontend<S, R, P> {
+    /// The repository the images of this container are loaded as.
+    fn repository(&self) -> &str {
+        self.described
+            .as_ref()
+            .and_then(|config| config.service.as_ref())
+            .map_or(IMAGE_REPOSITORY, |service| service.repository.as_str())
+    }
+
     fn config(&self) -> Result<FrontendConfig, Fault> {
+        if let Some(described) = &self.described {
+            return Ok(described.clone());
+        }
         let config = FrontendConfig::load(&self.host.trust, &self.config_file)
             .map_err(|why| Fault::refused(Code::ConfigInvalid, why))?;
         match &self.bound_name {
@@ -227,18 +237,37 @@ impl<S: ImageSource, R: Runtime, P: Probe> Frontend<S, R, P> {
     fn wait_ready(&self, config: &FrontendConfig, commit: &str) -> Result<(), String> {
         let start = (self.pace.now)();
         loop {
-            let ready = probe::ready(&self.probe, config.api);
-            let said = probe::commit(&self.probe, config.api);
-            let names = said
-                .as_deref()
-                .is_some_and(|said| said.len() >= 12 && commit.starts_with(said));
+            let (ready, said, asks) = match &config.service {
+                None => {
+                    let said = probe::commit(&self.probe, config.api);
+                    (probe::ready(&self.probe, config.api), said, true)
+                }
+                Some(service) => (
+                    probe::answers_2xx(&self.probe, config.api, &service.ready_path),
+                    service
+                        .version_path
+                        .as_deref()
+                        .and_then(|path| probe::commit_at(&self.probe, config.api, path)),
+                    service.version_path.is_some(),
+                ),
+            };
+            // The release is named by the version the service says, when it says one.
+            let names = !asks
+                || said
+                    .as_deref()
+                    .is_some_and(|said| said.len() >= 12 && commit.starts_with(said));
             if ready && names {
                 return Ok(());
             }
             let waited = (self.pace.now)().saturating_sub(start);
             if waited >= Duration::from_secs(config.ready_secs) {
+                let what = if config.service.is_some() {
+                    "the service"
+                } else {
+                    "the frontend"
+                };
                 return Err(format!(
-                    "the frontend is not ready on {} after {} s (ready: {ready}, commit: {})",
+                    "{what} is not ready on {} after {} s (ready: {ready}, commit: {})",
                     commit.get(..12).unwrap_or(commit),
                     config.ready_secs,
                     said.as_deref().unwrap_or("none"),
@@ -261,7 +290,8 @@ impl<S: ImageSource, R: Runtime, P: Probe> Frontend<S, R, P> {
         // The container ends by itself once drained; a policy that restarts it would bring
         // the old release back before the new one is made.
         self.runtime.set_restart(name, "no").map_err(say)?;
-        if running {
+        let drain = config.service.as_ref().is_none_or(|service| service.drain);
+        if running && drain {
             self.runtime.exec(name, &drain_argv(config)).map_err(say)?;
             self.wait_ended(config)?;
         }
@@ -323,7 +353,7 @@ impl<S: ImageSource, R: Runtime, P: Probe> Backend for Frontend<S, R, P> {
             .map_err(runtime_fault)?;
         Ok(container
             .as_ref()
-            .and_then(|c| commit_of_ref(&c.image_ref))
+            .and_then(|c| commit_of_ref_in(self.repository(), &c.image_ref))
             .map(str::to_owned))
     }
 
@@ -349,7 +379,7 @@ impl<S: ImageSource, R: Runtime, P: Probe> Backend for Frontend<S, R, P> {
     fn stage(&self, version: &Version, channel: &Channel) -> Result<String, Fault> {
         let fetched = self.source.fetch(version, channel)?;
         self.runtime.load(&fetched.file).map_err(runtime_fault)?;
-        let tag = image_tag(&fetched.commit);
+        let tag = format!("{}:{}", self.repository(), fetched.commit);
         let id = self
             .runtime
             .image_id(&tag)
@@ -512,8 +542,46 @@ pub fn production(
         config_file,
         record_file: Path::new(super::production::LINUX_STATE_DIR).join(files.record),
         bound_name: bound,
+        described: None,
         pace: Pace::real(),
     }
+}
+
+/// The container service `descriptor` describes (one with a container), as the program runs
+/// it: its image comes from the service's own channel, its record and lock are its own.
+///
+/// # Errors
+/// The descriptor is not a container's, or its tree is not a tree name.
+#[cfg(target_os = "linux")]
+pub fn production_service(
+    descriptor: &crate::service::Descriptor,
+) -> Result<Frontend<super::linux::Linux<kbf_host::HostExec>, runtime::Docker, probe::Http>, String>
+{
+    let described = descriptor
+        .container
+        .clone()
+        .ok_or_else(|| format!("{} is not a container service", descriptor.name.as_str()))?;
+    let source = super::linux::production_for(descriptor)?;
+    let mut host = Host::production();
+    host.install_lock = source.host.install_lock.clone();
+    Ok(Frontend {
+        source,
+        runtime: runtime::Docker::new(
+            Box::new(crate::runner::SystemRunner),
+            Path::new("/usr/bin/docker").to_path_buf(),
+        ),
+        probe: probe::Http {
+            limit: Duration::from_secs(5),
+            now: crate::pace::real_now(),
+        },
+        host,
+        config_file: PathBuf::new(),
+        record_file: Path::new(super::production::LINUX_STATE_DIR)
+            .join(format!("container-{}.json", descriptor.name.as_str())),
+        bound_name: None,
+        described: Some(described),
+        pace: Pace::real(),
+    })
 }
 
 #[cfg(test)]
@@ -526,6 +594,8 @@ mod probe_tests;
 mod record_tests;
 #[cfg(test)]
 mod runtime_tests;
+#[cfg(test)]
+mod service_tests;
 #[cfg(test)]
 mod several_tests;
 #[cfg(test)]
