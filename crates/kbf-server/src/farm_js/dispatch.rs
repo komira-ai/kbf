@@ -29,6 +29,7 @@ use tonic::Status;
 use super::adapter::{KbfAdapter, Wall, wire_lease};
 use super::ext::KbfExt;
 use super::host::{Caller, Connection};
+use super::learning::Sized;
 use crate::action_usage::{Measured, Shapes};
 use crate::answer;
 use crate::farm::Reported;
@@ -126,6 +127,13 @@ pub fn submit(
     // Outside the lock: hashes the action's shape and drops its argv and paths.
     let usage = shapes.subject(std::mem::take(&mut submission.described));
     let shape = submission.call.as_ref().map(|_| usage.recorded());
+    let sized = Sized {
+        kind: submission.request.kind,
+        gpus: submission.request.resources.gpus,
+        memory_bytes: submission.request.resources.memory_bytes,
+        cpu_millis: submission.request.resources.cpu_millis,
+        evidence: submission.evidence,
+    };
     let call = submission
         .call
         .take()
@@ -148,7 +156,10 @@ pub fn submit(
         .submit(now, submission.request, &parcel, enrol)
         .map_err(unavailable)?;
     // A caller that joined an operation that holds a lease sees it executing.
-    core.with(|view, adapter| adapter.mark_joined(view, &admitted));
+    core.with(|view, adapter| {
+        adapter.mark_joined(view, &admitted);
+        adapter.learn_submit(view, &admitted, &sized);
+    });
     Ok(Ticket {
         name: stored_name(admitted.operation),
         instance,

@@ -123,5 +123,6 @@ pub fn open(
 ) -> Result<Core<KbfAdapter>, StateError> {
     let observer = KbfObserver::new(adapter.cache.clone());
     let core = Core::open(config, adapter, storage(store, epoch), now)?;
+    core.with(|_, adapter| adapter.restore_learned());
     Ok(core.with_observer(observer))
 }

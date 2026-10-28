@@ -44,11 +44,12 @@ impl Drop for Taking<'_> {
 /// tick old.
 fn publish(js: &JsFarm) {
     let metrics = js.cache.metrics();
-    js.core.with(|view, _| {
+    js.core.with(|view, adapter| {
         let sched = view.sched();
         metrics.sched_queued.set(sched.queued_len() as u64);
         metrics.sched_leases.set(sched.leases_held() as u64);
         metrics.sched_whole.set(sched.whole_summary().as_ref());
+        adapter.publish_learned();
     });
 }
 
@@ -132,6 +133,7 @@ pub(crate) async fn report(
 /// [`Farm::tick`](crate::farm::Farm::tick).
 pub(crate) async fn tick(js: &JsFarm) {
     js.core.tick(js.now()).await;
+    js.core.with(|_, adapter| adapter.flush_learned());
     publish(js);
 }
 

@@ -42,6 +42,7 @@ use tonic::Code;
 
 use super::codec::KbfRowCodec;
 use super::facts::WorkerFacts;
+use super::learning::Learning;
 use super::report_hooks::ReportHooks;
 use crate::action_usage::Subject;
 use crate::answer::{Detail, Pending, failed, finished_of, refused_as};
@@ -104,6 +105,8 @@ pub struct KbfAdapter {
     unreadable_results: u64,
     /// What the hooks around a report keep between them ([`super::report_hooks`]).
     pub(super) hooks: ReportHooks,
+    /// What the estimator is shown ([`super::learning`]).
+    pub(super) learning: Learning,
 }
 
 /// The `LeaseId` of the wire.
@@ -164,6 +167,7 @@ impl KbfAdapter {
             failed: FailedActions::default(),
             unreadable_results: 0,
             hooks: ReportHooks::default(),
+            learning: Learning::off(),
         }
     }
 
@@ -291,14 +295,18 @@ impl KbfAdapter {
 }
 
 impl Adapter for KbfAdapter {
+    fn clock(&mut self, now: FarmTime) {
+        self.learning_clock(now);
+    }
+
     fn before_report(
         &mut self,
         view: &View<'_>,
         _now: FarmTime,
-        _worker: &WorkerId,
+        worker: &WorkerId,
         report: &Report,
     ) {
-        self.note_report_start(view, report);
+        self.note_report_start(view, worker, report);
     }
 
     fn after_report(
@@ -400,6 +408,7 @@ impl Adapter for KbfAdapter {
         sent.into_iter()
             .for_each(|sent| self.machine.start(start.lease, sent));
         self.record_started(start);
+        self.learning_started(start);
     }
 
     /// Tells `worker` to stop the run of `lease`. A stream that has just ended drops the
@@ -438,6 +447,7 @@ impl Adapter for KbfAdapter {
 
     fn requeued(&mut self, requeue: &Requeue) {
         self.record_requeue(requeue);
+        self.learning_requeued(requeue);
     }
 
     /// Works out what the callers of a finished operation get, and keeps them until the

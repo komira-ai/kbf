@@ -26,6 +26,7 @@ pub mod dispatch;
 pub mod ext;
 mod facts;
 pub mod host;
+mod learning;
 pub mod load;
 pub mod open;
 mod record;
