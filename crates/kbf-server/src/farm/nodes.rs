@@ -13,6 +13,7 @@ impl Farm {
     /// This build, and every node registered since this farm started, in node-id order,
     /// with the oldest protocol version among them ([`NodesView::of_this_build`]).
     pub fn nodes(&self) -> NodesView {
+        js_arm!(self, views::nodes());
         let mut state = self.lock();
         state.side.note_closed_streams();
         let nodes = state
@@ -26,6 +27,7 @@ impl Farm {
 
     /// `worker` as `GET /v1/nodes` lists it, if it has registered.
     pub fn node_view(&self, worker: &WorkerId) -> Option<NodeView> {
+        js_arm!(self, views::node_view(worker));
         let mut state = self.lock();
         state.side.note_closed_streams();
         state
@@ -50,6 +52,7 @@ impl Farm {
     /// The node is another frontend's and the state store could not be read; or the store
     /// cannot say who holds the node, and it is not connected to this frontend.
     pub fn node_detail(&self, worker: &WorkerId) -> Result<Option<NodeDetail>, NodeUnread> {
+        js_arm!(self, views::node_detail(worker));
         let now = self.now();
         let mut guard = self.lock();
         let state = &mut *guard;

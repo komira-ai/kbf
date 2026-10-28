@@ -45,6 +45,10 @@ fn the_flag_defaults_to_legacy_and_takes_only_its_two_values() {
 /// `legacy` refused, a message that does not name the flag and the value, and an exit
 /// status other than the one of a refused flag (2, which systemd does not restart).
 #[test]
+#[cfg_attr(
+    feature = "farm-core-js",
+    ignore = "a build with farm-core-js has the js core"
+)]
 fn js_is_refused_naming_the_flag_and_exits_as_a_refused_flag_does() {
     Args::parse_from(["kbf-server"])
         .check_scheduler_core()
@@ -119,6 +123,10 @@ fn the_gauge_is_one_for_the_running_core_and_zero_for_the_other() {
 /// logged, and by `start` before it creates any of the store, metadata, state or log
 /// paths it is given.
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    feature = "farm-core-js",
+    ignore = "a build with farm-core-js has the js core"
+)]
 async fn a_start_logs_the_core_and_js_is_refused_before_anything_opens() {
     let root = crate::test_dir::scratch_dir("kbf-server-scheduler-core");
     let open = |name: &'static str| {

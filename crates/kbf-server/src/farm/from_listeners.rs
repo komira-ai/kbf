@@ -16,8 +16,9 @@ impl Farm {
     /// recorder, the state store).
     #[must_use]
     pub(crate) fn from_listeners(cache: impl Into<Backend>, listeners: &Listeners) -> Self {
-        Self::new(
-            cache,
+        Self::on_core(
+            listeners.scheduler_core,
+            cache.into(),
             listeners.unservable_wait,
             listeners.finished_retention,
         )

@@ -2,22 +2,85 @@
 //!
 //! A farm's methods reach its engine through [`Driver`], so a second engine is a new
 //! variant and one new arm in the methods that differ, not a change to every method.
-//! Today there is one: the farm's own scheduler, engine and side under one lock.
+//! The farm's own scheduler, engine and side under one lock is [`Driver::Legacy`]. With the
+//! `farm-core-js` feature there is a second, [`Driver::Js`]: the core of `crate::farm_js`.
+//!
+//! A method of the farm that differs by engine starts with [`js_arm!`], which returns the
+//! result of the matching function in `farm::js` when the farm runs on the second engine
+//! and expands to nothing without the feature.
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use kbf_front::Recorder;
 use kbf_sched::{MEMORY_FLOORS, MemoryLadder, Scheduler, WholeNodeConfig};
 
 use super::State;
+use super::durable::ORPHAN_WAIT;
 use super::engine::HELD_CAP;
+#[cfg(feature = "farm-core-js")]
+use super::js::JsFarm;
 use crate::learned::{Learned, LearnedSizes};
 use crate::placement_load::PlacementLoad;
 
+/// Returns from the enclosing method with `farm::js::<group>::<method>(js, args..)` when
+/// the farm runs on the js core: `js_arm!(self, hot::resize(worker, stream, reported))`.
+#[cfg(feature = "farm-core-js")]
+macro_rules! js_arm {
+    ($farm:expr, $group:ident :: $method:ident ( $($arg:expr),* $(,)? )) => {
+        if let $crate::farm::driver::Driver::Js(js) = &$farm.driver {
+            return $crate::farm::js::$group::$method(js $(, $arg)*);
+        }
+    };
+}
+
+/// [`js_arm!`] for an `async fn`: awaits the function of the js core.
+#[cfg(feature = "farm-core-js")]
+macro_rules! js_arm_async {
+    ($farm:expr, $group:ident :: $method:ident ( $($arg:expr),* $(,)? )) => {
+        if let $crate::farm::driver::Driver::Js(js) = &$farm.driver {
+            return $crate::farm::js::$group::$method(js $(, $arg)*).await;
+        }
+    };
+}
+
+/// Returns from the enclosing [`Driver`] method once the js core is built again from
+/// `settings`, if the driver is the js core: its builders change the core's configuration,
+/// which the core takes at construction.
+#[cfg(feature = "farm-core-js")]
+macro_rules! js_rebuilt {
+    ($driver:expr, $settings:expr) => {
+        if $driver.rebuilt($settings) {
+            return;
+        }
+    };
+}
+
+/// Without the feature there is one engine: nothing to select.
+#[cfg(not(feature = "farm-core-js"))]
+macro_rules! js_rebuilt {
+    ($($tokens:tt)*) => {};
+}
+
+/// Without the feature there is one engine: nothing to select.
+#[cfg(not(feature = "farm-core-js"))]
+macro_rules! js_arm {
+    ($($tokens:tt)*) => {};
+}
+
+/// Without the feature there is one engine: nothing to select.
+#[cfg(not(feature = "farm-core-js"))]
+macro_rules! js_arm_async {
+    ($($tokens:tt)*) => {};
+}
+
 /// What a farm's `with_*` builders set: the values an engine is configured from, kept
 /// whichever engine the farm runs on.
-#[derive(Debug)]
-pub(super) struct Settings {
+#[derive(Clone, Debug)]
+pub(crate) struct Settings {
+    /// How long a lease whose node has no session row waits before the intake poll requeues
+    /// it ([`Farm::with_orphan_wait`](super::Farm::with_orphan_wait)).
+    pub orphan_wait: Duration,
     /// The memory ladder an action that passes its limit climbs.
     pub ladder: MemoryLadder,
     /// How many memory floors are kept.
@@ -40,6 +103,7 @@ impl Default for Settings {
     /// The settings of a farm no builder has touched.
     fn default() -> Self {
         Self {
+            orphan_wait: ORPHAN_WAIT,
             ladder: MemoryLadder::default(),
             floors: MEMORY_FLOORS,
             placement_load: PlacementLoad::Off,
@@ -53,10 +117,17 @@ impl Default for Settings {
 }
 
 /// The engine state of a farm.
+// A farm holds one driver for its whole life, so the legacy state, which is the large
+// variant, is not boxed.
+#[cfg_attr(feature = "farm-core-js", allow(clippy::large_enum_variant))]
 #[derive(Debug)]
 pub(super) enum Driver {
     /// The farm's scheduler, engine and side, under the one lock every operation takes.
     Legacy(Mutex<State>),
+    /// The core of `crate::farm_js` and the pieces around it (`farm::js`). Only a build with
+    /// the `farm-core-js` feature has it.
+    #[cfg(feature = "farm-core-js")]
+    Js(Box<JsFarm>),
 }
 
 impl Driver {
@@ -65,11 +136,14 @@ impl Driver {
         Self::Legacy(Mutex::new(state))
     }
 
-    /// The engine state, locked.
+    /// The engine state, locked. A farm on the js core has none: each of its methods
+    /// reaches [`Driver::Js`] first ([`js_arm!`]).
     pub(super) fn lock(&self) -> MutexGuard<'_, State> {
         match self {
             // Nothing under the lock panics midway through a change.
             Self::Legacy(state) => state.lock().unwrap_or_else(PoisonError::into_inner),
+            #[cfg(feature = "farm-core-js")]
+            Self::Js(_) => unreachable!("a farm on the js core has no engine lock"),
         }
     }
 
@@ -77,11 +151,26 @@ impl Driver {
     pub(super) fn state_mut(&mut self) -> &mut State {
         match self {
             Self::Legacy(state) => state.get_mut().unwrap_or_else(PoisonError::into_inner),
+            #[cfg(feature = "farm-core-js")]
+            Self::Js(_) => unreachable!("a farm on the js core has no engine state"),
+        }
+    }
+
+    /// Opens the core again over `settings` if this is the js core, and says whether it is.
+    #[cfg(feature = "farm-core-js")]
+    fn rebuilt(&mut self, settings: &Settings) -> bool {
+        match self {
+            Self::Js(js) => {
+                js.rebuild(settings);
+                true
+            }
+            Self::Legacy(_) => false,
         }
     }
 
     /// Applies `settings.ladder`.
     pub(super) fn set_ladder(&mut self, settings: &Settings) {
+        js_rebuilt!(self, settings);
         self.state_mut()
             .engine
             .sched
@@ -90,12 +179,14 @@ impl Driver {
 
     /// Applies `settings.floors` to the scheduler of `term`.
     pub(super) fn set_floors(&mut self, term: u64, settings: &Settings) {
+        js_rebuilt!(self, settings);
         let sched = &mut self.state_mut().engine.sched;
         *sched = std::mem::replace(sched, Scheduler::new(term)).with_memory_floors(settings.floors);
     }
 
     /// Applies `settings.placement_load` to the scheduler of `term`.
     pub(super) fn set_placement_load(&mut self, term: u64, settings: &Settings) {
+        js_rebuilt!(self, settings);
         let sched = &mut self.state_mut().engine.sched;
         // The scheduler is moved out and back; the stand-in is dropped at once.
         *sched = std::mem::replace(sched, Scheduler::new(term))
@@ -105,12 +196,14 @@ impl Driver {
     /// Applies `settings.learned` and `settings.default_memory`, for a farm built at
     /// `epoch_unix_ms`.
     pub(super) fn set_learned(&mut self, epoch_unix_ms: u64, settings: &Settings) {
+        js_rebuilt!(self, settings);
         self.state_mut().side.learned =
             Learned::new(settings.learned, settings.default_memory, epoch_unix_ms);
     }
 
     /// Applies `settings.whole_node` to the scheduler of `term`. Called once it is set.
     pub(super) fn set_whole_node(&mut self, term: u64, settings: &Settings) {
+        js_rebuilt!(self, settings);
         let sched = &mut self.state_mut().engine.sched;
         settings.whole_node.iter().for_each(|config| {
             *sched = std::mem::replace(sched, Scheduler::new(term)).with_whole_node(config.clone());
@@ -119,11 +212,19 @@ impl Driver {
 
     /// Applies `settings.recorder`.
     pub(super) fn set_recorder(&mut self, settings: &Settings) {
+        js_rebuilt!(self, settings);
         self.state_mut().side.recorder = settings.recorder.clone();
+    }
+
+    /// Applies `settings.orphan_wait`.
+    pub(super) fn set_orphan_wait(&mut self, settings: &Settings) {
+        js_rebuilt!(self, settings);
+        self.state_mut().engine.intake.orphan_wait = settings.orphan_wait;
     }
 
     /// Applies `settings.held_cap`.
     pub(super) fn set_held_cap(&mut self, settings: &Settings) {
+        js_rebuilt!(self, settings);
         self.state_mut().engine.held_cap = settings.held_cap;
     }
 }
