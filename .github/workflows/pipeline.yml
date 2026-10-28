@@ -41,6 +41,8 @@ jobs:
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
+      # The last coverage part lists the run's jobs and artifacts to wait for the others.
+      actions: read
 
   artifacts:
     needs: [ci]
