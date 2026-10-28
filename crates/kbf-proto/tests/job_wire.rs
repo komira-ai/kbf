@@ -977,11 +977,15 @@ fn today_s_worker_proto_removes_and_changes_nothing_of_the_earlier_file() {
 }
 
 #[test]
-fn the_only_additions_to_the_worker_proto_are_the_job_fields() {
+fn the_only_additions_to_the_worker_proto_are_the_job_fields_and_the_node_load() {
     let mut want: Vec<String> = [
         "enum FencePolicy",
         "enum Isolation",
         "enum JobExit",
+        // The node load a heartbeat carries and the peak window a lease's usage carries.
+        "field CgroupUsage.peak_window_millicores = 17",
+        "field Heartbeat.node_load = 6",
+        "message NodeLoad",
         "field Result.job_outcome = 7",
         "field Start.job = 9",
         "field Start.fence = 10",

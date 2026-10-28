@@ -77,6 +77,7 @@ mod handover;
 mod js;
 mod learning;
 mod named;
+mod node_load;
 mod node_types;
 mod nodes;
 mod pack_reads;

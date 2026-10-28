@@ -34,6 +34,9 @@
 //   estimator reads. Each is absent from a peer that predates it, and absent means no
 //   report (a reader never reads absent as zero); a peer that predates them skips the
 //   unknown fields.
+// - Heartbeat.node_load and CgroupUsage.peak_window_millicores: the actions cgroup's load
+//   and a lease's busiest CPU window. Each is absent from a peer that predates it, and
+//   absent means no report; a peer that predates them skips the unknown fields.
 // - ResultAck.reason: why a Result was or was not accepted. A daemon that predates it
 //   reads `accepted`; a server that predates it leaves the reason unspecified, which a
 //   daemon takes as "acknowledged: forget the Result".
@@ -356,6 +359,44 @@ message Heartbeat {
   // when the daemon writes packs (`--pack-write`): a daemon that does not, or one built
   // before the field, sends none, and a server built before it skips the field.
   PackWriteCounts pack_writes = 5;
+  // What the node's `actions/` cgroup is doing now. Present when the daemon's runtime
+  // reads it and the read succeeded: a runtime that does not, a failed read, or a daemon
+  // built before the field sends none, and a server built before it skips the field.
+  NodeLoad node_load = 6;
+}
+
+// One reading of the cgroup that holds the node's actions. Every counter is cumulative
+// in the daemon process's own clock, so a reader takes differences between readings of
+// one daemon process (`seq` restarts at 1 with the process).
+message NodeLoad {
+  // 1 for the first reading of this daemon process, plus one for each after.
+  uint64 seq = 1;
+  // The daemon's monotonic clock at the read of the CPU counter, in microseconds. Only
+  // differences of its readings mean anything.
+  uint64 mono_usec = 2;
+  // Cumulative CPU time of the cgroup (`cpu.stat` usage_usec), in microseconds. It still
+  // holds the CPU of descendants removed since.
+  uint64 cpu_usage_usec = 3;
+  // The memory the cgroup holds that cannot be reclaimed cheaply: `memory.current` minus
+  // the inactive file pages of `memory.stat`, in bytes.
+  uint64 memory_working_set_bytes = 4;
+  // The leases that ran for the whole window since the previous reading. Empty for the
+  // first reading.
+  repeated LeaseId covered = 5;
+  // Whether the cgroup has a CPU quota (`cpu.max`).
+  bool actions_cpu_limited = 6;
+  // `cpu.stat` throttled_usec, in microseconds. Telemetry only. Absent when the cgroup
+  // has no such counter: absent is not zero.
+  optional uint64 cpu_throttled_usec = 7;
+  // The cumulative `total=` of the `some` line of `cpu.pressure`, in microseconds.
+  // Telemetry only. Absent without pressure stall information.
+  optional uint64 cpu_pressure_some_total_usec = 8;
+  // 9 and 10 are held for fields not defined yet.
+  reserved 9, 10;
+  // The active file pages of `memory.stat` (`active_file`), in bytes: page cache the
+  // kernel has not marked reclaimable, which a working set counts. 0 when the file has
+  // no such line.
+  uint64 memory_active_file_bytes = 11;
 }
 
 // The counts of a daemon's pack reads, cumulative since the daemon process started (they
@@ -881,6 +922,10 @@ message CgroupUsage {
   // How many CPUs the lease's cgroup could run on (`cpuset.cpus.effective`): fewer than
   // the node's for a lease placed on one NUMA node. Absent when not readable.
   optional uint32 cpus_effective = 16;
+  // The most CPU any one window between two node-load readings used by the lease, in
+  // thousandths of a CPU. Absent when the lease ended before it had a full window, or the
+  // runtime takes no readings.
+  optional uint64 peak_window_millicores = 17;
 }
 
 // Bytes of one NUMA node.
