@@ -517,3 +517,75 @@ fn every_cause_is_rendered_from_the_start() {
         ]
     );
 }
+
+fn whole_summary(
+    held: usize,
+    waiting: &[(kbf_sched::WholeReason, usize)],
+) -> kbf_sched::WholeSummary {
+    kbf_sched::WholeSummary {
+        held,
+        marks: 2,
+        whole: held + 2,
+        draining: 1,
+        ceiling: 5,
+        max_whole_node: 6,
+        capable_hosts: 7,
+        keep_for_ordinary: 1,
+        max_draining: 2,
+        waiting: waiting.iter().copied().collect(),
+    }
+}
+
+/// Catches the whole-node gauges rendered with the option off (a scrape must be what it was),
+/// a gauge not set from the summary (each of held, marks, draining, ceiling), a reason
+/// without its series or with another's count, and a count that stays after the requests
+/// that waited for the reason have gone.
+#[test]
+fn the_whole_node_gauges_are_rendered_only_when_set_and_follow_the_summary() {
+    use kbf_sched::{Blocked, WholeReason};
+    let metrics = CacheMetrics::default();
+    assert!(!metrics.render().contains("kbf_sched_whole"), "off");
+    metrics.sched_whole.set(Some(&whole_summary(
+        3,
+        &[
+            (WholeReason::Holding, 4),
+            (WholeReason::Cap(Blocked::MaxDraining), 5),
+            (WholeReason::Unservable, 6),
+        ],
+    )));
+    let text = metrics.render();
+    for family in [
+        "kbf_sched_whole_held",
+        "kbf_sched_whole_marks",
+        "kbf_sched_whole_draining",
+        "kbf_sched_whole_ceiling",
+        "kbf_sched_whole_waiting",
+    ] {
+        assert!(text.contains(&format!("# TYPE {family} gauge")), "{family}");
+    }
+    let series = lines(&text, "kbf_sched_whole_");
+    assert_eq!(
+        series,
+        [
+            "kbf_sched_whole_held 3",
+            "kbf_sched_whole_marks 2",
+            "kbf_sched_whole_draining 1",
+            "kbf_sched_whole_ceiling 5",
+            r#"kbf_sched_whole_waiting{reason="early"} 0"#,
+            r#"kbf_sched_whole_waiting{reason="holding"} 4"#,
+            r#"kbf_sched_whole_waiting{reason="barred"} 0"#,
+            r#"kbf_sched_whole_waiting{reason="cap_ceiling"} 0"#,
+            r#"kbf_sched_whole_waiting{reason="cap_keep_for_ordinary"} 0"#,
+            r#"kbf_sched_whole_waiting{reason="cap_max_draining"} 5"#,
+            r#"kbf_sched_whole_waiting{reason="cap_per_consumer"} 0"#,
+            r#"kbf_sched_whole_waiting{reason="last_capable"} 0"#,
+            r#"kbf_sched_whole_waiting{reason="queued"} 0"#,
+            r#"kbf_sched_whole_waiting{reason="unservable"} 6"#,
+        ]
+    );
+    metrics.sched_whole.set(Some(&whole_summary(0, &[])));
+    assert_eq!(metrics.sched_whole.waiting(WholeReason::Holding), 0);
+    assert_eq!(metrics.sched_whole.held(), 0);
+    metrics.sched_whole.set(None);
+    assert!(!metrics.render().contains("kbf_sched_whole"), "off again");
+}
