@@ -555,7 +555,10 @@ jobs:
           VERSION: ${{ steps.farm-version.outputs.version }}
           MIN_UP_STORAGE: ${{ vars.KBF_MIN_UP_STORAGE || '1' }}
           MIN_UP_FRONTEND: ${{ vars.KBF_MIN_UP_FRONTEND || '1' }}
-        run: cargo xtask deploy-farm --url "$COORDINATOR_URL" --ca-pem "$COORDINATOR_CA" --version "$VERSION" --min-up-storage "$MIN_UP_STORAGE" --min-up-frontend "$MIN_UP_FRONTEND"
+          # `true`: fail before setting anything when the coordinator runs another commit than
+          # this release (docs/deploy/kbf-updater.md, "Updating the coordinator").
+          REQUIRE_CURRENT: ${{ vars.KBF_REQUIRE_COORDINATOR_CURRENT }}
+        run: cargo xtask deploy-farm --url "$COORDINATOR_URL" --ca-pem "$COORDINATOR_CA" --version "$VERSION" --min-up-storage "$MIN_UP_STORAGE" --min-up-frontend "$MIN_UP_FRONTEND" --require-coordinator-current "$REQUIRE_CURRENT"
       # The proof. The farm now runs this release; build a small project (four `/bin/sh -c`
       # actions that depend on each other) against it with remote execution on and local off, and
       # read Buck2's own count of the actions it ran: some remote, none local. The run id and

@@ -339,6 +339,35 @@ whose operator accepts the token there (anything running as the agent's account 
 given, they are used instead of the certificate. Without `--frontend` and without the token an
 agent heartbeats and refuses every update order before it fetches anything, for any host.
 
+## Updating the coordinator
+
+The coordinator is not one of the hosts it orders: it does not update itself. It is updated the
+way it was deployed ([containers.md](containers.md#run-the-coordinator-on-one-host): a new image,
+the tag changed in the unit, a restart; to go back, name the old tag). Hosts that were updating
+finish or revert on their own while it is down, and the restarted coordinator orders nothing for
+its first 30 seconds.
+
+Update it first when a release changes the coordinator or the messages between it and the
+hosts (`crates/kbf-coordinator`, `crates/kbf-updater/src/wire.rs`): a newer agent's heartbeat
+reaches an older coordinator, but a coordinator that does not know a newer rule would order the
+farm by the old one.
+
+`GET /v1/status` and `GET /v1/convergence` say which build answers, as `commit`: the 12 digits
+`kbf-coordinator --version` shows after the `+`. A coordinator built before this field, or
+without a git checkout (`unknown`), says none. With `--require-coordinator-current`
+(`KBF_REQUIRE_COORDINATOR_CURRENT=true` in the release workflow, passed as the flag's value), `deploy-farm` reads that
+commit before it sets anything and fails when it is not the release's:
+
+```text
+the coordinator runs 0123456789ab, the release is 89abcdef0123: update the coordinator first (docs/deploy/kbf-updater.md, Updating the coordinator)
+```
+
+Without the flag, a different commit is a `coordinator not current` warning annotation on the run
+summary (the same text) and the deploy goes on. A coordinator that reports no commit gets a notice and the deploy goes on, so a farm whose
+coordinator is older than this field keeps working. The rule is equality, not order: a
+coordinator newer than the release (a rollback of the hosts) also fails; leave the variable unset
+for such a deploy. The variable is the operator's to set for the releases that need it.
+
 ## Turn on the gamma stage
 
 The last job of `release.yml`, `gamma`, tells the update coordinator "desired = this release" once
@@ -390,6 +419,7 @@ that runs no farm is unaffected. Nothing in this repository does any of them.
    | `TS_CLIENT_ID`, `TS_AUDIENCE` | optional, for a coordinator reachable only on a Tailscale network: the client id and audience of the Tailscale trust credential (workload identity federation) that CI jobs join the network with, as `tag:ci`. It must trust this repository's `release` environment (the token's subject is `repo:<owner>/<repo>:environment:release`), and the network's policy must let `tag:ci` reach the control listener. With `TS_CLIENT_ID` and `KBF_COORDINATOR_URL` set, the job joins as an ephemeral node with the run's OIDC token, after the build and before the verb; no secret is involved. `TS_CLIENT_ID` or `KBF_COORDINATOR_URL` unset: the step is skipped (`TS_AUDIENCE` must be set with `TS_CLIENT_ID`) |
    | `FARM_ADDRESS`, `FARM_INSTANCE`, `FARM_TLS`, `FARM_LINUX_X86_64_PROPERTIES` | optional, for the proof below: the farm's REAPI address as `grpc://<host>:<port>` (also when TLS is on), its instance name (empty: the empty instance), `true` or `false` for TLS, and the platform properties of the Linux x86-64 workers as a comma-separated `key=value` list, such as `OSFamily=linux,ISA=x86-64`. `FARM_ADDRESS` unset or empty: the proof is off |
    | `KBF_MIN_UP_STORAGE`, `KBF_MIN_UP_FRONTEND` | optional: the storage hosts and frontends that must stay up while others update (default 1 each). The operator picks the storage number so that every blob stays readable |
+   | `KBF_REQUIRE_COORDINATOR_CURRENT` | optional: `true` makes the step fail before it sets anything when the coordinator runs another commit than the release ([Updating the coordinator](#updating-the-coordinator)). Unset: a different commit is a warning annotation on the run and the step goes on |
 
 ### What the step does
 
