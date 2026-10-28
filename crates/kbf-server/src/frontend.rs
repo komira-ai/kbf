@@ -179,6 +179,7 @@ pub const ALLOWED: &[&str] = &[
     "vm_host_floor_mem_gib",
     "learned_sizes",
     "placement_load",
+    "scheduler_core",
     "whole_node_max",
     "whole_node_max_draining",
     "whole_node_keep_for_ordinary",
