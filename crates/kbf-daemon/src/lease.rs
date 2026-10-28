@@ -52,7 +52,7 @@ pub(crate) type Done = (
 
 /// The leases a daemon is running.
 pub(crate) struct Leases {
-    runtimes: Runtimes,
+    pub(crate) runtimes: Runtimes,
     running: BTreeMap<LeaseId, Running>,
     /// Running leases being killed on the server's `Cancel`.
     cancelled: BTreeSet<LeaseId>,
@@ -118,17 +118,7 @@ impl Leases {
             // An error carries no result, so no usage: the runtime is asked for it. An
             // out-of-memory kill (the lease's own limit, or the node's) is marked.
             let mut usage = outcome.as_ref().err().and_then(|_| run.failed_usage(id));
-            // The run has ended, so the runtime can say its peak window.
-            if let Some(peak) = run.take_peak_window_millicores(id) {
-                match &mut outcome {
-                    Ok(result) => peak_into_result(result, peak),
-                    Err(_) => {
-                        if let Some(usage) = usage.as_mut() {
-                            set_peak(usage, peak);
-                        }
-                    }
-                }
-            }
+            crate::lease_peak::peak(run.as_ref(), id, &mut outcome, &mut usage);
             let oom = matches!(
                 outcome,
                 Err(RuntimeError::OutOfMemory { .. } | RuntimeError::BusyNode(_))
@@ -142,13 +132,6 @@ impl Leases {
         tracing::info!(lease = %id, driver = runtime.driver(), "lease started");
         self.running.insert(id, Running { runtime });
         None
-    }
-
-    /// One reading of the node's load from the first runtime that takes readings.
-    pub(crate) async fn node_load(
-        &self,
-    ) -> Result<Option<worker::NodeLoad>, crate::runtime::NodeLoadError> {
-        self.runtimes.node_load().await
     }
 
     /// Starts killing lease `id` because the server cancelled it, and returns at once.
@@ -335,29 +318,6 @@ pub(crate) fn result_of(
 /// from every report, failed ones included, for its `action usage:` line, before it
 /// judges the report (a made `action_result` is not a run's: its exit code is not
 /// one).
-/// `usage` saying its lease's busiest window used `peak` millicores.
-fn set_peak(usage: &mut ResourceUsage, peak: u64) {
-    usage
-        .cgroup
-        .get_or_insert_with(worker::CgroupUsage::default)
-        .peak_window_millicores = Some(peak);
-}
-
-/// The usage `result` carries, saying its lease's busiest window used `peak` millicores.
-/// A result that carries none is left as it is.
-fn peak_into_result(result: &mut ActionResult, peak: u64) {
-    let Some(any) = result.execution_metadata.as_mut().and_then(|metadata| {
-        (metadata.auxiliary_metadata.iter_mut()).find(|any| any.type_url == ResourceUsage::TYPE_URL)
-    }) else {
-        return;
-    };
-    let Ok(mut usage) = ResourceUsage::decode(any.value.as_slice()) else {
-        return;
-    };
-    set_peak(&mut usage, peak);
-    *any = usage.to_any();
-}
-
 fn carry_usage(result: &mut worker::Result, usage: &ResourceUsage) {
     let metadata = result
         .action_result
@@ -687,64 +647,6 @@ mod tests {
         assert!(line.contains(" INFO "), "{line}");
         assert!(line.ends_with(&format!("lease phases: {phases}")), "{line}");
         assert!(line.contains("lease=3.4 driver=fake ok=true "), "{line}");
-    }
-
-    /// Catches a peak window put in a result whose usage is not there (a result with no
-    /// metadata, or with other metadata), a usage that does not decode being replaced by
-    /// one holding only the peak, and the peak not reaching a usage that decodes.
-    #[test]
-    fn a_peak_goes_into_the_usage_a_result_carries_and_nowhere_else() {
-        let mut bare = ActionResult::default();
-        peak_into_result(&mut bare, 5);
-        assert_eq!(bare, ActionResult::default());
-
-        let other = prost_types::Any {
-            type_url: "type.googleapis.com/other".to_owned(),
-            value: vec![1],
-        };
-        let mut unrelated = ActionResult {
-            execution_metadata: Some(ExecutedActionMetadata {
-                auxiliary_metadata: vec![other],
-                ..ExecutedActionMetadata::default()
-            }),
-            ..ActionResult::default()
-        };
-        let before = unrelated.clone();
-        peak_into_result(&mut unrelated, 5);
-        assert_eq!(unrelated, before);
-
-        let garbled = prost_types::Any {
-            type_url: ResourceUsage::TYPE_URL.to_owned(),
-            value: vec![0xff, 0xff],
-        };
-        let mut broken = ActionResult {
-            execution_metadata: Some(ExecutedActionMetadata {
-                auxiliary_metadata: vec![garbled],
-                ..ExecutedActionMetadata::default()
-            }),
-            ..ActionResult::default()
-        };
-        let before = broken.clone();
-        peak_into_result(&mut broken, 5);
-        assert_eq!(broken, before);
-
-        let mut usage = ResourceUsage {
-            wall_micros: 8,
-            ..ResourceUsage::default()
-        };
-        let mut result = ActionResult::default();
-        carry_usage_into(&mut result, &usage);
-        peak_into_result(&mut result, 5);
-        set_peak(&mut usage, 5);
-        assert_eq!(ResourceUsage::in_result(&result), Some(usage));
-    }
-
-    fn carry_usage_into(result: &mut ActionResult, usage: &ResourceUsage) {
-        result
-            .execution_metadata
-            .get_or_insert_with(ExecutedActionMetadata::default)
-            .auxiliary_metadata
-            .push(usage.to_any());
     }
 
     /// A runtime whose every run ends at once with the one error it was given, before

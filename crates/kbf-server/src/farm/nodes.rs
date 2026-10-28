@@ -90,6 +90,7 @@ impl Farm {
             free: ResourcesView::of(capacity.saturating_sub(booked)),
             leases,
             load: state
+                .side
                 .node_loads
                 .get(worker)
                 .map(|kept| kept.view(&capacity, now)),

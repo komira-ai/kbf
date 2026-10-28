@@ -228,15 +228,15 @@ impl Farm {
             return;
         };
         let mut state = self.lock();
-        let Some(link) = state.links.get(worker).filter(|l| l.stream == stream) else {
+        let Some(link) = state.side.links.get(worker).filter(|l| l.stream == stream) else {
             return;
         };
         let session = Session::of(&link.instance, stream);
-        let capacity = state.sched.capacity(worker).unwrap_or_default();
-        let kept = state.node_loads.remove(worker);
+        let capacity = state.engine.sched.capacity(worker).unwrap_or_default();
+        let kept = state.side.node_loads.remove(worker);
         let now = self.now();
         if let Some(next) = Kept::take(kept, &session, load, &capacity, now) {
-            state.node_loads.insert(worker.clone(), next);
+            state.side.node_loads.insert(worker.clone(), next);
         }
     }
 }

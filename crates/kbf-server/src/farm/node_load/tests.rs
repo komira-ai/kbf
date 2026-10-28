@@ -397,10 +397,10 @@ async fn readings_reach_the_node_view() {
     let second = register(&farm, "a", "proc-1");
     farm.note_node_load(&a, first, Some(&reading(9, 9 * SECOND, 9 * SECOND)));
     farm.note_node_load(&a, second, Some(&reading(2, 3 * SECOND, 3 * SECOND)));
-    assert_eq!(farm.lock().node_loads[&a].last.seq, 2);
+    assert_eq!(farm.lock().side.node_loads[&a].last.seq, 2);
     farm.note_node_load(&a, second, Some(&reading(3, 2 * SECOND, 3 * SECOND)));
     assert_eq!(
-        farm.lock().node_loads[&a].last.seq,
+        farm.lock().side.node_loads[&a].last.seq,
         2,
         "the clock did not move"
     );
@@ -425,7 +425,7 @@ async fn readings_reach_the_node_view() {
         StreamId(0),
         Some(&reading(1, 1, 1)),
     );
-    assert!(!farm.lock().node_loads.contains_key(&WorkerId::new("ghost")));
+    assert!(!farm.lock().side.node_loads.contains_key(&WorkerId::new("ghost")));
 
     // Two readings a second apart, then no heartbeat for more than three seconds.
     farm.note_node_load(&a, third, Some(&reading(2, SECOND / 2 + SECOND, SECOND)));
