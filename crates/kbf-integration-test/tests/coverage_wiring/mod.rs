@@ -4,6 +4,12 @@
 //! notices when a refactor of the job drops the second step or gives either a
 //! condition: the gate would pass every pull request, and floors could be lowered. The
 //! rules read the workflow; [`wiring`] returns how it does not meet them.
+//!
+//! The fast tests run in shards (the `test-shard` job, a matrix), and the `test` job
+//! merges the shards' tracefiles and gates the merge. [`merge_wiring`] holds that part:
+//! the gate must read the file the merge wrote, and the job must fail, not be skipped,
+//! when a shard fails: GitHub counts a job skipped for a failed `needs` as passing a
+//! required check, so without it a red shard would leave the required `test` check green.
 
 use super::workflows;
 
@@ -35,13 +41,18 @@ fn flag<'a>(words: &[&'a str], flag: &str) -> Option<&'a str> {
     words.get(at + 1).copied()
 }
 
+/// Whether a `run:` script is the `kbf-coverage merge` verb.
+fn is_merge(run: &str) -> bool {
+    run.contains("-p kbf-coverage ") && words(run).contains(&"merge")
+}
+
 /// The kbf-coverage steps of `job` meet the rules; an error says how they do not.
 fn wiring(workflow: &str, job: &str, floors_exist: bool) -> Result<(), String> {
     let steps = workflows::job_steps(workflow, job)?;
     let runs = |step: &&workflows::Step| {
         step.run
             .as_deref()
-            .is_some_and(|r| r.contains("-p kbf-coverage "))
+            .is_some_and(|r| r.contains("-p kbf-coverage ") && !is_merge(r))
     };
     let (gate, lowering): (Vec<_>, Vec<_>) = steps
         .iter()
@@ -144,6 +155,70 @@ fn wiring(workflow: &str, job: &str, floors_exist: bool) -> Result<(), String> {
         return Err("the base checkout comes after the no-lowering step".to_owned());
     }
     Ok(())
+}
+
+/// The `job` merges the shards' tracefiles into the file its gate reads, and fails when a
+/// shard did; an error says how it does not.
+fn merge_wiring(workflow: &str, job: &str) -> Result<(), String> {
+    let steps = workflows::job_steps(workflow, job)?;
+    let at = |pred: &dyn Fn(&workflows::Step) -> bool| steps.iter().position(pred);
+    let merge = at(&|s| s.run.as_deref().is_some_and(is_merge))
+        .ok_or_else(|| format!("the job `{job}` has no step running `kbf-coverage merge`"))?;
+    let gate = at(&|s| {
+        s.run.as_deref().is_some_and(|r| {
+            r.contains("-p kbf-coverage ") && !is_merge(r) && !r.contains("no-lowering")
+        })
+    })
+    .ok_or_else(|| format!("the job `{job}` has no step running the gate"))?;
+    if merge >= gate {
+        return Err("the merge step comes after the gate step".to_owned());
+    }
+    let merge_step = &steps[merge];
+    if let Some(condition) = &merge_step.condition {
+        return Err(format!(
+            "the merge step runs `if: {condition}`, so the gate could read a stale file"
+        ));
+    }
+    let merge_words = words(merge_step.run.as_deref().unwrap_or_default());
+    let gate_words = words(steps[gate].run.as_deref().unwrap_or_default());
+    let out = flag(&merge_words, "--out");
+    if out.is_none() || out != flag(&gate_words, "--lcov") {
+        return Err(
+            "the gate step does not read the file the merge step writes (`--out`)".to_owned(),
+        );
+    }
+    for f in ["--dir", "--expect"] {
+        if flag(&merge_words, f).is_none() {
+            return Err(format!("the merge step has no `{f}`"));
+        }
+    }
+    if !workflows::job_has_key(workflow, job, "if")? {
+        return Err(format!(
+            "the job `{job}` has no `if:`, so it is skipped, not failed, when a shard fails, and a skipped required check passes"
+        ));
+    }
+    if workflows::job_needs(workflow, job)?.is_empty() {
+        return Err(format!("the job `{job}` needs no shard job"));
+    }
+    let checks = steps[..merge].iter().any(|s| {
+        s.condition.is_none()
+            && s.env
+                .iter()
+                .any(|(_, v)| v.contains("needs.") && v.contains(".result"))
+    });
+    if !checks {
+        return Err("no step before the merge reads a shard job's `needs.<job>.result`".to_owned());
+    }
+    Ok(())
+}
+
+#[test]
+fn the_test_job_merges_the_shards_and_fails_with_them() {
+    // Catches: the merge dropped, run after the gate, or writing a file the gate does not
+    // read, and the job skipped (a passing required check) instead of failed when a shard
+    // fails.
+    let text = std::fs::read_to_string(super::repo_root().join(CI)).expect(CI);
+    assert_eq!(merge_wiring(&text, JOB), Ok(()), "{CI}");
 }
 
 #[test]
@@ -309,6 +384,116 @@ mod rules {
             Err(format!(
                 "the file `{FLOORS}` does not exist at the repository root"
             ))
+        );
+    }
+}
+
+/// The rules [`merge_wiring`] reads the workflow by, on planted workflows.
+mod merge_rules {
+    use super::*;
+
+    const RESULT: &str = "      - env:\n          SHARDS: ${{ needs.test-shard.result }}\n        run: test \"$SHARDS\" = success\n";
+    const MERGE: &str = "      - run: cargo run -p kbf-coverage --locked -- merge --dir d --expect 3 --out m.info\n";
+    const GATE: &str = "      - run: cargo run -p kbf-coverage --locked -- --lcov m.info --root r --floors coverage-floors\n";
+
+    fn workflow(job_head: &str, steps: &str) -> String {
+        format!(
+            "on: push\npermissions: {{}}\njobs:\n  test-shard:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n  test:\n    runs-on: ubuntu-latest\n{job_head}    steps:\n{steps}"
+        )
+    }
+
+    const HEAD: &str = "    needs: test-shard\n    if: ${{ !cancelled() }}\n";
+
+    fn check(job_head: &str, steps: &str) -> Result<(), String> {
+        merge_wiring(&workflow(job_head, steps), "test")
+    }
+
+    #[test]
+    fn the_shape_ci_uses_passes() {
+        assert_eq!(check(HEAD, &format!("{RESULT}{MERGE}{GATE}")), Ok(()));
+    }
+
+    #[test]
+    fn each_drift_is_refused() {
+        // Catches: each way the merge or the shard failure stops binding.
+        let all = format!("{RESULT}{MERGE}{GATE}");
+        let cases = [
+            (
+                HEAD,
+                format!("{RESULT}{GATE}"),
+                "the job `test` has no step running `kbf-coverage merge`",
+            ),
+            (
+                HEAD,
+                format!("{RESULT}{MERGE}"),
+                "the job `test` has no step running the gate",
+            ),
+            (
+                HEAD,
+                format!("{RESULT}{GATE}{MERGE}"),
+                "the merge step comes after the gate step",
+            ),
+            (
+                HEAD,
+                all.replace(
+                    "      - run: cargo run -p kbf-coverage --locked -- merge",
+                    "      - if: ${{ github.event_name == 'push' }}\n        run: cargo run -p kbf-coverage --locked -- merge",
+                ),
+                "the merge step runs `if: ${{ github.event_name == 'push' }}`, so the gate could read a stale file",
+            ),
+            (
+                HEAD,
+                all.replace("--out m.info", "--out other.info"),
+                "the gate step does not read the file the merge step writes (`--out`)",
+            ),
+            (
+                HEAD,
+                all.replace(" --out m.info", ""),
+                "the gate step does not read the file the merge step writes (`--out`)",
+            ),
+            (HEAD, all.replace("--dir d ", ""), "the merge step has no `--dir`"),
+            (
+                HEAD,
+                all.replace("--expect 3 ", ""),
+                "the merge step has no `--expect`",
+            ),
+            (
+                "    needs: test-shard\n",
+                all.clone(),
+                "the job `test` has no `if:`, so it is skipped, not failed, when a shard fails, and a skipped required check passes",
+            ),
+            (
+                "    if: ${{ !cancelled() }}\n",
+                all.clone(),
+                "the job `test` needs no shard job",
+            ),
+            (
+                HEAD,
+                all.replace("needs.test-shard.result", "github.run_id"),
+                "no step before the merge reads a shard job's `needs.<job>.result`",
+            ),
+            (
+                HEAD,
+                all.replace(
+                    "      - env:",
+                    "      - if: ${{ always() }}\n        env:",
+                ),
+                "no step before the merge reads a shard job's `needs.<job>.result`",
+            ),
+        ];
+        for (head, steps, want) in cases {
+            assert_eq!(check(head, &steps), Err(want.to_owned()), "{head}{steps}");
+        }
+    }
+
+    #[test]
+    fn the_merge_step_is_not_taken_for_the_gate() {
+        // Catches: `wiring` taking the merge step, which has no `--floors`, for the
+        // gate step, so that the real gate went unchecked.
+        let steps = format!("{MERGE}{GATE}");
+        assert_eq!(
+            wiring(&workflow(HEAD, &steps), "test", true).map_err(|e| e.contains("no-lowering")),
+            Err(true)
         );
     }
 }

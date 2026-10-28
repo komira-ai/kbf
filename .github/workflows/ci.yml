@@ -1,4 +1,5 @@
-# The pull-request gate: two jobs, `lint` and `test`. GitHub-hosted runners only; the repository
+# The pull-request gate: `lint`, and the fast tests under coverage in parts, `test-shard` (a matrix)
+# and `test` (merges the shards' coverage and gates it). GitHub-hosted runners only; the repository
 # lints in crates/kbf-integration-test/tests/repo_lints.rs hold every workflow to that, to commit-SHA pinned
 # actions from the set the repository's Actions policy allows (actions/* and
 # tailscale/github-action), and to a top-level `permissions: {}`.
@@ -33,6 +34,10 @@ env:
   RUSTFLAGS: -D warnings
   # Incremental artifacts only bloat a cached target directory (rust-cache set this too).
   CARGO_INCREMENTAL: 0
+  # How many parts the fast tests run in (nextest `--partition`): the matrix of `test-shard` lists
+  # exactly 1 to this number, and `test` expects this many tracefiles to merge, so a shard missing
+  # from the matrix fails the merge instead of leaving its tests out of the coverage.
+  SHARDS: 3
 
 jobs:
   # Format, clippy, the repository lints and cargo-deny, one after another on one Cargo
@@ -120,22 +125,26 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
-  # The fast tests and their coverage: the `pr` profile of .config/nextest.toml (every test
-  # but the slow ones, which beta.yml runs) under cargo-llvm-cov, then the gate in
-  # `coverage-floors` (crates/kbf-coverage): every crate must reach 99.00% of lines and
-  # 99.00% of branches, or the floor its line in that file lists for it (the crates under
-  # 99% today, each with an open issue). A floor may only rise: the last step fails a pull
-  # request whose file lowers one. The fast set includes the Postgres tests (a throwaway
-  # server, below): no S3, crun, root or Mac test is in it.
+  # One part of the fast tests and its coverage: the `pr` profile of .config/nextest.toml (every
+  # test but the slow ones, which beta.yml runs) under cargo-llvm-cov, the part being a third of
+  # the tests (`--partition count:<n>/3`, the matrix's `shard`). Every part builds the same
+  # instrumented workspace and writes its own tracefile; the `test` job below merges them and
+  # holds the gate. The fast set includes the Postgres tests (a throwaway server per part,
+  # below): no S3, crun, root or Mac test is in it.
   # Branch coverage (`--branch`, rustc's `-Zcoverage-options=branch`) is unstable, so this
   # job alone builds with a pinned nightly; every other job stays on the toolchain in
   # rust-toolchain.toml. The nightly may warn where stable does not, so `-D warnings` is off
   # here (clippy, in the lint job, enforces it). cargo-llvm-cov is the release binary,
   # checked against its SHA-256 before use.
-  test:
+  test-shard:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # Every part runs to its end, so a run reports the failures of all of them at once.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     # A throwaway Postgres server for every test that needs one, the same container as
     # beta.yml's jobs use. KBF_TEST_POSTGRES_URL (below) names it; a test that needs it makes a
     # database (js-testkit's `database`, which kbf-testkit re-exports) or a schema of its own on it and drops it, and fails,
@@ -158,6 +167,7 @@ jobs:
       # `cargo llvm-cov nextest` runs the tests with cargo-nextest, one process per test.
       NEXTEST_VERSION: 0.9.146
       NEXTEST_SHA256: 682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428
+      SHARD: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -238,10 +248,13 @@ jobs:
       # instead of about 30 tests failing with "Full".
       - name: Refuse early when the disk is short for the tests (80 GiB free)
         run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --path . --min-free-gb 80
-      - name: Run the fast tests under coverage
+      # `--partition` is a flag of `cargo nextest run`, which cargo-llvm-cov passes on as it does any
+      # flag it does not know. `count` deals the tests out in turn, so the parts are the same size
+      # whatever the tests are named.
+      - name: Run this part of the fast tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --features tierstore/s3 --locked --branch --no-report --no-fail-fast --profile pr
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --features tierstore/s3 --locked --branch --no-report --no-fail-fast --profile pr "--partition=count:$SHARD/$SHARDS"
       # What the test run left on the disk, so a run that ran the runner out of room says
       # which directories grew (the instrumented build, the tests' own temporary files).
       - name: Free disk after the tests (report)
@@ -252,14 +265,71 @@ jobs:
         run: du -xhd 2 target
       # No step below runs Postgres tests on their own: they are in the run above, which
       # fails any of them when KBF_TEST_POSTGRES_URL (set for the job) names no server.
-      - name: Report
+      - name: Report (this part's tracefile)
         env:
           LLVM_COV_FLAGS: -skip-functions
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov report --branch --lcov --output-path target/coverage/lcov.info
+      # Each part's tracefile, for the merge in the `test` job.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: target/coverage/lcov.info
+          if-no-files-found: error
+      # and the cache it saves holds none of this run's workspace coverage artifacts either; one part
+      # saves it (the parts restore and would save the same key)
+      - if: ${{ github.event_name == 'push' && matrix.shard == 1 && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.event_name == 'push' && matrix.shard == 1 && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  # The merge and the gate, under the name `test` that the required check has always had. It
+  # needs every part and is not skipped when one fails (`if: !cancelled()`): GitHub counts a job
+  # skipped for a failed `needs` as passing a required check, so the first step fails the job
+  # itself when any part did not succeed. Then, with the nightly toolchain that built the parts
+  # (so its `kbf-coverage` is built as before; no llvm-tools and no instrumented build here),
+  # `kbf-coverage merge` adds the parts' tracefiles into the one a single run of the fast tests
+  # would have written and the gate reads that: every crate must reach 99.00% of lines and
+  # 99.00% of branches, or the floor its line in `coverage-floors` (crates/kbf-coverage) lists
+  # for it (the crates under 99% today, each with an open issue). A floor may only rise: the
+  # last step fails a pull request whose file lowers one.
+  test:
+    needs: test-shard
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: ""
+      COVERAGE_TOOLCHAIN: nightly-2026-10-01
+    steps:
+      - name: Every part ran and passed
+        env:
+          SHARDS_RESULT: ${{ needs.test-shard.result }}
+        run: test "$SHARDS_RESULT" = success
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The merge commit and its first parent, the base branch (no-lowering --base-ref).
+          fetch-depth: 2
+      - run: rustup toolchain install "$COVERAGE_TOOLCHAIN" --profile minimal
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: coverage-shard-*
+          path: shards
+      # Refuses a directory that does not hold exactly SHARDS tracefiles, tracefiles that do not
+      # list the same lines and branches, and a tracefile whose totals disagree with its lines.
+      - name: Merge the parts' coverage
+        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- merge --dir shards --expect "$SHARDS" --out lcov.info
       # Fails when a crate is under its threshold; floors that could rise are printed in
       # the log and the job summary (`kbf-coverage raise` lifts them) and do not fail.
       - name: Per-crate table and 99% gate
-        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- --lcov target/coverage/lcov.info --root "$GITHUB_WORKSPACE" --floors coverage-floors --summary-file "$GITHUB_STEP_SUMMARY"
+        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- --lcov lcov.info --root "$GITHUB_WORKSPACE" --floors coverage-floors --summary-file "$GITHUB_STEP_SUMMARY"
       # The base's floors file, checked out beside this one; a base without one (the change
       # that adds the file) has nothing to compare, and the step says so.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -277,16 +347,5 @@ jobs:
         if: ${{ !cancelled() }}
         with:
           name: coverage
-          path: target/coverage/lcov.info
+          path: lcov.info
           if-no-files-found: error
-      # and the cache it saves holds none of this run's workspace coverage artifacts either
-      - if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}

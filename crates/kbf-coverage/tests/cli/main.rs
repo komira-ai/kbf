@@ -14,6 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod merge;
 mod rename;
 mod replace;
 
