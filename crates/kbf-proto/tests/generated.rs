@@ -227,6 +227,7 @@ fn worker_messages_round_trip() {
                 missing_indexed: 11,
                 missing_unasked: 12,
             }),
+            busy_millis: Some(61_500),
         })),
     };
     let back = DaemonMessage::decode(heartbeat.encode_to_vec().as_slice()).expect("decode");

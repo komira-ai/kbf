@@ -349,6 +349,15 @@ message Heartbeat {
   // when the daemon writes packs (`--pack-write`): a daemon that does not, or one built
   // before the field, sends none, and a server built before it skips the field.
   PackWriteCounts pack_writes = 5;
+  // How busy the CPUs of this daemon's actions were over the window since the previous
+  // Heartbeat on this daemon (the daemon's first sends none): CPU-milliseconds used per
+  // second, from the growth of `usage_usec` in the actions cgroup's `cpu.stat`. A fully
+  // used 80-CPU allowance reads 80000. Absent when the daemon does not measure it (no
+  // cgroup v2 actions cgroup, as on macOS, or a daemon built before the field) or has no
+  // window yet; a server built before the field skips it. Absent means unknown, never
+  // idle: the scheduler's CPU admission (`--admit-busy-percent`) admits as it would
+  // without it.
+  optional uint64 busy_millis = 6;
 }
 
 // The counts of a daemon's pack reads, cumulative since the daemon process started (they

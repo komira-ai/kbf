@@ -33,6 +33,7 @@ fn new(pack_reads: Option<worker::PackReadCounts>) -> worker::Heartbeat {
         running: vec![worker::LeaseId { term: 2, seq: 9 }],
         pack_reads,
         pack_writes: None,
+        busy_millis: None,
     }
 }
 
