@@ -345,7 +345,7 @@ fn a_bad_services_list_is_dropped_and_the_rest_is_kept() {
 }
 
 /// Catches: the lenient read accepting what is wrong beyond the services list: not JSON,
-/// not an object, a missing or bad field, with or without a services key, is an error.
+/// not an object, a missing, bad or duplicated field, with or without a services key, is an error.
 #[test]
 fn a_heartbeat_that_is_wrong_beyond_its_services_is_still_refused() {
     for text in [
@@ -354,6 +354,8 @@ fn a_heartbeat_that_is_wrong_beyond_its_services_is_still_refused() {
         "{}",
         r#"{"platform":"linux-x86_64","health":"healthy"}"#,
         r#"{"platform":"linux-x86_64","health":"healthy","services":[]}"#,
+        r#"{"platform":"linux-x86_64","version":"1","version":"2","health":"healthy","services":[]}"#,
+        r#"{"platform":"linux-x86_64","version":"1","health":"healthy","services":3,"services":[]}"#,
         r#"{"platform":"linux-x86_64","version":"-1","health":"healthy","services":3}"#,
     ] {
         assert!(read_heartbeat(text.as_bytes()).is_err(), "{text}");

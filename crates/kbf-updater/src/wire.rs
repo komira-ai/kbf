@@ -195,12 +195,35 @@ pub fn read_heartbeat(bytes: &[u8]) -> Result<HeartbeatRead, serde_json::Error> 
     }
 }
 
-/// The heartbeat in `bytes` once its `services` key is removed, if there is one to remove
-/// and what is left is a heartbeat.
+/// A [`Heartbeat`] whose `services` value is not read: it reads every other field as
+/// [`Heartbeat`] does, duplicate keys included.
+#[derive(Deserialize)]
+struct HeartbeatWithoutServices {
+    #[serde(with = "platform_text")]
+    platform: ReleasePlatform,
+    version: Version,
+    health: Health,
+    #[serde(default)]
+    last_update: Option<UpdateResult>,
+    #[serde(default)]
+    updating: Option<Version>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    services: Option<serde::de::IgnoredAny>,
+}
+
+/// The heartbeat in `bytes` with its `services` value ignored, if what is left is a
+/// heartbeat.
 fn without_services(bytes: &[u8]) -> Option<Heartbeat> {
-    let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    value.as_object_mut()?.remove("services")?;
-    serde_json::from_value(value).ok()
+    let rest: HeartbeatWithoutServices = serde_json::from_slice(bytes).ok()?;
+    Some(Heartbeat {
+        platform: rest.platform,
+        version: rest.version,
+        health: rest.health,
+        last_update: rest.last_update,
+        updating: rest.updating,
+        services: None,
+    })
 }
 
 /// The coordinator's answer to a heartbeat.

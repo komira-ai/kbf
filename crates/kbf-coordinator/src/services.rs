@@ -252,9 +252,9 @@ impl Services {
     ///
     /// # Errors
     /// [`ServicesError`]: the text is not TOML of the shape, a name is bad or repeated, a
-    /// service has no roles, there are more than [`MAX_SERVICES`] services, a role name or count is unusable, an `after` names what does
-    /// not exist (or is defined later, which also forbids a cycle), or `ci_services` names an
-    /// unknown service.
+    /// service has no roles, there are more than [`MAX_SERVICES`] services, a role name or
+    /// count is unusable, an `after` names what does not exist (or is defined later, which
+    /// also forbids a cycle), or `ci_services` names an unknown service.
     pub fn parse(text: &str) -> Result<Self, ServicesError> {
         let file: RawFile =
             toml::from_str(text).map_err(|e| ServicesError::Parse(e.to_string()))?;
