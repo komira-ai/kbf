@@ -189,6 +189,7 @@ async fn the_daemon_runs_an_action_and_its_result_is_cached() {
         memory_ladder: kbf_server::MemoryLadder::default(),
         vm_host_floor: kbf_server::HostFloor::default(),
         learned_sizes: kbf_server::LearnedSizes::Off,
+        scheduler_core: kbf_server::SchedulerCore::under_test(),
         placement_load: kbf_server::PlacementLoad::Off,
         whole_node: None,
         finished_retention: Duration::from_secs(60),

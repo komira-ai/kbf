@@ -66,7 +66,6 @@ fn kbf_is_built_in_as_data() {
     assert!(frontend.never_last);
     assert_eq!(frontend.after, [Storage, Daemon, MacDaemon]);
     assert_eq!(Services::default().get(KBF), Some(&kbf));
-    assert!(Services::default().ci_may_set(KBF));
 }
 
 /// Catches: a services file that is read wrongly: the two services of the file are defined
@@ -81,10 +80,6 @@ fn a_services_file_defines_further_services() {
     assert_eq!((daemon.max_updating, daemon.min_up), (Some(2), Some(0)));
     assert!(!daemon.never_last);
     assert!(s.get(KBF).is_some() && s.get("server").is_some());
-    assert!(s.ci_may_set(KBF) && !s.ci_may_set("server"));
-
-    let only = Services::parse(&format!("ci_services = [\"server\"]\n{TWO}")).expect("parsed");
-    assert!(only.ci_may_set("server") && !only.ci_may_set(KBF));
     assert_eq!(Services::parse("").expect("empty"), Services::default());
 
     let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "services-file");
@@ -172,7 +167,11 @@ fn a_services_file_that_cannot_work_is_refused() {
         svc("b", "", role)
     );
     assert!(refusal(&later).contains("defined earlier"));
-    assert!(refusal(&format!("ci_services = [\"nope\"]\n{}", svc("a", "", role))).contains("nope"));
+    // Which services a token may set is the allow-list's: the old key is refused by name.
+    assert!(
+        refusal(&format!("ci_services = [\"kbf\"]\n{}", svc("a", "", role)))
+            .contains("ci_services")
+    );
     let after_kbf = svc(
         "a",
         "after = [\"kbf\"]",
