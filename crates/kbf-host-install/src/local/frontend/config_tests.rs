@@ -286,3 +286,230 @@ fn a_gid_that_is_not_a_plain_nonzero_number_is_refused() {
     // A number that is not quoted is not a string: refused too.
     FrontendConfig::parse(&with("group_add = [990]")).unwrap_err();
 }
+
+const HARDENING: &str = "read_only = true\ntmpfs = [\"/tmp:rw,size=256m\", \"/run\"]\ncap_drop = [\"ALL\"]\nsecurity_opt = [\"no-new-privileges\"]\nulimits = [\"nofile=1048576:1048576\", \"core=0\"]";
+
+/// The hardening keys come out as `--read-only`, `--tmpfs`, `--cap-drop`, `--security-opt` and
+/// `--ulimit` words, one argument per entry, in the order given, after `--user` and before the
+/// first `--publish`.
+#[test]
+fn hardening_keys_are_exact_argv_words() {
+    let text = with(&format!(
+        "user = \"65532:65532\"\n{HARDENING}\nports = [\"8980:8980\"]"
+    ));
+    let config = FrontendConfig::parse(&text).unwrap();
+    assert_eq!(
+        config.run.run_args("sha256:abc"),
+        [
+            "run",
+            "--detach",
+            "--name",
+            "kbf-frontend",
+            "--restart",
+            "unless-stopped",
+            "--user",
+            "65532:65532",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,size=256m",
+            "--tmpfs",
+            "/run",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--ulimit",
+            "nofile=1048576:1048576",
+            "--ulimit",
+            "core=0",
+            "--publish",
+            "8980:8980",
+            "sha256:abc"
+        ]
+    );
+    // `read_only = false` and left out are the same: no flag.
+    let args = FrontendConfig::parse(&with("read_only = false"))
+        .unwrap()
+        .run
+        .run_args("i");
+    assert!(!args.contains(&"--read-only".to_owned()));
+    assert_eq!(
+        FrontendConfig::parse(&with("")).unwrap().run.run_args("i"),
+        args
+    );
+}
+
+/// Every shape of a `tmpfs` entry that is read: a bare path, each option, a size with and
+/// without a unit.
+#[test]
+fn tmpfs_entries_of_every_documented_shape_are_read() {
+    for good in [
+        "/tmp",
+        "/var/run/kbf-x_1.d",
+        "/tmp:rw,size=256m",
+        "/tmp:ro,noexec,nosuid,nodev",
+        "/tmp:size=1048576",
+        "/tmp:size=4k",
+        "/tmp:size=2g,mode=1777,uid=65532,gid=65532,nr_inodes=4096",
+    ] {
+        let config = FrontendConfig::parse(&with(&format!("tmpfs = [{good:?}]"))).unwrap();
+        assert_eq!(config.run.tmpfs, [good], "{good}");
+    }
+}
+
+/// A `tmpfs` entry that is not a path with documented options is refused naming `tmpfs`:
+/// relative paths, `..`, shell words, a second flag smuggled in, options that loosen the mount.
+#[test]
+fn a_bad_tmpfs_entry_is_refused() {
+    for bad in [
+        "",
+        "tmp",
+        "/tmp/../etc",
+        "/tmp x",
+        "/tmp;rm",
+        "/tmp:",
+        "/tmp:rw,",
+        "/tmp:exec",
+        "/tmp:suid",
+        "/tmp:dev",
+        "/tmp:size=",
+        "/tmp:size=m",
+        "/tmp:size=1x",
+        "/tmp:size=-1",
+        "/tmp:mode=",
+        "/tmp:mode=0789",
+        "/tmp:mode=77777",
+        "/tmp:uid=",
+        "/tmp:uid=a",
+        "/tmp:uid=12345678901",
+        "/tmp:rw size=1m",
+        "/tmp:rw:size=1m",
+        "/tmp:unknown=1",
+        "--privileged",
+        "/tmp\n",
+    ] {
+        assert!(
+            refusal(&with(&format!("tmpfs = [{bad:?}]"))).contains("tmpfs"),
+            "{bad:?}"
+        );
+    }
+    FrontendConfig::parse(&with("tmpfs = \"/tmp\"")).unwrap_err();
+}
+
+#[test]
+fn cap_drop_names_are_read_and_anything_else_is_refused() {
+    let config = FrontendConfig::parse(&with(
+        "cap_drop = [\"ALL\", \"NET_RAW\", \"CAP_SYS_ADMIN\"]",
+    ))
+    .unwrap();
+    assert_eq!(config.run.cap_drop, ["ALL", "NET_RAW", "CAP_SYS_ADMIN"]);
+    for bad in [
+        "",
+        "all",
+        "net_raw",
+        "NET RAW",
+        "1ALL",
+        "ALL,NET_RAW",
+        "--cap-add=ALL",
+        "NET-RAW",
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789",
+    ] {
+        assert!(
+            refusal(&with(&format!("cap_drop = [{bad:?}]"))).contains("cap_drop"),
+            "{bad:?}"
+        );
+    }
+}
+
+/// Only `no-new-privileges` (true) is accepted for `security_opt`; every option that would
+/// loosen the container, and every other option, is refused. There is no `cap_add`: the
+/// file cannot add a capability back.
+#[test]
+fn security_opt_accepts_only_no_new_privileges() {
+    for good in [
+        "no-new-privileges",
+        "no-new-privileges=true",
+        "no-new-privileges:true",
+    ] {
+        let config = FrontendConfig::parse(&with(&format!("security_opt = [{good:?}]"))).unwrap();
+        assert_eq!(config.run.security_opt, [good]);
+    }
+    for bad in [
+        "seccomp=unconfined",
+        "seccomp:unconfined",
+        "apparmor=unconfined",
+        "label=disable",
+        "label:disable",
+        "no-new-privileges=false",
+        "no-new-privileges:false",
+        "no-new-privileges ",
+        "seccomp=/etc/kbf/profile.json",
+        "systempaths=unconfined",
+        "",
+    ] {
+        assert!(
+            refusal(&with(&format!(
+                "security_opt = [\"no-new-privileges\", {bad:?}]"
+            )))
+            .contains("security_opt"),
+            "{bad:?}"
+        );
+    }
+    assert!(refusal(&with("cap_add = [\"SYS_ADMIN\"]")).contains("cap_add"));
+}
+
+#[test]
+fn ulimits_of_every_documented_shape_are_read() {
+    for good in [
+        "nofile=1048576:1048576",
+        "nofile=1024",
+        "core=0",
+        "nproc=64:128",
+        "stack=8388608:8388608",
+        "memlock=0:0",
+    ] {
+        let config = FrontendConfig::parse(&with(&format!("ulimits = [{good:?}]"))).unwrap();
+        assert_eq!(config.run.ulimits, [good]);
+    }
+}
+
+/// A `ulimits` entry that is not `NAME=SOFT[:HARD]` of a known resource, in digits, with the
+/// soft limit not above the hard one, is refused naming `ulimits`.
+#[test]
+fn a_bad_ulimit_is_refused() {
+    for bad in [
+        "",
+        "nofile",
+        "nofile=",
+        "nofile=:",
+        "nofile=1:",
+        "nofile=:1",
+        "nofile=-1",
+        "nofile=1:-1",
+        "nofile=a",
+        "nofile=1:b",
+        "nofile=2:1",
+        "nofile=1:2:3",
+        "nofile=99999999999999999999",
+        "NOFILE=1",
+        "files=1",
+        "nofile=1 --privileged",
+        "=1",
+    ] {
+        assert!(
+            refusal(&with(&format!("ulimits = [{bad:?}]"))).contains("ulimits"),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn read_only_is_a_boolean() {
+    assert!(
+        FrontendConfig::parse(&with("read_only = true"))
+            .unwrap()
+            .run
+            .read_only
+    );
+    FrontendConfig::parse(&with("read_only = \"true\"")).unwrap_err();
+}
