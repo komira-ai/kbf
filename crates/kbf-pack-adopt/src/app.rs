@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use clap::Parser as _;
 use kbf_pack::{AdoptReport, Adopter};
-use kbf_state::postgres::{PostgresConfig, PostgresPackIndex};
-use kbf_state::{PackIndex, PackIndexError};
+use kbf_pack_index::postgres::PostgresPackIndex;
+use kbf_pack_index::{PackIndex, PackIndexError};
+use kbf_state::postgres::PostgresConfig;
 use serde::Serialize;
 
 use crate::cli::Args;

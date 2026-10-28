@@ -4,7 +4,7 @@
 //! `ExecStartPre=`. For a mode that keeps its state in the database (frontend, all-in-one:
 //! [`names::keeps_state_in_database`]) the state database is brought to the schema this kbf
 //! needs before the unit starts it. The schema is this binary's own: the newest migration it
-//! embeds ([`kbf_state::postgres::schema::latest`]), the number `kbf --version --json` prints
+//! embeds ([`kbf_pack_index::schema::latest`]), the number `kbf --version --json` prints
 //! as `state_schema`; nothing is run to ask for it. Any failure ends the check with exit
 //! status 1, so the unit does not start on a database its binary cannot use. The other modes
 //! keep no state in the database, and a host whose `installer.toml` names no database has
@@ -28,7 +28,6 @@ use std::process::ExitCode;
 use clap::{Arg, Command};
 use kbf_state::postgres::PostgresConfig;
 use kbf_state::postgres::boot::BootStep;
-use kbf_state::postgres::schema;
 
 use crate::names;
 
@@ -82,7 +81,7 @@ pub fn migrate_before_start<S: SchemaStep>(
     let Some(mut step) = database()? else {
         return Ok(NO_DATABASE.to_owned());
     };
-    step.before_start(schema::latest())
+    step.before_start(kbf_pack_index::schema::latest())
         .map(|said| format!("schema step: {said}"))
         .map_err(|why| format!("state schema: {why}"))
 }
@@ -114,7 +113,7 @@ fn database_in(shown: &str, text: &str) -> Result<Option<BootStep>, String> {
             "the `database` URL in {shown} carries a password; use peer authentication"
         ));
     }
-    Ok(Some(BootStep::of_this_build(config)))
+    Ok(Some(kbf_pack_index::schema::boot_step(config)))
 }
 
 /// A parsed `kbf boot-check` command line.

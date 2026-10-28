@@ -479,8 +479,8 @@ mod tests {
         };
         let store = std::sync::Arc::new(kbf_objstore::MemoryStore::new(create_only));
         let clock = std::sync::Arc::new(kbf_state::ManualClock::default());
-        let index = kbf_state::pack_index::memory::MemoryPackIndex::new(clock);
-        let index: std::sync::Arc<dyn kbf_state::PackIndex> = std::sync::Arc::new(index);
+        let index = kbf_pack_index::memory::MemoryPackIndex::new(clock);
+        let index: std::sync::Arc<dyn kbf_pack_index::PackIndex> = std::sync::Arc::new(index);
         let keys = kbf_pack::PackKeys::new(kbf_pack::WriterKind::Frontend, "fe1", "boot1");
         let keys = keys.expect("keys");
         let made = Packs::new(store, index, keys, settings);

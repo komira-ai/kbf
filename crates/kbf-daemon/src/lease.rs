@@ -274,6 +274,7 @@ pub(crate) fn result_of(
             action_digest: None,
             memory_kill: worker::MemoryKill::Unspecified as i32,
             lost: worker::Lost::Unspecified as i32,
+            job_outcome: None,
         },
         Err(RuntimeError::Killed) => failure(id, Code::Aborted, "killed"),
         Err(RuntimeError::Failed(why)) => failure(id, Code::Internal, why),
@@ -350,6 +351,7 @@ fn missing(id: LeaseId, blob: &str) -> worker::Result {
         // A missing input is not a memory kill, nor lost.
         memory_kill: worker::MemoryKill::Unspecified as i32,
         lost: worker::Lost::Unspecified as i32,
+        job_outcome: None,
     }
 }
 
@@ -368,6 +370,7 @@ pub(crate) fn failure(id: LeaseId, code: Code, message: impl Into<String>) -> wo
         // that are.
         memory_kill: worker::MemoryKill::Unspecified as i32,
         lost: worker::Lost::Unspecified as i32,
+        job_outcome: None,
     }
 }
 

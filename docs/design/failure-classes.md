@@ -130,14 +130,14 @@ exit code, or a non-OK status (`kbf-proto/proto/kbf/worker/v1/worker.proto:240-2
   Bazel needs to re-upload (section 3); keep it.
 - **Retries**: farm faults only (#22; [scheduler.md](scheduler.md#retries-of-farm-faults)).
   A busy node's memory kill, a lost run (`Failure::Lost`), a result the farm could not
-  produce (`Failure::Infra`, `result_committed` in `kbf-sched/src/scheduler.rs`) and a
+  produce (`Failure::Infra`, `result_committed` in `js-sched/src/scheduler.rs` (jobscheduler)) and a
   lease of a daemon its successor proved stopped (the requeue reason `Restarted`) run
   again from one budget, `FARM_RERUNS` = 2, so at most 3 runs ending so per operation,
   preferring another node; past it the operation is answered `INTERNAL` "kbf farm fault
   on <node>: ...", naming the runs. A lease given up as not started has its own budget,
   `NOT_STARTED_RERUNS` = 3 per operation; past it the operation finishes with
   `Failure::Infra`. A lease given up for reconnection or a session switch runs again with
-  no limit (`kbf-sched/src/requeue.rs`). A MissingInput result
+  no limit (`js-sched/src/requeue.rs` (jobscheduler)). A MissingInput result
   finishes its operation at once and is never rerun: the blob is the client's to
   upload, so it is not a farm fault and counts against no farm rerun budget.
 - **Cache**: written only for an OK result with exit 0 and not `do_not_cache`
@@ -693,7 +693,7 @@ requeued (decided). Today only half of that holds:
   counts suspension (`CLOCK_BOOTTIME`, `mach_continuous_time`; [daemon.md](daemon.md)).
   A suspend past T = 40 s therefore ends in the fence: the run is killed and reported
   lost (`UNAVAILABLE`, `LOST_FENCED`). Past G = 60 s the server has already given the lease up and requeued the
-  operation (`kbf-sched/src/requeue.rs`), outside the rerun budget, and the late result
+  operation (`js-sched/src/requeue.rs` (jobscheduler)), outside the rerun budget, and the late result
   loses (simulation I5). On resume the fence is checked first (simulation F2.6).
 - **Between T and G, today.** The server still holds the lease, so it accepts the
   lost result: `Farm::outcome` maps it to `Failure::Lost(Fenced)`, and the scheduler
@@ -813,7 +813,7 @@ refusal at the stream's opening), and Bazel treats `UNAVAILABLE` as catastrophic
   - is server policy, not an action-cache entry: REAPI says a failed result must not
     be cached, and the memo stores no `ActionResult`.
 - **What it needs in code.** A `Failure::Farm` outcome the scheduler requeues from
-  (today `Failure::Infra` is rerun within the farm budget, `kbf-sched/src/scheduler/fault.rs`), the
+  (today `Failure::Infra` is rerun within the farm budget, `js-sched/src/scheduler/fault.rs` (jobscheduler)), the
   excluded nodes and the run count in the operation's state, and the reason kept beside
   the outcome as `Detail::Invalid` keeps its reason today.
 

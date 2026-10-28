@@ -424,6 +424,28 @@ async fn a_failed_report_ends_the_order() {
     );
 }
 
+/// Catches: a report of an earlier success, or of a failure of some other version, ending
+/// the order of the version asked for, which would give the slot away while the ordered
+/// update is still to come.
+#[tokio::test]
+async fn a_report_of_another_update_keeps_the_order() {
+    let rig = started("svc-order-other-failed", ONE_STORAGE).await;
+    let c = &rig.coordinator;
+    c.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    for report in [
+        last(beat("1.0"), "0.9", Outcome::Succeeded),
+        last(beat("1.0"), "1.5", Outcome::Failed),
+    ] {
+        c.heartbeat(storage("s2"), report);
+        assert_eq!(
+            c.heartbeat(storage("s3"), beat("1.0")),
+            Reply::Nothing,
+            "s2 still holds the slot it was ordered"
+        );
+    }
+}
+
 /// Catches: an order for a host that never reports holding its slot for ever.
 #[tokio::test]
 async fn an_order_nobody_reports_ages_out() {
@@ -515,6 +537,23 @@ async fn a_failure_for_another_target_does_not_end_the_order() {
     c.heartbeat(storage("s1"), beat("1.0"));
     assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
     c.heartbeat(storage("s2"), last(beat("1.0"), "1.5", Outcome::Failed));
+    assert_eq!(
+        c.heartbeat(storage("s3"), beat("1.0")),
+        Reply::Nothing,
+        "s2's report is about 1.5; its order for 2.0 still holds the slot"
+    );
+}
+
+/// Catches: any report of a finished update ending an order: a host that reports a
+/// successful update to a different version, while still at the old version and not yet
+/// updating to the ordered one, has not reported the order, so it still holds its slot.
+#[tokio::test]
+async fn a_success_for_another_target_does_not_end_the_order() {
+    let rig = started("svc-order-other-success", ONE_STORAGE).await;
+    let c = &rig.coordinator;
+    c.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    c.heartbeat(storage("s2"), last(beat("1.0"), "1.5", Outcome::Succeeded));
     assert_eq!(
         c.heartbeat(storage("s3"), beat("1.0")),
         Reply::Nothing,

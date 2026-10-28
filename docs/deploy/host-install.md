@@ -366,7 +366,8 @@ stage):
    (`gh` hashes the staged copy), the build's source digest to the full 40-digit commit (not the
    version's 12 digits), its source ref to the channel's branch, the signer to
    `komira-ai/kbf`'s `artifacts.yml` workflow (the repository's former name is still accepted,
-   for releases attested under it), and GitHub-hosted runners only;
+   for releases attested under it; a channel may name [another repository and
+   workflow](#a-channel-of-another-repository)), and GitHub-hosted runners only;
 5. the tarball holds exactly one regular file named `kbf`, a Mach-O file for arm64;
 6. the binary carries no `com.apple.quarantine` attribute (it is removed, and proven gone);
 7. `codesign --verify --strict` accepts it and its signature has the hardened runtime;
@@ -476,7 +477,7 @@ on one without, it is to remove its files from `dir`.
 
 A channel with `source = "github"` needs no file delivery and no edit of the allowlist for a new
 release: the install fetches the release itself, as `nobody`, from the GitHub releases of
-`komira-ai/kbf`, and then handles the two files exactly as it handles the files of a `dir`
+`komira-ai/kbf` (or the repository the channel names, [below](#a-channel-of-another-repository)), and then handles the two files exactly as it handles the files of a `dir`
 (copied once into the stage, `sums` checked when set, then the offline attestation check and
 everything after it). The build attestation is still the only trust anchor; the listing and the
 download only bring the bytes. A directory channel stays for a Mac that cannot reach GitHub.
@@ -486,7 +487,7 @@ What the install does, in this order, with the system `curl` (listing) and the p
 directory that `nobody` owns inside the stage, with its own `HOME`:
 
 1. lists the repository's releases with `/usr/bin/curl` from the public REST endpoint
-   `https://api.github.com/repos/komira-ai/kbf/releases?per_page=100&page=N`, with no token. The
+   `https://api.github.com/repos/komira-ai/kbf/releases?per_page=100&page=N` (the channel's repository), with no token. The
    flags are fixed: no configuration file (`-q` first), HTTPS only, no redirect, an HTTP error
    fails the command, a time limit, a size limit, and an empty environment. It is 100 a page, newest first, page
    after page until a page is empty, and at most 30 pages (an empty page ends it; a short one
@@ -498,7 +499,8 @@ directory that `nobody` owns inside the stage, with its own `HOME`:
    `unknown_release`, since not all of it was seen. When the channel has `sums`, the commit is
    the one the sums list, and the listing must hold it;
 3. builds the download itself from the release's tag and the two asset names:
-   `gh release download <tag> --repo komira-ai/kbf --pattern <tarball> --pattern <bundle> --dir <dir>`.
+   `gh release download <tag> --repo komira-ai/kbf --pattern <tarball> --pattern <bundle> --dir <dir>`
+   (the channel's repository again).
    The URLs in the listing (`browser_download_url`, `url`) are never read or followed, and an entry
    whose tag is not letters, digits and `. _ + -` is not used;
 4. runs that download under a time limit (15 minutes) and a limit on what it may write (the
@@ -549,6 +551,53 @@ launchd, and no stage left behind.
   before it is killed; the copy then refuses the file, and the stage is removed.
 - A channel with `sums` pins the commit and the tarball's hash, and needs an edit of the sums file
   for each new release; the point of this source is a channel without them.
+
+### A channel of another repository
+
+By default a channel takes its releases from `komira-ai/kbf`, trusts the attestation of that
+repository's `artifacts.yml`, and names its files `kbf-<commit>-...`. A channel with
+`source = "github"` may name its own:
+
+```toml
+trusted_workflows = ["owner/other/.github/workflows/release.yml"]   # top level, before the first [channels.*]; empty by default
+
+[channels.other]
+source = "github"
+repository = "owner/other"
+signer_workflow = "owner/other/.github/workflows/release.yml"
+artifact_prefix = "other"                 # optional; "kbf" is the default
+```
+
+- `repository` is `owner/name` (letters, digits and `-` in the owner; letters, digits and
+  `. _ -` in the name). It is the repository the releases are listed from (the URL above), the
+  one `gh release download --repo` reads, and the `--repo` of the attestation check.
+- `signer_workflow` is the workflow whose attestation is believed (`--signer-workflow`): a
+  `.yml` or `.yaml` file directly under that repository's `.github/workflows/`. It comes with
+  `repository`; one without the other is `config_invalid`.
+- `artifact_prefix` replaces `kbf` at the start of the release files' names
+  (`<prefix>-<commit>-<platform>.tar.gz`, `.deb`, `.rpm`, and `<prefix>-frontend-image-<commit>-...`).
+  It is lower-case letters, digits and `-`, and goes only with `source = "github"` and no `sums`
+  (a directory's file names and a sums file are kbf's).
+- A string that is not safe to put in a URL or an argument of `gh` makes the file `config_invalid`
+  when it is read, so no channel of the file is usable. So does an entry of `trusted_workflows`
+  that is not `owner/name/.github/workflows/<file>.yml`.
+- **Any signer other than exactly `komira-ai/kbf` with `.github/workflows/artifacts.yml` is
+  refused when the channel is used**, unless the same file lists that exact workflow in the
+  top-level `trusted_workflows`. This holds for another workflow of `komira-ai/kbf` too (a channel
+  naming its `ci.yml` needs the entry), and an entry for one workflow does not trust the other
+  workflows of its repository. The answer is `channel_not_allowed`, and the words on stderr (the
+  socket's `detail`) name the channel and the workflow. Trusting a workflow to sign what this host
+  installs is the operator's act, on a file that must be root's alone to write like the rest of
+  the allowlist; nothing trusts one by default, and `trusted_workflows` is empty when the key is
+  absent.
+- The other rules of the check do not change: the attestation must come from a GitHub-hosted
+  runner, name the full commit, the channel's branch, and a subject whose sha256 is the file's,
+  and be checked offline by the pinned `gh` and trusted root. The former `komira-ai/komira-build-farm`
+  name is accepted for the `komira-ai/kbf` default pair only; for any other pair `gh` is asked once.
+- Only the signer, the listing and the file names are the channel's. What is checked about the
+  contents (the tarball holds the one `kbf` executable, a package is named `kbf`) is unchanged.
+
+A file without these keys means what it meant before.
 
 ## The local socket
 
@@ -644,7 +693,7 @@ installer's `state.json`, which is also where the pending marker lives (`pending
 the deadline). A host that was set up by hand with `kbf-deploy host install` has all of it; a host
 with no `current` release has nothing to go back to and is refused (`no_current`). The channels
 are in `/etc/kbf/host-install-releases.toml`, in the format of the Mac's allowlist below (a
-channel whose `source = "github"`; the ssh path's `host-install.toml` is the apt channels' and is
+channel whose `source = "github"`, which may name its own [repository and signer](#a-channel-of-another-repository); the ssh path's `host-install.toml` is the apt channels' and is
 not read):
 
 ```toml
@@ -656,7 +705,7 @@ source = "github"
 bundle as the installer's unprivileged user, copies them once into the installer's scratch, and
 runs the installer's verify pipeline over the copy with the pinned `gh` and trusted root
 ([host-releases.md](host-releases.md#what-is-trusted)): the attestation must be of this
-repository's `artifacts.yml` on a hosted runner, for the full commit, on the channel's branch; the
+repository's `artifacts.yml` (or the channel's own [signer](#a-channel-of-another-repository)) on a hosted runner, for the full commit, on the channel's branch; the
 tarball must hold the one executable of this CPU; and the binary run as the unprivileged user must
 say it is that commit. Nothing is fetched when the trust files are not root's. A release whose
 `protocol` or `state_schema` is newer than this program's `kbf-installer` understands is refused
@@ -673,7 +722,7 @@ directory (`/var/lib/kbf-host-install`: `package.json` and `packages/`, root's, 
 
 | request | does |
 |---|---|
-| `install` | fetches the release's `kbf-<commit>-linux-<cpu>.deb` (or `.rpm`), its `.sigstore.json` bundle and the release's `SHA256SUMS` as the installer's unprivileged user, copies them once as root, and checks the copy, offline, before it keeps anything: the sha256 `SHA256SUMS` lists for the file; `gh attestation verify` (this repository's `artifacts.yml` on a hosted runner, for the full commit, on the channel's branch, with the pinned `gh` and trusted root); and the package manager's own reading of the file (`dpkg-deb --field`, `rpm --query --package`): the package `kbf`, for this CPU, at the version asked for. Nothing is installed, restarted or recorded |
+| `install` | fetches the release's `kbf-<commit>-linux-<cpu>.deb` (or `.rpm`), its `.sigstore.json` bundle and the release's `SHA256SUMS` as the installer's unprivileged user, copies them once as root, and checks the copy, offline, before it keeps anything: the sha256 `SHA256SUMS` lists for the file; `gh attestation verify` (this repository's `artifacts.yml`, or the channel's own signer, on a hosted runner, for the full commit, on the channel's branch, with the pinned `gh` and trusted root); and the package manager's own reading of the file (`dpkg-deb --field`, `rpm --query --package`): the package `kbf`, for this CPU, at the version asked for. Nothing is installed, restarted or recorded |
 | `switch` | checks the kept file's sha256 again; reads the installed version from the package database; keeps a verified copy of the package that runs (the one kept already, or the release of that version fetched and checked the same way); writes the trial, with its deadline, naming that copy; then installs the new file (`dpkg --force-confold --install`, or `rpm --upgrade --oldpackage --replacepkgs`: one file, no repository, no dependency resolution) and restarts each `--restart-unit` and waits for it. A package that fails to install, or a unit that does not come up, puts the previous package back at once |
 | `confirm` | ends the trial and forgets every kept file but the new package and the one before it |
 | `revert` | and the deadline: installs the kept copy of the package that ran (fetching and checking it again if the file is gone or changed), ends the trial, restarts the units |

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use kbf_objstore::ObjectStore;
 use kbf_pack::{Blob, Fetch, PackerConfig, ReadCache, ReadError, ReaderConfig};
-use kbf_state::{MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError};
+use kbf_pack_index::{MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError};
 
 use crate::support::{Rig, blob, cache_dir, digests, filler, keys, limits, pack_all, pack_key};
 

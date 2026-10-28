@@ -8,12 +8,16 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The scheduler vocabulary (`sched`) lives in the jobscheduler repository, at the revision
+# the workspace pins.
+js-types.workspace = true
 serde.workspace = true
-# `Version::parse` reads the report of `kbf --version --json` (crates/kbf-types/src/sched/version.rs).
-serde_json.workspace = true
 thiserror.workspace = true
 # The wipe-on-drop of `object_store_api::Secret`.
 zeroize.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

@@ -639,6 +639,7 @@ impl Cell {
             tick: Duration::from_millis(50),
             unservable_wait: wait,
             default_platform,
+            qos_allowed: kbf_front::QosAllow::DEFAULT,
             memory_ladder: ladder,
             vm_host_floor: kbf_server::HostFloor::default(),
             learned_sizes: learned,
@@ -1217,6 +1218,7 @@ pub fn ran(lease: Option<LeaseId>, result: &ActionResult) -> kbf_proto::worker::
         action_digest: None,
         memory_kill: 0,
         lost: 0,
+        job_outcome: None,
     }
 }
 
@@ -1253,6 +1255,7 @@ pub fn failed(lease: Option<LeaseId>, code: Code) -> kbf_proto::worker::Result {
         action_digest: None,
         memory_kill: 0,
         lost: 0,
+        job_outcome: None,
     }
 }
 

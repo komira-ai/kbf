@@ -18,7 +18,9 @@ clap.workspace = true
 kbf-objstore.workspace = true
 # `Adopter`, which lists the segments, reads their footers and records them.
 kbf-pack.workspace = true
-# `PostgresConfig` and `PostgresPackIndex`: the pack index is in the Postgres state store.
+# `PostgresPackIndex`: the pack index is in the Postgres state store.
+kbf-pack-index = { workspace = true, features = ["postgres"] }
+# `PostgresConfig`.
 kbf-state = { workspace = true, features = ["postgres"] }
 # The credentials file, the checkpoint and the report are JSON.
 serde.workspace = true
@@ -35,7 +37,8 @@ bytes.workspace = true
 kbf-objstore = { workspace = true, features = ["testkit"] }
 # The segments the tests put in the fake store.
 kbf-segments.workspace = true
-# The in-memory pack index and, for one test, a Postgres database of its own.
+# The in-memory pack index and, for one test, a Postgres database of its own with the pack tables.
+kbf-pack-index = { workspace = true, features = ["test-database", "test-support"] }
 kbf-state = { workspace = true, features = ["test-database", "test-support"] }
 # `TestDir`, and the test Postgres server the database is made on.
 kbf-testkit = { workspace = true, features = ["postgres"] }

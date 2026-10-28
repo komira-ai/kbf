@@ -27,7 +27,7 @@ use kbf_sched::{DaemonInstance, Request};
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Failure, FarmTime, LeaseGrant, LeaseId,
     LeaseKind, LostWhy, OperationId, Outcome, Qos, QosError, RefusalRecord, Resources,
-    ResultRecord, WorkerId,
+    ResultRecord, WorkKey, WorkerId,
 };
 use prost::Message;
 
@@ -197,7 +197,8 @@ impl Rng {
             key: ActionKey {
                 instance: self.name(),
                 action: self.digest(),
-            },
+            }
+            .into(),
             qos: self.qos(),
             kind: self.pick(&LeaseKind::ALL),
             resources: self.resources(),
@@ -220,7 +221,7 @@ impl Rng {
         ];
         if self.below(2) == 0 {
             Outcome::Completed {
-                action_result: self.digest(),
+                action_result: self.digest().into(),
             }
         } else {
             Outcome::Failed(self.pick(&failures))
@@ -233,6 +234,7 @@ impl Rng {
                 lease: self.lease(),
                 operation: OperationId(self.number()),
                 worker: self.worker(),
+                cost: Default::default(),
             }),
             1 => ControlRecord::Result(ResultRecord {
                 lease: self.lease(),
@@ -865,6 +867,27 @@ fn a_wall_time_outside_u64_nanoseconds_is_not_written() {
     let past = last + Duration::from_nanos(1);
     assert_eq!(encode(Format::V1, &at(past)), Err(EncodeError::WallTime));
     assert_eq!(dec(&enc(&at(last))), Ok(at(last)));
+}
+
+/// Catches a request whose work key is not an action's being written anyway, as the
+/// action it is not: the format has a message for an instance and a digest only.
+#[test]
+fn a_work_key_that_is_not_an_action_is_not_written() {
+    let request = |dedup: &str| Request {
+        key: WorkKey::new("i", dedup),
+        qos: Qos::Ci,
+        kind: LeaseKind::Action,
+        resources: Resources::new(1, 2),
+        needs: kbf_caps::Request::default(),
+        hermetic: true,
+        do_not_cache: false,
+    };
+    assert_eq!(
+        encode(Format::V1, &batch(FarmInput::Submit(request("job 7")))),
+        Err(EncodeError::WorkKey)
+    );
+    let ok = format!("{}/3", "0a".repeat(32));
+    assert!(encode(Format::V1, &batch(FarmInput::Submit(request(&ok)))).is_ok());
 }
 
 /// Catches a control command written or read under a format this build does not know

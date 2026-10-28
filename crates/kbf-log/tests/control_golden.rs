@@ -35,7 +35,8 @@ fn request(qos: Qos, kind: LeaseKind) -> Request {
         key: ActionKey {
             instance: "i".to_owned(),
             action: d(3),
-        },
+        }
+        .into(),
         qos,
         kind,
         resources: Resources::new(1, 2),
@@ -176,6 +177,7 @@ fn golden() -> Vec<(&'static str, LogCommand, String)> {
                 lease: lease(1, 2),
                 operation: OperationId(3),
                 worker: w("w"),
+                cost: Default::default(),
             }))),
             batch_hex(21, 15, "2a0d0a0b0a040801100210031a0177"),
         ),
@@ -280,7 +282,7 @@ fn golden() -> Vec<(&'static str, LogCommand, String)> {
                 operation: OperationId(3),
                 lease: lease(1, 2),
                 outcome: Outcome::Completed {
-                    action_result: d(3),
+                    action_result: d(3).into(),
                 },
                 action_entry: Some(ActionEntry {
                     action: d(4),

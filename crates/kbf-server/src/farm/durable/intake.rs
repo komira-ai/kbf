@@ -19,7 +19,7 @@
 //!   stays.
 //! - **Callers.** The callers of an operation another frontend took are shown what the store
 //!   says of it each poll: executing while it holds a lease, and its result once the `done/`
-//!   row is there ([`State::follow_elsewhere`]); the callers of a result or a refusal this
+//!   row is there ([`Engine::follow_elsewhere`]); the callers of a result or a refusal this
 //!   frontend could not write (it lost the race, or the node moved to another frontend)
 //!   follow it the same way. They are kept for the finished retention after, as the callers
 //!   of an operation this frontend finished are. A recorded call among them is ended in the
@@ -29,7 +29,7 @@
 //!   frontend owns are followed the same way from the start ([`Held::Elsewhere`]): the
 //!   scheduler never held the operation.
 //! - **Watched operations.** The operations clients wait on or ask about by name that the
-//!   scheduler does not hold are looked at each poll too ([`State::follow_watched`]).
+//!   scheduler does not hold are looked at each poll too ([`Engine::follow_watched`]).
 //! - **A lost grant.** A grant this frontend wrote that the store refuses as stale was
 //!   taken by another frontend: the placement is undone ([`kbf_sched::Scheduler::unplace`]),
 //!   and the operation follows the store as above.
@@ -44,15 +44,13 @@
 //! nothing. One whose intake is closed by a drain ([`Farm::close_intake`]) takes in no operation
 //! of the others' queue and does the rest.
 
-use std::collections::BTreeSet;
-
 use kbf_sched::{Cordon, Event, Input};
 use kbf_types::{StartLease, StateMachine};
 
 use super::owner::owner_key;
 use super::sweep::Orphan;
 use super::*;
-use crate::farm::handover::{cordon_event, note, show};
+use crate::farm::handover::{cordon_event, note};
 
 /// How often the intake poll looks at the state store: often enough that an operation
 /// another frontend queued waits a fifth of a second for a frontend with room, and a
@@ -181,8 +179,8 @@ impl Durable {
     /// Every queued operation, with the version of its `queue/` row.
     fn queued(&self) -> Result<BTreeMap<OperationId, Version>, StateError> {
         let mut queued = BTreeMap::new();
-        for (key, row) in self.store.scan_prefix("queue/")? {
-            queued.insert(parse_operation(&key, "queue/")?, row.version);
+        for (key, row) in self.store.scan_prefix(QUEUE)? {
+            queued.insert(parse_operation(&key, QUEUE)?, row.version);
         }
         Ok(queued)
     }
@@ -229,7 +227,11 @@ impl Farm {
     /// Placement follows at the next tick.
     pub fn intake(&self) {
         let now = self.now();
-        self.lock().take_intake(now, self.lease_epoch);
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        state
+            .engine
+            .take_intake(&mut state.side, now, self.lease_epoch);
     }
 
     /// Polls [`Farm::intake`] every [`INTAKE_POLL`], for as long as it is polled.
@@ -249,7 +251,7 @@ impl Farm {
     /// it saw everything written before it.
     #[must_use]
     pub fn intake_polls(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.lock().intake.polls.subscribe()
+        self.lock().engine.intake.polls.subscribe()
     }
 
     /// The epoch the state store holds, if it is past the one this frontend serves, as the
@@ -257,7 +259,7 @@ impl Farm {
     /// frontend serves the epoch it started under until it is restarted.
     #[must_use]
     pub fn epoch_ahead(&self) -> Option<u64> {
-        self.lock().intake.epoch_ahead
+        self.lock().engine.intake.epoch_ahead
     }
 
     /// This farm, requeueing a lease whose node has no session row after `wait` (instead of
@@ -265,14 +267,14 @@ impl Farm {
     #[doc(hidden)]
     #[must_use]
     pub fn with_orphan_wait(self, wait: Duration) -> Self {
-        self.lock().intake.orphan_wait = wait;
+        self.lock().engine.intake.orphan_wait = wait;
         self
     }
 }
 
-impl State {
+impl Engine {
     /// [`Farm::intake`] under the lock.
-    pub(in crate::farm) fn take_intake(&mut self, now: FarmTime, served: u64) {
+    pub(in crate::farm) fn take_intake(&mut self, a: &mut dyn Adapter, now: FarmTime, served: u64) {
         if self.fenced {
             self.count_poll();
             return;
@@ -286,14 +288,14 @@ impl State {
             return;
         };
         self.note_epoch(polled.epoch, served);
-        self.release_followed(now);
-        self.take_queued(&polled.queued);
-        self.follow_elsewhere(now);
-        self.follow_watched();
-        self.apply_cordons(now, polled.cordons, polled.at);
+        self.release_followed(a, now);
+        self.take_queued(a, &polled.queued);
+        self.follow_elsewhere(a, now);
+        self.follow_watched(a);
+        self.apply_cordons(a, now, polled.cordons, polled.at);
         self.apply_floors(&polled.floors, &polled.key_floors);
-        self.sweep_orphans();
-        self.look_at_remote_sessions();
+        self.sweep_orphans(a);
+        self.look_at_remote_sessions(a);
         self.count_poll();
     }
 
@@ -310,17 +312,12 @@ impl State {
     /// with none the scan is skipped (a scan on top of the orphan sweep's, five times a
     /// second). Accepted staleness: when an operation first waits, the list may be up to
     /// one poll old, and the next poll's republish corrects its stage.
-    fn look_at_remote_sessions(&mut self) {
+    fn look_at_remote_sessions(&mut self, a: &mut dyn Adapter) {
         if self.stuck.is_empty() {
             self.intake.remote.clear();
             return;
         }
-        let connected: BTreeSet<WorkerId> = self
-            .links
-            .iter()
-            .filter(|(_, link)| !link.outbound.is_closed())
-            .map(|(worker, _)| worker.clone())
-            .collect();
+        let connected = a.connected();
         let mut remote = None;
         self.durably("a session look", |d| {
             remote = Some(d.remote_sessions(&connected)?);
@@ -328,7 +325,7 @@ impl State {
         });
         if let Some(remote) = remote {
             self.intake.remote = remote;
-            self.republish_stuck();
+            self.republish_stuck(a);
         }
     }
 
@@ -347,23 +344,23 @@ impl State {
 
     /// Forgets the callers of the operations other frontends finished whose retention has
     /// passed.
-    fn release_followed(&mut self, now: FarmTime) {
+    fn release_followed(&mut self, a: &mut dyn Adapter, now: FarmTime) {
         self.intake.kept.retain(|_, until| now < *until);
-        self.forget_dropped();
+        self.forget_dropped(a);
     }
 
     /// Makes the scheduler's queue the store's: reconciles each operation held queued with
     /// its `queue/` row in `queued`, then takes in the queued operations it does not hold.
-    fn take_queued(&mut self, queued: &BTreeMap<OperationId, Version>) {
+    fn take_queued(&mut self, a: &mut dyn Adapter, queued: &BTreeMap<OperationId, Version>) {
         let held: Vec<OperationId> = self.sched.queued().collect();
         for operation in held {
-            self.reconcile(operation, queued.get(&operation).copied());
+            self.reconcile(a, operation, queued.get(&operation).copied());
         }
         // A farm whose intake is closed ([`Farm::close_intake`]) takes in nothing new.
         if !self.closed {
             for (&operation, &version) in queued {
                 if !self.known_operation(operation) {
-                    self.take_in(operation, version);
+                    self.take_in(a, operation, version);
                 }
             }
         }
@@ -380,7 +377,7 @@ impl State {
     /// still to come. A row that is not the one read before: the operation was granted and
     /// queued again, and is taken in again with the rows of now, unless the intake is closed:
     /// then it is only handed off.
-    fn reconcile(&mut self, operation: OperationId, row: Option<Version>) {
+    fn reconcile(&mut self, a: &mut dyn Adapter, operation: OperationId, row: Option<Version>) {
         let Some(version) = row else {
             if !self.requeue_pending(operation) {
                 self.hand_off(operation);
@@ -391,7 +388,7 @@ impl State {
         if before.is_some_and(|before| before != version) {
             self.hand_off(operation);
             if !self.closed {
-                self.take_in(operation, version);
+                self.take_in(a, operation, version);
             }
         }
     }
@@ -425,7 +422,12 @@ impl State {
     /// meanwhile) is not taken in, and neither is one that holds a lease now: another
     /// frontend granted it since the poll read the queue, and its lease is taken up only
     /// when its node says `Hello` here.
-    pub(super) fn take_in(&mut self, operation: OperationId, version: Version) {
+    pub(in crate::farm) fn take_in(
+        &mut self,
+        a: &mut dyn Adapter,
+        operation: OperationId,
+        version: Version,
+    ) {
         let mut found = None;
         self.durably("a queued operation", |d| {
             found = d.stored_with(operation, None)?;
@@ -435,7 +437,7 @@ impl State {
             .filter(|stored| stored.lease.is_none())
             .into_iter()
             .for_each(|stored| {
-                self.take_in_stored(stored);
+                self.take_in_stored(a, stored);
                 self.intake.queue_seen.insert(operation, version);
             });
     }
@@ -444,10 +446,10 @@ impl State {
     /// stale: another frontend's work stands in their place. A grant is undone, so the
     /// worker's booking is released and the scheduler does not keep a lease the store does
     /// not hold; the callers of a result or a refusal that lost are answered from the store.
-    pub(in crate::farm) fn lost_race(&mut self, dropped: &VecDeque<Effect>) {
+    pub(in crate::farm) fn lost_race(&mut self, a: &mut dyn Adapter, dropped: &VecDeque<Effect>) {
         for effect in dropped {
             if let Effect::Start(start) = effect {
-                self.lose_grant(start);
+                self.lose_grant(a, start);
             }
         }
         self.follow_finishes(dropped);
@@ -471,16 +473,16 @@ impl State {
 
     /// The grant `start` lost to another frontend: the scheduler forgets the placement and
     /// asks the store where the operation stands.
-    fn lose_grant(&mut self, start: &StartLease) {
+    fn lose_grant(&mut self, a: &mut dyn Adapter, start: &StartLease) {
         let unplaced = self.sched.unplace(start.lease);
         unplaced
             .into_iter()
-            .for_each(|operation| self.undone(operation, start));
+            .for_each(|operation| self.undone(a, operation, start));
     }
 
     /// `operation`, whose grant `start` was undone: asks the store where it stands. A row
     /// that cannot be read is looked at again by the next poll.
-    fn undone(&mut self, operation: OperationId, start: &StartLease) {
+    fn undone(&mut self, a: &mut dyn Adapter, operation: OperationId, start: &StartLease) {
         tracing::info!(
             %operation,
             lease = %start.lease,
@@ -494,18 +496,18 @@ impl State {
         });
         looked
             .into_iter()
-            .for_each(|row| self.reconcile(operation, row));
+            .for_each(|row| self.reconcile(a, operation, row));
     }
 
     /// Shows the callers kept for the operations other frontends took what the store says
     /// of each: executing while it holds a lease, its result once it has one. The callers
     /// of an operation that ended, or whose own streams are all gone, are kept for the
     /// finished retention and then forgotten.
-    fn follow_elsewhere(&mut self, now: FarmTime) {
+    fn follow_elsewhere(&mut self, a: &mut dyn Adapter, now: FarmTime) {
         for (operation, callers) in std::mem::take(&mut self.intake.elsewhere) {
-            let live = self.waiting_among(&callers);
+            let live = a.waiting_among(&callers);
             if live.is_empty() {
-                self.retire(operation, callers, now);
+                self.retire(a, operation, callers, now);
                 continue;
             }
             let mut looked = None;
@@ -516,13 +518,11 @@ impl State {
             let untraced = &mut self.untraced_kept;
             let stage = looked.and_then(|progress| note(untraced, operation, &progress));
             if let Some(stage) = &stage {
-                for channel in live.iter().filter_map(|caller| self.stages.get(caller)) {
-                    show(channel, stage.clone());
-                }
+                a.show_callers(&live, stage);
             }
             if let Some(Stage::Done(finished)) = &stage {
-                self.record_followed(operation, finished);
-                self.retire(operation, callers, now);
+                a.followed(operation, finished);
+                self.retire(a, operation, callers, now);
             } else {
                 self.intake.elsewhere.insert(operation, callers);
             }
@@ -531,29 +531,41 @@ impl State {
 
     /// Ends the following of `operation`: its `callers` are kept for the finished
     /// retention, as the callers of an operation this frontend finished are.
-    fn retire(&mut self, operation: OperationId, callers: Vec<WaiterId>, now: FarmTime) {
+    fn retire(
+        &mut self,
+        a: &mut dyn Adapter,
+        operation: OperationId,
+        callers: Vec<WaiterId>,
+        now: FarmTime,
+    ) {
         self.untraced_kept.remove(&operation);
         let until = now.saturating_add(self.finished_retention);
         self.intake.kept.insert(operation, until);
-        self.machine.keep_finished(operation, callers);
-        self.forget_dropped();
+        a.keep_finished(operation, callers);
+        self.forget_dropped(a);
     }
 
     /// Places the nodes as the `cordon/` rows `rows` say now, `at` milliseconds on the
     /// store's clock: a row that is not as the last poll found it is applied, and a node
     /// whose row is gone returns to placement.
-    fn apply_cordons(&mut self, now: FarmTime, rows: BTreeMap<WorkerId, StoredCordon>, at: u64) {
+    fn apply_cordons(
+        &mut self,
+        a: &mut dyn Adapter,
+        now: FarmTime,
+        rows: BTreeMap<WorkerId, StoredCordon>,
+        at: u64,
+    ) {
         let seen = std::mem::replace(&mut self.intake.cordons, rows.clone());
         for (worker, cordon) in &rows {
             if seen.get(worker) != Some(cordon) {
                 tracing::info!(%worker, ?cordon, "another frontend placed the node");
-                self.feed_quiet(now, cordon_event(worker.clone(), *cordon, now, at));
+                self.feed_quiet(a, now, cordon_event(worker.clone(), *cordon, now, at));
             }
         }
         for worker in seen.keys().filter(|worker| !rows.contains_key(*worker)) {
             tracing::info!(%worker, "another frontend returned the node to placement");
             let worker = worker.clone();
-            self.feed_quiet(now, Event::Uncordon { worker });
+            self.feed_quiet(a, now, Event::Uncordon { worker });
         }
     }
 
@@ -563,6 +575,7 @@ impl State {
     /// no store or the store cannot be read.
     pub(in crate::farm) fn take_cordons(
         &mut self,
+        a: &mut dyn Adapter,
         now: FarmTime,
     ) -> Option<BTreeMap<WorkerId, StoredCordon>> {
         let mut read = None;
@@ -572,14 +585,14 @@ impl State {
         });
         let (rows, at) = read?;
         let rows: BTreeMap<WorkerId, StoredCordon> = rows.into_iter().collect();
-        self.apply_cordons(now, rows.clone(), at);
+        self.apply_cordons(a, now, rows.clone(), at);
         Some(rows)
     }
 
     /// Puts `worker` back in the drain its `cordon/` row says, if the drain ended for want of
     /// a lease. A start takes up no leased operation, so a drain taken up at the start finds
     /// its node holding no lease and ends; the node's leases are taken up when it says
-    /// `Hello` ([`State::claim_worker`], which calls this after taking them up), and a node
+    /// `Hello` ([`Engine::claim_worker`], which calls this after taking them up), and a node
     /// that runs work is not drained.
     pub(super) fn resume_drain(&mut self, now: FarmTime, worker: &WorkerId) {
         if self.sched.cordon(worker) != Some(&Cordon::Drained) {
@@ -612,24 +625,23 @@ impl State {
     }
 
     /// Whether the state store knows `worker`: a frontend has owned it. An operator may
-    /// place a node connected to another frontend through this one.
-    pub(in crate::farm) fn known_elsewhere(&self, worker: &WorkerId) -> bool {
-        let mut known = false;
+    /// place a node connected to another frontend through this one. `None` when the store
+    /// cannot say. A farm with no state store knows no node but its own.
+    pub(in crate::farm) fn known_elsewhere(&self, worker: &WorkerId) -> Option<bool> {
+        if self.durable.is_none() {
+            return Some(false);
+        }
+        let mut known = None;
         self.durably("a node look", |d| {
-            known = d.node_known(worker)?;
+            known = Some(d.node_known(worker)?);
             Ok(())
         });
         known
     }
 
     /// Requeues the leases whose node has no session row anywhere (see the `sweep` module).
-    fn sweep_orphans(&mut self) {
-        let connected: BTreeSet<WorkerId> = self
-            .links
-            .iter()
-            .filter(|(_, link)| !link.outbound.is_closed())
-            .map(|(worker, _)| worker.clone())
-            .collect();
+    fn sweep_orphans(&mut self, a: &dyn Adapter) {
+        let connected = a.connected();
         let wait = self.intake.orphan_wait;
         let mut orphans = std::mem::take(&mut self.intake.orphans);
         self.durably("an orphan sweep", |d| {
