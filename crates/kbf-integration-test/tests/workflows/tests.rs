@@ -498,6 +498,40 @@ fn a_main_push_job_still_gets_no_other_write_scope() {
     }
 }
 
+#[test]
+fn actions_write_needs_a_job_that_runs_only_for_a_push_to_main() {
+    // Catches: `actions: write` (cancel or re-run any run of the repository) allowed in a job a
+    // pull request or the merge queue runs, or refused where the pipeline's watch job needs it;
+    // and the same exception read as unlocking another scope or a level other than `write`.
+    clean(&workflow(&format!(
+        "    runs-on: ubuntu-latest\n{SIGNING_PUSH_IF}    permissions: {{contents: read, actions: write}}\n"
+    )));
+    for cond in [
+        "",
+        "    if: ${{ github.event_name == 'push' }}\n",
+        "    if: ${{ github.ref == 'refs/heads/main' }}\n",
+        "    if: ${{ github.event_name != 'pull_request' }}\n",
+        "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' || true }}\n",
+    ] {
+        let body =
+            format!("    runs-on: ubuntu-latest\n{cond}    permissions: {{actions: write}}\n");
+        assert_eq!(
+            scan(&workflow(&body)),
+            vec![format!(
+                "line {}: `actions: write` is allowed only in a job whose `if:` is exactly `{SIGNING_PUSH_ONLY}`",
+                if cond.is_empty() { 7 } else { 8 }
+            )],
+            "{body}"
+        );
+    }
+    for p in ["{Actions: write}", "{actions: admin}", "write-all"] {
+        refused(
+            &format!("    runs-on: ubuntu-latest\n{SIGNING_PUSH_IF}    permissions: {p}\n"),
+            "a job's `permissions`",
+        );
+    }
+}
+
 /// The `if:` line under which a job may sign provenance: a push to main.
 const SIGNING_PUSH_IF: &str =
     "    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n";

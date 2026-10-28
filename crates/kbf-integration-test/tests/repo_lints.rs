@@ -38,15 +38,16 @@
 //!   built, and again on the packaged tarball with `build-commit check-asset`), signing and
 //!   `darwin-asset`-checking every macOS binary, or docs/artifacts.md describing
 //!   another set (module `release_artifacts`);
-//! - the push-to-main pipeline drifting from one sequential run (`ci`, then `artifacts`, then
-//!   `beta` on those artifacts, each needing the one before), a called workflow gaining a push
+//! - the push-to-main pipeline drifting from its shape (`ci` and `beta` together, `artifacts` after `ci`,
+//!   `smoke` on those artifacts after `artifacts`, `passed` needing all four, and the `watch` job that
+//!   cancels the run when a job fails), a called workflow gaining a push
 //!   trigger of its own or losing its pull-request triggers, a second call of a check, the
-//!   pipeline not cancelling its predecessor or holding anything that writes, or the release
+//!   pipeline cancelling a running predecessor or holding anything that releases, or the release
 //!   not following the pipeline's success in a group that never cancels (modules
 //!   `pipeline_workflow` and `release_workflow`);
 //! - the beta smoke workflow's Buck2 pin and its actions' commits drifting from
 //!   the copies they are of `ci.yml`'s (module `beta_pins`);
-//! - `beta.yml` gaining a `continue-on-error`, a job-level `if:` or a step condition beyond the
+//! - `beta.yml` or `smoke.yml` gaining a `continue-on-error`, a job-level `if:` or a step condition beyond the
 //!   two it has, which would let a green run mean less than a PASSED beta (module `beta_succeeds`);
 //! - the test job's coverage gate step skipped by a condition, or its no-lowering check on
 //!   pull requests dropped or made conditional on something else, which lets floors fall

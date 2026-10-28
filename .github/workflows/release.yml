@@ -6,20 +6,20 @@
 #
 # The run is started by one event and nothing else: the completion of a run of the pipeline
 # (`workflow_run`), and only a pipeline run that succeeded, for a push to main of this
-# repository. The pipeline is ci, then artifacts, then beta on those artifacts, each needing the
-# one before, so a release is cut only from a commit all three passed. No tag starts this
+# repository. The pipeline is ci and the source tests of beta.yml (side by side), artifacts after ci and
+# the smoke on those artifacts after artifacts, and a closing job that needs all of them, so a release is
+# cut only from a commit on which every job of every stage passed. No tag starts this
 # workflow (a tag the release bot makes would start a second run, and a hand-pushed `v*` tag
 # starts nothing, since only the release bot may create one), and there is no hand-started dry
 # run: a failed release job is re-run from this run's page. The workflow lint
 # (crates/kbf-integration-test/tests/release_workflow) pins the trigger, the condition every
 # job carries, and the chain below.
 #
-# Why a second workflow. A newer push cancels the pipeline run it replaces, whole (a
-# workflow-level cancel stops every job of the run). The release is the one part that must
-# never be stopped half way, so it is not a job of that run: this workflow has its own
-# concurrency group that never cancels, and nothing but the success of a pipeline run starts it.
-# A pipeline run cancelled at any point starts no release; a release run that has started is
-# never cancelled by a push. `workflow_run` runs the copy of this file on main and holds this
+# Why a second workflow. A pipeline run is cancelled whole when one of its jobs fails (its
+# `watch` job, pipeline.yml), and a release is the one part that must never be stopped half way,
+# so it is not a job of that run: this workflow has its own concurrency group that never
+# cancels, and nothing but the success of a pipeline run starts it. A pipeline run cancelled at
+# any point starts no release; a release run that has started is never cancelled by a push. `workflow_run` runs the copy of this file on main and holds this
 # repository's token and the `release` environment, which is why the lint allows the trigger
 # here and nowhere else, and why every job tests the run that started it: its conclusion, its
 # event, its branch and its repository. A run started by `workflow_run` has the latest commit of
