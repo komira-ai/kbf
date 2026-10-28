@@ -147,29 +147,25 @@ async fn an_operation_the_store_holds_becomes_a_caller_that_names_its_action() {
     });
 }
 
-/// Asserts that an operation whose request the adapter cannot read from the store is given
-/// no caller: the row is missing, cannot be read, or is not a request. A caller with a
-/// guessed action would have a `Start` sent for an action the operation never named.
+/// Asserts that an operation whose request names no action is given no caller, and that one
+/// whose request does is given one. A caller with a guessed action would have a `Start` sent
+/// for an action the operation never named.
 #[test]
-fn an_operation_whose_request_cannot_be_read_gets_no_caller() {
+fn a_request_whose_key_is_not_an_actions_gets_no_caller() {
     let store = Flaky::new();
     let rig = rig_over(&store, kbf_front::Recorder::off());
-    // A lease row where the `op/` row of operation 8 should be.
-    let lease = super::testing::lease_row();
-    super::testing::overwrite(store.plain(), "op/0000000000000008", lease);
-    store.fail_reads(Some("op/0000000000000009"));
+    let mut foreign = request(1);
+    foreign.key.dedup = "not a digest".to_owned();
     let log = capture();
 
     rig.core.with(|_, adapter| {
-        adapter.adopted(OperationId(7), WaiterId(70), None);
-        adapter.adopted(OperationId(8), WaiterId(80), None);
-        adapter.adopted(OperationId(9), WaiterId(90), None);
-        let callers = adapter.machine().waiter_ids().count();
-        assert_eq!(callers, 0, "no caller for a request nobody can read");
+        adapter.adopted(OperationId(7), WaiterId(70), None, &foreign, None, None);
+        assert_eq!(adapter.machine().waiter_ids().count(), 0, "no caller");
+        adapter.adopted(OperationId(8), WaiterId(80), None, &request(2), None, None);
+        assert_eq!(adapter.machine().waiter_ids().count(), 1, "a caller");
     });
     let text = log.text();
-    assert_eq!(text.matches("no readable request").count(), 3, "{text}");
-    assert!(text.contains("the state store cannot be read"), "{text}");
+    assert_eq!(text.matches("no readable request").count(), 1, "{text}");
 }
 
 /// Asserts that a parcel the store kept with an operation is its subject when it reads and
@@ -190,9 +186,17 @@ async fn a_parcel_that_is_not_a_subject_leaves_the_empty_shape() {
     let parcel = crate::farm::durable::subject::encode(&shaped);
 
     rig.core.with(|_, adapter| {
-        adapter.adopted(OperationId(0), WaiterId(10), Some(&parcel));
-        adapter.adopted(OperationId(0), WaiterId(11), Some(b"not a subject"));
-        adapter.adopted(OperationId(0), WaiterId(12), None);
+        let asked = request(3);
+        adapter.adopted(OperationId(0), WaiterId(10), Some(&parcel), &asked, None, None);
+        adapter.adopted(
+            OperationId(0),
+            WaiterId(11),
+            Some(b"not a subject"),
+            &asked,
+            None,
+            None,
+        );
+        adapter.adopted(OperationId(0), WaiterId(12), None, &asked, None, None);
         let usage = |id| {
             adapter
                 .machine()
