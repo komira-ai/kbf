@@ -22,6 +22,8 @@
 mod scenarios;
 mod session;
 mod tape;
+mod text;
+mod transcript;
 
 use std::future::Future;
 use std::path::PathBuf;
