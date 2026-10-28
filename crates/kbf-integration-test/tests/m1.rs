@@ -103,9 +103,7 @@ mod fake {
     fn server(args: &[String]) -> i32 {
         // The start line of a server given the core, as the real one logs it.
         if args.iter().any(|a| a == "--scheduler-core=js") && !defect("core-line-missing") {
-            eprintln!(
-                "\x1b[2mT\x1b[0m \x1b[32m INFO\x1b[0m kbf_server::start: scheduler core: js"
-            );
+            eprintln!("\x1b[2mT\x1b[0m \x1b[32m INFO\x1b[0m kbf_server::start: scheduler core: js");
         }
         if !defect("server-silent") {
             println!("kbf-server listening reapi=127.0.0.1:8980 worker=127.0.0.1:8981");
