@@ -1,27 +1,30 @@
 # The end-to-end gate for flipping the farm onto the jobscheduler core (js-server-core).
 #
-# It is the M1 exit test of beta.yml's `m1-cell` (MinIO, one kbf-server, one daemon, the sample
-# projects built twice each with pinned Bazel and buck2, a lease drained in flight, a planted
-# failing build; `kbf-cell m1`, crates/kbf-integration-test/src/m1.rs says exactly what is
-# checked) with two differences: the kbf-server is built with `--features farm-core-js` in a build of its own
-# and started with `--scheduler-core js --placement-load on`, and the run also requires that the
-# server logged `scheduler core: js` and reports `kbf_scheduler_core{core="js"} 1` on /metrics,
-# before the builds and after them (`--expect-scheduler-core js`), so it cannot pass on the legacy
-# driver by accident. It is kbf's own frontend on js-server-core; the standalone pieces of the
-# jobscheduler repository (js-lease-server, js-agent) are not on the flip path and not here.
+# It is the M1 exit test of beta.yml's `m1-cell` (MinIO, the sample projects built twice each
+# with pinned Bazel and buck2, a lease drained in flight, a planted failing build; `kbf-cell
+# m1`, crates/kbf-integration-test/src/m1.rs says exactly what is checked) with two
+# differences:
 #
-# Red by design until two things land:
+# 1. It runs the binary the farm ships. A production frontend is `/usr/bin/kbf --mode=frontend`,
+#    so the cell starts `kbf --mode=storage` and `kbf --mode=frontend` from one `kbf` built with
+#    `cargo build -p kbf-cli --bins --locked --features farm-core-js` (`--kbf-bin`; the feature
+#    is kbf-cli's and forwards to kbf-server), and not the `kbf-server` binary, which no
+#    production host runs. The frontend is given `--scheduler-core=js --placement-load=on`.
+# 2. The run also requires that the frontend logged `scheduler core: js` and reports
+#    `kbf_scheduler_core{core="js"} 1` on /metrics, before the builds and after them
+#    (`--expect-scheduler-core js`), so it cannot pass on the legacy driver by accident.
 #
-# 1. The change that lets release builds start with `--scheduler-core js`. The `farm-core-js`
-#    feature itself is komira-ai/kbf#1870; until a build with the feature can start the js core,
-#    a server given the flag refuses to start (crates/kbf-server/src/config.rs,
-#    `check_scheduler_core`). That change is not open yet.
-# 2. A server that reports its ACTUAL core. The gate requires the start line `scheduler core: js`
-#    and `kbf_scheduler_core{core="js"} 1` on /metrics. Today the gauge is a constant: metrics.rs
-#    renders `SchedulerCore::RUNNING`, which is the legacy core whatever the server was started
-#    with, so /metrics says `core="legacy"` even on a js farm and this gate can never pass. The
-#    flip must derive both the start line and the gauge from the farm's running driver. This
-#    workflow changes no server code.
+# Red by design until the flip lands: a frontend of the shipping binary must start on the js core
+# and serve the scenario on it. What the latest run stops at is in the description of
+# komira-ai/kbf#1867. This workflow changes no server code.
+#
+# It is kbf's own frontend on js-server-core; the standalone pieces of the jobscheduler
+# repository (js-lease-server, js-agent) are not on the flip path and not here.
+#
+# There is no second leg on the `kbf-server` binary: it is not what ships, the job would run
+# the whole M1 scenario twice (45 minutes is already its budget), and a leg that drives the
+# same core would fail for the same reason as this one. `m1-cell` in beta.yml keeps running
+# `kbf-server` on the legacy core.
 #
 # Not part of the pipeline yet, on purpose. A job of beta.yml or of pipeline.yml that is red
 # stops every release (no `continue-on-error` is allowed in either: tests/beta_succeeds,
@@ -106,18 +109,15 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      # The kbf-server with the js core compiled in, the cell, and kbf-act (the program the
-      # samples' `shout` action runs). The feature belongs to kbf-server; the other packages are
-      # built as m1-cell builds them.
-      # Two invocations, the server last. One invocation naming all three packages with
-      # `--features kbf-server/farm-core-js` was tried and builds a kbf-server WITHOUT the
-      # feature (it refuses `--scheduler-core js` as "not available yet"); the feature given
-      # to a build of the server alone is what turns it on. The server is built last so
-      # nothing after it can relink its binary.
+      # The cell (kbf-cell, kbf-act) and then the shipping binary with the js core compiled in.
+      # Two invocations, `kbf` last: the feature belongs to kbf-cli (it forwards to
+      # kbf-server) and is turned on by a build of that package alone; one invocation naming
+      # all the packages with a `--features` for one of them was tried on the server and built it
+      # WITHOUT the feature. `kbf` is built last so nothing after it can relink its binary.
       - name: Build the cell
         run: cargo build -p kbf-integration-test -p kbf-testkit --bins --locked
-      - name: Build the kbf-server with the js core
-        run: cargo build -p kbf-server --bins --locked --features farm-core-js
+      - name: Build kbf with the js core
+        run: cargo build -p kbf-cli --bins --locked --features farm-core-js
       - name: Fetch Bazel (pinned version, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/bazelbuild/bazel/releases/download/$BAZEL_VERSION/bazel-$BAZEL_VERSION-linux-x86_64" --sha256 "$BAZEL_SHA256" --out "$RUNNER_TEMP/tools/bazel"
       - name: Fetch buck2 (pinned version, checked by SHA-256)
@@ -126,8 +126,8 @@ jobs:
       - run: $RUNNER_TEMP/tools/buck2 --version
       - name: Wait for MinIO, then run the store conformance suite on it
         run: cargo run -p kbf-objstore --example s3_conformance --locked -- --endpoint http://127.0.0.1:9000 --bucket kbf-m1-conformance --create-bucket --conditional-put --wait-ready 60
-      - name: M1 cell on the js core, Bazel and buck2 twice each
-        run: target/debug/kbf-cell m1 --bin-dir target/debug --projects crates/kbf-integration-test/m1 --work "$RUNNER_TEMP/m1" --s3-endpoint http://127.0.0.1:9000 --s3-bucket kbf-m1 --bazel "$RUNNER_TEMP/tools/bazel" --buck2 "$RUNNER_TEMP/tools/buck2" --server-arg=--scheduler-core=js --server-arg=--placement-load=on --expect-scheduler-core js
+      - name: M1 cell on kbf --mode=frontend with the js core, Bazel and buck2 twice each
+        run: target/debug/kbf-cell m1 --bin-dir target/debug --kbf-bin target/debug/kbf --projects crates/kbf-integration-test/m1 --work "$RUNNER_TEMP/m1" --s3-endpoint http://127.0.0.1:9000 --s3-bucket kbf-m1 --bazel "$RUNNER_TEMP/tools/bazel" --buck2 "$RUNNER_TEMP/tools/buck2" --server-arg=--scheduler-core=js --server-arg=--placement-load=on --expect-scheduler-core js
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:

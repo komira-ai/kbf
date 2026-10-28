@@ -30,7 +30,17 @@
 //!    its event log;
 //! 6. the bucket holds objects: the blobs went to the store.
 //!
-//! `--server-arg` adds flags to the `kbf-server` the cell starts, and
+//! **The shipping binary.** With `--kbf-bin <kbf>` the cell starts the farm as it ships
+//! instead of `kbf-server`: a storage node (`kbf --mode=storage`: the S3 cold store, the
+//! metadata, a listener under mutual TLS on 127.0.0.1:8983) and then the frontend
+//! (`kbf --mode=frontend`: REAPI, the worker listener and the operator API on the same
+//! addresses as above, `--storage` the node, a SQLite state store in `--work`). A frontend
+//! holds no blobs and its worker listener serves none, so the daemon is given the storage
+//! node for `--cas`. The two start lines, the checks and the logs are the same (the
+//! frontend's go to `server.out` and `server.err`, the storage node's to `storage.out` and
+//! `storage.err`). Without the flag nothing above changes.
+//!
+//! `--server-arg` adds flags to the `kbf-server` (or the `kbf --mode=frontend`) the cell starts, and
 //! `--expect-scheduler-core <core>` makes the run also require, after the server starts
 //! and again after the builds, that the server logged `scheduler core: <core>` and that
 //! its `/metrics` says `kbf_scheduler_core{core="<core>"} 1`, so a run given
@@ -53,7 +63,7 @@ use serde_json::Value;
 
 use crate::cell::{
     CellError, OrBroken as _, Process, absolute, copy_tree, ensure, leases_started, logged,
-    print_tails, random_hex, read, status, to_log, wait_for_line,
+    print_tail, print_tails, random_hex, read, status, to_log, wait_for_line,
 };
 use crate::pki::PkiFiles;
 use crate::summary::{Tool, check_logs};
@@ -62,6 +72,8 @@ use crate::summary::{Tool, check_logs};
 const REAPI: &str = "127.0.0.1:8980";
 /// The worker listener.
 const WORKER: &str = "127.0.0.1:8981";
+/// The storage node's listener, with `--kbf-bin`.
+const STORAGE: &str = "127.0.0.1:8983";
 /// The node id the daemon's certificate names.
 const NODE_ID: &str = "cell-node-1";
 /// How much shorter than its sleep `//:pause` may seem: the daemon logs `lease started`
@@ -103,7 +115,12 @@ pub struct M1Args {
     /// The pinned buck2 to build the buck2 sample with.
     #[arg(long)]
     pub buck2: Option<PathBuf>,
-    /// A flag for `kbf-server`, after the cell's own; once for each, in the `=` form
+    /// Start the farm with this `kbf` (a storage node and a frontend, see the module
+    /// docs) instead of `kbf-server`.
+    #[arg(long)]
+    pub kbf_bin: Option<PathBuf>,
+    /// A flag for the frontend (`kbf-server`, or `kbf --mode=frontend` with `--kbf-bin`),
+    /// after the cell's own; once for each, in the `=` form
     /// (`--server-arg=--scheduler-core=js`).
     #[arg(long = "server-arg", allow_hyphen_values = true)]
     pub server_args: Vec<String>,
@@ -125,6 +142,9 @@ pub fn run(args: &M1Args) -> Result<(), CellError> {
     let result = cell.steps();
     if result.is_err() {
         print_tails(&cell.logs, TAIL);
+        if cell.kbf_bin.is_some() {
+            print_tail(&cell.logs, "storage.err", TAIL);
+        }
     }
     result
 }
@@ -146,6 +166,7 @@ struct Cell {
     buck2: Option<PathBuf>,
     server_args: Vec<String>,
     expect_core: Option<String>,
+    kbf_bin: Option<PathBuf>,
 }
 
 impl Cell {
@@ -194,6 +215,7 @@ impl Cell {
             buck2: args.buck2.as_deref().map(absolute).transpose()?,
             server_args: args.server_args.clone(),
             expect_core: args.expect_scheduler_core.clone(),
+            kbf_bin: args.kbf_bin.as_deref().map(absolute).transpose()?,
         })
     }
 
@@ -203,7 +225,7 @@ impl Cell {
         let pki = crate::pki::write(&self.work.join("pki"), NODE_ID);
         let pki = pki.or_broken(&"the certificates")?;
         let token = self.write_token()?;
-        let _server = self.start_server(&pki)?;
+        let _farm = self.start_farm(&pki)?;
         self.check_core()?;
         let _daemon = self.start_daemon(&pki)?;
         if let Some(bazel) = &self.bazel {
@@ -257,6 +279,80 @@ impl Cell {
         Ok(token)
     }
 
+    /// The processes of the farm, the frontend first (they are stopped in this order).
+    fn start_farm(&self, pki: &PkiFiles) -> Result<Vec<Process>, CellError> {
+        match &self.kbf_bin {
+            None => Ok(vec![self.start_server(pki)?]),
+            Some(kbf) => self.start_kbf(kbf, pki),
+        }
+    }
+
+    /// The farm as it ships: `kbf --mode=storage`, then `kbf --mode=frontend` in front of it.
+    fn start_kbf(&self, kbf: &Path, pki: &PkiFiles) -> Result<Vec<Process>, CellError> {
+        // An empty settings file, so that no host file is read.
+        let settings = self.work.join("kbf.toml");
+        std::fs::write(&settings, "").or_broken(&settings.display())?;
+        let mut storage = Command::new(kbf);
+        storage
+            .arg("--mode=storage")
+            .arg(format!("--storage-listen={STORAGE}"))
+            .arg("--cold-store")
+            .arg(format!(
+                "s3://{}?endpoint={}&conditional-put=true",
+                self.bucket, self.s3_endpoint
+            ))
+            .arg("--meta-dir")
+            .arg(self.work.join("storage-meta"))
+            .arg("--storage-tls-cert")
+            .arg(&pki.storage_cert)
+            .arg("--storage-tls-key")
+            .arg(&pki.storage_key)
+            .arg("--storage-client-ca")
+            .arg(&pki.ca_cert)
+            .arg(format!("--config={}", settings.display()))
+            .stdout(self.log_file("storage.out")?)
+            .stderr(self.log_file("storage.err")?);
+        let storage = Process::spawn(storage, "kbf --mode=storage")?;
+        let out = self.logs.join("storage.out");
+        let why = "kbf --mode=storage did not start";
+        let line = wait_for_line(&out, "kbf-storage ", why)?;
+        println!("{line}");
+
+        let mut frontend = Command::new(kbf);
+        frontend
+            .arg("--mode=frontend")
+            .args(["--listen", REAPI, "--worker-listen", WORKER])
+            .arg("--worker-tls-cert")
+            .arg(&pki.frontend_cert)
+            .arg("--worker-tls-key")
+            .arg(&pki.frontend_key)
+            .arg("--worker-client-ca")
+            .arg(&pki.ca_cert)
+            .args(["--api-listen", &self.api_listen])
+            .arg("--api-token-file")
+            .arg(self.work.join("api-token"))
+            .arg(format!("--storage=https://localhost:{}", port_of(STORAGE)))
+            .arg("--storage-client-cert")
+            .arg(&pki.frontend_cert)
+            .arg("--storage-client-key")
+            .arg(&pki.frontend_key)
+            .arg("--storage-ca")
+            .arg(&pki.ca_cert)
+            .arg(format!(
+                "--state-store=sqlite://{}",
+                self.work.join("frontend-state.db").display()
+            ))
+            .arg(format!("--config={}", settings.display()))
+            .args(&self.server_args)
+            .stdout(self.log_file("server.out")?)
+            .stderr(self.log_file("server.err")?);
+        let frontend = Process::spawn(frontend, "kbf --mode=frontend")?;
+        let out = self.logs.join("server.out");
+        let line = wait_for_line(&out, " reapi=", "kbf --mode=frontend did not start")?;
+        println!("{line}");
+        Ok(vec![frontend, storage])
+    }
+
     fn start_server(&self, pki: &PkiFiles) -> Result<Process, CellError> {
         let mut server = Command::new(self.bin_dir.join("kbf-server"));
         server
@@ -295,7 +391,12 @@ impl Cell {
         };
         let line = format!("scheduler core: {core}");
         let err = self.logs.join("server.err");
-        wait_for_line(&err, &line, &format!("kbf-server did not log `{line}`"))?;
+        let program = if self.kbf_bin.is_some() {
+            "kbf --mode=frontend"
+        } else {
+            "kbf-server"
+        };
+        wait_for_line(&err, &line, &format!("{program} did not log `{line}`"))?;
         let url = format!("http://{}/metrics", self.api_listen);
         let body = self.runtime.block_on(async {
             let answer = self.http.get(url).send().await?.error_for_status()?;
@@ -316,9 +417,15 @@ impl Cell {
 
     fn start_daemon(&self, pki: &PkiFiles) -> Result<Process, CellError> {
         let worker = format!("https://{WORKER}");
+        // A frontend's worker listener serves no blobs: the daemon reads and writes them
+        // at the storage node.
+        let cas = match &self.kbf_bin {
+            None => worker.clone(),
+            Some(_) => format!("https://{STORAGE}"),
+        };
         let mut daemon = Command::new(self.bin_dir.join("kbf-cell"));
         daemon
-            .args(["daemon", "--server", &worker, "--cas", &worker])
+            .args(["daemon", "--server", &worker, "--cas", &cas])
             .arg("--ca-cert")
             .arg(&pki.ca_cert)
             .arg("--cert")
@@ -565,4 +672,9 @@ fn leases_of(answer: &Value) -> String {
 
 fn unset(name: &str) -> CellError {
     CellError::Broken(format!("{name} must be set (the store's key pair)"))
+}
+
+/// The port of a `host:port` address.
+fn port_of(address: &str) -> &str {
+    address.rsplit(':').next().unwrap_or(address)
 }
