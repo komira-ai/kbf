@@ -17,9 +17,9 @@ use kbf_sched::{
 };
 use kbf_sim::SimRng;
 use kbf_types::{
-    ActionKey, Answer, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmFault, FarmRun,
-    FarmTime, LeaseKind, LostWhy, OperationId, Outcome, Qos, Resources, ResultRecord, StartLease,
-    StateMachine, WaiterId, WorkerId,
+    Answer, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmFault, FarmRun, FarmTime,
+    LeaseKind, LostWhy, OperationId, Outcome, Qos, Resources, ResultRecord, StartLease,
+    StateMachine, WaiterId, WorkKey, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -28,11 +28,11 @@ const RESTARTED: Outcome = Outcome::Failed(Failure::Lost(LostWhy::DaemonRestarte
 const INFRA: Outcome = Outcome::Failed(Failure::Infra);
 const PRESSURE: Outcome = Outcome::Failed(Failure::NodeMemoryPressure);
 
-fn key(n: u8) -> ActionKey {
-    ActionKey {
-        instance: "main".to_owned(),
-        action: Digest::new(DigestFunction::Sha256, [n; 32], u64::from(n)),
-    }
+fn key(n: u8) -> WorkKey {
+    kbf_types::work_key(
+        "main",
+        Digest::new(DigestFunction::Sha256, [n; 32], u64::from(n)),
+    )
 }
 
 /// Action `n`: one core and 1 GiB, of `kind`.
@@ -54,7 +54,7 @@ fn w(name: &str) -> WorkerId {
 
 fn ok() -> Outcome {
     Outcome::Completed {
-        action_result: Digest::new(DigestFunction::Sha256, [200; 32], 1),
+        action_result: Digest::new(DigestFunction::Sha256, [200; 32], 1).into(),
     }
 }
 

@@ -35,7 +35,7 @@ use super::blocks::contended;
 use super::*;
 use crate::config::MAX_HEARTBEAT_INTERVAL_MS;
 
-const OWNER: &str = "owner/";
+pub(super) const OWNER: &str = "owner/";
 
 /// How long a frontend trusts its last look at an `owner/` row before it reads the row
 /// again to acknowledge a heartbeat. The frontend a daemon moved to waits this long beyond
@@ -255,10 +255,7 @@ impl Durable {
         let Some(row) = self.store.get(&key)? else {
             return Ok(None);
         };
-        Ok(match decode(&key, &row.value) {
-            Ok(FarmInput::WorkerUp { instance, .. }) => Some(instance),
-            _ => None,
-        })
+        Ok(self.session_row(&key, &row).ok().map(|up| up.instance))
     }
 
     fn remember_owner(&self, worker: &WorkerId, state: Ownership) {

@@ -112,6 +112,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "progress-interval-secs",
             "qos-allowed",
             "readyz-store-timeout-ms",
+            "scheduler-core",
             "state-store",
             "state-store-wait-secs",
             "unservable-wait-secs",

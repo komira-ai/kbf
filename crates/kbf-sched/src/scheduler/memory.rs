@@ -66,7 +66,7 @@
 use std::collections::BTreeMap;
 
 use kbf_types::{
-    ActionKey, Failure, FarmFault, LeaseKind, MemoryKill, MemoryRun, OperationId, ResultRecord,
+    Failure, FarmFault, LeaseKind, MemoryKill, MemoryRun, OperationId, ResultRecord, WorkKey,
     WorkerId,
 };
 
@@ -204,7 +204,7 @@ impl Default for MemoryLadder {
 /// differ.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryState {
-    floors: Floors<ActionKey>,
+    floors: Floors<WorkKey>,
     /// The floors by size key, with the order they were raised in.
     key_floors: Floors<u64>,
     /// The operations with a memory kill, while the scheduler holds them.
@@ -366,8 +366,8 @@ impl<K: Clone + Ord> Floors<K> {
 /// One memory floor as the state store keeps it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Floor {
-    /// The action it floors.
-    pub key: ActionKey,
+    /// The work it floors.
+    pub key: WorkKey,
     /// The least memory a submission of `key` books, in bytes.
     pub ask: u64,
     /// When it was raised, among the floors: a larger stamp is a later raise. Equal for
@@ -396,7 +396,7 @@ pub struct FloorChange {
     /// later raise has already forgotten it).
     pub raised: Option<Floor>,
     /// The keys forgotten since the last change was taken, to forget in the store too.
-    pub evicted: Vec<ActionKey>,
+    pub evicted: Vec<WorkKey>,
     /// The key floor of the operation's `size_key`, as it stands now; `None` when the
     /// operation has none.
     pub key_raised: Option<KeyFloor>,
@@ -424,7 +424,7 @@ impl Scheduler {
     /// to after it passed its own memory limit. A new submission of `key` books at
     /// least this much memory.
     #[must_use]
-    pub fn memory_floor(&self, key: &ActionKey) -> Option<u64> {
+    pub fn memory_floor(&self, key: &WorkKey) -> Option<u64> {
         self.memory.floors.get(key)
     }
 

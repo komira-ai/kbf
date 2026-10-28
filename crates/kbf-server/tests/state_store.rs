@@ -430,12 +430,18 @@ impl Disk {
     }
 }
 
+/// The digest of the action `request(tag)` asks to run.
+fn action_of(tag: u8) -> Digest {
+    Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag))
+}
+
 fn request(tag: u8) -> Request {
     Request {
         key: ActionKey {
             instance: "main".to_owned(),
-            action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        },
+            action: action_of(tag),
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, GIB),
@@ -510,6 +516,7 @@ fn invalid(lease: LeaseId) -> worker::Result {
         action_digest: None,
         memory_kill: 0,
         lost: 0,
+        job_outcome: None,
     }
 }
 
@@ -2151,7 +2158,7 @@ async fn a_kept_epoch_does_not_reuse_operation_names() {
     let second = farm_over(kept);
     assert_eq!(second.lease_epoch(), epoch, "the epoch was kept");
     let same = second.wait(&name).expect("the store holds the operation");
-    assert_eq!(same.action, request(1).key.action, "another operation");
+    assert_eq!(same.action, action_of(1), "another operation");
     let other = second
         .submit(Submission {
             request: request(2),

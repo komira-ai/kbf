@@ -182,12 +182,18 @@ fn bump(previous: u64, epoch: u64) -> EpochBump {
     EpochBump { previous, epoch }
 }
 
+/// The action `request(tag)` runs.
+pub(super) fn action_key(tag: u8) -> ActionKey {
+    ActionKey::try_from(&request(tag).key).expect("an action's key")
+}
+
 pub(super) fn request(tag: u8) -> Request {
     Request {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),

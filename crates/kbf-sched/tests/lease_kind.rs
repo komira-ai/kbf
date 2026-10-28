@@ -6,8 +6,8 @@
 use kbf_caps::NodeCaps;
 use kbf_sched::{DaemonInstance, Event, Input, Request, Scheduler};
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, LeaseKind,
-    Outcome, Qos, Resources, StartLease, StateMachine, WaiterId, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, LeaseKind, Outcome, Qos,
+    Resources, StartLease, StateMachine, WaiterId, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -20,10 +20,7 @@ fn digest(n: u8) -> Digest {
 /// Action `n` of `kind` at `qos`, one core and 1 GiB.
 fn request(n: u8, kind: LeaseKind, qos: Qos) -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: digest(n),
-        },
+        key: kbf_types::work_key("main", digest(n)),
         qos,
         kind,
         resources: Resources::new(1_000, GIB),
@@ -119,7 +116,7 @@ impl Harness {
             operation: grant.operation,
             lease: grant.lease,
             outcome: Outcome::Completed {
-                action_result: digest(200),
+                action_result: digest(200).into(),
             },
         });
         let [Effect::Commit(record)] = proposed.as_slice() else {

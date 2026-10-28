@@ -82,11 +82,8 @@ fn a_ladder_must_ascend_and_be_positive() {
     }
 }
 
-fn key(n: u8) -> ActionKey {
-    ActionKey {
-        instance: "main".to_owned(),
-        action: kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [n; 32], 1),
-    }
+fn key(n: u8) -> WorkKey {
+    WorkKey::new("main", format!("work-{n}"))
 }
 
 /// Catches a floor that falls when a smaller ask is raised, a bound that is not
@@ -129,7 +126,7 @@ fn restored_floors_keep_their_order_and_the_bound() {
             .map(|f| (f.key.clone(), f.ask, f.stamp))
             .collect::<Vec<_>>()
     };
-    let row = |floors: &Floors<ActionKey>, k: &ActionKey| {
+    let row = |floors: &Floors<WorkKey>, k: &WorkKey| {
         floors.stamped(k).map(|(ask, stamp)| Floor {
             key: k.clone(),
             ask,
@@ -296,7 +293,7 @@ const PRESSURE: Outcome = Outcome::Failed(Failure::NodeMemoryPressure);
 
 fn done() -> Outcome {
     Outcome::Completed {
-        action_result: Digest::new(DigestFunction::Sha256, [7; 32], 1),
+        action_result: Digest::new(DigestFunction::Sha256, [7; 32], 1).into(),
     }
 }
 

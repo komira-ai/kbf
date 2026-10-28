@@ -1318,6 +1318,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "js-caps"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "js-sim"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
+dependencies = [
+ "js-types",
+ "rand_chacha 0.10.0",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "js-sizing"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
+
+[[package]]
+name = "js-state"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
+dependencies = [
+ "js-testkit",
+ "postgres",
+ "rusqlite",
+ "rustix",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1326,6 +1363,27 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "js-testkit"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
+dependencies = [
+ "libc",
+ "postgres",
+ "rustix",
+ "tokio",
+]
+
+[[package]]
+name = "js-types"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=4b85a7953bd701c8163be179b24e2e83d91ec61b#4b85a7953bd701c8163be179b24e2e83d91ec61b"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -1409,7 +1467,7 @@ dependencies = [
 name = "kbf-caps"
 version = "0.1.0"
 dependencies = [
- "thiserror",
+ "js-caps",
 ]
 
 [[package]]
@@ -1738,6 +1796,9 @@ dependencies = [
 [[package]]
 name = "kbf-estimator"
 version = "0.1.0"
+dependencies = [
+ "js-sizing",
+]
 
 [[package]]
 name = "kbf-estimator-replay"
@@ -2452,6 +2513,7 @@ dependencies = [
  "kbf-route",
  "kbf-sched",
  "kbf-segments",
+ "kbf-server",
  "kbf-signer",
  "kbf-sim",
  "kbf-state",
@@ -2528,10 +2590,8 @@ dependencies = [
 name = "kbf-sim"
 version = "0.1.0"
 dependencies = [
- "kbf-testkit",
+ "js-sim",
  "kbf-types",
- "rand_chacha 0.10.0",
- "sha2 0.11.0",
 ]
 
 [[package]]
@@ -2559,14 +2619,7 @@ dependencies = [
 name = "kbf-state"
 version = "0.1.0"
 dependencies = [
- "kbf-state",
- "kbf-testkit",
- "postgres",
- "rusqlite",
- "rustix",
- "thiserror",
- "tokio",
- "tracing",
+ "js-state",
 ]
 
 [[package]]
@@ -2654,11 +2707,7 @@ dependencies = [
 name = "kbf-testkit"
 version = "0.1.0"
 dependencies = [
- "kbf-testkit",
- "libc",
- "postgres",
- "rustix",
- "tokio",
+ "js-testkit",
 ]
 
 [[package]]
@@ -2726,6 +2775,7 @@ dependencies = [
 name = "kbf-types"
 version = "0.1.0"
 dependencies = [
+ "js-types",
  "serde",
  "serde_json",
  "thiserror",

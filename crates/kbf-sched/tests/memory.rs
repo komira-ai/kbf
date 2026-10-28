@@ -10,20 +10,20 @@ use kbf_sched::{
     Requeue, RequeueReason, Scheduler,
 };
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmFault, FarmRun,
-    FarmTime, LeaseKind, LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Qos, Resources,
-    ResultRecord, StartLease, WaiterId, Waiting, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, Failure, FarmFault, FarmRun, FarmTime,
+    LeaseKind, LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Qos, Resources, ResultRecord,
+    StartLease, WaiterId, Waiting, WorkKey, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
 const OOM: Outcome = Outcome::Failed(Failure::OutOfMemory);
 const PRESSURE: Outcome = Outcome::Failed(Failure::NodeMemoryPressure);
 
-fn key(n: u8) -> ActionKey {
-    ActionKey {
-        instance: "main".to_owned(),
-        action: Digest::new(DigestFunction::Sha256, [n; 32], u64::from(n)),
-    }
+fn key(n: u8) -> WorkKey {
+    kbf_types::work_key(
+        "main",
+        Digest::new(DigestFunction::Sha256, [n; 32], u64::from(n)),
+    )
 }
 
 /// Action `n`: one core and `memory` bytes, on Linux.
@@ -64,7 +64,7 @@ fn w(name: &str) -> WorkerId {
 
 fn ok() -> Outcome {
     Outcome::Completed {
-        action_result: Digest::new(DigestFunction::Sha256, [200; 32], 1),
+        action_result: Digest::new(DigestFunction::Sha256, [200; 32], 1).into(),
     }
 }
 
@@ -463,8 +463,8 @@ fn two_instances_with_the_same_action_keep_separate_floors() {
     assert_eq!(f.s.memory_floor(&key(1)), Some(4 * GIB));
 
     let mut other = request(1, GIB);
-    other.key.instance = "other".to_owned();
-    assert_eq!(other.key.action, key(1).action);
+    other.key.class = "other".to_owned();
+    assert_eq!(other.key.dedup, key(1).dedup);
     assert_eq!(
         f.s.memory_floor(&other.key),
         None,

@@ -833,7 +833,7 @@ impl<D> ExecutionService<D> {
         }
         let submission = Submission {
             request: Request {
-                key: ActionKey { instance, action },
+                key: ActionKey { instance, action }.into(),
                 qos,
                 kind,
                 resources: booked,

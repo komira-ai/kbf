@@ -22,8 +22,8 @@ use kbf_caps::NodeCaps;
 use kbf_sched::{Cordon, DaemonInstance, Event, Input, Request, Scheduler, UNSERVABLE_WAIT};
 use kbf_sim::{Chance, SimRng};
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, OperationId,
-    Outcome, Qos, Resources, StateMachine, WaiterId, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, OperationId, Outcome, Qos,
+    Resources, StateMachine, WaiterId, WorkerId,
 };
 
 const SEEDS: u64 = 64;
@@ -190,10 +190,7 @@ impl World {
             self.next += 1;
             self.submitted += 1;
             let request = Request {
-                key: ActionKey {
-                    instance: "main".to_owned(),
-                    action: digest(n),
-                },
+                key: kbf_types::work_key("main", digest(n)),
                 qos: Qos::Ci,
                 kind: kbf_types::LeaseKind::Action,
                 resources: Resources::new(1_000, GIB),
@@ -228,7 +225,7 @@ impl World {
                     operation: grant.operation,
                     lease: grant.lease,
                     outcome: Outcome::Completed {
-                        action_result: digest(1_000_000 + grant.operation.0),
+                        action_result: digest(1_000_000 + grant.operation.0).into(),
                     },
                 });
             }

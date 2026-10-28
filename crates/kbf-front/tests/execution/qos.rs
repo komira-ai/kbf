@@ -28,7 +28,10 @@ async fn level_for(allow: QosAllow, qos: Option<&str>, names: &[&str]) -> Vec<(Q
     script
         .submitted()
         .into_iter()
-        .map(|s| (s.request.qos, s.request.key.action.hash_hex()))
+        .map(|s| {
+            let key = ActionKey::try_from(&s.request.key).expect("an action's key");
+            (s.request.qos, key.action.hash_hex())
+        })
         .collect()
 }
 

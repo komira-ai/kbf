@@ -7,8 +7,8 @@ use std::time::Duration;
 use kbf_caps::NodeCaps;
 use kbf_sched::{DaemonInstance, Event, Input, OpState, Request, Scheduler};
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseKind, OperationId,
-    Qos, Refusal, RefusalRecord, Resources, StateMachine, WaiterId, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseKind, OperationId, Qos, Refusal,
+    RefusalRecord, Resources, StateMachine, WaiterId, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -18,10 +18,10 @@ const WAIT: Duration = Duration::from_secs(30);
 /// Action `tag`, one core and 1 GiB, for a worker of operating system `os`.
 fn request(tag: u8, os: &str) -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        },
+        key: kbf_types::work_key(
+            "main",
+            Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
+        ),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, GIB),

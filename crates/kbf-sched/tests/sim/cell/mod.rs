@@ -57,8 +57,8 @@ use std::time::Duration;
 use kbf_sched::Request;
 use kbf_sim::{Chance, Faults, Node, NodeId, NodeInput, Output, Partition, Sim};
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseId, Outcome, Qos,
-    Resources, StartLease, StateMachine, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseId, Outcome, Qos, Resources,
+    StartLease, StateMachine, WorkKey, WorkerId,
 };
 
 pub use leader::{Leader, LeaderPlan};
@@ -241,6 +241,12 @@ pub fn action(n: u64) -> Digest {
     Digest::new(DigestFunction::Sha256, hash, n)
 }
 
+/// The action digest a key made by [`request`] carries as its dedup text.
+#[must_use]
+pub fn action_of(key: &WorkKey) -> Digest {
+    Digest::parse(DigestFunction::Sha256, &key.dedup).expect("a key made by `request`")
+}
+
 /// The `ActionResult` digest a run of `action` under `lease` produces: one value per
 /// (action, lease), so an answer shows which run it came from.
 #[must_use]
@@ -257,10 +263,7 @@ pub fn result_digest(action: &Digest, lease: LeaseId) -> Digest {
 #[must_use]
 pub fn request(n: u64) -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: action(n),
-        },
+        key: kbf_types::work_key("main", action(n)),
         qos: Qos::Ci,
         kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),

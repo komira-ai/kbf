@@ -46,9 +46,8 @@ use kbf_sched::fence::{HANDOVER_GRACE, START_GRACE};
 use kbf_sched::{DaemonInstance, Event as SchedEvent, Input, Request, Scheduler, SelfFence};
 use kbf_sim::{Chance, Event, Faults, Node, NodeId, NodeInput, Output, Partition, Sim, TraceHash};
 use kbf_types::{
-    ActionKey, Answer, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmTime,
-    FencePolicy, LeaseId, OperationId, Outcome, Qos, Resources, StartLease, StateMachine, WaiterId,
-    WorkerId,
+    Answer, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmTime, FencePolicy, LeaseId,
+    OperationId, Outcome, Qos, Resources, StartLease, StateMachine, WaiterId, WorkerId,
 };
 
 const SEEDS: u64 = 48;
@@ -334,7 +333,7 @@ impl Worker {
         run.ended = Some(now);
         let operation = run.operation;
         let outcome = Outcome::Completed {
-            action_result: digest(1_000 + operation.0),
+            action_result: digest(1_000 + operation.0).into(),
         };
         self.unacked.insert(lease, (operation, outcome));
         self.send(Msg::Report {
@@ -419,10 +418,7 @@ enum Cell {
 
 fn request(n: u64) -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: digest(n),
-        },
+        key: kbf_types::work_key("main", digest(n)),
         qos: Qos::Ci,
         kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),

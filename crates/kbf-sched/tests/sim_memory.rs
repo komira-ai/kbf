@@ -25,8 +25,8 @@ use kbf_caps::NodeCaps;
 use kbf_sched::{DaemonInstance, Event, FARM_RERUNS, Input, Request, Scheduler};
 use kbf_sim::{Chance, SimRng};
 use kbf_types::{
-    ActionKey, Digest, DigestFunction, Effect, Failure, FarmTime, LeaseKind, OperationId, Outcome,
-    Qos, Resources, StartLease, StateMachine, WaiterId, WorkerId,
+    Digest, DigestFunction, Effect, Failure, FarmTime, LeaseKind, OperationId, Outcome, Qos,
+    Resources, StartLease, StateMachine, WaiterId, WorkKey, WorkerId,
 };
 
 const SEEDS: u64 = 64;
@@ -55,11 +55,11 @@ fn rung(booked: u64) -> Option<u64> {
     })
 }
 
-fn key(n: u8) -> ActionKey {
-    ActionKey {
-        instance: "main".to_owned(),
-        action: Digest::new(DigestFunction::Sha256, [n; 32], u64::from(n)),
-    }
+fn key(n: u8) -> WorkKey {
+    kbf_types::work_key(
+        "main",
+        Digest::new(DigestFunction::Sha256, [n; 32], u64::from(n)),
+    )
 }
 
 /// What the model knows of one operation.
@@ -273,7 +273,8 @@ impl World {
             Outcome::Failed(Failure::NodeMemoryPressure)
         } else {
             Outcome::Completed {
-                action_result: Digest::new(DigestFunction::Sha256, [255; 32], start.lease.seq),
+                action_result: Digest::new(DigestFunction::Sha256, [255; 32], start.lease.seq)
+                    .into(),
             }
         };
         let run = op.runs.last_mut().expect("a started run");

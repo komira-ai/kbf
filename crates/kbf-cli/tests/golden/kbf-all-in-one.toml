@@ -238,6 +238,8 @@ progress-interval-secs = 30
 qos-allowed = "ci,batch"
 # How long, in milliseconds, `GET /readyz` on the operator API and the REAPI listener's `grpc.health.v1` service wait for the object store to answer their read-only probe before they answer not ready
 readyz-store-timeout-ms = 2000
+# Which core drives the farm's scheduling. `legacy`, the default, is the driver the server has always had. `js` is not available in this release: a server given it refuses to start (exit status 2) and says so. The core a server runs is logged at start and exported as `kbf_scheduler_core{core}`, 1 for it and 0 for the other
+scheduler-core = "legacy"
 # Where the scheduler keeps its state, written before each change is acknowledged and replayed at start: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a local Unix socket, reached as this process's own user (peer authentication; a URL with a password is refused, and the server must flush commits before it acknowledges them, `synchronous_commit` on, or the start is refused), or `sqlite:///absolute/path`, a file on a local disk that this process owns (created, with its directory, if missing; the file is 0600 and a directory it makes 0700); SQLite is removed in the next release, so a start on it logs a warning (see the upgrade notes). A start keeps the epoch the store holds, so work the earlier process leased is queued again when the daemon half's first heartbeat leaves it out. Left out, it is `postgres:///kbf?host=/run/postgresql`
 # state-store = "URI"
 # How long, in seconds, queued work waits while no connected daemon can run it (none satisfies its platform, or none that does is large enough) before it is refused FAILED_PRECONDITION. The wait restarts whenever one can

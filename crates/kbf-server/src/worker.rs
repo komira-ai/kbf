@@ -434,7 +434,8 @@ pub fn phase(hello: &Hello) -> Result<NodePhase, String> {
         Ok(Phase::Quarantined) => NodePhase::Quarantined(reported.reason.clone()),
         Ok(Phase::MemoryPressure) => NodePhase::MemoryPressure,
         Ok(Phase::Draining) => NodePhase::Draining,
-        Err(_) => NodePhase::Quarantined(format!(
+        // `Tainted` is on the wire before this server acts on it: the fallback applies.
+        Ok(Phase::Tainted) | Err(_) => NodePhase::Quarantined(format!(
             "the node reports phase {}, which this server does not know",
             reported.phase
         )),

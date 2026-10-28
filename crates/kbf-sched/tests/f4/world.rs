@@ -22,8 +22,8 @@ use kbf_sched::fence::{HANDOVER_GRACE, SELF_FENCE};
 use kbf_sched::{DaemonInstance, Event, Request, Scheduler};
 use kbf_sim::{Chance, SimRng, Trace, TraceHash, text};
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmTime, FencePolicy,
-    LeaseId, OperationId, Outcome, Qos, Resources, StartLease, WaiterId, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, Failure, FarmTime, FencePolicy, LeaseId,
+    OperationId, Outcome, Qos, Resources, StartLease, WaiterId, WorkKey, WorkerId,
 };
 
 use super::check::{Checker, TERM};
@@ -315,7 +315,7 @@ pub struct World {
     log: VecDeque<(u64, ControlRecord)>,
     log_last: u64,
     recent: VecDeque<Template>,
-    durations: BTreeMap<ActionKey, u64>,
+    durations: BTreeMap<WorkKey, u64>,
     next_key: u64,
     submitted: u64,
     rate_milli: u64,
@@ -633,7 +633,7 @@ impl World {
                 Outcome::Failed(Failure::Timeout)
             } else {
                 Outcome::Completed {
-                    action_result: digest(lease.seq << 20 | run.op.0),
+                    action_result: digest(lease.seq << 20 | run.op.0).into(),
                 }
             };
             self.check.produced(lease, outcome);
@@ -797,10 +797,7 @@ impl World {
             ("main", self.next_key - 1)
         };
         let request = Request {
-            key: ActionKey {
-                instance: instance.to_owned(),
-                action: digest(number),
-            },
+            key: kbf_types::work_key(instance, digest(number)),
             qos: Qos::Ci,
             kind: kbf_types::LeaseKind::Action,
             resources,

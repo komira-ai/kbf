@@ -12,8 +12,8 @@ use kbf_caps::NodeCaps;
 use kbf_sched::{DaemonInstance, Event, NodePhase, Request};
 use kbf_sim::Trace;
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, FarmTime, LeaseGrant, LeaseId, LeaseKind,
-    OperationId, Outcome, Qos, Resources, WaiterId, WorkerId,
+    ControlRecord, Digest, DigestFunction, FarmTime, LeaseGrant, LeaseId, LeaseKind, OperationId,
+    Outcome, Qos, Resources, WaiterId, WorkerId,
 };
 
 fn digest(n: u8) -> Digest {
@@ -36,10 +36,7 @@ fn caps() -> NodeCaps {
 
 fn request(cpu_millis: u64) -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: digest(1),
-        },
+        key: kbf_types::work_key("main", digest(1)),
         qos: Qos::Ci,
         kind: LeaseKind::WholeMachine,
         resources: Resources::new(cpu_millis, 2),
@@ -147,7 +144,7 @@ fn every_event_has_its_fixed_spelling() {
                 operation: OperationId(7),
                 lease: lease(),
                 outcome: Outcome::Completed {
-                    action_result: digest(2),
+                    action_result: digest(2).into(),
                 },
             },
             format!("report(op=op7 lease=1.4 outcome=done({}))", digest_text(2)),

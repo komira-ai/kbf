@@ -5,8 +5,8 @@
 use kbf_caps::NodeCaps;
 use kbf_sched::{DaemonInstance, Event, Input, Request, Scheduler};
 use kbf_types::{
-    ActionKey, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, LeaseKind, Outcome, Qos,
-    Resources, StateMachine, WaiterId, WorkerId,
+    Digest, DigestFunction, Effect, FarmTime, LeaseGrant, LeaseKind, Outcome, Qos, Resources,
+    StateMachine, WaiterId, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -81,10 +81,7 @@ impl Farm {
             let n = self.next;
             self.next += 1;
             let request = Request {
-                key: ActionKey {
-                    instance: "main".to_owned(),
-                    action: digest(n),
-                },
+                key: kbf_types::work_key("main", digest(n)),
                 qos: Qos::Ci,
                 kind,
                 resources,
@@ -121,7 +118,7 @@ impl Farm {
             operation: done.operation,
             lease: done.lease,
             outcome: Outcome::Completed {
-                action_result: digest(1_000_000 + done.operation.0),
+                action_result: digest(1_000_000 + done.operation.0).into(),
             },
         });
         self.secs += 1;
