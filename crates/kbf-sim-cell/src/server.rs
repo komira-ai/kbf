@@ -252,7 +252,7 @@ fn wall(t: FarmTime) -> SystemTime {
 /// The request every action makes: one core and 1 GiB, hermetic.
 fn request(action: Digest) -> Request {
     Request {
-        key: key(action),
+        key: key(action).into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
@@ -544,7 +544,10 @@ impl Up {
     fn start_lease(&mut self, now: FarmTime, start: &StartLease, cx: &mut Cx<'_>) {
         let worker = &start.worker;
         let process = cx.seen.starts;
-        let runs = cx.seen.started.entry(start.key.action).or_default();
+        let action = ActionKey::try_from(&start.key)
+            .expect("the cell submits the keys of actions")
+            .action;
+        let runs = cx.seen.started.entry(action).or_default();
         runs.insert(process);
         let stream = self.streams.get(worker).copied().unwrap_or_default();
         cx.send(
@@ -553,7 +556,7 @@ impl Up {
                 stream,
                 lease: start.lease,
                 operation: start.operation,
-                action: start.key.action,
+                action,
             },
         );
         let queued = self
@@ -564,7 +567,7 @@ impl Up {
             .map_or(wall(now), |w| w.queued);
         let sent = Sent {
             operation: start.operation,
-            action: start.key.action,
+            action,
             stamp: Stamp {
                 queued,
                 started: wall(now),
@@ -636,6 +639,7 @@ impl Up {
         let event = SchedEvent::Heartbeat {
             worker: worker.clone(),
             running: running.clone(),
+            load: None,
         };
         self.feed(now, event, cx);
         let cancels: Vec<LeaseId> = self.sched.not_held(&worker, &running).collect();
@@ -711,7 +715,7 @@ impl Up {
         if let (Outcome::Completed { action_result }, Some(action)) = (answer.outcome, action) {
             cx.seen.won.insert(action);
             let record = ActionRecord {
-                result: action_result,
+                result: action_result.into(),
                 closure: Closure::new(),
             };
             let put = Command::PutAction {

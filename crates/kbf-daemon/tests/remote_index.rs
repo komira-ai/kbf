@@ -17,6 +17,10 @@ use kbf_daemon::cas::{Cas, CasError, digest_of, label};
 use kbf_daemon::{PackCommit, PackWriter, PackedCas, RemoteIndex, WriteSettings};
 use kbf_objstore::{Capabilities, MemoryStore};
 use kbf_pack::{Blob, PackError, PackKeys, Packer, PackerConfig, Reader, ReaderConfig, WriterKind};
+use kbf_pack_index::memory::MemoryPackIndex;
+use kbf_pack_index::{
+    BlobDigest, Location, MAX_BATCH, NewPack, PackBlob, PackIndex, PackIndexError, Recorded,
+};
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::pack_index_server::{PackIndex as PackIndexRpc, PackIndexServer};
 use kbf_proto::worker::{
@@ -24,11 +28,7 @@ use kbf_proto::worker::{
 };
 use kbf_server::Peers;
 use kbf_server::pack_locate::PackLocateService;
-use kbf_state::pack_index::memory::MemoryPackIndex;
-use kbf_state::{
-    BlobDigest, Location, MAX_BATCH, ManualClock, NewPack, PackBlob, PackIndex, PackIndexError,
-    Recorded, StoreError,
-};
+use kbf_state::{ManualClock, StoreError};
 use support::memory::MemoryCas;
 use tokio::runtime::Handle;
 use tonic::transport::server::TcpIncoming;

@@ -8,9 +8,8 @@
 //! real clock instead: that flush reads and hashes on threads of the process, which a
 //! paused clock does not wait for.
 
-use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
@@ -24,6 +23,7 @@ use kbf_store::FaultFs;
 use kbf_tier::TierOptions;
 
 use super::RamDrain;
+use crate::test_log::capture;
 
 /// A memory store that refuses every PUT while `refuse` is set.
 struct Refusing {
@@ -122,53 +122,6 @@ fn bytes(seed: u8) -> Bytes {
 
 fn blob(seed: u8) -> VerifiedBlob {
     VerifiedBlob::hashed(bytes(seed))
-}
-
-/// What the subscriber wrote.
-#[derive(Clone, Default)]
-struct Log(Arc<Mutex<Vec<u8>>>);
-
-impl io::Write for Log {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Log {
-    type Writer = Log;
-
-    fn make_writer(&'a self) -> Log {
-        self.clone()
-    }
-}
-
-impl Log {
-    fn text(&self) -> String {
-        let bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        String::from_utf8_lossy(&bytes).into_owned()
-    }
-}
-
-/// The log of this thread, until the guard drops. Other tests of the binary reach the
-/// same callsites with no subscriber and can leave their interest cached as never, so
-/// the cache is rebuilt once ours is installed.
-fn capture(log: &Log) -> tracing::subscriber::DefaultGuard {
-    let guard = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_writer(log.clone())
-            .with_ansi(false)
-            .finish(),
-    );
-    tracing_core::callsite::rebuild_interest_cache();
-    guard
 }
 
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -291,8 +244,7 @@ async fn the_stop_flushes_what_is_staged_after_serving_ends() {
 /// ends without a line saying what was left (defect: the timed-out arm does not log).
 #[tokio::test]
 async fn a_stop_that_cannot_flush_ends_at_its_deadline_and_says_what_is_left() {
-    let log = Log::default();
-    let _guard = capture(&log);
+    let log = capture();
     let (cache, refuse) = tiered().await;
     refuse.store(true, Ordering::SeqCst);
     let ram = RamDrain::start(Arc::clone(&cache), 0, Duration::from_millis(500));
@@ -324,8 +276,7 @@ async fn a_stop_that_cannot_flush_ends_at_its_deadline_and_says_what_is_left() {
 /// reports a flush that finished as one that did not (defect: the arms are swapped).
 #[tokio::test]
 async fn a_stop_that_flushes_says_so() {
-    let log = Log::default();
-    let _guard = capture(&log);
+    let log = capture();
     let (cache, _) = tiered().await;
     let ram = RamDrain::start(Arc::clone(&cache), 0, DEADLINE);
     let staged = blob(8);

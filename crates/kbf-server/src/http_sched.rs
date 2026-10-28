@@ -182,8 +182,8 @@ fn lease_item(lease: &LeaseView, epoch_unix_ms: u64) -> Value {
         "granted_unix_ms": wall(lease.granted_at),
         "started_unix_ms": lease.started_at.map(wall),
         "operation": lease.operation.to_string(),
-        "instance": lease.instance,
-        "digest": lease.action.to_string(),
+        "instance": lease.key.class,
+        "digest": lease.key.dedup,
         "platform": lease.platform,
         "qos": lease.qos.name(),
     })
@@ -248,8 +248,8 @@ fn queue_body(queue: &QueueView) -> Value {
                 "reason": g.reason,
                 "count": g.count,
                 "example_operation": g.example.to_string(),
-                "example_instance": g.example_instance,
-                "example_digest": g.example_action.to_string(),
+                "example_instance": g.example_key.class,
+                "example_digest": g.example_key.dedup,
             })
         })
         .collect();
@@ -259,8 +259,8 @@ fn queue_body(queue: &QueueView) -> Value {
         .map(|a| {
             json!({
                 "operation": a.operation.to_string(),
-                "instance": a.instance,
-                "digest": a.action.to_string(),
+                "instance": a.key.class,
+                "digest": a.key.dedup,
                 "nodes": a.nodes.iter().map(WorkerId::as_str).collect::<Vec<_>>(),
             })
         })

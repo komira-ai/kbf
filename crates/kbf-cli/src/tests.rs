@@ -863,7 +863,7 @@ fn the_identity_is_the_libraries_own_and_both_halves_speak_one_protocol() {
         kbf_server::worker::OLDEST_PROTOCOL_VERSION
     );
     assert_eq!(v["meta_log"], kbf_server::raft_log::RUNS.get());
-    assert_eq!(v["state_schema"], kbf_state::postgres::schema::latest());
+    assert_eq!(v["state_schema"], kbf_pack_index::schema::latest());
     assert_eq!(v["admin_protocol"], 1);
     assert_eq!(v["seq"], version::build_seq());
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));

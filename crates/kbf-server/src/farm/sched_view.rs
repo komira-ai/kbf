@@ -24,14 +24,14 @@ impl Farm {
     pub fn lease_views(&self, node: Option<&WorkerId>) -> LeaseViews {
         let state = self.lock();
         LeaseViews {
-            term: state.sched.term(),
+            term: state.engine.sched.term(),
             epoch_unix_ms: self.epoch_unix_ms,
-            leases: state.sched.lease_snapshot(node),
+            leases: state.engine.sched.lease_snapshot(node),
         }
     }
 
     /// The queue now, summarised.
     pub fn queue_view(&self) -> QueueView {
-        self.lock().sched.queue_snapshot()
+        self.lock().engine.sched.queue_snapshot()
     }
 }

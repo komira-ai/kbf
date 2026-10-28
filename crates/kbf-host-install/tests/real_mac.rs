@@ -664,7 +664,9 @@ fn a_real_release_is_fetched_as_nobody_and_verified() {
     fs::write(&root_copy, &trusted.stdout).unwrap();
     fs::set_permissions(&root_copy, fs::Permissions::from_mode(0o644)).unwrap();
 
+    let origin = release::Origin::kbf();
     let fetcher_with = |token| Fetcher {
+        origin: &origin,
         platform: "darwin-arm64",
         asset: AssetKind::Tarball,
         runner: &SystemRunner,

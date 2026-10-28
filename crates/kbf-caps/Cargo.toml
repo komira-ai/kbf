@@ -8,7 +8,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-thiserror.workspace = true
+# The code lives in the jobscheduler repository, at the revision the workspace pins.
+js-caps.workspace = true
 
 [lints]
 workspace = true

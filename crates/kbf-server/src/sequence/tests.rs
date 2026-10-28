@@ -115,7 +115,8 @@ fn request(tag: u8) -> Request {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        },
+        }
+        .into(),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, 1 << 30),
@@ -445,6 +446,7 @@ fn finished(lease: kbf_types::LeaseId) -> kbf_proto::worker::Result {
         action_digest: None,
         memory_kill: 0,
         lost: 0,
+        job_outcome: None,
     }
 }
 

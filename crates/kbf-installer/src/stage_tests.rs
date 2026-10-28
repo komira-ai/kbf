@@ -1045,7 +1045,7 @@ fn a_policy_is_the_installer_tomls_caps_and_floor_over_the_installers_own_number
         supported: Supported {
             protocol: 1,
             min_protocol: 1,
-            state_schema: u64::from(kbf_state::postgres::schema::latest()),
+            state_schema: u64::from(kbf_pack_index::schema::latest()),
         },
         timeouts: Timeouts::DEFAULT,
     };
@@ -1068,9 +1068,6 @@ fn a_policy_is_the_installer_tomls_caps_and_floor_over_the_installers_own_number
 fn the_supported_numbers_are_protocol_one_and_the_embedded_schema() {
     let s = supported();
     assert_eq!((s.protocol, s.min_protocol), (1, 1));
-    assert_eq!(
-        s.state_schema,
-        u64::from(kbf_state::postgres::schema::latest())
-    );
+    assert_eq!(s.state_schema, u64::from(kbf_pack_index::schema::latest()));
     assert!(s.state_schema > 0, "this build embeds a migration");
 }

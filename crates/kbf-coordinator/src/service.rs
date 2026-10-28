@@ -39,7 +39,8 @@ pub enum SetError {
     /// The state file could not be written.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// The token's allow-list entry may not set this service.
+    /// The services file's `ci_services` does not name this service, so CI's token may
+    /// not set it.
     #[error("the token may not set this service")]
     Forbidden,
 }
@@ -101,6 +102,8 @@ pub struct Status {
     pub quiet: bool,
     /// Every host heard from since the coordinator started, by node id.
     pub hosts: Vec<HostStatus>,
+    /// The commit this coordinator was built from ([`crate::BUILD_COMMIT`]).
+    pub commit: &'static str,
 }
 
 /// The coordinator.
@@ -257,6 +260,7 @@ impl Coordinator {
             services: self.desired.all(),
             quiet: fleet.is_quiet(now),
             hosts,
+            commit: crate::BUILD_COMMIT,
         })
     }
 

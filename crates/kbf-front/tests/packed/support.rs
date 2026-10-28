@@ -17,15 +17,16 @@ use kbf_objstore::{
     ObjectStoreError, PageSize,
 };
 use kbf_pack::{PackKeys, WriterKind};
+use kbf_pack_index::memory::MemoryPackIndex;
+use kbf_pack_index::{
+    BlobDigest, Location, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
+};
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_proto::reapi::{
     self, BatchReadBlobsRequest, BatchUpdateBlobsRequest, FindMissingBlobsRequest,
     batch_update_blobs_request,
 };
-use kbf_state::pack_index::memory::MemoryPackIndex;
-use kbf_state::{
-    BlobDigest, Location, ManualClock, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
-};
+use kbf_state::ManualClock;
 use kbf_storage::Storage;
 use kbf_storage::service::{Admission, Config, StorageService};
 use kbf_types::Digest;
