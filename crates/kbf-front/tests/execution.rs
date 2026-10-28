@@ -11,6 +11,8 @@ mod platform_tests;
 mod qos_tests;
 #[path = "execution/refuse_platform.rs"]
 mod refuse_platform_tests;
+#[path = "execution/wall.rs"]
+mod wall_tests;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -123,6 +125,16 @@ fn property(name: &str, value: &str) -> platform::Property {
 }
 
 fn job(argv: &str, action_platform: &[(&str, &str)], do_not_cache: bool) -> Job {
+    job_with_timeout(argv, action_platform, do_not_cache, None)
+}
+
+/// As [`job`], with the action's `timeout` field set to `timeout`.
+fn job_with_timeout(
+    argv: &str,
+    action_platform: &[(&str, &str)],
+    do_not_cache: bool,
+    timeout: Option<prost_types::Duration>,
+) -> Job {
     let input = Blob::new(format!("input of {argv}"));
     let root = Blob::of(&Directory {
         files: vec![FileNode {
@@ -140,6 +152,7 @@ fn job(argv: &str, action_platform: &[(&str, &str)], do_not_cache: bool) -> Job 
         command_digest: Some(command.proto.clone()),
         input_root_digest: Some(root.proto.clone()),
         do_not_cache,
+        timeout,
         platform: Some(Platform {
             properties: action_platform
                 .iter()

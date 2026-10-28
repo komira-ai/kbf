@@ -106,6 +106,7 @@ impl Job {
                 memory_source: self.memory,
                 ..Evidence::default()
             },
+            max_wall: None,
         })
         .expect("submitted");
     }

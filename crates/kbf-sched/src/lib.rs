@@ -17,3 +17,6 @@
 #![forbid(unsafe_code)]
 
 pub use js_sched::*;
+/// The whole-node settings of a scheduler ([`Scheduler::with_whole_node`]) and the cap a
+/// request can be stopped by ([`WholeWait::Cap`]), which `js-sched` takes from `js-whole`.
+pub use js_whole::{WholeNodeConfig, caps::Blocked};
