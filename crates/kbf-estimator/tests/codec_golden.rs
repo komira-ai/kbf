@@ -3,8 +3,11 @@
 //! and that every later build must read as the summary it was written from.
 //!
 //! `tests/golden/codec/` holds the record of each summary below as hex text, after comment
-//! lines (beginning with `#`) that say what the file pins. The summaries are built from
-//! runs of the shapes a farm records: quiet successes of several sizes on several days, an
+//! lines (beginning with `#`) that say what the file pins. The summaries are synthetic: no
+//! farm data was read to make them. Each is made by feeding made-up runs to the estimator's
+//! own update path (`Summary::new` and `Summary::observe`, the calls `Summaries::observe`
+//! makes) and encoding what it holds, so a summary is a state that path can reach. The runs
+//! have the shapes a farm records: quiet successes of several sizes on several days, an
 //! own-limit kill that sets a floor, node-pressure kills, a Mac footprint and a mix of small
 //! and large runs that wraps the sample ring. This test requires, for each file:
 //!
@@ -274,6 +277,7 @@ fn write_missing_files() {
         }
         let text = format!(
             "# Size summary `{name}`: the stored record of one summary, version {VERSION}.\n\
+             # Synthetic: made-up runs fed to the estimator's update path, not farm data.\n\
              # Pins: this build encodes the summary to these bytes, decodes them to it, and\n\
              # refuses a record with any byte changed.\n\
              # A change to this file needs a reason in the pull request that makes it, and the\n\

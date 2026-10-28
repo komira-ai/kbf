@@ -184,6 +184,7 @@ fn result(lease: LeaseId, memory_kill: MemoryKill) -> worker::Result {
         action_digest: None,
         memory_kill: memory_kill as i32,
         lost: 0,
+        job_outcome: None,
     }
 }
 

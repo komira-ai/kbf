@@ -273,6 +273,13 @@ fn the_daemon_wire_has_no_cold_store_field() {
     for must in [
         ".kbf.worker.v1.Welcome",
         ".kbf.worker.v1.Start",
+        // The job a Start carries and the outcome a Result carries, at depth.
+        ".kbf.worker.v1.Job",
+        ".kbf.worker.v1.Mount",
+        ".kbf.worker.v1.Label",
+        ".kbf.worker.v1.JobLimits",
+        ".kbf.worker.v1.JobOutcome",
+        ".kbf.worker.v1.JobTaint",
         ".kbf.map.v1.Map",
         ".kbf.map.v1.Member",
         ".kbf.worker.v1.ReadRangeResponse",
