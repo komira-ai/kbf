@@ -488,38 +488,56 @@ impl Ending {
     /// [`Ending::settle_with`] with the rows of the build server.
     #[cfg(test)]
     fn settle(&self, txn: Txn, operation: OperationId) -> Txn {
-        self.settle_with(&KbfRows, txn, operation)
+        self.settle_with(&KbfRows, txn, operation, false)
     }
 
     /// `txn`, then the removal of the operation's `op/`, `queue/`, `loss/`, `fate/` and
     /// `opkey/` rows (and the rows `ext` removes, between the `fate/` and `opkey/` deletes)
     /// and the put of its result, so one transaction carries all of it. The `opkey/` delete
     /// is made whatever `--learned-sizes` says: an operation
-    /// an `on` run queued has the row, and a later `off` run cleans it up as it ends.
+    /// an `on` run queued has the row, and a later `off` run cleans it up as it ends. The
+    /// `opwall/` row is deleted only if `walled` says the operation has one, so an operation
+    /// without a wall time ends in the transaction it always did.
     /// The result goes over whatever is there: the transaction also deletes the lease row
     /// at the version read, which no other writer can have deleted first and written a
     /// result after.
-    fn settle_with(&self, ext: &dyn Ext, txn: Txn, operation: OperationId) -> Txn {
+    fn settle_with(&self, ext: &dyn Ext, txn: Txn, operation: OperationId, walled: bool) -> Txn {
         let txn = txn
             .delete(op_key(operation), Cond::Any)
             .delete(queue_key(operation), Cond::Any);
-        self.settle_rest(ext, txn, operation, Cond::Any)
+        self.settle_rest(ext, txn, operation, walled, Cond::Any)
     }
 
     /// `txn`, which already deletes the operation's `op/` and `queue/` rows at the versions
     /// it read, then the removal of the rest of its rows (its `lease-by-op/` row among
     /// them, whoever left it) and the put of its result where `done` allows:
     /// [`Cond::Absent`] for a result no other writer has put.
-    fn settle_rest(&self, ext: &dyn Ext, txn: Txn, operation: OperationId, done: Cond) -> Txn {
+    fn settle_rest(
+        &self,
+        ext: &dyn Ext,
+        txn: Txn,
+        operation: OperationId,
+        walled: bool,
+        done: Cond,
+    ) -> Txn {
         let ttl = self.ttl();
         let txn = txn
             .delete(loss_key(operation), Cond::Any)
             .delete(fate_key(operation), Cond::Any);
-        ext.settled(txn, operation)
-            .delete(opkey_key(operation), Cond::Any)
-            .delete(opwall_key(operation), Cond::Any)
-            .delete(lease_by_op_key(operation), Cond::Any)
-            .put_ttl(done_key(operation), self.finished.to_row(), ttl, done)
+        let txn = ext
+            .settled(txn, operation)
+            .delete(opkey_key(operation), Cond::Any);
+        let txn = if walled {
+            txn.delete(opwall_key(operation), Cond::Any)
+        } else {
+            txn
+        };
+        txn.delete(lease_by_op_key(operation), Cond::Any).put_ttl(
+            done_key(operation),
+            self.finished.to_row(),
+            ttl,
+            done,
+        )
     }
 }
 
