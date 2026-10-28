@@ -716,3 +716,54 @@ async fn each_entry_sets_only_its_own_services() {
     assert_eq!(status.services["js-agent"].version.as_str(), "3.0");
     assert_eq!(status.services.len(), 3);
 }
+
+/// Catches: a service matched by prefix or without regard to case. The entry names `kbf`
+/// and `js`, and the services file defines `js` and `js-server`: `js` is set, `js-server`
+/// (which starts with `js`) is a 403, and `JS` is no defined service, so a 400. An entry
+/// that names `JS` gets a 403 for `js`. Each refusal leaves the state as it was.
+#[tokio::test]
+async fn a_service_is_allowed_by_its_exact_name_only() {
+    let start = |rig: &Rig, named: &str| {
+        let list = config_text(STATIC_ISSUER) + &format!("services = [\"kbf\", \"{named}\"]\n");
+        Rig::start_with_allow_list(&rig.dir, &rig.clock, &list).with_services(
+            Services::parse(
+                "[[service]]\nname = \"js\"\n[service.roles.daemon]\n\
+                 [[service]]\nname = \"js-server\"\n[service.roles.daemon]\n",
+            )
+            .expect("services"),
+        )
+    };
+    let mut rig = Rig::new("svc-exact");
+    rig.coordinator = start(&rig, "js");
+    let c = &rig.coordinator;
+    c.set_desired(Some(&ci_token()), body_for("js").as_bytes())
+        .await
+        .expect("js is named");
+    assert!(matches!(
+        c.set_desired(Some(&ci_token()), body_for("js-server").as_bytes())
+            .await,
+        Err(SetError::Forbidden)
+    ));
+    assert!(matches!(
+        c.set_desired(Some(&ci_token()), body_for("JS").as_bytes())
+            .await,
+        Err(SetError::Invalid(_))
+    ));
+    let status = c.status(Some(OPERATOR)).expect("status");
+    assert_eq!(status.services.keys().collect::<Vec<_>>(), ["js"]);
+
+    let mut rig = Rig::new("svc-exact-case");
+    rig.coordinator = start(&rig, "JS");
+    let c = &rig.coordinator;
+    assert!(matches!(
+        c.set_desired(Some(&ci_token()), body_for("js").as_bytes())
+            .await,
+        Err(SetError::Forbidden)
+    ));
+    assert!(
+        c.status(Some(OPERATOR))
+            .expect("status")
+            .services
+            .is_empty()
+    );
+}

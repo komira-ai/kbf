@@ -76,9 +76,23 @@ fn spawn(flags: &[String]) -> Child {
         .expect("spawned")
 }
 
-/// Runs the binary to its end: the exit code, stdout and stderr.
+/// How long a run that should end at once may take before it is taken to have started
+/// serving instead: a bound on a hang, not a measure of speed.
+const RUN_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Runs the binary to its end: the exit code, stdout and stderr. A binary still running
+/// after [`RUN_BOUND`] (one that started instead of refusing) is stopped and the test
+/// fails saying so, rather than waiting for ever.
 fn run(flags: &[String]) -> (i32, String, String) {
-    let out = Command::new(BIN).args(flags).output().expect("ran");
+    let child = spawn(flags);
+    let pid = Pid::from_raw(i32::try_from(child.id()).expect("a pid")).expect("not zero");
+    let (sent, ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sent.send(child.wait_with_output()));
+    let Ok(out) = ended.recv_timeout(RUN_BOUND) else {
+        kill_process(pid, Signal::KILL).expect("stopped");
+        panic!("the coordinator did not exit with {flags:?}: it started instead of refusing");
+    };
+    let out = out.expect("ran");
     (
         out.status.code().expect("an exit code"),
         String::from_utf8_lossy(&out.stdout).into_owned(),
