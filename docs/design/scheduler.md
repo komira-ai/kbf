@@ -493,7 +493,7 @@ The level is on the operation, not in the action: it is not a platform property,
 action sent at `ci` and at `batch` has one digest and one action-cache entry. Queued work
 orders by urgency, so a queued `batch` action starts after every queued `ci` action; a
 caller that joins a queued twin at a more urgent level promotes it (see the tests in
-`crates/kbf-sched/tests/scheduler.rs`).
+`crates/js-sched/tests/scheduler.rs` in the jobscheduler repository, where the scheduler code and its tests now live).
 
 Not built yet: reading REAPI's `ExecutionPolicy.priority`, **preemption** of `batch` work
 (a running `batch` action keeps its slot while `ci` work waits; only what is queued is
