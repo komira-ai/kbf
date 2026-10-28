@@ -11,10 +11,9 @@
 //!   0400). Nothing of the host's identity is in the body: the coordinator reads it from the
 //!   certificate, and a certificate that names another node or role than the one the agent
 //!   started as is not used (the drain it does targets the node it started as).
-//! - **What it takes back.** A 200 whose body is exactly a [`Reply`] (a [`ServiceReply`] for an agent that lists
-//!   services), read strictly and no
-//!   more than [`REPLY_MAX`] bytes. Anything else is an error, and the updater does nothing
-//!   with it but heartbeat again.
+//! - **What it takes back.** A 200 whose body is exactly a [`Reply`] (a [`ServiceReply`] for
+//!   an agent that lists services), read strictly and no more than [`REPLY_MAX`] bytes.
+//!   Anything else is an error, and the updater does nothing with it but heartbeat again.
 //!
 //! HTTP/1.1 only, `Connection: close`, rustls with the ring provider over a std socket, like
 //! the other clients of this crate: no async runtime.

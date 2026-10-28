@@ -286,6 +286,11 @@ by commas, each at most once:
 | `drain=node` or `drain=none` | `node`: the host's node is drained and given back through the frontend, as for `kbf`; `none`: nothing is drained, and no drain call is made | `node` |
 | `ready-url=http://IP:PORT/PATH` | health is `GET PATH` on that loopback address answering 2xx (the path is `/` if there is none) | the node's health through the frontend, as for `kbf` |
 
+A service's helper is spoken to exactly as `kbf`'s is: `query`, and `install kbf=<version> from
+<channel>`, with the service's version and channel. The request names no service, so each service
+needs a helper of its own that installs that service when asked so; the agent refuses to start with a
+service whose socket is its own `--helper-socket`.
+
 A value holds no comma. `drain=node` and node health need `--frontend` (or the operator token), as
 `kbf` does; a service with `drain=none` and a `ready-url` needs neither. A readiness URL is checked
 for the service's word that it serves; it does not say which release answered.
