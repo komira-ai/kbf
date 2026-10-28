@@ -43,7 +43,7 @@ pub struct KbfExtras {
     /// The runtime's phase, if one reports it; see [`Daemon::with_phase`].
     phase: Option<watch::Receiver<NodePhase>>,
     /// The newest phase taken from it.
-    phase_now: NodePhase,
+    pub(crate) phase_now: NodePhase,
     /// The memory backstop, if one is set; see [`Daemon::with_memory_backstop`]. Every
     /// Hello carries `phase_now`, or [`NodePhase::MemoryPressure`] in its place while
     /// the node is serving and the backstop has paused it.

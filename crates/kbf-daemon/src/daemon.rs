@@ -659,8 +659,7 @@ impl<X: SessionExtras> Daemon<X> {
     /// Takes the lease epoch a Welcome named: the node's hook first, then the core's
     /// (see [`LeaseCore::new_epoch`]).
     fn new_epoch(&mut self, epoch: Option<u64>) {
-        self.extras.epoch_changed(epoch, &mut self.core);
-        self.core.new_epoch(epoch);
+        change_epoch(&mut self.extras, &mut self.core, epoch);
     }
 
     fn on_message(&mut self, msg: ServerMessage, tx: &UnboundedSender<DaemonMessage>) {
@@ -770,9 +769,83 @@ fn wire_phase(phase: &NodePhase) -> Option<worker::NodePhase> {
     })
 }
 
+/// A Welcome named lease epoch `epoch`: the node's hook first, then the core's change.
+/// The hook goes first because it forgets leases the node holds outside the core (a
+/// session switch's lease) by the epoch the core is about to replace; the core's change
+/// then drops what it granted under the old one. Both kill by lease id and a kill of a
+/// lease already killed does nothing, so what is dropped and what is reported does not
+/// depend on which comes first, but the hook is written to see the core as the Welcome
+/// found it.
+fn change_epoch<X: SessionExtras>(extras: &mut X, core: &mut LeaseCore, epoch: Option<u64>) {
+    extras.epoch_changed(epoch, core);
+    core.new_epoch(epoch);
+}
+
 #[cfg(test)]
 mod tests {
+    use kbf_proto::reapi::Digest;
+    use kbf_types::LeaseId;
+
+    use crate::clock::SystemClock;
+    use crate::runtime::FakeRuntime;
+
     use super::*;
+
+    /// Catches a new epoch that leaves a lease which is the Mac session's switching lease
+    /// and is also granted and running alive, or reports its Result: the run is killed
+    /// (once, though the hook and the core both kill it), the Result of the run is
+    /// dropped when it ends, nothing is kept for resending, and the observer is told the
+    /// lease was superseded. Driven through [`change_epoch`], without a stream.
+    #[tokio::test]
+    async fn a_new_epoch_drops_a_switching_lease_that_runs_and_its_result() {
+        let lease = LeaseId::new(1, 1);
+        let runtime = Arc::new(FakeRuntime::new(Duration::from_secs(3600)));
+        let (done_tx, mut done) = mpsc::unbounded_channel();
+        let mut core = LeaseCore::new(
+            Leases::new(Runtimes::new(Arc::clone(&runtime)), done_tx),
+            Duration::from_secs(40),
+            8,
+            Arc::new(SystemClock),
+        );
+        let (events_tx, mut events) = mpsc::unbounded_channel();
+        core.observe(events_tx);
+        core.contact.new_stream(Duration::from_secs(1));
+        core.window.new_stream(core.clock.now());
+        core.new_epoch(Some(1));
+        let (tx, mut sent) = unbounded();
+        let start = worker::Start {
+            lease_id: Some(worker::LeaseId { term: 1, seq: 1 }),
+            kind: "action".to_owned(),
+            action_digest: Some(Digest::default()),
+            ..worker::Start::default()
+        };
+        core.on_start(start, &tx);
+        let mut extras = KbfExtras::detect();
+        extras.phase_now = NodePhase::Preparing(lease);
+        while runtime.started().is_empty() {
+            tokio::task::yield_now().await;
+        }
+
+        change_epoch(&mut extras, &mut core, Some(2));
+        let finished = done.recv().await.expect("the killed run ends");
+        core.finished(Some(&tx), finished);
+
+        assert_eq!(runtime.killed(), [lease]);
+        assert_eq!(core.epoch, Some(2));
+        assert!(core.unacked.is_empty(), "no Result kept");
+        assert!(core.granted.is_empty(), "the grant is forgotten");
+        assert!(sent.try_recv().is_err(), "no Result sent");
+        assert_eq!(
+            events.recv().await,
+            Some(Event::Superseded(vec![lease])),
+            "superseded first"
+        );
+        let ended = events
+            .recv()
+            .await
+            .map(|e| matches!(e, Event::LeaseEnded(_)));
+        assert_eq!(ended, Some(true), "then the run's end");
+    }
 
     /// Catches (issue #170): a session error logged as `connect: transport error`
     /// alone, without the cause under it (here, the refused connection), and a chain

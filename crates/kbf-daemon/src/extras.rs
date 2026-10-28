@@ -56,7 +56,11 @@ pub trait SessionExtras: Send {
 
     /// A Welcome named lease epoch `epoch` (`None`: none): runs the node holds outside
     /// `core` that belong to another epoch are dropped here, before `core` drops its
-    /// own.
+    /// own. The session calls this before `core`'s epoch change, not after: the hook sees
+    /// `core` as the Welcome found it (the old epoch, every grant still in place), and
+    /// the core then drops what it granted under that epoch. Kills are by lease id and
+    /// repeat harmlessly, so today either order drops the same leases; an implementation
+    /// that reads `core` must keep this order.
     fn epoch_changed(&mut self, epoch: Option<u64>, core: &mut LeaseCore);
 
     /// Completes when the node has something to take (an [`ExtraWake`]); never

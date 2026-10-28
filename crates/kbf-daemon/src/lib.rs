@@ -39,6 +39,12 @@
 //!   exact kill of an action it runs as a pool user, and its keeper's.
 //! - [`LocalRuntime`]: **tests only**, runs actions as plain child processes.
 //! - [`Daemon`]: the session loop, with the contact clock and lease manager inside.
+//! - [`LeaseCore`] (`core`): the lease state the session loop drives (leases, contact,
+//!   start window, unacknowledged Results, epoch) and [`Event`], what it tells an observer.
+//! - [`SessionExtras`] (`extras`): the hooks of the session loop that name more than
+//!   leases; [`NoExtras`] answers none.
+//! - [`KbfExtras`] (`kbf_extras`): a kbf node's answers (storage map, pack counters, driver
+//!   report, session phase, memory backstop); the builders on `Daemon<KbfExtras>` set them.
 //!
 //! The `kbf-daemon` binary lives in the `kbf-node` crate: it picks its drivers
 //! (`--driver fake|container|native`, once per runtime), and the drivers depend on this

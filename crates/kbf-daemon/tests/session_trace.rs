@@ -5,7 +5,8 @@
 //! events the daemon emitted. It leaves out what differs between hosts and runs (the
 //! capabilities, the instance id, the build, times). Catches a change to the session
 //! that reorders or reshapes what the daemon sends or emits for the same script, which no
-//! test of one message would notice.
+//! test of one message would notice. The golden was captured by running the code before
+//! the session hooks moved behind a trait, and is committed with that change.
 
 mod support;
 
@@ -178,9 +179,10 @@ impl Bare {
     }
 }
 
-/// Catches a session loop that does something for a kbf node that a node with no extras
-/// does not need: the same script against a daemon with [`NoExtras`] leaves the same trace
-/// (a `NodeStatus` with no software, which the trace counts, not reads).
+/// Catches a session loop that sends or emits, for a node with no extras, something
+/// the golden does not hold. The trace shows the same text as a kbf node's because the
+/// fields it reads (phase, counts, lists) do not depend on the extras; the `NodeStatus`
+/// of a node with no extras carries no software, which the trace counts and does not read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_same_session_without_extras_leaves_the_same_trace() {
     let mut bare = Bare::new("session-trace-bare", Duration::ZERO).await;
