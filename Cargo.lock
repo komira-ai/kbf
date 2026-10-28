@@ -1337,6 +1337,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "js-server-core"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=3692799c4a336e392a494a0248050152312c47ee#3692799c4a336e392a494a0248050152312c47ee"
+dependencies = [
+ "js-caps",
+ "js-sched",
+ "js-state",
+ "js-store",
+ "js-types",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "js-sim"
 version = "0.1.0"
 source = "git+https://github.com/komira-ai/jobscheduler?rev=3692799c4a336e392a494a0248050152312c47ee#3692799c4a336e392a494a0248050152312c47ee"
@@ -2521,6 +2535,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "hyper-util",
+ "js-server-core",
  "js-store",
  "kbf-auth",
  "kbf-ca",
