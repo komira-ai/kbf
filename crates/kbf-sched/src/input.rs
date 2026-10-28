@@ -2,8 +2,8 @@
 
 use kbf_caps::NodeCaps;
 use kbf_types::{
-    ActionKey, ControlRecord, FarmTime, FencePolicy, LeaseId, LeaseKind, NodePhase, OperationId,
-    Outcome, Qos, Resources, WaiterId, WorkerId,
+    ControlRecord, FarmTime, FencePolicy, LeaseId, LeaseKind, NodePhase, OperationId, Outcome, Qos,
+    Resources, WaiterId, WorkKey, WorkerId,
 };
 
 use crate::servable::serves;
@@ -11,8 +11,8 @@ use crate::servable::serves;
 /// One execution request, as the front submits it after the cache missed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
-    /// The dedup key: instance name and action digest.
-    pub key: ActionKey,
+    /// The dedup key: what makes two requests the same work.
+    pub key: WorkKey,
     /// How urgent the caller says it is.
     pub qos: Qos,
     /// What the lease takes. Placement offers it only to a worker that reports a driver

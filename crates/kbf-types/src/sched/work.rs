@@ -1,4 +1,4 @@
-//! The vocabulary of scheduled work: operations, workers, waiters, the dedup key, the
+//! The vocabulary of scheduled work: operations, workers, waiters, the work key, the
 //! request vector, fence policies, outcomes, and the records the scheduler commits to
 //! the control log.
 //!
@@ -49,16 +49,39 @@ impl fmt::Display for WorkerId {
     }
 }
 
-/// What makes two executions the same work: the REAPI instance name and the action
-/// digest. In-flight dedup joins a second call to a running twin only when both match;
-/// the same digest under another instance is different work (another namespace, maybe
-/// another cache), so it never joins.
+/// What makes two executions the same work, as the scheduler sees it: a class and a
+/// dedup text, both opaque to it. In-flight dedup joins a second request to a running
+/// twin only when both match; the same dedup text under another class is different work,
+/// so it never joins.
+///
+/// Both parts are plain text, so the scheduler, the control log and the durable rows
+/// that name work need nothing from the code that builds it. For a build the class is
+/// the REAPI instance name and the dedup text is the action digest's text form
+/// (`<lowercase hex>/<size>`): `kbf_types::ActionKey` converts to and from a `WorkKey`
+/// (`WorkKey::from`, `ActionKey::try_from`), and the log codec writes a `WorkKey` through
+/// that conversion, so the bytes on the log and in the rows are those of an `ActionKey`.
+///
+/// Keys compare class first, then dedup text, as text. For action digests that is the
+/// order of the `ActionKey` (instance, then hash) except between two digests with the
+/// same hash and different sizes, which sort by the size's decimal text.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ActionKey {
-    /// The REAPI instance name the client sent.
-    pub instance: String,
-    /// The digest of the `Action` message.
-    pub action: Digest,
+pub struct WorkKey {
+    /// What namespace the work is in: two keys of different classes are never the same
+    /// work.
+    pub class: String,
+    /// What identifies the work within its class.
+    pub dedup: String,
+}
+
+impl WorkKey {
+    /// The key of the work `dedup` in `class`.
+    #[must_use]
+    pub fn new(class: impl Into<String>, dedup: impl Into<String>) -> Self {
+        Self {
+            class: class.into(),
+            dedup: dedup.into(),
+        }
+    }
 }
 
 /// A request vector, or a node's capacity in the same units.
@@ -354,8 +377,8 @@ pub struct StartLease {
     pub lease: LeaseId,
     /// The operation; the worker names it in its reports.
     pub operation: OperationId,
-    /// The action to run.
-    pub key: ActionKey,
+    /// The work to run.
+    pub key: WorkKey,
     /// What the lease takes: a share of the worker, or all of it.
     pub kind: LeaseKind,
     /// What the scheduler booked for it on `worker`: the request for an action lease,
@@ -531,6 +554,21 @@ mod tests {
                 .saturating_add(one)
                 .gpus,
             u64::MAX
+        );
+    }
+
+    /// Catches: a key whose class and dedup text are swapped or merged, which would join
+    /// work across classes.
+    #[test]
+    fn a_work_key_is_its_class_and_its_dedup_text() {
+        let key = WorkKey::new("main", "abc/3");
+        assert_eq!((key.class.as_str(), key.dedup.as_str()), ("main", "abc/3"));
+        assert_ne!(key, WorkKey::new("abc/3", "main"));
+        assert_ne!(key, WorkKey::new("main", "abc/4"));
+        assert_ne!(key, WorkKey::new("other", "abc/3"));
+        assert!(
+            WorkKey::new("a", "z") < WorkKey::new("b", "a"),
+            "class first"
         );
     }
 

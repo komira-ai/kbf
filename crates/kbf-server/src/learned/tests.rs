@@ -82,7 +82,8 @@ fn start(seq: u64, kind: LeaseKind, gpus: u64) -> StartLease {
         key: ActionKey {
             instance: "main".to_owned(),
             action: Digest::new(DigestFunction::Sha256, [2; 32], 2),
-        },
+        }
+        .into(),
         kind,
         resources: Resources {
             gpus,

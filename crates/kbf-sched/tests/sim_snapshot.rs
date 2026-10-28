@@ -14,8 +14,8 @@ use kbf_caps::NodeCaps;
 use kbf_sched::{DaemonInstance, Event, Input, Request, Scheduler};
 use kbf_sim::{Chance, SimRng};
 use kbf_types::{
-    ActionKey, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, LeaseKind, Outcome, Qos,
-    Resources, StateMachine, WaiterId, WorkerId,
+    Digest, DigestFunction, Effect, FarmTime, LeaseGrant, LeaseKind, Outcome, Qos, Resources,
+    StateMachine, WaiterId, WorkerId,
 };
 
 const SEEDS: u64 = 24;
@@ -199,10 +199,7 @@ impl World {
                 _ => Qos::Batch,
             };
             let request = Request {
-                key: ActionKey {
-                    instance: "main".to_owned(),
-                    action: digest(n),
-                },
+                key: kbf_sim::work_key("main", digest(n)),
                 qos,
                 kind: LeaseKind::Action,
                 resources: Resources::new(1_000, GIB),

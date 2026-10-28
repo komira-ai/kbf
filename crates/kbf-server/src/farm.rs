@@ -59,8 +59,8 @@ use kbf_sched::{
     MemoryLadder, NodePhase, OpState, Requeue, Scheduler,
 };
 use kbf_types::{
-    Answer, ControlRecord, Digest, Effect, Failure, FarmRun, FarmTime, LeaseGrant, LeaseId,
-    MemoryRun, OperationId, Outcome, Refusal, StartLease, StateMachine, WaiterId, Waiting,
+    ActionKey, Answer, ControlRecord, Digest, Effect, Failure, FarmRun, FarmTime, LeaseGrant,
+    LeaseId, MemoryRun, OperationId, Outcome, Refusal, StartLease, StateMachine, WaiterId, Waiting,
     WorkerId,
 };
 use tokio::sync::{mpsc, watch};
@@ -1117,6 +1117,10 @@ impl Farm {
 
 impl Dispatch for Farm {
     fn submit(&self, mut submission: Submission) -> Result<Ticket, Status> {
+        // The front keys every request by an action; the callers and tickets of the
+        // server name that action.
+        let key = ActionKey::try_from(&submission.request.key)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
         // An action with no program and no output names no shape: all such actions would
         // share one key.
         let shaped =
@@ -1136,7 +1140,7 @@ impl Dispatch for Farm {
             .keys()
             .then(|| {
                 Keyable {
-                    instance: &submission.request.key.instance,
+                    instance: &key.instance,
                     platform: &platform,
                     shape: usage.key,
                     shaped,
@@ -1158,10 +1162,10 @@ impl Dispatch for Farm {
                 twin.is_some(),
             ),
         };
-        let action = submission.request.key.action;
-        let instance = submission.request.key.instance.clone();
+        let action = key.action;
+        let instance = key.instance.clone();
         let waiter = state.machine.submit(Waiter {
-            key: submission.request.key.clone(),
+            key,
             kind: submission.request.kind,
             do_not_cache: submission.request.do_not_cache,
             queued: SystemTime::now(),
@@ -1632,11 +1636,11 @@ impl State {
                 hook(stages.map(|stage| stage.borrow().clone()).collect());
             }
         });
-        self.send_for(&start.worker, start.operation, |_| {
+        self.send_for(&start.worker, start.operation, |w| {
             server_message::Message::Start(Start {
                 lease_id: Some(wire_lease(start.lease)),
                 kind: start.kind.name().to_owned(),
-                action_digest: Some(kbf_front::digest_to_proto(&start.key.action)),
+                action_digest: Some(kbf_front::digest_to_proto(&w.key.action)),
                 millicpus: start.resources.cpu_millis,
                 memory_bytes: start.resources.memory_bytes,
                 heartbeat_seq,
@@ -1649,19 +1653,18 @@ impl State {
             })
         });
         let now = SystemTime::now();
-        // An operation with a `Start` has its first waiter (see `send_for`).
-        let queued = self
-            .first_waiter(start.operation)
-            .map_or(now, |(_, w)| w.queued);
-        let sent = Sent {
+        // An operation with a `Start` has its first waiter (see `send_for`), which names
+        // the action.
+        let sent = self.first_waiter(start.operation).map(|(_, w)| Sent {
             operation: start.operation,
-            action: start.key.action,
+            action: w.key.action,
             stamp: Stamp {
-                queued,
+                queued: w.queued,
                 started: now,
             },
-        };
-        self.machine.start(start.lease, sent);
+        });
+        sent.into_iter()
+            .for_each(|sent| self.machine.start(start.lease, sent));
         self.learned.on_start(&start);
         self.record_started(&start);
     }

@@ -77,8 +77,8 @@ hyper-util = { version = "0.1.21", default-features = false }
 # (a lease id, say) is the same type in every kbf crate; a test in kbf-integration-test
 # reads Cargo.lock and refuses a second source. The revision is raised by a pull request
 # of its own that runs the whole CI, never along with other changes.
-js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "ae9f6087359f8876a6ddfd940c92eb41caa246b2" }
-js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "ae9f6087359f8876a6ddfd940c92eb41caa246b2" }
+js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "2b64dc6282aac440860224cb4a1a2c791fb698f4" }
+js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "2b64dc6282aac440860224cb4a1a2c791fb698f4" }
 md-5 = "0.11.0"
 # macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
 objc2 = "0.6.5"

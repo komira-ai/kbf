@@ -11,8 +11,8 @@ use kbf_sched::{
     UNSERVABLE_WAIT,
 };
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, LeaseId,
-    LeaseKind, Qos, Resources, StartLease, StateMachine, WaiterId, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, LeaseId, LeaseKind, Qos,
+    Resources, StartLease, StateMachine, WaiterId, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -25,10 +25,7 @@ fn digest(n: u8) -> Digest {
 
 fn request(n: u8, kind: LeaseKind) -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: digest(n),
-        },
+        key: kbf_sim::work_key("main", digest(n)),
         qos: Qos::Ci,
         kind,
         resources: Resources::new(1_000, GIB),

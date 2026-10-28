@@ -5,7 +5,7 @@
 use kbf_front::{Cache, Dispatch, Submission};
 use tonic::Code;
 
-use super::blocks_tests::{Racing, durable_over, farm_over, request, unfinished};
+use super::blocks_tests::{Racing, action_key, durable_over, farm_over, request, unfinished};
 use super::intake_tests::{caller, done_with, invalid, register};
 use super::owner_tests::grant;
 use super::transition_tests::{answer, ending, rows, subject};
@@ -49,7 +49,7 @@ async fn a_farm_over_a_store_names_an_operation_by_its_id_and_answers_the_name()
 
     assert_eq!(waited.name, name);
     assert_eq!(waited.instance, "main");
-    assert_eq!(waited.action, request(1).key.action);
+    assert_eq!(waited.action, action_key(1).action);
     assert_eq!(shown(&waited), Stage::Executing);
     assert!(farm.lock().watched.is_empty(), "the store was read");
     let lease = lease_of(&farm);
@@ -78,7 +78,7 @@ async fn a_name_in_the_old_form_is_answered_for_a_caller_the_process_holds() {
 
     assert_eq!(waited.name, old);
     assert_eq!(waited.instance, "main");
-    assert_eq!(waited.action, request(1).key.action);
+    assert_eq!(waited.action, action_key(1).action);
     let unknown = old.replace("-0", "-7");
     assert!(farm.wait(&unknown).is_none(), "no such caller");
 }
@@ -122,7 +122,7 @@ async fn a_frontend_that_does_not_hold_an_operation_answers_its_name_from_the_st
 
     assert_eq!(waiting.name, name);
     assert_eq!(waiting.instance, "main");
-    assert_eq!(waiting.action, request(1).key.action);
+    assert_eq!(waiting.action, action_key(1).action);
     assert_eq!(shown(&waiting), Stage::Executing);
     a.report(&node, invalid(lease)).await;
     b.intake();
@@ -193,7 +193,7 @@ async fn a_recorded_call_that_joined_an_operation_elsewhere_ends_with_the_operat
     let _leased = caller(&a, 1);
     let lease = lease_of(&a);
     let asked = request(1);
-    let action = asked.key.action;
+    let action = action_key(1).action;
     let metadata = kbf_front::CallMetadata {
         invocation_id: kbf_front::InvocationId::parse("build-1"),
         ..Default::default()

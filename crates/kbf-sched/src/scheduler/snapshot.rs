@@ -12,7 +12,7 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use kbf_types::{Digest, FarmTime, LeaseId, OperationId, Qos, WorkerId};
+use kbf_types::{FarmTime, LeaseId, OperationId, Qos, WorkKey, WorkerId};
 
 use super::{OpState, Scheduler};
 
@@ -50,10 +50,8 @@ pub struct LeaseView {
     pub lease: LeaseId,
     /// The operation it runs.
     pub operation: OperationId,
-    /// The instance name and action digest of the operation.
-    pub instance: String,
-    /// The action digest.
-    pub action: Digest,
+    /// The work key of the operation.
+    pub key: WorkKey,
     /// The worker that holds it.
     pub node: WorkerId,
     /// The platform the action asked for ([`platform_label`]).
@@ -94,10 +92,8 @@ pub struct WaitingGroup {
     pub count: usize,
     /// The first of them in queue order, as one to look at.
     pub example: OperationId,
-    /// Its instance name and action digest.
-    pub example_instance: String,
-    /// The action digest.
-    pub example_action: Digest,
+    /// Its work key.
+    pub example_key: WorkKey,
 }
 
 /// A queued operation placement keeps off some workers: its runs ended there as the
@@ -106,10 +102,8 @@ pub struct WaitingGroup {
 pub struct Avoided {
     /// The operation.
     pub operation: OperationId,
-    /// Its instance name.
-    pub instance: String,
-    /// Its action digest.
-    pub action: Digest,
+    /// Its work key.
+    pub key: WorkKey,
     /// The workers placement prefers it not run on, in name order.
     pub nodes: Vec<WorkerId>,
 }
@@ -194,8 +188,7 @@ impl Scheduler {
                 Some(LeaseView {
                     lease: *lease,
                     operation: held.operation,
-                    instance: op.request.key.instance.clone(),
-                    action: op.request.key.action,
+                    key: op.request.key.clone(),
                     node: holder.clone(),
                     platform: platform_label(&op.request.needs),
                     qos: op.request.qos.clone(),
@@ -236,15 +229,13 @@ impl Scheduler {
                         reason: u.reason.clone(),
                         count: 1,
                         example: id,
-                        example_instance: op.request.key.instance.clone(),
-                        example_action: op.request.key.action,
+                        example_key: op.request.key.clone(),
                     });
             }
             if !op.avoid.is_empty() {
                 avoided.push(Avoided {
                     operation: id,
-                    instance: op.request.key.instance.clone(),
-                    action: op.request.key.action,
+                    key: op.request.key.clone(),
                     nodes: op.avoid.iter().cloned().collect(),
                 });
             }

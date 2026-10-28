@@ -27,9 +27,9 @@ use std::time::Duration;
 
 use kbf_caps::NodeCaps;
 use kbf_types::{
-    ActionKey, Answer, ControlRecord, Effect, Failure, FarmRun, FarmTime, LeaseGrant, LeaseId,
-    LeaseKind, NodePhase, OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources,
-    ResultRecord, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
+    Answer, ControlRecord, Effect, Failure, FarmRun, FarmTime, LeaseGrant, LeaseId, LeaseKind,
+    NodePhase, OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources, ResultRecord,
+    StartLease, StateMachine, WaiterId, Waiting, WorkKey, WorkerId,
 };
 
 use crate::cordon::Cordons;
@@ -302,7 +302,7 @@ pub struct Scheduler {
     /// Queued operations, most urgent first, then oldest first.
     queue: BTreeSet<(Reverse<Qos>, OperationId)>,
     /// Joinable operations not yet finished, by dedup key.
-    in_flight: BTreeMap<ActionKey, OperationId>,
+    in_flight: BTreeMap<WorkKey, OperationId>,
     workers: BTreeMap<WorkerId, Worker>,
     /// Every lease currently held (leased or running).
     held: BTreeMap<LeaseId, Held>,

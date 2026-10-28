@@ -34,8 +34,8 @@ use kbf_caps::NodeCaps;
 use kbf_sched::{DaemonInstance, Event, Input, OpState, Request, Scheduler};
 use kbf_sim::SimRng;
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseId, OperationId,
-    Outcome, Qos, Resources, StateMachine, WaiterId, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseId, OperationId, Outcome, Qos,
+    Resources, StateMachine, WaiterId, WorkerId,
 };
 
 const SEEDS: u64 = 64;
@@ -387,10 +387,7 @@ fn run_secs(name: &str, seq: u64) -> u64 {
 
 fn request(n: u64, platform: usize) -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: digest(n),
-        },
+        key: kbf_sim::work_key("main", digest(n)),
         qos: Qos::Ci,
         kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),

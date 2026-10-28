@@ -1320,7 +1320,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "js-caps"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=ae9f6087359f8876a6ddfd940c92eb41caa246b2#ae9f6087359f8876a6ddfd940c92eb41caa246b2"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=2b64dc6282aac440860224cb4a1a2c791fb698f4#2b64dc6282aac440860224cb4a1a2c791fb698f4"
 dependencies = [
  "thiserror",
 ]
@@ -1328,7 +1328,7 @@ dependencies = [
 [[package]]
 name = "js-sizing"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=ae9f6087359f8876a6ddfd940c92eb41caa246b2#ae9f6087359f8876a6ddfd940c92eb41caa246b2"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=2b64dc6282aac440860224cb4a1a2c791fb698f4#2b64dc6282aac440860224cb4a1a2c791fb698f4"
 
 [[package]]
 name = "js-sys"
