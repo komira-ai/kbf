@@ -380,6 +380,10 @@ fn detail(farm: &Farm, name: &str) -> crate::fleet::NodeDetail {
 /// or of a node that never registered is ignored, the same daemon process on a new stream
 /// keeps its baseline, a restarted one resets it, and the view goes stale on the farm's clock.
 #[tokio::test(start_paused = true)]
+#[cfg_attr(
+    feature = "farm-core-js",
+    ignore = "known-different-on-js: the js core keeps no node load"
+)]
 async fn readings_reach_the_node_view() {
     let farm = farm();
     let a = WorkerId::new("a");
@@ -449,6 +453,10 @@ async fn readings_reach_the_node_view() {
 /// cannot be believed is not kept as a baseline. Catches the old session's reading kept
 /// after a restart, and a refused first reading stored anyway.
 #[tokio::test(start_paused = true)]
+#[cfg_attr(
+    feature = "farm-core-js",
+    ignore = "known-different-on-js: the js core keeps no node load"
+)]
 async fn a_restarted_daemons_unbelievable_first_reading_leaves_no_load() {
     let farm = farm();
     let a = WorkerId::new("a");

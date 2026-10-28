@@ -224,6 +224,11 @@ impl Farm {
     /// ([module](self)) does. A heartbeat with none changes nothing: the last accepted
     /// reading ages. Ignored if `stream` was replaced.
     pub fn note_node_load(&self, worker: &WorkerId, stream: StreamId, load: Option<&NodeLoad>) {
+        // The js core keeps no node load yet: its readings are neither stored nor shown.
+        #[cfg(feature = "farm-core-js")]
+        if matches!(self.driver, super::driver::Driver::Js(_)) {
+            return;
+        }
         let Some(load) = load else {
             return;
         };
