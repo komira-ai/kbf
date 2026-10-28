@@ -22,7 +22,10 @@ pub struct WholeNodeFlags {
     /// The ceiling is also at most the workers that serve whole-machine leases less
     /// `--whole-node-keep-for-ordinary`, and falls as workers leave. Left out, the
     /// scheduler books whole-machine requests as it always has, and the other
-    /// `--whole-node-*` flags are refused
+    /// `--whole-node-*` flags are refused. A request's reservation is given up at its action's
+    /// timeout, and a client may send none: without `--whole-node-drain-deadline-secs` the
+    /// reservation of such a request is never given up (it ends when its worker is empty), so
+    /// set that flag when clients may send no timeout
     #[arg(
         long,
         value_name = "WORKERS",

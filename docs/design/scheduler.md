@@ -561,7 +561,8 @@ What the code does today:
   name. A wall time is the `timeout` of an action; one that names none (or zero) is taken
   to end last. The hold is given up at its deadline,
   `--whole-node-drain-deadline-secs` or, left out, the request's own wall time (an action
-  with no wall time and no such flag is never given up); the worker is then barred to the
+  with no wall time and no such flag is never given up, so set the flag when clients may
+  send no timeout; it also covers an operation taken up again after a restart); the worker is then barred to the
   request for `--whole-node-reserve-backoff-secs` (300) and another is held. After
   `--whole-node-max-reserve-attempts` (2) give-ups the deadline is the wall time. No lease
   is stopped. The caps: at most N workers whole (held or reserved) at once, at most
