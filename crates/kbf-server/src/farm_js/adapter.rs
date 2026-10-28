@@ -397,6 +397,7 @@ impl Adapter for KbfAdapter {
     }
 
     fn refuse(&mut self, _view: &View<'_>, refusal: &Refusal) {
+        tracing::warn!(operation = %refusal.operation, reason = %refusal.reason, "operation refused");
         self.record_refused(refusal);
         let finished = refused_as(refusal);
         self.failed.count(Class::Farm);
