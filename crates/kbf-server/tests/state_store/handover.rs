@@ -37,6 +37,7 @@ fn queue(farm: &TestFarm, request: Request) -> kbf_front::Ticket {
         call: None,
         described: Described::default(),
         evidence: Default::default(),
+        max_wall: None,
     })
     .expect("queued")
 }
@@ -396,6 +397,7 @@ async fn a_successors_recorder_has_no_record_of_a_build_but_its_caller_is_answer
             call: Some(call),
             described: Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         })
         .expect("queued");
     let [lease] = starts(&mut inbox)[..] else {

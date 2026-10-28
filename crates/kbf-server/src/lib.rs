@@ -164,6 +164,7 @@ pub mod ui_mount;
 pub mod update_status;
 pub mod verbs;
 pub mod vitals;
+pub mod whole_node;
 pub mod worker;
 pub mod worker_roles;
 pub mod write_tier;
@@ -199,6 +200,7 @@ pub use state_store::{
 };
 pub use streams::{StreamArgs, StreamLimits};
 pub use ui_mount::bind_server_with_options;
+pub use whole_node::WholeNodeFlags;
 pub use worker::HostFloor;
 pub use worker::WorkerService;
 

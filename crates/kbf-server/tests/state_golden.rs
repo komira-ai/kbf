@@ -125,6 +125,7 @@ fn submit(farm: &Farm, request: Request) {
             call: None,
             described: Described::default(),
             evidence: Default::default(),
+            max_wall: None,
         },
     )
     .expect("submitted");

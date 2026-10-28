@@ -57,6 +57,18 @@ fn the_frontend_takes_placement_load_and_defaults_to_off() {
     assert!(parsed(&["--placement-load=load"]).is_err());
 }
 
+/// Catches a frontend that refuses a whole-node flag (scheduling runs in the frontend, so a
+/// unit file that sets one would not start), one that ignores the ceiling, and one that is
+/// on without it.
+#[test]
+fn the_frontend_takes_the_whole_node_flags_and_defaults_to_off() {
+    let config = |more: &[&str]| parsed(more).expect("flags").server.whole_node.config();
+    assert_eq!(config(&[]), None);
+    let on = config(&["--whole-node-max=2", "--whole-node-drain-after-secs=9"]).expect("on");
+    assert_eq!((on.max_whole_node, on.drain_after_ms), (2, 9_000));
+    assert!(parsed(&["--whole-node-drain-after-secs=9"]).is_err());
+}
+
 /// All eleven flags of the removed handover and admin port, each with a value.
 const RETIRED: [&str; 11] = [
     "--handover-socket=/run/kbf/control.sock",

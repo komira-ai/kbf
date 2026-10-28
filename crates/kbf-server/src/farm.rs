@@ -841,6 +841,13 @@ impl Dispatch for Farm {
         }
         let (stage, receiver) = watch::channel(Stage::Queued);
         state.side.stages.insert(waiter, stage);
+        // The longest the operation this submit allocates may run is given before the submit
+        // is fed: its first placement round follows, and the whole-node drain order and
+        // deadlines read it (nothing reads it with them off). A twin joined keeps the one
+        // it was given.
+        if let Some(wall) = submission.max_wall.filter(|_| !joined) {
+            state.engine.sched.set_max_wall(operation, wall);
+        }
         // The operation this submit allocates (none if it joins a twin, which keeps its
         // own key) is named before the submit is fed: its first placement round follows.
         if let Some(key) = size_key.filter(|_| !joined) {
@@ -985,3 +992,5 @@ mod learned_tests;
 mod placement_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod whole_node_tests;

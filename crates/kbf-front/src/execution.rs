@@ -189,6 +189,11 @@ pub struct Submission {
     /// client named, and the size of the input tree. For the run record only; it is
     /// not part of the scheduler's [`Request`], which the log codec writes.
     pub evidence: Evidence,
+    /// The longest the action may run: its `timeout`, `None` when it names none or names
+    /// zero (the daemon then applies its own default, which the front does not know). The
+    /// scheduler reads it for the drain order and the deadlines of whole-machine requests
+    /// when those are on (`Scheduler::set_max_wall`); it is not part of the [`Request`].
+    pub max_wall: Option<Duration>,
 }
 
 /// Where an operation is, as its callers see it.
@@ -850,6 +855,7 @@ impl<D> ExecutionService<D> {
                 input_bytes,
                 input_files,
             },
+            max_wall: wall_of(&decoded),
         };
         Ok((submission, command_digest))
     }
@@ -1177,6 +1183,17 @@ fn device_kind(kind: LeaseKind, needs: &kbf_caps::Request) -> Result<(), Status>
         )));
     }
     Ok(())
+}
+
+/// How long `action` may run, from its `timeout`: `None` when it has none, when it is
+/// zero, and when it is negative (the daemon refuses such an action when it runs it).
+fn wall_of(action: &Action) -> Option<Duration> {
+    let timeout = action.timeout.as_ref()?;
+    let wall = Duration::new(
+        u64::try_from(timeout.seconds).ok()?,
+        u32::try_from(timeout.nanos).ok()?,
+    );
+    (!wall.is_zero()).then_some(wall)
 }
 
 /// The lease kind a platform names, or INVALID_ARGUMENT for one not in

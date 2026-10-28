@@ -366,6 +366,10 @@ pub struct Args {
         hide_default_value = true
     )]
     pub placement_load: crate::PlacementLoad,
+    /// Whether whole-machine requests are run with the scheduler's whole-node drain and
+    /// caps (`--whole-node-max`), and with which settings: off unless it is given.
+    #[command(flatten)]
+    pub whole_node: crate::WholeNodeFlags,
     /// How long, in seconds, a finished operation is kept after its callers are
     /// answered. Within it, WaitExecution on the operation's name streams its result
     /// (a client whose Execute stream broke gets a result the action cache does not
@@ -890,6 +894,7 @@ impl Args {
             vm_host_floor: HostFloor::new(self.vm_host_floor_cpus, self.vm_host_floor_mem_gib),
             learned_sizes: self.learned_sizes,
             placement_load: self.placement_load,
+            whole_node: self.whole_node.config(),
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {
                 0 => Duration::MAX,
