@@ -21,16 +21,28 @@ pub struct Tape {
     inner: Fake,
     clock: Arc<ManualClock>,
     lines: Mutex<Vec<String>>,
+    /// How a value is written down, given its key.
+    normalise: Normalise,
+}
+
+/// How the tape writes down the value put at a key: the bytes whose length and hash it
+/// records.
+pub type Normalise = fn(&str, &[u8]) -> Vec<u8>;
+
+/// The value as the store was given it.
+pub fn as_written(_key: &str, value: &[u8]) -> Vec<u8> {
+    value.to_vec()
 }
 
 impl Tape {
-    /// An empty store whose clock reads zero.
-    pub fn new() -> Self {
+    /// An empty store whose clock reads zero, writing values down as `normalise` says.
+    pub fn new(normalise: Normalise) -> Self {
         let clock = Arc::new(ManualClock::default());
         Self {
             inner: Fake::with_flaw(Arc::clone(&clock), Flaw::None),
             clock,
             lines: Mutex::new(Vec::new()),
+            normalise,
         }
     }
 
@@ -50,6 +62,7 @@ impl Tape {
             inner: self.inner.restart(),
             clock: self.clock,
             lines: self.lines,
+            normalise: self.normalise,
         }
     }
 
@@ -72,7 +85,7 @@ fn bytes(value: &[u8]) -> String {
     format!("len={} sha={}", value.len(), hex::encode(&hash[..8]))
 }
 
-fn op(op: &Op) -> String {
+fn op(op: &Op, normalise: Normalise) -> String {
     match op {
         Op::Put {
             key,
@@ -81,7 +94,8 @@ fn op(op: &Op) -> String {
             cond: c,
         } => {
             let ttl = ttl.map_or_else(|| "-".to_owned(), |t| format!("{}ms", t.as_millis()));
-            format!("    put {key} cond={} {} ttl={ttl}", cond(*c), bytes(value))
+            let value = bytes(&normalise(key, value));
+            format!("    put {key} cond={} {value} ttl={ttl}", cond(*c))
         }
         Op::Delete { key, cond: c } => format!("    del {key} cond={}", cond(*c)),
         Op::Check { key, cond: c } => format!("    check {key} cond={}", cond(*c)),
@@ -89,7 +103,7 @@ fn op(op: &Op) -> String {
     }
 }
 
-fn txn(txn: &Txn, applied: Option<&Result<Commit, Conflict>>) -> Vec<String> {
+fn txn(txn: &Txn, applied: Option<&Result<Commit, Conflict>>, normalise: Normalise) -> Vec<String> {
     let head = match applied {
         Some(Ok(commit)) => {
             let counters: Vec<String> = commit.counters.iter().map(u64::to_string).collect();
@@ -103,7 +117,7 @@ fn txn(txn: &Txn, applied: Option<&Result<Commit, Conflict>>) -> Vec<String> {
         None => "  txn failed".to_owned(),
     };
     std::iter::once(head)
-        .chain(txn.ops().iter().map(op))
+        .chain(txn.ops().iter().map(|one| op(one, normalise)))
         .collect()
 }
 
@@ -113,7 +127,7 @@ impl Store for Tape {
         let mut lines = self.lines();
         for (index, one) in batch.iter().enumerate() {
             let applied = result.as_ref().ok().and_then(|all| all.get(index));
-            lines.extend(txn(one, applied));
+            lines.extend(txn(one, applied, self.normalise));
         }
         result
     }

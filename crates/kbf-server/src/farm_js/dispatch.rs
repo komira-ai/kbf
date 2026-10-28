@@ -26,7 +26,7 @@ use kbf_sched::DaemonInstance;
 use kbf_types::{ActionKey, FarmTime, LeaseId, OperationId, WorkerId};
 use tonic::Status;
 
-use super::adapter::{KbfAdapter, Wall, decoded, wire_lease};
+use super::adapter::{KbfAdapter, Wall, wire_lease};
 use super::ext::KbfExt;
 use super::host::{Caller, Connection};
 use crate::action_usage::Shapes;
@@ -153,7 +153,12 @@ pub fn submit(
 /// A new ticket on the operation called `name`: through the first caller the core holds for
 /// it, if it holds the operation, and from the state store if not. `None` if `name` is not
 /// of the form `operations/<id>`, or neither the core nor the store has a trace of the
-/// operation (it never existed, or its result is past its retention).
+/// operation (it never existed, or its result is past its retention), and for one whose
+/// `done/` row cannot be read (logged and counted at each look). The by-name lookup answers
+/// not found there, unlike the callers already waiting (UNAVAILABLE, see
+/// `KbfAdapter::decoded`): a client that resumes by name and is told UNAVAILABLE retries
+/// the same name, which reads the same bytes until the result expires, while not found makes
+/// it send a fresh Execute call.
 pub fn wait(core: &Core<KbfAdapter>, name: &str) -> Option<Ticket> {
     let operation = parse_stored_name(name)?;
     let held = core.with(|view, adapter| adapter.held_ticket(view, operation));
@@ -173,7 +178,7 @@ fn stored_ticket(core: &Core<KbfAdapter>, operation: OperationId) -> Option<Tick
         _ => return None,
     };
     let stage = match progress {
-        Progress::Ended(row) => Stage::Done(decoded(&row)?),
+        Progress::Ended(row) => Stage::Done(core.with(|_, adapter| adapter.readable(&row))?),
         Progress::Running => Stage::Executing,
         Progress::Queued | Progress::Gone => Stage::Queued,
     };

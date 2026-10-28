@@ -6,9 +6,20 @@ use std::collections::BTreeMap;
 use super::*;
 use crate::scrape::Scrapes;
 
+/// The series key of a member's boot counter.
+fn boot_key(member: u32) -> String {
+    format!("{MEMBER_BOOT}{{member=\"{member}\"}}")
+}
+
 /// A scrape of the frontend: it holds no cache, so it carries no lost-blob series.
 fn sample(at: f64, execute_errors: f64) -> Sample {
-    let mut series = BTreeMap::from([(EXECUTE_ERRORS.to_owned(), execute_errors)]);
+    let mut series = BTreeMap::from([
+        (EXECUTE_ERRORS.to_owned(), execute_errors),
+        (MEMBERS_NOT_ACTIVE.to_owned(), 0.0),
+    ]);
+    for member in 1..=3 {
+        series.insert(boot_key(member), 1.0);
+    }
     for class in FAILURE_CLASSES {
         series.insert(class_key(class), 0.0);
     }
@@ -55,6 +66,7 @@ struct Run {
     whole: Result<(), String>,
     stopped: Vec<(String, String)>,
     hung: bool,
+    restarts_allowed: u32,
 }
 
 fn pass() -> Run {
@@ -73,6 +85,7 @@ fn pass() -> Run {
         whole: Ok(()),
         stopped: vec![("frontend".to_owned(), "exit 0".to_owned())],
         hung: false,
+        restarts_allowed: 0,
     }
 }
 
@@ -85,6 +98,7 @@ fn gates(run: &Run) -> Vec<Gate> {
         farm_whole: &run.whole,
         stopped: &run.stopped,
         hung: run.hung,
+        restarts_allowed: run.restarts_allowed,
         load: (
             "2026-10-18T00:00:00Z".to_owned(),
             "2026-10-18T00:00:10Z".to_owned(),
@@ -124,7 +138,7 @@ fn a_healthy_run_passes_every_gate() {
     let run = pass();
     assert_eq!(failed(&run), Vec::<String>::new());
     assert!(all_pass(&gates(&run)));
-    assert_eq!(gates(&run).len(), 12);
+    assert_eq!(gates(&run).len(), 14);
 }
 
 #[test]
@@ -538,6 +552,7 @@ fn a_load_of_no_time_has_no_scrape_coverage() {
         farm_whole: &run.whole,
         stopped: &run.stopped,
         hung: false,
+        restarts_allowed: 0,
         load: (String::new(), String::new()),
         load_secs: 0.0,
         stop: (String::new(), String::new()),
@@ -721,6 +736,12 @@ fn broken(name: &str) -> Run {
         "clean_stop" => run
             .stopped
             .push(("daemon-1".to_owned(), "exit 1".to_owned())),
+        "members_down_at_most_one" => {
+            run.scrapes.samples[5]
+                .series
+                .insert(MEMBERS_NOT_ACTIVE.to_owned(), 2.0);
+        }
+        "member_restarts" => boots_from(&mut run, 2, 6, 2.0),
         "hang" => run.hung = true,
         other => panic!("gate {other} has no failing case: add it to `broken`"),
     }
@@ -740,7 +761,112 @@ fn every_gate_has_a_case_that_fails_it_alone() {
         assert_eq!(failed(&broken(name)), [name.as_str()], "{name}");
         assert!(seen.insert(name.clone()), "{name} is listed twice");
     }
-    assert_eq!(names.len(), 12);
+    assert_eq!(names.len(), 14);
+}
+
+/// Sets member `member`'s boot to `boot` from scrape `from` on.
+fn boots_from(run: &mut Run, member: u32, from: usize, boot: f64) {
+    for sample in &mut run.scrapes.samples[from..] {
+        sample.series.insert(boot_key(member), boot);
+    }
+}
+
+/// Asserts that one member out of `ACTIVE` is allowed and two are not, in any one scrape,
+/// the first included. Catches: a threshold of zero (a planned single restart read as a
+/// failure), a gate that reads only the last scrape (two down in the middle of the load,
+/// none at the end), and one that sums a scrape's count with another's.
+#[test]
+fn two_members_down_at_once_in_any_scrape_is_red_and_one_is_not() {
+    let mut run = pass();
+    for sample in &mut run.scrapes.samples {
+        sample.series.insert(MEMBERS_NOT_ACTIVE.to_owned(), 1.0);
+    }
+    assert_eq!(failed(&run), Vec::<String>::new());
+    for scrape in [0, 5, 9] {
+        let mut run = pass();
+        run.scrapes.samples[scrape]
+            .series
+            .insert(MEMBERS_NOT_ACTIVE.to_owned(), 2.0);
+        assert_eq!(
+            failed(&run),
+            ["members_down_at_most_one"],
+            "scrape {scrape}"
+        );
+    }
+}
+
+/// Asserts that the gate fails closed on a missing count, in the first scrape and a later
+/// one. Catches: an unreadable membership (the series is then not exported) read as no
+/// member down.
+#[test]
+fn an_absent_member_count_fails_the_down_gate() {
+    for scrape in [0, 7] {
+        let mut run = pass();
+        run.scrapes.samples[scrape]
+            .series
+            .remove(MEMBERS_NOT_ACTIVE);
+        assert_eq!(
+            failed(&run),
+            ["members_down_at_most_one"],
+            "scrape {scrape}"
+        );
+    }
+}
+
+/// Asserts that a restart is a rise of the member's boot, that the number allowed is
+/// per member and inclusive, and that two restarts of one member are two. Catches: a
+/// gate that counts members that restarted instead of restarts, an off-by-one at the
+/// allowance, a rise of two read as one.
+#[test]
+fn a_restart_is_a_rise_of_the_boot_and_the_allowance_is_per_member() {
+    let mut run = pass();
+    boots_from(&mut run, 2, 4, 2.0);
+    assert_eq!(failed(&run), ["member_restarts"]);
+    run.restarts_allowed = 1;
+    assert_eq!(failed(&run), Vec::<String>::new());
+    boots_from(&mut run, 2, 8, 3.0);
+    assert_eq!(failed(&run), ["member_restarts"]);
+    let detail = detail(&run, "member_restarts");
+    assert!(detail.contains("most of any member"), "{detail}");
+    // One restart each of two members is still one per member.
+    let mut run = pass();
+    run.restarts_allowed = 1;
+    boots_from(&mut run, 1, 3, 2.0);
+    boots_from(&mut run, 3, 6, 2.0);
+    assert_eq!(failed(&run), Vec::<String>::new());
+}
+
+/// Asserts that a member missing from a scrape, a boot that falls, a boot that is not a
+/// finite number, no boot series at all and too few scrapes each fail the gate. Catches: a
+/// member that vanished (and so shows no restart) passing, a reset read as no growth.
+#[test]
+fn a_boot_series_that_cannot_be_read_fails_the_restart_gate() {
+    let mut run = pass();
+    run.scrapes.samples[7].series.remove(&boot_key(2));
+    assert_eq!(failed(&run), ["member_restarts"]);
+    assert!(detail(&run, "member_restarts").contains("absent from scrape 7"));
+
+    let mut run = pass();
+    boots_from(&mut run, 1, 0, 3.0);
+    boots_from(&mut run, 1, 5, 2.0);
+    assert_eq!(failed(&run), ["member_restarts"]);
+    assert!(detail(&run, "member_restarts").contains("went down"));
+
+    let mut run = pass();
+    boots_from(&mut run, 1, 4, f64::NAN);
+    assert_eq!(failed(&run), ["member_restarts"]);
+    assert!(detail(&run, "member_restarts").contains("not a finite number"));
+
+    let mut run = pass();
+    for sample in &mut run.scrapes.samples {
+        sample.series.retain(|key, _| !key.starts_with(MEMBER_BOOT));
+    }
+    assert_eq!(failed(&run), ["member_restarts"]);
+    assert!(detail(&run, "member_restarts").contains("absent from scrape 0"));
+
+    let mut run = pass();
+    run.scrapes.samples.truncate(1);
+    assert!(failed(&run).contains(&"member_restarts".to_owned()));
 }
 
 #[test]

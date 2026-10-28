@@ -46,6 +46,7 @@ fn member(id: u64, state: MemberState, report: Option<Report>) -> MemberReport {
     MemberReport {
         id: MemberId(id),
         state,
+        boot: 1,
         planned: kbf_server::storage_health::Planned::No,
         report,
     }
@@ -463,7 +464,8 @@ fn the_scrape_has_a_sample_per_member_only_for_what_is_known() {
     }
 
     let nothing = scrape(&[member(1, MemberState::Active, None)]);
-    assert!(!nothing.contains("kbf_member_"), "{nothing}");
+    assert!(!nothing.contains("kbf_member_repair_debts"), "{nothing}");
+    assert!(!nothing.contains("kbf_member_open_writes"), "{nothing}");
     let mut unreadable = String::new();
     render(&mut unreadable, None);
     assert!(!unreadable.contains("kbf_member_"), "{unreadable}");
