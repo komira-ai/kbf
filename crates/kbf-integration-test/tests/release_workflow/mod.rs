@@ -19,9 +19,10 @@
 //!   for a successful pipeline run and the run's own for any other (a cancelled or red pipeline
 //!   run starts this workflow too, to skip it, and must not replace a release waiting in the
 //!   group), and it never cancels.
-//! - **The gamma stage.** `gamma` needs `plan` and `publish` (it runs after the release is
-//!   published), holds `contents: read` and `id-token: write` and no secret, and reads the
-//!   coordinator's address from the repository variable `KBF_COORDINATOR_URL` alone: no address
+//! - **The gamma stage.** `gamma` needs `plan`, `publish`, `rehearse` and `rehearse-agent` (it
+//!   runs after the release is published and a host has been updated to it, by the helper alone
+//!   and through the coordinator and the agent), holds `contents: read` and `id-token: write`
+//!   and no secret, and reads the coordinator's address from the repository variable `KBF_COORDINATOR_URL` alone: no address
 //!   is written in the file and no other job reads the variable ([`COORDINATOR_URL_VAR`]). Its one
 //!   `deploy-farm` step is given the release's version and that address, and has no `if:` (an
 //!   unset variable is a notice from the verb, not a skipped step). It may join a Tailscale
@@ -65,6 +66,10 @@ const PUBLISH: &str = "publish";
 
 /// The job that sets the published release as the farm's desired version and waits.
 const GAMMA: &str = "gamma";
+/// The update rehearsal, which `gamma` needs.
+const REHEARSE: &str = "rehearse";
+/// The update rehearsal of the agent and the coordinator, which `gamma` needs too.
+const REHEARSE_AGENT: &str = "rehearse-agent";
 
 /// The repository variable that holds the coordinator's address, and the one environment
 /// variable of `gamma` it is read into.
@@ -105,7 +110,17 @@ const TS_WITH: [(&str, &str); 3] = [
 ];
 
 /// The jobs, in file order.
-const JOBS: [&str; 7] = ["plan", "verify", "tag", "notes", PUBLISH, "bump", GAMMA];
+const JOBS: [&str; 9] = [
+    "plan",
+    "verify",
+    "tag",
+    "notes",
+    PUBLISH,
+    "bump",
+    REHEARSE,
+    REHEARSE_AGENT,
+    GAMMA,
+];
 
 /// The events that start the workflow: the completion of a run of [`PIPELINE`], filtered to
 /// [`TYPES`] and `branches: [main]`, and only while [`CHAIN`] is whole.
@@ -165,7 +180,7 @@ const READ: &[(&str, &str)] = &[
     ("attestations", "read"),
 ];
 
-const RULES: [Rule; 7] = [
+const RULES: [Rule; 9] = [
     Rule {
         job: "plan",
         needs: &[],
@@ -209,8 +224,22 @@ const RULES: [Rule; 7] = [
         environment: Some(ENVIRONMENT),
     },
     Rule {
-        job: GAMMA,
+        job: REHEARSE,
         needs: &["plan", PUBLISH],
+        permissions: &[("contents", "read")],
+        condition: Some(RELEASE_IF),
+        environment: None,
+    },
+    Rule {
+        job: REHEARSE_AGENT,
+        needs: &["plan", PUBLISH],
+        permissions: &[("contents", "read")],
+        condition: Some(RELEASE_IF),
+        environment: None,
+    },
+    Rule {
+        job: GAMMA,
+        needs: &["plan", PUBLISH, REHEARSE, REHEARSE_AGENT],
         permissions: &[("contents", "read"), ("id-token", "write")],
         condition: Some(RELEASE_IF),
         environment: Some(ENVIRONMENT),

@@ -144,4 +144,8 @@ impl SimHost for RealSimHost {
     fn pause(&self, d: Duration) {
         self.host.pause(d);
     }
+
+    fn read_file(&self, path: &str, cap: usize) -> Result<Vec<u8>, String> {
+        read_regular(Path::new(path), cap)
+    }
 }

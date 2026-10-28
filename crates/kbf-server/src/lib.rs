@@ -128,6 +128,7 @@ pub mod replication;
 pub mod retire;
 pub mod retired;
 mod run_record;
+pub mod scheduler_core;
 pub mod sequence;
 pub mod serve;
 #[cfg(test)]
@@ -177,6 +178,7 @@ pub use learned::LearnedSizes;
 pub use local::LocalStore;
 pub use node_map::NodeMap;
 pub use raft_log::{RaftLogError, RaftMetaLog};
+pub use scheduler_core::SchedulerCore;
 pub use serve::{
     Api, Behind, Bound, BoundStorage, Listeners, ServeError, StorageListener, StreamTiming,
     WorkerTls, bind_server, bind_server_with_api, bind_server_with_map, bind_server_with_policy,

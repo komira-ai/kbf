@@ -286,14 +286,16 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
-  # The state store's Postgres backend against a real server in a service container,
-  # pinned by digest (postgres 17.9): the conformance suite C1 to C8, the defects it must
-  # reject, the startup refusal of a server that does not flush commits, and the claim
-  # path (crates/kbf-state/tests/postgres_conformance.rs), then the server over it
-  # (crates/kbf-server/tests/state_store_postgres.rs and the `over_postgres` restart tests).
-  # The workspace jobs (test-x86, test-arm and ci.yml's test) run these tests too, each on a
-  # server of their own; this job is kept because release/stages.yml lists it as a gate, and
-  # it clippy-lints kbf-state with its feature on. The password is a throwaway for this
+  # The state store's Postgres backend, seen from kbf, against a real server in a service
+  # container pinned by digest (postgres 17.9). The store itself (the conformance suite C1 to
+  # C8, the defects it must reject, the startup refusal of a server that does not flush
+  # commits, the claim path and the write-rate measurement) lives in the jobscheduler
+  # repository as js-state, and its Postgres suite runs in that repository's CI at the revision
+  # this workspace pins. This job covers kbf's consumers over that backend: the pack index, the
+  # installer's setup, the server (crates/kbf-server/tests/state_store_postgres.rs and the
+  # `over_postgres` restart tests), the cli and the state copy. The workspace jobs (test-x86,
+  # test-arm and ci.yml's test) run these tests too, each on a server of their own; this job is
+  # kept because release/stages.yml lists it as a gate. The password is a throwaway for this
   # container, which lives only for this job.
   state-postgres:
     runs-on: ubuntu-latest
@@ -326,9 +328,10 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      - run: cargo clippy -p kbf-state --features postgres --all-targets --locked -- -D warnings
-      # The write-rate measurement (tests/postgres_write_rate.rs) is read by a person, not a gate.
-      - run: cargo test -p kbf-state --features postgres --locked -- --include-ignored --skip the_write_rate_of_one_two_and_three_frontends
+      # The pack index over a real schema: its conformance suite, the migration identity and an
+      # existing database the earlier runner left (crates/kbf-pack-index/tests).
+      - run: cargo clippy -p kbf-pack-index --all-features --all-targets --locked -- -D warnings
+      - run: cargo test -p kbf-pack-index --all-features --locked -- --include-ignored
       # The installer's `setup` and update step over a real schema (crates/kbf-setup/src/database_tests.rs).
       - run: 'cargo test -p kbf-setup --features proxy --locked --lib -- --include-ignored database:: setup_creates_the_schema'
       - run: 'cargo test -p kbf-installer --locked --lib --test binary -- --include-ignored database:: setup_creates_the_schema'
@@ -563,9 +566,9 @@ jobs:
       - run: uname -m
       - run: sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
       - run: cargo build -p kbf-node --bin kbf-daemon --locked
-      # Not the tests named `database::` (crates/kbf-testkit/tests/database.rs): they make
-      # databases on a Postgres server, which a hosted Mac has not.
-      - run: 'cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node -p kbf-testkit --locked -- --skip database::'
+      # kbf-testkit has no tests of its own now (it re-exports js-testkit, whose database tests
+      # run in the jobscheduler repository's CI).
+      - run: 'cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node --locked'
       # `kbf daemon --driver native` started with the words the Mac's launchd unit
       # writes, against a fake front, and the helpers it re-runs itself as (each action's
       # keeper, the lease-user pool's `as-user` step) through the `kbf` binary

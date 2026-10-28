@@ -177,7 +177,8 @@ fn server_attempt(rec: &Rec) -> Attempt {
         Outcome::Failed(Failure::OutOfMemory)
     } else {
         Outcome::Completed {
-            action_result: kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [1; 32], 1),
+            action_result: kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [1; 32], 1)
+                .into(),
         }
     };
     let (basis, mut run) = run_of(outcome, Some(&rec.usage()), rec.booked).expect("a run");

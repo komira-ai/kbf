@@ -104,7 +104,11 @@ fn stable() -> Channel {
 }
 
 fn tarball_name(commit: &str) -> String {
-    format!("kbf-{commit}-linux-{}.tar.gz", arch_name())
+    named_tarball("kbf", commit)
+}
+
+fn named_tarball(prefix: &str, commit: &str) -> String {
+    format!("{prefix}-{commit}-linux-{}.tar.gz", arch_name())
 }
 
 fn bundle_name(commit: &str) -> String {
@@ -365,22 +369,26 @@ impl Rig {
 
     /// The channel's GitHub offers release `commit` with this tarball.
     fn offer(&self, commit: &str, tar: &[u8]) {
+        self.offer_as("kbf", commit, tar);
+    }
+
+    /// [`Rig::offer`] for a release whose files' names start with `prefix`.
+    fn offer_as(&self, prefix: &str, commit: &str, tar: &[u8]) {
         let tag = format!("v-{}", &commit[..8]);
+        let (tarball, bundle) = (
+            named_tarball(prefix, commit),
+            format!("{}.sigstore.json", named_tarball(prefix, commit)),
+        );
         let assets = format!(
-            "{{\"name\":\"{}\",\"size\":{}}},{{\"name\":\"{}\",\"size\":30}}",
-            tarball_name(commit),
-            tar.len(),
-            bundle_name(commit)
+            "{{\"name\":\"{tarball}\",\"size\":{}}},{{\"name\":\"{bundle}\",\"size\":30}}",
+            tar.len()
         );
         let release = format!("{{\"tag_name\":\"{tag}\",\"draft\":false,\"assets\":[{assets}]}}");
         let mut net = self.net.borrow_mut();
         net.pages = vec![format!("[{release}]")];
         let files = net.assets.entry(tag).or_default();
-        files.insert(tarball_name(commit), tar.to_vec());
-        files.insert(
-            bundle_name(commit),
-            b"{\"mediaType\":\"bundle\"}\n".to_vec(),
-        );
+        files.insert(tarball, tar.to_vec());
+        files.insert(bundle, b"{\"mediaType\":\"bundle\"}\n".to_vec());
     }
 
     fn root(&self) -> PathBuf {
@@ -508,6 +516,183 @@ fn a_release_is_fetched_verified_and_laid_out_beside_the_running_one() {
         0,
         "the scratch is gone"
     );
+}
+
+const OTHER_REPO: &str = "owner/other";
+const OTHER_WORKFLOW: &str = "owner/other/.github/workflows/release.yml";
+
+/// The channels file of a `stable` channel for the repository `owner/other`, with
+/// `trusted` as the file's `trusted_workflows` (none: the key is absent).
+fn other_channels(trusted: Option<&[&str]>) -> String {
+    let list = trusted.map_or_else(String::new, |names| {
+        let quoted: Vec<String> = names.iter().map(|n| format!("\"{n}\"")).collect();
+        format!("trusted_workflows = [{}]\n", quoted.join(", "))
+    });
+    format!(
+        "{list}[channels.stable]\nsource = \"github\"\nrepository = \"{OTHER_REPO}\"\nsigner_workflow = \"{OTHER_WORKFLOW}\"\nartifact_prefix = \"other\"\n"
+    )
+}
+
+/// The arguments of the `i`th spawn of the installer's runner.
+fn spawn_args(rig: &Rig, i: usize) -> Vec<String> {
+    rig.installer.borrow()[i]
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn flag_value(args: &[String], flag: &str) -> String {
+    args[args.iter().position(|a| a == flag).unwrap() + 1].clone()
+}
+
+/// A channel for a repository other than kbf's is read, and refused when it is used, unless the
+/// same file lists its workflow in `trusted_workflows`. The refusal is
+/// `channel_not_allowed`, its words name the channel, the workflow and the key, and nothing is
+/// fetched, run or left behind. A list that names other workflows (another repository's, or another file of this one) does not help.
+#[test]
+fn a_channel_of_another_repository_is_refused_unless_the_file_trusts_it() {
+    for trusted in [
+        None,
+        Some(&[][..]),
+        Some(
+            &[
+                "owner/unrelated/.github/workflows/release.yml",
+                "owner/other/.github/workflows/other.yml",
+            ][..],
+        ),
+    ] {
+        let rig = Rig::new("untrusted-repo");
+        put(&rig.dir.join("releases.toml"), other_channels(trusted));
+        let fault = rig.stage().unwrap_err();
+        assert!(refused(Code::ChannelNotAllowed)(&fault), "{fault:?}");
+        for word in ["stable", OTHER_REPO, "trusted_workflows"] {
+            assert!(fault.detail.contains(word), "{word}: {}", fault.detail);
+        }
+        assert!(rig.calls.borrow().is_empty(), "nothing was fetched");
+        assert!(rig.installer.borrow().is_empty(), "nothing was attested");
+        rig.assert_nothing_installed();
+    }
+}
+
+/// A channel for a trusted repository lists that repository's releases, downloads from it,
+/// takes the files under the channel's prefix and has the installer's `gh attestation verify`
+/// name that repository and workflow, once: kbf's former name is not tried for it. Every other
+/// rule is the channel's as before: the branch, the full commit, hosted runners.
+#[test]
+fn a_trusted_channel_is_listed_downloaded_and_attested_under_its_own_names() {
+    let rig = Rig::new("trusted-repo");
+    put(
+        &rig.dir.join("releases.toml"),
+        other_channels(Some(&[OTHER_WORKFLOW])),
+    );
+    rig.offer_as("other", COMMIT, &tar_gz(&[file("kbf", &binary("b"))]));
+    assert_eq!(rig.stage().unwrap(), COMMIT);
+
+    let calls = rig.calls.borrow();
+    let listing = calls.iter().find(|c| c.program.ends_with("curl")).unwrap();
+    assert_eq!(
+        listing.args.last().unwrap(),
+        "https://api.github.com/repos/owner/other/releases?per_page=100&page=1"
+    );
+    let download = calls
+        .iter()
+        .find(|c| c.args.first().map(String::as_str) == Some("release"))
+        .unwrap();
+    assert_eq!(flag_value(&download.args, "--repo"), OTHER_REPO);
+    assert!(download.args.contains(&named_tarball("other", COMMIT)));
+    assert!(
+        download
+            .args
+            .contains(&format!("{}.sigstore.json", named_tarball("other", COMMIT)))
+    );
+    assert!(!download.args.contains(&tarball_name(COMMIT)));
+
+    assert_eq!(
+        rig.installer.borrow().len(),
+        2,
+        "one attestation, one probe"
+    );
+    let verify = spawn_args(&rig, 0);
+    assert_eq!(flag_value(&verify, "--repo"), OTHER_REPO);
+    assert_eq!(flag_value(&verify, "--signer-workflow"), OTHER_WORKFLOW);
+    assert_eq!(flag_value(&verify, "--source-digest"), COMMIT);
+    assert_eq!(flag_value(&verify, "--source-ref"), "refs/heads/main");
+    assert!(verify.contains(&"--deny-self-hosted-runners".to_owned()));
+}
+
+/// A release that kbf's workflow attested is not one a channel of another repository accepts:
+/// `gh` is asked once, for that repository, and its refusal is the channel's `verify_failed`.
+/// For a channel without the new keys it is asked twice, kbf's name and its former one.
+#[test]
+fn kbfs_former_name_is_accepted_for_kbfs_channel_only() {
+    let rig = Rig::new("former-name");
+    *rig.gh_exit.borrow_mut() = 1;
+    let fault = rig.stage().unwrap_err();
+    assert!(refused(Code::VerifyFailed)(&fault), "{fault:?}");
+    let repos: Vec<String> = (0..rig.installer.borrow().len())
+        .map(|i| flag_value(&spawn_args(&rig, i), "--repo"))
+        .collect();
+    assert_eq!(repos, ["komira-ai/kbf", "komira-ai/komira-build-farm"]);
+
+    let rig = Rig::new("former-name-other");
+    put(
+        &rig.dir.join("releases.toml"),
+        other_channels(Some(&[OTHER_WORKFLOW])),
+    );
+    rig.offer_as("other", COMMIT, &tar_gz(&[file("kbf", &binary("b"))]));
+    *rig.gh_exit.borrow_mut() = 1;
+    let fault = rig.stage().unwrap_err();
+    assert!(refused(Code::VerifyFailed)(&fault), "{fault:?}");
+    assert_eq!(rig.installer.borrow().len(), 1);
+    assert_eq!(flag_value(&spawn_args(&rig, 0), "--repo"), OTHER_REPO);
+}
+
+/// A repository or workflow that is not safe is refused as `config_invalid` before anything
+/// runs, and so is a prefix on a channel whose file names are fixed.
+#[test]
+fn a_bad_repository_or_workflow_in_the_channels_file_is_config_invalid() {
+    let good = format!(
+        "trusted_workflows = [\"{OTHER_WORKFLOW}\"]\n[channels.stable]\nsource = \"github\"\nrepository = \"{OTHER_REPO}\"\nsigner_workflow = \"{OTHER_WORKFLOW}\"\n"
+    );
+    for (why, text) in [
+        (
+            "a repository with a space",
+            good.replace(
+                &format!("repository = \"{OTHER_REPO}\""),
+                "repository = \"owner/o ther\"",
+            ),
+        ),
+        (
+            "an option as repository",
+            good.replace(
+                &format!("repository = \"{OTHER_REPO}\""),
+                "repository = \"--x/y\"",
+            ),
+        ),
+        (
+            "a workflow of another repository",
+            good.replace(OTHER_WORKFLOW, "owner/else/.github/workflows/release.yml"),
+        ),
+        (
+            "a workflow outside the workflows directory",
+            good.replace(OTHER_WORKFLOW, "owner/other/.github/release.yml"),
+        ),
+        (
+            "a trusted entry that is no repository",
+            good.replace(&format!("[\"{OTHER_WORKFLOW}\"]"), "[\"other\"]"),
+        ),
+        (
+            "an unknown key",
+            good.replace("source = \"github\"", "source = \"github\"\nsigner = \"x\""),
+        ),
+    ] {
+        let rig = Rig::new("bad-repo");
+        put(&rig.dir.join("releases.toml"), text);
+        let fault = rig.stage().unwrap_err();
+        assert!(refused(Code::ConfigInvalid)(&fault), "{why}: {fault:?}");
+        assert!(rig.calls.borrow().is_empty(), "{why}");
+    }
 }
 
 /// A channel's token file is read as root's, and goes to the listing on its standard input and

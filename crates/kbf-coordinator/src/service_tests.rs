@@ -2,14 +2,15 @@ use std::sync::Arc;
 
 use kbf_oidc::testkit::{STATIC_ISSUER, good_claims, keys, mint, mint_with, static_verifier};
 use kbf_types::HostRole;
-use kbf_updater::wire::Reply;
+use kbf_updater::wire::{Outcome, Reply};
 use serde_json::json;
 
 use crate::converge::State;
 use crate::desired::DesiredStore;
+use crate::fleet::ORDER_AGE;
 use crate::identity::Identity;
 use crate::service::{CiRefused, Coordinator, SetError, Unauthorized};
-use crate::testutil::{OPERATOR, Rig, beat, ci_token, clock_of, id, updating, version};
+use crate::testutil::{OPERATOR, Rig, beat, ci_token, clock_of, id, last, updating, version};
 
 const STATE: &str = r#"{"version":"2.0","max_updating":{"daemon":1},
     "min_up":{"storage":1,"frontend":1}}"#;
@@ -349,4 +350,193 @@ async fn the_convergence_follows_the_heartbeats() {
         .find(|r| r.role == "daemon")
         .expect("daemon");
     assert_eq!(daemons.at_desired, 1);
+}
+
+// ---- an order holds its slot until the host reports ------------------------------------
+
+const ONE_STORAGE: &str = r#"{"version":"2.0","max_updating":{"storage":1},
+    "min_up":{"storage":1,"frontend":1}}"#;
+
+/// Two storage hosts may update at once; the minimum up is one.
+const TWO_STORAGE: &str = r#"{"version":"2.0","max_updating":{"storage":2},
+    "min_up":{"storage":1,"frontend":1}}"#;
+
+fn storage(name: &str) -> Identity {
+    who(name, HostRole::Storage)
+}
+
+/// A rig past the quiet start with `state` set.
+async fn started(name: &str, state: &str) -> Rig {
+    let rig = Rig::new(name);
+    rig.at(2_000);
+    rig.set(state).await;
+    rig.at(2_100);
+    rig
+}
+
+/// Catches: the limit counted only from heartbeats, so every host that beats before the
+/// ordered one reports is ordered too (four of six storage hosts restarted within seconds
+/// with a limit of one).
+#[tokio::test]
+async fn hosts_that_beat_before_the_ordered_one_reports_are_not_ordered() {
+    let rig = started("svc-order-one", ONE_STORAGE).await;
+    let c = &rig.coordinator;
+    let replies: Vec<Reply> = ["s1", "s2", "s3"]
+        .iter()
+        .map(|h| c.heartbeat(storage(h), beat("1.0")))
+        .collect();
+    assert_eq!(replies, [Reply::Nothing, update("2.0"), Reply::Nothing]);
+    assert_eq!(c.heartbeat(storage("s1"), beat("1.0")), Reply::Nothing);
+    assert_eq!(c.heartbeat(storage("s3"), beat("1.0")), Reply::Nothing);
+}
+
+/// Catches: the slot freeing before the host is done, or never freeing: it is held while the
+/// host reports updating, and the next host is ordered once it reports the new version.
+#[tokio::test]
+async fn the_slot_frees_when_the_ordered_host_is_done() {
+    let rig = started("svc-order-done", ONE_STORAGE).await;
+    let c = &rig.coordinator;
+    c.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    c.heartbeat(storage("s2"), updating(beat("1.0"), "2.0"));
+    assert_eq!(c.heartbeat(storage("s3"), beat("1.0")), Reply::Nothing);
+    let done = last(beat("2.0"), "2.0", Outcome::Succeeded);
+    c.heartbeat(storage("s2"), done);
+    assert_eq!(c.heartbeat(storage("s3"), beat("1.0")), update("2.0"));
+}
+
+/// Catches: a failed update leaving the order holding the slot after the host said so, when
+/// it is healthy again it is the failure rule that holds the slot, not the order.
+#[tokio::test]
+async fn a_failed_report_ends_the_order() {
+    let rig = started("svc-order-failed", ONE_STORAGE).await;
+    let c = &rig.coordinator;
+    c.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    c.heartbeat(storage("s2"), last(beat("1.0"), "2.0", Outcome::Failed));
+    assert_eq!(
+        c.heartbeat(storage("s3"), beat("1.0")),
+        update("2.0"),
+        "s2 is healthy and failed: it holds no slot and is up, and its order is over"
+    );
+}
+
+/// Catches: an order for a host that never reports holding its slot for ever.
+#[tokio::test]
+async fn an_order_nobody_reports_ages_out() {
+    let rig = started("svc-order-age", ONE_STORAGE).await;
+    let c = &rig.coordinator;
+    let age = ORDER_AGE.as_secs();
+    c.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    rig.at(2_100 + age - 1);
+    // Both beat afresh, so neither is down: only the order can refuse them.
+    assert_eq!(c.heartbeat(storage("s1"), beat("1.0")), Reply::Nothing);
+    assert_eq!(c.heartbeat(storage("s3"), beat("1.0")), Reply::Nothing);
+    rig.at(2_100 + age);
+    assert_eq!(c.heartbeat(storage("s1"), beat("1.0")), update("2.0"));
+}
+
+/// Catches: the minimum of hosts up counted from heartbeats alone: with room for two
+/// updates and one host that must stay up, the host that was just ordered is not up, so the
+/// other is not ordered.
+#[tokio::test]
+async fn an_ordered_host_is_not_counted_as_up() {
+    let rig = started("svc-order-min-up", TWO_STORAGE).await;
+    let c = &rig.coordinator;
+    c.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    assert_eq!(c.heartbeat(storage("s1"), beat("1.0")), Reply::Nothing);
+}
+
+/// Catches: a host that asks again before it reports (it did not hear the reply) being
+/// refused, or its own order counting against it, or the repeat taking a second slot: it is
+/// told the same again, and the others still wait.
+#[tokio::test]
+async fn a_host_that_asks_again_is_told_the_same_order() {
+    let rig = started("svc-order-again", ONE_STORAGE).await;
+    let c = &rig.coordinator;
+    c.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    assert_eq!(c.heartbeat(storage("s3"), beat("1.0")), Reply::Nothing);
+    c.heartbeat(storage("s2"), updating(beat("1.0"), "2.0"));
+    assert_eq!(
+        c.heartbeat(storage("s2"), updating(beat("1.0"), "2.0")),
+        Reply::Nothing
+    );
+}
+
+/// Catches: a re-beating host extending its own hold (the order time must stay the first
+/// one), and Fleet::order restarting the clock on an order for the same target.
+#[tokio::test]
+async fn a_repeat_does_not_extend_the_hold() {
+    let rig = started("svc-order-keep-time", ONE_STORAGE).await;
+    let c = &rig.coordinator;
+    let age = ORDER_AGE.as_secs();
+    c.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    rig.at(2_100 + age - 1);
+    c.heartbeat(storage("s1"), beat("1.0"));
+    c.heartbeat(storage("s3"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    rig.at(2_100 + age);
+    assert_eq!(
+        c.heartbeat(storage("s1"), beat("1.0")),
+        update("2.0"),
+        "the order was given at the first ask; the repeat did not move it"
+    );
+}
+
+/// Catches: the operator status reading heartbeats alone, so it shows an ordered host as up
+/// and not holding a slot while the coordinator refuses others because of it.
+#[tokio::test]
+async fn the_status_shows_an_ordered_host_as_holding_a_slot() {
+    let rig = started("svc-order-status", ONE_STORAGE).await;
+    let c = &rig.coordinator;
+    c.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    let status = c.status(Some(OPERATOR)).expect("status");
+    let of = |n: &str| status.hosts.iter().find(|h| h.node_id == n).expect("host");
+    assert!(of("s2").holds_slot && !of("s2").up);
+    assert!(!of("s1").holds_slot && of("s1").up);
+}
+
+/// Catches: any failure report ending an order: a host that reports an older update to a
+/// different version as failed, while still at the old version and not yet updating to the
+/// ordered one, has not reported the order, so it still holds its slot.
+#[tokio::test]
+async fn a_failure_for_another_target_does_not_end_the_order() {
+    let rig = started("svc-order-other-failure", ONE_STORAGE).await;
+    let c = &rig.coordinator;
+    c.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    c.heartbeat(storage("s2"), last(beat("1.0"), "1.5", Outcome::Failed));
+    assert_eq!(
+        c.heartbeat(storage("s3"), beat("1.0")),
+        Reply::Nothing,
+        "s2's report is about 1.5; its order for 2.0 still holds the slot"
+    );
+}
+
+/// Catches: a new desired version leaving the host's old order in place: the host is
+/// ordered to the new version, the order is dated from then (not from the first), and it
+/// holds the slot until it ages out from that time.
+#[tokio::test]
+async fn an_order_for_a_new_version_replaces_the_old_one() {
+    let rig = started("svc-order-replaced", ONE_STORAGE).await;
+    let c = &rig.coordinator;
+    let age = ORDER_AGE.as_secs();
+    c.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    rig.at(2_100 + age - 20);
+    rig.set(&ONE_STORAGE.replace("2.0", "3.0")).await;
+    c.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("3.0"));
+    rig.at(2_100 + age);
+    assert_eq!(
+        c.heartbeat(storage("s1"), beat("1.0")),
+        Reply::Nothing,
+        "the first order would have aged out by now; the one for 3.0 has not"
+    );
 }

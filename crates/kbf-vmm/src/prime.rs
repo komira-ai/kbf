@@ -14,8 +14,23 @@
 //! password; `kbf_guest::mkuser_audit`; informational, it never changes the verdict), and what to run next. A clone of the base made afterwards boots into the
 //! user's session.
 //!
-//! Run on a base whose user is ready already, the guest says so and stays up; the host then
-//! shuts it down at once.
+//! The same boot also runs the simulator's root setup, so that no clone repeats it: the guest's
+//! `mkuser` steps `xcode-select`, `license`, `first-launch` and each runtime's add or import
+//! come before the ready marker, and `primed.json` records them (`kbf_guest::sim_primed`). They
+//! are steps like the user's, so they are in `steps` and `problems` of the report, and a
+//! failed one leaves no ready marker. Their time counts against `--deadline-secs`.
+//!
+//! The guest runs the root setup only in this boot, and only when the host says so: the
+//! base's disk, and so every clone's, is the same and the daemon runs in every boot, so the
+//! daemon asks the host over the results channel (vsock) whether this is the priming boot. The
+//! host's sink answers `yes` only while this run's results directory holds a marker that
+//! `prime` makes before the start and removes on every way out (a drop guard); any other host answers no. Run
+//! on a base whose user is ready already and whose root setup is done, the guest says so and
+//! stays up; the host then shuts it down at once. The host asked for the setup, so a summary
+//! that does not say `root_setup` was `done` or `not_needed` (the guest got no yes, or is too
+//! old to say) is an error, never a success, and `summary.signal` says what the question got.
+//! When the user is ready but the root setup is not (a base primed earlier, or restaged
+//! since), the guest runs those steps alone and powers off. A clone's boot of such a base leaves them to `sim`.
 //!
 //! The base is changed by this run (a user is added to its disk): it is the one verb of the
 //! probes that writes to the base. A run that did not end in a power-off may leave the
@@ -23,11 +38,12 @@
 //! daemon's steps again (it is idempotent).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use kbf_guest::mkuser::{FRAME_PREFIX, MkUserSummary, SHUTDOWN_NAME, SUMMARY_NAME};
 use kbf_guest::mkuser_audit::{AUDIT_NAME, AuditFrame};
+use kbf_guest::mkuser_prime::RootSetup;
 use kbf_guest::sim::{Status, StepFrame};
 use serde_json::{Value, json};
 
@@ -42,7 +58,7 @@ use crate::spec::VmSpec;
 const PROBE: &str = "image-prime";
 /// How long the guest has, by default, to create its user and power off (the flag
 /// `--deadline-secs` sets it).
-pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(20 * 60);
+pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(60 * 60);
 /// The directory in the base the frames are collected into (`<name>-results` of
 /// [`guest::prepare_share`] for the name `prime`).
 pub const RESULTS_DIR: &str = "prime-results";
@@ -152,6 +168,26 @@ fn is_power_off(ended: &str) -> bool {
 fn remove_share(ctx: &Ctx<'_>) {
     for suffix in ["-share", "-tagged"] {
         guest::remove_leftover(&ctx.work.join(format!("prime{suffix}")));
+    }
+}
+
+/// Marks this run as the priming one in the results directory (which only the host can
+/// write): the sink answers the guest's question `yes` while the marker is there.
+/// The mark is taken away when the returned guard is dropped: on every way out of `prime`
+/// (a start that fails, a panic included), not only after a run to its end.
+pub(crate) fn request_prime(share: &Share) -> Result<Mark, String> {
+    let path = share.received.join(crate::sink::PRIME_MARKER);
+    std::fs::write(&path, b"").map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(Mark(path))
+}
+
+/// The marker file of a priming run; removed on drop.
+#[derive(Debug)]
+pub(crate) struct Mark(PathBuf);
+
+impl Drop for Mark {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -271,7 +307,14 @@ pub fn prime(ctx: &Ctx<'_>, deadline: Duration) -> Report {
             json!({"guest_binary": null}),
         );
     }
-    let share = match guest::prepare_share(ctx, "prime") {
+    // The base's disk is every clone's: the host's answer to the guest's question, which is
+    // yes only while this marker is in the results directory, is what tells the guest that
+    // this boot, and no other, is the priming one.
+    let mut mark = None;
+    let share = match guest::prepare_share(ctx, "prime").and_then(|s| {
+        mark = Some(request_prime(&s)?);
+        Ok(s)
+    }) {
         Ok(s) => s,
         Err(e) => return Report::error(PROBE, e),
     };
@@ -302,6 +345,8 @@ pub fn prime(ctx: &Ctx<'_>, deadline: Duration) -> Report {
     // Reap the helper in every case; a no-op when it has gone.
     vm.stop(&ctx.timing);
     remove_share(ctx);
+    // The mark goes before the report lists the results directory.
+    drop(mark);
     let stop = stop_json(how, &vm);
     let d = details(
         ctx,
@@ -345,6 +390,21 @@ pub fn prime(ctx: &Ctx<'_>, deadline: Duration) -> Report {
             ),
             d,
         ),
+        (_, Some(s))
+            if !matches!(
+                s.root_setup,
+                Some(RootSetup::Done | RootSetup::NotNeeded)
+            ) =>
+        {
+            failed(
+                format!(
+                    "the host did not get a yes to the guest's prime question, so the simulator's root setup was not run (root_setup: {}, signal: {}); the base is not primed for clones. Run `prime` again; if it repeats, see `summary.signal` for what the question got and the helper log for the host's side",
+                    s.root_setup.map_or("missing: a guest binary older than this check".to_owned(), |r| format!("{r:?}")),
+                    s.signal.as_ref().map_or("missing".to_owned(), |x| format!("{x:?}")),
+                ),
+                d,
+            )
+        }
         (Outcome::AlreadyReady, Some(s)) => Report::ok(
             PROBE,
             format!("user {} was ready already; the guest was shut down", s.user),

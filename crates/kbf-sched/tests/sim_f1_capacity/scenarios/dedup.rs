@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use kbf_sim::SimRng;
-use kbf_types::{ActionKey, OperationId, Qos, Resources};
+use kbf_types::{OperationId, Qos, Resources};
 
 use super::pick;
 use crate::world::{ANY, DARWIN, GIB, LINUX, Node, Scenario, Spec, World, digest, levels, request};
@@ -61,10 +61,7 @@ impl Scenario for Dedup {
             let mut req = request(key, qos, Resources::new(2_000, 4 * GIB), ANY);
             match rng.below(8) {
                 0 => {
-                    req.key = ActionKey {
-                        instance: "other".to_owned(),
-                        action: digest(key),
-                    };
+                    req.key = kbf_types::work_key("other", digest(key));
                     self.other_instance += 1;
                 }
                 1 => {

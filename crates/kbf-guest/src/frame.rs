@@ -197,9 +197,17 @@ pub enum SendError {
 /// a stream error, a stream that ended without a reply, or a reply that is not an `ack`
 /// for this frame.
 pub fn exchange<S: Read + Write>(stream: &mut S, frame: &Frame) -> Result<(), SendError> {
+    ask(stream, frame).map(|_| ())
+}
+
+/// [`exchange`], giving the `ack`'s body: the host's answer to a question sent as a frame.
+///
+/// # Errors
+/// As [`exchange`].
+pub fn ask<S: Read + Write>(stream: &mut S, frame: &Frame) -> Result<String, SendError> {
     write_frame(stream, frame).map_err(|e| SendError::Unavailable(format!("send: {e}")))?;
     match read_frame(stream) {
-        Ok(Some(r)) if r.kind == Kind::Ack && r.name == frame.name => Ok(()),
+        Ok(Some(r)) if r.kind == Kind::Ack && r.name == frame.name => Ok(r.body),
         Ok(Some(r)) if r.kind == Kind::Refused => Err(SendError::Refused(r.body)),
         Ok(Some(r)) => Err(SendError::Unavailable(format!(
             "unexpected reply: {:?} for {}",
@@ -421,6 +429,22 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    /// Catches a question whose answer is lost (the ack's body is the host's answer), and an
+    /// answer taken from a reply that is not the ack of this question.
+    #[test]
+    fn a_question_gets_the_body_of_its_ack_and_nothing_else() {
+        let q = Frame::new(Kind::Result, "prime-question", "");
+        let mut yes = Talk::replying(&[Frame::new(Kind::Ack, "prime-question", "yes")]);
+        assert_eq!(ask(&mut yes, &q), Ok("yes".to_owned()));
+        let mut other = Talk::replying(&[Frame::new(Kind::Ack, "other", "yes")]);
+        assert!(ask(&mut other, &q).is_err());
+        let mut refused = Talk::replying(&[Frame::new(Kind::Refused, "prime-question", "no")]);
+        assert_eq!(
+            ask(&mut refused, &q),
+            Err(SendError::Refused("no".to_owned()))
+        );
     }
 
     /// Catches an exchange that counts anything but an ack of this frame as delivered, and

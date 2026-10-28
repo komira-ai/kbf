@@ -181,8 +181,8 @@ impl Durable {
     /// Every queued operation, with the version of its `queue/` row.
     fn queued(&self) -> Result<BTreeMap<OperationId, Version>, StateError> {
         let mut queued = BTreeMap::new();
-        for (key, row) in self.store.scan_prefix("queue/")? {
-            queued.insert(parse_operation(&key, "queue/")?, row.version);
+        for (key, row) in self.store.scan_prefix(QUEUE)? {
+            queued.insert(parse_operation(&key, QUEUE)?, row.version);
         }
         Ok(queued)
     }
@@ -557,6 +557,25 @@ impl State {
         }
     }
 
+    /// Applies the `cordon/` rows as the store holds them now, as an intake poll does: a read
+    /// of a node then shows a cordon or drain another frontend wrote without waiting for the
+    /// next poll. Returns the rows; `None`, with the nodes left as they are, when the farm has
+    /// no store or the store cannot be read.
+    pub(in crate::farm) fn take_cordons(
+        &mut self,
+        now: FarmTime,
+    ) -> Option<BTreeMap<WorkerId, StoredCordon>> {
+        let mut read = None;
+        self.durably("a cordon look", |d| {
+            read = Some((d.cordons()?, d.store_ms()));
+            Ok(())
+        });
+        let (rows, at) = read?;
+        let rows: BTreeMap<WorkerId, StoredCordon> = rows.into_iter().collect();
+        self.apply_cordons(now, rows.clone(), at);
+        Some(rows)
+    }
+
     /// Puts `worker` back in the drain its `cordon/` row says, if the drain ended for want of
     /// a lease. A start takes up no leased operation, so a drain taken up at the start finds
     /// its node holding no lease and ends; the node's leases are taken up when it says
@@ -593,11 +612,15 @@ impl State {
     }
 
     /// Whether the state store knows `worker`: a frontend has owned it. An operator may
-    /// place a node connected to another frontend through this one.
-    pub(in crate::farm) fn known_elsewhere(&self, worker: &WorkerId) -> bool {
-        let mut known = false;
+    /// place a node connected to another frontend through this one. `None` when the store
+    /// cannot say. A farm with no state store knows no node but its own.
+    pub(in crate::farm) fn known_elsewhere(&self, worker: &WorkerId) -> Option<bool> {
+        if self.durable.is_none() {
+            return Some(false);
+        }
+        let mut known = None;
         self.durably("a node look", |d| {
-            known = d.node_known(worker)?;
+            known = Some(d.node_known(worker)?);
             Ok(())
         });
         known

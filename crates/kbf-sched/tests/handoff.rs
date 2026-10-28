@@ -5,8 +5,8 @@
 use kbf_caps::NodeCaps;
 use kbf_sched::{DaemonInstance, Event, Floor, Input, KeyFloor, OpState, Request, Scheduler};
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseKind, OperationId,
-    Resources, StateMachine, WaiterId, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseKind, OperationId, Resources,
+    StateMachine, WaiterId, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -14,10 +14,10 @@ const TERM: u64 = 4;
 
 fn request(tag: u8) -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
-        },
+        key: kbf_types::work_key(
+            "main",
+            Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
+        ),
         qos: kbf_types::Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, GIB),

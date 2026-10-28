@@ -1,0 +1,113 @@
+# The update rehearsals: a host laid out by hand from the release before the newest, as a farm
+# node is, updated to the newest release.
+#
+# `rehearse` (crates/kbf-host-install/tests/update_rehearsal.rs): by the real helper under the
+# real systemd, through its local socket, the way the updater agent asks for it. The helper
+# fetches the newest release from this repository's releases itself. The helper's unit and the
+# updater's account are this checkout's, so a pull request that changes them, the helper or the
+# installer is rehearsed with them.
+#
+# `rehearse-agent` (crates/kbf-host-install/tests/update_rehearsal_agent.rs): through the whole
+# control loop the farm uses. The coordinator is this checkout's, `cargo xtask deploy-farm` is
+# given the version `cargo xtask release farm-version` prints, and the agent, the helper, the
+# frontend and the host's `kbf` are the release before the newest. A pull request that changes
+# the coordinator, the agent's wire, the deploy verb or the OIDC verifier is rehearsed with them.
+#
+# The release runs both before its gamma stage, for the release it has just published
+# (release.yml, `rehearse` and `rehearse-agent`). A GitHub-hosted runner has systemd and
+# passwordless sudo; nothing here runs on any other machine.
+#
+# Every raw output and the units' journal are uploaded as an artifact (`gh run download`).
+name: update-rehearsal
+
+on:
+  pull_request:
+    paths:
+      - crates/kbf-host-install/**
+      - crates/kbf-installer/**
+      - crates/kbf-coordinator/**
+      - crates/kbf-updater/**
+      - crates/kbf-oidc/**
+      - crates/kbf-ca/**
+      - crates/xtask/src/deploy_farm.rs
+      - crates/xtask/src/release/farm_version.rs
+      - packaging/host-agent/linux/**
+      - .github/workflows/update-rehearsal.yml
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - crates/kbf-host-install/**
+      - crates/kbf-installer/**
+      - crates/kbf-coordinator/**
+      - crates/kbf-updater/**
+      - crates/kbf-oidc/**
+      - crates/kbf-ca/**
+      - crates/xtask/src/deploy_farm.rs
+      - crates/xtask/src/release/farm_version.rs
+      - packaging/host-agent/linux/**
+
+permissions: {}
+
+concurrency:
+  group: update-rehearsal-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  rehearse:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      # sudo clears the environment: the test reads the workflow's own read-only token from
+      # this file, for the release listing and downloads (the shared address's anonymous quota
+      # is small).
+      - name: Token file of the rehearsal, readable by its owner alone
+        run: install -m 0600 /dev/null /var/tmp/kbf-update-rehearsal.token
+      - name: Token of the rehearsal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" > /var/tmp/kbf-update-rehearsal.token
+      - run: cargo xtask sudo-test -p kbf-host-install --test update_rehearsal -- --exact the_helper_updates_a_hand_laid_host_from_the_last_release_to_the_next --nocapture
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: update-rehearsal-raw-output
+          path: target/update-rehearsal
+          if-no-files-found: error
+
+  rehearse-agent:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: Token file of the rehearsal, readable by its owner alone
+        run: install -m 0600 /dev/null /var/tmp/kbf-update-rehearsal.token
+      - name: Token of the rehearsal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" > /var/tmp/kbf-update-rehearsal.token
+      # The coordinator of this checkout; the test finds it beside the test binaries.
+      - name: The coordinator of this checkout
+        run: cargo build --locked -p kbf-coordinator
+      - run: cargo xtask sudo-test -p kbf-host-install --test update_rehearsal_agent -- --exact the_agent_updates_the_host_when_the_coordinator_is_told_the_next_release --nocapture
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: update-rehearsal-agent-raw-output
+          path: target/update-rehearsal
+          if-no-files-found: error

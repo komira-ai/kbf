@@ -16,6 +16,9 @@ use crate::stage::*;
 #[path = "stage_bundle_tests.rs"]
 mod bundle;
 
+#[path = "stage_primed_tests.rs"]
+mod primed;
+
 #[path = "stage_tamper_tests.rs"]
 mod tamper;
 

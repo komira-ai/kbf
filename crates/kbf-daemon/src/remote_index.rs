@@ -1,7 +1,7 @@
 //! [`RemoteIndex`]: the frontend's pack index, as a daemon reaches it.
 //!
 //! The pack index lives in the frontends' shared state store, and a daemon opens no connection
-//! to it. [`RemoteIndex`] is `kbf_state::PackIndex` over the frontend's worker listener
+//! to it. [`RemoteIndex`] is `kbf_pack_index::PackIndex` over the frontend's worker listener
 //! (`kbf.worker.v1.PackIndex/Locate`), for `kbf_pack::Reader`, which asks the index where a blob
 //! lies and then reads that range of that pack from the object store, and for `kbf_pack::Packer`,
 //! which records the packs a daemon stored. It **locates and commits, and does nothing else**:
@@ -34,15 +34,15 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use kbf_pack_index::{
+    BlobDigest, Location, MAX_BATCH, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
+};
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::pack_index_client::PackIndexClient;
 use kbf_proto::worker::{
     CommitPackRequest, PackLocateRequest, PackLocateResponse, PackLocation, PackedBlob,
 };
-use kbf_state::{
-    BlobDigest, Location, MAX_BATCH, NewPack, PackIndex, PackIndexError, PackInfo, Recorded,
-    StoreError,
-};
+use kbf_state::StoreError;
 use tokio::runtime::Handle;
 use tonic::transport::Channel;
 use tonic::{Code, Request, Status};

@@ -1290,16 +1290,79 @@ fn only_plan_and_verify_download_from_another_run() {
 }
 
 #[test]
+fn the_rehearsals_run_after_publish_read_only_under_the_release_condition() {
+    // Catches: a rehearsal (the helper's, and the agent's with the coordinator) starting before
+    // the release it updates to is published, holding a write scope or the OIDC token, or
+    // running for a pipeline run that cuts no release.
+    for job in ["rehearse", "rehearse-agent"] {
+        red(
+            &plant(job, "needs: [plan, publish]\n", "needs: [plan]\n"),
+            &format!("the job `{job}` needs"),
+        );
+        red(
+            &plant(job, "      contents: read\n", "      contents: write\n"),
+            &format!("the job `{job}` holds `contents: write`"),
+        );
+        red(
+            &plant(
+                job,
+                "      contents: read\n",
+                "      contents: read\n      id-token: write\n",
+            ),
+            &format!("the job `{job}` holds `id-token: write`"),
+        );
+        red(
+            &plant(job, " && needs.plan.outputs.pipeline != 'true' }}", " }}"),
+            job,
+        );
+    }
+}
+
+#[test]
 fn gamma_runs_after_publish_with_the_run_token_and_no_write_scope() {
     // Catches: the gamma stage starting before the release is published or without the
     // run's conditions, holding a write scope or a token other than the OIDC one, or
     // dropping the environment whose name the coordinator's allow-list can require.
     red(
-        &plant("gamma", "needs: [plan, publish]\n", "needs: [plan]\n"),
+        &plant(
+            "gamma",
+            "needs: [plan, publish, rehearse, rehearse-agent]\n",
+            "needs: [plan, rehearse, rehearse-agent]\n",
+        ),
         "the job `gamma` needs",
     );
     red(
-        &plant("gamma", "needs: [plan, publish]\n", "needs: [plan, bump]\n"),
+        &plant(
+            "gamma",
+            "needs: [plan, publish, rehearse, rehearse-agent]\n",
+            "needs: [plan, bump, rehearse, rehearse-agent]\n",
+        ),
+        "the job `gamma` needs",
+    );
+    // Catches: the gamma stage telling the farm about a release no host was updated to, by the
+    // helper alone or through the coordinator and the agent.
+    red(
+        &plant(
+            "gamma",
+            "needs: [plan, publish, rehearse, rehearse-agent]\n",
+            "needs: [plan, publish]\n",
+        ),
+        "the job `gamma` needs",
+    );
+    red(
+        &plant(
+            "gamma",
+            "needs: [plan, publish, rehearse, rehearse-agent]\n",
+            "needs: [plan, publish, rehearse]\n",
+        ),
+        "the job `gamma` needs",
+    );
+    red(
+        &plant(
+            "gamma",
+            "needs: [plan, publish, rehearse, rehearse-agent]\n",
+            "needs: [plan, publish, rehearse-agent]\n",
+        ),
         "the job `gamma` needs",
     );
     red(

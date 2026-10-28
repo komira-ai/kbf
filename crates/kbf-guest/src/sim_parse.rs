@@ -66,3 +66,34 @@ pub fn parse_bundle_id(stdout: &str) -> Result<String, String> {
         Ok(id.to_owned())
     }
 }
+
+/// The last `max` bytes of `bytes` as text, cut where a character starts; whether anything
+/// was cut.
+#[must_use]
+pub fn tail_text(bytes: &[u8], max: usize) -> (String, bool) {
+    if bytes.len() <= max {
+        return (String::from_utf8_lossy(bytes).into_owned(), false);
+    }
+    let mut start = bytes.len() - max;
+    // Skip continuation bytes: the cut then falls on a character boundary of valid UTF-8.
+    while start < bytes.len() && (bytes[start] & 0xC0) == 0x80 {
+        start += 1;
+    }
+    (String::from_utf8_lossy(&bytes[start..]).into_owned(), true)
+}
+
+/// Whether `name` could be a name the host staged: letters, digits, `.`, `_`, `-`, ending
+/// `suffix` (`.dmg` for a runtime, `.app` for the app), no `..`, no leading dot, short. The
+/// name becomes part of a result frame's name, which the host checks too.
+#[must_use]
+pub fn name_ok(name: &str, suffix: &str) -> bool {
+    name.strip_suffix(suffix).is_some_and(|stem| {
+        !stem.is_empty()
+            && !name.starts_with('.')
+            && !name.contains("..")
+            && name.len() <= crate::sim::MAX_STAGED_NAME_BYTES
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    })
+}

@@ -1,6 +1,6 @@
 //! Where an operation is: [`OpState`].
 
-use kbf_types::{Digest, Failure, LeaseId, WorkerId};
+use kbf_types::{Failure, LeaseId, ResultRef, WorkerId};
 
 /// Where an operation is.
 ///
@@ -32,8 +32,8 @@ pub enum OpState {
     Completed {
         /// The lease whose result was accepted.
         lease: LeaseId,
-        /// The digest of its `ActionResult`.
-        action_result: Digest,
+        /// Where its result is stored.
+        action_result: ResultRef,
     },
     /// Failed: the failure of `lease` was committed.
     Failed {

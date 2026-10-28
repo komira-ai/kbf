@@ -5,18 +5,18 @@
 //! go into the trace hash.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::fmt::Write as _;
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
 use kbf_sched::{DaemonInstance, Event, Input, Request, Scheduler};
-use kbf_sim::SimRng;
+use kbf_sim::{SimRng, Trace, TraceHash, text};
 use kbf_types::{
-    ActionKey, Digest, DigestFunction, Effect, Failure, FarmTime, LeaseId, OperationId, Outcome,
-    Qos, Resources, StateMachine, WaiterId, WorkerId,
+    Digest, DigestFunction, Effect, Failure, FarmTime, LeaseId, OperationId, Outcome, Qos,
+    Resources, StateMachine, WaiterId, WorkerId,
 };
 
 use crate::check::Checker;
+use crate::trace_text;
 
 pub const GIB: u64 = 1 << 30;
 /// Each worker heartbeats this often, staggered by its index.
@@ -99,10 +99,7 @@ pub fn levels() -> [Qos; 4] {
 /// A hermetic, cacheable request for action `key` under instance `main`.
 pub fn request(key: u64, qos: Qos, resources: Resources, platform: usize) -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: digest(key),
-        },
+        key: kbf_types::work_key("main", digest(key)),
         qos,
         kind: kbf_types::LeaseKind::Action,
         resources,
@@ -149,22 +146,9 @@ pub struct World {
     next_waiter: u64,
     /// Operations answered or refused since the scenario last took them.
     pub finished: Vec<OperationId>,
-    trace: Fnv,
+    trace: Trace,
     /// Inputs fed.
     pub inputs: u64,
-}
-
-/// FNV-1a over the trace text, written without allocating.
-#[derive(Clone, Copy, Debug)]
-pub struct Fnv(pub u64);
-
-impl std::fmt::Write for Fnv {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        for b in s.bytes() {
-            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
-        }
-        Ok(())
-    }
 }
 
 impl World {
@@ -179,7 +163,7 @@ impl World {
             run_for: BTreeMap::new(),
             next_waiter: 0,
             finished: Vec::new(),
-            trace: Fnv(0xcbf2_9ce4_8422_2325),
+            trace: Trace::new("f1"),
             inputs: 0,
         };
         for spec in world.fleet.clone() {
@@ -195,8 +179,8 @@ impl World {
     }
 
     /// The trace hash so far.
-    pub fn trace_hash(&self) -> u64 {
-        self.trace.0
+    pub fn trace_hash(&self) -> TraceHash {
+        self.trace.hash()
     }
 
     /// Feeds `event` now, then every record it proposes as committed and every `Start`
@@ -208,7 +192,11 @@ impl World {
             let input = Input::new(now, event);
             // The trace covers every input as well as every effect, so two runs that
             // fed different inputs never share a hash.
-            let _ = write!(self.trace, "{} in {:?};", self.t, input.event);
+            self.trace.record(&format!(
+                "{} in {}",
+                self.t,
+                trace_text::event(&input.event)
+            ));
             let effects = self.sched.apply(input.clone());
             self.inputs += 1;
             self.check.observe(&input, &effects, &self.sched);
@@ -235,24 +223,25 @@ impl World {
 
     fn record(&mut self, effect: &Effect) {
         let t = self.t;
-        let tr = &mut self.trace;
-        let _ = match effect {
+        let line = match effect {
             Effect::Commit(kbf_types::ControlRecord::Lease(g)) => {
-                write!(
-                    tr,
-                    "{t} grant {} {} {};",
-                    g.lease.seq, g.operation.0, g.worker
+                format!(
+                    "{t} grant {} {} {}",
+                    g.lease.seq,
+                    g.operation.0,
+                    text::worker(&g.worker)
                 )
             }
             Effect::Commit(kbf_types::ControlRecord::Refusal(r)) => {
-                write!(tr, "{t} refuse {};", r.operation.0)
+                format!("{t} refuse {}", r.operation.0)
             }
-            Effect::Commit(_) => write!(tr, "{t} commit;"),
-            Effect::Start(s) => write!(tr, "{t} start {};", s.lease.seq),
-            Effect::Answer(a) => write!(tr, "{t} answer {} {};", a.operation.0, a.lease.seq),
-            Effect::Refuse(r) => write!(tr, "{t} refused {};", r.operation.0),
-            Effect::Waiting(w) => write!(tr, "{t} wait {} {};", w.operation.0, w.reason.is_some()),
+            Effect::Commit(_) => format!("{t} commit"),
+            Effect::Start(s) => format!("{t} start {}", s.lease.seq),
+            Effect::Answer(a) => format!("{t} answer {} {}", a.operation.0, a.lease.seq),
+            Effect::Refuse(r) => format!("{t} refused {}", r.operation.0),
+            Effect::Waiting(w) => format!("{t} wait {} {}", w.operation.0, w.reason.is_some()),
         };
+        self.trace.record(&line);
     }
 
     /// Submits `request` for a new waiter; a new operation runs for `secs` each time
@@ -314,7 +303,7 @@ impl World {
                 Outcome::Failed(Failure::Timeout)
             } else {
                 Outcome::Completed {
-                    action_result: digest(1_000_000 + lease.seq),
+                    action_result: digest(1_000_000 + lease.seq).into(),
                 }
             };
             self.feed(Event::Report {

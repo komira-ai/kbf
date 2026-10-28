@@ -5,8 +5,8 @@
 use kbf_caps::NodeCaps;
 use kbf_sched::{DEVICE_LEASES_PER_WORKER, DaemonInstance, Event, Input, Request, Scheduler};
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, LeaseKind,
-    Outcome, Qos, Resources, StartLease, StateMachine, WaiterId, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, LeaseKind, Outcome, Qos,
+    Resources, StartLease, StateMachine, WaiterId, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -32,10 +32,7 @@ fn digest(n: u64) -> Digest {
 /// Action `n`, one core and 1 GiB, needing what the REAPI `platform` asks for.
 fn request(n: u64, platform: &[(&str, &str)]) -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: digest(n),
-        },
+        key: kbf_types::work_key("main", digest(n)),
         qos: Qos::Ci,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, GIB),
@@ -78,7 +75,7 @@ fn w(name: &str) -> WorkerId {
 
 fn completed(n: u64) -> Outcome {
     Outcome::Completed {
-        action_result: digest(100 + n),
+        action_result: digest(100 + n).into(),
     }
 }
 

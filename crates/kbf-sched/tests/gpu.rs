@@ -4,8 +4,8 @@
 use kbf_caps::NodeCaps;
 use kbf_sched::{DaemonInstance, Event, Input, OpState, Request, Scheduler};
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, OperationId,
-    Outcome, Qos, Resources, StateMachine, WaiterId, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, OperationId, Outcome, Qos,
+    Resources, StateMachine, WaiterId, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -17,10 +17,7 @@ fn digest(n: u8) -> Digest {
 /// Action `n`, one core and 1 GiB, and `gpus` GPUs.
 fn request(n: u8, gpus: u64) -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: digest(n),
-        },
+        key: kbf_types::work_key("main", digest(n)),
         qos: Qos::Ci,
         kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB).with_gpus(gpus),
@@ -103,7 +100,7 @@ impl Harness {
     /// Reports `grant` completed and commits the result.
     fn finish(&mut self, grant: &LeaseGrant) {
         let outcome = Outcome::Completed {
-            action_result: digest(200),
+            action_result: digest(200).into(),
         };
         let proposed = self.feed(Event::Report {
             operation: grant.operation,

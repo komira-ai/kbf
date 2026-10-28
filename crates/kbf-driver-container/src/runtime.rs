@@ -868,6 +868,7 @@ fn sweep(engine: &Arc<Oci>, config: &ContainerConfig) -> Result<(), String> {
         tracing::warn!(lease = %name, "removing a lease a previous daemon left");
         let mut lease = Lease::named(engine, config, name);
         lease.created = true;
+        lease.left_by_a_daemon = true;
         if let Err(why) = lease.clean_blocking() {
             errors.push(why);
         }
@@ -902,6 +903,9 @@ struct Lease {
     /// The NUMA node the lease is placed on, with `--lease-placement=numa-node`. Dropped
     /// with the lease, which gives the node its load back.
     pin: Option<Pin>,
+    /// Whether a previous daemon started this lease: a `crun run` of it may still be
+    /// there, and is no child of this process to wait for.
+    left_by_a_daemon: bool,
     /// Whether cleaning is still owed.
     armed: bool,
     /// When the container was about to be created, once the lease got that far.
@@ -935,6 +939,7 @@ impl Lease {
             keeper: None,
             trees: Vec::new(),
             pin: None,
+            left_by_a_daemon: false,
             armed: true,
             ran: None,
             numa: NumaSample::default(),
@@ -979,6 +984,12 @@ impl Lease {
             let _ = self.cgroup.kill();
             if let Err(e) = self.engine.remove(&self.name) {
                 errors.push(e);
+            }
+            // The container is gone, so a `crun run` of it ends on its own, and it would
+            // write into the directory removed below as it does: the state directory,
+            // recreated. This process is not its parent to reap it, so end it here.
+            if self.left_by_a_daemon {
+                errors.extend(self.engine.end_runs(&self.dir).err());
             }
         }
         if let Err(e) = self.cgroup.remove() {

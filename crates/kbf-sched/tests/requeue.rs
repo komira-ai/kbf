@@ -10,18 +10,15 @@ use kbf_sched::{
     DaemonInstance, Event, Input, OpState, Request, Requeue, RequeueReason, Scheduler,
 };
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, Outcome, Qos,
-    Resources, StateMachine, WaiterId, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, Outcome, Qos, Resources,
+    StateMachine, WaiterId, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
 
 fn request() -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: Digest::new(DigestFunction::Sha256, [7; 32], 7),
-        },
+        key: kbf_types::work_key("main", Digest::new(DigestFunction::Sha256, [7; 32], 7)),
         qos: Qos::Ci,
         kind: kbf_types::LeaseKind::Action,
         resources: Resources::new(1_000, GIB),
@@ -185,7 +182,7 @@ fn report(grant: &LeaseGrant) -> Event {
         operation: grant.operation,
         lease: grant.lease,
         outcome: Outcome::Completed {
-            action_result: Digest::new(DigestFunction::Sha256, [9; 32], 9),
+            action_result: Digest::new(DigestFunction::Sha256, [9; 32], 9).into(),
         },
     }
 }

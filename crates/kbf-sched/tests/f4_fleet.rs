@@ -64,6 +64,8 @@
 //! moves out of `sim_cell`.
 
 mod f4;
+mod golden_file;
+mod trace_text;
 
 use f4::check::Reach;
 use f4::world::{Scenario, World};
@@ -201,6 +203,31 @@ fn a_seed_replays() {
     let a = run(5, 300).trace();
     assert_eq!(a, run(5, 300).trace());
     assert_ne!(a, run(9, 300).trace());
+}
+
+/// The trace hash of a small run (300 operations) of each of eight seeds: two of each
+/// of the four scenarios, which a seed picks as `seed % 4`.
+fn golden_runs() -> Vec<(String, kbf_sim::TraceHash)> {
+    (0..8)
+        .map(|seed| (format!("seed-{seed}-ops-300"), run(seed, 300).trace()))
+        .collect()
+}
+
+/// Catches: a change to the scheduler, the world or the trace text that alters what a
+/// scenario decides, or how its trace reads, without the author meaning it: eight runs,
+/// two of every scenario, are compared with the checked-in hashes.
+#[test]
+fn traces_match_their_golden_hashes() {
+    golden_file::golden("f4").assert_matches(&golden_runs());
+}
+
+/// Rewrites the F4 lines of `tests/golden/trace-hashes.txt`.
+#[test]
+#[ignore = "regenerates the golden trace hashes; run it only on purpose"]
+fn regenerate_golden_hashes() {
+    golden_file::golden("f4")
+        .regenerate(&golden_runs())
+        .unwrap();
 }
 
 /// Runs the seed in `KBF_SIM_SEED` with `KBF_SIM_OPS` operations (default 2,000).

@@ -20,13 +20,14 @@ use std::collections::{BTreeMap, VecDeque};
 use kbf_caps::NodeCaps;
 use kbf_sched::fence::{HANDOVER_GRACE, SELF_FENCE};
 use kbf_sched::{DaemonInstance, Event, Request, Scheduler};
-use kbf_sim::{Chance, SimRng};
+use kbf_sim::{Chance, SimRng, Trace, TraceHash, text};
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmTime, FencePolicy,
-    LeaseId, OperationId, Outcome, Qos, Resources, StartLease, WaiterId, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, Failure, FarmTime, FencePolicy, LeaseId,
+    OperationId, Outcome, Qos, Resources, StartLease, WaiterId, WorkKey, WorkerId,
 };
 
 use super::check::{Checker, TERM};
+use crate::trace_text;
 
 pub const GIB: u64 = 1 << 30;
 /// The unservable wait the scheduler is built with.
@@ -314,7 +315,7 @@ pub struct World {
     log: VecDeque<(u64, ControlRecord)>,
     log_last: u64,
     recent: VecDeque<Template>,
-    durations: BTreeMap<ActionKey, u64>,
+    durations: BTreeMap<WorkKey, u64>,
     next_key: u64,
     submitted: u64,
     rate_milli: u64,
@@ -332,7 +333,7 @@ pub struct World {
     mass_at: Vec<u64>,
     quiesced_at: Option<u64>,
     bound_s: u64,
-    trace: u64,
+    trace: Trace,
     /// Seconds from the last arrival until every operation was finished.
     pub drained_in: u64,
 }
@@ -406,7 +407,7 @@ impl World {
             mass_at,
             quiesced_at: None,
             bound_s: 0,
-            trace: 0xcbf2_9ce4_8422_2325,
+            trace: Trace::new("f4"),
             drained_in: 0,
         };
         for i in 0..w.nodes.len() {
@@ -416,14 +417,12 @@ impl World {
     }
 
     /// The run's trace hash: every input and effect, as text.
-    pub const fn trace(&self) -> u64 {
-        self.trace
+    pub fn trace(&self) -> TraceHash {
+        self.trace.hash()
     }
 
     fn record(&mut self, line: &str) {
-        for b in line.bytes().chain(std::iter::once(b'\n')) {
-            self.trace = (self.trace ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
-        }
+        self.trace.record(line);
     }
 
     /// Runs to the end: arrivals until `ops` were submitted, then no faults until
@@ -457,10 +456,10 @@ impl World {
 
     fn feed(&mut self, event: Event) {
         let t = self.t;
-        self.record(&format!("{t} {event:?}"));
+        self.record(&format!("{t} in {}", trace_text::event(&event)));
         let effects = self.check.feed(t * 1_000, event);
         for effect in effects {
-            self.record(&format!("  {effect:?}"));
+            self.record(&format!("  out {}", text::effect(&effect)));
             self.carry_out(effect);
         }
     }
@@ -634,7 +633,7 @@ impl World {
                 Outcome::Failed(Failure::Timeout)
             } else {
                 Outcome::Completed {
-                    action_result: digest(lease.seq << 20 | run.op.0),
+                    action_result: digest(lease.seq << 20 | run.op.0).into(),
                 }
             };
             self.check.produced(lease, outcome);
@@ -798,10 +797,7 @@ impl World {
             ("main", self.next_key - 1)
         };
         let request = Request {
-            key: ActionKey {
-                instance: instance.to_owned(),
-                action: digest(number),
-            },
+            key: kbf_types::work_key(instance, digest(number)),
             qos: Qos::Ci,
             kind: kbf_types::LeaseKind::Action,
             resources,

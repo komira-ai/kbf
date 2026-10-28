@@ -8,8 +8,8 @@ use kbf_sched::{
     DaemonInstance, Event, Input, LeasePhase, MAX_AVOIDED, Request, Scheduler, platform_label,
 };
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, LeaseKind, Qos,
-    Resources, StateMachine, WaiterId, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseGrant, LeaseKind, Qos, Resources,
+    StateMachine, WaiterId, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -30,10 +30,7 @@ fn linux() -> NodeCaps {
 
 fn request(n: u8, qos: Qos) -> Request {
     Request {
-        key: ActionKey {
-            instance: "main".to_owned(),
-            action: digest(n),
-        },
+        key: kbf_types::work_key("main", digest(n)),
         qos,
         kind: LeaseKind::Action,
         resources: Resources::new(1_000, GIB),
@@ -134,8 +131,7 @@ fn a_lease_is_viewed_through_its_phases() {
     let [lease] = h.s.snapshot().leases.try_into().unwrap();
     assert_eq!(lease.lease, grant.lease);
     assert_eq!(lease.operation, grant.operation);
-    assert_eq!(lease.instance, "main");
-    assert_eq!(lease.action, digest(3));
+    assert_eq!(lease.key, kbf_types::work_key("main", digest(3)));
     assert_eq!(lease.node, w("a"));
     assert_eq!(lease.qos, Qos::Interactive);
     assert_eq!(lease.platform, "any");
@@ -202,7 +198,7 @@ fn leases_filter_by_node_and_end_with_their_operation() {
         operation: first.operation,
         lease: first.lease,
         outcome: kbf_types::Outcome::Completed {
-            action_result: digest(99),
+            action_result: digest(99).into(),
         },
     });
     h.feed(Event::Committed(ControlRecord::Result(
@@ -210,7 +206,7 @@ fn leases_filter_by_node_and_end_with_their_operation() {
             lease: first.lease,
             operation: first.operation,
             outcome: kbf_types::Outcome::Completed {
-                action_result: digest(99),
+                action_result: digest(99).into(),
             },
         },
     )));
@@ -343,8 +339,11 @@ fn work_nobody_can_run_is_grouped_by_its_reason() {
         .find(|g| g.count == 2)
         .expect("two wait for a mac");
     assert!(mac.reason.contains("macos"), "{}", mac.reason);
-    assert_eq!(mac.example_instance, "main");
-    assert_eq!(mac.example_action, digest(1), "the first in queue order");
+    assert_eq!(
+        mac.example_key,
+        kbf_types::work_key("main", digest(1)),
+        "the first in queue order"
+    );
     assert_eq!(mac.example.0, 0);
     for group in &queue.waiting {
         assert_eq!(
@@ -398,8 +397,8 @@ fn queued_work_names_the_workers_it_avoids() {
     for (i, a) in queue.avoided.iter().enumerate() {
         assert_eq!(a.operation.0, i as u64, "operation order");
         assert_eq!(a.nodes, [w("a")]);
-        assert_eq!(a.instance, "main");
-        assert_eq!(a.action, digest(u8::try_from(i).unwrap()));
+        let want = kbf_types::work_key("main", digest(u8::try_from(i).unwrap()));
+        assert_eq!(a.key, want);
     }
     // The same data the scheduler's own accessor holds.
     assert_eq!(h.s.avoided().len(), 3);

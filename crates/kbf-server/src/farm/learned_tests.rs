@@ -82,7 +82,8 @@ impl Job {
             key: ActionKey {
                 instance: self.instance.to_owned(),
                 action: Digest::new(DigestFunction::Sha256, [self.tag; 32], 1),
-            },
+            }
+            .into(),
             qos: Qos::Ci,
             kind: self.kind,
             resources: Resources::new(1_000, 4 << 30).with_gpus(self.gpus),
@@ -388,7 +389,7 @@ fn estimator_key_and_run() -> (kbf_estimator::Key, kbf_estimator::Run) {
     };
     let key = key_of("main", &platform, Basis::Cgroup, &subject).expect("a key");
     let ok = Outcome::Completed {
-        action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+        action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1).into(),
     };
     let usage = kbf_invocation::RunUsage {
         wall_micros: 2_000_000,
@@ -786,7 +787,7 @@ fn succeed(
     let report = super::Report {
         lease,
         outcome: kbf_types::Outcome::Completed {
-            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1).into(),
         },
         measured: Some(measured(peak)),
         exit_code: Some(0),
@@ -1133,13 +1134,15 @@ fn a_stored_operation_is_registered_only_when_it_can_be_named() {
     });
     let (empty, _) = Subject::of(Described::default());
     let linux = kbf_caps::Request::from_platform([("OSFamily", "linux")]).unwrap();
+    let action = ActionKey {
+        instance: "main".to_owned(),
+        action: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+    };
     let stored = |needs: kbf_caps::Request, subject: Option<Subject>| StoredOperation {
         operation: kbf_types::OperationId(1),
+        action: action.clone(),
         request: kbf_sched::Request {
-            key: ActionKey {
-                instance: "main".to_owned(),
-                action: Digest::new(DigestFunction::Sha256, [1; 32], 1),
-            },
+            key: (&action).into(),
             qos: Qos::Ci,
             kind: LeaseKind::Action,
             resources: Resources::new(1_000, 4 << 30),
@@ -1180,7 +1183,7 @@ fn a_report_without_a_booking_or_usage_is_counted_not_shown() {
     let report = super::Report {
         lease: stranger,
         outcome: kbf_types::Outcome::Completed {
-            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1).into(),
         },
         measured: None,
         exit_code: Some(0),
@@ -1198,7 +1201,7 @@ fn a_report_without_a_booking_or_usage_is_counted_not_shown() {
     let report = super::Report {
         lease,
         outcome: kbf_types::Outcome::Completed {
-            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+            action_result: Digest::new(DigestFunction::Sha256, [1; 32], 1).into(),
         },
         measured: None,
         exit_code: Some(0),

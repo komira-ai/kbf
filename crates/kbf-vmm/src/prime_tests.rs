@@ -19,6 +19,7 @@ use crate::probe::Ctx;
 use crate::report::Status as ReportStatus;
 use crate::spec::Event;
 use crate::system::Poll;
+use kbf_guest::mkuser_prime::{RootSetup, Signal};
 
 const LONG: std::time::Duration = std::time::Duration::from_secs(30);
 const SHORT: std::time::Duration = std::time::Duration::from_millis(40);
@@ -60,6 +61,22 @@ fn step(index: usize, id: &str, status: Status, exit: Option<i32>) -> (String, S
 }
 
 fn summary(ok: bool, already_ready: bool, n: usize) -> (String, String) {
+    summary_root(
+        ok,
+        already_ready,
+        n,
+        Some(RootSetup::Done),
+        Some(Signal::Yes),
+    )
+}
+
+fn summary_root(
+    ok: bool,
+    already_ready: bool,
+    n: usize,
+    root_setup: Option<RootSetup>,
+    signal: Option<Signal>,
+) -> (String, String) {
     let s = MkUserSummary {
         complete: true,
         user: "kbfuser".to_owned(),
@@ -74,6 +91,8 @@ fn summary(ok: bool, already_ready: bool, n: usize) -> (String, String) {
         powering_off: !already_ready,
         undelivered: Vec::new(),
         note: (!ok).then(|| "a step failed".to_owned()),
+        root_setup,
+        signal,
     };
     (
         SUMMARY_NAME.to_owned(),
@@ -455,6 +474,36 @@ fn a_helper_that_cannot_start_is_an_error_and_leaves_no_share() {
     assert!(r.reason.expect("reason").contains("no helper"));
     assert!(!work.join("base/prime-share").exists());
     assert!(!work.join("base/prime-tagged").exists());
+    // The priming mark is not left behind by a run that never started.
+    assert!(!results(&work).join(crate::sink::PRIME_MARKER).exists());
+}
+
+/// Catches the priming mark outliving its run on a way out the normal path does not take: the
+/// guard removes it when dropped, a panic's unwinding included, and a missing file is fine.
+#[test]
+fn the_priming_mark_is_removed_when_its_guard_is_dropped_even_by_a_panic() {
+    let dir = tmp("prime-mark");
+    let share = crate::guest::Share {
+        dir: dir.join("s"),
+        tagged: dir.join("t"),
+        received: dir.to_path_buf(),
+    };
+    let marker = dir.join(crate::sink::PRIME_MARKER);
+    let mark = crate::prime::request_prime(&share).expect("mark");
+    assert!(marker.exists());
+    drop(mark);
+    assert!(!marker.exists());
+    let r = std::panic::catch_unwind(|| {
+        let _mark = crate::prime::request_prime(&share).expect("mark");
+        assert!(dir.join(crate::sink::PRIME_MARKER).exists());
+        panic!("a bug between the mark and the end");
+    });
+    assert!(r.is_err());
+    assert!(!marker.exists());
+    // Dropped after the file is gone already: nothing to say.
+    let mark = crate::prime::request_prime(&share).expect("mark");
+    std::fs::remove_file(&marker).expect("rm");
+    drop(mark);
 }
 
 /// Catches the host trusting what the guest wrote: a frame that is not valid JSON must not
@@ -589,7 +638,7 @@ fn setup_with_a_guest_user_writes_the_daemon_and_the_wish_and_says_to_prime() {
 
 /// Catches the flags not parsing or not reaching the verbs: `--guest-user` with a bad name
 /// refused by the parser, `image prime` taking its base and binary, its default deadline of
-/// 20 minutes, a deadline of zero refused, and the dispatch passing all three on.
+/// an hour, a deadline of zero refused, and the dispatch passing all three on.
 #[test]
 fn the_flags_parse_and_prime_is_dispatched_with_its_deadline() {
     assert!(
@@ -644,7 +693,7 @@ fn the_flags_parse_and_prime_is_dispatched_with_its_deadline() {
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(DEFAULT_DEADLINE.as_secs(), 1200);
+    assert_eq!(DEFAULT_DEADLINE.as_secs(), 3600);
     for bad in ["0", "86401", "x"] {
         assert!(
             Cli::try_parse_from([
@@ -842,4 +891,103 @@ fn without_a_log_audit_frame_the_report_says_none_arrived_and_a_bad_one_is_liste
         r.details["unreadable_frames"][0]["frame"],
         "mkuser-audit.json"
     );
+}
+
+/// Catches the priming boot not being marked for the sink to answer yes to (the guest then
+/// leaves the root setup to `sim` on every clone), a mark in the guest's reach (the share), a
+/// mark left behind in the base afterwards, and the guest's and the sink's names for the
+/// question drifting apart.
+#[test]
+fn the_priming_boot_is_marked_in_the_results_directory_and_the_mark_is_withdrawn() {
+    let work = work_with_base("prime-request");
+    let sys = FakeSystem::new();
+    sys.script(powering_off(&all_ok()));
+    let r = prime(&prime_ctx(&sys, &work), LONG);
+    assert_eq!(r.status, ReportStatus::Ok, "{r:?}");
+    let seen = sys.results_at_start.borrow();
+    assert_eq!(seen.len(), 1);
+    assert!(
+        seen[0].contains(&crate::sink::PRIME_MARKER.to_owned()),
+        "{:?}",
+        seen[0]
+    );
+    assert!(!results(&work).join(crate::sink::PRIME_MARKER).exists());
+    assert_eq!(
+        crate::sink::PRIME_QUESTION,
+        kbf_guest::mkuser_prime::QUESTION
+    );
+    assert_eq!(kbf_guest::mkuser_prime::ANSWER_YES, "yes");
+}
+
+/// Catches a guest step allowed to run longer than the host waits for the whole priming
+/// boot: with the defaults, no single step of the root setup may outlast `--deadline-secs`.
+#[test]
+fn no_guest_step_may_outlast_the_default_deadline() {
+    use clap::Parser;
+    #[derive(clap::Parser)]
+    struct W {
+        #[command(flatten)]
+        a: kbf_guest::mkuser::MkUserArgs,
+    }
+    let a = W::parse_from(["w", "--name", "kbfuser"]).a;
+    let c = kbf_guest::mkuser::Config::from(&a);
+    for d in [c.quick, c.audit, c.first_launch, c.runtime_add] {
+        assert!(d <= DEFAULT_DEADLINE, "{d:?}");
+    }
+}
+
+/// Catches a priming boot that never got a yes being reported as a success: the guest
+/// then ran no root setup and wrote no record, every clone pays for it, and the base looks
+/// primed. A summary that says the setup was skipped, or says nothing (an older guest), is an
+/// error naming the question; one that says done, or that nothing was staged, is a success.
+#[test]
+fn a_prime_whose_guest_got_no_yes_is_an_error() {
+    let ids = plan("kbfuser", false).len();
+    let run_with = |root: Option<RootSetup>, signal: Option<Signal>| {
+        let work = work_with_base("prime-unseen");
+        let sys = FakeSystem::new();
+        let mut frames = all_ok();
+        frames.pop();
+        frames.push(summary_root(true, false, ids, root, signal));
+        sys.script(powering_off(&frames));
+        prime(&prime_ctx(&sys, &work), LONG)
+    };
+    for (root, signal) in [
+        (Some(RootSetup::Skipped), Some(Signal::No)),
+        (
+            Some(RootSetup::Skipped),
+            Some(Signal::NoAnswer("x".to_owned())),
+        ),
+        (
+            Some(RootSetup::Skipped),
+            Some(Signal::Refused("no".to_owned())),
+        ),
+        (None, None),
+    ] {
+        let r = run_with(root, signal);
+        assert_eq!(r.status, ReportStatus::Error, "{root:?}");
+        let why = r.reason.expect("reason");
+        assert!(why.contains("did not get a yes"), "{why}");
+        assert!(
+            why.contains("root_setup:") && why.contains("signal:"),
+            "{why}"
+        );
+    }
+    for root in [RootSetup::Done, RootSetup::NotNeeded] {
+        let r = run_with(Some(root), Some(Signal::Yes));
+        assert_eq!(r.status, ReportStatus::Ok, "{root:?} {r:?}");
+    }
+    // An already-ready base that did not see the request is no better.
+    let work = work_with_base("prime-unseen-ready");
+    let sys = FakeSystem::new();
+    sys.script(
+        Script::booted()
+            .with_guest_file(
+                &summary_root(true, true, 0, Some(RootSetup::Skipped), Some(Signal::No)).0,
+                &summary_root(true, true, 0, Some(RootSetup::Skipped), Some(Signal::No)).1,
+            )
+            .then(Poll::Event(Event::Stopped { ms: 50 })),
+    );
+    let r = prime(&prime_ctx(&sys, &work), LONG);
+    assert_eq!(r.status, ReportStatus::Error, "{r:?}");
 }

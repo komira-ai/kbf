@@ -7,7 +7,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use kbf_front::{MAX_PACKED_BLOB_BYTES, PackSettings, Packs};
 use kbf_pack::{FRONTEND_PACK_BYTES, PackError, PackKeys, ReadCache, WriterKind};
-use kbf_state::{MAX_BATCH, PackIndex};
+use kbf_pack_index::{MAX_BATCH, PackIndex};
 use kbf_types::{Digest, DigestFunction};
 use tonic::Code;
 

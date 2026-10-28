@@ -172,11 +172,19 @@ const PATH_USE: &[&str] = &[
 /// Test files that use a host path on purpose, with how many lines do (the count is pinned,
 /// so a second use in the same file is refused until it is argued here). Key: path, count,
 /// reason.
-pub const HOST_PATH_ALLOWANCE: &[(&str, usize, &str)] = &[(
-    "crates/kbf-cli/tests/deploy_units.rs",
-    2,
-    "asserts the default of `api-token-file` as a `Path` value; nothing is opened",
-)];
+pub const HOST_PATH_ALLOWANCE: &[(&str, usize, &str)] = &[
+    (
+        "crates/kbf-cli/tests/deploy_units.rs",
+        2,
+        "asserts the default of `api-token-file` as a `Path` value; nothing is opened",
+    ),
+    (
+        "crates/kbf-host-install/tests/rehearsal/mod.rs",
+        1,
+        "the update rehearsals lay out and update the real host layout on purpose: root, \
+         `#[ignore]`, run only through `cargo xtask sudo-test` on a throwaway hosted runner",
+    ),
+];
 
 /// Lines of `text` (comments left out) that name a [`HOST_PATHS`] literal in a path use.
 fn host_path_uses(text: &str) -> usize {

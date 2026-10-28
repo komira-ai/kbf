@@ -9,9 +9,10 @@ use std::error::Error;
 use std::future::pending;
 use std::sync::Arc;
 
+use kbf_pack_index::schema::test_database;
+use kbf_pack_index::{BlobDigest, NewPack, PackBlob, PackIndex};
 use kbf_server::frontend::{self, FrontendFlags, FrontendHandle, start_frontend};
-use kbf_state::postgres::{PostgresConfig, TestDatabase, schema, test_database};
-use kbf_state::{BlobDigest, NewPack, PackBlob, PackIndex};
+use kbf_state::postgres::{PostgresConfig, TestDatabase, schema};
 
 /// The flags of a frontend on loopback ports over the state store at `url`, with
 /// `--pack-index` as `pack_index` says.

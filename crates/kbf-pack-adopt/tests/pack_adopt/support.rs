@@ -11,10 +11,11 @@ use kbf_objstore::s3::{S3Store, fake::FakeS3};
 use kbf_objstore::{Capabilities, ObjectKey, ObjectStore};
 use kbf_pack::{Fetch, Reader, ReaderConfig, blob_digest};
 use kbf_pack_adopt::{Seams, main_with, main_with_seams};
+use kbf_pack_index::memory::MemoryPackIndex;
+use kbf_pack_index::{BlobDigest, PackIndex, PackIndexError};
 use kbf_segments::{MAX_SEGMENT_BYTES, SegmentWriter};
-use kbf_state::pack_index::memory::MemoryPackIndex;
+use kbf_state::ManualClock;
 use kbf_state::postgres::PostgresConfig;
-use kbf_state::{BlobDigest, ManualClock, PackIndex, PackIndexError};
 use kbf_testkit::dir::TestDir;
 
 /// The URL given to the flag when a seam opens the index: parsed, and never connected to.

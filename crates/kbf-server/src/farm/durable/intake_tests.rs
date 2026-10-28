@@ -80,6 +80,7 @@ pub(super) fn invalid(lease: LeaseId) -> worker::Result {
         action_digest: None,
         memory_kill: 0,
         lost: 0,
+        job_outcome: None,
     }
 }
 
