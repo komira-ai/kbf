@@ -6,10 +6,13 @@
 //! the reasons a frontend refuses a node).
 //!
 //! The crate has two parts. The `sched` module is generic: scheduling vocabulary with no
-//! REAPI and no content `Digest`. Work is keyed there by a `WorkKey` and a stored result
-//! is a `ResultRef`; the build's `ActionKey` and `Digest` convert to and from them.
+//! REAPI and no content `Digest`. It is `js_types::sched` of the `komira-ai/jobscheduler`
+//! repository, at the revision pinned in the workspace `Cargo.toml`, re-exported here.
+//! Work is keyed there by a `WorkKey` and a stored result is a `ResultRef`; the build's
+//! `ActionKey` and `Digest` convert to and from them (`action_key.rs`, `result_ref.rs`).
 //! Everything else is specific to building. The generic items are re-exported at the
-//! root, so existing paths are unchanged.
+//! root, so existing paths are unchanged. The root's `LeaseId` and `Resources` are
+//! `sched`'s, not the different types of the same names at the root of `js_types`.
 //!
 //! This is a pure crate: no async runtime, network, clock, randomness or hashed
 //! collections. The layering test in `kbf-integration-test` and the lists in `clippy.toml` enforce it.
@@ -29,7 +32,11 @@ pub mod operator_api;
 mod platform;
 mod release;
 mod result_ref;
-pub mod sched;
+
+/// The scheduler's vocabulary, from `js_types::sched`.
+pub mod sched {
+    pub use js_types::sched::*;
+}
 
 pub use action_key::{ActionKey, NotAnActionKey, work_key};
 pub use digest::{Digest, DigestFunction, ParseDigestError};

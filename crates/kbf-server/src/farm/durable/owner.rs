@@ -255,10 +255,7 @@ impl Durable {
         let Some(row) = self.store.get(&key)? else {
             return Ok(None);
         };
-        Ok(match decode(&key, &row.value) {
-            Ok(FarmInput::WorkerUp { instance, .. }) => Some(instance),
-            _ => None,
-        })
+        Ok(self.session_row(&key, &row).ok().map(|up| up.instance))
     }
 
     fn remember_owner(&self, worker: &WorkerId, state: Ownership) {

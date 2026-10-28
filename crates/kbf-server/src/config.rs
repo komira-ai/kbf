@@ -332,6 +332,19 @@ pub struct Args {
     /// until it ends.
     #[arg(long, value_enum, default_value_t = crate::LearnedSizes::Off)]
     pub learned_sizes: crate::LearnedSizes,
+    /// Which core drives the farm's scheduling. `legacy`, the default, is the driver the
+    /// server has always had. `js` is not available in this release: a server given it
+    /// refuses to start (exit status 2) and says so. The core a server runs is logged at
+    /// start and exported as `kbf_scheduler_core{core}`, 1 for it and 0 for the other
+    // The text above states the default; the help golden cannot hold the whitespace-only
+    // line clap prints before a `[default: ...]` line.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = crate::SchedulerCore::Legacy,
+        hide_default_value = true
+    )]
+    pub scheduler_core: crate::SchedulerCore,
     /// How long, in seconds, a finished operation is kept after its callers are
     /// answered. Within it, WaitExecution on the operation's name streams its result
     /// (a client whose Execute stream broke gets a result the action cache does not
@@ -704,9 +717,29 @@ pub enum ConfigError {
         #[source]
         source: PolicyError,
     },
+    /// `--scheduler-core` names a core this release does not have.
+    #[error(
+        "--scheduler-core {}: that core is not available yet in this release; run with \
+         --scheduler-core {} (the default)",
+        .0.name(),
+        crate::SchedulerCore::RUNNING.name()
+    )]
+    SchedulerCoreUnavailable(crate::SchedulerCore),
 }
 
 impl Args {
+    /// Refuses a `--scheduler-core` this release cannot run.
+    ///
+    /// # Errors
+    /// [`ConfigError::SchedulerCoreUnavailable`]: the core is `js`.
+    pub fn check_scheduler_core(&self) -> Result<(), ConfigError> {
+        if self.scheduler_core.available() {
+            Ok(())
+        } else {
+            Err(ConfigError::SchedulerCoreUnavailable(self.scheduler_core))
+        }
+    }
+
     /// The directory of the durable log file: `--log-dir`, else `log` in the hot
     /// store's directory (beside `meta`), else none.
     #[must_use]
