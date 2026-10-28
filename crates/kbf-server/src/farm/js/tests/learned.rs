@@ -258,7 +258,7 @@ fn estimate_rows(store: &Fake) -> usize {
 /// Asserts an own-limit kill that ends the operation (the ladder is spent, no requeue
 /// carries it) is written to the store at once, with no usage reported (the kill teaches the
 /// estimator by its node's OS and the limit it died at), and that a farm started over the
-/// same store takes the summary up again: the action is known to it (cold, not missing).
+/// same store takes the summary up again: the action is known to it (known, with the floor the kill left, not missing).
 /// Catches: the kill left to the write-behind, so a crash in the next seconds loses it; no
 /// restore on start; a store that is written with no store.
 #[tokio::test(start_paused = true)]
@@ -289,5 +289,7 @@ async fn a_kill_that_ends_the_operation_is_written_at_once_and_a_restart_reads_i
     let lines = estimates(&log.text(), argv);
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert!(lines[0].contains("fallback=Missing"), "{}", lines[0]);
-    assert!(lines[1].contains("fallback=Cold"), "{}", lines[1]);
+    // The kill left a floor the 4 GiB node cannot meet: the action is known, with a floor.
+    assert!(lines[1].contains("fallback=OverCap"), "{}", lines[1]);
+    assert!(lines[1].contains("floor_mib=3840"), "{}", lines[1]);
 }
