@@ -23,6 +23,9 @@ futures.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
 hyper-util = { workspace = true, features = ["tokio"] }
+# The scheduler's rows in the state store (src/farm_js): the farm's row codec and its
+# build-only rows are written against this crate's `RowCodec` and `Ext`.
+js-store.workspace = true
 kbf-auth.workspace = true
 kbf-ca.workspace = true
 kbf-front.workspace = true

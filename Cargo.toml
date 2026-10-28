@@ -82,6 +82,7 @@ js-sched = { git = "https://github.com/komira-ai/jobscheduler", rev = "c9acfec5a
 js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "c9acfec5aeb45c35254585861493009e35f060d1" }
 js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "c9acfec5aeb45c35254585861493009e35f060d1" }
 js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "c9acfec5aeb45c35254585861493009e35f060d1" }
+js-store = { git = "https://github.com/komira-ai/jobscheduler", rev = "c9acfec5aeb45c35254585861493009e35f060d1" }
 js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "c9acfec5aeb45c35254585861493009e35f060d1" }
 js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "c9acfec5aeb45c35254585861493009e35f060d1" }
 md-5 = "0.11.0"

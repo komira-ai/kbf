@@ -211,11 +211,11 @@ const FATE: &str = "fate/";
 const FLOOR: &str = "floor/";
 const KEY_FLOOR: &str = "keyfloor/";
 const OPKEY: &str = "opkey/";
-const ESTIMATE: &str = "est/";
+pub(crate) const ESTIMATE: &str = "est/";
 /// Rows of one transaction of the size sweep, and the most transactions of one call.
 pub(super) const SWEEP_ROWS: usize = 256;
 pub(super) const SWEEP_TXNS: usize = 4;
-const SUBJECT: &str = "subject/";
+pub(crate) const SUBJECT: &str = "subject/";
 
 /// The least time a `done/` row is kept, whatever the finished retention: a process that
 /// follows an operation it did not finish needs the row for as long as a stream it kept
@@ -411,18 +411,20 @@ pub(super) enum Held {
 
 mod blocks;
 mod codec;
-mod estimate;
+// `estimate`, `named` and `subject` hold the formats of the build-only rows, which the
+// adapter over `js-store` (`crate::farm_js`) writes too.
+pub(crate) mod estimate;
 mod ext;
 mod fate;
 mod floor;
 mod inflight;
 pub(super) mod intake;
 mod leases;
-mod named;
+pub(crate) mod named;
 mod opkey;
 mod owner;
 mod reads;
-mod subject;
+pub(crate) mod subject;
 mod sweep;
 mod transitions;
 
@@ -1732,6 +1734,8 @@ mod submit_tests;
 mod sweep_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod timing_tests;
 #[cfg(test)]
 mod transition_tests;
 #[cfg(test)]

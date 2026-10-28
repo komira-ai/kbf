@@ -1365,6 +1365,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "js-store"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=c9acfec5aeb45c35254585861493009e35f060d1#c9acfec5aeb45c35254585861493009e35f060d1"
+dependencies = [
+ "js-caps",
+ "js-sched",
+ "js-state",
+ "js-types",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2501,6 +2514,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "hyper-util",
+ "js-store",
  "kbf-auth",
  "kbf-ca",
  "kbf-caps",
