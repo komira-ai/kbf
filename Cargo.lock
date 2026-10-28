@@ -2460,6 +2460,7 @@ dependencies = [
  "kbf-route",
  "kbf-sched",
  "kbf-segments",
+ "kbf-server",
  "kbf-signer",
  "kbf-sim",
  "kbf-state",
