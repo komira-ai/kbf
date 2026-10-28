@@ -7,8 +7,9 @@
 //!
 //! - kbf-server defines the feature (a renamed or removed feature would pass the rest
 //!   vacuously);
-//! - the only line of any manifest that names it, comments aside, is the feature's own
-//!   definition in kbf-server's manifest: it is in no `default` list, in no other
+//! - the only lines of any manifest that name it, comments aside, are the feature's own
+//!   definition in kbf-server's manifest and the `kbf` binary's forwarding flag
+//!   (`farm-core-js = ["kbf-server/farm-core-js"]`): it is in no `default` list, in no other
 //!   feature's list, and in no dependency's `features` (the `kbf` binary's, the
 //!   workspace's, a dev-dependency's), so no default or release feature set carries it.
 
@@ -18,6 +19,10 @@ const FEATURE: &str = "farm-core-js";
 
 /// The manifest that defines the feature, as a path from the repository root.
 const OWNER: &str = "crates/kbf-server/Cargo.toml";
+
+/// The manifest of the `kbf` binary, which forwards the feature under the same name so a
+/// build can ask for it with `-p kbf-cli --features farm-core-js`.
+const FORWARDER: &str = "crates/kbf-cli/Cargo.toml";
 
 /// Every `Cargo.toml` under `dir` as (path from `root`, text), in path order.
 fn manifests(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
@@ -57,6 +62,9 @@ fn problems(manifests: &[(String, String)]) -> Vec<String> {
             }
             if path == OWNER && line.starts_with(&format!("{FEATURE} =")) {
                 defined = true;
+            } else if path == FORWARDER && line == format!("{FEATURE} = [\"kbf-server/{FEATURE}\"]")
+            {
+                // The `kbf` binary's own flag for the feature, off like the feature.
             } else {
                 out.push(format!("{path}:{}: {line}", number + 1));
             }
@@ -131,6 +139,21 @@ fn the_check_refuses_each_way_to_turn_the_feature_on() {
     let chained = owner.replace("testkit = []", "release = [\"farm-core-js\"]");
     let bad = [manifest(OWNER, &chained)];
     assert_eq!(problems(&bad).len(), 1, "{:?}", problems(&bad));
+
+    let forward = "[features]\nfarm-core-js = [\"kbf-server/farm-core-js\"]\n";
+    let ok = [manifest(OWNER, owner), manifest(FORWARDER, forward)];
+    assert!(is_clean(&problems(&ok)), "{:?}", problems(&ok));
+    let default_forward = format!("{forward}default = [\"farm-core-js\"]\n");
+    let bad = [
+        manifest(OWNER, owner),
+        manifest(FORWARDER, &default_forward),
+    ];
+    assert_eq!(problems(&bad).len(), 1, "{:?}", problems(&bad));
+    let elsewhere = [
+        manifest(OWNER, owner),
+        manifest("crates/kbf-node/Cargo.toml", forward),
+    ];
+    assert_eq!(problems(&elsewhere).len(), 1, "{:?}", problems(&elsewhere));
 
     let gone = [manifest(OWNER, "[features]\ntestkit = []\n")];
     assert_eq!(problems(&gone).len(), 1, "{:?}", problems(&gone));

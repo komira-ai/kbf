@@ -81,7 +81,10 @@ fn the_parsed_flag_reaches_the_listeners() {
     assert_eq!(core(&[]), SchedulerCore::Legacy);
     assert_eq!(core(&["--scheduler-core=legacy"]), SchedulerCore::Legacy);
     assert_eq!(core(&["--scheduler-core=js"]), SchedulerCore::Js);
-    assert_eq!(SchedulerCore::under_test(), SchedulerCore::RUNNING);
+    assert_eq!(
+        SchedulerCore::under_test() == SchedulerCore::Js,
+        cfg!(feature = "farm-core-js")
+    );
 }
 
 /// Catches the start line missing the core, or naming another one.
