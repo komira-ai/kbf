@@ -443,3 +443,27 @@ async fn readings_reach_the_node_view() {
     assert!(stale.stale);
     assert_eq!(stale.measured_cpu_millicores, None);
 }
+
+/// Asserts that a restarted daemon whose first reading fails validation leaves the node with
+/// no load: the earlier process's reading is not shown for it, and a first reading that
+/// cannot be believed is not kept as a baseline. Catches the old session's reading kept
+/// after a restart, and a refused first reading stored anyway.
+#[tokio::test(start_paused = true)]
+async fn a_restarted_daemons_unbelievable_first_reading_leaves_no_load() {
+    let farm = farm();
+    let a = WorkerId::new("a");
+    let first = register(&farm, "a", "proc-1");
+    farm.note_node_load(&a, first, Some(&reading(1, SECOND, 0)));
+    farm.note_node_load(&a, first, Some(&reading(2, 2 * SECOND, 2 * SECOND)));
+    assert!(detail(&farm, "a").load.is_some());
+
+    let restarted = register(&farm, "a", "proc-2");
+    farm.note_node_load(&a, restarted, Some(&reading(0, SECOND, 0)));
+    assert_eq!(detail(&farm, "a").load, None);
+    assert!(!farm.lock().side.node_loads.contains_key(&a));
+
+    // Its next believable reading is a first one again: no rate yet.
+    farm.note_node_load(&a, restarted, Some(&reading(1, 2 * SECOND, SECOND)));
+    let load = detail(&farm, "a").load.expect("a load");
+    assert_eq!(load.measured_cpu_millicores, None);
+}
