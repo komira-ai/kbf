@@ -524,6 +524,23 @@ async fn a_failure_for_another_target_does_not_end_the_order() {
     );
 }
 
+/// Catches: any report of a finished update ending an order: a host that reports a
+/// successful update to a different version, while still at the old version and not yet
+/// updating to the ordered one, has not reported the order, so it still holds its slot.
+#[tokio::test]
+async fn a_success_for_another_target_does_not_end_the_order() {
+    let rig = started("svc-order-other-success", ONE_STORAGE).await;
+    let c = &rig.coordinator;
+    c.heartbeat(storage("s1"), beat("1.0"));
+    assert_eq!(c.heartbeat(storage("s2"), beat("1.0")), update("2.0"));
+    c.heartbeat(storage("s2"), last(beat("1.0"), "1.5", Outcome::Succeeded));
+    assert_eq!(
+        c.heartbeat(storage("s3"), beat("1.0")),
+        Reply::Nothing,
+        "s2's report is about 1.5; its order for 2.0 still holds the slot"
+    );
+}
+
 /// Catches: a new desired version leaving the host's old order in place: the host is
 /// ordered to the new version, the order is dated from then (not from the first), and it
 /// holds the slot until it ages out from that time.
