@@ -199,12 +199,13 @@ impl Member {
         told.expect("the serving task told its end");
     }
 
-    /// Stops the frontend and waits until it has ended. Its two drain waits are ended first,
-    /// so a frontend that has not drained goes through its sequence at once.
+    /// Stops the frontend and waits until it has ended. The stop is forced as a second signal
+    /// forces it, so a frontend that has not drained, or still holds an execution, goes
+    /// through its sequence at once.
     async fn stop(mut self) {
         self.drain.end_lb_wait();
-        self.drain.end_deadline();
         self.signal();
+        self.drain.close();
         let ended = tokio::time::timeout(Duration::from_secs(30), self.served).await;
         let served = ended.expect("the frontend ends").expect("its task");
         served.expect("served without an error");

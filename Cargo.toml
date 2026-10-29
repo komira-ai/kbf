@@ -77,16 +77,17 @@ hyper-util = { version = "0.1.21", default-features = false }
 # (a lease id, say) is the same type in every kbf crate; a test in kbf-integration-test
 # reads Cargo.lock and refuses a second source. The revision is raised by a pull request
 # of its own that runs the whole CI, never along with other changes.
-js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
-js-sched = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
-js-server-core = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
-js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
-js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
-js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
-js-store = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
-js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
-js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
-js-whole = { git = "https://github.com/komira-ai/jobscheduler", rev = "3692799c4a336e392a494a0248050152312c47ee" }
+js-caps = { git = "https://github.com/komira-ai/jobscheduler", rev = "772628f4356de822e8fe9971d807e368c70be479" }
+js-sched = { git = "https://github.com/komira-ai/jobscheduler", rev = "772628f4356de822e8fe9971d807e368c70be479" }
+js-server-core = { git = "https://github.com/komira-ai/jobscheduler", rev = "772628f4356de822e8fe9971d807e368c70be479" }
+js-sim = { git = "https://github.com/komira-ai/jobscheduler", rev = "772628f4356de822e8fe9971d807e368c70be479" }
+js-sizing = { git = "https://github.com/komira-ai/jobscheduler", rev = "772628f4356de822e8fe9971d807e368c70be479" }
+js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "772628f4356de822e8fe9971d807e368c70be479" }
+js-store = { git = "https://github.com/komira-ai/jobscheduler", rev = "772628f4356de822e8fe9971d807e368c70be479" }
+js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "772628f4356de822e8fe9971d807e368c70be479" }
+js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "772628f4356de822e8fe9971d807e368c70be479" }
+js-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "772628f4356de822e8fe9971d807e368c70be479" }
+js-whole = { git = "https://github.com/komira-ai/jobscheduler", rev = "772628f4356de822e8fe9971d807e368c70be479" }
 md-5 = "0.11.0"
 # macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
 objc2 = "0.6.5"
@@ -266,6 +267,7 @@ kbf-ui = { path = "crates/kbf-ui" }
 kbf-unitfile = { path = "crates/kbf-unitfile" }
 kbf-update = { path = "crates/kbf-update" }
 kbf-updater = { path = "crates/kbf-updater" }
+kbf-usage = { path = "crates/kbf-usage" }
 # The hot/cold object store library; it depends on no kbf crate unless its `s3` feature is on
 # (kbf-integration-test keeps it so).
 tierstore = { path = "crates/tierstore" }

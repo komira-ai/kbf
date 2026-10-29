@@ -1,6 +1,7 @@
 //! Unit tests of `node_load`: the parsers over real-format files, the reader over a
 //! directory, and the tracker's covered set, windows and sequence number.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
@@ -109,6 +110,28 @@ fn memory_stat_gives_inactive_file() {
     }
 }
 
+/// Catches `inactive_file` or `active_anon` read for `active_file`, and a missing or
+/// garbled line read as 0 (which would make the admission working set look larger or smaller
+/// than the cgroup's).
+#[test]
+fn memory_stat_gives_active_file() {
+    assert_eq!(parse_active_file(MEMORY_STAT), Ok(6_291_456));
+    for bad in [
+        "",
+        "inactive_file 5\nactive_anon 5\n",
+        "active_file x\n",
+        "active_file\n",
+    ] {
+        assert!(matches!(
+            parse_active_file(bad),
+            Err(LoadError::Malformed {
+                file: "memory.stat",
+                ..
+            })
+        ));
+    }
+}
+
 /// Catches `max 100000` read as a limit, a quota read as none, and a garbled file read
 /// as either.
 #[test]
@@ -167,6 +190,7 @@ fn a_directory_of_cgroup_files_is_one_reading() {
             mono_usec: 77,
             cpu_usage_usec: 5_000_000,
             working_set_bytes: 10_485_760 - 2_097_152,
+            active_file_bytes: 6_291_456,
             covered: BTreeSet::new(),
             actions_cpu_limited: false,
             throttled_usec: Some(123_456),
@@ -189,7 +213,7 @@ fn the_clock_is_read_right_after_cpu_stat() {
     let dir = cgroup("load-clock-order");
     usage(&dir, 1);
     write(&dir, "memory.current", "1000\n");
-    write(&dir, "memory.stat", "inactive_file 0\n");
+    write(&dir, "memory.stat", "inactive_file 0\nactive_file 0\n");
     let moved = dir.to_path_buf();
     let ticking: MonoClock = Arc::new(move || {
         usage(&moved, 2);
@@ -315,6 +339,38 @@ async fn covered_leases_ran_the_whole_window() {
         .expect("second");
     assert_eq!(second.seq, 2);
     assert_eq!(second.covered, BTreeSet::from([id(1), id(3), id(5)]));
+}
+
+/// Catches a lease that ended while its cgroup was being read coming back to life: the
+/// reading finishes, and the lease is neither running again nor holding a peak.
+#[tokio::test]
+async fn a_lease_that_ends_during_a_reading_stays_ended() {
+    let actions = cgroup("load-ends-during");
+    let leases = crate::unit_dir("load-ends-during-leases");
+    let slot: Arc<OnceLock<Arc<LoadTracker>>> = Arc::new(OnceLock::new());
+    let hook = Arc::clone(&slot);
+    // Every reading of the clock ends lease 1, as its run ending on another thread would.
+    let clock: MonoClock = Arc::new(move || {
+        if let Some(tracker) = hook.get() {
+            tracker.ended(id(1));
+        }
+        7
+    });
+    let tracker = Arc::new(LoadTracker::new(clock));
+    for n in [1, 2] {
+        let dir = leases.join(format!("l{n}"));
+        std::fs::create_dir(&dir).expect("mkdir");
+        usage(&dir, 0);
+        tracker.started(id(n), dir);
+    }
+    assert!(slot.set(Arc::clone(&tracker)).is_ok(), "set once");
+    tracker
+        .reading(actions.to_path_buf())
+        .await
+        .expect("reading");
+    assert!(!tracker.running().contains_key(&id(1)));
+    assert!(tracker.running().contains_key(&id(2)));
+    assert_eq!(tracker.take_peak(id(1)), None);
 }
 
 /// Catches a failed reading counting as one (the next would then skip a sequence number

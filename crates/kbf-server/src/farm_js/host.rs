@@ -3,9 +3,12 @@
 //! [`Core::submit`](js_server_core::Core::submit), [`Core::report`](js_server_core::Core::report))
 //! and the counters operators read. None of these is a hook: the core never calls them.
 
+use std::time::UNIX_EPOCH;
+
 use js_server_core::{Admitted, Held, Stream, View};
 use kbf_front::{ExecuteCall, Stage, Ticket};
-use kbf_proto::worker::{self, ServerMessage};
+use kbf_proto::update::UpdateStatus;
+use kbf_proto::worker::{self, NodeStatus, ServerMessage};
 use kbf_sched::OpState;
 use kbf_types::{ActionKey, LeaseId, LeaseKind, OperationId, WorkerId};
 use tokio::sync::watch;
@@ -13,7 +16,9 @@ use tokio::sync::watch;
 use super::adapter::{Attached, KbfAdapter, Outbound, show_on};
 use crate::action_usage::Subject;
 use crate::answer::Detail;
+use crate::fleet::take_node_status;
 use crate::machine::{Platform, Waiter, stored_name};
+use crate::update_status::UpdateReport;
 
 /// A worker's newest stream, as the farm holds it: where its messages go, and the first one.
 #[derive(Debug)]
@@ -37,6 +42,15 @@ pub struct Caller {
     pub usage: Subject,
     /// The OS family and ISA the action asked for.
     pub platform: Platform,
+}
+
+/// The number the core gave `stream`, which the farm's `StreamId` carries. Always `Some`; the
+/// `Option` keeps the callers written as `StreamId(stream_number(stream)?)`. A caller that
+/// registers a worker returns that `StreamId`: any other numbering makes every status and
+/// pack count the views take for the stream be ignored.
+#[must_use]
+pub fn stream_number(stream: Stream) -> Option<u64> {
+    Some(stream.number())
 }
 
 impl KbfAdapter {
@@ -174,6 +188,50 @@ impl KbfAdapter {
         self.nodes
             .get(worker)
             .is_some_and(|node| node.stream == stream)
+    }
+
+    /// `worker`'s newest stream, if it is the one the farm calls `number`: the farm numbers a
+    /// stream by the number the core gave it ([`stream_number`]).
+    #[must_use]
+    pub fn current_stream(&self, worker: &WorkerId, number: u64) -> Option<Stream> {
+        let node = self.nodes.get(worker)?;
+        (stream_number(node.stream) == Some(number)).then_some(node.stream)
+    }
+
+    /// A `NodeStatus` of `worker` on `stream`: kept as the node's newest, unless `stream`
+    /// was replaced (a newer stream sends its own after its `Welcome`). Returns the
+    /// attention items it raises or clears against the node's previous status, from any
+    /// stream, `true` for each raised; each is logged once, as the farm's own driver logs
+    /// it ([`take_node_status`]). The time it was received is the wall clock's now.
+    pub fn report_node_status(
+        &mut self,
+        worker: &WorkerId,
+        stream: Stream,
+        status: NodeStatus,
+    ) -> Vec<(bool, String)> {
+        if !self.is_current(worker, stream) {
+            return Vec::new();
+        }
+        let received = (self.wall)().duration_since(UNIX_EPOCH).map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        });
+        take_node_status(&mut self.machine, worker, status, received)
+    }
+
+    /// An `UpdateStatus` of `worker` on `stream`: kept as the node's newest, unless `stream`
+    /// was replaced. Returns whether it was kept.
+    pub fn report_update_status(
+        &mut self,
+        worker: &WorkerId,
+        stream: Stream,
+        status: UpdateStatus,
+    ) -> bool {
+        let current = self.is_current(worker, stream);
+        if current {
+            self.machine
+                .report_update(worker, UpdateReport::new(status));
+        }
+        current
     }
 
     /// The pack-read counts of a heartbeat of `worker` on `stream`: kept as the node's

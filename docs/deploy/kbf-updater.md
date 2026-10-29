@@ -54,11 +54,26 @@ All are flags; none is read from the environment.
 | `--state-dir`, `--inventory`, `--proxy-uid`, `--token-file`, `--ssh-key-file`, `--ssh-user`, `--channel` | required |
 | `--operator-api http://<loopback ip>:<port>` | required: the frontend's operator API, for safe-to-stop and the health of storage and daemon hosts. Not a loopback address is refused |
 | `--socket` | the roll API's socket, for tests and development; in production systemd passes it |
-| `--ssh-connect-timeout-secs`, `--ssh-command-timeout-secs`, `--drain-deadline-secs`, `--apply-poll-secs`, `--apply-deadline-secs` | optional bounds in seconds; they default to 10, 900, 600, 5 and 600 |
-| `--peer-ready-secs`, `--frontend-drain-deadline-secs` | optional bounds in seconds, at least 1, for a frontend pool member: how long every other member must answer `/readyz` 200 in a row before a member is drained (default 30), and how long a member is given to exit once it is told to drain (default 1200, which must be longer than the longest execution a member may have open). |
+| `--ssh-connect-timeout-secs`, `--ssh-command-timeout-secs`, `--apply-poll-secs`, `--apply-deadline-secs` | optional bounds in seconds; they default to 10, 900, 5 and 600 |
+| `--drain-deadline-secs` | optional, 1 or more with no upper bound, absent by default. A daemon host's node is drained before its install and its leases are waited for however long they take. With the flag, a deadline that passes stops the waiting only: nothing is installed, the roll stops at the host with `drain_failed` and the node left drained (see [A daemon host's drain](#a-daemon-hosts-drain)). 0 is refused |
+| `--peer-ready-secs`, `--frontend-drain-deadline-secs` | `--peer-ready-secs`: optional, at least 1 (default 30), how long every other member must answer `/readyz` 200 in a row before a member is drained. `--frontend-drain-deadline-secs`: optional, 1 or more with no upper bound, absent by default; a member that was told to drain is waited for until it has exited, however long its executions run. With the flag, a deadline that passes fails the roll with the member left draining. 0 is refused |
 
 The updater reaches each member's operator API on loopback at `127.0.0.1:<base + 2>`, with the
 same token (`--token-file`) as `--operator-api`.
+
+## A daemon host's drain
+
+A daemon host's node is drained at the frontend (`POST /v1/nodes/{id}:drain`) before its install,
+and the roll reads the node's leases every poll until there are none, however long that takes: the
+install restarts the daemon, which would cut the leases it still holds, so it waits. Without
+`--drain-deadline-secs` the drain asks the frontend for no deadline of its own. With the flag, a
+deadline that passes with a lease still held stops the waiting and nothing else: the host is not
+installed, the roll stops at it with `drain_failed` ("`dm still holds N leases after the drain
+deadline of S s; nothing was installed and the leases run on; ...; node dm-node (dm) is left
+drained`"), the node stays drained (cordoned) and its leases run on. To try again, start another
+roll: it drains the node again (a drain of a drained node does nothing) and waits again. To give
+the node back without installing, uncordon it (`POST /v1/nodes/{id}:uncordon`, or `kbf cluster`).
+The node drain at the frontend is the frontend's cordon and is not changed by this.
 
 ## What a roll does with a frontend pool member
 
@@ -81,8 +96,8 @@ turn of a member is:
    until the member's operator API refuses the connection (it has exited) or its
    `GET /v1/frontend/drain` reports `"phase": "closing"` (the streams that are left are being
    closed and the process exits within seconds; a status with another phase, or none, is taken
-   to be still draining), for at most `--frontend-drain-deadline-secs`
-   (`drain_failed`). A member that answers the status but says it is not draining fails the roll
+   to be still draining), however long that takes, or until `--frontend-drain-deadline-secs`,
+   if it was given, is out (`drain_failed`). A member that answers the status but says it is not draining fails the roll
    at once (`drain_failed`). A member that is not running refuses the connection of the drain
    itself, has nothing to drain, and the turn goes on; a drain that gets no answer (a timeout)
    fails the roll with `frontend member a (fe-a) may be draining`.
@@ -100,14 +115,14 @@ Nothing is put back at the end: a drained frontend has exited, and the restart m
 which is ready or is not. The next member is rolled only when this one is ready, which is also
 what the next check asks of it.
 
-**The bound.** `--frontend-drain-deadline-secs` (default 1200) must be longer than the longest
-execution a member may have open, or the roll gives up on a drain that is still going as it
-should. The frontend in this tree puts no bound of its own on a drain that its endpoint began
-(`--shutdown-timeout-secs` bounds only a drain that a signal began), so an execution that runs
-past the bound fails every roll at that member until it ends. A drain that outlasts the bound
-fails the roll with `drain_failed` and `frontend member a (fe-a) is left draining`: the member
-goes on draining and exits by itself, and a new roll finds it stopped (its connection is refused)
-and goes on from the install.
+**The bound.** There is none unless `--frontend-drain-deadline-secs` is given: the roll waits for
+the member to exit however long the executions open on it run, and cuts none of them. The
+frontend in this tree puts no bound of its own on a drain that its endpoint began
+(`--shutdown-timeout-secs` bounds only a drain that a signal began). With the flag, a drain that
+outlasts the deadline fails the roll with `drain_failed` and `frontend member a (fe-a) is left
+draining`: the member goes on draining and exits by itself, and a new roll finds it stopped (its
+connection is refused) and goes on from the install. A deadline shorter than the longest
+execution a member may have open fails every roll at that member until the execution ends.
 
 **A member that is stopped, or a wrong `base`.** A member whose operator API refuses the
 connection of the first drain is taken for one that an earlier roll left stopped, and is installed
@@ -199,8 +214,9 @@ kbf-updater agent --coordinator <dns name>:<port> --channel NAME
 - `--service NAME,helper-socket=PATH[,SETTING=VALUE...]`: a service the host runs besides `kbf`, given once for
   each; see [Services besides kbf](#services-besides-kbf). Without it the agent is a
   `kbf`-only agent.
-- Times, in seconds, 1 to 86400: `--heartbeat-secs` 15, `--drain-deadline-secs` 600,
-  `--health-timeout-secs` 300, `--health-poll-secs` 5, `--retry-secs` 900.
+- Times, in seconds, 1 to 86400: `--heartbeat-secs` 15, `--health-timeout-secs` 300,
+  `--health-poll-secs` 5, `--retry-secs` 900. `--drain-deadline-secs` has no default and no
+  upper bound (1 or more): without it the node's leases are waited for however long they take.
 
 ### A frontend host
 
@@ -229,8 +245,9 @@ switch kbf=<version>
 confirm kbf=<version>
 ```
 
-The farm's frontend is down for the length of the switch (its `drain_secs`, the stop, and
-`ready_secs`), so do it when nothing needs it. The switch answers `switched` only after `/readyz` answered 200 on the
+The farm's frontend is down only from the moment the old container has ended, for the new one's start and
+`ready_secs`; the drain before that (no deadline unless `drain_secs` is set, and never cutting work) lets the old
+frontend finish what it has. The switch answers `switched` only after `/readyz` answered 200 on the
 new commit; send `confirm` then, or the helper reverts at the window's deadline.
 
 ### The heartbeat
@@ -253,15 +270,30 @@ before it worked:
    checked there. An unattested build, one of another commit, or one the channel does not have is
    refused here, and the node has not been touched.
 2. **Drain** the node at the frontend (`:drain`, with the updater's certificate on the frontend's
-   worker listener) and wait for its leases, for at most `--drain-deadline-secs`. A storage host
+   worker listener) and wait until it holds no lease, however long that takes. With
+   `--drain-deadline-secs`, a deadline that passes before that fails the update with the node
+   left drained, nothing switched, and the leases running on; the agent tries the same order
+   again after `--retry-secs`, which drains the node again and waits again. A storage host
    drains the **daemon part** of its node too when it has one (a `storage-and-daemon` host): its
    restart would cut the daemon off from its leases, so the drain is asked, and a node the
    frontend does not know (404) is a storage host without a daemon, which has nothing to drain.
-3. **Switch** (`switch`): the helper puts X on trial and restarts the units.
+3. **Switch** (`switch`): the helper puts X on trial and restarts the units. The agent's call
+   has no time limit: a frontend host's helper drains the container for as long as it takes
+   (`drain_secs` unset), and it serves one request at a time, so it cannot be asked anything
+   meanwhile. The agent waits on the open call; a helper that dies closes the socket, which ends
+   the wait at once as `unreachable`. The other calls keep their limits (an install 20 minutes, a
+   revert 10 minutes, the rest 1 minute). A helper that is alive and silent is waited for, bounded
+   by the helper's own deadlines (the drain deadline it is configured with, the stop, the readiness
+   wait).
 4. **Health**: the node's health check (`node_health`: a storage member is `active` on the build
    and no blob is known to be owed a copy, read from the frontend's
    `GET /v1/nodes/{id}/storage-health`; a daemon is connected on it) of X, held drained, for at
    most `--health-timeout-secs`, and never past the helper's deadline less ten seconds.
+   A daemon is connected to one frontend only, and `--frontend` is the load balancer's name,
+   which picks a frontend per connection: a frontend that does not hold the node answers
+   "not connected" (or 404). The agent therefore asks up to 8 times, each on a new connection,
+   and takes the first answer that says connected; it reports "is not connected" only when
+   none does. A client with `--operator-api` reaches one frontend and asks once.
 5. **Confirm** X if it is healthy. If it is not, **revert**: the helper does that by itself at its
    deadline whatever this process is doing; the agent asks for it at once.
 6. **Undrain** only if the node is healthy: on X after a confirm, or on the release that ran

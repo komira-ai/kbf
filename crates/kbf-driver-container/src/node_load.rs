@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
+use kbf_proto::worker;
 use kbf_types::LeaseId;
 
 use crate::cgroup_usage::cpu_stat;
@@ -37,6 +38,8 @@ pub struct NodeLoad {
     pub cpu_usage_usec: u64,
     /// `memory.current` minus `inactive_file` of `memory.stat`, floored at 0.
     pub working_set_bytes: u64,
+    /// `active_file` of `memory.stat`.
+    pub active_file_bytes: u64,
     /// The leases that ran for the whole window since the previous reading: started (the
     /// container, after inputs and image) at or before the previous reading's
     /// `mono_usec`, and running now. Empty for the first reading.
@@ -49,6 +52,32 @@ pub struct NodeLoad {
     /// The cumulative `total=` (microseconds) of the `some` line of `cpu.pressure`, when
     /// the kernel has pressure files.
     pub pressure_some_total_usec: Option<u64>,
+}
+
+impl NodeLoad {
+    /// The reading as the daemon sends it in a heartbeat.
+    pub(crate) fn into_proto(self) -> worker::NodeLoad {
+        worker::NodeLoad {
+            seq: self.seq,
+            mono_usec: self.mono_usec,
+            cpu_usage_usec: self.cpu_usage_usec,
+            memory_working_set_bytes: self.working_set_bytes,
+            covered: self
+                .covered
+                .into_iter()
+                .map(|id| worker::LeaseId {
+                    term: id.term,
+                    seq: id.seq,
+                })
+                .collect(),
+            actions_cpu_limited: self.actions_cpu_limited,
+            cpu_throttled_usec: self.throttled_usec,
+            cpu_pressure_some_total_usec: self.pressure_some_total_usec,
+            memory_active_file_bytes: self.active_file_bytes,
+            lease_clocks: Vec::new(),
+            minutes: Vec::new(),
+        }
+    }
 }
 
 /// Why a reading could not be made.
@@ -87,12 +116,22 @@ pub(crate) fn parse_memory_current(text: &str) -> Result<u64, LoadError> {
 
 /// `inactive_file` of a `memory.stat`.
 pub(crate) fn parse_inactive_file(text: &str) -> Result<u64, LoadError> {
-    text.lines()
-        .find_map(|line| {
-            let mut words = line.split_whitespace();
-            (words.next()? == "inactive_file").then(|| words.next()?.parse().ok())?
-        })
+    memory_stat_key(text, "inactive_file")
         .ok_or_else(|| malformed("memory.stat", "no usable inactive_file"))
+}
+
+/// `active_file` of a `memory.stat`. Strict like [`parse_inactive_file`]: every cgroup v2
+/// `memory.stat` has both lines, so a file without one is not the file the reading needs.
+pub(crate) fn parse_active_file(text: &str) -> Result<u64, LoadError> {
+    memory_stat_key(text, "active_file")
+        .ok_or_else(|| malformed("memory.stat", "no usable active_file"))
+}
+
+fn memory_stat_key(text: &str, key: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        (words.next()? == key).then(|| words.next()?.parse().ok())?
+    })
 }
 
 /// Whether a `cpu.max` (`max 100000` or `<quota> <period>`) holds a quota.
@@ -149,7 +188,9 @@ pub(crate) fn read_load(dir: &Path, clock: &dyn Fn() -> u64) -> Result<NodeLoad,
     let (cpu_usage_usec, throttled_usec) = parse_cpu_stat(&read(dir, "cpu.stat")?)?;
     let mono_usec = clock();
     let current = parse_memory_current(&read(dir, "memory.current")?)?;
-    let inactive = parse_inactive_file(&read(dir, "memory.stat")?)?;
+    let stat = read(dir, "memory.stat")?;
+    let inactive = parse_inactive_file(&stat)?;
+    let active_file_bytes = parse_active_file(&stat)?;
     let actions_cpu_limited = match read_optional(dir, "cpu.max")? {
         Some(text) => parse_cpu_limited(&text)?,
         None => false,
@@ -163,6 +204,7 @@ pub(crate) fn read_load(dir: &Path, clock: &dyn Fn() -> u64) -> Result<NodeLoad,
         mono_usec,
         cpu_usage_usec,
         working_set_bytes: current.saturating_sub(inactive),
+        active_file_bytes,
         covered: BTreeSet::new(),
         actions_cpu_limited,
         throttled_usec,

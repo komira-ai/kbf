@@ -173,9 +173,8 @@ async fn a_result_is_refused_for_an_unknown_lease_another_action_or_a_copy() {
 }
 
 /// Asserts that a result a node sends for a lease that was taken up from the state store,
-/// which the adapter never sent, is accepted when the store's request is readable (its
-/// action is the first caller's), and refused as unknown when the request cannot be read
-/// and so no caller was recorded: the lease is not answered with an action it never named.
+/// which the adapter never sent, is accepted: its action is the first caller's, taken from
+/// the request the core passed as it took the operation up.
 #[tokio::test(start_paused = true)]
 async fn a_lease_taken_up_from_the_store_is_answered_for_the_action_of_its_first_caller() {
     let store = Flaky::new();
@@ -192,27 +191,6 @@ async fn a_lease_taken_up_from_the_store_is_answered_for_the_action_of_its_first
         .expect("an ack");
 
     assert!(ack.accepted, "{ack:?}");
-
-    let store = Flaky::new();
-    let first = rig_over(&store, kbf_front::Recorder::off());
-    let mut node = register(&first, "node-a", 0);
-    submit(&first, 1, 0).expect("queued");
-    let lease = started(&node.sent()).expect("started");
-    drop(first);
-    let second = rig_over(&store, kbf_front::Recorder::off());
-    // The core reads the operation's row once as it takes the lease up; the adapter's own
-    // read of it, which follows, fails.
-    store.fail_gets_after(Some("op/"), 1);
-    register(&second, "node-a", 0);
-
-    let ack = report_of(&second, "node-a", ran(lease, 0))
-        .await
-        .expect("an ack");
-
-    assert_eq!(
-        (ack.accepted, ResultAckReason::try_from(ack.reason).ok()),
-        (false, Some(ResultAckReason::UnknownLease))
-    );
 }
 
 /// Asserts that a result the state store could not take when it came is not acknowledged and

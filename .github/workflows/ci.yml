@@ -101,6 +101,13 @@ jobs:
         if: ${{ !cancelled() }}
       - run: cargo test -p kbf-setup --lib --locked no_proxy_tests
         if: ${{ !cancelled() }}
+      # The server's `farm-core-js` feature (the farm on the js scheduler core, off in every
+      # build above and below): the code that only it compiles is linted, and its construction
+      # tests run. Alone in the commands, so that no other package turns the feature on.
+      - run: cargo clippy -p kbf-server --all-targets --features farm-core-js --locked -- -D warnings
+        if: ${{ !cancelled() }}
+      - run: cargo test -p kbf-server --lib --features farm-core-js --locked farm::js::tests
+        if: ${{ !cancelled() }}
       # The interpreter budget only shrinks: a pull request may not add a row to it
       # (crates/xtask/src/budget.rs). A pull request is checked out as the merge commit,
       # so HEAD^1 is the base branch it merges into.

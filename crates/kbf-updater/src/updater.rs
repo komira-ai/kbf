@@ -7,6 +7,12 @@
 //! finds the host where its work began and never earlier.
 //! The first failure stops the roll and no later host is asked about, let alone touched.
 //!
+//! A drain never cuts work. A daemon host's node is waited for until it holds no lease, however
+//! long that takes; a [`Timing::drain_deadline`] the operator set only stops the waiting, with
+//! `drain_failed`, the node left drained and nothing installed. A frontend pool member's
+//! drain ([`Timing::frontend_drain`]) is the same: waited for until the member has exited,
+//! and a deadline fails the roll with the member left draining.
+//!
 //! A frontend that is a member of a pool of frontends (an inventory line with `instance=` and
 //! `base=`) takes a turn of its own, in `updater_no_proxy.rs`, whatever load balancer is in
 //! front of the pool: every other member must have answered `/readyz` 200 for a while, the
@@ -53,7 +59,7 @@ use crate::api::{
 use crate::inventory::{Host, Inventory, Role};
 use crate::ports::{
     Apply, Clock, Drain, FrontendControl, Health, HealthCheck, InstallAnswer, Installed, Installer,
-    PortError, SafeToStop, Stop,
+    PortError, SafeToStop, Stop, UNBOUNDED_NODE_DRAIN,
 };
 use crate::record::{FORMAT, Record, RollStore, StoreError, roll_id};
 use crate::timing::Timing;
@@ -621,9 +627,11 @@ impl Updater {
         }
     }
 
-    /// Drain the host's node and wait until it holds no lease, or until the drain deadline
-    /// has passed (its leases then run on and the install goes ahead). A failure leaves the
-    /// node as the frontend has it, which may be drained.
+    /// Drain the host's node and wait until it holds no lease, however long that takes, or
+    /// until the drain deadline, if the operator set one, has passed. At the deadline nothing is
+    /// installed: the roll stops with the node left drained and its leases running, and a new
+    /// roll drains the node again and waits again. A failure leaves the node as the frontend
+    /// has it, which may be drained.
     fn drain(&self, host: &Host) -> Result<(), Halt> {
         let fail = |why: &str, e: PortError| {
             left_drained(
@@ -634,7 +642,7 @@ impl Updater {
         let deadline = self.timing.drain_deadline;
         self.ports
             .drain
-            .drain(host, deadline)
+            .drain(host, deadline.unwrap_or(UNBOUNDED_NODE_DRAIN))
             .map_err(|e| fail("the drain was refused", e))?;
         let start = self.now();
         loop {
@@ -643,8 +651,23 @@ impl Updater {
                 .drain
                 .leases(host)
                 .map_err(|e| fail("the node's leases could not be read", e))?;
-            if held == 0 || self.since(start) >= deadline {
+            if held == 0 {
                 return Ok(());
+            }
+            if let Some(deadline) = deadline.filter(|d| self.since(start) >= *d) {
+                return Err(left_drained(
+                    host,
+                    Halt::Fail(
+                        ErrorCode::DrainFailed,
+                        format!(
+                            "{} still holds {held} leases after the drain deadline of {} s; \
+                             nothing was installed and the leases run on; start a new roll to \
+                             drain it again and wait again",
+                            host.alias,
+                            deadline.as_secs()
+                        ),
+                    ),
+                ));
             }
             self.ports.clock.sleep(self.timing.poll);
         }

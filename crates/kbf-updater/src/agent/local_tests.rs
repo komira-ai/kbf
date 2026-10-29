@@ -48,7 +48,8 @@ fn serve(
 fn limits() -> Limits {
     Limits {
         install: Duration::from_secs(5),
-        switch: Duration::from_secs(5),
+        switch: None,
+        revert: Duration::from_secs(5),
         other: Duration::from_secs(5),
     }
 }
@@ -398,6 +399,48 @@ fn a_helper_that_is_gone_or_silent_is_unreachable() {
         assert!(!error.to_string().is_empty());
     }
     assert_eq!(Limits::default().install, Duration::from_secs(1200));
+}
+
+/// A switch is not limited by default (the helper waits for the frontend's drain as long as it
+/// takes, and answers when the switch is done), so a helper that answers late is still heard:
+/// this one holds its answer for a moment, a limit of the old 10 minutes' kind would have
+/// given up, and the switch is read as made. The other requests keep their limits.
+#[test]
+fn a_switch_is_waited_for_as_long_as_the_helper_takes() {
+    assert_eq!(Limits::default().switch, None);
+    assert_eq!(Limits::default().revert, Duration::from_secs(600));
+    let d = dir("lc-long-switch");
+    let (socket, asked) = serve(&d, 1, |_| {
+        std::thread::sleep(Duration::from_millis(600));
+        line(&Answer::Switched {
+            version: VB.into(),
+            commit: COMMIT_B.into(),
+            deadline_unix: 77,
+        })
+    });
+    let quick = Limits {
+        other: Duration::from_millis(100),
+        revert: Duration::from_millis(100),
+        ..limits()
+    };
+    assert_eq!(
+        SocketLocal::new(&socket, quick).switch(&version(VB)),
+        Ok(77)
+    );
+    assert_eq!(asked.join().unwrap(), [format!("switch kbf={VB}")]);
+}
+
+/// A switch with no limit still notices a helper that is gone: one that takes the request and
+/// closes the socket (it died) ends the wait at once as unreachable, which the update reports.
+#[test]
+fn a_switch_with_no_limit_still_notices_a_helper_that_dies() {
+    let d = dir("lc-dead-switch");
+    let (socket, _) = serve(&d, 1, |_| None);
+    assert_eq!(Limits::default().switch, None);
+    assert!(matches!(
+        SocketLocal::new(&socket, Limits::default()).switch(&version(VB)),
+        Err(LocalError::Unreachable(_))
+    ));
 }
 
 /// The health check asks the helper what the host runs through the installer port: the commit

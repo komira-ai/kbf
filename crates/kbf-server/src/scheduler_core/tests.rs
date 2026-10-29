@@ -45,6 +45,10 @@ fn the_flag_defaults_to_legacy_and_takes_only_its_two_values() {
 /// `legacy` refused, a message that does not name the flag and the value, and an exit
 /// status other than the one of a refused flag (2, which systemd does not restart).
 #[test]
+#[cfg_attr(
+    feature = "farm-core-js",
+    ignore = "a build with farm-core-js has the js core"
+)]
 fn js_is_refused_naming_the_flag_and_exits_as_a_refused_flag_does() {
     Args::parse_from(["kbf-server"])
         .check_scheduler_core()
@@ -77,7 +81,10 @@ fn the_parsed_flag_reaches_the_listeners() {
     assert_eq!(core(&[]), SchedulerCore::Legacy);
     assert_eq!(core(&["--scheduler-core=legacy"]), SchedulerCore::Legacy);
     assert_eq!(core(&["--scheduler-core=js"]), SchedulerCore::Js);
-    assert_eq!(SchedulerCore::under_test(), SchedulerCore::RUNNING);
+    assert_eq!(
+        SchedulerCore::under_test() == SchedulerCore::Js,
+        cfg!(feature = "farm-core-js")
+    );
 }
 
 /// Catches the start line missing the core, or naming another one.
@@ -119,6 +126,10 @@ fn the_gauge_is_one_for_the_running_core_and_zero_for_the_other() {
 /// logged, and by `start` before it creates any of the store, metadata, state or log
 /// paths it is given.
 #[tokio::test(flavor = "current_thread")]
+#[cfg_attr(
+    feature = "farm-core-js",
+    ignore = "a build with farm-core-js has the js core"
+)]
 async fn a_start_logs_the_core_and_js_is_refused_before_anything_opens() {
     let root = crate::test_dir::scratch_dir("kbf-server-scheduler-core");
     let open = |name: &'static str| {
@@ -192,4 +203,32 @@ async fn a_start_logs_the_core_and_js_is_refused_before_anything_opens() {
         !log.text().contains("scheduler core: js"),
         "a refused core is never logged as running"
     );
+}
+
+/// Catches `--learned-sizes on` accepted with the js core (which learns in shadow only, so
+/// a farm told `on` would book as `off` does), and the refusal applied to the other
+/// combinations: `shadow` and `off` on js, and `on` on the legacy core.
+#[test]
+fn learned_sizes_on_is_refused_with_the_js_core_only() {
+    let check = |flags: &[&str]| {
+        let mut argv = vec!["kbf-server"];
+        argv.extend_from_slice(flags);
+        Args::parse_from(argv).check_scheduler_core()
+    };
+    let refused = check(&["--scheduler-core=js", "--learned-sizes=on"]).expect_err("on");
+    assert!(matches!(refused, ConfigError::LearnedSizesOnUnderJs));
+    let said = refused.to_string();
+    assert!(said.contains("--learned-sizes on"), "{said}");
+    assert!(said.contains("--scheduler-core js"), "{said}");
+    assert_eq!(StartFailure::of(&refused).status(), REFUSED);
+    for mode in ["shadow", "off"] {
+        let flag = format!("--learned-sizes={mode}");
+        let checked = check(&["--scheduler-core=js", &flag]);
+        // Whether js is built decides; the learned sizes do not.
+        assert!(
+            !matches!(checked, Err(ConfigError::LearnedSizesOnUnderJs)),
+            "{mode}"
+        );
+    }
+    check(&["--scheduler-core=legacy", "--learned-sizes=on"]).expect("legacy on");
 }

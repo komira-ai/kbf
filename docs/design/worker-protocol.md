@@ -372,6 +372,52 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
   daemon without the flag, and one built before the field, send none, and a server built before it
   skips the field. The server keeps the newest of each node for `GET /metrics`
   (`kbf_pack_daemon_*`, [api.md](../api.md#get-metrics)).
+- `node_load` (optional): one reading of the node's `actions/` cgroup (`NodeLoad`). `seq` counts up
+  by one from 1 for each reading within a daemon process; `mono_usec` is the daemon's monotonic
+  clock at the read of the CPU counter and `cpu_usage_usec` the cgroup's cumulative CPU time, so a
+  reader takes rates between two readings of one process; `memory_working_set_bytes` is
+  `memory.current` less the inactive file pages and `memory_active_file_bytes` the active file
+  pages; `covered` lists the leases that ran for the whole window since the previous reading;
+  `actions_cpu_limited` says the cgroup has a CPU quota; `cpu_throttled_usec` and
+  `cpu_pressure_some_total_usec` are telemetry, absent when the daemon could not read them;
+  `lease_clocks` and `minutes` (fields 9 and 10) are described below. The daemon sends it when its
+  runtime takes readings (the container runtime does); a reading that fails leaves it out (logged
+  once per failing file), and a daemon or runtime without readings, or one built before the field,
+  sends none. A server built before the field skips it. The server accepts and shows readings under
+  the rule of [api.md](../api.md#node-load) and places by none of them yet.
+
+  Two lists of a reading say when each lease started and what each used, minute by minute:
+
+  - `lease_clocks` (field 9): `LeaseClock { lease, started_mono_usec }`, the start of each lease the
+    runtime is running, on the reading's own clock (`mono_usec`): the lease's container start,
+    after its inputs and image. At most 96, oldest start first, none after `mono_usec`.
+  - `minutes` (field 10): `LeaseMinute { lease, minute, cpu_mean_millis, cpu_peak_window_millis,
+    ws_max_bytes }`, the closed minutes of leases, counted from each lease's own start, oldest
+    minute first, at most 64 a heartbeat. `cpu_mean_millis` is the mean CPU over the span observed,
+    in thousandths of a CPU, and is not above `cpu_peak_window_millis`, the busiest sampling window
+    of the minute; `ws_max_bytes` is the largest working set (`memory.current` less
+    `inactive_file`) seen in it. A minute observed for less than 30 s is absent, never sent as
+    zero. Minute 63 means "63 or later": the sender folds every later minute into it with the
+    larger value of each field. Repeats have two scopes. Within one load, `NodeLoad::vet` drops a
+    repeat of (lease, minute) and the first one stays. Across heartbeats, a receiver merges by
+    (lease, minute) with the larger value of each field: a minute sent again (a heartbeat not
+    acknowledged before its stream ended) is harmless, and so is every later fold into minute 63.
+    The minute's peak window is taken on the reading's clock; the `peak_window_millicores` of a
+    lease's usage record is taken on the lease's own clock reads, so the two may differ in the last
+    digits.
+  - `covered` is capped like `lease_clocks`: at most 96, in the order of `lease_clocks`.
+
+  Caps and rules equal the job scheduler agent's (96 leases, 64 minutes, minute 63, working set at
+  most 2^45 bytes). `NodeLoad::vet` of `kbf-proto` is the receiver's rule: each list is cut to its
+  cap first (the excess is counted as over the cap and not judged); a record is then dropped as
+  invalid when a `LeaseMinute` or `LeaseClock` has no `lease`, a minute is above 63, its
+  `ws_max_bytes` is above 2^45, its mean is above its peak, or a clock starts after `mono_usec`;
+  and a repeat of an earlier record is dropped as a duplicate, the first one staying (a minute is
+  told by lease and minute, a clock and a `covered` entry by lease). A bad record is dropped alone
+  and counted; vetting never fails, and a heartbeat is never refused, nor its acknowledgement
+  changed, for its lists. Every list at its cap and every number at its most digits make a load of
+  9,001 bytes and a heartbeat of about 11.5 KB, well under the 17 MiB a message may be. Nothing sends
+  the two lists yet and the server does not read them.
 
 The server acknowledges a heartbeat with `HeartbeatAck { seq }`, but only one from the
 node's newest stream. A heartbeat from a replaced stream is dropped unacknowledged, so

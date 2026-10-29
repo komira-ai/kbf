@@ -357,8 +357,8 @@ impl Fetcher<'_> {
         match self.runner.run(&download) {
             Err(e) => failed(format!("gh release download: {e}")),
             Ok(exec) if !exec.success() => failed(format!(
-                "gh release download: exit status {:?}: {}",
-                exec.code,
+                "gh release download: {}: {}",
+                exec.ended(),
                 exec.stderr_text()
             )),
             Ok(_) => Ok(commit),
@@ -371,11 +371,7 @@ impl Fetcher<'_> {
             Err(e) => return failed(format!("curl: {e}")),
         };
         if !exec.success() {
-            return failed(format!(
-                "curl: exit status {:?}: {}",
-                exec.code,
-                exec.stderr_text()
-            ));
+            return failed(format!("curl: {}: {}", exec.ended(), exec.stderr_text()));
         }
         serde_json::from_slice(page_body(&exec.stdout)?)
             .or_else(|_| failed("the answer is not a listing of releases"))
