@@ -50,8 +50,27 @@ impl KbfAdapter {
     }
 
     /// The work before the feed: finds what the `action usage:` line names.
-    pub(super) fn note_report_start(&mut self, view: &View<'_>, report: &Report) {
+    pub(super) fn note_report_start(
+        &mut self,
+        view: &View<'_>,
+        worker: &WorkerId,
+        report: &Report,
+    ) {
         let Staged { measured, run } = self.hooks.staged.take().unwrap_or_default();
+        // What the estimator will be shown of the report, if the scheduler takes it.
+        let Report {
+            operation,
+            lease,
+            outcome,
+        } = *report;
+        self.stage_learning(
+            view.sched(),
+            operation,
+            lease,
+            worker,
+            outcome,
+            measured.as_ref(),
+        );
         let usage = measured.and_then(|measured| {
             let (_, waiter) = self.first_waiter(view.sched(), report.operation)?;
             Some((waiter.usage.clone(), measured))
@@ -69,6 +88,8 @@ impl KbfAdapter {
         taken: Taken,
     ) {
         let Awaiting { usage, run } = self.hooks.awaiting.take().unwrap_or_default();
+        let learned = matches!(taken, Taken::Accepted | Taken::Held);
+        self.finish_learning(view, report.lease, worker, learned);
         if taken != Taken::Accepted {
             return;
         }
