@@ -11,12 +11,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use kbf_front::grants::{GrantKey, Grants};
-use kbf_front::job_read::BlobSource;
+use kbf_front::job_read::{BlobSource, Limits};
 use kbf_objstore::s3::fake::FakeS3;
 use kbf_proto::reapi::{Action, Directory, DirectoryNode, FileNode};
-use kbf_storage::StorageError;
+use kbf_storage::{ReadStream, StorageError};
 use kbf_types::Digest;
 use prost::Message as _;
 use rcgen::{
@@ -99,6 +100,8 @@ fn flags(files: &Files, listen: &str) -> JobReadFlags {
         tls_cert: files.cert.clone(),
         tls_key: files.key.clone(),
         grant_secret_file: files.secret.clone(),
+        max_blob_bytes: Limits::default().max_blob_bytes,
+        reads_in_flight: 32,
     }
 }
 
@@ -119,7 +122,25 @@ impl BlobSource for Blobs {
         let found = self.0.get(digest).cloned();
         Box::pin(async move { found.ok_or(StorageError::NotFound(*digest)) })
     }
+
+    fn read_stream<'a>(
+        &'a self,
+        digest: &'a Digest,
+    ) -> BoxFuture<'a, Result<ReadStream, StorageError>> {
+        let found = self.0.get(digest).cloned();
+        Box::pin(async move {
+            let blob = found.ok_or(StorageError::NotFound(*digest))?;
+            let chunks: Vec<Result<Bytes, StorageError>> = blob
+                .chunks(STREAM_CHUNK)
+                .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                .collect();
+            Ok(futures::stream::iter(chunks).boxed())
+        })
+    }
 }
+
+/// The size of the chunks a test source streams a blob in.
+const STREAM_CHUNK: usize = 1024;
 
 /// One Action with one input file, and a blob that is in no scope.
 struct World {
@@ -621,3 +642,5 @@ async fn a_frontend_without_the_job_flags_has_no_job_listener() {
     assert!(!text.contains("listener=\"job\""), "{text}");
     served.abort();
 }
+
+mod stream;
