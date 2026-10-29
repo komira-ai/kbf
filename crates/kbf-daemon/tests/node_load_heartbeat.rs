@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use kbf_daemon::{NodeLoadError, Runtime, RuntimeError, Work};
+use kbf_daemon::{NodeLoadError, NodeReading, Runtime, RuntimeError, Work};
 use kbf_proto::reapi::{ActionResult, ExecutedActionMetadata};
 use kbf_proto::worker::{CgroupUsage, NodeLoad, ResourceUsage};
 use kbf_types::LeaseId;
@@ -18,7 +18,7 @@ use support::{Harness, PROMPT};
 /// once, reports `failed` as what it measured of an erroring run, and says `peak` for the first
 /// lease that asks.
 struct Scripted {
-    readings: Mutex<VecDeque<Result<Option<NodeLoad>, NodeLoadError>>>,
+    readings: Mutex<VecDeque<Result<Option<NodeReading>, NodeLoadError>>>,
     outcome: Mutex<Option<Result<ActionResult, RuntimeError>>>,
     failed: Mutex<Option<ResourceUsage>>,
     peak: Mutex<Option<u64>>,
@@ -58,7 +58,7 @@ impl Runtime for Scripted {
         lock(&self.failed).take()
     }
 
-    async fn node_load(&self) -> Result<Option<NodeLoad>, NodeLoadError> {
+    async fn node_load(&self) -> Result<Option<NodeReading>, NodeLoadError> {
         lock(&self.readings).pop_front().unwrap_or(Ok(None))
     }
 
@@ -85,7 +85,7 @@ fn reading(seq: u64) -> NodeLoad {
     }
 }
 
-fn broke(kind: &'static str) -> Result<Option<NodeLoad>, NodeLoadError> {
+fn broke(kind: &'static str) -> Result<Option<NodeReading>, NodeLoadError> {
     Err(NodeLoadError {
         kind,
         why: "unreadable".to_owned(),
@@ -133,12 +133,12 @@ async fn usage_of_a_lease(name: &str, runtime: Arc<Scripted>) -> Option<Resource
 async fn a_reading_reaches_the_heartbeat_and_a_failed_one_leaves_it_unset() {
     let runtime = Arc::new(Scripted::new());
     lock(&runtime.readings).extend([
-        Ok(Some(reading(1))),
+        Ok(Some(reading(1).into())),
         broke("cpu.stat"),
         broke("cpu.stat"),
         broke("memory.stat"),
         Ok(None),
-        Ok(Some(reading(2))),
+        Ok(Some(reading(2).into())),
     ]);
     let mut h = Harness::with_runtime(
         "node-load-heartbeat",
