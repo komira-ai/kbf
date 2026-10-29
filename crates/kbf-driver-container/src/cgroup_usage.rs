@@ -264,6 +264,8 @@ impl NumaSample {
             cpus_effective: std::fs::read_to_string(dir.join("cpuset.cpus.effective"))
                 .ok()
                 .and_then(|text| cpu_list_len(&text)),
+            // The daemon fills it in once the run has ended (`Runtime::take_peak_window_millicores`).
+            peak_window_millicores: None,
             numa: self
                 .best
                 .into_iter()
