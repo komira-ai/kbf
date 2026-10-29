@@ -385,7 +385,6 @@ jobs:
         run: cmp target/coordinator-image-out/1.oci.tar target/coordinator-image-out/2.oci.tar
       - name: The coordinator image is the built kbf-coordinator, and is an asset
         run: cargo xtask pkg-image-asset --service coordinator --image target/coordinator-image-out/1.oci.tar --platform linux-x86_64 --commit "$GITHUB_SHA" --binary "target/$TARGET/release/kbf-coordinator" --out dist
-      # `docker image load` reads the file the release ships, as a host does.
       # The task image (packaging/container/kbf-task/Dockerfile) is made the same
       # way from the `kbf-task` built above, which `build-commit check` has shown names the
       # commit. It has no tarball of its own, so the image is held to that file.
@@ -404,6 +403,9 @@ jobs:
       # `docker image load` reads the file the release ships, as a host does.
       - name: Load the coordinator image with docker
         run: docker image load --input "dist/kbf-coordinator-image-$GITHUB_SHA-linux-x86_64.oci.tar"
+      # `docker image load` reads the file the release ships, as a host does.
+      - name: Load the task image with docker
+        run: docker image load --input "dist/kbf-task-image-$GITHUB_SHA-linux-x86_64.oci.tar"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-x86_64
@@ -568,7 +570,6 @@ jobs:
         run: cmp target/coordinator-image-out/1.oci.tar target/coordinator-image-out/2.oci.tar
       - name: The coordinator image is the built kbf-coordinator, and is an asset
         run: cargo xtask pkg-image-asset --service coordinator --image target/coordinator-image-out/1.oci.tar --platform linux-arm64 --commit "$GITHUB_SHA" --binary "target/$TARGET/release/kbf-coordinator" --out dist
-      # `docker image load` reads the file the release ships, as a host does.
       # The task image (packaging/container/kbf-task/Dockerfile) is made the same
       # way from the `kbf-task` built above, which `build-commit check` has shown names the
       # commit. It has no tarball of its own, so the image is held to that file.
@@ -587,6 +588,9 @@ jobs:
       # `docker image load` reads the file the release ships, as a host does.
       - name: Load the coordinator image with docker
         run: docker image load --input "dist/kbf-coordinator-image-$GITHUB_SHA-linux-arm64.oci.tar"
+      # `docker image load` reads the file the release ships, as a host does.
+      - name: Load the task image with docker
+        run: docker image load --input "dist/kbf-task-image-$GITHUB_SHA-linux-arm64.oci.tar"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-arm64
