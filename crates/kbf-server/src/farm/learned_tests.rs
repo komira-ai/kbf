@@ -1159,6 +1159,7 @@ fn a_stored_operation_is_registered_only_when_it_can_be_named() {
         fate: None,
         subject,
         size_key: Some(5),
+        max_wall: None,
     };
     let (key, _) = estimator_key_and_run();
     {

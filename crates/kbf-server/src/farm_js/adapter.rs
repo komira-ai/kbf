@@ -504,13 +504,21 @@ impl Adapter for KbfAdapter {
     /// Takes `operation`, which the state store holds, as a caller of its own that no client
     /// waits on, and notes the lease it holds as sent.
     ///
-    /// The hook is told the operation and its parcel, not its request, so the request is
-    /// read from the store's `op/` row. A row that cannot be read leaves the caller out: the
-    /// operation would otherwise be started with an action it never named, and an operation
-    /// with no caller the machine knows is sent no `Start` (its lease is given up after the
-    /// grace and the operation runs again).
-    fn adopted(&mut self, operation: OperationId, waiter: WaiterId, parcel: Option<&[u8]>) {
-        let Some((request, key)) = self.stored_request(operation) else {
+    /// The hook is told the operation, its parcel and its request. A request whose key is not
+    /// an action's leaves the caller out: the operation would otherwise be started with an
+    /// action it never named, and an operation with no caller the machine knows is sent no
+    /// `Start` (its lease is given up after the grace and the operation runs again). The
+    /// lease the operation held and its size key are not used here.
+    fn adopted(
+        &mut self,
+        operation: OperationId,
+        waiter: WaiterId,
+        parcel: Option<&[u8]>,
+        request: &Request,
+        _lease: Option<&LeaseGrant>,
+        _size_key: Option<u64>,
+    ) {
+        let Ok(key) = ActionKey::try_from(&request.key) else {
             tracing::error!(%operation, "an operation the store holds has no readable request: no caller");
             return;
         };

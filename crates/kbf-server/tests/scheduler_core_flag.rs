@@ -8,6 +8,10 @@ use std::process::Command;
 /// directory or the state store is created (the check moved below `log_file::init` or
 /// into the start), a status other than 2, and a message that does not name the flag.
 #[test]
+#[cfg_attr(
+    feature = "farm-core-js",
+    ignore = "a build with farm-core-js has the js core"
+)]
 fn js_is_refused_before_the_binary_creates_anything() {
     let scratch = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-core-flag");
     let (log, hot, meta, state) = (

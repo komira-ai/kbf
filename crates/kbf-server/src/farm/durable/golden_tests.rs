@@ -4,7 +4,7 @@
 //! scheduler wrote through its own calls, every row: its key, when the store expires it and
 //! its value as hex. The calls cover each kind of row the scheduler writes (`op/`, `queue/`,
 //! `lease/`, `lease-by-op/`, `session/`, `owner/`, `cordon/`, `done/`, `doneof/`, `loss/`,
-//! `fate/`, `floor/`, `keyfloor/`, `opkey/`, `subject/`, `inflight/`, `est/` and the `meta/`
+//! `fate/`, `floor/`, `keyfloor/`, `opkey/`, `opwall/`, `subject/`, `inflight/`, `est/` and the `meta/`
 //! rows), so a change to the key of a row, to its value or to how long it lives fails here,
 //! and a row this release adds is missing from the file until a person adds it with the
 //! reason. This test requires:
@@ -67,7 +67,7 @@ const VARIANTS: &str = include_str!("../../../tests/golden/farm-rows/scheduler-v
 
 /// The kinds of row the scheduler writes, as the start of their keys: the constants that
 /// the writers build their keys from.
-const KINDS: [&str; 22] = [
+const KINDS: [&str; 23] = [
     OPERATION,
     QUEUE,
     LEASE,
@@ -82,6 +82,7 @@ const KINDS: [&str; 22] = [
     FLOOR,
     KEY_FLOOR,
     OPKEY,
+    OPWALL,
     SUBJECT,
     inflight::INFLIGHT,
     ESTIMATE,
@@ -91,6 +92,9 @@ const KINDS: [&str; 22] = [
     NEXT_OP,
     NEXT_SEQ,
 ];
+
+/// The wall time operation 8 of the first store is queued with.
+pub(super) const WALL: Duration = Duration::new(3_600, 250_000_000);
 
 fn request(tag: u8) -> Request {
     Request {
@@ -249,7 +253,7 @@ fn size_summary() -> Vec<u8> {
 /// Submits operation `operation` of action `tag` (with the size key `size`, if any) and
 /// grants it lease `seq`.
 fn granted(durable: &Durable, operation: u64, seq: u64, tag: u8, size: Option<u64>) {
-    granted_request(durable, operation, seq, &request(tag), size);
+    granted_request(durable, operation, seq, &request(tag), size, None);
 }
 
 /// [`granted`] for an operation of `request`.
@@ -259,8 +263,9 @@ fn granted_request(
     seq: u64,
     request: &Request,
     size: Option<u64>,
+    wall: Option<Duration>,
 ) {
-    let submitted = durable.submit_keyed(OperationId(operation), request, &subject(), size);
+    let submitted = durable.submit_keyed(OperationId(operation), request, &subject(), size, wall);
     submitted.expect("submit");
     let start = StartLease {
         key: request.key.clone(),
@@ -363,8 +368,8 @@ fn written() -> Arc<Fake> {
             .expect("a result");
     }
 
-    // Operation 8 holds its lease.
-    granted(&durable, 8, 4, 9, Some(7));
+    // Operation 8 holds its lease, and has a size key and a wall time.
+    granted_request(&durable, 8, 4, &request(9), Some(7), Some(WALL));
 
     durable
         .put_estimates(&[(size_key(), size_summary())])
@@ -610,7 +615,7 @@ fn written_variants() -> Arc<Fake> {
             kind,
             ..request(tag)
         };
-        granted_request(&durable, operation, seq, &held, None);
+        granted_request(&durable, operation, seq, &held, None, None);
     }
 
     // Finished with each failure: the `done/` row is what the callers are told.
@@ -631,7 +636,13 @@ fn written_variants() -> Arc<Fake> {
 
     // Refused while queued.
     let (operation, _, tag) = next();
-    let submitted = durable.submit_keyed(OperationId(operation), &request(tag), &subject(), None);
+    let submitted = durable.submit_keyed(
+        OperationId(operation),
+        &request(tag),
+        &subject(),
+        None,
+        None,
+    );
     submitted.expect("submit");
     let refusal = Refusal {
         operation: OperationId(operation),
@@ -702,7 +713,7 @@ fn a_requeue_reason_is_not_a_row() {
 fn a_start_writes_the_grant_and_nothing_of_it() {
     let rows = |fence, device: Option<&str>| {
         let (store, durable) = opened();
-        let submitted = durable.submit_keyed(OperationId(4), &request(1), &subject(), None);
+        let submitted = durable.submit_keyed(OperationId(4), &request(1), &subject(), None, None);
         submitted.expect("submit");
         let start = StartLease {
             fence,
@@ -830,6 +841,10 @@ fn every_row_of_the_file_reads_and_writes_back_the_same() {
             OPKEY => {
                 let size = opkey::decode(&row).expect("a size key");
                 assert_eq!(opkey::encode(size), row, "{key}");
+            }
+            OPWALL => {
+                let wall = opwall::decode(&row).expect("a wall time");
+                assert_eq!(opwall::encode(wall), row, "{key}");
             }
             SUBJECT => {
                 let subject = subject::decode(&row).expect("a subject");

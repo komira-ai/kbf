@@ -454,7 +454,7 @@ fn a_pin_that_lands_after_the_look_is_not_written_over() {
     let farm = farm_over(&store);
     let other = durable_over(&store);
     let landing = other
-        .submission(OperationId(5), &request(1), &subject(), None)
+        .submission(OperationId(5), &request(1), &subject(), None, None)
         .expect("encode")
         .put(
             format!("inflight/6d61696e/{}", request(1).key.dedup),
@@ -674,7 +674,7 @@ fn a_submit_takes_three_conflicts_and_is_refused_at_the_fourth() {
         for id in 0..landed {
             let tag = 10 + u8::try_from(id).expect("a small id");
             let landing = other
-                .submission(OperationId(id), &request(tag), &subject(), None)
+                .submission(OperationId(id), &request(tag), &subject(), None, None)
                 .expect("encode");
             store.before_submit.lock().expect("lock").push_back(landing);
         }
