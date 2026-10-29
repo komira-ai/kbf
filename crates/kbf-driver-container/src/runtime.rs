@@ -112,6 +112,8 @@ pub struct ContainerConfig {
     /// Places each lease on one NUMA node (`--lease-placement=numa-node`); `None` leaves
     /// them on any CPU the daemon may use.
     pub placer: Option<Arc<Placer>>,
+    /// The actions cgroup's CPU limit per Welcome (`--actions-cpu-max`); `None`: as at start.
+    pub actions_cpu: Option<crate::ActionsCpu>,
 }
 
 /// The node's input cache as the driver is given it: not opened yet.
@@ -171,6 +173,7 @@ impl ContainerConfig {
             cache: None,
             cpu: CpuPool::new(DEFAULT_CPU_THREADS),
             placer: None,
+            actions_cpu: None,
         }
     }
 
@@ -819,6 +822,10 @@ impl<C: Cas> Runtime for ContainerRuntime<C> {
 
     fn serves(&self, kind: &str) -> bool {
         kind == KIND
+    }
+
+    async fn welcomed_placement_load(&self, on: bool) {
+        self.config.welcomed(on).await;
     }
 
     async fn node_load(&self) -> Result<Option<worker::NodeLoad>, NodeLoadError> {

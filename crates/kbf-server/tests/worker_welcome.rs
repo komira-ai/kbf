@@ -10,6 +10,7 @@ use std::time::Duration;
 use kbf_front::Cache;
 use kbf_proto::worker::server_message::Message;
 use kbf_proto::worker::{Hello, daemon_message, worker_server::WorkerServer};
+use kbf_server::PlacementLoad;
 use kbf_server::worker::WorkerService;
 use kbf_server::{Farm, Peers};
 use support::{Cell, FakeDaemon, hello};
@@ -155,4 +156,56 @@ async fn a_node_is_listed_at_the_version_welcome_named() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(listed.expect("registered").protocol, Some(3));
+}
+
+/// A service over an empty farm told `mode` (`--placement-load`), on a port of its own.
+fn serve_placing(mode: PlacementLoad) -> std::net::SocketAddr {
+    let farm = Arc::new(Farm::new(
+        Arc::new(Cache::memory()),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    ));
+    let service = WorkerService::new(
+        farm,
+        Peers::Unauthenticated,
+        support::INTERVAL,
+        Duration::from_secs(5),
+    )
+    .with_placement_load(mode);
+    let incoming =
+        tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = incoming.local_addr().expect("address");
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(WorkerServer::new(service))
+            .serve_with_incoming(incoming),
+    );
+    addr
+}
+
+/// The `Welcome` the server at `addr` sends a daemon.
+async fn welcome_of(addr: std::net::SocketAddr) -> kbf_proto::worker::Welcome {
+    let first = daemon_message::Message::Hello(hello_of(1));
+    let mut daemon = FakeDaemon::open(addr, first).await.expect("opened");
+    daemon
+        .expect("Welcome", |m| match m {
+            Message::Welcome(w) => Some(w.clone()),
+            _ => None,
+        })
+        .await
+}
+
+/// Asserts that `Welcome.placement_load` is true for `--placement-load=on` and absent (not
+/// false) for `off` and a service told nothing, so that a farm that does not place by
+/// measured load sends the bytes it sent before the field (the bytes of an absent field are
+/// pinned in kbf-proto's `welcome_placement_load`). Catches `off` sent as `Some(false)` and
+/// the default being on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn welcome_says_placement_load_only_for_on() {
+    let cell = Cell::start().await;
+    assert_eq!(welcome_of(cell.worker_addr).await.placement_load, None);
+    for (mode, says) in [(PlacementLoad::Off, None), (PlacementLoad::On, Some(true))] {
+        let welcome = welcome_of(serve_placing(mode)).await;
+        assert_eq!(welcome.placement_load, says, "{mode:?}");
+    }
 }
