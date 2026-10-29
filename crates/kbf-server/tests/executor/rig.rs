@@ -30,6 +30,9 @@ pub struct FakeInputs {
     pub facts: Mutex<Result<ActionFacts, InputsError>>,
     pub grant: Mutex<Result<ReadGrant, InputsError>>,
     pub looked_up: Mutex<Vec<String>>,
+    /// While set, the read of an action waits for `release` (a slow CAS).
+    pub hold: std::sync::atomic::AtomicBool,
+    pub release: tokio::sync::Notify,
 }
 
 impl FakeInputs {
@@ -44,6 +47,8 @@ impl FakeInputs {
                 token: Secret::new("read-token-0001"),
             })),
             looked_up: Mutex::new(Vec::new()),
+            hold: std::sync::atomic::AtomicBool::new(false),
+            release: tokio::sync::Notify::new(),
         }
     }
 }
@@ -52,6 +57,9 @@ impl FakeInputs {
 impl Inputs for FakeInputs {
     async fn action(&self, action: &Digest) -> Result<ActionFacts, InputsError> {
         locked(&self.looked_up).push(action.hash.clone());
+        if self.hold.load(std::sync::atomic::Ordering::SeqCst) {
+            self.release.notified().await;
+        }
         locked(&self.facts).clone()
     }
 

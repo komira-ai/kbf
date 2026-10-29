@@ -62,7 +62,8 @@ pub enum Fault {
 
 struct Shared {
     state: Mutex<State>,
-    faults: Mutex<VecDeque<Fault>>,
+    /// Each fault, with the prefix of the `METHOD /path` line of the request it breaks.
+    faults: Mutex<VecDeque<(String, Fault)>>,
     requests: Mutex<Vec<String>>,
 }
 
@@ -240,7 +241,13 @@ impl FakeLeaseServer {
 
     /// Breaks the next request that arrives (after the ones already queued).
     pub fn inject(&self, fault: Fault) {
-        locked(&self.shared.faults).push_back(fault);
+        self.inject_on("", fault);
+    }
+
+    /// Breaks the next request whose `METHOD /path` line starts with `route`, such as
+    /// `DELETE /v1/leases/`; requests before it are served as usual.
+    pub fn inject_on(&self, route: &str, fault: Fault) {
+        locked(&self.shared.faults).push_back((route.to_owned(), fault));
     }
 
     /// Every request seen so far, as `METHOD /path`, in arrival order. Empty for a server

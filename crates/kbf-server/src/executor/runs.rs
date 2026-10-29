@@ -86,6 +86,9 @@ enum Queued {
     Posted(Running),
     Settled(Settled),
     Retire(Retire),
+    /// The `Start`'s window ended while the task was being prepared: dropped, as one that
+    /// arrived late is.
+    Late,
 }
 
 impl From<InputsError> for Settled {
@@ -117,6 +120,11 @@ fn pinned(image: &str) -> Result<String, Settled> {
             "the action's image {image:?} is not pinned by an @sha256 digest"
         ))),
     }
+}
+
+/// Whether `now` is outside the window of `w`: past its deadline, or with none to act in.
+fn outside(w: &Waiting, now: Instant) -> bool {
+    w.deadline.is_none_or(|deadline| now >= deadline)
 }
 
 fn require(ok: bool, why: impl FnOnce() -> String) -> Result<(), Settled> {
@@ -189,16 +197,21 @@ impl HostWorker {
             })
             .collect();
         for (lease, action, w) in waiting {
-            if w.deadline.is_none_or(|deadline| now >= deadline) {
+            // Read again for each task: the ones before it took time.
+            if outside(&w, ctx.clock.now()) {
                 tracing::warn!(worker = %self.id, %lease, "a Start outside its window is dropped");
                 self.drop_task(lease);
                 continue;
             }
-            match self.queue(ctx, now, lease, &action, &w).await {
+            match self.queue(ctx, lease, &action, &w).await {
                 Queued::Wait => {}
                 Queued::Posted(running) => self.set_stage(lease, Stage::Running(running)),
                 Queued::Settled(settled) => self.settle_with(lease, &settled, now),
                 Queued::Retire(why) => return ControlFlow::Break(why),
+                Queued::Late => {
+                    tracing::warn!(worker = %self.id, %lease, "a Start ran out of its window while it was prepared and is dropped");
+                    self.drop_task(lease);
+                }
             }
         }
         ControlFlow::Continue(())
@@ -220,7 +233,6 @@ impl HostWorker {
     async fn queue(
         &mut self,
         ctx: &Ctx<'_>,
-        now: Instant,
         lease: kbf_types::LeaseId,
         action: &Digest,
         w: &Waiting,
@@ -232,9 +244,17 @@ impl HostWorker {
         // The lease server cuts the run's wall time to what the lease has left when it is
         // posted, and a renewal later does not stretch it: renew first when the lease would
         // end before the run does.
+        let now = ctx.clock.now();
         let renewed = self.renew(ctx, now, self.left(now) < wall).await;
         if let ControlFlow::Break(why) = renewed {
             return Queued::Retire(why);
+        }
+        // The CAS read, the url, the grant and the renewal each took as long as the lease
+        // server or the store took: the window is judged by the clock now, the last moment
+        // before the post, not by the one read when the pass began.
+        let now = ctx.clock.now();
+        if outside(w, now) {
+            return Queued::Late;
         }
         let truncated = wall > self.left(now);
         let posted = ctx.deps.client.queue_run(self.lease, &spec).await;

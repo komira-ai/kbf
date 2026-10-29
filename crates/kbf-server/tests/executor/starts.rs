@@ -131,6 +131,43 @@ async fn a_late_start_never_runs_twice() {
     assert_eq!(rig.runs_of(3).await.len(), 1, "the action ran once");
 }
 
+/// Catches a `Start` posted past its window because the window was judged once, at the start
+/// of the pass, and the read of the action then took longer than the window left (a slow
+/// CAS): the farm has given the lease up and runs it again, so the late post would run
+/// beside its retry. The clock is read again just before the post, the `Start` is dropped, and
+/// the action runs once, after the farm requeues it.
+#[tokio::test(start_paused = true)]
+async fn a_start_whose_inputs_were_slow_is_not_posted_past_its_window() {
+    use crate::rig::settle;
+    use std::sync::atomic::Ordering;
+    let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
+    rig.pump().await;
+    let caller = rig.submit(1);
+    rig.farm.tick().await;
+    settle().await;
+    rig.inputs.hold.store(true, Ordering::SeqCst);
+    let (exec, fake, inputs) = (&mut rig.exec, &rig.fake, &rig.inputs);
+    let slow = async {
+        settle().await;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        fake.advance(Duration::from_secs(20));
+        inputs.release.notify_one();
+    };
+    tokio::join!(exec.step(), slow);
+    rig.inputs.hold.store(false, Ordering::SeqCst);
+    assert!(
+        rig.runs().await.is_empty(),
+        "a Start was posted 20 s after its 14 s window"
+    );
+    assert_eq!(count_tail(&rig.requests(), "POST", "/runs"), 0);
+    rig.elapse(70).await;
+    let runs = rig.runs_of(1).await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
+    assert!(matches!(rig.until_done(&caller, 6).await, Finished::Ran(_)));
+    assert_eq!(rig.runs_of(1).await.len(), 1, "the action ran once");
+}
+
 /// Catches an action the executor cannot run being passed to the host or rerun: an image that
 /// is not pinned by digest, or a timeout over the executor's limit, is the caller's to fix and
 /// is answered INVALID_ARGUMENT; no run is posted.
