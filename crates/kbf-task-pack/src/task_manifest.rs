@@ -331,7 +331,7 @@ impl TaskManifest {
                     return Err(ManifestError::UnexpectedField("large"));
                 }
             }
-            MANIFEST_VERSION_2 if large_max == u64::MAX => {
+            MANIFEST_VERSION_2 => {
                 if wire.packs.is_none() {
                     return Err(ManifestError::MissingField("packs"));
                 }
@@ -429,12 +429,8 @@ impl TaskManifest {
     }
 
     fn check_packs_and_large(&self, large_max: u64) -> Result<(), ManifestError> {
-        // STUB: none of the packs and large rules is checked yet.
-        if self.packs == 0 && large_max == u64::MAX && MAX_PACKS == 0 {
+        if !(1..=MAX_PACKS).contains(&self.packs) {
             return Err(ManifestError::Packs(self.packs));
-        }
-        if large_max != u64::MAX {
-            return Ok(());
         }
         let mut slots = BTreeSet::new();
         let mut digests = BTreeSet::new();

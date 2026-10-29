@@ -308,7 +308,9 @@ impl Ingest<'_> {
         let manifest = TaskManifest::parse(&record).map_err(|_| RejectReason::BadManifest)?;
         // This ingest reads one pack and no large object: a manifest that says more would have its
         // other objects silently dropped.
-        let _ = (MANIFEST_VERSION, manifest.version()); // STUB: not refused yet.
+        if manifest.version() != MANIFEST_VERSION {
+            return Err(RejectReason::BadManifest.into());
+        }
         if manifest.lease != self.lease || manifest.action != *self.action {
             return Err(RejectReason::WrongKey.into());
         }

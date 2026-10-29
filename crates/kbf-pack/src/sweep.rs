@@ -50,9 +50,8 @@ impl Default for SweepConfig {
 /// [`SweepGates::age_of`].
 #[must_use]
 pub fn task_key_age(key: &str) -> Option<SystemTime> {
-    // STUB: no key says its age yet.
-    let _ = TaskPackKey::parse(key);
-    None
+    let key = TaskPackKey::parse(key).ok()?;
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(key.minted_unix_secs()))
 }
 
 /// When a key was minted, read from the key itself; `None` when the key does not say.

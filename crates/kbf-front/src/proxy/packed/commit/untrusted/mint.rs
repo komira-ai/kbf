@@ -127,12 +127,8 @@ impl PackKeyMint {
         packs: u8,
         large: u8,
     ) -> Result<Vec<IssuedPackKey>, MintError> {
-        // STUB: the set is not minted yet.
-        if packs == 0 || large > MAX_LARGE || packs > MAX_PACKS {
+        if !(1..=MAX_PACKS).contains(&packs) || large > MAX_LARGE {
             return Err(MintError::SetSize { packs, large });
-        }
-        if packs < u8::MAX {
-            return Ok(Vec::new());
         }
         let slots = (0..packs)
             .map(Slot::Pack)
@@ -172,9 +168,7 @@ impl PackKeyMint {
         minute: u32,
         slot: Slot,
     ) -> Result<[u8; MAC_LEN], MintError> {
-        // STUB: the v1 message, no slot.
-        let _ = (mac_input(lease, action, minute, slot)?, MAX_LARGE);
-        Ok(self.truncated(&mac_input_v1(lease, action, minute)?))
+        Ok(self.truncated(&mac_input(lease, action, minute, slot)?))
     }
 
     /// The same over the message of [`mac_input_v1`].

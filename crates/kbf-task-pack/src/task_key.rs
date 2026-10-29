@@ -78,10 +78,10 @@ impl Slot {
     /// Whether the index is below [`MAX_PACKS`] or [`MAX_LARGE`].
     #[must_use]
     pub const fn in_range(self) -> bool {
-        // STUB: the range is not checked yet.
-        let _ = (MAX_PACKS, MAX_LARGE);
-        let _ = self;
-        true
+        match self {
+            Self::Pack(k) => k < MAX_PACKS,
+            Self::Large(i) => i < MAX_LARGE,
+        }
     }
 
     /// Parses `<k>` or `L<i>`.
@@ -289,9 +289,9 @@ pub fn mac_input(
     if !slot.in_range() {
         return Err(TaskKeyError::SlotRange(slot));
     }
-    // STUB: the v1 message, no slot.
-    let _ = (MAC_DOMAIN, slot.mac_bytes());
-    message(MAC_DOMAIN_V1, build, action, minute)
+    let mut out = message(MAC_DOMAIN, build, action, minute)?;
+    out.extend_from_slice(&slot.mac_bytes());
+    Ok(out)
 }
 
 /// The message of the first MAC, `kbf-task-pack/v1`: [`mac_input`] without the slot. Keys minted
