@@ -160,8 +160,9 @@ impl PackSink for HttpSink {
 ///
 /// The steps run in this order: fetch the Action, its Command and the input tree; run; collect the
 /// outputs; build the manifest and the pack; store the pack. The Command's own exit code, or a
-/// deadline kill, is in the manifest and is not a failure. The manifest's `put_ms` is 0: the pack
-/// holds the manifest, so it cannot hold the time the pack took to store.
+/// deadline kill, is in the manifest and is not a failure. The manifest has no time for the PUT: the
+/// pack holds the manifest, so it cannot hold the time the pack took to store. An empty stdout or
+/// stderr is left out of the manifest, and no empty blob is a record of the pack.
 ///
 /// # Errors
 /// A [`Failure`], whose [`Failure::exit_code`] names the step that failed.
@@ -222,8 +223,8 @@ pub async fn execute(
         lease: cli.lease.clone(),
         action: cli.action,
         exit_code: ran.exit_code,
-        stdout: blob_id(result.stdout_digest.as_ref())?,
-        stderr: blob_id(result.stderr_digest.as_ref())?,
+        stdout: stdio(result.stdout_digest.as_ref())?,
+        stderr: stdio(result.stderr_digest.as_ref())?,
         output_files: Vec::new(),
         output_directories: Vec::new(),
         output_symlinks: Vec::new(),
@@ -231,7 +232,6 @@ pub async fn execute(
             fetch_ms,
             run_ms: ran.wall_ms,
             pack_ms,
-            put_ms: 0,
         },
         usage: Usage {
             cpu_usage_us: ran.cpu_us,
@@ -272,6 +272,11 @@ fn named(what: &str, digest: Option<&Digest>) -> Result<Digest, FetchError> {
 fn blob_id(digest: Option<&Digest>) -> Result<BlobId, Failure> {
     let digest = digest.ok_or_else(|| Failure::Result("a digest is absent".to_owned()))?;
     BlobId::try_from(digest).map_err(|e| Failure::Result(e.to_string()))
+}
+
+/// A stream's digest as the manifest writes it: absent when the stream is empty.
+fn stdio(digest: Option<&Digest>) -> Result<Option<BlobId>, Failure> {
+    Ok(Some(blob_id(digest)?).filter(|id| !id.is_empty()))
 }
 
 /// How long the Command may run: the Action's timeout when it sets a positive one, but never more
@@ -502,11 +507,42 @@ mod tests {
         assert_eq!(manifest.output_files[0].path, "out");
         assert_eq!(manifest.output_files[0].digest, BlobId::of(b"hi\n"));
         assert!(!manifest.output_files[0].is_executable);
-        assert_eq!(manifest.stdout, BlobId::of(b""));
-        assert_eq!(manifest.stderr, BlobId::of(b"err\n"));
-        // The manifest, stdout, stderr and the one output file: four distinct records.
+        // Stdout is empty: it is left out of the manifest and has no record.
+        assert_eq!(manifest.stdout, None);
+        assert_eq!(manifest.stderr, Some(BlobId::of(b"err\n")));
+        // The manifest, stderr and the one output file: three records, none of them empty.
         let reader = SegmentReader::open(body).expect("segment");
-        assert_eq!(reader.footer().entries().len(), 4);
+        assert_eq!(reader.footer().entries().len(), 3);
+        assert!(
+            reader
+                .footer()
+                .entries()
+                .iter()
+                .all(|e| e.digest.size_bytes > 0)
+        );
+        let json = String::from_utf8_lossy(&body[..manifest.encode().len()]).into_owned();
+        assert!(
+            !json.contains("stdout") && !json.contains("put_ms"),
+            "{json}"
+        );
+    }
+
+    /// An empty output file is listed with the empty digest and the pack holds no record for it.
+    #[tokio::test]
+    async fn an_empty_output_file_is_listed_without_a_record() {
+        let mut mem = Mem::default();
+        let digest = action(&mut mem, &["sh", "-c", ": > out"], &["out"]);
+        let dir = scratch("empty-out");
+        let sink = Fake::new(false);
+        let manifest = execute(&cli(&dir, digest), &mem, &sink)
+            .await
+            .expect("task");
+        assert_eq!(manifest.output_files[0].digest, BlobId::of(b""));
+        assert_eq!((manifest.stdout, manifest.stderr), (None, None));
+        let stored = sink.stored.lock().unwrap();
+        assert_eq!(&verify(&stored[0]).expect("verify"), &manifest);
+        let reader = SegmentReader::open(&stored[0]).expect("segment");
+        assert_eq!(reader.footer().entries().len(), 1);
     }
 
     #[tokio::test]
@@ -626,6 +662,30 @@ mod tests {
             Failure::Put(PutError::Exists { url: String::new() }).exit_code(),
         ];
         assert_eq!(codes, [14, 10, 11, 12, 12, 12, 13]);
+    }
+
+    /// Each cap is a pack failure (exit 12) whose message on stderr says `output-too-large`.
+    #[test]
+    fn every_size_cap_is_exit_12_with_output_too_large() {
+        for err in [
+            PackError::TooLarge { limit: 1 },
+            PackError::TooManyEntries { limit: 1 },
+            PackError::RecordTooLarge { limit: 1 },
+            PackError::ManifestTooLarge { limit: 1 },
+        ] {
+            let failure = Failure::Pack(err);
+            assert_eq!(failure.exit_code(), EXIT_PACK);
+            assert!(
+                failure.to_string().contains("output-too-large"),
+                "{failure}"
+            );
+        }
+        for err in [
+            PackError::PathTooLong { len: 2, limit: 1 },
+            PackError::DuplicatePath("p".to_owned()),
+        ] {
+            assert_eq!(Failure::Pack(err).exit_code(), EXIT_PACK);
+        }
     }
 
     #[test]

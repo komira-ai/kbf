@@ -128,7 +128,7 @@ impl Recorder {
         let size = u64::try_from(digest.size_bytes).unwrap_or(0);
         if blobs.bytes.saturating_add(size) > self.cap {
             return Err(format!(
-                "the outputs do not fit in one pack: they pass {} bytes",
+                "output-too-large: the outputs do not fit in one pack: they pass {} bytes",
                 self.cap
             )
             .into());
@@ -399,6 +399,7 @@ mod tests {
             .expect_err("one byte over");
         assert!(matches!(why, OutputsError::Store { .. }), "{why}");
         assert!(why.to_string().contains("one pack"), "{why}");
+        assert!(why.to_string().contains("output-too-large"), "{why}");
     }
 
     /// Catches the output limits not reaching the collection: stdout past

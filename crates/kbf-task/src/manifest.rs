@@ -4,6 +4,10 @@
 //! names must be a record of the same pack, and the frontend rebuilds the action's result
 //! from its own hashing. The wire form is JSON, version 1, with digests as
 //! `<lowercase hex>/<size>` strings ([`BlobId`]).
+//!
+//! The empty blob is implicit in every store, so a pack never holds it as a record: a
+//! zero-size digest in the manifest must be the empty digest, and `stdout` and `stderr` are
+//! left out when the stream is empty.
 
 use std::fmt;
 use std::str::FromStr;
@@ -39,6 +43,12 @@ pub enum ParseBlobIdError {
 }
 
 impl BlobId {
+    /// Whether this is a zero-size blob.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
     /// The id of `bytes`.
     #[must_use]
     pub fn of(bytes: &[u8]) -> Self {
@@ -154,8 +164,6 @@ pub struct Timing {
     pub run_ms: u64,
     /// Collecting outputs and building the pack.
     pub pack_ms: u64,
-    /// Storing the pack.
-    pub put_ms: u64,
 }
 
 /// What the command used.
@@ -180,11 +188,13 @@ pub struct Manifest {
     pub action: BlobId,
     /// The command's exit code.
     pub exit_code: i32,
-    /// Standard output (a record of the pack).
-    pub stdout: BlobId,
-    /// Standard error (a record of the pack).
-    pub stderr: BlobId,
-    /// Output files (their contents are records of the pack).
+    /// Standard output (a record of the pack); absent when the stream is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<BlobId>,
+    /// Standard error (a record of the pack); absent when the stream is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<BlobId>,
+    /// Output files (their non-empty contents are records of the pack).
     pub output_files: Vec<OutputFile>,
     /// Output directories (their Trees are records of the pack).
     pub output_directories: Vec<OutputDirectory>,
@@ -205,6 +215,9 @@ pub enum ParseError {
     /// A version other than [`VERSION`].
     #[error("manifest version {0} is not supported (this build reads {VERSION})")]
     Version(u32),
+    /// A zero-size digest that is not the empty digest.
+    #[error("manifest digest {0} has size 0 but is not the empty digest")]
+    NotEmpty(BlobId),
 }
 
 impl Manifest {
@@ -226,16 +239,39 @@ impl Manifest {
         if m.version != VERSION {
             return Err(ParseError::Version(m.version));
         }
+        let empty = BlobId::of(b"");
+        let mut all = m
+            .stdout
+            .into_iter()
+            .chain(m.stderr)
+            .chain(std::iter::once(m.action))
+            .chain(m.output_files.iter().map(|f| f.digest))
+            .chain(m.output_directories.iter().map(|d| d.tree));
+        if let Some(bad) = all.find(|id| id.is_empty() && *id != empty) {
+            return Err(ParseError::NotEmpty(bad));
+        }
         Ok(m)
     }
 
     /// Every blob the manifest says the pack holds: stdout, stderr, each output file's
-    /// content and each output directory's Tree. Not the action.
+    /// content and each output directory's Tree, except the empty blob, which is no record.
+    /// Not the action.
     pub fn blobs(&self) -> impl Iterator<Item = BlobId> + '_ {
-        [self.stdout, self.stderr]
+        self.stdout
             .into_iter()
+            .chain(self.stderr)
             .chain(self.output_files.iter().map(|f| f.digest))
             .chain(self.output_directories.iter().map(|d| d.tree))
+            .filter(|id| !id.is_empty())
+    }
+
+    /// Every path the manifest names: output files, directories and symlinks.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.output_files
+            .iter()
+            .map(|f| f.path.as_str())
+            .chain(self.output_directories.iter().map(|d| d.path.as_str()))
+            .chain(self.output_symlinks.iter().map(|l| l.path.as_str()))
     }
 }
 
@@ -249,8 +285,8 @@ pub(crate) mod tests {
             lease: "lease-1".to_owned(),
             action: BlobId::of(b"action"),
             exit_code: -3,
-            stdout: BlobId::of(b"out"),
-            stderr: BlobId::of(b""),
+            stdout: Some(BlobId::of(b"out")),
+            stderr: None,
             output_files: vec![OutputFile {
                 path: "bin/a".to_owned(),
                 digest: BlobId::of(b"file"),
@@ -268,7 +304,6 @@ pub(crate) mod tests {
                 fetch_ms: 1,
                 run_ms: 2,
                 pack_ms: 3,
-                put_ms: 4,
             },
             usage: Usage {
                 cpu_usage_us: 5,
@@ -286,23 +321,74 @@ pub(crate) mod tests {
         assert_eq!(m.encode(), bytes);
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with(r#"{"version":1,"lease":"lease-1","action":""#));
-        assert!(text.contains(&format!("\"stdout\":\"{}\"", m.stdout)));
+        assert!(text.contains(&format!("\"stdout\":\"{}\"", BlobId::of(b"out"))));
+        assert!(text.contains(r#""timing":{"fetch_ms":1,"run_ms":2,"pack_ms":3}"#));
+        assert!(!text.contains("put_ms"));
     }
 
-    /// `blobs` names stdout, stderr, files and Trees, and not the action.
+    /// An empty stream is left out of the JSON, not written as the empty digest, and a
+    /// manifest without the keys reads back with `None`.
+    #[test]
+    fn empty_stdio_is_omitted() {
+        let m = sample();
+        let text = String::from_utf8(m.encode()).unwrap();
+        assert!(!text.contains("stderr"));
+        let mut both = sample();
+        both.stdout = None;
+        let text = String::from_utf8(both.encode()).unwrap();
+        assert!(!text.contains("stdout") && !text.contains("stderr"));
+        assert_eq!(Manifest::parse(text.as_bytes()).unwrap(), both);
+        let mut full = sample();
+        full.stderr = Some(BlobId::of(b"err"));
+        assert_eq!(Manifest::parse(&full.encode()).unwrap(), full);
+    }
+
+    /// A timing with `put_ms` is refused: the frontend reads the object with unknown fields denied.
+    #[test]
+    fn timing_refuses_put_ms() {
+        let text = String::from_utf8(sample().encode()).unwrap();
+        let with = text.replace("\"pack_ms\":3", "\"pack_ms\":3,\"put_ms\":4");
+        assert!(Manifest::parse(with.as_bytes()).is_err());
+    }
+
+    /// A size-0 digest must be the empty digest, wherever it appears.
+    #[test]
+    fn zero_size_digest_must_be_the_empty_digest() {
+        let empty = BlobId::of(b"");
+        let mut m = sample();
+        m.output_files[0].digest = empty;
+        assert_eq!(Manifest::parse(&m.encode()).unwrap(), m);
+        let forged = BlobId {
+            hash: [7; 32],
+            size: 0,
+        };
+        assert!(forged.is_empty() && forged != empty);
+        let mut bad = sample();
+        bad.output_files[0].digest = forged;
+        let err = Manifest::parse(&bad.encode()).unwrap_err();
+        assert!(matches!(err, ParseError::NotEmpty(id) if id == forged));
+        assert!(err.to_string().contains("not the empty digest"));
+    }
+
+    /// `blobs` names stdout, stderr, files and Trees, and not the action or the empty blob.
     #[test]
     fn blobs_lists_pack_records() {
-        let m = sample();
+        let mut m = sample();
+        m.stderr = Some(BlobId::of(b"err"));
         let got: Vec<BlobId> = m.blobs().collect();
         assert_eq!(
             got,
             vec![
-                m.stdout,
-                m.stderr,
+                BlobId::of(b"out"),
+                BlobId::of(b"err"),
                 m.output_files[0].digest,
                 m.output_directories[0].tree
             ]
         );
+        m.stderr = Some(BlobId::of(b""));
+        m.output_files[0].digest = BlobId::of(b"");
+        assert_eq!(m.blobs().count(), 2);
+        assert_eq!(m.paths().collect::<Vec<_>>(), ["bin/a", "d", "l"]);
     }
 
     #[test]
@@ -370,7 +456,7 @@ pub(crate) mod tests {
     fn parse_refuses_bad_manifests() {
         let m = sample();
         let good = String::from_utf8(m.encode()).unwrap();
-        let bad_digest = good.replace(&m.stdout.to_string(), "nothex/1");
+        let bad_digest = good.replace(&BlobId::of(b"out").to_string(), "nothex/1");
         assert!(matches!(
             Manifest::parse(bad_digest.as_bytes()),
             Err(ParseError::Json(_))
