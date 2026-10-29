@@ -112,33 +112,37 @@ impl Exec {
     }
 }
 
-/// The name of a signal that ends a process on this platform, or `unnamed`. Numbers 7, 10 and
-/// 12 mean different signals on macOS and on Linux.
+/// The signals that end a process, by number, on this platform. The numbers of `SIGBUS` and
+/// `SIGSYS` differ between macOS and Linux, so those are listed per platform.
+const SIGNALS: &[(i32, &str)] = &[
+    (1, "SIGHUP"),
+    (2, "SIGINT"),
+    (3, "SIGQUIT"),
+    (4, "SIGILL"),
+    (5, "SIGTRAP"),
+    (6, "SIGABRT"),
+    #[cfg(not(target_os = "macos"))]
+    (7, "SIGBUS"),
+    #[cfg(target_os = "macos")]
+    (10, "SIGBUS"),
+    #[cfg(target_os = "macos")]
+    (12, "SIGSYS"),
+    (8, "SIGFPE"),
+    (9, "SIGKILL"),
+    (11, "SIGSEGV"),
+    (13, "SIGPIPE"),
+    (14, "SIGALRM"),
+    (15, "SIGTERM"),
+    (24, "SIGXCPU"),
+    (25, "SIGXFSZ"),
+];
+
+/// The name of a signal that ends a process on this platform, or `unnamed`.
 pub fn signal_name(signal: i32) -> &'static str {
-    let mac = cfg!(target_os = "macos");
-    match signal {
-        1 => "SIGHUP",
-        2 => "SIGINT",
-        3 => "SIGQUIT",
-        4 => "SIGILL",
-        5 => "SIGTRAP",
-        6 => "SIGABRT",
-        7 if mac => "SIGEMT",
-        7 => "SIGBUS",
-        8 => "SIGFPE",
-        9 => "SIGKILL",
-        10 if mac => "SIGBUS",
-        10 => "SIGUSR1",
-        11 => "SIGSEGV",
-        12 if mac => "SIGSYS",
-        12 => "SIGUSR2",
-        13 => "SIGPIPE",
-        14 => "SIGALRM",
-        15 => "SIGTERM",
-        24 => "SIGXCPU",
-        25 => "SIGXFSZ",
-        _ => "unnamed",
-    }
+    SIGNALS
+        .iter()
+        .find(|(number, _)| *number == signal)
+        .map_or("unnamed", |(_, name)| name)
 }
 
 /// Something that runs a [`Cmd`] and waits for it.
