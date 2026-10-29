@@ -15,8 +15,8 @@
 //!   [`MAX_COMMIT_BLOBS`] blobs, none over [`MAX_UNTRUSTED_BLOB_BYTES`]; blobs listed in strictly
 //!   ascending (hash, size) order; records that start at offset 0, follow each other with no gap and
 //!   no overlap, and end exactly where the footer starts (the pack's size less the footer's length).
-//!   A record has at least one byte: the empty blob is implicit and is in no pack, and records of
-//!   no bytes would put any number of digests at one offset.
+//!   An untrusted pack may not hold a record of no bytes: offset 0 would be ambiguous and any
+//!   number of digests could share one offset. The empty blob needs no record, its digest is known.
 //!   The bytes the commit will read (the trailer, the footer and every record) must fit
 //!   [`UntrustedLimits::read_budget`]; a commit over it is refused without a read.
 //! - **Footer.** The trailer's magic, version and CRC, its blob count and where the records end

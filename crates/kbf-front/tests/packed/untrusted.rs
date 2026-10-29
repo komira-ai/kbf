@@ -607,9 +607,9 @@ fn at(hash: u8, size: u64, offset: u64) -> PackBlob {
 }
 
 /// Asserts that a record of no bytes is refused as invalid before any read, whether it is the
-/// empty blob's own digest or not, at offset 0 or after a record. The empty blob is implicit and
-/// is never in a pack, and a record of no bytes at offset 0 would leave it unsaid which record is
-/// the first. Catches a manifest that passes the layout check with a record that holds nothing.
+/// empty blob's own digest or not, at offset 0 or after a record. An untrusted pack may not hold
+/// a record of no bytes (the frontend's own packs may): offset 0 would be ambiguous and many
+/// digests could share one offset. The empty blob needs no record, its digest is known. Catches a manifest that passes the layout check with a record that holds nothing.
 #[tokio::test]
 async fn a_zero_size_record_is_refused() {
     let first = FIRST.len() as u64;
