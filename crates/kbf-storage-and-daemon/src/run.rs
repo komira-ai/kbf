@@ -153,17 +153,22 @@ pub(crate) fn with_draining_daemon(
 /// half takes them, and as a process that hands them to another half takes them from.
 pub(crate) fn forwarded(tokio: &Runtime, signals: kbf_node::Signals) -> UnboundedReceiver<()> {
     let (sender, received) = tokio::sync::mpsc::unbounded_channel();
-    tokio.spawn(async move {
-        let mut signals = signals;
-        loop {
-            let name = signals.recv().await;
-            tracing::info!("{name}: shutting down");
-            if sender.send(()).is_err() {
-                return;
-            }
-        }
-    });
+    tokio.spawn(forward_signals(signals, sender));
     received
+}
+
+/// [`forwarded`]'s task: ends once nobody reads the channel.
+pub(crate) async fn forward_signals(
+    mut signals: kbf_node::Signals,
+    sender: tokio::sync::mpsc::UnboundedSender<()>,
+) {
+    loop {
+        let name = signals.recv().await;
+        tracing::info!("{name}: shutting down");
+        if sender.send(()).is_err() {
+            return;
+        }
+    }
 }
 
 /// Runs `drain`, then fires `stop` and waits for `serving` to end: the order of

@@ -60,7 +60,9 @@ async fn a_hold_keeps_the_worker_listener_up_after_the_executions_are_done() {
     let hold = cell.drain.hold();
     assert!(cell.drain.is_held());
 
+    assert!(!cell.drain.is_unready());
     cell.drain.begin();
+    assert!(cell.drain.is_unready(), "a drain left /readyz ready");
     assert!(
         cell.drain.settled().now_or_never().is_none(),
         "settled with an execution open"

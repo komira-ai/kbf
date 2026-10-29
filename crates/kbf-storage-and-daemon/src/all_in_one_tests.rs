@@ -9,7 +9,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use super::*;
 use crate::run::tests::fake_daemon;
-use crate::run::{drain_then_stop, prepared};
+use crate::run::{drain_then_stop, forward_signals, prepared};
 
 /// A pause long enough for every task that can run to have run, on a paused clock.
 const SETTLE: Duration = Duration::from_millis(10);
@@ -27,6 +27,7 @@ struct Rig {
     first: oneshot::Receiver<()>,
     second: oneshot::Receiver<()>,
     fan: Arc<Fan>,
+    fanning: tokio::task::JoinHandle<()>,
 }
 
 impl Rig {
@@ -36,13 +37,14 @@ impl Rig {
         let (first_tx, first) = oneshot::channel();
         let (second_tx, second) = oneshot::channel();
         let fan = Arc::new(Fan::new(daemon_tx));
-        tokio::spawn(fan_out(received, Arc::clone(&fan), first_tx, second_tx));
+        let fanning = tokio::spawn(fan_out(received, Arc::clone(&fan), first_tx, second_tx));
         Self {
             signals,
             daemon,
             first,
             second,
             fan,
+            fanning,
         }
     }
 
@@ -74,6 +76,16 @@ async fn the_first_signal_drains_the_server_half_and_the_second_stops_both() {
     rig.signal().await;
     assert_eq!(rig.second.try_recv(), Ok(()), "the second did not escalate");
     assert_eq!(told(&mut rig.daemon), 2, "a begin and then a stop");
+
+    // A third signal has no server event left to fire and stops the daemon half again; the
+    // fan-out ends when the signals do.
+    rig.signal().await;
+    assert_eq!(told(&mut rig.daemon), 1, "a later signal was dropped");
+    let Rig {
+        signals, fanning, ..
+    } = rig;
+    drop(signals);
+    fanning.await.expect("the fan-out ends with its signals");
 }
 
 /// Catches a daemon half that drains before the server half has settled, and one that never
@@ -273,4 +285,87 @@ fn one_signal_drains_both_halves_and_the_mode_stops() {
 #[test]
 fn two_signals_stop_both_halves() {
     assert_eq!(stopped_by("aio-two-signals", 2), Ok(()));
+}
+
+/// Catches the forwarding task of the signals outliving its reader (a task per stopped
+/// mode) or dropping a signal: a signal reaches the channel as one `()`, and once the
+/// receiver is gone the next signal ends the task. The task is awaited under a bound, so
+/// a task that never ends fails here instead of hanging the run.
+#[tokio::test]
+async fn forwarded_signals_reach_the_channel_and_the_task_ends_with_its_reader() {
+    let within = Duration::from_secs(10);
+    let raise = || {
+        // SAFETY: raise(3) on this process, whose SIGTERM handler `install` made.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+    };
+    let signals = kbf_node::Signals::install().expect("handlers");
+    let (sender, mut received) = unbounded_channel();
+    let task = tokio::spawn(forward_signals(signals, sender));
+    raise();
+    tokio::time::timeout(within, received.recv())
+        .await
+        .expect("the signal is forwarded")
+        .expect("open");
+    drop(received);
+    raise();
+    tokio::time::timeout(within, task)
+        .await
+        .expect("the task ends once nobody reads")
+        .expect("no panic");
+}
+
+/// Catches a stop signal that arrives while the server half starts and is lost or obeyed
+/// late: with one waiting before the start, the start is abandoned (the server half is
+/// never bound) and the mode ends `Ok`, nothing running yet.
+#[test]
+fn a_signal_while_the_server_half_starts_abandons_the_start() {
+    let (dir, flags) = flags("aio-signal-in-start");
+    let (sender, received) = unbounded_channel::<()>();
+    sender.send(()).expect("the receiver is kept");
+    let served = serve_on(
+        prepared(&flags),
+        move |_| Ok(received),
+        |_| panic!("the server half started"),
+    );
+    assert!(served.is_ok());
+    drop((dir, sender));
+}
+
+/// The mode as `kbf` runs it, [`serve`], with the process's own SIGTERM: sent again and
+/// again from a thread until `serve` returns (a handler of the test's own is installed
+/// first, so none is fatal before the mode has installed its own). Catches: `serve` not
+/// installing the handlers or not reading them, which hangs the stop; it runs on a thread
+/// the test waits on for 60 s.
+#[test]
+fn serve_stops_on_the_process_sigterm() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (dir, flags) = flags("aio-sigterm");
+    let guard = Runtime::new().expect("runtime");
+    let _handled = {
+        let _context = guard.enter();
+        Signals::install().expect("handlers")
+    };
+    let done = Arc::new(AtomicBool::new(false));
+    let sender = {
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            while !done.load(Ordering::SeqCst) {
+                // SAFETY: raise(3) on this process, which handles SIGTERM above.
+                assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+    let (ended, result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        ended
+            .send(serve(prepared(&flags)).map_err(|f| f.said("server")))
+            .ok();
+    });
+    let served = result.recv_timeout(Duration::from_secs(60));
+    done.store(true, Ordering::SeqCst);
+    sender.join().expect("the sender");
+    assert_eq!(served.expect("the mode stopped"), Ok(()));
+    drop(dir);
 }

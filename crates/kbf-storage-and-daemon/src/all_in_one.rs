@@ -90,15 +90,12 @@ pub(crate) async fn fan_out(
     second: oneshot::Sender<()>,
 ) {
     let (mut first, mut second) = (Some(first), Some(second));
-    let mut seen = 0_usize;
     while signals.recv().await.is_some() {
-        seen += 1;
-        if seen == 1 {
-            if let Some(first) = first.take() {
-                let _ = first.send(());
-            }
+        if let Some(first) = first.take() {
+            let _ = first.send(());
             continue;
         }
+        // The second signal and every later one.
         if let Some(second) = second.take() {
             let _ = second.send(());
         }
