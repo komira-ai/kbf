@@ -9,8 +9,10 @@
 //!    and lays it out beside A. An unattested, mismatched or unknown build is refused here,
 //!    before the node is touched. The updater never takes a URL or a path from the
 //!    coordinator's reply: the version is the only input, and it is looked up by the helper.
-//! 2. **Drain** the node at the frontend and wait for its leases (`NodeDrain`: cordon, drain,
-//!    uncordon over the operator API; a cordon is durable).
+//! 2. **Drain** the node at the frontend and wait until it holds no lease, however long that
+//!    takes (`NodeDrain`: cordon, drain, uncordon over the operator API; a cordon is durable).
+//!    A `--drain-deadline-secs` that passes first fails the update with the node left drained
+//!    and nothing switched; the order is tried again after `--retry-secs`.
 //! 3. **Switch**: the helper puts B in place on trial, with a pending marker and a deadline on
 //!    its disk, and restarts the service on it.
 //! 4. **Health**: the node's health check (`node_health`) until B shows healthy, for no longer
@@ -32,7 +34,7 @@ use super::flags::Timing;
 use super::local::{Local, LocalError, Trial};
 use super::status::{Shared, version_of_commit};
 use crate::inventory::Host;
-use crate::ports::{Clock, Drain, Health, HealthCheck, PortError};
+use crate::ports::{Clock, Drain, Health, HealthCheck, PortError, UNBOUNDED_NODE_DRAIN};
 use crate::version::Version;
 use crate::wire::{Outcome, UpdateResult};
 
@@ -215,12 +217,15 @@ impl Update<'_> {
         result(target, Outcome::Failed)
     }
 
-    /// Drain the node and wait for its leases, for at most the drain deadline: the host is
-    /// switched when that is out, leases or not.
+    /// Drain the node and wait until it holds no lease, however long that takes, or until the
+    /// drain deadline, if the operator set one, is out. At that deadline the host is not
+    /// switched: the update fails with the node left drained (its leases run on), and the same
+    /// order is tried again after the retry time, which drains the node again and waits again.
     fn drain(&self) -> Result<(), PortError> {
-        self.ports
-            .drain
-            .drain(self.host, self.timing.drain_deadline)?;
+        self.ports.drain.drain(
+            self.host,
+            self.timing.drain_deadline.unwrap_or(UNBOUNDED_NODE_DRAIN),
+        )?;
         let start = self.ports.clock.now();
         loop {
             let leases = match self.ports.drain.leases(self.host) {
@@ -232,8 +237,15 @@ impl Update<'_> {
                 }
             };
             let waited = self.ports.clock.now().saturating_sub(start);
-            if leases == 0 || waited >= self.timing.drain_deadline {
+            if leases == 0 {
                 return Ok(());
+            }
+            if let Some(deadline) = self.timing.drain_deadline.filter(|d| waited >= *d) {
+                return Err(PortError::other(format!(
+                    "the node still holds {leases} leases after the drain deadline of {} s; \
+                     nothing was switched, the leases run on and the node is left drained",
+                    deadline.as_secs()
+                )));
             }
             self.ports.clock.sleep(self.timing.drain_poll);
         }

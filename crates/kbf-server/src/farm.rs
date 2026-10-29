@@ -77,6 +77,7 @@ mod handover;
 mod js;
 mod learning;
 mod named;
+mod node_load;
 mod node_types;
 mod nodes;
 mod pack_reads;
@@ -236,6 +237,22 @@ impl Farm {
     ) -> Self {
         Self::on_core(
             crate::SchedulerCore::under_test(),
+            cache.into(),
+            unservable_wait,
+            finished_retention,
+        )
+    }
+
+    /// [`Farm::new`] on the legacy core whatever core [`crate::SchedulerCore::under_test`] names:
+    /// for the tests of the legacy engine, which reach its state (`lock`, `state_mut`).
+    #[cfg(test)]
+    pub(crate) fn new_legacy(
+        cache: impl Into<Backend>,
+        unservable_wait: Duration,
+        finished_retention: Duration,
+    ) -> Self {
+        Self::on_core(
+            crate::SchedulerCore::Legacy,
             cache.into(),
             unservable_wait,
             finished_retention,

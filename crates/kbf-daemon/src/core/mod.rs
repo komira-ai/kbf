@@ -57,6 +57,9 @@ pub struct LeaseCore {
     max_unacked: usize,
     /// The suspend-counting clock that contact and the Start window read.
     pub(crate) clock: Arc<dyn Clock>,
+    /// The kinds of failed node-load reading already logged, so a read that fails on
+    /// every heartbeat is logged once.
+    load_errors: BTreeSet<&'static str>,
     events: Option<mpsc::UnboundedSender<Event>>,
 }
 
@@ -77,7 +80,22 @@ impl LeaseCore {
             draining: false,
             max_unacked,
             clock,
+            load_errors: BTreeSet::new(),
             events: None,
+        }
+    }
+
+    /// The node's load for a Heartbeat, from the runtime that takes readings. A reading
+    /// that fails leaves it unset, and is logged the first time its kind fails.
+    pub(crate) async fn node_load(&mut self) -> Option<worker::NodeLoad> {
+        match self.leases.runtimes.node_load().await {
+            Ok(load) => load,
+            Err(error) => {
+                if self.load_errors.insert(error.kind) {
+                    tracing::warn!(%error, "node load not read: heartbeats go without it");
+                }
+                None
+            }
         }
     }
 

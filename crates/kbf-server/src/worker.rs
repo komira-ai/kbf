@@ -326,6 +326,7 @@ impl Session {
                 // has its counts on `/metrics`.
                 farm.note_pack_reads(worker, stream, beat.pack_reads);
                 farm.note_pack_writes(worker, stream, beat.pack_writes);
+                farm.note_node_load(worker, stream, beat.node_load.as_ref());
                 let running = beat
                     .running
                     .iter()

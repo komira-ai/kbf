@@ -368,6 +368,7 @@ pub(crate) fn run_record(row: &ActionRow, attempt: &Attempt) -> RunRecord {
                 memory_pressure_some_us: u.memory_pressure_some_micros,
                 memory_pressure_full_us: u.memory_pressure_full_micros,
                 cpus_effective: u.cpus_effective,
+                peak_window_millicores: u.peak_window_millicores,
             }),
         basis: usage
             .map_or(UsageBasis::Unspecified, |u| match u.basis {
