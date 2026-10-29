@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use js_server_core::{Admission, Admitted, Core, Denied, Held, Stream};
-use js_store::{EpochPolicy, RowCodec as _, Rows};
+use js_store::{EpochPolicy, Rows};
 use kbf_caps::NodeCaps;
 use kbf_front::{
     Backend, Cache, Described, MemoryMetaLog, MetaLog, MetaLogError, Recorder, Stage, Submission,
@@ -452,17 +452,6 @@ pub(super) fn request_of(tag: u8, cores: u64, gib: u64) -> Request {
         resources: Resources::new(cores * 1_000, gib << 30),
         ..request(tag)
     }
-}
-
-/// The value of a lease row: a row of the scheduler that is not a request.
-pub(super) fn lease_row() -> Vec<u8> {
-    let grant = kbf_types::LeaseGrant {
-        lease: LeaseId::new(7, 0),
-        operation: OperationId(0),
-        worker: WorkerId::new("node-a"),
-        cost: charged(),
-    };
-    KbfRowCodec.lease(&grant).expect("a lease row")
 }
 
 /// An action of the farm's `ci` level that books one core, for `Caller`.

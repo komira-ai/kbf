@@ -86,6 +86,7 @@ impl Farm {
     /// resends what it is not acknowledged for, and a copy of a held result gets no ack
     /// either.
     pub async fn report(&self, worker: &WorkerId, result: worker::Result) -> Option<ResultAck> {
+        js_arm_async!(self, hot::report(worker, result));
         let wire_lease = result.lease_id?;
         let _taking = self.in_flight();
         let lease = LeaseId::new(wire_lease.term, wire_lease.seq);

@@ -90,7 +90,7 @@ pub(in crate::farm) struct Intake {
     /// The leases whose node had no session row at the last sweep.
     orphans: BTreeMap<LeaseId, Orphan>,
     /// How long such a lease is left before it is requeued.
-    orphan_wait: Duration,
+    pub(in crate::farm) orphan_wait: Duration,
     /// The stored epoch, if it is past the one this frontend serves.
     epoch_ahead: Option<u64>,
     /// The daemons connected to the other frontends of the state store (capabilities and
@@ -226,6 +226,7 @@ impl Farm {
     ///
     /// Placement follows at the next tick.
     pub fn intake(&self) {
+        js_arm!(self, lifecycle::intake());
         let now = self.now();
         let mut guard = self.lock();
         let state = &mut *guard;
@@ -251,6 +252,7 @@ impl Farm {
     /// it saw everything written before it.
     #[must_use]
     pub fn intake_polls(&self) -> tokio::sync::watch::Receiver<u64> {
+        js_arm!(self, lifecycle::intake_polls());
         self.lock().engine.intake.polls.subscribe()
     }
 
@@ -259,6 +261,7 @@ impl Farm {
     /// frontend serves the epoch it started under until it is restarted.
     #[must_use]
     pub fn epoch_ahead(&self) -> Option<u64> {
+        js_arm!(self, lifecycle::epoch_ahead());
         self.lock().engine.intake.epoch_ahead
     }
 
@@ -266,8 +269,9 @@ impl Farm {
     /// [`ORPHAN_WAIT`]): for a test of the sweep over a store whose clock cannot be moved.
     #[doc(hidden)]
     #[must_use]
-    pub fn with_orphan_wait(self, wait: Duration) -> Self {
-        self.lock().engine.intake.orphan_wait = wait;
+    pub fn with_orphan_wait(mut self, wait: Duration) -> Self {
+        self.settings.orphan_wait = wait;
+        self.driver.set_orphan_wait(&self.settings);
         self
     }
 }
