@@ -472,8 +472,8 @@ leases they held before. Copying a joining member's slice to it
 | `frontend` | drains, by the sequence below | `--drain-lb-wait` (10 s by default); nothing else by default: the drain waits for every open execution, and `--drain-deadline` (none by default) only reports; to force a stop, a second signal or `--shutdown-timeout-secs` (0 by default: none) |
 | `all-in-one` | the frontend half drains; the daemon half does not | as `frontend`; the daemon half stops when the server half has |
 | `storage` | stops | none of its own |
-| `daemon` | drains | `--drain-deadline-secs` (600 by default); a second signal |
-| `storage-and-daemon` | drains the daemon half, then stops storage | `--drain-deadline-secs` (600 by default); a second signal |
+| `daemon` | drains | nothing but the leases: it waits until all have ended (`--drain-deadline-secs`, off by default, only logs a warning); a second signal |
+| `storage-and-daemon` | drains the daemon half, then stops storage | as `daemon` |
 
 **The frontend.** Buck2 does not recover an Execute stream that breaks after it started, so
 a stop that cuts a stream fails its action. On the first signal, or on
@@ -505,8 +505,11 @@ running. Updating an `all-in-one` host therefore waits for every build to finish
 
 **`storage-and-daemon`.** The signal handlers are installed before anything starts. On the
 first signal the daemon half takes no new lease, lets the running ones finish and report, and
-waits for their acknowledgements, for at most `--drain-deadline-secs`. A second signal ends
-the drain at once and abandons the leases still running. Only then does the storage half
+waits for their acknowledgements, however long that takes. `--drain-deadline-secs` is not
+set by default; given, it only logs one warning with the number of leases still running
+when that many seconds have passed (any value, no upper bound; 0 warns at once), and the
+wait goes on. A second signal is the hard stop: it ends the drain at once and abandons the
+leases still running. Only then does the storage half
 stop, because a running action reads and writes its blobs through it, and the process exits
 0 (kbf#1087). A signal while the storage half is still starting, for instance waiting for
 a frontend that is down, abandons the start and exits 0.

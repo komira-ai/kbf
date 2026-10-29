@@ -59,12 +59,14 @@
 //! program the body of the install unit, and counts only when sshd set none of its own
 //! variables; see [`host::dispatch`].)
 
-#![forbid(unsafe_code)]
+// The one place that is not safe code is `ids`: the system calls of a privilege drop.
+#![deny(unsafe_code)]
 
 mod audit;
 mod config;
 mod debver;
 mod host;
+mod ids;
 mod local;
 mod locks;
 pub(crate) mod mac;

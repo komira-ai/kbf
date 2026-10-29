@@ -56,12 +56,18 @@ impl Extras {
             history.render(out);
         }
         if let Some(farm) = self.farm {
-            // The core the farm's driver is, so the gauge cannot name another.
-            crate::scheduler_core::render(out, farm.scheduler_core());
-            crate::pack_daemon_metrics::render_farm(out, &farm);
-            farm.failed_actions().render(out);
+            render_farm(out, &farm);
         }
     }
+}
+
+/// Appends what a farm reports: the scheduler core its driver is (so the gauge cannot name
+/// another), the pack daemons' counts, and the failed actions. The one call every server's
+/// `/metrics` makes, so the all-in-one and the frontend pages cannot differ.
+pub(crate) fn render_farm(out: &mut String, farm: &Farm) {
+    crate::scheduler_core::render(out, farm.scheduler_core());
+    crate::pack_daemon_metrics::render_farm(out, farm);
+    farm.failed_actions().render(out);
 }
 
 /// What a scrape reads: the cache, and the extras.

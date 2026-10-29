@@ -99,6 +99,12 @@ impl LeaseCore {
         }
     }
 
+    /// Tells the runtimes what a Welcome said of placement by measured load (`Welcome.placement_load`,
+    /// false when absent).
+    pub(crate) async fn welcomed_placement_load(&self, on: bool) {
+        self.leases.runtimes.welcomed_placement_load(on).await;
+    }
+
     /// Sends every [`Event`] to `events`.
     pub(crate) fn observe(&mut self, events: mpsc::UnboundedSender<Event>) {
         self.events = Some(events);

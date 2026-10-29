@@ -34,7 +34,7 @@ use super::flags::Timing;
 use super::local::{Local, LocalError, Trial};
 use super::status::{Shared, version_of_commit};
 use crate::inventory::Host;
-use crate::ports::{Clock, Drain, Health, HealthCheck, PortError, UNBOUNDED_NODE_DRAIN};
+use crate::ports::{Clock, Drain, Health, HealthCheck, PortError};
 use crate::version::Version;
 use crate::wire::{Outcome, UpdateResult};
 
@@ -222,10 +222,9 @@ impl Update<'_> {
     /// switched: the update fails with the node left drained (its leases run on), and the same
     /// order is tried again after the retry time, which drains the node again and waits again.
     fn drain(&self) -> Result<(), PortError> {
-        self.ports.drain.drain(
-            self.host,
-            self.timing.drain_deadline.unwrap_or(UNBOUNDED_NODE_DRAIN),
-        )?;
+        self.ports
+            .drain
+            .drain(self.host, self.timing.drain_deadline)?;
         let start = self.ports.clock.now();
         loop {
             let leases = match self.ports.drain.leases(self.host) {
