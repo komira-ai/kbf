@@ -25,21 +25,33 @@
 //! `not_found`, `method_not_allowed` or `store_unavailable`. Requests by outcome and the
 //! bytes served are counted ([`JobRead::render_metrics`]).
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use futures::stream::{self, StreamExt as _, TryStreamExt as _};
+use kbf_proto::reapi;
 use kbf_storage::StorageError;
-use kbf_types::Digest;
+use kbf_types::{Digest, DigestFunction};
+use prost::Message as _;
+use tokio::sync::{OnceCell, Semaphore};
 use tonic::codegen::http::{Method, StatusCode};
 
 use crate::backend::Backend;
-use crate::grants::Grants;
+use crate::cache::is_empty_blob;
+use crate::grants::{Claims, GrantError, Grants, Scope};
+use crate::metrics::{Counter, Families};
 use crate::proxy::MAX_UNTRUSTED_BLOB_BYTES;
+use crate::wire;
 
 /// The most bytes one response carries: the per-blob cap of the packs a task's results are
 /// written into.
 pub const MAX_BLOB_BYTES: u64 = MAX_UNTRUSTED_BLOB_BYTES;
+
+/// The Directory blobs of one level of an input tree read at once.
+const DIRECTORIES_IN_FLIGHT: usize = 16;
 
 /// Where the blobs a job reads come from.
 ///
@@ -87,17 +99,73 @@ pub struct Reply {
     pub body: Bytes,
 }
 
-/// The job-facing read of one frontend. Shared by every connection.
-pub struct JobRead {
-    _source: Arc<dyn BlobSource>,
-    _grants: Arc<Grants>,
-    _limits: Limits,
+/// How a request ended, which is how it is counted.
+#[derive(Clone, Copy)]
+enum Outcome {
+    Ok,
+    Unauthorized,
+    Forbidden,
+    NotFound,
+    TooLarge,
+    MethodNotAllowed,
+    Unavailable,
 }
 
-impl std::fmt::Debug for JobRead {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JobRead").finish_non_exhaustive()
+/// The label of each [`Outcome`], in the order of the variants.
+const OUTCOMES: [&str; 7] = [
+    "ok",
+    "unauthorized",
+    "forbidden",
+    "not_found",
+    "too_large",
+    "method_not_allowed",
+    "unavailable",
+];
+
+impl Outcome {
+    fn status(self) -> StatusCode {
+        match self {
+            Self::Ok => StatusCode::OK,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        }
     }
+}
+
+/// Why an Action has no scope.
+enum ScopeError {
+    /// Its blobs are not in the store, are not what they must be, or name more than
+    /// [`Limits::scope_digests`].
+    Unusable,
+    /// The store could not answer.
+    Store,
+}
+
+impl From<StorageError> for ScopeError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::NotFound(_) => Self::Unusable,
+            _ => Self::Store,
+        }
+    }
+}
+
+/// The scope of each Action worked out, each in a cell that is filled by the first ask.
+type Cells = HashMap<Digest, Arc<OnceCell<Arc<Scope>>>>;
+
+/// The job-facing read of one frontend. Shared by every connection.
+pub struct JobRead {
+    source: Arc<dyn BlobSource>,
+    grants: Arc<Grants>,
+    limits: Limits,
+    scopes: Mutex<Cells>,
+    reads: Semaphore,
+    requests: [Counter; OUTCOMES.len()],
+    bytes: Counter,
 }
 
 impl JobRead {
@@ -105,26 +173,123 @@ impl JobRead {
     #[must_use]
     pub fn new(source: Arc<dyn BlobSource>, grants: Arc<Grants>, limits: Limits) -> Self {
         Self {
-            _source: source,
-            _grants: grants,
-            _limits: limits,
+            source,
+            grants,
+            reads: Semaphore::new(limits.reads_in_flight.max(1)),
+            limits,
+            scopes: Mutex::new(HashMap::new()),
+            requests: Default::default(),
+            bytes: Counter::default(),
         }
     }
 
     /// The answer to `method` `path` with the `Authorization` header `authorization`.
     /// `path` is the request's path alone, without its query.
     pub async fn respond(&self, method: &Method, path: &str, authorization: Option<&str>) -> Reply {
-        let _ = (method, path, authorization);
+        if *method != Method::GET {
+            return self.refuse(Outcome::MethodNotAllowed, "method_not_allowed");
+        }
+        let Some(digest) = digest_of(path) else {
+            return self.refuse(Outcome::NotFound, "not_found");
+        };
+        let claims = match self.claims(authorization) {
+            Ok(claims) => claims,
+            Err(reason) => return self.refuse(Outcome::Unauthorized, reason),
+        };
+        let scope = match self.scope(claims.action).await {
+            Ok(scope) => scope,
+            Err(ScopeError::Unusable) => return self.refuse(Outcome::Forbidden, "no_scope"),
+            Err(ScopeError::Store) => {
+                return self.refuse(Outcome::Unavailable, "store_unavailable");
+            }
+        };
+        if scope.check(&claims, &[digest]).is_err() {
+            return self.refuse(Outcome::Forbidden, "out_of_scope");
+        }
+        if digest.size_bytes > MAX_BLOB_BYTES {
+            return self.refuse(Outcome::TooLarge, "too_large");
+        }
+        if is_empty_blob(&digest) {
+            return self.serve(Bytes::new());
+        }
+        let _read = self.reads.acquire().await;
+        match self.source.read_blob(&digest).await {
+            Ok(bytes) => self.serve(bytes),
+            Err(StorageError::NotFound(_)) => self.refuse(Outcome::NotFound, "not_found"),
+            Err(_) => self.refuse(Outcome::Unavailable, "store_unavailable"),
+        }
+    }
+
+    /// The claims of the grant in `authorization`, or the reason code it is refused with.
+    fn claims(&self, authorization: Option<&str>) -> Result<Claims, &'static str> {
+        let token = bearer(authorization).ok_or("missing_token")?;
+        self.grants.verify(token).map_err(|error| match error {
+            GrantError::Malformed | GrantError::BadMac => "invalid_token",
+            GrantError::Expired => "expired",
+            GrantError::Revoked => "revoked",
+        })
+    }
+
+    /// The scope of `action`, worked out on the first ask and remembered. A failure is not
+    /// remembered: the blobs may be there at the next ask.
+    async fn scope(&self, action: Digest) -> Result<Arc<Scope>, ScopeError> {
+        let cell = {
+            let mut cells = self.scopes.lock().unwrap_or_else(PoisonError::into_inner);
+            if cells.len() >= self.limits.scopes {
+                cells.clear();
+            }
+            Arc::clone(cells.entry(action).or_default())
+        };
+        let scope = cell
+            .get_or_try_init(|| async {
+                walk(&*self.source, action, self.limits.scope_digests)
+                    .await
+                    .map(Arc::new)
+            })
+            .await?;
+        Ok(Arc::clone(scope))
+    }
+
+    fn serve(&self, body: Bytes) -> Reply {
+        self.bytes.add(body.len() as u64);
+        self.answer(Outcome::Ok, body)
+    }
+
+    fn refuse(&self, outcome: Outcome, reason: &'static str) -> Reply {
+        self.answer(outcome, Bytes::from(format!("{reason}\n")))
+    }
+
+    fn answer(&self, outcome: Outcome, body: Bytes) -> Reply {
+        self.requests[outcome as usize].add(1);
         Reply {
-            status: StatusCode::NOT_IMPLEMENTED,
-            body: Bytes::new(),
+            status: outcome.status(),
+            body,
         }
     }
 
     /// Appends the counters to `out`: `kbf_job_read_requests_total` by `outcome` and
     /// `kbf_job_read_bytes_total`.
     pub fn render_metrics(&self, out: &mut String) {
-        let _ = out;
+        let mut families = Families(std::mem::take(out));
+        let name = "kbf_job_read_requests_total";
+        families.head(
+            name,
+            "counter",
+            "Job-facing read requests answered, by outcome",
+        );
+        for (outcome, counter) in OUTCOMES.iter().zip(&self.requests) {
+            let _ = writeln!(
+                families.0,
+                "{name}{{outcome=\"{outcome}\"}} {}",
+                counter.get()
+            );
+        }
+        families.counter(
+            "kbf_job_read_bytes_total",
+            "Blob bytes served to jobs",
+            self.bytes.get(),
+        );
+        *out = families.0;
     }
 
     /// [`JobRead::render_metrics`] when there is a job-facing read, and nothing when there
@@ -134,4 +299,79 @@ impl JobRead {
             read.render_metrics(out);
         }
     }
+}
+
+/// The token of an `Authorization: Bearer <token>` header (the scheme in any case).
+fn bearer(authorization: Option<&str>) -> Option<&str> {
+    let (scheme, token) = authorization?.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then_some(token.trim())
+}
+
+/// The digest a path `/<hex>/<size>` names.
+fn digest_of(path: &str) -> Option<Digest> {
+    Digest::parse(DigestFunction::Sha256, path.strip_prefix('/')?).ok()
+}
+
+/// The scope of `action`: the Action, its Command, and the Directory blobs and files of the
+/// tree under its input root, read from `source` a level at a time.
+async fn walk(source: &dyn BlobSource, action: Digest, most: usize) -> Result<Scope, ScopeError> {
+    let decoded = reapi::Action::decode(source.read_blob(&action).await?)
+        .map_err(|_| ScopeError::Unusable)?;
+    let command = proto(decoded.command_digest.as_ref())?;
+    let root = proto(decoded.input_root_digest.as_ref())?;
+    let mut seen = HashSet::from([root]);
+    let mut level = vec![root];
+    while !level.is_empty() {
+        let directories: Vec<reapi::Directory> = stream::iter(level)
+            .map(|digest| directory(source, digest))
+            .buffer_unordered(DIRECTORIES_IN_FLIGHT)
+            .try_collect()
+            .await?;
+        level = Vec::new();
+        for directory in &directories {
+            seen.extend(files_of(directory)?);
+            for digest in directories_of(directory)? {
+                if seen.insert(digest) {
+                    level.push(digest);
+                }
+            }
+        }
+        if seen.len() > most {
+            return Err(ScopeError::Unusable);
+        }
+    }
+    Ok(Scope::new(action, command, seen))
+}
+
+/// The Directory blob `digest`, decoded; the empty blob is the empty Directory.
+async fn directory(
+    source: &dyn BlobSource,
+    digest: Digest,
+) -> Result<reapi::Directory, ScopeError> {
+    if is_empty_blob(&digest) {
+        return Ok(reapi::Directory::default());
+    }
+    reapi::Directory::decode(source.read_blob(&digest).await?).map_err(|_| ScopeError::Unusable)
+}
+
+fn files_of(directory: &reapi::Directory) -> Result<Vec<Digest>, ScopeError> {
+    directory
+        .files
+        .iter()
+        .map(|file| proto(file.digest.as_ref()))
+        .collect()
+}
+
+fn directories_of(directory: &reapi::Directory) -> Result<Vec<Digest>, ScopeError> {
+    directory
+        .directories
+        .iter()
+        .map(|child| proto(child.digest.as_ref()))
+        .collect()
+}
+
+fn proto(digest: Option<&reapi::Digest>) -> Result<Digest, ScopeError> {
+    wire::digest(digest).map_err(|_| ScopeError::Unusable)
 }

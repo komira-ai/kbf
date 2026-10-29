@@ -146,7 +146,8 @@ fn tree() -> Tree {
             file("big", &big),
             file("at_cap", &at_cap),
         ],
-        directories: vec![subdirectory("lib", &lib)],
+        // Named twice: the walk reads a Directory once however often it is named.
+        directories: vec![subdirectory("lib", &lib), subdirectory("again", &lib)],
         ..Directory::default()
     };
     let root = put(&mut blobs, &root.encode_to_vec());

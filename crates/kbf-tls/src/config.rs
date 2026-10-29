@@ -75,7 +75,7 @@ impl Alpn {
         match self {
             Self::H2 => vec![b"h2".to_vec()],
             Self::H2AndHttp1 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-            Self::Http1 => vec![b"h2".to_vec()],
+            Self::Http1 => vec![b"http/1.1".to_vec()],
         }
     }
 }

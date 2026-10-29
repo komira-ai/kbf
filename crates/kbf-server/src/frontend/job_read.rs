@@ -47,7 +47,7 @@ use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 
 use crate::listen::{Binder, Latch, Socket, Stoppable};
 use crate::serve::ServeError;
-use crate::token::TokenFileError;
+use crate::token::{TokenFileError, read_owner_only};
 
 const LISTEN: &str = "job_listen";
 const TLS_CERT: &str = "job_tls_cert";
@@ -281,15 +281,34 @@ impl Prepared {
 
 /// The grant key the secret in the file `path` makes.
 fn grant_key(path: &Path) -> Result<GrantKey, JobReadError> {
-    let _ = (path, MAX_SECRET_FILE_BYTES);
-    Ok(GrantKey::from_secret(&[0; 32])?)
+    let content = read_owner_only(path, MAX_SECRET_FILE_BYTES)?;
+    if content.len() > MAX_SECRET_FILE_BYTES {
+        return Err(TokenFileError::Content {
+            path: path.to_owned(),
+        }
+        .into());
+    }
+    Ok(GrantKey::from_secret(content.trim_ascii())?)
 }
 
 /// Whether the leaf of the PEM chain `pem` names `listen`: as an IP subjectAltName when the
 /// address is a particular one, and some IP subjectAltName when it is the unspecified one.
 fn names_the_address(pem: &[u8], listen: SocketAddr) -> Result<(), String> {
-    let _ = (pem, listen);
-    Ok(())
+    let bundle = kbf_ca::Bundle::from_pem(pem).map_err(|_| "no PEM certificate".to_owned())?;
+    let names = kbf_peer::names_of(&bundle.certs()[0]).unwrap_or_default();
+    let ip = listen.ip();
+    let named = if ip.is_unspecified() {
+        !names.ips().is_empty()
+    } else {
+        names.covers(&ip.to_string())
+    };
+    if named {
+        return Ok(());
+    }
+    Err(format!(
+        "the certificate has no IP subjectAltName for {ip} (it names {names}); a job dials \
+         the frontend by IP address and accepts only a certificate that names it"
+    ))
 }
 
 fn router(read: Arc<JobRead>) -> Router {
