@@ -69,9 +69,6 @@ pub(crate) mod durable;
 mod engine;
 pub(crate) mod failed_actions;
 mod handover;
-// The core's pieces are read as the groups of methods in `js` are written.
-#[cfg(feature = "farm-core-js")]
-#[allow(dead_code)]
 mod js;
 mod learning;
 mod named;
@@ -227,7 +224,7 @@ impl Farm {
     /// new [`process_term`] for both otherwise (see the module docs).
     ///
     /// It runs on the core [`crate::SchedulerCore::under_test`] names: the farm's own, and
-    /// the js core in a build with the `farm-core-js` feature.
+    /// the js core in a build with the `farm-core-js` feature (the tests of the js core).
     #[must_use]
     pub fn new(
         cache: impl Into<Backend>,
@@ -259,14 +256,12 @@ impl Farm {
     }
 
     /// [`Farm::new`] on `core`.
-    #[cfg_attr(not(feature = "farm-core-js"), allow(unused_variables))]
     pub(crate) fn on_core(
         core: crate::SchedulerCore,
         cache: Backend,
         unservable_wait: Duration,
         finished_retention: Duration,
     ) -> Self {
-        #[cfg(feature = "farm-core-js")]
         if core == crate::SchedulerCore::Js {
             return Self::new_js(cache, unservable_wait, finished_retention);
         }

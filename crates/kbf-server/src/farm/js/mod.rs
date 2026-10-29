@@ -1,5 +1,4 @@
-//! The farm on the js core (`--scheduler-core js`), built with the `farm-core-js` feature:
-//! [`JsFarm`] is what [`Driver::Js`](super::driver::Driver) holds.
+//! The farm on the js core (`--scheduler-core js`): [`JsFarm`] is what [`Driver::Js`](super::driver::Driver) holds.
 //!
 //! Every method of [`Farm`](super::Farm) that differs by core starts with an arm that calls
 //! the function of the same name in one of three files, with the same arguments after the

@@ -187,7 +187,6 @@ impl KbfAdapter {
 
     /// The operations this adapter finished as failed, per class: those it settled by what
     /// their callers are told, and those it refused.
-    #[cfg_attr(not(feature = "farm-core-js"), allow(dead_code))]
     pub(crate) const fn failed_actions(&self) -> FailedActions {
         self.failed
     }

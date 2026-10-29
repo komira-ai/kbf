@@ -260,7 +260,6 @@ impl KbfAdapter {
     }
 
     /// Copies the estimator's tally into the scrape.
-    #[cfg_attr(not(feature = "farm-core-js"), allow(dead_code))]
     pub(crate) fn publish_learned(&self) {
         let metrics = self.cache.metrics();
         self.learning.learned.publish(&metrics.estimator_shadow);
@@ -269,7 +268,6 @@ impl KbfAdapter {
     /// Writes behind the summaries changed since they were last written, and sweeps the
     /// stale ones from the store once an hour, a bounded number of rows at a tick. Run at
     /// each tick.
-    #[cfg_attr(not(feature = "farm-core-js"), allow(dead_code))]
     pub(crate) fn flush_learned(&mut self) {
         if self.learning.learned.off() {
             return;
@@ -385,7 +383,6 @@ impl KbfAdapter {
     /// This adapter, showing the estimator of `learned` the attempts that finish. `stored`:
     /// the core has a state store to write the summaries to.
     #[must_use]
-    #[cfg_attr(not(feature = "farm-core-js"), allow(dead_code))]
     pub(crate) fn learning_with(mut self, learned: Learned, stored: bool) -> Self {
         self.learning = Learning::of(learned, stored);
         self
