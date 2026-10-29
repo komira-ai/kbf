@@ -257,19 +257,19 @@ fn children_usage() -> ChildrenUsage {
 #[cfg(test)]
 mod tests {
     use kbf_proto::reapi::command::EnvironmentVariable;
+    use kbf_testkit::dir::TestDir;
 
     use super::*;
 
     struct Rig {
-        dir: PathBuf,
+        dir: TestDir,
         stdout: PathBuf,
         stderr: PathBuf,
     }
 
     impl Rig {
         fn new(name: &str) -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("kbf-task-run-{}-{name}", std::process::id()));
+            let dir = TestDir::under(std::env::temp_dir(), &format!("kbf-task-run-{name}"));
             std::fs::create_dir_all(dir.join("root")).expect("root");
             Self {
                 stdout: dir.join("stdout"),
@@ -302,12 +302,6 @@ mod tests {
 
         fn err(&self) -> String {
             std::fs::read_to_string(&self.stderr).expect("stderr")
-        }
-    }
-
-    impl Drop for Rig {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 

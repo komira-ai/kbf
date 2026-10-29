@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use kbf_proto::reapi::command::EnvironmentVariable;
 use kbf_proto::reapi::{Directory, FileNode};
 use kbf_segments::SegmentReader;
+use kbf_testkit::dir::TestDir;
 use prost::Message;
 
 use super::*;
@@ -66,11 +67,8 @@ impl PackSink for Fake {
 }
 
 /// A fresh scratch directory for one test, beside the test binary.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-task-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(std::env::temp_dir(), &format!("kbf-task-{name}"))
 }
 
 fn cli(work_dir: &Path, action: Digest) -> Cli {

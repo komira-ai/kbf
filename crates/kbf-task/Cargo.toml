@@ -29,6 +29,7 @@ ureq.workspace = true
 tokio = { workspace = true, features = ["rt", "fs", "process", "time", "io-util"] }
 
 [dev-dependencies]
+kbf-testkit.workspace = true
 prost-types.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
