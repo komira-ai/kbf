@@ -2585,7 +2585,7 @@ name = "kbf-lease-client"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "http",
+ "http 1.5.0",
  "http-body-util",
  "hyper",
  "hyper-util",
