@@ -99,7 +99,11 @@ async fn a_start_waits_for_room_inside_its_window() {
     // Read once, however many passes it waited: the CAS is not read, and no url or grant is
     // made, on each pass of the window.
     let reads = rig.inputs.looked_up.lock().expect("looked up").clone();
-    assert_eq!(reads.iter().filter(|h| **h == hex(3)).count(), 1, "{reads:?}");
+    assert_eq!(
+        reads.iter().filter(|h| **h == hex(3)).count(),
+        1,
+        "{reads:?}"
+    );
     let waited = rig.presign.keys().len();
     assert_eq!(waited, 3, "a url was minted again while the Start waited");
     rig.host_finishes(&third[0].run, Outcome::Succeeded, Some(0));

@@ -20,13 +20,31 @@
 //!
 //! # Time
 //!
-//! Every time here is the clock passed to `step`, and the safety of the whole rests on two
+//! Every time here is a clock read where it is used, and the safety of the whole rests on two
 //! numbers. `T` ([`Config::fence_after`]) is how long the worker goes on after the farm
-//! last acknowledged a heartbeat, or the lease server last answered, before it stops its
-//! runs and falls silent. `G` ([`kbf_sched::fence::LEASE_GRACE`]) is how long the farm waits
+//! last acknowledged a heartbeat, or the lease server last answered, before it asks its runs
+//! to stop and falls silent. `G` ([`kbf_sched::fence::LEASE_GRACE`]) is how long the farm waits
 //! after last hearing a worker before it requeues the worker's leases. `T` plus the
 //! scheduler's margin stays under `G` ([`Config::validate`]), so a silent worker's runs
 //! were asked to stop before the farm starts their retry.
+//!
+//! What that needs, and what it does not give:
+//!
+//! - A pass is a series of calls to the lease server with the heartbeat and the fence
+//!   inside it, so every call is bounded ([`Config::call_timeout`]), a pass starts no new
+//!   task once its budget is spent ([`Config::pass_budget`]), and the heartbeat and the fence
+//!   read the clock where they act. A pass is bounded by those, not by a timer of its own: the
+//!   caller steps the executor again when it returns, and a caller that does not step it
+//!   leaves the farm hearing nothing.
+//! - Asking a run to stop is a call to the lease server. If that is what cannot be
+//!   reached, the fence falls silent and the farm requeues the action while the run goes on
+//!   to its wall time: the work is done twice, and the second copy is not harmed by the first
+//!   (each run writes only its own key). The fence bounds wasted work; it does not stop a run
+//!   the lease server cannot be asked to stop.
+//! - A `Start` posted at the end of its window ([`kbf_sched::fence::START_VALIDITY`]) is
+//!   stopped `T` after the farm last heard the worker, and the farm reruns the action
+//!   [`kbf_sched::fence::START_GRACE`] after the `Start`: the window, `T` and the margin stay
+//!   under it ([`Config::validate`]).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::ControlFlow;
