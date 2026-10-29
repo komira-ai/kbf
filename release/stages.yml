@@ -12,16 +12,28 @@
 # stage workflow's triggers are checked as a whole), and that the operator stages are
 # verified before release (the release workflow's own steps do that).
 stages:
-  # pipeline.yml, on a push to main, runs the stages in order, each needing the one before:
-  # ci (the pull-request gate, ci.yml, run again on the merged result), build, beta, and then
-  # the release (prod), which is a workflow of its own started by the pipeline's success.
-  # The pipeline's own jobs are the callers of the three stage workflows, and `push`, which
-  # leaves the commit the push replaced for the release run.
+  # pipeline.yml, on a push to main, runs the stages: ci (the pull-request gate, ci.yml, run
+  # again on the merged result) and the suite (beta.yml, below) start together; build needs ci;
+  # the beta smoke needs build; the release (prod) is a workflow of its own started by the
+  # pipeline's success, which needs every stage. The pipeline's own jobs are the callers of the
+  # stage workflows, `watch` (the fail-fast: it cancels the run when a job has failed, so it
+  # belongs to the stage the run starts with, and its trigger is `push`) and `passed` (needs
+  # every stage and does nothing else), which leaves the commit the push replaced for the release run.
   - name: ci
     runs: actions
     after: []
     result: ci green
     events: [push]
+  # beta.yml, called by the pipeline beside ci: everything the pull-request gate (ci.yml) leaves
+  # out that tests the commit's source, each job building what it runs. The whole nextest run with
+  # its slow tests, the Arm run, the jobs that need a service, root, crun or a Mac, and the Linux
+  # packages. It needs no artifact of the run, so it waits for no stage. beta.yml has no trigger
+  # of its own: no pull request, no merge queue entry, no push.
+  - name: suite
+    runs: actions
+    after: []
+    result: suite green
+    events: [workflow_call]
   # artifacts.yml builds, tests and (on a push to main, called by the pipeline) attests the files
   # every later stage uses. It also runs for pull requests and the merge queue, which attest
   # nothing.
@@ -30,14 +42,12 @@ stages:
     after: [ci]
     result: SHA256SUMS
     events: [pull_request, merge_group, workflow_call]
-  # The full run, called by the pipeline after build: everything the pull-request gate (ci.yml)
-  # leaves out. The whole nextest run with its slow tests, the Arm run, the jobs that need a
-  # service, root, crun or a Mac, the Linux packages, and the end-to-end smoke of beta.yml
-  # (scenario B0, the farm under Buck2 load), whose farm runs the kbf of build's linux-x86_64
-  # tarball of the same run; its result document records no set hash and so says it is
-  # unattested. The full run on the attested bytes with the update and kill scenarios, and the
-  # `signing: true` job that attests its result, are added to `jobs` by the changes that build
-  # them. beta.yml has no trigger of its own: no pull request, no merge queue entry, no push.
+  # smoke.yml, called by the pipeline after build: the end-to-end smoke (scenario B0, the farm
+  # under Buck2 load), whose farm runs the kbf of build's linux-x86_64 tarball of the same run;
+  # its result document records no set hash and so says it is unattested. The full run on the
+  # attested bytes with the update and kill scenarios, and the `signing: true` job that attests
+  # its result, are added to `jobs` by the changes that build them. smoke.yml has no trigger of
+  # its own.
   - name: beta
     runs: actions
     after: [build]
@@ -48,11 +58,11 @@ stages:
   # update coordinator, waits for the farm to converge, and proves the farm with a remote-only
   # Buck2 build (`cargo xtask prove-farm`). All of it is one run, in the stage below. It is
   # started by the completion of a successful pipeline run (`workflow_run`), the one workflow
-  # that is, so that a newer push cancelling the pipeline never cancels a release that has
-  # started. gamma.yml is deleted, and the 24 hour bake and its verdict run outside Actions.
+  # that is, so that the release is a run of its own that no push cancels once it has started.
+  # gamma.yml is deleted, and the 24 hour bake and its verdict run outside Actions.
   - name: prod
     runs: actions
-    after: [beta]
+    after: [beta, suite]
     result: release.json
     events: [workflow_run]
 jobs:
@@ -62,6 +72,12 @@ jobs:
     stage: build
     signing: true
   - job: pipeline.yml#beta
+    stage: suite
+  - job: pipeline.yml#smoke
+    stage: beta
+  - job: pipeline.yml#watch
+    stage: ci
+  - job: pipeline.yml#passed
     stage: beta
   - job: artifacts.yml#darwin-arm64
     stage: build
@@ -85,36 +101,36 @@ jobs:
     stage: build
   - job: artifacts.yml#verify-darwin-arm64
     stage: build
-  - job: beta.yml#smoke
+  - job: smoke.yml#smoke
     stage: beta
   - job: beta.yml#test-x86
-    stage: beta
+    stage: suite
   - job: beta.yml#test-arm
-    stage: beta
+    stage: suite
   - job: beta.yml#state-postgres
-    stage: beta
+    stage: suite
   - job: beta.yml#objstore-s3
-    stage: beta
+    stage: suite
   - job: beta.yml#crun-x86
-    stage: beta
+    stage: suite
   - job: beta.yml#crun-arm
-    stage: beta
+    stage: suite
   - job: beta.yml#m2-container
-    stage: beta
+    stage: suite
   - job: beta.yml#native-macos
-    stage: beta
+    stage: suite
   - job: beta.yml#native-macos-assert
-    stage: beta
+    stage: suite
   - job: beta.yml#pkg-macos
-    stage: beta
+    stage: suite
   - job: beta.yml#packages
-    stage: beta
+    stage: suite
   - job: beta.yml#m1-cell
-    stage: beta
+    stage: suite
   - job: beta.yml#cross-version
-    stage: beta
+    stage: suite
   - job: beta.yml#mixed-version
-    stage: beta
+    stage: suite
   - job: release.yml#plan
     stage: prod
   - job: release.yml#verify

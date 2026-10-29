@@ -341,7 +341,7 @@ fn the_admission_working_set_drops_active_file_beyond_a_quarter_of_memory() {
 // The farm's wiring.
 
 fn farm() -> Farm {
-    Farm::new(
+    Farm::new_legacy(
         Arc::new(kbf_front::Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,

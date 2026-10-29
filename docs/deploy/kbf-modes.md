@@ -469,7 +469,7 @@ leases they held before. Copying a joining member's slice to it
 
 | mode | on SIGTERM or SIGINT | what bounds it |
 |---|---|---|
-| `frontend` | drains, by the sequence below | `--drain-lb-wait` (10 s by default) and `--drain-deadline` (900 s by default); `--shutdown-timeout-secs` (0 by default: no deadline); a second signal |
+| `frontend` | drains, by the sequence below | `--drain-lb-wait` (10 s by default); nothing else by default: the drain waits for every open execution, and `--drain-deadline` (none by default) only reports; to force a stop, a second signal or `--shutdown-timeout-secs` (0 by default: none) |
 | `all-in-one` | the frontend half drains; the daemon half does not | as `frontend`; the daemon half stops when the server half has |
 | `storage` | stops | none of its own |
 | `daemon` | drains | `--drain-deadline-secs` (600 by default); a second signal |
@@ -483,13 +483,16 @@ a stop that cuts a stream fails its action. On the first signal, or on
 503 while everything is still served; after `--drain-lb-wait` it refuses each new Execute with
 `UNAVAILABLE` (which Buck2 retries), takes no more work from the state store, and sends
 GOAWAY on the REAPI, worker and operator API listeners; it keeps every open Execute and
-WaitExecution stream until its action is done, at most `--drain-deadline`, except a stream
+WaitExecution stream until its action is done, however long that takes, except a stream
 whose operation was never started, that no worker on this frontend can run and that no
-other frontend can take, which ends `UNAVAILABLE` at the end of the load balancer wait (the
-action would fail at the deadline anyway); then it ends the
-worker streams and the streams left `UNAVAILABLE` and exits 0. `GET /v1/frontend/drain`
-reports the phase. A second signal skips the waits, and `--shutdown-timeout-secs` running
-out does the same. A frontend with no state store (a test setup) drains at once: `/readyz`
+other frontend can take, which ends `UNAVAILABLE` at the end of the load balancer wait;
+then it ends the worker streams and exits 0. There is no default deadline. A
+`--drain-deadline` that is set (no upper bound) only reports when it passes with executions
+open: a WARN with the count, and `deadline_passed` in `GET /v1/frontend/drain`; no stream is
+ended, the process stays up, and the drain keeps waiting, whether a signal or the endpoint
+began it. `GET /v1/frontend/drain` reports the phase. The way to force a stop is a second
+signal, which skips the waits, or `--shutdown-timeout-secs` running out on a drain a
+signal began; either ends the streams that are left `UNAVAILABLE`, and their builds fail. A frontend with no state store (a test setup) drains at once: `/readyz`
 503, new Execute calls refused, GOAWAY on the REAPI listener, and exit 0 once the REAPI
 connections have closed. Under systemd that needs `TimeoutStopSec=infinity`; the units that
 `kbf-deploy` renders set it.

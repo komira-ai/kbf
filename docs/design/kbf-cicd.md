@@ -32,8 +32,8 @@ the nodes, which pull it. The deploy is itself a test (no build failed because a
 verdict (gamma verdict TBD, on a generic monitoring library) then comes from the operator's real usage over the metrics
 the gamma farm emits during a 24 hour **bake** (section 7); nothing produces that verdict today.
 
-**prod** is the existing attested-artifact release (tag, files, notes), cut from a push to `main` whose one pipeline run (`ci`, then
-`artifacts`, then `beta` on those artifacts) succeeded, and gated on the checks of the files (sections 8.0 and 8.1); no verdict document gates it. **Rollback** is the updater walking back through the same mechanism it walked forward with: the
+**prod** is the existing attested-artifact release (tag, files, notes), cut from a push to `main` whose one pipeline run (`ci`, the `beta` source tests,
+`artifacts` and the `smoke` on those artifacts) succeeded, and gated on the checks of the files (sections 8.0 and 8.1); no verdict document gates it. **Rollback** is the updater walking back through the same mechanism it walked forward with: the
 desired commit is set to the older release under a higher generation.
 
 ```
@@ -191,11 +191,11 @@ Two layers, because "on every merge" and "a merge must not wait an hour" pull ap
   `merge_group` build's output, then smoke's own build. Smoke is unattested and says so in its result document.
   `merge_group` runs repository code from the queue ref with no fork code, so the root-level helpers are acceptable there.
 - **Full, after the merge** (`push` to main): rolling update of every role under a running build,
-  kill-a-node, the Envoy swap, the all-in-one variant, N/N-1, on the attested bytes. It is the third stage of the one
-  pipeline of section 8.0: `beta.yml`, called after `artifacts.yml` in the same run, so it reads the attested files from
+  kill-a-node, the Envoy swap, the all-in-one variant, N/N-1, on the attested bytes. It is part of the one
+  pipeline of section 8.0: `smoke.yml`, called after `artifacts.yml` in the same run, reads the attested files from
   that run's artifacts and needs no `workflow_run` for the order. Built today: the smoke job runs the `kbf` of the
-  linux-x86_64 tarball of that run (checked against `SHA256SUMS` and for the commit); the other jobs of `beta.yml` test the
-  commit's source and build what they run; the scenarios that need the attested bytes are the later work named here. A red full run does not revert anything; it **blocks the
+  linux-x86_64 tarball of that run (checked against `SHA256SUMS` and for the commit); the jobs of `beta.yml` test the
+  commit's source, build what they run and start beside `ci`; the scenarios that need the attested bytes are the later work named here. A red full run does not revert anything; it **blocks the
   commit from being offered to gamma** (the offer needs its beta-result attestation) and opens an issue automatically.
   A scenario becomes a required part of the full run on the day its blocking pull requests merge (section 4.5), not before,
   because a fail-closed gate on an absent metric is red by construction.
@@ -548,30 +548,40 @@ fails its gate, never passes it, and a producer failure is never a pass.
 
 ### 8.0 The one pipeline of a push to main
 
-A push to `main` runs one sequential pipeline, `pipeline.yml`, in this order, each stage needing the one before it:
+A push to `main` runs one pipeline, `pipeline.yml`:
 
 ```
- push to main ─> ci ─> artifacts ─> beta ─────────────> release
-                 ci.yml  artifacts.yml  beta.yml          release.yml
-                 (called)  (called, attests)  (called, installs and tests
-                                              the files artifacts built)
+ push to main -+-> ci ---------------------------------+
+               +-> beta (source tests, beta.yml) --------+-> passed -> release
+               +-> artifacts (after ci) -> smoke --------+      (release.yml)
+               +-> watch (cancels the run when a job fails)
 ```
 
-- **Each check runs once.** `ci.yml`, `artifacts.yml` and `beta.yml` have a `workflow_call` trigger and no `push`
+- **Each check runs once.** `ci.yml`, `artifacts.yml`, `beta.yml` and `smoke.yml` have a `workflow_call` trigger and no `push`
   trigger of their own. `ci.yml` and `artifacts.yml` keep `pull_request` and `merge_group`, so the pull-request gate and the
-  merge queue are unchanged; `beta.yml` has `workflow_call` alone (it never ran for a pull request). In a called workflow
+  merge queue are unchanged; `beta.yml` and `smoke.yml` have `workflow_call` alone (they never ran for a pull request). In a called workflow
   `github.event_name` and `github.ref` are the caller's, so the jobs that attest still read as a push to `main`.
-- **Beta tests the files that will be released.** `beta` runs after `artifacts` in the same run and downloads that run's
+- **Smoke tests the files that will be released.** `smoke` runs after `artifacts` in the same run and downloads that run's
   `assets-*` and `sha256sums` artifacts (no run id), checks them with `verify-assets sums`, checks the tarball's `kbf` with `build-commit check-asset` (this commit, a
   release build), and the smoke farm runs the `kbf` out of the linux-x86_64 tarball. The release then publishes those same files (`release.yml` downloads them from the same
-  pipeline run and checks them again).
-- **A red or cancelled stage stops the rest.** Every stage `needs` the one before it, none can be skipped, and the workflow
-  has no `always()` or `continue-on-error`.
+  pipeline run and checks them again). Only the smoke reads the run's artifacts, so only it waits for `artifacts`; every job of
+  `beta.yml` tests the commit's source and builds what it runs, so it starts beside `ci` (the suite is the longest part
+  of the pipeline, about an hour, and no longer waits behind two stages that it does not read). The lint refuses a
+  `download-artifact` in `beta.yml`.
+- **A red or cancelled stage stops the rest, and a red job stops the run.** `artifacts` needs `ci` and `smoke` needs
+  `artifacts`; none can be skipped, and the workflow has no `always()` or `continue-on-error`. `passed` needs all four
+  and does nothing else, so the run succeeds, and the release follows, only when every job of every stage passed. GitHub
+  cancels the rest of a run for a failed job only inside a matrix, so `watch` (`cargo xtask pipeline-watch`) polls the
+  run's jobs and cancels the run as soon as one has failed or timed out; the run then ends cancelled and starts no
+  release, and the failed job keeps its own conclusion. It ends when `passed` has completed, ends with a notice when it
+  cannot read the jobs, and never makes a run red itself.
 - **A running pipeline finishes; the newest waiting push queues behind it.** The workflow's group is `pipeline-<ref>` with
   `cancel-in-progress: false`: the run in progress is never cancelled, and of the pushes that wait GitHub keeps the newest
-  (a pending run is replaced by a newer one). Nothing that writes is a job of this run anyway: it holds no tag, no
+  (a pending run is replaced by a newer one; the release plan measures from the highest tag, so the code of a replaced
+  or failed run ships in the next release). Nothing that releases is a job of this run: it holds no tag, no
   release, no push to another repository, no environment and no secret. The only write scopes it grants are the signing
-  scopes of the `artifacts` call, under the exact `if:` of a push to `main` (the `beta` call grants `attestations: read`
+  scopes of the `artifacts` call and `actions: write` of the `watch` job (to cancel this run), both under the exact `if:`
+  of a push to `main` (the `beta` call grants `attestations: read`
   for its `mixed-version` job); a called workflow gets at most what the caller grants, and GitHub refuses the whole
   workflow at startup when one asks for more, so the workflow lint compares every job of each called workflow with its
   caller's grant. No stage call passes `secrets:`.
