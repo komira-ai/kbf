@@ -25,6 +25,8 @@ use kbf_proto::reapi::Command;
 use tokio::fs;
 use tokio::process::Command as Process;
 
+use crate::fetch;
+
 /// The exit code reported for a run the deadline ended: 128 plus SIGKILL.
 pub const TIMED_OUT_EXIT_CODE: i32 = 128 + 9;
 
@@ -179,23 +181,13 @@ pub(crate) fn output_paths(command: &Command) -> Vec<&String> {
 }
 
 /// A path the Command names must be empty (the directory itself) or relative, of non-empty
-/// components other than `.` and `..`, joined by single slashes.
+/// components other than `.` and `..`: the rule of [`fetch::check_relative`].
 fn check_relative(what: &str, path: &str) -> Result<(), RunError> {
-    let plain = path.is_empty()
-        || path
-            .split('/')
-            .all(|part| !matches!(part, "" | "." | "..") && !part.contains('\0'));
-    if plain {
-        Ok(())
-    } else {
-        Err(RunError::Invalid(format!(
-            "{what} {path:?} must be relative and must not contain . or .."
-        )))
-    }
+    fetch::check_relative(what, path).map_err(|e| RunError::Invalid(e.to_string()))
 }
 
 /// Creates `base/relative` and each directory on the way that does not exist yet. A component
-/// that exists as anything but a directory (a symlink the input tree planted, a file) refuses
+/// that exists as anything but a directory (a symlink the input tree contains, a file) refuses
 /// the command: following it would put the program's work outside the input root.
 async fn real_dirs(base: &Path, relative: &str) -> Result<PathBuf, RunError> {
     let mut at = base.to_owned();

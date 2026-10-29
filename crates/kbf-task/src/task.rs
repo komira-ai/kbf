@@ -57,9 +57,11 @@ pub const EXIT_SETUP: u8 = 14;
     version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT"))
 )]
 pub struct Cli {
-    /// The presigned URL the pack is PUT to, once.
+    /// A file holding the presigned URL the pack is PUT to, once. The URL is a credential, so it
+    /// is not a flag value (argv is readable by the Command): the file is read, and removed,
+    /// before the Command starts.
     #[arg(long)]
-    pub pack_url: String,
+    pub pack_url_file: PathBuf,
     /// The base URL of the read grant: blobs are read from `<base>/<hex>/<size>`.
     #[arg(long)]
     pub grant_url: String,
@@ -75,7 +77,8 @@ pub struct Cli {
     /// Where the inputs are laid out (`in/` under it) and the output streams are written.
     #[arg(long, default_value = "/scratch/work")]
     pub work_dir: PathBuf,
-    /// How long the Command may run when the Action sets no timeout, in milliseconds.
+    /// The longest the Command may run, in milliseconds: the Action's timeout when it sets a
+    /// shorter positive one, else this.
     #[arg(long, default_value_t = 3_600_000)]
     pub deadline_ms: u64,
     /// A DER certificate to trust besides the host's roots, for a job image with no CA bundle.
@@ -133,19 +136,22 @@ impl Failure {
 
 /// Where the finished pack goes.
 pub trait PackSink {
-    /// Stores `body` at `url`, once.
+    /// Stores `body`, once.
     ///
     /// # Errors
     /// The pack was not stored.
-    fn store(&self, url: &str, body: &[u8]) -> Result<(), PutError>;
+    fn store(&self, body: &[u8]) -> Result<(), PutError>;
 }
 
-/// The real sink: one create-only PUT ([`put`]).
-pub struct HttpSink(ureq::Agent);
+/// The real sink: one create-only PUT ([`put`]) to the presigned URL it holds.
+pub struct HttpSink {
+    agent: ureq::Agent,
+    url: String,
+}
 
 impl PackSink for HttpSink {
-    fn store(&self, url: &str, body: &[u8]) -> Result<(), PutError> {
-        put(&self.0, url, body)
+    fn store(&self, body: &[u8]) -> Result<(), PutError> {
+        put(&self.agent, &self.url, body)
     }
 }
 
@@ -251,7 +257,7 @@ pub async fn execute(
             target: link.target.clone(),
         });
     }
-    sink.store(&cli.pack_url, &pack(&manifest, blobs)?)?;
+    sink.store(&pack(&manifest, blobs)?)?;
     Ok(manifest)
 }
 
@@ -268,13 +274,14 @@ fn blob_id(digest: Option<&Digest>) -> Result<BlobId, Failure> {
     BlobId::try_from(digest).map_err(|e| Failure::Result(e.to_string()))
 }
 
-/// How long the Command may run: the Action's timeout when it sets a positive one, else `default`.
-fn deadline(action: &Action, default: Duration) -> Duration {
+/// How long the Command may run: the Action's timeout when it sets a positive one, but never more
+/// than `cap`, the operator's limit; else `cap`.
+fn deadline(action: &Action, cap: Duration) -> Duration {
     match &action.timeout {
         Some(t) if t.seconds > 0 || (t.seconds == 0 && t.nanos > 0) => {
-            Duration::new(t.seconds.unsigned_abs(), t.nanos.unsigned_abs())
+            Duration::new(t.seconds.unsigned_abs(), t.nanos.unsigned_abs()).min(cap)
         }
-        _ => default,
+        _ => cap,
     }
 }
 
@@ -300,8 +307,24 @@ fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
             std::fs::read(path).map_err(|e| Failure::Setup(format!("{}: {e}", path.display())))?,
         );
     }
+    let url = std::fs::read_to_string(&cli.pack_url_file)
+        .map_err(|e| Failure::Setup(format!("{}: {e}", cli.pack_url_file.display())))?;
+    let url = url.trim_end_matches(['\r', '\n']).to_owned();
+    if url.is_empty() {
+        return Err(Failure::Setup(format!(
+            "{} is empty",
+            cli.pack_url_file.display()
+        )));
+    }
+    // The Command runs as a child of this process: the URL must not be left where it can read it.
+    std::fs::remove_file(&cli.pack_url_file)
+        .map_err(|e| Failure::Setup(format!("{}: {e}", cli.pack_url_file.display())))?;
     let source = HttpBlobSource::new(&cli.grant_url, token, &roots)?;
-    Ok((source, HttpSink(agent(Some(tls_config(&roots))))))
+    let sink = HttpSink {
+        agent: agent(Some(tls_config(&roots))),
+        url,
+    };
+    Ok((source, sink))
 }
 
 /// Runs the task the flags describe against the real grant and the real presigned URL, and turns
@@ -365,7 +388,7 @@ mod tests {
 
     /// A sink that keeps what it was given, or refuses.
     struct Fake {
-        stored: Mutex<Vec<(String, Vec<u8>)>>,
+        stored: Mutex<Vec<Vec<u8>>>,
         refuse: bool,
     }
 
@@ -379,16 +402,13 @@ mod tests {
     }
 
     impl PackSink for Fake {
-        fn store(&self, url: &str, body: &[u8]) -> Result<(), PutError> {
+        fn store(&self, body: &[u8]) -> Result<(), PutError> {
             if self.refuse {
                 return Err(PutError::Exists {
-                    url: url.to_owned(),
+                    url: "https://store.example/pack".to_owned(),
                 });
             }
-            self.stored
-                .lock()
-                .unwrap()
-                .push((url.to_owned(), body.to_vec()));
+            self.stored.lock().unwrap().push(body.to_vec());
             Ok(())
         }
     }
@@ -405,8 +425,8 @@ mod tests {
         let id = BlobId::try_from(&action).expect("digest");
         Cli::try_parse_from([
             "kbf-task",
-            "--pack-url",
-            "https://store.example/pack?sig=secret",
+            "--pack-url-file",
+            "/nonexistent-url",
             "--grant-url",
             "https://grant.example",
             "--grant-token-file",
@@ -470,8 +490,7 @@ mod tests {
         let manifest = execute(&cli, &mem, &sink).await.expect("task");
         let stored = sink.stored.lock().unwrap();
         assert_eq!(stored.len(), 1);
-        let (url, body) = &stored[0];
-        assert_eq!(url, "https://store.example/pack?sig=secret");
+        let body = &stored[0];
 
         // The frontend's check: the manifest is the record at offset 0 and every digest it names
         // is a record of the pack.
@@ -519,7 +538,7 @@ mod tests {
         assert_eq!(manifest.output_symlinks.len(), 1);
         assert_eq!(manifest.output_symlinks[0].target, "d/f");
         let stored = sink.stored.lock().unwrap();
-        assert_eq!(&verify(&stored[0].1).expect("verify"), &manifest);
+        assert_eq!(&verify(&stored[0]).expect("verify"), &manifest);
     }
 
     #[tokio::test]
@@ -633,6 +652,8 @@ mod tests {
         assert_eq!(deadline(&with(0, 500), default), Duration::from_nanos(500));
         assert_eq!(deadline(&with(0, 0), default), default);
         assert_eq!(deadline(&with(-1, 0), default), default);
+        // An Action cannot outlive the operator's limit.
+        assert_eq!(deadline(&with(1_000_000_000, 0), default), default);
     }
 
     /// The Action's `timeout`, whatever type the generated code gives it.
@@ -648,7 +669,7 @@ mod tests {
         assert!(flags.root_der.is_empty());
         let default = Cli::try_parse_from([
             "kbf-task",
-            "--pack-url=u",
+            "--pack-url-file=u",
             "--grant-url=g",
             "--grant-token-file=t",
             "--lease=l",
@@ -659,6 +680,11 @@ mod tests {
         // A grant token is never a flag value, and the action must be a digest.
         for bad in [
             vec!["kbf-task", "--grant-token=x"],
+            // The presigned URL is a credential: it is not accepted as a flag value.
+            vec![
+                "kbf-task",
+                "--pack-url=https://store.example/pack?sig=secret",
+            ],
             vec!["kbf-task", "--action=nothex/1"],
         ] {
             assert!(Cli::try_parse_from(bad).is_err());
@@ -680,10 +706,39 @@ mod tests {
         std::fs::write(&flags.grant_token_file, "tok\n").expect("write");
         flags.root_der = vec![dir.join("absent.der")];
         assert!(matches!(connect(&flags), Err(Failure::Setup(_))));
-        // Both usable.
+        // Both usable, but the URL file is missing.
         std::fs::write(dir.join("root.der"), [1, 2, 3]).expect("write");
         flags.root_der = vec![dir.join("root.der")];
+        flags.pack_url_file = dir.join("url");
+        assert!(matches!(connect(&flags), Err(Failure::Setup(_))));
+        // An empty one.
+        std::fs::write(&flags.pack_url_file, "\n").expect("write");
+        assert!(matches!(connect(&flags), Err(Failure::Setup(_))));
+        // A URL: it is read, and the file is gone before the Command could read it.
+        std::fs::write(&flags.pack_url_file, "https://store.example/pack?sig=s\n").expect("write");
         assert!(connect(&flags).is_ok());
+        assert!(!flags.pack_url_file.exists());
+    }
+
+    #[test]
+    fn connect_refuses_a_url_file_it_cannot_remove() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("connect-unremovable");
+        let held = dir.join("held");
+        std::fs::create_dir(&held).expect("dir");
+        let mut flags = cli(&dir, Digest::from(BlobId::of(b"a")));
+        flags.grant_token_file = dir.join("token");
+        std::fs::write(&flags.grant_token_file, "tok\n").expect("write");
+        flags.pack_url_file = held.join("url");
+        std::fs::write(&flags.pack_url_file, "https://store.example/pack?sig=s").expect("write");
+        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o500)).expect("mode");
+        // A superuser removes it anyway; the refusal is checked where the mode is enforced.
+        let enforced = std::fs::write(held.join("probe"), b"").is_err();
+        let outcome = connect(&flags);
+        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        if enforced {
+            assert!(matches!(outcome, Err(Failure::Setup(_))));
+        }
     }
 
     #[tokio::test]
@@ -710,8 +765,11 @@ mod tests {
                 .expect("reply");
             String::from_utf8_lossy(&got).into_owned()
         });
-        let sink = HttpSink(agent(None));
-        sink.store(&url, b"ok").expect("stored");
+        let sink = HttpSink {
+            agent: agent(None),
+            url,
+        };
+        sink.store(b"ok").expect("stored");
         let request = server.join().expect("server");
         assert!(request.starts_with("PUT /pack "), "{request}");
     }

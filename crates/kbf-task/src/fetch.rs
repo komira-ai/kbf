@@ -10,7 +10,7 @@
 //! come from clients, so every name is checked before it touches the filesystem: a name with a
 //! slash, `.`, `..` or a NUL, empty, or used twice in one directory refuses the tree. Files are
 //! created with `O_EXCL` in directories this module made, so no write follows a symlink the tree
-//! planted. There is no cache and no hard link: each file is its own copy.
+//! contains. There is no cache and no hard link: each file is its own copy.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read as _, Write as _};

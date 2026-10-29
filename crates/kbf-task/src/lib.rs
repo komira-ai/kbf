@@ -18,6 +18,18 @@
 //! (whatever the action's own exit code, which is in the manifest), nonzero when fetching, packing or
 //! storing failed. Nothing the tool writes is trusted: the frontend hashes every record of the pack,
 //! checks its footer, and builds the action's result from its own hashing.
+//!
+//! # What the tool does not separate
+//!
+//! The Command runs as a child of the tool, under the same user. The presigned PUT URL is read
+//! from `--pack-url-file` and the file is removed before the Command starts, so it is neither in
+//! argv nor on disk while the Command runs. The grant token is read from `--grant-token-file`, which
+//! is not removed, and its path stays in the tool's argv: the job's sandbox must keep that file and the
+//! tool's `/proc` entry out of the Command's reach (a separate user or a separate process
+//! namespace), or the Command can read the token. A process of the Command that leaves its process
+//! group (for example with `setsid`) survives the group kill at the deadline; only such a sandbox
+//! ends it. The tool holds each collected blob in memory twice and the pack once more, so its peak
+//! is about three times the pack limit.
 
 pub mod fetch;
 pub mod manifest;

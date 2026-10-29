@@ -12,6 +12,9 @@ use std::time::Duration;
 /// How long the tool waits to reach the store.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the whole PUT may take, so a store that stalls cannot hold the tool.
+const PUT_TIMEOUT: Duration = Duration::from_secs(900);
+
 /// The string that stands in for a URL's query string and fragment.
 const REDACTED: &str = "<redacted>";
 
@@ -42,13 +45,26 @@ pub enum PutError {
     },
 }
 
-/// `url` with its query string and fragment replaced by `<redacted>`; a URL with neither is
-/// returned as it is. Only the part before the first `?` or `#` is kept.
+/// `url` with its user information, query string and fragment removed: the credentials before an
+/// `@` in the authority are dropped, and a query or fragment is replaced by `<redacted>`. Only the
+/// part before the first `?` or `#` is kept.
 pub fn redact(url: &str) -> String {
-    match url.find(['?', '#']) {
-        Some(at) => format!("{}?{REDACTED}", &url[..at]),
-        None => url.to_string(),
+    let (head, secret) = match url.find(['?', '#']) {
+        Some(at) => (&url[..at], true),
+        None => (url, false),
+    };
+    let mut out = head.to_string();
+    if let Some(start) = head.find("://").map(|i| i + 3) {
+        let end = head[start..].find('/').map_or(head.len(), |i| start + i);
+        if let Some(at) = head[start..end].rfind('@') {
+            out.replace_range(start..=start + at, "");
+        }
     }
+    if secret {
+        out.push('?');
+        out.push_str(REDACTED);
+    }
+    out
 }
 
 /// `message` with every occurrence of `url`, and of its query string, replaced by the redacted
@@ -94,16 +110,18 @@ pub fn tls_config(roots: &[Vec<u8>]) -> ureq::tls::TlsConfig {
 }
 
 /// The HTTP client of the PUT: no proxy whatever the environment says, no redirect followed, a
-/// non-2xx status returned as a response, and `tls` for `https` URLs (`None` trusts nothing, so
-/// only `http` URLs can be reached).
+/// non-2xx status returned as a response, a limit on the whole request, and `tls` for `https`
+/// URLs. With `Some(tls)` only `https` URLs are used, so the signature never travels in the
+/// clear; `None` trusts nothing and reaches only `http` URLs (tests).
 pub fn agent(tls: Option<ureq::tls::TlsConfig>) -> ureq::Agent {
     let mut config = ureq::Agent::config_builder()
         .proxy(None)
         .max_redirects(0)
         .http_status_as_error(false)
-        .timeout_connect(Some(CONNECT_TIMEOUT));
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_global(Some(PUT_TIMEOUT));
     if let Some(tls) = tls {
-        config = config.tls_config(tls);
+        config = config.tls_config(tls).https_only(true);
     }
     config.build().into()
 }
@@ -141,6 +159,14 @@ mod tests {
         assert_eq!(redact("https://h/p/k#frag"), "https://h/p/k?<redacted>");
         assert_eq!(redact("https://h/p/k?a#b"), "https://h/p/k?<redacted>");
         assert_eq!(redact("https://h/p/k"), "https://h/p/k");
+        // User information is a credential too.
+        assert_eq!(redact("https://user:pw@h/p/k"), "https://h/p/k");
+        assert_eq!(
+            redact("https://user:pw@h:9/p?a=b@c"),
+            "https://h:9/p?<redacted>"
+        );
+        assert_eq!(redact("https://h/p/a@b"), "https://h/p/a@b");
+        assert_eq!(redact("https://u:p@h"), "https://h");
     }
 
     #[test]
@@ -312,6 +338,15 @@ mod tests {
             .port();
         let url = format!("http://127.0.0.1:{port}/k?X-Sig=secret");
         let err = put(&agent(None), &url, b"x").unwrap_err();
+        assert!(matches!(err, PutError::Transport { .. }), "{err:?}");
+        assert!(!err.to_string().contains("secret"), "{err}");
+    }
+
+    #[test]
+    fn a_tls_agent_refuses_a_plain_http_url() {
+        // The refusal comes before any connection: nothing listens at the address.
+        let agent = agent(Some(tls_config(&[])));
+        let err = put(&agent, "http://127.0.0.1:9/k?X-Sig=secret", b"x").unwrap_err();
         assert!(matches!(err, PutError::Transport { .. }), "{err:?}");
         assert!(!err.to_string().contains("secret"), "{err}");
     }
