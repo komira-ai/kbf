@@ -248,7 +248,9 @@ pub enum PlacementView {
     /// The deadline passed while leases still ran. They run on; nothing proceeds
     /// until an operator drains it again or uncordons it.
     DrainPaused {
-        /// The deadline that passed (milliseconds since the Unix epoch).
+        /// The deadline that passed (milliseconds since the Unix epoch). Left out for a
+        /// drain that had none.
+        #[serde(skip_serializing_if = "Option::is_none")]
         deadline_unix_ms: Option<u64>,
         /// The leases it still holds, as `term.seq`.
         leases: Vec<String>,
