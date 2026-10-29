@@ -258,3 +258,47 @@ async fn an_in_process_miss_or_stale_read_is_not_counted() {
     node.read_blob(&sha(b"")).await.expect("empty");
     assert_eq!(rows(&reads), [0, 0, 0, 0, 0]);
 }
+
+/// Catches a daemon half of a node without a frontend that reads its storage directly and so
+/// around the counter: through `CountedStorage` a blob read whole, a ranged read, an action
+/// entry and an action result each count once on an `in_process` row; a miss, the empty
+/// blob, a store failure, a write and an existence check count nothing; and every call
+/// still returns what the inner storage returns.
+#[tokio::test]
+async fn a_direct_read_of_the_node_storage_counts_on_the_in_process_rows() {
+    let mem = Arc::new(Mem::default());
+    let reads = Arc::new(LegacyReads::default());
+    let storage: Arc<dyn Storage> = Arc::clone(&mem) as Arc<dyn Storage>;
+    let node = crate::legacy::CountedStorage::new(storage, Arc::clone(&reads));
+    let digest = hold(&mem, b"blob");
+    let action = hold_action(&mem, b"action");
+
+    assert_eq!(node.read_blob(&digest).await.expect("blob"), &b"blob"[..]);
+    assert_eq!(rows(&reads), [0, 0, 1, 0, 0]);
+    drain(node.read_range(&digest, 0, 0).await.expect("range")).await;
+    assert_eq!(rows(&reads), [0, 0, 2, 0, 0]);
+    assert!(node.action_entry(&action).await.expect("entry").is_some());
+    assert!(node.action_result(&action).await.expect("result").is_some());
+    assert_eq!(rows(&reads), [0, 0, 2, 0, 2]);
+
+    assert!(node.read_blob(&sha(b"absent")).await.is_err());
+    assert!(node.read_range(&sha(b"absent"), 0, 0).await.is_err());
+    assert!(
+        node.action_entry(&sha(b"none"))
+            .await
+            .expect("miss")
+            .is_none()
+    );
+    assert!(
+        node.action_result(&sha(b"none"))
+            .await
+            .expect("miss")
+            .is_none()
+    );
+    node.read_blob(&sha(b"")).await.expect("empty");
+    node.put(Bytes::from_static(b"payload")).await.expect("put");
+    node.find_missing(&[digest]).await.expect("asked");
+    *mem.fail.lock().expect("lock") = Some(StorageError::Internal("disk".into()));
+    assert!(node.read_blob(&digest).await.is_err());
+    assert_eq!(rows(&reads), [0, 0, 2, 0, 2]);
+}
