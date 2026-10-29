@@ -24,8 +24,8 @@
 //! A URL signed by the key is good for:
 //!
 //! - a `PUT` of one object whose key, after the path is percent-decoded, starts with the
-//!   prefix of the ceiling (a byte prefix; no normalization) and is a valid name: at most 1024
-//!   bytes, no control character (NUL included), no `..` anywhere and no `.` segment; never a
+//!   prefix of the ceiling (a byte prefix, no normalization; the prefix ends in `/` and the key is
+//!   longer than it) and is a valid name: at most 1024 bytes, no control character (NUL included), no `..` anywhere and no `.` segment; never a
 //!   key under `_journal/` or `_tiering/`;
 //! - no multipart call, no `If-Match` (nothing is replaced), and no other method;
 //! - an `X-Amz-Expires` of at most the smaller of the ceiling's `max_expires_secs` and the
@@ -230,7 +230,8 @@ impl Grant {
         if header(&parts.headers, "if-match").is_some() {
             return Err(NO_OVERWRITE);
         }
-        let inside = key.starts_with(&self.prefix) && !is_reserved(key);
+        let inside =
+            key.len() > self.prefix.len() && key.starts_with(&self.prefix) && !is_reserved(key);
         if inside && check_name(key).is_ok() {
             Ok(())
         } else {
