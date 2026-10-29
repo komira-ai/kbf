@@ -128,8 +128,8 @@ what "tested" means below.
 | `x-id` | nothing to set | the AWS SDKs add `x-id=<Operation>` to the query of the calls of an object, and no setting stops it; S3 ignores it, and so does the front |
 | listing | no `encoding-type` | `encoding-type=url` is refused with 501 (aws-sdk-rust sends it only when asked to) |
 
-Payload signing, read from the front's code and seen through the test only as far as the SDK's own
-choice goes: a body whose signed `x-amz-content-sha256` is its hex SHA-256 is checked against it;
+Payload signing, read from the front's code and not tested as such (not checked: whether the Rust
+SDK signs the hex hash or `UNSIGNED-PAYLOAD` for an in-memory body): a body whose signed `x-amz-content-sha256` is its hex SHA-256 is checked against it;
 `UNSIGNED-PAYLOAD` with no checksum header is accepted unchecked; a `STREAMING-` payload is
 refused with 501.
 
