@@ -10,7 +10,7 @@ use kbf_lease_client::{AcquireRequest, Acquired, Lease, LeaseId, LeaseState, Res
 use tokio::time::Instant;
 
 use crate::executor::host::{HostWorker, Retire};
-use crate::executor::{Ctx, HostInfo, View, note};
+use crate::executor::{Ctx, HostInfo, Listing, View, note};
 
 /// The label every lease of this executor carries, valued with the frontend's id: how a
 /// restarted frontend finds the leases it made.
@@ -51,10 +51,14 @@ impl Slot {
         match self {
             Self::Vacant { retry_at } if now < retry_at => Self::Vacant { retry_at },
             Self::Vacant { .. } => acquire(ctx, now).await,
+            // A lease that could not be looked up is not a lease that is gone: only a list
+            // that was read and lacks it frees the slot to book another.
             Self::Pending { lease } => match view.lease(lease) {
-                Some(held) if held.state == LeaseState::Held => activate(ctx, held, now),
-                Some(_) => Self::Pending { lease },
-                None => Self::Vacant { retry_at: now },
+                Listing::Found(held) if held.state == LeaseState::Held => {
+                    activate(ctx, held, now)
+                }
+                Listing::Absent => Self::Vacant { retry_at: now },
+                Listing::Found(_) | Listing::Unread => Self::Pending { lease },
             },
             Self::Active(mut worker) => match worker.step(ctx, view, now).await {
                 None => Self::Active(worker),

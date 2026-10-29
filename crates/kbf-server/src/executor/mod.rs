@@ -115,13 +115,30 @@ pub(crate) struct Ctx<'a> {
 /// What the lease server said this pass.
 #[derive(Default)]
 pub(crate) struct View {
-    leases: Vec<Lease>,
+    /// The booked leases; `None` if they were not read, or the read failed.
+    leases: Option<Vec<Lease>>,
     hosts: Vec<Host>,
 }
 
+/// What a read of the lease server's leases says of one lease.
+pub(crate) enum Listing<'a> {
+    /// The list was not read, or could not be: nothing is known of the lease.
+    Unread,
+    /// The list was read and the lease is not in it.
+    Absent,
+    /// The lease, as listed.
+    Found(&'a Lease),
+}
+
 impl View {
-    pub(crate) fn lease(&self, id: LeaseId) -> Option<&Lease> {
-        self.leases.iter().find(|lease| lease.id == id)
+    pub(crate) fn lease(&self, id: LeaseId) -> Listing<'_> {
+        match &self.leases {
+            None => Listing::Unread,
+            Some(leases) => leases
+                .iter()
+                .find(|lease| lease.id == id)
+                .map_or(Listing::Absent, Listing::Found),
+        }
     }
 
     pub(crate) fn host(&self, id: &str) -> Option<&Host> {
@@ -245,8 +262,12 @@ async fn read(
 ) -> View {
     let waiting = slots.iter().any(Slot::is_pending);
     let leases = match waiting {
-        true => ctx.deps.client.leases().await.unwrap_or_default(),
-        false => Vec::new(),
+        true => {
+            let listed = ctx.deps.client.leases().await;
+            note("listing the leases", &listed);
+            listed.ok()
+        }
+        false => None,
     };
     let due = hosts_read.is_none_or(|at| now >= at + ctx.cfg.host_check);
     let holding = slots.iter().any(Slot::is_active);

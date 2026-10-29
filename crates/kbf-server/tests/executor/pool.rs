@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use kbf_lease_client::LeaseState;
+use kbf_lease_client::fake::Fault;
 use kbf_server::executor::{Clock, Config, ConfigError, Deps, Executor};
 use kbf_types::LeaseKind;
 
@@ -102,6 +103,34 @@ async fn a_booked_lease_that_vanishes_is_asked_for_again() {
     rig.api.release(lease).await.expect("released");
     rig.pump().await;
     assert_eq!(count(&rig.requests(), "POST /v1/leases"), 2);
+}
+
+/// Catches a booked lease being given up because the list of leases could not be read: a
+/// transport error is not an empty list, and a second lease booked beside the first would hold
+/// a second host, the first never renewed or released. The slot waits, and the lease is
+/// used once its host is ready.
+#[tokio::test(start_paused = true)]
+async fn a_booked_lease_survives_a_list_that_could_not_be_read() {
+    let mut rig = Rig::built(&["node1", "node2"], 1, 16, true, |_| {}).await;
+    rig.exec.step().await;
+    let lease = rig.api.leases().await.expect("leases")[0].id;
+    for fault in [Fault::Close, Fault::Reply {
+        status: 503,
+        body: bytes::Bytes::new(),
+    }] {
+        rig.fake.inject_on("GET /v1/leases", fault);
+        rig.advance(Duration::from_secs(1)).await;
+        rig.exec.step().await;
+    }
+    assert_eq!(
+        count(&rig.requests(), "POST /v1/leases"),
+        1,
+        "a second lease was booked"
+    );
+    assert!(rig.fake.ready(lease));
+    rig.pump().await;
+    assert_eq!(rig.exec.hosts()[0].lease, lease);
+    assert_eq!(count(&rig.requests(), "POST /v1/leases"), 1);
 }
 
 /// Catches a restarted frontend that asks for new hosts while its old leases run on (the pool
