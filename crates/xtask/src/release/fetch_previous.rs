@@ -82,6 +82,14 @@ pub struct FetchPreviousArgs {
     /// Append the lines to this file (on Actions, `GITHUB_OUTPUT`).
     #[arg(long)]
     pub output: Option<PathBuf>,
+    /// How many times the previous tag's release is asked for before its absence is an error:
+    /// GitHub answers a draft release with 404, and a release is one for some minutes after
+    /// its tag is pushed.
+    #[arg(long, default_value_t = 40)]
+    pub release_attempts: u32,
+    /// Seconds between those asks.
+    #[arg(long, default_value_t = 30)]
+    pub release_poll_secs: u64,
     /// The `gh` program.
     #[arg(long, default_value = "gh")]
     pub gh: PathBuf,
