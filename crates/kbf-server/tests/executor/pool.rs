@@ -136,6 +136,28 @@ async fn a_booked_lease_survives_a_list_that_could_not_be_read() {
     assert_eq!(count(&rig.requests(), "POST /v1/leases"), 1);
 }
 
+/// Catches the check for strays releasing a lease that is booked but not ready: a slot waiting
+/// for its host holds that lease, and releasing it would book another each time.
+#[tokio::test(start_paused = true)]
+async fn the_check_for_strays_does_not_release_a_booked_lease() {
+    let mut rig = Rig::built(&["node1", "node2"], 1, 16, true, |cfg| {
+        cfg.reconcile_every = Duration::from_secs(1);
+    })
+    .await;
+    rig.exec.step().await;
+    let lease = rig.api.leases().await.expect("leases")[0].id;
+    for _ in 0..3 {
+        rig.advance(Duration::from_secs(2)).await;
+        rig.exec.step().await;
+    }
+    assert_eq!(state_of(&rig, lease).await, Some(LeaseState::Pending));
+    assert_eq!(
+        count(&rig.requests(), &format!("DELETE /v1/leases/{lease}")),
+        0
+    );
+    assert_eq!(count(&rig.requests(), "POST /v1/leases"), 1);
+}
+
 /// Catches a restarted frontend that asks for new hosts while its old leases run on (the pool
 /// would double), or leaves the runs of the frontend that died where they are (nothing of the
 /// farm maps to them any more, and each holds its host's budget): it finds its leases by
@@ -310,6 +332,38 @@ async fn a_stray_lease_is_found_by_the_periodic_check() {
     assert_ne!(state_of(&rig, stray).await, Some(LeaseState::Held));
     assert_eq!(state_of(&rig, held).await, Some(LeaseState::Held));
     assert_eq!(rig.exec.hosts()[0].lease, held);
+}
+
+/// Catches the check for strays releasing a lease that is already being released: a lease
+/// with a live run is `Releasing` until the run ends, no slot holds it, and the lease server
+/// is not asked again.
+#[tokio::test(start_paused = true)]
+async fn the_check_for_strays_leaves_a_lease_being_released_alone() {
+    let mut rig = Rig::start(&["node1", "node2"], 1, |cfg| {
+        cfg.reconcile_every = Duration::from_secs(30);
+    })
+    .await;
+    rig.pump().await;
+    let _caller = rig.submit(1);
+    rig.pump().await;
+    let first = rig.exec.hosts()[0].lease;
+    let run = rig.runs_of(1).await.remove(0);
+    assert!(rig.fake.run_started(&run.run));
+    // The host is lost: the worker stops the run and releases the lease, which stays
+    // `Releasing` while the run is live.
+    assert!(rig.fake.set_lost("node1", true));
+    rig.elapse(15).await;
+    assert_eq!(state_of(&rig, first).await, Some(LeaseState::Releasing));
+    assert_ne!(
+        rig.exec.hosts()[0].lease,
+        first,
+        "the worker was not replaced"
+    );
+    let asked = format!("DELETE /v1/leases/{first}");
+    let before = count(&rig.requests(), &asked);
+    rig.elapse(60).await;
+    assert_eq!(count(&rig.requests(), &asked), before, "released again");
+    assert_eq!(state_of(&rig, first).await, Some(LeaseState::Releasing));
 }
 
 /// Catches a restarted frontend that adopts a lease whose runs it could not list, or could not

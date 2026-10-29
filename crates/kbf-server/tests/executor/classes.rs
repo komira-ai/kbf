@@ -74,23 +74,9 @@ async fn a_timeout_is_answered_to_the_caller_and_not_rerun() {
 /// timeout, above.)
 #[tokio::test(start_paused = true)]
 async fn a_timeout_at_a_wall_the_lease_cut_short_is_rerun() {
-    let timeout = Duration::from_secs(3_500);
-    let mut rig = Rig::start(&["node1"], 1, |cfg| {
-        cfg.max_run = timeout;
-        cfg.default_timeout = timeout;
-        cfg.lease_ttl = Duration::from_secs(4 * 3600);
-        cfg.max_wall = Duration::from_secs(12 * 3600);
-        cfg.drain_before_end = Duration::from_secs(3 * 3600);
-    })
-    .await;
+    let mut rig = Rig::start(&["node1"], 1, crate::rig::long_runs).await;
     rig.pump().await;
-    rig.inputs
-        .facts
-        .lock()
-        .expect("facts")
-        .as_mut()
-        .expect("ok")
-        .timeout = Some(timeout);
+    rig.set_timeout(Duration::from_secs(3_500));
     let caller = rig.submit(1);
     rig.pump().await;
     let first = rig.runs_of(1).await.remove(0);

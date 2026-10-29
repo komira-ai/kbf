@@ -183,6 +183,64 @@ async fn a_start_whose_inputs_were_slow_is_not_posted_past_its_window() {
     assert_eq!(rig.runs_of(1).await.len(), 1, "the action ran once");
 }
 
+/// Catches a lease found gone only when the run is to be posted: the renewal that comes before
+/// a post (the lease would end before the run does) is refused, the worker is taken down with
+/// its lease, and the `Start` is given back to the farm, which runs the action again on
+/// another lease. Nothing is posted to a lease that is not there.
+#[tokio::test(start_paused = true)]
+async fn a_lease_gone_before_the_post_is_given_up_and_the_action_rerun() {
+    use std::sync::atomic::Ordering;
+    let mut rig = Rig::start(&["node1", "node2"], 1, crate::rig::long_runs).await;
+    rig.pump().await;
+    rig.set_timeout(Duration::from_secs(3_500));
+    let caller = rig.submit(1);
+    rig.farm.tick().await;
+    crate::rig::settle().await;
+    rig.inputs.hold.store(true, Ordering::SeqCst);
+    let lease = rig.exec.hosts()[0].lease;
+    let (exec, api, inputs) = (&mut rig.exec, &rig.api, &rig.inputs);
+    let gone = async {
+        crate::rig::settle().await;
+        api.release(lease).await.expect("released");
+        inputs.hold.store(false, Ordering::SeqCst);
+        inputs.release.notify_one();
+    };
+    tokio::join!(exec.step(), gone);
+    assert!(rig.exec.hosts().is_empty(), "the worker kept a gone lease");
+    assert!(rig.runs().await.is_empty());
+    let posts = count_tail(&rig.requests(), "POST", "/runs");
+    assert_eq!(posts, 0, "a run was posted to a lease that is gone");
+    rig.elapse(15).await;
+    let runs = rig.runs_of(1).await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
+    assert!(matches!(rig.until_done(&caller, 6).await, Finished::Ran(_)));
+}
+
+/// Catches a `Start` posted after its window because the renewal that comes first took the
+/// time: the lease server answers a renewal slowly (here, not at all until the call gives up),
+/// the window ends meanwhile, and the post is not made.
+#[tokio::test(start_paused = true)]
+async fn a_start_whose_renewal_outlasted_its_window_is_not_posted() {
+    use kbf_lease_client::fake::Fault;
+    let mut rig = Rig::start(&["node1"], 1, crate::rig::long_runs).await;
+    rig.pump().await;
+    rig.set_timeout(Duration::from_secs(3_500));
+    let caller = rig.submit(1);
+    rig.farm.tick().await;
+    crate::rig::settle().await;
+    rig.advance(Duration::from_secs(10)).await;
+    rig.fake.inject_on("POST /v1/leases", Fault::Hang);
+    let in_time = rig.step_through(Duration::from_secs(6)).await;
+    assert!(in_time);
+    assert!(rig.runs().await.is_empty(), "posted after its window");
+    rig.elapse(70).await;
+    let runs = rig.runs_of(1).await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
+    assert!(matches!(rig.until_done(&caller, 6).await, Finished::Ran(_)));
+}
+
 /// Catches a read of the CAS that never answers holding the pass, and with it the heartbeats
 /// and the fence: the read is given the `Start`'s window and no more, after which the
 /// `Start` is dropped, as one that arrived late is.

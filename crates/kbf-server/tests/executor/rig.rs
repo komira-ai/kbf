@@ -270,6 +270,16 @@ impl Caller {
     }
 }
 
+/// A config whose longest run (3800 s of wall time) outlasts the 3600 s the lease server grants
+/// at most: the lease is renewed before every post, and cuts the run it is posted with.
+pub fn long_runs(cfg: &mut Config) {
+    cfg.max_run = Duration::from_secs(3_500);
+    cfg.default_timeout = Duration::from_secs(3_500);
+    cfg.lease_ttl = Duration::from_secs(4 * 3600);
+    cfg.max_wall = Duration::from_secs(12 * 3600);
+    cfg.drain_before_end = Duration::from_secs(3 * 3600);
+}
+
 pub fn digest_of(tag: u8) -> kbf_types::Digest {
     kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [tag; 32], u64::from(tag))
 }
@@ -534,6 +544,14 @@ impl Rig {
 
     pub fn requests(&self) -> Vec<String> {
         self.fake.requests()
+    }
+
+    /// Every action the rig is asked about runs for `timeout`.
+    pub fn set_timeout(&self, timeout: Duration) {
+        locked(&self.inputs.facts)
+            .as_mut()
+            .expect("ok facts")
+            .timeout = Some(timeout);
     }
 }
 
