@@ -19,9 +19,6 @@
 //! code calls this crate yet, so linking it changes no placement. Admission reads a curve
 //! only for an action that also has a prediction; feeding predictions is a separate change.
 #![forbid(unsafe_code)]
-// The first commit of the crate holds its tests and signatures with placeholder bodies, so
-// that the tests fail on their assertions and not at compile time.
-#![allow(dead_code, unused_variables, unused_imports)]
 
 mod mode;
 mod name;

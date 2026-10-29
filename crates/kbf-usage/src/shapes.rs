@@ -67,17 +67,46 @@ impl ShapeIndex {
 
     /// Records that `action`'s runs are kept under `profile`. An action already here is
     /// updated and counts as the newest.
-    pub fn insert(&self, action: ActionKey, profile: ProfileKey) {}
+    pub fn insert(&self, action: ActionKey, profile: ProfileKey) {
+        let mut inner = self.lock();
+        let Inner {
+            by_action,
+            by_tick,
+            next_tick,
+            evicted,
+        } = &mut *inner;
+        if let Some(old) = by_action.remove(&action) {
+            by_tick.remove(&old.tick);
+        } else if by_action.len() >= self.cap {
+            // `by_tick` holds one entry per action, so a full index has an oldest.
+            by_tick.pop_first().into_iter().for_each(|(_, oldest)| {
+                by_action.remove(&oldest);
+                *evicted += 1;
+            });
+        }
+        let tick = *next_tick;
+        *next_tick += 1;
+        by_tick.insert(tick, action.clone());
+        by_action.insert(action, Entry { profile, tick });
+    }
 
     /// Forgets `action`; whether it was here.
     pub fn remove(&self, action: &ActionKey) -> bool {
-        false
+        let mut inner = self.lock();
+        let Some(old) = inner.by_action.remove(action) else {
+            return false;
+        };
+        inner.by_tick.remove(&old.tick);
+        true
     }
 
     /// The profile `action` is kept under.
     #[must_use]
     pub fn get(&self, action: &ActionKey) -> Option<ProfileKey> {
-        None
+        self.lock()
+            .by_action
+            .get(action)
+            .map(|entry| entry.profile.clone())
     }
 
     /// The profile of the action `key` names; `None` when it is not here, or when `key` is
@@ -90,7 +119,7 @@ impl ShapeIndex {
     /// How many actions are held.
     #[must_use]
     pub fn len(&self) -> usize {
-        0
+        self.lock().by_action.len()
     }
 
     /// Whether no action is held.
@@ -102,7 +131,7 @@ impl ShapeIndex {
     /// How many actions were forgotten to make room, since the index was made.
     #[must_use]
     pub fn evicted(&self) -> u64 {
-        0
+        self.lock().evicted
     }
 
     /// The map the scheduler's curve source reads.

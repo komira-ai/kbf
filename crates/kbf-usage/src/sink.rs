@@ -106,7 +106,9 @@ impl ProfileSink {
         limits: Limits,
         now_wall_minute: u64,
     ) -> (Observed, Vec<MinuteIn>) {
-        (Observed::Accepted, Vec::new())
+        self.lock()
+            .recorder
+            .observe(host, epoch, load, limits, now_wall_minute)
     }
 
     /// Adds the run `series` of `key`, which ended on its own on `today`, to the key's
@@ -122,14 +124,14 @@ impl ProfileSink {
         series: &RunSeries,
         today: u64,
     ) -> Result<Admitted, ProfileError> {
-        Ok(Admitted::Empty)
+        self.lock().profiles.run_ended(key, series, today)
     }
 
     /// Records that `key` was used on `day`, so a key that is placed but idle in runs does
     /// not age out. In memory until the next flush writes it; a key with no stored profile
     /// is ignored.
     pub fn touch(&self, key: &ProfileKey, day: u64) {
-        let _ = (key, day);
+        self.lock().profiles.touch(key, day);
     }
 
     /// The tick's work: drops the node minutes finished before `now_wall_minute`, tells the
@@ -139,15 +141,20 @@ impl ProfileSink {
     /// # Errors
     /// The store failed while writing days. The node minutes were dropped already.
     pub fn flush(&self, now_wall_minute: u64, today: u64) -> Result<Flushed, ProfileError> {
+        let mut inner = self.lock();
+        let dropped = inner.recorder.node_minutes_due(now_wall_minute).len();
+        inner.node_minutes_discarded += dropped as u64;
+        self.curves.set_today(today);
+        let touches_persisted = inner.profiles.persist_touches()?;
         Ok(Flushed {
-            node_minutes_discarded: 0,
-            touches_persisted: 0,
+            node_minutes_discarded: dropped,
+            touches_persisted,
         })
     }
 
     /// Forgets a node that left the pool, with its open readings.
     pub fn forget_host(&self, host: &HostId) {
-        let _ = host;
+        self.lock().recorder.forget_host(host);
     }
 
     /// What the sink holds and has counted.

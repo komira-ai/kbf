@@ -19,19 +19,23 @@ impl UsageMode {
     /// Whether runs are learned and stored.
     #[must_use]
     pub fn learns(self) -> bool {
-        false
+        self != Self::Off
     }
 
     /// Whether the scheduler reads the learned curves.
     #[must_use]
     pub fn serves(self) -> bool {
-        false
+        self == Self::On
     }
 
     /// The setting's spelling.
     #[must_use]
     pub fn as_str(self) -> &'static str {
-        "off"
+        match self {
+            Self::Off => "off",
+            Self::Record => "record",
+            Self::On => "on",
+        }
     }
 }
 
@@ -50,6 +54,9 @@ impl FromStr for UsageMode {
     type Err = BadMode;
 
     fn from_str(text: &str) -> Result<Self, BadMode> {
-        Ok(Self::Off)
+        [Self::Off, Self::Record, Self::On]
+            .into_iter()
+            .find(|mode| mode.as_str() == text)
+            .ok_or_else(|| BadMode(text.to_owned()))
     }
 }
