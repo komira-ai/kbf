@@ -391,7 +391,7 @@ async fn report(rig: &super::testing::Rig, result: worker::Result) -> bool {
 
 /// Asserts that the farm's number of a stream is the core's, that a stream is found from it
 /// only while it is the worker's newest, and that a status on a replaced stream or of a worker
-/// the core never heard is not kept. Catches: a replaced stream found by its number, which
+/// the core never heard is not kept, while one on the newest stream is. Catches: a replaced stream found by its number, which
 /// lets a restarted daemon's old stream overwrite its status.
 #[tokio::test(start_paused = true)]
 async fn a_stream_is_found_by_its_number_while_it_is_the_workers_newest() {
@@ -418,5 +418,11 @@ async fn a_stream_is_found_by_its_number_while_it_is_the_workers_newest() {
                 .is_empty()
         );
         assert!(a.machine().node(&node).is_some_and(|n| n.update_live));
+        assert!(a.machine().node(&node).is_some_and(|n| n.status.is_none()));
+        a.report_node_status(&node, new.stream, Default::default());
+        assert!(
+            a.machine().node(&node).is_some_and(|n| n.status.is_some()),
+            "a status on the newest stream is kept"
+        );
     });
 }
