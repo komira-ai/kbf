@@ -240,6 +240,31 @@ pub enum PrepareError {
     Grant(#[from] ClaimsError),
 }
 
+/// Whose a refused preparation is to fix, for the caller that settles the run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrepareFault {
+    /// The store could not be read: the same run may be prepared later, so it is the farm's
+    /// to retry.
+    Unavailable,
+    /// The run cannot be prepared as asked (an input missing, malformed or over budget, a
+    /// lease or a time no key can carry, a configuration that does not sign): asking again
+    /// gives the same answer, so it is the caller's to fix.
+    Refused,
+}
+
+impl PrepareError {
+    /// Whose this refusal is to fix. Only a store that could not be read is
+    /// [`PrepareFault::Unavailable`]; minting, presigning and the grant are local work and
+    /// fail the same way every time.
+    #[must_use]
+    pub fn fault(&self) -> PrepareFault {
+        match self {
+            Self::Closure(ClosureError::Unavailable { .. }) => PrepareFault::Unavailable,
+            _ => PrepareFault::Refused,
+        }
+    }
+}
+
 /// The read grant of a run.
 #[derive(Clone, Debug)]
 pub struct ReadGrant {
@@ -291,6 +316,13 @@ pub struct RunPrep {
 }
 
 impl RunPrep {
+    /// The mint that signs this preparer's keys: the one [`crate::ingest`] must verify a
+    /// run's pack key with.
+    #[must_use]
+    pub fn mint(&self) -> &PackKeyMint {
+        &self.mint
+    }
+
     /// A preparer that reads the store through `backend` and is set up by `config`.
     ///
     /// # Errors
