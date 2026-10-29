@@ -167,7 +167,7 @@ async fn a_run_that_was_not_killed_has_no_booking_and_a_pressure_kill_is_logged(
     let text = log.text();
     let lines: Vec<&str> = text
         .lines()
-        .filter(|l| l.contains("node memory pressure") && l.contains("node=busy-node"))
+        .filter(|l| l.contains("kills=") && l.contains("node=busy-node"))
         .collect();
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("kills=1"), "{}", lines[0]);
