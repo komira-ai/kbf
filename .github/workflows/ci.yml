@@ -49,6 +49,9 @@ jobs:
     env:
       DENY_VERSION: 0.20.2
       DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+      # The x86_64-linux tarball of ziglang.org/download/index.json.
+      ZIG_VERSION: 0.14.1
+      ZIG_SHA256: 24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -102,6 +105,29 @@ jobs:
       # in the `test` job's two coverage runs.
       - run: cargo clippy -p kbf-server --all-targets --features farm-core-js --locked -- -D warnings
         if: ${{ !cancelled() }}
+      # The crates the Mac jobs build (beta.yml's native-macos and pkg-macos, artifacts.yml's
+      # darwin-arm64), checked for aarch64-apple-darwin on this Linux runner. A Linux-only item
+      # in code macOS compiles is then red on the pull request, not on the Mac job of the push to
+      # main an hour later (a `use` of a Linux-only module in kbf-node failed native-macos on eight
+      # main pushes in a row). `cargo check` does not link, so no macOS SDK is needed; the build
+      # scripts that compile C for the target (ring, the bundled SQLite of libsqlite3-sys) use
+      # Zig's C compiler and archiver, which carry macOS's libc headers: the cc crate reads
+      # `CC_<target>` and `AR_<target>` as a program and its leading arguments. Zig is the release
+      # tarball, checked against its SHA-256 before use and unpacked whole (its compiler needs its
+      # lib directory) into the runner's temporary directory.
+      - name: Fetch Zig (pinned version and checksum), the C compiler for aarch64-apple-darwin
+        if: ${{ !cancelled() }}
+        run: cargo xtask fetch --url "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" --sha256 "$ZIG_SHA256" --out "$RUNNER_TEMP/zig.tar.xz"
+      - run: tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+        if: ${{ !cancelled() }}
+      - run: rustup target add aarch64-apple-darwin
+        if: ${{ !cancelled() }}
+      - name: Check the crates the Mac jobs build for aarch64-apple-darwin
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+        run: cargo check --locked --target aarch64-apple-darwin --bins --tests --features kbf-setup/proxy -p kbf-node -p kbf-outputs -p kbf-driver-native -p kbf-cli -p kbf-daemon -p kbf-daemon-test -p kbf-mac-session -p kbf-installer -p kbf-setup -p kbf-vmm -p kbf-deploy -p kbf-host-install -p kbf-updater -p kbf-mac-provision -p xtask
       # The interpreter budget only shrinks: a pull request may not add a row to it
       # (crates/xtask/src/budget.rs). A pull request is checked out as the merge commit,
       # so HEAD^1 is the base branch it merges into.
