@@ -232,7 +232,8 @@ pub struct Cli {
     /// The longest body of a request, in bytes: the longest object, and the longest part of a
     /// multipart upload. An upper bound on the length of what is streamed, not a bound on
     /// memory: the body of a put or of a part is passed on to the tiers as it arrives and is
-    /// never held whole. A body over it is refused with 413 and nothing is stored; a request
+    /// never held whole. A presigning key with a larger `max_object_bytes` is held to this too: the smaller of the two
+    /// applies, so raise this with the key's cap. A body over it is refused with 413 and nothing is stored; a request
     /// that says in its `Content-Length` that its body is longer is refused before any byte of
     /// it is read.
     #[arg(

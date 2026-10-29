@@ -106,8 +106,10 @@ start):
 A URL is good for one `PUT` of a key that starts with the prefix (after the path is decoded: no
 `..`, no `.` segment, no control character, never `_journal/` or `_tiering/`), with an
 `X-Amz-Expires` of at most the smaller of `max_expires_secs` and `--presign-max-expires` (default
-15m), and a body of at most `max_object_bytes` (128 MiB at most), checked on `Content-Length` and on
-the bytes received. It is refused from `X-Amz-Date` plus `X-Amz-Expires` on, with no grace. The
+15m), and a body of at most `max_object_bytes` (5 GiB at most, the S3 single-PUT limit; each key file chooses its own), checked on
+`Content-Length` and on the bytes received (and held to `--max-request-bytes`, 256 MiB by default, too: a key with a larger
+cap needs that raised, and the smaller of the two applies; the body is streamed to the tier and
+never held whole). It is refused from `X-Amz-Date` plus `X-Amz-Expires` on, with no grace. The
 object appears only after a complete body, a second `PUT` of the key is `412`, and no multipart
 call, `If-Match`, read, list or delete is allowed. The signature does not cover the body, so the
 reader of the object must check its content. The query string is never logged.
