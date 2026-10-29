@@ -34,7 +34,8 @@ mod metadata;
 mod policy;
 
 pub use crate::authenticate::{
-    AllAuthenticator, AllowAuthenticator, AnyAuthenticator, Authenticator, DenyAuthenticator,
+    AllAuthenticator, AllowAuthenticator, AnyAuthenticator, Authenticator, BearerAuthenticator,
+    DenyAuthenticator,
 };
 pub use crate::authorize::{
     AllowAuthorizer, Authorizer, Authorizers, DenyAuthorizer, InstanceNamePrefixAuthorizer,
