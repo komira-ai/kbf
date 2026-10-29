@@ -29,6 +29,7 @@ pub mod host;
 pub mod load;
 pub mod open;
 mod record;
+mod report_hooks;
 
 pub use adapter::{KbfAdapter, Outbound, Wall};
 pub use host::{Caller, Connection};
@@ -50,5 +51,7 @@ mod failed_tests;
 mod host_tests;
 #[cfg(test)]
 mod load_tests;
+#[cfg(test)]
+mod report_hooks_tests;
 #[cfg(test)]
 mod testing;
