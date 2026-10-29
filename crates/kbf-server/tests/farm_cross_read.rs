@@ -861,7 +861,9 @@ async fn a_row_written_before_the_cost_field_recovers_at_its_request(backing: Ba
 ///
 /// Catches: a js core that cannot finish an operation whose wall is stored, a wall row left
 /// behind by the js core, and a leftover row that stops the legacy core starting.
-async fn a_legacy_walled_operation_finished_by_the_js_core_deletes_its_opwall_row(backing: Backing) {
+async fn a_legacy_walled_operation_finished_by_the_js_core_deletes_its_opwall_row(
+    backing: Backing,
+) {
     let disk = Disk::over(backing);
     let writer = farm_on(SchedulerCore::Legacy, &disk);
     let mut node = Node::join(&writer, "node-a", 1);
