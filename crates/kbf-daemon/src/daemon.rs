@@ -522,6 +522,7 @@ impl<X: SessionExtras> Daemon<X> {
         self.core.recheck();
         // Before any Result is resent or any Start of this stream is read.
         self.new_epoch(epoch);
+        let placement_load = welcome.placement_load == Some(true);
         self.extras.on_welcome(welcome);
         if self.core.contact.confirm(hello_sent) {
             self.core.emit(Event::ContactRestored);
@@ -530,6 +531,11 @@ impl<X: SessionExtras> Daemon<X> {
         self.core.emit(Event::Welcomed {
             heartbeat_interval: interval,
         });
+        // On every stream, so a reconnect to a server with another mode changes the limit
+        // (absent is false); after contact is renewed, so a slow write cannot cost the
+        // fence, and before the first Heartbeat of the stream, which reports what was
+        // written.
+        self.core.welcomed_placement_load(placement_load).await;
         // Before the first Heartbeat, which lists these leases (issue #26).
         for result in self.core.unacked.values() {
             send(&tx, daemon_message::Message::Result(result.clone()));
