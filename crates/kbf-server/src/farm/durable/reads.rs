@@ -10,7 +10,7 @@
 use kbf_types::Resources;
 
 use super::*;
-use crate::fleet::{NodeDetail, NodeView, PhaseView, PlacementView, ResourcesView};
+use crate::fleet::{NodeDetail, NodeView, PhaseView, PlacementView, ResourcesView, shown_deadline};
 
 impl Engine {
     /// Whether another frontend of the store holds `worker`: this frontend does not, and the
@@ -54,7 +54,7 @@ impl Engine {
             Some(StoredCordon::Cordoned) => PlacementView::Cordoned,
             Some(StoredCordon::Draining { .. }) if leases.is_empty() => PlacementView::Drained,
             Some(StoredCordon::Draining { deadline_unix_ms }) => PlacementView::Draining {
-                deadline_unix_ms,
+                deadline_unix_ms: shown_deadline(deadline_unix_ms),
                 leases: leases.clone(),
             },
         };
