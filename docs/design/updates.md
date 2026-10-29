@@ -49,7 +49,7 @@ Host state is rebuilt from heartbeats. No heartbeat for 45 s means down. After a
 ## 4. One host's A/B
 
 1. Fetch B and verify it (section 5).
-2. Drain the node (`NodeDrain`, durable cordon).
+2. Drain the node (`NodeDrain`, durable cordon) and wait until it holds no lease, however long that takes. An operator-set drain deadline that passes stops the update with the node left drained; it never installs over running leases.
 3. Install B beside A, then switch (a Mac uses the kit layout and a detached launchd apply).
 4. Health check (`node_health`).
 5. `kbf-host-install` (on a Mac, the detached apply) owns the revert: if B has not confirmed healthy within a timeout, it switches back to A. Rollback does not need B to run. Stay drained if A is not healthy.
