@@ -226,14 +226,16 @@ pub struct Cli {
     )]
     pub max_concurrent_puts: u32,
     /// The least average rate, in bytes a second, at which a request body may come in, counted
-    /// from the start of the body once `--put-rate-grace` has passed. A slower body is
+    /// over the time the server spends waiting for the client to send the next piece, once that
+    /// time has passed `--put-rate-grace`. Time the server spends not waiting for the client (a
+    /// tier that is slow to answer or to take the body) is not counted. A slower body is
     /// answered 400 `RequestTimeout`, nothing of it is stored and the upload it began at an S3
     /// tier is aborted. It ends senders that send a byte inside every idle timeout. 0 turns
     /// it off.
     #[arg(long, default_value_t = DEFAULT_PUT_MIN_BYTES_PER_SEC)]
     pub put_min_bytes_per_sec: u64,
-    /// How long a body is let to go before `--put-min-bytes-per-sec` is held to it: a number
-    /// and `ms`, `s`, `m` or `h`.
+    /// How much time spent waiting for the client a body is let to go before
+    /// `--put-min-bytes-per-sec` is held to it: a number and `ms`, `s`, `m` or `h`.
     #[arg(long, default_value = "30s", value_parser = parse_duration)]
     pub put_rate_grace: Duration,
     /// How long a request body may go without a byte arriving, and how long a client may go
