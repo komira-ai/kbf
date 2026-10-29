@@ -494,7 +494,10 @@ fn a_helper_with_its_own_file_is_bound_to_the_container_it_names() {
     .unwrap();
     fs::set_permissions(&zero, fs::Permissions::from_mode(0o644)).unwrap();
     let zeroed = flags(&["--frontend-config", &zero.display().to_string()]);
-    assert_eq!(bound_container(&t, &zeroed), Ok(Some("kbf-fe-z".to_owned())));
+    assert_eq!(
+        bound_container(&t, &zeroed),
+        Ok(Some("kbf-fe-z".to_owned()))
+    );
     assert!(
         bound_container(&t, &missing)
             .unwrap_err()
