@@ -205,3 +205,48 @@ async fn ending_the_streams_tells_the_open_ones_and_counts_them() {
     let told = std::iter::from_fn(|| open.inbox.try_recv().ok()).find_map(Result::err);
     assert_eq!(told.map(|status| status.code()), Some(Code::Unavailable));
 }
+
+/// Asserts a kill at the largest node, which ends the operation (no requeue carries it), is
+/// recorded with its booking too: the run is looked up in the answer the report led to, not
+/// in the scheduler, which has dropped the operation's runs with it. Catches: the booking
+/// taken only from a requeued run.
+#[tokio::test(start_paused = true)]
+async fn a_kill_that_ends_the_operation_is_recorded_with_its_booking() {
+    let (recorder, recording) = Recorder::new(1 << 20, 64);
+    tokio::spawn(recording.run());
+    let rig = rig_over(&Flaky::new(), recorder.clone());
+    let mut node = register(&rig, "last-node", 0);
+    let ticket =
+        super::testing::submit_recorded(&rig, &recorder, request(3), "build-3").expect("queued");
+    let mut lease = started(&node.sent()).expect("started");
+    // The ladder climbs to the node's memory, then the kill there ends the operation.
+    for _ in 0..8 {
+        assert!(
+            report(&rig, "last-node", killed(lease, MemoryKill::OwnLimit))
+                .await
+                .accepted
+        );
+        if matches!(&*ticket.stage.borrow(), kbf_front::Stage::Done(_)) {
+            break;
+        }
+        rig.core.tick(at(1)).await;
+        lease = started(&node.sent()).expect("the rerun");
+    }
+    assert!(matches!(&*ticket.stage.borrow(), kbf_front::Stage::Done(_)));
+
+    recorder.caught_up().await;
+    let action = ActionKey::try_from(&request(3).key)
+        .expect("an action")
+        .action;
+    let record = recorder
+        .get(&RecordKey::owner(InvocationId::new("build-3")))
+        .expect("a record");
+    let last = record
+        .row(&action)
+        .expect("a row")
+        .attempts
+        .last()
+        .and_then(|attempt| attempt.run.clone())
+        .expect("the last run");
+    assert!(last.booked_memory_bytes.is_some(), "{last:?}");
+}
