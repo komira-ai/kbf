@@ -73,6 +73,9 @@ struct Generated {
     /// A clock, and the milliseconds it is moved by before each piece comes: a client that is
     /// slow, in the time the server reads.
     tick: Option<(Arc<TestClock>, u64)>,
+    /// A clock, and the milliseconds it is stepped by (forward or back) before each piece: the
+    /// clock of the machine, set by the time service while the server waits.
+    step: Option<(Arc<TestClock>, i64)>,
 }
 
 impl Generated {
@@ -83,7 +86,22 @@ impl Generated {
             flip_last: false,
             made: Arc::clone(made),
             tick: None,
+            step: None,
         }
+    }
+
+    /// The same, with the wall clock `wall` stepped by `millis` before each piece, as well as
+    /// the clock `rate` moved by `tick` milliseconds.
+    fn stepping(
+        pieces: usize,
+        rate: &Arc<TestClock>,
+        tick: u64,
+        wall: &Arc<TestClock>,
+        millis: i64,
+    ) -> Self {
+        let mut body = Self::ticking(pieces, rate, tick);
+        body.step = Some((Arc::clone(wall), millis));
+        body
     }
 
     /// The same, a client that takes `millis` of the time of `clock` to send each piece.
@@ -115,6 +133,9 @@ impl Body for Generated {
         }
         if let Some((clock, millis)) = &this.tick {
             clock.advance(*millis);
+        }
+        if let Some((clock, millis)) = &this.step {
+            clock.set(clock.now().saturating_add_signed(*millis));
         }
         let last = this.next + 1 == this.pieces;
         let bytes = piece(this.next, this.flip_last && last);
@@ -704,7 +725,8 @@ async fn a_tier_that_is_slow_before_it_takes_the_body_is_not_blamed_on_the_clien
         seen: Arc::clone(&seen),
         stall: Some((Arc::clone(&clock), 60_000)),
     };
-    let mut config = ServerConfig::new(BUCKET, KEY_ID, SECRET, clock);
+    let mut config = ServerConfig::new(BUCKET, KEY_ID, SECRET, clock.clone());
+    config.rate_clock = clock;
     config.put_min_bytes_per_sec = 1_000_000;
     config.put_rate_grace = Duration::from_secs(10);
     let server = Server::new(Arc::new(probe), config.clone());
@@ -727,6 +749,7 @@ async fn a_rate_cut_over_s3_aborts_the_upload_and_frees_the_permit() {
     let clock = Arc::new(TestClock::new());
     clock.set(NOW);
     let mut config = ServerConfig::new(BUCKET, KEY_ID, SECRET, clock.clone());
+    config.rate_clock = clock.clone();
     config.max_concurrent_puts = 1;
     config.put_min_bytes_per_sec = 1_000_000;
     config.put_rate_grace = Duration::from_secs(10);
@@ -815,4 +838,37 @@ async fn two_streamed_puts_of_one_key_make_one_object_and_one_journal_entry() {
     assert_eq!(tiers.hot.get("k", None).await.unwrap().len(), 4 * PIECE);
     assert_eq!(tiers.journal().await.len(), 1);
     assert!(!Tiers::has_temporary_file(&tiers.hot_dir));
+}
+
+/// Asserts that a step of the clock of the machine while the server waits for the pieces does
+/// not change the verdict on the rate: the rate is read from a clock of its own, which the
+/// machine's clock does not move. A prompt client is not cut when the wall clock steps forward
+/// an hour at every piece, and a slow client is cut when the wall clock steps back an hour at
+/// every piece (a step back would have counted as no waiting at all). Both clocks are set by
+/// hand.
+#[tokio::test(start_paused = true)]
+async fn a_step_of_the_wall_clock_does_not_change_the_verdict_on_the_rate() {
+    const PIECES: usize = 20;
+    const HOUR: i64 = 3_600_000;
+    let rate = Arc::new(TestClock::new());
+    let kept = Arc::clone(&rate);
+    let rig = Rig::with(1 << 30, |config| {
+        config.rate_clock = kept;
+        config.put_min_bytes_per_sec = 100_000;
+        config.put_rate_grace = Duration::from_secs(10);
+    })
+    .await;
+    let wall = rig.hot_mem.clock();
+    let (claim, _) = truth(PIECES);
+
+    let prompt = Generated::stepping(PIECES, &rate, 0, &wall, HOUR);
+    let sent = put_request(&rig.config, "prompt", &claim, &[], prompt);
+    assert_eq!(answer(&rig.server, sent).await.status, StatusCode::OK);
+
+    let slow = Generated::stepping(PIECES, &rate, 20_000, &wall, -HOUR);
+    let sent = put_request(&rig.config, "slow", &claim, &[], slow);
+    let cut = answer(&rig.server, sent).await;
+    assert_eq!(cut.status, StatusCode::BAD_REQUEST);
+    assert_eq!(cut.code(), "RequestTimeout");
+    assert!(rig.hot_mem.get("slow", None).await.is_err());
 }

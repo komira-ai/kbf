@@ -379,3 +379,17 @@ async fn the_injector_treats_a_streamed_put_as_a_put() {
         Error::NotFound("b".to_owned())
     );
 }
+
+/// Asserts that the monotonic clock never goes back between reads, for a clock made with `new`
+/// and one made with `default`.
+#[test]
+fn the_monotonic_clock_does_not_go_back() {
+    for clock in [
+        tierstore::MonotonicClock::new(),
+        tierstore::MonotonicClock::default(),
+    ] {
+        let first = clock.now();
+        let second = clock.now();
+        assert!(second >= first);
+    }
+}

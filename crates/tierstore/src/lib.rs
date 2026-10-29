@@ -94,7 +94,7 @@ mod tiered;
 
 pub use backend::{Backend, ByteRange, Listed, Meta, PartBody};
 pub use cache::CachedStore;
-pub use clock::{Clock, SystemClock};
+pub use clock::{Clock, MonotonicClock, SystemClock};
 pub use dir::DirBackend;
 pub use error::Error;
 pub use faulty::{FaultyBackend, Op};
