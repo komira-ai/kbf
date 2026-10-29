@@ -86,10 +86,11 @@ impl LeaseCore {
     }
 
     /// The node's load for a Heartbeat, from the runtime that takes readings. A reading
-    /// that fails leaves it unset, and is logged the first time its kind fails.
+    /// that fails leaves it unset, and is logged the first time its kind fails. The
+    /// heartbeat carries the reading's node part; what it says of each lease is not sent.
     pub(crate) async fn node_load(&mut self) -> Option<worker::NodeLoad> {
         match self.leases.runtimes.node_load().await {
-            Ok(load) => load,
+            Ok(reading) => reading.map(|reading| reading.load),
             Err(error) => {
                 if self.load_errors.insert(error.kind) {
                     tracing::warn!(%error, "node load not read: heartbeats go without it");

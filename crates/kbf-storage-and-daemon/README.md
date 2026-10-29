@@ -32,9 +32,17 @@ Linux only, the container driver only. Elsewhere `kbf all-in-one` exits 2 and sa
    async runtime of its own, with `LocalDataPlane` as its data plane in place of the
    transfer engine. Its control plane is a remote daemon's: `--server` names the server
    half's worker listener, over mutual TLS with the node's certificate, as any node's.
-5. **Stopping.** SIGTERM or SIGINT stops the server half as it stops `kbf-server`; the
-   daemon half stops once the server half has, abandoning the leases still running, and
-   the process exits 0. A server half that stops serving on its own stops the daemon too,
+5. **Stopping.** SIGTERM or SIGINT drains both halves and abandons no lease. The server
+   half begins its drain as `kbf-server` does (`/readyz` 503, no new Execute calls, GOAWAY)
+   and the daemon half goes on taking leases, so work already accepted runs. When no
+   execution is open any more the daemon half drains as `kbf-daemon` does: no new lease,
+   the running ones finish, report and are acknowledged, however long that takes. The server
+   half is held at the end of its drain (`kbf_server::Drain::hold`) until the daemon half
+   has returned, since the leases report through it; then it stands down and the process
+   exits 0. A second signal is the hard stop of both: the server half ends its open
+   streams and the daemon half abandons its leases. `--drain-deadline-secs` (the daemon
+   half's) only logs a warning when it passes; `--shutdown-timeout-secs` (default none) ends the server half's drain when it runs out, and the
+   daemon half stops with it. A server half that stops serving on its own stops the daemon too,
    and the process exits 1. A start the server half refuses exits 2, as `kbf-server`
    does; one that can pass on a later try exits 75 (`kbf_server::StartFailure`); one the daemon half refuses exits as `kbf-daemon` does (1, or 2 for an
    `--image` the node cannot run).

@@ -18,7 +18,7 @@
 //! of the store the core opened ([`Core::epoch`]) once it has one.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
 use js_server_core::Core;
@@ -128,6 +128,10 @@ pub(crate) struct JsFarm {
     pub(crate) reports: AtomicUsize,
     /// Lets one writer of size summaries at a time take its rows and write them.
     pub(crate) learning_gate: crate::farm_js::Gate,
+    /// Whether the farm is fenced ([`Farm::fence`](crate::farm::Farm::fence)), which the
+    /// core does not say. A fenced core feeds nothing, so it refuses every `Result` as
+    /// stale, the current lease's too.
+    pub(crate) fenced: AtomicBool,
 }
 
 impl std::fmt::Debug for JsFarm {
@@ -308,6 +312,7 @@ impl Farm {
             shapes: Shapes::default(),
             reports: AtomicUsize::new(0),
             learning_gate: crate::farm_js::Gate::default(),
+            fenced: AtomicBool::new(false),
         };
         Self {
             cache,
