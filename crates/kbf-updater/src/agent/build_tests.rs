@@ -167,7 +167,10 @@ fn every_host_is_drained_through_the_frontend() {
     for role in [Role::Storage, Role::Daemon, Role::MacDaemon] {
         let drain = drain_for(role, &api);
         let h = host(role);
-        assert!(drain.drain(&h, Duration::from_secs(1)).is_err(), "{role:?}");
+        assert!(
+            drain.drain(&h, Some(Duration::from_secs(1))).is_err(),
+            "{role:?}"
+        );
         assert!(drain.undrain(&h).is_err(), "{role:?}");
     }
 }
@@ -230,7 +233,7 @@ fn an_agent_without_the_operator_credential_refuses_every_update() {
     assert!(none.refusal(&h).unwrap().contains("neither --frontend"));
     assert!(none.check(&h, &v).is_err());
     assert!(none.check_held(&h, &v).is_err());
-    assert!(none.drain(&h, Duration::from_secs(1)).is_err());
+    assert!(none.drain(&h, Some(Duration::from_secs(1))).is_err());
     assert!(none.leases(&h).is_err());
     assert!(none.undrain(&h).is_err());
 }
@@ -337,7 +340,7 @@ fn a_frontend_hosts_agent_drains_a_node_only_when_the_host_runs_a_daemon() {
     let h = host(Role::Frontend);
 
     let (drain, health) = frontend_ports(&rig.config, &identity, &local).unwrap();
-    assert_eq!(drain.drain(&h, Duration::from_secs(1)), Ok(()));
+    assert_eq!(drain.drain(&h, Some(Duration::from_secs(1))), Ok(()));
     assert_eq!(drain.leases(&h), Ok(0));
     assert_eq!(drain.undrain(&h), Ok(()));
     assert_eq!(health.refusal(&h), None);
@@ -345,7 +348,7 @@ fn a_frontend_hosts_agent_drains_a_node_only_when_the_host_runs_a_daemon() {
     let mut with_daemon = rig.config.clone();
     with_daemon.daemon_node = Some("d1".to_owned());
     let (drain, _) = frontend_ports(&with_daemon, &identity, &local).unwrap();
-    assert!(drain.drain(&h, Duration::from_secs(1)).is_err());
+    assert!(drain.drain(&h, Some(Duration::from_secs(1))).is_err());
     // The agent is built.
     assert!(build(&with_daemon).is_ok());
 
@@ -353,7 +356,7 @@ fn a_frontend_hosts_agent_drains_a_node_only_when_the_host_runs_a_daemon() {
     let mut bare = with_daemon.clone();
     bare.node_api = None;
     let (drain, _) = frontend_ports(&bare, &identity, &local).unwrap();
-    assert!(drain.drain(&h, Duration::from_secs(1)).is_err());
+    assert!(drain.drain(&h, Some(Duration::from_secs(1))).is_err());
 
     for role in [HostRole::Storage, HostRole::Daemon, HostRole::MacDaemon] {
         let mut other = Rig::new("bd-fe-flag", role);
@@ -389,7 +392,7 @@ fn a_services_ports_follow_its_settings() {
     )
     .unwrap();
     assert_eq!((node.name.as_str(), node.channel.as_str()), ("db", "db-ch"));
-    assert!(node.drain.drain(&h, Duration::from_secs(1)).is_err());
+    assert!(node.drain.drain(&h, Some(Duration::from_secs(1))).is_err());
     assert!(node.health.check(&h, &target).is_err());
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -415,7 +418,7 @@ fn a_services_ports_follow_its_settings() {
         ),
     )
     .unwrap();
-    assert_eq!(ready.drain.drain(&h, Duration::from_secs(1)), Ok(()));
+    assert_eq!(ready.drain.drain(&h, Some(Duration::from_secs(1))), Ok(()));
     assert_eq!(ready.drain.leases(&h), Ok(0));
     assert_eq!(ready.drain.undrain(&h), Ok(()));
     assert_eq!(
