@@ -11,9 +11,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use js_server_core::Beat;
+use js_server_core::{Beat, Standing};
 use kbf_front::{Submission, Ticket};
-use kbf_proto::worker::{self, ResultAck, ServerMessage};
+use kbf_proto::worker::{self, ResultAck, ResultAckReason, ServerMessage};
 use kbf_sched::DaemonInstance;
 use kbf_types::{LeaseId, WorkerId};
 use tonic::Status;
@@ -123,14 +123,31 @@ pub(crate) async fn report(
     worker: &WorkerId,
     result: worker::Result,
 ) -> Option<ResultAck> {
-    result.lease_id?;
+    let wire = result.lease_id?;
+    let lease = LeaseId::new(wire.term, wire.seq);
     let _taking = Taking::of(&js.reports);
     let ambient = js.ambient;
     let wall: Wall = Arc::new(move || ambient.wall());
-    dispatch::report(&js.core, &js.cache, &wall, || js.now(), worker, result)
+    let ack = dispatch::report(&js.core, &js.cache, &wall, || js.now(), worker, result)
         .await
         .ok()
-        .flatten()
+        .flatten()?;
+    // A stale refusal of the lease the core still calls current: the scheduler took no
+    // answer from its Result. A daemon forgets a Result on any ack, so a refusal would lose
+    // it and leave the lease on the node; without one the daemon sends it again. A fenced
+    // core refuses every Result as stale, by design: that refusal stands.
+    let swallowed = !ack.accepted
+        && ack.reason == ResultAckReason::Stale as i32
+        && !js.fenced.load(Ordering::SeqCst)
+        && matches!(js.core.standing(worker, lease), Ok(Standing::Current(_)));
+    if swallowed {
+        tracing::error!(
+            %lease, %worker,
+            "the scheduler took no answer from the result of the operation's current lease; not acknowledged, so the daemon sends it again"
+        );
+        return None;
+    }
+    Some(ack)
 }
 
 /// [`Farm::tick`](crate::farm::Farm::tick).
