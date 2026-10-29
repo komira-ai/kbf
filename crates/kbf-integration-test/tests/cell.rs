@@ -8,6 +8,7 @@
 
 use std::future::pending;
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::{Child, Command, Output};
 use std::sync::Arc;
@@ -286,8 +287,20 @@ fn pki_writes_every_file_or_fails() {
         "server.key",
         "client.pem",
         "client.key",
+        "frontend.pem",
+        "frontend.key",
+        "storage.pem",
+        "storage.key",
     ] {
         assert!(read(&dir.join(file)).starts_with("-----BEGIN"), "{file}");
+    }
+    // `kbf --mode=frontend` and `--mode=storage` refuse a key another user could read.
+    for key in ["frontend.key", "storage.key"] {
+        let mode = std::fs::metadata(dir.join(key))
+            .expect("the key")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "{key} is mode {mode:o}");
     }
 
     // A file where the directory should be, and a directory where a file should be.
