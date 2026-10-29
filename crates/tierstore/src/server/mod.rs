@@ -92,6 +92,9 @@
 //! cold tier (see [`Proxy`](crate::Proxy)); a presigned PUT never goes to the cold tier.
 //! A credential that may write one object under a prefix, and expires, is a presigned PUT URL: see [`presign`], and
 //! [`ServerConfig::presign_keys`] for the keys that sign them (`--presign-key-file` in the binary).
+//! A key that lists, heads and deletes under one prefix, and does nothing else (no get, no put), is a
+//! GC key: see [`gc`], and [`ServerConfig::gc_keys`] (`--gc-key-file` in the binary). Its deletes are
+//! not create-only: they are the only way an object leaves a prefix that presigned PUTs write.
 //!
 //! # Checksums
 //!
@@ -146,6 +149,7 @@
 
 mod auth;
 pub mod cli;
+pub mod gc;
 mod handover;
 mod idle;
 mod keys;
@@ -164,6 +168,10 @@ mod body_stall_tests;
 mod completion_tests;
 #[cfg(test)]
 mod drain_tests;
+#[cfg(test)]
+mod gc_server_tests;
+#[cfg(test)]
+mod gc_tests;
 #[cfg(test)]
 mod idle_tests;
 #[cfg(test)]
@@ -216,7 +224,9 @@ use tokio::sync::{Notify, Semaphore, watch};
 
 use crate::{Backend, Clock, MonotonicClock};
 
+pub use gc::GcKey;
 pub use keys::AccessKey;
+use keys::Role;
 pub use presign::{Grant, PresignKey, PresignRequest, presign_put};
 
 use idle::Watched;
@@ -241,6 +251,9 @@ pub struct ServerConfig {
     /// The keys that sign presigned PUT URLs (see [`presign`]); a URL is accepted only if one of
     /// them signed it. None by default. Their ids differ from each other's and from the other keys'.
     pub presign_keys: Vec<PresignKey>,
+    /// The GC keys (see [`gc`]): header-signed keys that list, head and delete under one prefix.
+    /// None by default. Their ids differ from each other's and from the other keys'.
+    pub gc_keys: Vec<GcKey>,
     /// The longest `X-Amz-Expires` a presigned URL may have, whatever the ceiling of its key says.
     pub presign_max_expires: Duration,
     /// The most bytes of a request body: the longest object that one put takes, and the
@@ -308,6 +321,7 @@ impl ServerConfig {
             secret_access_key: secret_access_key.to_owned(),
             read_only_keys: Vec::new(),
             presign_keys: Vec::new(),
+            gc_keys: Vec::new(),
             presign_max_expires: Duration::from_secs(900),
             max_request_bytes: 256 << 20,
             body_idle_timeout: Duration::from_secs(30),
@@ -663,6 +677,9 @@ impl Server {
         }
         let data = matches!((&parts.method, &target), (&Method::PUT, Target::Object(_)));
         let check = Check::new(&signed.payload, &parts.headers, data)?;
+        if let Role::Gc(prefix) = &signed.role {
+            gc::permit(prefix, parts, &target, &query)?;
+        }
         let limit = self.config.max_request_bytes;
         let limit = signed.presign.as_ref().map_or(limit, |grant| {
             limit.min(usize::try_from(grant.max_object_bytes).unwrap_or(usize::MAX))
