@@ -22,7 +22,8 @@ use tonic::Status;
 use super::JsFarm;
 use crate::farm::{Outbound, Reported, StreamId};
 use crate::farm_js::host::{Connection, stream_number};
-use crate::farm_js::{Wall, dispatch};
+use crate::farm_js::{Wall, dispatch, write_learned};
+use crate::learned::LearnedSizes;
 
 /// One `Result` being taken, counted until dropped ([`quiet`] waits for none).
 struct Taking<'a>(&'a AtomicUsize);
@@ -45,11 +46,12 @@ impl Drop for Taking<'_> {
 /// tick old.
 fn publish(js: &JsFarm) {
     let metrics = js.cache.metrics();
-    js.core.with(|view, _| {
+    js.core.with(|view, adapter| {
         let sched = view.sched();
         metrics.sched_queued.set(sched.queued_len() as u64);
         metrics.sched_leases.set(sched.leases_held() as u64);
         metrics.sched_whole.set(sched.whole_summary().as_ref());
+        adapter.publish_learned();
     });
 }
 
@@ -132,10 +134,15 @@ pub(crate) async fn report(
     let _taking = Taking::of(&js.reports);
     let ambient = js.ambient;
     let wall: Wall = Arc::new(move || ambient.wall());
-    let ack = dispatch::report(&js.core, &js.cache, &wall, || js.now(), worker, result)
+    let acked = dispatch::report(&js.core, &js.cache, &wall, || js.now(), worker, result)
         .await
         .ok()
-        .flatten()?;
+        .flatten();
+    // The summaries a kill changed are written now, after the core has let go of its lock.
+    if js.settings.learned != LearnedSizes::Off {
+        write_learned(&js.core, &js.learning_gate, false).await;
+    }
+    let ack = acked?;
     // A stale refusal of the lease the core still calls current: the scheduler took no
     // answer from its Result. A daemon forgets a Result on any ack, so a refusal would lose
     // it and leave the lease on the node; without one the daemon sends it again. A fenced
@@ -157,6 +164,7 @@ pub(crate) async fn report(
 /// [`Farm::tick`](crate::farm::Farm::tick).
 pub(crate) async fn tick(js: &JsFarm) {
     js.core.tick(js.now()).await;
+    write_learned(&js.core, &js.learning_gate, true).await;
     publish(js);
 }
 
