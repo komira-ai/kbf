@@ -805,7 +805,11 @@ fn a_key_with_no_summary_has_no_row_to_write() {
     let platform = crate::machine::Platform::of(
         &kbf_caps::Request::from_platform([("OSFamily", "linux")]).expect("a platform"),
     );
-    let subject = crate::action_usage::Subject::of(Described::default()).0;
+    let described = Described {
+        arguments: vec!["compile".to_owned()],
+        ..Described::default()
+    };
+    let subject = crate::action_usage::Subject::of(described).0;
     let basis = crate::learned::basis_of_os("linux").expect("a basis");
     let key = crate::learned::key_of("main", &platform, basis, &subject).expect("a key");
     let keys = std::collections::BTreeSet::from([key]);
