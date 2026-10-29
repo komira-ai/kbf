@@ -617,3 +617,181 @@ fn futures_poll_once<F: std::future::Future>(future: std::pin::Pin<&mut F>) -> O
         std::task::Poll::Pending => None,
     }
 }
+
+/// A macOS node with room for the actions of the tests.
+fn register_mac(rig: &Rig, name: &str) -> Wire {
+    let caps = kbf_caps::NodeCaps::from_report([("arch", "arm64"), ("os", "macos")])
+        .expect("caps")
+        .with_drivers(["container"]);
+    let reported = crate::farm::Reported::serving(Resources::new(4_000, 8 * GIB), caps);
+    let (outbound, inbox) = tokio::sync::mpsc::unbounded_channel();
+    let welcome = worker::ServerMessage::default();
+    let stream = dispatch::register(
+        &rig.core,
+        at(0),
+        &WorkerId::new(name),
+        kbf_sched::DaemonInstance::new(format!("daemon-{name}")),
+        kbf_sched::DaemonInstance::new(""),
+        reported,
+        super::Connection { outbound, welcome },
+    )
+    .expect("a host the core hears");
+    Wire { stream, inbox }
+}
+
+/// Asserts what an estimate is asked against: with no node of the operation's OS registered
+/// the bounds are the unbounded ones; with a node of another OS only, the same (that node's
+/// memory does not bound a Linux action); and a lease kind other than an action is not asked
+/// about. Catches: another OS's node bounding the estimate, and a whole-machine lease given
+/// an estimate for a share of a machine.
+#[tokio::test(start_paused = true)]
+async fn an_estimate_is_bounded_by_the_nodes_of_its_os_and_asked_for_actions_only() {
+    let log = capture();
+    let rig = learning_rig(&Flaky::new(), LearnedSizes::Shadow);
+    let _none = submit(&rig, 1, "compile bounds", 0);
+    let _mac = register_mac(&rig, "node-mac");
+    let _other = submit(&rig, 2, "compile bounds", 0);
+    let whole = Submission {
+        request: Request {
+            kind: LeaseKind::Vm,
+            ..request(3, 0)
+        },
+        call: None,
+        described: Described::default(),
+        evidence: Default::default(),
+        max_wall: None,
+    };
+    let _vm = dispatch::submit(&rig.core, at(0), &Shapes::default(), whole).expect("queued");
+    let lines = estimates(&log.text());
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines.iter().all(|l| l.contains("floor_mib=0")), "{lines:?}");
+}
+
+/// Asserts a core whose estimator is off takes nothing to write at a tick, and one whose
+/// adapter has no state store to write to learns without writing and ends its sweeps at once.
+/// Catches: summaries written to a store the core was not given, a sweep that never ends.
+#[tokio::test(start_paused = true)]
+async fn an_estimator_that_is_off_or_has_no_store_writes_nothing() {
+    let off = learning_rig(&Flaky::new(), LearnedSizes::Off);
+    write(&off, true).await;
+    assert_eq!(rows(&off), 0);
+
+    let store = Flaky::new();
+    let rig = learning_rig_stored(&store, LearnedSizes::Shadow, false);
+    teach(&rig, "node-bare", "compile bare").await;
+    flush_at(&rig, 10_000).await;
+    flush_at(&rig, 3_700_000).await;
+    assert_eq!(rows(&rig), 0);
+}
+
+/// Asserts a store that is fenced as the sweep is due stops the sweep and keeps nothing: the
+/// summaries are not written, and the sweep is over for the hour. Catches: a sweep that goes
+/// on against a fenced store.
+#[tokio::test(start_paused = true)]
+async fn a_fence_that_comes_as_the_sweep_is_due_ends_it() {
+    let store = Flaky::new();
+    let rig = learning_rig(&store, LearnedSizes::Shadow);
+    let mut node = register(&rig, "node-fence", 0);
+    for tag in 1..=3_u8 {
+        run(
+            &rig,
+            &mut node,
+            "node-fence",
+            tag,
+            "compile fence",
+            100 * MIB,
+        )
+        .await;
+    }
+    flush_at(&rig, 10_000).await;
+    let written = rows(&rig);
+    run(&rig, &mut node, "node-fence", 4, "compile fence", 100 * MIB).await;
+    store.set_fenced(true);
+    flush_at(&rig, 3_700_000).await;
+    store.set_fenced(false);
+    assert_eq!(rows(&rig), written, "nothing was written or swept");
+}
+
+/// Asserts the sweep leaves a row it cannot read as a summary alone, and strips the samples
+/// of a summary that holds a floor without deleting the floor. Catches: a sweep that stops
+/// at a bad row, and one that deletes a floor.
+#[tokio::test(start_paused = true)]
+async fn the_sweep_skips_a_bad_summary_and_keeps_a_floor() {
+    let store = Flaky::new();
+    let rig = learning_rig(&store, LearnedSizes::Shadow);
+    let mut node = register(&rig, "node-floor", 0);
+    for tag in 1..=3_u8 {
+        run(
+            &rig,
+            &mut node,
+            "node-floor",
+            tag,
+            "compile floor",
+            100 * MIB,
+        )
+        .await;
+    }
+    let _ticket = submit(&rig, 7, "compile killed", 0);
+    let lease = started(&node.sent()).expect("started");
+    let kill = worker::Result {
+        status: Some(kbf_proto::google::rpc::Status {
+            code: tonic::Code::ResourceExhausted as i32,
+            message: "test".to_owned(),
+            details: Vec::new(),
+        }),
+        memory_kill: worker::MemoryKill::OwnLimit as i32,
+        ..result_with(lease, ActionResult::default())
+    };
+    assert!(report(&rig, "node-floor", kill).await.accepted);
+    flush_at(&rig, 10_000).await;
+    // One row is damaged where the store holds it.
+    let held = store.plain().scan_prefix(ESTIMATE).expect("a scan");
+    let (name, row) = held.first().expect("a row");
+    let mut damaged = row.value.clone();
+    let last = damaged.len() - 1;
+    damaged[last] ^= 0xFF;
+    overwrite(store.plain(), name, damaged);
+
+    let seventy_days = 70 * 24 * 3_600_000;
+    flush_at(&rig, seventy_days).await;
+    flush_at(&rig, seventy_days + 3_700_000).await;
+    assert!(rows(&rig) > 0, "the floor of the kill is kept");
+}
+
+/// Asserts a report the estimator was not shown the start of, or whose operation is gone, is
+/// skipped without a sample. Catches: a panic or a made-up booking for a lease the farm never
+/// started.
+#[tokio::test(start_paused = true)]
+async fn a_report_without_a_known_start_or_operation_teaches_nothing() {
+    let rig = learning_rig(&Flaky::new(), LearnedSizes::Shadow);
+    let mut node = register(&rig, "node-unknown", 0);
+    let _ticket = submit(&rig, 1, "compile unknown", 0);
+    let lease = started(&node.sent()).expect("started");
+    let outcome = kbf_types::Outcome::Failed(kbf_types::Failure::Infra);
+    let worker = WorkerId::new("node-unknown");
+    rig.core.with(|view, adapter| {
+        let unknown = kbf_types::LeaseId::new(7, 999);
+        adapter.stage_learning(
+            view.sched(),
+            kbf_types::OperationId(0),
+            unknown,
+            &worker,
+            outcome,
+            None,
+        );
+        adapter.stage_learning(
+            view.sched(),
+            kbf_types::OperationId(999),
+            lease,
+            &worker,
+            outcome,
+            None,
+        );
+    });
+    assert!(
+        report(&rig, "node-unknown", measured(lease, 100 * MIB))
+            .await
+            .accepted
+    );
+    assert_eq!(tally(&rig, ShadowLevel::None, ShadowBucket::Cold), 1);
+}
