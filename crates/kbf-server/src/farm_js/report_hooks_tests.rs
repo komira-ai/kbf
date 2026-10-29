@@ -69,7 +69,7 @@ async fn report(
         &rig.core,
         &rig.backend,
         &wall(),
-        || at(0),
+        &|| at(0),
         &WorkerId::new(worker),
         result,
     )

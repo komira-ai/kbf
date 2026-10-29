@@ -144,7 +144,7 @@ async fn report_only(rig: &Rig, worker: &str, result: worker::Result) -> worker:
         &rig.core,
         &rig.backend,
         &wall(),
-        || at(0),
+        &|| at(0),
         &WorkerId::new(worker),
         result,
     )
