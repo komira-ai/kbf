@@ -40,7 +40,7 @@ impl FakeInputs {
                 timeout: Some(Duration::from_secs(60)),
             })),
             grant: Mutex::new(Ok(ReadGrant {
-                url: "https://10.0.0.1:9400".to_owned(),
+                url: "https://grant.test:9400".to_owned(),
                 token: Secret::new("read-token-0001"),
             })),
             looked_up: Mutex::new(Vec::new()),

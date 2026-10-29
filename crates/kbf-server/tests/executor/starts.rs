@@ -35,7 +35,7 @@ async fn an_action_runs_end_to_end() {
     assert_eq!(run.arg("--action"), Some(format!("{}/7", hex(7)).as_str()));
     assert_eq!(run.args[0], "/mnt/kbf-tools/kbf-task");
     assert_eq!(run.arg("--grant-token"), Some("read-token-0001"));
-    assert_eq!(run.arg("--grant-url"), Some("https://10.0.0.1:9400"));
+    assert_eq!(run.arg("--grant-url"), Some("https://grant.test:9400"));
     assert!(run.args.contains(&"--insecure-argv-secrets".to_owned()));
     let url = run.arg("--pack-url").expect("a pack url");
     assert!(url.starts_with("http://store.test/cas/b/front-1/"), "{url}");
