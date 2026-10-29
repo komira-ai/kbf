@@ -182,10 +182,13 @@ fn refuse_reserved(key: &str) -> Result<(), Error> {
 ///   before its journal object was written leaves the object in the hot tier with no entry:
 ///   it is never copied or evicted, and a retry of the put is refused as existing. Bound the
 ///   calls inside the backends rather than dropping a put.
-/// - The checks and the write of a put are not atomic. Two proxies that put the same key
-///   at once, one to the hot tier and one (the hot tier being full for it) to the cold tier,
-///   may both succeed; the reconciler then counts the cold tier's object as the copy of the
-///   hot tier's, and the object of the cold tier is the one that stays.
+/// - The checks and the write of a put are not atomic. Two puts of the same key at once, one to
+///   the hot tier and one (the hot tier being full for it, or having just said so) to the cold
+///   tier, may both succeed, whether through one proxy or two; a presigned PUT of the S3 front
+///   never takes that path ([`Backend::put_stream_hot_only`] answers [`Error::Full`] instead), so the
+///   hot tier's create-only write alone decides it. For the other keys the race remains: the
+///   reconciler then counts the cold tier's object as the copy of the hot tier's, and the object
+///   of the cold tier is the one that stays.
 /// - A get that copies an object back into the hot tier while it is deleted may put it back
 ///   there, with a put entry after the delete entry.
 pub struct Proxy {
@@ -493,12 +496,17 @@ impl Inner {
         key: &str,
         len: Option<u64>,
         offered: &Offered<'_>,
+        hot_only: bool,
     ) -> Result<(), Error> {
         let stored = match self.hot.put_stream(key, len, offered.view()).await {
             Ok(()) => self.journal_put(key, offered.taken()).await,
             failed => failed,
         };
         match stored {
+            Err(Error::Full(_)) if hot_only => {
+                self.latch_full();
+                Err(Error::Full(key.to_owned()))
+            }
             Err(Error::Full(_)) if offered.taken() == 0 => {
                 self.latch_full();
                 self.put_cold_stream(key, len, offered).await
@@ -518,6 +526,7 @@ impl Inner {
         key: &str,
         len: Option<u64>,
         body: PartBody<'_>,
+        hot_only: bool,
     ) -> Result<(), Error> {
         refuse_reserved(key)?;
         match self.cold.head(key).await {
@@ -527,12 +536,13 @@ impl Inner {
         }
         let offered = Offered::new(body);
         match self.level().await {
+            Level::Full if hot_only => Err(Error::Full(key.to_owned())),
             Level::Full => self.put_cold_stream(key, len, &offered).await,
             Level::Critical => {
                 tokio::time::sleep(self.config.back_pressure).await;
-                self.put_hot_stream(key, len, &offered).await
+                self.put_hot_stream(key, len, &offered, hot_only).await
             }
-            Level::Open => self.put_hot_stream(key, len, &offered).await,
+            Level::Open => self.put_hot_stream(key, len, &offered, hot_only).await,
         }
     }
 
@@ -660,7 +670,16 @@ impl Backend for Proxy {
         len: Option<u64>,
         body: PartBody<'_>,
     ) -> Result<(), Error> {
-        self.inner.put_object_stream(key, len, body).await
+        self.inner.put_object_stream(key, len, body, false).await
+    }
+
+    async fn put_stream_hot_only(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        self.inner.put_object_stream(key, len, body, true).await
     }
 
     /// The proxy keeps objects immutable: it never replaces one.
