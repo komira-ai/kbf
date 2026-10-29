@@ -196,6 +196,14 @@ pub struct Cli {
     /// How often the reconciler works: shorter than `--lease-ttl`.
     #[arg(long, default_value = "5s", value_parser = parse_duration)]
     pub reconcile_interval: Duration,
+    /// How old the usage the reconciler publishes may be before `/readyz` says 503 with the
+    /// reason: a number and `ms`, `s`, `m` or `h`, longer than `--lease-ttl`, so that a
+    /// reconciler that takes over the lease does not show. A usage that is older than 30 seconds
+    /// is ignored by the puts as if the hot tier were not full, so a reconciler that has stopped
+    /// would otherwise show nowhere; the puts are not refused. A process that has run this long
+    /// without any usage is judged the same way.
+    #[arg(long, default_value = "2m", value_parser = parse_duration)]
+    pub usage_stale_after: Duration,
     /// The largest body of a request, in bytes: the largest object, and the largest part of a
     /// multipart upload.
     #[arg(
@@ -368,6 +376,9 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     if cli.reconcile_interval >= cli.lease_ttl {
         return Err("--reconcile-interval must be shorter than --lease-ttl".into());
     }
+    if cli.usage_stale_after <= cli.lease_ttl {
+        return Err("--usage-stale-after must be longer than --lease-ttl".into());
+    }
     if matches!(cli.bucket.as_str(), "healthz" | "readyz") {
         let name = &cli.bucket;
         return Err(format!("--bucket {name:?} is the name of a probe path").into());
@@ -392,6 +403,7 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     server.body_idle_timeout = cli.body_idle_timeout;
     server.drain_lb_wait = cli.drain_lb_wait;
     server.drain_deadline = cli.drain_deadline;
+    server.usage_stale_after = cli.usage_stale_after;
     let mut proxy = ProxyConfig::new(&cli.proxy_id, cli.hot_bytes, Arc::clone(&clock));
     proxy.critical = share(cli.critical);
     proxy.linger = cli.journal_linger;
@@ -452,11 +464,12 @@ pub async fn run(
     stop: impl Future<Output = ()> + Send + 'static,
     ready: impl FnOnce(SocketAddr),
 ) -> Result<Drained, Error> {
-    let built = build(cli)?;
+    let mut built = build(cli)?;
     let (hot, cold) = (Arc::clone(&built.hot), Arc::clone(&built.cold));
     let opened = Proxy::open(hot, cold, built.proxy).await;
-    let proxy = opened.map_err(|why| format!("opening the proxy: {why}"))?;
-    let server = Server::new(Arc::new(proxy), built.server);
+    let proxy = Arc::new(opened.map_err(|why| format!("opening the proxy: {why}"))?);
+    built.server.proxy = Some(Arc::clone(&proxy));
+    let server = Server::new(proxy, built.server);
     let address = cli.listen;
     let bound = TcpListener::bind(address).await;
     let listener = bound.map_err(|why| format!("binding {address}: {why}"))?;

@@ -121,8 +121,10 @@ impl Rig {
         proxy_config.linger = Duration::from_millis(1);
         proxy_config.usage_refresh = Duration::ZERO;
         let proxy = Proxy::open(hot.clone(), cold.clone(), proxy_config).await;
-        let backend: Arc<dyn Backend> = Arc::new(proxy.expect("a proxy"));
+        let proxy = Arc::new(proxy.expect("a proxy"));
+        let backend: Arc<dyn Backend> = proxy.clone();
         let mut config = ServerConfig::new(BUCKET, KEY_ID, SECRET, clock);
+        config.proxy = Some(proxy);
         change(&mut config);
         let server = Server::new(backend, config.clone());
         Self {

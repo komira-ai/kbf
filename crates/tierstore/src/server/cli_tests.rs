@@ -124,6 +124,7 @@ fn the_flags_have_their_defaults() {
     assert_eq!(cli.journal_retention, Duration::from_secs(24 * 3600));
     assert_eq!(cli.copy_parallel, 16);
     assert_eq!(cli.lease_ttl, Duration::from_secs(30));
+    assert_eq!(cli.usage_stale_after, Duration::from_secs(120));
     assert_eq!(cli.reconcile_interval, Duration::from_secs(5));
     assert_eq!(cli.max_request_bytes, 256 << 20);
     assert_eq!(cli.body_idle_timeout, Duration::from_secs(30));
@@ -171,6 +172,7 @@ fn the_flags_can_all_be_given() {
         ("--journal-retention", "2h"),
         ("--copy-parallel", "4"),
         ("--lease-ttl", "20s"),
+        ("--usage-stale-after", "45s"),
         ("--reconcile-interval", "1s"),
         ("--max-request-bytes", "10"),
         ("--body-idle-timeout", "7s"),
@@ -192,6 +194,7 @@ fn the_flags_can_all_be_given() {
     assert_eq!(cli.journal_retention, Duration::from_secs(7200));
     assert_eq!(cli.copy_parallel, 4);
     assert_eq!(cli.lease_ttl, Duration::from_secs(20));
+    assert_eq!(cli.usage_stale_after, Duration::from_secs(45));
     assert_eq!(cli.reconcile_interval, Duration::from_secs(1));
     assert_eq!(cli.max_request_bytes, 10);
     assert_eq!(cli.body_idle_timeout, Duration::from_secs(7));
@@ -313,6 +316,7 @@ fn the_settings_are_made_from_the_flags() {
     assert_eq!(built.server.body_idle_timeout, Duration::from_secs(30));
     assert_eq!(built.server.drain_lb_wait, Duration::from_secs(7));
     assert_eq!(built.server.drain_deadline, Duration::from_secs(11));
+    assert_eq!(built.server.usage_stale_after, Duration::from_secs(120));
     assert_eq!(built.proxy.proxy_id, "p1");
     assert_eq!(built.proxy.hot_budget, 1000);
     assert_eq!(built.proxy.critical, 0.95);
@@ -345,6 +349,8 @@ fn flags_that_do_not_fit_together_are_refused() {
     assert!(refused(&|cli| cli.high_water = 96).contains("--high-water"));
     let interval = refused(&|cli| cli.reconcile_interval = cli.lease_ttl);
     assert!(interval.contains("--reconcile-interval"), "{interval}");
+    let stale = refused(&|cli| cli.usage_stale_after = cli.lease_ttl);
+    assert!(stale.contains("--usage-stale-after"), "{stale}");
     assert!(refused(&|cli| cli.bucket = "readyz".to_owned()).contains("probe path"));
     assert!(refused(&|cli| cli.bucket = "healthz".to_owned()).contains("probe path"));
     let idle = refused(&|cli| cli.body_idle_timeout = Duration::ZERO);

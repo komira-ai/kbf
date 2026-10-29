@@ -92,6 +92,13 @@
 //! `GET /healthz` is 200 while the process runs. `GET /readyz` is 200 until the drain begins and
 //! 503 after. Neither is signed, so a bucket cannot have either name.
 //!
+//! Where [`ServerConfig::proxy`] is set, `/readyz` is also 503, with the reason as its body, while
+//! the usage object that the reconciler publishes (`_tiering/usage`) is older than
+//! [`ServerConfig::usage_stale_after`]. The puts ignore a stale usage, as if the hot tier were not
+//! full, so a stopped reconciler would otherwise show nowhere. A usage object that is missing is
+//! judged the same way by the time the server has run, so that a server that starts before the
+//! first pass of the reconciler is ready for that long. The puts are not refused.
+//!
 //! # Drain
 //!
 //! [`Server::begin_drain`], which the binary calls on SIGTERM or SIGINT, starts a sequence that
@@ -130,6 +137,8 @@ mod ops_tests;
 #[cfg(test)]
 mod pipes;
 #[cfg(test)]
+mod ready_tests;
+#[cfg(test)]
 mod reply_tests;
 #[cfg(test)]
 mod request_tests;
@@ -167,7 +176,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 
-use crate::{Backend, Clock};
+use crate::{Backend, Clock, Proxy};
 
 pub use keys::AccessKey;
 
@@ -207,7 +216,14 @@ pub struct ServerConfig {
     /// How long the server waits for requests in flight, and for the answers it is sending, after
     /// it began refusing new requests.
     pub drain_deadline: Duration,
-    /// The time, for the age of a signature.
+    /// The proxy whose usage object `/readyz` judges: none by default, and then `/readyz` says
+    /// nothing of the usage. The binary sets the proxy it serves.
+    pub proxy: Option<Arc<Proxy>>,
+    /// The age of the usage object past which `/readyz` says 503. A server that has run this
+    /// long without finding any usage object is judged the same way. Longer than the lease and
+    /// the pass interval of the reconciler, so that a takeover of the lease does not show.
+    pub usage_stale_after: Duration,
+    /// The time, for the age of a signature and of the usage object.
     pub clock: Arc<dyn Clock>,
 }
 
@@ -234,6 +250,8 @@ impl ServerConfig {
             header_timeout: Duration::from_secs(60),
             drain_lb_wait: Duration::from_secs(10),
             drain_deadline: Duration::from_secs(900),
+            proxy: None,
+            usage_stale_after: Duration::from_secs(120),
             clock,
         }
     }
@@ -293,6 +311,8 @@ async fn pause_after(failed: bool) {
 pub struct Server {
     backend: Arc<dyn Backend>,
     config: ServerConfig,
+    /// When the server was made, by the clock of the config.
+    started: u64,
     phase: AtomicU8,
     /// Notified once, when the drain begins.
     drain_requested: Notify,
@@ -350,6 +370,7 @@ impl Server {
     pub fn new(backend: Arc<dyn Backend>, config: ServerConfig) -> Arc<Self> {
         Arc::new(Self {
             backend,
+            started: config.clock.now(),
             config,
             phase: AtomicU8::new(SERVING),
             drain_requested: Notify::new(),
@@ -549,7 +570,7 @@ impl Server {
         B::Data: Send,
         B::Error: Into<BoxError>,
     {
-        if let Some(answer) = self.probe(parts) {
+        if let Some(answer) = self.probe(parts).await {
             return Ok(answer);
         }
         if self.phase() == REFUSING {
@@ -567,15 +588,38 @@ impl Server {
     }
 
     /// The answer to a health or readiness probe, which are not signed.
-    fn probe(&self, parts: &Parts) -> Option<Answer> {
+    async fn probe(&self, parts: &Parts) -> Option<Answer> {
         let read = matches!(parts.method, Method::GET | Method::HEAD);
         let (status, text) = match (read, parts.uri.path(), self.is_ready()) {
-            (true, "/healthz", _) => (StatusCode::OK, "ok"),
-            (true, "/readyz", true) => (StatusCode::OK, "ready"),
-            (true, "/readyz", false) => (StatusCode::SERVICE_UNAVAILABLE, "draining"),
+            (true, "/healthz", _) => (StatusCode::OK, "ok".to_owned()),
+            (true, "/readyz", true) => self.readiness().await,
+            (true, "/readyz", false) => (StatusCode::SERVICE_UNAVAILABLE, "draining".to_owned()),
             _ => return None,
         };
         let headers = [("content-type", "text/plain".to_owned())];
         Some(answer(status, &headers, Bytes::from(text)))
+    }
+
+    /// The answer of `/readyz` to a server that is not draining: 503 and the reason if the usage
+    /// object of the reconciler is older than the limit.
+    async fn readiness(&self) -> (StatusCode, String) {
+        let ready = (StatusCode::OK, "ready".to_owned());
+        let Some(proxy) = &self.config.proxy else {
+            return ready;
+        };
+        let limit = self.config.usage_stale_after;
+        let published = proxy.usage_age().await;
+        let since_start = self.config.clock.now().saturating_sub(self.started);
+        let age = published.unwrap_or(Duration::from_millis(since_start));
+        if age <= limit {
+            return ready;
+        }
+        let (secs, max) = (age.as_secs(), limit.as_secs());
+        let text = if published.is_some() {
+            format!("usage of the hot tier is stale: published {secs}s ago, limit {max}s")
+        } else {
+            format!("usage of the hot tier is missing: none published in {secs}s, limit {max}s")
+        };
+        (StatusCode::SERVICE_UNAVAILABLE, text)
     }
 }
