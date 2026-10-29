@@ -1,0 +1,33 @@
+# Runs js-core-gate.yml (the end-to-end gate for the farm's flip onto the jobscheduler core) for
+# every pull request, and by hand. It is a check of its own and not a stage of the release
+# pipeline: the pipeline lint (tests/pipeline_workflow) pins the pipeline's jobs, and this file
+# is the second caller of js-core-gate.yml that it would refuse once the pipeline calls the gate.
+# js-core-gate.yml says how the flip replaces this file.
+#
+# No `paths:` filter, on purpose. This check is to be a required status check of main, and a
+# path-filtered workflow never starts for a pull request outside its paths, which leaves a
+# required check pending and blocks that pull request for good. The gate depends on most of the
+# workspace (kbf-server and kbf-cli pull in the estimator, map, mapsync, proto, raft, route,
+# state, storage, pack and peer crates, among others), so a filter would also miss changes that
+# can break it.
+#
+# No `push: main` trigger. Every change reaches main through a pull request that ran this check,
+# a run per push would repeat a 45 minute job for nothing, and after the flip the pipeline calls
+# the gate on main itself.
+name: js-core-gate-pr
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: js-core-gate-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gate:
+    uses: ./.github/workflows/js-core-gate.yml
+    permissions:
+      contents: read

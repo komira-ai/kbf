@@ -267,19 +267,21 @@ jobs:
       # the log and the job summary (`kbf-coverage raise` lifts them) and do not fail.
       - name: Per-crate table and 99% gate
         run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- --lcov target/coverage/lcov.info --root "$GITHUB_WORKSPACE" --floors coverage-floors --summary-file "$GITHUB_STEP_SUMMARY"
-      # The base's floors file, checked out beside this one; a base without one (the change
-      # that adds the file) has nothing to compare, and the step says so.
+      # The base's floors file, checked out under the ignored `target/` (a checkout at the root
+      # would be an untracked nested repository that the js run's repo lints try to read); a
+      # base without one (the change that adds the file) has nothing to compare, and the step
+      # says so.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         with:
           ref: ${{ github.event.pull_request.base.sha }}
-          path: base
+          path: target/base-floors
           sparse-checkout: coverage-floors
           sparse-checkout-cone-mode: false
           persist-credentials: false
       - name: Floors are not lower than the base's
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
-        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base-ref HEAD^1 --base base/coverage-floors --floors coverage-floors
+        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base-ref HEAD^1 --base target/base-floors/coverage-floors --floors coverage-floors
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:

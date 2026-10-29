@@ -321,6 +321,45 @@ pub(super) async fn a_new_process_that_moves_waits_before_its_unlisted_lease_is_
     assert!(has_lease(&disk, again));
 }
 
+/// Asserts that a daemon's `Result` for its operation's current lease is accepted, or not
+/// acknowledged at all, and never refused: a daemon forgets a `Result` on any
+/// acknowledgement, so a refused current-lease `Result` is lost, and its lease stays on the
+/// node, counted, until the node falls silent. The frontend the daemon moved to opened
+/// first, so it holds the lower block of lease sequences: after the handover grace it gives
+/// up the lease it took up and grants the operation again with a lower sequence than that
+/// lease's, as when a daemon restarts during a roll.
+pub(super) async fn a_result_for_a_lease_numbered_below_the_one_taken_up_is_never_refused(
+    backing: Backing,
+) {
+    let disk = Disk::over(backing);
+    let b = disk.farm(EpochPolicy::Keep);
+    let a = disk.farm(EpochPolicy::Keep);
+    let (_, mut inbox_a) = register_instance(&a, &node(), "daemon-1");
+    submit(&a, request(1)).expect("submitted");
+    let [taken_up] = starts(&mut inbox_a)[..] else {
+        panic!("one lease expected");
+    };
+    let (stream, mut inbox) = register_instance(&b, &node(), "daemon-2");
+    assert_eq!(held(&b), [taken_up], "the lease was not taken up");
+    assert!(b.heartbeat(&node(), stream, 1, Vec::new()).await);
+    tokio::time::advance(HANDOVER_GRACE + OWNER_CACHE_TTL + Duration::from_secs(1)).await;
+    assert!(b.heartbeat(&node(), stream, 2, Vec::new()).await);
+    let [again] = starts(&mut inbox)[..] else {
+        panic!("the lease was not given up and granted again");
+    };
+    assert!(
+        again.seq < taken_up.seq,
+        "the grant again is not below the lease taken up: {again:?} {taken_up:?}"
+    );
+
+    let ack = b.report(&node(), invalid(again)).await;
+
+    assert!(
+        ack.as_ref().is_none_or(|ack| ack.accepted),
+        "the current lease's result was refused: {ack:?}"
+    );
+}
+
 /// Asserts that the lease a daemon does not list, after it moved to a frontend as the same
 /// process, is given up at once, as it is when a daemon reconnects.
 pub(super) async fn the_same_process_that_moves_loses_an_unlisted_lease_at_once(backing: Backing) {

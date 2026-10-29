@@ -10,8 +10,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use kbf_server::{ServeError, StartFailure};
-use kbf_threads::Topology;
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::LocalDataPlane;
 use crate::cli::Flags;
@@ -22,7 +22,11 @@ pub(crate) fn run(flags: &Flags) -> ExitCode {
         .with_writer(std::io::stderr)
         .with_ansi(std::io::stderr().is_terminal())
         .init();
-    exit("kbf-all-in-one", "server", serve(prepared(flags)))
+    exit(
+        "kbf-all-in-one",
+        "server",
+        crate::all_in_one::serve(prepared(flags)),
+    )
 }
 
 /// The exit status of a run that ended as `served` did, its failure said on stderr
@@ -88,7 +92,7 @@ impl Failed {
         }
     }
 
-    fn said(&self, half: &str) -> String {
+    pub(crate) fn said(&self, half: &str) -> String {
         match self {
             Self::Server(e) => format!("{half}: {e}"),
             Self::Daemon(e) => format!("daemon: {e}"),
@@ -99,25 +103,10 @@ impl Failed {
 
 /// Both halves' flags as the mode runs them: given one cache when they share a disk
 /// (`crate::one_cache`).
-fn prepared(flags: &Flags) -> Flags {
+pub(crate) fn prepared(flags: &Flags) -> Flags {
     let mut flags = flags.clone();
     crate::one_cache::share(&mut flags.server, &mut flags.daemon);
     flags
-}
-
-/// The server half on a runtime of its own, then the daemon half over the in-process
-/// plane; returns once the server half has stopped and the daemon half after it. Both
-/// halves start from `flags`, as [`prepared`] made them: no half sees another copy.
-fn serve(flags: Flags) -> Result<(), Failed> {
-    let sizes = kbf_server::sizes_on(&flags.server, Topology::detect());
-    sizes.log();
-    let tokio = sizes.runtime().map_err(Failed::server)?;
-    let started = tokio.block_on(kbf_server::start_interruptible(&flags.server));
-    let server = started.map_err(Failed::server)?;
-    println!("{}", server.start_line());
-    let plane = Arc::new(LocalDataPlane::new(server.local(), tokio.handle().clone()));
-    let serving = Box::pin(server.serve());
-    with_daemon(&tokio, serving, in_process(plane), &flags.daemon)
 }
 
 /// What the half beside the daemon serves until it stops.
@@ -132,41 +121,18 @@ pub(crate) fn in_process(plane: Arc<LocalDataPlane>) -> Starter {
     Box::new(move |cli| kbf_node::start_with(cli, move |_| Ok(Arc::clone(&plane))))
 }
 
-/// The daemon half of `daemon` started by `start`, beside the half (server or storage)
-/// `serving` on `tokio`; returns once that half has stopped and the daemon half after
-/// it. Not generic, so both modes run one copy of it.
-pub(crate) fn with_daemon(
-    tokio: &Runtime,
-    serving: Serving,
-    start: Starter,
-    daemon: &kbf_node::Cli,
-) -> Result<(), Failed> {
-    // Dropped when the other half stops serving, which stops the daemon half.
-    let (ended, other_ended) = tokio::sync::oneshot::channel::<()>();
-    let serving = tokio.spawn(async move {
-        let _ended = ended;
-        serving.await
-    });
-    let node = start(daemon).map_err(Failed::Daemon)?;
-    node.serve_until(async move {
-        let _ = other_ended.await;
-    })
-    .map_err(Failed::Daemon)?;
-    let served = tokio.block_on(serving);
-    let served = served.map_err(Failed::stopped)?;
-    served.map_err(Failed::stopped)
-}
-
-/// [`with_daemon`] for the storage half: the daemon half drains on the first SIGTERM or
-/// SIGINT ([`kbf_node::NodeHandle::serve_alongside`]) while `serving` goes on, and only
-/// then is `stop` fired, which stops the half beside it. A lease the daemon half runs
-/// reads and writes its blobs through that half, so it must outlive the drain.
+/// The daemon half of `daemon` started by `start`, beside the half (storage or server)
+/// `serving` on `tokio`: the daemon half drains on the first `()` of `received`, the
+/// stop signals ([`forwarded`]; [`kbf_node::NodeHandle::serve_beside`]), while `serving`
+/// goes on, and only then is `stop` fired, which stops the half beside it. A lease the
+/// daemon half runs reads and writes its blobs through that half, so it must outlive the
+/// drain. Returns once that half has stopped and the daemon half before it.
 pub(crate) fn with_draining_daemon(
     tokio: &Runtime,
     serving: Serving,
     stop: tokio::sync::oneshot::Sender<()>,
     start: Starter,
-    signals: kbf_node::Signals,
+    received: UnboundedReceiver<()>,
     daemon: &kbf_node::Cli,
 ) -> Result<(), Failed> {
     let (ended, other_ended) = tokio::sync::oneshot::channel::<()>();
@@ -176,16 +142,39 @@ pub(crate) fn with_draining_daemon(
     });
     let node = start(daemon).map_err(Failed::Daemon)?;
     drain_then_stop(tokio, serving, stop, || {
-        node.serve_alongside(signals, async move {
+        node.serve_beside(received, async move {
             let _ = other_ended.await;
         })
     })
 }
 
+/// Reads every SIGTERM and SIGINT of `signals` on `tokio` and sends one `()` for each on
+/// the returned channel, until the receiver is dropped: the stop signals as the daemon
+/// half takes them, and as a process that hands them to another half takes them from.
+pub(crate) fn forwarded(tokio: &Runtime, signals: kbf_node::Signals) -> UnboundedReceiver<()> {
+    let (sender, received) = tokio::sync::mpsc::unbounded_channel();
+    tokio.spawn(forward_signals(signals, sender));
+    received
+}
+
+/// [`forwarded`]'s task: ends once nobody reads the channel.
+pub(crate) async fn forward_signals(
+    mut signals: kbf_node::Signals,
+    sender: tokio::sync::mpsc::UnboundedSender<()>,
+) {
+    loop {
+        let name = signals.recv().await;
+        tracing::info!("{name}: shutting down");
+        if sender.send(()).is_err() {
+            return;
+        }
+    }
+}
+
 /// Runs `drain`, then fires `stop` and waits for `serving` to end: the order of
 /// [`with_draining_daemon`]. A daemon that failed is the error unless the half beside it
 /// failed first.
-fn drain_then_stop(
+pub(crate) fn drain_then_stop(
     tokio: &Runtime,
     serving: tokio::task::JoinHandle<Result<(), ServeError>>,
     stop: tokio::sync::oneshot::Sender<()>,
@@ -200,7 +189,7 @@ fn drain_then_stop(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use clap::Parser as _;
 
     use super::*;
@@ -367,7 +356,7 @@ mod tests {
     /// The flags of a daemon half on the fake driver, with certificates it can read, in a
     /// directory of `name`, removed when the first returned drops.
     #[cfg(target_os = "linux")]
-    fn fake_daemon(name: &str) -> (kbf_testkit::dir::TestDir, kbf_node::Cli) {
+    pub(crate) fn fake_daemon(name: &str) -> (kbf_testkit::dir::TestDir, kbf_node::Cli) {
         let dir = crate::one_cache::under_target(name);
         let at = |name: &str| dir.join(name);
         let ca = rcgen::CertifiedIssuer::self_signed(
@@ -399,7 +388,7 @@ mod tests {
 
     /// The daemon half's starter over a plane on an in-memory cache, as the modes give it
     /// theirs. The fake driver the tests use never asks for the plane.
-    fn starter(tokio: &Runtime) -> Starter {
+    pub(crate) fn starter(tokio: &Runtime) -> Starter {
         let _context = tokio.enter();
         let cache = Arc::new(kbf_front::Cache::memory());
         let store = kbf_server::LocalStore::new(cache, kbf_front::SegmentsConfig::DEFAULT);
@@ -435,7 +424,8 @@ mod tests {
         let start = starter(&tokio);
         // SAFETY: raise(3) on this process, which handles SIGTERM above.
         assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
-        let served = with_draining_daemon(&tokio, serving, stop, start, signals, &cli);
+        let received = forwarded(&tokio, signals);
+        let served = with_draining_daemon(&tokio, serving, stop, start, received, &cli);
         assert!(served.is_ok(), "drained and stopped");
         assert!(
             stopped_at.lock().expect("flag").is_some(),
@@ -445,7 +435,8 @@ mod tests {
         let (stop, _stopped) = tokio::sync::oneshot::channel::<()>();
         let serving = Box::pin(std::future::pending());
         let refused: Starter = Box::new(|_| Err("no scratch".into()));
-        let failed = with_draining_daemon(&tokio, serving, stop, refused, install(), &cli);
+        let received = forwarded(&tokio, install());
+        let failed = with_draining_daemon(&tokio, serving, stop, refused, received, &cli);
         assert_eq!(
             failed.expect_err("refused").said("storage"),
             "daemon: no scratch"
@@ -478,7 +469,8 @@ mod tests {
                 })
             });
             let start = starter(&tokio);
-            let served = with_draining_daemon(&tokio, serving, stop, start, signals, &cli);
+            let received = forwarded(&tokio, signals);
+            let served = with_draining_daemon(&tokio, serving, stop, start, received, &cli);
             ended
                 .send(served.expect_err("the half failed").said("storage"))
                 .ok();
@@ -490,56 +482,5 @@ mod tests {
             said.starts_with("the storage half stopped: bind 127.0.0.1:1"),
             "{said}"
         );
-    }
-
-    /// The combined start (`serve` and `with_daemon`'s normal path) through the crate's own
-    /// API, not the `kbf` binary: the server half starts on its flags over temp stores, the
-    /// daemon half (fake driver, dialling nothing that answers) starts over the in-process
-    /// plane, and both stop cleanly, `serve` returning `Ok`, once the server half is asked
-    /// to stop with SIGTERM. Catches: `with_daemon` not stopping the daemon half when the
-    /// server half ends, or returning the server half's stop as a failure; `serve` not
-    /// starting the daemon half over the server half's plane. The combined start goes away
-    /// with the all-in-one mode. SIGTERM is sent to this process again and again until
-    /// `serve` returns, from a thread, with a handler of the test's own installed first so
-    /// that none is fatal before the server half has installed its handler.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_combined_start_serves_and_stops_both_halves_when_the_server_half_is_stopped() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let (dir, daemon) = fake_daemon("combined-start");
-        let at = |name: &str| dir.join(name).display().to_string();
-        let server = kbf_server::Args::try_parse_from([
-            "kbf-server".to_owned(),
-            "--listen=127.0.0.1:0".to_owned(),
-            "--worker-listen=127.0.0.1:0".to_owned(),
-            "--default-platform=none".to_owned(),
-            format!("--cold-store=file://{}", at("cold")),
-            format!("--meta-dir={}", at("meta")),
-        ])
-        .expect("the server's flags");
-        let flags = Flags { server, daemon };
-
-        // Keeps SIGTERM handled for the whole test, whichever half installs its own.
-        let guard = Runtime::new().expect("runtime");
-        let _handled = {
-            let _context = guard.enter();
-            kbf_node::Signals::install().expect("handlers")
-        };
-        let done = Arc::new(AtomicBool::new(false));
-        let sender = {
-            let done = Arc::clone(&done);
-            std::thread::spawn(move || {
-                while !done.load(Ordering::SeqCst) {
-                    // SAFETY: raise(3) on this process, which handles SIGTERM above.
-                    assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            })
-        };
-        let served = serve(prepared(&flags));
-        done.store(true, Ordering::SeqCst);
-        sender.join().expect("the sender");
-        assert!(served.is_ok(), "both halves stopped cleanly");
     }
 }
