@@ -28,7 +28,7 @@ pub enum Event {
     Query(String),
     Health(String),
     /// A node drain was asked for, with the deadline in seconds.
-    Drain(String, u64),
+    Drain(String, Option<u64>),
     /// The node's leases were read.
     Leases(String),
     Undrain(String),
@@ -53,7 +53,10 @@ impl Event {
             Event::Install(_, version) => format!("install {version}"),
             Event::Query(_) => "query".to_owned(),
             Event::Health(_) => "health".to_owned(),
-            Event::Drain(_, secs) => format!("drain {secs}"),
+            Event::Drain(_, secs) => match secs {
+                Some(secs) => format!("drain {secs}"),
+                None => "drain none".to_owned(),
+            },
             Event::Leases(_) => "leases".to_owned(),
             Event::Undrain(_) => "undrain".to_owned(),
             Event::Commit(_) => "commit".to_owned(),
@@ -456,9 +459,11 @@ impl FakeDrain {
 }
 
 impl Drain for FakeDrain {
-    fn drain(&self, host: &Host, deadline: Duration) -> Result<(), PortError> {
-        self.log
-            .push(Event::Drain(host.alias.clone(), deadline.as_secs()));
+    fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError> {
+        self.log.push(Event::Drain(
+            host.alias.clone(),
+            deadline.map(|d| d.as_secs()),
+        ));
         self.drains.next(&host.alias)
     }
 
@@ -775,7 +780,7 @@ mod tests {
             Event::Install(a(), "2.0".into()),
             Event::Query(a()),
             Event::Health(a()),
-            Event::Drain(a(), 600),
+            Event::Drain(a(), Some(600)),
             Event::Leases(a()),
             Event::Undrain(a()),
             Event::Commit(a()),

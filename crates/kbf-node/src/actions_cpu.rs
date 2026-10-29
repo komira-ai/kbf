@@ -1,6 +1,9 @@
 //! `--actions-cpu-max`: whether the container driver's actions cgroup keeps its CPU limit.
 
 use clap::ValueEnum;
+// The container driver builds on Linux only; elsewhere the flag parses and is refused unless
+// `auto`, and nothing reads its mode.
+#[cfg(target_os = "linux")]
 use kbf_driver_container::{ActionsCpu, ActionsCpuMax};
 
 use super::Driver;
@@ -31,6 +34,7 @@ enum Mode {
     Off,
 }
 
+#[cfg(target_os = "linux")]
 impl From<Mode> for ActionsCpuMax {
     fn from(mode: Mode) -> Self {
         match mode {
@@ -63,6 +67,7 @@ impl ActionsCpuArgs {
     }
 
     /// What the driver applies at each Welcome, given the leases' CPUs.
+    #[cfg(target_os = "linux")]
     pub(crate) fn config(self, lease_cpus: u64) -> ActionsCpu {
         ActionsCpu {
             mode: self.actions_cpu_max.into(),
@@ -82,6 +87,7 @@ mod tests {
     /// else, and each reaches the driver as its own mode. Catches a default other than
     /// `auto` (a farm that does not set it would stop following the Welcome), two modes
     /// swapped, and a value outside the three accepted.
+    #[cfg(target_os = "linux")]
     #[test]
     fn actions_cpu_max_is_parsed_strictly_and_mapped_to_its_mode() {
         let parse = |extra: Option<&str>| {
