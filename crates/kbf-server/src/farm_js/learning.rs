@@ -288,7 +288,7 @@ impl KbfAdapter {
     /// summaries a kill changed, as they are now; with `tick`, also the dirty summaries that
     /// are due and the day to sweep the store for, if a sweep is due. Takes nothing while the
     /// estimator is off.
-    pub(crate) fn take_learned_work(&mut self, tick: bool) -> Work {
+    pub(crate) fn take_learned_work(&mut self, take: Take) -> Work {
         let learning = &mut self.learning;
         if learning.learned.off() {
             return Work::default();
@@ -296,9 +296,11 @@ impl KbfAdapter {
         let urgent = std::mem::take(&mut learning.urgent);
         let mut rows = learning.learned.take_rows(urgent);
         let mut sweep = None;
-        if tick {
+        if matches!(take, Take::Tick) {
             rows.extend(learning.learned.due());
             sweep = learning.learned.sweep_due();
+        } else if matches!(take, Take::Now) {
+            rows.extend(learning.learned.due_now());
         }
         let store = learning.stored.then(|| Arc::clone(&self.store));
         Work { rows, sweep, store }
@@ -322,6 +324,17 @@ pub(crate) struct Work {
     store: Option<Arc<dyn Store>>,
 }
 
+/// What a writer of size summaries takes under the core's lock.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Take {
+    /// The summaries a kill changed.
+    Urgent,
+    /// Those, the dirty summaries that are due, and the sweep if one is due.
+    Tick,
+    /// Those, and every dirty summary whatever the time since the last write.
+    Now,
+}
+
 /// Lets one writer of size summaries at a time take its rows and write them, so that a
 /// write of an older summary never lands after a write of a newer one.
 #[derive(Default)]
@@ -338,7 +351,28 @@ pub(crate) async fn write_learned(core: &Core<KbfAdapter>, gate: &Gate, tick: bo
         return;
     }
     let _writer = gate.0.lock().await;
-    let work = core.with(|_, adapter| adapter.take_learned_work(tick));
+    write_taken(core, if tick { Take::Tick } else { Take::Urgent });
+}
+
+/// Writes every changed summary now, whatever the time since the last write, and returns when
+/// it is written: for `Farm::write_behind_now`, which is not async, as the farm's own driver's
+/// is not. No awaiting happens while a writer holds the gate (the store's calls are blocking),
+/// so on a runtime of one thread the gate is free here and on a runtime of many a writer that
+/// holds it is a few store calls from letting go: waiting for it needs no runtime.
+pub(crate) fn write_behind_now(core: &Core<KbfAdapter>, gate: &Gate) {
+    let _writer = loop {
+        if let Ok(held) = gate.0.try_lock() {
+            break held;
+        }
+        std::thread::yield_now();
+    };
+    write_taken(core, Take::Now);
+}
+
+/// Takes what `take` says under the core's lock and writes it, with no hold of the core's lock
+/// across a store call. The caller holds the gate.
+fn write_taken(core: &Core<KbfAdapter>, take: Take) {
+    let work = core.with(|_, adapter| adapter.take_learned_work(take));
     let Work { rows, sweep, store } = work;
     let Some(store) = store else {
         // Nothing to write to: a sweep that is due ends at once.

@@ -815,3 +815,30 @@ fn a_key_with_no_summary_has_no_row_to_write() {
     let keys = std::collections::BTreeSet::from([key]);
     assert!(learned.take_rows(keys).is_empty());
 }
+
+/// Asserts `write_behind_now` writes the changed summaries at once, before the write-behind
+/// interval and without a tick, and returns with them in the store; and that a second call
+/// with nothing changed writes nothing more. Catches: a call that leaves the summaries to the
+/// next tick, and one that rewrites summaries no run changed.
+#[tokio::test(start_paused = true)]
+async fn write_behind_now_writes_the_changed_summaries_before_returning() {
+    let rig = learning_rig(&Flaky::new(), LearnedSizes::Shadow);
+    teach(&rig, "node-now", "compile now").await;
+    assert_eq!(rows(&rig), 0, "nothing is written at the report");
+
+    let gate = GATE.with(Rc::clone);
+    super::write_behind_now(&rig.core, &gate);
+    let written = rows(&rig);
+    assert!(written > 0, "written at once");
+
+    // Overwritten with a marker: a second call that writes nothing leaves it alone.
+    let (name, _) = rig.store.plain().scan_prefix(ESTIMATE).expect("a scan")[0].clone();
+    overwrite(rig.store.plain(), &name, vec![9]);
+    super::write_behind_now(&rig.core, &gate);
+    let held = rig.store.plain().get(&name).expect("a get").expect("a row");
+    assert_eq!(
+        held.value,
+        vec![9],
+        "an unchanged summary is not written again"
+    );
+}

@@ -452,7 +452,6 @@ impl Learned {
         self.tally[level as usize][bucket as usize]
     }
 
-    /// The rows of `keys`, which are no longer dirty.
     /// The rows of `keys` as the summaries are now, which are no longer dirty.
     pub fn take_rows(&mut self, keys: BTreeSet<Key>) -> Vec<Row> {
         self.rows_of(keys)

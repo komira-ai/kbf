@@ -99,7 +99,8 @@ pub(crate) struct JsFarm {
     pub(crate) core: Core<KbfAdapter>,
     /// The farm's settings as the core was last built from them: the memory ladder and
     /// floors, the placement mode, the whole-node settings, the recorder, the held cap and
-    /// the orphan wait. The learned sizes are kept but this core does not use them.
+    /// the orphan wait, and the learned sizes mode, which the adapter's estimator is built
+    /// from (`on` learns as `shadow`).
     pub(crate) settings: Settings,
     /// The state store the core opened, if the farm has taken one.
     pub(crate) store: Option<Arc<dyn Store>>,
