@@ -14,6 +14,7 @@ use bytes::Bytes;
 use kbf_front::grants::{ClaimsError, GrantError, GrantKey, Grants};
 use kbf_front::prepare_run::{
     AccessKey, ClosureError, ClosureLimits, ConfigError, ExpiryError, MAX_EXPIRY, PrepareError,
+    PrepareFault,
     PutTarget, RunPrep, RunPrepConfig,
 };
 use kbf_front::{Backend, Cache, CacheStorage, PackKeyMint, SegmentsConfig};
@@ -25,6 +26,8 @@ use kbf_types::Digest;
 use prost::Message as _;
 use tierstore::server::{PresignRequest, presign_put};
 
+#[path = "prepare_run/faults.rs"]
+mod faults;
 #[path = "prepare_run/start.rs"]
 mod start;
 
