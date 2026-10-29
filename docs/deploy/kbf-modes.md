@@ -149,8 +149,8 @@ the pack key the task may write (`cas/b/<lease>/<nonce>-0`, which the executor p
 when the run ends); a presigned `PUT` of exactly that key to the tier store, signed with a
 presign-only key (the URL takes a `PUT` until it expires, and the store is create-only, so the
 first write is the only one that lands); and a read grant, a bearer token with the base URL of the job-facing read
-listener, for the Action, its Command and every blob of its input tree (the listener works the scope out
-again from the Action each time the token is used, so a blob removed after the run was prepared
+listener, for the Action, its Command and every blob of its input tree (the job-facing read listener, kbf#1943, works
+the scope out again from the Action each time the token is used, so a blob removed after the run was prepared
 fails that read). The write and the grant
 are good for the run's wall limit plus a slack, `--task-run-wall-secs` (default 7200) and
 `--task-url-slack-secs` (default 600), and never for more than 4 hours (14400 seconds), the

@@ -317,7 +317,8 @@ pub struct RunPrep {
 
 impl RunPrep {
     /// The mint that signs this preparer's keys: the one [`crate::ingest`] must verify a
-    /// run's pack key with.
+    /// run's pack key with. It can mint as well as verify, so only the frontend's own code
+    /// holds it (the executor beside it); nothing a task or a client reaches is given it.
     #[must_use]
     pub fn mint(&self) -> &PackKeyMint {
         &self.mint

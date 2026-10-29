@@ -283,11 +283,30 @@ async fn read(
                 what,
                 digest: *digest,
             },
-            other => ClosureError::Unavailable {
-                digest: *digest,
-                why: other.to_string(),
-            },
+            other => store_fault(what, digest, &other),
         })
+}
+
+/// A store error other than "not held": [`ClosureError::Unavailable`] when the same call may
+/// succeed later (the store could not answer, a node served bad bytes and another owner may
+/// not, a stale map, an object a write will heal), else [`ClosureError::Invalid`], since an
+/// error that repeats (the store's records disagree, a malformed request, an action-cache
+/// refusal) must not be retried as if it were transient.
+fn store_fault(what: &'static str, digest: &Digest, error: &StorageError) -> ClosureError {
+    match error {
+        StorageError::Unavailable(_)
+        | StorageError::Corrupt { .. }
+        | StorageError::StaleMap { .. }
+        | StorageError::Unreachable(_) => ClosureError::Unavailable {
+            digest: *digest,
+            why: error.to_string(),
+        },
+        _ => ClosureError::Invalid {
+            what,
+            digest: *digest,
+            why: format!("the store refused it: {error}"),
+        },
+    }
 }
 
 /// Checks that the store holds the Command and every file; the empty blob is always held.
@@ -304,10 +323,7 @@ async fn require_held(
         backend
             .find_missing(chunk)
             .await
-            .map_err(|error| ClosureError::Unavailable {
-                digest: chunk[0],
-                why: error.to_string(),
-            })
+            .map_err(|error| store_fault("a blob of the inputs", &chunk[0], &error))
     });
     let answers: Vec<Vec<Digest>> = stream::iter(asks)
         .buffered(ASKS_IN_FLIGHT)
