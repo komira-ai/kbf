@@ -29,11 +29,12 @@ use tonic::Status;
 use super::adapter::{KbfAdapter, Wall, wire_lease};
 use super::ext::KbfExt;
 use super::host::{Caller, Connection};
-use crate::action_usage::Shapes;
+use crate::action_usage::{Measured, Shapes};
 use crate::answer;
 use crate::farm::Reported;
 use crate::farm::durable::{named, subject};
 use crate::machine::{Platform, Sent, parse_stored_name, stored_name};
+use crate::run_record;
 use crate::stamp::Stamp;
 
 /// `reported` as the core takes a `Hello`: the protocol version it names is the stream's
@@ -56,7 +57,11 @@ pub fn register(
     reported: Reported,
     connection: Connection,
 ) -> Result<Stream, Denied> {
-    let open = |adapter: &mut KbfAdapter, stream| adapter.attach(worker, stream, connection);
+    let noted = reported.clone();
+    let open = |adapter: &mut KbfAdapter, stream| {
+        adapter.attach(worker, stream, connection);
+        adapter.note_registered(worker, &noted);
+    };
     core.register(
         now,
         worker,
@@ -78,7 +83,9 @@ pub fn resize(
     stream: Stream,
     reported: Reported,
 ) -> Result<(), Denied> {
-    core.resize(now, worker, stream, core_reported(reported), |_| {})
+    let caps = reported.caps.clone();
+    let update = |adapter: &mut KbfAdapter| adapter.note_resized(worker, &caps);
+    core.resize(now, worker, stream, core_reported(reported), update)
 }
 
 /// The refusal of a request the core did not queue, as the front is told it.
@@ -243,7 +250,12 @@ pub async fn report(
     };
     // The lease id is this process's, so the run it reports was started for this
     // operation; a daemon that says it ran another action is refused all the same.
-    let sent = core.with(|view, adapter| adapter.sent(view, operation, lease));
+    let (sent, recorded) = core.with(|view, adapter| {
+        (
+            adapter.sent(view, operation, lease),
+            adapter.is_recorded(operation),
+        )
+    });
     let Some(Sent { action, stamp, .. }) = sent else {
         return Ok(Some(refusal(wire, ResultAckReason::UnknownLease)));
     };
@@ -255,6 +267,13 @@ pub async fn report(
     }
     let read = || wall();
     let ran_on = (worker, stamp);
+    // Read before `outcome`, which drops a failed run's result. What the report measured
+    // is kept for the hooks around the feed (`action usage:` line, the invocation record).
+    let measured = Measured::of(&result);
+    let run = recorded.then(|| {
+        let usage = measured.as_ref().map(Measured::usage);
+        run_record::of(&result, usage, stamp, read())
+    });
     let (outcome, detail) = answer::outcome(cache, read, lease, ran_on, result).await;
     let report = Report {
         operation,
@@ -265,6 +284,7 @@ pub async fn report(
         if let Some(detail) = detail {
             adapter.park(lease, detail);
         }
+        adapter.stage_report(measured, run);
     };
     let taken = core.report(now(), worker, report, park).await;
     // None: the ack is sent when the store has taken the record, or never.

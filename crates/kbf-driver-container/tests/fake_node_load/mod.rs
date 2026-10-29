@@ -151,6 +151,8 @@ async fn a_lease_is_covered_from_the_second_reading_and_leaves_with_its_peak() {
             cpu_throttled_usec: Some(3),
             cpu_pressure_some_total_usec: Some(9),
             memory_active_file_bytes: 7,
+            lease_clocks: Vec::new(),
+            minutes: Vec::new(),
         }
     );
     assert!(sent.mono_usec > second.mono_usec);

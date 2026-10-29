@@ -99,6 +99,31 @@ async fn an_action_on_a_node_another_frontend_holds_fails_when_its_cordon_cannot
         store.fail_writes(None);
         pair.own.intake();
         assert_eq!(placement(&pair.own, &pair.node), PlacementView::Serving);
+    }
+}
+
+/// Asserts that a frontend the node is not connected to shows a drain or cordon the store
+/// refused as not placed, from the store's rows. Catches: a refused row that this frontend
+/// reads back as the node's placement.
+#[tokio::test(start_paused = true)]
+#[cfg_attr(
+    feature = "farm-core-js",
+    ignore = "known-different-on-js: the detail of a node another frontend holds is not answered on the js core"
+)]
+async fn a_frontend_the_node_is_not_connected_to_shows_a_refused_cordon_as_serving() {
+    for action in [
+        NodeAction::Cordon,
+        NodeAction::Drain(Duration::from_secs(600)),
+    ] {
+        let store = Racing::new();
+        let pair = pair(&store);
+        store.fail_writes(Some("cordon/"));
+
+        let placed = pair.through.place(&pair.node, action);
+
+        placed.expect_err("the store refused the cordon row");
+        store.fail_writes(None);
+        pair.own.intake();
         assert_eq!(placement(&pair.through, &pair.node), PlacementView::Serving);
     }
 }

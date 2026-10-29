@@ -66,7 +66,7 @@ impl Farm {
     /// settings.
     pub fn whole_view(&self) -> Option<WholeView> {
         js_arm!(self, views::whole_view());
-        self.whole_of(&self.lock().engine.sched)
+        whole_of(self.now(), &self.lock().engine.sched)
     }
 
     /// The queue and its whole-node view from one read of the scheduler, so the two agree.
@@ -74,33 +74,35 @@ impl Farm {
         js_arm!(self, views::queue_views());
         let state = self.lock();
         let sched = &state.engine.sched;
-        (sched.queue_snapshot(), self.whole_of(sched))
+        (sched.queue_snapshot(), whole_of(self.now(), sched))
     }
+}
 
-    fn whole_of(&self, sched: &Scheduler) -> Option<WholeView> {
-        let summary = sched.whole_summary()?;
-        let mut requests: Vec<WholeRequest> = sched
-            .queued()
-            .filter(|op| {
-                sched
-                    .request(*op)
-                    .is_some_and(|r| r.kind == LeaseKind::WholeMachine)
-            })
-            .filter_map(|operation| {
-                Some(WholeRequest {
-                    operation,
-                    key: sched.request(operation)?.key.clone(),
-                    state: sched.whole_state(operation)?,
-                })
-            })
-            .collect();
-        let total = requests.len();
-        requests.truncate(MAX_AVOIDED);
-        Some(WholeView {
-            now: self.now(),
-            summary,
-            requests,
-            total,
+/// The whole-node view of `sched` at farm time `now`; `None` unless the farm runs with
+/// whole-node settings. Both drivers of the farm read the queue through this.
+pub(super) fn whole_of(now: FarmTime, sched: &Scheduler) -> Option<WholeView> {
+    let summary = sched.whole_summary()?;
+    let mut requests: Vec<WholeRequest> = sched
+        .queued()
+        .filter(|op| {
+            sched
+                .request(*op)
+                .is_some_and(|r| r.kind == LeaseKind::WholeMachine)
         })
-    }
+        .filter_map(|operation| {
+            Some(WholeRequest {
+                operation,
+                key: sched.request(operation)?.key.clone(),
+                state: sched.whole_state(operation)?,
+            })
+        })
+        .collect();
+    let total = requests.len();
+    requests.truncate(MAX_AVOIDED);
+    Some(WholeView {
+        now,
+        summary,
+        requests,
+        total,
+    })
 }
