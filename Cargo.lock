@@ -2836,6 +2836,7 @@ dependencies = [
  "kbf-pack-index",
  "kbf-segments",
  "kbf-state",
+ "kbf-task-pack",
  "kbf-testkit",
  "kbf-types",
  "serde",
@@ -3206,6 +3207,18 @@ name = "kbf-store"
 version = "0.1.0"
 dependencies = [
  "kbf-raft",
+ "thiserror",
+]
+
+[[package]]
+name = "kbf-task-pack"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "kbf-segments",
+ "kbf-types",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
