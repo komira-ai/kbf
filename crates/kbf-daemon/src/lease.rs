@@ -52,7 +52,7 @@ pub(crate) type Done = (
 
 /// The leases a daemon is running.
 pub(crate) struct Leases {
-    runtimes: Runtimes,
+    pub(crate) runtimes: Runtimes,
     running: BTreeMap<LeaseId, Running>,
     /// Running leases being killed on the server's `Cancel`.
     cancelled: BTreeSet<LeaseId>,
@@ -114,10 +114,10 @@ impl Leases {
         let run = Arc::clone(&runtime);
         tokio::spawn(async move {
             let started = Instant::now();
-            let outcome = contained(run.as_ref(), id, work).await;
+            let mut outcome = contained(run.as_ref(), id, work).await;
             // An error carries no result, so no usage: the runtime is asked for it. An
             // out-of-memory kill (the lease's own limit, or the node's) is marked.
-            let usage = outcome.as_ref().err().and_then(|_| run.failed_usage(id));
+            let usage = crate::lease_peak::usage_with_peak(run.as_ref(), id, &mut outcome);
             let oom = matches!(
                 outcome,
                 Err(RuntimeError::OutOfMemory { .. } | RuntimeError::BusyNode(_))

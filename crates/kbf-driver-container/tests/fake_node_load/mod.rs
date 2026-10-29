@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use kbf_daemon::Runtime;
 use kbf_driver_container::{MonoClock, NodeLoad};
+use kbf_proto::worker;
 use kbf_types::{LeaseId, Resources};
 
 use crate::support::fake::{Fake, image};
@@ -41,15 +42,22 @@ fn replace(dir: &Path, file: &str, text: &str) {
 /// test makes; the clock moves by ten on every call and counts its calls, so the reading
 /// that first holds the lease is the one that read the lease's `cpu.stat` too. The lease
 /// is not covered at that reading, is at the next, and is not after the run; its peak is
-/// handed over once.
+/// handed over once. Also catches the reading a heartbeat carries losing, swapping or
+/// misnaming a field: a reading through the driver's `Runtime` hook while the lease runs
+/// must hold every value of the actions cgroup's files and the covered lease.
 #[tokio::test]
 async fn a_lease_is_covered_from_the_second_reading_and_leaves_with_its_peak() {
     let fake = Fake::new("node-load-hooks");
     let actions = fake.cgroup.join("actions");
     for (file, text) in [
-        ("cpu.stat", "usage_usec 0\n"),
+        ("cpu.stat", "usage_usec 0\nthrottled_usec 3\n"),
         ("memory.current", "1000\n"),
-        ("memory.stat", "inactive_file 0\n"),
+        ("memory.stat", "inactive_file 0\nactive_file 7\n"),
+        ("cpu.max", "200000 100000\n"),
+        (
+            "cpu.pressure",
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=9\n",
+        ),
     ] {
         replace(&actions, file, text);
     }
@@ -107,11 +115,17 @@ async fn a_lease_is_covered_from_the_second_reading_and_leaves_with_its_peak() {
         );
         replace(&cgroup, "cpu.stat", "usage_usec 5000000\n");
         let second = runtime.node_load().await.expect("the second reading");
+        // The reading as a heartbeat carries it, through the driver's `Runtime` hook.
+        let sent = Runtime::node_load(&runtime)
+            .await
+            .expect("a heartbeat reading")
+            .expect("the container driver has a reading");
         std::fs::write(cgroup.join("release"), "").expect("release the action");
-        (first, second)
+        (first, second, sent)
     };
     let run = runtime.run(work(1, digest, Resources::new(2000, 1 << 30)));
-    let (outcome, (first, second)): (_, (NodeLoad, NodeLoad)) = tokio::join!(run, readings);
+    let (outcome, (first, second, sent)): (_, (NodeLoad, NodeLoad, worker::NodeLoad)) =
+        tokio::join!(run, readings);
     outcome.expect("ran");
     fake.assert_clean(1);
 
@@ -124,6 +138,22 @@ async fn a_lease_is_covered_from_the_second_reading_and_leaves_with_its_peak() {
         second.covered.contains(&lease),
         "not covered at the second reading: {second:?}"
     );
+
+    assert_eq!(
+        sent,
+        worker::NodeLoad {
+            seq: second.seq + 1,
+            mono_usec: sent.mono_usec,
+            cpu_usage_usec: 0,
+            memory_working_set_bytes: 1000,
+            covered: vec![worker::LeaseId { term: 1, seq: 1 }],
+            actions_cpu_limited: true,
+            cpu_throttled_usec: Some(3),
+            cpu_pressure_some_total_usec: Some(9),
+            memory_active_file_bytes: 7,
+        }
+    );
+    assert!(sent.mono_usec > second.mono_usec);
 
     let after = runtime.node_load().await.expect("a reading after the run");
     assert!(
