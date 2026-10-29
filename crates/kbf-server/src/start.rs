@@ -305,7 +305,6 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
-    tracing::info!("{}", args.scheduler_core.start_line());
     args.retired_release.warn();
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
