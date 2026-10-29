@@ -194,3 +194,33 @@ fn a_name_under_the_prefix_that_is_not_a_valid_name_is_refused() {
         assert_eq!(listed, Err(OUT_OF_SCOPE), "list {name:?}");
     }
 }
+
+/// Asserts the second guard on the keys of the proxy: the check of a call, given a reserved
+/// prefix directly (as a grant built another way than `GcKey::new`, which refuses one, would
+/// have), refuses a delete of a key under it and a list of it.
+#[test]
+fn the_keys_of_the_proxy_are_refused_even_under_a_reserved_prefix() {
+    for prefix in ["_journal/", "_tiering/"] {
+        let (parts, ()) = Request::builder()
+            .method("DELETE")
+            .uri("/b/k")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let target = Target::Object(format!("{prefix}p1/0001"));
+        let query = Query::parse(None).unwrap();
+        let deleted = permit(prefix, &parts, &target, &query);
+        assert_eq!(deleted, Err(OUT_OF_SCOPE), "delete under {prefix}");
+        let (parts, ()) = Request::builder()
+            .method("GET")
+            .uri("/b")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let encoded = prefix.replace('/', "%2F");
+        let listing = format!("list-type=2&prefix={encoded}");
+        let query = Query::parse(Some(&listing)).unwrap();
+        let listed = permit(prefix, &parts, &Target::Bucket, &query);
+        assert_eq!(listed, Err(OUT_OF_SCOPE), "list of {prefix}");
+    }
+}

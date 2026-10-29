@@ -38,6 +38,8 @@ use hyper::Method;
 use hyper::http::request::Parts;
 use serde::Deserialize;
 
+use crate::journal::is_reserved;
+
 use super::ServerConfig;
 use super::auth::Refusal;
 use super::keys::{AccessKey, read_private_text};
@@ -178,18 +180,20 @@ pub(super) fn permit(
     target: &Target,
     query: &Query,
 ) -> Result<(), Refusal> {
-    // A name that starts with the prefix of a key is never one of the proxy's: the prefix of a key
-    // is neither under `_journal/` or `_tiering/` nor a prefix of either (`GcKey::new`).
+    // `GcKey::new` also refuses a prefix that is, or covers, `_journal/` or `_tiering/`, so a name
+    // under the prefix of a key is never one of the proxy's; the check of reserved names here is the
+    // second guard, for a caller that builds its prefix another way.
     let inside = |name: &str| {
         let longer = name.len() > prefix.len() && name.starts_with(prefix);
-        if longer && check_name(name).is_ok() {
+        if longer && !is_reserved(name) && check_name(name).is_ok() {
             Ok(())
         } else {
             Err(OUT_OF_SCOPE)
         }
     };
     let within = |listed: &str| {
-        if listed.starts_with(prefix) && check_name(listed).is_ok() {
+        let reserved = is_reserved(listed);
+        if listed.starts_with(prefix) && !reserved && check_name(listed).is_ok() {
             Ok(())
         } else {
             Err(OUT_OF_SCOPE)
