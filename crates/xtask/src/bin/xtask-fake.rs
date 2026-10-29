@@ -69,8 +69,8 @@
 //!   `gh-calls` next to it, and answers `{"number": 42, "html_url": ...}`. It reads the
 //!   body from stdin only with `--input -` on its arguments, as `gh` does: a call without
 //!   one is sent with no body and refused with HTTP 422, as GitHub refuses an issue with
-//!   no title. With `gh-fault` next to it holding `empty-reply`, it answers a write with
-//!   nothing at all (an HTTP 204), and with `fail-write` it refuses a write with HTTP 404.
+//!   no title (a POST to a path ending in `/cancel` needs none). With `gh-fault` next to it holding `empty-reply`, it answers a write with
+//!   nothing at all (an HTTP 204), and with `fail-write` it refuses a write with HTTP 404, and with `conflict` with HTTP 409.
 //! - Run as `gh release create|upload <tag> <files> --repo <repo> ...`, it copies each
 //!   file into `releases/<tag>/` next to it (create makes that directory and fails if
 //!   it exists; a file already there fails the command, as GitHub refuses an asset
@@ -628,11 +628,15 @@ fn issues_write(dir: &Path, args: &[String]) -> ExitCode {
         .open(dir.join("gh-calls"))
         .expect("gh-calls");
     writeln!(log, "{}", serde_json::json!({ "args": args, "body": body })).expect("gh-calls");
-    if body.is_null() {
+    if body.is_null() && !args[3].ends_with("/cancel") {
         eprintln!("gh: Validation Failed (HTTP 422)");
         return ExitCode::FAILURE;
     }
     let fault = std::fs::read_to_string(dir.join("gh-fault")).unwrap_or_default();
+    if fault == "conflict" {
+        eprintln!("gh: Conflict (HTTP 409)");
+        return ExitCode::FAILURE;
+    }
     if fault == "fail-write" {
         eprintln!("gh: Not Found (HTTP 404)");
         return ExitCode::FAILURE;

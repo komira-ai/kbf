@@ -243,6 +243,22 @@ impl Farm {
         )
     }
 
+    /// [`Farm::new`] on the legacy core whatever core [`crate::SchedulerCore::under_test`] names:
+    /// for the tests of the legacy engine, which reach its state (`lock`, `state_mut`).
+    #[cfg(test)]
+    pub(crate) fn new_legacy(
+        cache: impl Into<Backend>,
+        unservable_wait: Duration,
+        finished_retention: Duration,
+    ) -> Self {
+        Self::on_core(
+            crate::SchedulerCore::Legacy,
+            cache.into(),
+            unservable_wait,
+            finished_retention,
+        )
+    }
+
     /// [`Farm::new`] on `core`.
     #[cfg_attr(not(feature = "farm-core-js"), allow(unused_variables))]
     pub(crate) fn on_core(
