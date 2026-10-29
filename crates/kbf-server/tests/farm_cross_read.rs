@@ -731,7 +731,11 @@ async fn a_js_farm_takes_over_the_store_a_legacy_farm_left_mid_flight(backing: B
         left.costs
     );
     assert_eq!(left.costs.len(), 2);
-    take_over(SchedulerCore::Js, &disk, &left, Reason::Duplicate).await;
+    // Neither core remembers a lease that ended before its process started (the legacy core
+    // keeps the answered ones in memory, the js core in its recovered state), so a replay after
+    // any restart, legacy to legacy included, is an unknown lease and not a duplicate. The
+    // daemon logs a warning and drops the Result; nobody is answered twice.
+    take_over(SchedulerCore::Js, &disk, &left, Reason::UnknownLease).await;
 }
 
 /// The rollback: a js farm leaves the same work, its lease rows carrying the cost
