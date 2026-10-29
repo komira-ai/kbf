@@ -362,10 +362,10 @@ fn a_figure_the_run_did_not_measure_is_not_counted() {
 }
 
 /// Catches a prediction compared with a run that says nothing about the operation's size:
-/// a run under a second, a failure, a report the scheduler did not take, and a kill (which
-/// is requeued, so the operation's prediction waits for its next run).
+/// a run under a second, a failure and a report the scheduler did not take count nothing;
+/// a kill (which is requeued) keeps the operation's prediction for its next run.
 #[test]
-fn a_run_that_is_no_sample_is_not_compared_and_leaves_the_prediction_for_the_next() {
+fn a_run_that_is_no_sample_is_not_compared() {
     let mut learned = learned(PlacementPredictions::Shadow);
     learned.to_set(OperationId(1), Some(figures()));
     report(&mut learned, 1, 1, run(999_999, Some(MIB), 1_000_000), true);
@@ -373,8 +373,51 @@ fn a_run_that_is_no_sample_is_not_compared_and_leaves_the_prediction_for_the_nex
         outcome: RunOutcome::Failed,
         ..taught()
     };
-    report(&mut learned, 2, 1, failed, true);
-    report(&mut learned, 3, 1, taught(), false);
+    learned.to_set(OperationId(2), Some(figures()));
+    report(&mut learned, 2, 2, failed, true);
+    learned.to_set(OperationId(3), Some(figures()));
+    report(&mut learned, 3, 3, taught(), false);
+    assert_eq!(vs_run(&learned), [[0; 3]; 3]);
+    assert_eq!(
+        learned.predictions_pending(),
+        1,
+        "only the report the scheduler did not take leaves its operation's prediction"
+    );
+}
+
+/// Catches the shadow's map filling with the predictions of operations that ended: every
+/// report the scheduler takes (a requeue is another path) frees its operation's entry,
+/// whether or not the run was a sample or a kill that ended the operation, so the map
+/// holds what is in flight.
+#[test]
+fn an_operation_that_ends_is_forgotten_whatever_its_run() {
+    let mut learned = learned(PlacementPredictions::Shadow);
+    let ends = [
+        run(999_999, Some(MIB), 1_000_000),
+        Run {
+            outcome: RunOutcome::Failed,
+            ..taught()
+        },
+        Run {
+            outcome: RunOutcome::OwnLimitKill,
+            ..taught()
+        },
+        taught(),
+    ];
+    for (n, ended) in (1..).zip(ends) {
+        learned.to_set(OperationId(n), Some(figures()));
+        assert_eq!(learned.predictions_pending(), 1, "run {n} is in flight");
+        report(&mut learned, n, n, ended, true);
+        assert_eq!(learned.predictions_pending(), 0, "run {n} ended");
+    }
+}
+
+/// Catches a killed run that drops its operation's prediction: the operation is requeued
+/// and its next run is compared with the prediction made at submit.
+#[test]
+fn a_killed_run_leaves_the_prediction_for_the_next() {
+    let mut learned = learned(PlacementPredictions::Shadow);
+    learned.to_set(OperationId(1), Some(figures()));
     let lease = LeaseId::new(1, 4);
     let killed = Run {
         outcome: RunOutcome::OwnLimitKill,
@@ -391,7 +434,6 @@ fn a_run_that_is_no_sample_is_not_compared_and_leaves_the_prediction_for_the_nex
     learned.requeued(lease, 8 * GIB, &bounds());
     assert_eq!(vs_run(&learned), [[0; 3]; 3]);
     assert_eq!(learned.predictions_pending(), 1);
-    // Its next run is compared with the prediction made at submit.
     report(&mut learned, 5, 1, taught(), true);
     assert_eq!(vs_run(&learned).iter().flatten().sum::<u64>(), 3);
     assert_eq!(learned.predictions_pending(), 0);
