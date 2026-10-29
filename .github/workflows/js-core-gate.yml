@@ -91,7 +91,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        load: [off, on]
+        include:
+          # `extra` is the leg's added kbf flag; the blocking leg adds none (a `run:` step
+          # may not hold a `||`, so the flag is chosen here and not in the step).
+          - load: off
+            extra: ''
+          - load: on
+            extra: --server-arg=--placement-load=on
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -146,7 +152,7 @@ jobs:
       - name: Wait for MinIO, then run the store conformance suite on it
         run: cargo run -p kbf-objstore --example s3_conformance --locked -- --endpoint http://127.0.0.1:9000 --bucket kbf-m1-conformance --create-bucket --conditional-put --wait-ready 60
       - name: M1 cell on kbf --mode=frontend with the js core, Bazel and buck2 twice each
-        run: target/debug/kbf-cell m1 --bin-dir target/debug --kbf-bin target/debug/kbf --projects crates/kbf-integration-test/m1 --work "$RUNNER_TEMP/m1" --s3-endpoint http://127.0.0.1:9000 --s3-bucket kbf-m1 --bazel "$RUNNER_TEMP/tools/bazel" --buck2 "$RUNNER_TEMP/tools/buck2" --server-arg=--scheduler-core=js --server-arg=--learned-sizes=shadow ${{ matrix.load == 'on' && '--server-arg=--placement-load=on' || '' }} --expect-scheduler-core js
+        run: target/debug/kbf-cell m1 --bin-dir target/debug --kbf-bin target/debug/kbf --projects crates/kbf-integration-test/m1 --work "$RUNNER_TEMP/m1" --s3-endpoint http://127.0.0.1:9000 --s3-bucket kbf-m1 --bazel "$RUNNER_TEMP/tools/bazel" --buck2 "$RUNNER_TEMP/tools/buck2" --server-arg=--scheduler-core=js --server-arg=--learned-sizes=shadow ${{ matrix.extra }} --expect-scheduler-core js
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
