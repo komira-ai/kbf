@@ -12,11 +12,11 @@ use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
-use kbf_pack::{PackKeys, TaskManifest, Timing, Usage, WriterKind, write_pack};
+use kbf_pack::{OutputDirectory, PackKeys, TaskManifest, Timing, Usage, WriterKind, write_pack};
 use kbf_pack_index::PackIndex;
 use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_proto::reapi::platform::Property;
-use kbf_proto::reapi::{self, Platform};
+use kbf_proto::reapi::{self, Directory, FileNode, Platform, Tree};
 use kbf_state::ManualClock;
 use kbf_types::DigestFunction;
 
@@ -24,6 +24,7 @@ use super::*;
 
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 const IMAGE: &str = "docker://registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const OTHER_IMAGE: &str = "docker://registry.test/other@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 const NOW: u64 = 1_790_000_040;
 
 thread_local! {
@@ -678,4 +679,128 @@ fn every_reason_of_the_frontend_is_the_executors_own() {
         let spelled = format!("{ours:?}").to_lowercase();
         assert_eq!(front.label().replace('_', ""), spelled);
     }
+}
+
+/// A manifest of an action that exited 0 with nothing to show, for the build `build`.
+fn manifest_of(build: &str, action: &Digest) -> TaskManifest {
+    TaskManifest {
+        lease: build.to_owned(),
+        action: super::cas_digest(action).expect("a digest"),
+        exit_code: 0,
+        stdout: None,
+        stderr: None,
+        output_files: Vec::new(),
+        output_directories: Vec::new(),
+        output_symlinks: Vec::new(),
+        timing: Timing::default(),
+        usage: Usage::default(),
+    }
+}
+
+/// Writes `pack` to the object store under `key`, as the task's `PUT` does.
+async fn put_pack(rig: &Rig, key: &PackKey, pack: Vec<u8>) {
+    let object = ObjectKey::new(key.as_str().to_owned()).expect("an object key");
+    rig.store
+        .put_new(&object, Bytes::from(pack), None)
+        .await
+        .expect("written");
+}
+
+/// Catches the executor's own caps not reaching the ingest (the ingest's defaults, 128 MiB and
+/// 64 MiB, would apply instead): a pack over the executor's `max_pack_bytes`, and one whose blob
+/// is over its `max_blob_bytes`, are refused as too large, and the same packs are taken under
+/// roomier caps, so the cap and nothing else is the reason.
+#[tokio::test]
+async fn a_pack_over_the_executors_caps_is_too_large() {
+    let rig = Rig::new(true);
+    let action = rig.action(|_| {}, |_| {}).await;
+
+    let small = write_pack(&manifest_of("7-3", &action), &[]).expect("a pack");
+    let key = issued(&rig, "7-3", &action);
+    put_pack(&rig, &key, small.clone()).await;
+    let capped = UntrustedLimits {
+        max_pack_bytes: small.len() as u64 - 1,
+        max_blob_bytes: 1 << 20,
+    };
+    let refused = rig.front.ingest(lease(), &key, &action, &capped).await;
+    assert!(
+        matches!(refused, Ingested::Reject(RejectReason::TooLarge)),
+        "{refused:?}"
+    );
+    let taken = rig.front.ingest(lease(), &key, &action, &limits()).await;
+    assert!(matches!(taken, Ingested::Ran { .. }), "{taken:?}");
+
+    let big = vec![b'b'; 4_000];
+    let mut manifest = manifest_of("7-4", &action);
+    manifest.stdout = Some(VerifiedBlob::hashed(Bytes::from(big.clone())).digest());
+    let heavy = write_pack(&manifest, &[&big]).expect("a pack");
+    let key = issued(&rig, "7-4", &action);
+    put_pack(&rig, &key, heavy).await;
+    let capped = UntrustedLimits {
+        max_pack_bytes: 1 << 20,
+        max_blob_bytes: 3_999,
+    };
+    let other = LeaseId::new(7, 4);
+    let refused = rig.front.ingest(other, &key, &action, &capped).await;
+    assert!(
+        matches!(refused, Ingested::Reject(RejectReason::TooLarge)),
+        "{refused:?}"
+    );
+    let taken = rig.front.ingest(other, &key, &action, &limits()).await;
+    assert!(matches!(taken, Ingested::Ran { .. }), "{taken:?}");
+}
+
+/// Catches the Command's platform winning over the Action's: when both name an image the
+/// Action's is the one (the frontend's own execution reads them in that order), so a client that
+/// sets both is run where the farm would run it.
+#[tokio::test]
+#[allow(deprecated)]
+async fn the_actions_platform_wins_over_the_commands() {
+    let rig = Rig::new(true);
+    let digest = rig
+        .action(
+            |action| action.platform = Some(platform(IMAGE)),
+            |command| command.platform = Some(platform(OTHER_IMAGE)),
+        )
+        .await;
+    let facts = rig.front.action(&digest).await.expect("facts");
+    assert_eq!(facts.image, IMAGE.trim_start_matches("docker://"));
+}
+
+/// Catches the ingest handed a backend that cannot read the packs (a tree that only the pack
+/// holds is then unavailable, and every task with an output directory is retried for ever): the
+/// pack of a task whose output directory's tree and file are in the pack alone is ingested into
+/// a result, and cached.
+#[tokio::test]
+async fn a_tree_that_only_the_pack_holds_is_read_through_the_same_packs() {
+    let rig = Rig::new(true);
+    let action = rig.action(|_| {}, |_| {}).await;
+    let file = b"a file inside the output directory".to_vec();
+    let file_digest = VerifiedBlob::hashed(Bytes::from(file.clone())).digest();
+    let tree = Tree {
+        root: Some(Directory {
+            files: vec![FileNode {
+                name: "f".to_owned(),
+                digest: Some(wire(&file_digest)),
+                ..FileNode::default()
+            }],
+            ..Directory::default()
+        }),
+        ..Tree::default()
+    };
+    let tree = prost::Message::encode_to_vec(&tree);
+    let mut manifest = manifest_of("7-3", &action);
+    manifest.output_directories = vec![OutputDirectory {
+        path: "out".to_owned(),
+        tree: VerifiedBlob::hashed(Bytes::from(tree.clone())).digest(),
+    }];
+    let pack = write_pack(&manifest, &[&tree, &file]).expect("a pack");
+    let key = issued(&rig, "7-3", &action);
+    put_pack(&rig, &key, pack).await;
+    let done = rig.front.ingest(lease(), &key, &action, &limits()).await;
+    let Ingested::Ran { result, cached } = done else {
+        panic!("not ingested: {done:?}");
+    };
+    assert_eq!(result.output_directories.len(), 1);
+    assert!(cached, "the result was not cached");
 }
