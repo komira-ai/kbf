@@ -341,9 +341,12 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = crate::LearnedSizes::Off)]
     pub learned_sizes: crate::LearnedSizes,
     /// Which core drives the farm's scheduling. `legacy`, the default, is the driver the
-    /// server has always had. `js` is not available in this release: a server given it
-    /// refuses to start (exit status 2) and says so. The core a server runs is logged at
-    /// start and exported as `kbf_scheduler_core{core}`, 1 for it and 0 for the other
+    /// server has always had. `js` runs the farm on the js scheduler core: it learns sizes in
+    /// `shadow` at most (`--learned-sizes on` with it is refused at start, exit status 2), and
+    /// it answers an operation by its `operations/<id>` name only. Either core reads the rows
+    /// the other wrote to the state store, so a restart with the other value takes them up.
+    /// The core a server runs is logged at start and exported as `kbf_scheduler_core{core}`,
+    /// 1 for it and 0 for the other
     // The text above states the default; the help golden cannot hold the whitespace-only
     // line clap prints before a `[default: ...]` line.
     #[arg(
@@ -769,14 +772,6 @@ pub enum ConfigError {
         #[source]
         source: PolicyError,
     },
-    /// `--scheduler-core` names a core this release does not have.
-    #[error(
-        "--scheduler-core {}: that core is not available yet in this release; run with \
-         --scheduler-core {} (the default)",
-        .0.name(),
-        crate::SchedulerCore::RUNNING.name()
-    )]
-    SchedulerCoreUnavailable(crate::SchedulerCore),
     /// `--placement-predictions shadow` or `on` with `--learned-sizes off`.
     #[error(
         "--placement-predictions {0} needs --learned-sizes shadow or on: with the estimator off \
@@ -805,18 +800,15 @@ pub enum ConfigError {
 }
 
 impl Args {
-    /// Refuses a `--scheduler-core` this release cannot run.
+    /// Refuses a combination of `--scheduler-core` and the flags that the core cannot run.
+    /// Both cores are built into every binary.
     ///
     /// # Errors
-    /// [`ConfigError::SchedulerCoreUnavailable`]: the core is `js`, in a build without it.
     /// [`ConfigError::LearnedSizesOnUnderJs`]: the core is `js` and `--learned-sizes` is `on`.
     pub fn check_scheduler_core(&self) -> Result<(), ConfigError> {
         let js = self.scheduler_core == crate::SchedulerCore::Js;
         if js && self.learned_sizes == crate::LearnedSizes::On {
             return Err(ConfigError::LearnedSizesOnUnderJs);
-        }
-        if !self.scheduler_core.available() {
-            return Err(ConfigError::SchedulerCoreUnavailable(self.scheduler_core));
         }
         Ok(())
     }
