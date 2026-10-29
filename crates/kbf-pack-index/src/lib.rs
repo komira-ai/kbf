@@ -262,11 +262,10 @@ impl NewPack {
                 "a blob reaches past the end of the pack",
             ));
         }
-        if blobs.iter().any(|blob| blob.digest.size == 0) {
-            return Err(PackIndexError::Invalid("a blob of no bytes"));
-        }
+        // A blob of no bytes shares none (the frontend's own packs hold the empty blob).
         let mut placed: Vec<(u64, u64)> = blobs
             .iter()
+            .filter(|blob| blob.digest.size > 0)
             .map(|blob| (blob.offset, blob.offset + blob.digest.size))
             .collect();
         placed.sort_unstable();

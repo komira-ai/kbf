@@ -123,17 +123,14 @@ fn the_index_refuses_overlapping_blobs() {
     assert!(recorded.created);
 }
 
-/// Asserts that the index refuses a blob of no bytes, alone and among others, with the reason and
-/// nothing recorded. Catches an index row whose range is empty, which a reader cannot fetch.
+/// Asserts that a blob of no bytes shares no bytes: the frontend's own packs hold the empty blob,
+/// so a pack with one, at the start, inside another blob or at the end, is recorded. Catches an
+/// overlap check that refuses the empty blob.
 #[test]
-fn the_index_refuses_a_blob_of_no_bytes() {
-    for pack in [
-        pack_of(&[(1, 0, 0)], 40),
-        pack_of(&[(1, 10, 0), (2, 0, 10)], 40),
-    ] {
-        let index = index();
-        let refused = index.record_pack(&pack).expect_err("refused");
-        assert_eq!(refused, PackIndexError::Invalid("a blob of no bytes"));
-        assert!(index.pack(&pack.key).expect("asked").is_none());
+fn a_blob_of_no_bytes_overlaps_nothing() {
+    for at in [0, 5, 10] {
+        let pack = pack_of(&[(1, 10, 0), (2, 0, at)], 40);
+        let recorded = index().record_pack(&pack).expect("recorded");
+        assert!(recorded.created, "at {at}");
     }
 }
