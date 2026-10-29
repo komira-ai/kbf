@@ -44,10 +44,22 @@ async fn an_http_listener_url_is_refused_at_start() {
         ("https://", "has no host"),
         ("https://:8443", "has no host"),
         ("https://[]:8443", "has no host"),
-        ("https://127.0.0.1:", "has a port that is not a number from 1 to 65535"),
-        ("https://127.0.0.1:0", "has a port that is not a number from 1 to 65535"),
-        ("https://127.0.0.1:65536", "has a port that is not a number from 1 to 65535"),
-        ("https://127.0.0.1:84x3", "has a port that is not a number from 1 to 65535"),
+        (
+            "https://127.0.0.1:",
+            "has a port that is not a number from 1 to 65535",
+        ),
+        (
+            "https://127.0.0.1:0",
+            "has a port that is not a number from 1 to 65535",
+        ),
+        (
+            "https://127.0.0.1:65536",
+            "has a port that is not a number from 1 to 65535",
+        ),
+        (
+            "https://127.0.0.1:84x3",
+            "has a port that is not a number from 1 to 65535",
+        ),
         ("https://[::1]x:8443", "has more than a host and a port"),
         (
             "https://127.0.0.1:8443/jobs",
@@ -92,7 +104,10 @@ async fn a_put_endpoint_that_is_not_http_or_https_host_is_refused_at_start() {
     let cases = [
         ("ftp://127.0.0.1:9000", "is not http or https"),
         ("http://:9000", "has no host"),
-        ("http://127.0.0.1:99999", "has a port that is not a number from 1 to 65535"),
+        (
+            "http://127.0.0.1:99999",
+            "has a port that is not a number from 1 to 65535",
+        ),
         ("127.0.0.1:9000", "is not of the form scheme://host[:port]"),
         (
             "http://127.0.0.1:9000/tiers",
