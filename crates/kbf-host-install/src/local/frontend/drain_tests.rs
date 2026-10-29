@@ -2,8 +2,9 @@
 //! unless a deadline is configured, a deadline that passes stops the switch without cutting
 //! anything, and the trial window starts after the new container does.
 
+use super::config::FrontendConfig;
 use super::fake::Source;
-use super::tests::{CONFIG, DRAIN, NEW, NEW_ID, OLD, OLD_ID, Rig, WINDOW, failed};
+use super::tests::{CONFIG, DRAIN, NEW, NEW_ID, OLD, OLD_ID, Rig, WINDOW, failed, refused};
 use crate::local::answer::{Answer, Code};
 use crate::local::backend::Backend;
 
@@ -120,4 +121,87 @@ api =",
     assert_eq!(rig.world.made().unwrap().image_id, OLD_ID);
     // The same configuration with the full window goes through.
     assert!(matches!(rig.switch(), Answer::Switched { .. }));
+}
+
+/// A drain request that fails, and a runtime that stops answering during the wait, both leave
+/// the old container running as it was, with its configured restart policy back, and nothing
+/// stopped, removed or recorded.
+#[test]
+fn a_failed_drain_leaves_the_old_container_running_with_its_policy() {
+    let steps = [
+        "fetch".to_owned(),
+        "load".to_owned(),
+        "set_restart:no".to_owned(),
+        DRAIN.to_owned(),
+        "set_restart:unless-stopped".to_owned(),
+    ];
+    let rig = Rig::new("drain-exec-fails");
+    rig.world.fail("exec");
+    assert!(failed(Code::SwitchFailed)(&rig.update()));
+    assert_eq!(rig.steps(), steps);
+    let made = rig.world.made().unwrap();
+    assert_eq!((made.image_id.as_str(), made.running), (OLD_ID, true));
+    assert_eq!(made.restart, "unless-stopped");
+    assert!(rig.record().pending.is_none());
+
+    let rig = Rig::new("drain-inspect-dies");
+    assert!(matches!(rig.install(), Answer::Staged { .. }));
+    {
+        let mut world = rig.world.0.borrow_mut();
+        world.inspects = 0;
+        world.inspect_fails_from = Some(3);
+        world.never_ends = true;
+    }
+    assert!(failed(Code::SwitchFailed)(&rig.switch()));
+    assert_eq!(rig.steps(), steps);
+    let made = rig.world.made().unwrap();
+    assert_eq!((made.image_id.as_str(), made.running), (OLD_ID, true));
+    assert_eq!(made.restart, "unless-stopped");
+    assert!(rig.record().pending.is_none());
+}
+
+/// A file with `drain_secs = 0`, which older programs accepted, does not stop the program from
+/// starting; the switch refuses it, naming the key, and touches nothing.
+#[test]
+fn a_zero_drain_secs_is_refused_by_the_switch_not_at_start() {
+    let rig = Rig::new("drain-zero");
+    assert!(matches!(rig.install(), Answer::Staged { .. }));
+    // The file is edited after the release was laid out.
+    super::tests::put(
+        &rig.config_path(),
+        &CONFIG.replace("api =", "drain_secs = 0\napi ="),
+    );
+    assert!(refused(Code::ConfigInvalid)(&rig.switch()));
+    let fault = rig.backend().switch(NEW, WINDOW, 1000).unwrap_err();
+    assert!(fault.detail.contains("drain_secs"), "{fault:?}");
+    assert_eq!(rig.world.made().unwrap().image_id, OLD_ID);
+    assert!(!rig.steps().contains(&"set_restart:no".to_owned()));
+    // The start-up reading of the same file accepts it.
+    let trust = rig.backend().host.trust.clone();
+    let loaded = FrontendConfig::load_for_start(&trust, &rig.config_path()).unwrap();
+    assert_eq!(loaded.drain_secs, Some(0));
+}
+
+/// A program that crashed in the middle of a drain (policy off, no marker) puts the configured
+/// policy back when it starts; with the policy as it should be, or a release on trial, it
+/// touches nothing.
+#[test]
+fn a_restart_policy_left_off_by_a_cut_short_drain_is_put_back_at_start() {
+    let rig = Rig::new("recover");
+    let backend = rig.backend();
+    assert_eq!(backend.recover_restart_policy(), Ok(None));
+    assert!(rig.steps().is_empty());
+
+    rig.world.0.borrow_mut().container.as_mut().unwrap().restart = "no".to_owned();
+    let said = backend.recover_restart_policy().unwrap().unwrap();
+    assert!(said.contains("unless-stopped"), "{said}");
+    assert_eq!(rig.steps(), ["set_restart:unless-stopped".to_owned()]);
+    assert_eq!(rig.world.made().unwrap().restart, "unless-stopped");
+
+    // A release on trial: the revert path owns the container.
+    assert!(matches!(rig.update(), Answer::Switched { .. }));
+    rig.world.0.borrow_mut().container.as_mut().unwrap().restart = "no".to_owned();
+    let before = rig.steps().len();
+    assert_eq!(backend.recover_restart_policy(), Ok(None));
+    assert_eq!(rig.steps().len(), before);
 }

@@ -216,6 +216,7 @@ impl Runtime for World {
             image_id: c.image_id.clone(),
             image_ref: c.image_ref.clone(),
             running: c.running,
+            restart: c.restart.clone(),
         }))
     }
 

@@ -760,7 +760,7 @@ container ([the example](../../packaging/host-agent/linux/host-install-frontend.
 | `api` | where this host reaches the frontend's operator API (a published port, or the host's own listen address under `network = "host"`), for `/readyz` and `/healthz` |
 | `drain_token_file` | the operator token as a path **inside** the container |
 | `peers` | optional: the other frontends' operator APIs this host can reach |
-| `drain_secs` | optional, at least 1, no upper limit. Left out (the default), a switch waits for the old container to end however long its builds take. Set, it is how long the switch waits before it gives up; it never stops, removes or replaces a container that still runs |
+| `drain_secs` | optional, at least 1, no upper limit. Left out (the default), a switch waits for the old container to end however long its builds take. Set, it is how long the switch waits before it gives up; it never stops, removes or replaces a container that still runs. Keep it below about 9 minutes, or expect the updater (whose switch call is limited to 10 minutes) to report the host Unreachable during a longer drain while the switch completes. A file with `drain_secs = 0` still starts the helper; the switch refuses it (`config_invalid`) |
 | `ready_secs` | optional (default 90, 10 to 600): how long a new container has to be ready |
 
 `group_add` is written into the record only when it is set, so that a host that sets none writes
@@ -810,7 +810,9 @@ release that fails the check changes nothing: nothing is loaded and nothing is s
    commit.
 
 A failure before step 5 (the drain request fails, the runtime stops answering) leaves the old
-container as it is and puts its restart policy back. When a step from 5 on fails, the container is removed and made again from the **old** image id with the
+container as it is and puts its restart policy back. If the helper itself dies during the drain, the
+policy is left off; when the helper starts and finds no marker and a container whose policy is
+off, it sets the configured policy back and logs it. When a step from 5 on fails, the container is removed and made again from the **old** image id with the
 same configuration, waited for the same way (on the old commit), the marker is cleared, and the
 switch answers `failed` (`switch_failed`). If the old container cannot be made again either,
 the answer is `revert_failed` and the marker stays: the deadline, or a `revert`, tries again.

@@ -231,6 +231,23 @@ impl FrontendConfig {
     /// # Errors
     /// Why it is not a usable file.
     pub fn parse(text: &str) -> Result<Self, String> {
+        Self::parse_with(text, true)
+    }
+
+    /// Like [`FrontendConfig::load`], for the start of the program: a `drain_secs` of 0, which
+    /// older programs accepted, is let through, so that an upgrade does not stop the program
+    /// from starting. The switch reads the file with [`FrontendConfig::load`] and refuses it.
+    ///
+    /// # Errors
+    /// As [`FrontendConfig::load`], but for `drain_secs = 0`.
+    pub fn load_for_start(trust: &Trust, path: &Path) -> Result<Self, String> {
+        let text = trust
+            .read(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Self::parse_with(&text, false).map_err(|why| format!("{}: {why}", path.display()))
+    }
+
+    fn parse_with(text: &str, strict: bool) -> Result<Self, String> {
         let file: File = toml::from_str(text).map_err(|e| e.message().to_owned())?;
         let entry = file.frontend;
         let group_add = entry
@@ -252,7 +269,7 @@ impl FrontendConfig {
         if !entry.drain_token_file.starts_with('/') || !plain(&entry.drain_token_file) {
             return Err("drain_token_file is not an absolute path".to_owned());
         }
-        if entry.drain_secs == Some(0) {
+        if strict && entry.drain_secs == Some(0) {
             return Err("drain_secs is 0; leave it out to wait for the drain".to_owned());
         }
         let drain_secs = entry.drain_secs;

@@ -321,6 +321,39 @@ impl<S: ImageSource, R: Runtime, P: Probe> Frontend<S, R, P> {
         Ok(deadline)
     }
 
+    /// At the start of the program: a drain that was cut short by a crash of the program (after
+    /// the restart policy was switched off, before the marker) leaves the old container with no
+    /// policy, and with nothing to say so; if it later exits, no frontend runs. With no release
+    /// on trial and the container's policy off, the configured policy is put back.
+    ///
+    /// Chosen over a "draining" marker because the state is already in the container (nothing
+    /// else turns its policy off outside a switch, and a switch in progress holds a marker
+    /// from the moment the container has ended), so it needs no new record field and cannot go
+    /// stale.
+    ///
+    /// # Errors
+    /// The file, the record or the runtime could not be read, or the policy not set.
+    pub fn recover_restart_policy(&self) -> Result<Option<String>, String> {
+        if self.record().map_err(|f| f.detail)?.pending.is_some() {
+            return Ok(None);
+        }
+        let config = FrontendConfig::load_for_start(&self.host.trust, &self.config_file)?;
+        let name = &config.run.name;
+        let Some(container) = self.runtime.container(name).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        if !matches!(container.restart.as_str(), "" | "no") {
+            return Ok(None);
+        }
+        self.runtime
+            .set_restart(name, &config.run.restart)
+            .map_err(|e| e.to_string())?;
+        Ok(Some(format!(
+            "the restart policy of {name} was off with no switch under way (a drain cut short); set back to {}",
+            config.run.restart
+        )))
+    }
+
     /// The container is the old release's again, from its image and the configuration of the
     /// switch, and ready.
     fn restore(&self, trial: &Trial) -> Result<(), String> {
