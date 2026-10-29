@@ -128,7 +128,7 @@ pub(crate) async fn report(
     let _taking = Taking::of(&js.reports);
     let ambient = js.ambient;
     let wall: Wall = Arc::new(move || ambient.wall());
-    let ack = dispatch::report(&js.core, &js.cache, &wall, || js.now(), worker, result)
+    let ack = dispatch::report(&js.core, &js.cache, &wall, &|| js.now(), worker, result)
         .await
         .ok()
         .flatten()?;

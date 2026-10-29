@@ -231,7 +231,7 @@ pub async fn report(
     core: &Core<KbfAdapter>,
     cache: &Backend,
     wall: &Wall,
-    now: impl Fn() -> FarmTime,
+    now: &(dyn Fn() -> FarmTime + Sync),
     worker: &WorkerId,
     result: worker::Result,
 ) -> Result<Option<ResultAck>, Denied> {
