@@ -402,9 +402,9 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
     repeat of (lease, minute) and the first one stays. Across heartbeats, a receiver merges by
     (lease, minute) with the larger value of each field: a minute sent again (a heartbeat not
     acknowledged before its stream ended) is harmless, and so is every later fold into minute 63.
-    The minute's peak window is taken on the
-    reading's clock; the `peak_window_millicores` of a lease's usage record is taken on the lease's
-    own clock reads, so the two may differ in the last digits.
+    The minute's peak window is taken on the reading's clock; the `peak_window_millicores` of a
+    lease's usage record is taken on the lease's own clock reads, so the two may differ in the last
+    digits.
   - `covered` is capped like `lease_clocks`: at most 96, in the order of `lease_clocks`.
 
   Caps and rules equal the job scheduler agent's (96 leases, 64 minutes, minute 63, working set at
