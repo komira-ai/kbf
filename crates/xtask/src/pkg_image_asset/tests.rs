@@ -657,3 +657,83 @@ fn each_image_is_refused_as_the_other_and_a_coordinator_without_a_file_is_checke
         1
     );
 }
+
+/// A task image: the program at its own path, its own entrypoint.
+fn task() -> Fix {
+    let mut fix = Fix::new();
+    fix.kbf = b"\x7fELF the kbf-task built for the commit".to_vec();
+    fix.program = "usr/bin/kbf-task";
+    fix.entrypoint = vec!["/usr/bin/kbf-task"];
+    fix
+}
+
+/// The problems of `fix` as the task image for arm64, held to `reference` when given.
+fn task_problems(name: &str, fix: &Fix, reference: Option<&[u8]>) -> Vec<String> {
+    let dir = scratch(name);
+    let binary = dir.join("kbf-task");
+    std::fs::write(&binary, reference.unwrap_or_default()).expect("binary");
+    let c = Check {
+        image: Image::Task,
+        platform: Platform::LinuxX86_64,
+        reference: reference.map(|_| Reference::Binary(&binary)),
+    };
+    problems(&fix.image(), &c).expect("problems")
+}
+
+/// Asserts that a task image holding the built `kbf-task`, run as a non-root user with the
+/// task entrypoint, is accepted and written as `kbf-task-image-<commit>-<platform>.oci.tar`
+/// with its line in the sums, that other bytes, root or another entrypoint are refused, that
+/// a coordinator image is not a task image, and that with no reference only the structure is
+/// checked.
+#[test]
+fn a_task_image_of_the_built_binary_is_accepted_and_another_is_refused() {
+    let fix = task();
+    let dir = scratch("task-good");
+    let binary = dir.join("kbf-task");
+    std::fs::write(&binary, &fix.kbf).expect("binary");
+    let image = dir.join("image.oci.tar");
+    std::fs::write(&image, fix.image()).expect("image");
+    let c = Check {
+        image: Image::Task,
+        platform: Platform::LinuxX86_64,
+        reference: Some(Reference::Binary(&binary)),
+    };
+    let out = dir.join("dist");
+    let printed = asset(&image, COMMIT, &Mode::Add(&out), &c).expect("asset");
+    let name = format!("kbf-task-image-{COMMIT}-linux-x86_64.oci.tar");
+    assert_eq!(
+        std::fs::read(out.join(&name)).expect("asset"),
+        std::fs::read(&image).expect("image")
+    );
+    assert_eq!(printed.first(), Some(&format!("packaged {name}:")));
+    assert_eq!(Image::named("kbf-task-image"), Some(Image::Task));
+
+    let good = fix.kbf.clone();
+    assert!(task_problems("task-ok", &fix, Some(&good)).is_empty());
+    assert!(task_problems("task-alone", &fix, None).is_empty());
+
+    let mut other = task();
+    other.kbf = b"\x7fELF another".to_vec();
+    let got = task_problems("task-differs", &other, Some(&good));
+    assert!(
+        got.len() == 1 && got[0].contains("is not the built kbf-task"),
+        "{got:?}"
+    );
+    let mut root = task();
+    root.user = "root";
+    assert_eq!(task_problems("task-root", &root, Some(&good)).len(), 1);
+    let mut wrong = task();
+    wrong.entrypoint = vec!["/usr/bin/kbf-coordinator"];
+    let got = task_problems("task-entry", &wrong, Some(&good));
+    assert!(
+        got.contains(
+            &"entrypoint is [\"/usr/bin/kbf-coordinator\"], not [\"/usr/bin/kbf-task\"]".to_owned()
+        ),
+        "{got:?}"
+    );
+    let got = task_problems("coordinator-as-task", &coordinator(), None);
+    assert!(
+        got.contains(&"holds no usr/bin/kbf-task".to_owned()),
+        "{got:?}"
+    );
+}

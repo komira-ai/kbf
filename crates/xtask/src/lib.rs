@@ -52,9 +52,9 @@
 //!   attested tarball, it replaces and breaks the old `kbf-installer`, it holds the units
 //!   of the modes, the slice, the sysusers and tmpfiles files, the drop-in and a trust
 //!   directory that trusts the branch it is attested for, and nothing else.
-//! - `pkg-image-asset` ([`pkg_image_asset`]): the frontend or coordinator OCI image tarball as the
+//! - `pkg-image-asset` ([`pkg_image_asset`]): the frontend, coordinator or task OCI image tarball as the
 //!   release asset `kbf-<service>-image-<commit>-<platform>.oci.tar`, refused unless its program
-//!   is the attested `kbf` (frontend) or the built `kbf-coordinator`, it runs as a user that is
+//!   is the attested `kbf` (frontend) or the built `kbf-coordinator` or `kbf-task`, it runs as a user that is
 //!   not root with the service's entrypoint, and it is built for the platform.
 //! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf` package
 //!   carries, in the one form a deb and an rpm put in the same order, and the most a package
@@ -389,8 +389,8 @@ enum Verb {
         #[arg(long)]
         verify_only: bool,
     },
-    /// The frontend or coordinator OCI image tarball as a release asset, refused unless its
-    /// program is the attested `kbf` (or the built `kbf-coordinator`), its entrypoint is the
+    /// The frontend, coordinator or task OCI image tarball as a release asset, refused unless its
+    /// program is the attested `kbf` (or the built `kbf-coordinator` or `kbf-task`), its entrypoint is the
     /// service's, it runs as a user that is not root and it is built for the platform.
     PkgImageAsset {
         /// The image tarball `docker buildx build --output type=docker,oci-mediatypes=true` wrote (with
@@ -409,7 +409,7 @@ enum Verb {
         /// The frontend's `kbf-<commit>-<platform>.tar.gz` whose `kbf` the image must hold.
         #[arg(long, conflicts_with = "binary")]
         kbf_tarball: Option<PathBuf>,
-        /// The coordinator's `kbf-coordinator` the image must hold (it has no tarball; not
+        /// The `kbf-coordinator` or `kbf-task` the image must hold (it has no tarball; not
         /// with `--verify-only`, where the build's file is not at hand).
         #[arg(long, conflicts_with = "verify_only")]
         binary: Option<PathBuf>,
@@ -900,7 +900,7 @@ fn source_date_epoch(root: &Path, commit: &str, output: &Path) -> Result<String,
 }
 
 /// What the image of `service` must hold, from the flags: the frontend wants `--kbf-tarball`
-/// always, the coordinator wants `--binary` unless only verifying.
+/// always, the coordinator and the task image want `--binary` unless only verifying.
 fn image_reference<'a>(
     service: pkg_image_asset::Image,
     tarball: Option<&'a Path>,
@@ -910,13 +910,18 @@ fn image_reference<'a>(
     use pkg_image_asset::{Image, Reference};
     match (service, tarball, binary, verify_only) {
         (Image::Frontend, Some(t), None, _) => Ok(Some(Reference::KbfTarball(t))),
-        (Image::Coordinator, None, Some(b), false) => Ok(Some(Reference::Binary(b))),
-        (Image::Coordinator, None, None, true) => Ok(None),
+        (Image::Coordinator | Image::Task, None, Some(b), false) => Ok(Some(Reference::Binary(b))),
+        (Image::Coordinator | Image::Task, None, None, true) => Ok(None),
         (Image::Frontend, ..) => Err(Error::Failed(
             "the frontend image is checked against --kbf-tarball, and only that".to_owned(),
         )),
         (Image::Coordinator, ..) => Err(Error::Failed(
             "the coordinator image is checked against --binary (not with --verify-only, \
+             which makes the other checks alone)"
+                .to_owned(),
+        )),
+        (Image::Task, ..) => Err(Error::Failed(
+            "the task image is checked against --binary (not with --verify-only, \
              which makes the other checks alone)"
                 .to_owned(),
         )),
