@@ -106,6 +106,7 @@ pub(crate) fn put(path: &Path, text: impl AsRef<str>) {
 pub(crate) fn exec(code: i32, stdout: &str, stderr: &str) -> io::Result<Exec> {
     Ok(Exec {
         code: Some(code),
+        signal: None,
         stdout: stdout.into(),
         stderr: stderr.into(),
     })
