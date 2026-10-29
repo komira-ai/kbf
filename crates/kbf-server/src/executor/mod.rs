@@ -27,6 +27,10 @@ mod runs;
 mod task;
 mod traits;
 
+#[cfg(test)]
+#[path = "support_tests.rs"]
+mod test_support;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -134,6 +138,13 @@ pub(crate) fn lease_gone(error: &Error) -> bool {
     ]
     .iter()
     .any(|code| error.is(code))
+}
+
+/// Logs, once and in one place, that a call to the lease server failed and the caller goes on.
+pub(crate) fn note<T>(what: &str, answer: &Result<T, Error>) {
+    if let Err(error) = answer {
+        tracing::warn!(%error, "{what} failed");
+    }
 }
 
 /// A held host, as an operator or a test looks at it.

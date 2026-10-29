@@ -60,3 +60,104 @@ fn what_could_not_be_read_is_classed_by_whose_fault_it_is() {
     );
     let _ = ErrorCode::NoCapacity;
 }
+
+mod worker {
+    use std::collections::BTreeMap;
+
+    use kbf_lease_client::{RunLimits, RunSpec};
+    use kbf_types::LeaseId;
+    use tokio::time::Instant;
+
+    use super::super::{Queued, Running, Stage, Task, reporting};
+    use crate::executor::outcome::{Settled, result_of};
+    use crate::executor::task::{Nonce, PackKey};
+    use crate::executor::test_support::{GIB, Harness, start};
+
+    fn pinned_spec(label: &str) -> RunSpec {
+        let mut spec = RunSpec::new(
+            format!("registry.test/app@sha256:{}", "ab".repeat(32)),
+            RunLimits {
+                cpu_millis: 1_000,
+                memory_bytes: 2 * GIB,
+                pids: None,
+                wall_ms: Some(60_000),
+            },
+        );
+        spec.labels = BTreeMap::from([(super::super::RUN_LABEL.to_owned(), label.to_owned())]);
+        spec
+    }
+
+    /// Catches a post whose answer was lost, whose run is on the list, being given up on (the
+    /// lease released, the action rerun, a second run possible): the run is found by the label
+    /// it was posted with and followed as the run, and a run of another label is not taken for
+    /// it.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_was_posted_is_found_by_its_label() {
+        let harness = Harness::new().await;
+        let (worker, _messages) = harness.worker().await;
+        let ctx = harness.ctx();
+        let other = harness
+            .deps
+            .client
+            .queue_run(worker.lease, &pinned_spec("someone-else"))
+            .await
+            .expect("posted");
+        let posted = harness
+            .deps
+            .client
+            .queue_run(worker.lease, &pinned_spec("mine"))
+            .await
+            .expect("posted");
+        let key = PackKey {
+            build: "front".to_owned(),
+            nonce: Nonce::random(),
+            index: 0,
+        };
+        let running = |run| Running {
+            run,
+            key: key.clone(),
+            truncated: false,
+            cancelled: false,
+        };
+        let found = worker.recover(&ctx, Instant::now(), "mine", running).await;
+        let Queued::Posted(found) = found else {
+            panic!("not found");
+        };
+        assert_eq!(found.run, posted.run_id);
+        assert_ne!(found.run, other.run_id);
+        let missing = worker
+            .recover(&ctx, Instant::now(), "nobody", running)
+            .await;
+        assert!(matches!(
+            missing,
+            Queued::Retire(crate::executor::host::Retire::Ambiguous)
+        ));
+    }
+
+    /// Catches a lease that is gone being reported lost in part: each task the worker holds is
+    /// told to the farm, a result already formed as it was formed, a run that was never posted
+    /// as lost. Every one reaches the farm (an unknown lease, here: the answer is a refusal).
+    #[tokio::test(start_paused = true)]
+    async fn the_tasks_of_a_gone_lease_are_all_reported() {
+        let harness = Harness::new().await;
+        let (mut worker, _messages) = harness.worker().await;
+        let ctx = harness.ctx();
+        let now = Instant::now();
+        worker.accept(now, &start(1, 1));
+        let formed = LeaseId::new(1, 2);
+        let action = start(1, 2).action_digest.expect("an action");
+        let result = result_of(formed, &action, &Settled::Infra("formed".to_owned()));
+        worker.tasks.insert(
+            formed,
+            Task {
+                action,
+                stage: reporting(result, now),
+            },
+        );
+        worker.report_lost(&ctx).await;
+        assert!(matches!(
+            worker.tasks[&LeaseId::new(1, 1)].stage,
+            Stage::Waiting(_)
+        ));
+    }
+}

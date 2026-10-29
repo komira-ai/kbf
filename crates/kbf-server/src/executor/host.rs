@@ -36,7 +36,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::executor::runs::Task;
-use crate::executor::{Ctx, HostInfo, View, lease_gone};
+use crate::executor::{Ctx, HostInfo, View, lease_gone, note};
 use crate::farm::{Outbound, Reported, StreamId};
 use crate::worker::{HostFloor, PROTOCOL_VERSION, reported};
 
@@ -133,6 +133,12 @@ impl HostWorker {
             draining: None,
             tasks: BTreeMap::new(),
         }
+    }
+
+    /// Takes the farm's messages from `inbox`: for the tests that feed a worker by hand.
+    #[cfg(test)]
+    pub(super) fn replace_inbox(&mut self, inbox: Inbox) {
+        self.inbox = inbox;
     }
 
     pub(super) fn info(&self) -> HostInfo {
@@ -359,9 +365,10 @@ impl HostWorker {
             Retire::Lost | Retire::Fenced => self.stop_all(ctx).await,
             Retire::Drained => {}
         }
-        if let Err(e) = ctx.deps.client.release(self.lease).await {
-            tracing::warn!(lease = %self.lease, error = %e, "releasing the lease failed");
-        }
+        note(
+            "releasing the lease",
+            &ctx.deps.client.release(self.lease).await,
+        );
         self.forget();
     }
 }
@@ -399,3 +406,7 @@ fn register(
     );
     (stream, instance, reported, inbox)
 }
+
+#[cfg(test)]
+#[path = "host_tests.rs"]
+mod tests;

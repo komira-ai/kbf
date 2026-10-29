@@ -332,6 +332,13 @@ async fn a_post_to_a_lease_that_is_gone_loses_the_start_and_replaces_the_lease()
         let lease = rig.exec.hosts()[0].lease;
         rig.api.release(lease).await.expect("released");
         rig.advance(Duration::from_secs(1)).await;
+        rig.inputs
+            .facts
+            .lock()
+            .expect("facts")
+            .as_mut()
+            .expect("ok")
+            .timeout = Some(rig.cfg.max_run);
         let caller = rig.submit(1);
         rig.pump().await;
         assert!(
@@ -345,4 +352,95 @@ async fn a_post_to_a_lease_that_is_gone_loses_the_start_and_replaces_the_lease()
         rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
         assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
     }
+}
+
+/// Catches a stream the farm dropped without a word (another stream registered as the same
+/// worker) being taken for a quiet one: the runs are stopped, the worker registers again, and
+/// the action, whose lease the farm gives up, runs again.
+#[tokio::test(start_paused = true)]
+async fn a_worker_registered_again_by_another_stream_registers_again_in_turn() {
+    use kbf_sched::DaemonInstance;
+    use kbf_server::farm::Reported;
+    let (mut rig, caller, first) = running(Rig::start(&["node1"], 1, |_| {}).await).await;
+    let caps = kbf_caps::NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
+        .expect("caps")
+        .with_drivers(["container"]);
+    let (outbound, _inbox) = tokio::sync::mpsc::unbounded_channel();
+    rig.farm.register(
+        &kbf_types::WorkerId::new("js:node1"),
+        DaemonInstance::new("another-process"),
+        DaemonInstance::new(""),
+        Reported::serving(kbf_types::Resources::new(2_000, 4 << 30), caps),
+        outbound,
+        kbf_proto::worker::ServerMessage::default(),
+    );
+    rig.pump().await;
+    let stop = format!("DELETE /v1/leases/{}/runs/{}", first.lease, first.run);
+    assert_eq!(count(&rig.requests(), &stop), 1);
+    rig.elapse(75).await;
+    let runs = rig.runs_of(1).await;
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    rig.host_finishes(&runs[1].run, Outcome::Succeeded, Some(0));
+    assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
+}
+
+/// Catches a run the lease server refuses for the job's own sake (a 422) being the action's
+/// failure or being posted again unchanged: it is infrastructure, so the farm runs the action
+/// again.
+#[tokio::test(start_paused = true)]
+async fn a_refused_post_is_rerun() {
+    let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
+    rig.pump().await;
+    let caller = rig.submit(1);
+    rig.fake.inject(Fault::Reply {
+        status: 422,
+        body: bytes::Bytes::from_static(br#"{"error":"invalid-job"}"#),
+    });
+    rig.pump().await;
+    assert!(caller.finished().is_none());
+    let runs = rig.runs_of(1).await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
+    assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
+}
+
+/// Catches an ingest that takes long (a slow store) stopping the worker's heartbeats: the
+/// farm then gives its lease up and runs the action again beside the one being read. The
+/// read runs on its own, the worker goes on heartbeating, and the result is reported when
+/// the read ends.
+#[tokio::test(start_paused = true)]
+async fn a_slow_ingest_does_not_stop_the_heartbeats() {
+    let (mut rig, caller, run) = running(Rig::start(&["node1"], 1, |_| {}).await).await;
+    rig.ingest
+        .hold
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    rig.host_finishes(&run.run, Outcome::Succeeded, Some(0));
+    rig.pump().await;
+    rig.elapse(150).await;
+    assert!(caller.finished().is_none());
+    assert_eq!(rig.exec.hosts()[0].runs, 1);
+    assert_eq!(
+        rig.runs_of(1).await.len(),
+        1,
+        "the farm ran the action again"
+    );
+    rig.ingest.release.notify_one();
+    assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
+}
+
+/// Catches a read left running for a worker that is gone: it is abandoned with the worker.
+#[tokio::test(start_paused = true)]
+async fn the_read_of_a_worker_that_goes_is_abandoned() {
+    let (mut rig, caller, run) = running(Rig::start(&["node1"], 1, |_| {}).await).await;
+    rig.ingest
+        .hold
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    rig.host_finishes(&run.run, Outcome::Succeeded, Some(0));
+    rig.pump().await;
+    assert_eq!(rig.ingest.calls.lock().expect("calls").len(), 1);
+    assert!(rig.fake.set_lost("node1", true));
+    rig.advance(Duration::from_secs(6)).await;
+    rig.pump().await;
+    assert!(rig.exec.hosts().is_empty());
+    assert!(caller.finished().is_none());
 }

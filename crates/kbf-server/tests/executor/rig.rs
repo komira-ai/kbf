@@ -132,6 +132,9 @@ impl Presign for FakePresign {
 
 /// What the frontend makes of a pack: scripted, then the default.
 pub struct FakeIngest {
+    /// While set, a read waits for `release` (a slow store).
+    pub hold: std::sync::atomic::AtomicBool,
+    pub release: tokio::sync::Notify,
     /// How many of the next reads panic, as a bug of the real ingest would.
     pub panics: std::sync::atomic::AtomicUsize,
     pub script: Mutex<VecDeque<Ingested>>,
@@ -141,6 +144,8 @@ pub struct FakeIngest {
 impl FakeIngest {
     fn new() -> Self {
         Self {
+            hold: std::sync::atomic::AtomicBool::new(false),
+            release: tokio::sync::Notify::new(),
             panics: std::sync::atomic::AtomicUsize::new(0),
             script: Mutex::new(VecDeque::new()),
             calls: Mutex::new(Vec::new()),
@@ -168,6 +173,9 @@ impl Ingest for FakeIngest {
         limits: &UntrustedLimits,
     ) -> Ingested {
         locked(&self.calls).push((lease, key.to_string(), *limits));
+        if self.hold.load(std::sync::atomic::Ordering::SeqCst) {
+            self.release.notified().await;
+        }
         let panics = self.panics.fetch_update(
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::SeqCst,

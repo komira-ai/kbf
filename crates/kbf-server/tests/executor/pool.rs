@@ -303,3 +303,58 @@ async fn shutdown_stops_the_runs_and_releases_the_leases() {
         assert_eq!(count(&requests, &format!("DELETE /v1/leases/{lease}")), 1);
     }
 }
+
+/// Catches a shutdown that leaves a booked lease behind or stops at a lease the server will
+/// not release: a booked lease is released, a failed release does not stop the rest, and a
+/// slot without a lease is nothing to release.
+#[tokio::test(start_paused = true)]
+async fn shutdown_releases_what_is_booked_and_goes_on_past_a_failure() {
+    let mut rig = Rig::built(&["node1"], 2, 16, true, |_| {}).await;
+    rig.pump().await;
+    assert_eq!(rig.api.leases().await.expect("leases").len(), 1);
+    rig.fake.inject(kbf_lease_client::fake::Fault::Close);
+    rig.exec.shutdown().await;
+    assert!(rig.exec.hosts().is_empty());
+    assert_eq!(count(&rig.requests(), "DELETE /v1/leases/4-1"), 1);
+
+    let mut rig = Rig::start(&["node1"], 2, |_| {}).await;
+    rig.pump().await;
+    assert_eq!(rig.exec.hosts().len(), 1, "the second slot has no host");
+    rig.exec.shutdown().await;
+    assert!(rig.api.leases().await.expect("leases").is_empty());
+}
+
+/// Catches a first step that gives up for good when the lease server cannot be asked which
+/// leases are its own: the question is asked again at the next step, and the pool is filled.
+#[tokio::test(start_paused = true)]
+async fn adoption_that_could_not_ask_is_asked_again() {
+    let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
+    rig.fake.inject(kbf_lease_client::fake::Fault::Close);
+    rig.pump().await;
+    assert_eq!(rig.exec.hosts().len(), 1);
+    assert_eq!(count(&rig.requests(), "GET /v1/leases"), 2);
+}
+
+/// Catches a lease that is being released (its runs are still stopping) being adopted as a
+/// host: a restarted frontend leaves it to finish, and asks for a host of its own, which is
+/// not that busy one.
+#[tokio::test(start_paused = true)]
+async fn a_lease_being_released_is_not_adopted() {
+    let mut rig = Rig::start(&["node1", "node2"], 1, |_| {}).await;
+    rig.pump().await;
+    let _caller = rig.submit(1);
+    rig.pump().await;
+    let first = rig.exec.hosts()[0].lease;
+    let run = rig.runs_of(1).await.remove(0);
+    assert!(rig.fake.run_started(&run.run));
+    rig.api.release(first).await.expect("released");
+    assert_eq!(
+        rig.api.leases().await.expect("leases")[0].state,
+        LeaseState::Releasing
+    );
+    rig.exec = rig.restarted_executor();
+    rig.pump().await;
+    assert_eq!(rig.exec.hosts().len(), 1);
+    assert_ne!(rig.exec.hosts()[0].lease, first);
+    assert_eq!(rig.exec.hosts()[0].host, "node2");
+}

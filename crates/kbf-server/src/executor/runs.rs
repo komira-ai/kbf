@@ -17,12 +17,12 @@ use kbf_sched::fence::START_VALIDITY;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::executor::Ctx;
 use crate::executor::config::Config;
 use crate::executor::host::{Drain, HostWorker, Retire};
 use crate::executor::outcome::{Settled, Verdict, judge, ran, result_of};
 use crate::executor::task::{Nonce, PackKey, TaskArgs};
 use crate::executor::traits::{Ingested, InputsError, PresignError, UntrustedLimits};
+use crate::executor::{Ctx, note};
 
 /// The label that names a run by the key it was posted with, so a run whose `202` was lost
 /// can be found again.
@@ -399,13 +399,12 @@ impl HostWorker {
     /// has answered: a server that knows no such run has nothing to stop.
     async fn stop(&mut self, ctx: &Ctx<'_>, lease: kbf_types::LeaseId, run: &RunId) {
         let stopped = ctx.deps.client.stop_run(self.lease, run).await;
+        note("stopping a run", &stopped);
         let answered = stopped.as_ref().err().is_none_or(|e| e.api().is_some());
-        if let Err(e) = &stopped {
-            tracing::warn!(worker = %self.id, error = %e, "stopping a run failed");
-        }
-        if answered {
-            self.drop_task(lease);
-        }
+        answered
+            .then_some(lease)
+            .iter()
+            .for_each(|l| self.drop_task(*l));
     }
 
     /// Moves a running task on if its run ended.
@@ -475,9 +474,10 @@ impl HostWorker {
             })
             .collect();
         for run in runs {
-            if let Err(e) = ctx.deps.client.stop_run(self.lease, &run).await {
-                tracing::warn!(worker = %self.id, error = %e, "stopping a run failed");
-            }
+            note(
+                "stopping a run",
+                &ctx.deps.client.stop_run(self.lease, &run).await,
+            );
         }
     }
 

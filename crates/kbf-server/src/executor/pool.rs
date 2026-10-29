@@ -10,7 +10,7 @@ use kbf_lease_client::{AcquireRequest, Acquired, Lease, LeaseId, LeaseState, Res
 use tokio::time::Instant;
 
 use crate::executor::host::{HostWorker, Retire};
-use crate::executor::{Ctx, HostInfo, View};
+use crate::executor::{Ctx, HostInfo, View, note};
 
 /// The label every lease of this executor carries, valued with the frontend's id: how a
 /// restarted frontend finds the leases it made.
@@ -75,9 +75,10 @@ impl Slot {
         match self {
             Self::Active(worker) => worker.retire(ctx, Retire::Fenced).await,
             Self::Pending { lease } => {
-                if let Err(e) = ctx.deps.client.release(lease).await {
-                    tracing::warn!(%lease, error = %e, "releasing a booked lease failed");
-                }
+                note(
+                    "releasing a booked lease",
+                    &ctx.deps.client.release(lease).await,
+                );
             }
             Self::Vacant { .. } => {}
         }
@@ -145,9 +146,10 @@ pub(super) async fn adopt(ctx: &Ctx<'_>, now: Instant) -> Option<Vec<Slot>> {
             }
             (LeaseState::Pending, true) => slots.push(Slot::Pending { lease: lease.id }),
             (LeaseState::Held | LeaseState::Pending, false) => {
-                if let Err(e) = ctx.deps.client.release(lease.id).await {
-                    tracing::warn!(lease = %lease.id, error = %e, "releasing a spare lease failed");
-                }
+                note(
+                    "releasing a spare lease",
+                    &ctx.deps.client.release(lease.id).await,
+                );
             }
             _ => {}
         }
@@ -160,8 +162,9 @@ pub(super) async fn adopt(ctx: &Ctx<'_>, now: Instant) -> Option<Vec<Slot>> {
 async fn stop_runs(ctx: &Ctx<'_>, lease: LeaseId) {
     let runs = ctx.deps.client.runs(lease).await.unwrap_or_default();
     for run in runs {
-        if let Err(e) = ctx.deps.client.stop_run(lease, &run.run_id).await {
-            tracing::warn!(%lease, error = %e, "stopping a run of an earlier frontend failed");
-        }
+        note(
+            "stopping a run of an earlier frontend",
+            &ctx.deps.client.stop_run(lease, &run.run_id).await,
+        );
     }
 }
