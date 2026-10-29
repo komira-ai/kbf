@@ -196,8 +196,10 @@ pub struct Cli {
     /// How often the reconciler works: shorter than `--lease-ttl`.
     #[arg(long, default_value = "5s", value_parser = parse_duration)]
     pub reconcile_interval: Duration,
-    /// The largest body of a request, in bytes: the largest object, and the largest part of a
-    /// multipart upload.
+    /// The longest body of a request, in bytes: the longest object, and the longest part of a
+    /// multipart upload. An upper bound on the length of what is streamed, not a bound on
+    /// memory: the body of a put or of a part is passed on to the tiers as it arrives and is
+    /// never held whole. A body over it is refused with 413 and nothing is stored.
     #[arg(
         long,
         default_value_t = DEFAULT_MAX_REQUEST_BYTES,

@@ -1,7 +1,8 @@
 //! The minimal API of an S3-compatible store, as this crate uses it.
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use crate::Error;
@@ -129,6 +130,40 @@ pub trait Backend: Send + Sync {
     /// [`Error::AlreadyExists`] if the key exists; the stored object is left as it was.
     /// [`Error::Full`] if the backend has no room for the object.
     async fn put(&self, key: &str, body: Bytes) -> Result<(), Error>;
+
+    /// As [`Backend::put`], for a body that arrives as chunks: `len` is the number of bytes
+    /// `body` is to give, or `None` if the caller does not know.
+    ///
+    /// The object becomes visible under `key` only after `body` has ended, and a body that ends
+    /// with an error leaves nothing: no object under `key`, and nothing left behind that a
+    /// listing or a get could find. The call gives that error. That is what lets a caller
+    /// verify the bytes as they pass (a checksum is known only at the end) and end the stream
+    /// with an error if they are wrong. The implementations of the directory and the S3
+    /// backend do not hold the body in memory: the directory backend writes the chunks to a
+    /// temporary file and links it to `key` after the last chunk; the S3 backend sends them to
+    /// the store as they arrive, as one request or as a multipart upload that is completed (with
+    /// `If-None-Match: *`) only after the last chunk, and aborted on any failure. A store that
+    /// must know the length of a request before it is sent (S3 does) needs `len`; given
+    /// `None`, the S3 backend holds the whole body first.
+    ///
+    /// The provided implementation collects the chunks and calls [`Backend::put`], which holds
+    /// the body whole; it serves a backend that holds its objects in memory anyway, and the
+    /// wrappers of other backends override the call to pass the stream on.
+    ///
+    /// # Errors
+    /// As [`Backend::put`], and the error of `body`, if it ends with one.
+    async fn put_stream(
+        &self,
+        key: &str,
+        _len: Option<u64>,
+        mut body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        let mut whole = BytesMut::new();
+        while let Some(chunk) = body.next().await {
+            whole.extend_from_slice(&chunk?);
+        }
+        self.put(key, whole.freeze()).await
+    }
 
     /// Replaces the object, only if its content tag is `etag` (`If-Match`), and gives the
     /// content tag of the new object.

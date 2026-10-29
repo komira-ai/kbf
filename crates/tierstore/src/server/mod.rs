@@ -36,7 +36,21 @@
 //!
 //! A put, a delete or the completion of an upload is carried to its end on a task of its own
 //! when the client goes away before the answer, so that no object is left without the journal
-//! entry that has it copied.
+//! entry that has it copied. (A put whose body the client had not finished sending is not
+//! carried on: its body is cut, and nothing is stored.)
+//!
+//! # Streamed puts
+//!
+//! The body of a put that only creates is not held. It is read a piece at a time, checked
+//! against its hashes as the pieces pass, and handed through a queue of a few pieces to the
+//! backend's streamed put ([`Backend::put_stream`](crate::Backend::put_stream)), so that the
+//! memory of a put does not grow with the length of the object, and a slow backend slows the
+//! client down instead of filling memory. The object becomes visible, and its journal entry is
+//! written, only after the last piece was read and every hash came out right: a hash that does
+//! not match at the last byte, a body over the limit, a stalled body and a connection cut half
+//! way each leave no object and no journal entry. A put with `If-Match`, or an `If-None-Match`
+//! other than `*`, is refused without being stored. [`ServerConfig::max_request_bytes`] is
+//! the most bytes a body may have, not a bound on memory.
 //!
 //! Requests are signed with SigV4 in the `Authorization` header (see `auth`): by one of the
 //! access keys of [`ServerConfig`], over `host`, `x-amz-content-sha256` and `x-amz-date` at
@@ -107,6 +121,7 @@
 
 mod auth;
 pub mod cli;
+mod handover;
 mod idle;
 mod keys;
 mod ops;
@@ -139,6 +154,8 @@ mod role_tests;
 mod server_tests;
 #[cfg(test)]
 mod slow_reader_tests;
+#[cfg(test)]
+mod stream_put_tests;
 #[cfg(test)]
 mod testing;
 #[cfg(test)]
@@ -190,8 +207,10 @@ pub struct ServerConfig {
     /// the module docs). None by default. Their ids differ from each other's and from the full
     /// key's: if one is the full key's, the full key is the one that is meant.
     pub read_only_keys: Vec<AccessKey>,
-    /// The most bytes of a request body: the largest object that one put takes, and the
-    /// largest part of an upload.
+    /// The most bytes of a request body: the longest object that one put takes, and the
+    /// longest part of an upload. It is an upper bound on a length, not on memory: the body of
+    /// a put or of a part is streamed to the backend and is never held whole. (The body of a
+    /// request that is not streamed, the XML of a completion, is held, up to this many bytes.)
     pub max_request_bytes: usize,
     /// How long a request body may go without a byte arriving, and how long the client may
     /// go without taking a byte of an answer, before the request ends: a body that arrives

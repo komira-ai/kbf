@@ -6,12 +6,14 @@ use std::sync::Arc;
 use bytes::Bytes;
 use hyper::StatusCode;
 use hyper::body::Body;
+use hyper::header::HeaderMap;
 use hyper::http::request::Parts;
 
 use crate::journal::is_reserved;
 use crate::{ByteRange, Error, Meta};
 
 use super::Server;
+use super::handover::hand_over;
 use super::reply::{Answer, S3Error, answer, xml_answer};
 use super::request::{BoxError, Check, Query, Reader, Refused, Target, header, pieces};
 use super::time::http_date;
@@ -162,10 +164,10 @@ fn conditional(parts: &Parts, key: &str, meta: &Meta) -> Result<Option<Answer>, 
 }
 
 /// Runs a call that changes the store to its end on a task of its own. The server drops the
-/// future of a request when the client goes away, and a put dropped after it wrote the object
-/// and before it wrote the journal entry would leave an object that nothing copies or evicts,
-/// and a key that no put can take. The completion of a multipart upload is carried to its end
-/// too, so that the parts it joins are not left half joined.
+/// future of a request when the client goes away, and a delete dropped after it removed the
+/// object from one tier would leave it in the other. The completion of a multipart upload is
+/// carried to its end too, so that the parts it joins are not left half joined. (A put does
+/// the same on its own, see `put_streamed`.)
 async fn detached<T, F>(call: F) -> Result<T, Error>
 where
     T: Send + 'static,
@@ -173,6 +175,16 @@ where
 {
     let done = tokio::spawn(call).await;
     done.expect("a call to the backend does not panic")
+}
+
+/// Whether a put only creates, which is what it does when it has no `If-Match` and its
+/// `If-None-Match` is absent or `*`: the body of such a put is streamed to the backend.
+fn creates_only(headers: &HeaderMap) -> bool {
+    let conditions = (
+        header(headers, "if-match"),
+        header(headers, "if-none-match"),
+    );
+    matches!(conditions, (None, None | Some("*")))
 }
 
 /// The answer to a failed call on a multipart upload: where the backend has no such upload, it
@@ -194,8 +206,9 @@ fn start_after(query: &Query) -> Result<Option<String>, S3Error> {
 }
 
 impl Server {
-    /// Does what a request asks for, once it is signed. A multipart part is streamed to the
-    /// backend as its body arrives; every other call reads its body first.
+    /// Does what a request asks for, once it is signed. The body of a multipart part and that
+    /// of a put that only creates are streamed to the backend as they arrive; every other call
+    /// reads its body first.
     pub(super) async fn dispatch<B>(
         &self,
         parts: &Parts,
@@ -217,6 +230,13 @@ impl Server {
             let len = declared.and_then(|text| text.parse().ok());
             return self.upload_part(query, key, len, reader, check).await;
         }
+        if let ("PUT", Target::Object(key), false) = (method, &target, multipart)
+            && creates_only(&parts.headers)
+        {
+            let declared = header(&parts.headers, "content-length");
+            let len = declared.and_then(|text| text.parse().ok());
+            return self.put_streamed(key, len, reader, check).await;
+        }
         let body = reader.read_all(check).await?;
         match (method, target, multipart) {
             ("PUT" | "HEAD", Target::Bucket, false) => {
@@ -225,7 +245,7 @@ impl Server {
             ("GET", Target::Bucket, false) => self.list_objects(query).await,
             ("GET", Target::Object(key), false) => self.get_object(parts, &key).await,
             ("HEAD", Target::Object(key), false) => self.head_object(parts, &key).await,
-            ("PUT", Target::Object(key), false) => self.put_object(parts, &key, body).await,
+            ("PUT", Target::Object(key), false) => self.put_conditional(parts, &key).await,
             ("DELETE", Target::Object(key), false) => self.delete_object(&key).await,
             ("DELETE", Target::Object(key), true) => self.abort_upload(query, &key).await,
             ("POST", Target::Object(key), true) if query.has("uploads") => {
@@ -272,17 +292,60 @@ impl Server {
         Ok(answer(StatusCode::OK, &headers, Bytes::new()))
     }
 
-    async fn put_object(&self, parts: &Parts, key: &str, body: Bytes) -> Result<Answer, S3Error> {
+    /// A put that is not a plain create (see [`creates_only`]): `If-Match`, which is refused
+    /// because an object cannot be replaced, or an `If-None-Match` other than `*`.
+    async fn put_conditional(&self, parts: &Parts, key: &str) -> Result<Answer, S3Error> {
         refuse_reserved(key)?;
-        let if_match = header(&parts.headers, "if-match");
-        match (if_match, header(&parts.headers, "if-none-match")) {
-            (Some(tag), _) => self.replace_object(key, tag).await,
-            (None, None | Some("*")) => {
-                self.put_detached(key, body).await?;
-                Ok(answer(StatusCode::OK, &[], Bytes::new()))
-            }
-            (None, Some(_)) => Err(S3Error::unsupported("only If-None-Match: * is supported")),
+        match header(&parts.headers, "if-match") {
+            Some(tag) => self.replace_object(key, tag).await,
+            None => Err(S3Error::unsupported("only If-None-Match: * is supported")),
         }
+    }
+
+    /// Creates the object from the body of the request as it arrives, create-only. The body is
+    /// not held: the pieces are checked against the hashes of the request as they pass, and go
+    /// on through a short queue to the backend's streamed put, which makes the object visible
+    /// only after the last piece. A body that is refused (a hash that does not match, a body
+    /// over the limit, a stalled or cut one) ends the stream with an error, so the backend
+    /// stores nothing, and `refused` has the answer to send. `len` is the `Content-Length` of
+    /// the request, if it has one.
+    ///
+    /// The backend's call runs on a task of its own, so that a client that goes away after
+    /// the whole body was handed over leaves the put to be carried to its end, with the
+    /// journal entry; a client that goes away before that ends the stream with an error, and
+    /// nothing is stored.
+    async fn put_streamed<B>(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        reader: Reader<B>,
+        check: Check,
+    ) -> Result<Answer, S3Error>
+    where
+        B: Body + Send,
+        B::Data: Send,
+        B::Error: Into<BoxError>,
+    {
+        refuse_reserved(key)?;
+        let refused = Refused::default();
+        let (carry, body) = hand_over(pieces(reader, check, refused.clone()));
+        let (backend, name) = (Arc::clone(&self.backend), key.to_owned());
+        let mut storing = tokio::spawn(async move { backend.put_stream(&name, len, body).await });
+        let early = tokio::select! {
+            biased;
+            done = &mut storing => Some(done),
+            () = carry => None,
+        };
+        let stored = match early {
+            Some(done) => done,
+            None => storing.await,
+        };
+        let stored = stored.expect("a call to the backend does not panic");
+        if let Some(error) = refused.take() {
+            return Err(error);
+        }
+        stored.map_err(S3Error::from)?;
+        Ok(answer(StatusCode::OK, &[], Bytes::new()))
     }
 
     /// `If-Match`: an object cannot be replaced, so the answer is that the condition does not
@@ -303,13 +366,6 @@ impl Server {
         let deleted = detached(async move { backend.delete(&key).await }).await;
         deleted.map_err(S3Error::from)?;
         Ok(answer(StatusCode::NO_CONTENT, &[], Bytes::new()))
-    }
-
-    /// Creates the object in the backend, and goes on to the end if the request is dropped.
-    async fn put_detached(&self, key: &str, body: Bytes) -> Result<(), S3Error> {
-        let (backend, key) = (Arc::clone(&self.backend), key.to_owned());
-        let put = detached(async move { backend.put(&key, body).await }).await;
-        put.map_err(S3Error::from)
     }
 
     async fn list_objects(&self, query: &Query) -> Result<Answer, S3Error> {
