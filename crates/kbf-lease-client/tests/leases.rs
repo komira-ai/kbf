@@ -286,7 +286,7 @@ async fn releasing_a_lease_with_live_runs_waits_for_them() {
 /// Asserts what the host list shows and what it means for the client: a free host, a leased
 /// host with its lease, a lost host (`is_lost`), a tainted one (`is_tainted`), and a host
 /// that has not said hello since a restart. Lost and awaiting hosts take no lease. It catches
-/// an `is_lost` that reads only one of the two fields the server sends, and a pool that leases
+/// a fake that reports a lost host as live (or the reverse), and a pool that leases
 /// a host nobody has heard from.
 #[tokio::test]
 async fn the_host_list_shows_who_is_lost_tainted_or_leased() {
@@ -315,6 +315,10 @@ async fn the_host_list_shows_who_is_lost_tainted_or_leased() {
         "post-job-check-failed"
     );
     assert!(hosts[1].is_lost() && !hosts[1].is_tainted());
+    assert_eq!(hosts[1].state, Some(kbf_lease_client::HostState::Lost));
+    assert_eq!(hosts[1].lost, Some(true));
+    assert_eq!(hosts[0].state, Some(kbf_lease_client::HostState::Live));
+    assert_eq!(hosts[0].lost, Some(false));
     let none = client.acquire(&whole_host()).await.unwrap_err();
     assert_eq!(
         refused(none),

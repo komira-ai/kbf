@@ -135,6 +135,9 @@ fn what_the_server_sends_reads_now_and_after_it_grows() {
     let failed: Run = round_trip("run_failed_to_start");
     assert_eq!(failed.outcome, Some(Outcome::FailedToStart));
     assert_eq!(failed.detail.as_deref(), Some("image-pull-failed"));
+    assert!(exited.labels.is_empty(), "a body with no labels has none");
+    let labelled: Run = round_trip("run_labelled");
+    assert_eq!(labelled.labels["kbf-descriptor"], "d-7f3a");
 
     // The wrapped lists are crate-private types; the elements are the public ones.
     let leases = golden("leases");
@@ -154,6 +157,14 @@ fn what_the_server_sends_reads_now_and_after_it_grows() {
         second.taint.as_ref().unwrap().check.as_deref(),
         Some("scratch-clean")
     );
+    // The server may send either field alone, and a live host's `lost: false` with
+    // `state: "live"` is not lost; the two readings each carry the answer.
+    let only_flag: Host = serde_json::from_value(hosts["hosts"][2].clone()).unwrap();
+    assert!(only_flag.state.is_none() && only_flag.is_lost());
+    let only_state: Host = serde_json::from_value(hosts["hosts"][3].clone()).unwrap();
+    assert!(only_state.lost.is_none() && only_state.is_lost());
+    let live: Host = serde_json::from_value(hosts["hosts"][4].clone()).unwrap();
+    assert!(!live.is_lost());
     for element in hosts["hosts"].as_array().unwrap() {
         let host: Host = serde_json::from_value(element.clone()).unwrap();
         assert_eq!(&serde_json::to_value(&host).unwrap(), element);

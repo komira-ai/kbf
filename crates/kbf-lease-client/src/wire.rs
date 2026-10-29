@@ -487,6 +487,10 @@ pub struct Run {
     /// A refusal code or a short text (at most 1024 bytes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The labels the run was queued with, when the server lists them (older servers do
+    /// not). They let a caller find a run whose 202 it never saw.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
 
 /// The 202 body of a queued or stopped run.

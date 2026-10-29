@@ -131,16 +131,19 @@ fn route(state: &mut State, method: &Method, path: &str, body: &[u8]) -> Answer 
         ("GET", ["v1", "leases"]) => state.leases(),
         ("GET", ["v1", "hosts"]) => state.hosts(),
         ("POST", ["v1", "leases", id, "renew"]) => {
+            // The id is read before the body, as the server's extractors do.
+            let id = lease(id)?;
             let request = match body.is_empty() {
                 true => RenewRequest::default(),
                 false => parse(body)?,
             };
-            state.renew(lease(id)?, &request)
+            state.renew(id, &request)
         }
         ("DELETE", ["v1", "leases", id]) => state.release(lease(id)?),
         ("POST", ["v1", "leases", id, "runs"]) => {
+            let id = lease(id)?;
             let spec: RunSpec = parse(body)?;
-            state.queue_run(lease(id)?, spec)
+            state.queue_run(id, spec)
         }
         ("GET", ["v1", "leases", id, "runs"]) => state.runs(lease(id)?),
         ("GET", ["v1", "leases", id, "runs", run]) => state.run(lease(id)?, run),

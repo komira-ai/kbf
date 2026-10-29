@@ -6,7 +6,7 @@ mod support;
 use std::time::Duration;
 
 use kbf_lease_client::{ErrorCode, Isolation, Outcome, RunId, RunState};
-use support::{IMAGE, fake, lease, refused, run_of, whole_host};
+use support::{IMAGE, fake, lease, raw_json, refused, run_of};
 
 /// Asserts a run's life as the client sees it: queued, then what the host does (started,
 /// result reported, listing dropped), with the outcome and exit code only once the host has
@@ -339,8 +339,9 @@ async fn a_lost_or_tainted_host_takes_no_run_and_keeps_the_ones_it_has() {
 }
 
 /// Asserts that runs are refused on a lease that is not there: unknown (404), and a lease
-/// whose ttl has run out between a renewal and a queue (`409 not-held`). It catches a fake
-/// that takes work for a lease with no time left, which the real server refuses.
+/// whose ttl has run out before the queue (the server has dropped it, so also
+/// `404 unknown-lease`). It catches a fake that takes work for a lease with no time left,
+/// which the real server refuses.
 #[tokio::test]
 async fn a_run_needs_a_lease_that_is_held_with_time_left() {
     let (server, client) = fake().await;
@@ -369,10 +370,11 @@ async fn a_run_needs_a_lease_that_is_held_with_time_left() {
 
 /// Asserts that a run spec never prints its arguments (they may hold a presigned URL) in its
 /// `Debug`, which is what a log line of a failed call would print, and that they do reach
-/// the server. It catches a derived `Debug`.
+/// the server unchanged. It catches a derived `Debug`, and a client that drops or rewrites
+/// the arguments.
 #[tokio::test]
 async fn arguments_reach_the_server_and_never_a_log_line() {
-    let (_server, client) = fake().await;
+    let (server, client) = fake().await;
     let id = lease(&client).await;
     let mut spec = run_of(1000, 1);
     spec.args = vec!["https://store.example/put?X-Amz-Signature=SECRETSIG".to_owned()];
@@ -380,6 +382,62 @@ async fn arguments_reach_the_server_and_never_a_log_line() {
     assert!(!printed.contains("SECRETSIG"), "{printed}");
     assert!(printed.contains("<1 redacted>"), "{printed}");
     assert!(printed.contains(IMAGE));
-    client.queue_run(id, &spec).await.unwrap();
-    let _ = whole_host();
+    let queued = client.queue_run(id, &spec).await.unwrap().run_id;
+    assert_eq!(server.run_args(&queued), Some(spec.args.clone()));
+}
+
+/// Asserts that a run's labels come back on the run and on the list, and that a run with
+/// none shows none. A caller that lost the 202 of a queue call finds its run again by the
+/// label it put on it. It catches a client that drops the labels it sends or the ones it
+/// reads.
+#[tokio::test]
+async fn a_run_shows_the_labels_it_was_queued_with() {
+    let (server, client) = fake().await;
+    let id = lease(&client).await;
+    let mut spec = run_of(1000, 1);
+    spec.labels
+        .insert("kbf-descriptor".to_owned(), "d-1".to_owned());
+    let labelled = client.queue_run(id, &spec).await.unwrap().run_id;
+    let bare = client.queue_run(id, &run_of(1000, 1)).await.unwrap().run_id;
+    assert_eq!(
+        client.run(id, &labelled).await.unwrap().labels["kbf-descriptor"],
+        "d-1"
+    );
+    assert!(client.run(id, &bare).await.unwrap().labels.is_empty());
+    let listed = client.runs(id).await.unwrap();
+    assert_eq!(listed[0].labels["kbf-descriptor"], "d-1");
+    assert!(listed[1].labels.is_empty());
+    let (_, body) = raw_json(&server, "GET", &format!("/v1/leases/{id}/runs/{bare}"), "").await;
+    assert!(body.get("labels").is_none(), "no labels, no field: {body}");
+}
+
+/// Asserts the order the server checks a queue call in: the lease, then the host's record,
+/// then the job, then the host's health. A lost or tainted host with an invalid job is a
+/// `422` (the job is wrong whoever runs it), a silent host is `409 host-not-registered`
+/// before the job is read, and an unreadable lease id is `404` before an unreadable body is
+/// `400`. It catches a fake that checks the host first, which would give the executor a
+/// retryable 409 for a job that can never run.
+#[tokio::test]
+async fn a_queue_call_is_checked_in_the_servers_order() {
+    let (server, client) = fake().await;
+    let id = lease(&client).await;
+    let mut bad = run_of(1000, 1);
+    bad.image = "reg.example/kbf-task:v1".to_owned();
+    assert!(server.set_lost("node1", true));
+    let lost = client.queue_run(id, &bad).await.unwrap_err();
+    assert_eq!(refused(lost), (422, ErrorCode::ImageDigestRequired));
+    let lost = client.queue_run(id, &run_of(1000, 1)).await.unwrap_err();
+    assert_eq!(refused(lost), (409, ErrorCode::HostLost));
+    assert!(server.set_lost("node1", false));
+    assert!(server.taint_host("node1", "scratch-not-clean"));
+    let tainted = client.queue_run(id, &run_of(0, 1)).await.unwrap_err();
+    assert_eq!(refused(tainted), (422, ErrorCode::InvalidJob));
+    server.restart();
+    let silent = client.queue_run(id, &bad).await.unwrap_err();
+    assert_eq!(refused(silent), (409, ErrorCode::HostNotRegistered));
+
+    let (status, _) = raw_json(&server, "POST", "/v1/leases/not-a-lease/runs", "{").await;
+    assert_eq!(status, 404, "the lease id is read before the body");
+    let (status, _) = raw_json(&server, "POST", &format!("/v1/leases/{id}/runs"), "{").await;
+    assert_eq!(status, 400);
 }

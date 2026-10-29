@@ -130,8 +130,8 @@ impl Token {
     /// server's own token file). One trailing newline is dropped.
     ///
     /// # Errors
-    /// The file cannot be read, is not a regular file, is readable or writable by group or
-    /// others, is over 4 KiB, or holds something that is not a token.
+    /// The file cannot be read, is not a regular file, has a mode other than 0600 or 0400
+    /// (the file's owner is not checked), is over 4 KiB, or holds something that is not a token.
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
         let file_error = |source| ConfigError::TokenFile {
             path: path.to_path_buf(),
@@ -147,10 +147,8 @@ impl Token {
         if !meta.is_file() {
             return Err(mode_error("not a regular file"));
         }
-        if meta.permissions().mode() & 0o077 != 0 {
-            return Err(mode_error(
-                "readable or writable by group or others (want 0600)",
-            ));
+        if !matches!(meta.permissions().mode() & 0o777, 0o600 | 0o400) {
+            return Err(mode_error("mode is not 0600 or 0400"));
         }
         let mut text = String::new();
         let read = file.take(MAX_TOKEN_FILE + 1).read_to_string(&mut text);

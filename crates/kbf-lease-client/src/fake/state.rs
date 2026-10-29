@@ -162,6 +162,8 @@ struct RunRow {
     cpu_millis: u64,
     memory_bytes: u64,
     wall_ms: u64,
+    args: Vec<String>,
+    labels: BTreeMap<String, String>,
 }
 
 impl RunRow {
@@ -177,6 +179,7 @@ impl RunRow {
             outcome: self.outcome,
             exit_code: self.exit_code,
             detail: self.detail.clone(),
+            labels: self.labels.clone(),
         }
     }
 }
@@ -398,15 +401,11 @@ impl State {
         if lease.state != LeaseState::Held {
             return Err(Refusal::new(409, "not-held"));
         }
+        // The server's order: the lease, the host's record, the job's vetting, and only then
+        // what the host is doing.
         let host = &self.hosts[&lease.host];
         if host.awaiting {
             return Err(Refusal::new(409, "host-not-registered"));
-        }
-        if host.lost {
-            return Err(Refusal::new(409, "host-lost"));
-        }
-        if host.taint.is_some() {
-            return Err(Refusal::new(409, "host-tainted"));
         }
         let limits = &spec.limits;
         if limits.cpu_millis == 0 || limits.memory_bytes == 0 || limits.wall_ms == Some(0) {
@@ -428,6 +427,12 @@ impl State {
             || gpu_beyond
         {
             return Err(Refusal::new(422, "limits-exceed-shape"));
+        }
+        if host.lost {
+            return Err(Refusal::new(409, "host-lost"));
+        }
+        if host.taint.is_some() {
+            return Err(Refusal::new(409, "host-tainted"));
         }
         let live = self.runs.iter().filter(|run| run.lease == id && run.live());
         let (count, cpu, memory) = live.fold((0, 0, 0), |(count, cpu, memory), run| {
@@ -452,6 +457,8 @@ impl State {
             cpu_millis: limits.cpu_millis,
             memory_bytes: limits.memory_bytes,
             wall_ms: limits.wall_ms.map_or(cap, |asked| asked.min(cap)),
+            args: spec.args.clone(),
+            labels: spec.labels.clone(),
         };
         let accepted = RunAccepted {
             run_id: row.id.clone(),
@@ -615,6 +622,13 @@ impl State {
             .iter()
             .find(|row| row.id == *run)
             .map(|row| row.wall_ms)
+    }
+
+    pub(super) fn run_args(&self, run: &RunId) -> Option<Vec<String>> {
+        self.runs
+            .iter()
+            .find(|row| row.id == *run)
+            .map(|row| row.args.clone())
     }
 
     pub(super) fn run_state(&self, run: &RunId) -> Option<RunState> {

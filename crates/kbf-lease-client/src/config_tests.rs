@@ -99,7 +99,8 @@ fn a_token_is_checked_and_never_printed() {
 
 /// Asserts that the token file is read the way the server reads its own: mode 0600 or
 /// 0400, regular file, one trailing newline dropped. It catches a file readable by others
-/// being accepted, which is how a token leaks to another user of the box.
+/// being accepted, which is how a token leaks to another user of the box, and an owner-execute
+/// mode (0700, 0500), which the server's own check refuses.
 #[test]
 fn a_token_file_must_be_private() {
     let dir = scratch("token-file");
@@ -116,7 +117,7 @@ fn a_token_file_must_be_private() {
         b"abcdefghijklmnopqrstuvwxyz012345",
     );
     assert!(Token::from_file(&read_only).is_ok());
-    for mode in [0o640, 0o604, 0o660, 0o666, 0o701] {
+    for mode in [0o640, 0o604, 0o660, 0o666, 0o701, 0o700, 0o500] {
         let shared = token_file(
             &dir,
             &format!("shared-{mode:o}"),

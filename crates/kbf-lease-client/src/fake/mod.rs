@@ -226,6 +226,12 @@ impl FakeLeaseServer {
         locked(&self.shared.state).run_wall_ms(run)
     }
 
+    /// The arguments the run was queued with, as the server received them.
+    #[must_use]
+    pub fn run_args(&self, run: &RunId) -> Option<Vec<String>> {
+        locked(&self.shared.state).run_args(run)
+    }
+
     /// The run's state, whoever is asking (a run of a forgotten boot is `None`).
     #[must_use]
     pub fn run_state(&self, run: &RunId) -> Option<RunState> {

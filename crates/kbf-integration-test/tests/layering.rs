@@ -1139,12 +1139,30 @@ fn the_release_workflow_builds_the_kbf_binary_apart_from_the_installer() {
 /// through.
 const LEASE_CLIENT_MUST_NOT_REACH: &[&str] = &["reqwest", "ureq", "js-agent", "js-client"];
 
-/// Asserts that no daemon-side crate reaches the lease server client: the executor that
-/// leases hosts runs in the server, and a daemon holding the lease token or the means to
-/// call the lease server would let a compromised node lease and run work on other hosts. The
-/// roots are the daemon crates and the crates they move blobs with
-/// (`DAEMON_SIDE`), and the walk is shown to see the client's own dependencies, so the check
-/// does not pass on an empty walk.
+/// The crates that must never reach the lease server client: the daemon side
+/// (`DAEMON_SIDE`), the VM driver and the guest agent (which run untrusted builds), the
+/// Mac session, and the updater and installer that run on nodes. `kbf-storage-and-daemon` is
+/// not here: it links the server library, which is where the executor that holds the token
+/// lives, and the server's own closure is what the lease client is for.
+const LEASE_CLIENT_FORBIDDEN_ROOTS: &[&str] = &[
+    "kbf-node",
+    "kbf-daemon",
+    "kbf-transfer",
+    "kbf-driver-container",
+    "kbf-driver-native",
+    "kbf-driver-vm",
+    "kbf-guest",
+    "kbf-mac-session",
+    "kbf-updater",
+    "kbf-installer",
+];
+
+/// Asserts that no node-side crate reaches the lease server client: the executor that
+/// leases hosts runs in the server, and a daemon, a VM guest or an installer holding the
+/// lease token or the means to call the lease server would let a compromised node or a build
+/// lease and run work on other hosts. The roots are `LEASE_CLIENT_FORBIDDEN_ROOTS`, and the
+/// walk is shown to see the client's own dependencies, so the check does not pass on an
+/// empty walk.
 #[test]
 fn a_daemon_cannot_reach_the_lease_client() {
     let g = load_graph();
@@ -1156,13 +1174,13 @@ fn a_daemon_cannot_reach_the_lease_client() {
         !reaches(&g, "kbf-lease-client", &["hyper", "tokio-rustls"]).is_empty(),
         "the lease client's closure must reach hyper and tokio-rustls, or this walk proves nothing"
     );
-    let violations: Vec<String> = DAEMON_SIDE
+    let violations: Vec<String> = LEASE_CLIENT_FORBIDDEN_ROOTS
         .iter()
-        .flat_map(|daemon| reaches(&g, daemon, &["kbf-lease-client"]))
+        .flat_map(|root| reaches(&g, root, &["kbf-lease-client"]))
         .collect();
     assert!(
         violations.is_empty(),
-        "a daemon-side crate reaches the lease server client:\n{}",
+        "a node-side crate reaches the lease server client:\n{}",
         violations.join("\n")
     );
 }
