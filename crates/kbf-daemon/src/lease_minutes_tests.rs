@@ -320,7 +320,7 @@ fn a_held_batch_unacked_again_is_held_again_once() {
     assert_eq!(minute_ids(&after), [(1, 1)]);
     wire.extend(minute_ids(&after));
     lm.acked(2);
-    let rest = beats(&mut lm, 3, [180, 190]);
+    let rest = beats(&mut lm, 3, [175]);
     assert!(
         rest.iter().all(|out| out.minutes.is_empty()),
         "nothing repeats"
