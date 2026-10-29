@@ -199,7 +199,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, Semaphore, watch};
 
-use crate::{Backend, Clock};
+use crate::{Backend, Clock, MonotonicClock};
 
 pub use keys::AccessKey;
 
@@ -261,6 +261,11 @@ pub struct ServerConfig {
     pub drain_deadline: Duration,
     /// The time, for the age of a signature.
     pub clock: Arc<dyn Clock>,
+    /// The time, for the rate of a request body (`put_min_bytes_per_sec`). It is a clock that
+    /// only goes forward ([`MonotonicClock`](crate::MonotonicClock) from [`ServerConfig::new`]),
+    /// not `clock`, so that a step of the clock of the machine (the time service setting it)
+    /// while the server waits for a piece does not count for or against the client.
+    pub rate_clock: Arc<dyn Clock>,
 }
 
 impl ServerConfig {
@@ -290,6 +295,7 @@ impl ServerConfig {
             drain_lb_wait: Duration::from_secs(10),
             drain_deadline: Duration::from_secs(900),
             clock,
+            rate_clock: Arc::new(MonotonicClock::new()),
         }
     }
 }
@@ -631,7 +637,7 @@ impl Server {
         let reader = Reader::new(body, limit, config.body_idle_timeout).with_floor(
             floor.0,
             floor.1,
-            Arc::clone(&config.clock),
+            Arc::clone(&config.rate_clock),
         );
         self.dispatch(parts, target, &query, reader, check).await
     }
