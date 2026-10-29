@@ -70,14 +70,14 @@ fn the_task_flags_are_off_unless_the_secret_file_is_given() {
 #[test]
 fn the_flags_need_each_other() {
     let missing = ErrorKind::MissingRequiredArgument;
-    for left_out in 0..TASK.len() {
+    for (left_out, flag) in TASK.iter().enumerate() {
         let given: Vec<&str> = TASK
             .iter()
             .enumerate()
             .filter(|(at, _)| *at != left_out)
             .map(|(_, flag)| *flag)
             .collect();
-        assert_eq!(refused(&given), missing, "without {}", TASK[left_out]);
+        assert_eq!(refused(&given), missing, "without {flag}");
     }
 }
 

@@ -17,6 +17,7 @@ use kbf_front::prepare_run::{
     PutTarget, RunPrep, RunPrepConfig,
 };
 use kbf_front::{Backend, Cache, CacheStorage, PackKeyMint, SegmentsConfig};
+use kbf_meta::{ActionRecord, Role};
 use kbf_proto::reapi::{self, ActionResult, Directory, DirectoryNode, FileNode};
 use kbf_proto::worker::segments_server::Segments;
 use kbf_storage::{Answer, PutStream, ReadStream, Storage, StorageError};
@@ -285,6 +286,19 @@ impl Storage for Watched {
         action: &'a Digest,
     ) -> Answer<'a, Option<(Digest, ActionResult)>> {
         self.inner.action_result(action)
+    }
+
+    fn prepare_action_result<'a>(&'a self, result: &'a ActionResult) -> Answer<'a, ActionRecord> {
+        self.inner.prepare_action_result(result)
+    }
+
+    fn commit_action_record(
+        &self,
+        role: Role,
+        action: Digest,
+        record: ActionRecord,
+    ) -> Answer<'_, ()> {
+        self.inner.commit_action_record(role, action, record)
     }
 }
 
@@ -787,7 +801,13 @@ async fn the_same_inputs_give_the_same_closure_and_scope() {
     assert_eq!(one.closure, two.closure, "another lease, time and farm");
     let again = first.closure(&parts.action).await.expect("collected");
     assert_eq!(one.closure, again);
-    let probe = [parts.tree.root, parts.tree.dup, parts.stray, parts.action];
+    let probe = [
+        parts.tree.root,
+        parts.tree.a,
+        parts.tree.dup,
+        parts.stray,
+        parts.action,
+    ];
     for digest in &probe {
         assert_eq!(
             one.closure.scope().allows(digest),
