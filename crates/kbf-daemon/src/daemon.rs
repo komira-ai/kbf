@@ -101,8 +101,8 @@ use crate::connect::{
     Backoff, Resolve, Server, SystemResolver, Target, WARN_EVERY, WarnLimit, resolve_all,
     rotate_after, unit_random,
 };
-use crate::drain::wait_for_drain;
 use crate::core::{Event, LeaseCore, send};
+use crate::drain::wait_for_drain;
 use crate::extras::{ExtraWake, SessionExtras};
 use crate::kbf_extras::KbfExtras;
 use crate::lease::{Done, Leases, lease_id, proto_lease_id};
