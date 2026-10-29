@@ -15,7 +15,7 @@ use crate::selftest_tests::{Flaw, Flawed};
 use crate::server::{AccessKey, Drained};
 use crate::{
     Backend, Check, FaultyBackend, MemoryBackend, Op, Proxy, ProxyConfig, Reconciler,
-    ReconcilerConfig, SelfTestFailure, TestClock,
+    ReconcilerConfig, SelfTestError, SelfTestFailure, TestClock,
 };
 
 use super::{
@@ -681,19 +681,26 @@ fn the_probe_run_id_is_made_of_the_proxy_the_time_and_the_process() {
     assert_ne!(probe_run_id("p1", 1, 7), probe_run_id("p1", 2, 7));
 }
 
-/// Asserts that a failed self-test is status 3, flags that cannot go together status 2 and any
+/// Asserts that a tier that answered the self-test wrongly is status 3, a tier that could not be
+/// reached status 1 (a restart may mend it), flags that cannot go together status 2 and any
 /// other failure status 1.
 #[test]
-fn a_failed_self_test_has_its_own_exit_status() {
+fn a_wrong_answer_has_its_own_exit_status_and_an_unreachable_tier_has_not() {
     let failure = SelfTestFailure {
         backend: "hot tier memory".to_owned(),
         check: Check::Range,
         observed: "x".to_owned(),
     };
-    let self_test: super::Error = Box::new(failure);
+    let wrong: super::Error = Box::new(SelfTestError::Violation(failure));
+    let down = SelfTestError::Unreachable {
+        backend: "hot tier memory".to_owned(),
+        error: "connection refused".to_owned(),
+    };
+    let down: super::Error = Box::new(down);
     let invalid: super::Error = Box::new(InvalidFlags("x".to_owned()));
     let other: super::Error = "another reason".into();
-    assert_eq!(exit_status(&self_test), 3);
+    assert_eq!(exit_status(&wrong), 3);
+    assert_eq!(exit_status(&down), 1);
     assert_eq!(exit_status(&invalid), 2);
     assert_eq!(exit_status(&other), 1);
 }
@@ -709,31 +716,68 @@ async fn the_tiers_are_tested_before_a_start_and_a_failure_names_the_tier() {
     cli.hot = "s3:hot-bucket".to_owned();
     cli.cold = "dir:/cold".to_owned();
     let good = Flawed::new(Flaw::None);
-    probe_tiers(&cli, &good, &good).await.unwrap();
+    let now = Duration::ZERO;
+    probe_tiers(&cli, &good, &good, now).await.unwrap();
 
     let broken = Flawed::new(Flaw::OverwritesOnCreate);
-    let why = probe_tiers(&cli, &broken, &good).await.unwrap_err();
+    let why = probe_tiers(&cli, &broken, &good, now).await.unwrap_err();
     assert_eq!(exit_status(&why), 3);
     let text = why.to_string();
     assert!(text.contains("hot tier s3:hot-bucket"), "{text}");
     assert!(text.contains("create-only"), "{text}");
 
-    let why = probe_tiers(&cli, &good, &broken).await.unwrap_err();
+    let why = probe_tiers(&cli, &good, &broken, now).await.unwrap_err();
     let text = why.to_string();
     assert!(text.contains("cold tier dir:/cold"), "{text}");
     assert!(text.contains("create-only"), "{text}");
 
     let no_multipart = Flawed::new(Flaw::NoMultipart);
-    probe_tiers(&cli, &no_multipart, &good).await.unwrap();
-    let why = probe_tiers(&cli, &good, &no_multipart).await.unwrap_err();
+    probe_tiers(&cli, &no_multipart, &good, now).await.unwrap();
+    let why = probe_tiers(&cli, &good, &no_multipart, now)
+        .await
+        .unwrap_err();
     assert!(why.to_string().contains("multipart-conditional"), "{why}");
 
     cli.skip_backend_check = vec![SkippedCheck {
         check: Check::MultipartConditional,
         reason: "test".to_owned(),
     }];
-    probe_tiers(&cli, &good, &no_multipart).await.unwrap();
+    probe_tiers(&cli, &good, &no_multipart, now).await.unwrap();
     assert!(good.inner.list("_tiering/").await.unwrap().is_empty());
+}
+
+/// Asserts that a tier that cannot be reached, hot or cold, is not a wrong answer: the start
+/// fails with `tier unreachable: <tier>: <error>` and exit status 1, which the unit restarts; and
+/// that a full hot tier, a state it is designed to be in, and a full cold tier, start.
+#[tokio::test]
+async fn an_unreachable_tier_is_status_1_and_a_full_tier_starts() {
+    let dir = TestDir::under(std::env::temp_dir(), "tierstore-probe-down");
+    let mut cli = cli(&dir);
+    cli.hot = "s3:hot-bucket".to_owned();
+    cli.cold = "s3:cold-bucket".to_owned();
+    let good = Flawed::new(Flaw::None);
+    let now = Duration::ZERO;
+    let down = Flawed::new(Flaw::Down);
+    for (hot, cold, tier) in [
+        (&down, &good, "hot tier s3:hot-bucket"),
+        (&good, &down, "cold tier s3:cold-bucket"),
+    ] {
+        let why = probe_tiers(&cli, hot, cold, now).await.unwrap_err();
+        assert_eq!(exit_status(&why), 1, "{why}");
+        let text = why.to_string();
+        assert!(
+            text.starts_with(&format!("tier unreachable: {tier}: ")),
+            "{text}"
+        );
+        assert!(text.contains("connection refused"), "{text}");
+    }
+
+    let full = Flawed::new(Flaw::Full);
+    probe_tiers(&cli, &full, &good, now).await.unwrap();
+    probe_tiers(&cli, &good, &full, now).await.unwrap();
+    let wrong = Flawed::new(Flaw::IgnoresIfMatch);
+    let why = probe_tiers(&cli, &full, &wrong, now).await.unwrap_err();
+    assert_eq!(exit_status(&why), 3, "{why}");
 }
 
 /// Asserts that the report of a drain names the requests that the deadline cut, and that a drain

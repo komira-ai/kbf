@@ -132,3 +132,24 @@ after five seconds; exit status 2 (a command line the argument parser refused: a
 missing or malformed value; or two keys with one access key id) is not, since a restart cannot
 mend it. Other flag combinations and key files refused after parsing exit 1, and are tried again
 every five seconds.
+
+## The start-up self-test
+
+Before it binds its address the process asks each tier the questions its guarantees rest on: a
+create-only put of a key that exists must be refused, a replace on a wrong ETag must be refused
+and one on the right ETag must work, a ranged read must give exactly the range, a HEAD must give
+the size and the ETag of what was written, a listing after a key must page right, and on the cold
+tier the completion of a multipart upload over a key that exists must be refused. (Only the
+create-only completion is probed, not the refusal of a bad part list.) It uses keys under
+`_tiering/selftest/`, which clients never see; they are deleted afterwards, and keys a killed
+start left more than ten minutes ago are swept. A tier that answers one of them wrongly exits 3
+with the tier, the check and the answer on stderr, and is not restarted
+(`RestartPreventExitStatus=2 3`): fix or replace the store. A tier that cannot be reached (down,
+503, a timeout) is asked three times, then the start exits 1 and is tried again every five seconds.
+A tier that is full (a full hot tier is a designed state) starts: the checks that need a write are
+skipped, with a line on stderr that says so.
+
+`--skip-backend-check multipart-conditional=<reason>` leaves out the multipart check, for a store
+that lacks a conditional completion; the reason is written to stderr at every start. No other check
+can be skipped (exit 2). Without that check a multipart upload to the cold tier may replace an
+object that exists.

@@ -44,7 +44,10 @@
 //! that overwrites, an `If-Match` that is ignored, a range answered with the whole object, a
 //! head with no `Last-Modified`, a listing that ignores `start-after`, and on the cold tier a
 //! multipart completion that overwrites) is not served over: the process says which tier, which
-//! check and what the tier answered, and exits with status 3. `--skip-backend-check` leaves the
+//! check and what the tier answered, and exits with status 3. A tier that cannot be reached (an
+//! error that says it is down, 503, a timeout) is asked three times, and then the start exits with
+//! status 1 and `tier unreachable: <tier>: <error>`. A tier that is full starts: the checks that
+//! need a write are skipped, with a line that says so. `--skip-backend-check` leaves the
 //! multipart-completion check out, for a reason that is logged at the start; no other check can
 //! be left out.
 
@@ -55,7 +58,7 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use tokio::net::TcpListener;
@@ -64,7 +67,7 @@ use tokio::sync::Notify;
 use crate::s3::{Capabilities, Credentials, S3Config};
 use crate::{
     Backend, Check, Clock, DirBackend, MemoryBackend, Proxy, ProxyConfig, Reconciler,
-    ReconcilerConfig, S3Backend, SelfTestFailure, SystemClock, self_test,
+    ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SystemClock, self_test,
 };
 
 use super::keys::{ensure_distinct, read_credentials, read_only_keys};
@@ -510,12 +513,27 @@ fn probe_run_id(proxy_id: &str, now: u64, process: u32) -> String {
     format!("{proxy}-{now}-{process}")
 }
 
+/// How many times a check of the self-test that could not reach its tier is run.
+const SELF_TEST_ATTEMPTS: u32 = 3;
+
+/// How long the self-test waits between two attempts at a tier it could not reach.
+const SELF_TEST_PAUSE: Duration = Duration::from_secs(1);
+
 /// Asks each tier the questions of the self-test, the hot tier first, and says on stderr which
-/// checks the flags leave out. The cold tier is also asked about multipart uploads.
+/// checks the flags leave out, a line before and after each tier with how long it took, and
+/// what the test notes (a check skipped because the tier is full, an attempt repeated, a probe key
+/// not deleted). The cold tier is also asked about multipart uploads. `pause` is the wait between
+/// attempts at a tier that did not answer.
 ///
 /// # Errors
-/// The [`SelfTestFailure`] of the first tier to answer a check wrongly.
-async fn probe_tiers(cli: &Cli, hot: &dyn Backend, cold: &dyn Backend) -> Result<(), Error> {
+/// The [`SelfTestError`] of the first tier to answer a check wrongly (a violation: exit status 3)
+/// or not to answer in any attempt (unreachable: exit status 1).
+async fn probe_tiers(
+    cli: &Cli,
+    hot: &dyn Backend,
+    cold: &dyn Backend,
+    pause: Duration,
+) -> Result<(), Error> {
     let mut skip = Vec::new();
     for skipped in &cli.skip_backend_check {
         eprintln!(
@@ -526,9 +544,26 @@ async fn probe_tiers(cli: &Cli, hot: &dyn Backend, cold: &dyn Backend) -> Result
     }
     let run_id = probe_run_id(&cli.proxy_id, SystemClock.now(), std::process::id());
     let hot_name = format!("hot tier {}", cli.hot);
-    self_test(&hot_name, hot, &run_id, false, &skip).await?;
     let cold_name = format!("cold tier {}", cli.cold);
-    self_test(&cold_name, cold, &run_id, true, &skip).await?;
+    let tiers = [(&hot_name, hot, false), (&cold_name, cold, true)];
+    for (name, backend, multipart) in tiers {
+        let options = SelfTestOptions {
+            name,
+            run_id: &run_id,
+            multipart,
+            skip: &skip,
+            attempts: SELF_TEST_ATTEMPTS,
+            pause,
+            now: SystemClock.now(),
+        };
+        let note = |line: String| eprintln!("tierstore: {line}");
+        eprintln!("tierstore: testing the {name}");
+        let started = Instant::now();
+        let outcome = self_test(backend, &options, &note).await;
+        let took = started.elapsed().as_millis();
+        eprintln!("tierstore: tested the {name} in {took} ms");
+        outcome?;
+    }
     Ok(())
 }
 
@@ -540,7 +575,7 @@ async fn probe_tiers(cli: &Cli, hot: &dyn Backend, cold: &dyn Backend) -> Result
 ///
 /// # Errors
 /// A flag that is not valid with the others, a key file or a tier that cannot be used, a tier
-/// that fails the self-test (a [`SelfTestFailure`]), a proxy that cannot be opened, or an address
+/// that fails the self-test (a [`SelfTestError`]), a proxy that cannot be opened, or an address
 /// that cannot be bound.
 pub async fn run(
     cli: &Cli,
@@ -548,7 +583,13 @@ pub async fn run(
     ready: impl FnOnce(SocketAddr),
 ) -> Result<Drained, Error> {
     let built = build(cli)?;
-    probe_tiers(cli, built.hot.as_ref(), built.cold.as_ref()).await?;
+    probe_tiers(
+        cli,
+        built.hot.as_ref(),
+        built.cold.as_ref(),
+        SELF_TEST_PAUSE,
+    )
+    .await?;
     let (hot, cold) = (Arc::clone(&built.hot), Arc::clone(&built.cold));
     let opened = Proxy::open(hot, cold, built.proxy).await;
     let proxy = opened.map_err(|why| format!("opening the proxy: {why}"))?;
@@ -634,14 +675,15 @@ pub fn main(args: Vec<OsString>) -> ExitCode {
 }
 
 /// The exit status of a start that failed: 2 for flags that cannot go together, 3 for a tier
-/// that failed the self-test, 1 for anything else.
+/// that answered the self-test wrongly, 1 for anything else (a tier that could not be reached
+/// among it: a restart may mend that).
 fn exit_status(why: &Error) -> u8 {
     if why.downcast_ref::<InvalidFlags>().is_some() {
-        2
-    } else if why.downcast_ref::<SelfTestFailure>().is_some() {
-        3
-    } else {
-        1
+        return 2;
+    }
+    match why.downcast_ref::<SelfTestError>() {
+        Some(SelfTestError::Violation(_)) => 3,
+        Some(SelfTestError::Unreachable { .. }) | None => 1,
     }
 }
 

@@ -398,10 +398,12 @@ async fn it_serves_over_two_s3_tiers_and_lands_a_multipart_upload_in_the_cold_on
 }
 
 /// Asserts that a start whose cold tier is an S3 store that cannot be reached exits with status
-/// 3 before it serves anything: nothing on stdout (no start line), and a message that says the
-/// start is refused, names the cold tier as the flag gave it and says which check failed.
+/// 1 (not 3, which is a store that answered wrongly: the unit restarts a status 1) before it
+/// serves anything: nothing on stdout (no start line), and a last line that says the tier is
+/// unreachable, names the cold tier as the flag gave it and says which check could not be run;
+/// the hot tier, a memory tier, was tested before it and said so.
 #[test]
-fn a_tier_that_fails_the_self_test_is_a_refused_start_with_status_3() {
+fn a_tier_that_cannot_be_reached_by_the_self_test_is_a_start_that_exits_1() {
     let files = Files::new("bin-selftest-refused");
     let secret = files.secret("cold-key", "ID\nsecret\n");
     let key = secret.display().to_string();
@@ -413,10 +415,15 @@ fn a_tier_that_fails_the_self_test_is_a_refused_start_with_status_3() {
     ]);
     let flags = with(&described, "--cold", "s3:cold-bucket");
     let (code, out, err) = run(&flags);
-    assert_eq!((code, out.as_str()), (3, ""));
-    assert!(err.starts_with("tierstore: refusing to start: "), "{err}");
-    assert!(err.contains("cold tier s3:cold-bucket"), "{err}");
-    assert!(err.contains("create-only"), "{err}");
+    assert_eq!((code, out.as_str()), (1, ""));
+    assert!(
+        err.contains("tierstore: tested the hot tier memory in "),
+        "{err}"
+    );
+    let last = err.lines().last().unwrap();
+    let want = "tierstore: tier unreachable: cold tier s3:cold-bucket: ";
+    assert!(last.starts_with(want), "{err}");
+    assert!(last.contains("create-only"), "{err}");
 }
 
 /// Asserts that a start with a tier that its flags do not describe exits with status 1 and a

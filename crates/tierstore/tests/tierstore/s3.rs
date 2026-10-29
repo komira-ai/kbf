@@ -13,7 +13,7 @@ use kbf_objstore::s3::fake::{FakeS3, part_etag};
 use tierstore::s3::{Capabilities, Credentials, S3Config};
 use tierstore::{
     Backend, ByteRange, Clock, Error, PartBody, Proxy, ProxyConfig, Reconciler, ReconcilerConfig,
-    S3Backend, SystemClock, self_test,
+    S3Backend, SelfTestError, SelfTestOptions, SystemClock, self_test,
 };
 
 use crate::conformance;
@@ -46,14 +46,67 @@ async fn backend() -> (FakeS3, S3Backend) {
 #[tokio::test]
 async fn the_self_test_passes_over_the_s3_service_and_leaves_nothing() {
     let (s3, backend) = backend().await;
-    self_test("hot", &backend, "run-1", false, &[])
+    for multipart in [false, true] {
+        let options = self_test_options("run-1", multipart);
+        self_test(&backend, &options, &|line: String| panic!("{line}"))
+            .await
+            .unwrap();
+    }
+    assert!(s3.keys().is_empty(), "{:?}", s3.keys());
+    assert_eq!(s3.incomplete_uploads(), 0);
+}
+
+/// The options of a self-test that waits no time between its attempts.
+fn self_test_options(run_id: &str, multipart: bool) -> SelfTestOptions<'_> {
+    SelfTestOptions {
+        name: "the service",
+        run_id,
+        multipart,
+        skip: &[],
+        attempts: 2,
+        pause: Duration::ZERO,
+        now: 0,
+    }
+}
+
+/// Asserts that a probe key an earlier start left, read from the listing of the service with the
+/// time the service stamped it with, is deleted when its age is over ten minutes.
+#[tokio::test]
+async fn the_self_test_sweeps_probe_keys_of_an_earlier_start_over_the_s3_service() {
+    let (s3, backend) = backend().await;
+    s3.set_time(1);
+    let left = bytes::Bytes::from_static(b"x");
+    backend
+        .put("_tiering/selftest/killed-start/create", left)
         .await
         .unwrap();
-    self_test("cold", &backend, "run-1", true, &[])
+    assert_eq!(s3.keys().len(), 1);
+    let mut options = self_test_options("run-1", true);
+    options.now = 2_000_000_000;
+    self_test(&backend, &options, &|line: String| panic!("{line}"))
         .await
         .unwrap();
     assert!(s3.keys().is_empty(), "{:?}", s3.keys());
-    assert_eq!(s3.incomplete_uploads(), 0);
+}
+
+/// Asserts that a service that does not answer is an unreachable tier, not a wrong answer, after
+/// the attempts given: the closed port of the service of a test that has stopped.
+#[tokio::test]
+async fn the_self_test_calls_a_service_that_does_not_answer_unreachable() {
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let backend = S3Backend::new(config(&endpoint)).unwrap();
+    let notes = Mutex::new(Vec::new());
+    let note = |line: String| notes.lock().unwrap().push(line);
+    let options = self_test_options("run-1", true);
+    let outcome = self_test(&backend, &options, &note).await;
+    let Err(SelfTestError::Unreachable { backend, error }) = outcome else {
+        panic!("not unreachable");
+    };
+    assert_eq!(backend, "the service");
+    assert!(error.contains("create-only"), "{error}");
+    assert_eq!(notes.lock().unwrap().len(), 1);
 }
 
 /// Asserts that a call failed with `Error::Other`.

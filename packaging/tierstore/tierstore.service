@@ -58,10 +58,13 @@ TimeoutStopSec=960
 # A start that fails (a store that cannot be reached yet, an address in use) is tried again.
 # Exit 2 is a command line the argument parser refused (an unknown flag, a missing or malformed
 # value) or two keys with one access key id: a restart cannot mend it. Other flag combinations and
-# key files refused after parsing exit 1 and are tried again every 5 s.
+# key files refused after parsing exit 1 and are tried again every 5 s. Exit 3 is a tier that
+# answered the start-up self-test wrongly (a store that overwrites on a create-only put, say): a
+# restart would ask the same store the same questions, so it is not tried again. A tier that could
+# not be reached exits 1 and is.
 Restart=on-failure
 RestartSec=5
-RestartPreventExitStatus=2
+RestartPreventExitStatus=2 3
 LimitNOFILE=65536
 UMask=0077
 NoNewPrivileges=yes
