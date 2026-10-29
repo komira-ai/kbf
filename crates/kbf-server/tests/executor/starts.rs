@@ -40,7 +40,7 @@ async fn an_action_runs_end_to_end() {
     let url = run.arg("--pack-url").expect("a pack url");
     let lease = run.arg("--lease").expect("a lease");
     assert!(
-        url.starts_with(&format!("http://store.test/cas/b/{lease}/")),
+        url.starts_with(&format!("https://store.test/cas/b/{lease}/")),
         "{url}"
     );
     assert!(!lease.contains('.'), "{lease}");

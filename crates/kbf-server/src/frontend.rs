@@ -60,8 +60,9 @@
 //! the farm then runs the actions it places on hosts leased from the job scheduler's lease
 //! server ([`crate::executor`]), and `FrontendHandle::serve` steps it beside the listeners and
 //! releases its leases when the frontend stops. It needs the packs and, given to
-//! [`start_frontend_with`], the preparation of task runs. By default, `--executor kbf-daemon`,
-//! nothing is built and no lease server is contacted.
+//! [`start_frontend_with`], the preparation of task runs, which the shipped binary does not
+//! give yet (kbf#1966): `--executor js-agent` is refused at start there. By default,
+//! `--executor kbf-daemon`, nothing is built and no lease server is contacted.
 //!
 //! **Readiness** (`GET /readyz`, `grpc.health.v1`) fails when the storage node does not
 //! answer an action-cache lookup within `--readyz-store-timeout-ms`, when the state store (if
@@ -608,7 +609,9 @@ impl FrontendHandle {
             .map(|task| AbortOnDrop(tokio::spawn(task).abort_handle()))
             .collect();
         // Started with the listeners: a frontend that never serves leases no host. Stopped
-        // after them, so the runs of builds still open are not cut before the drain ends.
+        // after the serving future (the listeners and their drain) is over, so the runs of
+        // builds still open are not cut before the drain ends; the background tasks above are
+        // not listeners and live to the end of this function.
         let mut running = self.executor.map(Running::spawn);
         let serving = escalating(self.serving, &self.drain, self.escalation);
         let served = match running.as_mut() {

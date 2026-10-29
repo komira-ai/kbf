@@ -76,27 +76,26 @@ fn a_frontend_with_no_executor_flag_runs_on_daemons_and_holds_no_settings() {
 }
 
 /// Catches the rollback losing its settings or tripping on them: with `--executor kbf-daemon`
-/// every setting of the lease server may stay in the unit or `kbf.toml`, and none is read.
+/// (or none) every setting of the lease server may stay in the unit or `kbf.toml`, the one that
+/// lets secrets travel as arguments too, and none is read. Flipping the one flag is the
+/// rollback: a frontend that refused to start over a setting nothing reads would need a second
+/// edit in an incident.
 #[test]
 fn the_daemon_executor_keeps_the_lease_servers_settings_unread() {
-    let mut all: Vec<&str> = JS.to_vec();
-    all[0] = "--executor=kbf-daemon";
-    all.retain(|flag| *flag != "--executor-insecure-argv-secrets");
-    let flags = parsed(argv(&all)).expect("flags");
-    assert_eq!(flags.executor.kind, ExecutorKind::KbfDaemon);
-    assert!(flags.executor.js.is_none());
-}
-
-/// Catches a setting that weakens a secret being accepted where it does nothing: the secrets of
-/// a task as arguments are for `js-agent` alone.
-#[test]
-fn the_secrets_as_arguments_are_refused_without_js_agent() {
-    for executor in [&["--executor=kbf-daemon"][..], &[]] {
-        let mut all = executor.to_vec();
-        all.push("--executor-insecure-argv-secrets");
-        let why = parsed(argv(&all)).expect_err("refused");
-        assert!(why.contains("--executor-insecure-argv-secrets"), "{why}");
-        assert!(why.contains("js-agent"), "{why}");
+    // The warning is made (its arguments are only evaluated under a subscriber).
+    let _logged =
+        tracing::subscriber::set_default(tracing_subscriber::fmt().with_test_writer().finish());
+    for executor in ["--executor=kbf-daemon", ""] {
+        let mut all: Vec<&str> = JS.to_vec();
+        if executor.is_empty() {
+            all.remove(0);
+        } else {
+            all[0] = executor;
+        }
+        assert!(all.contains(&"--executor-insecure-argv-secrets"));
+        let flags = parsed(argv(&all)).expect("flags");
+        assert_eq!(flags.executor.kind, ExecutorKind::KbfDaemon);
+        assert!(flags.executor.js.is_none());
     }
 }
 

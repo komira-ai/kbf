@@ -59,18 +59,18 @@ async fn drive(
     loop {
         if Instant::now() >= next_check {
             next_check = Instant::now() + executor.rival_check();
-            if let Some(rival) = executor.rival().await {
-                tracing::error!(
-                    %rival,
-                    "another frontend holds hosts on the lease server: the executor runs on exactly one frontend"
-                );
-                let _ = failed.send(format!(
-                    "the frontend {rival:?} holds hosts on the lease server too: the executor runs on exactly one frontend"
-                ));
+            if let Some(why) = executor.rival().await {
+                tracing::error!(%why, "another frontend holds hosts: the executor runs on exactly one frontend");
+                let _ = failed.send(why);
                 break;
             }
         }
         executor.step().await;
+        if let Some(why) = executor.twin() {
+            tracing::error!(%why, "another process runs under this frontend's id");
+            let _ = failed.send(why.to_owned());
+            break;
+        }
         tokio::select! {
             _ = stopped.changed() => break,
             () = sleep(executor.poll()) => {}

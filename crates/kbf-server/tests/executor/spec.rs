@@ -117,6 +117,34 @@ async fn a_read_grant_that_is_not_https_is_never_posted() {
     assert!(rig.runs().await.is_empty());
 }
 
+/// Catches a write url sent in clear without the operator's word: a pack url that is not
+/// https is infrastructure to rerun while `allow_plain_http_put` is unset, and no run is posted
+/// with it; with the flag set the same url is posted.
+#[tokio::test(start_paused = true)]
+async fn a_pack_url_that_is_not_https_is_posted_only_when_plain_http_is_allowed() {
+    for allowed in [false, true] {
+        let mut rig =
+            Rig::start(&["node1"], 1, move |cfg| cfg.allow_plain_http_put = allowed).await;
+        rig.presign
+            .plain
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        rig.pump().await;
+        let caller = rig.submit(3);
+        match allowed {
+            false => {
+                let finished = rig.until_done(&caller, 3).await;
+                assert_eq!(code(&finished), Code::Internal, "{finished:?}");
+                assert!(rig.runs().await.is_empty());
+            }
+            true => {
+                let run = posted(&mut rig).await;
+                let url = run.arg("--pack-url").expect("a pack url");
+                assert!(url.starts_with("http://store.test/"), "{url}");
+            }
+        }
+    }
+}
+
 /// Catches an image with an entrypoint being run: the lease server appends the arguments to
 /// it, the secrets go to that program and the task tool never runs. The caller is told the
 /// action cannot run here, and nothing is posted.

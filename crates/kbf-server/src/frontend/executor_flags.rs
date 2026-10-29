@@ -7,9 +7,8 @@
 //!
 //! The companions are the frontend's own. They are not refused with `kbf-daemon`, so a unit or
 //! `kbf.toml` that names the lease server keeps its settings when the executor is switched back
-//! (the rollback is the one flag), with one exception: `--executor-insecure-argv-secrets` lets
-//! the secrets of a task travel as arguments, where the action can read them, and a setting that
-//! weakens a secret is never left in a file that does not use it.
+//! (the rollback is the one flag). `--executor-insecure-argv-secrets` too: it is ignored with a
+//! warning, since nothing reads it there, and refusing it would make the rollback a second edit.
 //!
 //! The executor runs on exactly one frontend. There is no flag that says a frontend is one of
 //! several: any frontends that open the same state store are, so the executor itself looks for
@@ -120,7 +119,10 @@ pub(super) fn args() -> Vec<Arg> {
                  `--executor-insecure-argv-secrets`. The executor runs on exactly one \
                  frontend: a second frontend that holds hosts on the same lease server stops. \
                  A restart of the frontend fails the builds in flight. Switching back to \
-                 `kbf-daemon` releases the leases when the frontend is stopped",
+                 `kbf-daemon` releases the leases when the frontend is stopped, not when it is \
+                 killed: a killed frontend's leases stay held until their ttl ends \
+                 (`--executor-lease-ttl-secs`), unless a later `js-agent` start releases them. \
+                 `--executor-insecure-argv-secrets` is ignored with `kbf-daemon`",
             ),
         text(
             FRONTEND,
@@ -128,8 +130,9 @@ pub(super) fn args() -> Vec<Arg> {
             "ID",
             "The name of this frontend on the lease server: the value of the `kbf-frontend` \
              label on its leases, by which a restarted frontend finds them and releases the \
-             ones it no longer needs. 1 to 63 of letters, digits, `-`, `_` and `.`. Used only \
-             with `--executor js-agent`",
+             ones it no longer needs. 1 to 63 of letters, digits, `-`, `_` and `.`. It must be \
+             different for each frontend (not copied with the config). Used only with \
+             `--executor js-agent`",
         ),
         text(
             LEASE_URL,
@@ -327,18 +330,19 @@ impl Default for ExecutorFlags {
 /// The setting the flags in `m` make.
 ///
 /// # Errors
-/// `--executor-insecure-argv-secrets` without `--executor js-agent`; for `js-agent`, a flag it
+/// For `js-agent`, a flag it
 /// needs that is missing, a setting that breaks a rule ([`Config::validate`]), a lease server
 /// URL that is not one or does not agree with the CA flag, or a task tool or root certificate
 /// path that is not one.
 pub(super) fn from_matches(m: &ArgMatches) -> Result<ExecutorFlags, String> {
     let js_agent = m.get_one::<String>(KIND).is_some_and(|k| k == "js-agent");
     if !js_agent {
+        // Every setting of the executor may stay in the unit or `kbf.toml` after the rollback,
+        // this one too: nothing reads it here, and refusing it would make the rollback a second
+        // edit, in an incident.
         if m.get_flag(INSECURE) {
-            return Err(
-                "--executor-insecure-argv-secrets is for --executor js-agent: it lets the \
-                        secrets of a task travel as arguments, and nothing else may be told to"
-                    .to_owned(),
+            tracing::warn!(
+                "--executor-insecure-argv-secrets is ignored: it is for --executor js-agent, and this frontend runs placed actions on daemons"
             );
         }
         return Ok(ExecutorFlags::default());

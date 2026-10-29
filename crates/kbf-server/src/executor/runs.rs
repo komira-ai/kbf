@@ -358,6 +358,11 @@ impl HostWorker {
             .presign
             .put_url(&self.host, &key, wall, ctx.cfg.max_pack_bytes)
             .await?;
+        // The signed url is the task's write permission: sent in clear only if the operator
+        // said the store does not serve TLS yet.
+        if !ctx.cfg.allow_plain_http_put && !pack.expose().starts_with("https://") {
+            return Err(Settled::Infra("the pack url is not https".to_owned()));
+        }
         let grant = ctx.deps.inputs.read_grant(lease, action, wall).await?;
         // The bearer token goes into the arguments: not over a scheme that sends it in clear.
         if !grant.url.starts_with("https://") {

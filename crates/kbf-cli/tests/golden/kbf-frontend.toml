@@ -39,7 +39,7 @@ enroll-rate-per-minute = 60
 # frontend-name = []
 
 [executor]
-# Where the farm runs the actions it places. `kbf-daemon`, the default, is the daemon of each node, over the worker listener: no executor is built and no lease server is contacted, whatever the other `--executor-*` flags say. `js-agent` runs them on hosts leased from the job scheduler's lease server, in the action's own image, by a task tool the agent mounts; it needs the lease server's flags (`--executor-lease-url`, `--executor-lease-token-file`, and `--executor-lease-ca-file` for https), the pool's (`--executor-class`, `--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`), `--executor-frontend-id`, the packs (`--pack-store-endpoint`) and `--executor-insecure-argv-secrets`. The executor runs on exactly one frontend: a second frontend that holds hosts on the same lease server stops. A restart of the frontend fails the builds in flight. Switching back to `kbf-daemon` releases the leases when the frontend is stopped
+# Where the farm runs the actions it places. `kbf-daemon`, the default, is the daemon of each node, over the worker listener: no executor is built and no lease server is contacted, whatever the other `--executor-*` flags say. `js-agent` runs them on hosts leased from the job scheduler's lease server, in the action's own image, by a task tool the agent mounts; it needs the lease server's flags (`--executor-lease-url`, `--executor-lease-token-file`, and `--executor-lease-ca-file` for https), the pool's (`--executor-class`, `--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`), `--executor-frontend-id`, the packs (`--pack-store-endpoint`) and `--executor-insecure-argv-secrets`. The executor runs on exactly one frontend: a second frontend that holds hosts on the same lease server stops. A restart of the frontend fails the builds in flight. Switching back to `kbf-daemon` releases the leases when the frontend is stopped, not when it is killed: a killed frontend's leases stay held until their ttl ends (`--executor-lease-ttl-secs`), unless a later `js-agent` start releases them. `--executor-insecure-argv-secrets` is ignored with `kbf-daemon`
 executor = "kbf-daemon"
 # Lets the task write its pack to an `http://` url, until the store serves TLS. The reads stay https. Used only with `--executor js-agent`
 executor-allow-plain-http-put = false
@@ -51,7 +51,7 @@ executor-call-timeout-secs = 5
 # executor-class = "CLASS"
 # The timeout, in seconds, of an action that names none: at most `--executor-max-run-secs`. Used only with `--executor js-agent`
 executor-default-timeout-secs = 3000
-# The name of this frontend on the lease server: the value of the `kbf-frontend` label on its leases, by which a restarted frontend finds them and releases the ones it no longer needs. 1 to 63 of letters, digits, `-`, `_` and `.`. Used only with `--executor js-agent`
+# The name of this frontend on the lease server: the value of the `kbf-frontend` label on its leases, by which a restarted frontend finds them and releases the ones it no longer needs. 1 to 63 of letters, digits, `-`, `_` and `.`. It must be different for each frontend (not copied with the config). Used only with `--executor js-agent`
 # executor-frontend-id = "ID"
 # The CPU cores a host's lease holds: the pool's shape. At least 1. Used only with `--executor js-agent`
 # executor-host-cpus = "CORES"

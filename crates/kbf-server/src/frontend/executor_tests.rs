@@ -99,6 +99,20 @@ async fn leases_of(client: &Client) -> Vec<kbf_lease_client::Lease> {
     client.leases().await.expect("leases")
 }
 
+/// Waits until the lease server lists a lease of the frontend `id`, and returns the leases.
+async fn leased_by(client: &Client, id: &str) -> Vec<kbf_lease_client::Lease> {
+    loop {
+        let leases = leases_of(client).await;
+        if leases
+            .iter()
+            .any(|l| l.labels.get("kbf-frontend").is_some_and(|v| v == id))
+        {
+            return leases;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
 /// Waits until `check` holds of the scraped metrics of `api`, asking again each time the
 /// frontend has had the chance to do something.
 async fn scraped_until(api: std::net::SocketAddr, check: impl Fn(&str) -> bool) -> String {
@@ -201,7 +215,12 @@ async fn a_frontend_stops_when_another_frontend_holds_hosts() {
         &["--executor=js-agent", "--executor-insecure-argv-secrets"],
     );
     let (handle, _stop) = started(&flags, Some(source())).expect("starts");
-    let served = handle.serve().await;
+    // A frontend that does not stop would lease a host of its own: the test fails then, with
+    // the leases, instead of waiting for a stop that does not come.
+    let served = tokio::select! {
+        served = handle.serve() => served,
+        held = leased_by(&api_client, "front-1") => panic!("it leased a host of its own: {held:?}"),
+    };
     let Err(ServeError::Executor(why)) = served else {
         panic!("not refused: {served:?}");
     };

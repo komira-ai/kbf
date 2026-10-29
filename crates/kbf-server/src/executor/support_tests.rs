@@ -46,7 +46,7 @@ impl Presign for Easy {
         _: Duration,
         _: u64,
     ) -> Result<Secret, PresignError> {
-        Ok(Secret::new(format!("http://store.test/{key}")))
+        Ok(Secret::new(format!("https://store.test/{key}")))
     }
 }
 

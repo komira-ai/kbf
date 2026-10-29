@@ -6,7 +6,7 @@ use std::time::Duration;
 use kbf_lease_client::{AcquireRequest, Lease, LeaseState, Resources};
 use kbf_server::executor::Running;
 
-use crate::rig::{GIB, Rig, count, settle};
+use crate::rig::{GIB, Rig, count, count_tail, settle};
 
 /// Lets `seconds` pass in steps of 5 s, the farm ticking after each.
 async fn pass(rig: &Rig, seconds: u64) {
@@ -24,6 +24,20 @@ async fn live(rig: &Rig) -> Vec<Lease> {
         .into_iter()
         .filter(|l| matches!(l.state, LeaseState::Held | LeaseState::Pending))
         .collect()
+}
+
+/// Lets time pass in steps of 5 s, at most `steps` of them, until `running` says why it
+/// stopped. No wall-clock assertion: a driver that never stops is `None`, not a hang.
+async fn stopped_within(rig: &Rig, running: &mut Running, steps: u32) -> Option<String> {
+    let failed = running.failed();
+    tokio::pin!(failed);
+    for _ in 0..steps {
+        tokio::select! {
+            why = &mut failed => return Some(why),
+            () = pass(rig, 5) => {}
+        }
+    }
+    None
 }
 
 /// Books a lease for the frontend `frontend`, from the lease server itself.
@@ -75,7 +89,9 @@ async fn a_rival_found_at_the_start_stops_the_driver_before_it_leases_anything()
     let rig = Rig::start(&["node1", "node2"], 1, |_| {}).await;
     book_for(&rig, "front-2").await;
     let mut running = Running::spawn(rig.restarted_executor());
-    let why = running.failed().await;
+    let why = stopped_within(&rig, &mut running, 40)
+        .await
+        .expect("the driver did not stop");
     assert!(why.contains("front-2"), "{why}");
     running.stop().await;
     assert_eq!(
@@ -86,31 +102,76 @@ async fn a_rival_found_at_the_start_stops_the_driver_before_it_leases_anything()
     assert_eq!(live(&rig).await.len(), 1);
 }
 
-/// Catches two frontends that started together, each seeing the other's lease only after
-/// its own: the check is made again, and the driver that finds a rival then stops and releases
-/// its hosts.
+/// Catches a running driver stopped by a frontend that came after it: the older frontend goes
+/// on holding its host through the checks that find the newer one's lease, and the newer one,
+/// which stops itself at its own first check, is the one that leaves.
 #[tokio::test(start_paused = true)]
-async fn a_rival_that_appears_later_stops_the_driver_and_its_hosts_are_released() {
+async fn a_rival_that_appears_later_does_not_stop_the_older_driver() {
     let rig = Rig::start(&["node1", "node2"], 1, |_| {}).await;
     let mut running = Running::spawn(rig.restarted_executor());
     pass(&rig, 10).await;
     assert_eq!(live(&rig).await.len(), 1);
     book_for(&rig, "front-2").await;
-    let why = {
-        let failed = running.failed();
-        tokio::pin!(failed);
-        loop {
-            tokio::select! {
-                why = &mut failed => break why,
-                () = pass(&rig, 5) => {}
-            }
-        }
-    };
-    assert!(why.contains("front-2"), "{why}");
+    pass(&rig, 130).await;
+    let failed = tokio::time::timeout(Duration::ZERO, running.failed()).await;
+    assert!(failed.is_err(), "the older frontend stopped");
+    assert_eq!(live(&rig).await.len(), 2, "it holds its host");
     running.stop().await;
     let held = live(&rig).await;
     assert_eq!(held.len(), 1, "{held:?}");
     assert_eq!(held[0].labels["kbf-frontend"], "front-2");
+}
+
+/// Catches two frontends that started together, each leasing a host before it saw the other's,
+/// both stopping at the next check and the farm left with no executor, or neither stopping and
+/// the farm with two: exactly one stops and releases its host, whether the two have different
+/// ids or (a config copied to a second frontend) the same one.
+#[tokio::test(start_paused = true)]
+async fn of_two_frontends_that_started_together_exactly_one_stops() {
+    for (first, second) in [("front-1", "front-2"), ("front-1", "front-1")] {
+        let rig = Rig::start(&["node1", "node2"], 1, |_| {}).await;
+        let mut a = Running::spawn(rig.other_executor(first));
+        let mut b = Running::spawn(rig.other_executor(second));
+        pass(&rig, 130).await;
+        let stopped = [
+            tokio::time::timeout(Duration::ZERO, a.failed())
+                .await
+                .is_ok(),
+            tokio::time::timeout(Duration::ZERO, b.failed())
+                .await
+                .is_ok(),
+        ];
+        assert_eq!(
+            stopped.iter().filter(|stopped| **stopped).count(),
+            1,
+            "{first} and {second}: {stopped:?}"
+        );
+        a.stop().await;
+        b.stop().await;
+    }
+}
+
+/// Catches a second process under the same frontend id that takes the first one's leases and
+/// stops their runs (a config copied to a second frontend): it finds the leases renewed while it
+/// watches them, stops with an error that says the id is shared, and the first process keeps
+/// its host and its run.
+#[tokio::test(start_paused = true)]
+async fn a_second_process_under_a_live_frontends_id_stops_and_leaves_its_hosts_alone() {
+    let rig = Rig::start(&["node1", "node2"], 1, |_| {}).await;
+    let mut first = Running::spawn(rig.restarted_executor());
+    pass(&rig, 10).await;
+    assert_eq!(live(&rig).await.len(), 1);
+    let mut second = Running::spawn(rig.restarted_executor());
+    let why = stopped_within(&rig, &mut second, 40)
+        .await
+        .expect("the second process did not stop");
+    assert!(why.contains("same id"), "{why}");
+    second.stop().await;
+    assert_eq!(live(&rig).await.len(), 1, "the first process lost its host");
+    assert_eq!(count_tail(&rig.requests(), "DELETE", ""), 0);
+    let failed = tokio::time::timeout(Duration::ZERO, first.failed()).await;
+    assert!(failed.is_err(), "the first process stopped");
+    first.stop().await;
 }
 
 /// Catches a list of leases that could not be read being taken for a rival, or for the want of

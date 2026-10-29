@@ -174,6 +174,8 @@ async fn a_restarted_frontend_adopts_its_leases_and_stops_their_runs() {
     let first = rig.runs_of(1).await.remove(0);
     let lease = rig.exec.hosts()[0].lease;
     rig.exec = rig.restarted_executor();
+    rig.exec.step().await;
+    rig.watch_over().await;
     rig.pump().await;
     assert_eq!(rig.exec.hosts().len(), 1);
     assert_eq!(
@@ -209,6 +211,8 @@ async fn adoption_releases_what_the_pool_does_not_need_and_waits_for_what_is_boo
     assert_eq!(leases.len(), 2);
     rig.cfg.hosts = 1;
     rig.exec = rig.restarted_executor();
+    rig.exec.step().await;
+    rig.watch_over().await;
     rig.pump().await;
     assert_eq!(rig.exec.hosts().len(), 1);
     assert_eq!(
@@ -221,6 +225,8 @@ async fn adoption_releases_what_the_pool_does_not_need_and_waits_for_what_is_boo
     booked.pump().await;
     let lease = booked.api.leases().await.expect("leases")[0].id;
     booked.exec = booked.restarted_executor();
+    booked.exec.step().await;
+    booked.watch_over().await;
     booked.pump().await;
     assert_eq!(count(&booked.requests(), "POST /v1/leases"), 1);
     assert!(booked.fake.ready(lease));
@@ -228,6 +234,93 @@ async fn adoption_releases_what_the_pool_does_not_need_and_waits_for_what_is_boo
     assert_eq!(booked.exec.hosts()[0].lease, lease);
     let state = booked.api.leases().await.expect("leases")[0].state;
     assert_eq!(state, LeaseState::Held);
+}
+
+/// Catches a restarted frontend that takes the leases of an earlier process at once: that
+/// process may be alive (a config copied to a second frontend), and its runs would be stopped.
+/// Nothing is taken, stopped or asked for while the leases are watched for a renewal; once they
+/// are seen not to be renewed, they are adopted.
+#[tokio::test(start_paused = true)]
+async fn an_earlier_process_leases_are_taken_only_after_they_are_seen_not_to_be_renewed() {
+    let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
+    rig.pump().await;
+    let _caller = rig.submit(1);
+    rig.pump().await;
+    let lease = rig.exec.hosts()[0].lease;
+    let first = rig.runs_of(1).await.remove(0);
+    rig.exec = rig.restarted_executor();
+    rig.pump().await;
+    assert!(rig.exec.hosts().is_empty(), "taken at once");
+    assert_eq!(count(&rig.requests(), "POST /v1/leases"), 1);
+    assert_eq!(count_tail(&rig.requests(), "DELETE", ""), 0);
+    rig.watch_over().await;
+    rig.pump().await;
+    assert_eq!(rig.exec.hosts()[0].lease, lease);
+    let stopped = format!("DELETE /v1/leases/{lease}/runs/{}", first.run);
+    assert_eq!(count(&rig.requests(), &stopped), 1, "its run");
+    assert!(rig.exec.twin().is_none());
+}
+
+/// Catches a second process under a live executor's frontend id adopting its lease: stepping
+/// both, the lease is renewed while the second watches, so it concludes the id is shared and
+/// stops, and nothing of the first's run or lease is touched.
+#[tokio::test(start_paused = true)]
+async fn an_executor_that_finds_a_live_one_under_its_id_stops_without_touching_it() {
+    let mut rig = Rig::start(&["node1", "node2"], 1, |_| {}).await;
+    rig.pump().await;
+    let _caller = rig.submit(1);
+    rig.pump().await;
+    let lease = rig.exec.hosts()[0].lease;
+    let mut twin = rig.restarted_executor();
+    for _ in 0..(rig.cfg.adopt_watch().as_secs() / 5 + 3) {
+        rig.advance(Duration::from_secs(5)).await;
+        rig.exec.step().await;
+        twin.step().await;
+    }
+    let why = twin.twin().expect("the twin did not stop");
+    assert!(why.contains("same id"), "{why}");
+    assert!(twin.hosts().is_empty());
+    assert_eq!(rig.exec.hosts()[0].lease, lease, "the first lost its host");
+    assert_eq!(count_tail(&rig.requests(), "DELETE", ""), 0);
+    assert_eq!(count(&rig.requests(), "POST /v1/leases"), 1);
+}
+
+/// Catches the periodic check releasing a lease of another process under the same frontend id
+/// as a stray: it is that process's, not a lease nobody holds.
+#[tokio::test(start_paused = true)]
+async fn the_stray_check_leaves_another_processs_lease_alone() {
+    let mut rig = Rig::start(&["node1", "node2"], 1, |_| {}).await;
+    rig.pump().await;
+    let resources = kbf_lease_client::Resources {
+        cpu_millis: 2_000,
+        memory_bytes: 16 * crate::rig::GIB,
+        gpus: 0,
+        gpu_class: None,
+    };
+    let request = kbf_lease_client::AcquireRequest::new("farm-linux", resources, rig.cfg.max_wall)
+        .label("kbf-frontend", &rig.cfg.frontend)
+        .label("kbf-instance", "another-process");
+    let other = match rig.api.acquire(&request).await.expect("booked") {
+        kbf_lease_client::Acquired::Granted(granted) => granted.id,
+        kbf_lease_client::Acquired::Pending(pending) => pending.id,
+    };
+    rig.elapse(130).await;
+    assert_eq!(state_of(&rig, other).await, Some(LeaseState::Held));
+    assert_eq!(
+        count(&rig.requests(), &format!("DELETE /v1/leases/{other}")),
+        0
+    );
+}
+
+/// Catches a lease of this very process that no slot holds (a booking whose answer was lost)
+/// being taken for another frontend's: it is no rival, and the executor goes on.
+#[tokio::test(start_paused = true)]
+async fn a_lease_of_this_process_that_no_slot_holds_is_no_rival() {
+    let mut rig = Rig::start(&["node1", "node2"], 1, |_| {}).await;
+    rig.pump().await;
+    let stray = book_stray(&rig).await;
+    assert_eq!(state_of(&rig, stray).await, Some(LeaseState::Held));
+    assert_eq!(rig.exec.rival().await, None);
 }
 
 /// Books a lease under the frontend's label straight from the lease server, as a request
@@ -240,7 +333,8 @@ async fn book_stray(rig: &Rig) -> kbf_lease_client::LeaseId {
         gpu_class: None,
     };
     let request = kbf_lease_client::AcquireRequest::new("farm-linux", resources, rig.cfg.max_wall)
-        .label("kbf-frontend", &rig.cfg.frontend);
+        .label("kbf-frontend", &rig.cfg.frontend)
+        .label("kbf-instance", &rig.cfg.instance);
     match rig.api.acquire(&request).await.expect("a stray lease") {
         kbf_lease_client::Acquired::Granted(granted) => granted.id,
         kbf_lease_client::Acquired::Pending(pending) => pending.id,
@@ -387,6 +481,8 @@ async fn adoption_that_could_not_stop_the_runs_gives_the_lease_up() {
         assert_eq!(rig.runs_of(1).await.len(), 1);
         let lease = rig.exec.hosts()[0].lease;
         rig.exec = rig.restarted_executor();
+        rig.exec.step().await;
+        rig.watch_over().await;
         rig.fake.inject_on(fault_on, Fault::Close);
         rig.exec.step().await;
         assert!(
