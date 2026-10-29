@@ -982,7 +982,8 @@ fn the_only_additions_to_the_worker_proto_are_the_job_fields_and_the_node_load()
         "enum FencePolicy",
         "enum Isolation",
         "enum JobExit",
-        // The node load a heartbeat carries and the peak window a lease's usage carries.
+        // The node load a heartbeat carries (with the clocks and minutes of its leases) and the
+        // peak window a lease's usage carries.
         "field CgroupUsage.peak_window_millicores = 17",
         "field Heartbeat.node_load = 6",
         "message NodeLoad",
@@ -994,6 +995,8 @@ fn the_only_additions_to_the_worker_proto_are_the_job_fields_and_the_node_load()
         "message JobOutcome",
         "message JobTaint",
         "message Label",
+        "message LeaseClock",
+        "message LeaseMinute",
         "message Mount",
         "value Phase.PHASE_TAINTED = 6",
     ]

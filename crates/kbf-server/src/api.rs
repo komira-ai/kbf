@@ -15,7 +15,8 @@
 //!   store.
 //! - `POST /v1/nodes/{node}:cordon`, `:drain` and `:uncordon`: take a node out of
 //!   placement, drain it, or return it ([`NodeAction`]). A drain's body may be
-//!   `{"deadline_secs": N}`; without one the deadline is [`DRAIN_DEADLINE`]. The answer
+//!   `{"deadline_secs": N}`; without one the drain has no deadline ([`NO_DRAIN_DEADLINE`]): it
+//!   waits for the leases however long they run. The answer
 //!   is the node as it is after the action.
 //!
 //! - `POST /v1/members/{id}` with `{"state": "active"|"draining"|"planned_down"}`: sets a
@@ -107,9 +108,11 @@ pub use safe_to_stop::{Verdict, safe_to_stop_path};
 /// The media type of every body this API returns, and of every write it accepts.
 pub const JSON: &str = "application/json";
 
-/// How long a drain waits for leases when its request names no deadline
-/// (`drain_deadline` in `fleet-updates.md` section 4.1).
-pub const DRAIN_DEADLINE: Duration = Duration::from_secs(30 * 60);
+/// What a drain waits for its leases when its request names no deadline: for ever. The
+/// scheduler adds it to the clock with saturation, so the drain's deadline is the largest
+/// farm time, which no clock reaches; the node is `drained` when its leases end and is never
+/// `drain_paused`. The views show no deadline for it ([`crate::fleet::shown_deadline`]).
+pub const NO_DRAIN_DEADLINE: Duration = Duration::MAX;
 
 /// The path of the frontend's drain: `GET` reads it, `POST` begins it.
 pub const FRONTEND_DRAIN: &str = "/v1/frontend/drain";
@@ -872,14 +875,15 @@ pub fn write_request(
     Ok((WorkerId::new(node), action))
 }
 
-/// The drain a request body asks for: [`DRAIN_DEADLINE`] for no body, else the
-/// `{"deadline_secs": N}` it holds.
+/// The drain a request body asks for: [`NO_DRAIN_DEADLINE`] for no body, else the
+/// `{"deadline_secs": N}` it holds (any `N`, 0 included: a drain with deadline 0 pauses at
+/// the next tick if a lease still runs).
 ///
 /// # Errors
 /// 400 for a body that is not `{"deadline_secs": N}`.
 pub(crate) fn drain_action(body: &[u8]) -> Result<NodeAction, (StatusCode, String)> {
     if body.is_empty() {
-        return Ok(NodeAction::Drain(DRAIN_DEADLINE));
+        return Ok(NodeAction::Drain(NO_DRAIN_DEADLINE));
     }
     serde_json::from_slice::<DrainBody>(body)
         .map(|drain| NodeAction::Drain(Duration::from_secs(drain.deadline_secs)))
