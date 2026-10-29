@@ -228,6 +228,13 @@ fn a_denied_build_is_refused_until_not_after() {
 
     // A longer revocation of the same build is kept, a shorter one does not shorten it.
     clock.store(10, Ordering::SeqCst);
+    let held = grants.revoked_len();
+    grants.revoke("stale", 5);
+    assert_eq!(
+        grants.revoked_len(),
+        held,
+        "an ended revocation is not kept"
+    );
     grants.revoke(BUILD, 20);
     grants.revoke(BUILD, 15);
     clock.store(16, Ordering::SeqCst);

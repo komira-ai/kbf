@@ -30,8 +30,7 @@ impl Scope {
     /// Whether `digest` is in the scope.
     #[must_use]
     pub fn allows(&self, digest: &Digest) -> bool {
-        let _ = (digest, &self.action, &self.command, &self.closure);
-        false
+        *digest == self.action || *digest == self.command || self.closure.contains(digest)
     }
 
     /// Whether the grant `claims` may read every one of `digests`.
@@ -39,7 +38,16 @@ impl Scope {
     /// # Errors
     /// PERMISSION_DENIED when the grant is for another Action or a digest is out of scope.
     pub fn check(&self, claims: &Claims, digests: &[Digest]) -> Result<(), Status> {
-        let _ = (claims, digests);
-        Ok(())
+        if claims.action != self.action {
+            return Err(Status::permission_denied(
+                "the read grant is for another action",
+            ));
+        }
+        match digests.iter().find(|d| !self.allows(d)) {
+            Some(out) => Err(Status::permission_denied(format!(
+                "{out} is not in the read grant's scope"
+            ))),
+            None => Ok(()),
+        }
     }
 }

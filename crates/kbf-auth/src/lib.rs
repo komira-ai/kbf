@@ -21,6 +21,9 @@
 //! ([`Policy::blobs_get`]) for the server's HTTP blob route, which is off when the
 //! file does not name it (and under [`Policy::allow_all`]).
 //!
+//! [`BearerAuthenticator`] is the one authenticator no policy file names: code builds it
+//! around a verifier of `authorization: Bearer` tokens (kbf-front's read grants).
+//!
 //! The policies built so far: authenticators `allow` (fixed metadata), `deny`, `any`
 //! and `all`; authorizers `allow`, `deny` and `instanceNamePrefix`. A policy file that
 //! names one of Buildbarn's other variants (`tlsClientCertificate`, `jwt`, `remote`,

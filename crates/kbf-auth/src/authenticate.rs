@@ -3,6 +3,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use tonic::codegen::http::header::AUTHORIZATION;
 use tonic::codegen::http::request::Parts;
 use tonic::{Code, Status};
 
@@ -151,8 +152,11 @@ impl Authenticator for AllAuthenticator {
 /// refuses; its refusal is the call's. A call with no such header, another scheme or an
 /// empty token is UNAUTHENTICATED, and the token is never put in a message or a log.
 pub struct BearerAuthenticator {
-    verify: Box<dyn Fn(&str) -> Result<AuthenticationMetadata, Status> + Send + Sync>,
+    verify: Verifier,
 }
+
+/// What a [`BearerAuthenticator`] asks about a token.
+type Verifier = Box<dyn Fn(&str) -> Result<AuthenticationMetadata, Status> + Send + Sync>;
 
 impl BearerAuthenticator {
     /// Accepts the bearers `verify` accepts.
@@ -166,6 +170,24 @@ impl BearerAuthenticator {
     }
 }
 
+/// The token of a call's `authorization: Bearer <token>` header. The scheme is matched
+/// without regard to case (RFC 9110); no message repeats the header.
+fn bearer(call: &Parts) -> Result<&str, Status> {
+    let header = call
+        .headers
+        .get(AUTHORIZATION)
+        .ok_or_else(|| Status::unauthenticated("no bearer token"))?;
+    let header = header
+        .to_str()
+        .map_err(|_| Status::unauthenticated("the authorization header is not text"))?;
+    match header.split_once(' ') {
+        Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() => {
+            Ok(token)
+        }
+        _ => Err(Status::unauthenticated("no bearer token")),
+    }
+}
+
 impl fmt::Debug for BearerAuthenticator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BearerAuthenticator")
@@ -176,10 +198,10 @@ impl fmt::Debug for BearerAuthenticator {
 impl Authenticator for BearerAuthenticator {
     fn authenticate<'a>(
         &'a self,
-        _call: &'a Parts,
+        call: &'a Parts,
     ) -> BoxFuture<'a, Result<Arc<AuthenticationMetadata>, Status>> {
-        let _ = &self.verify;
-        Box::pin(std::future::ready(Ok(Arc::default())))
+        let answer = bearer(call).and_then(|token| (self.verify)(token).map(Arc::new));
+        Box::pin(std::future::ready(answer))
     }
 }
 
