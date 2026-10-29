@@ -53,4 +53,6 @@ mod host_tests;
 #[cfg(test)]
 mod load_tests;
 #[cfg(test)]
+mod report_hooks_tests;
+#[cfg(test)]
 mod testing;
