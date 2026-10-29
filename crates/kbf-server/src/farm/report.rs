@@ -272,6 +272,12 @@ impl State {
             Taken::Accepted
         } else {
             match self.standing(lease, worker) {
+                // A fenced farm feeds nothing, so it refuses every Result as stale, the
+                // current lease's too, by design.
+                Ok(_) if self.engine.fenced => {
+                    ack::log_refusal(worker, lease, Reason::Stale);
+                    Taken::Refused(Reason::Stale)
+                }
                 Ok(_) => {
                     tracing::error!(
                         %operation, %lease, %worker,

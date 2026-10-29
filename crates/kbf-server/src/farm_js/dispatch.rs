@@ -290,16 +290,6 @@ pub async fn report(
     // None: the ack is sent when the store has taken the record, or never.
     let (accepted, reason) = match taken {
         Taken::Accepted => (true, ResultAckReason::Accepted),
-        // Still the current lease: the scheduler took no answer from its Result. A refusal
-        // would lose the Result (a daemon forgets it on any ack) and leave the lease on the
-        // node; without an ack the daemon sends it again.
-        Taken::Refused(_) if matches!(core.standing(worker, lease), Ok(Standing::Current(_))) => {
-            tracing::error!(
-                %operation, %lease, %worker,
-                "the scheduler took no answer from the result of the operation's current lease; not acknowledged, so the daemon sends it again"
-            );
-            return Ok(None);
-        }
         Taken::Refused(reason) => (false, acked(reason)),
         Taken::Held | Taken::Dropped => return Ok(None),
     };

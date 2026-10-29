@@ -11,6 +11,7 @@
 //! [`Farm::intake`](crate::farm::Farm::intake) and [`Farm::follow`](crate::farm::Farm::follow)
 //! on a timer, whichever core the farm runs on.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use js_server_core::{FLUSH_LOOK, NodeAction as CoreAction, PlaceError as CorePlaceError};
@@ -26,10 +27,12 @@ use crate::fleet::NodeView;
 /// [`Farm::fence`](crate::farm::Farm::fence): [`Core::fence`](js_server_core::Core::fence).
 pub(crate) fn fence(js: &JsFarm) {
     js.core.fence();
+    js.fenced.store(true, Ordering::SeqCst);
 }
 
 /// [`Farm::resume`](crate::farm::Farm::resume): [`Core::resume`](js_server_core::Core::resume).
 pub(crate) fn resume(js: &JsFarm) {
+    js.fenced.store(false, Ordering::SeqCst);
     js.core.resume();
 }
 
