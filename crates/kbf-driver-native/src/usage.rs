@@ -49,12 +49,26 @@ pub struct Lifetime {
     pub user_ticks: u64,
     /// `ri_system_time`, in mach absolute time units.
     pub system_ticks: u64,
+    /// `ri_child_user_time`: user CPU of the descendants this process reaped, in mach
+    /// absolute time units (each counted with what it reaped in turn).
+    pub child_user_ticks: u64,
+    /// `ri_child_system_time`, likewise.
+    pub child_system_ticks: u64,
+    /// The process's parent when it was read; 0 when unknown.
+    pub ppid: i32,
 }
 
 impl Lifetime {
     fn cpu(self) -> u64 {
         self.user_ticks.saturating_add(self.system_ticks)
     }
+}
+
+/// What reaping the lease's leader gave of its CPU, in microseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reaped {
+    pub user_micros: u64,
+    pub system_micros: u64,
 }
 
 /// The processes of one lease that polls have read, and what they last read of each.
@@ -98,6 +112,12 @@ impl Meter {
         {
             self.retired.push(before);
         }
+    }
+
+    /// Records that the lease's leader, `leader`, was reaped with `total`: its own CPU and
+    /// that of every descendant it reaped.
+    pub fn reaped(&mut self, leader: i32, total: Reaped) {
+        let _ = (leader, total);
     }
 
     /// The usage to report after `wall`, with `timebase` (numerator, denominator) turning
