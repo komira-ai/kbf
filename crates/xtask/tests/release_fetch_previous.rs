@@ -375,6 +375,16 @@ fn a_release_never_published_is_still_an_error_after_the_asks() {
 }
 
 #[test]
+fn no_asks_at_all_is_refused_as_a_usage_error() {
+    // Catches: `--release-attempts 0` taken as one ask, or as no ask (no previous release).
+    let f = world("zero-asks");
+    let (code, out, err) = f.run(&["--release-attempts", "0"], None);
+    assert_eq!(code, Some(2), "{err}");
+    assert_eq!(out, "");
+    assert!(err.contains("--release-attempts"), "{err}");
+}
+
+#[test]
 fn a_failed_call_is_an_error_and_never_no_tags() {
     // Catches: an API failure (HTTP 502) or an answer that is not JSON read as "no release
     // tags": exit 0 and `previous-source=none`, a green job on an N-1 test that never ran.

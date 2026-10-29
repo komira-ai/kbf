@@ -89,7 +89,7 @@ pub struct FetchPreviousArgs {
     /// How many times the previous tag's release is asked for before its absence is an error:
     /// GitHub answers a draft release with 404, and a release is one for some minutes after
     /// its tag is pushed.
-    #[arg(long, default_value_t = 40)]
+    #[arg(long, default_value_t = 40, value_parser = clap::value_parser!(u32).range(1..))]
     pub release_attempts: u32,
     /// Seconds between those asks.
     #[arg(long, default_value_t = 30)]
@@ -163,7 +163,7 @@ pub(super) fn tag_commit(gh: &Path, repo: &str, tag: &str) -> Result<String, Err
 /// after the last, it is the error a missing release always was.
 fn published_release(a: &FetchPreviousArgs, tag: &str) -> Result<Value, Error> {
     let path = format!("repos/{}/releases/tags/{tag}", a.repo);
-    let attempts = a.release_attempts.max(1);
+    let attempts = a.release_attempts;
     for attempt in 1..=attempts {
         if let Some(found) = super::api(&a.gh, &path)? {
             return Ok(found);
@@ -178,7 +178,8 @@ fn published_release(a: &FetchPreviousArgs, tag: &str) -> Result<Value, Error> {
         }
     }
     Err(Error::Failed(format!(
-        "gh api {path}: not found (HTTP 404), asked {attempts} times {} s apart",
+        "gh api {path}: not found (HTTP 404), asked {attempts} times {} s apart: the release of \
+         {tag} is still a draft, or does not exist",
         a.release_poll_secs
     )))
 }
