@@ -68,6 +68,7 @@ mod extras;
 mod kbf_extras;
 pub mod keeper;
 mod lease;
+mod lease_minutes;
 mod lease_panic;
 mod lease_peak;
 #[cfg(target_os = "linux")]

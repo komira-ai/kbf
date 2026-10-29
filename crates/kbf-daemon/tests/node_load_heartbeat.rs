@@ -8,7 +8,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use kbf_daemon::{NodeLoadError, NodeReading, Runtime, RuntimeError, Work};
+use kbf_daemon::{
+    LeaseReading, LeaseUsage, NodeLoadError, NodeReading, Runtime, RuntimeError, Work,
+};
 use kbf_proto::reapi::{ActionResult, ExecutedActionMetadata};
 use kbf_proto::worker::{CgroupUsage, NodeLoad, ResourceUsage};
 use kbf_types::LeaseId;
@@ -210,4 +212,167 @@ async fn a_failed_lease_carries_its_peak_window_in_the_usage_the_runtime_measure
     let runtime = Arc::new(Scripted::new());
     *lock(&runtime.peak) = Some(750);
     assert_eq!(usage_of_a_lease("peak-no-metadata", runtime).await, None);
+}
+
+/// One lease (1, 1) started at 0, read every ten seconds of the reading's own clock: at 500
+/// thousandths of a CPU, with a working set that grows by 100 a reading. `n` counts from 1.
+fn lease_reading(n: u64) -> NodeReading {
+    let at = (n - 1) * 10_000_000;
+    let mut load = reading(n);
+    load.mono_usec = at;
+    load.covered = vec![kbf_proto::worker::LeaseId { term: 1, seq: 1 }];
+    NodeReading {
+        load,
+        leases: vec![LeaseReading {
+            lease: LeaseId::new(1, 1),
+            started_usec: 0,
+            usage: Some(LeaseUsage {
+                cpu_usage_usec: (n - 1) * 5_000_000,
+                working_set_bytes: n * 100,
+            }),
+        }],
+    }
+}
+
+/// Asserts that a heartbeat names each running lease of the reading with its start on the
+/// reading's clock, in `lease_clocks`, and carries no minute before one closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_heartbeat_carries_the_clock_of_each_running_lease() {
+    let runtime = Arc::new(Scripted::new());
+    let mut two = lease_reading(1);
+    two.leases.push(LeaseReading {
+        lease: LeaseId::new(1, 0),
+        started_usec: 0,
+        usage: None,
+    });
+    lock(&runtime.readings).push_back(Ok(Some(two)));
+    let mut h = Harness::with_runtime(
+        "node-load-clocks",
+        Arc::clone(&runtime),
+        Duration::from_secs(60),
+    )
+    .await;
+    let mut peer = h.welcomed().await;
+    let load = peer.heartbeat().await.node_load.expect("a load");
+    let clocks: Vec<_> = load
+        .lease_clocks
+        .iter()
+        .map(|c| {
+            let lease = c.lease.as_ref().expect("a lease");
+            (lease.term, lease.seq, c.started_mono_usec)
+        })
+        .collect();
+    // The same start orders by lease: an unreadable lease keeps its clock.
+    assert_eq!(clocks, [(1, 0, 0), (1, 1, 0)]);
+    assert!(load.minutes.is_empty());
+}
+
+/// Asserts that a runtime that lists no leases sends both lists empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runtime_without_leases_sends_empty_lists() {
+    let runtime = Arc::new(Scripted::new());
+    lock(&runtime.readings).push_back(Ok(Some(reading(1).into())));
+    let mut h = Harness::with_runtime(
+        "node-load-no-leases",
+        Arc::clone(&runtime),
+        Duration::from_secs(60),
+    )
+    .await;
+    let mut peer = h.welcomed().await;
+    let load = peer.heartbeat().await.node_load.expect("a load");
+    assert!(load.lease_clocks.is_empty());
+    assert!(load.minutes.is_empty());
+}
+
+/// Asserts the path of a minute through a real stream: readings ten seconds apart close
+/// minute 0 on the seventh heartbeat (mean 500 thousandths, peak 500, the largest working set
+/// of the minute), the minute is sent once while no acknowledgement comes, an
+/// acknowledgement of that heartbeat frees the batch, and the next minute then goes out alone.
+/// The daemon bins by a ten second window here (`DaemonConfig::usage_window`); the stream's
+/// own interval is a tenth of a second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_minute_reaches_the_server_on_a_real_stream() {
+    let runtime = Arc::new(Scripted::new());
+    lock(&runtime.readings).extend((1..=14).map(|n| Ok(Some(lease_reading(n)))));
+    let mut h = Harness::with_usage_window(
+        "node-load-minutes",
+        Arc::clone(&runtime),
+        Duration::from_secs(60),
+        Duration::from_secs(10),
+    )
+    .await;
+    let mut peer = h.welcomed().await;
+    // No acknowledgements: the batch stays in flight until the test acknowledges it.
+    peer.acking
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut loads = Vec::new();
+    for _ in 0..14 {
+        let beat = peer.heartbeat().await;
+        loads.push((beat.seq, beat.node_load.expect("a load")));
+    }
+    let carrying: Vec<_> = loads
+        .iter()
+        .filter(|(_, load)| !load.minutes.is_empty())
+        .map(|(seq, _)| *seq)
+        .collect();
+    assert_eq!(carrying, [7], "one batch, sent once");
+    let minute = &loads[6].1.minutes;
+    assert_eq!(minute.len(), 1);
+    assert_eq!(
+        (
+            minute[0].lease.as_ref().map(|l| (l.term, l.seq)),
+            minute[0].minute,
+            minute[0].cpu_mean_millis,
+            minute[0].cpu_peak_window_millis,
+            minute[0].ws_max_bytes
+        ),
+        (Some((1, 1)), 0, 500, 500, 600)
+    );
+}
+
+/// Asserts that the acknowledgement of the heartbeat that carried a minute frees the batch
+/// and that the next minute goes out alone: a first lease of two minutes, read until its
+/// second minute closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_acknowledged_minute_is_not_sent_again_and_the_next_one_goes_out() {
+    let runtime = Arc::new(Scripted::new());
+    lock(&runtime.readings).extend((1..=14).map(|n| Ok(Some(lease_reading(n)))));
+    let mut h = Harness::with_usage_window(
+        "node-load-minutes-ack",
+        Arc::clone(&runtime),
+        Duration::from_secs(60),
+        Duration::from_secs(10),
+    )
+    .await;
+    let mut peer = h.welcomed().await;
+    peer.acking
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..6 {
+        assert!(
+            peer.heartbeat()
+                .await
+                .node_load
+                .expect("a load")
+                .minutes
+                .is_empty()
+        );
+    }
+    let beat = peer.heartbeat().await;
+    assert_eq!(beat.seq, 7);
+    assert_eq!(beat.node_load.expect("a load").minutes.len(), 1);
+    peer.send(kbf_proto::worker::server_message::Message::HeartbeatAck(
+        kbf_proto::worker::HeartbeatAck { seq: 7 },
+    ));
+    let mut later = Vec::new();
+    for _ in 0..7 {
+        let beat = peer.heartbeat().await;
+        later.push((beat.seq, beat.node_load.expect("a load").minutes));
+    }
+    // Minute 1 closes with the reading at 120 s, the thirteenth. Whatever was in flight
+    // when the acknowledgement landed is not sent again, and minute 0 never is.
+    let minutes: Vec<_> = later
+        .iter()
+        .flat_map(|(_, minutes)| minutes.iter().map(|m| m.minute))
+        .collect();
+    assert_eq!(minutes, [1]);
 }

@@ -231,6 +231,10 @@ pub struct DaemonConfig {
     /// The most Results the daemon keeps for resending until the server acknowledges
     /// them, normally [`MAX_UNACKED`]. Over it a new Result is sent once and not kept.
     pub max_unacked: usize,
+    /// The window the lease usage is binned by. `None`: the Welcome's heartbeat interval,
+    /// at least one second. Tests set it so readings scripted ten seconds apart are not a
+    /// gap. It is not a flag.
+    pub usage_window: Option<Duration>,
 }
 
 /// The default [`DaemonConfig::max_unacked`]: far above the Results a node has in flight,
@@ -252,6 +256,7 @@ impl DaemonConfig {
             recheck_every: RECHECK_EVERY,
             keep_alive: KeepAlive::DEFAULT,
             max_unacked: MAX_UNACKED,
+            usage_window: None,
         }
     }
 
@@ -327,6 +332,7 @@ mod tests {
         assert_eq!(config.tls.server_name.as_deref(), Some("front"));
         assert_eq!(config.fence_after, FENCE_AFTER);
         assert_eq!(config.recheck_every, RECHECK_EVERY);
+        assert_eq!(config.usage_window, None);
 
         let defaults = DaemonConfig::from_args(&parse(&[]).expect("defaults"));
         assert_eq!(defaults.reconnect_after, Duration::from_secs(1));
