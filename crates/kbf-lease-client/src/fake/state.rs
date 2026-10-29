@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::ids::{LeaseId, RunId};
 use crate::wire::{
     AcquireRequest, Granted, Host, HostList, HostSource, HostState, Lease, LeaseList, LeaseState,
-    Outcome, PendingLease, ReleaseState, Released, RenewRequest, Renewed, Run, RunAccepted,
+    Mount, Outcome, PendingLease, ReleaseState, Released, RenewRequest, Renewed, Run, RunAccepted,
     RunList, RunSpec, RunState, Shape, Taint,
 };
 
@@ -163,6 +163,7 @@ struct RunRow {
     memory_bytes: u64,
     wall_ms: u64,
     args: Vec<String>,
+    mounts: Vec<Mount>,
     labels: BTreeMap<String, String>,
 }
 
@@ -458,6 +459,7 @@ impl State {
             memory_bytes: limits.memory_bytes,
             wall_ms: limits.wall_ms.map_or(cap, |asked| asked.min(cap)),
             args: spec.args.clone(),
+            mounts: spec.mounts.clone(),
             labels: spec.labels.clone(),
         };
         let accepted = RunAccepted {
@@ -629,6 +631,13 @@ impl State {
             .iter()
             .find(|row| row.id == *run)
             .map(|row| row.args.clone())
+    }
+
+    pub(super) fn run_mounts(&self, run: &RunId) -> Option<Vec<Mount>> {
+        self.runs
+            .iter()
+            .find(|row| row.id == *run)
+            .map(|row| row.mounts.clone())
     }
 
     pub(super) fn run_state(&self, run: &RunId) -> Option<RunState> {
