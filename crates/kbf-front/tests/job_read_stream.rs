@@ -50,6 +50,12 @@ enum Fault {
     Extend,
     /// Fails in place of this chunk.
     FailAt(usize),
+    /// Fails in place of this chunk with the store's own report that the bytes are not the
+    /// blob's: `Corrupt` when `corrupt`, else `DigestMismatch`.
+    Reported {
+        at: usize,
+        corrupt: bool,
+    },
 }
 
 /// A source of blobs that streams in chunks of [`CHUNK`] bytes, logs what is asked of it and
@@ -136,6 +142,21 @@ impl BlobSource for Source {
                 Fault::FailAt(n) => {
                     items.truncate(n);
                     items.push(Err(StorageError::Unreachable(*digest)));
+                }
+                Fault::Reported { at, corrupt } => {
+                    items.truncate(at);
+                    let actual = kbf_segments::sha256(b"other");
+                    items.push(Err(if corrupt {
+                        StorageError::Corrupt {
+                            digest: *digest,
+                            actual,
+                        }
+                    } else {
+                        StorageError::DigestMismatch {
+                            claimed: *digest,
+                            actual,
+                        }
+                    }));
                 }
                 Fault::None | Fault::Flip(_) => {}
             }
@@ -377,6 +398,32 @@ async fn a_corrupted_large_blob_ends_the_response_short_and_is_counted() {
             "{what}: {received} of {} bytes were sent",
             w.big.size_bytes
         );
+        let out = rig.metrics();
+        has_line(
+            &out,
+            "kbf_job_read_stream_ended_early_total{reason=\"digest_mismatch\"} 1",
+        );
+        has_line(
+            &out,
+            "kbf_job_read_stream_ended_early_total{reason=\"store_error\"} 0",
+        );
+    }
+}
+
+/// Catches: a store that says itself that the bytes are not the blob's (a router that found
+/// a bad owner, a node that failed its own check) being counted as a store failure, not as a
+/// mismatch, or served on.
+#[tokio::test]
+async fn a_store_that_reports_corruption_is_counted_as_a_mismatch() {
+    for corrupt in [true, false] {
+        let w = world();
+        let rig = rig(w.blobs.clone(), limits());
+        rig.source.set_fault(Fault::Reported { at: 4, corrupt });
+        let token = rig.token(w.action);
+        let stream = rig.get(&w.big, &token).await.stream.expect("streamed");
+        let (chunks, ended) = drain(stream).await;
+        assert!(matches!(ended, Some(StreamError::Corrupt)), "{ended:?}");
+        assert!(joined(&chunks).len() < 10 * CHUNK);
         let out = rig.metrics();
         has_line(
             &out,
