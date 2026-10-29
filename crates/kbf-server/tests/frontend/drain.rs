@@ -4,7 +4,7 @@
 //! tests of retire mode have them. A fake daemon and a client play the farm's node and Buck2.
 //! `--drain-lb-wait` and `--drain-deadline` are given as an operator gives them, but with
 //! a day of seconds, which no test lives to see run out: a test ends a wait by hand
-//! (`Drain::end_lb_wait`, `Drain::end_deadline`) and follows the drain by its phase events
+//! (`Drain::end_lb_wait`, `Drain::pass_deadline`) and follows the drain by its phase events
 //! (`Drain::phases`) and by the intake polls the frontend counts, never by time.
 
 use futures::FutureExt as _;
@@ -342,46 +342,52 @@ async fn a_running_execution_finishes_before_the_frontend_exits() {
     pair.stop().await;
 }
 
-/// Asserts that with an execution that does not end, the phase goes from draining to
-/// closing when the deadline is ended (by hand here, as its time running out ends it), the
-/// caller's stream ends UNAVAILABLE, the node's stream ends UNAVAILABLE, and the frontend
-/// exits 0. The daemon then dials the other frontend, which keeps the lease the node held:
-/// its heartbeat is acknowledged, its result is accepted, and the store holds one result and
-/// no operation.
+/// Asserts that when the deadline passes (by hand here, as its time running out passes it)
+/// with an execution open, the drain reports and goes on: the status says `deadline_passed`
+/// with the open count, the phase stays `draining`, the caller's stream and the node's are
+/// not ended, and the frontend stays up. The node's result is then taken, the caller gets
+/// it, and the frontend exits 0 once the execution is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn at_the_deadline_the_streams_end_and_the_daemon_keeps_its_lease_on_the_other() {
+async fn past_the_deadline_the_streams_stay_open_until_the_execution_ends() {
     let pair = Pair::start_with("drain-deadline", &NO_WAIT).await;
-    let (a, b) = (&pair.a, &pair.b);
+    let a = &pair.a;
     let client = Client::connect(a.reapi, a.worker).await;
     let mut daemon = client.daemon("node-a", 4, 8).await;
-    let job = Job::new("cut by the deadline", &[]);
+    let job = Job::new("kept past the deadline", &[]);
     client.upload(&job.blobs()).await;
     let mut ops = client.execute(&job.action).await;
-    let lease = daemon.start().await.lease_id.expect("a lease id");
-    let result = support::output(&client, "built across a drain", 0).await;
+    let start = daemon.start().await;
+    let result = support::output(&client, "built past the deadline", 0).await;
 
     begin_drain(a.api).await;
     reaches(a, Phase::Draining).await;
-    a.drain.end_deadline();
-    reaches(a, Phase::Closing).await;
-    let ended = stream_end(&mut ops).await;
-    assert_eq!(ended.code(), Code::Unavailable, "{ended}");
-    let ended = daemon.ended().await;
-    assert_eq!(ended.code(), Code::Unavailable, "{ended}");
-    a.exits().await;
+    let before = status(a.api).await;
+    assert!(before.get("deadline_passed").is_none(), "{before}");
+    a.drain.pass_deadline();
+    let mut passed = before;
+    for _ in 0..SAFETY.as_secs() * 10 {
+        passed = status(a.api).await;
+        if passed.get("deadline_passed").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(passed["deadline_passed"], true, "{passed}");
+    assert_eq!(passed["phase"], "draining", "{passed}");
+    assert_eq!(passed["open_executions"], 1, "{passed}");
+    // Nothing ends in a quiet moment: the caller's stream and the node's stay open.
+    let quiet = Duration::from_secs(2);
+    let ended = tokio::time::timeout(quiet, stream_end(&mut ops)).await;
+    assert!(ended.is_err(), "the caller's stream was ended");
+    let ended = tokio::time::timeout(quiet, daemon.ended()).await;
+    assert!(ended.is_err(), "the node's stream was ended");
 
-    let reached = Client::connect(b.reapi, b.worker).await;
-    let mut daemon = reached.daemon("node-a", 4, 8).await;
-    assert_eq!(daemon.epoch, lease.term, "the epoch was kept");
-    assert!(
-        daemon.heartbeat(&[lease]).await,
-        "the other frontend did not keep the lease"
-    );
-    let ack = daemon.report(ran(Some(lease), &result)).await;
-    assert!(ack.accepted, "the other frontend did not take the lease");
-    assert_eq!(pair.count("done/"), 1);
-    assert_eq!((pair.count("op/"), pair.count("lease/")), (0, 0));
-    drop((ops, daemon, reached, client));
+    let ack = daemon.report(ran(start.lease_id, &result)).await;
+    assert!(ack.accepted, "{ack:?}");
+    let last = done(&mut ops).await;
+    assert_eq!(response(&last).result, Some(result));
+    a.exits().await;
+    drop((ops, daemon, client));
     pair.stop().await;
 }
 

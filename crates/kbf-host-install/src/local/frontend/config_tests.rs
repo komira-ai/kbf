@@ -5,7 +5,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use kbf_testkit::dir::TestDir;
 
-use super::config::{CONFIG, FrontendConfig, STOP_SECS};
+use super::config::{CONFIG, FrontendConfig};
 use crate::trust::Trust;
 
 const MINIMAL: &str = r#"
@@ -49,8 +49,7 @@ ready_secs = 30
     let config = FrontendConfig::parse(text).unwrap();
     assert_eq!(config.api, "127.0.0.1:8982".parse().unwrap());
     assert_eq!(config.peers, ["203.0.113.11:8982".parse().unwrap()]);
-    assert_eq!((config.drain_secs, config.ready_secs), (60, 30));
-    assert_eq!(config.switch_secs(), 60 + STOP_SECS + 30);
+    assert_eq!((config.drain_secs, config.ready_secs), (Some(60), 30));
     assert_eq!(
         config.run.run_args("sha256:abc"),
         [
@@ -81,7 +80,7 @@ ready_secs = 30
 #[test]
 fn what_is_left_out_takes_its_default() {
     let config = FrontendConfig::parse(MINIMAL).unwrap();
-    assert_eq!((config.drain_secs, config.ready_secs), (180, 90));
+    assert_eq!((config.drain_secs, config.ready_secs), (None, 90));
     assert!(config.peers.is_empty());
     assert_eq!(
         config.run.run_args("sha256:abc"),
@@ -134,7 +133,7 @@ fn values_that_are_not_what_they_name_are_refused() {
             MINIMAL.replace("\"/token\"", "\"/to\\u0001ken\""),
             "drain_token_file",
         ),
-        (with("drain_secs = 1801"), "drain_secs"),
+        (with("drain_secs = 0"), "drain_secs"),
         (with("ready_secs = 9"), "ready_secs"),
         (with("ready_secs = 601"), "ready_secs"),
         (MINIMAL.replace("127.0.0.1:8982", "localhost:8982"), "api"),
@@ -154,8 +153,10 @@ fn values_that_are_not_what_they_name_are_refused() {
 #[test]
 fn the_edges_of_the_ranges_are_accepted() {
     for extra in [
-        "drain_secs = 0",
+        "drain_secs = 1",
         "drain_secs = 1800",
+        "drain_secs = 7200",
+        "drain_secs = 31536000",
         "ready_secs = 10",
         "ready_secs = 600",
         "user = \"nobody\"",

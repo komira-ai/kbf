@@ -572,12 +572,14 @@ impl<X: SessionExtras> Daemon<X> {
                     self.core.contact.sent(seq, now);
                     self.core.window.sent(seq, now);
                     let (pack_reads, pack_writes) = self.extras.pack_counts();
+                    let node_load = self.core.node_load().await;
                     let heartbeat = Heartbeat {
                         seq,
                         report_hash: self.report.hash().to_vec(),
                         running: self.core.listed().into_iter().map(proto_lease_id).collect(),
                         pack_reads,
                         pack_writes,
+                        node_load,
                     };
                     send(&tx, daemon_message::Message::Heartbeat(heartbeat));
                 }

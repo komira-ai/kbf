@@ -99,12 +99,36 @@ fn the_optional_flags_are_read() {
     assert_eq!(config.daemon_node.as_deref(), Some("d1"));
     let secs = Duration::from_secs;
     assert_eq!(config.timing.heartbeat, secs(20));
-    assert_eq!(config.timing.drain_deadline, secs(30));
+    assert_eq!(config.timing.drain_deadline, Some(secs(30)));
     assert_eq!(config.timing.health_timeout, secs(40));
     assert_eq!(config.timing.health_poll, secs(2));
     assert_eq!(config.timing.retry, secs(60));
     assert_eq!(config.timing.drain_poll, Timing::DEFAULT.drain_poll);
     assert_eq!(config.timing.margin, Timing::DEFAULT.margin);
+}
+
+/// The drain deadline has no default (absent waits however long the leases take), takes any
+/// number of seconds from 1 up with no upper bound (the other times stop at a day), and refuses
+/// 0 and non-numbers with the flag named.
+#[test]
+fn the_drain_deadline_is_absent_by_default_has_no_cap_and_refuses_zero() {
+    let base = with(&NODE_API);
+    assert_eq!(parse_flags(&base).unwrap().timing.drain_deadline, None);
+    for (text, want) in [("1", 1), ("86401", 86_401), ("31536000", 31_536_000)] {
+        let mut args = base.clone();
+        args.extend(["--drain-deadline-secs".to_owned(), text.to_owned()]);
+        let got = parse_flags(&args).unwrap().timing.drain_deadline;
+        assert_eq!(got, Some(Duration::from_secs(want)), "{text}");
+    }
+    for bad in ["0", "-1", "soon", "1.5", ""] {
+        let mut args = base.clone();
+        args.extend(["--drain-deadline-secs".to_owned(), bad.to_owned()]);
+        let err = parse_flags(&args).unwrap_err();
+        assert!(
+            err.contains("--drain-deadline-secs must be"),
+            "{bad}: {err}"
+        );
+    }
 }
 
 /// Whatever is missing, repeated, unknown or malformed is refused with the flag in the message:

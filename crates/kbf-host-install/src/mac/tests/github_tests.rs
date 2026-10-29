@@ -559,6 +559,25 @@ fn a_network_failure_refuses_before_any_root_state_changes() {
     assert_untouched(&fx);
 }
 
+/// Catches a listing that a signal ended being reported as "exit status None": the refusal
+/// is `fetch_failed`, and its reason names the program and the signal, so the operator can tell
+/// a kill (SIGKILL), a crash (SIGSEGV, SIGABRT) and a broken pipe (SIGPIPE) apart.
+#[test]
+fn a_listing_ended_by_a_signal_names_the_signal() {
+    let fx = Fx::new("mac-gh-signal");
+    let sim = github(&fx);
+    sim.break_("list-signal");
+    let result = run(&fx, &sim, &channel(&fx, false), NEW_VERSION);
+    match result {
+        Err(Outcome::RefusedBecause(Refusal::FetchFailed, why)) => {
+            assert!(why.starts_with("curl: signal 13 (SIGPIPE): "), "{why}");
+            assert!(!why.contains("None"), "{why}");
+        }
+        other => panic!("not a fetch failure with a reason: {other:?}"),
+    }
+    assert_untouched(&fx);
+}
+
 fn write_channel(fx: &Fx, body: &str) {
     write(
         &fx.host.allowlist,

@@ -197,6 +197,9 @@ pub struct RunUsage {
     pub memory_pressure_full_micros: Option<u64>,
     /// The CPUs the lease's cgroup could run on.
     pub cpus_effective: Option<u32>,
+    /// The most CPU any one window between two node-load readings used by the lease, in
+    /// thousandths of a CPU; `None` for a lease that had no full window.
+    pub peak_window_millicores: Option<u64>,
 }
 
 /// Which instrument measured a run's usage.

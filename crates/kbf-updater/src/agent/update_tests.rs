@@ -12,7 +12,7 @@ use super::testing::{
 };
 use super::update::{Ports, Update};
 use crate::inventory::Role;
-use crate::ports::{Health, PortError};
+use crate::ports::{Clock, Health, PortError};
 use crate::wire::{Health as WireHealth, Outcome, UpdateResult};
 use kbf_types::ReleasePlatform;
 
@@ -34,6 +34,7 @@ struct Rig {
     status: Shared,
     logs: Arc<Mutex<Vec<String>>>,
     now: u64,
+    timing: Timing,
 }
 
 impl Rig {
@@ -53,6 +54,7 @@ impl Rig {
             status,
             logs: Arc::default(),
             now: NOW,
+            timing: timing(),
             events,
         }
     }
@@ -74,7 +76,7 @@ impl Rig {
             },
             host: &host,
             channel: "stable",
-            timing: timing(),
+            timing: self.timing,
             status: &self.status,
         };
         update.run(&version(target))
@@ -131,7 +133,7 @@ fn an_update_runs_fetch_verify_drain_switch_health_confirm_undrain_in_order() {
         rig.steps(),
         [
             &format!("local:install {VB} stable"),
-            "drain n1 600",
+            "drain n1 4294967295",
             &format!("local:switch {VB}"),
             &format!("local:confirm {VB}"),
             "undrain",
@@ -238,7 +240,7 @@ fn a_failed_health_check_reverts_and_undrains_when_a_is_healthy() {
         rig.steps(),
         [
             &format!("local:install {VB} stable"),
-            "drain n1 600",
+            "drain n1 4294967295",
             &format!("local:switch {VB}"),
             "local:revert",
             "undrain",
@@ -406,20 +408,67 @@ fn after_a_revert_a_is_known_by_its_version_or_its_commit() {
     assert!(rig.logged("does not say what runs"));
 }
 
-/// The node's drain is waited out: the leases are looked at until none is left, and when they
-/// never end the update goes on at the deadline, leases or not.
+/// With no drain deadline (the default) the leases are looked at until none is left, however
+/// long that takes: 200 looks 5 s apart is 1000 s, past the 600 s the old default gave up at,
+/// and the host is switched only after the look that reads 0.
 #[test]
-fn the_leases_are_waited_for_until_the_deadline() {
+fn the_leases_are_waited_for_however_long_they_take() {
     let rig = Rig::new();
     *rig.drain.leases.lock().unwrap() = [3, 2, 1, 0].into();
     assert_eq!(rig.run(VB), succeeded(VB));
     assert_eq!(rig.events.count("leases"), 4);
 
     let rig = Rig::new();
-    *rig.drain.leases.lock().unwrap() = [2].into();
+    let mut held: std::collections::VecDeque<usize> = std::iter::repeat_n(2, 200).collect();
+    held.push_back(0);
+    *rig.drain.leases.lock().unwrap() = held;
     assert_eq!(rig.run(VB), succeeded(VB));
-    let looks = rig.events.count("leases");
-    assert!((120..=122).contains(&looks), "600 s in steps of 5: {looks}");
+    assert_eq!(rig.events.count("leases"), 201);
+    assert!(rig.clock.now() > Duration::from_secs(600));
+    let all = rig.events.all();
+    let at = |needle: &str| all.iter().position(|e| e.starts_with(needle)).unwrap();
+    assert!(all.iter().rposition(|e| e == "leases").unwrap() < at("local:switch"));
+}
+
+/// A drain deadline the operator set that passes with a lease still held does not switch: the
+/// update fails saying why, the node is left drained (no undrain), and the helper is never
+/// asked to switch. The same order, tried again after the retry time, drains and waits again.
+#[test]
+fn a_drain_deadline_that_passes_switches_nothing_and_leaves_the_node_drained() {
+    let mut rig = Rig::new();
+    rig.timing.drain_deadline = Some(Duration::from_secs(60));
+    *rig.drain.leases.lock().unwrap() = [2].into();
+    assert_eq!(rig.run(VB), failed(VB));
+    assert_eq!(rig.events.count("local:switch"), 0);
+    assert_eq!(rig.events.count("undrain"), 0);
+    assert!(rig.drain.is_drained());
+    assert_eq!(rig.events.count("drain n1 60"), 1);
+    assert!(rig.logged("still holds 2 leases after the drain deadline of 60 s"));
+    assert!(rig.logged("left drained"));
+    assert_eq!(rig.clock.now(), Duration::from_secs(60));
+
+    // The leases end later; the same order, run again, drains again and switches.
+    *rig.drain.leases.lock().unwrap() = [0].into();
+    assert_eq!(rig.run(VB), succeeded(VB));
+    assert_eq!(rig.events.count("drain n1 60"), 2);
+    assert!(!rig.drain.is_drained());
+}
+
+/// A switch that takes longer than the 10 minutes the call used to be limited to (the helper
+/// waits for the frontend's drain as long as it takes) is not a failure: the update waits for it
+/// and succeeds, and the default limit on a switch is none.
+#[test]
+fn a_switch_that_takes_longer_than_ten_minutes_is_waited_for() {
+    let rig = Rig::new();
+    let clock = Arc::clone(&rig.clock);
+    rig.local.world().on_switch = Some(Arc::new(move || {
+        clock.advance(Duration::from_secs(3 * 3600));
+    }));
+    assert_eq!(rig.run(VB), succeeded(VB));
+    assert!(rig.clock.now() >= Duration::from_secs(3 * 3600));
+    assert_eq!(rig.events.count("local:switch"), 1);
+    assert_eq!(rig.events.count("local:revert"), 0);
+    assert!(!rig.logged("switch failed"));
 }
 
 /// A drain that fails stops the update before the switch and leaves the node as it was; a node

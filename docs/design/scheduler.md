@@ -562,7 +562,7 @@ What the code does today:
   to end last. The hold is given up at its deadline,
   `--whole-node-drain-deadline-secs` or, left out, the request's own wall time (an action
   with no wall time and no such flag is never given up, so set the flag when clients may
-  send no timeout; it also covers an operation taken up again after a restart); the worker is then barred to the
+  send no timeout); the worker is then barred to the
   request for `--whole-node-reserve-backoff-secs` (300) and another is held. After
   `--whole-node-max-reserve-attempts` (2) give-ups the deadline is the wall time. No lease
   is stopped. The caps: at most N workers whole (held or reserved) at once, at most
@@ -570,7 +570,12 @@ What the code does today:
   `--whole-node-keep-for-ordinary` (1) workers left with neither, and no reservation on the
   last worker an older ordinary request could run on unless
   `--whole-node-allow-last-capable`; a request a cap stops holds nothing and queues.
-  The wall times are kept in memory: an operation taken up again after a restart has none.
+  An operation's wall time is kept with its rows in the state store (an `opwall/` row, written
+  in the transaction that queues it, only for an operation that has one, and removed when the
+  operation ends): a farm that takes the operation up again, after a restart or from another
+  frontend, gives it to the scheduler before the first placement round, so the hold keeps its
+  deadline and the leases their place in the drain order. A store written before the row
+  existed recovers its operations with no wall time.
   The tuning flags need `--whole-node-max`. `Scheduler::whole_state` and `whole_summary`
   say why a request waits; `GET /v1/queue` (a `whole_node` section) and the
   `kbf_sched_whole_*` gauges show them, and the Queue page of the UI.

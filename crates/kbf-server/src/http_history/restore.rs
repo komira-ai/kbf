@@ -301,6 +301,7 @@ fn usage(r: &RunRecord) -> Option<RunUsage> {
             memory_pressure_some_micros: c.memory_pressure_some_us,
             memory_pressure_full_micros: c.memory_pressure_full_us,
             cpus_effective: c.cpus_effective,
+            peak_window_millicores: c.peak_window_millicores,
             numa: c
                 .numa_bytes
                 .iter()

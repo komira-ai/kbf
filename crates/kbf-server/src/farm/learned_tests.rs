@@ -30,7 +30,7 @@ fn over(store: Arc<dyn Store>, mode: LearnedSizes) -> Farm {
 
 /// [`over`], keeping at most `floors` memory floors.
 fn over_with(store: Arc<dyn Store>, mode: LearnedSizes, floors: Option<usize>) -> Farm {
-    let farm = Farm::new(
+    let farm = Farm::new_legacy(
         Arc::new(kbf_front::Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -278,7 +278,7 @@ fn a_bad_size_key_row_stops_a_start_only_when_on() {
     for mode in [LearnedSizes::Off, LearnedSizes::Shadow] {
         drop(farm_over(&store, mode));
     }
-    let on = Farm::new(
+    let on = Farm::new_legacy(
         Arc::new(kbf_front::Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -1159,6 +1159,7 @@ fn a_stored_operation_is_registered_only_when_it_can_be_named() {
         fate: None,
         subject,
         size_key: Some(5),
+        max_wall: None,
     };
     let (key, _) = estimator_key_and_run();
     {
