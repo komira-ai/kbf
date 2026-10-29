@@ -440,6 +440,7 @@ pub(super) fn verify_query(config: &ServerConfig, parts: &Parts) -> Result<Signe
         payload: UNSIGNED.to_owned(),
         role: Role::PresignPut,
         presign: Some(key.grant.clone()),
+        gc: None,
     })
 }
 

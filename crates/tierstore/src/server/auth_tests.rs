@@ -30,6 +30,7 @@ fn full(payload: &str) -> Signed {
         payload: payload.to_owned(),
         role: Role::Full,
         presign: None,
+        gc: None,
     }
 }
 
@@ -177,6 +178,7 @@ fn each_key_is_accepted_with_its_own_role() {
             payload: EMPTY.to_owned(),
             role: Role::ReadOnly,
             presign: None,
+            gc: None,
         };
         assert_eq!(accepted, Ok(read_only), "{}", key.0);
     }

@@ -28,6 +28,7 @@ use serde::Deserialize;
 
 use super::ServerConfig;
 use super::auth::{READ_ONLY, Refusal};
+use super::gc::NOT_ALLOWED;
 use super::presign::PUT_ONLY;
 
 /// The flag whose files hold the read-only keys.
@@ -78,6 +79,8 @@ pub(crate) enum Role {
     ReadOnly,
     /// A presigning key: one presigned `PUT`, as far as its grant goes (see `presign`).
     PresignPut,
+    /// A GC key: list, head and delete under one prefix, header-signed (see `gc`).
+    Gc,
 }
 
 impl Role {
@@ -93,6 +96,9 @@ impl Role {
         match (self, reads) {
             (Self::ReadOnly, false) => Err(READ_ONLY),
             (Self::PresignPut, _) if *method != Method::PUT => Err(PUT_ONLY),
+            (Self::Gc, _) if !matches!(*method, Method::GET | Method::HEAD | Method::DELETE) => {
+                Err(NOT_ALLOWED)
+            }
             _ => Ok(()),
         }
     }
@@ -106,7 +112,10 @@ impl ServerConfig {
             return Some((self.secret_access_key.as_str(), Role::Full));
         }
         let found = self.read_only_keys.iter().find(|key| key.id == id);
-        found.map(|key| (key.secret.as_str(), Role::ReadOnly))
+        if let Some(key) = found {
+            return Some((key.secret.as_str(), Role::ReadOnly));
+        }
+        self.gc_key(id).map(|key| (key.secret(), Role::Gc))
     }
 }
 
