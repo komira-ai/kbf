@@ -26,9 +26,9 @@ use crate::trust::Trust;
 pub(super) const OLD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub(super) const NEW: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 pub(super) const VERSION: &str = "0.1.7+gbbbbbbbbbbbb-3";
-const OLD_ID: &str = "sha256:old";
-const NEW_ID: &str = "sha256:new";
-const WINDOW: u64 = 600;
+pub(super) const OLD_ID: &str = "sha256:old";
+pub(super) const NEW_ID: &str = "sha256:new";
+pub(super) const WINDOW: u64 = 600;
 
 pub(super) const CONFIG: &str = r#"
 [frontend]
@@ -200,7 +200,7 @@ pub(super) fn failed(code: Code) -> impl Fn(&Answer) -> bool {
     move |a| matches!(a, Answer::Failed(c, _) if *c == code)
 }
 
-const DRAIN: &str =
+pub(super) const DRAIN: &str =
     "exec:/usr/bin/kbf cluster drain --frontend --token-file /etc/kbf/operator.token";
 
 /// An update verifies and loads the image first (nothing is stopped before the fetch is done),
@@ -252,18 +252,6 @@ fn a_drain_is_waited_for_until_the_container_ends() {
     assert_eq!(rig.world.0.borrow().drain_looks, 3);
     // Three looks of a second each, not the deadline of 180 s.
     assert!(rig.world.elapsed().as_secs() < 100);
-}
-
-/// A frontend that does not end is cut at the drain deadline, not waited for for ever.
-#[test]
-fn a_drain_that_does_not_finish_is_cut_at_its_deadline() {
-    let config = CONFIG.replace("api =", "drain_secs = 20\nready_secs = 30\napi =");
-    let rig = Rig::with_config("drain-deadline", &config);
-    assert!(matches!(rig.update(), Answer::Switched { .. }));
-    let steps = rig.steps();
-    assert!(steps.contains(&"stop".to_owned()));
-    assert!(rig.world.elapsed().as_secs() >= 20);
-    assert_eq!(rig.world.made().unwrap().image_id, NEW_ID);
 }
 
 /// A container that is not running has nothing to drain: it is replaced without a drain.
@@ -335,9 +323,9 @@ fn the_run_configuration_is_kept_byte_for_byte() {
 fn the_marker_is_written_before_anything_is_stopped() {
     let rig = Rig::new("marker-first");
     assert!(matches!(rig.install(), Answer::Staged { .. }));
-    // A drain request that fails stops the switch at its second step: the marker is on disk by
-    // then, and the record keeps the configuration and both images.
-    rig.world.fail("set_restart");
+    // A stop that fails stops the switch at its first step after the drain: the marker is on
+    // disk by then, and the record keeps the configuration and both images.
+    rig.world.fail("stop");
     rig.world.fail(&format!("run:{OLD_ID}"));
     assert!(failed(Code::RevertFailed)(&rig.switch()));
     let trial = rig.record().pending.unwrap();
@@ -345,9 +333,9 @@ fn the_marker_is_written_before_anything_is_stopped() {
     assert_eq!(trial.image, NEW_ID);
     assert_eq!(trial.from, OLD);
     assert_eq!(trial.from_image, OLD_ID);
-    assert_eq!(trial.deadline_unix, Some(1000 + WINDOW));
+    // Counted from the end of the drain (one look of a second here).
+    assert_eq!(trial.deadline_unix, Some(1000 + 1 + WINDOW));
     assert_eq!(trial.config, FrontendConfig::parse(CONFIG).unwrap());
-    assert!(!rig.steps().contains(&"stop".to_owned()));
 }
 
 /// Whatever step of the switch fails, the container is made again from the old image, waited
@@ -372,6 +360,7 @@ fn a_failed_step_puts_the_old_image_back_and_reports_failed() {
             "{call}"
         );
         assert_eq!(now.args, original, "{call}");
+        assert_eq!(now.restart, "unless-stopped", "{call}");
         assert!(rig.record().pending.is_none(), "{call}");
         let view = rig.query();
         assert_eq!(view.commit.as_deref(), Some(OLD), "{call}");
@@ -623,7 +612,7 @@ fn a_restore_that_fails_keeps_the_marker_and_a_later_revert_finishes_it() {
 fn a_reboot_during_the_switch_reverts_on_the_deadline() {
     let rig = Rig::new("reboot");
     assert!(
-        matches!(rig.update(), Answer::Switched { deadline_unix, .. } if deadline_unix == 1000 + WINDOW)
+        matches!(rig.update(), Answer::Switched { deadline_unix, .. } if deadline_unix == 1000 + 1 + WINDOW)
     );
     assert_eq!(rig.world.made().unwrap().image_id, NEW_ID);
 
@@ -751,17 +740,6 @@ fn a_peer_that_is_not_ready_refuses_the_switch_before_anything_stops() {
         .unwrap();
     let stopped = events.iter().position(|e| e == "stop").unwrap();
     assert!(asked < stopped);
-}
-
-/// A window shorter than the switch can take is refused before anything is written.
-#[test]
-fn a_window_too_short_for_the_drain_is_refused() {
-    let config = CONFIG.replace("api =", "drain_secs = 600\napi =");
-    let rig = Rig::with_config("window", &config);
-    assert!(matches!(rig.install(), Answer::Staged { .. }));
-    assert!(refused(Code::ConfigInvalid)(&rig.switch()));
-    assert!(rig.record().pending.is_none());
-    assert_eq!(rig.world.made().unwrap().image_id, OLD_ID);
 }
 
 /// A configuration that is not usable refuses the switch (and says what is wrong in the log).
