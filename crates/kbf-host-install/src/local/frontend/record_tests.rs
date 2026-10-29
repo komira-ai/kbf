@@ -24,7 +24,7 @@ fn trial() -> Trial {
         from_image: "sha256:o".to_owned(),
         deadline_unix: Some(7),
         config: FrontendConfig::parse(
-            "[frontend]\nname = \"f\"\nrestart = \"unless-stopped\"\napi = \"127.0.0.1:1\"\ndrain_token_file = \"/t\"\n",
+            "[frontend]\nname = \"f\"\nrestart = \"unless-stopped\"\napi = \"127.0.0.1:1\"\ndrain_token_file = \"/t\"\ndrain_secs = 180\n",
         )
         .unwrap(),
     }

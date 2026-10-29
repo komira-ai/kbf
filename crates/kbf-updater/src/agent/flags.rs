@@ -49,8 +49,9 @@
 //!   names its own helper, which may not be the agent's `--helper-socket`: an install request
 //!   names no service, so the agent's helper would install `kbf` at the service's version.
 //!   Without the flag the agent is a `kbf`-only agent, as before.
-//! - Times, in seconds: `--heartbeat-secs` (default 15), `--drain-deadline-secs` (600, how long
-//!   the node's leases are waited for), `--health-timeout-secs` (300, how long the release on
+//! - Times, in seconds: `--heartbeat-secs` (default 15), `--drain-deadline-secs` (no default, 1 or
+//!   more with no upper bound: without it the node's leases are waited for however long they take;
+//!   a deadline that passes fails the update with the node left drained and nothing switched), `--health-timeout-secs` (300, how long the release on
 //!   trial has to show healthy), `--health-poll-secs` (5) and `--retry-secs` (900, how long a
 //!   target that failed is left alone before the same order is tried again).
 
@@ -102,8 +103,9 @@ pub const DEFAULT_HELPER_SOCKET: &str = "/run/kbf-host-install/local.sock";
 pub struct Timing {
     /// Between two heartbeats.
     pub heartbeat: Duration,
-    /// How long the node's leases are waited for once it is drained.
-    pub drain_deadline: Duration,
+    /// How long the node's leases are waited for once it is drained; `None`, the default,
+    /// waits however long they take. When a set time is out the host is not switched.
+    pub drain_deadline: Option<Duration>,
     /// How often they are looked at.
     pub drain_poll: Duration,
     /// How long a release on trial has to show healthy.
@@ -120,7 +122,7 @@ pub struct Timing {
 impl Timing {
     pub const DEFAULT: Self = Self {
         heartbeat: Duration::from_secs(15),
-        drain_deadline: Duration::from_secs(600),
+        drain_deadline: None,
         drain_poll: Duration::from_secs(5),
         health_timeout: Duration::from_secs(300),
         health_poll: Duration::from_secs(5),
@@ -232,6 +234,20 @@ fn secs(flag: &str, text: &str) -> Result<Duration, String> {
         .ok_or_else(|| format!("{flag} must be a number of seconds from 1 to 86400"))
 }
 
+/// A drain deadline: a number of seconds from 1 up, with no upper bound. Absent is no deadline.
+fn drain_secs(flag: &str, text: &str) -> Result<Duration, String> {
+    text.parse::<u64>()
+        .ok()
+        .filter(|n| *n >= 1)
+        .map(Duration::from_secs)
+        .ok_or_else(|| {
+            format!(
+                "{flag} must be a number of seconds, 1 or more (leave it out to wait however \
+                 long it takes)"
+            )
+        })
+}
+
 /// Read the flags (after `agent`). Each is given once, as `--flag value` or `--flag=value`.
 ///
 /// # Errors
@@ -302,9 +318,11 @@ pub fn parse_flags(args: &[String]) -> Result<Config, String> {
         ));
     }
     let mut timing = Timing::DEFAULT;
+    if let Some(text) = found.remove("--drain-deadline-secs") {
+        timing.drain_deadline = Some(drain_secs("--drain-deadline-secs", &text)?);
+    }
     for (flag, slot) in [
         ("--heartbeat-secs", &mut timing.heartbeat),
-        ("--drain-deadline-secs", &mut timing.drain_deadline),
         ("--health-timeout-secs", &mut timing.health_timeout),
         ("--health-poll-secs", &mut timing.health_poll),
         ("--retry-secs", &mut timing.retry),

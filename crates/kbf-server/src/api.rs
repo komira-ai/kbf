@@ -39,7 +39,7 @@
 //!   a state store runs the drain sequence ([`crate::sequence`]): `/readyz` goes false at
 //!   once while everything is still served, new Execute calls are refused after
 //!   `--drain-lb-wait`, every listener is sent GOAWAY, open executions run until they
-//!   are done or `--drain-deadline` (but the streams of operations that were never started
+//!   are done, however long (`--drain-deadline`, if set, only reports when it passes; but the streams of operations that were never started
 //!   and that no worker on this frontend can run and no other frontend can take end
 //!   UNAVAILABLE when the drain begins), and the process exits 0. Any other server drains at
 //!   once ([`crate::drain`]): new Execute calls are refused, `/readyz` goes false, the REAPI
@@ -217,6 +217,7 @@ fn status(api: &ApiState) -> DrainStatus {
         phase,
         open_executions: api.farm.open_executions(),
         queued_operations: api.farm.queued_operations(),
+        deadline_passed: api.drain.deadline_passed(),
     }
 }
 

@@ -26,7 +26,7 @@ fn each_process_term_is_new_and_later() {
 /// as anything but the fixed INTERNAL "could not run the action", or panicking.
 #[test]
 fn a_result_without_detail_that_is_no_fault_is_answered_internal() {
-    let farm = Farm::new(
+    let farm = Farm::new_legacy(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -83,7 +83,7 @@ fn only_a_taken_or_a_refused_result_is_acknowledged() {
 /// refused: it is refused, and nothing is answered.
 #[test]
 fn a_report_the_scheduler_does_not_take_is_refused() {
-    let farm = Farm::new(
+    let farm = Farm::new_legacy(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -144,7 +144,7 @@ fn a_report_the_scheduler_does_not_take_is_refused() {
 /// argument, and nothing is queued.
 #[test]
 fn a_request_keyed_by_something_other_than_an_action_is_refused() {
-    let farm = Farm::new(
+    let farm = Farm::new_legacy(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
