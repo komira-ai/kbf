@@ -426,6 +426,32 @@ async fn a_frontend_exports_its_failed_actions_by_class() {
     served.abort();
 }
 
+/// Asserts that a frontend writes `kbf_scheduler_core` on `GET /metrics` for the core its
+/// farm runs: 1 for it and 0 for the other, the page the flip gate reads. The core is the
+/// legacy one by default and the js one in a build with `farm-core-js`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_exports_the_scheduler_core_it_runs() {
+    let flags = flags_of(&[]);
+    let handle = started(&flags, Some(index())).expect("starts");
+    let api = handle.api.expect("the operator API");
+    let served = tokio::spawn(handle.serve());
+    let text = scrape(api).await;
+    let (running, other) = if cfg!(feature = "farm-core-js") {
+        ("js", "legacy")
+    } else {
+        ("legacy", "js")
+    };
+    assert!(
+        text.contains("# TYPE kbf_scheduler_core gauge\n"),
+        "{text}"
+    );
+    let on = format!("kbf_scheduler_core{{core=\"{running}\"}} 1\n");
+    let off = format!("kbf_scheduler_core{{core=\"{other}\"}} 0\n");
+    assert!(text.contains(&on), "{on}{text}");
+    assert!(text.contains(&off), "{off}{text}");
+    served.abort();
+}
+
 /// Asserts that a frontend puts the pack-write counts its daemons send on their heartbeats on
 /// `GET /metrics`: none before a daemon has sent any, a sample per node and per fallback reason
 /// for the node that sent them, none for a node that sent read counts only, and no write sample
