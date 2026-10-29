@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use js_server_core::{Adapter, Delivery, Stage as CoreStage, Stream, View};
+use js_server_core::{Adapter, Delivery, Report, Stage as CoreStage, Stream, Taken, View};
 use js_store::{Ending, RowCodec as _, Value, keys};
 use kbf_front::{Backend, Finished, Recorder, Stage};
 use kbf_proto::worker::{
@@ -34,14 +34,15 @@ use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{NodePhase, Request, Requeue, Scheduler};
 use kbf_state::Store;
 use kbf_types::{
-    ActionKey, Answer, Effect, LeaseGrant, LeaseId, OperationId, Refusal, StartLease, WaiterId,
-    WorkerId,
+    ActionKey, Answer, Effect, FarmTime, LeaseGrant, LeaseId, OperationId, Refusal, StartLease,
+    WaiterId, WorkerId,
 };
 use tokio::sync::watch;
 use tonic::Code;
 
 use super::codec::KbfRowCodec;
 use super::facts::WorkerFacts;
+use super::report_hooks::ReportHooks;
 use crate::action_usage::Subject;
 use crate::answer::{Detail, Pending, failed, finished_of, refused_as};
 use crate::farm::durable::{named, subject};
@@ -101,6 +102,8 @@ pub struct KbfAdapter {
     failed: FailedActions,
     /// The unreadable `done/` rows looked at, each look counted.
     unreadable_results: u64,
+    /// What the hooks around a report keep between them ([`super::report_hooks`]).
+    pub(super) hooks: ReportHooks,
 }
 
 /// The `LeaseId` of the wire.
@@ -160,6 +163,7 @@ impl KbfAdapter {
             facts: BTreeMap::new(),
             failed: FailedActions::default(),
             unreadable_results: 0,
+            hooks: ReportHooks::default(),
         }
     }
 
@@ -287,6 +291,28 @@ impl KbfAdapter {
 }
 
 impl Adapter for KbfAdapter {
+    fn before_report(
+        &mut self,
+        view: &View<'_>,
+        _now: FarmTime,
+        _worker: &WorkerId,
+        report: &Report,
+    ) {
+        self.note_report_start(view, report);
+    }
+
+    fn after_report(
+        &mut self,
+        view: &View<'_>,
+        _now: FarmTime,
+        worker: &WorkerId,
+        report: &Report,
+        answers: &[Answer],
+        taken: Taken,
+    ) {
+        self.note_report_end(view, worker, report, answers, taken);
+    }
+
     fn stream_open(&self, worker: &WorkerId, stream: Stream) -> bool {
         let node = self.nodes.get(worker);
         node.is_some_and(|node| node.stream == stream && !node.outbound.is_closed())
