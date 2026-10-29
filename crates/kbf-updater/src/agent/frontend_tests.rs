@@ -102,7 +102,7 @@ fn the_agent_drains_reads_and_undrains_its_node_with_its_certificate_and_no_toke
     let api = rig.api(addr);
     let drain = super::build::drain_for(Role::Daemon, &api);
     let h = host(Role::Daemon);
-    assert_eq!(drain.drain(&h, Duration::from_secs(600)), Ok(()));
+    assert_eq!(drain.drain(&h, Some(Duration::from_secs(600))), Ok(()));
     assert_eq!(drain.leases(&h), Ok(2));
     assert_eq!(drain.undrain(&h), Ok(()));
 
@@ -183,7 +183,7 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
     let (drain, health) = node_ports(&none, &rig.identity(), Role::Daemon, &local).unwrap();
     for text in [
         drain
-            .drain(&h, Duration::from_secs(1))
+            .drain(&h, Some(Duration::from_secs(1)))
             .unwrap_err()
             .to_string(),
         health.refusal(&h).unwrap(),
@@ -194,7 +194,7 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
     let (addr, server) = rig.frontend(vec![ok("{}")]);
     let with_frontend = rig.config(Some(addr));
     let (drain, _) = node_ports(&with_frontend, &rig.identity(), Role::Daemon, &local).unwrap();
-    assert_eq!(drain.drain(&h, Duration::from_secs(1)), Ok(()));
+    assert_eq!(drain.drain(&h, Some(Duration::from_secs(1))), Ok(()));
     assert_eq!(server.join().unwrap().len(), 1);
 
     // A storage host is built the same way: its drain and its health are calls to the frontend
@@ -205,7 +205,10 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
         node_ports(&with_frontend, &rig.identity(), Role::Storage, &local).unwrap();
     let st = host(Role::Storage);
     assert_eq!(storage_health.refusal(&st), None);
-    assert_eq!(storage_drain.drain(&st, Duration::from_secs(1)), Ok(()));
+    assert_eq!(
+        storage_drain.drain(&st, Some(Duration::from_secs(1))),
+        Ok(())
+    );
     let target = Version::parse("0.1.5+gaaaaaaaaaaaa-2").unwrap();
     assert_eq!(
         storage_health.check_held(&st, &target),
@@ -230,7 +233,7 @@ fn the_ports_follow_the_flags_the_agent_was_given() {
         token_file: token,
     });
     let (drain, _) = node_ports(&with_token, &rig.identity(), Role::Daemon, &local).unwrap();
-    let err = drain.drain(&h, Duration::from_secs(1)).unwrap_err();
+    let err = drain.drain(&h, Some(Duration::from_secs(1))).unwrap_err();
     assert_eq!(err.kind(), PortErrorKind::Unreachable);
     assert!(err.to_string().contains("the operator API"), "{err}");
     drop(std::net::TcpStream::connect(alive));
@@ -265,7 +268,7 @@ fn only_the_frontend_is_talked_to() {
     ];
     for (addr, server) in cases {
         let drain = super::build::drain_for(Role::Daemon, &rig.api(addr));
-        let err = drain.drain(&h, Duration::from_secs(1)).unwrap_err();
+        let err = drain.drain(&h, Some(Duration::from_secs(1))).unwrap_err();
         assert_eq!(err.kind(), PortErrorKind::Other, "{err}");
         assert!(err.to_string().contains("is not the frontend"), "{err}");
         assert!(server.join().unwrap()[0].request.is_empty());
@@ -284,7 +287,7 @@ fn a_swapped_pair_a_bad_file_and_a_dead_frontend_are_refused() {
     let other = rig.pki.updater("n2", HostRole::Daemon);
     write_files(&rig.dir, &rig.pki, &other);
     let err = super::build::drain_for(Role::Daemon, &api)
-        .drain(&h, Duration::from_secs(1))
+        .drain(&h, Some(Duration::from_secs(1)))
         .unwrap_err();
     assert_eq!(err.kind(), PortErrorKind::Other);
     assert!(
@@ -305,7 +308,7 @@ fn a_swapped_pair_a_bad_file_and_a_dead_frontend_are_refused() {
     std::fs::write(&rig.files.cert, storage.cert_pem()).unwrap();
     std::fs::write(&rig.files.key, storage.key_pem()).unwrap();
     let err = super::build::drain_for(Role::Daemon, &api_for_dead(&rig))
-        .drain(&h, Duration::from_secs(1))
+        .drain(&h, Some(Duration::from_secs(1)))
         .unwrap_err();
     assert!(
         err.to_string().contains("TLS files cannot be used"),
@@ -317,7 +320,7 @@ fn a_swapped_pair_a_bad_file_and_a_dead_frontend_are_refused() {
         listener.local_addr().unwrap()
     };
     let err = super::build::drain_for(Role::Daemon, &rig.api(dead))
-        .drain(&h, Duration::from_secs(1))
+        .drain(&h, Some(Duration::from_secs(1)))
         .unwrap_err();
     assert_eq!(err.kind(), PortErrorKind::Unreachable);
 }
@@ -346,7 +349,7 @@ fn a_chunked_reply_is_read_and_a_refusal_is_a_refusal() {
     let drain = super::build::drain_for(Role::Daemon, &rig.api(addr));
     let h = host(Role::Daemon);
     assert_eq!(drain.leases(&h), Ok(2));
-    let err = drain.drain(&h, Duration::from_secs(1)).unwrap_err();
+    let err = drain.drain(&h, Some(Duration::from_secs(1))).unwrap_err();
     assert!(err.to_string().contains("refused the call (403)"), "{err}");
     server.join().unwrap();
 }

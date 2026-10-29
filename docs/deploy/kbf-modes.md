@@ -470,10 +470,10 @@ leases they held before. Copying a joining member's slice to it
 | mode | on SIGTERM or SIGINT | what bounds it |
 |---|---|---|
 | `frontend` | drains, by the sequence below | `--drain-lb-wait` (10 s by default); nothing else by default: the drain waits for every open execution, and `--drain-deadline` (none by default) only reports; to force a stop, a second signal or `--shutdown-timeout-secs` (0 by default: none) |
-| `all-in-one` | the frontend half drains; the daemon half does not | as `frontend`; the daemon half stops when the server half has |
+| `all-in-one` | drains both halves, in order: the server half refuses new work and finishes what it accepted, then the daemon half drains, and the server half stops after it | nothing by default: it waits for every execution and every lease, however long; a second signal, or `--shutdown-timeout-secs` (none by default), stops both at once; `--drain-deadline-secs` only logs a warning |
 | `storage` | stops | none of its own |
-| `daemon` | drains | `--drain-deadline-secs` (600 by default); a second signal |
-| `storage-and-daemon` | drains the daemon half, then stops storage | `--drain-deadline-secs` (600 by default); a second signal |
+| `daemon` | drains | nothing but the leases: it waits until all have ended (`--drain-deadline-secs`, off by default, only logs a warning); a second signal |
+| `storage-and-daemon` | drains the daemon half, then stops storage | as `daemon` |
 
 **The frontend.** Buck2 does not recover an Execute stream that breaks after it started, so
 a stop that cuts a stream fails its action. On the first signal, or on
@@ -497,16 +497,35 @@ signal began; either ends the streams that are left `UNAVAILABLE`, and their bui
 connections have closed. Under systemd that needs `TimeoutStopSec=infinity`; the units that
 `kbf-deploy` renders set it.
 
-**`all-in-one`.** The process has the frontend's drain and no drain of its own for builds.
-`--drain-deadline-secs` is used by `daemon` and `storage-and-daemon`, and `all-in-one` stops
-its daemon half with the server half: the daemon keeps running leases while the server half
-drains, and when the server half has stopped the daemon stops and abandons the leases still
-running. Updating an `all-in-one` host therefore waits for every build to finish or cuts it.
+**`all-in-one`.** A stop drains both halves and abandons no lease. On the first signal the
+server half does the plain drain of `kbf-server` (not the load balancer sequence of `kbf
+frontend`: `--drain-lb-wait` and `--drain-deadline` are not flags of this mode): `/readyz`
+turns to 503, new Execute calls are refused `UNAVAILABLE`, the REAPI listener is sent GOAWAY,
+and the executions that are open run until their action is done. The daemon half keeps
+taking leases meanwhile, since an operation the server accepted before the signal and has
+not placed still has to run, and its leases report through the server half. When no
+execution is open any more, the daemon half drains as `daemon` does: no new lease, the
+running ones finish, report and are acknowledged, however long that takes. The server half
+keeps serving the worker listener (the daemon's `Result`s and their acknowledgements, and
+its blobs) until the daemon half has returned, and then stops; the process exits 0 when both
+have. A drain begun with `POST /v1/frontend/drain` goes the same way.
+
+There is no default deadline. A second signal is the hard stop of both halves: the server
+half ends its open streams `UNAVAILABLE` and the daemon half abandons its running leases,
+which the scheduler places again. `--shutdown-timeout-secs` (0, none, by default) is the
+server half's own hard stop and ends the process the same way: when it runs out the server
+half ends its streams and stops, and the daemon half stops with it, abandoning its leases.
+`--drain-deadline-secs` is the daemon half's and, as on `daemon`, only logs one warning with
+the number of leases still running (0 warns at once) and keeps waiting. Under systemd the
+unit needs `TimeoutStopSec=infinity`, as `frontend`'s and `daemon`'s do.
 
 **`storage-and-daemon`.** The signal handlers are installed before anything starts. On the
 first signal the daemon half takes no new lease, lets the running ones finish and report, and
-waits for their acknowledgements, for at most `--drain-deadline-secs`. A second signal ends
-the drain at once and abandons the leases still running. Only then does the storage half
+waits for their acknowledgements, however long that takes. `--drain-deadline-secs` is not
+set by default; given, it only logs one warning with the number of leases still running
+when that many seconds have passed (any value, no upper bound; 0 warns at once), and the
+wait goes on. A second signal is the hard stop: it ends the drain at once and abandons the
+leases still running. Only then does the storage half
 stop, because a running action reads and writes its blobs through it, and the process exits
 0 (kbf#1087). A signal while the storage half is still starting, for instance waiting for
 a frontend that is down, abandons the start and exits 0.

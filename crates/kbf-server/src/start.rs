@@ -132,6 +132,16 @@ impl ServerHandle {
         Arc::clone(&self.drain)
     }
 
+    /// This handle with `second` as its escalation: when it completes while the handle
+    /// serves, [`ServerHandle::serve`] calls [`Drain::close`], as the second stop signal of
+    /// [`start_interruptible`] does. For a process that reads the stop signals itself, to
+    /// hand them to a daemon beside the server as well, and passes the first to [`start`].
+    #[must_use]
+    pub fn escalate_on(mut self, second: impl Future<Output = ()> + Send + 'static) -> Self {
+        self.escalation = Some(Box::pin(second));
+        self
+    }
+
     /// Serves every listener until the shutdown future ends and its connections close
     /// or `--shutdown-timeout-secs` runs out. A handle from [`start_interruptible`]
     /// also ends the open streams, and so the drain, at a second stop signal.

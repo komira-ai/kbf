@@ -25,8 +25,11 @@
 //! holds while the heartbeats go on; a Start that still arrives is refused with a Result
 //! the server runs again (`UNAVAILABLE`); the runs go on, report and are acknowledged as
 //! always. It returns, so the process exits 0, once no lease runs and no Result is
-//! unacknowledged, connected or not. A second signal, or the drain deadline, returns at
-//! once, and the runs still going are abandoned as [`Daemon::run`] abandons them.
+//! unacknowledged, connected or not, however long that takes: a drain never ends
+//! because time ran out. A deadline, if the operator sets one, only logs a warning with
+//! the number of leases still running, once, and the wait goes on. A second signal is
+//! the operator's hard stop: it returns at once, and the runs still going are abandoned
+//! as [`Daemon::run`] abandons them.
 //!
 //! A runtime that switches a Mac's GUI session for a whole-machine lease hands the
 //! daemon its phase ([`Daemon::with_phase`]; `docs/design/worker-protocol.md#node-phases`):
@@ -79,6 +82,7 @@
 use std::future::Future;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
@@ -98,9 +102,11 @@ use crate::connect::{
     rotate_after, unit_random,
 };
 use crate::core::{Event, LeaseCore, send};
+use crate::drain::wait_for_drain;
 use crate::extras::{ExtraWake, SessionExtras};
 use crate::kbf_extras::KbfExtras;
 use crate::lease::{Done, Leases, lease_id, proto_lease_id};
+use crate::lease_minutes::usage_window;
 use crate::report::NodeReport;
 use crate::runtimes::Runtimes;
 use crate::welcome;
@@ -170,6 +176,9 @@ pub struct Daemon<X = KbfExtras> {
     drain: Option<watch::Receiver<bool>>,
     /// Notified when the daemon is draining and has nothing left to wait for.
     drained: Arc<Notify>,
+    /// How many leases ran when the session loop last looked, for the drain's warning
+    /// past its deadline (the stop future cannot reach `core`).
+    running: Arc<AtomicUsize>,
     /// The lease state: leases, contact, Start window, unacknowledged Results, epoch.
     core: LeaseCore,
     /// Where the runs of `core`'s leases report their end.
@@ -249,6 +258,7 @@ impl<X: SessionExtras> Daemon<X> {
             report,
             drain: None,
             drained: Arc::new(Notify::new()),
+            running: Arc::new(AtomicUsize::new(0)),
             core,
             done,
             extras,
@@ -318,6 +328,8 @@ impl<X: SessionExtras> Daemon<X> {
     /// Wakes [`Self::run_draining`] when the daemon is draining and nothing is left to
     /// wait for: no lease runs and every Result is acknowledged.
     fn check_drained(&self) {
+        self.running
+            .store(self.core.leases.running().len(), Ordering::Relaxed);
         if self.core.drained() {
             self.drained.notify_one();
         }
@@ -371,18 +383,21 @@ impl<X: SessionExtras> Daemon<X> {
 
     /// Runs the daemon like [`Self::run`], but drains on the first of `signals` (a
     /// `()` for each SIGTERM or SIGINT): see the module documentation. Returns when
-    /// the drain is complete (no lease runs, no Result is unacknowledged), at the
-    /// second signal, or `deadline` after the first; `signals` closing does not stop it.
+    /// the drain is complete (no lease runs, no Result is unacknowledged) or at the
+    /// second signal; `signals` closing does not stop it. `deadline`, if set, is when
+    /// the drain warns that leases still run; it never ends the drain, so no lease is
+    /// abandoned for it.
     pub async fn run_draining(
         mut self,
         mut signals: mpsc::UnboundedReceiver<()>,
-        deadline: Duration,
+        deadline: Option<Duration>,
     ) {
         #[cfg(target_os = "linux")]
         crate::numa::log_layout();
         let (begin, began) = watch::channel(false);
         self.drain = Some(began);
         let drained = Arc::clone(&self.drained);
+        let running = Arc::clone(&self.running);
         let stop = async {
             // A closed channel is no signal.
             if signals.recv().await.is_none() {
@@ -390,11 +405,7 @@ impl<X: SessionExtras> Daemon<X> {
             }
             tracing::info!(?deadline, "draining: no new leases; running ones finish");
             begin.send_replace(true);
-            tokio::select! {
-                _ = signals.recv() => tracing::warn!("second signal: stopping at once"),
-                () = sleep(deadline) => tracing::warn!(?deadline, "drain deadline: stopping"),
-                () = drained.notified() => tracing::info!("drained: stopping"),
-            }
+            wait_for_drain(&mut signals, &drained, deadline, &running).await;
         };
         tokio::select! {
             () = self.reconnect_forever() => {}
@@ -514,8 +525,8 @@ impl<X: SessionExtras> Daemon<X> {
             .map_err(|_| SessionError::WelcomeTimeout(wait))??;
         let (interval, epoch, welcome) = self.welcome(first)?;
         self.welcomed = true;
-        self.core.contact.new_stream(interval);
-        self.core.window.new_stream(hello_sent);
+        let usage_window = usage_window(interval, self.config.usage_window);
+        self.core.new_stream(interval, usage_window, hello_sent);
         // Before the Welcome renews contact: a lease whose fence passed while this
         // stream was set up must not outlive it (`offline` checked already; this keeps
         // the order true by construction here too).
@@ -578,7 +589,7 @@ impl<X: SessionExtras> Daemon<X> {
                     self.core.contact.sent(seq, now);
                     self.core.window.sent(seq, now);
                     let (pack_reads, pack_writes) = self.extras.pack_counts();
-                    let node_load = self.core.node_load().await;
+                    let node_load = self.core.node_load(seq).await;
                     let heartbeat = Heartbeat {
                         seq,
                         report_hash: self.report.hash().to_vec(),
@@ -817,8 +828,11 @@ mod tests {
         );
         let (events_tx, mut events) = mpsc::unbounded_channel();
         core.observe(events_tx);
-        core.contact.new_stream(Duration::from_secs(1));
-        core.window.new_stream(core.clock.now());
+        core.new_stream(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            core.clock.now(),
+        );
         core.new_epoch(Some(1));
         let (tx, mut sent) = unbounded();
         let start = worker::Start {

@@ -33,7 +33,7 @@ pub fn golden_plist_as(_sha12: &str, user: Option<&str>) -> String {
 	<key>ThrottleInterval</key>
 	<integer>10</integer>
 	<key>ExitTimeOut</key>
-	<integer>30</integer>
+	<integer>2147483647</integer>
 	<key>ProcessType</key>
 	<string>Interactive</string>
 	<key>StandardErrorPath</key>

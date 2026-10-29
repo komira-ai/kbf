@@ -411,7 +411,7 @@ async fn told(fake: &Fake, placement_load: bool) -> (bool, String) {
         .expect("reading")
         .expect("a container runtime takes readings");
     let written = std::fs::read_to_string(fake.cgroup.join("actions/cpu.max")).expect("cpu.max");
-    (load.actions_cpu_limited, written)
+    (load.load.actions_cpu_limited, written)
 }
 
 /// A fake node whose actions cgroup holds the limit the start wrote (4 CPUs), with the
@@ -447,7 +447,7 @@ const LIFTED: &str = "max 100000";
 async fn auto_follows_each_welcome_and_the_reading_reports_it() {
     let fake = limited_node("cpu-max-auto", Some(ActionsCpuMax::Auto));
     let before = Runtime::node_load(&*fake.runtime).await.expect("reading");
-    assert!(before.expect("reading").actions_cpu_limited);
+    assert!(before.expect("reading").load.actions_cpu_limited);
     for (placement_load, limited, written) in [
         (true, false, LIFTED),
         (false, true, RESERVE),

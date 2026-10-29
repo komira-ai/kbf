@@ -1,15 +1,19 @@
 //! What the node's `actions/` cgroup is doing now: the CPU it has used, the memory it
 //! holds that cannot be reclaimed, whether a CPU limit is set, and which leases have run
-//! for a whole window.
+//! for a whole window. The same reading lists every running lease with its start and
+//! what its own cgroup holds ([`LeaseReading`]).
 //!
 //! The daemon reports a reading every heartbeat and the scheduler places by it. Every
 //! number is an integer and every subtraction saturates. The files are read on the
-//! blocking pool ([`crate::off_worker`]), never on an async worker.
+//! blocking pool ([`crate::off_worker`]), never on an async worker, in one call for the
+//! node and all its leases.
 //!
 //! Two kinds of absence: a file the reading cannot do without (`cpu.stat`'s
 //! `usage_usec`, `memory.current`, `memory.stat`'s `inactive_file`) that cannot be read
 //! or does not parse is a [`LoadError`]; telemetry (`throttled_usec`, the pressure total)
-//! is `None` when its file or field is not there.
+//! is `None` when its file or field is not there. A lease's files are not needed by the
+//! reading: a lease with one unreadable or garbled is still listed, with its start and no
+//! usage, never a zero.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
@@ -17,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
+use kbf_daemon::{LeaseReading, LeaseUsage, NodeReading};
 use kbf_proto::worker;
 use kbf_types::LeaseId;
 
@@ -52,9 +57,22 @@ pub struct NodeLoad {
     /// The cumulative `total=` (microseconds) of the `some` line of `cpu.pressure`, when
     /// the kernel has pressure files.
     pub pressure_some_total_usec: Option<u64>,
+    /// Every lease running at the reading, in lease order, with its start and what its
+    /// cgroup holds. A lease that ended while the files were read is not listed.
+    pub leases: Vec<LeaseReading>,
 }
 
 impl NodeLoad {
+    /// The reading as the daemon takes it: the node's part as a heartbeat sends it, and
+    /// the leases beside it.
+    pub(crate) fn into_reading(mut self) -> NodeReading {
+        let leases = std::mem::take(&mut self.leases);
+        NodeReading {
+            load: self.into_proto(),
+            leases,
+        }
+    }
+
     /// The reading as the daemon sends it in a heartbeat.
     pub(crate) fn into_proto(self) -> worker::NodeLoad {
         worker::NodeLoad {
@@ -209,7 +227,49 @@ pub(crate) fn read_load(dir: &Path, clock: &dyn Fn() -> u64) -> Result<NodeLoad,
         actions_cpu_limited,
         throttled_usec,
         pressure_some_total_usec,
+        leases: Vec::new(),
     })
+}
+
+/// What one lease's cgroup said at a reading. A part is `None` when a file it needs could
+/// not be read or does not parse.
+struct LeaseRead {
+    /// `usage_usec` of `cpu.stat`, with the clock read right after it.
+    cpu: Option<(u64, u64)>,
+    /// `memory.current` less `inactive_file` of `memory.stat`, floored at 0.
+    working_set: Option<u64>,
+}
+
+impl LeaseRead {
+    /// The cumulative CPU and the working set, when both were read.
+    fn usage(&self) -> Option<LeaseUsage> {
+        let ((cpu_usage_usec, _), working_set_bytes) = self.cpu.zip(self.working_set)?;
+        Some(LeaseUsage {
+            cpu_usage_usec,
+            working_set_bytes,
+        })
+    }
+}
+
+/// Reads the cgroup of one lease. Blocking. The clock is read right after `cpu.stat` and
+/// before the memory files, so the window it closes is the CPU's alone.
+fn read_lease(dir: &Path, clock: &dyn Fn() -> u64) -> LeaseRead {
+    let cpu = std::fs::read_to_string(dir.join("cpu.stat"))
+        .ok()
+        .and_then(|text| cpu_stat(&text).usage)
+        .map(|usage| (usage, clock()));
+    LeaseRead {
+        cpu,
+        working_set: lease_working_set(dir),
+    }
+}
+
+fn lease_working_set(dir: &Path) -> Option<u64> {
+    let current = std::fs::read_to_string(dir.join("memory.current")).ok()?;
+    let stat = std::fs::read_to_string(dir.join("memory.stat")).ok()?;
+    let current = parse_memory_current(&current).ok()?;
+    let inactive = parse_inactive_file(&stat).ok()?;
+    Some(current.saturating_sub(inactive))
 }
 
 /// The process's monotonic clock: microseconds since the first call.
@@ -246,8 +306,10 @@ pub(crate) struct LoadTracker {
     running: Mutex<BTreeMap<LeaseId, Running>>,
     /// Peaks of leases that ended, until taken.
     finished: Mutex<BTreeMap<LeaseId, Option<u64>>>,
-    /// Held across a reading, so readings are in order.
-    gate: tokio::sync::Mutex<Gate>,
+    /// Held across a reading, so readings are in order, and held by the blocking read for
+    /// as long as it runs: a reading given up on (its future dropped) does not let a second
+    /// read start on the blocking pool behind a file that does not answer.
+    gate: Arc<tokio::sync::Mutex<Gate>>,
 }
 
 impl std::fmt::Debug for LoadTracker {
@@ -262,7 +324,7 @@ impl LoadTracker {
             clock,
             running: Mutex::new(BTreeMap::new()),
             finished: Mutex::new(BTreeMap::new()),
-            gate: tokio::sync::Mutex::new(Gate::default()),
+            gate: Arc::new(tokio::sync::Mutex::new(Gate::default())),
         }
     }
 
@@ -303,41 +365,52 @@ impl LoadTracker {
         self.finished().remove(&id)?
     }
 
-    /// Reads the cgroup at `actions` and every running lease's `cpu.stat` in one blocking
-    /// call.
+    /// Reads the cgroup at `actions` and every running lease's cgroup (`cpu.stat`, then the
+    /// clock, then `memory.current` and `memory.stat`) in one blocking call.
+    ///
+    /// The gate moves into that call and comes back with its result, so it stays held
+    /// while the files are read even when this future is dropped: a later reading waits
+    /// for the read still running instead of starting another one beside it.
     pub(crate) async fn reading(&self, actions: PathBuf) -> Result<NodeLoad, LoadError> {
-        let mut gate = self.gate.lock().await;
+        let gate = Arc::clone(&self.gate).lock_owned().await;
         let leases: Vec<(LeaseId, PathBuf)> = self
             .running()
             .iter()
             .map(|(id, lease)| (*id, lease.dir.clone()))
             .collect();
         let clock = Arc::clone(&self.clock);
-        let (load, samples) = off_worker(move || {
+        let (load, reads, mut gate) = off_worker(move || {
             let load = read_load(&actions, &*clock);
-            // A lease whose cgroup is gone has ended; its window is not taken.
-            let samples: Vec<(LeaseId, (u64, u64))> = leases
+            let reads: Vec<(LeaseId, LeaseRead)> = leases
                 .iter()
-                .filter_map(|(id, dir)| {
-                    let text = std::fs::read_to_string(dir.join("cpu.stat")).ok()?;
-                    let usage = cpu_stat(&text).usage?;
-                    Some((*id, (usage, clock())))
-                })
+                .map(|(id, dir)| (*id, read_lease(dir, &*clock)))
                 .collect();
-            (load, samples)
+            (load, reads, gate)
         })
         .await;
         let mut running = self.running();
-        for (id, sample) in samples {
+        let mut listed = Vec::with_capacity(reads.len());
+        for (id, read) in reads {
+            // A lease that ended while the files were read is not listed, and its window
+            // is not taken.
             let Some(lease) = running.get_mut(&id) else {
                 continue;
             };
-            if let Some(window) = lease.last.and_then(|last| window_millicores(last, sample)) {
-                lease.peak = Some(lease.peak.map_or(window, |p| p.max(window)));
+            // A lease whose `cpu.stat` is not there has no window; it keeps its start.
+            if let Some(sample) = read.cpu {
+                if let Some(window) = lease.last.and_then(|last| window_millicores(last, sample)) {
+                    lease.peak = Some(lease.peak.map_or(window, |p| p.max(window)));
+                }
+                lease.last = Some(sample);
             }
-            lease.last = Some(sample);
+            listed.push(LeaseReading {
+                lease: id,
+                started_usec: lease.started,
+                usage: read.usage(),
+            });
         }
         let mut load = load?;
+        load.leases = listed;
         if let Some(previous) = gate.previous_mono {
             load.covered = running
                 .iter()

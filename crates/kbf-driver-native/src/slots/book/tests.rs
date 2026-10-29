@@ -182,25 +182,127 @@ fn the_backoff_doubles_to_its_cap_and_starts_again_after_a_slot_comes_back() {
     assert_eq!(backoff.next(Duration::from_secs(160), true), backoff.first);
 }
 
-/// Catches a recovery thread whose real waits do not grow: with a cleaner that never
-/// passes, the passes get further apart, so the fifth is later than five of the first
-/// gap (10 ms) would be.
+/// A book whose recovery thread does not sleep: it asks for each wait on `delays` and
+/// then holds until the test sends on the returned sender, so the test steps it one pass at
+/// a time. The cleaner answers `outcomes` in turn (then clean) and counts its calls.
+fn stepped(
+    outcomes: Vec<Outcome>,
+    backoff: Backoff,
+) -> (
+    Arc<Book<Stub>>,
+    Arc<AtomicUsize>,
+    mpsc::Receiver<Duration>,
+    mpsc::Sender<()>,
+) {
+    quiet();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let queue = Mutex::new(VecDeque::from(outcomes));
+    let counted = Arc::clone(&calls);
+    let cleaner: Cleaner<Stub> = Arc::new(move |_: &Stub| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        lock(&queue).pop_front().unwrap_or(Outcome::Clean)
+    });
+    let (ask, delays) = mpsc::channel();
+    let (go, stepping) = mpsc::channel::<()>();
+    // A test that is done drops `go`: the waits then return at once and the thread ends
+    // with its book.
+    let nap: Nap = Box::new(move |_, time| {
+        let _ = ask.send(time);
+        let _ = stepping.recv();
+        false
+    });
+    let book = Book::start_with(stubs(1), cleaner, backoff, None, nap);
+    (book, calls, delays, go)
+}
+
+/// Catches a recovery thread that does not back off: with a cleaner that never passes,
+/// the waits it asks for are the first, then double up to the cap and stay there (a
+/// constant wait, none, or a wait without a cap would each differ), and one pass is made
+/// per wait, none before the first.
 #[test]
 fn a_slot_that_stays_dirty_is_cleaned_less_and_less_often() {
+    let (book, calls, delays, go) = stepped(vec![dirty(); 20], FAST);
+    let mut asked = Vec::new();
+    for passes_so_far in 0..7 {
+        asked.push(delays.recv_timeout(LONG).expect("a wait"));
+        // The start's clean, and one pass for each wait that was sat out.
+        assert_eq!(calls.load(Ordering::SeqCst), 1 + passes_so_far);
+        go.send(()).expect("step");
+    }
+    let millis: Vec<u128> = asked.iter().map(Duration::as_millis).collect();
+    assert_eq!(millis, [10, 20, 40, 80, 80, 80, 80]);
+    assert_eq!(book.dirty(), BTreeSet::from([0]));
+}
+
+/// Catches a pass that frees a slot not starting the waits again from the first while
+/// another slot stays dirty (the thread is not idle, so only the pass's own accounting
+/// resets the wait): slot 0 comes back at the third pass, slot 1 never, and the wait after
+/// that pass is the first, not the next double.
+#[test]
+fn a_slot_that_comes_back_resets_the_wait_while_another_stays_dirty() {
     quiet();
-    let (send, receive) = mpsc::channel();
-    let send = Mutex::new(send);
-    let cleaner: Cleaner<Stub> = Arc::new(move |_: &Stub| {
-        let _ = lock(&send).send(Instant::now());
+    let zero_calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&zero_calls);
+    // Slot 0 is dirty at the start and at two passes, clean at the third.
+    let cleaner: Cleaner<Stub> = Arc::new(move |slot: &Stub| {
+        if slot.0 == 0 && counted.fetch_add(1, Ordering::SeqCst) >= 3 {
+            return Outcome::Clean;
+        }
         dirty()
     });
-    let _book = Book::start(stubs(1), cleaner, FAST);
-    let times: Vec<Instant> = (0..6)
-        .map(|_| receive.recv_timeout(LONG).expect("a pass"))
-        .collect();
-    let gaps: Vec<Duration> = times.windows(2).map(|w| w[1] - w[0]).collect();
-    assert!(gaps[4] >= Duration::from_millis(60), "{gaps:?}");
-    assert!(gaps[4] > gaps[0], "{gaps:?}");
+    let (ask, delays) = mpsc::channel();
+    let (go, stepping) = mpsc::channel::<()>();
+    let nap: Nap = Box::new(move |_, time| {
+        let _ = ask.send(time);
+        let _ = stepping.recv();
+        false
+    });
+    let book = Book::start_with(stubs(2), cleaner, FAST, None, nap);
+    let mut asked = Vec::new();
+    for _ in 0..4 {
+        asked.push(delays.recv_timeout(LONG).expect("a wait"));
+        go.send(()).expect("step");
+    }
+    let millis: Vec<u128> = asked.iter().map(Duration::as_millis).collect();
+    assert_eq!(millis, [10, 20, 40, 10]);
+    assert_eq!(book.dirty(), BTreeSet::from([1]));
+}
+
+/// Catches a recovery that keeps its grown wait after a slot came back (a slot that
+/// fails again would wait the longest), and one that keeps cleaning a slot that is clean:
+/// the waits grow while the slot stays dirty, the pass that cleans it ends them (no wait
+/// is asked for, no clean is made), and when it goes dirty again the next wait is the first.
+#[tokio::test]
+async fn the_waits_stop_once_the_slot_is_clean_and_start_again_from_the_first() {
+    // Dirty at the start and at the first two passes, clean at the third, dirty at the
+    // lease's clean, clean after.
+    let outcomes = vec![dirty(), dirty(), dirty(), Outcome::Clean, dirty()];
+    let (book, calls, delays, go) = stepped(outcomes, FAST);
+    let reported = counts(&book);
+    assert_eq!(reported.recv_timeout(LONG), Ok(0));
+    let mut asked = Vec::new();
+    for _ in 0..3 {
+        asked.push(delays.recv_timeout(LONG).expect("a wait"));
+        go.send(()).expect("step");
+    }
+    until(&reported, 1).expect("the slot never came back");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        4,
+        "the start and three passes"
+    );
+    let (index, permit) = take(&book).await;
+    book.held(index, permit).give();
+    assert_eq!(calls.load(Ordering::SeqCst), 5, "giving back cleans");
+    asked.push(delays.recv_timeout(LONG).expect("a wait"));
+    // Without the reset the wait would be the next double, 80 ms.
+    let millis: Vec<u128> = asked.iter().map(Duration::as_millis).collect();
+    assert_eq!(millis, [10, 20, 40, 10]);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        5,
+        "no pass before the wait is sat out"
+    );
 }
 
 /// Catches a slot that fails for the same reason over and over logged at `ERROR` each
@@ -476,49 +578,52 @@ fn a_stale_count_never_overwrites_a_newer_one() {
 /// Catches a newly dirty slot that waits out the wait a stubborn one had grown to (the
 /// recovery would answer a fresh failure after minutes): with slot 0 never coming back and
 /// its wait grown to over a second, slot 1 going dirty is cleaned again within a few
-/// first-waits, not after the grown one.
-#[test]
-fn a_newly_dirty_slot_restarts_the_backoff() {
+/// first-waits, not after the grown one: the waits asked for are the first, grown while
+/// slot 0 stays dirty, and the first again right after slot 1 goes dirty.
+#[tokio::test]
+async fn a_newly_dirty_slot_restarts_the_backoff() {
     quiet();
-    let first = Duration::from_millis(50);
     let backoff = Backoff {
-        first,
+        first: Duration::from_millis(10),
         max: Duration::from_secs(3600),
     };
-    let (passes, passed) = mpsc::channel();
-    let passes = Mutex::new(passes);
-    let cleaner: Cleaner<Stub> = Arc::new(move |slot: &Stub| {
-        if slot.0 == 0 {
-            let _ = lock(&passes).send(());
-            return dirty();
-        }
-        Outcome::Clean
+    let cleaner: Cleaner<Stub> = Arc::new(
+        |slot: &Stub| {
+            if slot.0 == 0 { dirty() } else { Outcome::Clean }
+        },
+    );
+    let (ask, delays) = mpsc::channel();
+    let (go, stepping) = mpsc::channel::<()>();
+    // As the real wait answers a wake-up: whether a slot went dirty, the signal taken.
+    // A test that is done drops `go`: the waits then return at once.
+    let nap: Nap = Box::new(move |wake, time| {
+        let _ = ask.send(time);
+        let _ = stepping.recv();
+        std::mem::take(&mut lock(&wake.state).news)
     });
     // Slot 0 is dirty from the start; slot 1 is clean and held.
-    let book = Book::start(stubs(2), cleaner, backoff);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .expect("runtime");
-    let (index, permit) = runtime.block_on(take(&book));
+    let book = Book::start_with(stubs(2), cleaner, backoff, None, nap);
+    let (index, permit) = take(&book).await;
     assert_eq!(index, 1);
     let held = book.held(index, permit);
-    let reported = counts(&book);
-    assert_eq!(reported.recv_timeout(LONG), Ok(1), "slot 1 can run a lease");
-    // The start's clean, then passes after 50, 100, 200, 400 and 800 ms: the wait is now
-    // 1600 ms, begun when the sixth pass ended.
-    for _ in 0..6 {
-        passed.recv_timeout(LONG).expect("a pass");
+    // The thread begins with the wake-up the start leaves: the first wait ends at once as
+    // news (the next starts from the first again), and the passes follow with waits that
+    // double.
+    let mut asked = Vec::new();
+    for _ in 0..5 {
+        asked.push(delays.recv_timeout(LONG).expect("a wait"));
+        // The fifth stays unanswered: the thread is inside a wait of 80 ms.
+        if asked.len() < 5 {
+            go.send(()).expect("step");
+        }
     }
-    let went_dirty = Instant::now();
+    // Slot 1 goes dirty during that wait; the wait ends as news.
     drop(held);
-    let seen = until(&reported, 1).expect("the slot never came back");
-    assert_eq!(seen, [0, 1]);
-    assert!(
-        went_dirty.elapsed() < Duration::from_millis(1000),
-        "waited out the grown wait: {:?}",
-        went_dirty.elapsed()
-    );
+    go.send(()).expect("step");
+    asked.push(delays.recv_timeout(LONG).expect("a wait"));
+    let millis: Vec<u128> = asked.iter().map(Duration::as_millis).collect();
+    // Without the restart the last would be the next double of the 80 before it.
+    assert_eq!(millis, [10, 10, 20, 40, 80, 10]);
 }
 
 /// Catches a recovery thread that cannot be made going unnoticed (the node would sit at
@@ -528,7 +633,7 @@ fn a_newly_dirty_slot_restarts_the_backoff() {
 fn a_book_whose_recovery_thread_cannot_be_made_still_starts() {
     quiet();
     let cleaner: Cleaner<Stub> = Arc::new(|_: &Stub| dirty());
-    let book = Book::start_with(stubs(1), cleaner, FAST, Some(usize::MAX));
+    let book = Book::start_with(stubs(1), cleaner, FAST, Some(usize::MAX), Box::new(sleep));
     assert_eq!(book.count(), 0);
     assert_eq!(book.dirty(), BTreeSet::from([0]));
 }

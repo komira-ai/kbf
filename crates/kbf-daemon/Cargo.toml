@@ -22,6 +22,8 @@ clap.workspace = true
 crc32fast.workspace = true
 futures.workspace = true
 hex.workspace = true
+# The per-minute binner of each lease's usage (`lease_minutes`); std only.
+js-agent-usage.workspace = true
 kbf-caps.workspace = true
 kbf-map.workspace = true
 kbf-mapsync.workspace = true

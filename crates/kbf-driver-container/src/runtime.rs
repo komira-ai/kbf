@@ -38,9 +38,9 @@ use kbf_daemon::cache::{Cache, CacheConfig, InputStats};
 use kbf_daemon::cas::{Cas, CasError};
 use kbf_daemon::cpu_pool::{CpuPool, DEFAULT_CPU_THREADS};
 use kbf_daemon::trees::{TreeConfig, TreeLease, Trees};
-use kbf_daemon::{NodeLoadError, Runtime, RuntimeError, Work, upload_within};
+use kbf_daemon::{NodeLoadError, NodeReading, Runtime, RuntimeError, Work, upload_within};
 use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata, Platform};
-use kbf_proto::worker::{self, ResourceUsage};
+use kbf_proto::worker::ResourceUsage;
 use kbf_types::LeaseId;
 use prost_types::Timestamp;
 use tokio::sync::oneshot;
@@ -308,8 +308,9 @@ impl<C: Cas> ContainerRuntime<C> {
     }
 
     /// One reading of the `actions/` cgroup (`NodeLoad`), with the leases that ran for the
-    /// whole window since the previous reading. The cgroup's files are read on the
-    /// blocking pool.
+    /// whole window since the previous reading and every running lease with its start and
+    /// what its own cgroup holds. The files are read on the blocking pool, and only one
+    /// reading reads them at a time.
     ///
     /// # Errors
     /// A file the reading needs cannot be read or does not parse.
@@ -828,7 +829,7 @@ impl<C: Cas> Runtime for ContainerRuntime<C> {
         self.config.welcomed(on).await;
     }
 
-    async fn node_load(&self) -> Result<Option<worker::NodeLoad>, NodeLoadError> {
+    async fn node_load(&self) -> Result<Option<NodeReading>, NodeLoadError> {
         let load = ContainerRuntime::node_load(self)
             .await
             .map_err(|e| NodeLoadError {
@@ -837,7 +838,7 @@ impl<C: Cas> Runtime for ContainerRuntime<C> {
                 },
                 why: e.to_string(),
             })?;
-        Ok(Some(load.into_proto()))
+        Ok(Some(load.into_reading()))
     }
 
     fn take_peak_window_millicores(&self, lease_id: LeaseId) -> Option<u64> {
