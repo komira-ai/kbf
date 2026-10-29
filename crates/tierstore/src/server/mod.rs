@@ -601,8 +601,8 @@ impl Server {
             limit.min(usize::try_from(grant.max_object_bytes).unwrap_or(usize::MAX))
         });
         let reader = Reader::new(body, limit, self.config.body_idle_timeout);
-        let hot_only = signed.presign.is_some();
-        self.dispatch(parts, target, &query, reader, check, hot_only)
+        let presigned = signed.presign.is_some();
+        self.dispatch(parts, target, &query, reader, check, presigned)
             .await
     }
 

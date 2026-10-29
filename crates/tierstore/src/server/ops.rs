@@ -29,6 +29,17 @@ const SUPPORTED: [&str; 8] = [
     "uploads",
 ];
 
+/// The query parameters of SigV4 query-string authentication, which only a presigned request
+/// carries: the check of the signature has read them, and they are not parameters of a call.
+const PRESIGN_PARAMS: [&str; 6] = [
+    "X-Amz-Algorithm",
+    "X-Amz-Credential",
+    "X-Amz-Date",
+    "X-Amz-Expires",
+    "X-Amz-SignedHeaders",
+    "X-Amz-Signature",
+];
+
 /// The query parameters that make a request part of a multipart upload.
 const MULTIPART: [&str; 3] = ["partNumber", "uploadId", "uploads"];
 
@@ -94,8 +105,10 @@ fn refuse_reserved(key: &str) -> Result<(), S3Error> {
 
 /// Refuses what this front does not do whatever the call is: a query parameter it does not
 /// know, and a copy.
-fn refuse_unsupported(parts: &Parts, query: &Query) -> Result<(), S3Error> {
-    if !query.only(&SUPPORTED) {
+fn refuse_unsupported(parts: &Parts, query: &Query, presigned: bool) -> Result<(), S3Error> {
+    let extra: &[&str] = if presigned { &PRESIGN_PARAMS } else { &[] };
+    let allowed: Vec<&str> = SUPPORTED.iter().chain(extra).copied().collect();
+    if !query.only(&allowed) {
         return Err(S3Error::unsupported(
             "this query parameter is not supported",
         ));
@@ -203,14 +216,14 @@ impl Server {
         query: &Query,
         reader: Reader<B>,
         check: Check,
-        hot_only: bool,
+        presigned: bool,
     ) -> Result<Answer, S3Error>
     where
         B: Body + Send,
         B::Data: Send,
         B::Error: Into<BoxError>,
     {
-        refuse_unsupported(parts, query)?;
+        refuse_unsupported(parts, query, presigned)?;
         let method = parts.method.as_str();
         let multipart = query.has_any(&MULTIPART);
         if let ("PUT", Target::Object(key), true) = (method, &target, multipart) {
@@ -227,7 +240,7 @@ impl Server {
             ("GET", Target::Object(key), false) => self.get_object(parts, &key).await,
             ("HEAD", Target::Object(key), false) => self.head_object(parts, &key).await,
             ("PUT", Target::Object(key), false) => {
-                self.put_object(parts, &key, body, hot_only).await
+                self.put_object(parts, &key, body, presigned).await
             }
             ("DELETE", Target::Object(key), false) => self.delete_object(&key).await,
             ("DELETE", Target::Object(key), true) => self.abort_upload(query, &key).await,
@@ -280,14 +293,14 @@ impl Server {
         parts: &Parts,
         key: &str,
         body: Bytes,
-        hot_only: bool,
+        presigned: bool,
     ) -> Result<Answer, S3Error> {
         refuse_reserved(key)?;
         let if_match = header(&parts.headers, "if-match");
         match (if_match, header(&parts.headers, "if-none-match")) {
             (Some(tag), _) => self.replace_object(key, tag).await,
             (None, None | Some("*")) => {
-                self.put_detached(key, body, hot_only).await?;
+                self.put_detached(key, body, presigned).await?;
                 Ok(answer(StatusCode::OK, &[], Bytes::new()))
             }
             (None, Some(_)) => Err(S3Error::unsupported("only If-None-Match: * is supported")),
@@ -315,10 +328,10 @@ impl Server {
     }
 
     /// Creates the object in the backend, and goes on to the end if the request is dropped.
-    async fn put_detached(&self, key: &str, body: Bytes, hot_only: bool) -> Result<(), S3Error> {
+    async fn put_detached(&self, key: &str, body: Bytes, presigned: bool) -> Result<(), S3Error> {
         let (backend, key) = (Arc::clone(&self.backend), key.to_owned());
         let put = detached(async move {
-            if hot_only {
+            if presigned {
                 backend.put_hot_only(&key, body).await
             } else {
                 backend.put(&key, body).await

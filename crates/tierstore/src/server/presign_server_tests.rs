@@ -553,3 +553,48 @@ async fn a_presigned_put_of_a_key_in_the_cold_tier_only_is_412() {
     assert_eq!(f.rig.cold_mem.get("cas/b/old", None).await.unwrap(), "old");
     assert!(f.rig.hot_mem.get("cas/b/old", None).await.is_err());
 }
+
+/// Asserts which query parameters the front takes: the six of query-string authentication on a
+/// presigned request (they are read by the check of the signature and are not parameters of the
+/// call), and no other that the front does not know, signed right or not; and that a request
+/// signed in the header that carries one of the six (a presigned URL's signature in a
+/// header-signed request, say) is `NotImplemented` and changes nothing. It catches a front that
+/// answers 501 to every presigned URL, or one that lets any parameter through.
+#[tokio::test(start_paused = true)]
+async fn only_the_query_authentication_parameters_are_taken_on_a_presigned_request() {
+    let f = fixture().await;
+    let ok = f.put(&put_url("cas/b/ok", 300), b"x").await;
+    assert_eq!(ok.status, StatusCode::OK);
+    let extra = [("versionId", "1")];
+    let url = presign_url(
+        "PUT",
+        &access("pack-presign"),
+        &request("cas/b/v", 300),
+        &extra,
+    );
+    let unknown = f.put(&url.unwrap(), b"x").await;
+    assert_eq!(refused(&unknown), (501, "NotImplemented".to_owned()));
+    assert!(!f.holds("cas/b/v").await);
+    for param in [
+        "X-Amz-Signature=00",
+        "X-Amz-Date=20270115T080000Z",
+        "X-Amz-Algorithm=x",
+    ] {
+        let uri = format!("/{BUCKET}/cas/a/h?{param}");
+        let signed = sign_as(
+            &f.rig.config,
+            (KEY_ID, super::testing::SECRET),
+            "PUT",
+            &uri,
+            &[],
+            b"x",
+        );
+        let reply = f.rig.send_raw(signed).await;
+        assert_eq!(
+            refused(&reply),
+            (501, "NotImplemented".to_owned()),
+            "{param}"
+        );
+    }
+    assert!(!f.holds("cas/a/h").await);
+}
