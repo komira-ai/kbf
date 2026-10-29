@@ -326,6 +326,7 @@ fn node_caps(caps: &NodeCaps) -> proto::NodeCaps {
                     Consumable::MemGib => proto::Consumable::MemGib,
                     Consumable::NvmeGib => proto::Consumable::NvmeGib,
                     Consumable::Gpus => proto::Consumable::Gpus,
+                    Consumable::DiskGib => proto::Consumable::DiskGib,
                 }
                 .into(),
                 amount,
@@ -603,6 +604,7 @@ fn from_consumable(c: proto::ConsumableAmount) -> Result<(Consumable, u64), Deco
         Ok(proto::Consumable::MemGib) => Consumable::MemGib,
         Ok(proto::Consumable::NvmeGib) => Consumable::NvmeGib,
         Ok(proto::Consumable::Gpus) => Consumable::Gpus,
+        Ok(proto::Consumable::DiskGib) => Consumable::DiskGib,
         Ok(proto::Consumable::Unspecified) | Err(_) => {
             return Err(DecodeError::UnknownValue {
                 field: "ConsumableAmount.consumable",

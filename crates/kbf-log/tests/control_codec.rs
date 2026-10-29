@@ -369,6 +369,25 @@ fn generated_control_commands_round_trip() {
     assert!(inputs.iter().all(|&n| n > 100), "{inputs:?}");
 }
 
+#[test]
+fn a_disk_gib_consumable_round_trips_as_enum_value_5() {
+    let mut caps = NodeCaps::new(CpuCaps::new(Arch::X86_64, Default::default()));
+    caps.consumables.insert(Consumable::DiskGib, 9);
+    let command = batch(FarmInput::Capacity {
+        worker: WorkerId::new("w"),
+        capacity: Resources::default(),
+        caps,
+    });
+    let bytes = enc(&command);
+    // ConsumableAmount { consumable 5, amount 9 } inside NodeCaps.consumables (field 4).
+    let amount = [0x22, 0x04, 0x08, 0x05, 0x10, 0x09];
+    assert!(
+        bytes.windows(amount.len()).any(|w| w == amount),
+        "{bytes:02x?}"
+    );
+    assert_eq!(dec(&bytes).expect("decode"), command);
+}
+
 const fn kind(command: &LogCommand) -> usize {
     match command {
         LogCommand::Meta(_)
