@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
 use kbf_objstore::PageSize;
-use kbf_pack::{SweepConfig, SweepGates, Sweeper};
+use kbf_pack::{SweepConfig, SweepError, SweepGates, Sweeper};
 use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_pack_index::{
     BlobDigest, Location, NewPack, PackBlob, PackIndex, PackIndexError, PackInfo, Recorded,
@@ -273,5 +273,50 @@ async fn a_pack_indexed_between_list_and_delete_is_kept() {
     let report = sweep.sweep(now()).await.unwrap();
     assert!(rig.store.holds(&key(OLD)).await);
     assert_eq!(report.referenced, 1);
+    assert_eq!(report.deleted, 0);
+}
+
+/// Asserts that a listing that fails on its second page stops the sweep with the listing's
+/// error, after the first page was swept.
+#[tokio::test]
+async fn a_failed_listing_stops_the_sweep_after_the_pages_it_swept() {
+    let rig = Rig::new();
+    for n in 0..3 {
+        rig.store.seed(&key(OLD + n), b"orphan").await;
+    }
+    rig.store.fail_list_after(1);
+    let index: Arc<dyn PackIndex> = rig.index.clone();
+    let config = SweepConfig {
+        page: PageSize::new(2).unwrap(),
+        ..SweepConfig::default()
+    };
+    let sweep = Sweeper::new(Arc::clone(&rig.store), index, config, gates(true, None));
+    let error = sweep.sweep(now()).await.unwrap_err();
+    assert!(matches!(error, SweepError::List(_)));
+    assert_eq!(rig.store.keys_under("cas/b/").await, vec![key(OLD + 2)]);
+}
+
+/// Asserts that an index that cannot answer stops the sweep with the index's error and
+/// deletes nothing: no key is deleted that the index did not say is unreferenced.
+#[tokio::test]
+async fn an_index_that_fails_stops_the_sweep_and_deletes_nothing() {
+    let rig = Rig::new();
+    rig.store.seed(&key(OLD), b"orphan").await;
+    rig.index.fail_unreferenced(1);
+    let error = sweeper(&rig, gates(true, None))
+        .sweep(now())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SweepError::Index(_)));
+    assert!(rig.store.holds(&key(OLD)).await);
+}
+
+/// Asserts that a key minted after `now` (a clock that runs behind) counts as young.
+#[tokio::test]
+async fn a_key_minted_in_the_future_is_young() {
+    let rig = Rig::new();
+    rig.store.seed(&key(NOW_MINUTE + 50), b"orphan").await;
+    let report = sweeper(&rig, gates(true, None)).sweep(now()).await.unwrap();
+    assert_eq!(report.young, 1);
     assert_eq!(report.deleted, 0);
 }

@@ -10,8 +10,10 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use kbf_objstore::{ObjectStore, ObjectStoreError, PageSize};
+use kbf_objstore::{KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError, PageSize};
 use kbf_pack_index::{PackIndex, PackIndexError};
+
+use crate::blocking::offload;
 
 /// The prefix the sweep covers, and the only one it ever deletes under.
 pub const SWEPT_PREFIX: &str = "cas/b/";
@@ -41,10 +43,13 @@ impl Default for SweepConfig {
     }
 }
 
+/// When a key was minted, read from the key itself; `None` when the key does not say.
+pub type AgeOf = Box<dyn Fn(&str) -> Option<SystemTime> + Send + Sync>;
+
 /// The three questions a sweep asks of its caller.
 pub struct SweepGates {
     /// When the key was minted, read from the key; `None` for a key that does not say.
-    pub age_of: Box<dyn Fn(&str) -> Option<SystemTime> + Send + Sync>,
+    pub age_of: AgeOf,
     /// Whether this process leads: only the leader sweeps.
     pub is_leader: Box<dyn Fn() -> bool + Send + Sync>,
     /// Whether the key is being verified right now.
@@ -115,8 +120,91 @@ impl<S: ObjectStore> Sweeper<S> {
     /// [`SweepError::List`] or [`SweepError::Index`]: the sweep stops, and what it deleted
     /// before stays deleted.
     pub async fn sweep(&self, now: SystemTime) -> Result<SweepReport, SweepError> {
-        let _ = (&self.store, &self.index, &self.config, &self.gates, now);
-        std::future::ready(()).await;
-        Ok(SweepReport::default())
+        let mut report = SweepReport::default();
+        if !(self.gates.is_leader)() {
+            return Ok(report);
+        }
+        report.led = true;
+        let prefix = KeyPrefix::new(SWEPT_PREFIX).expect("the swept prefix is a valid prefix");
+        let mut after: Option<ListToken> = None;
+        loop {
+            let page = self
+                .store
+                .list(&prefix, after.as_ref(), self.config.page)
+                .await
+                .map_err(SweepError::List)?;
+            report.listed += page.objects.len();
+            let mut candidates = Vec::new();
+            for object in &page.objects {
+                let key = object.key.as_str();
+                let Some(born) = (self.gates.age_of)(key) else {
+                    tracing::warn!(%key, "a key under cas/b/ does not say its age: kept");
+                    report.strays.push(key.to_owned());
+                    continue;
+                };
+                // A key minted in the future (clock skew) is as young as it can be.
+                let age = now.duration_since(born).unwrap_or(Duration::ZERO);
+                if age < self.config.grace {
+                    report.young += 1;
+                } else if (self.gates.verifying)(key) {
+                    report.verifying += 1;
+                } else {
+                    candidates.push(object.key.clone());
+                }
+            }
+            self.judge(candidates, &mut report).await?;
+            match page.next {
+                Some(token) => after = Some(token),
+                None => return Ok(report),
+            }
+        }
+    }
+
+    /// Deletes the keys among `candidates` that the index does not record.
+    async fn judge(
+        &self,
+        candidates: Vec<ObjectKey>,
+        report: &mut SweepReport,
+    ) -> Result<(), SweepError> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let asked = candidates.len();
+        let names = candidates.iter().map(ToString::to_string).collect();
+        let orphans = self.unreferenced(names).await?;
+        report.referenced += asked.saturating_sub(orphans.len());
+        for key in candidates {
+            if !orphans.contains(&key.to_string()) {
+                continue;
+            }
+            // The page was judged a moment ago: a pack may have been recorded since.
+            if self.unreferenced(vec![key.to_string()]).await?.is_empty() {
+                report.referenced += 1;
+                continue;
+            }
+            if self.config.dry_run {
+                tracing::info!(%key, "an orphan pack would be deleted");
+                report.would_delete += 1;
+                continue;
+            }
+            match self.store.delete(&key).await {
+                Ok(()) => {
+                    tracing::info!(%key, "deleted an orphan pack");
+                    report.deleted += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(%key, %error, "could not delete an orphan pack");
+                    report.delete_failed += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn unreferenced(&self, keys: Vec<String>) -> Result<Vec<String>, SweepError> {
+        let index = Arc::clone(&self.index);
+        offload(move || index.unreferenced_keys(&keys))
+            .await
+            .map_err(SweepError::Index)
     }
 }
