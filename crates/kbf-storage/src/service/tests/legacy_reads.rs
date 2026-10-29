@@ -2,6 +2,7 @@
 //! the row of the call that served it, and nothing that serves no stored bytes is counted.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use futures::StreamExt as _;
@@ -301,4 +302,79 @@ async fn a_direct_read_of_the_node_storage_counts_on_the_in_process_rows() {
     *mem.fail.lock().expect("lock") = Some(StorageError::Internal("disk".into()));
     assert!(node.read_blob(&digest).await.is_err());
     assert_eq!(rows(&reads), [0, 0, 2, 0, 2]);
+}
+
+/// Catches a `CountedStorage` that drops, alters or double-answers a call it only passes on:
+/// each existence check, write, stream, segments handle, action-cache write and RAM-ack
+/// query reaches the inner storage exactly once and returns its answer (a refusal included),
+/// and none of them counts as a read.
+#[tokio::test]
+async fn every_other_call_reaches_the_inner_storage_and_counts_nothing() {
+    let mem = Arc::new(Mem::default());
+    let reads = Arc::new(LegacyReads::default());
+    let storage: Arc<dyn Storage> = Arc::clone(&mem) as Arc<dyn Storage>;
+    let node = crate::legacy::CountedStorage::new(storage, Arc::clone(&reads));
+    let held = hold(&mem, b"held");
+
+    node.find_durable(&[held]).await.expect("durable");
+    node.find_durable_waiting(&[held]).await.expect("waited");
+    assert_eq!(mem.durable_asked.load(Ordering::SeqCst), 1);
+    assert_eq!(mem.waited.load(Ordering::SeqCst), 1);
+
+    let unowned = node
+        .put_unowned(Bytes::from_static(b"unowned"))
+        .await
+        .expect("put");
+    assert_eq!(unowned, sha(b"unowned"));
+    assert!(mem.blobs.lock().expect("lock").contains_key(&unowned));
+    assert_eq!(mem.puts.load(Ordering::SeqCst), 1);
+
+    assert!(node.stream(5).is_none(), "the inner storage offers none");
+    mem.knobs.enabled.store(true, Ordering::SeqCst);
+    assert!(node.stream(5).is_some(), "the inner storage's stream");
+    assert_eq!(mem.knobs.begun.load(Ordering::SeqCst), 1);
+
+    let streamed = sha(b"streamed");
+    let pieces = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"streamed"))]);
+    let claim = Box::pin(async move { Some(streamed) });
+    let done = node.put_streamed(8, pieces.boxed(), claim).await;
+    assert_eq!(done.expect("streamed"), Some(streamed));
+    assert_eq!(mem.streamed.load(Ordering::SeqCst), 1);
+
+    let begun = node
+        .segments()
+        .begin(Request::new(kbf_proto::worker::BeginRequest::default()))
+        .await;
+    begun.expect("begin");
+    let seen = mem.segments.calls.lock().expect("lock").len();
+    assert_eq!(seen, 1, "the inner segments service took the call");
+    let open = crate::service::OpenWrites::new();
+    node.segments_counted(&open);
+    assert!(mem.counted_with.lock().expect("lock").is_some());
+
+    let result = ActionResult {
+        stdout_raw: b"out".to_vec(),
+        exit_code: 2,
+        ..ActionResult::default()
+    };
+    let record = node.prepare_action_result(&result).await.expect("prepared");
+    assert_eq!((record.result, record.closure.len()), (sha(b"out"), 2));
+    let action = sha(b"an action");
+    let refused = node
+        .commit_action_record(Role::Client, action, record.clone())
+        .await;
+    assert!(refused.is_err(), "the inner storage's refusal is returned");
+    assert!(mem.actions.lock().expect("lock").is_empty());
+    node.commit_action_record(Role::Daemon, action, record)
+        .await
+        .expect("committed");
+    assert!(mem.actions.lock().expect("lock").contains_key(&action));
+
+    assert!(!node.ram_ack());
+    mem.knobs.ram_ack.store(true, Ordering::SeqCst);
+    assert!(node.ram_ack());
+    node.unconfirmed(3);
+    assert_eq!(mem.knobs.unconfirmed.load(Ordering::SeqCst), 3);
+
+    assert_eq!(rows(&reads), [0, 0, 0, 0, 0], "none of these is a read");
 }
