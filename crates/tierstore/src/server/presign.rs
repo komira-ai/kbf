@@ -201,6 +201,9 @@ impl Grant {
                 "the ceiling prefix is not a valid prefix",
             ));
         }
+        if !self.prefix.ends_with('/') {
+            return Err(PresignError::Key("the ceiling prefix does not end in /"));
+        }
         if !(1..=MAX_EXPIRES_SECS).contains(&self.max_expires_secs) {
             return Err(PresignError::Key("max_expires_secs is from 1 to 604800"));
         }
