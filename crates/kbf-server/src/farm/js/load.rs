@@ -7,8 +7,9 @@ use super::JsFarm;
 
 /// The load `worker`'s heartbeat reported, as `js_sched` takes it in `Event::Heartbeat`
 /// (`js_server_core::Beat::with_load`): placement by `--placement-load` weighs a node by
-/// it. This server's heartbeat carries no load yet, so there is none; the conversion from
-/// the heartbeat's `NodeLoad`, and the vetting of what it says, follow with it.
+/// it. None for now: the conversion from the heartbeat's reported load, and the vetting of
+/// what it says, follow in their own change, which also keeps the load the node view shows
+/// (the farm's `note_node_load` returns early on this core).
 pub(crate) fn node_load(js: &JsFarm, worker: &WorkerId) -> Option<NodeLoad> {
     let _ = (js, worker);
     None

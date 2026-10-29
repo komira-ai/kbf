@@ -204,3 +204,31 @@ async fn a_start_logs_the_core_and_js_is_refused_before_anything_opens() {
         "a refused core is never logged as running"
     );
 }
+
+/// Catches `--learned-sizes on` accepted with the js core (which learns in shadow only, so
+/// a farm told `on` would book as `off` does), and the refusal applied to the other
+/// combinations: `shadow` and `off` on js, and `on` on the legacy core.
+#[test]
+fn learned_sizes_on_is_refused_with_the_js_core_only() {
+    let check = |flags: &[&str]| {
+        let mut argv = vec!["kbf-server"];
+        argv.extend_from_slice(flags);
+        Args::parse_from(argv).check_scheduler_core()
+    };
+    let refused = check(&["--scheduler-core=js", "--learned-sizes=on"]).expect_err("on");
+    assert!(matches!(refused, ConfigError::LearnedSizesOnUnderJs));
+    let said = refused.to_string();
+    assert!(said.contains("--learned-sizes on"), "{said}");
+    assert!(said.contains("--scheduler-core js"), "{said}");
+    assert_eq!(StartFailure::of(&refused).status(), REFUSED);
+    for mode in ["shadow", "off"] {
+        let flag = format!("--learned-sizes={mode}");
+        let checked = check(&["--scheduler-core=js", &flag]);
+        // Whether js is built decides; the learned sizes do not.
+        assert!(
+            !matches!(checked, Err(ConfigError::LearnedSizesOnUnderJs)),
+            "{mode}"
+        );
+    }
+    check(&["--scheduler-core=legacy", "--learned-sizes=on"]).expect("legacy on");
+}
