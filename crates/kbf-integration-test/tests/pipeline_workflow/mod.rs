@@ -1,29 +1,39 @@
 //! What `.github/workflows/pipeline.yml` and the workflows it calls must keep: the one
-//! sequential pipeline of a push to main (docs/design/kbf-cicd.md, section 8), as workflow
-//! rules. [`problems`] reads the five workflow files and reports each way they differ from the
-//! rules; the real files must report none, and `tests` plants a defect for each rule.
+//! pipeline of a push to main (docs/design/kbf-cicd.md, section 8), as workflow rules.
+//! [`problems`] reads the workflow files and reports each way they differ from the rules; the
+//! real files must report none, and `tests` plants a defect for each rule.
 //!
-//! - **One pipeline, in order.** `pipeline.yml` runs on a push to `branches: [main]` and on
-//!   nothing else, with the jobs [`JOBS`]: `ci`, `artifacts` and `beta` call `ci.yml`,
-//!   `artifacts.yml` and `beta.yml`, each `needs` exactly the one before it. No job can pass or run
-//!   after a red one, so a red or cancelled stage stops the stages after it.
-//! - **Each check once.** The three called workflows have a `workflow_call` trigger and no
+//! - **One pipeline.** `pipeline.yml` runs on a push to `branches: [main]` and on nothing
+//!   else, with the jobs [`JOBS`]. `ci`, `beta`, `artifacts` and `smoke` call `ci.yml`,
+//!   `beta.yml`, `artifacts.yml` and `smoke.yml`. `ci` and `beta` need nothing and start
+//!   together; `artifacts` needs `ci`, and `smoke`, the one job that tests the artifacts, needs
+//!   `artifacts` (a commit that fails the gate is neither signed nor smoke-tested). No stage
+//!   can pass or run after a red one, so a red or cancelled stage stops the stages after it.
+//! - **Everything must pass.** `passed` needs every stage and has no `if:`, so the run is green
+//!   only when each stage is, and the release (which follows the run's success) is made only
+//!   then. It is also the end of the run for `watch`.
+//! - **Fail fast.** `watch` needs nothing, runs only for a push to main (the one condition the
+//!   workflow lint lets hold `actions: write`), builds xtask before any step holds a token and
+//!   ends with the one step that does: `cargo xtask pipeline-watch`, which cancels the run as soon
+//!   as a job has failed.
+//! - **Each check once.** The four called workflows have a `workflow_call` trigger and no
 //!   `push` trigger; `ci.yml` and `artifacts.yml` keep `pull_request` and `merge_group`;
-//!   `beta.yml` has `workflow_call` alone. Exactly one job in the repository calls each of
-//!   them, and it is the job of the pipeline, so a push to main runs each check once.
-//! - **Beta tests the artifacts of the same run.** `beta.yml` downloads the `assets-*` and
-//!   `sha256sums` artifacts without a `run-id` (the run it is part of), checks them with
-//!   `verify-assets sums`, takes the `kbf` of the linux-x86_64 tarball and runs the farm from
-//!   it; the job that runs the farm builds no `kbf` of its own.
-//! - **A running pipeline finishes; a release is never cancelled.** The pipeline's concurrency is
-//!   `pipeline-${{ github.ref }}` with `cancel-in-progress: false`: the run in progress is
-//!   never cancelled, and of the pushes that wait GitHub keeps the newest; nothing in it writes (no job
-//!   holds a write scope but the two signing scopes of the `artifacts` call, under the exact
-//!   `if:` of a push to main; no environment, no secret, no token of the release bot). The
+//!   `beta.yml` and `smoke.yml` have `workflow_call` alone. Exactly one job in the repository
+//!   calls each of them, and it is the job of the pipeline, so a push to main runs each check
+//!   once.
+//! - **Smoke tests the artifacts of the same run; beta needs none.** `smoke.yml` downloads the
+//!   `assets-*` and `sha256sums` artifacts without a `run-id` (the run it is part of), checks
+//!   them with `verify-assets sums`, takes the `kbf` of the linux-x86_64 tarball and runs the
+//!   farm from it; the job that runs the farm builds no `kbf` of its own. `beta.yml` downloads
+//!   no artifact, which is what lets it start beside `ci`.
+//! - **A running pipeline is not cancelled by a push; a release is never cancelled.** The
+//!   pipeline's concurrency is `pipeline-${{ github.ref }}` with `cancel-in-progress: false`: the
+//!   run in progress is never cancelled by a push, and of the pushes that wait GitHub keeps the
+//!   newest. Nothing in it releases (no environment, no secret, no token of the release bot). The
 //!   release is another workflow, in a group of its own that never cancels (`release_workflow`
 //!   holds that rule), started by the success of a run of this one.
 //! - **Least privilege.** Every job has `contents: read` and nothing else but the signing
-//!   scopes of `artifacts`; a called workflow gets at most
+//!   scopes of `artifacts` and the `actions: write` of `watch`; a called workflow gets at most
 //!   what its caller job grants.
 
 use super::workflows;
@@ -32,13 +42,14 @@ use super::workflows;
 const NAME: &str = "pipeline";
 
 /// The jobs, in file order.
-const JOBS: [&str; 3] = ["ci", "artifacts", "beta"];
+const JOBS: [&str; 6] = ["ci", "beta", "artifacts", "smoke", "watch", "passed"];
 
 /// `(job, workflow file, the job it needs)`: the stages, in order.
-const STAGES: [(&str, &str, Option<&str>); 3] = [
+const STAGES: [(&str, &str, Option<&str>); 4] = [
     ("ci", "ci.yml", None),
+    ("beta", "beta.yml", None),
     ("artifacts", "artifacts.yml", Some("ci")),
-    ("beta", "beta.yml", Some("artifacts")),
+    ("smoke", "smoke.yml", Some("artifacts")),
 ];
 
 /// The only job that holds a write scope: the call of `artifacts.yml`, whose attest jobs sign.
@@ -47,6 +58,17 @@ const SIGNING_JOB: &str = "artifacts";
 /// Its `if:`: a push to `main`, the exact spelling the signing scopes need (`workflows`).
 pub const SIGNING_IF: &str =
     "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
+
+/// The fail-fast job: it cancels the run when another job has failed, and is the one job that
+/// holds a write scope besides the signing ones (`actions: write`, to cancel this run).
+const WATCH: &str = "watch";
+
+/// The closing job: it needs every stage and does nothing else, so it completes (skipped, when a
+/// stage did not pass) only when the run is over. The watch ends when it has.
+const PASSED: &str = "passed";
+
+/// The command of the watch's only step that holds a token.
+const WATCH_COMMAND: &str = "cargo xtask pipeline-watch --repo \"$GITHUB_REPOSITORY\" --run-id \"$GITHUB_RUN_ID\" --last-job passed";
 
 /// The group and the cancel of the pipeline: a newer push to the ref replaces the run.
 const GROUP: &str = "pipeline-${{ github.ref }}";
@@ -60,6 +82,7 @@ pub struct Files {
     pub ci: String,
     pub artifacts: String,
     pub beta: String,
+    pub smoke: String,
     pub release: String,
     /// Every other workflow file, `(name, text)`.
     pub others: Vec<(String, String)>,
@@ -70,6 +93,7 @@ impl Files {
         match file {
             "ci.yml" => &self.ci,
             "artifacts.yml" => &self.artifacts,
+            "smoke.yml" => &self.smoke,
             _ => &self.beta,
         }
     }
@@ -105,7 +129,9 @@ pub fn problems(files: &Files) -> Result<Vec<String>, String> {
     pipeline(files, &mut out)?;
     called(files, &mut out)?;
     each_check_once(files, &mut out)?;
-    beta_consumes_the_run(&files.beta, &mut out)?;
+    beta_needs_nothing_of_the_run(&files.beta, &mut out);
+    smoke_consumes_the_run(&files.smoke, &mut out)?;
+    watcher(&files.pipeline, &mut out)?;
     release_follows(files, &mut out)?;
     Ok(out)
 }
@@ -192,7 +218,7 @@ fn pipeline(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
     ] {
         if all.contains(word) {
             out.push(format!(
-                "pipeline.yml names `{word}`: nothing that writes may be in a run a newer push cancels"
+                "pipeline.yml names `{word}`: nothing that releases may be in the pipeline"
             ));
         }
     }
@@ -210,6 +236,7 @@ fn permissions(text: &str, out: &mut Vec<String>) -> Result<(), String> {
                 ("attestations", "write"),
             ],
             "beta" => vec![("contents", "read"), ("attestations", "read")],
+            WATCH => vec![("contents", "read"), ("actions", "write")],
             _ => vec![("contents", "read")],
         };
         let mut got: Vec<String> = have.iter().map(|(s, l)| format!("{s}: {l}")).collect();
@@ -290,7 +317,7 @@ fn called(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
         if has(&events, "push") {
             out.push(format!("{file} has a `push` trigger: a push to main would run it beside the pipeline, and each check must run once"));
         }
-        let pull_requests = file != "beta.yml";
+        let pull_requests = !matches!(file, "beta.yml" | "smoke.yml");
         for event in ["pull_request", "merge_group"] {
             if pull_requests && !has(&events, event) {
                 out.push(format!("{file} does not run on `{event}`: the pull-request gate and the merge queue keep running it"));
@@ -315,6 +342,7 @@ fn each_check_once(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
         ("ci.yml", &files.ci),
         ("artifacts.yml", &files.artifacts),
         ("beta.yml", &files.beta),
+        ("smoke.yml", &files.smoke),
         ("release.yml", &files.release),
     ];
     all.extend(files.others.iter().map(|(n, t)| (n.as_str(), t.as_str())));
@@ -334,14 +362,15 @@ fn each_check_once(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// The smoke of beta runs the `kbf` of the linux-x86_64 tarball of this run's artifacts.
-fn beta_consumes_the_run(beta: &str, out: &mut Vec<String>) -> Result<(), String> {
-    if code(beta).contains("run-id") {
+/// The smoke runs the `kbf` of the linux-x86_64 tarball of this run's artifacts.
+fn smoke_consumes_the_run(smoke: &str, out: &mut Vec<String>) -> Result<(), String> {
+    if code(smoke).contains("run-id") {
         out.push(
-            "beta.yml names a `run-id`: it reads the artifacts of the run it is part of".to_owned(),
+            "smoke.yml names a `run-id`: it reads the artifacts of the run it is part of"
+                .to_owned(),
         );
     }
-    let steps = workflows::job_steps(beta, "smoke")?;
+    let steps = workflows::job_steps(smoke, "smoke")?;
     let downloads: Vec<&workflows::Step> = steps
         .iter()
         .filter(|s| {
@@ -357,11 +386,13 @@ fn beta_consumes_the_run(beta: &str, out: &mut Vec<String>) -> Result<(), String
         .iter()
         .position(|d| input(d, "name") == Some("sha256sums") && input(d, "path") == Some("dist"));
     if assets.is_none() {
-        out.push("the job `smoke` of beta.yml does not download `assets-*` into `dist`".to_owned());
+        out.push(
+            "the job `smoke` of smoke.yml does not download `assets-*` into `dist`".to_owned(),
+        );
     }
     if sums.is_none() {
         out.push(
-            "the job `smoke` of beta.yml does not download `sha256sums` into `dist`".to_owned(),
+            "the job `smoke` of smoke.yml does not download `sha256sums` into `dist`".to_owned(),
         );
     }
     let exact = |command: &str| {
@@ -411,6 +442,84 @@ fn beta_consumes_the_run(beta: &str, out: &mut Vec<String>) -> Result<(), String
                     .to_owned(),
             );
         }
+    }
+    Ok(())
+}
+
+/// `beta.yml` tests the commit's source and waits for nothing: it downloads no artifact of the
+/// run (a job that does belongs in `smoke.yml`, behind `artifacts`), so it can start with `ci`.
+fn beta_needs_nothing_of_the_run(beta: &str, out: &mut Vec<String>) {
+    if code(beta).contains("download-artifact") {
+        out.push("beta.yml downloads an artifact: it starts beside `ci`, before any artifact exists; a job that tests the run's artifacts belongs in smoke.yml".to_owned());
+    }
+}
+
+/// The fail-fast and the end of the run: `passed` needs every stage, `watch` cancels the run
+/// from a token it holds in its last step alone, under the push-to-main condition.
+fn watcher(text: &str, out: &mut Vec<String>) -> Result<(), String> {
+    let stages: Vec<String> = STAGES.iter().map(|(job, _, _)| (*job).to_owned()).collect();
+    let needs = workflows::job_needs(text, PASSED)?;
+    if needs != stages {
+        out.push(format!(
+            "the job `{PASSED}` needs {needs:?}, not {stages:?}: it is green only when every stage is, and the release follows the run's success"
+        ));
+    }
+    if let Some(condition) = workflows::job_condition(text, PASSED)? {
+        out.push(format!(
+            "the job `{PASSED}` has `if: {condition}`: a skipped closing job would let the run succeed without a stage"
+        ));
+    }
+    let needs = workflows::job_needs(text, WATCH)?;
+    if !needs.is_empty() {
+        out.push(format!(
+            "the job `{WATCH}` needs {needs:?}: it must run beside the stages to cancel them"
+        ));
+    }
+    let condition = workflows::job_condition(text, WATCH)?;
+    if condition.as_deref() != Some(SIGNING_IF) {
+        out.push(format!(
+            "the job `{WATCH}` has `if: {}`, not exactly `{SIGNING_IF}`: the lint lets only that condition hold `actions: write`",
+            condition.as_deref().unwrap_or("(none)")
+        ));
+    }
+    let steps = workflows::job_steps(text, WATCH)?;
+    let at = steps
+        .iter()
+        .position(|s| s.run.as_deref() == Some(WATCH_COMMAND));
+    let Some(at) = at else {
+        out.push(format!(
+            "the job `{WATCH}` does not run `{WATCH_COMMAND}`: nothing cancels the run when a job fails"
+        ));
+        return Ok(());
+    };
+    if steps[at].env != [("GH_TOKEN".to_owned(), "${{ github.token }}".to_owned())] {
+        out.push(format!(
+            "the step of `{WATCH}` that cancels does not have exactly `GH_TOKEN: ${{{{ github.token }}}}` as its environment"
+        ));
+    }
+    for (i, step) in steps.iter().enumerate() {
+        let token = step.env.iter().any(|(_, v)| v.contains("token"))
+            || step.with.iter().any(|(_, v)| v.contains("token"));
+        if i != at && token {
+            out.push(format!(
+                "a step of `{WATCH}` other than the one that cancels holds a token: the build of xtask must run before any step holds one"
+            ));
+        }
+        if step
+            .run
+            .as_deref()
+            .is_some_and(|r| r.starts_with("cargo build"))
+            && i > at
+        {
+            out.push(format!(
+                "the job `{WATCH}` builds after the step that holds the token: no build script may run beside it"
+            ));
+        }
+    }
+    if at + 1 != steps.len() {
+        out.push(format!(
+            "the step of `{WATCH}` that cancels is not its last: a step after it would run beside the token"
+        ));
     }
     Ok(())
 }

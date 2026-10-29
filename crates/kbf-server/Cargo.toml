@@ -12,6 +12,11 @@ publish.workspace = true
 # scripted session of it can be written down and compared. Test-only: a production build
 # carries none of it. This crate's own tests enable it through the dev-dependency on itself.
 testkit = []
+# The farm runs on the scheduler core of `src/farm_js` (`Driver::Js`, `src/farm/js`) where
+# `SchedulerCore::under_test` and `--scheduler-core js` name it. Test-only for now: no
+# default feature set turns it on, and `tests/farm_core_js_gate.rs` in kbf-integration-test
+# fails a manifest that does.
+farm-core-js = []
 
 [dependencies]
 axum = { workspace = true, features = ["http1", "tokio"] }

@@ -1,7 +1,8 @@
 //! `--scheduler-core`: which core drives the farm's scheduling. Only `legacy`, the
 //! driver the server has always had, is built; `js` is a value of the flag that the
 //! server refuses at start (`ConfigError::SchedulerCoreUnavailable`), so that a unit
-//! file written for the later core fails loudly and is never taken for the first.
+//! file written for the later core fails loudly and is never taken for the first. A build
+//! with the test-only `farm-core-js` feature has the second core and accepts the value.
 //!
 //! The core a server runs is logged once at start ([`SchedulerCore::start_line`]) and
 //! exported as the gauge `kbf_scheduler_core{core}` ([`render`]).
@@ -24,11 +25,19 @@ impl SchedulerCore {
     /// The core every server runs in this release: the only one a start accepts.
     pub const RUNNING: Self = Self::Legacy;
 
-    /// The core a `Listeners` built by a test names. Always `Legacy` in this build.
+    /// The core a `Listeners` built by a test names, and the one `Farm::new` builds:
+    /// `Legacy`, and `Js` in a build with the `farm-core-js` feature, so that the suites run
+    /// on it.
     #[must_use]
     pub const fn under_test() -> Self {
-        Self::Legacy
+        Self::UNDER_TEST
     }
+
+    #[cfg(not(feature = "farm-core-js"))]
+    const UNDER_TEST: Self = Self::Legacy;
+
+    #[cfg(feature = "farm-core-js")]
+    const UNDER_TEST: Self = Self::Js;
 
     /// The value the flag takes and the gauge's `core` label carries.
     #[must_use]
@@ -39,10 +48,19 @@ impl SchedulerCore {
         }
     }
 
-    /// Whether this release can run the core.
+    /// Whether this build can run the core: `js` only with the `farm-core-js` feature,
+    /// which no release build has.
     #[must_use]
+    #[cfg(not(feature = "farm-core-js"))]
     pub const fn available(self) -> bool {
         matches!(self, Self::Legacy)
+    }
+
+    /// Whether this build can run the core: both, with the `farm-core-js` feature.
+    #[must_use]
+    #[cfg(feature = "farm-core-js")]
+    pub const fn available(self) -> bool {
+        matches!(self, Self::Legacy | Self::Js)
     }
 
     /// The line a start logs: the core it runs.

@@ -87,6 +87,10 @@
 //!   with its line in `SHA256SUMS.<platform>`. The release set holds it for every `kbf`
 //!   tarball (`verify-assets sums`, `release check`), because only a runner of a platform
 //!   can run its binary.
+//! - `pipeline-watch --repo <owner/repo> --run-id <id> --last-job <name> [--interval-secs 30] [--max-polls 300]`
+//!   ([`pipeline_watch`]): the fail-fast of the push pipeline: cancel the run as soon as one of its jobs
+//!   has failed, and stop when the job `--last-job` has completed. Exit 0 whatever it saw; 1 only when
+//!   GitHub refuses the cancel.
 //! - `runner-disk --path <path> --min-free-gb <n>` ([`runner_disk`]): exit 1 naming the disk
 //!   when the disk of `<path>` has less free space than the coverage run needs.
 //! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
@@ -117,6 +121,7 @@ pub mod entitlements;
 pub mod fetch;
 pub mod installer_tarball;
 pub mod package;
+pub mod pipeline_watch;
 pub mod pkg;
 pub mod pkg_asset;
 pub mod pkg_image_asset;
@@ -196,6 +201,8 @@ enum Verb {
     ProveFarm(prove_farm::Args),
     /// Check that the runner's disk has the room the coverage run needs.
     RunnerDisk(runner_disk::Args),
+    /// Cancel the pipeline run when one of its jobs has failed, so its other jobs stop.
+    PipelineWatch(pipeline_watch::Args),
     /// Refuse a row the budget file gains against `--base`.
     BudgetDiff {
         /// The revision to compare with (on a pull request, the base branch).
@@ -1005,6 +1012,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::DeployFarm(args) => deploy_farm::run(&args),
         Verb::ProveFarm(args) => prove_farm::run(&args),
         Verb::RunnerDisk(args) => runner_disk::run(&args),
+        Verb::PipelineWatch(args) => pipeline_watch::run(&args),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::SourceDateEpoch { commit, output } => {
             source_date_epoch(&root, &commit, &output).map(|line| vec![line])

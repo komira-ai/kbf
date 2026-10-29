@@ -16,8 +16,9 @@ impl Farm {
     /// recorder, the state store).
     #[must_use]
     pub(crate) fn from_listeners(cache: impl Into<Backend>, listeners: &Listeners) -> Self {
-        Self::new(
-            cache,
+        Self::on_core(
+            listeners.scheduler_core,
+            cache.into(),
             listeners.unservable_wait,
             listeners.finished_retention,
         )
@@ -25,6 +26,12 @@ impl Farm {
         .with_learned_sizes(listeners.learned_sizes, listeners.memory_ladder.first())
         .with_placement_load(listeners.placement_load)
         .with_whole_node(listeners.whole_node.clone())
+    }
+
+    /// The core this farm runs on, as its driver is (not as a flag says).
+    #[must_use]
+    pub const fn scheduler_core(&self) -> crate::SchedulerCore {
+        self.driver.core()
     }
 
     /// This farm, running whole-machine requests with `config`'s whole-node drain and caps

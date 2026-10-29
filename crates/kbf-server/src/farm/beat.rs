@@ -23,6 +23,7 @@ impl Farm {
         seq: u64,
         running: Vec<LeaseId>,
     ) -> bool {
+        js_arm_async!(self, hot::heartbeat(worker, stream, seq, running));
         let now = self.now();
         let taken = self
             .lock()

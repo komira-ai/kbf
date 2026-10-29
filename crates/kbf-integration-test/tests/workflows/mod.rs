@@ -13,7 +13,9 @@
 //!   (`${{ }}`, so a matrix too), a custom label (even one that starts like a hosted
 //!   label, such as `ubuntu-gpu`) or a second label could select a non-hosted runner,
 //!   so each is refused because the lint cannot tell where it lands;
-//! - a job's `permissions` grants anything but `read` or `none`, except the two scopes
+//! - a job's `permissions` grants anything but `read` or `none`, except `actions` ([`ACTIONS_SCOPES`]: the
+//!   pipeline's watch job cancels its own run), which may be `write` only in a job whose `if:` is exactly
+//!   [`SIGNING_PUSH_ONLY`], and the two scopes
 //!   that sign build provenance ([`SIGNING_SCOPES`]: `id-token` and `attestations`),
 //!   which may be `write` only in a job whose `if:` is exactly [`SIGNING_PUSH_ONLY`] (`id-token`
 //!   also in a job whose `if:` is exactly [`RELEASE_PUSH_ONLY`], for the release's deploy step,
@@ -175,6 +177,10 @@ const RELEASE_PUSH_ONLY: &str = "${{ github.event.workflow_run.conclusion == 'su
 /// Token scopes a job may set to `write` when it runs only on `main`'s ref: the issues
 /// API, which the advisories workflow uses to open, update and close its one issue.
 const ISSUE_SCOPES: &[&str] = &["issues"];
+
+/// Token scopes a job may set to `write` when it runs only for a push to `main`: the Actions API,
+/// which the pipeline's watch job uses to cancel its own run when another job has failed.
+const ACTIONS_SCOPES: &[&str] = &["actions"];
 
 /// The one `if:` spelling under which a job may hold [`ISSUE_SCOPES`] for writing: a run
 /// whose ref is `main` (a scheduled run, a push to `main`, a manual run of `main`). A pull
@@ -669,6 +675,8 @@ impl Lint<'_> {
                 Some(SIGNING_PUSH_ONLY)
             } else if RELEASE_SCOPES.contains(&name) {
                 Some(RELEASE_PUSH_ONLY)
+            } else if ACTIONS_SCOPES.contains(&name) {
+                Some(SIGNING_PUSH_ONLY)
             } else if ISSUE_SCOPES.contains(&name) {
                 Some(ISSUES_MAIN_ONLY)
             } else {
