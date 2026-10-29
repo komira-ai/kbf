@@ -377,18 +377,17 @@ pub struct Args {
     /// finished within it is held in memory.
     #[arg(long, default_value_t = kbf_sched::FINISHED_RETENTION.as_secs())]
     pub finished_retention_secs: u64,
-    /// How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to
-    /// finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and
-    /// sends GOAWAY, and every open Execute and WaitExecution stream stays open until its
-    /// action is done; the exception is a stream whose operation was never started and
-    /// that no worker on this frontend can run (say every capable worker is cordoned) and
-    /// no other frontend can take, which ends UNAVAILABLE as the drain begins, since that
-    /// action would fail at the deadline anyway (Buck2 retries only the opening of a call). The operation stays queued. On a
-    /// frontend over a state store, `--drain-deadline` bounds the wait in any case; this
-    /// flag bounds it earlier. Buck2 never recovers a stream that breaks mid-action, so the
-    /// default, 0, is no deadline; set one at least as long as the longest action. When
-    /// it runs out, the open streams end UNAVAILABLE (a client still uploading is cut
-    /// off).
+    /// The operator's hard stop, in seconds, for a stop (SIGINT or SIGTERM). A stop refuses
+    /// new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open
+    /// Execute and WaitExecution stream stays open until its action is done, however long
+    /// that takes; the exception is a stream whose operation was never started and that no
+    /// worker on this frontend can run (say every capable worker is cordoned) and no other
+    /// frontend can take, which ends UNAVAILABLE as the drain begins (Buck2 retries only the
+    /// opening of a call). The operation stays queued. The default, 0, is no deadline: the
+    /// stop waits indefinitely, and a second signal is the other way to end it at once.
+    /// Buck2 never recovers a stream that breaks mid-action, so set one only to force a stop:
+    /// when it runs out, the open streams end UNAVAILABLE (a client still uploading is cut
+    /// off). `--drain-deadline` on a frontend over a state store only reports.
     #[arg(long, default_value_t = 0)]
     pub shutdown_timeout_secs: u64,
     /// How often, in seconds, every open Execute and WaitExecution stream is sent its
