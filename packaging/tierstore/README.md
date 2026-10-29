@@ -219,7 +219,39 @@ load balancer sees it, refuses new requests, waits for those in flight for at mo
 `--drain-deadline`, gives up the reconciler's lease and exits 0. `TimeoutStopSec=` is set above
 the sum of the two flags and the lease's wait, so that systemd does not send SIGKILL to a drain
 in progress; if `--drain-deadline` is raised, raise it too. A start that fails is tried again
-after five seconds; exit status 2 (a command line the argument parser refused: an unknown flag, a
+after 30 seconds; exit status 2 (a command line the argument parser refused: an unknown flag, a
 missing or malformed value; or two keys with one access key id) is not, since a restart cannot
 mend it. Other flag combinations and key files refused after parsing exit 1, and are tried again
-every five seconds.
+every 30 seconds.
+
+## The start-up self-test
+
+Before it binds its address the process asks each tier the questions its guarantees rest on: a
+create-only put of a key that exists must be refused, a replace on a wrong ETag must be refused
+and one on the right ETag must work, a ranged read must give exactly the range, a HEAD must give
+the size and the ETag of what was written, a listing after a key must page right, and on the cold
+tier the completion of a multipart upload over a key that exists must be refused. (Only the
+create-only completion is probed, not the refusal of a bad part list.) It uses keys under
+`_tiering/selftest/`, which clients never see; they are deleted afterwards, and keys a killed
+start left more than an hour ago (by the store's clock, not the machine's) are swept; only keys
+under that prefix are ever deleted. A tier that answers one of them wrongly exits 3
+with the tier, the check and the answer on stderr, and is not restarted
+(`RestartPreventExitStatus=2 3`): fix or replace the store. That includes answers that are a
+configuration error, such as 403 `AccessDenied` or `NoSuchBucket`, which are not retried either.
+A tier that cannot be reached (down, a timeout, 408, 429, any 5xx but 501 and 507) is asked again,
+after pauses from one second doubling to thirty, for `--backend-check-wait` (five minutes by
+default, for each tier; `0s` asks once), so that a store that is slow to come up after a reboot
+does not fail the start. Then the start exits 1 and the unit tries it again after 30 seconds, up to
+its start limit (5 starts in an hour, so about half an hour of real failures, then systemd gives up
+until `systemctl reset-failed tierstore`). An
+error that persists on a conditional step (a create-only put, `If-Match`, the completion of a
+multipart upload) while the store is up, a 500 for instance, may be a gap in the store and not an
+outage; the message says so.
+A tier that is full (a full hot tier is a designed state) starts: the checks that need a write are
+skipped, with a line on stderr that says so. For a full cold tier the line is a warning that writes
+to the cold tier will fail.
+
+`--skip-backend-check multipart-conditional=<reason>` leaves out the multipart check, for a store
+that lacks a conditional completion; the reason is written to stderr at every start. No other check
+can be skipped (exit 2). Without that check a multipart upload to the cold tier may replace an
+object that exists.
