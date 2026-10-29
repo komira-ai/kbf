@@ -1,7 +1,7 @@
 //! The key of a task pack, `cas/b/<build>/<nonce>-<slot>`: its shape, its minute, and the
 //! message its MAC covers.
 
-use kbf_pack::{
+use kbf_task_pack::{
     MAC_LEN, MAX_BUILD_BYTES, TaskKeyError, TaskPackKey, check_build, mac_input, minute_of,
 };
 use kbf_types::{Digest, DigestFunction};
