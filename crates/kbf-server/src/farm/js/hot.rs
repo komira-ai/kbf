@@ -134,7 +134,7 @@ pub(crate) async fn report(
     let _taking = Taking::of(&js.reports);
     let ambient = js.ambient;
     let wall: Wall = Arc::new(move || ambient.wall());
-    let acked = dispatch::report(&js.core, &js.cache, &wall, || js.now(), worker, result)
+    let acked = dispatch::report(&js.core, &js.cache, &wall, &|| js.now(), worker, result)
         .await
         .ok()
         .flatten();
@@ -143,14 +143,32 @@ pub(crate) async fn report(
         write_learned(&js.core, &js.learning_gate, false).await;
     }
     let ack = acked?;
-    // A stale refusal of the lease the core still calls current: the scheduler took no
-    // answer from its Result. A daemon forgets a Result on any ack, so a refusal would lose
-    // it and leave the lease on the node; without one the daemon sends it again. A fenced
-    // core refuses every Result as stale, by design: that refusal stands.
-    let swallowed = !ack.accepted
-        && ack.reason == ResultAckReason::Stale as i32
-        && !js.fenced.load(Ordering::SeqCst)
-        && matches!(js.core.standing(worker, lease), Ok(Standing::Current(_)));
+    let current = || matches!(js.core.standing(worker, lease), Ok(Standing::Current(_)));
+    answered(
+        ack,
+        js.fenced.load(Ordering::SeqCst),
+        &current,
+        lease,
+        worker,
+    )
+}
+
+/// The acknowledgement a `Result` of `lease` gets, from the one the core answered (`ack`):
+/// none for a stale refusal of a lease the core still calls current (`current`, asked only
+/// then), whose `Result` the scheduler took no answer from. A daemon forgets a `Result` on
+/// any ack, so a refusal would lose it and leave the lease on the node; without one the
+/// daemon sends it again. A fenced core refuses every `Result` as stale, by design: that
+/// refusal stands, as does any refusal for another reason. `current` is a trait object, not
+/// generic, so the farm and the tests share one body, whose branches are measured once.
+pub(super) fn answered(
+    ack: ResultAck,
+    fenced: bool,
+    current: &dyn Fn() -> bool,
+    lease: LeaseId,
+    worker: &WorkerId,
+) -> Option<ResultAck> {
+    let swallowed =
+        !ack.accepted && ack.reason == ResultAckReason::Stale as i32 && !fenced && current();
     if swallowed {
         tracing::error!(
             %lease, %worker,
