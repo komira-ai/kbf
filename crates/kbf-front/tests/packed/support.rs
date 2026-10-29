@@ -376,7 +376,22 @@ impl Rig {
 
     /// Packs as `settings` say, in front of `owners`.
     pub async fn over(owners: Owners, settings: PackSettings) -> Self {
-        let store = Arc::new(Spy::new());
+        Self::over_store(owners, settings, Spy::new()).await
+    }
+
+    /// Packs of the default settings over a store that replaces an object it holds, in front of
+    /// a real storage node.
+    pub async fn replacing() -> Self {
+        let (node, addr) = node();
+        let owners = Owners::single(Owner::new("node", lazy(addr)));
+        let mut rig = Self::over_store(owners, PackSettings::default(), Spy::replacing()).await;
+        rig.node = Some(node);
+        rig
+    }
+
+    /// Packs as `settings` say, over `store`, in front of `owners`.
+    async fn over_store(owners: Owners, settings: PackSettings, store: Spy) -> Self {
+        let store = Arc::new(store);
         let index = Arc::new(Index::over(Arc::clone(&store)));
         let shared: Arc<dyn PackIndex> = index.clone();
         let keys = PackKeys::new(WriterKind::Frontend, "fe1", "boot1").expect("keys");
