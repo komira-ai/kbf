@@ -136,7 +136,7 @@ pub(crate) async fn report(
     answered(
         ack,
         js.fenced.load(Ordering::SeqCst),
-        current,
+        &current,
         lease,
         worker,
     )
@@ -147,11 +147,12 @@ pub(crate) async fn report(
 /// then), whose `Result` the scheduler took no answer from. A daemon forgets a `Result` on
 /// any ack, so a refusal would lose it and leave the lease on the node; without one the
 /// daemon sends it again. A fenced core refuses every `Result` as stale, by design: that
-/// refusal stands, as does any refusal for another reason.
+/// refusal stands, as does any refusal for another reason. `current` is a trait object, not
+/// generic, so the farm and the tests share one body, whose branches are measured once.
 pub(super) fn answered(
     ack: ResultAck,
     fenced: bool,
-    current: impl FnOnce() -> bool,
+    current: &dyn Fn() -> bool,
     lease: LeaseId,
     worker: &WorkerId,
 ) -> Option<ResultAck> {

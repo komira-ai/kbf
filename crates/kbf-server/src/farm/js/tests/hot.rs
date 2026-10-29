@@ -491,20 +491,20 @@ fn only_a_stale_refusal_of_the_current_lease_loses_its_ack() {
     let unasked = || -> bool { panic!("the ack alone decides") };
     let stale = ack(false, ResultAckReason::Stale);
 
-    assert_eq!(answered(stale, false, || true, lease, &worker), None);
+    assert_eq!(answered(stale, false, &|| true, lease, &worker), None);
     let accepted = ack(true, ResultAckReason::Accepted);
     assert_eq!(
-        answered(accepted, false, unasked, lease, &worker),
+        answered(accepted, false, &unasked, lease, &worker),
         Some(accepted)
     );
-    assert_eq!(answered(stale, true, unasked, lease, &worker), Some(stale));
+    assert_eq!(answered(stale, true, &unasked, lease, &worker), Some(stale));
     assert_eq!(
-        answered(stale, false, || false, lease, &worker),
+        answered(stale, false, &|| false, lease, &worker),
         Some(stale)
     );
     let unknown = ack(false, ResultAckReason::UnknownLease);
     assert_eq!(
-        answered(unknown, false, unasked, lease, &worker),
+        answered(unknown, false, &unasked, lease, &worker),
         Some(unknown)
     );
 }
