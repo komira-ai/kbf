@@ -239,12 +239,16 @@ pub struct ServerConfig {
     /// times that.
     pub max_concurrent_puts: usize,
     /// The least average rate, in bytes a second, at which a request body is taken, counted
-    /// from the first byte once `put_rate_grace` has passed; a body that goes slower is
-    /// refused with 400 `RequestTimeout` and nothing of it is stored (an upload in progress
-    /// at the store is aborted). Zero turns the check off. It catches a sender that trickles
-    /// a byte inside every idle timeout.
+    /// over the time the server spends waiting for the client to send the next piece once
+    /// that time has passed `put_rate_grace`; a body that goes slower is refused with 400
+    /// `RequestTimeout` and nothing of it is stored (an upload in progress at the store is
+    /// aborted). Time the server spends not waiting for the client does not count, so a tier
+    /// that is slow to take the body, or to answer before it takes it, is not blamed on the
+    /// client. Zero turns the check off. It catches a sender that trickles a byte inside every
+    /// idle timeout.
     pub put_min_bytes_per_sec: u64,
-    /// How long a body is let to go before its rate is held to `put_min_bytes_per_sec`.
+    /// How much time spent waiting for the client a body is let to go before its rate is held
+    /// to `put_min_bytes_per_sec`.
     pub put_rate_grace: Duration,
     /// How long a client has to send the head of a request. It also bounds how long a
     /// connection may wait, idle, for its next request, so keep it above the time a client
@@ -623,8 +627,12 @@ impl Server {
         let check = Check::new(&signed.payload, &parts.headers, data)?;
         let limit = self.config.max_request_bytes;
         let config = &self.config;
-        let reader = Reader::new(body, limit, config.body_idle_timeout)
-            .with_floor(config.put_min_bytes_per_sec, config.put_rate_grace);
+        let floor = (config.put_min_bytes_per_sec, config.put_rate_grace);
+        let reader = Reader::new(body, limit, config.body_idle_timeout).with_floor(
+            floor.0,
+            floor.1,
+            Arc::clone(&config.clock),
+        );
         self.dispatch(parts, target, &query, reader, check).await
     }
 

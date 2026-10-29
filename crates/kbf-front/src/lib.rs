@@ -68,6 +68,7 @@ mod described;
 mod dir_cache;
 mod execution;
 mod finished_row;
+pub mod grants;
 mod input_tree;
 mod input_walk;
 mod meta_log;

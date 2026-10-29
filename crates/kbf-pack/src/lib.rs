@@ -17,6 +17,8 @@
 //! - [`ReadCache`] is the bounded on-disk cache of blobs a reader keeps in front of the
 //!   store: least recently used out first, written with a temporary file and a rename,
 //!   checked by digest on every read.
+//! - [`Sweeper`] deletes the orphans under `cas/b/`: the packs a task wrote that nothing ever
+//!   recorded, once they are older than a grace period.
 //! - [`Adopter`] indexes, in place, the segments that storage members flushed to the cold store
 //!   before there were packs: a segment has the layout of a pack, so one record of the index
 //!   per segment, made from its footer, makes its blobs readable through [`Reader`]. It copies
@@ -42,6 +44,7 @@ mod error;
 mod keys;
 mod packer;
 mod reader;
+mod sweep;
 mod task_key;
 mod task_manifest;
 mod task_pack;
@@ -58,6 +61,9 @@ pub use packer::{
     Blob, FRONTEND_PACK_BYTES, Packed, Packer, PackerConfig, StoredPack, check_create_only,
 };
 pub use reader::{DEFAULT_CONCURRENCY, DEFAULT_GAP, Fetch, Reader, ReaderConfig};
+pub use sweep::{
+    AgeOf, DEFAULT_GRACE, SWEPT_PREFIX, SweepConfig, SweepError, SweepGates, SweepReport, Sweeper,
+};
 pub use task_key::{
     MAC_LEN, MAX_BUILD_BYTES, TaskKeyError, TaskPackKey, check_build, mac_input, minute_of,
 };
