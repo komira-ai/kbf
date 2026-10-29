@@ -113,8 +113,9 @@ pub enum ConfigError {
     Expiry(#[from] ExpiryError),
 }
 
-/// `(scheme, authority)` of `url` if it is `scheme://authority` and nothing more: no path (not
-/// even `/`), query, fragment or user information.
+/// `(scheme, authority)` of `url` if it is `scheme://host[:port]` and nothing more: no path (not
+/// even `/`), query, fragment or user information, a host that is not empty, and a port, when
+/// there is one, from 1 to 65535.
 fn base_of(url: &str) -> Result<(&str, &str), &'static str> {
     let (scheme, authority) = url
         .split_once("://")
@@ -125,6 +126,36 @@ fn base_of(url: &str) -> Result<(&str, &str), &'static str> {
     let stray = |c: char| c.is_whitespace() || c.is_control() || "/?#@\\".contains(c);
     if authority.chars().any(stray) {
         return Err("has more than a host and a port");
+    }
+    // A bracketed IPv6 address holds colons of its own: its port, if any, follows the `]`.
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(rest) => {
+            let (inside, after) = rest
+                .split_once(']')
+                .ok_or("has more than a host and a port")?;
+            let port = match after {
+                "" => None,
+                _ => Some(
+                    after
+                        .strip_prefix(':')
+                        .ok_or("has more than a host and a port")?,
+                ),
+            };
+            (inside, port)
+        }
+        None => match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        },
+    };
+    if host.is_empty() {
+        return Err("has no host");
+    }
+    let valid = |port: &str| {
+        port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok_and(|n| n != 0)
+    };
+    if port.is_some_and(|port| !valid(port)) {
+        return Err("has a port that is not a number from 1 to 65535");
     }
     Ok((scheme, authority))
 }
