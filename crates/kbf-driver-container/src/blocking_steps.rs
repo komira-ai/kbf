@@ -25,12 +25,12 @@ pub(crate) async fn create_logs(
     stderr: &Path,
 ) -> Result<(std::fs::File, std::fs::File), RuntimeError> {
     let (out, err) = (stdout.to_owned(), stderr.to_owned());
-    off_worker(move || {
+    let work = move || {
         let stdout = std::fs::File::create(&out).map_err(|e| failed(&out, &e))?;
         let stderr = std::fs::File::create(&err).map_err(|e| failed(&err, &e))?;
         Ok((stdout, stderr))
-    })
-    .await
+    };
+    work()
 }
 
 /// What [`make_cgroup`] did.
