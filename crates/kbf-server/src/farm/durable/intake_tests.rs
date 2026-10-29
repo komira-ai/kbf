@@ -96,7 +96,7 @@ pub(super) fn done_with(ticket: &kbf_front::Ticket) -> String {
 /// the stored epoch is not ahead.
 #[tokio::test(start_paused = true)]
 async fn a_farm_without_a_state_store_polls_nothing() {
-    let farm = Farm::new(
+    let farm = Farm::new_legacy(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -691,7 +691,7 @@ async fn the_poll_looks_at_the_store_every_interval() {
 /// intake, count too.
 #[tokio::test(start_paused = true)]
 async fn the_count_of_intake_polls_follows_the_polls_that_ran_to_the_end() {
-    let none = Farm::new(
+    let none = Farm::new_legacy(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,

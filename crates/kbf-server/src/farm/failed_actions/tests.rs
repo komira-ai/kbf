@@ -9,7 +9,7 @@ use super::*;
 use crate::farm::report::Pending;
 
 fn farm() -> Farm {
-    Farm::new(
+    Farm::new_legacy(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
