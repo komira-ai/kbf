@@ -412,6 +412,20 @@ fn an_operation_that_ends_is_forgotten_whatever_its_run() {
     }
 }
 
+/// Catches an operation whose run named no instrument (so nothing was staged to learn
+/// from) keeping its prediction after the scheduler took the report that ended it.
+#[test]
+fn a_run_with_no_instrument_still_ends_the_operation() {
+    let mut learned = learned(PlacementPredictions::Shadow);
+    learned.to_set(OperationId(1), Some(figures()));
+    let lease = LeaseId::new(1, 1);
+    learned.stage(lease, None);
+    learned.stage_prediction(lease, OperationId(1));
+    learned.finish(lease, true, &bounds());
+    assert_eq!(learned.predictions_pending(), 0);
+    assert_eq!(vs_run(&learned), [[0; 3]; 3], "no run, nothing compared");
+}
+
 /// Catches a killed run that drops its operation's prediction: the operation is requeued
 /// and its next run is compared with the prediction made at submit.
 #[test]

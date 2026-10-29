@@ -373,13 +373,16 @@ impl Learned {
     /// operation, with no requeue), for the caller to write at once.
     pub fn finish(&mut self, lease: LeaseId, taken: bool, bounds: &Bounds) -> Vec<Row> {
         self.forget(lease);
-        let compared = self.unstage_prediction(lease);
-        let Some(attempt) = self.staged.remove(&lease).filter(|_| taken) else {
+        let compared = self.unstage_prediction(lease).filter(|_| taken);
+        let attempt = self.staged.remove(&lease).filter(|_| taken);
+        if let Some((operation, prediction)) = compared {
+            // A report the scheduler took ends the operation, with or without a run to
+            // compare (a run that named no instrument has no attempt).
+            self.end_prediction(operation, &prediction, attempt.as_ref().map(|a| &a.run));
+        }
+        let Some(attempt) = attempt else {
             return Vec::new();
         };
-        if let Some((operation, prediction)) = compared {
-            self.compare_run(operation, &prediction, &attempt.run);
-        }
         self.observe_keyed(&attempt, bounds);
         if attempt.run.outcome != RunOutcome::OwnLimitKill {
             return Vec::new();

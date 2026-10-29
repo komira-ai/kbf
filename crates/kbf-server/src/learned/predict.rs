@@ -233,19 +233,26 @@ impl Learned {
         self.predictions.staged.remove(&lease)
     }
 
-    /// Compares `run`, a report of `operation` the scheduler took, with `prediction`. Only
-    /// a run the estimator takes as a sample counts, and only the first: the operation's
-    /// prediction is then forgotten.
-    pub(super) fn compare_run(
+    /// `run`, a report of `operation` the scheduler took, ends the operation (a requeue is
+    /// another path): its prediction is forgotten, so the map holds what is in flight, and
+    /// compared with the run if the estimator takes it as a sample.
+    pub(super) fn end_prediction(
         &mut self,
         operation: OperationId,
         prediction: &Prediction,
-        run: &Run,
+        run: Option<&Run>,
     ) {
+        self.predictions.pending.remove(&operation);
+        if let Some(run) = run {
+            self.compare_run(prediction, run);
+        }
+    }
+
+    /// Compares `run` with `prediction`, if the estimator takes the run as a sample.
+    fn compare_run(&mut self, prediction: &Prediction, run: &Run) {
         if run.outcome != RunOutcome::Success || run.wall_us < MIN_WALL_US {
             return;
         }
-        self.predictions.pending.remove(&operation);
         let life = (run.wall_us / MINUTE_US)
             .saturating_add(1)
             .clamp(1, u64::from(LIFE_HORIZON));
