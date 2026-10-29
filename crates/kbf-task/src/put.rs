@@ -3,8 +3,12 @@
 //! The URL is taken as given and is a credential (its query string carries the signature), so it
 //! is never printed: every error, and every message a lower layer produced, names the URL only
 //! as [`redact`] renders it. The PUT carries `Content-Length` and `If-None-Match: *`, so the
-//! store refuses it when the key already holds an object. It is made once: a retry with the same
-//! key can only meet that refusal, so a failure is reported, not retried.
+//! store refuses it when the key already holds an object.
+//!
+//! One answer is retried: 503, which the store gives when its hot tier is full and nothing was
+//! stored ([`put_retrying`]). Every other answer, a 412 (the key exists, and a re-attempt of the
+//! task gets a new key, so it is final) and a transport error included, is reported on the first
+//! attempt.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,11 +19,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the whole PUT may take, so a store that stalls cannot hold the tool.
 const PUT_TIMEOUT: Duration = Duration::from_secs(900);
 
+/// How many times a 503 is retried after the first attempt.
+pub const MAX_RETRIES: u32 = 3;
+
+/// The longest the tool waits before one retry, however long the store asks.
+pub const MAX_WAIT: Duration = Duration::from_secs(30);
+
+/// How long the tool waits before a retry when the 503 names no usable `Retry-After`.
+pub const DEFAULT_WAIT: Duration = Duration::from_secs(2);
+
 /// The string that stands in for a URL's query string and fragment.
 const REDACTED: &str = "<redacted>";
 
 /// Why the pack was not stored.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PutError {
     /// The store answered 412: the key already holds an object.
     #[error("the object already exists at {url}")]
@@ -27,7 +40,16 @@ pub enum PutError {
         /// The URL, redacted.
         url: String,
     },
-    /// The store answered with a status other than 200, 201 or 412.
+    /// The store answered 503: it had no room, and nothing was stored.
+    #[error("the store answered 503 to the PUT of {url}{}", retry_text(.retry_after_secs))]
+    Unavailable {
+        /// The URL, redacted.
+        url: String,
+        /// The `Retry-After` the store gave, in seconds; `None` when the header is absent or is
+        /// not a whole number of seconds (an HTTP date is not read).
+        retry_after_secs: Option<u64>,
+    },
+    /// The store answered with a status other than 200, 201, 412 or 503.
     #[error("the store answered {status} to the PUT of {url}")]
     Status {
         /// The HTTP status.
@@ -43,6 +65,11 @@ pub enum PutError {
         /// What went wrong, with the URL's secret parts removed.
         reason: String,
     },
+}
+
+/// The part of a 503's message that tells what the store asked for.
+fn retry_text(secs: &Option<u64>) -> String {
+    secs.map_or_else(String::new, |s| format!(" (retry after {s}s)"))
 }
 
 /// `url` with its user information, query string and fragment removed: the credentials before an
@@ -80,13 +107,18 @@ fn scrub(message: &str, url: &str) -> String {
     out
 }
 
-/// What a status means for the PUT: `Ok` for 200 and 201, [`PutError::Exists`] for 412, and
-/// [`PutError::Status`] for any other. `url` is the redacted URL.
-fn classify(status: u16, url: &str) -> Result<(), PutError> {
+/// What a status means for the PUT: `Ok` for 200 and 201, [`PutError::Exists`] for 412,
+/// [`PutError::Unavailable`] for 503 (with `retry_after`, the value of the `Retry-After` header,
+/// read as whole seconds) and [`PutError::Status`] for any other. `url` is the redacted URL.
+fn classify(status: u16, url: &str, retry_after: Option<&str>) -> Result<(), PutError> {
     match status {
         200 | 201 => Ok(()),
         412 => Err(PutError::Exists {
             url: url.to_string(),
+        }),
+        503 => Err(PutError::Unavailable {
+            url: url.to_string(),
+            retry_after_secs: retry_after.and_then(|v| v.trim().parse().ok()),
         }),
         status => Err(PutError::Status {
             status,
@@ -138,10 +170,11 @@ fn build(tls: Option<ureq::tls::TlsConfig>, https_only: bool) -> ureq::Agent {
     config.build().into()
 }
 
-/// Store `body` at the presigned `url`: one PUT, create-only, never retried.
+/// Store `body` at the presigned `url`: one PUT, create-only.
 ///
-/// Returns `Ok` on a 200 or 201, [`PutError::Exists`] on a 412 and [`PutError::Status`] on any
-/// other status. Nothing in the returned error contains the URL's query string.
+/// Returns `Ok` on a 200 or 201, [`PutError::Exists`] on a 412, [`PutError::Unavailable`] on a 503
+/// and [`PutError::Status`] on any other status. Nothing in the returned error contains the URL's
+/// query string.
 pub fn put(agent: &ureq::Agent, url: &str, body: &[u8]) -> Result<(), PutError> {
     let shown = redact(url);
     let response = agent
@@ -152,7 +185,60 @@ pub fn put(agent: &ureq::Agent, url: &str, body: &[u8]) -> Result<(), PutError> 
             url: shown.clone(),
             reason: scrub(&e.to_string(), url),
         })?;
-    classify(response.status().as_u16(), &shown)
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok());
+    classify(response.status().as_u16(), &shown, retry_after)
+}
+
+/// What waits between the attempts of [`put_retrying`]; a parameter so tests record the waits
+/// instead of making them.
+pub trait Sleeper {
+    /// Returns after `wait`.
+    fn sleep(&self, wait: Duration);
+}
+
+/// The real [`Sleeper`]: the thread sleeps.
+pub struct ThreadSleeper;
+
+impl Sleeper for ThreadSleeper {
+    fn sleep(&self, wait: Duration) {
+        std::thread::sleep(wait);
+    }
+}
+
+/// How long to wait before a retry: the store's `Retry-After`, at most [`MAX_WAIT`], else
+/// [`DEFAULT_WAIT`] when it gave none.
+fn wait_for(retry_after_secs: Option<u64>) -> Duration {
+    retry_after_secs.map_or(DEFAULT_WAIT, |s| Duration::from_secs(s).min(MAX_WAIT))
+}
+
+/// Runs `attempt` (one PUT) and runs it again after a 503, up to [`MAX_RETRIES`] more times,
+/// waiting with `sleeper` before each. Any other outcome is returned at once.
+///
+/// A retry is safe because every attempt is the create-only PUT (`If-None-Match: *`) of the same
+/// key: a 503 stored nothing, and if an earlier attempt had in fact stored the object, the retry
+/// meets a 412 and fails instead of overwriting it.
+///
+/// # Errors
+/// The last attempt's [`PutError`].
+pub fn put_retrying(
+    mut attempt: impl FnMut() -> Result<(), PutError>,
+    sleeper: &dyn Sleeper,
+) -> Result<(), PutError> {
+    let mut retries = 0;
+    loop {
+        match attempt() {
+            Err(PutError::Unavailable {
+                retry_after_secs, ..
+            }) if retries < MAX_RETRIES => {
+                sleeper.sleep(wait_for(retry_after_secs));
+                retries += 1;
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -200,21 +286,42 @@ mod tests {
 
     #[test]
     fn classify_maps_each_status() {
-        assert_eq!(classify(200, "u"), Ok(()));
-        assert_eq!(classify(201, "u"), Ok(()));
+        assert_eq!(classify(200, "u", None), Ok(()));
+        assert_eq!(classify(201, "u", None), Ok(()));
         assert_eq!(
-            classify(412, "u"),
+            classify(412, "u", Some("5")),
             Err(PutError::Exists { url: "u".into() })
         );
-        for status in [204, 301, 400, 403, 409, 500, 503] {
+        for status in [204, 301, 400, 403, 409, 500] {
             assert_eq!(
-                classify(status, "u"),
+                classify(status, "u", Some("5")),
                 Err(PutError::Status {
                     status,
                     url: "u".into()
                 })
             );
         }
+    }
+
+    /// Catches a 503 being read as an ordinary status (so never retried), and a `Retry-After`
+    /// that is not whole seconds being believed.
+    #[test]
+    fn classify_reads_the_retry_after_of_a_503() {
+        let unavailable = |retry_after_secs| {
+            Err(PutError::Unavailable {
+                url: "u".into(),
+                retry_after_secs,
+            })
+        };
+        assert_eq!(classify(503, "u", Some("7")), unavailable(Some(7)));
+        assert_eq!(classify(503, "u", Some(" 7 ")), unavailable(Some(7)));
+        assert_eq!(classify(503, "u", None), unavailable(None));
+        assert_eq!(classify(503, "u", Some("soon")), unavailable(None));
+        assert_eq!(classify(503, "u", Some("-1")), unavailable(None));
+        assert_eq!(
+            classify(503, "u", Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            unavailable(None)
+        );
     }
 
     #[test]
@@ -241,6 +348,48 @@ mod tests {
         );
     }
 
+    /// A [`Sleeper`] that records the waits it was asked for and does not wait.
+    #[derive(Default)]
+    struct Recorded(std::sync::Mutex<Vec<Duration>>);
+
+    impl Sleeper for Recorded {
+        fn sleep(&self, wait: Duration) {
+            self.0.lock().expect("lock").push(wait);
+        }
+    }
+
+    impl Recorded {
+        fn waits(&self) -> Vec<Duration> {
+            self.0.lock().expect("lock").clone()
+        }
+    }
+
+    /// The attempts of a PUT that answers with `answers` in turn, and how many it was asked for.
+    fn answering(
+        answers: Vec<Result<(), PutError>>,
+    ) -> (
+        impl FnMut() -> Result<(), PutError>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+    ) {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = calls.clone();
+        let mut answers = answers.into_iter();
+        (
+            move || {
+                calls.set(calls.get() + 1);
+                answers.next().expect("more attempts than answers")
+            },
+            seen,
+        )
+    }
+
+    fn busy(retry_after_secs: Option<u64>) -> Result<(), PutError> {
+        Err(PutError::Unavailable {
+            url: "u".into(),
+            retry_after_secs,
+        })
+    }
+
     /// What the test server saw of one request.
     struct Seen {
         request_line: String,
@@ -259,6 +408,11 @@ mod tests {
 
     /// Serve one connection on a local port: read the request, answer `status`.
     fn serve(status: u16) -> (String, JoinHandle<Seen>) {
+        serve_with(status, "")
+    }
+
+    /// [`serve`] with `extra` header lines (each ending in CRLF) in the reply.
+    fn serve_with(status: u16, extra: &'static str) -> (String, JoinHandle<Seen>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let base = format!("http://{}", listener.local_addr().expect("addr"));
         let handle = std::thread::spawn(move || {
@@ -283,8 +437,9 @@ mod tests {
                 .map_or(0, |(_, v)| v.parse().expect("length"));
             let mut body = vec![0u8; length];
             reader.read_exact(&mut body).expect("body");
-            let reply =
-                format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let reply = format!(
+                "HTTP/1.1 {status} X\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
             reader.get_mut().write_all(reply.as_bytes()).expect("reply");
             Seen {
                 request_line: request_line.trim_end().to_string(),
@@ -387,5 +542,113 @@ mod tests {
         let _ = agent(Some(tls_config(&[])));
         // A certificate that is not parseable is kept as given; the handshake would refuse it.
         let _ = agent(Some(tls_config(&[vec![1, 2, 3]])));
+    }
+
+    /// Catches a 503's `Retry-After` header not reaching the error: it is read from the real
+    /// response, in seconds, and a 503 without one carries none.
+    #[test]
+    fn put_reports_a_503_with_its_retry_after() {
+        for (header, expected) in [("Retry-After: 12\r\n", Some(12)), ("", None)] {
+            let (base, server) = serve_with(503, header);
+            let url = format!("{base}/k?X-Sig=secret");
+            let err = put(&agent(None), &url, b"x").unwrap_err();
+            server.join().expect("server");
+            assert_eq!(
+                err,
+                PutError::Unavailable {
+                    url: format!("{base}/k?<redacted>"),
+                    retry_after_secs: expected
+                }
+            );
+            assert!(!err.to_string().contains("secret"));
+        }
+    }
+
+    /// Catches the message of a 503 hiding what the store asked for.
+    #[test]
+    fn a_503_names_the_wait_the_store_asked_for() {
+        let text = busy(Some(9)).unwrap_err().to_string();
+        assert!(text.contains("503"), "{text}");
+        assert!(text.contains("retry after 9s"), "{text}");
+        assert!(!busy(None).unwrap_err().to_string().contains("retry after"));
+    }
+
+    /// Catches a 503 failing the task after the whole build ran: one 503 and then a 201 is
+    /// stored, after one wait equal to the `Retry-After`.
+    #[test]
+    fn a_503_then_a_201_is_stored_after_the_wait_the_store_asked_for() {
+        let sleeper = Recorded::default();
+        let (attempt, calls) = answering(vec![busy(Some(5)), Ok(())]);
+        assert_eq!(put_retrying(attempt, &sleeper), Ok(()));
+        assert_eq!(calls.get(), 2);
+        assert_eq!(sleeper.waits(), [Duration::from_secs(5)]);
+    }
+
+    /// Catches an unbounded retry: a store that stays full is asked `MAX_RETRIES` + 1 times,
+    /// no more, then the 503 is the failure.
+    #[test]
+    fn a_store_that_stays_full_is_asked_a_bounded_number_of_times() {
+        let sleeper = Recorded::default();
+        let answers = (0..=MAX_RETRIES).map(|_| busy(Some(1))).collect();
+        let (attempt, calls) = answering(answers);
+        let err = put_retrying(attempt, &sleeper).unwrap_err();
+        assert_eq!(
+            err,
+            PutError::Unavailable {
+                url: "u".into(),
+                retry_after_secs: Some(1)
+            }
+        );
+        assert_eq!(calls.get(), MAX_RETRIES as usize + 1);
+        assert_eq!(sleeper.waits().len(), MAX_RETRIES as usize);
+    }
+
+    /// Catches a 412 being retried: the key exists and is final, so one PUT and no wait.
+    #[test]
+    fn a_412_is_not_retried() {
+        let sleeper = Recorded::default();
+        let exists = PutError::Exists { url: "u".into() };
+        let (attempt, calls) = answering(vec![Err(exists.clone())]);
+        assert_eq!(put_retrying(attempt, &sleeper), Err(exists));
+        assert_eq!(calls.get(), 1);
+        assert!(sleeper.waits().is_empty());
+    }
+
+    /// Catches a transport error or another status being retried: each is reported on the first
+    /// attempt.
+    #[test]
+    fn a_transport_error_and_another_status_are_not_retried() {
+        for error in [
+            PutError::Transport {
+                url: "u".into(),
+                reason: "reset".into(),
+            },
+            PutError::Status {
+                status: 500,
+                url: "u".into(),
+            },
+        ] {
+            let sleeper = Recorded::default();
+            let (attempt, calls) = answering(vec![Err(error.clone())]);
+            assert_eq!(put_retrying(attempt, &sleeper), Err(error));
+            assert_eq!(calls.get(), 1);
+            assert!(sleeper.waits().is_empty());
+        }
+    }
+
+    /// Catches the wait being unbounded or missing: no usable `Retry-After` waits the default,
+    /// and a long one is cut to the cap.
+    #[test]
+    fn the_wait_is_the_retry_after_capped_or_a_default() {
+        let sleeper = Recorded::default();
+        let (attempt, _) = answering(vec![busy(None), busy(Some(3600)), busy(Some(0)), Ok(())]);
+        assert_eq!(put_retrying(attempt, &sleeper), Ok(()));
+        assert_eq!(sleeper.waits(), [DEFAULT_WAIT, MAX_WAIT, Duration::ZERO]);
+    }
+
+    /// Catches the real sleeper not being the thread's sleep (a zero wait returns at once).
+    #[test]
+    fn the_thread_sleeper_returns_after_its_wait() {
+        ThreadSleeper.sleep(Duration::ZERO);
     }
 }

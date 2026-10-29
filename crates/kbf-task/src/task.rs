@@ -18,12 +18,13 @@
 //! | 10 | fetch: the Action, the Command or an input could not be read or checked, or laid out |
 //! | 11 | run-start: the Command could not be started (bad paths, no program) |
 //! | 12 | pack: the outputs could not be collected, did not fit one pack (`output-too-large`), or made a manifest or pack the frontend would refuse (`invalid-manifest`, `invalid-pack`) |
-//! | 13 | put: the pack could not be stored (refused, key already taken, unreachable) |
+//! | 13 | put: the pack could not be stored (refused, key already taken, still no room after the retries of a 503, unreachable) |
 //! | 14 | setup: `--lease` is not a build id, a credential or root certificate is unusable, a credential given as a flag value without `--insecure-argv-secrets`, or the runtime did not start |
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{ArgGroup, Parser};
@@ -39,7 +40,9 @@ use crate::fetch::{
 };
 use crate::outputs::{OutputLimits, collect_outputs};
 use crate::pack::{MAX_PACK_BYTES, PackError, build};
-use crate::put::{PutError, agent, agent_with_plain_http, put, tls_config};
+use crate::put::{
+    PutError, Sleeper, ThreadSleeper, agent, agent_with_plain_http, put, put_retrying, tls_config,
+};
 use crate::run::{Run, RunError, output_paths, run};
 
 /// Exit code: an input could not be read, checked or laid out.
@@ -74,6 +77,12 @@ pub const EXIT_SETUP: u8 = 14;
 /// built in memory (the collected blobs, the writer's buffer and the finished pack), so the tool's
 /// peak memory is about three times the pack (about 384 MiB at the 128 MiB limit); a job's memory
 /// limit must allow for it, or the kill shows as 137, not 12.
+///
+/// # Storing the pack
+///
+/// The pack is PUT once, create-only. A 503 (no room in the store) is retried up to three times
+/// after the wait its `Retry-After` names, at most 30 s; every other answer is final, and a 412
+/// means the key exists (a re-attempt of the task gets a new key).
 #[derive(Parser)]
 #[command(
     name = "kbf-task",
@@ -192,15 +201,17 @@ pub trait PackSink {
     fn store(&self, body: &[u8]) -> Result<(), PutError>;
 }
 
-/// The real sink: one create-only PUT ([`put`]) to the presigned URL it holds.
+/// The real sink: the create-only PUT ([`put`]) to the presigned URL it holds, repeated after a
+/// 503 only ([`put_retrying`]), with `sleeper` between the attempts.
 pub struct HttpSink {
     agent: ureq::Agent,
     url: String,
+    sleeper: Arc<dyn Sleeper>,
 }
 
 impl PackSink for HttpSink {
     fn store(&self, body: &[u8]) -> Result<(), PutError> {
-        put(&self.agent, &self.url, body)
+        put_retrying(|| put(&self.agent, &self.url, body), self.sleeper.as_ref())
     }
 }
 
@@ -408,6 +419,7 @@ fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
             agent(Some(tls_config(&roots)))
         },
         url,
+        sleeper: Arc::new(ThreadSleeper),
     };
     Ok((source, sink))
 }

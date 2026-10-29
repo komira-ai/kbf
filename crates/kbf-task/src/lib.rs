@@ -15,7 +15,10 @@
 //!    frontend that ingests the pack uses. The manifest is validated before anything is stored,
 //!    and the pack is read back through the shape check ingest applies to its footer: a manifest
 //!    or a pack ingest would refuse fails the task (exit 12) instead of being stored;
-//! 5. PUTs that object once to the presigned URL ([`put`]).
+//! 5. PUTs that object to the presigned URL ([`put`]): one create-only PUT, repeated only after a
+//!    503 (the store's hot tier is full and nothing was stored), at most three more times, each
+//!    after the wait the store's `Retry-After` names (whole seconds, at most 30; 2 s when it names
+//!    none). Every other answer, 412 included, is final.
 //!
 //! `js-agent` returns nothing but an exit code, so the manifest travels inside the pack, and the exit
 //! code says only whether the farm did its part: 0 when the action ran and its pack was stored
@@ -23,21 +26,33 @@
 //! storing failed. Nothing the tool writes is trusted: the frontend hashes every record of the pack,
 //! checks its footer, and builds the action's result from its own hashing.
 //!
+//! # What a failure means
+//!
+//! - A 412 means the pack key already holds an object, and it is final: the frontend mints a new
+//!   key for every attempt at a lease, so a re-attempt of the task does not meet the old key.
+//! - The `exit_code`, `timing` and `usage` in the manifest are written by this tool, which runs
+//!   as the same user as the Command, so they are claims. Ingest does not trust them.
+//! - The tool builds the pack in memory: the collected blobs, the segment writer's buffer and the
+//!   finished pack are each about the size of the pack, so the peak is about three times the pack
+//!   (about 384 MiB at the 128 MiB pack limit). A job's memory limit must allow for it; a task
+//!   killed for passing it ends with 137, not with the pack code 12.
+//!
 //! # What the tool does not separate
 //!
 //! The Command runs as a child of the tool, under the same user. The presigned PUT URL is read
 //! from `--pack-url-file`, not from argv, and the file is left in place for the executor that
-//! delivered it to remove; the Command can read it, and the URL allows one create-only PUT of
-//! this task's own pack key. The grant token is read from `--grant-token-file`, which
-//! is not removed, and its path stays in the tool's argv: the job's sandbox must keep that file and the
-//! tool's `/proc` entry out of the Command's reach (a separate user or a separate process
-//! namespace), or the Command can read the token. The flag forms `--pack-url` and `--grant-token`,
-//! accepted only with `--insecure-argv-secrets` (komira-ai/kbf#1934), put the values in argv for every
-//! process on the host to read; they are a stopgap until the job scheduler delivers job secrets as
-//! files, and are removed then. A process of the Command that leaves its process
-//! group (for example with `setsid`) survives the group kill at the deadline; only such a sandbox
-//! ends it. The tool holds the collected blobs, the writer's buffer and the finished pack in memory, so
-//! its peak is about three times the pack limit.
+//! delivered it to remove; the Command can read it, and could copy it into a declared output,
+//! which would then be stored in the content-addressable store. That is allowed: the URL permits
+//! one create-only PUT of this task's own pack key and nothing else, so what the Command learns
+//! from it, it could already produce as an output. The grant token is read from
+//! `--grant-token-file`, which is not removed, and its path stays in the tool's argv: the job's
+//! sandbox must keep that file and the tool's `/proc` entry out of the Command's reach (a
+//! separate user or a separate process namespace), or the Command can read the token. The flag
+//! forms `--pack-url` and `--grant-token`, accepted only with `--insecure-argv-secrets`
+//! (komira-ai/kbf#1934), put the values in argv for every process on the host to read; they are
+//! a stopgap until the job scheduler delivers job secrets as files, and are removed then. A
+//! process of the Command that leaves its process group (for example with `setsid`) survives the
+//! group kill at the deadline; only such a sandbox ends it.
 
 pub mod digest;
 pub mod fetch;

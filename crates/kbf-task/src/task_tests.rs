@@ -710,6 +710,7 @@ fn the_http_sink_puts_the_pack_to_the_url() {
     let sink = HttpSink {
         agent: agent(None),
         url,
+        sleeper: Arc::new(ThreadSleeper),
     };
     sink.store(b"ok").expect("stored");
     let request = server.join().expect("server");
@@ -788,4 +789,87 @@ fn a_size_cap_is_exit_12_with_output_too_large() {
         failure.to_string().contains("output-too-large"),
         "{failure}"
     );
+}
+
+/// A store that answers `statuses` in turn, one connection each; it returns how many PUTs it saw.
+fn serve_statuses(statuses: Vec<u16>) -> (String, std::thread::JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}/pack", listener.local_addr().expect("addr"));
+    let server = std::thread::spawn(move || {
+        let mut seen = 0;
+        for status in statuses {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut got = Vec::new();
+            let mut chunk = [0_u8; 512];
+            while !got.ends_with(b"ok") {
+                let n = stream.read(&mut chunk).expect("read");
+                got.extend_from_slice(&chunk[..n]);
+            }
+            seen += 1;
+            let reply = format!(
+                "HTTP/1.1 {status} X\r\nRetry-After: 4\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(reply.as_bytes()).expect("reply");
+        }
+        seen
+    });
+    (url, server)
+}
+
+/// A sleeper that records the waits it is asked for and does not wait.
+#[derive(Default)]
+struct Waits(Mutex<Vec<Duration>>);
+
+impl Sleeper for Arc<Waits> {
+    fn sleep(&self, wait: Duration) {
+        self.0.lock().unwrap().push(wait);
+    }
+}
+
+fn recording_sink(url: String, waits: &Arc<Waits>) -> HttpSink {
+    HttpSink {
+        agent: agent(None),
+        url,
+        sleeper: Arc::new(Arc::clone(waits)),
+    }
+}
+
+/// Catches a full hot tier failing the task after the build ran: the sink PUTs again after a 503,
+/// waits what the store's `Retry-After` said, and stores on the 201.
+#[test]
+fn the_http_sink_retries_a_503_after_the_wait_the_store_asked_for() {
+    let (url, server) = serve_statuses(vec![503, 201]);
+    let waits = Arc::new(Waits::default());
+    recording_sink(url, &waits).store(b"ok").expect("stored");
+    assert_eq!(server.join().expect("server"), 2);
+    assert_eq!(*waits.0.lock().unwrap(), [Duration::from_secs(4)]);
+}
+
+/// Catches an unbounded retry against a real store: a store that keeps answering 503 sees exactly
+/// one PUT plus the retries, and the failure is a put (exit 13).
+#[test]
+fn a_store_that_keeps_answering_503_fails_the_task_as_a_put_after_a_bounded_number_of_puts() {
+    let attempts = crate::put::MAX_RETRIES as usize + 1;
+    let (url, server) = serve_statuses(vec![503; attempts]);
+    let waits = Arc::new(Waits::default());
+    let err = recording_sink(url, &waits)
+        .store(b"ok")
+        .expect_err("still full");
+    assert_eq!(server.join().expect("server"), attempts);
+    assert_eq!(waits.0.lock().unwrap().len(), attempts - 1);
+    assert_eq!(Failure::from(err).exit_code(), EXIT_PUT);
+}
+
+/// Catches a 412 being retried: the key exists, so the sink PUTs once, waits for nothing and the
+/// failure is a put (exit 13).
+#[test]
+fn the_http_sink_does_not_retry_a_412() {
+    let (url, server) = serve_statuses(vec![412]);
+    let waits = Arc::new(Waits::default());
+    let err = recording_sink(url, &waits)
+        .store(b"ok")
+        .expect_err("exists");
+    assert_eq!(server.join().expect("server"), 1);
+    assert!(waits.0.lock().unwrap().is_empty());
+    assert!(matches!(err, PutError::Exists { .. }), "{err:?}");
 }
