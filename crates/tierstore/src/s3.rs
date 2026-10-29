@@ -36,6 +36,9 @@
 //!   of an object made of parts is not the MD5 of its bytes, so it is not the tag of a `put`
 //!   of the same bytes, unlike in the in-memory and the directory backend.
 //! - `abort_upload` is AbortMultipartUpload.
+//! - `list_uploads` is ListMultipartUploads (`prefix`, `max-uploads`, `key-marker` and
+//!   `upload-id-marker`), whose pages the backend follows until it has the uploads asked for or
+//!   the listing ends.
 //! - An upload the store does not hold (`NoSuchUpload`) is [`Error::NotFound`] with the upload
 //!   id, and a completion the store refuses for its parts (`InvalidPart`, `InvalidPartOrder`,
 //!   `EntityTooSmall`) is [`Error::InvalidPart`]. S3 takes no part under 5 MiB but the last.
@@ -83,7 +86,7 @@ use kbf_objstore::{
 };
 use tokio::sync::mpsc;
 
-use crate::{Backend, ByteRange, Error, Listed, Meta, PartBody};
+use crate::{Backend, ByteRange, Error, Listed, Meta, OpenUpload, PartBody, UploadsAfter};
 
 pub use kbf_objstore::Capabilities;
 pub use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError};
@@ -199,6 +202,15 @@ fn listed_of(object: StampedObject) -> Listed {
         key: object.key.as_str().to_owned(),
         size: object.size,
         modified: object.modified_millis,
+    }
+}
+
+/// An upload of a listing of the client as one of this crate.
+fn open_of(upload: kbf_objstore::s3::OpenUpload) -> OpenUpload {
+    OpenUpload {
+        key: upload.key.as_str().to_owned(),
+        id: upload.upload_id,
+        initiated: upload.initiated_millis,
     }
 }
 
@@ -413,6 +425,40 @@ impl Backend for S3Backend {
         let object = object_key(key)?;
         let abort = self.store.abort_multipart(&object, id);
         abort.await.map_err(|e| upload_error(e, key, id))
+    }
+
+    async fn list_uploads(
+        &self,
+        prefix: &str,
+        after: Option<UploadsAfter<'_>>,
+        max_uploads: usize,
+    ) -> Result<Vec<OpenUpload>, Error> {
+        let under = KeyPrefix::new(prefix).map_err(|e| Error::Other(e.to_string()))?;
+        let mut marker = match after {
+            Some((key, id)) => Some((object_key(key)?, id.map(str::to_owned))),
+            None => None,
+        };
+        let mut open = Vec::new();
+        while open.len() < max_uploads {
+            let room = max_uploads - open.len();
+            let size = u16::try_from(room).ok().and_then(PageSize::new);
+            let size = size.unwrap_or(PageSize::MAX);
+            let from = marker.as_ref().map(|(key, id)| (key, id.as_deref()));
+            let page = self.store.list_multipart_uploads(&under, from, size);
+            let page = page.await.map_err(|e| map_error(e, prefix))?;
+            open.extend(page.uploads.into_iter().map(open_of));
+            let Some((key, id)) = page.next else { break };
+            // A store that has no id to give for the end of a page gives the empty one.
+            let next = (key, Some(id).filter(|id| !id.is_empty()));
+            if marker.as_ref() == Some(&next) {
+                let why =
+                    format!("{prefix:?} listing of uploads stalled: the marker did not change");
+                return Err(Error::Other(why));
+            }
+            marker = Some(next);
+        }
+        open.truncate(max_uploads);
+        Ok(open)
     }
 }
 

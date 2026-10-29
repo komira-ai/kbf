@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::{Backend, ByteRange, Error, Listed, Meta, PartBody};
+use crate::{Backend, ByteRange, Error, Listed, Meta, OpenUpload, PartBody, UploadsAfter};
 
 /// What a cached read was asked for: an object, and a range of it or the whole of it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -245,5 +245,14 @@ impl Backend for CachedStore {
 
     async fn abort_upload(&self, key: &str, id: &str) -> Result<(), Error> {
         self.inner.abort_upload(key, id).await
+    }
+
+    async fn list_uploads(
+        &self,
+        prefix: &str,
+        after: Option<UploadsAfter<'_>>,
+        max_uploads: usize,
+    ) -> Result<Vec<OpenUpload>, Error> {
+        self.inner.list_uploads(prefix, after, max_uploads).await
     }
 }

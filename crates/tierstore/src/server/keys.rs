@@ -73,7 +73,7 @@ impl fmt::Debug for AccessKey {
 pub(crate) enum Role {
     /// Everything the front serves.
     Full,
-    /// GetObject, HeadObject, ListObjectsV2 and HeadBucket.
+    /// GetObject, HeadObject, ListObjectsV2, ListMultipartUploads and HeadBucket.
     ReadOnly,
 }
 
@@ -90,6 +90,23 @@ impl Role {
         match (self, reads) {
             (Self::ReadOnly, false) => Err(READ_ONLY),
             _ => Ok(()),
+        }
+    }
+
+    /// Whether the role may list the open multipart uploads under `prefix` (ListMultipartUploads,
+    /// a `GET` that [`Role::permit`] has already let through for any role). Both roles may, for
+    /// any prefix: a read-only key already lists every key of the bucket, and the listing gives
+    /// it upload ids, which let it do nothing, since a part, a completion and an abort are not
+    /// reads. S3 asks for a permission of its own (`s3:ListBucketMultipartUploads`) here.
+    ///
+    /// This is the place to narrow the listing when a key may act on one prefix only: a key
+    /// that may delete under a prefix may list the uploads under it, as it may abort them.
+    ///
+    /// # Errors
+    /// [`READ_ONLY`] or another refusal, for a role that may not list the uploads under `prefix`.
+    pub(crate) fn permit_list_uploads(self, _prefix: &str) -> Result<(), Refusal> {
+        match self {
+            Self::Full | Self::ReadOnly => Ok(()),
         }
     }
 }

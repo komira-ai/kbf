@@ -17,6 +17,7 @@ use tierstore::{
 };
 
 use crate::conformance;
+use crate::list_uploads::contract as uploads_contract;
 use crate::multipart::{contract, large};
 use crate::support::{body, keys, page};
 
@@ -382,6 +383,100 @@ async fn the_s3_backend_does_multipart_uploads() {
     large(&backend).await;
     assert_eq!(s3.incomplete_uploads(), 0);
     assert_eq!(s3.stats().completed, 2);
+}
+
+/// Asserts that the S3 backend lists the open uploads of the service as the trait says, held to
+/// the same checks as the in-memory and the directory backend (ListMultipartUploads with the
+/// prefix, the page size and the two markers), that the time of a start is the service's in
+/// milliseconds, and that an upload that was completed or aborted is no longer on the service's
+/// list.
+#[tokio::test]
+async fn the_s3_backend_lists_open_uploads() {
+    let (s3, backend) = backend().await;
+    s3.set_time(1_255_369_830);
+    let id = backend.create_upload("when").await.unwrap();
+    let listed = backend.list_uploads("", None, 10).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        (listed[0].key.as_str(), listed[0].id.as_str()),
+        ("when", id.as_str())
+    );
+    assert_eq!(listed[0].initiated, 1_255_369_830_000);
+    backend.abort_upload("when", &id).await.unwrap();
+
+    uploads_contract(&backend).await;
+    assert_eq!(s3.incomplete_uploads(), 2);
+}
+
+/// Asserts that the S3 backend asks for the pages of a listing of uploads until it has the
+/// number asked for or the listing ends, from the markers of each page, leaves the upload id
+/// marker out where the service sends an empty one, and ends with an error, as a listing of
+/// objects does, when a page names the marker it was sent.
+#[tokio::test]
+async fn the_s3_backend_follows_the_pages_of_a_listing_of_uploads() {
+    const FIRST: &str = "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n\
+                         <ListMultipartUploadsResult><IsTruncated>true</IsTruncated>\
+                         <NextKeyMarker>k1</NextKeyMarker><NextUploadIdMarker></NextUploadIdMarker>\
+                         <Upload><Key>k1</Key><UploadId>u1</UploadId>\
+                         <Initiated>2009-10-12T17:50:30.000Z</Initiated></Upload>\
+                         </ListMultipartUploadsResult>";
+    const LAST: &str = "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n\
+                        <ListMultipartUploadsResult><IsTruncated>false</IsTruncated>\
+                        <Upload><Key>k2</Key><UploadId>u2</UploadId>\
+                        <Initiated>2009-10-12T17:50:31.000Z</Initiated></Upload>\
+                        </ListMultipartUploadsResult>";
+    let (endpoint, seen) = scripted(vec![FIRST, LAST]);
+    let backend = S3Backend::new(config(&endpoint)).unwrap();
+    let listed = backend.list_uploads("", None, usize::MAX).await.unwrap();
+    let keys: Vec<(&str, &str)> = listed
+        .iter()
+        .map(|upload| (upload.key.as_str(), upload.id.as_str()))
+        .collect();
+    assert_eq!(keys, [("k1", "u1"), ("k2", "u2")]);
+    {
+        let heads = seen.lock().unwrap();
+        assert_eq!(heads.len(), 2);
+        assert!(!heads[0].contains("key-marker"), "{}", heads[0]);
+        assert!(heads[0].contains("max-uploads=1000"), "{}", heads[0]);
+        assert!(heads[1].contains("key-marker=k1"), "{}", heads[1]);
+        assert!(!heads[1].contains("upload-id-marker"), "{}", heads[1]);
+    }
+
+    const STUCK: &str = "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n\
+                         <ListMultipartUploadsResult><IsTruncated>true</IsTruncated>\
+                         <NextKeyMarker>k</NextKeyMarker><NextUploadIdMarker>u</NextUploadIdMarker>\
+                         </ListMultipartUploadsResult>";
+    let (endpoint, seen) = scripted(vec![STUCK, STUCK]);
+    let backend = S3Backend::new(config(&endpoint)).unwrap();
+    let error = backend.list_uploads("", None, 10).await.unwrap_err();
+    assert!(error.to_string().contains("stalled"), "{error}");
+    assert_other(Err::<(), Error>(error));
+    let heads = seen.lock().unwrap();
+    assert_eq!(heads.len(), 2);
+    assert!(heads[1].contains("key-marker=k"), "{}", heads[1]);
+    assert!(heads[1].contains("upload-id-marker=u"), "{}", heads[1]);
+}
+
+/// Asserts that a listing of uploads that the service refuses, or answers with something that is
+/// not a listing of uploads, or that names a prefix or a marker the client cannot name, is an
+/// `Other` error, as the other calls of the backend give for them, and that the last of these
+/// asks nothing of the service.
+#[tokio::test]
+async fn a_listing_of_uploads_that_fails_is_an_error() {
+    let (endpoint, _) = scripted(vec!["HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n<html/>"]);
+    let store = S3Backend::new(config(&endpoint)).unwrap();
+    assert_other(store.list_uploads("", None, 10).await);
+
+    let refusal = "HTTP/1.1 403 Forbidden\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
+    let (endpoint, _) = scripted(vec![refusal]);
+    let store = S3Backend::new(config(&endpoint)).unwrap();
+    assert_other(store.list_uploads("", None, 10).await);
+
+    let (endpoint, seen) = scripted(vec![]);
+    let store = S3Backend::new(config(&endpoint)).unwrap();
+    assert_other(store.list_uploads("", Some(("", None)), 10).await);
+    assert_other(store.list_uploads("a//b", None, 10).await);
+    assert!(seen.lock().unwrap().is_empty());
 }
 
 /// Asserts that a completion that names a part under the least size S3 takes, before the last

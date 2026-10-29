@@ -13,7 +13,8 @@ use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use crate::{Backend, ByteRange, Error, Listed, Meta, PartBody};
+use crate::backend::upload_page;
+use crate::{Backend, ByteRange, Error, Listed, Meta, OpenUpload, PartBody, UploadsAfter};
 
 /// The length of the content tag that starts the file of an object: the SHA-256 of its body.
 const TAG_LEN: usize = 32;
@@ -549,6 +550,32 @@ impl Backend for DirBackend {
     async fn abort_upload(&self, key: &str, id: &str) -> Result<(), Error> {
         let dir = self.upload_dir(key, id).await?;
         fs::remove_dir_all(&dir).await.map_err(io_error(&dir))
+    }
+
+    async fn list_uploads(
+        &self,
+        prefix: &str,
+        after: Option<UploadsAfter<'_>>,
+        max_uploads: usize,
+    ) -> Result<Vec<OpenUpload>, Error> {
+        let uploads = self.root.join(UPLOADS);
+        let mut entries = fs::read_dir(&uploads).await.map_err(io_error(&uploads))?;
+        let mut open = Vec::new();
+        while let Some(entry) = entries.next_entry().await.map_err(io_error(&uploads))? {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            // An upload that is made, completed or aborted while this is read has no key file
+            // (yet, or any more): it is not open, so it is left out.
+            let named = entry.path().join(KEY_FILE);
+            let Ok(key) = fs::read_to_string(&named).await else {
+                continue;
+            };
+            let started = fs::metadata(&named).await.and_then(|meta| meta.modified());
+            let since = started.map(|time| time.duration_since(UNIX_EPOCH));
+            let elapsed = since.ok().and_then(Result::ok);
+            let initiated = elapsed.map_or(0, |elapsed| elapsed.as_millis() as u64);
+            open.push(OpenUpload { key, id, initiated });
+        }
+        Ok(upload_page(open, prefix, after, max_uploads))
     }
 }
 

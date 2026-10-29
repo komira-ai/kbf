@@ -9,7 +9,8 @@ use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 
-use crate::{Backend, ByteRange, Clock, Error, Listed, Meta, PartBody};
+use crate::backend::upload_page;
+use crate::{Backend, ByteRange, Clock, Error, Listed, Meta, OpenUpload, PartBody, UploadsAfter};
 
 /// A clock a test sets by hand, for the times a [`MemoryBackend`] gives its objects. It starts
 /// at zero and moves only when told to, so two tiers that share one clock agree on the time.
@@ -59,10 +60,11 @@ fn tag_of(body: &Bytes) -> String {
     hex::encode(Sha256::digest(body))
 }
 
-/// A multipart upload in progress: the key it is for, and the parts stored so far by number,
-/// each with its content tag.
+/// A multipart upload in progress: the key it is for, when it was started, and the parts stored
+/// so far by number, each with its content tag.
 struct Upload {
     key: String,
+    initiated: u64,
     parts: BTreeMap<u32, (Bytes, String)>,
 }
 
@@ -209,6 +211,7 @@ impl Backend for MemoryBackend {
         let id = format!("upload-{}", uploads.started);
         let upload = Upload {
             key: key.to_owned(),
+            initiated: self.clock.now(),
             parts: BTreeMap::new(),
         };
         uploads.open.insert(id.clone(), upload);
@@ -266,5 +269,20 @@ impl Backend for MemoryBackend {
         self.check_upload(key, id)?;
         self.uploads().open.remove(id);
         Ok(())
+    }
+
+    async fn list_uploads(
+        &self,
+        prefix: &str,
+        after: Option<UploadsAfter<'_>>,
+        max_uploads: usize,
+    ) -> Result<Vec<OpenUpload>, Error> {
+        let uploads = self.uploads();
+        let open = uploads.open.iter().map(|(id, upload)| OpenUpload {
+            key: upload.key.clone(),
+            id: id.clone(),
+            initiated: upload.initiated,
+        });
+        Ok(upload_page(open, prefix, after, max_uploads))
     }
 }

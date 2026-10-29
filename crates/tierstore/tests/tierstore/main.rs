@@ -8,6 +8,7 @@ mod conformance;
 mod faults;
 mod journal;
 mod lease;
+mod list_uploads;
 mod multipart;
 mod reconciler;
 mod reconciler_faults;
