@@ -122,7 +122,8 @@ impl Rig {
         proxy_config.usage_refresh = Duration::ZERO;
         let proxy = Proxy::open(hot.clone(), cold.clone(), proxy_config).await;
         let backend: Arc<dyn Backend> = Arc::new(proxy.expect("a proxy"));
-        let mut config = ServerConfig::new(BUCKET, KEY_ID, SECRET, clock);
+        let mut config = ServerConfig::new(BUCKET, KEY_ID, SECRET, clock.clone());
+        config.rate_clock = clock;
         change(&mut config);
         let server = Server::new(backend, config.clone());
         Self {

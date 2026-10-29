@@ -1,11 +1,13 @@
 //! The proxy: a store over a hot and a cold backend.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::{StreamExt, stream};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OnceCell};
 use tokio::time::Instant;
 
@@ -131,6 +133,16 @@ fn refuse_reserved(key: &str) -> Result<(), Error> {
 ///   is not acknowledged, and the object it wrote to the hot tier is removed, best effort:
 ///   left there it would never be copied, and would make a retry of the put fail with
 ///   [`Error::AlreadyExists`].
+/// - **Streamed put** ([`Backend::put_stream`]) is a put whose body arrives as chunks and is
+///   never held whole: the chunks go on to the hot tier's own streamed put (or the cold tier's,
+///   where the hot tier is full), which makes the object visible, create-only, only after the
+///   last chunk, and the journal entry is appended after that. A body that ends with an error
+///   (a checksum that does not match, a connection that was cut) leaves no object in either
+///   tier and no journal entry. The checks of a put (the key exists in either tier, reserved
+///   keys) are made before the first chunk is taken. If the hot tier answers [`Error::Full`]
+///   after it took some of the body, the bytes cannot be offered to the cold tier, so the put
+///   fails with [`Error::Full`] (the tier is latched full, and the client's retry goes to the
+///   cold tier); if it took none, the cold tier gets the whole body as for a held put.
 /// - **Delete** removes the object from the hot tier and from the cold tier, then appends a
 ///   delete entry, which lets the reconciler undo a copy to the cold tier that was under way.
 /// - **List** is the union of both tiers without duplicates (the hot tier's entry where both
@@ -178,6 +190,50 @@ fn refuse_reserved(key: &str) -> Result<(), Error> {
 ///   there, with a put entry after the delete entry.
 pub struct Proxy {
     inner: Arc<Inner>,
+}
+
+/// The body of a streamed put, which more than one tier may be offered in turn: a view of it is
+/// a stream of its chunks, and the next view goes on where the last one stopped. The proxy
+/// counts the bytes that were taken (the size of the object, for the journal), and a tier that
+/// refuses the put before it took a byte is followed by the other tier, which gets the whole
+/// body.
+struct Offered<'a> {
+    /// The rest of the body; `None` once it has ended or failed.
+    rest: AsyncMutex<Option<PartBody<'a>>>,
+    taken: AtomicU64,
+}
+
+impl<'a> Offered<'a> {
+    fn new(body: PartBody<'a>) -> Self {
+        Self {
+            rest: AsyncMutex::new(Some(body)),
+            taken: AtomicU64::new(0),
+        }
+    }
+
+    /// The number of bytes of the body taken so far.
+    fn taken(&self) -> u64 {
+        self.taken.load(Ordering::SeqCst)
+    }
+
+    /// The rest of the body as a stream. It ends after the end of the body or an error of it.
+    fn view(&self) -> PartBody<'_> {
+        stream::unfold(self, |offered| async move {
+            let mut rest = offered.rest.lock().await;
+            let next = rest.as_mut()?.next().await;
+            match &next {
+                Some(Ok(chunk)) => {
+                    offered
+                        .taken
+                        .fetch_add(chunk.len() as u64, Ordering::SeqCst);
+                }
+                Some(Err(_)) | None => *rest = None,
+            }
+            drop(rest);
+            Some((next?, offered))
+        })
+        .boxed()
+    }
 }
 
 struct Inner {
@@ -415,6 +471,71 @@ impl Inner {
         }
     }
 
+    /// Writes the object to the cold tier from the body, create-only, when the hot tier is full.
+    async fn put_cold_stream(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        offered: &Offered<'_>,
+    ) -> Result<(), Error> {
+        self.check_not_in_hot(key).await?;
+        self.cold.put_stream(key, len, offered.view()).await
+    }
+
+    /// Writes the object to the hot tier from the body, then journals it. The object is in the
+    /// hot tier only when the body has ended whole (the backend sees to it), and the journal
+    /// entry comes after that, so a body that fails leaves neither. A hot tier with no room is
+    /// latched full; the body goes to the cold tier instead if the hot tier took none of it,
+    /// and else the put fails with [`Error::Full`], since the bytes taken cannot be offered
+    /// again (the client's retry goes to the cold tier).
+    async fn put_hot_stream(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        offered: &Offered<'_>,
+    ) -> Result<(), Error> {
+        let stored = match self.hot.put_stream(key, len, offered.view()).await {
+            Ok(()) => self.journal_put(key, offered.taken()).await,
+            failed => failed,
+        };
+        match stored {
+            Err(Error::Full(_)) if offered.taken() == 0 => {
+                self.latch_full();
+                self.put_cold_stream(key, len, offered).await
+            }
+            Err(error @ Error::Full(_)) => {
+                self.latch_full();
+                Err(error)
+            }
+            other => other,
+        }
+    }
+
+    /// As `put_object`, for a body that arrives as chunks: it goes to the hot tier, or to the
+    /// cold tier where the hot tier is full, without being held.
+    async fn put_object_stream(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        refuse_reserved(key)?;
+        match self.cold.head(key).await {
+            Ok(_) => return Err(Error::AlreadyExists(key.to_owned())),
+            Err(Error::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        let offered = Offered::new(body);
+        match self.level().await {
+            Level::Full => self.put_cold_stream(key, len, &offered).await,
+            Level::Critical => {
+                tokio::time::sleep(self.config.back_pressure).await;
+                self.put_hot_stream(key, len, &offered).await
+            }
+            Level::Open => self.put_hot_stream(key, len, &offered).await,
+        }
+    }
+
     /// Copies an object read from the cold tier into the hot tier, and journals the copy in
     /// the background.
     async fn copy_back(self: &Arc<Self>, key: &str, body: &Bytes) {
@@ -523,6 +644,23 @@ fn merge(in_hot: Vec<Listed>, in_cold: Vec<Listed>, max_keys: usize) -> Vec<List
 impl Backend for Proxy {
     async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
         self.inner.put_object(key, body).await
+    }
+
+    /// Whether either tier needs the length of a streamed body (the put may go to either).
+    fn needs_length(&self) -> bool {
+        self.inner.hot.needs_length() || self.inner.cold.needs_length()
+    }
+
+    /// A put whose body is not held: the chunks go to the hot tier (or the cold tier of a full
+    /// hot tier) as they arrive, and the object is created, create-only, only after the body has
+    /// ended whole; a body that fails leaves no object and no journal entry. See [`Proxy`].
+    async fn put_stream(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        self.inner.put_object_stream(key, len, body).await
     }
 
     /// The proxy keeps objects immutable: it never replaces one.

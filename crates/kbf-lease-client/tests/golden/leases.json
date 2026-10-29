@@ -1,0 +1,1 @@
+{"leases":[{"id":"4-17","state":"held","host":"node3","acquired_at_ms":1793000000000,"expires_at_ms":1793000600000,"ends_at_ms":1793021600000,"labels":{"kbf-frontend":"fe-1"}},{"id":"4-18","state":"pending","acquired_at_ms":1793000001000,"expires_at_ms":1793000601000,"ends_at_ms":1793021601000,"labels":{}}]}

@@ -1130,3 +1130,86 @@ fn the_release_workflow_builds_the_kbf_binary_apart_from_the_installer() {
          on for it: {together:?}"
     );
 }
+
+/// What the lease server client's normal dependencies must not reach: another HTTP stack
+/// (`reqwest`, which the object store uses, and `ureq`, which the daemons must not link), and
+/// the jobscheduler's own agent and client crates, whose names the workspace refuses. The
+/// client is written over hyper and tokio-rustls alone, with the one CA it is given as its
+/// only trust anchor; a second stack beside it would be a second place the token could go
+/// through.
+const LEASE_CLIENT_MUST_NOT_REACH: &[&str] = &["reqwest", "ureq", "js-agent", "js-client"];
+
+/// The crates that must never reach the lease server client: the daemon side
+/// (`DAEMON_SIDE`), the VM driver and the guest agent (which run untrusted builds), the
+/// Mac session, and the updater and installer that run on nodes. `kbf-storage-and-daemon` is
+/// not here: it links the server library, which is where the executor that holds the token
+/// lives, and the server's own closure is what the lease client is for.
+const LEASE_CLIENT_FORBIDDEN_ROOTS: &[&str] = &[
+    "kbf-node",
+    "kbf-daemon",
+    "kbf-transfer",
+    "kbf-driver-container",
+    "kbf-driver-native",
+    "kbf-driver-vm",
+    "kbf-guest",
+    "kbf-mac-session",
+    "kbf-updater",
+    "kbf-installer",
+];
+
+/// Asserts that no node-side crate reaches the lease server client: the executor that
+/// leases hosts runs in the server, and a daemon, a VM guest or an installer holding the
+/// lease token or the means to call the lease server would let a compromised node or a build
+/// lease and run work on other hosts. The roots are `LEASE_CLIENT_FORBIDDEN_ROOTS`, and the
+/// walk is shown to see the client's own dependencies, so the check does not pass on an
+/// empty walk.
+#[test]
+fn a_daemon_cannot_reach_the_lease_client() {
+    let g = load_graph();
+    assert!(
+        g.names.values().any(|n| n == "kbf-lease-client"),
+        "kbf-lease-client is not a package of the workspace's graph"
+    );
+    assert!(
+        !reaches(&g, "kbf-lease-client", &["hyper", "tokio-rustls"]).is_empty(),
+        "the lease client's closure must reach hyper and tokio-rustls, or this walk proves nothing"
+    );
+    let violations: Vec<String> = LEASE_CLIENT_FORBIDDEN_ROOTS
+        .iter()
+        .flat_map(|root| reaches(&g, root, &["kbf-lease-client"]))
+        .collect();
+    assert!(
+        violations.is_empty(),
+        "a node-side crate reaches the lease server client:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Asserts that the lease server client depends on no other kbf crate and on no second HTTP
+/// stack (`LEASE_CLIENT_MUST_NOT_REACH`), so it can be linked anywhere the server can and
+/// brings nothing else with it.
+#[test]
+fn the_lease_client_is_a_leaf_over_hyper_and_tokio_rustls() {
+    let g = load_graph();
+    let (id, root) = &g.members["kbf-lease-client"];
+    assert!(
+        root.is_some(),
+        "kbf-lease-client must have a library target"
+    );
+    let kbf_deps: Vec<String> = normal_closure(&g, id)
+        .into_iter()
+        .filter(|(dep, _)| g.names[dep].starts_with("kbf-"))
+        .map(|(_, chain)| chain)
+        .collect();
+    assert!(
+        kbf_deps.is_empty(),
+        "the lease client depends on a kbf crate:\n{}",
+        kbf_deps.join("\n")
+    );
+    let violations = reaches(&g, "kbf-lease-client", LEASE_CLIENT_MUST_NOT_REACH);
+    assert!(
+        violations.is_empty(),
+        "the lease client reaches another HTTP stack or a jobscheduler agent crate:\n{}",
+        violations.join("\n")
+    );
+}

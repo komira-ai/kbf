@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -57,6 +57,8 @@ pub struct Spy {
     claims: Capabilities,
     reject_puts: AtomicU32,
     reject_reads: AtomicU32,
+    reject_lens: AtomicU32,
+    shave_len: AtomicU64,
     puts: AtomicU32,
     ranges: Mutex<Vec<(String, u64, u64)>>,
 }
@@ -91,6 +93,8 @@ impl Spy {
             claims,
             reject_puts: AtomicU32::new(0),
             reject_reads: AtomicU32::new(0),
+            reject_lens: AtomicU32::new(0),
+            shave_len: AtomicU64::new(0),
             puts: AtomicU32::new(0),
             ranges: Mutex::new(Vec::new()),
         }
@@ -104,6 +108,17 @@ impl Spy {
     /// The next `n` range reads fail (after they are logged).
     pub fn reject_reads(&self, n: u32) {
         self.reject_reads.store(n, SeqCst);
+    }
+
+    /// The next `n` length questions fail.
+    pub fn reject_lens(&self, n: u32) {
+        self.reject_lens.store(n, SeqCst);
+    }
+
+    /// Every length answer is `by` bytes short of the object's: the store says an object is
+    /// shorter than it is.
+    pub fn understate_len(&self, by: u64) {
+        self.shave_len.store(by, SeqCst);
     }
 
     /// How many writes were tried.
@@ -177,6 +192,15 @@ impl ObjectStore for Spy {
 
     async fn may_hold(&self, key: &ObjectKey) -> Result<bool, ObjectStoreError> {
         self.inner.may_hold(key).await
+    }
+
+    async fn len(&self, key: &ObjectKey) -> Result<Option<u64>, ObjectStoreError> {
+        if fires(&self.reject_lens) {
+            return Err(injected());
+        }
+        let shave = self.shave_len.load(SeqCst);
+        let len = self.inner.len(key).await?;
+        Ok(len.map(|len| len.saturating_sub(shave)))
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
@@ -376,7 +400,22 @@ impl Rig {
 
     /// Packs as `settings` say, in front of `owners`.
     pub async fn over(owners: Owners, settings: PackSettings) -> Self {
-        let store = Arc::new(Spy::new());
+        Self::over_store(owners, settings, Spy::new()).await
+    }
+
+    /// Packs of the default settings over a store that replaces an object it holds, in front of
+    /// a real storage node.
+    pub async fn replacing() -> Self {
+        let (node, addr) = node();
+        let owners = Owners::single(Owner::new("node", lazy(addr)));
+        let mut rig = Self::over_store(owners, PackSettings::default(), Spy::replacing()).await;
+        rig.node = Some(node);
+        rig
+    }
+
+    /// Packs as `settings` say, over `store`, in front of `owners`.
+    async fn over_store(owners: Owners, settings: PackSettings, store: Spy) -> Self {
+        let store = Arc::new(store);
         let index = Arc::new(Index::over(Arc::clone(&store)));
         let shared: Arc<dyn PackIndex> = index.clone();
         let keys = PackKeys::new(WriterKind::Frontend, "fe1", "boot1").expect("keys");
