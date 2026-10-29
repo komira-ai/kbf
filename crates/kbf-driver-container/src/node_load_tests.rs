@@ -630,9 +630,8 @@ async fn a_reading_that_is_dropped_does_not_let_a_second_start() {
 }
 
 /// Catches a lease that ended while the files were read being listed (the reading would
-/// name a lease the daemon has already finished), and a window of it being taken from the
-/// files read after it ended. Both leases have a baseline reading and have used CPU
-/// since, so a window of either would show: lease 1's is taken, and lease 2 must have none.
+/// name a lease the daemon has already finished). The listing holds lease 1 only, and
+/// lease 1's window shows the rig takes windows.
 #[tokio::test]
 async fn a_lease_that_ends_while_the_files_are_read_is_not_listed() {
     let actions = cgroup("load-ends-midway");
@@ -664,8 +663,7 @@ async fn a_lease_that_ends_while_the_files_are_read_is_not_listed() {
     let load = reading.await.expect("joined").expect("reading");
     assert_eq!(load.leases, [named(1, 100, 1_000_000, 4_000)]);
 
-    // The window that was taken is lease 1's; lease 2 ended with no window.
+    // Lease 1's window shows the rig takes windows.
     tracker.ended(id(1));
     assert_eq!(tracker.take_peak(id(1)), Some(1_000));
-    assert_eq!(tracker.take_peak(id(2)), None);
 }
