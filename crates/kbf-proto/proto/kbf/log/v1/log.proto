@@ -491,6 +491,7 @@ enum Consumable {
   CONSUMABLE_MEM_GIB = 2;
   CONSUMABLE_NVME_GIB = 3;
   CONSUMABLE_GPUS = 4;
+  CONSUMABLE_DISK_GIB = 5;
 }
 
 // One execution request (kbf-sched's Request). `needs` is the capability request as the

@@ -67,10 +67,10 @@
 //! (`If-None-Match: *` on a put and on the completion of a multipart upload, answering 412 for a
 //! key that exists): on one that ignores them a put would replace.
 //!
-//! Requests are signed with SigV4 in the `Authorization` header (see `auth`): by one of the
-//! access keys of [`ServerConfig`], over `host`, `x-amz-content-sha256` and `x-amz-date` at
-//! least, and a request without a good signature, a presigned URL included, is answered 403
-//! before its body is read. A request names its key by the key id of its credential, and an id
+//! Requests are signed with SigV4 in the `Authorization` header (see `auth`) by one of the access
+//! keys of [`ServerConfig`], over `host`, `x-amz-content-sha256` and `x-amz-date` at least, or are
+//! presigned PUT URLs of a presigning key (see [`presign`]). A request without a good signature is
+//! answered 403 before its body is read. A request names its key by the key id of its credential, and an id
 //! that is no key's is `InvalidAccessKeyId`.
 //!
 //! # Access keys
@@ -80,8 +80,11 @@
 //! GetObject, HeadObject, ListObjectsV2 and HeadBucket and nothing else. Any other call signed
 //! by a read-only key (a put, a delete, CreateBucket, and every call of a multipart upload) is
 //! answered 403 `AccessDenied` with the S3 error document before its body is read, and changes
-//! nothing. The roles are of the key and not of a prefix: a key that may write under one prefix
-//! only is not built yet.
+//! nothing. The roles of those keys are of the key and not of a prefix. A put by the full key
+//! is create-only but, when the hot tier is full, can race another put of the same key into the
+//! cold tier (see [`Proxy`](crate::Proxy)); a presigned PUT never goes to the cold tier.
+//! A credential that may write one object under a prefix, and expires, is a presigned PUT URL: see [`presign`], and
+//! [`ServerConfig::presign_keys`] for the keys that sign them (`--presign-key-file` in the binary).
 //!
 //! # Checksums
 //!
@@ -140,6 +143,7 @@ mod handover;
 mod idle;
 mod keys;
 mod ops;
+pub mod presign;
 mod reply;
 mod request;
 mod time;
@@ -159,6 +163,8 @@ mod idle_tests;
 mod ops_tests;
 #[cfg(test)]
 mod pipes;
+#[cfg(test)]
+mod presign_server_tests;
 #[cfg(test)]
 mod reply_tests;
 #[cfg(test)]
@@ -202,6 +208,7 @@ use tokio::sync::{Notify, Semaphore, watch};
 use crate::{Backend, Clock, MonotonicClock};
 
 pub use keys::AccessKey;
+pub use presign::{Grant, PresignKey, PresignRequest, presign_put};
 
 use idle::Watched;
 use reply::{Answer, S3Error, answer};
@@ -222,6 +229,11 @@ pub struct ServerConfig {
     /// the module docs). None by default. Their ids differ from each other's and from the full
     /// key's: if one is the full key's, the full key is the one that is meant.
     pub read_only_keys: Vec<AccessKey>,
+    /// The keys that sign presigned PUT URLs (see [`presign`]); a URL is accepted only if one of
+    /// them signed it. None by default. Their ids differ from each other's and from the other keys'.
+    pub presign_keys: Vec<PresignKey>,
+    /// The longest `X-Amz-Expires` a presigned URL may have, whatever the ceiling of its key says.
+    pub presign_max_expires: Duration,
     /// The most bytes of a request body: the longest object that one put takes, and the
     /// longest part of an upload. It is an upper bound on a length, not on memory: the body of
     /// a put or of a part is streamed to the backend and is never held whole. (The body of a
@@ -286,6 +298,8 @@ impl ServerConfig {
             access_key_id: access_key_id.to_owned(),
             secret_access_key: secret_access_key.to_owned(),
             read_only_keys: Vec::new(),
+            presign_keys: Vec::new(),
+            presign_max_expires: Duration::from_secs(900),
             max_request_bytes: 256 << 20,
             body_idle_timeout: Duration::from_secs(30),
             max_concurrent_puts: 32,
@@ -629,9 +643,15 @@ impl Server {
         signed.role.permit(&parts.method)?;
         let target = resolve(&self.config.bucket, parts.uri.path())?;
         let query = Query::parse(parts.uri.query())?;
+        if let Some(grant) = &signed.presign {
+            grant.permit(parts, &target, &query)?;
+        }
         let data = matches!((&parts.method, &target), (&Method::PUT, Target::Object(_)));
         let check = Check::new(&signed.payload, &parts.headers, data)?;
         let limit = self.config.max_request_bytes;
+        let limit = signed.presign.as_ref().map_or(limit, |grant| {
+            limit.min(usize::try_from(grant.max_object_bytes).unwrap_or(usize::MAX))
+        });
         let config = &self.config;
         let floor = (config.put_min_bytes_per_sec, config.put_rate_grace);
         let reader = Reader::new(body, limit, config.body_idle_timeout).with_floor(
@@ -639,7 +659,9 @@ impl Server {
             floor.1,
             Arc::clone(&config.rate_clock),
         );
-        self.dispatch(parts, target, &query, reader, check).await
+        let grant = signed.presign.as_ref();
+        self.dispatch(parts, target, &query, reader, check, grant)
+            .await
     }
 
     /// The answer to a health or readiness probe, which are not signed.

@@ -322,3 +322,142 @@ fn the_verify_job_checks_the_signed_coordinator_image_with_the_commit_alone() {
         assert!(found(&w).iter().any(|l| l.contains(wanted)), "{to}");
     }
 }
+
+/// Asserts that the lint names a Linux job that does not make its task image an asset or makes
+/// it twice.
+#[test]
+fn the_task_image_is_made_an_asset_exactly_where_the_set_says() {
+    for platform in PACKAGES {
+        let step = task_steps(platform);
+        let asset = step
+            .split_once("      - name: Task asset\n")
+            .expect("asset")
+            .1;
+        let asset = format!("      - name: Task asset\n{asset}");
+        let none = good().replacen(&asset, "", 1);
+        assert_ne!(none, good(), "{platform}: in the fixture");
+        let wanted = format!(
+            "the task image for {platform} is made an asset by 0 `cargo xtask pkg-image-asset` lines, not exactly one"
+        );
+        assert!(found(&none).contains(&wanted), "{:?}", found(&none));
+        let twice = good().replacen(&asset, &format!("{asset}{asset}"), 1);
+        let wanted = wanted.replace("by 0", "by 2");
+        assert!(found(&twice).contains(&wanted), "{:?}", found(&twice));
+    }
+}
+
+/// Asserts that the lint names a task image made an asset from another binary or commit, and
+/// one made without the context from the built binary, a build, the comparison of the builds
+/// or the binary's identity check before it.
+#[test]
+fn the_task_image_is_built_twice_from_the_checked_binary_and_compared() {
+    let steps = task_steps("linux-x86_64");
+    let line = |from: &str, to: &str, wanted: &str| {
+        let w = good().replacen(&steps, &steps.replace(from, to), 1);
+        assert_ne!(w, good(), "{from}");
+        let got = found(&w);
+        assert!(got.iter().any(|l| l.contains(wanted)), "{from}: {got:?}");
+    };
+    line(
+        "--binary \"target/$STATIC_TARGET/release/kbf-task\"",
+        "--binary \"target/$TARGET/release/kbf-task\"",
+        "has --binary \"target/$TARGET/release/kbf-task\", not `target/$STATIC_TARGET/release/kbf-task`",
+    );
+    line(
+        "--commit \"$GITHUB_SHA\"",
+        "--commit abc",
+        "has --commit \"abc\", not `$GITHUB_SHA`",
+    );
+    for (name, what) in [
+        (
+            "Task context",
+            "the context filled with this job's kbf-task (`cp` into target/task-image)",
+        ),
+        ("Task build 1", "a `docker buildx build` into 1.oci.tar"),
+        ("Task build 2", "a `docker buildx build` into 2.oci.tar"),
+        ("Task same", "`cmp` of the two builds"),
+    ] {
+        let start = steps
+            .find(&format!("      - name: {name}\n"))
+            .expect("step");
+        let end = start
+            + 1
+            + steps[start + 1..]
+                .find("      - name:")
+                .unwrap_or(steps.len() - start - 1);
+        let w = good().replacen(&steps, &format!("{}{}", &steps[..start], &steps[end..]), 1);
+        let wanted = format!("is made an asset without {what} in a step before");
+        let got = found(&w);
+        assert!(got.iter().any(|l| l.contains(&wanted)), "{name}: {got:?}");
+    }
+    let check = "      - name: Task check\n        run: cargo xtask build-commit check \"target/$STATIC_TARGET/release/kbf-task\" \"$GITHUB_SHA\"\n";
+    let without = good().replacen(check, "", 1);
+    assert_ne!(without, good());
+    assert!(
+        found(&without).iter().any(|l| l.contains(
+            "is made an asset without `cargo xtask build-commit check` of the kbf-task before it"
+        )),
+        "{:?}",
+        found(&without)
+    );
+}
+
+/// Asserts that the lint names a verify job that does not check the signed task image of each
+/// platform with the commit alone.
+#[test]
+fn the_verify_job_checks_the_signed_task_image_with_the_commit_alone() {
+    for platform in PACKAGES {
+        let w = good().replacen(&verify_task_step(platform), "", 1);
+        assert_ne!(w, good(), "{platform}");
+        let wanted = format!(
+            "`verify-linux` does not run `cargo xtask pkg-image-asset --verify-only` on `dist/kbf-task-image-$GITHUB_SHA-{platform}.oci.tar`"
+        );
+        assert!(found(&w).iter().any(|l| l.contains(&wanted)), "{platform}");
+    }
+    let step = verify_task_step("linux-arm64");
+    let with_binary = step.replace("--commit", "--binary target/release/kbf-task --commit");
+    let w = good().replacen(&step, &with_binary, 1);
+    assert_ne!(w, good());
+    assert!(found(&w).iter().any(|l| l.contains(
+        "does not run `cargo xtask pkg-image-asset --verify-only` on `dist/kbf-task-image-$GITHUB_SHA-linux-arm64.oci.tar`"
+    )));
+}
+
+/// Asserts that the lint names a Linux job whose task runner is not the static build: the
+/// target not added, the build not made for it, or no check that the binary links no library.
+#[test]
+fn the_task_binary_is_built_for_the_static_target_and_checked_to_be_static() {
+    for platform in PACKAGES {
+        let steps = task_steps(platform);
+        for (name, what) in [
+            (
+                "Task target",
+                "`rustup target add \"$STATIC_TARGET\"` in a step before",
+            ),
+            (
+                "Task build",
+                "a `cargo build` of kbf-task `--target \"$STATIC_TARGET\"` in a step before",
+            ),
+            (
+                "Task static",
+                "a `cargo xtask static-elf` check that kbf-task is statically linked in a step before",
+            ),
+        ] {
+            let start = steps
+                .find(&format!("      - name: {name}\n"))
+                .expect("step");
+            let end = start
+                + 1
+                + steps[start + 1..]
+                    .find("      - name:")
+                    .unwrap_or(steps.len() - start - 1);
+            let w = good().replacen(&steps, &format!("{}{}", &steps[..start], &steps[end..]), 1);
+            assert_ne!(w, good(), "{platform}: {name}");
+            let got = found(&w);
+            assert!(
+                got.iter().any(|l| l.contains(what)),
+                "{platform}: {name}: {got:?}"
+            );
+        }
+    }
+}

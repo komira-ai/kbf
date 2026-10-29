@@ -179,6 +179,15 @@ impl Backend for CachedStore {
         self.inner.put_stream(key, len, body).await
     }
 
+    async fn put_stream_hot_only(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        self.inner.put_stream_hot_only(key, len, body).await
+    }
+
     async fn put_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<String, Error> {
         let tag = self.inner.put_if_match(key, body, etag).await?;
         self.cache().drop_key(key);
