@@ -260,6 +260,12 @@ jobs:
       - run: rustup toolchain install
       - name: Add the static target kbf-task is built for
         run: rustup target add "$STATIC_TARGET"
+      # ring (through rustls) compiles C for the static target: its build looks for a musl C
+      # compiler, which the runner image does not have. `musl-tools` provides `musl-gcc`.
+      - name: Refresh the package lists for the musl C compiler
+        run: sudo apt-get update
+      - name: Install the musl C compiler ring's build uses for the static target
+        run: sudo apt-get install --yes --no-install-recommends musl-tools
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
@@ -281,6 +287,8 @@ jobs:
       - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-cli --bins
       - run: cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-host-install -p kbf-updater -p kbf-coordinator -p kbf-signer --bins
       - name: Build kbf-task for the static target
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo build --locked --release --target "$STATIC_TARGET" -p kbf-task --bin kbf-task
       # `tierstore` is built by itself: its binary needs the crate's `server` feature (`required-features`),
       # and `-p tierstore --bins` without it builds no binary and says nothing.
@@ -463,6 +471,12 @@ jobs:
       - run: rustup toolchain install
       - name: Add the static target kbf-task is built for
         run: rustup target add "$STATIC_TARGET"
+      # ring (through rustls) compiles C for the static target: its build looks for a musl C
+      # compiler, which the runner image does not have. `musl-tools` provides `musl-gcc`.
+      - name: Refresh the package lists for the musl C compiler
+        run: sudo apt-get update
+      - name: Install the musl C compiler ring's build uses for the static target
+        run: sudo apt-get install --yes --no-install-recommends musl-tools
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
@@ -484,6 +498,8 @@ jobs:
       - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-cli --bins
       - run: cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-host-install -p kbf-updater -p kbf-coordinator -p kbf-signer --bins
       - name: Build kbf-task for the static target
+        env:
+          CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo build --locked --release --target "$STATIC_TARGET" -p kbf-task --bin kbf-task
       # `tierstore` is built by itself, with its `server` feature (see linux-x86_64).
       - run: cargo build --locked --release --target "$TARGET" -p tierstore --features server --bin tierstore
