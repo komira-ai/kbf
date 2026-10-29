@@ -430,10 +430,11 @@ jobs:
   # clean's mutants added and slower test steps on the same runner type, passed every test
   # step up to the last and was cancelled at 45 (run 39688515489). The slot assertion and the
   # package steps were jobs of their own (about 4 and 3.5 minutes of tests) and are steps here,
-  # so one runner is taken for them instead of three: 75 plus those 8 minutes, rounded up.
+  # so one runner is taken for them instead of three. Recent passing runs took 51 to 71 minutes
+  # before the fold; 71 plus those 8 is 79, so 95 leaves room for a slow runner.
   native-macos:
     runs-on: macos-latest
-    timeout-minutes: 85
+    timeout-minutes: 95
     permissions:
       contents: read
     env:
@@ -575,6 +576,7 @@ jobs:
       # crates/kbf-mac-provision/tests/as_root.rs lists what it applies, asserts and
       # only reads). Last, because it changes this runner's settings.
       - run: cargo xtask sudo-test -p kbf-mac-provision --test as_root -- --test-threads=1 --nocapture
+        if: ${{ !cancelled() }}
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
