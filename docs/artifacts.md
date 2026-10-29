@@ -85,9 +85,14 @@ two tools above. Its tarball holds one member, the binary under its own name.
 one member, the binary under its own name, built for the musl target of the architecture, so it is
 statically linked: it needs no libc of the image it runs in, and a host installs the one file into the
 directory it mounts read-only into the images of the actions it runs (the action's own image, with
-`kbf-task` as the job's command). It is built and tested on a native runner of each architecture, which
-installs the target with `rustup target add`; the job runs `build-commit check` on the binary, which
-runs it, and refuses it unless `readelf` shows no interpreter and no needed library. The task image
+`kbf-task` as the job's command). On js-agent that directory is the agent's mount root `kbf-tools`:
+the job mounts its `kbf-task` read-only and runs `/mnt/kbf-tools/kbf-task`, and the farm's root
+certificate beside it (`farm-ca.der`) is given as `--root-der /mnt/kbf-tools/farm-ca.der`; the
+executor's job spec names these paths, and `kbf-task` takes every path as a flag. It is built and
+tested on a native runner of each architecture, which installs the target with `rustup target add` and
+`musl-tools` (ring compiles C for the target with `musl-gcc`); the job runs `build-commit check` on the
+binary, which runs it, and `cargo xtask static-elf`, which refuses it unless it has no program
+interpreter and no needed library. The task image
 carries the same file. It writes its pack with `kbf-task-pack` (`crates/kbf-task-pack`), the task pack types
 the frontend ingests with, a crate of pure Rust that does not link the pack index or the object store client.
 
