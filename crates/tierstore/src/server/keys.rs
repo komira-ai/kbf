@@ -71,7 +71,7 @@ impl fmt::Debug for AccessKey {
 }
 
 /// What a key may do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Role {
     /// Everything the front serves.
     Full,
@@ -79,8 +79,8 @@ pub(crate) enum Role {
     ReadOnly,
     /// A presigning key: one presigned `PUT`, as far as its grant goes (see `presign`).
     PresignPut,
-    /// A GC key: list, head and delete under one prefix, header-signed (see `gc`).
-    Gc,
+    /// A GC key: list, head and delete under this prefix, header-signed (see `gc`).
+    Gc(String),
 }
 
 impl Role {
@@ -91,12 +91,12 @@ impl Role {
     ///
     /// # Errors
     /// [`READ_ONLY`], for a read-only key and a call that is not a read.
-    pub(crate) fn permit(self, method: &Method) -> Result<(), Refusal> {
+    pub(crate) fn permit(&self, method: &Method) -> Result<(), Refusal> {
         let reads = matches!(*method, Method::GET | Method::HEAD);
-        match (self, reads) {
-            (Self::ReadOnly, false) => Err(READ_ONLY),
-            (Self::PresignPut, _) if *method != Method::PUT => Err(PUT_ONLY),
-            (Self::Gc, _) if !matches!(*method, Method::GET | Method::HEAD | Method::DELETE) => {
+        match self {
+            Self::ReadOnly if !reads => Err(READ_ONLY),
+            Self::PresignPut if *method != Method::PUT => Err(PUT_ONLY),
+            Self::Gc(_) if !matches!(*method, Method::GET | Method::HEAD | Method::DELETE) => {
                 Err(NOT_ALLOWED)
             }
             _ => Ok(()),
@@ -115,7 +115,8 @@ impl ServerConfig {
         if let Some(key) = found {
             return Some((key.secret.as_str(), Role::ReadOnly));
         }
-        self.gc_key(id).map(|key| (key.secret(), Role::Gc))
+        self.gc_key(id)
+            .map(|key| (key.secret(), Role::Gc(key.prefix().to_owned())))
     }
 }
 

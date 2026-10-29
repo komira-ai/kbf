@@ -314,3 +314,42 @@ async fn a_presigned_url_signed_with_a_gc_key_is_refused() {
     }
     assert_eq!(rig.get("cas/b/x", None).await.body, "CONTENT-OF-X");
 }
+
+/// Asserts that a call the GC key may not do is refused with 403 before its body is looked at: a
+/// put and a get of an object whose body fails when it is read, and a put with a declared length
+/// and a body over `--max-request-bytes`, are each 403, not 400 (the body), 413 (the limit) or
+/// 408 (a stalled body).
+#[tokio::test(start_paused = true)]
+async fn a_refused_gc_call_is_403_without_its_body_being_read() {
+    let rig = Rig::with(MEBIBYTE, |config| {
+        config.gc_keys = vec![GcKey::new(GC.0, GC.1, "cas/b/").unwrap()];
+        config.max_request_bytes = 4;
+    })
+    .await;
+    rig.cold_mem
+        .put("cas/b/x", bytes::Bytes::from_static(b"CONTENT-OF-X"))
+        .await
+        .unwrap();
+    let signed = |method: &str, key: &str, extra: &[(&str, &str)]| {
+        super::auth::sign_as(&rig.config, GC, method, &uri(key), extra, b"x")
+    };
+    for (method, key, extra) in [
+        ("PUT", "cas/b/new", &[][..]),
+        ("GET", "cas/b/x", &[][..]),
+        ("PUT", "cas/b/new", &[("content-length", "10")][..]),
+        ("POST", "cas/b/new?uploads", &[][..]),
+    ] {
+        let (parts, _) = signed(method, key, extra).into_parts();
+        let failing = super::testing::Scripted::new(vec![super::testing::Step::Fail]);
+        let reply = rig
+            .send_raw(hyper::Request::from_parts(parts, failing))
+            .await;
+        assert_eq!(denied(&reply), access_denied(), "{method} {key} {extra:?}");
+        assert!(!reply.body.contains("CONTENT-OF-X"));
+    }
+    let (parts, _) = signed("PUT", "cas/b/new", &[("content-length", "10")]).into_parts();
+    let long = http_body_util::Full::new(bytes::Bytes::from(vec![9_u8; 10]));
+    let reply = rig.send_raw(hyper::Request::from_parts(parts, long)).await;
+    assert_eq!(denied(&reply), access_denied());
+    assert!(rig.hot_mem.list("cas/").await.unwrap().is_empty());
+}

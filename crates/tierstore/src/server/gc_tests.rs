@@ -39,6 +39,8 @@ fn a_gc_key_file_has_a_prefix_ending_in_a_slash_and_is_private() {
     assert_eq!((read.id(), read.prefix()), ("pack-gc", "cas/b/"));
     let bad = [
         ("noslash", json("cas/b")),
+        ("slash", json("/")),
+        ("leading", json("/cas/b/")),
         ("empty", json("")),
         ("reserved", json("_journal/")),
         ("dots", json("cas/../")),
@@ -154,6 +156,10 @@ fn a_gc_key_needs_a_plain_id_and_a_secret() {
         );
     }
     assert!(GcKey::new("pack-gc", SECRET, "cas/b/").is_ok());
+    for prefix in ["/", "/cas/b/", "cas/b", ""] {
+        let made = GcKey::new("pack-gc", SECRET, prefix);
+        assert!(matches!(made, Err(PresignError::Key(_))), "{prefix:?}");
+    }
 }
 
 /// Asserts that a key or a list prefix that starts with the prefix of the key but is not a valid

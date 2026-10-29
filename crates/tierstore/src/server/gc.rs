@@ -16,15 +16,23 @@
 //!
 //! - ListObjectsV2 with a `prefix` parameter inside the prefix of the key (a list with no prefix,
 //!   or one outside, is refused and not filtered), and ListMultipartUploads (`GET ?uploads`) with
-//!   such a prefix;
+//!   such a prefix (authorized here; the front serves it once ListMultipartUploads is built, and
+//!   answers 501 until then);
 //! - HeadObject;
 //! - DeleteObject, and AbortMultipartUpload of an upload of such a key.
 //!
-//! Everything else is `403 AccessDenied` before the body is read: GetObject (a GC key never reads
+//! Everything else is `403 AccessDenied`, answered before the body is read: GetObject (a GC key never reads
 //! a body), every `PUT` and `POST` (put, part, start and completion of an upload, copy), the calls
 //! on the bucket itself, and every key under `_journal/` or `_tiering/`. The key is refused
 //! on a presigned URL (the URL's key must be a presigning key), as a presigning key is refused in
 //! the header.
+//!
+//! The refusals come in this order, none of them after the body is read: the signature and the key
+//! id (403 or the signature errors), then the method (a `PUT` or `POST` is refused at once), then
+//! the path and query are decoded (a bad encoding is 400, an unknown bucket 404), then the checksum
+//! headers of the request are read (400 or 501), and last the key or list prefix is held to the
+//! prefix of the key. So a call that is both refused and malformed may be answered with the
+//! malformed-request error rather than 403.
 //!
 //! A delete through the proxy removes the object from both tiers and journals the delete, as for
 //! any key. **A delete by a GC key is not create-only: it is the only way an object leaves

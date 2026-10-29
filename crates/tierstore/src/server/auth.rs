@@ -85,8 +85,6 @@ pub(crate) struct Signed {
     pub(crate) role: Role,
     /// What a presigned URL is limited to, if it was signed by a presigning key.
     pub(crate) presign: Option<Grant>,
-    /// The prefix a GC key is limited to, if the request was signed by one.
-    pub(crate) gc: Option<String>,
 }
 
 impl From<Refusal> for S3Error {
@@ -264,18 +262,10 @@ pub(crate) fn verify(config: &ServerConfig, parts: &Parts) -> Result<Signed, Ref
     if signature.is_none_or(|tag| mac.verify_slice(&tag).is_err()) {
         return Err(MISMATCH);
     }
-    let gc = (role == Role::Gc)
-        .then(|| {
-            config
-                .gc_key(auth.key_id)
-                .map(|key| key.prefix().to_owned())
-        })
-        .flatten();
     Ok(Signed {
         payload: payload.to_owned(),
         role,
         presign: None,
-        gc,
     })
 }
 

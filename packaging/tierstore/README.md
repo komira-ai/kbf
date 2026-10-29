@@ -125,7 +125,8 @@ and is longer than it:
 
 | call | allowed |
 |---|---|
-| ListObjectsV2, ListMultipartUploads | with a `prefix` inside the key's; a list with no prefix or another is 403, not filtered |
+| ListObjectsV2 | with a `prefix` inside the key's; a list with no prefix or another is 403, not filtered |
+| ListMultipartUploads | authorized the same way, but served once ListMultipartUploads lands; the front answers 501 until then |
 | HeadObject | yes |
 | DeleteObject | yes: from both tiers, journaled as for any delete |
 | AbortMultipartUpload | of an upload of such a key |
@@ -133,7 +134,10 @@ and is longer than it:
 | put, part, start or completion of an upload, copy, CreateBucket, HeadBucket | no |
 | `_journal/`, `_tiering/`, any key outside the prefix, the prefix itself | no |
 
-A refused call is 403 `AccessDenied` before its body is read. A delete by a GC key is not
+A call the key may not do is refused with 403 `AccessDenied` without its body being read. The
+refusals are made in this order: the signature and key id, the method, the decoding of the path and
+query (400, or 404 for an unknown bucket), the checksum headers (400 or 501), and last the key or
+list prefix; so a call that is both refused and malformed may get the malformed-request error. A delete by a GC key is not
 create-only; it is the only way an object leaves the prefix that presigned PUTs write.
 
 ## Filling in the flags

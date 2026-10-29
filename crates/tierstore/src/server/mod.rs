@@ -217,6 +217,7 @@ use crate::{Backend, Clock, MonotonicClock};
 
 pub use gc::GcKey;
 pub use keys::AccessKey;
+use keys::Role;
 pub use presign::{Grant, PresignKey, PresignRequest, presign_put};
 
 use idle::Watched;
@@ -661,7 +662,7 @@ impl Server {
         }
         let data = matches!((&parts.method, &target), (&Method::PUT, Target::Object(_)));
         let check = Check::new(&signed.payload, &parts.headers, data)?;
-        if let Some(prefix) = &signed.gc {
+        if let Role::Gc(prefix) = &signed.role {
             gc::permit(prefix, parts, &target, &query)?;
         }
         let limit = self.config.max_request_bytes;
