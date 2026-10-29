@@ -332,7 +332,8 @@ jobs:
         env:
           JS_RUN: ${{ steps.js-run.outcome }}
           JS_DISK: ${{ steps.js-disk.outcome }}
-        run: echo "js core run: $JS_RUN (disk guard: $JS_DISK)" >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          echo "js core run: $JS_RUN (disk guard: $JS_DISK)" >> "$GITHUB_STEP_SUMMARY"
       # REPORT ONLY until the flip PR (W): one llvm-cov report over the legacy and the js run,
       # then the kbf-coverage table on it. The lines under cfg(feature = "farm-core-js") exist
       # only in the js build; llvm-cov merges the profiles of every binary, so each line counts
