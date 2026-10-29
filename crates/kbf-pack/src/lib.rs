@@ -37,6 +37,7 @@ mod error;
 mod keys;
 mod packer;
 mod reader;
+mod sweep;
 
 pub use adopt::{
     AdoptConfig, AdoptError, AdoptMode, AdoptReport, AdoptRun, Adopter, CHECKPOINT_EVERY,
@@ -50,3 +51,6 @@ pub use packer::{
     Blob, FRONTEND_PACK_BYTES, Packed, Packer, PackerConfig, StoredPack, check_create_only,
 };
 pub use reader::{DEFAULT_CONCURRENCY, DEFAULT_GAP, Fetch, Reader, ReaderConfig};
+pub use sweep::{
+    DEFAULT_GRACE, SWEPT_PREFIX, SweepConfig, SweepError, SweepGates, SweepReport, Sweeper,
+};
