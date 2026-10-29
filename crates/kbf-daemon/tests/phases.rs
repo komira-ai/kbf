@@ -73,6 +73,7 @@ impl Farm {
             learned_sizes: kbf_server::LearnedSizes::Off,
             scheduler_core: kbf_server::SchedulerCore::under_test(),
             placement_load: kbf_server::PlacementLoad::Off,
+            placement_predictions: kbf_server::PlacementPredictions::Off,
             whole_node: None,
             finished_retention: Duration::from_secs(60),
             shutdown_timeout: Duration::from_secs(10),
