@@ -16,13 +16,12 @@
 #    `kbf_scheduler_core{core="js"} 1` on /metrics, before the builds and after them
 #    (`--expect-scheduler-core js`), so it cannot pass on the legacy driver by accident.
 #
-# Red until the flip is proven. The js core's hot path is on main (komira-ai/kbf#1870, #1875,
-# #1877) and so is the frontend's acceptance of `--scheduler-core` with the core logged from
-# the driver (komira-ai/kbf#1886); this gate says what still stops the flip. Run it on a head,
-# read the first failing step of the job log: the start line (`scheduler core: js`), the gauge
-# check (`kbf_scheduler_core{core="js"} 1`), then the M1 scenario steps. The same cell without
-# any of these flags (legacy core, no core check) passes with kbf in frontend mode, so the
-# layout itself is not what is red. This workflow changes no server code.
+# Green on main. The js core's hot path (komira-ai/kbf#1870, #1875, #1877) and the frontend's
+# acceptance of `--scheduler-core`, with the core logged from the driver (komira-ai/kbf#1886),
+# are on main, and this gate passes with them. If it goes red, read the first failing step of
+# the job log: the start line (`scheduler core: js`), the gauge check
+# (`kbf_scheduler_core{core="js"} 1`), then the M1 scenario steps. This workflow changes no
+# server code.
 #
 # A second, optional leg runs the same cell with `--placement-load=on` added (matrix entry
 # `load: on`, job name "m1-cell-js (placement load, optional)"). It is `continue-on-error`, so
@@ -39,32 +38,43 @@
 # same core would fail for the same reason as this one. `m1-cell` in beta.yml keeps running
 # `kbf-server` on the legacy core.
 #
-# Not part of the pipeline yet, on purpose. A job of beta.yml or of pipeline.yml that is red
-# stops every release (no `continue-on-error` is allowed in either: tests/beta_succeeds,
-# tests/pipeline_workflow), and the fix-forward path must not wait on a change that is not
-# here. So this workflow is a check of its own: it runs for a pull request or a push to main that
-# touches the flip path (js-core-gate-pr.yml, which calls this file), or by hand, and it is
-# listed in release/stages.yml as a job of the beta stage so the stage lint keeps it honest.
+# Not a stage of the pipeline yet, on purpose: the flip (the change that makes the js core the
+# farm's default) makes it one. Until then it is a check of its own: js-core-gate-pr.yml calls
+# it for every pull request (no path filter, so the check can be required) and by hand.
 #
-# The flip (the change that makes the js core the farm's default) makes it release-blocking
-# without losing the pull-request check:
+# What the pipeline is now (tests/pipeline_workflow): the jobs are ci, beta, artifacts, smoke,
+# watch, passed. The stages are ci and beta (neither needs anything), artifacts (needs ci) and
+# smoke (needs artifacts); `passed` needs exactly the stages and `watch` ends at
+# `--last-job passed`. In release/stages.yml beta.yml is the stage `suite`, smoke the stage
+# `beta`. Every called stage workflow is called by pipeline.yml alone (each_check_once), and
+# every one but beta.yml and smoke.yml keeps `pull_request` and `merge_group` triggers.
+# Because of that, js-core-gate-pr.yml cannot stay a second caller of this file once the
+# pipeline calls it. The flip is therefore:
 #
-#   - pipeline.yml gains, after `beta`, the caller job
+#   - This file takes the triggers `pull_request`, `merge_group` and `workflow_call`, and
+#     js-core-gate-pr.yml is deleted. The pull-request check is then the job of this file
+#     itself, `m1-cell-js`, and it is the required status check of main (replacing
+#     `gate / m1-cell-js`). Its concurrency group must not start with `pipeline-`.
+#   - pipeline.yml gains, beside ci and beta (it needs nothing, like beta, so it starts at
+#     once and the hour of source tests is not lengthened):
 #       js-core-gate:
-#         needs: [beta]
 #         uses: ./.github/workflows/js-core-gate.yml
 #         permissions:
 #           contents: read
-#     (`needs: [beta]` because the pipeline lint requires each job to need exactly the one
-#     before it, and its jobs to be exactly ci, artifacts, beta, js-core-gate; each job also
-#     needs its own permissions block, which is `contents: read` here).
-#   - release/stages.yml gains the row `pipeline.yml#js-core-gate`, stage beta.
-#   - tests/pipeline_workflow (mod.rs: JOBS, STAGES, Files, called, each_check_once; tests.rs:
-#     real, plant, and a case for the new job) learns the fourth stage. The ready-to-apply diff
-#     is in the description of komira-ai/kbf#1867.
-#   - js-core-gate-pr.yml is NOT deleted. It stays, and its check `gate / m1-cell-js` is made a
-#     required status check of main next to the pipeline job, so a pull request still runs the
-#     gate before it merges (the pipeline only runs after a push to main).
+#     placed after `beta`, so JOBS is [ci, beta, js-core-gate, artifacts, smoke, watch,
+#     passed]; `passed` is `needs: [ci, beta, js-core-gate, artifacts, smoke]`.
+#   - release/stages.yml: the row `pipeline.yml#js-core-gate`, stage suite; the comment above
+#     `js-core-gate.yml#m1-cell-js` stops saying the pipeline does not call it.
+#   - tests/pipeline_workflow: mod.rs gets JOBS and STAGES (`("js-core-gate",
+#     "js-core-gate.yml", None)`) with seven and five entries, a `js_core_gate` field in
+#     Files and in `Files::called`; tests.rs `real()` lists js-core-gate.yml among its own
+#     files (not `others`) and the `passed` plants name the new list. `called()` already
+#     expects `pull_request` and `merge_group` on every stage that is not beta.yml or
+#     smoke.yml, which is what this file gets. Tests: one that the job needs nothing, one
+#     that dropping it from `passed` is refused, one that a second caller (a restored
+#     js-core-gate-pr.yml) is refused.
+#   - The optional `load: on` leg keeps `continue-on-error`: the lint reads pipeline.yml and
+#     tests/beta_succeeds reads beta.yml, not this file. Decide then whether it stays.
 #
 # Same hosted-runner, pinning and permission rules as the other workflows
 # (crates/kbf-integration-test/tests/repo_lints.rs). The pins are copies of m1-cell's.

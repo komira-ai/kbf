@@ -1,41 +1,23 @@
 # Runs js-core-gate.yml (the end-to-end gate for the farm's flip onto the jobscheduler core) for
-# a pull request or a push to main that touches what the flip path is made of, and by hand. It
-# is a check of its own and not a stage of the release pipeline: it is red until the change that
-# lets release builds start with `--scheduler-core js` lands, and a red stage job would stop
-# every release. js-core-gate.yml says how the flip makes the gate release-blocking; this file
-# stays after that, as the pull-request check (job `gate`, check `gate / m1-cell-js`).
+# every pull request, and by hand. It is a check of its own and not a stage of the release
+# pipeline: the pipeline lint (tests/pipeline_workflow) pins the pipeline's jobs, and this file
+# is the second caller of js-core-gate.yml that it would refuse once the pipeline calls the gate.
+# js-core-gate.yml says how the flip replaces this file.
+#
+# No `paths:` filter, on purpose. This check is to be a required status check of main, and a
+# path-filtered workflow never starts for a pull request outside its paths, which leaves a
+# required check pending and blocks that pull request for good. The gate depends on most of the
+# workspace (kbf-server and kbf-cli pull in the estimator, map, mapsync, proto, raft, route,
+# state, storage, pack and peer crates, among others), so a filter would also miss changes that
+# can break it.
+#
+# No `push: main` trigger. Every change reaches main through a pull request that ran this check,
+# a run per push would repeat a 45 minute job for nothing, and after the flip the pipeline calls
+# the gate on main itself.
 name: js-core-gate-pr
 
 on:
   pull_request:
-    paths:
-      - crates/kbf-server/**
-      - Cargo.toml
-      - Cargo.lock
-      - crates/kbf-front/**
-      - crates/kbf-sched/**
-      - crates/kbf-daemon/**
-      - crates/kbf-cli/**
-      - crates/kbf-testkit/**
-      - crates/kbf-integration-test/**
-      - rust-toolchain.toml
-      - .github/workflows/js-core-gate.yml
-      - .github/workflows/js-core-gate-pr.yml
-  push:
-    branches: [main]
-    paths:
-      - crates/kbf-server/**
-      - Cargo.toml
-      - Cargo.lock
-      - crates/kbf-front/**
-      - crates/kbf-sched/**
-      - crates/kbf-daemon/**
-      - crates/kbf-cli/**
-      - crates/kbf-testkit/**
-      - crates/kbf-integration-test/**
-      - rust-toolchain.toml
-      - .github/workflows/js-core-gate.yml
-      - .github/workflows/js-core-gate-pr.yml
   workflow_dispatch:
 
 permissions: {}

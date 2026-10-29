@@ -131,8 +131,8 @@ jobs:
     stage: suite
   - job: beta.yml#mixed-version
     stage: suite
-  # Red until the change that makes the js core the farm's default lands, so it is a check of its own (js-core-gate-pr.yml calls it) and
-  # pipeline.yml does not call it yet; that change adds `pipeline.yml#js-core-gate` (js-core-gate.yml says how).
+  # Green, and a check of its own until the change that makes the js core the farm's default lands (js-core-gate-pr.yml calls it for
+  # pull requests); pipeline.yml does not call it yet. That change adds `pipeline.yml#js-core-gate` (js-core-gate.yml says how).
   - job: js-core-gate.yml#m1-cell-js
     stage: suite
   - job: release.yml#plan
