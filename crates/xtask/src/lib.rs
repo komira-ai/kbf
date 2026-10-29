@@ -93,6 +93,8 @@
 //!   GitHub refuses the cancel.
 //! - `runner-disk --path <path> --min-free-gb <n>` ([`runner_disk`]): exit 1 naming the disk
 //!   when the disk of `<path>` has less free space than the coverage run needs.
+//! - `static-elf <binary>` ([`static_elf`]): exit 1 unless the ELF64 binary is statically
+//!   linked: no `PT_INTERP` program header and no `DT_NEEDED` entry.
 //! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
 //!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
 //!   unit.
@@ -138,6 +140,7 @@ pub mod pkg_version;
 pub mod prove_farm;
 pub mod release;
 pub mod runner_disk;
+pub mod static_elf;
 pub mod sudo_test;
 pub mod sums;
 pub mod version_facts;
@@ -201,6 +204,9 @@ enum Verb {
     ProveFarm(prove_farm::Args),
     /// Check that the runner's disk has the room the coverage run needs.
     RunnerDisk(runner_disk::Args),
+    /// Refuse a binary that has a dynamic loader (`PT_INTERP`) or a needed shared library
+    /// (`DT_NEEDED`).
+    StaticElf(static_elf::Args),
     /// Cancel the pipeline run when one of its jobs has failed, so its other jobs stop.
     PipelineWatch(pipeline_watch::Args),
     /// Refuse a row the budget file gains against `--base`.
@@ -1017,6 +1023,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::DeployFarm(args) => deploy_farm::run(&args),
         Verb::ProveFarm(args) => prove_farm::run(&args),
         Verb::RunnerDisk(args) => runner_disk::run(&args),
+        Verb::StaticElf(args) => static_elf::run(&args),
         Verb::PipelineWatch(args) => pipeline_watch::run(&args),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::SourceDateEpoch { commit, output } => {

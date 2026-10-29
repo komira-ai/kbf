@@ -440,7 +440,7 @@ fn the_task_binary_is_built_for_the_static_target_and_checked_to_be_static() {
             ),
             (
                 "Task static",
-                "a `readelf` check that kbf-task is statically linked in a step before",
+                "a `cargo xtask static-elf` check that kbf-task is statically linked in a step before",
             ),
         ] {
             let start = steps

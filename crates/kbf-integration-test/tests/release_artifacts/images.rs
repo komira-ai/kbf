@@ -290,9 +290,9 @@ fn build_job(
             out,
         );
         earlier(
-            "a `readelf` check that kbf-task is statically linked",
+            "a `cargo xtask static-elf` check that kbf-task is statically linked",
             first(&steps, 0, |l| {
-                l.contains("readelf") && l.contains(service.binary)
+                l.starts_with("cargo xtask static-elf ") && l.contains(service.binary)
             }),
             out,
         );

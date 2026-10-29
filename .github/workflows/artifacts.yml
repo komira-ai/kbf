@@ -291,7 +291,7 @@ jobs:
       - name: kbf-task names the commit
         run: cargo xtask build-commit check "target/$STATIC_TARGET/release/kbf-task" "$GITHUB_SHA"
       - name: kbf-task is statically linked
-        run: test "$(readelf -lWd "target/$STATIC_TARGET/release/kbf-task" | grep -c -e INTERP -e NEEDED || true)" = 0
+        run: cargo xtask static-elf "target/$STATIC_TARGET/release/kbf-task"
       - name: kbf names the commit and a release build
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
       # What kbf says it is, kept as an asset (the darwin kbf cannot be run here, so every platform's job does).
@@ -493,7 +493,7 @@ jobs:
       - name: kbf-task names the commit
         run: cargo xtask build-commit check "target/$STATIC_TARGET/release/kbf-task" "$GITHUB_SHA"
       - name: kbf-task is statically linked
-        run: test "$(readelf -lWd "target/$STATIC_TARGET/release/kbf-task" | grep -c -e INTERP -e NEEDED || true)" = 0
+        run: cargo xtask static-elf "target/$STATIC_TARGET/release/kbf-task"
       - name: kbf names the commit and a release build
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
       # What kbf says it is, kept as an asset (see linux-x86_64).
