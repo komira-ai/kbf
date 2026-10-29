@@ -343,6 +343,30 @@ async fn sdk_region_and_encoding_type_are_what_the_front_refuses() {
     assert_eq!(refusal(encoded), (501, "NotImplemented".to_owned()));
 }
 
+/// Asserts that `x-id` is the one name the front's list of query parameters gained: a put with
+/// `x-id` and a parameter it still does not know (`acl`) is refused 501 `NotImplemented`, and
+/// stores nothing.
+#[tokio::test]
+async fn sdk_x_id_does_not_let_an_unknown_parameter_through() {
+    let h = serving().await;
+    let sdk = client(&h);
+    let sent = sdk
+        .put_object()
+        .bucket(BUCKET)
+        .key("out/acl")
+        .body(ByteStream::from_static(b"x"))
+        .customize()
+        .mutate_request(|request| {
+            let uri = format!("{}&acl", request.uri());
+            request.set_uri(uri).unwrap();
+        })
+        .send()
+        .await;
+    assert_eq!(refusal(sent), (501, "NotImplemented".to_owned()));
+    let kept = sdk.head_object().bucket(BUCKET).key("out/acl").send().await;
+    assert!(kept.unwrap_err().into_service_error().is_not_found());
+}
+
 /// Asserts why the settings turn flexible checksums off: with the SDK's defaults, a put whose
 /// body is a file, which the SDK sends with a trailing checksum in an aws-chunked body, is
 /// refused with 501 `NotImplemented`, and nothing is stored.
