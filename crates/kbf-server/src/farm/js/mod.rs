@@ -246,6 +246,17 @@ impl JsFarm {
         self.settings = settings.clone();
     }
 
+    /// Sets the cap on the records the core holds for a store that refuses them, on the core
+    /// as it is. [`JsFarm::rebuild`] would take a core over a store up again from the store,
+    /// and lose what it holds only in memory: the records held back, which the cap counts.
+    /// The core takes the cap by value, so a bare core stands in for it meanwhile.
+    pub(crate) fn set_held_cap(&mut self, settings: &Settings) {
+        let stand_in = self.opening(settings, self.term).bare();
+        let core = std::mem::replace(&mut self.core, stand_in);
+        self.core = core.with_held_cap(settings.held_cap);
+        self.settings = settings.clone();
+    }
+
     /// Takes `state` over: builds the core over its store, which decides the epoch. Returns
     /// the epoch the core opened under, which is the farm's term and lease epoch from now on;
     /// `None` for no store.
