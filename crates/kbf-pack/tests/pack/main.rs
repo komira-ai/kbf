@@ -8,3 +8,6 @@ mod keys;
 mod packer;
 mod reader;
 mod support;
+mod task_key;
+mod task_manifest;
+mod task_pack;
