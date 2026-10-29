@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -58,6 +58,7 @@ pub struct Spy {
     reject_puts: AtomicU32,
     reject_reads: AtomicU32,
     reject_lens: AtomicU32,
+    shave_len: AtomicU64,
     puts: AtomicU32,
     ranges: Mutex<Vec<(String, u64, u64)>>,
 }
@@ -93,6 +94,7 @@ impl Spy {
             reject_puts: AtomicU32::new(0),
             reject_reads: AtomicU32::new(0),
             reject_lens: AtomicU32::new(0),
+            shave_len: AtomicU64::new(0),
             puts: AtomicU32::new(0),
             ranges: Mutex::new(Vec::new()),
         }
@@ -111,6 +113,12 @@ impl Spy {
     /// The next `n` length questions fail.
     pub fn reject_lens(&self, n: u32) {
         self.reject_lens.store(n, SeqCst);
+    }
+
+    /// Every length answer is `by` bytes short of the object's: the store says an object is
+    /// shorter than it is.
+    pub fn understate_len(&self, by: u64) {
+        self.shave_len.store(by, SeqCst);
     }
 
     /// How many writes were tried.
@@ -190,7 +198,9 @@ impl ObjectStore for Spy {
         if fires(&self.reject_lens) {
             return Err(injected());
         }
-        self.inner.len(key).await
+        let shave = self.shave_len.load(SeqCst);
+        let len = self.inner.len(key).await?;
+        Ok(len.map(|len| len.saturating_sub(shave)))
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {

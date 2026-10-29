@@ -1,8 +1,7 @@
 //! `ingest`: the pack a task wrote under a key the frontend minted is read from the object store,
 //! hashed to the last byte, checked against the manifest at its offset 0, and turned into an
 //! action result that is written to the action cache only when the action ran cacheably and exited 0.
-//! And the minting of the key (`PackKeyMint`): a key is the frontend's HMAC over the lease, the
-//! action and the minute, so a key it did not mint is refused before the store is asked.
+//! The minting of the key (`PackKeyMint`) is in `untrusted_mint`.
 //!
 //! The store is an in-memory object store that logs every range it is asked for, the index is an
 //! in-memory pack index, and the action cache is a real storage node behind the frontend, read
@@ -12,8 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use kbf_front::{
-    Backend, Ingested, IssuedPackKey, MIN_SECRET_BYTES, MintError, PackKeyMint, RejectReason,
-    UntrustedLimits, ingest,
+    Backend, Ingested, IssuedPackKey, PackKeyMint, RejectReason, UntrustedLimits, ingest,
 };
 use kbf_pack::{
     EMPTY_DIGEST, OutputDirectory, OutputFile, OutputSymlink, TaskManifest, Timing, Usage,
@@ -30,8 +28,8 @@ use tonic::Code;
 
 use crate::support::{Rig, blob, update};
 
-const LEASE: &str = "00000000000000010000000000000002";
-const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
+pub(crate) const LEASE: &str = "00000000000000010000000000000002";
+pub(crate) const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 /// A minute boundary: 29833334 minutes after the epoch.
 const NOW_SECS: u64 = 1_790_000_040;
 
@@ -39,7 +37,7 @@ const OBJECT: &str = "object code of the action";
 const STDOUT: &str = "compiling\n";
 const IN_DIR: &str = "a file inside the output directory";
 
-fn now() -> SystemTime {
+pub(crate) fn now() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(NOW_SECS)
 }
 
@@ -100,6 +98,17 @@ fn patch_count(pack: &mut [u8], count: u32) {
     pack[at..at + 4].copy_from_slice(&count.to_le_bytes());
 }
 
+/// The bytes of an Action that says `do_not_cache` as given.
+fn action_bytes(do_not_cache: bool) -> Bytes {
+    let action = reapi::Action {
+        command_digest: Some(wire(&blob("the command").0)),
+        input_root_digest: Some(wire(&blob("the inputs").0)),
+        do_not_cache,
+        ..reapi::Action::default()
+    };
+    Bytes::from(action.encode_to_vec())
+}
+
 /// The frontend with packs, a mint, the Action of the lease and the key issued for it.
 struct Farm {
     rig: Rig,
@@ -116,13 +125,7 @@ impl Farm {
 
     /// A farm whose Action says `do_not_cache`.
     async fn of(do_not_cache: bool) -> Self {
-        let action = reapi::Action {
-            command_digest: Some(wire(&blob("the command").0)),
-            input_root_digest: Some(wire(&blob("the inputs").0)),
-            do_not_cache,
-            ..reapi::Action::default()
-        };
-        Self::with_action(Bytes::from(action.encode_to_vec())).await
+        Self::with_action(action_bytes(do_not_cache)).await
     }
 
     /// A farm whose Action blob is `bytes`, whatever they are.
@@ -135,8 +138,16 @@ impl Farm {
         Self::build(Bytes::from_static(b"an action nobody stored"), false).await
     }
 
+    /// A farm over a store that replaces an object it holds (a task that writes again).
+    async fn replacing() -> Self {
+        Self::over(Rig::replacing().await, action_bytes(false), true).await
+    }
+
     async fn build(bytes: Bytes, store: bool) -> Self {
-        let rig = Rig::new().await;
+        Self::over(Rig::new().await, bytes, store).await
+    }
+
+    async fn over(rig: Rig, bytes: Bytes, store: bool) -> Self {
         let action = sha256(&bytes);
         if store {
             let stored = update(&rig.front, &[(action, bytes)]).await;
@@ -723,7 +734,115 @@ async fn a_manifest_naming_a_digest_outside_the_pack_is_incomplete() {
         let got = farm.ingest().await;
 
         farm.rejected(got, reason).await;
+        farm.nothing_indexed();
     }
+}
+
+/// Asserts that a digest held in the pack under another size is not held: a file, a stdout, a
+/// tree, and a file a tree names, each given the size of the record plus one with the hash of the
+/// record, are `Incomplete` and nothing is indexed. Catches a held set keyed by hash alone.
+#[tokio::test]
+async fn a_digest_held_under_another_size_is_incomplete() {
+    let one_more = |digest: Digest| Digest {
+        size_bytes: digest.size_bytes + 1,
+        ..digest
+    };
+    let (object, stdout, in_dir) = (blob(OBJECT).1, blob(STDOUT).1, blob(IN_DIR).1);
+    let probe = Farm::new().await;
+    let tree = probe.tree().1;
+    let mut file = probe.manifest(0);
+    file.output_files[0].digest = one_more(blob(OBJECT).0);
+    let mut out = probe.manifest(0);
+    out.stdout = Some(one_more(blob(STDOUT).0));
+    let mut dir = probe.manifest(0);
+    dir.output_directories[0].tree = one_more(probe.tree().0);
+    let lying = tree_of(&[one_more(blob(IN_DIR).0)]);
+    let mut inner = probe.manifest(0);
+    for dir in &mut inner.output_directories {
+        dir.tree = lying.0;
+    }
+    let cases = [
+        (file, tree.clone()),
+        (out, tree.clone()),
+        (dir, tree),
+        (inner, lying.1),
+    ];
+    for (manifest, tree) in cases {
+        let farm = Farm::new().await;
+        let blobs: [&[u8]; 4] = [&object, &stdout, &tree, &in_dir];
+        farm.put(&write_pack(&manifest, &blobs).expect("a pack"))
+            .await;
+
+        let got = farm.ingest().await;
+
+        farm.rejected(got, RejectReason::Incomplete).await;
+        farm.nothing_indexed();
+    }
+}
+
+/// Asserts that a different object under a key already recorded is refused as `WrongKey` (the
+/// commit's conflict) and that the first pack stays what the index says: a task that writes its
+/// key again, with another result, cannot change what was recorded. Catches a replay accepted
+/// because the key is the same.
+#[tokio::test]
+async fn another_object_under_a_recorded_key_is_wrong_key() {
+    let farm = Farm::replacing().await;
+    farm.put(&farm.pack(0)).await;
+    let first = farm.ingest().await;
+    assert!(matches!(first, Ingested::Ran { .. }), "{first:?}");
+
+    farm.put(&farm.pack(3)).await;
+    let got = farm.ingest().await;
+
+    assert_eq!(got, Ingested::Reject(RejectReason::WrongKey));
+    let metrics = farm.rig.packs.metrics();
+    assert_eq!(metrics.ingest_rejects(RejectReason::WrongKey), 1);
+    assert_eq!(metrics.ingests(), 1);
+}
+
+/// Asserts that an object longer than the store's length said (the length is read first, the
+/// object grows after it) is `Missing`, the commit's answer for a pack that is not as long as it
+/// was said to be, and indexes nothing: the extra byte is found by the commit's read of one byte
+/// past the trailer.
+#[tokio::test]
+async fn an_object_longer_than_its_length_said_is_missing() {
+    let farm = Farm::new().await;
+    let mut bytes = farm.pack(0);
+    bytes.push(0);
+    farm.put(&bytes).await;
+    farm.rig.store.understate_len(1);
+
+    let got = farm.ingest().await;
+
+    farm.rejected(got, RejectReason::Missing).await;
+    farm.nothing_indexed();
+}
+
+/// Asserts that an output path with a `..` component, which no honest task writes, is a
+/// `BadManifest` and indexes nothing: the manifest is parsed by `TaskManifest::parse`, which
+/// refuses it, so the path never reaches the action result.
+#[tokio::test]
+async fn an_output_path_with_a_parent_component_is_a_bad_manifest() {
+    let farm = Farm::new().await;
+    let json = farm.manifest(0).to_json().expect("json");
+    let text = String::from_utf8(json).expect("utf8");
+    let dotted = text.replace("out/a.txt", "out/../a.txt");
+    assert_ne!(dotted, text, "the path was replaced");
+    let (object, stdout) = (blob(OBJECT).1, blob(STDOUT).1);
+    let (tree, in_dir) = (farm.tree().1, blob(IN_DIR).1);
+    farm.put(&segment_of(&[
+        dotted.as_bytes(),
+        &object,
+        &stdout,
+        &tree,
+        &in_dir,
+    ]))
+    .await;
+
+    let got = farm.ingest().await;
+
+    farm.rejected(got, RejectReason::BadManifest).await;
+    farm.nothing_indexed();
 }
 
 /// Asserts that a store or an index that fails is `Unavailable`, counted as neither a refusal nor
@@ -790,102 +909,4 @@ async fn ingests_are_scraped_by_reason() {
     assert!(after.contains("kbf_pack_ingests_total 1\n"), "{after}");
     let line = "kbf_pack_ingest_rejects_total{reason=\"missing\"} 1\n";
     assert!(after.contains(line), "{after}");
-}
-
-fn mint() -> PackKeyMint {
-    PackKeyMint::new(SECRET).expect("a mint")
-}
-
-fn action() -> Digest {
-    blob("an action").0
-}
-
-/// Asserts that minting is deterministic and that each input changes the key: the lease, the
-/// action, the minute and the secret; and that two times in one minute are one key.
-#[test]
-fn minting_is_deterministic_and_each_input_changes_the_key() {
-    let key = |mint: &PackKeyMint, lease: &str, action: &Digest, at: SystemTime| {
-        mint.mint(lease, action, at)
-            .expect("a key")
-            .key()
-            .to_owned()
-    };
-    let base = key(&mint(), LEASE, &action(), now());
-
-    assert_eq!(base, key(&mint(), LEASE, &action(), now()));
-    let same_minute = now() + Duration::from_secs(59);
-    assert_eq!(base, key(&mint(), LEASE, &action(), same_minute));
-    let next_minute = now() + Duration::from_secs(60);
-    let other_secret = PackKeyMint::new(&[9; 32]).expect("a mint");
-    let changed = [
-        key(&mint(), "another", &action(), now()),
-        key(&mint(), LEASE, &blob("other").0, now()),
-        key(&mint(), LEASE, &action(), next_minute),
-        key(&other_secret, LEASE, &action(), now()),
-    ];
-    for other in &changed {
-        assert_ne!(&base, other);
-    }
-    assert!(base.starts_with(&format!("cas/b/{LEASE}/")), "{base}");
-    assert!(base.ends_with("-0"), "{base}");
-}
-
-/// Asserts that a minted key verifies and says the minute it was minted in (the start of it), and
-/// that a key with another action, another secret or a changed MAC does not verify, nor does a key
-/// of another shape. Catches a verification that compares less than the whole MAC.
-#[test]
-fn a_minted_key_verifies_and_names_its_minute() {
-    let key = mint()
-        .mint(LEASE, &action(), now() + Duration::from_secs(7))
-        .expect("a key");
-
-    assert_eq!(mint().verify(&key, &action()).expect("minted here"), now());
-
-    let other_secret = PackKeyMint::new(&[9; 32]).expect("a mint");
-    let nonce = key.key().rsplit('/').next().expect("a nonce");
-    let digit = if nonce.starts_with('0') { "1" } else { "0" };
-    let flipped = format!("{digit}{}", &nonce[1..]);
-    let keys = [
-        (key.clone(), blob("other").0, &mint()),
-        (key.clone(), action(), &other_secret),
-        (
-            IssuedPackKey::new(LEASE, &flipped).expect("a key"),
-            action(),
-            &mint(),
-        ),
-        (
-            IssuedPackKey::new(LEASE, "n0nce1").expect("a key"),
-            action(),
-            &mint(),
-        ),
-    ];
-    for (key, action, mint) in keys {
-        let refused = mint.verify(&key, &action).expect_err("not minted here");
-        assert!(matches!(refused, MintError::NotMinted(_)), "{refused:?}");
-    }
-}
-
-/// Asserts what minting refuses: a secret under the least, a clock before the epoch, a time past
-/// the last minute a key can name, and a lease that cannot be a build; and that the secret is not
-/// in the mint's Debug text.
-#[test]
-fn a_mint_refuses_what_cannot_be_a_key_and_hides_its_secret() {
-    let short = PackKeyMint::new(&[1; MIN_SECRET_BYTES - 1]).err();
-    assert_eq!(short, Some(MintError::ShortSecret(MIN_SECRET_BYTES - 1)));
-    let before = UNIX_EPOCH - Duration::from_secs(1);
-    assert_eq!(
-        mint().mint(LEASE, &action(), before).err(),
-        Some(MintError::Clock)
-    );
-    let far = UNIX_EPOCH + Duration::from_secs(60 * (1 << 32));
-    let past = mint()
-        .mint(LEASE, &action(), far)
-        .expect_err("past the last minute");
-    assert!(matches!(past, MintError::Key(_)), "{past:?}");
-    let bad = mint()
-        .mint("not/a/build", &action(), now())
-        .expect_err("a bad lease");
-    assert!(matches!(bad, MintError::Key(_)), "{bad:?}");
-    let debug = format!("{:?}", mint());
-    assert!(!debug.contains("0123456789abcdef"), "{debug}");
 }
