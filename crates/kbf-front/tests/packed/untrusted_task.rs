@@ -22,7 +22,7 @@ use kbf_pack::{
 use kbf_pack_index::PackIndex as _;
 use kbf_proto::reapi::action_cache_client::ActionCacheClient;
 use kbf_proto::reapi::{self, ActionResult, Directory, FileNode, GetActionResultRequest, Tree};
-use kbf_segments::layout::{encode_footer, footer_len};
+use kbf_segments::layout::{TRAILER_LEN, encode_footer, footer_len};
 use kbf_segments::{IndexEntry, MAX_SEGMENT_BYTES, SegmentWriter, crc32c, sha256};
 use kbf_types::Digest;
 use prost::Message as _;
@@ -93,6 +93,13 @@ fn segment_of(records: &[&[u8]]) -> Vec<u8> {
     writer.finish()
 }
 
+/// Sets the record count in the trailer of `pack` (the trailer is its last 32 bytes, the count
+/// a u32 after the index offset); nothing else in the pack changes.
+fn patch_count(pack: &mut [u8], count: u32) {
+    let at = pack.len() - TRAILER_LEN + 8;
+    pack[at..at + 4].copy_from_slice(&count.to_le_bytes());
+}
+
 /// The frontend with packs, a mint, the Action of the lease and the key issued for it.
 struct Farm {
     rig: Rig,
@@ -109,17 +116,32 @@ impl Farm {
 
     /// A farm whose Action says `do_not_cache`.
     async fn of(do_not_cache: bool) -> Self {
-        let rig = Rig::new().await;
         let action = reapi::Action {
             command_digest: Some(wire(&blob("the command").0)),
             input_root_digest: Some(wire(&blob("the inputs").0)),
             do_not_cache,
             ..reapi::Action::default()
         };
-        let bytes = Bytes::from(action.encode_to_vec());
+        Self::with_action(Bytes::from(action.encode_to_vec())).await
+    }
+
+    /// A farm whose Action blob is `bytes`, whatever they are.
+    async fn with_action(bytes: Bytes) -> Self {
+        Self::build(bytes, true).await
+    }
+
+    /// A farm whose Action blob was never stored.
+    async fn without_action() -> Self {
+        Self::build(Bytes::from_static(b"an action nobody stored"), false).await
+    }
+
+    async fn build(bytes: Bytes, store: bool) -> Self {
+        let rig = Rig::new().await;
         let action = sha256(&bytes);
-        let stored = update(&rig.front, &[(action, bytes)]).await;
-        assert_eq!(stored, [0], "the Action is stored");
+        if store {
+            let stored = update(&rig.front, &[(action, bytes)]).await;
+            assert_eq!(stored, [0], "the Action is stored");
+        }
         let backend = Backend::remote_over(rig.node().clone(), Some(rig.packs.clone()));
         let mint = PackKeyMint::new(SECRET).expect("a mint");
         let key = mint.mint(LEASE, &action, now()).expect("a key");
@@ -150,14 +172,18 @@ impl Farm {
                 file("out/z.o", blob(OBJECT).0, true),
                 file("out/a.txt", EMPTY_DIGEST, false),
             ],
-            output_directories: vec![OutputDirectory {
-                path: "out/d".to_owned(),
-                tree: self.tree().0,
-            }],
-            output_symlinks: vec![OutputSymlink {
-                path: "out/l".to_owned(),
-                target: "z.o".to_owned(),
-            }],
+            output_directories: ["out/d", "out/c"]
+                .map(|path| OutputDirectory {
+                    path: path.to_owned(),
+                    tree: self.tree().0,
+                })
+                .to_vec(),
+            output_symlinks: [("out/l", "z.o"), ("out/k", "a.txt")]
+                .map(|(path, target)| OutputSymlink {
+                    path: path.to_owned(),
+                    target: target.to_owned(),
+                })
+                .to_vec(),
             timing: Timing::default(),
             usage: Usage::default(),
         }
@@ -191,16 +217,20 @@ impl Farm {
                 file("out/a.txt", &EMPTY_DIGEST, false),
                 file("out/z.o", &blob(OBJECT).0, true),
             ],
-            output_directories: vec![reapi::OutputDirectory {
-                path: "out/d".to_owned(),
-                tree_digest: Some(wire(&self.tree().0)),
-                ..reapi::OutputDirectory::default()
-            }],
-            output_symlinks: vec![reapi::OutputSymlink {
-                path: "out/l".to_owned(),
-                target: "z.o".to_owned(),
-                ..reapi::OutputSymlink::default()
-            }],
+            output_directories: ["out/c", "out/d"]
+                .map(|path| reapi::OutputDirectory {
+                    path: path.to_owned(),
+                    tree_digest: Some(wire(&self.tree().0)),
+                    ..reapi::OutputDirectory::default()
+                })
+                .to_vec(),
+            output_symlinks: [("out/k", "a.txt"), ("out/l", "z.o")]
+                .map(|(path, target)| reapi::OutputSymlink {
+                    path: path.to_owned(),
+                    target: target.to_owned(),
+                    ..reapi::OutputSymlink::default()
+                })
+                .to_vec(),
             stdout_digest: Some(wire(&blob(STDOUT).0)),
             exit_code,
             ..ActionResult::default()
@@ -290,7 +320,7 @@ async fn an_honest_pack_is_ingested_into_the_exact_action_result_and_cached() {
     let got = farm.ingest().await;
 
     let want = Ingested::Ran {
-        result: farm.result(0),
+        result: Box::new(farm.result(0)),
         cached: true,
     };
     assert_eq!(got, want);
@@ -317,7 +347,7 @@ async fn a_failed_action_is_ran_and_not_cached() {
     let got = farm.ingest().await;
 
     let want = Ingested::Ran {
-        result: farm.result(3),
+        result: Box::new(farm.result(3)),
         cached: false,
     };
     assert_eq!(got, want);
@@ -336,12 +366,43 @@ async fn a_do_not_cache_action_is_ran_and_not_cached() {
     let got = farm.ingest().await;
 
     let want = Ingested::Ran {
-        result: farm.result(0),
+        result: Box::new(farm.result(0)),
         cached: false,
     };
     assert_eq!(got, want);
     let miss = farm.cached().await.expect_err("not cached");
     assert_eq!(miss.code(), Code::NotFound);
+}
+
+/// Asserts that an Action that does not decode is not cached, since the frontend cannot say it
+/// may be: the action is ingested as ran and the action cache stays empty.
+#[tokio::test]
+async fn an_action_that_does_not_decode_is_ran_and_not_cached() {
+    let farm = Farm::with_action(blob("not an Action \u{ff}\u{ff}").1).await;
+    farm.put(&farm.pack(0)).await;
+
+    let got = farm.ingest().await;
+
+    let want = Ingested::Ran {
+        result: Box::new(farm.result(0)),
+        cached: false,
+    };
+    assert_eq!(got, want);
+    let miss = farm.cached().await.expect_err("not cached");
+    assert_eq!(miss.code(), Code::NotFound);
+}
+
+/// Asserts that an Action the store does not hold, which the frontend must read to know whether
+/// the result may be cached, is `Unavailable` and counted so, not a refusal of the pack.
+#[tokio::test]
+async fn an_action_the_store_does_not_hold_is_unavailable() {
+    let farm = Farm::without_action().await;
+    farm.put(&farm.pack(0)).await;
+
+    let got = farm.ingest().await;
+
+    assert!(matches!(got, Ingested::Unavailable(_)), "{got:?}");
+    assert_eq!(farm.rig.packs.metrics().ingest_unavailable(), 1);
 }
 
 /// Asserts that ingesting the same key again is idempotent: the same result, the same cache entry,
@@ -451,7 +512,7 @@ async fn a_manifest_for_another_lease_or_action_is_wrong_key() {
 /// any read at all), more records than `max_blobs`, and a record over `max_blob_bytes`.
 #[tokio::test]
 async fn a_pack_over_a_cap_is_too_large() {
-    let big = "b".repeat(2000);
+    let big = "b".repeat(5000);
     let farm = Farm::new().await;
     let honest = farm.pack(0);
     let (object, stdout, tree) = (blob(OBJECT).1, blob(STDOUT).1, farm.tree().1);
@@ -462,7 +523,10 @@ async fn a_pack_over_a_cap_is_too_large() {
     let blobs: [&[u8]; 5] = [big.as_bytes(), &stdout, &tree, &in_dir, &object];
     let bigger = write_pack(&with_big, &blobs).expect("a pack");
     let default = UntrustedLimits::default();
+    let mut counting = honest.clone();
+    patch_count(&mut counting, 20_000);
     let cases = [
+        ("trailer", counting, default),
         (
             "pack",
             honest.clone(),
@@ -483,7 +547,7 @@ async fn a_pack_over_a_cap_is_too_large() {
             "blob",
             bigger,
             UntrustedLimits {
-                max_blob_bytes: 1000,
+                max_blob_bytes: 3000,
                 ..default
             },
         ),
@@ -546,13 +610,27 @@ async fn a_pack_that_is_not_laid_out_is_malformed() {
         &[entry_of(&manifest, 0), entry_of(&blob_bytes, m - 2)],
     );
     let honest = farm.pack(0);
+    let honest_again = honest.clone();
     let mut in_footer = honest.clone();
     let last = in_footer.len() - 40;
     in_footer[last] ^= 0xff;
     let mut in_trailer = honest;
     let end = in_trailer.len() - 1;
     in_trailer[end] ^= 0xff;
-    for bytes in [zero, gap, overlap, in_footer, in_trailer] {
+    let mut long_footer = honest_again.clone();
+    patch_count(&mut long_footer, 1000);
+    let empty = forged(b"", &[]);
+    let tiny = vec![0; 10];
+    for bytes in [
+        zero,
+        gap,
+        overlap,
+        in_footer,
+        in_trailer,
+        long_footer,
+        empty,
+        tiny,
+    ] {
         let farm = Farm::new().await;
         farm.put(&bytes).await;
 
@@ -635,7 +713,9 @@ async fn a_manifest_naming_a_digest_outside_the_pack_is_incomplete() {
     for ((digest, bytes), reason) in cases {
         let farm = Farm::new().await;
         let mut manifest = farm.manifest(0);
-        manifest.output_directories[0].tree = digest;
+        for dir in &mut manifest.output_directories {
+            dir.tree = digest;
+        }
         let blobs: [&[u8]; 4] = [&object, &stdout, &bytes, &in_dir];
         farm.put(&write_pack(&manifest, &blobs).expect("a pack"))
             .await;
