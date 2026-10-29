@@ -1,0 +1,163 @@
+# The end-to-end gate for flipping the farm onto the jobscheduler core (js-server-core).
+#
+# It is the M1 exit test of beta.yml's `m1-cell` (MinIO, the sample projects built twice each
+# with pinned Bazel and buck2, a lease drained in flight, a planted failing build; `kbf-cell
+# m1`, crates/kbf-integration-test/src/m1.rs says exactly what is checked) with two
+# differences:
+#
+# 1. It runs the binary the farm ships. A production frontend is `/usr/bin/kbf --mode=frontend`,
+#    so the cell starts `kbf --mode=storage` and `kbf --mode=frontend` from one `kbf` built with
+#    `cargo build -p kbf-cli --bins --locked --features farm-core-js` (`--kbf-bin`; the feature
+#    is kbf-cli's and forwards to kbf-server), and not the `kbf-server` binary, which no
+#    production host runs. The frontend is given the flip's flags, `--scheduler-core=js --learned-sizes=shadow`, and no
+#    `--placement-load` (it defaults to `off`, which is what the farm runs, so the blocking
+#    leg leaves it out).
+# 2. The run also requires that the frontend logged `scheduler core: js` and reports
+#    `kbf_scheduler_core{core="js"} 1` on /metrics, before the builds and after them
+#    (`--expect-scheduler-core js`), so it cannot pass on the legacy driver by accident.
+#
+# Red until the flip is proven. The js core's hot path is on main (komira-ai/kbf#1870, #1875,
+# #1877) and so is the frontend's acceptance of `--scheduler-core` with the core logged from
+# the driver (komira-ai/kbf#1886); this gate says what still stops the flip. Run it on a head,
+# read the first failing step of the job log: the start line (`scheduler core: js`), the gauge
+# check (`kbf_scheduler_core{core="js"} 1`), then the M1 scenario steps. The same cell without
+# any of these flags (legacy core, no core check) passes with kbf in frontend mode, so the
+# layout itself is not what is red. This workflow changes no server code.
+#
+# A second, optional leg runs the same cell with `--placement-load=on` added (matrix entry
+# `load: on`, job name "m1-cell-js (placement load, optional)"). It is `continue-on-error`, so
+# it never blocks: the check that gates is the `load: off` leg, named `m1-cell-js`. A red
+# optional leg is a result to read, not a stop. `continue-on-error` is allowed here because this
+# file is a check of its own (the beta and pipeline lints that refuse it read beta.yml and
+# pipeline.yml). When the pipeline calls this file, decide then whether the optional leg stays.
+#
+# It is kbf's own frontend on js-server-core; the standalone pieces of the jobscheduler
+# repository (js-lease-server, js-agent) are not on the flip path and not here.
+#
+# There is no second leg on the `kbf-server` binary: it is not what ships, the job would run
+# the whole M1 scenario twice (45 minutes is already its budget), and a leg that drives the
+# same core would fail for the same reason as this one. `m1-cell` in beta.yml keeps running
+# `kbf-server` on the legacy core.
+#
+# Not part of the pipeline yet, on purpose. A job of beta.yml or of pipeline.yml that is red
+# stops every release (no `continue-on-error` is allowed in either: tests/beta_succeeds,
+# tests/pipeline_workflow), and the fix-forward path must not wait on a change that is not
+# here. So this workflow is a check of its own: it runs for a pull request or a push to main that
+# touches the flip path (js-core-gate-pr.yml, which calls this file), or by hand, and it is
+# listed in release/stages.yml as a job of the beta stage so the stage lint keeps it honest.
+#
+# The flip (the change that makes the js core the farm's default) makes it release-blocking
+# without losing the pull-request check:
+#
+#   - pipeline.yml gains, after `beta`, the caller job
+#       js-core-gate:
+#         needs: [beta]
+#         uses: ./.github/workflows/js-core-gate.yml
+#         permissions:
+#           contents: read
+#     (`needs: [beta]` because the pipeline lint requires each job to need exactly the one
+#     before it, and its jobs to be exactly ci, artifacts, beta, js-core-gate; each job also
+#     needs its own permissions block, which is `contents: read` here).
+#   - release/stages.yml gains the row `pipeline.yml#js-core-gate`, stage beta.
+#   - tests/pipeline_workflow (mod.rs: JOBS, STAGES, Files, called, each_check_once; tests.rs:
+#     real, plant, and a case for the new job) learns the fourth stage. The ready-to-apply diff
+#     is in the description of komira-ai/kbf#1867.
+#   - js-core-gate-pr.yml is NOT deleted. It stays, and its check `gate / m1-cell-js` is made a
+#     required status check of main next to the pipeline job, so a pull request still runs the
+#     gate before it merges (the pipeline only runs after a push to main).
+#
+# Same hosted-runner, pinning and permission rules as the other workflows
+# (crates/kbf-integration-test/tests/repo_lints.rs). The pins are copies of m1-cell's.
+name: js-core-gate
+
+on:
+  workflow_call:
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  m1-cell-js:
+    name: m1-cell-js${{ matrix.load == 'on' && ' (placement load, optional)' || '' }}
+    continue-on-error: ${{ matrix.load == 'on' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        load: [off, on]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    services:
+      minio:
+        # The digest the objstore-s3 and m1-cell jobs pin (Chainguard's build of MinIO).
+        image: cgr.dev/chainguard/minio@sha256:e7ca559d9f7c0b5f24f5f669bb92f40f3ca88d56273b808bf3a7c116c17d2ffa
+        command: server /data
+        env:
+          MINIO_ROOT_USER: kbf-ci-access
+          MINIO_ROOT_PASSWORD: kbf-ci-throwaway
+        ports:
+          - 9000:9000
+    env:
+      # A throwaway key pair for the service container, which lives only for this job.
+      AWS_ACCESS_KEY_ID: kbf-ci-access
+      AWS_SECRET_ACCESS_KEY: kbf-ci-throwaway
+      BAZEL_VERSION: 8.8.1
+      BAZEL_SHA256: 5b5bab2095065817d3416ca9a0678bd39c10c9ede432dbe8187bfe74de285160
+      BUCK2_VERSION: 2026-10-01
+      BUCK2_SHA256: 828aba01bf80e8ba50ed27d89be86efe0246b3807c3d040e1ea7b4810a55fb78
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      # The cell (kbf-cell, kbf-act) and then the shipping binary with the js core compiled in.
+      # Two invocations, `kbf` last: the feature belongs to kbf-cli (it forwards to
+      # kbf-server) and is turned on by a build of that package alone; one invocation naming
+      # all the packages with a `--features` for one of them was tried on the server and built it
+      # WITHOUT the feature. `kbf` is built last so nothing after it can relink its binary.
+      - name: Build the cell
+        run: cargo build -p kbf-integration-test -p kbf-testkit --bins --locked
+      - name: Build kbf with the js core
+        run: cargo build -p kbf-cli --bins --locked --features farm-core-js
+      - name: Fetch Bazel (pinned version, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/bazelbuild/bazel/releases/download/$BAZEL_VERSION/bazel-$BAZEL_VERSION-linux-x86_64" --sha256 "$BAZEL_SHA256" --out "$RUNNER_TEMP/tools/bazel"
+      - name: Fetch buck2 (pinned version, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --out "$RUNNER_TEMP/tools/buck2" --extract zst
+      - run: $RUNNER_TEMP/tools/bazel --version
+      - run: $RUNNER_TEMP/tools/buck2 --version
+      - name: Wait for MinIO, then run the store conformance suite on it
+        run: cargo run -p kbf-objstore --example s3_conformance --locked -- --endpoint http://127.0.0.1:9000 --bucket kbf-m1-conformance --create-bucket --conditional-put --wait-ready 60
+      - name: M1 cell on kbf --mode=frontend with the js core, Bazel and buck2 twice each
+        run: target/debug/kbf-cell m1 --bin-dir target/debug --kbf-bin target/debug/kbf --projects crates/kbf-integration-test/m1 --work "$RUNNER_TEMP/m1" --s3-endpoint http://127.0.0.1:9000 --s3-bucket kbf-m1 --bazel "$RUNNER_TEMP/tools/bazel" --buck2 "$RUNNER_TEMP/tools/buck2" --server-arg=--scheduler-core=js --server-arg=--learned-sizes=shadow ${{ matrix.load == 'on' && '--server-arg=--placement-load=on' || '' }} --expect-scheduler-core js
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: js-core-gate-logs-${{ matrix.load }}
+          path: ${{ runner.temp }}/m1/logs
+          if-no-files-found: warn
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}

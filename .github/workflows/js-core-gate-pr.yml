@@ -1,0 +1,51 @@
+# Runs js-core-gate.yml (the end-to-end gate for the farm's flip onto the jobscheduler core) for
+# a pull request or a push to main that touches what the flip path is made of, and by hand. It
+# is a check of its own and not a stage of the release pipeline: it is red until the change that
+# lets release builds start with `--scheduler-core js` lands, and a red stage job would stop
+# every release. js-core-gate.yml says how the flip makes the gate release-blocking; this file
+# stays after that, as the pull-request check (job `gate`, check `gate / m1-cell-js`).
+name: js-core-gate-pr
+
+on:
+  pull_request:
+    paths:
+      - crates/kbf-server/**
+      - Cargo.toml
+      - Cargo.lock
+      - crates/kbf-front/**
+      - crates/kbf-sched/**
+      - crates/kbf-daemon/**
+      - crates/kbf-cli/**
+      - crates/kbf-testkit/**
+      - crates/kbf-integration-test/**
+      - rust-toolchain.toml
+      - .github/workflows/js-core-gate.yml
+      - .github/workflows/js-core-gate-pr.yml
+  push:
+    branches: [main]
+    paths:
+      - crates/kbf-server/**
+      - Cargo.toml
+      - Cargo.lock
+      - crates/kbf-front/**
+      - crates/kbf-sched/**
+      - crates/kbf-daemon/**
+      - crates/kbf-cli/**
+      - crates/kbf-testkit/**
+      - crates/kbf-integration-test/**
+      - rust-toolchain.toml
+      - .github/workflows/js-core-gate.yml
+      - .github/workflows/js-core-gate-pr.yml
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: js-core-gate-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gate:
+    uses: ./.github/workflows/js-core-gate.yml
+    permissions:
+      contents: read
