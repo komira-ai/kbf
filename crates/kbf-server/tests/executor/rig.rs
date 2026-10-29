@@ -1,0 +1,478 @@
+//! The harness: a farm, a lease server, an executor, and fakes for what the executor reads
+//! from the rest of the server.
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use kbf_front::{Cache, Described, Dispatch, Finished, Stage, Submission};
+use kbf_lease_client::fake::{FakeLeaseServer, Pool};
+use kbf_lease_client::{Client, LeaseId, Outcome, RunId};
+use kbf_proto::reapi::{ActionResult, Digest};
+use kbf_sched::Request;
+use kbf_server::Farm;
+use kbf_server::executor::{
+    ActionFacts, Clock, Config, Deps, Executor, Ingest, Ingested, Inputs, InputsError, PackKey,
+    Presign, PresignError, ReadGrant, Secret, UntrustedLimits,
+};
+use kbf_types::{ActionKey, LeaseKind, Qos, Resources};
+use tokio::sync::watch;
+
+pub const GIB: u64 = 1 << 30;
+pub const IMAGE: &str =
+    "docker://registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What the executor reads of an action, and the grant of its task.
+pub struct FakeInputs {
+    pub facts: Mutex<Result<ActionFacts, InputsError>>,
+    pub grant: Mutex<Result<ReadGrant, InputsError>>,
+    pub looked_up: Mutex<Vec<String>>,
+}
+
+impl FakeInputs {
+    fn new() -> Self {
+        Self {
+            facts: Mutex::new(Ok(ActionFacts {
+                image: IMAGE.to_owned(),
+                timeout: Some(Duration::from_secs(60)),
+            })),
+            grant: Mutex::new(Ok(ReadGrant {
+                url: "https://10.0.0.1:9400".to_owned(),
+                token: Secret::new("read-token-0001"),
+            })),
+            looked_up: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl Inputs for FakeInputs {
+    async fn action(&self, action: &Digest) -> Result<ActionFacts, InputsError> {
+        locked(&self.looked_up).push(action.hash.clone());
+        locked(&self.facts).clone()
+    }
+
+    async fn read_grant(
+        &self,
+        _lease: kbf_types::LeaseId,
+        _action: &Digest,
+        _expires: Duration,
+    ) -> Result<ReadGrant, InputsError> {
+        locked(&self.grant).clone()
+    }
+}
+
+/// One url the store minted.
+#[derive(Clone, Debug)]
+pub struct Minted {
+    pub host: String,
+    pub key: String,
+    pub expires: Duration,
+    pub max_bytes: u64,
+}
+
+/// A store that signs a url for any key, and takes a `PUT` of a key once.
+pub struct FakePresign {
+    pub minted: Mutex<Vec<Minted>>,
+    pub written: Mutex<BTreeSet<String>>,
+    pub fail: Mutex<Option<PresignError>>,
+}
+
+impl FakePresign {
+    fn new() -> Self {
+        Self {
+            minted: Mutex::new(Vec::new()),
+            written: Mutex::new(BTreeSet::new()),
+            fail: Mutex::new(None),
+        }
+    }
+
+    /// The `PUT` of a task to `url`: refused if the key was written before, as a create-only
+    /// store refuses it.
+    pub fn put(&self, url: &str) -> Result<(), &'static str> {
+        let key = url
+            .strip_prefix("http://store.test/")
+            .and_then(|rest| rest.split('?').next())
+            .expect("a url this store minted");
+        match locked(&self.written).insert(key.to_owned()) {
+            true => Ok(()),
+            false => Err("412 the key exists"),
+        }
+    }
+
+    pub fn keys(&self) -> Vec<String> {
+        locked(&self.minted).iter().map(|m| m.key.clone()).collect()
+    }
+}
+
+#[tonic::async_trait]
+impl Presign for FakePresign {
+    async fn put_url(
+        &self,
+        host: &str,
+        key: &PackKey,
+        expires: Duration,
+        max_bytes: u64,
+    ) -> Result<Secret, PresignError> {
+        if let Some(error) = locked(&self.fail).clone() {
+            return Err(error);
+        }
+        locked(&self.minted).push(Minted {
+            host: host.to_owned(),
+            key: key.to_string(),
+            expires,
+            max_bytes,
+        });
+        Ok(Secret::new(format!("http://store.test/{key}?sig=s3cr3t")))
+    }
+}
+
+/// What the frontend makes of a pack: scripted, then the default.
+pub struct FakeIngest {
+    pub script: Mutex<VecDeque<Ingested>>,
+    pub calls: Mutex<Vec<(kbf_types::LeaseId, String, UntrustedLimits)>>,
+}
+
+impl FakeIngest {
+    fn new() -> Self {
+        Self {
+            script: Mutex::new(VecDeque::new()),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn ran(exit_code: i32) -> Ingested {
+        Ingested::Ran {
+            result: Box::new(ActionResult {
+                exit_code,
+                ..ActionResult::default()
+            }),
+            cached: true,
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl Ingest for FakeIngest {
+    async fn ingest(
+        &self,
+        lease: kbf_types::LeaseId,
+        key: &PackKey,
+        _action: &Digest,
+        limits: &UntrustedLimits,
+    ) -> Ingested {
+        locked(&self.calls).push((lease, key.to_string(), *limits));
+        locked(&self.script)
+            .pop_front()
+            .unwrap_or_else(|| Self::ran(0))
+    }
+}
+
+/// Holds tokio's paused clock where it is. The paused clock jumps to its next timer whenever
+/// the runtime waits, which a client's timeout, a retry delay of the farm and a socket being
+/// served all do; a blocking task in flight stops the jump. The tests move the clock by hand,
+/// and so assert on what happened, never on how long it took.
+pub struct ClockHold {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ClockHold {
+    pub fn new() -> Self {
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let task = tokio::task::spawn_blocking(move || {
+            let _ = hold.recv();
+        });
+        Self {
+            release: Some(release),
+            task: Some(task),
+        }
+    }
+}
+
+impl Drop for ClockHold {
+    fn drop(&mut self) {
+        self.release.take().iter().for_each(|release| {
+            let _ = release.send(());
+        });
+        self.task.take();
+    }
+}
+
+/// A farm, a lease server of `hosts`, and an executor that holds them.
+pub struct Rig {
+    pub fake: FakeLeaseServer,
+    pub api: Client,
+    pub farm: Arc<Farm>,
+    pub exec: Executor,
+    pub cfg: Config,
+    pub inputs: Arc<FakeInputs>,
+    pub presign: Arc<FakePresign>,
+    pub ingest: Arc<FakeIngest>,
+    _hold: ClockHold,
+}
+
+/// The farm leases an action makes, by what the test calls it.
+pub struct Caller {
+    pub tag: u8,
+    pub stage: watch::Receiver<Stage>,
+}
+
+impl Caller {
+    pub fn finished(&self) -> Option<Finished> {
+        match &*self.stage.borrow() {
+            Stage::Done(finished) => Some(finished.clone()),
+            _ => None,
+        }
+    }
+}
+
+pub fn digest_of(tag: u8) -> kbf_types::Digest {
+    kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [tag; 32], u64::from(tag))
+}
+
+impl Rig {
+    /// A rig over a pool of `hosts` of 2 cores and 16 GiB, held by an executor of `held`
+    /// hosts with `adjust` applied to its config.
+    pub async fn start(hosts: &[&str], held: usize, adjust: impl FnOnce(&mut Config)) -> Self {
+        let _ = tracing_subscriber::fmt().with_test_writer().with_max_level(tracing::Level::INFO).try_init();
+        let hold = ClockHold::new();
+        let pool = Pool::new("farm-linux", hosts, 2_000, 16 * GIB);
+        let fake = FakeLeaseServer::start(pool).await;
+        let api = fake.client().expect("a client");
+        let mut cfg = Config::new("front-1", held, "farm-linux", 2_000, 16 * GIB);
+        cfg.slots = 2;
+        adjust(&mut cfg);
+        let farm = Arc::new(Farm::new(
+            Arc::new(Cache::memory()),
+            kbf_sched::UNSERVABLE_WAIT,
+            kbf_sched::FINISHED_RETENTION,
+        ));
+        let (inputs, presign, ingest) = (
+            Arc::new(FakeInputs::new()),
+            Arc::new(FakePresign::new()),
+            Arc::new(FakeIngest::new()),
+        );
+        let exec = Self::executor(&fake, &farm, &cfg, &inputs, &presign, &ingest);
+        Self {
+            fake,
+            api,
+            farm,
+            exec,
+            cfg,
+            inputs,
+            presign,
+            ingest,
+            _hold: hold,
+        }
+    }
+
+    fn executor(
+        fake: &FakeLeaseServer,
+        farm: &Arc<Farm>,
+        cfg: &Config,
+        inputs: &Arc<FakeInputs>,
+        presign: &Arc<FakePresign>,
+        ingest: &Arc<FakeIngest>,
+    ) -> Executor {
+        let deps = Deps {
+            farm: Arc::clone(farm),
+            client: fake.client().expect("a client"),
+            ingest: ingest.clone(),
+            presign: presign.clone(),
+            inputs: inputs.clone(),
+        };
+        Executor::new(cfg.clone(), deps, Clock::from_unix_ms(fake.now_ms())).expect("a valid config")
+    }
+
+    /// A new executor over the same farm and lease server, as a restarted frontend has.
+    pub fn restarted_executor(&self) -> Executor {
+        Self::executor(
+            &self.fake,
+            &self.farm,
+            &self.cfg,
+            &self.inputs,
+            &self.presign,
+            &self.ingest,
+        )
+    }
+
+    /// One step of the executor and of the farm, with the tasks they spawn run to rest.
+    pub async fn pump(&mut self) {
+        for _ in 0..4 {
+            self.exec.step().await;
+            settle().await;
+            self.farm.tick().await;
+            settle().await;
+        }
+    }
+
+    pub async fn pump_n(&mut self, n: usize) {
+        for _ in 0..n {
+            self.pump().await;
+        }
+    }
+
+    /// Time passes: tokio's clock, the lease server's, and the farm's with the first.
+    pub async fn advance(&self, by: Duration) {
+        tokio::time::advance(by).await;
+        self.fake.advance(by);
+    }
+
+    /// `seconds` pass in steps of 5 s, the executor and the farm stepping after each.
+    pub async fn elapse(&mut self, seconds: u64) {
+        for _ in 0..seconds.div_ceil(5) {
+            self.advance(Duration::from_secs(5)).await;
+            self.pump().await;
+        }
+    }
+
+    /// Submits the action of `tag`, booking one core and one GiB.
+    pub fn submit(&self, tag: u8) -> Caller {
+        let request = Request {
+            key: ActionKey {
+                instance: "main".to_owned(),
+                action: digest_of(tag),
+            }
+            .into(),
+            qos: Qos::Ci,
+            kind: LeaseKind::Action,
+            resources: Resources::new(1_000, GIB),
+            hermetic: true,
+            do_not_cache: false,
+            needs: kbf_caps::Request::default(),
+        };
+        let ticket = self
+            .farm
+            .submit(Submission {
+                request,
+                call: None,
+                described: Described {
+                    arguments: vec!["/bin/run".to_owned()],
+                    outputs: Vec::new(),
+                    label: Default::default(),
+                },
+                evidence: Default::default(),
+                max_wall: None,
+            })
+            .expect("the farm takes the action");
+        Caller {
+            tag,
+            stage: ticket.stage,
+        }
+    }
+
+    /// Every run of every lease the lease server holds, with its lease and its arguments.
+    pub async fn runs(&self) -> Vec<Posted> {
+        let mut posted = Vec::new();
+        for lease in self.api.leases().await.expect("leases") {
+            for run in self.api.runs(lease.id).await.expect("runs") {
+                let args = self.fake.run_args(&run.run_id).unwrap_or_default();
+                posted.push(Posted {
+                    lease: lease.id,
+                    host: lease.host.clone().unwrap_or_default(),
+                    run: run.run_id,
+                    state: run.state,
+                    args,
+                });
+            }
+        }
+        posted
+    }
+
+    /// The runs queued for the action of `tag`.
+    pub async fn runs_of(&self, tag: u8) -> Vec<Posted> {
+        let want = format!("{}/{}", hex(tag), tag);
+        self.runs()
+            .await
+            .into_iter()
+            .filter(|p| p.arg("--action") == Some(want.as_str()))
+            .collect()
+    }
+
+    /// The host runs `run` to the end with `outcome`, and stops listing it.
+    pub fn host_finishes(&self, run: &RunId, outcome: Outcome, exit_code: Option<i32>) {
+        self.fake.run_started(run);
+        assert!(self.fake.finish_run(run, outcome, exit_code, Some("detail")));
+    }
+
+    pub fn host_ends(&self, run: &RunId) {
+        assert!(self.fake.end_run(run));
+    }
+
+    /// Runs the executor until `caller` is done, or panics after `steps` of 5 s.
+    pub async fn until_done(&mut self, caller: &Caller, steps: usize) -> Finished {
+        for _ in 0..steps {
+            if let Some(finished) = caller.finished() {
+                return finished;
+            }
+            self.advance(Duration::from_secs(5)).await;
+            self.pump().await;
+        }
+        panic!("action {} not done: {:?}\nhosts {:?}\nrequests {:#?}", caller.tag, caller.stage.borrow(), self.exec.hosts(), self.fake.requests());
+    }
+
+    pub fn requests(&self) -> Vec<String> {
+        self.fake.requests()
+    }
+}
+
+pub fn hex(tag: u8) -> String {
+    format!("{tag:02x}").repeat(32)
+}
+
+/// Lets the tasks the executor and the farm spawned run to rest. The farm's cache lingers
+/// 2 ms before it writes a batch, and the clock is held, so the clock moves 3 ms a round: the
+/// tests' own clock is `Rig::advance` and `Rig::elapse`.
+pub async fn settle() {
+    for _ in 0..3 {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(3)).await;
+    }
+}
+
+/// A run as the lease server holds it.
+#[derive(Clone, Debug)]
+pub struct Posted {
+    pub lease: LeaseId,
+    pub host: String,
+    pub run: RunId,
+    pub state: kbf_lease_client::RunState,
+    pub args: Vec<String>,
+}
+
+impl Posted {
+    /// The value after `flag` in the task tool's arguments.
+    pub fn arg(&self, flag: &str) -> Option<&str> {
+        let at = self.args.iter().position(|a| a == flag)?;
+        self.args.get(at + 1).map(String::as_str)
+    }
+}
+
+/// How many of `requests` are exactly `request`.
+pub fn count(requests: &[String], request: &str) -> usize {
+    requests.iter().filter(|r| *r == request).count()
+}
+
+/// How many of `requests` are `method` on a path under `/v1/leases/` that ends `tail`.
+pub fn count_tail(requests: &[String], method: &str, tail: &str) -> usize {
+    let prefix = format!("{method} /v1/leases/");
+    requests
+        .iter()
+        .filter(|r| r.starts_with(&prefix) && r.ends_with(tail))
+        .count()
+}
+
+#[allow(dead_code)]
+pub fn by_key(posted: &[Posted]) -> BTreeMap<String, Posted> {
+    posted
+        .iter()
+        .map(|p| (p.run.to_string(), p.clone()))
+        .collect()
+}
