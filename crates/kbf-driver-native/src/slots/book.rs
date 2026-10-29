@@ -74,6 +74,11 @@ pub(crate) type Cleaner<R> = Arc<dyn Fn(&R) -> Outcome + Send + Sync>;
 /// Called with the number of slots that can run a lease whenever it changes.
 pub(crate) type CountHook = Arc<dyn Fn(usize) + Send + Sync>;
 
+/// How the recovery thread waits `time` between passes, and whether a slot went dirty
+/// meanwhile. The daemon's is [`sleep`]: it waits until `time` has passed or the wake is
+/// signalled. A test's records `time` and returns when the test steps it.
+type Nap = Box<dyn FnMut(&Wake, Duration) -> bool + Send>;
+
 /// What wakes the recovery thread: a slot went dirty, or the book is gone.
 #[derive(Default)]
 struct Wake {
@@ -116,16 +121,18 @@ impl<R: Slotted + Send + Sync + 'static> Book<R> {
     /// The slots over `ready`, each cleaned by `cleaner` first (a slot whose clean leaves
     /// it dirty is not free), and the recovery thread started with `backoff`.
     pub(crate) fn start(ready: Vec<R>, cleaner: Cleaner<R>, backoff: Backoff) -> Arc<Self> {
-        Self::start_with(ready, cleaner, backoff, None)
+        Self::start_with(ready, cleaner, backoff, None, Box::new(sleep))
     }
 
     /// [`Book::start`], the recovery thread given a stack of `stack` bytes if any (a test
-    /// asks for one that cannot be made).
+    /// asks for one that cannot be made) and waiting by `nap` (a test asks for the waits
+    /// instead of sitting through them).
     fn start_with(
         ready: Vec<R>,
         cleaner: Cleaner<R>,
         backoff: Backoff,
         stack: Option<usize>,
+        nap: Nap,
     ) -> Arc<Self> {
         let book = Arc::new(Self {
             permits: Arc::new(Semaphore::new(0)),
@@ -147,7 +154,7 @@ impl<R: Slotted + Send + Sync + 'static> Book<R> {
         if let Some(bytes) = stack {
             thread = thread.stack_size(bytes);
         }
-        if let Err(why) = thread.spawn(move || recover(&weak, &wake, backoff)) {
+        if let Err(why) = thread.spawn(move || recover(&weak, &wake, backoff, nap)) {
             tracing::error!(%why, "no thread to clean dirty slots again: they stay dirty");
         }
         book.wake_up();
@@ -376,6 +383,7 @@ fn recover<R: Slotted + Send + Sync + 'static>(
     book: &Weak<Book<R>>,
     wake: &Arc<Wake>,
     backoff: Backoff,
+    mut nap: Nap,
 ) {
     let mut wait = backoff.first;
     // Whether the wait before the next pass is over.
@@ -389,7 +397,7 @@ fn recover<R: Slotted + Send + Sync + 'static>(
                 wait = backoff.first;
                 due = false;
                 sleep_until_news(wake);
-            } else if sleep(wake, wait) {
+            } else if nap(wake, wait) {
                 // Another slot went dirty: its wait starts now, from the first.
                 wait = backoff.first;
             } else {

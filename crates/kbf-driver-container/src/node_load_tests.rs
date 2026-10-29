@@ -2,7 +2,7 @@
 //! directory, and the tracker's covered set, windows and sequence number.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::*;
 
@@ -195,6 +195,7 @@ fn a_directory_of_cgroup_files_is_one_reading() {
             actions_cpu_limited: false,
             throttled_usec: Some(123_456),
             pressure_some_total_usec: Some(987_654),
+            leases: Vec::new(),
         }
     );
     write(&dir, "cpu.max", "8700000 100000\n");
@@ -445,4 +446,257 @@ async fn a_lease_keeps_the_largest_window_it_had() {
     tracker.ended(id(1));
     assert_eq!(tracker.take_peak(id(1)), None);
     assert!(format!("{tracker:?}").contains("LoadTracker"));
+}
+
+/// A lease's cgroup directory under `parent`: `cpu` microseconds in `cpu.stat`, `current`
+/// bytes in `memory.current` and `inactive` bytes of inactive file memory in `memory.stat`.
+fn lease_cgroup(parent: &Path, name: &str, cpu: u64, current: u64, inactive: u64) -> PathBuf {
+    let dir = parent.join(name);
+    std::fs::create_dir(&dir).expect("mkdir");
+    usage(&dir, cpu);
+    write(&dir, "memory.current", &format!("{current}\n"));
+    let stat = format!("inactive_file {inactive}\nactive_file 1\n");
+    write(&dir, "memory.stat", &stat);
+    dir
+}
+
+/// A lease as a reading names it, with CPU and working set read.
+fn named(n: u64, started_usec: u64, cpu_usage_usec: u64, working_set_bytes: u64) -> LeaseReading {
+    LeaseReading {
+        lease: id(n),
+        started_usec,
+        usage: Some(LeaseUsage {
+            cpu_usage_usec,
+            working_set_bytes,
+        }),
+    }
+}
+
+/// What a test holds to stop a read part way: the time the clock reads, the flag that makes
+/// the clock's next call wait, the notice that the call has begun to wait, and the release.
+struct Held {
+    now: Arc<AtomicU64>,
+    armed: Arc<AtomicBool>,
+    entered: tokio::sync::mpsc::UnboundedReceiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+/// A clock that reads `now` (100 until the test sets it), except that its first call after
+/// `armed` is set tells `entered` and then waits, inside the caller, for `release`. A read
+/// on the blocking pool that calls it is held part way for exactly as long as the test
+/// says, with nothing timed.
+fn held_clock() -> (MonoClock, Held) {
+    let now = Arc::new(AtomicU64::new(100));
+    let time = Arc::clone(&now);
+    let armed = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered) = tokio::sync::mpsc::unbounded_channel();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    let on = Arc::clone(&armed);
+    let clock: MonoClock = Arc::new(move || {
+        if on.swap(false, Ordering::SeqCst) {
+            entered_tx.send(()).expect("the test is listening");
+            let waiting = release_rx.lock().expect("lock");
+            waiting.recv().expect("the test releases the read");
+        }
+        time.load(Ordering::SeqCst)
+    });
+    (
+        clock,
+        Held {
+            now,
+            armed,
+            entered,
+            release,
+        },
+    )
+}
+
+/// Catches a working set without the inactive-file subtraction, starts swapped between
+/// leases, a list in start order or in no order instead of lease order, an ended lease
+/// listed, a running lease left out, and the reading given to the daemon losing its leases.
+#[tokio::test]
+async fn a_reading_names_each_running_lease_with_its_start_and_counters() {
+    let actions = cgroup("load-leases");
+    let parent = crate::unit_dir("load-leases-dirs");
+    let (now, clock) = manual();
+    let tracker = LoadTracker::new(clock);
+    // Leases 3, 2 and 1 started in that order, so a list in start order differs from one in
+    // lease order; lease 4 starts last and ends before the reading.
+    for (n, at, cpu, current, inactive) in [
+        (3, 10, 3_000, 9_000, 4_000),
+        (1, 30, 1_000, 5_000, 1_500),
+        (4, 40, 4_000, 1, 1),
+        (2, 20, 2_000, 7_000, 100),
+    ] {
+        now.store(at, Ordering::SeqCst);
+        let dir = lease_cgroup(&parent, &format!("l{n}"), cpu, current, inactive);
+        tracker.started(id(n), dir);
+    }
+    tracker.ended(id(4));
+    now.store(100, Ordering::SeqCst);
+    let load = tracker
+        .reading(actions.to_path_buf())
+        .await
+        .expect("reading");
+    assert_eq!(
+        load.leases,
+        [
+            named(1, 30, 1_000, 3_500),
+            named(2, 20, 2_000, 6_900),
+            named(3, 10, 3_000, 5_000),
+        ]
+    );
+
+    let reading = load.clone().into_reading();
+    assert_eq!(reading.leases, load.leases);
+    assert_eq!(reading.load.seq, 1);
+    assert_eq!(
+        reading.load.memory_working_set_bytes,
+        10_485_760 - 2_097_152
+    );
+}
+
+/// Catches one lease's missing or garbled file failing the whole reading, a lease dropped
+/// from the list for it, an invented zero for what could not be read, and a lease losing
+/// its busiest CPU window because its memory files are bad. For each of a lease's three
+/// files, missing and garbled in turn: the node's part and the other lease are intact, the
+/// lease is listed with its start and no usage, and its peak window is still taken unless
+/// its own `cpu.stat` is the file that is bad.
+#[tokio::test]
+async fn a_lease_with_an_unreadable_file_keeps_its_clock_and_has_no_usage() {
+    for (file, garbled, peak) in [
+        ("cpu.stat", None, None),
+        ("cpu.stat", Some("not a counter\n"), None),
+        ("memory.current", None, Some(2000)),
+        ("memory.current", Some("lots\n"), Some(2000)),
+        ("memory.stat", None, Some(2000)),
+        ("memory.stat", Some("no such line\n"), Some(2000)),
+    ] {
+        let case = format!("{file}-{}", garbled.map_or("missing", |_| "garbled"));
+        let actions = cgroup(&format!("load-bad-{case}"));
+        let parent = crate::unit_dir(&format!("load-bad-{case}-leases"));
+        let (now, clock) = manual();
+        let tracker = LoadTracker::new(clock);
+        now.store(10, Ordering::SeqCst);
+        let good = lease_cgroup(&parent, "good", 0, 5_000, 1_000);
+        let bad = lease_cgroup(&parent, "bad", 0, 5_000, 1_000);
+        tracker.started(id(1), good.clone());
+        tracker.started(id(2), bad.clone());
+
+        // The first reading is each lease's baseline; a second of clock later each has used
+        // two CPU-seconds, and then one of the bad lease's files is broken.
+        now.store(1_000_000, Ordering::SeqCst);
+        tracker
+            .reading(actions.to_path_buf())
+            .await
+            .expect("baseline");
+        usage(&good, 2_000_000);
+        usage(&bad, 2_000_000);
+        match garbled {
+            None => std::fs::remove_file(bad.join(file)).expect("rm"),
+            Some(text) => write(&bad, file, text),
+        }
+        now.store(2_000_000, Ordering::SeqCst);
+        let load = tracker.reading(actions.to_path_buf()).await.expect(&case);
+
+        assert_eq!(load.cpu_usage_usec, 5_000_000, "{case}");
+        assert_eq!(load.working_set_bytes, 10_485_760 - 2_097_152, "{case}");
+        let unread = LeaseReading {
+            lease: id(2),
+            started_usec: 10,
+            usage: None,
+        };
+        assert_eq!(
+            load.leases,
+            [named(1, 10, 2_000_000, 4_000), unread],
+            "{case}"
+        );
+        tracker.ended(id(2));
+        assert_eq!(tracker.take_peak(id(2)), peak, "{case}");
+    }
+}
+
+/// Catches a lease's working set wrapping to a huge number, or the lease losing its usage,
+/// when its inactive file memory is more than `memory.current` holds (the two files are read
+/// at different instants).
+#[tokio::test]
+async fn a_lease_working_set_is_floored_at_zero() {
+    let actions = cgroup("load-lease-floor");
+    let parent = crate::unit_dir("load-lease-floor-dirs");
+    let (_, clock) = manual();
+    let tracker = LoadTracker::new(clock);
+    tracker.started(id(1), lease_cgroup(&parent, "l1", 7, 1_000, 5_000));
+    let load = tracker
+        .reading(actions.to_path_buf())
+        .await
+        .expect("reading");
+    assert_eq!(load.leases, [named(1, 0, 7, 0)]);
+}
+
+/// Catches a reading that is given up on (its future dropped while the blocking read still
+/// runs, as a daemon does when a reading outlives its deadline) letting the next reading
+/// start a second blocking read beside it: the gate is still held while the first read runs,
+/// and the next reading waits for it, then is the first one made (the lost reading took no
+/// sequence number).
+#[tokio::test]
+async fn a_reading_that_is_dropped_does_not_let_a_second_start() {
+    let actions = cgroup("load-dropped");
+    let (clock, mut held) = held_clock();
+    let tracker = Arc::new(LoadTracker::new(clock));
+    held.armed.store(true, Ordering::SeqCst);
+    let first = tokio::spawn({
+        let (tracker, dir) = (Arc::clone(&tracker), actions.to_path_buf());
+        async move { tracker.reading(dir).await }
+    });
+    // The blocking read is running: it is inside the clock.
+    held.entered.recv().await.expect("the read began");
+    first.abort();
+    first.await.expect_err("the reading was given up on");
+    assert!(
+        tracker.gate.try_lock().is_err(),
+        "the gate was let go while the first read still ran"
+    );
+    held.release.send(()).expect("release the read");
+    let next = tracker.reading(actions.to_path_buf()).await;
+    assert_eq!(next.expect("the next reading").seq, 1);
+}
+
+/// Catches a lease that ended while the files were read being listed (the reading would
+/// name a lease the daemon has already finished). The listing holds lease 1 only, and
+/// lease 1's window shows the rig takes windows.
+#[tokio::test]
+async fn a_lease_that_ends_while_the_files_are_read_is_not_listed() {
+    let actions = cgroup("load-ends-midway");
+    let parent = crate::unit_dir("load-ends-midway-dirs");
+    let (clock, mut held) = held_clock();
+    let tracker = Arc::new(LoadTracker::new(clock));
+    let one = lease_cgroup(&parent, "one", 0, 5_000, 1_000);
+    let two = lease_cgroup(&parent, "two", 0, 5_000, 1_000);
+    tracker.started(id(1), one.clone());
+    tracker.started(id(2), two.clone());
+    tracker
+        .reading(actions.to_path_buf())
+        .await
+        .expect("baseline");
+
+    // A second of clock later the leases have used one and two CPU-seconds, and lease 2
+    // ends while the second reading is part way through its files.
+    usage(&one, 1_000_000);
+    usage(&two, 2_000_000);
+    held.now.store(1_000_100, Ordering::SeqCst);
+    held.armed.store(true, Ordering::SeqCst);
+    let reading = tokio::spawn({
+        let (tracker, dir) = (Arc::clone(&tracker), actions.to_path_buf());
+        async move { tracker.reading(dir).await }
+    });
+    held.entered.recv().await.expect("the read began");
+    tracker.ended(id(2));
+    held.release.send(()).expect("release the read");
+    let load = reading.await.expect("joined").expect("reading");
+    assert_eq!(load.leases, [named(1, 100, 1_000_000, 4_000)]);
+
+    // Lease 1's window shows the rig takes windows.
+    tracker.ended(id(1));
+    assert_eq!(tracker.take_peak(id(1)), Some(1_000));
 }

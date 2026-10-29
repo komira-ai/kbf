@@ -1036,7 +1036,15 @@ where
         };
         let mut reapi_done = false;
         let outcome = tokio::select! {
-            served = reapi_serve => {
+            // The connections closed after GOAWAY, so no execution is open (`settle`); a
+            // daemon beside the server may hold the end ([`Drain::hold`]), and the worker
+            // listener serves meanwhile.
+            served = async {
+                let served = reapi_serve.await;
+                stopper.settle();
+                stopper.may_stand_down().await;
+                served
+            } => {
                 reapi_done = true;
                 served.map_err(ServeError::from)
             }

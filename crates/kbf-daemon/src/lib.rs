@@ -68,6 +68,7 @@ mod extras;
 mod kbf_extras;
 pub mod keeper;
 mod lease;
+mod lease_minutes;
 mod lease_panic;
 mod lease_peak;
 #[cfg(target_os = "linux")]
@@ -128,7 +129,8 @@ pub use plane::{
 pub use remote_index::RemoteIndex;
 pub use report::{Capacity, NodeReport};
 pub use runtime::{
-    FakeRuntime, NodeLoadError, Runtime, RuntimeError, UPLOAD_DEADLINE, Work, upload_within,
+    FakeRuntime, LeaseReading, LeaseUsage, NodeLoadError, NodeReading, Runtime, RuntimeError,
+    UPLOAD_DEADLINE, Work, upload_within,
 };
 pub use runtimes::{KindServedTwice, Runtimes};
 pub use status::DriverReport;

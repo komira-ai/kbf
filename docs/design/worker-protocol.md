@@ -428,8 +428,22 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
   told by lease and minute, a clock and a `covered` entry by lease). A bad record is dropped alone
   and counted; vetting never fails, and a heartbeat is never refused, nor its acknowledgement
   changed, for its lists. Every list at its cap and every number at its most digits make a load of
-  9,001 bytes and a heartbeat of about 11.5 KB, well under the 17 MiB a message may be. Nothing sends
-  the two lists yet and the server does not read them.
+  9,001 bytes and a heartbeat of about 11.5 KB, well under the 17 MiB a message may be. The server
+  does not read the two lists yet.
+
+  What the daemon sends. The container runtime's one reading per heartbeat lists every running
+  lease with its start and counters, and the daemon bins each lease's counters into minutes with
+  the job scheduler's per-minute binner (`js-agent-usage`): no second read and no timer of its own,
+  so a lease that ran less than about 35 s has no minute, and a window between readings longer
+  than three sampling windows is dropped and counted. The sampling window is the `Welcome`'s
+  heartbeat interval, at least one second. One batch of at most 64 minutes is in flight at a time:
+  a `HeartbeatAck` of `seq` frees the batch sent at `seq` or earlier, and a stream that ends with a
+  batch not acknowledged sends it again on the next stream (a repeat is harmless, above). A server
+  that does not acknowledge keeps the batch in flight; minutes that close meanwhile wait, and the
+  daemon drops those older than ten minutes. A lease's last, partial minute is closed when the
+  lease ends and rides the first heartbeat after it, not its `Result`. A reading that fails or
+  takes more than two seconds sends no `node_load` on that heartbeat and costs the minutes
+  nothing.
 
 The server acknowledges a heartbeat with `HeartbeatAck { seq }`, but only one from the
 node's newest stream. A heartbeat from a replaced stream is dropped unacknowledged, so
