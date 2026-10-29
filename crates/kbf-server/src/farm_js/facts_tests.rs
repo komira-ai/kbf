@@ -46,7 +46,7 @@ fn a_registered_worker_has_the_identity_and_protocol_it_reported() {
 fn a_hello_that_names_no_protocol_leaves_it_unknown() {
     let mut adapter = adapter();
     adapter.note_registered(&worker("a"), &reported("linux", "x86_64", Some(3)));
-    adapter.note_registered(&worker("b"), &reported("macos", "aarch64", None));
+    adapter.note_registered(&worker("b"), &reported("macos", "arm64", None));
 
     assert_eq!(
         adapter.worker_facts(&worker("b")).expect("b").protocol,
@@ -66,11 +66,11 @@ fn a_new_stream_replaces_the_identity_and_the_protocol() {
     let a = worker("a");
     adapter.note_registered(&a, &reported("linux", "x86_64", Some(3)));
 
-    adapter.note_registered(&a, &reported("macos", "aarch64", Some(4)));
+    adapter.note_registered(&a, &reported("macos", "arm64", Some(4)));
 
     let facts = adapter.worker_facts(&a).expect("facts");
     assert_eq!(facts.os, "macos");
-    assert_eq!(facts.arch, identity(&caps("macos", "aarch64")).1);
+    assert_eq!(facts.arch, identity(&caps("macos", "arm64")).1);
     assert_ne!(facts.arch, identity(&caps("linux", "x86_64")).1);
     assert_eq!(facts.protocol, Some(4));
 }
@@ -84,12 +84,12 @@ fn a_resent_hello_changes_the_identity_and_keeps_the_protocol() {
     let a = worker("a");
     adapter.note_registered(&a, &reported("linux", "x86_64", Some(3)));
 
-    adapter.note_resized(&a, &caps("macos", "aarch64"));
+    adapter.note_resized(&a, &caps("macos", "arm64"));
     adapter.note_resized(&worker("ghost"), &caps("linux", "x86_64"));
 
     let facts = adapter.worker_facts(&a).expect("facts");
     assert_eq!(facts.os, "macos");
-    assert_eq!(facts.arch, identity(&caps("macos", "aarch64")).1);
+    assert_eq!(facts.arch, identity(&caps("macos", "arm64")).1);
     assert_eq!(facts.protocol, Some(3));
     assert_eq!(adapter.worker_facts(&worker("ghost")), None);
 }
