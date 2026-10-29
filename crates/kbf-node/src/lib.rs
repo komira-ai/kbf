@@ -24,9 +24,11 @@
 //! Exits non-zero when the node cannot be detected or the configuration cannot be
 //! loaded; otherwise runs until SIGTERM or SIGINT, then drains: it takes no new lease,
 //! lets the running ones finish and report, waits for their acknowledgements and exits
-//! zero. A second signal, or `--drain-deadline-secs` after the first, stops it at once;
-//! leases still running then are abandoned (their processes killed, their directories
-//! removed) and the scheduler places them again.
+//! zero, however long the leases take: a drain never ends because time ran out. A second
+//! signal is the operator's hard stop; leases still running then are abandoned (their
+//! processes killed, their directories removed) and the scheduler places them again.
+//! `--drain-deadline-secs`, if given, only makes the daemon warn, once, with the number of
+//! leases still running, that many seconds after the first signal; it keeps waiting.
 //!
 //! Everything the daemon keeps on disk is under one directory, `--data-dir` (default
 //! `/var/lib/kbf`; `data_dir`): `leases/`, and under the container driver and the
@@ -227,11 +229,14 @@ pub struct Cli {
     memory_pressure_pause_percent: f64,
     /// On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets
     /// the running ones finish and report, waits for their acknowledgements, then exits
-    /// 0. A second signal, or this many seconds after the first, stops it at once and
-    /// abandons the leases still running. Used by `kbf daemon` and `kbf
+    /// 0, however long that takes. A second signal stops it at once and abandons the
+    /// leases still running. Left out, the drain has no deadline. Given, this many
+    /// seconds after the first signal the daemon logs a warning with the number of
+    /// leases still running and keeps waiting; the value has no upper bound, and 0
+    /// warns at once. It never abandons a lease. Used by `kbf daemon` and `kbf
     /// storage-and-daemon`; `kbf all-in-one` stops its daemon half with the server half.
-    #[arg(long, default_value_t = 600)]
-    drain_deadline_secs: u64,
+    #[arg(long, value_name = "SECONDS")]
+    drain_deadline_secs: Option<u64>,
     /// Where the kernel reports memory pressure stall information. For tests only.
     #[arg(long, hide = true, default_value = kbf_daemon::pressure::MEMORY_PSI)]
     psi_memory_file: PathBuf,
@@ -461,8 +466,9 @@ fn sizes_on(
 pub struct NodeHandle {
     tokio: tokio::runtime::Runtime,
     daemon: Daemon,
-    /// `--drain-deadline-secs`.
-    drain_deadline: Duration,
+    /// `--drain-deadline-secs`, when to warn that leases still run; `None` waits without
+    /// a word.
+    drain_deadline: Option<Duration>,
     /// The storage network check of a daemon that keeps the frontend's map.
     reach: Option<ReachCheck>,
 }
@@ -551,8 +557,9 @@ impl NodeHandle {
         self.drain_on(received, other)
     }
 
-    /// Drains on the first of `received` and ends at the second, at the drain deadline,
-    /// or when `other` completes, whichever is first ([`Daemon::run_draining`]).
+    /// Drains on the first of `received` and ends at the second, when the drain is
+    /// complete, or when `other` completes, whichever is first ([`Daemon::run_draining`]);
+    /// the drain deadline does not end it.
     fn drain_on(
         self,
         received: tokio::sync::mpsc::UnboundedReceiver<()>,
@@ -679,7 +686,7 @@ fn start_over<C: Cas>(
     Ok(NodeHandle {
         tokio,
         daemon,
-        drain_deadline: Duration::from_secs(cli.drain_deadline_secs),
+        drain_deadline: cli.drain_deadline_secs.map(Duration::from_secs),
         reach: None,
     })
 }
@@ -1419,6 +1426,27 @@ mod tests {
             "--node-id=mac-1",
         ];
         Cli::try_parse_from(base.iter().chain(extra))
+    }
+
+    /// Catches a drain deadline that comes back as a default (the old 600 s), one that is
+    /// capped, and a 0 that is refused (a live `kbf.toml` may hold it) or read as "no
+    /// deadline" (it was "stop at once"): absent is `None`, any number is kept as given,
+    /// and 0 is `Some(0)`, a warning at once.
+    #[test]
+    fn the_drain_deadline_is_absent_by_default_and_has_no_cap() {
+        let deadline = |extra: &[&str]| {
+            parse(&[&["--driver=native"], extra].concat())
+                .expect("flags")
+                .drain_deadline_secs
+        };
+        assert_eq!(deadline(&[]), None);
+        assert_eq!(deadline(&["--drain-deadline-secs=600"]), Some(600));
+        assert_eq!(deadline(&["--drain-deadline-secs=0"]), Some(0));
+        assert_eq!(
+            deadline(&["--drain-deadline-secs=315360000"]),
+            Some(315_360_000)
+        );
+        assert!(parse(&["--driver=native", "--drain-deadline-secs=-1"]).is_err());
     }
 
     /// Catches: native flags that do not reach the driver's configuration (the
