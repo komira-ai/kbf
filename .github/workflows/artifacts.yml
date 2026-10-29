@@ -1,15 +1,17 @@
 # The binaries nodes and servers run, the deploy tool, and the host tools that put them on
 # a host, built once per commit (docs/artifacts.md): kbf (all five modes, `kbf --version
 # --json` says what it is), kbf-daemon, kbf-server, kbf-deploy, kbf-host-install, kbf-updater,
-# kbf-signer and tierstore (built with its `server` feature) for linux-x86_64 and linux-arm64,
+# kbf-signer, tierstore (built with its `server` feature) and kbf-task (a static musl build, which runs in
+# any Linux image) for linux-x86_64 and linux-arm64,
 # and kbf, kbf-deploy, kbf-installer, kbf-host-install, kbf-updater and kbf-mac-provision for darwin-arm64 (each
 # signed ad hoc with the hardened runtime; a Mac runs `kbf daemon`). Each comes as a
 # tarball with a CycloneDX SBOM; one SHA256SUMS covers a commit's files. The kbf of each
 # platform also comes with `kbf-<commit>-<platform>.version.json`, the exact bytes its
 # `--version --json` printed on the runner that built it (only a runner of the platform can
-# run its binary). The Linux jobs also ship the frontend and the update coordinator as OCI
-# images, `kbf-frontend-image-<commit>-<platform>.oci.tar` and
-# `kbf-coordinator-image-<commit>-<platform>.oci.tar` (docs/artifacts.md).
+# run its binary). The Linux jobs also ship the frontend, the update coordinator and the task runner
+# as OCI images, `kbf-frontend-image-<commit>-<platform>.oci.tar`,
+# `kbf-coordinator-image-<commit>-<platform>.oci.tar` and
+# `kbf-task-image-<commit>-<platform>.oci.tar` (docs/artifacts.md).
 #
 # A pull request runs none of it unless it carries the label `needs-artifacts` (add the
 # label to get the files; every build and sums job carries the same condition, so an unlabelled
@@ -242,6 +244,9 @@ jobs:
       contents: read
     env:
       TARGET: x86_64-unknown-linux-gnu
+      # kbf-task is built for this target, which links no libc, so the one file runs in any Linux
+      # image of the arch (it is mounted into the images of the actions it runs).
+      STATIC_TARGET: x86_64-unknown-linux-musl
       # The branch the package trusts, and is attested for: on a push the pushed branch; a pull
       # request is never attested and builds the package for the branch it is aimed at.
       PKG_SOURCE_REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}
@@ -253,6 +258,14 @@ jobs:
           # shallow clone counts none (0, "unknown").
           fetch-depth: 0
       - run: rustup toolchain install
+      - name: Add the static target kbf-task is built for
+        run: rustup target add "$STATIC_TARGET"
+      # ring (through rustls) compiles C for the static target: its build looks for a musl C
+      # compiler, which the runner image does not have. `musl-tools` provides `musl-gcc`.
+      - name: Refresh the package lists for the musl C compiler
+        run: sudo apt-get update
+      - name: Install the musl C compiler ring's build uses for the static target
+        run: sudo apt-get install --yes --no-install-recommends musl-tools
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
@@ -273,12 +286,20 @@ jobs:
       # `kbf` is built without the installer (see the darwin job): its `kbf setup` links no proxy.
       - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-cli --bins
       - run: cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-host-install -p kbf-updater -p kbf-coordinator -p kbf-signer --bins
+      - name: Build kbf-task for the static target
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --locked --release --target "$STATIC_TARGET" -p kbf-task --bin kbf-task
       # `tierstore` is built by itself: its binary needs the crate's `server` feature (`required-features`),
       # and `-p tierstore --bins` without it builds no binary and says nothing.
       - run: cargo build --locked --release --target "$TARGET" -p tierstore --features server --bin tierstore
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
       - name: kbf-coordinator names the commit
         run: cargo xtask build-commit check "target/$TARGET/release/kbf-coordinator" "$GITHUB_SHA"
+      - name: kbf-task names the commit
+        run: cargo xtask build-commit check "target/$STATIC_TARGET/release/kbf-task" "$GITHUB_SHA"
+      - name: kbf-task is statically linked
+        run: cargo xtask static-elf "target/$STATIC_TARGET/release/kbf-task"
       - name: kbf names the commit and a release build
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
       # What kbf says it is, kept as an asset (the darwin kbf cannot be run here, so every platform's job does).
@@ -304,6 +325,14 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf-signer" --sbom crates/kbf-signer/kbf-signer_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
       - name: Package tierstore
         run: cargo xtask package --binary "target/$TARGET/release/tierstore" --sbom crates/tierstore/tierstore_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
+      # The SBOM of kbf-task is made for the target it is built for. This runs after the others are
+      # packaged because it writes every crate's SBOM again, for that target.
+      - name: SBOM of kbf-task for the static target
+        run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$STATIC_TARGET"
+      - name: The static SBOM step left Cargo.lock unchanged
+        run: git diff --exit-code -- Cargo.lock
+      - name: Package kbf-task
+        run: cargo xtask package --binary "target/$STATIC_TARGET/release/kbf-task" --sbom crates/kbf-task/kbf-task_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
       - name: The packaged kbf names the commit and a release build
         run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz" "$GITHUB_SHA"
       # The kbf package (packaging/linux/README.md): this job's `kbf` at /usr/bin/kbf, the real units
@@ -382,9 +411,27 @@ jobs:
         run: cmp target/coordinator-image-out/1.oci.tar target/coordinator-image-out/2.oci.tar
       - name: The coordinator image is the built kbf-coordinator, and is an asset
         run: cargo xtask pkg-image-asset --service coordinator --image target/coordinator-image-out/1.oci.tar --platform linux-x86_64 --commit "$GITHUB_SHA" --binary "target/$TARGET/release/kbf-coordinator" --out dist
+      # The task image (packaging/container/kbf-task/Dockerfile) is made the same
+      # way from the `kbf-task` built above, which `build-commit check` has shown names the
+      # commit. It has no tarball of its own, so the image is held to that file.
+      - name: The task image directories
+        run: mkdir -p target/task-image target/task-image-out
+      - name: The task image context holds the built kbf-task
+        run: cp "target/$STATIC_TARGET/release/kbf-task" target/task-image/kbf-task
+      - name: Build the task image, build 1 of 2
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/amd64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-task:$GITHUB_SHA" --file packaging/container/kbf-task/Dockerfile --output "type=docker,oci-mediatypes=true,dest=target/task-image-out/1.oci.tar,rewrite-timestamp=true" target/task-image
+      - name: Build the task image, build 2 of 2
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/amd64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-task:$GITHUB_SHA" --file packaging/container/kbf-task/Dockerfile --output "type=docker,oci-mediatypes=true,dest=target/task-image-out/2.oci.tar,rewrite-timestamp=true" target/task-image
+      - name: The two builds of the task image are the same bytes
+        run: cmp target/task-image-out/1.oci.tar target/task-image-out/2.oci.tar
+      - name: The task image is the built kbf-task, and is an asset
+        run: cargo xtask pkg-image-asset --service task --image target/task-image-out/1.oci.tar --platform linux-x86_64 --commit "$GITHUB_SHA" --binary "target/$STATIC_TARGET/release/kbf-task" --out dist
       # `docker image load` reads the file the release ships, as a host does.
       - name: Load the coordinator image with docker
         run: docker image load --input "dist/kbf-coordinator-image-$GITHUB_SHA-linux-x86_64.oci.tar"
+      # `docker image load` reads the file the release ships, as a host does.
+      - name: Load the task image with docker
+        run: docker image load --input "dist/kbf-task-image-$GITHUB_SHA-linux-x86_64.oci.tar"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-x86_64
@@ -408,6 +455,9 @@ jobs:
       contents: read
     env:
       TARGET: aarch64-unknown-linux-gnu
+      # kbf-task is built for this target, which links no libc, so the one file runs in any Linux
+      # image of the arch (it is mounted into the images of the actions it runs).
+      STATIC_TARGET: aarch64-unknown-linux-musl
       # The branch the package trusts, and is attested for: on a push the pushed branch; a pull
       # request is never attested and builds the package for the branch it is aimed at.
       PKG_SOURCE_REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}
@@ -419,6 +469,14 @@ jobs:
           # shallow clone counts none (0, "unknown").
           fetch-depth: 0
       - run: rustup toolchain install
+      - name: Add the static target kbf-task is built for
+        run: rustup target add "$STATIC_TARGET"
+      # ring (through rustls) compiles C for the static target: its build looks for a musl C
+      # compiler, which the runner image does not have. `musl-tools` provides `musl-gcc`.
+      - name: Refresh the package lists for the musl C compiler
+        run: sudo apt-get update
+      - name: Install the musl C compiler ring's build uses for the static target
+        run: sudo apt-get install --yes --no-install-recommends musl-tools
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
@@ -439,11 +497,19 @@ jobs:
       # `kbf` is built without the installer (see the darwin job): its `kbf setup` links no proxy.
       - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-cli --bins
       - run: cargo build --locked --release --target "$TARGET" -p kbf-deploy -p kbf-host-install -p kbf-updater -p kbf-coordinator -p kbf-signer --bins
+      - name: Build kbf-task for the static target
+        env:
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --locked --release --target "$STATIC_TARGET" -p kbf-task --bin kbf-task
       # `tierstore` is built by itself, with its `server` feature (see linux-x86_64).
       - run: cargo build --locked --release --target "$TARGET" -p tierstore --features server --bin tierstore
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
       - name: kbf-coordinator names the commit
         run: cargo xtask build-commit check "target/$TARGET/release/kbf-coordinator" "$GITHUB_SHA"
+      - name: kbf-task names the commit
+        run: cargo xtask build-commit check "target/$STATIC_TARGET/release/kbf-task" "$GITHUB_SHA"
+      - name: kbf-task is statically linked
+        run: cargo xtask static-elf "target/$STATIC_TARGET/release/kbf-task"
       - name: kbf names the commit and a release build
         run: cargo xtask build-commit check --json "target/$TARGET/release/kbf" "$GITHUB_SHA"
       # What kbf says it is, kept as an asset (see linux-x86_64).
@@ -469,6 +535,14 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf-signer" --sbom crates/kbf-signer/kbf-signer_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
       - name: Package tierstore
         run: cargo xtask package --binary "target/$TARGET/release/tierstore" --sbom crates/tierstore/tierstore_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
+      # The SBOM of kbf-task is made for the target it is built for. This runs after the others are
+      # packaged because it writes every crate's SBOM again, for that target.
+      - name: SBOM of kbf-task for the static target
+        run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$STATIC_TARGET"
+      - name: The static SBOM step left Cargo.lock unchanged
+        run: git diff --exit-code -- Cargo.lock
+      - name: Package kbf-task
+        run: cargo xtask package --binary "target/$STATIC_TARGET/release/kbf-task" --sbom crates/kbf-task/kbf-task_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
       - name: The packaged kbf names the commit and a release build
         run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" "$GITHUB_SHA"
       # The kbf package (packaging/linux/README.md): this job's `kbf` at /usr/bin/kbf, the real units
@@ -547,9 +621,27 @@ jobs:
         run: cmp target/coordinator-image-out/1.oci.tar target/coordinator-image-out/2.oci.tar
       - name: The coordinator image is the built kbf-coordinator, and is an asset
         run: cargo xtask pkg-image-asset --service coordinator --image target/coordinator-image-out/1.oci.tar --platform linux-arm64 --commit "$GITHUB_SHA" --binary "target/$TARGET/release/kbf-coordinator" --out dist
+      # The task image (packaging/container/kbf-task/Dockerfile) is made the same
+      # way from the `kbf-task` built above, which `build-commit check` has shown names the
+      # commit. It has no tarball of its own, so the image is held to that file.
+      - name: The task image directories
+        run: mkdir -p target/task-image target/task-image-out
+      - name: The task image context holds the built kbf-task
+        run: cp "target/$STATIC_TARGET/release/kbf-task" target/task-image/kbf-task
+      - name: Build the task image, build 1 of 2
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/arm64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-task:$GITHUB_SHA" --file packaging/container/kbf-task/Dockerfile --output "type=docker,oci-mediatypes=true,dest=target/task-image-out/1.oci.tar,rewrite-timestamp=true" target/task-image
+      - name: Build the task image, build 2 of 2
+        run: docker buildx build --builder kbf-image --no-cache --platform linux/arm64 --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --tag "kbf-task:$GITHUB_SHA" --file packaging/container/kbf-task/Dockerfile --output "type=docker,oci-mediatypes=true,dest=target/task-image-out/2.oci.tar,rewrite-timestamp=true" target/task-image
+      - name: The two builds of the task image are the same bytes
+        run: cmp target/task-image-out/1.oci.tar target/task-image-out/2.oci.tar
+      - name: The task image is the built kbf-task, and is an asset
+        run: cargo xtask pkg-image-asset --service task --image target/task-image-out/1.oci.tar --platform linux-arm64 --commit "$GITHUB_SHA" --binary "target/$STATIC_TARGET/release/kbf-task" --out dist
       # `docker image load` reads the file the release ships, as a host does.
       - name: Load the coordinator image with docker
         run: docker image load --input "dist/kbf-coordinator-image-$GITHUB_SHA-linux-arm64.oci.tar"
+      # `docker image load` reads the file the release ships, as a host does.
+      - name: Load the task image with docker
+        run: docker image load --input "dist/kbf-task-image-$GITHUB_SHA-linux-arm64.oci.tar"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-arm64
@@ -720,6 +812,10 @@ jobs:
           sbom-path: dist/tierstore-${{ github.sha }}-linux-x86_64.cdx.json
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
+          subject-path: dist/kbf-task-${{ github.sha }}-linux-x86_64.tar.gz
+          sbom-path: dist/kbf-task-${{ github.sha }}-linux-x86_64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
           subject-path: dist/kbf-daemon-${{ github.sha }}-linux-arm64.tar.gz
           sbom-path: dist/kbf-daemon-${{ github.sha }}-linux-arm64.cdx.json
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
@@ -750,6 +846,10 @@ jobs:
         with:
           subject-path: dist/tierstore-${{ github.sha }}-linux-arm64.tar.gz
           sbom-path: dist/tierstore-${{ github.sha }}-linux-arm64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/kbf-task-${{ github.sha }}-linux-arm64.tar.gz
+          sbom-path: dist/kbf-task-${{ github.sha }}-linux-arm64.cdx.json
       # Each tarball is also attested as its own subject, and the bundle of that attestation
       # (the file `gh attestation verify --bundle` takes offline) is copied beside the tarball
       # as `<tarball>.sigstore.json`, for the release and for a host that verifies without GitHub.
@@ -817,6 +917,14 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-tierstore-linux-x86_64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/tierstore-${GITHUB_SHA}-linux-x86_64.tar.gz.sigstore.json"
+      - id: provenance-kbf-task-linux-x86_64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-task-${{ github.sha }}-linux-x86_64.tar.gz
+      - name: Name the bundle of kbf-task for linux-x86_64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-task-linux-x86_64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-task-${GITHUB_SHA}-linux-x86_64.tar.gz.sigstore.json"
       - id: provenance-kbf-deb-linux-x86_64
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -841,6 +949,14 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-kbf-coordinator-image-linux-x86_64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/kbf-coordinator-image-${GITHUB_SHA}-linux-x86_64.oci.tar.sigstore.json"
+      - id: provenance-kbf-task-image-linux-x86_64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-task-image-${{ github.sha }}-linux-x86_64.oci.tar
+      - name: Name the bundle of the task image for linux-x86_64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-task-image-linux-x86_64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-task-image-${GITHUB_SHA}-linux-x86_64.oci.tar.sigstore.json"
       - id: provenance-kbf-daemon-linux-arm64
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -905,6 +1021,14 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-tierstore-linux-arm64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/tierstore-${GITHUB_SHA}-linux-arm64.tar.gz.sigstore.json"
+      - id: provenance-kbf-task-linux-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-task-${{ github.sha }}-linux-arm64.tar.gz
+      - name: Name the bundle of kbf-task for linux-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-task-linux-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-task-${GITHUB_SHA}-linux-arm64.tar.gz.sigstore.json"
       - id: provenance-kbf-deb-linux-arm64
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -929,6 +1053,14 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-kbf-coordinator-image-linux-arm64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/kbf-coordinator-image-${GITHUB_SHA}-linux-arm64.oci.tar.sigstore.json"
+      - id: provenance-kbf-task-image-linux-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-task-image-${{ github.sha }}-linux-arm64.oci.tar
+      - name: Name the bundle of the task image for linux-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-task-image-linux-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-task-image-${GITHUB_SHA}-linux-arm64.oci.tar.sigstore.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bundles-linux
@@ -1105,12 +1237,16 @@ jobs:
         run: cargo xtask pkg-image-asset --verify-only --service frontend --image "dist/kbf-frontend-image-$GITHUB_SHA-linux-x86_64.oci.tar" --platform linux-x86_64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-x86_64.tar.gz"
       - name: The signed linux-x86_64 coordinator image runs the coordinator as a user that is not root
         run: cargo xtask pkg-image-asset --verify-only --service coordinator --image "dist/kbf-coordinator-image-$GITHUB_SHA-linux-x86_64.oci.tar" --platform linux-x86_64 --commit "$GITHUB_SHA"
+      - name: The signed linux-x86_64 task image runs the task as a user that is not root
+        run: cargo xtask pkg-image-asset --verify-only --service task --image "dist/kbf-task-image-$GITHUB_SHA-linux-x86_64.oci.tar" --platform linux-x86_64 --commit "$GITHUB_SHA"
       - name: The signed linux-arm64 kbf package holds the attested kbf, the units of the modes and a trust directory for this branch
         run: cargo xtask pkg-kbf-asset --verify-only --package "dist/kbf-$GITHUB_SHA-linux-arm64.deb" --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz" --expect-ref "$GITHUB_REF"
       - name: The signed linux-arm64 frontend image holds the attested kbf
         run: cargo xtask pkg-image-asset --verify-only --service frontend --image "dist/kbf-frontend-image-$GITHUB_SHA-linux-arm64.oci.tar" --platform linux-arm64 --commit "$GITHUB_SHA" --kbf-tarball "dist/kbf-$GITHUB_SHA-linux-arm64.tar.gz"
       - name: The signed linux-arm64 coordinator image runs the coordinator as a user that is not root
         run: cargo xtask pkg-image-asset --verify-only --service coordinator --image "dist/kbf-coordinator-image-$GITHUB_SHA-linux-arm64.oci.tar" --platform linux-arm64 --commit "$GITHUB_SHA"
+      - name: The signed linux-arm64 task image runs the task as a user that is not root
+        run: cargo xtask pkg-image-asset --verify-only --service task --image "dist/kbf-task-image-$GITHUB_SHA-linux-arm64.oci.tar" --platform linux-arm64 --commit "$GITHUB_SHA"
 
   # Push to main only, after attest-darwin-arm64: the checks the planned deployment
   # job is to make (cargo xtask verify-assets, crates/xtask/src/sums.rs), for the branch

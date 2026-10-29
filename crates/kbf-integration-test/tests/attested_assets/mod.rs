@@ -57,7 +57,7 @@ pub fn packaged_kbf_debs(workflow: &str) -> Result<Vec<String>, String> {
 
 /// The (service, platform) of every `cargo xtask pkg-image-asset` line in the workflow's `run:`
 /// steps that makes an image an asset (it has no `--verify-only`), in file order: `service` is
-/// the word after `--service` (`frontend` or `coordinator`). The asset is
+/// the word after `--service` (`frontend`, `coordinator` or `task`). The asset is
 /// `kbf-<service>-image-<commit>-<platform>.oci.tar`. An error names a line without `--service`
 /// or `--platform`.
 pub fn packaged_images(workflow: &str) -> Result<Vec<(String, String)>, String> {
