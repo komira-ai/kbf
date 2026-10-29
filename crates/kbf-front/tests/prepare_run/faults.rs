@@ -15,6 +15,26 @@ async fn a_store_that_cannot_be_read_is_an_unavailable_fault() {
 }
 
 #[tokio::test]
+async fn a_store_whose_records_disagree_is_refused_not_retried() {
+    let (parts, store, prep) = standard().await;
+    store.reads_broken.store(true, SeqCst);
+    let error = refused(prep.prepare_run(LEASE, &parts.action, now()).await);
+    assert!(
+        matches!(&error, PrepareError::Closure(ClosureError::Invalid { .. })),
+        "{error}"
+    );
+    assert_eq!(error.fault(), PrepareFault::Refused, "{error}");
+}
+
+#[tokio::test]
+async fn a_store_that_cannot_say_what_it_holds_for_good_is_refused() {
+    let (parts, store, prep) = standard().await;
+    store.asks_broken.store(true, SeqCst);
+    let error = refused(prep.prepare_run(LEASE, &parts.action, now()).await);
+    assert_eq!(error.fault(), PrepareFault::Refused, "{error}");
+}
+
+#[tokio::test]
 async fn a_missing_input_is_refused_not_unavailable() {
     let parts = Parts::new();
     let (_, _, prep) = missing(&[parts.tree.b]).await;

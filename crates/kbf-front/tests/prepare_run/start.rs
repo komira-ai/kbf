@@ -57,6 +57,10 @@ async fn an_http_listener_url_is_refused_at_start() {
             "has a port that is not a number from 1 to 65535",
         ),
         (
+            "https://127.0.0.1:+80",
+            "has a port that is not a number from 1 to 65535",
+        ),
+        (
             "https://127.0.0.1:84x3",
             "has a port that is not a number from 1 to 65535",
         ),

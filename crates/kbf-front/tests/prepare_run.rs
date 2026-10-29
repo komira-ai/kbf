@@ -14,8 +14,7 @@ use bytes::Bytes;
 use kbf_front::grants::{ClaimsError, GrantError, GrantKey, Grants};
 use kbf_front::prepare_run::{
     AccessKey, ClosureError, ClosureLimits, ConfigError, ExpiryError, MAX_EXPIRY, PrepareError,
-    PrepareFault,
-    PutTarget, RunPrep, RunPrepConfig,
+    PrepareFault, PutTarget, RunPrep, RunPrepConfig,
 };
 use kbf_front::{Backend, Cache, CacheStorage, PackKeyMint, SegmentsConfig};
 use kbf_meta::{ActionRecord, Role};
@@ -204,6 +203,8 @@ struct Watched {
     asks: AtomicUsize,
     reads_down: AtomicBool,
     asks_down: AtomicBool,
+    reads_broken: AtomicBool,
+    asks_broken: AtomicBool,
 }
 
 impl Watched {
@@ -223,6 +224,8 @@ impl Watched {
             asks: AtomicUsize::new(0),
             reads_down: AtomicBool::new(false),
             asks_down: AtomicBool::new(false),
+            reads_broken: AtomicBool::new(false),
+            asks_broken: AtomicBool::new(false),
         })
     }
 
@@ -239,7 +242,12 @@ impl Watched {
 }
 
 fn down() -> StorageError {
-    StorageError::Invalid("the store is down".to_owned())
+    StorageError::Unavailable(Arc::new(std::io::Error::other("the store is down")))
+}
+
+/// What a store whose own records disagree answers: the same every time.
+fn broken() -> StorageError {
+    StorageError::Internal("the store's records disagree".to_owned())
 }
 
 impl Storage for Watched {
@@ -247,6 +255,9 @@ impl Storage for Watched {
         self.asks.fetch_add(1, SeqCst);
         if self.asks_down.load(SeqCst) {
             return Box::pin(async { Err(down()) });
+        }
+        if self.asks_broken.load(SeqCst) {
+            return Box::pin(async { Err(broken()) });
         }
         self.inner.find_missing(digests)
     }
@@ -262,6 +273,9 @@ impl Storage for Watched {
             .push(*digest);
         if self.reads_down.load(SeqCst) {
             return Box::pin(async { Err(down()) });
+        }
+        if self.reads_broken.load(SeqCst) {
+            return Box::pin(async { Err(broken()) });
         }
         self.inner.read_blob(digest)
     }
