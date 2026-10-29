@@ -206,3 +206,28 @@ async fn the_stop_timeout_ends_a_drain_that_is_past_its_deadline() {
     let ended = stream.await.expect("task").expect_err("ended");
     assert_eq!(ended.code(), Code::Unavailable, "{ended:?}");
 }
+
+/// Asserts that a deadline that passes in the moment between the last execution ending and
+/// the sequence's next look at the open count reports nothing: no WARN, no
+/// `deadline_passed`, and the drain ends as it would have.
+#[tokio::test(start_paused = true)]
+async fn a_deadline_passing_as_the_last_execution_ends_reports_nothing() {
+    let log = crate::test_log::capture();
+    let rig = Rig::new(timing(0, 30));
+    let open = rig.backend.metrics().execute.open_executions.raise();
+
+    assert!(rig.sequence.begin());
+    let mut phases = rig.drain.phases();
+    phases
+        .wait_for(|phase| *phase == Phase::Draining)
+        .await
+        .expect("the drain is alive");
+    // Both happen before the sequence looks at the count again.
+    drop(open);
+    rig.drain.pass_deadline();
+    rig.drain.sequence_finished().await;
+
+    assert!(!rig.drain.deadline_passed());
+    assert!(!log.text().contains("deadline passed"), "{}", log.text());
+    assert_eq!(rig.drain.phase(), Phase::Closing);
+}
