@@ -1720,6 +1720,54 @@ not SHA-256, is never asked of the packs and always counts in `kbf_pack_daemon_e
 so a farm that reads such blobs has a sum that keeps rising: the criterion is that it has stopped
 rising apart from those reads.
 
+**Measured load.** A frontend with a farm hands the scheduler each node load reading it accepts
+([Node load](#node-load)), in every `--placement-load` mode, and exports what the scheduler has
+counted of them and of placement by load, and each node's load as its view shows it, so that
+placement by measured load can be watched before and after `--placement-load on`. The same families
+are written by the farm's own scheduler core and by the js core.
+
+The scheduler's counters are written on every scrape of a frontend with a farm, 0 included, and
+count since the frontend started (a restart starts them again from 0):
+
+| Family | Type | What it measures |
+|---|---|---|
+| `kbf_sched_load_readings_accepted_total` | counter | readings the scheduler accepted |
+| `kbf_sched_load_readings_dropped_total` | counter | readings the scheduler dropped: out of order, a counter or the clock going back, or implausible (more than four times the node's cores or memory). A reading the server itself refuses (a repeat, an older one) is not handed to the scheduler: it counts only in `kbf_node_load_refused_minutes_total` of its node, by the minutes it carried |
+| `kbf_sched_load_floor_windows_total`, `kbf_sched_load_floor_binds_total` | counter | accepted readings that gave a window, and of those the windows in which the floor from the covered leases' predictions was above the measurement |
+| `kbf_sched_load_misfit_cpu_minutes_total`, `kbf_sched_load_misfit_memory_minutes_total` | counter | lease-minutes whose mean cores were over twice the charge (and 250 millicores over it), and whose working set was above the curve's remaining maximum |
+| `kbf_sched_load_demotions_cpu_total`, `kbf_sched_load_demotions_memory_total` | counter | times the shape guard charged a key's CPU, or memory, flat for its next runs |
+| `kbf_sched_load_admitted_total` | counter | leases the load predicate admitted (`--placement-load on`) |
+| `kbf_sched_load_admitted_fallback_total`, `kbf_sched_load_admitted_cold_total`, `kbf_sched_load_curve_flat_total`, `kbf_sched_load_profile_cpu_total`, `kbf_sched_load_profile_memory_total` | counter | of those admitted: on a node charged by prediction alone; cold (a key with no usable estimate); whose key has a curve that was not used (charged flat in CPU and memory); charged by curve in CPU; charged by curve in memory |
+| `kbf_sched_load_blocked_total`, `kbf_sched_load_cold_deferred_total` | counter | queued requests, once per request per round, that had a node with room apart from the predicate and found none it admitted, and of those the ones whose only obstacle was the cold cap |
+| `kbf_sched_load_reservations_total` | counter | head reservations taken or moved |
+| `kbf_sched_load_score_evaluations_total`, `kbf_sched_load_scored_total` | counter | slot-resource evaluations of the placement score, and placements the score chose among two or more nodes |
+| `kbf_sched_load_chose_slack_total`, `kbf_sched_load_chose_distrusted_total`, `kbf_sched_load_chose_concentrated_total`, `kbf_sched_load_chose_by_tie_break_total` | counter | of the scored placements: on a node predicted above its capacity; on a distrusted node; on a node concentrated on the lease's key; decided by the last tie-break |
+| `kbf_sched_load_fallback_cpu_limited_nodes` | gauge | live nodes charged by prediction because their newest reading says the actions cgroup has a CPU limit, while `--placement-load` is on: not a running total, and above 0 means a node whose cgroup limit and pool do not match |
+
+Each node that has a load in its view ([Node load](#node-load); `GET /v1/nodes/{id}`) has one
+sample of each of these, labelled `node` (the node id) as the pack families are: at most one series
+per node the frontend has accepted a reading of. A node with no accepted reading has none. A node
+whose stream has closed keeps its samples, going stale, until the frontend restarts (as `load` is
+kept in the node view and the pack counts are kept); with no node having a load no family is
+written. A value the view leaves out has no sample and is never written as 0, and a family that no
+node has a sample of is not written at all.
+
+| Family | Type | Labels | What it measures, and when it has no sample |
+|---|---|---|---|
+| `kbf_node_load_measured_cpu_millicores` | gauge | `node` | `measured_cpu_millicores`: the CPU the node's actions used, in thousandths of a CPU, the larger of the last two windows. No sample with fewer than two windows, and when `stale` |
+| `kbf_node_load_memory_working_set_bytes` | gauge | `node` | `memory_working_set_bytes` at the last accepted reading |
+| `kbf_node_load_memory_active_file_bytes` | gauge | `node` | `memory_active_file_bytes` at the last accepted reading |
+| `kbf_node_load_admission_working_set_bytes` | gauge | `node` | `admission_working_set_bytes`: the working set less the active file pages beyond a quarter of the node's memory |
+| `kbf_node_load_stale` | gauge | `node` | 1 when no reading was accepted for three windows, else 0 |
+| `kbf_node_load_actions_cpu_limited` | gauge | `node` | 1 when the actions cgroup has a CPU quota, else 0 |
+| `kbf_node_load_cpu_throttled_usec_total`, `kbf_node_load_cpu_pressure_some_usec_total` | counter | `node` | the cumulative CPU throttled time and CPU pressure (`some` total) of the actions cgroup, in microseconds, of the daemon's process. No sample when the daemon could not read them |
+| `kbf_node_load_clocks_total`, `kbf_node_load_minutes_total` | counter | `node` | `lists.clocks` and `lists.minutes`: the clock and minute records kept, summed over the accepted readings of the daemon's process |
+| `kbf_node_load_refused_minutes_total` | counter | `node` | `lists.refused_minutes`: the minutes carried by readings that were not accepted |
+| `kbf_node_load_dropped_total` | counter | `node`, `reason` | `lists.dropped`, one series per reason: `invalid`, `duplicate`, `over_cap` (always all three for a node that has a load) |
+
+The counters of a node are those of its daemon's process: they start again from 0 when it restarts.
+The `covered` list of the view is not exported.
+
 **Reading a stall with idle slots.** `kbf_sched_queued` high and `kbf_sched_leases` below the
 nodes' slots means work is waiting that placement cannot use (look at the node's booking and
 `GET /v1/nodes`). `kbf_sched_queued` low while buck2 has many Executes open means they have not
