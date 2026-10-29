@@ -708,7 +708,7 @@ over_each_store!(
     a_js_farm_takes_over_the_store_a_legacy_farm_left_mid_flight,
     a_legacy_farm_takes_over_the_store_a_js_farm_left_mid_flight,
     a_row_written_before_the_cost_field_recovers_at_its_request,
-    a_legacy_walled_operation_finished_by_the_js_core_leaves_its_opwall_row,
+    a_legacy_walled_operation_finished_by_the_js_core_deletes_its_opwall_row,
 );
 
 /// A rollback is forward only if the other direction works too: this is the flip itself. A
@@ -853,16 +853,15 @@ async fn a_row_written_before_the_cost_field_recovers_at_its_request(backing: Ba
 }
 
 /// A legacy farm keeps the longest an action may run in an `opwall/` row beside the
-/// operation's, and deletes it with them. The js core does not use `max_wall` yet, so an
-/// operation the legacy farm walled and the js core finishes leaves the row behind. This
-/// asserts what happens today: the answer is delivered and the other rows go; the `opwall/`
-/// row stays, and a legacy farm started over the store afterwards (the rollback) opens it
-/// all the same. When the js core takes `max_wall`, the row is deleted with the operation's,
-/// and the count below becomes 0.
+/// operation's, and deletes it with them. The js core keeps the same row (it takes
+/// `max_wall` at submit and restores it at start), so an operation the legacy farm walled and
+/// the js core finishes goes with its `opwall/` row: the answer is delivered and every row of
+/// the operation is deleted, and a legacy farm started over the store afterwards (the
+/// rollback) opens it all the same.
 ///
-/// Catches: a js core that cannot finish an operation whose wall is stored, a leftover row
-/// that stops the legacy core starting, and a changed behaviour nobody decided on.
-async fn a_legacy_walled_operation_finished_by_the_js_core_leaves_its_opwall_row(backing: Backing) {
+/// Catches: a js core that cannot finish an operation whose wall is stored, a wall row left
+/// behind by the js core, and a leftover row that stops the legacy core starting.
+async fn a_legacy_walled_operation_finished_by_the_js_core_deletes_its_opwall_row(backing: Backing) {
     let disk = Disk::over(backing);
     let writer = farm_on(SchedulerCore::Legacy, &disk);
     let mut node = Node::join(&writer, "node-a", 1);
@@ -894,8 +893,8 @@ async fn a_legacy_walled_operation_finished_by_the_js_core_leaves_its_opwall_row
     }
     assert_eq!(
         disk.rows("opwall/").len(),
-        1,
-        "the js core now deletes the wall row: make this 0 and say so in the PR"
+        0,
+        "the js core deletes the wall row with the operation's"
     );
     drop(node);
     drop(farm);
