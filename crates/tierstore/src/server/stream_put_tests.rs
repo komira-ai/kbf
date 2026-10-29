@@ -70,6 +70,9 @@ struct Generated {
     pieces: usize,
     flip_last: bool,
     made: Arc<AtomicUsize>,
+    /// A clock, and the milliseconds it is moved by before each piece comes: a client that is
+    /// slow, in the time the server reads.
+    tick: Option<(Arc<TestClock>, u64)>,
 }
 
 impl Generated {
@@ -79,7 +82,15 @@ impl Generated {
             pieces,
             flip_last: false,
             made: Arc::clone(made),
+            tick: None,
         }
+    }
+
+    /// The same, a client that takes `millis` of the time of `clock` to send each piece.
+    fn ticking(pieces: usize, clock: &Arc<TestClock>, millis: u64) -> Self {
+        let mut body = Self::new(pieces, &Arc::default());
+        body.tick = Some((Arc::clone(clock), millis));
+        body
     }
 
     /// The same, with the last byte of the last piece not the one the hash was made of.
@@ -101,6 +112,9 @@ impl Body for Generated {
         let this = self.get_mut();
         if this.next == this.pieces {
             return Poll::Ready(None);
+        }
+        if let Some((clock, millis)) = &this.tick {
+            clock.advance(*millis);
         }
         let last = this.next + 1 == this.pieces;
         let bytes = piece(this.next, this.flip_last && last);
@@ -165,6 +179,9 @@ struct Seen {
 struct Probe {
     made: Arc<AtomicUsize>,
     seen: Arc<Mutex<Seen>>,
+    /// A clock, and the milliseconds it is moved by before the backend takes the first piece:
+    /// a tier that is slow to answer before it takes the body.
+    stall: Option<(Arc<TestClock>, u64)>,
 }
 
 #[async_trait]
@@ -180,6 +197,9 @@ impl Backend for Probe {
         len: Option<u64>,
         mut body: PartBody<'_>,
     ) -> Result<(), Error> {
+        if let Some((clock, millis)) = &self.stall {
+            clock.advance(*millis);
+        }
         let (mut pieces, mut bytes, mut ahead) = (0_usize, 0_u64, 0_usize);
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;
@@ -237,6 +257,7 @@ async fn a_large_body_is_streamed_through_a_bounded_queue() {
     let probe = Probe {
         made: Arc::clone(&made),
         seen: Arc::clone(&seen),
+        stall: None,
     };
     let clock = Arc::new(TestClock::new());
     clock.set(NOW);
@@ -499,6 +520,16 @@ async fn a_hot_tier_with_no_room_sends_the_streamed_body_to_the_cold_tier() {
 /// A server over an S3 tier (the loopback S3 service of the tests) whose limit is `limit`.
 async fn s3_server(limit: usize) -> (FakeS3, Arc<Server>, ServerConfig) {
     let s3 = FakeS3::start().await;
+    let clock = Arc::new(TestClock::new());
+    clock.set(NOW);
+    let mut config = ServerConfig::new(BUCKET, KEY_ID, SECRET, clock);
+    config.max_request_bytes = limit;
+    let server = Server::new(s3_backend(&s3), config.clone());
+    (s3, server, config)
+}
+
+/// A backend over the bucket of the loopback S3 service.
+fn s3_backend(s3: &FakeS3) -> Arc<S3Backend> {
     let store = S3Config {
         endpoint: s3.endpoint().to_owned(),
         region: "us-east-1".to_owned(),
@@ -509,13 +540,7 @@ async fn s3_server(limit: usize) -> (FakeS3, Arc<Server>, ServerConfig) {
         request_timeout: Duration::from_secs(30),
         min_body_rate: None,
     };
-    let backend = S3Backend::new(store).unwrap();
-    let clock = Arc::new(TestClock::new());
-    clock.set(NOW);
-    let mut config = ServerConfig::new(BUCKET, KEY_ID, SECRET, clock);
-    config.max_request_bytes = limit;
-    let server = Server::new(Arc::new(backend), config.clone());
-    (s3, server, config)
+    Arc::new(S3Backend::new(store).unwrap())
 }
 
 /// Asserts that, over an S3 tier, which cannot take a body of unknown length without holding
@@ -612,38 +637,162 @@ async fn a_put_over_the_concurrency_limit_is_answered_slow_down_and_the_next_is_
     assert_eq!(rig.put("third", b"x").await.status, StatusCode::OK);
 }
 
-/// Asserts that a body that comes in under the least average rate, once the grace has passed, is
-/// cut with 400 `RequestTimeout` and stores nothing, although no wait in it is as long as the
-/// idle timeout; and that the same bytes sent without the wait are stored. The clock is paused:
-/// the wait is moved over, not slept.
+/// Asserts that a body that comes in under the least average rate, once the time spent waiting
+/// for the client has passed the grace, is cut with 400 `RequestTimeout` and stores nothing; that
+/// a body that takes as long in all but comes in over the least rate is stored; and that a body
+/// that comes at once is stored. The time is the server's clock, which the body moves by hand.
 #[tokio::test(start_paused = true)]
 async fn a_body_under_the_least_rate_is_cut_and_stores_nothing() {
-    let rig = Rig::with(1 << 20, |config| {
-        config.put_min_bytes_per_sec = 100;
+    const PIECES: usize = 150;
+    let rig = Rig::with(1 << 30, |config| {
+        config.put_min_bytes_per_sec = 100_000;
         config.put_rate_grace = Duration::from_secs(10);
     })
     .await;
-    let uri = format!("/{BUCKET}/k");
-    let slow = vec![
-        Step::Data(b"abcd"),
-        Step::Wait(Duration::from_secs(20)),
-        Step::Data(b"efgh"),
-    ];
-    let cut = rig
-        .send_played("PUT", &uri, &[], b"abcdefgh", Scripted::new(slow))
-        .await;
+    let clock = rig.hot_mem.clock();
+    let (claim, _) = truth(PIECES);
+
+    // 20 s for a piece of 32 KiB is 1.6 KB a second.
+    let slow = Generated::ticking(PIECES, &clock, 20_000);
+    let cut = answer(
+        &rig.server,
+        put_request(&rig.config, "k", &claim, &[], slow),
+    )
+    .await;
     assert_eq!(cut.status, StatusCode::BAD_REQUEST);
     assert_eq!(cut.code(), "RequestTimeout");
     assert!(texts(&cut.body, "Message").concat().contains("average"));
     assert!(rig.hot_mem.get("k", None).await.is_err());
     assert!(rig.cold_mem.get("k", None).await.is_err());
 
-    let prompt = vec![Step::Data(b"abcd"), Step::Data(b"efgh")];
-    let whole = rig
-        .send_played("PUT", &uri, &[], b"abcdefgh", Scripted::new(prompt))
-        .await;
+    // 100 ms for a piece is 327 KB a second, over the floor, for 15 s in all: past the grace.
+    let steady = Generated::ticking(PIECES, &clock, 100);
+    let kept = answer(
+        &rig.server,
+        put_request(&rig.config, "j", &claim, &[], steady),
+    )
+    .await;
+    assert_eq!(kept.status, StatusCode::OK);
+    assert_eq!(
+        rig.hot_mem.get("j", None).await.unwrap().len(),
+        PIECES * PIECE
+    );
+
+    let made = Arc::default();
+    let prompt = Generated::new(PIECES, &made);
+    let whole = answer(
+        &rig.server,
+        put_request(&rig.config, "i", &claim, &[], prompt),
+    )
+    .await;
     assert_eq!(whole.status, StatusCode::OK);
-    assert_eq!(rig.hot_mem.get("k", None).await.unwrap(), "abcdefgh");
+}
+
+/// Asserts that a tier that is slow to answer before it takes the body is not blamed on the
+/// client: the backend lets 60 s of the server's clock pass before it takes its first piece,
+/// the body is ready at once, and the put is stored although the average over the whole put is
+/// far under the floor.
+#[tokio::test]
+async fn a_tier_that_is_slow_before_it_takes_the_body_is_not_blamed_on_the_client() {
+    const PIECES: usize = 12;
+    let clock = Arc::new(TestClock::new());
+    clock.set(NOW);
+    let made = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let probe = Probe {
+        made: Arc::clone(&made),
+        seen: Arc::clone(&seen),
+        stall: Some((Arc::clone(&clock), 60_000)),
+    };
+    let mut config = ServerConfig::new(BUCKET, KEY_ID, SECRET, clock);
+    config.put_min_bytes_per_sec = 1_000_000;
+    config.put_rate_grace = Duration::from_secs(10);
+    let server = Server::new(Arc::new(probe), config.clone());
+    let (claim, _) = truth(PIECES);
+
+    let body = Generated::new(PIECES, &made);
+    let stored = answer(&server, put_request(&config, "k", &claim, &[], body)).await;
+
+    assert_eq!(stored.status, StatusCode::OK);
+    assert_eq!(seen.lock().unwrap().pieces, PIECES);
+}
+
+/// Asserts that a body cut by the rate floor while an S3 multipart upload is under way (the body
+/// is over the 16 MiB a request holds) leaves no object and no open upload, and gives its
+/// permit back: with one permit, the next put is taken.
+#[tokio::test]
+async fn a_rate_cut_over_s3_aborts_the_upload_and_frees_the_permit() {
+    const PIECES: usize = 544;
+    let s3 = FakeS3::start().await;
+    let clock = Arc::new(TestClock::new());
+    clock.set(NOW);
+    let mut config = ServerConfig::new(BUCKET, KEY_ID, SECRET, clock.clone());
+    config.max_concurrent_puts = 1;
+    config.put_min_bytes_per_sec = 1_000_000;
+    config.put_rate_grace = Duration::from_secs(10);
+    let server = Server::new(s3_backend(&s3), config.clone());
+    let (claim, _) = truth(PIECES);
+    let length = (PIECES * PIECE).to_string();
+    let told = [("content-length", length.as_str())];
+
+    let slow = Generated::ticking(PIECES, &clock, 1_000);
+    let cut = answer(&server, put_request(&config, "big", &claim, &told, slow)).await;
+
+    assert_eq!(cut.status, StatusCode::BAD_REQUEST);
+    assert_eq!(cut.code(), "RequestTimeout");
+    assert_eq!(s3.keys(), Vec::<String>::new());
+    assert_eq!(s3.incomplete_uploads(), 0);
+    assert_eq!(s3.stats().completed, 0);
+    assert_eq!(server.put_permits_free(), 1);
+
+    let (small, _) = truth(4);
+    let size = (4 * PIECE).to_string();
+    let told = [("content-length", size.as_str())];
+    let made = Arc::default();
+    let next = put_request(&config, "next", &small, &told, Generated::new(4, &made));
+    assert_eq!(answer(&server, next).await.status, StatusCode::OK);
+    assert_eq!(s3.keys(), ["next"]);
+}
+
+/// Asserts, through a proxy with a directory hot tier and an S3 cold tier, that a put with no
+/// `Content-Length` is refused 411 before a byte of the body is read (the cold tier needs the
+/// length), and that a part of an upload whose `Content-Length` is over the limit is refused 413
+/// before a byte is read: nothing is stored in either tier.
+#[tokio::test]
+async fn a_proxy_with_an_s3_cold_tier_refuses_a_body_of_no_length_or_too_long_before_reading() {
+    let hot_dir = TestDir::under(std::env::temp_dir(), "tierstore-stream-mixed");
+    let hot = Arc::new(DirBackend::open(hot_dir.path()).unwrap());
+    let s3 = FakeS3::start().await;
+    let clock = Arc::new(TestClock::new());
+    clock.set(NOW);
+    let proxy_config = ProxyConfig::new("p1", 1 << 40, clock.clone());
+    let proxy = Proxy::open(hot.clone(), s3_backend(&s3), proxy_config);
+    let proxy = proxy.await.unwrap();
+    let mut config = ServerConfig::new(BUCKET, KEY_ID, SECRET, clock);
+    config.max_request_bytes = 4 * PIECE;
+    let server = Server::new(Arc::new(proxy), config.clone());
+    let made = Arc::new(AtomicUsize::new(0));
+    let (claim, _) = truth(5);
+
+    let chunked = put_request(&config, "k", &claim, &[], Generated::new(5, &made));
+    let refused = answer(&server, chunked).await;
+    assert_eq!(refused.status, StatusCode::LENGTH_REQUIRED);
+    assert_eq!(refused.code(), "MissingContentLength");
+
+    let uploads = format!("/{BUCKET}/mp?uploads");
+    let started = answer(&server, sign(&config, "POST", &uploads, &[], b"")).await;
+    let id = texts(&started.body, "UploadId").concat();
+    let part_key = format!("mp?partNumber=1&uploadId={id}");
+    let length = (5 * PIECE).to_string();
+    let told = [("content-length", length.as_str())];
+    let part = put_request(&config, &part_key, &claim, &told, Generated::new(5, &made));
+    let refused = answer(&server, part).await;
+    assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(refused.code(), "EntityTooLarge");
+
+    assert_eq!(made.load(Ordering::SeqCst), 0);
+    assert_eq!(Tiers::data_keys(&hot).await, Vec::<String>::new());
+    assert_eq!(s3.keys(), Vec::<String>::new());
 }
 
 /// Asserts that two streamed puts of one key at once end with one 200 and one 412
