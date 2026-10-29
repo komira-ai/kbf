@@ -44,8 +44,9 @@
 //! that overwrites, an `If-Match` that is ignored, a range answered with the whole object, a
 //! head with no `Last-Modified`, a listing that ignores `start-after`, and on the cold tier a
 //! multipart completion that overwrites) is not served over: the process says which tier, which
-//! check and what the tier answered, and exits with status 3. `--skip-backend-check` leaves a
-//! named check out, for a reason that is logged at the start.
+//! check and what the tier answered, and exits with status 3. `--skip-backend-check` leaves the
+//! multipart-completion check out, for a reason that is logged at the start; no other check can
+//! be left out.
 
 use std::ffi::OsString;
 use std::future::Future;
@@ -221,13 +222,14 @@ pub struct Cli {
     /// logged on stderr, and a drain waits no longer than this for a stalled client.
     #[arg(long, default_value = "30s", value_parser = parse_duration)]
     pub body_idle_timeout: Duration,
-    /// Leaves one check of the start-up self-test of the tiers out, for a reason: `CHECK=REASON`,
-    /// where CHECK is `create-only`, `last-modified`, `if-match`, `range`, `paging` or
-    /// `multipart-conditional`, and REASON says why the store cannot pass it (for example
-    /// `multipart-conditional=store-ignores-if-none-match-on-completion`). The reason is
-    /// written to stderr at every start. Without the check the guarantee it tests is not
-    /// known to hold: skip one only for a store you have shown to be safe another way. May be
-    /// given more than once; none is skipped by default.
+    /// Leaves the multipart-completion check of the start-up self-test out, for a reason:
+    /// `multipart-conditional=REASON`, where REASON says why the store cannot pass it (for
+    /// example `multipart-conditional=store-ignores-if-none-match-on-completion`). It is the
+    /// only check that can be left out: the others test the guarantees the proxy, the lease and
+    /// the journal stand on, and any other name is refused as a usage error. The reason is
+    /// written to stderr at every start. Without the check, a multipart upload may replace an
+    /// object that exists: leave it out only for a store you have shown to be safe another way.
+    /// None is skipped by default.
     #[arg(long, value_name = "CHECK=REASON", value_parser = parse_skip)]
     pub skip_backend_check: Vec<SkippedCheck>,
 }
@@ -241,7 +243,8 @@ pub struct SkippedCheck {
     pub reason: String,
 }
 
-/// A skipped check: the name of a check, `=`, and a reason that is not empty.
+/// A skipped check: `multipart-conditional`, `=`, and a reason that is not empty. Any other
+/// check is refused.
 fn parse_skip(text: &str) -> Result<SkippedCheck, String> {
     let names: Vec<&str> = Check::ALL.iter().map(|check| check.name()).collect();
     let usage = format!(
@@ -250,6 +253,11 @@ fn parse_skip(text: &str) -> Result<SkippedCheck, String> {
     );
     let (name, reason) = text.split_once('=').ok_or_else(|| usage.clone())?;
     let check = Check::parse(name).ok_or(usage)?;
+    if check != Check::MultipartConditional {
+        return Err(format!(
+            "the {name} check cannot be skipped: only multipart-conditional can"
+        ));
+    }
     let reason = reason.trim();
     if reason.is_empty() {
         return Err(format!(

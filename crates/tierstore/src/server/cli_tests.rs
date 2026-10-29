@@ -620,19 +620,20 @@ async fn a_halt_cuts_the_pass_that_is_running() {
     assert!(cold_mem.get("k", None).await.is_err());
 }
 
-/// Asserts that `--skip-backend-check` takes a check name and a reason, may be given more than
-/// once, keeps the order, trims the reason and keeps a `=` inside it; and that a value with no
-/// `=`, an unknown check, or an empty or blank reason is refused by the parser with a message
-/// that lists the checks or names the check that lacks a reason.
+/// Asserts that `--skip-backend-check` takes `multipart-conditional` and a reason, may be given
+/// more than once, trims the reason and keeps a `=` inside it; that a value with no `=` or an
+/// unknown check is refused with a message that lists the checks; that a blank reason is refused
+/// with a message that says a reason is needed; and that every check but
+/// `multipart-conditional` is refused as a usage error (exit status 2), whatever its reason.
 #[test]
-fn a_skipped_check_is_a_check_name_and_a_reason() {
+fn only_the_multipart_check_can_be_skipped_and_with_a_reason() {
     let mut args = flags("key", &[]);
     args.extend(
         [
             "--skip-backend-check",
             "multipart-conditional= store ignores it on completion ",
             "--skip-backend-check",
-            "range=a=b",
+            "multipart-conditional=a=b",
         ]
         .map(str::to_owned),
     );
@@ -643,7 +644,7 @@ fn a_skipped_check_is_a_check_name_and_a_reason() {
             reason: "store ignores it on completion".to_owned(),
         },
         SkippedCheck {
-            check: Check::Range,
+            check: Check::MultipartConditional,
             reason: "a=b".to_owned(),
         },
     ];
@@ -654,12 +655,21 @@ fn a_skipped_check_is_a_check_name_and_a_reason() {
         assert!(why.contains("CHECK=REASON"), "{text}: {why}");
         assert!(why.contains("multipart-conditional"), "{text}: {why}");
     }
-    for text in ["range=", "paging=   "] {
+    for text in ["multipart-conditional=", "multipart-conditional=   "] {
         let why = parse_skip(text).unwrap_err();
         assert!(why.contains("needs a reason"), "{text}: {why}");
     }
-    let refused = Cli::try_parse_from(flags("key", &[("--skip-backend-check", "range")]));
-    assert!(refused.is_err());
+    for check in Check::ALL
+        .into_iter()
+        .filter(|c| *c != Check::MultipartConditional)
+    {
+        let value = format!("{check}=the store cannot do it");
+        let why = parse_skip(&value).unwrap_err();
+        assert!(why.contains("cannot be skipped"), "{value}: {why}");
+        assert!(why.contains(check.name()), "{value}: {why}");
+        let refused = Cli::try_parse_from(flags("key", &[("--skip-backend-check", &value)]));
+        assert_eq!(refused.unwrap_err().exit_code(), 2, "{value}");
+    }
 }
 
 /// Asserts that the id of a start's probe keys has the proxy id, the time and the process, with
