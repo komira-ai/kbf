@@ -29,7 +29,9 @@ hex.workspace = true
 futures.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
-hyper-util = { workspace = true, features = ["tokio"] }
+# The job-facing read listener serves HTTP/1.1 over its own TLS connections (src/frontend/job_read.rs).
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["service", "tokio"] }
 # The loop around the scheduler (src/farm_js): `KbfAdapter` is its `Adapter`.
 js-server-core.workspace = true
 # The scheduler's rows in the state store (src/farm_js): the farm's row codec and its
@@ -122,7 +124,11 @@ libc.workspace = true
 postgres.workspace = true
 prost.workspace = true
 rcgen.workspace = true
+# The client of the job-facing read listener's tests: TLS over the farm CA, dialling an IP address
+# (src/frontend/job_read/tests.rs).
+rustls.workspace = true
 tokio = { workspace = true, features = ["io-util", "test-util"] }
+tokio-rustls.workspace = true
 # The codec of a raw call to each method of the worker listener's role table
 # (tests/worker_roles.rs).
 tonic-prost.workspace = true

@@ -117,6 +117,7 @@ use kbf_tls::TlsSource;
 use tonic::service::Routes;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server};
 
+pub use self::job_read::{JobReadError, JobReadFlags};
 pub use self::pack_flags::{PackFlagError, PackFlags};
 use crate::drain::Drain;
 use crate::enroll::flags::EnrollFlags;
@@ -247,6 +248,9 @@ pub struct FrontendFlags {
     /// `--pack-store-endpoint` and its companions: the blobs clients upload are kept in packs
     /// in an object store. `None` without the endpoint, where nothing is packed.
     pub packs: Option<PackFlags>,
+    /// `--job-listen` and its companions: the listener a task on a worker reads its action's
+    /// inputs from with a read grant. `None` without `--job-listen`, where there is none.
+    pub job_read: Option<JobReadFlags>,
 }
 
 /// The long names of the flags of [`Args`] that `kbf frontend` hides and refuses by name
@@ -301,6 +305,7 @@ pub fn command() -> Command {
     .args(drain_flags::args())
     .args(state_wait::args())
     .args(pack_flags::args())
+    .args(job_read::args())
     .arg(
         Arg::new(SECRETS_DIR)
             .long("object-store-secrets-dir")
@@ -370,6 +375,7 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         state_store_wait: state_wait::from_matches(m),
         retired: RetiredHandoverFlags::from_arg_matches(m)?,
         packs: pack_flags::from_matches(m),
+        job_read: job_read::from_matches(m),
     })
 }
 
@@ -496,6 +502,8 @@ pub struct FrontendHandle {
     pub api: Option<SocketAddr>,
     /// Where the enroll listener is, if there is one.
     pub enroll: Option<SocketAddr>,
+    /// Where the job-facing read listener is (`--job-listen`), if there is one.
+    pub job_read: Option<SocketAddr>,
     enroll_tls: Option<kbf_tls::TlsSource>,
     drain: Arc<Drain>,
     /// Completes on the second stop signal; [`FrontendHandle::serve`] then closes the
@@ -682,6 +690,9 @@ struct Prepared<'a> {
     sockets: Bound,
     /// The enroll listener bound and its CA open, if `--enroll-listen` is given.
     enroll: Option<enroll_start::Prepared>,
+    /// The job-facing read listener bound, its certificate and grant secret read, if
+    /// `--job-listen` is given.
+    job_read: Option<job_read::Prepared>,
 }
 
 /// The three listening sockets.
@@ -727,6 +738,12 @@ impl<'a> Prepared<'a> {
             .as_ref()
             .map(|enroll| enroll_start::prepare_with(enroll, &binder))
             .transpose()?;
+        let reload = Duration::from_secs(args.tls_reload_interval_secs);
+        let job_read = flags
+            .job_read
+            .as_ref()
+            .map(|job| job_read::Prepared::new(job, reload, &binder))
+            .transpose()?;
         let sockets = Bound::bind(
             listeners.reapi,
             listeners.worker,
@@ -742,6 +759,7 @@ impl<'a> Prepared<'a> {
             channel,
             sockets,
             enroll,
+            job_read,
         })
     }
 
@@ -762,6 +780,7 @@ impl<'a> Prepared<'a> {
             channel,
             sockets,
             enroll,
+            job_read,
         } = self;
         let args = &flags.server;
         let state = crate::start::with_members(state, args.members());
@@ -818,7 +837,7 @@ impl<'a> Prepared<'a> {
         );
         // The rows a revocation writes, beside the file: a revoked daemon is refused here.
         let peers = peers.with_denied_rows(members.clone());
-        let tls_sources: Vec<TlsSource> = listeners
+        let mut tls_sources: Vec<TlsSource> = listeners
             .reapi_tls
             .iter()
             .chain(&worker_tls)
@@ -871,6 +890,28 @@ impl<'a> Prepared<'a> {
             }
             None => (None, futures::future::pending().boxed(), None, None),
         };
+        // The job-facing read listener, which reads the blobs the REAPI listener's reads do
+        // (through the same backend) and is closed, like the others, the moment the drain
+        // begins. Off without `--job-listen`.
+        let job_addr = job_read.as_ref().map(job_read::Prepared::local);
+        let job_read = job_read
+            .map(|prepared| {
+                prepared.start(Arc::new(backend.clone()), job_read::Timeouts::default())
+            })
+            .transpose()?;
+        let (job_stats, job_task) = match job_read {
+            Some(job_read::Serving {
+                latch,
+                task,
+                tls,
+                read,
+            }) => {
+                drain.begins().closes(latch);
+                tls_sources.push(tls);
+                (Some(read), Some(task))
+            }
+            None => (None, None),
+        };
         let object_stores = flags
             .object_store_secrets_dir
             .as_deref()
@@ -900,6 +941,7 @@ impl<'a> Prepared<'a> {
             members.clone(),
             tls_sources,
             packs.clone(),
+            job_stats,
             Arc::clone(&farm),
         ));
         // The storage health, if there are members.
@@ -991,6 +1033,7 @@ impl<'a> Prepared<'a> {
             let _ = retire.set(Retire::new(stand, sequence));
         }
         background.extend(enroll_renewal);
+        background.extend(job_task);
 
         let intake_polls = farm.intake_polls();
         let shutdown = shutdown()?;
@@ -1086,6 +1129,7 @@ impl<'a> Prepared<'a> {
             worker: worker_addr,
             api: api_addr,
             enroll: enroll_addr,
+            job_read: job_addr,
             enroll_tls,
             drain,
             escalation: None,
@@ -1155,26 +1199,30 @@ fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Stor
 
 /// `GET /metrics`: what the service counts, in the Prometheus text format, history's
 /// counters when it keeps history, the storage health of `members` when there are any, the
-/// reloads of the listeners' `tls` files, the counters of the `packs` when there are any, and
-/// the pack reads the daemons of `farm` report and its failed actions by class.
+/// reloads of the listeners' `tls` files, the counters of the `packs` when there are any, those
+/// of the job-facing read when there is one, and the pack reads the daemons of `farm` report
+/// and its failed actions by class.
 fn metrics_route(
     backend: Backend,
     history: Option<Arc<crate::history::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
     packs: Option<Packs>,
+    job_read: Option<Arc<kbf_front::job_read::JobRead>>,
     farm: Arc<Farm>,
 ) -> axum::Router {
     let tls = Arc::new(tls);
     let render = move || {
         let (backend, members, tls) = (backend.clone(), members.clone(), Arc::clone(&tls));
         let (history, packs, farm) = (history.clone(), packs.clone(), Arc::clone(&farm));
+        let job_read = job_read.clone();
         async move {
             let mut text = backend.render_metrics();
             if let Some(history) = history {
                 history.render(&mut text);
             }
             Packs::render_metrics_of(packs.as_ref(), &mut text);
+            kbf_front::job_read::JobRead::render_metrics_of(job_read.as_deref(), &mut text);
             crate::metrics::render_farm(&mut text, &farm);
             crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);
@@ -1248,6 +1296,7 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
 
 mod drain_flags;
 mod handoff;
+mod job_read;
 mod pack_flags;
 mod state_wait;
 
