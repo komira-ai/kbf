@@ -1,6 +1,7 @@
 //! The janitor's sweep of orphans under `cas/b/`.
 //!
-//! A task writes one pack to `cas/b/<build>/<nonce>-0` through a presigned write. When the
+//! A task writes its packs (`-<k>`) and large objects (`-L<i>`) to `cas/b/<build>/<nonce>-<slot>`
+//! through presigned writes. When the
 //! pack is rejected, or the run fails after the write, nothing records it and nothing reads it:
 //! it is an orphan. [`Sweeper::sweep`] lists the prefix and deletes the orphans that are older
 //! than the grace period. Every delete is gated four ways: by the prefix, by the age the key
@@ -12,6 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use kbf_objstore::{KeyPrefix, ListToken, ObjectKey, ObjectStore, ObjectStoreError, PageSize};
 use kbf_pack_index::{PackIndex, PackIndexError};
+use kbf_task_pack::TaskPackKey;
 
 use crate::blocking::offload;
 
@@ -41,6 +43,16 @@ impl Default for SweepConfig {
             dry_run: false,
         }
     }
+}
+
+/// The age a task pack key says: the start of the minute it was minted in, whatever its slot
+/// (`-<k>` or `-L<i>`). `None` for a key that is not a task pack key. This is the usual
+/// [`SweepGates::age_of`].
+#[must_use]
+pub fn task_key_age(key: &str) -> Option<SystemTime> {
+    // STUB: no key says its age yet.
+    let _ = TaskPackKey::parse(key);
+    None
 }
 
 /// When a key was minted, read from the key itself; `None` when the key does not say.
