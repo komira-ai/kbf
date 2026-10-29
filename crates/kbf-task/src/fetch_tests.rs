@@ -888,27 +888,31 @@ mod failure;
 
 /// What a keep-alive server saw: requests served and connections accepted. Both are counted
 /// before the response bytes are written, so they are final once the client has all its answers.
+/// `ended` gets one message per connection whose client closed it.
 struct KeepAlive {
     base: String,
     requests: Arc<AtomicUsize>,
     connections: Arc<AtomicUsize>,
+    ended: std::sync::mpsc::Receiver<()>,
 }
 
 /// Serves `blobs` (by `<hex>/<size>`) over HTTP/1.1 with Content-Length bodies and no
 /// `Connection: close`, any number of requests per accepted connection, one thread per
-/// connection. A connection's thread ends when the client closes it; nothing waits for that.
+/// connection. A connection's thread ends when the client closes it; `ended` hears of it.
 fn serve_keep_alive(blobs: HashMap<String, Vec<u8>>) -> KeepAlive {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let base = format!("http://{}", listener.local_addr().expect("addr"));
     let requests = Arc::new(AtomicUsize::new(0));
     let connections = Arc::new(AtomicUsize::new(0));
+    let (ended_tx, ended) = std::sync::mpsc::channel();
     let (served, accepted) = (Arc::clone(&requests), Arc::clone(&connections));
     let blobs = Arc::new(blobs);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let mut stream = stream.expect("accept");
             accepted.fetch_add(1, Ordering::SeqCst);
-            let (served, blobs) = (Arc::clone(&served), Arc::clone(&blobs));
+            let (served, blobs, ended_tx) =
+                (Arc::clone(&served), Arc::clone(&blobs), ended_tx.clone());
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stream.try_clone().expect("clone"));
                 let mut line = String::new();
@@ -929,6 +933,7 @@ fn serve_keep_alive(blobs: HashMap<String, Vec<u8>>) -> KeepAlive {
                     stream.write_all(body).expect("body");
                     line.clear();
                 }
+                ended_tx.send(()).expect("ended");
             });
         }
     });
@@ -936,6 +941,7 @@ fn serve_keep_alive(blobs: HashMap<String, Vec<u8>>) -> KeepAlive {
         base,
         requests,
         connections,
+        ended,
     }
 }
 
@@ -974,7 +980,6 @@ fn connections_are_reused_across_requests_and_threads() {
     let dir = scratch_dir.join("in");
     let source = plain(&server.base);
     materialize(&source, &root, &dir, 4).expect("materialize");
-    drop(source);
     for group in 0..4 {
         for i in 0..10 {
             assert_eq!(
@@ -986,4 +991,17 @@ fn connections_are_reused_across_requests_and_threads() {
     assert_eq!(server.requests.load(Ordering::SeqCst), mem.blobs.len());
     let connections = server.connections.load(Ordering::SeqCst);
     assert!(connections <= 4, "{connections} connections");
+    // Dropping the source drops its agent's pool, which closes the idle sockets; every
+    // connection's loop then ends on end of input. The wait is only a liveness guard: if a
+    // socket is leaked, `GUARD` turns the hang into the named failure below. Nothing here asserts
+    // elapsed time.
+    drop(source);
+    let guard_expired = AtomicBool::new(false);
+    for _ in 0..connections {
+        guard_expired.fetch_or(server.ended.recv_timeout(GUARD).is_err(), Ordering::SeqCst);
+    }
+    assert!(
+        !guard_expired.load(Ordering::SeqCst),
+        "a connection was not closed when the source was dropped"
+    );
 }
