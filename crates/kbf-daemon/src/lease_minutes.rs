@@ -224,10 +224,10 @@ impl LeaseMinutes {
         self.in_flight.as_ref().map(|sent| sent.seq)
     }
 
-    /// How many minutes wait in the binner for a heartbeat to carry them.
+    /// How many minutes wait, in the binner or in a kept batch, for a heartbeat to carry them.
     #[cfg(test)]
     pub(crate) fn pending(&self) -> usize {
-        self.binner.pending()
+        self.binner.pending() + self.held.as_ref().map_or(0, |held| held.minutes.len())
     }
 
     /// What the binner counted of readings it could not use, with the minutes of a kept
