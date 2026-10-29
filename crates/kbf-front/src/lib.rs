@@ -74,6 +74,7 @@ mod input_walk;
 mod meta_log;
 pub mod metrics;
 mod operations;
+pub mod prepare_run;
 mod proxy;
 mod qos_header;
 mod recorder;
