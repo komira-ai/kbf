@@ -21,11 +21,12 @@
 
 use std::fs::{File, OpenOptions};
 use std::future::Future;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use kbf_types::Resources;
-use rustix::fs::{CWD, FileType, Mode};
+use rustix::fs::{CWD, FileType, Mode, OFlags};
 
 use crate::blocking_steps::{create_logs, make_cgroup, oom_outcome, read_start, usage};
 use crate::cgroup::{LeaseCgroup, presses_into_swap};
@@ -56,11 +57,28 @@ fn read_end(path: &Path) -> File {
 /// Starts `WORKERS` calls on a runtime of `WORKERS` async workers, each given the
 /// directory `<name>/<n>` in which the file `blocked` is a pipe (the other files a
 /// cgroup has are plain files), waits until every call waits on its pipe, and then waits
-/// for a task on every async worker to run: it runs only if no call holds a worker. `meet` opens the other end
-/// of the pipe, and `call` is the work under test.
+/// for a task on every async worker to run: it runs only if no call holds a worker. `meet`
+/// opens the other end of the pipe, and `call` is the work under test.
 fn workers_stay_free_while_calls_wait<F, Fut>(
     name: &str,
     blocked: &str,
+    meet: fn(&Path) -> File,
+    call: F,
+) where
+    F: Fn(PathBuf) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    workers_stay_free_after(name, blocked, &[], meet, call);
+}
+
+/// As [`workers_stay_free_while_calls_wait`], for a call that still has the pipes `then`
+/// to open after `blocked`: opening a pipe for writing returns once the test has opened
+/// it for reading, so a call that only opens `blocked` is done when the test meets it.
+/// The call waits on the last of `then` instead, which nobody reads until the end.
+fn workers_stay_free_after<F, Fut>(
+    name: &str,
+    blocked: &str,
+    then: &[&str],
     meet: fn(&Path) -> File,
     call: F,
 ) where
@@ -90,6 +108,10 @@ fn workers_stay_free_while_calls_wait<F, Fut>(
             }
             let _ = std::fs::remove_file(dir.join(blocked));
             fifo(&dir.join(blocked));
+            for later in then {
+                let _ = std::fs::remove_file(dir.join(later));
+                fifo(&dir.join(later));
+            }
             dir
         })
         .collect();
@@ -117,6 +139,19 @@ fn workers_stay_free_while_calls_wait<F, Fut>(
         std::fs::rename(&plain, dir.join(blocked)).expect("replace");
     }
     drop(held);
+    // Open the pipes the calls wait on at their end, without waiting for a writer.
+    let released: Vec<File> = dirs
+        .iter()
+        .flat_map(|dir| then.iter().map(move |later| dir.join(later)))
+        .map(|path| {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(OFlags::NONBLOCK.bits() as i32)
+                .open(path)
+                .expect("the pipe opens for reading")
+        })
+        .collect();
+    drop(released);
     for task in &tasks {
         task.abort();
     }
@@ -159,7 +194,8 @@ fn the_numa_sampler_reads_off_the_async_workers() {
 /// create on a busy file system waits for the journal.
 #[test]
 fn the_logs_are_created_off_the_async_workers() {
-    workers_stay_free_while_calls_wait("logs", "stdout", read_end, |dir| async move {
+    // The call opens `stdout`, then `stderr`: it waits on the second, which no one reads.
+    workers_stay_free_after("logs", "stdout", &["stderr"], read_end, |dir| async move {
         let _ = create_logs(&dir.join("stdout"), &dir.join("stderr")).await;
     });
 }
