@@ -188,7 +188,7 @@ ExecStartPre=/usr/bin/timeout 240 /bin/sh -c 'until /usr/bin/docker exec kbf-pos
 ExecStartPre=-/usr/bin/docker rm -f kbf-fe-a
 # The arguments of the docker run command for fe-a above, with --rm.
 ExecStart=/usr/bin/docker run --rm --name kbf-fe-a --network host --user 65532:65532 ...
-# A stop drains: the time must exceed --drain-lb-wait plus --drain-deadline.
+# A stop drains: the time must exceed --drain-lb-wait plus the longest action.
 ExecStop=/usr/bin/docker stop --time 3600 kbf-fe-a
 TimeoutStopSec=infinity
 Restart=on-failure

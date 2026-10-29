@@ -88,7 +88,7 @@ async fn a_name_in_the_old_form_is_answered_for_a_caller_the_process_holds() {
 /// answers no name of the form `operations/<id>`.
 #[tokio::test(start_paused = true)]
 async fn a_farm_with_no_state_store_answers_no_name_by_id() {
-    let farm = Farm::new(
+    let farm = Farm::new_legacy(
         Arc::new(Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,

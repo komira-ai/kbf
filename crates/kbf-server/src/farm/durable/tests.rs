@@ -2239,7 +2239,7 @@ fn the_sweep_drops_what_is_stale_and_keeps_floors() {
 
 fn farm_over(store: &Arc<Flaky>, mode: crate::LearnedSizes) -> Farm {
     let store: Arc<dyn Store> = store.clone();
-    Farm::new(
+    Farm::new_legacy(
         Arc::new(kbf_front::Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,

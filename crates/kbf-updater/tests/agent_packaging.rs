@@ -168,8 +168,8 @@ fn the_frontend_container_unit_and_its_configuration_agree_with_the_program() {
     let config = FrontendConfig::parse(&read("linux/host-install-frontend.toml"))
         .expect("the example configuration");
     assert!(
-        config.switch_secs() <= serve.window_secs,
-        "a switch has to fit the window of a trial"
+        config.ready_secs <= serve.window_secs,
+        "the readiness wait has to fit the window of a trial"
     );
 }
 
