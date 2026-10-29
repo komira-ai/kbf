@@ -286,7 +286,7 @@ async fn a_cordon_survives_a_restart(backing: Backing) {
     let wall = |view: PlacementView| match view {
         PlacementView::Draining {
             deadline_unix_ms, ..
-        } => deadline_unix_ms,
+        } => deadline_unix_ms.expect("a deadline"),
         other => panic!("{other:?}"),
     };
     after
