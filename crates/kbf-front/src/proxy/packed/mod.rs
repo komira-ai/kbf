@@ -63,9 +63,9 @@ mod store;
 pub(in crate::proxy) use self::bytestream::{applies, read as read_stream, write as write_stream};
 pub(in crate::proxy) use self::cas::{Served, find_missing, read_blob, read_many, store_batch};
 pub use self::commit::{
-    CommitError, IssuedPackKey, MAX_COMMIT_BLOBS, MAX_UNTRUSTED_BLOB_BYTES,
+    CommitError, Ingested, IssuedPackKey, MAX_COMMIT_BLOBS, MAX_UNTRUSTED_BLOB_BYTES,
     MAX_UNTRUSTED_MANIFEST_BYTES, MAX_UNTRUSTED_PACK_BYTES, MAX_UNTRUSTED_READ_BYTES,
-    UntrustedLimits,
+    MIN_SECRET_BYTES, MintError, PackKeyMint, RejectReason, StoreError, UntrustedLimits, ingest,
 };
 pub(in crate::proxy) use self::hit::held;
 pub use self::metrics::PackMetrics;
