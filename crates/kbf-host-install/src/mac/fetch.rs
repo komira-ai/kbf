@@ -371,11 +371,7 @@ impl Fetcher<'_> {
             Err(e) => return failed(format!("curl: {e}")),
         };
         if !exec.success() {
-            return failed(format!(
-                "curl: {}: {}",
-                exec.ended(),
-                exec.stderr_text()
-            ));
+            return failed(format!("curl: {}: {}", exec.ended(), exec.stderr_text()));
         }
         serde_json::from_slice(page_body(&exec.stdout)?)
             .or_else(|_| failed("the answer is not a listing of releases"))

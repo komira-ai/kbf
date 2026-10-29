@@ -97,9 +97,17 @@ fn a_node_connected_to_the_other_frontend_is_healthy_whichever_answers_first() {
                 });
                 let health = updater_side(&server, name);
                 let mac = host(role);
-                assert_eq!(health.check(&mac, &target()), Ok(Health::Healthy), "{role:?}");
+                assert_eq!(
+                    health.check(&mac, &target()),
+                    Ok(Health::Healthy),
+                    "{role:?}"
+                );
                 assert_eq!(health.check_held(&mac, &target()), Ok(Health::Healthy));
-                assert!(server.requests().len() <= 4, "{:?}", server.requests().len());
+                assert!(
+                    server.requests().len() <= 4,
+                    "{:?}",
+                    server.requests().len()
+                );
             }
         }
     }
