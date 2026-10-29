@@ -18,19 +18,21 @@ use futures::StreamExt;
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame};
 use hyper::{Request, StatusCode};
+use kbf_objstore::s3::fake::FakeS3;
 use kbf_testkit::dir::TestDir;
 use sha2::{Digest, Sha256};
 
 use crate::journal::is_reserved;
+use crate::s3::{Capabilities, Credentials, S3Config};
 use crate::{
     Backend, ByteRange, DirBackend, Error, JournalEntry, JournalOp, Listed, Meta, Op, PartBody,
-    Proxy, ProxyConfig, TestClock, decode_journal,
+    Proxy, ProxyConfig, S3Backend, TestClock, decode_journal,
 };
 
 use super::auth::{sign, sign_claiming};
 use super::handover::PIECES_QUEUED;
 use super::request::BoxError;
-use super::testing::{BUCKET, KEY_ID, NOW, Reply, Rig, SECRET, Scripted, Step};
+use super::testing::{BUCKET, KEY_ID, NOW, Reply, Rig, SECRET, Scripted, Step, texts};
 use super::{Server, ServerConfig};
 
 /// The size of a piece of a generated body.
@@ -492,4 +494,176 @@ async fn a_hot_tier_with_no_room_sends_the_streamed_body_to_the_cold_tier() {
     assert!(rig.hot_mem.get("k", None).await.is_err());
     let journals = rig.hot_mem.list("_journal/").await.unwrap();
     assert_eq!(journals, Vec::<Listed>::new());
+}
+
+/// A server over an S3 tier (the loopback S3 service of the tests) whose limit is `limit`.
+async fn s3_server(limit: usize) -> (FakeS3, Arc<Server>, ServerConfig) {
+    let s3 = FakeS3::start().await;
+    let store = S3Config {
+        endpoint: s3.endpoint().to_owned(),
+        region: "us-east-1".to_owned(),
+        bucket: "tier-test".to_owned(),
+        credentials: Credentials::new("test-key", "test-secret"),
+        capabilities: Capabilities::default(),
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(30),
+        min_body_rate: None,
+    };
+    let backend = S3Backend::new(store).unwrap();
+    let clock = Arc::new(TestClock::new());
+    clock.set(NOW);
+    let mut config = ServerConfig::new(BUCKET, KEY_ID, SECRET, clock);
+    config.max_request_bytes = limit;
+    let server = Server::new(Arc::new(backend), config.clone());
+    (s3, server, config)
+}
+
+/// Asserts that, over an S3 tier, which cannot take a body of unknown length without holding
+/// it, a put and a part with no `Content-Length` are refused 411 `MissingContentLength` before
+/// a byte of the body is read and nothing is stored or begun, and that the same bodies with
+/// their length are taken.
+#[tokio::test]
+async fn a_body_without_a_length_is_refused_for_an_s3_tier_before_it_is_read() {
+    let (s3, server, config) = s3_server(256 << 20).await;
+    let made = Arc::new(AtomicUsize::new(0));
+    let (claim, _) = truth(4);
+
+    let chunked = put_request(&config, "k", &claim, &[], Generated::new(4, &made));
+    let refused = answer(&server, chunked).await;
+    assert_eq!(refused.status, StatusCode::LENGTH_REQUIRED);
+    assert_eq!(refused.code(), "MissingContentLength");
+
+    let uploads = format!("/{BUCKET}/mp?uploads");
+    let started = answer(&server, sign(&config, "POST", &uploads, &[], b"")).await;
+    let id = texts(&started.body, "UploadId").concat();
+    let part_key = format!("mp?partNumber=1&uploadId={id}");
+    let part = put_request(&config, &part_key, &claim, &[], Generated::new(4, &made));
+    let refused = answer(&server, part).await;
+    assert_eq!(refused.status, StatusCode::LENGTH_REQUIRED);
+    assert_eq!(made.load(Ordering::SeqCst), 0);
+    assert_eq!(s3.keys(), Vec::<String>::new());
+
+    let length = (4 * PIECE).to_string();
+    let told = [("content-length", length.as_str())];
+    let body = Generated::new(4, &made);
+    let stored = answer(&server, put_request(&config, "k", &claim, &told, body)).await;
+    assert_eq!(stored.status, StatusCode::OK);
+    let body = Generated::new(4, &made);
+    let part = answer(
+        &server,
+        put_request(&config, &part_key, &claim, &told, body),
+    )
+    .await;
+    assert_eq!(part.status, StatusCode::OK);
+    assert_eq!(s3.keys(), ["k"]);
+}
+
+/// Asserts that a request whose `Content-Length` is over the limit is refused 413
+/// `EntityTooLarge` before any byte of the body is read: over an S3 tier no multipart upload is
+/// begun, nothing is stored and no upload is left open.
+#[tokio::test]
+async fn a_declared_length_over_the_limit_is_refused_before_any_byte_is_read() {
+    let (s3, server, config) = s3_server(4 * PIECE).await;
+    let made = Arc::new(AtomicUsize::new(0));
+    let (claim, _) = truth(5);
+    let length = (5 * PIECE).to_string();
+    let told = [("content-length", length.as_str())];
+
+    let body = Generated::new(5, &made);
+    let refused = answer(&server, put_request(&config, "big", &claim, &told, body)).await;
+
+    assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(refused.code(), "EntityTooLarge");
+    assert_eq!(made.load(Ordering::SeqCst), 0);
+    assert_eq!(s3.keys(), Vec::<String>::new());
+    assert_eq!(s3.incomplete_uploads(), 0);
+    assert_eq!(s3.stats().completed, 0);
+}
+
+/// Asserts that with the server taking as many streamed bodies as it may, one more is answered
+/// 503 `SlowDown` with `Retry-After` and its body is not stored, that the first is stored when
+/// its body ends, and that the permit it held is then free for the next.
+#[tokio::test(start_paused = true)]
+async fn a_put_over_the_concurrency_limit_is_answered_slow_down_and_the_next_is_taken() {
+    let rig = Rig::with(1 << 20, |config| config.max_concurrent_puts = 1).await;
+    let uri = format!("/{BUCKET}/first");
+    let steps = vec![
+        Step::Data(b"ab"),
+        Step::Wait(Duration::from_secs(5)),
+        Step::Data(b"cd"),
+    ];
+    let (parts, _) = sign(&rig.config, "PUT", &uri, &[], b"abcd").into_parts();
+    let request = Request::from_parts(parts, Scripted::new(steps));
+    let server = Arc::clone(&rig.server);
+    let first = tokio::spawn(async move { server.handle(request).await.status() });
+    while rig.server.put_permits_free() > 0 {
+        tokio::task::yield_now().await;
+    }
+
+    let over = rig.put("second", b"x").await;
+    assert_eq!(over.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(over.code(), "SlowDown");
+    assert_eq!(over.header("retry-after"), "1");
+    assert!(rig.hot_mem.get("second", None).await.is_err());
+
+    assert_eq!(first.await.unwrap(), StatusCode::OK);
+    assert_eq!(rig.hot_mem.get("first", None).await.unwrap(), "abcd");
+    assert_eq!(rig.server.put_permits_free(), 1);
+    assert_eq!(rig.put("third", b"x").await.status, StatusCode::OK);
+}
+
+/// Asserts that a body that comes in under the least average rate, once the grace has passed, is
+/// cut with 400 `RequestTimeout` and stores nothing, although no wait in it is as long as the
+/// idle timeout; and that the same bytes sent without the wait are stored. The clock is paused:
+/// the wait is moved over, not slept.
+#[tokio::test(start_paused = true)]
+async fn a_body_under_the_least_rate_is_cut_and_stores_nothing() {
+    let rig = Rig::with(1 << 20, |config| {
+        config.put_min_bytes_per_sec = 100;
+        config.put_rate_grace = Duration::from_secs(10);
+    })
+    .await;
+    let uri = format!("/{BUCKET}/k");
+    let slow = vec![
+        Step::Data(b"abcd"),
+        Step::Wait(Duration::from_secs(20)),
+        Step::Data(b"efgh"),
+    ];
+    let cut = rig
+        .send_played("PUT", &uri, &[], b"abcdefgh", Scripted::new(slow))
+        .await;
+    assert_eq!(cut.status, StatusCode::BAD_REQUEST);
+    assert_eq!(cut.code(), "RequestTimeout");
+    assert!(texts(&cut.body, "Message").concat().contains("average"));
+    assert!(rig.hot_mem.get("k", None).await.is_err());
+    assert!(rig.cold_mem.get("k", None).await.is_err());
+
+    let prompt = vec![Step::Data(b"abcd"), Step::Data(b"efgh")];
+    let whole = rig
+        .send_played("PUT", &uri, &[], b"abcdefgh", Scripted::new(prompt))
+        .await;
+    assert_eq!(whole.status, StatusCode::OK);
+    assert_eq!(rig.hot_mem.get("k", None).await.unwrap(), "abcdefgh");
+}
+
+/// Asserts that two streamed puts of one key at once end with one 200 and one 412
+/// `PreconditionFailed`, one object in the hot tier, one journal entry and no temporary file.
+#[tokio::test]
+async fn two_streamed_puts_of_one_key_make_one_object_and_one_journal_entry() {
+    let tiers = Tiers::new(256 << 20).await;
+    let made = Arc::default();
+    let (claim, _) = truth(4);
+    let one = put_request(&tiers.config, "k", &claim, &[], Generated::new(4, &made));
+    let other = put_request(&tiers.config, "k", &claim, &[], Generated::new(4, &made));
+
+    let (first, second) = tokio::join!(answer(&tiers.server, one), answer(&tiers.server, other));
+
+    let mut statuses = [first.status.as_u16(), second.status.as_u16()];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [200, 412]);
+    assert_eq!(Tiers::data_keys(&tiers.hot).await, ["k"]);
+    assert_eq!(Tiers::data_keys(&tiers.cold).await, Vec::<String>::new());
+    assert_eq!(tiers.hot.get("k", None).await.unwrap().len(), 4 * PIECE);
+    assert_eq!(tiers.journal().await.len(), 1);
+    assert!(!Tiers::has_temporary_file(&tiers.hot_dir));
 }

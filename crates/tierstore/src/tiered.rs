@@ -646,6 +646,11 @@ impl Backend for Proxy {
         self.inner.put_object(key, body).await
     }
 
+    /// Whether either tier needs the length of a streamed body (the put may go to either).
+    fn needs_length(&self) -> bool {
+        self.inner.hot.needs_length() || self.inner.cold.needs_length()
+    }
+
     /// A put whose body is not held: the chunks go to the hot tier (or the cold tier of a full
     /// hot tier) as they arrive, and the object is created, create-only, only after the body has
     /// ended whole; a body that fails leaves no object and no journal entry. See [`Proxy`].

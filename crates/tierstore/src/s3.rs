@@ -4,7 +4,10 @@
 //! the same meaning, sent by the client the workspace already has (path-style addressing,
 //! SigV4, a timeout on every request), and each answer is read into this crate's [`Error`].
 //!
-//! - `put` is a PUT with `If-None-Match: *`; the 412 is [`Error::AlreadyExists`].
+//! - `put` is a PUT with `If-None-Match: *`; the 412 is [`Error::AlreadyExists`]. Create-only
+//!   (here, in `put_stream` and in `complete_upload`) needs a store that honours conditional
+//!   writes: one that ignores `If-None-Match` on a put or on the completion of a multipart upload
+//!   would replace an object that exists.
 //! - `put_stream` is the store client's streamed write, given the chunks of the body as they
 //!   arrive and their total length (the `Content-Length` of the request; without one the body
 //!   is held first, since S3 takes no request of unknown length). A body of at most 16 MiB is
@@ -336,6 +339,11 @@ where
 
 #[async_trait]
 impl Backend for S3Backend {
+    /// S3 takes no request of unknown length: given none, the backend holds the body first.
+    fn needs_length(&self) -> bool {
+        true
+    }
+
     async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
         let object = object_key(key)?;
         let put = self.store.put_new(&object, body, None);

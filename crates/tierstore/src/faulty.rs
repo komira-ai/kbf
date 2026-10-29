@@ -198,6 +198,10 @@ impl Backend for FaultyBackend {
         self.inner.put(key, body).await
     }
 
+    fn needs_length(&self) -> bool {
+        self.inner.needs_length()
+    }
+
     /// A streamed put is a call of kind [`Op::Put`], so what is planned for puts applies to it.
     async fn put_stream(
         &self,

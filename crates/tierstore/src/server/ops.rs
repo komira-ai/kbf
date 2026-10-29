@@ -8,6 +8,7 @@ use hyper::StatusCode;
 use hyper::body::Body;
 use hyper::header::HeaderMap;
 use hyper::http::request::Parts;
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::journal::is_reserved;
 use crate::{ByteRange, Error, Meta};
@@ -302,6 +303,23 @@ impl Server {
         }
     }
 
+    /// Lets a streamed body in, before any byte of it is read: refuses a body of unknown length
+    /// where the backend needs the length (411), one that says it is longer than the limit
+    /// (413, so that nothing is stored and no upload is begun), and one that comes when the
+    /// server is taking as many as it may (503 `SlowDown`, with `Retry-After`). Gives the
+    /// permit that is held until the body is stored or refused.
+    fn admit(&self, len: Option<u64>) -> Result<OwnedSemaphorePermit, S3Error> {
+        let limit = self.config.max_request_bytes;
+        match len {
+            None if self.backend.needs_length() => return Err(S3Error::length_required()),
+            Some(declared) if declared > limit as u64 => return Err(S3Error::too_large(limit)),
+            _ => {}
+        }
+        Arc::clone(&self.puts)
+            .try_acquire_owned()
+            .map_err(|_| S3Error::busy())
+    }
+
     /// Creates the object from the body of the request as it arrives, create-only. The body is
     /// not held: the pieces are checked against the hashes of the request as they pass, and go
     /// on through a short queue to the backend's streamed put, which makes the object visible
@@ -327,10 +345,14 @@ impl Server {
         B::Error: Into<BoxError>,
     {
         refuse_reserved(key)?;
+        let permit = self.admit(len)?;
         let refused = Refused::default();
         let (carry, body) = hand_over(pieces(reader, check, refused.clone()));
         let (backend, name) = (Arc::clone(&self.backend), key.to_owned());
-        let mut storing = tokio::spawn(async move { backend.put_stream(&name, len, body).await });
+        let mut storing = tokio::spawn(async move {
+            let _permit = permit;
+            backend.put_stream(&name, len, body).await
+        });
         let early = tokio::select! {
             biased;
             done = &mut storing => Some(done),
@@ -430,6 +452,7 @@ impl Server {
         if !(1..=PART_LIMIT).contains(&number) {
             return Err(S3Error::invalid("a part number is from 1 to 10000"));
         }
+        let _permit = self.admit(len)?;
         let refused = Refused::default();
         let body = pieces(reader, check, refused.clone());
         let backend = &self.backend;

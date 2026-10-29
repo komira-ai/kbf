@@ -124,6 +124,16 @@ fn is_after(key: &str, start_after: Option<&str>) -> bool {
 /// whose time is set by the client that sends the part (see there).
 #[async_trait]
 pub trait Backend: Send + Sync {
+    /// Whether a streamed body (of [`Backend::put_stream`] or [`Backend::upload_part_with_len`])
+    /// must come with its length for the backend to avoid holding it whole. A store that needs
+    /// the length of a request before it is sent (S3 does) says `true`: given no length it
+    /// collects the body first, which is memory the client chooses. The S3 front refuses a
+    /// request without a `Content-Length` (411) before reading its body when this is `true`.
+    /// The default is `false`.
+    fn needs_length(&self) -> bool {
+        false
+    }
+
     /// Writes an object, only if the key does not exist (`If-None-Match: *`).
     ///
     /// # Errors

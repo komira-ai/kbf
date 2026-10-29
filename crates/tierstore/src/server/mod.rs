@@ -52,6 +52,21 @@
 //! other than `*`, is refused without being stored. [`ServerConfig::max_request_bytes`] is
 //! the most bytes a body may have, not a bound on memory.
 //!
+//! Before the first byte of a streamed body (a put, or a part of an upload) is read, the request
+//! is refused if it gives no `Content-Length` and the backend needs the length to stream
+//! ([`Backend::needs_length`](crate::Backend::needs_length): an S3 tier does, and would hold the
+//! body whole otherwise) with 411 `MissingContentLength`; if its `Content-Length` is over
+//! [`ServerConfig::max_request_bytes`], with 413 `EntityTooLarge`, so that nothing is stored and
+//! no upload is begun; and if [`ServerConfig::max_concurrent_puts`] bodies are already being
+//! taken, with 503 `SlowDown` and `Retry-After`. A body that then comes in at an average rate
+//! under [`ServerConfig::put_min_bytes_per_sec`], once [`ServerConfig::put_rate_grace`] has
+//! passed, is cut with 400 `RequestTimeout`, which ends the stream with an error, so nothing is
+//! stored and an upload at an S3 tier is aborted.
+//!
+//! Create-only on an S3 tier needs a store that honours conditional writes
+//! (`If-None-Match: *` on a put and on the completion of a multipart upload, answering 412 for a
+//! key that exists): on one that ignores them a put would replace.
+//!
 //! Requests are signed with SigV4 in the `Authorization` header (see `auth`): by one of the
 //! access keys of [`ServerConfig`], over `host`, `x-amz-content-sha256` and `x-amz-date` at
 //! least, and a request without a good signature, a presigned URL included, is answered 403
@@ -182,7 +197,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 
 use crate::{Backend, Clock};
 
@@ -217,6 +232,20 @@ pub struct ServerConfig {
     /// slowly but steadily is not cut, and neither is a slow reader that keeps taking bytes.
     /// See the module docs.
     pub body_idle_timeout: Duration,
+    /// The most streamed bodies (puts and parts of uploads) taken at once. A request over the
+    /// limit is answered 503 `SlowDown` with a `Retry-After` and its body is not read. Each
+    /// streamed body holds a few pieces (`PIECES_QUEUED`, of the size the connection delivers),
+    /// and an S3 tier up to 16 MiB more, so the memory of the puts is bounded by this number
+    /// times that.
+    pub max_concurrent_puts: usize,
+    /// The least average rate, in bytes a second, at which a request body is taken, counted
+    /// from the first byte once `put_rate_grace` has passed; a body that goes slower is
+    /// refused with 400 `RequestTimeout` and nothing of it is stored (an upload in progress
+    /// at the store is aborted). Zero turns the check off. It catches a sender that trickles
+    /// a byte inside every idle timeout.
+    pub put_min_bytes_per_sec: u64,
+    /// How long a body is let to go before its rate is held to `put_min_bytes_per_sec`.
+    pub put_rate_grace: Duration,
     /// How long a client has to send the head of a request. It also bounds how long a
     /// connection may wait, idle, for its next request, so keep it above the time a client
     /// keeps an idle connection in its pool.
@@ -250,6 +279,9 @@ impl ServerConfig {
             read_only_keys: Vec::new(),
             max_request_bytes: 256 << 20,
             body_idle_timeout: Duration::from_secs(30),
+            max_concurrent_puts: 32,
+            put_min_bytes_per_sec: 1024,
+            put_rate_grace: Duration::from_secs(30),
             header_timeout: Duration::from_secs(60),
             drain_lb_wait: Duration::from_secs(10),
             drain_deadline: Duration::from_secs(900),
@@ -325,6 +357,8 @@ pub struct Server {
     /// the answers they are sending and close.
     closing: watch::Sender<bool>,
     next_request: AtomicU64,
+    /// One permit for each streamed body that may be taken at once.
+    puts: Arc<Semaphore>,
 }
 
 /// A request in flight, counted until it is dropped.
@@ -367,7 +401,9 @@ impl Server {
     /// A server over `backend`.
     #[must_use]
     pub fn new(backend: Arc<dyn Backend>, config: ServerConfig) -> Arc<Self> {
+        let puts = Arc::new(Semaphore::new(config.max_concurrent_puts));
         Arc::new(Self {
+            puts,
             backend,
             config,
             phase: AtomicU8::new(SERVING),
@@ -394,6 +430,12 @@ impl Server {
     #[must_use]
     pub fn in_flight(&self) -> usize {
         self.inflight.load(Ordering::SeqCst)
+    }
+
+    /// The streamed bodies that may still be taken at once.
+    #[cfg(test)]
+    pub(super) fn put_permits_free(&self) -> usize {
+        self.puts.available_permits()
     }
 
     /// The connections that are open now, those that wait for a request included.
@@ -544,7 +586,7 @@ impl Server {
         let path = parts.uri.path();
         let mut response = outcome.unwrap_or_else(|error| {
             if error.is_timeout() {
-                self.log_stalled(&parts, &id);
+                self.log_stalled(&parts, &id, error.message());
             }
             error.into_answer(path, &id)
         });
@@ -556,10 +598,9 @@ impl Server {
     }
 
     /// Logs a request that was ended because its body stalled.
-    fn log_stalled(&self, parts: &Parts, id: &str) {
+    fn log_stalled(&self, parts: &Parts, id: &str, why: &str) {
         let (method, path) = (&parts.method, parts.uri.path());
-        let idle = self.config.body_idle_timeout;
-        eprintln!("tierstore: request {id} ({method} {path}): body idle for {idle:?}, closed");
+        eprintln!("tierstore: request {id} ({method} {path}): {why} Closed.");
     }
 
     async fn respond<B>(&self, parts: &Parts, body: B) -> Result<Answer, S3Error>
@@ -581,7 +622,9 @@ impl Server {
         let data = matches!((&parts.method, &target), (&Method::PUT, Target::Object(_)));
         let check = Check::new(&signed.payload, &parts.headers, data)?;
         let limit = self.config.max_request_bytes;
-        let reader = Reader::new(body, limit, self.config.body_idle_timeout);
+        let config = &self.config;
+        let reader = Reader::new(body, limit, config.body_idle_timeout)
+            .with_floor(config.put_min_bytes_per_sec, config.put_rate_grace);
         self.dispatch(parts, target, &query, reader, check).await
     }
 

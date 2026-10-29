@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{StreamExt, stream};
+use futures::{FutureExt, StreamExt, stream};
 use tierstore::{
     Backend, ByteRange, Error, JournalEntry, JournalOp, Listed, MemoryBackend, Meta, Op, PartBody,
 };
@@ -162,8 +162,9 @@ async fn a_streamed_put_goes_straight_to_the_cold_tier_when_the_hot_tier_is_full
     assert_absent(&*rig.cold_mem, "h").await;
 }
 
-/// Asserts that a streamed put made while the usage is above the critical share waits for the
-/// back-pressure and then goes to the hot tier.
+/// Asserts that a streamed put made while the usage is above the critical share is still
+/// waiting for the back-pressure when it is polled (nothing is written to the hot tier), and
+/// goes to the hot tier once the paused clock is moved past the back-pressure.
 #[tokio::test(start_paused = true)]
 async fn a_streamed_put_above_the_critical_mark_is_delayed_and_goes_to_the_hot_tier() {
     let rig = Rig::new();
@@ -173,10 +174,12 @@ async fn a_streamed_put_above_the_critical_mark_is_delayed_and_goes_to_the_hot_t
     let proxy = rig.open(config).await.unwrap();
     set_usage(&rig, 600, 0).await;
 
-    let start = tokio::time::Instant::now();
-    proxy.put_stream("b", None, chunks(&["2"])).await.unwrap();
+    let mut putting = Box::pin(proxy.put_stream("b", None, chunks(&["2"])));
+    assert!((&mut putting).now_or_never().is_none());
+    assert_absent(&*rig.hot_mem, "b").await;
+    tokio::time::advance(Duration::from_millis(200)).await;
+    putting.await.unwrap();
 
-    assert!(start.elapsed() >= Duration::from_millis(200));
     assert_eq!(read(&*rig.hot_mem, "b").await, body("2"));
 }
 

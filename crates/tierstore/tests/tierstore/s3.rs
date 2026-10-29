@@ -516,3 +516,23 @@ async fn a_large_streamed_put_is_completed_only_after_the_last_chunk() {
     assert_eq!(s3.incomplete_uploads(), 0);
     assert_eq!(s3.stats().completed, 1);
 }
+
+/// Asserts that the S3 backend says it needs the length of a streamed body, the in-memory
+/// backend does not, and a proxy needs it when either of its tiers does.
+#[tokio::test]
+async fn a_proxy_needs_the_length_of_a_body_when_either_tier_is_s3() {
+    let (_s3, s3) = backend().await;
+    assert!(s3.needs_length());
+    assert!(!tierstore::MemoryBackend::new().needs_length());
+    let s3: Arc<dyn Backend> = Arc::new(s3);
+    let memory = || -> Arc<dyn Backend> { Arc::new(tierstore::MemoryBackend::new()) };
+    let open = |hot: Arc<dyn Backend>, cold: Arc<dyn Backend>| async move {
+        let clock = Arc::new(SystemClock);
+        Proxy::open(hot, cold, ProxyConfig::new("p1", 1000, clock))
+            .await
+            .unwrap()
+    };
+    assert!(open(memory(), s3.clone()).await.needs_length());
+    assert!(open(s3.clone(), memory()).await.needs_length());
+    assert!(!open(memory(), memory()).await.needs_length());
+}
