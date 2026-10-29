@@ -451,6 +451,7 @@ fn an_unintelligible_unit_is_an_install_failure() {
             "killed by a signal",
             Ok(crate::runner::Exec {
                 code: None,
+                signal: None,
                 stdout: vec![],
                 stderr: b"killed".to_vec(),
             }),
@@ -845,6 +846,7 @@ fn unreadable_state_fails_the_query() {
             "systemctl is killed",
             Ok(crate::runner::Exec {
                 code: None,
+                signal: None,
                 stdout: vec![],
                 stderr: vec![],
             }),
