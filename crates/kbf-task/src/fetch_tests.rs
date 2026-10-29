@@ -2,8 +2,9 @@ use kbf_testkit::dir::TestDir;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use kbf_proto::reapi::{Directory, DirectoryNode, FileNode, SymlinkNode};
 
@@ -16,21 +17,26 @@ fn digest_of(bytes: &[u8]) -> Digest {
     }
 }
 
-/// Holds the first `need` requests for gated blobs until `need` of them are in flight at
-/// once; later ones pass. It counts arrivals, never time.
+/// Holds requests for gated blobs until `need` of them are in flight at once; later ones pass.
+/// The release is decided by counting arrivals. `GUARD` is only a liveness guard that turns a hang
+/// (code that never runs `need` requests together) into a named failure: when it expires the
+/// request proceeds and `expired` is set, and the test fails on its counts and on `expired`. No
+/// test result depends on elapsed time.
 #[derive(Default)]
 struct Rendezvous {
     need: usize,
     arrived: Mutex<usize>,
     open: Condvar,
+    expired: AtomicBool,
 }
+
+const GUARD: Duration = Duration::from_secs(60);
 
 impl Rendezvous {
     fn new(need: usize) -> Self {
         Self {
             need,
-            arrived: Mutex::new(0),
-            open: Condvar::new(),
+            ..Self::default()
         }
     }
 
@@ -38,9 +44,15 @@ impl Rendezvous {
         let mut arrived = self.arrived.lock().expect("arrived");
         *arrived += 1;
         self.open.notify_all();
-        while *arrived < self.need {
-            arrived = self.open.wait(arrived).expect("wait");
-        }
+        let (_held, waited) = self
+            .open
+            .wait_timeout_while(arrived, GUARD, |arrived| *arrived < self.need)
+            .expect("wait");
+        self.expired.fetch_or(waited.timed_out(), Ordering::SeqCst);
+    }
+
+    fn expired(&self) -> bool {
+        self.expired.load(Ordering::SeqCst)
     }
 }
 
@@ -615,6 +627,7 @@ fn directories_are_fetched_four_at_a_time_when_four_are_allowed() {
     let dir = scratch_dir.join("in");
     materialize(&mem, &root, &dir, 4).expect("materialize");
     check_wide(&dir, 8);
+    assert!(!mem.gate.expired(), "fewer than 4 requests ran together");
     assert_eq!(mem.most_in_flight(), 4);
 }
 
@@ -628,6 +641,7 @@ fn file_blobs_are_fetched_four_at_a_time_when_four_are_allowed() {
     let dir = scratch_dir.join("in");
     materialize(&mem, &root, &dir, 4).expect("materialize");
     check_wide(&dir, 8);
+    assert!(!mem.gate.expired(), "fewer than 4 requests ran together");
     assert_eq!(mem.most_in_flight(), 4);
 }
 
