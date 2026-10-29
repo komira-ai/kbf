@@ -3,11 +3,11 @@
 
 use std::path::Path;
 
-use kbf_pack::{
+use kbf_segments::sha256;
+use kbf_task_pack::{
     EMPTY_DIGEST, MAX_MANIFEST_BYTES, ManifestError, OutputDirectory, OutputFile, OutputSymlink,
     PathError, TaskKeyError, TaskManifest, Timing, Usage,
 };
-use kbf_segments::sha256;
 use kbf_types::{Digest, DigestFunction, ParseDigestError};
 
 /// The bytes of a fixture under `tests/fixtures/task_pack`.

@@ -19,6 +19,8 @@ kbf-objstore.workspace = true
 kbf-segments.workspace = true
 # `PackIndex`: where the write rule records a pack and where the reader finds a blob.
 kbf-pack-index.workspace = true
+# The task pack types, re-exported by this crate.
+kbf-task-pack.workspace = true
 # `Digest`, the key of a segment's index.
 kbf-types.workspace = true
 # The report of an adoption (`adopt`), which is also its checkpoint, is kept as JSON, and so is

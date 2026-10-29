@@ -36,3 +36,39 @@ fn a_signature_date_is_right_and_sorts_by_time() {
     assert!(amz_date(86_399_000) < amz_date(86_400_000));
     assert!(amz_date(946_684_799_000) < amz_date(946_684_800_000));
 }
+
+/// Asserts that the date of a signature is read back to the time it stands for, at the known
+/// times, and that text that is not a date, or not the form of one, or a date that does not exist,
+/// is not read.
+#[test]
+fn an_amz_date_is_read_back() {
+    use super::time::parse_amz_date;
+    for ms in [
+        0,
+        1_369_353_600_000,
+        951_868_799_000,
+        4_107_542_400_000,
+        1_800_000_000_000,
+    ] {
+        assert_eq!(parse_amz_date(&amz_date(ms)), Some(ms));
+    }
+    for text in [
+        "",
+        "20130524",
+        "20130524T000000",
+        "20130524T000000Zx",
+        "20130524 000000Z",
+        "20130230T000000Z",
+        "20130524T250000Z",
+        "20130524T006000Z",
+        "2013052aT000000Z",
+        "+0130524T000000Z",
+        "20131324T000000Z",
+        "20130500T000000Z",
+        "é0130524T00000Z",
+        "20130524T000000X",
+        "19600101T000000Z",
+    ] {
+        assert_eq!(parse_amz_date(text), None, "{text:?}");
+    }
+}

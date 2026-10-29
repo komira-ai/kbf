@@ -72,10 +72,13 @@ async fn a_get_of_a_hot_object_does_not_touch_the_cold_tier() {
     let proxy = rig.proxy("p1", 1000).await;
     proxy.put("k", body("value")).await.unwrap();
 
+    // The put asked the cold tier twice (before the create, and again after it).
+    let (gets, heads) = (rig.cold.calls(Op::Get), rig.cold.calls(Op::Head));
     assert_eq!(proxy.get("k", None).await.unwrap(), body("value"));
     assert_eq!(proxy.head("k").await.unwrap().size, 5);
-    assert_eq!(rig.cold.calls(Op::Get), 0);
-    assert_eq!(rig.cold.calls(Op::Head), 1);
+    assert_eq!(rig.cold.calls(Op::Get), gets);
+    assert_eq!(rig.cold.calls(Op::Head), heads);
+    assert_eq!((gets, heads), (0, 2));
 }
 
 /// Asserts that a get of an object only the cold tier holds returns it and copies it back into

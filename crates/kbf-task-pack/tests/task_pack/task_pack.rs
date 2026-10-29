@@ -2,13 +2,13 @@
 //! `tests/fixtures/task_pack`, footers made to fail one rule each, and packs built to fail
 //! reading.
 
-use kbf_pack::{
+use kbf_segments::{
+    Footer, IndexEntry, SegmentError, SegmentReader, SegmentWriter, WriteError, layout, sha256,
+};
+use kbf_task_pack::{
     MAX_MANIFEST_BYTES, MAX_PACK_BYTES, MAX_PACK_RECORDS, MAX_RECORD_BYTES, ManifestError,
     ShapeError, TaskManifest, TaskPackError, WritePackError, check_shape, read_manifest,
     write_pack,
-};
-use kbf_segments::{
-    Footer, IndexEntry, SegmentError, SegmentReader, SegmentWriter, WriteError, layout, sha256,
 };
 use kbf_types::{Digest, DigestFunction};
 
