@@ -306,6 +306,8 @@ jobs:
       # (25 GiB, over the 5% free-space floor of the file store) and the disk reports after say
       # how much it took. A separate job would build the whole instrumented workspace again.
       - name: Refuse early when the disk is short for the js run (25 GiB free)
+        id: js-disk
+        continue-on-error: true
         run: cargo "+$COVERAGE_TOOLCHAIN" xtask runner-disk --path . --min-free-gb 25
       # NOT BLOCKING YET. Until the hot path, the lifecycle and the views of the js core are filled
       # in, the bodies of farm/js/{hot,lifecycle,views}.rs are todo!(), so this run is red on main
@@ -314,6 +316,8 @@ jobs:
       # those files deletes the line (a one-line change), and from then on a failing js test
       # fails the required `test` job.
       - name: Run the fast tests on the js core under coverage
+        id: js-run
+        if: ${{ steps.js-disk.outcome == 'success' }}
         continue-on-error: true
         env:
           LLVM_COV_FLAGS: -skip-functions
@@ -321,6 +325,14 @@ jobs:
       - name: Free disk after the js run (report)
         if: ${{ always() }}
         run: df -h /
+      # While `continue-on-error` stands a green job says nothing about the js run: this line does.
+      - name: Say how the js run went
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          JS_RUN: ${{ steps.js-run.outcome }}
+          JS_DISK: ${{ steps.js-disk.outcome }}
+        run: echo "js core run: $JS_RUN (disk guard: $JS_DISK)" >> "$GITHUB_STEP_SUMMARY"
       # REPORT ONLY until the flip PR (W): one llvm-cov report over the legacy and the js run,
       # then the kbf-coverage table on it. The lines under cfg(feature = "farm-core-js") exist
       # only in the js build; llvm-cov merges the profiles of every binary, so each line counts
@@ -329,13 +341,13 @@ jobs:
       # uncovered, so the merged numbers can sit under 99%: they are shown, not enforced. W
       # removes `continue-on-error` and the legacy-only gate above, making this the gate.
       - name: Merged legacy+js report (not a gate until the flip)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.js-disk.outcome == 'success' }}
         continue-on-error: true
         env:
           LLVM_COV_FLAGS: -skip-functions
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov report --branch --lcov --output-path target/coverage/lcov-merged.info
       - name: Merged per-crate table (not a gate until the flip)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.js-disk.outcome == 'success' }}
         continue-on-error: true
         run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- --lcov target/coverage/lcov-merged.info --root "$GITHUB_WORKSPACE" --floors coverage-floors
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
