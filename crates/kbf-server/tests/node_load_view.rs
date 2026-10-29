@@ -7,7 +7,7 @@ mod support;
 use std::net::SocketAddr;
 
 use kbf_proto::worker::{LeaseClock, LeaseId, LeaseMinute, NodeLoad};
-use support::Cell;
+use support::{Cell, Job};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -164,14 +164,28 @@ async fn the_node_view_shows_the_list_counts_and_the_scheduler_hears_accepted_re
 }
 
 /// Asserts that a load far past every cap, with an absent lease and a repeated one in it,
-/// costs its heartbeat nothing (it is acknowledged), that the view shows the records kept
-/// within the caps and every drop under its reason, and that the scheduler took the reading.
+/// costs its heartbeat nothing: it is acknowledged and the running list it carries is applied
+/// (a lease the server gave up, which the heartbeat lists, is cancelled; the lease it holds is
+/// not); that the view shows the records kept within the caps and every drop under its
+/// reason; and that the scheduler took the reading.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hostile_load_does_not_cost_the_beat_and_its_drops_are_counted() {
     const N: u64 = 100_000;
     let cell = Cell::start_with_api().await;
     let api = cell.api.expect("an operator API");
+    let mut first = cell.daemon("node-a", 8, 16).await;
+    let job = Job::new("hostile", &[]);
+    cell.upload(&job.blobs()).await;
+    let _ops = cell.execute(&job.action).await;
+    let lost = first.start().await.lease_id.expect("a lease id");
+
+    // The daemon returns and its first heartbeat leaves the lease out: the server gives it up
+    // and places the operation again, so `lost` is one it no longer holds and `retry` one it
+    // does.
     let mut daemon = cell.daemon("node-a", 8, 16).await;
+    assert!(daemon.heartbeat(&[]).await);
+    let retry = daemon.start().await.lease_id.expect("a lease id");
+    assert_ne!(retry, lost);
 
     let clock = |i: u64| LeaseClock {
         // The first names no lease, the second is the lease of the third.
@@ -190,7 +204,14 @@ async fn a_hostile_load_does_not_cost_the_beat_and_its_drops_are_counted() {
             .collect(),
         ..reading(1, 1_000_000, 0)
     };
-    daemon.beat_loaded_acked(Some(hostile)).await;
+    daemon
+        .beat_running_loaded_acked(&[lost, retry], Some(hostile))
+        .await;
+    assert_eq!(
+        daemon.cancelled().await,
+        Some(lost),
+        "the running list of the hostile heartbeat was not applied"
+    );
 
     let view = node(api, "node-a").await;
     let load = &view["load"];

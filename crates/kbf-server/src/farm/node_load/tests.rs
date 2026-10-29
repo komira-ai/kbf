@@ -644,6 +644,30 @@ async fn a_refused_reading_feeds_nothing_and_counts_its_minutes() {
     assert_eq!(detail(&farm, "a").load, None);
 }
 
+/// Asserts that a heartbeat of a replaced stream feeds the scheduler nothing, even when it
+/// carries the load a reading came to: it is not taken (not acknowledged) and the scheduler's
+/// count of accepted readings does not move; the same load on the stream that replaced it is
+/// fed.
+#[tokio::test(start_paused = true)]
+async fn a_heartbeat_of_a_replaced_stream_feeds_nothing() {
+    let farm = farm();
+    let a = WorkerId::new("a");
+    let old = register(&farm, "a", "proc-1");
+    let fed = farm
+        .note_node_load(&a, old, Some(&reading(1, SECOND, 0)))
+        .expect("fed");
+    let current = register(&farm, "a", "proc-2");
+
+    let taken = farm
+        .heartbeat_with_load(&a, old, 1, Vec::new(), Some(fed))
+        .await;
+    assert!(!taken, "a heartbeat of a replaced stream was taken");
+    assert_eq!(accepted(&farm), 0, "a replaced stream fed the scheduler");
+
+    assert!(beat(&farm, &a, current, 1, &reading(1, SECOND, 0)).await);
+    assert_eq!(accepted(&farm), 1);
+}
+
 /// Asserts that the scheduler is handed accepted readings under `--placement-load off` and
 /// under `on`: it keeps them either way, so the feed is warm before the flag is raised.
 #[tokio::test(start_paused = true)]
