@@ -795,3 +795,19 @@ async fn a_report_without_a_known_start_or_operation_teaches_nothing() {
     );
     assert_eq!(tally(&rig, ShadowLevel::None, ShadowBucket::Cold), 1);
 }
+
+/// Asserts the rows taken for keys the estimator holds no summary of are none, so that a key
+/// that was swept from memory between a report and its write is not written as an empty row.
+/// Catches: a row made for an unknown key.
+#[test]
+fn a_key_with_no_summary_has_no_row_to_write() {
+    let mut learned = Learned::new(LearnedSizes::Shadow, 4 * GIB, 0);
+    let platform = crate::machine::Platform::of(
+        &kbf_caps::Request::from_platform([("OSFamily", "linux")]).expect("a platform"),
+    );
+    let subject = crate::action_usage::Subject::of(Described::default()).0;
+    let basis = crate::learned::basis_of_os("linux").expect("a basis");
+    let key = crate::learned::key_of("main", &platform, basis, &subject).expect("a key");
+    let keys = std::collections::BTreeSet::from([key]);
+    assert!(learned.take_rows(keys).is_empty());
+}
