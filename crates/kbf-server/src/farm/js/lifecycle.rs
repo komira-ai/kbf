@@ -15,13 +15,13 @@ use std::time::Duration;
 
 use js_server_core::{FLUSH_LOOK, NodeAction as CoreAction, PlaceError as CorePlaceError};
 use kbf_front::Finished;
-use kbf_sched::Cordon;
-use kbf_types::{FarmTime, OperationId, WorkerId};
+use kbf_types::{OperationId, WorkerId};
 use tokio::sync::watch;
 
 use super::{JsFarm, views};
+use crate::farm::nodes::node_of;
 use crate::farm::{EpochBump, NodeAction, NodeUnread, PlaceError, StateError, UnknownNode};
-use crate::fleet::{NodeView, PhaseView, PlacementView, ResourcesView, needs_attention};
+use crate::fleet::NodeView;
 
 /// [`Farm::fence`](crate::farm::Farm::fence): [`Core::fence`](js_server_core::Core::fence).
 pub(crate) fn fence(js: &JsFarm) {
@@ -144,44 +144,21 @@ pub(crate) fn place(
             CorePlaceError::Unwritten(node) => PlaceError::Unwritten(node),
         })?;
     // A node another frontend of the state store holds is not registered here: it is shown
-    // as the scheduler has it, which is what the action just fed.
-    Ok(views::node_view(js, worker).unwrap_or_else(|| elsewhere(js, worker)))
-}
-
-/// `worker`, which is not registered here, as the scheduler shows it: placement, phase and
-/// leases, with nothing of a stream or software.
-fn elsewhere(js: &JsFarm, worker: &WorkerId) -> NodeView {
-    js.core.with(|view, _| {
-        let sched = view.sched();
-        let wall = |at: FarmTime| js.epoch_unix_ms.saturating_add(at.as_millis());
-        let held = sched.leases_on(worker);
-        let leases = || held.iter().map(ToString::to_string).collect();
-        let placement = match sched.cordon(worker) {
-            None => PlacementView::Serving,
-            Some(Cordon::Cordoned) => PlacementView::Cordoned,
-            Some(Cordon::Draining { deadline }) => PlacementView::Draining {
-                deadline_unix_ms: wall(*deadline),
-                leases: leases(),
-            },
-            Some(Cordon::Drained) => PlacementView::Drained,
-            Some(Cordon::Paused { deadline }) => PlacementView::DrainPaused {
-                deadline_unix_ms: wall(*deadline),
-                leases: leases(),
-            },
-        };
-        let phase = sched.phase(worker).cloned().unwrap_or_default();
-        NodeView {
-            node_id: worker.as_str().to_owned(),
-            connected: false,
-            protocol: None,
-            needs_attention: needs_attention(None, &phase),
-            software: None,
-            placement,
-            phase: PhaseView::new(&phase),
-            lease_count: u32::try_from(held.len()).unwrap_or(u32::MAX),
-            booked: ResourcesView::of(sched.booked(worker).unwrap_or_default()),
-        }
-    })
+    // as the scheduler has it, which is what the action just fed. The core's lock is taken
+    // once more, after `place` has returned.
+    Ok(views::node_view(js, worker).unwrap_or_else(|| {
+        js.core.with(|view, adapter| {
+            node_of(
+                view.sched(),
+                adapter.machine(),
+                js.epoch_unix_ms,
+                adapter
+                    .worker_facts(worker)
+                    .and_then(|facts| facts.protocol),
+                worker,
+            )
+        })
+    }))
 }
 
 /// [`Farm::write_behind_now`](crate::farm::Farm::write_behind_now).
