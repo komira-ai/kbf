@@ -4,7 +4,7 @@
 //! access keys (the key is picked by the id in the credential), signed over `host`,
 //! `x-amz-content-sha256` and `x-amz-date` at least, made within 15 minutes of the server's
 //! clock, with the signature that the secret of that key gives. The role of the key comes with
-//! the answer, for the caller to hold the call to it. Query strings (presigned URLs) and signed
+//! the answer, for the caller to hold the call to it. A request with no `Authorization` header is checked as a presigned URL (see `presign`); signed
 //! streams are not accepted.
 
 use hmac::{Hmac, KeyInit, Mac};
@@ -15,10 +15,10 @@ use sha2::{Digest, Sha256};
 
 use super::ServerConfig;
 use super::keys::Role;
+use super::presign::{self, Grant, PRESIGN_ONLY};
 use super::reply::S3Error;
 use super::request::{header, query_pairs};
 use super::time::amz_date;
-use super::token::{self, Claims, EXPIRED};
 
 /// How far the time of a request may be from the server's, either way.
 const SKEW_MILLIS: u64 = 15 * 60 * 1000;
@@ -27,13 +27,13 @@ const SKEW_MILLIS: u64 = 15 * 60 * 1000;
 const REQUIRED: [&str; 3] = ["host", "x-amz-content-sha256", "x-amz-date"];
 
 /// What SigV4 leaves unencoded in a query, and in a path but for the `/`.
-const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
+pub(super) const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
     .remove(b'.')
     .remove(b'~');
 
-const PATH: &AsciiSet = &UNRESERVED.remove(b'/');
+pub(super) const PATH: &AsciiSet = &UNRESERVED.remove(b'/');
 
 /// Why a request was refused, as the error S3 sends.
 #[derive(Debug, PartialEq, Eq)]
@@ -83,10 +83,8 @@ pub(crate) const READ_ONLY: Refusal = Refusal {
 pub(crate) struct Signed {
     pub(crate) payload: String,
     pub(crate) role: Role,
-    /// The claims of the token that signed it, if it was signed with one.
-    pub(crate) claims: Option<Claims>,
-    /// The most bytes of a request body, if the minting key of a token limits it.
-    pub(crate) max_body: Option<u64>,
+    /// What a presigned URL is limited to, if it was signed by a presigning key.
+    pub(crate) presign: Option<Grant>,
 }
 
 impl From<Refusal> for S3Error {
@@ -139,7 +137,7 @@ impl<'a> Authorization<'a> {
     }
 }
 
-fn encode(text: &str, set: &'static AsciiSet) -> String {
+pub(super) fn encode(text: &str, set: &'static AsciiSet) -> String {
     utf8_percent_encode(text, set).to_string()
 }
 
@@ -158,13 +156,25 @@ pub(crate) fn canonical_header(parts: &Parts, name: &str) -> Option<String> {
 
 /// The canonical request of SigV4: method, path, query, signed headers and payload hash.
 fn canonical_request(parts: &Parts, auth: &Authorization<'_>, payload: &str) -> Option<String> {
+    canonical(parts, &auth.signed, payload, false)
+}
+
+/// The canonical request of SigV4 for the headers `signed`; for a presigned URL the parameter
+/// `X-Amz-Signature` is left out of the query (`drop_signature`).
+pub(super) fn canonical(
+    parts: &Parts,
+    signed: &[&str],
+    payload: &str,
+    drop_signature: bool,
+) -> Option<String> {
     let path = percent_decode_str(parts.uri.path()).decode_utf8().ok()?;
-    let mut names = auth.signed.clone();
+    let mut names = signed.to_vec();
     names.sort_unstable();
     let headers = names.iter().map(|name| canonical_header(parts, name));
     let headers: String = headers.collect::<Option<String>>()?;
     let mut pairs: Vec<(String, String)> = query_pairs(parts.uri.query())?
         .iter()
+        .filter(|(name, _)| !(drop_signature && name == "X-Amz-Signature"))
         .map(|(name, value)| (encode(name, UNRESERVED), encode(value, UNRESERVED)))
         .collect();
     pairs.sort();
@@ -179,18 +189,18 @@ fn canonical_request(parts: &Parts, auth: &Authorization<'_>, payload: &str) -> 
     ))
 }
 
-fn keyed(key: &[u8]) -> Hmac<Sha256> {
+pub(super) fn keyed(key: &[u8]) -> Hmac<Sha256> {
     <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts a key of any length")
 }
 
-fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+pub(super) fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = keyed(key);
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
 
 /// The key a request of `date` in `region` is signed with.
-fn signing_key(secret: &str, date: &str, region: &str) -> Vec<u8> {
+pub(super) fn signing_key(secret: &str, date: &str, region: &str) -> Vec<u8> {
     let k_date = hmac(format!("AWS4{secret}").as_bytes(), date.as_bytes());
     let k_region = hmac(&k_date, region.as_bytes());
     let k_service = hmac(&k_region, b"s3");
@@ -199,29 +209,14 @@ fn signing_key(secret: &str, date: &str, region: &str) -> Vec<u8> {
 
 /// The string SigV4 signs.
 fn string_to_sign(stamp: &str, auth: &Authorization<'_>, request: &str) -> String {
-    let scope = format!("{}/{}/s3/aws4_request", auth.date, auth.region);
-    let digest = hex::encode(Sha256::digest(request.as_bytes()));
-    format!("AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{digest}")
+    string_to_sign_for(stamp, (auth.date, auth.region), request)
 }
 
-/// The secret, role, claims and body limit of a key.
-type Granted = (String, Role, Option<Claims>, Option<u64>);
-
-/// The secret, the role and the claims of the access key `id`: a static key if the server has
-/// one with the id, else a token that one of its minting keys signed. A token that is refused,
-/// for any reason, is an unknown key, so that the answer does not tell a forger which part was
-/// wrong.
-fn credential(config: &ServerConfig, id: &str) -> Result<Granted, Refusal> {
-    if let Some((secret, role)) = config.key(id) {
-        return Ok((secret.to_owned(), role, None, None));
-    }
-    if !token::is_token_id(id) {
-        return Err(UNKNOWN_KEY);
-    }
-    let verified =
-        token::verify(&config.token_keys, id, config.clock.now()).map_err(|_| UNKNOWN_KEY)?;
-    let (claims, max) = (Some(verified.claims), verified.max_body);
-    Ok((verified.secret, Role::Scoped, claims, max))
+/// The string SigV4 signs for a request of `stamp`, in the scope of a `(date, region)`.
+pub(super) fn string_to_sign_for(stamp: &str, scope: (&str, &str), request: &str) -> String {
+    let scope = format!("{}/{}/s3/aws4_request", scope.0, scope.1);
+    let digest = hex::encode(Sha256::digest(request.as_bytes()));
+    format!("AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{digest}")
 }
 
 /// Checks the signature of a request.
@@ -233,12 +228,17 @@ fn credential(config: &ServerConfig, id: &str) -> Result<Granted, Refusal> {
 /// # Errors
 /// The [`Refusal`] that says what is wrong with the request.
 pub(crate) fn verify(config: &ServerConfig, parts: &Parts) -> Result<Signed, Refusal> {
-    let text = header(&parts.headers, "authorization").ok_or(UNSIGNED)?;
+    let Some(text) = header(&parts.headers, "authorization") else {
+        return presign::verify_query(config, parts);
+    };
     let auth = Authorization::parse(text).ok_or(MALFORMED)?;
-    if auth.region != config.region {
-        return Err(UNKNOWN_KEY);
+    if config.presign_key(auth.key_id).is_some() {
+        return Err(PRESIGN_ONLY);
     }
-    let (secret, role, claims, max_body) = credential(config, auth.key_id)?;
+    let known = config.key(auth.key_id);
+    let (secret, role) = known
+        .filter(|_| auth.region == config.region)
+        .ok_or(UNKNOWN_KEY)?;
     if !REQUIRED.iter().all(|name| auth.signed.contains(name)) {
         return Err(WEAK);
     }
@@ -255,21 +255,17 @@ pub(crate) fn verify(config: &ServerConfig, parts: &Parts) -> Result<Signed, Ref
     let payload = header(&parts.headers, "x-amz-content-sha256");
     let payload = payload.ok_or(MALFORMED)?;
     let request = canonical_request(parts, &auth, payload).ok_or(MALFORMED)?;
-    let key = signing_key(&secret, auth.date, auth.region);
+    let key = signing_key(secret, auth.date, auth.region);
     let mut mac = keyed(&key);
     mac.update(string_to_sign(stamp, &auth, &request).as_bytes());
     let signature = hex::decode(auth.signature).ok();
     if signature.is_none_or(|tag| mac.verify_slice(&tag).is_err()) {
         return Err(MISMATCH);
     }
-    if claims.as_ref().is_some_and(|claims| claims.expired(now)) {
-        return Err(EXPIRED);
-    }
     Ok(Signed {
         payload: payload.to_owned(),
         role,
-        claims,
-        max_body,
+        presign: None,
     })
 }
 

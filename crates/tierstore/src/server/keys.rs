@@ -28,6 +28,7 @@ use serde::Deserialize;
 
 use super::ServerConfig;
 use super::auth::{READ_ONLY, Refusal};
+use super::presign::PUT_ONLY;
 
 /// The flag whose files hold the read-only keys.
 const READ_ONLY_FLAG: &str = "--read-only-key-file";
@@ -75,8 +76,8 @@ pub(crate) enum Role {
     Full,
     /// GetObject, HeadObject, ListObjectsV2 and HeadBucket.
     ReadOnly,
-    /// A token: what it may do is in its claims, held to the call once the call is parsed.
-    Scoped,
+    /// A presigning key: one presigned `PUT`, as far as its grant goes (see `presign`).
+    PresignPut,
 }
 
 impl Role {
@@ -91,6 +92,7 @@ impl Role {
         let reads = matches!(*method, Method::GET | Method::HEAD);
         match (self, reads) {
             (Self::ReadOnly, false) => Err(READ_ONLY),
+            (Self::PresignPut, _) if *method != Method::PUT => Err(PUT_ONLY),
             _ => Ok(()),
         }
     }

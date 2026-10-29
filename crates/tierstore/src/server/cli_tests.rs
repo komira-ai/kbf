@@ -138,7 +138,8 @@ fn the_flags_have_their_defaults() {
     ];
     assert!(!s3_flags.contains(&true), "no S3 flag by default");
     assert!(cli.read_only_key_file.is_empty());
-    assert!(cli.token_key_file.is_empty());
+    assert!(cli.presign_key_file.is_empty());
+    assert_eq!(cli.presign_max_expires, Duration::from_secs(900));
 }
 
 /// Asserts that `--read-only-key-file` can be given any number of times, and that the files are

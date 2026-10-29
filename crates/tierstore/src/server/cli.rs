@@ -58,7 +58,7 @@ use crate::{
 };
 
 use super::keys::{ensure_distinct, read_credentials, read_only_keys};
-use super::token::{ensure_distinct_ids, token_keys};
+use super::presign::{ensure_distinct as presign_distinct, presign_keys};
 use super::{Drained, Server, ServerConfig};
 
 /// A start-up error, for the operator.
@@ -174,14 +174,18 @@ pub struct Cli {
     /// refused with status 2. Only its owner may read it (mode 0600).
     #[arg(long)]
     pub read_only_key_file: Vec<PathBuf>,
-    /// A file that holds a minting key, in the form of `--access-key-file` (its id is the key id
-    /// a token names; its secret is at least 32 bytes): the server accepts the tokens that this
-    /// key signed, which are scoped to a prefix and expire. Give the flag once for each key that
-    /// is accepted; during a rotation, the new key and the one it replaces. A token that names a
-    /// key given by no flag is refused. The key ids must differ. Only its owner may read it
-    /// (mode 0600).
+    /// A file that holds a presigning key and its ceiling, JSON of `access_key_id`,
+    /// `secret_access_key` and `ceiling` (`prefix`, `max_expires_secs`, `max_object_bytes`; all
+    /// required, so a key without a ceiling is refused at start): the key may sign presigned PUT
+    /// URLs for one object each under the prefix, and nothing else; a request signed with it in
+    /// the header is refused. Give the flag once for each such key; all key ids must differ. Only
+    /// its owner may read it (mode 0600).
     #[arg(long)]
-    pub token_key_file: Vec<PathBuf>,
+    pub presign_key_file: Vec<PathBuf>,
+    /// The longest `X-Amz-Expires` that a presigned URL may have, whatever the ceiling of its key
+    /// says: a number and `ms`, `s`, `m` or `h`.
+    #[arg(long, default_value = "15m", value_parser = parse_duration)]
+    pub presign_max_expires: Duration,
     /// How long, after the drain began, the server goes on serving everything, so that the
     /// 503 of `/readyz` is seen: a number and `ms`, `s`, `m` or `h`.
     #[arg(long, default_value = "10s", value_parser = parse_duration)]
@@ -390,15 +394,19 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     let (key_id, secret) = read_key(&cli.access_key_file)?;
     let read_only = read_only_keys(&cli.read_only_key_file)?;
     ensure_distinct(&key_id, &read_only).map_err(InvalidFlags)?;
-    let token_keys = token_keys(&cli.token_key_file)?;
-    ensure_distinct_ids(&token_keys).map_err(InvalidFlags)?;
+    let presign = presign_keys(&cli.presign_key_file)?;
+    let others: Vec<&str> = std::iter::once(key_id.as_str())
+        .chain(read_only.iter().map(|key| key.id.as_str()))
+        .collect();
+    presign_distinct(&others, &presign).map_err(InvalidFlags)?;
     let timeout = cli.s3_request_timeout;
     let hot = open_tier("--hot", &cli.hot, &cli.hot_s3(), timeout)?;
     let cold = open_tier("--cold", &cli.cold, &cli.cold_s3(), timeout)?;
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut server = ServerConfig::new(&cli.bucket, &key_id, &secret, Arc::clone(&clock));
     server.read_only_keys = read_only;
-    server.token_keys = token_keys;
+    server.presign_keys = presign;
+    server.presign_max_expires = cli.presign_max_expires;
     server.region = cli.region.clone();
     server.max_request_bytes = usize::try_from(cli.max_request_bytes).unwrap_or(usize::MAX);
     server.body_idle_timeout = cli.body_idle_timeout;

@@ -38,10 +38,10 @@
 //! when the client goes away before the answer, so that no object is left without the journal
 //! entry that has it copied.
 //!
-//! Requests are signed with SigV4 in the `Authorization` header (see `auth`): by one of the
-//! access keys of [`ServerConfig`], over `host`, `x-amz-content-sha256` and `x-amz-date` at
-//! least, and a request without a good signature, a presigned URL included, is answered 403
-//! before its body is read. A request names its key by the key id of its credential, and an id
+//! Requests are signed with SigV4 in the `Authorization` header (see `auth`) by one of the access
+//! keys of [`ServerConfig`], over `host`, `x-amz-content-sha256` and `x-amz-date` at least, or are
+//! presigned PUT URLs of a presigning key (see [`presign`]). A request without a good signature is
+//! answered 403 before its body is read. A request names its key by the key id of its credential, and an id
 //! that is no key's is `InvalidAccessKeyId`.
 //!
 //! # Access keys
@@ -51,9 +51,9 @@
 //! GetObject, HeadObject, ListObjectsV2 and HeadBucket and nothing else. Any other call signed
 //! by a read-only key (a put, a delete, CreateBucket, and every call of a multipart upload) is
 //! answered 403 `AccessDenied` with the S3 error document before its body is read, and changes
-//! nothing. The roles of those keys are of the key and not of a prefix. A credential that is limited
-//! to a prefix, and expires, is a token: see [`token`], and [`ServerConfig::token_keys`] for the
-//! keys the server checks tokens with (`--token-key-file` in the binary).
+//! nothing. The roles of those keys are of the key and not of a prefix. A credential that may write one
+//! object under a prefix, and expires, is a presigned PUT URL: see [`presign`], and
+//! [`ServerConfig::presign_keys`] for the keys that sign them (`--presign-key-file` in the binary).
 //!
 //! # Checksums
 //!
@@ -111,10 +111,10 @@ pub mod cli;
 mod idle;
 mod keys;
 mod ops;
+pub mod presign;
 mod reply;
 mod request;
 mod time;
-pub mod token;
 mod xml;
 
 #[cfg(test)]
@@ -132,6 +132,8 @@ mod ops_tests;
 #[cfg(test)]
 mod pipes;
 #[cfg(test)]
+mod presign_server_tests;
+#[cfg(test)]
 mod reply_tests;
 #[cfg(test)]
 mod request_tests;
@@ -145,8 +147,6 @@ mod slow_reader_tests;
 mod testing;
 #[cfg(test)]
 mod time_tests;
-#[cfg(test)]
-mod token_server_tests;
 #[cfg(test)]
 mod xml_tests;
 
@@ -174,11 +174,11 @@ use tokio::sync::{Notify, watch};
 use crate::{Backend, Clock};
 
 pub use keys::AccessKey;
-pub use token::MintingKey;
+pub use presign::{Grant, PresignKey, PresignRequest, presign_put};
 
 use idle::Watched;
 use reply::{Answer, S3Error, answer};
-use request::{BoxError, Check, Query, Reader, Target, resolve};
+use request::{BoxError, Check, Query, Reader, Target, header, resolve};
 
 /// The settings of a [`Server`].
 #[derive(Clone)]
@@ -195,10 +195,11 @@ pub struct ServerConfig {
     /// the module docs). None by default. Their ids differ from each other's and from the full
     /// key's: if one is the full key's, the full key is the one that is meant.
     pub read_only_keys: Vec<AccessKey>,
-    /// The keys that tokens are signed with (see [`token`]): a token names one by its id, and one
-    /// that names another, or none, is refused. During a rotation, the new key and the one it
-    /// replaces. None by default. Their ids differ from each other's.
-    pub token_keys: Vec<MintingKey>,
+    /// The keys that sign presigned PUT URLs (see [`presign`]); a URL is accepted only if one of
+    /// them signed it. None by default. Their ids differ from each other's and from the other keys'.
+    pub presign_keys: Vec<PresignKey>,
+    /// The longest `X-Amz-Expires` a presigned URL may have, whatever the ceiling of its key says.
+    pub presign_max_expires: Duration,
     /// The most bytes of a request body: the largest object that one put takes, and the
     /// largest part of an upload.
     pub max_request_bytes: usize,
@@ -238,7 +239,8 @@ impl ServerConfig {
             access_key_id: access_key_id.to_owned(),
             secret_access_key: secret_access_key.to_owned(),
             read_only_keys: Vec::new(),
-            token_keys: Vec::new(),
+            presign_keys: Vec::new(),
+            presign_max_expires: Duration::from_secs(900),
             max_request_bytes: 256 << 20,
             body_idle_timeout: Duration::from_secs(30),
             header_timeout: Duration::from_secs(60),
@@ -520,6 +522,23 @@ impl Server {
         }));
     }
 
+    /// Refuses a request whose declared body is over `max` bytes, before its body is read.
+    fn too_large(parts: &Parts, max: u64) -> Result<(), S3Error> {
+        let declared = header(&parts.headers, "content-length");
+        if declared
+            .and_then(|text| text.parse::<u64>().ok())
+            .is_some_and(|len| len > max)
+        {
+            let text = format!("The request body is over the limit of {max} bytes.");
+            return Err(S3Error::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "EntityTooLarge",
+                text,
+            ));
+        }
+        Ok(())
+    }
+
     /// Answers one request.
     pub async fn handle<B>(&self, request: Request<B>) -> Response<Full<Bytes>>
     where
@@ -569,14 +588,15 @@ impl Server {
         signed.role.permit(&parts.method)?;
         let target = resolve(&self.config.bucket, parts.uri.path())?;
         let query = Query::parse(parts.uri.query())?;
-        if let Some(claims) = &signed.claims {
-            claims.permit(parts, &target, &query)?;
+        if let Some(grant) = &signed.presign {
+            grant.permit(parts, &target, &query)?;
+            Self::too_large(parts, grant.max_object_bytes)?;
         }
         let data = matches!((&parts.method, &target), (&Method::PUT, Target::Object(_)));
         let check = Check::new(&signed.payload, &parts.headers, data)?;
         let limit = self.config.max_request_bytes;
-        let limit = signed.max_body.map_or(limit, |max| {
-            limit.min(usize::try_from(max).unwrap_or(usize::MAX))
+        let limit = signed.presign.as_ref().map_or(limit, |grant| {
+            limit.min(usize::try_from(grant.max_object_bytes).unwrap_or(usize::MAX))
         });
         let reader = Reader::new(body, limit, self.config.body_idle_timeout);
         self.dispatch(parts, target, &query, reader, check).await
