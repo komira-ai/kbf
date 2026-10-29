@@ -414,8 +414,10 @@ mod tests {
         let rig = Rig::new("slash");
         let work = rig.root().join("sub");
         std::fs::create_dir_all(&work).expect("work");
-        std::os::unix::fs::symlink("/bin/echo", work.join("myecho")).expect("link");
-        let mut command = program(&["./myecho", "ok"]);
+        // Named `echo`: a multi-call build of the tools picks its behaviour from the name it is
+        // run as. Nothing on the run's PATH (it sets none) could find it: only `./` does.
+        std::os::unix::fs::symlink("/bin/echo", work.join("echo")).expect("link");
+        let mut command = program(&["./echo", "ok"]);
         command.working_directory = "sub".into();
         rig.run(&command, LONG).await.expect("ran");
         assert_eq!(rig.out(), "ok\n");
