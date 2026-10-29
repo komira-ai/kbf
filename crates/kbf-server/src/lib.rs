@@ -105,6 +105,7 @@ pub mod identity;
 pub mod join;
 pub mod learned;
 mod listen;
+mod load_metrics;
 mod local;
 pub mod log_file;
 pub mod machine;

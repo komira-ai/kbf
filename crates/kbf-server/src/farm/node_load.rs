@@ -307,7 +307,36 @@ pub(crate) fn shown(
     loads.get(worker).map(|kept| kept.view(capacity, now))
 }
 
+/// The load of every node that has one, as the node view shows it at `now`, in node-id
+/// order. `capacity` is what each node reported. Both drivers of the farm list loads through
+/// this, for the `kbf_node_load_*` families of `GET /metrics`.
+pub(crate) fn shown_all(
+    loads: &NodeLoads,
+    capacity: impl Fn(&WorkerId) -> Resources,
+    now: FarmTime,
+) -> Vec<(WorkerId, LoadView)> {
+    loads
+        .iter()
+        .map(|(worker, kept)| (worker.clone(), kept.view(&capacity(worker), now)))
+        .collect()
+}
+
 impl Farm {
+    /// The load of every node the farm has accepted a reading of, as `GET /v1/nodes/{id}`
+    /// shows it now, in node-id order: the source of the `kbf_node_load_*` families of
+    /// `GET /metrics` ([`crate::load_metrics`]). A node keeps its load, aging to stale, until
+    /// the server restarts or its daemon's next stream starts a new session.
+    #[must_use]
+    pub fn node_loads(&self) -> Vec<(WorkerId, LoadView)> {
+        js_arm!(self, load::node_loads());
+        let state = self.lock();
+        shown_all(
+            &state.side.node_loads,
+            |worker| state.engine.sched.capacity(worker).unwrap_or_default(),
+            self.now(),
+        )
+    }
+
     /// The node load on a heartbeat of `worker` on `stream`, taken if the accept rule
     /// ([module](self)) does. A heartbeat with none changes nothing: the last accepted
     /// reading ages. Ignored if `stream` was replaced.
