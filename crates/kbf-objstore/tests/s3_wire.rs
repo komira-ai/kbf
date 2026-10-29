@@ -1122,3 +1122,34 @@ async fn a_put_cut_before_its_answer_is_sent_once_and_fails_as_transport() {
     s.put_stream(&key(), 3, body).await.unwrap();
     assert_eq!(reads.load(Ordering::SeqCst), 2);
 }
+
+/// Catches: a `len` that sends a GET (the object's bytes come over the wire), or that
+/// takes any failure for a missing object (an ingest would then call a denied bucket
+/// empty): only a 404 is `None`; a 403 is `Service` with its status and code.
+#[tokio::test]
+async fn len_sends_a_head_and_only_a_404_is_none() {
+    let denied = "<Error><Code>AccessDenied</Code><Message>no</Message></Error>";
+    let (endpoint, seen) = script(vec![
+        "HTTP/1.1 200 OK\r\nconnection: close\r\netag: \"abc\"\r\n\
+         last-modified: Wed, 21 Oct 2026 07:28:00 GMT\r\ncontent-length: 33\r\n\r\n"
+            .to_owned(),
+        answer("404 Not Found", &[], ""),
+        answer("403 Forbidden", &[], denied),
+    ])
+    .await;
+    let s = store(endpoint, Capabilities::default());
+    assert_eq!(s.len(&key()).await.unwrap(), Some(33));
+    assert_eq!(s.len(&key()).await.unwrap(), None);
+    let err = s.len(&key()).await.unwrap_err();
+    assert!(
+        matches!(&err, ObjectStoreError::Service { status: 403, code, .. } if code == "AccessDenied"),
+        "{err}"
+    );
+    let heads = seen.lock().unwrap();
+    assert!(
+        heads[0].starts_with("HEAD /kbf-test/cas/seg-1 HTTP/1.1"),
+        "{}",
+        heads[0]
+    );
+    assert_eq!(heads.len(), 3);
+}
