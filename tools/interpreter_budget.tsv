@@ -52,3 +52,7 @@ crates/kbf-mac-provision/tests/drift.rs	data: /bin/zsh as a drifted UserShell va
 crates/kbf-mac-session/tests/node_admin.rs	data: /bin/sh as an argument the verb parser must refuse; nothing runs it
 crates/kbf-mac-session/tests/role_user.rs	data: /bin/zsh as a UserShell changed by hand; nothing runs it
 crates/kbf-node/tests/front/mod.rs	Front::user_shell: the tests of how the daemon ends a user's /bin/sh -c command and its background job (`$$`, `$!` name the processes), sent through the front
+crates/kbf-task/src/fetch.rs	runs an action's Command, which is a shell command line in the tests
+crates/kbf-task/src/outputs.rs	runs an action's Command, which is a shell command line in the tests
+crates/kbf-task/src/run.rs	runs an action's Command, which is a shell command line in the tests
+crates/kbf-task/src/task_tests.rs	runs an action's Command, which is a shell command line in the tests
