@@ -135,7 +135,14 @@ async fn the_self_test_calls_a_service_that_does_not_answer_unreachable() {
     };
     assert_eq!(backend, "the service");
     assert!(error.contains("create-only"), "{error}");
-    assert_eq!(notes.lock().unwrap().len(), 1);
+    // With two attempts the notes are: the listing of old probe keys that failed, one repeat, and
+    // the delete of the check's key that failed before each attempt and after the check.
+    let notes = notes.lock().unwrap();
+    let count = |text: &str| notes.iter().filter(|note| note.contains(text)).count();
+    assert_eq!(count("could not list the probe keys"), 1, "{notes:?}");
+    assert_eq!(count("trying again"), 1, "{notes:?}");
+    assert_eq!(count("could not delete the probe key"), 3, "{notes:?}");
+    assert_eq!(notes.len(), 5, "{notes:?}");
 }
 
 /// Asserts that a call failed with `Error::Other`.
