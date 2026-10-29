@@ -488,7 +488,7 @@ mod tests {
     fn tree() -> (Memory, Digest) {
         let mut mem = Memory::default();
         let text = mem.put(b"hello".to_vec());
-        let script = mem.put(b"#!/bin/sh\n".to_vec());
+        let script = mem.put(b"tool bytes\n".to_vec());
         let empty = mem.put(Vec::new());
         let bin = mem.put_directory(&Directory {
             files: vec![file("run", &script, true)],
@@ -544,7 +544,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(dir.join("bin/run")).expect("run"),
-            b"#!/bin/sh\n"
+            b"tool bytes\n"
         );
         assert_eq!(mode(&dir.join("bin/run")), 0o755);
         assert_eq!(mode(&dir.join("a.txt")), 0o644);

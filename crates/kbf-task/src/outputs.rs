@@ -261,7 +261,7 @@ mod tests {
     async fn files_are_recorded_with_their_executable_bit() {
         let (work, out, err) = rig("files");
         std::fs::write(work.join("plain"), b"plain bytes").expect("plain");
-        std::fs::write(work.join("tool"), b"#!/bin/sh\n").expect("tool");
+        std::fs::write(work.join("tool"), b"tool bytes\n").expect("tool");
         std::fs::set_permissions(work.join("tool"), std::fs::Permissions::from_mode(0o755))
             .expect("chmod");
         let limits = OutputLimits::default();
@@ -280,7 +280,7 @@ mod tests {
         );
         assert_eq!(files[0].digest, Some(digest_of(b"plain bytes")));
         assert_eq!(text(&got, &files[0].digest), b"plain bytes");
-        assert_eq!(text(&got, &files[1].digest), b"#!/bin/sh\n");
+        assert_eq!(text(&got, &files[1].digest), b"tool bytes\n");
     }
 
     /// Catches stdout or stderr left out of the result or the blobs, or swapped.

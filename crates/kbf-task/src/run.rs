@@ -307,9 +307,10 @@ mod tests {
 
     const LONG: Duration = Duration::from_secs(600);
 
-    fn sh(script: &str) -> Command {
+    /// A Command that runs `argv` directly, without a shell.
+    fn program(argv: &[&str]) -> Command {
         Command {
-            arguments: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            arguments: argv.iter().map(|a| (*a).to_owned()).collect(),
             ..Command::default()
         }
     }
@@ -322,30 +323,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stdout_and_stderr_go_to_their_files() {
-        let rig = Rig::new("streams");
+    async fn stdout_goes_to_its_file() {
+        let rig = Rig::new("stdout");
         let ran = rig
-            .run(&sh("echo out; echo err >&2"), LONG)
+            .run(&program(&["/bin/echo", "out"]), LONG)
             .await
             .expect("ran");
         assert_eq!(ran.exit_code, 0);
         assert!(!ran.timed_out);
         assert_eq!(rig.out(), "out\n");
-        assert_eq!(rig.err(), "err\n");
+        assert_eq!(rig.err(), "");
+    }
+
+    /// The text of the message is the program's and its locale's, so only that it reached the
+    /// stderr file, and not the stdout file, is asserted.
+    #[tokio::test]
+    async fn stderr_goes_to_its_file() {
+        let rig = Rig::new("stderr");
+        let ran = rig
+            .run(&program(&["/bin/cat", "no-such-file"]), LONG)
+            .await
+            .expect("ran");
+        assert_ne!(ran.exit_code, 0);
+        assert!(!ran.timed_out);
+        assert_eq!(rig.out(), "");
+        assert!(!rig.err().is_empty());
     }
 
     #[tokio::test]
     async fn the_exit_code_is_reported() {
         let rig = Rig::new("exit");
-        let ran = rig.run(&sh("exit 7"), LONG).await.expect("ran");
-        assert_eq!(ran.exit_code, 7);
-        assert!(!ran.timed_out);
+        // `env` exits 127 when it cannot find the program it was asked to run.
+        for (argv, code) in [
+            (vec!["/bin/true"], 0),
+            (vec!["/bin/false"], 1),
+            (vec!["/usr/bin/env", "./no-such-program"], 127),
+        ] {
+            let ran = rig.run(&program(&argv), LONG).await.expect("ran");
+            assert_eq!(ran.exit_code, code, "{argv:?}");
+            assert!(!ran.timed_out);
+        }
     }
 
     #[tokio::test]
     async fn a_program_a_signal_ended_reports_128_plus_the_signal() {
         let rig = Rig::new("signal");
-        let ran = rig.run(&sh("kill -TERM $$"), LONG).await.expect("ran");
+        // Process 0 is the sender's own group: the program leads its group, so only it ends.
+        let ran = rig
+            .run(&program(&["/bin/kill", "-TERM", "0"]), LONG)
+            .await
+            .expect("ran");
         assert_eq!(ran.exit_code, 128 + 15);
         assert!(!ran.timed_out);
     }
@@ -354,23 +381,29 @@ mod tests {
     async fn the_environment_is_the_commands_alone() {
         let rig = Rig::new("env");
         // Set in the parent of the program; the Command does not name it.
-        let mut command =
-            sh("echo \"${KBF_TASK_ONLY_MINE-unset}:${KBF_TASK_FROM_COMMAND-unset}:${HOME-unset}\"");
+        let mut command = program(&["/usr/bin/env"]);
         command.environment_variables = vec![var("KBF_TASK_FROM_COMMAND", "yes")];
         // SAFETY: nothing else in this test binary reads or writes this variable.
         unsafe { std::env::set_var("KBF_TASK_ONLY_MINE", "leaked") };
         rig.run(&command, LONG).await.expect("ran");
-        assert_eq!(rig.out(), "unset:yes:unset\n");
+        let out = rig.out();
+        let names: Vec<&str> = out
+            .lines()
+            .map(|l| l.split_once('=').map_or(l, |(name, _)| name))
+            .collect();
+        assert!(
+            out.lines().any(|l| l == "KBF_TASK_FROM_COMMAND=yes"),
+            "{out}"
+        );
+        assert!(!names.contains(&"KBF_TASK_ONLY_MINE"), "{out}");
+        assert!(!names.contains(&"HOME"), "{out}");
     }
 
     #[tokio::test]
     async fn a_bare_program_name_is_found_on_the_commands_path() {
         let rig = Rig::new("path");
-        let command = Command {
-            arguments: vec!["sh".into(), "-c".into(), "echo found".into()],
-            environment_variables: vec![var("PATH", "/bin:/usr/bin")],
-            ..Command::default()
-        };
+        let mut command = program(&["echo", "found"]);
+        command.environment_variables = vec![var("PATH", "/bin:/usr/bin")];
         let ran = rig.run(&command, LONG).await.expect("ran");
         assert_eq!(ran.exit_code, 0);
         assert_eq!(rig.out(), "found\n");
@@ -381,12 +414,9 @@ mod tests {
         let rig = Rig::new("slash");
         let work = rig.root().join("sub");
         std::fs::create_dir_all(&work).expect("work");
-        std::os::unix::fs::symlink("/bin/sh", work.join("mysh")).expect("link");
-        let command = Command {
-            arguments: vec!["./mysh".into(), "-c".into(), "echo ok".into()],
-            working_directory: "sub".into(),
-            ..Command::default()
-        };
+        std::os::unix::fs::symlink("/bin/echo", work.join("myecho")).expect("link");
+        let mut command = program(&["./myecho", "ok"]);
+        command.working_directory = "sub".into();
         rig.run(&command, LONG).await.expect("ran");
         assert_eq!(rig.out(), "ok\n");
     }
@@ -394,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn the_working_directory_is_made_and_the_program_runs_in_it() {
         let rig = Rig::new("cwd");
-        let mut command = sh("pwd -P");
+        let mut command = program(&["/bin/pwd", "-P"]);
         command.working_directory = "a/b".into();
         rig.run(&command, LONG).await.expect("ran");
         let expected = std::fs::canonicalize(rig.root().join("a/b")).expect("made");
@@ -404,7 +434,7 @@ mod tests {
     #[tokio::test]
     async fn the_parent_directories_of_outputs_are_made_under_the_working_directory() {
         let rig = Rig::new("parents");
-        let mut command = sh("true");
+        let mut command = program(&["/bin/true"]);
         command.working_directory = "w".into();
         command.output_paths = vec!["out/deep/file".into(), "top".into()];
         rig.run(&command, LONG).await.expect("ran");
@@ -417,7 +447,7 @@ mod tests {
     #[allow(deprecated)]
     async fn the_older_output_lists_make_their_parents_too() {
         let rig = Rig::new("legacy");
-        let mut command = sh("true");
+        let mut command = program(&["/bin/true"]);
         command.output_files = vec!["f/g/file".into()];
         command.output_directories = vec!["d/e".into()];
         rig.run(&command, LONG).await.expect("ran");
@@ -429,38 +459,30 @@ mod tests {
     #[tokio::test]
     async fn a_deadline_kills_the_process_group() {
         let rig = Rig::new("deadline");
-        // The shell stays alive and a child of it sleeps; both must go.
-        let command = sh("sleep 600 & echo $! > pid; wait");
+        // `find` stays alive and runs `sleep` as its child; both must go.
+        let command = program(&[
+            "/usr/bin/find",
+            ".",
+            "-maxdepth",
+            "0",
+            "-exec",
+            "/bin/sleep",
+            "600",
+            ";",
+        ]);
         let ran = rig.run(&command, Duration::ZERO).await.expect("ran");
         assert!(ran.timed_out);
         assert_eq!(ran.exit_code, TIMED_OUT_EXIT_CODE);
     }
 
     #[tokio::test]
-    async fn a_process_left_in_the_group_is_ended_with_the_program() {
-        let rig = Rig::new("left");
-        let command = sh("sleep 600 & echo $! > pid");
-        let ran = rig.run(&command, LONG).await.expect("ran");
-        assert_eq!(ran.exit_code, 0);
-        let pid = std::fs::read_to_string(rig.root().join("pid")).expect("pid");
-        let pid: libc::pid_t = pid.trim().parse().expect("number");
-        // Gone (or a zombie adopted by init, which no longer answers a signal-0 probe once
-        // reaped); poll the group kill's effect through /proc without timing assertions.
-        loop {
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
-            match stat {
-                Err(_) => break,
-                Ok(s) if s.contains(") Z ") => break,
-                Ok(_) => tokio::task::yield_now().await,
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn usage_is_reported() {
         let rig = Rig::new("usage");
-        let ran = rig.run(&sh("echo hi"), LONG).await.expect("ran");
-        // A shell that ran and was reaped has a resident set; the other figures are
+        let ran = rig
+            .run(&program(&["/bin/echo", "hi"]), LONG)
+            .await
+            .expect("ran");
+        // A program that ran and was reaped has a resident set; the other figures are
         // measured, not asserted.
         assert!(ran.peak_rss_bytes > 0, "{ran:?}");
     }
@@ -485,7 +507,7 @@ mod tests {
             ("", "../x"),
             ("", ""),
         ] {
-            let mut command = sh("true");
+            let mut command = program(&["/bin/true"]);
             command.working_directory = work.into();
             command.output_paths = vec![output.into()];
             let error = rig.run(&command, LONG).await.expect_err("refused");
@@ -502,13 +524,13 @@ mod tests {
         std::os::unix::fs::symlink("/", rig.root().join("link")).expect("link");
         std::fs::write(rig.root().join("file"), b"x").expect("file");
         for work in ["link", "link/x", "file/x"] {
-            let mut command = sh("true");
+            let mut command = program(&["/bin/true"]);
             command.working_directory = work.into();
             let error = rig.run(&command, LONG).await.expect_err("refused");
             assert!(matches!(error, RunError::Invalid(_)), "{work}: {error}");
         }
         // The same for a directory an output needs.
-        let mut command = sh("true");
+        let mut command = program(&["/bin/true"]);
         command.output_paths = vec!["link/out".into()];
         let error = rig.run(&command, LONG).await.expect_err("refused");
         assert!(matches!(error, RunError::Invalid(_)), "{error}");
@@ -522,7 +544,7 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o500),
         )
         .expect("chmod");
-        let mut command = sh("true");
+        let mut command = program(&["/bin/true"]);
         command.working_directory = "new".into();
         let result = rig.run(&command, LONG).await;
         std::fs::set_permissions(
@@ -542,7 +564,7 @@ mod tests {
         let root = rig.root();
         let missing = rig.dir.join("none/stdout");
         let error = run(
-            &sh("true"),
+            &program(&["/bin/true"]),
             &Run {
                 root: &root,
                 stdout: &missing,

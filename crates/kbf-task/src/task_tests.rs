@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use kbf_proto::reapi::command::EnvironmentVariable;
-use kbf_proto::reapi::{Directory, FileNode};
+use kbf_proto::reapi::{Directory, DirectoryNode, FileNode, SymlinkNode};
 use kbf_segments::SegmentReader;
 use kbf_testkit::dir::TestDir;
 use prost::Message;
@@ -91,17 +91,46 @@ fn cli(work_dir: &Path, action: Digest) -> Cli {
     .expect("flags")
 }
 
-/// An Action whose Command is `argv` with `outputs`, over an input root holding `data`.
+/// An Action whose Command is `argv` with `outputs`, over an input root holding `data` and
+/// `src`, a directory of `d/f` and a symlink `link` to `d/f`.
 fn action(mem: &mut Mem, argv: &[&str], outputs: &[&str]) -> Digest {
-    let data = mem.add(b"input\n".to_vec());
-    let root = mem.add(
+    let data = mem.add(b"hi\n".to_vec());
+    let x = mem.add(b"x\n".to_vec());
+    let file = |name: &str, digest: Digest| FileNode {
+        name: name.to_owned(),
+        digest: Some(digest),
+        is_executable: false,
+        ..Default::default()
+    };
+    let sub = |name: &str, directory: Directory, mem: &mut Mem| DirectoryNode {
+        name: name.to_owned(),
+        digest: Some(mem.add(directory.encode_to_vec())),
+    };
+    let d = sub(
+        "d",
         Directory {
-            files: vec![FileNode {
-                name: "data".to_owned(),
-                digest: Some(data),
-                is_executable: false,
+            files: vec![file("f", x)],
+            ..Default::default()
+        },
+        mem,
+    );
+    let src = sub(
+        "src",
+        Directory {
+            directories: vec![d],
+            symlinks: vec![SymlinkNode {
+                name: "link".to_owned(),
+                target: "d/f".to_owned(),
                 ..Default::default()
             }],
+            ..Default::default()
+        },
+        mem,
+    );
+    let root = mem.add(
+        Directory {
+            files: vec![file("data", data)],
+            directories: vec![src],
             ..Default::default()
         }
         .encode_to_vec(),
@@ -128,12 +157,13 @@ fn action(mem: &mut Mem, argv: &[&str], outputs: &[&str]) -> Digest {
     )
 }
 
-const SCRIPT: &str = "echo hi > out; echo err >&2";
+/// Copies `data` to `out` and reports its record counts on standard error.
+const COPY: &[&str] = &["dd", "if=data", "of=out", "status=noxfer"];
 
 #[tokio::test]
 async fn a_run_stores_a_pack_whose_first_record_is_the_manifest_naming_every_output() {
     let mut mem = Mem::default();
-    let digest = action(&mut mem, &["sh", "-c", SCRIPT], &["out"]);
+    let digest = action(&mut mem, COPY, &["out"]);
     let dir = scratch("e2e");
     let cli = cli(&dir, digest);
     let sink = Fake::new(false);
@@ -152,9 +182,16 @@ async fn a_run_stores_a_pack_whose_first_record_is_the_manifest_naming_every_out
     assert_eq!(manifest.output_files[0].path, "out");
     assert_eq!(manifest.output_files[0].digest, BlobId::of(b"hi\n"));
     assert!(!manifest.output_files[0].is_executable);
-    // Stdout is empty: it is left out of the manifest and has no record.
+    // Stdout is empty: it is left out of the manifest and has no record. What dd reports on
+    // stderr depends on its locale, so only that it is recorded is asserted; `verify` above
+    // found its record in the pack.
     assert_eq!(manifest.stdout, None);
-    assert_eq!(manifest.stderr, Some(BlobId::of(b"err\n")));
+    assert!(
+        manifest
+            .stderr
+            .as_ref()
+            .is_some_and(|e| *e != BlobId::of(b""))
+    );
     // The manifest, stderr and the one output file: three records, none of them empty.
     let reader = SegmentReader::open(body).expect("segment");
     assert_eq!(reader.footer().entries().len(), 3);
@@ -176,7 +213,7 @@ async fn a_run_stores_a_pack_whose_first_record_is_the_manifest_naming_every_out
 #[tokio::test]
 async fn an_empty_output_file_is_listed_without_a_record() {
     let mut mem = Mem::default();
-    let digest = action(&mut mem, &["sh", "-c", ": > out"], &["out"]);
+    let digest = action(&mut mem, &["touch", "out"], &["out"]);
     let dir = scratch("empty-out");
     let sink = Fake::new(false);
     let manifest = execute(&cli(&dir, digest), &mem, &sink)
@@ -193,13 +230,13 @@ async fn an_empty_output_file_is_listed_without_a_record() {
 #[tokio::test]
 async fn the_actions_exit_code_is_in_the_manifest_and_the_tool_still_succeeds() {
     let mut mem = Mem::default();
-    let digest = action(&mut mem, &["sh", "-c", "exit 3"], &[]);
+    let digest = action(&mut mem, &["false"], &[]);
     let dir = scratch("exit3");
     let sink = Fake::new(false);
     let manifest = execute(&cli(&dir, digest), &mem, &sink)
         .await
         .expect("task");
-    assert_eq!(manifest.exit_code, 3);
+    assert_eq!(manifest.exit_code, 1);
     assert!(manifest.output_files.is_empty());
     assert_eq!(sink.stored.lock().unwrap().len(), 1);
 }
@@ -207,8 +244,11 @@ async fn the_actions_exit_code_is_in_the_manifest_and_the_tool_still_succeeds() 
 #[tokio::test]
 async fn output_directories_and_symlinks_reach_the_manifest() {
     let mut mem = Mem::default();
-    let script = "mkdir d; echo x > d/f; ln -s d/f link";
-    let digest = action(&mut mem, &["sh", "-c", script], &["d", "link"]);
+    let digest = action(
+        &mut mem,
+        &["cp", "-a", "src/d", "src/link", "."],
+        &["d", "link"],
+    );
     let dir = scratch("tree");
     let sink = Fake::new(false);
     let manifest = execute(&cli(&dir, digest), &mem, &sink)
@@ -272,7 +312,7 @@ async fn a_command_with_no_program_fails_as_a_run_start() {
 #[tokio::test]
 async fn outputs_past_a_limit_fail_as_a_pack_and_store_nothing() {
     let mut mem = Mem::default();
-    let digest = action(&mut mem, &["sh", "-c", SCRIPT], &["out"]);
+    let digest = action(&mut mem, COPY, &["out"]);
     let dir = scratch("limit");
     let mut flags = cli(&dir, digest);
     flags.limits.max_stdio_bytes = 1;
@@ -286,7 +326,7 @@ async fn outputs_past_a_limit_fail_as_a_pack_and_store_nothing() {
 #[tokio::test]
 async fn a_pack_the_store_refuses_fails_as_a_put() {
     let mut mem = Mem::default();
-    let digest = action(&mut mem, &["sh", "-c", SCRIPT], &["out"]);
+    let digest = action(&mut mem, COPY, &["out"]);
     let dir = scratch("refused");
     let failure = execute(&cli(&dir, digest), &mem, &Fake::new(true))
         .await
