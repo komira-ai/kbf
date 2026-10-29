@@ -5,7 +5,7 @@
 
 use kbf_estimator::Bounds;
 use kbf_invocation::Evidence;
-use kbf_sched::{Request, Scheduler};
+use kbf_sched::{Prediction, Request, Scheduler};
 use std::sync::atomic::Ordering;
 
 use kbf_types::{Failure, LeaseId, LeaseKind, OperationId, Outcome, WaiterId, WorkerId};
@@ -14,7 +14,9 @@ use super::State;
 use super::engine::{Adapter, Engine};
 use super::side::Side;
 use crate::action_usage::Measured;
-use crate::learned::{Attempt, BATCH, Row, Skip, basis_of_os, hint_of, key_of, kill_run, run_of};
+use crate::learned::{
+    Attempt, BATCH, Row, Skip, Unset, basis_of_os, hint_of, key_of, kill_run, run_of,
+};
 use crate::machine::Platform;
 use crate::run_record;
 
@@ -52,7 +54,7 @@ impl Side {
 
     /// The bounds a new operation for `os` is asked about: the largest registered node of
     /// that OS (the scheduler's own cap also looks at the rest of the request's `needs`).
-    fn bounds_for_os(&self, sched: &Scheduler, os: &str) -> Bounds {
+    pub(super) fn bounds_for_os(&self, sched: &Scheduler, os: &str) -> Bounds {
         let mut bounds = Bounds {
             default_memory: self.learned.default_memory(),
             host_memory: 0,
@@ -113,7 +115,10 @@ impl Side {
             return;
         };
         match key_of(&instance, &platform, basis, &subject) {
-            Ok(key) => self.learned.stage(lease, Some(Attempt { key, run })),
+            Ok(key) => {
+                self.learned.stage(lease, Some(Attempt { key, run }));
+                self.learned.stage_prediction(lease, operation);
+            }
             Err(why) => self.learned.skip(why),
         }
     }
@@ -240,27 +245,30 @@ impl State {
     }
 
     /// Logs what the estimator would book for `request`, the new operation `name` that
-    /// `waiter` waits on. A caller that joined a twin (`joined`) is not a new operation.
+    /// `waiter` waits on, `operation`. A caller that joined a twin (`joined`) is not a new
+    /// operation. Returns the prediction the submit gives the scheduler for `operation`
+    /// (`--placement-predictions on`; `shadow` remembers it to compare with the run).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn learn_submit(
         &mut self,
         waiter: WaiterId,
+        operation: OperationId,
         name: &str,
         request: &Request,
         evidence: &Evidence,
         joined: bool,
         size_key: Option<u64>,
-    ) {
+    ) -> Option<Prediction> {
         let side = &mut self.side;
         if side.learned.off() || joined {
-            return;
+            return None;
         }
         if request.kind != LeaseKind::Action || request.resources.gpus != 0 {
             side.learned.skip(Skip::Kind);
-            return;
+            side.learned.unpredicted(Unset::Kind);
+            return None;
         }
-        let Some(waiter) = side.machine.waiter(waiter) else {
-            return;
-        };
+        let waiter = side.machine.waiter(waiter)?;
         let (instance, platform, subject) = (
             waiter.key.instance.clone(),
             waiter.platform.clone(),
@@ -273,7 +281,8 @@ impl State {
             Ok(key) => key,
             Err(why) => {
                 side.learned.skip(why);
-                return;
+                side.learned.unpredicted(Unset::of_key_error(why));
+                return None;
             }
         };
         if let Some(size_key) = size_key {
@@ -287,6 +296,8 @@ impl State {
         );
         let text = side.learned.estimate_text(&key, &hint, &bounds);
         tracing::info!(operation = %name, "size estimate: {text}");
+        let predicted = side.learned.predict(&key, &hint, &bounds);
+        side.learned.to_set(operation, predicted)
     }
 
     /// The scheduler has answered the report of `lease`, run by `worker`; `taken`: it

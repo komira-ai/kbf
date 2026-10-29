@@ -803,6 +803,47 @@ hosts later, and the scheduler runs on its leader:
   always passes on the one server, and there is no second readiness path and no
   redirect yet.
 
+## The js scheduler core (`--scheduler-core`)
+
+Every build has two scheduler cores, and `--scheduler-core` (`[scheduler] scheduler-core`)
+picks the one a server runs: `legacy`, the default, is the farm described above; `js` runs
+the farm on the js scheduler core (`kbf-server/src/farm_js` and `src/farm/js`), which
+decides placement, leases and retries itself while the farm carries out what it decides.
+The server logs the core at start (`scheduler core: js`) and exports it as
+`kbf_scheduler_core{core}`.
+
+To switch, change the flag and restart the frontend; to switch back, set `legacy` and
+restart. Both cores keep their state in the same rows of the state store, and each reads
+what the other wrote (the lease record's cost field is additive and the legacy core ignores
+it), so nothing is converted either way.
+
+What an operator sees with `js`:
+
+- **Learned sizes.** `--learned-sizes shadow` and `off` work: the estimator is shown every
+  attempt, the `size estimate:` line, the `kbf_estimator_shadow_total` counts and the
+  size summaries (`est/` rows) are as on `legacy`, and no booking changes. `--learned-sizes on`
+  is refused at start (exit status 2): this core sets no size keys, so `on` would book as
+  `off` does.
+- **Operation names.** Only `operations/<id>` names are answered. A name of the older form,
+  `operations/<term>-<waiter>`, is not found, also on a farm with no state store (see
+  "Results across frontends": `legacy` still answers it for a caller its own process holds). After a rollback to `legacy` a client that holds an
+  `operations/<id>` name from `js` still finds it on a farm over a state store: `legacy`
+  answers that form from the same `op/`, `queue/` and `done/` rows. A farm with no state
+  store (tests only) answers no name of that form.
+- **Node load.** The load a daemon reports on its heartbeat is neither kept nor shown on
+  this core (the node view has no load block), and it does not reach placement, so
+  `--placement-load on` has no load to read; keep `--placement-load off` with `js`.
+- **Node of another frontend.** The detail of a node that another frontend holds is not
+  answered from the store's rows.
+- **Whole-node drain.** A submission's `max_wall` is not given to the scheduler, so a
+  whole-node drain sees no per-operation deadline. Keep whole-node placement off
+  (`--whole-node-max` unset) with `js` until the core takes `max_wall`.
+- **Logs.** The core's "lease finished" line has no `exit_code=` field and comes before
+  the `action usage:` line. The `size estimate:` line of a new operation is written after
+  the submit is queued, not before.
+- **Fenced frontend.** A frontend the store has fenced still writes size summaries (the
+  `est/` rows); on `legacy` it writes none.
+
 ## Where to look
 
 - `crates/kbf-sched/src/scheduler.rs`: the state machine.
