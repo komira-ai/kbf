@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::RejectReason;
 use crate::metrics::{Counter, Families};
 
 /// The bytes reserved for uploads now and the most reserved at once.
@@ -77,6 +78,12 @@ pub struct PackMetrics {
     pub(super) untrusted_commits: Counter,
     /// Commits of an untrusted pack that were refused, by [`UNTRUSTED_REASONS`].
     pub(super) untrusted_rejects: [Counter; UNTRUSTED_REASONS.len()],
+    /// Packs a task wrote that `ingest` turned into a result.
+    pub(super) ingests: Counter,
+    /// Packs `ingest` refused, by [`RejectReason`] in the order of its variants.
+    pub(super) ingest_rejects: [Counter; RejectReason::ALL.len()],
+    /// Ingests that the store, the index or the action cache could not answer.
+    pub(super) ingest_unavailable: Counter,
 }
 
 /// Why a commit of an untrusted pack was refused: the key is not the one issued, the manifest
@@ -103,6 +110,24 @@ const UNTRUSTED_REASONS: [&str; 6] = [
 ];
 
 impl PackMetrics {
+    /// The packs `ingest` turned into a result: the action ran, whether or not it was cached.
+    #[must_use]
+    pub fn ingests(&self) -> u64 {
+        self.ingests.get()
+    }
+
+    /// The packs `ingest` refused for `reason`.
+    #[must_use]
+    pub fn ingest_rejects(&self, reason: RejectReason) -> u64 {
+        self.ingest_rejects[reason as usize].get()
+    }
+
+    /// The ingests that the store, the index or the action cache could not answer.
+    #[must_use]
+    pub fn ingest_unavailable(&self) -> u64 {
+        self.ingest_unavailable.get()
+    }
+
     /// The bytes reserved for the uploads in flight now.
     #[must_use]
     pub fn inflight_bytes(&self) -> u64 {
@@ -241,6 +266,31 @@ impl PackMetrics {
             );
             families.0.push_str(&line);
         }
+        families.counter(
+            "kbf_pack_ingests_total",
+            "Packs a task wrote that were ingested into an action result: the action ran, \
+             whether or not it was cached",
+            self.ingests.get(),
+        );
+        families.head(
+            "kbf_pack_ingest_rejects_total",
+            "counter",
+            "Packs a task wrote that ingest refused, by why",
+        );
+        for (reason, counter) in RejectReason::ALL.iter().zip(&self.ingest_rejects) {
+            let line = format!(
+                "kbf_pack_ingest_rejects_total{{reason=\"{}\"}} {}\n",
+                reason.label(),
+                counter.get()
+            );
+            families.0.push_str(&line);
+        }
+        families.counter(
+            "kbf_pack_ingest_unavailable_total",
+            "Ingests of a task's pack that the object store, the pack index or the action cache \
+             could not answer",
+            self.ingest_unavailable.get(),
+        );
         *out = families.0;
     }
 }
