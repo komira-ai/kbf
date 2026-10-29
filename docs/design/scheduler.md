@@ -826,7 +826,11 @@ What an operator sees with `js`:
   `off` does.
 - **Operation names.** Only `operations/<id>` names are answered. A name of the older form,
   `operations/<term>-<waiter>`, is not found, also on a farm with no state store (see
-  "Results across frontends": `legacy` still answers it for a caller its own process holds).- **Node load.** The load a daemon reports on its heartbeat is neither kept nor shown on
+  "Results across frontends": `legacy` still answers it for a caller its own process holds). After a rollback to `legacy` a client that holds an
+  `operations/<id>` name from `js` still finds it on a farm over a state store: `legacy`
+  answers that form from the same `op/`, `queue/` and `done/` rows. A farm with no state
+  store (tests only) answers no name of that form.
+- **Node load.** The load a daemon reports on its heartbeat is neither kept nor shown on
   this core (the node view has no load block), and it does not reach placement, so
   `--placement-load on` has no load to read; keep `--placement-load off` with `js`.
 - **Node of another frontend.** The detail of a node that another frontend holds is not
