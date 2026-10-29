@@ -565,8 +565,10 @@ A push to `main` runs one pipeline, `pipeline.yml`:
   never signed. The build call's files wait in the run's artifact store while the `beta` jobs run repository code, so
   the build call's `sums-*` jobs output the SHA-256 of the `SHA256SUMS` they upload (`sums assemble --digest-output`), the
   pipeline passes those digests to `artifacts-sign`, and each `attest-*` job, before it signs anything, checks the sums it
-  downloaded against its digest and every file against the sums (`sha256sum --check --strict`, plain commands: the job holds
-  `id-token`). The files of the build call are covered from the sums job on; what a job could swap between a build job and
+  downloaded against its digest and every listed file against the sums (two `sha256sum --check --strict` commands under the
+  workflow's pinned bash, no repository code: the job holds `id-token`; the lint refuses a `shell:`, `defaults` or `env` that
+  could turn them into no-ops). The file check proves the listed files match, not that `dist` holds nothing else (the sums job
+  refuses an unlisted file). The files of the build call are covered from the sums job on; what a job could swap between a build job and
   its sums job is not. The attest jobs stay in `artifacts.yml` because an attestation's signer identity is the workflow file that
   signed, and the installers verify exactly that file. A pull request or merge-queue run has no `stage` input, so its
   build and sums jobs run as before and the attest and verify jobs never do.

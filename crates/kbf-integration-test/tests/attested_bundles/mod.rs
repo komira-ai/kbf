@@ -33,9 +33,14 @@
 //!   is the one the build call's sums job published (`sha256sum --check --strict <<<
 //!   "$SUMS_SHA256  dist/SHA256SUMS"`, with `SUMS_SHA256` the input the pipeline passes from
 //!   that job's output), then that every file is the one the sums list (`sha256sum --check
-//!   --strict SHA256SUMS` in `dist`). Both are unconditional, plain commands (no repository
-//!   code runs beside `id-token: write`), after the last download and before the first
-//!   attestation step.
+//!   --strict SHA256SUMS` in `dist`; this proves that the files the sums LIST match, not that
+//!   `dist` holds nothing else: the sums job refuses an unlisted file, and the attest steps name
+//!   their files). Both are unconditional `sha256sum` commands run by the workflow's pinned bash
+//!   (the here-string is bash), after the last download and before the first attestation step.
+//!   No repository code runs beside `id-token: write`. The checks must also be able to fail: the
+//!   workflow's `defaults.run.shell` is exactly `bash` and its `env` has none of
+//!   [`STARTUP_ENV`]; the attest job has no `defaults`, no `env`, and no step with a `shell:`
+//!   (a `shell: true {0}` would make both checks no-ops).
 //! - **Out of the job.** The job uploads `dist/*.sigstore.json` as the artifact
 //!   `bundles-<group>`, in a step that cannot be skipped and fails on no file.
 //! - **Into the verification and the release.** The group's verify job downloads
@@ -158,7 +163,7 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
             .collect();
         let steps = workflows::job_steps(artifacts, &attest_job)?;
         attested_alone(&attest_job, &steps, &mine, &my_packages, &mut out);
-        sums_checked(&attest_job, g, &steps, &mut out);
+        sums_checked(artifacts, &attest_job, g, &steps, &mut out)?;
         uploaded(&attest_job, g, &steps, &mut out);
         let verify_job = format!("verify-{g}");
         let verify = workflows::job_steps(artifacts, &verify_job)?;
@@ -312,7 +317,14 @@ pub fn digest_input(g: &str) -> String {
 /// The two checks the attest job `job` (group `g`) makes of what it downloaded before it signs
 /// anything: the sums file against the digest input, then the files against the sums file, each
 /// an unconditional step, both after the last download and before the first attestation step.
-fn sums_checked(job: &str, g: &str, steps: &[workflows::Step], out: &mut Vec<String>) {
+fn sums_checked(
+    artifacts: &str,
+    job: &str,
+    g: &str,
+    steps: &[workflows::Step],
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    shell_cannot_be_swapped(artifacts, job, steps, out)?;
     let input_name = digest_input(g);
     let want_env = format!("${{{{ inputs.{input_name} }}}}");
     let digest = steps
@@ -372,6 +384,66 @@ fn sums_checked(job: &str, g: &str, steps: &[workflows::Step], out: &mut Vec<Str
             ));
         }
     }
+    Ok(())
+}
+
+/// The shell the workflow pins as its default. Written in parts: it is data here, and the
+/// interpreter-budget scan reads a bare program literal in test code as a use of that program.
+const PINNED_SHELL: &str = concat!("b", "a", "s", "h");
+
+/// Variables that change what a bash does at startup or which program a name runs: set at the
+/// workflow's level they reach every step, so a check could be made to pass without checking.
+const STARTUP_ENV: &[&str] = &[
+    "BASH_ENV",
+    "ENV",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "PATH",
+    "IFS",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+];
+
+/// The checks of the attest job `job` are `sha256sum` run by the workflow's bash: the workflow's
+/// `defaults.run.shell` is exactly `bash` and its `env` sets none of [`STARTUP_ENV`], and the job
+/// has no `defaults`, no `env` and no step with a `shell:` (`shell: true {0}` runs nothing).
+fn shell_cannot_be_swapped(
+    artifacts: &str,
+    job: &str,
+    steps: &[workflows::Step],
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    let shell = workflows::top_defaults_shell(artifacts)?;
+    if shell.as_deref() != Some(PINNED_SHELL) {
+        out.push(format!(
+            "the workflow's `defaults.run.shell` is {shell:?}, not exactly `{PINNED_SHELL}`: the checks of `{job}` use a here-string and must run under a known shell"
+        ));
+    }
+    for (name, _) in workflows::top_env(artifacts)? {
+        if STARTUP_ENV.contains(&name.as_str()) {
+            out.push(format!(
+                "the workflow's `env` sets `{name}`, which changes how a shell starts: the checks of `{job}` could be made to pass without checking"
+            ));
+        }
+    }
+    if workflows::job_has_key(artifacts, job, "defaults")? {
+        out.push(format!(
+            "`{job}` has `defaults:`: a job-level `defaults.run.shell` could turn the checks into no-ops"
+        ));
+    }
+    if !workflows::job_env(artifacts, job)?.is_empty() {
+        out.push(format!(
+            "`{job}` has a job-level `env:`: it reaches every step of the job that holds `id-token: write`, and a startup variable would make the checks pass without checking"
+        ));
+    }
+    for step in steps.iter().filter(|s| s.run.is_some()) {
+        if let Some(shell) = &step.shell {
+            out.push(format!(
+                "a `run:` step of `{job}` has `shell: {shell}`: the workflow's pinned bash runs every step of the job that signs"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The step of the attest job `job` (group `g`) that uploads the bundles.

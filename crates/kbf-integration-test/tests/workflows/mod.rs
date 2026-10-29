@@ -89,8 +89,9 @@ mod yaml;
 
 mod jobs;
 pub use jobs::{
-    concurrency, job_env, job_environment, job_has_key, job_needs, job_outputs,
-    job_permission_levels, job_uses, job_with, push_filters, top_env, trigger_filters,
+    concurrency, job_defaults_shell, job_env, job_environment, job_has_key, job_needs, job_outputs,
+    job_permission_levels, job_uses, job_with, push_filters, top_defaults_shell, top_env,
+    trigger_filters,
 };
 
 use yaml::{Node, Value};
@@ -229,6 +230,8 @@ pub struct Step {
     pub conditional: bool,
     pub condition: Option<String>,
     pub working_directory: Option<String>,
+    /// The step's own `shell:`, if it has one.
+    pub shell: Option<String>,
 }
 
 /// The steps of the job `job` (its key matched ignoring ASCII case) in a workflow
@@ -272,6 +275,7 @@ pub fn job_steps(text: &str, job: &str) -> Result<Vec<Step>, String> {
                 conditional: get(m, "if").is_some() || get(m, "continue-on-error").is_some(),
                 condition: text_of(get(m, "if")),
                 working_directory: text_of(get(m, "working-directory")),
+                shell: text_of(get(m, "shell")),
             },
             _ => Step::default(),
         })

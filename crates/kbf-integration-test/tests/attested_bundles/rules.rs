@@ -108,7 +108,7 @@ const SUMS_FILES_STEP: &str = "      - name: Refuse files other than the sums li
 /// artifacts.yml as the rules want it.
 fn good_artifacts() -> String {
     let mut w = String::from(
-        "on: push\npermissions: {}\njobs:\n  build:\n    runs-on: ubuntu-24.04\n    steps:\n",
+        "on: push\npermissions: {}\ndefaults:\n  run:\n    shell: bash\njobs:\n  build:\n    runs-on: ubuntu-24.04\n    steps:\n",
     );
     for (name, platform) in PACKAGES {
         w.push_str(&format!(
@@ -955,4 +955,117 @@ fn the_attest_job_checks_the_downloaded_sums_and_files_before_it_signs() {
         false,
     );
     cases.done();
+}
+
+#[test]
+fn the_sums_checks_cannot_be_turned_into_no_ops_by_a_shell_or_a_startup_variable() {
+    // Catches: both `sha256sum` checks passing without checking. A step-level `shell: true {0}`
+    // (or `echo {0}`), a job-level `defaults.run.shell`, a workflow default other than `bash`
+    // (the here-string is bash), and a variable that changes how bash starts or which program a
+    // name runs (`BASH_ENV` runs a file first, `SHELLOPTS`/`BASHOPTS` change options, `PATH`
+    // picks the `sha256sum`), at the job's level or the workflow's. Each plant leaves the
+    // checks themselves as they are, so only these rules can see it.
+    let mut cases = Cases::default();
+    let digest = sums_digest_step("linux");
+    let files = SUMS_FILES_STEP;
+    let shell_wanted = "a `run:` step of `attest-linux` has `shell: ";
+    for shell in ["true {0}", "echo {0}", PINNED_SHELL] {
+        cases.artifacts(
+            &format!("a step shell `{shell}` on the digest check"),
+            &broken(
+                &digest,
+                &digest.replace(
+                    "        run:",
+                    &format!("        shell: {shell}\n        run:"),
+                ),
+            ),
+            shell_wanted,
+            true,
+        );
+        cases.artifacts(
+            &format!("a step shell `{shell}` on the file check"),
+            &broken(
+                files,
+                &files.replace(
+                    "        run:",
+                    &format!("        shell: {shell}\n        run:"),
+                ),
+            ),
+            shell_wanted,
+            true,
+        );
+    }
+    let head = "  attest-linux:\n    runs-on: ubuntu-24.04\n";
+    cases.artifacts(
+        "a job-level default shell",
+        &broken(
+            head,
+            &format!("{head}    defaults:\n      run:\n        shell: 'true {{0}}'\n"),
+        ),
+        "`attest-linux` has `defaults:`",
+        true,
+    );
+    for var in ["BASH_ENV", "SHELLOPTS", "PATH"] {
+        cases.artifacts(
+            &format!("a job-level {var}"),
+            &broken(head, &format!("{head}    env:\n      {var}: /x\n")),
+            "`attest-linux` has a job-level `env:`",
+            true,
+        );
+    }
+    cases.artifacts(
+        "any job-level env",
+        &broken(head, &format!("{head}    env:\n      A: b\n")),
+        "`attest-linux` has a job-level `env:`",
+        true,
+    );
+    let defaults = format!("defaults:\n  run:\n    shell: {PINNED_SHELL}\n");
+    let defaults = defaults.as_str();
+    cases.artifacts(
+        "another workflow default shell",
+        &broken(defaults, "defaults:\n  run:\n    shell: cmd\n"),
+        "`defaults.run.shell` is Some(\"cmd\"), not exactly",
+        false,
+    );
+    cases.artifacts(
+        "a workflow default shell that runs nothing",
+        &broken(defaults, "defaults:\n  run:\n    shell: 'true {0}'\n"),
+        "not exactly",
+        false,
+    );
+    cases.artifacts(
+        "no workflow default shell",
+        &broken(defaults, ""),
+        "`defaults.run.shell` is None, not exactly",
+        false,
+    );
+    for var in [
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PATH",
+        "IFS",
+        "LD_PRELOAD",
+    ] {
+        cases.artifacts(
+            &format!("a workflow-level {var}"),
+            &broken(defaults, &format!("{defaults}env:\n  {var}: /x\n")),
+            &format!("the workflow's `env` sets `{var}`"),
+            false,
+        );
+    }
+    cases.done();
+    // An ordinary variable is not refused.
+    assert_eq!(
+        found(
+            &broken(
+                defaults,
+                &format!("{defaults}env:\n  CARGO_TERM_COLOR: always\n")
+            ),
+            GOOD_RELEASE,
+            &LISTED
+        ),
+        Vec::<String>::new()
+    );
 }

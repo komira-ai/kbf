@@ -188,6 +188,42 @@ pub fn job_with(text: &str, job: &str) -> Result<Vec<(String, String)>, String> 
     }
 }
 
+/// The `defaults.run.shell` of the mapping `m` (a workflow's top level or a job): `None` without
+/// one. An error when `defaults` or `run` is not a mapping or `shell` not a string.
+fn defaults_shell(m: &[(Node, Node)], what: &str) -> Result<Option<String>, String> {
+    let Some(defaults) = get(m, "defaults") else {
+        return Ok(None);
+    };
+    let Value::Map(defaults) = &defaults.value else {
+        return Err(format!("the `defaults` of {what} is not a mapping"));
+    };
+    let Some(run) = get(defaults, "run") else {
+        return Ok(None);
+    };
+    let Value::Map(run) = &run.value else {
+        return Err(format!("the `defaults.run` of {what} is not a mapping"));
+    };
+    match get(run, "shell") {
+        None => Ok(None),
+        Some(sh) => sh
+            .as_str()
+            .map(|v| Some(v.to_owned()))
+            .ok_or_else(|| format!("the `defaults.run.shell` of {what} is not a string")),
+    }
+}
+
+/// The workflow's `defaults.run.shell`; `None` without one.
+pub fn top_defaults_shell(text: &str) -> Result<Option<String>, String> {
+    let root = yaml::load(text)?;
+    defaults_shell(top_of(&root)?, "the workflow")
+}
+
+/// The job `job`'s own `defaults.run.shell`; `None` without one.
+pub fn job_defaults_shell(text: &str, job: &str) -> Result<Option<String>, String> {
+    let root = yaml::load(text)?;
+    defaults_shell(job_of(&root, job)?, &format!("job `{job}`"))
+}
+
 /// The workflow's own top-level `concurrency:` as `(group, cancel-in-progress)`, both as
 /// written (`(absent)` for a missing cancel); `None` without one. An error when it is not a mapping of strings with a `group`.
 pub fn concurrency(text: &str) -> Result<Option<(String, String)>, String> {
