@@ -235,7 +235,7 @@ Options:
           [default: 10]
 
       --drain-deadline-secs <SECONDS>
-          On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets the running ones finish and report, waits for their acknowledgements, then exits 0, however long that takes. A second signal stops it at once and abandons the leases still running. Left out, the drain has no deadline. Given, this many seconds after the first signal the daemon logs a warning with the number of leases still running and keeps waiting; the value has no upper bound, and 0 warns at once. It never abandons a lease. Used by `kbf daemon` and `kbf storage-and-daemon`; `kbf all-in-one` stops its daemon half with the server half
+          On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets the running ones finish and report, waits for their acknowledgements, then exits 0, however long that takes. A second signal stops it at once and abandons the leases still running. Left out, the drain has no deadline. Given, this many seconds after the first signal the daemon logs a warning with the number of leases still running and keeps waiting; the value has no upper bound, and 0 warns at once. It never abandons a lease. Used by `kbf daemon`, `kbf storage-and-daemon` and `kbf all-in-one`, whose daemon half drains once its server half has no execution open, while the server half goes on serving it; a second signal stops both
 
       --lease-swap-poll-ms <LEASE_SWAP_POLL_MS>
           How often each lease's `max` events and swap are sampled, in milliseconds (container)

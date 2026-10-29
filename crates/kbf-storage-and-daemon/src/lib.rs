@@ -15,9 +15,11 @@
 //! (`kbf_server::start`, on an async runtime of its own, sized as `kbf-server` sizes
 //! one), its start line printed to stdout; then the daemon half, as `kbf-daemon` starts
 //! (`kbf_node::start_with`, on its own runtime), with the in-process plane in place of
-//! the transfer engine. SIGTERM or SIGINT stops the server half as it stops
-//! `kbf-server`; the daemon half stops once the server half has, abandoning the leases
-//! still running, and the process exits 0. A server half that fails while serving stops
+//! the transfer engine. SIGTERM or SIGINT drains both halves and abandons no lease
+//! (`all_in_one` says in what order): the server half drains as `kbf-server` does, the
+//! daemon half as `kbf-daemon` does once the server half has no execution open, and the
+//! server half goes on serving the daemon half until the daemon half has drained; the
+//! process exits 0 when both have. A second signal stops both at once. A server half that fails while serving stops
 //! the daemon too, and the process exits 1. A start the server half refuses exits 2; one
 //! that can pass on a later try (a directory the stopping process still holds) exits 75,
 //! `EX_TEMPFAIL` (`kbf_server::StartFailure`); one the daemon half refuses exits as
@@ -37,6 +39,8 @@
 //! crash simulation, the driver-panic test and the rest of the helper-dispatch tests;
 //! and the deploy shape, the ownership step and the unit.
 
+#[cfg(target_os = "linux")]
+mod all_in_one;
 pub mod cli;
 #[cfg(all(test, target_os = "linux"))]
 mod entry_tests;
