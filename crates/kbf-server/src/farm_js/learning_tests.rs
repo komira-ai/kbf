@@ -349,7 +349,7 @@ async fn summaries_that_cannot_be_read_or_decoded_are_skipped() {
     assert!(rows(&rig) > 0);
 }
 
-/// Asserts the hourly sweep removes the summaries idle past the estimator's staleness and
+/// Asserts the hourly sweep removes the summaries idle past the estimator's staleness (60 days) and
 /// keeps the others, and does it from the store, not only from memory. Catches: a sweep that
 /// never deletes, or one that deletes rows a day old.
 #[tokio::test(start_paused = true)]
@@ -360,9 +360,9 @@ async fn the_sweep_deletes_stale_summaries_from_the_store() {
     let written = rows(&rig);
     assert!(written > 0);
 
-    let forty_days = 40 * 24 * 3_600_000;
-    flush_at(&rig, forty_days).await;
-    flush_at(&rig, forty_days + 3_700_000).await;
+    let seventy_days = 70 * 24 * 3_600_000;
+    flush_at(&rig, seventy_days).await;
+    flush_at(&rig, seventy_days + 3_700_000).await;
     assert!(rows(&rig) < written, "stale rows are swept");
 }
 
