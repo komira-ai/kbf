@@ -8,7 +8,11 @@
 //!
 //! Each test runs over the in-memory fake, a SQLite file and a Postgres schema
 //! (`KBF_TEST_POSTGRES_URL` names the server; the Postgres tests fail without it). The farm's
-//! clock is tokio's, paused; nothing here waits or measures time.
+//! clock is tokio's, paused; nothing here waits or measures time. The SQLite and Postgres stores
+//! stamp their rows from their own clocks, which run in real time under the paused one; the
+//! only times a row's meaning depends on here are the lease grace and the done-row retention
+//! (minutes), and a test takes milliseconds, so a run could only differ if the machine stalled
+//! for minutes between two lines of one test.
 //!
 //! The js core exists only in a build with the `farm-core-js` feature, so the file is empty
 //! without it.
@@ -16,12 +20,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
 
 use kbf_caps::NodeCaps;
 use kbf_front::{Cache, Described, Dispatch, Finished, Stage, Submission, Ticket};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::{ActionResult, ExecutedActionMetadata};
+use kbf_proto::worker::ResultAckReason as Reason;
 use kbf_proto::worker::server_message::Message;
 use kbf_proto::worker::{self, CgroupUsage, MemoryKill, ResourceUsage, ServerMessage, UsageBasis};
 use kbf_sched::{DaemonInstance, Request};
@@ -31,11 +37,11 @@ use kbf_server::{EpochPolicy, Farm, LearnedSizes, SchedulerCore, StateStore};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::postgres::{Flaw as PgFlaw, PostgresBackend, PostgresStore};
 use kbf_state::sqlite::{Options, SqliteStore};
-use kbf_state::{ManualClock, Store};
+use kbf_state::{Cond, ManualClock, Store, Txn};
 use kbf_types::sched::usage::LeaseCost;
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, LeaseId, LeaseKind, MemoryRun, OperationId,
-    Qos, Resources, WorkerId,
+    ActionKey, ControlRecord, Digest, DigestFunction, FarmTime, LeaseGrant, LeaseId, LeaseKind,
+    MemoryRun, OperationId, Qos, Resources, WorkerId,
 };
 use tokio::sync::mpsc;
 use tonic::Code;
@@ -114,17 +120,56 @@ impl Disk {
         self.rows("lease/")
             .into_iter()
             .map(|(key, bytes)| {
-                let decoded = kbf_log::decode(Format::V1, &bytes).expect("a lease row decodes");
-                let LogCommand::Farm(FarmBatch { mut inputs, .. }) = decoded else {
-                    panic!("{key}: not a scheduler input");
-                };
-                let Some(FarmInput::Committed(ControlRecord::Lease(grant))) = inputs.pop() else {
-                    panic!("{key}: not a lease");
-                };
+                let grant = grant_of(&key, &bytes);
                 (grant.lease, grant.cost)
             })
             .collect()
     }
+
+    /// The rows of the families a rollback depends on besides the ones each test names.
+    fn families(&self) -> BTreeMap<String, Vec<u8>> {
+        FAMILIES
+            .iter()
+            .flat_map(|prefix| self.rows(prefix))
+            .collect()
+    }
+
+    /// The first operation id and lease sequence no frontend has reserved.
+    fn counters(&self) -> (u64, u64) {
+        let counter = |key: &str| {
+            self.store.get(key).expect("read").map_or(0, |row| {
+                u64::from_be_bytes(row.value.as_slice().try_into().expect("eight bytes"))
+            })
+        };
+        (counter("meta/next_op"), counter("meta/next_seq"))
+    }
+}
+
+/// The row families a takeover must leave as the other core wrote them: the fate of each
+/// operation, the lease of each operation, the losses, who owns each node, each node's
+/// session, what each operation's log line says, the names of the answered, and the
+/// longest an operation may run.
+const FAMILIES: [&str; 8] = [
+    "fate/",
+    "lease-by-op/",
+    "loss/",
+    "owner/",
+    "session/",
+    "subject/",
+    "doneof/",
+    "opwall/",
+];
+
+/// The lease a `lease/` row holds.
+fn grant_of(key: &str, bytes: &[u8]) -> LeaseGrant {
+    let decoded = kbf_log::decode(Format::V1, bytes).expect("a lease row decodes");
+    let LogCommand::Farm(FarmBatch { mut inputs, .. }) = decoded else {
+        panic!("{key}: not a scheduler input");
+    };
+    let Some(FarmInput::Committed(ControlRecord::Lease(grant))) = inputs.pop() else {
+        panic!("{key}: not a lease");
+    };
+    grant
 }
 
 /// A farm of `core` over the store, learning sizes in shadow as the live farm does.
@@ -224,6 +269,11 @@ fn request(tag: u8, memory_gib: u64, do_not_cache: bool) -> Request {
 }
 
 fn submit(farm: &Farm, request: Request) -> Ticket {
+    submit_walled(farm, request, None)
+}
+
+/// [`submit`], naming the longest the action may run.
+fn submit_walled(farm: &Farm, request: Request, max_wall: Option<Duration>) -> Ticket {
     farm.submit(Submission {
         request,
         call: None,
@@ -232,7 +282,7 @@ fn submit(farm: &Farm, request: Request) -> Ticket {
             ..Described::default()
         },
         evidence: Default::default(),
-        max_wall: None,
+        max_wall,
     })
     .expect("queued")
 }
@@ -288,11 +338,31 @@ fn out_of_memory(lease: LeaseId) -> worker::Result {
     }
 }
 
-/// Whether the farm acknowledges `result` of `node` as accepted.
+/// What the farm answers a daemon that sends a `Result`.
+#[derive(Debug, PartialEq, Eq)]
+enum Ack {
+    /// Taken.
+    Accepted,
+    /// Refused, for this reason.
+    Refused(Reason),
+    /// No acknowledgement at all.
+    Silent,
+}
+
+async fn ack_of(farm: &Farm, node: &WorkerId, result: worker::Result) -> Ack {
+    match farm.report(node, result).await {
+        None => Ack::Silent,
+        Some(ack) if ack.accepted => {
+            assert_eq!(Reason::try_from(ack.reason), Ok(Reason::Accepted));
+            Ack::Accepted
+        }
+        Some(ack) => Ack::Refused(Reason::try_from(ack.reason).expect("a known reason")),
+    }
+}
+
+/// Whether the farm acknowledges `result` of `node` as accepted, and says so.
 async fn accepted(farm: &Farm, node: &WorkerId, result: worker::Result) -> bool {
-    farm.report(node, result)
-        .await
-        .is_some_and(|ack| ack.accepted)
+    ack_of(farm, node, result).await == Ack::Accepted
 }
 
 fn is_done(ticket: &Ticket) -> bool {
@@ -363,6 +433,11 @@ struct Left {
     floor: BTreeMap<String, Vec<u8>>,
     estimates: BTreeMap<String, Vec<u8>>,
     costs: BTreeMap<LeaseId, LeaseCost>,
+    /// The lease of the answered operation, and the first lease of the killed one (given up
+    /// when it was killed): leases that ended before the takeover.
+    ended: [LeaseId; 2],
+    families: BTreeMap<String, Vec<u8>>,
+    counters: (u64, u64),
 }
 
 /// A farm of `core` does the work of a morning and stops with a store a successor must take
@@ -396,12 +471,26 @@ async fn leave_mid_flight(core: SchedulerCore, disk: &Disk) -> Left {
     assert_eq!(farm.queued_operations(), 1);
     farm.write_behind_now();
 
-    for prefix in ["cordon/", "floor/", "done/", "est/"] {
+    // A comparison of two empty families proves nothing: each of these must hold rows.
+    for prefix in [
+        "cordon/",
+        "floor/",
+        "done/",
+        "est/",
+        "fate/",
+        "lease-by-op/",
+        "owner/",
+        "session/",
+        "subject/",
+        "doneof/",
+    ] {
         assert!(
             !disk.rows(prefix).is_empty(),
             "the farm wrote no {prefix} row"
         );
     }
+    let runs = farm.memory_runs();
+    assert!(!runs.is_empty(), "the kill left no memory run to compare");
     Left {
         names: [answered, leased, killed, queued].map(|ticket| ticket.name),
         issued: BTreeSet::from([first, second, third, rerun_lease]),
@@ -409,13 +498,16 @@ async fn leave_mid_flight(core: SchedulerCore, disk: &Disk) -> Left {
         rerun,
         leased: second,
         epoch: farm.lease_epoch(),
-        runs: farm.memory_runs(),
+        runs,
         node_a: node_of(&farm, "node-a"),
         done: disk.rows("done/"),
         cordon: disk.rows("cordon/"),
         floor: disk.rows("floor/"),
         estimates: disk.rows("est/"),
         costs: disk.lease_costs(),
+        ended: [first, third],
+        families: disk.families(),
+        counters: disk.counters(),
     }
 }
 
@@ -426,7 +518,16 @@ async fn leave_mid_flight(core: SchedulerCore, disk: &Disk) -> Left {
 /// leases the daemon still runs are rebound to the same operations and book the same; the
 /// cordoned node is still cordoned and is offered nothing; each operation is answered
 /// once and the lease of the queued one is new; and the floor still raises a fresh submission.
-async fn take_over(core: SchedulerCore, disk: &Disk, left: &Left) {
+///
+/// A daemon whose acknowledgement was lost sends again the `Result` of a lease that ended
+/// before the takeover. It must be refused for `replay` and answer nobody a second time.
+/// Returns what node-a shows after its heartbeat.
+async fn take_over(
+    core: SchedulerCore,
+    disk: &Disk,
+    left: &Left,
+    replay: Reason,
+) -> (u32, ResourcesView, bool) {
     let farm = farm_on(core, disk);
     assert_eq!(
         farm.lease_epoch(),
@@ -444,6 +545,11 @@ async fn take_over(core: SchedulerCore, disk: &Disk, left: &Left) {
         disk.rows("est/"),
         left.estimates,
         "a size summary was changed"
+    );
+    assert_eq!(
+        disk.families(),
+        left.families,
+        "a takeover changed a row family it only reads"
     );
 
     let tickets: Vec<Ticket> = left
@@ -482,8 +588,35 @@ async fn take_over(core: SchedulerCore, disk: &Disk, left: &Left) {
     assert!(cordoned, "the cordon is not honoured");
     assert_eq!(farm.memory_runs(), left.runs, "the kill was forgotten");
     assert_eq!(farm.queued_operations(), 1);
+    let booked_after = node_of(&farm, "node-a");
     farm.tick().await;
     assert!(b.starts().is_empty(), "a cordoned node was offered work");
+
+    // The Results of leases that ended before the takeover are sent again.
+    for (lease, result) in [
+        (left.ended[0], ran(left.ended[0])),
+        (left.ended[1], out_of_memory(left.ended[1])),
+    ] {
+        assert_eq!(
+            ack_of(&farm, &a.name, result).await,
+            Ack::Refused(replay),
+            "{lease:?}"
+        );
+    }
+    assert_eq!(
+        disk.rows("done/"),
+        left.done,
+        "a replay changed the answers"
+    );
+    assert!(is_answered_with_a_result(&tickets[0]));
+    assert!(!is_done(&tickets[2]), "the killed operation was answered");
+    assert_eq!(
+        farm.memory_runs(),
+        left.runs,
+        "a replayed kill counted again"
+    );
+    assert_eq!(farm.queued_operations(), 1);
+    assert_eq!(leases_of(&farm), left.held);
 
     // The two running leases end; the queued operation is given the room.
     let mut fresh = Vec::new();
@@ -504,8 +637,9 @@ async fn take_over(core: SchedulerCore, disk: &Disk, left: &Left) {
 
     // Each is answered once: the same result again is refused.
     for lease in running.into_iter().chain([queued_lease]) {
-        assert!(
-            !accepted(&farm, &a.name, ran(lease)).await,
+        assert_eq!(
+            ack_of(&farm, &a.name, ran(lease)).await,
+            Ack::Refused(Reason::Duplicate),
             "{lease:?} twice"
         );
     }
@@ -538,6 +672,14 @@ async fn take_over(core: SchedulerCore, disk: &Disk, left: &Left) {
     let (fresh, booked) = a.started();
     assert_eq!(booked, 16 * GIB, "the floor was not offered");
     assert!(Some(&fresh) > left.issued.last());
+    let (next_op, next_seq) = disk.counters();
+    assert!(
+        next_op >= left.counters.0 && next_seq >= left.counters.1,
+        "an id counter went back: {:?} after {:?}",
+        (next_op, next_seq),
+        left.counters
+    );
+    booked_after
 }
 
 /// Runs each test over the fake, a SQLite file and a Postgres schema.
@@ -566,6 +708,7 @@ over_each_store!(
     a_js_farm_takes_over_the_store_a_legacy_farm_left_mid_flight,
     a_legacy_farm_takes_over_the_store_a_js_farm_left_mid_flight,
     a_row_written_before_the_cost_field_recovers_at_its_request,
+    a_legacy_walled_operation_finished_by_the_js_core_leaves_its_opwall_row,
 );
 
 /// A rollback is forward only if the other direction works too: this is the flip itself. A
@@ -588,7 +731,7 @@ async fn a_js_farm_takes_over_the_store_a_legacy_farm_left_mid_flight(backing: B
         left.costs
     );
     assert_eq!(left.costs.len(), 2);
-    take_over(SchedulerCore::Js, &disk, &left).await;
+    take_over(SchedulerCore::Js, &disk, &left, Reason::Duplicate).await;
 }
 
 /// The rollback: a js farm leaves the same work, its lease rows carrying the cost
@@ -611,27 +754,73 @@ async fn a_legacy_farm_takes_over_the_store_a_js_farm_left_mid_flight(backing: B
         "the rerun up the ladder is not flagged as one"
     );
     assert!(!left.costs[&left.leased].retry);
-    take_over(SchedulerCore::Legacy, &disk, &left).await;
+    // A legacy process knows the leases it granted itself and those it recovered running; one
+    // that ended before it started is not among them.
+    let (_, booked, _) = take_over(SchedulerCore::Legacy, &disk, &left, Reason::UnknownLease).await;
+
+    // The accepted divergence of a rollback: the legacy core keeps no per-lease cost, so it
+    // books each recovered lease at its request. Here that is more than the js core charged
+    // (the lease with no prediction is charged no memory, only its limit), and never less:
+    // a rolled-back farm admits no more than the js one did.
+    let leased = &left.costs[&left.leased];
+    assert!(
+        leased.memory_bytes < leased.limit_bytes,
+        "the js core charged this lease its whole limit, so the two cores agree and nothing is shown"
+    );
+    let charged_cpu: u64 = left.costs.values().map(|cost| cost.cpu_millis).sum();
+    let charged_memory: u64 = left.costs.values().map(|cost| cost.memory_bytes).sum();
+    assert!(
+        charged_cpu <= booked.cpu_millis,
+        "{charged_cpu} cores charged"
+    );
+    assert!(
+        charged_memory < booked.memory_bytes,
+        "{charged_memory} bytes charged, {} booked",
+        booked.memory_bytes
+    );
 }
 
-/// A lease row without a cost, as every row written before the field and every row the
-/// legacy core writes, is taken up by the js core as a lease charged its request.
+/// A lease row as it was written before the cost field existed is taken up by the js core as
+/// a lease charged its request.
+///
+/// The row is a js row with its cost field cut out: the log's lease record without field 4,
+/// the bytes every binary wrote before the field. (The legacy writer's rows decode to the same
+/// grant, but they say nothing about the bytes: an absent field and a zero cost read alike.)
 ///
 /// Catches: a row decoded as a lease with a zero cost (booked at nothing, so the node is
 /// offered more work than it has room for), or one the js core refuses.
 async fn a_row_written_before_the_cost_field_recovers_at_its_request(backing: Backing) {
     let disk = Disk::over(backing);
-    let writer = farm_on(SchedulerCore::Legacy, &disk);
+    let writer = farm_on(SchedulerCore::Js, &disk);
     let mut node = Node::join(&writer, "node-a", 1);
     let held = submit(&writer, request(1, 4, false)).name;
     let (lease, booked) = node.started();
     let queued = submit(&writer, request(2, 4, false)).name;
     assert!(node.starts().is_empty(), "no room for the second");
-    let costs = disk.lease_costs();
-    assert_eq!(costs.get(&lease), Some(&LeaseCost::default()));
     let before = node_of(&writer, "node-a");
     drop(node);
     drop(writer);
+
+    let (key, with_cost) = disk.rows("lease/").into_iter().next().expect("a lease row");
+    let mut grant = grant_of(&key, &with_cost);
+    assert_ne!(grant.cost, LeaseCost::default(), "the js row has no cost");
+    grant.cost = LeaseCost::default();
+    let old = kbf_log::encode(
+        Format::V1,
+        &LogCommand::Farm(FarmBatch {
+            now: FarmTime::default(),
+            wall: UNIX_EPOCH,
+            inputs: vec![FarmInput::Committed(ControlRecord::Lease(grant))],
+        }),
+    )
+    .expect("a lease row encodes");
+    assert!(old.len() < with_cost.len(), "the cost field is still there");
+    disk.store
+        .txn(Txn::new().put(key.clone(), old.clone(), Cond::Any))
+        .expect("a store")
+        .expect("a write");
+    assert_eq!(disk.rows("lease/").get(&key), Some(&old));
+    assert_eq!(disk.lease_costs().get(&lease), Some(&LeaseCost::default()));
 
     let farm = farm_on(SchedulerCore::Js, &disk);
     let mut node = Node::join(&farm, "node-a", 1);
@@ -657,4 +846,58 @@ async fn a_row_written_before_the_cost_field_recovers_at_its_request(backing: Ba
         let ticket = farm.wait(&name).expect("known");
         assert!(is_answered_with_a_result(&ticket), "{name}");
     }
+}
+
+/// A legacy farm keeps the longest an action may run in an `opwall/` row beside the
+/// operation's, and deletes it with them. The js core does not use `max_wall` yet, so an
+/// operation the legacy farm walled and the js core finishes leaves the row behind. This
+/// asserts what happens today: the answer is delivered and the other rows go; the `opwall/`
+/// row stays, and a legacy farm started over the store afterwards (the rollback) opens it
+/// all the same. When the js core takes `max_wall`, the row is deleted with the operation's,
+/// and the count below becomes 0.
+///
+/// Catches: a js core that cannot finish an operation whose wall is stored, a leftover row
+/// that stops the legacy core starting, and a changed behaviour nobody decided on.
+async fn a_legacy_walled_operation_finished_by_the_js_core_leaves_its_opwall_row(backing: Backing) {
+    let disk = Disk::over(backing);
+    let writer = farm_on(SchedulerCore::Legacy, &disk);
+    let mut node = Node::join(&writer, "node-a", 1);
+    let name = submit_walled(
+        &writer,
+        request(1, 4, false),
+        Some(Duration::from_secs(600)),
+    )
+    .name;
+    let (lease, _) = node.started();
+    assert_eq!(
+        disk.rows("opwall/").len(),
+        1,
+        "the legacy farm wrote no wall"
+    );
+    drop(node);
+    drop(writer);
+
+    let farm = farm_on(SchedulerCore::Js, &disk);
+    let mut node = Node::join(&farm, "node-a", 1);
+    assert!(node.beat(&farm, &[lease]).await);
+    assert!(accepted(&farm, &node.name, ran(lease)).await);
+    assert!(is_answered_with_a_result(&farm.wait(&name).expect("known")));
+    for prefix in ["op/", "queue/", "lease/", "lease-by-op/"] {
+        assert!(
+            disk.rows(prefix).is_empty(),
+            "{prefix} rows of finished work"
+        );
+    }
+    assert_eq!(
+        disk.rows("opwall/").len(),
+        1,
+        "the js core now deletes the wall row: make this 0 and say so in the PR"
+    );
+    drop(node);
+    drop(farm);
+
+    let rolled_back = farm_on(SchedulerCore::Legacy, &disk);
+    assert!(is_answered_with_a_result(
+        &rolled_back.wait(&name).expect("still answerable")
+    ));
 }
