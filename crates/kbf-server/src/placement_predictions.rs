@@ -8,8 +8,6 @@
 //! of using what the farm learned in placement; they are shipped and measured alone, before
 //! any per-minute profile is read.
 
-#![allow(unused_imports)]
-
 use crate::{Args, ConfigError, LearnedSizes, PlacementLoad, SchedulerCore};
 
 /// What `--placement-predictions` does with the estimator's answer for a new operation.
@@ -56,6 +54,19 @@ impl Args {
     /// [`ConfigError::PredictionsNeedLegacyCore`]: `shadow` or `on` with
     /// `--scheduler-core js`, whose arm does not read the flag yet.
     pub(crate) fn placement_predictions_fit(&self) -> Result<(), ConfigError> {
+        let mode = self.placement_predictions;
+        if !mode.predicts() {
+            return Ok(());
+        }
+        if self.learned_sizes == LearnedSizes::Off {
+            return Err(ConfigError::PredictionsNeedLearnedSizes(mode.name()));
+        }
+        if mode == PlacementPredictions::On && self.placement_load == PlacementLoad::Off {
+            return Err(ConfigError::PredictionsNeedPlacementLoad);
+        }
+        if self.scheduler_core != SchedulerCore::Legacy {
+            return Err(ConfigError::PredictionsNeedLegacyCore(mode.name()));
+        }
         Ok(())
     }
 }

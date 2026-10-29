@@ -623,6 +623,86 @@ async fn a_restart_predicts_the_queued_operations_from_the_stored_rows() {
     assert_eq!(unset_counts(&restarted), [0; 8]);
 }
 
+/// Catches a stored operation the estimator cannot be asked about given a prediction anyway,
+/// or counted under another reason: a GPU action and a whole-machine request (not asked), one
+/// whose subject the store did not keep or whose action describes nothing, and one whose
+/// `needs` pin no OS. The one that can be named is predicted, and nothing else is.
+#[test]
+fn a_stored_operation_that_cannot_be_named_is_counted_and_gets_no_prediction() {
+    use super::durable::StoredOperation;
+    let farm = farm(PlacementPredictions::On);
+    teach(&farm, 6, &five_minutes());
+    let (named, _) = Subject::of(Described {
+        arguments: vec!["cc".to_owned()],
+        ..Described::default()
+    });
+    let (empty, _) = Subject::of(Described::default());
+    let linux = kbf_caps::Request::from_platform([("OSFamily", "linux")]).unwrap();
+    let action = ActionKey {
+        instance: "main".to_owned(),
+        action: Digest::new(DigestFunction::Sha256, [1; 32], 1),
+    };
+    let stored =
+        |kind: LeaseKind, gpus: u64, needs: &kbf_caps::Request, subject: Option<&Subject>| {
+            StoredOperation {
+                operation: OperationId(1),
+                action: action.clone(),
+                request: kbf_sched::Request {
+                    key: (&action).into(),
+                    qos: Qos::Ci,
+                    kind,
+                    resources: Resources::new(1_000, 256 * MIB).with_gpus(gpus),
+                    hermetic: true,
+                    do_not_cache: false,
+                    needs: needs.clone(),
+                },
+                lease: None,
+                losses: 0,
+                fate: None,
+                subject: subject.cloned(),
+                size_key: None,
+                max_wall: None,
+            }
+        };
+    let state = &mut *farm.lock();
+    let mut predict = |op: StoredOperation| state.side.predict_stored(&state.engine.sched, &op);
+    let none = kbf_caps::Request::default();
+    assert_eq!(
+        predict(stored(LeaseKind::Action, 1, &linux, Some(&named))),
+        None
+    );
+    assert_eq!(
+        predict(stored(LeaseKind::WholeMachine, 0, &linux, Some(&named))),
+        None
+    );
+    assert_eq!(predict(stored(LeaseKind::Action, 0, &linux, None)), None);
+    assert_eq!(
+        predict(stored(LeaseKind::Action, 0, &linux, Some(&empty))),
+        None
+    );
+    assert_eq!(
+        predict(stored(LeaseKind::Action, 0, &none, Some(&named))),
+        None
+    );
+    let counted = |why| state.side.learned.predictions_unset(why);
+    assert_eq!(
+        ALL.map(counted),
+        [0, 0, 0, 0, 0, 2, 1, 2],
+        "kind twice, no OS once, no subject twice"
+    );
+    assert_eq!(state.side.learned.predictions_made(), 0);
+    let predicted = state
+        .side
+        .predict_stored(
+            &state.engine.sched,
+            &stored(LeaseKind::Action, 0, &linux, Some(&named)),
+        )
+        .expect("the one that can be named");
+    assert_eq!(predicted.cpu_millis, 1_500);
+    assert!(!predicted.cold);
+    assert_eq!(state.side.learned.predictions_made(), 1);
+}
+
 /// Catches a restart that sets a prediction with `off` or in `shadow`: the operation is
 /// charged its request's cores and no memory, as it is without the flag.
 #[tokio::test(start_paused = true)]
@@ -740,6 +820,13 @@ async fn a_cpu_quota_under_placement_load_on_is_counted_and_warned_of_once() {
     assert_eq!((limited_nodes(), said()), (0, 1));
     farm.note_node_load(&worker, stream, Some(&reading(5, true)));
     assert_eq!(said(), 2, "a new quota is a new warning");
+    farm.tick().await;
+    assert_eq!(limited_nodes(), 1);
+    // No reading for more than three windows (of a second each): the node is not reporting
+    // a quota now.
+    tokio::time::advance(std::time::Duration::from_secs(4)).await;
+    farm.tick().await;
+    assert_eq!(limited_nodes(), 0, "a stale reading is not counted");
 
     let quiet_cache = Arc::new(Cache::memory());
     let off = Farm::new_legacy(

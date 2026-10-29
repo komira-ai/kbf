@@ -3,8 +3,6 @@
 //! nodes whose actions cgroup has a CPU quota while placement reads the load. Rendered with
 //! the cache's families ([`super::CacheMetrics::render`]).
 
-#![allow(unused_imports)]
-
 use std::fmt::Write as _;
 
 use super::{Families, Level};
@@ -99,6 +97,42 @@ impl PredictionTotals {
     }
 
     pub(super) fn render(&self, out: &mut Families) {
-        let _ = out;
+        out.counter(
+            "kbf_prediction_made_total",
+            "New operations the estimator gave a prediction (--placement-predictions shadow or on)",
+            self.made(),
+        );
+        let name = "kbf_prediction_unset_total";
+        out.head(
+            name,
+            "counter",
+            "New operations that got no prediction, by why (--placement-predictions shadow or on)",
+        );
+        for (reason, label) in PREDICTION_UNSET.iter().enumerate() {
+            let _ = writeln!(out.0, "{name}{{reason=\"{label}\"}} {}", self.unset(reason));
+        }
+        let name = "kbf_prediction_vs_run_total";
+        out.head(
+            name,
+            "counter",
+            "Finished runs compared with the prediction made for their operation, by the figure \
+             and whether the run was under, within or over half of the prediction (shadow only)",
+        );
+        for (axis, axis_label) in PREDICTION_AXES.iter().enumerate() {
+            for (bucket, bucket_label) in PREDICTION_BUCKETS.iter().enumerate() {
+                let _ = writeln!(
+                    out.0,
+                    "{name}{{axis=\"{axis_label}\",bucket=\"{bucket_label}\"}} {}",
+                    self.vs_run(axis, bucket)
+                );
+            }
+        }
+        out.gauge(
+            "kbf_placement_cpu_limited_nodes",
+            "Nodes whose latest load reading says the actions cgroup has a CPU quota while \
+             --placement-load is on: nodes that placement charges by prediction alone, which is \
+             a misconfiguration",
+            self.cpu_limited_nodes(),
+        );
     }
 }

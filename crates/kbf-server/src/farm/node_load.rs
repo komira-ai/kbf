@@ -25,7 +25,8 @@ use kbf_proto::worker::NodeLoad;
 use kbf_sched::DaemonInstance;
 use kbf_types::{LeaseId, Resources, WorkerId};
 
-use super::{Farm, FarmTime, StreamId};
+use super::{Farm, FarmTime, State, StreamId};
+use crate::PlacementLoad;
 use crate::fleet::LoadView;
 
 /// How many cores of CPU per hardware thread a window may imply before it is not believed.
@@ -239,10 +240,42 @@ impl Farm {
         let session = Session::of(&link.instance, stream);
         let capacity = state.engine.sched.capacity(worker).unwrap_or_default();
         let kept = state.side.node_loads.remove(worker);
+        let was_limited = kept.as_ref().is_some_and(|k| k.last.cpu_limited);
         let now = self.now();
         if let Some(next) = Kept::take(kept, &session, load, &capacity, now) {
+            if next.last.cpu_limited && !was_limited && self.load_is_read() {
+                tracing::warn!(
+                    %worker,
+                    "the node's actions cgroup has a CPU quota while --placement-load is on: \
+                     its measured CPU says nothing of the load, so placement charges it by \
+                     prediction alone; remove the quota or run with --placement-load off"
+                );
+            }
             state.side.node_loads.insert(worker.clone(), next);
         }
+    }
+
+    /// Whether placement reads the load the nodes report (`--placement-load on`).
+    fn load_is_read(&self) -> bool {
+        let _ = (&self.settings, PlacementLoad::On);
+        false
+    }
+
+    /// The nodes whose last accepted reading, if it is not stale, says the actions cgroup has
+    /// a CPU quota while placement reads the load: a misconfiguration, exported as
+    /// `kbf_placement_cpu_limited_nodes`. None while placement does not read the load.
+    pub(super) fn cpu_limited_nodes(&self, state: &State) -> u64 {
+        if !self.load_is_read() {
+            return 0;
+        }
+        let now = self.now();
+        let limited = state
+            .side
+            .node_loads
+            .values()
+            .filter(|kept| kept.last.cpu_limited && !kept.stale(now))
+            .count();
+        limited as u64
     }
 }
 

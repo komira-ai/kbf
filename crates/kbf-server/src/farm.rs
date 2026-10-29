@@ -427,6 +427,10 @@ impl Farm {
             .sched_whole
             .set(state.engine.sched.whole_summary().as_ref());
         state.side.learned.publish(&metrics.estimator_shadow);
+        state.side.learned.publish_predictions(&metrics.prediction);
+        metrics
+            .prediction
+            .set_cpu_limited_nodes(self.cpu_limited_nodes(state));
     }
 
     /// Writes the changed size summaries to the state store now, as the tick does once
@@ -848,8 +852,9 @@ impl Dispatch for Farm {
         let name = state
             .side
             .name_of(state.engine.durable.is_some(), waiter, operation);
-        state.learn_submit(
+        let predicted = state.learn_submit(
             waiter,
+            operation,
             &name,
             &submission.request,
             &submission.evidence,
@@ -874,6 +879,11 @@ impl Dispatch for Farm {
         if let Some(key) = size_key.filter(|_| !joined) {
             let next = state.engine.sched.next_operation();
             state.engine.sched.set_size_key(next, key);
+        }
+        // Its predicted cost is given before the submit is fed too (`--placement-predictions
+        // on`; none for a twin joined, which keeps the one it was given).
+        if let Some(prediction) = predicted {
+            state.engine.sched.set_cost(operation, prediction);
         }
         match held {
             Held::Here => state.feed_quiet(

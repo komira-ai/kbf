@@ -19,8 +19,6 @@
 //! from 1, at most the estimator's horizon). A run that measured no peak or no CPU time has
 //! no figure on that axis and is not counted on it.
 
-#![allow(unused_imports, unused_variables, dead_code)]
-
 use std::collections::BTreeMap;
 
 use kbf_estimator::{
@@ -173,14 +171,29 @@ impl Learned {
     /// largest node's. `None` when the estimator has no usable row (counted by its reason),
     /// and always while predictions are off. Never the scheduler's cold prediction.
     pub fn predict(&mut self, key: &Key, hint: &Hint, bounds: &Bounds) -> Option<Prediction> {
-        let _ = (key, hint, bounds);
-        None
+        if !self.predictions.mode.predicts() {
+            return None;
+        }
+        self.calls += 1;
+        let day = self.day();
+        match self.summaries.estimate(key, day, bounds, hint) {
+            Ok(estimate) => {
+                self.predictions.made += 1;
+                Some(prediction_of(&estimate, bounds))
+            }
+            Err(why) => {
+                self.predictions.unset[Unset::from(why) as usize] += 1;
+                None
+            }
+        }
     }
 
     /// Counts an operation the farm did not ask the estimator about, for reason `why`.
     /// Does nothing while predictions are off.
     pub fn unpredicted(&mut self, why: Unset) {
-        let _ = why;
+        if self.predictions.mode.predicts() {
+            self.predictions.unset[why as usize] += 1;
+        }
     }
 
     /// What to give the scheduler for `operation`, for which [`Learned::predict`] returned
@@ -191,15 +204,25 @@ impl Learned {
         operation: OperationId,
         prediction: Option<Prediction>,
     ) -> Option<Prediction> {
-        let _ = (operation, prediction);
-        None
+        let prediction = prediction?;
+        if self.predictions.mode == PlacementPredictions::Shadow {
+            if self.predictions.pending.len() >= STARTED_CAP {
+                self.predictions.pending.pop_first();
+            }
+            self.predictions.pending.insert(operation, prediction);
+        }
+        Some(prediction).filter(|_| self.predictions.mode == PlacementPredictions::On)
     }
 
     /// The report of `lease` of `operation` is staged: the prediction remembered for the
     /// operation is compared with the run if the scheduler takes the report
     /// ([`Learned::finish`]).
     pub fn stage_prediction(&mut self, lease: LeaseId, operation: OperationId) {
-        let _ = (lease, operation);
+        if let Some(prediction) = self.predictions.pending.get(&operation).copied() {
+            self.predictions
+                .staged
+                .insert(lease, (operation, prediction));
+        }
     }
 
     /// Forgets the prediction staged for `lease`, returning it.
@@ -219,7 +242,21 @@ impl Learned {
         prediction: &Prediction,
         run: &Run,
     ) {
-        let _ = (operation, prediction, run);
+        if run.outcome != RunOutcome::Success || run.wall_us < MIN_WALL_US {
+            return;
+        }
+        self.predictions.pending.remove(&operation);
+        let life = (run.wall_us / MINUTE_US)
+            .saturating_add(1)
+            .clamp(1, u64::from(LIFE_HORIZON));
+        self.tally(Axis::Life, life, u64::from(prediction.life_minutes));
+        if let Some(peak) = run.peak_memory_bytes.filter(|peak| *peak > 0) {
+            self.tally(Axis::Mem, peak, prediction.memory_bytes);
+        }
+        if run.cpu_usage_us > 0 {
+            let cores = run.cpu_usage_us.saturating_mul(1000) / run.wall_us;
+            self.tally(Axis::Cpu, cores, prediction.cpu_millis);
+        }
     }
 
     fn tally(&mut self, axis: Axis, used: u64, predicted: u64) {
@@ -253,7 +290,15 @@ impl Learned {
 
     /// Copies the predictions' counts into the scrape.
     pub fn publish_predictions(&self, totals: &PredictionTotals) {
-        let _ = totals;
+        totals.set_made(self.predictions.made);
+        for (reason, count) in self.predictions.unset.iter().enumerate() {
+            totals.set_unset(reason, *count);
+        }
+        for (axis, row) in self.predictions.vs_run.iter().enumerate() {
+            for (fit, count) in row.iter().enumerate() {
+                totals.set_vs_run(axis, fit, *count);
+            }
+        }
     }
 }
 

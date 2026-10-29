@@ -355,6 +355,8 @@ impl Learned {
     /// are returned, for the caller to write after the requeue is settled.
     pub fn requeued(&mut self, lease: LeaseId, raised: u64, bounds: &Bounds) -> Vec<Row> {
         self.forget(lease);
+        // A kill is no run to compare: the operation's prediction waits for its next one.
+        self.unstage_prediction(lease);
         let Some(mut attempt) = self.staged.remove(&lease) else {
             return Vec::new();
         };
@@ -371,9 +373,13 @@ impl Learned {
     /// operation, with no requeue), for the caller to write at once.
     pub fn finish(&mut self, lease: LeaseId, taken: bool, bounds: &Bounds) -> Vec<Row> {
         self.forget(lease);
+        let compared = self.unstage_prediction(lease);
         let Some(attempt) = self.staged.remove(&lease).filter(|_| taken) else {
             return Vec::new();
         };
+        if let Some((operation, prediction)) = compared {
+            self.compare_run(operation, &prediction, &attempt.run);
+        }
         self.observe_keyed(&attempt, bounds);
         if attempt.run.outcome != RunOutcome::OwnLimitKill {
             return Vec::new();
