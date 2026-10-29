@@ -76,9 +76,11 @@
 //!   between non-empty segments); any other key is an [`Error::Other`] before a request is
 //!   made. The `start_after` of `list_page` is named as a key as well, so one that is not
 //!   nameable (`a/`, say) is refused although another backend takes any string.
-//! - A request that did not complete, and the statuses 408, 429, 502, 503 and 504, are
-//!   [`Error::Unavailable`]. 507 (Insufficient Storage, which is how MinIO reports a full
-//!   drive) is [`Error::Full`]. Anything else that is not a success is [`Error::Other`].
+//! - A request that did not complete, and the statuses 408, 429 and every 5xx but 501 and 507,
+//!   are [`Error::Unavailable`] (a server error may be gone on the next try). 507
+//!   (Insufficient Storage, which is how MinIO reports a full drive) is [`Error::Full`]. 501 (Not
+//!   Implemented: the store does not do what was asked) and anything else that is not a success
+//!   is [`Error::Other`].
 //!
 //! Each request is bounded by the `request_timeout` of the [`S3Config`], and a read is sent
 //! again after a failure in transport; a write never is. A part is the exception to the bound:
@@ -234,8 +236,9 @@ fn map_error(error: ObjectStoreError, key: &str) -> Error {
 fn by_status(status: u16, key: String, message: String) -> Error {
     match status {
         412 => Error::PreconditionFailed(key),
-        408 | 429 | 502..=504 => Error::Unavailable(message),
         507 => Error::Full(message),
+        501 => Error::Other(message),
+        408 | 429 | 500..=599 => Error::Unavailable(message),
         _ => Error::Other(message),
     }
 }
@@ -482,8 +485,9 @@ mod tests {
 
     /// Asserts that each answer of the client is the error of this crate the trait documents
     /// for it: not found, already exists and a failed precondition name the key, a request
-    /// that did not complete and the statuses 408, 429 and 502 to 504 are unavailable, 507 is
-    /// full, and any other answer is an other error that says what it was.
+    /// that did not complete and the statuses 408, 429 and every 5xx but 501 and 507 are
+    /// unavailable, 507 is full, and any other answer (501 among them) is an other error that
+    /// says what it was.
     #[test]
     fn answers_of_the_client_are_the_errors_the_trait_documents() {
         let key = ObjectKey::new("k").unwrap();
@@ -498,13 +502,13 @@ mod tests {
         let reset = Arc::new(std::io::Error::other("reset"));
         let down = map_error(ObjectStoreError::Transport(reset), "k");
         assert!(down.is_unavailable(), "{down}");
-        for status in [408, 429, 502, 503, 504] {
+        for status in [408, 429, 500, 502, 503, 504, 505, 506, 508, 599] {
             let down = map_error(service(status), "k");
             assert!(down.is_unavailable(), "{status}");
         }
         let full = map_error(service(507), "k");
         assert!(matches!(full, Error::Full(_)), "{full}");
-        for status in [400, 403, 409, 500, 501, 505, 506, 508] {
+        for status in [400, 403, 409, 501] {
             let other = map_error(service(status), "k");
             assert!(matches!(other, Error::Other(_)), "{status}: {other}");
         }
