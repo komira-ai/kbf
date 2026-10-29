@@ -21,7 +21,11 @@
 //!    compared names; this commit is compared again and must itself be a strict ancestor of
 //!    N, so a branch of the tag's name, or a tag made since the scan, cannot stand in;
 //! 2. the release of that tag must exist. A tag with no release is an error, not a step back
-//!    to a lower tag: N-1 is the release before N, not the newest that happens to be whole;
+//!    to a lower tag: N-1 is the release before N, not the newest that happens to be whole.
+//!    GitHub answers a release that is still a draft with 404 too, and a release is a draft
+//!    for some minutes after its tag is pushed, so the release is asked for up to
+//!    `--release-attempts` times, `--release-poll-secs` apart (by default 40 times, 30 s
+//!    apart), before its absence is that error;
 //! 3. its assets are downloaded into a directory of this process alone;
 //! 4. they are verified as a release for that commit is: `release
 //!    check` (`SHA256SUMS`, names, one bundle per tarball) and `verify-assets attestations`
@@ -153,6 +157,32 @@ pub(super) fn tag_commit(gh: &Path, repo: &str, tag: &str) -> Result<String, Err
     }
 }
 
+/// The release of `tag`, waited for while GitHub answers 404: a release is a draft for some
+/// minutes after its tag is pushed, and GitHub answers a draft's tag as it answers a missing
+/// release. Asked up to `--release-attempts` times, `--release-poll-secs` apart; still missing
+/// after the last, it is the error a missing release always was.
+fn published_release(a: &FetchPreviousArgs, tag: &str) -> Result<Value, Error> {
+    let path = format!("repos/{}/releases/tags/{tag}", a.repo);
+    let attempts = a.release_attempts.max(1);
+    for attempt in 1..=attempts {
+        if let Some(found) = super::api(&a.gh, &path)? {
+            return Ok(found);
+        }
+        if attempt < attempts {
+            eprintln!(
+                "xtask: gh api {path}: not found yet (a release is a draft until it is \
+                 published); asking again in {} s ({attempt} of {attempts})",
+                a.release_poll_secs
+            );
+            std::thread::sleep(std::time::Duration::from_secs(a.release_poll_secs));
+        }
+    }
+    Err(Error::Failed(format!(
+        "gh api {path}: not found (HTTP 404), asked {attempts} times {} s apart",
+        a.release_poll_secs
+    )))
+}
+
 /// Creates `dir` and its parents.
 fn make_dir(dir: &Path) -> Result<(), Error> {
     std::fs::create_dir_all(dir).map_err(Error::spawn(format!("create {}", dir.display())))
@@ -161,7 +191,7 @@ fn make_dir(dir: &Path) -> Result<(), Error> {
 /// Downloads the release `tag` (of `commit`) into `scratch`, verifies it, and writes the
 /// binaries `a` asks for.
 fn unpack(a: &FetchPreviousArgs, tag: &str, commit: &str, scratch: &Path) -> Result<(), Error> {
-    must_api(&a.gh, &format!("repos/{}/releases/tags/{tag}", a.repo))?;
+    published_release(a, tag)?;
     let assets = scratch.join("assets");
     let flipped = scratch.join("flipped");
     for dir in [&assets, &flipped] {
