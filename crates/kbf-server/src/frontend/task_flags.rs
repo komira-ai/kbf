@@ -21,8 +21,6 @@
 //! `--presign-key-file` of the tier store works too: its ceiling is read by the store and
 //! ignored here), with the same owner and mode rules.
 
-#![allow(dead_code, unused_imports)] // red: the stubs below read no file
-
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -214,8 +212,30 @@ pub struct TaskFlags {
 /// # Errors
 /// `--task-read-url` is not `https://host[:port]`.
 pub(super) fn from_matches(m: &ArgMatches) -> Result<Option<TaskFlags>, String> {
-    let _ = m;
-    Ok(None)
+    let Some(secret_file) = m.get_one::<PathBuf>(SECRET) else {
+        return Ok(None);
+    };
+    // clap makes the four others come with the switch; the rest have a default.
+    let text = |id: &str| m.get_one::<String>(id).cloned().unwrap_or_default();
+    let secs = |id: &str| Duration::from_secs(m.get_one::<u64>(id).copied().unwrap_or_default());
+    let read_url = text(READ_URL);
+    check_read_url(&read_url).map_err(|error| format!("--task-read-url: {error}"))?;
+    let digests = m.get_one::<u32>(MAX_DIGESTS).copied().unwrap_or_default();
+    Ok(Some(TaskFlags {
+        secret_file: secret_file.clone(),
+        put_endpoint: text(PUT_ENDPOINT),
+        put_bucket: text(PUT_BUCKET),
+        put_region: text(PUT_REGION),
+        put_credentials_file: m
+            .get_one::<PathBuf>(PUT_CREDENTIALS)
+            .cloned()
+            .unwrap_or_default(),
+        read_url,
+        run_wall: secs(RUN_WALL),
+        url_slack: secs(URL_SLACK),
+        max_digests: usize::try_from(digests).unwrap_or(usize::MAX),
+        max_bytes: m.get_one::<u64>(MAX_BYTES).copied().unwrap_or_default(),
+    }))
 }
 
 /// Why the runs cannot be prepared. No message carries a secret.
@@ -252,8 +272,29 @@ impl TaskFlags {
     /// secret is under 32 bytes, the credentials are not the JSON of a key, or the preparer
     /// refuses the URLs, the bucket, the region or the expiry.
     pub fn open(&self, backend: Backend) -> Result<RunPrep, TaskFlagError> {
-        let _ = backend;
-        unimplemented!("TaskFlags::open")
+        let secret = Zeroizing::new(read_owner_only(&self.secret_file, MAX_FILE_BYTES)?);
+        let secret = secret.trim_ascii();
+        let grant_key = GrantKey::from_secret(secret)?;
+        let mint = PackKeyMint::new(secret)?;
+        let key = read_credentials(&self.put_credentials_file)?;
+        let config = RunPrepConfig {
+            mint,
+            grant_key,
+            put: PutTarget {
+                endpoint: self.put_endpoint.clone(),
+                region: self.put_region.clone(),
+                bucket: self.put_bucket.clone(),
+                key,
+            },
+            read_url: self.read_url.clone(),
+            run_wall: self.run_wall,
+            slack: self.url_slack,
+            limits: ClosureLimits {
+                max_digests: self.max_digests,
+                max_bytes: self.max_bytes,
+            },
+        };
+        Ok(RunPrep::new(backend, config)?)
     }
 }
 

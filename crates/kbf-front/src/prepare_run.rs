@@ -31,8 +31,6 @@
 //! are values the caller loads from files named by flags (`kbf-server`'s `task_flags`); no
 //! type here prints one, and the URL and the token are redacted from [`RunInputs`]'s `Debug`.
 
-#![allow(dead_code, unused_imports)] // red: the stubs below use none of the helpers
-
 mod closure;
 
 use std::fmt;
@@ -74,8 +72,18 @@ pub enum ExpiryError {
 /// The seconds a write and a grant are good for when the run may take `wall` and the tasks
 /// need `slack` more (a fraction of a second counts as a second).
 fn expiry_secs(wall: Duration, slack: Duration) -> Result<u64, ExpiryError> {
-    let _ = (wall, slack);
-    Ok(1)
+    let total = wall.saturating_add(slack);
+    let seconds = total
+        .as_secs()
+        .saturating_add(u64::from(total.subsec_nanos() > 0));
+    if seconds == 0 {
+        return Err(ExpiryError::Zero);
+    }
+    let ceiling = MAX_EXPIRY.as_secs();
+    if seconds > ceiling {
+        return Err(ExpiryError::OverCeiling { seconds, ceiling });
+    }
+    Ok(seconds)
 }
 
 /// Why a [`RunPrep`] cannot be built.
@@ -128,8 +136,15 @@ fn base_of(url: &str) -> Result<(&str, &str), &'static str> {
 /// [`ConfigError::ReadUrl`] for a URL that is not, `http://` ones included: a grant's token is
 /// a bearer secret and crosses only a TLS connection.
 pub fn check_read_url(url: &str) -> Result<(), ConfigError> {
-    let _ = url;
-    Ok(())
+    let refuse = |why| ConfigError::ReadUrl {
+        url: url.to_owned(),
+        why,
+    };
+    match base_of(url) {
+        Ok(("https", _)) => Ok(()),
+        Ok(_) => Err(refuse("is not https")),
+        Err(why) => Err(refuse(why)),
+    }
 }
 
 /// Where a task writes its pack, and the credential that signs the write.
@@ -262,7 +277,18 @@ impl RunPrep {
             limits,
         } = config;
         check_read_url(&read_url)?;
-        let _ = expiry_secs(run_wall, slack);
+        match base_of(&put.endpoint) {
+            Ok(("http" | "https", _)) => {}
+            Ok(_) => return Err(put_endpoint(&put, "is not http or https")),
+            Err(why) => return Err(put_endpoint(&put, why)),
+        }
+        if put.bucket.is_empty() {
+            return Err(ConfigError::Empty("bucket"));
+        }
+        if put.region.is_empty() {
+            return Err(ConfigError::Empty("region"));
+        }
+        expiry_secs(run_wall, slack)?;
         Ok(Self {
             backend,
             mint,
@@ -312,19 +338,36 @@ impl RunPrep {
         now: SystemTime,
         wall: Duration,
     ) -> Result<RunInputs, PrepareError> {
-        let _ = (
-            lease,
-            action,
-            now,
-            wall,
-            &self.mint,
-            &self.grants,
-            &self.put,
-            &self.read_url,
-            &self.limits,
-            &self.backend,
-        );
-        unimplemented!("prepare_run_for")
+        check_build(lease)?;
+        let expires_secs = expiry_secs(wall, self.slack)?;
+        let since = now
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| PrepareError::Clock)?;
+        let closure = self.closure(action).await?;
+        let key = self.mint.mint(lease, action, now)?;
+        let put_url = presign_put(
+            &self.put.key,
+            &PresignRequest {
+                endpoint: &self.put.endpoint,
+                region: &self.put.region,
+                bucket: &self.put.bucket,
+                key: key.key(),
+                expires_secs,
+                now: u64::try_from(since.as_millis()).unwrap_or(u64::MAX),
+            },
+        )?;
+        let not_after = since.as_secs().saturating_add(expires_secs);
+        let token = self.grants.issue(lease, *action, not_after)?;
+        Ok(RunInputs {
+            key,
+            put_url,
+            read_grant: ReadGrant {
+                url: self.read_url.clone(),
+                token,
+                not_after,
+            },
+            closure,
+        })
     }
 }
 

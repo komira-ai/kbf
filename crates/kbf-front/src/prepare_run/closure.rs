@@ -17,8 +17,6 @@
 //!   one of the Directory read first in level order (the reads of a level are issued
 //!   together and answered in order), so the same store gives the same answer.
 
-#![allow(dead_code, unused_imports)] // red: the stub below uses none of the helpers
-
 use std::collections::BTreeSet;
 
 use bytes::Bytes;
@@ -188,8 +186,56 @@ pub async fn collect_closure(
     action: &Digest,
     limits: ClosureLimits,
 ) -> Result<InputClosure, ClosureError> {
-    let _ = (backend, action, limits);
-    unimplemented!("collect_closure")
+    let blob = read(backend, "the Action", action).await?;
+    let decoded = reapi::Action::decode(blob).map_err(|e| invalid("the Action", action, &e))?;
+    let named = |what, digest: Option<&reapi::Digest>| {
+        wire::digest(digest).map_err(|status| invalid(what, action, &status.message()))
+    };
+    let command = named(
+        "the Action's command digest",
+        decoded.command_digest.as_ref(),
+    )?;
+    let root = named(
+        "the Action's input root",
+        decoded.input_root_digest.as_ref(),
+    )?;
+    let mut seen = Seen {
+        limits,
+        digests: BTreeSet::new(),
+        bytes: 0,
+    };
+    seen.add(root)?;
+    let mut files = Vec::new();
+    let mut level = vec![root];
+    while !level.is_empty() {
+        let directories: Vec<(Digest, reapi::Directory)> = stream::iter(level)
+            .map(|digest| directory(backend, digest))
+            .buffered(DIRECTORIES_IN_FLIGHT)
+            .try_collect()
+            .await?;
+        level = Vec::new();
+        for (parent, directory) in &directories {
+            for file in &directory.files {
+                let file = named_in(parent, "a file", file.digest.as_ref())?;
+                if seen.add(file)? {
+                    files.push(file);
+                }
+            }
+            for child in &directory.directories {
+                let child = named_in(parent, "a subdirectory", child.digest.as_ref())?;
+                if seen.add(child)? {
+                    level.push(child);
+                }
+            }
+        }
+    }
+    require_held(backend, &command, files).await?;
+    Ok(InputClosure {
+        action: *action,
+        command,
+        inputs: seen.digests,
+        bytes: seen.bytes,
+    })
 }
 
 /// The digest a Directory `parent` names for `what`.
