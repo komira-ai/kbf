@@ -6,7 +6,14 @@
 //!    every blob's SHA-256 against its digest, and lays the input tree out under the working
 //!    directory;
 //! 2. runs the Command there ([`run`]): its argv, environment and working directory, stdout and
-//!    stderr to files, under a deadline;
+//!    stderr to files, under a deadline. The environment is the Command's own, preceded by `HOME`,
+//!    `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`, which name fresh directories
+//!    `private/{home,tmp,cache}` (the last holding `clang/ModuleCache`) under the working
+//!    directory, mode 0700, beside the input root and not in it. A job's image root is read-only
+//!    and its `/tmp` is a small `noexec` tmpfs, so a compiler that writes under `~` or the
+//!    temporary directory would otherwise fail; and since outputs are collected relative to the
+//!    input root, nothing written there is packed. A variable the Command sets itself keeps its
+//!    value. A directory that cannot be made fails the run start (exit 11);
 //! 3. collects the declared outputs as REAPI does ([`outputs`]): files, directories as Trees,
 //!    symlinks, the executable bit;
 //! 4. writes every output blob, stdout, stderr and Tree, and the manifest, into ONE kbf-segments

@@ -310,6 +310,65 @@ async fn a_command_with_no_program_fails_as_a_run_start() {
     assert_eq!(failure.exit_code(), EXIT_RUN);
 }
 
+/// Catches: files a Command leaves in its `HOME` or `TMPDIR` (a compiler's scratch and caches)
+/// being collected, so they would bloat the pack and appear as outputs the action never declared.
+#[tokio::test]
+async fn files_written_into_home_and_tmp_are_not_packed_or_listed() {
+    let dir = scratch("private-unpacked");
+    let in_home = dir.join("private/home/cc-cache");
+    let in_tmp = dir.join("private/tmp/cc-scratch");
+    let mut mem = Mem::default();
+    let digest = action(
+        &mut mem,
+        &[
+            "touch",
+            in_home.to_str().unwrap(),
+            in_tmp.to_str().unwrap(),
+            "out",
+        ],
+        &["out"],
+    );
+    let sink = Fake::new(false);
+    let manifest = execute(&cli(&dir, digest), &mem, &sink)
+        .await
+        .expect("task");
+    assert!(in_home.exists());
+    assert!(in_tmp.exists());
+    assert_eq!(manifest.exit_code, 0);
+    assert_eq!(manifest.output_files.len(), 1);
+    assert_eq!(manifest.output_files[0].path, "out");
+    assert!(manifest.output_directories.is_empty());
+    assert!(manifest.output_symlinks.is_empty());
+    let stored = sink.stored.lock().unwrap();
+    let reader = SegmentReader::open(&stored[0]).expect("segment");
+    // Only the manifest: `out` is empty, and the files in `private/` have no record.
+    assert_eq!(reader.footer().entries().len(), 1);
+    let json = manifest.to_json().expect("json");
+    assert!(!String::from_utf8_lossy(&json).contains("private"));
+}
+
+/// Catches: a task whose home, tmp and cache directories cannot be made (a file where the
+/// `private` directory belongs) starting the Command anyway, or failing in a class other than
+/// the run start.
+#[tokio::test]
+async fn private_directories_that_cannot_be_made_fail_as_a_run_start() {
+    let mut mem = Mem::default();
+    let digest = action(&mut mem, COPY, &["out"]);
+    let dir = scratch("private-blocked");
+    std::fs::write(dir.join("private"), b"in the way").expect("file");
+    let sink = Fake::new(false);
+    let failure = execute(&cli(&dir, digest), &mem, &sink)
+        .await
+        .expect_err("run");
+    assert!(
+        matches!(failure, Failure::Run(RunError::Io { .. })),
+        "{failure}"
+    );
+    assert_eq!(failure.exit_code(), EXIT_RUN);
+    assert!(!dir.join("in/out").exists());
+    assert!(sink.stored.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn outputs_past_a_limit_fail_as_a_pack_and_store_nothing() {
     let mut mem = Mem::default();
