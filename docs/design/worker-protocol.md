@@ -398,9 +398,11 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
     of the minute; `ws_max_bytes` is the largest working set (`memory.current` less
     `inactive_file`) seen in it. A minute observed for less than 30 s is absent, never sent as
     zero. Minute 63 means "63 or later": the sender folds every later minute into it with the
-    larger value of each field, and a receiver merges repeats of it the same way. A minute sent
-    again (a heartbeat not acknowledged before its stream ended) is harmless: a receiver merges by
-    (lease, minute) with the larger value of each field. The minute's peak window is taken on the
+    larger value of each field. Repeats have two scopes. Within one load, `NodeLoad::vet` drops a
+    repeat of (lease, minute) and the first one stays. Across heartbeats, a receiver merges by
+    (lease, minute) with the larger value of each field: a minute sent again (a heartbeat not
+    acknowledged before its stream ended) is harmless, and so is every later fold into minute 63.
+    The minute's peak window is taken on the
     reading's clock; the `peak_window_millicores` of a lease's usage record is taken on the lease's
     own clock reads, so the two may differ in the last digits.
   - `covered` is capped like `lease_clocks`: at most 96, in the order of `lease_clocks`.

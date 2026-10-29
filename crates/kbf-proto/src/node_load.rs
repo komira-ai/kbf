@@ -4,8 +4,9 @@
 //! The load is telemetry, so a bad one never costs the heartbeat around it. [`NodeLoad::vet`]
 //! never fails: it drops a record that breaks a rule, alone, and counts it in [`LoadDrops`].
 //! The caps and rules are the ones the job scheduler's agent wire applies to the same lists
-//! (`js_agent_wire::limits` and its `NodeLoad::vet`); a test of this crate holds the numbers
-//! equal.
+//! (`js_agent_wire::limits` and its `NodeLoad::vet`); a test of this crate pins the documented
+//! numbers, which are js-agent-wire's. The check that the two crates agree is made where both
+//! are visible, not here.
 //!
 //! A list is cut to its cap first and the excess is counted as `over_cap` without being
 //! judged; each remaining record is then judged (`invalid`), and a repeat of an earlier kept
