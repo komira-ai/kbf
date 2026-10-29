@@ -300,11 +300,6 @@ impl KbfAdapter {
             sweep = learning.learned.sweep_due();
         }
         let store = learning.stored.then(|| Arc::clone(&self.store));
-        if store.is_none() {
-            // Nothing to write the rows to; a sweep that has no store ends at once.
-            learning.learned.swept(false);
-            return Work::default();
-        }
         Work { rows, sweep, store }
     }
 
@@ -345,6 +340,8 @@ pub(crate) async fn write_learned(core: &Core<KbfAdapter>, gate: &Gate, tick: bo
     let work = core.with(|_, adapter| adapter.take_learned_work(tick));
     let Work { rows, sweep, store } = work;
     let Some(store) = store else {
+        // Nothing to write to: a sweep that is due ends at once.
+        core.with(|_, adapter| adapter.finish_learned_work(&[], sweep.map(|_| false)));
         return;
     };
     let (refused, fenced) = write_estimates(&*store, &rows);
