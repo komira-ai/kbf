@@ -660,6 +660,25 @@ fn the_plain_http_opt_in_lets_the_sink_reach_an_http_store() {
     assert!(!failed.to_string().contains("sig=s"), "{failed}");
 }
 
+/// Catches `--fetch-batch` not reaching the source: it is off unless the flag is given.
+#[test]
+fn the_fetch_batch_flag_turns_batching_on_in_the_source() {
+    let dir = scratch("batch-flag");
+    let mut flags = cli(&dir, reapi_of(b"a"));
+    std::fs::write(dir.join("token"), "tok\n").expect("write");
+    flags.grant_token_file = Some(dir.join("token"));
+    let url_file = dir.join("url");
+    std::fs::write(&url_file, "https://store.example/pack?sig=s\n").expect("write");
+    flags.pack_url_file = Some(url_file.clone());
+    assert!(!flags.fetch_batch);
+    let (source, _) = connect(&flags).expect("connect");
+    assert!(!source.batching());
+    flags.fetch_batch = true;
+    std::fs::write(&url_file, "https://store.example/pack?sig=s\n").expect("write");
+    let (source, _) = connect(&flags).expect("connect");
+    assert!(source.batching());
+}
+
 /// Catches: the URL file being removed, or needing a writable directory: an executor delivers it
 /// as a read-only run file, so the tool reads it and leaves it in place.
 #[test]

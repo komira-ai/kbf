@@ -136,3 +136,39 @@ fn the_request_time_grows_with_the_blob_and_is_capped() {
     assert_eq!(secs(800 << 20), 160);
     assert_eq!(secs(i64::MAX), 3600);
 }
+
+/// A source that serves what it is asked for but never calls back for the blobs in `skip`.
+struct SkipsSome {
+    mem: Memory,
+    skip: Vec<String>,
+}
+
+impl BlobSource for SkipsSome {
+    fn get(&self, digest: &Digest) -> Result<Vec<u8>, FetchError> {
+        self.mem.get(digest)
+    }
+
+    fn fetch_many(&self, digests: &[Digest], _: usize, each: &Each<'_>) -> Result<(), FetchError> {
+        for (index, digest) in digests.iter().enumerate() {
+            if !self.skip.contains(&digest.hash) {
+                each(index, &mut |out| self.fetch_to(digest, out))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Catches a source that skips one file blob while serving the rest being taken for a complete
+/// fetch: the tree is read, one of two files is never delivered, and the fetch fails as invalid.
+#[test]
+fn a_source_that_skips_a_file_blob_fails_the_fetch() {
+    let (mem, root, _, files) = wide(2);
+    let source = SkipsSome {
+        mem,
+        skip: vec![files[1].clone()],
+    };
+    let scratch_dir = scratch("skips-file");
+    let error = materialize(&source, &root, &scratch_dir.join("in"), 4).expect_err("skipped");
+    assert!(matches!(&error, FetchError::Invalid(_)), "{error:?}");
+    assert!(error.to_string().contains("skipped"), "{error}");
+}
