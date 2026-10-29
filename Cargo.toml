@@ -87,6 +87,7 @@ js-state = { git = "https://github.com/komira-ai/jobscheduler", rev = "772628f43
 js-store = { git = "https://github.com/komira-ai/jobscheduler", rev = "772628f4356de822e8fe9971d807e368c70be479" }
 js-testkit = { git = "https://github.com/komira-ai/jobscheduler", rev = "772628f4356de822e8fe9971d807e368c70be479" }
 js-types = { git = "https://github.com/komira-ai/jobscheduler", rev = "772628f4356de822e8fe9971d807e368c70be479" }
+js-usage = { git = "https://github.com/komira-ai/jobscheduler", rev = "772628f4356de822e8fe9971d807e368c70be479" }
 js-whole = { git = "https://github.com/komira-ai/jobscheduler", rev = "772628f4356de822e8fe9971d807e368c70be479" }
 md-5 = "0.11.0"
 # macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
@@ -267,6 +268,7 @@ kbf-ui = { path = "crates/kbf-ui" }
 kbf-unitfile = { path = "crates/kbf-unitfile" }
 kbf-update = { path = "crates/kbf-update" }
 kbf-updater = { path = "crates/kbf-updater" }
+kbf-usage = { path = "crates/kbf-usage" }
 # The hot/cold object store library; it depends on no kbf crate unless its `s3` feature is on
 # (kbf-integration-test keeps it so).
 tierstore = { path = "crates/tierstore" }
