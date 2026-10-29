@@ -174,6 +174,8 @@ pub struct Cli {
     /// its memory when that is less, and the CPUs of their cpuset.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     actions_memory_max_gib: Option<u64>,
+    #[command(flatten)]
+    actions_cpu: actions_cpu::ActionsCpuArgs,
     /// Written to the daemon's `supervisor` leaf's `memory.min` at start, in MiB
     /// (container, without `--cgroup-parent`): memory the kernel does not reclaim from
     /// the daemon while it uses no more, so builds short of memory never take it. The
@@ -888,6 +890,7 @@ fn node_over<C: Cas>(
         )
         .into());
     }
+    cli.actions_cpu.refuse(&cli.drivers)?;
     let mut node = Node::new(plane);
     for driver in drivers(cli) {
         match driver {
@@ -1202,7 +1205,8 @@ mod container {
         };
         // The leases' share of the CPUs: all the daemon may use but `--reserve-cpus`.
         // A limit on the actions cgroup, not a pinning: any CPU, at most this many.
-        kbf_driver_container::limit_cpus(mount, &parent, super::sizes(cli)?.lease_cpus() as u64)?;
+        let lease_cpus = super::sizes(cli)?.lease_cpus() as u64;
+        kbf_driver_container::limit_cpus(mount, &parent, lease_cpus)?;
         let capacity = kbf_driver_container::capacity(mount, &parent)?;
         tracing::info!(
             "leases may use {} CPUs and {} of memory (cgroup {parent})",
@@ -1224,6 +1228,8 @@ mod container {
         };
         let mut config = ContainerConfig::new(scratch, parent);
         config.placer = placer;
+        // Applied by each Welcome from here on; the limit above stands until the first.
+        config.actions_cpu = Some(cli.actions_cpu.config(lease_cpus));
         config.oci.runtime = cli.oci_runtime.clone();
         config.oci.id_files = files;
         config.cgroup_root = mount.clone();
@@ -1303,6 +1309,7 @@ mod container {
     }
 }
 
+mod actions_cpu;
 mod data_dir;
 mod instance;
 mod pack_read;
@@ -2277,6 +2284,16 @@ mod tests {
         let broken = Cli::try_parse_from(broken).expect("flags");
         let why = start_over(&broken, None, plane).err().expect("refused");
         assert!(why.to_string().contains("only --driver container"), "{why}");
+        // `--actions-cpu-max` other than `auto` needs the container driver too.
+        for mode in ["on", "off"] {
+            let mut broken = base.clone();
+            broken.push(format!("--actions-cpu-max={mode}"));
+            let broken = Cli::try_parse_from(broken).expect("flags");
+            let why = start_over(&broken, None, plane).err().expect("refused");
+            let why = why.to_string();
+            assert!(why.contains(&format!("--actions-cpu-max={mode}")), "{why}");
+            assert!(why.contains("only --driver container"), "{why}");
+        }
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 

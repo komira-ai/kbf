@@ -1,6 +1,7 @@
 //! Unit tests of `node_load`: the parsers over real-format files, the reader over a
 //! directory, and the tracker's covered set, windows and sequence number.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
@@ -338,6 +339,38 @@ async fn covered_leases_ran_the_whole_window() {
         .expect("second");
     assert_eq!(second.seq, 2);
     assert_eq!(second.covered, BTreeSet::from([id(1), id(3), id(5)]));
+}
+
+/// Catches a lease that ended while its cgroup was being read coming back to life: the
+/// reading finishes, and the lease is neither running again nor holding a peak.
+#[tokio::test]
+async fn a_lease_that_ends_during_a_reading_stays_ended() {
+    let actions = cgroup("load-ends-during");
+    let leases = crate::unit_dir("load-ends-during-leases");
+    let slot: Arc<OnceLock<Arc<LoadTracker>>> = Arc::new(OnceLock::new());
+    let hook = Arc::clone(&slot);
+    // Every reading of the clock ends lease 1, as its run ending on another thread would.
+    let clock: MonoClock = Arc::new(move || {
+        if let Some(tracker) = hook.get() {
+            tracker.ended(id(1));
+        }
+        7
+    });
+    let tracker = Arc::new(LoadTracker::new(clock));
+    for n in [1, 2] {
+        let dir = leases.join(format!("l{n}"));
+        std::fs::create_dir(&dir).expect("mkdir");
+        usage(&dir, 0);
+        tracker.started(id(n), dir);
+    }
+    assert!(slot.set(Arc::clone(&tracker)).is_ok(), "set once");
+    tracker
+        .reading(actions.to_path_buf())
+        .await
+        .expect("reading");
+    assert!(!tracker.running().contains_key(&id(1)));
+    assert!(tracker.running().contains_key(&id(2)));
+    assert_eq!(tracker.take_peak(id(1)), None);
 }
 
 /// Catches a failed reading counting as one (the next would then skip a sequence number
