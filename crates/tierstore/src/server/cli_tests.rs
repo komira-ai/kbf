@@ -11,15 +11,16 @@ use clap::{CommandFactory, Parser};
 use kbf_testkit::dir::TestDir;
 use tokio::sync::Notify;
 
+use crate::selftest_tests::{Flaw, Flawed};
 use crate::server::{AccessKey, Drained};
 use crate::{
-    Backend, FaultyBackend, MemoryBackend, Op, Proxy, ProxyConfig, Reconciler, ReconcilerConfig,
-    TestClock,
+    Backend, Check, FaultyBackend, MemoryBackend, Op, Proxy, ProxyConfig, Reconciler,
+    ReconcilerConfig, SelfTestFailure, TestClock,
 };
 
 use super::{
-    Cli, InvalidFlags, S3Flags, build, cut_note, open_tier, parse_duration, read_key, reconcile,
-    share, tier,
+    Cli, InvalidFlags, S3Flags, SkippedCheck, build, cut_note, exit_status, open_tier,
+    parse_duration, parse_skip, probe_run_id, probe_tiers, read_key, reconcile, share, tier,
 };
 
 const MEBIBYTE: u64 = 1 << 20;
@@ -138,6 +139,10 @@ fn the_flags_have_their_defaults() {
     ];
     assert!(!s3_flags.contains(&true), "no S3 flag by default");
     assert!(cli.read_only_key_file.is_empty());
+    assert!(
+        cli.skip_backend_check.is_empty(),
+        "no check is skipped by default"
+    );
 }
 
 /// Asserts that `--read-only-key-file` can be given any number of times, and that the files are
@@ -267,6 +272,7 @@ fn the_help_names_every_flag_and_the_version_the_package() {
         "--cold-endpoint",
         "--cold-region",
         "--cold-credentials-file",
+        "--skip-backend-check",
     ];
     for name in names {
         assert!(help.contains(name), "{name}");
@@ -612,6 +618,112 @@ async fn a_halt_cuts_the_pass_that_is_running() {
     assert!(done.is_ok());
     assert!(hot.get("_tiering/lease", None).await.is_err());
     assert!(cold_mem.get("k", None).await.is_err());
+}
+
+/// Asserts that `--skip-backend-check` takes a check name and a reason, may be given more than
+/// once, keeps the order, trims the reason and keeps a `=` inside it; and that a value with no
+/// `=`, an unknown check, or an empty or blank reason is refused by the parser with a message
+/// that lists the checks or names the check that lacks a reason.
+#[test]
+fn a_skipped_check_is_a_check_name_and_a_reason() {
+    let mut args = flags("key", &[]);
+    args.extend(
+        [
+            "--skip-backend-check",
+            "multipart-conditional= store ignores it on completion ",
+            "--skip-backend-check",
+            "range=a=b",
+        ]
+        .map(str::to_owned),
+    );
+    let cli = Cli::try_parse_from(args).unwrap();
+    let want = [
+        SkippedCheck {
+            check: Check::MultipartConditional,
+            reason: "store ignores it on completion".to_owned(),
+        },
+        SkippedCheck {
+            check: Check::Range,
+            reason: "a=b".to_owned(),
+        },
+    ];
+    assert_eq!(cli.skip_backend_check, want);
+
+    for text in ["range", "ranges=because", "=because"] {
+        let why = parse_skip(text).unwrap_err();
+        assert!(why.contains("CHECK=REASON"), "{text}: {why}");
+        assert!(why.contains("multipart-conditional"), "{text}: {why}");
+    }
+    for text in ["range=", "paging=   "] {
+        let why = parse_skip(text).unwrap_err();
+        assert!(why.contains("needs a reason"), "{text}: {why}");
+    }
+    let refused = Cli::try_parse_from(flags("key", &[("--skip-backend-check", "range")]));
+    assert!(refused.is_err());
+}
+
+/// Asserts that the id of a start's probe keys has the proxy id, the time and the process, with
+/// every character a key cannot carry in the proxy id replaced by an underscore.
+#[test]
+fn the_probe_run_id_is_made_of_the_proxy_the_time_and_the_process() {
+    assert_eq!(probe_run_id("p1", 1234, 77), "p1-1234-77");
+    assert_eq!(probe_run_id("a/b c.d-e", 5, 6), "a_b_c_d-e-5-6");
+    assert_ne!(probe_run_id("p1", 1, 7), probe_run_id("p1", 2, 7));
+}
+
+/// Asserts that a failed self-test is status 3, flags that cannot go together status 2 and any
+/// other failure status 1.
+#[test]
+fn a_failed_self_test_has_its_own_exit_status() {
+    let failure = SelfTestFailure {
+        backend: "hot tier memory".to_owned(),
+        check: Check::Range,
+        observed: "x".to_owned(),
+    };
+    let self_test: super::Error = Box::new(failure);
+    let invalid: super::Error = Box::new(InvalidFlags("x".to_owned()));
+    let other: super::Error = "another reason".into();
+    assert_eq!(exit_status(&self_test), 3);
+    assert_eq!(exit_status(&invalid), 2);
+    assert_eq!(exit_status(&other), 1);
+}
+
+/// Asserts that the two tiers are tested before a start: tiers that are correct pass; a hot tier
+/// that fails is named as the hot tier with its flag value and the check; a cold tier that fails
+/// is named as the cold tier; the failure is the error a start gives, so that its exit status is
+/// 3; and a check the flags skip is not run, so a tier that fails only that one passes.
+#[tokio::test]
+async fn the_tiers_are_tested_before_a_start_and_a_failure_names_the_tier() {
+    let dir = TestDir::under(std::env::temp_dir(), "tierstore-probe-tiers");
+    let mut cli = cli(&dir);
+    cli.hot = "s3:hot-bucket".to_owned();
+    cli.cold = "dir:/cold".to_owned();
+    let good = Flawed::new(Flaw::None);
+    probe_tiers(&cli, &good, &good).await.unwrap();
+
+    let broken = Flawed::new(Flaw::OverwritesOnCreate);
+    let why = probe_tiers(&cli, &broken, &good).await.unwrap_err();
+    assert_eq!(exit_status(&why), 3);
+    let text = why.to_string();
+    assert!(text.contains("hot tier s3:hot-bucket"), "{text}");
+    assert!(text.contains("create-only"), "{text}");
+
+    let why = probe_tiers(&cli, &good, &broken).await.unwrap_err();
+    let text = why.to_string();
+    assert!(text.contains("cold tier dir:/cold"), "{text}");
+    assert!(text.contains("create-only"), "{text}");
+
+    let no_multipart = Flawed::new(Flaw::NoMultipart);
+    probe_tiers(&cli, &no_multipart, &good).await.unwrap();
+    let why = probe_tiers(&cli, &good, &no_multipart).await.unwrap_err();
+    assert!(why.to_string().contains("multipart-conditional"), "{why}");
+
+    cli.skip_backend_check = vec![SkippedCheck {
+        check: Check::MultipartConditional,
+        reason: "test".to_owned(),
+    }];
+    probe_tiers(&cli, &good, &no_multipart).await.unwrap();
+    assert!(good.inner.list("_tiering/").await.unwrap().is_empty());
 }
 
 /// Asserts that the report of a drain names the requests that the deadline cut, and that a drain

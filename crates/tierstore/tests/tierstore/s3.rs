@@ -13,7 +13,7 @@ use kbf_objstore::s3::fake::{FakeS3, part_etag};
 use tierstore::s3::{Capabilities, Credentials, S3Config};
 use tierstore::{
     Backend, ByteRange, Clock, Error, PartBody, Proxy, ProxyConfig, Reconciler, ReconcilerConfig,
-    S3Backend, SystemClock,
+    S3Backend, SystemClock, self_test,
 };
 
 use crate::conformance;
@@ -38,6 +38,22 @@ async fn backend() -> (FakeS3, S3Backend) {
     let s3 = FakeS3::start().await;
     let backend = S3Backend::new(config(s3.endpoint())).unwrap();
     (s3, backend)
+}
+
+/// Asserts that the self-test passes over the S3 service, as a hot tier and as a cold tier (the
+/// conditional puts, the range, the head, the paging and the multipart completion of the service
+/// are the ones the test asks for), and leaves no object and no open upload in the bucket.
+#[tokio::test]
+async fn the_self_test_passes_over_the_s3_service_and_leaves_nothing() {
+    let (s3, backend) = backend().await;
+    self_test("hot", &backend, "run-1", false, &[])
+        .await
+        .unwrap();
+    self_test("cold", &backend, "run-1", true, &[])
+        .await
+        .unwrap();
+    assert!(s3.keys().is_empty(), "{:?}", s3.keys());
+    assert_eq!(s3.incomplete_uploads(), 0);
 }
 
 /// Asserts that a call failed with `Error::Other`.

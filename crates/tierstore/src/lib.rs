@@ -28,6 +28,11 @@
 //!   listing follows the continuation tokens. It does the multipart calls too: the chunks of
 //!   a part are sent to the store as they arrive, never collected, and a completion is
 //!   create-only.
+//! - [`self_test`] asks a backend the questions its guarantees rest on (a create-only put that
+//!   refuses a key that exists, a replace on the right content tag only, a ranged read that
+//!   gives the range, a head, a listing that pages, and on the cold tier a create-only
+//!   completion) under a probe key in `_tiering/selftest/`, and names the first one it answers
+//!   wrongly. The `tierstore` binary runs it on both tiers and refuses to start if one fails.
 //! - [`Proxy`] is a store over a hot and a cold backend that is itself a [`Backend`]. Any
 //!   number of proxies (one per node, each with its own id) work over the same two backends,
 //!   and none needs state for correctness. A get reads the hot tier, else the cold tier, and
@@ -77,6 +82,9 @@ mod memory;
 mod reconciler;
 #[cfg(feature = "s3")]
 pub mod s3;
+mod selftest;
+#[cfg(test)]
+mod selftest_tests;
 #[cfg(feature = "server")]
 pub mod server;
 mod state;
@@ -93,4 +101,5 @@ pub use memory::{MemoryBackend, TestClock};
 pub use reconciler::{PassReport, Reconciler, ReconcilerConfig};
 #[cfg(feature = "s3")]
 pub use s3::S3Backend;
+pub use selftest::{Check, SelfTestFailure, self_test};
 pub use tiered::{Proxy, ProxyConfig};

@@ -397,6 +397,28 @@ async fn it_serves_over_two_s3_tiers_and_lands_a_multipart_upload_in_the_cold_on
     assert_eq!(running.exit_code().await, Some(0));
 }
 
+/// Asserts that a start whose cold tier is an S3 store that cannot be reached exits with status
+/// 3 before it serves anything: nothing on stdout (no start line), and a message that says the
+/// start is refused, names the cold tier as the flag gave it and says which check failed.
+#[test]
+fn a_tier_that_fails_the_self_test_is_a_refused_start_with_status_3() {
+    let files = Files::new("bin-selftest-refused");
+    let secret = files.secret("cold-key", "ID\nsecret\n");
+    let key = secret.display().to_string();
+    let described = files.flags(&[
+        "--cold-credentials-file",
+        key.as_str(),
+        "--cold-endpoint",
+        "http://127.0.0.1:1",
+    ]);
+    let flags = with(&described, "--cold", "s3:cold-bucket");
+    let (code, out, err) = run(&flags);
+    assert_eq!((code, out.as_str()), (3, ""));
+    assert!(err.starts_with("tierstore: refusing to start: "), "{err}");
+    assert!(err.contains("cold tier s3:cold-bucket"), "{err}");
+    assert!(err.contains("create-only"), "{err}");
+}
+
 /// Asserts that a start with a tier that its flags do not describe exits with status 1 and a
 /// reason that names the flag: an S3 tier with no endpoint, one whose credentials file is not
 /// there, one whose bucket name is not a bucket name, and the flags of an S3 tier given for a
