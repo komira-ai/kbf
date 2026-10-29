@@ -23,6 +23,8 @@ pub struct Container {
     /// The image reference it was made with (`kbf-frontend:<commit>`).
     pub image_ref: String,
     pub running: bool,
+    /// Docker's restart policy name (`no` or empty: none).
+    pub restart: String,
 }
 
 /// A runtime call that did not work, in a line for the log.
@@ -192,7 +194,7 @@ impl Runtime for Docker {
                 "container",
                 "inspect",
                 "--format",
-                "{{.Image}} {{.Config.Image}} {{.State.Running}}",
+                "{{.Image}} {{.Config.Image}} {{.State.Running}} {{.HostConfig.RestartPolicy.Name}}",
                 name,
             ],
             CALL,
@@ -202,12 +204,15 @@ impl Runtime for Docker {
         };
         let text = exec.stdout_text();
         let mut fields = text.split_whitespace();
-        match (fields.next(), fields.next(), fields.next(), fields.next()) {
-            (Some(id), Some(image_ref), Some(running @ ("true" | "false")), None) => {
+        let seen = (fields.next(), fields.next(), fields.next());
+        let (restart, rest) = (fields.next(), fields.next());
+        match seen {
+            (Some(id), Some(image_ref), Some(running @ ("true" | "false"))) if rest.is_none() => {
                 Ok(Some(Container {
                     image_id: id.to_owned(),
                     image_ref: image_ref.to_owned(),
                     running: running == "true",
+                    restart: restart.unwrap_or_default().to_owned(),
                 }))
             }
             _ => Err(RuntimeError(
