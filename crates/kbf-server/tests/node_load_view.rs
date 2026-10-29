@@ -207,9 +207,11 @@ async fn a_hostile_load_does_not_cost_the_beat_and_its_drops_are_counted() {
     daemon
         .beat_running_loaded_acked(&[lost, retry], Some(hostile))
         .await;
+    // Every cancel the heartbeat caused arrived before its acknowledgement: exactly one, for
+    // the lost lease, so the held lease was not cancelled.
     assert_eq!(
-        daemon.cancelled().await,
-        Some(lost),
+        daemon.cancels_received(),
+        vec![lost],
         "the running list of the hostile heartbeat was not applied"
     );
 

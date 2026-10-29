@@ -1135,6 +1135,21 @@ impl FakeDaemon {
         .await
     }
 
+    /// The leases of every `Cancel` already received and kept, in order, without waiting.
+    /// The server queues a heartbeat's cancels before its acknowledgement, so after
+    /// `beat_*_acked` these are all that heartbeat caused.
+    pub fn cancels_received(&mut self) -> Vec<LeaseId> {
+        let mut leases = Vec::new();
+        self.kept.retain(|m| match m {
+            server_message::Message::Cancel(c) => {
+                leases.push(c.lease_id.expect("a lease id"));
+                false
+            }
+            _ => true,
+        });
+        leases
+    }
+
     /// Asserts no Offer or Start arrives within [`QUIET`].
     pub async fn no_work(&mut self) {
         let work = self

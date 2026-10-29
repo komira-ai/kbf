@@ -277,7 +277,8 @@ impl Farm {
     ///
     /// Returns the accepted reading with its vetted lists, as the scheduler takes it, for
     /// [`Farm::heartbeat_with_load`]; `None` when there was no reading, it was refused, or
-    /// the stream was replaced.
+    /// the stream was replaced. Always `None` on the js core, which does not take the
+    /// reading yet.
     pub fn note_node_load(
         &self,
         worker: &WorkerId,

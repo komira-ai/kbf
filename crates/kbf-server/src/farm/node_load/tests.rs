@@ -572,6 +572,10 @@ fn accepted(farm: &Farm) -> u64 {
 /// is the heartbeat carrying it that the scheduler hears (the scheduler counts it as accepted
 /// then and not before), and that a heartbeat with no reading feeds it nothing.
 #[tokio::test(start_paused = true)]
+#[cfg_attr(
+    feature = "farm-core-js",
+    ignore = "known-different-on-js: the js core's heartbeat does not take the load yet"
+)]
 async fn an_accepted_reading_is_handed_to_the_scheduler_with_its_lists() {
     let farm = farm();
     let a = WorkerId::new("a");
@@ -605,6 +609,10 @@ async fn an_accepted_reading_is_handed_to_the_scheduler_with_its_lists() {
 /// counted as refused in the node view; and that the refused first reading of a restarted
 /// daemon feeds nothing either and leaves the node without a load.
 #[tokio::test(start_paused = true)]
+#[cfg_attr(
+    feature = "farm-core-js",
+    ignore = "known-different-on-js: the js core's heartbeat does not take the load yet"
+)]
 async fn a_refused_reading_feeds_nothing_and_counts_its_minutes() {
     let farm = farm();
     let a = WorkerId::new("a");
@@ -649,6 +657,10 @@ async fn a_refused_reading_feeds_nothing_and_counts_its_minutes() {
 /// count of accepted readings does not move; the same load on the stream that replaced it is
 /// fed.
 #[tokio::test(start_paused = true)]
+#[cfg_attr(
+    feature = "farm-core-js",
+    ignore = "known-different-on-js: the js core's heartbeat does not take the load yet"
+)]
 async fn a_heartbeat_of_a_replaced_stream_feeds_nothing() {
     let farm = farm();
     let a = WorkerId::new("a");
@@ -671,6 +683,10 @@ async fn a_heartbeat_of_a_replaced_stream_feeds_nothing() {
 /// Asserts that the scheduler is handed accepted readings under `--placement-load off` and
 /// under `on`: it keeps them either way, so the feed is warm before the flag is raised.
 #[tokio::test(start_paused = true)]
+#[cfg_attr(
+    feature = "farm-core-js",
+    ignore = "known-different-on-js: the js core's heartbeat does not take the load yet"
+)]
 async fn the_feed_reaches_the_scheduler_in_every_placement_mode() {
     for mode in [PlacementLoad::Off, PlacementLoad::On] {
         let farm = farm().with_placement_load(mode);
