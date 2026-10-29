@@ -78,3 +78,28 @@ fn a_history_key_passes_through() {
     assert_eq!(scoped.capabilities(), objects.capabilities());
     assert_eq!(scoped.inner().counts().deletes.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn len_is_refused_outside_history_and_passes_through_inside() {
+    // Catches: a wrapper that leaves `len` to the trait default (every history length
+    // read would fail as Unsupported), or lets it reach a `cas/` key.
+    use kbf_objstore::{Capabilities, MemoryStore};
+    let store = MemoryStore::new(Capabilities::default());
+    let inside = ObjectKey::new("kbf/history/r30/inv/x").unwrap();
+    let cas = ObjectKey::new("kbf/cas/1/2").unwrap();
+    futures::executor::block_on(async {
+        store
+            .put_new(&inside, Bytes::from_static(b"abc"), None)
+            .await
+            .unwrap();
+        store
+            .put_new(&cas, Bytes::from_static(b"abcd"), None)
+            .await
+            .unwrap();
+        let scoped = Scoped::history(store, &root());
+        assert_eq!(scoped.len(&inside).await.unwrap(), Some(3));
+        let absent = ObjectKey::new("kbf/history/r30/inv/none").unwrap();
+        assert_eq!(scoped.len(&absent).await.unwrap(), None);
+        assert!(denied(scoped.len(&cas).await.unwrap_err()));
+    });
+}
