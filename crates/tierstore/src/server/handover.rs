@@ -73,3 +73,7 @@ fn received(queue: mpsc::Receiver<Item>) -> PartBody<'static> {
     .fuse()
     .boxed()
 }
+
+#[cfg(test)]
+#[path = "handover_tests.rs"]
+mod tests;

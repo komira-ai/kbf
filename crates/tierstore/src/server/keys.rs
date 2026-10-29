@@ -20,7 +20,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use hyper::Method;
@@ -28,6 +28,7 @@ use serde::Deserialize;
 
 use super::ServerConfig;
 use super::auth::{READ_ONLY, Refusal};
+use super::presign::PUT_ONLY;
 
 /// The flag whose files hold the read-only keys.
 const READ_ONLY_FLAG: &str = "--read-only-key-file";
@@ -75,6 +76,8 @@ pub(crate) enum Role {
     Full,
     /// GetObject, HeadObject, ListObjectsV2 and HeadBucket.
     ReadOnly,
+    /// A presigning key: one presigned `PUT`, as far as its grant goes (see `presign`).
+    PresignPut,
 }
 
 impl Role {
@@ -89,6 +92,7 @@ impl Role {
         let reads = matches!(*method, Method::GET | Method::HEAD);
         match (self, reads) {
             (Self::ReadOnly, false) => Err(READ_ONLY),
+            (Self::PresignPut, _) if *method != Method::PUT => Err(PUT_ONLY),
             _ => Ok(()),
         }
     }
@@ -170,6 +174,29 @@ fn from_lines(text: &str) -> Result<(String, String), &'static str> {
     }
 }
 
+/// The text of the file that the flag `flag` names, if only its owner can read it.
+///
+/// # Errors
+/// It cannot be read, or a group or other permission bit is set; led by the flag and the path.
+pub(super) fn read_private_text(flag: &str, path: &Path) -> Result<String, String> {
+    let shown = path.display();
+    let fail = |why: &str| format!("{flag} {shown}: {why}");
+    // The link itself, not what it points at: a link is not a key file.
+    let meta = std::fs::symlink_metadata(path);
+    let meta = meta.map_err(|why| fail(&why.to_string()))?;
+    if meta.file_type().is_symlink() {
+        return Err(fail("is a symbolic link; name the file itself"));
+    }
+    if meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(fail("is not owned by the user the server runs as"));
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        return Err(fail("others can read it; make it mode 0600"));
+    }
+    let text = std::fs::read_to_string(path);
+    text.map_err(|why| fail(&why.to_string()))
+}
+
 /// The access key id and the secret access key in the file that the flag `flag` names, in
 /// either form (see the module docs).
 ///
@@ -177,15 +204,8 @@ fn from_lines(text: &str) -> Result<(String, String), &'static str> {
 /// What is wrong with the file, led by the flag and the path: it cannot be read, a group or
 /// other permission bit is set, or its text is not a key in either form.
 pub(super) fn read_credentials(flag: &str, path: &Path) -> Result<(String, String), String> {
-    let shown = path.display();
-    let fail = |why: &str| format!("{flag} {shown}: {why}");
-    let meta = std::fs::metadata(path);
-    let meta = meta.map_err(|why| fail(&why.to_string()))?;
-    if meta.permissions().mode() & 0o077 != 0 {
-        return Err(fail("others can read it; make it mode 0600"));
-    }
-    let text = std::fs::read_to_string(path);
-    let text = text.map_err(|why| fail(&why.to_string()))?;
+    let fail = |why: &str| format!("{flag} {}: {why}", path.display());
+    let text = read_private_text(flag, path)?;
     let json = text.trim_start().starts_with('{');
     let pair = if json {
         from_json(&text)
