@@ -158,12 +158,13 @@ pub(crate) fn serve_on(
     let (first, first_sent) = oneshot::channel::<()>();
     let (second, second_sent) = oneshot::channel::<()>();
     let start = kbf_server::start(&flags.server, move || Ok(when_sent(first_sent)));
-    // A signal while the server half starts abandons the start: nothing is running yet,
-    // and the process exits 0.
+    // A signal before or while the server half starts abandons the start: nothing is
+    // running yet, and the process exits 0. The signal is polled first, so one already
+    // queued wins without the start being polled at all.
     let bound = tokio.block_on(async {
-        match futures::future::select(Box::pin(start), Box::pin(signals.recv())).await {
-            futures::future::Either::Left((server, _)) => Some(server),
-            futures::future::Either::Right(_) => None,
+        match futures::future::select(Box::pin(signals.recv()), Box::pin(start)).await {
+            futures::future::Either::Left(_) => None,
+            futures::future::Either::Right((server, _)) => Some(server),
         }
     });
     let Some(server) = bound else {
