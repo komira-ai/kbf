@@ -203,6 +203,7 @@ impl Server {
         query: &Query,
         reader: Reader<B>,
         check: Check,
+        hot_only: bool,
     ) -> Result<Answer, S3Error>
     where
         B: Body + Send,
@@ -225,7 +226,9 @@ impl Server {
             ("GET", Target::Bucket, false) => self.list_objects(query).await,
             ("GET", Target::Object(key), false) => self.get_object(parts, &key).await,
             ("HEAD", Target::Object(key), false) => self.head_object(parts, &key).await,
-            ("PUT", Target::Object(key), false) => self.put_object(parts, &key, body).await,
+            ("PUT", Target::Object(key), false) => {
+                self.put_object(parts, &key, body, hot_only).await
+            }
             ("DELETE", Target::Object(key), false) => self.delete_object(&key).await,
             ("DELETE", Target::Object(key), true) => self.abort_upload(query, &key).await,
             ("POST", Target::Object(key), true) if query.has("uploads") => {
@@ -272,13 +275,19 @@ impl Server {
         Ok(answer(StatusCode::OK, &headers, Bytes::new()))
     }
 
-    async fn put_object(&self, parts: &Parts, key: &str, body: Bytes) -> Result<Answer, S3Error> {
+    async fn put_object(
+        &self,
+        parts: &Parts,
+        key: &str,
+        body: Bytes,
+        hot_only: bool,
+    ) -> Result<Answer, S3Error> {
         refuse_reserved(key)?;
         let if_match = header(&parts.headers, "if-match");
         match (if_match, header(&parts.headers, "if-none-match")) {
             (Some(tag), _) => self.replace_object(key, tag).await,
             (None, None | Some("*")) => {
-                self.put_detached(key, body).await?;
+                self.put_detached(key, body, hot_only).await?;
                 Ok(answer(StatusCode::OK, &[], Bytes::new()))
             }
             (None, Some(_)) => Err(S3Error::unsupported("only If-None-Match: * is supported")),
@@ -306,9 +315,16 @@ impl Server {
     }
 
     /// Creates the object in the backend, and goes on to the end if the request is dropped.
-    async fn put_detached(&self, key: &str, body: Bytes) -> Result<(), S3Error> {
+    async fn put_detached(&self, key: &str, body: Bytes, hot_only: bool) -> Result<(), S3Error> {
         let (backend, key) = (Arc::clone(&self.backend), key.to_owned());
-        let put = detached(async move { backend.put(&key, body).await }).await;
+        let put = detached(async move {
+            if hot_only {
+                backend.put_hot_only(&key, body).await
+            } else {
+                backend.put(&key, body).await
+            }
+        })
+        .await;
         put.map_err(S3Error::from)
     }
 

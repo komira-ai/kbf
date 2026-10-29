@@ -170,10 +170,13 @@ fn refuse_reserved(key: &str) -> Result<(), Error> {
 ///   before its journal object was written leaves the object in the hot tier with no entry:
 ///   it is never copied or evicted, and a retry of the put is refused as existing. Bound the
 ///   calls inside the backends rather than dropping a put.
-/// - The checks and the write of a put are not atomic. Two proxies that put the same key
-///   at once, one to the hot tier and one (the hot tier being full for it) to the cold tier,
-///   may both succeed; the reconciler then counts the cold tier's object as the copy of the
-///   hot tier's, and the object of the cold tier is the one that stays.
+/// - The checks and the write of a put are not atomic. Two puts of the same key at once, one to
+///   the hot tier and one (the hot tier being full for it, or having just said so) to the cold
+///   tier, may both succeed, whether through one proxy or two; a presigned PUT of the S3 front
+///   never takes that path ([`Backend::put_hot_only`] answers [`Error::Full`] instead), so the
+///   hot tier's create-only write alone decides it. For the other keys the race remains: the
+///   reconciler then counts the cold tier's object as the copy of the hot tier's, and the object
+///   of the cold tier is the one that stays.
 /// - A get that copies an object back into the hot tier while it is deleted may put it back
 ///   there, with a put entry after the delete entry.
 pub struct Proxy {
@@ -383,13 +386,17 @@ impl Inner {
         self.cold.complete_upload(key, id, parts).await
     }
 
-    async fn put_hot(&self, key: &str, body: Bytes) -> Result<(), Error> {
+    async fn put_hot(&self, key: &str, body: Bytes, hot_only: bool) -> Result<(), Error> {
         let size = body.len() as u64;
         let stored = match self.hot.put(key, body.clone()).await {
             Ok(()) => self.journal_put(key, size).await,
             failed => failed,
         };
         match stored {
+            Err(Error::Full(_)) if hot_only => {
+                self.latch_full();
+                Err(Error::Full(key.to_owned()))
+            }
             Err(Error::Full(_)) => {
                 self.latch_full();
                 self.put_cold(key, body).await
@@ -398,7 +405,7 @@ impl Inner {
         }
     }
 
-    async fn put_object(&self, key: &str, body: Bytes) -> Result<(), Error> {
+    async fn put_object(&self, key: &str, body: Bytes, hot_only: bool) -> Result<(), Error> {
         refuse_reserved(key)?;
         match self.cold.head(key).await {
             Ok(_) => return Err(Error::AlreadyExists(key.to_owned())),
@@ -406,12 +413,13 @@ impl Inner {
             Err(error) => return Err(error),
         }
         match self.level().await {
+            Level::Full if hot_only => Err(Error::Full(key.to_owned())),
             Level::Full => self.put_cold(key, body).await,
             Level::Critical => {
                 tokio::time::sleep(self.config.back_pressure).await;
-                self.put_hot(key, body).await
+                self.put_hot(key, body, hot_only).await
             }
-            Level::Open => self.put_hot(key, body).await,
+            Level::Open => self.put_hot(key, body, hot_only).await,
         }
     }
 
@@ -522,7 +530,11 @@ fn merge(in_hot: Vec<Listed>, in_cold: Vec<Listed>, max_keys: usize) -> Vec<List
 #[async_trait]
 impl Backend for Proxy {
     async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
-        self.inner.put_object(key, body).await
+        self.inner.put_object(key, body, false).await
+    }
+
+    async fn put_hot_only(&self, key: &str, body: Bytes) -> Result<(), Error> {
+        self.inner.put_object(key, body, true).await
     }
 
     /// The proxy keeps objects immutable: it never replaces one.

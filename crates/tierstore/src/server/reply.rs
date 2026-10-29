@@ -178,6 +178,10 @@ impl From<Error> for S3Error {
             Error::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable"),
             Error::Other(_) => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
         };
-        Self::new(status, code, error.to_string())
+        let mut refusal = Self::new(status, code, error.to_string());
+        if matches!(error, Error::Full(_)) {
+            refusal.headers.push(("retry-after", "1".to_owned()));
+        }
+        refusal
     }
 }

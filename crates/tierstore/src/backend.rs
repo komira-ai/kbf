@@ -130,6 +130,18 @@ pub trait Backend: Send + Sync {
     /// [`Error::Full`] if the backend has no room for the object.
     async fn put(&self, key: &str, body: Bytes) -> Result<(), Error>;
 
+    /// [`Backend::put`] for a writer that cannot be trusted to race: a backend with more than one
+    /// tier writes the object to its first tier only, and answers [`Error::Full`] and stores
+    /// nothing when that tier has no room, so that one create-only write into one tier decides
+    /// which of two concurrent puts of a key wins. The default is [`Backend::put`], for a backend
+    /// with one place to put an object.
+    ///
+    /// # Errors
+    /// As [`Backend::put`].
+    async fn put_hot_only(&self, key: &str, body: Bytes) -> Result<(), Error> {
+        self.put(key, body).await
+    }
+
     /// Replaces the object, only if its content tag is `etag` (`If-Match`), and gives the
     /// content tag of the new object.
     ///

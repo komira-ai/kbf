@@ -51,8 +51,10 @@
 //! GetObject, HeadObject, ListObjectsV2 and HeadBucket and nothing else. Any other call signed
 //! by a read-only key (a put, a delete, CreateBucket, and every call of a multipart upload) is
 //! answered 403 `AccessDenied` with the S3 error document before its body is read, and changes
-//! nothing. The roles of those keys are of the key and not of a prefix. A credential that may write one
-//! object under a prefix, and expires, is a presigned PUT URL: see [`presign`], and
+//! nothing. The roles of those keys are of the key and not of a prefix. A put by the full key
+//! is create-only but, when the hot tier is full, can race another put of the same key into the
+//! cold tier (see [`Proxy`](crate::Proxy)); a presigned PUT never goes to the cold tier.
+//! A credential that may write one object under a prefix, and expires, is a presigned PUT URL: see [`presign`], and
 //! [`ServerConfig::presign_keys`] for the keys that sign them (`--presign-key-file` in the binary).
 //!
 //! # Checksums
@@ -599,7 +601,9 @@ impl Server {
             limit.min(usize::try_from(grant.max_object_bytes).unwrap_or(usize::MAX))
         });
         let reader = Reader::new(body, limit, self.config.body_idle_timeout);
-        self.dispatch(parts, target, &query, reader, check).await
+        let hot_only = signed.presign.is_some();
+        self.dispatch(parts, target, &query, reader, check, hot_only)
+            .await
     }
 
     /// The answer to a health or readiness probe, which are not signed.
