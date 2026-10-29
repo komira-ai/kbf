@@ -51,6 +51,8 @@ mod failed_tests;
 #[cfg(test)]
 mod host_tests;
 #[cfg(test)]
+mod learning_tests;
+#[cfg(test)]
 mod load_tests;
 #[cfg(test)]
 mod report_hooks_tests;
