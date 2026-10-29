@@ -18,21 +18,31 @@
 # pull request's run is skipped without queueing a runner). The merge queue is unchanged.
 #
 # On a pull request or in the merge queue this is a build check: everything is built,
-# signed, packaged and summed, and nothing is attested. On a push to main this workflow is the
-# second stage of the one pipeline (pipeline.yml calls it, `workflow_call`, after ci): the
-# attest jobs sign build provenance for every file and an SBOM
-# attestation for every tarball, per platform group (Linux does not wait for the macOS
-# runners), and the verify jobs then check them, for the branch
-# that was pushed, as the planned deployment job is to. In a called workflow `github.event_name`
-# and `github.ref` are the caller's, so a call from the pipeline reads as the push it is. Only
-# attest may hold `id-token:
+# signed, packaged and summed, and nothing is attested. On a push to main the pipeline
+# (pipeline.yml) calls this workflow twice (`workflow_call`), with the input `stage`:
+#   - `build` (job `artifacts`, beside ci): the build and sums jobs run, so the builds start with ci
+#     instead of after it; nothing is attested and the call holds no
+#     signing scope;
+#   - `sign` (job `artifacts-sign`, which needs ci and the build call): only the attest jobs and
+#     the verify jobs run. They sign build provenance for every file and an SBOM attestation for
+#     every tarball, per platform group (Linux does not wait for the macOS runners), and then
+#     check them, for the branch that was pushed, as the planned deployment job is to. They read
+#     the files and the SHA256SUMS the build call uploaded to the same run, by name. A commit that
+#     fails ci is therefore built but never signed.
+# The attest jobs are in THIS file for one reason: the signer identity of an attestation is the
+# workflow file that ran the signing step, and the installers verify exactly
+# `.github/workflows/artifacts.yml` (crates/kbf-installer/src/attest.rs, crates/kbf-host-install).
+# Without `stage` (pull request, merge queue) the build and sums jobs run as above and the attest
+# and verify jobs never do. In a called workflow `github.event_name` and `github.ref` are the
+# caller's, so a call from the pipeline reads as the push it is. Only attest may hold `id-token:
 # write` and `attestations: write`, and only under its exact `if:` (the workflow lint,
 # crates/kbf-integration-test/tests/workflows, requires both; crates/kbf-integration-test/tests/release_artifacts
-# pins the set of files built and attested). The pipeline grants the scopes to its call of this
-# workflow and no other; the jobs here still ask for only their own.
+# pins the set of files built and attested; tests/pipeline_workflow requires every other job to
+# exclude the sign stage). The pipeline grants the scopes to its sign call alone; the jobs here
+# still ask for only their own.
 #
 # The files are kept as workflow artifacts for 90 days, GitHub's limit. The next stages of the
-# pipeline read them from the same run (beta installs and tests the kbf of the linux-x86_64
+# pipeline read them from the same run (smoke installs and tests the kbf of the linux-x86_64
 # tarball), and the release (release.yml, started by the pipeline's success) attaches these
 # exact files for a commit on main, checked again against these attestations as
 # refs/heads/main's, and never rebuilds. The
@@ -46,6 +56,12 @@ on:
     types: [opened, synchronize, reopened, labeled]
   merge_group:
   workflow_call:
+    inputs:
+      stage:
+        description: "'build' or 'sign' from the pipeline, empty otherwise"
+        type: string
+        required: false
+        default: ''
 
 permissions: {}
 
@@ -54,7 +70,9 @@ permissions: {}
 # check, not the release pipeline: it has its own group per pull request, and a newer run of the
 # same pull request replaces its older one. Called from the pipeline, the group is the run's
 # own: what cancels a superseded push is the pipeline's group (pipeline.yml), so this one never
-# holds up a newer push.
+# holds up a newer push. The pipeline's two calls (build, sign) share that one group and
+# `cancel-in-progress` is false, so neither cancels the other; the sign call waits for the build
+# call anyway (it needs it), so the group never holds it up.
 concurrency:
   group: artifacts-${{ github.event_name == 'pull_request' && format('pr-{0}', github.ref) || github.event_name == 'merge_group' && 'merge-queue' || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -96,7 +114,7 @@ jobs:
   darwin-arm64:
     # A pull request builds it only with the label `needs-artifacts`, like every job here:
     # nothing is attested from a pull request and the macOS runners are the scarce ones.
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts')) && inputs.stage != 'sign' }}
     runs-on: macos-15
     timeout-minutes: 45
     permissions:
@@ -237,7 +255,7 @@ jobs:
   # glibc: the binaries need the glibc of the runner image they were built on (Ubuntu
   # 24.04) or newer.
   linux-x86_64:
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts')) && inputs.stage != 'sign' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -448,7 +466,7 @@ jobs:
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   linux-arm64:
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts')) && inputs.stage != 'sign' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     permissions:
@@ -667,7 +685,7 @@ jobs:
   # SHA256SUMS over the Linux files (both architectures), as `sums` is over all.
   sums-linux:
     needs: [linux-x86_64, linux-arm64]
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts')) && inputs.stage != 'sign' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -695,7 +713,7 @@ jobs:
   # SHA256SUMS over the macOS files.
   sums-darwin-arm64:
     needs: [darwin-arm64]
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts')) && inputs.stage != 'sign' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -725,7 +743,7 @@ jobs:
   # without the label excepted, once every platform is built. Nothing waits for it: attestation is per platform, below.
   sums:
     needs: [darwin-arm64, linux-x86_64, linux-arm64]
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts')) && inputs.stage != 'sign' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -757,8 +775,7 @@ jobs:
   # names each bundle. The Linux sums job checked these files against its SHA256SUMS; the Linux
   # verify job checks what it signs.
   attest-linux:
-    needs: [sums-linux]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -1075,8 +1092,7 @@ jobs:
   # names each bundle. The macOS sums job checked these files against its SHA256SUMS; the macOS
   # verify job checks what it signs.
   attest-darwin-arm64:
-    needs: [sums-darwin-arm64]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -1193,7 +1209,7 @@ jobs:
   # (`--commit "$GITHUB_SHA"`), with the flags a host's installer uses.
   verify-linux:
     needs: [attest-linux]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -1256,7 +1272,7 @@ jobs:
   # Each tarball and the package is also verified against its own bundle; see verify-linux.
   verify-darwin-arm64:
     needs: [attest-darwin-arm64]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:

@@ -168,6 +168,26 @@ pub fn job_uses(text: &str, job: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// The inputs the job `job` passes to the reusable workflow it calls (`with:`) as `(name,
+/// value)`; empty without one. An error when it is not a mapping of strings.
+pub fn job_with(text: &str, job: &str) -> Result<Vec<(String, String)>, String> {
+    let root = yaml::load(text)?;
+    let found = job_of(&root, job)?;
+    match get(found, "with").map(|w| &w.value) {
+        None => Ok(Vec::new()),
+        Some(Value::Map(with)) => with
+            .iter()
+            .map(|(k, v)| match (k.as_str(), v.as_str()) {
+                (Some(k), Some(v)) => Ok((k.to_owned(), v.to_owned())),
+                _ => Err(format!(
+                    "a `with` entry of job `{job}` is not a string pair"
+                )),
+            })
+            .collect(),
+        Some(_) => Err(format!("the `with` of job `{job}` is not a mapping")),
+    }
+}
+
 /// The workflow's own top-level `concurrency:` as `(group, cancel-in-progress)`, both as
 /// written (`(absent)` for a missing cancel); `None` without one. An error when it is not a mapping of strings with a `group`.
 pub fn concurrency(text: &str) -> Result<Option<(String, String)>, String> {

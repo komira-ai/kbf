@@ -77,22 +77,43 @@ fn the_real_pipeline_meets_every_rule() {
 }
 
 #[test]
-fn the_pipeline_runs_ci_and_beta_together_and_smoke_after_artifacts_after_ci() {
-    // Catches: a stage that can start before the one it follows (so smoke could test files that
-    // are not built yet, or artifacts sign a commit that failed the gate), a beta that waits for
-    // a stage it does not need (an hour added to the lane), a stage calling another workflow, and
-    // a stage added or reordered.
+fn the_builds_start_with_ci_signing_needs_ci_and_the_build_and_smoke_needs_the_signing() {
+    // Catches: a build that waits for ci again (the 50 minutes this ordering removes), a signing
+    // call that can start before ci or before the files are built (an unsigned or failed commit
+    // signed, or nothing to sign), a smoke that can start before the files are signed, a beta
+    // that waits for a stage it does not need (an hour added to the lane), a stage calling
+    // another workflow, and a stage added or reordered.
     red(
-        &plant("pipeline.yml", "    needs: [ci]\n", "    needs: []\n"),
-        "the job `artifacts` needs [], not [\"ci\"]",
+        &plant(
+            "pipeline.yml",
+            "  artifacts:\n    if:",
+            "  artifacts:\n    needs: [ci]\n    if:",
+        ),
+        "the job `artifacts` needs [\"ci\"], not []",
     );
     red(
         &plant(
             "pipeline.yml",
+            "    needs: [ci, artifacts]\n",
             "    needs: [artifacts]\n",
+        ),
+        "the job `artifacts-sign` needs [\"artifacts\"], not [\"ci\", \"artifacts\"]",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "    needs: [ci, artifacts]\n",
             "    needs: [ci]\n",
         ),
-        "the job `smoke` needs [\"ci\"], not [\"artifacts\"]",
+        "the job `artifacts-sign` needs [\"ci\"], not [\"ci\", \"artifacts\"]",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "    needs: [artifacts-sign]\n",
+            "    needs: [artifacts]\n",
+        ),
+        "the job `smoke` needs [\"artifacts\"], not [\"artifacts-sign\"]",
     );
     red(
         &plant(
@@ -121,6 +142,121 @@ fn the_pipeline_runs_ci_and_beta_together_and_smoke_after_artifacts_after_ci() {
 }
 
 #[test]
+fn the_two_calls_of_artifacts_differ_by_their_stage_input() {
+    // Catches: a call whose stage is swapped, missing or extended (the build call would sign, or
+    // the sign call would rebuild), so the order of the pipeline and the jobs that ran disagree.
+    red(
+        &plant(
+            "pipeline.yml",
+            "      stage: build\n",
+            "      stage: sign\n",
+        ),
+        "the job `artifacts` passes [(\"stage\", \"sign\")], not exactly `stage: build`",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "      stage: sign\n",
+            "      stage: build\n",
+        ),
+        "the job `artifacts-sign` passes [(\"stage\", \"build\")], not exactly `stage: sign`",
+    );
+    red(
+        &plant("pipeline.yml", "    with:\n      stage: build\n", ""),
+        "the job `artifacts` passes [], not exactly `stage: build`",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "      stage: sign\n",
+            "      stage: sign\n      extra: x\n",
+        ),
+        "the job `artifacts-sign` passes",
+    );
+}
+
+#[test]
+fn artifacts_yml_is_called_by_exactly_the_build_and_the_sign_job() {
+    // Catches: a third call of artifacts.yml (from release.yml or the pipeline), or one of the two
+    // calls pointed at another file, so a push to main would build or sign twice, or not at all.
+    red(
+        &plant(
+            "release.yml",
+            "\njobs:\n",
+            "\njobs:\n  again:\n    uses: ./.github/workflows/artifacts.yml\n",
+        ),
+        "artifacts.yml is called by [\"pipeline.yml#artifacts\", \"pipeline.yml#artifacts-sign\", \"release.yml#again\"]",
+    );
+    red(
+        &plant(
+            "pipeline.yml",
+            "  artifacts-sign:\n    needs: [ci, artifacts]\n    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n    uses: ./.github/workflows/artifacts.yml\n",
+            "  artifacts-sign:\n    needs: [ci, artifacts]\n    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n    uses: ./.github/workflows/ci.yml\n",
+        ),
+        "artifacts.yml is called by [\"pipeline.yml#artifacts\"], not by",
+    );
+}
+
+#[test]
+fn only_the_sign_stage_runs_the_signing_jobs_and_it_runs_nothing_else() {
+    // Catches: a signing job that the build call (or a pull request) can run (signing a commit
+    // before ci has passed), a verify job outside the sign stage, a build or sums job that the
+    // sign call would run again (a rebuild, or a second set of files under the same names), an
+    // attest job that needs a job the sign call skips (it would be skipped and nothing signed,
+    // with the pipeline green), and a new job without a stage condition.
+    let stage = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}";
+    let push = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
+    red(
+        &plant(
+            "artifacts.yml",
+            &format!("  attest-linux:\n    if: {stage}\n"),
+            &format!("  attest-linux:\n    if: {push}\n"),
+        ),
+        "the job `attest-linux` of artifacts.yml holds a signing scope and has `if:",
+    );
+    red(
+        &plant(
+            "artifacts.yml",
+            &format!("  verify-darwin-arm64:\n    needs: [attest-darwin-arm64]\n    if: {stage}\n"),
+            &format!("  verify-darwin-arm64:\n    needs: [attest-darwin-arm64]\n    if: {push}\n"),
+        ),
+        "the job `verify-darwin-arm64` of artifacts.yml verifies and has `if:",
+    );
+    red(
+        &plant(
+            "artifacts.yml",
+            "  sums-linux:\n    needs: [linux-x86_64, linux-arm64]\n    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts')) && inputs.stage != 'sign' }}\n",
+            "  sums-linux:\n    needs: [linux-x86_64, linux-arm64]\n    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts') }}\n",
+        ),
+        "the job `sums-linux` of artifacts.yml has `if:",
+    );
+    red(
+        &plant(
+            "artifacts.yml",
+            "  sums:\n    needs: [darwin-arm64, linux-x86_64, linux-arm64]\n    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts')) && inputs.stage != 'sign' }}\n",
+            "  sums:\n    needs: [darwin-arm64, linux-x86_64, linux-arm64]\n",
+        ),
+        "the job `sums` of artifacts.yml has `if: (none)`",
+    );
+    red(
+        &plant(
+            "artifacts.yml",
+            "  attest-linux:\n",
+            "  attest-linux:\n    needs: [sums-linux]\n",
+        ),
+        "the job `attest-linux` of artifacts.yml needs `sums-linux`, which the sign call skips",
+    );
+    red(
+        &plant(
+            "artifacts.yml",
+            "\njobs:\n",
+            "\njobs:\n  extra:\n    runs-on: ubuntu-24.04\n    steps: []\n",
+        ),
+        "the job `extra` of artifacts.yml has `if: (none)`",
+    );
+}
+
+#[test]
 fn a_stage_that_can_be_skipped_or_continue_after_red_is_refused() {
     // Catches: a skipped stage (a skipped job counts as success for the jobs after it and for
     // the run), `always()`, `failure()`, `cancelled()` and `continue-on-error`: a red or
@@ -128,8 +264,8 @@ fn a_stage_that_can_be_skipped_or_continue_after_red_is_refused() {
     red(
         &plant(
             "pipeline.yml",
-            "  smoke:\n    needs: [artifacts]\n",
-            "  smoke:\n    needs: [artifacts]\n    if: ${{ github.event.before != '' }}\n",
+            "  smoke:\n    needs: [artifacts-sign]\n",
+            "  smoke:\n    needs: [artifacts-sign]\n    if: ${{ github.event.before != '' }}\n",
         ),
         "the job `smoke` has `if:",
     );
@@ -152,15 +288,15 @@ fn a_stage_that_can_be_skipped_or_continue_after_red_is_refused() {
     red(
         &plant(
             "pipeline.yml",
-            "  artifacts:\n    needs: [ci]\n    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n",
-            "  artifacts:\n    needs: [ci]\n    if: ${{ always() && github.event_name == 'push' }}\n",
+            "  artifacts:\n    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n",
+            "  artifacts:\n    if: ${{ always() && github.event_name == 'push' }}\n",
         ),
         "uses `always()`",
     );
     red(
         &plant(
             "pipeline.yml",
-            "  smoke:\n    needs: [artifacts]\n",
+            "  smoke:\n    needs: [artifacts-sign]\n",
             "  smoke:\n    needs: [artifacts]\n    continue-on-error: true\n",
         ),
         "uses `continue-on-error`",
@@ -175,15 +311,15 @@ fn the_run_is_green_only_when_every_stage_is() {
     red(
         &plant(
             "pipeline.yml",
-            "    needs: [ci, beta, artifacts, smoke]\n",
-            "    needs: [ci, artifacts, smoke]\n",
+            "    needs: [ci, beta, artifacts, artifacts-sign, smoke]\n",
+            "    needs: [ci, artifacts, artifacts-sign, smoke]\n",
         ),
         "the job `passed` needs",
     );
     red(
         &plant(
             "pipeline.yml",
-            "    needs: [ci, beta, artifacts, smoke]\n",
+            "    needs: [ci, beta, artifacts, artifacts-sign, smoke]\n",
             "    needs: [ci, beta, artifacts, smoke, watch]\n",
         ),
         "the job `passed` needs",
@@ -342,7 +478,7 @@ fn a_push_to_main_runs_each_check_once() {
             "\njobs:\n",
             "\njobs:\n  again:\n    uses: ./.github/workflows/ci.yml\n",
         ),
-        "ci.yml is called by [\"pipeline.yml\", \"release.yml\"]",
+        "ci.yml is called by [\"pipeline.yml#ci\", \"release.yml#again\"]",
     );
     red(
         &plant(
@@ -520,14 +656,29 @@ fn a_called_workflow_never_asks_for_more_than_its_caller_grants() {
         ),
         "the job `mixed-version` of beta.yml asks for `attestations: read`",
     );
-    red(
-        &plant(
-            "pipeline.yml",
-            "      attestations: write\n",
-            "      attestations: read\n",
-        ),
-        "the job `attest-linux` of artifacts.yml asks for `attestations: write`",
-    );
+    // Both calls are checked: GitHub compares the permissions of a called workflow's jobs with
+    // the caller's grant whether or not the job runs in that call.
+    for stage in ["build", "sign"] {
+        let job = if stage == "build" {
+            "artifacts"
+        } else {
+            "artifacts-sign"
+        };
+        red(
+            &plant(
+                "pipeline.yml",
+                &format!(
+                    "      stage: {stage}\n    permissions:\n      contents: read\n      id-token: write\n      attestations: write\n"
+                ),
+                &format!(
+                    "      stage: {stage}\n    permissions:\n      contents: read\n      id-token: write\n      attestations: read\n"
+                ),
+            ),
+            &format!(
+                "the job `attest-linux` of artifacts.yml asks for `attestations: write`, but the job `{job}` of pipeline.yml"
+            ),
+        );
+    }
     red(
         &plant(
             "ci.yml",
@@ -544,9 +695,13 @@ fn no_stage_passes_secrets_to_its_workflow() {
     // which would put the release bot's key in a run a newer push cancels.
     for (call, next) in [
         ("  ci:\n    uses: ./.github/workflows/ci.yml\n", "ci"),
-        ("  artifacts:\n    needs: [ci]\n", "artifacts"),
+        ("  artifacts:\n", "artifacts"),
+        (
+            "  artifacts-sign:\n    needs: [ci, artifacts]\n",
+            "artifacts-sign",
+        ),
         ("  beta:\n    uses: ./.github/workflows/beta.yml\n", "beta"),
-        ("  smoke:\n    needs: [artifacts]\n", "smoke"),
+        ("  smoke:\n    needs: [artifacts-sign]\n", "smoke"),
     ] {
         red(
             &plant(
