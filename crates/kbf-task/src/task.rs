@@ -36,7 +36,7 @@ use crate::manifest::{
 };
 use crate::outputs::{OutputLimits, collect_outputs};
 use crate::pack::{Blob, MAX_PACK_BYTES, PackError, pack};
-use crate::put::{PutError, agent, put, tls_config};
+use crate::put::{PutError, agent, agent_with_plain_http, put, tls_config};
 use crate::run::{Run, RunError, output_paths, run};
 
 /// Exit code: an input could not be read, checked or laid out.
@@ -95,6 +95,11 @@ pub struct Cli {
     /// (komira-ai/kbf#1934).
     #[arg(long)]
     pub insecure_argv_secrets: bool,
+    /// PUT the pack to an `http` URL as well as an `https` one: for a store reached over a private
+    /// network without TLS, where the presigned signature crosses that network in the clear. Without
+    /// it, only `https` URLs are used. Blobs are read over `https` either way.
+    #[arg(long)]
+    pub allow_plain_http_put: bool,
     /// The lease id the frontend gave; it is copied into the manifest.
     #[arg(long)]
     pub lease: String,
@@ -383,7 +388,11 @@ fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
     }
     let source = HttpBlobSource::new(&cli.grant_url, &token, &roots)?;
     let sink = HttpSink {
-        agent: agent(Some(tls_config(&roots))),
+        agent: if cli.allow_plain_http_put {
+            agent_with_plain_http(tls_config(&roots))
+        } else {
+            agent(Some(tls_config(&roots)))
+        },
         url,
     };
     Ok((source, sink))

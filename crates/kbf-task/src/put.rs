@@ -114,6 +114,18 @@ pub fn tls_config(roots: &[Vec<u8>]) -> ureq::tls::TlsConfig {
 /// URLs. With `Some(tls)` only `https` URLs are used, so the signature never travels in the
 /// clear; `None` trusts nothing and reaches only `http` URLs (tests).
 pub fn agent(tls: Option<ureq::tls::TlsConfig>) -> ureq::Agent {
+    let https_only = tls.is_some();
+    build(tls, https_only)
+}
+
+/// [`agent`] with `tls` for `https` URLs that also reaches `http` URLs: for a store reached over a
+/// private network without TLS, where the presigned signature crosses that network in the clear.
+/// The caller opts in explicitly (`--allow-plain-http-put`).
+pub fn agent_with_plain_http(tls: ureq::tls::TlsConfig) -> ureq::Agent {
+    build(Some(tls), false)
+}
+
+fn build(tls: Option<ureq::tls::TlsConfig>, https_only: bool) -> ureq::Agent {
     let mut config = ureq::Agent::config_builder()
         .proxy(None)
         .max_redirects(0)
@@ -121,7 +133,7 @@ pub fn agent(tls: Option<ureq::tls::TlsConfig>) -> ureq::Agent {
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_global(Some(PUT_TIMEOUT));
     if let Some(tls) = tls {
-        config = config.tls_config(tls).https_only(true);
+        config = config.tls_config(tls).https_only(https_only);
     }
     config.build().into()
 }
@@ -349,6 +361,17 @@ mod tests {
         let err = put(&agent, "http://127.0.0.1:9/k?X-Sig=secret", b"x").unwrap_err();
         assert!(matches!(err, PutError::Transport { .. }), "{err:?}");
         assert!(!err.to_string().contains("secret"), "{err}");
+    }
+
+    #[test]
+    fn the_plain_http_agent_reaches_an_http_store() {
+        let (base, server) = serve(201);
+        let url = format!("{base}/pack/key?X-Sig=secret");
+        let agent = agent_with_plain_http(tls_config(&[]));
+        assert_eq!(put(&agent, &url, b"pack"), Ok(()));
+        let seen = server.join().expect("server");
+        assert_eq!(seen.header("if-none-match"), Some("*"));
+        assert_eq!(seen.body, b"pack");
     }
 
     #[test]

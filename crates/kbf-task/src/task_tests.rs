@@ -577,6 +577,31 @@ fn connect_reads_the_token_file_and_the_extra_roots() {
     assert!(!url_file.exists());
 }
 
+/// Catches the plain-HTTP opt-in being ignored: without `--allow-plain-http-put` the sink refuses
+/// an `http` URL before connecting; with it, the sink reaches an `http` store.
+#[test]
+fn the_plain_http_opt_in_lets_the_sink_reach_an_http_store() {
+    let dir = scratch("plain-http");
+    let digest = Digest::from(BlobId::of(b"a"));
+    let mut flags = cli(&dir, digest);
+    std::fs::write(dir.join("token"), "tok\n").expect("write");
+    flags.grant_token_file = Some(dir.join("token"));
+    let url_file = dir.join("url");
+    flags.pack_url_file = Some(url_file.clone());
+    // Nothing listens at port 9: a refusal before connecting is a different error from a failed
+    // connection, which is what the opt-in leads to.
+    let http = "http://127.0.0.1:9/pack?sig=s\n";
+    std::fs::write(&url_file, http).expect("write");
+    let (_, sink) = connect(&flags).expect("connect");
+    let refused = sink.store(b"x").expect_err("https only");
+    flags.allow_plain_http_put = true;
+    std::fs::write(&url_file, http).expect("write");
+    let (_, sink) = connect(&flags).expect("connect");
+    let failed = sink.store(b"x").expect_err("nothing listens");
+    assert_ne!(refused.to_string(), failed.to_string());
+    assert!(!failed.to_string().contains("sig=s"), "{failed}");
+}
+
 #[test]
 fn connect_refuses_a_url_file_it_cannot_remove() {
     use std::os::unix::fs::PermissionsExt as _;
