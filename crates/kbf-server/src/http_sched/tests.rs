@@ -3,7 +3,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::Request;
 use kbf_front::Cache;
-use kbf_sched::{Avoided, LeasePhase, QueueGroup, WaitingGroup};
+use kbf_sched::{Avoided, LeasePhase, QueueGroup, Unservable, WaitingGroup};
 use kbf_types::{ActionKey, Digest, DigestFunction, FarmTime, OperationId, Qos, WorkKey};
 use tower_service::Service;
 
@@ -176,6 +176,13 @@ fn the_queue_body_has_the_documented_shape() {
         }],
         waiting: vec![WaitingGroup {
             reason: "none of the 2 live workers satisfies the action's platform".to_owned(),
+            cause: Unservable::PlatformMismatch {
+                serving: 2,
+                some_cannot_serve: false,
+                kind: kbf_types::LeaseKind::Action,
+                closest: kbf_types::WorkerId::new("a"),
+                lacks: vec!["os=macos".to_owned()],
+            },
             count: 4,
             example: OperationId(3),
             example_key: key(1),

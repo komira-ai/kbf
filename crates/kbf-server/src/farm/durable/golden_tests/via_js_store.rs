@@ -143,6 +143,15 @@ fn js_written() -> Arc<Fake> {
     let estimates = [(size_key(), size_summary())];
     apply(&store, KbfExt.put_estimates(Txn::new(), &estimates));
     apply(&store, Txn::new().put(ALIVE, Vec::new(), Cond::Any));
+    // Last, so that it moves no expiry: `js-store` has no seam for a wall time yet, and
+    // nothing wires it into the server. The row is put as the embedder will put it, so the
+    // bytes of the file are checked on both sides.
+    let wall = Txn::new().put(
+        opwall_key(OperationId(8)),
+        opwall::encode(WALL),
+        Cond::Absent,
+    );
+    apply(&store, wall);
     store
 }
 

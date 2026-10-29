@@ -60,20 +60,22 @@ impl Durable {
         request: &Request,
         subject: &Subject,
     ) -> Result<Submitted, StateError> {
-        self.submit_keyed(id, request, subject, None)
+        self.submit_keyed(id, request, subject, None, None)
     }
 
-    /// [`Durable::submit`], with the size key the operation is given, if any: written in
-    /// an `opkey/` row of the transaction that queues it.
+    /// [`Durable::submit`], with the size key and the longest wall time the operation is
+    /// given, if any: written in an `opkey/` and an `opwall/` row of the transaction that
+    /// queues it.
     pub(super) fn submit_keyed(
         &self,
         mut id: OperationId,
         request: &Request,
         subject: &Subject,
         size_key: Option<u64>,
+        max_wall: Option<Duration>,
     ) -> Result<Submitted, StateError> {
         if !request.joinable() {
-            self.submitted_keyed(id, request, subject, size_key)?;
+            self.submitted_keyed(id, request, subject, size_key, max_wall)?;
             return Ok(Submitted::Queued(id));
         }
         let pin = inflight_key(&request.key);
@@ -91,7 +93,7 @@ impl Durable {
                 // The operation it names is gone: the row is left over, and goes.
                 cond = Cond::Version(row.version);
             }
-            match self.submitted_pinned(id, request, subject, size_key, (&pin, cond)) {
+            match self.submitted_pinned(id, request, subject, size_key, max_wall, (&pin, cond)) {
                 Ok(()) => return Ok(Submitted::Queued(id)),
                 // Another writer queued this action since the look, or a row of an earlier
                 // writer is in the way of the id: look again, and try the next id of the
@@ -150,6 +152,11 @@ impl Durable {
             }
             None => None,
         };
+        let key = opwall_key(operation);
+        let max_wall = match self.store.get(&key)? {
+            Some(row) => Some(opwall::decode(&row.value).map_err(|why| corrupt(&key, why))?),
+            None => None,
+        };
         Ok(Some(StoredOperation {
             operation,
             request,
@@ -159,6 +166,7 @@ impl Durable {
             fate,
             subject,
             size_key,
+            max_wall,
         }))
     }
 

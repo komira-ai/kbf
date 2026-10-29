@@ -76,6 +76,7 @@ impl Farm {
     /// taken and no Execute is between its request and its queueing (the input check).
     #[must_use]
     pub fn quiet(&self) -> bool {
+        js_arm!(self, hot::quiet());
         let presubmit = self.cache.metrics().execute_presubmit_in_flight.get();
         let taking = u64::try_from(self.reports.load(Ordering::SeqCst)).unwrap_or(u64::MAX);
         presubmit + taking == 0
@@ -87,6 +88,7 @@ impl Farm {
     /// successor's work could depend on. What it already holds stays as it was, for
     /// [`Farm::follow`] to answer.
     pub fn fence(&self) {
+        js_arm!(self, lifecycle::fence());
         self.lock().engine.fenced = true;
     }
 
@@ -95,6 +97,7 @@ impl Farm {
     /// state store's as of the fence; the caller checks first that the store is still at
     /// the generation this process holds.
     pub fn resume(&self) {
+        js_arm!(self, lifecycle::resume());
         self.lock().engine.fenced = false;
     }
 
@@ -107,6 +110,7 @@ impl Farm {
     /// other frontends write ([`Farm::intake`]). Unlike [`Farm::fence`] it refuses nothing a
     /// node reports, so the executions that are running finish here. Nothing undoes it.
     pub fn close_intake(&self) {
+        js_arm!(self, lifecycle::close_intake());
         self.lock().engine.closed = true;
     }
 
@@ -114,6 +118,7 @@ impl Farm {
     /// holds it.
     #[must_use]
     pub fn superseded(&self) -> bool {
+        js_arm!(self, lifecycle::superseded());
         self.lock()
             .engine
             .durable
@@ -124,6 +129,7 @@ impl Farm {
     /// Worker streams open now.
     #[must_use]
     pub fn open_sessions(&self) -> usize {
+        js_arm!(self, views::open_sessions());
         self.lock().side.links.len()
     }
 
@@ -136,6 +142,7 @@ impl Farm {
     /// `deadline`; whatever is left is logged at ERROR, naming the operations. Returns
     /// the operations whose requeues were not written.
     pub async fn flush_unsettled(&self, deadline: Duration) -> Vec<OperationId> {
+        js_arm_async!(self, lifecycle::flush_unsettled(deadline));
         let until = tokio::time::Instant::now() + deadline;
         let (left, why) = loop {
             // The lock is not held across the sleep.
@@ -169,6 +176,7 @@ impl Farm {
     /// successor, once this process no longer accepts). Returns how many streams were
     /// still open.
     pub fn end_worker_streams(&self, status: &Status) -> usize {
+        js_arm!(self, hot::end_worker_streams(status));
         let state = self.lock();
         state
             .side
@@ -191,6 +199,7 @@ impl Farm {
     /// # Errors
     /// The state store cannot be read.
     pub fn follow(&self) -> Result<usize, StateError> {
+        js_arm!(self, lifecycle::follow());
         self.lock().follow()
     }
 
@@ -315,12 +324,13 @@ impl Engine {
         request: &kbf_sched::Request,
         subject: &crate::action_usage::Subject,
         size_key: Option<u64>,
+        max_wall: Option<Duration>,
         now: FarmTime,
     ) -> Result<Held, Status> {
         if self.fenced {
             return Err(Status::unavailable(HANDING_OVER));
         }
-        self.queue(a, request, subject, size_key, now)
+        self.queue(a, request, subject, size_key, max_wall, now)
     }
 
     /// The callers of `operation` still waiting: not answered, and with a stream open

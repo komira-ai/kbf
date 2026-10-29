@@ -310,7 +310,7 @@ fn whole_body(view: &WholeView) -> Value {
                     fields.insert("state".into(), json!("stopped"));
                 }
                 WholeState::Queued => {}
-                WholeState::Unservable { reason } => {
+                WholeState::Unservable { reason, .. } => {
                     fields.insert("state".into(), json!("unservable"));
                     fields.insert("unservable".into(), json!(reason));
                 }
