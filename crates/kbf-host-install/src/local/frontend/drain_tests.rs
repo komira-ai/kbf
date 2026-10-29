@@ -205,3 +205,13 @@ fn a_restart_policy_left_off_by_a_cut_short_drain_is_put_back_at_start() {
     assert_eq!(backend.recover_restart_policy(), Ok(None));
     assert_eq!(rig.steps().len(), before);
 }
+
+/// At start with no release on trial and no container of that name, there is nothing to put
+/// back: the lookup is the only call made to the runtime.
+#[test]
+fn nothing_is_restored_at_start_when_there_is_no_container() {
+    let rig = Rig::new("recover-none");
+    rig.world.0.borrow_mut().container = None;
+    assert_eq!(rig.backend().recover_restart_policy(), Ok(None));
+    assert!(rig.steps().is_empty());
+}

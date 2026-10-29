@@ -313,9 +313,10 @@ impl<S: ImageSource, R: Runtime, P: Probe> Frontend<S, R, P> {
         self.runtime.remove(name).map_err(say)?;
         self.runtime.run(&config.run, &trial.image).map_err(say)?;
         let deadline = unix_now() + window_secs;
-        if let Some(on) = record.pending.as_mut() {
-            on.deadline_unix = Some(deadline);
-        }
+        record.pending = Some(Trial {
+            deadline_unix: Some(deadline),
+            ..trial.clone()
+        });
         record.save(&self.record_file)?;
         self.wait_ready(config, &trial.commit)?;
         Ok(deadline)
