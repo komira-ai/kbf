@@ -18,6 +18,7 @@ use super::keys::Role;
 use super::reply::S3Error;
 use super::request::{header, query_pairs};
 use super::time::amz_date;
+use super::token::{self, Claims, EXPIRED};
 
 /// How far the time of a request may be from the server's, either way.
 const SKEW_MILLIS: u64 = 15 * 60 * 1000;
@@ -82,6 +83,10 @@ pub(crate) const READ_ONLY: Refusal = Refusal {
 pub(crate) struct Signed {
     pub(crate) payload: String,
     pub(crate) role: Role,
+    /// The claims of the token that signed it, if it was signed with one.
+    pub(crate) claims: Option<Claims>,
+    /// The most bytes of a request body, if the minting key of a token limits it.
+    pub(crate) max_body: Option<u64>,
 }
 
 impl From<Refusal> for S3Error {
@@ -199,6 +204,26 @@ fn string_to_sign(stamp: &str, auth: &Authorization<'_>, request: &str) -> Strin
     format!("AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{digest}")
 }
 
+/// The secret, role, claims and body limit of a key.
+type Granted = (String, Role, Option<Claims>, Option<u64>);
+
+/// The secret, the role and the claims of the access key `id`: a static key if the server has
+/// one with the id, else a token that one of its minting keys signed. A token that is refused,
+/// for any reason, is an unknown key, so that the answer does not tell a forger which part was
+/// wrong.
+fn credential(config: &ServerConfig, id: &str) -> Result<Granted, Refusal> {
+    if let Some((secret, role)) = config.key(id) {
+        return Ok((secret.to_owned(), role, None, None));
+    }
+    if !token::is_token_id(id) {
+        return Err(UNKNOWN_KEY);
+    }
+    let verified =
+        token::verify(&config.token_keys, id, config.clock.now()).map_err(|_| UNKNOWN_KEY)?;
+    let (claims, max) = (Some(verified.claims), verified.max_body);
+    Ok((verified.secret, Role::Scoped, claims, max))
+}
+
 /// Checks the signature of a request.
 ///
 /// Gives the value of its `x-amz-content-sha256` header, the hash of the body that the
@@ -210,10 +235,10 @@ fn string_to_sign(stamp: &str, auth: &Authorization<'_>, request: &str) -> Strin
 pub(crate) fn verify(config: &ServerConfig, parts: &Parts) -> Result<Signed, Refusal> {
     let text = header(&parts.headers, "authorization").ok_or(UNSIGNED)?;
     let auth = Authorization::parse(text).ok_or(MALFORMED)?;
-    let known = config.key(auth.key_id);
-    let (secret, role) = known
-        .filter(|_| auth.region == config.region)
-        .ok_or(UNKNOWN_KEY)?;
+    if auth.region != config.region {
+        return Err(UNKNOWN_KEY);
+    }
+    let (secret, role, claims, max_body) = credential(config, auth.key_id)?;
     if !REQUIRED.iter().all(|name| auth.signed.contains(name)) {
         return Err(WEAK);
     }
@@ -230,16 +255,21 @@ pub(crate) fn verify(config: &ServerConfig, parts: &Parts) -> Result<Signed, Ref
     let payload = header(&parts.headers, "x-amz-content-sha256");
     let payload = payload.ok_or(MALFORMED)?;
     let request = canonical_request(parts, &auth, payload).ok_or(MALFORMED)?;
-    let key = signing_key(secret, auth.date, auth.region);
+    let key = signing_key(&secret, auth.date, auth.region);
     let mut mac = keyed(&key);
     mac.update(string_to_sign(stamp, &auth, &request).as_bytes());
     let signature = hex::decode(auth.signature).ok();
     if signature.is_none_or(|tag| mac.verify_slice(&tag).is_err()) {
         return Err(MISMATCH);
     }
+    if claims.as_ref().is_some_and(|claims| claims.expired(now)) {
+        return Err(EXPIRED);
+    }
     Ok(Signed {
         payload: payload.to_owned(),
         role,
+        claims,
+        max_body,
     })
 }
 

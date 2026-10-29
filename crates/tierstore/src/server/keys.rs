@@ -75,6 +75,8 @@ pub(crate) enum Role {
     Full,
     /// GetObject, HeadObject, ListObjectsV2 and HeadBucket.
     ReadOnly,
+    /// A token: what it may do is in its claims, held to the call once the call is parsed.
+    Scoped,
 }
 
 impl Role {
@@ -170,13 +172,11 @@ fn from_lines(text: &str) -> Result<(String, String), &'static str> {
     }
 }
 
-/// The access key id and the secret access key in the file that the flag `flag` names, in
-/// either form (see the module docs).
+/// The text of the file that the flag `flag` names, if only its owner can read it.
 ///
 /// # Errors
-/// What is wrong with the file, led by the flag and the path: it cannot be read, a group or
-/// other permission bit is set, or its text is not a key in either form.
-pub(super) fn read_credentials(flag: &str, path: &Path) -> Result<(String, String), String> {
+/// It cannot be read, or a group or other permission bit is set; led by the flag and the path.
+pub(super) fn read_private_text(flag: &str, path: &Path) -> Result<String, String> {
     let shown = path.display();
     let fail = |why: &str| format!("{flag} {shown}: {why}");
     let meta = std::fs::metadata(path);
@@ -185,7 +185,18 @@ pub(super) fn read_credentials(flag: &str, path: &Path) -> Result<(String, Strin
         return Err(fail("others can read it; make it mode 0600"));
     }
     let text = std::fs::read_to_string(path);
-    let text = text.map_err(|why| fail(&why.to_string()))?;
+    text.map_err(|why| fail(&why.to_string()))
+}
+
+/// The access key id and the secret access key in the file that the flag `flag` names, in
+/// either form (see the module docs).
+///
+/// # Errors
+/// What is wrong with the file, led by the flag and the path: it cannot be read, a group or
+/// other permission bit is set, or its text is not a key in either form.
+pub(super) fn read_credentials(flag: &str, path: &Path) -> Result<(String, String), String> {
+    let fail = |why: &str| format!("{flag} {}: {why}", path.display());
+    let text = read_private_text(flag, path)?;
     let json = text.trim_start().starts_with('{');
     let pair = if json {
         from_json(&text)

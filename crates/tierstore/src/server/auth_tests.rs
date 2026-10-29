@@ -29,6 +29,8 @@ fn full(payload: &str) -> Signed {
     Signed {
         payload: payload.to_owned(),
         role: Role::Full,
+        claims: None,
+        max_body: None,
     }
 }
 
@@ -175,6 +177,8 @@ fn each_key_is_accepted_with_its_own_role() {
         let read_only = Signed {
             payload: EMPTY.to_owned(),
             role: Role::ReadOnly,
+            claims: None,
+            max_body: None,
         };
         assert_eq!(accepted, Ok(read_only), "{}", key.0);
     }

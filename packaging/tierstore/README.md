@@ -84,8 +84,29 @@ the key that `tierstore` checks only if it has exactly those two non-empty field
 file that has another field must be trimmed to be shared. `tierstore` takes the values of the
 JSON form as they are, without trimming. No message of the process carries a secret.
 
-A role belongs to a key, not to a prefix: a read-only key may read every object of the bucket,
-and there is no key yet that may write under one prefix only.
+A role belongs to a static key, not to a prefix: a read-only key may read every object of the bucket.
+A credential that is limited to a prefix is a token (below).
+
+## Tokens
+
+A token is a SigV4 credential that a minting key signed: its access key id carries the claims (role,
+operations, prefix, expiry) and a MAC, and its secret is derived from them, so any S3 client works
+with the pair as it is. The server keeps no token state. Give `--token-key-file` once for each
+minting key it accepts (during a rotation, the new key and the one it replaces); a token that names
+another key is refused. A minting key file is JSON, mode 0600, with a ceiling, and a file without one
+is refused at start:
+
+```json
+{"access_key_id": "jobs-mint", "secret_access_key": "at least 32 bytes",
+ "ceiling": {"prefix": "jobs/", "ops": ["create"], "max_ttl_secs": 3600, "max_object_bytes": null}}
+```
+
+A token whose claims exceed the ceiling of its key (a prefix not under the ceiling's, an operation
+it lacks, more time to live than `max_ttl_secs`) is refused even with a good MAC. `max_object_bytes`
+bounds each body (a put, a part) of a token of that key. `create` is a create-only put and the calls
+of a multipart upload; `read` is get, head and list (the listing prefix must be inside the token
+prefix); `delete` only for the gc role. `_journal/` and `_tiering/` are never reachable. The format
+of the id is in the docs of `tierstore::server::token`.
 
 A secret is never on the command line or in the environment: the process reads no environment
 variable, and the unit sets none.
@@ -100,6 +121,7 @@ The unit's `ExecStart=` is a complete command line. The flags to edit:
 | `--proxy-id` | names this process's journal and its lease in the hot tier; keep it across restarts, and give each process over the same tiers one of its own |
 | `--bucket` | the name of the one bucket clients see |
 | `--access-key-file`, `--read-only-key-file` | the full key, and (given once for each) the read-only keys; see above |
+| `--token-key-file` | a minting key, with its ceiling (given once for each key accepted); see Tokens |
 | `--hot`, `--cold` | the tiers: `s3:<bucket>` for a bucket of an S3-compatible store (also `dir:<path>` and `memory`; a `dir:` path must also be writable under `ProtectSystem=strict`, so add it to `ReadWritePaths=`) |
 | `--hot-endpoint`, `--cold-endpoint` | where the tier's store is, `http://host[:port]` (TLS is not built yet); `--hot-region` and `--cold-region` set the signing region of a tier, `us-east-1` if not given |
 | `--hot-bytes` | the bytes the hot tier is meant to hold; the water marks are shares of it (`--high-water`, `--low-water`, `--critical`) |
