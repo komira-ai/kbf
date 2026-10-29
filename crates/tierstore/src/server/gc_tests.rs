@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use hyper::Request;
 use kbf_testkit::dir::TestDir;
 
-use super::gc::{GcKey, NOT_ALLOWED, ensure_distinct, gc_keys, permit};
+use super::gc::{GcKey, NOT_ALLOWED, OUT_OF_SCOPE, ensure_distinct, gc_keys, permit};
+use super::presign::PresignError;
 use super::request::{Query, Target};
 
 const SECRET: &str = "gc-secret-0123456789";
@@ -129,4 +130,67 @@ fn a_gc_key_may_list_head_delete_and_abort_and_nothing_else() {
         assert_eq!(refused.code, "AccessDenied", "{method} {uri}");
     }
     assert_eq!(call("PUT", "/b/cas/b/x"), Err(NOT_ALLOWED));
+}
+
+/// Asserts that a key needs an id and a secret that are not empty and an id that a credential
+/// scope can carry: an empty id or secret, and an id with `/`, `,`, `=`, a space or a character
+/// that is not printable ASCII are each a key error, and a good one is made.
+#[test]
+fn a_gc_key_needs_a_plain_id_and_a_secret() {
+    for (id, secret) in [
+        ("", SECRET),
+        ("k", ""),
+        ("a/b", SECRET),
+        ("a,b", SECRET),
+        ("a=b", SECRET),
+        ("a b", SECRET),
+        ("a\tb", SECRET),
+        ("é", SECRET),
+    ] {
+        let made = GcKey::new(id, secret, "cas/b/");
+        assert!(
+            matches!(made, Err(PresignError::Key(_))),
+            "{id:?} {secret:?}"
+        );
+    }
+    assert!(GcKey::new("pack-gc", SECRET, "cas/b/").is_ok());
+}
+
+/// Asserts that a key or a list prefix that starts with the prefix of the key but is not a valid
+/// name is refused: a `..` or a `.` segment, a control character, a name over 1024 bytes. The
+/// names are given as they are after the path is decoded, so each is a name the check sees.
+#[test]
+fn a_name_under_the_prefix_that_is_not_a_valid_name_is_refused() {
+    let long = format!("cas/b/{}", "x".repeat(1100));
+    let bad = [
+        "cas/b/x/../y",
+        "cas/b/./y",
+        "cas/b/y/.",
+        "cas/b/y\u{7}",
+        "cas/b/y\0",
+        long.as_str(),
+    ];
+    for name in bad {
+        let (parts, ()) = Request::builder()
+            .method("DELETE")
+            .uri("/b/k")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let query = Query::parse(None).unwrap();
+        let target = Target::Object(name.to_owned());
+        let key = permit("cas/b/", &parts, &target, &query);
+        assert_eq!(key, Err(OUT_OF_SCOPE), "key {name:?}");
+        let (parts, ()) = Request::builder()
+            .method("GET")
+            .uri("/b")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let encoded: String = name.bytes().map(|byte| format!("%{byte:02X}")).collect();
+        let uri = format!("/b?list-type=2&prefix={encoded}");
+        let query = Query::parse(Some(uri.split_once('?').unwrap().1)).unwrap();
+        let listed = permit("cas/b/", &parts, &Target::Bucket, &query);
+        assert_eq!(listed, Err(OUT_OF_SCOPE), "list {name:?}");
+    }
 }

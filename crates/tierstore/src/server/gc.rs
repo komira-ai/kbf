@@ -38,8 +38,6 @@ use hyper::Method;
 use hyper::http::request::Parts;
 use serde::Deserialize;
 
-use crate::journal::is_reserved;
-
 use super::ServerConfig;
 use super::auth::Refusal;
 use super::keys::{AccessKey, read_private_text};
@@ -57,7 +55,7 @@ pub(crate) const NOT_ALLOWED: Refusal = Refusal {
     message: "Access Denied: this access key lists, heads and deletes under its prefix only.",
 };
 
-const OUT_OF_SCOPE: Refusal = Refusal {
+pub(crate) const OUT_OF_SCOPE: Refusal = Refusal {
     code: "AccessDenied",
     message: "Access Denied: the key, or the listing prefix, is outside the prefix of this access key.",
 };
@@ -180,17 +178,18 @@ pub(super) fn permit(
     target: &Target,
     query: &Query,
 ) -> Result<(), Refusal> {
+    // A name that starts with the prefix of a key is never one of the proxy's: the prefix of a key
+    // is neither under `_journal/` or `_tiering/` nor a prefix of either (`GcKey::new`).
     let inside = |name: &str| {
         let longer = name.len() > prefix.len() && name.starts_with(prefix);
-        if longer && !is_reserved(name) && check_name(name).is_ok() {
+        if longer && check_name(name).is_ok() {
             Ok(())
         } else {
             Err(OUT_OF_SCOPE)
         }
     };
     let within = |listed: &str| {
-        let reserved = is_reserved(listed);
-        if listed.starts_with(prefix) && !reserved && check_name(listed).is_ok() {
+        if listed.starts_with(prefix) && check_name(listed).is_ok() {
             Ok(())
         } else {
             Err(OUT_OF_SCOPE)
