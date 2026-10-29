@@ -209,6 +209,28 @@ async fn a_directory_that_cannot_be_synced_fails_the_call() {
     assert!(matches!(placed, Err(Error::Other(_))));
 }
 
+/// Asserts that a streamed put syncs the directory once the name is linked, and that when that
+/// sync fails it leaves no name and the retry succeeds. It would catch a streamed path that
+/// links without syncing the directory, or one that keeps the name after the error.
+#[tokio::test]
+async fn a_streamed_put_syncs_the_directory_and_undoes_the_name_when_it_fails() {
+    let (dir, backend, seen, switch) = switched(None, false, false);
+    backend.put_stream("k", None, part("abc")).await.unwrap();
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].dir, dir.path());
+        assert!(seen[0].names.contains(&"k".to_owned()));
+    }
+    switch.store(true, Ordering::SeqCst);
+    let failed = backend.put_stream("j", None, part("abc")).await;
+    assert!(matches!(failed, Err(Error::Other(_))));
+    assert!(matches!(backend.head("j").await, Err(Error::NotFound(_))));
+    switch.store(false, Ordering::SeqCst);
+    backend.put_stream("j", None, part("abc")).await.unwrap();
+    assert_eq!(backend.get("j", None).await.unwrap(), body("abc"));
+}
+
 /// Asserts that a create-only put whose directory sync fails after the link leaves no name, so
 /// the object is never visible and unacknowledged, and that the retry succeeds once the sync
 /// does. It would catch a put that returns the error and leaves the name, which makes the retry
