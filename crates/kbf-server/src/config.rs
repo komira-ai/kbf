@@ -795,19 +795,30 @@ pub enum ConfigError {
          the flag yet"
     )]
     PredictionsNeedLegacyCore(&'static str),
+    /// `--learned-sizes on` was given with `--scheduler-core js`, which learns sizes in `shadow`
+    /// only: it would book as `off` does while the flag says otherwise.
+    #[error(
+        "--learned-sizes on is not supported with --scheduler-core js yet; use --learned-sizes \
+         shadow or off, or --scheduler-core legacy"
+    )]
+    LearnedSizesOnUnderJs,
 }
 
 impl Args {
     /// Refuses a `--scheduler-core` this release cannot run.
     ///
     /// # Errors
-    /// [`ConfigError::SchedulerCoreUnavailable`]: the core is `js`.
+    /// [`ConfigError::SchedulerCoreUnavailable`]: the core is `js`, in a build without it.
+    /// [`ConfigError::LearnedSizesOnUnderJs`]: the core is `js` and `--learned-sizes` is `on`.
     pub fn check_scheduler_core(&self) -> Result<(), ConfigError> {
-        if self.scheduler_core.available() {
-            Ok(())
-        } else {
-            Err(ConfigError::SchedulerCoreUnavailable(self.scheduler_core))
+        let js = self.scheduler_core == crate::SchedulerCore::Js;
+        if js && self.learned_sizes == crate::LearnedSizes::On {
+            return Err(ConfigError::LearnedSizesOnUnderJs);
         }
+        if !self.scheduler_core.available() {
+            return Err(ConfigError::SchedulerCoreUnavailable(self.scheduler_core));
+        }
+        Ok(())
     }
 
     /// The directory of the durable log file: `--log-dir`, else `log` in the hot

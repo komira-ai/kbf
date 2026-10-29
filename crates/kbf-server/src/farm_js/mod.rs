@@ -24,10 +24,12 @@ pub mod adapter;
 pub mod codec;
 pub mod dispatch;
 pub mod ext;
+mod facts;
 pub mod host;
 pub mod load;
 pub mod open;
 mod record;
+mod report_hooks;
 
 pub use adapter::{KbfAdapter, Outbound, Wall};
 pub use host::{Caller, Connection};
@@ -42,8 +44,14 @@ mod dispatch_tests;
 #[cfg(test)]
 mod ext_tests;
 #[cfg(test)]
+mod facts_tests;
+#[cfg(test)]
+mod failed_tests;
+#[cfg(test)]
 mod host_tests;
 #[cfg(test)]
 mod load_tests;
+#[cfg(test)]
+mod report_hooks_tests;
 #[cfg(test)]
 mod testing;

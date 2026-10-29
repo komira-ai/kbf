@@ -580,6 +580,27 @@ mod tests {
         assert_eq!((calls, err.kind()), (1, io::ErrorKind::PermissionDenied));
     }
 
+    /// Catches a busy-cgroup report that names only the processes of the cgroup itself: a
+    /// process in a child cgroup keeps the parent busy, so the report must reach it, and
+    /// must name the child it sits in.
+    #[test]
+    fn the_members_of_a_busy_cgroup_include_those_of_its_children() {
+        let dir = scratch("members-below");
+        std::fs::create_dir_all(dir.join("child/grandchild")).expect("mkdir");
+        let pid = std::process::id();
+        std::fs::write(
+            dir.join("child/grandchild/cgroup.procs"),
+            format!("{pid}\n"),
+        )
+        .expect("plant a member");
+        let report = members(&dir);
+        let place = dir.join("child/grandchild");
+        assert!(
+            report.contains(&format!("in {}: pid {pid} (", place.display())),
+            "{report}"
+        );
+    }
+
     /// Catches child cgroups left behind (removal must go deepest first), a cgroup
     /// already gone failing the clean, and a cgroup that will not go read as removed.
     /// On cgroupfs the interface files vanish with their cgroup; on a plain directory a

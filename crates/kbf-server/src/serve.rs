@@ -553,6 +553,12 @@ pub(crate) fn sweeping(members: Option<Arc<Members>>) -> Pin<Box<dyn Future<Outp
     }
 }
 
+/// Logs the core `farm` runs on, as its driver says (not as the flag does), in the words
+/// the all-in-one server and the frontend both use.
+pub(crate) fn log_core(farm: &Farm) {
+    tracing::info!("{}", farm.scheduler_core().start_line());
+}
+
 /// Logs where the scheduler's state is, at every start. Not generic, unlike the binding
 /// that calls it, so every test binary's runs count toward the same function's coverage.
 pub(crate) fn log_state(durable: bool, term: u64, epoch: u64) {
@@ -801,6 +807,7 @@ where
         qos: listeners.qos_allowed,
     };
     let farm = Farm::from_listeners(Arc::clone(&cache), &listeners).recording(recorder.clone());
+    log_core(&farm);
     let durable = state.is_some();
     // Storage nodes register with a frontend that has a state store to keep them in.
     let members = members_of(state.as_ref(), None);

@@ -21,7 +21,9 @@ use tokio::sync::watch;
 
 use super::{JsFarm, views};
 use crate::farm::{EpochBump, NodeAction, NodeUnread, PlaceError, StateError, UnknownNode};
-use crate::fleet::{NodeView, PhaseView, PlacementView, ResourcesView, needs_attention};
+use crate::fleet::{
+    NodeView, PhaseView, PlacementView, ResourcesView, needs_attention, shown_deadline,
+};
 
 /// [`Farm::fence`](crate::farm::Farm::fence): [`Core::fence`](js_server_core::Core::fence).
 pub(crate) fn fence(js: &JsFarm) {
@@ -160,12 +162,12 @@ fn elsewhere(js: &JsFarm, worker: &WorkerId) -> NodeView {
             None => PlacementView::Serving,
             Some(Cordon::Cordoned) => PlacementView::Cordoned,
             Some(Cordon::Draining { deadline }) => PlacementView::Draining {
-                deadline_unix_ms: wall(*deadline),
+                deadline_unix_ms: shown_deadline(wall(*deadline)),
                 leases: leases(),
             },
             Some(Cordon::Drained) => PlacementView::Drained,
             Some(Cordon::Paused { deadline }) => PlacementView::DrainPaused {
-                deadline_unix_ms: wall(*deadline),
+                deadline_unix_ms: shown_deadline(wall(*deadline)),
                 leases: leases(),
             },
         };
