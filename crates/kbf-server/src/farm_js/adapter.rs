@@ -376,6 +376,13 @@ impl Adapter for KbfAdapter {
             stage.send_replace(Stage::Executing);
         }
         let heartbeat_seq = view.link(&start.worker).map_or(0, |l| l.newest_beat);
+        #[cfg(test)]
+        crate::farm::BEFORE_START.with(|hook| {
+            if let Some(hook) = &*hook.borrow() {
+                let stages = waiters.iter().filter_map(|id| self.stages.get(id));
+                hook(stages.map(|stage| stage.borrow().clone()).collect());
+            }
+        });
         self.send_for(view.sched(), &start.worker, start.operation, |w| {
             server_message::Message::Start(Start {
                 lease_id: Some(wire_lease(start.lease)),
