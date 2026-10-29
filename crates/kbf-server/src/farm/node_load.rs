@@ -39,7 +39,8 @@ use kbf_proto::worker::NodeLoad;
 use kbf_types::sched::usage;
 use kbf_types::{LeaseId, Resources, WorkerId};
 
-use super::{Farm, FarmTime, StreamId};
+use super::{Farm, FarmTime, State, StreamId};
+use crate::PlacementLoad;
 use crate::fleet::LoadView;
 
 mod feed;
@@ -360,14 +361,36 @@ impl Farm {
             .filter(|l| l.stream == stream)?;
         let session = Session::of(link.instance.as_str(), stream);
         let capacity = state.engine.sched.capacity(worker).unwrap_or_default();
-        accept(
+        let was_limited = state
+            .side
+            .node_loads
+            .get(worker)
+            .is_some_and(|k| k.last.cpu_limited);
+        let now = self.now();
+        let fed = accept(
             &mut state.side.node_loads,
             worker,
             &session,
             load,
             &capacity,
-            self.now(),
-        )
+            now,
+        );
+        let limited = state
+            .side
+            .node_loads
+            .get(worker)
+            .is_some_and(|k| k.last.cpu_limited);
+        if limited && !was_limited && self.load_is_read() {
+            tracing::warn!(
+                %worker,
+                "the node's actions cgroup has a CPU quota while --placement-load is on: \
+                 its measured CPU says nothing of the load, so placement charges it by \
+                 prediction alone; a node lifts the limit itself unless it runs \
+                 --actions-cpu-max off or predates the lift, so start it without that \
+                 flag or upgrade it"
+            );
+        }
+        fed
     }
 
     /// What is kept of `worker`'s readings, on either core.
@@ -375,6 +398,28 @@ impl Farm {
     fn kept_load(&self, worker: &WorkerId) -> Option<Kept> {
         js_arm!(self, load::kept_load(worker));
         self.lock().side.node_loads.get(worker).cloned()
+    }
+
+    /// Whether placement reads the load the nodes report (`--placement-load on`).
+    fn load_is_read(&self) -> bool {
+        self.settings.placement_load == PlacementLoad::On
+    }
+
+    /// The nodes whose last accepted reading, if it is not stale, says the actions cgroup has
+    /// a CPU quota while placement reads the load: a misconfiguration, exported as
+    /// `kbf_placement_cpu_limited_nodes`. None while placement does not read the load.
+    pub(super) fn cpu_limited_nodes(&self, state: &State) -> u64 {
+        if !self.load_is_read() {
+            return 0;
+        }
+        let now = self.now();
+        let limited = state
+            .side
+            .node_loads
+            .values()
+            .filter(|kept| kept.last.cpu_limited && !kept.stale(now))
+            .count();
+        limited as u64
     }
 }
 
