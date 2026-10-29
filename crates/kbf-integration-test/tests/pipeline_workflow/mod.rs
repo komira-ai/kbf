@@ -450,12 +450,9 @@ fn artifacts_stages(artifacts: &str, out: &mut Vec<String>) -> Result<(), String
             for need in workflows::job_needs(artifacts, job)? {
                 staged.push((job.clone(), need));
             }
-        } else if !condition
-            .as_deref()
-            .is_some_and(|c| c.contains(NOT_SIGN_STAGE))
-        {
+        } else if !condition.as_deref().is_some_and(excludes_sign_stage) {
             out.push(format!(
-                "the job `{job}` of artifacts.yml has `if: {shown}`, which does not say `{NOT_SIGN_STAGE}`: the sign call would run it again"
+                "the job `{job}` of artifacts.yml has `if: {shown}`, not `${{{{ (<condition>) && {NOT_SIGN_STAGE} }}}}`: the sign call would run it again"
             ));
         }
     }
@@ -467,6 +464,41 @@ fn artifacts_stages(artifacts: &str, out: &mut Vec<String>) -> Result<(), String
         }
     }
     Ok(())
+}
+
+/// Whether `condition` is exactly `${{ (<condition>) && inputs.stage != 'sign' }}`, the
+/// parenthesis closing at the end of `<condition>`: `x || inputs.stage != 'sign'`, or
+/// `(a) || (b) && inputs.stage != 'sign'` (where `&&` binds first), would still let the sign
+/// call run the job.
+fn excludes_sign_stage(condition: &str) -> bool {
+    let tail = format!(" && {NOT_SIGN_STAGE} }}}}");
+    let Some(inner) = condition
+        .strip_prefix("${{ ")
+        .and_then(|rest| rest.strip_suffix(tail.as_str()))
+    else {
+        return false;
+    };
+    let Some(body) = inner
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    // The opening parenthesis closes at the end: the body never closes more than it opens.
+    let mut depth = 0i32;
+    for c in body.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 /// The smoke runs the `kbf` of the linux-x86_64 tarball of this run's artifacts.

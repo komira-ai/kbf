@@ -238,6 +238,25 @@ fn only_the_sign_stage_runs_the_signing_jobs_and_it_runs_nothing_else() {
         ),
         "the job `sums` of artifacts.yml has `if: (none)`",
     );
+    // The exclusion must apply to the whole condition: an `||` beside it, or a group that closes
+    // before the end, still lets the sign call run the job.
+    let good = "  sums:\n    needs: [darwin-arm64, linux-x86_64, linux-arm64]\n    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'needs-artifacts')) && inputs.stage != 'sign' }}\n";
+    for loose in [
+        "${{ github.event_name != 'pull_request' || inputs.stage != 'sign' }}",
+        "${{ (github.event_name != 'pull_request') || (github.ref != '') && inputs.stage != 'sign' }}",
+        "${{ (github.event_name != 'pull_request') && inputs.stage != 'sign' || always() }}",
+    ] {
+        red(
+            &plant(
+                "artifacts.yml",
+                good,
+                &format!(
+                    "  sums:\n    needs: [darwin-arm64, linux-x86_64, linux-arm64]\n    if: {loose}\n"
+                ),
+            ),
+            "the job `sums` of artifacts.yml has `if:",
+        );
+    }
     red(
         &plant(
             "artifacts.yml",
