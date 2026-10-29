@@ -4,7 +4,7 @@
 //! actions as plain processes; the container driver (`kbf-driver-container`)
 //! implements the trait for farm nodes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -226,6 +226,8 @@ struct FakeState {
     started: Vec<LeaseId>,
     killed: Vec<LeaseId>,
     stop: BTreeMap<LeaseId, oneshot::Sender<()>>,
+    readings: VecDeque<Result<Option<NodeReading>, NodeLoadError>>,
+    hangs: bool,
 }
 
 impl FakeRuntime {
@@ -249,6 +251,21 @@ impl FakeRuntime {
             driver,
             ..self
         }
+    }
+
+    /// This runtime answering its next [`Runtime::node_load`] with `reading`, after the
+    /// readings already given (then `Ok(None)`, as a runtime that takes none does).
+    #[must_use]
+    pub fn with_node_load(self, reading: Result<Option<NodeReading>, NodeLoadError>) -> Self {
+        self.lock().readings.push_back(reading);
+        self
+    }
+
+    /// This runtime never answering [`Runtime::node_load`]: a read that hangs.
+    #[must_use]
+    pub fn with_hanging_node_load(self) -> Self {
+        self.lock().hangs = true;
+        self
     }
 
     /// Leases started, in order.
@@ -301,6 +318,13 @@ impl Runtime for FakeRuntime {
             // The receiver is gone only if the run already ended.
             let _ = stop.send(());
         }
+    }
+
+    async fn node_load(&self) -> Result<Option<NodeReading>, NodeLoadError> {
+        if self.lock().hangs {
+            std::future::pending::<()>().await;
+        }
+        self.lock().readings.pop_front().unwrap_or(Ok(None))
     }
 }
 

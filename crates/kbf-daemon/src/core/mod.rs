@@ -20,14 +20,20 @@ use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{self, DaemonMessage, daemon_message};
 use kbf_types::LeaseId;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 
 use crate::acks;
-use crate::clock::Clock;
+use crate::clock::{Clock, Moment};
 use crate::contact::Contact;
 use crate::lease::{Done, Leases, failure, lease_id};
+use crate::lease_minutes::LeaseMinutes;
 use crate::window::StartWindow;
 
 pub use event::Event;
+
+/// The longest a heartbeat waits for the runtime's reading: past it the beat goes out
+/// without a load, so a hung cgroup file cannot stop the stream's heartbeats.
+const NODE_LOAD_DEADLINE: Duration = Duration::from_secs(2);
 
 /// What the daemon remembers of a lease's Start until it forgets the lease.
 pub(crate) struct Granted {
@@ -60,6 +66,8 @@ pub struct LeaseCore {
     /// The kinds of failed node-load reading already logged, so a read that fails on
     /// every heartbeat is logged once.
     load_errors: BTreeSet<&'static str>,
+    /// The closed minutes and start clocks that heartbeats carry.
+    pub(crate) minutes: LeaseMinutes,
     events: Option<mpsc::UnboundedSender<Event>>,
 }
 
@@ -81,23 +89,57 @@ impl LeaseCore {
             max_unacked,
             clock,
             load_errors: BTreeSet::new(),
+            minutes: LeaseMinutes::new(),
             events: None,
         }
     }
 
-    /// The node's load for a Heartbeat, from the runtime that takes readings. A reading
-    /// that fails leaves it unset, and is logged the first time its kind fails. The
-    /// heartbeat carries the reading's node part; what it says of each lease is not sent.
-    pub(crate) async fn node_load(&mut self) -> Option<worker::NodeLoad> {
-        match self.leases.runtimes.node_load().await {
-            Ok(reading) => reading.map(|reading| reading.load),
-            Err(error) => {
+    /// The node's load for a Heartbeat, from the runtime that takes readings, with the
+    /// start of each running lease and the minutes that closed since the last batch was
+    /// acknowledged ([`LeaseMinutes`]). A reading that fails, or does not come within
+    /// [`NODE_LOAD_DEADLINE`], leaves the load unset and takes nothing from the collector;
+    /// each kind of failure is logged the first time it happens.
+    pub(crate) async fn node_load(&mut self, seq: u64) -> Option<worker::NodeLoad> {
+        let read = timeout(NODE_LOAD_DEADLINE, self.leases.runtimes.node_load()).await;
+        match read {
+            Ok(Ok(Some(reading))) => {
+                let attached = self.minutes.beat(seq, &reading);
+                let mut load = reading.load;
+                load.lease_clocks = attached.clocks;
+                load.covered = attached.covered;
+                load.minutes = attached.minutes;
+                Some(load)
+            }
+            Ok(Ok(None)) => None,
+            Ok(Err(error)) => {
                 if self.load_errors.insert(error.kind) {
                     tracing::warn!(%error, "node load not read: heartbeats go without it");
                 }
                 None
             }
+            Err(_) => {
+                if self.load_errors.insert("deadline") {
+                    tracing::warn!(
+                        deadline = ?NODE_LOAD_DEADLINE,
+                        "node load not read in time: heartbeats go without it"
+                    );
+                }
+                None
+            }
         }
+    }
+
+    /// A stream began: its contact, its Start window and its lease usage start over.
+    /// `usage_window` is the sampling window of the stream's heartbeats.
+    pub(crate) fn new_stream(
+        &mut self,
+        interval: Duration,
+        usage_window: Duration,
+        hello_sent: Moment,
+    ) {
+        self.contact.new_stream(interval);
+        self.window.new_stream(hello_sent);
+        self.minutes.new_stream(usage_window);
     }
 
     /// Tells the runtimes what a Welcome said of placement by measured load (`Welcome.placement_load`,
@@ -127,6 +169,7 @@ impl LeaseCore {
     /// Takes the acknowledgement of heartbeat `seq`.
     pub(crate) fn on_heartbeat_ack(&mut self, seq: u64) {
         self.window.acknowledged(seq);
+        self.minutes.acked(seq);
         if self.contact.acknowledged(seq).restored {
             tracing::info!("contact restored");
             self.emit(Event::ContactRestored);
@@ -279,6 +322,7 @@ impl LeaseCore {
         (id, outcome, usage, phases): Done,
     ) {
         let result = self.leases.finished(id, outcome, usage, &phases);
+        self.minutes.lease_ended(id);
         self.emit(Event::LeaseEnded(phases));
         self.report(tx, result);
     }
@@ -357,3 +401,7 @@ pub(crate) fn send(tx: &UnboundedSender<DaemonMessage>, message: daemon_message:
 pub fn superseded(granted: Option<u64>, newest: Option<u64>) -> bool {
     newest.is_some() && granted.is_some() && granted != newest
 }
+
+#[cfg(test)]
+#[path = "lease_minutes_tests.rs"]
+mod lease_minutes_tests;

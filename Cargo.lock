@@ -1634,6 +1634,7 @@ dependencies = [
  "crc32fast",
  "futures",
  "hex",
+ "js-agent-usage",
  "kbf-auth",
  "kbf-caps",
  "kbf-cas-conformance",

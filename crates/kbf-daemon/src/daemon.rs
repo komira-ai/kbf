@@ -101,6 +101,7 @@ use crate::core::{Event, LeaseCore, send};
 use crate::extras::{ExtraWake, SessionExtras};
 use crate::kbf_extras::KbfExtras;
 use crate::lease::{Done, Leases, lease_id, proto_lease_id};
+use crate::lease_minutes::usage_window;
 use crate::report::NodeReport;
 use crate::runtimes::Runtimes;
 use crate::welcome;
@@ -514,8 +515,8 @@ impl<X: SessionExtras> Daemon<X> {
             .map_err(|_| SessionError::WelcomeTimeout(wait))??;
         let (interval, epoch, welcome) = self.welcome(first)?;
         self.welcomed = true;
-        self.core.contact.new_stream(interval);
-        self.core.window.new_stream(hello_sent);
+        let usage_window = usage_window(interval, self.config.usage_window);
+        self.core.new_stream(interval, usage_window, hello_sent);
         // Before the Welcome renews contact: a lease whose fence passed while this
         // stream was set up must not outlive it (`offline` checked already; this keeps
         // the order true by construction here too).
@@ -578,7 +579,7 @@ impl<X: SessionExtras> Daemon<X> {
                     self.core.contact.sent(seq, now);
                     self.core.window.sent(seq, now);
                     let (pack_reads, pack_writes) = self.extras.pack_counts();
-                    let node_load = self.core.node_load().await;
+                    let node_load = self.core.node_load(seq).await;
                     let heartbeat = Heartbeat {
                         seq,
                         report_hash: self.report.hash().to_vec(),
@@ -817,8 +818,11 @@ mod tests {
         );
         let (events_tx, mut events) = mpsc::unbounded_channel();
         core.observe(events_tx);
-        core.contact.new_stream(Duration::from_secs(1));
-        core.window.new_stream(core.clock.now());
+        core.new_stream(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            core.clock.now(),
+        );
         core.new_epoch(Some(1));
         let (tx, mut sent) = unbounded();
         let start = worker::Start {
