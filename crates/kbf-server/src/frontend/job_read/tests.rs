@@ -88,7 +88,7 @@ fn files(dir: &Path, ca: &Ca, sans: Vec<SanType>) -> Files {
     };
     std::fs::write(&files.cert, cert.pem()).expect("certificate");
     std::fs::write(&files.key, key.serialize_pem()).expect("key");
-    std::fs::write(&files.secret, [SECRET, b"\n"].concat()).expect("secret");
+    std::fs::write(&files.secret, [SECRET, b"\n".as_slice()].concat()).expect("secret");
     std::fs::set_permissions(&files.secret, std::fs::Permissions::from_mode(0o600)).expect("mode");
     files
 }

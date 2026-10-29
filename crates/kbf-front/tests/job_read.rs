@@ -600,8 +600,9 @@ async fn the_bound_on_reads_holds_a_second_read_until_the_first_ends() {
     };
     let rig = rig(t.blobs.clone(), Some(t.a), limits);
     let token = rig.token(t.action);
-    let first = rig.get(&path(&t.a), Some(&token));
-    let second = rig.get(&path(&t.b), Some(&token));
+    let (path_a, path_b) = (path(&t.a), path(&t.b));
+    let first = rig.get(&path_a, Some(&token));
+    let second = rig.get(&path_b, Some(&token));
     let driver = async {
         for _ in 0..50 {
             tokio::task::yield_now().await;
@@ -638,6 +639,7 @@ async fn the_metrics_count_each_outcome_and_the_bytes_served() {
     let mut out = "# before\n".to_owned();
     rig.read.render_metrics(&mut out);
     let served = (t.a.size_bytes + t.b.size_bytes).to_string();
+    let bytes_line = format!("kbf_job_read_bytes_total {served}");
     for line in [
         "# before",
         "kbf_job_read_requests_total{outcome=\"ok\"} 2",
@@ -647,7 +649,7 @@ async fn the_metrics_count_each_outcome_and_the_bytes_served() {
         "kbf_job_read_requests_total{outcome=\"too_large\"} 1",
         "kbf_job_read_requests_total{outcome=\"method_not_allowed\"} 1",
         "kbf_job_read_requests_total{outcome=\"unavailable\"} 1",
-        &format!("kbf_job_read_bytes_total {served}"),
+        bytes_line.as_str(),
     ] {
         assert!(out.lines().any(|l| l == line), "{line} is not in\n{out}");
     }
