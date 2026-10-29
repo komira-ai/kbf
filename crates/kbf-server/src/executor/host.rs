@@ -34,6 +34,7 @@ use std::ops::ControlFlow;
 use kbf_lease_client::LeaseId;
 use kbf_proto::worker::{Cancel, ResultAck, ServerMessage, Welcome, server_message};
 use kbf_sched::DaemonInstance;
+use kbf_sched::fence::START_VALIDITY;
 use kbf_types::WorkerId;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -42,9 +43,6 @@ use crate::executor::runs::Task;
 use crate::executor::{Ctx, HostInfo, View, lease_gone, release_lease};
 use crate::farm::{Outbound, Reported, StreamId};
 use crate::worker::{HostFloor, PROTOCOL_VERSION, reported};
-
-/// How many heartbeat send times a worker remembers, to judge a `Start` by.
-const BEATS_KEPT: usize = 16;
 
 /// Why a worker is taken down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,7 +82,8 @@ pub(super) struct HostWorker {
     inbox: Inbox,
     /// The seq of the newest heartbeat sent.
     seq: u64,
-    /// When each recent heartbeat was sent, by seq; seq 0 is the registration.
+    /// When each heartbeat that a `Start` may still name was sent, by seq: those sent less
+    /// than [`START_VALIDITY`] ago. Seq 0 is the registration.
     beats: VecDeque<(u64, Instant)>,
     next_beat: Instant,
     /// When the newest heartbeat the farm acknowledged was sent.
@@ -130,7 +129,7 @@ impl HostWorker {
             next_beat: now,
             last_ack: now,
             server_ok: now,
-            renew_at: now + ctx.cfg.lease_ttl / 3,
+            renew_at: third_of(expires_at, now),
             expires_at,
             ends_at,
             draining: None,
@@ -183,7 +182,7 @@ impl HostWorker {
         self.poll(ctx, now).await?;
         self.settle(ctx, now);
         self.rotate(ctx, now)?;
-        self.beat(ctx, now).await
+        self.beat(ctx).await
     }
 
     /// Takes every message the farm queued since the last pass. True if the farm ended the
@@ -262,16 +261,14 @@ impl HostWorker {
         if now < self.renew_at && !due {
             return ControlFlow::Continue(());
         }
-        let renewed = ctx
-            .deps
-            .client
-            .renew(self.lease, Some(ctx.cfg.lease_ttl))
-            .await;
+        let renewed = ctx.api().renew(self.lease, Some(ctx.cfg.lease_ttl)).await;
         self.heard(now, &renewed);
         match renewed {
             Ok(renewed) => {
-                self.renew_at = now + ctx.cfg.lease_ttl / 3;
+                // A third of what the server granted, which is at most its own maximum,
+                // not of what was asked.
                 self.expires_at = ctx.clock.local(renewed.expires_at_ms, now);
+                self.renew_at = third_of(self.expires_at, now);
             }
             Err(e) if lease_gone(&e) => return ControlFlow::Break(Retire::Gone),
             Err(e) => tracing::warn!(worker = %self.id, error = %e, "renewing the lease failed"),
@@ -326,8 +323,11 @@ impl HostWorker {
     }
 
     /// Heartbeats the farm when one is due, and fences when the farm or the lease server
-    /// has been silent for the fence time.
-    async fn beat(&mut self, ctx: &Ctx<'_>, now: Instant) -> ControlFlow<Retire> {
+    /// has been silent for the fence time. The clock is read here, not taken from the start
+    /// of the pass: the calls before this took as long as they took, and the silence is
+    /// counted to now.
+    async fn beat(&mut self, ctx: &Ctx<'_>) -> ControlFlow<Retire> {
+        let now = ctx.clock.now();
         let older = self.last_ack.min(self.server_ok);
         if now.saturating_duration_since(older) > ctx.cfg.fence_after {
             return ControlFlow::Break(Retire::Fenced);
@@ -337,9 +337,7 @@ impl HostWorker {
         }
         self.seq += 1;
         self.beats.push_back((self.seq, now));
-        self.beats = self
-            .beats
-            .split_off(self.beats.len().saturating_sub(BEATS_KEPT));
+        self.beats.retain(|(_, sent)| now < *sent + START_VALIDITY);
         self.next_beat = now + ctx.cfg.heartbeat;
         let running = self.listed();
         let acked = ctx
@@ -371,6 +369,11 @@ impl HostWorker {
         release_lease(ctx, self.lease).await;
         self.forget();
     }
+}
+
+/// A third of the time from `now` to `expires_at`: when the lease is renewed.
+fn third_of(expires_at: Instant, now: Instant) -> Instant {
+    now + expires_at.saturating_duration_since(now) / 3
 }
 
 /// Registers a worker with the farm: the `Hello` a real node would send, the `Welcome` the

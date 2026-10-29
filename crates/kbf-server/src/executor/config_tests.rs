@@ -1,19 +1,28 @@
 use std::time::Duration;
 
-use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE};
+use kbf_lease_client::Mount;
+use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE, START_GRACE, START_VALIDITY};
 
-use super::{Config, ConfigError, HARD_CAP_PAD};
+use super::{Config, ConfigError, HARD_CAP_PAD, PRESIGN_LIMIT};
 use crate::config::MAX_HEARTBEAT_INTERVAL_MS;
 
 const GIB: u64 = 1 << 30;
 
 fn base() -> Config {
-    Config::new("front-1", 2, "farm-linux", 16_000, 64 * GIB)
+    Config {
+        insecure_argv_secrets: true,
+        ..Config::new("front-1", 2, "farm-linux", 16_000, 64 * GIB)
+    }
 }
 
-/// Catches a default set that the executor itself refuses (a start that fails at once).
+/// Catches a default set that the executor itself refuses (a start that fails at once), and
+/// secrets in arguments that nobody asked for: a config built from the defaults is refused
+/// until the operator says the secrets may travel as arguments, and is valid once they do.
 #[test]
-fn the_defaults_are_valid() {
+fn the_defaults_are_valid_once_the_operator_allows_argv_secrets() {
+    let defaults = Config::new("front-1", 2, "farm-linux", 16_000, 64 * GIB);
+    assert!(!defaults.insecure_argv_secrets);
+    assert_eq!(defaults.validate(), Err(ConfigError::InsecureArgv));
     assert_eq!(base().validate(), Ok(()));
 }
 
@@ -31,13 +40,36 @@ fn the_fence_time_stays_under_the_schedulers_grace() {
         fence_after,
         ..base()
     };
-    let room = LEASE_GRACE - LEADER_LEASE_MARGIN - config.poll;
-    assert_eq!(
-        at_the_edge(room - Duration::from_millis(1)).validate(),
-        Ok(())
-    );
-    assert_eq!(at_the_edge(room).validate(), Err(ConfigError::Fence));
+    // The step is long here, so the grace is the rule that binds, and not the start window.
+    let slow = |fence_after| Config {
+        fence_after,
+        poll: Duration::from_secs(20),
+        ..base()
+    };
+    let room = LEASE_GRACE - LEADER_LEASE_MARGIN - Duration::from_secs(20);
+    assert_eq!(slow(room - Duration::from_millis(1)).validate(), Ok(()));
+    assert_eq!(slow(room).validate(), Err(ConfigError::Fence));
     assert_eq!(at_the_edge(LEASE_GRACE).validate(), Err(ConfigError::Fence));
+}
+
+/// Catches a fence time under which a `Start` posted at the very end of its window is stopped
+/// after the farm has run the action again: the window, T and the scheduler's margin must
+/// stay under the start grace. T = 50 s passes the grace rule (55.5 s under 60 s) and breaks
+/// this one (69 s over 60 s): the boundary is at 41 s.
+#[test]
+fn the_fence_time_leaves_a_start_posted_at_the_end_of_its_window_its_stop() {
+    let with = |fence_after| Config {
+        fence_after,
+        ..base()
+    };
+    let room = START_GRACE - START_VALIDITY - LEADER_LEASE_MARGIN;
+    assert_eq!(room, Duration::from_secs(41));
+    assert_eq!(with(room - Duration::from_millis(1)).validate(), Ok(()));
+    assert_eq!(with(room).validate(), Err(ConfigError::StartWindow));
+    assert_eq!(
+        with(Duration::from_secs(50)).validate(),
+        Err(ConfigError::StartWindow)
+    );
 }
 
 /// Catches each setting the executor's safety or the farm's wire rejects being accepted:
@@ -162,6 +194,51 @@ fn each_unsafe_setting_is_refused_by_name() {
                 ..base()
             },
             ConfigError::Presign,
+        ),
+        (
+            Config {
+                presign_ceiling: PRESIGN_LIMIT + Duration::from_secs(1),
+                ..base()
+            },
+            ConfigError::PresignLimit,
+        ),
+        (
+            Config {
+                call_timeout: Duration::ZERO,
+                ..base()
+            },
+            ConfigError::Bounds,
+        ),
+        (
+            Config {
+                call_timeout: Duration::from_secs(40),
+                ..base()
+            },
+            ConfigError::Bounds,
+        ),
+        (
+            Config {
+                pass_budget: Duration::ZERO,
+                ..base()
+            },
+            ConfigError::Bounds,
+        ),
+        (
+            Config {
+                insecure_argv_secrets: false,
+                ..base()
+            },
+            ConfigError::InsecureArgv,
+        ),
+        (
+            Config {
+                tool_mount: Mount {
+                    ro: false,
+                    ..base().tool_mount
+                },
+                ..base()
+            },
+            ConfigError::ToolMount,
         ),
         (
             Config {

@@ -168,6 +168,63 @@ async fn a_start_whose_inputs_were_slow_is_not_posted_past_its_window() {
     assert_eq!(rig.runs_of(1).await.len(), 1, "the action ran once");
 }
 
+/// Catches a read of the CAS that never answers holding the pass, and with it the heartbeats
+/// and the fence: the read is given the `Start`'s window and no more, after which the
+/// `Start` is dropped, as one that arrived late is.
+#[tokio::test(start_paused = true)]
+async fn a_cas_that_never_answers_is_given_the_window_and_no_more() {
+    use std::sync::atomic::Ordering;
+    let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
+    rig.pump().await;
+    let caller = rig.submit(1);
+    rig.farm.tick().await;
+    crate::rig::settle().await;
+    rig.inputs.hold.store(true, Ordering::SeqCst);
+    let in_time = rig.step_through(Duration::from_secs(15)).await;
+    rig.inputs.hold.store(false, Ordering::SeqCst);
+    assert!(in_time, "the pass waited for the CAS past the window");
+    assert!(rig.runs().await.is_empty());
+    rig.elapse(70).await;
+    let runs = rig.runs_of(1).await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    rig.host_finishes(&runs[0].run, Outcome::Succeeded, Some(0));
+    assert!(matches!(rig.until_done(&caller, 6).await, Finished::Ran(_)));
+}
+
+/// Catches a pass that starts every waiting task however long the first ones take: the
+/// heartbeats and the fence come after them. Once the pass budget is spent no more is begun,
+/// and the tasks left are taken in the next pass, still inside their windows.
+#[tokio::test(start_paused = true)]
+async fn a_pass_begins_no_task_once_its_budget_is_spent() {
+    use std::sync::atomic::Ordering;
+    let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
+    rig.pump().await;
+    let (_a, _b) = (rig.submit(1), rig.submit(2));
+    rig.farm.tick().await;
+    crate::rig::settle().await;
+    rig.inputs.hold.store(true, Ordering::SeqCst);
+    let (exec, fake, inputs) = (&mut rig.exec, &rig.fake, &rig.inputs);
+    let slow = async {
+        crate::rig::settle().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        fake.advance(Duration::from_secs(11));
+        inputs.hold.store(false, Ordering::SeqCst);
+        inputs.release.notify_one();
+    };
+    tokio::join!(exec.step(), slow);
+    assert_eq!(
+        rig.runs().await.len(),
+        1,
+        "the second task began past the budget"
+    );
+    rig.exec.step().await;
+    assert_eq!(
+        rig.runs().await.len(),
+        2,
+        "the second task was not taken up"
+    );
+}
+
 /// Catches an action the executor cannot run being passed to the host or rerun: an image that
 /// is not pinned by digest, or a timeout over the executor's limit, is the caller's to fix and
 /// is answered INVALID_ARGUMENT; no run is posted.

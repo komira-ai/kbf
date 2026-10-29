@@ -63,9 +63,7 @@ impl Slot {
             // A lease that could not be looked up is not a lease that is gone: only a list
             // that was read and lacks it frees the slot to book another.
             Self::Pending { lease } => match view.lease(lease) {
-                Listing::Found(held) if held.state == LeaseState::Held => {
-                    activate(ctx, held, now)
-                }
+                Listing::Found(held) if held.state == LeaseState::Held => activate(ctx, held, now),
                 Listing::Absent => Self::Vacant { retry_at: now },
                 Listing::Found(_) | Listing::Unread => Self::Pending { lease },
             },
@@ -104,7 +102,7 @@ async fn acquire(ctx: &Ctx<'_>, now: Instant) -> Slot {
     let request = AcquireRequest::new(&ctx.cfg.class, resources, ctx.cfg.max_wall)
         .label(FRONTEND_LABEL, &ctx.cfg.frontend)
         .ttl(ctx.cfg.lease_ttl);
-    match ctx.deps.client.acquire(&request).await {
+    match ctx.api().acquire(&request).await {
         Ok(Acquired::Granted(granted)) => {
             let ends = (
                 ctx.clock.local(granted.expires_at_ms, now),
@@ -143,8 +141,7 @@ fn activate(ctx: &Ctx<'_>, held: &Lease, now: Instant) -> Slot {
 /// could not be asked.
 pub(super) async fn adopt(ctx: &Ctx<'_>, now: Instant) -> Option<Vec<Slot>> {
     let own = ctx
-        .deps
-        .client
+        .api()
         .leases_labelled(FRONTEND_LABEL, &ctx.cfg.frontend)
         .await
         .ok()?;
@@ -178,14 +175,14 @@ pub(super) async fn adopt(ctx: &Ctx<'_>, now: Instant) -> Option<Vec<Slot>> {
 /// Stops every run of `lease`: they belong to the frontend that made it, which is gone.
 /// False if the runs could not be listed, or a stop got no answer: some may still run.
 async fn stop_runs(ctx: &Ctx<'_>, lease: LeaseId) -> bool {
-    let listed = ctx.deps.client.runs(lease).await;
+    let listed = ctx.api().runs(lease).await;
     note("listing the runs of an earlier frontend", &listed);
     let Ok(runs) = listed else {
         return false;
     };
     let mut stopped = true;
     for run in runs {
-        let answer = ctx.deps.client.stop_run(lease, &run.run_id).await;
+        let answer = ctx.api().stop_run(lease, &run.run_id).await;
         note("stopping a run of an earlier frontend", &answer);
         stopped &= answer.as_ref().err().is_none_or(|e| e.api().is_some());
     }
@@ -198,8 +195,7 @@ async fn stop_runs(ctx: &Ctx<'_>, lease: LeaseId) -> bool {
 /// if the lease server could not be asked.
 pub(super) async fn reconcile(ctx: &Ctx<'_>, slots: &[Slot]) -> bool {
     let listed = ctx
-        .deps
-        .client
+        .api()
         .leases_labelled(FRONTEND_LABEL, &ctx.cfg.frontend)
         .await;
     note("listing the leases to look for strays", &listed);

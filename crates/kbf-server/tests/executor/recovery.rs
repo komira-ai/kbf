@@ -444,3 +444,38 @@ async fn the_read_of_a_worker_that_goes_is_abandoned() {
     assert!(rig.exec.hosts().is_empty());
     assert!(caller.finished().is_none());
 }
+
+/// Catches a lease server that accepts a request and never answers holding the executor's
+/// pass for the client's own 30 s a call: a pass makes several, one after another, with the
+/// heartbeats to the farm among them, and the farm requeues a worker it has not heard from
+/// after a minute. Each call gives up after the call timeout, the pass ends, and the run goes
+/// on being tracked.
+#[tokio::test(start_paused = true)]
+async fn a_lease_server_that_never_answers_does_not_hold_the_pass() {
+    let (mut rig, caller, run) = running(Rig::start(&["node1"], 1, |_| {}).await).await;
+    rig.fake.inject_on("GET /v1/leases/", Fault::Hang);
+    let in_time = rig.step_through(Duration::from_secs(6)).await;
+    assert!(in_time, "the pass waited for the client's own timeout");
+    assert_eq!(rig.exec.hosts().len(), 1);
+    rig.host_finishes(&run.run, Outcome::Succeeded, Some(0));
+    assert!(matches!(rig.until_done(&caller, 4).await, Finished::Ran(_)));
+}
+
+/// Catches the fence being judged by the clock at the start of the pass: a pass that spent
+/// its time waiting for the lease server would then fence a pass late, with the lease server
+/// silent for longer than the fence time. The clock is read where the silence is counted.
+#[tokio::test(start_paused = true)]
+async fn the_fence_counts_the_time_the_pass_itself_took() {
+    let mut rig = Rig::start(&["node1"], 1, |cfg| {
+        cfg.fence_after = Duration::from_secs(10);
+    })
+    .await;
+    rig.pump().await;
+    assert_eq!(rig.exec.hosts().len(), 1);
+    rig.advance(Duration::from_secs(9)).await;
+    rig.fake.inject_on("GET /v1/leases/", Fault::Hang);
+    // The pass starts 9 s after the lease server last answered, and waits 5 s for it.
+    let in_time = rig.step_through(Duration::from_secs(6)).await;
+    assert!(in_time);
+    assert!(rig.exec.hosts().is_empty(), "the worker was not fenced");
+}

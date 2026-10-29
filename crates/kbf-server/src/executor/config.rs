@@ -6,13 +6,18 @@ use std::time::Duration;
 
 use kbf_lease_client::Mount;
 use kbf_proto::worker::{Capability, Hello};
-use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE, SELF_FENCE};
+use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE, SELF_FENCE, START_GRACE, START_VALIDITY};
 
 use crate::config::MAX_HEARTBEAT_INTERVAL_MS;
 use crate::executor::task::Delivery;
 use crate::worker::PROTOCOL_VERSION;
 
 const GIB: u64 = 1 << 30;
+
+/// The longest a presigned url may be asked to stay good. The store refuses more, and the
+/// executor does not ask: [`Config::presign_ceiling`] stays under it, and the longest run's
+/// wall time under that.
+pub const PRESIGN_LIMIT: Duration = Duration::from_secs(4 * 3600);
 
 /// What the container driver adds to 1.5 times a booking for the hard memory cap of a run
 /// (`kbf-driver-container`, `cgroup.rs`). The lease server caps a run at the number it is
@@ -68,11 +73,23 @@ pub struct Config {
     /// release one no slot holds: one booked by a request whose answer was lost, or one a
     /// release did not reach. The same check runs at once after either.
     pub reconcile_every: Duration,
+    /// How long one call to the lease server may take before it counts as unanswered. A pass
+    /// of the executor is a series of calls, and it carries the heartbeats and the
+    /// self-fence, so a server that never answers must not hold it for the client's own
+    /// 30 s a call.
+    pub call_timeout: Duration,
+    /// How long a pass goes on starting waiting tasks: past it the rest wait for the next.
+    pub pass_budget: Duration,
     /// T: how long a worker goes on with its runs after the farm last acknowledged a
     /// heartbeat, or the lease server last answered, before it stops them and goes silent.
     pub fence_after: Duration,
     /// How the secrets reach the task.
     pub delivery: Delivery,
+    /// Whether the operator has said the secrets may travel as arguments, where the action
+    /// can read them (`/proc/1/cmdline`) and the engine's inspect shows them: the only
+    /// delivery there is until the lease server's job takes a secret field. False by
+    /// default, and [`Config::validate`] refuses a config that leaves it so.
+    pub insecure_argv_secrets: bool,
     /// The path of the task tool in the container.
     pub tool: String,
     /// The mount that puts the tool there.
@@ -125,6 +142,24 @@ pub enum ConfigError {
     /// A default timeout of zero or over the longest run.
     #[error("the default timeout must be above zero and no more than the longest run")]
     Timeout,
+    /// A fence time that leaves a `Start` posted at the end of its window a run that outlives
+    /// the grace after which the farm runs it again.
+    #[error("the start window plus the fence time and the margin must be under the start grace")]
+    StartWindow,
+    /// A call or pass bound that is zero, or a call that may outlast the fence time.
+    #[error(
+        "the call timeout must be above zero and under the fence time, and the pass budget above zero"
+    )]
+    Bounds,
+    /// Secrets as arguments, which the operator has not allowed.
+    #[error("the secrets travel as arguments: set insecure_argv_secrets to say so")]
+    InsecureArgv,
+    /// A tool mount the action could write to.
+    #[error("the tool mount must be read-only: the action could replace the tool")]
+    ToolMount,
+    /// A presign ceiling or a run longer than a url may be good for.
+    #[error("the presign ceiling and the longest run's wall time must be at most 4 hours")]
+    PresignLimit,
 }
 
 impl Config {
@@ -157,8 +192,11 @@ impl Config {
             acquire_retry: Duration::from_secs(5),
             host_check: Duration::from_secs(5),
             reconcile_every: Duration::from_secs(60),
+            call_timeout: Duration::from_secs(5),
+            pass_budget: Duration::from_secs(10),
             fence_after: SELF_FENCE,
             delivery: Delivery::InsecureArgv,
+            insecure_argv_secrets: false,
             tool: "/mnt/kbf-tools/kbf-task".to_owned(),
             tool_mount: Mount {
                 root_name: "kbf-tools".to_owned(),
@@ -169,7 +207,7 @@ impl Config {
             allow_plain_http_put: false,
             max_pack_bytes: 128 << 20,
             max_blob_bytes: 64 << 20,
-            presign_ceiling: Duration::from_secs(4 * 3600),
+            presign_ceiling: PRESIGN_LIMIT,
         }
     }
 
@@ -177,8 +215,14 @@ impl Config {
     ///
     /// The fence time T plus the scheduler's margin plus one step must stay under the
     /// scheduler's re-dispatch grace G ([`LEASE_GRACE`]): a worker the farm last heard from
-    /// is silent after T, and its runs are stopped by then, so the farm that requeues them
-    /// after G never runs the action beside the first copy.
+    /// is silent after T, and its runs are asked to stop by then, so the farm that requeues
+    /// them after G does not run the action beside the first copy. The ask goes to the lease
+    /// server; if that is the one that cannot be reached, the run goes on to its wall time,
+    /// which wastes the work and is harmless: its pack key is its own.
+    ///
+    /// A `Start` posted at the end of its window ([`START_VALIDITY`]) is then a run whose
+    /// stop is asked T later, and the farm runs the action again [`START_GRACE`] after the
+    /// `Start`: the window, T and the margin stay under it.
     ///
     /// # Errors
     /// The first setting that breaks a rule.
@@ -223,6 +267,22 @@ impl Config {
                 ConfigError::Timeout,
             ),
             (self.presign_ceiling >= longest, ConfigError::Presign),
+            (
+                self.presign_ceiling <= PRESIGN_LIMIT,
+                ConfigError::PresignLimit,
+            ),
+            (
+                START_VALIDITY + self.fence_after + LEADER_LEASE_MARGIN < START_GRACE,
+                ConfigError::StartWindow,
+            ),
+            (
+                !self.call_timeout.is_zero()
+                    && self.call_timeout < self.fence_after
+                    && !self.pass_budget.is_zero(),
+                ConfigError::Bounds,
+            ),
+            (self.insecure_argv_secrets, ConfigError::InsecureArgv),
+            (self.tool_mount.ro, ConfigError::ToolMount),
             (
                 self.max_wall > self.drain_before_end && self.drain_before_end > longest,
                 ConfigError::Drain,

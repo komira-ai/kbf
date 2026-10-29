@@ -19,6 +19,7 @@
 //!
 //! Nothing wires it yet: there is no flag, and no server builds one.
 
+mod api;
 mod config;
 mod host;
 mod outcome;
@@ -114,6 +115,16 @@ pub(crate) struct Ctx<'a> {
     pub(crate) strays: &'a Strays,
 }
 
+impl Ctx<'_> {
+    /// The lease server, each call limited to [`Config::call_timeout`].
+    pub(crate) fn api(&self) -> api::Api<'_> {
+        api::Api {
+            client: &self.deps.client,
+            limit: self.cfg.call_timeout,
+        }
+    }
+}
+
 /// Whether a lease may exist that no slot holds: a request that may have booked one got no
 /// answer, or a release failed. The next pass looks for it by label.
 #[derive(Default)]
@@ -133,7 +144,7 @@ impl Strays {
 /// holds, so the next pass looks for it; one the server answered, even with a refusal, leaves
 /// nothing to look for.
 pub(crate) async fn release_lease(ctx: &Ctx<'_>, lease: LeaseId) {
-    let released = ctx.deps.client.release(lease).await;
+    let released = ctx.api().release(lease).await;
     note("releasing the lease", &released);
     if released.as_ref().err().is_some_and(|e| e.api().is_none()) {
         ctx.strays.suspect();
@@ -312,7 +323,7 @@ async fn read(
     let waiting = slots.iter().any(Slot::is_pending);
     let leases = match waiting {
         true => {
-            let listed = ctx.deps.client.leases().await;
+            let listed = ctx.api().leases().await;
             note("listing the leases", &listed);
             listed.ok()
         }
@@ -323,7 +334,7 @@ async fn read(
     let hosts = match (due, holding) {
         (true, true) => {
             *hosts_read = Some(now);
-            ctx.deps.client.hosts().await.unwrap_or_default()
+            ctx.api().hosts().await.unwrap_or_default()
         }
         _ => Vec::new(),
     };

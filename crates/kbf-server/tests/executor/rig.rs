@@ -295,6 +295,7 @@ impl Rig {
         let api = fake.client().expect("a client");
         let mut cfg = Config::new("front-1", held, "farm-linux", 2_000, gib * GIB);
         cfg.slots = 2;
+        cfg.insecure_argv_secrets = true;
         adjust(&mut cfg);
         let farm = Arc::new(Farm::new(
             Arc::new(Cache::memory()),
@@ -453,6 +454,36 @@ impl Rig {
 
     pub fn host_ends(&self, run: &RunId) {
         assert!(self.fake.end_run(run));
+    }
+
+    /// One step of the executor while `by` passes on every clock after it has begun and
+    /// waited as long as it will. True if the step had ended by then; a step that had not is
+    /// given 31 s more (the client's own request timeout) so that it ends, and the answer is
+    /// false.
+    pub async fn step_through(&mut self, by: Duration) -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let done = AtomicBool::new(false);
+        let (exec, fake, inputs) = (&mut self.exec, &self.fake, &self.inputs);
+        let stepping = async {
+            exec.step().await;
+            done.store(true, Ordering::SeqCst);
+        };
+        let passing = async {
+            settle().await;
+            tokio::time::advance(by).await;
+            fake.advance(by);
+            settle().await;
+            let in_time = done.load(Ordering::SeqCst);
+            if !in_time {
+                // Whatever the step waits on is let go, so that a failure fails and does not hang.
+                inputs.hold.store(false, Ordering::SeqCst);
+                inputs.release.notify_one();
+                tokio::time::advance(Duration::from_secs(31)).await;
+                fake.advance(Duration::from_secs(31));
+            }
+            in_time
+        };
+        tokio::join!(stepping, passing).1
     }
 
     /// Runs the executor until `caller` is done, or panics after `steps` of 5 s.

@@ -101,6 +101,7 @@ impl Harness {
         ));
         let mut cfg = Config::new("front", 1, "pool", 2_000, 16 * GIB);
         cfg.slots = 2;
+        cfg.insecure_argv_secrets = true;
         let deps = Deps {
             farm: Arc::clone(&farm),
             client: fake.client().expect("a client"),

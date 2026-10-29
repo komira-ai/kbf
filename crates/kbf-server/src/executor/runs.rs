@@ -122,11 +122,6 @@ fn pinned(image: &str) -> Result<String, Settled> {
     }
 }
 
-/// Whether `now` is outside the window of `w`: past its deadline, or with none to act in.
-fn outside(w: &Waiting, now: Instant) -> bool {
-    w.deadline.is_none_or(|deadline| now >= deadline)
-}
-
 fn require(ok: bool, why: impl FnOnce() -> String) -> Result<(), Settled> {
     match ok {
         true => Ok(()),
@@ -198,12 +193,18 @@ impl HostWorker {
             .collect();
         for (lease, action, w) in waiting {
             // Read again for each task: the ones before it took time.
-            if outside(&w, ctx.clock.now()) {
+            let at = ctx.clock.now();
+            // The heartbeats and the fence come after this, in the same pass: it starts no more
+            // once its budget is spent, and the tasks left are taken up by the next.
+            if at.saturating_duration_since(now) >= ctx.cfg.pass_budget {
+                break;
+            }
+            let Some(deadline) = w.deadline.filter(|deadline| at < *deadline) else {
                 tracing::warn!(worker = %self.id, %lease, "a Start outside its window is dropped");
                 self.drop_task(lease);
                 continue;
-            }
-            match self.queue(ctx, lease, &action, &w).await {
+            };
+            match self.queue(ctx, lease, &action, &w, deadline).await {
                 Queued::Wait => {}
                 Queued::Posted(running) => self.set_stage(lease, Stage::Running(running)),
                 Queued::Settled(settled) => self.settle_with(lease, &settled, now),
@@ -236,10 +237,16 @@ impl HostWorker {
         lease: kbf_types::LeaseId,
         action: &Digest,
         w: &Waiting,
+        deadline: Instant,
     ) -> Queued {
-        let (spec, key, wall) = match self.prepare(ctx, lease, action, w).await {
-            Ok(prepared) => prepared,
-            Err(settled) => return Queued::Settled(settled),
+        // What preparing reads (the CAS, the store, the grant service) is not the lease
+        // server's and is not bounded by it: it is bounded by the window, which it cannot
+        // outlast and have the post still be good.
+        let prepared = tokio::time::timeout_at(deadline, self.prepare(ctx, lease, action, w));
+        let (spec, key, wall) = match prepared.await {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(settled)) => return Queued::Settled(settled),
+            Err(_) => return Queued::Late,
         };
         // The lease server cuts the run's wall time to what the lease has left when it is
         // posted, and a renewal later does not stretch it: renew first when the lease would
@@ -253,11 +260,11 @@ impl HostWorker {
         // server or the store took: the window is judged by the clock now, the last moment
         // before the post, not by the one read when the pass began.
         let now = ctx.clock.now();
-        if outside(w, now) {
+        if now >= deadline {
             return Queued::Late;
         }
         let truncated = wall > self.left(now);
-        let posted = ctx.deps.client.queue_run(self.lease, &spec).await;
+        let posted = ctx.api().queue_run(self.lease, &spec).await;
         self.heard(now, &posted);
         let label = key.nonce.to_string();
         let running = |run: RunId| Running {
@@ -338,16 +345,10 @@ impl HostWorker {
         label: &str,
         running: impl FnOnce(RunId) -> Running,
     ) -> Queued {
-        let found = ctx
-            .deps
-            .client
-            .runs(self.lease)
-            .await
-            .ok()
-            .and_then(|runs| {
-                runs.into_iter()
-                    .find(|run| run.labels.get(RUN_LABEL).is_some_and(|v| v == label))
-            });
+        let found = ctx.api().runs(self.lease).await.ok().and_then(|runs| {
+            runs.into_iter()
+                .find(|run| run.labels.get(RUN_LABEL).is_some_and(|v| v == label))
+        });
         match found {
             Some(run) => Queued::Posted(running(run.run_id)),
             None => Queued::Retire(Retire::Ambiguous),
@@ -377,7 +378,7 @@ impl HostWorker {
     /// Reads the host's runs and acts on each running task: stop the ones the farm cancelled,
     /// and take the verdict on those that ended.
     pub(super) async fn poll(&mut self, ctx: &Ctx<'_>, now: Instant) -> ControlFlow<Retire> {
-        let listed = ctx.deps.client.runs(self.lease).await;
+        let listed = ctx.api().runs(self.lease).await;
         self.heard(now, &listed);
         let runs = match listed {
             Ok(runs) => runs,
@@ -417,7 +418,7 @@ impl HostWorker {
     /// Asks the lease server to stop a run the farm cancelled, and forgets it once the server
     /// has answered: a server that knows no such run has nothing to stop.
     async fn stop(&mut self, ctx: &Ctx<'_>, lease: kbf_types::LeaseId, run: &RunId) {
-        let stopped = ctx.deps.client.stop_run(self.lease, run).await;
+        let stopped = ctx.api().stop_run(self.lease, run).await;
         note("stopping a run", &stopped);
         let answered = stopped.as_ref().err().is_none_or(|e| e.api().is_some());
         answered
@@ -495,7 +496,7 @@ impl HostWorker {
         for run in runs {
             note(
                 "stopping a run",
-                &ctx.deps.client.stop_run(self.lease, &run).await,
+                &ctx.api().stop_run(self.lease, &run).await,
             );
         }
     }

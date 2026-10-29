@@ -114,10 +114,13 @@ async fn a_booked_lease_survives_a_list_that_could_not_be_read() {
     let mut rig = Rig::built(&["node1", "node2"], 1, 16, true, |_| {}).await;
     rig.exec.step().await;
     let lease = rig.api.leases().await.expect("leases")[0].id;
-    for fault in [Fault::Close, Fault::Reply {
-        status: 503,
-        body: bytes::Bytes::new(),
-    }] {
+    for fault in [
+        Fault::Close,
+        Fault::Reply {
+            status: 503,
+            body: bytes::Bytes::new(),
+        },
+    ] {
         rig.fake.inject_on("GET /v1/leases", fault);
         rig.advance(Duration::from_secs(1)).await;
         rig.exec.step().await;
@@ -321,11 +324,38 @@ async fn adoption_that_could_not_stop_the_runs_gives_the_lease_up() {
         rig.exec = rig.restarted_executor();
         rig.fake.inject_on(fault_on, Fault::Close);
         rig.exec.step().await;
-        assert!(rig.exec.hosts().is_empty(), "{what}: adopted with live runs");
+        assert!(
+            rig.exec.hosts().is_empty(),
+            "{what}: adopted with live runs"
+        );
         let released = count(&rig.requests(), &format!("DELETE /v1/leases/{lease}"));
         assert_eq!(released, 1, "{what}: the lease was not given up");
-        assert_ne!(state_of(&rig, lease).await, Some(LeaseState::Held), "{what}");
+        assert_ne!(
+            state_of(&rig, lease).await,
+            Some(LeaseState::Held),
+            "{what}"
+        );
     }
+}
+
+/// Catches a lease renewed on the cadence of the ttl that was asked, not of the one that was
+/// granted: the lease server grants at most its own maximum (an hour), so a ttl asked for
+/// beyond three times that would be renewed only after the lease had expired, and the host
+/// and its runs lost.
+#[tokio::test(start_paused = true)]
+async fn the_renewal_follows_the_ttl_the_server_granted() {
+    let mut rig = Rig::start(&["node1"], 1, |cfg| {
+        cfg.lease_ttl = Duration::from_secs(4 * 3600);
+        cfg.max_wall = Duration::from_secs(12 * 3600);
+        cfg.drain_before_end = Duration::from_secs(3 * 3600);
+    })
+    .await;
+    rig.pump().await;
+    let lease = rig.exec.hosts()[0].lease;
+    rig.elapse(1_300).await;
+    let renewals = count(&rig.requests(), &format!("POST /v1/leases/{lease}/renew"));
+    assert!(renewals >= 1, "not renewed after 1300 s of a 3600 s grant");
+    assert_eq!(rig.exec.hosts()[0].lease, lease);
 }
 
 /// Catches a lease that expires under a busy pool: it is renewed every third of its ttl for

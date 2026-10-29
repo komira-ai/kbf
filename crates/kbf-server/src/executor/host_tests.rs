@@ -149,7 +149,7 @@ async fn an_unacknowledged_heartbeat_does_not_move_the_fence() {
         ServerMessage::default(),
     );
     worker.stream = other;
-    let flow = worker.beat(&ctx, Instant::now()).await;
+    let flow = worker.beat(&ctx).await;
     assert!(flow.is_continue());
     assert_eq!(
         worker.last_ack, registered,
@@ -179,4 +179,32 @@ async fn a_start_sent_twice_posts_one_run() {
     assert_eq!(stage_of(&worker, LeaseId::new(1, 1)), "running");
     let runs = harness.deps.client.runs(worker.lease).await.expect("runs");
     assert_eq!(runs.len(), 1);
+}
+
+/// Catches a worker that forgets when it sent a heartbeat that a `Start` may still name: the
+/// farm judges a `Start` from the heartbeat it names and gives it 14 s, so a count of sends
+/// kept (16 of them, which at a heartbeat of 100 ms is 1.6 s) drops a legitimate `Start`
+/// and costs the farm a whole grace to run it again. Sends are kept for the window, whatever
+/// the interval, and no longer.
+#[tokio::test(start_paused = true)]
+async fn the_sends_remembered_cover_the_start_window_at_any_heartbeat_interval() {
+    let mut harness = Harness::new().await;
+    harness.cfg.heartbeat = Duration::from_millis(100);
+    let (mut worker, _messages) = harness.worker().await;
+    let ctx = harness.ctx();
+    for _ in 0..139 {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(worker.beat(&ctx).await.is_continue());
+    }
+    assert!(
+        worker.sent_at(0).is_some(),
+        "the registration was forgotten 13.9 s on"
+    );
+    tokio::time::advance(Duration::from_millis(100)).await;
+    assert!(worker.beat(&ctx).await.is_continue());
+    assert!(
+        worker.sent_at(0).is_none(),
+        "a send from outside the window was kept"
+    );
+    assert!(worker.sent_at(worker.seq).is_some());
 }
