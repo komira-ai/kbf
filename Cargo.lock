@@ -744,7 +744,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1318,17 +1318,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "js-agent-usage"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=a826aba49ac204ea4189ba547907f32aa58467dd#a826aba49ac204ea4189ba547907f32aa58467dd"
+
+[[package]]
 name = "js-caps"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=772628f4356de822e8fe9971d807e368c70be479#772628f4356de822e8fe9971d807e368c70be479"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=a826aba49ac204ea4189ba547907f32aa58467dd#a826aba49ac204ea4189ba547907f32aa58467dd"
 dependencies = [
+ "js-types",
  "thiserror",
 ]
 
 [[package]]
 name = "js-sched"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=772628f4356de822e8fe9971d807e368c70be479#772628f4356de822e8fe9971d807e368c70be479"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=a826aba49ac204ea4189ba547907f32aa58467dd#a826aba49ac204ea4189ba547907f32aa58467dd"
 dependencies = [
  "js-caps",
  "js-sizing",
@@ -1339,7 +1345,7 @@ dependencies = [
 [[package]]
 name = "js-server-core"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=772628f4356de822e8fe9971d807e368c70be479#772628f4356de822e8fe9971d807e368c70be479"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=a826aba49ac204ea4189ba547907f32aa58467dd#a826aba49ac204ea4189ba547907f32aa58467dd"
 dependencies = [
  "js-caps",
  "js-sched",
@@ -1354,7 +1360,7 @@ dependencies = [
 [[package]]
 name = "js-sim"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=772628f4356de822e8fe9971d807e368c70be479#772628f4356de822e8fe9971d807e368c70be479"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=a826aba49ac204ea4189ba547907f32aa58467dd#a826aba49ac204ea4189ba547907f32aa58467dd"
 dependencies = [
  "js-types",
  "rand_chacha 0.10.0",
@@ -1364,12 +1370,12 @@ dependencies = [
 [[package]]
 name = "js-sizing"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=772628f4356de822e8fe9971d807e368c70be479#772628f4356de822e8fe9971d807e368c70be479"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=a826aba49ac204ea4189ba547907f32aa58467dd#a826aba49ac204ea4189ba547907f32aa58467dd"
 
 [[package]]
 name = "js-state"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=772628f4356de822e8fe9971d807e368c70be479#772628f4356de822e8fe9971d807e368c70be479"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=a826aba49ac204ea4189ba547907f32aa58467dd#a826aba49ac204ea4189ba547907f32aa58467dd"
 dependencies = [
  "js-testkit",
  "postgres",
@@ -1383,7 +1389,7 @@ dependencies = [
 [[package]]
 name = "js-store"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=772628f4356de822e8fe9971d807e368c70be479#772628f4356de822e8fe9971d807e368c70be479"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=a826aba49ac204ea4189ba547907f32aa58467dd#a826aba49ac204ea4189ba547907f32aa58467dd"
 dependencies = [
  "js-caps",
  "js-sched",
@@ -1407,7 +1413,7 @@ dependencies = [
 [[package]]
 name = "js-testkit"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=772628f4356de822e8fe9971d807e368c70be479#772628f4356de822e8fe9971d807e368c70be479"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=a826aba49ac204ea4189ba547907f32aa58467dd#a826aba49ac204ea4189ba547907f32aa58467dd"
 dependencies = [
  "libc",
  "postgres",
@@ -1418,7 +1424,7 @@ dependencies = [
 [[package]]
 name = "js-types"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=772628f4356de822e8fe9971d807e368c70be479#772628f4356de822e8fe9971d807e368c70be479"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=a826aba49ac204ea4189ba547907f32aa58467dd#a826aba49ac204ea4189ba547907f32aa58467dd"
 dependencies = [
  "serde",
  "serde_json",
@@ -1428,7 +1434,7 @@ dependencies = [
 [[package]]
 name = "js-usage"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=772628f4356de822e8fe9971d807e368c70be479#772628f4356de822e8fe9971d807e368c70be479"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=a826aba49ac204ea4189ba547907f32aa58467dd#a826aba49ac204ea4189ba547907f32aa58467dd"
 dependencies = [
  "js-state",
  "js-types",
@@ -1438,7 +1444,7 @@ dependencies = [
 [[package]]
 name = "js-whole"
 version = "0.1.0"
-source = "git+https://github.com/komira-ai/jobscheduler?rev=772628f4356de822e8fe9971d807e368c70be479#772628f4356de822e8fe9971d807e368c70be479"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=a826aba49ac204ea4189ba547907f32aa58467dd#a826aba49ac204ea4189ba547907f32aa58467dd"
 
 [[package]]
 name = "kbf-alert"
@@ -1639,6 +1645,7 @@ dependencies = [
  "crc32fast",
  "futures",
  "hex",
+ "js-agent-usage",
  "kbf-auth",
  "kbf-caps",
  "kbf-cas-conformance",
@@ -3410,7 +3417,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4109,7 +4116,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4564,7 +4571,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

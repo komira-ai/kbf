@@ -293,3 +293,35 @@ async fn a_kill_that_ends_the_operation_is_written_at_once_and_a_restart_reads_i
     assert!(lines[1].contains("fallback=OverCap"), "{}", lines[1]);
     assert!(lines[1].contains("floor_mib=3840"), "{}", lines[1]);
 }
+
+/// Asserts `Farm::write_behind_now` on the js core writes the changed summaries to the state
+/// store before it returns (the farm's own driver does), where the report alone writes none:
+/// the case `tests/learned_sizes.rs` and `farm/learned_tests.rs` rely on. Catches: an arm that
+/// writes nothing.
+#[tokio::test(start_paused = true)]
+async fn write_behind_now_writes_the_summaries_of_runs_to_the_store() {
+    let store = store();
+    let farm = shadow_farm(LearnedSizes::Shadow, &backend())
+        .with_state(Some(StateStore {
+            store: Arc::clone(&store) as Arc<dyn Store>,
+            epoch: EpochPolicy::Keep,
+            members: Default::default(),
+            history: None,
+        }))
+        .expect("a farm over the store");
+    let mut joined = join(&farm, "node-now", big_node());
+    for i in 0..3_u8 {
+        run(
+            &farm,
+            "node-now",
+            &mut joined,
+            i + 1,
+            "compile now",
+            100 * MIB,
+        )
+        .await;
+    }
+    assert!(store.scan_prefix(ESTIMATE).expect("a scan").is_empty());
+    farm.write_behind_now();
+    assert!(!store.scan_prefix(ESTIMATE).expect("a scan").is_empty());
+}

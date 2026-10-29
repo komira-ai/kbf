@@ -17,7 +17,7 @@
 //! of the store the core opened ([`Core::epoch`]) once it has one.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
 use js_server_core::Core;
@@ -98,7 +98,8 @@ pub(crate) struct JsFarm {
     pub(crate) core: Core<KbfAdapter>,
     /// The farm's settings as the core was last built from them: the memory ladder and
     /// floors, the placement mode, the whole-node settings, the recorder, the held cap and
-    /// the orphan wait. The learned sizes are kept but this core does not use them.
+    /// the orphan wait, and the learned sizes mode, which the adapter's estimator is built
+    /// from (`on` learns as `shadow`).
     pub(crate) settings: Settings,
     /// The state store the core opened, if the farm has taken one.
     pub(crate) store: Option<Arc<dyn Store>>,
@@ -126,6 +127,10 @@ pub(crate) struct JsFarm {
     pub(crate) reports: AtomicUsize,
     /// Lets one writer of size summaries at a time take its rows and write them.
     pub(crate) learning_gate: crate::farm_js::Gate,
+    /// Whether the farm is fenced ([`Farm::fence`](crate::farm::Farm::fence)), which the
+    /// core does not say. A fenced core feeds nothing, so it refuses every `Result` as
+    /// stale, the current lease's too.
+    pub(crate) fenced: AtomicBool,
 }
 
 impl std::fmt::Debug for JsFarm {
@@ -240,6 +245,17 @@ impl JsFarm {
         self.settings = settings.clone();
     }
 
+    /// Sets the cap on the records the core holds for a store that refuses them, on the core
+    /// as it is. [`JsFarm::rebuild`] would take a core over a store up again from the store,
+    /// and lose what it holds only in memory: the records held back, which the cap counts.
+    /// The core takes the cap by value, so a bare core stands in for it meanwhile.
+    pub(crate) fn set_held_cap(&mut self, settings: &Settings) {
+        let stand_in = self.opening(settings, self.term).bare();
+        let core = std::mem::replace(&mut self.core, stand_in);
+        self.core = core.with_held_cap(settings.held_cap);
+        self.settings = settings.clone();
+    }
+
     /// Takes `state` over: builds the core over its store, which decides the epoch. Returns
     /// the epoch the core opened under, which is the farm's term and lease epoch from now on;
     /// `None` for no store.
@@ -306,6 +322,7 @@ impl Farm {
             shapes: Shapes::default(),
             reports: AtomicUsize::new(0),
             learning_gate: crate::farm_js::Gate::default(),
+            fenced: AtomicBool::new(false),
         };
         Self {
             cache,

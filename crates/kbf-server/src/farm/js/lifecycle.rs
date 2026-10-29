@@ -11,6 +11,7 @@
 //! [`Farm::intake`](crate::farm::Farm::intake) and [`Farm::follow`](crate::farm::Farm::follow)
 //! on a timer, whichever core the farm runs on.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use js_server_core::{FLUSH_LOOK, NodeAction as CoreAction, PlaceError as CorePlaceError};
@@ -26,10 +27,12 @@ use crate::fleet::NodeView;
 /// [`Farm::fence`](crate::farm::Farm::fence): [`Core::fence`](js_server_core::Core::fence).
 pub(crate) fn fence(js: &JsFarm) {
     js.core.fence();
+    js.fenced.store(true, Ordering::SeqCst);
 }
 
 /// [`Farm::resume`](crate::farm::Farm::resume): [`Core::resume`](js_server_core::Core::resume).
 pub(crate) fn resume(js: &JsFarm) {
+    js.fenced.store(false, Ordering::SeqCst);
     js.core.resume();
 }
 
@@ -163,13 +166,18 @@ pub(crate) fn place(
 
 /// [`Farm::write_behind_now`](crate::farm::Farm::write_behind_now).
 ///
-/// Nothing to write: the farm's write-behind is the learned size summaries, which this core
-/// does not keep (its store does not read or write sizes). The core's own write-behind, the
-/// effects of records the store has not taken ([`Core::write_behind`]), is retried by the
-/// write that follows and not on request.
+/// Writes the changed learned size summaries to the state store now, whatever the time since
+/// the last write, and returns when they are written: the same writer as the tick's
+/// ([`crate::farm_js::write_learned`]), taking the gate it shares with the tick and the
+/// reports. It is sync, as the farm's own driver's is, so it waits for the gate by yielding
+/// the thread and needs no runtime. The core's own write-behind, the effects of records the
+/// store has not taken ([`Core::write_behind`]), is retried by the write that follows and not
+/// on request.
 ///
 /// [`Core::write_behind`]: js_server_core::Core::write_behind
-pub(crate) fn write_behind_now(_js: &JsFarm) {}
+pub(crate) fn write_behind_now(js: &JsFarm) {
+    crate::farm_js::write_behind_now(&js.core, &js.learning_gate);
+}
 
 #[cfg(test)]
 #[path = "lifecycle_tests.rs"]

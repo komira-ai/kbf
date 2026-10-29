@@ -1603,9 +1603,16 @@ impl State {
         // over a store, so no client holds one for two frontends of a store to answer.
         self.side.machine = FarmMachine::new(durable.generation()?.unwrap_or(epoch));
         let now = self.engine.ambient.wall();
+        // The summaries come first: a queued operation is predicted from them as it is read
+        // back (`--placement-predictions`), by a lookup in memory. Off reads none and leaves
+        // them as they are.
+        if !self.side.learned.off() {
+            self.side.learned.restore(&durable.estimates()?);
+        }
         let mut recovered = Vec::new();
         let mut keyed = Vec::new();
         let mut walled = Vec::new();
+        let mut predicted = Vec::new();
         // A start takes up the operations that wait for a lease, and none that holds one:
         // the lease belongs to the frontend its node is connected to, which may be another
         // than this. A leased operation is taken up when its node says `Hello` here
@@ -1622,6 +1629,9 @@ impl State {
             if let Some(wall) = op.max_wall {
                 walled.push((op.operation, wall));
             }
+            if let Some(prediction) = self.side.predict_stored(&self.engine.sched, &op) {
+                predicted.push((op.operation, prediction));
+            }
             recovered.push(self.engine.take_stored(&mut self.side, op, now));
         }
         // The first blocks of ids are reserved here, past everything any frontend of the
@@ -1633,10 +1643,6 @@ impl State {
         self.engine.sched.restore_floors(stored.floors);
         self.engine.sched.restore_key_floors(stored.key_floors);
         let stored_names = stored.key_names;
-        // Off reads no size summaries and leaves them as they are.
-        if !self.side.learned.off() {
-            self.side.learned.restore(&durable.estimates()?);
-        }
         self.engine
             .sched
             .recover(epoch, first_operation, seqs.start, recovered);
@@ -1645,6 +1651,11 @@ impl State {
         // first placement round: the whole-node drain order and deadlines read it.
         for (operation, wall) in walled {
             self.engine.sched.set_max_wall(operation, wall);
+        }
+        // So is the predicted cost of a queued operation: it is not in the store, and the
+        // first placement round after the start reads it.
+        for (operation, prediction) in predicted {
+            self.engine.sched.set_cost(operation, prediction);
         }
         // The size keys come from the store's own rows, not from the requests: only `on`
         // reads them. A recovered lease keeps the request the store holds; a key floor

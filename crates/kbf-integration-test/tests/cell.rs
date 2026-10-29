@@ -8,6 +8,7 @@
 
 use std::future::pending;
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::{Child, Command, Output};
 use std::sync::Arc;
@@ -191,6 +192,7 @@ async fn the_daemon_runs_an_action_and_its_result_is_cached() {
         learned_sizes: kbf_server::LearnedSizes::Off,
         scheduler_core: kbf_server::SchedulerCore::under_test(),
         placement_load: kbf_server::PlacementLoad::Off,
+        placement_predictions: kbf_server::PlacementPredictions::Off,
         whole_node: None,
         finished_retention: Duration::from_secs(60),
         shutdown_timeout: Duration::from_secs(10),
@@ -285,8 +287,20 @@ fn pki_writes_every_file_or_fails() {
         "server.key",
         "client.pem",
         "client.key",
+        "frontend.pem",
+        "frontend.key",
+        "storage.pem",
+        "storage.key",
     ] {
         assert!(read(&dir.join(file)).starts_with("-----BEGIN"), "{file}");
+    }
+    // `kbf --mode=frontend` and `--mode=storage` refuse a key another user could read.
+    for key in ["frontend.key", "storage.key"] {
+        let mode = std::fs::metadata(dir.join(key))
+            .expect("the key")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "{key} is mode {mode:o}");
     }
 
     // A file where the directory should be, and a directory where a file should be.

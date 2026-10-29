@@ -19,6 +19,8 @@ use crate::state_store::StateStore;
 mod hot;
 mod learned;
 
+mod placement;
+
 mod views;
 
 fn farm() -> Farm {

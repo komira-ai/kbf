@@ -815,3 +815,133 @@ fn a_key_with_no_summary_has_no_row_to_write() {
     let keys = std::collections::BTreeSet::from([key]);
     assert!(learned.take_rows(keys).is_empty());
 }
+
+/// Asserts `write_behind_now` writes the changed summaries at once, before the write-behind
+/// interval and without a tick, and returns with them in the store; and that a second call
+/// with nothing changed writes nothing more. Catches: a call that leaves the summaries to the
+/// next tick, and one that rewrites summaries no run changed.
+#[tokio::test(start_paused = true)]
+async fn write_behind_now_writes_the_changed_summaries_before_returning() {
+    let rig = learning_rig(&Flaky::new(), LearnedSizes::Shadow);
+    teach(&rig, "node-now", "compile now").await;
+    assert_eq!(rows(&rig), 0, "nothing is written at the report");
+
+    let gate = GATE.with(Rc::clone);
+    super::write_behind_now(&rig.core, &gate);
+    let written = rows(&rig);
+    assert!(written > 0, "written at once");
+
+    // Overwritten with a marker: a second call that writes nothing leaves it alone.
+    let (name, _) = rig.store.plain().scan_prefix(ESTIMATE).expect("a scan")[0].clone();
+    overwrite(rig.store.plain(), &name, vec![9]);
+    super::write_behind_now(&rig.core, &gate);
+    let held = rig.store.plain().get(&name).expect("a get").expect("a row");
+    assert_eq!(
+        held.value,
+        vec![9],
+        "an unchanged summary is not written again"
+    );
+}
+
+/// Asserts an operation whose caller the machine does not know is not asked about, without a
+/// panic or a line. Catches: an estimate made for a waiter that is gone.
+#[tokio::test(start_paused = true)]
+async fn an_operation_whose_caller_is_unknown_is_not_asked_about() {
+    let log = capture();
+    let rig = learning_rig(&Flaky::new(), LearnedSizes::Shadow);
+    let admitted = rig
+        .core
+        .submit(at(0), request(1, 0), &super::testing::parcel(), |_, _| {})
+        .expect("queued");
+    let sized = super::learning::Sized {
+        kind: LeaseKind::Action,
+        gpus: 0,
+        memory_bytes: 4 * GIB,
+        cpu_millis: 1_000,
+        evidence: Default::default(),
+    };
+    rig.core
+        .with(|view, adapter| adapter.learn_submit(view, &admitted, &sized));
+    assert!(estimates(&log.text()).is_empty());
+}
+
+/// Asserts a writer that finds the gate held waits until it is let go and then takes it,
+/// without a runtime. Catches: a wait that gives up, or a take that does not wait.
+#[test]
+fn a_writer_without_a_runtime_waits_for_the_gate_to_be_let_go() {
+    let gate = Gate::default();
+    let mut held = Some(gate.0.try_lock().expect("the gate is free"));
+    let mut waited = 0_u32;
+    let taken = super::learning::hold(&gate, || {
+        waited += 1;
+        held.take();
+    });
+    assert_eq!(waited, 1, "it waited once, for the one holder");
+    assert!(gate.0.try_lock().is_err(), "and now holds the gate");
+    drop(taken);
+}
+
+/// Asserts the hourly sweep is bounded per tick and carries on at the next: more stale
+/// summaries than one tick commits are not all deleted at once, and the next tick finishes
+/// them. Catches: a sweep that does all of a large store in one tick (the lock-free write
+/// still holds the writer's gate and the store), and one that forgets what is left.
+#[tokio::test(start_paused = true)]
+async fn a_large_sweep_is_bounded_per_tick_and_continues_at_the_next() {
+    let store = Flaky::new();
+    let rig = learning_rig(&store, LearnedSizes::Shadow);
+    teach(&rig, "node-large", "compile large").await;
+    flush_at(&rig, 10_000).await;
+    let (name, row) = store.plain().scan_prefix(ESTIMATE).expect("a scan")[0].clone();
+    let first = name.strip_prefix(ESTIMATE).expect("a row name");
+    let (instance, rest) = first.split_once('/').expect("an instance segment");
+    for n in 0..1_100 {
+        // The instance is hex of its text: the copies name instances "main0000", "main0001"...
+        let suffix: String = format!("{n:04}")
+            .bytes()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let copy = format!("{ESTIMATE}{instance}{suffix}/{rest}");
+        overwrite(store.plain(), &copy, row.value.clone());
+    }
+    let before = rows(&rig);
+
+    let seventy_days = 70 * 24 * 3_600_000;
+    flush_at(&rig, seventy_days).await;
+    let after_one = rows(&rig);
+    assert!(
+        after_one < before && after_one > 0,
+        "{before} -> {after_one}"
+    );
+    flush_at(&rig, seventy_days + 1_000).await;
+    assert!(rows(&rig) < after_one, "the next tick goes on");
+}
+
+/// Asserts the estimator's record of which size keys it named is bounded: past the bound the
+/// oldest estimator key is dropped with its size keys. Catches: a record that grows without
+/// end for a farm that runs for months.
+#[test]
+fn the_names_of_size_keys_are_bounded() {
+    let mut learned = Learned::new(LearnedSizes::On, 4 * GIB, 0);
+    let platform = crate::machine::Platform::of(
+        &kbf_caps::Request::from_platform([("OSFamily", "linux")]).expect("a platform"),
+    );
+    let described = Described {
+        arguments: vec!["compile".to_owned()],
+        ..Described::default()
+    };
+    let subject = crate::action_usage::Subject::of(described).0;
+    let basis = crate::learned::basis_of_os("linux").expect("a basis");
+    let key_of = |n: usize| {
+        crate::learned::key_of(&format!("instance-{n}"), &platform, basis, &subject).expect("a key")
+    };
+    learned.register(&key_of(0), 0);
+    assert!(learned.summary_key(0).is_some());
+    for n in 1..=65_536_u64 {
+        learned.register(&key_of(n as usize), n);
+    }
+    assert!(
+        learned.summary_key(0).is_none(),
+        "the oldest name is dropped"
+    );
+    assert!(learned.summary_key(65_536).is_some());
+}

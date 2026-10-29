@@ -99,6 +99,9 @@ pub struct Listeners {
     pub scheduler_core: crate::SchedulerCore,
     /// Whether placement reads the load the nodes report (`--placement-load`).
     pub placement_load: crate::PlacementLoad,
+    /// Whether the scheduler is given the estimator's prediction of a new operation's cost
+    /// (`--placement-predictions`).
+    pub placement_predictions: crate::PlacementPredictions,
     /// The whole-node settings of the scheduler, if on (`--whole-node-max`).
     pub whole_node: Option<kbf_sched::WholeNodeConfig>,
     /// How long a finished operation is kept after its callers are answered, in which
@@ -1033,7 +1036,15 @@ where
         };
         let mut reapi_done = false;
         let outcome = tokio::select! {
-            served = reapi_serve => {
+            // The connections closed after GOAWAY, so no execution is open (`settle`); a
+            // daemon beside the server may hold the end ([`Drain::hold`]), and the worker
+            // listener serves meanwhile.
+            served = async {
+                let served = reapi_serve.await;
+                stopper.settle();
+                stopper.may_stand_down().await;
+                served
+            } => {
                 reapi_done = true;
                 served.map_err(ServeError::from)
             }

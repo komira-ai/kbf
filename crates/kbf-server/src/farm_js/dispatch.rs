@@ -59,9 +59,11 @@ pub fn register(
     connection: Connection,
 ) -> Result<Stream, Denied> {
     let noted = reported.clone();
+    let named = instance.as_str().to_owned();
     let open = |adapter: &mut KbfAdapter, stream| {
         adapter.attach(worker, stream, connection);
         adapter.note_registered(worker, &noted);
+        adapter.note_instance(worker, &named);
     };
     core.register(
         now,

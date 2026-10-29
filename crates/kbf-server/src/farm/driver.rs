@@ -20,6 +20,7 @@ use super::engine::HELD_CAP;
 use super::js::JsFarm;
 use crate::learned::{Learned, LearnedSizes};
 use crate::placement_load::PlacementLoad;
+use crate::placement_predictions::PlacementPredictions;
 
 /// Returns from the enclosing method with `farm::js::<group>::<method>(js, args..)` when
 /// the farm runs on the js core: `js_arm!(self, hot::resize(worker, stream, reported))`.
@@ -66,6 +67,8 @@ pub(crate) struct Settings {
     pub placement_load: PlacementLoad,
     /// What learned sizes do (`--learned-sizes`).
     pub learned: LearnedSizes,
+    /// Whether the scheduler is given predictions (`--placement-predictions`).
+    pub predictions: PlacementPredictions,
     /// The first rung of the ladder, in bytes, learned sizes start from.
     pub default_memory: u64,
     /// The whole-node drain and caps (`--whole-node-max`), if set.
@@ -85,6 +88,7 @@ impl Default for Settings {
             floors: MEMORY_FLOORS,
             placement_load: PlacementLoad::Off,
             learned: LearnedSizes::Off,
+            predictions: PlacementPredictions::Off,
             default_memory: 0,
             whole_node: None,
             recorder: Recorder::default(),
@@ -178,7 +182,17 @@ impl Driver {
     pub(super) fn set_learned(&mut self, epoch_unix_ms: u64, settings: &Settings) {
         js_rebuilt!(self, settings);
         self.state_mut().side.learned =
-            Learned::new(settings.learned, settings.default_memory, epoch_unix_ms);
+            Learned::new(settings.learned, settings.default_memory, epoch_unix_ms)
+                .with_predictions(settings.predictions);
+    }
+
+    /// Applies `settings.predictions`.
+    pub(super) fn set_predictions(&mut self, settings: &Settings) {
+        js_rebuilt!(self, settings);
+        self.state_mut()
+            .side
+            .learned
+            .set_predictions(settings.predictions);
     }
 
     /// Applies `settings.whole_node` to the scheduler of `term`. Called once it is set.
@@ -202,9 +216,13 @@ impl Driver {
         self.state_mut().engine.intake.orphan_wait = settings.orphan_wait;
     }
 
-    /// Applies `settings.held_cap`.
+    /// Applies `settings.held_cap`, to the core as it is on either driver: the cap changes
+    /// nothing the core was built from.
     pub(super) fn set_held_cap(&mut self, settings: &Settings) {
-        js_rebuilt!(self, settings);
+        if let Self::Js(js) = self {
+            js.set_held_cap(settings);
+            return;
+        }
         self.state_mut().engine.held_cap = settings.held_cap;
     }
 }
