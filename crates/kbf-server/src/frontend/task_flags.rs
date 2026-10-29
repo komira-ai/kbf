@@ -51,10 +51,13 @@ const MAX_BYTES: &str = "task_closure_max_bytes";
 /// unless they are configured to another.
 const DEFAULT_REGION: &str = "us-east-1";
 
-/// The run wall when `--task-run-wall-secs` is left out: 2 hours.
+/// The run wall when `--task-run-wall-secs` is left out: 2 hours. Clap takes the default as
+/// the literal below; this is the number the default-flags test checks it against.
+#[cfg(test)]
 const DEFAULT_RUN_WALL_SECS: u64 = 7_200;
 
-/// The slack when `--task-url-slack-secs` is left out: 10 minutes.
+/// The slack when `--task-url-slack-secs` is left out: 10 minutes (test-only, as above).
+#[cfg(test)]
 const DEFAULT_URL_SLACK_SECS: u64 = 600;
 
 /// The longest wall or slack a flag takes, in seconds: the 4 hour ceiling of a presigned write
