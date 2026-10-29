@@ -30,16 +30,16 @@
 //! - **Signed only what the build published.** The build call's files wait in the run's
 //!   artifact store while jobs that run repository code go by, so before it signs, the attest
 //!   job of a group checks what it downloaded ([`sums_checked`]): first that the sums file
-//!   is the one the build call's sums job published (`sha256sum --check --strict <<<
+//!   is the one the build call's sums job published (`/usr/bin/sha256sum --check --strict <<<
 //!   "$SUMS_SHA256  dist/SHA256SUMS"`, with `SUMS_SHA256` the input the pipeline passes from
-//!   that job's output), then that every file is the one the sums list (`sha256sum --check
+//!   that job's output), then that every file is the one the sums list (`/usr/bin/sha256sum --check
 //!   --strict SHA256SUMS` in `dist`; this proves that the files the sums LIST match, not that
 //!   `dist` holds nothing else: the sums job refuses an unlisted file, and the attest steps name
 //!   their files). Both are unconditional `sha256sum` commands run by the workflow's pinned bash
 //!   (the here-string is bash), after the last download and before the first attestation step.
 //!   No repository code runs beside `id-token: write`. The checks must also be able to fail: the
-//!   workflow's `defaults.run.shell` is exactly `bash` and its `env` has none of
-//!   [`STARTUP_ENV`]; the attest job has no `defaults`, no `env`, and no step with a `shell:`
+//!   workflow's `defaults.run.shell` is exactly `bash` and its `env` sets only names of
+//!   [`WORKFLOW_ENV`]; the attest job has no `defaults`, no `env`, and no step with a `shell:`
 //!   (a `shell: true {0}` would make both checks no-ops).
 //! - **Out of the job.** The job uploads `dist/*.sigstore.json` as the artifact
 //!   `bundles-<group>`, in a step that cannot be skipped and fails on no file.
@@ -304,10 +304,11 @@ fn attested_alone(
 }
 
 /// The check of the downloaded sums file against the digest the build call's sums job published.
-const SUMS_DIGEST_RUN: &str = "sha256sum --check --strict <<< \"$SUMS_SHA256  dist/SHA256SUMS\"";
+const SUMS_DIGEST_RUN: &str =
+    "/usr/bin/sha256sum --check --strict <<< \"$SUMS_SHA256  dist/SHA256SUMS\"";
 
 /// The check of every downloaded file against the sums file, run in `dist`.
-const SUMS_FILES_RUN: &str = "sha256sum --check --strict SHA256SUMS";
+const SUMS_FILES_RUN: &str = "/usr/bin/sha256sum --check --strict SHA256SUMS";
 
 /// The workflow input that carries group `g`'s digest: `sums_<group>_sha256`.
 pub fn digest_input(g: &str) -> String {
@@ -391,21 +392,38 @@ fn sums_checked(
 /// interpreter-budget scan reads a bare program literal in test code as a use of that program.
 const PINNED_SHELL: &str = concat!("b", "a", "s", "h");
 
-/// Variables that change what a bash does at startup or which program a name runs: set at the
-/// workflow's level they reach every step, so a check could be made to pass without checking.
-const STARTUP_ENV: &[&str] = &[
-    "BASH_ENV",
-    "ENV",
-    "SHELLOPTS",
-    "BASHOPTS",
-    "PATH",
-    "IFS",
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
+/// The names the workflow's top-level `env:` may set: exactly the ones it sets today. An
+/// allow-list, because a deny-list misses a name (`BASH_FUNC_sha256sum%%` makes bash import a
+/// function that shadows the command, and `LD_AUDIT`, `BASH_XTRACEFD` and `POSIXLY_CORRECT` change
+/// how programs run) and every step of the jobs that sign sees these. Adding a name here needs a
+/// security reason: say in the change why it cannot alter how a shell or `sha256sum` runs.
+/// This list is the protection: bash outside posix mode also imports a function named like the
+/// absolute path (`BASH_FUNC_/usr/bin/sha256sum%%`), so calling `/usr/bin/sha256sum` shadows nothing
+/// away by itself.
+const WORKFLOW_ENV: &[&str] = &[
+    "CARGO_TERM_COLOR",
+    "CARGO_INCREMENTAL",
+    "CYCLONEDX_VERSION",
+    "CYCLONEDX_SHA256_AARCH64_DARWIN",
+    "CYCLONEDX_SHA256_X86_64_LINUX",
+    "CYCLONEDX_SHA256_AARCH64_LINUX",
+    "GH_VERSION",
+    "GH_SHA256_X86_64_LINUX",
+    "GH_SHA256_AARCH64_LINUX",
+    "GH_SHA256_AARCH64_DARWIN",
+    "UPGRADE_FROM_TAG",
+    "UPGRADE_FROM_COMMIT",
+    "UPGRADE_FROM_INSTALLER_SHA256_X86_64",
+    "UPGRADE_FROM_KBF_SHA256_X86_64",
+    "UPGRADE_FROM_INSTALLER_SHA256_AARCH64",
+    "UPGRADE_FROM_KBF_SHA256_AARCH64",
+    "NFPM_VERSION",
+    "NFPM_SHA256_X86_64_LINUX",
+    "NFPM_SHA256_AARCH64_LINUX",
 ];
 
 /// The checks of the attest job `job` are `sha256sum` run by the workflow's bash: the workflow's
-/// `defaults.run.shell` is exactly `bash` and its `env` sets none of [`STARTUP_ENV`], and the job
+/// `defaults.run.shell` is exactly `bash` and its `env` sets only names of [`WORKFLOW_ENV`], and the job
 /// has no `defaults`, no `env` and no step with a `shell:` (`shell: true {0}` runs nothing).
 fn shell_cannot_be_swapped(
     artifacts: &str,
@@ -420,9 +438,9 @@ fn shell_cannot_be_swapped(
         ));
     }
     for (name, _) in workflows::top_env(artifacts)? {
-        if STARTUP_ENV.contains(&name.as_str()) {
+        if !WORKFLOW_ENV.contains(&name.as_str()) {
             out.push(format!(
-                "the workflow's `env` sets `{name}`, which changes how a shell starts: the checks of `{job}` could be made to pass without checking"
+                "the workflow's `env` sets `{name}`, which is not in the allow-list `WORKFLOW_ENV`: a variable can change how a shell or `sha256sum` runs, and the checks of `{job}` could be made to pass without checking"
             ));
         }
     }

@@ -97,13 +97,13 @@ fn sums_checks(g: &str) -> String {
 /// The digest check of the group `g`.
 fn sums_digest_step(g: &str) -> String {
     format!(
-        "      - name: Refuse sums other than the build's\n        env:\n          SUMS_SHA256: ${{{{ inputs.{} }}}}\n        run: sha256sum --check --strict <<< \"$SUMS_SHA256  dist/SHA256SUMS\"\n",
+        "      - name: Refuse sums other than the build's\n        env:\n          SUMS_SHA256: ${{{{ inputs.{} }}}}\n        run: /usr/bin/sha256sum --check --strict <<< \"$SUMS_SHA256  dist/SHA256SUMS\"\n",
         digest_input(g)
     )
 }
 
 /// The file check.
-const SUMS_FILES_STEP: &str = "      - name: Refuse files other than the sums list\n        working-directory: dist\n        run: sha256sum --check --strict SHA256SUMS\n";
+const SUMS_FILES_STEP: &str = "      - name: Refuse files other than the sums list\n        working-directory: dist\n        run: /usr/bin/sha256sum --check --strict SHA256SUMS\n";
 
 /// artifacts.yml as the rules want it.
 fn good_artifacts() -> String {
@@ -165,6 +165,18 @@ fn broken(from: &str, to: &str) -> String {
     let w = good_artifacts();
     assert!(w.contains(from), "{from:?} is not in the planted workflow");
     w.replacen(from, to, 1)
+}
+
+/// [`broken`] for the `nth` (from 0) occurrence of `from`, for text both attest jobs share.
+fn broken_at(from: &str, to: &str, nth: usize) -> String {
+    let mut w = good_artifacts();
+    let at = w
+        .match_indices(from)
+        .nth(nth)
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| panic!("{from:?} has no occurrence {nth} in the planted workflow"));
+    w.replace_range(at..at + from.len(), to);
+    w
 }
 
 /// Defects checked one after the other, every one that goes unnamed reported
@@ -866,8 +878,9 @@ fn the_attest_job_checks_the_downloaded_sums_and_files_before_it_signs() {
     let digest = sums_digest_step("linux");
     let files = SUMS_FILES_STEP;
     let first_attest = "      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2\n        with:\n          subject-checksums: dist/SHA256SUMS\n";
-    let wrong = "does not run `sha256sum --check --strict <<< \"$SUMS_SHA256  dist/SHA256SUMS\"`";
-    let wrong_files = "does not run `sha256sum --check --strict SHA256SUMS` in `dist`";
+    let wrong =
+        "does not run `/usr/bin/sha256sum --check --strict <<< \"$SUMS_SHA256  dist/SHA256SUMS\"`";
+    let wrong_files = "does not run `/usr/bin/sha256sum --check --strict SHA256SUMS` in `dist`";
     cases.artifacts("no digest check", &broken(&digest, ""), wrong, true);
     cases.artifacts("no file check", &broken(files, ""), wrong_files, true);
     cases.artifacts(
@@ -948,8 +961,8 @@ fn the_attest_job_checks_the_downloaded_sums_and_files_before_it_signs() {
     cases.artifacts(
         "a weaker command",
         &broken(
-            "run: sha256sum --check --strict SHA256SUMS",
-            "run: sha256sum --check SHA256SUMS",
+            "run: /usr/bin/sha256sum --check --strict SHA256SUMS",
+            "run: /usr/bin/sha256sum --check SHA256SUMS",
         ),
         wrong_files,
         false,
@@ -960,65 +973,55 @@ fn the_attest_job_checks_the_downloaded_sums_and_files_before_it_signs() {
 #[test]
 fn the_sums_checks_cannot_be_turned_into_no_ops_by_a_shell_or_a_startup_variable() {
     // Catches: both `sha256sum` checks passing without checking. A step-level `shell: true {0}`
-    // (or `echo {0}`), a job-level `defaults.run.shell`, a workflow default other than `bash`
-    // (the here-string is bash), and a variable that changes how bash starts or which program a
-    // name runs (`BASH_ENV` runs a file first, `SHELLOPTS`/`BASHOPTS` change options, `PATH`
-    // picks the `sha256sum`), at the job's level or the workflow's. Each plant leaves the
-    // checks themselves as they are, so only these rules can see it.
+    // (or `echo {0}`), a job-level `defaults.run.shell` or `env`, a workflow default other than
+    // `bash` (the here-string is bash), and any workflow-level variable outside the allow-list
+    // (`BASH_ENV` runs a file first, `SHELLOPTS`/`BASHOPTS`/`POSIXLY_CORRECT`/`BASH_XTRACEFD`
+    // change how bash runs, `PATH`/`LD_*` pick or alter the program, `BASH_FUNC_sha256sum%%`
+    // imports a function that shadows it). Each plant leaves the checks as they are, so only
+    // these rules can see it, and it is made against both attest jobs.
     let mut cases = Cases::default();
-    let digest = sums_digest_step("linux");
-    let files = SUMS_FILES_STEP;
-    let shell_wanted = "a `run:` step of `attest-linux` has `shell: ";
-    for shell in ["true {0}", "echo {0}", PINNED_SHELL] {
+    for (nth, g) in ["linux", "darwin-arm64"].into_iter().enumerate() {
+        let job = format!("attest-{g}");
+        let digest = sums_digest_step(g);
+        let files = SUMS_FILES_STEP;
+        let shell_wanted = format!("a `run:` step of `{job}` has `shell: ");
+        for shell in ["true {0}", "echo {0}", PINNED_SHELL] {
+            for (what, step) in [("digest", digest.as_str()), ("file", files)] {
+                cases.artifacts(
+                    &format!("a step shell `{shell}` on the {what} check of {job}"),
+                    &broken_at(
+                        step,
+                        &step.replace(
+                            "        run:",
+                            &format!("        shell: {shell}\n        run:"),
+                        ),
+                        // The digest step is the group's own; the file step is in both jobs.
+                        if what == "file" { nth } else { 0 },
+                    ),
+                    &shell_wanted,
+                    true,
+                );
+            }
+        }
+        let head = format!("  {job}:\n    runs-on: ubuntu-24.04\n");
         cases.artifacts(
-            &format!("a step shell `{shell}` on the digest check"),
+            &format!("a job-level default shell on {job}"),
             &broken(
-                &digest,
-                &digest.replace(
-                    "        run:",
-                    &format!("        shell: {shell}\n        run:"),
-                ),
+                &head,
+                &format!("{head}    defaults:\n      run:\n        shell: 'true {{0}}'\n"),
             ),
-            shell_wanted,
+            &format!("`{job}` has `defaults:`"),
             true,
         );
-        cases.artifacts(
-            &format!("a step shell `{shell}` on the file check"),
-            &broken(
-                files,
-                &files.replace(
-                    "        run:",
-                    &format!("        shell: {shell}\n        run:"),
-                ),
-            ),
-            shell_wanted,
-            true,
-        );
+        for var in ["BASH_ENV", "SHELLOPTS", "PATH", "A"] {
+            cases.artifacts(
+                &format!("a job-level {var} on {job}"),
+                &broken(&head, &format!("{head}    env:\n      {var}: /x\n")),
+                &format!("`{job}` has a job-level `env:`"),
+                true,
+            );
+        }
     }
-    let head = "  attest-linux:\n    runs-on: ubuntu-24.04\n";
-    cases.artifacts(
-        "a job-level default shell",
-        &broken(
-            head,
-            &format!("{head}    defaults:\n      run:\n        shell: 'true {{0}}'\n"),
-        ),
-        "`attest-linux` has `defaults:`",
-        true,
-    );
-    for var in ["BASH_ENV", "SHELLOPTS", "PATH"] {
-        cases.artifacts(
-            &format!("a job-level {var}"),
-            &broken(head, &format!("{head}    env:\n      {var}: /x\n")),
-            "`attest-linux` has a job-level `env:`",
-            true,
-        );
-    }
-    cases.artifacts(
-        "any job-level env",
-        &broken(head, &format!("{head}    env:\n      A: b\n")),
-        "`attest-linux` has a job-level `env:`",
-        true,
-    );
     let defaults = format!("defaults:\n  run:\n    shell: {PINNED_SHELL}\n");
     let defaults = defaults.as_str();
     cases.artifacts(
@@ -1047,25 +1050,50 @@ fn the_sums_checks_cannot_be_turned_into_no_ops_by_a_shell_or_a_startup_variable
         "PATH",
         "IFS",
         "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "BASH_FUNC_sha256sum%%",
+        "BASH_FUNC_/usr/bin/sha256sum%%",
+        "BASH_XTRACEFD",
+        "POSIXLY_CORRECT",
+        "FOO",
     ] {
         cases.artifacts(
             &format!("a workflow-level {var}"),
-            &broken(defaults, &format!("{defaults}env:\n  {var}: /x\n")),
-            &format!("the workflow's `env` sets `{var}`"),
+            &broken(
+                defaults,
+                &format!("{defaults}env:\n  '{var}': '() {{ true; }}'\n"),
+            ),
+            &format!("the workflow's `env` sets `{var}`, which is not in the allow-list"),
             false,
         );
     }
     cases.done();
-    // An ordinary variable is not refused.
+    // Every name of the allow-list is accepted, and the lint reads them as the workflow sets them.
+    let all: String = WORKFLOW_ENV.iter().map(|n| format!("  {n}: x\n")).collect();
     assert_eq!(
         found(
-            &broken(
-                defaults,
-                &format!("{defaults}env:\n  CARGO_TERM_COLOR: always\n")
-            ),
+            &broken(defaults, &format!("{defaults}env:\n{all}")),
             GOOD_RELEASE,
             &LISTED
         ),
         Vec::<String>::new()
     );
+}
+
+#[test]
+fn the_real_workflow_env_is_the_allow_list() {
+    // Catches: a variable added to (or dropped from) artifacts.yml's top-level `env:` without the
+    // allow-list being changed on purpose, which is what makes adding one a reviewed decision.
+    let text = std::fs::read_to_string(crate::repo_root().join(".github/workflows/artifacts.yml"))
+        .expect("artifacts.yml");
+    let mut names: Vec<String> = workflows::top_env(&text)
+        .expect("env")
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    names.sort();
+    let mut allowed: Vec<String> = WORKFLOW_ENV.iter().map(|n| (*n).to_owned()).collect();
+    allowed.sort();
+    assert_eq!(names, allowed);
 }

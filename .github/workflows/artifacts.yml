@@ -829,10 +829,10 @@ jobs:
       - name: Refuse sums other than the build's
         env:
           SUMS_SHA256: ${{ inputs.sums_linux_sha256 }}
-        run: sha256sum --check --strict <<< "$SUMS_SHA256  dist/SHA256SUMS"
+        run: /usr/bin/sha256sum --check --strict <<< "$SUMS_SHA256  dist/SHA256SUMS"
       - name: Refuse listed files that differ from the sums
         working-directory: dist
-        run: sha256sum --check --strict SHA256SUMS
+        run: /usr/bin/sha256sum --check --strict SHA256SUMS
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: dist/SHA256SUMS
@@ -1162,10 +1162,10 @@ jobs:
       - name: Refuse sums other than the build's
         env:
           SUMS_SHA256: ${{ inputs.sums_darwin_arm64_sha256 }}
-        run: sha256sum --check --strict <<< "$SUMS_SHA256  dist/SHA256SUMS"
+        run: /usr/bin/sha256sum --check --strict <<< "$SUMS_SHA256  dist/SHA256SUMS"
       - name: Refuse listed files that differ from the sums
         working-directory: dist
-        run: sha256sum --check --strict SHA256SUMS
+        run: /usr/bin/sha256sum --check --strict SHA256SUMS
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: dist/SHA256SUMS
