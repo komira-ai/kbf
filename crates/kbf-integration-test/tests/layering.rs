@@ -605,6 +605,26 @@ fn a_daemon_cannot_build_a_cold_store_client() {
     );
 }
 
+/// The daemon bins each lease's usage with the jobscheduler's standalone `js-agent-usage`
+/// crate, which depends on nothing. The crates that read the same files and post them
+/// (`js-agent`, `js-client`) are in no package of the workspace's graph: a daemon that took
+/// `js-agent` would reach `ureq`, and `a_daemon_cannot_build_a_cold_store_client` would say
+/// only that; this one says why.
+#[test]
+fn a_daemon_takes_the_usage_binner_from_js_agent_usage_alone() {
+    let g = load_graph();
+    assert!(
+        !reaches(&g, "kbf-daemon", &["js-agent-usage"]).is_empty(),
+        "kbf-daemon's closure must hold js-agent-usage"
+    );
+    for name in ["js-agent", "js-client"] {
+        assert!(
+            !g.names.values().any(|n| n == name),
+            "{name} is a package of the workspace's graph"
+        );
+    }
+}
+
 /// What the routing library's normal dependencies must not reach: the frontend's scheduler
 /// and authorization, the server, and the daemon's side (the transfer engine and the node).
 /// The frontend and the daemon both use it (docs/design/architecture-v2.md, section 7); a

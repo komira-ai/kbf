@@ -635,6 +635,19 @@ impl<R: Runtime> Harness<R> {
         Self::build(name, runtimes, runtime, fence_after, |_| {}, None, None).await
     }
 
+    /// Starts a server and a daemon running leases through `runtime`, whose lease usage is
+    /// binned by `usage_window` instead of the Welcome's interval (`DaemonConfig::usage_window`).
+    pub async fn with_usage_window(
+        name: &str,
+        runtime: Arc<R>,
+        fence_after: Duration,
+        usage_window: Duration,
+    ) -> Self {
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let configure = |config: &mut DaemonConfig| config.usage_window = Some(usage_window);
+        Self::build(name, runtimes, runtime, fence_after, configure, None, None).await
+    }
+
     /// Starts a server and a daemon running leases through `runtimes`, of which
     /// `runtime` is the one [`Harness::runtime`] names and whose driver the report the
     /// daemon is given lists (the daemon adds the others'). Its fence time is

@@ -231,9 +231,14 @@ impl Driver {
         self.state_mut().engine.intake.orphan_wait = settings.orphan_wait;
     }
 
-    /// Applies `settings.held_cap`.
+    /// Applies `settings.held_cap`, to the core as it is on either driver: the cap changes
+    /// nothing the core was built from.
     pub(super) fn set_held_cap(&mut self, settings: &Settings) {
-        js_rebuilt!(self, settings);
+        #[cfg(feature = "farm-core-js")]
+        if let Self::Js(js) = self {
+            js.set_held_cap(settings);
+            return;
+        }
         self.state_mut().engine.held_cap = settings.held_cap;
     }
 }
