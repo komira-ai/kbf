@@ -800,5 +800,15 @@ fn pkg_image_asset_wants_the_reference_of_its_service_and_no_other() {
     let (code, _, err) = run(&["--binary", &file, "--out", &out], "coordinator");
     assert_eq!(code, Some(1), "{err}");
     assert!(err.contains("not an OCI image tar"), "{err}");
+    // The task image is held to --binary as the coordinator's is.
+    let (code, _, err) = run(&["--kbf-tarball", &file, "--out", &out], "task");
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("the task image is checked against --binary"),
+        "{err}"
+    );
+    let (code, _, err) = run(&["--binary", &file, "--out", &out], "task");
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("not an OCI image tar"), "{err}");
     assert!(!root.join("dist").join("SHA256SUMS.linux-x86_64").exists());
 }

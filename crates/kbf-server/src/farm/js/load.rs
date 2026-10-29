@@ -8,7 +8,8 @@ use kbf_types::sched::usage;
 
 use super::JsFarm;
 use crate::farm::StreamId;
-use crate::farm::node_load::{Session, accept};
+use crate::farm::node_load::{Session, accept, shown_all};
+use crate::fleet::LoadView;
 
 /// [`Farm::note_node_load`](crate::farm::Farm::note_node_load): the reading, taken if the
 /// accept rule takes it, as the load `Beat::with_load` takes
@@ -33,6 +34,18 @@ pub(crate) fn note_node_load(
             &session,
             load,
             &capacity,
+            now,
+        )
+    })
+}
+
+/// [`Farm::node_loads`](crate::farm::Farm::node_loads).
+pub(crate) fn node_loads(js: &JsFarm) -> Vec<(WorkerId, LoadView)> {
+    let now = js.now();
+    js.core.with(|view, adapter| {
+        shown_all(
+            adapter.node_loads(),
+            |worker| view.sched().capacity(worker).unwrap_or_default(),
             now,
         )
     })

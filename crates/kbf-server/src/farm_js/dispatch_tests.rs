@@ -34,7 +34,7 @@ async fn report_of(
         &rig.core,
         backend,
         &wall(),
-        || at(0),
+        &|| at(0),
         &WorkerId::new(worker),
         result,
     )
@@ -320,7 +320,7 @@ async fn calls_the_admission_refuses_are_refused() {
         &rig.core,
         &rig.backend,
         &wall(),
-        || at(0),
+        &|| at(0),
         &worker,
         ran(LeaseId::new(7, 0), 0),
     )
@@ -466,7 +466,7 @@ async fn a_result_taken_after_the_core_was_handed_over_is_refused_stale() {
         &rig.core,
         &rig.backend,
         &wall(),
-        now,
+        &now,
         &WorkerId::new("node-a"),
         ran(lease, 0),
     )
