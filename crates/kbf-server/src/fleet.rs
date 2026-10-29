@@ -214,6 +214,16 @@ pub fn quarantine_change(
     }
 }
 
+/// The deadline a drain is shown with: `unix_ms` as it is, or `None` for a drain with no
+/// deadline. A deadline of half the range of a `u64` of milliseconds (about 292 million years)
+/// or more counts as none: it is what [`NO_DRAIN_DEADLINE`](crate::api::NO_DRAIN_DEADLINE)
+/// becomes (saturated, or less the store's clock when another frontend applies the stored
+/// row), and no operator's deadline comes near it.
+#[must_use]
+pub(crate) fn shown_deadline(unix_ms: u64) -> Option<u64> {
+    (unix_ms < u64::MAX / 2).then_some(unix_ms)
+}
+
 /// Where a node is in placement. Serialized with its `state` as a tag.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -225,8 +235,9 @@ pub enum PlacementView {
     /// Cordoned, and its leases are waited for until the deadline.
     Draining {
         /// When the drain pauses if leases still run: milliseconds since the Unix
-        /// epoch, server clock.
-        deadline_unix_ms: u64,
+        /// epoch, server clock. Left out for a drain with no deadline.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        deadline_unix_ms: Option<u64>,
         /// The leases it still holds, as `term.seq`.
         leases: Vec<String>,
     },
@@ -236,7 +247,7 @@ pub enum PlacementView {
     /// until an operator drains it again or uncordons it.
     DrainPaused {
         /// The deadline that passed (milliseconds since the Unix epoch).
-        deadline_unix_ms: u64,
+        deadline_unix_ms: Option<u64>,
         /// The leases it still holds, as `term.seq`.
         leases: Vec<String>,
     },

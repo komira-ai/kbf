@@ -7,6 +7,7 @@ use kbf_types::{FarmTime, WorkerId};
 use super::{Farm, NodeUnread, State};
 use crate::fleet::{
     NodeDetail, NodeView, NodesView, PhaseView, PlacementView, ResourcesView, needs_attention,
+    shown_deadline,
 };
 
 impl Farm {
@@ -111,12 +112,12 @@ impl Farm {
             None => PlacementView::Serving,
             Some(Cordon::Cordoned) => PlacementView::Cordoned,
             Some(Cordon::Draining { deadline }) => PlacementView::Draining {
-                deadline_unix_ms: wall(*deadline),
+                deadline_unix_ms: shown_deadline(wall(*deadline)),
                 leases: leases(),
             },
             Some(Cordon::Drained) => PlacementView::Drained,
             Some(Cordon::Paused { deadline }) => PlacementView::DrainPaused {
-                deadline_unix_ms: wall(*deadline),
+                deadline_unix_ms: shown_deadline(wall(*deadline)),
                 leases: leases(),
             },
         };

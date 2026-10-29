@@ -183,7 +183,7 @@ placement, and, after the list, the oldest protocol version among them:
 | `needs_attention` | what an operator must do on the node, one line per item: today each installed Xcode that is not ready, as `Xcode <build> (<app>) installed but not ready: <reason>; fix: <command>`. An Xcode `not_surveyed` keeps the item the same app had in the node's previous status (as when a restarted daemon sends its first status), until a survey reports it; one with no previous item has none. The server also logs each item once at `WARN` (target `kbf_server::attention`) when it appears, and at `INFO` when a status reports it gone (its Xcode ready, changed or removed); a status that repeats an item, or lists its Xcode `not_surveyed`, logs nothing. An item is the same while its Xcode's app, build, state and fix are, so a reason that changes alone is shown here but not logged again. The previous status is kept in the server's memory: after a server restart, each item is logged again when its node reports it; kbf has no alert delivery yet (issue #189) |
 | `lease_count` | how many leases it holds now (granted or running), the number of entries of `GET /v1/nodes/{id}`'s `leases`. In memory like the rest: after a server restart it is 0 until the daemon's leases are granted again |
 | `booked` | what those leases book of its capacity: `{"cpu_millis", "memory_bytes", "gpus", "vms"}`, CPU in thousandths of a core, memory in bytes. A record of the leases' limits, not a measurement of use |
-| `placement.state` | `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
+| `placement.state` | `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`, which is left out for a drain with no deadline); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
 | `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term, the Raft term under the Raft metadata log: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
 
 The list is the nodes this server process has seen, so it says nothing of a daemon that has
@@ -278,7 +278,7 @@ the call:
 
 | Call | Answer |
 |---|---|
-| `POST /v1/nodes/{id}:drain` | as the operator API's drain: cordons the node and waits for its leases; the body is `{"deadline_secs": N}` or none (30 minutes) |
+| `POST /v1/nodes/{id}:drain` | as the operator API's drain: cordons the node and waits for its leases; the body is `{"deadline_secs": N}` or none (no deadline: the drain waits for the leases however long they run) |
 | `POST /v1/nodes/{id}:uncordon` | as the operator API's uncordon |
 | `GET /v1/nodes/{id}` | as `GET /v1/nodes/{id}` above |
 | `GET /v1/nodes/{id}/storage-health` | below |
@@ -376,8 +376,10 @@ An operator takes a node out of placement, drains it, or returns it
 - `:cordon` (`POST /v1/nodes/{node}:cordon`): the scheduler offers the node no new lease; its leases run on. A drain
   already under way is kept.
 - `:drain` (`POST /v1/nodes/{node}:drain`): cordons the node and waits for its leases to end. The body may be
-  `{"deadline_secs": N}`; without a body the deadline is 30 minutes. With no lease
-  left the node is `drained`. If the deadline comes first the drain **pauses**: the
+  `{"deadline_secs": N}` (seconds, any value, 0 included); without a body there is **no
+  deadline**: the node stays `draining` until its leases end, then is `drained`, and is never
+  `drain_paused`. With no lease left the node is `drained`. If a deadline that was given comes
+  first, the drain **pauses**: the
   leases run on, nothing is killed or given up, and the node stays `drain_paused`
   even after they end, until an operator drains it again (a new deadline) or
   uncordons it.
