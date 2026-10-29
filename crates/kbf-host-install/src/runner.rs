@@ -12,6 +12,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::ids;
+
 /// The only `PATH` a child sees.
 pub const PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -60,8 +62,8 @@ pub struct Cmd {
     /// Variables the child sees besides the fixed three.
     pub env: Vec<(String, String)>,
     /// The user and group the child runs as, with no supplementary group; none for the
-    /// caller's own. A root caller is needed (see [`launch`]). On macOS the command starts in
-    /// `/`, because `chroot` sets the working directory.
+    /// caller's own. A root caller is needed (see [`drop_ids`]). On macOS the command starts in
+    /// `/`, because the user may not be able to enter the caller's directory.
     pub run_as: Option<Identity>,
     /// Bytes written to the child's standard input, which is then closed; none for an
     /// input that is closed at once.
@@ -228,54 +230,32 @@ fn wait_watching(
     }
 }
 
-/// macOS's `chroot(8)`, which sets the supplementary groups itself before it drops to a user.
-const CHROOT: &str = "/usr/sbin/chroot";
-
-/// What is executed for a command.
-#[derive(Debug, PartialEq, Eq)]
-struct Launch {
-    program: String,
-    args: Vec<String>,
-    /// The ids this process sets on the child (`Command::uid` and `gid`), for a drop it makes
-    /// itself.
-    set_ids: Option<Identity>,
-}
-
-/// How `cmd` is started. A drop to another user is made by this process (`Command::uid` and
-/// `gid`) unless `through_chroot`, because the standard library empties the supplementary
-/// groups with `setgroups(0)` before it sets the gid, and on macOS that leaves the old
-/// effective gid (group 0, `wheel`, for root) as the child's only supplementary group;
-/// `CommandExt::groups` would set them explicitly but is not stable. `chroot -u -g -G /`
-/// sets the groups to the one gid, drops, and runs the program; the root it enters is `/`.
-/// That path refuses a target of uid 0 or gid 0 (`PermissionDenied`), which `refuse_setuid_drop`
-/// does not cover there: `chroot` would run the program as root, or in group 0, without a drop.
-fn launch(cmd: &Cmd, through_chroot: bool) -> io::Result<Launch> {
-    Ok(match cmd.run_as {
-        Some(id) if through_chroot => {
-            if id.uid == 0 || id.gid == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "a privilege drop through chroot needs a uid and a gid that are not root's",
-                ));
-            }
-            let ids = [id.uid, id.gid, id.gid].map(|n| n.to_string());
-            let mut args: Vec<String> = ["-u", &ids[0], "-g", &ids[1], "-G", &ids[2], "/"]
-                .map(str::to_owned)
-                .to_vec();
-            args.push(cmd.program.clone());
-            args.extend(cmd.args.iter().cloned());
-            Launch {
-                program: CHROOT.to_owned(),
-                args,
-                set_ids: None,
-            }
-        }
-        other => Launch {
-            program: cmd.program.clone(),
-            args: cmd.args.clone(),
-            set_ids: other,
-        },
-    })
+/// How the child gets its ids. A drop to another user is made by this process: by
+/// `Command::uid` and `gid` where the standard library's `setgroups(0)` empties the groups
+/// (Linux), and, with `exact_groups`, in the child just before it executes the program, which
+/// sets the supplementary groups to the one gid, then the gid, then the uid ([`ids::switch_to`]).
+/// The second is for macOS, where the standard library's `setgroups(0)` leaves the old
+/// effective gid (group 0, `wheel`, for root) as the child's only supplementary group.
+/// (`chroot(8)` would set the groups too, but a process that calls `chroot` and then executes
+/// a program is killed by the system on macOS, `SIGKILL` at once, even for `/` and
+/// `/usr/bin/true`.) The second refuses a target of uid 0 or gid 0 (`PermissionDenied`): it
+/// would otherwise run the program as root, or in group 0, without a drop.
+fn drop_ids(command: &mut Command, run_as: Option<Identity>, exact_groups: bool) -> io::Result<()> {
+    let Some(id) = run_as else { return Ok(()) };
+    if !exact_groups {
+        command.uid(id.uid).gid(id.gid);
+        return Ok(());
+    }
+    if id.uid == 0 || id.gid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "a privilege drop with exact groups needs a uid and a gid that are not root's",
+        ));
+    }
+    // The child starts in `/`: the caller's directory may be one the new user cannot enter.
+    command.current_dir("/");
+    ids::switch_to(command, id);
+    Ok(())
 }
 
 /// Refuse a privilege drop made by this process when its effective uid is root and its real
@@ -293,15 +273,14 @@ fn refuse_setuid_drop(set_ids: Option<Identity>, uid: u32, euid: u32) -> io::Res
 
 impl Runner for SystemRunner {
     fn run(&self, cmd: &Cmd) -> io::Result<Exec> {
-        let launch = launch(cmd, cfg!(target_os = "macos"))?;
         refuse_setuid_drop(
-            launch.set_ids,
+            cmd.run_as,
             rustix::process::getuid().as_raw(),
             rustix::process::geteuid().as_raw(),
         )?;
-        let mut command = Command::new(&launch.program);
+        let mut command = Command::new(&cmd.program);
         command
-            .args(&launch.args)
+            .args(&cmd.args)
             .env_clear()
             .env("PATH", PATH)
             .env("LANG", LANG)
@@ -314,9 +293,7 @@ impl Runner for SystemRunner {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(id) = launch.set_ids {
-            command.uid(id.uid).gid(id.gid);
-        }
+        drop_ids(&mut command, cmd.run_as, cfg!(target_os = "macos"))?;
         let mut child = command.spawn()?;
         // The input is written from a thread, or a child that writes before it reads
         // blocks on a full pipe while this waits for it.

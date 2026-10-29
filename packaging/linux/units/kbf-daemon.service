@@ -52,10 +52,11 @@ ExecStartPre=+/usr/bin/kbf boot-check --mode=daemon
 # that runs before the bind retry never leaves the unit down for good (kbf#998, #1000).
 ExecStartPre=/usr/bin/kbf --mode=daemon --check
 ExecStart=/usr/bin/kbf --mode=daemon
-# The daemon drains on SIGTERM for up to --drain-deadline-secs (600 by default), then
-# stops. The stop timeout is that plus 60 s, so systemd never SIGKILLs a drain; it stays
-# finite, so a hung daemon still lets a reboot through (package-test rule `stop`).
-TimeoutStopSec=660
+# The daemon drains on SIGTERM until every lease has ended, however long that takes
+# (--drain-deadline-secs, if set, only logs a warning), so systemd must never SIGKILL a
+# drain: the stop timeout is infinity, as on every unit that drains (package-test rule
+# `stop`). A second SIGTERM is the operator's hard stop.
+TimeoutStopSec=infinity
 KillSignal=SIGTERM
 # KillMode=mixed: systemd's default (control-group) sends SIGTERM to every process of the
 # unit at once, and the actions run in sub-cgroups of it, so a stop would end them in the
