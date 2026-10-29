@@ -133,7 +133,7 @@ pub struct Cli {
     pub action: Digest,
     /// Where the inputs are laid out (`in/` under it) and the output streams are written. The
     /// Command's `HOME`, `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH` name directories
-    /// under `private/` here (mode 0700), beside `in/` and so never collected as outputs: a job's
+    /// under `private/` here, made new for the run (an existing `private` is refused) with mode 0700, beside `in/` and so never collected as outputs: a job's
     /// image root is read-only and its `/tmp` is small and `noexec`. A variable the Command sets
     /// itself keeps its value.
     #[arg(long, default_value = "/scratch/work")]

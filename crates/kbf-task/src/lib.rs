@@ -9,7 +9,7 @@
 //!    stderr to files, under a deadline. The environment is the Command's own, preceded by `HOME`,
 //!    `TMPDIR`, `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`, which name fresh directories
 //!    `private/{home,tmp,cache}` (the last holding `clang/ModuleCache`) under the working
-//!    directory, mode 0700, beside the input root and not in it. A job's image root is read-only
+//!    directory, mode 0700, made new for the run (an existing `private` is refused), beside the input root and not in it. A job's image root is read-only
 //!    and its `/tmp` is a small `noexec` tmpfs, so a compiler that writes under `~` or the
 //!    temporary directory would otherwise fail; and since outputs are collected relative to the
 //!    input root, nothing written there is packed. A variable the Command sets itself keeps its

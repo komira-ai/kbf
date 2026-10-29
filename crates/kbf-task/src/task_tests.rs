@@ -310,8 +310,8 @@ async fn a_command_with_no_program_fails_as_a_run_start() {
     assert_eq!(failure.exit_code(), EXIT_RUN);
 }
 
-/// Catches: files a Command leaves in its `HOME` or `TMPDIR` (a compiler's scratch and caches)
-/// being collected, so they would bloat the pack and appear as outputs the action never declared.
+/// The home and tmp directories are outside the input root, so files a Command writes there are
+/// not in the manifest's outputs and not a record of the pack.
 #[tokio::test]
 async fn files_written_into_home_and_tmp_are_not_packed_or_listed() {
     let dir = scratch("private-unpacked");
