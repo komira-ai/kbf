@@ -3,7 +3,6 @@
 use clap::ValueEnum;
 // The container driver builds on Linux only; elsewhere the flag parses and is refused unless
 // `auto`, and nothing reads its mode.
-#[cfg(target_os = "linux")]
 use kbf_driver_container::{ActionsCpu, ActionsCpuMax};
 
 use super::Driver;
