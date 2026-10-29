@@ -210,7 +210,7 @@ serving -> cordoned -> draining -> updating -> rebooting -> qualifying -> servin
 | `canary` | nodes updated first, per pool | 1 |
 | `soak` | wait after the canary before the rest | 2 h |
 | `qualify` | the qualification job (4.2) | per platform |
-| `drain_deadline` | how long running leases may finish | 30 min |
+| `drain_deadline` | how long running leases may finish before the rollout holds; running leases are never cut | none (wait however long they take) |
 | `client_gate_timeout` | how long `awaiting_client` may wait (6.1) | 24 h |
 | `accept_outage` | classes the operator allows to drop to zero, with a reason | none |
 | `window` | optional maintenance window | none |

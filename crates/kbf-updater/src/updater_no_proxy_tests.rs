@@ -225,16 +225,39 @@ fn a_member_with_no_other_member_is_refused_without_a_call() {
     assert_eq!(rig.elapsed(), Duration::ZERO);
 }
 
-/// Asserts that a drain that never ends fails the turn at the drain bound (1200 s after the
-/// window), with `drain_failed`, the number of executions still open, the bound and the member
-/// named as left draining, before any install or restart, and that the wait reads the member's
-/// drain once every 5 s.
+/// Asserts that, with no drain deadline (the default), a member that is still draining after
+/// the old 1200 s is waited for: 400 reads 5 s apart (2000 s) say two executions are open, then
+/// the member has exited, and the turn goes on to the install and the restart and is done.
+#[test]
+fn with_no_drain_deadline_a_drain_is_waited_for_past_1200_seconds() {
+    let rig = member_rig("np-long-drain");
+    let mut reads = vec![Ok(draining(2)); 400];
+    reads.push(Err(gone()));
+    rig.front.script_drain_status("fe1", reads, Err(gone()));
+    let u = open_over(&rig);
+    let roll = run(&u, only("fe1"));
+    assert_eq!(roll.state, RollState::Done, "{:?}", roll.failure);
+    assert!(rig.elapsed() >= Duration::from_secs(2000));
+    assert_eq!(rig.log.installs(), ["fe1"]);
+    let events = rig.log.events();
+    let polls = events.iter().filter(|e| **e == ev("fs:fe1")).count();
+    assert_eq!(polls, 401);
+}
+
+/// Asserts that a drain that never ends fails the turn at the drain deadline the operator set
+/// (1200 s after the window), with `drain_failed`, the number of executions still open, the
+/// bound and the member named as left draining, before any install or restart, and that the
+/// wait reads the member's drain once every 5 s.
 #[test]
 fn a_drain_that_never_ends_fails_the_turn_with_the_member_left_draining() {
     let rig = member_rig("np-stuck");
     let first = Ok(draining(2));
     rig.front.script_drain_status("fe1", vec![], first);
-    let u = open_over(&rig);
+    let timing = Timing {
+        frontend_drain: Some(Duration::from_secs(1200)),
+        ..Timing::default()
+    };
+    let u = rig.open_inventory_timed(inventory_with(""), rig.store(), timing);
     let roll = run(&u, Hosts::default());
     assert_eq!(roll.state, RollState::Failed);
     let failure = roll.failure.clone().expect("failure");
@@ -246,7 +269,7 @@ fn a_drain_that_never_ends_fails_the_turn_with_the_member_left_draining() {
     assert!(detail.contains(note), "{detail}");
     assert_eq!(phases(&roll), [Phase::Failed, Phase::Pending]);
     let t = Timing::default();
-    assert_eq!(rig.elapsed(), t.peer_ready + t.frontend_drain);
+    assert_eq!(rig.elapsed(), t.peer_ready + Duration::from_secs(1200));
     let events = rig.log.events();
     let (queried, restarted) = (ev("qy:fe1"), ev("rn:fe1,a"));
     assert!(rig.log.installs().is_empty());
