@@ -68,6 +68,10 @@ use kbf_front::Described;
 use crate::action_usage::{ShapeKey, Subject};
 use crate::machine::Platform;
 
+mod predict;
+use predict::Predictions;
+pub use predict::{Axis, Fit, Unset};
+
 /// What `--learned-sizes` does with the estimator.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum LearnedSizes {
@@ -155,6 +159,9 @@ pub struct Learned {
     /// Key floors the estimator's decay has lowered since they were last taken: the size
     /// key, the floor the summary held before and the one it holds now.
     lowered: Vec<(u64, u64, u64)>,
+    /// The predictions made for new operations, and what became of them
+    /// ([`Learned::predict`]).
+    predictions: Predictions,
 }
 
 impl Learned {
@@ -180,6 +187,7 @@ impl Learned {
             named: BTreeMap::new(),
             names: BTreeMap::new(),
             lowered: Vec::new(),
+            predictions: Predictions::default(),
         }
     }
 
@@ -230,7 +238,7 @@ impl Learned {
     }
 
     /// The day of farm time `now`, on the wall clock the farm was built on.
-    fn day(&self) -> Day {
+    pub(crate) fn day(&self) -> Day {
         let ms = self.epoch_unix_ms.saturating_add(self.now.as_millis());
         Day(u32::try_from(ms / DAY_MS).unwrap_or(u32::MAX))
     }

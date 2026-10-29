@@ -110,6 +110,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "input-tree-reads-in-flight",
             "pack-index",
             "placement-load",
+            "placement-predictions",
             "progress-interval-secs",
             "qos-allowed",
             "readyz-store-timeout-ms",

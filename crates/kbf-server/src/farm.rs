@@ -1013,6 +1013,9 @@ mod from_listeners;
 mod learned_tests;
 #[cfg(test)]
 mod placement_tests;
+mod prediction;
+#[cfg(test)]
+mod prediction_tests;
 #[cfg(test)]
 mod storage_down_tests;
 #[cfg(test)]

@@ -122,6 +122,7 @@ pub mod object_store;
 mod pack_daemon_metrics;
 pub mod pack_locate;
 pub mod placement_load;
+pub mod placement_predictions;
 pub mod proxy_auth;
 pub mod raft_log;
 mod ram_drain;
@@ -186,6 +187,7 @@ pub use learned::LearnedSizes;
 pub use local::LocalStore;
 pub use node_map::NodeMap;
 pub use placement_load::PlacementLoad;
+pub use placement_predictions::PlacementPredictions;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use scheduler_core::SchedulerCore;
 pub use serve::{
