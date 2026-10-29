@@ -69,6 +69,12 @@ impl SyncDir for FsyncDir {
 ///   after the link, so that the name of an object whose put was acknowledged survives a power
 ///   loss. A replacement ([`Backend::put_if_match`]), a delete, the placing of a part and the
 ///   completion of an upload sync the directory they changed the same way, before they return.
+///   If the sync after a link fails the name is removed again, so that an object that was not
+///   acknowledged is not left visible and a retry can succeed (if the name cannot be removed the
+///   error says it may exist without being durable). A replacement or a delete whose sync fails
+///   cannot be undone, the old body being gone: the call fails and the change may be visible; a
+///   retry of a delete is fine, and the caller of a replacement reads the object to see which
+///   body it holds.
 /// - A multipart upload is a directory `.uploads/<id>` that holds a file with the key and a file
 ///   for each part, written as the chunks of the part arrive, so that a part is never held in
 ///   memory; the completion joins the parts into the new object by streaming them, and removes
@@ -399,13 +405,31 @@ impl DirBackend {
 
     /// Moves the temporary file `temp` to `path` if nothing is there: a hard link fails where
     /// the name is taken. The temporary file is gone either way. Where the link was made, the
-    /// directory is synced before this returns.
+    /// directory is synced before this returns. If that sync fails the name is removed again
+    /// (and the directory synced, best effort), so that an object that was not acknowledged is
+    /// not left visible and a retry of the create-only put can succeed; if the name cannot be
+    /// removed the error says that it may exist without being durable.
     async fn publish(&self, temp: &Path, path: &Path, key: &str) -> Result<(), Error> {
         let linked = fs::hard_link(temp, path).await;
         let _ = fs::remove_file(temp).await;
         let taken = ErrorKind::AlreadyExists;
         linked.map_err(|e| classify(key, path, &e, taken, Error::AlreadyExists))?;
-        self.sync(&self.root).await
+        let Err(synced) = self.sync(&self.root).await else {
+            return Ok(());
+        };
+        match fs::remove_file(path).await {
+            Ok(()) => {
+                let _ = self.sync(&self.root).await;
+                Err(synced)
+            }
+            Err(why) => {
+                let text = format!(
+                    "{}: the name may exist without being durable: the directory sync failed ({synced}) and the name could not be removed ({why})",
+                    path.display()
+                );
+                Err(Error::Other(text))
+            }
+        }
     }
 
     /// The directory of the upload `id` of `key`.

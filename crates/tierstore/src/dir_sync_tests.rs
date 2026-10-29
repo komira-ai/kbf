@@ -3,7 +3,10 @@
 //! to sync, so the tests see what the directory held then and whether the call had returned: no
 //! power is lost and no time is measured.
 
+use std::fs::Permissions;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -23,11 +26,13 @@ struct Seen {
     watched: Option<Vec<u8>>,
 }
 
-/// Records each sync with what the directory held at that moment, and fails them all if told to.
+/// Records each sync with what the directory held at that moment, fails them while `fails` is
+/// set, and makes the directory `lock` read-only when it is asked to sync it, if there is one.
 struct Recorder {
     seen: Arc<Mutex<Vec<Seen>>>,
     watch: Option<PathBuf>,
-    fails: bool,
+    fails: Arc<AtomicBool>,
+    lock: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -47,7 +52,10 @@ impl SyncDir for Recorder {
             names,
             watched,
         });
-        if self.fails {
+        if let Some(lock) = &self.lock {
+            std::fs::set_permissions(lock, Permissions::from_mode(0o500))?;
+        }
+        if self.fails.load(Ordering::SeqCst) {
             return Err(std::io::Error::other("the disk refused the sync"));
         }
         Ok(())
@@ -59,15 +67,28 @@ type Log = Arc<Mutex<Vec<Seen>>>;
 /// A backend over a new directory that syncs with a recorder, which also reads the file `watch`
 /// (a name in the directory) at each sync.
 fn recorded(watch: Option<&str>, fails: bool) -> (TestDir, DirBackend, Log) {
+    let (dir, backend, seen, _) = switched(watch, fails, false);
+    (dir, backend, seen)
+}
+
+/// The same, with the switch that sets whether the syncs fail, and with the directory made
+/// read-only at its first sync if `lock`.
+fn switched(
+    watch: Option<&str>,
+    fails: bool,
+    lock: bool,
+) -> (TestDir, DirBackend, Log, Arc<AtomicBool>) {
     let dir = TestDir::under(std::env::temp_dir(), "tierstore-dirsync");
     let seen = Log::default();
+    let switch = Arc::new(AtomicBool::new(fails));
     let recorder = Recorder {
         seen: Arc::clone(&seen),
         watch: watch.map(|name| dir.path().join(name)),
-        fails,
+        fails: Arc::clone(&switch),
+        lock: lock.then(|| dir.path().to_owned()),
     };
     let backend = DirBackend::open_with(dir.path().to_owned(), Box::new(recorder)).unwrap();
-    (dir, backend, seen)
+    (dir, backend, seen, switch)
 }
 
 fn body(text: &'static str) -> Bytes {
@@ -168,34 +189,79 @@ async fn a_part_and_a_completion_sync_the_directory_they_changed() {
 }
 
 /// Asserts that when the directory cannot be synced no call that changes the directory returns
-/// success: the put, the replacement, the delete, the part and the completion each fail. It would
-/// catch a sync whose error is dropped, which acks a change the disk did not take.
+/// success: the put, the replacement, the delete and the part each fail. It would catch a sync
+/// whose error is dropped, which acks a change the disk did not take. A replacement or a delete
+/// cannot be undone, so their change stays visible.
 #[tokio::test]
 async fn a_directory_that_cannot_be_synced_fails_the_call() {
-    let (_dir, backend, _seen) = recorded(None, true);
-    let put = backend.put("k", body("one")).await;
-    assert!(matches!(put, Err(Error::Other(_))));
+    let (_dir, backend, _seen, switch) = switched(None, false, false);
+    backend.put("k", body("one")).await.unwrap();
     let tag = backend.head("k").await.unwrap().tag;
+    switch.store(true, Ordering::SeqCst);
     let replaced = backend.put_if_match("k", body("two"), &tag).await;
     assert!(matches!(replaced, Err(Error::Other(_))));
+    assert_eq!(backend.get("k", None).await.unwrap(), body("two"));
     let deleted = backend.delete("k").await;
     assert!(matches!(deleted, Err(Error::Other(_))));
+    assert!(matches!(backend.head("k").await, Err(Error::NotFound(_))));
     let id = backend.create_upload("j").await.unwrap();
     let placed = backend.upload_part("j", &id, 1, part("abc")).await;
     assert!(matches!(placed, Err(Error::Other(_))));
 }
 
-/// Asserts that a completion whose directory sync fails is an error. The part is put in place by
-/// hand, since placing it through the backend would fail the same sync first.
+/// Asserts that a create-only put whose directory sync fails after the link leaves no name, so
+/// the object is never visible and unacknowledged, and that the retry succeeds once the sync
+/// does. It would catch a put that returns the error and leaves the name, which makes the retry
+/// fail with `AlreadyExists` for an object nobody was told was stored.
 #[tokio::test]
-async fn a_completion_whose_directory_cannot_be_synced_fails() {
-    let (dir, backend, _seen) = recorded(None, true);
+async fn a_put_whose_sync_fails_leaves_no_name_and_a_retry_succeeds() {
+    let (dir, backend, _seen, switch) = switched(None, true, false);
+    let put = backend.put("k", body("one")).await;
+    assert!(matches!(put, Err(Error::Other(_))));
+    assert!(matches!(backend.head("k").await, Err(Error::NotFound(_))));
+    let mut names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, [".uploads".to_owned()]);
+    switch.store(false, Ordering::SeqCst);
+    backend.put("k", body("one")).await.unwrap();
+    assert_eq!(backend.get("k", None).await.unwrap(), body("one"));
+}
+
+/// Asserts the same of the completion of an upload: it fails, leaves no object, keeps the
+/// upload, and the completion succeeds once the sync does. The part is put in place by hand,
+/// since placing it through the backend would fail the same sync first.
+#[tokio::test]
+async fn a_completion_whose_sync_fails_leaves_no_name_and_a_retry_succeeds() {
+    let (dir, backend, _seen, switch) = switched(None, true, false);
     let id = backend.create_upload("k").await.unwrap();
     let upload = dir.path().join(".uploads").join(&id);
     let tag = "0".repeat(2 * TAG_LEN);
     std::fs::write(upload.join(format!("00001-{tag}")), b"abc").unwrap();
-    let done = backend.complete_upload("k", &id, &[(1, tag)]).await;
+    let parts = [(1, tag)];
+    let done = backend.complete_upload("k", &id, &parts).await;
     assert!(matches!(done, Err(Error::Other(_))));
+    assert!(matches!(backend.head("k").await, Err(Error::NotFound(_))));
+    assert!(upload.exists());
+    switch.store(false, Ordering::SeqCst);
+    backend.complete_upload("k", &id, &parts).await.unwrap();
+    assert_eq!(backend.get("k", None).await.unwrap(), body("abc"));
+}
+
+/// Asserts that when the directory sync fails and the name cannot be removed either, the error
+/// says that the name may exist without being durable. The directory is made read-only by the
+/// recorder at the sync, so that the removal is refused.
+#[tokio::test]
+async fn a_name_that_cannot_be_removed_after_a_failed_sync_is_reported() {
+    let (dir, backend, _seen, _switch) = switched(None, true, true);
+    let put = backend.put("k", body("one")).await;
+    let _ = std::fs::set_permissions(dir.path(), Permissions::from_mode(0o700));
+    let Err(Error::Other(text)) = put else {
+        panic!("expected an error that says the name may exist");
+    };
+    assert!(text.contains("may exist without being durable"), "{text}");
 }
 
 /// Asserts that the real sync of a directory succeeds on a directory and fails on one that is
