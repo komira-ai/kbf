@@ -12,6 +12,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const SECOND: u64 = 1_000_000;
+/// An hour, in seconds.
+const HOUR: u64 = 3600;
 
 /// The text `GET /metrics` at `api` answers.
 async fn scrape(api: SocketAddr) -> String {
@@ -68,13 +70,18 @@ async fn a_server_shows_the_load_its_daemons_report() {
         "{text}"
     );
 
+    // This server reads wall time, so the node must not go stale however long the runner stalls
+    // between the heartbeats: it is stale after three windows, and the window between these two
+    // readings is an hour (3600 s of the daemon's clock, using half of it in CPU), so a stall of
+    // three hours would be needed.
     loaded
-        .beat_loaded_acked(Some(reading(2, 11 * SECOND, SECOND)))
+        .beat_loaded_acked(Some(reading(2, (10 + HOUR) * SECOND, HOUR * SECOND / 2)))
         .await;
     let text = scrape(api).await;
     for sample in [
         "kbf_sched_load_readings_accepted_total 2\n",
-        "kbf_node_load_measured_cpu_millicores{node=\"node-a\"} 1000\n",
+        "kbf_node_load_measured_cpu_millicores{node=\"node-a\"} 500\n",
+        "kbf_node_load_stale{node=\"node-a\"} 0\n",
     ] {
         assert!(text.contains(sample), "{sample}{text}");
     }

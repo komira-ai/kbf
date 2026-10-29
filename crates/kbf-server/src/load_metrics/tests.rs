@@ -12,6 +12,7 @@ use kbf_types::{Resources, WorkerId};
 
 use super::{COUNTS, render_counters, render_nodes};
 use crate::farm::{Farm, Reported, StreamId};
+use crate::fleet::{DroppedView, ListsView, LoadView};
 
 const GIB: u64 = 1 << 30;
 const SECOND: u64 = 1_000_000;
@@ -246,9 +247,11 @@ async fn a_scrape_after_accepted_readings_shows_the_counters_and_each_nodes_load
     };
     let first = NodeLoad {
         covered: (0..100).map(lease).collect(),
+        // Two repeats and one that starts after the reading: duplicates and invalid differ.
         lease_clocks: vec![
             clock(1, SECOND),
             clock(1, 2 * SECOND),
+            clock(1, 3 * SECOND),
             clock(2, 11 * SECOND),
         ],
         minutes: vec![minute(7, 0), broken, minute(7, 0)],
@@ -266,9 +269,12 @@ async fn a_scrape_after_accepted_readings_shows_the_counters_and_each_nodes_load
     };
     beat(&farm, &a, stream_a, 2, &second).await;
 
-    // `b` has one reading, so no window, and a CPU limit.
+    // `b` has one reading, so no window, and a CPU limit. Its active file pages are above a
+    // quarter of its 64 GiB, so its admission working set (19 GiB) is neither its working set
+    // (20 GiB) nor its active file pages (17 GiB).
     let only = NodeLoad {
-        memory_working_set_bytes: 5_000,
+        memory_working_set_bytes: 20 * GIB,
+        memory_active_file_bytes: 17 * GIB,
         actions_cpu_limited: true,
         ..reading(1, 10 * SECOND, 0)
     };
@@ -282,25 +288,34 @@ async fn a_scrape_after_accepted_readings_shows_the_counters_and_each_nodes_load
             ("kbf_sched_load_readings_dropped_total", "0"),
             ("kbf_node_load_measured_cpu_millicores{node=\"a\"}", "2000"),
             ("kbf_node_load_memory_working_set_bytes{node=\"a\"}", "1000"),
-            ("kbf_node_load_memory_working_set_bytes{node=\"b\"}", "5000"),
+            (
+                "kbf_node_load_memory_working_set_bytes{node=\"b\"}",
+                "21474836480",
+            ),
             ("kbf_node_load_memory_active_file_bytes{node=\"a\"}", "200"),
-            ("kbf_node_load_memory_active_file_bytes{node=\"b\"}", "0"),
+            (
+                "kbf_node_load_memory_active_file_bytes{node=\"b\"}",
+                "18253611008",
+            ),
             (
                 "kbf_node_load_admission_working_set_bytes{node=\"a\"}",
                 "1000",
             ),
             (
                 "kbf_node_load_admission_working_set_bytes{node=\"b\"}",
-                "5000",
+                "20401094656",
             ),
             ("kbf_node_load_stale{node=\"a\"}", "0"),
             ("kbf_node_load_stale{node=\"b\"}", "0"),
             ("kbf_node_load_actions_cpu_limited{node=\"a\"}", "0"),
             ("kbf_node_load_actions_cpu_limited{node=\"b\"}", "1"),
-            ("kbf_node_load_cpu_throttled_usec_total{node=\"a\"}", "7"),
             (
-                "kbf_node_load_cpu_pressure_some_usec_total{node=\"a\"}",
-                "12345",
+                "kbf_node_load_cpu_throttled_seconds_total{node=\"a\"}",
+                "0.000007",
+            ),
+            (
+                "kbf_node_load_cpu_pressure_some_seconds_total{node=\"a\"}",
+                "0.012345",
             ),
             ("kbf_node_load_clocks_total{node=\"a\"}", "1"),
             ("kbf_node_load_clocks_total{node=\"b\"}", "0"),
@@ -313,7 +328,7 @@ async fn a_scrape_after_accepted_readings_shows_the_counters_and_each_nodes_load
             ),
             (
                 "kbf_node_load_dropped_total{node=\"a\",reason=\"duplicate\"}",
-                "2",
+                "3",
             ),
             (
                 "kbf_node_load_dropped_total{node=\"a\",reason=\"over_cap\"}",
@@ -329,8 +344,8 @@ async fn a_scrape_after_accepted_readings_shows_the_counters_and_each_nodes_load
     // telemetry.
     for series in [
         "kbf_node_load_measured_cpu_millicores{node=\"b\"}",
-        "kbf_node_load_cpu_throttled_usec_total{node=\"b\"}",
-        "kbf_node_load_cpu_pressure_some_usec_total{node=\"b\"}",
+        "kbf_node_load_cpu_throttled_seconds_total{node=\"b\"}",
+        "kbf_node_load_cpu_pressure_some_seconds_total{node=\"b\"}",
     ] {
         assert_eq!(sample(&text, series), None, "{series}\n{text}");
     }
@@ -428,8 +443,9 @@ async fn a_refused_reading_increments_the_refused_counters() {
     beat(&farm, &a, stream, 2, &with_minutes(5, 11 * SECOND, 4)).await;
     beat(&farm, &a, stream, 3, &with_minutes(4, 11 * SECOND, 2)).await;
     beat(&farm, &a, stream, 4, &with_minutes(6, 9 * SECOND, 3)).await;
+    let after = scrape(&farm);
     assert_samples(
-        &scrape(&farm),
+        &after,
         &[
             ("kbf_node_load_refused_minutes_total{node=\"a\"}", "9"),
             ("kbf_node_load_minutes_total{node=\"a\"}", "1"),
@@ -437,6 +453,15 @@ async fn a_refused_reading_increments_the_refused_counters() {
             ("kbf_sched_load_readings_dropped_total", "0"),
         ],
     );
+    // The refused readings' minutes are not counted as dropped records either.
+    let dropped = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| l.starts_with("kbf_node_load_dropped_total{"))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert_eq!(dropped(&after), dropped(&before));
+    assert_eq!(dropped(&after).len(), 3, "{after}");
 }
 
 /// Asserts that a reading the server accepted and the scheduler then drops (here, the same
@@ -449,8 +474,13 @@ async fn a_reading_the_scheduler_drops_is_counted_apart_from_one_the_server_refu
     let farm = farm();
     let a = WorkerId::new("a");
     let stream = register(&farm, "a", "proc-a");
+    // The reading carries minutes, so a double count of the doubled feed as refused would show.
+    let load = NodeLoad {
+        minutes: vec![minute(7, 0), minute(7, 1)],
+        ..reading(1, SECOND, 0)
+    };
     let fed = farm
-        .note_node_load(&a, stream, Some(&reading(1, SECOND, 0)))
+        .note_node_load(&a, stream, Some(&load))
         .expect("accepted");
     for seq in [1, 2] {
         assert!(
@@ -464,6 +494,119 @@ async fn a_reading_the_scheduler_drops_is_counted_apart_from_one_the_server_refu
             ("kbf_sched_load_readings_accepted_total", "1"),
             ("kbf_sched_load_readings_dropped_total", "1"),
             ("kbf_node_load_refused_minutes_total{node=\"a\"}", "0"),
+            ("kbf_node_load_minutes_total{node=\"a\"}", "2"),
         ],
     );
+}
+
+/// Asserts that a new daemon session (a new `Hello.instance_id`) starts the node's list counters
+/// again from 0, as the docs say, and that the refused first reading of yet another session has
+/// no state to count in and removes the node's series altogether (the node view has no load then
+/// either).
+#[tokio::test(start_paused = true)]
+async fn a_new_session_resets_the_list_counters_and_a_refused_first_reading_drops_the_series() {
+    let farm = farm();
+    let a = WorkerId::new("a");
+    let first = register(&farm, "a", "proc-1");
+    let load = NodeLoad {
+        lease_clocks: vec![clock(1, SECOND)],
+        minutes: vec![minute(7, 0), minute(7, 0)],
+        ..reading(1, 10 * SECOND, 0)
+    };
+    farm.note_node_load(&a, first, Some(&load));
+    // Refused (the seq is not above the last): its 3 minutes count as refused.
+    let again = NodeLoad {
+        minutes: vec![minute(7, 3); 3],
+        ..reading(1, 11 * SECOND, 0)
+    };
+    farm.note_node_load(&a, first, Some(&again));
+    assert_samples(
+        &scrape(&farm),
+        &[
+            ("kbf_node_load_clocks_total{node=\"a\"}", "1"),
+            ("kbf_node_load_minutes_total{node=\"a\"}", "1"),
+            ("kbf_node_load_refused_minutes_total{node=\"a\"}", "3"),
+            (
+                "kbf_node_load_dropped_total{node=\"a\",reason=\"duplicate\"}",
+                "1",
+            ),
+        ],
+    );
+
+    // The daemon restarted: its first reading is a new baseline and its counts start again.
+    let second = register(&farm, "a", "proc-2");
+    farm.note_node_load(&a, second, Some(&reading(1, SECOND, 0)));
+    assert_samples(
+        &scrape(&farm),
+        &[
+            ("kbf_node_load_clocks_total{node=\"a\"}", "0"),
+            ("kbf_node_load_minutes_total{node=\"a\"}", "0"),
+            ("kbf_node_load_refused_minutes_total{node=\"a\"}", "0"),
+            (
+                "kbf_node_load_dropped_total{node=\"a\",reason=\"duplicate\"}",
+                "0",
+            ),
+        ],
+    );
+
+    // A third process whose first reading is refused (no seq): nothing is kept, no series.
+    let third = register(&farm, "a", "proc-3");
+    farm.note_node_load(&a, third, Some(&reading(0, SECOND, 0)));
+    let text = scrape(&farm);
+    assert!(!text.contains("kbf_node_load_"), "{text}");
+}
+
+/// Asserts the `# TYPE` of every node family, by name, and that the name ends in `_total` exactly
+/// when the family is a counter: the cumulative CPU times are in seconds, and the gauges (the
+/// measured CPU, the bytes, the two flags) are not counters.
+#[test]
+fn each_node_family_has_its_type_and_only_counters_end_in_total() {
+    let view = LoadView {
+        measured_cpu_millicores: Some(1),
+        memory_working_set_bytes: 2,
+        memory_active_file_bytes: 3,
+        admission_working_set_bytes: 4,
+        covered: Vec::new(),
+        actions_cpu_limited: true,
+        cpu_throttled_usec: Some(5),
+        cpu_pressure_some_total_usec: Some(6),
+        lists: ListsView {
+            clocks: 7,
+            minutes: 8,
+            dropped: DroppedView {
+                invalid: 9,
+                duplicate: 10,
+                over_cap: 11,
+            },
+            refused_minutes: 12,
+        },
+        stale: false,
+    };
+    let mut text = String::new();
+    render_nodes(&mut text, &[(WorkerId::new("a"), view)]);
+    let kinds: Vec<(&str, &str)> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("# TYPE "))
+        .filter_map(|l| l.split_once(' '))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("kbf_node_load_measured_cpu_millicores", "gauge"),
+            ("kbf_node_load_memory_working_set_bytes", "gauge"),
+            ("kbf_node_load_memory_active_file_bytes", "gauge"),
+            ("kbf_node_load_admission_working_set_bytes", "gauge"),
+            ("kbf_node_load_stale", "gauge"),
+            ("kbf_node_load_actions_cpu_limited", "gauge"),
+            ("kbf_node_load_cpu_throttled_seconds_total", "counter"),
+            ("kbf_node_load_cpu_pressure_some_seconds_total", "counter"),
+            ("kbf_node_load_refused_minutes_total", "counter"),
+            ("kbf_node_load_clocks_total", "counter"),
+            ("kbf_node_load_minutes_total", "counter"),
+            ("kbf_node_load_dropped_total", "counter"),
+        ]
+    );
+    for (name, kind) in kinds {
+        assert_eq!(name.ends_with("_total"), kind == "counter", "{name}");
+    }
 }

@@ -182,13 +182,31 @@ impl Kind {
     }
 }
 
+/// A sample's value as it is written.
+#[derive(Clone, Copy)]
+enum Num {
+    /// A whole number, as the view has it.
+    Whole(u64),
+    /// Microseconds, written as seconds with six decimals (exact, no rounding).
+    Micros(u64),
+}
+
+impl std::fmt::Display for Num {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Whole(v) => write!(f, "{v}"),
+            Self::Micros(v) => write!(f, "{}.{:06}", v / 1_000_000, v % 1_000_000),
+        }
+    }
+}
+
 /// One node family: its name, kind and `# HELP` text, and the value a node's view gives it
 /// (`None` when the view leaves it out).
 type Gauge = (
     &'static str,
     Kind,
     &'static str,
-    fn(&LoadView) -> Option<u64>,
+    fn(&LoadView) -> Option<Num>,
 );
 
 /// The families with one sample per node, in the order they are written.
@@ -197,55 +215,55 @@ const NODE_FAMILIES: [Gauge; 9] = [
         "kbf_node_load_measured_cpu_millicores",
         Kind::Gauge,
         "The CPU a node's actions used, in thousandths of a CPU: the larger of its last two windows; absent with fewer than two windows and when stale",
-        |v| v.measured_cpu_millicores,
+        |v| v.measured_cpu_millicores.map(Num::Whole),
     ),
     (
         "kbf_node_load_memory_working_set_bytes",
         Kind::Gauge,
         "memory.current less the inactive file pages of a node's actions cgroup at its last accepted reading, in bytes",
-        |v| Some(v.memory_working_set_bytes),
+        |v| Some(Num::Whole(v.memory_working_set_bytes)),
     ),
     (
         "kbf_node_load_memory_active_file_bytes",
         Kind::Gauge,
         "The active file pages of a node's actions cgroup at its last accepted reading, in bytes",
-        |v| Some(v.memory_active_file_bytes),
+        |v| Some(Num::Whole(v.memory_active_file_bytes)),
     ),
     (
         "kbf_node_load_admission_working_set_bytes",
         Kind::Gauge,
         "A node's working set less the active file pages beyond a quarter of its memory: what an admission would count, in bytes",
-        |v| Some(v.admission_working_set_bytes),
+        |v| Some(Num::Whole(v.admission_working_set_bytes)),
     ),
     (
         "kbf_node_load_stale",
         Kind::Gauge,
         "1 when no reading of a node was accepted for three windows, else 0",
-        |v| Some(u64::from(v.stale)),
+        |v| Some(Num::Whole(u64::from(v.stale))),
     ),
     (
         "kbf_node_load_actions_cpu_limited",
         Kind::Gauge,
         "1 when a node's actions cgroup has a CPU quota, else 0",
-        |v| Some(u64::from(v.actions_cpu_limited)),
+        |v| Some(Num::Whole(u64::from(v.actions_cpu_limited))),
     ),
     (
-        "kbf_node_load_cpu_throttled_usec_total",
+        "kbf_node_load_cpu_throttled_seconds_total",
         Kind::Counter,
-        "Cumulative CPU throttled time of a node's actions cgroup, in microseconds, as its daemon read it; absent when it could not",
-        |v| v.cpu_throttled_usec,
+        "Cumulative CPU throttled time of a node's actions cgroup, in seconds, as its daemon read it (it can fall if the cgroup is recreated within a session); absent when it could not",
+        |v| v.cpu_throttled_usec.map(Num::Micros),
     ),
     (
-        "kbf_node_load_cpu_pressure_some_usec_total",
+        "kbf_node_load_cpu_pressure_some_seconds_total",
         Kind::Counter,
-        "Cumulative CPU pressure (some total) of a node's actions cgroup, in microseconds, as its daemon read it; absent when it could not",
-        |v| v.cpu_pressure_some_total_usec,
+        "Cumulative CPU pressure (some total) of a node's actions cgroup, in seconds, as its daemon read it (it can fall if the cgroup is recreated within a session); absent when it could not",
+        |v| v.cpu_pressure_some_total_usec.map(Num::Micros),
     ),
     (
         "kbf_node_load_refused_minutes_total",
         Kind::Counter,
         "Minute records carried by readings of a node that were not accepted, since its daemon process began",
-        |v| Some(v.lists.refused_minutes),
+        |v| Some(Num::Whole(v.lists.refused_minutes)),
     ),
 ];
 
@@ -255,13 +273,13 @@ const LISTS: [Gauge; 2] = [
         "kbf_node_load_clocks_total",
         Kind::Counter,
         "Lease clock records of a node's accepted readings that were kept, since its daemon process began",
-        |v| Some(v.lists.clocks),
+        |v| Some(Num::Whole(v.lists.clocks)),
     ),
     (
         "kbf_node_load_minutes_total",
         Kind::Counter,
         "Lease minute records of a node's accepted readings that were kept, since its daemon process began",
-        |v| Some(v.lists.minutes),
+        |v| Some(Num::Whole(v.lists.minutes)),
     ),
 ];
 
