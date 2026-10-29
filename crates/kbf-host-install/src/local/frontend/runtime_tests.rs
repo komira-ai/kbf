@@ -127,13 +127,18 @@ fn an_image_is_found_by_its_id_and_a_missing_one_is_none() {
 /// A container is read from one inspect line; anything that is not three fields is an error.
 #[test]
 fn a_container_is_read_from_one_line() {
-    let (d, seen) = docker(vec![done(0, "sha256:i kbf-frontend:c true\n", "")]);
+    let (d, seen) = docker(vec![done(
+        0,
+        "sha256:i kbf-frontend:c true unless-stopped\n",
+        "",
+    )]);
     assert_eq!(
         d.container("kbf-frontend").unwrap(),
         Some(Container {
             image_id: "sha256:i".to_owned(),
             image_ref: "kbf-frontend:c".to_owned(),
             running: true,
+            restart: "unless-stopped".to_owned(),
         })
     );
     assert_eq!(
@@ -142,19 +147,21 @@ fn a_container_is_read_from_one_line() {
             "container",
             "inspect",
             "--format",
-            "{{.Image}} {{.Config.Image}} {{.State.Running}}",
+            "{{.Image}} {{.Config.Image}} {{.State.Running}} {{.HostConfig.RestartPolicy.Name}}",
             "kbf-frontend",
         ]
     );
     let (d, _) = docker(vec![done(0, "sha256:i kbf-frontend:c false\n", "")]);
-    assert!(!d.container("kbf-frontend").unwrap().unwrap().running);
+    let made = d.container("kbf-frontend").unwrap().unwrap();
+    assert!(!made.running);
+    assert_eq!(made.restart, "", "an empty policy name is read as none");
     let (d, _) = docker(vec![done(
         1,
         "",
         "Error: No such container: kbf-frontend\n",
     )]);
     assert_eq!(d.container("kbf-frontend").unwrap(), None);
-    for said in ["", "a b", "a b maybe", "a b true extra"] {
+    for said in ["", "a b", "a b maybe", "a b true no extra"] {
         let (d, _) = docker(vec![done(0, said, "")]);
         assert!(
             err(d.container("kbf-frontend")).contains("not what was asked"),

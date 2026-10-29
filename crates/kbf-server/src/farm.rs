@@ -53,9 +53,7 @@ use kbf_front::{Backend, Dispatch, Recorder, Stage, Submission, Ticket};
 use kbf_proto::update::UpdateStatus;
 use kbf_proto::worker::{self, NodeStatus, ServerMessage};
 use kbf_sched::fence::START_VALIDITY;
-use kbf_sched::{
-    Cordon, DaemonInstance, Event, LOSS_REQUEUES, MemoryLadder, NodePhase, OpState, Scheduler,
-};
+use kbf_sched::{Cordon, DaemonInstance, Event, LOSS_REQUEUES, MemoryLadder, OpState, Scheduler};
 use kbf_types::{
     ActionKey, Answer, Digest, FarmTime, LeaseId, MemoryRun, OperationId, StateMachine, WorkerId,
 };
@@ -69,7 +67,7 @@ mod ambient;
 mod beat;
 pub(crate) mod durable;
 mod engine;
-mod failed_actions;
+pub(crate) mod failed_actions;
 mod handover;
 // The core's pieces are read as the groups of methods in `js` are written.
 #[cfg(feature = "farm-core-js")]
@@ -107,9 +105,10 @@ pub(crate) use self::driver::Settings;
 use self::durable::Held;
 use self::engine::Engine;
 use self::report::{Detail, Settled, finished_of, refused_as};
-use self::side::{Link, Side, identity};
+pub(crate) use self::side::identity;
+use self::side::{Link, Side};
 use crate::action_usage::Shapes;
-use crate::fleet::{NodeView, SoftwareView, attention_changes};
+use crate::fleet::{NodeView, take_node_status};
 use crate::learned::LearnedSizes;
 use crate::machine::{Platform, Waiter, parse_stored_name};
 use crate::size_key::Keyable;
@@ -237,6 +236,22 @@ impl Farm {
     ) -> Self {
         Self::on_core(
             crate::SchedulerCore::under_test(),
+            cache.into(),
+            unservable_wait,
+            finished_retention,
+        )
+    }
+
+    /// [`Farm::new`] on the legacy core whatever core [`crate::SchedulerCore::under_test`] names:
+    /// for the tests of the legacy engine, which reach its state (`lock`, `state_mut`).
+    #[cfg(test)]
+    pub(crate) fn new_legacy(
+        cache: impl Into<Backend>,
+        unservable_wait: Duration,
+        finished_retention: Duration,
+    ) -> Self {
+        Self::on_core(
+            crate::SchedulerCore::Legacy,
             cache.into(),
             unservable_wait,
             finished_retention,
@@ -604,24 +619,7 @@ impl Farm {
         if !state.side.is_current(worker, stream) {
             return Vec::new();
         }
-        let mut view = SoftwareView::new(status, received);
-        let node = state.side.machine.node(worker);
-        let before = node
-            .and_then(|n| n.status.as_ref())
-            .map_or(&[][..], |s| &s.xcodes);
-        // An Xcode not surveyed yet (a restarted daemon's first status) keeps the item
-        // it had: neither cleared now nor raised again by the survey (`crate::fleet`).
-        view.hold_unsurveyed(before);
-        let changes = attention_changes(worker.as_str(), before, &view.xcodes);
-        for (raise, line) in &changes {
-            if *raise {
-                tracing::warn!(target: "kbf_server::attention", "{line}");
-            } else {
-                tracing::info!(target: "kbf_server::attention", "{line}");
-            }
-        }
-        state.side.machine.report_status(worker, view);
-        changes
+        take_node_status(&mut state.side.machine, worker, status, received)
     }
 
     /// An `UpdateStatus` on `stream`: kept as the worker's newest, unless `stream` was
@@ -648,31 +646,12 @@ impl Farm {
         side.machine
             .nodes()
             .map(|worker| {
-                let node = side.machine.node(worker);
-                let held = engine.sched.leases_on(worker);
-                let undelivered = held
-                    .iter()
-                    .filter(|lease| side.machine.sent(**lease).is_none())
-                    .count();
                 let link = side.links.get(worker);
-                NodeLook {
-                    id: worker.clone(),
-                    connected: node.is_some_and(|n| n.connected),
-                    os: link.map(|l| l.os.clone()).unwrap_or_default(),
-                    arch: link.map_or("", |l| l.arch),
-                    cordoned: engine.sched.cordon(worker).is_some(),
-                    leases: u32::try_from(held.len()).unwrap_or(u32::MAX),
-                    undelivered: u32::try_from(undelivered).unwrap_or(u32::MAX),
-                    whole_machine_hold: matches!(
-                        engine.sched.phase(worker),
-                        Some(NodePhase::Preparing(_) | NodePhase::Restoring(_))
-                    ),
-                    // The report is kept across streams; the controller reads only one
-                    // its node's current stream sent.
-                    update: node
-                        .filter(|n| n.update_live)
-                        .and_then(|n| n.update.clone()),
-                }
+                let identity = (
+                    link.map(|l| l.os.clone()).unwrap_or_default(),
+                    link.map_or("", |l| l.arch),
+                );
+                nodes::look_of(&engine.sched, &side.machine, identity, worker)
             })
             .collect()
     }

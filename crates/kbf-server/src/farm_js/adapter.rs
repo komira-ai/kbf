@@ -41,9 +41,11 @@ use tokio::sync::watch;
 use tonic::Code;
 
 use super::codec::KbfRowCodec;
+use super::facts::WorkerFacts;
 use crate::action_usage::Subject;
 use crate::answer::{Detail, Pending, failed, finished_of, refused_as};
 use crate::farm::durable::{named, subject};
+use crate::farm::failed_actions::{Class, FailedActions, class_of};
 use crate::fleet::quarantine_change;
 use crate::machine::{FarmMachine, Platform, Sent, Waiter, stored_name};
 use crate::stamp::Stamp;
@@ -92,6 +94,11 @@ pub struct KbfAdapter {
     pub(super) recorded: BTreeSet<OperationId>,
     pub(super) pack_reads: BTreeMap<WorkerId, worker::PackReadCounts>,
     pub(super) pack_writes: BTreeMap<WorkerId, worker::PackWriteCounts>,
+    /// What each registered worker's newest stream said of itself ([`WorkerFacts`]).
+    pub(super) facts: BTreeMap<WorkerId, WorkerFacts>,
+    /// The operations this adapter settled or refused as failed, per class
+    /// (`kbf_execute_failed_actions_total`).
+    failed: FailedActions,
     /// The unreadable `done/` rows looked at, each look counted.
     unreadable_results: u64,
 }
@@ -150,6 +157,8 @@ impl KbfAdapter {
             recorded: BTreeSet::new(),
             pack_reads: BTreeMap::new(),
             pack_writes: BTreeMap::new(),
+            facts: BTreeMap::new(),
+            failed: FailedActions::default(),
             unreadable_results: 0,
         }
     }
@@ -166,6 +175,13 @@ impl KbfAdapter {
     #[must_use]
     pub const fn machine(&self) -> &FarmMachine {
         &self.machine
+    }
+
+    /// The operations this adapter finished as failed, per class: those it settled by what
+    /// their callers are told, and those it refused.
+    #[cfg_attr(not(feature = "farm-core-js"), allow(dead_code))]
+    pub(crate) const fn failed_actions(&self) -> FailedActions {
+        self.failed
     }
 
     /// The first waiter of `operation`: its key and lease kind are the operation's.
@@ -381,8 +397,10 @@ impl Adapter for KbfAdapter {
     }
 
     fn refuse(&mut self, _view: &View<'_>, refusal: &Refusal) {
+        tracing::warn!(operation = %refusal.operation, reason = %refusal.reason, "operation refused");
         self.record_refused(refusal);
         let finished = refused_as(refusal);
+        self.failed.count(Class::Farm);
         // A lease given up before the operation was refused may still be listed.
         self.machine.forget_leases(refusal.operation);
         for stage in refusal.waiters.iter().filter_map(|id| self.stages.get(id)) {
@@ -414,6 +432,9 @@ impl Adapter for KbfAdapter {
             .filter_map(|id| self.stages.get(id).cloned())
             .collect();
         let reason = detail.as_ref().and_then(Detail::reason);
+        if let Some(class) = class_of(answer.outcome, detail.as_ref()) {
+            self.failed.count(class);
+        }
         let finished = finished_of(answer, detail.as_ref());
         let (stored, write) = match detail {
             Some(Detail::Ran(pending)) => {

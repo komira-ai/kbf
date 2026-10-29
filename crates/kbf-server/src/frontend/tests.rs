@@ -231,10 +231,10 @@ fn auto_promote_is_off_by_default_and_its_companions_need_it() {
     }
 }
 
-/// Asserts that with no drain flag given the waits are the defaults (ten seconds and
-/// fifteen minutes, which `DrainTiming::default` says too), that values are read as
-/// seconds, that a wait of zero is allowed and a deadline of zero, a word and a negative
-/// number are refused, and that both flags are in the command's help.
+/// Asserts that with no drain flag given the waits are the defaults (ten seconds, and no
+/// deadline, which `DrainTiming::default` says too), that values are read as
+/// seconds, that a deadline has no upper bound, that a wait of zero is allowed and a deadline
+/// of zero, a word and a negative number are refused, and that both flags are in the command's help.
 #[test]
 fn the_drain_flags_have_their_defaults_and_bounds() {
     use crate::sequence::DrainTiming;
@@ -242,9 +242,15 @@ fn the_drain_flags_have_their_defaults_and_bounds() {
 
     let drain = |more: &[&str]| parsed(more).expect("parses").drain;
     assert_eq!(drain(&[]), DrainTiming::default());
+    assert_eq!(drain(&[]).deadline, None, "a deadline by default");
     let set = drain(&["--drain-lb-wait=3", "--drain-deadline=45"]);
-    let (lb_wait, deadline) = (Duration::from_secs(3), Duration::from_secs(45));
+    let (lb_wait, deadline) = (Duration::from_secs(3), Some(Duration::from_secs(45)));
     assert_eq!(set, DrainTiming { lb_wait, deadline });
+    // No upper bound: a year, and a number of seconds only u64 holds.
+    let year = drain(&["--drain-deadline=31536000"]).deadline;
+    assert_eq!(year, Some(Duration::from_secs(31_536_000)));
+    let huge = drain(&["--drain-deadline=18446744073709551615"]).deadline;
+    assert_eq!(huge, Some(Duration::from_secs(u64::MAX)));
     assert_eq!(drain(&["--drain-lb-wait=0"]).lb_wait, Duration::ZERO);
     for refused in [
         "--drain-deadline=0",
