@@ -71,6 +71,12 @@ struct InvalidFlags(String);
 
 const DEFAULT_MAX_REQUEST_BYTES: u64 = 256 << 20;
 
+/// The streamed bodies taken at once: 32 of them hold at most 32 x (16 MiB + a few pieces).
+const DEFAULT_MAX_CONCURRENT_PUTS: u32 = 32;
+
+/// The least average rate of a body, in bytes a second.
+const DEFAULT_PUT_MIN_BYTES_PER_SEC: u64 = 1024;
+
 /// The signing region of an S3 tier whose region is not given.
 const DEFAULT_REGION: &str = "us-east-1";
 
@@ -196,18 +202,44 @@ pub struct Cli {
     /// How often the reconciler works: shorter than `--lease-ttl`.
     #[arg(long, default_value = "5s", value_parser = parse_duration)]
     pub reconcile_interval: Duration,
-    /// The largest body of a request, in bytes: the largest object, and the largest part of a
-    /// multipart upload.
+    /// The longest body of a request, in bytes: the longest object, and the longest part of a
+    /// multipart upload. An upper bound on the length of what is streamed, not a bound on
+    /// memory: the body of a put or of a part is passed on to the tiers as it arrives and is
+    /// never held whole. A body over it is refused with 413 and nothing is stored; a request
+    /// that says in its `Content-Length` that its body is longer is refused before any byte of
+    /// it is read.
     #[arg(
         long,
         default_value_t = DEFAULT_MAX_REQUEST_BYTES,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub max_request_bytes: u64,
+    /// The most put bodies and upload parts taken at once. One more is answered 503 `SlowDown`
+    /// with `Retry-After: 1` and its body is not read. A body in flight holds a few pieces of
+    /// at most the size the connection delivers (tens of KiB), and an S3 tier up to 16 MiB
+    /// more, so 32 bodies hold about half a GiB at most, with S3 tiers, and a few MiB with
+    /// directory tiers.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_CONCURRENT_PUTS,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub max_concurrent_puts: u32,
+    /// The least average rate, in bytes a second, at which a request body may come in, counted
+    /// from the start of the body once `--put-rate-grace` has passed. A slower body is
+    /// answered 400 `RequestTimeout`, nothing of it is stored and the upload it began at an S3
+    /// tier is aborted. It ends senders that send a byte inside every idle timeout. 0 turns
+    /// it off.
+    #[arg(long, default_value_t = DEFAULT_PUT_MIN_BYTES_PER_SEC)]
+    pub put_min_bytes_per_sec: u64,
+    /// How long a body is let to go before `--put-min-bytes-per-sec` is held to it: a number
+    /// and `ms`, `s`, `m` or `h`.
+    #[arg(long, default_value = "30s", value_parser = parse_duration)]
+    pub put_rate_grace: Duration,
     /// How long a request body may go without a byte arriving, and how long a client may go
     /// without taking a byte of an answer, before the request ends: a number and `ms`, `s`,
-    /// `m` or `h`. A body that arrives slowly but steadily is never cut, however long the whole
-    /// takes. A request whose body stalls is answered 400 `RequestTimeout` and its connection
+    /// `m` or `h`. A body that arrives slowly but steadily is not cut by this timeout, however long
+    /// the whole takes (`--put-min-bytes-per-sec` sets the slowest rate it is let to have). A request whose body stalls is answered 400 `RequestTimeout` and its connection
     /// is closed; a connection whose client stops reading an answer is closed. Both are
     /// logged on stderr, and a drain waits no longer than this for a stalled client.
     #[arg(long, default_value = "30s", value_parser = parse_duration)]
@@ -390,6 +422,9 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     server.region = cli.region.clone();
     server.max_request_bytes = usize::try_from(cli.max_request_bytes).unwrap_or(usize::MAX);
     server.body_idle_timeout = cli.body_idle_timeout;
+    server.max_concurrent_puts = cli.max_concurrent_puts as usize;
+    server.put_min_bytes_per_sec = cli.put_min_bytes_per_sec;
+    server.put_rate_grace = cli.put_rate_grace;
     server.drain_lb_wait = cli.drain_lb_wait;
     server.drain_deadline = cli.drain_deadline;
     let mut proxy = ProxyConfig::new(&cli.proxy_id, cli.hot_bytes, Arc::clone(&clock));
