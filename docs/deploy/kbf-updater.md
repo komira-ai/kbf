@@ -245,8 +245,9 @@ switch kbf=<version>
 confirm kbf=<version>
 ```
 
-The farm's frontend is down for the length of the switch (its `drain_secs`, the stop, and
-`ready_secs`), so do it when nothing needs it. The switch answers `switched` only after `/readyz` answered 200 on the
+The farm's frontend is down only from the moment the old container has ended, for the new one's start and
+`ready_secs`; the drain before that (no deadline unless `drain_secs` is set, and never cutting work) lets the old
+frontend finish what it has. The switch answers `switched` only after `/readyz` answered 200 on the
 new commit; send `confirm` then, or the helper reverts at the window's deadline.
 
 ### The heartbeat
