@@ -8,11 +8,12 @@
 //!
 //! Each test makes the file the step first touches a named pipe nobody serves: the call
 //! cannot finish until the test lets it. The test opens the other end of the pipe, which
-//! returns only once the call has opened its end, so the call is known to be waiting in
-//! the kernel. It then counts the threads the runtime's blocking pool has started. Two
-//! calls wait at once on a runtime of two workers; if both waited on the workers, the
-//! pool has started no thread. Each runtime names its threads with a prefix of its own,
-//! so the tests count only their own when they run side by side.
+//! returns only once the call has opened its end, so the call is known to be inside the
+//! kernel wait. The test then asks the runtime's metrics how many blocking-pool threads
+//! are busy. Two calls wait at once on a runtime of two workers; a call that waits on a
+//! pool thread is one busy pool thread, and a call that waits on an async worker is none.
+//! The pipes are the rendezvous: the count is read only after every call has reached its
+//! wait, so it does not depend on how the threads were scheduled.
 //!
 //! The digest of the outputs' Directory messages runs on the CPU pool, and its test is
 //! in `outputs_tests`.
@@ -20,7 +21,6 @@
 use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use kbf_types::Resources;
@@ -31,21 +31,6 @@ use crate::cgroup::{LeaseCgroup, presses_into_swap};
 use crate::cgroup_usage::{NumaSample, Start};
 
 const WORKERS: usize = 2;
-
-/// How many runtimes the tests have built, for their thread name prefixes.
-static RUNTIMES: AtomicUsize = AtomicUsize::new(0);
-
-/// How many threads named `<prefix><n>` of this process have `n` of `WORKERS` or more:
-/// the threads the blocking pool of the runtime with that prefix has started.
-fn blocking_pool_threads(prefix: &str) -> usize {
-    let tasks = std::fs::read_dir("/proc/self/task").expect("threads");
-    tasks
-        .flatten()
-        .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
-        .filter_map(|name| name.trim().strip_prefix(prefix)?.parse::<usize>().ok())
-        .filter(|&n| n >= WORKERS)
-        .count()
-}
 
 fn fifo(path: &Path) {
     rustix::fs::mknodat(CWD, path, FileType::Fifo, Mode::from_raw_mode(0o600), 0).expect("mkfifo");
@@ -70,7 +55,7 @@ fn read_end(path: &Path) -> File {
 /// Starts `WORKERS` calls on a runtime of `WORKERS` async workers, each given the
 /// directory `<name>/<n>` in which the file `blocked` is a pipe (the other files a
 /// cgroup has are plain files), waits until every call waits on its pipe, and returns how
-/// many threads the runtime's blocking pool has started then. `meet` opens the other end
+/// many threads of the runtime's blocking pool are busy then. `meet` opens the other end
 /// of the pipe, and `call` is the work under test.
 fn blocking_threads_while_calls_wait<F, Fut>(
     name: &str,
@@ -83,17 +68,8 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     let scratch = crate::unit_dir(name);
-    // The runtime starts its workers when it is built, so the first `WORKERS` names go to
-    // them and any later name to a thread of the blocking pool. A thread name is at most
-    // 15 bytes long.
-    let prefix = format!("kw{}-", RUNTIMES.fetch_add(1, Ordering::Relaxed));
-    let named = AtomicUsize::new(0);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(WORKERS)
-        .thread_name_fn({
-            let prefix = prefix.clone();
-            move || format!("{prefix}{}", named.fetch_add(1, Ordering::Relaxed))
-        })
         .enable_all()
         .build()
         .expect("runtime");
@@ -120,7 +96,9 @@ where
     let tasks: Vec<_> = dirs.iter().map(|dir| rt.spawn(call(dir.clone()))).collect();
     // Returns once the call has opened the pipe: it waits for its other end from here.
     let held: Vec<_> = dirs.iter().map(|dir| meet(&dir.join(blocked))).collect();
-    let started = blocking_pool_threads(&prefix);
+    // Every call waits on its pipe, so a pool thread that runs one is busy for good.
+    let metrics = rt.metrics();
+    let busy = metrics.num_blocking_threads() - metrics.num_idle_blocking_threads();
     // Let every call finish, and every later one find a plain file.
     for dir in &dirs {
         let plain = dir.join("plain");
@@ -132,14 +110,14 @@ where
         task.abort();
     }
     drop(rt);
-    started
+    busy
 }
 
-/// The failure message when `started` threads are too few.
-fn rest_waited(started: usize) -> String {
+/// The failure message when `busy` pool threads are too few.
+fn rest_waited(busy: usize) -> String {
     format!(
-        "two calls waited at once and the blocking pool started {started} threads: \
-         the rest waited on the async workers"
+        "{WORKERS} calls wait on their pipes and {busy} blocking-pool threads are busy: \
+         the rest wait on the async workers"
     )
 }
 
@@ -156,7 +134,7 @@ fn cgroup_at(dir: &Path) -> LeaseCgroup {
 /// heartbeat included.
 #[test]
 fn the_swap_watch_reads_off_the_async_workers() {
-    let started = blocking_threads_while_calls_wait(
+    let busy = blocking_threads_while_calls_wait(
         "swap-watch",
         "memory.events",
         write_end,
@@ -164,14 +142,14 @@ fn the_swap_watch_reads_off_the_async_workers() {
             presses_into_swap(&cgroup_at(&dir), Some(1 << 30), u64::MAX, Duration::ZERO).await;
         },
     );
-    assert_eq!(started, WORKERS, "{}", rest_waited(started));
+    assert_eq!(busy, WORKERS, "{}", rest_waited(busy));
 }
 
 /// Catches the NUMA sampler reading `memory.stat` and `memory.numa_stat` on an async
 /// worker every second for every running lease.
 #[test]
 fn the_numa_sampler_reads_off_the_async_workers() {
-    let started = blocking_threads_while_calls_wait(
+    let busy = blocking_threads_while_calls_wait(
         "numa-watch",
         "memory.stat",
         write_end,
@@ -179,17 +157,17 @@ fn the_numa_sampler_reads_off_the_async_workers() {
             NumaSample::default().watch(&dir, Duration::ZERO).await;
         },
     );
-    assert_eq!(started, WORKERS, "{}", rest_waited(started));
+    assert_eq!(busy, WORKERS, "{}", rest_waited(busy));
 }
 
 /// Catches the container's stdout and stderr files being created on an async worker: a
 /// create on a busy file system waits for the journal.
 #[test]
 fn the_logs_are_created_off_the_async_workers() {
-    let started = blocking_threads_while_calls_wait("logs", "stdout", read_end, |dir| async move {
+    let busy = blocking_threads_while_calls_wait("logs", "stdout", read_end, |dir| async move {
         let _ = create_logs(&dir.join("stdout"), &dir.join("stderr")).await;
     });
-    assert_eq!(started, WORKERS, "{}", rest_waited(started));
+    assert_eq!(busy, WORKERS, "{}", rest_waited(busy));
 }
 
 /// Catches the lease cgroup being made on an async worker: the read of the parent's OOM
@@ -197,7 +175,7 @@ fn the_logs_are_created_off_the_async_workers() {
 /// first calls of a lease that touch the cgroup file system.
 #[test]
 fn the_cgroup_is_made_off_the_async_workers() {
-    let started = blocking_threads_while_calls_wait(
+    let busy = blocking_threads_while_calls_wait(
         "make-cgroup",
         "memory.events.local",
         write_end,
@@ -206,13 +184,13 @@ fn the_cgroup_is_made_off_the_async_workers() {
             let _ = make_cgroup(cgroup, Resources::new(1000, 1 << 30), None).await;
         },
     );
-    assert_eq!(started, WORKERS, "{}", rest_waited(started));
+    assert_eq!(busy, WORKERS, "{}", rest_waited(busy));
 }
 
 /// Catches the read of the node's CPU pressure at a lease's start on an async worker.
 #[test]
 fn the_cpu_pressure_is_read_off_the_async_workers() {
-    let started = blocking_threads_while_calls_wait(
+    let busy = blocking_threads_while_calls_wait(
         "start-read",
         "cpu.pressure",
         write_end,
@@ -220,14 +198,14 @@ fn the_cpu_pressure_is_read_off_the_async_workers() {
             read_start(dir.join("cpu.pressure"), 1000).await;
         },
     );
-    assert_eq!(started, WORKERS, "{}", rest_waited(started));
+    assert_eq!(busy, WORKERS, "{}", rest_waited(busy));
 }
 
 /// Catches the check for an OOM kill, which reads `memory.events` of a lease that was
 /// killed, on an async worker.
 #[test]
 fn the_oom_check_reads_off_the_async_workers() {
-    let started = blocking_threads_while_calls_wait(
+    let busy = blocking_threads_while_calls_wait(
         "oom-check",
         "memory.events",
         write_end,
@@ -235,28 +213,28 @@ fn the_oom_check_reads_off_the_async_workers() {
             let _ = oom_outcome(cgroup_at(&dir), None, None).await;
         },
     );
-    assert_eq!(started, WORKERS, "{}", rest_waited(started));
+    assert_eq!(busy, WORKERS, "{}", rest_waited(busy));
 }
 
 /// Catches the lease's resource usage, read from the cgroup's `cpu.stat`, memory and
 /// pressure files when the action has ended, on an async worker.
 #[test]
 fn the_usage_is_read_off_the_async_workers() {
-    let started =
+    let busy =
         blocking_threads_while_calls_wait("usage", "cpu.stat", write_end, |dir| async move {
             usage(dir, NumaSample::default(), Instant::now(), Start::default()).await;
         });
-    assert_eq!(started, WORKERS, "{}", rest_waited(started));
+    assert_eq!(busy, WORKERS, "{}", rest_waited(busy));
 }
 
 /// Catches the node load reading the `actions/` cgroup's files on an async worker every
 /// heartbeat.
 #[test]
 fn the_node_load_reads_off_the_async_workers() {
-    let started =
+    let busy =
         blocking_threads_while_calls_wait("node-load", "cpu.stat", write_end, |dir| async move {
             let tracker = crate::node_load::LoadTracker::new(crate::node_load::process_clock());
             let _ = tracker.reading(dir).await;
         });
-    assert_eq!(started, WORKERS, "{}", rest_waited(started));
+    assert_eq!(busy, WORKERS, "{}", rest_waited(busy));
 }
