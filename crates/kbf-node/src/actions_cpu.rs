@@ -8,11 +8,14 @@ use super::Driver;
 /// The flag, flattened into the command line.
 #[derive(Clone, Copy, Debug, clap::Args)]
 pub(crate) struct ActionsCpuArgs {
-    /// Whether the actions cgroup's `cpu.max` is lifted (container). `auto` follows the
-    /// server's Welcome (`placement_load`): `max` when it says the farm places by measured
-    /// load, the leases' CPUs (the node's minus `--reserve-cpus`) when it says otherwise or
-    /// nothing; `on` lifts the limit and `off` keeps it, whatever the Welcome says. Until the
-    /// first Welcome the limit of the start stays. The heartbeat reports what was written
+    /// Whether the actions cgroup's `cpu.max` is lifted (container). At start it holds the
+    /// leases' CPUs, the node's minus `--reserve-cpus`; the server's Welcome then says,
+    /// on every connect and reconnect, whether the farm places by the load the nodes
+    /// measure (`Welcome.placement_load`), which a CPU limit would hide (a cgroup throttled
+    /// at its limit never measures more than it). `auto` follows the Welcome: `cpu.max` is
+    /// `max` when it says so, and the leases' CPUs when it says otherwise or nothing; `on`
+    /// lifts the limit and `off` keeps it, whatever the Welcome says. Until the first
+    /// Welcome the limit of the start stays. The heartbeat reports what was written
     /// (`NodeLoad.actions_cpu_limited`). Refused with a driver other than `container`.
     #[arg(long, value_enum, default_value_t = Mode::Auto, value_name = "auto|on|off")]
     actions_cpu_max: Mode,
