@@ -3,7 +3,7 @@
 //! one that is full is not in doubt.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -51,6 +51,8 @@ pub(crate) enum Flaw {
     ListFails,
     /// A delete fails with an error that is not a down store's.
     DeleteFails,
+    /// A listing by page ignores its prefix, as a store that lists the whole bucket.
+    ListIgnoresPrefix,
 }
 
 /// A memory backend with one flaw. The memory backend is reachable, to see what a test left.
@@ -58,15 +60,28 @@ pub(crate) struct Flawed {
     pub(crate) inner: MemoryBackend,
     flaw: Flaw,
     tripped: AtomicBool,
+    /// The puts of the key `create` of a check, to count the attempts at that check.
+    create_puts: AtomicU32,
 }
 
 impl Flawed {
     pub(crate) fn new(flaw: Flaw) -> Self {
+        Self::over(flaw, MemoryBackend::new())
+    }
+
+    /// A backend with this flaw over `inner`.
+    pub(crate) fn over(flaw: Flaw, inner: MemoryBackend) -> Self {
         Self {
-            inner: MemoryBackend::new(),
+            inner,
             flaw,
             tripped: AtomicBool::new(false),
+            create_puts: AtomicU32::new(0),
         }
+    }
+
+    /// How many puts of the create-only check's key there were.
+    fn create_puts(&self) -> u32 {
+        self.create_puts.load(Ordering::SeqCst)
     }
 
     fn is(&self, flaw: Flaw) -> bool {
@@ -81,14 +96,15 @@ impl Flawed {
     }
 
     /// The error a put gives for the flaws that fail it.
-    fn put_error(&self) -> Result<(), Error> {
+    fn put_error(&self, key: &str) -> Result<(), Error> {
         if self.is(Flaw::Down) {
             return Err(Error::Unavailable("connection refused".to_owned()));
         }
         if self.is(Flaw::Full) {
             return Err(Error::Full("507 Insufficient Storage".to_owned()));
         }
-        if self.is(Flaw::FlakyOnce) && !self.tripped.swap(true, Ordering::SeqCst) {
+        let clock = key.ends_with("/clock");
+        if self.is(Flaw::FlakyOnce) && !clock && !self.tripped.swap(true, Ordering::SeqCst) {
             return Err(Error::Unavailable("503 Service Unavailable".to_owned()));
         }
         Ok(())
@@ -98,7 +114,10 @@ impl Flawed {
 #[async_trait]
 impl Backend for Flawed {
     async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
-        self.put_error()?;
+        self.put_error(key)?;
+        if key.ends_with("/create") {
+            self.create_puts.fetch_add(1, Ordering::SeqCst);
+        }
         let exists = self.inner.head(key).await.is_ok();
         if exists && self.is(Flaw::OverwritesOnCreate) {
             self.inner.delete(key).await?;
@@ -154,6 +173,11 @@ impl Backend for Flawed {
             return Err(Error::Other("listing broke".to_owned()));
         }
         let after = start_after.filter(|_| !self.is(Flaw::IgnoresStartAfter));
+        let prefix = if self.is(Flaw::ListIgnoresPrefix) {
+            ""
+        } else {
+            prefix
+        };
         self.inner.list_page(prefix, after, max_keys).await
     }
 
@@ -189,7 +213,7 @@ impl Backend for Flawed {
     }
 }
 
-/// The options of a run: three attempts, no wait between them, the time zero.
+/// The options of a run: three attempts, no wait between them.
 fn options<'a>(run_id: &'a str, multipart: bool, skip: &'a [Check]) -> SelfTestOptions<'a> {
     SelfTestOptions {
         name: "the backend",
@@ -198,7 +222,6 @@ fn options<'a>(run_id: &'a str, multipart: bool, skip: &'a [Check]) -> SelfTestO
         skip,
         attempts: 3,
         pause: Duration::ZERO,
-        now: 0,
     }
 }
 
@@ -376,8 +399,12 @@ async fn a_store_that_cannot_be_asked_is_unreachable_after_three_attempts() {
     assert!(error.contains("connection refused"), "{error}");
     let repeats = notes.iter().filter(|note| note.contains("trying again"));
     assert_eq!(repeats.count(), 2, "{notes:?}");
+    let first = notes
+        .iter()
+        .find(|note| note.contains("trying again"))
+        .unwrap();
     assert!(
-        notes[0].contains("the backend: the create-only check"),
+        first.contains("the backend: the create-only check"),
         "{notes:?}"
     );
     assert!(backend.inner.list(PROBE).await.unwrap().is_empty());
@@ -388,6 +415,10 @@ async fn a_store_that_cannot_be_asked_is_unreachable_after_three_attempts() {
     .to_string();
     assert!(
         text.starts_with("tier unreachable: the backend: "),
+        "{text}"
+    );
+    assert!(
+        text.contains("may be a gap in the store, not an outage"),
         "{text}"
     );
 }
@@ -417,6 +448,17 @@ async fn a_full_store_passes_with_a_note_for_each_check_it_skipped() {
             .filter(|note| note.contains("the tier is full"));
         assert_eq!(full.count(), skipped, "{notes:?}");
         assert!(backend.inner.list(PROBE).await.unwrap().is_empty());
+        // A full cold tier is not a designed state: its notes are warnings that say so.
+        let warned = notes.iter().filter(|note| note.contains("WARNING"));
+        let cold = notes
+            .iter()
+            .filter(|note| note.contains("writes to the cold tier will fail"));
+        let (warned, cold) = (warned.count(), cold.count());
+        assert_eq!(
+            (warned, cold),
+            if multipart { (6, 6) } else { (0, 0) },
+            "{notes:?}"
+        );
     }
 }
 
@@ -451,32 +493,106 @@ async fn a_skipped_check_does_not_run_and_the_others_do() {
     }
 }
 
-/// Asserts that probe keys of an earlier start that are older than ten minutes are deleted when
-/// the test starts, and a key that is newer, and a key outside the prefix, are not.
+/// The keys of a backend, in order.
+async fn keys_of(backend: &dyn Backend) -> Vec<String> {
+    let all = backend.list("").await.unwrap();
+    all.into_iter().map(|object| object.key).collect()
+}
+
+/// Asserts that probe keys of an earlier start are deleted when the test starts if they are more
+/// than an hour old by the store's own clock, whatever the clock of the machine says: at 59
+/// minutes on the store's clock a key written at 0 stays, at 61 it goes; a key that is newer and a
+/// key outside the prefix stay; and a stale key under this run's own id stays (it is not an
+/// earlier start's).
 #[tokio::test]
-async fn probe_keys_of_an_earlier_start_older_than_ten_minutes_are_swept() {
+async fn probe_keys_older_than_an_hour_by_the_store_clock_are_swept() {
     let clock = std::sync::Arc::new(TestClock::new());
     let memory = MemoryBackend::with_clock(clock.clone());
-    let old = format!("{PROBE}killed-start/create");
-    let recent = format!("{PROBE}running-start/create");
-    memory.put(&old, Bytes::from_static(b"x")).await.unwrap();
-    memory
-        .put("client/object", Bytes::from_static(b"x"))
-        .await
-        .unwrap();
+    let put = |key: &'static str| memory.put(key, Bytes::from_static(b"x"));
+    put("_tiering/selftest/killed-start/create").await.unwrap();
+    put("_tiering/selftest/run-1/stale").await.unwrap();
+    put("client/object").await.unwrap();
     clock.set(30 * 60 * 1000);
-    memory.put(&recent, Bytes::from_static(b"x")).await.unwrap();
-    let mut swept = options("run-1", true, &[]);
-    swept.now = 35 * 60 * 1000;
-    let (outcome, notes) = go(&memory, &swept).await;
+    put("_tiering/selftest/running-start/create").await.unwrap();
+
+    clock.set(59 * 60 * 1000);
+    let (outcome, notes) = go(&memory, &options("run-1", true, &[])).await;
     assert_eq!(outcome, Ok(()));
     assert!(notes.is_empty(), "{notes:?}");
-    let all = memory.list("").await.unwrap();
-    let keys: Vec<&str> = all.iter().map(|object| object.key.as_str()).collect();
+    assert_eq!(keys_of(&memory).await.len(), 4);
+
+    clock.set(61 * 60 * 1000);
+    let (outcome, notes) = go(&memory, &options("run-1", true, &[])).await;
+    assert_eq!(outcome, Ok(()));
+    assert!(notes.is_empty(), "{notes:?}");
     assert_eq!(
-        keys,
-        ["_tiering/selftest/running-start/create", "client/object"]
+        keys_of(&memory).await,
+        [
+            "_tiering/selftest/run-1/stale",
+            "_tiering/selftest/running-start/create",
+            "client/object"
+        ]
     );
+}
+
+/// Asserts that a store that ignores the prefix of a listing, and so lists client keys and the
+/// journal, loses none of them to the sweep, however old they are; only the probe key is deleted.
+#[tokio::test]
+async fn the_sweep_deletes_nothing_outside_the_probe_prefix() {
+    let clock = std::sync::Arc::new(TestClock::new());
+    let backend = Flawed::over(
+        Flaw::ListIgnoresPrefix,
+        MemoryBackend::with_clock(clock.clone()),
+    );
+    let put = |key: &'static str| backend.put(key, Bytes::from_static(b"x"));
+    put("client/object").await.unwrap();
+    put("_journal/p1/1").await.unwrap();
+    put("_tiering/lease").await.unwrap();
+    put("_tiering/selftest/killed-start/create").await.unwrap();
+    clock.set(3 * 60 * 60 * 1000);
+    let skip = [Check::Paging];
+    let (outcome, notes) = go(&backend, &options("run-1", true, &skip)).await;
+    assert_eq!(outcome, Ok(()));
+    assert!(notes.is_empty(), "{notes:?}");
+    assert_eq!(
+        keys_of(&backend.inner).await,
+        ["_journal/p1/1", "_tiering/lease", "client/object"]
+    );
+}
+
+/// Asserts that a store whose time cannot be read (its HEAD fails) is not swept, with a note, and
+/// the checks go on: the head check then refuses the store.
+#[tokio::test]
+async fn a_store_whose_time_cannot_be_read_is_not_swept_and_a_note_says_so() {
+    let backend = Flawed::new(Flaw::NoLastModified);
+    let (outcome, notes) = go(&backend, &options("run-1", true, &[])).await;
+    assert!(
+        matches!(outcome, Err(SelfTestError::Violation(_))),
+        "{outcome:?}"
+    );
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains("could not read the time of the store"),
+        "{notes:?}"
+    );
+    assert!(notes[0].contains("Last-Modified"), "{notes:?}");
+}
+
+/// Asserts that an answer that is not retried is asked once: a store that rejects the conditional
+/// header (501) and one that overwrites on a create-only put are each sent the create-only put
+/// of the first attempt and the second put of the same attempt, and no other.
+#[tokio::test]
+async fn a_wrong_answer_is_not_retried() {
+    for flaw in [Flaw::RejectsConditionalHeader, Flaw::OverwritesOnCreate] {
+        let backend = Flawed::new(flaw);
+        let (outcome, notes) = go(&backend, &options("run-1", true, &[])).await;
+        assert!(
+            matches!(outcome, Err(SelfTestError::Violation(_))),
+            "{flaw:?}: {outcome:?}"
+        );
+        assert!(notes.is_empty(), "{flaw:?}: {notes:?}");
+        assert_eq!(backend.create_puts(), 2, "{flaw:?}");
+    }
 }
 
 /// Asserts that a listing of the old probe keys that fails is noted and does not end the test, and

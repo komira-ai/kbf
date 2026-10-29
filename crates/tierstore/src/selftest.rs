@@ -20,8 +20,12 @@
 //! The probe keys are under `_tiering/selftest/<run id>/`, a prefix a client never sees (the
 //! `_tiering/` prefix is reserved), and the caller gives a run id that is new for each start.
 //! The keys of a check are deleted after it, whether it passed or not (a delete that fails is
-//! noted). Keys under the prefix that are older than ten minutes, left by a start that was killed,
-//! are deleted when the test starts (at most the first thousand are looked at).
+//! noted). Keys under the prefix that are older than an hour, left by a start that was killed,
+//! are deleted when the test starts (at most the first thousand are looked at). Only keys that
+//! start with the probe prefix and are not this run's are deleted, whatever a listing returns, and
+//! the age is judged by the clock of the store (the `Last-Modified` of a key the test writes for
+//! the purpose and deletes), not by the clock of the machine, which may be minutes from that of
+//! another machine over the same bucket.
 //!
 //! The test sees a backend through the [`Backend`] trait, so it asks what the trait promises: the
 //! S3 backend turns a store's answers into those promises (`If-None-Match: *` answered 412 is
@@ -45,7 +49,7 @@ use crate::{Backend, ByteRange, Error, Listed};
 const PROBE_PREFIX: &str = "_tiering/selftest/";
 
 /// The age, in milliseconds, past which a probe key of an earlier start is deleted.
-const SWEEP_AGE_MS: u64 = 10 * 60 * 1000;
+const SWEEP_AGE_MS: u64 = 60 * 60 * 1000;
 
 /// The most keys of an earlier start that are looked at.
 const SWEEP_LIMIT: usize = 1000;
@@ -56,6 +60,7 @@ const WRONG_TAG: &str = "00000000000000000000000000000000";
 /// The names of the probe keys, under the run's prefix.
 const CREATE_KEY: &str = "create";
 const HEAD_KEY: &str = "head";
+const CLOCK_KEY: &str = "clock";
 const MATCH_KEY: &str = "match";
 const RANGE_KEY: &str = "range";
 const PAGE_KEYS: [&str; 3] = ["page/a", "page/b", "page/c"];
@@ -176,7 +181,12 @@ impl fmt::Display for SelfTestError {
         match self {
             SelfTestError::Violation(failure) => failure.fmt(out),
             SelfTestError::Unreachable { backend, error } => {
-                write!(out, "tier unreachable: {backend}: {error}")
+                write!(
+                    out,
+                    "tier unreachable: {backend}: {error}; if the store is up, an error that \
+                     persists on a conditional step (a create-only put, If-Match, the completion \
+                     of a multipart upload) may be a gap in the store, not an outage"
+                )
             }
         }
     }
@@ -201,9 +211,6 @@ pub struct SelfTestOptions<'a> {
     pub attempts: u32,
     /// How long to wait between two attempts.
     pub pause: Duration,
-    /// The time now, in milliseconds since the Unix epoch, to judge the age of the keys of an
-    /// earlier start by.
-    pub now: u64,
 }
 
 /// Where the notes of the test go: a skipped check, an attempt that is repeated, a key that was
@@ -238,7 +245,15 @@ pub async fn self_test(
         match verdict {
             Ok(()) => {}
             Err(Fault::Full) => {
-                probe.note(format!("the {check} check was skipped: the tier is full"));
+                let line = if options.multipart {
+                    format!(
+                        "WARNING: the {check} check was skipped: the tier is full, and writes \
+                         to the cold tier will fail"
+                    )
+                } else {
+                    format!("the {check} check was skipped: the tier is full")
+                };
+                probe.note(line);
             }
             Err(Fault::Wrong(observed)) => {
                 let failure = SelfTestFailure {
@@ -379,8 +394,27 @@ impl Probe<'_> {
         }
     }
 
-    /// Deletes the probe keys that an earlier start left.
+    /// The time of the store, in milliseconds: the time of last write of a key written now, which
+    /// is deleted again.
+    async fn store_time(&self) -> Result<u64, Error> {
+        let key = self.key(CLOCK_KEY);
+        self.backend.put(&key, text("clock")).await?;
+        let head = self.backend.head(&key).await;
+        self.delete(&key).await;
+        Ok(head?.modified)
+    }
+
+    /// Deletes the probe keys that an earlier start left, more than an hour old by the clock of
+    /// the store. Only keys under the probe prefix and not this run's are deleted, whatever the
+    /// listing returns (a store that ignores the prefix lists the data too).
     async fn sweep(&self) {
+        let now = match self.store_time().await {
+            Ok(now) => now,
+            Err(error) => {
+                self.note(format!("could not read the time of the store: {error}"));
+                return;
+            }
+        };
         let listed = self.backend.list_page(PROBE_PREFIX, None, SWEEP_LIMIT);
         let found = match listed.await {
             Ok(found) => found,
@@ -391,7 +425,9 @@ impl Probe<'_> {
             }
         };
         for object in found {
-            if object.modified.saturating_add(SWEEP_AGE_MS) < self.options.now {
+            let ours = object.key.starts_with(&self.prefix);
+            let probe = object.key.starts_with(PROBE_PREFIX);
+            if probe && !ours && object.modified.saturating_add(SWEEP_AGE_MS) < now {
                 self.delete(&object.key).await;
             }
         }

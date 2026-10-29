@@ -554,7 +554,6 @@ async fn probe_tiers(
             skip: &skip,
             attempts: SELF_TEST_ATTEMPTS,
             pause,
-            now: SystemClock.now(),
         };
         let note = |line: String| eprintln!("tierstore: {line}");
         eprintln!("tierstore: testing the {name}");

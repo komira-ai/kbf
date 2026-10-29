@@ -142,12 +142,20 @@ the size and the ETag of what was written, a listing after a key must page right
 tier the completion of a multipart upload over a key that exists must be refused. (Only the
 create-only completion is probed, not the refusal of a bad part list.) It uses keys under
 `_tiering/selftest/`, which clients never see; they are deleted afterwards, and keys a killed
-start left more than ten minutes ago are swept. A tier that answers one of them wrongly exits 3
+start left more than an hour ago (by the store's clock, not the machine's) are swept; only keys
+under that prefix are ever deleted. A tier that answers one of them wrongly exits 3
 with the tier, the check and the answer on stderr, and is not restarted
-(`RestartPreventExitStatus=2 3`): fix or replace the store. A tier that cannot be reached (down,
-503, a timeout) is asked three times, then the start exits 1 and is tried again every five seconds.
+(`RestartPreventExitStatus=2 3`): fix or replace the store. That includes answers that are a
+configuration error, such as 403 `AccessDenied` or `NoSuchBucket`, which are not retried either.
+A tier that cannot be reached (down, a timeout, 408, 429, any 5xx but 501 and 507) is asked three
+times, then the start exits 1 and is tried again every five seconds, up to the start limit of the
+unit (5 starts in 10 minutes, then systemd gives up until `systemctl reset-failed tierstore`). An
+error that persists on a conditional step (a create-only put, `If-Match`, the completion of a
+multipart upload) while the store is up, a 500 for instance, may be a gap in the store and not an
+outage; the message says so.
 A tier that is full (a full hot tier is a designed state) starts: the checks that need a write are
-skipped, with a line on stderr that says so.
+skipped, with a line on stderr that says so. For a full cold tier the line is a warning that writes
+to the cold tier will fail.
 
 `--skip-backend-check multipart-conditional=<reason>` leaves out the multipart check, for a store
 that lacks a conditional completion; the reason is written to stderr at every start. No other check

@@ -29,6 +29,13 @@ Documentation=https://github.com/komira-ai/kbf/blob/main/packaging/tierstore/REA
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=/etc/tierstore/access.key
+# Restart=on-failure below tries a start that failed again every 5 s. A store that answers 500 for
+# ever to a step the start-up self-test needs (a conditional put it does not support) fails every
+# start with exit 1, as a store that is down does: after 5 starts in 10 minutes systemd stops
+# trying (`systemctl reset-failed tierstore` and a start try again), so that it does not loop for
+# ever on a store that needs fixing.
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple

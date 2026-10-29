@@ -12,8 +12,8 @@ use futures::{StreamExt, stream};
 use kbf_objstore::s3::fake::{Failure, FakeS3, part_etag};
 use tierstore::s3::{Capabilities, Credentials, S3Config};
 use tierstore::{
-    Backend, ByteRange, Clock, Error, PartBody, Proxy, ProxyConfig, Reconciler, ReconcilerConfig,
-    S3Backend, SelfTestError, SelfTestOptions, SystemClock, self_test,
+    Backend, ByteRange, Check, Clock, Error, PartBody, Proxy, ProxyConfig, Reconciler,
+    ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SystemClock, self_test,
 };
 
 use crate::conformance;
@@ -65,28 +65,42 @@ fn self_test_options(run_id: &str, multipart: bool) -> SelfTestOptions<'_> {
         skip: &[],
         attempts: 2,
         pause: Duration::ZERO,
-        now: 0,
     }
 }
 
-/// Asserts that a probe key an earlier start left, read from the listing of the service with the
-/// time the service stamped it with, is deleted when its age is over ten minutes.
+/// Asserts that a probe key an earlier start left is deleted when the service's own clock, read
+/// from the time it stamps a key the test writes, says it is over an hour old, as listed with the
+/// time the service stamped it with; and that a key that is not yet an hour old stays.
 #[tokio::test]
 async fn the_self_test_sweeps_probe_keys_of_an_earlier_start_over_the_s3_service() {
     let (s3, backend) = backend().await;
-    s3.set_time(1);
     let left = bytes::Bytes::from_static(b"x");
+    s3.set_time(1);
     backend
-        .put("_tiering/selftest/killed-start/create", left)
+        .put("_tiering/selftest/killed-start/create", left.clone())
         .await
         .unwrap();
-    assert_eq!(s3.keys().len(), 1);
-    let mut options = self_test_options("run-1", true);
-    options.now = 2_000_000_000;
+    s3.set_time(5_000);
+    backend
+        .put("_tiering/selftest/running-start/create", left)
+        .await
+        .unwrap();
+    let options = self_test_options("run-1", true);
+
+    // 3000 s on the service's clock: the first key is under an hour old.
+    s3.set_time(3_000);
     self_test(&backend, &options, &|line: String| panic!("{line}"))
         .await
         .unwrap();
-    assert!(s3.keys().is_empty(), "{:?}", s3.keys());
+    assert_eq!(s3.keys().len(), 2, "{:?}", s3.keys());
+
+    // 4000 s: the first key, written at 1 s, is over an hour old; the second, at 5000 s, is not
+    // older than now.
+    s3.set_time(4_000);
+    self_test(&backend, &options, &|line: String| panic!("{line}"))
+        .await
+        .unwrap();
+    assert_eq!(s3.keys(), ["_tiering/selftest/running-start/create"]);
 }
 
 /// Asserts that a 500 from the service is not a wrong answer: the cold tier's multipart check is
@@ -135,14 +149,135 @@ async fn the_self_test_calls_a_service_that_does_not_answer_unreachable() {
     };
     assert_eq!(backend, "the service");
     assert!(error.contains("create-only"), "{error}");
-    // With two attempts the notes are: the listing of old probe keys that failed, one repeat, and
-    // the delete of the check's key that failed before each attempt and after the check.
+    // With two attempts the notes are: the time of the store that could not be read (for the
+    // sweep), one repeat, and the delete of the check's key that failed before each attempt and
+    // after the check.
     let notes = notes.lock().unwrap();
     let count = |text: &str| notes.iter().filter(|note| note.contains(text)).count();
-    assert_eq!(count("could not list the probe keys"), 1, "{notes:?}");
+    assert_eq!(
+        count("could not read the time of the store"),
+        1,
+        "{notes:?}"
+    );
     assert_eq!(count("trying again"), 1, "{notes:?}");
     assert_eq!(count("could not delete the probe key"), 3, "{notes:?}");
     assert_eq!(notes.len(), 5, "{notes:?}");
+}
+
+/// A service that answers every write (a PUT or a POST) with `status`, a whole HTTP reply, a
+/// DELETE with 204 and anything else with 404. Gives the endpoint and the request line of each
+/// request so far.
+fn refusing_writes(status: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+    const NO_CONTENT: &str =
+        "HTTP/1.1 204 No Content\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
+    const NOT_FOUND: &str =
+        "HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for socket in listener.incoming() {
+            let Ok(mut socket) = socket else { return };
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&chunk[..n]);
+            }
+            let text = String::from_utf8_lossy(&head).into_owned();
+            let line = text.lines().next().unwrap_or("").to_owned();
+            // The body, if there is one, is read before the reply, so the client does not see a
+            // reset while it is still sending.
+            let split = text.find("\r\n\r\n").map_or(text.len(), |at| at + 4);
+            let length = text
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::trim)
+                        .map(str::to_owned)
+                })
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut have = head.len() - split;
+            while have < length {
+                let n = socket.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                have += n;
+            }
+            log.lock().unwrap().push(line.clone());
+            let reply = match line.split(' ').next() {
+                Some("PUT" | "POST") => status,
+                Some("DELETE") => NO_CONTENT,
+                _ => NOT_FOUND,
+            };
+            let _ = socket.write_all(reply.as_bytes());
+        }
+    });
+    (endpoint, seen)
+}
+
+/// Asserts that a 507 from a store, through the real S3 mapping, is a full tier and not a wrong
+/// answer: the hot tier's checks that need a write are each skipped with a note (five), the test
+/// passes, and nothing but writes, deletes were sent (no listing: the time of the store could not
+/// be read).
+#[tokio::test]
+async fn a_507_from_the_store_skips_the_write_checks_through_the_s3_mapping() {
+    let (endpoint, seen) = refusing_writes(
+        "HTTP/1.1 507 Insufficient Storage\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+    );
+    let backend = S3Backend::new(config(&endpoint)).unwrap();
+    let notes = Mutex::new(Vec::new());
+    let note = |line: String| notes.lock().unwrap().push(line);
+    let options = self_test_options("run-1", false);
+    self_test(&backend, &options, &note).await.unwrap();
+    let notes = notes.lock().unwrap();
+    let full = notes
+        .iter()
+        .filter(|note| note.contains("the tier is full"));
+    assert_eq!(full.count(), 5, "{notes:?}");
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().all(|line| !line.starts_with("GET")), "{seen:?}");
+}
+
+/// Asserts that a 501 from a store, through the real S3 mapping, is a wrong answer that is not
+/// asked again: the self-test is refused as the create-only check after one put of the key, and
+/// no repeat is noted.
+#[tokio::test]
+async fn a_501_from_the_store_is_a_violation_asked_once() {
+    let (endpoint, seen) = refusing_writes(
+        "HTTP/1.1 501 Not Implemented\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+    );
+    let backend = S3Backend::new(config(&endpoint)).unwrap();
+    let notes = Mutex::new(Vec::new());
+    let note = |line: String| notes.lock().unwrap().push(line);
+    let options = self_test_options("run-1", true);
+    let outcome = self_test(&backend, &options, &note).await;
+    let Err(SelfTestError::Violation(failure)) = outcome else {
+        panic!("a 501 is a violation");
+    };
+    assert_eq!(failure.check, Check::CreateOnly);
+    assert!(failure.observed.contains("501"), "{failure}");
+    let notes = notes.lock().unwrap();
+    assert_eq!(
+        notes
+            .iter()
+            .filter(|note| note.contains("trying again"))
+            .count(),
+        0,
+        "{notes:?}"
+    );
+    let seen = seen.lock().unwrap();
+    let puts = seen
+        .iter()
+        .filter(|line| line.starts_with("PUT") && line.contains("/create"));
+    assert_eq!(puts.count(), 1, "{seen:?}");
 }
 
 /// Asserts that a call failed with `Error::Other`.
