@@ -10,8 +10,8 @@
 //!
 //! Two outcomes are kept apart. A store that answered, and wrongly, is a [`SelfTestFailure`]
 //! (a [`SelfTestError::Violation`]): fixing it takes a different store, so a restart is no use.
-//! A store that could not be asked ([`Error::Unavailable`]: down, 503, a timeout, a refused
-//! connection) is asked again, a bounded number of times, and then is a
+//! A store that could not be asked ([`Error::Unavailable`]: down, a timeout, a refused
+//! connection, and for the S3 backend a 408, 429 or any 5xx but 501 and 507) is asked again, a bounded number of times, and then is a
 //! [`SelfTestError::Unreachable`], which a restart may mend. A store that is full
 //! ([`Error::Full`], a state the hot tier is designed to be in) is not in doubt: the checks that
 //! need a write are skipped, with a note, and the test passes. Any other error is an answer the

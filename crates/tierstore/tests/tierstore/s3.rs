@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::{StreamExt, stream};
-use kbf_objstore::s3::fake::{FakeS3, part_etag};
+use kbf_objstore::s3::fake::{Failure, FakeS3, part_etag};
 use tierstore::s3::{Capabilities, Credentials, S3Config};
 use tierstore::{
     Backend, ByteRange, Clock, Error, PartBody, Proxy, ProxyConfig, Reconciler, ReconcilerConfig,
@@ -86,6 +86,35 @@ async fn the_self_test_sweeps_probe_keys_of_an_earlier_start_over_the_s3_service
     self_test(&backend, &options, &|line: String| panic!("{line}"))
         .await
         .unwrap();
+    assert!(s3.keys().is_empty(), "{:?}", s3.keys());
+}
+
+/// Asserts that a 500 from the service is not a wrong answer: the cold tier's multipart check is
+/// asked again after one 500 and passes with a note for the repeat; and after a 500 in every
+/// attempt the tier is unreachable (a start that exits 1 and is restarted), not a violation.
+#[tokio::test]
+async fn a_500_from_the_service_is_retried_and_then_unreachable_not_a_violation() {
+    let (s3, backend) = backend().await;
+    s3.fail(Failure::Create);
+    let notes = Mutex::new(Vec::new());
+    let note = |line: String| notes.lock().unwrap().push(line);
+    let options = self_test_options("run-1", true);
+    self_test(&backend, &options, &note).await.unwrap();
+    assert_eq!(
+        notes.lock().unwrap().len(),
+        1,
+        "{:?}",
+        notes.lock().unwrap()
+    );
+
+    s3.fail(Failure::Create);
+    s3.fail(Failure::Create);
+    let outcome = self_test(&backend, &options, &note).await;
+    let Err(SelfTestError::Unreachable { error, .. }) = outcome else {
+        panic!("a 500 in every attempt is not unreachable");
+    };
+    assert!(error.contains("starting a multipart upload"), "{error}");
+    assert!(error.contains("500"), "{error}");
     assert!(s3.keys().is_empty(), "{:?}", s3.keys());
 }
 

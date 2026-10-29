@@ -778,6 +778,12 @@ async fn an_unreachable_tier_is_status_1_and_a_full_tier_starts() {
     let wrong = Flawed::new(Flaw::IgnoresIfMatch);
     let why = probe_tiers(&cli, &full, &wrong, now).await.unwrap_err();
     assert_eq!(exit_status(&why), 3, "{why}");
+    // A 501 from the store (the S3 backend's other error) is a contract gap: status 3.
+    let not_implemented = Flawed::new(Flaw::RejectsConditionalHeader);
+    let why = probe_tiers(&cli, &not_implemented, &good, now)
+        .await
+        .unwrap_err();
+    assert_eq!(exit_status(&why), 3, "{why}");
 }
 
 /// Asserts that the report of a drain names the requests that the deadline cut, and that a drain
