@@ -2771,6 +2771,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-task"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "kbf-outputs",
+ "kbf-proto",
+ "kbf-segments",
+ "libc",
+ "prost",
+ "prost-types",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
+ "ureq",
+]
+
+[[package]]
 name = "kbf-testkit"
 version = "0.1.0"
 dependencies = [

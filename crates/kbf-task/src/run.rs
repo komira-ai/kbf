@@ -166,7 +166,7 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
 /// The output paths a Command declares: `output_paths` (REAPI 2.1), else the older
 /// `output_files` and `output_directories`.
 #[allow(deprecated)]
-fn output_paths(command: &Command) -> Vec<&String> {
+pub(crate) fn output_paths(command: &Command) -> Vec<&String> {
     if command.output_paths.is_empty() {
         command
             .output_files
