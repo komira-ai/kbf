@@ -135,3 +135,17 @@ fn the_builders_rebuild_the_core_and_keep_the_settings() {
 fn a_js_farm_names_the_js_core() {
     assert_eq!(farm().scheduler_core(), crate::SchedulerCore::Js);
 }
+
+/// Catches a held cap lost on a farm that runs the legacy core in a build with the feature:
+/// `with_held_cap` checks for the js driver first, and a legacy farm must still get the cap.
+#[test]
+fn a_legacy_farm_in_a_js_build_takes_its_held_cap() {
+    let farm = Farm::on_core(
+        crate::SchedulerCore::Legacy,
+        Arc::new(Cache::memory()).into(),
+        UNSERVABLE_WAIT,
+        FINISHED_RETENTION,
+    )
+    .with_held_cap(3);
+    assert_eq!(farm.lock().engine.held_cap, 3);
+}
