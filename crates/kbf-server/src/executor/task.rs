@@ -3,8 +3,11 @@
 //! A job of the lease server has no secret field yet, so the pack url and the read token
 //! travel in the arguments, where the action can read them (`/proc/1/cmdline`) and the
 //! engine's inspect shows them. That is [`Delivery::InsecureArgv`], and the executor
-//! refuses to run without being told to use it. Nothing here prints a secret: [`Secret`]
-//! formats as `<redacted>`, and so does a [`TaskArgs`].
+//! refuses to run without being told to use it: [`Config::validate`] fails unless
+//! `insecure_argv_secrets` is set. Nothing here prints a secret: [`Secret`] formats as
+//! `<redacted>`, and so does a [`TaskArgs`].
+//!
+//! [`Config::validate`]: crate::executor::Config::validate
 
 use std::fmt;
 use std::time::Duration;
@@ -38,14 +41,15 @@ impl fmt::Debug for Secret {
 }
 
 /// 128 random bits, drawn for every `POST` of a run and never reused: not per process, not per
-/// attempt. A zombie of an earlier run holds the url of its own key, so a later run, which
-/// has another nonce, never meets the create-only refusal of a key it did not write.
+/// attempt. It labels the run, so that a run whose `202` was lost can be found again in the
+/// lease server's list. (The pack key is not drawn here: the frontend's ingest issues it,
+/// see [`PackKey`].)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Nonce(u128);
 
 impl Nonce {
     /// A nonce from the operating system's random source, which cannot fail in a way a
-    /// caller could repair: a failure stops the process rather than reuse a key.
+    /// caller could repair: a failure stops the process rather than reuse a label.
     #[must_use]
     pub fn random() -> Self {
         let mut bytes = [0_u8; 16];
@@ -62,20 +66,44 @@ impl fmt::Display for Nonce {
     }
 }
 
-/// The one object key a task may write: `cas/b/<build>/<nonce>-<index>`.
+/// The build id of a farm lease, in a pack key and in the task's `--lease`: `<term>-<seq>`.
+/// The farm's own spelling, `<term>.<seq>`, holds a dot, which a build id may not
+/// (`kbf_pack::check_build` allows `0-9`, `a-z`, `A-Z`, `-` and `_`): a pack that names it is
+/// refused by the ingest, and a key built from it is refused by the mint.
+#[must_use]
+pub fn build_id(lease: LeaseId) -> String {
+    format!("{}-{}", lease.term, lease.seq)
+}
+
+/// The one object key a task may write: `cas/b/<build>/<nonce>-<slot>`, issued by the
+/// frontend's ingest ([`Ingest::mint`](crate::executor::Ingest::mint)) for one farm lease of
+/// one action and verified by the same ingest when the pack is read. The executor does not
+/// look inside it.
+///
+/// A farm lease is run at most once: a worker that cannot tell whether a run was queued is
+/// taken down and the farm rules the action again as a new farm lease, so the key of a lease
+/// is never handed to a second run, and a zombie of an earlier run, which holds the url of
+/// its own key, never meets the create-only refusal of a key it did not write.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PackKey {
-    /// The build the key belongs to: the executor's frontend id.
-    pub build: String,
-    /// Random, per `POST`.
-    pub nonce: Nonce,
-    /// Which pack of the task; one pack per task, so 0.
-    pub index: u32,
+pub struct PackKey(String);
+
+impl PackKey {
+    /// The object key `key`.
+    #[must_use]
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(key.into())
+    }
+
+    /// The object key.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Display for PackKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "cas/b/{}/{}-{}", self.build, self.nonce, self.index)
+        f.write_str(&self.0)
     }
 }
 
@@ -106,6 +134,8 @@ pub struct TaskArgs<'a> {
     pub deadline: Duration,
     /// The farm's root certificate in the container, when the reads are `https`.
     pub root_der: Option<&'a str>,
+    /// Where the tool works, if not where it would: the action image's writable directory.
+    pub work_dir: Option<&'a str>,
     /// Whether the `PUT` goes over plain http (until the store serves TLS).
     pub allow_plain_http_put: bool,
 }
@@ -120,7 +150,7 @@ impl TaskArgs<'_> {
             "--action".to_owned(),
             format!("{}/{}", self.action.hash, self.action.size_bytes),
             "--lease".to_owned(),
-            self.lease.to_string(),
+            build_id(self.lease),
             "--grant-url".to_owned(),
             self.grant_url.to_owned(),
             "--deadline-ms".to_owned(),
@@ -133,6 +163,9 @@ impl TaskArgs<'_> {
         ];
         if let Some(root) = self.root_der {
             argv.extend(["--root-der".to_owned(), root.to_owned()]);
+        }
+        if let Some(dir) = self.work_dir {
+            argv.extend(["--work-dir".to_owned(), dir.to_owned()]);
         }
         if self.allow_plain_http_put {
             argv.push("--allow-plain-http-put".to_owned());

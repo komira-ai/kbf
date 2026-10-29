@@ -1,6 +1,8 @@
 //! How each ending of a run reaches the farm: which are the farm's fault and run again, which
 //! are the caller's, and what the caller is answered.
 
+use std::time::Duration;
+
 use kbf_front::Finished;
 use kbf_lease_client::Outcome;
 use kbf_server::executor::{Ingested, RejectReason};
@@ -62,6 +64,45 @@ async fn a_timeout_is_answered_to_the_caller_and_not_rerun() {
         other => panic!("not a timeout: {other:?}"),
     }
     assert_eq!(rig.runs_of(1).await.len(), 1);
+}
+
+/// Catches a timeout at a wall time the lease cut short being called the caller's: the lease
+/// server grants at most its maximum ttl, and a run is cut to what the lease has left when it
+/// is posted, so an action whose wall time is longer than that is ended by the lease, not by its
+/// own timeout. That is the farm's fault: the action is rerun, and the caller is not told it
+/// timed out. (The run is cut to 3600 s of the 3800 s asked; a run not cut is the caller's
+/// timeout, above.)
+#[tokio::test(start_paused = true)]
+async fn a_timeout_at_a_wall_the_lease_cut_short_is_rerun() {
+    let timeout = Duration::from_secs(3_500);
+    let mut rig = Rig::start(&["node1"], 1, |cfg| {
+        cfg.max_run = timeout;
+        cfg.default_timeout = timeout;
+        cfg.lease_ttl = Duration::from_secs(4 * 3600);
+        cfg.max_wall = Duration::from_secs(12 * 3600);
+        cfg.drain_before_end = Duration::from_secs(3 * 3600);
+    })
+    .await;
+    rig.pump().await;
+    rig.inputs
+        .facts
+        .lock()
+        .expect("facts")
+        .as_mut()
+        .expect("ok")
+        .timeout = Some(timeout);
+    let caller = rig.submit(1);
+    rig.pump().await;
+    let first = rig.runs_of(1).await.remove(0);
+    let cut = rig.fake.run_wall_ms(&first.run).expect("a wall");
+    assert!(cut < 3_800_000, "the lease did not cut the run: {cut} ms");
+    rig.host_finishes(&first.run, Outcome::TimedOut, None);
+    rig.pump().await;
+    assert!(
+        caller.finished().is_none(),
+        "answered as the caller's timeout"
+    );
+    assert_eq!(rig.runs_of(1).await.len(), 2, "not run again");
 }
 
 /// Catches an ending that says the infrastructure failed (the task tool exited nonzero, the

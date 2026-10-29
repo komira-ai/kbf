@@ -48,10 +48,14 @@ pub(super) enum Settled {
 /// The verdict on `run`. `truncated` says the lease cut the run's wall time short of what
 /// was asked, so a timeout was the lease's.
 pub(super) fn judge(run: &Run, truncated: bool) -> Verdict {
+    // The host's detail is for the log: it is a driver's text, and a driver's error can quote
+    // the arguments, which hold the pack url and the read token. The caller is told the fixed
+    // phrase and the exit code.
     let infra = |what: &str| {
         let detail = run.detail.as_deref().unwrap_or("-");
+        tracing::warn!(run = %run.run_id, detail, exit_code = ?run.exit_code, "{what}");
         Verdict::Settled(Settled::Infra(format!(
-            "{what} (exit code {:?}, {detail})",
+            "{what} (exit code {:?})",
             run.exit_code
         )))
     };

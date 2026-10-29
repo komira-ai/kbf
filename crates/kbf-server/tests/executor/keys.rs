@@ -31,10 +31,13 @@ async fn a_zombie_write_cannot_land_on_the_key_of_its_rerun() {
     let keys = rig.presign.keys();
     assert_eq!(keys.len(), 2);
     assert_ne!(keys[0], keys[1]);
-    assert!(
-        keys.iter()
-            .all(|k| k.starts_with("cas/b/front-1/") && k.ends_with("-0"))
-    );
+    for (key, posted) in keys.iter().zip([&first, &second]) {
+        let lease = posted.arg("--lease").expect("a lease");
+        assert!(
+            key.starts_with(&format!("cas/b/{lease}/")) && key.ends_with("-0"),
+            "{key} for lease {lease}"
+        );
+    }
     // The zombie writes first, and the rerun still creates its own key.
     assert_eq!(rig.presign.put(&zombie_url), Ok(()));
     assert_eq!(rig.presign.put(&url), Ok(()));
@@ -121,7 +124,7 @@ async fn the_hard_caps_of_the_booked_runs_fill_the_shape_exactly() {
 #[tokio::test(start_paused = true)]
 async fn the_lease_is_renewed_before_a_run_that_would_outlive_it() {
     let mut rig = Rig::start(&["node1"], 1, |cfg| {
-        cfg.lease_ttl = cfg.max_run + cfg.run_margin;
+        cfg.lease_ttl = cfg.max_run + cfg.run_margin + cfg.heartbeat * 2;
         cfg.drain_before_end = cfg.lease_ttl + Duration::from_secs(60);
     })
     .await;
@@ -133,7 +136,8 @@ async fn the_lease_is_renewed_before_a_run_that_would_outlive_it() {
         .as_mut()
         .expect("ok")
         .timeout = Some(rig.cfg.max_run);
-    rig.advance(Duration::from_secs(5)).await;
+    // More than the two heartbeats the ttl has over the longest run.
+    rig.elapse(15).await;
     let _caller = rig.submit(1);
     rig.pump().await;
     let run = rig.runs_of(1).await.remove(0);

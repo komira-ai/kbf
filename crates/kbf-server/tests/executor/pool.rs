@@ -12,7 +12,7 @@ use crate::rig::{Rig, count, count_tail};
 fn short_leases(cfg: &mut Config) {
     cfg.max_run = Duration::from_secs(30);
     cfg.default_timeout = Duration::from_secs(30);
-    cfg.run_margin = Duration::from_secs(30);
+    cfg.run_margin = Duration::from_secs(20);
     cfg.lease_ttl = Duration::from_secs(60);
     cfg.drain_before_end = Duration::from_secs(120);
     cfg.max_wall = Duration::from_secs(300);
@@ -302,6 +302,10 @@ async fn a_stray_lease_is_found_by_the_periodic_check() {
     rig.pump().await;
     assert_eq!(state_of(&rig, stray).await, Some(LeaseState::Held));
     rig.advance(Duration::from_secs(25)).await;
+    // The list that looks for strays fails once: it is made again at the next pass.
+    rig.fake.inject_on("GET /v1/leases", Fault::Close);
+    rig.exec.step().await;
+    assert_eq!(state_of(&rig, stray).await, Some(LeaseState::Held));
     rig.pump().await;
     assert_ne!(state_of(&rig, stray).await, Some(LeaseState::Held));
     assert_eq!(state_of(&rig, held).await, Some(LeaseState::Held));
@@ -541,4 +545,24 @@ async fn a_lease_being_released_is_not_adopted() {
     assert_eq!(rig.exec.hosts().len(), 1);
     assert_ne!(rig.exec.hosts()[0].lease, first);
     assert_eq!(rig.exec.hosts()[0].host, "node2");
+}
+
+/// Catches a shutdown that leaves the farm placing actions on a worker that is gone: the farm
+/// only learns it from its silence a grace later, and requeues what it placed there. The farm
+/// is told the worker takes no more work, so an action submitted afterwards is not placed on
+/// it.
+#[tokio::test(start_paused = true)]
+async fn shutdown_tells_the_farm_the_worker_takes_no_more_work() {
+    let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
+    rig.pump().await;
+    let placed = |rig: &Rig| {
+        let look = rig.farm.update_look();
+        let node = look.iter().find(|n| n.id.to_string() == "js:node1");
+        node.map_or(0, |n| n.leases)
+    };
+    rig.exec.shutdown().await;
+    let _caller = rig.submit(1);
+    rig.farm.tick().await;
+    crate::rig::settle().await;
+    assert_eq!(placed(&rig), 0, "an action was placed on a gone worker");
 }

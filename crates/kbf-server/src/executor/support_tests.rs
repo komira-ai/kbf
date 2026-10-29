@@ -16,10 +16,10 @@ use tokio::time::Instant;
 use crate::Farm;
 use crate::executor::host::HostWorker;
 use crate::executor::traits::{
-    ActionFacts, Ingest, Ingested, Inputs, InputsError, Presign, PresignError, ReadGrant,
-    UntrustedLimits,
+    ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, Presign, PresignError,
+    ReadGrant, UntrustedLimits,
 };
-use crate::executor::{Clock, Config, Ctx, Deps, PackKey, Secret, Strays};
+use crate::executor::{Clock, Config, Ctx, Deps, PackKey, Secret, Strays, build_id};
 
 pub(super) const GIB: u64 = 1 << 30;
 
@@ -28,6 +28,10 @@ struct Easy;
 
 #[tonic::async_trait]
 impl Ingest for Easy {
+    fn mint(&self, lease: LeaseId, _: &Digest) -> Result<PackKey, MintError> {
+        Ok(PackKey::new(format!("cas/b/{}/aa-0", build_id(lease))))
+    }
+
     async fn ingest(&self, _: LeaseId, _: &PackKey, _: &Digest, _: &UntrustedLimits) -> Ingested {
         Ingested::Unavailable("not read here".to_owned())
     }
@@ -52,6 +56,7 @@ impl Inputs for Easy {
         Ok(ActionFacts {
             image: format!("registry.test/app@sha256:{}", "ab".repeat(32)),
             timeout: Some(Duration::from_secs(20)),
+            has_entrypoint: false,
         })
     }
 

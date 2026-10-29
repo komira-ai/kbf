@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::FutureExt as _;
@@ -24,8 +25,8 @@ use crate::executor::task::{Nonce, PackKey, TaskArgs};
 use crate::executor::traits::{Ingested, InputsError, PresignError, UntrustedLimits};
 use crate::executor::{Ctx, note};
 
-/// The label that names a run by the key it was posted with, so a run whose `202` was lost
-/// can be found again.
+/// The label that names a run by the nonce drawn for its `POST`, so a run whose `202` was
+/// lost can be found again.
 pub(super) const RUN_LABEL: &str = "kbf-run";
 
 /// One farm lease the worker was told to run.
@@ -45,13 +46,24 @@ pub(super) enum Stage {
     Reporting(Box<Reporting>),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct Waiting {
     /// Until when the `Start` may be acted on; `None` for one that names a heartbeat the
     /// worker did not send.
     deadline: Option<Instant>,
     millicpus: u64,
     memory_bytes: u64,
+    /// What the run is made of, kept while the lease server cannot take it yet: a read of the
+    /// CAS, a url and a grant are not made again on each pass of the up to 14 s it may wait.
+    prepared: Option<Arc<Prepared>>,
+}
+
+/// A run ready to post.
+pub(super) struct Prepared {
+    spec: RunSpec,
+    key: PackKey,
+    nonce: Nonce,
+    wall: Duration,
 }
 
 pub(super) struct Running {
@@ -81,8 +93,8 @@ impl Task {
 
 /// What came of trying to start a task.
 enum Queued {
-    /// Not now: try again while the `Start` is valid.
-    Wait,
+    /// Not now: try again while the `Start` is valid, with the run as it was prepared.
+    Wait(Arc<Prepared>),
     Posted(Running),
     Settled(Settled),
     Retire(Retire),
@@ -141,6 +153,7 @@ impl HostWorker {
             deadline: self.sent_at(start.heartbeat_seq).map(|sent| sent + window),
             millicpus: start.millicpus,
             memory_bytes: start.memory_bytes,
+            prepared: None,
         };
         let action = start.action_digest.clone().unwrap_or_default();
         // A `Start` sent again, for a lease that is already known, changes nothing: it must
@@ -187,7 +200,7 @@ impl HostWorker {
             .tasks
             .iter()
             .filter_map(|(lease, task)| match &task.stage {
-                Stage::Waiting(w) => Some((*lease, task.action.clone(), *w)),
+                Stage::Waiting(w) => Some((*lease, task.action.clone(), w.clone())),
                 _ => None,
             })
             .collect();
@@ -205,7 +218,13 @@ impl HostWorker {
                 continue;
             };
             match self.queue(ctx, lease, &action, &w, deadline).await {
-                Queued::Wait => {}
+                Queued::Wait(prepared) => {
+                    let w = Waiting {
+                        prepared: Some(prepared),
+                        ..w
+                    };
+                    self.set_stage(lease, Stage::Waiting(w));
+                }
                 Queued::Posted(running) => self.set_stage(lease, Stage::Running(running)),
                 Queued::Settled(settled) => self.settle_with(lease, &settled, now),
                 Queued::Retire(why) => return ControlFlow::Break(why),
@@ -242,12 +261,19 @@ impl HostWorker {
         // What preparing reads (the CAS, the store, the grant service) is not the lease
         // server's and is not bounded by it: it is bounded by the window, which it cannot
         // outlast and have the post still be good.
-        let prepared = tokio::time::timeout_at(deadline, self.prepare(ctx, lease, action, w));
-        let (spec, key, wall) = match prepared.await {
-            Ok(Ok(prepared)) => prepared,
-            Ok(Err(settled)) => return Queued::Settled(settled),
-            Err(_) => return Queued::Late,
+        let prepared = match &w.prepared {
+            Some(prepared) => Arc::clone(prepared),
+            None => {
+                let preparing =
+                    tokio::time::timeout_at(deadline, self.prepare(ctx, lease, action, w));
+                match preparing.await {
+                    Ok(Ok(prepared)) => Arc::new(prepared),
+                    Ok(Err(settled)) => return Queued::Settled(settled),
+                    Err(_) => return Queued::Late,
+                }
+            }
         };
+        let wall = prepared.wall;
         // The lease server cuts the run's wall time to what the lease has left when it is
         // posted, and a renewal later does not stretch it: renew first when the lease would
         // end before the run does.
@@ -264,19 +290,19 @@ impl HostWorker {
             return Queued::Late;
         }
         let truncated = wall > self.left(now);
-        let posted = ctx.api().queue_run(self.lease, &spec).await;
+        let posted = ctx.api().queue_run(self.lease, &prepared.spec).await;
         self.heard(now, &posted);
-        let label = key.nonce.to_string();
+        let label = prepared.nonce.to_string();
         let running = |run: RunId| Running {
             run,
-            key: key.clone(),
+            key: prepared.key.clone(),
             truncated,
             cancelled: false,
         };
         match posted {
             Ok(accepted) => Queued::Posted(running(accepted.run_id)),
             Err(e) if e.may_have_applied() => self.recover(ctx, &label, running).await,
-            Err(e) => self.refused(ctx, &e),
+            Err(e) => self.refused(ctx, &e, prepared),
         }
     }
 
@@ -294,34 +320,49 @@ impl HostWorker {
         lease: kbf_types::LeaseId,
         action: &Digest,
         w: &Waiting,
-    ) -> Result<(RunSpec, PackKey, Duration), Settled> {
+    ) -> Result<Prepared, Settled> {
         let facts = ctx.deps.inputs.action(action).await?;
         let timeout = facts.timeout.unwrap_or(ctx.cfg.default_timeout);
         require(timeout <= ctx.cfg.max_run, || {
             format!("the action's timeout {timeout:?} is over the executor's limit")
         })?;
+        // The lease server appends the arguments to the image's entrypoint: with one, the
+        // secrets would go to that program and the task tool would not run.
+        require(!facts.has_entrypoint, || {
+            "the action's image sets an entrypoint, which the task tool cannot be run under"
+                .to_owned()
+        })?;
         let image = pinned(&facts.image)?;
         let wall = ctx.cfg.wall(timeout);
-        let key = PackKey {
-            build: ctx.cfg.frontend.clone(),
-            nonce: Nonce::random(),
-            index: 0,
-        };
+        let nonce = Nonce::random();
+        let key = ctx
+            .deps
+            .ingest
+            .mint(lease, action)
+            .map_err(|e| Settled::Infra(format!("no key for the pack: {e}")))?;
         let pack = ctx
             .deps
             .presign
             .put_url(&self.host, &key, wall, ctx.cfg.max_pack_bytes)
             .await?;
         let grant = ctx.deps.inputs.read_grant(lease, action, wall).await?;
+        // The bearer token goes into the arguments: not over a scheme that sends it in clear.
+        if !grant.url.starts_with("https://") {
+            return Err(Settled::Infra(
+                "the read grant is not served over https".to_owned(),
+            ));
+        }
+        let (tool, root) = (ctx.cfg.tool_path(), ctx.cfg.root_mount());
         let args = TaskArgs {
-            tool: &ctx.cfg.tool,
+            tool: &tool,
             action,
             lease,
             grant_url: &grant.url,
             grant_token: &grant.token,
             pack_url: &pack,
             deadline: timeout,
-            root_der: ctx.cfg.root_der.as_deref(),
+            root_der: root.as_ref().map(|(_, path)| path.as_str()),
+            work_dir: ctx.cfg.work_dir.as_deref(),
             allow_plain_http_put: ctx.cfg.allow_plain_http_put,
         };
         let limits = RunLimits {
@@ -332,9 +373,17 @@ impl HostWorker {
         };
         let mut spec = RunSpec::new(image, limits);
         spec.args = args.argv(ctx.cfg.delivery);
-        spec.mounts = vec![ctx.cfg.tool_mount.clone()];
-        spec.labels = BTreeMap::from([(RUN_LABEL.to_owned(), key.nonce.to_string())]);
-        Ok((spec, key, wall))
+        spec.mounts = std::iter::once(ctx.cfg.tool_mount.clone())
+            .chain(root.map(|(mount, _)| mount))
+            .collect();
+        // The labels are listed back with every run and are not secret-safe: the nonce only.
+        spec.labels = BTreeMap::from([(RUN_LABEL.to_owned(), nonce.to_string())]);
+        Ok(Prepared {
+            spec,
+            key,
+            nonce,
+            wall,
+        })
     }
 
     /// The post's answer was lost: the run may be queued. Found by its label, it is the
@@ -356,9 +405,9 @@ impl HostWorker {
     }
 
     /// The lease server refused the run: nothing was queued.
-    fn refused(&mut self, ctx: &Ctx<'_>, e: &Error) -> Queued {
+    fn refused(&mut self, ctx: &Ctx<'_>, e: &Error, prepared: Arc<Prepared>) -> Queued {
         match e.api().map(|api| &api.code) {
-            None | Some(ErrorCode::NoCapacity | ErrorCode::NotReady) => Queued::Wait,
+            None | Some(ErrorCode::NoCapacity | ErrorCode::NotReady) => Queued::Wait(prepared),
             Some(ErrorCode::HostTainted) => {
                 self.begin_drain(ctx, Drain::Tainted);
                 Queued::Settled(Settled::Infra("the host is tainted".to_owned()))

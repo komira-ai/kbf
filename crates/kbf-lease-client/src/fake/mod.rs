@@ -33,7 +33,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::{Config, Origin, Token};
 use crate::ids::{LeaseId, RunId};
-use crate::wire::{Outcome, RunState};
+use crate::wire::{Mount, Outcome, RunState};
 use crate::{Client, ConfigError};
 
 pub use state::Pool;
@@ -231,6 +231,12 @@ impl FakeLeaseServer {
     #[must_use]
     pub fn run_args(&self, run: &RunId) -> Option<Vec<String>> {
         locked(&self.shared.state).run_args(run)
+    }
+
+    /// The mounts the run was queued with, as the server received them.
+    #[must_use]
+    pub fn run_mounts(&self, run: &RunId) -> Option<Vec<Mount>> {
+        locked(&self.shared.state).run_mounts(run)
     }
 
     /// The run's state, whoever is asking (a run of a forgotten boot is `None`).

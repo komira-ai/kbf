@@ -13,7 +13,7 @@ use crate::rig::{Rig, count, count_tail};
 fn short_leases(cfg: &mut kbf_server::executor::Config) {
     cfg.max_run = Duration::from_secs(30);
     cfg.default_timeout = Duration::from_secs(30);
-    cfg.run_margin = Duration::from_secs(30);
+    cfg.run_margin = Duration::from_secs(20);
     cfg.lease_ttl = Duration::from_secs(60);
     cfg.drain_before_end = Duration::from_secs(120);
     cfg.max_wall = Duration::from_secs(300);
@@ -323,7 +323,7 @@ async fn a_post_to_a_lease_that_is_gone_loses_the_start_and_replaces_the_lease()
             if renewing_first {
                 // A ttl that only just covers the longest run: the lease is renewed
                 // before a run is posted, and that renewal finds the lease gone.
-                cfg.lease_ttl = cfg.max_run + cfg.run_margin;
+                cfg.lease_ttl = cfg.max_run + cfg.run_margin + cfg.heartbeat * 2;
                 cfg.drain_before_end = cfg.lease_ttl + Duration::from_secs(60);
             }
         })

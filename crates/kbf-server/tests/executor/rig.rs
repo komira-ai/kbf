@@ -12,8 +12,8 @@ use kbf_proto::reapi::{ActionResult, Digest};
 use kbf_sched::Request;
 use kbf_server::Farm;
 use kbf_server::executor::{
-    ActionFacts, Clock, Config, Deps, Executor, Ingest, Ingested, Inputs, InputsError, PackKey,
-    Presign, PresignError, ReadGrant, Secret, UntrustedLimits,
+    ActionFacts, Clock, Config, Deps, Executor, Ingest, Ingested, Inputs, InputsError, MintError,
+    Nonce, PackKey, Presign, PresignError, ReadGrant, Secret, UntrustedLimits, build_id,
 };
 use kbf_types::{ActionKey, LeaseKind, Qos, Resources};
 use tokio::sync::watch;
@@ -41,6 +41,7 @@ impl FakeInputs {
             facts: Mutex::new(Ok(ActionFacts {
                 image: IMAGE.to_owned(),
                 timeout: Some(Duration::from_secs(60)),
+                has_entrypoint: false,
             })),
             grant: Mutex::new(Ok(ReadGrant {
                 url: "https://grant.test:9400".to_owned(),
@@ -146,6 +147,8 @@ pub struct FakeIngest {
     /// How many of the next reads panic, as a bug of the real ingest would.
     pub panics: std::sync::atomic::AtomicUsize,
     pub script: Mutex<VecDeque<Ingested>>,
+    /// The reason the next mint fails for, if any.
+    pub mint_fails: Mutex<Option<String>>,
     pub calls: Mutex<Vec<(kbf_types::LeaseId, String, UntrustedLimits)>>,
 }
 
@@ -156,6 +159,7 @@ impl FakeIngest {
             release: tokio::sync::Notify::new(),
             panics: std::sync::atomic::AtomicUsize::new(0),
             script: Mutex::new(VecDeque::new()),
+            mint_fails: Mutex::new(None),
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -173,6 +177,17 @@ impl FakeIngest {
 
 #[tonic::async_trait]
 impl Ingest for FakeIngest {
+    fn mint(&self, lease: kbf_types::LeaseId, _action: &Digest) -> Result<PackKey, MintError> {
+        match locked(&self.mint_fails).take() {
+            Some(why) => Err(MintError(why)),
+            None => Ok(PackKey::new(format!(
+                "cas/b/{}/{}-0",
+                build_id(lease),
+                Nonce::random()
+            ))),
+        }
+    }
+
     async fn ingest(
         &self,
         lease: kbf_types::LeaseId,
@@ -284,13 +299,26 @@ impl Rig {
         prepare: bool,
         adjust: impl FnOnce(&mut Config),
     ) -> Self {
+        Self::pooled(hosts, held, gib, |pool| pool.prepare = prepare, adjust).await
+    }
+
+    /// As [`Rig::built`], over a pool `shape` changes.
+    pub async fn pooled(
+        hosts: &[&str],
+        held: usize,
+        gib: u64,
+        shape: impl FnOnce(&mut Pool),
+        adjust: impl FnOnce(&mut Config),
+    ) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_test_writer()
             .with_max_level(tracing::Level::INFO)
             .try_init();
         let hold = ClockHold::new();
         let mut pool = Pool::new("farm-linux", hosts, 2_000, gib * GIB);
-        pool.prepare = prepare;
+        pool.capabilities
+            .insert("arch".to_owned(), "x86_64".to_owned());
+        shape(&mut pool);
         let fake = FakeLeaseServer::start(pool).await;
         let api = fake.client().expect("a client");
         let mut cfg = Config::new("front-1", held, "farm-linux", 2_000, gib * GIB);

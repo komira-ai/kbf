@@ -63,6 +63,7 @@ fn what_could_not_be_read_is_classed_by_whose_fault_it_is() {
 
 mod worker {
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     use kbf_lease_client::{RunLimits, RunSpec};
     use kbf_types::LeaseId;
@@ -70,7 +71,7 @@ mod worker {
 
     use super::super::{Queued, Running, Stage, Task, reporting};
     use crate::executor::outcome::{Settled, result_of};
-    use crate::executor::task::{Nonce, PackKey};
+    use crate::executor::task::PackKey;
     use crate::executor::test_support::{GIB, Harness, start};
 
     fn pinned_spec(label: &str) -> RunSpec {
@@ -108,11 +109,7 @@ mod worker {
             .queue_run(worker.lease, &pinned_spec("mine"))
             .await
             .expect("posted");
-        let key = PackKey {
-            build: "front".to_owned(),
-            nonce: Nonce::random(),
-            index: 0,
-        };
+        let key = PackKey::new("cas/b/1-1/aa-0");
         let running = |run| Running {
             run,
             key: key.clone(),
@@ -130,6 +127,42 @@ mod worker {
             missing,
             Queued::Retire(crate::executor::host::Retire::Ambiguous)
         ));
+    }
+
+    /// Catches a result being forgotten that the farm did not acknowledge: `report` answers
+    /// `None` for a result its record is not written for (and for one it dropped over its
+    /// cap), and the send that panicked answers nothing at all. Neither is an acknowledgement:
+    /// the result is sent again, and only a real acknowledgement ends the sending.
+    #[tokio::test(start_paused = true)]
+    async fn a_report_the_farm_did_not_acknowledge_is_sent_again() {
+        use kbf_proto::worker::ResultAck;
+        let harness = Harness::new().await;
+        let worker = kbf_types::WorkerId::new("js:node1");
+        let held = tokio::spawn(async { None::<ResultAck> });
+        let broken = tokio::spawn(async { panic!("the report broke") });
+        let acked = tokio::spawn(async { Some(ResultAck::default()) });
+        for (what, in_flight, done) in [
+            ("held", held, false),
+            ("broken", broken, false),
+            ("acknowledged", acked, true),
+        ] {
+            let mut report = super::super::Reporting {
+                result: kbf_proto::worker::Result::default(),
+                in_flight: Some(in_flight),
+                retry_at: Instant::now(),
+            };
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            let said = report.drive(
+                &harness.farm,
+                &worker,
+                Instant::now(),
+                Duration::from_secs(5),
+            );
+            assert_eq!(said, done, "{what}");
+            assert_eq!(report.in_flight.is_some(), !done, "{what}: sent again");
+        }
     }
 
     /// Catches a lease that is gone being reported lost in part: each task the worker holds is

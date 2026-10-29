@@ -14,4 +14,5 @@ mod keys;
 mod pool;
 mod recovery;
 mod rig;
+mod spec;
 mod starts;

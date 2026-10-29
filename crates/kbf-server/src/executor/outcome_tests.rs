@@ -63,15 +63,15 @@ fn every_ending_has_its_class() {
     );
 }
 
-/// Catches the infra reason leaving out what the lease server said (the exit code and the
-/// detail), which is all an operator has to go on.
+/// Catches the infra reason leaving out the exit code the lease server reported, which is what
+/// an operator has to go on in the answer (the detail is in the log).
 #[test]
-fn an_infra_reason_carries_the_exit_code_and_detail() {
+fn an_infra_reason_carries_the_exit_code() {
     let why = infra(judge(
         &run(RunState::Exited, Some(Outcome::Failed), Some(13)),
         false,
     ));
-    assert!(why.contains("Some(13)") && why.contains("why"), "{why}");
+    assert!(why.contains("Some(13)"), "{why}");
 }
 
 fn code_of(result: &kbf_proto::worker::Result) -> i32 {
@@ -139,4 +139,22 @@ fn a_result_that_ran_is_ok_and_names_its_action() {
     assert!(result.status.is_none());
     assert_eq!(result.action_result.map(|r| r.exit_code), Some(2));
     assert_eq!(result.action_digest.as_ref(), Some(&action));
+}
+
+/// Catches a host's detail text reaching the caller: it is a driver's, and a driver's error can
+/// quote the arguments, which hold the pack url and the read token. The caller gets the fixed
+/// phrase and the exit code; the detail goes to the log.
+#[test]
+fn a_hosts_detail_never_reaches_the_caller() {
+    let mut leaky = run(RunState::Exited, Some(Outcome::Failed), Some(12));
+    leaky.detail = Some("exec failed: --pack-url https://store/key?sig=SECRET".to_owned());
+    let said = infra(judge(&leaky, false));
+    assert!(
+        !said.contains("SECRET") && !said.contains("exec failed"),
+        "{said}"
+    );
+    assert!(
+        said.contains("task tool failed") && said.contains("12"),
+        "{said}"
+    );
 }

@@ -38,7 +38,12 @@ async fn an_action_runs_end_to_end() {
     assert_eq!(run.arg("--grant-url"), Some("https://grant.test:9400"));
     assert!(run.args.contains(&"--insecure-argv-secrets".to_owned()));
     let url = run.arg("--pack-url").expect("a pack url");
-    assert!(url.starts_with("http://store.test/cas/b/front-1/"), "{url}");
+    let lease = run.arg("--lease").expect("a lease");
+    assert!(
+        url.starts_with(&format!("http://store.test/cas/b/{lease}/")),
+        "{url}"
+    );
+    assert!(!lease.contains('.'), "{lease}");
     let minted = rig.presign.minted.lock().expect("minted").clone();
     assert_eq!(minted.len(), 1);
     assert_eq!(minted[0].host, "node1");
@@ -91,6 +96,12 @@ async fn a_start_waits_for_room_inside_its_window() {
     rig.pump().await;
     let third = rig.runs_of(3).await;
     assert_eq!(third.len(), 1, "posted once room was made");
+    // Read once, however many passes it waited: the CAS is not read, and no url or grant is
+    // made, on each pass of the window.
+    let reads = rig.inputs.looked_up.lock().expect("looked up").clone();
+    assert_eq!(reads.iter().filter(|h| **h == hex(3)).count(), 1, "{reads:?}");
+    let waited = rig.presign.keys().len();
+    assert_eq!(waited, 3, "a url was minted again while the Start waited");
     rig.host_finishes(&third[0].run, Outcome::Succeeded, Some(0));
     assert!(matches!(rig.until_done(&c, 4).await, Finished::Ran(_)));
 }

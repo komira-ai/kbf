@@ -45,10 +45,10 @@ use crate::Farm;
 use pool::Slot;
 
 pub use config::{Config, ConfigError};
-pub use task::{Delivery, Nonce, PackKey, Secret, TaskArgs};
+pub use task::{Delivery, Nonce, PackKey, Secret, TaskArgs, build_id};
 pub use traits::{
-    ActionFacts, Ingest, Ingested, Inputs, InputsError, Presign, PresignError, ReadGrant,
-    RejectReason, UntrustedLimits,
+    ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, Presign, PresignError,
+    ReadGrant, RejectReason, UntrustedLimits,
 };
 
 /// Which executor a server runs placed actions on.
@@ -64,6 +64,12 @@ pub enum ExecutorKind {
 /// The server's wall clock at the moment the executor starts, and the monotonic clock from
 /// there. All of the executor's timing is the monotonic clock; the wall clock only translates
 /// the lease server's times.
+///
+/// The translation assumes the frontend's wall clock and the lease server's agree. If the lease
+/// server's is ahead by `S`, the time a lease has left reads `S` too long, a run the lease
+/// cuts short is not seen as cut, and its timeout is answered to the caller as the action's
+/// own instead of being rerun. Hosts of one cluster keep their clocks within a few seconds,
+/// which is what the margin of a run's wall time is for.
 #[derive(Clone, Copy, Debug)]
 pub struct Clock {
     at_start: Instant,

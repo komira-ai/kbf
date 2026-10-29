@@ -321,3 +321,23 @@ fn the_hello_reports_a_container_host_and_nothing_else() {
     assert_eq!(reported.capacity.cpu_millis, 16_000);
     assert_eq!(reported.capacity.memory_bytes, 40 * GIB);
 }
+
+/// Catches a lease ttl that only just covers the longest run: the lease server cuts a run's
+/// wall time again from the time left when the run reaches the host, which can be a heartbeat
+/// late, so a run delivered late under a ttl equal to the longest run is cut and read as
+/// finished by its own timeout. The ttl exceeds the longest run by two heartbeats.
+#[test]
+fn the_ttl_exceeds_the_longest_run_by_two_heartbeats() {
+    let base = base();
+    let longest = base.max_run + base.run_margin;
+    let with = |lease_ttl| Config {
+        lease_ttl,
+        ..base.clone()
+    };
+    let room = longest + base.heartbeat * 2;
+    assert_eq!(with(room).validate(), Ok(()));
+    assert_eq!(
+        with(room - Duration::from_millis(1)).validate(),
+        Err(ConfigError::Ttl)
+    );
+}

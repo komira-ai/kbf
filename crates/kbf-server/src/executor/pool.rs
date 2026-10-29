@@ -9,7 +9,7 @@
 use kbf_lease_client::{AcquireRequest, Acquired, Lease, LeaseId, LeaseState, Resources};
 use tokio::time::Instant;
 
-use crate::executor::host::{HostWorker, Retire};
+use crate::executor::host::{Drain, HostWorker, Retire};
 use crate::executor::{Ctx, HostInfo, Listing, View, note, release_lease};
 
 /// The label every lease of this executor carries, valued with the frontend's id: how a
@@ -84,7 +84,12 @@ impl Slot {
     /// Releases the lease the slot holds or has booked.
     pub(super) async fn release(self, ctx: &Ctx<'_>) {
         match self {
-            Self::Active(worker) => worker.retire(ctx, Retire::Fenced).await,
+            Self::Active(mut worker) => {
+                // The farm is told the worker takes no more work, so it does not place
+                // actions on a receiver that is gone and requeue them a grace later.
+                worker.begin_drain(ctx, Drain::Rotation);
+                worker.retire(ctx, Retire::Fenced).await;
+            }
             Self::Pending { lease } => release_lease(ctx, lease).await,
             Self::Vacant { .. } => {}
         }
@@ -99,9 +104,12 @@ async fn acquire(ctx: &Ctx<'_>, now: Instant) -> Slot {
         gpus: 0,
         gpu_class: None,
     };
-    let request = AcquireRequest::new(&ctx.cfg.class, resources, ctx.cfg.max_wall)
+    let mut request = AcquireRequest::new(&ctx.cfg.class, resources, ctx.cfg.max_wall)
         .label(FRONTEND_LABEL, &ctx.cfg.frontend)
         .ttl(ctx.cfg.lease_ttl);
+    // Exactly what the node report claims, and what the task tool and its static binary
+    // need: a host of another system or architecture is not one this executor can use.
+    request.capabilities = ctx.cfg.host_capabilities();
     match ctx.api().acquire(&request).await {
         Ok(Acquired::Granted(granted)) => {
             let ends = (

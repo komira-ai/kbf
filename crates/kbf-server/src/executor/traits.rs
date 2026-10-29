@@ -3,6 +3,14 @@
 //! Each trait has a real implementation elsewhere (the frontend's ingest of an untrusted
 //! pack, the tier store's presigned `PUT`, the CAS read for an action and the read grant) and
 //! a fake in the tests. None of them is implemented here.
+//!
+//! The real [`Ingest`] is a thin adapter over the frontend's ingest of an untrusted pack and
+//! belongs to the change that wires the executor in, which builds it from what the server
+//! owns: the pack index, a CAS backend over the same index, and the key mint with its secret.
+//! It maps this module's types to the frontend's one for one: the build id of a farm lease
+//! ([`build_id`](crate::executor::build_id)) for the lease, a key the mint issued for
+//! [`PackKey`], [`UntrustedLimits`] filled out with the frontend's own bounds for the fields it
+//! does not have, and the frontend's reasons for [`RejectReason`].
 
 use std::fmt;
 use std::time::Duration;
@@ -72,10 +80,23 @@ pub enum Ingested {
     Unavailable(String),
 }
 
-/// Reads, verifies and commits the pack a task wrote. Called after a run ended with the
-/// task tool's exit 0, and never with a lock of the farm held.
+/// Why a pack key was not issued.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct MintError(pub String);
+
+/// Issues, reads, verifies and commits the pack a task wrote. Called after a run ended with
+/// the task tool's exit 0, and never with a lock of the farm held.
 #[tonic::async_trait]
 pub trait Ingest: Send + Sync {
+    /// The key `lease` may write the pack of `action` under. Issued by the same secret that
+    /// [`ingest`](Self::ingest) verifies it with: a key the ingest did not issue for this
+    /// lease and this action is refused there. Called once for a farm lease.
+    ///
+    /// # Errors
+    /// [`MintError`].
+    fn mint(&self, lease: LeaseId, action: &Digest) -> Result<PackKey, MintError>;
+
     /// What `key` holds, for `action`, run under `lease`. Never trusts the pack.
     async fn ingest(
         &self,
@@ -119,6 +140,10 @@ pub struct ActionFacts {
     pub image: String,
     /// The action's timeout; `None` when it names none, and the executor applies its own.
     pub timeout: Option<Duration>,
+    /// Whether the image sets an `ENTRYPOINT`. The lease server appends the task tool's
+    /// arguments to it, so the secrets would go to that program and the tool would not run:
+    /// such an action is refused.
+    pub has_entrypoint: bool,
 }
 
 /// What a task reads its inputs with.
@@ -134,7 +159,7 @@ pub struct ReadGrant {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputsError {
     /// The action cannot run here, whatever is tried again: no image, an image without a
-    /// digest, an image with an entrypoint. The caller's to fix.
+    /// digest. The caller's to fix.
     Invalid(String),
     /// The CAS or the grant service could not be reached.
     Unavailable(String),

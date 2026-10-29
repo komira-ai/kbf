@@ -4,7 +4,7 @@ use std::time::Duration;
 use kbf_proto::reapi::Digest;
 use kbf_types::LeaseId;
 
-use super::{Delivery, Nonce, PackKey, Secret, TaskArgs};
+use super::{Delivery, Nonce, PackKey, Secret, TaskArgs, build_id};
 
 fn args<'a>(
     action: &'a Digest,
@@ -22,6 +22,7 @@ fn args<'a>(
         pack_url: url,
         deadline: Duration::from_secs(90),
         root_der: root,
+        work_dir: None,
         allow_plain_http_put: plain,
     }
 }
@@ -45,16 +46,26 @@ fn nonces_are_random_and_never_repeat() {
     assert!(text.bytes().all(|b| b.is_ascii_hexdigit()));
 }
 
-/// Catches a pack key outside the `cas/b/<build>/<nonce>-<index>` space the frontend
-/// ingests from.
+/// Catches a build id the neighbours refuse: the farm prints a lease as `7.3`, and the pack
+/// key, the manifest and the ingest take a build of `0-9 a-z A-Z - _` only (a dot is refused,
+/// and every action would be rerun and answered INTERNAL). The id is `7-3`, and passes the
+/// pack crate's own check, for any lease.
 #[test]
-fn a_pack_key_is_under_cas_b() {
-    let key = PackKey {
-        build: "front-1".to_owned(),
-        nonce: Nonce::random(),
-        index: 0,
-    };
-    assert_eq!(key.to_string(), format!("cas/b/front-1/{}-0", key.nonce));
+fn a_lease_is_a_build_id_the_pack_crate_accepts() {
+    assert_eq!(build_id(LeaseId::new(7, 3)), "7-3");
+    assert!(LeaseId::new(7, 3).to_string().contains('.'));
+    for lease in [LeaseId::new(0, 0), LeaseId::new(u64::MAX, u64::MAX)] {
+        assert_eq!(kbf_pack::check_build(&build_id(lease)), Ok(()), "{lease}");
+    }
+}
+
+/// Catches a pack key that is not the string the mint issued: the executor passes it on to
+/// the store and the ingest as it is.
+#[test]
+fn a_pack_key_is_the_object_key_it_was_issued_as() {
+    let key = PackKey::new("cas/b/7-3/ab-0");
+    assert_eq!(key.to_string(), "cas/b/7-3/ab-0");
+    assert_eq!(key.as_str(), "cas/b/7-3/ab-0");
 }
 
 /// Catches a secret that formats as itself: it would reach a log line or an error.
@@ -83,7 +94,7 @@ fn the_argv_is_the_task_tools_command_line() {
             "--action",
             &format!("{}/12", "ab".repeat(32)),
             "--lease",
-            &LeaseId::new(7, 3).to_string(),
+            "7-3",
             "--grant-url",
             "https://grant.test:9400",
             "--deadline-ms",
@@ -111,6 +122,12 @@ fn the_argv_is_the_task_tools_command_line() {
             "--allow-plain-http-put"
         ]
     );
+    let worked = TaskArgs {
+        work_dir: Some("/work"),
+        ..args(&action, &grant, &url, None, false)
+    }
+    .argv(Delivery::InsecureArgv);
+    assert_eq!(&worked[plain.len()..], ["--work-dir", "/work"]);
 }
 
 /// Catches a Debug of the task arguments that shows the pack url or the read token.

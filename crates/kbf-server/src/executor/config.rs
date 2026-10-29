@@ -25,13 +25,18 @@ pub const PRESIGN_LIMIT: Duration = Duration::from_secs(4 * 3600);
 /// on either executor.
 const HARD_CAP_PAD: u64 = 512 << 20;
 
+/// Where the agent of the lease server puts `mount` in the container.
+fn container_path(mount: &Mount) -> String {
+    format!("/mnt/{}/{}", mount.root_name, mount.rel)
+}
+
 /// The executor's settings. Every duration is an upper or lower bound the executor holds
 /// itself to; [`Config::validate`] refuses a set that breaks the ones the scheduler's
 /// safety rests on.
 #[derive(Clone, Debug)]
 pub struct Config {
     /// This frontend's id: the value of the `kbf-frontend` label on its leases, the prefix
-    /// of its workers' instances and the build of its pack keys.
+    /// of its workers' instances.
     pub frontend: String,
     /// How many hosts to hold, a lease each.
     pub hosts: usize,
@@ -47,7 +52,9 @@ pub struct Config {
     pub arch: String,
     /// How long a lease lasts without a renewal, asked at each renewal. A run's wall time is
     /// cut to what the lease has left when it is posted, so this must cover the longest run
-    /// ([`Config::max_run`] and [`Config::run_margin`]); the lease server grants at most its
+    /// ([`Config::max_run`] and [`Config::run_margin`]) and two heartbeats more (the server cuts
+    /// a run's wall time again from the time left when the run is delivered to the host, which
+    /// can be a heartbeat late); the lease server grants at most its
     /// `--max-ttl`, and a worker that is granted less treats a run the lease cuts short as
     /// lost, not as the action's timeout.
     pub lease_ttl: Duration,
@@ -57,7 +64,10 @@ pub struct Config {
     pub drain_before_end: Duration,
     /// The longest action timeout the executor runs.
     pub max_run: Duration,
-    /// What a run's wall time adds to the action's timeout: fetch, pack and upload.
+    /// What a run's wall time adds to the action's timeout: fetch, pack and upload. The task
+    /// tool's own deadline bounds only the action's command, so a fetch of a large input tree
+    /// or an upload that outlasts this margin ends the run at the wall time, and is answered
+    /// to the caller as a timeout and not rerun: raise it for slower stores.
     pub run_margin: Duration,
     /// The timeout of an action that names none: at most [`Config::max_run`].
     pub default_timeout: Duration,
@@ -90,12 +100,15 @@ pub struct Config {
     /// delivery there is until the lease server's job takes a secret field. False by
     /// default, and [`Config::validate`] refuses a config that leaves it so.
     pub insecure_argv_secrets: bool,
-    /// The path of the task tool in the container.
-    pub tool: String,
-    /// The mount that puts the tool there.
+    /// The mount that puts the task tool in the container, at `/mnt/<root_name>/<rel>`: the
+    /// lease server mounts one path to one place, and nothing else of its root is there.
     pub tool_mount: Mount,
-    /// The farm's root certificate in the container, for the task's `https` reads.
+    /// The farm's root certificate, for the task's `https` reads: a file beside the tool in
+    /// the tool mount's root, mounted read-only next to it. `None` if the reads need none.
     pub root_der: Option<String>,
+    /// Where the task tool works in the container, if not in the tool's own default: the
+    /// action image must have a writable directory there.
+    pub work_dir: Option<String>,
     /// Whether the task may `PUT` over plain http.
     pub allow_plain_http_put: bool,
     /// The most bytes of a pack the frontend takes.
@@ -137,7 +150,9 @@ pub enum ConfigError {
     #[error("the longest run's wall time exceeds the presign ceiling")]
     Presign,
     /// A lease ttl that cannot be renewed in time, or that does not cover the longest run.
-    #[error("the lease ttl must be at least 30 s, three times the step, and cover the longest run")]
+    #[error(
+        "the lease ttl must be at least 30 s, three times the step, and cover the longest run and two heartbeats"
+    )]
     Ttl,
     /// A default timeout of zero or over the longest run.
     #[error("the default timeout must be above zero and no more than the longest run")]
@@ -197,13 +212,13 @@ impl Config {
             fence_after: SELF_FENCE,
             delivery: Delivery::InsecureArgv,
             insecure_argv_secrets: false,
-            tool: "/mnt/kbf-tools/kbf-task".to_owned(),
             tool_mount: Mount {
                 root_name: "kbf-tools".to_owned(),
                 rel: "kbf-task".to_owned(),
                 ro: true,
             },
             root_der: None,
+            work_dir: None,
             allow_plain_http_put: false,
             max_pack_bytes: 128 << 20,
             max_blob_bytes: 64 << 20,
@@ -256,7 +271,7 @@ impl Config {
                 [
                     self.lease_ttl >= Duration::from_secs(30),
                     self.lease_ttl >= self.poll * 3,
-                    self.lease_ttl >= longest,
+                    self.lease_ttl >= longest + self.heartbeat * 2,
                 ]
                 .into_iter()
                 .all(|ok| ok),
@@ -292,6 +307,35 @@ impl Config {
             .into_iter()
             .find_map(|(ok, error)| (!ok).then_some(error))
             .map_or(Ok(()), Err)
+    }
+
+    /// What a lease must ask of its host: the system and the architecture, the same as the
+    /// worker's node report says.
+    #[must_use]
+    pub fn host_capabilities(&self) -> std::collections::BTreeMap<String, String> {
+        [("os", "linux"), ("arch", self.arch.as_str())]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect()
+    }
+
+    /// The path of the task tool in the container.
+    #[must_use]
+    pub fn tool_path(&self) -> String {
+        container_path(&self.tool_mount)
+    }
+
+    /// The mount of the root certificate, and its path in the container, if one is set.
+    #[must_use]
+    pub fn root_mount(&self) -> Option<(Mount, String)> {
+        let rel = self.root_der.as_ref()?;
+        let mount = Mount {
+            root_name: self.tool_mount.root_name.clone(),
+            rel: rel.clone(),
+            ro: true,
+        };
+        let path = container_path(&mount);
+        Some((mount, path))
     }
 
     /// How many whole GiB of memory the farm may book on a host.
