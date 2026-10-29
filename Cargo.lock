@@ -1426,6 +1426,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "js-usage"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=772628f4356de822e8fe9971d807e368c70be479#772628f4356de822e8fe9971d807e368c70be479"
+dependencies = [
+ "js-state",
+ "js-types",
+ "thiserror",
+]
+
+[[package]]
 name = "js-whole"
 version = "0.1.0"
 source = "git+https://github.com/komira-ai/jobscheduler?rev=772628f4356de822e8fe9971d807e368c70be479#772628f4356de822e8fe9971d807e368c70be479"
@@ -2882,6 +2892,20 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "kbf-usage"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "js-types",
+ "js-usage",
+ "kbf-estimator",
+ "kbf-state",
+ "kbf-types",
+ "sha2 0.11.0",
+ "thiserror",
 ]
 
 [[package]]

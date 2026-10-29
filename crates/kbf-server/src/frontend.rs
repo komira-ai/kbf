@@ -177,6 +177,7 @@ pub const ALLOWED: &[&str] = &[
     "memory_ladder_gib",
     "vm_host_floor_cpus",
     "vm_host_floor_mem_gib",
+    "scheduler_core",
     "learned_sizes",
     "placement_load",
     "whole_node_max",
@@ -711,6 +712,7 @@ impl<'a> Prepared<'a> {
     /// Reads the flags and binds the listeners.
     fn new(flags: &'a FrontendFlags) -> Result<Self, Box<dyn Error>> {
         let args = &flags.server;
+        args.check_scheduler_core()?;
         args.retired_release.warn();
         flags.retired.warn();
         let listeners = args.listeners()?;
@@ -801,6 +803,7 @@ impl<'a> Prepared<'a> {
         };
         let durable = state.is_some();
         let farm = Farm::from_listeners(backend.clone(), &listeners).recording(recorder.clone());
+        crate::serve::log_core(&farm);
         let farm = Arc::new(farm.with_state(state)?);
         log_state(durable, farm.term(), farm.lease_epoch());
 

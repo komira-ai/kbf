@@ -72,6 +72,7 @@ fn stdin_is_closed() {
 fn exec_text_replaces_invalid_bytes() {
     let exec = Exec {
         code: Some(0),
+        signal: None,
         stdout: vec![b'a', 0xff],
         stderr: vec![0xfe, b'b'],
     };
@@ -439,4 +440,54 @@ fn a_chroot_drop_to_gid_zero_is_refused() {
     let kind = launch(&c, true).map_err(|e| e.kind());
     assert_eq!(kind, Err(std::io::ErrorKind::PermissionDenied));
     assert!(launch(&c, false).is_ok());
+}
+
+/// The words for how a command ended, from a fixed exit.
+#[test]
+fn ended_says_the_status_or_the_signal() {
+    let exec = |code, signal| Exec {
+        code,
+        signal,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    assert_eq!(exec(Some(0), None).ended(), "exit status 0");
+    assert_eq!(exec(None, Some(9)).ended(), "signal 9 (SIGKILL)");
+    assert_eq!(exec(None, Some(13)).ended(), "signal 13 (SIGPIPE)");
+    assert_eq!(exec(None, Some(11)).ended(), "signal 11 (SIGSEGV)");
+    assert_eq!(exec(None, Some(63)).ended(), "signal 63 (unnamed)");
+    assert_eq!(exec(None, None).ended(), "no exit status");
+}
+
+/// The variable that makes `helper_raise_sigterm_when_asked` end this test binary with SIGTERM.
+const RAISE: &str = "KBF_RUNNER_TEST_RAISE_SIGTERM";
+
+/// Not a test of its own: the program the next test runs. Without the variable it does
+/// nothing; with it, the test binary sends itself SIGTERM and so ends by that signal.
+#[test]
+fn helper_raise_sigterm_when_asked() {
+    if std::env::var_os(RAISE).is_some() {
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::TERM)
+            .expect("send SIGTERM to self");
+        // The default action ends the process before this; a stop here would be a hang.
+        std::process::abort();
+    }
+}
+
+/// Catches a runner that does not record the signal that ended a real child (`signal` always
+/// none): the test binary is run again, filtered to the helper above, with the variable set.
+/// It ends itself by SIGTERM, and the result has that signal, no exit code, and the words
+/// `fetch` uses in its reasons.
+#[test]
+fn a_real_child_that_kills_itself_reports_signal_15() {
+    let mut c = cmd(
+        std::env::current_exe().unwrap().to_str().unwrap(),
+        &["helper_raise_sigterm_when_asked", "--test-threads=1"],
+    );
+    c.env = vec![(RAISE.into(), "1".into())];
+    let exec = SystemRunner.run(&c).unwrap();
+    assert_eq!(exec.signal, Some(15), "{}", exec.stderr_text());
+    assert_eq!(exec.code, None);
+    assert!(!exec.success());
+    assert_eq!(exec.ended(), "signal 15 (SIGTERM)");
 }

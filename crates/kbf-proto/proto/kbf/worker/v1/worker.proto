@@ -35,8 +35,9 @@
 //   report (a reader never reads absent as zero); a peer that predates them skips the
 //   unknown fields.
 // - Heartbeat.node_load and CgroupUsage.peak_window_millicores: the actions cgroup's load
-//   and a lease's busiest CPU window. Each is absent from a peer that predates it, and
-//   absent means no report; a peer that predates them skips the unknown fields.
+//   and a lease's busiest CPU window; and the lease clocks and closed minutes of NodeLoad
+//   (lease_clocks, minutes). Each is absent from a peer that predates it, and absent means
+//   no report; a peer that predates them skips the unknown fields.
 // - ResultAck.reason: why a Result was or was not accepted. A daemon that predates it
 //   reads `accepted`; a server that predates it leaves the reason unspecified, which a
 //   daemon takes as "acknowledged: forget the Result".
@@ -390,7 +391,7 @@ message NodeLoad {
   // the inactive file pages of `memory.stat`, in bytes.
   uint64 memory_working_set_bytes = 4;
   // The leases that ran for the whole window since the previous reading. Empty for the
-  // first reading.
+  // first reading. At most 96, in the order of `lease_clocks`.
   repeated LeaseId covered = 5;
   // Whether the cgroup has a CPU quota (`cpu.max`).
   bool actions_cpu_limited = 6;
@@ -400,12 +401,46 @@ message NodeLoad {
   // The cumulative `total=` of the `some` line of `cpu.pressure`, in microseconds.
   // Telemetry only. Absent without pressure stall information.
   optional uint64 cpu_pressure_some_total_usec = 8;
-  // 9 and 10 are held for fields not defined yet.
-  reserved 9, 10;
+  // When each lease the runtime is running started, on this reading's own clock
+  // (`mono_usec`): the lease's container start, after its inputs and image. At most 96,
+  // oldest start first. Empty from a daemon that predates the field, from a runtime with
+  // no leases, or when the reading could not list them.
+  repeated LeaseClock lease_clocks = 9;
+  // Closed minutes of leases, counted from each lease's own start, oldest minute first,
+  // at most 64 a heartbeat. A minute is absent when it was observed for less than 30 s,
+  // never zero. Minute 63 means "63 or later": the daemon folds every later minute into
+  // it with the larger value of each field. Two scopes of repeat: within one load, a
+  // repeat of (lease, minute) is dropped on receipt and the first one stays; across
+  // heartbeats (a minute sent again because a heartbeat was not acknowledged before the
+  // stream ended, and every later fold into minute 63), a receiver merges by
+  // (lease, minute) with the larger value of each field.
+  repeated LeaseMinute minutes = 10;
   // The active file pages of `memory.stat` (`active_file`), in bytes: page cache the
   // kernel has not marked reclaimable, which a working set counts. 0 when the file has
   // no such line.
   uint64 memory_active_file_bytes = 11;
+}
+
+// When a lease started, on the clock of the NodeLoad that carries it.
+message LeaseClock {
+  LeaseId lease = 1;
+  // The daemon's monotonic clock, in microseconds, when the lease's container started.
+  // Not after NodeLoad.mono_usec.
+  uint64 started_mono_usec = 2;
+}
+
+// What one lease used in one minute of its life.
+message LeaseMinute {
+  LeaseId lease = 1;
+  // 0 to 63: the minute since the lease's start.
+  uint32 minute = 2;
+  // Mean CPU over the span observed, thousandths of a CPU. Not above the peak.
+  uint32 cpu_mean_millis = 3;
+  // The busiest sampling window of the minute, thousandths of a CPU.
+  uint32 cpu_peak_window_millis = 4;
+  // The largest working set seen in the minute (`memory.current` less `inactive_file`),
+  // bytes.
+  uint64 ws_max_bytes = 5;
 }
 
 // The counts of a daemon's pack reads, cumulative since the daemon process started (they
