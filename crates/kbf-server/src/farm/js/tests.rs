@@ -17,6 +17,8 @@ use crate::state_store::StateStore;
 
 mod hot;
 
+mod placement;
+
 mod views;
 
 fn farm() -> Farm {
