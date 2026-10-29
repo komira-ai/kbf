@@ -1,7 +1,9 @@
 //! Authenticators: who is calling.
 
+use std::fmt;
 use std::sync::Arc;
 
+use tonic::codegen::http::header::AUTHORIZATION;
 use tonic::codegen::http::request::Parts;
 use tonic::{Code, Status};
 
@@ -145,6 +147,64 @@ impl Authenticator for AllAuthenticator {
     }
 }
 
+/// Accepts a call that carries `authorization: Bearer <token>` whose token a verifier
+/// accepts. The verifier answers who the bearer is, as [`AuthenticationMetadata`], or
+/// refuses; its refusal is the call's. A call with no such header, another scheme or an
+/// empty token is UNAUTHENTICATED, and the token is never put in a message or a log.
+pub struct BearerAuthenticator {
+    verify: Verifier,
+}
+
+/// What a [`BearerAuthenticator`] asks about a token.
+type Verifier = Box<dyn Fn(&str) -> Result<AuthenticationMetadata, Status> + Send + Sync>;
+
+impl BearerAuthenticator {
+    /// Accepts the bearers `verify` accepts.
+    #[must_use]
+    pub fn new(
+        verify: impl Fn(&str) -> Result<AuthenticationMetadata, Status> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            verify: Box::new(verify),
+        }
+    }
+}
+
+/// The token of a call's `authorization: Bearer <token>` header. The scheme is matched
+/// without regard to case (RFC 9110); no message repeats the header.
+fn bearer(call: &Parts) -> Result<&str, Status> {
+    let header = call
+        .headers
+        .get(AUTHORIZATION)
+        .ok_or_else(|| Status::unauthenticated("no bearer token"))?;
+    let header = header
+        .to_str()
+        .map_err(|_| Status::unauthenticated("the authorization header is not text"))?;
+    match header.split_once(' ') {
+        Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() => {
+            Ok(token)
+        }
+        _ => Err(Status::unauthenticated("no bearer token")),
+    }
+}
+
+impl fmt::Debug for BearerAuthenticator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BearerAuthenticator")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Authenticator for BearerAuthenticator {
+    fn authenticate<'a>(
+        &'a self,
+        call: &'a Parts,
+    ) -> BoxFuture<'a, Result<Arc<AuthenticationMetadata>, Status>> {
+        let answer = bearer(call).and_then(|token| (self.verify)(token).map(Arc::new));
+        Box::pin(std::future::ready(answer))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -252,5 +312,95 @@ mod tests {
         let e = run(&all).await.expect_err("refused");
         assert_eq!((e.code(), e.message()), (Code::Unauthenticated, "no token"));
         assert_eq!(after.1.load(Ordering::SeqCst), 0, "asked after a refusal");
+    }
+
+    fn call_with(authorization: Option<&[u8]>) -> Parts {
+        let mut request = http::Request::new(());
+        if let Some(value) = authorization {
+            request.headers_mut().insert(
+                http::header::AUTHORIZATION,
+                http::HeaderValue::from_bytes(value).expect("a header value"),
+            );
+        }
+        request.into_parts().0
+    }
+
+    /// Accepts the token `good` as the caller `who`, and refuses any other with
+    /// PERMISSION_DENIED.
+    fn bearer() -> BearerAuthenticator {
+        BearerAuthenticator::new(|token| {
+            if token == "good" {
+                Ok(AuthenticationMetadata::new(
+                    Some(json!("who")),
+                    Some(json!("secret")),
+                ))
+            } else {
+                Err(Status::permission_denied("not that one"))
+            }
+        })
+    }
+
+    /// Catches: a bearer that reads another header or none, passes the scheme along
+    /// with the token, is case-sensitive about the scheme (RFC 9110: it is not), or
+    /// answers with metadata other than the verifier's.
+    #[tokio::test]
+    async fn a_bearer_token_is_given_to_the_verifier_and_its_metadata_is_the_callers() {
+        for header in ["Bearer good", "bearer good", "BEARER good"] {
+            let md = bearer()
+                .authenticate(&call_with(Some(header.as_bytes())))
+                .await
+                .expect(header);
+            assert_eq!(md.public(), Some(&json!("who")), "{header}");
+            assert_eq!(md.private(), Some(&json!("secret")), "{header}");
+        }
+    }
+
+    /// Catches: a call without a usable bearer that is accepted or that fails with a
+    /// code other than UNAUTHENTICATED, a verifier asked for a call that has none, and
+    /// a message that repeats the header.
+    #[tokio::test]
+    async fn a_call_without_a_bearer_token_is_unauthenticated() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&asked);
+        let counting = BearerAuthenticator::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(AuthenticationMetadata::default())
+        });
+        let headers: [Option<&[u8]>; 6] = [
+            None,
+            Some(b"Basic Zm9vOmJhcg=="),
+            Some(b"Bearer"),
+            Some(b"Bearer "),
+            Some(b"good"),
+            Some(b"Bearer \xff\xfe"),
+        ];
+        for header in headers {
+            let e = counting
+                .authenticate(&call_with(header))
+                .await
+                .expect_err("no bearer token");
+            assert_eq!(e.code(), Code::Unauthenticated, "{header:?}");
+            assert!(!e.message().contains("good"), "{}", e.message());
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "the verifier was asked");
+    }
+
+    /// Catches: a verifier's refusal turned into another status, or into an accept.
+    #[tokio::test]
+    async fn the_verifiers_refusal_is_the_calls_status() {
+        let e = bearer()
+            .authenticate(&call_with(Some(b"Bearer other")))
+            .await
+            .expect_err("refused");
+        assert_eq!(
+            (e.code(), e.message()),
+            (Code::PermissionDenied, "not that one")
+        );
+    }
+
+    /// Catches: a `Debug` that shows what the verifier closes over.
+    #[test]
+    fn a_bearer_authenticator_debug_names_no_verifier() {
+        assert_eq!(format!("{:?}", bearer()), "BearerAuthenticator { .. }");
     }
 }

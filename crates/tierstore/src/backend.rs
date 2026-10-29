@@ -1,7 +1,8 @@
 //! The minimal API of an S3-compatible store, as this crate uses it.
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use crate::Error;
@@ -123,12 +124,73 @@ fn is_after(key: &str, start_after: Option<&str>) -> bool {
 /// whose time is set by the client that sends the part (see there).
 #[async_trait]
 pub trait Backend: Send + Sync {
+    /// Whether a streamed body (of [`Backend::put_stream`] or [`Backend::upload_part_with_len`])
+    /// must come with its length for the backend to avoid holding it whole. A store that needs
+    /// the length of a request before it is sent (S3 does) says `true`: given no length it
+    /// collects the body first, which is memory the client chooses. The S3 front refuses a
+    /// request without a `Content-Length` (411) before reading its body when this is `true`.
+    /// The default is `false`.
+    fn needs_length(&self) -> bool {
+        false
+    }
+
     /// Writes an object, only if the key does not exist (`If-None-Match: *`).
     ///
     /// # Errors
     /// [`Error::AlreadyExists`] if the key exists; the stored object is left as it was.
     /// [`Error::Full`] if the backend has no room for the object.
     async fn put(&self, key: &str, body: Bytes) -> Result<(), Error>;
+
+    /// As [`Backend::put`], for a body that arrives as chunks: `len` is the number of bytes
+    /// `body` is to give, or `None` if the caller does not know.
+    ///
+    /// The object becomes visible under `key` only after `body` has ended, and a body that ends
+    /// with an error leaves nothing: no object under `key`, and nothing left behind that a
+    /// listing or a get could find. The call gives that error. That is what lets a caller
+    /// verify the bytes as they pass (a checksum is known only at the end) and end the stream
+    /// with an error if they are wrong. The implementations of the directory and the S3
+    /// backend do not hold the body in memory: the directory backend writes the chunks to a
+    /// temporary file and links it to `key` after the last chunk; the S3 backend sends them to
+    /// the store as they arrive, as one request or as a multipart upload that is completed (with
+    /// `If-None-Match: *`) only after the last chunk, and aborted on any failure. A store that
+    /// must know the length of a request before it is sent (S3 does) needs `len`; given
+    /// `None`, the S3 backend holds the whole body first.
+    ///
+    /// The provided implementation collects the chunks and calls [`Backend::put`], which holds
+    /// the body whole; it serves a backend that holds its objects in memory anyway, and the
+    /// wrappers of other backends override the call to pass the stream on.
+    ///
+    /// # Errors
+    /// As [`Backend::put`], and the error of `body`, if it ends with one.
+    async fn put_stream(
+        &self,
+        key: &str,
+        _len: Option<u64>,
+        mut body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        let mut whole = BytesMut::new();
+        while let Some(chunk) = body.next().await {
+            whole.extend_from_slice(&chunk?);
+        }
+        self.put(key, whole.freeze()).await
+    }
+
+    /// [`Backend::put_stream`] for a writer that cannot be trusted to race: a backend with more
+    /// than one tier writes the object to its first tier only, and answers [`Error::Full`] and
+    /// stores nothing when that tier has no room (whatever part of the body it took), so that one
+    /// create-only write into one tier decides which of two concurrent puts of a key wins. The
+    /// default is [`Backend::put_stream`], for a backend with one place to put an object.
+    ///
+    /// # Errors
+    /// As [`Backend::put_stream`].
+    async fn put_stream_hot_only(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        self.put_stream(key, len, body).await
+    }
 
     /// Replaces the object, only if its content tag is `etag` (`If-Match`), and gives the
     /// content tag of the new object.

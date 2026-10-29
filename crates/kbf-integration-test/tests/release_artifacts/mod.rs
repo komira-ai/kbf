@@ -11,7 +11,7 @@
 //!   [`ASSETS`] (binary and platform): `kbf`, `kbf-host-install` and `kbf-updater` for the
 //!   three platforms (a Mac runs the host agent), `kbf-installer` and `kbf-mac-provision` for macOS only (its Linux
 //!   package is the `kbf` package's now; a Mac is provisioned by `kbf-mac-provision`), `kbf-daemon`, `kbf-server`, `kbf-deploy`,
-//!   `kbf-signer` and `tierstore` for Linux, `kbf-deploy` for macOS (a Mac runs
+//!   `kbf-signer`, `tierstore` and `kbf-task` (a static musl build) for Linux, `kbf-deploy` for macOS (a Mac runs
 //!   `kbf daemon`; there is no darwin `kbf-daemon`). Each one's SBOM attestation is
 //!   [`crate::attested_assets`]' business, and its provenance bundle
 //!   [`crate::attested_bundles`]'.
@@ -55,9 +55,9 @@
 //!   `--expect-ref "$GITHUB_REF"`, so the file that was attested is the one checked
 //!   (`kbf_package`'s rules).
 //! - **The images.** The same jobs build the frontend's OCI image from the `kbf` of their own
-//!   tarball and the update coordinator's from the `kbf-coordinator` they built, each twice with
-//!   the commit's time and no BuildKit attachments, compare the two files, and make the first an
-//!   asset (`cargo xtask pkg-image-asset --service`, `images`' rules); the verify job checks
+//!   tarball, the update coordinator's from the `kbf-coordinator` and the task runner's from the
+//!   `kbf-task` they built, each twice with the commit's time and no BuildKit attachments,
+//!   compare the two files, and make the first an asset (`cargo xtask pkg-image-asset --service`, `images`' rules); the verify job checks
 //!   each signed one.
 //! - **The installer's Mac package.** The darwin job builds the `kbf-installer` `.pkg`
 //!   (`cargo xtask pkg build`, with the pinned darwin `gh`, the trusted root and an
@@ -91,6 +91,7 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-updater", "linux-x86_64"),
     ("kbf-signer", "linux-x86_64"),
     ("tierstore", "linux-x86_64"),
+    ("kbf-task", "linux-x86_64"),
     ("kbf", "linux-arm64"),
     ("kbf-daemon", "linux-arm64"),
     ("kbf-server", "linux-arm64"),
@@ -99,6 +100,7 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-updater", "linux-arm64"),
     ("kbf-signer", "linux-arm64"),
     ("tierstore", "linux-arm64"),
+    ("kbf-task", "linux-arm64"),
 ];
 
 /// The binaries of [`ASSETS`] that name the commit they were built from (`<binary>
@@ -714,6 +716,7 @@ fn the_docs_describe_the_release_set() {
             format!("`kbf-<commit>-{platform}.deb`"),
             format!("`kbf-frontend-image-<commit>-{platform}.oci.tar`"),
             format!("`kbf-coordinator-image-<commit>-{platform}.oci.tar`"),
+            format!("`kbf-task-image-<commit>-{platform}.oci.tar`"),
         ] {
             if !doc.contains(&file) {
                 missing.push(format!("docs/artifacts.md does not list {file}"));
@@ -832,6 +835,28 @@ mod rules {
         )
     }
 
+    /// The steps that check the job's `kbf-task`, build its image twice from it, compare the
+    /// builds and make the first an asset.
+    fn task_steps(platform: &str) -> String {
+        let build = |n: u32| {
+            format!(
+                "      - name: Task build {n}\n        run: docker buildx build --builder b --no-cache --platform p --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH --file f --output \"type=docker,oci-mediatypes=true,dest=target/task-image-out/{n}.oci.tar,rewrite-timestamp=true\" target/task-image\n"
+            )
+        };
+        format!(
+            "      - name: Task target\n        run: rustup target add \"$STATIC_TARGET\"\n      - name: Task build\n        run: cargo build --locked --release --target \"$STATIC_TARGET\" -p kbf-task --bin kbf-task\n      - name: Task check\n        run: cargo xtask build-commit check \"target/$STATIC_TARGET/release/kbf-task\" \"$GITHUB_SHA\"\n      - name: Task static\n        run: cargo xtask static-elf \"target/$STATIC_TARGET/release/kbf-task\"\n      - name: Task context\n        run: cp \"target/$STATIC_TARGET/release/kbf-task\" target/task-image/kbf-task\n{}{}      - name: Task same\n        run: cmp target/task-image-out/1.oci.tar target/task-image-out/2.oci.tar\n      - name: Task asset\n        run: cargo xtask pkg-image-asset --service task --image target/task-image-out/1.oci.tar --platform {platform} --commit \"$GITHUB_SHA\" --binary \"target/$STATIC_TARGET/release/kbf-task\" --out dist\n",
+            build(1),
+            build(2)
+        )
+    }
+
+    /// The verify job's check of the signed task image of `platform` (no file of the build).
+    fn verify_task_step(platform: &str) -> String {
+        format!(
+            "      - name: Task image {platform}\n        run: cargo xtask pkg-image-asset --verify-only --service task --image \"dist/kbf-task-image-$GITHUB_SHA-{platform}.oci.tar\" --platform {platform} --commit \"$GITHUB_SHA\"\n"
+        )
+    }
+
     /// The steps that make the Mac `.pkg` an asset, as the darwin job has them (after the
     /// tarball's identity and signature checks, which `good()` writes before).
     fn mac_package_steps() -> String {
@@ -926,6 +951,7 @@ mod rules {
                 w.push_str(&kbf_asset_step(platform));
                 w.push_str(&image_steps(platform));
                 w.push_str(&coordinator_steps(platform));
+                w.push_str(&task_steps(platform));
             }
             if *job == MAC_PACKAGE {
                 w.push_str(&mac_package_steps());
@@ -945,6 +971,7 @@ mod rules {
                     w.push_str(&verify_kbf_package_step(p));
                     w.push_str(&verify_image_step(p));
                     w.push_str(&verify_coordinator_step(p));
+                    w.push_str(&verify_task_step(p));
                 }
             } else {
                 w.push_str(&verify_mac_package_step());

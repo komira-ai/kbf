@@ -49,7 +49,6 @@ pub fn config(
 /// with the memory ladder and floors, the loss requeues, the whole-node drain and caps
 /// (`--whole-node-max`) if they are set, and the wait of the orphan sweep, as
 /// [`Farm::new`](crate::farm::Farm::new) and its builders give the farm's own scheduler.
-#[cfg(feature = "farm-core-js")]
 #[must_use]
 pub(crate) fn farm_config(
     term: u64,
@@ -116,11 +115,13 @@ impl Observer for KbfObserver {
 /// The store cannot be read or written, or holds a row that is not one the scheduler wrote.
 pub fn open(
     config: &Config,
-    adapter: KbfAdapter,
+    mut adapter: KbfAdapter,
     store: Arc<dyn Store>,
     epoch: EpochPolicy,
     now: FarmTime,
 ) -> Result<Core<KbfAdapter>, StateError> {
+    // Read before the core exists: no caller waits for the store behind its lock.
+    adapter.restore_learned();
     let observer = KbfObserver::new(adapter.cache.clone());
     let core = Core::open(config, adapter, storage(store, epoch), now)?;
     Ok(core.with_observer(observer))
