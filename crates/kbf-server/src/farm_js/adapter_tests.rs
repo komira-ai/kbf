@@ -400,7 +400,7 @@ async fn an_unreadable_done_row_ends_the_caller_with_a_retryable_error_and_does_
         &first.core,
         &first.backend,
         &super::testing::wall(),
-        || FarmTime::from_millis(0),
+        &|| FarmTime::from_millis(0),
         &WorkerId::new("node-a"),
         super::testing::ran(lease, 0),
     )

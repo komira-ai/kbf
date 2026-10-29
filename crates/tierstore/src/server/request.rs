@@ -20,6 +20,7 @@ use md5::Md5;
 use percent_encoding::percent_decode_str;
 use ring::digest::{Context as Sha1Context, SHA1_FOR_LEGACY_USE_ONLY};
 use sha2::{Digest, Sha256};
+use tokio::time::Instant;
 
 use crate::{Error, PartBody};
 
@@ -121,11 +122,35 @@ impl Query {
 
 /// A request body, read a piece at a time: it has at most a limit of bytes, and it must not be
 /// idle: a wait for the next piece that takes longer than the idle timeout ends the read. The
-/// time that the whole body takes is not bounded, so a body that is slow and steady is read.
+/// time that the whole body takes is not bounded, so a body that is slow and steady is read, but
+/// a body may be held to a least average rate ([`Reader::with_floor`]).
 pub(crate) struct Reader<B> {
     body: Pin<Box<Limited<B>>>,
     limit: usize,
     idle: Duration,
+    floor: Option<Floor>,
+}
+
+/// The least average rate of a body, counted from when its reader was made, once the grace
+/// has passed.
+struct Floor {
+    min_bytes_per_sec: u64,
+    grace: Duration,
+    start: Instant,
+    taken: u64,
+}
+
+impl Floor {
+    /// Counts a piece of `len` bytes, and says whether the body is now slower than the floor.
+    fn too_slow(&mut self, len: usize) -> bool {
+        self.taken = self.taken.saturating_add(len as u64);
+        let elapsed = self.start.elapsed();
+        if elapsed <= self.grace {
+            return false;
+        }
+        let wanted = u128::from(self.min_bytes_per_sec) * elapsed.as_millis();
+        u128::from(self.taken) * 1000 < wanted
+    }
 }
 
 impl<B> Reader<B>
@@ -140,13 +165,28 @@ where
             body: Box::pin(Limited::new(body, limit)),
             limit,
             idle,
+            floor: None,
         }
+    }
+
+    /// The same reader, held to an average of at least `min_bytes_per_sec` once `grace` has
+    /// passed since it was made (zero: no floor). A piece that makes the average fall under it
+    /// ends the read with a `RequestTimeout`.
+    pub(crate) fn with_floor(mut self, min_bytes_per_sec: u64, grace: Duration) -> Self {
+        self.floor = (min_bytes_per_sec > 0).then(|| Floor {
+            min_bytes_per_sec,
+            grace,
+            start: Instant::now(),
+            taken: 0,
+        });
+        self
     }
 
     /// The next piece of the body, or `None` at its end.
     ///
     /// # Errors
-    /// `RequestTimeout` for no piece within the idle timeout; `EntityTooLarge` for a body of
+    /// `RequestTimeout` for no piece within the idle timeout, or for a body under its floor;
+    /// `EntityTooLarge` for a body of
     /// more than the limit; `IncompleteBody` for one that could not be read.
     pub(crate) async fn next(&mut self) -> Result<Option<Bytes>, S3Error> {
         loop {
@@ -159,7 +199,13 @@ where
                 Some(Err(error)) => return Err(self.refusal(&error)),
                 Some(Ok(frame)) => {
                     if let Ok(mut data) = frame.into_data() {
-                        return Ok(Some(data.copy_to_bytes(data.remaining())));
+                        let piece = data.copy_to_bytes(data.remaining());
+                        if let Some(floor) = &mut self.floor
+                            && floor.too_slow(piece.len())
+                        {
+                            return Err(S3Error::too_slow(floor.min_bytes_per_sec));
+                        }
+                        return Ok(Some(piece));
                     }
                 }
             }

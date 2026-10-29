@@ -23,6 +23,11 @@
 //!   before there were packs: a segment has the layout of a pack, so one record of the index
 //!   per segment, made from its footer, makes its blobs readable through [`Reader`]. It copies
 //!   nothing, and does nothing unless it is run; the operator tool `kbf-pack-adopt` runs it.
+//! - The task pack types ([`TaskManifest`], [`TaskPackKey`], [`check_shape`], [`write_pack`]) are the
+//!   shared, pure contract of a pack written by a task that has no store credential: one pack
+//!   whose record at offset 0 is a JSON manifest, under a key the frontend minted. The task that
+//!   writes one and the frontend that ingests it use these, so the two cannot drift. They do no
+//!   I/O and hold no secret.
 //!
 //! Pack keys are `cas/d/<node>/<boot>/<seq>` for a daemon and `cas/f/<frontend>/<boot>/<seq>`
 //! for a frontend ([`PackKeys`]); the sequence number is sixteen hex digits, so a listing of
@@ -40,6 +45,9 @@ mod keys;
 mod packer;
 mod reader;
 mod sweep;
+mod task_key;
+mod task_manifest;
+mod task_pack;
 
 pub use adopt::{
     AdoptConfig, AdoptError, AdoptMode, AdoptReport, AdoptRun, Adopter, CHECKPOINT_EVERY,
@@ -55,4 +63,15 @@ pub use packer::{
 pub use reader::{DEFAULT_CONCURRENCY, DEFAULT_GAP, Fetch, Reader, ReaderConfig};
 pub use sweep::{
     AgeOf, DEFAULT_GRACE, SWEPT_PREFIX, SweepConfig, SweepError, SweepGates, SweepReport, Sweeper,
+};
+pub use task_key::{
+    MAC_LEN, MAX_BUILD_BYTES, TaskKeyError, TaskPackKey, check_build, mac_input, minute_of,
+};
+pub use task_manifest::{
+    EMPTY_DIGEST, MANIFEST_VERSION, MAX_MANIFEST_BYTES, MAX_PATH_BYTES, ManifestError,
+    OutputDirectory, OutputFile, OutputSymlink, PathError, TaskManifest, Timing, Usage,
+};
+pub use task_pack::{
+    MAX_PACK_BYTES, MAX_PACK_RECORDS, MAX_RECORD_BYTES, ShapeError, TaskPackError, WritePackError,
+    check_shape, read_manifest, write_pack,
 };

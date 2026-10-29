@@ -180,6 +180,7 @@ pub const ALLOWED: &[&str] = &[
     "scheduler_core",
     "learned_sizes",
     "placement_load",
+    "placement_predictions",
     "whole_node_max",
     "whole_node_max_draining",
     "whole_node_keep_for_ordinary",
