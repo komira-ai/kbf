@@ -91,15 +91,16 @@ pub(crate) fn node_detail(
         if !readable && !node.is_some_and(|node| node.connected) {
             return Err(NodeUnread(worker.as_str().to_owned()));
         }
-        Ok(node.map(|_| {
+        // The js core keeps no node load yet: the detail shows none.
+        let detail = |_| {
             detail_of(
                 listed(js, view, adapter, worker),
                 view.sched(),
                 worker,
-                // The js core keeps no node load yet.
                 None,
             )
-        }))
+        };
+        Ok(node.map(detail))
     })
 }
 

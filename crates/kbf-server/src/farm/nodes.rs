@@ -80,12 +80,12 @@ impl Farm {
             return Ok(None);
         }
         let node = self.node(state, worker);
-        let load = state.side.node_loads.get(worker).map(|kept| {
-            kept.view(
-                &state.engine.sched.capacity(worker).unwrap_or_default(),
-                now,
-            )
-        });
+        let capacity = state.engine.sched.capacity(worker).unwrap_or_default();
+        let load = state
+            .side
+            .node_loads
+            .get(worker)
+            .map(|kept| kept.view(&capacity, now));
         Ok(Some(detail_of(node, &state.engine.sched, worker, load)))
     }
 
@@ -149,7 +149,7 @@ pub(super) fn node_of(
 }
 
 /// `node`, which is `worker` as [`node_of`] lists it, with what it can run, what is left of
-/// that and its leases, as `GET /v1/nodes/{id}` answers.
+/// that, its leases and the `load` its daemon reported, as `GET /v1/nodes/{id}` answers.
 pub(super) fn detail_of(
     node: NodeView,
     sched: &Scheduler,
