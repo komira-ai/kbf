@@ -842,3 +842,25 @@ async fn write_behind_now_writes_the_changed_summaries_before_returning() {
         "an unchanged summary is not written again"
     );
 }
+
+/// Asserts an operation whose caller the machine does not know is not asked about, without a
+/// panic or a line. Catches: an estimate made for a waiter that is gone.
+#[tokio::test(start_paused = true)]
+async fn an_operation_whose_caller_is_unknown_is_not_asked_about() {
+    let log = capture();
+    let rig = learning_rig(&Flaky::new(), LearnedSizes::Shadow);
+    let admitted = rig
+        .core
+        .submit(at(0), request(1, 0), &super::testing::parcel(), |_, _| {})
+        .expect("queued");
+    let sized = super::learning::Sized {
+        kind: LeaseKind::Action,
+        gpus: 0,
+        memory_bytes: 4 * GIB,
+        cpu_millis: 1_000,
+        evidence: Default::default(),
+    };
+    rig.core
+        .with(|view, adapter| adapter.learn_submit(view, &admitted, &sized));
+    assert!(estimates(&log.text()).is_empty());
+}
