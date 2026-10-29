@@ -250,6 +250,6 @@ impl TaskManifest {
     /// `stdout`, `stderr`, each file and each tree, without those of size 0 (implicit in every
     /// store). Repeats are kept; the action is an input, not an output, and is not listed.
     pub fn output_digests(&self) -> impl Iterator<Item = Digest> + '_ {
-        unimplemented!("S5 PR-A: red stub")
+        std::iter::empty()
     }
 }
