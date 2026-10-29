@@ -3,9 +3,10 @@
 //! `:drain`, `:uncordon`"). The calls are the ones of `kbf cluster drain` and `kbf cluster
 //! undrain`.
 //!
-//! - **drain**: `POST /v1/nodes/<node>:drain` with `{"deadline_secs": N}`. The frontend
-//!   cordons the node (no new lease; its leases run on) and waits for the leases for `N`
-//!   seconds. The call returns at once with the node as it is then.
+//! - **drain**: `POST /v1/nodes/<node>:drain` with `{"deadline_secs": N}`, or with no body
+//!   when there is no deadline. The frontend cordons the node (no new lease; its leases run
+//!   on) and waits for the leases for `N` seconds, or however long they run. The call returns
+//!   at once with the node as it is then.
 //! - **leases**: `GET /v1/nodes/<node>`, the length of `leases`. A node that is `serving`
 //!   is not drained (somebody returned it), and that is an error, not zero leases.
 //! - **undrain**: `POST /v1/nodes/<node>:uncordon`.
@@ -86,9 +87,11 @@ impl NodeDrain {
 }
 
 impl Drain for NodeDrain {
-    fn drain(&self, host: &Host, deadline: Duration) -> Result<(), PortError> {
+    fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError> {
         let node = Self::node(host)?;
-        let body = serde_json::json!({ "deadline_secs": deadline.as_secs() }).to_string();
+        let body = deadline.map_or_else(String::new, |deadline| {
+            serde_json::json!({ "deadline_secs": deadline.as_secs() }).to_string()
+        });
         let reply = self.api.post(&format!("/v1/nodes/{node}:drain"), &body)?;
         self.judged(reply, node).map(drop)
     }

@@ -158,7 +158,7 @@ fn e(s: &str) -> Event {
         "ck" => Event::Check(a),
         "in" => Event::Install(a, "2.0".to_owned()),
         "hl" => Event::Health(a),
-        "dr" => Event::Drain(a, crate::ports::UNBOUNDED_NODE_DRAIN.as_secs()),
+        "dr" => Event::Drain(a, None),
         "ls" => Event::Leases(a),
         "ud" => Event::Undrain(a),
         _ => Event::Query(a),

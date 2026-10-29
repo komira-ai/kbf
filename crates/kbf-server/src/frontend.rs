@@ -1174,8 +1174,7 @@ fn metrics_route(
                 history.render(&mut text);
             }
             Packs::render_metrics_of(packs.as_ref(), &mut text);
-            crate::pack_daemon_metrics::render_farm(&mut text, &farm);
-            farm.failed_actions().render(&mut text);
+            crate::metrics::render_farm(&mut text, &farm);
             crate::metrics::scrape_health(&mut text, members.as_ref()).await;
             kbf_tls::render_metrics(tls.iter(), &mut text);
             ([(CONTENT_TYPE, crate::metrics::TEXT_FORMAT)], text)
