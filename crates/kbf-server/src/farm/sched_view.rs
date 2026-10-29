@@ -49,6 +49,7 @@ impl Farm {
     /// The leases held now: all of them, or only `node`'s (none for a node that holds
     /// none or does not exist).
     pub fn lease_views(&self, node: Option<&WorkerId>) -> LeaseViews {
+        js_arm!(self, views::lease_views(node));
         let state = self.lock();
         LeaseViews {
             term: state.engine.sched.term(),
@@ -59,6 +60,7 @@ impl Farm {
 
     /// The queue now, summarised.
     pub fn queue_view(&self) -> QueueView {
+        js_arm!(self, views::queue_view());
         self.lock().engine.sched.queue_snapshot()
     }
 
@@ -72,11 +74,13 @@ impl Farm {
     /// The whole-node view of the queue now; `None` unless the farm runs with whole-node
     /// settings.
     pub fn whole_view(&self) -> Option<WholeView> {
+        js_arm!(self, views::whole_view());
         self.whole_of(&self.lock().engine.sched)
     }
 
     /// The queue and its whole-node view from one read of the scheduler, so the two agree.
     pub fn queue_views(&self) -> (QueueView, Option<WholeView>) {
+        js_arm!(self, views::queue_views());
         let state = self.lock();
         let sched = &state.engine.sched;
         (sched.queue_snapshot(), self.whole_of(sched))

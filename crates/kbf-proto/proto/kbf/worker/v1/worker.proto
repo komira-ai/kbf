@@ -400,9 +400,11 @@ message NodeLoad {
   // Closed minutes of leases, counted from each lease's own start, oldest minute first,
   // at most 64 a heartbeat. A minute is absent when it was observed for less than 30 s,
   // never zero. Minute 63 means "63 or later": the daemon folds every later minute into
-  // it with the larger value of each field, and a receiver merges repeats of it the same
-  // way. A minute sent again (a heartbeat not acknowledged before the stream ended) is
-  // harmless: a receiver merges by (lease, minute) with the larger value of each field.
+  // it with the larger value of each field. Two scopes of repeat: within one load, a
+  // repeat of (lease, minute) is dropped on receipt and the first one stays; across
+  // heartbeats (a minute sent again because a heartbeat was not acknowledged before the
+  // stream ended, and every later fold into minute 63), a receiver merges by
+  // (lease, minute) with the larger value of each field.
   repeated LeaseMinute minutes = 10;
   // The active file pages of `memory.stat` (`active_file`), in bytes: page cache the
   // kernel has not marked reclaimable, which a working set counts. 0 when the file has

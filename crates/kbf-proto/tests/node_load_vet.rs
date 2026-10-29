@@ -170,11 +170,19 @@ fn duplicates_use_the_right_key() {
 
     let vetted = load(
         Vec::new(),
-        vec![clock(1, 5, 10), clock(1, 5, 20), clock(2, 5, 30)],
+        vec![
+            clock(1, 5, 10),
+            clock(1, 5, 20),
+            clock(2, 5, 30),
+            clock(1, 6, 40),
+        ],
         Vec::new(),
     )
     .vet();
-    assert_eq!(vetted.clocks, vec![clock(1, 5, 10), clock(2, 5, 30)]);
+    assert_eq!(
+        vetted.clocks,
+        vec![clock(1, 5, 10), clock(2, 5, 30), clock(1, 6, 40)]
+    );
     assert_eq!(vetted.drops, drops(0, 1, 0));
 }
 
@@ -276,6 +284,11 @@ fn covered_is_cut_and_deduplicated() {
     let vetted = load(sent, Vec::new(), Vec::new()).vet();
     assert_eq!(vetted.covered, vec![lease(3, 3), lease(1, 1), lease(0, 0)]);
     assert_eq!(vetted.drops, drops(0, 2, 0));
+
+    // The same sequence under two terms is two leases.
+    let vetted = load(vec![lease(1, 1), lease(2, 1)], Vec::new(), Vec::new()).vet();
+    assert_eq!(vetted.covered, vec![lease(1, 1), lease(2, 1)]);
+    assert_eq!(vetted.drops, drops(0, 0, 0));
 }
 
 /// Vetting what vet returned drops nothing and changes nothing, so a record that passed once
@@ -352,7 +365,8 @@ fn a_hostile_load_vets_to_empty_and_is_counted() {
 }
 
 /// The numbers the receiver applies are the documented ones, and the same ones the job
-/// scheduler's agent wire applies to the same lists (`js_agent_wire::limits`).
+/// scheduler's agent wire documents for the same lists (`js_agent_wire::limits`). This crate does
+/// not depend on that one, so the numbers are pinned here as literals.
 #[test]
 fn the_cap_table_is_the_documented_one() {
     assert_eq!(MAX_LOAD_LEASES, 96);

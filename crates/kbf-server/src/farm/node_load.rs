@@ -284,6 +284,11 @@ impl Farm {
         stream: StreamId,
         load: Option<&NodeLoad>,
     ) -> Option<usage::NodeLoad> {
+        // The js core keeps no node load yet: its readings are neither stored nor shown.
+        #[cfg(feature = "farm-core-js")]
+        if matches!(self.driver, super::driver::Driver::Js(_)) {
+            return None;
+        }
         let load = load?;
         let mut state = self.lock();
         let link = state

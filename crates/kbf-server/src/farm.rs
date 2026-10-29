@@ -62,14 +62,19 @@ use kbf_types::{
 use tokio::sync::{mpsc, watch};
 use tonic::Status;
 
+#[macro_use]
+mod driver;
 mod ack;
 mod ambient;
 mod beat;
-mod driver;
 pub(crate) mod durable;
 mod engine;
 mod failed_actions;
 mod handover;
+// The core's pieces are read as the groups of methods in `js` are written.
+#[cfg(feature = "farm-core-js")]
+#[allow(dead_code)]
+mod js;
 mod learning;
 mod named;
 mod node_load;
@@ -97,7 +102,8 @@ pub use node_types::{NodeAction, NodeLook, NodeUnread, PlaceError, UnknownNode};
 pub use phase::Reported;
 
 use self::ambient::Ambient;
-use self::driver::{Driver, Settings};
+use self::driver::Driver;
+pub(crate) use self::driver::Settings;
 use self::durable::Held;
 use self::engine::Engine;
 use self::report::{Detail, Settled, finished_of, refused_as};
@@ -220,20 +226,36 @@ impl Farm {
     /// The term and the lease epoch are those of the cache's metadata log
     /// ([`MetaLog::leadership`]: its leader's term, and its id) if it has them, and a
     /// new [`process_term`] for both otherwise (see the module docs).
+    ///
+    /// It runs on the core [`crate::SchedulerCore::under_test`] names: the farm's own, and
+    /// the js core in a build with the `farm-core-js` feature.
     #[must_use]
     pub fn new(
         cache: impl Into<Backend>,
         unservable_wait: Duration,
         finished_retention: Duration,
     ) -> Self {
-        let cache = cache.into();
-        let (term, lease_epoch) = cache.leadership().map_or_else(
-            || {
-                let term = process_term();
-                (term, term)
-            },
-            |log| (log.term, log.log_id.get()),
-        );
+        Self::on_core(
+            crate::SchedulerCore::under_test(),
+            cache.into(),
+            unservable_wait,
+            finished_retention,
+        )
+    }
+
+    /// [`Farm::new`] on `core`.
+    #[cfg_attr(not(feature = "farm-core-js"), allow(unused_variables))]
+    pub(crate) fn on_core(
+        core: crate::SchedulerCore,
+        cache: Backend,
+        unservable_wait: Duration,
+        finished_retention: Duration,
+    ) -> Self {
+        #[cfg(feature = "farm-core-js")]
+        if core == crate::SchedulerCore::Js {
+            return Self::new_js(cache, unservable_wait, finished_retention);
+        }
+        let (term, lease_epoch) = Self::terms_of(&cache);
         let sched = Scheduler::new(term)
             .with_load_config(crate::PlacementLoad::Off.config())
             .with_unservable_wait(unservable_wait)
@@ -252,6 +274,18 @@ impl Farm {
                 epoch_unix_ms: unix_ms(),
             },
             epoch,
+        )
+    }
+
+    /// The term and the lease epoch of a new farm over `cache`: its metadata log's, or a new
+    /// process term for both.
+    fn terms_of(cache: &Backend) -> (u64, u64) {
+        cache.leadership().map_or_else(
+            || {
+                let term = process_term();
+                (term, term)
+            },
+            |log| (log.term, log.log_id.get()),
         )
     }
 
@@ -384,6 +418,7 @@ impl Farm {
     /// the interval.
     #[doc(hidden)]
     pub fn write_behind_now(&self) {
+        js_arm!(self, lifecycle::write_behind_now());
         self.lock().write_behind(true);
     }
 
@@ -391,6 +426,7 @@ impl Farm {
     /// scheduler's lock, not the gauge `/metrics` serves, which is a tick old).
     #[must_use]
     pub fn queued_operations(&self) -> u64 {
+        js_arm!(self, views::queued_operations());
         self.lock().engine.sched.queued_len() as u64
     }
 
@@ -398,6 +434,7 @@ impl Farm {
     /// stale or on a fence, records over the cap.
     #[must_use]
     pub fn dropped_writes(&self) -> u64 {
+        js_arm!(self, views::dropped_writes());
         self.lock().engine.write_drops
     }
 
@@ -415,6 +452,7 @@ impl Farm {
     /// farm over the same state store must hold too.
     #[must_use]
     pub fn memory_runs(&self) -> BTreeMap<OperationId, Vec<MemoryRun>> {
+        js_arm!(self, views::memory_runs());
         self.lock().engine.sched.memory_state().runs_by_operation()
     }
 
@@ -423,6 +461,7 @@ impl Farm {
     /// store must hold too.
     #[must_use]
     pub fn avoided(&self) -> BTreeMap<OperationId, BTreeSet<WorkerId>> {
+        js_arm!(self, views::avoided());
         self.lock().engine.sched.avoided()
     }
 
@@ -430,6 +469,7 @@ impl Farm {
     /// (`kbf_front_open_executions`).
     #[must_use]
     pub fn open_executions(&self) -> u64 {
+        js_arm!(self, views::open_executions());
         self.cache.metrics().execute.open_executions.get()
     }
 
@@ -457,6 +497,10 @@ impl Farm {
         outbound: Outbound,
         welcome: ServerMessage,
     ) -> StreamId {
+        js_arm!(
+            self,
+            hot::register(worker, instance, predecessor, reported, outbound, welcome)
+        );
         let now = self.now();
         let mut state = self.lock();
         let stream = StreamId(state.side.next_stream);
@@ -519,6 +563,7 @@ impl Farm {
     /// does not hold there is sent a `Cancel`, so the daemon cleans up after it. A
     /// change into or out of quarantine is logged as an attention item.
     pub fn resize(&self, worker: &WorkerId, stream: StreamId, reported: Reported) {
+        js_arm!(self, hot::resize(worker, stream, reported));
         let now = self.now();
         let mut state = self.lock();
         let (os, arch) = identity(&reported.caps);
@@ -553,6 +598,7 @@ impl Farm {
         stream: StreamId,
         status: NodeStatus,
     ) -> Vec<(bool, String)> {
+        js_arm!(self, views::node_status(worker, stream, status));
         let received = self.ambient.unix_ms();
         let mut state = self.lock();
         if !state.side.is_current(worker, stream) {
@@ -582,6 +628,7 @@ impl Farm {
     /// replaced (a newer stream sends its own), exactly as [`Self::node_status`] keeps a
     /// `NodeStatus`. Returns whether it was kept.
     pub fn update_status(&self, worker: &WorkerId, stream: StreamId, status: UpdateStatus) -> bool {
+        js_arm!(self, views::update_status(worker, stream, status));
         let report = UpdateReport::new(status);
         let mut state = self.lock();
         if !state.side.is_current(worker, stream) {
@@ -594,6 +641,7 @@ impl Farm {
     /// Every node registered since this farm started, as the update node step reads it, in
     /// node-id order.
     pub fn update_look(&self) -> Vec<NodeLook> {
+        js_arm!(self, views::update_look());
         let mut state = self.lock();
         state.side.note_closed_streams();
         let (engine, side) = (&state.engine, &state.side);
@@ -646,6 +694,7 @@ impl Farm {
     /// here; or the store did not take the node's `cordon/` row. In the last two the action is
     /// not applied here either: the row is written first, and the scheduler follows it.
     pub fn place(&self, worker: &WorkerId, action: NodeAction) -> Result<NodeView, PlaceError> {
+        js_arm!(self, lifecycle::place(worker, action));
         let now = self.now();
         let mut state = self.lock();
         state.side.note_closed_streams();
@@ -685,6 +734,7 @@ impl Farm {
     /// answered (nothing is cached), as a heartbeat's are. Logs each drain that has
     /// paused at its deadline, once.
     pub async fn tick(&self) {
+        js_arm_async!(self, hot::tick());
         let now = self.now();
         let settled = {
             let mut state = self.lock();
@@ -716,6 +766,7 @@ impl Farm {
 
 impl Dispatch for Farm {
     fn submit(&self, mut submission: Submission) -> Result<Ticket, Status> {
+        js_arm!(self, hot::submit(submission));
         // The front keys every request by an action; the callers and tickets of the
         // server name that action.
         let key = ActionKey::try_from(&submission.request.key)
@@ -751,7 +802,13 @@ impl Dispatch for Farm {
                 .key()
             })
             .flatten();
-        let held = state.admit(&submission.request, &usage, size_key, now)?;
+        let held = state.admit(
+            &submission.request,
+            &usage,
+            size_key,
+            submission.max_wall,
+            now,
+        )?;
         // The operation this submit queues or joins: the twin the scheduler holds, the one
         // another frontend leases (which the scheduler does not hold), or the next it numbers.
         let twin = state.engine.sched.twin(&submission.request);
@@ -841,6 +898,7 @@ impl Dispatch for Farm {
     /// ([`State::stored_ticket`]); a farm with no store answers none. A name of the old form,
     /// `operations/{term}-{waiter}`, is answered only for a caller this process holds.
     fn wait(&self, name: &str) -> Option<Ticket> {
+        js_arm!(self, hot::wait(name));
         let mut state = self.lock();
         if let Some(operation) = parse_stored_name(name) {
             return state.stored_ticket(operation);
@@ -878,10 +936,11 @@ impl State {
         request: &kbf_sched::Request,
         subject: &crate::action_usage::Subject,
         size_key: Option<u64>,
+        max_wall: Option<Duration>,
         now: FarmTime,
     ) -> Result<Held, Status> {
         self.engine
-            .admit(&mut self.side, request, subject, size_key, now)
+            .admit(&mut self.side, request, subject, size_key, max_wall, now)
     }
 
     /// [`Engine::claim_worker`] with the farm's own side.
@@ -939,6 +998,10 @@ mod learned_tests;
 #[cfg(test)]
 mod placement_tests;
 #[cfg(test)]
+mod storage_down_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod whole_node_recovery_tests;
 #[cfg(test)]
 mod whole_node_tests;

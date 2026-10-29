@@ -99,6 +99,7 @@ impl Farm {
     /// The operations this process settled as failed, per class.
     #[must_use]
     pub(crate) fn failed_actions(&self) -> FailedActions {
+        js_arm!(self, views::failed_actions());
         self.lock().side.failed
     }
 }
