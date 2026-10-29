@@ -144,7 +144,7 @@ fn a_drained_daemon_is_installed_only_once_its_leases_are_zero() {
         [
             "query",
             "check",
-            "drain 4294967295",
+            "drain none",
             "leases",
             "leases",
             "leases",
