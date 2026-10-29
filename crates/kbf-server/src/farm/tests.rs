@@ -75,6 +75,7 @@ fn only_a_taken_or_a_refused_result_is_acknowledged() {
     );
     assert_eq!(Taken::Held.ack(), None);
     assert_eq!(Taken::Dropped.ack(), None);
+    assert_eq!(Taken::Unanswered.ack(), None);
 }
 
 /// Catches: a report the scheduler does not take (its lease is not the operation's

@@ -46,6 +46,10 @@ pub(super) enum Taken {
     Held,
     /// The scheduler took it, and the record was dropped unwritten: never acknowledged.
     Dropped,
+    /// It names the operation's current lease, and the scheduler took no answer from it:
+    /// never acknowledged, so the daemon keeps it and sends it again. A refusal would lose
+    /// it, and leave the lease on the node.
+    Unanswered,
 }
 
 impl Taken {
@@ -55,7 +59,7 @@ impl Taken {
         match self {
             Self::Accepted => Some((true, Reason::Accepted)),
             Self::Refused(reason) => Some((false, reason)),
-            Self::Held | Self::Dropped => None,
+            Self::Held | Self::Dropped | Self::Unanswered => None,
         }
     }
 }
@@ -262,18 +266,22 @@ impl State {
         let rerun = self.runs_recorded(operation) > recorded_before;
         let accepted = rerun || answers.iter().any(|a| a.lease == lease);
         // Not answered: refused, or finished by this lease with the finish waiting for the
-        // store, or with its record dropped unwritten (a finish neither held nor answered).
+        // store, or with its record dropped unwritten (a finish neither held nor answered),
+        // or still the current lease, which the scheduler took no answer from.
         let taken = if accepted {
             Taken::Accepted
         } else {
-            let verdict = self
-                .standing(lease, worker)
-                .err()
-                .unwrap_or(Verdict::Refused(Reason::Stale));
-            match verdict {
-                Verdict::Held => Taken::Held,
-                Verdict::Refused(Reason::Duplicate) => Taken::Dropped,
-                Verdict::Refused(reason) => {
+            match self.standing(lease, worker) {
+                Ok(_) => {
+                    tracing::error!(
+                        %operation, %lease, %worker,
+                        "the scheduler took no answer from the result of the operation's current lease; not acknowledged, so the daemon sends it again"
+                    );
+                    Taken::Unanswered
+                }
+                Err(Verdict::Held) => Taken::Held,
+                Err(Verdict::Refused(Reason::Duplicate)) => Taken::Dropped,
+                Err(Verdict::Refused(reason)) => {
                     ack::log_refusal(worker, lease, reason);
                     Taken::Refused(reason)
                 }
