@@ -110,8 +110,8 @@ pub struct NodeLoadError {
 /// One reading of the node's actions cgroup and of each lease that runs in it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NodeReading {
-    /// What a heartbeat carries of the node. Nothing turns `leases` into fields of this
-    /// message yet. (`NodeReading` is `PartialEq` and not `Eq` because the generated
+    /// What a heartbeat carries of the node. The runtime leaves `lease_clocks` and
+    /// `minutes` empty; the daemon's collector fills them from `leases`. (`NodeReading` is `PartialEq` and not `Eq` because the generated
     /// `NodeLoad` is not `Eq`.)
     pub load: NodeLoad,
     /// Each running lease of the runtime at the reading, in lease order.
