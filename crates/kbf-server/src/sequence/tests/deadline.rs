@@ -32,7 +32,8 @@ async fn at_the_deadline_the_drain_reports_and_goes_on_waiting() {
     assert!(rig.drain.sequence_finished().now_or_never().is_none());
     assert_eq!(rig.drain.phase(), Phase::Draining);
     assert_eq!(errors(&mut inbox), [], "a stream was ended");
-    assert_eq!(text.matches("deadline passed").count(), 1, "{text}");
+    let later = log.text();
+    assert_eq!(later.matches("deadline passed").count(), 1, "{later}");
 
     drop(open);
     rig.drain.sequence_finished().await;
