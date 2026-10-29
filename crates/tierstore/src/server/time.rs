@@ -82,3 +82,33 @@ pub(crate) fn amz_date(ms: u64) -> String {
     let (hour, minute, second) = (c.hour, c.minute, c.second);
     format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
 }
+
+/// The time in milliseconds of an `x-amz-date`, `19700101T000000Z`, if `text` is one.
+pub(crate) fn parse_amz_date(text: &str) -> Option<u64> {
+    let digits = |from: usize, to: usize| text.get(from..to)?.parse::<u32>().ok();
+    let (year, month, day) = (digits(0, 4)?, digits(4, 6)?, digits(6, 8)?);
+    let (hour, minute, second) = (digits(9, 11)?, digits(11, 13)?, digits(13, 15)?);
+    if text.len() != 16 || text.get(8..9) != Some("T") || text.get(15..16) != Some("Z") {
+        return None;
+    }
+    let days = days_from_civil(i64::from(year), month, day);
+    let secs = u64::try_from(days).ok()? * 86_400
+        + u64::from(hour) * 3600
+        + u64::from(minute) * 60
+        + u64::from(second);
+    let millis = secs * 1000;
+    // A date that is not one (the 31st of February, hour 25) does not come back the same.
+    (amz_date(millis) == text).then_some(millis)
+}
+
+/// The count of days since 1970-01-01 of a date (proleptic Gregorian), after Howard Hinnant's
+/// `days_from_civil`.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let yoe = year.rem_euclid(400);
+    let shifted = i64::from(if month > 2 { month - 3 } else { month + 9 });
+    let doy = (153 * shifted + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}

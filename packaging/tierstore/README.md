@@ -84,8 +84,33 @@ the key that `tierstore` checks only if it has exactly those two non-empty field
 file that has another field must be trimmed to be shared. `tierstore` takes the values of the
 JSON form as they are, without trimming. No message of the process carries a secret.
 
-A role belongs to a key, not to a prefix: a read-only key may read every object of the bucket,
-and there is no key yet that may write under one prefix only.
+A role belongs to a key, not to a prefix: a read-only key may read every object of the bucket.
+A write limited to one object under a prefix is a presigned PUT URL (below).
+
+## Presigned PUT URLs
+
+A client that holds a presigned URL writes one object with a plain `PUT` of the URL: the server
+checks SigV4 query-string authentication as the AWS documentation has it (`X-Amz-Algorithm`,
+`X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`, `X-Amz-SignedHeaders`, `X-Amz-Signature`;
+payload `UNSIGNED-PAYLOAD`; `host` signed), so any SDK presigner or `tierstore::server::presign_put`
+makes one. Only a presigning key (`--presign-key-file`, once per key, mode 0600) can sign a URL; the
+full and read-only keys cannot, and a presigning key is refused for any request signed in the
+header. The file holds the key and its ceiling, all required (a file without one is refused at
+start):
+
+```json
+{"access_key_id": "pack-presign", "secret_access_key": "the secret",
+ "ceiling": {"prefix": "cas/b/", "max_expires_secs": 600, "max_object_bytes": 134217728}}
+```
+
+A URL is good for one `PUT` of a key that starts with the prefix (after the path is decoded: no
+`..`, no `.` segment, no control character, never `_journal/` or `_tiering/`), with an
+`X-Amz-Expires` of at most the smaller of `max_expires_secs` and `--presign-max-expires` (default
+15m), and a body of at most `max_object_bytes` (128 MiB at most), checked on `Content-Length` and on
+the bytes received. It is refused from `X-Amz-Date` plus `X-Amz-Expires` on, with no grace. The
+object appears only after a complete body, a second `PUT` of the key is `412`, and no multipart
+call, `If-Match`, read, list or delete is allowed. The signature does not cover the body, so the
+reader of the object must check its content. The query string is never logged.
 
 A secret is never on the command line or in the environment: the process reads no environment
 variable, and the unit sets none.
@@ -100,6 +125,7 @@ The unit's `ExecStart=` is a complete command line. The flags to edit:
 | `--proxy-id` | names this process's journal and its lease in the hot tier; keep it across restarts, and give each process over the same tiers one of its own |
 | `--bucket` | the name of the one bucket clients see |
 | `--access-key-file`, `--read-only-key-file` | the full key, and (given once for each) the read-only keys; see above |
+| `--presign-key-file`, `--presign-max-expires` | a presigning key with its ceiling (given once for each key), and the longest expiry of any URL; see Presigned PUT URLs |
 | `--hot`, `--cold` | the tiers: `s3:<bucket>` for a bucket of an S3-compatible store (also `dir:<path>` and `memory`; a `dir:` path must also be writable under `ProtectSystem=strict`, so add it to `ReadWritePaths=`) |
 | `--hot-endpoint`, `--cold-endpoint` | where the tier's store is, `http://host[:port]` (TLS is not built yet); `--hot-region` and `--cold-region` set the signing region of a tier, `us-east-1` if not given |
 | `--hot-bytes` | the bytes the hot tier is meant to hold; the water marks are shares of it (`--high-water`, `--low-water`, `--critical`) |

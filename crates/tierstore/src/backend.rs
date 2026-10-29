@@ -175,6 +175,23 @@ pub trait Backend: Send + Sync {
         self.put(key, whole.freeze()).await
     }
 
+    /// [`Backend::put_stream`] for a writer that cannot be trusted to race: a backend with more
+    /// than one tier writes the object to its first tier only, and answers [`Error::Full`] and
+    /// stores nothing when that tier has no room (whatever part of the body it took), so that one
+    /// create-only write into one tier decides which of two concurrent puts of a key wins. The
+    /// default is [`Backend::put_stream`], for a backend with one place to put an object.
+    ///
+    /// # Errors
+    /// As [`Backend::put_stream`].
+    async fn put_stream_hot_only(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        self.put_stream(key, len, body).await
+    }
+
     /// Replaces the object, only if its content tag is `etag` (`If-Match`), and gives the
     /// content tag of the new object.
     ///

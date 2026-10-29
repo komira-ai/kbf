@@ -15,6 +15,7 @@ use crate::{ByteRange, Error, Meta};
 
 use super::Server;
 use super::handover::hand_over;
+use super::presign::Grant;
 use super::reply::{Answer, S3Error, answer, xml_answer};
 use super::request::{BoxError, Check, Query, Reader, Refused, Target, header, pieces};
 use super::time::http_date;
@@ -33,6 +34,17 @@ const SUPPORTED: [&str; 9] = [
     "uploadId",
     "uploads",
     "x-id",
+];
+
+/// The query parameters of SigV4 query-string authentication, which only a presigned request
+/// carries: the check of the signature has read them, and they are not parameters of a call.
+const PRESIGN_PARAMS: [&str; 6] = [
+    "X-Amz-Algorithm",
+    "X-Amz-Credential",
+    "X-Amz-Date",
+    "X-Amz-Expires",
+    "X-Amz-SignedHeaders",
+    "X-Amz-Signature",
 ];
 
 /// The query parameters that make a request part of a multipart upload.
@@ -100,8 +112,10 @@ fn refuse_reserved(key: &str) -> Result<(), S3Error> {
 
 /// Refuses what this front does not do whatever the call is: a query parameter it does not
 /// know, and a copy.
-fn refuse_unsupported(parts: &Parts, query: &Query) -> Result<(), S3Error> {
-    if !query.only(&SUPPORTED) {
+fn refuse_unsupported(parts: &Parts, query: &Query, presigned: bool) -> Result<(), S3Error> {
+    let extra: &[&str] = if presigned { &PRESIGN_PARAMS } else { &[] };
+    let allowed: Vec<&str> = SUPPORTED.iter().chain(extra).copied().collect();
+    if !query.only(&allowed) {
         return Err(S3Error::unsupported(
             "this query parameter is not supported",
         ));
@@ -220,13 +234,14 @@ impl Server {
         query: &Query,
         reader: Reader<B>,
         check: Check,
+        presign: Option<&Grant>,
     ) -> Result<Answer, S3Error>
     where
         B: Body + Send,
         B::Data: Send,
         B::Error: Into<BoxError>,
     {
-        refuse_unsupported(parts, query)?;
+        refuse_unsupported(parts, query, presign.is_some())?;
         let method = parts.method.as_str();
         let multipart = query.has_any(&MULTIPART);
         if let ("PUT", Target::Object(key), true) = (method, &target, multipart) {
@@ -239,7 +254,7 @@ impl Server {
         {
             let declared = header(&parts.headers, "content-length");
             let len = declared.and_then(|text| text.parse().ok());
-            return self.put_streamed(key, len, reader, check).await;
+            return self.put_streamed(key, len, reader, check, presign).await;
         }
         let body = reader.read_all(check).await?;
         match (method, target, multipart) {
@@ -311,8 +326,14 @@ impl Server {
     /// (413, so that nothing is stored and no upload is begun), and one that comes when the
     /// server is taking as many as it may (503 `SlowDown`, with `Retry-After`). Gives the
     /// permit that is held until the body is stored or refused.
-    fn admit(&self, len: Option<u64>) -> Result<OwnedSemaphorePermit, S3Error> {
+    fn admit(
+        &self,
+        len: Option<u64>,
+        presign: Option<&Grant>,
+    ) -> Result<OwnedSemaphorePermit, S3Error> {
         let limit = self.config.max_request_bytes;
+        let cap = presign.map_or(u64::MAX, |grant| grant.max_object_bytes);
+        let limit = limit.min(usize::try_from(cap).unwrap_or(usize::MAX));
         match len {
             None if self.backend.needs_length() => return Err(S3Error::length_required()),
             Some(declared) if declared > limit as u64 => return Err(S3Error::too_large(limit)),
@@ -341,6 +362,7 @@ impl Server {
         len: Option<u64>,
         reader: Reader<B>,
         check: Check,
+        presign: Option<&Grant>,
     ) -> Result<Answer, S3Error>
     where
         B: Body + Send,
@@ -348,13 +370,18 @@ impl Server {
         B::Error: Into<BoxError>,
     {
         refuse_reserved(key)?;
-        let permit = self.admit(len)?;
+        let permit = self.admit(len, presign)?;
+        let hot_only = presign.is_some();
         let refused = Refused::default();
         let (carry, body) = hand_over(pieces(reader, check, refused.clone()));
         let (backend, name) = (Arc::clone(&self.backend), key.to_owned());
         let mut storing = tokio::spawn(async move {
             let _permit = permit;
-            backend.put_stream(&name, len, body).await
+            if hot_only {
+                backend.put_stream_hot_only(&name, len, body).await
+            } else {
+                backend.put_stream(&name, len, body).await
+            }
         });
         let early = tokio::select! {
             biased;
@@ -455,7 +482,7 @@ impl Server {
         if !(1..=PART_LIMIT).contains(&number) {
             return Err(S3Error::invalid("a part number is from 1 to 10000"));
         }
-        let _permit = self.admit(len)?;
+        let _permit = self.admit(len, None)?;
         let refused = Refused::default();
         let body = pieces(reader, check, refused.clone());
         let backend = &self.backend;

@@ -10,10 +10,11 @@ use aws_sdk_s3::config::{
     Builder, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
 };
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, EncodingType};
 use aws_sdk_s3::{Client, Config};
-use tierstore::server::AccessKey;
+use tierstore::server::{AccessKey, Grant, PresignKey};
 
 use crate::files::Files;
 use crate::support::{BUCKET, Harness, KEY_ID, SECRET};
@@ -398,4 +399,60 @@ async fn sdk_default_checksums_on_a_streamed_body_are_refused() {
         .send()
         .await;
     assert!(kept.unwrap_err().into_service_error().is_not_found());
+}
+
+/// Asserts that a URL made by the stock presigner of the SDK (`PresigningConfig`, which signs the
+/// `x-id=PutObject` query parameter it adds) with the credentials of a presigning key is accepted
+/// by the front when it is sent by plain HTTP with no SDK, with the headers the presigner says
+/// to send: 200 and the object is stored, and the same URL used again is 412 with the first body
+/// kept. A presigner nobody here wrote is what shows the check follows SigV4 and is not only
+/// consistent with the code that makes URLs.
+#[tokio::test]
+async fn a_url_from_the_stock_presigner_is_accepted_once() {
+    let grant = Grant {
+        prefix: "cas/b/".to_owned(),
+        max_expires_secs: 600,
+        max_object_bytes: 1 << 20,
+    };
+    let key = PresignKey::new("AKIDSDKPRESIGN", "sdk-presign-secret", grant).unwrap();
+    let h = Harness::start(move |config| config.presign_keys = vec![key]).await;
+    let presigner =
+        Client::from_conf(settings(&h, ("AKIDSDKPRESIGN", "sdk-presign-secret")).build());
+    let expires = PresigningConfig::expires_in(std::time::Duration::from_secs(300)).unwrap();
+    let presigned = presigner
+        .put_object()
+        .bucket(BUCKET)
+        .key("cas/b/build-1/nonce")
+        .presigned(expires)
+        .await
+        .unwrap();
+    assert_eq!(presigned.method(), "PUT");
+    assert!(
+        presigned.uri().contains("x-id=PutObject"),
+        "{}",
+        presigned.uri()
+    );
+    let http = reqwest::Client::new();
+    let send = |body: &'static str| {
+        let mut request = http.put(presigned.uri()).body(body);
+        for (name, value) in presigned.headers() {
+            request = request.header(name, value);
+        }
+        request.send()
+    };
+    let first = send("pack").await.unwrap();
+    assert_eq!(first.status(), 200, "{}", first.text().await.unwrap());
+    let second = send("other").await.unwrap();
+    assert_eq!(second.status(), 412);
+    let kept = client(&h)
+        .get_object()
+        .bucket(BUCKET)
+        .key("cas/b/build-1/nonce")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        kept.body.collect().await.unwrap().into_bytes().as_ref(),
+        b"pack"
+    );
 }

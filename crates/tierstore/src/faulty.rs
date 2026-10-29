@@ -213,6 +213,17 @@ impl Backend for FaultyBackend {
         self.inner.put_stream(key, len, body).await
     }
 
+    /// As `put_stream`, a call of kind [`Op::Put`].
+    async fn put_stream_hot_only(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        self.enter(Op::Put, key).await?;
+        self.inner.put_stream_hot_only(key, len, body).await
+    }
+
     async fn put_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<String, Error> {
         self.enter(Op::PutIfMatch, key).await?;
         self.inner.put_if_match(key, body, etag).await
