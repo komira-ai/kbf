@@ -360,15 +360,22 @@ pub(crate) async fn write_learned(core: &Core<KbfAdapter>, gate: &Gate, tick: bo
 /// so on a runtime of one thread the gate is free here and on a runtime of many a writer that
 /// holds it is a few store calls from letting go: waiting for it needs no runtime.
 pub(crate) fn write_behind_now(core: &Core<KbfAdapter>, gate: &Gate) {
-    let _writer = loop {
-        if let Ok(held) = gate.0.try_lock() {
-            break held;
-        }
-        std::thread::yield_now();
-    };
+    let _writer = hold(gate, std::thread::yield_now);
     write_taken(core, Take::Now);
 }
 
+/// Takes the gate without awaiting, calling `waiting` each time another writer holds it.
+pub(super) fn hold<'g>(
+    gate: &'g Gate,
+    mut waiting: impl FnMut(),
+) -> tokio::sync::MutexGuard<'g, ()> {
+    loop {
+        if let Ok(held) = gate.0.try_lock() {
+            return held;
+        }
+        waiting();
+    }
+}
 /// Takes what `take` says under the core's lock and writes it, with no hold of the core's lock
 /// across a store call. The caller holds the gate.
 fn write_taken(core: &Core<KbfAdapter>, take: Take) {
