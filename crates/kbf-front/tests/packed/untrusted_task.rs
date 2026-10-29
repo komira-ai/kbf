@@ -653,14 +653,15 @@ async fn a_pack_that_is_not_laid_out_is_malformed() {
 }
 
 /// Asserts that a record whose bytes are not its digest is a `HashMismatch` and indexes nothing:
-/// a flipped byte in a blob, and in the manifest itself. Catches a record taken on the word of
-/// the footer.
+/// a flipped byte in a blob, in a tree (checked before the commit), and in the manifest itself.
+/// Catches a record taken on the word of the footer.
 #[tokio::test]
 async fn a_record_that_is_not_its_digest_is_a_hash_mismatch() {
     let probe = Farm::new().await;
     let honest = probe.pack(0);
     let manifest_len = probe.manifest(0).to_json().expect("json").len();
-    for at in [manifest_len + 3, 5] {
+    let tree_at = manifest_len + OBJECT.len() + STDOUT.len() + 2;
+    for at in [manifest_len + 3, 5, tree_at] {
         let farm = Farm::new().await;
         let mut bytes = honest.clone();
         bytes[at] ^= 0xff;

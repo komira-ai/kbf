@@ -18,22 +18,39 @@
 //! 4. **The manifest.** The record at offset 0 is read, checked against its CRC and digest, and
 //!    parsed. It must be for this lease and this action, and every digest it names must be a
 //!    record of the pack (or the empty blob, which has no record).
-//! 5. **Every byte.** The footer is turned into the pack's manifest for
+//! 5. **The trees.** Each output directory's `Tree` is read from the pack itself (its record is
+//!    at the offset and size of its footer entry), checked against its CRC and SHA-256, decoded
+//!    (a record is at most the cap of a record), and every file it names must be a record of the
+//!    pack as well, or the empty blob. This is before anything is recorded: a hollow or damaged
+//!    tree leaves nothing indexed.
+//! 6. **Every byte.** The footer is turned into the pack's manifest for
 //!    [`Packs::commit_untrusted_pack`], which hashes every record and records the pack where it
 //!    lies. Nothing a manifest says is believed beyond this: it names digests, the pack's own
 //!    hashing says the records are those digests.
-//! 6. **The trees.** Each output directory's `Tree` is read back (it is hashed now) and every
-//!    file it names must be a record of the pack as well.
 //! 7. **The result** is rebuilt from the manifest's now-verified digests, sorted by path, with
 //!    no execution metadata (the task's timings are advisory and not carried). It is written to
 //!    the action cache only if the action exited 0 and its Action does not say `do_not_cache`,
 //!    by the same two calls a daemon's result takes ([`Backend::prepare_action_result`] and
 //!    [`Backend::commit_action_record`]); a failed action is reported and not cached.
 //!
-//! A refusal indexes nothing before step 5; one at step 6 leaves a recorded pack with no
-//! action-cache entry, which is harmless (its blobs are readable and a re-run finds them).
-//! What is not decided here: whether the paths are the Command's declared outputs (the executor
-//! knows the Command), and a replaced object (the store's create-only write is the guard).
+//! A refusal at steps 1 to 5 indexes nothing; one at step 6 (a record that is not its digest, a
+//! key recorded before with another pack) records nothing new. A failure of the action cache at
+//! step 7 leaves a recorded pack with no action-cache entry, which is harmless (its blobs are
+//! readable and a re-run finds them).
+//!
+//! What is not decided here:
+//!
+//! - **The age of the key.** [`PackKeyMint::verify`] says the minute a key was minted in, and
+//!   `ingest` enforces no age: the executor knows the run's wall time and decides when a key has
+//!   expired.
+//! - Whether the paths are the Command's declared outputs (the executor knows the Command).
+//! - A replaced object (the store's create-only write is the guard).
+//!
+//! The `backend` must be built over the same [`Packs`] as `packs`
+//! (`Backend::remote_over(node, Some(packs))`): the Action it reads to decide on caching may be a
+//! blob a frontend keeps in a pack, which a backend over other packs, or none, does not find (the
+//! ingest is then `Unavailable`). The trees do not need it: they are read from the task's pack.
+//! The wiring of the executor builds the backend so.
 
 use std::collections::BTreeSet;
 
@@ -225,12 +242,12 @@ impl Ingest<'_> {
         {
             return Err(RejectReason::Incomplete.into());
         }
+        self.trees_held(object, &manifest, &footer, &held).await?;
         let pack = new_pack(self.key, &footer, size);
         let recorded = self
             .packs
             .commit_untrusted_pack(self.key, pack, self.limits);
         recorded.await?;
-        self.trees_held(&manifest, &held).await?;
         let result = rebuilt(&manifest);
         let cached = self.cached(&result, manifest.exit_code).await?;
         Ok((result, cached))
@@ -295,9 +312,17 @@ impl Ingest<'_> {
         Ok(manifest)
     }
 
-    /// Checks that every file of every output tree is a record of the pack. The trees are read
-    /// back through the frontend, which hashes them: after the commit they are the pack's own.
-    async fn trees_held(&self, manifest: &TaskManifest, held: &BTreeSet<Digest>) -> Step<()> {
+    /// Checks that every file of every output tree is a record of the pack, reading each tree
+    /// from the pack itself: its record is verified against its footer entry (length, CRC and
+    /// SHA-256), and decoded (it is at most the cap of a record). This is before the commit, so a
+    /// pack with a hollow or damaged tree indexes nothing.
+    async fn trees_held(
+        &self,
+        object: &ObjectKey,
+        manifest: &TaskManifest,
+        footer: &Footer,
+        held: &BTreeSet<Digest>,
+    ) -> Step<()> {
         let trees: BTreeSet<Digest> = manifest
             .output_directories
             .iter()
@@ -305,10 +330,20 @@ impl Ingest<'_> {
             .filter(|tree| tree.size_bytes != 0)
             .collect();
         let mut files = Closure::new();
-        for tree in &trees {
-            let bytes = self.backend.read_blob(tree).await;
-            let bytes = bytes.map_err(|error| unavailable(&format!("the tree {tree}: {error}")))?;
-            closure::add_tree(&mut files, tree, bytes).map_err(|_| RejectReason::BadManifest)?;
+        for entry in footer
+            .entries()
+            .iter()
+            .filter(|entry| trees.contains(&entry.digest))
+        {
+            let range = entry.range();
+            let record = self
+                .read(object, range.start, range.end - range.start)
+                .await?;
+            entry
+                .verify(&record)
+                .map_err(|_| RejectReason::HashMismatch)?;
+            closure::add_tree(&mut files, &entry.digest, record)
+                .map_err(|_| RejectReason::BadManifest)?;
         }
         if files.iter().any(|digest| !held.contains(digest)) {
             return Err(RejectReason::Incomplete.into());
