@@ -598,3 +598,19 @@ async fn only_the_query_authentication_parameters_are_taken_on_a_presigned_reque
     }
     assert!(!f.holds("cas/a/h").await);
 }
+
+/// Asserts that a presigned PUT whose declared length is over the cap of its key is answered 413
+/// before any byte of the body is read: the body of this request fails when it is read, so a
+/// 400 (`IncompleteBody`) in its place would mean the body was read first. Nothing is stored,
+/// and the proxy is not asked for a put.
+#[tokio::test(start_paused = true)]
+async fn a_presigned_put_over_the_cap_is_413_before_the_body_is_read() {
+    let f = fixture().await;
+    let url = put_url("cas/b/big", 300);
+    let (parts, _) = request_for("PUT", &url, &[("content-length", "17")], b"").into_parts();
+    let failing = Scripted::new(vec![Step::Fail]);
+    let reply = f.rig.send_raw(Request::from_parts(parts, failing)).await;
+    assert_eq!(refused(&reply), (413, "EntityTooLarge".to_owned()));
+    assert!(!f.holds("cas/b/big").await);
+    assert_eq!(f.rig.hot.calls(Op::Put), 0);
+}

@@ -37,6 +37,20 @@
 //! answers it is sending for at most `--drain-deadline`, gives the reconciler's lease up and
 //! exits with status 0. A start that fails exits with status 1. Flags that are not valid exit
 //! with status 2: those the parser refuses, and two keys that have one id.
+//!
+//! Before it opens the proxy or binds the address, the process asks each tier the questions its
+//! guarantees rest on (see [`self_test`]) under a probe key in `_tiering/selftest/` that is
+//! new for each start and deleted afterwards. A tier that answers one wrongly (a create-only put
+//! that overwrites, an `If-Match` that is ignored, a range answered with the whole object, a
+//! head with no `Last-Modified`, a listing that ignores `start-after`, and on the cold tier a
+//! multipart completion that overwrites) is not served over: the process says which tier, which
+//! check and what the tier answered, and exits with status 3. A tier that cannot be reached (an
+//! error that says it is down, 503, a timeout) is asked again, after pauses from one second doubling
+//! to thirty, for `--backend-check-wait` (five minutes by default; each tier has all of it), and
+//! then the start exits with status 1 and `tier unreachable: <tier>: <error>`. A tier that is full starts: the checks that
+//! need a write are skipped, with a line that says so. `--skip-backend-check` leaves the
+//! multipart-completion check out, for a reason that is logged at the start; no other check can
+//! be left out.
 
 use std::ffi::OsString;
 use std::future::Future;
@@ -45,7 +59,7 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use tokio::net::TcpListener;
@@ -53,8 +67,8 @@ use tokio::sync::Notify;
 
 use crate::s3::{Capabilities, Credentials, S3Config};
 use crate::{
-    Backend, Clock, DirBackend, MemoryBackend, Proxy, ProxyConfig, Reconciler, ReconcilerConfig,
-    S3Backend, SystemClock,
+    Backend, Check, Clock, DirBackend, MemoryBackend, Proxy, ProxyConfig, Reconciler,
+    ReconcilerConfig, S3Backend, SelfTestError, SelfTestOptions, SystemClock, self_test,
 };
 
 use super::keys::{ensure_distinct, read_credentials, read_only_keys};
@@ -71,6 +85,12 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 struct InvalidFlags(String);
 
 const DEFAULT_MAX_REQUEST_BYTES: u64 = 256 << 20;
+
+/// The streamed bodies taken at once: 32 of them hold at most 32 x (16 MiB + a few pieces).
+const DEFAULT_MAX_CONCURRENT_PUTS: u32 = 32;
+
+/// The least average rate of a body, in bytes a second.
+const DEFAULT_PUT_MIN_BYTES_PER_SEC: u64 = 1024;
 
 /// The signing region of an S3 tier whose region is not given.
 const DEFAULT_REGION: &str = "us-east-1";
@@ -209,22 +229,103 @@ pub struct Cli {
     /// How often the reconciler works: shorter than `--lease-ttl`.
     #[arg(long, default_value = "5s", value_parser = parse_duration)]
     pub reconcile_interval: Duration,
-    /// The largest body of a request, in bytes: the largest object, and the largest part of a
-    /// multipart upload.
+    /// The longest body of a request, in bytes: the longest object, and the longest part of a
+    /// multipart upload. An upper bound on the length of what is streamed, not a bound on
+    /// memory: the body of a put or of a part is passed on to the tiers as it arrives and is
+    /// never held whole. A body over it is refused with 413 and nothing is stored; a request
+    /// that says in its `Content-Length` that its body is longer is refused before any byte of
+    /// it is read.
     #[arg(
         long,
         default_value_t = DEFAULT_MAX_REQUEST_BYTES,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub max_request_bytes: u64,
+    /// The most put bodies and upload parts taken at once. One more is answered 503 `SlowDown`
+    /// with `Retry-After: 1` and its body is not read. A body in flight holds a few pieces of
+    /// at most the size the connection delivers (tens of KiB), and an S3 tier up to 16 MiB
+    /// more, so 32 bodies hold about half a GiB at most, with S3 tiers, and a few MiB with
+    /// directory tiers.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_CONCURRENT_PUTS,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub max_concurrent_puts: u32,
+    /// The least average rate, in bytes a second, at which a request body may come in, counted
+    /// over the time the server spends waiting for the client to send the next piece, once that
+    /// time has passed `--put-rate-grace`. Time the server spends not waiting for the client (a
+    /// tier that is slow to answer or to take the body) is not counted. A slower body is
+    /// answered 400 `RequestTimeout`, nothing of it is stored and the upload it began at an S3
+    /// tier is aborted. It ends senders that send a byte inside every idle timeout. 0 turns
+    /// it off.
+    #[arg(long, default_value_t = DEFAULT_PUT_MIN_BYTES_PER_SEC)]
+    pub put_min_bytes_per_sec: u64,
+    /// How much time spent waiting for the client a body is let to go before
+    /// `--put-min-bytes-per-sec` is held to it: a number and `ms`, `s`, `m` or `h`.
+    #[arg(long, default_value = "30s", value_parser = parse_duration)]
+    pub put_rate_grace: Duration,
     /// How long a request body may go without a byte arriving, and how long a client may go
     /// without taking a byte of an answer, before the request ends: a number and `ms`, `s`,
-    /// `m` or `h`. A body that arrives slowly but steadily is never cut, however long the whole
-    /// takes. A request whose body stalls is answered 400 `RequestTimeout` and its connection
+    /// `m` or `h`. A body that arrives slowly but steadily is not cut by this timeout, however long
+    /// the whole takes (`--put-min-bytes-per-sec` sets the slowest rate it is let to have). A request whose body stalls is answered 400 `RequestTimeout` and its connection
     /// is closed; a connection whose client stops reading an answer is closed. Both are
     /// logged on stderr, and a drain waits no longer than this for a stalled client.
     #[arg(long, default_value = "30s", value_parser = parse_duration)]
     pub body_idle_timeout: Duration,
+    /// Leaves the multipart-completion check of the start-up self-test out, for a reason:
+    /// `multipart-conditional=REASON`, where REASON says why the store cannot pass it (for
+    /// example `multipart-conditional=store-ignores-if-none-match-on-completion`). It is the
+    /// only check that can be left out: the others test the guarantees the proxy, the lease and
+    /// the journal stand on, and any other name is refused as a usage error. The reason is
+    /// written to stderr at every start. Without the check, a multipart upload may replace an
+    /// object that exists: leave it out only for a store you have shown to be safe another way.
+    /// None is skipped by default.
+    #[arg(long, value_name = "CHECK=REASON", value_parser = parse_skip)]
+    pub skip_backend_check: Vec<SkippedCheck>,
+    /// How long the start-up self-test asks again of a tier that does not answer (down, a
+    /// timeout, a 503 or another 5xx but 501 and 507), with pauses that double from one second
+    /// to thirty, before the start fails with status 1 (and the unit starts it again): a number
+    /// and `ms`, `s`, `m` or `h`. Each tier has the whole of it. `0s` asks once. A tier that
+    /// answers wrongly is not asked again.
+    #[arg(long, default_value = "5m", value_parser = parse_duration)]
+    pub backend_check_wait: Duration,
+}
+
+/// A check of the self-test that the operator leaves out, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedCheck {
+    /// The check left out.
+    pub check: Check,
+    /// The reason given, never empty.
+    pub reason: String,
+}
+
+/// A skipped check: `multipart-conditional`, `=`, and a reason that is not empty. Any other
+/// check is refused.
+fn parse_skip(text: &str) -> Result<SkippedCheck, String> {
+    let names: Vec<&str> = Check::ALL.iter().map(|check| check.name()).collect();
+    let usage = format!(
+        "{text:?} is not CHECK=REASON; the checks are {}",
+        names.join(", ")
+    );
+    let (name, reason) = text.split_once('=').ok_or_else(|| usage.clone())?;
+    let check = Check::parse(name).ok_or(usage)?;
+    if check != Check::MultipartConditional {
+        return Err(format!(
+            "the {name} check cannot be skipped: only multipart-conditional can"
+        ));
+    }
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(format!(
+            "the skipped check {name} needs a reason after the ="
+        ));
+    }
+    Ok(SkippedCheck {
+        check,
+        reason: reason.to_owned(),
+    })
 }
 
 /// A duration: a whole number of `ms`, `s`, `m` or `h`, such as `250ms` or `15m`.
@@ -410,6 +511,9 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     server.region = cli.region.clone();
     server.max_request_bytes = usize::try_from(cli.max_request_bytes).unwrap_or(usize::MAX);
     server.body_idle_timeout = cli.body_idle_timeout;
+    server.max_concurrent_puts = cli.max_concurrent_puts as usize;
+    server.put_min_bytes_per_sec = cli.put_min_bytes_per_sec;
+    server.put_rate_grace = cli.put_rate_grace;
     server.drain_lb_wait = cli.drain_lb_wait;
     server.drain_deadline = cli.drain_deadline;
     let mut proxy = ProxyConfig::new(&cli.proxy_id, cli.hot_bytes, Arc::clone(&clock));
@@ -459,20 +563,95 @@ pub(crate) async fn reconcile(mut reconciler: Reconciler, interval: Duration, ha
     let _ = tokio::time::timeout(STOP_WAIT, reconciler.stop()).await;
 }
 
-/// Opens the proxy and serves it until `stop` resolves, and then drains.
-///
-/// `ready` is called with the address the server is bound to, before the first request is
-/// taken. Returns when the drain is over.
+/// The id of a start for the probe keys of its self-test: the proxy id (with any character a
+/// key cannot carry replaced by `_`), the time of the start and the process id, so that two
+/// starts never share a probe key.
+fn probe_run_id(proxy_id: &str, now: u64, process: u32) -> String {
+    let safe = |c: char| {
+        if c.is_ascii_alphanumeric() || c == '-' {
+            c
+        } else {
+            '_'
+        }
+    };
+    let proxy: String = proxy_id.chars().map(safe).collect();
+    format!("{proxy}-{now}-{process}")
+}
+
+/// The pause before the first repeat of a check of the self-test that could not reach its tier;
+/// each repeat waits twice as long as the one before.
+const SELF_TEST_FIRST_PAUSE: Duration = Duration::from_secs(1);
+
+/// The longest pause between two attempts at a tier the self-test could not reach.
+const SELF_TEST_MAX_PAUSE: Duration = Duration::from_secs(30);
+
+/// Asks each tier the questions of the self-test, the hot tier first, and says on stderr which
+/// checks the flags leave out, a line before and after each tier with how long it took, and
+/// what the test notes (a check skipped because the tier is full, an attempt repeated, a probe key
+/// not deleted). The cold tier is also asked about multipart uploads. A tier that did not answer
+/// is asked again, after pauses from one second doubling to thirty, for `wait` (each tier has the
+/// whole of it).
 ///
 /// # Errors
-/// A flag that is not valid with the others, a key file or a tier that cannot be used, a proxy
-/// that cannot be opened, or an address that cannot be bound.
+/// The [`SelfTestError`] of the first tier to answer a check wrongly (a violation: exit status 3)
+/// or not to answer within `wait` (unreachable: exit status 1).
+async fn probe_tiers(
+    cli: &Cli,
+    hot: &dyn Backend,
+    cold: &dyn Backend,
+    wait: Duration,
+) -> Result<(), Error> {
+    let mut skip = Vec::new();
+    for skipped in &cli.skip_backend_check {
+        eprintln!(
+            "tierstore: skipping the {} check of the tiers: {}",
+            skipped.check, skipped.reason
+        );
+        skip.push(skipped.check);
+    }
+    let run_id = probe_run_id(&cli.proxy_id, SystemClock.now(), std::process::id());
+    let hot_name = format!("hot tier {}", cli.hot);
+    let cold_name = format!("cold tier {}", cli.cold);
+    let tiers = [(&hot_name, hot, false), (&cold_name, cold, true)];
+    for (name, backend, multipart) in tiers {
+        let options = SelfTestOptions {
+            name,
+            run_id: &run_id,
+            multipart,
+            skip: &skip,
+            wait,
+            pause: SELF_TEST_FIRST_PAUSE,
+            max_pause: SELF_TEST_MAX_PAUSE,
+        };
+        let note = |line: String| eprintln!("tierstore: {line}");
+        eprintln!("tierstore: testing the {name}");
+        let started = Instant::now();
+        let outcome = self_test(backend, &options, &note).await;
+        let took = started.elapsed().as_millis();
+        eprintln!("tierstore: tested the {name} in {took} ms");
+        outcome?;
+    }
+    Ok(())
+}
+
+/// Opens the proxy and serves it until `stop` resolves, and then drains.
+///
+/// The tiers are tested first (see [`self_test`]): a tier that fails is an error before the
+/// proxy is opened or the address bound. `ready` is called with the address the server is bound
+/// to, before the first request is taken. Returns when the drain is over.
+///
+/// # Errors
+/// A flag that is not valid with the others, a key file or a tier that cannot be used, a tier
+/// that fails the self-test (a [`SelfTestError`]), a proxy that cannot be opened, or an address
+/// that cannot be bound.
 pub async fn run(
     cli: &Cli,
     stop: impl Future<Output = ()> + Send + 'static,
     ready: impl FnOnce(SocketAddr),
 ) -> Result<Drained, Error> {
     let built = build(cli)?;
+    let (hot, cold) = (built.hot.as_ref(), built.cold.as_ref());
+    probe_tiers(cli, hot, cold, cli.backend_check_wait).await?;
     let (hot, cold) = (Arc::clone(&built.hot), Arc::clone(&built.cold));
     let opened = Proxy::open(hot, cold, built.proxy).await;
     let proxy = opened.map_err(|why| format!("opening the proxy: {why}"))?;
@@ -552,9 +731,21 @@ pub fn main(args: Vec<OsString>) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(why) => {
             eprintln!("tierstore: {why}");
-            let invalid = why.downcast_ref::<InvalidFlags>().is_some();
-            ExitCode::from(if invalid { 2 } else { 1 })
+            ExitCode::from(exit_status(&why))
         }
+    }
+}
+
+/// The exit status of a start that failed: 2 for flags that cannot go together, 3 for a tier
+/// that answered the self-test wrongly, 1 for anything else (a tier that could not be reached
+/// among it: a restart may mend that).
+fn exit_status(why: &Error) -> u8 {
+    if why.downcast_ref::<InvalidFlags>().is_some() {
+        return 2;
+    }
+    match why.downcast_ref::<SelfTestError>() {
+        Some(SelfTestError::Violation(_)) => 3,
+        Some(SelfTestError::Unreachable { .. }) | None => 1,
     }
 }
 

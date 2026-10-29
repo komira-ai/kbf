@@ -2,7 +2,8 @@
 //! ByteStream of a proxy given packs, in front of a storage node (a real one, or the fake node
 //! that streams), an in-memory pack index and an in-memory object store that count what they
 //! are asked and fail when told to; the action-cache hits such a proxy checks against the
-//! index (`closure`); and the commits of packs that daemons stored (`commit`).
+//! index (`closure`); the commits of packs that daemons stored (`commit`); and the commits of packs
+//! that builds wrote through presigned writes (`untrusted`).
 //!
 //! Every test says the behaviour it asserts.
 
@@ -15,3 +16,4 @@ mod closure;
 mod commit;
 mod store;
 mod support;
+mod untrusted;

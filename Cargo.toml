@@ -18,6 +18,14 @@ publish = false
 # `Io` and `Spawner` of the `runc` client (below) are async traits; the container driver
 # implements both. Already in the tree through runc.
 async-trait = "0.1.92"
+# A stock S3 SDK, to prove it works against the tierstore S3 front (tierstore's tests only).
+# Pinned exactly, so that the test is of one SDK version. No default features: the default
+# HTTP client brings a TLS provider (aws-lc), which the front, plain HTTP, does not need; the
+# HTTP client below has no TLS either. Apache-2.0.
+aws-sdk-s3 = { version = "=1.96.0", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+# The SDK's own hyper-based HTTP client, built without TLS (`build_http`) for a plain-HTTP
+# endpoint. Apache-2.0.
+aws-smithy-http-client = { version = "1.1.4", default-features = false, features = ["default-client"] }
 # The operator API's HTTP server (kbf-server). Already in the tree through tonic; no
 # default features: no form, query or json extractors, whose parsers are not needed.
 axum = { version = "0.8.9", default-features = false }
@@ -229,6 +237,7 @@ kbf-host = { path = "crates/kbf-host" }
 kbf-installer = { path = "crates/kbf-installer" }
 kbf-invocation = { path = "crates/kbf-invocation" }
 kbf-integration-test = { path = "crates/kbf-integration-test" }
+kbf-lease-client = { path = "crates/kbf-lease-client" }
 kbf-log = { path = "crates/kbf-log" }
 kbf-map = { path = "crates/kbf-map" }
 kbf-mapsync = { path = "crates/kbf-mapsync" }

@@ -99,6 +99,9 @@ pub struct Listeners {
     pub scheduler_core: crate::SchedulerCore,
     /// Whether placement reads the load the nodes report (`--placement-load`).
     pub placement_load: crate::PlacementLoad,
+    /// Whether the scheduler is given the estimator's prediction of a new operation's cost
+    /// (`--placement-predictions`).
+    pub placement_predictions: crate::PlacementPredictions,
     /// The whole-node settings of the scheduler, if on (`--whole-node-max`).
     pub whole_node: Option<kbf_sched::WholeNodeConfig>,
     /// How long a finished operation is kept after its callers are answered, in which

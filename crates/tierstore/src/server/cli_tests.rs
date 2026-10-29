@@ -11,15 +11,16 @@ use clap::{CommandFactory, Parser};
 use kbf_testkit::dir::TestDir;
 use tokio::sync::Notify;
 
+use crate::selftest_tests::{Flaw, Flawed};
 use crate::server::{AccessKey, Drained};
 use crate::{
-    Backend, FaultyBackend, MemoryBackend, Op, Proxy, ProxyConfig, Reconciler, ReconcilerConfig,
-    TestClock,
+    Backend, Check, FaultyBackend, MemoryBackend, Op, Proxy, ProxyConfig, Reconciler,
+    ReconcilerConfig, SelfTestError, SelfTestFailure, TestClock,
 };
 
 use super::{
-    Cli, InvalidFlags, S3Flags, build, cut_note, open_tier, parse_duration, read_key, reconcile,
-    share, tier,
+    Cli, InvalidFlags, S3Flags, SkippedCheck, build, cut_note, exit_status, open_tier,
+    parse_duration, parse_skip, probe_run_id, probe_tiers, read_key, reconcile, share, tier,
 };
 
 const MEBIBYTE: u64 = 1 << 20;
@@ -126,6 +127,9 @@ fn the_flags_have_their_defaults() {
     assert_eq!(cli.lease_ttl, Duration::from_secs(30));
     assert_eq!(cli.reconcile_interval, Duration::from_secs(5));
     assert_eq!(cli.max_request_bytes, 256 << 20);
+    assert_eq!(cli.max_concurrent_puts, 32);
+    assert_eq!(cli.put_min_bytes_per_sec, 1024);
+    assert_eq!(cli.put_rate_grace, Duration::from_secs(30));
     assert_eq!(cli.body_idle_timeout, Duration::from_secs(30));
     assert_eq!(cli.s3_request_timeout, Duration::from_secs(60));
     let s3_flags = [
@@ -140,6 +144,11 @@ fn the_flags_have_their_defaults() {
     assert!(cli.read_only_key_file.is_empty());
     assert!(cli.presign_key_file.is_empty());
     assert_eq!(cli.presign_max_expires, Duration::from_secs(900));
+    assert!(
+        cli.skip_backend_check.is_empty(),
+        "no check is skipped by default"
+    );
+    assert_eq!(cli.backend_check_wait, Duration::from_secs(300));
 }
 
 /// Asserts that `--read-only-key-file` can be given any number of times, and that the files are
@@ -175,8 +184,12 @@ fn the_flags_can_all_be_given() {
         ("--lease-ttl", "20s"),
         ("--reconcile-interval", "1s"),
         ("--max-request-bytes", "10"),
+        ("--max-concurrent-puts", "3"),
+        ("--put-min-bytes-per-sec", "5"),
+        ("--put-rate-grace", "2s"),
         ("--body-idle-timeout", "7s"),
         ("--s3-request-timeout", "90s"),
+        ("--backend-check-wait", "2m"),
         ("--hot-endpoint", "http://127.0.0.1:9000"),
         ("--hot-region", "eu-west-1"),
         ("--hot-credentials-file", "hot-key"),
@@ -196,8 +209,12 @@ fn the_flags_can_all_be_given() {
     assert_eq!(cli.lease_ttl, Duration::from_secs(20));
     assert_eq!(cli.reconcile_interval, Duration::from_secs(1));
     assert_eq!(cli.max_request_bytes, 10);
+    assert_eq!(cli.max_concurrent_puts, 3);
+    assert_eq!(cli.put_min_bytes_per_sec, 5);
+    assert_eq!(cli.put_rate_grace, Duration::from_secs(2));
     assert_eq!(cli.body_idle_timeout, Duration::from_secs(7));
     assert_eq!(cli.s3_request_timeout, Duration::from_secs(90));
+    assert_eq!(cli.backend_check_wait, Duration::from_secs(120));
     let hot = cli.hot_s3();
     assert_eq!(hot.endpoint, Some("http://127.0.0.1:9000"));
     assert_eq!(hot.region, Some("eu-west-1"));
@@ -269,6 +286,8 @@ fn the_help_names_every_flag_and_the_version_the_package() {
         "--cold-endpoint",
         "--cold-region",
         "--cold-credentials-file",
+        "--skip-backend-check",
+        "--backend-check-wait",
     ];
     for name in names {
         assert!(help.contains(name), "{name}");
@@ -312,6 +331,9 @@ fn the_settings_are_made_from_the_flags() {
     assert_eq!(built.server.access_key_id, "AKID");
     assert_eq!(built.server.secret_access_key, "secret");
     assert_eq!(built.server.max_request_bytes, 256 << 20);
+    assert_eq!(built.server.max_concurrent_puts, 32);
+    assert_eq!(built.server.put_min_bytes_per_sec, 1024);
+    assert_eq!(built.server.put_rate_grace, Duration::from_secs(30));
     assert_eq!(built.server.body_idle_timeout, Duration::from_secs(30));
     assert_eq!(built.server.drain_lb_wait, Duration::from_secs(7));
     assert_eq!(built.server.drain_deadline, Duration::from_secs(11));
@@ -614,6 +636,172 @@ async fn a_halt_cuts_the_pass_that_is_running() {
     assert!(done.is_ok());
     assert!(hot.get("_tiering/lease", None).await.is_err());
     assert!(cold_mem.get("k", None).await.is_err());
+}
+
+/// Asserts that `--skip-backend-check` takes `multipart-conditional` and a reason, may be given
+/// more than once, trims the reason and keeps a `=` inside it; that a value with no `=` or an
+/// unknown check is refused with a message that lists the checks; that a blank reason is refused
+/// with a message that says a reason is needed; and that every check but
+/// `multipart-conditional` is refused as a usage error (exit status 2), whatever its reason.
+#[test]
+fn only_the_multipart_check_can_be_skipped_and_with_a_reason() {
+    let mut args = flags("key", &[]);
+    args.extend(
+        [
+            "--skip-backend-check",
+            "multipart-conditional= store ignores it on completion ",
+            "--skip-backend-check",
+            "multipart-conditional=a=b",
+        ]
+        .map(str::to_owned),
+    );
+    let cli = Cli::try_parse_from(args).unwrap();
+    let want = [
+        SkippedCheck {
+            check: Check::MultipartConditional,
+            reason: "store ignores it on completion".to_owned(),
+        },
+        SkippedCheck {
+            check: Check::MultipartConditional,
+            reason: "a=b".to_owned(),
+        },
+    ];
+    assert_eq!(cli.skip_backend_check, want);
+
+    for text in ["range", "ranges=because", "=because"] {
+        let why = parse_skip(text).unwrap_err();
+        assert!(why.contains("CHECK=REASON"), "{text}: {why}");
+        assert!(why.contains("multipart-conditional"), "{text}: {why}");
+    }
+    for text in ["multipart-conditional=", "multipart-conditional=   "] {
+        let why = parse_skip(text).unwrap_err();
+        assert!(why.contains("needs a reason"), "{text}: {why}");
+    }
+    for check in Check::ALL
+        .into_iter()
+        .filter(|c| *c != Check::MultipartConditional)
+    {
+        let value = format!("{check}=the store cannot do it");
+        let why = parse_skip(&value).unwrap_err();
+        assert!(why.contains("cannot be skipped"), "{value}: {why}");
+        assert!(why.contains(check.name()), "{value}: {why}");
+        let refused = Cli::try_parse_from(flags("key", &[("--skip-backend-check", &value)]));
+        assert_eq!(refused.unwrap_err().exit_code(), 2, "{value}");
+    }
+}
+
+/// Asserts that the id of a start's probe keys has the proxy id, the time and the process, with
+/// every character a key cannot carry in the proxy id replaced by an underscore.
+#[test]
+fn the_probe_run_id_is_made_of_the_proxy_the_time_and_the_process() {
+    assert_eq!(probe_run_id("p1", 1234, 77), "p1-1234-77");
+    assert_eq!(probe_run_id("a/b c.d-e", 5, 6), "a_b_c_d-e-5-6");
+    assert_ne!(probe_run_id("p1", 1, 7), probe_run_id("p1", 2, 7));
+}
+
+/// Asserts that a tier that answered the self-test wrongly is status 3, a tier that could not be
+/// reached status 1 (a restart may mend it), flags that cannot go together status 2 and any
+/// other failure status 1.
+#[test]
+fn a_wrong_answer_has_its_own_exit_status_and_an_unreachable_tier_has_not() {
+    let failure = SelfTestFailure {
+        backend: "hot tier memory".to_owned(),
+        check: Check::Range,
+        observed: "x".to_owned(),
+    };
+    let wrong: super::Error = Box::new(SelfTestError::Violation(failure));
+    let down = SelfTestError::Unreachable {
+        backend: "hot tier memory".to_owned(),
+        error: "connection refused".to_owned(),
+    };
+    let down: super::Error = Box::new(down);
+    let invalid: super::Error = Box::new(InvalidFlags("x".to_owned()));
+    let other: super::Error = "another reason".into();
+    assert_eq!(exit_status(&wrong), 3);
+    assert_eq!(exit_status(&down), 1);
+    assert_eq!(exit_status(&invalid), 2);
+    assert_eq!(exit_status(&other), 1);
+}
+
+/// Asserts that the two tiers are tested before a start: tiers that are correct pass; a hot tier
+/// that fails is named as the hot tier with its flag value and the check; a cold tier that fails
+/// is named as the cold tier; the failure is the error a start gives, so that its exit status is
+/// 3; and a check the flags skip is not run, so a tier that fails only that one passes.
+#[tokio::test]
+async fn the_tiers_are_tested_before_a_start_and_a_failure_names_the_tier() {
+    let dir = TestDir::under(std::env::temp_dir(), "tierstore-probe-tiers");
+    let mut cli = cli(&dir);
+    cli.hot = "s3:hot-bucket".to_owned();
+    cli.cold = "dir:/cold".to_owned();
+    let good = Flawed::new(Flaw::None);
+    let now = Duration::ZERO;
+    probe_tiers(&cli, &good, &good, now).await.unwrap();
+
+    let broken = Flawed::new(Flaw::OverwritesOnCreate);
+    let why = probe_tiers(&cli, &broken, &good, now).await.unwrap_err();
+    assert_eq!(exit_status(&why), 3);
+    let text = why.to_string();
+    assert!(text.contains("hot tier s3:hot-bucket"), "{text}");
+    assert!(text.contains("create-only"), "{text}");
+
+    let why = probe_tiers(&cli, &good, &broken, now).await.unwrap_err();
+    let text = why.to_string();
+    assert!(text.contains("cold tier dir:/cold"), "{text}");
+    assert!(text.contains("create-only"), "{text}");
+
+    let no_multipart = Flawed::new(Flaw::NoMultipart);
+    probe_tiers(&cli, &no_multipart, &good, now).await.unwrap();
+    let why = probe_tiers(&cli, &good, &no_multipart, now)
+        .await
+        .unwrap_err();
+    assert!(why.to_string().contains("multipart-conditional"), "{why}");
+
+    cli.skip_backend_check = vec![SkippedCheck {
+        check: Check::MultipartConditional,
+        reason: "test".to_owned(),
+    }];
+    probe_tiers(&cli, &good, &no_multipart, now).await.unwrap();
+    assert!(good.inner.list("_tiering/").await.unwrap().is_empty());
+}
+
+/// Asserts that a tier that cannot be reached, hot or cold, is not a wrong answer: the start
+/// fails with `tier unreachable: <tier>: <error>` and exit status 1, which the unit restarts; and
+/// that a full hot tier, a state it is designed to be in, and a full cold tier, start.
+#[tokio::test]
+async fn an_unreachable_tier_is_status_1_and_a_full_tier_starts() {
+    let dir = TestDir::under(std::env::temp_dir(), "tierstore-probe-down");
+    let mut cli = cli(&dir);
+    cli.hot = "s3:hot-bucket".to_owned();
+    cli.cold = "s3:cold-bucket".to_owned();
+    let good = Flawed::new(Flaw::None);
+    let now = Duration::ZERO;
+    let down = Flawed::new(Flaw::Down);
+    for (hot, cold, tier) in [
+        (&down, &good, "hot tier s3:hot-bucket"),
+        (&good, &down, "cold tier s3:cold-bucket"),
+    ] {
+        let why = probe_tiers(&cli, hot, cold, now).await.unwrap_err();
+        assert_eq!(exit_status(&why), 1, "{why}");
+        let text = why.to_string();
+        assert!(
+            text.starts_with(&format!("tier unreachable: {tier}: ")),
+            "{text}"
+        );
+        assert!(text.contains("connection refused"), "{text}");
+    }
+
+    let full = Flawed::new(Flaw::Full);
+    probe_tiers(&cli, &full, &good, now).await.unwrap();
+    probe_tiers(&cli, &good, &full, now).await.unwrap();
+    let wrong = Flawed::new(Flaw::IgnoresIfMatch);
+    let why = probe_tiers(&cli, &full, &wrong, now).await.unwrap_err();
+    assert_eq!(exit_status(&why), 3, "{why}");
+    // A 501 from the store (the S3 backend's other error) is a contract gap: status 3.
+    let not_implemented = Flawed::new(Flaw::RejectsConditionalHeader);
+    let why = probe_tiers(&cli, &not_implemented, &good, now)
+        .await
+        .unwrap_err();
+    assert_eq!(exit_status(&why), 3, "{why}");
 }
 
 /// Asserts that the report of a drain names the requests that the deadline cut, and that a drain

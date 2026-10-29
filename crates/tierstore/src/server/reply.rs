@@ -96,6 +96,33 @@ impl S3Error {
         Self::new(StatusCode::BAD_REQUEST, "RequestTimeout", text).with("connection", "close")
     }
 
+    /// A request body that came in slower, on average, than the least rate allowed: the
+    /// connection is closed.
+    pub(crate) fn too_slow(min_bytes_per_sec: u64) -> Self {
+        let text = format!(
+            "The request body came in at an average of less than {min_bytes_per_sec} bytes a second."
+        );
+        Self::new(StatusCode::BAD_REQUEST, "RequestTimeout", text).with("connection", "close")
+    }
+
+    /// A streamed body whose length the request did not give, for a store that needs it.
+    pub(crate) fn length_required() -> Self {
+        let text = "A Content-Length is needed: this store does not take a body of unknown length.";
+        Self::new(StatusCode::LENGTH_REQUIRED, "MissingContentLength", text)
+    }
+
+    /// A body that the request says is longer than the limit, before any of it was read.
+    pub(crate) fn too_large(limit: usize) -> Self {
+        let text = format!("The request body is over the limit of {limit} bytes.");
+        Self::new(StatusCode::PAYLOAD_TOO_LARGE, "EntityTooLarge", text)
+    }
+
+    /// More streamed bodies than the server takes at once: try again after a moment.
+    pub(crate) fn busy() -> Self {
+        let text = "The server is taking as many uploads as it can; retry after a moment.";
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, "SlowDown", text).with("retry-after", "1")
+    }
+
     /// Whether this is the answer to a request that stalled.
     pub(crate) fn is_timeout(&self) -> bool {
         self.code == "RequestTimeout"
@@ -158,7 +185,6 @@ impl S3Error {
     }
 
     /// The text for the client.
-    #[cfg(test)]
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
