@@ -143,6 +143,7 @@ fn the_flags_have_their_defaults() {
         cli.skip_backend_check.is_empty(),
         "no check is skipped by default"
     );
+    assert_eq!(cli.backend_check_wait, Duration::from_secs(300));
 }
 
 /// Asserts that `--read-only-key-file` can be given any number of times, and that the files are
@@ -180,6 +181,7 @@ fn the_flags_can_all_be_given() {
         ("--max-request-bytes", "10"),
         ("--body-idle-timeout", "7s"),
         ("--s3-request-timeout", "90s"),
+        ("--backend-check-wait", "2m"),
         ("--hot-endpoint", "http://127.0.0.1:9000"),
         ("--hot-region", "eu-west-1"),
         ("--hot-credentials-file", "hot-key"),
@@ -201,6 +203,7 @@ fn the_flags_can_all_be_given() {
     assert_eq!(cli.max_request_bytes, 10);
     assert_eq!(cli.body_idle_timeout, Duration::from_secs(7));
     assert_eq!(cli.s3_request_timeout, Duration::from_secs(90));
+    assert_eq!(cli.backend_check_wait, Duration::from_secs(120));
     let hot = cli.hot_s3();
     assert_eq!(hot.endpoint, Some("http://127.0.0.1:9000"));
     assert_eq!(hot.region, Some("eu-west-1"));
@@ -273,6 +276,7 @@ fn the_help_names_every_flag_and_the_version_the_package() {
         "--cold-region",
         "--cold-credentials-file",
         "--skip-backend-check",
+        "--backend-check-wait",
     ];
     for name in names {
         assert!(help.contains(name), "{name}");

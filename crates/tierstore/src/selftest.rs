@@ -11,8 +11,9 @@
 //! Two outcomes are kept apart. A store that answered, and wrongly, is a [`SelfTestFailure`]
 //! (a [`SelfTestError::Violation`]): fixing it takes a different store, so a restart is no use.
 //! A store that could not be asked ([`Error::Unavailable`]: down, a timeout, a refused
-//! connection, and for the S3 backend a 408, 429 or any 5xx but 501 and 507) is asked again, a bounded number of times, and then is a
-//! [`SelfTestError::Unreachable`], which a restart may mend. A store that is full
+//! connection, and for the S3 backend a 408, 429 or any 5xx but 501 and 507) is asked again, after
+//! pauses that double up to a longest, for as long as [`SelfTestOptions::wait`] allows, and then
+//! is a [`SelfTestError::Unreachable`], which a restart may mend. A store that is full
 //! ([`Error::Full`], a state the hot tier is designed to be in) is not in doubt: the checks that
 //! need a write are skipped, with a note, and the test passes. Any other error is an answer the
 //! contract does not allow, and a violation.
@@ -42,6 +43,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream;
+use tokio::time::Instant;
 
 use crate::{Backend, ByteRange, Error, Listed};
 
@@ -50,6 +52,9 @@ const PROBE_PREFIX: &str = "_tiering/selftest/";
 
 /// The age, in milliseconds, past which a probe key of an earlier start is deleted.
 const SWEEP_AGE_MS: u64 = 60 * 60 * 1000;
+
+/// The shortest pause between two attempts, so that a pause of zero still ends.
+const MIN_PAUSE: Duration = Duration::from_millis(1);
 
 /// The most keys of an earlier start that are looked at.
 const SWEEP_LIMIT: usize = 1000;
@@ -207,10 +212,15 @@ pub struct SelfTestOptions<'a> {
     pub multipart: bool,
     /// Checks that do not run.
     pub skip: &'a [Check],
-    /// How many times a check that could not reach the backend is run (at least one).
-    pub attempts: u32,
-    /// How long to wait between two attempts.
+    /// For how long a check that could not reach the backend is tried again, counted from the
+    /// start of the test: a check is not tried again if the pause before it would end at or after
+    /// this. Zero tries each check once.
+    pub wait: Duration,
+    /// The pause before the first repeat of a check (at least a millisecond is waited). Each
+    /// repeat waits twice as long as the one before, up to [`SelfTestOptions::max_pause`].
     pub pause: Duration,
+    /// The longest pause between two attempts.
+    pub max_pause: Duration,
 }
 
 /// Where the notes of the test go: a skipped check, an attempt that is repeated, a key that was
@@ -221,7 +231,7 @@ pub type Note<'a> = &'a (dyn Fn(String) + Sync);
 ///
 /// # Errors
 /// [`SelfTestError::Violation`] for the first check the backend answered wrongly, and
-/// [`SelfTestError::Unreachable`] if it could not be asked in any of the attempts.
+/// [`SelfTestError::Unreachable`] if it could not be asked within the wait given.
 pub async fn self_test(
     backend: &dyn Backend,
     options: &SelfTestOptions<'_>,
@@ -232,6 +242,7 @@ pub async fn self_test(
         prefix: format!("{PROBE_PREFIX}{}/", options.run_id),
         options,
         note,
+        started: Instant::now(),
     };
     probe.sweep().await;
     for check in Check::ALL {
@@ -287,6 +298,8 @@ struct Probe<'a> {
     prefix: String,
     options: &'a SelfTestOptions<'a>,
     note: Note<'a>,
+    /// When the test began, to count the wait from.
+    started: Instant,
 }
 
 /// The bytes of a text.
@@ -348,23 +361,25 @@ impl Probe<'_> {
         (self.note)(format!("{}: {line}", self.options.name));
     }
 
-    /// Runs `check`, again if it could not reach the backend, up to the attempts given.
+    /// Runs `check`, again if it could not reach the backend, after a pause that doubles up to
+    /// the longest, for as long as the time since the test began, plus the next pause, is below
+    /// the wait given.
     async fn attempt(&self, check: Check) -> Verdict {
-        let mut tried = 0;
+        let mut pause = self.options.pause.max(MIN_PAUSE);
         loop {
-            tried += 1;
             self.delete_keys(check).await;
             let verdict = self.run(check).await;
             let Err(Fault::Down(why)) = &verdict else {
                 return verdict;
             };
-            if tried >= self.options.attempts {
+            if self.started.elapsed() + pause >= self.options.wait {
                 return verdict;
             }
             self.note(format!(
-                "the {check} check could not reach the tier ({why}); trying again"
+                "the {check} check could not reach the tier ({why}); trying again in {pause:?}"
             ));
-            tokio::time::sleep(self.options.pause).await;
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(self.options.max_pause).max(MIN_PAUSE);
         }
     }
 

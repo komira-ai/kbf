@@ -412,10 +412,15 @@ fn a_tier_that_cannot_be_reached_by_the_self_test_is_a_start_that_exits_1() {
         key.as_str(),
         "--cold-endpoint",
         "http://127.0.0.1:1",
+        "--backend-check-wait",
+        "2s",
     ]);
     let flags = with(&described, "--cold", "s3:cold-bucket");
     let (code, out, err) = run(&flags);
     assert_eq!((code, out.as_str()), (1, ""));
+    // The flag is read: a wait of 2 s allows the first pause (1 s) and not the second (2 s).
+    assert_eq!(err.matches("trying again in 1s").count(), 1, "{err}");
+    assert!(!err.contains("trying again in 2s"), "{err}");
     assert!(
         err.contains("tierstore: tested the hot tier memory in "),
         "{err}"

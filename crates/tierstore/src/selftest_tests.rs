@@ -213,15 +213,18 @@ impl Backend for Flawed {
     }
 }
 
-/// The options of a run: three attempts, no wait between them.
+/// The options of a run: a store that does not answer is asked again for 20 seconds, after
+/// pauses of 1, 2 and then 4 seconds. Tests that make a store not answer run on a paused clock,
+/// so that no time is waited.
 fn options<'a>(run_id: &'a str, multipart: bool, skip: &'a [Check]) -> SelfTestOptions<'a> {
     SelfTestOptions {
         name: "the backend",
         run_id,
         multipart,
         skip,
-        attempts: 3,
-        pause: Duration::ZERO,
+        wait: Duration::from_secs(20),
+        pause: Duration::from_secs(1),
+        max_pause: Duration::from_secs(4),
     }
 }
 
@@ -385,10 +388,12 @@ async fn a_cold_tier_without_multipart_is_refused() {
 }
 
 /// Asserts that a store that cannot be asked (a refused connection) is not a wrong answer: the
-/// first check is run three times, with a note for each repeat, and the outcome is unreachable
-/// with the backend and the error, not a violation; nothing is left behind.
-#[tokio::test]
-async fn a_store_that_cannot_be_asked_is_unreachable_after_three_attempts() {
+/// first check is run again after pauses of 1, 2 and 4 seconds, the 4 repeated, for as long as the
+/// wait of 20 seconds allows (a pause is not taken if it would end at or after the wait), with a
+/// note that names each pause, and the outcome is unreachable with the backend and the error, not
+/// a violation; nothing is left behind. The clock is paused: no time is waited.
+#[tokio::test(start_paused = true)]
+async fn a_store_that_cannot_be_asked_is_asked_again_with_growing_pauses_and_then_unreachable() {
     let backend = Flawed::new(Flaw::Down);
     let (outcome, notes) = go(&backend, &options("run-1", true, &[])).await;
     let (name, error) = match outcome {
@@ -397,14 +402,17 @@ async fn a_store_that_cannot_be_asked_is_unreachable_after_three_attempts() {
     };
     assert_eq!(name, "the backend");
     assert!(error.contains("connection refused"), "{error}");
-    let repeats = notes.iter().filter(|note| note.contains("trying again"));
-    assert_eq!(repeats.count(), 2, "{notes:?}");
-    let first = notes
+    let repeats: Vec<&String> = notes
         .iter()
-        .find(|note| note.contains("trying again"))
-        .unwrap();
+        .filter(|note| note.contains("trying again"))
+        .collect();
+    let pauses: Vec<&str> = repeats
+        .iter()
+        .map(|note| note.rsplit("trying again in ").next().unwrap())
+        .collect();
+    assert_eq!(pauses, ["1s", "2s", "4s", "4s", "4s", "4s"], "{notes:?}");
     assert!(
-        first.contains("the backend: the create-only check"),
+        repeats[0].contains("the backend: the create-only check"),
         "{notes:?}"
     );
     assert!(backend.inner.list(PROBE).await.unwrap().is_empty());
@@ -425,13 +433,56 @@ async fn a_store_that_cannot_be_asked_is_unreachable_after_three_attempts() {
 
 /// Asserts that a store that fails once with a 503 and then answers passes, with one note for the
 /// repeat: a brief outage at the start does not stop the start.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_store_that_fails_once_is_asked_again_and_passes() {
     let backend = Flawed::new(Flaw::FlakyOnce);
     let (outcome, notes) = go(&backend, &options("run-1", true, &[])).await;
     assert_eq!(outcome, Ok(()));
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(notes[0].contains("503 Service Unavailable"), "{notes:?}");
+    assert!(notes[0].ends_with("trying again in 1s"), "{notes:?}");
+}
+
+/// Asserts that a wait of zero asks once, whatever the pauses: no repeat, no note about one, and
+/// the outcome is unreachable; and that a wait too short for the first pause does the same.
+#[tokio::test(start_paused = true)]
+async fn a_wait_too_short_for_a_pause_asks_once() {
+    for wait in [Duration::ZERO, Duration::from_secs(1)] {
+        let backend = Flawed::new(Flaw::Down);
+        let mut once = options("run-1", true, &[]);
+        once.wait = wait;
+        let (outcome, notes) = go(&backend, &once).await;
+        assert!(
+            matches!(outcome, Err(SelfTestError::Unreachable { .. })),
+            "{outcome:?}"
+        );
+        assert!(
+            notes.iter().all(|note| !note.contains("trying again")),
+            "{notes:?}"
+        );
+    }
+}
+
+/// Asserts that a pause of zero is waited at least a millisecond, so that a wait that is more than
+/// zero still ends.
+#[tokio::test(start_paused = true)]
+async fn a_pause_of_zero_still_ends() {
+    let backend = Flawed::new(Flaw::Down);
+    let mut quick = options("run-1", true, &[]);
+    quick.pause = Duration::ZERO;
+    quick.max_pause = Duration::ZERO;
+    quick.wait = Duration::from_millis(5);
+    let (outcome, notes) = go(&backend, &quick).await;
+    assert!(
+        matches!(outcome, Err(SelfTestError::Unreachable { .. })),
+        "{outcome:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.ends_with("trying again in 1ms")),
+        "{notes:?}"
+    );
 }
 
 /// Asserts that a store that is full passes without being asked anything that needs a write: each

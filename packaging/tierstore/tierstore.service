@@ -29,12 +29,15 @@ Documentation=https://github.com/komira-ai/kbf/blob/main/packaging/tierstore/REA
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=/etc/tierstore/access.key
-# Restart=on-failure below tries a start that failed again every 5 s. A store that answers 500 for
+# Restart=on-failure below tries a start that failed again after RestartSec=30. The process itself
+# asks a store that does not answer again for --backend-check-wait (5 minutes by default), so a
+# store that is slow to come up after a reboot does not fail a start. A store that answers 500 for
 # ever to a step the start-up self-test needs (a conditional put it does not support) fails every
-# start with exit 1, as a store that is down does: after 5 starts in 10 minutes systemd stops
-# trying (`systemctl reset-failed tierstore` and a start try again), so that it does not loop for
-# ever on a store that needs fixing.
-StartLimitIntervalSec=600
+# start with exit 1, as a store that is down does: after 5 starts in an hour (about half an hour
+# of real failures, each start taking up to 5 minutes and a restart 30 s) systemd stops trying
+# (`systemctl reset-failed tierstore` and a start try again), so that it does not loop for ever on
+# a store that needs fixing.
+StartLimitIntervalSec=1h
 StartLimitBurst=5
 
 [Service]
@@ -65,12 +68,12 @@ TimeoutStopSec=960
 # A start that fails (a store that cannot be reached yet, an address in use) is tried again.
 # Exit 2 is a command line the argument parser refused (an unknown flag, a missing or malformed
 # value) or two keys with one access key id: a restart cannot mend it. Other flag combinations and
-# key files refused after parsing exit 1 and are tried again every 5 s. Exit 3 is a tier that
+# key files refused after parsing exit 1 and are tried again every 30 s. Exit 3 is a tier that
 # answered the start-up self-test wrongly (a store that overwrites on a create-only put, say): a
 # restart would ask the same store the same questions, so it is not tried again. A tier that could
 # not be reached exits 1 and is.
 Restart=on-failure
-RestartSec=5
+RestartSec=30
 RestartPreventExitStatus=2 3
 LimitNOFILE=65536
 UMask=0077

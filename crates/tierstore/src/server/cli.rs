@@ -45,8 +45,9 @@
 //! head with no `Last-Modified`, a listing that ignores `start-after`, and on the cold tier a
 //! multipart completion that overwrites) is not served over: the process says which tier, which
 //! check and what the tier answered, and exits with status 3. A tier that cannot be reached (an
-//! error that says it is down, 503, a timeout) is asked three times, and then the start exits with
-//! status 1 and `tier unreachable: <tier>: <error>`. A tier that is full starts: the checks that
+//! error that says it is down, 503, a timeout) is asked again, after pauses from one second doubling
+//! to thirty, for `--backend-check-wait` (five minutes by default; each tier has all of it), and
+//! then the start exits with status 1 and `tier unreachable: <tier>: <error>`. A tier that is full starts: the checks that
 //! need a write are skipped, with a line that says so. `--skip-backend-check` leaves the
 //! multipart-completion check out, for a reason that is logged at the start; no other check can
 //! be left out.
@@ -235,6 +236,13 @@ pub struct Cli {
     /// None is skipped by default.
     #[arg(long, value_name = "CHECK=REASON", value_parser = parse_skip)]
     pub skip_backend_check: Vec<SkippedCheck>,
+    /// How long the start-up self-test asks again of a tier that does not answer (down, a
+    /// timeout, a 503 or another 5xx but 501 and 507), with pauses that double from one second
+    /// to thirty, before the start fails with status 1 (and the unit starts it again): a number
+    /// and `ms`, `s`, `m` or `h`. Each tier has the whole of it. `0s` asks once. A tier that
+    /// answers wrongly is not asked again.
+    #[arg(long, default_value = "5m", value_parser = parse_duration)]
+    pub backend_check_wait: Duration,
 }
 
 /// A check of the self-test that the operator leaves out, and why.
@@ -513,26 +521,28 @@ fn probe_run_id(proxy_id: &str, now: u64, process: u32) -> String {
     format!("{proxy}-{now}-{process}")
 }
 
-/// How many times a check of the self-test that could not reach its tier is run.
-const SELF_TEST_ATTEMPTS: u32 = 3;
+/// The pause before the first repeat of a check of the self-test that could not reach its tier;
+/// each repeat waits twice as long as the one before.
+const SELF_TEST_FIRST_PAUSE: Duration = Duration::from_secs(1);
 
-/// How long the self-test waits between two attempts at a tier it could not reach.
-const SELF_TEST_PAUSE: Duration = Duration::from_secs(1);
+/// The longest pause between two attempts at a tier the self-test could not reach.
+const SELF_TEST_MAX_PAUSE: Duration = Duration::from_secs(30);
 
 /// Asks each tier the questions of the self-test, the hot tier first, and says on stderr which
 /// checks the flags leave out, a line before and after each tier with how long it took, and
 /// what the test notes (a check skipped because the tier is full, an attempt repeated, a probe key
-/// not deleted). The cold tier is also asked about multipart uploads. `pause` is the wait between
-/// attempts at a tier that did not answer.
+/// not deleted). The cold tier is also asked about multipart uploads. A tier that did not answer
+/// is asked again, after pauses from one second doubling to thirty, for `wait` (each tier has the
+/// whole of it).
 ///
 /// # Errors
 /// The [`SelfTestError`] of the first tier to answer a check wrongly (a violation: exit status 3)
-/// or not to answer in any attempt (unreachable: exit status 1).
+/// or not to answer within `wait` (unreachable: exit status 1).
 async fn probe_tiers(
     cli: &Cli,
     hot: &dyn Backend,
     cold: &dyn Backend,
-    pause: Duration,
+    wait: Duration,
 ) -> Result<(), Error> {
     let mut skip = Vec::new();
     for skipped in &cli.skip_backend_check {
@@ -552,8 +562,9 @@ async fn probe_tiers(
             run_id: &run_id,
             multipart,
             skip: &skip,
-            attempts: SELF_TEST_ATTEMPTS,
-            pause,
+            wait,
+            pause: SELF_TEST_FIRST_PAUSE,
+            max_pause: SELF_TEST_MAX_PAUSE,
         };
         let note = |line: String| eprintln!("tierstore: {line}");
         eprintln!("tierstore: testing the {name}");
@@ -582,13 +593,8 @@ pub async fn run(
     ready: impl FnOnce(SocketAddr),
 ) -> Result<Drained, Error> {
     let built = build(cli)?;
-    probe_tiers(
-        cli,
-        built.hot.as_ref(),
-        built.cold.as_ref(),
-        SELF_TEST_PAUSE,
-    )
-    .await?;
+    let (hot, cold) = (built.hot.as_ref(), built.cold.as_ref());
+    probe_tiers(cli, hot, cold, cli.backend_check_wait).await?;
     let (hot, cold) = (Arc::clone(&built.hot), Arc::clone(&built.cold));
     let opened = Proxy::open(hot, cold, built.proxy).await;
     let proxy = opened.map_err(|why| format!("opening the proxy: {why}"))?;

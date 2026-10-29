@@ -128,10 +128,10 @@ load balancer sees it, refuses new requests, waits for those in flight for at mo
 `--drain-deadline`, gives up the reconciler's lease and exits 0. `TimeoutStopSec=` is set above
 the sum of the two flags and the lease's wait, so that systemd does not send SIGKILL to a drain
 in progress; if `--drain-deadline` is raised, raise it too. A start that fails is tried again
-after five seconds; exit status 2 (a command line the argument parser refused: an unknown flag, a
+after 30 seconds; exit status 2 (a command line the argument parser refused: an unknown flag, a
 missing or malformed value; or two keys with one access key id) is not, since a restart cannot
 mend it. Other flag combinations and key files refused after parsing exit 1, and are tried again
-every five seconds.
+every 30 seconds.
 
 ## The start-up self-test
 
@@ -147,9 +147,12 @@ under that prefix are ever deleted. A tier that answers one of them wrongly exit
 with the tier, the check and the answer on stderr, and is not restarted
 (`RestartPreventExitStatus=2 3`): fix or replace the store. That includes answers that are a
 configuration error, such as 403 `AccessDenied` or `NoSuchBucket`, which are not retried either.
-A tier that cannot be reached (down, a timeout, 408, 429, any 5xx but 501 and 507) is asked three
-times, then the start exits 1 and is tried again every five seconds, up to the start limit of the
-unit (5 starts in 10 minutes, then systemd gives up until `systemctl reset-failed tierstore`). An
+A tier that cannot be reached (down, a timeout, 408, 429, any 5xx but 501 and 507) is asked again,
+after pauses from one second doubling to thirty, for `--backend-check-wait` (five minutes by
+default, for each tier; `0s` asks once), so that a store that is slow to come up after a reboot
+does not fail the start. Then the start exits 1 and the unit tries it again after 30 seconds, up to
+its start limit (5 starts in an hour, so about half an hour of real failures, then systemd gives up
+until `systemctl reset-failed tierstore`). An
 error that persists on a conditional step (a create-only put, `If-Match`, the completion of a
 multipart upload) while the store is up, a 500 for instance, may be a gap in the store and not an
 outage; the message says so.

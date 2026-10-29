@@ -56,15 +56,17 @@ async fn the_self_test_passes_over_the_s3_service_and_leaves_nothing() {
     assert_eq!(s3.incomplete_uploads(), 0);
 }
 
-/// The options of a self-test that waits no time between its attempts.
+/// The options of a self-test that asks a service that does not answer once (a wait of zero); a
+/// test that wants a repeat sets `wait`, and the pause is a millisecond.
 fn self_test_options(run_id: &str, multipart: bool) -> SelfTestOptions<'_> {
     SelfTestOptions {
         name: "the service",
         run_id,
         multipart,
         skip: &[],
-        attempts: 2,
-        pause: Duration::ZERO,
+        wait: Duration::ZERO,
+        pause: Duration::from_millis(1),
+        max_pause: Duration::from_millis(1),
     }
 }
 
@@ -112,7 +114,8 @@ async fn a_500_from_the_service_is_retried_and_then_unreachable_not_a_violation(
     s3.fail(Failure::Create);
     let notes = Mutex::new(Vec::new());
     let note = |line: String| notes.lock().unwrap().push(line);
-    let options = self_test_options("run-1", true);
+    let mut options = self_test_options("run-1", true);
+    options.wait = Duration::from_secs(5);
     self_test(&backend, &options, &note).await.unwrap();
     assert_eq!(
         notes.lock().unwrap().len(),
@@ -121,7 +124,8 @@ async fn a_500_from_the_service_is_retried_and_then_unreachable_not_a_violation(
         notes.lock().unwrap()
     );
 
-    s3.fail(Failure::Create);
+    // With a wait of zero a 500 is not asked again: the tier is unreachable at once.
+    options.wait = Duration::ZERO;
     s3.fail(Failure::Create);
     let outcome = self_test(&backend, &options, &note).await;
     let Err(SelfTestError::Unreachable { error, .. }) = outcome else {
@@ -132,8 +136,8 @@ async fn a_500_from_the_service_is_retried_and_then_unreachable_not_a_violation(
     assert!(s3.keys().is_empty(), "{:?}", s3.keys());
 }
 
-/// Asserts that a service that does not answer is an unreachable tier, not a wrong answer, after
-/// the attempts given: the closed port of the service of a test that has stopped.
+/// Asserts that a service that does not answer is an unreachable tier, not a wrong answer, asked
+/// once for a wait of zero: the closed port of the service of a test that has stopped.
 #[tokio::test]
 async fn the_self_test_calls_a_service_that_does_not_answer_unreachable() {
     let closed = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -149,9 +153,9 @@ async fn the_self_test_calls_a_service_that_does_not_answer_unreachable() {
     };
     assert_eq!(backend, "the service");
     assert!(error.contains("create-only"), "{error}");
-    // With two attempts the notes are: the time of the store that could not be read (for the
-    // sweep), one repeat, and the delete of the check's key that failed before each attempt and
-    // after the check.
+    // With a wait of zero the notes are: the time of the store that could not be read (for the
+    // sweep), and the delete of the check's key that failed before the attempt and after the
+    // check; no repeat.
     let notes = notes.lock().unwrap();
     let count = |text: &str| notes.iter().filter(|note| note.contains(text)).count();
     assert_eq!(
@@ -159,9 +163,9 @@ async fn the_self_test_calls_a_service_that_does_not_answer_unreachable() {
         1,
         "{notes:?}"
     );
-    assert_eq!(count("trying again"), 1, "{notes:?}");
-    assert_eq!(count("could not delete the probe key"), 3, "{notes:?}");
-    assert_eq!(notes.len(), 5, "{notes:?}");
+    assert_eq!(count("trying again"), 0, "{notes:?}");
+    assert_eq!(count("could not delete the probe key"), 2, "{notes:?}");
+    assert_eq!(notes.len(), 3, "{notes:?}");
 }
 
 /// A service that answers every write (a PUT or a POST) with `status`, a whole HTTP reply, a
@@ -257,7 +261,9 @@ async fn a_501_from_the_store_is_a_violation_asked_once() {
     let backend = S3Backend::new(config(&endpoint)).unwrap();
     let notes = Mutex::new(Vec::new());
     let note = |line: String| notes.lock().unwrap().push(line);
-    let options = self_test_options("run-1", true);
+    // A wait of 5 s would allow a repeat, if a 501 were taken for a store that is down.
+    let mut options = self_test_options("run-1", true);
+    options.wait = Duration::from_secs(5);
     let outcome = self_test(&backend, &options, &note).await;
     let Err(SelfTestError::Violation(failure)) = outcome else {
         panic!("a 501 is a violation");
