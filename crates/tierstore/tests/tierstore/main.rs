@@ -13,5 +13,6 @@ mod reconciler;
 mod reconciler_faults;
 #[cfg(feature = "s3")]
 mod s3;
+mod streaming;
 mod support;
 mod tiered;

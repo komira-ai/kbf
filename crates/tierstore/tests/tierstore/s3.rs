@@ -8,6 +8,7 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures::{StreamExt, stream};
 use kbf_objstore::s3::fake::{FakeS3, part_etag};
 use tierstore::s3::{Capabilities, Credentials, S3Config};
@@ -447,4 +448,91 @@ async fn tags_are_given_without_quotes_and_taken_with_or_without() {
     assert!(made.ends_with("-2"), "{made}");
     backend.put("plain", body("abcd")).await.unwrap();
     assert_ne!(backend.head("plain").await.unwrap().tag, made);
+}
+
+/// Asserts that a streamed put to S3 creates the object from its chunks, with the size and the
+/// tag a put of the same bytes gives, whether the length is told or not.
+#[tokio::test]
+async fn a_streamed_put_creates_the_object_from_its_chunks() {
+    let (_s3, backend) = backend().await;
+    conformance::a_streamed_put_creates_the_object_from_its_chunks(&backend).await;
+}
+
+/// Asserts that a streamed put to S3 whose body fails leaves nothing and gives the error.
+#[tokio::test]
+async fn a_streamed_put_that_fails_leaves_nothing() {
+    let (_s3, backend) = backend().await;
+    conformance::a_streamed_put_that_fails_leaves_nothing(&backend).await;
+}
+
+/// Asserts that a streamed put to S3 of an existing key is refused and the first object stays.
+#[tokio::test]
+async fn a_streamed_put_of_an_existing_key_is_refused() {
+    let (_s3, backend) = backend().await;
+    conformance::a_streamed_put_of_an_existing_key_is_refused(&backend).await;
+}
+
+/// The number of bytes in a chunk of a large body.
+const MEBIBYTE: usize = 1 << 20;
+
+/// A body of `count` chunks of a mebibyte, made as they are asked for, that then ends as `end`
+/// says.
+fn generated(count: usize, end: Option<Error>) -> PartBody<'static> {
+    let made = stream::iter(0..count).map(|n| Ok(Bytes::from(vec![n as u8; MEBIBYTE])));
+    let last = stream::iter(end.map(Err));
+    made.chain(last).boxed()
+}
+
+/// Asserts that a body longer than one request carries (17 MiB, over the 16 MiB a request
+/// holds) is stored by S3 as a multipart upload that is completed only after the last chunk:
+/// a body that fails at its last byte leaves no object and no open upload, a key that exists
+/// is refused after the upload was aborted, and a whole body makes one object of its length.
+#[tokio::test]
+async fn a_large_streamed_put_is_completed_only_after_the_last_chunk() {
+    let (s3, backend) = backend().await;
+    let len = Some(17 * MEBIBYTE as u64);
+    let cut = Error::Other("cut".to_owned());
+
+    let failed = backend
+        .put_stream("big", len, generated(17, Some(cut.clone())))
+        .await;
+    assert_eq!(failed, Err(cut));
+    assert_eq!(s3.keys(), Vec::<String>::new());
+    assert_eq!(s3.incomplete_uploads(), 0);
+    assert_eq!(s3.stats().completed, 0);
+
+    backend
+        .put_stream("big", len, generated(17, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.head("big").await.unwrap().size,
+        17 * MEBIBYTE as u64
+    );
+    assert_eq!(s3.stats().completed, 1);
+
+    let again = backend.put_stream("big", len, generated(17, None)).await;
+    assert_eq!(again, Err(Error::AlreadyExists("big".to_owned())));
+    assert_eq!(s3.incomplete_uploads(), 0);
+    assert_eq!(s3.stats().completed, 1);
+}
+
+/// Asserts that the S3 backend says it needs the length of a streamed body, the in-memory
+/// backend does not, and a proxy needs it when either of its tiers does.
+#[tokio::test]
+async fn a_proxy_needs_the_length_of_a_body_when_either_tier_is_s3() {
+    let (_s3, s3) = backend().await;
+    assert!(s3.needs_length());
+    assert!(!tierstore::MemoryBackend::new().needs_length());
+    let s3: Arc<dyn Backend> = Arc::new(s3);
+    let memory = || -> Arc<dyn Backend> { Arc::new(tierstore::MemoryBackend::new()) };
+    let open = |hot: Arc<dyn Backend>, cold: Arc<dyn Backend>| async move {
+        let clock = Arc::new(SystemClock);
+        Proxy::open(hot, cold, ProxyConfig::new("p1", 1000, clock))
+            .await
+            .unwrap()
+    };
+    assert!(open(memory(), s3.clone()).await.needs_length());
+    assert!(open(s3.clone(), memory()).await.needs_length());
+    assert!(!open(memory(), memory()).await.needs_length());
 }

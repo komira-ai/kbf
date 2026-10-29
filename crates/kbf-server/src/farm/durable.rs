@@ -291,7 +291,6 @@ pub enum StateError {
 /// The errors of the core's rows ([`js_store`]) are the farm's own, variant for variant. The
 /// core has no encode error of the log's kind: its codec's text is a row that cannot be
 /// written, which is [`StateError::Corrupt`] here.
-#[cfg(feature = "farm-core-js")]
 impl From<js_store::StateError> for StateError {
     fn from(error: js_store::StateError) -> Self {
         match error {
@@ -1201,7 +1200,6 @@ impl Farm {
     /// The store cannot be read or written, or holds a row that is not one the scheduler
     /// wrote.
     pub fn with_state(mut self, state: Option<StateStore>) -> Result<Self, StateError> {
-        #[cfg(feature = "farm-core-js")]
         if let super::driver::Driver::Js(js) = &mut self.driver {
             let epoch = js.keep_in(state, &self.settings)?;
             self.term = epoch.unwrap_or(self.term);

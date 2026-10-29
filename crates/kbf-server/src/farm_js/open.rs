@@ -49,7 +49,6 @@ pub fn config(
 /// with the memory ladder and floors, the loss requeues, the whole-node drain and caps
 /// (`--whole-node-max`) if they are set, and the wait of the orphan sweep, as
 /// [`Farm::new`](crate::farm::Farm::new) and its builders give the farm's own scheduler.
-#[cfg(feature = "farm-core-js")]
 #[must_use]
 pub(crate) fn farm_config(
     term: u64,
