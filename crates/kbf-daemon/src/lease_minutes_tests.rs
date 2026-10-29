@@ -223,11 +223,14 @@ fn a_kept_minute_does_not_come_after_a_newer_one_of_its_lease() {
 /// minute already closed and waiting, loses no minute and sends none out of order: 70 leases
 /// close minute 0 (64 go out, 6 wait), minute 1 closes for all 70 under the batch in flight,
 /// the stream ends, and over the next stream's heartbeats each lease's minutes reach the wire
-/// as 0 then 1, once each, 140 in all.
+/// as 0 then 1, once each, 140 in all (so nothing is lost if the first batch never arrived).
+/// If the first batch did arrive, the minutes it carried are sent once more (the receiver
+/// merges a repeat) and every lease's minutes still never go down.
 #[test]
 fn a_full_batch_unacked_at_stream_end_leaves_every_lease_in_order() {
     let mut lm = ten_seconds();
     let all = |at_s: u64| reading(at_s, (0..70u64).map(|i| lease(1, i, 0, at_s)).collect());
+    let mut before: Vec<(u64, u64)> = Vec::new();
     let mut wire: Vec<(u64, u64)> = Vec::new();
 
     for (n, at_s) in (0..=50u64).step_by(10).enumerate() {
@@ -235,7 +238,7 @@ fn a_full_batch_unacked_at_stream_end_leaves_every_lease_in_order() {
     }
     let first = lm.beat(7, &all(60));
     assert_eq!(first.minutes.len(), MAX_LOAD_MINUTES);
-    wire.extend(minutes_of(&first).iter().map(|m| (m.1, u64::from(m.2))));
+    before.extend(minutes_of(&first).iter().map(|m| (m.1, u64::from(m.2))));
     // Minute 1 closes at 120; the heartbeats at 130 and 140 still run under the batch in
     // flight, so the close time of the batch is long past when the stream ends.
     for (n, at_s) in (70..=140u64).step_by(10).enumerate() {
@@ -260,6 +263,14 @@ fn a_full_batch_unacked_at_stream_end_leaves_every_lease_in_order() {
             .map(|&(_, minute)| minute)
             .collect();
         assert_eq!(of_lease, [0, 1], "lease {lease}");
+
+        let delivered: Vec<_> = before
+            .iter()
+            .chain(&wire)
+            .filter(|&&(l, _)| l == lease)
+            .map(|&(_, minute)| minute)
+            .collect();
+        assert!(delivered.is_sorted(), "lease {lease}: {delivered:?}");
     }
 }
 
