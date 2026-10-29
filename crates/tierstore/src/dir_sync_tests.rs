@@ -37,7 +37,10 @@ impl SyncDir for Recorder {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        let watched = self.watch.as_ref().and_then(|path| std::fs::read(path).ok());
+        let watched = self
+            .watch
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok());
         let dir = dir.to_owned();
         self.seen.lock().unwrap().push(Seen {
             dir,
