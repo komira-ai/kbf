@@ -253,12 +253,12 @@ fn stopped_by(name: &str, signals: usize) -> Result<(), String> {
         let (sender, received) = unbounded_channel::<()>();
         let served = serve_on(
             prepared(&flags),
-            move |_| Ok(received),
-            |_server| {
+            Box::new(move |_| Ok(received)),
+            Box::new(move |_server| {
                 for _ in 0..signals {
                     sender.send(()).expect("the fan-out reads");
                 }
-            },
+            }),
         );
         ended
             .send(served.map_err(|failed| failed.said("server")))
@@ -324,8 +324,8 @@ fn a_signal_while_the_server_half_starts_abandons_the_start() {
     sender.send(()).expect("the receiver is kept");
     let served = serve_on(
         prepared(&flags),
-        move |_| Ok(received),
-        |_| panic!("the server half started"),
+        Box::new(move |_| Ok(received)),
+        Box::new(|_| panic!("the server half started")),
     );
     assert!(served.is_ok());
     drop((dir, sender));

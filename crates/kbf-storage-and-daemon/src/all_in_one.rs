@@ -131,24 +131,27 @@ pub(crate) async fn release_after(stopped: oneshot::Receiver<()>, hold: kbf_serv
 pub(crate) fn serve(flags: Flags) -> Result<(), Failed> {
     serve_on(
         flags,
-        |tokio| {
+        Box::new(|tokio| {
             // First of all: from here a SIGTERM waits to be read, and is not the default
             // action that ends the process.
             let _context = tokio.enter();
             Signals::install().map(|signals| forwarded(tokio, signals))
-        },
-        |_| {},
+        }),
+        Box::new(|_| {}),
     )
 }
 
+/// What makes the stop signals on the runtime it is given.
+pub(crate) type MakeSignals = Box<dyn FnOnce(&Runtime) -> std::io::Result<UnboundedReceiver<()>>>;
+
+/// What is called with the server half once it is bound.
+pub(crate) type Started = Box<dyn FnOnce(&kbf_server::ServerHandle)>;
+
 /// [`serve`] on the stop signals `signals` makes on the runtime it is given (one `()` for
 /// each SIGTERM or SIGINT, [`forwarded`]), calling `started` with the server half once it
-/// is bound.
-pub(crate) fn serve_on(
-    flags: Flags,
-    signals: impl FnOnce(&Runtime) -> std::io::Result<UnboundedReceiver<()>>,
-    started: impl FnOnce(&kbf_server::ServerHandle),
-) -> Result<(), Failed> {
+/// is bound. Boxed, not generic: one body serves the mode and every test, so its branches
+/// are measured once, whichever test reaches which.
+pub(crate) fn serve_on(flags: Flags, signals: MakeSignals, started: Started) -> Result<(), Failed> {
     let sizes = kbf_server::sizes_on(&flags.server, Topology::detect());
     sizes.log();
     let tokio = sizes.runtime().map_err(Failed::server)?;
