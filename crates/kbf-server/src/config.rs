@@ -341,9 +341,12 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = crate::LearnedSizes::Off)]
     pub learned_sizes: crate::LearnedSizes,
     /// Which core drives the farm's scheduling. `legacy`, the default, is the driver the
-    /// server has always had. `js` is not available in this release: a server given it
-    /// refuses to start (exit status 2) and says so. The core a server runs is logged at
-    /// start and exported as `kbf_scheduler_core{core}`, 1 for it and 0 for the other
+    /// server has always had. `js` runs the farm on the js scheduler core: it learns sizes in
+    /// `shadow` at most (`--learned-sizes on` with it is refused at start, exit status 2), and
+    /// it answers an operation by its `operations/<id>` name only. Either core reads the rows
+    /// the other wrote to the state store, so a restart with the other value takes them up.
+    /// The core a server runs is logged at start and exported as `kbf_scheduler_core{core}`,
+    /// 1 for it and 0 for the other
     // The text above states the default; the help golden cannot hold the whitespace-only
     // line clap prints before a `[default: ...]` line.
     #[arg(
@@ -366,6 +369,34 @@ pub struct Args {
         hide_default_value = true
     )]
     pub placement_load: crate::PlacementLoad,
+    /// Whether the farm gives its scheduler the estimator's prediction of what a new
+    /// operation costs, from the rows `--learned-sizes` keeps, so that placement charges the
+    /// learned cores and memory instead of the cores the request asked for and no memory.
+    /// `off`, the default, computes none. `shadow` computes the prediction at submit, gives
+    /// the scheduler nothing, and compares it with the run when it ends: the cores the run
+    /// used on average, its peak memory and its life in whole minutes, each counted as under
+    /// (the run used more than predicted), fit (at most the prediction and at least half of
+    /// it) or over (less than half of it) in `kbf_prediction_vs_run_total`; the operations
+    /// given a prediction are counted in `kbf_prediction_made_total` and those given none,
+    /// by why, in `kbf_prediction_unset_total`. Placement is exactly what `off` does. `on`
+    /// gives the scheduler the prediction as the cost of the operation's lease, at submit
+    /// and again for an operation read back from the state store at a start, which charges
+    /// the learned memory as well as the cores: a lease is admitted to a node only while the
+    /// memory charged to the node's leases stays within the node's memory. An operation the
+    /// estimator has no usable row for, or is not asked about (not an action, one that asks
+    /// for a GPU, no OS pinned, no subject), gets none and is charged as it is with `off`.
+    /// `shadow` and `on` need `--learned-sizes shadow` or `on`; `on` needs `--placement-load
+    /// on`; neither is available with `--scheduler-core js`. A server given a combination
+    /// that breaks one of these refuses to start
+    // The text above states the default; the help golden cannot hold the whitespace-only
+    // line clap prints before a `[default: ...]` line.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = crate::PlacementPredictions::Off,
+        hide_default_value = true
+    )]
+    pub placement_predictions: crate::PlacementPredictions,
     /// Whether whole-machine requests are run with the scheduler's whole-node drain and
     /// caps (`--whole-node-max`), and with which settings: off unless it is given.
     #[command(flatten)]
@@ -741,14 +772,24 @@ pub enum ConfigError {
         #[source]
         source: PolicyError,
     },
-    /// `--scheduler-core` names a core this release does not have.
+    /// `--placement-predictions shadow` or `on` with `--learned-sizes off`.
     #[error(
-        "--scheduler-core {}: that core is not available yet in this release; run with \
-         --scheduler-core {} (the default)",
-        .0.name(),
-        crate::SchedulerCore::RUNNING.name()
+        "--placement-predictions {0} needs --learned-sizes shadow or on: with the estimator off \
+         there are no learned rows to predict from"
     )]
-    SchedulerCoreUnavailable(crate::SchedulerCore),
+    PredictionsNeedLearnedSizes(&'static str),
+    /// `--placement-predictions on` with `--placement-load off`.
+    #[error(
+        "--placement-predictions on needs --placement-load on: with it off the scheduler books \
+         by cores and ignores a prediction"
+    )]
+    PredictionsNeedPlacementLoad,
+    /// `--placement-predictions shadow` or `on` with `--scheduler-core js`.
+    #[error(
+        "--placement-predictions {0} needs --scheduler-core legacy: the js core does not read \
+         the flag yet"
+    )]
+    PredictionsNeedLegacyCore(&'static str),
     /// `--learned-sizes on` was given with `--scheduler-core js`, which learns sizes in `shadow`
     /// only: it would book as `off` does while the flag says otherwise.
     #[error(
@@ -759,18 +800,15 @@ pub enum ConfigError {
 }
 
 impl Args {
-    /// Refuses a `--scheduler-core` this release cannot run.
+    /// Refuses a combination of `--scheduler-core` and the flags that the core cannot run.
+    /// Both cores are built into every binary.
     ///
     /// # Errors
-    /// [`ConfigError::SchedulerCoreUnavailable`]: the core is `js`, in a build without it.
     /// [`ConfigError::LearnedSizesOnUnderJs`]: the core is `js` and `--learned-sizes` is `on`.
     pub fn check_scheduler_core(&self) -> Result<(), ConfigError> {
         let js = self.scheduler_core == crate::SchedulerCore::Js;
         if js && self.learned_sizes == crate::LearnedSizes::On {
             return Err(ConfigError::LearnedSizesOnUnderJs);
-        }
-        if !self.scheduler_core.available() {
-            return Err(ConfigError::SchedulerCoreUnavailable(self.scheduler_core));
         }
         Ok(())
     }
@@ -846,6 +884,7 @@ impl Args {
     pub fn listeners(&self) -> Result<Listeners, ConfigError> {
         self.segment_upload_fits_write_bound()?;
         self.durable_wait_fits_commit_bound()?;
+        self.placement_predictions_fit()?;
         let reload = Duration::from_secs(self.tls_reload_interval_secs);
         let deny_list = self
             .worker_deny_list
@@ -905,6 +944,7 @@ impl Args {
             learned_sizes: self.learned_sizes,
             scheduler_core: self.scheduler_core,
             placement_load: self.placement_load,
+            placement_predictions: self.placement_predictions,
             whole_node: self.whole_node.config(),
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {

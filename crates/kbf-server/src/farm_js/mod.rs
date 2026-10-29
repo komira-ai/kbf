@@ -26,6 +26,7 @@ pub mod dispatch;
 pub mod ext;
 mod facts;
 pub mod host;
+mod learning;
 pub mod load;
 pub mod open;
 mod record;
@@ -33,6 +34,8 @@ mod report_hooks;
 
 pub use adapter::{KbfAdapter, Outbound, Wall};
 pub use host::{Caller, Connection};
+#[cfg_attr(not(any(feature = "farm-core-js", test)), allow(unused_imports))]
+pub(crate) use learning::{Gate, write_behind_now, write_learned};
 pub use open::KbfObserver;
 
 #[cfg(test)]
@@ -49,6 +52,8 @@ mod facts_tests;
 mod failed_tests;
 #[cfg(test)]
 mod host_tests;
+#[cfg(test)]
+mod learning_tests;
 #[cfg(test)]
 mod load_tests;
 #[cfg(test)]

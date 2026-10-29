@@ -397,6 +397,40 @@ async fn it_serves_over_two_s3_tiers_and_lands_a_multipart_upload_in_the_cold_on
     assert_eq!(running.exit_code().await, Some(0));
 }
 
+/// Asserts that a start whose cold tier is an S3 store that cannot be reached exits with status
+/// 1 (not 3, which is a store that answered wrongly: the unit restarts a status 1) before it
+/// serves anything: nothing on stdout (no start line), and a last line that says the tier is
+/// unreachable, names the cold tier as the flag gave it and says which check could not be run;
+/// the hot tier, a memory tier, was tested before it and said so.
+#[test]
+fn a_tier_that_cannot_be_reached_by_the_self_test_is_a_start_that_exits_1() {
+    let files = Files::new("bin-selftest-refused");
+    let secret = files.secret("cold-key", "ID\nsecret\n");
+    let key = secret.display().to_string();
+    let described = files.flags(&[
+        "--cold-credentials-file",
+        key.as_str(),
+        "--cold-endpoint",
+        "http://127.0.0.1:1",
+        "--backend-check-wait",
+        "2s",
+    ]);
+    let flags = with(&described, "--cold", "s3:cold-bucket");
+    let (code, out, err) = run(&flags);
+    assert_eq!((code, out.as_str()), (1, ""));
+    // The flag is read: a wait of 2 s allows the first pause (1 s) and not the second (2 s).
+    assert_eq!(err.matches("trying again in 1s").count(), 1, "{err}");
+    assert!(!err.contains("trying again in 2s"), "{err}");
+    assert!(
+        err.contains("tierstore: tested the hot tier memory in "),
+        "{err}"
+    );
+    let last = err.lines().last().unwrap();
+    let want = "tierstore: tier unreachable: cold tier s3:cold-bucket: ";
+    assert!(last.starts_with(want), "{err}");
+    assert!(last.contains("create-only"), "{err}");
+}
+
 /// Asserts that a start with a tier that its flags do not describe exits with status 1 and a
 /// reason that names the flag: an S3 tier with no endpoint, one whose credentials file is not
 /// there, one whose bucket name is not a bucket name, and the flags of an S3 tier given for a

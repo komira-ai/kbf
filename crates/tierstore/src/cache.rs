@@ -160,8 +160,23 @@ impl CachedStore {
 
 #[async_trait]
 impl Backend for CachedStore {
+    fn needs_length(&self) -> bool {
+        self.inner.needs_length()
+    }
+
     async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
         self.inner.put(key, body).await
+    }
+
+    /// A put does not touch the cache (objects are immutable, and a key that was absent has
+    /// nothing cached), so the stream goes on to the inner store as it is, not held.
+    async fn put_stream(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        self.inner.put_stream(key, len, body).await
     }
 
     async fn put_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<String, Error> {

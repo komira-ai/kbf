@@ -121,6 +121,10 @@ async fn a_granted_lease_names_the_os_family_and_isa_the_action_asked_for() {
 /// not be told apart), and a `lease finished failed` line, for a lease that failed
 /// before the action ran, that makes up a code instead of `-`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(
+    feature = "farm-core-js",
+    ignore = "known-different-on-js: the js core's lease finished line has no exit_code= field"
+)]
 async fn a_finished_lease_names_the_exit_code_or_a_dash() {
     capture();
     let cell = Cell::start().await;

@@ -4,7 +4,7 @@
 
 use tierstore::{Backend, Error};
 
-use crate::support::{body, check_ranges, keys, page};
+use crate::support::{body, broken, check_ranges, chunks, keys, page};
 
 /// A second put of a key is refused with `AlreadyExists`, and the first object stays.
 pub async fn a_second_put_is_refused(backend: &dyn Backend) {
@@ -101,4 +101,57 @@ pub async fn a_put_if_match_replaces_only_the_object_with_that_tag(backend: &dyn
 
     let absent = backend.put_if_match("other", body("x"), &tag).await;
     assert_eq!(absent, Err(Error::NotFound("other".to_owned())));
+}
+
+/// A streamed put creates the object from its chunks, whose length is told or not, with the
+/// size and the content tag a put of the same bytes gives.
+pub async fn a_streamed_put_creates_the_object_from_its_chunks(backend: &dyn Backend) {
+    backend.put("whole", body("streamed body")).await.unwrap();
+    let told = chunks(&["streamed", " ", "body"]);
+    backend.put_stream("told", Some(13), told).await.unwrap();
+    let untold = chunks(&["streamed ", "body"]);
+    backend.put_stream("untold", None, untold).await.unwrap();
+    for key in ["told", "untold"] {
+        assert_eq!(backend.get(key, None).await.unwrap(), body("streamed body"));
+        let (made, whole) = (
+            backend.head(key).await.unwrap(),
+            backend.head("whole").await,
+        );
+        assert!(made.same_content(&whole.unwrap()), "{key}");
+    }
+    backend
+        .put_stream("empty", Some(0), chunks(&[]))
+        .await
+        .unwrap();
+    assert_eq!(backend.get("empty", None).await.unwrap(), body(""));
+}
+
+/// A streamed put whose body ends with an error, after chunks or at once, gives that error and
+/// leaves nothing: no object under the key and none in a listing; the key can be put again.
+pub async fn a_streamed_put_that_fails_leaves_nothing(backend: &dyn Backend) {
+    let cut = Error::Other("cut".to_owned());
+    let after_chunks = backend
+        .put_stream("k", Some(9), broken(&["abc", "def"], &cut))
+        .await;
+    assert_eq!(after_chunks, Err(cut.clone()));
+    let at_once = backend.put_stream("k", None, broken(&[], &cut)).await;
+    assert_eq!(at_once, Err(cut));
+    assert_eq!(keys(backend).await, Vec::<String>::new());
+    let missing = Error::NotFound("k".to_owned());
+    assert_eq!(backend.head("k").await.unwrap_err(), missing);
+    backend
+        .put_stream("k", None, chunks(&["fine"]))
+        .await
+        .unwrap();
+    assert_eq!(backend.get("k", None).await.unwrap(), body("fine"));
+}
+
+/// A streamed put of a key that exists is refused with `AlreadyExists`, and the first object
+/// stays.
+pub async fn a_streamed_put_of_an_existing_key_is_refused(backend: &dyn Backend) {
+    backend.put("k", body("one")).await.unwrap();
+    let again = backend.put_stream("k", Some(3), chunks(&["two"])).await;
+    assert_eq!(again, Err(Error::AlreadyExists("k".to_owned())));
+    assert_eq!(backend.get("k", None).await.unwrap(), body("one"));
+    assert_eq!(keys(backend).await, ["k"]);
 }
