@@ -385,6 +385,7 @@ fn create_file(path: &Path, is_executable: bool, bytes: &[u8]) -> Result<(), Fet
 
 #[cfg(test)]
 mod tests {
+    use kbf_testkit::dir::TestDir;
     use std::collections::HashMap;
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::net::TcpListener;
@@ -447,16 +448,8 @@ mod tests {
         }
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let exe = std::env::current_exe().expect("test binary");
-        let dir = exe
-            .parent()
-            .expect("deps directory")
-            .join("kbf-task-fetch-unit")
-            .join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
-        dir
+    fn scratch(name: &str) -> TestDir {
+        TestDir::under(std::env::temp_dir(), &format!("kbf-task-fetch-{name}"))
     }
 
     fn file(name: &str, digest: &Digest, is_executable: bool) -> FileNode {
@@ -534,7 +527,8 @@ mod tests {
     #[test]
     fn a_nested_tree_is_laid_out_with_modes_and_symlinks() {
         let (mem, root) = tree();
-        let dir = scratch("layout").join("in");
+        let scratch_dir = scratch("layout");
+        let dir = scratch_dir.join("in");
         materialize(&mem, &root, &dir).expect("materialize");
         assert_eq!(std::fs::read(dir.join("a.txt")).expect("a"), b"hello");
         assert_eq!(std::fs::read(dir.join("copy.txt")).expect("copy"), b"hello");

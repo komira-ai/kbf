@@ -204,6 +204,7 @@ pub async fn collect_outputs(
 
 #[cfg(test)]
 mod tests {
+    use kbf_testkit::dir::TestDir;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::PathBuf;
 
@@ -211,26 +212,20 @@ mod tests {
 
     use super::*;
 
-    /// A fresh scratch directory for one unit test, beside the test binary.
-    fn scratch(name: &str) -> PathBuf {
-        let exe = std::env::current_exe().expect("test binary");
-        let dir = exe
-            .parent()
-            .expect("deps directory")
-            .join("kbf-task-outputs-unit")
-            .join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
-        dir
+    /// A fresh scratch directory for one unit test, removed when the test ends.
+    fn scratch(name: &str) -> TestDir {
+        TestDir::under(std::env::temp_dir(), &format!("kbf-task-outputs-{name}"))
     }
 
     /// A work directory `work` and log files `out` and `err` under a scratch directory.
-    fn rig(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+    /// The directory is returned too: it is removed when the caller drops it.
+    fn rig(name: &str) -> (TestDir, PathBuf, PathBuf, PathBuf) {
         let dir = scratch(name);
         std::fs::create_dir(dir.join("work")).expect("work");
         std::fs::write(dir.join("out"), b"to stdout").expect("out");
         std::fs::write(dir.join("err"), b"to stderr").expect("err");
-        (dir.join("work"), dir.join("out"), dir.join("err"))
+        let (work, out, err) = (dir.join("work"), dir.join("out"), dir.join("err"));
+        (dir, work, out, err)
     }
 
     async fn gather(
@@ -259,7 +254,7 @@ mod tests {
     /// executable bit that is dropped or set on a plain file.
     #[tokio::test]
     async fn files_are_recorded_with_their_executable_bit() {
-        let (work, out, err) = rig("files");
+        let (_dir, work, out, err) = rig("files");
         std::fs::write(work.join("plain"), b"plain bytes").expect("plain");
         std::fs::write(work.join("tool"), b"tool bytes\n").expect("tool");
         std::fs::set_permissions(work.join("tool"), std::fs::Permissions::from_mode(0o755))
@@ -286,7 +281,7 @@ mod tests {
     /// Catches stdout or stderr left out of the result or the blobs, or swapped.
     #[tokio::test]
     async fn stdout_and_stderr_are_hashed_and_recorded() {
-        let (work, out, err) = rig("stdio");
+        let (_dir, work, out, err) = rig("stdio");
         let got = gather(&work, &out, &err, &[], OutputLimits::default(), 1 << 20)
             .await
             .expect("collect");
@@ -304,7 +299,7 @@ mod tests {
     #[tokio::test]
     async fn a_directory_is_recorded_as_a_tree() {
         use prost::Message;
-        let (work, out, err) = rig("tree");
+        let (_dir, work, out, err) = rig("tree");
         std::fs::create_dir_all(work.join("d/sub")).expect("dirs");
         std::fs::write(work.join("d/a"), b"a").expect("a");
         std::fs::write(work.join("d/sub/b"), b"b").expect("b");
@@ -330,7 +325,7 @@ mod tests {
     /// Catches a symlink followed or recorded as a file, and a missing output recorded at all.
     #[tokio::test]
     async fn a_symlink_is_kept_and_a_missing_output_is_left_out() {
-        let (work, out, err) = rig("links");
+        let (_dir, work, out, err) = rig("links");
         symlink("elsewhere/target", work.join("link")).expect("link");
         let got = gather(
             &work,
@@ -353,7 +348,7 @@ mod tests {
     /// two outputs with the same bytes recorded twice.
     #[tokio::test]
     async fn a_large_file_is_read_back_and_equal_blobs_are_recorded_once() {
-        let (work, out, err) = rig("large");
+        let (_dir, work, out, err) = rig("large");
         let large: Vec<u8> = (0..(CHUNK_BYTES + 5)).map(|i| (i % 251) as u8).collect();
         std::fs::write(work.join("big"), &large).expect("big");
         std::fs::write(work.join("copy"), &large).expect("copy");
@@ -386,7 +381,7 @@ mod tests {
     /// second time.
     #[tokio::test]
     async fn blobs_past_the_cap_fail() {
-        let (work, out, err) = rig("cap");
+        let (_dir, work, out, err) = rig("cap");
         std::fs::write(work.join("x"), vec![1u8; 100]).expect("x");
         std::fs::write(work.join("y"), vec![1u8; 100]).expect("y");
         let limits = OutputLimits::default();
@@ -406,7 +401,7 @@ mod tests {
     /// `--output-max-stdio-bytes` must fail.
     #[tokio::test]
     async fn the_output_limits_apply() {
-        let (work, out, err) = rig("limits");
+        let (_dir, work, out, err) = rig("limits");
         let limits = OutputLimits {
             max_stdio_bytes: 4,
             ..OutputLimits::default()
