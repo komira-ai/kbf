@@ -127,6 +127,10 @@ jobs:
         env:
           CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
           AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          # The cc crate's own flags include `--target=arm64-apple-macosx`, which Zig refuses
+          # (its compiler-family probe runs the program without `cc`, so it takes Zig for clang).
+          # Without the defaults Zig gets its own `-target` and each build script's flags.
+          CRATE_CC_NO_DEFAULTS: "1"
         run: cargo check --locked --target aarch64-apple-darwin --bins --tests --features kbf-setup/proxy -p kbf-node -p kbf-outputs -p kbf-driver-native -p kbf-cli -p kbf-daemon -p kbf-daemon-test -p kbf-mac-session -p kbf-installer -p kbf-setup -p kbf-vmm -p kbf-deploy -p kbf-host-install -p kbf-updater -p kbf-mac-provision -p xtask
       # The interpreter budget only shrinks: a pull request may not add a row to it
       # (crates/xtask/src/budget.rs). A pull request is checked out as the merge commit,
