@@ -213,6 +213,11 @@ async fn the_fake_answers_in_the_shape_of_the_golden_bodies() {
     let (status, bodyless) = raw_json(&server, "POST", &format!("/v1/leases/{id}/renew"), "").await;
     assert_eq!(status, 200, "the renew body may be left out");
     assert_eq!(shape(&bodyless), shape(&golden("renewed")));
+    let ttl = golden("renew_request_ttl").to_string();
+    let (status, with_ttl) =
+        raw_json(&server, "POST", &format!("/v1/leases/{id}/renew"), &ttl).await;
+    assert_eq!(status, 200, "the documented renew body is read");
+    assert_eq!(shape(&with_ttl), shape(&golden("renewed")));
     let (_, leases) = raw_json(&server, "GET", "/v1/leases", "").await;
     assert_eq!(
         shape(&leases["leases"][0]),
