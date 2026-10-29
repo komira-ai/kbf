@@ -39,7 +39,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::executor::runs::Task;
-use crate::executor::{Ctx, HostInfo, View, lease_gone, note};
+use crate::executor::{Ctx, HostInfo, View, lease_gone, release_lease};
 use crate::farm::{Outbound, Reported, StreamId};
 use crate::worker::{HostFloor, PROTOCOL_VERSION, reported};
 
@@ -368,10 +368,7 @@ impl HostWorker {
             Retire::Lost | Retire::Fenced => self.stop_all(ctx).await,
             Retire::Drained => {}
         }
-        note(
-            "releasing the lease",
-            &ctx.deps.client.release(self.lease).await,
-        );
+        release_lease(ctx, self.lease).await;
         self.forget();
     }
 }

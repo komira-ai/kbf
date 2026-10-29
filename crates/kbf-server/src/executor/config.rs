@@ -64,6 +64,10 @@ pub struct Config {
     pub acquire_retry: Duration,
     /// How often the lease server's host list is read, to see a host lost or tainted.
     pub host_check: Duration,
+    /// How often the leases under this frontend's label are compared with the slots', to
+    /// release one no slot holds: one booked by a request whose answer was lost, or one a
+    /// release did not reach. The same check runs at once after either.
+    pub reconcile_every: Duration,
     /// T: how long a worker goes on with its runs after the farm last acknowledged a
     /// heartbeat, or the lease server last answered, before it stops them and goes silent.
     pub fence_after: Duration,
@@ -152,6 +156,7 @@ impl Config {
             poll: Duration::from_millis(500),
             acquire_retry: Duration::from_secs(5),
             host_check: Duration::from_secs(5),
+            reconcile_every: Duration::from_secs(60),
             fence_after: SELF_FENCE,
             delivery: Delivery::InsecureArgv,
             tool: "/mnt/kbf-tools/kbf-task".to_owned(),

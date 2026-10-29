@@ -32,6 +32,7 @@ mod traits;
 mod test_support;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::future::join_all;
@@ -110,6 +111,33 @@ pub(crate) struct Ctx<'a> {
     pub(crate) cfg: &'a Config,
     pub(crate) deps: &'a Deps,
     pub(crate) clock: &'a Clock,
+    pub(crate) strays: &'a Strays,
+}
+
+/// Whether a lease may exist that no slot holds: a request that may have booked one got no
+/// answer, or a release failed. The next pass looks for it by label.
+#[derive(Default)]
+pub(crate) struct Strays(AtomicBool);
+
+impl Strays {
+    pub(crate) fn suspect(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    fn take(&self) -> bool {
+        self.0.swap(false, Ordering::Relaxed)
+    }
+}
+
+/// Releases `lease`. A release that did not reach the lease server leaves a lease nobody
+/// holds, so the next pass looks for it; one the server answered, even with a refusal, leaves
+/// nothing to look for.
+pub(crate) async fn release_lease(ctx: &Ctx<'_>, lease: LeaseId) {
+    let released = ctx.deps.client.release(lease).await;
+    note("releasing the lease", &released);
+    if released.as_ref().err().is_some_and(|e| e.api().is_none()) {
+        ctx.strays.suspect();
+    }
 }
 
 /// What the lease server said this pass.
@@ -186,6 +214,9 @@ pub struct Executor {
     clock: Clock,
     slots: Vec<Slot>,
     adopted: bool,
+    strays: Strays,
+    /// When the leases were last compared with the slots'.
+    reconciled: Option<Instant>,
     /// When the host list was last read.
     hosts_read: Option<Instant>,
 }
@@ -204,6 +235,8 @@ impl Executor {
             clock,
             slots: Vec::new(),
             adopted: false,
+            strays: Strays::default(),
+            reconciled: None,
             hosts_read: None,
         })
     }
@@ -227,12 +260,27 @@ impl Executor {
             clock,
             slots,
             adopted,
+            strays,
+            reconciled,
             hosts_read,
         } = self;
-        let ctx = Ctx { cfg, deps, clock };
+        let ctx = Ctx {
+            cfg,
+            deps,
+            clock,
+            strays,
+        };
         if !*adopted {
             *slots = pool::adopt(&ctx, now).await.unwrap_or_default();
             *adopted = !slots.is_empty();
+            *reconciled = Some(now);
+        }
+        let due = reconciled.is_none_or(|at| now >= at + cfg.reconcile_every);
+        if strays.take() || due {
+            *reconciled = Some(now);
+            if !pool::reconcile(&ctx, slots).await {
+                strays.suspect();
+            }
         }
         let view = read(&ctx, slots, hosts_read, now).await;
         join_all(slots.iter_mut().map(|slot| slot.drive(&ctx, &view, now))).await;
@@ -245,6 +293,7 @@ impl Executor {
             cfg: &self.cfg,
             deps: &self.deps,
             clock: &self.clock,
+            strays: &self.strays,
         };
         let slots = std::mem::take(&mut self.slots);
         join_all(slots.into_iter().map(|slot| slot.release(&ctx))).await;

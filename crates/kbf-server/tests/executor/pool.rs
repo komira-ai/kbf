@@ -203,6 +203,131 @@ async fn adoption_releases_what_the_pool_does_not_need_and_waits_for_what_is_boo
     assert_eq!(state, LeaseState::Held);
 }
 
+/// Books a lease under the frontend's label straight from the lease server, as a request
+/// the executor sent and got no answer to may have been booked.
+async fn book_stray(rig: &Rig) -> kbf_lease_client::LeaseId {
+    let resources = kbf_lease_client::Resources {
+        cpu_millis: 2_000,
+        memory_bytes: 16 * crate::rig::GIB,
+        gpus: 0,
+        gpu_class: None,
+    };
+    let request = kbf_lease_client::AcquireRequest::new("farm-linux", resources, rig.cfg.max_wall)
+        .label("kbf-frontend", &rig.cfg.frontend);
+    match rig.api.acquire(&request).await.expect("a stray lease") {
+        kbf_lease_client::Acquired::Granted(granted) => granted.id,
+        kbf_lease_client::Acquired::Pending(pending) => pending.id,
+    }
+}
+
+async fn state_of(rig: &Rig, lease: kbf_lease_client::LeaseId) -> Option<LeaseState> {
+    let leases = rig.api.leases().await.expect("leases");
+    leases.iter().find(|l| l.id == lease).map(|l| l.state)
+}
+
+/// Catches a lease booked by a request whose answer was lost staying booked: the executor
+/// does not know it, nothing renews or releases it, and it keeps a host until its ttl. After
+/// an acquire that may have applied, the leases under the frontend's label are compared with
+/// the slots' at once, and the one no slot holds is released.
+#[tokio::test(start_paused = true)]
+async fn a_lease_booked_by_a_lost_answer_is_released() {
+    let mut rig = Rig::start(&["node1", "node2"], 1, |_| {}).await;
+    rig.pump().await;
+    let first = rig.exec.hosts()[0].lease;
+    rig.api.release(first).await.expect("released");
+    rig.pump().await;
+    rig.advance(Duration::from_secs(6)).await;
+    rig.fake.inject_on("POST /v1/leases", Fault::Close);
+    rig.exec.step().await;
+    assert!(rig.exec.hosts().is_empty(), "the answer was lost");
+    let stray = book_stray(&rig).await;
+    rig.advance(Duration::from_secs(6)).await;
+    rig.pump().await;
+    assert_ne!(state_of(&rig, stray).await, Some(LeaseState::Held));
+    let hosts = rig.exec.hosts();
+    assert_eq!(hosts.len(), 1, "the slot was not filled again");
+    assert_ne!(hosts[0].lease, stray);
+    let released = format!("DELETE /v1/leases/{stray}");
+    assert_eq!(count(&rig.requests(), &released), 1);
+}
+
+/// Catches a lease the executor released without the lease server hearing (a flaky server
+/// is when workers are retired) staying booked: the slot asks for a replacement at once and
+/// on a pool sized to the machines is refused for room, with the first lease holding the
+/// host until its ttl. The release is found out, and the lease released before the slot asks.
+#[tokio::test(start_paused = true)]
+async fn a_release_that_did_not_arrive_is_made_again() {
+    let mut rig = Rig::start(&["node1"], 1, |cfg| {
+        short_leases(cfg);
+        cfg.lease_ttl = Duration::from_secs(3600);
+        cfg.host_check = Duration::from_secs(3600);
+        cfg.reconcile_every = Duration::from_secs(3600);
+    })
+    .await;
+    rig.pump().await;
+    let first = rig.exec.hosts()[0].lease;
+    // 181 s on, the lease is within 120 s of its end: the worker drains, and is released.
+    rig.advance(Duration::from_secs(181)).await;
+    rig.fake.inject_on("DELETE /v1/leases/", Fault::Close);
+    rig.exec.step().await;
+    assert_eq!(
+        state_of(&rig, first).await,
+        Some(LeaseState::Held),
+        "the release arrived"
+    );
+    rig.advance(Duration::from_secs(1)).await;
+    rig.pump().await;
+    assert_ne!(state_of(&rig, first).await, Some(LeaseState::Held));
+    let hosts = rig.exec.hosts();
+    assert_eq!(hosts.len(), 1, "no replacement: the host was still booked");
+    assert_ne!(hosts[0].lease, first);
+}
+
+/// Catches a stray lease no failure announced (the leases of a frontend that crashed
+/// after booking, of a request that timed out and was read as a refusal) staying booked for
+/// good: the leases under the label are compared with the slots' every `reconcile_every`.
+#[tokio::test(start_paused = true)]
+async fn a_stray_lease_is_found_by_the_periodic_check() {
+    let mut rig = Rig::start(&["node1", "node2"], 1, |cfg| {
+        cfg.reconcile_every = Duration::from_secs(30);
+    })
+    .await;
+    rig.pump().await;
+    let held = rig.exec.hosts()[0].lease;
+    let stray = book_stray(&rig).await;
+    rig.advance(Duration::from_secs(10)).await;
+    rig.pump().await;
+    assert_eq!(state_of(&rig, stray).await, Some(LeaseState::Held));
+    rig.advance(Duration::from_secs(25)).await;
+    rig.pump().await;
+    assert_ne!(state_of(&rig, stray).await, Some(LeaseState::Held));
+    assert_eq!(state_of(&rig, held).await, Some(LeaseState::Held));
+    assert_eq!(rig.exec.hosts()[0].lease, held);
+}
+
+/// Catches a restarted frontend that adopts a lease whose runs it could not list, or could not
+/// stop: they keep the host's budget until their wall time ends and every `Start` is refused
+/// for room until its window is gone. The lease is given up instead, and the slot asks for
+/// another once it may.
+#[tokio::test(start_paused = true)]
+async fn adoption_that_could_not_stop_the_runs_gives_the_lease_up() {
+    for (what, fault_on) in [("list", "GET /v1/leases/"), ("stop", "DELETE /v1/leases/")] {
+        let mut rig = Rig::start(&["node1"], 1, |_| {}).await;
+        rig.pump().await;
+        let _caller = rig.submit(1);
+        rig.pump().await;
+        assert_eq!(rig.runs_of(1).await.len(), 1);
+        let lease = rig.exec.hosts()[0].lease;
+        rig.exec = rig.restarted_executor();
+        rig.fake.inject_on(fault_on, Fault::Close);
+        rig.exec.step().await;
+        assert!(rig.exec.hosts().is_empty(), "{what}: adopted with live runs");
+        let released = count(&rig.requests(), &format!("DELETE /v1/leases/{lease}"));
+        assert_eq!(released, 1, "{what}: the lease was not given up");
+        assert_ne!(state_of(&rig, lease).await, Some(LeaseState::Held), "{what}");
+    }
+}
+
 /// Catches a lease that expires under a busy pool: it is renewed every third of its ttl for
 /// as long as the executor runs, and the lease server never lets go of it.
 #[tokio::test(start_paused = true)]

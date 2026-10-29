@@ -19,7 +19,7 @@ use crate::executor::traits::{
     ActionFacts, Ingest, Ingested, Inputs, InputsError, Presign, PresignError, ReadGrant,
     UntrustedLimits,
 };
-use crate::executor::{Clock, Config, Ctx, Deps, PackKey, Secret};
+use crate::executor::{Clock, Config, Ctx, Deps, PackKey, Secret, Strays};
 
 pub(super) const GIB: u64 = 1 << 30;
 
@@ -75,6 +75,7 @@ pub(super) struct Harness {
     pub(super) cfg: Config,
     pub(super) deps: Deps,
     pub(super) clock: Clock,
+    pub(super) strays: Strays,
     release: Option<std::sync::mpsc::Sender<()>>,
 }
 
@@ -114,6 +115,7 @@ impl Harness {
             cfg,
             deps,
             clock,
+            strays: Strays::default(),
             release: Some(release),
         }
     }
@@ -123,6 +125,7 @@ impl Harness {
             cfg: &self.cfg,
             deps: &self.deps,
             clock: &self.clock,
+            strays: &self.strays,
         }
     }
 
