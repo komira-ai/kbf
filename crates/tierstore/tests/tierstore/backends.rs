@@ -379,3 +379,15 @@ async fn the_injector_treats_a_streamed_put_as_a_put() {
         Error::NotFound("b".to_owned())
     );
 }
+
+/// Asserts that the monotonic clock starts near zero, never goes back, and counts milliseconds
+/// (a thousand of them do not pass in the first read), whatever the clock of the machine says.
+#[test]
+fn the_monotonic_clock_starts_near_zero_and_does_not_go_back() {
+    let clock = tierstore::MonotonicClock::new();
+    let first = clock.now();
+    let second = clock.now();
+    assert!(first < 60_000);
+    assert!(second >= first);
+    assert!(tierstore::MonotonicClock::default().now() < 60_000);
+}
