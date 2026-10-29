@@ -274,6 +274,102 @@ fn a_full_batch_unacked_at_stream_end_leaves_every_lease_in_order() {
     }
 }
 
+/// Asserts that a batch left unacknowledged by two streams in a row is held again each time and
+/// sent once per stream, alone, with the time it was first taken kept: minute 0 goes out on
+/// the first stream, again on the second and the third, and only after its acknowledgement
+/// does minute 1 (closed and waiting the whole time) follow, once. Each lease's minutes reach
+/// the wire ascending. Then the same on a third stream that begins past the age limit counted
+/// from the first take (but within it counted from the second send) drops the batch and counts
+/// it as aged out, so minute 1 goes out and minute 0 does not.
+#[test]
+fn a_held_batch_unacked_again_is_held_again_once() {
+    let minute_ids = |out: &Attached| -> Vec<(u64, u32)> {
+        minutes_of(out).iter().map(|m| (m.1, m.2)).collect()
+    };
+    let first_take = 60 * S;
+    let limit_s = MAX_UNSENT_AGE_USEC / S;
+
+    let mut lm = ten_seconds();
+    let mut wire: Vec<(u64, u32)> = Vec::new();
+    let first = beats(&mut lm, 1, (0..=140).step_by(10));
+    for out in &first {
+        wire.extend(minute_ids(out));
+    }
+    assert_eq!(wire, [(1, 0)], "minute 0 on the first stream");
+    assert_eq!(lm.in_flight(), Some(7));
+
+    lm.new_stream(Duration::from_secs(10));
+    let second = lm.beat(1, &steady(150));
+    assert_eq!(minute_ids(&second), [(1, 0)]);
+    wire.extend(minute_ids(&second));
+    assert_eq!(lm.in_flight(), Some(1));
+
+    lm.new_stream(Duration::from_secs(10));
+    assert_eq!(lm.in_flight(), None);
+    let third = lm.beat(1, &steady(160));
+    assert_eq!(minute_ids(&third), [(1, 0)], "alone, though minute 1 waits");
+    wire.extend(minute_ids(&third));
+    let kept = lm.in_flight.as_ref().expect("the batch is in flight again");
+    assert_eq!(
+        kept.batch.taken_usec, first_take,
+        "ages from the first take"
+    );
+    lm.acked(1);
+
+    let after = lm.beat(2, &steady(170));
+    assert_eq!(minute_ids(&after), [(1, 1)]);
+    wire.extend(minute_ids(&after));
+    lm.acked(2);
+    let rest = beats(&mut lm, 3, [180, 190]);
+    assert!(
+        rest.iter().all(|out| out.minutes.is_empty()),
+        "nothing repeats"
+    );
+    assert_eq!(wire, [(1, 0), (1, 0), (1, 0), (1, 1)]);
+    assert!(wire.is_sorted());
+    assert_eq!(lm.counters().aged_out, 0);
+
+    // Past the limit from the first take, within it from the second send (at 150 s).
+    let mut lm = ten_seconds();
+    beats(&mut lm, 1, (0..=140).step_by(10));
+    lm.new_stream(Duration::from_secs(10));
+    lm.beat(1, &steady(150));
+    lm.new_stream(Duration::from_secs(10));
+    let late = lm.beat(1, &steady(60 + limit_s + 1));
+    assert_eq!(
+        minute_ids(&late),
+        [(1, 1)],
+        "minute 0 dropped, minute 1 sent"
+    );
+    assert_eq!(lm.counters().aged_out, 1);
+}
+
+/// Asserts that a lease that ends while its minutes are in a held batch sends its last minute
+/// after them: minute 0 is held at the stream end, the lease ends (its open minute 1 closes)
+/// before the next stream's first heartbeat, which carries the held minute 0 alone, and the
+/// acknowledged one after carries the final minute 1, each once and ascending.
+#[test]
+fn a_lease_that_ends_while_its_minutes_are_held_sends_its_last_minute_after_them() {
+    let mut lm = ten_seconds();
+    beats(
+        &mut lm,
+        1,
+        [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 105],
+    );
+    assert_eq!(lm.in_flight(), Some(7));
+
+    lm.new_stream(Duration::from_secs(10));
+    lm.lease_ended(LeaseId::new(1, 1));
+    let first = lm.beat(1, &reading(115, Vec::new()));
+    assert_eq!(minutes_of(&first), [(1, 1, 0, 500, 500, 50)], "held, alone");
+    lm.acked(1);
+    let second = lm.beat(2, &reading(125, Vec::new()));
+    assert_eq!(minutes_of(&second), [(1, 1, 1, 500, 500, 105)]);
+    lm.acked(2);
+    let third = lm.beat(3, &reading(135, Vec::new()));
+    assert!(third.minutes.is_empty(), "each once");
+}
+
 /// Asserts the age limit of a kept batch: one the next stream's first heartbeat finds ten
 /// minutes old (to the second) is still sent, and one a second older is dropped and counted
 /// as aged out.

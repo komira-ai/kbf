@@ -19,10 +19,12 @@
 //! lease's minutes must reach it in ascending order; handing the batch back to the binner
 //! would stamp its minutes with the latest close time and let a newer minute of a lease
 //! go out ahead of the older one when more than a batch is waiting. A minute sent twice is
-//! merged by the receiver with the larger value of each field. A kept batch older than the
-//! binner's age limit is dropped and counted, as the binner does with its own minutes. A
-//! server that withholds acknowledgements keeps the batch in flight; minutes that close
-//! under it wait in the binner, which drops those older than ten minutes.
+//! merged by the receiver with the larger value of each field. A kept batch is dropped and
+//! counted once it is older than the binner's age limit, but it ages from when the batch was
+//! first taken (it keeps that time across streams), not from when its minutes closed, so it
+//! can outlive the binner's own limit by up to one batch interval. A server that withholds
+//! acknowledgements keeps the batch in flight; minutes that close under it wait in the
+//! binner, which drops those older than ten minutes.
 //!
 //! A lease's last, partial minute is closed by [`LeaseMinutes::lease_ended`] and rides the
 //! first heartbeat after it, not the lease's Result.
