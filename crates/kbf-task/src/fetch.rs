@@ -1,22 +1,47 @@
 //! Reading the action's inputs through the read grant: blobs by digest, checked, and the input
 //! tree laid out under a directory.
 //!
-//! A [`BlobSource`] returns the bytes of one blob. Nothing a source returns is trusted:
-//! [`BlobSource::verified`] checks the length and the SHA-256 of every blob against its digest, and
-//! every read in this module goes through it. [`HttpBlobSource`] is the source over the read grant
-//! (a base URL and a bearer token); tests use an in-memory one.
+//! A [`BlobSource`] hands over the bytes of a blob, either whole ([`BlobSource::get`]) or streamed
+//! into a writer ([`BlobSource::fetch_to`]). Nothing a source returns is trusted: every blob
+//! passes through a check of its length and SHA-256 against its digest as it streams, and a body
+//! longer than the digest says is refused at the first byte past the size, never buffered.
+//! [`HttpBlobSource`] is the source over the read grant (a base URL and a bearer token); tests use
+//! in-memory ones.
+//!
+//! Directory, Action and Command messages are held in memory and decoded; a message whose digest
+//! names more than [`MAX_MESSAGE_BYTES`] is refused before any request. File blobs are never held
+//! whole: each streams from the response to its first path on disk.
 //!
 //! [`materialize`] writes the tree under an input root digest into a directory. Directory messages
 //! come from clients, so every name is checked before it touches the filesystem: a name with a
 //! slash, `.`, `..` or a NUL, empty, or used twice in one directory refuses the tree. Files are
 //! created with `O_EXCL` in directories this module made, so no write follows a symlink the tree
-//! contains. There is no cache and no hard link: each file is its own copy.
+//! contains.
+//!
+//! # Concurrency
+//!
+//! The tree is read breadth-first: each level's distinct Directory messages are fetched together,
+//! then every distinct file blob. In both phases at most `concurrency` requests are in flight, on
+//! that many threads of a scope pulling from one shared queue of digests (see
+//! [`BlobSource::fetch_many`]); [`HttpBlobSource`] shares one `ureq` agent among them, so
+//! keep-alive connections are pooled. The first failure stops new requests; requests already in
+//! flight finish, and that first error is returned.
+//!
+//! # Copies
+//!
+//! A blob named by several paths is fetched once, streamed to the first path. The other paths are
+//! made from that file once its hash has been checked: a hard link when the executable bit is the
+//! same and the filesystem allows it (the paths then share one inode, so a write through one is
+//! seen through the other), else a copy with its own mode. A blob that fails its check is removed
+//! from its path, so a file at a path is a complete, verified one; the tree around it is left for
+//! the caller to remove.
 
-use std::collections::{BTreeSet, HashMap};
-use std::io::{Read as _, Write as _};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::{Read as _, Write};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kbf_proto::reapi::Digest;
@@ -86,53 +111,221 @@ fn check_digest(digest: &Digest) -> Result<(), FetchError> {
     }
 }
 
-/// Where blobs come from. Implement [`BlobSource::get`]; read through [`BlobSource::verified`].
-pub trait BlobSource {
+/// The most a Directory, Action or Command message may be: these are held in memory, so a digest
+/// naming more is refused before any request.
+pub const MAX_MESSAGE_BYTES: i64 = 4 << 20;
+
+/// Streams one blob into the writer it is handed: what [`BlobSource::fetch_many`] gives its
+/// callback for each digest.
+pub type Fetch<'a> = &'a mut dyn FnMut(&mut dyn Write) -> Result<(), FetchError>;
+
+/// What [`BlobSource::fetch_many`] calls for digest number `index`: it must call the [`Fetch`]
+/// it is given exactly once and return its result, or its own error.
+pub type Each<'a> = dyn Fn(usize, Fetch<'_>) -> Result<(), FetchError> + Sync + 'a;
+
+/// Where blobs come from. Implement [`BlobSource::get`]; a source that can stream overrides
+/// [`BlobSource::fetch_to`], and one that can ask for many blobs in one request overrides
+/// [`BlobSource::fetch_many`].
+pub trait BlobSource: Sync {
     /// The bytes the source holds for `digest`, unchecked.
     ///
     /// # Errors
     /// The blob cannot be had: [`FetchError::Source`].
     fn get(&self, digest: &Digest) -> Result<Vec<u8>, FetchError>;
 
-    /// The blob `digest` names: [`BlobSource::get`] with the digest itself checked first, and the
-    /// bytes checked against it after (length, then SHA-256).
+    /// Writes the bytes the source holds for `digest`, unchecked, into `out` as they arrive. A
+    /// source that streams stops reading once `out` refuses a write; the default holds the blob
+    /// whole through [`BlobSource::get`].
+    ///
+    /// # Errors
+    /// The blob cannot be had ([`FetchError::Source`]), or `out` fails.
+    fn fetch_to(&self, digest: &Digest, out: &mut dyn Write) -> Result<(), FetchError> {
+        let bytes = self.get(digest)?;
+        out.write_all(&bytes).map_err(|e| FetchError::Source {
+            digest: label(digest),
+            why: format!("the bytes could not be taken: {e}"),
+        })
+    }
+
+    /// Fetches every digest in `digests`, at most `concurrency` (at least 1) requests in flight,
+    /// by calling `each(index, fetch)` for each; `fetch` streams that digest's blob into the
+    /// writer `each` gives it. Returns the first error, after which no new request starts and
+    /// those in flight finish.
+    ///
+    /// This is the one place a source that has a batch request would send its requests: the
+    /// default is one [`BlobSource::fetch_to`] per digest, on a pool of threads.
+    ///
+    /// # Errors
+    /// The first error any `each` returned.
+    fn fetch_many(
+        &self,
+        digests: &[Digest],
+        concurrency: usize,
+        each: &Each<'_>,
+    ) -> Result<(), FetchError> {
+        run_bounded(concurrency, digests, &|index, digest| {
+            each(index, &mut |out| self.fetch_to(digest, out))
+        })
+    }
+
+    /// The blob `digest` names: [`BlobSource::fetch_to`] with the digest itself checked first, and
+    /// the bytes checked against it as they arrive (length, then SHA-256).
     ///
     /// # Errors
     /// The digest is malformed, the source fails, or the bytes are not the blob.
     fn verified(&self, digest: &Digest) -> Result<Vec<u8>, FetchError> {
-        check_digest(digest)?;
-        let bytes = self.get(digest)?;
-        let mismatch = |why: String| FetchError::Mismatch {
-            digest: label(digest),
-            why,
-        };
-        if i64::try_from(bytes.len()).ok() != Some(digest.size_bytes) {
-            return Err(mismatch(format!("it has {} bytes", bytes.len())));
-        }
-        let hash = hex::encode(Sha256::digest(&bytes));
-        if hash != digest.hash {
-            return Err(mismatch(format!("its SHA-256 is {hash}")));
-        }
-        Ok(bytes)
+        stream_checked(digest, Path::new(""), Vec::new(), &mut |out| {
+            self.fetch_to(digest, out)
+        })
     }
 }
 
-/// Fetches a blob and decodes it as `M`.
+/// Runs `work(index, item)` for every item on up to `concurrency` threads that take items from
+/// one shared queue in order. After the first error no thread takes another item; the others
+/// finish the one they have. Returns that first error.
+fn run_bounded<T: Sync>(
+    concurrency: usize,
+    items: &[T],
+    work: &(dyn Fn(usize, &T) -> Result<(), FetchError> + Sync),
+) -> Result<(), FetchError> {
+    let next = AtomicUsize::new(0);
+    let stopped = AtomicBool::new(false);
+    let first: Mutex<Option<FetchError>> = Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..concurrency.max(1).min(items.len()) {
+            scope.spawn(|| {
+                while !stopped.load(Ordering::SeqCst) {
+                    let index = next.fetch_add(1, Ordering::SeqCst);
+                    let Some(item) = items.get(index) else { break };
+                    if let Err(error) = work(index, item) {
+                        stopped.store(true, Ordering::SeqCst);
+                        first.lock().expect("first error").get_or_insert(error);
+                    }
+                }
+            });
+        }
+    });
+    match first.into_inner().expect("first error") {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// A writer in front of `inner` that checks what passes through against `digest`: it refuses the
+/// first write that would take the total past the digest's size, and hashes what it passes on.
+/// Why it refused (or why `inner` failed) is kept in `failure`, since the `io::Error` a source
+/// sees cannot carry it.
+struct Checked<'a, W> {
+    inner: W,
+    digest: &'a Digest,
+    path: &'a Path,
+    hasher: Sha256,
+    seen: u64,
+    failure: Option<FetchError>,
+}
+
+impl<W: Write> Write for Checked<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let (digest, path) = (self.digest, self.path);
+        let size = digest.size_bytes.unsigned_abs();
+        if self.seen + buf.len() as u64 > size {
+            self.failure.get_or_insert_with(|| FetchError::Mismatch {
+                digest: label(digest),
+                why: format!("it is longer than {size} bytes"),
+            });
+            return Err(std::io::Error::other("longer than its digest says"));
+        }
+        if let Err(source) = self.inner.write_all(buf) {
+            let kind = source.kind();
+            self.failure.get_or_insert_with(|| FetchError::Io {
+                path: path.to_owned(),
+                source,
+            });
+            return Err(std::io::Error::from(kind));
+        }
+        self.hasher.update(buf);
+        self.seen += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Streams the blob `digest` names into `inner` through `fetch`, checking it as it goes: the
+/// digest is well formed, the body is not longer than its size, and at the end it is exactly that
+/// long and its SHA-256 matches. Returns `inner` on success. `path` names `inner` in an error
+/// when writing to it fails.
+fn stream_checked<W: Write>(
+    digest: &Digest,
+    path: &Path,
+    inner: W,
+    fetch: Fetch<'_>,
+) -> Result<W, FetchError> {
+    check_digest(digest)?;
+    let mut checked = Checked {
+        inner,
+        digest,
+        path,
+        hasher: Sha256::new(),
+        seen: 0,
+        failure: None,
+    };
+    let fetched = fetch(&mut checked);
+    if let Some(failure) = checked.failure.take() {
+        return Err(failure);
+    }
+    fetched?;
+    checked.flush().map_err(io(path))?;
+    let mismatch = |why: String| FetchError::Mismatch {
+        digest: label(digest),
+        why,
+    };
+    if i64::try_from(checked.seen).ok() != Some(digest.size_bytes) {
+        return Err(mismatch(format!("it has {} bytes", checked.seen)));
+    }
+    let hash = hex::encode(checked.hasher.finalize());
+    if hash != digest.hash {
+        return Err(mismatch(format!("its SHA-256 is {hash}")));
+    }
+    Ok(checked.inner)
+}
+
+/// Streams `digest` through `fetch` into memory (at most [`MAX_MESSAGE_BYTES`], checked before
+/// the request), verifies it, and decodes it as `M`.
+fn message_from<M: Message + Default>(digest: &Digest, fetch: Fetch<'_>) -> Result<M, FetchError> {
+    if digest.size_bytes > MAX_MESSAGE_BYTES {
+        return Err(FetchError::Invalid(format!(
+            "message blob {} is {} bytes, over the {MAX_MESSAGE_BYTES}-byte limit for a message",
+            label(digest),
+            digest.size_bytes
+        )));
+    }
+    let bytes = stream_checked(digest, Path::new(""), Vec::new(), fetch)?;
+    M::decode(bytes.as_slice())
+        .map_err(|e| FetchError::Invalid(format!("blob {} does not decode: {e}", label(digest))))
+}
+
+/// Fetches a message blob and decodes it as `M`.
 ///
 /// # Errors
-/// The blob cannot be read ([`BlobSource::verified`]) or does not decode as `M`
+/// The digest names more than [`MAX_MESSAGE_BYTES`] ([`FetchError::Invalid`]), the blob cannot be
+/// read or checked ([`BlobSource::verified`]), or it does not decode as `M`
 /// ([`FetchError::Invalid`]).
 pub fn fetch_message<M: Message + Default>(
     source: &impl BlobSource,
     digest: &Digest,
 ) -> Result<M, FetchError> {
-    let bytes = source.verified(digest)?;
-    M::decode(bytes.as_slice())
-        .map_err(|e| FetchError::Invalid(format!("blob {} does not decode: {e}", label(digest))))
+    message_from(digest, &mut |out| source.fetch_to(digest, out))
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The most requests [`materialize`] may have in flight, and the number of idle keep-alive
+/// connections the agent keeps for them.
+pub const MAX_CONCURRENCY: usize = 256;
 
 /// The blobs of a read grant: `GET <base>/<hex>/<size>` with `Authorization: Bearer <token>`,
 /// over HTTPS with rustls on the ring provider, trusting only the roots it is given. No redirect
@@ -194,6 +387,8 @@ impl HttpBlobSource {
             .http_status_as_error(false)
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_global(Some(REQUEST_TIMEOUT))
+            .max_idle_connections(MAX_CONCURRENCY)
+            .max_idle_connections_per_host(MAX_CONCURRENCY)
             .tls_config(tls)
             .build()
             .into();
@@ -207,6 +402,12 @@ impl HttpBlobSource {
 
 impl BlobSource for HttpBlobSource {
     fn get(&self, digest: &Digest) -> Result<Vec<u8>, FetchError> {
+        let mut bytes = Vec::new();
+        self.fetch_to(digest, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn fetch_to(&self, digest: &Digest, out: &mut dyn Write) -> Result<(), FetchError> {
         check_digest(digest)?;
         let source = |why: String| FetchError::Source {
             digest: label(digest),
@@ -223,16 +424,11 @@ impl BlobSource for HttpBlobSource {
         if status != 200 {
             return Err(source(format!("the grant answered {status}")));
         }
-        // One byte past the size is enough for `verified` to see a blob that is too long.
+        // One byte past the size is enough for a check to see a blob that is too long.
         let limit = digest.size_bytes.unsigned_abs() + 1;
-        let mut bytes = Vec::new();
-        response
-            .body_mut()
-            .as_reader()
-            .take(limit)
-            .read_to_end(&mut bytes)
-            .map_err(|e| source(e.to_string()))?;
-        Ok(bytes)
+        std::io::copy(&mut response.body_mut().as_reader().take(limit), out)
+            .map(|_| ())
+            .map_err(|e| source(e.to_string()))
     }
 }
 
@@ -292,561 +488,157 @@ struct Copies {
     copies: Vec<(PathBuf, bool)>,
 }
 
-/// Writes the tree under `root` into `dir` (created if absent, and empty).
+/// Writes the tree under `root` into `dir` (created if absent, and empty), with at most
+/// `concurrency` (at least 1) requests in flight.
 ///
-/// The tree is walked first: every Directory message is read once however many places name it,
-/// every name is checked, every directory and symlink made. Then each distinct file blob is read
-/// once and written, with its executable bit, to every path that names it. A blob that is
-/// missing or does not match its digest fails the call; files already written stay in `dir`, for
-/// the caller to remove.
+/// The tree is walked breadth-first: each level's distinct Directory messages are fetched
+/// together, every Directory is read once however many places name it, every name is checked,
+/// every directory and symlink made. Then each distinct file blob is fetched once, streamed
+/// through its digest check to the first path that names it, and made at every other path (see
+/// the module documentation), with the executable bit of each. A blob that is missing or does not
+/// match its digest fails the call and is not left at its path; files already written stay in
+/// `dir`, for the caller to remove.
 ///
 /// # Errors
 /// A blob is missing or corrupt, the tree breaks a naming rule, or a write fails.
-pub fn materialize(source: &impl BlobSource, root: &Digest, dir: &Path) -> Result<(), FetchError> {
+pub fn materialize(
+    source: &impl BlobSource,
+    root: &Digest,
+    dir: &Path,
+    concurrency: usize,
+) -> Result<(), FetchError> {
     std::fs::create_dir_all(dir).map_err(io(dir))?;
-    let files = make_directories(source, root, dir)?;
-    write_files(source, files)
+    let files = make_directories(source, root, dir, concurrency)?;
+    let digests: Vec<Digest> = files.iter().map(|f| f.digest.clone()).collect();
+    source.fetch_many(&digests, concurrency, &|index, fetch| {
+        write_copies(&files[index], fetch)
+    })
 }
 
-/// Walks the tree under `root`, checking every Directory's names and making its directories and
-/// symlinks under `dir`; returns the file blobs to write, each distinct digest once.
+/// Fetches and decodes one Directory message and checks its names.
+fn fetch_directory(
+    digest: &Digest,
+    fetch: Fetch<'_>,
+) -> Result<kbf_proto::reapi::Directory, FetchError> {
+    let directory: kbf_proto::reapi::Directory = message_from(digest, fetch)?;
+    check_names(&directory)?;
+    Ok(directory)
+}
+
+/// Walks the tree under `root` a level at a time, checking every Directory's names and making
+/// its directories and symlinks under `dir`; returns the file blobs to write, each distinct digest
+/// once.
 fn make_directories(
     source: &impl BlobSource,
     root: &Digest,
     dir: &Path,
+    concurrency: usize,
 ) -> Result<Vec<Copies>, FetchError> {
     let mut files: Vec<Copies> = Vec::new();
     let mut blob_at: HashMap<String, usize> = HashMap::new();
     let mut loaded: HashMap<String, kbf_proto::reapi::Directory> = HashMap::new();
-    let mut pending = vec![(root.clone(), dir.to_owned())];
-    while let Some((digest, here)) = pending.pop() {
-        let key = label(&digest);
-        if !loaded.contains_key(&key) {
-            let directory = fetch_message(source, &digest)?;
-            check_names(&directory)?;
-            loaded.insert(key.clone(), directory);
+    let mut level = vec![(root.clone(), dir.to_owned())];
+    while !level.is_empty() {
+        let mut wanted: Vec<Digest> = Vec::new();
+        let mut queued = HashSet::new();
+        for (digest, _) in &level {
+            if !loaded.contains_key(&label(digest)) && queued.insert(label(digest)) {
+                wanted.push(digest.clone());
+            }
         }
-        let directory = &loaded[&key];
-        for file in &directory.files {
-            let digest = file.digest.clone().ok_or_else(|| {
-                FetchError::Invalid(format!("input file {:?} has no digest", file.name))
-            })?;
-            let copy = (here.join(&file.name), file.is_executable);
-            let at = *blob_at.entry(label(&digest)).or_insert_with(|| {
-                files.push(Copies {
-                    digest,
-                    copies: Vec::new(),
+        let slots: Vec<Mutex<Option<kbf_proto::reapi::Directory>>> =
+            wanted.iter().map(|_| Mutex::new(None)).collect();
+        source.fetch_many(&wanted, concurrency, &|index, fetch| {
+            let directory = fetch_directory(&wanted[index], fetch)?;
+            *slots[index].lock().expect("slot") = Some(directory);
+            Ok(())
+        })?;
+        for (digest, slot) in wanted.iter().zip(slots) {
+            let directory = slot.into_inner().expect("slot").expect("fetched");
+            loaded.insert(label(digest), directory);
+        }
+        let mut below = Vec::new();
+        for (digest, here) in level {
+            let directory = &loaded[&label(&digest)];
+            for file in &directory.files {
+                let digest = file.digest.clone().ok_or_else(|| {
+                    FetchError::Invalid(format!("input file {:?} has no digest", file.name))
+                })?;
+                let copy = (here.join(&file.name), file.is_executable);
+                let at = *blob_at.entry(label(&digest)).or_insert_with(|| {
+                    files.push(Copies {
+                        digest,
+                        copies: Vec::new(),
+                    });
+                    files.len() - 1
                 });
-                files.len() - 1
-            });
-            files[at].copies.push(copy);
+                files[at].copies.push(copy);
+            }
+            for link in &directory.symlinks {
+                let path = here.join(&link.name);
+                std::os::unix::fs::symlink(&link.target, &path).map_err(io(&path))?;
+            }
+            for sub in &directory.directories {
+                let path = here.join(&sub.name);
+                let digest = sub.digest.clone().ok_or_else(|| {
+                    FetchError::Invalid(format!("input directory {:?} has no digest", sub.name))
+                })?;
+                std::fs::create_dir(&path).map_err(io(&path))?;
+                below.push((digest, path));
+            }
         }
-        for link in &directory.symlinks {
-            let path = here.join(&link.name);
-            std::os::unix::fs::symlink(&link.target, &path).map_err(io(&path))?;
-        }
-        for sub in &directory.directories {
-            let path = here.join(&sub.name);
-            let digest = sub.digest.clone().ok_or_else(|| {
-                FetchError::Invalid(format!("input directory {:?} has no digest", sub.name))
-            })?;
-            std::fs::create_dir(&path).map_err(io(&path))?;
-            pending.push((digest, path));
-        }
+        level = below;
     }
     Ok(files)
 }
 
-/// Reads each blob in `files` once and writes it to every path that names it.
-fn write_files(source: &impl BlobSource, files: Vec<Copies>) -> Result<(), FetchError> {
-    for blob in files {
-        let bytes = source.verified(&blob.digest)?;
-        for (path, is_executable) in &blob.copies {
-            create_file(path, *is_executable, &bytes)?;
-        }
+/// Streams `blob` to its first path, checked, then makes its other paths from that file. A blob
+/// that fails its check is removed from the first path.
+fn write_copies(blob: &Copies, fetch: Fetch<'_>) -> Result<(), FetchError> {
+    let (first, first_executable) = &blob.copies[0];
+    let file = create_file(first, *first_executable)?;
+    if let Err(error) = stream_checked(&blob.digest, first, file, fetch) {
+        // Best effort: the error is the one to report, and the file is not complete.
+        let _ = std::fs::remove_file(first);
+        return Err(error);
+    }
+    for (path, is_executable) in &blob.copies[1..] {
+        copy_of(first, *first_executable, path, *is_executable)?;
     }
     Ok(())
 }
 
-/// Creates `path` with `O_EXCL`, writes `bytes`, and sets the mode exactly (the process umask
-/// does not apply).
-fn create_file(path: &Path, is_executable: bool, bytes: &[u8]) -> Result<(), FetchError> {
+/// Makes `path` from the finished file `from`: a hard link when both are executable or both are
+/// not and the filesystem allows it, else a copy with the mode `path` is to have.
+fn copy_of(
+    from: &Path,
+    from_executable: bool,
+    path: &Path,
+    is_executable: bool,
+) -> Result<(), FetchError> {
+    if from_executable == is_executable && std::fs::hard_link(from, path).is_ok() {
+        return Ok(());
+    }
+    let mut source = std::fs::File::open(from).map_err(io(from))?;
+    let mut file = create_file(path, is_executable)?;
+    std::io::copy(&mut source, &mut file).map_err(io(path))?;
+    Ok(())
+}
+
+/// Creates `path` with `O_EXCL` and sets the mode exactly (the process umask does not apply).
+fn create_file(path: &Path, is_executable: bool) -> Result<std::fs::File, FetchError> {
     let mode = if is_executable { 0o755 } else { 0o644 };
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(mode)
         .open(path)
         .map_err(io(path))?;
-    file.write_all(bytes).map_err(io(path))?;
     file.set_permissions(std::fs::Permissions::from_mode(mode))
-        .map_err(io(path))
+        .map_err(io(path))?;
+    Ok(file)
 }
 
 #[cfg(test)]
-mod tests {
-    use kbf_testkit::dir::TestDir;
-    use std::collections::HashMap;
-    use std::io::{BufRead as _, BufReader, Write as _};
-    use std::net::TcpListener;
-    use std::sync::Mutex;
-
-    use kbf_proto::reapi::{Directory, DirectoryNode, FileNode, SymlinkNode};
-
-    use super::*;
-
-    fn digest_of(bytes: &[u8]) -> Digest {
-        Digest {
-            hash: hex::encode(Sha256::digest(bytes)),
-            size_bytes: bytes.len() as i64,
-        }
-    }
-
-    /// Blobs by hash; `reads` counts the `get`s per hash.
-    #[derive(Default)]
-    struct Memory {
-        blobs: HashMap<String, Vec<u8>>,
-        reads: Mutex<HashMap<String, usize>>,
-    }
-
-    impl Memory {
-        fn put(&mut self, bytes: Vec<u8>) -> Digest {
-            let digest = digest_of(&bytes);
-            self.blobs.insert(digest.hash.clone(), bytes);
-            digest
-        }
-
-        fn put_directory(&mut self, directory: &Directory) -> Digest {
-            self.put(directory.encode_to_vec())
-        }
-
-        fn reads(&self, digest: &Digest) -> usize {
-            self.reads
-                .lock()
-                .expect("reads")
-                .get(&digest.hash)
-                .copied()
-                .unwrap_or(0)
-        }
-    }
-
-    impl BlobSource for Memory {
-        fn get(&self, digest: &Digest) -> Result<Vec<u8>, FetchError> {
-            *self
-                .reads
-                .lock()
-                .expect("reads")
-                .entry(digest.hash.clone())
-                .or_default() += 1;
-            self.blobs
-                .get(&digest.hash)
-                .cloned()
-                .ok_or_else(|| FetchError::Source {
-                    digest: label(digest),
-                    why: "absent".to_owned(),
-                })
-        }
-    }
-
-    fn scratch(name: &str) -> TestDir {
-        TestDir::under(std::env::temp_dir(), &format!("kbf-task-fetch-{name}"))
-    }
-
-    fn file(name: &str, digest: &Digest, is_executable: bool) -> FileNode {
-        FileNode {
-            name: name.to_owned(),
-            digest: Some(digest.clone()),
-            is_executable,
-            ..FileNode::default()
-        }
-    }
-
-    fn sub(name: &str, digest: &Digest) -> DirectoryNode {
-        DirectoryNode {
-            name: name.to_owned(),
-            digest: Some(digest.clone()),
-        }
-    }
-
-    fn mode(path: &Path) -> u32 {
-        std::fs::metadata(path)
-            .expect("metadata")
-            .permissions()
-            .mode()
-            & 0o777
-    }
-
-    /// root: bin/run (executable), a.txt, copy.txt (same blob as a.txt), link -> a.txt,
-    /// twice/one and twice/two (the same Directory), deep/x/y/z.txt.
-    fn tree() -> (Memory, Digest) {
-        let mut mem = Memory::default();
-        let text = mem.put(b"hello".to_vec());
-        let script = mem.put(b"tool bytes\n".to_vec());
-        let empty = mem.put(Vec::new());
-        let bin = mem.put_directory(&Directory {
-            files: vec![file("run", &script, true)],
-            ..Directory::default()
-        });
-        let shared = mem.put_directory(&Directory {
-            files: vec![file("e", &empty, false)],
-            ..Directory::default()
-        });
-        let z = mem.put_directory(&Directory {
-            files: vec![file("z.txt", &text, false)],
-            ..Directory::default()
-        });
-        let y = mem.put_directory(&Directory {
-            directories: vec![sub("y", &z)],
-            ..Directory::default()
-        });
-        let x = mem.put_directory(&Directory {
-            directories: vec![sub("x", &y)],
-            ..Directory::default()
-        });
-        let root = mem.put_directory(&Directory {
-            files: vec![file("a.txt", &text, false), file("copy.txt", &text, false)],
-            directories: vec![
-                sub("bin", &bin),
-                sub("one", &shared),
-                sub("two", &shared),
-                sub("deep", &x),
-            ],
-            symlinks: vec![SymlinkNode {
-                name: "link".to_owned(),
-                target: "a.txt".to_owned(),
-                ..SymlinkNode::default()
-            }],
-            ..Directory::default()
-        });
-        (mem, root)
-    }
-
-    /// Catches a tree laid out wrongly: a nested directory, the executable bit and the plain
-    /// mode, a symlink kept as one, two files of one blob each filled, and a blob or Directory
-    /// read more than once.
-    #[test]
-    fn a_nested_tree_is_laid_out_with_modes_and_symlinks() {
-        let (mem, root) = tree();
-        let scratch_dir = scratch("layout");
-        let dir = scratch_dir.join("in");
-        materialize(&mem, &root, &dir).expect("materialize");
-        assert_eq!(std::fs::read(dir.join("a.txt")).expect("a"), b"hello");
-        assert_eq!(std::fs::read(dir.join("copy.txt")).expect("copy"), b"hello");
-        assert_eq!(
-            std::fs::read(dir.join("deep/x/y/z.txt")).expect("z"),
-            b"hello"
-        );
-        assert_eq!(
-            std::fs::read(dir.join("bin/run")).expect("run"),
-            b"tool bytes\n"
-        );
-        assert_eq!(mode(&dir.join("bin/run")), 0o755);
-        assert_eq!(mode(&dir.join("a.txt")), 0o644);
-        assert_eq!(
-            std::fs::read_link(dir.join("link")).expect("link"),
-            Path::new("a.txt")
-        );
-        assert!(dir.join("one/e").is_file());
-        assert!(dir.join("two/e").is_file());
-        assert_eq!(mem.reads(&digest_of(b"hello")), 1);
-        let shared = digest_of(
-            &Directory {
-                files: vec![file("e", &digest_of(b""), false)],
-                ..Directory::default()
-            }
-            .encode_to_vec(),
-        );
-        assert_eq!(mem.reads(&shared), 1);
-    }
-
-    /// Catches a blob accepted though its bytes are not the ones its digest names: wrong
-    /// content of the right length, wrong length, and a missing blob.
-    #[test]
-    fn a_blob_that_does_not_match_its_digest_is_refused() {
-        let mut mem = Memory::default();
-        let good = digest_of(b"abc");
-        mem.blobs.insert(good.hash.clone(), b"abd".to_vec());
-        let error = mem.verified(&good).expect_err("same length, other bytes");
-        assert!(matches!(&error, FetchError::Mismatch { .. }), "{error:?}");
-        assert!(error.to_string().contains(&label(&good)), "{error}");
-        assert!(error.to_string().contains("SHA-256"), "{error}");
-
-        mem.blobs.insert(good.hash.clone(), b"abcd".to_vec());
-        let error = mem.verified(&good).expect_err("longer");
-        assert!(error.to_string().contains("4 bytes"), "{error}");
-
-        let absent = digest_of(b"nothing");
-        let error = mem.verified(&absent).expect_err("absent");
-        assert!(matches!(error, FetchError::Source { .. }), "{error:?}");
-
-        mem.blobs.insert(good.hash.clone(), b"abc".to_vec());
-        assert_eq!(mem.verified(&good).expect("good"), b"abc");
-    }
-
-    /// Catches a corrupt blob inside a tree being written: the file blob is checked, and so is a
-    /// Directory message.
-    #[test]
-    fn a_corrupt_blob_in_a_tree_fails_materialize() {
-        let (mut mem, root) = tree();
-        let text = digest_of(b"hello");
-        mem.blobs.insert(text.hash.clone(), b"HELLO".to_vec());
-        let error = materialize(&mem, &root, &scratch("corrupt-file")).expect_err("file");
-        assert!(matches!(error, FetchError::Mismatch { .. }), "{error:?}");
-
-        let (mut mem, root) = tree();
-        mem.blobs.insert(root.hash.clone(), b"junk".to_vec());
-        let error = materialize(&mem, &root, &scratch("corrupt-dir")).expect_err("directory");
-        assert!(matches!(error, FetchError::Mismatch { .. }), "{error:?}");
-    }
-
-    /// Catches a Directory entry name that could write outside the directory or collide:
-    /// slash, `..`, `.`, empty, NUL, a name twice (also across files and directories).
-    #[test]
-    fn a_bad_name_is_refused() {
-        let names = ["a/b", "..", ".", "", "a\0b", "dup"];
-        for (i, name) in names.iter().enumerate() {
-            let mut mem = Memory::default();
-            let blob = mem.put(b"x".to_vec());
-            let empty = mem.put_directory(&Directory::default());
-            let mut directory = Directory {
-                files: vec![file(name, &blob, false)],
-                ..Directory::default()
-            };
-            if *name == "dup" {
-                directory.directories.push(sub("dup", &empty));
-            }
-            let root = mem.put_directory(&directory);
-            let error = materialize(&mem, &root, &scratch(&format!("name{i}"))).expect_err(name);
-            assert!(
-                matches!(error, FetchError::Invalid(_)),
-                "{name:?}: {error:?}"
-            );
-        }
-    }
-
-    /// Catches an entry without a digest, and a blob that is not a Directory where one is wanted.
-    #[test]
-    fn a_malformed_tree_is_refused() {
-        let mut mem = Memory::default();
-        let no_file_digest = mem.put_directory(&Directory {
-            files: vec![FileNode {
-                name: "f".to_owned(),
-                ..FileNode::default()
-            }],
-            ..Directory::default()
-        });
-        let no_dir_digest = mem.put_directory(&Directory {
-            directories: vec![DirectoryNode {
-                name: "d".to_owned(),
-                digest: None,
-            }],
-            ..Directory::default()
-        });
-        let not_a_directory = mem.put(vec![0xff, 0xff, 0xff]);
-        for (i, root) in [no_file_digest, no_dir_digest, not_a_directory]
-            .iter()
-            .enumerate()
-        {
-            let error =
-                materialize(&mem, root, &scratch(&format!("malformed{i}"))).expect_err("bad");
-            assert!(matches!(error, FetchError::Invalid(_)), "{i}: {error:?}");
-        }
-    }
-
-    /// Catches a tree written over something already there (`O_EXCL`), and an unwritable target.
-    #[test]
-    fn writing_does_not_overwrite_or_follow() {
-        let (mem, root) = tree();
-        let dir = scratch("exists");
-        std::fs::write(dir.join("a.txt"), b"mine").expect("pre-existing");
-        let error = materialize(&mem, &root, &dir).expect_err("exists");
-        assert!(matches!(error, FetchError::Io { .. }), "{error:?}");
-        assert_eq!(std::fs::read(dir.join("a.txt")).expect("kept"), b"mine");
-
-        // The directory itself cannot be made under a file.
-        let under_file = dir.join("a.txt").join("in");
-        let error = materialize(&mem, &root, &under_file).expect_err("under a file");
-        assert!(matches!(error, FetchError::Io { .. }), "{error:?}");
-
-        // A symlink in the tree cannot be made where a directory entry already is.
-        let dir = scratch("link-exists");
-        std::fs::write(dir.join("link"), b"x").expect("pre-existing");
-        let error = materialize(&mem, &root, &dir).expect_err("link exists");
-        assert!(matches!(error, FetchError::Io { .. }), "{error:?}");
-    }
-
-    /// Catches a digest that could reach a URL or path unchecked.
-    #[test]
-    fn a_malformed_digest_is_refused() {
-        let mem = Memory::default();
-        let good = digest_of(b"x");
-        let cases = [
-            Digest {
-                hash: "../etc".to_owned(),
-                size_bytes: 1,
-            },
-            Digest {
-                hash: good.hash.to_uppercase(),
-                size_bytes: 1,
-            },
-            Digest {
-                hash: good.hash.clone(),
-                size_bytes: -1,
-            },
-        ];
-        for digest in cases {
-            let error = mem.verified(&digest).expect_err("bad digest");
-            assert!(matches!(error, FetchError::BadDigest(_)), "{error:?}");
-        }
-    }
-
-    /// Catches working-directory and output paths that leave the tree.
-    #[test]
-    fn relative_paths_are_checked() {
-        for ok in ["", "a", "a/b.c", "a/.hidden"] {
-            check_relative("path", ok).expect(ok);
-        }
-        for bad in ["/a", "a//b", "a/", ".", "..", "a/../b", "a/./b", "a\0b"] {
-            let error = check_relative("output path", bad).expect_err(bad);
-            assert!(error.to_string().contains("output path"), "{error}");
-        }
-    }
-
-    /// One request the test server saw: its request line and its Authorization header.
-    type Seen = Arc<Mutex<Vec<(String, String)>>>;
-
-    /// Serves `answers` (status line and body), one connection each, in order, over plain HTTP;
-    /// returns the base URL and what it saw.
-    fn serve(answers: Vec<(&'static str, Vec<u8>)>) -> (String, Seen) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let base = format!("http://{}", listener.local_addr().expect("addr"));
-        let seen: Seen = Arc::default();
-        let log = Arc::clone(&seen);
-        std::thread::spawn(move || {
-            for (status, body) in answers {
-                let (stream, _) = listener.accept().expect("accept");
-                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
-                let (mut line, mut auth) = (String::new(), String::new());
-                reader.read_line(&mut line).expect("request line");
-                loop {
-                    let mut header = String::new();
-                    reader.read_line(&mut header).expect("header");
-                    if header.trim().is_empty() {
-                        break;
-                    }
-                    if let Some(value) = header.strip_prefix("authorization: ") {
-                        value.trim().clone_into(&mut auth);
-                    }
-                }
-                log.lock()
-                    .expect("log")
-                    .push((line.trim().to_owned(), auth));
-                let mut stream = stream;
-                // The client may hang up on a body it has read enough of.
-                let head = format!(
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(head.as_bytes());
-                let _ = stream.write_all(&body);
-            }
-        });
-        (base, seen)
-    }
-
-    fn plain(base: &str) -> HttpBlobSource {
-        HttpBlobSource::build(&format!("{base}/"), "tok", &[], false)
-    }
-
-    /// Catches a wrong URL shape or a missing bearer: the grant sees `GET /<hex>/<size>` and the
-    /// token, the trailing slash of the base does not double, and the body comes back whole.
-    #[test]
-    fn the_http_source_asks_the_grant_with_the_token() {
-        let blob = b"payload".to_vec();
-        let digest = digest_of(&blob);
-        let (base, seen) = serve(vec![("200 OK", blob.clone())]);
-        let got = plain(&base).verified(&digest).expect("fetch");
-        assert_eq!(got, blob);
-        let seen = seen.lock().expect("seen");
-        assert_eq!(
-            seen[0],
-            (
-                format!("GET /{}/{} HTTP/1.1", digest.hash, digest.size_bytes),
-                "Bearer tok".to_owned()
-            )
-        );
-    }
-
-    /// Catches a non-200 taken for a blob, a body longer than its digest taken whole, and an
-    /// unreachable grant reported as anything but a source error naming the digest.
-    #[test]
-    fn the_http_source_refuses_bad_answers() {
-        let digest = digest_of(b"abc");
-        let (base, _) = serve(vec![
-            ("403 Forbidden", b"no".to_vec()),
-            ("200 OK", vec![b'a'; 100_000]),
-        ]);
-        let source = plain(&base);
-        let error = source.verified(&digest).expect_err("403");
-        assert!(matches!(&error, FetchError::Source { .. }), "{error:?}");
-        assert!(error.to_string().contains("403"), "{error}");
-        assert!(error.to_string().contains(&label(&digest)), "{error}");
-        let error = source.verified(&digest).expect_err("too long");
-        assert!(error.to_string().contains("4 bytes"), "{error}");
-
-        let closed = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let base = format!("http://{}", closed.local_addr().expect("addr"));
-        drop(closed);
-        let error = plain(&base).verified(&digest).expect_err("unreachable");
-        assert!(matches!(error, FetchError::Source { .. }), "{error:?}");
-    }
-
-    /// Catches a body that ends before its Content-Length being taken for a blob, or reported as
-    /// anything but a source error naming the digest.
-    #[test]
-    fn a_body_cut_short_is_a_source_error() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let base = format!("http://{}", listener.local_addr().expect("addr"));
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request);
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort");
-        });
-        let digest = digest_of(&[b'a'; 100]);
-        let error = plain(&base).get(&digest).expect_err("cut short");
-        assert!(matches!(&error, FetchError::Source { .. }), "{error:?}");
-        assert!(error.to_string().contains(&label(&digest)), "{error}");
-    }
-
-    /// Catches a digest reaching the URL unchecked when `get` is called directly.
-    #[test]
-    fn the_http_source_checks_the_digest_it_is_asked_for() {
-        let bad = Digest {
-            hash: "x/../y".to_owned(),
-            size_bytes: 1,
-        };
-        let error = plain("http://127.0.0.1:1").get(&bad).expect_err("bad");
-        assert!(matches!(error, FetchError::BadDigest(_)), "{error:?}");
-    }
-
-    /// Catches a source built with no roots to trust, and the redacted Debug.
-    #[test]
-    fn the_https_source_needs_roots_and_hides_its_token() {
-        let error = HttpBlobSource::new("https://grant.example", "secret", &[]).expect_err("none");
-        assert!(matches!(error, FetchError::Invalid(_)), "{error:?}");
-        let source = HttpBlobSource::new("https://grant.example/", "secret", &[vec![1, 2, 3]])
-            .expect("one root");
-        let shown = format!("{source:?}");
-        assert!(shown.contains("https://grant.example"), "{shown}");
-        assert!(!shown.contains("secret"), "{shown}");
-        // Plain HTTP is refused by a source built with `new`.
-        let digest = digest_of(b"x");
-        let error = HttpBlobSource::new("http://127.0.0.1:1", "t", &[vec![1]])
-            .expect("source")
-            .get(&digest)
-            .expect_err("http");
-        assert!(matches!(error, FetchError::Source { .. }), "{error:?}");
-        let _ = native_roots();
-    }
-}
+#[path = "fetch_tests.rs"]
+mod tests;
