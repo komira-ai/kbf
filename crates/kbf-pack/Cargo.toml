@@ -19,10 +19,14 @@ kbf-objstore.workspace = true
 kbf-segments.workspace = true
 # `PackIndex`: where the write rule records a pack and where the reader finds a blob.
 kbf-pack-index.workspace = true
+# The task pack types, re-exported by this crate.
+kbf-task-pack.workspace = true
 # `Digest`, the key of a segment's index.
 kbf-types.workspace = true
-# The report of an adoption (`adopt`), which is also its checkpoint, is kept as JSON.
+# The report of an adoption (`adopt`), which is also its checkpoint, is kept as JSON, and so is
+# the manifest of a task pack (`TaskManifest`).
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 # `rt`, to run the blocking index and cache calls off the async worker threads; `time`, to
 # space out the segments an adoption handles.
@@ -36,8 +40,6 @@ kbf-pack-index = { workspace = true, features = ["test-support"] }
 kbf-state.workspace = true
 # `TestDir`, the cache directories of the tests.
 kbf-testkit.workspace = true
-# The report of an adoption written and read back (tests/pack/adopt.rs).
-serde_json.workspace = true
 # `test-util`: the clock of the test that paces an adoption stands still until it is waited on.
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 

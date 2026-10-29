@@ -4,7 +4,7 @@
 //! access keys (the key is picked by the id in the credential), signed over `host`,
 //! `x-amz-content-sha256` and `x-amz-date` at least, made within 15 minutes of the server's
 //! clock, with the signature that the secret of that key gives. The role of the key comes with
-//! the answer, for the caller to hold the call to it. Query strings (presigned URLs) and signed
+//! the answer, for the caller to hold the call to it. A request with no `Authorization` header is checked as a presigned URL (see `presign`); signed
 //! streams are not accepted.
 
 use hmac::{Hmac, KeyInit, Mac};
@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use super::ServerConfig;
 use super::keys::Role;
+use super::presign::{self, Grant, PRESIGN_ONLY};
 use super::reply::S3Error;
 use super::request::{header, query_pairs};
 use super::time::amz_date;
@@ -26,13 +27,13 @@ const SKEW_MILLIS: u64 = 15 * 60 * 1000;
 const REQUIRED: [&str; 3] = ["host", "x-amz-content-sha256", "x-amz-date"];
 
 /// What SigV4 leaves unencoded in a query, and in a path but for the `/`.
-const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
+pub(super) const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
     .remove(b'.')
     .remove(b'~');
 
-const PATH: &AsciiSet = &UNRESERVED.remove(b'/');
+pub(super) const PATH: &AsciiSet = &UNRESERVED.remove(b'/');
 
 /// Why a request was refused, as the error S3 sends.
 #[derive(Debug, PartialEq, Eq)]
@@ -82,6 +83,8 @@ pub(crate) const READ_ONLY: Refusal = Refusal {
 pub(crate) struct Signed {
     pub(crate) payload: String,
     pub(crate) role: Role,
+    /// What a presigned URL is limited to, if it was signed by a presigning key.
+    pub(crate) presign: Option<Grant>,
 }
 
 impl From<Refusal> for S3Error {
@@ -134,7 +137,7 @@ impl<'a> Authorization<'a> {
     }
 }
 
-fn encode(text: &str, set: &'static AsciiSet) -> String {
+pub(super) fn encode(text: &str, set: &'static AsciiSet) -> String {
     utf8_percent_encode(text, set).to_string()
 }
 
@@ -153,13 +156,25 @@ pub(crate) fn canonical_header(parts: &Parts, name: &str) -> Option<String> {
 
 /// The canonical request of SigV4: method, path, query, signed headers and payload hash.
 fn canonical_request(parts: &Parts, auth: &Authorization<'_>, payload: &str) -> Option<String> {
+    canonical(parts, &auth.signed, payload, false)
+}
+
+/// The canonical request of SigV4 for the headers `signed`; for a presigned URL the parameter
+/// `X-Amz-Signature` is left out of the query (`drop_signature`).
+pub(super) fn canonical(
+    parts: &Parts,
+    signed: &[&str],
+    payload: &str,
+    drop_signature: bool,
+) -> Option<String> {
     let path = percent_decode_str(parts.uri.path()).decode_utf8().ok()?;
-    let mut names = auth.signed.clone();
+    let mut names = signed.to_vec();
     names.sort_unstable();
     let headers = names.iter().map(|name| canonical_header(parts, name));
     let headers: String = headers.collect::<Option<String>>()?;
     let mut pairs: Vec<(String, String)> = query_pairs(parts.uri.query())?
         .iter()
+        .filter(|(name, _)| !(drop_signature && name == "X-Amz-Signature"))
         .map(|(name, value)| (encode(name, UNRESERVED), encode(value, UNRESERVED)))
         .collect();
     pairs.sort();
@@ -174,18 +189,18 @@ fn canonical_request(parts: &Parts, auth: &Authorization<'_>, payload: &str) -> 
     ))
 }
 
-fn keyed(key: &[u8]) -> Hmac<Sha256> {
+pub(super) fn keyed(key: &[u8]) -> Hmac<Sha256> {
     <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts a key of any length")
 }
 
-fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+pub(super) fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = keyed(key);
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
 
 /// The key a request of `date` in `region` is signed with.
-fn signing_key(secret: &str, date: &str, region: &str) -> Vec<u8> {
+pub(super) fn signing_key(secret: &str, date: &str, region: &str) -> Vec<u8> {
     let k_date = hmac(format!("AWS4{secret}").as_bytes(), date.as_bytes());
     let k_region = hmac(&k_date, region.as_bytes());
     let k_service = hmac(&k_region, b"s3");
@@ -194,7 +209,12 @@ fn signing_key(secret: &str, date: &str, region: &str) -> Vec<u8> {
 
 /// The string SigV4 signs.
 fn string_to_sign(stamp: &str, auth: &Authorization<'_>, request: &str) -> String {
-    let scope = format!("{}/{}/s3/aws4_request", auth.date, auth.region);
+    string_to_sign_for(stamp, (auth.date, auth.region), request)
+}
+
+/// The string SigV4 signs for a request of `stamp`, in the scope of a `(date, region)`.
+pub(super) fn string_to_sign_for(stamp: &str, scope: (&str, &str), request: &str) -> String {
+    let scope = format!("{}/{}/s3/aws4_request", scope.0, scope.1);
     let digest = hex::encode(Sha256::digest(request.as_bytes()));
     format!("AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{digest}")
 }
@@ -208,8 +228,13 @@ fn string_to_sign(stamp: &str, auth: &Authorization<'_>, request: &str) -> Strin
 /// # Errors
 /// The [`Refusal`] that says what is wrong with the request.
 pub(crate) fn verify(config: &ServerConfig, parts: &Parts) -> Result<Signed, Refusal> {
-    let text = header(&parts.headers, "authorization").ok_or(UNSIGNED)?;
+    let Some(text) = header(&parts.headers, "authorization") else {
+        return presign::verify_query(config, parts);
+    };
     let auth = Authorization::parse(text).ok_or(MALFORMED)?;
+    if config.presign_key(auth.key_id).is_some() {
+        return Err(PRESIGN_ONLY);
+    }
     let known = config.key(auth.key_id);
     let (secret, role) = known
         .filter(|_| auth.region == config.region)
@@ -240,6 +265,7 @@ pub(crate) fn verify(config: &ServerConfig, parts: &Parts) -> Result<Signed, Ref
     Ok(Signed {
         payload: payload.to_owned(),
         role,
+        presign: None,
     })
 }
 
@@ -267,18 +293,34 @@ pub(crate) fn sign_as(
     extra: &[(&str, &str)],
     body: &[u8],
 ) -> hyper::Request<http_body_util::Full<bytes::Bytes>> {
+    let payload = hex::encode(Sha256::digest(body));
+    sign_claiming(config, key, method, uri, extra, &payload, body)
+}
+
+/// A request signed with the key `(id, secret)` that claims `payload` as the hash of its body
+/// (the value of `x-amz-content-sha256`), whatever `body` is, for the tests that send a body
+/// they do not hold: they sign the head, and give the request the body they play.
+#[cfg(test)]
+pub(crate) fn sign_claiming(
+    config: &ServerConfig,
+    key: (&str, &str),
+    method: &str,
+    uri: &str,
+    extra: &[(&str, &str)],
+    payload: &str,
+    body: &[u8],
+) -> hyper::Request<http_body_util::Full<bytes::Bytes>> {
     use bytes::Bytes;
     use http_body_util::Full;
     use hyper::Request;
 
     let (id, secret) = key;
     let stamp = amz_date(config.clock.now());
-    let payload = hex::encode(Sha256::digest(body));
     let mut builder = Request::builder()
         .method(method)
         .uri(uri)
         .header("host", "tier.test")
-        .header("x-amz-content-sha256", &payload)
+        .header("x-amz-content-sha256", payload)
         .header("x-amz-date", &stamp);
     for (name, value) in extra {
         builder = builder.header(*name, *value);
@@ -297,7 +339,7 @@ pub(crate) fn sign_as(
         signed: names.iter().map(String::as_str).collect(),
         signature: "",
     };
-    let request = canonical_request(&parts, &auth, &payload).expect("a canonical request");
+    let request = canonical_request(&parts, &auth, payload).expect("a canonical request");
     let key = signing_key(secret, auth.date, auth.region);
     let to_sign = string_to_sign(&stamp, &auth, &request);
     let signature = hex::encode(hmac(&key, to_sign.as_bytes()));

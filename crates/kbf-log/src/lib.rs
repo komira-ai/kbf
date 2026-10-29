@@ -30,6 +30,9 @@
 //!   [`LogCommand::Unknown`];
 //! - an enum value that is unspecified (zero) or unnamed, in a command this binary
 //!   knows: the entry decodes as [`LogCommand::Unknown`] as well;
+//! - a consumable amount whose consumable is unspecified or unnamed: that amount is left
+//!   out of the node's capabilities and the rest of the command decodes as it would
+//!   without it;
 //! - the bytes [`encode`] would not have written (an explicit zero, a varint that is not
 //!   minimal, a field repeated or out of order): the value they stand for is decoded.
 //!

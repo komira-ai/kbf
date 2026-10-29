@@ -47,6 +47,8 @@ pub enum Image {
     Frontend,
     /// `kbf-coordinator`.
     Coordinator,
+    /// `kbf-task`.
+    Task,
 }
 
 impl Image {
@@ -55,12 +57,13 @@ impl Image {
         match self {
             Image::Frontend => "kbf-frontend-image",
             Image::Coordinator => "kbf-coordinator-image",
+            Image::Task => "kbf-task-image",
         }
     }
 
     /// The image the asset name `binary` (before `-<commit>-<platform>`) belongs to.
     pub fn named(binary: &str) -> Option<Image> {
-        [Image::Frontend, Image::Coordinator]
+        [Image::Frontend, Image::Coordinator, Image::Task]
             .into_iter()
             .find(|i| i.asset_name() == binary)
     }
@@ -70,6 +73,7 @@ impl Image {
         match self {
             Image::Frontend => "kbf",
             Image::Coordinator => "kbf-coordinator",
+            Image::Task => "kbf-task",
         }
     }
 
@@ -83,6 +87,7 @@ impl Image {
         match self {
             Image::Frontend => &["/usr/bin/kbf", "--mode=frontend"],
             Image::Coordinator => &["/usr/bin/kbf-coordinator"],
+            Image::Task => &["/usr/bin/kbf-task"],
         }
     }
 
@@ -91,6 +96,7 @@ impl Image {
         match self {
             Image::Frontend => "frontend",
             Image::Coordinator => "coordinator",
+            Image::Task => "task",
         }
     }
 
@@ -105,7 +111,7 @@ impl Image {
 pub enum Reference<'a> {
     /// The `kbf` inside a `kbf-<commit>-<platform>.tar.gz`.
     KbfTarball(&'a Path),
-    /// A built program (the coordinator has no tarball).
+    /// A built program (the coordinator and the task image have no tarball).
     Binary(&'a Path),
 }
 
@@ -114,7 +120,7 @@ pub struct Check<'a> {
     pub image: Image,
     pub platform: Platform,
     /// What the program of the image must equal; `None` only to check an asset where the
-    /// build's own file is not at hand (`--verify-only` of a coordinator image).
+    /// build's own file is not at hand (`--verify-only` of a coordinator or task image).
     pub reference: Option<Reference<'a>>,
 }
 

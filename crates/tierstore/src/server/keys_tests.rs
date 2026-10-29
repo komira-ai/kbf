@@ -12,6 +12,7 @@ use kbf_testkit::dir::TestDir;
 use crate::TestClock;
 use crate::server::ServerConfig;
 use crate::server::auth::READ_ONLY;
+use crate::server::presign::PUT_ONLY;
 
 use super::{AccessKey, Role, ensure_distinct, read_credentials, read_only_keys};
 
@@ -273,4 +274,20 @@ fn a_read_only_key_may_only_get_and_head() {
         assert_eq!(refused, Err(READ_ONLY), "{method}");
     }
     assert_eq!(READ_ONLY.code, "AccessDenied");
+}
+
+/// Asserts which roles may list the open multipart uploads, under any prefix: the full and the
+/// read-only role may, and a presigning key may not.
+#[test]
+fn only_a_presigning_key_is_refused_the_listing_of_open_uploads() {
+    for prefix in ["", "jobs/", "_journal/"] {
+        assert_eq!(Role::Full.permit_list_uploads(prefix), Ok(()), "{prefix}");
+        assert_eq!(
+            Role::ReadOnly.permit_list_uploads(prefix),
+            Ok(()),
+            "{prefix}"
+        );
+        let refused = Role::PresignPut.permit_list_uploads(prefix);
+        assert_eq!(refused, Err(PUT_ONLY), "{prefix}");
+    }
 }

@@ -87,6 +87,12 @@ pub trait PackStore: Send + Sync {
         key: &'a ObjectKey,
         range: ByteRange,
     ) -> BoxFuture<'a, Result<Bytes, ObjectStoreError>>;
+
+    /// The length of the object `key`, or `None` if the store has none ([`ObjectStore::len`]).
+    fn len<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> BoxFuture<'a, Result<Option<u64>, ObjectStoreError>>;
 }
 
 /// A packer and a reader over one store.
@@ -119,6 +125,13 @@ impl<S: ObjectStore> PackStore for Over<S> {
         range: ByteRange,
     ) -> BoxFuture<'a, Result<Bytes, ObjectStoreError>> {
         Box::pin(self.store.get_range(key, range))
+    }
+
+    fn len<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> BoxFuture<'a, Result<Option<u64>, ObjectStoreError>> {
+        Box::pin(self.store.len(key))
     }
 }
 

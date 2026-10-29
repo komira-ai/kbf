@@ -739,7 +739,7 @@ async fn a_put_whose_checksum_matches_is_stored() {
 async fn a_put_whose_checksum_does_not_match_is_refused_and_stores_nothing() {
     let rig = Rig::new(MEBIBYTE).await;
     let before = rig.hot_mem.list("").await.unwrap().len();
-    let puts = rig.hot.calls(Op::Put);
+    let journals = rig.hot_mem.list("_journal/p1/").await.unwrap().len();
     for name in CHECKSUMS {
         let wrong = checksum(name, b"another body");
         let extra = [(name, wrong.as_str())];
@@ -748,7 +748,8 @@ async fn a_put_whose_checksum_does_not_match_is_refused_and_stores_nothing() {
         assert_eq!(reply.code(), "BadDigest", "{name}");
         let message = texts(&reply.body, "Message").concat();
         assert!(message.contains(name), "{name}");
-        assert_eq!(rig.hot.calls(Op::Put), puts, "{name}");
+        let after = rig.hot_mem.list("_journal/p1/").await.unwrap().len();
+        assert_eq!(after, journals, "{name}");
     }
     assert_eq!(rig.hot_mem.list("").await.unwrap().len(), before);
     assert!(rig.cold_mem.list("").await.unwrap().is_empty());

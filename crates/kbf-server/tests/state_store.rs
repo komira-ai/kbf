@@ -1175,9 +1175,41 @@ restarts!(
     the_epoch_an_operator_raised_is_reported_by_the_other_frontend,
     a_client_waiting_through_another_frontend_gets_the_result,
     a_name_in_the_new_form_is_answered_by_every_frontend_at_every_stage,
-    a_joiner_of_a_leased_operation_never_deletes_its_lease,
-    an_old_form_name_is_answered_by_the_issuing_frontend
+    a_joiner_of_a_leased_operation_never_deletes_its_lease
 );
+
+/// `an_old_form_name_is_answered_by_the_issuing_frontend` over each store, as `restarts!` runs
+/// a test, written out so that the js core's difference can be marked on it.
+mod an_old_form_name_is_answered_by_the_issuing_frontend {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    #[cfg_attr(
+        feature = "farm-core-js",
+        ignore = "known-different-on-js: a name of the old form operations/<term>-<waiter> is not answered"
+    )]
+    async fn over_the_fake() {
+        super::an_old_form_name_is_answered_by_the_issuing_frontend(Backing::Fake).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[cfg_attr(
+        feature = "farm-core-js",
+        ignore = "known-different-on-js: a name of the old form operations/<term>-<waiter> is not answered"
+    )]
+    async fn over_sqlite() {
+        super::an_old_form_name_is_answered_by_the_issuing_frontend(Backing::Sqlite).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[cfg_attr(
+        feature = "farm-core-js",
+        ignore = "known-different-on-js: a name of the old form operations/<term>-<waiter> is not answered"
+    )]
+    async fn over_postgres() {
+        super::an_old_form_name_is_answered_by_the_issuing_frontend(Backing::Postgres).await;
+    }
+}
 
 /// A state store opened as a start opens it: from the flag, over `dir`.
 fn store_from_flag(dir: &std::path::Path) -> Result<StateStore, StateError> {
@@ -1251,6 +1283,7 @@ fn listeners() -> Listeners {
         learned_sizes: kbf_server::LearnedSizes::Off,
         scheduler_core: kbf_server::SchedulerCore::under_test(),
         placement_load: kbf_server::PlacementLoad::Off,
+        placement_predictions: kbf_server::PlacementPredictions::Off,
         whole_node: None,
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),

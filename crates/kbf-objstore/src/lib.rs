@@ -108,6 +108,22 @@ pub trait ObjectStore: Send + Sync + 'static {
         std::future::ready(Ok(true))
     }
 
+    /// The length in bytes of the object under `key`, or `None` if there is no object
+    /// (a missing key is an answer, not an error, so a caller tells it from a store
+    /// that failed). Without reading the object: a HEAD for a store over the network.
+    ///
+    /// An object still being written is not there: a store that stages an upload
+    /// answers `None` until the write is whole. The default refuses with
+    /// [`ObjectStoreError::Unsupported`], so a store that does not implement it fails
+    /// loudly instead of answering a length it did not look up.
+    fn len(
+        &self,
+        key: &ObjectKey,
+    ) -> impl Future<Output = Result<Option<u64>, ObjectStoreError>> + Send {
+        let _ = key;
+        std::future::ready(Err(ObjectStoreError::Unsupported("object length")))
+    }
+
     /// Deletes an object. Deleting an absent key succeeds, so a retried delete is safe.
     /// An object under retention is refused and stays readable.
     fn delete(&self, key: &ObjectKey) -> impl Future<Output = Result<(), ObjectStoreError>> + Send;
