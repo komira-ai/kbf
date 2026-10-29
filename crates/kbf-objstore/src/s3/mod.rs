@@ -610,6 +610,15 @@ impl ObjectStore for S3Store {
         self.get_range_once(key, range).await
     }
 
+    /// A HEAD: the `Content-Length` of the object, or `None` for a 404.
+    async fn len(&self, key: &ObjectKey) -> Result<Option<u64>, ObjectStoreError> {
+        match self.head(key).await {
+            Ok(head) => Ok(Some(head.size)),
+            Err(ObjectStoreError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
         let mut query = Vec::new();
         if self.conn.capabilities.object_lock {

@@ -350,7 +350,7 @@ impl Session {
             self.core(),
             &self.backend,
             &self.wall,
-            || self.now(),
+            &|| self.now(),
             &WorkerId::new(name),
             result_of(lease, digest, label, ended),
         )

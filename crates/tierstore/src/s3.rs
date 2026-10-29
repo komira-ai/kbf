@@ -4,7 +4,20 @@
 //! the same meaning, sent by the client the workspace already has (path-style addressing,
 //! SigV4, a timeout on every request), and each answer is read into this crate's [`Error`].
 //!
-//! - `put` is a PUT with `If-None-Match: *`; the 412 is [`Error::AlreadyExists`].
+//! - `put` is a PUT with `If-None-Match: *`; the 412 is [`Error::AlreadyExists`]. Create-only
+//!   (here, in `put_stream` and in `complete_upload`) needs a store that honours conditional
+//!   writes: one that ignores `If-None-Match` on a put or on the completion of a multipart upload
+//!   would replace an object that exists.
+//! - `put_stream` is the store client's streamed write, given the chunks of the body as they
+//!   arrive and their total length (the `Content-Length` of the request; without one the body
+//!   is held first, since S3 takes no request of unknown length). A body of at most 16 MiB is
+//!   gathered and sent as one PUT with `If-None-Match: *`; a longer one is a multipart upload
+//!   whose parts are sent as they fill, completed with `If-None-Match: *` only after the body
+//!   has ended with exactly its length, and aborted on any failure. Either way the object comes
+//!   into being in the last request, after the whole body was read and checked by the caller, so
+//!   a body that ends with an error, or is cut short, leaves no object and no staged key, and
+//!   at most 16 MiB of the body is held at a time. A key that exists is
+//!   [`Error::AlreadyExists`].
 //! - `put_if_match` is a PUT with `If-Match: "<tag>"` (a tag given in quotes is not quoted
 //!   twice); the 412 is [`Error::PreconditionFailed`] and a 404 is [`Error::NotFound`]. It
 //!   gives the `ETag` of the answer, without its quotes.
@@ -71,6 +84,8 @@
 //! again after a failure in transport; a write never is. A part is the exception to the bound:
 //! it is as slow as the client that sends it, so only a part that makes no progress for the
 //! `request_timeout` is cut, as an [`Error::Unavailable`].
+
+use std::future::Future;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -296,12 +311,56 @@ async fn feed(
     None
 }
 
+/// Sends `body` to the store as the body of the request that `send` makes, which is given its
+/// length and the chunks as they arrive. A body whose length is not known is held first, since
+/// S3 takes no request of unknown length. Gives the error of `body`, if it ended with one,
+/// else the answer of the store.
+async fn streamed<T, F, Fut>(
+    body: PartBody<'_>,
+    len: Option<u64>,
+    send: F,
+) -> Result<Result<T, ObjectStoreError>, Error>
+where
+    F: FnOnce(u64, BodyStream) -> Fut,
+    Fut: Future<Output = Result<T, ObjectStoreError>>,
+{
+    let (len, body) = match len {
+        Some(len) => (len, body),
+        None => held(collect(body).await?),
+    };
+    let (sink, mut chunks) = mpsc::channel(CHUNKS_WAITING);
+    let source: BodyStream = stream::poll_fn(move |cx| chunks.poll_recv(cx)).boxed();
+    let (ended, sent) = futures::join!(feed(body, sink), send(len, source));
+    match ended {
+        Some(error) => Err(error),
+        None => Ok(sent),
+    }
+}
+
 #[async_trait]
 impl Backend for S3Backend {
+    /// S3 takes no request of unknown length: given none, the backend holds the body first.
+    fn needs_length(&self) -> bool {
+        true
+    }
+
     async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
         let object = object_key(key)?;
         let put = self.store.put_new(&object, body, None);
         put.await.map_err(|e| map_error(e, key))
+    }
+
+    async fn put_stream(
+        &self,
+        key: &str,
+        len: Option<u64>,
+        body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        let object = object_key(key)?;
+        let store = &self.store;
+        let sending = |len, source| store.put_stream(&object, len, source);
+        let sent = streamed(body, len, sending).await?;
+        sent.map_err(|e| map_error(e, key))
     }
 
     async fn put_if_match(&self, key: &str, body: Bytes, etag: &str) -> Result<String, Error> {
@@ -377,18 +436,9 @@ impl Backend for S3Backend {
         body: PartBody<'_>,
     ) -> Result<String, Error> {
         let object = object_key(key)?;
-        let (len, body) = match len {
-            Some(len) => (len, body),
-            None => held(collect(body).await?),
-        };
-        let (sink, mut chunks) = mpsc::channel(CHUNKS_WAITING);
-        let source: BodyStream = stream::poll_fn(move |cx| chunks.poll_recv(cx)).boxed();
         let store = &self.store;
-        let sending = store.upload_part_stream(&object, id, number, len, source);
-        let (ended, sent) = futures::join!(feed(body, sink), sending);
-        if let Some(error) = ended {
-            return Err(error);
-        }
+        let sending = |len, source| store.upload_part_stream(&object, id, number, len, source);
+        let sent = streamed(body, len, sending).await?;
         let etag = sent.map_err(|e| upload_error(e, key, id))?;
         Ok(unquoted(&etag))
     }

@@ -490,10 +490,14 @@ impl Inner {
         Ok(Object::open(&path)?.is_some_and(|o| o.key == *key))
     }
 
-    fn get(&self, key: &ObjectKey, range: ByteRange) -> Result<Bytes, ObjectStoreError> {
+    /// The object file for `key`: `None` if there is none (or it is not a whole object).
+    ///
+    /// # Errors
+    /// The file cannot be read, or holds another key's object.
+    fn open_checked(&self, key: &ObjectKey) -> Result<Option<(Object, PathBuf)>, ObjectStoreError> {
         let (_, path) = self.place(key);
         let Some(object) = Object::open(&path)? else {
-            return Err(ObjectStoreError::NotFound(key.clone()));
+            return Ok(None);
         };
         if object.key != *key {
             return Err(ObjectStoreError::Protocol(format!(
@@ -502,6 +506,17 @@ impl Inner {
                 object.key
             )));
         }
+        Ok(Some((object, path)))
+    }
+
+    fn len(&self, key: &ObjectKey) -> Result<Option<u64>, ObjectStoreError> {
+        Ok(self.open_checked(key)?.map(|(object, _)| object.size))
+    }
+
+    fn get(&self, key: &ObjectKey, range: ByteRange) -> Result<Bytes, ObjectStoreError> {
+        let Some((object, path)) = self.open_checked(key)? else {
+            return Err(ObjectStoreError::NotFound(key.clone()));
+        };
         if range.offset() >= object.size {
             return Err(ObjectStoreError::InvalidRange {
                 key: key.clone(),
@@ -864,6 +879,11 @@ impl ObjectStore for FsStore {
     async fn may_hold(&self, key: &ObjectKey) -> Result<bool, ObjectStoreError> {
         let (inner, key) = (Arc::clone(&self.inner), key.clone());
         blocking(move || inner.may_hold(&key)).await
+    }
+
+    async fn len(&self, key: &ObjectKey) -> Result<Option<u64>, ObjectStoreError> {
+        let (inner, key) = (Arc::clone(&self.inner), key.clone());
+        blocking(move || inner.len(&key)).await
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {

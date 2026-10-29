@@ -9,7 +9,7 @@ use tierstore::{
 };
 
 use crate::conformance;
-use crate::support::{body, keys};
+use crate::support::{body, chunks, keys};
 
 /// Asserts that a second put of a key is refused with `AlreadyExists` and leaves the first
 /// object's bytes in place, on two separate backends (the hot and the cold tier are two).
@@ -338,4 +338,44 @@ async fn a_delayed_call_waits_before_it_runs() {
     backend.set_delay(Op::Put, None);
     backend.put("j", body("v")).await.unwrap();
     assert_eq!(start.elapsed(), waited);
+}
+
+/// Asserts that a streamed put to the in-memory backend creates the object from its chunks, with
+/// the size and the tag of a put of the same bytes.
+#[tokio::test]
+async fn a_streamed_put_creates_the_object_from_its_chunks() {
+    let backend = MemoryBackend::new();
+    conformance::a_streamed_put_creates_the_object_from_its_chunks(&backend).await;
+}
+
+/// Asserts that a streamed put whose body fails stores nothing in the in-memory backend and
+/// gives the error of the body.
+#[tokio::test]
+async fn a_streamed_put_that_fails_leaves_nothing() {
+    let backend = MemoryBackend::new();
+    conformance::a_streamed_put_that_fails_leaves_nothing(&backend).await;
+}
+
+/// Asserts that a streamed put of an existing key is refused and the first object stays.
+#[tokio::test]
+async fn a_streamed_put_of_an_existing_key_is_refused() {
+    let backend = MemoryBackend::new();
+    conformance::a_streamed_put_of_an_existing_key_is_refused(&backend).await;
+}
+
+/// Asserts that the fault injector passes a streamed put to the backend it wraps as a call of
+/// kind `Put`: it is counted, and a failure planned for puts fails it and stores nothing.
+#[tokio::test]
+async fn the_injector_treats_a_streamed_put_as_a_put() {
+    let backend = faulty();
+    backend.put_stream("a", None, chunks(&["x"])).await.unwrap();
+    assert_eq!(backend.calls(Op::Put), 1);
+    backend.fail_next(Op::Put, 1);
+    let failed = backend.put_stream("b", None, chunks(&["y"])).await;
+    assert!(matches!(failed, Err(Error::Unavailable(_))));
+    assert_eq!(backend.calls(Op::Put), 2);
+    assert_eq!(
+        backend.head("b").await.unwrap_err(),
+        Error::NotFound("b".to_owned())
+    );
 }

@@ -267,18 +267,34 @@ pub(crate) fn sign_as(
     extra: &[(&str, &str)],
     body: &[u8],
 ) -> hyper::Request<http_body_util::Full<bytes::Bytes>> {
+    let payload = hex::encode(Sha256::digest(body));
+    sign_claiming(config, key, method, uri, extra, &payload, body)
+}
+
+/// A request signed with the key `(id, secret)` that claims `payload` as the hash of its body
+/// (the value of `x-amz-content-sha256`), whatever `body` is, for the tests that send a body
+/// they do not hold: they sign the head, and give the request the body they play.
+#[cfg(test)]
+pub(crate) fn sign_claiming(
+    config: &ServerConfig,
+    key: (&str, &str),
+    method: &str,
+    uri: &str,
+    extra: &[(&str, &str)],
+    payload: &str,
+    body: &[u8],
+) -> hyper::Request<http_body_util::Full<bytes::Bytes>> {
     use bytes::Bytes;
     use http_body_util::Full;
     use hyper::Request;
 
     let (id, secret) = key;
     let stamp = amz_date(config.clock.now());
-    let payload = hex::encode(Sha256::digest(body));
     let mut builder = Request::builder()
         .method(method)
         .uri(uri)
         .header("host", "tier.test")
-        .header("x-amz-content-sha256", &payload)
+        .header("x-amz-content-sha256", payload)
         .header("x-amz-date", &stamp);
     for (name, value) in extra {
         builder = builder.header(*name, *value);
@@ -297,7 +313,7 @@ pub(crate) fn sign_as(
         signed: names.iter().map(String::as_str).collect(),
         signature: "",
     };
-    let request = canonical_request(&parts, &auth, &payload).expect("a canonical request");
+    let request = canonical_request(&parts, &auth, payload).expect("a canonical request");
     let key = signing_key(secret, auth.date, auth.region);
     let to_sign = string_to_sign(&stamp, &auth, &request);
     let signature = hex::encode(hmac(&key, to_sign.as_bytes()));
