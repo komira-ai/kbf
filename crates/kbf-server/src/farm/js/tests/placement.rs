@@ -74,12 +74,15 @@ fn placed(farm: &Farm) -> LoadCounters {
         max_wall: None,
     })
     .expect("submitted");
+    // Every message sent so far: the stream's first is the empty welcome given above.
     let mut started = false;
-    while let Ok(Ok(ServerMessage {
-        message: Some(message),
-    })) = inbox.try_recv()
-    {
-        started |= matches!(message, Message::Start(_));
+    while let Ok(sent) = inbox.try_recv() {
+        started |= matches!(
+            sent,
+            Ok(ServerMessage {
+                message: Some(Message::Start(_)),
+            })
+        );
     }
     assert!(started, "the action was not placed");
     farm.load_counters()
