@@ -2165,6 +2165,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-lease-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "kbf-lease-client",
+ "kbf-testkit",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "kbf-log"
 version = "0.1.0"
 dependencies = [

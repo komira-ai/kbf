@@ -229,6 +229,7 @@ kbf-host = { path = "crates/kbf-host" }
 kbf-installer = { path = "crates/kbf-installer" }
 kbf-invocation = { path = "crates/kbf-invocation" }
 kbf-integration-test = { path = "crates/kbf-integration-test" }
+kbf-lease-client = { path = "crates/kbf-lease-client" }
 kbf-log = { path = "crates/kbf-log" }
 kbf-map = { path = "crates/kbf-map" }
 kbf-mapsync = { path = "crates/kbf-mapsync" }

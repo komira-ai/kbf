@@ -1,0 +1,40 @@
+[package]
+name = "kbf-lease-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# `fake`: `fake::FakeLeaseServer`, an in-process lease server on loopback that applies the
+# server's admission rules, for other crates' tests (and this one's, through the
+# dev-dependency on itself).
+fake = ["hyper/server"]
+
+# A typed client of the job scheduler's lease server (see the crate documentation). No
+# farm crate depends on it yet. It is written over hyper and tokio-rustls, which are in
+# the tree already; a `reqwest` with TLS would add a platform verifier and a second HTTP
+# stack to the lock.
+[dependencies]
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
+tokio-rustls.workspace = true
+
+[dev-dependencies]
+kbf-lease-client = { workspace = true, features = ["fake"] }
+kbf-testkit.workspace = true
+rcgen.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
