@@ -534,3 +534,33 @@ fn presigning_key_ids_must_differ_from_each_other_and_from_the_other_keys() {
     let clash = ensure_distinct(&["FULL", "two"], &keys).unwrap_err();
     assert!(clash.contains("\"two\""), "{clash}");
 }
+
+/// Asserts that the grant itself holds a call to a `PUT` of one object, apart from the check of
+/// the role that comes before it: a `GET`, a `HEAD` and a `DELETE` of a key inside the prefix are
+/// refused with the one-PUT-only refusal, as is a `PUT` that carries the query of a part of a
+/// multipart upload, and a `PUT` of the same key without them is allowed.
+#[test]
+fn a_grant_permits_one_put_of_an_object_and_no_other_call() {
+    use super::super::request::{Query, Target};
+    use super::PUT_ONLY;
+    let grant = grant();
+    let target = Target::Object("cas/b/x".to_owned());
+    let call = |method: &str, query: &str| {
+        let uri = format!("/tier-bucket/cas/b/x{query}");
+        let (parts, ()) = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(())
+            .unwrap()
+            .into_parts();
+        let query = Query::parse(parts.uri.query()).unwrap();
+        grant.permit(&parts, &target, &query)
+    };
+    assert_eq!(call("PUT", ""), Ok(()));
+    for method in ["GET", "HEAD", "DELETE", "POST"] {
+        assert_eq!(call(method, ""), Err(PUT_ONLY), "{method}");
+    }
+    for query in ["?partNumber=1&uploadId=u", "?uploads", "?uploadId=u"] {
+        assert_eq!(call("PUT", query), Err(PUT_ONLY), "{query}");
+    }
+}
