@@ -257,8 +257,7 @@ impl Farm {
 
     /// Whether placement reads the load the nodes report (`--placement-load on`).
     fn load_is_read(&self) -> bool {
-        let _ = (&self.settings, PlacementLoad::On);
-        false
+        self.settings.placement_load == PlacementLoad::On
     }
 
     /// The nodes whose last accepted reading, if it is not stale, says the actions cgroup has

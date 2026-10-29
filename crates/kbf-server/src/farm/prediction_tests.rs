@@ -328,7 +328,12 @@ fn a_key_last_seen_sixty_one_days_ago_gets_no_prediction() {
 #[test]
 fn an_estimate_the_size_of_the_node_gets_no_prediction() {
     unset_for(&Job::new(1), Unset::OverCap, |farm| {
-        teach(farm, 6, &run(5 * MINUTE, 20 * GIB, 450_000_000));
+        // Booked at 32 GiB, so that a peak of 20 GiB is not a run cut off at its limit.
+        let big = Run {
+            booked_memory_bytes: 32 * GIB,
+            ..run(5 * MINUTE, 20 * GIB, 450_000_000)
+        };
+        teach(farm, 6, &big);
     });
 }
 
