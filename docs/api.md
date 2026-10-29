@@ -1669,6 +1669,19 @@ blobs clients upload are kept in packs, and these counters follow; without the f
 | `kbf_pack_commits_total` | counter | packs a daemon stored that `kbf.worker.v1.PackIndex/CommitPack` recorded in the pack index (a retry of a commit already recorded is not counted again) |
 | `kbf_pack_commit_rejects_total` | counter | commits of a pack refused with nothing recorded: the writer was not the caller, the name or the list of blobs was not one a daemon may commit, the pack was not in the store, a sampled blob was not its digest (`--pack-commit-sample`; alert on any), or the pack was recorded before with other contents. A store or an index that failed is UNAVAILABLE to the daemon and is not counted |
 
+**Legacy reads, on a storage node's `--metrics-listen`.** `kbf_storage_legacy_read_total{kind,source}`
+(counter) counts the reads a storage node (`kbf storage`, `kbf storage-and-daemon`) serves from its
+own copy of the data. Its five rows are always printed, 0 included: `kind="cas",source="bytestream"`
+(a ByteStream `Read` that found its blob, one per call), `kind="cas",source="segments"` (a `Segments`
+`ReadRange` that returned bytes, one per call), `kind="ac",source="action_store"` (an `ActionStore`
+`Get` that found an entry), and `kind="cas",source="in_process"` and `kind="ac",source="in_process"`
+(the same blob and entry reads made by the daemon half of a `storage-and-daemon` process, which reaches
+its own node without a connection). A read that finds nothing, a read of the empty blob,
+`FindMissingBlobs`, `QueryWriteStatus`, `Segments` `Locate`, every write, and the node's own reads for
+flushing and repair are not counted; a read a frontend or a daemon serves from a pack never reaches a
+node. The sum over all rows staying at 0 is how an operator sees that nothing reads the storage nodes
+any more.
+
 **Pack reads by daemons.** A daemon started with `--pack-read` ([kbf-modes.md](deploy/kbf-modes.md))
 puts the counts of its pack reads in every heartbeat, and the frontend its worker stream is on
 keeps the newest of each node and exports them, one sample per node, labelled `node`. They

@@ -43,6 +43,7 @@ use kbf_mapsync::MapHolder;
 use kbf_meta::Retention;
 use kbf_objstore::FsStore;
 use kbf_storage::Storage;
+use kbf_storage::legacy::LegacyReads;
 use kbf_storage::repair::Repairs;
 use kbf_storage::service::InProcess;
 use kbf_threads::disk::Statvfs;
@@ -218,7 +219,11 @@ where
     // `Binder` is not `Send`).
     let (socket, metrics) = bind_node_sockets(listener.listen, flags.metrics, &Binder::new())?;
     let (cache, registered) = open_cache(flags, socket, (meta, cold, prefix, log)).await?;
+    // The reads this node serves from its own copy, the daemon half's included: the service
+    // counts them, the scrape of the cache renders them.
+    let legacy_reads = Arc::new(LegacyReads::default());
     let cache = cache
+        .with_legacy_reads(Arc::clone(&legacy_reads))
         .with_writes(args.write_config())
         .with_write_pool(args.write_pool_config())
         .with_durable_wait(args.durable_wait())
@@ -259,7 +264,15 @@ where
     let repair_dir = stores.meta_dir.join(REPAIR_DIR);
     let stop = Box::pin(shutdown()?);
     let served = Arc::clone(&storage);
-    let node = bind_node(flags, listener, registered, served, &repair_dir, stop)?;
+    let node = bind_node(
+        flags,
+        listener,
+        registered,
+        served,
+        legacy_reads,
+        &repair_dir,
+        stop,
+    )?;
     let addr = node.addr;
     Ok(StorageHalf {
         addr,

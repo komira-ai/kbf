@@ -10,6 +10,7 @@ use kbf_proto::google::bytestream::{
 use tonic::{Request, Response, Status, Streaming};
 
 use super::{Endpoint, StorageService, catch_up, generation, wire};
+use crate::legacy::Path;
 
 #[tonic::async_trait]
 impl ByteStream for StorageService {
@@ -43,6 +44,9 @@ impl ByteStream for StorageService {
                 );
             }
         };
+        // The blob is found and its first window verified: this node serves a read from its
+        // own copy ([`crate::legacy`]). The empty blob is held by no store.
+        self.count_blob_read(&digest, Path::CasByteStream);
         let messages = chunks.map(|chunk| match chunk {
             Ok(data) => Ok(ReadResponse {
                 data: data.to_vec(),
