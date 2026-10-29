@@ -260,15 +260,32 @@ async fn request(
     path: &str,
     token: Option<&str>,
 ) -> std::io::Result<Got> {
+    send(addr, trust, method, path, token, "", &[]).await
+}
+
+/// [`request`] with the header lines `extra` (each ending in CRLF) and then `body` after the
+/// headers.
+async fn send(
+    addr: SocketAddr,
+    trust: &str,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    extra: &str,
+    body: &[u8],
+) -> std::io::Result<Got> {
     let tcp = TcpStream::connect(addr).await?;
     let name = ServerName::IpAddress(addr.ip().into());
     let mut tls = client(trust).connect(name, tcp).await?;
     let auth = token
         .map(|token| format!("Authorization: Bearer {token}\r\n"))
         .unwrap_or_default();
-    let head =
-        format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Connection: close\r\n\r\n");
+    let head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}{extra}Connection: close\r\n\r\n"
+    );
     tls.write_all(head.as_bytes()).await?;
+    // A server that answers without reading the body may have closed by now.
+    let _ = tls.write_all(body).await;
     let mut raw = Vec::new();
     // The server closes after its answer; whether it says so first does not matter.
     let _ = tls.read_to_end(&mut raw).await;
@@ -643,4 +660,5 @@ async fn a_frontend_without_the_job_flags_has_no_job_listener() {
     served.abort();
 }
 
+mod batch;
 mod stream;
