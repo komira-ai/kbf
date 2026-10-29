@@ -52,9 +52,9 @@
 //!   attested tarball, it replaces and breaks the old `kbf-installer`, it holds the units
 //!   of the modes, the slice, the sysusers and tmpfiles files, the drop-in and a trust
 //!   directory that trusts the branch it is attested for, and nothing else.
-//! - `pkg-image-asset` ([`pkg_image_asset`]): the frontend or coordinator OCI image tarball as the
+//! - `pkg-image-asset` ([`pkg_image_asset`]): the frontend, coordinator or task OCI image tarball as the
 //!   release asset `kbf-<service>-image-<commit>-<platform>.oci.tar`, refused unless its program
-//!   is the attested `kbf` (frontend) or the built `kbf-coordinator`, it runs as a user that is
+//!   is the attested `kbf` (frontend) or the built `kbf-coordinator` or `kbf-task`, it runs as a user that is
 //!   not root with the service's entrypoint, and it is built for the platform.
 //! - [`pkg_version`] and [`pkg_size`] (no verb yet): the version a `kbf` package
 //!   carries, in the one form a deb and an rpm put in the same order, and the most a package
@@ -93,6 +93,8 @@
 //!   GitHub refuses the cancel.
 //! - `runner-disk --path <path> --min-free-gb <n>` ([`runner_disk`]): exit 1 naming the disk
 //!   when the disk of `<path>` has less free space than the coverage run needs.
+//! - `static-elf <binary>` ([`static_elf`]): exit 1 unless the ELF64 binary is statically
+//!   linked: no `PT_INTERP` program header and no `DT_NEEDED` entry.
 //! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
 //!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
 //!   unit.
@@ -138,6 +140,7 @@ pub mod pkg_version;
 pub mod prove_farm;
 pub mod release;
 pub mod runner_disk;
+pub mod static_elf;
 pub mod sudo_test;
 pub mod sums;
 pub mod version_facts;
@@ -201,6 +204,9 @@ enum Verb {
     ProveFarm(prove_farm::Args),
     /// Check that the runner's disk has the room the coverage run needs.
     RunnerDisk(runner_disk::Args),
+    /// Refuse a binary that has a dynamic loader (`PT_INTERP`) or a needed shared library
+    /// (`DT_NEEDED`).
+    StaticElf(static_elf::Args),
     /// Cancel the pipeline run when one of its jobs has failed, so its other jobs stop.
     PipelineWatch(pipeline_watch::Args),
     /// Refuse a row the budget file gains against `--base`.
@@ -389,8 +395,8 @@ enum Verb {
         #[arg(long)]
         verify_only: bool,
     },
-    /// The frontend or coordinator OCI image tarball as a release asset, refused unless its
-    /// program is the attested `kbf` (or the built `kbf-coordinator`), its entrypoint is the
+    /// The frontend, coordinator or task OCI image tarball as a release asset, refused unless its
+    /// program is the attested `kbf` (or the built `kbf-coordinator` or `kbf-task`), its entrypoint is the
     /// service's, it runs as a user that is not root and it is built for the platform.
     PkgImageAsset {
         /// The image tarball `docker buildx build --output type=docker,oci-mediatypes=true` wrote (with
@@ -409,7 +415,7 @@ enum Verb {
         /// The frontend's `kbf-<commit>-<platform>.tar.gz` whose `kbf` the image must hold.
         #[arg(long, conflicts_with = "binary")]
         kbf_tarball: Option<PathBuf>,
-        /// The coordinator's `kbf-coordinator` the image must hold (it has no tarball; not
+        /// The `kbf-coordinator` or `kbf-task` the image must hold (it has no tarball; not
         /// with `--verify-only`, where the build's file is not at hand).
         #[arg(long, conflicts_with = "verify_only")]
         binary: Option<PathBuf>,
@@ -900,7 +906,7 @@ fn source_date_epoch(root: &Path, commit: &str, output: &Path) -> Result<String,
 }
 
 /// What the image of `service` must hold, from the flags: the frontend wants `--kbf-tarball`
-/// always, the coordinator wants `--binary` unless only verifying.
+/// always, the coordinator and the task image want `--binary` unless only verifying.
 fn image_reference<'a>(
     service: pkg_image_asset::Image,
     tarball: Option<&'a Path>,
@@ -910,13 +916,18 @@ fn image_reference<'a>(
     use pkg_image_asset::{Image, Reference};
     match (service, tarball, binary, verify_only) {
         (Image::Frontend, Some(t), None, _) => Ok(Some(Reference::KbfTarball(t))),
-        (Image::Coordinator, None, Some(b), false) => Ok(Some(Reference::Binary(b))),
-        (Image::Coordinator, None, None, true) => Ok(None),
+        (Image::Coordinator | Image::Task, None, Some(b), false) => Ok(Some(Reference::Binary(b))),
+        (Image::Coordinator | Image::Task, None, None, true) => Ok(None),
         (Image::Frontend, ..) => Err(Error::Failed(
             "the frontend image is checked against --kbf-tarball, and only that".to_owned(),
         )),
         (Image::Coordinator, ..) => Err(Error::Failed(
             "the coordinator image is checked against --binary (not with --verify-only, \
+             which makes the other checks alone)"
+                .to_owned(),
+        )),
+        (Image::Task, ..) => Err(Error::Failed(
+            "the task image is checked against --binary (not with --verify-only, \
              which makes the other checks alone)"
                 .to_owned(),
         )),
@@ -1012,6 +1023,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::DeployFarm(args) => deploy_farm::run(&args),
         Verb::ProveFarm(args) => prove_farm::run(&args),
         Verb::RunnerDisk(args) => runner_disk::run(&args),
+        Verb::StaticElf(args) => static_elf::run(&args),
         Verb::PipelineWatch(args) => pipeline_watch::run(&args),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::SourceDateEpoch { commit, output } => {
