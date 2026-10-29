@@ -64,3 +64,12 @@ fn each_mode_maps_to_the_schedulers_and_changes_nothing_else() {
         );
     }
 }
+
+/// Catches `off` carried as `Some(false)` (a farm that does not place by load would send a
+/// field it never sent), `on` carried as absent (nodes would never lift their limit), and a
+/// mode added without deciding what `Welcome` says of it.
+#[test]
+fn welcome_carries_true_for_on_and_nothing_for_off() {
+    assert_eq!(PlacementLoad::On.welcome(), Some(true));
+    assert_eq!(PlacementLoad::Off.welcome(), None);
+}

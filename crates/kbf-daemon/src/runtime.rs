@@ -137,6 +137,15 @@ pub trait Runtime: Send + Sync + 'static {
         async { Ok(None) }
     }
 
+    /// Told by each Welcome whether the farm places by the load the nodes measure
+    /// (`Welcome.placement_load`, false when absent), on the connect of every stream, before
+    /// the first heartbeat of it. A runtime that limits the CPU of its leases applies the
+    /// mode here, off the async workers; one that does not (the default) ignores it. A failure
+    /// is the runtime's to log: the stream goes on, and the next Welcome tells it again.
+    fn welcomed_placement_load(&self, _on: bool) -> impl Future<Output = ()> + Send {
+        async {}
+    }
+
     /// The most CPU any one window between two readings used by lease `lease_id`, in
     /// millicores, once, after its [`Runtime::run`] ended. `None` for a runtime that takes
     /// no readings (the default), and for a lease that ended before it had a full window.
