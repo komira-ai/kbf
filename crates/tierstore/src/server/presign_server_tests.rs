@@ -264,7 +264,7 @@ fn resign_with_raw_path(url: &str, raw: &str) -> String {
 #[tokio::test(start_paused = true)]
 async fn a_presigning_key_never_reads_lists_deletes_or_uploads_in_parts() {
     let f = fixture().await;
-    f.rig.put("cas/b/kept", b"kept").await;
+    f.rig.put("cas/b/kept", b"CONTENT-OF-KEPT").await;
     for method in ["GET", "HEAD", "DELETE", "POST"] {
         let url = presign_url(
             method,
@@ -278,7 +278,7 @@ async fn a_presigning_key_never_reads_lists_deletes_or_uploads_in_parts() {
             (403, "AccessDenied".to_owned()),
             "{method}"
         );
-        assert!(!reply.body.contains("kept"), "{method}");
+        assert!(!reply.body.contains("CONTENT-OF-KEPT"), "{method}");
     }
     let put = put_url("cas/b/kept", 300);
     for method in ["GET", "HEAD", "DELETE"] {
@@ -324,7 +324,7 @@ async fn a_presigning_key_never_reads_lists_deletes_or_uploads_in_parts() {
     );
     let reply = f.rig.send_raw(replace).await;
     assert_eq!(refused(&reply), (403, "AccessDenied".to_owned()));
-    assert_eq!(f.rig.get("cas/b/kept", None).await.body, "kept");
+    assert_eq!(f.rig.get("cas/b/kept", None).await.body, "CONTENT-OF-KEPT");
     assert!(!f.holds("cas/b/new").await && !f.holds("cas/b/big").await);
 }
 
