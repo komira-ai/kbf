@@ -110,9 +110,8 @@ async fn a_cancel_stops_a_run_and_forgets_the_lease() {
 async fn an_acknowledgement_forgets_its_lease_only() {
     let harness = Harness::new().await;
     let (mut worker, _messages) = harness.worker().await;
-    let now = Instant::now();
     for seq in [1, 2] {
-        worker.accept(now, &start(1, seq));
+        worker.accept(&start(1, seq));
     }
     let ack = |lease_id| {
         message(server_message::Message::ResultAck(ResultAck {
@@ -122,16 +121,10 @@ async fn an_acknowledgement_forgets_its_lease_only() {
         }))
         .expect("a message")
     };
-    worker.on_message(now, ack(None));
-    worker.on_message(
-        now,
-        ack(Some(kbf_proto::worker::LeaseId { term: 1, seq: 9 })),
-    );
+    worker.on_message(ack(None));
+    worker.on_message(ack(Some(kbf_proto::worker::LeaseId { term: 1, seq: 9 })));
     assert_eq!(worker.tasks.len(), 2);
-    worker.on_message(
-        now,
-        ack(Some(kbf_proto::worker::LeaseId { term: 1, seq: 1 })),
-    );
+    worker.on_message(ack(Some(kbf_proto::worker::LeaseId { term: 1, seq: 1 })));
     assert_eq!(stage_of(&worker, LeaseId::new(1, 1)), "none");
     assert_eq!(stage_of(&worker, LeaseId::new(1, 2)), "waiting");
 }
@@ -163,4 +156,27 @@ async fn an_unacknowledged_heartbeat_does_not_move_the_fence() {
         "an unacknowledged heartbeat moved the fence"
     );
     assert_eq!(worker.seq, 1);
+}
+
+/// Catches a `Start` that the farm sends twice for one lease posting two runs of it (the
+/// second would run beside the first and report beside it): the second changes nothing, even
+/// after the first was posted.
+#[tokio::test(start_paused = true)]
+async fn a_start_sent_twice_posts_one_run() {
+    let harness = Harness::new().await;
+    let (mut worker, messages) = harness.worker().await;
+    let (ctx, view) = (harness.ctx(), View::default());
+    for _ in 0..2 {
+        messages
+            .send(message(server_message::Message::Start(start(1, 1))))
+            .expect("sent");
+    }
+    worker.step(&ctx, &view, Instant::now()).await;
+    messages
+        .send(message(server_message::Message::Start(start(1, 1))))
+        .expect("sent");
+    worker.step(&ctx, &view, Instant::now()).await;
+    assert_eq!(stage_of(&worker, LeaseId::new(1, 1)), "running");
+    let runs = harness.deps.client.runs(worker.lease).await.expect("runs");
+    assert_eq!(runs.len(), 1);
 }

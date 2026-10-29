@@ -119,15 +119,13 @@ mod worker {
             truncated: false,
             cancelled: false,
         };
-        let found = worker.recover(&ctx, Instant::now(), "mine", running).await;
+        let found = worker.recover(&ctx, "mine", running).await;
         let Queued::Posted(found) = found else {
             panic!("not found");
         };
         assert_eq!(found.run, posted.run_id);
         assert_ne!(found.run, other.run_id);
-        let missing = worker
-            .recover(&ctx, Instant::now(), "nobody", running)
-            .await;
+        let missing = worker.recover(&ctx, "nobody", running).await;
         assert!(matches!(
             missing,
             Queued::Retire(crate::executor::host::Retire::Ambiguous)
@@ -143,7 +141,7 @@ mod worker {
         let (mut worker, _messages) = harness.worker().await;
         let ctx = harness.ctx();
         let now = Instant::now();
-        worker.accept(now, &start(1, 1));
+        worker.accept(&start(1, 1));
         let formed = LeaseId::new(1, 2);
         let action = start(1, 2).action_digest.expect("an action");
         let result = result_of(formed, &action, &Settled::Infra("formed".to_owned()));

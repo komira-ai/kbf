@@ -129,9 +129,9 @@ fn require(ok: bool, why: impl FnOnce() -> String) -> Result<(), Settled> {
 impl HostWorker {
     /// A `Start` from the farm. It is acted on only inside the window it names, counted from
     /// the heartbeat it names, as a daemon does: a `Start` that is late is dropped without a
-    /// result, and the farm, which no longer lists it, runs the lease again.
-    pub(super) fn accept(&mut self, now: Instant, start: &Start) {
-        let _ = now;
+    /// result, and the farm, which no longer lists it, runs the lease again. A window of
+    /// zero (a server that names none) is no time at all, the safe way.
+    pub(super) fn accept(&mut self, start: &Start) {
         let lease = start.lease_id.unwrap_or_default();
         let window = Duration::from_millis(start.valid_for_ms).min(START_VALIDITY);
         let waiting = Waiting {
@@ -140,13 +140,14 @@ impl HostWorker {
             memory_bytes: start.memory_bytes,
         };
         let action = start.action_digest.clone().unwrap_or_default();
-        self.tasks.insert(
-            kbf_types::LeaseId::new(lease.term, lease.seq),
-            Task {
+        // A `Start` sent again, for a lease that is already known, changes nothing: it must
+        // never post a second run.
+        self.tasks
+            .entry(kbf_types::LeaseId::new(lease.term, lease.seq))
+            .or_insert(Task {
                 action,
                 stage: Stage::Waiting(waiting),
-            },
-        );
+            });
     }
 
     /// The farm no longer holds the lease: whatever is stopped, and nothing is owed.
@@ -247,7 +248,7 @@ impl HostWorker {
         };
         match posted {
             Ok(accepted) => Queued::Posted(running(accepted.run_id)),
-            Err(e) if e.may_have_applied() => self.recover(ctx, now, &label, running).await,
+            Err(e) if e.may_have_applied() => self.recover(ctx, &label, running).await,
             Err(e) => self.refused(ctx, &e),
         }
     }
@@ -314,11 +315,9 @@ impl HostWorker {
     async fn recover(
         &self,
         ctx: &Ctx<'_>,
-        now: Instant,
         label: &str,
         running: impl FnOnce(RunId) -> Running,
     ) -> Queued {
-        let _ = now;
         let found = ctx
             .deps
             .client

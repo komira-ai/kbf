@@ -14,6 +14,9 @@
 //!   counted by the frontend's own ingest.
 //! - `Welcome.pack_commit` and `placement_load`: nothing here commits a pack through
 //!   `CommitPack`, and the host reports no load, so the farm places it by booking alone.
+//! - `Start.kind`, `device_id`, `job` and `fence`: the node report names `container` as its
+//!   only driver, so the farm places only actions on it, with no device; the worker fences
+//!   every run it starts, as a daemon does that is told nothing else.
 //!
 //! # Time
 //!
@@ -171,7 +174,7 @@ impl HostWorker {
     }
 
     async fn pass(&mut self, ctx: &Ctx<'_>, view: &View, now: Instant) -> ControlFlow<Retire> {
-        if self.intake(now) {
+        if self.intake() {
             self.reconnect(ctx, now).await;
         }
         self.renew(ctx, now, false).await?;
@@ -186,10 +189,10 @@ impl HostWorker {
     /// Takes every message the farm queued since the last pass. True if the farm ended the
     /// stream (a status in place of a message, as a handover sends) or dropped it (the worker
     /// was registered again).
-    fn intake(&mut self, now: Instant) -> bool {
+    fn intake(&mut self) -> bool {
         loop {
             match self.inbox.try_recv() {
-                Ok(Ok(message)) => self.on_message(now, message),
+                Ok(Ok(message)) => self.on_message(message),
                 Ok(Err(status)) => {
                     tracing::warn!(worker = %self.id, %status, "the farm ended the stream");
                     return true;
@@ -200,10 +203,10 @@ impl HostWorker {
         }
     }
 
-    fn on_message(&mut self, now: Instant, message: ServerMessage) {
+    fn on_message(&mut self, message: ServerMessage) {
         let farm_lease = |l: kbf_proto::worker::LeaseId| kbf_types::LeaseId::new(l.term, l.seq);
         match message.message {
-            Some(server_message::Message::Start(start)) => self.accept(now, &start),
+            Some(server_message::Message::Start(start)) => self.accept(&start),
             Some(server_message::Message::Cancel(Cancel { lease_id })) => {
                 lease_id
                     .map(farm_lease)

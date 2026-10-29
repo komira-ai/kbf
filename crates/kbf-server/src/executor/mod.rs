@@ -199,7 +199,9 @@ impl Executor {
 
     /// One pass over every slot: leases are asked for, kept and released, the farm's
     /// messages taken, runs posted and read, results reported, heartbeats sent. A caller
-    /// steps it every [`Config::poll`]; a pass never waits on a run.
+    /// steps it every [`Config::poll`]; a pass never waits on a run. A pass is run to its end:
+    /// dropping it half way leaves a slot that held a lease vacant, and the lease unreleased
+    /// (it expires, and a restarted frontend finds it by its label).
     pub async fn step(&mut self) {
         let now = self.clock.now();
         let Self {
