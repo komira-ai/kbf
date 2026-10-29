@@ -38,6 +38,52 @@ enroll-rate-per-minute = 60
 # A name this frontend serves, a DNS name or an IP address; repeat it for each. The enroll listener's certificate carries these names, and no node may advertise one or a host under one.
 # frontend-name = []
 
+[executor]
+# Where the farm runs the actions it places. `kbf-daemon`, the default, is the daemon of each node, over the worker listener: no executor is built and no lease server is contacted, whatever the other `--executor-*` flags say. `js-agent` runs them on hosts leased from the job scheduler's lease server, in the action's own image, by a task tool the agent mounts; it needs the lease server's flags (`--executor-lease-url`, `--executor-lease-token-file`, and `--executor-lease-ca-file` for https), the pool's (`--executor-class`, `--executor-hosts`, `--executor-host-cpus`, `--executor-host-memory-gib`), `--executor-frontend-id`, the packs (`--pack-store-endpoint`) and `--executor-insecure-argv-secrets`. The executor runs on exactly one frontend: a second frontend that holds hosts on the same lease server stops. A restart of the frontend fails the builds in flight. Switching back to `kbf-daemon` releases the leases when the frontend is stopped
+executor = "kbf-daemon"
+# Lets the task write its pack to an `http://` url, until the store serves TLS. The reads stay https. Used only with `--executor js-agent`
+executor-allow-plain-http-put = false
+# The CPU architecture of the hosts. Every lease asks for a host of `os=linux` and this `arch`, and the hosts report them to the farm. Used only with `--executor js-agent`
+executor-arch = "x86_64"
+# How long one call to the lease server may take before it counts as unanswered, in seconds. Under the fence time. Used only with `--executor js-agent`
+executor-call-timeout-secs = 5
+# The lease server's class every lease asks for (the pool of hosts the executor draws from). Used only with `--executor js-agent`
+# executor-class = "CLASS"
+# The timeout, in seconds, of an action that names none: at most `--executor-max-run-secs`. Used only with `--executor js-agent`
+executor-default-timeout-secs = 3000
+# The name of this frontend on the lease server: the value of the `kbf-frontend` label on its leases, by which a restarted frontend finds them and releases the ones it no longer needs. 1 to 63 of letters, digits, `-`, `_` and `.`. Used only with `--executor js-agent`
+# executor-frontend-id = "ID"
+# The CPU cores a host's lease holds: the pool's shape. At least 1. Used only with `--executor js-agent`
+# executor-host-cpus = "CORES"
+# The memory, in GiB, a host's lease holds: the pool's shape. Each run is capped at 1.5 times its booking plus 512 MiB, and the bookings of a host add up to what is left after that. Used only with `--executor js-agent`
+# executor-host-memory-gib = "GIB"
+# The most runs a host takes at once, reported to the farm as the host's action slots. Used only with `--executor js-agent`
+executor-host-slots = 8
+# How many hosts to hold, a lease each. A host is leased whole for the shape below and released before its lease ends. Used only with `--executor js-agent`
+# executor-hosts = "HOSTS"
+# Says that no image of the farm sets an `ENTRYPOINT`. The lease server appends the task tool's arguments to the image's entrypoint, so the tool would not run under one, and the frontend does not read an image's config: without this every action is refused as such. Used only with `--executor js-agent`
+executor-images-have-no-entrypoint = false
+# Says the secrets of a task (the presigned write url, the read token) may travel as arguments of the run, where the action can read them from `/proc` and the engine's inspect shows them. The lease server's job has no secret field yet, so `--executor js-agent` cannot run without it; it is refused with `--executor kbf-daemon`. Off by default
+executor-insecure-argv-secrets = false
+# The CA certificate (PEM) the lease server's certificate chains to: the only trust anchor, no system roots are consulted. Needed for an `https` lease server and refused for an `http` one. Used only with `--executor js-agent`
+# executor-lease-ca-file = "PATH"
+# A file with the bearer token of the lease server, readable by its owner alone (mode 0600 or 0400). The secret is never a flag: a command line is world-readable. Used only with `--executor js-agent`
+# executor-lease-token-file = "PATH"
+# How long a lease lasts without a renewal, in seconds, asked at each renewal. It must cover the longest run and two heartbeats, and the lease server grants at most its own `--max-ttl`. Used only with `--executor js-agent`
+executor-lease-ttl-secs = 3600
+# The lease server, as `https://host[:port]`, or `http://` to a loopback host. Used only with `--executor js-agent`
+# executor-lease-url = "URL"
+# The longest action timeout the executor runs, in seconds; an action that asks for more is refused. Used only with `--executor js-agent`
+executor-max-run-secs = 3000
+# A file beside the task tool in its root (the farm's root certificate, DER) that the task trusts for its https reads; mounted read-only next to the tool. Left out, the task is given none. Used only with `--executor js-agent`
+# executor-root-der = "FILE"
+# What a run's wall time adds to the action's timeout, in seconds: the fetch of the inputs and the upload of the pack. An action that fetches or uploads for longer than this ends at the wall time and is answered to the caller as a timeout. Used only with `--executor js-agent`
+executor-run-margin-secs = 300
+# Where the task tool is in the action's container, as `/mnt/<root>/<file>`: the agent mounts `<file>` of its root `<root>` read-only at `/mnt/<root>/<file>`. Used only with `--executor js-agent`
+executor-task-tool = "/mnt/kbf-tools/kbf-task"
+# Where the task tool works in the container, if not in its own default: the action's image must have a writable directory there. Used only with `--executor js-agent`
+# executor-work-dir = "DIR"
+
 [handover]
 # Retired: no longer read, the handover was removed. Accepted and ignored for one release
 # (not in --help)

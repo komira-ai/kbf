@@ -21,7 +21,7 @@ fn short_leases(cfg: &mut Config) {
 
 /// Catches an executor that reaches for the lease server before it is run: building one asks
 /// for nothing, and a config that breaks a rule is refused before anything is built. (What a
-/// server without an executor never does is tested at the frontend, in tests/executor_flag.rs.)
+/// server without an executor never does is tested at the frontend, in src/frontend/executor_tests.rs.)
 #[tokio::test(start_paused = true)]
 async fn building_an_executor_asks_the_lease_server_for_nothing() {
     let rig = Rig::start(&["node1"], 1, |_| {}).await;
@@ -276,6 +276,11 @@ async fn a_lease_booked_by_a_lost_answer_is_released() {
     assert_ne!(hosts[0].lease, stray);
     let released = format!("DELETE /v1/leases/{stray}");
     assert_eq!(count(&rig.requests(), &released), 1);
+    let counted = rig.counted();
+    assert!(
+        counted.contains("kbf_executor_stray_leases_released_total 1\n"),
+        "{counted}"
+    );
 }
 
 /// Catches a lease the executor released without the lease server hearing (a flaky server
@@ -546,6 +551,7 @@ async fn shutdown_stops_the_runs_and_releases_the_leases() {
     for lease in leases {
         assert_eq!(count(&requests, &format!("DELETE /v1/leases/{lease}")), 1);
     }
+    assert!(rig.counted().contains("kbf_executor_leases_held 0\n"));
 }
 
 /// Catches a shutdown that leaves a booked lease behind or stops at a lease the server will

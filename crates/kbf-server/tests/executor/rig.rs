@@ -12,8 +12,8 @@ use kbf_proto::reapi::{ActionResult, Digest};
 use kbf_sched::Request;
 use kbf_server::Farm;
 use kbf_server::executor::{
-    ActionFacts, Clock, Config, Deps, Executor, Ingest, Ingested, Inputs, InputsError, MintError,
-    Nonce, PackKey, Presign, PresignError, ReadGrant, Secret, UntrustedLimits, build_id,
+    ActionFacts, Clock, Config, Deps, Executor, Ingest, Ingested, Inputs, InputsError, Metrics,
+    MintError, Nonce, PackKey, Presign, PresignError, ReadGrant, Secret, UntrustedLimits, build_id,
 };
 use kbf_types::{ActionKey, LeaseKind, Qos, Resources};
 use tokio::sync::watch;
@@ -257,6 +257,7 @@ pub struct Rig {
     pub inputs: Arc<FakeInputs>,
     pub presign: Arc<FakePresign>,
     pub ingest: Arc<FakeIngest>,
+    pub metrics: Arc<Metrics>,
     _hold: ClockHold,
 }
 
@@ -350,7 +351,8 @@ impl Rig {
             Arc::new(FakePresign::new()),
             Arc::new(FakeIngest::new()),
         );
-        let exec = Self::executor(&fake, &farm, &cfg, &inputs, &presign, &ingest);
+        let metrics = Arc::new(Metrics::default());
+        let exec = Self::executor(&fake, &farm, &cfg, &inputs, &presign, &ingest, &metrics);
         Self {
             fake,
             api,
@@ -360,6 +362,7 @@ impl Rig {
             inputs,
             presign,
             ingest,
+            metrics,
             _hold: hold,
         }
     }
@@ -371,6 +374,7 @@ impl Rig {
         inputs: &Arc<FakeInputs>,
         presign: &Arc<FakePresign>,
         ingest: &Arc<FakeIngest>,
+        metrics: &Arc<Metrics>,
     ) -> Executor {
         let deps = Deps {
             farm: Arc::clone(farm),
@@ -378,7 +382,7 @@ impl Rig {
             ingest: ingest.clone(),
             presign: presign.clone(),
             inputs: inputs.clone(),
-            metrics: Arc::default(),
+            metrics: Arc::clone(metrics),
         };
         Executor::new(cfg.clone(), deps, Clock::from_unix_ms(fake.now_ms()))
             .expect("a valid config")
@@ -393,6 +397,7 @@ impl Rig {
             &self.inputs,
             &self.presign,
             &self.ingest,
+            &self.metrics,
         )
     }
 
@@ -550,6 +555,13 @@ impl Rig {
 
     pub fn requests(&self) -> Vec<String> {
         self.fake.requests()
+    }
+
+    /// What the executor counts, as `GET /metrics` shows it.
+    pub fn counted(&self) -> String {
+        let mut text = String::new();
+        self.metrics.render(&mut text);
+        text
     }
 
     /// Every action the rig is asked about runs for `timeout`.

@@ -1,16 +1,11 @@
 //! What the executor needs from the rest of the server, as the smallest seams it can say.
 //!
-//! Each trait has a real implementation elsewhere (the frontend's ingest of an untrusted
-//! pack, the tier store's presigned `PUT`, the CAS read for an action and the read grant) and
-//! a fake in the tests. None of them is implemented here.
-//!
-//! The real [`Ingest`] is a thin adapter over the frontend's ingest of an untrusted pack and
-//! belongs to the change that wires the executor in, which builds it from what the server
-//! owns: the pack index, a CAS backend over the same index, and the key mint with its secret.
-//! It maps this module's types to the frontend's one for one: the build id of a farm lease
-//! ([`build_id`](crate::executor::build_id)) for the lease, a key the mint issued for
-//! [`PackKey`], [`UntrustedLimits`] filled out with the frontend's own bounds for the fields it
-//! does not have, and the frontend's reasons for [`RejectReason`].
+//! Each trait has a real implementation, [`Front`](crate::executor::Front), which is built from
+//! what the frontend owns: the packs, a CAS backend over the same packs, the key mint and the
+//! preparation of a run. It maps this module's types to the frontend's one for one: the build id
+//! of a farm lease ([`build_id`](crate::executor::build_id)) for the lease, a key the mint
+//! issued for [`PackKey`], [`UntrustedLimits`] filled out with the frontend's own bounds for the
+//! fields it does not have, and the frontend's reasons for [`RejectReason`]. The tests have fakes.
 
 use std::fmt;
 use std::time::Duration;

@@ -394,12 +394,12 @@ fn js_agent_flags(m: &ArgMatches) -> Result<JsAgentFlags, String> {
     config.arch = one(ARCH);
     config.tool_mount = tool_mount(&one(TOOL))?;
     config.root_der = m.get_one::<String>(ROOT_DER).cloned();
-    if let Some(file) = &config.root_der {
-        if file.is_empty() || file.contains('/') || file == ".." {
-            return Err(format!(
-                "--executor-root-der {file:?} is not a file beside the task tool"
-            ));
-        }
+    if let Some(file) = &config.root_der
+        && (file.is_empty() || file.contains('/') || file == "..")
+    {
+        return Err(format!(
+            "--executor-root-der {file:?} is not a file beside the task tool"
+        ));
     }
     config.work_dir = m.get_one::<String>(WORK_DIR).cloned();
     if config

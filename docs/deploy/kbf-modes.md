@@ -113,6 +113,39 @@ that keeps sending, however slowly, is never cut and keeps its bytes until it en
 nothing holds only its reservation, never a buffer of the claimed size. Both flags are
 accepted and ignored without `--pack-store-endpoint`.
 
+Where the frontend runs the actions it places is `--executor` (the `[executor]` table of
+`kbf.toml`). `kbf-daemon`, the default, is the daemon of each node over the worker listener,
+as always: the frontend builds no executor and contacts no lease server, whatever the other
+`--executor-*` flags say, so a unit or `kbf.toml` that names a lease server keeps its settings
+when the executor is switched back (the one exception is `--executor-insecure-argv-secrets`,
+refused with `kbf-daemon`). `js-agent` leases hosts from the job scheduler's lease server
+instead, one lease for each of `--executor-hosts` hosts of `--executor-host-cpus` cores and
+`--executor-host-memory-gib` GiB in the class `--executor-class`, asked for with
+`os=linux` and `--executor-arch` (default `x86_64`), and runs each placed action in its own
+image by a task tool that the agent mounts read-only (`--executor-task-tool`, default
+`/mnt/kbf-tools/kbf-task`). The image must be named by digest and be on the host. It needs the
+lease server (`--executor-lease-url`, `https://`, or `http://` to loopback only;
+`--executor-lease-token-file`, mode 0600 or 0400; `--executor-lease-ca-file` for an `https`
+URL), `--executor-frontend-id` (the `kbf-frontend` label on the frontend's leases, by which a
+restarted frontend finds and releases them), the packs (`--pack-store-endpoint`, through which
+the pack a task writes is read, hashed and turned into the action's result) and
+`--executor-insecure-argv-secrets`: the lease server's job has no secret field yet, so the
+presigned write url and the read token travel as arguments of the run, where the action can
+read them. No image's config is read, and the task tool cannot run under an `ENTRYPOINT`, so
+every action is refused until `--executor-images-have-no-entrypoint` says no image of the farm
+sets one. The executor runs on exactly one frontend: it looks for another frontend's leases on
+the lease server before its first pass and every minute after, and a frontend that finds one
+stops with an error naming it. A restart of the frontend fails the builds in flight, and
+stopping it stops the runs and releases the leases. `GET /metrics` gains the
+`kbf_executor_*` families. The remaining settings are `--executor-host-slots` (default 8),
+`--executor-run-margin-secs` (300; what a run's wall time adds to the action's timeout),
+`--executor-lease-ttl-secs` (3600), `--executor-max-run-secs` and
+`--executor-default-timeout-secs` (3000), `--executor-call-timeout-secs` (5),
+`--executor-root-der` and `--executor-work-dir` (for the task tool), and
+`--executor-allow-plain-http-put` (until the store serves TLS). A setting that breaks a rule
+the executor's safety rests on (the fence time against the scheduler's grace, the lease ttl
+against the longest run) is refused at start, exit status 2.
+
 A daemon reads from the packs with `--pack-read` (off by default; the `[packs]` table of
 `kbf.toml`), which needs `--pack-store-endpoint`, `--pack-store-bucket` and
 `--pack-store-credentials-file` (a JSON key pair, mode 0600 or 0400, of a key that may read

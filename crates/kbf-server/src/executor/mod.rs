@@ -15,9 +15,13 @@
 //!
 //! The executor runs on exactly one frontend: it holds its leases under its frontend id, and
 //! on start stops every run of the leases it finds under that id, which nothing of the farm
-//! maps to any more.
+//! maps to any more. [`Executor::rival`] finds another frontend's leases on the lease server,
+//! and the task that steps the executor ([`Running`]) stops when it does.
 //!
-//! Nothing wires it yet: there is no flag, and no server builds one.
+//! The frontend builds one only for `--executor js-agent` (`frontend/executor_flags.rs`), over
+//! [`Front`], which implements the three seams ([`Ingest`], [`Presign`], [`Inputs`]) with the
+//! frontend's own packs, CAS, key mint and run preparation, and steps it from
+//! [`FrontendHandle::serve`](crate::frontend::FrontendHandle::serve) until the frontend stops.
 
 mod api;
 mod config;

@@ -56,6 +56,13 @@
 //! pack index too, the frontend takes a daemon's `CommitPack` (it must read the pack to check it)
 //! and says so in `Welcome.pack_commit`.
 //!
+//! **The executor** is off unless `--executor js-agent` is given (`executor_flags` has the flags):
+//! the farm then runs the actions it places on hosts leased from the job scheduler's lease
+//! server ([`crate::executor`]), and `FrontendHandle::serve` steps it beside the listeners and
+//! releases its leases when the frontend stops. It needs the packs and, given to
+//! [`start_frontend_with`], the preparation of task runs. By default, `--executor kbf-daemon`,
+//! nothing is built and no lease server is contacted.
+//!
 //! **Readiness** (`GET /readyz`, `grpc.health.v1`) fails when the storage node does not
 //! answer an action-cache lookup within `--readyz-store-timeout-ms`, when the state store (if
 //! configured) does not answer a read, and when the storage map is not loaded (always
@@ -957,7 +964,7 @@ impl<'a> Prepared<'a> {
             tls_sources,
             packs.clone(),
             Arc::clone(&farm),
-            executor.as_ref().map(|(_, metrics)| Arc::clone(metrics)),
+            executor.as_ref().map(|built| Arc::clone(&built.metrics)),
         ));
         // The storage health, if there are members.
         let api_routes = members.iter().fold(api_routes, |routes, members| {
@@ -1163,7 +1170,7 @@ impl<'a> Prepared<'a> {
             pack_index,
             packs,
             intake_polls,
-            executor: executor.map(|(executor, _)| executor),
+            executor: executor.map(|built| built.executor),
         })
     }
 }
@@ -1206,6 +1213,12 @@ fn open_object_stores(
     })
 }
 
+/// A built executor, and the counts it keeps.
+struct ExecutorParts {
+    executor: Executor,
+    metrics: Arc<ExecutorMetrics>,
+}
+
 /// The executor `--executor js-agent` describes, over `farm`, with the metrics it counts into;
 /// none for `kbf-daemon`, which builds nothing and contacts no lease server. The seams are the
 /// frontend's own: the ingest of the packs, the CAS `backend` over the same packs, and the
@@ -1220,7 +1233,7 @@ fn executor_of(
     packs: Option<&Packs>,
     backend: &Backend,
     source: Option<RunSource>,
-) -> Result<Option<(Executor, Arc<ExecutorMetrics>)>, Box<dyn Error>> {
+) -> Result<Option<ExecutorParts>, Box<dyn Error>> {
     let Some(js) = &flags.executor.js else {
         return Ok(None);
     };
@@ -1238,7 +1251,7 @@ fn executor_of(
     });
     let metrics = Arc::new(ExecutorMetrics::default());
     let executor = js.build(Arc::clone(farm), Arc::new(front), Arc::clone(&metrics))?;
-    Ok(Some((executor, metrics)))
+    Ok(Some(ExecutorParts { executor, metrics }))
 }
 
 /// The store `/readyz` probes: the open state store's, if there is one.
