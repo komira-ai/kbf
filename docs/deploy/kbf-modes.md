@@ -123,31 +123,6 @@ against the digest. A blob the frontend does not locate, and a frontend without
 previous release, which answers PERMISSION_DENIED (logged once, then once more after a
 read that was answered, and counted as `unasked`); `missing`, uploads and every
 other call are unchanged, so without `--pack-write` the daemon still uploads its outputs to the storage members.
-
-**Task runs** (off by default; the `[task-runs]` table of `kbf.toml`). With `--task-secret-file`
-the frontend prepares the runs of a host executor: for each lease and Action it makes the three
-values a task needs and the executor delivers, `RunInputs` of `kbf_front::prepare_run`. They are
-the pack key the task may write (`cas/b/<lease>/<nonce>-0`, which the executor passes to `ingest`
-when the run ends); one presigned `PUT` of exactly that key to the tier store, signed with a
-presign-only key; and a read grant, a bearer token with the base URL of the job-facing read
-listener, for the Action, its Command and every blob of its input tree. The write and the grant
-are good for the run's wall limit plus a slack, `--task-run-wall-secs` (default 7200) and
-`--task-url-slack-secs` (default 600), and never for more than 4 hours (14400 seconds), the
-ceiling of a presigned write: the tier store's presigning key must allow at least that
-(`max_expires_secs` of its `--presign-key-file`, and `--presign-max-expires`), and a wall and
-slack that add up to more are refused at start. Before it signs anything the frontend reads the
-Action, its Command and the whole input tree and checks that every blob is held: a blob that is
-missing is an error, never a smaller grant, and a tree over `--task-closure-max-digests`
-(default 500000) or `--task-closure-max-bytes` (default 32 GiB) is refused. The switch needs
-`--task-put-endpoint` (the tier store's proxy, `http://` or `https://host:port`),
-`--task-put-bucket`, `--task-put-region` (default `us-east-1`),
-`--task-put-credentials-file` (JSON `{"access_key_id": "...", "secret_access_key": "..."}` of
-the presign-only key, owned by the server's user, mode 0600 or 0400) and `--task-read-url`
-(`https://host:port`, no path: an `http://` URL is refused at start, as the token is a bearer
-secret). The secret file holds one secret of at least 32 bytes, owned by the server's user
-and readable by it alone; the pack-key mint and the grant key are made from it, and the
-job-facing listener must verify grants with the same secret. No secret is a flag. Left out, no
-secret file is read and the frontend serves exactly as before.
 A pack that is gone or whose bytes are not the digest fails the read. Each read asks for one
 blob: one `Locate` call and one ranged request, with at most 16 asking at once. A blob of
 more than 64 MiB is read where it was before, as a read from a pack holds the whole blob in
@@ -166,6 +141,34 @@ reads first, and the outputs still go to the members. `kbf all-in-one` and
 the whole farm, with no frontend to ask and no pack index, and refuse the flag. Counts of
 what was read from packs, elsewhere, lost and damaged are logged when the daemon stops
 (`pack reads: ...`), and a lost or damaged blob is logged when it is found.
+
+**Task runs** (off by default; the `[task-runs]` table of `kbf.toml`). With `--task-secret-file`
+the frontend prepares the runs of a host executor: for each lease and Action it makes the three
+values a task needs and the executor delivers, `RunInputs` of `kbf_front::prepare_run`. They are
+the pack key the task may write (`cas/b/<lease>/<nonce>-0`, which the executor passes to `ingest`
+when the run ends); a presigned `PUT` of exactly that key to the tier store, signed with a
+presign-only key (the URL takes a `PUT` until it expires, and the store is create-only, so the
+first write is the only one that lands); and a read grant, a bearer token with the base URL of the job-facing read
+listener, for the Action, its Command and every blob of its input tree (the listener works the scope out
+again from the Action each time the token is used, so a blob removed after the run was prepared
+fails that read). The write and the grant
+are good for the run's wall limit plus a slack, `--task-run-wall-secs` (default 7200) and
+`--task-url-slack-secs` (default 600), and never for more than 4 hours (14400 seconds), the
+ceiling of a presigned write: the tier store's presigning key must allow at least that
+(`max_expires_secs` of its `--presign-key-file`, and `--presign-max-expires`), and a wall and
+slack that add up to more are refused at start. Before it signs anything the frontend reads the
+Action, its Command and the whole input tree and checks that every blob is held: a blob that is
+missing is an error, never a smaller grant, and a tree over `--task-closure-max-digests`
+(default 500000) or `--task-closure-max-bytes` (default 32 GiB) is refused. The switch needs
+`--task-put-endpoint` (the tier store's proxy, `http://` or `https://host:port`),
+`--task-put-bucket`, `--task-put-region` (default `us-east-1`),
+`--task-put-credentials-file` (JSON `{"access_key_id": "...", "secret_access_key": "..."}` of
+the presign-only key, owned by the server's user, mode 0600 or 0400) and `--task-read-url`
+(`https://host:port`, no path: an `http://` URL is refused at start, as the token is a bearer
+secret). The secret file holds one secret of at least 32 bytes, owned by the server's user
+and readable by it alone; the pack-key mint and the grant key are made from it, and the
+job-facing listener must verify grants with the same secret. No secret is a flag. Left out, no
+secret file is read and the frontend serves exactly as before.
 
 A daemon writes its outputs into packs with `--pack-write` (off by default; the `[packs]`
 table of `kbf.toml`), which needs `--pack-read` and `--pack-store-write-credentials-file`, a
