@@ -115,13 +115,14 @@ impl Observer for KbfObserver {
 /// The store cannot be read or written, or holds a row that is not one the scheduler wrote.
 pub fn open(
     config: &Config,
-    adapter: KbfAdapter,
+    mut adapter: KbfAdapter,
     store: Arc<dyn Store>,
     epoch: EpochPolicy,
     now: FarmTime,
 ) -> Result<Core<KbfAdapter>, StateError> {
+    // Read before the core exists: no caller waits for the store behind its lock.
+    adapter.restore_learned();
     let observer = KbfObserver::new(adapter.cache.clone());
     let core = Core::open(config, adapter, storage(store, epoch), now)?;
-    core.with(|_, adapter| adapter.restore_learned());
     Ok(core.with_observer(observer))
 }

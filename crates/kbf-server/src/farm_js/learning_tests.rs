@@ -2,7 +2,9 @@
 //! (`learning`): what the estimator is shown, what it says, and the summaries in the state
 //! store. The farm-level cases that need the feature are in `farm::js::tests::learned`.
 
+use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use kbf_front::metrics::{ShadowBucket, ShadowLevel};
 use kbf_front::{Cache, Described, Recorder, Submission};
@@ -13,7 +15,10 @@ use kbf_state::Store;
 use kbf_types::{ActionKey, Digest, DigestFunction, FarmTime, LeaseKind, Qos, Resources, WorkerId};
 
 use super::dispatch;
-use super::testing::{Flaky, Rig, Wire, register, result_with, started, wall};
+use super::testing::{
+    Flaky, Rig, Wire, overwrite, register, result_with, started, submit as plain_submit, wall,
+};
+use super::{Gate, write_learned};
 use super::{KbfAdapter, open};
 use crate::PlacementLoad;
 use crate::action_usage::Shapes;
@@ -30,11 +35,26 @@ fn at(millis: u64) -> FarmTime {
 
 /// A core of term 7 over `store` whose adapter learns as `mode` says.
 fn learning_rig(store: &Arc<Flaky>, mode: LearnedSizes) -> Rig {
+    learning_rig_stored(store, mode, true)
+}
+
+/// [`learning_rig`], whose adapter is told whether the core has a state store to write to.
+fn learning_rig_stored(store: &Arc<Flaky>, mode: LearnedSizes, stored: bool) -> Rig {
     let shared: Arc<dyn Store> = store.clone();
+    learning_rig_over(shared, store, mode, stored)
+}
+
+/// A core over `shared`, which is `store` or a wrapper of it.
+fn learning_rig_over(
+    shared: Arc<dyn Store>,
+    store: &Arc<Flaky>,
+    mode: LearnedSizes,
+    stored: bool,
+) -> Rig {
     let backend: kbf_front::Backend = Arc::new(Cache::memory()).into();
     let adapter = KbfAdapter::new(7, backend.clone(), Arc::clone(&shared), wall())
         .recording(Recorder::off())
-        .learning_with(Learned::new(mode, 4 * GIB, 0), true);
+        .learning_with(Learned::new(mode, 4 * GIB, 0), stored);
     let config = open::config(
         7,
         kbf_sched::UNSERVABLE_WAIT,
@@ -112,6 +132,14 @@ fn measured(lease: kbf_types::LeaseId, peak: u64) -> worker::Result {
 }
 
 async fn report(rig: &Rig, worker: &str, result: worker::Result) -> worker::ResultAck {
+    let ack = report_only(rig, worker, result).await;
+    // As the farm does after the report: the summaries a kill changed, outside the lock.
+    write(rig, false).await;
+    ack
+}
+
+/// The core's answer to `result`, with no write of summaries after it.
+async fn report_only(rig: &Rig, worker: &str, result: worker::Result) -> worker::ResultAck {
     dispatch::report(
         &rig.core,
         &rig.backend,
@@ -123,6 +151,17 @@ async fn report(rig: &Rig, worker: &str, result: worker::Result) -> worker::Resu
     .await
     .expect("a host the core hears")
     .expect("an ack")
+}
+
+thread_local! {
+    /// The gate of the writers of this test's core: a test runs on one thread.
+    static GATE: Rc<Gate> = Rc::new(Gate::default());
+}
+
+/// [`write_learned`] on the gate of this test.
+async fn write(rig: &Rig, tick: bool) {
+    let gate = GATE.with(Rc::clone);
+    write_learned(&rig.core, &gate, tick).await;
 }
 
 /// Runs the action `tag` of `argv` to the end on `node`, which reports `peak`.
@@ -210,14 +249,13 @@ async fn summaries_are_written_behind_swept_and_read_back_on_start() {
     assert_eq!(rows(&rig), 0, "nothing is written at the report");
 
     rig.core.tick(at(10_000)).await;
-    rig.core.with(|_, adapter| adapter.flush_learned());
+    write(&rig, true).await;
     let written = rows(&rig);
     assert!(written > 0, "written behind at the tick");
 
     // The first look at the sweep starts the hour; the next one after it sweeps.
     rig.core.tick(at(3_700_000)).await;
-    rig.core.with(|_, adapter| adapter.flush_learned());
-    rig.core.with(|_, adapter| adapter.write_behind_now());
+    write(&rig, true).await;
     assert_eq!(rows(&rig), written, "fresh rows are not swept");
 
     let second = learning_rig(&store, LearnedSizes::Shadow);
@@ -249,4 +287,333 @@ async fn an_own_limit_kill_is_written_at_once() {
     assert_eq!(rows(&rig), 0);
     assert!(report(&rig, "node-kill", kill).await.accepted);
     assert!(rows(&rig) > 0, "the kill is in the store");
+}
+
+/// Three successful runs of `argv` on a node of `rig`, so that the estimator holds a summary.
+async fn teach(rig: &Rig, name: &str, argv: &str) {
+    let mut node = register(rig, name, 0);
+    for tag in 1..=3_u8 {
+        run(rig, &mut node, name, tag, argv, 100 * MIB).await;
+    }
+}
+
+/// Flushes the summaries written behind at farm time `millis`.
+async fn flush_at(rig: &Rig, millis: u64) {
+    rig.core.tick(at(millis)).await;
+    write(rig, true).await;
+}
+
+/// Asserts a summary the store refuses is kept and written at a later tick, and one a newer
+/// writer's fence refuses is dropped and not kept. Catches: a refused write lost for good, a
+/// fenced write retried at every tick.
+#[tokio::test(start_paused = true)]
+async fn a_refused_write_is_written_again_and_a_fenced_one_is_not_kept() {
+    let store = Flaky::new();
+    let rig = learning_rig(&store, LearnedSizes::Shadow);
+    teach(&rig, "node-refused", "compile refused").await;
+
+    store.set_down(true);
+    flush_at(&rig, 10_000).await;
+    assert_eq!(rows(&rig), 0, "the store refused");
+    store.set_down(false);
+    flush_at(&rig, 20_000).await;
+    assert!(rows(&rig) > 0, "written again");
+
+    let fenced = Flaky::new();
+    let rig = learning_rig(&fenced, LearnedSizes::Shadow);
+    teach(&rig, "node-fenced", "compile fenced").await;
+    fenced.set_fenced(true);
+    flush_at(&rig, 10_000).await;
+    fenced.set_fenced(false);
+    flush_at(&rig, 20_000).await;
+    assert_eq!(rows(&rig), 0, "a fenced write is not kept");
+}
+
+/// Asserts summaries the store holds that cannot be read, or decoded, leave the action cold
+/// and stop nothing: a core opens over a store whose `est/` rows cannot be read, and over one
+/// that holds a row that is no summary, which the sweep skips. Catches: a start that fails
+/// on a summary, a sweep that stops at a row it cannot decode.
+#[tokio::test(start_paused = true)]
+async fn summaries_that_cannot_be_read_or_decoded_are_skipped() {
+    let store = Flaky::new();
+    store.fail_reads(Some(ESTIMATE));
+    let rig = learning_rig(&store, LearnedSizes::Shadow);
+    teach(&rig, "node-unread", "compile unread").await;
+    store.fail_reads(None);
+
+    overwrite(store.plain(), "est/garbage", vec![1, 2, 3]);
+    let rig = learning_rig(&store, LearnedSizes::Shadow);
+    teach(&rig, "node-garbage", "compile garbage").await;
+    flush_at(&rig, 10_000).await;
+    flush_at(&rig, 3_700_000).await;
+    assert!(rows(&rig) > 0);
+}
+
+/// Asserts the hourly sweep removes the summaries idle past the estimator's staleness (60 days) and
+/// keeps the others, and does it from the store, not only from memory. Catches: a sweep that
+/// never deletes, or one that deletes rows a day old.
+#[tokio::test(start_paused = true)]
+async fn the_sweep_deletes_stale_summaries_from_the_store() {
+    let rig = learning_rig(&Flaky::new(), LearnedSizes::Shadow);
+    teach(&rig, "node-stale", "compile stale").await;
+    flush_at(&rig, 10_000).await;
+    let written = rows(&rig);
+    assert!(written > 0);
+
+    let seventy_days = 70 * 24 * 3_600_000;
+    flush_at(&rig, seventy_days).await;
+    flush_at(&rig, seventy_days + 3_700_000).await;
+    assert!(rows(&rig) < written, "stale rows are swept");
+}
+
+/// Asserts what the estimator is not shown: a report with no usage that is no memory kill, an
+/// operation whose platform is not pinned, a caller that joined a twin, and a lease given up
+/// for a silent node. Catches: a panic or a made-up sample for any of them.
+#[tokio::test(start_paused = true)]
+async fn what_the_estimator_cannot_use_is_skipped() {
+    let log = capture();
+    let rig = learning_rig(&Flaky::new(), LearnedSizes::Shadow);
+    let mut node = register(&rig, "node-skip", 0);
+
+    // No usage, no memory kill: nothing to learn.
+    let _ticket = submit(&rig, 1, "compile skip", 0);
+    let lease = started(&node.sent()).expect("started");
+    let failed = worker::Result {
+        status: Some(kbf_proto::google::rpc::Status {
+            code: tonic::Code::Internal as i32,
+            message: "test".to_owned(),
+            details: Vec::new(),
+        }),
+        ..result_with(lease, ActionResult::default())
+    };
+    assert!(report(&rig, "node-skip", failed).await.accepted);
+
+    // The platform is not pinned: no key.
+    let _unpinned = plain_submit(&rig, 2, 0).expect("queued");
+    // A twin joined is no new operation.
+    let _first = submit(&rig, 3, "compile twin", 0);
+    let _twin = submit(&rig, 3, "compile twin", 0);
+    let asked = estimates(&log.text()).len();
+    assert_eq!(asked, 2, "{:?}", estimates(&log.text()));
+
+    // A node that falls silent loses its lease: the estimator forgets the booking.
+    rig.core.tick(at(600_000)).await;
+}
+
+/// A state store that checks the core's lock is free whenever the learning code calls it for
+/// size summaries: a probe thread takes the core's lock (`Core::with`) while the call is made,
+/// and the call fails if the probe cannot get it. Calls for anything else, which the core
+/// makes under its own lock, are not checked.
+struct Probed {
+    armed: AtomicBool,
+    inner: Arc<Flaky>,
+    asking: AtomicBool,
+    answered: AtomicBool,
+    checked: AtomicUsize,
+}
+
+impl Probed {
+    fn check(&self, what: &str) {
+        if !self.armed.load(Ordering::SeqCst) {
+            return;
+        }
+        self.checked.fetch_add(1, Ordering::SeqCst);
+        self.answered.store(false, Ordering::SeqCst);
+        self.asking.store(true, Ordering::SeqCst);
+        // The probe answers in a few yields when the lock is free; held, it never does.
+        let mut spins = 0_u32;
+        while !self.answered.load(Ordering::SeqCst) {
+            spins += 1;
+            assert!(spins < 2_000_000, "the core's lock is held across {what}");
+            std::thread::yield_now();
+        }
+        self.asking.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Store for Probed {
+    fn apply_batch(
+        &self,
+        batch: Vec<kbf_state::Txn>,
+    ) -> Result<Vec<Result<kbf_state::Commit, kbf_state::Conflict>>, kbf_state::StoreError> {
+        if format!("{batch:?}").contains("\"est/") {
+            self.check("a write of size summaries");
+        }
+        self.inner.apply_batch(batch)
+    }
+
+    fn get(&self, key: &str) -> Result<Option<kbf_state::Versioned>, kbf_state::StoreError> {
+        self.inner.get(key)
+    }
+
+    fn scan_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, kbf_state::Versioned)>, kbf_state::StoreError> {
+        if prefix == ESTIMATE {
+            self.check("a scan of size summaries");
+        }
+        self.inner.scan_prefix(prefix)
+    }
+
+    fn scan_range(
+        &self,
+        scan: kbf_state::ScanRange<'_>,
+    ) -> Result<kbf_state::ScanPage, kbf_state::StoreError> {
+        self.inner.scan_range(scan)
+    }
+
+    fn changes(
+        &self,
+        after: kbf_state::Revision,
+        limit: usize,
+    ) -> Result<kbf_state::Changes, kbf_state::StoreError> {
+        self.inner.changes(after, limit)
+    }
+
+    fn reap_expired(&self) -> Result<usize, kbf_state::StoreError> {
+        self.inner.reap_expired()
+    }
+
+    fn commit_stats(&self) -> kbf_state::CommitStats {
+        self.inner.commit_stats()
+    }
+
+    fn now(&self) -> kbf_state::StoreTime {
+        self.inner.now()
+    }
+}
+
+/// Asserts no call the learning code makes to the state store (the write of a kill's
+/// summaries after its report, the write behind at the tick, the hourly sweep's scan and
+/// commits, and the read at the core's start) is made while the core's lock is held, so that
+/// a slow store cannot hold up heartbeats and reports. Catches: a write or sweep moved back
+/// into a hook or `Core::with`, which fails the probe; the test also requires that each of
+/// the four was made, so that it cannot pass by checking nothing.
+#[tokio::test(start_paused = true)]
+async fn no_store_call_for_size_summaries_is_made_under_the_cores_lock() {
+    let flaky = Flaky::new();
+    let probed = Arc::new(Probed {
+        inner: Arc::clone(&flaky),
+        armed: AtomicBool::new(false),
+        asking: AtomicBool::new(false),
+        answered: AtomicBool::new(false),
+        checked: AtomicUsize::new(0),
+    });
+    let shared: Arc<dyn Store> = probed.clone();
+    // Leaked, so that the probe thread may hold the core for as long as the test runs.
+    let rig: &'static Rig = Box::leak(Box::new(learning_rig_over(
+        shared,
+        &flaky,
+        LearnedSizes::Shadow,
+        true,
+    )));
+    let quit = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let (probed, quit) = (Arc::clone(&probed), Arc::clone(&quit));
+        std::thread::spawn(move || {
+            while !quit.load(Ordering::SeqCst) {
+                if probed.asking.load(Ordering::SeqCst) && !probed.answered.load(Ordering::SeqCst) {
+                    rig.core.with(|_, _| ());
+                    probed.answered.store(true, Ordering::SeqCst);
+                }
+                std::thread::yield_now();
+            }
+        })
+    };
+    probed.armed.store(true, Ordering::SeqCst);
+
+    // A kill's summaries are written after its report; the rest at the tick, and the sweep
+    // an hour after the first look.
+    let mut node = register(rig, "node-probe", 0);
+    let _ticket = submit(rig, 1, "compile probe", 0);
+    let lease = started(&node.sent()).expect("started");
+    let kill = worker::Result {
+        status: Some(kbf_proto::google::rpc::Status {
+            code: tonic::Code::ResourceExhausted as i32,
+            message: "test".to_owned(),
+            details: Vec::new(),
+        }),
+        memory_kill: worker::MemoryKill::OwnLimit as i32,
+        ..result_with(lease, ActionResult::default())
+    };
+    assert!(report(rig, "node-probe", kill).await.accepted);
+    let after_kill = probed.checked.load(Ordering::SeqCst);
+    assert!(after_kill > 0, "the kill's summaries were written");
+    for tag in 2..=4_u8 {
+        run(
+            rig,
+            &mut node,
+            "node-probe",
+            tag,
+            "compile probe",
+            100 * MIB,
+        )
+        .await;
+    }
+    flush_at(rig, 10_000).await;
+    let after_tick = probed.checked.load(Ordering::SeqCst);
+    assert!(after_tick > after_kill, "the write behind was made");
+    flush_at(rig, 3_700_000).await;
+    assert!(
+        probed.checked.load(Ordering::SeqCst) > after_tick,
+        "the sweep was made"
+    );
+
+    quit.store(true, Ordering::SeqCst);
+    watcher.join().expect("the probe thread");
+}
+
+/// Asserts a writer takes each summary as it is when it writes, not as it was when it was
+/// asked to: a tick's write behind that waits for the gate while a run changes the summary
+/// writes the newer one. Catches: rows taken before the gate, which would let an older
+/// summary land after a newer one.
+#[tokio::test(start_paused = true)]
+async fn a_writer_that_waited_for_the_gate_writes_the_newest_summary() {
+    let rig = learning_rig(&Flaky::new(), LearnedSizes::Shadow);
+    let mut node = register(&rig, "node-race", 0);
+    for tag in 1..=3_u8 {
+        run(&rig, &mut node, "node-race", tag, "compile race", 100 * MIB).await;
+    }
+    rig.core.tick(at(10_000)).await;
+
+    let gate = GATE.with(Rc::clone);
+    let held = gate.0.lock().await;
+    // The writer of the tick is waiting for the gate; a run changes the summary meanwhile.
+    let waiting = write_learned(&rig.core, &gate, true);
+    tokio::pin!(waiting);
+    assert!(futures_poll_once(waiting.as_mut()).is_none(), "it waits");
+    for tag in 4..=5_u8 {
+        let _ticket = submit(&rig, tag, "compile race", 0);
+        let lease = started(&node.sent()).expect("started");
+        assert!(
+            report_only(&rig, "node-race", measured(lease, 300 * MIB))
+                .await
+                .accepted
+        );
+    }
+    drop(held);
+    waiting.await;
+
+    let stored = rig.store.plain().scan_prefix(ESTIMATE).expect("a scan");
+    assert!(!stored.is_empty());
+    for (name, row) in stored {
+        let (key, written) =
+            crate::farm::durable::estimate::decode(&name, &row.value).expect("a summary");
+        let now = rig
+            .core
+            .with(|_, adapter| adapter.summary_now(&key))
+            .expect("the summary is held");
+        assert_eq!(written, now, "{name} holds an older summary");
+    }
+}
+
+/// Polls `future` once: its output if it is ready, `None` if it is waiting.
+fn futures_poll_once<F: std::future::Future>(future: std::pin::Pin<&mut F>) -> Option<F::Output> {
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    match future.poll(&mut cx) {
+        std::task::Poll::Ready(out) => Some(out),
+        std::task::Poll::Pending => None,
+    }
 }
