@@ -100,6 +100,10 @@ impl LeaseCore {
     /// [`NODE_LOAD_DEADLINE`], leaves the load unset and takes nothing from the collector;
     /// each kind of failure is logged the first time it happens.
     pub(crate) async fn node_load(&mut self, seq: u64) -> Option<worker::NodeLoad> {
+        // Dropping the read at the deadline does not stop a read running on the blocking pool,
+        // and cannot pile such reads up: the container runtime's gate stays held by that
+        // blocking call until it returns, so the next beat waits (on a lock, not on a thread)
+        // instead of starting a second read.
         let read = timeout(NODE_LOAD_DEADLINE, self.leases.runtimes.node_load()).await;
         match read {
             Ok(Ok(Some(reading))) => {

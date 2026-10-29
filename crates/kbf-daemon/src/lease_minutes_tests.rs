@@ -202,17 +202,83 @@ fn a_new_stream_sends_the_unacked_batch_again_once() {
     assert!(after[0].minutes.is_empty());
 }
 
-/// Asserts that a requeued minute goes out before a newer minute of its lease: minute 0 is
-/// in flight when minute 1 closes, then the stream ends and both wait, and the batch lists
-/// them ascending even though the binner stamps the requeued one as the newer close.
+/// Asserts that a kept minute goes out before a newer minute of its lease: minute 0 is in
+/// flight when minute 1 closes, then the stream ends and both wait; the first heartbeat of
+/// the next stream carries minute 0 alone, and minute 1 follows the acknowledgement.
 #[test]
-fn a_requeued_minute_does_not_come_after_a_newer_one_of_its_lease() {
+fn a_kept_minute_does_not_come_after_a_newer_one_of_its_lease() {
     let mut lm = ten_seconds();
     beats(&mut lm, 1, (0..=140).step_by(10));
     lm.new_stream(Duration::from_secs(10));
-    let out = beats(&mut lm, 1, [150]);
-    let minutes: Vec<_> = minutes_of(&out[0]).iter().map(|m| (m.1, m.2)).collect();
-    assert_eq!(minutes, [(1, 0), (1, 1)]);
+    let first = beats(&mut lm, 1, [150]);
+    let minutes: Vec<_> = minutes_of(&first[0]).iter().map(|m| (m.1, m.2)).collect();
+    assert_eq!(minutes, [(1, 0)]);
+    lm.acked(1);
+    let second = beats(&mut lm, 2, [160]);
+    let minutes: Vec<_> = minutes_of(&second[0]).iter().map(|m| (m.1, m.2)).collect();
+    assert_eq!(minutes, [(1, 1)]);
+}
+
+/// Asserts that a stream that ends on a full unacknowledged batch, with every lease's next
+/// minute already closed and waiting, loses no minute and sends none out of order: 70 leases
+/// close minute 0 (64 go out, 6 wait), minute 1 closes for all 70 under the batch in flight,
+/// the stream ends, and over the next stream's heartbeats each lease's minutes reach the wire
+/// as 0 then 1, once each, 140 in all.
+#[test]
+fn a_full_batch_unacked_at_stream_end_leaves_every_lease_in_order() {
+    let mut lm = ten_seconds();
+    let all = |at_s: u64| reading(at_s, (0..70u64).map(|i| lease(1, i, 0, at_s)).collect());
+    let mut wire: Vec<(u64, u64)> = Vec::new();
+
+    for (n, at_s) in (0..=50u64).step_by(10).enumerate() {
+        assert!(lm.beat(n as u64 + 1, &all(at_s)).minutes.is_empty());
+    }
+    let first = lm.beat(7, &all(60));
+    assert_eq!(first.minutes.len(), MAX_LOAD_MINUTES);
+    wire.extend(minutes_of(&first).iter().map(|m| (m.1, u64::from(m.2))));
+    // Minute 1 closes at 120; the heartbeats at 130 and 140 still run under the batch in
+    // flight, so the close time of the batch is long past when the stream ends.
+    for (n, at_s) in (70..=140u64).step_by(10).enumerate() {
+        assert!(lm.beat(n as u64 + 8, &all(at_s)).minutes.is_empty());
+    }
+    assert_eq!(lm.in_flight(), Some(7));
+
+    lm.new_stream(Duration::from_secs(10));
+    for (n, at_s) in (150..=170u64).step_by(10).enumerate() {
+        let seq = n as u64 + 1;
+        let out = lm.beat(seq, &all(at_s));
+        assert!(out.minutes.len() <= MAX_LOAD_MINUTES);
+        wire.extend(minutes_of(&out).iter().map(|m| (m.1, u64::from(m.2))));
+        lm.acked(seq);
+    }
+
+    assert_eq!(wire.len(), 140, "every minute once: {wire:?}");
+    for lease in 0..70u64 {
+        let of_lease: Vec<_> = wire
+            .iter()
+            .filter(|&&(l, _)| l == lease)
+            .map(|&(_, minute)| minute)
+            .collect();
+        assert_eq!(of_lease, [0, 1], "lease {lease}");
+    }
+}
+
+/// Asserts the age limit of a kept batch: one the next stream's first heartbeat finds ten
+/// minutes old (to the second) is still sent, and one a second older is dropped and counted
+/// as aged out.
+#[test]
+fn a_kept_batch_ages_out_like_a_pending_minute() {
+    let limit_s = MAX_UNSENT_AGE_USEC / S;
+    for (late_s, kept) in [(60 + limit_s, true), (60 + limit_s + 1, false)] {
+        let mut lm = ten_seconds();
+        beats(&mut lm, 1, (0..=60).step_by(10));
+        assert_eq!(lm.in_flight(), Some(7));
+        lm.new_stream(Duration::from_secs(10));
+        let out = beats(&mut lm, 1, [late_s]);
+        assert_eq!(out[0].minutes.len(), usize::from(kept), "at {late_s} s");
+        assert_eq!(lm.counters().aged_out, u64::from(!kept), "at {late_s} s");
+        assert_eq!(lm.in_flight().is_some(), kept);
+    }
 }
 
 /// Asserts that a lease that ends after a span long enough for a minute hands over its
@@ -255,7 +321,7 @@ fn an_unreadable_lease_has_a_clock_and_no_minutes() {
 
 /// Asserts that the window of a new stream takes effect and keeps what waits: a step of
 /// twenty seconds is a gap under a five second window and not under a twenty second one, and
-/// the minute requeued across the change still goes out.
+/// the minute kept across the change still goes out.
 #[test]
 fn a_longer_welcome_interval_takes_effect_and_keeps_pending_minutes() {
     let mut control = LeaseMinutes::new();
@@ -298,7 +364,7 @@ fn the_binner_key_round_trips() {
 }
 
 /// Asserts that a minute the binner holds under a name `key` never made is left out of the
-/// batch (the batch is still in flight, so the binner's copy is dropped on its ack).
+/// batch (the batch is still in flight, so the minute is dropped on its ack).
 #[test]
 fn a_minute_with_a_foreign_name_is_not_sent() {
     let mut lm = ten_seconds();
