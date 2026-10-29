@@ -18,7 +18,7 @@
 //!   pkg-macos-asset` lists ([`attested_assets::packaged_macos_pkgs`]) are held to the same
 //!   two rules, as `dist/kbf-<commit>-<platform>.deb` and `dist/kbf-installer-<commit>-<platform>.pkg`
 //!   and their `.deb.sigstore.json` (`.pkg.sigstore.json`).
-//!   So are the frontend and coordinator images that `cargo xtask pkg-image-asset` lists
+//!   So are the frontend, coordinator and task images that `cargo xtask pkg-image-asset` lists
 //!   ([`attested_assets::packaged_images`]), as `dist/kbf-<service>-image-<commit>-<platform>.oci.tar`
 //!   and its `.oci.tar.sigstore.json`.
 //! - **Its bundle's name.** The step after it sets `BUNDLE` to that step's
@@ -113,6 +113,7 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
         let name = match service.as_str() {
             "frontend" => "kbf-frontend-image",
             "coordinator" => "kbf-coordinator-image",
+            "task" => "kbf-task-image",
             other => {
                 return Err(format!(
                     "`pkg-image-asset --service {other}`: not an image of the release set"
