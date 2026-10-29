@@ -397,7 +397,10 @@ async fn leave_mid_flight(core: SchedulerCore, disk: &Disk) -> Left {
     farm.write_behind_now();
 
     for prefix in ["cordon/", "floor/", "done/", "est/"] {
-        assert!(!disk.rows(prefix).is_empty(), "the farm wrote no {prefix} row");
+        assert!(
+            !disk.rows(prefix).is_empty(),
+            "the farm wrote no {prefix} row"
+        );
     }
     Left {
         names: [answered, leased, killed, queued].map(|ticket| ticket.name),
@@ -425,11 +428,23 @@ async fn leave_mid_flight(core: SchedulerCore, disk: &Disk) -> Left {
 /// once and the lease of the queued one is new; and the floor still raises a fresh submission.
 async fn take_over(core: SchedulerCore, disk: &Disk, left: &Left) {
     let farm = farm_on(core, disk);
-    assert_eq!(farm.lease_epoch(), left.epoch, "the successor serves the epoch");
-    assert_eq!(disk.rows("done/"), left.done, "an answered operation was dropped");
+    assert_eq!(
+        farm.lease_epoch(),
+        left.epoch,
+        "the successor serves the epoch"
+    );
+    assert_eq!(
+        disk.rows("done/"),
+        left.done,
+        "an answered operation was dropped"
+    );
     assert_eq!(disk.rows("cordon/"), left.cordon, "a cordon was dropped");
     assert_eq!(disk.rows("floor/"), left.floor, "a floor was dropped");
-    assert_eq!(disk.rows("est/"), left.estimates, "a size summary was changed");
+    assert_eq!(
+        disk.rows("est/"),
+        left.estimates,
+        "a size summary was changed"
+    );
 
     let tickets: Vec<Ticket> = left
         .names
@@ -445,9 +460,19 @@ async fn take_over(core: SchedulerCore, disk: &Disk, left: &Left) {
     let mut a = Node::join(&farm, "node-a", 2);
     let mut b = Node::join(&farm, "node-b", 2);
     let running = [left.leased, left.rerun.0];
-    assert!(a.beat(&farm, &running).await, "the heartbeat is acknowledged");
-    assert!(a.starts().is_empty(), "a lease the daemon runs was started again");
-    assert_eq!(leases_of(&farm), left.held, "the leases are not the ones left");
+    assert!(
+        a.beat(&farm, &running).await,
+        "the heartbeat is acknowledged"
+    );
+    assert!(
+        a.starts().is_empty(),
+        "a lease the daemon runs was started again"
+    );
+    assert_eq!(
+        leases_of(&farm),
+        left.held,
+        "the leases are not the ones left"
+    );
     assert_eq!(
         node_of(&farm, "node-a"),
         left.node_a,
@@ -479,7 +504,10 @@ async fn take_over(core: SchedulerCore, disk: &Disk, left: &Left) {
 
     // Each is answered once: the same result again is refused.
     for lease in running.into_iter().chain([queued_lease]) {
-        assert!(!accepted(&farm, &a.name, ran(lease)).await, "{lease:?} twice");
+        assert!(
+            !accepted(&farm, &a.name, ran(lease)).await,
+            "{lease:?} twice"
+        );
     }
     for name in &left.names {
         let ticket = farm.wait(name).expect("still known");
@@ -493,11 +521,16 @@ async fn take_over(core: SchedulerCore, disk: &Disk, left: &Left) {
     assert_eq!(done_now.len(), left.done.len() + 3);
     let summaries_now = disk.rows("est/");
     assert!(
-        left.estimates.keys().all(|key| summaries_now.contains_key(key)),
+        left.estimates
+            .keys()
+            .all(|key| summaries_now.contains_key(key)),
         "a size summary was dropped"
     );
     for prefix in ["op/", "queue/", "lease/"] {
-        assert!(disk.rows(prefix).is_empty(), "{prefix} rows of finished work");
+        assert!(
+            disk.rows(prefix).is_empty(),
+            "{prefix} rows of finished work"
+        );
     }
 
     // The floor the kill raised is offered to a fresh submission of the same action.
@@ -548,7 +581,9 @@ async fn a_js_farm_takes_over_the_store_a_legacy_farm_left_mid_flight(backing: B
     let disk = Disk::over(backing);
     let left = leave_mid_flight(SchedulerCore::Legacy, &disk).await;
     assert!(
-        left.costs.values().all(|cost| *cost == LeaseCost::default()),
+        left.costs
+            .values()
+            .all(|cost| *cost == LeaseCost::default()),
         "the legacy farm writes a lease row with a cost: {:?}",
         left.costs
     );
@@ -603,8 +638,14 @@ async fn a_row_written_before_the_cost_field_recovers_at_its_request(backing: Ba
     assert!(node.beat(&farm, &[lease]).await);
     let after = node_of(&farm, "node-a");
     assert_eq!(after, before, "the lease books what the request asked");
-    assert_eq!((after.0, after.1.cpu_millis, after.1.memory_bytes), (1, 1_000, booked));
-    assert!(node.starts().is_empty(), "the node has no room for the queued one");
+    assert_eq!(
+        (after.0, after.1.cpu_millis, after.1.memory_bytes),
+        (1, 1_000, booked)
+    );
+    assert!(
+        node.starts().is_empty(),
+        "the node has no room for the queued one"
+    );
     assert_eq!(farm.queued_operations(), 1);
 
     assert!(accepted(&farm, &node.name, ran(lease)).await);
