@@ -32,9 +32,10 @@
 //! scheduler on the same heartbeat, in every `--placement-load` mode: the scheduler keeps the
 //! readings whether or not it places by them, so the feed is warm before a flip to `on`.
 
+use std::collections::BTreeMap;
+
 use kbf_proto::Vetted;
 use kbf_proto::worker::NodeLoad;
-use kbf_sched::DaemonInstance;
 use kbf_types::sched::usage;
 use kbf_types::{LeaseId, Resources, WorkerId};
 
@@ -52,9 +53,14 @@ const MAX_MEMORY_MULTIPLE: u64 = 4;
 /// How many windows without a reading make the load stale.
 const STALE_AFTER_WINDOWS: u128 = 3;
 
+/// What each node's readings have come to: the legacy driver keeps it in its side state, the
+/// js core in its adapter. Both take a reading through [`accept`] and show a node's through
+/// [`shown`], so the accept rule is one.
+pub(crate) type NodeLoads = BTreeMap<WorkerId, Kept>;
+
 /// Which daemon session a reading belongs to.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Session {
+pub(crate) enum Session {
     /// The daemon process that named itself.
     Process(String),
     /// A daemon that named no process: the stream it sent on.
@@ -62,11 +68,13 @@ enum Session {
 }
 
 impl Session {
-    fn of(instance: &DaemonInstance, stream: StreamId) -> Self {
-        if instance.as_str().is_empty() {
+    /// The session of a stream opened by the daemon process `instance` (empty when it named
+    /// none).
+    pub(crate) fn of(instance: &str, stream: StreamId) -> Self {
+        if instance.is_empty() {
             Self::Stream(stream)
         } else {
-            Self::Process(instance.as_str().to_owned())
+            Self::Process(instance.to_owned())
         }
     }
 }
@@ -98,7 +106,7 @@ struct Accepted {
 
 /// What the server keeps of one node's readings.
 #[derive(Clone, Debug)]
-pub(super) struct Kept {
+pub(crate) struct Kept {
     session: Session,
     last: Accepted,
     /// The newest window first.
@@ -243,7 +251,7 @@ impl Kept {
     }
 
     /// The load as the node view shows it. `capacity` is what the node reported.
-    pub(super) fn view(&self, capacity: &Resources, now: FarmTime) -> LoadView {
+    pub(crate) fn view(&self, capacity: &Resources, now: FarmTime) -> LoadView {
         let stale = self.stale(now);
         let last = &self.last;
         // The working set less the active file cache beyond a quarter of the node's memory:
@@ -270,6 +278,35 @@ impl Kept {
     }
 }
 
+/// Takes `load`, a reading of `worker`'s `session` at `now` on a node of `capacity`, into
+/// `loads` if the accept rule ([module](self)) does. Returns the accepted reading with its
+/// vetted lists as the scheduler takes it; `None` when it was refused. Both drivers of the
+/// farm take readings through this.
+pub(crate) fn accept(
+    loads: &mut NodeLoads,
+    worker: &WorkerId,
+    session: &Session,
+    load: &NodeLoad,
+    capacity: &Resources,
+    now: FarmTime,
+) -> Option<usage::NodeLoad> {
+    let taken = Kept::take(loads.remove(worker), session, load, capacity, now);
+    if let Some(next) = taken.kept {
+        loads.insert(worker.clone(), next);
+    }
+    taken.vetted.map(|vetted| sched_load(load, &vetted))
+}
+
+/// The load of `worker` as the node view shows it at `now`, if a reading was accepted.
+pub(crate) fn shown(
+    loads: &NodeLoads,
+    worker: &WorkerId,
+    capacity: &Resources,
+    now: FarmTime,
+) -> Option<LoadView> {
+    loads.get(worker).map(|kept| kept.view(capacity, now))
+}
+
 impl Farm {
     /// The node load on a heartbeat of `worker` on `stream`, taken if the accept rule
     /// ([module](self)) does. A heartbeat with none changes nothing: the last accepted
@@ -277,19 +314,14 @@ impl Farm {
     ///
     /// Returns the accepted reading with its vetted lists, as the scheduler takes it, for
     /// [`Farm::heartbeat_with_load`]; `None` when there was no reading, it was refused, or
-    /// the stream was replaced. Always `None` on the js core, which does not take the
-    /// reading yet.
+    /// the stream was replaced.
     pub fn note_node_load(
         &self,
         worker: &WorkerId,
         stream: StreamId,
         load: Option<&NodeLoad>,
     ) -> Option<usage::NodeLoad> {
-        // The js core keeps no node load yet: its readings are neither stored nor shown.
-        #[cfg(feature = "farm-core-js")]
-        if matches!(self.driver, super::driver::Driver::Js(_)) {
-            return None;
-        }
+        js_arm!(self, load::note_node_load(worker, stream, load));
         let load = load?;
         let mut state = self.lock();
         let link = state
@@ -297,15 +329,23 @@ impl Farm {
             .links
             .get(worker)
             .filter(|l| l.stream == stream)?;
-        let session = Session::of(&link.instance, stream);
+        let session = Session::of(link.instance.as_str(), stream);
         let capacity = state.engine.sched.capacity(worker).unwrap_or_default();
-        let kept = state.side.node_loads.remove(worker);
-        let now = self.now();
-        let taken = Kept::take(kept, &session, load, &capacity, now);
-        if let Some(next) = taken.kept {
-            state.side.node_loads.insert(worker.clone(), next);
-        }
-        taken.vetted.map(|vetted| sched_load(load, &vetted))
+        accept(
+            &mut state.side.node_loads,
+            worker,
+            &session,
+            load,
+            &capacity,
+            self.now(),
+        )
+    }
+
+    /// What is kept of `worker`'s readings, on either core.
+    #[cfg(test)]
+    fn kept_load(&self, worker: &WorkerId) -> Option<Kept> {
+        js_arm!(self, load::kept_load(worker));
+        self.lock().side.node_loads.get(worker).cloned()
     }
 }
 

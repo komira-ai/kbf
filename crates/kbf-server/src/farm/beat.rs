@@ -41,7 +41,7 @@ impl Farm {
         running: Vec<LeaseId>,
         load: Option<NodeLoad>,
     ) -> bool {
-        js_arm_async!(self, hot::heartbeat(worker, stream, seq, running));
+        js_arm_async!(self, hot::heartbeat(worker, stream, seq, running, load));
         let now = self.now();
         let taken = self
             .lock()

@@ -11,7 +11,7 @@ use kbf_caps::NodeCaps;
 use kbf_types::WorkerId;
 
 use super::adapter::KbfAdapter;
-use crate::farm::{Reported, identity};
+use crate::farm::{NodeLoads, Reported, identity};
 
 /// A worker's newest stream, as its `Hello` described it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +22,10 @@ pub(crate) struct WorkerFacts {
     pub(crate) arch: &'static str,
     /// The version `Welcome` named for its first `Hello`; `None` if the `Hello` named none.
     pub(crate) protocol: Option<u32>,
+    /// The daemon process that opened the stream, as its `Hello` named itself; empty if it
+    /// named none ([`KbfAdapter::note_instance`]). A node's load readings are of one session
+    /// per process.
+    pub(crate) instance: String,
 }
 
 impl KbfAdapter {
@@ -31,8 +35,21 @@ impl KbfAdapter {
     pub(crate) fn note_registered(&mut self, worker: &WorkerId, reported: &Reported) {
         let (os, arch) = identity(&reported.caps);
         let protocol = reported.protocol;
-        self.facts
-            .insert(worker.clone(), WorkerFacts { os, arch, protocol });
+        let facts = WorkerFacts {
+            os,
+            arch,
+            protocol,
+            instance: String::new(),
+        };
+        self.facts.insert(worker.clone(), facts);
+    }
+
+    /// Keeps the daemon process `instance` that opened `worker`'s newest stream; called with
+    /// [`KbfAdapter::note_registered`]. A worker that has not registered gains nothing.
+    pub(crate) fn note_instance(&mut self, worker: &WorkerId, instance: &str) {
+        if let Some(facts) = self.facts.get_mut(worker) {
+            facts.instance = instance.to_owned();
+        }
     }
 
     /// Takes the `os` and `arch` a resent `Hello` reports. The protocol is kept: the
@@ -51,6 +68,16 @@ impl KbfAdapter {
     /// worker's `os`, `arch` and protocol.
     pub(crate) fn forget_worker(&mut self, worker: &WorkerId) {
         self.facts.remove(worker);
+    }
+
+    /// What each node's load readings have come to.
+    pub(crate) fn node_loads(&self) -> &NodeLoads {
+        &self.node_loads
+    }
+
+    /// [`KbfAdapter::node_loads`], to take a reading into.
+    pub(crate) fn node_loads_mut(&mut self) -> &mut NodeLoads {
+        &mut self.node_loads
     }
 
     /// What `worker`'s newest stream said of itself, if it has registered.

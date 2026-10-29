@@ -1,16 +1,46 @@
-//! The load a node reports in its heartbeat, as the js core takes it.
+//! The node load a daemon's heartbeat reports, as the js core takes it: the same accept rule
+//! and vet as the farm's own driver ([`crate::farm::node_load`]), over the readings the
+//! adapter keeps for each node.
 
+use kbf_proto::worker::NodeLoad;
 use kbf_types::WorkerId;
-use kbf_types::sched::usage::NodeLoad;
+use kbf_types::sched::usage;
 
 use super::JsFarm;
+use crate::farm::StreamId;
+use crate::farm::node_load::{Session, accept};
 
-/// The load `worker`'s heartbeat reported, as `js_sched` takes it in `Event::Heartbeat`
-/// (`js_server_core::Beat::with_load`): placement by `--placement-load` weighs a node by
-/// it. None for now: the conversion from the heartbeat's reported load, and the vetting of
-/// what it says, follow in their own change, which also keeps the load the node view shows
-/// (the farm's `note_node_load` returns early on this core).
-pub(crate) fn node_load(js: &JsFarm, worker: &WorkerId) -> Option<NodeLoad> {
-    let _ = (js, worker);
-    None
+/// [`Farm::note_node_load`](crate::farm::Farm::note_node_load): the reading, taken if the
+/// accept rule takes it, as the load `Beat::with_load` takes
+/// ([`hot::heartbeat`](super::hot::heartbeat)). `None` when there was no reading, it was
+/// refused, or `stream` was replaced.
+pub(crate) fn note_node_load(
+    js: &JsFarm,
+    worker: &WorkerId,
+    stream: StreamId,
+    load: Option<&NodeLoad>,
+) -> Option<usage::NodeLoad> {
+    let load = load?;
+    let now = js.now();
+    js.core.with(|view, adapter| {
+        adapter.current_stream(worker, stream.0)?;
+        let instance = adapter.worker_facts(worker)?.instance.clone();
+        let session = Session::of(&instance, stream);
+        let capacity = view.sched().capacity(worker).unwrap_or_default();
+        accept(
+            adapter.node_loads_mut(),
+            worker,
+            &session,
+            load,
+            &capacity,
+            now,
+        )
+    })
+}
+
+/// What is kept of `worker`'s readings.
+#[cfg(test)]
+pub(crate) fn kept_load(js: &JsFarm, worker: &WorkerId) -> Option<crate::farm::node_load::Kept> {
+    js.core
+        .with(|_, adapter| adapter.node_loads().get(worker).cloned())
 }

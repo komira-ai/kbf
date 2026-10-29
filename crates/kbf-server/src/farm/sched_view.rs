@@ -68,6 +68,7 @@ impl Farm {
     /// `readings_accepted` and `readings_dropped` show whether the readings the farm hands it
     /// (see [`Farm::heartbeat_with_load`]) are taken, in every `--placement-load` mode.
     pub fn load_counters(&self) -> LoadCounters {
+        js_arm!(self, views::load_counters());
         self.lock().engine.sched.load_counters()
     }
 

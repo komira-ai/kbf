@@ -177,18 +177,12 @@ fn a_new_session_resets_the_baseline() {
     assert_eq!(restarted.windows, [None, None]);
 
     // A daemon that names no process is a new session on each stream.
-    let a = Session::of(&DaemonInstance::new(""), StreamId(1));
-    let b = Session::of(&DaemonInstance::new(""), StreamId(2));
+    let a = Session::of("", StreamId(1));
+    let b = Session::of("", StreamId(2));
     assert_ne!(a, b);
-    assert_eq!(a, Session::of(&DaemonInstance::new(""), StreamId(1)));
-    assert_eq!(
-        Session::of(&DaemonInstance::new("p"), StreamId(1)),
-        process("p")
-    );
-    assert_eq!(
-        Session::of(&DaemonInstance::new("p"), StreamId(2)),
-        process("p")
-    );
+    assert_eq!(a, Session::of("", StreamId(1)));
+    assert_eq!(Session::of("p", StreamId(1)), process("p"));
+    assert_eq!(Session::of("p", StreamId(2)), process("p"));
 }
 
 /// Catches each validation failing to drop its reading, a dropped reading moving the baseline,
@@ -340,8 +334,10 @@ fn the_admission_working_set_drops_active_file_beyond_a_quarter_of_memory() {
 
 // The farm's wiring.
 
+/// A farm on the core under test: the farm's own, and the js core in a build with
+/// `farm-core-js`.
 fn farm() -> Farm {
-    Farm::new_legacy(
+    Farm::new(
         Arc::new(kbf_front::Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -383,10 +379,6 @@ fn detail(farm: &Farm, name: &str) -> crate::fleet::NodeDetail {
 /// or of a node that never registered is ignored, the same daemon process on a new stream
 /// keeps its baseline, a restarted one resets it, and the view goes stale on the farm's clock.
 #[tokio::test(start_paused = true)]
-#[cfg_attr(
-    feature = "farm-core-js",
-    ignore = "known-different-on-js: the js core keeps no node load"
-)]
 async fn readings_reach_the_node_view() {
     let farm = farm();
     let a = WorkerId::new("a");
@@ -404,10 +396,10 @@ async fn readings_reach_the_node_view() {
     let second = register(&farm, "a", "proc-1");
     farm.note_node_load(&a, first, Some(&reading(9, 9 * SECOND, 9 * SECOND)));
     farm.note_node_load(&a, second, Some(&reading(2, 3 * SECOND, 3 * SECOND)));
-    assert_eq!(farm.lock().side.node_loads[&a].last.seq, 2);
+    assert_eq!(farm.kept_load(&a).expect("kept").last.seq, 2);
     farm.note_node_load(&a, second, Some(&reading(3, 2 * SECOND, 3 * SECOND)));
     assert_eq!(
-        farm.lock().side.node_loads[&a].last.seq,
+        farm.kept_load(&a).expect("kept").last.seq,
         2,
         "the clock did not move"
     );
@@ -432,13 +424,7 @@ async fn readings_reach_the_node_view() {
         StreamId(0),
         Some(&reading(1, 1, 1)),
     );
-    assert!(
-        !farm
-            .lock()
-            .side
-            .node_loads
-            .contains_key(&WorkerId::new("ghost"))
-    );
+    assert!(farm.kept_load(&WorkerId::new("ghost")).is_none());
 
     // Two readings a second apart, then no heartbeat for more than three seconds.
     farm.note_node_load(&a, third, Some(&reading(2, SECOND / 2 + SECOND, SECOND)));
@@ -572,10 +558,6 @@ fn accepted(farm: &Farm) -> u64 {
 /// is the heartbeat carrying it that the scheduler hears (the scheduler counts it as accepted
 /// then and not before), and that a heartbeat with no reading feeds it nothing.
 #[tokio::test(start_paused = true)]
-#[cfg_attr(
-    feature = "farm-core-js",
-    ignore = "known-different-on-js: the js core's heartbeat does not take the load yet"
-)]
 async fn an_accepted_reading_is_handed_to_the_scheduler_with_its_lists() {
     let farm = farm();
     let a = WorkerId::new("a");
@@ -609,10 +591,6 @@ async fn an_accepted_reading_is_handed_to_the_scheduler_with_its_lists() {
 /// counted as refused in the node view; and that the refused first reading of a restarted
 /// daemon feeds nothing either and leaves the node without a load.
 #[tokio::test(start_paused = true)]
-#[cfg_attr(
-    feature = "farm-core-js",
-    ignore = "known-different-on-js: the js core's heartbeat does not take the load yet"
-)]
 async fn a_refused_reading_feeds_nothing_and_counts_its_minutes() {
     let farm = farm();
     let a = WorkerId::new("a");
@@ -657,10 +635,6 @@ async fn a_refused_reading_feeds_nothing_and_counts_its_minutes() {
 /// count of accepted readings does not move; the same load on the stream that replaced it is
 /// fed.
 #[tokio::test(start_paused = true)]
-#[cfg_attr(
-    feature = "farm-core-js",
-    ignore = "known-different-on-js: the js core's heartbeat does not take the load yet"
-)]
 async fn a_heartbeat_of_a_replaced_stream_feeds_nothing() {
     let farm = farm();
     let a = WorkerId::new("a");
@@ -683,10 +657,6 @@ async fn a_heartbeat_of_a_replaced_stream_feeds_nothing() {
 /// Asserts that the scheduler is handed accepted readings under `--placement-load off` and
 /// under `on`: it keeps them either way, so the feed is warm before the flag is raised.
 #[tokio::test(start_paused = true)]
-#[cfg_attr(
-    feature = "farm-core-js",
-    ignore = "known-different-on-js: the js core's heartbeat does not take the load yet"
-)]
 async fn the_feed_reaches_the_scheduler_in_every_placement_mode() {
     for mode in [PlacementLoad::Off, PlacementLoad::On] {
         let farm = farm().with_placement_load(mode);
@@ -703,10 +673,6 @@ async fn the_feed_reaches_the_scheduler_in_every_placement_mode() {
 /// cannot be believed is not kept as a baseline. Catches the old session's reading kept
 /// after a restart, and a refused first reading stored anyway.
 #[tokio::test(start_paused = true)]
-#[cfg_attr(
-    feature = "farm-core-js",
-    ignore = "known-different-on-js: the js core keeps no node load"
-)]
 async fn a_restarted_daemons_unbelievable_first_reading_leaves_no_load() {
     let farm = farm();
     let a = WorkerId::new("a");
@@ -718,7 +684,7 @@ async fn a_restarted_daemons_unbelievable_first_reading_leaves_no_load() {
     let restarted = register(&farm, "a", "proc-2");
     farm.note_node_load(&a, restarted, Some(&reading(0, SECOND, 0)));
     assert_eq!(detail(&farm, "a").load, None);
-    assert!(!farm.lock().side.node_loads.contains_key(&a));
+    assert!(farm.kept_load(&a).is_none());
 
     // Its next believable reading is a first one again: no rate yet.
     farm.note_node_load(&a, restarted, Some(&reading(1, 2 * SECOND, SECOND)));
