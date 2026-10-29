@@ -1,4 +1,5 @@
-//! Tests of the js core's construction (`super`), run in a build with `farm-core-js`.
+//! Tests of the js core's construction (`super`). Their farms name the js core, so they run
+//! the same in a build with `farm-core-js` and in one without.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,8 +24,9 @@ mod placement;
 mod views;
 
 fn farm() -> Farm {
-    Farm::new(
-        Arc::new(Cache::memory()),
+    Farm::on_core(
+        crate::SchedulerCore::Js,
+        Arc::new(Cache::memory()).into(),
         UNSERVABLE_WAIT,
         FINISHED_RETENTION,
     )
@@ -37,8 +39,7 @@ fn js(farm: &Farm) -> &JsFarm {
     }
 }
 
-/// Catches `Farm::new` building the legacy driver in a build with the feature (every farm
-/// suite would then run on the core it is not meant to test), a farm that takes a state
+/// Catches `Farm::on_core` building the legacy driver for the js core, a farm that takes a state
 /// store over without building its core over it (no epoch), and a term or lease epoch that
 /// is not the epoch the core opened under: `Welcome` and every lease id would name an epoch
 /// the store does not hold. The farm's ambient term is fixed to a value no process term

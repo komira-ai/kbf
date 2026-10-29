@@ -125,7 +125,6 @@ impl KbfAdapter {
 
     /// Ends every worker stream with `status`, so each daemon dials again. Returns how many
     /// streams were still open.
-    #[cfg_attr(not(feature = "farm-core-js"), allow(dead_code))]
     pub(crate) fn end_streams(&self, status: &Status) -> usize {
         self.nodes
             .values()
