@@ -441,10 +441,7 @@ async fn a_frontend_exports_the_scheduler_core_it_runs() {
     } else {
         ("legacy", "js")
     };
-    assert!(
-        text.contains("# TYPE kbf_scheduler_core gauge\n"),
-        "{text}"
-    );
+    assert!(text.contains("# TYPE kbf_scheduler_core gauge\n"), "{text}");
     let on = format!("kbf_scheduler_core{{core=\"{running}\"}} 1\n");
     let off = format!("kbf_scheduler_core{{core=\"{other}\"}} 0\n");
     assert!(text.contains(&on), "{on}{text}");
