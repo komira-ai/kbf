@@ -1,0 +1,32 @@
+[package]
+name = "kbf-usage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# What kbf learns from the leases' measured use, for the job scheduler's admission
+# (see the crate documentation). No farm crate depends on it yet.
+[dependencies]
+hex.workspace = true
+# The host ids of a node series (`HostId`); `kbf-types` re-exports the scheduler's
+# `sched` module only.
+js-types.workspace = true
+# The recorder and the profile store; the code lives in the jobscheduler repository, at
+# the revision the workspace pins.
+js-usage.workspace = true
+kbf-estimator.workspace = true
+# The state store trait the profile rows are written through.
+kbf-state.workspace = true
+kbf-types.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# The in-memory store the tests run the sink over.
+kbf-state = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true
