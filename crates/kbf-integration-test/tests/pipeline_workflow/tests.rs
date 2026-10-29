@@ -61,6 +61,20 @@ fn plant(file: &str, from: &str, to: &str) -> Vec<String> {
     problems(&files).unwrap_or_else(|e| vec![e])
 }
 
+/// [`plant`] for a text that occurs more than once: the `nth` (from 0) occurrence is replaced.
+fn plant_nth(file: &str, from: &str, to: &str, nth: usize) -> Vec<String> {
+    let mut files = real();
+    let text = match file {
+        "artifacts.yml" => &mut files.artifacts,
+        "pipeline.yml" => &mut files.pipeline,
+        other => panic!("no file {other}"),
+    };
+    let at = text.match_indices(from).nth(nth).map(|(i, _)| i);
+    let at = at.unwrap_or_else(|| panic!("`{from}` has no occurrence {nth} in {file}"));
+    text.replace_range(at..at + from.len(), to);
+    problems(&files).unwrap_or_else(|e| vec![e])
+}
+
 fn red(found: &[String], want: &str) {
     assert!(
         found.iter().any(|p| p.contains(want)),
@@ -142,16 +156,19 @@ fn the_builds_start_with_ci_signing_needs_ci_and_the_build_and_smoke_needs_the_s
 }
 
 #[test]
-fn the_two_calls_of_artifacts_differ_by_their_stage_input() {
+fn the_two_calls_of_artifacts_differ_by_their_stage_and_the_sign_call_gets_the_build_digests() {
     // Catches: a call whose stage is swapped, missing or extended (the build call would sign, or
-    // the sign call would rebuild), so the order of the pipeline and the jobs that ran disagree.
+    // the sign call would rebuild), and a sign call that is not handed the digests of the sums the
+    // build call published, or is handed another job's output (its attest jobs compare the sums
+    // they download with those digests, and an empty or wrong one makes them sign unchecked sums
+    // or nothing).
     red(
         &plant(
             "pipeline.yml",
             "      stage: build\n",
             "      stage: sign\n",
         ),
-        "the job `artifacts` passes [(\"stage\", \"sign\")], not exactly `stage: build`",
+        "the job `artifacts` passes [(\"stage\", \"sign\")]",
     );
     red(
         &plant(
@@ -159,19 +176,92 @@ fn the_two_calls_of_artifacts_differ_by_their_stage_input() {
             "      stage: sign\n",
             "      stage: build\n",
         ),
-        "the job `artifacts-sign` passes [(\"stage\", \"build\")], not exactly `stage: sign`",
+        "the job `artifacts-sign` passes [(\"stage\", \"build\"),",
     );
     red(
         &plant("pipeline.yml", "    with:\n      stage: build\n", ""),
-        "the job `artifacts` passes [], not exactly `stage: build`",
+        "the job `artifacts` passes []",
     );
     red(
         &plant(
             "pipeline.yml",
-            "      stage: sign\n",
-            "      stage: sign\n      extra: x\n",
+            "      stage: build\n",
+            "      stage: build\n      extra: x\n",
+        ),
+        "the job `artifacts` passes",
+    );
+    for input in ["sums_linux_sha256", "sums_darwin_arm64_sha256"] {
+        let line = format!("      {input}: ${{{{ needs.artifacts.outputs.{input} }}}}\n");
+        red(
+            &plant("pipeline.yml", &line, ""),
+            "the job `artifacts-sign` passes",
+        );
+        red(
+            &plant("pipeline.yml", &line, &format!("      {input}: ''\n")),
+            "the job `artifacts-sign` passes",
+        );
+    }
+    red(
+        &plant(
+            "pipeline.yml",
+            "      sums_linux_sha256: ${{ needs.artifacts.outputs.sums_linux_sha256 }}\n",
+            "      sums_linux_sha256: ${{ needs.artifacts.outputs.sums_darwin_arm64_sha256 }}\n",
         ),
         "the job `artifacts-sign` passes",
+    );
+}
+
+#[test]
+fn the_sums_jobs_hand_their_digest_to_the_pipeline() {
+    // Catches: a link of the chain from the digest of the uploaded sums to the sign call broken,
+    // so the attest jobs would compare with nothing (or with another job's value): the sums job
+    // that does not write the digest, one that does not expose it, a workflow_call that does not
+    // re-export it or does not declare the input, and a digest step that can be skipped.
+    // The two group sums jobs are textually alike: `nth` picks the first (Linux) or second (macOS).
+    for (nth, job) in [(0, "sums-linux"), (1, "sums-darwin-arm64")] {
+        red(
+            &plant_nth(
+                "artifacts.yml",
+                "      sha256: ${{ steps.assemble.outputs.sha256 }}\n",
+                "      other: x\n",
+                nth,
+            ),
+            &format!("the job `{job}` of artifacts.yml has the outputs"),
+        );
+        red(
+            &plant_nth(
+                "artifacts.yml",
+                " --digest-output \"$GITHUB_OUTPUT\"",
+                "",
+                nth,
+            ),
+            &format!("the job `{job}` of artifacts.yml has no unconditional step `assemble`"),
+        );
+        red(
+            &plant_nth(
+                "artifacts.yml",
+                "        id: assemble\n",
+                "        id: assembled\n",
+                nth,
+            ),
+            &format!("the job `{job}` of artifacts.yml has no unconditional step `assemble`"),
+        );
+    }
+    red(
+        &plant(
+            "artifacts.yml",
+            "        value: ${{ jobs.sums-darwin-arm64.outputs.sha256 }}\n",
+            "        value: ${{ jobs.sums-linux.outputs.sha256 }}\n",
+        ),
+        "does not declare the output `sums_darwin_arm64_sha256`",
+    );
+    red(
+        &plant(
+            "artifacts.yml",
+            "      sums_linux_sha256:\n        description: \"sha256 of the Linux SHA256SUMS the build call uploaded; the sign call's attest job refuses other sums\"\n",
+            "      sums_linux_sha256_x:\n        description: \"sha256 of the Linux SHA256SUMS the build call uploaded; the sign call's attest job refuses other sums\"\n",
+        ),
+        "does not declare the input `sums_linux_sha256`",
     );
 }
 
@@ -677,21 +767,13 @@ fn a_called_workflow_never_asks_for_more_than_its_caller_grants() {
     );
     // Both calls are checked: GitHub compares the permissions of a called workflow's jobs with
     // the caller's grant whether or not the job runs in that call.
-    for stage in ["build", "sign"] {
-        let job = if stage == "build" {
-            "artifacts"
-        } else {
-            "artifacts-sign"
-        };
+    for (nth, job) in [(0, "artifacts"), (1, "artifacts-sign")] {
         red(
-            &plant(
+            &plant_nth(
                 "pipeline.yml",
-                &format!(
-                    "      stage: {stage}\n    permissions:\n      contents: read\n      id-token: write\n      attestations: write\n"
-                ),
-                &format!(
-                    "      stage: {stage}\n    permissions:\n      contents: read\n      id-token: write\n      attestations: read\n"
-                ),
+                "      attestations: write\n",
+                "      attestations: read\n",
+                nth,
             ),
             &format!(
                 "the job `attest-linux` of artifacts.yml asks for `attestations: write`, but the job `{job}` of pipeline.yml"

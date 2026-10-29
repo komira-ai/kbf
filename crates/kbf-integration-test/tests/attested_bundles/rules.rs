@@ -86,6 +86,25 @@ fn download(g: &str) -> String {
     )
 }
 
+/// The download of the group's sums and the two checks the attest job makes before it signs.
+fn sums_checks(g: &str) -> String {
+    format!(
+        "      - uses: actions/download-artifact@{DOWNLOAD_PIN}\n        with:\n          name: sha256sums-{g}\n          path: dist\n{}{SUMS_FILES_STEP}",
+        sums_digest_step(g)
+    )
+}
+
+/// The digest check of the group `g`.
+fn sums_digest_step(g: &str) -> String {
+    format!(
+        "      - name: Refuse sums other than the build's\n        env:\n          SUMS_SHA256: ${{{{ inputs.{} }}}}\n        run: sha256sum --check --strict <<< \"$SUMS_SHA256  dist/SHA256SUMS\"\n",
+        digest_input(g)
+    )
+}
+
+/// The file check.
+const SUMS_FILES_STEP: &str = "      - name: Refuse files other than the sums list\n        working-directory: dist\n        run: sha256sum --check --strict SHA256SUMS\n";
+
 /// artifacts.yml as the rules want it.
 fn good_artifacts() -> String {
     let mut w = String::from(
@@ -104,7 +123,8 @@ fn good_artifacts() -> String {
     w.push_str("      - name: Package macos\n        run: cargo xtask pkg-macos-asset --package p.pkg --commit \"$GITHUB_SHA\" --binary-tarball t.tar.gz --expect-ref \"$PKG_SOURCE_REF\" --gh gh --out dist\n      - name: Check macos\n        run: cargo xtask pkg-macos-asset --verify-only --package p.pkg --commit \"$GITHUB_SHA\" --binary-tarball t.tar.gz --expect-ref \"$GITHUB_REF\"\n");
     for g in ["linux", "darwin-arm64"] {
         w.push_str(&format!(
-            "  attest-{g}:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/attest-build-provenance@{ATTEST_PIN}\n        with:\n          subject-checksums: dist/SHA256SUMS\n"
+            "  attest-{g}:\n    runs-on: ubuntu-24.04\n    steps:\n{}      - uses: actions/attest-build-provenance@{ATTEST_PIN}\n        with:\n          subject-checksums: dist/SHA256SUMS\n",
+            sums_checks(g)
         ));
         for (name, platform) in PACKAGES.iter().filter(|(_, p)| group(p) == g) {
             w.push_str(&provenance(name, platform));
@@ -833,4 +853,106 @@ fn the_kbf_deb_lines_are_read_apart_from_the_checks() {
         said.contains("a pkg-kbf-asset line without --platform"),
         "{said}"
     );
+}
+
+#[test]
+fn the_attest_job_checks_the_downloaded_sums_and_files_before_it_signs() {
+    // Catches: an attest job that signs what the artifact store holds without checking it. The
+    // build call's files wait there for the length of the beta jobs, which run repository code;
+    // `subject-checksums` signs the digests the sums file lists without opening the files, so a
+    // consistent swap of files and sums would be signed. Each defect below leaves every other rule
+    // satisfied.
+    let mut cases = Cases::default();
+    let digest = sums_digest_step("linux");
+    let files = SUMS_FILES_STEP;
+    let first_attest = "      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2\n        with:\n          subject-checksums: dist/SHA256SUMS\n";
+    let wrong = "does not run `sha256sum --check --strict <<< \"$SUMS_SHA256  dist/SHA256SUMS\"`";
+    let wrong_files = "does not run `sha256sum --check --strict SHA256SUMS` in `dist`";
+    cases.artifacts("no digest check", &broken(&digest, ""), wrong, true);
+    cases.artifacts("no file check", &broken(files, ""), wrong_files, true);
+    cases.artifacts(
+        "the digest check after the first attestation",
+        &broken(&digest, &"").replacen(first_attest, &format!("{first_attest}{digest}"), 1),
+        "the digest check of `attest-linux` comes after an attestation step",
+        true,
+    );
+    cases.artifacts(
+        "the file check after the first attestation",
+        &broken(files, "").replacen(first_attest, &format!("{first_attest}{files}"), 1),
+        "the file check of `attest-linux` comes after an attestation step",
+        true,
+    );
+    let sums_download = "          name: sha256sums-linux\n          path: dist\n";
+    cases.artifacts(
+        "the checks before the last download",
+        &broken(
+            &format!("{sums_download}{digest}{files}"),
+            &format!("{sums_download}"),
+        )
+        .replacen(
+            "  attest-linux:\n    runs-on: ubuntu-24.04\n    steps:\n",
+            &format!("  attest-linux:\n    runs-on: ubuntu-24.04\n    steps:\n{digest}{files}"),
+            1,
+        ),
+        "comes before its last download",
+        false,
+    );
+    cases.artifacts(
+        "a skippable digest check",
+        &broken(
+            &digest,
+            &digest.replace("        env:", "        if: always()\n        env:"),
+        ),
+        "the digest check of `attest-linux` is to be an unconditional step",
+        true,
+    );
+    cases.artifacts(
+        "a skippable file check",
+        &broken(
+            files,
+            &files.replace(
+                "        working-directory",
+                "        continue-on-error: true\n        working-directory",
+            ),
+        ),
+        "the file check of `attest-linux` is to be an unconditional step",
+        true,
+    );
+    cases.artifacts(
+        "the digest of the other group",
+        &broken(&digest, &digest.replace("sums_linux_sha256", "sums_darwin_arm64_sha256")),
+        "the digest check of `attest-linux` is to be an unconditional step with exactly `env: SUMS_SHA256: ${{ inputs.sums_linux_sha256 }}`",
+        true,
+    );
+    cases.artifacts(
+        "a digest that is not the input",
+        &broken(
+            &digest,
+            &digest.replace("${{ inputs.sums_linux_sha256 }}", ""),
+        ),
+        "the digest check of `attest-linux` is to be an unconditional step",
+        true,
+    );
+    cases.artifacts(
+        "a file check outside dist",
+        &broken(files, &files.replace("        working-directory: dist\n", "")),
+        "the file check of `attest-linux` is to be an unconditional step with `working-directory: dist`",
+        true,
+    );
+    cases.artifacts(
+        "the darwin job without its digest check",
+        &broken(&sums_digest_step("darwin-arm64"), ""),
+        "`attest-darwin-arm64` does not run",
+        true,
+    );
+    cases.artifacts(
+        "a weaker command",
+        &broken(
+            "run: sha256sum --check --strict SHA256SUMS",
+            "run: sha256sum --check SHA256SUMS",
+        ),
+        wrong_files,
+        false,
+    );
+    cases.done();
 }

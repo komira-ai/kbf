@@ -103,6 +103,9 @@ jobs:
     uses: ./.github/workflows/artifacts.yml
     with:
       stage: sign
+      # The digests of the SHA256SUMS the build call published: the attest jobs refuse other sums.
+      sums_linux_sha256: ${{ needs.artifacts.outputs.sums_linux_sha256 }}
+      sums_darwin_arm64_sha256: ${{ needs.artifacts.outputs.sums_darwin_arm64_sha256 }}
     permissions:
       contents: read
       id-token: write

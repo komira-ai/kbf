@@ -562,7 +562,12 @@ A push to `main` runs one pipeline, `pipeline.yml`:
   nothing, so the four builds (12 to 15 minutes each, plus the wait for a macOS runner) start with `ci` instead of after
   it, and signs nothing (its call is granted the signing scopes only because GitHub checks a called workflow's job permissions against its caller's grant statically, skipped jobs included; every job that signs is skipped in this call, which the pipeline lint requires). `artifacts-sign` (`stage: sign`) needs `ci` and `artifacts` and runs only the `attest-*`
   and `verify-*` jobs, which read the files the build call uploaded to the same run; a commit that fails `ci` is built but
-  never signed. The attest jobs stay in `artifacts.yml` because an attestation's signer identity is the workflow file that
+  never signed. The build call's files wait in the run's artifact store while the `beta` jobs run repository code, so
+  the build call's `sums-*` jobs output the SHA-256 of the `SHA256SUMS` they upload (`sums assemble --digest-output`), the
+  pipeline passes those digests to `artifacts-sign`, and each `attest-*` job, before it signs anything, checks the sums it
+  downloaded against its digest and every file against the sums (`sha256sum --check --strict`, plain commands: the job holds
+  `id-token`). The files of the build call are covered from the sums job on; what a job could swap between a build job and
+  its sums job is not. The attest jobs stay in `artifacts.yml` because an attestation's signer identity is the workflow file that
   signed, and the installers verify exactly that file. A pull request or merge-queue run has no `stage` input, so its
   build and sums jobs run as before and the attest and verify jobs never do.
 - **Each check runs once.** `ci.yml`, `artifacts.yml`, `beta.yml` and `smoke.yml` have a `workflow_call` trigger and no `push`

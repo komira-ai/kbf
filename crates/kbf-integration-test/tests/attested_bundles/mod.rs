@@ -24,8 +24,18 @@
 //! - **Its bundle's name.** The step after it sets `BUNDLE` to that step's
 //!   `bundle-path` output and copies it to `dist/<tarball>.sigstore.json` (the action
 //!   leaves it in a temporary directory under a name that is the same for every
-//!   attestation). That `cp` is the only `run:` step the attest job may have: it holds
-//!   `id-token: write` and signs, and any other shell step is named.
+//!   attestation). That `cp` and the two checks of the next point are the only `run:` steps
+//!   the attest job may have: it holds `id-token: write` and signs, and any other shell step
+//!   is named.
+//! - **Signed only what the build published.** The build call's files wait in the run's
+//!   artifact store while jobs that run repository code go by, so before it signs, the attest
+//!   job of a group checks what it downloaded ([`sums_checked`]): first that the sums file
+//!   is the one the build call's sums job published (`sha256sum --check --strict <<<
+//!   "$SUMS_SHA256  dist/SHA256SUMS"`, with `SUMS_SHA256` the input the pipeline passes from
+//!   that job's output), then that every file is the one the sums list (`sha256sum --check
+//!   --strict SHA256SUMS` in `dist`). Both are unconditional, plain commands (no repository
+//!   code runs beside `id-token: write`), after the last download and before the first
+//!   attestation step.
 //! - **Out of the job.** The job uploads `dist/*.sigstore.json` as the artifact
 //!   `bundles-<group>`, in a step that cannot be skipped and fails on no file.
 //! - **Into the verification and the release.** The group's verify job downloads
@@ -148,6 +158,7 @@ pub fn gaps(artifacts: &str, release: &str, listed: &[&str]) -> Result<Vec<Strin
             .collect();
         let steps = workflows::job_steps(artifacts, &attest_job)?;
         attested_alone(&attest_job, &steps, &mine, &my_packages, &mut out);
+        sums_checked(&attest_job, g, &steps, &mut out);
         uploaded(&attest_job, g, &steps, &mut out);
         let verify_job = format!("verify-{g}");
         let verify = workflows::job_steps(artifacts, &verify_job)?;
@@ -267,6 +278,10 @@ fn attested_alone(
         let Some(run) = step.run.as_deref() else {
             continue;
         };
+        if run == SUMS_FILES_RUN || run == SUMS_DIGEST_RUN {
+            // Held to the exact step, its place and its inputs by [`sums_checked`].
+            continue;
+        }
         if !after_provenance.contains(&at) {
             let first: String = run
                 .trim_start()
@@ -278,6 +293,82 @@ fn attested_alone(
                 .collect();
             out.push(format!(
                 "`{job}` has a `run:` step (`{first}`) that is not the naming of a bundle right after a provenance step: the job holds `id-token: write` and signs, so nothing else runs in it"
+            ));
+        }
+    }
+}
+
+/// The check of the downloaded sums file against the digest the build call's sums job published.
+const SUMS_DIGEST_RUN: &str = "sha256sum --check --strict <<< \"$SUMS_SHA256  dist/SHA256SUMS\"";
+
+/// The check of every downloaded file against the sums file, run in `dist`.
+const SUMS_FILES_RUN: &str = "sha256sum --check --strict SHA256SUMS";
+
+/// The workflow input that carries group `g`'s digest: `sums_<group>_sha256`.
+pub fn digest_input(g: &str) -> String {
+    format!("sums_{}_sha256", g.replace('-', "_"))
+}
+
+/// The two checks the attest job `job` (group `g`) makes of what it downloaded before it signs
+/// anything: the sums file against the digest input, then the files against the sums file, each
+/// an unconditional step, both after the last download and before the first attestation step.
+fn sums_checked(job: &str, g: &str, steps: &[workflows::Step], out: &mut Vec<String>) {
+    let input_name = digest_input(g);
+    let want_env = format!("${{{{ inputs.{input_name} }}}}");
+    let digest = steps
+        .iter()
+        .position(|s| s.run.as_deref().map(str::trim) == Some(SUMS_DIGEST_RUN));
+    let files = steps
+        .iter()
+        .position(|s| s.run.as_deref().map(str::trim) == Some(SUMS_FILES_RUN));
+    match digest {
+        None => out.push(format!(
+            "`{job}` does not run `{SUMS_DIGEST_RUN}`: it would sign sums the build call did not publish"
+        )),
+        Some(at) => {
+            let step = &steps[at];
+            if step.conditional
+                || step.env != [("SUMS_SHA256".to_owned(), want_env.clone())]
+                || step.working_directory.is_some()
+            {
+                out.push(format!(
+                    "the digest check of `{job}` is to be an unconditional step with exactly `env: SUMS_SHA256: {want_env}` and no working directory"
+                ));
+            }
+        }
+    }
+    match files {
+        None => out.push(format!(
+            "`{job}` does not run `{SUMS_FILES_RUN}` in `dist`: it would sign files the sums do not list"
+        )),
+        Some(at) => {
+            let step = &steps[at];
+            if step.conditional
+                || !step.env.is_empty()
+                || step.working_directory.as_deref() != Some("dist")
+            {
+                out.push(format!(
+                    "the file check of `{job}` is to be an unconditional step with `working-directory: dist` and no `env:`"
+                ));
+            }
+        }
+    }
+    let last_download = steps.iter().rposition(|s| uses(s, DOWNLOAD));
+    let first_attest = steps.iter().position(|s| {
+        s.uses
+            .as_deref()
+            .is_some_and(|u| u.starts_with("actions/attest"))
+    });
+    for (what, at) in [("digest", digest), ("file", files)] {
+        let Some(at) = at else { continue };
+        if first_attest.is_some_and(|a| at > a) {
+            out.push(format!(
+                "the {what} check of `{job}` comes after an attestation step: it must run before anything is signed"
+            ));
+        }
+        if last_download.is_some_and(|d| at < d) {
+            out.push(format!(
+                "the {what} check of `{job}` comes before its last download: it would check files that are not the ones signed"
             ));
         }
     }

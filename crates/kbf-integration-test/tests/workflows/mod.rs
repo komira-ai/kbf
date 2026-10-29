@@ -228,6 +228,7 @@ pub struct Step {
     pub env: Vec<(String, String)>,
     pub conditional: bool,
     pub condition: Option<String>,
+    pub working_directory: Option<String>,
 }
 
 /// The steps of the job `job` (its key matched ignoring ASCII case) in a workflow
@@ -270,6 +271,7 @@ pub fn job_steps(text: &str, job: &str) -> Result<Vec<Step>, String> {
                 env: strings(m, "env"),
                 conditional: get(m, "if").is_some() || get(m, "continue-on-error").is_some(),
                 condition: text_of(get(m, "if")),
+                working_directory: text_of(get(m, "working-directory")),
             },
             _ => Step::default(),
         })

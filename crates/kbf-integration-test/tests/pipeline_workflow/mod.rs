@@ -82,8 +82,32 @@ const BUILD_JOB: &str = "artifacts";
 /// `artifacts.yml` run.
 const SIGNING_JOB: &str = "artifacts-sign";
 
-/// `artifacts.yml`'s `stage` input for each of its two calls, `(job, value)`.
-const CALLS: [(&str, &str); 2] = [(BUILD_JOB, "build"), (SIGNING_JOB, "sign")];
+/// The groups that are signed, `(group, the sums job that publishes its SHA256SUMS)`. The build
+/// call's sums job hands the digest of the sums it uploaded to the sign call, whose attest job of
+/// the group refuses other sums (`attested_bundles` holds that check). The workflow output and the
+/// input of the sign call are both named `sums_<group>_sha256` (see `attested_bundles::digest_input`).
+const SIGNED_GROUPS: [(&str, &str); 2] = [
+    ("linux", "sums-linux"),
+    ("darwin-arm64", "sums-darwin-arm64"),
+];
+
+/// The `with:` of the build call: its stage alone.
+fn build_with() -> Vec<(String, String)> {
+    vec![("stage".to_owned(), "build".to_owned())]
+}
+
+/// The `with:` of the sign call: its stage, and the build call's digest of each group's sums.
+fn sign_with() -> Vec<(String, String)> {
+    let mut with = vec![("stage".to_owned(), "sign".to_owned())];
+    for (group, _) in SIGNED_GROUPS {
+        let name = super::attested_bundles::digest_input(group);
+        with.push((
+            name.clone(),
+            format!("${{{{ needs.{BUILD_JOB}.outputs.{name} }}}}"),
+        ));
+    }
+    with
+}
 
 /// The `if:` of the two calls and of `watch`: a push to `main`, the exact spelling the signing
 /// scopes need (`workflows`; a caller job has no `inputs`, so this is not the stage spelling).
@@ -236,11 +260,11 @@ fn pipeline(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
             ));
         }
     }
-    for (job, stage) in CALLS {
+    for (job, want) in [(BUILD_JOB, build_with()), (SIGNING_JOB, sign_with())] {
         let with = workflows::job_with(text, job)?;
-        if with != [("stage".to_owned(), stage.to_owned())] {
+        if with != want {
             out.push(format!(
-                "the job `{job}` passes {with:?}, not exactly `stage: {stage}`: the two calls of artifacts.yml differ by that input alone"
+                "the job `{job}` passes {with:?}, not exactly {want:?}: the two calls of artifacts.yml differ by their stage, and the sign call is given the digests of the sums the build call published (its attest jobs refuse other sums)"
             ));
         }
     }
@@ -432,6 +456,7 @@ fn each_check_once(files: &Files, out: &mut Vec<String>) -> Result<(), String> {
 /// rebuilds nothing. A job under [`SIGNING_STAGE_IF`] needs only jobs under it: a skipped `need`
 /// would skip the signing job and let an unsigned commit through as a success.
 fn artifacts_stages(artifacts: &str, out: &mut Vec<String>) -> Result<(), String> {
+    digests_handed_on(artifacts, out)?;
     let names = workflows::job_names(artifacts)?;
     let mut staged: Vec<(String, String)> = Vec::new();
     for job in &names {
@@ -499,6 +524,74 @@ fn excludes_sign_stage(condition: &str) -> bool {
         }
     }
     depth == 0
+}
+
+/// The digest of each group's SHA256SUMS travels from the build call to the sign call: the sums
+/// job of the group writes `sha256=<hex>` of the file it uploads to its step output (`sums
+/// assemble --digest-output "$GITHUB_OUTPUT"`) and exposes it as the job output `sha256`;
+/// `workflow_call` re-exports it as the output `sums_<group>_sha256` and declares the input of the
+/// same name, which the sign call's attest job reads. (The pipeline passes it: [`pipeline`].)
+fn digests_handed_on(artifacts: &str, out: &mut Vec<String>) -> Result<(), String> {
+    for (group, sums_job) in SIGNED_GROUPS {
+        let name = super::attested_bundles::digest_input(group);
+        let outputs = workflows::job_outputs(artifacts, sums_job)?;
+        if outputs
+            != [(
+                "sha256".to_owned(),
+                "${{ steps.assemble.outputs.sha256 }}".to_owned(),
+            )]
+        {
+            out.push(format!(
+                "the job `{sums_job}` of artifacts.yml has the outputs {outputs:?}, not exactly `sha256: ${{{{ steps.assemble.outputs.sha256 }}}}`: the sign call could not tell the sums it signs from others"
+            ));
+        }
+        let steps = workflows::job_steps(artifacts, sums_job)?;
+        let assembles = steps.iter().any(|s| {
+            s.id.as_deref() == Some("assemble")
+                && !s.conditional
+                && s.run.as_deref().is_some_and(|r| {
+                    r.starts_with("cargo xtask sums assemble dist")
+                        && r.contains("--digest-output \"$GITHUB_OUTPUT\"")
+                })
+        });
+        if !assembles {
+            out.push(format!(
+                "the job `{sums_job}` of artifacts.yml has no unconditional step `assemble` that runs `cargo xtask sums assemble dist ... --digest-output \"$GITHUB_OUTPUT\"`: its output `sha256` would be empty or not the digest of the uploaded sums"
+            ));
+        }
+        let code = code(artifacts);
+        let export = format!("value: ${{{{ jobs.{sums_job}.outputs.sha256 }}}}");
+        let declared = |section: &str| {
+            let at = code.find(&format!("    {section}:\n"))?;
+            let rest = &code[at + 1..];
+            // To the next key of the same indentation (or the end of `workflow_call`).
+            let end = rest
+                .match_indices("\n    ")
+                .find(|(i, _)| rest[i + 5..].chars().next().is_some_and(|c| c != ' '))
+                .map_or_else(
+                    || rest.find("\npermissions:").unwrap_or(rest.len()),
+                    |(i, _)| i,
+                );
+            Some(&rest[..end])
+        };
+        let outputs_section = declared("outputs").unwrap_or_default();
+        if !outputs_section.contains(&format!("      {name}:\n"))
+            || !outputs_section.contains(&export)
+        {
+            out.push(format!(
+                "artifacts.yml's `workflow_call` does not declare the output `{name}` with `{export}`: the pipeline could not hand the digest to the sign call"
+            ));
+        }
+        if !declared("inputs")
+            .unwrap_or_default()
+            .contains(&format!("      {name}:\n"))
+        {
+            out.push(format!(
+                "artifacts.yml's `workflow_call` does not declare the input `{name}`: the sign call could not be given the digest"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The smoke runs the `kbf` of the linux-x86_64 tarball of this run's artifacts.
