@@ -936,3 +936,23 @@ async fn a_bar_with_no_end_shows_a_null_until() {
         json!([{"worker": "node-a", "until_in_ms": null}])
     );
 }
+
+/// Asserts that the update node step's look counts the leases each node holds and, of those,
+/// none undelivered once their `Start`s went out. Catches a look that counts no leases on a
+/// busy node (the update step would restart it under its builds), and one that counts a
+/// lease whose `Start` was sent as undelivered.
+#[tokio::test(start_paused = true)]
+async fn the_update_look_counts_each_nodes_leases_and_none_undelivered_once_sent() {
+    let rig = Rig::new(&[], &["node-a", "node-b"]);
+    rig.busy();
+    let looks: Vec<_> = rig
+        .farm
+        .update_look()
+        .into_iter()
+        .map(|look| (look.id.as_str().to_owned(), look.leases, look.undelivered))
+        .collect();
+    assert_eq!(
+        looks,
+        [("node-a".to_owned(), 1, 0), ("node-b".to_owned(), 1, 0)]
+    );
+}

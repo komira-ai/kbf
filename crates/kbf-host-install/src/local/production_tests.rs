@@ -484,6 +484,20 @@ fn a_helper_with_its_own_file_is_bound_to_the_container_it_names() {
         "--frontend-config",
         &dir.join("nope.toml").display().to_string(),
     ]);
+    // A file older programs accepted (drain_secs = 0) still lets the program start and name its
+    // container; the switch is what refuses it.
+    let zero = dir.join("fe-zero.toml");
+    fs::write(
+        &zero,
+        "[frontend]\nname = \"kbf-fe-z\"\nrestart = \"always\"\napi = \"127.0.0.1:28983\"\ndrain_token_file = \"/t\"\ndrain_secs = 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&zero, fs::Permissions::from_mode(0o644)).unwrap();
+    let zeroed = flags(&["--frontend-config", &zero.display().to_string()]);
+    assert_eq!(
+        bound_container(&t, &zeroed),
+        Ok(Some("kbf-fe-z".to_owned()))
+    );
     assert!(
         bound_container(&t, &missing)
             .unwrap_err()
