@@ -44,7 +44,7 @@ fn a_missing_credential_file_is_a_setup_failure_exit_code() {
             "--lease",
             "lease-1",
             "--action",
-            &format!("{}-0", "0".repeat(64)),
+            &format!("{}/0", "0".repeat(64)),
             "--work-dir",
             "/nonexistent-work",
         ])
