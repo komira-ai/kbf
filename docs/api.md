@@ -246,7 +246,9 @@ a restarted daemon starts again, and its first reading is the new baseline. A re
 went back or its clock did not move, when its CPU since the last accepted reading is more than
 four cores per hardware thread of the node's `capacity`, or when its working set is more than four
 times the node's memory. A lease's busiest window is not here: it is the usage record's
-`peak_window_millicores`.
+`peak_window_millicores`. The reading's `lease_clocks` and `minutes` lists
+([worker-protocol.md](design/worker-protocol.md#heartbeat-and-heartbeatack)) are not read or shown
+yet.
 
 `{id}` is the node id as `POST /v1/nodes/{node}:cordon` takes it, percent-encoded as one
 path segment. `404` with `{"error": "no_node"}` for a node that has not registered since
