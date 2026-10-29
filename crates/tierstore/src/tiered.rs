@@ -18,6 +18,10 @@ use crate::{
     UploadsAfter,
 };
 
+/// The most calls to the cold tier that one listing of uploads makes to fill a page that the
+/// filter of reserved keys cut short.
+const UPLOAD_LISTING_CALLS: u32 = 100;
+
 /// The settings of a [`Proxy`].
 #[derive(Clone)]
 pub struct ProxyConfig {
@@ -619,7 +623,15 @@ impl Backend for Proxy {
         let cold = &self.inner.cold;
         let mut after = after.map(|(key, id)| (key.to_owned(), id.map(str::to_owned)));
         let mut found: Vec<OpenUpload> = Vec::new();
+        let mut calls = 0;
         while found.len() < max_uploads {
+            calls += 1;
+            if calls > UPLOAD_LISTING_CALLS {
+                let text = format!(
+                    "the cold tier's listing of uploads took over {UPLOAD_LISTING_CALLS} calls"
+                );
+                return Err(Error::Unavailable(text));
+            }
             let want = max_uploads - found.len();
             let marker = after
                 .as_ref()
@@ -629,7 +641,14 @@ impl Backend for Proxy {
             let full = page.len() == want;
             found.extend(page.into_iter().filter(|up| !is_reserved(&up.key)));
             match last {
-                Some(last) if full => after = Some(last),
+                Some(last) if full => {
+                    // A full page that ends where the last one did would be asked for for ever.
+                    if after.as_ref().is_some_and(|before| last <= *before) {
+                        let text = "the cold tier's listing of uploads did not advance";
+                        return Err(Error::Unavailable(text.to_owned()));
+                    }
+                    after = Some(last);
+                }
                 _ => break,
             }
         }

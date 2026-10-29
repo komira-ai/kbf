@@ -9,6 +9,7 @@ mod faults;
 mod journal;
 mod lease;
 mod list_uploads;
+mod list_uploads_reserved;
 mod multipart;
 mod reconciler;
 mod reconciler_faults;

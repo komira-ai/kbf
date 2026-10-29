@@ -215,3 +215,39 @@ async fn a_listing_of_uploads_refuses_what_it_does_not_do() {
     assert_eq!(back.status, StatusCode::OK);
     assert_eq!(uploads(&back).len(), 1);
 }
+
+/// Asserts that a key with `&` and `<` in it, and a prefix and a marker with them, come back
+/// escaped in the XML (so that the document parses and gives the key as it was), and that the
+/// markers the page names are the escaped text too. It catches a listing that writes a key into
+/// the document as it is.
+#[tokio::test(start_paused = true)]
+async fn a_key_with_xml_characters_is_escaped_in_the_listing() {
+    let rig = Rig::new(1 << 20).await;
+    let first = rig.cold_mem.create_upload("t&c/<one>").await.unwrap();
+    let second = rig.cold_mem.create_upload("t&c/two").await.unwrap();
+
+    let page = list(&rig, "prefix=t%26c%2F&max-uploads=1").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        page.body.contains("<Key>t&amp;c/&lt;one&gt;</Key>"),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body.contains("<Prefix>t&amp;c/</Prefix>"),
+        "{}",
+        page.body
+    );
+    assert_eq!(uploads(&page), [("t&c/<one>".to_owned(), first.clone())]);
+    assert_eq!(texts(&page.body, "NextKeyMarker"), ["t&c/<one>"]);
+
+    let marker = "key-marker=t%26c%2F%3Cone%3E";
+    let rest = list(&rig, &format!("{marker}&upload-id-marker={first}")).await;
+    assert!(
+        rest.body
+            .contains("<KeyMarker>t&amp;c/&lt;one&gt;</KeyMarker>"),
+        "{}",
+        rest.body
+    );
+    assert_eq!(uploads(&rest), [("t&c/two".to_owned(), second)]);
+}
