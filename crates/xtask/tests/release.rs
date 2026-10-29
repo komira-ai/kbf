@@ -1640,6 +1640,30 @@ fn check_accepts_the_coordinator_image_of_each_linux_arch_and_refuses_it_on_the_
     assert_eq!(err, format!("xtask: {mac}: not an asset of {COMMIT}\n"));
 }
 
+#[test]
+fn check_accepts_the_task_image_of_each_linux_arch_and_refuses_it_on_the_mac() {
+    // Catches: `kbf-task-image-...oci.tar` refused as "not an asset of <commit>" (the release
+    // of the first main push that lists it fails), or accepted for the Mac.
+    let root = scratch("check-task-image");
+    let listed = dist(&root, COMMIT);
+    for platform in ["linux-x86_64", "linux-arm64"] {
+        add_deb(
+            &listed,
+            &format!("kbf-task-image-{COMMIT}-{platform}.oci.tar"),
+            true,
+        );
+    }
+    let (code, _, err) = check(&listed, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    let mac = format!("kbf-task-image-{COMMIT}-darwin-arm64.oci.tar");
+    let root = scratch("check-task-image-mac");
+    let held = dist(&root, COMMIT);
+    add_deb(&held, &mac, true);
+    let (code, out, err) = check(&held, COMMIT);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(err, format!("xtask: {mac}: not an asset of {COMMIT}\n"));
+}
+
 /// A `dist` of the commit with the x86_64 frontend image listed and no bundle for it: the
 /// directory and the image's name.
 fn dist_without_bundle(root: &Path) -> (PathBuf, String) {

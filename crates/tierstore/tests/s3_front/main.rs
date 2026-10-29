@@ -9,6 +9,7 @@ mod idle;
 mod raw;
 mod roles;
 mod run;
+mod sdk;
 mod signer;
 mod stalled;
 mod support;

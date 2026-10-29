@@ -1,5 +1,4 @@
-//! The farm on the js core (`--scheduler-core js`), built with the `farm-core-js` feature:
-//! [`JsFarm`] is what [`Driver::Js`](super::driver::Driver) holds.
+//! The farm on the js core (`--scheduler-core js`): [`JsFarm`] is what [`Driver::Js`](super::driver::Driver) holds.
 //!
 //! Every method of [`Farm`](super::Farm) that differs by core starts with an arm that calls
 //! the function of the same name in one of three files, with the same arguments after the
@@ -36,6 +35,7 @@ use super::{EpochPolicy, Farm};
 use crate::action_usage::Shapes;
 use crate::farm_js::open::{self, KbfObserver};
 use crate::farm_js::{KbfAdapter, Wall};
+use crate::learned::{Learned, LearnedSizes};
 use crate::state_store::StateStore;
 
 pub(crate) mod hot;
@@ -98,7 +98,8 @@ pub(crate) struct JsFarm {
     pub(crate) core: Core<KbfAdapter>,
     /// The farm's settings as the core was last built from them: the memory ladder and
     /// floors, the placement mode, the whole-node settings, the recorder, the held cap and
-    /// the orphan wait. The learned sizes are kept but this core does not use them.
+    /// the orphan wait, and the learned sizes mode, which the adapter's estimator is built
+    /// from (`on` learns as `shadow`).
     pub(crate) settings: Settings,
     /// The state store the core opened, if the farm has taken one.
     pub(crate) store: Option<Arc<dyn Store>>,
@@ -124,6 +125,8 @@ pub(crate) struct JsFarm {
     pub(crate) shapes: Shapes,
     /// `Result`s being taken now: a handover waits for none to be.
     pub(crate) reports: AtomicUsize,
+    /// Lets one writer of size summaries at a time take its rows and write them.
+    pub(crate) learning_gate: crate::farm_js::Gate,
     /// Whether the farm is fenced ([`Farm::fence`](crate::farm::Farm::fence)), which the
     /// core does not say. A fenced core feeds nothing, so it refuses every `Result` as
     /// stale, the current lease's too.
@@ -152,6 +155,8 @@ struct Opening<'a> {
     term: u64,
     /// The farm time of the start.
     now: FarmTime,
+    /// The wall-clock time the farm was built at, in milliseconds since the Unix epoch.
+    epoch_unix_ms: u64,
 }
 
 impl Opening<'_> {
@@ -164,17 +169,28 @@ impl Opening<'_> {
         )
     }
 
-    fn adapter(&self, store: Arc<dyn Store>) -> KbfAdapter {
+    /// The estimator the settings ask for. `on` is not supported on this core: it learns as
+    /// `shadow` does and books what `off` books.
+    fn learned(&self) -> Learned {
+        let mode = match self.settings.learned {
+            LearnedSizes::On => LearnedSizes::Shadow,
+            mode => mode,
+        };
+        Learned::new(mode, self.settings.default_memory, self.epoch_unix_ms)
+    }
+
+    fn adapter(&self, store: Arc<dyn Store>, stored: bool) -> KbfAdapter {
         let ambient = self.ambient;
         let wall: Wall = Arc::new(move || ambient.wall());
         KbfAdapter::new(self.term, self.cache.clone(), store, wall)
             .recording(self.settings.recorder.clone())
+            .learning_with(self.learned(), stored)
     }
 
     /// A core with no state store: it writes nothing.
     fn bare(&self) -> Core<KbfAdapter> {
         let observer = KbfObserver::new(self.cache.clone());
-        Core::new(&self.config(), self.adapter(Arc::new(Detached)))
+        Core::new(&self.config(), self.adapter(Arc::new(Detached), false))
             .with_observer(observer)
             .with_held_cap(self.settings.held_cap)
     }
@@ -185,7 +201,7 @@ impl Opening<'_> {
         store: Arc<dyn Store>,
         epoch: EpochPolicy,
     ) -> Result<Core<KbfAdapter>, js_store::StateError> {
-        let adapter = self.adapter(Arc::clone(&store));
+        let adapter = self.adapter(Arc::clone(&store), true);
         let core = open::open(&self.config(), adapter, store, epoch, self.now)?;
         Ok(core.with_held_cap(self.settings.held_cap))
     }
@@ -207,6 +223,7 @@ impl JsFarm {
             ambient: self.ambient,
             term,
             now: self.now(),
+            epoch_unix_ms: self.epoch_unix_ms,
         }
     }
 
@@ -287,6 +304,7 @@ impl Farm {
             ambient,
             term,
             now: FarmTime::from_millis(0),
+            epoch_unix_ms,
         }
         .bare();
         let js = JsFarm {
@@ -303,6 +321,7 @@ impl Farm {
             epoch_unix_ms,
             shapes: Shapes::default(),
             reports: AtomicUsize::new(0),
+            learning_gate: crate::farm_js::Gate::default(),
             fenced: AtomicBool::new(false),
         };
         Self {

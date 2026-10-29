@@ -17,6 +17,7 @@ testkit = []
 base64.workspace = true
 bytes.workspace = true
 futures.workspace = true
+hmac.workspace = true
 http-body.workspace = true
 kbf-auth.workspace = true
 kbf-caps.workspace = true
@@ -41,6 +42,9 @@ kbf-tls.workspace = true
 kbf-types.workspace = true
 prost.workspace = true
 prost-types.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tonic.workspace = true
@@ -61,7 +65,6 @@ protox.workspace = true
 # certificates, the switch that cuts a node off, and the TLS server the nodes serve with.
 kbf-testkit.workspace = true
 rcgen.workspace = true
-serde_json.workspace = true
 tonic = { workspace = true, features = ["tls-ring"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util", "time"] }
 tracing-subscriber.workspace = true

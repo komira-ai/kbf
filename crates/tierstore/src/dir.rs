@@ -75,6 +75,11 @@ impl SyncDir for FsyncDir {
 ///   cannot be undone, the old body being gone: the call fails and the change may be visible; a
 ///   retry of a delete is fine, and the caller of a replacement reads the object to see which
 ///   body it holds.
+/// - A streamed put ([`Backend::put_stream`]) writes the chunks to the temporary file as they
+///   arrive, so that the body is never held in memory; the content tag, which starts the file,
+///   is written over reserved room after the last chunk, the file is synced, and only then is it
+///   linked to the name, with the directory synced after the link as for any put. A body that
+///   fails leaves no object and removes the temporary file.
 /// - A multipart upload is a directory `.uploads/<id>` that holds a file with the key and a file
 ///   for each part, written as the chunks of the part arrive, so that a part is never held in
 ///   memory; the completion joins the parts into the new object by streaming them, and removes
@@ -267,11 +272,34 @@ async fn join_files(path: &Path, files: &[PathBuf]) -> Result<[u8; TAG_LEN], Err
             out.write_all(&buffer[..count]).await.map_err(&fail)?;
         }
     }
+    seal(&mut out, hasher).await.map_err(&fail)
+}
+
+/// Writes the chunks of `body` to a new file at `path` behind room for the content tag, then
+/// the tag of the whole, which is known only after the last chunk, and syncs the file. A body
+/// that ends with an error leaves a file that is not an object (the caller removes it). Gives
+/// the tag.
+async fn write_object_stream(path: &Path, body: &mut PartBody<'_>) -> Result<[u8; TAG_LEN], Error> {
+    let fail = io_error(path);
+    let mut out = create_new(path).await.map_err(&fail)?;
+    out.write_all(&[0_u8; TAG_LEN]).await.map_err(&fail)?;
+    let mut hasher = Sha256::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        hasher.update(&chunk);
+        out.write_all(&chunk).await.map_err(&fail)?;
+    }
+    seal(&mut out, hasher).await.map_err(&fail)
+}
+
+/// Writes the tag of the hash `hasher` has come to over the room at the start of `out`, and
+/// syncs the file. Gives the tag.
+async fn seal(out: &mut File, hasher: Sha256) -> std::io::Result<[u8; TAG_LEN]> {
     let tag = finish(hasher);
-    let sought = out.seek(SeekFrom::Start(0)).await.map(|_| ());
-    let tagged = sought.and(out.write_all(&tag).await);
-    let flushed = tagged.and(out.flush().await);
-    flushed.and(out.sync_all().await).map_err(&fail)?;
+    out.seek(SeekFrom::Start(0)).await?;
+    out.write_all(&tag).await?;
+    out.flush().await?;
+    out.sync_all().await?;
     Ok(tag)
 }
 
@@ -454,6 +482,23 @@ impl Backend for DirBackend {
     async fn put(&self, key: &str, body: Bytes) -> Result<(), Error> {
         let path = self.path(key)?;
         let (temp, _) = self.write_temp(body).await?;
+        self.publish(&temp, &path, key).await
+    }
+
+    /// Writes the chunks to a temporary file as they arrive, and links it to the name only
+    /// after the last chunk, when the content tag is known and the file is synced. A body that
+    /// fails, or a call that is dropped half way, removes the temporary file and leaves the
+    /// name as it was.
+    async fn put_stream(
+        &self,
+        key: &str,
+        _len: Option<u64>,
+        mut body: PartBody<'_>,
+    ) -> Result<(), Error> {
+        let path = self.path(key)?;
+        let temp = self.temp(&self.root);
+        let _scratch = Scratch(temp.clone());
+        write_object_stream(&temp, &mut body).await?;
         self.publish(&temp, &path, key).await
     }
 

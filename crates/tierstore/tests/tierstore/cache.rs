@@ -252,3 +252,33 @@ async fn the_cache_works_in_front_of_a_proxy() {
     assert_absent(&*rig.cold_mem, "k").await;
     assert_eq!(cached.cached_bytes(), 0);
 }
+
+/// Asserts that a streamed put through the cache goes on to the inner store as a stream: with
+/// the inner store failing its next put, the body is never asked for a chunk (a cache that
+/// collected the body first would have read it), and with nothing planned the object is stored
+/// and reads back through the cache.
+#[tokio::test]
+async fn a_streamed_put_is_passed_to_the_inner_store_unread() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
+
+    use futures::StreamExt;
+
+    let f = fixture(100);
+    let asked = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&asked);
+    let untouched = futures::stream::poll_fn(move |_| {
+        seen.store(true, Ordering::SeqCst);
+        Poll::Ready(None)
+    });
+    f.backend.fail_next(Op::Put, 1);
+    let failed = f.cached.put_stream("k", None, untouched.boxed()).await;
+    assert!(matches!(failed, Err(Error::Unavailable(_))));
+    assert!(!asked.load(Ordering::SeqCst));
+    assert_absent(&*f.backend, "k").await;
+
+    let chunks = crate::support::chunks(&["01", "23"]);
+    f.cached.put_stream("k", Some(4), chunks).await.unwrap();
+    assert_eq!(f.cached.get("k", None).await.unwrap(), body("0123"));
+    assert!(!f.cached.needs_length());
+}
