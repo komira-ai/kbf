@@ -1,5 +1,6 @@
-//! Tests of the farm's lifecycle on the js core (`lifecycle`), run in a build with
-//! `farm-core-js`. The farm suites cover the rest on the core they are built for.
+//! Tests of the farm's lifecycle on the js core (`lifecycle`). Their farms name the js core,
+//! so they run the same with and without `farm-core-js`. The farm suites cover the rest on
+//! the core they are built for.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,8 +15,9 @@ use crate::farm::{EpochPolicy, Farm, NodeAction};
 use crate::state_store::StateStore;
 
 fn bare_farm() -> Farm {
-    Farm::new(
-        Arc::new(Cache::memory()),
+    Farm::on_core(
+        crate::SchedulerCore::Js,
+        Arc::new(Cache::memory()).into(),
         UNSERVABLE_WAIT,
         FINISHED_RETENTION,
     )
