@@ -18,7 +18,9 @@ use super::time::http_date;
 use super::xml::{self, Listing};
 
 /// The query parameters this front understands. A request with another is not served.
-const SUPPORTED: [&str; 8] = [
+/// `x-id` names the operation (`?x-id=PutObject`) and S3 ignores it; the AWS SDKs add it to
+/// the calls of an object, so a request with it is served as one without.
+const SUPPORTED: [&str; 9] = [
     "continuation-token",
     "list-type",
     "max-keys",
@@ -27,6 +29,7 @@ const SUPPORTED: [&str; 8] = [
     "start-after",
     "uploadId",
     "uploads",
+    "x-id",
 ];
 
 /// The query parameters that make a request part of a multipart upload.

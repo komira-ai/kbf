@@ -380,7 +380,7 @@ async fn report(rig: &super::testing::Rig, result: worker::Result) -> bool {
         &rig.core,
         &rig.backend,
         &wall(),
-        || at(0),
+        &|| at(0),
         &WorkerId::new("node-a"),
         result,
     )
