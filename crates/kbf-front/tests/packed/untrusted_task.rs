@@ -1,0 +1,811 @@
+//! `ingest`: the pack a task wrote under a key the frontend minted is read from the object store,
+//! hashed to the last byte, checked against the manifest at its offset 0, and turned into an
+//! action result that is written to the action cache only when the action ran cacheably and exited 0.
+//! And the minting of the key (`PackKeyMint`): a key is the frontend's HMAC over the lease, the
+//! action and the minute, so a key it did not mint is refused before the store is asked.
+//!
+//! The store is an in-memory object store that logs every range it is asked for, the index is an
+//! in-memory pack index, and the action cache is a real storage node behind the frontend, read
+//! back through the frontend's own GetActionResult. Every test says the behaviour it asserts.
+
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use bytes::Bytes;
+use kbf_front::{
+    Backend, Ingested, IssuedPackKey, MIN_SECRET_BYTES, MintError, PackKeyMint, RejectReason,
+    UntrustedLimits, ingest,
+};
+use kbf_pack::{
+    EMPTY_DIGEST, OutputDirectory, OutputFile, OutputSymlink, TaskManifest, Timing, Usage,
+    write_pack,
+};
+use kbf_pack_index::PackIndex as _;
+use kbf_proto::reapi::action_cache_client::ActionCacheClient;
+use kbf_proto::reapi::{self, ActionResult, Directory, FileNode, GetActionResultRequest, Tree};
+use kbf_segments::layout::{encode_footer, footer_len};
+use kbf_segments::{IndexEntry, MAX_SEGMENT_BYTES, SegmentWriter, crc32c, sha256};
+use kbf_types::Digest;
+use prost::Message as _;
+use tonic::Code;
+
+use crate::support::{Rig, blob, update};
+
+const LEASE: &str = "00000000000000010000000000000002";
+const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
+/// A minute boundary: 29833334 minutes after the epoch.
+const NOW_SECS: u64 = 1_790_000_040;
+
+const OBJECT: &str = "object code of the action";
+const STDOUT: &str = "compiling\n";
+const IN_DIR: &str = "a file inside the output directory";
+
+fn now() -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(NOW_SECS)
+}
+
+fn wire(digest: &Digest) -> reapi::Digest {
+    kbf_front::digest_to_proto(digest)
+}
+
+/// The `Tree` that names `files` (one directory, no children), and its digest.
+fn tree_of(files: &[Digest]) -> (Digest, Bytes) {
+    let named = |digest: &Digest| FileNode {
+        name: digest.hash_hex(),
+        digest: Some(wire(digest)),
+        ..FileNode::default()
+    };
+    let tree = Tree {
+        root: Some(Directory {
+            files: files.iter().map(named).collect(),
+            ..Directory::default()
+        }),
+        ..Tree::default()
+    };
+    let bytes = Bytes::from(tree.encode_to_vec());
+    (sha256(&bytes), bytes)
+}
+
+/// The record of `bytes` at `offset`, as the footer lists it.
+fn entry_of(bytes: &[u8], offset: u64) -> IndexEntry {
+    IndexEntry {
+        digest: sha256(bytes),
+        offset,
+        crc32c: crc32c(bytes),
+    }
+}
+
+/// A pack of `records` back to back as given and a footer that lists `entries`, whatever the
+/// records are: the footer is made, not derived, so it can lie about the layout.
+fn forged(records: &[u8], entries: &[IndexEntry]) -> Vec<u8> {
+    let mut sorted = entries.to_vec();
+    sorted.sort_by_key(|entry| entry.digest);
+    let mut bytes = records.to_vec();
+    bytes.extend(encode_footer(records.len() as u64, &sorted));
+    bytes
+}
+
+/// A pack of `records` pushed in order (the first is the record at offset 0).
+fn segment_of(records: &[&[u8]]) -> Vec<u8> {
+    let mut writer = SegmentWriter::new(MAX_SEGMENT_BYTES);
+    for record in records {
+        writer.push(record).expect("pushed");
+    }
+    writer.finish()
+}
+
+/// The frontend with packs, a mint, the Action of the lease and the key issued for it.
+struct Farm {
+    rig: Rig,
+    backend: Backend,
+    mint: PackKeyMint,
+    action: Digest,
+    key: IssuedPackKey,
+}
+
+impl Farm {
+    async fn new() -> Self {
+        Self::of(false).await
+    }
+
+    /// A farm whose Action says `do_not_cache`.
+    async fn of(do_not_cache: bool) -> Self {
+        let rig = Rig::new().await;
+        let action = reapi::Action {
+            command_digest: Some(wire(&blob("the command").0)),
+            input_root_digest: Some(wire(&blob("the inputs").0)),
+            do_not_cache,
+            ..reapi::Action::default()
+        };
+        let bytes = Bytes::from(action.encode_to_vec());
+        let action = sha256(&bytes);
+        let stored = update(&rig.front, &[(action, bytes)]).await;
+        assert_eq!(stored, [0], "the Action is stored");
+        let backend = Backend::remote_over(rig.node().clone(), Some(rig.packs.clone()));
+        let mint = PackKeyMint::new(SECRET).expect("a mint");
+        let key = mint.mint(LEASE, &action, now()).expect("a key");
+        Self {
+            rig,
+            backend,
+            mint,
+            action,
+            key,
+        }
+    }
+
+    /// The manifest of an honest task that exited with `exit_code`: the files are listed out of
+    /// order, one is empty (no record), and there is a directory and a symlink.
+    fn manifest(&self, exit_code: i32) -> TaskManifest {
+        let file = |path: &str, digest: Digest, is_executable: bool| OutputFile {
+            path: path.to_owned(),
+            digest,
+            is_executable,
+        };
+        TaskManifest {
+            lease: LEASE.to_owned(),
+            action: self.action,
+            exit_code,
+            stdout: Some(blob(STDOUT).0),
+            stderr: None,
+            output_files: vec![
+                file("out/z.o", blob(OBJECT).0, true),
+                file("out/a.txt", EMPTY_DIGEST, false),
+            ],
+            output_directories: vec![OutputDirectory {
+                path: "out/d".to_owned(),
+                tree: self.tree().0,
+            }],
+            output_symlinks: vec![OutputSymlink {
+                path: "out/l".to_owned(),
+                target: "z.o".to_owned(),
+            }],
+            timing: Timing::default(),
+            usage: Usage::default(),
+        }
+    }
+
+    fn tree(&self) -> (Digest, Bytes) {
+        tree_of(&[blob(IN_DIR).0])
+    }
+
+    /// The pack of an honest task that exited with `exit_code`.
+    fn pack(&self, exit_code: i32) -> Vec<u8> {
+        let (object, stdout, in_dir) = (blob(OBJECT).1, blob(STDOUT).1, blob(IN_DIR).1);
+        let tree = self.tree().1;
+        write_pack(
+            &self.manifest(exit_code),
+            &[&object, &stdout, &tree, &in_dir],
+        )
+        .expect("a pack")
+    }
+
+    /// The result the frontend must rebuild from the honest pack: sorted by path.
+    fn result(&self, exit_code: i32) -> ActionResult {
+        let file = |path: &str, digest: &Digest, is_executable: bool| reapi::OutputFile {
+            path: path.to_owned(),
+            digest: Some(wire(digest)),
+            is_executable,
+            ..reapi::OutputFile::default()
+        };
+        ActionResult {
+            output_files: vec![
+                file("out/a.txt", &EMPTY_DIGEST, false),
+                file("out/z.o", &blob(OBJECT).0, true),
+            ],
+            output_directories: vec![reapi::OutputDirectory {
+                path: "out/d".to_owned(),
+                tree_digest: Some(wire(&self.tree().0)),
+                ..reapi::OutputDirectory::default()
+            }],
+            output_symlinks: vec![reapi::OutputSymlink {
+                path: "out/l".to_owned(),
+                target: "z.o".to_owned(),
+                ..reapi::OutputSymlink::default()
+            }],
+            stdout_digest: Some(wire(&blob(STDOUT).0)),
+            exit_code,
+            ..ActionResult::default()
+        }
+    }
+
+    /// The blobs the honest pack holds besides its manifest.
+    fn blobs(&self) -> [Digest; 4] {
+        [
+            blob(OBJECT).0,
+            blob(STDOUT).0,
+            self.tree().0,
+            blob(IN_DIR).0,
+        ]
+    }
+
+    /// Stores `bytes` under the issued key, as the task's presigned write would.
+    async fn put(&self, bytes: &[u8]) {
+        self.rig.store.seed(self.key.key(), bytes).await;
+    }
+
+    async fn ingest_with(&self, limits: &UntrustedLimits) -> Ingested {
+        let packs = &self.rig.packs;
+        let (mint, key) = (&self.mint, &self.key);
+        ingest(packs, &self.backend, mint, LEASE, key, &self.action, limits).await
+    }
+
+    async fn ingest(&self) -> Ingested {
+        self.ingest_with(&UntrustedLimits::default()).await
+    }
+
+    /// The ingest of the object under `key`, which is not necessarily the one issued.
+    async fn ingest_key(&self, key: &IssuedPackKey) -> Ingested {
+        let (packs, limits) = (&self.rig.packs, UntrustedLimits::default());
+        let (backend, mint) = (&self.backend, &self.mint);
+        ingest(packs, backend, mint, LEASE, key, &self.action, &limits).await
+    }
+
+    /// What the frontend's GetActionResult answers for the action.
+    async fn cached(&self) -> Result<ActionResult, tonic::Status> {
+        let request = GetActionResultRequest {
+            action_digest: Some(wire(&self.action)),
+            ..GetActionResultRequest::default()
+        };
+        let mut client = ActionCacheClient::new(self.rig.front.clone());
+        Ok(client.get_action_result(request).await?.into_inner())
+    }
+
+    /// Asserts that the pack was refused for `reason`: counted under it and no other, and no
+    /// action-cache entry.
+    async fn rejected(&self, got: Ingested, reason: RejectReason) {
+        assert_eq!(got, Ingested::Reject(reason));
+        let metrics = self.rig.packs.metrics();
+        for each in RejectReason::ALL {
+            let want = u64::from(each == reason);
+            assert_eq!(metrics.ingest_rejects(each), want, "{each:?}");
+        }
+        assert_eq!(metrics.ingests(), 0);
+        let cached = self.cached().await.expect_err("nothing cached");
+        assert_eq!(cached.code(), Code::NotFound);
+    }
+
+    /// Asserts that the index has no row for the pack and none of its blobs.
+    fn nothing_indexed(&self) {
+        assert!(
+            self.rig
+                .index
+                .pack(self.key.key())
+                .expect("asked")
+                .is_none()
+        );
+        assert!(self.rig.index.has_none(&self.blobs()));
+    }
+}
+
+/// Asserts the happy path: an honest pack is ingested into exactly the action result its
+/// manifest describes (paths sorted, the empty file listed with the empty digest and no record,
+/// the symlink, the directory's tree, stdout), the result is cached and served by the frontend,
+/// every blob the pack holds is in the index, and the pack is recorded. Catches a result built
+/// from the wrong fields, one left unsorted, an empty blob given a record, a result not written to
+/// the action cache and blobs not indexed.
+#[tokio::test]
+async fn an_honest_pack_is_ingested_into_the_exact_action_result_and_cached() {
+    let farm = Farm::new().await;
+    farm.put(&farm.pack(0)).await;
+
+    let got = farm.ingest().await;
+
+    let want = Ingested::Ran {
+        result: farm.result(0),
+        cached: true,
+    };
+    assert_eq!(got, want);
+    assert_eq!(farm.cached().await.expect("a hit"), farm.result(0));
+    assert!(farm.rig.index.has_all(&farm.blobs()));
+    assert!(
+        farm.rig
+            .index
+            .pack(farm.key.key())
+            .expect("asked")
+            .is_some()
+    );
+    assert_eq!(farm.rig.packs.metrics().ingests(), 1);
+}
+
+/// Asserts that an action that ran and failed is reported, not cached: the result carries the
+/// exit code, nothing is written to the action cache, and the blobs (stdout among them) are
+/// indexed so the client can read them. Catches a failed action cached.
+#[tokio::test]
+async fn a_failed_action_is_ran_and_not_cached() {
+    let farm = Farm::new().await;
+    farm.put(&farm.pack(3)).await;
+
+    let got = farm.ingest().await;
+
+    let want = Ingested::Ran {
+        result: farm.result(3),
+        cached: false,
+    };
+    assert_eq!(got, want);
+    let miss = farm.cached().await.expect_err("not cached");
+    assert_eq!(miss.code(), Code::NotFound);
+    assert!(farm.rig.index.has_all(&farm.blobs()));
+}
+
+/// Asserts that an action that says `do_not_cache` is ingested and not cached even when it
+/// exited 0. Catches an ingest that decides cacheability from the exit code alone.
+#[tokio::test]
+async fn a_do_not_cache_action_is_ran_and_not_cached() {
+    let farm = Farm::of(true).await;
+    farm.put(&farm.pack(0)).await;
+
+    let got = farm.ingest().await;
+
+    let want = Ingested::Ran {
+        result: farm.result(0),
+        cached: false,
+    };
+    assert_eq!(got, want);
+    let miss = farm.cached().await.expect_err("not cached");
+    assert_eq!(miss.code(), Code::NotFound);
+}
+
+/// Asserts that ingesting the same key again is idempotent: the same result, the same cache entry,
+/// one pack recorded and counted once as recorded.
+#[tokio::test]
+async fn replaying_the_same_key_is_idempotent() {
+    let farm = Farm::new().await;
+    farm.put(&farm.pack(0)).await;
+
+    let first = farm.ingest().await;
+    let again = farm.ingest().await;
+
+    assert_eq!(first, again);
+    assert!(
+        matches!(again, Ingested::Ran { cached: true, .. }),
+        "{again:?}"
+    );
+    assert_eq!(farm.cached().await.expect("a hit"), farm.result(0));
+    let mut text = String::new();
+    farm.rig.packs.render_metrics(&mut text);
+    assert!(
+        text.contains("kbf_pack_untrusted_commits_total 1\n"),
+        "{text}"
+    );
+    assert_eq!(farm.rig.packs.metrics().ingests(), 2);
+}
+
+/// Asserts that no object under the key is `Missing`, and that the store's length answer, not a
+/// read, said so.
+#[tokio::test]
+async fn an_absent_object_is_missing() {
+    let farm = Farm::new().await;
+
+    let got = farm.ingest().await;
+
+    farm.rejected(got, RejectReason::Missing).await;
+    assert!(farm.rig.store.ranges().is_empty(), "nothing was read");
+}
+
+/// Asserts that a key the frontend did not mint is refused before the store is asked about it:
+/// a key of the right shape with a made-up MAC, and a key minted for another action, another
+/// lease or under another secret. Catches a key taken on its shape and a MAC that does not cover
+/// the action, the lease or the secret.
+#[tokio::test]
+async fn a_key_not_minted_here_is_wrong_key() {
+    let other_action = blob("another action").0;
+    let secret = b"fedcba9876543210fedcba9876543210";
+    let farm = Farm::new().await;
+    let made_up = format!("{}{:08x}-0", "ab".repeat(16), NOW_SECS / 60);
+    let keys = [
+        IssuedPackKey::new(LEASE, &made_up).expect("a key"),
+        farm.mint.mint(LEASE, &other_action, now()).expect("a key"),
+        farm.mint
+            .mint("another", &farm.action, now())
+            .expect("a key"),
+        PackKeyMint::new(secret)
+            .expect("a mint")
+            .mint(LEASE, &farm.action, now())
+            .expect("a key"),
+    ];
+    for key in &keys {
+        farm.rig.store.seed(key.key(), &farm.pack(0)).await;
+        let got = farm.ingest_key(key).await;
+        assert_eq!(
+            got,
+            Ingested::Reject(RejectReason::WrongKey),
+            "{}",
+            key.key()
+        );
+    }
+    assert!(farm.rig.store.ranges().is_empty(), "nothing was read");
+    assert_eq!(
+        farm.rig
+            .packs
+            .metrics()
+            .ingest_rejects(RejectReason::WrongKey),
+        4
+    );
+}
+
+/// Asserts that a manifest that names another lease or another action is refused as the wrong
+/// key, and indexes nothing. Catches a pack accepted because it is at the right key whatever it
+/// says it is for.
+#[tokio::test]
+async fn a_manifest_for_another_lease_or_action_is_wrong_key() {
+    let farm = Farm::new().await;
+    let mut other_lease = farm.manifest(0);
+    other_lease.lease = "someone-elses".to_owned();
+    let mut other_action = farm.manifest(0);
+    other_action.action = blob("another action").0;
+    for manifest in [other_lease, other_action] {
+        let farm = Farm::new().await;
+        let (object, stdout, in_dir) = (blob(OBJECT).1, blob(STDOUT).1, blob(IN_DIR).1);
+        let tree = farm.tree().1;
+        let blobs: [&[u8]; 4] = [&object, &stdout, &tree, &in_dir];
+        farm.put(&write_pack(&manifest, &blobs).expect("a pack"))
+            .await;
+
+        let got = farm.ingest().await;
+
+        farm.rejected(got, RejectReason::WrongKey).await;
+        farm.nothing_indexed();
+    }
+}
+
+/// Asserts the caps, each refused before a record is read: a pack over `max_pack_bytes` (before
+/// any read at all), more records than `max_blobs`, and a record over `max_blob_bytes`.
+#[tokio::test]
+async fn a_pack_over_a_cap_is_too_large() {
+    let big = "b".repeat(2000);
+    let farm = Farm::new().await;
+    let honest = farm.pack(0);
+    let (object, stdout, tree) = (blob(OBJECT).1, blob(STDOUT).1, farm.tree().1);
+    let manifest = farm.manifest(0);
+    let in_dir = blob(IN_DIR).1;
+    let mut with_big = manifest;
+    with_big.output_files[0].digest = blob(&big).0;
+    let blobs: [&[u8]; 5] = [big.as_bytes(), &stdout, &tree, &in_dir, &object];
+    let bigger = write_pack(&with_big, &blobs).expect("a pack");
+    let default = UntrustedLimits::default();
+    let cases = [
+        (
+            "pack",
+            honest.clone(),
+            UntrustedLimits {
+                max_pack_bytes: honest.len() as u64 - 1,
+                ..default
+            },
+        ),
+        (
+            "blobs",
+            honest.clone(),
+            UntrustedLimits {
+                max_blobs: 4,
+                ..default
+            },
+        ),
+        (
+            "blob",
+            bigger,
+            UntrustedLimits {
+                max_blob_bytes: 1000,
+                ..default
+            },
+        ),
+    ];
+    for (what, bytes, limits) in cases {
+        let farm = Farm::new().await;
+        farm.put(&bytes).await;
+
+        let got = farm.ingest_with(&limits).await;
+
+        farm.rejected(got, RejectReason::TooLarge).await;
+        farm.nothing_indexed();
+        if what == "pack" {
+            assert!(
+                farm.rig.store.ranges().is_empty(),
+                "{what}: nothing was read"
+            );
+        }
+    }
+}
+
+/// Asserts that a record at offset 0 over 4 MiB is refused without being read: the only ranges
+/// asked of the store are in the footer (the trailer and the footer), none in the records.
+/// Catches a manifest buffered whole before its size is checked.
+#[tokio::test]
+async fn a_manifest_over_four_mebibytes_is_too_large_and_unread() {
+    let farm = Farm::new().await;
+    let manifest = vec![b'x'; (4 << 20) + 1];
+    let bytes = segment_of(&[&manifest]);
+    let records = bytes.len() as u64 - footer_len(1);
+    farm.put(&bytes).await;
+
+    let got = farm.ingest().await;
+
+    farm.rejected(got, RejectReason::TooLarge).await;
+    let asked = farm.rig.store.ranges();
+    assert!(!asked.is_empty());
+    for (_, offset, _) in asked {
+        assert!(offset >= records, "a record was read at {offset}");
+    }
+}
+
+/// Asserts that a layout that is not records back to back from 0 is `Malformed`, before a
+/// record is read: a record of no bytes, a gap between records, an overlap, and a footer or a
+/// trailer that is damaged.
+#[tokio::test]
+async fn a_pack_that_is_not_laid_out_is_malformed() {
+    let farm = Farm::new().await;
+    let manifest = farm.manifest(0).to_json().expect("json");
+    let m = manifest.len() as u64;
+    let blob_bytes = blob(OBJECT).1;
+    let with = |gap: &[u8]| [&manifest[..], gap, &blob_bytes[..]].concat();
+    let zero = forged(&manifest, &[entry_of(&manifest, 0), entry_of(b"", m)]);
+    let gap = forged(
+        &with(&[0; 3]),
+        &[entry_of(&manifest, 0), entry_of(&blob_bytes, m + 3)],
+    );
+    let overlap = forged(
+        &with(&[]),
+        &[entry_of(&manifest, 0), entry_of(&blob_bytes, m - 2)],
+    );
+    let honest = farm.pack(0);
+    let mut in_footer = honest.clone();
+    let last = in_footer.len() - 40;
+    in_footer[last] ^= 0xff;
+    let mut in_trailer = honest;
+    let end = in_trailer.len() - 1;
+    in_trailer[end] ^= 0xff;
+    for bytes in [zero, gap, overlap, in_footer, in_trailer] {
+        let farm = Farm::new().await;
+        farm.put(&bytes).await;
+
+        let got = farm.ingest().await;
+
+        farm.rejected(got, RejectReason::Malformed).await;
+        farm.nothing_indexed();
+    }
+}
+
+/// Asserts that a record whose bytes are not its digest is a `HashMismatch` and indexes nothing:
+/// a flipped byte in a blob, and in the manifest itself. Catches a record taken on the word of
+/// the footer.
+#[tokio::test]
+async fn a_record_that_is_not_its_digest_is_a_hash_mismatch() {
+    let probe = Farm::new().await;
+    let honest = probe.pack(0);
+    let manifest_len = probe.manifest(0).to_json().expect("json").len();
+    for at in [manifest_len + 3, 5] {
+        let farm = Farm::new().await;
+        let mut bytes = honest.clone();
+        bytes[at] ^= 0xff;
+        farm.put(&bytes).await;
+
+        let got = farm.ingest().await;
+
+        farm.rejected(got, RejectReason::HashMismatch).await;
+        farm.nothing_indexed();
+    }
+}
+
+/// Asserts that a record at offset 0 that is not a valid manifest is `BadManifest`: not JSON, and
+/// JSON with a field the manifest does not have.
+#[tokio::test]
+async fn a_record_at_offset_zero_that_is_not_a_manifest_is_bad() {
+    let junk: [&[u8]; 2] = [b"not json at all", br#"{"version":1,"surprise":true}"#];
+    for text in junk {
+        let farm = Farm::new().await;
+        farm.put(&segment_of(&[text, OBJECT.as_bytes()])).await;
+
+        let got = farm.ingest().await;
+
+        farm.rejected(got, RejectReason::BadManifest).await;
+        farm.nothing_indexed();
+    }
+}
+
+/// Asserts that a manifest that names a digest the pack has no record for (an output file, stdout,
+/// a tree) is `Incomplete` and nothing is indexed; and that a tree that names a file the pack does
+/// not hold is `Incomplete` too, and a tree that does not decode is a `BadManifest`.
+#[tokio::test]
+async fn a_manifest_naming_a_digest_outside_the_pack_is_incomplete() {
+    let farm = Farm::new().await;
+    let (object, stdout, in_dir) = (blob(OBJECT).1, blob(STDOUT).1, blob(IN_DIR).1);
+    let tree = farm.tree().1;
+    let elsewhere = blob("held nowhere").0;
+    let mut no_stdout = farm.manifest(0);
+    no_stdout.stdout = Some(elsewhere);
+    let mut no_file = farm.manifest(0);
+    no_file.output_files[0].digest = elsewhere;
+    let mut no_tree = farm.manifest(0);
+    no_tree.output_directories[0].tree = elsewhere;
+    for manifest in [no_stdout, no_file, no_tree] {
+        let farm = Farm::new().await;
+        let blobs: [&[u8]; 4] = [&object, &stdout, &tree, &in_dir];
+        farm.put(&write_pack(&manifest, &blobs).expect("a pack"))
+            .await;
+
+        let got = farm.ingest().await;
+
+        farm.rejected(got, RejectReason::Incomplete).await;
+        farm.nothing_indexed();
+    }
+    let hollow = tree_of(&[blob(IN_DIR).0, elsewhere]);
+    let junk = blob("not a Tree \u{ff}\u{ff}");
+    let cases = [
+        (hollow, RejectReason::Incomplete),
+        (junk, RejectReason::BadManifest),
+    ];
+    for ((digest, bytes), reason) in cases {
+        let farm = Farm::new().await;
+        let mut manifest = farm.manifest(0);
+        manifest.output_directories[0].tree = digest;
+        let blobs: [&[u8]; 4] = [&object, &stdout, &bytes, &in_dir];
+        farm.put(&write_pack(&manifest, &blobs).expect("a pack"))
+            .await;
+
+        let got = farm.ingest().await;
+
+        farm.rejected(got, reason).await;
+    }
+}
+
+/// Asserts that a store or an index that fails is `Unavailable`, counted as neither a refusal nor
+/// an ingest, and that the same key ingests once they answer: a length that fails, a read that
+/// fails, an index that cannot record.
+#[tokio::test]
+async fn a_failing_store_or_index_is_unavailable_and_retried_on_the_same_key() {
+    for what in ["len", "read", "record"] {
+        let farm = Farm::new().await;
+        farm.put(&farm.pack(0)).await;
+        match what {
+            "len" => farm.rig.store.reject_lens(1),
+            "read" => farm.rig.store.reject_reads(1),
+            _ => farm.rig.index.fail_record(1),
+        }
+
+        let got = farm.ingest().await;
+
+        assert!(matches!(got, Ingested::Unavailable(_)), "{what}: {got:?}");
+        let metrics = farm.rig.packs.metrics();
+        for each in RejectReason::ALL {
+            assert_eq!(metrics.ingest_rejects(each), 0, "{what}: {each:?}");
+        }
+        assert_eq!(metrics.ingests(), 0);
+        assert_eq!(metrics.ingest_unavailable(), 1, "{what}");
+        let again = farm.ingest().await;
+        assert!(
+            matches!(again, Ingested::Ran { cached: true, .. }),
+            "{what}: {again:?}"
+        );
+    }
+}
+
+/// Asserts that the scrape carries the ingest counts: the ingests, and the refusals by reason
+/// with every label present.
+#[tokio::test]
+async fn ingests_are_scraped_by_reason() {
+    let farm = Farm::new().await;
+    let scrape = || {
+        let mut text = String::new();
+        farm.rig.packs.render_metrics(&mut text);
+        text
+    };
+    let before = scrape();
+    assert!(before.contains("kbf_pack_ingests_total 0\n"), "{before}");
+    for reason in RejectReason::ALL {
+        let line = format!(
+            "kbf_pack_ingest_rejects_total{{reason=\"{}\"}} 0\n",
+            reason.label()
+        );
+        assert!(before.contains(&line), "{line}in {before}");
+    }
+    assert!(
+        before.contains("kbf_pack_ingest_unavailable_total 0\n"),
+        "{before}"
+    );
+
+    let missing = farm.ingest().await;
+    assert_eq!(missing, Ingested::Reject(RejectReason::Missing));
+    farm.put(&farm.pack(0)).await;
+    farm.ingest().await;
+
+    let after = scrape();
+    assert!(after.contains("kbf_pack_ingests_total 1\n"), "{after}");
+    let line = "kbf_pack_ingest_rejects_total{reason=\"missing\"} 1\n";
+    assert!(after.contains(line), "{after}");
+}
+
+fn mint() -> PackKeyMint {
+    PackKeyMint::new(SECRET).expect("a mint")
+}
+
+fn action() -> Digest {
+    blob("an action").0
+}
+
+/// Asserts that minting is deterministic and that each input changes the key: the lease, the
+/// action, the minute and the secret; and that two times in one minute are one key.
+#[test]
+fn minting_is_deterministic_and_each_input_changes_the_key() {
+    let key = |mint: &PackKeyMint, lease: &str, action: &Digest, at: SystemTime| {
+        mint.mint(lease, action, at)
+            .expect("a key")
+            .key()
+            .to_owned()
+    };
+    let base = key(&mint(), LEASE, &action(), now());
+
+    assert_eq!(base, key(&mint(), LEASE, &action(), now()));
+    let same_minute = now() + Duration::from_secs(59);
+    assert_eq!(base, key(&mint(), LEASE, &action(), same_minute));
+    let next_minute = now() + Duration::from_secs(60);
+    let other_secret = PackKeyMint::new(&[9; 32]).expect("a mint");
+    let changed = [
+        key(&mint(), "another", &action(), now()),
+        key(&mint(), LEASE, &blob("other").0, now()),
+        key(&mint(), LEASE, &action(), next_minute),
+        key(&other_secret, LEASE, &action(), now()),
+    ];
+    for other in &changed {
+        assert_ne!(&base, other);
+    }
+    assert!(base.starts_with(&format!("cas/b/{LEASE}/")), "{base}");
+    assert!(base.ends_with("-0"), "{base}");
+}
+
+/// Asserts that a minted key verifies and says the minute it was minted in (the start of it), and
+/// that a key with another action, another secret or a changed MAC does not verify, nor does a key
+/// of another shape. Catches a verification that compares less than the whole MAC.
+#[test]
+fn a_minted_key_verifies_and_names_its_minute() {
+    let key = mint()
+        .mint(LEASE, &action(), now() + Duration::from_secs(7))
+        .expect("a key");
+
+    assert_eq!(mint().verify(&key, &action()).expect("minted here"), now());
+
+    let other_secret = PackKeyMint::new(&[9; 32]).expect("a mint");
+    let nonce = key.key().rsplit('/').next().expect("a nonce");
+    let digit = if nonce.starts_with('0') { "1" } else { "0" };
+    let flipped = format!("{digit}{}", &nonce[1..]);
+    let keys = [
+        (key.clone(), blob("other").0, &mint()),
+        (key.clone(), action(), &other_secret),
+        (
+            IssuedPackKey::new(LEASE, &flipped).expect("a key"),
+            action(),
+            &mint(),
+        ),
+        (
+            IssuedPackKey::new(LEASE, "n0nce1").expect("a key"),
+            action(),
+            &mint(),
+        ),
+    ];
+    for (key, action, mint) in keys {
+        let refused = mint.verify(&key, &action).expect_err("not minted here");
+        assert!(matches!(refused, MintError::NotMinted(_)), "{refused:?}");
+    }
+}
+
+/// Asserts what minting refuses: a secret under the least, a clock before the epoch, a time past
+/// the last minute a key can name, and a lease that cannot be a build; and that the secret is not
+/// in the mint's Debug text.
+#[test]
+fn a_mint_refuses_what_cannot_be_a_key_and_hides_its_secret() {
+    let short = PackKeyMint::new(&[1; MIN_SECRET_BYTES - 1]).err();
+    assert_eq!(short, Some(MintError::ShortSecret(MIN_SECRET_BYTES - 1)));
+    let before = UNIX_EPOCH - Duration::from_secs(1);
+    assert_eq!(
+        mint().mint(LEASE, &action(), before).err(),
+        Some(MintError::Clock)
+    );
+    let far = UNIX_EPOCH + Duration::from_secs(60 * (1 << 32));
+    let past = mint()
+        .mint(LEASE, &action(), far)
+        .expect_err("past the last minute");
+    assert!(matches!(past, MintError::Key(_)), "{past:?}");
+    let bad = mint()
+        .mint("not/a/build", &action(), now())
+        .expect_err("a bad lease");
+    assert!(matches!(bad, MintError::Key(_)), "{bad:?}");
+    let debug = format!("{:?}", mint());
+    assert!(!debug.contains("0123456789abcdef"), "{debug}");
+}

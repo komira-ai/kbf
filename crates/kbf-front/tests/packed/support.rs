@@ -57,6 +57,7 @@ pub struct Spy {
     claims: Capabilities,
     reject_puts: AtomicU32,
     reject_reads: AtomicU32,
+    reject_lens: AtomicU32,
     puts: AtomicU32,
     ranges: Mutex<Vec<(String, u64, u64)>>,
 }
@@ -91,6 +92,7 @@ impl Spy {
             claims,
             reject_puts: AtomicU32::new(0),
             reject_reads: AtomicU32::new(0),
+            reject_lens: AtomicU32::new(0),
             puts: AtomicU32::new(0),
             ranges: Mutex::new(Vec::new()),
         }
@@ -104,6 +106,11 @@ impl Spy {
     /// The next `n` range reads fail (after they are logged).
     pub fn reject_reads(&self, n: u32) {
         self.reject_reads.store(n, SeqCst);
+    }
+
+    /// The next `n` length questions fail.
+    pub fn reject_lens(&self, n: u32) {
+        self.reject_lens.store(n, SeqCst);
     }
 
     /// How many writes were tried.
@@ -177,6 +184,13 @@ impl ObjectStore for Spy {
 
     async fn may_hold(&self, key: &ObjectKey) -> Result<bool, ObjectStoreError> {
         self.inner.may_hold(key).await
+    }
+
+    async fn len(&self, key: &ObjectKey) -> Result<Option<u64>, ObjectStoreError> {
+        if fires(&self.reject_lens) {
+            return Err(injected());
+        }
+        self.inner.len(key).await
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {

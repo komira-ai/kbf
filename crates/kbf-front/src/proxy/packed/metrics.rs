@@ -103,6 +103,24 @@ const UNTRUSTED_REASONS: [&str; 6] = [
 ];
 
 impl PackMetrics {
+    /// Packs ingested into a result (stub).
+    #[must_use]
+    pub fn ingests(&self) -> u64 {
+        0
+    }
+
+    /// Ingests that were refused for `reason` (stub).
+    #[must_use]
+    pub fn ingest_rejects(&self, _reason: super::RejectReason) -> u64 {
+        0
+    }
+
+    /// Ingests the store could not answer (stub).
+    #[must_use]
+    pub fn ingest_unavailable(&self) -> u64 {
+        0
+    }
+
     /// The bytes reserved for the uploads in flight now.
     #[must_use]
     pub fn inflight_bytes(&self) -> u64 {
