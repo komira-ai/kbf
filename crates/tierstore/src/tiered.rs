@@ -161,7 +161,7 @@ fn refuse_reserved(key: &str) -> Result<(), Error> {
 /// at most every [`ProxyConfig::usage_refresh`]); a usage that is missing, unreadable or
 /// older than [`ProxyConfig::usage_stale_after`] counts as not full (a dead reconciler thus
 /// leaves puts unrestrained: [`Proxy::usage_age`] is how a caller sees it, and the server's
-/// `/readyz` reports it). Above
+/// `/usagez` reports it). Above
 /// [`ProxyConfig::critical`] of the budget a put waits [`ProxyConfig::back_pressure`] first.
 /// At the budget, or when the hot tier answers a put (of the object, or of the journal object
 /// that holds its entry) with [`Error::Full`], puts go straight to the cold tier, create-only

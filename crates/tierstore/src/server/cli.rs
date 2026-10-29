@@ -89,7 +89,7 @@ const S3_MIN_BODY_RATE: Option<NonZeroU64> = NonZeroU64::new(1 << 20);
 #[derive(Clone, Debug, Parser)]
 #[command(name = "tierstore", version)]
 pub struct Cli {
-    /// The address the S3 API, `/healthz` and `/readyz` are served on.
+    /// The address the S3 API, `/healthz`, `/readyz` and `/usagez` are served on.
     #[arg(long)]
     pub listen: SocketAddr,
     /// The id of this proxy, which names its journal in the hot tier and its lease. Keep it
@@ -196,8 +196,8 @@ pub struct Cli {
     /// How often the reconciler works: shorter than `--lease-ttl`.
     #[arg(long, default_value = "5s", value_parser = parse_duration)]
     pub reconcile_interval: Duration,
-    /// How old the usage the reconciler publishes may be before `/readyz` says 503 with the
-    /// reason: a number and `ms`, `s`, `m` or `h`, longer than `--lease-ttl`, so that a
+    /// How old the usage the reconciler publishes may be before `/usagez` says 503 with the
+    /// reason (`/readyz` does not look at it): a number and `ms`, `s`, `m` or `h`, longer than `--lease-ttl`, so that a
     /// reconciler that takes over the lease does not show. A usage that is older than 30 seconds
     /// is ignored by the puts as if the hot tier were not full, so a reconciler that has stopped
     /// would otherwise show nowhere; the puts are not refused. A process that has run this long
@@ -379,7 +379,7 @@ fn build(cli: &Cli) -> Result<Built, Error> {
     if cli.usage_stale_after <= cli.lease_ttl {
         return Err("--usage-stale-after must be longer than --lease-ttl".into());
     }
-    if matches!(cli.bucket.as_str(), "healthz" | "readyz") {
+    if matches!(cli.bucket.as_str(), "healthz" | "readyz" | "usagez") {
         let name = &cli.bucket;
         return Err(format!("--bucket {name:?} is the name of a probe path").into());
     }

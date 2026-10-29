@@ -92,12 +92,15 @@
 //! `GET /healthz` is 200 while the process runs. `GET /readyz` is 200 until the drain begins and
 //! 503 after. Neither is signed, so a bucket cannot have either name.
 //!
-//! Where [`ServerConfig::proxy`] is set, `/readyz` is also 503, with the reason as its body, while
-//! the usage object that the reconciler publishes (`_tiering/usage`) is older than
-//! [`ServerConfig::usage_stale_after`]. The puts ignore a stale usage, as if the hot tier were not
-//! full, so a stopped reconciler would otherwise show nowhere. A usage object that is missing is
-//! judged the same way by the time the server has run, so that a server that starts before the
-//! first pass of the reconciler is ready for that long. The puts are not refused.
+//! `GET /usagez`, for alerting and not for a load balancer, is 200 with the age of the usage
+//! object that the reconciler publishes (`_tiering/usage`), and 503 with the reason once that
+//! object is older than [`ServerConfig::usage_stale_after`]. The puts ignore a stale usage, as if
+//! the hot tier were not full, so a stopped reconciler would otherwise show nowhere. A usage
+//! object that is missing is judged by the time the server has run, so that a server that starts
+//! before the first pass of the reconciler is 200 for that long. `/readyz` does not look at the
+//! usage (one stopped reconciler would make every node unready), and the puts are not refused.
+//! Without [`ServerConfig::proxy`] it is 200 and says the usage is not watched. A bucket cannot
+//! be called `usagez` either.
 //!
 //! # Drain
 //!
@@ -216,10 +219,10 @@ pub struct ServerConfig {
     /// How long the server waits for requests in flight, and for the answers it is sending, after
     /// it began refusing new requests.
     pub drain_deadline: Duration,
-    /// The proxy whose usage object `/readyz` judges: none by default, and then `/readyz` says
-    /// nothing of the usage. The binary sets the proxy it serves.
+    /// The proxy whose usage object `/usagez` judges: none by default, and then `/usagez` says
+    /// the usage is not watched. The binary sets the proxy it serves.
     pub proxy: Option<Arc<Proxy>>,
-    /// The age of the usage object past which `/readyz` says 503. A server that has run this
+    /// The age of the usage object past which `/usagez` says 503. A server that has run this
     /// long without finding any usage object is judged the same way. Longer than the lease and
     /// the pass interval of the reconciler, so that a takeover of the lease does not show.
     pub usage_stale_after: Duration,
@@ -592,34 +595,41 @@ impl Server {
         let read = matches!(parts.method, Method::GET | Method::HEAD);
         let (status, text) = match (read, parts.uri.path(), self.is_ready()) {
             (true, "/healthz", _) => (StatusCode::OK, "ok".to_owned()),
-            (true, "/readyz", true) => self.readiness().await,
+            (true, "/readyz", true) => (StatusCode::OK, "ready".to_owned()),
             (true, "/readyz", false) => (StatusCode::SERVICE_UNAVAILABLE, "draining".to_owned()),
+            (true, "/usagez", _) => self.usage_probe().await,
             _ => return None,
         };
         let headers = [("content-type", "text/plain".to_owned())];
         Some(answer(status, &headers, Bytes::from(text)))
     }
 
-    /// The answer of `/readyz` to a server that is not draining: 503 and the reason if the usage
-    /// object of the reconciler is older than the limit.
-    async fn readiness(&self) -> (StatusCode, String) {
-        let ready = (StatusCode::OK, "ready".to_owned());
+    /// The answer of `/usagez`: 200 and the age of the usage object of the reconciler while it is
+    /// within the limit, 503 and the reason once it is older, or missing for longer than the
+    /// limit since the server started. It does not depend on the drain.
+    async fn usage_probe(&self) -> (StatusCode, String) {
         let Some(proxy) = &self.config.proxy else {
-            return ready;
+            return (StatusCode::OK, "usage not watched".to_owned());
         };
         let limit = self.config.usage_stale_after;
         let published = proxy.usage_age().await;
         let since_start = self.config.clock.now().saturating_sub(self.started);
         let age = published.unwrap_or(Duration::from_millis(since_start));
-        if age <= limit {
-            return ready;
-        }
         let (secs, max) = (age.as_secs(), limit.as_secs());
-        let text = if published.is_some() {
-            format!("usage of the hot tier is stale: published {secs}s ago, limit {max}s")
-        } else {
-            format!("usage of the hot tier is missing: none published in {secs}s, limit {max}s")
-        };
-        (StatusCode::SERVICE_UNAVAILABLE, text)
+        let down = StatusCode::SERVICE_UNAVAILABLE;
+        match (age <= limit, published.is_some()) {
+            (true, true) => (StatusCode::OK, format!("usage published {secs}s ago")),
+            (true, false) => (StatusCode::OK, format!("no usage yet, {secs}s since start")),
+            (false, true) => (
+                down,
+                format!("usage of the hot tier is stale: published {secs}s ago, limit {max}s"),
+            ),
+            (false, false) => (
+                down,
+                format!(
+                    "usage of the hot tier is missing: none published in {secs}s, limit {max}s"
+                ),
+            ),
+        }
     }
 }
