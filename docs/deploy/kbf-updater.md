@@ -262,6 +262,11 @@ before it worked:
    and no blob is known to be owed a copy, read from the frontend's
    `GET /v1/nodes/{id}/storage-health`; a daemon is connected on it) of X, held drained, for at
    most `--health-timeout-secs`, and never past the helper's deadline less ten seconds.
+   A daemon is connected to one frontend only, and `--frontend` is the load balancer's name,
+   which picks a frontend per connection: a frontend that does not hold the node answers
+   "not connected" (or 404). The agent therefore asks up to 8 times, each on a new connection,
+   and takes the first answer that says connected; it reports "is not connected" only when
+   none does. A client with `--operator-api` reaches one frontend and asks once.
 5. **Confirm** X if it is healthy. If it is not, **revert**: the helper does that by itself at its
    deadline whatever this process is doing; the agent asks for it at once.
 6. **Undrain** only if the node is healthy: on X after a confirm, or on the release that ran

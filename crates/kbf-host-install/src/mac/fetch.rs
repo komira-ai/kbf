@@ -357,8 +357,8 @@ impl Fetcher<'_> {
         match self.runner.run(&download) {
             Err(e) => failed(format!("gh release download: {e}")),
             Ok(exec) if !exec.success() => failed(format!(
-                "gh release download: exit status {:?}: {}",
-                exec.code,
+                "gh release download: {}: {}",
+                exec.ended(),
                 exec.stderr_text()
             )),
             Ok(_) => Ok(commit),
@@ -372,8 +372,8 @@ impl Fetcher<'_> {
         };
         if !exec.success() {
             return failed(format!(
-                "curl: exit status {:?}: {}",
-                exec.code,
+                "curl: {}: {}",
+                exec.ended(),
                 exec.stderr_text()
             ));
         }

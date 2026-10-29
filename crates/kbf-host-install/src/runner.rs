@@ -5,7 +5,7 @@
 //! only environment a child sees is [`PATH`], [`LANG`] and [`DEBIAN_FRONTEND`].
 
 use std::io::{self, Read, Write};
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
@@ -79,11 +79,23 @@ pub struct Cmd {
 pub struct Exec {
     /// The exit status, or none when a signal ended it.
     pub code: Option<i32>,
+    /// The signal that ended it, when one did (then `code` is none).
+    pub signal: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
 
 impl Exec {
+    /// How it ended, in words: `exit status 3`, `signal 13 (SIGPIPE)`, or, for a status that is
+    /// neither (not seen on Unix), `no exit status`.
+    pub fn ended(&self) -> String {
+        match (self.code, self.signal) {
+            (Some(code), _) => format!("exit status {code}"),
+            (None, Some(signal)) => format!("signal {signal} ({})", signal_name(signal)),
+            (None, None) => "no exit status".to_owned(),
+        }
+    }
+
     /// Whether it exited with status 0.
     pub fn success(&self) -> bool {
         self.code == Some(0)
@@ -97,6 +109,35 @@ impl Exec {
     /// Stderr as text, invalid bytes replaced.
     pub fn stderr_text(&self) -> String {
         String::from_utf8_lossy(&self.stderr).into_owned()
+    }
+}
+
+/// The name of a signal that ends a process on this platform, or `unnamed`. Numbers 7, 10 and
+/// 12 mean different signals on macOS and on Linux.
+pub fn signal_name(signal: i32) -> &'static str {
+    let mac = cfg!(target_os = "macos");
+    match signal {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        5 => "SIGTRAP",
+        6 => "SIGABRT",
+        7 if mac => "SIGEMT",
+        7 => "SIGBUS",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        10 if mac => "SIGBUS",
+        10 => "SIGUSR1",
+        11 => "SIGSEGV",
+        12 if mac => "SIGSYS",
+        12 => "SIGUSR2",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        24 => "SIGXCPU",
+        25 => "SIGXFSZ",
+        _ => "unnamed",
     }
 }
 
@@ -309,6 +350,7 @@ impl Runner for SystemRunner {
             |bytes: mpsc::Receiver<Vec<u8>>| bytes.recv_timeout(DRAIN_GRACE).unwrap_or_default();
         Ok(Exec {
             code: status.code(),
+            signal: status.signal(),
             stdout: collect(stdout),
             stderr: collect(stderr),
         })

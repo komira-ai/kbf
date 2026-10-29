@@ -47,6 +47,7 @@ fn the_unprivileged_process_relays_through_sudo() {
         let sim = fx.sim();
         *sim.sudo.borrow_mut() = Some(Ok(crate::runner::Exec {
             code: Some(status),
+            signal: None,
             stdout: line.into(),
             stderr: b"detail\n".to_vec(),
         }));
@@ -83,6 +84,7 @@ fn a_sudo_that_does_not_answer_is_a_failure_of_the_verb() {
             exec(1, "{\"result\":\"query\"}\n", ""),
             Ok(crate::runner::Exec {
                 code: None,
+                signal: None,
                 stdout: vec![],
                 stderr: vec![],
             }),

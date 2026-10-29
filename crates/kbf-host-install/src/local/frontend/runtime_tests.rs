@@ -28,6 +28,7 @@ impl Runner for Script {
 fn done(code: i32, stdout: &str, stderr: &str) -> io::Result<Exec> {
     Ok(Exec {
         code: Some(code),
+        signal: None,
         stdout: stdout.into(),
         stderr: stderr.into(),
     })
@@ -185,6 +186,7 @@ fn what_is_not_there_is_stopped_and_removed_already() {
 
     let (d, _) = docker(vec![Ok(Exec {
         code: None,
+        signal: None,
         stdout: Vec::new(),
         stderr: Vec::new(),
     })]);

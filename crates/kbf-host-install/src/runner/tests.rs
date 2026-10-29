@@ -72,6 +72,7 @@ fn stdin_is_closed() {
 fn exec_text_replaces_invalid_bytes() {
     let exec = Exec {
         code: Some(0),
+        signal: None,
         stdout: vec![b'a', 0xff],
         stderr: vec![0xfe, b'b'],
     };
@@ -439,4 +440,36 @@ fn a_chroot_drop_to_gid_zero_is_refused() {
     let kind = launch(&c, true).map_err(|e| e.kind());
     assert_eq!(kind, Err(std::io::ErrorKind::PermissionDenied));
     assert!(launch(&c, false).is_ok());
+}
+
+/// Catches a signal that ends a child being lost as a bare "no exit status": the real runner
+/// reports which signal ended a child that killed itself, and an exit is not a signal.
+#[test]
+fn a_child_ended_by_a_signal_reports_the_signal() {
+    let killed = SystemRunner
+        .run(&cmd("/bin/sh", &["-c", "kill -TERM $$"]))
+        .unwrap();
+    assert_eq!((killed.code, killed.signal), (None, Some(15)));
+    assert!(!killed.success());
+    assert_eq!(killed.ended(), "signal 15 (SIGTERM)");
+    let exited = SystemRunner.run(&cmd("/bin/sh", &["-c", "exit 3"])).unwrap();
+    assert_eq!((exited.code, exited.signal), (Some(3), None));
+    assert_eq!(exited.ended(), "exit status 3");
+}
+
+/// The words for how a command ended, from a fixed exit.
+#[test]
+fn ended_says_the_status_or_the_signal() {
+    let exec = |code, signal| Exec {
+        code,
+        signal,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    assert_eq!(exec(Some(0), None).ended(), "exit status 0");
+    assert_eq!(exec(None, Some(9)).ended(), "signal 9 (SIGKILL)");
+    assert_eq!(exec(None, Some(13)).ended(), "signal 13 (SIGPIPE)");
+    assert_eq!(exec(None, Some(11)).ended(), "signal 11 (SIGSEGV)");
+    assert_eq!(exec(None, Some(63)).ended(), "signal 63 (unnamed)");
+    assert_eq!(exec(None, None).ended(), "no exit status");
 }
