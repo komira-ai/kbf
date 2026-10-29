@@ -216,7 +216,7 @@ fn the_defaults_are_the_executors_own() {
 /// each is refused at the flags, naming the flag.
 #[test]
 fn settings_that_are_not_what_they_name_are_refused_naming_the_flag() {
-    let cases: [(&[&str], &str); 11] = [
+    let cases: [(&[&str], &str); 12] = [
         (&["--executor-lease-url=ftp://x"], "--executor-lease-url"),
         (
             &["--executor-lease-url=http://lease.example:80"],
@@ -244,6 +244,7 @@ fn settings_that_are_not_what_they_name_are_refused_naming_the_flag() {
             "--executor-task-tool",
         ),
         (&["--executor-root-der=dir/ca.der"], "--executor-root-der"),
+        (&["--executor-root-der="], "--executor-root-der"),
         (&["--executor-root-der=.."], "--executor-root-der"),
         (&["--executor-work-dir=scratch"], "--executor-work-dir"),
     ];

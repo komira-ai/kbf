@@ -289,6 +289,11 @@ async fn a_write_is_found_by_its_key_and_a_stranger_gets_none() {
     let other = PackKey::new("cas/b/7-4/bb-0");
     let refused = rig.front.put_url("node1", &other, wall, 1).await;
     assert!(matches!(refused, Err(PresignError::Refused(_))));
+    let grant = rig
+        .front
+        .read_grant(LeaseId::new(7, 4), &action_digest(), wall)
+        .await;
+    assert!(matches!(grant, Err(InputsError::Unavailable(_))));
     assert_eq!(rig.front.parked().len(), 1, "the prepared run is kept");
 }
 

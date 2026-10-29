@@ -129,9 +129,7 @@ pub use self::pack_flags::{PackFlagError, PackFlags};
 use crate::drain::Drain;
 use crate::enroll::flags::EnrollFlags;
 use crate::enroll::start as enroll_start;
-use crate::executor::{
-    Executor, Front, FrontParts, Metrics as ExecutorMetrics, RunSource, Running,
-};
+use crate::executor::{Executor, Metrics as ExecutorMetrics, RunSource, Running};
 use crate::farm::Farm;
 use crate::front_maps::FrontMaps;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
@@ -1242,13 +1240,7 @@ fn executor_of(
         "--executor js-agent: this frontend was started without the preparation of task runs \
          (the key mint, the presigned write and the read grant)",
     )?;
-    let front = Front::new(FrontParts {
-        packs: packs.clone(),
-        backend: backend.clone(),
-        mint: source.mint,
-        prepare: source.prepare,
-        images_have_no_entrypoint: js.images_have_no_entrypoint,
-    });
+    let front = js.front(packs.clone(), backend.clone(), source);
     let metrics = Arc::new(ExecutorMetrics::default());
     let executor = js.build(Arc::clone(farm), Arc::new(front), Arc::clone(&metrics))?;
     Ok(Some(ExecutorParts { executor, metrics }))

@@ -17,7 +17,7 @@ use crate::executor::Executor;
 /// An executor stepping in a task of its own.
 pub struct Running {
     stop: watch::Sender<bool>,
-    failed: Option<oneshot::Receiver<String>>,
+    failed: oneshot::Receiver<String>,
     task: JoinHandle<()>,
 }
 
@@ -29,22 +29,15 @@ impl Running {
         let (stop, stopped) = watch::channel(false);
         let (fail, failed) = oneshot::channel();
         let task = tokio::spawn(drive(executor, stopped, fail));
-        Self {
-            stop,
-            failed: Some(failed),
-            task,
-        }
+        Self { stop, failed, task }
     }
 
-    /// Why the executor stopped by itself: completes if it did, never if it runs on or was
-    /// stopped.
+    /// Why the executor stopped by itself: completes if it did, never while it runs on.
     pub async fn failed(&mut self) -> String {
-        match self.failed.as_mut() {
-            Some(failed) => match failed.await {
-                Ok(why) => why,
-                Err(_) => std::future::pending().await,
-            },
-            None => std::future::pending().await,
+        match (&mut self.failed).await {
+            Ok(why) => why,
+            // The task ended with no reason given: it broke.
+            Err(_) => "the executor's task ended without a reason".to_owned(),
         }
     }
 
@@ -84,4 +77,36 @@ async fn drive(
         }
     }
     executor.shutdown().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn running(task: JoinHandle<()>) -> (Running, oneshot::Sender<String>) {
+        let (stop, _stopped) = watch::channel(false);
+        let (fail, failed) = oneshot::channel();
+        (Running { stop, failed, task }, fail)
+    }
+
+    /// Catches a task that ends with nothing said being waited on for ever: the frontend that
+    /// is told it ended stops with an error instead of serving without its executor.
+    #[tokio::test]
+    async fn a_task_that_ended_without_a_reason_is_told_as_such() {
+        let (mut running, fail) = running(tokio::spawn(async {}));
+        drop(fail);
+        assert_eq!(
+            running.failed().await,
+            "the executor's task ended without a reason"
+        );
+        running.stop().await;
+    }
+
+    /// Catches a task that broke taking the stop down with it: the stop returns, and the break
+    /// is in the log.
+    #[tokio::test]
+    async fn a_task_that_broke_does_not_stop_the_stop() {
+        let (running, _fail) = running(tokio::spawn(async { panic!("the executor broke") }));
+        running.stop().await;
+    }
 }

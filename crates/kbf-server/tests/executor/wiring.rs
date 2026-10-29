@@ -24,7 +24,7 @@ use kbf_proto::reapi::{Action, Command, Platform};
 use kbf_sched::Request;
 use kbf_server::Farm;
 use kbf_server::executor::{
-    Front, FrontParts, Metrics, PrepareError, PreparedRun, RunPrepare, Running, Secret,
+    Metrics, PrepareError, PreparedRun, RunPrepare, RunSource, Running, Secret,
 };
 use kbf_server::frontend;
 use kbf_state::ManualClock;
@@ -170,13 +170,12 @@ async fn an_action_runs_end_to_end_through_the_flags_and_the_frontends_own_seams
         mint: PackKeyMint::new(SECRET).expect("a mint"),
         asked: Mutex::new(Vec::new()),
     });
-    let front = Front::new(FrontParts {
-        packs: packs.clone(),
-        backend: Backend::remote_over(storage, Some(packs)),
+    let source = RunSource {
         mint: PackKeyMint::new(SECRET).expect("a mint"),
         prepare: preparing.clone(),
-        images_have_no_entrypoint: js.images_have_no_entrypoint,
-    });
+    };
+    let backend = Backend::remote_over(storage, Some(packs.clone()));
+    let front = js.front(packs, backend, source);
 
     let farm = Arc::new(Farm::new(
         Arc::new(Cache::memory()),

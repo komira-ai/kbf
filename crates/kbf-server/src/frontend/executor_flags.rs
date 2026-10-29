@@ -25,10 +25,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Arg, ArgAction, ArgMatches};
+use kbf_front::{Backend, Packs};
 use kbf_lease_client::{Client, Origin, Token};
 
 use crate::Farm;
-use crate::executor::{Clock, Config, Deps, Executor, ExecutorKind, Front, Metrics};
+use crate::executor::{
+    Clock, Config, Deps, Executor, ExecutorKind, Front, FrontParts, Metrics, RunSource,
+};
 
 const KIND: &str = "executor";
 const FRONTEND: &str = "executor_frontend_id";
@@ -440,7 +443,7 @@ fn tool_mount(path: &str) -> Result<kbf_lease_client::Mount, String> {
         .strip_prefix("/mnt/")
         .and_then(|rest| rest.split_once('/'))
         .ok_or_else(refuse)?;
-    let plain = |part: &str| !part.is_empty() && part != "." && part != ".." && !part.contains('/');
+    let plain = |part: &str| !part.is_empty() && part != "." && part != "..";
     if !plain(root) || !rel.split('/').all(plain) {
         return Err(refuse());
     }
@@ -452,6 +455,19 @@ fn tool_mount(path: &str) -> Result<kbf_lease_client::Mount, String> {
 }
 
 impl JsAgentFlags {
+    /// The executor's seams over the frontend's own `packs`, CAS `backend` (built over the same
+    /// packs) and `source` of keys, writes and grants.
+    #[must_use]
+    pub fn front(&self, packs: Packs, backend: Backend, source: RunSource) -> Front {
+        Front::new(FrontParts {
+            packs,
+            backend,
+            mint: source.mint,
+            prepare: source.prepare,
+            images_have_no_entrypoint: self.images_have_no_entrypoint,
+        })
+    }
+
     /// The client of the lease server these flags describe. Nothing is sent: the server is
     /// first contacted when the executor is stepped.
     ///

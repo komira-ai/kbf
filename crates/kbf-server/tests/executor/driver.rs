@@ -127,3 +127,41 @@ async fn a_list_that_cannot_be_read_is_no_rival() {
     assert_eq!(live(&rig).await.len(), 1, "and it holds its host");
     running.stop().await;
 }
+
+/// Catches leases that are not another frontend's being taken for one: a lease of another
+/// frontend that has been released, a lease with no frontend label at all, and the frontend's
+/// own are no rival, and the driver goes on and leases its host.
+#[tokio::test(start_paused = true)]
+async fn leases_that_are_not_a_live_lease_of_another_frontend_are_no_rival() {
+    let rig = Rig::start(&["node1", "node2", "node3"], 1, |_| {}).await;
+    let resources = Resources {
+        cpu_millis: 2_000,
+        memory_bytes: 16 * GIB,
+        gpus: 0,
+        gpu_class: None,
+    };
+    let unlabelled = AcquireRequest::new("farm-linux", resources, rig.cfg.max_wall);
+    rig.api.acquire(&unlabelled).await.expect("booked");
+    book_for(&rig, "front-2").await;
+    let released = rig
+        .api
+        .leases()
+        .await
+        .expect("leases")
+        .into_iter()
+        .find(|l| l.labels.get("kbf-frontend").is_some_and(|v| v == "front-2"))
+        .expect("the booking");
+    rig.api.release(released.id).await.expect("released");
+
+    let mut running = Running::spawn(rig.restarted_executor());
+    pass(&rig, 10).await;
+    let failed = tokio::time::timeout(Duration::ZERO, running.failed()).await;
+    assert!(failed.is_err(), "no rival");
+    let ours = live(&rig)
+        .await
+        .into_iter()
+        .filter(|l| l.labels.get("kbf-frontend").is_some_and(|v| v == "front-1"))
+        .count();
+    assert_eq!(ours, 1);
+    running.stop().await;
+}
