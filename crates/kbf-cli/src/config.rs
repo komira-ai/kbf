@@ -279,6 +279,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "driver",
             "image",
             "native-term-grace-ms",
+            "no-input-cache",
             "orders-dir",
             "reconnect-max-ms",
             "reconnect-ms",

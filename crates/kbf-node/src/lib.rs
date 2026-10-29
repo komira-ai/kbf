@@ -34,7 +34,8 @@
 //! `/var/lib/kbf`; `data_dir`): `leases/`, and under the container driver and the
 //! native driver on macOS the input cache it links (container) or clones (native) each
 //! lease's input files from, and the shared input trees. Their budgets
-//! come from the filesystem, not from flags; `--data-max-bytes` only lowers them.
+//! come from the filesystem, not from flags; `--data-max-bytes` only lowers them, and
+//! `--no-input-cache` switches the cache and the trees off.
 //!
 //! With `--pack-read` (off by default; `pack_read`) the data plane of `kbf daemon` and of the
 //! daemon half of `kbf storage-and-daemon` with a frontend reads blobs from the packs of the

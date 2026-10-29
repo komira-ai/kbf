@@ -9,11 +9,21 @@ Every "today" claim cites a file on `main` at `d7f25cf` (#524). Every number mar
 `--tree-min-files`, `--tree-max-mounts` and `--scratch`. They are not flags any more: the
 daemon takes one directory, `--data-dir` (default `/var/lib/kbf`), holding `leases/` (what
 `--scratch` was), `cache/` (`--cache-dir`) and `trees/` (`--tree-dir`) on one filesystem,
-and one optional `--data-max-bytes`. The cache and the trees are on by default under the
+and two optional flags, `--data-max-bytes` and `--no-input-cache`. The cache and the trees are on by default under the
 container driver and the native driver on macOS, and their budgets come from the filesystem: the cache may keep half and
 the trees a quarter of its size less a floor of 5% (at least 1 GiB), and the cache's
 `--cache-min-free-bytes` is that floor. The link concurrency (64) and the trees' thresholds
-(256 files, 8 mounts) are constants. Read each flag below as the part of the data directory
+(256 files, 8 mounts) are constants.
+`--no-input-cache` (default off, `[daemon] no-input-cache` in `kbf.toml`) switches both off:
+the daemon makes no `cache/` and opens no `trees/`, leaves what an earlier start put there
+untouched, and logs `cache: off:--no-input-cache` and `trees: off:--no-input-cache`. Each
+action then fetches its inputs from the CAS into its own input root, as under a driver with no
+cache, with no hard link or clone from either directory, and the lease has no `InputStats`
+(no `cache_hits`, `cache_misses` or `inputs:` statistics line; the cached counters exist only
+with a cache). It is for measuring what host-level reuse of inputs saves; `--data-max-bytes`
+only shrinks the budgets. With `kbf all-in-one` or `kbf storage-and-daemon` it also ends the one cache
+shared with the storage half's hot store: the start logs `one cache: off`, and each half keeps
+what it keeps without the other. Read each flag below as the part of the data directory
 it names ([storage-node.md](../deploy/storage-node.md#the-daemons-data-directory)).
 
 This document covers four changes to how a kbf-daemon moves blobs:
