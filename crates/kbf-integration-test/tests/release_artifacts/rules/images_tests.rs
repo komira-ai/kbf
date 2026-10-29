@@ -359,9 +359,9 @@ fn the_task_image_is_built_twice_from_the_checked_binary_and_compared() {
         assert!(got.iter().any(|l| l.contains(wanted)), "{from}: {got:?}");
     };
     line(
+        "--binary \"target/$STATIC_TARGET/release/kbf-task\"",
         "--binary \"target/$TARGET/release/kbf-task\"",
-        "--binary \"target/$TARGET/release/kbf-updater\"",
-        "has --binary \"target/$TARGET/release/kbf-updater\", not `target/$TARGET/release/kbf-task`",
+        "has --binary \"target/$TARGET/release/kbf-task\", not `target/$STATIC_TARGET/release/kbf-task`",
     );
     line(
         "--commit \"$GITHUB_SHA\"",
@@ -390,7 +390,7 @@ fn the_task_image_is_built_twice_from_the_checked_binary_and_compared() {
         let got = found(&w);
         assert!(got.iter().any(|l| l.contains(&wanted)), "{name}: {got:?}");
     }
-    let check = "      - name: Task check\n        run: cargo xtask build-commit check \"target/$TARGET/release/kbf-task\" \"$GITHUB_SHA\"\n";
+    let check = "      - name: Task check\n        run: cargo xtask build-commit check \"target/$STATIC_TARGET/release/kbf-task\" \"$GITHUB_SHA\"\n";
     let without = good().replacen(check, "", 1);
     assert_ne!(without, good());
     assert!(
@@ -421,4 +421,43 @@ fn the_verify_job_checks_the_signed_task_image_with_the_commit_alone() {
     assert!(found(&w).iter().any(|l| l.contains(
         "does not run `cargo xtask pkg-image-asset --verify-only` on `dist/kbf-task-image-$GITHUB_SHA-linux-arm64.oci.tar`"
     )));
+}
+
+/// Asserts that the lint names a Linux job whose task runner is not the static build: the
+/// target not added, the build not made for it, or no check that the binary links no library.
+#[test]
+fn the_task_binary_is_built_for_the_static_target_and_checked_to_be_static() {
+    for platform in PACKAGES {
+        let steps = task_steps(platform);
+        for (name, what) in [
+            (
+                "Task target",
+                "`rustup target add \"$STATIC_TARGET\"` in a step before",
+            ),
+            (
+                "Task build",
+                "a `cargo build` of kbf-task `--target \"$STATIC_TARGET\"` in a step before",
+            ),
+            (
+                "Task static",
+                "a `readelf` check that kbf-task is statically linked in a step before",
+            ),
+        ] {
+            let start = steps
+                .find(&format!("      - name: {name}\n"))
+                .expect("step");
+            let end = start
+                + 1
+                + steps[start + 1..]
+                    .find("      - name:")
+                    .unwrap_or(steps.len() - start - 1);
+            let w = good().replacen(&steps, &format!("{}{}", &steps[..start], &steps[end..]), 1);
+            assert_ne!(w, good(), "{platform}: {name}");
+            let got = found(&w);
+            assert!(
+                got.iter().any(|l| l.contains(what)),
+                "{platform}: {name}: {got:?}"
+            );
+        }
+    }
 }

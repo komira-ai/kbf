@@ -11,7 +11,7 @@
 //!   [`ASSETS`] (binary and platform): `kbf`, `kbf-host-install` and `kbf-updater` for the
 //!   three platforms (a Mac runs the host agent), `kbf-installer` and `kbf-mac-provision` for macOS only (its Linux
 //!   package is the `kbf` package's now; a Mac is provisioned by `kbf-mac-provision`), `kbf-daemon`, `kbf-server`, `kbf-deploy`,
-//!   `kbf-signer` and `tierstore` for Linux, `kbf-deploy` for macOS (a Mac runs
+//!   `kbf-signer`, `tierstore` and `kbf-task` (a static musl build) for Linux, `kbf-deploy` for macOS (a Mac runs
 //!   `kbf daemon`; there is no darwin `kbf-daemon`). Each one's SBOM attestation is
 //!   [`crate::attested_assets`]' business, and its provenance bundle
 //!   [`crate::attested_bundles`]'.
@@ -91,6 +91,7 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-updater", "linux-x86_64"),
     ("kbf-signer", "linux-x86_64"),
     ("tierstore", "linux-x86_64"),
+    ("kbf-task", "linux-x86_64"),
     ("kbf", "linux-arm64"),
     ("kbf-daemon", "linux-arm64"),
     ("kbf-server", "linux-arm64"),
@@ -99,6 +100,7 @@ pub const ASSETS: &[(&str, &str)] = &[
     ("kbf-updater", "linux-arm64"),
     ("kbf-signer", "linux-arm64"),
     ("tierstore", "linux-arm64"),
+    ("kbf-task", "linux-arm64"),
 ];
 
 /// The binaries of [`ASSETS`] that name the commit they were built from (`<binary>
@@ -842,7 +844,7 @@ mod rules {
             )
         };
         format!(
-            "      - name: Task check\n        run: cargo xtask build-commit check \"target/$TARGET/release/kbf-task\" \"$GITHUB_SHA\"\n      - name: Task context\n        run: cp \"target/$TARGET/release/kbf-task\" target/task-image/kbf-task\n{}{}      - name: Task same\n        run: cmp target/task-image-out/1.oci.tar target/task-image-out/2.oci.tar\n      - name: Task asset\n        run: cargo xtask pkg-image-asset --service task --image target/task-image-out/1.oci.tar --platform {platform} --commit \"$GITHUB_SHA\" --binary \"target/$TARGET/release/kbf-task\" --out dist\n",
+            "      - name: Task target\n        run: rustup target add \"$STATIC_TARGET\"\n      - name: Task build\n        run: cargo build --locked --release --target \"$STATIC_TARGET\" -p kbf-task --bin kbf-task\n      - name: Task check\n        run: cargo xtask build-commit check \"target/$STATIC_TARGET/release/kbf-task\" \"$GITHUB_SHA\"\n      - name: Task static\n        run: test \"$(readelf -lWd \"target/$STATIC_TARGET/release/kbf-task\" | grep -c -e INTERP -e NEEDED || true)\" = 0\n      - name: Task context\n        run: cp \"target/$STATIC_TARGET/release/kbf-task\" target/task-image/kbf-task\n{}{}      - name: Task same\n        run: cmp target/task-image-out/1.oci.tar target/task-image-out/2.oci.tar\n      - name: Task asset\n        run: cargo xtask pkg-image-asset --service task --image target/task-image-out/1.oci.tar --platform {platform} --commit \"$GITHUB_SHA\" --binary \"target/$STATIC_TARGET/release/kbf-task\" --out dist\n",
             build(1),
             build(2)
         )

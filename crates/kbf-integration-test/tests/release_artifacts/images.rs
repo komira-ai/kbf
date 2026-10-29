@@ -2,8 +2,9 @@
 //! one of the update coordinator and one of the task runner for each Linux architecture,
 //! `kbf-<service>-image-<commit>-<platform>.oci.tar`. The frontend's is built from the `kbf` of
 //! the job's own tarball, the coordinator's and the task runner's (they have no tarball) from the
-//! `kbf-coordinator` and `kbf-task` the job built. No pull request run attests them, so a step that goes missing would turn `main` red or
-//! release an image nobody checked. [`rules`] reads the workflow and names a job that:
+//! `kbf-coordinator` and `kbf-task` the job built (the task runner's is the static musl build, which
+//! runs in any Linux image). No pull request run attests them, so a step that goes missing would
+//! turn `main` red or release an image nobody checked. [`rules`] reads the workflow and names a job that:
 //!
 //! - does not make an image an asset exactly once (`cargo xtask pkg-image-asset --service`,
 //!   [`PACKAGES`]), or makes it for another platform than its own;
@@ -64,7 +65,7 @@ const TASK: Service = Service {
     second: "target/task-image-out/2.oci.tar",
     context: "target/task-image",
     program: "kbf-task",
-    binary: "target/$TARGET/release/kbf-task",
+    binary: "target/$STATIC_TARGET/release/kbf-task",
 };
 
 impl Service {
@@ -272,6 +273,30 @@ fn build_job(
         _ => args(l, "cargo xtask build-commit check ")
             .is_some_and(|a| a.len() == 2 && a[0] == service.binary && a[1] == "$GITHUB_SHA"),
     });
+    if service.name == TASK.name {
+        // The task runner is mounted into the images of other actions, so it is the static build.
+        earlier(
+            "`rustup target add \"$STATIC_TARGET\"`",
+            first(&steps, 0, |l| l == "rustup target add \"$STATIC_TARGET\""),
+            out,
+        );
+        earlier(
+            "a `cargo build` of kbf-task `--target \"$STATIC_TARGET\"`",
+            first(&steps, 0, |l| {
+                l.starts_with("cargo build ")
+                    && l.contains("--target \"$STATIC_TARGET\"")
+                    && l.contains("-p kbf-task")
+            }),
+            out,
+        );
+        earlier(
+            "a `readelf` check that kbf-task is statically linked",
+            first(&steps, 0, |l| {
+                l.contains("readelf") && l.contains(service.binary)
+            }),
+            out,
+        );
+    }
     let (verb, of) = match service.name {
         "frontend" => ("check-asset", "the kbf tarball".to_owned()),
         _ => ("check", format!("the {}", service.program)),
@@ -305,7 +330,7 @@ fn verify_job(workflow: &str, out: &mut Vec<String>) -> Result<(), String> {
             let tarball = format!("dist/kbf-$GITHUB_SHA-{platform}.tar.gz");
             let found = first(&verify, 0, |l| {
                 args(l, VERB).is_some_and(|a| {
-                    // The coordinator and the task runner have no tarball and the verify job has not its binary.
+                    // The coordinator and the task runner have no image tarball and the verify job has not its binary.
                     let reference = match service.name {
                         "frontend" => flag(&a, "--kbf-tarball") == Some(tarball.as_str()),
                         _ => flag(&a, "--kbf-tarball").is_none() && flag(&a, "--binary").is_none(),

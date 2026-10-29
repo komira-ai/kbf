@@ -35,7 +35,7 @@ by `crates/kbf-integration-test/tests/release_artifacts`.
 
 ## What is built
 
-22 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
+24 tarballs, each with its SBOM and (once the push is attested) its provenance bundle
 ([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of `kbf`
 ([below](#the-kbf-package-deb)), one frontend, one update coordinator and one task runner container image per
 Linux architecture ([below](#the-frontend-and-coordinator-images-oci)) and one macOS package of `kbf-installer`
@@ -44,8 +44,8 @@ Linux architecture ([below](#the-frontend-and-coordinator-images-oci)) and one m
 | Asset | Runner | Target |
 |---|---|---|
 | `kbf-<commit>-darwin-arm64.tar.gz`, `kbf-deploy-<commit>-darwin-arm64.tar.gz`, `kbf-installer-<commit>-darwin-arm64.tar.gz`, `kbf-host-install-<commit>-darwin-arm64.tar.gz`, `kbf-updater-<commit>-darwin-arm64.tar.gz`, `kbf-mac-provision-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
-| `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz`, `kbf-host-install-<commit>-linux-x86_64.tar.gz`, `kbf-updater-<commit>-linux-x86_64.tar.gz`, `kbf-signer-<commit>-linux-x86_64.tar.gz`, `tierstore-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
-| `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz`, `kbf-host-install-<commit>-linux-arm64.tar.gz`, `kbf-updater-<commit>-linux-arm64.tar.gz`, `kbf-signer-<commit>-linux-arm64.tar.gz`, `tierstore-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
+| `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz`, `kbf-host-install-<commit>-linux-x86_64.tar.gz`, `kbf-updater-<commit>-linux-x86_64.tar.gz`, `kbf-signer-<commit>-linux-x86_64.tar.gz`, `tierstore-<commit>-linux-x86_64.tar.gz`, `kbf-task-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu`; `kbf-task` is built for `x86_64-unknown-linux-musl` |
+| `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz`, `kbf-host-install-<commit>-linux-arm64.tar.gz`, `kbf-updater-<commit>-linux-arm64.tar.gz`, `kbf-signer-<commit>-linux-arm64.tar.gz`, `tierstore-<commit>-linux-arm64.tar.gz`, `kbf-task-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu`; `kbf-task` is built for `aarch64-unknown-linux-musl` |
 
 `kbf` is the one binary with all five modes (`kbf --mode=daemon`, `kbf --mode=all-in-one`,
 `kbf --mode=storage`, and the two modes not built yet; [cluster.md](design/cluster.md) sections 1
@@ -81,6 +81,15 @@ the guide says. Each tarball holds one member, the binary under its own name. Th
 tarballs only, no package and no container image; it is taken by digest, verified, and placed like the
 two tools above. Its tarball holds one member, the binary under its own name.
 
+`kbf-task` is the runner of one build action inside a job (`crates/kbf-task`). Its Linux tarballs hold
+one member, the binary under its own name, built for the musl target of the architecture, so it is
+statically linked: it needs no libc of the image it runs in, and a host installs the one file into the
+directory it mounts read-only into the images of the actions it runs (the action's own image, with
+`kbf-task` as the job's command). It is built and tested on a native runner of each architecture, which
+installs the target with `rustup target add`; the job runs `build-commit check` on the binary, which
+runs it, and refuses it unless `readelf` shows no interpreter and no needed library. The task image
+carries the same file.
+
 `tierstore` is the hot and cold S3 object store proxy (`crates/tierstore`): an S3 server over two
 tiers that copies new objects to the cold tier and frees the hot one when it fills. It is built with
 the crate's `server` feature, in a `cargo build` of its own. It has Linux tarballs only, no package
@@ -89,7 +98,7 @@ tools above, and its tarball holds one member, the binary under its own name. Th
 not update it: the farm places it, and the example unit and the flags to fill in are in
 [`packaging/tierstore`](../packaging/tierstore/README.md).
 
-The packages are the two Linux jobs' debs (one each) and container images (two each), and the macOS job's `.pkg`:
+The packages are the two Linux jobs' debs (one each) and container images (three each), and the macOS job's `.pkg`:
 
 | Asset | Built by | Holds |
 |---|---|---|
@@ -552,14 +561,14 @@ pinned by digest (`packaging/container/frontend/Dockerfile` says why that base).
   into the build context after `build-commit check` showed it names the commit.
   Its entrypoint is `kbf-coordinator`, with the flags of its mounted files as the default command
   (`packaging/container/kbf-coordinator/Dockerfile`), and it declares the ports 8443 and 8444.
-- **Task.** The `kbf-task` the job built (it has no tarball of its own), copied into the build
+- **Task.** The `kbf-task` the job built (the same file as its tarball's), copied into the build
   context after `build-commit check` showed it names the commit. Its entrypoint is `kbf-task`
   with no default command and no declared port: what a task is given is the arguments of the
-  entrypoint (`packaging/container/kbf-task/Dockerfile`). The binary is dynamically linked
-  against glibc, like every binary of the release, which the distroless `cc` base provides.
+  entrypoint (`packaging/container/kbf-task/Dockerfile`). The binary is the static musl build
+  (the tarball's), so the base is distroless `static`: the system CA roots and the `nonroot` user, no libc.
 
 Both are run as `docs/deploy/containers.md` says. The archives are small, a binary on a distroless
-base: about 34 MB for a frontend image and 13 MB for a coordinator image, about 94 MB for the four,
+base: about 34 MB for a frontend image and 13 MB for a coordinator image,
 and they add that much to every run's artifacts and to every release.
 
 The build is reproducible: the job builds each image twice from the commit's time
@@ -580,7 +589,7 @@ unless:
 It is attested like a deb: build provenance (one subject of the `SHA256SUMS` attestation, and alone,
 with its bundle `kbf-<service>-image-<commit>-<platform>.oci.tar.sigstore.json` in `bundles-linux`)
 and **no SBOM attestation**. The `kbf` of the frontend image has the SBOM of its tarball. The
-coordinator and the task runner have no tarball and so no SBOM asset yet. The verify job checks both
+coordinator has no tarball and so no SBOM asset yet; the task runner's SBOM is that of its tarball. The verify job checks both
 offline and runs `cargo xtask pkg-image-asset --verify-only` on each signed file (for the
 coordinator and the task runner that makes the checks of the image alone: the verify job has not the binary the build
 compared it with). Verify one before loading it, as for the `kbf` deb above:
