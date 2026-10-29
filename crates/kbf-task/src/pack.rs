@@ -276,6 +276,7 @@ mod tests {
     use super::*;
     use crate::manifest::OutputFile;
     use crate::manifest::tests::sample;
+    use kbf_testkit::dir::TestDir;
 
     /// The blobs `sample()` names (it leaves stderr out as empty).
     fn blobs() -> Vec<Blob> {
@@ -321,7 +322,7 @@ mod tests {
         let mut b = blobs();
         b.insert(0, Blob::Bytes(Vec::new()));
         b.push(Blob::Bytes(Vec::new()));
-        let path = scratch("empty");
+        let (_dir, path) = scratch("empty");
         std::fs::write(&path, b"").unwrap();
         b.push(Blob::File(path.clone()));
         let bytes = pack(&m, b).unwrap();
@@ -366,7 +367,7 @@ mod tests {
     #[test]
     fn duplicate_blobs_share_a_record() {
         let m = sample();
-        let path = scratch("dup");
+        let (_dir, path) = scratch("dup");
         std::fs::write(&path, b"out").unwrap();
         let mut b = blobs();
         b.push(Blob::Bytes(b"out".to_vec()));
@@ -380,7 +381,7 @@ mod tests {
     #[test]
     fn file_blob_is_read() {
         let m = sample();
-        let path = scratch("file");
+        let (_dir, path) = scratch("file");
         std::fs::write(&path, b"file").unwrap();
         let mut b = blobs();
         b.retain(|x| *x != Blob::Bytes(b"file".to_vec()));
@@ -392,7 +393,7 @@ mod tests {
 
     #[test]
     fn missing_file_is_a_read_error() {
-        let err = pack(&sample(), [Blob::File(scratch("absent"))]).unwrap_err();
+        let err = pack(&sample(), [Blob::File(scratch("absent").1)]).unwrap_err();
         assert!(matches!(err, PackError::Read { .. }));
         assert!(err.to_string().contains("cannot read"));
     }
@@ -425,7 +426,7 @@ mod tests {
         assert!(err.to_string().contains(&pack_bytes.to_string()));
         assert!(err.to_string().contains("output-too-large"));
 
-        let path = scratch("big");
+        let (_dir, path) = scratch("big");
         std::fs::write(&path, vec![1u8; 2000]).unwrap();
         let err = pack_within(tight, &m, [Blob::File(path.clone())]).unwrap_err();
         std::fs::remove_file(&path).unwrap();
@@ -481,21 +482,27 @@ mod tests {
     #[test]
     fn record_size_limit_is_refused() {
         let m = sample();
+        // The manifest is a record too, so the limit under test is the manifest's own size.
+        let len = m.encode().len();
+        let limit = len as u64;
         let small = Limits {
-            record_bytes: 8,
+            record_bytes: limit,
             ..limits()
         };
         let mut b = blobs();
-        b.push(Blob::Bytes(vec![1; 9]));
+        b.push(Blob::Bytes(vec![1; len]));
+        pack_within(small, &m, b).unwrap();
+        let mut b = blobs();
+        b.push(Blob::Bytes(vec![1; len + 1]));
         let err = pack_within(small, &m, b).unwrap_err();
-        assert!(matches!(err, PackError::RecordTooLarge { limit: 8 }));
+        assert!(matches!(err, PackError::RecordTooLarge { limit: l } if l == limit));
         assert!(err.to_string().contains("output-too-large"));
 
-        let path = scratch("record");
-        std::fs::write(&path, [1u8; 9]).unwrap();
+        let (_dir, path) = scratch("record");
+        std::fs::write(&path, vec![1u8; len + 1]).unwrap();
         let err = pack_within(small, &m, [Blob::File(path.clone())]).unwrap_err();
-        assert!(matches!(err, PackError::RecordTooLarge { limit: 8 }));
-        std::fs::write(&path, [1u8; 8]).unwrap();
+        assert!(matches!(err, PackError::RecordTooLarge { limit: l } if l == limit));
+        std::fs::write(&path, vec![1u8; len]).unwrap();
         let mut b = blobs();
         b.push(Blob::File(path.clone()));
         pack_within(small, &m, b).unwrap();
@@ -598,8 +605,10 @@ mod tests {
         assert!(matches!(verify(&w.finish()), Err(VerifyError::Manifest(_))));
     }
 
-    /// A path in the system temp directory, unique to this process and name.
-    fn scratch(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("kbf-task-pack-{}-{name}", std::process::id()))
+    /// A fresh directory, and the path `name` inside it (no file there yet).
+    fn scratch(name: &str) -> (TestDir, PathBuf) {
+        let dir = TestDir::under(std::env::temp_dir(), "kbf-task-pack");
+        let path = dir.join(name);
+        (dir, path)
     }
 }
