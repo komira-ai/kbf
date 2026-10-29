@@ -295,9 +295,24 @@ fn a_url_that_is_not_well_formed_is_refused() {
         url.replace("20270115T080000Z", "20270116T080000Z"),
         url.replace("X-Amz-Expires=300", "X-Amz-Expires=soon"),
         url.replace("X-Amz-Expires=300", "X-Amz-Expires=-1"),
+        url.replace(
+            "pack-presign%2F20270115%2Fus-east-1%2Fs3%2Faws4_request",
+            "pack-presign",
+        ),
+        url.replace("%2Fus-east-1%2Fs3%2Faws4_request", ""),
+        url.replace(
+            "pack-presign%2F20270115%2Fus-east-1%2Fs3%2Faws4_request",
+            "pack-presign%2F20270115",
+        ),
+        format!("{url}&bad=%FF"),
     ];
     for broken in broken {
         assert_eq!(signed(&broken), Err(MALFORMED), "{broken}");
+    }
+    let signature = url.rsplit('=').next().unwrap().to_owned();
+    for not_hex in ["zz", "", "abc"] {
+        let result = signed(&url.replace(&signature, not_hex));
+        assert_eq!(result, Err(MISMATCH), "{not_hex:?}");
     }
     let no_host = url.replace("X-Amz-SignedHeaders=host", "X-Amz-SignedHeaders=range");
     let result = signed(&no_host);

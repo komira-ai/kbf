@@ -66,6 +66,8 @@ fn an_amz_date_is_read_back() {
         "20131324T000000Z",
         "20130500T000000Z",
         "é0130524T00000Z",
+        "20130524T000000X",
+        "19600101T000000Z",
     ] {
         assert_eq!(parse_amz_date(text), None, "{text:?}");
     }
