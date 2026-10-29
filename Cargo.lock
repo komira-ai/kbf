@@ -2345,6 +2345,7 @@ dependencies = [
  "rcgen",
  "serde_json",
  "sha2 0.11.0",
+ "subtle",
  "thiserror",
  "tokio",
  "tonic",

@@ -42,6 +42,12 @@ use kbf_segments::{Footer, MAX_SEGMENT_BYTES, SegmentError};
 use super::{CommitError, MAX_COMMIT_BLOBS, Packs, offload, recording_failed};
 use crate::proxy::packed::metrics::Reason;
 
+mod mint;
+mod task;
+
+pub use self::mint::{MIN_SECRET_BYTES, MintError, PackKeyMint};
+pub use self::task::{Ingested, RejectReason, StoreError, ingest};
+
 /// The most bytes a pack of an untrusted writer may have: the most a segment may have.
 pub const MAX_UNTRUSTED_PACK_BYTES: u64 = MAX_SEGMENT_BYTES;
 
