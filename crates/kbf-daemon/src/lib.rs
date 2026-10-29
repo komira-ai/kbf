@@ -62,6 +62,7 @@ mod contact;
 mod core;
 pub mod cpu_pool;
 mod daemon;
+mod drain;
 pub mod driver_watch;
 mod extras;
 mod kbf_extras;

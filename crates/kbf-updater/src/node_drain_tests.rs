@@ -52,7 +52,7 @@ fn a_drain_posts_the_deadline_to_the_nodes_drain_route() {
     let server = answering(200, &node("draining", &["1.1"]));
     let drain = adapter(&server, "nd-drain");
     drain
-        .drain(&dm(Some("dm-node")), Duration::from_secs(600))
+        .drain(&dm(Some("dm-node")), Some(Duration::from_secs(600)))
         .expect("drained");
     let sent = server.requests();
     assert_eq!(sent.len(), 1);
@@ -68,6 +68,25 @@ fn a_drain_posts_the_deadline_to_the_nodes_drain_route() {
         "{}",
         sent[0]
     );
+}
+
+/// Catches a drain without a deadline that still sends one: the frontend takes a drain with
+/// no body as having no deadline, and any number in the body as a deadline it ends at.
+#[test]
+fn a_drain_without_a_deadline_sends_no_body() {
+    let server = answering(200, &node("draining", &["1.1"]));
+    adapter(&server, "nd-drain-unbounded")
+        .drain(&dm(Some("dm-node")), None)
+        .expect("drained");
+    let sent = server.requests();
+    assert_eq!(sent.len(), 1);
+    assert!(
+        sent[0].starts_with("POST /v1/nodes/dm-node:drain HTTP/1.1\r\n"),
+        "{}",
+        sent[0]
+    );
+    assert!(sent[0].contains("Content-Length: 0\r\n"), "{}", sent[0]);
+    assert!(sent[0].ends_with("\r\n\r\n"), "{}", sent[0]);
 }
 
 /// Catches an undrain that is not the uncordon route, or that sends a body: it is
@@ -143,7 +162,7 @@ fn errors_are_of_the_right_kind_and_leak_nothing() {
         let host = dm(Some("dm-node"));
         let errors = [
             drain
-                .drain(&host, Duration::from_secs(5))
+                .drain(&host, Some(Duration::from_secs(5)))
                 .expect_err("drain"),
             drain.leases(&host).expect_err("leases"),
             drain.undrain(&host).expect_err("undrain"),
@@ -189,7 +208,7 @@ fn a_host_without_a_usable_node_id_is_refused_without_a_call() {
         let host = dm(id);
         for e in [
             drain
-                .drain(&host, Duration::from_secs(5))
+                .drain(&host, Some(Duration::from_secs(5)))
                 .expect_err("drain"),
             drain.leases(&host).expect_err("leases"),
             drain.undrain(&host).expect_err("undrain"),
@@ -219,7 +238,9 @@ fn a_daemon_the_frontend_knows_is_drained_counted_and_given_back() {
     let server = answering(200, &node("draining", &["1.1", "1.2"]));
     let drain = adapter_if_present(&server, "nd-present");
     let host = dm(Some("dm-node"));
-    drain.drain(&host, Duration::from_secs(60)).expect("drain");
+    drain
+        .drain(&host, Some(Duration::from_secs(60)))
+        .expect("drain");
     assert_eq!(drain.leases(&host), Ok(2));
     drain.undrain(&host).expect("undrain");
     let sent = server.requests();
@@ -245,7 +266,7 @@ fn a_storage_host_with_no_daemon_has_nothing_to_drain() {
     let server = answering(404, "{\"error\":\"no_node\"}");
     let drain = adapter_if_present(&server, "nd-absent");
     let host = dm(Some("dm-node"));
-    assert_eq!(drain.drain(&host, Duration::from_secs(60)), Ok(()));
+    assert_eq!(drain.drain(&host, Some(Duration::from_secs(60))), Ok(()));
     assert_eq!(drain.leases(&host), Ok(0));
     assert_eq!(drain.undrain(&host), Ok(()));
     assert_eq!(server.requests().len(), 3);
@@ -254,7 +275,7 @@ fn a_storage_host_with_no_daemon_has_nothing_to_drain() {
         let server = answering(status, "{}");
         let drain = adapter_if_present(&server, "nd-absent-errors");
         assert!(
-            drain.drain(&host, Duration::from_secs(1)).is_err(),
+            drain.drain(&host, Some(Duration::from_secs(1))).is_err(),
             "{status}"
         );
         assert!(drain.leases(&host).is_err(), "{status}");
