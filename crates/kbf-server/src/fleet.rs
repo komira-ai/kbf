@@ -107,7 +107,8 @@ pub struct NodeDetail {
 }
 
 /// The load of a node's `actions/` cgroup, from the readings its heartbeats carried
-/// (`docs/api.md`, "Node load"). Shown only: nothing places leases by it yet.
+/// (`docs/api.md`, "Node load"). The scheduler is handed each accepted reading as well;
+/// whether it places by them is `--placement-load`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct LoadView {
     /// The CPU the actions used, in thousandths of a CPU: the larger of the last two
@@ -131,8 +132,37 @@ pub struct LoadView {
     /// Cumulative CPU pressure (`some` total), in microseconds, when the daemon read it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_pressure_some_total_usec: Option<u64>,
+    /// What the lists of the readings carried, and what was not taken.
+    pub lists: ListsView,
     /// Whether no reading was accepted for three windows.
     pub stale: bool,
+}
+
+/// What the `lease_clocks` and `minutes` lists of a node's readings have come to since its
+/// daemon process began (`docs/api.md`, "Node load"), so that a dropped record, or a feed
+/// that is empty, can be seen.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ListsView {
+    /// Clock records kept, summed over the accepted readings.
+    pub clocks: u64,
+    /// Minute records kept, summed over the accepted readings.
+    pub minutes: u64,
+    /// Records dropped, from the three lists (`covered` included), by reason.
+    pub dropped: DroppedView,
+    /// Minute records carried by readings that were not accepted.
+    pub refused_minutes: u64,
+}
+
+/// Why records of a reading's lists were dropped.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DroppedView {
+    /// A rule was broken: no lease, a minute above 63, a working set above 2^45 bytes, a mean
+    /// above its peak, a start after the reading.
+    pub invalid: u64,
+    /// The record repeated an earlier kept one.
+    pub duplicate: u64,
+    /// The record was past the cap of its list.
+    pub over_cap: u64,
 }
 
 /// A node's phase (`kbf_sched::NodePhase`). Serialized with its `state` as a tag.

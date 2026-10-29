@@ -218,15 +218,20 @@ has sent readings, a read open like the list:
 ### Node load
 
 `load` is what the node's daemon reports of the CPU and memory its actions use, from the
-`node_load` of its heartbeats. It is shown only: nothing places a lease by it. It is left out when
-the server has accepted no reading of the node (a daemon or runtime that takes none, a failed
-read, a node another frontend holds), and it is in memory: a server restart forgets it.
+`node_load` of its heartbeats. The server also hands each accepted reading to the scheduler, which
+places by it only under `--placement-load on`. It is left out when the server has accepted no
+reading of the node (a daemon or runtime that takes none, a failed read, a node another frontend
+holds), and it is in memory: a server restart forgets it.
 
 ```json
 "load": { "measured_cpu_millicores": 2500, "memory_working_set_bytes": 1000,
           "memory_active_file_bytes": 200, "admission_working_set_bytes": 1000,
           "covered": ["117399224320012061.40"], "actions_cpu_limited": false,
-          "cpu_throttled_usec": 7, "cpu_pressure_some_total_usec": 12345, "stale": false }
+          "cpu_throttled_usec": 7, "cpu_pressure_some_total_usec": 12345,
+          "lists": { "clocks": 12, "minutes": 40,
+                     "dropped": { "invalid": 0, "duplicate": 0, "over_cap": 0 },
+                     "refused_minutes": 0 },
+          "stale": false }
 ```
 
 | Field | Meaning |
@@ -238,6 +243,7 @@ read, a node another frontend holds), and it is in memory: a server restart forg
 | `covered` | the leases, as `term.seq`, that ran for the whole window before the last reading |
 | `actions_cpu_limited` | whether the actions cgroup has a CPU quota |
 | `cpu_throttled_usec`, `cpu_pressure_some_total_usec` | cumulative CPU throttled time and CPU pressure (`some` total), in microseconds; telemetry. Left out when the daemon could not read them |
+| `lists` | what the `lease_clocks` and `minutes` lists of the node's readings have come to since its daemon process began (a restarted daemon counts again from 0), so that a dropped record, or an empty feed, can be seen: `clocks` and `minutes` are the records kept, summed over the accepted readings; `dropped` counts the records left out of the two lists and of `covered`, by reason (`invalid`: a lease missing, a minute above 63, a working set above 2^45 bytes, a mean above its peak, a start after the reading; `duplicate`: a repeat of an earlier kept record; `over_cap`: a record past the cap of its list, 96 for the clocks and `covered`, 64 for the minutes); `refused_minutes` counts the minutes carried by readings that were not accepted |
 | `stale` | no reading was accepted for three windows (a window being the time between the last two accepted readings) |
 
 A reading is accepted only if its `seq` is above the last accepted one of the same daemon process;
@@ -247,8 +253,10 @@ went back or its clock did not move, when its CPU since the last accepted readin
 four cores per hardware thread of the node's `capacity`, or when its working set is more than four
 times the node's memory. A lease's busiest window is not here: it is the usage record's
 `peak_window_millicores`. The reading's `lease_clocks` and `minutes` lists
-([worker-protocol.md](design/worker-protocol.md#heartbeat-and-heartbeatack)) are not read or shown
-yet.
+([worker-protocol.md](design/worker-protocol.md#heartbeat-and-heartbeatack)) are vetted and counted
+(`lists`) and handed to the scheduler with the reading; their records are not shown, and the server
+keeps no series of them. `covered` is cut to 96 leases, each once, before it is kept. A heartbeat is
+never refused, nor its acknowledgement changed, for what its load carries.
 
 `{id}` is the node id as `POST /v1/nodes/{node}:cordon` takes it, percent-encoded as one
 path segment. `404` with `{"error": "no_node"}` for a node that has not registered since

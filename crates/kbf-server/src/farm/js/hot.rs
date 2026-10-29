@@ -15,10 +15,11 @@ use js_server_core::{Beat, Standing};
 use kbf_front::{Submission, Ticket};
 use kbf_proto::worker::{self, ResultAck, ResultAckReason, ServerMessage};
 use kbf_sched::DaemonInstance;
+use kbf_types::sched::usage::NodeLoad;
 use kbf_types::{LeaseId, WorkerId};
 use tonic::Status;
 
-use super::{JsFarm, load};
+use super::JsFarm;
 use crate::farm::{Outbound, Reported, StreamId};
 use crate::farm_js::host::{Connection, stream_number};
 use crate::farm_js::{Wall, dispatch};
@@ -91,13 +92,16 @@ pub(crate) fn resize(js: &JsFarm, worker: &WorkerId, stream: StreamId, reported:
     let _ = dispatch::resize(&js.core, js.now(), worker, stream, reported);
 }
 
-/// [`Farm::heartbeat`](crate::farm::Farm::heartbeat).
+/// [`Farm::heartbeat_with_load`](crate::farm::Farm::heartbeat_with_load): `load` is the
+/// reading the farm accepted on this heartbeat ([`super::load::note_node_load`]), which the core is
+/// handed with the beat.
 pub(crate) async fn heartbeat(
     js: &JsFarm,
     worker: &WorkerId,
     stream: StreamId,
     seq: u64,
     running: Vec<LeaseId>,
+    load: Option<NodeLoad>,
 ) -> bool {
     // A heartbeat from a replaced stream is dropped and not acknowledged.
     let Some(stream) = js
@@ -107,7 +111,7 @@ pub(crate) async fn heartbeat(
         return false;
     };
     let beat = Beat::new(seq, running);
-    let beat = match load::node_load(js, worker) {
+    let beat = match load {
         Some(load) => beat.with_load(load),
         None => beat,
     };

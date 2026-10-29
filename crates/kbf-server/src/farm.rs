@@ -104,6 +104,7 @@ use self::driver::Driver;
 pub(crate) use self::driver::Settings;
 use self::durable::Held;
 use self::engine::Engine;
+pub(crate) use self::node_load::NodeLoads;
 use self::report::{Detail, Settled, finished_of, refused_as};
 pub(crate) use self::side::identity;
 use self::side::{Link, Side};

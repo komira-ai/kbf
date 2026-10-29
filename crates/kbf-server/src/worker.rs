@@ -338,13 +338,14 @@ impl Session {
                 // has its counts on `/metrics`.
                 farm.note_pack_reads(worker, stream, beat.pack_reads);
                 farm.note_pack_writes(worker, stream, beat.pack_writes);
-                farm.note_node_load(worker, stream, beat.node_load.as_ref());
+                // The accepted reading goes to the scheduler with the heartbeat.
+                let load = farm.note_node_load(worker, stream, beat.node_load.as_ref());
                 let running = beat
                     .running
                     .iter()
                     .map(|l| LeaseId::new(l.term, l.seq))
                     .collect();
-                farm.heartbeat(worker, stream, beat.seq, running)
+                farm.heartbeat_with_load(worker, stream, beat.seq, running, load)
                     .await
                     .then_some(server_message::Message::HeartbeatAck(HeartbeatAck {
                         seq: beat.seq,
