@@ -466,3 +466,45 @@ async fn rerun_start(farm: &Farm, joined: &mut Joined) -> worker::LeaseId {
     }
     panic!("no rerun was started");
 }
+
+/// Asserts which acknowledgement the js farm's report keeps from the core's: a stale
+/// refusal of a lease the core still calls current is dropped (the daemon keeps that
+/// `Result` and sends it again), and every other answer stands: an acceptance, a refusal
+/// while the farm is fenced (which refuses every `Result` as stale by design), a stale
+/// refusal of a lease that is not current, and a refusal for another reason. Catches a
+/// check that drops the wrong acks, or that asks whether the lease is current when the
+/// ack alone decides.
+#[test]
+fn only_a_stale_refusal_of_the_current_lease_loses_its_ack() {
+    use kbf_proto::worker::{ResultAck, ResultAckReason};
+    use kbf_types::LeaseId;
+
+    use super::super::hot::answered;
+
+    let lease = LeaseId::new(1, 1);
+    let worker = node("n1");
+    let ack = |accepted, reason: ResultAckReason| ResultAck {
+        lease_id: Some(worker::LeaseId { term: 1, seq: 1 }),
+        accepted,
+        reason: reason as i32,
+    };
+    let unasked = || -> bool { panic!("the ack alone decides") };
+    let stale = ack(false, ResultAckReason::Stale);
+
+    assert_eq!(answered(stale, false, || true, lease, &worker), None);
+    let accepted = ack(true, ResultAckReason::Accepted);
+    assert_eq!(
+        answered(accepted, false, unasked, lease, &worker),
+        Some(accepted)
+    );
+    assert_eq!(answered(stale, true, unasked, lease, &worker), Some(stale));
+    assert_eq!(
+        answered(stale, false, || false, lease, &worker),
+        Some(stale)
+    );
+    let unknown = ack(false, ResultAckReason::UnknownLease);
+    assert_eq!(
+        answered(unknown, false, unasked, lease, &worker),
+        Some(unknown)
+    );
+}
