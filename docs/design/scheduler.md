@@ -832,7 +832,8 @@ What an operator sees with `js`:
 - **Node of another frontend.** The detail of a node that another frontend holds is not
   answered from the store's rows.
 - **Whole-node drain.** A submission's `max_wall` is not given to the scheduler, so a
-  whole-node drain sees no per-operation deadline.
+  whole-node drain sees no per-operation deadline. Keep whole-node placement off
+  (`--whole-node-max` unset) with `js` until the core takes `max_wall`.
 - **Logs.** The core's "lease finished" line has no `exit_code=` field and comes before
   the `action usage:` line. The `size estimate:` line of a new operation is written after
   the submit is queued, not before.
