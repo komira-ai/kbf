@@ -74,8 +74,9 @@ pub(crate) type Cleaner<R> = Arc<dyn Fn(&R) -> Outcome + Send + Sync>;
 /// Called with the number of slots that can run a lease whenever it changes.
 pub(crate) type CountHook = Arc<dyn Fn(usize) + Send + Sync>;
 
-/// How the recovery thread waits `time` between passes: the daemon's is [`sleep`]; a test
-/// records `time` and returns at once. Whether a slot went dirty meanwhile.
+/// How the recovery thread waits `time` between passes, and whether a slot went dirty
+/// meanwhile. The daemon's is [`sleep`]: it waits until `time` has passed or the wake is
+/// signalled. A test's records `time` and returns when the test steps it.
 type Nap = Box<dyn FnMut(&Wake, Duration) -> bool + Send>;
 
 /// What wakes the recovery thread: a slot went dirty, or the book is gone.

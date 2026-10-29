@@ -234,6 +234,40 @@ fn a_slot_that_stays_dirty_is_cleaned_less_and_less_often() {
     assert_eq!(book.dirty(), BTreeSet::from([0]));
 }
 
+/// Catches a pass that frees a slot not starting the waits again from the first while
+/// another slot stays dirty (the thread is not idle, so only the pass's own accounting
+/// resets the wait): slot 0 comes back at the third pass, slot 1 never, and the wait after
+/// that pass is the first, not the next double.
+#[test]
+fn a_slot_that_comes_back_resets_the_wait_while_another_stays_dirty() {
+    quiet();
+    let zero_calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&zero_calls);
+    // Slot 0 is dirty at the start and at two passes, clean at the third.
+    let cleaner: Cleaner<Stub> = Arc::new(move |slot: &Stub| {
+        if slot.0 == 0 && counted.fetch_add(1, Ordering::SeqCst) >= 3 {
+            return Outcome::Clean;
+        }
+        dirty()
+    });
+    let (ask, delays) = mpsc::channel();
+    let (go, stepping) = mpsc::channel::<()>();
+    let nap: Nap = Box::new(move |_, time| {
+        let _ = ask.send(time);
+        let _ = stepping.recv();
+        false
+    });
+    let book = Book::start_with(stubs(2), cleaner, FAST, None, nap);
+    let mut asked = Vec::new();
+    for _ in 0..4 {
+        asked.push(delays.recv_timeout(LONG).expect("a wait"));
+        go.send(()).expect("step");
+    }
+    let millis: Vec<u128> = asked.iter().map(Duration::as_millis).collect();
+    assert_eq!(millis, [10, 20, 40, 10]);
+    assert_eq!(book.dirty(), BTreeSet::from([1]));
+}
+
 /// Catches a recovery that keeps its grown wait after a slot came back (a slot that
 /// fails again would wait the longest), and one that keeps cleaning a slot that is clean:
 /// the waits grow while the slot stays dirty, the pass that cleans it ends them (no wait
@@ -588,7 +622,7 @@ async fn a_newly_dirty_slot_restarts_the_backoff() {
     go.send(()).expect("step");
     asked.push(delays.recv_timeout(LONG).expect("a wait"));
     let millis: Vec<u128> = asked.iter().map(Duration::as_millis).collect();
-    // Without the restart the last would be 160.
+    // Without the restart the last would be the next double of the 80 before it.
     assert_eq!(millis, [10, 10, 20, 40, 80, 10]);
 }
 
