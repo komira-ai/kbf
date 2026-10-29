@@ -932,7 +932,8 @@ where
         listeners.heartbeat_interval,
         listeners.hello_wait,
     )
-    .with_host_floor(listeners.vm_host_floor);
+    .with_host_floor(listeners.vm_host_floor)
+    .with_placement_load(listeners.placement_load);
     // The map, if there is one: no branch in this generic function.
     let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
     let worker_service = WorkerServer::new(sessions)

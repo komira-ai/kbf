@@ -202,16 +202,11 @@ impl<T: Installer + ?Sized> Installer for std::sync::Arc<T> {
     }
 }
 
-/// The deadline a node drain is asked for when the operator set none: about 136 years, which
-/// the frontend takes as no deadline. The caller's own wait is what a configured deadline
-/// bounds; the frontend's is never what ends a drain the caller is still waiting for.
-pub const UNBOUNDED_NODE_DRAIN: Duration = Duration::from_secs(u32::MAX as u64);
-
 /// Taking a daemon host's node out of placement at the frontend, and giving it back.
 pub trait Drain: Send + Sync {
-    /// Cordon the node of `host` and ask the frontend to wait for its leases for `deadline`
-    /// ([`UNBOUNDED_NODE_DRAIN`] when the caller waits however long it takes).
-    fn drain(&self, host: &Host, deadline: Duration) -> Result<(), PortError>;
+    /// Cordon the node of `host` and ask the frontend to wait for its leases for `deadline`,
+    /// or with no deadline (`None`) when the caller waits however long it takes.
+    fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError>;
     /// How many leases the node of `host` holds now.
     fn leases(&self, host: &Host) -> Result<usize, PortError>;
     /// Return the node of `host` to placement. This is unconditional: a node an operator

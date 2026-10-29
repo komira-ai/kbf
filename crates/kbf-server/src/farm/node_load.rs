@@ -248,7 +248,9 @@ impl Farm {
                     %worker,
                     "the node's actions cgroup has a CPU quota while --placement-load is on: \
                      its measured CPU says nothing of the load, so placement charges it by \
-                     prediction alone; remove the quota or run with --placement-load off"
+                     prediction alone; a node lifts the limit itself unless it runs \
+                     --actions-cpu-max off or predates the lift, so start it without that \
+                     flag or upgrade it"
                 );
             }
             state.side.node_loads.insert(worker.clone(), next);

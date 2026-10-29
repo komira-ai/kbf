@@ -30,7 +30,7 @@ use crate::version::Version;
 pub struct NoDrain;
 
 impl Drain for NoDrain {
-    fn drain(&self, _host: &Host, _deadline: Duration) -> Result<(), PortError> {
+    fn drain(&self, _host: &Host, _deadline: Option<Duration>) -> Result<(), PortError> {
         Ok(())
     }
 
@@ -72,7 +72,7 @@ impl HealthCheck for NoCredential {
 }
 
 impl Drain for NoCredential {
-    fn drain(&self, _host: &Host, _deadline: Duration) -> Result<(), PortError> {
+    fn drain(&self, _host: &Host, _deadline: Option<Duration>) -> Result<(), PortError> {
         Err(PortError::other(self.0))
     }
 

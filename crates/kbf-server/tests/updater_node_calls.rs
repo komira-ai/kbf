@@ -384,7 +384,7 @@ async fn an_updater_drains_checks_and_undrains_its_own_node_with_no_token() {
 
     let (d, h) = (Arc::clone(&drain), host.clone());
     assert_eq!(
-        blocking(move || d.drain(&h, Duration::from_secs(30))).await,
+        blocking(move || d.drain(&h, Some(Duration::from_secs(30)))).await,
         Ok(())
     );
     assert_ne!(state_of(&node_state().await), "serving");
