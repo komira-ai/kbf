@@ -30,14 +30,14 @@
 //! # Copies
 //!
 //! A blob named by several paths is fetched once, streamed to the first path. The other paths are
-//! made from that file once its hash has been checked: a hard link when the executable bit is the
-//! same and the filesystem allows it (the paths then share one inode, so a write through one is
-//! seen through the other), else a copy with its own mode. A blob that fails its check is removed
-//! from its path, so a file at a path is a complete, verified one; the tree around it is left for
-//! the caller to remove.
+//! made from that file once its hash has been checked, each a copy of its own (its own inode and its
+//! own mode, so a write or a chmod through one path does not show through another). A blob that
+//! fails its check, and a copy that fails partway, are removed from their paths, so a file this
+//! module created is a complete, verified one; the tree around it is left for the caller to
+//! remove.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io::{Read as _, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -194,6 +194,12 @@ fn run_bounded<T: Sync>(
     std::thread::scope(|scope| {
         for _ in 0..concurrency.max(1).min(items.len()) {
             scope.spawn(|| {
+                // A worker that unwinds (a panic in `work`) ends here too, and this stops the
+                // others from taking new items while the scope carries the panic out. A worker
+                // that ends normally has run out of items or seen `stopped` already, so setting
+                // it again changes nothing. There is no test of the panic itself: it would need a
+                // branch in test code to tell the panic from the other exits.
+                let _stop_on_exit = StopOnExit(&stopped);
                 while !stopped.load(Ordering::SeqCst) {
                     let index = next.fetch_add(1, Ordering::SeqCst);
                     let Some(item) = items.get(index) else { break };
@@ -208,6 +214,15 @@ fn run_bounded<T: Sync>(
     match first.into_inner().expect("first error") {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+/// Sets the flag when dropped, whether the worker holding it returned or unwound.
+struct StopOnExit<'a>(&'a AtomicBool);
+
+impl Drop for StopOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
     }
 }
 
@@ -321,7 +336,15 @@ pub fn fetch_message<M: Message + Default>(
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The time one request for a blob of `size` bytes may take in all: 60 s and 1 s more for each
+/// 8 MiB, at most an hour.
+fn request_timeout(size: i64) -> Duration {
+    const BASE: u64 = 60;
+    const PER_SECOND: u64 = 8 << 20;
+    const MAX: u64 = 3600;
+    Duration::from_secs((BASE + size.unsigned_abs() / PER_SECOND).min(MAX))
+}
 
 /// The most requests [`materialize`] may have in flight, and the number of idle keep-alive
 /// connections the agent keeps for them.
@@ -386,7 +409,6 @@ impl HttpBlobSource {
             .max_redirects(0)
             .http_status_as_error(false)
             .timeout_connect(Some(CONNECT_TIMEOUT))
-            .timeout_global(Some(REQUEST_TIMEOUT))
             .max_idle_connections(MAX_CONCURRENCY)
             .max_idle_connections_per_host(MAX_CONCURRENCY)
             .tls_config(tls)
@@ -417,6 +439,9 @@ impl BlobSource for HttpBlobSource {
         let mut response = self
             .agent
             .get(&url)
+            .config()
+            .timeout_global(Some(request_timeout(digest.size_bytes)))
+            .build()
             .header("Authorization", &self.authorization)
             .call()
             .map_err(|e| source(e.to_string()))?;
@@ -554,7 +579,10 @@ fn make_directories(
             Ok(())
         })?;
         for (digest, slot) in wanted.iter().zip(slots) {
-            let directory = slot.into_inner().expect("slot").expect("fetched");
+            let directory = slot
+                .into_inner()
+                .expect("slot")
+                .ok_or_else(|| FetchError::Invalid("a source skipped a blob".to_owned()))?;
             loaded.insert(label(digest), directory);
         }
         let mut below = Vec::new();
@@ -603,25 +631,29 @@ fn write_copies(blob: &Copies, fetch: Fetch<'_>) -> Result<(), FetchError> {
         return Err(error);
     }
     for (path, is_executable) in &blob.copies[1..] {
-        copy_of(first, *first_executable, path, *is_executable)?;
+        copy_of(first, path, *is_executable)?;
     }
     Ok(())
 }
 
-/// Makes `path` from the finished file `from`: a hard link when both are executable or both are
-/// not and the filesystem allows it, else a copy with the mode `path` is to have.
-fn copy_of(
-    from: &Path,
-    from_executable: bool,
-    path: &Path,
-    is_executable: bool,
-) -> Result<(), FetchError> {
-    if from_executable == is_executable && std::fs::hard_link(from, path).is_ok() {
-        return Ok(());
-    }
+/// Makes `path` from the finished file `from`: a copy with the mode `path` is to have.
+fn copy_of(from: &Path, path: &Path, is_executable: bool) -> Result<(), FetchError> {
     let mut source = std::fs::File::open(from).map_err(io(from))?;
+    copy_from(&mut source, path, is_executable)
+}
+
+/// Creates `path` (which must not exist) from everything `source` gives. A copy that fails
+/// partway is removed: the file is one this call created.
+fn copy_from(source: &mut impl Read, path: &Path, is_executable: bool) -> Result<(), FetchError> {
     let mut file = create_file(path, is_executable)?;
-    std::io::copy(&mut source, &mut file).map_err(io(path))?;
+    std::io::copy(source, &mut file).map_err(|error| {
+        // Best effort: the copy's error is the one to report.
+        let _ = std::fs::remove_file(path);
+        FetchError::Io {
+            path: path.to_owned(),
+            source: error,
+        }
+    })?;
     Ok(())
 }
 

@@ -1,7 +1,8 @@
 use kbf_testkit::dir::TestDir;
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader, Read, Write as _};
 use std::net::TcpListener;
+use std::os::unix::fs::MetadataExt as _;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
@@ -294,6 +295,25 @@ fn a_bad_name_is_refused() {
             "{name:?}: {error:?}"
         );
     }
+}
+
+/// Catches a file and a symlink of one name in one Directory being accepted.
+#[test]
+fn a_symlink_and_a_file_of_one_name_are_refused() {
+    let mut mem = Memory::default();
+    let blob = mem.put(b"x".to_vec());
+    let root = mem.put_directory(&Directory {
+        files: vec![file("clash", &blob, false)],
+        symlinks: vec![SymlinkNode {
+            name: "clash".to_owned(),
+            target: "elsewhere".to_owned(),
+            ..SymlinkNode::default()
+        }],
+        ..Directory::default()
+    });
+    let error = materialize(&mem, &root, &scratch("clash"), 4).expect_err("clash");
+    assert!(matches!(&error, FetchError::Invalid(_)), "{error:?}");
+    assert!(error.to_string().contains("twice"), "{error}");
 }
 
 /// Catches an entry without a digest, and a blob that is not a Directory where one is wanted.
@@ -609,6 +629,14 @@ fn a_tree_with_shared_subtrees_and_duplicate_blobs_is_fetched_once_each() {
             if executable { 0o755 } else { 0o644 }
         );
     }
+    // Each path is a file of its own: a write through one does not show through another.
+    let (one, two) = (dir.join("same1"), dir.join("same2"));
+    assert_ne!(
+        std::fs::metadata(&one).expect("one").ino(),
+        std::fs::metadata(&two).expect("two").ino()
+    );
+    std::fs::write(&one, b"changed").expect("write");
+    assert_eq!(std::fs::read(&two).expect("two"), b"same");
     let reads = mem.reads.lock().expect("reads");
     assert_eq!(reads.len(), mem.blobs.len(), "every blob is requested");
     for (hash, count) in reads.iter() {
@@ -671,7 +699,10 @@ fn the_first_failure_stops_new_requests() {
         ..Directory::default()
     });
     let scratch_dir = scratch("stop");
-    let error = materialize(&mem, &root, &scratch_dir.join("in"), 1).expect_err("missing");
+    let dir = scratch_dir.join("in");
+    let error = materialize(&mem, &root, &dir, 1).expect_err("missing");
+    assert!(!dir.join("a").exists());
+    assert!(!dir.join("b").exists());
     assert!(matches!(&error, FetchError::Source { .. }), "{error:?}");
     assert!(error.to_string().contains(&label(&missing)), "{error}");
     assert_eq!(mem.reads(&missing), 1);
@@ -851,3 +882,6 @@ fn a_tree_is_fetched_over_http() {
         format!("GET /{}/{} HTTP/1.1", root.hash, root.size_bytes)
     );
 }
+
+#[path = "fetch_failure_tests.rs"]
+mod failure;
