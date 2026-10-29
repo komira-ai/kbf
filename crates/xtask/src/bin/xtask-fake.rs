@@ -63,7 +63,9 @@
 //!   `garbage` (a reply that is not JSON), `refuse-ref` (a ref is refused with HTTP 422
 //!   `Validation Failed`), `race` (another run made the ref first, with another message),
 //!   `lose-ref-502` / `lose-ref-422` (the next ref is stored, and its reply is lost as that
-//!   HTTP status), or `fail-get:<code>` (every GET of a ref fails with that status).
+//!   HTTP status), `fail-get:<code>` (every GET of a ref fails with that status), or
+//!   `draft-release:<tag>:<times>` (the first `<times>` GETs of that tag's release answer
+//!   404, as GitHub answers a release that is still a draft; it counts in `gh-draft-asked`).
 //! - Run as `gh api -X <METHOD> <path> [--input -]` (the method first: the issue calls of
 //!   `advisories`), it appends `{"args": [...], "body": <JSON or null>}` as one line to
 //!   `gh-calls` next to it, and answers `{"number": 42, "html_url": ...}`. It reads the
@@ -493,6 +495,21 @@ fn api(dir: &Path, path: &str) -> ExitCode {
     {
         eprintln!("gh: Error (HTTP {code})");
         return ExitCode::FAILURE;
+    }
+    if let Some(spec) = fault.trim().strip_prefix("draft-release:") {
+        let (tag, times) = spec.rsplit_once(':').expect("draft-release:<tag>:<times>");
+        if path.ends_with(&format!("/releases/tags/{tag}")) {
+            let counter = dir.join("gh-draft-asked");
+            let asked: u32 = std::fs::read_to_string(&counter)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+                .unwrap_or(0);
+            std::fs::write(&counter, (asked + 1).to_string()).expect("gh-draft-asked");
+            if asked < times.parse::<u32>().expect("a count") {
+                eprintln!("gh: Not Found (HTTP 404)");
+                return ExitCode::FAILURE;
+            }
+        }
     }
     let store = api_store(dir);
     match store.get(path).cloned() {

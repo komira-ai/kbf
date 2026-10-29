@@ -65,6 +65,8 @@ fn args_for<'a>(sha: &'a str, out: &'a str) -> Vec<&'a str> {
     let mut args = vec!["release", "fetch-previous", "--repo", REPO, "--sha", sha];
     args.extend(["--platform", "linux-x86_64", "--binary", "kbf"]);
     args.extend(["--binary", "kbf-server", "--out", out]);
+    // A release that is not found is asked for again with no pause between the asks.
+    args.extend(["--release-poll-secs", "0"]);
     args
 }
 
@@ -329,6 +331,47 @@ fn a_tag_with_no_release_is_an_error_not_a_step_back_to_a_lower_tag() {
     f.assert_refused(ran, "releases/tags/v0.0.2: not found (HTTP 404)");
     let asked = f.gh_args();
     assert!(!asked.contains("release download"), "{asked}");
+}
+
+#[test]
+fn a_release_that_is_still_a_draft_is_waited_for_and_then_fetched() {
+    // Catches: GitHub's 404 for the previous tag's release while it is still a draft (its tag
+    // is pushed minutes before the release is published) taken as an error at the first ask,
+    // which turned every push to main in that window red; and a step back to a lower tag
+    // instead of waiting for the release before N.
+    let f = fx("draft");
+    let tags = [("v0.0.1", "ahead"), (TAG, "ahead")];
+    let mut more = found(TAG, PREV);
+    more.extend(annotated("v0.0.1", PREV));
+    f.github(&tags, more);
+    f.release(TAG, PREV);
+    std::fs::write(f.root.join("gh/gh-fault"), format!("draft-release:{TAG}:2")).expect("fault");
+    let (code, out, err) = f.run(&[], None);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(value(&out, "previous-tag"), TAG);
+    assert_eq!(names_in(&f.out()), ["kbf", "kbf-server"]);
+    assert!(err.contains("not found yet"), "{err}");
+    let asked = std::fs::read_to_string(f.root.join("gh/gh-draft-asked")).expect("asked");
+    assert_eq!(asked.trim(), "3", "two drafts, then the published release");
+}
+
+#[test]
+fn a_release_never_published_is_still_an_error_after_the_asks() {
+    // Catches: the wait made endless, or its end taken as "no previous release" (exit 0,
+    // `none`) instead of the error a missing release is.
+    let f = world("never-published");
+    std::fs::write(
+        f.root.join("gh/gh-fault"),
+        format!("draft-release:{TAG}:99"),
+    )
+    .expect("fault");
+    let ran = f.run(&["--release-attempts", "3"], None);
+    f.assert_refused(
+        ran,
+        &format!("releases/tags/{TAG}: not found (HTTP 404), asked 3 times"),
+    );
+    let asked = std::fs::read_to_string(f.root.join("gh/gh-draft-asked")).expect("asked");
+    assert_eq!(asked.trim(), "3");
 }
 
 #[test]
