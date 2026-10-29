@@ -28,7 +28,7 @@ struct Easy;
 
 #[tonic::async_trait]
 impl Ingest for Easy {
-    fn mint(&self, lease: LeaseId, _: &Digest) -> Result<PackKey, MintError> {
+    async fn mint(&self, lease: LeaseId, _: &Digest, _: Duration) -> Result<PackKey, MintError> {
         Ok(PackKey::new(format!("cas/b/{}/aa-0", build_id(lease))))
     }
 
@@ -113,6 +113,7 @@ impl Harness {
             ingest: Arc::new(Easy),
             presign: Arc::new(Easy),
             inputs: Arc::new(Easy),
+            metrics: Arc::default(),
         };
         let clock = Clock::from_unix_ms(fake.now_ms());
         Self {

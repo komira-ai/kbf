@@ -20,6 +20,7 @@ use tokio::time::Instant;
 
 use crate::executor::config::Config;
 use crate::executor::host::{Drain, HostWorker, Retire};
+use crate::executor::metrics::{IngestEnd, Metrics, RunEnd};
 use crate::executor::outcome::{Settled, Verdict, judge, ran, result_of};
 use crate::executor::task::{Nonce, PackKey, TaskArgs};
 use crate::executor::traits::{Ingested, InputsError, PresignError, UntrustedLimits};
@@ -214,6 +215,7 @@ impl HostWorker {
             }
             let Some(deadline) = w.deadline.filter(|deadline| at < *deadline) else {
                 tracing::warn!(worker = %self.id, %lease, "a Start outside its window is dropped");
+                ctx.deps.metrics.late_start();
                 self.drop_task(lease);
                 continue;
             };
@@ -226,10 +228,13 @@ impl HostWorker {
                     self.set_stage(lease, Stage::Waiting(w));
                 }
                 Queued::Posted(running) => self.set_stage(lease, Stage::Running(running)),
-                Queued::Settled(settled) => self.settle_with(lease, &settled, now),
+                Queued::Settled(settled) => {
+                    self.settle_with(lease, &settled, now, &ctx.deps.metrics);
+                }
                 Queued::Retire(why) => return ControlFlow::Break(why),
                 Queued::Late => {
                     tracing::warn!(worker = %self.id, %lease, "a Start ran out of its window while it was prepared and is dropped");
+                    ctx.deps.metrics.late_start();
                     self.drop_task(lease);
                 }
             }
@@ -244,9 +249,16 @@ impl HostWorker {
     }
 
     /// Forms the result of `lease` from `settled`, to be reported.
-    fn settle_with(&mut self, lease: kbf_types::LeaseId, settled: &Settled, now: Instant) {
+    fn settle_with(
+        &mut self,
+        lease: kbf_types::LeaseId,
+        settled: &Settled,
+        now: Instant,
+        metrics: &Metrics,
+    ) {
         let action = self.tasks[&lease].action.clone();
         let result = result_of(lease, &action, settled);
+        metrics.run_ended(RunEnd::of(&result));
         self.set_stage(lease, reporting(result, now));
     }
 
@@ -338,7 +350,8 @@ impl HostWorker {
         let key = ctx
             .deps
             .ingest
-            .mint(lease, action)
+            .mint(lease, action, wall)
+            .await
             .map_err(|e| Settled::Infra(format!("no key for the pack: {e}")))?;
         let pack = ctx
             .deps
@@ -494,7 +507,9 @@ impl HostWorker {
             return;
         }
         match judge(run, truncated) {
-            Verdict::Settled(settled) => self.settle_with(lease, &settled, now),
+            Verdict::Settled(settled) => {
+                self.settle_with(lease, &settled, now, &ctx.deps.metrics);
+            }
             Verdict::Ingest => {
                 let action = self.tasks[&lease].action.clone();
                 let ingest = std::sync::Arc::clone(&ctx.deps.ingest);
@@ -517,9 +532,12 @@ impl HostWorker {
         for (lease, task) in &mut self.tasks {
             match &mut task.stage {
                 Stage::Ingesting(handle) => {
-                    let next = handle
-                        .now_or_never()
-                        .map(|done| reporting(ingested(*lease, &task.action, done), now));
+                    let next = handle.now_or_never().map(|done| {
+                        let (result, end) = ingested(*lease, &task.action, done);
+                        ctx.deps.metrics.ingested(end);
+                        ctx.deps.metrics.run_ended(RunEnd::of(&result));
+                        reporting(result, now)
+                    });
                     next.into_iter().for_each(|stage| task.stage = stage);
                 }
                 Stage::Reporting(report) => {
@@ -556,7 +574,10 @@ impl HostWorker {
         for (lease, task) in &self.tasks {
             let result = match &task.stage {
                 Stage::Reporting(report) => report.result.clone(),
-                _ => result_of(*lease, &task.action, &Settled::Lost(Lost::DaemonRestarted)),
+                _ => {
+                    ctx.deps.metrics.run_ended(RunEnd::Lost);
+                    result_of(*lease, &task.action, &Settled::Lost(Lost::DaemonRestarted))
+                }
             };
             ctx.deps.farm.report(&self.id, result).await;
         }
@@ -620,23 +641,21 @@ fn ingested(
     lease: kbf_types::LeaseId,
     action: &Digest,
     done: Result<Ingested, tokio::task::JoinError>,
-) -> kbf_proto::worker::Result {
+) -> (kbf_proto::worker::Result, IngestEnd) {
+    let infra = |why: String| result_of(lease, action, &Settled::Infra(why));
     match done {
-        Ok(Ingested::Ran { result, .. }) => ran(lease, action, *result),
-        Ok(Ingested::Reject(why)) => result_of(
-            lease,
-            action,
-            &Settled::Infra(format!("the pack was refused: {why}")),
+        Ok(Ingested::Ran { result, .. }) => (ran(lease, action, *result), IngestEnd::Ok),
+        Ok(Ingested::Reject(why)) => (
+            infra(format!("the pack was refused: {why}")),
+            IngestEnd::Rejected(why),
         ),
-        Ok(Ingested::Unavailable(why)) => result_of(
-            lease,
-            action,
-            &Settled::Infra(format!("the pack could not be read: {why}")),
+        Ok(Ingested::Unavailable(why)) => (
+            infra(format!("the pack could not be read: {why}")),
+            IngestEnd::Unavailable,
         ),
-        Err(e) => result_of(
-            lease,
-            action,
-            &Settled::Infra(format!("the ingest stopped: {e}")),
+        Err(e) => (
+            infra(format!("the ingest stopped: {e}")),
+            IngestEnd::Stopped,
         ),
     }
 }

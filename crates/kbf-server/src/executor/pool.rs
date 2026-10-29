@@ -171,6 +171,7 @@ pub(super) async fn adopt(ctx: &Ctx<'_>, now: Instant) -> Option<Vec<Slot>> {
             },
             (LeaseState::Pending, true) => slots.push(Slot::Pending { lease: lease.id }),
             (LeaseState::Held | LeaseState::Pending, false) => {
+                ctx.deps.metrics.stray_released();
                 release_lease(ctx, lease.id).await;
             }
             _ => {}
@@ -215,6 +216,7 @@ pub(super) async fn reconcile(ctx: &Ctx<'_>, slots: &[Slot]) -> bool {
         let live = matches!(lease.state, LeaseState::Held | LeaseState::Pending);
         if live && !held.contains(&lease.id) {
             tracing::warn!(lease = %lease.id, "releasing a lease no slot holds");
+            ctx.deps.metrics.stray_released();
             release_lease(ctx, lease.id).await;
         }
     }

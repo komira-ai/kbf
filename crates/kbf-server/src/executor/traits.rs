@@ -89,13 +89,19 @@ pub struct MintError(pub String);
 /// the task tool's exit 0, and never with a lock of the farm held.
 #[tonic::async_trait]
 pub trait Ingest: Send + Sync {
-    /// The key `lease` may write the pack of `action` under. Issued by the same secret that
-    /// [`ingest`](Self::ingest) verifies it with: a key the ingest did not issue for this
-    /// lease and this action is refused there. Called once for a farm lease.
+    /// The key `lease` may write the pack of `action` under, good for a run of `wall`. Issued
+    /// by the same secret that [`ingest`](Self::ingest) verifies it with: a key the ingest did
+    /// not issue for this lease and this action is refused there. Called once for a farm
+    /// lease, before the url and the grant of the same run are asked for.
     ///
     /// # Errors
     /// [`MintError`].
-    fn mint(&self, lease: LeaseId, action: &Digest) -> Result<PackKey, MintError>;
+    async fn mint(
+        &self,
+        lease: LeaseId,
+        action: &Digest,
+        wall: Duration,
+    ) -> Result<PackKey, MintError>;
 
     /// What `key` holds, for `action`, run under `lease`. Never trusts the pack.
     async fn ingest(

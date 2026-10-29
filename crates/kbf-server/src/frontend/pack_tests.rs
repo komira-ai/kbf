@@ -76,7 +76,7 @@ fn started(
     index: Option<Arc<dyn PackIndex>>,
 ) -> Result<FrontendHandle, Box<dyn Error>> {
     let shutdown = boxed(|| Ok(pending::<()>()));
-    Prepared::new(flags)?.start(None, index, shutdown)
+    Prepared::new(flags)?.start(None, index, shutdown, None)
 }
 
 async fn connect(addr: SocketAddr) -> ContentAddressableStorageClient<Channel> {

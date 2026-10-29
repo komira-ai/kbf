@@ -1,5 +1,6 @@
 //! The pool of leases: acquired, kept, rotated, found again after a restart, and released.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use kbf_lease_client::LeaseState;
@@ -20,7 +21,7 @@ fn short_leases(cfg: &mut Config) {
 
 /// Catches an executor that reaches for the lease server before it is run: building one asks
 /// for nothing, and a config that breaks a rule is refused before anything is built. (What a
-/// server without an executor never does is for the wiring to test: nothing builds one yet.)
+/// server without an executor never does is tested at the frontend, in tests/executor_flag.rs.)
 #[tokio::test(start_paused = true)]
 async fn building_an_executor_asks_the_lease_server_for_nothing() {
     let rig = Rig::start(&["node1"], 1, |_| {}).await;
@@ -32,6 +33,7 @@ async fn building_an_executor_asks_the_lease_server_for_nothing() {
         ingest: rig.ingest.clone(),
         presign: rig.presign.clone(),
         inputs: rig.inputs.clone(),
+        metrics: Arc::default(),
     };
     let none = Config {
         hosts: 0,

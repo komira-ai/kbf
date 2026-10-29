@@ -21,7 +21,10 @@
 
 mod api;
 mod config;
+mod driver;
+mod front;
 mod host;
+mod metrics;
 mod outcome;
 mod pool;
 mod runs;
@@ -37,7 +40,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::future::join_all;
-use kbf_lease_client::{Client, Error, ErrorCode, Host, Lease, LeaseId};
+use kbf_lease_client::{Client, Error, ErrorCode, Host, Lease, LeaseId, LeaseState};
 use kbf_types::WorkerId;
 use tokio::time::Instant;
 
@@ -45,6 +48,9 @@ use crate::Farm;
 use pool::Slot;
 
 pub use config::{Config, ConfigError};
+pub use driver::Running;
+pub use front::{Front, FrontParts, PrepareError, PreparedRun, RunPrepare, RunSource};
+pub use metrics::Metrics;
 pub use task::{Delivery, Nonce, PackKey, Secret, TaskArgs, build_id};
 pub use traits::{
     ActionFacts, Ingest, Ingested, Inputs, InputsError, MintError, Presign, PresignError,
@@ -111,6 +117,8 @@ pub struct Deps {
     pub presign: Arc<dyn Presign>,
     /// The CAS read of an action, and the read grant.
     pub inputs: Arc<dyn Inputs>,
+    /// What the executor counts.
+    pub metrics: Arc<Metrics>,
 }
 
 /// What one pass reads once for every worker.
@@ -264,6 +272,37 @@ impl Executor {
         self.slots.iter().filter_map(Slot::info).collect()
     }
 
+    /// How often the caller steps the executor.
+    #[must_use]
+    pub fn poll(&self) -> Duration {
+        self.cfg.poll
+    }
+
+    /// How often the caller checks that no other frontend holds hosts.
+    #[must_use]
+    pub fn rival_check(&self) -> Duration {
+        self.cfg.reconcile_every
+    }
+
+    /// The id of another frontend that holds a live lease on the lease server, if one does.
+    /// The executor runs on exactly one frontend: two would each stop the other's runs on
+    /// restart and share hosts the farm knows one of. Nothing is concluded from a list that
+    /// could not be read.
+    pub async fn rival(&self) -> Option<String> {
+        let ctx = Ctx {
+            cfg: &self.cfg,
+            deps: &self.deps,
+            clock: &self.clock,
+            strays: &self.strays,
+        };
+        let leases = ctx.api().leases().await.ok()?;
+        leases.into_iter().find_map(|lease| {
+            let live = matches!(lease.state, LeaseState::Held | LeaseState::Pending);
+            let other = lease.labels.get(pool::FRONTEND_LABEL)?;
+            (live && *other != self.cfg.frontend).then(|| other.clone())
+        })
+    }
+
     /// One pass over every slot: leases are asked for, kept and released, the farm's
     /// messages taken, runs posted and read, results reported, heartbeats sent. A caller
     /// steps it every [`Config::poll`]; a pass never waits on a run. A pass is run to its end:
@@ -301,6 +340,8 @@ impl Executor {
         }
         let view = read(&ctx, slots, hosts_read, now).await;
         join_all(slots.iter_mut().map(|slot| slot.drive(&ctx, &view, now))).await;
+        deps.metrics
+            .hold(slots.iter().filter(|slot| slot.is_active()).count());
     }
 
     /// Stops what runs and releases every lease. The executor holds nothing afterwards, and
@@ -315,6 +356,7 @@ impl Executor {
         let slots = std::mem::take(&mut self.slots);
         join_all(slots.into_iter().map(|slot| slot.release(&ctx))).await;
         self.adopted = false;
+        self.deps.metrics.hold(0);
     }
 }
 

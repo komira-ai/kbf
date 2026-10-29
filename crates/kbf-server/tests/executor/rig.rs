@@ -177,7 +177,12 @@ impl FakeIngest {
 
 #[tonic::async_trait]
 impl Ingest for FakeIngest {
-    fn mint(&self, lease: kbf_types::LeaseId, _action: &Digest) -> Result<PackKey, MintError> {
+    async fn mint(
+        &self,
+        lease: kbf_types::LeaseId,
+        _action: &Digest,
+        _wall: Duration,
+    ) -> Result<PackKey, MintError> {
         match locked(&self.mint_fails).take() {
             Some(why) => Err(MintError(why)),
             None => Ok(PackKey::new(format!(
@@ -373,6 +378,7 @@ impl Rig {
             ingest: ingest.clone(),
             presign: presign.clone(),
             inputs: inputs.clone(),
+            metrics: Arc::default(),
         };
         Executor::new(cfg.clone(), deps, Clock::from_unix_ms(fake.now_ms()))
             .expect("a valid config")
