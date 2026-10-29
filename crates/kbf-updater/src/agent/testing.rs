@@ -100,6 +100,9 @@ pub struct LocalWorld {
     pub before: Option<Version>,
     /// Called at the start of an install, without the lock held.
     pub on_install: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Called at the start of a switch, without the lock held: a test makes the switch take
+    /// time here.
+    pub on_switch: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Called at the start of a confirm, without the lock held.
     pub on_confirm: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -134,6 +137,7 @@ impl FakeLocal {
             mute_after_revert: false,
             before: None,
             on_install: None,
+            on_switch: None,
             on_confirm: None,
         };
         Self {
@@ -167,6 +171,10 @@ impl Local for FakeLocal {
 
     fn switch(&self, version: &Version) -> Result<u64, LocalError> {
         self.events.push(format!("local:switch {version}"));
+        let hook = self.world().on_switch.clone();
+        if let Some(hook) = hook {
+            hook();
+        }
         let mut world = self.world();
         let deadline = world.switch.clone()?;
         world.before = world.state.version.clone();

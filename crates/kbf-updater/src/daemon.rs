@@ -11,14 +11,14 @@
 //! - `--token-file`: the file holding the operator bearer token.
 //!
 //! Optional: `--peer-ready-secs` (default 30, at least 1) and `--frontend-drain-deadline-secs`
-//! (default 1200, at least 1), for the frontend pool members (lines of the inventory with
+//! (no default, at least 1, no upper bound), for the frontend pool members (lines of the inventory with
 //! `instance=` and `base=`). The updater runs on the frontend host: it reaches each member's
 //! operator API (its `base` plus two) on loopback with the token it uses for `--operator-api`.
 //! A member is rolled behind whatever load balancer there is (`updater_no_proxy.rs`): it drains
 //! itself and exits, and is restarted on the new package, after every other member has answered
-//! `/readyz` 200 for `--peer-ready-secs` in a row. `--frontend-drain-deadline-secs` is how long a
-//! member is given to exit after it is told to drain; it must be longer than the longest
-//! execution a member may have open, which its drain waits for.
+//! `/readyz` 200 for `--peer-ready-secs` in a row. A member's drain waits for the executions open
+//! on it and for its exit however long that takes; `--frontend-drain-deadline-secs`, when given,
+//! only stops the waiting: the roll fails with the member left draining.
 //!
 //! And the socket, one of two (never both):
 //!
@@ -36,13 +36,14 @@
 //! - `--channel`: the package channel an install comes from;
 //! - optional `--ssh-connect-timeout-secs` (default 10) and `--ssh-command-timeout-secs`
 //!   (default 900, the time one install may take);
-//! - optional `--drain-deadline-secs` (default 600, at least 1);
+//! - optional `--drain-deadline-secs` (no default, at least 1, no upper bound);
 //! - optional `--apply-poll-secs` (default 5, at least 1) and `--apply-deadline-secs` (default
 //!   600, at least 1), for `mac-daemon` hosts.
 //!
 //! A daemon host's node is drained at the frontend before its install and given back after
-//! it runs the target ([`crate::node_drain`]); `--drain-deadline-secs` (default 600) is how long
-//! its leases are waited for. The health check is real for storage and daemon hosts and refuses a
+//! it runs the target ([`crate::node_drain`]); without `--drain-deadline-secs` its leases
+//! are waited for however long they take; with it, a deadline that passes stops the roll with the
+//! node left drained and nothing installed. The health check is real for storage and daemon hosts and refuses a
 //! frontend that is no pool member ([`crate::node_health`]); the roll asks it before it
 //! installs, so ssh is never run for one. A frontend pool member is rolled through its own API
 //! ([`crate::frontend_http`]).
@@ -112,8 +113,6 @@ const DEFAULT_CONNECT_SECS: u64 = 10;
 /// How long one call may take, unless a flag says otherwise: as long as a restart waits for
 /// an install that is in progress.
 const DEFAULT_COMMAND_SECS: u64 = 900;
-/// How long a daemon host's node is given to finish its leases, unless a flag says otherwise.
-const DEFAULT_DRAIN_SECS: u64 = 600;
 /// How often a Mac host is asked how its apply stands, unless a flag says otherwise.
 const DEFAULT_APPLY_POLL_SECS: u64 = 5;
 /// How long a Mac host's apply may take, unless a flag says otherwise.
@@ -121,9 +120,24 @@ const DEFAULT_APPLY_DEADLINE_SECS: u64 = 600;
 /// How long every other frontend member must have been ready in a row before a member is drained,
 /// unless a flag says otherwise.
 const DEFAULT_PEER_READY_SECS: u64 = 30;
-/// How long a frontend member is given to exit after it is told to drain, unless a flag
-/// says otherwise: 20 minutes, for executions that run up to that long.
-const DEFAULT_FRONTEND_DRAIN_SECS: u64 = 1200;
+
+/// A drain deadline flag: absent is no deadline (wait however long it takes); given, a number of
+/// seconds from 1 up, with no upper bound. Zero is refused: a deadline of nothing is not one.
+fn optional_seconds(
+    found: &mut BTreeMap<&str, String>,
+    flag: &str,
+) -> Result<Option<Duration>, String> {
+    match found.remove(flag) {
+        None => Ok(None),
+        Some(text) => match text.parse::<u64>() {
+            Ok(0) => Err(format!(
+                "{flag} must be at least 1 (leave it out to wait however long it takes)"
+            )),
+            Ok(n) => Ok(Some(Duration::from_secs(n))),
+            Err(_) => Err(format!("{flag} must be a number of seconds")),
+        },
+    }
+}
 
 /// The settings of a run.
 #[derive(Clone, Debug)]
@@ -143,9 +157,10 @@ pub struct Config {
     pub channel: String,
     pub ssh_connect_timeout: Duration,
     pub ssh_command_timeout: Duration,
-    /// How long a daemon host's node is given to finish its leases once drained; its host is
-    /// installed when that is out, leases or not.
-    pub drain_deadline: Duration,
+    /// How long a daemon host's node is waited for to finish its leases once drained; absent,
+    /// as long as it takes. When it is out the host is not installed: the roll stops with the
+    /// node left drained.
+    pub drain_deadline: Option<Duration>,
     /// How often a `mac-daemon` host is asked how its apply stands.
     pub apply_poll: Duration,
     /// How long a `mac-daemon` host's apply may take to be done for the target.
@@ -153,8 +168,9 @@ pub struct Config {
     /// How long every other frontend member must answer `/readyz` 200 in a row before a member
     /// is drained.
     pub peer_ready: Duration,
-    /// How long a frontend member is given to exit after it is told to drain.
-    pub frontend_drain_deadline: Duration,
+    /// How long a frontend member is waited for to exit after it is told to drain; absent, as
+    /// long as it takes. When it is out the roll fails with the member left draining.
+    pub frontend_drain_deadline: Option<Duration>,
 }
 
 /// The settings from the command line (without the program name) and from what the service
@@ -208,10 +224,6 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
     };
     let ssh_connect_timeout = seconds("--ssh-connect-timeout-secs", DEFAULT_CONNECT_SECS)?;
     let ssh_command_timeout = seconds("--ssh-command-timeout-secs", DEFAULT_COMMAND_SECS)?;
-    let drain_deadline = seconds("--drain-deadline-secs", DEFAULT_DRAIN_SECS)?;
-    if drain_deadline.is_zero() {
-        return Err("--drain-deadline-secs must be at least 1".to_owned());
-    }
     let apply_poll = seconds("--apply-poll-secs", DEFAULT_APPLY_POLL_SECS)?;
     if apply_poll.is_zero() {
         return Err("--apply-poll-secs must be at least 1".to_owned());
@@ -224,13 +236,8 @@ pub fn parse_flags(args: &[String], activation: &Activation) -> Result<Config, S
     if peer_ready.is_zero() {
         return Err("--peer-ready-secs must be at least 1".to_owned());
     }
-    let frontend_drain_deadline = seconds(
-        "--frontend-drain-deadline-secs",
-        DEFAULT_FRONTEND_DRAIN_SECS,
-    )?;
-    if frontend_drain_deadline.is_zero() {
-        return Err("--frontend-drain-deadline-secs must be at least 1".to_owned());
-    }
+    let drain_deadline = optional_seconds(&mut found, "--drain-deadline-secs")?;
+    let frontend_drain_deadline = optional_seconds(&mut found, "--frontend-drain-deadline-secs")?;
     let listen = match (
         found.remove("--socket"),
         activation.passed_to(std::process::id())?,

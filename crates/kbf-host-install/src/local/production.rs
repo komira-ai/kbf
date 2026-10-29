@@ -201,7 +201,7 @@ pub(super) fn bound_container(
     if config.frontend_config == Path::new(super::frontend::config::CONFIG) {
         return Ok(None);
     }
-    super::frontend::config::FrontendConfig::load(trust, &config.frontend_config)
+    super::frontend::config::FrontendConfig::load_for_start(trust, &config.frontend_config)
         .map(|loaded| Some(loaded.run.name))
 }
 
@@ -212,13 +212,14 @@ fn serve_linux_for(config: &ServeConfig) -> Result<(), String> {
         let trust = Trust::root();
         let bound = bound_container(&trust, config)?;
         env.state_name = super::frontend::Files::of(bound.as_deref()).state;
-        return serve_linux_with(
-            config,
-            &env,
-            &trust,
-            super::frontend::production(config.frontend_config.clone(), bound),
-            &AtomicBool::new(false),
-        );
+        let backend = super::frontend::production(config.frontend_config.clone(), bound);
+        // A crash in the middle of a drain left the policy off: put it back before serving.
+        match backend.recover_restart_policy() {
+            Ok(Some(line)) => log(&line),
+            Ok(None) => {}
+            Err(why) => log(&format!("the restart policy was not checked: {why}")),
+        }
+        return serve_linux_with(config, &env, &trust, backend, &AtomicBool::new(false));
     }
     let format = match config.layout {
         Layout::Installer => {

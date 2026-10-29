@@ -21,9 +21,10 @@ pub struct Timing {
     pub healthy_frontend: Duration,
     pub healthy_storage: Duration,
     pub healthy_daemon: Duration,
-    /// How long a daemon host's node is given to finish its leases once it is drained. When
-    /// the time is out the host is installed anyway, with the leases it still holds.
-    pub drain_deadline: Duration,
+    /// How long a daemon host's node is waited for to finish its leases once it is drained.
+    /// `None`, the default, waits however long they take. When a set time is out the host is
+    /// not installed: the roll stops with the node left drained.
+    pub drain_deadline: Option<Duration>,
     /// Between two asks of a Mac host how its apply stands.
     pub apply_poll: Duration,
     /// How long a Mac host's apply may take, from the answer `apply_started` (or from a
@@ -33,11 +34,10 @@ pub struct Timing {
     /// `/readyz` 200 without a miss before the member is drained. The wait for that window,
     /// which a miss restarts, is given this and [`Timing::healthy_frontend`] on top.
     pub peer_ready: Duration,
-    /// For a frontend member rolled without a proxy: how long the member is given, from the
-    /// start of its own drain, to exit. It must be longer than the longest execution that a
-    /// member may have open, which the drain waits for: the frontend in this tree puts no bound
-    /// on a drain that its endpoint began.
-    pub frontend_drain: Duration,
+    /// For a frontend member rolled without a proxy: how long the member is waited for, from the
+    /// start of its own drain, to exit. `None`, the default, waits until it has exited however
+    /// long that takes. When a set time is out the roll fails and the member is left draining.
+    pub frontend_drain: Option<Duration>,
 }
 
 impl Default for Timing {
@@ -50,11 +50,11 @@ impl Default for Timing {
             healthy_frontend: Duration::from_secs(300),
             healthy_storage: Duration::from_secs(300),
             healthy_daemon: Duration::from_secs(780),
-            drain_deadline: Duration::from_secs(600),
+            drain_deadline: None,
             apply_poll: Duration::from_secs(5),
             apply_deadline: Duration::from_secs(600),
             peer_ready: Duration::from_secs(30),
-            frontend_drain: Duration::from_secs(1200),
+            frontend_drain: None,
         }
     }
 }
