@@ -46,6 +46,7 @@ use super::learning::Learning;
 use super::report_hooks::ReportHooks;
 use crate::action_usage::Subject;
 use crate::answer::{Detail, Pending, failed, finished_of, refused_as};
+use crate::farm::NodeLoads;
 use crate::farm::durable::{named, subject};
 use crate::farm::failed_actions::{Class, FailedActions, class_of};
 use crate::fleet::quarantine_change;
@@ -98,6 +99,9 @@ pub struct KbfAdapter {
     pub(super) pack_writes: BTreeMap<WorkerId, worker::PackWriteCounts>,
     /// What each registered worker's newest stream said of itself ([`WorkerFacts`]).
     pub(super) facts: BTreeMap<WorkerId, WorkerFacts>,
+    /// What each node's load readings have come to, under the accept rule the farm's own
+    /// driver uses ([`crate::farm::NodeLoads`]).
+    pub(super) node_loads: NodeLoads,
     /// The operations this adapter settled or refused as failed, per class
     /// (`kbf_execute_failed_actions_total`).
     failed: FailedActions,
@@ -164,6 +168,7 @@ impl KbfAdapter {
             pack_reads: BTreeMap::new(),
             pack_writes: BTreeMap::new(),
             facts: BTreeMap::new(),
+            node_loads: NodeLoads::new(),
             failed: FailedActions::default(),
             unreadable_results: 0,
             hooks: ReportHooks::default(),

@@ -5,12 +5,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_proto::worker::{LeaseId as ProtoLease, NodeLoad, ServerMessage};
+use kbf_proto::worker::{LeaseClock, LeaseId as ProtoLease, LeaseMinute, NodeLoad, ServerMessage};
 use kbf_sched::DaemonInstance;
 use kbf_types::{Resources, WorkerId};
 
 use super::*;
+use crate::PlacementLoad;
 use crate::farm::phase::Reported;
+use crate::fleet::{DroppedView, ListsView};
 
 const GIB: u64 = 1 << 30;
 const SECOND: u64 = 1_000_000;
@@ -37,7 +39,8 @@ fn reading(seq: u64, mono: u64, usage: u64) -> NodeLoad {
     }
 }
 
-/// `kept` with `next` taken as `session` at `now` on a node of `capacity`.
+/// What is kept after `next` is taken (or refused) as `session` at `now` on a node of `capacity`,
+/// with `kept` before it.
 fn take(
     kept: Option<Kept>,
     session: &Session,
@@ -45,7 +48,7 @@ fn take(
     capacity: &Resources,
     now: u64,
 ) -> Option<Kept> {
-    Kept::take(kept, session, next, capacity, at(now))
+    Kept::take(kept, session, next, capacity, at(now)).kept
 }
 
 fn newest_seq(kept: &Option<Kept>) -> Option<u64> {
@@ -174,18 +177,12 @@ fn a_new_session_resets_the_baseline() {
     assert_eq!(restarted.windows, [None, None]);
 
     // A daemon that names no process is a new session on each stream.
-    let a = Session::of(&DaemonInstance::new(""), StreamId(1));
-    let b = Session::of(&DaemonInstance::new(""), StreamId(2));
+    let a = Session::of("", StreamId(1));
+    let b = Session::of("", StreamId(2));
     assert_ne!(a, b);
-    assert_eq!(a, Session::of(&DaemonInstance::new(""), StreamId(1)));
-    assert_eq!(
-        Session::of(&DaemonInstance::new("p"), StreamId(1)),
-        process("p")
-    );
-    assert_eq!(
-        Session::of(&DaemonInstance::new("p"), StreamId(2)),
-        process("p")
-    );
+    assert_eq!(a, Session::of("", StreamId(1)));
+    assert_eq!(Session::of("p", StreamId(1)), process("p"));
+    assert_eq!(Session::of("p", StreamId(2)), process("p"));
 }
 
 /// Catches each validation failing to drop its reading, a dropped reading moving the baseline,
@@ -337,8 +334,10 @@ fn the_admission_working_set_drops_active_file_beyond_a_quarter_of_memory() {
 
 // The farm's wiring.
 
+/// A farm on the core under test: the farm's own, and the js core in a build with
+/// `farm-core-js`.
 fn farm() -> Farm {
-    Farm::new_legacy(
+    Farm::new(
         Arc::new(kbf_front::Cache::memory()),
         kbf_sched::UNSERVABLE_WAIT,
         kbf_sched::FINISHED_RETENTION,
@@ -380,10 +379,6 @@ fn detail(farm: &Farm, name: &str) -> crate::fleet::NodeDetail {
 /// or of a node that never registered is ignored, the same daemon process on a new stream
 /// keeps its baseline, a restarted one resets it, and the view goes stale on the farm's clock.
 #[tokio::test(start_paused = true)]
-#[cfg_attr(
-    feature = "farm-core-js",
-    ignore = "known-different-on-js: the js core keeps no node load"
-)]
 async fn readings_reach_the_node_view() {
     let farm = farm();
     let a = WorkerId::new("a");
@@ -401,10 +396,10 @@ async fn readings_reach_the_node_view() {
     let second = register(&farm, "a", "proc-1");
     farm.note_node_load(&a, first, Some(&reading(9, 9 * SECOND, 9 * SECOND)));
     farm.note_node_load(&a, second, Some(&reading(2, 3 * SECOND, 3 * SECOND)));
-    assert_eq!(farm.lock().side.node_loads[&a].last.seq, 2);
+    assert_eq!(farm.kept_load(&a).expect("kept").last.seq, 2);
     farm.note_node_load(&a, second, Some(&reading(3, 2 * SECOND, 3 * SECOND)));
     assert_eq!(
-        farm.lock().side.node_loads[&a].last.seq,
+        farm.kept_load(&a).expect("kept").last.seq,
         2,
         "the clock did not move"
     );
@@ -429,13 +424,7 @@ async fn readings_reach_the_node_view() {
         StreamId(0),
         Some(&reading(1, 1, 1)),
     );
-    assert!(
-        !farm
-            .lock()
-            .side
-            .node_loads
-            .contains_key(&WorkerId::new("ghost"))
-    );
+    assert!(farm.kept_load(&WorkerId::new("ghost")).is_none());
 
     // Two readings a second apart, then no heartbeat for more than three seconds.
     farm.note_node_load(&a, third, Some(&reading(2, SECOND / 2 + SECOND, SECOND)));
@@ -448,15 +437,242 @@ async fn readings_reach_the_node_view() {
     assert_eq!(stale.measured_cpu_millicores, None);
 }
 
+// The lists of a reading, and the feed to the scheduler.
+
+fn lease(seq: u64) -> ProtoLease {
+    ProtoLease { term: 1, seq }
+}
+
+fn clock(seq: u64, started_mono_usec: u64) -> LeaseClock {
+    LeaseClock {
+        lease: Some(lease(seq)),
+        started_mono_usec,
+    }
+}
+
+fn minute(seq: u64, minute: u32) -> LeaseMinute {
+    LeaseMinute {
+        lease: Some(lease(seq)),
+        minute,
+        cpu_mean_millis: 100,
+        cpu_peak_window_millis: 200,
+        ws_max_bytes: 1 << 20,
+    }
+}
+
+/// `reading(seq, mono, 0)` carrying `minutes`.
+fn with_minutes(seq: u64, mono: u64, minutes: Vec<LeaseMinute>) -> NodeLoad {
+    NodeLoad {
+        minutes,
+        ..reading(seq, mono, 0)
+    }
+}
+
+fn counts(
+    (clocks, minutes): (u64, u64),
+    (invalid, duplicate, over_cap): (u64, u64, u64),
+    refused_minutes: u64,
+) -> ListsView {
+    ListsView {
+        clocks,
+        minutes,
+        dropped: DroppedView {
+            invalid,
+            duplicate,
+            over_cap,
+        },
+        refused_minutes,
+    }
+}
+
+/// Asserts what the accept rule does with the lists of a reading: the records that pass the
+/// vet are returned and counted, each reason of a drop on its own count, the counts add up
+/// over the readings of a session, the minutes of a refused reading are counted as refused
+/// and nothing else, a refused first reading counts nowhere, and a new session starts the
+/// counts again. The kept `covered` is the vetted one: at most 96 leases, each once.
+#[test]
+fn the_lists_of_an_accepted_reading_are_vetted_and_counted() {
+    let s = process("d");
+    let broken = LeaseMinute {
+        cpu_mean_millis: 300,
+        ..minute(7, 1)
+    };
+    let load = NodeLoad {
+        covered: (0..100).map(lease).collect(),
+        // The second is a repeat of the first; the third starts after the reading.
+        lease_clocks: vec![
+            clock(1, SECOND),
+            clock(1, 2 * SECOND),
+            clock(2, 11 * SECOND),
+        ],
+        // The second has a mean above its peak; the third is a repeat of the first.
+        minutes: vec![minute(7, 0), broken, minute(7, 0)],
+        ..reading(1, 10 * SECOND, 0)
+    };
+    let taken = Kept::take(None, &s, &load, &node(), at(0));
+    let vetted = taken.vetted.expect("accepted");
+    assert_eq!(vetted.minutes, [minute(7, 0)]);
+    assert_eq!(vetted.clocks, [clock(1, SECOND)]);
+    let kept = taken.kept.expect("kept");
+    assert_eq!(kept.last.covered.len(), 96);
+    assert_eq!(kept.lists.view(), counts((1, 1), (2, 2, 4), 0));
+
+    // The next accepted reading adds to the counts.
+    let next = with_minutes(2, 11 * SECOND, vec![minute(7, 1), minute(7, 2)]);
+    let kept = take(Some(kept), &s, &next, &node(), 0).expect("kept");
+    assert_eq!(kept.lists.view(), counts((1, 3), (2, 2, 4), 0));
+
+    // A refused reading counts its minutes as refused, and changes nothing else.
+    let again = with_minutes(2, 12 * SECOND, vec![minute(7, 3); 5]);
+    let taken = Kept::take(Some(kept), &s, &again, &node(), at(0));
+    assert!(taken.vetted.is_none());
+    let kept = taken.kept.expect("kept");
+    assert_eq!(kept.last.seq, 2);
+    assert_eq!(kept.lists.view(), counts((1, 3), (2, 2, 4), 5));
+
+    // A reading of a new session starts the counts again, and a refused first one has no
+    // state to count in.
+    let fresh = with_minutes(1, SECOND, vec![minute(7, 0)]);
+    let kept = take(Some(kept), &process("new"), &fresh, &node(), 0).expect("kept");
+    assert_eq!(kept.lists.view(), counts((0, 1), (0, 0, 0), 0));
+    let refused = with_minutes(0, SECOND, vec![minute(7, 0)]);
+    let taken = Kept::take(None, &s, &refused, &node(), at(0));
+    assert!(taken.kept.is_none());
+    assert!(taken.vetted.is_none());
+}
+
+/// A heartbeat carrying `load`, as the worker session handles one: the accepted reading goes to
+/// the scheduler with the heartbeat, and a refused one leaves it with none.
+async fn beat(farm: &Farm, worker: &WorkerId, stream: StreamId, seq: u64, load: &NodeLoad) -> bool {
+    let fed = farm.note_node_load(worker, stream, Some(load));
+    farm.heartbeat_with_load(worker, stream, seq, Vec::new(), fed)
+        .await
+}
+
+fn accepted(farm: &Farm) -> u64 {
+    farm.load_counters().readings_accepted
+}
+
+/// Asserts that an accepted reading comes back from `note_node_load` as the load the scheduler
+/// takes, with the lists that passed the vet and the ids of the scheduler's own type, that it
+/// is the heartbeat carrying it that the scheduler hears (the scheduler counts it as accepted
+/// then and not before), and that a heartbeat with no reading feeds it nothing.
+#[tokio::test(start_paused = true)]
+async fn an_accepted_reading_is_handed_to_the_scheduler_with_its_lists() {
+    let farm = farm();
+    let a = WorkerId::new("a");
+    let stream = register(&farm, "a", "proc");
+    let load = NodeLoad {
+        covered: vec![lease(7)],
+        lease_clocks: vec![clock(7, 5 * SECOND)],
+        minutes: vec![minute(7, 0)],
+        ..reading(1, 10 * SECOND, 0)
+    };
+    let fed = farm.note_node_load(&a, stream, Some(&load)).expect("fed");
+    assert_eq!(fed.seq, 1);
+    assert_eq!(fed.covered, [LeaseId::new(1, 7)]);
+    assert_eq!(fed.lease_clocks.len(), 1);
+    assert_eq!(fed.minutes.len(), 1);
+    assert_eq!(accepted(&farm), 0, "noting a reading is not feeding it");
+    assert!(
+        farm.heartbeat_with_load(&a, stream, 1, Vec::new(), Some(fed))
+            .await
+    );
+    assert_eq!(accepted(&farm), 1);
+
+    assert!(beat(&farm, &a, stream, 2, &reading(2, 11 * SECOND, SECOND)).await);
+    assert_eq!(accepted(&farm), 2);
+    assert!(farm.heartbeat(&a, stream, 3, Vec::new()).await);
+    assert_eq!(accepted(&farm), 2, "a heartbeat with no reading feeds none");
+}
+
+/// Asserts that a reading the accept rule refuses (a repeat of the last seq, an older one, a
+/// clock that went back) is not handed to the scheduler, and that the minutes it carried are
+/// counted as refused in the node view; and that the refused first reading of a restarted
+/// daemon feeds nothing either and leaves the node without a load.
+#[tokio::test(start_paused = true)]
+async fn a_refused_reading_feeds_nothing_and_counts_its_minutes() {
+    let farm = farm();
+    let a = WorkerId::new("a");
+    let stream = register(&farm, "a", "proc");
+    let first = with_minutes(5, 10 * SECOND, vec![minute(7, 0)]);
+    assert!(beat(&farm, &a, stream, 1, &first).await);
+    assert_eq!(accepted(&farm), 1);
+
+    let three = |seq, mono| with_minutes(seq, mono, vec![minute(7, 1), minute(7, 2), minute(7, 3)]);
+    let refused = [
+        ("a repeat of the last seq", three(5, 11 * SECOND)),
+        ("an older seq", three(4, 11 * SECOND)),
+        ("a clock that went back", three(6, 9 * SECOND)),
+    ];
+    for (n, (why, load)) in refused.iter().enumerate() {
+        let fed = farm.note_node_load(&a, stream, Some(load));
+        assert!(fed.is_none(), "{why}");
+        let seq = 2 + n as u64;
+        let acked = farm
+            .heartbeat_with_load(&a, stream, seq, Vec::new(), fed)
+            .await;
+        assert!(acked, "{why}");
+    }
+    assert_eq!(
+        accepted(&farm),
+        1,
+        "no refused reading reached the scheduler"
+    );
+    let lists = detail(&farm, "a").load.expect("a load").lists;
+    assert_eq!(lists, counts((0, 1), (0, 0, 0), 9));
+
+    // The first reading of a restarted daemon that is refused has no counts to add to: it
+    // feeds nothing, and the node has no load to show until one is accepted.
+    let restarted = register(&farm, "a", "proc-2");
+    let bad = with_minutes(0, SECOND, vec![minute(7, 0)]);
+    assert!(farm.note_node_load(&a, restarted, Some(&bad)).is_none());
+    assert_eq!(detail(&farm, "a").load, None);
+}
+
+/// Asserts that a heartbeat of a replaced stream feeds the scheduler nothing, even when it
+/// carries the load a reading came to: it is not taken (not acknowledged) and the scheduler's
+/// count of accepted readings does not move; the same load on the stream that replaced it is
+/// fed.
+#[tokio::test(start_paused = true)]
+async fn a_heartbeat_of_a_replaced_stream_feeds_nothing() {
+    let farm = farm();
+    let a = WorkerId::new("a");
+    let old = register(&farm, "a", "proc-1");
+    let fed = farm
+        .note_node_load(&a, old, Some(&reading(1, SECOND, 0)))
+        .expect("fed");
+    let current = register(&farm, "a", "proc-2");
+
+    let taken = farm
+        .heartbeat_with_load(&a, old, 1, Vec::new(), Some(fed))
+        .await;
+    assert!(!taken, "a heartbeat of a replaced stream was taken");
+    assert_eq!(accepted(&farm), 0, "a replaced stream fed the scheduler");
+
+    assert!(beat(&farm, &a, current, 1, &reading(1, SECOND, 0)).await);
+    assert_eq!(accepted(&farm), 1);
+}
+
+/// Asserts that the scheduler is handed accepted readings under `--placement-load off` and
+/// under `on`: it keeps them either way, so the feed is warm before the flag is raised.
+#[tokio::test(start_paused = true)]
+async fn the_feed_reaches_the_scheduler_in_every_placement_mode() {
+    for mode in [PlacementLoad::Off, PlacementLoad::On] {
+        let farm = farm().with_placement_load(mode);
+        let a = WorkerId::new("a");
+        let stream = register(&farm, "a", "proc");
+        assert!(beat(&farm, &a, stream, 1, &reading(1, SECOND, 0)).await);
+        assert!(beat(&farm, &a, stream, 2, &reading(2, 2 * SECOND, SECOND)).await);
+        assert_eq!(accepted(&farm), 2, "{mode:?}");
+    }
+}
+
 /// Asserts that a restarted daemon whose first reading fails validation leaves the node with
 /// no load: the earlier process's reading is not shown for it, and a first reading that
 /// cannot be believed is not kept as a baseline. Catches the old session's reading kept
 /// after a restart, and a refused first reading stored anyway.
 #[tokio::test(start_paused = true)]
-#[cfg_attr(
-    feature = "farm-core-js",
-    ignore = "known-different-on-js: the js core keeps no node load"
-)]
 async fn a_restarted_daemons_unbelievable_first_reading_leaves_no_load() {
     let farm = farm();
     let a = WorkerId::new("a");
@@ -468,7 +684,7 @@ async fn a_restarted_daemons_unbelievable_first_reading_leaves_no_load() {
     let restarted = register(&farm, "a", "proc-2");
     farm.note_node_load(&a, restarted, Some(&reading(0, SECOND, 0)));
     assert_eq!(detail(&farm, "a").load, None);
-    assert!(!farm.lock().side.node_loads.contains_key(&a));
+    assert!(farm.kept_load(&a).is_none());
 
     // Its next believable reading is a first one again: no rate yet.
     farm.note_node_load(&a, restarted, Some(&reading(1, 2 * SECOND, SECOND)));

@@ -92,7 +92,7 @@ pub(in crate::farm) struct Side {
     pub pack_writes: BTreeMap<WorkerId, worker::PackWriteCounts>,
     /// What the accepted node-load readings of each node that sent any come to
     /// ([`Farm::note_node_load`](super::Farm::note_node_load)).
-    pub node_loads: BTreeMap<WorkerId, super::node_load::Kept>,
+    pub node_loads: super::node_load::NodeLoads,
     /// The operations this process settled as failed, per class
     /// (`kbf_execute_failed_actions_total`, [`Farm::failed_actions`](super::Farm::failed_actions)).
     pub failed: FailedActions,

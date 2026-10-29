@@ -103,6 +103,12 @@ jobs:
         if: ${{ !cancelled() }}
       - run: cargo test -p kbf-server --lib --features farm-core-js --locked farm::js::tests
         if: ${{ !cancelled() }}
+      # The farm-level node-load tests on the core that build runs (`Farm::new` takes the js
+      # core there): the same accept rule, node view and feed to the scheduler as on the
+      # farm's own driver; and the `/metrics` families of the scheduler's load counters and each
+      # node's load (`load_metrics`), over the same farm.
+      - run: cargo test -p kbf-server --lib --features farm-core-js --locked -- farm::node_load load_metrics
+        if: ${{ !cancelled() }}
       # The interpreter budget only shrinks: a pull request may not add a row to it
       # (crates/xtask/src/budget.rs). A pull request is checked out as the merge commit,
       # so HEAD^1 is the base branch it merges into.
