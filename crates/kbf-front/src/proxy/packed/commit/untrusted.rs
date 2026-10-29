@@ -15,6 +15,8 @@
 //!   [`MAX_COMMIT_BLOBS`] blobs, none over [`MAX_UNTRUSTED_BLOB_BYTES`]; blobs listed in strictly
 //!   ascending (hash, size) order; records that start at offset 0, follow each other with no gap and
 //!   no overlap, and end exactly where the footer starts (the pack's size less the footer's length).
+//!   A record has at least one byte: the empty blob is implicit and is in no pack, and records of
+//!   no bytes would put any number of digests at one offset.
 //!   The bytes the commit will read (the trailer, the footer and every record) must fit
 //!   [`UntrustedLimits::read_budget`]; a commit over it is refused without a read.
 //! - **Footer.** The trailer's magic, version and CRC, its blob count and where the records end
@@ -38,6 +40,7 @@ use kbf_segments::layout::{TRAILER_LEN, footer_len};
 use kbf_segments::{Footer, MAX_SEGMENT_BYTES, SegmentError};
 
 use super::{CommitError, MAX_COMMIT_BLOBS, Packs, offload, recording_failed};
+use crate::proxy::packed::metrics::Reason;
 
 /// The most bytes a pack of an untrusted writer may have: the most a segment may have.
 pub const MAX_UNTRUSTED_PACK_BYTES: u64 = MAX_SEGMENT_BYTES;
@@ -49,7 +52,7 @@ pub const MAX_UNTRUSTED_BLOB_BYTES: u64 = 64 << 20;
 /// The most bytes the record at offset 0 of an untrusted pack may have when the caller reads that
 /// record as the pack's manifest (the caller applies it; this module does not know which record
 /// is one).
-pub const MAX_UNTRUSTED_MANIFEST_BYTES: u64 = 1 << 20;
+pub const MAX_UNTRUSTED_MANIFEST_BYTES: u64 = 4 << 20;
 
 /// The most bytes one commit of an untrusted pack may read from the store: every byte of a pack
 /// of [`MAX_UNTRUSTED_PACK_BYTES`] once, and the trailer twice (the read of the trailer, which
@@ -152,25 +155,35 @@ impl Packs {
     ) -> Result<Recorded, CommitError> {
         let key = pack.key.clone();
         let done = self.committed_untrusted(issued, pack, limits).await;
-        self.counted(&key, done)
+        match &done {
+            Ok(recorded) if recorded.created => self.metrics.untrusted_commits.add(1),
+            Err((stage, error)) => {
+                if let Some(reason) = reason_of(*stage, error) {
+                    self.metrics.untrusted_rejects[reason as usize].add(1);
+                }
+            }
+            Ok(_) => {}
+        }
+        self.counted(&key, done.map_err(|(_, error)| error))
     }
 
-    /// The commit, without its counts.
+    /// The commit, without its counts; a refusal says which step made it.
     async fn committed_untrusted(
         &self,
         issued: &IssuedPackKey,
         pack: NewPack,
         limits: &UntrustedLimits,
-    ) -> Result<Recorded, CommitError> {
-        let layout = laid_out(issued, &pack, limits)?;
-        self.proved(&issued.object, &pack, &layout).await?;
+    ) -> Result<Recorded, (Stage, CommitError)> {
+        let layout = laid_out(issued, &pack, limits).map_err(|error| (Stage::Layout, error))?;
+        let proof = self.proved(&issued.object, &pack, &layout).await;
+        proof.map_err(|error| (Stage::Proof, error))?;
         let recorded = NewPack {
             writer: format!("b/{}", issued.build),
             ..pack
         };
         let index = Arc::clone(&self.index);
         let done = offload(move || index.record_pack(&recorded)).await;
-        done.map_err(recording_failed)
+        done.map_err(|error| (Stage::Index, recording_failed(error)))
     }
 
     /// Reads the trailer and the footer of the pack `key`, requires the footer to be the manifest
@@ -225,6 +238,30 @@ impl Packs {
     }
 }
 
+/// The step of a commit that refused it.
+#[derive(Clone, Copy)]
+enum Stage {
+    /// The manifest alone: the key, the shape and the layout.
+    Layout,
+    /// The reads: the trailer, the footer and every record.
+    Proof,
+    /// The pack index.
+    Index,
+}
+
+/// Under which reason a refusal is counted; none for a store or an index that failed.
+fn reason_of(stage: Stage, error: &CommitError) -> Option<Reason> {
+    match (error, stage) {
+        (CommitError::Forbidden(_), _) => Some(Reason::Forbidden),
+        (CommitError::Invalid(_), Stage::Proof) => Some(Reason::Footer),
+        (CommitError::Invalid(_), _) => Some(Reason::Shape),
+        (CommitError::Mismatch(_), _) => Some(Reason::Mismatch),
+        (CommitError::Missing(_), _) => Some(Reason::Missing),
+        (CommitError::Conflict(_), _) => Some(Reason::Conflict),
+        (CommitError::Unavailable(_), _) => None,
+    }
+}
+
 /// The refusal for a footer that cannot be one.
 fn damaged(error: SegmentError) -> CommitError {
     CommitError::Invalid(format!("the pack's footer: {error}"))
@@ -271,6 +308,9 @@ fn laid_out(
         .any(|blob| blob.digest.size > limits.max_blob_bytes)
     {
         return invalid(format!("a blob of over {} bytes", limits.max_blob_bytes));
+    }
+    if pack.blobs.iter().any(|blob| blob.digest.size == 0) {
+        return invalid("a record of no bytes".to_owned());
     }
     let mut by_offset: Vec<usize> = (0..given).collect();
     by_offset.sort_by_key(|&at| pack.blobs[at].offset);

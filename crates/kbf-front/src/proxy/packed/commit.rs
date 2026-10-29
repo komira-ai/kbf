@@ -29,7 +29,9 @@
 //! must be under `cas/d/`.
 //!
 //! Every refusal that is the commit's own (not a failure of the store or the index) is counted
-//! in `kbf_pack_commit_rejects_total` and logged.
+//! in `kbf_pack_commit_rejects_total` and logged. A commit of an untrusted pack is counted there
+//! too, and also in `kbf_pack_untrusted_commits_total` and, for a refusal, in
+//! `kbf_pack_untrusted_commit_rejects_total` by `reason`.
 
 use std::sync::Arc;
 
@@ -44,8 +46,8 @@ use super::store::{Packs, from_index, offload};
 mod untrusted;
 
 pub use self::untrusted::{
-    IssuedPackKey, MAX_UNTRUSTED_BLOB_BYTES, MAX_UNTRUSTED_MANIFEST_BYTES, MAX_UNTRUSTED_PACK_BYTES,
-    MAX_UNTRUSTED_READ_BYTES, UntrustedLimits,
+    IssuedPackKey, MAX_UNTRUSTED_BLOB_BYTES, MAX_UNTRUSTED_MANIFEST_BYTES,
+    MAX_UNTRUSTED_PACK_BYTES, MAX_UNTRUSTED_READ_BYTES, UntrustedLimits,
 };
 
 /// The most blobs one commit lists: the most the packer puts in a pack.

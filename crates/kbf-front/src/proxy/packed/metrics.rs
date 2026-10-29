@@ -79,8 +79,21 @@ pub struct PackMetrics {
     pub(super) untrusted_rejects: [Counter; UNTRUSTED_REASONS.len()],
 }
 
-/// Why a commit of an untrusted pack was refused, in the order of the counters.
-pub(super) const UNTRUSTED_REASONS: [&str; 6] = [
+/// Why a commit of an untrusted pack was refused: the key is not the one issued, the manifest
+/// cannot be a pack's, the footer is not the manifest, a record is not its digest, the pack is not
+/// in the store as said, or the key was recorded with other contents.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Reason {
+    Forbidden,
+    Shape,
+    Footer,
+    Mismatch,
+    Missing,
+    Conflict,
+}
+
+/// The label of each [`Reason`], in the order of the variants.
+const UNTRUSTED_REASONS: [&str; 6] = [
     "forbidden",
     "shape",
     "footer",
