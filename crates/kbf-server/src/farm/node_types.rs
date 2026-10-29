@@ -39,6 +39,8 @@ pub enum NodeAction {
     /// Offer it no new lease; its leases run on.
     Cordon,
     /// Cordon it and wait this long for its leases to end; then the drain pauses.
+    /// `Duration::MAX` ([`NO_DRAIN_DEADLINE`](crate::api::NO_DRAIN_DEADLINE)) waits for
+    /// ever: the stored deadline and the scheduler's saturate, and the views show none.
     Drain(Duration),
     /// Return it to placement, ending any drain.
     Uncordon,

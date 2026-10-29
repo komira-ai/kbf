@@ -7,7 +7,7 @@ use kbf_types::{FarmTime, WorkerId};
 use super::{Farm, NodeLook, NodeUnread, State, node_load};
 use crate::fleet::{
     LoadView, NodeDetail, NodeView, NodesView, PhaseView, PlacementView, ResourcesView,
-    needs_attention,
+    needs_attention, shown_deadline,
 };
 use crate::machine::FarmMachine;
 
@@ -118,12 +118,12 @@ pub(super) fn node_of(
         None => PlacementView::Serving,
         Some(Cordon::Cordoned) => PlacementView::Cordoned,
         Some(Cordon::Draining { deadline }) => PlacementView::Draining {
-            deadline_unix_ms: wall(*deadline),
+            deadline_unix_ms: shown_deadline(wall(*deadline)),
             leases: leases(),
         },
         Some(Cordon::Drained) => PlacementView::Drained,
         Some(Cordon::Paused { deadline }) => PlacementView::DrainPaused {
-            deadline_unix_ms: wall(*deadline),
+            deadline_unix_ms: shown_deadline(wall(*deadline)),
             leases: leases(),
         },
     };
