@@ -77,7 +77,8 @@ kbf cluster drain <node> --deadline-secs 600 --token-file /etc/kbf/api-token
 ```
 
 That is `POST /v1/nodes/{node}:drain` of [the operator API](../api.md); the node is `drained` once
-its leases have ended, and `draining` or `drain_paused` until then. Then plan the restart of the
+its leases have ended, and `draining` or `drain_paused` until then. Without `--deadline-secs` the
+drain has no deadline and never pauses: it waits for the leases however long they run. Then plan the restart of the
 member, with the id from `GET /v1/members`:
 
 ```text

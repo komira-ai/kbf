@@ -16,7 +16,7 @@ use cluster_support::{cluster, kbf, token_file};
 fn each_verb_sends_its_call_and_prints_the_answer() {
     let token = token_file("each", "kbf-test-token-0123456789abcdef0123456789");
     let bearer = "authorization: bearer kbf-test-token-0123456789abcdef0123456789";
-    let cases: [(&[&str], &str, &str); 10] = [
+    let cases: [(&[&str], &str, &str); 12] = [
         (&["status"], "GET /v1/nodes HTTP/1.1", ""),
         (
             &["status", "--frontend"],
@@ -39,6 +39,25 @@ fn each_verb_sends_its_call_and_prints_the_answer() {
             ],
             "POST /v1/nodes/rack%201%2Fa:drain HTTP/1.1",
             r#"{"deadline_secs":5}"#,
+        ),
+        // No `--deadline-secs`: an empty body, which the server reads as a drain with no
+        // deadline (it waits for the leases however long they run).
+        (
+            &["drain", "n1", "--token-file", &token],
+            "POST /v1/nodes/n1:drain HTTP/1.1",
+            "",
+        ),
+        (
+            &[
+                "drain",
+                "n1",
+                "--deadline-secs",
+                "0",
+                "--token-file",
+                &token,
+            ],
+            "POST /v1/nodes/n1:drain HTTP/1.1",
+            r#"{"deadline_secs":0}"#,
         ),
         (
             &["undrain", "n1", "--token-file", &token],
@@ -273,4 +292,15 @@ fn the_cluster_help_and_the_hint_name_every_verb_group() {
     ] {
         assert!(top.contains(word), "{word} missing from the hint: {top}");
     }
+}
+
+/// Catches `kbf cluster drain --help` still naming a default deadline: without
+/// `--deadline-secs` the drain has none.
+#[test]
+fn the_drain_help_says_no_deadline_is_the_default() {
+    let (code, out, err) = kbf(&["cluster", "drain", "--help"]);
+    assert_eq!(code, Some(0), "{err}");
+    let text = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(text.contains("Not given: no deadline"), "{out}");
+    assert!(!text.contains("30 minutes"), "{out}");
 }
