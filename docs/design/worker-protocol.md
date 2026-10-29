@@ -372,6 +372,19 @@ The daemon heartbeats at the interval `Welcome` named. A `Heartbeat` carries:
   daemon without the flag, and one built before the field, send none, and a server built before it
   skips the field. The server keeps the newest of each node for `GET /metrics`
   (`kbf_pack_daemon_*`, [api.md](../api.md#get-metrics)).
+- `node_load` (optional): one reading of the node's `actions/` cgroup (`NodeLoad`). `seq` counts up
+  by one from 1 for each reading within a daemon process; `mono_usec` is the daemon's monotonic
+  clock at the read of the CPU counter and `cpu_usage_usec` the cgroup's cumulative CPU time, so a
+  reader takes rates between two readings of one process; `memory_working_set_bytes` is
+  `memory.current` less the inactive file pages and `memory_active_file_bytes` the active file
+  pages; `covered` lists the leases that ran for the whole window since the previous reading;
+  `actions_cpu_limited` says the cgroup has a CPU quota; `cpu_throttled_usec` and
+  `cpu_pressure_some_total_usec` are telemetry, absent when the daemon could not read them. Fields
+  9 and 10 are reserved. The daemon sends it when its runtime takes readings (the container
+  runtime does); a reading that fails leaves it out (logged once per failing file), and a daemon
+  or runtime without readings, or one built before the field, sends none. A server built before the
+  field skips it. The server accepts and shows readings under the rule of
+  [api.md](../api.md#node-load) and places by none of them yet.
 
 The server acknowledges a heartbeat with `HeartbeatAck { seq }`, but only one from the
 node's newest stream. A heartbeat from a replaced stream is dropped unacknowledged, so

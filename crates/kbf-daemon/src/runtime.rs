@@ -10,7 +10,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use kbf_proto::reapi::{ActionResult, Digest};
-use kbf_proto::worker::ResourceUsage;
+use kbf_proto::worker::{NodeLoad, ResourceUsage};
 use kbf_types::{LeaseId, LeaseKind, LostWhy, Resources};
 use tokio::sync::oneshot;
 
@@ -98,6 +98,15 @@ pub async fn upload_within<T>(
         })
 }
 
+/// A runtime could not read the node's load. `kind` names what failed in a few fixed
+/// words (a file name), so the daemon can log one kind once instead of on every heartbeat.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{kind}: {why}")]
+pub struct NodeLoadError {
+    pub kind: &'static str,
+    pub why: String,
+}
+
 /// Runs leases. The lease manager never names a driver: it asks the runtime whether it
 /// serves a lease kind, and runs the lease through it.
 pub trait Runtime: Send + Sync + 'static {
@@ -115,6 +124,23 @@ pub trait Runtime: Send + Sync + 'static {
     /// carried. Called once, after `run` returned the error; a second call, or a runtime
     /// that measures nothing (the default), returns `None`.
     fn failed_usage(&self, _lease_id: LeaseId) -> Option<ResourceUsage> {
+        None
+    }
+
+    /// One reading of what the node's actions are doing, for the heartbeat. `Ok(None)`
+    /// for a runtime that takes no readings (the default). The reading is made off the
+    /// async workers.
+    ///
+    /// # Errors
+    /// The reading could not be made.
+    fn node_load(&self) -> impl Future<Output = Result<Option<NodeLoad>, NodeLoadError>> + Send {
+        async { Ok(None) }
+    }
+
+    /// The most CPU any one window between two readings used by lease `lease_id`, in
+    /// millicores, once, after its [`Runtime::run`] ended. `None` for a runtime that takes
+    /// no readings (the default), and for a lease that ended before it had a full window.
+    fn take_peak_window_millicores(&self, _lease_id: LeaseId) -> Option<u64> {
         None
     }
 

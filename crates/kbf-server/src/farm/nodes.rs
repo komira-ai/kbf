@@ -6,7 +6,8 @@ use kbf_types::{FarmTime, WorkerId};
 
 use super::{Farm, NodeLook, NodeUnread, State};
 use crate::fleet::{
-    NodeDetail, NodeView, NodesView, PhaseView, PlacementView, ResourcesView, needs_attention,
+    LoadView, NodeDetail, NodeView, NodesView, PhaseView, PlacementView, ResourcesView,
+    needs_attention,
 };
 use crate::machine::FarmMachine;
 
@@ -79,7 +80,13 @@ impl Farm {
             return Ok(None);
         }
         let node = self.node(state, worker);
-        Ok(Some(detail_of(node, &state.engine.sched, worker)))
+        let capacity = state.engine.sched.capacity(worker).unwrap_or_default();
+        let load = state
+            .side
+            .node_loads
+            .get(worker)
+            .map(|kept| kept.view(&capacity, now));
+        Ok(Some(detail_of(node, &state.engine.sched, worker, load)))
     }
 
     /// One node's view; `worker` is registered, and every closed stream noted
@@ -142,8 +149,13 @@ pub(super) fn node_of(
 }
 
 /// `node`, which is `worker` as [`node_of`] lists it, with what it can run, what is left of
-/// that and its leases, as `GET /v1/nodes/{id}` answers.
-pub(super) fn detail_of(node: NodeView, sched: &Scheduler, worker: &WorkerId) -> NodeDetail {
+/// that, its leases and the `load` its daemon reported, as `GET /v1/nodes/{id}` answers.
+pub(super) fn detail_of(
+    node: NodeView,
+    sched: &Scheduler,
+    worker: &WorkerId,
+    load: Option<LoadView>,
+) -> NodeDetail {
     let capacity = sched.capacity(worker).unwrap_or_default();
     let booked = sched.booked(worker).unwrap_or_default();
     let leases = sched
@@ -156,6 +168,7 @@ pub(super) fn detail_of(node: NodeView, sched: &Scheduler, worker: &WorkerId) ->
         capacity: ResourcesView::of(capacity),
         free: ResourcesView::of(capacity.saturating_sub(booked)),
         leases,
+        load,
     }
 }
 

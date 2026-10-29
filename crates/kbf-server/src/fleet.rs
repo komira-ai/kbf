@@ -99,6 +99,40 @@ pub struct NodeDetail {
     pub free: ResourcesView,
     /// The leases it holds, as `term.seq`, in lease order.
     pub leases: Vec<String>,
+    /// What its daemon reports of the CPU and memory its actions use. Left out when the
+    /// node has sent no reading this frontend accepted (a daemon or runtime that takes
+    /// none, or a node another frontend holds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load: Option<LoadView>,
+}
+
+/// The load of a node's `actions/` cgroup, from the readings its heartbeats carried
+/// (`docs/api.md`, "Node load"). Shown only: nothing places leases by it yet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LoadView {
+    /// The CPU the actions used, in thousandths of a CPU: the larger of the last two
+    /// windows between accepted readings. `null` with fewer than two windows, and when
+    /// `stale`.
+    pub measured_cpu_millicores: Option<u64>,
+    /// `memory.current` less the inactive file pages, in bytes, at the last reading.
+    pub memory_working_set_bytes: u64,
+    /// The active file pages of the cgroup, in bytes, at the last reading.
+    pub memory_active_file_bytes: u64,
+    /// The working set less the active file pages beyond a quarter of the node's memory:
+    /// what an admission would count. Never above the working set.
+    pub admission_working_set_bytes: u64,
+    /// The leases that ran for the whole window before the last reading, as `term.seq`.
+    pub covered: Vec<String>,
+    /// Whether the cgroup has a CPU quota.
+    pub actions_cpu_limited: bool,
+    /// Cumulative CPU throttled time, in microseconds, when the daemon read it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_throttled_usec: Option<u64>,
+    /// Cumulative CPU pressure (`some` total), in microseconds, when the daemon read it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_pressure_some_total_usec: Option<u64>,
+    /// Whether no reading was accepted for three windows.
+    pub stale: bool,
 }
 
 /// A node's phase (`kbf_sched::NodePhase`). Serialized with its `state` as a tag.

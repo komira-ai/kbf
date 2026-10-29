@@ -68,6 +68,7 @@ mod kbf_extras;
 pub mod keeper;
 mod lease;
 mod lease_panic;
+mod lease_peak;
 #[cfg(target_os = "linux")]
 mod local;
 mod map;
@@ -125,7 +126,9 @@ pub use plane::{
 };
 pub use remote_index::RemoteIndex;
 pub use report::{Capacity, NodeReport};
-pub use runtime::{FakeRuntime, Runtime, RuntimeError, UPLOAD_DEADLINE, Work, upload_within};
+pub use runtime::{
+    FakeRuntime, NodeLoadError, Runtime, RuntimeError, UPLOAD_DEADLINE, Work, upload_within,
+};
 pub use runtimes::{KindServedTwice, Runtimes};
 pub use status::DriverReport;
 
