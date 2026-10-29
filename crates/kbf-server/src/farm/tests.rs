@@ -4,7 +4,8 @@ use kbf_types::{Failure, Outcome};
 use std::sync::Arc;
 use tonic::Code;
 
-use super::report::{Report, Taken, failed, unrun};
+use super::ack::Verdict;
+use super::report::{Report, Taken, failed, not_answered, unrun};
 use super::*;
 use crate::fault;
 
@@ -76,6 +77,30 @@ fn only_a_taken_or_a_refused_result_is_acknowledged() {
     assert_eq!(Taken::Held.ack(), None);
     assert_eq!(Taken::Dropped.ack(), None);
     assert_eq!(Taken::Unanswered.ack(), None);
+}
+
+/// Catches a `Result` the scheduler gave no answer to taken as what it is not. The current
+/// lease's is not acknowledged, so the daemon sends it again (a refusal would lose it),
+/// unless the farm is fenced, which refuses every `Result` as stale. A held finish waits
+/// for the store, a copy of an answered one is dropped, and any other refusal stands.
+#[test]
+fn a_result_given_no_answer_is_taken_by_what_its_lease_stands_for() {
+    let (operation, lease) = (kbf_types::OperationId(1), kbf_types::LeaseId::new(1, 1));
+    let worker = WorkerId::new("node-a");
+    let taken = |standing, fenced| not_answered(standing, fenced, operation, lease, &worker);
+    assert_eq!(taken(Ok(()), false), Taken::Unanswered);
+    assert_eq!(taken(Ok(()), true), Taken::Refused(Reason::Stale));
+    assert_eq!(taken(Err(Verdict::Held), false), Taken::Held);
+    assert_eq!(
+        taken(Err(Verdict::Refused(Reason::Duplicate)), false),
+        Taken::Dropped
+    );
+    for reason in [Reason::Stale, Reason::UnknownLease] {
+        assert_eq!(
+            taken(Err(Verdict::Refused(reason)), false),
+            Taken::Refused(reason)
+        );
+    }
 }
 
 /// Catches: a report the scheduler does not take (its lease is not the operation's

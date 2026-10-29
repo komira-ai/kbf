@@ -64,6 +64,42 @@ impl Taken {
     }
 }
 
+/// What a `Result` the scheduler gave no answer to is taken as, from what its lease stands
+/// for now (`standing`, `Ok` while it is the operation's current lease) and whether the farm
+/// is fenced.
+///
+/// A current lease the scheduler took no answer from is not acknowledged, so that the daemon
+/// keeps the `Result` and sends it again: a refusal would lose it, and leave the lease on the
+/// node. A fenced farm feeds nothing, so it refuses every `Result` as stale, the current
+/// lease's too, by design.
+pub(super) fn not_answered(
+    standing: Result<(), Verdict>,
+    fenced: bool,
+    operation: OperationId,
+    lease: LeaseId,
+    worker: &WorkerId,
+) -> Taken {
+    match standing {
+        Ok(()) if fenced => {
+            ack::log_refusal(worker, lease, Reason::Stale);
+            Taken::Refused(Reason::Stale)
+        }
+        Ok(()) => {
+            tracing::error!(
+                %operation, %lease, %worker,
+                "the scheduler took no answer from the result of the operation's current lease; not acknowledged, so the daemon sends it again"
+            );
+            Taken::Unanswered
+        }
+        Err(Verdict::Held) => Taken::Held,
+        Err(Verdict::Refused(Reason::Duplicate)) => Taken::Dropped,
+        Err(Verdict::Refused(reason)) => {
+            ack::log_refusal(worker, lease, reason);
+            Taken::Refused(reason)
+        }
+    }
+}
+
 /// A worker's report as [`State::take_report`] feeds it: the lease, the scheduler's
 /// outcome, and what the report measured for the `action usage:` line and for the
 /// invocation record (`None` for an operation no recorded call waits on).
@@ -271,27 +307,8 @@ impl State {
         let taken = if accepted {
             Taken::Accepted
         } else {
-            match self.standing(lease, worker) {
-                // A fenced farm feeds nothing, so it refuses every Result as stale, the
-                // current lease's too, by design.
-                Ok(_) if self.engine.fenced => {
-                    ack::log_refusal(worker, lease, Reason::Stale);
-                    Taken::Refused(Reason::Stale)
-                }
-                Ok(_) => {
-                    tracing::error!(
-                        %operation, %lease, %worker,
-                        "the scheduler took no answer from the result of the operation's current lease; not acknowledged, so the daemon sends it again"
-                    );
-                    Taken::Unanswered
-                }
-                Err(Verdict::Held) => Taken::Held,
-                Err(Verdict::Refused(Reason::Duplicate)) => Taken::Dropped,
-                Err(Verdict::Refused(reason)) => {
-                    ack::log_refusal(worker, lease, reason);
-                    Taken::Refused(reason)
-                }
-            }
+            let standing = self.standing(lease, worker).map(drop);
+            not_answered(standing, self.engine.fenced, operation, lease, worker)
         };
         self.finish_learning(operation, lease, worker, accepted || taken == Taken::Held);
         if accepted && let Some((subject, measured)) = &usage {
