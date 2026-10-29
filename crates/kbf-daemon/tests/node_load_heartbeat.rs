@@ -80,6 +80,8 @@ fn reading(seq: u64) -> NodeLoad {
         actions_cpu_limited: true,
         cpu_throttled_usec: Some(5),
         cpu_pressure_some_total_usec: None,
+        lease_clocks: Vec::new(),
+        minutes: Vec::new(),
     }
 }
 

@@ -92,6 +92,8 @@ impl NodeLoad {
             cpu_throttled_usec: self.throttled_usec,
             cpu_pressure_some_total_usec: self.pressure_some_total_usec,
             memory_active_file_bytes: self.active_file_bytes,
+            lease_clocks: Vec::new(),
+            minutes: Vec::new(),
         }
     }
 }

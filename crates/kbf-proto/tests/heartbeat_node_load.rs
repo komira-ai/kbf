@@ -45,6 +45,8 @@ fn load() -> worker::NodeLoad {
         cpu_throttled_usec: Some(8),
         cpu_pressure_some_total_usec: Some(9),
         memory_active_file_bytes: 10,
+        lease_clocks: Vec::new(),
+        minutes: Vec::new(),
     }
 }
 
