@@ -453,6 +453,11 @@ impl Learned {
     }
 
     /// The rows of `keys`, which are no longer dirty.
+    /// The rows of `keys` as the summaries are now, which are no longer dirty.
+    pub fn take_rows(&mut self, keys: BTreeSet<Key>) -> Vec<Row> {
+        self.rows_of(keys)
+    }
+
     fn rows_of(&mut self, keys: BTreeSet<Key>) -> Vec<Row> {
         let mut rows = Vec::new();
         for key in keys {

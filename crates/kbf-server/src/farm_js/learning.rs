@@ -8,13 +8,21 @@
 //! floors on requeue) is not supported here; a farm asked for it learns as `shadow` does.
 //! Every method returns at once while the estimator is off.
 
-use std::collections::BTreeMap;
+// Only the farm of the js core (and the tests) write the summaries; a build without it keeps
+// the pieces for them compiled.
+#![cfg_attr(
+    not(any(feature = "farm-core-js", test)),
+    allow(dead_code, unused_imports)
+)]
 
-use js_server_core::View;
-use kbf_estimator::{Bounds, Day, Summaries};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use js_server_core::{Core, View};
+use kbf_estimator::{Bounds, Day, Key, Summaries};
 use kbf_invocation::Evidence;
 use kbf_sched::{Requeue, RequeueReason, Scheduler};
-use kbf_state::{Cond, StoreError, Txn};
+use kbf_state::{Cond, Store, StoreError, Txn};
 use kbf_types::{
     Failure, FarmTime, LeaseId, LeaseKind, OperationId, Outcome, StartLease, WorkerId,
 };
@@ -42,6 +50,8 @@ pub(super) struct Learning {
     /// The size a lease given up after an own-limit kill will be booked at next, by lease,
     /// from the core's `requeued` hook until the report that caused it is answered.
     raised: BTreeMap<LeaseId, u64>,
+    /// The summaries an own-limit kill changed, which [`write_learned`] writes at once.
+    urgent: BTreeSet<Key>,
 }
 
 impl Learning {
@@ -57,6 +67,7 @@ impl Learning {
             learned,
             stored,
             raised: BTreeMap::new(),
+            urgent: BTreeSet::new(),
         }
     }
 }
@@ -203,7 +214,9 @@ impl KbfAdapter {
             Some(raised) => self.learning.learned.requeued(lease, raised, &bounds),
             None => self.learning.learned.finish(lease, taken, &bounds),
         };
-        self.write_estimates(&rows);
+        self.learning
+            .urgent
+            .extend(rows.into_iter().map(|(key, _)| key));
     }
 
     /// Logs what the estimator would book for the new operation `admitted`, that `sized`
@@ -266,119 +279,162 @@ impl KbfAdapter {
         self.learning.learned.publish(&metrics.estimator_shadow);
     }
 
-    /// Writes behind the summaries changed since they were last written, and sweeps the
-    /// stale ones from the store once an hour, a bounded number of rows at a tick. Run at
-    /// each tick.
-    #[cfg_attr(not(feature = "farm-core-js"), allow(dead_code))]
-    pub(crate) fn flush_learned(&mut self) {
-        if self.learning.learned.off() {
-            return;
+    /// Whether summaries a kill changed wait to be written ([`write_learned`]).
+    pub(crate) fn learning_pending(&self) -> bool {
+        !self.learning.urgent.is_empty()
+    }
+
+    /// Takes what [`write_learned`] writes, under the core's lock and from memory only: the
+    /// summaries a kill changed, as they are now; with `tick`, also the dirty summaries that
+    /// are due and the day to sweep the store for, if a sweep is due. Takes nothing while the
+    /// estimator is off.
+    pub(crate) fn take_learned_work(&mut self, tick: bool) -> Work {
+        let learning = &mut self.learning;
+        if learning.learned.off() {
+            return Work::default();
         }
-        let rows = self.learning.learned.due();
-        self.write_estimates(&rows);
-        let Some(today) = self.learning.learned.sweep_due() else {
-            return;
-        };
-        let more = if self.learning.stored {
-            match self.sweep_estimates(today) {
-                Ok(more) => more,
-                Err(error) => {
-                    tracing::warn!(%error, "the size summaries could not be swept");
-                    false
-                }
-            }
-        } else {
+        let urgent = std::mem::take(&mut learning.urgent);
+        let mut rows = learning.learned.take_rows(urgent);
+        let mut sweep = None;
+        if tick {
+            rows.extend(learning.learned.due());
+            sweep = learning.learned.sweep_due();
+        }
+        let store = learning.stored.then(|| Arc::clone(&self.store));
+        if store.is_none() {
+            // Nothing to write the rows to; a sweep that has no store ends at once.
+            learning.learned.swept(false);
+            return Work::default();
+        }
+        Work { rows, sweep, store }
+    }
+
+    /// Takes what writing [`Work`] left: the rows the store refused are written again from
+    /// their newest summary at a later tick, and a sweep says whether it has more to do.
+    pub(crate) fn finish_learned_work(&mut self, refused: &[Row], sweep_more: Option<bool>) {
+        self.learning.learned.unwritten(refused);
+        if let Some(more) = sweep_more {
+            self.learning.learned.swept(more);
+        }
+    }
+}
+
+/// What the estimator has for the state store, taken under the core's lock.
+#[derive(Default)]
+pub(crate) struct Work {
+    rows: Vec<Row>,
+    sweep: Option<Day>,
+    store: Option<Arc<dyn Store>>,
+}
+
+/// Lets one writer of size summaries at a time take its rows and write them, so that a
+/// write of an older summary never lands after a write of a newer one.
+#[derive(Default)]
+pub(crate) struct Gate(pub(super) tokio::sync::Mutex<()>);
+
+/// Writes the size summaries the estimator holds for the state store, with no hold of the
+/// core's lock across a store call: the writer takes the gate, takes its rows from the
+/// core in one short hold (each key's newest summary), writes them, and tells the core what
+/// the store refused. `tick`: the dirty summaries that are due and the hourly sweep go too;
+/// otherwise only the summaries a kill changed, which is written at once, after the report
+/// that changed them. A newer writer's fence stops the writing and keeps nothing.
+pub(crate) async fn write_learned(core: &Core<KbfAdapter>, gate: &Gate, tick: bool) {
+    if !tick && !core.with(|_, adapter| adapter.learning_pending()) {
+        return;
+    }
+    let _writer = gate.0.lock().await;
+    let work = core.with(|_, adapter| adapter.take_learned_work(tick));
+    let Work { rows, sweep, store } = work;
+    let Some(store) = store else {
+        return;
+    };
+    let (refused, fenced) = write_estimates(&*store, &rows);
+    // A sweep the fence stopped, or the store refused, is over until the next hour.
+    let more = sweep.map(|today| {
+        if fenced {
+            return false;
+        }
+        sweep_estimates(&*store, today).unwrap_or_else(|error| {
+            tracing::warn!(%error, "the size summaries could not be swept");
             false
+        })
+    });
+    core.with(|_, adapter| adapter.finish_learned_work(&refused, more));
+}
+
+/// Writes `rows` on a best-effort basis: the rows a store refuses are returned, to be
+/// written again from their newest summary at a later tick. Whether a newer writer holds the
+/// store, which ends the writing with nothing kept.
+fn write_estimates(store: &dyn Store, rows: &[Row]) -> (Vec<Row>, bool) {
+    let mut refused = Vec::new();
+    for chunk in rows.chunks(BATCH) {
+        if let Err(error) = commit(store, KbfExt.put_estimates(Txn::new(), chunk)) {
+            if matches!(error, StoreError::Fenced) {
+                return (Vec::new(), true);
+            }
+            tracing::warn!(%error, "size summaries were not written");
+            refused.extend_from_slice(chunk);
+        }
+    }
+    (refused, false)
+}
+
+/// Commits `txn` to the state store.
+fn commit(store: &dyn Store, txn: Txn) -> Result<(), StoreError> {
+    let mut results = store.apply_batch(vec![txn])?;
+    match results.pop() {
+        Some(Ok(_)) => Ok(()),
+        _ => Err(StoreError::Failed(
+            "the size summaries were not committed".to_owned(),
+        )),
+    }
+}
+
+/// Deletes the size summaries idle past the estimator's staleness on `today`, and strips the
+/// samples from those that hold a floor, as the estimator itself does in memory. At most
+/// [`SWEEP_TXNS`] transactions of [`SWEEP_ROWS`] rows are committed per call. Returns
+/// whether more are left for another call.
+fn sweep_estimates(store: &dyn Store, today: Day) -> Result<bool, StoreError> {
+    let mut changes = Vec::new();
+    for (name, row) in store.scan_prefix(ESTIMATE)? {
+        let Some((key, summary)) = estimate::decode(&name, &row.value) else {
+            continue;
         };
-        self.learning.learned.swept(more);
-    }
-
-    /// Writes the changed summaries now, whatever the time since the last write: for
-    /// `Farm::write_behind_now` on this core.
-    #[allow(dead_code)]
-    pub(crate) fn write_behind_now(&mut self) {
-        let rows = self.learning.learned.due_now();
-        self.write_estimates(&rows);
-    }
-
-    /// Writes `rows`, size summaries, on a best-effort basis: a store that refuses them is
-    /// logged and their keys are written again from their newest summary at a later tick.
-    /// It never marks the store unreachable and never changes what the scheduler wrote.
-    fn write_estimates(&mut self, rows: &[Row]) {
-        if !self.learning.stored || rows.is_empty() {
-            return;
+        let mut held = Summaries::default();
+        if held.insert_encoded(&key, &summary).is_err() {
+            continue;
         }
-        let mut refused = Vec::new();
-        for chunk in rows.chunks(BATCH) {
-            if let Err(error) = self.commit(KbfExt.put_estimates(Txn::new(), chunk)) {
-                // A newer writer holds the store: nothing more is written, nor kept.
-                if matches!(error, StoreError::Fenced) {
-                    return;
-                }
-                tracing::warn!(%error, "size summaries were not written");
-                refused.extend_from_slice(chunk);
+        held.expire(today);
+        match held.get(&key) {
+            None => changes.push((name, None, row.version)),
+            Some(kept) if kept.encode() != summary => {
+                changes.push((name, Some(estimate::encode(&kept.encode())), row.version));
             }
-        }
-        self.learning.learned.unwritten(&refused);
-    }
-
-    /// Commits `txn` to the state store.
-    fn commit(&self, txn: Txn) -> Result<(), StoreError> {
-        let mut results = self.store.apply_batch(vec![txn])?;
-        match results.pop() {
-            Some(Ok(_)) => Ok(()),
-            _ => Err(StoreError::Failed(
-                "the size summaries were not committed".to_owned(),
-            )),
+            Some(_) => {}
         }
     }
-
-    /// Deletes the size summaries idle past the estimator's staleness on `today`, and
-    /// strips the samples from those that hold a floor, as the estimator itself does in
-    /// memory. At most [`SWEEP_TXNS`] transactions of [`SWEEP_ROWS`] rows are committed per
-    /// call. Returns whether more are left for another call.
-    fn sweep_estimates(&self, today: Day) -> Result<bool, StoreError> {
-        let mut changes = Vec::new();
-        for (name, row) in self.store.scan_prefix(ESTIMATE)? {
-            let Some((key, summary)) = estimate::decode(&name, &row.value) else {
-                continue;
+    let left = changes.len() > SWEEP_TXNS * SWEEP_ROWS;
+    let mut changed = 0;
+    for chunk in changes.chunks(SWEEP_ROWS).take(SWEEP_TXNS) {
+        let mut txn = Txn::new();
+        for (name, value, version) in chunk {
+            txn = match value {
+                None => txn.delete(name.clone(), Cond::Version(*version)),
+                Some(value) => txn.put(name.clone(), value.clone(), Cond::Version(*version)),
             };
-            let mut held = Summaries::default();
-            if held.insert_encoded(&key, &summary).is_err() {
-                continue;
-            }
-            held.expire(today);
-            match held.get(&key) {
-                None => changes.push((name, None, row.version)),
-                Some(kept) if kept.encode() != summary => {
-                    changes.push((name, Some(estimate::encode(&kept.encode())), row.version));
-                }
-                Some(_) => {}
-            }
         }
-        let left = changes.len() > SWEEP_TXNS * SWEEP_ROWS;
-        let mut changed = 0;
-        for chunk in changes.chunks(SWEEP_ROWS).take(SWEEP_TXNS) {
-            let mut txn = Txn::new();
-            for (name, value, version) in chunk {
-                txn = match value {
-                    None => txn.delete(name.clone(), Cond::Version(*version)),
-                    Some(value) => txn.put(name.clone(), value.clone(), Cond::Version(*version)),
-                };
-            }
-            match self.commit(txn) {
-                Ok(()) => changed += chunk.len(),
-                Err(error) => {
-                    tracing::warn!(%error, "a batch of size summaries was not swept");
-                    if matches!(error, StoreError::Fenced) {
-                        break;
-                    }
+        match commit(store, txn) {
+            Ok(()) => changed += chunk.len(),
+            Err(error) => {
+                tracing::warn!(%error, "a batch of size summaries was not swept");
+                if matches!(error, StoreError::Fenced) {
+                    break;
                 }
             }
         }
-        // A sweep that committed nothing does not ask for another tick.
-        Ok(left && changed > 0)
     }
+    // A sweep that committed nothing does not ask for another tick.
+    Ok(left && changed > 0)
 }
 
 impl KbfAdapter {
@@ -389,5 +445,17 @@ impl KbfAdapter {
     pub(crate) fn learning_with(mut self, learned: Learned, stored: bool) -> Self {
         self.learning = Learning::of(learned, stored);
         self
+    }
+}
+
+#[cfg(test)]
+impl KbfAdapter {
+    /// The row of the summary of `key` as the estimator holds it now.
+    pub(super) fn summary_now(&self, key: &kbf_estimator::Key) -> Option<Vec<u8>> {
+        self.learning
+            .learned
+            .summaries()
+            .get(key)
+            .map(|s| s.encode())
     }
 }

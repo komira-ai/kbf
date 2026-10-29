@@ -125,6 +125,8 @@ pub(crate) struct JsFarm {
     pub(crate) shapes: Shapes,
     /// `Result`s being taken now: a handover waits for none to be.
     pub(crate) reports: AtomicUsize,
+    /// Lets one writer of size summaries at a time take its rows and write them.
+    pub(crate) learning_gate: crate::farm_js::Gate,
 }
 
 impl std::fmt::Debug for JsFarm {
@@ -304,6 +306,7 @@ impl Farm {
             epoch_unix_ms,
             shapes: Shapes::default(),
             reports: AtomicUsize::new(0),
+            learning_gate: crate::farm_js::Gate::default(),
         };
         Self {
             cache,
