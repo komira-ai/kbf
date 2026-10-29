@@ -254,9 +254,11 @@ impl FakeDrain {
 }
 
 impl Drain for FakeDrain {
-    fn drain(&self, host: &Host, deadline: Duration) -> Result<(), PortError> {
-        self.events
-            .push(format!("drain {} {}", host.alias, deadline.as_secs()));
+    fn drain(&self, host: &Host, deadline: Option<Duration>) -> Result<(), PortError> {
+        self.events.push(match deadline {
+            Some(deadline) => format!("drain {} {}", host.alias, deadline.as_secs()),
+            None => format!("drain {} none", host.alias),
+        });
         if let Some(e) = lock(&self.drain_error).clone() {
             return Err(e);
         }

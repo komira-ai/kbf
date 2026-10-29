@@ -74,6 +74,7 @@
 //! Not yet: re-adopting leases after a daemon restart (one systemd unit per lease) and
 //! networked actions.
 
+mod actions_cpu;
 mod blocking_steps;
 pub mod cas;
 mod cgroup;
@@ -122,11 +123,12 @@ pub(crate) fn unit_dir(name: &str) -> kbf_testkit::dir::TestDir {
     kbf_testkit::dir::TestDir::under(root, name)
 }
 
+pub use actions_cpu::{ActionsCpu, ActionsCpuMax};
 pub use cas::{CHUNK, FileBlob, MemoryCas};
 pub use cgroup::{SwapKill, cpu_weight, memory_max};
 pub use container::{ContainerLimits, EXEC_ROOT};
 pub use delegate::{
-    DelegateError, Delegation, adopt, capacity, delegate, enable_cpuset, limit_cpus,
+    DelegateError, Delegation, adopt, capacity, delegate, enable_cpuset, limit_cpus, unlimit_cpus,
 };
 pub use image::{ImageCheckError, ImageError, ImageRef};
 pub use input_phases::Spot;

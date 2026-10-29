@@ -206,7 +206,7 @@ async fn a_daemon_without_extras_drains() {
     let (signals, signals_rx) = mpsc::unbounded_channel();
     let daemon = tokio::spawn(
         bare.daemon
-            .run_draining(signals_rx, Duration::from_secs(30)),
+            .run_draining(signals_rx, Some(Duration::from_secs(30))),
     );
     let mut peer = timeout(PROMPT, bare.sessions.recv())
         .await

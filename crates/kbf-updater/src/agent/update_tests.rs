@@ -133,7 +133,7 @@ fn an_update_runs_fetch_verify_drain_switch_health_confirm_undrain_in_order() {
         rig.steps(),
         [
             &format!("local:install {VB} stable"),
-            "drain n1 4294967295",
+            "drain n1 none",
             &format!("local:switch {VB}"),
             &format!("local:confirm {VB}"),
             "undrain",
@@ -240,7 +240,7 @@ fn a_failed_health_check_reverts_and_undrains_when_a_is_healthy() {
         rig.steps(),
         [
             &format!("local:install {VB} stable"),
-            "drain n1 4294967295",
+            "drain n1 none",
             &format!("local:switch {VB}"),
             "local:revert",
             "undrain",
