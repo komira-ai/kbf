@@ -16,7 +16,7 @@ fn listeners(args: &[&str]) -> Result<Listeners, ConfigError> {
 }
 
 fn refused(args: &[&str]) -> ConfigError {
-    listeners(args).err().expect("the start is refused")
+    listeners(args).expect_err("the start is refused")
 }
 
 /// Catches a default other than `off` (a server started with no flag would predict), a value
