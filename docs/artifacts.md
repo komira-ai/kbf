@@ -88,7 +88,8 @@ directory it mounts read-only into the images of the actions it runs (the action
 `kbf-task` as the job's command). It is built and tested on a native runner of each architecture, which
 installs the target with `rustup target add`; the job runs `build-commit check` on the binary, which
 runs it, and refuses it unless `readelf` shows no interpreter and no needed library. The task image
-carries the same file.
+carries the same file. It writes its pack with `kbf-task-pack` (`crates/kbf-task-pack`), the task pack types
+the frontend ingests with, a crate of pure Rust that does not link the pack index or the object store client.
 
 `tierstore` is the hot and cold S3 object store proxy (`crates/tierstore`): an S3 server over two
 tiers that copies new objects to the cold tier and frees the hot one when it fills. It is built with

@@ -16,11 +16,10 @@ clap.workspace = true
 hex.workspace = true
 kbf-outputs.workspace = true
 kbf-proto.workspace = true
-kbf-segments.workspace = true
+kbf-task-pack.workspace = true
+kbf-types.workspace = true
 libc.workspace = true
 prost.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 sha2.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
@@ -29,6 +28,7 @@ ureq.workspace = true
 tokio = { workspace = true, features = ["rt", "fs", "process", "time", "io-util"] }
 
 [dev-dependencies]
+kbf-segments.workspace = true
 kbf-testkit.workspace = true
 prost-types.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

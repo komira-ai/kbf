@@ -5,14 +5,21 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use kbf_proto::reapi::command::EnvironmentVariable;
-use kbf_proto::reapi::{Directory, DirectoryNode, FileNode, SymlinkNode};
-use kbf_segments::SegmentReader;
+use kbf_proto::reapi::{Digest, Directory, DirectoryNode, FileNode, SymlinkNode};
+use kbf_segments::{SegmentReader, sha256};
+use kbf_task_pack::{EMPTY_DIGEST, read_manifest};
 use kbf_testkit::dir::TestDir;
 use prost::Message;
 
+use kbf_task_pack::ManifestError;
+
 use super::*;
 use crate::fetch::label;
-use crate::pack::verify;
+
+/// The REAPI digest of `bytes`.
+fn reapi_of(bytes: &[u8]) -> Digest {
+    digest::to_reapi(&sha256(bytes))
+}
 
 /// Blobs held in memory by digest.
 #[derive(Default)]
@@ -20,8 +27,7 @@ struct Mem(HashMap<String, Vec<u8>>);
 
 impl Mem {
     fn add(&mut self, bytes: Vec<u8>) -> Digest {
-        let id = BlobId::of(&bytes);
-        let digest = Digest::from(id);
+        let digest = reapi_of(&bytes);
         self.0.insert(label(&digest), bytes);
         digest
     }
@@ -72,7 +78,7 @@ fn scratch(name: &str) -> TestDir {
 }
 
 fn cli(work_dir: &Path, action: Digest) -> Cli {
-    let id = BlobId::try_from(&action).expect("digest");
+    let id = digest::from_reapi(&action).expect("digest");
     Cli::try_parse_from([
         "kbf-task",
         "--pack-url-file",
@@ -174,24 +180,20 @@ async fn a_run_stores_a_pack_whose_first_record_is_the_manifest_naming_every_out
 
     // The frontend's check: the manifest is the record at offset 0 and every digest it names
     // is a record of the pack.
-    assert_eq!(verify(body).expect("verify"), manifest);
+    assert_eq!(read_manifest(body).expect("read"), manifest);
     assert_eq!(manifest.lease, "lease-1");
     assert_eq!(manifest.action, cli.action);
     assert_eq!(manifest.exit_code, 0);
     assert_eq!(manifest.output_files.len(), 1);
     assert_eq!(manifest.output_files[0].path, "out");
-    assert_eq!(manifest.output_files[0].digest, BlobId::of(b"hi\n"));
+    assert_eq!(manifest.output_files[0].digest, sha256(b"hi\n"));
     assert!(!manifest.output_files[0].is_executable);
     // Stdout is empty: it is left out of the manifest and has no record. What dd reports on
-    // stderr depends on its locale, so only that it is recorded is asserted; `verify` above
+    // stderr depends on its locale, so only that it is recorded is asserted; `read_manifest` above
     // found its record in the pack.
     assert_eq!(manifest.stdout, None);
-    assert!(
-        manifest
-            .stderr
-            .as_ref()
-            .is_some_and(|e| *e != BlobId::of(b""))
-    );
+    assert_ne!(manifest.stderr.map(|e| e.size_bytes), Some(0));
+    assert!(manifest.stderr.is_some());
     // The manifest, stderr and the one output file: three records, none of them empty.
     let reader = SegmentReader::open(body).expect("segment");
     assert_eq!(reader.footer().entries().len(), 3);
@@ -202,11 +204,10 @@ async fn a_run_stores_a_pack_whose_first_record_is_the_manifest_naming_every_out
             .iter()
             .all(|e| e.digest.size_bytes > 0)
     );
-    let json = String::from_utf8_lossy(&body[..manifest.encode().len()]).into_owned();
-    assert!(
-        !json.contains("stdout") && !json.contains("put_ms"),
-        "{json}"
-    );
+    let json_len = manifest.to_json().expect("json").len();
+    let json = String::from_utf8_lossy(&body[..json_len]).into_owned();
+    assert!(!json.contains("stdout"), "{json}");
+    assert!(!json.contains("put_ms"), "{json}");
 }
 
 /// An empty output file is listed with the empty digest and the pack holds no record for it.
@@ -219,10 +220,10 @@ async fn an_empty_output_file_is_listed_without_a_record() {
     let manifest = execute(&cli(&dir, digest), &mem, &sink)
         .await
         .expect("task");
-    assert_eq!(manifest.output_files[0].digest, BlobId::of(b""));
+    assert_eq!(manifest.output_files[0].digest, EMPTY_DIGEST);
     assert_eq!((manifest.stdout, manifest.stderr), (None, None));
     let stored = sink.stored.lock().unwrap();
-    assert_eq!(&verify(&stored[0]).expect("verify"), &manifest);
+    assert_eq!(&read_manifest(&stored[0]).expect("read"), &manifest);
     let reader = SegmentReader::open(&stored[0]).expect("segment");
     assert_eq!(reader.footer().entries().len(), 1);
 }
@@ -259,7 +260,7 @@ async fn output_directories_and_symlinks_reach_the_manifest() {
     assert_eq!(manifest.output_symlinks.len(), 1);
     assert_eq!(manifest.output_symlinks[0].target, "d/f");
     let stored = sink.stored.lock().unwrap();
-    assert_eq!(&verify(&stored[0]).expect("verify"), &manifest);
+    assert_eq!(&read_manifest(&stored[0]).expect("read"), &manifest);
 }
 
 #[tokio::test]
@@ -267,7 +268,7 @@ async fn an_action_that_cannot_be_read_fails_as_a_fetch_and_stores_nothing() {
     let mem = Mem::default();
     let dir = scratch("nofetch");
     let sink = Fake::new(false);
-    let failure = execute(&cli(&dir, Digest::from(BlobId::of(b"x"))), &mem, &sink)
+    let failure = execute(&cli(&dir, reapi_of(b"x")), &mem, &sink)
         .await
         .expect_err("fetch");
     assert!(matches!(failure, Failure::Fetch(_)), "{failure}");
@@ -343,46 +344,22 @@ fn each_failure_class_has_its_own_exit_code() {
         Failure::Run(RunError::Invalid(String::new())).exit_code(),
         Failure::Result(String::new()).exit_code(),
         Failure::Read(std::io::Error::other("x")).exit_code(),
-        Failure::Pack(PackError::TooLarge { limit: 1 }).exit_code(),
+        Failure::Pack(PackError::from(ManifestError::Version(2))).exit_code(),
         Failure::Put(PutError::Exists { url: String::new() }).exit_code(),
     ];
     assert_eq!(codes, [14, 10, 11, 12, 12, 12, 13]);
 }
 
-/// Each cap is a pack failure (exit 12) whose message on stderr says `output-too-large`.
-#[test]
-fn every_size_cap_is_exit_12_with_output_too_large() {
-    for err in [
-        PackError::TooLarge { limit: 1 },
-        PackError::TooManyEntries { limit: 1 },
-        PackError::RecordTooLarge { limit: 1 },
-        PackError::ManifestTooLarge { limit: 1 },
-    ] {
-        let failure = Failure::Pack(err);
-        assert_eq!(failure.exit_code(), EXIT_PACK);
-        assert!(
-            failure.to_string().contains("output-too-large"),
-            "{failure}"
-        );
-    }
-    for err in [
-        PackError::PathTooLong { len: 2, limit: 1 },
-        PackError::DuplicatePath("p".to_owned()),
-    ] {
-        assert_eq!(Failure::Pack(err).exit_code(), EXIT_PACK);
-    }
-}
-
 #[test]
 fn a_result_digest_that_is_absent_or_malformed_is_refused() {
-    let good = Digest::from(BlobId::of(b"x"));
-    assert_eq!(blob_id(Some(&good)).expect("good"), BlobId::of(b"x"));
-    assert!(matches!(blob_id(None), Err(Failure::Result(_))));
+    let good = reapi_of(b"x");
+    assert_eq!(digest_of(Some(&good)).expect("good"), sha256(b"x"));
+    assert!(matches!(digest_of(None), Err(Failure::Result(_))));
     let bad = Digest {
         hash: "xyz".to_owned(),
         size_bytes: 1,
     };
-    assert!(matches!(blob_id(Some(&bad)), Err(Failure::Result(_))));
+    assert!(matches!(digest_of(Some(&bad)), Err(Failure::Result(_))));
 }
 
 #[test]
@@ -408,7 +385,7 @@ fn prost_types_duration(seconds: i64, nanos: i32) -> prost_types::Duration {
 
 #[test]
 fn the_flags_parse_with_their_defaults() {
-    let digest = Digest::from(BlobId::of(b"a"));
+    let digest = reapi_of(b"a");
     let flags = cli(Path::new("/w"), digest);
     assert_eq!(flags.deadline_ms, 3_600_000);
     assert!(flags.root_der.is_empty());
@@ -418,7 +395,7 @@ fn the_flags_parse_with_their_defaults() {
         "--grant-url=g",
         "--grant-token-file=t",
         "--lease=l",
-        &format!("--action={}", BlobId::of(b"a")),
+        &format!("--action={}", sha256(b"a")),
     ])
     .expect("flags");
     assert_eq!(default.work_dir, PathBuf::from("/scratch/work"));
@@ -442,7 +419,7 @@ const SECRET_TOKEN: &str = "very-secret-token";
 
 /// Flags with the credentials as the given options, and `insecure` as asked.
 fn with_secrets(args: &[&str]) -> Result<Cli, clap::Error> {
-    let action = format!("--action={}", BlobId::of(b"a"));
+    let action = format!("--action={}", sha256(b"a"));
     let mut all = vec![
         "kbf-task",
         "--grant-url=https://grant.example",
@@ -588,7 +565,7 @@ fn credential_values_are_not_in_a_setup_error() {
 #[test]
 fn connect_reads_the_token_file_and_the_extra_roots() {
     let dir = scratch("connect");
-    let digest = Digest::from(BlobId::of(b"a"));
+    let digest = reapi_of(b"a");
     let mut flags = cli(&dir, digest);
     // No token file.
     assert!(matches!(connect(&flags), Err(Failure::Setup(_))));
@@ -620,7 +597,7 @@ fn connect_reads_the_token_file_and_the_extra_roots() {
 #[test]
 fn the_plain_http_opt_in_lets_the_sink_reach_an_http_store() {
     let dir = scratch("plain-http");
-    let digest = Digest::from(BlobId::of(b"a"));
+    let digest = reapi_of(b"a");
     let mut flags = cli(&dir, digest);
     std::fs::write(dir.join("token"), "tok\n").expect("write");
     flags.grant_token_file = Some(dir.join("token"));
@@ -648,7 +625,7 @@ fn connect_reads_a_url_file_in_a_read_only_directory() {
     let dir = scratch("connect-read-only");
     let held = dir.join("held");
     std::fs::create_dir(&held).expect("dir");
-    let mut flags = cli(&dir, Digest::from(BlobId::of(b"a")));
+    let mut flags = cli(&dir, reapi_of(b"a"));
     flags.grant_token_file = Some(dir.join("token"));
     std::fs::write(dir.join("token"), "tok\n").expect("write");
     flags.pack_url_file = Some(held.join("url"));
@@ -664,7 +641,7 @@ fn connect_reads_a_url_file_in_a_read_only_directory() {
 #[tokio::test]
 async fn main_with_reports_a_setup_failure_by_exit_code() {
     let dir = scratch("main-setup");
-    let flags = cli(&dir, Digest::from(BlobId::of(b"a")));
+    let flags = cli(&dir, reapi_of(b"a"));
     assert_eq!(main_with(&flags).await, ExitCode::from(EXIT_SETUP));
 }
 
@@ -700,7 +677,7 @@ async fn finish_exits_with_the_code_of_the_failure() {
 #[test]
 fn run_cli_runs_the_task_and_returns_its_exit_code() {
     let dir = scratch("run-cli");
-    let flags = cli(&dir, Digest::from(BlobId::of(b"a")));
+    let flags = cli(&dir, reapi_of(b"a"));
     assert_eq!(run_cli(&flags), ExitCode::from(EXIT_SETUP));
 }
 
@@ -708,7 +685,7 @@ fn run_cli_runs_the_task_and_returns_its_exit_code() {
 #[test]
 fn a_runtime_that_cannot_start_is_a_setup_failure() {
     let dir = scratch("no-runtime");
-    let flags = cli(&dir, Digest::from(BlobId::of(b"a")));
+    let flags = cli(&dir, reapi_of(b"a"));
     let failed = Err(std::io::Error::other("no threads"));
     assert_eq!(start(failed, &flags), ExitCode::from(EXIT_SETUP));
 }
@@ -737,4 +714,78 @@ fn the_http_sink_puts_the_pack_to_the_url() {
     sink.store(b"ok").expect("stored");
     let request = server.join().expect("server");
     assert!(request.starts_with("PUT /pack "), "{request}");
+}
+
+/// Catches a lease the frontend would refuse (empty, a `/`, a space, non-ASCII, over 128 bytes)
+/// starting the Command: it is a setup failure (exit 14) that names `--lease`, raised before any
+/// credential file is read or anything is fetched.
+#[test]
+fn a_lease_ingest_would_refuse_is_a_setup_failure() {
+    let long = "a".repeat(129);
+    for lease in ["", "a/b", "a b", "caf\u{e9}", long.as_str()] {
+        let mut flags = cli(Path::new("/w"), reapi_of(b"a"));
+        flags.lease = lease.to_owned();
+        let Err(failure) = connect(&flags) else {
+            panic!("accepted the lease {lease:?}");
+        };
+        assert_eq!(failure.exit_code(), EXIT_SETUP);
+        assert!(failure.to_string().contains("--lease"), "{failure}");
+    }
+}
+
+/// Catches a valid lease being refused: 1 byte and 128 bytes of `0-9A-Za-z_-` pass.
+#[test]
+fn a_build_id_is_a_lease() {
+    let longest = format!("{}aZ", "aZ09_-".repeat(21));
+    assert_eq!(longest.len(), 128);
+    for lease in ["0", "Lease_1-b", longest.as_str()] {
+        let mut flags = cli(Path::new("/w"), reapi_of(b"a"));
+        flags.lease = lease.to_owned();
+        check_lease(&flags).expect(lease);
+    }
+}
+
+/// Catches a bad lease reaching the run: the process ends with the setup code and the Command
+/// never starts.
+#[tokio::test]
+async fn main_with_refuses_a_bad_lease_before_fetching() {
+    let dir = scratch("bad-lease");
+    let mut flags = cli(&dir, reapi_of(b"a"));
+    flags.lease = "a/b".to_owned();
+    assert_eq!(main_with(&flags).await, ExitCode::from(EXIT_SETUP));
+    assert!(!dir.join("in").exists());
+}
+
+/// Catches a manifest ingest would refuse being stored: two declared outputs with one path make a
+/// manifest that names the path twice, so the task fails as a pack refusal (exit 12, detail
+/// `invalid-manifest`) after the Command ran, and nothing is stored.
+#[tokio::test]
+async fn a_manifest_ingest_would_refuse_fails_as_a_pack_and_stores_nothing() {
+    let mut mem = Mem::default();
+    let digest = action(&mut mem, COPY, &["out", "out"]);
+    let dir = scratch("duplicate-path");
+    let sink = Fake::new(false);
+    let failure = execute(&cli(&dir, digest), &mem, &sink)
+        .await
+        .expect_err("duplicate path");
+    assert!(matches!(failure, Failure::Pack(_)), "{failure}");
+    assert_eq!(failure.exit_code(), EXIT_PACK);
+    let text = failure.to_string();
+    assert!(text.contains("invalid-manifest"), "{text}");
+    assert!(!text.contains("output-too-large"), "{text}");
+    assert!(sink.stored.lock().unwrap().is_empty());
+}
+
+/// Catches a size cap losing its detail on the way to stderr: the failure says `output-too-large`
+/// and exits 12.
+#[test]
+fn a_size_cap_is_exit_12_with_output_too_large() {
+    let failure = Failure::Pack(PackError::from(
+        kbf_task_pack::WritePackError::RecordTooLarge { size: 1 },
+    ));
+    assert_eq!(failure.exit_code(), EXIT_PACK);
+    assert!(
+        failure.to_string().contains("output-too-large"),
+        "{failure}"
+    );
 }

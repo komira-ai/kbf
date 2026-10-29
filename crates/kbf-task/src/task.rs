@@ -17,25 +17,28 @@
 //! | 2 | the flags are wrong (clap) |
 //! | 10 | fetch: the Action, the Command or an input could not be read or checked, or laid out |
 //! | 11 | run-start: the Command could not be started (bad paths, no program) |
-//! | 12 | pack: the outputs could not be collected or did not fit one pack |
+//! | 12 | pack: the outputs could not be collected, did not fit one pack (`output-too-large`), or made a manifest or pack the frontend would refuse (`invalid-manifest`, `invalid-pack`) |
 //! | 13 | put: the pack could not be stored (refused, key already taken, unreachable) |
-//! | 14 | setup: a credential or root certificate is unusable, a credential given as a flag value without `--insecure-argv-secrets`, or the runtime did not start |
+//! | 14 | setup: `--lease` is not a build id, a credential or root certificate is unusable, a credential given as a flag value without `--insecure-argv-secrets`, or the runtime did not start |
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::{ArgGroup, Parser};
-use kbf_proto::reapi::{Action, Command, Digest};
+use kbf_proto::reapi::{self, Action, Command};
+use kbf_task_pack::{
+    OutputDirectory, OutputFile, OutputSymlink, TaskManifest, Timing, Usage, check_build,
+};
+use kbf_types::Digest;
 
+use crate::digest;
 use crate::fetch::{
     BlobSource, FetchError, HttpBlobSource, fetch_message, materialize, native_roots,
 };
-use crate::manifest::{
-    BlobId, Manifest, OutputDirectory, OutputFile, OutputSymlink, Timing, Usage, VERSION,
-};
 use crate::outputs::{OutputLimits, collect_outputs};
-use crate::pack::{Blob, MAX_PACK_BYTES, PackError, pack};
+use crate::pack::{MAX_PACK_BYTES, PackError, build};
 use crate::put::{PutError, agent, agent_with_plain_http, put, tls_config};
 use crate::run::{Run, RunError, output_paths, run};
 
@@ -63,6 +66,14 @@ pub const EXIT_SETUP: u8 = 14;
 /// the grant is scoped to one build's inputs. The flag forms exist because the job scheduler does
 /// not yet deliver job secrets as files (komira-ai/kbf#1934), and are removed when it does. Neither
 /// value is ever written to a log or an error message.
+///
+/// # What the manifest claims
+///
+/// The manifest's `exit_code`, `timing` and `usage` are written by this tool, which runs as the
+/// same user as the Command: they are claims, and the frontend does not trust them. The pack is
+/// built in memory (the collected blobs, the writer's buffer and the finished pack), so the tool's
+/// peak memory is about three times the pack (about 384 MiB at the 128 MiB limit); a job's memory
+/// limit must allow for it, or the kill shows as 137, not 12.
 #[derive(Parser)]
 #[command(
     name = "kbf-task",
@@ -75,7 +86,8 @@ pub struct Cli {
     /// default it is not a flag value (argv is readable by the Command): the file is read and left
     /// in place. The executor that delivered it removes it when the run ends (on js-agent it is a
     /// read-only run file). The URL allows one create-only PUT of this task's own pack key, so a
-    /// Command that reads it can only store what it could already produce as outputs.
+    /// Command that reads it, and copies it into a declared output, stores nothing it could not
+    /// already store as an output.
     #[arg(long)]
     pub pack_url_file: Option<PathBuf>,
     /// The presigned URL itself. Stopgap (komira-ai/kbf#1934): it is in argv, so it needs
@@ -102,12 +114,14 @@ pub struct Cli {
     /// it, only `https` URLs are used. Blobs are read over `https` either way.
     #[arg(long)]
     pub allow_plain_http_put: bool,
-    /// The lease id the frontend gave; it is copied into the manifest.
+    /// The lease id the frontend gave; it is copied into the manifest. It must be a build id, 1 to
+    /// 128 bytes of `0-9A-Za-z_-`, the only lease the frontend accepts in a manifest; any other is
+    /// refused at startup (exit 14), before anything is fetched.
     #[arg(long)]
     pub lease: String,
-    /// The Action to run, as `<hex>/<size>`.
-    #[arg(long)]
-    pub action: BlobId,
+    /// The Action to run, as `<64 lowercase hex digits>/<size>`.
+    #[arg(long, value_parser = digest::parse)]
+    pub action: Digest,
     /// Where the inputs are laid out (`in/` under it) and the output streams are written.
     #[arg(long, default_value = "/scratch/work")]
     pub work_dir: PathBuf,
@@ -144,7 +158,8 @@ pub enum Failure {
     /// A collected blob could not be read back.
     #[error("outputs: {0}")]
     Read(#[from] std::io::Error),
-    /// The pack could not be built.
+    /// The manifest or the pack is one the frontend would refuse: a size cap (detail
+    /// `output-too-large`), or a path, a target, a number or a digest the shared rules refuse.
     #[error("pack: {0}")]
     Pack(#[from] PackError),
     /// The pack could not be stored.
@@ -204,9 +219,9 @@ pub async fn execute(
     cli: &Cli,
     source: &impl BlobSource,
     sink: &impl PackSink,
-) -> Result<Manifest, Failure> {
+) -> Result<TaskManifest, Failure> {
     let fetching = Instant::now();
-    let action_digest = Digest::from(cli.action);
+    let action_digest = digest::to_reapi(&cli.action);
     let action: Action = fetch_message(source, &action_digest)?;
     let command: Command =
         fetch_message(source, &named("command", action.command_digest.as_ref())?)?;
@@ -240,20 +255,15 @@ pub async fn execute(
         MAX_PACK_BYTES,
     )
     .await?;
-    let mut blobs = Vec::new();
+    let mut held: Vec<Cow<'_, [u8]>> = Vec::new();
     for digest in outputs.blobs.digests() {
-        blobs.extend(
-            outputs
-                .blobs
-                .read(&digest)?
-                .map(|bytes| Blob::Bytes(bytes.into_owned())),
-        );
+        held.extend(outputs.blobs.read(&digest)?);
     }
+    let blobs: Vec<&[u8]> = held.iter().map(|bytes| bytes.as_ref()).collect();
     // The manifest is part of the pack, so the time to build the pack ends here.
     let pack_ms = millis(packing.elapsed());
     let result = &outputs.result;
-    let mut manifest = Manifest {
-        version: VERSION,
+    let mut manifest = TaskManifest {
         lease: cli.lease.clone(),
         action: cli.action,
         exit_code: ran.exit_code,
@@ -275,14 +285,14 @@ pub async fn execute(
     for file in &result.output_files {
         manifest.output_files.push(OutputFile {
             path: file.path.clone(),
-            digest: blob_id(file.digest.as_ref())?,
+            digest: digest_of(file.digest.as_ref())?,
             is_executable: file.is_executable,
         });
     }
     for dir in &result.output_directories {
         manifest.output_directories.push(OutputDirectory {
             path: dir.path.clone(),
-            tree: blob_id(dir.tree_digest.as_ref())?,
+            tree: digest_of(dir.tree_digest.as_ref())?,
         });
     }
     for link in &result.output_symlinks {
@@ -291,26 +301,26 @@ pub async fn execute(
             target: link.target.clone(),
         });
     }
-    sink.store(&pack(&manifest, blobs)?)?;
+    sink.store(&build(&manifest, &blobs)?)?;
     Ok(manifest)
 }
 
 /// The digest an Action field names, or a fetch failure saying which field is missing.
-fn named(what: &str, digest: Option<&Digest>) -> Result<Digest, FetchError> {
+fn named(what: &str, digest: Option<&reapi::Digest>) -> Result<reapi::Digest, FetchError> {
     digest
         .cloned()
         .ok_or_else(|| FetchError::Invalid(format!("the Action names no {what}")))
 }
 
 /// A result's digest as the manifest writes it.
-fn blob_id(digest: Option<&Digest>) -> Result<BlobId, Failure> {
+fn digest_of(digest: Option<&reapi::Digest>) -> Result<Digest, Failure> {
     let digest = digest.ok_or_else(|| Failure::Result("a digest is absent".to_owned()))?;
-    BlobId::try_from(digest).map_err(|e| Failure::Result(e.to_string()))
+    digest::from_reapi(digest).map_err(|e| Failure::Result(e.to_string()))
 }
 
 /// A stream's digest as the manifest writes it: absent when the stream is empty.
-fn stdio(digest: Option<&Digest>) -> Result<Option<BlobId>, Failure> {
-    Ok(Some(blob_id(digest)?).filter(|id| !id.is_empty()))
+fn stdio(digest: Option<&reapi::Digest>) -> Result<Option<Digest>, Failure> {
+    Ok(Some(digest_of(digest)?).filter(|d| d.size_bytes != 0))
 }
 
 /// How long the Command may run: the Action's timeout when it sets a positive one, but never more
@@ -345,6 +355,12 @@ fn check_argv_secrets(cli: &Cli) -> Result<(), Failure> {
     }
 }
 
+/// Refuses a lease the frontend would refuse in a manifest ([`check_build`]), before anything is
+/// fetched: the Command would run for nothing, and its pack would be refused after the PUT.
+fn check_lease(cli: &Cli) -> Result<(), Failure> {
+    check_build(&cli.lease).map_err(|e| Failure::Setup(format!("--lease: {e}")))
+}
+
 /// A credential from the file or the flag value the command line named, a trailing newline
 /// dropped, and the file (when it was one) left in place. `what` names the credential.
 fn credential(what: &str, file: Option<&Path>, flag: Option<&str>) -> Result<String, Failure> {
@@ -366,6 +382,7 @@ fn credential(what: &str, file: Option<&Path>, flag: Option<&str>) -> Result<Str
 
 /// The trusted roots and the real source and sink the flags name.
 fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
+    check_lease(cli)?;
     check_argv_secrets(cli)?;
     let token = credential(
         "grant token",

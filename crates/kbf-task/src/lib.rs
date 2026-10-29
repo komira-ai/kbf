@@ -9,8 +9,12 @@
 //!    stderr to files, under a deadline;
 //! 3. collects the declared outputs as REAPI does ([`outputs`]): files, directories as Trees,
 //!    symlinks, the executable bit;
-//! 4. writes every output blob, stdout, stderr and Tree, and the [`manifest`], into ONE kbf-segments
-//!    object ([`pack`]), the manifest as the record at offset 0;
+//! 4. writes every output blob, stdout, stderr and Tree, and the manifest, into ONE kbf-segments
+//!    object ([`pack`]), the manifest as the record at offset 0, with the shared task pack types
+//!    of `kbf-task-pack` (`TaskManifest`, `write_pack`, `read_manifest`), the same code the
+//!    frontend that ingests the pack uses. The manifest is validated before anything is stored,
+//!    and the pack is read back through the shape check ingest applies to its footer: a manifest
+//!    or a pack ingest would refuse fails the task (exit 12) instead of being stored;
 //! 5. PUTs that object once to the presigned URL ([`put`]).
 //!
 //! `js-agent` returns nothing but an exit code, so the manifest travels inside the pack, and the exit
@@ -32,11 +36,11 @@
 //! process on the host to read; they are a stopgap until the job scheduler delivers job secrets as
 //! files, and are removed then. A process of the Command that leaves its process
 //! group (for example with `setsid`) survives the group kill at the deadline; only such a sandbox
-//! ends it. The tool holds each collected blob in memory twice and the pack once more, so its peak
-//! is about three times the pack limit.
+//! ends it. The tool holds the collected blobs, the writer's buffer and the finished pack in memory, so
+//! its peak is about three times the pack limit.
 
+pub mod digest;
 pub mod fetch;
-pub mod manifest;
 pub mod outputs;
 pub mod pack;
 pub mod put;
