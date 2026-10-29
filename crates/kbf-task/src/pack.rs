@@ -391,6 +391,17 @@ mod tests {
         assert_eq!(verify(&bytes).unwrap(), m);
     }
 
+    /// Catches: a file that opens but cannot be read (a directory named as a blob) not being
+    /// reported as a read error naming it.
+    #[test]
+    fn unreadable_file_is_a_read_error() {
+        let (_dir, sub) = scratch("a-directory");
+        std::fs::create_dir(&sub).unwrap();
+        let err = pack(&sample(), [Blob::File(sub)]).unwrap_err();
+        assert!(matches!(err, PackError::Read { .. }));
+        assert!(err.to_string().contains("cannot read"));
+    }
+
     #[test]
     fn missing_file_is_a_read_error() {
         let err = pack(&sample(), [Blob::File(scratch("absent").1)]).unwrap_err();
@@ -404,7 +415,10 @@ mod tests {
         b.pop();
         let m = sample();
         let err = pack(&m, b).unwrap_err();
-        assert!(matches!(err, PackError::Missing(id) if id == m.output_directories[0].tree));
+        assert_eq!(
+            format!("{err:?}"),
+            format!("{:?}", PackError::Missing(m.output_directories[0].tree))
+        );
     }
 
     /// The byte limit names itself, for bytes and for a manifest alone that does not fit.
@@ -422,7 +436,10 @@ mod tests {
         let mut b = blobs();
         b.push(Blob::Bytes(vec![7; 10_000]));
         let err = pack_within(tight, &m, b).unwrap_err();
-        assert!(matches!(err, PackError::TooLarge { limit: l } if l == pack_bytes));
+        assert_eq!(
+            format!("{err:?}"),
+            format!("{:?}", PackError::TooLarge { limit: pack_bytes })
+        );
         assert!(err.to_string().contains(&pack_bytes.to_string()));
         assert!(err.to_string().contains("output-too-large"));
 
@@ -495,13 +512,19 @@ mod tests {
         let mut b = blobs();
         b.push(Blob::Bytes(vec![1; len + 1]));
         let err = pack_within(small, &m, b).unwrap_err();
-        assert!(matches!(err, PackError::RecordTooLarge { limit: l } if l == limit));
+        assert_eq!(
+            format!("{err:?}"),
+            format!("{:?}", PackError::RecordTooLarge { limit })
+        );
         assert!(err.to_string().contains("output-too-large"));
 
         let (_dir, path) = scratch("record");
         std::fs::write(&path, vec![1u8; len + 1]).unwrap();
         let err = pack_within(small, &m, [Blob::File(path.clone())]).unwrap_err();
-        assert!(matches!(err, PackError::RecordTooLarge { limit: l } if l == limit));
+        assert_eq!(
+            format!("{err:?}"),
+            format!("{:?}", PackError::RecordTooLarge { limit })
+        );
         std::fs::write(&path, vec![1u8; len]).unwrap();
         let mut b = blobs();
         b.push(Blob::File(path.clone()));
@@ -525,7 +548,10 @@ mod tests {
             ..limits()
         };
         let err = pack_within(under, &m, blobs()).unwrap_err();
-        assert!(matches!(err, PackError::ManifestTooLarge { limit } if limit == len - 1));
+        assert_eq!(
+            format!("{err:?}"),
+            format!("{:?}", PackError::ManifestTooLarge { limit: len - 1 })
+        );
         assert!(err.to_string().contains("output-too-large"));
         assert_eq!(MAX_MANIFEST_BYTES, 4 * 1024 * 1024);
     }
@@ -538,8 +564,15 @@ mod tests {
         pack(&m, blobs()).unwrap();
         m.output_files[0].path.push('p');
         let err = pack(&m, blobs()).unwrap_err();
-        assert!(
-            matches!(err, PackError::PathTooLong { len, limit } if len == 4097 && limit == 4096)
+        assert_eq!(
+            format!("{err:?}"),
+            format!(
+                "{:?}",
+                PackError::PathTooLong {
+                    len: 4097,
+                    limit: 4096
+                }
+            )
         );
         assert!(err.to_string().contains("4097"));
 
@@ -555,7 +588,10 @@ mod tests {
                     _ => m.output_symlinks[0].path = dup.to_owned(),
                 }
                 let err = pack(&m, blobs()).unwrap_err();
-                assert!(matches!(&err, PackError::DuplicatePath(p) if p == dup));
+                assert_eq!(
+                    format!("{err:?}"),
+                    format!("{:?}", PackError::DuplicatePath(dup.to_owned()))
+                );
                 assert!(err.to_string().contains(dup));
             }
         }
@@ -595,7 +631,10 @@ mod tests {
         let mut w = SegmentWriter::new(MAX_PACK_BYTES);
         w.push(&m.encode()).unwrap();
         let err = verify(&w.finish()).unwrap_err();
-        assert!(matches!(err, VerifyError::Missing(id) if id == m.stdout.unwrap()));
+        assert_eq!(
+            format!("{err:?}"),
+            format!("{:?}", VerifyError::Missing(m.stdout.unwrap()))
+        );
         assert!(err.to_string().contains("not a record"));
 
         // A manifest that is not first is not found at offset 0.

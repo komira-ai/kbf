@@ -27,3 +27,30 @@ fn the_version_names_the_commit_it_was_built_from() {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     assert!(hex || stamp == "unknown", "the stamp is {stamp:?}");
 }
+
+/// Catches: the binary's `main` not handing the parsed flags to the task and returning the
+/// task's exit code: a token file that does not exist is a setup failure, exit code 14, before
+/// anything is fetched or written.
+#[test]
+fn a_missing_credential_file_is_a_setup_failure_exit_code() {
+    let out = Command::new(env!("CARGO_BIN_EXE_kbf-task"))
+        .args([
+            "--pack-url-file",
+            "/nonexistent-url",
+            "--grant-url",
+            "https://grant.example",
+            "--grant-token-file",
+            "/nonexistent-token",
+            "--lease",
+            "lease-1",
+            "--action",
+            &format!("{}-0", "0".repeat(64)),
+            "--work-dir",
+            "/nonexistent-work",
+        ])
+        .output()
+        .expect("kbf-task runs");
+    assert_eq!(out.status.code(), Some(14));
+    let text = String::from_utf8(out.stderr).expect("utf-8");
+    assert!(text.starts_with("kbf-task: "), "{text}");
+}

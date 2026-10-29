@@ -546,7 +546,8 @@ mod tests {
             std::fs::read_link(dir.join("link")).expect("link"),
             Path::new("a.txt")
         );
-        assert!(dir.join("one/e").is_file() && dir.join("two/e").is_file());
+        assert!(dir.join("one/e").is_file());
+        assert!(dir.join("two/e").is_file());
         assert_eq!(mem.reads(&digest_of(b"hello")), 1);
         let shared = digest_of(
             &Directory {
@@ -798,6 +799,24 @@ mod tests {
         drop(closed);
         let error = plain(&base).verified(&digest).expect_err("unreachable");
         assert!(matches!(error, FetchError::Source { .. }), "{error:?}");
+    }
+
+    /// Catches a body that ends before its Content-Length being taken for a blob, or reported as
+    /// anything but a source error naming the digest.
+    #[test]
+    fn a_body_cut_short_is_a_source_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort");
+        });
+        let digest = digest_of(&[b'a'; 100]);
+        let error = plain(&base).get(&digest).expect_err("cut short");
+        assert!(matches!(&error, FetchError::Source { .. }), "{error:?}");
+        assert!(error.to_string().contains(&label(&digest)), "{error}");
     }
 
     /// Catches a digest reaching the URL unchecked when `get` is called directly.

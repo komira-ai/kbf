@@ -128,10 +128,11 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
 
     let cpu_before = children_usage().cpu_us;
     let started = Instant::now();
-    let mut child = process.spawn().map_err(|source| RunError::Spawn {
+    let spawn_error = |source| RunError::Spawn {
         program: program.clone(),
         source,
-    })?;
+    };
+    let mut child = process.spawn().map_err(spawn_error)?;
     // Taken before the wait: the pid is also the id of the group the child leads.
     let group = child.id();
     let waited = tokio::time::timeout(run.deadline, child.wait()).await;
@@ -143,10 +144,7 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
     };
     // Whatever the program left running in its group is ended with it.
     kill_group(group);
-    let status = status.map_err(|source| RunError::Spawn {
-        program: program.clone(),
-        source,
-    })?;
+    let status = status.map_err(spawn_error)?;
     let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let usage = children_usage();
     let exit_code = if timed_out {
@@ -538,6 +536,14 @@ mod tests {
         assert!(matches!(error, RunError::Invalid(_)), "{error}");
     }
 
+    /// Catches a kill of a child that never had a pid, or whose pid does not fit a `pid_t`,
+    /// signalling anything or failing: both are nothing to kill.
+    #[test]
+    fn kill_group_does_nothing_without_a_usable_group() {
+        kill_group(None);
+        kill_group(Some(u32::MAX));
+    }
+
     #[tokio::test]
     async fn a_directory_that_cannot_be_made_is_an_io_error() {
         let rig = Rig::new("mkdir");
@@ -555,9 +561,11 @@ mod tests {
         )
         .expect("chmod back");
         // A privileged user ignores the mode; then the directory is made and nothing fails.
-        if let Err(error) = result {
-            assert!(matches!(error, RunError::Io { .. }), "{error}");
-        }
+        assert!(
+            result
+                .err()
+                .is_none_or(|error| matches!(error, RunError::Io { .. }))
+        );
     }
 
     #[tokio::test]

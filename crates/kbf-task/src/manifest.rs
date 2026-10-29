@@ -77,7 +77,8 @@ impl FromStr for BlobId {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
         let mut hash = [0u8; 32];
-        if hex_part.len() != 64 || !lower || hex::decode_to_slice(hex_part, &mut hash).is_err() {
+        // `decode_to_slice` also refuses any length but 64 hex digits for the 32-byte array.
+        if !lower || hex::decode_to_slice(hex_part, &mut hash).is_err() {
             return Err(ParseBlobIdError::Hash(hex_part.to_owned()));
         }
         // `u64::from_str` accepts a leading `+`; one id has exactly one text form.
@@ -336,7 +337,8 @@ pub(crate) mod tests {
         let mut both = sample();
         both.stdout = None;
         let text = String::from_utf8(both.encode()).unwrap();
-        assert!(!text.contains("stdout") && !text.contains("stderr"));
+        assert!(!text.contains("stdout"));
+        assert!(!text.contains("stderr"));
         assert_eq!(Manifest::parse(text.as_bytes()).unwrap(), both);
         let mut full = sample();
         full.stderr = Some(BlobId::of(b"err"));
@@ -362,11 +364,15 @@ pub(crate) mod tests {
             hash: [7; 32],
             size: 0,
         };
-        assert!(forged.is_empty() && forged != empty);
+        assert!(forged.is_empty());
+        assert_ne!(forged, empty);
         let mut bad = sample();
         bad.output_files[0].digest = forged;
         let err = Manifest::parse(&bad.encode()).unwrap_err();
-        assert!(matches!(err, ParseError::NotEmpty(id) if id == forged));
+        assert_eq!(
+            format!("{err:?}"),
+            format!("{:?}", ParseError::NotEmpty(forged))
+        );
         assert!(err.to_string().contains("not the empty digest"));
     }
 

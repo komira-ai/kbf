@@ -609,10 +609,10 @@ fn connect_reads_the_token_file_and_the_extra_roots() {
     // An empty one.
     std::fs::write(&url_file, "\n").expect("write");
     assert!(matches!(connect(&flags), Err(Failure::Setup(_))));
-    // A URL: it is read, and the file is gone before the Command could read it.
+    // A URL: it is read, and the file is left in place for the executor that delivered it.
     std::fs::write(&url_file, "https://store.example/pack?sig=s\n").expect("write");
     assert!(connect(&flags).is_ok());
-    assert!(!url_file.exists());
+    assert!(url_file.exists());
 }
 
 /// Catches the plain-HTTP opt-in being ignored: without `--allow-plain-http-put` the sink refuses
@@ -640,10 +640,12 @@ fn the_plain_http_opt_in_lets_the_sink_reach_an_http_store() {
     assert!(!failed.to_string().contains("sig=s"), "{failed}");
 }
 
+/// Catches: the URL file being removed, or needing a writable directory: an executor delivers it
+/// as a read-only run file, so the tool reads it and leaves it in place.
 #[test]
-fn connect_refuses_a_url_file_it_cannot_remove() {
+fn connect_reads_a_url_file_in_a_read_only_directory() {
     use std::os::unix::fs::PermissionsExt as _;
-    let dir = scratch("connect-unremovable");
+    let dir = scratch("connect-read-only");
     let held = dir.join("held");
     std::fs::create_dir(&held).expect("dir");
     let mut flags = cli(&dir, Digest::from(BlobId::of(b"a")));
@@ -652,13 +654,11 @@ fn connect_refuses_a_url_file_it_cannot_remove() {
     flags.pack_url_file = Some(held.join("url"));
     std::fs::write(held.join("url"), "https://store.example/pack?sig=s").expect("write");
     std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o500)).expect("mode");
-    // A superuser removes it anyway; the refusal is checked where the mode is enforced.
-    let enforced = std::fs::write(held.join("probe"), b"").is_err();
     let outcome = connect(&flags);
+    let left = held.join("url").exists();
     std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o700)).expect("mode");
-    if enforced {
-        assert!(matches!(outcome, Err(Failure::Setup(_))));
-    }
+    assert!(outcome.is_ok());
+    assert!(left);
 }
 
 #[tokio::test]
@@ -666,6 +666,51 @@ async fn main_with_reports_a_setup_failure_by_exit_code() {
     let dir = scratch("main-setup");
     let flags = cli(&dir, Digest::from(BlobId::of(b"a")));
     assert_eq!(main_with(&flags).await, ExitCode::from(EXIT_SETUP));
+}
+
+/// Catches: a task that ran and stored its pack not exiting 0.
+#[tokio::test]
+async fn a_task_that_stores_its_pack_exits_zero() {
+    let mut mem = Mem::default();
+    let digest = action(&mut mem, COPY, &["out"]);
+    let dir = scratch("finish-ok");
+    let flags = cli(&dir, digest);
+    let connected = Ok::<_, Failure>((mem, Fake::new(false)));
+    assert_eq!(finish(&flags, connected).await, ExitCode::SUCCESS);
+}
+
+/// Catches: a failed connect not ending as its own exit code, or a sink that refuses the pack
+/// not ending as the put code.
+#[tokio::test]
+async fn finish_exits_with_the_code_of_the_failure() {
+    let mut mem = Mem::default();
+    let digest = action(&mut mem, COPY, &["out"]);
+    let dir = scratch("finish-fail");
+    let flags = cli(&dir, digest);
+    let refused = Ok::<_, Failure>((mem, Fake::new(true)));
+    assert_eq!(finish(&flags, refused).await, ExitCode::from(EXIT_PUT));
+    let not_connected: Result<(Mem, Fake), Failure> = Err(Failure::Setup("no".to_owned()));
+    assert_eq!(
+        finish(&flags, not_connected).await,
+        ExitCode::from(EXIT_SETUP)
+    );
+}
+
+/// Catches: `run_cli` not building a runtime and running the task on it.
+#[test]
+fn run_cli_runs_the_task_and_returns_its_exit_code() {
+    let dir = scratch("run-cli");
+    let flags = cli(&dir, Digest::from(BlobId::of(b"a")));
+    assert_eq!(run_cli(&flags), ExitCode::from(EXIT_SETUP));
+}
+
+/// Catches: a runtime that cannot start not being a setup failure.
+#[test]
+fn a_runtime_that_cannot_start_is_a_setup_failure() {
+    let dir = scratch("no-runtime");
+    let flags = cli(&dir, Digest::from(BlobId::of(b"a")));
+    let failed = Err(std::io::Error::other("no threads"));
+    assert_eq!(start(failed, &flags), ExitCode::from(EXIT_SETUP));
 }
 
 #[test]

@@ -224,7 +224,8 @@ mod tests {
             url: "http://h/k?<redacted>".into(),
         }
         .to_string();
-        assert!(text.contains("403") && text.contains("http://h/k?<redacted>"));
+        assert!(text.contains("403"));
+        assert!(text.contains("http://h/k?<redacted>"));
         assert!(
             PutError::Exists { url: "u".into() }
                 .to_string()

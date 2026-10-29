@@ -72,8 +72,10 @@ pub const EXIT_SETUP: u8 = 14;
 )]
 pub struct Cli {
     /// A file holding the presigned URL the pack is PUT to, once. The URL is a credential, so by
-    /// default it is not a flag value (argv is readable by the Command): the file is read, and
-    /// removed, before the Command starts.
+    /// default it is not a flag value (argv is readable by the Command): the file is read and left
+    /// in place. The executor that delivered it removes it when the run ends (on js-agent it is a
+    /// read-only run file). The URL allows one create-only PUT of this task's own pack key, so a
+    /// Command that reads it can only store what it could already produce as outputs.
     #[arg(long)]
     pub pack_url_file: Option<PathBuf>,
     /// The presigned URL itself. Stopgap (komira-ai/kbf#1934): it is in argv, so it needs
@@ -381,11 +383,6 @@ fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
         cli.pack_url_file.as_deref(),
         cli.pack_url.as_deref(),
     )?;
-    if let Some(path) = &cli.pack_url_file {
-        // The Command runs as a child of this process: the URL must not be left where it can read it.
-        std::fs::remove_file(path)
-            .map_err(|e| Failure::Setup(format!("{}: {e}", path.display())))?;
-    }
     let source = HttpBlobSource::new(&cli.grant_url, &token, &roots)?;
     let sink = HttpSink {
         agent: if cli.allow_plain_http_put {
@@ -402,7 +399,16 @@ fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
 /// the outcome into the process exit code (see the module documentation). A failure is written to
 /// standard error; no message holds the token or the presigned URL's query.
 pub async fn main_with(cli: &Cli) -> ExitCode {
-    let outcome = match connect(cli) {
+    finish(cli, connect(cli)).await
+}
+
+/// Runs the task over `connected` (what [`connect`] made, or why it could not) and turns the
+/// outcome into the exit code.
+async fn finish(
+    cli: &Cli,
+    connected: Result<(impl BlobSource, impl PackSink), Failure>,
+) -> ExitCode {
+    let outcome = match connected {
         Ok((source, sink)) => execute(cli, &source, &sink).await,
         Err(failure) => Err(failure),
     };
@@ -411,6 +417,27 @@ pub async fn main_with(cli: &Cli) -> ExitCode {
         Err(failure) => {
             eprintln!("kbf-task: {failure}");
             ExitCode::from(failure.exit_code())
+        }
+    }
+}
+
+/// Runs the task the flags describe on a fresh single-threaded runtime and returns the exit code;
+/// a runtime that cannot start is a setup failure.
+pub fn run_cli(cli: &Cli) -> ExitCode {
+    start(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build(),
+        cli,
+    )
+}
+
+fn start(runtime: std::io::Result<tokio::runtime::Runtime>, cli: &Cli) -> ExitCode {
+    match runtime {
+        Ok(runtime) => runtime.block_on(main_with(cli)),
+        Err(e) => {
+            eprintln!("kbf-task: cannot start the async runtime: {e}");
+            ExitCode::from(EXIT_SETUP)
         }
     }
 }
