@@ -140,6 +140,11 @@ pub(crate) async fn tick(js: &JsFarm) {
 }
 
 /// [`Dispatch::submit`](kbf_front::Dispatch::submit) for the farm.
+///
+/// Known gap: the submission's `max_wall` is not used. The legacy farm admits with it, keeps it
+/// in the operation's `opwall` row and gives it to the scheduler (`set_max_wall`), where a
+/// whole-node drain reads it; `js-server-core` has no way to take it, so on this core a
+/// whole-node drain sees no per-operation deadline (whole-node placement is off at the flip).
 pub(crate) fn submit(js: &JsFarm, submission: Submission) -> Result<Ticket, Status> {
     let ticket = dispatch::submit(&js.core, js.now(), &js.shapes, submission)?;
     publish(js);
