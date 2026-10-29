@@ -18,6 +18,14 @@ pub(crate) fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {}: {e}", path.display()))
 }
 
+/// The golden pack: `task_pack_v1.pack.hex` is the pack in hexadecimal (64 digits a line), because
+/// the repository's text lint refuses a file with a NUL byte.
+pub(crate) fn golden_pack() -> Vec<u8> {
+    let text = String::from_utf8(fixture("task_pack_v1.pack.hex")).expect("hex is text");
+    let digits: String = text.split_whitespace().collect();
+    hex::decode(digits).expect("hexadecimal digits")
+}
+
 pub(crate) fn digest(text: &str) -> Digest {
     Digest::parse(DigestFunction::Sha256, text).expect("a digest in text form")
 }
@@ -25,10 +33,13 @@ pub(crate) fn digest(text: &str) -> Digest {
 const LEASE: &str = "0000000000000001000000000000002a";
 const ACTION: &str = "33d8589de117bdf22bdc10c48a5908a4bbd88481d54cf7c0c358905e72b79abb/18";
 const A_O: &str = "4b2cb5acb6856c5130b9bf553b2d0ff59552ea5e028f0b4e391b0581db48b71c/17";
-const TOOL: &str = "bf664cf84f00f6ed76164c8457fdeaf8e4dee547226e9ffcf8274e2d2246fed9/20";
+const TOOL: &str = "81e6db07b4376d9a120a55c66f8812633f7733c2699a07cecac0bd363a9ce426/35";
 const STDOUT: &str = "bd6c3301ad961288669682494372379ffe35526bf49c5f4bf3d85eba4bd220ae/14";
 const STDERR: &str = "e5cde090a13f5b74917873ea155e00f8407867c992ab09c2102df7aa50c7d43a/25";
 const TREE: &str = "793526f079189e7aaf35fa52cfdda4139699c8cd80832e8f404e1290b236a848/77";
+
+/// Sets one timing or usage number.
+type Setter = fn(&mut TaskManifest, u64);
 
 fn base() -> TaskManifest {
     TaskManifest {
@@ -399,7 +410,7 @@ fn a_timing_or_usage_beyond_i64_is_refused() {
         }
     ));
     let over = i64::MAX as u64 + 1;
-    let fields: [(&str, fn(&mut TaskManifest, u64)); 5] = [
+    let fields: [(&str, Setter); 5] = [
         ("timing.fetch_ms", |m, v| m.timing.fetch_ms = v),
         ("timing.run_ms", |m, v| m.timing.run_ms = v),
         ("timing.pack_ms", |m, v| m.timing.pack_ms = v),

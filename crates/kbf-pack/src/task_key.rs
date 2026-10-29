@@ -14,6 +14,9 @@ use kbf_types::Digest;
 /// The prefix every task pack key starts with.
 const PREFIX: &str = "cas/b/";
 
+/// The domain tag at the start of the MAC's message.
+const MAC_DOMAIN: &[u8] = b"kbf-task-pack/v1";
+
 /// The bytes of the MAC a key carries (a truncated HMAC-SHA-256).
 pub const MAC_LEN: usize = 16;
 
@@ -63,14 +66,19 @@ impl TaskPackKey {
     ///
     /// # Errors
     /// The refusal of [`check_build`].
-    #[expect(unused_variables, reason = "red-first stub")]
     pub fn new(
         build: &str,
         mac: [u8; MAC_LEN],
         minute: u32,
         slot: u32,
     ) -> Result<Self, TaskKeyError> {
-        unimplemented!("S5 PR-A: red stub")
+        check_build(build)?;
+        Ok(Self {
+            build: build.to_owned(),
+            mac,
+            minute,
+            slot,
+        })
     }
 
     /// Parses `cas/b/<build>/<nonce>-<slot>`.
@@ -80,9 +88,26 @@ impl TaskPackKey {
     /// `/`), the refusal of [`check_build`] for the build, [`TaskKeyError::Nonce`] for a nonce
     /// that is not 40 lowercase hex digits then `-`, [`TaskKeyError::Slot`] for a slot that is
     /// not a canonical decimal.
-    #[expect(unused_variables, reason = "red-first stub")]
     pub fn parse(key: &str) -> Result<Self, TaskKeyError> {
-        unimplemented!("S5 PR-A: red stub")
+        let not_a_key = || TaskKeyError::NotAPackKey(key.to_owned());
+        let rest = key.strip_prefix(PREFIX).ok_or_else(not_a_key)?;
+        let (build, nonce) = rest.split_once('/').ok_or_else(not_a_key)?;
+        if nonce.contains('/') {
+            return Err(not_a_key());
+        }
+        check_build(build)?;
+        let bad_nonce = || TaskKeyError::Nonce(nonce.to_owned());
+        let (digits, slot) = nonce.split_once('-').ok_or_else(bad_nonce)?;
+        if digits.len() != 2 * MAC_LEN + 8 || !is_lower_hex(digits) {
+            return Err(bad_nonce());
+        }
+        let (mac_hex, minute_hex) = digits.split_at(2 * MAC_LEN);
+        // Both halves are lowercase hex of the right length (checked above), so these cannot fail.
+        let mac = std::array::from_fn(|i| {
+            u8::from_str_radix(&mac_hex[2 * i..2 * i + 2], 16).unwrap_or_default()
+        });
+        let minute = u32::from_str_radix(minute_hex, 16).unwrap_or_default();
+        Self::new(build, mac, minute, parse_slot(slot)?)
     }
 
     /// The build id: the lease the frontend issued.
@@ -136,18 +161,28 @@ impl fmt::Display for TaskPackKey {
 ///
 /// # Errors
 /// [`TaskKeyError::EmptyBuild`], [`TaskKeyError::LongBuild`] or [`TaskKeyError::BuildCharacter`].
-#[expect(unused_variables, reason = "red-first stub")]
 pub fn check_build(build: &str) -> Result<(), TaskKeyError> {
-    unimplemented!("S5 PR-A: red stub")
+    if build.is_empty() {
+        return Err(TaskKeyError::EmptyBuild);
+    }
+    if build.len() > MAX_BUILD_BYTES {
+        return Err(TaskKeyError::LongBuild(build.len()));
+    }
+    match build
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(*c, '-' | '_')))
+    {
+        Some(c) => Err(TaskKeyError::BuildCharacter(c)),
+        None => Ok(()),
+    }
 }
 
 /// The minute (minutes since the Unix epoch) that `unix_secs` falls in.
 ///
 /// # Errors
 /// [`TaskKeyError::MinuteRange`] past the year 10000.
-#[expect(unused_variables, reason = "red-first stub")]
 pub fn minute_of(unix_secs: u64) -> Result<u32, TaskKeyError> {
-    unimplemented!("S5 PR-A: red stub")
+    u32::try_from(unix_secs / 60).map_err(|_| TaskKeyError::MinuteRange(unix_secs))
 }
 
 /// The message the MAC of a key covers: the domain tag `kbf-task-pack/v1`, a NUL, the build,
@@ -157,7 +192,29 @@ pub fn minute_of(unix_secs: u64) -> Result<u32, TaskKeyError> {
 ///
 /// # Errors
 /// The refusal of [`check_build`].
-#[expect(unused_variables, reason = "red-first stub")]
 pub fn mac_input(build: &str, action: &Digest, minute: u32) -> Result<Vec<u8>, TaskKeyError> {
-    unimplemented!("S5 PR-A: red stub")
+    check_build(build)?;
+    let mut out = Vec::with_capacity(MAC_DOMAIN.len() + build.len() + 2 + 32 + 8 + 4);
+    out.extend_from_slice(MAC_DOMAIN);
+    out.push(0);
+    out.extend_from_slice(build.as_bytes());
+    out.push(0);
+    out.extend_from_slice(&action.hash);
+    out.extend_from_slice(&action.size_bytes.to_be_bytes());
+    out.extend_from_slice(&minute.to_be_bytes());
+    Ok(out)
+}
+
+fn is_lower_hex(s: &str) -> bool {
+    s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn parse_slot(slot: &str) -> Result<u32, TaskKeyError> {
+    let bad = || TaskKeyError::Slot(slot.to_owned());
+    let digits = !slot.is_empty() && slot.bytes().all(|b| b.is_ascii_digit());
+    let leading_zero = slot.len() > 1 && slot.starts_with('0');
+    if !digits || leading_zero {
+        return Err(bad());
+    }
+    slot.parse().map_err(|_| bad())
 }

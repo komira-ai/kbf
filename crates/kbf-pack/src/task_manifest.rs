@@ -23,9 +23,12 @@
 //! with every field required except `stdout` and `stderr`, which are left out when the stream
 //! is empty. An unknown field, a duplicate key and uppercase hex are refused.
 
-use kbf_types::{Digest, DigestFunction, ParseDigestError};
+use std::collections::BTreeSet;
 
-use crate::task_key::TaskKeyError;
+use kbf_types::{Digest, DigestFunction, ParseDigestError};
+use serde::{Deserialize, Serialize};
+
+use crate::task_key::{TaskKeyError, check_build};
 
 /// The manifest version this build reads and writes.
 pub const MANIFEST_VERSION: u32 = 1;
@@ -220,9 +223,15 @@ impl TaskManifest {
     /// [`ManifestError::TooLarge`] first, before anything is parsed; then the first of
     /// [`ManifestError::Json`], [`ManifestError::Version`], [`ManifestError::Digest`] and the
     /// refusals of [`TaskManifest::validate`].
-    #[expect(unused_variables, reason = "red-first stub")]
     pub fn parse(bytes: &[u8]) -> Result<Self, ManifestError> {
-        unimplemented!("S5 PR-A: red stub")
+        check_len(bytes.len() as u64)?;
+        let wire: Wire = serde_json::from_slice(bytes)?;
+        if wire.version != MANIFEST_VERSION {
+            return Err(ManifestError::Version(wire.version));
+        }
+        let manifest = wire.into_manifest()?;
+        manifest.validate()?;
+        Ok(manifest)
     }
 
     /// The canonical JSON of the manifest: compact, in the field order of the module docs.
@@ -231,7 +240,10 @@ impl TaskManifest {
     /// The refusals of [`TaskManifest::validate`], and [`ManifestError::TooLarge`] when the
     /// JSON would pass [`MAX_MANIFEST_BYTES`].
     pub fn to_json(&self) -> Result<Vec<u8>, ManifestError> {
-        unimplemented!("S5 PR-A: red stub")
+        self.validate()?;
+        let json = serde_json::to_vec(&Wire::from_manifest(self))?;
+        check_len(json.len() as u64)?;
+        Ok(json)
     }
 
     /// Checks every rule that is not the JSON's own: the lease is a build id; a digest of size 0
@@ -243,13 +255,262 @@ impl TaskManifest {
     /// # Errors
     /// The first rule that fails, in the order of the fields.
     pub fn validate(&self) -> Result<(), ManifestError> {
-        unimplemented!("S5 PR-A: red stub")
+        check_build(&self.lease)?;
+        check_digest("action", &self.action)?;
+        for (field, stream) in [("stdout", &self.stdout), ("stderr", &self.stderr)] {
+            if let Some(digest) = stream {
+                check_digest(field, digest)?;
+                if digest.size_bytes == 0 {
+                    return Err(ManifestError::EmptyStream(field));
+                }
+            }
+        }
+        let mut seen = BTreeSet::new();
+        for (i, file) in self.output_files.iter().enumerate() {
+            check_path(&mut seen, &file.path)?;
+            check_digest(&format!("output_files[{i}].digest"), &file.digest)?;
+        }
+        for (i, dir) in self.output_directories.iter().enumerate() {
+            check_path(&mut seen, &dir.path)?;
+            check_digest(&format!("output_directories[{i}].tree"), &dir.tree)?;
+        }
+        for link in &self.output_symlinks {
+            check_path(&mut seen, &link.path)?;
+            check_text(&link.target).map_err(|reason| ManifestError::Target {
+                path: link.path.clone(),
+                reason,
+            })?;
+        }
+        for (field, value) in [
+            ("timing.fetch_ms", self.timing.fetch_ms),
+            ("timing.run_ms", self.timing.run_ms),
+            ("timing.pack_ms", self.timing.pack_ms),
+            ("usage.cpu_usage_us", self.usage.cpu_usage_us),
+            ("usage.memory_peak_bytes", self.usage.memory_peak_bytes),
+        ] {
+            if i64::try_from(value).is_err() {
+                return Err(ManifestError::Advisory { field, value });
+            }
+        }
+        Ok(())
     }
 
     /// The digests of the outputs that need a record in the pack or a copy already in the store:
     /// `stdout`, `stderr`, each file and each tree, without those of size 0 (implicit in every
     /// store). Repeats are kept; the action is an input, not an output, and is not listed.
     pub fn output_digests(&self) -> impl Iterator<Item = Digest> + '_ {
-        std::iter::empty()
+        self.stdout
+            .iter()
+            .chain(&self.stderr)
+            .copied()
+            .chain(self.output_files.iter().map(|f| f.digest))
+            .chain(self.output_directories.iter().map(|d| d.tree))
+            .filter(|d| d.size_bytes != 0)
+    }
+}
+
+fn check_len(len: u64) -> Result<(), ManifestError> {
+    if len > MAX_MANIFEST_BYTES {
+        return Err(ManifestError::TooLarge { len });
+    }
+    Ok(())
+}
+
+fn check_digest(field: &str, digest: &Digest) -> Result<(), ManifestError> {
+    if digest.size_bytes == 0 && *digest != EMPTY_DIGEST {
+        return Err(ManifestError::ZeroSizeNotEmpty {
+            field: field.to_owned(),
+            digest: *digest,
+        });
+    }
+    Ok(())
+}
+
+/// The rules a path and a symlink target share: not empty, not too long, no NUL.
+fn check_text(text: &str) -> Result<(), PathError> {
+    if text.is_empty() {
+        return Err(PathError::Empty);
+    }
+    if text.len() > MAX_PATH_BYTES {
+        return Err(PathError::TooLong(text.len()));
+    }
+    if text.contains('\0') {
+        return Err(PathError::Nul);
+    }
+    Ok(())
+}
+
+fn check_path(seen: &mut BTreeSet<String>, path: &str) -> Result<(), ManifestError> {
+    let refuse = |reason| ManifestError::Path {
+        path: path.to_owned(),
+        reason,
+    };
+    check_text(path).map_err(refuse)?;
+    if path.starts_with('/') {
+        return Err(refuse(PathError::Absolute));
+    }
+    if path.split('/').any(|part| part == "..") {
+        return Err(refuse(PathError::ParentComponent));
+    }
+    if !seen.insert(path.to_owned()) {
+        return Err(ManifestError::DuplicatePath(path.to_owned()));
+    }
+    Ok(())
+}
+
+fn digest_of(field: String, text: &str) -> Result<Digest, ManifestError> {
+    Digest::parse(DigestFunction::Sha256, text)
+        .map_err(|source| ManifestError::Digest { field, source })
+}
+
+// The wire form. Private: the typed manifest above is the API, so a caller cannot build a
+// manifest the reader would disagree with about spelling.
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Wire {
+    version: u32,
+    lease: String,
+    action: String,
+    exit_code: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stderr: Option<String>,
+    output_files: Vec<WireFile>,
+    output_directories: Vec<WireDirectory>,
+    output_symlinks: Vec<WireSymlink>,
+    timing: WireTiming,
+    usage: WireUsage,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireFile {
+    path: String,
+    digest: String,
+    is_executable: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireDirectory {
+    path: String,
+    tree: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireSymlink {
+    path: String,
+    target: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireTiming {
+    fetch_ms: u64,
+    run_ms: u64,
+    pack_ms: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireUsage {
+    cpu_usage_us: u64,
+    memory_peak_bytes: u64,
+}
+
+impl Wire {
+    fn from_manifest(m: &TaskManifest) -> Self {
+        Self {
+            version: MANIFEST_VERSION,
+            lease: m.lease.clone(),
+            action: m.action.to_string(),
+            exit_code: m.exit_code,
+            stdout: m.stdout.map(|d| d.to_string()),
+            stderr: m.stderr.map(|d| d.to_string()),
+            output_files: m
+                .output_files
+                .iter()
+                .map(|f| WireFile {
+                    path: f.path.clone(),
+                    digest: f.digest.to_string(),
+                    is_executable: f.is_executable,
+                })
+                .collect(),
+            output_directories: m
+                .output_directories
+                .iter()
+                .map(|d| WireDirectory {
+                    path: d.path.clone(),
+                    tree: d.tree.to_string(),
+                })
+                .collect(),
+            output_symlinks: m
+                .output_symlinks
+                .iter()
+                .map(|l| WireSymlink {
+                    path: l.path.clone(),
+                    target: l.target.clone(),
+                })
+                .collect(),
+            timing: WireTiming {
+                fetch_ms: m.timing.fetch_ms,
+                run_ms: m.timing.run_ms,
+                pack_ms: m.timing.pack_ms,
+            },
+            usage: WireUsage {
+                cpu_usage_us: m.usage.cpu_usage_us,
+                memory_peak_bytes: m.usage.memory_peak_bytes,
+            },
+        }
+    }
+
+    fn into_manifest(self) -> Result<TaskManifest, ManifestError> {
+        let stream = |field: &str, text: Option<String>| {
+            text.map(|t| digest_of(field.to_owned(), &t)).transpose()
+        };
+        let mut output_files = Vec::with_capacity(self.output_files.len());
+        for (i, f) in self.output_files.into_iter().enumerate() {
+            output_files.push(OutputFile {
+                digest: digest_of(format!("output_files[{i}].digest"), &f.digest)?,
+                path: f.path,
+                is_executable: f.is_executable,
+            });
+        }
+        let mut output_directories = Vec::with_capacity(self.output_directories.len());
+        for (i, d) in self.output_directories.into_iter().enumerate() {
+            output_directories.push(OutputDirectory {
+                tree: digest_of(format!("output_directories[{i}].tree"), &d.tree)?,
+                path: d.path,
+            });
+        }
+        Ok(TaskManifest {
+            action: digest_of("action".to_owned(), &self.action)?,
+            lease: self.lease,
+            exit_code: self.exit_code,
+            stdout: stream("stdout", self.stdout)?,
+            stderr: stream("stderr", self.stderr)?,
+            output_files,
+            output_directories,
+            output_symlinks: self
+                .output_symlinks
+                .into_iter()
+                .map(|l| OutputSymlink {
+                    path: l.path,
+                    target: l.target,
+                })
+                .collect(),
+            timing: Timing {
+                fetch_ms: self.timing.fetch_ms,
+                run_ms: self.timing.run_ms,
+                pack_ms: self.timing.pack_ms,
+            },
+            usage: Usage {
+                cpu_usage_us: self.usage.cpu_usage_us,
+                memory_peak_bytes: self.usage.memory_peak_bytes,
+            },
+        })
     }
 }

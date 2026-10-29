@@ -7,7 +7,9 @@
 //! footer before it fetches a byte of a record. It is not the frontend's verification: every
 //! record's hash, the manifest's claims against the lease and the closure check are ingest's.
 
-use kbf_segments::{Footer, IndexEntry, MAX_SEGMENT_BYTES, SegmentError, WriteError};
+use kbf_segments::{
+    Footer, IndexEntry, MAX_SEGMENT_BYTES, SegmentError, SegmentReader, SegmentWriter, WriteError,
+};
 
 use crate::task_manifest::{MAX_MANIFEST_BYTES, ManifestError, TaskManifest};
 
@@ -112,9 +114,55 @@ pub enum WritePackError {
 ///
 /// # Errors
 /// The first rule that fails, as a [`ShapeError`].
-#[expect(unused_variables, reason = "red-first stub")]
 pub fn check_shape(footer: &Footer, pack_len: u64) -> Result<&IndexEntry, ShapeError> {
-    unimplemented!("S5 PR-A: red stub")
+    if pack_len > MAX_PACK_BYTES {
+        return Err(ShapeError::TooLarge { len: pack_len });
+    }
+    let mut by_offset: Vec<&IndexEntry> = footer.entries().iter().collect();
+    if by_offset.is_empty() {
+        return Err(ShapeError::NoRecords);
+    }
+    if by_offset.len() > MAX_PACK_RECORDS {
+        return Err(ShapeError::TooManyRecords {
+            count: by_offset.len(),
+        });
+    }
+    by_offset.sort_by_key(|e| e.offset);
+    let mut next = 0u64;
+    for entry in &by_offset {
+        let size = entry.digest.size_bytes;
+        if size == 0 {
+            return Err(ShapeError::ZeroSizeRecord {
+                offset: entry.offset,
+            });
+        }
+        if size > MAX_RECORD_BYTES {
+            return Err(ShapeError::RecordTooLarge {
+                offset: entry.offset,
+                size,
+            });
+        }
+        if entry.offset != next {
+            return Err(ShapeError::NotContiguous {
+                expected: next,
+                found: entry.offset,
+            });
+        }
+        next = entry.offset + size;
+    }
+    if next != footer.records_len() {
+        return Err(ShapeError::NotContiguous {
+            expected: next,
+            found: footer.records_len(),
+        });
+    }
+    let manifest = by_offset[0];
+    if manifest.digest.size_bytes > MAX_MANIFEST_BYTES {
+        return Err(ShapeError::ManifestTooLarge {
+            size: manifest.digest.size_bytes,
+        });
+    }
+    Ok(manifest)
 }
 
 /// Reads the manifest of `pack`, the whole object: checks the footer, the shape, the manifest
@@ -122,9 +170,14 @@ pub fn check_shape(footer: &Footer, pack_len: u64) -> Result<&IndexEntry, ShapeE
 ///
 /// # Errors
 /// [`TaskPackError::Segment`], [`TaskPackError::Shape`] or [`TaskPackError::Manifest`].
-#[expect(unused_variables, reason = "red-first stub")]
 pub fn read_manifest(pack: &[u8]) -> Result<TaskManifest, TaskPackError> {
-    unimplemented!("S5 PR-A: red stub")
+    let reader = SegmentReader::open(pack)?;
+    let entry = check_shape(reader.footer(), pack.len() as u64)?;
+    let range = entry.range();
+    // The footer checked that every record lies inside the object, so the slice is in bounds.
+    let record = &pack[range.start as usize..range.end as usize];
+    entry.verify(record)?;
+    Ok(TaskManifest::parse(record)?)
 }
 
 /// Writes a task pack: the manifest first, so it is the record at offset 0, then `blobs`, each
@@ -138,7 +191,15 @@ pub fn read_manifest(pack: &[u8]) -> Result<TaskManifest, TaskPackError> {
 /// [`WritePackError::Manifest`] for a manifest that [`TaskManifest::to_json`] refuses;
 /// [`WritePackError::RecordTooLarge`] for a blob over [`MAX_RECORD_BYTES`];
 /// [`WritePackError::Segment`] when the records pass [`MAX_PACK_BYTES`].
-#[expect(unused_variables, reason = "red-first stub")]
 pub fn write_pack(manifest: &TaskManifest, blobs: &[&[u8]]) -> Result<Vec<u8>, WritePackError> {
-    unimplemented!("S5 PR-A: red stub")
+    let mut writer = SegmentWriter::new(MAX_PACK_BYTES);
+    writer.push(&manifest.to_json()?)?;
+    for blob in blobs.iter().filter(|b| !b.is_empty()) {
+        let size = blob.len() as u64;
+        if size > MAX_RECORD_BYTES {
+            return Err(WritePackError::RecordTooLarge { size });
+        }
+        writer.push(blob)?;
+    }
+    Ok(writer.finish())
 }

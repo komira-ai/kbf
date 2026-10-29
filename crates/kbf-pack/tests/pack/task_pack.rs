@@ -12,11 +12,11 @@ use kbf_segments::{
 };
 use kbf_types::{Digest, DigestFunction};
 
-use crate::task_manifest::{fixture, golden};
+use crate::task_manifest::{fixture, golden, golden_pack};
 
 // The blobs of the golden pack, in the order they were pushed after the manifest.
 const A_O: &[u8] = b"object code of a\n";
-const TOOL: &[u8] = b"#!/bin/sh\necho tool\n";
+const TOOL: &[u8] = b"an executable output of the action\n";
 const STDOUT: &[u8] = b"compiling a.o\n";
 const STDERR: &[u8] = b"warning: unused variable\n";
 const X: &[u8] = b"x inside the directory\n";
@@ -27,12 +27,17 @@ fn tree() -> Vec<u8> {
     [&b"\nK\nI\n\x01x\x12D\n@"[..], x.as_bytes(), b"\x10\x17"].concat()
 }
 
+/// The blobs of the golden pack in the order they were written after the manifest: the offsets
+/// in the fixture follow it.
 fn golden_blobs() -> Vec<Vec<u8>> {
-    [A_O, TOOL, STDOUT, STDERR, X]
-        .iter()
-        .map(|b| b.to_vec())
-        .chain([tree()])
-        .collect()
+    vec![
+        A_O.to_vec(),
+        TOOL.to_vec(),
+        STDOUT.to_vec(),
+        STDERR.to_vec(),
+        tree(),
+        X.to_vec(),
+    ]
 }
 
 /// A footer that indexes the records `(size, offset)`, for an object whose records end at
@@ -70,7 +75,7 @@ fn shape(records: &[(u64, u64)], records_len: u64) -> Result<u64, ShapeError> {
 /// blob the tree names, and that the empty output file has no record.
 #[test]
 fn the_golden_pack_parses_and_its_manifest_is_at_offset_zero() {
-    let pack = fixture("task_pack_v1.pack");
+    let pack = golden_pack();
     let manifest_json = fixture("task_pack_v1.manifest.json");
     let reader = SegmentReader::open(&pack).expect("a segment");
     let entry = check_shape(reader.footer(), pack.len() as u64).expect("a task pack");
@@ -109,7 +114,7 @@ fn writing_the_golden_manifest_gives_the_golden_pack() {
     let plain: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
     assert_eq!(
         write_pack(&golden(), &plain).expect("writes"),
-        fixture("task_pack_v1.pack")
+        golden_pack()
     );
 
     let mut noisy = vec![&b""[..]];
@@ -118,7 +123,7 @@ fn writing_the_golden_manifest_gives_the_golden_pack() {
     noisy.push(b"");
     assert_eq!(
         write_pack(&golden(), &noisy).expect("writes"),
-        fixture("task_pack_v1.pack")
+        golden_pack()
     );
 }
 
@@ -258,7 +263,7 @@ fn a_damaged_pack_is_refused_as_a_segment() {
         read_manifest(b"not a segment at all, but long enough for a trailer......"),
         Err(TaskPackError::Segment(SegmentError::BadMagic))
     ));
-    let mut pack = fixture("task_pack_v1.pack");
+    let mut pack = golden_pack();
     pack[0] ^= 1;
     assert!(matches!(
         read_manifest(&pack),
