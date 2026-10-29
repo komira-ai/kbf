@@ -15,13 +15,15 @@ use js_server_core::{Beat, Standing};
 use kbf_front::{Submission, Ticket};
 use kbf_proto::worker::{self, ResultAck, ResultAckReason, ServerMessage};
 use kbf_sched::DaemonInstance;
+use kbf_types::sched::usage::NodeLoad;
 use kbf_types::{LeaseId, WorkerId};
 use tonic::Status;
 
-use super::{JsFarm, load};
+use super::JsFarm;
 use crate::farm::{Outbound, Reported, StreamId};
 use crate::farm_js::host::{Connection, stream_number};
-use crate::farm_js::{Wall, dispatch};
+use crate::farm_js::{Wall, dispatch, write_learned};
+use crate::learned::LearnedSizes;
 
 /// One `Result` being taken, counted until dropped ([`quiet`] waits for none).
 struct Taking<'a>(&'a AtomicUsize);
@@ -44,11 +46,12 @@ impl Drop for Taking<'_> {
 /// tick old.
 fn publish(js: &JsFarm) {
     let metrics = js.cache.metrics();
-    js.core.with(|view, _| {
+    js.core.with(|view, adapter| {
         let sched = view.sched();
         metrics.sched_queued.set(sched.queued_len() as u64);
         metrics.sched_leases.set(sched.leases_held() as u64);
         metrics.sched_whole.set(sched.whole_summary().as_ref());
+        adapter.publish_learned();
     });
 }
 
@@ -91,13 +94,16 @@ pub(crate) fn resize(js: &JsFarm, worker: &WorkerId, stream: StreamId, reported:
     let _ = dispatch::resize(&js.core, js.now(), worker, stream, reported);
 }
 
-/// [`Farm::heartbeat`](crate::farm::Farm::heartbeat).
+/// [`Farm::heartbeat_with_load`](crate::farm::Farm::heartbeat_with_load): `load` is the
+/// reading the farm accepted on this heartbeat ([`super::load::note_node_load`]), which the core is
+/// handed with the beat.
 pub(crate) async fn heartbeat(
     js: &JsFarm,
     worker: &WorkerId,
     stream: StreamId,
     seq: u64,
     running: Vec<LeaseId>,
+    load: Option<NodeLoad>,
 ) -> bool {
     // A heartbeat from a replaced stream is dropped and not acknowledged.
     let Some(stream) = js
@@ -107,7 +113,7 @@ pub(crate) async fn heartbeat(
         return false;
     };
     let beat = Beat::new(seq, running);
-    let beat = match load::node_load(js, worker) {
+    let beat = match load {
         Some(load) => beat.with_load(load),
         None => beat,
     };
@@ -128,10 +134,15 @@ pub(crate) async fn report(
     let _taking = Taking::of(&js.reports);
     let ambient = js.ambient;
     let wall: Wall = Arc::new(move || ambient.wall());
-    let ack = dispatch::report(&js.core, &js.cache, &wall, &|| js.now(), worker, result)
+    let acked = dispatch::report(&js.core, &js.cache, &wall, &|| js.now(), worker, result)
         .await
         .ok()
-        .flatten()?;
+        .flatten();
+    // The summaries a kill changed are written now, after the core has let go of its lock.
+    if js.settings.learned != LearnedSizes::Off {
+        write_learned(&js.core, &js.learning_gate, false).await;
+    }
+    let ack = acked?;
     let current = || matches!(js.core.standing(worker, lease), Ok(Standing::Current(_)));
     answered(
         ack,
@@ -171,6 +182,7 @@ pub(super) fn answered(
 /// [`Farm::tick`](crate::farm::Farm::tick).
 pub(crate) async fn tick(js: &JsFarm) {
     js.core.tick(js.now()).await;
+    write_learned(&js.core, &js.learning_gate, true).await;
     publish(js);
 }
 

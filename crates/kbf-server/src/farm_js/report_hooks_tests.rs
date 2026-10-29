@@ -250,3 +250,28 @@ async fn a_kill_that_ends_the_operation_is_recorded_with_its_booking() {
         .expect("the last run");
     assert!(last.booked_memory_bytes.is_some(), "{last:?}");
 }
+
+/// Asserts the callers of an operation read `Executing` before its `Start` leaves, as the
+/// farm's own driver orders it: a drain that ends the streams of operations that cannot start
+/// then never ends one whose `Start` is in flight. Catches: the stage shown after the `Start`
+/// is sent.
+#[tokio::test(start_paused = true)]
+async fn the_callers_read_executing_before_the_start_leaves() {
+    let rig = rig();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = std::sync::Arc::clone(&seen);
+    crate::farm::BEFORE_START.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |stages| {
+            record.lock().expect("lock").push(stages);
+        }));
+    });
+    let mut node = register(&rig, "start-node", 0);
+    let _ticket = submit(&rig, 1, 0).expect("queued");
+    crate::farm::BEFORE_START.with(|hook| hook.borrow_mut().take());
+    assert!(started(&node.sent()).is_some());
+    assert_eq!(
+        *seen.lock().expect("lock"),
+        [[kbf_front::Stage::Executing]],
+        "the Start left before its callers read Executing"
+    );
+}

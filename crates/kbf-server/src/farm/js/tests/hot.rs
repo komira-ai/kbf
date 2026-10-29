@@ -28,14 +28,14 @@ use crate::test_log::capture;
 type Inbox = mpsc::UnboundedReceiver<Result<ServerMessage, Status>>;
 
 /// A node's stream as a test holds it: dropping the inbox ends the stream.
-struct Joined {
-    stream: StreamId,
-    inbox: Inbox,
+pub(super) struct Joined {
+    pub(super) stream: StreamId,
+    pub(super) inbox: Inbox,
 }
 
 impl Joined {
     /// The messages sent on the stream since the last call.
-    fn sent(&mut self) -> Vec<Message> {
+    pub(super) fn sent(&mut self) -> Vec<Message> {
         let mut sent = Vec::new();
         while let Ok(Ok(ServerMessage {
             message: Some(message),
@@ -47,7 +47,7 @@ impl Joined {
     }
 
     /// The lease of the `Start` sent since the last call, if one was.
-    fn started(&mut self) -> Option<worker::LeaseId> {
+    pub(super) fn started(&mut self) -> Option<worker::LeaseId> {
         self.sent().into_iter().find_map(|message| match message {
             Message::Start(start) => start.lease_id,
             _ => None,
@@ -55,15 +55,15 @@ impl Joined {
     }
 }
 
-fn farm_on(core: SchedulerCore, cache: &Backend) -> Farm {
+pub(super) fn farm_on(core: SchedulerCore, cache: &Backend) -> Farm {
     Farm::on_core(core, cache.clone(), UNSERVABLE_WAIT, FINISHED_RETENTION)
 }
 
-fn backend() -> Backend {
+pub(super) fn backend() -> Backend {
     Arc::new(Cache::memory()).into()
 }
 
-fn node(name: &str) -> WorkerId {
+pub(super) fn node(name: &str) -> WorkerId {
     WorkerId::new(name)
 }
 
@@ -74,12 +74,12 @@ fn hello(os: &str, arch: &str) -> Reported {
     Reported::serving(Resources::new(4_000, 8 << 30), caps)
 }
 
-fn linux() -> Reported {
+pub(super) fn linux() -> Reported {
     hello("linux", "x86_64")
 }
 
 /// `name` joined to `farm` on a new stream.
-fn join(farm: &Farm, name: &str, reported: Reported) -> Joined {
+pub(super) fn join(farm: &Farm, name: &str, reported: Reported) -> Joined {
     let (outbound, inbox) = mpsc::unbounded_channel();
     let welcome = ServerMessage {
         message: Some(Message::Welcome(Welcome::default())),
@@ -95,7 +95,7 @@ fn join(farm: &Farm, name: &str, reported: Reported) -> Joined {
     Joined { stream, inbox }
 }
 
-fn request(tag: u8) -> kbf_sched::Request {
+pub(super) fn request(tag: u8) -> kbf_sched::Request {
     let key = ActionKey {
         instance: "main".to_owned(),
         action: Digest::new(DigestFunction::Sha256, [tag; 32], u64::from(tag)),
@@ -126,7 +126,7 @@ fn submit(farm: &Farm, tag: u8) -> Ticket {
 }
 
 /// The `Result` of a run that exited 0, carrying `usage` the way a daemon sends it.
-fn ok(lease: &worker::LeaseId, usage: Option<&ResourceUsage>) -> worker::Result {
+pub(super) fn ok(lease: &worker::LeaseId, usage: Option<&ResourceUsage>) -> worker::Result {
     let execution_metadata = usage.map(|usage| ExecutedActionMetadata {
         auxiliary_metadata: vec![usage.to_any()],
         ..ExecutedActionMetadata::default()
@@ -143,7 +143,7 @@ fn ok(lease: &worker::LeaseId, usage: Option<&ResourceUsage>) -> worker::Result 
 }
 
 /// A `Result` for `lease` killed for memory as `kill` says, with the status a driver sends.
-fn killed(lease: &worker::LeaseId, kill: MemoryKill) -> worker::Result {
+pub(super) fn killed(lease: &worker::LeaseId, kill: MemoryKill) -> worker::Result {
     worker::Result {
         lease_id: Some(*lease),
         status: Some(rpc::Status {
@@ -156,7 +156,7 @@ fn killed(lease: &worker::LeaseId, kill: MemoryKill) -> worker::Result {
     }
 }
 
-fn usage() -> ResourceUsage {
+pub(super) fn usage() -> ResourceUsage {
     ResourceUsage {
         wall_micros: 2_000_000,
         cgroup: Some(CgroupUsage {

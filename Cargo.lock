@@ -1318,6 +1318,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "js-agent-usage"
+version = "0.1.0"
+source = "git+https://github.com/komira-ai/jobscheduler?rev=a826aba49ac204ea4189ba547907f32aa58467dd#a826aba49ac204ea4189ba547907f32aa58467dd"
+
+[[package]]
 name = "js-caps"
 version = "0.1.0"
 source = "git+https://github.com/komira-ai/jobscheduler?rev=a826aba49ac204ea4189ba547907f32aa58467dd#a826aba49ac204ea4189ba547907f32aa58467dd"
@@ -1640,6 +1645,7 @@ dependencies = [
  "crc32fast",
  "futures",
  "hex",
+ "js-agent-usage",
  "kbf-auth",
  "kbf-caps",
  "kbf-cas-conformance",

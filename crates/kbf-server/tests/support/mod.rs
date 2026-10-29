@@ -207,6 +207,11 @@ impl Cell {
     pub fn write_behind(&self) {
         self.farm().write_behind_now();
     }
+
+    /// What the farm's scheduler has counted about node-load readings, among other things.
+    pub fn load_counters(&self) -> kbf_sched::LoadCounters {
+        self.farm().load_counters()
+    }
 }
 
 impl Drop for Cell {
@@ -645,6 +650,7 @@ impl Cell {
             learned_sizes: learned,
             scheduler_core: kbf_server::SchedulerCore::under_test(),
             placement_load: kbf_server::PlacementLoad::Off,
+            placement_predictions: kbf_server::PlacementPredictions::Off,
             whole_node: None,
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),
@@ -1130,6 +1136,21 @@ impl FakeDaemon {
         .await
     }
 
+    /// The leases of every `Cancel` already received and kept, in order, without waiting.
+    /// The server queues a heartbeat's cancels before its acknowledgement, so after
+    /// `beat_*_acked` these are all that heartbeat caused.
+    pub fn cancels_received(&mut self) -> Vec<LeaseId> {
+        let mut leases = Vec::new();
+        self.kept.retain(|m| match m {
+            server_message::Message::Cancel(c) => {
+                leases.push(c.lease_id.expect("a lease id"));
+                false
+            }
+            _ => true,
+        });
+        leases
+    }
+
     /// Asserts no Offer or Start arrives within [`QUIET`].
     pub async fn no_work(&mut self) {
         let work = self
@@ -1170,12 +1191,21 @@ impl FakeDaemon {
     /// Sends a heartbeat listing nothing and carrying the node load `load`, and waits for its
     /// acknowledgement for as long as [`PROMPT`], a bound on failure only.
     pub async fn beat_loaded_acked(&mut self, load: Option<kbf_proto::worker::NodeLoad>) {
+        self.beat_running_loaded_acked(&[], load).await;
+    }
+
+    /// [`Self::beat_loaded_acked`] listing `running` too.
+    pub async fn beat_running_loaded_acked(
+        &mut self,
+        running: &[LeaseId],
+        load: Option<kbf_proto::worker::NodeLoad>,
+    ) {
         self.seq += 1;
         let seq = self.seq;
         self.send(daemon_message::Message::Heartbeat(Heartbeat {
             seq,
             report_hash: Vec::new(),
-            running: Vec::new(),
+            running: running.to_vec(),
             pack_reads: None,
             pack_writes: None,
             node_load: load,
