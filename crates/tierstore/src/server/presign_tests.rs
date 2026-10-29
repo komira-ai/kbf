@@ -2,6 +2,7 @@
 
 use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -401,6 +402,10 @@ fn a_presigning_key_needs_a_grant_that_can_be_used() {
             ..grant()
         },
         Grant {
+            prefix: "cas/b".to_owned(),
+            ..grant()
+        },
+        Grant {
             prefix: "_tiering/".to_owned(),
             ..grant()
         },
@@ -487,6 +492,7 @@ fn a_presigning_key_file_has_a_ceiling_and_is_private() {
             json(&full.replace(", \"max_object_bytes\": 1048576", "")),
         ),
         ("prefix", json(&full.replace("cas/b/", "_journal/"))),
+        ("noslash", json(&full.replace("cas/b/", "cas/b"))),
         ("ttl", json(&full.replace("600", "0"))),
         ("big", json(&full.replace("1048576", "999999999999"))),
         ("type", json(&full.replace("600", "\"600\""))),
@@ -557,10 +563,45 @@ fn a_grant_permits_one_put_of_an_object_and_no_other_call() {
         grant.permit(&parts, &target, &query)
     };
     assert_eq!(call("PUT", ""), Ok(()));
+    let prefix_itself = Target::Object("cas/b/".to_owned());
+    let (parts, ()) = Request::builder()
+        .method("PUT")
+        .uri("/tier-bucket/cas/b/")
+        .body(())
+        .unwrap()
+        .into_parts();
+    let query = Query::parse(parts.uri.query()).unwrap();
+    assert_eq!(
+        grant.permit(&parts, &prefix_itself, &query),
+        Err(super::OUT_OF_SCOPE)
+    );
     for method in ["GET", "HEAD", "DELETE", "POST"] {
         assert_eq!(call(method, ""), Err(PUT_ONLY), "{method}");
     }
     for query in ["?partNumber=1&uploadId=u", "?uploads", "?uploadId=u"] {
         assert_eq!(call("PUT", query), Err(PUT_ONLY), "{query}");
+    }
+}
+
+/// Asserts that a key file must be the file itself and the server's own: a symbolic link to a
+/// good key file is refused (the link is not followed to check its mode), and a file of another
+/// user is refused with the owner named as the reason (`/etc/passwd`, which root owns, stands for
+/// one; a test that runs as root gets the refusal of its mode instead).
+#[test]
+fn a_key_file_may_not_be_a_link_or_another_users() {
+    let dir = TestDir::under(std::env::temp_dir(), "tierstore-presign-link");
+    let text = format!(
+        "{{\"access_key_id\": \"k\", \"secret_access_key\": \"{SECRET}\", \"ceiling\": {{\"prefix\": \"cas/b/\", \"max_expires_secs\": 60, \"max_object_bytes\": 10}}}}"
+    );
+    let real = file(&dir, "real", &text, 0o600);
+    assert!(PresignKey::from_file("--presign-key-file", &real).is_ok());
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let refused = PresignKey::from_file("--presign-key-file", &link).unwrap_err();
+    assert!(refused.contains("symbolic link"), "{refused}");
+    let other = Path::new("/etc/passwd");
+    let refused = PresignKey::from_file("--presign-key-file", other).unwrap_err();
+    if !rustix::process::geteuid().is_root() {
+        assert!(refused.contains("not owned"), "{refused}");
     }
 }

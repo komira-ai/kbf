@@ -20,7 +20,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use hyper::Method;
@@ -181,8 +181,15 @@ fn from_lines(text: &str) -> Result<(String, String), &'static str> {
 pub(super) fn read_private_text(flag: &str, path: &Path) -> Result<String, String> {
     let shown = path.display();
     let fail = |why: &str| format!("{flag} {shown}: {why}");
-    let meta = std::fs::metadata(path);
+    // The link itself, not what it points at: a link is not a key file.
+    let meta = std::fs::symlink_metadata(path);
     let meta = meta.map_err(|why| fail(&why.to_string()))?;
+    if meta.file_type().is_symlink() {
+        return Err(fail("is a symbolic link; name the file itself"));
+    }
+    if meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(fail("is not owned by the user the server runs as"));
+    }
     if meta.permissions().mode() & 0o077 != 0 {
         return Err(fail("others can read it; make it mode 0600"));
     }

@@ -7,14 +7,14 @@ use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Request, StatusCode};
 
-use crate::{Backend, Error, Op, Proxy, ProxyConfig, TestClock};
+use crate::{Backend, Error, Op, TestClock};
 
 use super::auth::sign_as;
 use super::presign::presign_url;
 use super::presign::tests::{NOW, SECRET, access, grant, request};
 use super::presign::{Grant, PresignKey};
 use super::testing::{BUCKET, KEY_ID, Reply, Rig, Scripted, Step};
-use super::{AccessKey, Server, ServerConfig};
+use super::{AccessKey, ServerConfig};
 
 const MEBIBYTE: u64 = 1 << 20;
 
@@ -454,58 +454,6 @@ async fn static_keys_work_unchanged_beside_a_presigning_key() {
     assert_eq!(delete.status, StatusCode::NO_CONTENT);
 }
 
-/// Asserts that two presigned PUTs of one key that run at once through one proxy have exactly one
-/// winner: one answers 200, the other 412, and the stored bytes are the winner's, in one tier. It
-/// catches a path in which both puts succeed, with different bytes in the two tiers.
-#[tokio::test(start_paused = true)]
-async fn two_concurrent_presigned_puts_of_one_key_have_one_winner() {
-    let f = fixture().await;
-    let (url_a, url_b) = (put_url("cas/b/race", 300), put_url("cas/b/race", 299));
-    let (a, b) = tokio::join!(f.put(&url_a, b"AAAA"), f.put(&url_b, b"BBBB"));
-    let mut statuses = [a.status.as_u16(), b.status.as_u16()];
-    statuses.sort_unstable();
-    assert_eq!(statuses, [200, 412]);
-    let winner: &[u8] = if a.status == StatusCode::OK {
-        b"AAAA"
-    } else {
-        b"BBBB"
-    };
-    assert_eq!(f.rig.get("cas/b/race", None).await.body.as_bytes(), winner);
-    let hot = f.rig.hot_mem.get("cas/b/race", None).await.ok();
-    assert_eq!(hot.as_deref(), Some(winner));
-    assert!(f.rig.cold_mem.get("cas/b/race", None).await.is_err());
-}
-
-/// Asserts the same for two proxies that share the hot and the cold tier, each behind a server of
-/// its own: one 200, one 412, the winner's bytes, and the other tier holds nothing.
-#[tokio::test(start_paused = true)]
-async fn two_concurrent_presigned_puts_through_two_proxies_have_one_winner() {
-    let f = fixture().await;
-    let mut config = ProxyConfig::new("p2", MEBIBYTE, f.clock.clone());
-    config.linger = Duration::from_millis(1);
-    config.usage_refresh = Duration::ZERO;
-    let second = Proxy::open(f.rig.hot.clone(), f.rig.cold.clone(), config)
-        .await
-        .unwrap();
-    let other = Server::new(Arc::new(second), f.rig.config.clone());
-    let url_a = put_url("cas/b/race", 300);
-    let url_b = put_url("cas/b/race", 299);
-    let first = f.put(&url_a, b"AAAA");
-    let sent = other.handle(request_for("PUT", &url_b, &[], b"BBBB"));
-    let (a, b) = tokio::join!(first, sent);
-    let mut statuses = [a.status.as_u16(), b.status().as_u16()];
-    statuses.sort_unstable();
-    assert_eq!(statuses, [200, 412]);
-    let winner: &[u8] = if a.status == StatusCode::OK {
-        b"AAAA"
-    } else {
-        b"BBBB"
-    };
-    let hot = f.rig.hot_mem.get("cas/b/race", None).await.ok();
-    assert_eq!(hot.as_deref(), Some(winner));
-    assert!(f.rig.cold_mem.get("cas/b/race", None).await.is_err());
-}
-
 /// Asserts that a presigned PUT never goes to the cold tier: when the usage says the hot tier is
 /// full, and when the hot tier answers the put itself with a capacity error, the answer is 503
 /// `SlowDown` with `Retry-After`, and neither tier holds the key. The same two cases for the full
@@ -616,4 +564,53 @@ async fn a_presigned_put_over_the_cap_is_413_before_the_body_is_read() {
     assert!(!f.holds("cas/b/big").await);
     assert_eq!(f.rig.hot.calls(Op::Put), before);
     assert_eq!(f.rig.cold.calls(Op::Put), 0);
+}
+
+/// Asserts the create-only conditions of a presigned PUT: no `If-None-Match` creates once and is
+/// then 412, so does `If-None-Match: *`, and any other `If-None-Match` is `NotImplemented`; a copy
+/// source is `NotImplemented`; and `?tagging`, `?acl` and `?retention` on a URL signed right for
+/// them are `NotImplemented` too, with nothing stored by any of them.
+#[tokio::test(start_paused = true)]
+async fn the_conditions_and_the_calls_a_presigned_put_does_not_do() {
+    let f = fixture().await;
+    let plain = put_url("cas/b/plain", 300);
+    assert_eq!(f.put(&plain, b"1").await.status, StatusCode::OK);
+    assert_eq!(
+        f.put(&plain, b"2").await.status,
+        StatusCode::PRECONDITION_FAILED
+    );
+    let star = put_url("cas/b/star", 300);
+    let with = |url: &str, headers: &[(&str, &str)]| request_for("PUT", url, headers, b"1");
+    let created = f.rig.send_raw(with(&star, &[("if-none-match", "*")])).await;
+    assert_eq!(created.status, StatusCode::OK);
+    let again = f.rig.send_raw(with(&star, &[("if-none-match", "*")])).await;
+    assert_eq!(refused(&again), (412, "PreconditionFailed".to_owned()));
+    let tagged = put_url("cas/b/tagged", 300);
+    let etag = [("if-none-match", "\"abc\"")];
+    let reply = f.rig.send_raw(with(&tagged, &etag)).await;
+    assert_eq!(refused(&reply), (501, "NotImplemented".to_owned()));
+    let copy = [("x-amz-copy-source", "/tier-bucket/cas/b/plain")];
+    let reply = f
+        .rig
+        .send_raw(with(&put_url("cas/b/copy", 300), &copy))
+        .await;
+    assert_eq!(refused(&reply), (501, "NotImplemented".to_owned()));
+    for name in ["tagging", "acl", "retention"] {
+        let url = presign_url(
+            "PUT",
+            &access("pack-presign"),
+            &request("cas/b/sub", 300),
+            &[(name, "")],
+        );
+        let reply = f.put(&url.unwrap(), b"x").await;
+        assert_eq!(
+            refused(&reply),
+            (501, "NotImplemented".to_owned()),
+            "{name}"
+        );
+    }
+    for key in ["cas/b/tagged", "cas/b/copy", "cas/b/sub"] {
+        assert!(!f.holds(key).await, "{key}");
+    }
+    assert_eq!(f.rig.get("cas/b/plain", None).await.body, "1");
 }

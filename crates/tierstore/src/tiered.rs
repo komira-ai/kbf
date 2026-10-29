@@ -125,7 +125,12 @@ fn refuse_reserved(key: &str) -> Result<(), Error> {
 /// - **Head** reads the hot tier, else the cold tier, and copies nothing back.
 /// - **Put** is refused with [`Error::AlreadyExists`] if the key exists in the cold tier (it
 ///   may have been evicted from the hot tier) or in the hot tier. The cold tier is asked
-///   first (a HEAD); then the object is written to the hot tier, create-only; then an entry
+///   first (a HEAD); then the object is written to the hot tier, create-only; then the cold
+///   tier is asked again, and if it now holds the key (a copy to the cold tier and a delete from
+///   the hot tier came between the first ask and the create) the object just created is removed
+///   from the hot tier and the put is refused, since the reconciler copies an object to the cold
+///   tier before it deletes it from the hot tier, so a create that wins the hot tier after that
+///   delete always finds the cold copy; then an entry
 ///   is appended to the journal; then the put is acknowledged. **The acknowledgement waits
 ///   for the journal object that holds the entry to be written to the hot tier**: an object
 ///   that is acknowledged and not journaled would be in no one's list of objects to copy to
@@ -442,10 +447,30 @@ impl Inner {
         self.cold.complete_upload(key, id, parts).await
     }
 
+    /// Asks the cold tier again, after this call created `key` in the hot tier. The first ask
+    /// (before the create) can be stale: the reconciler copies an object to the cold tier before it
+    /// deletes it from the hot tier, so a create that wins the hot tier after that delete finds the
+    /// cold copy here. If the cold tier holds the key, the object this call created is removed from
+    /// the hot tier (best effort) and the put is [`Error::AlreadyExists`]; if the cold tier cannot
+    /// be asked, the object is removed and the put fails with that error, since it cannot be told
+    /// to be the only one.
+    async fn confirm_not_tiered(&self, key: &str) -> Result<(), Error> {
+        let refused = match self.cold.head(key).await {
+            Ok(_) => Error::AlreadyExists(key.to_owned()),
+            Err(Error::NotFound(_)) => return Ok(()),
+            Err(error) => error,
+        };
+        let _ = self.hot.delete(key).await;
+        Err(refused)
+    }
+
     async fn put_hot(&self, key: &str, body: Bytes) -> Result<(), Error> {
         let size = body.len() as u64;
         let stored = match self.hot.put(key, body.clone()).await {
-            Ok(()) => self.journal_put(key, size).await,
+            Ok(()) => match self.confirm_not_tiered(key).await {
+                Ok(()) => self.journal_put(key, size).await,
+                refused => refused,
+            },
             failed => failed,
         };
         match stored {
@@ -499,7 +524,10 @@ impl Inner {
         hot_only: bool,
     ) -> Result<(), Error> {
         let stored = match self.hot.put_stream(key, len, offered.view()).await {
-            Ok(()) => self.journal_put(key, offered.taken()).await,
+            Ok(()) => match self.confirm_not_tiered(key).await {
+                Ok(()) => self.journal_put(key, offered.taken()).await,
+                refused => refused,
+            },
             failed => failed,
         };
         match stored {
