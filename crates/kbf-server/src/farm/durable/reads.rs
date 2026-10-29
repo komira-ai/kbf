@@ -75,6 +75,7 @@ impl Engine {
             capacity: none,
             free: none,
             leases,
+            load: None,
         })
     }
 }

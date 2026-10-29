@@ -11,10 +11,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use kbf_proto::reapi::ActionResult;
-use kbf_proto::worker::ResourceUsage;
+use kbf_proto::worker::{NodeLoad, ResourceUsage};
 use kbf_types::{LeaseId, LeaseKind};
 
-use crate::runtime::{Runtime, RuntimeError, Work};
+use crate::runtime::{NodeLoadError, Runtime, RuntimeError, Work};
 
 /// A future a runtime behind [`AnyRuntime`] returns.
 type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -25,6 +25,8 @@ pub(crate) trait AnyRuntime: Send + Sync {
     fn serves(&self, kind: &str) -> bool;
     fn run(&self, work: Work) -> Boxed<'_, Result<ActionResult, RuntimeError>>;
     fn failed_usage(&self, lease_id: LeaseId) -> Option<ResourceUsage>;
+    fn node_load(&self) -> Boxed<'_, Result<Option<NodeLoad>, NodeLoadError>>;
+    fn take_peak_window_millicores(&self, lease_id: LeaseId) -> Option<u64>;
     fn kill(&self, lease_id: LeaseId) -> Boxed<'_, ()>;
 }
 
@@ -43,6 +45,14 @@ impl<R: Runtime> AnyRuntime for R {
 
     fn failed_usage(&self, lease_id: LeaseId) -> Option<ResourceUsage> {
         Runtime::failed_usage(self, lease_id)
+    }
+
+    fn node_load(&self) -> Boxed<'_, Result<Option<NodeLoad>, NodeLoadError>> {
+        Box::pin(Runtime::node_load(self))
+    }
+
+    fn take_peak_window_millicores(&self, lease_id: LeaseId) -> Option<u64> {
+        Runtime::take_peak_window_millicores(self, lease_id)
     }
 
     fn kill(&self, lease_id: LeaseId) -> Boxed<'_, ()> {
@@ -110,6 +120,17 @@ impl Runtimes {
             }
         }
         drivers
+    }
+
+    /// The first reading any runtime gives, in the order they were added; `Ok(None)` when
+    /// none takes readings. A runtime that fails ends the search with its error.
+    pub(crate) async fn node_load(&self) -> Result<Option<NodeLoad>, NodeLoadError> {
+        for runtime in &self.all {
+            if let Some(load) = runtime.node_load().await? {
+                return Ok(Some(load));
+            }
+        }
+        Ok(None)
     }
 
     /// Every runtime, in the order they were added.

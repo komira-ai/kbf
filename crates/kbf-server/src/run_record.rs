@@ -123,6 +123,7 @@ pub(crate) fn run_usage(u: &ResourceUsage) -> RunUsage {
         memory_pressure_some_micros: c.memory_pressure_some_micros,
         memory_pressure_full_micros: c.memory_pressure_full_micros,
         cpus_effective: c.cpus_effective,
+        peak_window_millicores: c.peak_window_millicores,
         numa: c
             .numa
             .iter()

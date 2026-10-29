@@ -370,7 +370,7 @@ async fn the_runtime_reads_the_actions_cgroup_with_its_clock() {
     for (file, text) in [
         ("cpu.stat", "usage_usec 42\nthrottled_usec 7\n"),
         ("memory.current", "1000\n"),
-        ("memory.stat", "inactive_file 400\n"),
+        ("memory.stat", "inactive_file 400\nactive_file 150\n"),
         ("cpu.max", "max 100000\n"),
     ] {
         std::fs::write(actions.join(file), text).expect("file");
@@ -391,6 +391,7 @@ async fn the_runtime_reads_the_actions_cgroup_with_its_clock() {
         ),
         (1, 9_000, 42, 600)
     );
+    assert_eq!(load.active_file_bytes, 150);
     assert_eq!(load.throttled_usec, Some(7));
     assert_eq!(load.pressure_some_total_usec, None);
     assert!(!load.actions_cpu_limited && load.covered.is_empty());

@@ -189,6 +189,10 @@ pub struct Cgroup {
     /// The CPUs the lease's cgroup could run on.
     #[prost(uint32, optional, tag = "17")]
     pub cpus_effective: Option<u32>,
+    /// The most CPU any one window of node-load readings saw the lease use, thousandths of a
+    /// CPU; `None` when the lease had no full window.
+    #[prost(uint64, optional, tag = "18")]
+    pub peak_window_millicores: Option<u64>,
 }
 
 /// The footprint block the macOS native driver reports for a run. A field that is
