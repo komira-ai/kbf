@@ -26,6 +26,7 @@ pub(crate) trait AnyRuntime: Send + Sync {
     fn run(&self, work: Work) -> Boxed<'_, Result<ActionResult, RuntimeError>>;
     fn failed_usage(&self, lease_id: LeaseId) -> Option<ResourceUsage>;
     fn node_load(&self) -> Boxed<'_, Result<Option<NodeLoad>, NodeLoadError>>;
+    fn welcomed_placement_load(&self, on: bool) -> Boxed<'_, ()>;
     fn take_peak_window_millicores(&self, lease_id: LeaseId) -> Option<u64>;
     fn kill(&self, lease_id: LeaseId) -> Boxed<'_, ()>;
 }
@@ -49,6 +50,10 @@ impl<R: Runtime> AnyRuntime for R {
 
     fn node_load(&self) -> Boxed<'_, Result<Option<NodeLoad>, NodeLoadError>> {
         Box::pin(Runtime::node_load(self))
+    }
+
+    fn welcomed_placement_load(&self, on: bool) -> Boxed<'_, ()> {
+        Box::pin(Runtime::welcomed_placement_load(self, on))
     }
 
     fn take_peak_window_millicores(&self, lease_id: LeaseId) -> Option<u64> {
@@ -131,6 +136,14 @@ impl Runtimes {
             }
         }
         Ok(None)
+    }
+
+    /// Tells every runtime, in the order they were added, what a Welcome said of placement
+    /// by measured load.
+    pub(crate) async fn welcomed_placement_load(&self, on: bool) {
+        for runtime in &self.all {
+            runtime.welcomed_placement_load(on).await;
+        }
     }
 
     /// Every runtime, in the order they were added.

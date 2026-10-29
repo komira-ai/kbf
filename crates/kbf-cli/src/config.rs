@@ -290,6 +290,7 @@ const GROUPS: &[(&str, &[&str])] = &[
     (
         "containers",
         &[
+            "actions-cpu-max",
             "actions-memory-max-gib",
             "cgroup-parent",
             "cgroup-root",
