@@ -127,9 +127,13 @@ impl View {
 
 /// Whether the lease server says the lease is no longer in force.
 pub(crate) fn lease_gone(error: &Error) -> bool {
-    [ErrorCode::UnknownLease, ErrorCode::NotHeld, ErrorCode::Expired]
-        .iter()
-        .any(|code| error.is(code))
+    [
+        ErrorCode::UnknownLease,
+        ErrorCode::NotHeld,
+        ErrorCode::Expired,
+    ]
+    .iter()
+    .any(|code| error.is(code))
 }
 
 /// A held host, as an operator or a test looks at it.

@@ -70,7 +70,11 @@ fn a_secret_never_prints() {
 /// only when asked for.
 #[test]
 fn the_argv_is_the_task_tools_command_line() {
-    let (action, grant, url) = (digest(), Secret::new("grant-token"), Secret::new("http://p/key"));
+    let (action, grant, url) = (
+        digest(),
+        Secret::new("grant-token"),
+        Secret::new("http://p/key"),
+    );
     let plain = args(&action, &grant, &url, None, false).argv(Delivery::InsecureArgv);
     assert_eq!(
         plain,
@@ -91,15 +95,32 @@ fn the_argv_is_the_task_tools_command_line() {
             "grant-token",
         ]
     );
-    let full = args(&action, &grant, &url, Some("/mnt/kbf-tools/farm-ca.der"), true)
-        .argv(Delivery::InsecureArgv);
-    assert_eq!(&full[plain.len()..], ["--root-der", "/mnt/kbf-tools/farm-ca.der", "--allow-plain-http-put"]);
+    let full = args(
+        &action,
+        &grant,
+        &url,
+        Some("/mnt/kbf-tools/farm-ca.der"),
+        true,
+    )
+    .argv(Delivery::InsecureArgv);
+    assert_eq!(
+        &full[plain.len()..],
+        [
+            "--root-der",
+            "/mnt/kbf-tools/farm-ca.der",
+            "--allow-plain-http-put"
+        ]
+    );
 }
 
 /// Catches a Debug of the task arguments that shows the pack url or the read token.
 #[test]
 fn the_arguments_never_print_a_secret() {
-    let (action, grant, url) = (digest(), Secret::new("grant-token-xyz"), Secret::new("http://p/key?sig=zz"));
+    let (action, grant, url) = (
+        digest(),
+        Secret::new("grant-token-xyz"),
+        Secret::new("http://p/key?sig=zz"),
+    );
     let shown = format!("{:?}", args(&action, &grant, &url, None, false));
     assert!(!shown.contains("grant-token-xyz"), "{shown}");
     assert!(!shown.contains("sig=zz"), "{shown}");

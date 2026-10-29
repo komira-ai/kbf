@@ -89,6 +89,8 @@ pub(super) struct HostWorker {
     /// When the lease server last answered.
     server_ok: Instant,
     renew_at: Instant,
+    /// When the lease expires unless renewed, as the lease server last said.
+    pub(super) expires_at: Instant,
     pub(super) ends_at: Instant,
     pub(super) draining: Option<Drain>,
     pub(super) tasks: BTreeMap<kbf_types::LeaseId, Task>,
@@ -106,7 +108,7 @@ impl HostWorker {
         ctx: &Ctx<'_>,
         lease: LeaseId,
         host: String,
-        ends_at: Instant,
+        (expires_at, ends_at): (Instant, Instant),
         now: Instant,
     ) -> Self {
         let id = WorkerId::new(format!("js:{host}"));
@@ -126,6 +128,7 @@ impl HostWorker {
             last_ack: now,
             server_ok: now,
             renew_at: now + ctx.cfg.lease_ttl / 3,
+            expires_at,
             ends_at,
             draining: None,
             tasks: BTreeMap::new(),
@@ -151,7 +154,12 @@ impl HostWorker {
 
     /// One pass: take the farm's messages, keep the lease, act on what the lease server says of
     /// the host, start what was told to start, read the results, settle them, and heartbeat.
-    pub(super) async fn step(&mut self, ctx: &Ctx<'_>, view: &View, now: Instant) -> Option<Retire> {
+    pub(super) async fn step(
+        &mut self,
+        ctx: &Ctx<'_>,
+        view: &View,
+        now: Instant,
+    ) -> Option<Retire> {
         let flow = self.pass(ctx, view, now).await;
         flow.break_value()
     }
@@ -160,7 +168,7 @@ impl HostWorker {
         if self.intake(now) {
             self.reconnect(ctx, now).await;
         }
-        self.renew(ctx, now).await?;
+        self.renew(ctx, now, false).await?;
         self.watch(ctx, view)?;
         self.launch(ctx, now).await?;
         self.poll(ctx, now).await?;
@@ -191,7 +199,10 @@ impl HostWorker {
         match message.message {
             Some(server_message::Message::Start(start)) => self.accept(now, &start),
             Some(server_message::Message::Cancel(Cancel { lease_id })) => {
-                lease_id.map(farm_lease).iter().for_each(|l| self.cancel(*l));
+                lease_id
+                    .map(farm_lease)
+                    .iter()
+                    .for_each(|l| self.cancel(*l));
             }
             Some(server_message::Message::ResultAck(ResultAck { lease_id, .. })) => {
                 lease_id.map(farm_lease).iter().for_each(|l| self.acked(*l));
@@ -232,9 +243,14 @@ impl HostWorker {
         self.draining = None;
     }
 
-    /// Renews the lease when a third of its ttl has passed.
-    async fn renew(&mut self, ctx: &Ctx<'_>, now: Instant) -> ControlFlow<Retire> {
-        if now < self.renew_at {
+    /// Renews the lease when a third of its ttl has passed, or at once if `due`.
+    pub(super) async fn renew(
+        &mut self,
+        ctx: &Ctx<'_>,
+        now: Instant,
+        due: bool,
+    ) -> ControlFlow<Retire> {
+        if now < self.renew_at && !due {
             return ControlFlow::Continue(());
         }
         let renewed = ctx
@@ -244,7 +260,10 @@ impl HostWorker {
             .await;
         self.heard(now, &renewed);
         match renewed {
-            Ok(_) => self.renew_at = now + ctx.cfg.lease_ttl / 3,
+            Ok(renewed) => {
+                self.renew_at = now + ctx.cfg.lease_ttl / 3;
+                self.expires_at = ctx.clock.local(renewed.expires_at_ms, now);
+            }
             Err(e) if lease_gone(&e) => return ControlFlow::Break(Retire::Gone),
             Err(e) => tracing::warn!(worker = %self.id, error = %e, "renewing the lease failed"),
         }
@@ -309,7 +328,9 @@ impl HostWorker {
         }
         self.seq += 1;
         self.beats.push_back((self.seq, now));
-        self.beats = self.beats.split_off(self.beats.len().saturating_sub(BEATS_KEPT));
+        self.beats = self
+            .beats
+            .split_off(self.beats.len().saturating_sub(BEATS_KEPT));
         self.next_beat = now + ctx.cfg.heartbeat;
         let running = self.listed();
         let acked = ctx
@@ -327,8 +348,15 @@ impl HostWorker {
     pub(super) async fn retire(mut self, ctx: &Ctx<'_>, why: Retire) {
         tracing::info!(worker = %self.id, lease = %self.lease, ?why, "retiring the worker");
         match why {
-            Retire::Gone => self.report_lost(ctx).await,
-            Retire::Lost | Retire::Fenced | Retire::Ambiguous => self.stop_all(ctx).await,
+            Retire::Gone => {
+                self.begin_drain(ctx, Drain::Rotation);
+                self.report_lost(ctx).await;
+            }
+            Retire::Ambiguous => {
+                self.begin_drain(ctx, Drain::Rotation);
+                self.stop_all(ctx).await;
+            }
+            Retire::Lost | Retire::Fenced => self.stop_all(ctx).await,
             Retire::Drained => {}
         }
         if let Err(e) = ctx.deps.client.release(self.lease).await {

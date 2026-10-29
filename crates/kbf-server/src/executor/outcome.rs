@@ -94,7 +94,10 @@ pub(super) fn result_of(lease: LeaseId, action: &Digest, settled: &Settled) -> w
             result.status = status(Code::DeadlineExceeded, "the action ran out of time");
         }
         Settled::OutOfMemory => {
-            result.status = status(Code::ResourceExhausted, "the action passed its memory limit");
+            result.status = status(
+                Code::ResourceExhausted,
+                "the action passed its memory limit",
+            );
             result.memory_kill = MemoryKill::OwnLimit as i32;
         }
         Settled::Lost(why) => {

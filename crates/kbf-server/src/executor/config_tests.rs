@@ -66,13 +66,7 @@ fn each_unsafe_setting_is_refused_by_name() {
             },
             ConfigError::Frontend,
         ),
-        (
-            Config {
-                hosts: 0,
-                ..base()
-            },
-            ConfigError::NoHosts,
-        ),
+        (Config { hosts: 0, ..base() }, ConfigError::NoHosts),
         (
             Config {
                 cpu_millis: 999,
@@ -80,13 +74,7 @@ fn each_unsafe_setting_is_refused_by_name() {
             },
             ConfigError::Shape,
         ),
-        (
-            Config {
-                slots: 0,
-                ..base()
-            },
-            ConfigError::Shape,
-        ),
+        (Config { slots: 0, ..base() }, ConfigError::Shape),
         (
             Config {
                 slots: 257,
@@ -149,14 +137,35 @@ fn each_unsafe_setting_is_refused_by_name() {
         ),
         (
             Config {
-                presign_ceiling: Duration::from_secs(3600),
+                lease_ttl: Duration::from_secs(3299),
+                ..base()
+            },
+            ConfigError::Ttl,
+        ),
+        (
+            Config {
+                default_timeout: Duration::ZERO,
+                ..base()
+            },
+            ConfigError::Timeout,
+        ),
+        (
+            Config {
+                default_timeout: Duration::from_secs(3001),
+                ..base()
+            },
+            ConfigError::Timeout,
+        ),
+        (
+            Config {
+                presign_ceiling: Duration::from_secs(3299),
                 ..base()
             },
             ConfigError::Presign,
         ),
         (
             Config {
-                drain_before_end: Duration::from_secs(3600),
+                drain_before_end: Duration::from_secs(3300),
                 ..base()
             },
             ConfigError::Drain,

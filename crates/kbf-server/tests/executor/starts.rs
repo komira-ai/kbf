@@ -42,6 +42,7 @@ async fn an_action_runs_end_to_end() {
     let minted = rig.presign.minted.lock().expect("minted").clone();
     assert_eq!(minted.len(), 1);
     assert_eq!(minted[0].host, "node1");
+    assert_eq!(minted[0].max_bytes, 128 << 20);
     assert_eq!(minted[0].expires, Duration::from_secs(60 + 300));
     assert_eq!(rig.fake.run_wall_ms(&run.run), Some(360_000));
     rig.host_finishes(&run.run, Outcome::Succeeded, Some(0));
@@ -57,7 +58,10 @@ async fn an_action_runs_end_to_end() {
     let requests = rig.requests();
     assert_eq!(count(&requests, "POST /v1/leases"), 1);
     assert_eq!(count_tail(&requests, "POST", "/runs"), 1);
-    assert!(rig.exec.hosts()[0].runs == 0, "the acknowledged result is forgotten");
+    assert!(
+        rig.exec.hosts()[0].runs == 0,
+        "the acknowledged result is forgotten"
+    );
 }
 
 /// Catches a `Start` that the lease server cannot take yet (its budget comes back only when a
@@ -72,11 +76,17 @@ async fn a_start_waits_for_room_inside_its_window() {
     let first = rig.runs_of(1).await;
     rig.host_finishes(&first[0].run, Outcome::Succeeded, Some(0));
     rig.pump().await;
-    assert!(a.finished().is_some(), "the farm has the result: its core is free");
+    assert!(
+        a.finished().is_some(),
+        "the farm has the result: its core is free"
+    );
     let c = rig.submit(3);
     rig.advance(Duration::from_secs(1)).await;
     rig.pump().await;
-    assert!(rig.runs_of(3).await.is_empty(), "the host's budget is still booked");
+    assert!(
+        rig.runs_of(3).await.is_empty(),
+        "the host's budget is still booked"
+    );
     rig.host_ends(&first[0].run);
     rig.pump().await;
     let third = rig.runs_of(3).await;
@@ -171,7 +181,10 @@ async fn what_the_farm_could_not_read_is_rerun_not_refused() {
             true => rig.inputs.looked_up.lock().expect("looked up").len(),
             false => rig.presign.minted.lock().expect("minted").len() + 3,
         };
-        assert_eq!(tries, 3, "{what}: the action was tried once and rerun twice");
+        assert_eq!(
+            tries, 3,
+            "{what}: the action was tried once and rerun twice"
+        );
     }
 }
 

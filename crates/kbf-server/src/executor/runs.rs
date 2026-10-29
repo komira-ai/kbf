@@ -17,12 +17,12 @@ use kbf_sched::fence::START_VALIDITY;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::executor::Ctx;
 use crate::executor::config::Config;
 use crate::executor::host::{Drain, HostWorker, Retire};
 use crate::executor::outcome::{Settled, Verdict, judge, ran, result_of};
 use crate::executor::task::{Nonce, PackKey, TaskArgs};
 use crate::executor::traits::{Ingested, InputsError, PresignError, UntrustedLimits};
-use crate::executor::Ctx;
 
 /// The label that names a run by the key it was posted with, so a run whose `202` was lost
 /// can be found again.
@@ -204,7 +204,9 @@ impl HostWorker {
     }
 
     fn set_stage(&mut self, lease: kbf_types::LeaseId, stage: Stage) {
-        self.tasks.entry(lease).and_modify(|task| task.stage = stage);
+        self.tasks
+            .entry(lease)
+            .and_modify(|task| task.stage = stage);
     }
 
     /// Forms the result of `lease` from `settled`, to be reported.
@@ -222,10 +224,18 @@ impl HostWorker {
         action: &Digest,
         w: &Waiting,
     ) -> Queued {
-        let (spec, key, truncated) = match self.prepare(ctx, now, lease, action, w).await {
+        let (spec, key, wall) = match self.prepare(ctx, lease, action, w).await {
             Ok(prepared) => prepared,
             Err(settled) => return Queued::Settled(settled),
         };
+        // The lease server cuts the run's wall time to what the lease has left when it is
+        // posted, and a renewal later does not stretch it: renew first when the lease would
+        // end before the run does.
+        let renewed = self.renew(ctx, now, self.left(now) < wall).await;
+        if let ControlFlow::Break(why) = renewed {
+            return Queued::Retire(why);
+        }
+        let truncated = wall > self.left(now);
         let posted = ctx.deps.client.queue_run(self.lease, &spec).await;
         self.heard(now, &posted);
         let label = key.nonce.to_string();
@@ -242,15 +252,21 @@ impl HostWorker {
         }
     }
 
-    /// The run, its key, and whether the lease cuts its wall time short.
+    /// How long the lease lasts from `now`: until it expires unless renewed, or ends.
+    fn left(&self, now: Instant) -> Duration {
+        self.expires_at
+            .min(self.ends_at)
+            .saturating_duration_since(now)
+    }
+
+    /// The run, its key, and the wall time it asks for.
     async fn prepare(
         &self,
         ctx: &Ctx<'_>,
-        now: Instant,
         lease: kbf_types::LeaseId,
         action: &Digest,
         w: &Waiting,
-    ) -> Result<(RunSpec, PackKey, bool), Settled> {
+    ) -> Result<(RunSpec, PackKey, Duration), Settled> {
         let facts = ctx.deps.inputs.action(action).await?;
         let timeout = facts.timeout.unwrap_or(ctx.cfg.default_timeout);
         require(timeout <= ctx.cfg.max_run, || {
@@ -290,8 +306,7 @@ impl HostWorker {
         spec.args = args.argv(ctx.cfg.delivery);
         spec.mounts = vec![ctx.cfg.tool_mount.clone()];
         spec.labels = BTreeMap::from([(RUN_LABEL.to_owned(), key.nonce.to_string())]);
-        let truncated = wall > self.ends_at.saturating_duration_since(now);
-        Ok((spec, key, truncated))
+        Ok((spec, key, wall))
     }
 
     /// The post's answer was lost: the run may be queued. Found by its label, it is the
@@ -357,7 +372,13 @@ impl HostWorker {
             .tasks
             .iter()
             .filter_map(|(lease, task)| match &task.stage {
-                Stage::Running(r) => Some((*lease, r.run.clone(), r.cancelled, r.truncated, r.key.clone())),
+                Stage::Running(r) => Some((
+                    *lease,
+                    r.run.clone(),
+                    r.cancelled,
+                    r.truncated,
+                    r.key.clone(),
+                )),
                 _ => None,
             })
             .collect();
@@ -483,7 +504,10 @@ impl Reporting {
         now: Instant,
         resend: Duration,
     ) -> bool {
-        let done = self.in_flight.as_mut().and_then(|handle| handle.now_or_never());
+        let done = self
+            .in_flight
+            .as_mut()
+            .and_then(|handle| handle.now_or_never());
         self.in_flight = self.in_flight.take().filter(|_| done.is_none());
         let acked = matches!(done, Some(Ok(Some(_))));
         let due = [self.in_flight.is_none(), now >= self.retry_at, !acked]
@@ -491,8 +515,14 @@ impl Reporting {
             .all(|b| b);
         if due {
             self.retry_at = now + resend;
-            let (farm, worker, result) = (std::sync::Arc::clone(farm), worker.clone(), self.result.clone());
-            self.in_flight = Some(tokio::spawn(async move { farm.report(&worker, result).await }));
+            let (farm, worker, result) = (
+                std::sync::Arc::clone(farm),
+                worker.clone(),
+                self.result.clone(),
+            );
+            self.in_flight = Some(tokio::spawn(
+                async move { farm.report(&worker, result).await },
+            ));
         }
         acked
     }
@@ -524,9 +554,11 @@ fn ingested(
 ) -> kbf_proto::worker::Result {
     match done {
         Ok(Ingested::Ran { result, .. }) => ran(lease, action, *result),
-        Ok(Ingested::Reject(why)) => {
-            result_of(lease, action, &Settled::Infra(format!("the pack was refused: {why}")))
-        }
+        Ok(Ingested::Reject(why)) => result_of(
+            lease,
+            action,
+            &Settled::Infra(format!("the pack was refused: {why}")),
+        ),
         Ok(Ingested::Unavailable(why)) => result_of(
             lease,
             action,

@@ -1,7 +1,7 @@
 //! The harness: a farm, a lease server, an executor, and fakes for what the executor reads
 //! from the rest of the server.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -19,8 +19,7 @@ use kbf_types::{ActionKey, LeaseKind, Qos, Resources};
 use tokio::sync::watch;
 
 pub const GIB: u64 = 1 << 30;
-pub const IMAGE: &str =
-    "docker://registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+pub const IMAGE: &str = "docker://registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -133,6 +132,8 @@ impl Presign for FakePresign {
 
 /// What the frontend makes of a pack: scripted, then the default.
 pub struct FakeIngest {
+    /// How many of the next reads panic, as a bug of the real ingest would.
+    pub panics: std::sync::atomic::AtomicUsize,
     pub script: Mutex<VecDeque<Ingested>>,
     pub calls: Mutex<Vec<(kbf_types::LeaseId, String, UntrustedLimits)>>,
 }
@@ -140,6 +141,7 @@ pub struct FakeIngest {
 impl FakeIngest {
     fn new() -> Self {
         Self {
+            panics: std::sync::atomic::AtomicUsize::new(0),
             script: Mutex::new(VecDeque::new()),
             calls: Mutex::new(Vec::new()),
         }
@@ -166,6 +168,12 @@ impl Ingest for FakeIngest {
         limits: &UntrustedLimits,
     ) -> Ingested {
         locked(&self.calls).push((lease, key.to_string(), *limits));
+        let panics = self.panics.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |n| Some(n.saturating_sub(1)),
+        );
+        assert!(panics == Ok(0), "the ingest broke");
         locked(&self.script)
             .pop_front()
             .unwrap_or_else(|| Self::ran(0))
@@ -239,12 +247,37 @@ impl Rig {
     /// A rig over a pool of `hosts` of 2 cores and 16 GiB, held by an executor of `held`
     /// hosts with `adjust` applied to its config.
     pub async fn start(hosts: &[&str], held: usize, adjust: impl FnOnce(&mut Config)) -> Self {
-        let _ = tracing_subscriber::fmt().with_test_writer().with_max_level(tracing::Level::INFO).try_init();
+        Self::shaped(hosts, held, 16, adjust).await
+    }
+
+    /// As [`Rig::start`], over hosts of `gib` GiB of memory.
+    pub async fn shaped(
+        hosts: &[&str],
+        held: usize,
+        gib: u64,
+        adjust: impl FnOnce(&mut Config),
+    ) -> Self {
+        Self::built(hosts, held, gib, false, adjust).await
+    }
+
+    /// As [`Rig::shaped`]; with `prepare` a lease is `202 pending` until its host is ready.
+    pub async fn built(
+        hosts: &[&str],
+        held: usize,
+        gib: u64,
+        prepare: bool,
+        adjust: impl FnOnce(&mut Config),
+    ) -> Self {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
         let hold = ClockHold::new();
-        let pool = Pool::new("farm-linux", hosts, 2_000, 16 * GIB);
+        let mut pool = Pool::new("farm-linux", hosts, 2_000, gib * GIB);
+        pool.prepare = prepare;
         let fake = FakeLeaseServer::start(pool).await;
         let api = fake.client().expect("a client");
-        let mut cfg = Config::new("front-1", held, "farm-linux", 2_000, 16 * GIB);
+        let mut cfg = Config::new("front-1", held, "farm-linux", 2_000, gib * GIB);
         cfg.slots = 2;
         adjust(&mut cfg);
         let farm = Arc::new(Farm::new(
@@ -286,7 +319,8 @@ impl Rig {
             presign: presign.clone(),
             inputs: inputs.clone(),
         };
-        Executor::new(cfg.clone(), deps, Clock::from_unix_ms(fake.now_ms())).expect("a valid config")
+        Executor::new(cfg.clone(), deps, Clock::from_unix_ms(fake.now_ms()))
+            .expect("a valid config")
     }
 
     /// A new executor over the same farm and lease server, as a restarted frontend has.
@@ -311,12 +345,6 @@ impl Rig {
         }
     }
 
-    pub async fn pump_n(&mut self, n: usize) {
-        for _ in 0..n {
-            self.pump().await;
-        }
-    }
-
     /// Time passes: tokio's clock, the lease server's, and the farm's with the first.
     pub async fn advance(&self, by: Duration) {
         tokio::time::advance(by).await;
@@ -333,6 +361,11 @@ impl Rig {
 
     /// Submits the action of `tag`, booking one core and one GiB.
     pub fn submit(&self, tag: u8) -> Caller {
+        self.submit_kind(tag, LeaseKind::Action)
+    }
+
+    /// Submits the action of `tag` as a lease of `kind`.
+    pub fn submit_kind(&self, tag: u8, kind: LeaseKind) -> Caller {
         let request = Request {
             key: ActionKey {
                 instance: "main".to_owned(),
@@ -340,7 +373,7 @@ impl Rig {
             }
             .into(),
             qos: Qos::Ci,
-            kind: LeaseKind::Action,
+            kind,
             resources: Resources::new(1_000, GIB),
             hermetic: true,
             do_not_cache: false,
@@ -376,7 +409,6 @@ impl Rig {
                     lease: lease.id,
                     host: lease.host.clone().unwrap_or_default(),
                     run: run.run_id,
-                    state: run.state,
                     args,
                 });
             }
@@ -397,7 +429,10 @@ impl Rig {
     /// The host runs `run` to the end with `outcome`, and stops listing it.
     pub fn host_finishes(&self, run: &RunId, outcome: Outcome, exit_code: Option<i32>) {
         self.fake.run_started(run);
-        assert!(self.fake.finish_run(run, outcome, exit_code, Some("detail")));
+        assert!(
+            self.fake
+                .finish_run(run, outcome, exit_code, Some("detail"))
+        );
     }
 
     pub fn host_ends(&self, run: &RunId) {
@@ -413,7 +448,13 @@ impl Rig {
             self.advance(Duration::from_secs(5)).await;
             self.pump().await;
         }
-        panic!("action {} not done: {:?}\nhosts {:?}\nrequests {:#?}", caller.tag, caller.stage.borrow(), self.exec.hosts(), self.fake.requests());
+        panic!(
+            "action {} not done: {:?}\nhosts {:?}\nrequests {:#?}",
+            caller.tag,
+            caller.stage.borrow(),
+            self.exec.hosts(),
+            self.fake.requests()
+        );
     }
 
     pub fn requests(&self) -> Vec<String> {
@@ -443,7 +484,6 @@ pub struct Posted {
     pub lease: LeaseId,
     pub host: String,
     pub run: RunId,
-    pub state: kbf_lease_client::RunState,
     pub args: Vec<String>,
 }
 
@@ -467,12 +507,4 @@ pub fn count_tail(requests: &[String], method: &str, tail: &str) -> usize {
         .iter()
         .filter(|r| r.starts_with(&prefix) && r.ends_with(tail))
         .count()
-}
-
-#[allow(dead_code)]
-pub fn by_key(posted: &[Posted]) -> BTreeMap<String, Posted> {
-    posted
-        .iter()
-        .map(|p| (p.run.to_string(), p.clone()))
-        .collect()
 }

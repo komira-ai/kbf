@@ -40,7 +40,11 @@ pub struct Config {
     pub slots: u64,
     /// The CPU architecture of the hosts.
     pub arch: String,
-    /// How long a lease lasts without a renewal. At most the server's `--default-ttl`.
+    /// How long a lease lasts without a renewal, asked at each renewal. A run's wall time is
+    /// cut to what the lease has left when it is posted, so this must cover the longest run
+    /// ([`Config::max_run`] and [`Config::run_margin`]); the lease server grants at most its
+    /// `--max-ttl`, and a worker that is granted less treats a run the lease cuts short as
+    /// lost, not as the action's timeout.
     pub lease_ttl: Duration,
     /// How long a lease may last in all: its `max_wall_seconds`.
     pub max_wall: Duration,
@@ -50,7 +54,7 @@ pub struct Config {
     pub max_run: Duration,
     /// What a run's wall time adds to the action's timeout: fetch, pack and upload.
     pub run_margin: Duration,
-    /// The wall time of an action that names no timeout.
+    /// The timeout of an action that names none: at most [`Config::max_run`].
     pub default_timeout: Duration,
     /// The heartbeat interval the workers' `Welcome` names.
     pub heartbeat: Duration,
@@ -111,9 +115,12 @@ pub enum ConfigError {
     /// A run whose pack url the store would not sign.
     #[error("the longest run's wall time exceeds the presign ceiling")]
     Presign,
-    /// A lease ttl that cannot be renewed in time.
-    #[error("the lease ttl must be at least 30 s and three times the step")]
+    /// A lease ttl that cannot be renewed in time, or that does not cover the longest run.
+    #[error("the lease ttl must be at least 30 s, three times the step, and cover the longest run")]
     Ttl,
+    /// A default timeout of zero or over the longest run.
+    #[error("the default timeout must be above zero and no more than the longest run")]
+    Timeout,
 }
 
 impl Config {
@@ -135,12 +142,12 @@ impl Config {
             memory_bytes,
             slots: 8,
             arch: "x86_64".to_owned(),
-            lease_ttl: Duration::from_secs(600),
+            lease_ttl: Duration::from_secs(3600),
             max_wall: Duration::from_secs(6 * 3600),
             drain_before_end: Duration::from_secs(90 * 60),
-            max_run: Duration::from_secs(3600),
+            max_run: Duration::from_secs(3000),
             run_margin: Duration::from_secs(300),
-            default_timeout: Duration::from_secs(3600),
+            default_timeout: Duration::from_secs(3000),
             heartbeat: Duration::from_secs(5),
             poll: Duration::from_millis(500),
             acquire_retry: Duration::from_secs(5),
@@ -172,7 +179,8 @@ impl Config {
     /// The first setting that breaks a rule.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let name_ok = |c: char| c.is_ascii_alphanumeric() || "-_.".contains(c);
-        let frontend = (1..=63).contains(&self.frontend.len()) && self.frontend.chars().all(name_ok);
+        let frontend =
+            (1..=63).contains(&self.frontend.len()) && self.frontend.chars().all(name_ok);
         let heartbeat = u64::try_from(self.heartbeat.as_millis()).unwrap_or(u64::MAX);
         let longest = self.max_run + self.run_margin;
         let checks = [
@@ -196,8 +204,18 @@ impl Config {
                 ConfigError::Fence,
             ),
             (
-                self.lease_ttl >= Duration::from_secs(30) && self.lease_ttl >= self.poll * 3,
+                [
+                    self.lease_ttl >= Duration::from_secs(30),
+                    self.lease_ttl >= self.poll * 3,
+                    self.lease_ttl >= longest,
+                ]
+                .into_iter()
+                .all(|ok| ok),
                 ConfigError::Ttl,
+            ),
+            (
+                !self.default_timeout.is_zero() && self.default_timeout <= self.max_run,
+                ConfigError::Timeout,
             ),
             (self.presign_ceiling >= longest, ConfigError::Presign),
             (

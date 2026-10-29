@@ -35,7 +35,10 @@ fn every_ending_has_its_class() {
     let ended = |outcome, exit| run(Exited, Some(outcome), exit);
     assert_eq!(judge(&ended(Succeeded, Some(0)), false), Verdict::Ingest);
     assert_eq!(judge(&ended(Succeeded, None), false), Verdict::Ingest);
-    assert_eq!(judge(&run(Ended, Some(Succeeded), Some(0)), false), Verdict::Ingest);
+    assert_eq!(
+        judge(&run(Ended, Some(Succeeded), Some(0)), false),
+        Verdict::Ingest
+    );
     assert!(infra(judge(&ended(Succeeded, Some(3)), false)).contains("nonzero"));
     assert!(infra(judge(&ended(Failed, Some(12)), false)).contains("task tool failed"));
     assert!(infra(judge(&ended(Killed, None), false)).contains("killed unasked"));
@@ -64,7 +67,10 @@ fn every_ending_has_its_class() {
 /// detail), which is all an operator has to go on.
 #[test]
 fn an_infra_reason_carries_the_exit_code_and_detail() {
-    let why = infra(judge(&run(RunState::Exited, Some(Outcome::Failed), Some(13)), false));
+    let why = infra(judge(
+        &run(RunState::Exited, Some(Outcome::Failed), Some(13)),
+        false,
+    ));
     assert!(why.contains("Some(13)") && why.contains("why"), "{why}");
 }
 
@@ -76,7 +82,13 @@ fn code_of(result: &kbf_proto::worker::Result) -> i32 {
 /// the farm reads in place of it (`memory_kill`, `lost`), for each way a run is settled.
 #[test]
 fn a_settled_run_becomes_the_result_the_farm_classifies() {
-    let (lease, action) = (LeaseId::new(4, 9), Digest { hash: "cd".repeat(32), size_bytes: 5 });
+    let (lease, action) = (
+        LeaseId::new(4, 9),
+        Digest {
+            hash: "cd".repeat(32),
+            size_bytes: 5,
+        },
+    );
     let of = |settled| result_of(lease, &action, &settled);
     let infra = of(Settled::Infra("disk".to_owned()));
     assert_eq!(code_of(&infra), Code::Unavailable as i32);
@@ -96,7 +108,10 @@ fn a_settled_run_becomes_the_result_the_farm_classifies() {
     let lost = of(Settled::Lost(Lost::Fenced));
     assert_eq!(code_of(&lost), Code::Unavailable as i32);
     assert_eq!(lost.lost, Lost::Fenced as i32);
-    assert_eq!(of(Settled::Lost(Lost::DaemonRestarted)).lost, Lost::DaemonRestarted as i32);
+    assert_eq!(
+        of(Settled::Lost(Lost::DaemonRestarted)).lost,
+        Lost::DaemonRestarted as i32
+    );
 
     let invalid = of(Settled::Invalid("no image".to_owned()));
     assert_eq!(code_of(&invalid), Code::InvalidArgument as i32);
@@ -106,8 +121,21 @@ fn a_settled_run_becomes_the_result_the_farm_classifies() {
 /// the farm checks it against.
 #[test]
 fn a_result_that_ran_is_ok_and_names_its_action() {
-    let (lease, action) = (LeaseId::new(4, 9), Digest { hash: "cd".repeat(32), size_bytes: 5 });
-    let result = ran(lease, &action, ActionResult { exit_code: 2, ..ActionResult::default() });
+    let (lease, action) = (
+        LeaseId::new(4, 9),
+        Digest {
+            hash: "cd".repeat(32),
+            size_bytes: 5,
+        },
+    );
+    let result = ran(
+        lease,
+        &action,
+        ActionResult {
+            exit_code: 2,
+            ..ActionResult::default()
+        },
+    );
     assert!(result.status.is_none());
     assert_eq!(result.action_result.map(|r| r.exit_code), Some(2));
     assert_eq!(result.action_digest.as_ref(), Some(&action));

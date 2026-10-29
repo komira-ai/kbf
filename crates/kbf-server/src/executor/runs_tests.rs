@@ -12,7 +12,10 @@ const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789
 fn an_image_must_be_pinned_by_digest() {
     let image = format!("registry.test/app@sha256:{DIGEST}");
     assert_eq!(pinned(&image).as_deref(), Ok(image.as_str()));
-    assert_eq!(pinned(&format!("docker://{image}")).as_deref(), Ok(image.as_str()));
+    assert_eq!(
+        pinned(&format!("docker://{image}")).as_deref(),
+        Ok(image.as_str())
+    );
     let tagged = format!("registry.test/app:1.0@sha256:{DIGEST}");
     assert_eq!(pinned(&tagged).as_deref(), Ok(tagged.as_str()));
     for bad in [
@@ -41,7 +44,10 @@ fn what_could_not_be_read_is_classed_by_whose_fault_it_is() {
         Settled::from(InputsError::Unavailable("down".to_owned())),
         Settled::Infra("down".to_owned())
     );
-    for error in [PresignError::Refused("ceiling".to_owned()), PresignError::Unavailable("ceiling".to_owned())] {
+    for error in [
+        PresignError::Refused("ceiling".to_owned()),
+        PresignError::Unavailable("ceiling".to_owned()),
+    ] {
         let Settled::Infra(why) = Settled::from(error) else {
             panic!("not infra");
         };

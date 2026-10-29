@@ -97,8 +97,11 @@ async fn acquire(ctx: &Ctx<'_>, now: Instant) -> Slot {
         .ttl(ctx.cfg.lease_ttl);
     match ctx.deps.client.acquire(&request).await {
         Ok(Acquired::Granted(granted)) => {
-            let ends_at = now + ctx.cfg.max_wall;
-            let host = HostWorker::start(ctx, granted.id, granted.host, ends_at, now);
+            let ends = (
+                ctx.clock.local(granted.expires_at_ms, now),
+                now + ctx.cfg.max_wall,
+            );
+            let host = HostWorker::start(ctx, granted.id, granted.host, ends, now);
             Slot::Active(Box::new(host))
         }
         Ok(Acquired::Pending(pending)) => Slot::Pending { lease: pending.id },
@@ -113,9 +116,12 @@ async fn acquire(ctx: &Ctx<'_>, now: Instant) -> Slot {
 
 /// A worker for the held lease `held`, which ends when the lease server says.
 fn activate(ctx: &Ctx<'_>, held: &Lease, now: Instant) -> Slot {
-    let ends_at = ctx.clock.local(held.ends_at_ms, now);
+    let ends = (
+        ctx.clock.local(held.expires_at_ms, now),
+        ctx.clock.local(held.ends_at_ms, now),
+    );
     let host = held.host.clone().unwrap_or_default();
-    Slot::Active(Box::new(HostWorker::start(ctx, held.id, host, ends_at, now)))
+    Slot::Active(Box::new(HostWorker::start(ctx, held.id, host, ends, now)))
 }
 
 /// The leases this frontend made before it started: held ones get a worker (after their runs
