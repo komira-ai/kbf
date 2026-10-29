@@ -343,7 +343,9 @@ refuses new Execute calls, which Buck2 retries elsewhere, and keeps every open E
 WaitExecution stream until its action is done, except a stream whose operation was never
 started, that no worker on this frontend can run and that no other frontend can take,
 which ends UNAVAILABLE when the drain begins: Buck2 retries only
-the opening of a call, so an ended stream fails that action); `--shutdown-timeout-secs` is 0, no
+the opening of a call, so an ended stream fails that action; the daemon half of `all-in-one`
+drains after its server half has no execution open and the process exits when its leases have
+ended and been acknowledged, see [kbf-modes.md](kbf-modes.md#stopping-and-draining)); `--shutdown-timeout-secs` is 0, no
 deadline, by default, and a frontend over a state store has no other bound: its
 `--drain-deadline`, when set, only reports. A `--shutdown-timeout-secs` above 0 ends a drain
 that a signal began when it runs out, as a second signal does, and fails the builds still

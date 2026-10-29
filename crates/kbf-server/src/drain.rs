@@ -36,7 +36,7 @@
 //! the sequence by events and not by seconds.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use kbf_front::Closer;
 use serde::Serialize;
@@ -118,6 +118,21 @@ pub struct Drain {
     deadline_over: Stop,
     /// The sequence reported open executions at the deadline ([`Drain::deadline_passed`]).
     deadline_reported: AtomicBool,
+    /// How many [`Hold`]s are alive.
+    holds: watch::Sender<usize>,
+    /// Given when the REAPI listener is done ([`Drain::settled`]).
+    settled: Stop,
+}
+
+/// Keeps a drain from standing down while it is alive ([`Drain::hold`]). Dropping it lets
+/// the drain go on.
+#[derive(Debug)]
+pub struct Hold(Arc<Drain>);
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        self.0.holds.send_modify(|held| *held -= 1);
+    }
 }
 
 impl Drain {
@@ -146,6 +161,8 @@ impl Drain {
             lb_wait_over: Stop::new(),
             deadline_over: Stop::new(),
             deadline_reported: AtomicBool::new(false),
+            holds: watch::Sender::new(0),
+            settled: Stop::new(),
         };
         (drain, begun)
     }
@@ -266,6 +283,49 @@ impl Drain {
 
     pub(crate) fn mark_deadline_passed(&self) {
         self.deadline_reported.store(true, Ordering::SeqCst);
+    }
+
+    /// A hold on the end of the plain drain ([`drain_and_stop`]'s: `kbf-server`, and the
+    /// server half of `kbf all-in-one`; `kbf frontend` ignores it): once the REAPI
+    /// listener is done, which is when every open execution has ended, the serving future
+    /// does not return, and the worker listener goes on answering, until no hold is alive.
+    /// A process that runs a worker daemon beside the server takes one so that the
+    /// daemon's leases keep reaching their results through it until the daemon has
+    /// drained ([`Drain::settled`] says when to begin). It holds nothing against
+    /// [`Drain::close`]: a second stop signal or `--shutdown-timeout-secs` ends the drain
+    /// whatever is held.
+    ///
+    /// [`drain_and_stop`]: crate::serve
+    #[must_use]
+    pub fn hold(self: &Arc<Self>) -> Hold {
+        self.holds.send_modify(|held| *held += 1);
+        Hold(Arc::clone(self))
+    }
+
+    /// Completes once the drain has settled: the REAPI listener is done, so no execution
+    /// is open and none will be taken. Only the plain drain gets there ([`Drain::hold`]).
+    pub async fn settled(&self) {
+        self.settled.fired().await;
+    }
+
+    pub(crate) fn settle(&self) {
+        self.settled.fire();
+    }
+
+    /// Whether a [`Hold`] is alive.
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        *self.holds.borrow() > 0
+    }
+
+    /// Completes once no [`Hold`] is alive, or [`Drain::close`] has been called.
+    pub async fn may_stand_down(&self) {
+        let mut holds = self.holds.subscribe();
+        tokio::select! {
+            // The sender is `self.holds`, alive as long as `self`.
+            _ = holds.wait_for(|held| *held == 0) => {}
+            () = self.closed() => {}
+        }
     }
 
     /// Completes once [`Drain::end_lb_wait`] has been called.

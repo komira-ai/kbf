@@ -231,8 +231,10 @@ pub struct Cli {
     /// leases still running. Left out, the drain has no deadline. Given, this many
     /// seconds after the first signal the daemon logs a warning with the number of
     /// leases still running and keeps waiting; the value has no upper bound, and 0
-    /// warns at once. It never abandons a lease. Used by `kbf daemon` and `kbf
-    /// storage-and-daemon`; `kbf all-in-one` stops its daemon half with the server half.
+    /// warns at once. It never abandons a lease. Used by `kbf daemon`, `kbf
+    /// storage-and-daemon` and `kbf all-in-one`, whose daemon half drains once its server
+    /// half has no execution open, while the server half goes on serving it; a second
+    /// signal stops both.
     #[arg(long, value_name = "SECONDS")]
     drain_deadline_secs: Option<u64>,
     /// Where the kernel reports memory pressure stall information. For tests only.
@@ -552,13 +554,18 @@ impl NodeHandle {
     ) -> Result<(), Error> {
         let (sender, received) = tokio::sync::mpsc::unbounded_channel();
         self.tokio.spawn(forward(signals, sender));
-        self.drain_on(received, other)
+        self.serve_beside(received, other)
     }
 
-    /// Drains on the first of `received` and ends at the second, when the drain is
-    /// complete, or when `other` completes, whichever is first ([`Daemon::run_draining`]);
-    /// the drain deadline does not end it.
-    fn drain_on(
+    /// [`Self::serve_alongside`] on stop signals the caller reads itself: drains on the
+    /// first `()` of `received` and ends at the second, when the drain is complete, or
+    /// when `other` completes, whichever is first ([`Daemon::run_draining`]); the drain
+    /// deadline does not end it. A process that hands each signal to another half too
+    /// (`kbf all-in-one`) reads the signals once and feeds this.
+    ///
+    /// # Errors
+    /// As [`Self::serve_alongside`].
+    pub fn serve_beside(
         self,
         received: tokio::sync::mpsc::UnboundedReceiver<()>,
         other: impl Future<Output = ()>,
@@ -2401,7 +2408,7 @@ mod tests {
     }
 
     /// Catches a daemon beside another half that does not drain on the first signal
-    /// (`drain_on` running the daemon with `run`, which ignores signals), and one that
+    /// (`serve_beside` running the daemon with `run`, which ignores signals), and one that
     /// keeps running when the half beside it has stopped. An idle node with a signal
     /// waiting returns at once, and so does one whose other half has stopped, with no
     /// signal; each runs on a thread the test waits on for 5 s, so a defect fails here
@@ -2437,7 +2444,7 @@ mod tests {
                         std::future::pending::<()>().await;
                     }
                 };
-                ended.send(node.drain_on(received, other).is_ok()).ok();
+                ended.send(node.serve_beside(received, other).is_ok()).ok();
                 drop(signals);
             });
             result.recv_timeout(Duration::from_secs(5))
