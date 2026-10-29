@@ -77,12 +77,13 @@ async fn a_body_that_never_arrives_is_a_malformed_request() {
         connection: Duration::from_secs(60),
     };
     let (addr, _latch) = listening(&files, world.source(), timeouts);
+    let token = world.token();
     let asked = send(
         addr,
         &farm.pem,
         "POST",
         "/batch",
-        Some(&world.token()),
+        Some(&token),
         "Content-Length: 100\r\n",
         &[],
     );
