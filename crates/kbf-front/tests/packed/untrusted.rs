@@ -6,7 +6,8 @@
 
 use kbf_front::{
     CommitError, IssuedPackKey, MAX_COMMIT_BLOBS, MAX_UNTRUSTED_BLOB_BYTES,
-    MAX_UNTRUSTED_PACK_BYTES, MAX_UNTRUSTED_READ_BYTES, UntrustedLimits,
+    MAX_UNTRUSTED_MANIFEST_BYTES, MAX_UNTRUSTED_PACK_BYTES, MAX_UNTRUSTED_READ_BYTES,
+    UntrustedLimits,
 };
 use kbf_pack_index::{BlobDigest, NewPack, PackBlob, PackIndex as _, Recorded};
 use kbf_segments::layout::{encode_footer, footer_len};
@@ -274,6 +275,7 @@ async fn a_manifest_out_of_order_or_with_a_blob_twice_is_refused() {
 async fn a_pack_over_the_caps_is_refused() {
     assert_eq!(MAX_UNTRUSTED_PACK_BYTES, 128 << 20);
     assert_eq!(MAX_UNTRUSTED_BLOB_BYTES, 64 << 20);
+    assert_eq!(MAX_UNTRUSTED_MANIFEST_BYTES, 4 << 20);
     assert_eq!(MAX_UNTRUSTED_READ_BYTES, (128 << 20) + 33);
     let limits = UntrustedLimits::default();
     assert_eq!(limits.max_blobs, MAX_COMMIT_BLOBS);
@@ -580,4 +582,171 @@ async fn a_store_that_fails_makes_the_commit_unavailable() {
     assert_eq!(rig.packs.metrics().commit_rejects.get(), 0);
     let recorded = commit(&rig, manifest).await;
     assert!(recorded.expect("recorded").created);
+}
+
+/// A manifest of a pack of `size` bytes that lists `blobs` as they are (digest and offset), sorted
+/// into the order a manifest must list them.
+fn raw(blobs: Vec<PackBlob>, size: u64) -> NewPack {
+    let mut manifest = manifest_of(&[], size);
+    manifest.blobs = blobs;
+    manifest
+        .blobs
+        .sort_by_key(|blob| (blob.digest.hash, blob.digest.size));
+    manifest
+}
+
+/// A blob of `size` bytes named by `hash` at `offset`.
+fn at(hash: u8, size: u64, offset: u64) -> PackBlob {
+    PackBlob {
+        digest: BlobDigest {
+            hash: [hash; 32],
+            size,
+        },
+        offset,
+    }
+}
+
+/// Asserts that a record of no bytes is refused as invalid before any read, whether it is the
+/// empty blob's own digest or not, at offset 0 or after a record. The empty blob is implicit and
+/// is never in a pack, and a record of no bytes at offset 0 would leave it unsaid which record is
+/// the first. Catches a manifest that passes the layout check with a record that holds nothing.
+#[tokio::test]
+async fn a_zero_size_record_is_refused() {
+    let first = FIRST.len() as u64;
+    let body = footer_len(2) + first;
+
+    let leading = listed(&[("", 0), (FIRST, 0)], body);
+    refused_unread(leading, "a record of no bytes").await;
+
+    let trailing = listed(&[(FIRST, 0), ("", first)], body);
+    refused_unread(trailing, "a record of no bytes").await;
+
+    let nameless = raw(vec![at(1, 0, 0), at(2, first, 0)], body);
+    refused_unread(nameless, "a record of no bytes").await;
+
+    let alone = listed(&[("", 0)], footer_len(1));
+    refused_unread(alone, "a record of no bytes").await;
+}
+
+/// Asserts that two records of no bytes at one offset are refused as invalid before any read,
+/// where the layout check alone would take them (each ends where the next starts). Catches any
+/// number of records of no bytes passing as a layout, which would put many digests at offset 0.
+#[tokio::test]
+async fn two_zero_size_records_at_one_offset_are_refused() {
+    let first = FIRST.len() as u64;
+    let size = footer_len(3) + first;
+    let two = raw(vec![at(1, 0, 0), at(2, 0, 0), at(3, first, 0)], size);
+    refused_unread(two, "a record of no bytes").await;
+
+    let after = raw(
+        vec![at(1, first, 0), at(2, 0, first), at(3, 0, first)],
+        size,
+    );
+    refused_unread(after, "a record of no bytes").await;
+}
+
+/// Asserts that every refusal of an untrusted commit is counted under the reason that names it,
+/// and nothing else is: one commit for each of forbidden (a key not issued), shape (records with
+/// a gap), missing (no object), footer (a footer that is not the manifest), mismatch (a record
+/// whose CRC is not its bytes) and conflict (a key recorded with other contents) moves its own
+/// label by one; a store that fails (unavailable) moves none; the pack that is recorded is
+/// counted as recorded, and its replay is not counted again; the daemons' shared counters still
+/// move for each refusal. Catches a reason counted under another, a refusal not counted, a
+/// failure of the store counted as a refusal, and a scrape that does not carry the labels.
+#[tokio::test]
+async fn an_untrusted_commit_counts_by_reason() {
+    let rig = Rig::replacing().await;
+    let scrape = || {
+        let mut text = String::new();
+        rig.packs.render_metrics(&mut text);
+        text
+    };
+    let reason = |text: &str, label: &str, n: u64| {
+        let line = format!("kbf_pack_untrusted_commit_rejects_total{{reason=\"{label}\"}} {n}\n");
+        assert!(text.contains(&line), "{line}in {text}");
+    };
+    let (honest, manifest) = segment_of(&[FIRST, SECOND]);
+    let before = scrape();
+    assert!(
+        before.contains("kbf_pack_untrusted_commits_total 0\n"),
+        "{before}"
+    );
+    for label in [
+        "forbidden",
+        "shape",
+        "footer",
+        "mismatch",
+        "missing",
+        "conflict",
+    ] {
+        reason(&before, label, 0);
+    }
+
+    let other = NewPack {
+        key: "cas/b/build7/other".to_owned(),
+        ..manifest.clone()
+    };
+    commit(&rig, other).await.expect_err("forbidden");
+    reason(&scrape(), "forbidden", 1);
+
+    let first = FIRST.len() as u64;
+    let gap = listed(&[(FIRST, 0), (SECOND, first + 3)], honest.len() as u64 + 3);
+    commit(&rig, gap).await.expect_err("shape");
+    reason(&scrape(), "shape", 1);
+
+    commit(&rig, manifest.clone()).await.expect_err("missing");
+    reason(&scrape(), "missing", 1);
+
+    let body = format!("{FIRST}{SECOND}");
+    let swapped = [entry(SECOND, 0), entry(FIRST, SECOND.len() as u64)];
+    let (lying, _) = forged(&swapped, body.as_bytes());
+    rig.store.seed(KEY, &lying).await;
+    let footer = listed(&[(FIRST, 0), (SECOND, first)], lying.len() as u64);
+    commit(&rig, footer).await.expect_err("footer");
+    reason(&scrape(), "footer", 1);
+
+    let mut wrong = entry(FIRST, 0);
+    wrong.crc32c ^= 1;
+    let (crooked, crooked_manifest) = forged(&[wrong], FIRST.as_bytes());
+    rig.store.seed(KEY, &crooked).await;
+    commit(&rig, crooked_manifest).await.expect_err("mismatch");
+    reason(&scrape(), "mismatch", 1);
+
+    rig.store.seed(KEY, &honest).await;
+    rig.store.reject_reads(1);
+    let failed = commit(&rig, manifest.clone())
+        .await
+        .expect_err("unavailable");
+    assert!(matches!(failed, CommitError::Unavailable(_)), "{failed:?}");
+    let text = scrape();
+    assert!(
+        text.contains("kbf_pack_untrusted_commits_total 0\n"),
+        "{text}"
+    );
+    for (label, n) in [("forbidden", 1), ("shape", 1), ("footer", 1)] {
+        reason(&text, label, n);
+    }
+    for (label, n) in [("mismatch", 1), ("missing", 1), ("conflict", 0)] {
+        reason(&text, label, n);
+    }
+
+    commit(&rig, manifest.clone()).await.expect("recorded");
+    commit(&rig, manifest).await.expect("replayed");
+    let (changed, changed_manifest) = segment_of(&[FIRST, "third blob"]);
+    rig.store.seed(KEY, &changed).await;
+    commit(&rig, changed_manifest).await.expect_err("conflict");
+
+    let text = scrape();
+    assert!(
+        text.contains("kbf_pack_untrusted_commits_total 1\n"),
+        "{text}"
+    );
+    for (label, n) in [("forbidden", 1), ("shape", 1), ("footer", 1)] {
+        reason(&text, label, n);
+    }
+    for (label, n) in [("mismatch", 1), ("missing", 1), ("conflict", 1)] {
+        reason(&text, label, n);
+    }
+    assert!(text.contains("kbf_pack_commit_rejects_total 6\n"), "{text}");
+    assert!(text.contains("kbf_pack_commits_total 1\n"), "{text}");
 }

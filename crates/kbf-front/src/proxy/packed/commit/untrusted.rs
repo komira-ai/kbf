@@ -46,6 +46,11 @@ pub const MAX_UNTRUSTED_PACK_BYTES: u64 = MAX_SEGMENT_BYTES;
 /// (a blob over it is not read from packs).
 pub const MAX_UNTRUSTED_BLOB_BYTES: u64 = 64 << 20;
 
+/// The most bytes the record at offset 0 of an untrusted pack may have when the caller reads that
+/// record as the pack's manifest (the caller applies it; this module does not know which record
+/// is one).
+pub const MAX_UNTRUSTED_MANIFEST_BYTES: u64 = 1 << 20;
+
 /// The most bytes one commit of an untrusted pack may read from the store: every byte of a pack
 /// of [`MAX_UNTRUSTED_PACK_BYTES`] once, and the trailer twice (the read of the trailer, which
 /// also shows that the pack is not longer than said by one byte, and the read of the footer).

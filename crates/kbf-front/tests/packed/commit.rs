@@ -334,10 +334,11 @@ async fn a_store_or_an_index_that_fails_makes_the_commit_unavailable() {
 }
 
 /// Asserts how an empty blob is checked: it is read from no range, and its digest must be that of
-/// no bytes. One listed with the digest of the empty blob is recorded; one listed with another
-/// hash is a mismatch.
+/// no bytes. One listed with the digest of the empty blob passes the check (two reads in all) and
+/// is then refused by the index, which holds no blob of no bytes (the empty blob is never read from
+/// a pack); one listed with another hash is a mismatch.
 #[tokio::test]
-async fn an_empty_blob_is_checked_without_a_read() {
+async fn an_empty_blob_is_checked_without_a_read_and_the_index_holds_none() {
     let one = blob("first blob");
     let (body, mut commit) = pack_of(KEY, &[&one]);
     let rig = Rig::new().await;
@@ -348,7 +349,9 @@ async fn an_empty_blob_is_checked_without_a_read() {
         offset: 0,
     });
     let first = rig.packs.commit_pack("node1", commit.clone(), 2).await;
-    assert!(first.expect("recorded").created);
+    let first = first.expect_err("refused by the index");
+    assert!(matches!(first, CommitError::Invalid(_)), "{first:?}");
+    assert!(first.message().contains("a blob of no bytes"), "{first:?}");
     let reads = rig.store.ranges().len();
     assert_eq!(reads, 2, "the last byte and the first blob");
 

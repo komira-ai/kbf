@@ -44,8 +44,8 @@ use super::store::{Packs, from_index, offload};
 mod untrusted;
 
 pub use self::untrusted::{
-    IssuedPackKey, MAX_UNTRUSTED_BLOB_BYTES, MAX_UNTRUSTED_PACK_BYTES, MAX_UNTRUSTED_READ_BYTES,
-    UntrustedLimits,
+    IssuedPackKey, MAX_UNTRUSTED_BLOB_BYTES, MAX_UNTRUSTED_MANIFEST_BYTES, MAX_UNTRUSTED_PACK_BYTES,
+    MAX_UNTRUSTED_READ_BYTES, UntrustedLimits,
 };
 
 /// The most blobs one commit lists: the most the packer puts in a pack.

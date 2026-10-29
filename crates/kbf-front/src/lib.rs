@@ -129,8 +129,8 @@ pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
 pub use crate::operations::OperationsService;
 pub use crate::proxy::{
     CommitError, DEFAULT_INFLIGHT_BYTES, DEFAULT_UPLOAD_IDLE_TIMEOUT, Direction, IssuedPackKey,
-    MAX_COMMIT_BLOBS, MAX_PACKED_BLOB_BYTES, MAX_UNTRUSTED_BLOB_BYTES, MAX_UNTRUSTED_PACK_BYTES,
-    MAX_UNTRUSTED_READ_BYTES, MAX_UPLOAD_IDLE_TIMEOUT, Meter, Method, Owner, Owners, PackMetrics,
+    MAX_COMMIT_BLOBS, MAX_PACKED_BLOB_BYTES, MAX_UNTRUSTED_BLOB_BYTES, MAX_UNTRUSTED_MANIFEST_BYTES,
+    MAX_UNTRUSTED_PACK_BYTES, MAX_UNTRUSTED_READ_BYTES, MAX_UPLOAD_IDLE_TIMEOUT, Meter, Method, Owner, Owners, PackMetrics,
     PackSettings, PackStore, Packs, Proxy, UntrustedLimits,
 };
 pub use crate::qos_header::{BadQosAllow, QOS_HEADER, QosAllow};

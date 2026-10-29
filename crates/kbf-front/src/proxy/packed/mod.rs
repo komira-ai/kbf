@@ -64,7 +64,8 @@ pub(in crate::proxy) use self::bytestream::{applies, read as read_stream, write 
 pub(in crate::proxy) use self::cas::{Served, find_missing, read_blob, read_many, store_batch};
 pub use self::commit::{
     CommitError, IssuedPackKey, MAX_COMMIT_BLOBS, MAX_UNTRUSTED_BLOB_BYTES,
-    MAX_UNTRUSTED_PACK_BYTES, MAX_UNTRUSTED_READ_BYTES, UntrustedLimits,
+    MAX_UNTRUSTED_MANIFEST_BYTES, MAX_UNTRUSTED_PACK_BYTES, MAX_UNTRUSTED_READ_BYTES,
+    UntrustedLimits,
 };
 pub(in crate::proxy) use self::hit::held;
 pub use self::metrics::PackMetrics;

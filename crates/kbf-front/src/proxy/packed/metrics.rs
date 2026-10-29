@@ -72,7 +72,22 @@ pub struct PackMetrics {
     /// store, a sampled blob is not its digest, the name or the list is not one a daemon may
     /// commit, or the pack was recorded before with other contents.
     pub commit_rejects: Counter,
+    /// Packs a build wrote through a presigned write that were recorded by
+    /// `commit_untrusted_pack`.
+    pub(super) untrusted_commits: Counter,
+    /// Commits of an untrusted pack that were refused, by [`UNTRUSTED_REASONS`].
+    pub(super) untrusted_rejects: [Counter; UNTRUSTED_REASONS.len()],
 }
+
+/// Why a commit of an untrusted pack was refused, in the order of the counters.
+pub(super) const UNTRUSTED_REASONS: [&str; 6] = [
+    "forbidden",
+    "shape",
+    "footer",
+    "mismatch",
+    "missing",
+    "conflict",
+];
 
 impl PackMetrics {
     /// The bytes reserved for the uploads in flight now.
@@ -196,6 +211,23 @@ impl PackMetrics {
             "The most bytes reserved for uploads into packs at once since the start",
             self.inflight_peak_bytes(),
         );
+        families.counter(
+            "kbf_pack_untrusted_commits_total",
+            "Packs a build wrote through a presigned write that were recorded in the pack index",
+            self.untrusted_commits.get(),
+        );
+        families.head(
+            "kbf_pack_untrusted_commit_rejects_total",
+            "counter",
+            "Commits of such a pack refused, nothing recorded, by why",
+        );
+        for (reason, counter) in UNTRUSTED_REASONS.iter().zip(&self.untrusted_rejects) {
+            let line = format!(
+                "kbf_pack_untrusted_commit_rejects_total{{reason=\"{reason}\"}} {}\n",
+                counter.get()
+            );
+            families.0.push_str(&line);
+        }
         *out = families.0;
     }
 }
