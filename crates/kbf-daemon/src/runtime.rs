@@ -107,6 +107,57 @@ pub struct NodeLoadError {
     pub why: String,
 }
 
+/// One reading of the node's actions cgroup and of each lease that runs in it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NodeReading {
+    /// What a heartbeat carries of the node. The runtime leaves `lease_clocks` and
+    /// `minutes` empty; the daemon's collector fills them from `leases`. (`NodeReading` is `PartialEq` and not `Eq` because the generated
+    /// `NodeLoad` is not `Eq`.)
+    pub load: NodeLoad,
+    /// Each running lease of the runtime at the reading, in lease order.
+    pub leases: Vec<LeaseReading>,
+}
+
+impl From<NodeLoad> for NodeReading {
+    /// A reading that names no leases.
+    fn from(load: NodeLoad) -> Self {
+        Self {
+            load,
+            leases: Vec::new(),
+        }
+    }
+}
+
+/// One running lease at a [`NodeReading`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaseReading {
+    pub lease: LeaseId,
+    /// When the lease's container started (after its inputs and image), on the clock of
+    /// the reading's `load.mono_usec`.
+    pub started_usec: u64,
+    /// What its cgroup holds now; `None` when a file of it could not be read or parsed.
+    /// The lease keeps its start then, and is never given a zero.
+    pub usage: Option<LeaseUsage>,
+}
+
+/// What one lease's cgroup holds at a reading.
+///
+/// A lease's CPU peak is computed in two places, from different clock reads, so the two
+/// can differ in the last digits and nothing asserts them equal. The container driver
+/// takes the busiest window between a lease's own successive `cpu.stat` reads, each
+/// stamped by a clock read right after that file ([`Runtime::take_peak_window_millicores`]).
+/// A figure taken between whole readings uses the reading's `load.mono_usec`, one stamp for
+/// every lease; the leases are read one after another, so a lease's own stamp is later than
+/// the reading's by the time spent reading the files before it (tens of milliseconds with
+/// many leases).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeaseUsage {
+    /// `usage_usec` of the lease's `cpu.stat`: cumulative.
+    pub cpu_usage_usec: u64,
+    /// `memory.current` less `inactive_file` of `memory.stat`, floored at 0.
+    pub working_set_bytes: u64,
+}
+
 /// Runs leases. The lease manager never names a driver: it asks the runtime whether it
 /// serves a lease kind, and runs the lease through it.
 pub trait Runtime: Send + Sync + 'static {
@@ -127,13 +178,13 @@ pub trait Runtime: Send + Sync + 'static {
         None
     }
 
-    /// One reading of what the node's actions are doing, for the heartbeat. `Ok(None)`
-    /// for a runtime that takes no readings (the default). The reading is made off the
-    /// async workers.
+    /// One reading of what the node's actions are doing and of each of this runtime's
+    /// running leases, for the heartbeat. `Ok(None)` for a runtime that takes no readings
+    /// (the default). The reading is made off the async workers.
     ///
     /// # Errors
     /// The reading could not be made.
-    fn node_load(&self) -> impl Future<Output = Result<Option<NodeLoad>, NodeLoadError>> + Send {
+    fn node_load(&self) -> impl Future<Output = Result<Option<NodeReading>, NodeLoadError>> + Send {
         async { Ok(None) }
     }
 

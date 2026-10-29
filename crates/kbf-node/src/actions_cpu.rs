@@ -78,8 +78,12 @@ impl ActionsCpuArgs {
 
 #[cfg(test)]
 mod tests {
-    use clap::{CommandFactory, Parser};
+    use clap::CommandFactory;
+    // The mapping test reads the driver's modes, which are Linux only.
+    #[cfg(target_os = "linux")]
+    use clap::Parser;
 
+    #[cfg(target_os = "linux")]
     use super::*;
     use crate::Cli;
 
