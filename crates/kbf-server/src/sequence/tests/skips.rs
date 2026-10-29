@@ -1,5 +1,5 @@
 //! Ending the two waits of the sequence by hand ([`Drain::end_lb_wait`] and
-//! [`Drain::end_deadline`]). The waits given here are too long for any test to see run out,
+//! [`Drain::pass_deadline`]). The waits given here are too long for any test to see run out,
 //! so only the calls end them, and each step is waited for as an event of the drain.
 
 use super::*;
@@ -31,7 +31,7 @@ async fn fires(stop: &Stop) {
 async fn ending_the_wait_by_hand_refuses_new_calls_and_sends_goaway() {
     let timing = DrainTiming {
         lb_wait: Duration::MAX,
-        deadline: Duration::MAX,
+        deadline: Some(Duration::MAX),
     };
     let mut rig = Rig::new(timing);
     let _open = rig.backend.metrics().execute.open_executions.raise();
@@ -54,30 +54,36 @@ async fn ending_the_wait_by_hand_refuses_new_calls_and_sends_goaway() {
     assert_eq!(rig.drain.phase(), Phase::Draining, "ended while open");
 }
 
-/// Asserts that `Drain::end_deadline` ends the wait for the open executions as the deadline
-/// running out does: with an execution that never ends and a deadline no test lives to see
-/// run out, the sequence stays in `draining`; after the call the phase is `closing`, the
-/// worker's stream is ended UNAVAILABLE, and the farm takes no more work.
+/// Asserts that `Drain::pass_deadline` passes the deadline as its running out does: with an
+/// execution that never ends and a deadline no test lives to see run out, the call sets
+/// `deadline_passed` and the sequence stays in `draining` with the worker's stream not
+/// ended; once the execution is gone the sequence ends.
 #[tokio::test]
-async fn ending_the_deadline_by_hand_closes_the_streams_that_are_left() {
+async fn passing_the_deadline_by_hand_reports_and_goes_on_waiting() {
     let timing = DrainTiming {
         lb_wait: Duration::ZERO,
-        deadline: Duration::MAX,
+        deadline: Some(Duration::MAX),
     };
     let rig = Rig::new(timing);
     let mut inbox = register(&rig);
-    let _open = rig.backend.metrics().execute.open_executions.raise();
+    let open = rig.backend.metrics().execute.open_executions.raise();
 
     assert!(rig.sequence.begin());
     reaches(&rig.drain, Phase::Draining).await;
-    assert_eq!(rig.drain.phase(), Phase::Draining, "ended while open");
+    assert!(!rig.drain.deadline_passed());
 
-    rig.drain.end_deadline();
+    rig.drain.pass_deadline();
+    let passed = async {
+        while !rig.drain.deadline_passed() {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(SAFETY, passed)
+        .await
+        .expect("the deadline is reported in time");
+    assert_eq!(rig.drain.phase(), Phase::Draining, "ended while open");
+    assert_eq!(errors(&mut inbox), [], "a stream was ended");
+
+    drop(open);
     reaches(&rig.drain, Phase::Closing).await;
-    let ended: Vec<Code> = std::iter::from_fn(|| inbox.try_recv().ok())
-        .filter_map(|message| message.err())
-        .map(|status| status.code())
-        .collect();
-    assert_eq!(ended, [Code::Unavailable]);
-    assert!(submit(&rig.farm, request(1)).is_err(), "still takes work");
 }
