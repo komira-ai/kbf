@@ -549,6 +549,14 @@ impl Clock for SuspendClock {
     }
 }
 
+/// How a harness's daemon is stopped by the signals sent to it.
+pub enum Stop {
+    /// [`Daemon::run`], which ends at the first signal and abandons its leases.
+    Shutdown,
+    /// [`Daemon::run_draining`] with this deadline.
+    Drain(Option<Duration>),
+}
+
 /// A daemon with a runtime (by default the fake one), connected to a fake server.
 pub struct Harness<R: Runtime = FakeRuntime> {
     pub runtime: Arc<R>,
@@ -768,6 +776,16 @@ impl<R: Runtime> Harness<R> {
         runtime: Arc<R>,
         deadline: Duration,
     ) -> (Self, mpsc::UnboundedSender<()>) {
+        Self::with_drain_phase(name, runtime, Some(deadline), None).await
+    }
+
+    /// [`Harness::with_drain`] with a deadline that may be absent, as the daemon's
+    /// default is.
+    pub async fn with_drain_deadline(
+        name: &str,
+        runtime: Arc<R>,
+        deadline: Option<Duration>,
+    ) -> (Self, mpsc::UnboundedSender<()>) {
         Self::with_drain_phase(name, runtime, deadline, None).await
     }
 
@@ -775,7 +793,7 @@ impl<R: Runtime> Harness<R> {
     pub async fn with_drain_phase(
         name: &str,
         runtime: Arc<R>,
-        deadline: Duration,
+        deadline: Option<Duration>,
         phase: Option<tokio::sync::watch::Receiver<kbf_types::NodePhase>>,
     ) -> (Self, mpsc::UnboundedSender<()>) {
         let (signals_tx, signals) = mpsc::unbounded_channel();
@@ -794,7 +812,7 @@ impl<R: Runtime> Harness<R> {
             phase,
             None,
             None,
-            Some((signals, Some(deadline))),
+            Some((signals, Stop::Drain(deadline))),
         )
         .await;
         (h, signals_tx)
@@ -816,7 +834,7 @@ impl<R: Runtime> Harness<R> {
             None,
             None,
             None,
-            Some((signals, None)),
+            Some((signals, Stop::Shutdown)),
         )
         .await;
         (h, signals_tx)
@@ -997,7 +1015,7 @@ impl<R: Runtime> Harness<R> {
         phase: Option<tokio::sync::watch::Receiver<kbf_types::NodePhase>>,
         pressure: Option<(tokio::sync::watch::Receiver<Option<f64>>, f64)>,
         map: Option<Arc<kbf_mapsync::MapHolder>>,
-        drain: Option<(mpsc::UnboundedReceiver<()>, Option<Duration>)>,
+        drain: Option<(mpsc::UnboundedReceiver<()>, Stop)>,
     ) -> Self {
         Self::build_all(
             name,
@@ -1029,7 +1047,7 @@ impl<R: Runtime> Harness<R> {
         phase: Option<tokio::sync::watch::Receiver<kbf_types::NodePhase>>,
         pressure: Option<(tokio::sync::watch::Receiver<Option<f64>>, f64)>,
         map: Option<Arc<kbf_mapsync::MapHolder>>,
-        drain: Option<(mpsc::UnboundedReceiver<()>, Option<Duration>)>,
+        drain: Option<(mpsc::UnboundedReceiver<()>, Stop)>,
         packs: Option<PackCounter>,
         commit: Option<PackCommit>,
     ) -> Self {
@@ -1101,8 +1119,10 @@ impl<R: Runtime> Harness<R> {
             assert!(daemon.pack_writes().is_some());
         }
         let daemon = match drain {
-            Some((signals, Some(deadline))) => tokio::spawn(daemon.run_draining(signals, deadline)),
-            Some((mut signals, None)) => tokio::spawn(daemon.run(async move {
+            Some((signals, Stop::Drain(deadline))) => {
+                tokio::spawn(daemon.run_draining(signals, deadline))
+            }
+            Some((mut signals, Stop::Shutdown)) => tokio::spawn(daemon.run(async move {
                 signals.recv().await;
             })),
             None => tokio::spawn(daemon.run(std::future::pending())),

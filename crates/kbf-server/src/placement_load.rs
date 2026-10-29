@@ -28,6 +28,16 @@ impl PlacementLoad {
         }
     }
 
+    /// What `Welcome.placement_load` carries: `Some(true)` for `on`, absent for `off` (never
+    /// `Some(false)`, so a farm that does not place by load sends the bytes it always did).
+    #[must_use]
+    pub const fn welcome(self) -> Option<bool> {
+        match self {
+            Self::On => Some(true),
+            Self::Off => None,
+        }
+    }
+
     /// The load configuration a scheduler is built with: this mode, and the scheduler's own
     /// values for every other setting.
     #[must_use]
