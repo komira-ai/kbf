@@ -86,9 +86,10 @@ fn needed_libraries_are_counted_up_to_the_end_of_the_section() {
 #[test]
 fn a_file_that_cannot_be_read_is_an_error() {
     let err = |bytes: &[u8]| dynamic_links(bytes).unwrap_err();
-    assert!(err(b"#!/bin/sh\n").contains("truncated"));
+    // A text file, not an ELF one: too short, then long enough but without the ELF magic.
+    assert!(err(b"plain text\n").contains("truncated"));
     let mut text = vec![0u8; 64];
-    text[..9].copy_from_slice(b"#!/bin/sh");
+    text[..10].copy_from_slice(b"plain text");
     assert!(err(&text).contains("not an ELF file"));
     let mut b32 = elf(&[], &[]);
     b32[4] = 1;
