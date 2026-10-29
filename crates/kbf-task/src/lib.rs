@@ -26,7 +26,10 @@
 //! argv nor on disk while the Command runs. The grant token is read from `--grant-token-file`, which
 //! is not removed, and its path stays in the tool's argv: the job's sandbox must keep that file and the
 //! tool's `/proc` entry out of the Command's reach (a separate user or a separate process
-//! namespace), or the Command can read the token. A process of the Command that leaves its process
+//! namespace), or the Command can read the token. The flag forms `--pack-url` and `--grant-token`,
+//! accepted only with `--insecure-argv-secrets` (komira-ai/kbf#1934), put the values in argv for every
+//! process on the host to read; they are a stopgap until the job scheduler delivers job secrets as
+//! files, and are removed then. A process of the Command that leaves its process
 //! group (for example with `setsid`) survives the group kill at the deadline; only such a sandbox
 //! ends it. The tool holds each collected blob in memory twice and the pack once more, so its peak
 //! is about three times the pack limit.

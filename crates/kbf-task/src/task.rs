@@ -19,13 +19,13 @@
 //! | 11 | run-start: the Command could not be started (bad paths, no program) |
 //! | 12 | pack: the outputs could not be collected or did not fit one pack |
 //! | 13 | put: the pack could not be stored (refused, key already taken, unreachable) |
-//! | 14 | setup: the grant token or a root certificate file is unusable, or the runtime did not start |
+//! | 14 | setup: a credential or root certificate is unusable, a credential given as a flag value without `--insecure-argv-secrets`, or the runtime did not start |
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use kbf_proto::reapi::{Action, Command, Digest};
 
 use crate::fetch::{
@@ -51,23 +51,50 @@ pub const EXIT_PUT: u8 = 13;
 pub const EXIT_SETUP: u8 = 14;
 
 /// `kbf-task`: runs one build action inside a job and stores its pack with one PUT.
+///
+/// # The credentials
+///
+/// The presigned PUT URL and the read grant's bearer token each come from exactly one of a file
+/// (`--pack-url-file`, `--grant-token-file`) or, as a stopgap, a flag value (`--pack-url`,
+/// `--grant-token`). A flag value is in the tool's argv, which the Command and every process on
+/// the host can read, so the flag forms are accepted only together with
+/// `--insecure-argv-secrets`; without it the tool refuses to start (exit 14). Their exposure is
+/// bounded: the URL is create-only, for one key, and expires at the action's timeout plus a margin;
+/// the grant is scoped to one build's inputs. The flag forms exist because the job scheduler does
+/// not yet deliver job secrets as files (komira-ai/kbf#1934), and are removed when it does. Neither
+/// value is ever written to a log or an error message.
 #[derive(Parser)]
 #[command(
     name = "kbf-task",
-    version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT"))
+    version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT")),
+    group(ArgGroup::new("pack_url_source").required(true).args(["pack_url_file", "pack_url"])),
+    group(ArgGroup::new("grant_token_source").required(true).args(["grant_token_file", "grant_token"]))
 )]
 pub struct Cli {
-    /// A file holding the presigned URL the pack is PUT to, once. The URL is a credential, so it
-    /// is not a flag value (argv is readable by the Command): the file is read, and removed,
-    /// before the Command starts.
+    /// A file holding the presigned URL the pack is PUT to, once. The URL is a credential, so by
+    /// default it is not a flag value (argv is readable by the Command): the file is read, and
+    /// removed, before the Command starts.
     #[arg(long)]
-    pub pack_url_file: PathBuf,
+    pub pack_url_file: Option<PathBuf>,
+    /// The presigned URL itself. Stopgap (komira-ai/kbf#1934): it is in argv, so it needs
+    /// `--insecure-argv-secrets`.
+    #[arg(long)]
+    pub pack_url: Option<String>,
     /// The base URL of the read grant: blobs are read from `<base>/<hex>/<size>`.
     #[arg(long)]
     pub grant_url: String,
     /// A file holding the read grant's bearer token (a trailing newline is dropped).
     #[arg(long)]
-    pub grant_token_file: PathBuf,
+    pub grant_token_file: Option<PathBuf>,
+    /// The bearer token itself. Stopgap (komira-ai/kbf#1934): it is in argv, so it needs
+    /// `--insecure-argv-secrets`.
+    #[arg(long)]
+    pub grant_token: Option<String>,
+    /// Accept `--pack-url` and `--grant-token`, whose values are visible in argv to the Command and
+    /// to every process on the host. Removed when the job scheduler delivers job secrets as files
+    /// (komira-ai/kbf#1934).
+    #[arg(long)]
+    pub insecure_argv_secrets: bool,
     /// The lease id the frontend gave; it is copied into the manifest.
     #[arg(long)]
     pub lease: String,
@@ -295,36 +322,66 @@ fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Refuses a credential given as a flag value unless `--insecure-argv-secrets` allows it. The
+/// message names the flags, never their values.
+fn check_argv_secrets(cli: &Cli) -> Result<(), Failure> {
+    let used = [
+        ("--pack-url", cli.pack_url.is_some()),
+        ("--grant-token", cli.grant_token.is_some()),
+    ];
+    match used.iter().find(|(_, set)| *set) {
+        Some((flag, _)) if !cli.insecure_argv_secrets => Err(Failure::Setup(format!(
+            "{flag} puts a credential in argv, where the Command can read it; \
+             pass --insecure-argv-secrets to accept that, or use the file form"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// A credential from the file or the flag value the command line named, a trailing newline
+/// dropped, and the file (when it was one) left in place. `what` names the credential.
+fn credential(what: &str, file: Option<&Path>, flag: Option<&str>) -> Result<String, Failure> {
+    let (raw, from) = match (file, flag) {
+        (Some(path), _) => (
+            std::fs::read_to_string(path)
+                .map_err(|e| Failure::Setup(format!("{}: {e}", path.display())))?,
+            path.display().to_string(),
+        ),
+        (None, Some(value)) => (value.to_owned(), format!("the {what} flag")),
+        (None, None) => return Err(Failure::Setup(format!("no {what} was given"))),
+    };
+    let value = raw.trim_end_matches(['\r', '\n']);
+    if value.is_empty() {
+        return Err(Failure::Setup(format!("{from} is empty")));
+    }
+    Ok(value.to_owned())
+}
+
 /// The trusted roots and the real source and sink the flags name.
 fn connect(cli: &Cli) -> Result<(HttpBlobSource, HttpSink), Failure> {
-    let token = std::fs::read_to_string(&cli.grant_token_file)
-        .map_err(|e| Failure::Setup(format!("{}: {e}", cli.grant_token_file.display())))?;
-    let token = token.trim_end_matches(['\r', '\n']);
-    if token.is_empty() {
-        return Err(Failure::Setup(format!(
-            "{} is empty",
-            cli.grant_token_file.display()
-        )));
-    }
+    check_argv_secrets(cli)?;
+    let token = credential(
+        "grant token",
+        cli.grant_token_file.as_deref(),
+        cli.grant_token.as_deref(),
+    )?;
     let mut roots = native_roots();
     for path in &cli.root_der {
         roots.push(
             std::fs::read(path).map_err(|e| Failure::Setup(format!("{}: {e}", path.display())))?,
         );
     }
-    let url = std::fs::read_to_string(&cli.pack_url_file)
-        .map_err(|e| Failure::Setup(format!("{}: {e}", cli.pack_url_file.display())))?;
-    let url = url.trim_end_matches(['\r', '\n']).to_owned();
-    if url.is_empty() {
-        return Err(Failure::Setup(format!(
-            "{} is empty",
-            cli.pack_url_file.display()
-        )));
+    let url = credential(
+        "pack URL",
+        cli.pack_url_file.as_deref(),
+        cli.pack_url.as_deref(),
+    )?;
+    if let Some(path) = &cli.pack_url_file {
+        // The Command runs as a child of this process: the URL must not be left where it can read it.
+        std::fs::remove_file(path)
+            .map_err(|e| Failure::Setup(format!("{}: {e}", path.display())))?;
     }
-    // The Command runs as a child of this process: the URL must not be left where it can read it.
-    std::fs::remove_file(&cli.pack_url_file)
-        .map_err(|e| Failure::Setup(format!("{}: {e}", cli.pack_url_file.display())))?;
-    let source = HttpBlobSource::new(&cli.grant_url, token, &roots)?;
+    let source = HttpBlobSource::new(&cli.grant_url, &token, &roots)?;
     let sink = HttpSink {
         agent: agent(Some(tls_config(&roots))),
         url,
@@ -737,18 +794,167 @@ mod tests {
         ])
         .expect("flags");
         assert_eq!(default.work_dir, PathBuf::from("/scratch/work"));
-        // A grant token is never a flag value, and the action must be a digest.
+        assert!(!default.insecure_argv_secrets);
+        // The action must be a digest, and each credential needs a source.
         for bad in [
-            vec!["kbf-task", "--grant-token=x"],
-            // The presigned URL is a credential: it is not accepted as a flag value.
+            vec!["kbf-task", "--action=nothex/1"],
             vec![
                 "kbf-task",
-                "--pack-url=https://store.example/pack?sig=secret",
+                "--grant-url=g",
+                "--lease=l",
+                "--grant-token-file=t",
             ],
-            vec!["kbf-task", "--action=nothex/1"],
         ] {
             assert!(Cli::try_parse_from(bad).is_err());
         }
+    }
+
+    const SECRET_URL: &str = "https://store.example/pack?X-Sig=very-secret";
+    const SECRET_TOKEN: &str = "very-secret-token";
+
+    /// Flags with the credentials as the given options, and `insecure` as asked.
+    fn with_secrets(args: &[&str]) -> Result<Cli, clap::Error> {
+        let action = format!("--action={}", BlobId::of(b"a"));
+        let mut all = vec![
+            "kbf-task",
+            "--grant-url=https://grant.example",
+            "--lease=l",
+            action.as_str(),
+        ];
+        all.extend_from_slice(args);
+        Cli::try_parse_from(all)
+    }
+
+    /// Both credentials as flag values are refused at startup without the opt-in, and the
+    /// refusal names the opt-in and neither value.
+    #[test]
+    fn credential_flags_need_the_insecure_opt_in() {
+        for args in [
+            vec![
+                format!("--pack-url={SECRET_URL}"),
+                "--grant-token-file=t".to_owned(),
+            ],
+            vec![
+                "--pack-url-file=u".to_owned(),
+                format!("--grant-token={SECRET_TOKEN}"),
+            ],
+            vec![
+                format!("--pack-url={SECRET_URL}"),
+                format!("--grant-token={SECRET_TOKEN}"),
+            ],
+        ] {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let flags = with_secrets(&refs).expect("clap accepts it; the startup check refuses");
+            let Err(failure) = check_argv_secrets(&flags) else {
+                panic!("accepted without --insecure-argv-secrets");
+            };
+            assert_eq!(failure.exit_code(), EXIT_SETUP);
+            let text = failure.to_string();
+            assert!(text.contains("--insecure-argv-secrets"), "{text}");
+            assert!(!text.contains("very-secret"), "{text}");
+            assert!(matches!(connect(&flags), Err(Failure::Setup(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn main_with_refuses_a_credential_flag_without_the_opt_in() {
+        let flags = with_secrets(&[&format!("--pack-url={SECRET_URL}"), "--grant-token-file=t"])
+            .expect("flags");
+        assert_eq!(main_with(&flags).await, ExitCode::from(EXIT_SETUP));
+    }
+
+    /// With the opt-in both flag values are used, and no file is needed or touched.
+    #[test]
+    fn credential_flags_work_with_the_insecure_opt_in() {
+        let flags = with_secrets(&[
+            "--insecure-argv-secrets",
+            &format!("--pack-url={SECRET_URL}"),
+            &format!("--grant-token={SECRET_TOKEN}"),
+        ])
+        .expect("flags");
+        assert!(flags.insecure_argv_secrets);
+        check_argv_secrets(&flags).expect("allowed");
+        assert!(connect(&flags).is_ok());
+        // The opt-in alone, with the file forms, changes nothing.
+        let files = with_secrets(&[
+            "--insecure-argv-secrets",
+            "--pack-url-file=u",
+            "--grant-token-file=t",
+        ])
+        .expect("flags");
+        check_argv_secrets(&files).expect("nothing to refuse");
+    }
+
+    /// An empty or absent flag value is a setup failure that names the flag, not the value.
+    #[test]
+    fn empty_credential_flag_values_are_refused() {
+        let mut flags = with_secrets(&[
+            "--insecure-argv-secrets",
+            &format!("--pack-url={SECRET_URL}"),
+            "--grant-token=",
+        ])
+        .expect("flags");
+        let Err(failure) = connect(&flags) else {
+            panic!("an empty token was accepted");
+        };
+        assert!(
+            failure.to_string().contains("grant token flag is empty"),
+            "{failure}"
+        );
+        flags.grant_token = Some(SECRET_TOKEN.to_owned());
+        flags.pack_url = Some("\n".to_owned());
+        assert!(matches!(connect(&flags), Err(Failure::Setup(_))));
+        flags.pack_url = None;
+        let Err(failure) = connect(&flags) else {
+            panic!("no URL was accepted");
+        };
+        assert!(failure.to_string().contains("no pack URL"), "{failure}");
+    }
+
+    /// Each credential has exactly one source: both or neither is a usage error, and the
+    /// error text does not echo a value.
+    #[test]
+    fn each_credential_has_exactly_one_source() {
+        let both_url = [
+            "--insecure-argv-secrets",
+            "--pack-url-file=u",
+            "--pack-url=https://store.example/pack?X-Sig=very-secret",
+            "--grant-token-file=t",
+        ];
+        let both_token = [
+            "--insecure-argv-secrets",
+            "--pack-url-file=u",
+            "--grant-token-file=t",
+            "--grant-token=very-secret-token",
+        ];
+        let no_url = ["--grant-token-file=t"];
+        let no_token = ["--pack-url-file=u"];
+        for args in [&both_url[..], &both_token[..], &no_url[..], &no_token[..]] {
+            let Err(err) = with_secrets(args) else {
+                panic!("accepted {args:?}");
+            };
+            assert_eq!(err.exit_code(), 2);
+            assert!(!err.to_string().contains("very-secret"), "{err}");
+        }
+        with_secrets(&["--pack-url-file=u", "--grant-token-file=t"]).expect("one each");
+    }
+
+    /// The values do not appear in a setup error raised after they were read.
+    #[test]
+    fn credential_values_are_not_in_a_setup_error() {
+        let dir = scratch("secret-text");
+        let flags = with_secrets(&[
+            "--insecure-argv-secrets",
+            &format!("--pack-url={SECRET_URL}"),
+            &format!("--grant-token={SECRET_TOKEN}"),
+            &format!("--root-der={}", dir.join("absent.der").display()),
+        ])
+        .expect("flags");
+        let Err(failure) = connect(&flags) else {
+            panic!("a missing root was accepted");
+        };
+        let text = failure.to_string();
+        assert!(!text.contains("very-secret"), "{text}");
     }
 
     #[test]
@@ -759,25 +965,26 @@ mod tests {
         // No token file.
         assert!(matches!(connect(&flags), Err(Failure::Setup(_))));
         // An empty one.
-        flags.grant_token_file = dir.join("token");
-        std::fs::write(&flags.grant_token_file, "\n").expect("write");
+        flags.grant_token_file = Some(dir.join("token"));
+        std::fs::write(dir.join("token"), "\n").expect("write");
         assert!(matches!(connect(&flags), Err(Failure::Setup(_))));
         // A token, and a root file that is missing.
-        std::fs::write(&flags.grant_token_file, "tok\n").expect("write");
+        std::fs::write(dir.join("token"), "tok\n").expect("write");
         flags.root_der = vec![dir.join("absent.der")];
         assert!(matches!(connect(&flags), Err(Failure::Setup(_))));
         // Both usable, but the URL file is missing.
         std::fs::write(dir.join("root.der"), [1, 2, 3]).expect("write");
         flags.root_der = vec![dir.join("root.der")];
-        flags.pack_url_file = dir.join("url");
+        let url_file = dir.join("url");
+        flags.pack_url_file = Some(url_file.clone());
         assert!(matches!(connect(&flags), Err(Failure::Setup(_))));
         // An empty one.
-        std::fs::write(&flags.pack_url_file, "\n").expect("write");
+        std::fs::write(&url_file, "\n").expect("write");
         assert!(matches!(connect(&flags), Err(Failure::Setup(_))));
         // A URL: it is read, and the file is gone before the Command could read it.
-        std::fs::write(&flags.pack_url_file, "https://store.example/pack?sig=s\n").expect("write");
+        std::fs::write(&url_file, "https://store.example/pack?sig=s\n").expect("write");
         assert!(connect(&flags).is_ok());
-        assert!(!flags.pack_url_file.exists());
+        assert!(!url_file.exists());
     }
 
     #[test]
@@ -787,10 +994,10 @@ mod tests {
         let held = dir.join("held");
         std::fs::create_dir(&held).expect("dir");
         let mut flags = cli(&dir, Digest::from(BlobId::of(b"a")));
-        flags.grant_token_file = dir.join("token");
-        std::fs::write(&flags.grant_token_file, "tok\n").expect("write");
-        flags.pack_url_file = held.join("url");
-        std::fs::write(&flags.pack_url_file, "https://store.example/pack?sig=s").expect("write");
+        flags.grant_token_file = Some(dir.join("token"));
+        std::fs::write(dir.join("token"), "tok\n").expect("write");
+        flags.pack_url_file = Some(held.join("url"));
+        std::fs::write(held.join("url"), "https://store.example/pack?sig=s").expect("write");
         std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o500)).expect("mode");
         // A superuser removes it anyway; the refusal is checked where the mode is enforced.
         let enforced = std::fs::write(held.join("probe"), b"").is_err();
