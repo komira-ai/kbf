@@ -72,7 +72,11 @@ mod linux {
                 println!("layers={}", ran.layers);
                 println!("exit={}", ran.exit_code);
             }
-            Err(e) => println!("error={e}"),
+            Err(e) => {
+                println!("error={e}");
+                // The exit code the tool gives a run that fails this way.
+                println!("code={}", kbf_task::task::Failure::from(e).exit_code());
+            }
         }
         ExitCode::SUCCESS
     }

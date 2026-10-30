@@ -8,7 +8,8 @@
 //! `child <mode>`: the same, in a copy of this program that this one starts and waits for, to
 //! show that a descendant has the same limits. Other modes: `touch <path>` makes a file (to show
 //! the program ran), `ifaces` prints the network interfaces it sees, `ids` prints its user and
-//! group id, `int80` (`x86_64`) makes a 32-bit system call, `steal <pid> <fd>` takes a
+//! group id, `tcp-loopback` (listen on 127.0.0.1, connect, accept: exit 0 or the errno) and
+//! `tcp-outside` (connect to an address outside any local network: the errno), `int80` (`x86_64`) makes a 32-bit system call, `steal <pid> <fd>` takes a
 //! descriptor out of another process with `pidfd_getfd` (exit 0 if it worked, else the errno),
 //! and `hidden <pid>` exits 0 when `/proc/<pid>/status` is not owned by its own user, which is what a
 //! non-dumpable process looks like.
@@ -34,6 +35,8 @@ fn probe(args: &[&str]) -> u8 {
         ["unix"] => socket(libc::AF_UNIX),
         ["touch", path] => u8::from(std::fs::File::create(path).is_err()),
         ["ifaces"] => ifaces(),
+        ["tcp-loopback"] => tcp_loopback(),
+        ["tcp-outside"] => tcp_outside(),
         ["ids"] => ids(),
         ["hidden", pid] => hidden(pid),
         #[cfg(target_arch = "x86_64")]
@@ -174,4 +177,28 @@ fn int80() -> u8 {
     }
     // A result in -4095..0 is an error number (negated).
     u8::from(result > u64::MAX - 4095)
+}
+
+fn errno_of(e: &std::io::Error) -> u8 {
+    u8::try_from(e.raw_os_error().unwrap_or(0)).unwrap_or(UNKNOWN_MODE)
+}
+
+fn tcp_loopback() -> u8 {
+    let run = || -> std::io::Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let client = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (_server, _) = listener.accept()?;
+        drop(client);
+        Ok(())
+    };
+    run().map_or_else(|e| errno_of(&e), |()| 0)
+}
+
+fn tcp_outside() -> u8 {
+    // An address of the documentation range (RFC 5737): no route to it exists in an empty
+    // namespace, so the connect fails at once with `ENETUNREACH`.
+    match std::net::TcpStream::connect("192.0.2.1:9") {
+        Ok(_) => 0,
+        Err(e) => errno_of(&e),
+    }
 }

@@ -8,7 +8,7 @@
 //!
 //! | call | refused with `EPERM` |
 //! |------|----------------------|
-//! | `socket`, `socketpair` | unless the domain is `AF_UNIX`. Every other domain is refused, not only `AF_INET` and `AF_INET6`: `AF_NETLINK` (interface and routing queries), `AF_PACKET`, `AF_VSOCK`, `AF_BLUETOOTH`, `AF_XDP` and the rest, so a protocol family added later is refused too |
+//! | `socket`, `socketpair` | unless the domain is `AF_UNIX` (or, in a namespace of the Command's own, `AF_INET` or `AF_INET6`, see below). Every other domain is refused, not only `AF_INET` and `AF_INET6`: `AF_NETLINK` (interface and routing queries), `AF_PACKET`, `AF_VSOCK`, `AF_BLUETOOTH`, `AF_XDP` and the rest, so a protocol family added later is refused too |
 //! | `io_uring_setup`, `io_uring_enter`, `io_uring_register` | always: `IORING_OP_SOCKET` makes a socket without the `socket` call, so a ring would step round the rule above |
 //!
 //! `AF_UNIX` stays open (a build tool's own local sockets, `socketpair` for a pipe-like pair).
@@ -34,20 +34,34 @@
 //!
 //! # The second layer: a network namespace
 //!
-//! Before the filter, the child also gives itself a user and network namespace of its own with
-//! the same user and group id inside as outside, and raises `lo` in it (`netns`, below). The
-//! Command then has a namespace with one interface and no route, so a socket it was handed (or
-//! made by a call the filter does not know) reaches nothing. It is defence in depth, not the
-//! guarantee: a host that restricts unprivileged user namespaces (on Ubuntu, the AppArmor
-//! setting `apparmor_restrict_unprivileged_userns`, which leaves a namespace without
-//! capabilities) makes a step fail, and the Command then runs under the filter alone. The
-//! tool says which, once per run, in [`layers_notice`]: `kbf-task: action <digest>: network:
-//! seccomp+netns`, or `seccomp only (netns: <step> <errno>)`, the step one of `unshare`,
-//! `setgroups`, `uid_map`, `gid_map`, `loopback`. The child reports it on a pipe it writes
-//! just before the `exec`.
+//! Before the filter, the child gives itself a user and network namespace of its own with the
+//! same user and group id inside as outside, and raises `lo` in it (`netns`, below). The
+//! Command then has a namespace with one interface and no route. Which filter follows depends
+//! on whether every one of those steps succeeded:
 //!
-//! Because the filter refuses `AF_INET` sockets whatever namespace the Command is in, the
-//! loopback interface is up but not usable by the Command.
+//! - **All succeeded** (`netns (loopback only) + seccomp`): the filter also lets `AF_INET` and
+//!   `AF_INET6` sockets be made, so the Command can use `127.0.0.1` (a test that starts a server
+//!   and connects to it). Nothing leaves the namespace; a connect to any other address fails
+//!   with `ENETUNREACH`. `AF_NETLINK`, `AF_PACKET`, every other non-Unix domain and io_uring
+//!   stay refused, and the architecture rules are the same.
+//! - **Any step failed** (`seccomp only, no inet (netns: <step> <errno>)`): the strict filter
+//!   alone, which refuses `AF_INET` and `AF_INET6` as well. A host that restricts unprivileged
+//!   user namespaces (on Ubuntu, `apparmor_restrict_unprivileged_userns`, which leaves a
+//!   namespace without capabilities unless the container's profile allows `userns`) takes this
+//!   path. The step is `unshare`, `setgroups`, `uid_map`, `gid_map` or `loopback`. A step that
+//!   fails does not fail the run.
+//!
+//! A Command that runs as root (effective uid 0) gets no namespace: one that maps only its own
+//! id would make `chown` to another user, `setuid`, `setgid` and `setgroups` fail for it, and
+//! `tar`, `dpkg` and `apt` do those. It runs under the strict filter, and the line says
+//! `seccomp only, no inet (netns: skipped for uid 0)`. Between the writes to its own `/proc`
+//! files and its `exec` the child is non-dumpable again.
+//!
+//! Both filters are built before the fork; the child picks one after the steps. It reports the
+//! outcome on a pipe it writes just before the `exec`, and the tool writes one line per run
+//! ([`layers_notice`]): `kbf-task: action <digest>: network: netns (loopback only) + seccomp`,
+//! `network: seccomp only, no inet (netns: <step> <errno>)` or `network: open
+//! (kbf-network=allow)`.
 //!
 //! # What it does not do
 //!
@@ -142,10 +156,14 @@ pub enum Layers {
     Open,
     /// This system has neither layer (not Linux).
     Unavailable,
-    /// The seccomp filter and a network namespace of the Command's own, in which only `lo` exists.
+    /// The strict filter alone, because the Command runs as root: a namespace with a map of one
+    /// id would make `chown`, `setuid` and `setgroups` fail for it (`tar`, `dpkg`), so none is made.
+    SeccompOnlyForRoot,
+    /// A network namespace of the Command's own, in which only `lo` exists, and the filter that
+    /// lets `AF_INET` and `AF_INET6` sockets be made (they reach `lo`).
     SeccompAndNetns,
-    /// The seccomp filter alone: a step of the namespace layer failed, which is not a failure of
-    /// the run, because the filter is the guarantee.
+    /// The strict seccomp filter alone, which refuses every `AF_INET` and `AF_INET6` socket: a
+    /// step of the namespace layer failed, which is not a failure of the run.
     SeccompOnly {
         /// The step: `unshare`, `setgroups`, `uid_map`, `gid_map`, `loopback`, or `report` (the
         /// child did not say).
@@ -160,9 +178,12 @@ impl std::fmt::Display for Layers {
         match self {
             Layers::Open => write!(f, "open ({PROPERTY}={ALLOW})"),
             Layers::Unavailable => write!(f, "none (this system has no filter)"),
-            Layers::SeccompAndNetns => write!(f, "seccomp+netns"),
+            Layers::SeccompOnlyForRoot => {
+                write!(f, "seccomp only, no inet (netns: skipped for uid 0)")
+            }
+            Layers::SeccompAndNetns => write!(f, "netns (loopback only) + seccomp"),
             Layers::SeccompOnly { step, errno } => {
-                write!(f, "seccomp only (netns: {step} {errno})")
+                write!(f, "seccomp only, no inet (netns: {step} {errno})")
             }
         }
     }
@@ -249,7 +270,8 @@ fn deny_sockets(_process: &mut Process) -> Result<Confinement, RunError> {
 
 #[cfg(target_os = "linux")]
 fn deny_sockets(process: &mut Process) -> Result<Confinement, RunError> {
-    let filter = seccomp::filter();
+    let strict = seccomp::filter(false);
+    let in_netns = seccomp::filter(true);
     let (plan, report) = netns::plan().map_err(|source| RunError::Io {
         path: "the network report pipe".into(),
         source,
@@ -260,7 +282,10 @@ fn deny_sockets(process: &mut Process) -> Result<Confinement, RunError> {
     unsafe {
         process.pre_exec(move || {
             let outcome = plan.apply();
-            seccomp::install(&filter)?;
+            // The filter that lets `AF_INET` through is for a Command that is certainly in a
+            // namespace of its own: every step must have succeeded.
+            let succeeded = outcome == (netns::OK, 0);
+            seccomp::install(if succeeded { &in_netns } else { &strict })?;
             plan.tell(outcome);
             Ok(())
         });
@@ -290,8 +315,9 @@ mod netns {
 
     use super::Layers;
 
-    const OK: u8 = 0;
+    pub const OK: u8 = 0;
     /// The steps, in the order they run; the number is what the child writes.
+    const SKIPPED_FOR_ROOT: u8 = 6;
     const STEPS: [&str; 5] = ["unshare", "setgroups", "uid_map", "gid_map", "loopback"];
 
     /// What the child needs, made before the fork.
@@ -299,6 +325,7 @@ mod netns {
         setgroups: CString,
         uid_map: CString,
         gid_map: CString,
+        skip: bool,
         uid_line: Vec<u8>,
         gid_line: Vec<u8>,
         write_end: i32,
@@ -309,6 +336,13 @@ mod netns {
         read: OwnedFd,
         // Held so that the child's copy is the only one once the parent lets this go.
         write: OwnedFd,
+    }
+
+    /// Whether the namespace layer is left out for a Command run as `euid`: root, for which a
+    /// namespace that maps only its own id (`0 0 1`) breaks `chown` to another user, `setuid`,
+    /// `setgid` and `setgroups`, which `tar`, `dpkg` and `apt` do.
+    pub fn skips_namespace(euid: u32) -> bool {
+        euid == 0
     }
 
     pub fn plan() -> io::Result<(Plan, Report)> {
@@ -326,6 +360,7 @@ mod netns {
             setgroups: path("/proc/self/setgroups"),
             uid_map: path("/proc/self/uid_map"),
             gid_map: path("/proc/self/gid_map"),
+            skip: skips_namespace(uid),
             uid_line: format!("{uid} {uid} 1").into_bytes(),
             gid_line: format!("{gid} {gid} 1").into_bytes(),
             write_end: write.as_raw_fd(),
@@ -347,6 +382,7 @@ mod netns {
             }
             match said[0] {
                 OK => Layers::SeccompAndNetns,
+                SKIPPED_FOR_ROOT => Layers::SeccompOnlyForRoot,
                 n => Layers::SeccompOnly {
                     step: STEPS.get(usize::from(n) - 1).copied().unwrap_or("report"),
                     errno: i32::from(said[1]),
@@ -359,6 +395,17 @@ mod netns {
         /// Runs the steps in the child; returns the step that failed (1-based) and its errno, or
         /// `(OK, 0)`. Only system calls on memory made before the fork.
         pub fn apply(&self) -> (u8, u8) {
+            if self.skip {
+                return (SKIPPED_FOR_ROOT, 0);
+            }
+            let outcome = self.steps();
+            // Whatever happened, the child is not dumpable from here to its `exec`.
+            // SAFETY: prctl with integer arguments only.
+            unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+            outcome
+        }
+
+        fn steps(&self) -> (u8, u8) {
             // The child is a copy of a process that made itself non-dumpable
             // (`protect_this_process`), which makes its `/proc/self` files root's. It is only
             // the child that becomes dumpable.
@@ -377,6 +424,9 @@ mod netns {
                     return (step, e);
                 }
             }
+            // The `/proc/self` writes are done: back to non-dumpable before anything else runs.
+            // SAFETY: prctl with integer arguments only.
+            unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
             match raise_loopback() {
                 Ok(()) => (OK, 0),
                 Err(e) => (5, e),
@@ -461,6 +511,8 @@ mod seccomp {
     #[cfg(target_arch = "x86_64")]
     const X32_BIT: u32 = 0x4000_0000;
     const AF_UNIX: u32 = 1;
+    const AF_INET: u32 = 2;
+    const AF_INET6: u32 = 10;
 
     const LOAD: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
     const JEQ: u16 = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
@@ -487,7 +539,10 @@ mod seccomp {
     }
 
     /// The classic BPF program (see the module documentation of `network` for the rule).
-    pub fn filter() -> Vec<sock_filter> {
+    ///
+    /// `inet` adds `AF_INET` and `AF_INET6` to the domains a socket may be made in: only for a
+    /// Command in a network namespace of its own, where they reach `lo` and nothing else.
+    pub fn filter(inet: bool) -> Vec<sock_filter> {
         // (code, k, jump if equal, jump otherwise)
         let mut main: Vec<(u16, u32, To, To)> = vec![
             (LOAD, OFFSET_ARCH, To::Next, To::Next),
@@ -507,20 +562,28 @@ mod seccomp {
         let n = main.len();
         // After `main`: the domain test, then the three verdicts it and `main` jump to. A BPF
         // jump goes forward only, so the verdicts follow every jump to them.
-        let tail = [
+        let mut tail = vec![
             (LOAD, OFFSET_ARG0, To::Next, To::Next),
-            (JEQ, AF_UNIX, To::Allow, To::Deny),
-            (RET, ALLOW, To::Next, To::Next),
-            (RET, DENY, To::Next, To::Next),
-            (RET, KILL, To::Next, To::Next),
+            (JEQ, AF_UNIX, To::Allow, To::Next),
         ];
+        if inet {
+            tail.push((JEQ, AF_INET, To::Allow, To::Next));
+            tail.push((JEQ, AF_INET6, To::Allow, To::Next));
+        }
+        // The last test falls through to the refusal.
+        tail.extend([
+            (RET, DENY, To::Next, To::Next),
+            (RET, ALLOW, To::Next, To::Next),
+            (RET, KILL, To::Next, To::Next),
+        ]);
+        let deny = n + tail.len() - 3;
         let index = |to: To, from: usize| -> u8 {
             let at = match to {
                 To::Next => from + 1,
-                To::Allow => n + 2,
+                To::Allow => deny + 1,
                 To::Domain => n,
-                To::Deny => n + 3,
-                To::Kill => n + 4,
+                To::Deny => deny,
+                To::Kill => deny + 2,
             };
             u8::try_from(at - (from + 1)).expect("a short jump")
         };

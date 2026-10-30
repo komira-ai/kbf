@@ -322,30 +322,83 @@ async fn a_32_bit_system_call_kills_the_process_unless_the_network_is_allowed() 
     );
 }
 
-/// Catches: the network namespace layer leaving the Command a host interface, or changing the
-/// user it runs as (which would change who owns what it writes). Where the host does not let an
-/// unprivileged user namespace keep its capabilities (AppArmor's
-/// `apparmor_restrict_unprivileged_userns`), the layer reports the step that failed and this
-/// case checks that report instead.
-#[tokio::test]
-async fn the_command_has_a_namespace_of_its_own_with_loopback_only_and_its_own_ids() {
+const ENETUNREACH: i32 = 101;
+
+/// What a Command sees when the namespace layer is active: only `lo`, its own ids, loopback TCP
+/// that works, no route anywhere else, and netlink and io_uring still refused.
+async fn assert_namespace_layer() {
     let (ran, out) = probe_run("netns-ifaces", Network::Denied, &["ifaces"]).await;
+    assert_eq!(ran.layers, Layers::SeccompAndNetns);
+    assert_eq!(out.lines().collect::<Vec<_>>(), ["lo"], "{out:?}");
     let (_, ids) = probe_run("netns-ids", Network::Denied, &["ids"]).await;
     // SAFETY: no arguments.
     let own = format!("{} {}\n", unsafe { libc::getuid() }, unsafe {
         libc::getgid()
     });
+    assert_eq!(ids, own);
+    assert_eq!(
+        probe_exit("netns-lo", Network::Denied, &["tcp-loopback"]).await,
+        0
+    );
+    assert_eq!(
+        probe_exit("netns-inet", Network::Denied, &["inet"]).await,
+        0
+    );
+    assert_eq!(
+        probe_exit("netns-out", Network::Denied, &["tcp-outside"]).await,
+        ENETUNREACH
+    );
+    for mode in ["netlink", "packet", "uring"] {
+        assert_eq!(
+            probe_exit("netns-no", Network::Denied, &[mode]).await,
+            EPERM,
+            "{mode}"
+        );
+    }
+    assert_eq!(
+        probe_exit("netns-child", Network::Denied, &["child", "tcp-outside"]).await,
+        ENETUNREACH
+    );
+}
+
+/// Catches: the namespace layer leaving the Command a host interface, changing the user it runs
+/// as, or opening more than loopback. Where the host does not let an unprivileged user namespace
+/// keep its capabilities (AppArmor's `apparmor_restrict_unprivileged_userns`) the layer reports
+/// the step that failed and the strict filter applies: this case then checks that, and says it
+/// skipped the rest. `netns_layer_is_active_strict` is the case that fails instead.
+#[tokio::test]
+async fn the_command_has_a_namespace_of_its_own_where_the_host_allows_one() {
+    let (ran, _) = probe_run("netns-probe", Network::Denied, &["unix"]).await;
     match ran.layers {
-        Layers::SeccompAndNetns => {
-            assert_eq!(out.lines().collect::<Vec<_>>(), ["lo"], "{out:?}");
-            assert_eq!(ids, own);
+        Layers::SeccompAndNetns => assert_namespace_layer().await,
+        Layers::SeccompOnlyForRoot => {
+            eprintln!("skipped: the Command runs as root, which gets no namespace")
         }
         Layers::SeccompOnly { step, errno } => {
             eprintln!("skipped: this host refuses the namespace layer ({step} {errno})");
             assert_ne!(errno, 0);
+            // The strict filter applies, with no inet at all.
+            for mode in ["inet", "inet6", "tcp-loopback"] {
+                assert_ne!(
+                    probe_exit("netns-failed", Network::Denied, &[mode]).await,
+                    0,
+                    "{mode}"
+                );
+            }
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// The same checks, failing when the layer is not active. Run it where the namespace is
+/// expected (a host or container that lets an unprivileged user namespace keep its
+/// capabilities):
+///
+/// `cargo test -p kbf-task --test network -- --ignored netns_layer_is_active_strict`
+#[tokio::test]
+#[ignore = "needs a host that allows unprivileged user namespaces; run with --ignored"]
+async fn netns_layer_is_active_strict() {
+    assert_namespace_layer().await;
 }
 
 /// Catches: the layers not being named for a run, in either direction.
@@ -354,7 +407,8 @@ async fn the_run_says_which_layers_confined_it() {
     let (ran, _) = probe_run("layers-denied", Network::Denied, &["unix"]).await;
     let line = ran.layers.to_string();
     assert!(
-        line == "seccomp+netns" || line.starts_with("seccomp only (netns: "),
+        line == "netns (loopback only) + seccomp"
+            || line.starts_with("seccomp only, no inet (netns: "),
         "{line}"
     );
     let (ran, _) = probe_run("layers-open", Network::Allowed, &["unix"]).await;
@@ -396,9 +450,8 @@ async fn a_filter_that_cannot_be_installed_fails_the_run_and_the_command_never_r
     assert!(text.starts_with("error=cannot start "), "{text}");
     assert!(!text.contains("exit="), "{text}");
     assert!(!marker.exists(), "the Command ran");
-    // The same run maps to the run-start exit code.
-    let failure = Failure::Run(kbf_task::run::RunError::Invalid(text));
-    assert_eq!(failure.exit_code(), EXIT_RUN);
+    // The error the run returned is a failure to start, which the tool exits 11 for.
+    assert!(text.ends_with(&format!("code={EXIT_RUN}\n")), "{text}");
 }
 
 /// Catches: a namespace step that fails failing the run, or the Command then running without the
@@ -415,15 +468,30 @@ async fn a_namespace_that_cannot_be_made_leaves_the_filter_and_says_so() {
         &["touch", marker.to_str().expect("utf-8")],
     )
     .await;
-    assert_eq!(text, "layers=seccomp only (netns: unshare 1)\nexit=0\n");
+    assert_eq!(
+        text,
+        "layers=seccomp only, no inet (netns: unshare 1)\nexit=0\n"
+    );
     assert!(marker.exists());
-    let (_, text) = under("unshare-inet", "unshare", "no", &["inet"]).await;
-    assert_eq!(text, "layers=seccomp only (netns: unshare 1)\nexit=1\n");
+    for (n, mode) in ["inet", "inet6", "tcp-loopback", "netlink"]
+        .into_iter()
+        .enumerate()
+    {
+        let (_, text) = under(&format!("unshare-inet{n}"), "unshare", "no", &[mode]).await;
+        assert!(
+            text.contains("netns: unshare 1)\n") && text.contains("exit=1\n"),
+            "{mode}: {text}"
+        );
+    }
 }
 
 /// Catches: the tool being open to the Command that runs beside it as the same user: the process
 /// that starts the Command, once made non-dumpable, shows root-owned in `/proc` and refuses
 /// `pidfd_getfd` of the socket it holds. Without it the process is visible as the user's.
+/// The `hidden` check (ownership of `/proc/<ppid>/status`, which the kernel makes root's for a
+/// non-dumpable process) is the primary assertion and fails without protection. The `steal`
+/// check is kept as a second view, but where Yama's `ptrace_scope` is 1 it passes even without
+/// protection, because a descendant may not trace its ancestor anyway.
 #[tokio::test]
 async fn the_tool_is_non_dumpable_so_the_command_cannot_take_its_sockets() {
     let (_, text) = under("protect-hidden", "unshare", "yes", &["hidden", "{PID}"]).await;
@@ -438,4 +506,59 @@ async fn the_tool_is_non_dumpable_so_the_command_cannot_take_its_sockets() {
     assert!(text.ends_with("exit=1\n"), "{text}");
     let (_, text) = under("unprotected-hidden", "unshare", "no", &["hidden", "{PID}"]).await;
     assert!(text.ends_with("exit=1\n"), "{text}");
+}
+
+/// Catches: `main` not making the tool non-dumpable before it does anything else (the Command it
+/// starts runs as the same user and could otherwise take its sockets). The real binary is
+/// started with a credential file that is a FIFO, so it stops at the first read of it, which
+/// is after `main`'s first instruction; opening the FIFO for writing returns exactly then. Its
+/// `/proc/<pid>/status` is then root's, not ours. As root that comparison says nothing, so the
+/// case ends there.
+#[test]
+fn the_binary_makes_itself_non_dumpable_before_reading_anything() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    // SAFETY: no arguments.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: running as root, whose files look the same either way");
+        return;
+    }
+    let dir = scratch("binary-dumpable");
+    let fifo = dir.join("token");
+    let path = std::ffi::CString::new(fifo.to_str().expect("utf-8")).expect("no NUL");
+    // SAFETY: `path` is NUL-terminated.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kbf-task"))
+        .args([
+            "--pack-url-file",
+            "/nonexistent-url",
+            "--grant-url",
+            "https://grant.example",
+            "--grant-token-file",
+        ])
+        .arg(&fifo)
+        .args([
+            "--lease",
+            "lease-1",
+            "--action",
+            &format!("{}/0", "0".repeat(64)),
+            "--work-dir",
+        ])
+        .arg(dir.join("work"))
+        .spawn()
+        .expect("kbf-task starts");
+    // Returns when the binary opens the FIFO to read the token.
+    let writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fifo)
+        .expect("the binary reads the token file");
+    let owner = std::fs::metadata(format!("/proc/{}/status", child.id()))
+        .expect("status")
+        .uid();
+    drop(writer);
+    let status = child.wait().expect("exit");
+    // SAFETY: no arguments.
+    assert_ne!(owner, unsafe { libc::geteuid() }, "the binary is dumpable");
+    // The empty token is a setup failure.
+    assert_eq!(status.code(), Some(14));
 }

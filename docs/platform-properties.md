@@ -428,23 +428,35 @@ property given twice is refused: the action fails without running and `kbf-task`
 (run-start). The name is read in any case. Like every platform property it is part of the
 action digest, so the same action with and without it are two cache entries.
 
-Two layers keep the Command off the network. The seccomp filter above is the guarantee. Under
-it, the Command also gets a user and network namespace of its own, with its own user and group
-id inside (`unshare` of `CLONE_NEWUSER|CLONE_NEWNET`, a map of its own ids to themselves, `lo`
-raised), so it sees one interface, `lo`, and has no route. The namespace layer is defence in
-depth: it needs the host to let an unprivileged user namespace keep its capabilities. Where an
-AppArmor setting restricts that (Ubuntu's `apparmor_restrict_unprivileged_userns`, which a
-container profile that allows `userns` lifts) a step fails with `EPERM`, the run goes on under
-the filter alone, and a Command whose maps could not be written sees itself as the overflow
-user (65534). `kbf-task` writes one line per run to standard error:
+Two layers keep the Command off the network. First, the Command gets a user and network
+namespace of its own, with its own user and group id inside (`unshare` of
+`CLONE_NEWUSER|CLONE_NEWNET`, a map of its own ids to themselves, `lo` raised): it sees one
+interface, `lo`, and has no route anywhere else. Then the seccomp filter goes in. Which filter
+depends on whether every namespace step succeeded:
+
+| every namespace step succeeded | the filter lets the Command make |
+|---|---|
+| yes | `AF_UNIX`, `AF_INET` and `AF_INET6` sockets: `127.0.0.1` works (a test can start a server and connect to it); a connect to any other address fails with `ENETUNREACH`. `AF_NETLINK`, `AF_PACKET`, every other domain and io_uring are refused |
+| no | `AF_UNIX` sockets only: every `AF_INET` and `AF_INET6` socket is refused with `EPERM`, as are all the others above |
+
+The namespace needs the host to let an unprivileged user namespace keep its capabilities.
+Where an AppArmor setting restricts that (Ubuntu's `apparmor_restrict_unprivileged_userns`,
+which a container profile that allows `userns` lifts) a step fails with `EPERM`; the run goes
+on under the strict filter, and a Command whose maps could not be written sees itself as the
+overflow user (65534). `kbf-task` writes one line per action to standard error saying which
+mode it ran in:
 
 ```
-kbf-task: action <digest>: network: seccomp+netns
-kbf-task: action <digest>: network: seccomp only (netns: <step> <errno>)
+kbf-task: action <digest>: network: netns (loopback only) + seccomp
+kbf-task: action <digest>: network: seccomp only, no inet (netns: <step> <errno>)
+kbf-task: action <digest>: platform property kbf-network=allow: the Command runs with the network
 ```
 
-where the step is `unshare`, `setgroups`, `uid_map`, `gid_map` or `loopback`. The filter
-refuses `AF_INET` sockets in either case, so `lo` is up and not usable by the Command.
+where the step is `unshare`, `setgroups`, `uid_map`, `gid_map` or `loopback`. A Command that
+runs as root (uid 0) gets no namespace, because a namespace that maps only its own id would
+make `chown` to another user, `setuid` and `setgroups` fail for it (`tar`, `dpkg`, `apt`); it
+runs under the strict filter, and the line says `network: seccomp only, no inet (netns:
+skipped for uid 0)`.
 `kbf-task` also makes itself non-dumpable (`PR_SET_DUMPABLE` 0) before it opens a socket, so
 the Command, which runs as the same user, cannot `ptrace` it, take its sockets with
 `pidfd_getfd` or read its memory through `/proc`. This property does not reach the Mac driver, which has its own
