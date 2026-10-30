@@ -10,21 +10,32 @@
 
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream;
-use kbf_objstore::{ByteRange, ObjectKey};
+use kbf_objstore::{ByteRange, ObjectKey, ObjectStoreError};
 use kbf_segments::RecordHasher;
 use kbf_storage::PieceStream;
 use kbf_types::Digest;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use super::task::{RejectReason, Step, Stop, unavailable};
 use super::{IssuedPackKey, Packs};
 use crate::backend::Backend;
+use crate::proxy::packed::LargeWriteThrough;
 
 /// The most bytes of a large object read from the object store at once.
 pub(super) const WINDOW_BYTES: u64 = 8 << 20;
+
+/// How long the write-through may leave a window unaccepted before it is given up on: the CAS
+/// write is not held up longer than this by the object store the copy goes to.
+const COPY_STALL: Duration = Duration::from_secs(30);
+
+/// A window of the copy to the object store, or the reason the copy must not be completed.
+type CopyPiece = Result<Bytes, ObjectStoreError>;
 
 /// How a pass over the object ended.
 enum Ended {
@@ -39,6 +50,8 @@ enum Ended {
 struct Pass {
     hasher: RecordHasher,
     ended: Option<Ended>,
+    /// The write-through of this pass to the object store.
+    wrote: Option<JoinHandle<()>>,
 }
 
 fn locked(pass: &Mutex<Pass>) -> MutexGuard<'_, Pass> {
@@ -90,6 +103,11 @@ impl<'a> Large<'a> {
     pub(super) async fn store(&self, backend: &Backend) -> Step<()> {
         let open = || self.open();
         let stored = backend.put_streamed(&self.digest, &open).await;
+        let wrote = locked(&self.pass).wrote.take();
+        if let Some(wrote) = wrote {
+            // The copy ends with the stream it was fed from; its result is counted by its task.
+            let _ = wrote.await;
+        }
         let ended = locked(&self.pass).ended.take();
         match (ended, stored) {
             (Some(Ended::Read(actual)), stored) if actual == self.digest => {
@@ -106,15 +124,52 @@ impl<'a> Large<'a> {
 
     /// The pieces of the object from its first byte. Starts the pass over.
     fn open(&self) -> PieceStream {
-        *locked(&self.pass) = Pass::default();
+        let (tee, wrote) = self.copy().unzip();
+        *locked(&self.pass) = Pass {
+            wrote,
+            ..Pass::default()
+        };
         let reading = Reading {
             packs: self.packs.clone(),
             object: self.object.clone(),
-            size: self.digest.size_bytes,
+            digest: self.digest,
             at: 0,
             pass: Arc::clone(&self.pass),
+            tee,
         };
         stream::try_unfold(reading, Reading::step).boxed()
+    }
+
+    /// Starts the write of the object to `cas/l/<sha256 hex>`: the sender of the windows it is to
+    /// write and the task that writes them. The task counts how the write ended.
+    fn copy(&self) -> Option<(mpsc::Sender<CopyPiece>, JoinHandle<()>)> {
+        let hex: String = self
+            .digest
+            .hash
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let key = ObjectKey::new(format!("cas/l/{hex}")).ok()?;
+        let (send, windows) = mpsc::channel::<CopyPiece>(1);
+        let body = stream::unfold(windows, |mut windows| async move {
+            windows.recv().await.map(|piece| (piece, windows))
+        })
+        .boxed();
+        let store = Arc::clone(&self.packs.store);
+        let metrics = Arc::clone(&self.packs.metrics);
+        let size = self.digest.size_bytes;
+        let task = tokio::spawn(async move {
+            let how = match store.put_stream(&key, size, body).await {
+                Ok(()) => LargeWriteThrough::Ok,
+                Err(ObjectStoreError::AlreadyExists(_)) => LargeWriteThrough::Exists,
+                Err(error) => {
+                    tracing::warn!(%key, %error, "the write-through of a large object failed");
+                    LargeWriteThrough::Failed
+                }
+            };
+            metrics.ingest_large_writethrough[how as usize].add(1);
+        });
+        Some((send, task))
     }
 }
 
@@ -122,26 +177,37 @@ impl<'a> Large<'a> {
 struct Reading {
     packs: Packs,
     object: ObjectKey,
-    size: u64,
+    digest: Digest,
     at: u64,
     pass: Arc<Mutex<Pass>>,
+    /// The windows of the write-through, until it is given up on or ends.
+    tee: Option<mpsc::Sender<CopyPiece>>,
 }
 
 impl Reading {
     /// The next window, or the end of the object (which says what its bytes hash to).
     async fn step(mut self) -> io::Result<Option<(Bytes, Self)>> {
-        if self.at == self.size {
-            let mut pass = locked(&self.pass);
-            let (seen, _) = std::mem::take(&mut pass.hasher).finish();
-            pass.ended = Some(Ended::Read(seen));
+        let size = self.digest.size_bytes;
+        if self.at == size {
+            let seen = {
+                let mut pass = locked(&self.pass);
+                let (seen, _) = std::mem::take(&mut pass.hasher).finish();
+                pass.ended = Some(Ended::Read(seen));
+                seen
+            };
+            if let Some(tee) = self.tee.take().filter(|_| seen != self.digest) {
+                let refused = ObjectStoreError::Body("the bytes are not the blob".to_owned());
+                let _ = tee.send(Err(refused)).await;
+            }
             return Ok(None);
         }
-        let want = WINDOW_BYTES.min(self.size - self.at);
+        let want = WINDOW_BYTES.min(size - self.at);
         let range = ByteRange::new(self.at, want).expect("a window has bytes");
         match self.packs.fetch(&self.object, range).await {
             Ok(bytes) if bytes.len() as u64 == want => {
                 locked(&self.pass).hasher.update(&bytes);
                 self.at += want;
+                self.copy(&bytes).await;
                 Ok(Some((bytes, self)))
             }
             Ok(_) => Err(self.stopped(
@@ -152,6 +218,16 @@ impl Reading {
                 let stop = Stop::from(error).absent_is_incomplete();
                 Err(self.stopped(stop, "reading the object failed"))
             }
+        }
+    }
+
+    /// Hands `window` to the write-through, which is dropped (and its write ends short, so the
+    /// store keeps nothing) if it has ended or does not take the window in time.
+    async fn copy(&mut self, window: &Bytes) {
+        let Some(tee) = &self.tee else { return };
+        let sent = tokio::time::timeout(COPY_STALL, tee.send(Ok(window.clone()))).await;
+        if !matches!(sent, Ok(Ok(()))) {
+            self.tee = None;
         }
     }
 
