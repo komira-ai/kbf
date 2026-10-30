@@ -181,6 +181,34 @@ async fn appends_after_the_refusal_repeat_it() {
     assert!(first.contains(FULL), "{first}");
 }
 
+/// Catches: an empty append after the last byte, once the upload has ended, consuming
+/// the upload task so that a caller who ignored the error and went on to finish and
+/// commit panics polling it again. The commit answers the refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_after_a_refused_empty_append_answers_the_refusal() {
+    // The store reads the one chunk and fails, so the chunk is always taken and the
+    // stream is complete when the upload ends.
+    let cache = cache(Plan::FailAfter(1)).await;
+    let bytes = vec![7u8; CHUNK];
+    let mut hasher = RecordHasher::new();
+    hasher.update(&bytes);
+    let (digest, crc32c) = hasher.finish();
+    let streamed = tokio::task::spawn_blocking(move || {
+        let mut stream = cache.stream(bytes.len() as u64).expect("a stream");
+        stream.append(&bytes).expect("the chunk is taken");
+        // Empty appends queue until the upload ends, then fail with its error.
+        while stream.append(&[]).is_ok() {}
+        stream
+            .finish(digest, crc32c)
+            .expect("every byte was written")
+    })
+    .await
+    .expect("joined");
+    let err = streamed.commit().await.expect_err("the refusal");
+    assert!(matches!(err, CacheError::Store(_)), "{err:?}");
+    assert!(err.to_string().contains(FULL), "{err}");
+}
+
 /// Catches: the storage boundary turning the store's refusal into `Invalid`
 /// (INVALID_ARGUMENT, which a client does not retry): it is `Unavailable`, carrying the
 /// store's text.

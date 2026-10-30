@@ -59,6 +59,9 @@ pub(super) struct ToStore {
 pub(super) struct Claim {
     claim: oneshot::Sender<Digest>,
     upload: Upload,
+    /// The upload's end, if an append took it: its task was consumed, so the commit
+    /// answers this instead of waiting on it again.
+    refused: Option<CacheError>,
 }
 
 impl ToStore {
@@ -119,7 +122,9 @@ impl ToStore {
     }
 
     /// The error the upload ended with, taken from its task (which has ended or is
-    /// ending: its body is dropped, and it only settles the store's write). Blocking.
+    /// ending: its body is dropped, and it only settles the store's write). Blocking: on
+    /// S3 the appender waits out the abort of the multipart upload, which the store's
+    /// `request_timeout` bounds.
     fn ended(&mut self) -> CacheError {
         // Built whether or not it is needed: no branch of its own.
         let gone = CacheError::Invalid(STOPPED.to_owned());
@@ -139,8 +144,17 @@ impl ToStore {
     /// stream's are; the upload then waits for the claim.
     pub(super) fn finish(self, digest: Digest, crc32c: u32) -> Result<Claim, CacheError> {
         checked(self.written, self.size, digest, self.crc.finish(), crc32c)?;
-        let Self { claim, upload, .. } = self;
-        Ok(Claim { claim, upload })
+        let Self {
+            claim,
+            upload,
+            refused,
+            ..
+        } = self;
+        Ok(Claim {
+            claim,
+            upload,
+            refused,
+        })
     }
 }
 
@@ -148,6 +162,9 @@ impl Claim {
     /// Claims `digest`: the store completes the upload only if the bytes hash to it,
     /// and the blob is indexed. Answers once it is present.
     pub(super) async fn commit(self, digest: Digest) -> Result<(), CacheError> {
+        if let Some(refused) = self.refused {
+            return Err(refused);
+        }
         let _ = self.claim.send(digest);
         // An upload that never ended (its runtime shut down) stored nothing.
         let gone = Err(CacheError::Invalid(STOPPED.to_owned()));
