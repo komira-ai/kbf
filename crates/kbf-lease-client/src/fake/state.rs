@@ -150,6 +150,8 @@ struct HostRow {
     /// Known, and silent since the server restarted.
     awaiting: bool,
     taint: Option<Taint>,
+    /// A code the host refuses every new run with, short of a taint.
+    refusing: Option<&'static str>,
 }
 
 struct RunRow {
@@ -435,6 +437,9 @@ impl State {
         if host.taint.is_some() {
             return Err(Refusal::new(409, "host-tainted"));
         }
+        if let Some(code) = host.refusing {
+            return Err(Refusal::new(409, code));
+        }
         let live = self.runs.iter().filter(|run| run.lease == id && run.live());
         let (count, cpu, memory) = live.fold((0, 0, 0), |(count, cpu, memory), run| {
             (count + 1, cpu + run.cpu_millis, memory + run.memory_bytes)
@@ -563,6 +568,13 @@ impl State {
         self.hosts
             .get_mut(host)
             .map(|row| row.lost = lost)
+            .is_some()
+    }
+
+    pub(super) fn refuse_posts(&mut self, host: &str, code: Option<&'static str>) -> bool {
+        self.hosts
+            .get_mut(host)
+            .map(|row| row.refusing = code)
             .is_some()
     }
 

@@ -357,3 +357,23 @@ fn the_watch_over_earlier_leases_outlasts_a_renewal_and_a_held_pass() {
     let config = base();
     assert!(config.adopt_watch() > config.renew_every + config.fence_after);
 }
+
+/// Catches a hold on a host with a sick quota that is zero (the host would be handed back at
+/// once and leased again), or longer than a lease lasts without renewal (the held-out lease
+/// would expire under the executor): a third of the ttl is the longest a renewed lease can
+/// have left.
+#[test]
+fn the_quota_hold_is_above_zero_and_within_a_third_of_the_ttl() {
+    let with = |quota_hold| Config {
+        quota_hold,
+        ..base()
+    };
+    assert!(base().quota_hold > Duration::ZERO);
+    assert_eq!(with(Duration::ZERO).validate(), Err(ConfigError::QuotaHold));
+    let edge = base().lease_ttl / 3;
+    assert_eq!(with(edge).validate(), Ok(()));
+    assert_eq!(
+        with(edge + Duration::from_millis(1)).validate(),
+        Err(ConfigError::QuotaHold)
+    );
+}
