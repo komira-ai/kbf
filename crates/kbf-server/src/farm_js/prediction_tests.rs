@@ -19,6 +19,7 @@ use kbf_types::WorkerId;
 use kbf_types::sched::usage::LeaseCost;
 use kbf_types::{ActionKey, Digest, DigestFunction, FarmTime, LeaseId, LeaseKind, Qos, Resources};
 
+use super::ablation::Booking;
 use super::dispatch;
 use super::testing::{Flaky, Rig, Wire, register, result_with, starts, wall};
 use super::{KbfAdapter, open};
@@ -235,6 +236,34 @@ async fn on_charges_the_predicted_cores_and_memory_and_books_the_request() {
         (3_000, 4 * GIB),
         "the node books and runs the request's cores and memory, not the prediction's"
     );
+}
+
+/// Asserts the ablation's bookings (`kbf_ablation_bookings_total`) follow what admission
+/// charged: a lease started on a prediction moves `prediction` and no other source, and the same
+/// shape with predictions off moves `default`. Catches: a prediction booking counted as the
+/// default, and a counter that follows the flag instead of the charge.
+#[tokio::test(start_paused = true)]
+async fn the_ablation_counts_a_predicted_start_as_a_prediction_booking() {
+    for (mode, expect) in [
+        (PlacementPredictions::On, Booking::Prediction),
+        (PlacementPredictions::Off, Booking::Default),
+    ] {
+        let rig = rig(PlacementLoad::On, mode);
+        let mut node = register(&rig, "node-book", 0);
+        warm(&rig, &mut node, "node-book").await;
+        let counts = |rig: &Rig| {
+            rig.core
+                .with(|_, adapter| Booking::ALL.map(|booking| adapter.ablation().bookings(booking)))
+        };
+        let before = counts(&rig);
+
+        let _ = start_new(&rig, &mut node, 9).await;
+        let after = counts(&rig);
+        for booking in Booking::ALL {
+            let moved = after[booking as usize] - before[booking as usize];
+            assert_eq!(moved, u64::from(booking == expect), "{mode:?}: {booking:?}");
+        }
+    }
 }
 
 /// Asserts `shadow` leaves the charge at the booked rule's (the request's cores, no memory)

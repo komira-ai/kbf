@@ -49,7 +49,7 @@ pub(crate) enum Booking {
 
 impl Booking {
     /// Every source, in the order the series are written.
-    const ALL: [Self; 4] = [Self::Prediction, Self::Cold, Self::Retry, Self::Default];
+    pub(crate) const ALL: [Self; 4] = [Self::Prediction, Self::Cold, Self::Retry, Self::Default];
 
     /// The value of the `source` label.
     const fn label(self) -> &'static str {
