@@ -110,11 +110,13 @@ pub mod run;
 pub mod task;
 
 // The feature that lets a denied Command run with the network where no confine exists is for tests:
-// a non-Linux build without debug assertions (a release build) that turns it on does not compile; on
-// Linux the feature does nothing, so it is allowed there (a workspace-wide `--all-features` build).
+// a build for a system that is neither Linux nor macOS, without debug assertions (a release build),
+// that turns it on does not compile. On Linux and macOS, which have a confine, the feature does
+// nothing, so it is allowed there (a workspace-wide `--all-features` build).
 #[cfg(all(
     feature = "unconfined-for-tests",
     not(target_os = "linux"),
+    not(target_os = "macos"),
     not(debug_assertions),
     not(test)
 ))]

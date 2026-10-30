@@ -50,12 +50,16 @@ pub enum RunError {
         path: PathBuf,
         source: std::io::Error,
     },
-    /// The Command is to be denied the network and this system has no way to deny it (no
-    /// platform confine is compiled in): it is refused, not run with the network.
+    /// The Command is to be denied the network and this system has no way to deny it (neither
+    /// Linux nor macOS): it is refused, not run with the network.
     #[error(
-        "this system cannot deny the Command the network (no confine is built for it), so the Command is not run; only a Command allowed the network (kbf-network=allow) runs here"
+        "this system cannot deny the Command the network (a confine is built for Linux and macOS only), so the Command is not run; only a Command allowed the network (kbf-network=allow) runs here"
     )]
     NoConfine,
+    /// A file this tool holds a credential in cannot be hidden from the Command (macOS): its path
+    /// cannot be written into the sandbox profile. Nothing was run.
+    #[error("cannot confine the Command: {0}")]
+    Confine(String),
     /// The program could not be started.
     #[error("cannot start {program}: {source}")]
     Spawn {
@@ -98,6 +102,10 @@ pub struct Run<'a> {
     /// Whether the program may use the network; [`Network::Denied`] unless the action asked
     /// ([`network::from_platform`]).
     pub network: Network,
+    /// Files holding a credential or a presigned URL this tool was given (the grant token file,
+    /// the PUT URL files). On macOS the Command's sandbox profile denies reading each; on Linux
+    /// the Command's own filesystem does not hold them and the list is not used.
+    pub unreadable: &'a [PathBuf],
 }
 
 /// Runs `command` under `run.root`.
@@ -134,9 +142,15 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
     } else {
         PathBuf::from(program)
     };
-    let mut process = Process::new(&program);
+    let launch = network::launch(
+        &program,
+        &command.arguments[1..],
+        run.network,
+        run.unreadable,
+    )?;
+    let mut process = Process::new(&launch.program);
     process
-        .args(&command.arguments[1..])
+        .args(&launch.args)
         .current_dir(&work_dir)
         .env_clear()
         .envs(private)
@@ -156,7 +170,7 @@ pub async fn run(command: &Command, run: &Run<'_>) -> Result<Ran, RunError> {
     let cpu_before = children_usage().cpu_us;
     let started = Instant::now();
     let spawn_error = |source| RunError::Spawn {
-        program: program.clone(),
+        program: launch.program.clone(),
         source,
     };
     let mut child = process.spawn().map_err(spawn_error)?;
@@ -375,6 +389,7 @@ mod tests {
                     stderr: &self.stderr,
                     deadline,
                     network: NETWORK,
+                    unreadable: &[],
                 },
             )
             .await
@@ -795,6 +810,7 @@ mod tests {
                 stderr: &rig.stderr,
                 deadline: LONG,
                 network: NETWORK,
+                unreadable: &[],
             },
         )
         .await
@@ -802,14 +818,24 @@ mod tests {
         assert!(matches!(error, RunError::Io { .. }), "{error}");
     }
 
+    /// Catches a Command whose program is missing being reported as a run. Where the program is
+    /// started directly, that is a spawn error. On macOS `sandbox-exec` starts it and is what
+    /// fails, so the run ends with a nonzero exit and the message in the Command's stderr.
     #[tokio::test]
-    async fn a_program_that_does_not_exist_is_a_spawn_error() {
+    async fn a_program_that_does_not_exist_is_not_run() {
         let rig = Rig::new("spawn");
         let command = Command {
             arguments: vec!["./no-such-program".into()],
             ..Command::default()
         };
-        let error = rig.run(&command, LONG).await.expect_err("refused");
-        assert!(matches!(error, RunError::Spawn { .. }), "{error}");
+        let result = rig.run(&command, LONG).await;
+        if cfg!(target_os = "macos") {
+            let ran = result.expect("sandbox-exec ran");
+            assert_ne!(ran.exit_code, 0);
+            assert!(rig.err().contains("no-such-program"), "{}", rig.err());
+        } else {
+            let error = result.expect_err("refused");
+            assert!(matches!(error, RunError::Spawn { .. }), "{error}");
+        }
     }
 }

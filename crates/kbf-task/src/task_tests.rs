@@ -505,6 +505,38 @@ fn the_flags_parse_with_their_defaults() {
     }
 }
 
+/// Catches a credential file the Command could read (macOS denies each in its sandbox profile): the
+/// grant token file, the pack URL file and the PUT URLs file are named, in that order, and a root
+/// certificate file, which holds no credential, and a credential given as a flag value are not.
+#[test]
+fn the_files_holding_a_credential_are_the_ones_the_flags_name() {
+    let all = Cli::try_parse_from([
+        "kbf-task",
+        "--put-urls-file=/run/puts",
+        "--grant-url=g",
+        "--grant-token-file=/run/grant",
+        "--lease=l",
+        &format!("--action={}", sha256(b"a")),
+        "--root-der=/etc/root.der",
+    ])
+    .expect("flags");
+    assert_eq!(
+        credential_files(&all),
+        [PathBuf::from("/run/grant"), PathBuf::from("/run/puts")]
+    );
+    let pack = cli(Path::new("/w"), reapi_of(b"a"));
+    assert_eq!(
+        credential_files(&pack),
+        [
+            PathBuf::from("/nonexistent"),
+            PathBuf::from("/nonexistent-url")
+        ]
+    );
+    let by_value = with_secrets(&["--pack-url=u", "--grant-token=t", "--insecure-argv-secrets"])
+        .expect("flags");
+    assert!(credential_files(&by_value).is_empty());
+}
+
 const SECRET_URL: &str = "https://store.example/pack?X-Sig=very-secret";
 const SECRET_TOKEN: &str = "very-secret-token";
 
