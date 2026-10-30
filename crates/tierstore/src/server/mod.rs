@@ -162,10 +162,13 @@
 
 mod auth;
 pub mod cli;
+mod config;
+mod config_print;
 pub mod gc;
 mod handover;
 mod idle;
 mod keys;
+mod launch;
 mod ops;
 pub mod presign;
 mod reply;
@@ -180,6 +183,8 @@ mod auth_tests;
 mod body_stall_tests;
 #[cfg(test)]
 mod completion_tests;
+#[cfg(test)]
+mod config_testing;
 #[cfg(test)]
 mod drain_tests;
 #[cfg(test)]
