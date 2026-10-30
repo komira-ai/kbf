@@ -26,6 +26,8 @@ use super::*;
 
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 const IMAGE: &str = "docker://registry.test/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const KBF_IMAGE: &str =
+    "registry.test/kbf@sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 const OTHER_IMAGE: &str = "docker://registry.test/other@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 const NOW: u64 = 1_790_000_040;
 
@@ -88,6 +90,7 @@ fn run(key: &str, not_after: u64) -> PreparedRun {
         grant_url: "https://grant.test:9400".to_owned(),
         grant_token: Secret::new("grant-token"),
         not_after,
+        input_bytes: Some(12_345),
     }
 }
 
@@ -154,7 +157,7 @@ struct Rig {
 }
 
 impl Rig {
-    fn new(images_have_no_entrypoint: bool) -> Self {
+    fn new() -> Self {
         CLOCK.with(|c| c.set(NOW));
         let store = Arc::new(Flaky {
             inner: MemoryStore::new(Capabilities {
@@ -181,8 +184,8 @@ impl Rig {
                 backend,
                 mint: PackKeyMint::new(SECRET).expect("a mint"),
                 prepare: prepared.clone(),
-                images_have_no_entrypoint,
-                default_image: None,
+                base_image: ImageRef::parse(IMAGE).expect("an image"),
+                kbf_image: ImageRef::parse(&format!("docker://{KBF_IMAGE}")).expect("an image"),
             },
             clock,
         );
@@ -247,7 +250,7 @@ fn action_digest() -> Digest {
 /// the run's wall, and each of the three is handed out once.
 #[tokio::test]
 async fn a_run_is_prepared_once_and_its_key_write_and_grant_are_handed_out_once() {
-    let rig = Rig::new(true);
+    let rig = Rig::new();
     let wall = Duration::from_secs(900);
     let key = rig
         .front
@@ -275,6 +278,11 @@ async fn a_run_is_prepared_once_and_its_key_write_and_grant_are_handed_out_once(
         .expect("the grant");
     assert_eq!(grant.url, "https://grant.test:9400");
     assert_eq!(grant.token.expose(), "grant-token");
+    assert_eq!(
+        grant.input_bytes,
+        Some(12_345),
+        "the closure size is the grant's"
+    );
     let again = rig.front.read_grant(lease(), &action_digest(), wall).await;
     assert!(matches!(again, Err(InputsError::Unavailable(_))));
     assert!(rig.front.parked().is_empty(), "nothing is kept once used");
@@ -284,7 +292,7 @@ async fn a_run_is_prepared_once_and_its_key_write_and_grant_are_handed_out_once(
 /// signs, and a key nobody prepared gets none.
 #[tokio::test]
 async fn a_write_is_found_by_its_key_and_a_stranger_gets_none() {
-    let rig = Rig::new(true);
+    let rig = Rig::new();
     let wall = Duration::from_secs(60);
     rig.front
         .mint(lease(), &action_digest(), wall)
@@ -305,7 +313,7 @@ async fn a_write_is_found_by_its_key_and_a_stranger_gets_none() {
 /// would start and be refused its inputs or its upload, and the farm would run it again.
 #[tokio::test]
 async fn a_write_that_ends_before_the_run_does_is_not_a_key() {
-    let rig = Rig::new(true);
+    let rig = Rig::new();
     rig.prepared.answers(Ok(run("cas/b/7-3/aa-0", NOW + 899)));
     let refused = rig
         .front
@@ -324,7 +332,7 @@ async fn a_write_that_ends_before_the_run_does_is_not_a_key() {
 /// Catches a preparation that fails being taken for a key, and its reason being lost.
 #[tokio::test]
 async fn a_run_that_cannot_be_prepared_is_not_a_key_and_says_why() {
-    let rig = Rig::new(true);
+    let rig = Rig::new();
     for why in [
         PrepareError::Refused("an input is not held".to_owned()),
         PrepareError::Unavailable("the store is down".to_owned()),
@@ -360,7 +368,7 @@ async fn a_run_that_cannot_be_prepared_is_not_a_key_and_says_why() {
 /// being kept for ever: what a later mint finds past its expiry is dropped.
 #[tokio::test]
 async fn what_a_start_that_ran_out_of_its_window_left_is_dropped_at_the_next_mint() {
-    let rig = Rig::new(true);
+    let rig = Rig::new();
     rig.prepared.answers(Ok(run("cas/b/7-3/aa-0", NOW + 100)));
     rig.front
         .mint(lease(), &action_digest(), Duration::from_secs(10))
@@ -386,7 +394,7 @@ async fn what_a_start_that_ran_out_of_its_window_left_is_dropped_at_the_next_min
 /// secrets: the second preparation replaces the first.
 #[tokio::test]
 async fn preparing_a_lease_again_replaces_what_was_parked() {
-    let rig = Rig::new(true);
+    let rig = Rig::new();
     let wall = Duration::from_secs(60);
     rig.front
         .mint(lease(), &action_digest(), wall)
@@ -402,11 +410,11 @@ async fn preparing_a_lease_again_replaces_what_was_parked() {
     assert!(rig.front.put_url("node1", &key, wall, 1).await.is_ok());
 }
 
-/// Catches an action whose image is not the one its platform names, by digest, and a timeout
-/// that is not the action's.
+/// Catches an action's run being launched from anything but the kbf image, and a timeout that is
+/// not the action's: an action that names the served base runs from the kbf image, by digest.
 #[tokio::test]
-async fn an_action_gives_its_image_by_digest_and_its_timeout() {
-    let rig = Rig::new(true);
+async fn an_action_runs_from_the_kbf_image_by_digest_and_has_its_timeout() {
+    let rig = Rig::new();
     let digest = rig
         .action(
             |action| {
@@ -420,9 +428,8 @@ async fn an_action_gives_its_image_by_digest_and_its_timeout() {
     assert_eq!(
         facts,
         ActionFacts {
-            image: IMAGE.trim_start_matches("docker://").to_owned(),
+            image: KBF_IMAGE.to_owned(),
             timeout: Some(Duration::from_secs(90)),
-            has_entrypoint: false,
         }
     );
 }
@@ -432,7 +439,7 @@ async fn an_action_gives_its_image_by_digest_and_its_timeout() {
 #[tokio::test]
 #[allow(deprecated)]
 async fn the_commands_platform_is_read_and_no_timeout_is_none() {
-    let rig = Rig::new(true);
+    let rig = Rig::new();
     let old = rig
         .action(|_| {}, |command| command.platform = Some(platform(IMAGE)))
         .await;
@@ -446,12 +453,12 @@ async fn the_commands_platform_is_read_and_no_timeout_is_none() {
     assert_eq!(rig.front.action(&zero).await.expect("facts").timeout, None);
 }
 
-/// Catches actions the executor must not run being passed on: no image, an image named by a tag
-/// and a timeout below zero are the caller's to fix.
+/// Catches actions the executor must not run being passed on: an image named by a tag and a
+/// timeout below zero are the caller's to fix (an action that names no image is run: see
+/// `an_action_that_names_no_image_is_run_from_the_kbf_image`).
 #[tokio::test]
-async fn an_action_that_names_no_image_by_digest_or_a_negative_timeout_is_invalid() {
-    let rig = Rig::new(true);
-    let bare = rig.action(|_| {}, |_| {}).await;
+async fn an_image_named_by_tag_or_a_negative_timeout_is_invalid() {
+    let rig = Rig::new();
     let tagged = rig
         .action(
             |action| action.platform = Some(platform("docker://registry.test/app:latest")),
@@ -467,29 +474,13 @@ async fn an_action_that_names_no_image_by_digest_or_a_negative_timeout_is_invali
             |_| {},
         )
         .await;
-    for digest in [bare, tagged, negative] {
+    for digest in [tagged, negative] {
         let refused = rig.front.action(&digest).await;
         assert!(
             matches!(refused, Err(InputsError::Invalid(_))),
             "{refused:?}"
         );
     }
-}
-
-/// Catches an image whose entrypoint nobody has said is empty running anyway: the lease server
-/// would hand the secrets to that program and the tool would not run. The frontend cannot see an
-/// image's config, so it refuses until the operator says no image sets one.
-#[tokio::test]
-async fn an_image_is_refused_unless_the_operator_says_none_sets_an_entrypoint() {
-    let rig = Rig::new(false);
-    let digest = rig
-        .action(|action| action.platform = Some(platform(IMAGE)), |_| {})
-        .await;
-    let refused = rig.front.action(&digest).await;
-    let Err(InputsError::Invalid(why)) = refused else {
-        panic!("not refused: {refused:?}");
-    };
-    assert!(why.contains("ENTRYPOINT"), "{why}");
 }
 
 /// Catches a refusal of the real preparation being sorted by its text or its kind and not by whose
@@ -523,50 +514,59 @@ fn the_real_preparations_refusals_are_sorted_by_whose_they_are() {
     }
 }
 
-/// Catches the operator's default image missing where an action names none, or replacing one
-/// that does: an action with no `container-image` runs in `--executor-default-image`, one that
-/// names an image runs in its own, and one with neither is the caller's to fix, told which flag
-/// would have run it.
+/// Catches the base environment being served for an image it is not: an action whose
+/// `container-image` is another digest than the served base is the caller's to fix, and the
+/// refusal names both images and the kbf image the run would have used; a tag is refused too,
+/// and so is a value that is not an image. An action that names the base, or none, is run.
 #[tokio::test]
-async fn an_action_that_names_no_image_runs_in_the_default_one() {
-    let mut rig = Rig::new(true);
-    rig.front.parts.default_image = Some(ImageRef::parse(OTHER_IMAGE).expect("an image"));
-    let bare = rig.action(|_| {}, |_| {}).await;
-    let facts = rig.front.action(&bare).await.expect("runs in the default");
-    assert_eq!(facts.image, OTHER_IMAGE.trim_start_matches("docker://"));
-    let named = rig
-        .action(|action| action.platform = Some(platform(IMAGE)), |_| {})
-        .await;
-    let facts = rig.front.action(&named).await.expect("runs in its own");
-    assert_eq!(facts.image, IMAGE.trim_start_matches("docker://"));
-
-    rig.front.parts.default_image = None;
-    let refused = rig.front.action(&bare).await;
-    let Err(InputsError::Invalid(why)) = refused else {
-        panic!("not refused: {refused:?}");
-    };
-    assert!(
-        why.contains("container-image") && why.contains("--executor-default-image"),
-        "{why}"
-    );
-}
-
-/// Catches an image the action names being excused by the default: an action that names a tag
-/// is refused, whether or not there is a default image.
-#[tokio::test]
-async fn a_default_image_does_not_excuse_an_image_that_is_named_by_tag() {
-    let mut rig = Rig::new(true);
-    rig.front.parts.default_image = Some(ImageRef::parse(OTHER_IMAGE).expect("an image"));
-    let tagged = rig
+async fn an_action_naming_another_image_than_the_served_base_is_refused() {
+    let rig = Rig::new();
+    let other = rig
         .action(
-            |action| action.platform = Some(platform("docker://registry.test/app:latest")),
+            |action| action.platform = Some(platform(OTHER_IMAGE)),
             |_| {},
         )
         .await;
-    assert!(matches!(
-        rig.front.action(&tagged).await,
-        Err(InputsError::Invalid(_))
-    ));
+    let refused = rig.front.action(&other).await;
+    let Err(InputsError::Invalid(why)) = refused else {
+        panic!("not refused: {refused:?}");
+    };
+    for named in [
+        OTHER_IMAGE.trim_start_matches("docker://"),
+        IMAGE.trim_start_matches("docker://"),
+        KBF_IMAGE,
+    ] {
+        assert!(why.contains(named), "{why} does not name {named}");
+    }
+    for value in ["docker://registry.test/app:latest", "not an image"] {
+        let bad = rig
+            .action(|action| action.platform = Some(platform(value)), |_| {})
+            .await;
+        let refused = rig.front.action(&bad).await;
+        assert!(
+            matches!(refused, Err(InputsError::Invalid(_))),
+            "{refused:?}"
+        );
+    }
+    // The same digest under another repository name is the same image.
+    let renamed = format!(
+        "docker://mirror.test/app@{}",
+        ImageRef::parse(IMAGE).expect("an image").digest()
+    );
+    let alias = rig
+        .action(|action| action.platform = Some(platform(&renamed)), |_| {})
+        .await;
+    assert!(rig.front.action(&alias).await.is_ok());
+}
+
+/// Catches an action that names no image being refused or run elsewhere: it gets the base, so it
+/// runs from the kbf image like one that names the base.
+#[tokio::test]
+async fn an_action_that_names_no_image_is_run_from_the_kbf_image() {
+    let rig = Rig::new();
+    let bare = rig.action(|_| {}, |_| {}).await;
+    let facts = rig.front.action(&bare).await.expect("runs");
+    assert_eq!(facts.image, KBF_IMAGE);
 }
 
 /// Catches blobs that cannot be had being taken for a bad action: a CAS that does not hold the
@@ -574,7 +574,7 @@ async fn a_default_image_does_not_excuse_an_image_that_is_named_by_tag() {
 /// there), and bytes that are not an Action or name a bad Command are the caller's.
 #[tokio::test]
 async fn an_action_the_cas_cannot_give_is_unavailable_and_one_that_is_malformed_is_invalid() {
-    let rig = Rig::new(true);
+    let rig = Rig::new();
     let unheld = rig.front.action(&action_digest()).await;
     assert!(
         matches!(unheld, Err(InputsError::Unavailable(_))),
@@ -649,7 +649,7 @@ fn limits() -> UntrustedLimits {
 /// text that is no key are not the issued one.
 #[tokio::test]
 async fn a_pack_that_is_not_there_or_a_key_that_is_not_the_issued_one_is_refused() {
-    let rig = Rig::new(true);
+    let rig = Rig::new();
     let action = rig.action(|_| {}, |_| {}).await;
     let key = issued(&rig, "7-3", &action);
     let missing = rig.front.ingest(lease(), &key, &action, &limits()).await;
@@ -684,7 +684,7 @@ async fn a_pack_that_is_not_there_or_a_key_that_is_not_the_issued_one_is_refused
 /// may be there, so the answer is to ask again and not to refuse it.
 #[tokio::test]
 async fn a_store_that_cannot_be_read_is_unavailable_and_not_a_refusal() {
-    let rig = Rig::new(true);
+    let rig = Rig::new();
     let action = rig.action(|_| {}, |_| {}).await;
     let key = issued(&rig, "7-3", &action);
     rig.store.fail_reads.store(true, Ordering::SeqCst);
@@ -705,7 +705,7 @@ async fn a_store_that_cannot_be_read_is_unavailable_and_not_a_refusal() {
 /// not when it failed.
 #[tokio::test]
 async fn a_pack_under_the_issued_key_becomes_the_actions_result() {
-    let rig = Rig::new(true);
+    let rig = Rig::new();
     for (exit_code, cached) in [(0, true), (3, false)] {
         let build = format!("7-{}", 10 + exit_code);
         let lease = LeaseId::new(7, 10 + u64::try_from(exit_code).expect("small"));
@@ -805,7 +805,7 @@ async fn put_pack(rig: &Rig, key: &PackKey, pack: Vec<u8>) {
 /// roomier caps, so the cap and nothing else is the reason.
 #[tokio::test]
 async fn a_pack_over_the_executors_caps_is_too_large() {
-    let rig = Rig::new(true);
+    let rig = Rig::new();
     let action = rig.action(|_| {}, |_| {}).await;
 
     let small = write_pack(&manifest_of("7-3", &action), &[]).expect("a pack");
@@ -849,7 +849,7 @@ async fn a_pack_over_the_executors_caps_is_too_large() {
 #[tokio::test]
 #[allow(deprecated)]
 async fn the_actions_platform_wins_over_the_commands() {
-    let rig = Rig::new(true);
+    let rig = Rig::new();
     let digest = rig
         .action(
             |action| action.platform = Some(platform(IMAGE)),
@@ -857,7 +857,8 @@ async fn the_actions_platform_wins_over_the_commands() {
         )
         .await;
     let facts = rig.front.action(&digest).await.expect("facts");
-    assert_eq!(facts.image, IMAGE.trim_start_matches("docker://"));
+    assert_eq!(facts.image, KBF_IMAGE);
+    // Were the Command's platform the one read, the other image would be refused.
 }
 
 /// Catches the ingest handed a backend that cannot read the packs (a tree that only the pack
@@ -866,7 +867,7 @@ async fn the_actions_platform_wins_over_the_commands() {
 /// a result, and cached.
 #[tokio::test]
 async fn a_tree_that_only_the_pack_holds_is_read_through_the_same_packs() {
-    let rig = Rig::new(true);
+    let rig = Rig::new();
     let action = rig.action(|_| {}, |_| {}).await;
     let file = b"a file inside the output directory".to_vec();
     let file_digest = VerifiedBlob::hashed(Bytes::from(file.clone())).digest();

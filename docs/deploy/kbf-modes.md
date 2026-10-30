@@ -124,9 +124,13 @@ hosts stay held until their ttl ends (`--executor-lease-ttl-secs`, an hour by de
 later `js-agent` start releases them. `js-agent` leases hosts from the job scheduler's lease server
 instead, one lease for each of `--executor-hosts` hosts of `--executor-host-cpus` cores and
 `--executor-host-memory-gib` GiB in the class `--executor-class`, asked for with
-`os=linux` and `--executor-arch` (default `x86_64`), and runs each placed action in its own
-image by a task tool that the agent mounts read-only (`--executor-task-tool`, default
-`/mnt/kbf-tools/kbf-task`). The image must be named by digest and be on the host. It needs the
+`os=linux` and `--executor-arch` (default `x86_64`), and runs each placed action in the kbf
+image (`--executor-kbf-image`), whose `ENTRYPOINT` is the task tool: the run's arguments are the
+tool's flags and nothing is mounted into the container. The kbf image is built from the base
+environment the actions' Commands see (`--executor-base-image`); both are named by digest, and
+the host pulls the kbf image. An action's `container-image` platform property names the base: an
+action that names another image is refused as invalid (the message names both), one that names
+none gets the base, and a tag is refused. It needs both image flags, and the
 lease server (`--executor-lease-url`, `https://`, or `http://` to loopback only;
 `--executor-lease-token-file`, mode 0600 or 0400; `--executor-lease-ca-file` for an `https`
 URL), `--executor-frontend-id` (the `kbf-frontend` label on the frontend's leases, by which a
@@ -135,9 +139,7 @@ restarted frontend finds and releases them; it must be different for each fronte
 the pack a task writes is read, hashed and turned into the action's result) and
 `--executor-insecure-argv-secrets`: the lease server's job has no secret field yet, so the
 presigned write url and the read token travel as arguments of the run, where the action can
-read them. No image's config is read, and the task tool cannot run under an `ENTRYPOINT`, so
-every action is refused until `--executor-images-have-no-entrypoint` says no image of the farm
-sets one. The executor runs on exactly one frontend: it looks for another frontend's leases on
+read them. The executor runs on exactly one frontend: it looks for another frontend's leases on
 the lease server before its first pass and every minute after, and a frontend that finds one
 older than its own (or finds one before it has any) stops with an error naming it. Each lease
 also carries the process that made it: a frontend that starts and finds leases of another
@@ -159,15 +161,19 @@ clamps the ask. The run's wall time is the action's timeout plus the margin, and
 `--task-run-wall-secs` is not used by the executor. A run that cannot be prepared because an
 input blob is missing, malformed or over the closure budget ends as an invalid argument to its
 caller and is not rerun; one that cannot be prepared because the store cannot be read is rerun.
-`--executor-default-image` (`<repository>@sha256:<digest>`, the `docker://` scheme optional)
-is the image of an action that names no `container-image` property; an action that names one
-runs in its own, a tag is refused, and an action with neither is refused as invalid. The
+`--executor-base-image` and `--executor-kbf-image` (`<repository>@sha256:<digest>`, the
+`docker://` scheme optional) replace the former `--executor-default-image`,
+`--executor-images-have-no-entrypoint`, `--executor-task-tool` and `--executor-root-der`: a
+missing or tag-named image, or the same image twice, is refused when the flags are read. The farm's
+certificate authority for the task's `https` reads must be in the kbf image. The
 presigned write and the read token are never part of an error, a log line or a metric.
 `GET /metrics` gains the `kbf_executor_*` families. The remaining settings are `--executor-host-slots` (default 8),
 `--executor-run-margin-secs` (300; what a run's wall time adds to the action's timeout),
 `--executor-lease-ttl-secs` (3600), `--executor-max-run-secs` and
 `--executor-default-timeout-secs` (3000), `--executor-call-timeout-secs` (5),
-`--executor-root-der` and `--executor-work-dir` (for the task tool), and
+`--executor-work-dir` (for the task tool),
+`--executor-output-disk-bytes` (8 GiB; the scratch disk a run books for its outputs, the pack and its
+private home, on top of the bytes of its inputs and a fixed 1 GiB margin), and
 `--executor-allow-plain-http-put` (until the store serves TLS). A setting that breaks a rule
 the executor's safety rests on (the fence time against the scheduler's grace, the lease ttl
 against the longest run) is refused at start, exit status 2.

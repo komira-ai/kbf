@@ -55,6 +55,7 @@ pub fn run_of(cpu_millis: u64, gib: u64) -> RunSpec {
         memory_bytes: gib * GIB,
         pids: None,
         wall_ms: None,
+        disk_bytes: None,
     };
     RunSpec::new(IMAGE, limits)
 }
