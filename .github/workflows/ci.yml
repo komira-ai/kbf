@@ -49,6 +49,9 @@ jobs:
     env:
       DENY_VERSION: 0.20.2
       DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+      # The x86_64-linux tarball of ziglang.org/download/index.json.
+      ZIG_VERSION: 0.14.1
+      ZIG_SHA256: 24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -102,6 +105,82 @@ jobs:
       # in the `test` job's two coverage runs.
       - run: cargo clippy -p kbf-server --all-targets --features farm-core-js --locked -- -D warnings
         if: ${{ !cancelled() }}
+      # The crates the Mac jobs build (beta.yml's native-macos and pkg-macos, artifacts.yml's
+      # darwin-arm64), checked for aarch64-apple-darwin on this Linux runner. A Linux-only item
+      # in code macOS compiles is then red on the pull request, not on the Mac job of the push to
+      # main an hour later (a `use` of a Linux-only module in kbf-node failed native-macos on eight
+      # main pushes in a row). `cargo check` does not link, so no macOS SDK is needed; the build
+      # scripts that compile C for the target (ring, the bundled SQLite of libsqlite3-sys) use
+      # Zig's C compiler and archiver, which carry macOS's libc headers: the cc crate reads
+      # `CC_<target>` and `AR_<target>` as a program and its leading arguments. Zig is the release
+      # tarball, checked against its SHA-256 before use and unpacked whole (its compiler needs its
+      # lib directory) into the runner's temporary directory.
+      - name: Fetch Zig (pinned version and checksum), the C compiler for aarch64-apple-darwin
+        if: ${{ !cancelled() }}
+        run: cargo xtask fetch --url "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" --sha256 "$ZIG_SHA256" --out "$RUNNER_TEMP/zig.tar.xz"
+      - run: tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+        if: ${{ !cancelled() }}
+      - run: rustup target add aarch64-apple-darwin
+        if: ${{ !cancelled() }}
+      # The targets the macOS jobs of every workflow compile (beta.yml's native-macos,
+      # artifacts.yml's darwin-arm64, mac-provision.yml, host-install-mac.yml, vmm-probe.yml), as
+      # they name them: a crate's other test targets (kbf-cli's harness tests, for one) are
+      # Linux-only and never built on a Mac. Linking and doc tests are not checked: `cargo check`
+      # compiles each crate and stops. The cc crate's own flags include
+      # `--target=arm64-apple-macosx`, which Zig refuses (its compiler-family probe runs the
+      # program without `cc`, so it takes Zig for clang); without them (CRATE_CC_NO_DEFAULTS) Zig
+      # gets its own `-target` and each build script's flags.
+      # The crates a Mac job tests whole: every test target, and the libraries' unit tests.
+      - name: Check for aarch64-apple-darwin the tests of the crates the Mac jobs test whole
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          # The oldest macOS the binaries support, as artifacts.yml builds them.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin --tests --features kbf-setup/proxy -p kbf-outputs -p kbf-driver-native -p kbf-node -p kbf-mac-session -p kbf-installer -p kbf-setup -p kbf-guest -p kbf-mac-provision -p kbf-vmm
+      # The binaries the Mac jobs build and run (`cargo xtask` included) and the darwin artifacts are.
+      - name: Check for aarch64-apple-darwin the binaries the Mac jobs build
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          # The oldest macOS the binaries support, as artifacts.yml builds them.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin --bins -p kbf-node -p kbf-cli -p kbf-deploy -p kbf-installer -p kbf-host-install -p kbf-updater -p kbf-mac-provision -p kbf-guest -p kbf-vmm -p xtask
+      # The test targets the Mac jobs name one by one.
+      - name: Check for aarch64-apple-darwin the test targets the Mac jobs name
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          # The oldest macOS the binaries support, as artifacts.yml builds them.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin -p kbf-cli -p kbf-daemon-test -p xtask -p kbf-host-install --test macos_daemon --test mac_pool_spike --test pkg_macos --test real_mac --test real_drop
+      # kbf-daemon's library with its unit tests (the test profile), and the tests native-macos runs.
+      - name: Check for aarch64-apple-darwin the kbf-daemon library's tests and the tests native-macos runs
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          # The oldest macOS the binaries support, as artifacts.yml builds them.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin --profile test -p kbf-daemon --lib --test suspend --test keeper --test cache_clone --test trees_clone
+      # The kbf binary alone, as artifacts.yml builds it: without the proxy feature of kbf-setup,
+      # which the steps above turn on for kbf-installer and so for every crate built beside it.
+      - name: Check for aarch64-apple-darwin the kbf binary without the proxy feature
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig cc -target aarch64-macos
+          AR_aarch64_apple_darwin: ${{ runner.temp }}/zig-x86_64-linux-${{ env.ZIG_VERSION }}/zig ar
+          CRATE_CC_NO_DEFAULTS: "1"
+          # The oldest macOS the binaries support, as artifacts.yml builds them.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo check --locked --target aarch64-apple-darwin -p kbf-cli --bin kbf
       # The interpreter budget only shrinks: a pull request may not add a row to it
       # (crates/xtask/src/budget.rs). A pull request is checked out as the merge commit,
       # so HEAD^1 is the base branch it merges into.
