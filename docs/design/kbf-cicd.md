@@ -595,6 +595,20 @@ A push to `main` runs one pipeline, `pipeline.yml`:
   run's jobs and cancels the run as soon as one has failed or timed out; the run then ends cancelled and starts no
   release, and the failed job keeps its own conclusion. It ends when `passed` has completed, ends with a notice when it
   cannot read the jobs, and never makes a run red itself.
+  **One rerun for a flake of an artifact job.** A job cannot be rerun while its run is in progress and `watch` keeps the run
+  open, so the rerun is made after it, by `pipeline-rerun.yml`: it starts when a pipeline run completes (`workflow_run`, the
+  second workflow the lint lets follow the pipeline, beside `release.yml`) and runs `cargo xtask pipeline-rerun`, which calls
+  `POST /actions/runs/<id>/rerun-failed-jobs` once, only for a push to `main` that failed (or ended cancelled, as `watch` ends
+  it), only in its first attempt (the rerun completes as attempt 2 and is ignored, so there is no loop), and only when EVERY
+  failed job builds or moves artifacts: the three builds, `sums*`, `attest*` and `verify*` of `artifacts.yml`, by exact name
+  (`RERUNNABLE`). A failed test, lint or smoke job, or a job nobody listed, means nothing is rerun and the pipeline stays failed,
+  so a flaky test still fails loudly. Each rerun is a line in the summary of the workflow's run with the jobs and the logs of
+  their first failure, so flakes stay visible and countable; a rerun GitHub refuses fails that run (exit 1). The rerun runs again
+  every job that did not pass, the cancelled ones included. As a `workflow_run` workflow it runs the file as it is on `main`,
+  with this repository's token, for a commit that may be any push: it never checks out or runs that commit's code (it builds
+  xtask from `main`, before the step that holds the token), its token is `actions: write` and `contents: read`, held only under
+  the exact `if:` of the lint (`RERUN_ONLY`), and it holds no secret. A change to this file or to the lint needs a token with
+  the `workflow` scope to push.
 - **A running pipeline finishes; the newest waiting push queues behind it.** The workflow's group is `pipeline-<ref>` with
   `cancel-in-progress: false`: the run in progress is never cancelled, and of the pushes that wait GitHub keeps the newest
   (a pending run is replaced by a newer one; the release plan measures from the highest tag, so the code of a replaced

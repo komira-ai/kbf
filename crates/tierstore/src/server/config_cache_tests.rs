@@ -458,6 +458,17 @@ fn a_storage_node_refuses_a_list_of_endpoints_and_a_cache_policy() {
     assert!(why.contains("keeps no cache"), "{why}");
 }
 
+/// Asserts that a build node's file with an `[oci]` table is refused, with a message that names
+/// `oci`, whether or not the table has `listen`.
+#[test]
+fn a_build_node_refuses_an_oci_table() {
+    for table in ["listen = \"127.0.0.1:5000\"", "prefix = \"cas/\""] {
+        let why = refusal(&format!("{CACHE}\n[oci]\n{table}\n"));
+        assert!(why.contains("oci"), "{why}");
+        assert!(why.contains("build node"), "{why}");
+    }
+}
+
 /// Asserts that a rate reads as a size and `/s`, is refused otherwise, and is written back as a
 /// rate that reads as the same.
 #[test]
