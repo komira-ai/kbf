@@ -316,3 +316,49 @@ async fn a_reader_that_goes_away_does_not_stop_the_fill_for_the_others() {
     let name = name_of("cas/b/obj");
     assert!(rig.cache.inner.kept(&name).is_some());
 }
+
+/// Asserts that a body that ended with the error of its fill gives nothing more when it is read
+/// again: the error is the last item, and the next read is the end of the stream, not a second
+/// error and not bytes.
+#[tokio::test]
+async fn a_body_that_ended_with_an_error_gives_nothing_after_it() {
+    let rig = rig("tsstream-after-error");
+    let key = format!("cas/l/{}", digest(&pattern(SIZE)));
+    rig.put(&key, &vec![7u8; SIZE]).await;
+    let gate = rig.tamper.hold();
+    open(&gate, 5);
+    let mut body = rig.cache.get_stream(&key, None).await.unwrap();
+    let _ = take(&mut body, 500).await;
+    open(&gate, 64);
+    let mut ended = false;
+    while let Some(next) = body.next().await {
+        if next.is_err() {
+            ended = true;
+            break;
+        }
+    }
+    assert!(ended);
+    assert!(body.next().await.is_none());
+}
+
+/// Asserts that the read that follows a fill (the object is in the cache when the reader looks
+/// again) is served from the file and counted as bytes from the upstream, not as a hit: no hit is
+/// counted, the bytes served from the upstream are the object's size, and the upstream is not read.
+#[tokio::test]
+async fn the_read_that_follows_a_fill_is_served_from_the_file_and_not_counted_as_a_hit() {
+    let rig = rig("tsstream-after-fill");
+    let body = pattern(SIZE);
+    rig.put("cas/b/obj", &body).await;
+    assert_eq!(rig.get("cas/b/obj").await.unwrap(), body);
+    let counters = rig.cache.counters();
+    let before = read(&counters.bytes_served_upstream);
+    let gets = rig.calls(Op::Get);
+    let name = name_of("cas/b/obj");
+    let stream = rig.cache.inner.open_kept(&name, None, false).await;
+    let (chunks, error) = drain(stream.unwrap().expect("the object is kept")).await;
+    assert_eq!(error, None);
+    assert_eq!(joined(&chunks), body);
+    assert_eq!(read(&counters.hits), 0);
+    assert_eq!(read(&counters.bytes_served_upstream) - before, SIZE as u64);
+    assert_eq!(rig.calls(Op::Get), gets);
+}
