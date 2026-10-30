@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use kbf_objstore::s3::{Credentials, S3Config, S3Store};
 use kbf_objstore::{ByteRange, Capabilities, ObjectKey, ObjectStore};
@@ -21,7 +22,11 @@ use super::config::{PerRun, settings_from_text};
 use super::config_cache::CacheSettings;
 use super::local_cache::testing::{FakeDisk, Quirk, digest, pattern};
 use super::local_cache::{Disk, SystemDisk};
-use crate::{Backend, FaultyBackend, MemoryBackend};
+use crate::selftest_tests::{Flaw, Flawed};
+use crate::{
+    Backend, ByteRange as TierRange, Error as BackendError, FaultyBackend, Listed, MemoryBackend,
+    Meta,
+};
 
 const KEY_ID: &str = "AKIDCACHE";
 const SECRET: &str = "cache-secret";
@@ -406,4 +411,117 @@ async fn a_file_system_whose_size_is_unknown_is_not_judged_and_the_node_starts()
     let disk: Arc<dyn Disk> = zero;
     let drained = serving(&settings, upstream, disk, nothing).await.unwrap();
     assert_eq!(drained, Drained { abandoned: 0 });
+}
+
+/// What a read-only key sees of a store: the reads are answered and every write is refused as a
+/// 403 is, with an error that is no precondition's.
+struct ReadOnly(MemoryBackend);
+
+fn forbidden() -> BackendError {
+    BackendError::Other("403 AccessDenied".to_owned())
+}
+
+#[async_trait]
+impl Backend for ReadOnly {
+    async fn put(&self, _key: &str, _body: Bytes) -> Result<(), BackendError> {
+        Err(forbidden())
+    }
+
+    async fn put_if_match(
+        &self,
+        _key: &str,
+        _body: Bytes,
+        _etag: &str,
+    ) -> Result<String, BackendError> {
+        Err(forbidden())
+    }
+
+    async fn get(&self, key: &str, range: Option<TierRange>) -> Result<Bytes, BackendError> {
+        self.0.get(key, range).await
+    }
+
+    async fn head(&self, key: &str) -> Result<Meta, BackendError> {
+        self.0.head(key).await
+    }
+
+    async fn delete(&self, _key: &str) -> Result<(), BackendError> {
+        Err(forbidden())
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<Listed>, BackendError> {
+        self.0.list(prefix).await
+    }
+
+    async fn create_upload(&self, _key: &str) -> Result<String, BackendError> {
+        Err(forbidden())
+    }
+}
+
+/// Asserts that a start with `write_through` asks the upstream the write questions of the
+/// self-test and refuses an upstream that answers one wrongly with exit status 3, before the
+/// address is bound: a key that may not write (the create-only check), a store that overwrites on
+/// a create-only put (the same check), and one that overwrites on the completion of an upload (the
+/// multipart-conditional check, so the start asks the multipart question too). The same read-only
+/// upstream starts a node without `write_through`, which never asks.
+#[tokio::test]
+async fn a_write_through_start_tests_the_upstream_for_writes_and_refuses_a_wrong_answer_with_3() {
+    let node = Node::new("tscache-cli-wthru-refused");
+    let disk: Arc<dyn Disk> = Arc::new(SystemDisk);
+    let nothing = |_addr: SocketAddr| async {};
+    let writing = node.settings("", "write_through = true");
+    let reading = node.settings("", "");
+
+    let read_only: Arc<dyn Backend> = Arc::new(ReadOnly(MemoryBackend::new()));
+    let overwriting: Arc<dyn Backend> = Arc::new(Flawed::new(Flaw::OverwritesOnCreate));
+    let completing: Arc<dyn Backend> = Arc::new(Flawed::new(Flaw::CompletionOverwrites));
+    let flaws = [
+        (read_only.clone(), "create-only"),
+        (overwriting, "create-only"),
+        (completing, "multipart-conditional"),
+    ];
+    for (upstream, check) in flaws {
+        let why = serving(&writing, upstream, disk.clone(), nothing)
+            .await
+            .unwrap_err();
+        let said = format!("failed the {check} check");
+        assert!(why.to_string().contains(&said), "{check}: {why}");
+        assert_eq!(exit_status(&why), 3, "{check}");
+    }
+
+    let drained = serving(&reading, read_only, disk, nothing).await.unwrap();
+    assert_eq!(drained, Drained { abandoned: 0 });
+}
+
+/// Asserts that a node with `write_through` over an upstream that answers the self-test takes a
+/// create-only put through its front, which is made at the upstream, and a repeat of it is
+/// refused with a precondition error; that the probe keys of the self-test are gone from the
+/// upstream when the node has started; and that the same node without `write_through` refuses the
+/// put and the upstream gets none.
+#[tokio::test]
+async fn a_write_through_node_takes_a_put_and_a_read_cache_refuses_it() {
+    let node = Node::new("tscache-cli-wthru-serve");
+    let disk: Arc<dyn Disk> = Arc::new(SystemDisk);
+    for writes in [true, false] {
+        let flat = Arc::new(Flawed::new(Flaw::None));
+        let upstream: Arc<dyn Backend> = flat.clone();
+        let local = if writes { "write_through = true" } else { "" };
+        let settings = node.settings("", local);
+        let work = |addr: SocketAddr| async move {
+            let store = client(addr);
+            let key = ObjectKey::new("cas/made").unwrap();
+            let made = store.put_new(&key, Bytes::from_static(b"made"), None).await;
+            assert_eq!(made.is_ok(), writes, "{made:?}");
+            let again = store
+                .put_new(&key, Bytes::from_static(b"twice"), None)
+                .await;
+            assert!(again.is_err());
+        };
+        let drained = serving(&settings, upstream, disk.clone(), work)
+            .await
+            .unwrap();
+        assert_eq!(drained, Drained { abandoned: 0 });
+        let stored = flat.inner.get("cas/made", None).await;
+        assert_eq!(stored.ok(), writes.then(|| Bytes::from_static(b"made")));
+        assert!(flat.inner.list("_tiering/").await.unwrap().is_empty());
+    }
 }
