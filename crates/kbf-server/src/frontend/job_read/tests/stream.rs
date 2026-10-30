@@ -144,9 +144,10 @@ async fn a_blob_over_the_bound_is_streamed_with_its_content_length() {
     assert_eq!(got.header("content-type"), Some("application/octet-stream"));
 }
 
-/// Catches: a blob whose stored bytes are not its digest's being sent to the end over the wire
-/// (the response must be shorter than its content length, so that the client sees the break at
-/// once), and the bytes of the blobs before it being spoilt.
+/// Catches: a blob whose stored bytes are not its digest's being sent to the end over the wire.
+/// The response is cut short: the client either gets no response at all (the server aborts a
+/// response it has not yet flushed) or one that ends before its content length, and never the
+/// whole of the wrong blob.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_corrupt_large_blob_is_cut_short_over_tls() {
     let dir = scratch_dir("job-read-stream-corrupt");
@@ -161,18 +162,22 @@ async fn a_corrupt_large_blob_is_cut_short_over_tls() {
         &path_of(&large.big),
         Some(&large.token()),
     )
-    .await
-    .expect("connects");
-    let length: usize = got
-        .header("content-length")
-        .and_then(|v| v.parse().ok())
-        .expect("a content length");
-    assert_eq!(length, large.bytes.len());
-    assert!(
-        got.body.len() < length,
-        "{} of {length} bytes",
-        got.body.len()
-    );
+    .await;
+    match got {
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof),
+        Ok(got) => {
+            let length: usize = got
+                .header("content-length")
+                .and_then(|v| v.parse().ok())
+                .expect("a content length");
+            assert_eq!(length, large.bytes.len());
+            assert!(
+                got.body.len() < length,
+                "{} of {length} bytes",
+                got.body.len()
+            );
+        }
+    }
 }
 
 /// Catches: a blob over the cap being opened (it is 413 with its reason code before a byte is

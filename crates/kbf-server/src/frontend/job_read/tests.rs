@@ -289,10 +289,11 @@ async fn send(
     let mut raw = Vec::new();
     // The server closes after its answer; whether it says so first does not matter.
     let _ = tls.read_to_end(&mut raw).await;
+    // A server that aborts a response it has not flushed leaves no head at all.
     let split = raw
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .expect("a response head");
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
     let head = std::str::from_utf8(&raw[..split]).expect("a text head");
     let mut lines = head.lines();
     let status = lines
