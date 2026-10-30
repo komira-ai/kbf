@@ -223,3 +223,50 @@ async fn a_failed_walk_does_not_stay_in_the_scope_memory() {
     assert_eq!(rig.get(&b.files[0], &tb).await.status, StatusCode::OK);
     assert_eq!(rig.get(&a.files[0], &ta).await.status, StatusCode::OK);
 }
+
+/// Catches: the memory of scopes growing past its bound when walks fail or are cancelled (each
+/// leaves a cell nobody waits on): with a bound of two, six Actions whose walk fails and six
+/// whose walk is dropped mid-read leave no more than two cells held, and an Action that is asked
+/// for again once the store is back is served.
+#[tokio::test]
+async fn failed_and_cancelled_walks_do_not_grow_the_scope_memory() {
+    let mut blobs = HashMap::new();
+    let built: Vec<Built> = (0..12)
+        .map(|i| build(&mut blobs, &format!("t{i}"), &[pattern(i, 50)], 0))
+        .collect();
+    let limits = Limits {
+        scopes: 2,
+        ..Limits::default()
+    };
+    let rig = rig(blobs, None, limits);
+    rig.source.broken.store(true, Ordering::SeqCst);
+    for b in &built[..6] {
+        let reply = rig.get(&b.command, &rig.token(b.action)).await;
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            rig.read.scopes_held() <= 2,
+            "{} held",
+            rig.read.scopes_held()
+        );
+    }
+    rig.source.broken.store(false, Ordering::SeqCst);
+    for b in &built[6..] {
+        // Dropped after its walk has begun: the future is polled until the source has been asked
+        // for the Action, then not polled again.
+        let token = rig.token(b.action);
+        let mut request = Box::pin(rig.get(&b.command, &token));
+        while rig.source.reads_of(&b.action) == 0 {
+            assert!(futures::poll!(request.as_mut()).is_pending());
+            tokio::task::yield_now().await;
+        }
+        drop(request);
+        assert!(
+            rig.read.scopes_held() <= 2,
+            "{} held",
+            rig.read.scopes_held()
+        );
+    }
+    let first = &built[0];
+    let reply = rig.get(&first.command, &rig.token(first.action)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+}
