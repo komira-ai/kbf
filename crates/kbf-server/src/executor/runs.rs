@@ -441,6 +441,22 @@ impl HostWorker {
             Some(ErrorCode::NotHeld | ErrorCode::UnknownLease | ErrorCode::Expired) => {
                 Queued::Retire(Retire::Gone)
             }
+            // Every host holds the pool's shape, so a run over it fits no host and rerunning
+            // the action never helps: the action's limits are the caller's to fix.
+            Some(ErrorCode::LimitsExceedShape) => {
+                let limits = &prepared.spec.limits;
+                let disk = limits
+                    .disk_bytes
+                    .map_or_else(|| "none".to_owned(), |bytes| format!("{bytes} bytes"));
+                Queued::Settled(Settled::Invalid(format!(
+                    "the run's limits (cpu {} millis, memory {} bytes, disk {disk}) exceed the \
+                     pool's shape (cpu {} millis, memory {} bytes), which every host shares",
+                    limits.cpu_millis,
+                    limits.memory_bytes,
+                    ctx.cfg.cpu_millis,
+                    ctx.cfg.memory_bytes,
+                )))
+            }
             Some(other) => Queued::Settled(Settled::Infra(format!(
                 "the lease server refused the run: {other}"
             ))),
