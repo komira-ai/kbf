@@ -56,7 +56,6 @@ impl Inputs for Easy {
         Ok(ActionFacts {
             image: format!("registry.test/app@sha256:{}", "ab".repeat(32)),
             timeout: Some(Duration::from_secs(20)),
-            has_entrypoint: false,
         })
     }
 

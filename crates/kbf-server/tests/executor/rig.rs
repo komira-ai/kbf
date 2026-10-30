@@ -42,7 +42,6 @@ impl FakeInputs {
             facts: Mutex::new(Ok(ActionFacts {
                 image: IMAGE.to_owned(),
                 timeout: Some(Duration::from_secs(60)),
-                has_entrypoint: false,
             })),
             grant: Mutex::new(Ok(ReadGrant {
                 url: "https://grant.test:9400".to_owned(),

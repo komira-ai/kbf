@@ -164,6 +164,7 @@ struct RunRow {
     memory_bytes: u64,
     wall_ms: u64,
     args: Vec<String>,
+    image: String,
     mounts: Vec<Mount>,
     labels: BTreeMap<String, String>,
 }
@@ -462,6 +463,7 @@ impl State {
             memory_bytes: limits.memory_bytes,
             wall_ms: limits.wall_ms.map_or(cap, |asked| asked.min(cap)),
             args: spec.args.clone(),
+            image: spec.image.clone(),
             mounts: spec.mounts.clone(),
             labels: spec.labels.clone(),
         };
@@ -641,6 +643,13 @@ impl State {
             .iter()
             .find(|row| row.id == *run)
             .map(|row| row.args.clone())
+    }
+
+    pub(super) fn run_image(&self, run: &RunId) -> Option<String> {
+        self.runs
+            .iter()
+            .find(|row| row.id == *run)
+            .map(|row| row.image.clone())
     }
 
     pub(super) fn run_mounts(&self, run: &RunId) -> Option<Vec<Mount>> {
