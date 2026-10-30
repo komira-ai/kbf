@@ -108,9 +108,20 @@ impl Leader {
     }
 }
 
+impl Leader {
+    /// Kills the leader and, when nothing is waiting for it, reaps it on a thread of its
+    /// own; `then` runs there once it is reaped.
+    fn finish(&mut self, then: impl FnOnce() + Send + 'static) {
+        let _ = self.start_kill();
+        if self.task.is_none() && self.answer.is_none() {
+            then();
+        }
+    }
+}
+
 impl Drop for Leader {
     fn drop(&mut self) {
-        let _ = self.start_kill();
+        self.finish(|| ());
     }
 }
 
@@ -293,6 +304,47 @@ mod tests {
     #[test]
     fn wait4_of_a_process_that_is_not_a_child_fails() {
         assert!(wait4(NO_SUCH).is_err());
+    }
+
+    /// Catches: a leader dropped before its first wait left a zombie (killed, never
+    /// reaped). The reap runs on its own thread and says when it is done; the pid then
+    /// names no process, not even a zombie (`kill(pid, 0)` fails with ESRCH).
+    #[test]
+    fn a_leader_dropped_before_its_first_wait_is_reaped() {
+        let mut leader = sleeper();
+        let pid = leader.pid();
+        let (done, reaped) = std::sync::mpsc::channel();
+        leader.finish(move || done.send(()).expect("test is listening"));
+        reaped.recv().expect("reaped");
+        // SAFETY: signal 0 sends nothing; it only asks whether the pid names a process.
+        let found = unsafe { libc::kill(pid, 0) };
+        assert_eq!(found, -1, "pid {pid} is still a process (a zombie)");
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    /// Catches: a second reaper started for a leader that is already being waited for or
+    /// is reaped (two waits for one pid): a dropped leader whose wait is running leaves
+    /// the reap to it, and one already reaped is left alone.
+    #[tokio::test]
+    async fn a_leader_being_waited_for_or_reaped_is_dropped_without_a_second_reaper() {
+        let mut leader = sleeper();
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(50), leader.wait()).await;
+        assert!(waited.is_err(), "the sleeper is still running");
+        let (done, never) = std::sync::mpsc::channel::<()>();
+        leader.finish(move || done.send(()).expect("test is listening"));
+        let reaped = leader.wait().await.expect("reaped by the running wait");
+        assert_eq!(reaped.status.signal(), Some(libc::SIGKILL));
+        assert!(never.try_recv().is_err(), "no second reaper ran");
+
+        let mut leader = Leader::new(Command::new("true").spawn().expect("true"));
+        leader.wait().await.expect("reaped");
+        let (done, never) = std::sync::mpsc::channel::<()>();
+        leader.finish(move || done.send(()).expect("test is listening"));
+        assert!(never.try_recv().is_err(), "no reaper for a reaped leader");
     }
 
     /// Catches: a negative pid accepted for waitid's unsigned id.

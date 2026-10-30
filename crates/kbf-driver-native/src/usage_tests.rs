@@ -355,7 +355,7 @@ fn without_a_reap_the_total_is_the_last_polls_own_and_children_cpu() {
 fn a_leader_read_only_before_its_exit_is_counted_by_its_reap_alone() {
     let mut meter = Meter::default();
     poll(&mut meter, &[(10, proc_row(S, 0, 1))]);
-    poll(&mut meter, &[(11, proc_row(2 * S, 0, 1))]);
+    poll(&mut meter, &[(11, proc_row(2 * S, 0, 10))]);
     reap(&mut meter, 10, 3);
     assert_eq!(user_micros(&meter), 3_000_000);
 }
@@ -376,4 +376,72 @@ fn a_reap_with_no_poll_reports_its_cpu_and_no_peak() {
     assert_eq!(f.cpu_user_micros, Some(700));
     assert_eq!(f.cpu_system_micros, Some(300));
     assert_eq!(f.peak_footprint_bytes, None);
+}
+
+/// Catches: a process that was never the leader's to reap and was still running at the
+/// last poll dropped by the larger-of rule. The orphan (parent launchd, pid 1) was alive
+/// at the last poll with 2 s; the leader's reap (4 s: the leader's own and the child it
+/// reaped) is larger than the whole last poll (1 s + 2 s) and holds none of the orphan.
+/// The total is the reap and the orphan, 6 s, not 4.
+#[test]
+fn an_orphan_alive_at_the_last_poll_is_added_to_the_reap() {
+    let mut meter = Meter::default();
+    poll(
+        &mut meter,
+        &[(10, proc_row(S, 0, 1)), (12, proc_row(2 * S, 0, 1))],
+    );
+    reap(&mut meter, 10, 4);
+    assert_eq!(user_micros(&meter), 6_000_000);
+}
+
+/// Catches: the same orphan counted twice, or the larger-of rule lost for the leader's
+/// own children: a child of the leader alive at the last poll (3 s) is part of the
+/// reap (4 s), so the total is 4 s, with the orphan's 2 s on top.
+#[test]
+fn a_child_of_the_leader_alive_at_the_last_poll_is_not_added_with_the_orphan() {
+    let mut meter = Meter::default();
+    poll(
+        &mut meter,
+        &[
+            (10, proc_row(S, 0, 1)),
+            (11, proc_row(3 * S, 0, 10)),
+            (12, proc_row(2 * S, 0, 1)),
+        ],
+    );
+    reap(&mut meter, 10, 4);
+    assert_eq!(user_micros(&meter), 6_000_000);
+}
+
+/// Catches: a grandchild alive at the last poll taken for an orphan because its parent is
+/// not the leader: the parent is a live process of the same poll, so the grandchild is in
+/// the chain (its parent will reap it) and the larger-of rule covers it.
+#[test]
+fn a_grandchild_alive_at_the_last_poll_is_in_the_chain() {
+    let mut meter = Meter::default();
+    poll(
+        &mut meter,
+        &[
+            (10, proc_row(S, 0, 1)),
+            (11, proc_row(S, 0, 10)),
+            (13, proc_row(2 * S, 0, 11)),
+        ],
+    );
+    reap(&mut meter, 10, 4);
+    assert_eq!(user_micros(&meter), 4_000_000);
+}
+
+/// Catches: a parent read as unknown (0, when the table lookup lost the race with the
+/// exit) replacing the parent an earlier read gave, which would make a child of a polled
+/// parent look like an orphan and be counted again on top of the reap.
+#[test]
+fn a_parent_unknown_in_a_later_reading_keeps_the_one_known_before() {
+    let mut meter = Meter::default();
+    poll(
+        &mut meter,
+        &[(10, proc_row(S, 0, 1)), (11, proc_row(S, 0, 10))],
+    );
+    poll(&mut meter, &[(10, proc_row(S, 0, 1)), (11, proc_row(2 * S, 0, 0))]);
+    poll(&mut meter, &[(10, proc_row(S, 0, 1))]);
+    reap(&mut meter, 10, 4);
+    assert_eq!(user_micros(&meter), 4_000_000);
 }
