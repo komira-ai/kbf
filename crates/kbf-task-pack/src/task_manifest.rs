@@ -125,6 +125,10 @@ pub enum ManifestError {
         "manifest version {MANIFEST_VERSION_2} with one pack, no large object and no inputs is spelled as version {MANIFEST_VERSION}"
     )]
     NotV2,
+    /// A manifest that names more than one pack, given to a reader of one pack: only the `_with`
+    /// forms read a multi-pack run, because the others would take pack 0 for all of it.
+    #[error("the manifest names {0} packs; this reader takes one")]
+    MultiPack(u8),
     /// `packs` is 0 or more than [`MAX_PACKS`].
     #[error("packs is {0}, not in 1..={MAX_PACKS}")]
     Packs(u8),
