@@ -222,6 +222,7 @@ fn tiered(
         "--listen=127.0.0.1:0".to_owned(),
         "--worker-listen=127.0.0.1:0".to_owned(),
         format!("--cold-store=file://{}", dir.join("cold").display()),
+        "--cold-store-floor-bytes=1".to_owned(),
         format!("--hot-store=file://{}", dir.join("hot").display()),
     ])
     .expect("flags");

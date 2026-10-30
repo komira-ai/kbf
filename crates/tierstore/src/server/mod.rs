@@ -147,9 +147,11 @@
 //! Without [`ServerConfig::proxy`] it is 200 and says the usage is not watched. A bucket cannot
 //! be called `usagez` either.
 //!
-//! `GET /metricz` is 200 with the counters of the OCI read front ([`oci`]) in the Prometheus text
-//! format, or a line that says the front is not enabled; it is not signed either, and a bucket
-//! cannot be called `metricz`.
+//! `GET /metricz` is 200 with the counters of the OCI read front ([`oci`]) and of the local cache
+//! ([`local_cache`]) in the Prometheus text format, each block or else a line that says it is
+//! not there; it is not signed either, and a bucket cannot be called `metricz`. A server that is
+//! the front of a local cache is a read cache: it answers GET and HEAD and refuses every other
+//! method, copies and multipart calls included, with 403 `AccessDenied`.
 //!
 //! # Drain
 //!
@@ -165,14 +167,18 @@
 //! the deadline cut: those still running, or still being sent.
 
 mod auth;
+mod cache_cli;
 pub mod cli;
 mod config;
+mod config_cache;
 mod config_print;
+mod front;
 pub mod gc;
 mod handover;
 mod idle;
 mod keys;
 mod launch;
+pub mod local_cache;
 pub mod oci;
 mod ops;
 pub mod presign;
@@ -187,7 +193,11 @@ mod auth_tests;
 #[cfg(test)]
 mod body_stall_tests;
 #[cfg(test)]
+mod cache_cli_tests;
+#[cfg(test)]
 mod completion_tests;
+#[cfg(test)]
+mod config_cache_tests;
 #[cfg(test)]
 mod config_testing;
 #[cfg(test)]
@@ -257,6 +267,7 @@ use crate::{Backend, Clock, MonotonicClock, Proxy};
 pub use gc::GcKey;
 pub use keys::AccessKey;
 use keys::Role;
+pub use local_cache::LocalCache;
 pub use presign::{Grant, PresignKey, PresignRequest, presign_put};
 pub use scoped::{Prefixes, ScopedKey};
 
@@ -331,6 +342,11 @@ pub struct ServerConfig {
     /// The proxy whose usage object `/usagez` judges: none by default, and then `/usagez` says
     /// the usage is not watched. The binary sets the proxy it serves.
     pub proxy: Option<Arc<Proxy>>,
+    /// The local cache the server is the front of, if it is one: none by default. With one the
+    /// server is a read cache: every call but GET and HEAD is refused 403 `AccessDenied` before
+    /// its body is read, and `/metricz` shows the cache's counters. The binary sets the cache it
+    /// serves, which is also the server's backend.
+    pub cache: Option<LocalCache>,
     /// The age of the usage object past which `/usagez` says 503. A server that has run this
     /// long without finding any usage object is judged the same way. Longer than the lease and
     /// the pass interval of the reconciler, so that a takeover of the lease does not show.
@@ -378,6 +394,7 @@ impl ServerConfig {
             drain_lb_wait: Duration::from_secs(10),
             drain_deadline: Duration::from_secs(900),
             proxy: None,
+            cache: None,
             usage_stale_after: Duration::from_secs(120),
             oci_metrics: None,
             clock,
@@ -715,6 +732,10 @@ impl Server {
             return Err(S3Error::draining());
         }
         let signed = auth::verify(&self.config, parts)?;
+        let reads = matches!(parts.method, Method::GET | Method::HEAD);
+        if self.config.cache.is_some() && !reads {
+            return Err(S3Error::read_cache());
+        }
         signed.role.permit(&parts.method)?;
         let target = resolve(&self.config.bucket, parts.uri.path())?;
         let query = Query::parse(parts.uri.query())?;
@@ -766,12 +787,21 @@ impl Server {
         Some(answer(status, &headers, Bytes::from(text)))
     }
 
-    /// The text of `/metricz`: the counters of the OCI front, or a line that says it is off.
+    /// The text of `/metricz`: the counters of the OCI front and those of the local cache, each
+    /// block or else a line that says it is not there.
     fn metrics_probe(&self) -> String {
-        match &self.config.oci_metrics {
+        let mut text = match &self.config.oci_metrics {
             Some(metrics) => metrics.render(),
             None => "# the OCI read front is not enabled\n".to_owned(),
+        };
+        if !text.ends_with('\n') {
+            text.push('\n');
         }
+        match &self.config.cache {
+            Some(cache) => text.push_str(&cache.metrics()),
+            None => text.push_str("# this tierstore has no local cache\n"),
+        }
+        text
     }
 
     /// The answer of `/usagez`: 200 and the age of the usage object of the reconciler while it is
