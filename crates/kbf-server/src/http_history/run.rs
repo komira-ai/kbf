@@ -360,6 +360,9 @@ pub(crate) fn render(r: &RunRecord) -> Value {
             put(key, bytes.into());
         }
     }
+    if let Some(cpu) = r.booked_millicpus {
+        put("booked_millicpus", cpu.into());
+    }
     if r.farm_budget != 0 {
         put("farm_runs", r.farm_runs.into());
         put("farm_budget", r.farm_budget.into());

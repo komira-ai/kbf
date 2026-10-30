@@ -269,7 +269,13 @@ pub async fn report(
             adapter.is_recorded(operation),
         )
     });
-    let Some(Sent { action, stamp, .. }) = sent else {
+    let Some(Sent {
+        action,
+        stamp,
+        booked,
+        ..
+    }) = sent
+    else {
         return Ok(Some(refusal(wire, ResultAckReason::UnknownLease)));
     };
     if let Some(named) = &result.action_digest
@@ -282,10 +288,10 @@ pub async fn report(
     let ran_on = (worker, stamp);
     // Read before `outcome`, which drops a failed run's result. What the report measured
     // is kept for the hooks around the feed (`action usage:` line, the invocation record).
-    let measured = Measured::of(&result);
+    let measured = Measured::of(&result).map(|m| m.booked(booked));
     let run = recorded.then(|| {
         let usage = measured.as_ref().map(Measured::usage);
-        run_record::of(&result, usage, stamp, read())
+        run_record::of(&result, usage, stamp, read(), booked)
     });
     let (outcome, detail) = answer::outcome(cache, read, lease, ran_on, result).await;
     let report = Report {
@@ -329,6 +335,7 @@ impl KbfAdapter {
                     queued: waiter.queued,
                     started: waiter.queued,
                 },
+                booked: None,
             })
         })
     }
