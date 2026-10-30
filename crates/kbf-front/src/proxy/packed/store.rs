@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use kbf_objstore::{ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
+use kbf_objstore::{BodyStream, ByteRange, ObjectKey, ObjectStore, ObjectStoreError};
 use kbf_pack::{
     Blob, FRONTEND_PACK_BYTES, Fetch, PackError, PackKeys, Packed, Packer, PackerConfig, ReadCache,
     ReadError, Reader, ReaderConfig, check_create_only,
@@ -93,6 +93,16 @@ pub trait PackStore: Send + Sync {
         &'a self,
         key: &'a ObjectKey,
     ) -> BoxFuture<'a, Result<Option<u64>, ObjectStoreError>>;
+
+    /// Writes the object `key` of exactly `len` bytes from `body` as it is sent
+    /// ([`ObjectStore::put_stream`]): create-only, and an `Err` piece or a body of another length
+    /// leaves nothing under `key`.
+    fn put_stream<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        len: u64,
+        body: BodyStream,
+    ) -> BoxFuture<'a, Result<(), ObjectStoreError>>;
 }
 
 /// A packer and a reader over one store.
@@ -132,6 +142,15 @@ impl<S: ObjectStore> PackStore for Over<S> {
         key: &'a ObjectKey,
     ) -> BoxFuture<'a, Result<Option<u64>, ObjectStoreError>> {
         Box::pin(self.store.len(key))
+    }
+
+    fn put_stream<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        len: u64,
+        body: BodyStream,
+    ) -> BoxFuture<'a, Result<(), ObjectStoreError>> {
+        Box::pin(self.store.put_stream(key, len, body))
     }
 }
 

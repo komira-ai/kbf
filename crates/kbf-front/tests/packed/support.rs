@@ -5,16 +5,17 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt as _;
 use kbf_auth::Authorizers;
 use kbf_front::{Cache, CacheStorage, Owner, Owners, PackSettings, Packs, Proxy, SegmentsConfig};
 use kbf_objstore::{
-    ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
-    ObjectStoreError, PageSize,
+    BodyStream, ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey,
+    ObjectStore, ObjectStoreError, PageSize,
 };
 use kbf_pack::{PackKeys, WriterKind};
 use kbf_pack_index::memory::MemoryPackIndex;
@@ -43,9 +44,18 @@ fn fires(armed: &AtomicU32) -> bool {
 }
 
 fn injected() -> ObjectStoreError {
+    injected_with(503)
+}
+
+fn injected_with(status: u32) -> ObjectStoreError {
+    let code = if status == 507 {
+        "InsufficientStorage"
+    } else {
+        "SlowDown"
+    };
     ObjectStoreError::Service {
-        status: 503,
-        code: "SlowDown".to_owned(),
+        status: u16::try_from(status).expect("a status"),
+        code: code.to_owned(),
         message: "injected".to_owned(),
     }
 }
@@ -62,7 +72,13 @@ pub struct Spy {
     reject_big_reads: AtomicU32,
     reject_large_lens: AtomicU32,
     overstated: Mutex<Vec<(String, u64)>>,
+    hidden: Mutex<Vec<String>>,
+    failing_len: Mutex<Vec<String>>,
+    put_status: AtomicU32,
+    stall_streams: AtomicBool,
     puts: AtomicU32,
+    stream_puts: AtomicU32,
+    largest_piece: AtomicU64,
     ranges: Mutex<Vec<(String, u64, u64)>>,
 }
 
@@ -101,7 +117,13 @@ impl Spy {
             reject_big_reads: AtomicU32::new(0),
             reject_large_lens: AtomicU32::new(0),
             overstated: Mutex::new(Vec::new()),
+            hidden: Mutex::new(Vec::new()),
+            failing_len: Mutex::new(Vec::new()),
+            put_status: AtomicU32::new(503),
+            stall_streams: AtomicBool::new(false),
             puts: AtomicU32::new(0),
+            stream_puts: AtomicU32::new(0),
+            largest_piece: AtomicU64::new(0),
             ranges: Mutex::new(Vec::new()),
         }
     }
@@ -148,9 +170,56 @@ impl Spy {
         overstated.push((key.to_owned(), by));
     }
 
+    /// The length question about `key` is answered as if there were no object (a write of the key
+    /// is still refused when it is held).
+    pub fn hide_len_of(&self, key: &str) {
+        let mut hidden = self.hidden.lock().unwrap_or_else(PoisonError::into_inner);
+        hidden.push(key.to_owned());
+    }
+
+    /// The length question about `key` fails (every time it is asked).
+    pub fn fail_len_of(&self, key: &str) {
+        let mut failing = self
+            .failing_len
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        failing.push(key.to_owned());
+    }
+
+    /// The next `n` writes fail with the HTTP `status` (503 and 507 are the answers of a store
+    /// that is slow and one that is full).
+    pub fn reject_puts_with(&self, n: u32, status: u32) {
+        self.put_status.store(status, SeqCst);
+        self.reject_puts.store(n, SeqCst);
+    }
+
+    /// A streamed write takes every byte of its body and then never finishes.
+    pub fn stall_streams(&self) {
+        self.stall_streams.store(true, SeqCst);
+    }
+
+    /// How many streamed writes were tried (not the writes the pack index makes).
+    pub fn stream_puts(&self) -> u32 {
+        self.stream_puts.load(SeqCst)
+    }
+
     /// How many writes were tried.
     pub fn puts(&self) -> u32 {
         self.puts.load(SeqCst)
+    }
+
+    /// The most bytes any one piece of a streamed write's body has had so far: what a writer
+    /// held at once to hand the store a piece.
+    pub fn largest_piece(&self) -> u64 {
+        self.largest_piece.load(SeqCst)
+    }
+
+    /// The bytes of the object under `key`, if the store holds one.
+    pub async fn held(&self, key: &str) -> Option<Bytes> {
+        let key = ObjectKey::new(key).expect("a key");
+        let len = self.inner.len(&key).await.expect("asked")?;
+        let range = ByteRange::new(0, len).expect("bytes");
+        Some(self.inner.get_range(&key, range).await.expect("read"))
     }
 
     /// Every range read so far: the key, the offset and the length.
@@ -201,6 +270,35 @@ impl ObjectStore for Spy {
         self.inner.put_new(key, body, retain_until).await
     }
 
+    async fn put_stream(
+        &self,
+        key: &ObjectKey,
+        len: u64,
+        mut body: BodyStream,
+    ) -> Result<(), ObjectStoreError> {
+        self.puts.fetch_add(1, SeqCst);
+        self.stream_puts.fetch_add(1, SeqCst);
+        if fires(&self.reject_puts) {
+            return Err(injected_with(self.put_status.load(SeqCst)));
+        }
+        let mut out = BytesMut::new();
+        while let Some(piece) = body.next().await {
+            let piece = piece?;
+            self.largest_piece.fetch_max(piece.len() as u64, SeqCst);
+            if out.len() as u64 + piece.len() as u64 > len {
+                return Err(ObjectStoreError::Body("more than its length".to_owned()));
+            }
+            out.extend_from_slice(&piece);
+        }
+        if (out.len() as u64) < len {
+            return Err(ObjectStoreError::Body("shorter than its length".to_owned()));
+        }
+        if self.stall_streams.load(SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        self.inner.put_new(key, out.freeze(), None).await
+    }
+
     async fn get_range(
         &self,
         key: &ObjectKey,
@@ -228,9 +326,26 @@ impl ObjectStore for Spy {
         if fires(&self.reject_lens) {
             return Err(injected());
         }
+        let failing = {
+            let failing = self
+                .failing_len
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            failing.iter().any(|named| named == key.as_str())
+        };
+        if failing {
+            return Err(injected());
+        }
         let large = key.as_str().rsplit('-').next();
         if large.is_some_and(|slot| slot.starts_with('L')) && fires(&self.reject_large_lens) {
             return Err(injected());
+        }
+        let hidden = {
+            let hidden = self.hidden.lock().unwrap_or_else(PoisonError::into_inner);
+            hidden.iter().any(|named| named == key.as_str())
+        };
+        if hidden {
+            return Ok(None);
         }
         let shave = self.shave_len.load(SeqCst);
         let len = self.inner.len(key).await?;

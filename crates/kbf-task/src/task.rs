@@ -20,6 +20,7 @@
 //! | 12 | pack: the outputs could not be collected, did not fit the run's packs and large objects (`output-too-large`), changed after they were hashed (`output-changed`), or made a manifest or pack the frontend would refuse (`invalid-manifest`, `invalid-pack`) |
 //! | 13 | put: a pack or large object could not be stored (refused, key already taken, still no room after the retries of a 503, unreachable), or a large object's bytes changed while it was sent (the stored object is an orphan) |
 //! | 14 | setup: `--lease` is not a build id, a credential or root certificate is unusable, a credential given as a flag value without `--insecure-argv-secrets`, or the runtime did not start |
+//! | 15 | no confine: the Command is to be denied the network and this system cannot deny it (not Linux, no platform confine built); nothing was run |
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -61,6 +62,8 @@ pub const EXIT_PACK: u8 = 12;
 pub const EXIT_PUT: u8 = 13;
 /// Exit code: a file a flag names is unusable, or the runtime did not start.
 pub const EXIT_SETUP: u8 = 14;
+/// Exit code: the Command is to be denied the network and this system has no confine that can.
+pub const EXIT_NO_CONFINE: u8 = 15;
 
 /// `kbf-task`: runs one build action inside a job and stores its pack with one PUT.
 ///
@@ -235,6 +238,7 @@ impl Failure {
         match self {
             Failure::Setup(_) => EXIT_SETUP,
             Failure::Fetch(_) => EXIT_FETCH,
+            Failure::Run(RunError::NoConfine) => EXIT_NO_CONFINE,
             Failure::Run(_) => EXIT_RUN,
             Failure::Outputs(_) | Failure::Result(_) | Failure::Read(_) | Failure::Pack(_) => {
                 EXIT_PACK
