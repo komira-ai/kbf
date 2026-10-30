@@ -1,5 +1,6 @@
 use kbf_proto::reapi::{Platform, platform::Property};
 
+#[cfg(target_os = "linux")]
 use super::seccomp::filter;
 use super::*;
 

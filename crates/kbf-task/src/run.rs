@@ -315,11 +315,16 @@ fn children_usage() -> ChildrenUsage {
     // SAFETY: the pointer is to a live local of the right type, which `getrusage` writes and
     // does not keep. On failure the zeroes stay, which reads as "no usage".
     unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &raw mut usage) };
-    let micros = |t: libc::timeval| u64::try_from(t.tv_sec * 1_000_000 + t.tv_usec).unwrap_or(0);
+    // `tv_usec` is an `i32` on macOS and an `i64` on Linux.
+    #[allow(clippy::useless_conversion)]
+    let micros = |t: libc::timeval| {
+        u64::try_from(i64::from(t.tv_sec) * 1_000_000 + i64::from(t.tv_usec)).unwrap_or(0)
+    };
     ChildrenUsage {
         cpu_us: micros(usage.ru_utime) + micros(usage.ru_stime),
-        // Linux reports the peak resident set in KiB.
-        peak_rss_bytes: u64::try_from(usage.ru_maxrss).unwrap_or(0) * 1024,
+        // Linux reports the peak resident set in KiB, macOS in bytes.
+        peak_rss_bytes: u64::try_from(usage.ru_maxrss).unwrap_or(0)
+            * if cfg!(target_os = "macos") { 1 } else { 1024 },
     }
 }
 
