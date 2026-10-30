@@ -220,10 +220,17 @@ fn assert_root() {
     );
 }
 
-/// Polls `f` until it holds. A condition that never comes is ended by the test runner's
-/// per-test limit.
-fn until(f: impl Fn() -> bool) {
+/// Polls `f` until it holds. `sudo-test` runs the binary itself, not nextest, so no per-test
+/// hang guard applies: a condition that never comes is ended by the workflow job's own
+/// `timeout-minutes`. `waiting_for` is said on stderr every twenty polls, so that job's log
+/// names what it was waiting for.
+fn until(waiting_for: &str, f: impl Fn() -> bool) {
+    let mut polls = 0u32;
     while !f() {
+        polls += 1;
+        if polls.is_multiple_of(20) {
+            eprintln!("still waiting: {waiting_for}");
+        }
         std::thread::sleep(Duration::from_millis(500));
     }
 }
@@ -347,6 +354,13 @@ fn installer_places_files_and_loads_nothing() {
     success("launchctl", &["bootstrap", "system", PLIST]);
     let state = success("launchctl", &["print", &format!("system/{LABEL}")]);
     assert!(state.contains("state = not running"), "{state}");
+    // No wait stands between bootstrap and these checks: the old three-second sleep raced
+    // a clock, and `launchctl` offers no event for "launchd evaluated the gate and left the
+    // job down" to wait on instead. What this step proves is therefore the state at that
+    // instant (a job that ignored the gate and started late is not seen here). That defect
+    // is closed from the other side: `cargo xtask pkg build` refuses a property list not
+    // gated on the file and kbf-setup's `setup::tests` pins the gate path, and the step
+    // below shows the gate is what starts the job.
     assert!(!is_running());
     assert!(
         !Path::new(JOB_LOG).exists(),
@@ -358,7 +372,7 @@ fn installer_places_files_and_loads_nothing() {
     // `setup` writes (kbf-setup's `setup::tests` pins that the plist's gate is it).
     std::fs::create_dir_all(gate_dir()).unwrap();
     std::fs::write(gate(), b"# configured\n").unwrap();
-    until(|| {
+    until(&format!("the job to run once {} exists", gate()), || {
         std::fs::read_to_string(JOB_LOG).is_ok_and(|log| log.contains("kbf-installer-stub run"))
     });
     success("launchctl", &["bootout", &format!("system/{LABEL}")]);
