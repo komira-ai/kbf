@@ -488,13 +488,13 @@ On macOS `kbf-task` has no seccomp filter or namespace. It runs the Command alon
 `network=off` profile uses): everything is allowed except handing work to `launchd` and writing a
 preference, a Command denied the network gets the `network=off` denial of the table below
 (loopback and Unix sockets only), and for every Command reading the files this tool holds a
-credential or presigned URL in is denied (`--grant-token-file`, `--pack-url-file`,
-`--put-urls-file`). A Command with `kbf-network=allow` gets the profile without the network
+credential or presigned URL in is denied, as are writing it and renaming or removing the
+directories above it (`--grant-token-file`, `--pack-url-file`, `--put-urls-file`). A Command with `kbf-network=allow` gets the profile without the network
 clause. The line for a denied Command is `kbf-task: action <digest>: network: sandbox-exec profile
 (no network but loopback and unix sockets)`. The limits are the driver's: any Unix socket stays
 open, so DNS lookups still go out through the system's resolver, and a connect to the node's own
 non-loopback address was allowed under the denial on the macOS runner. The profile does not limit
-writes, and a credential given as a flag value (`--insecure-argv-secrets`) stays in this tool's
+other writes, helper daemons reached by `mach-lookup` and other services on the node stay reachable, and a credential given as a flag value (`--insecure-argv-secrets`) stays in this tool's
 argv. No macOS `kbf-task` is released yet. On a system that is neither Linux nor macOS there is
 no confine, and a Command denied the network is refused there (exit 15).
 

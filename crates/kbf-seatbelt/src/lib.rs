@@ -14,10 +14,23 @@
 //! - A connect to the node's own non-loopback address is still allowed under these rules (seen on
 //!   the macOS runner by `kbf-driver-native/tests/network.rs`), so a service listening on the
 //!   node's LAN address is reachable.
-//! - A read deny ([`Profile::deny_read`]) names a file by its path, as the sandbox compares paths:
-//!   the caller passes the real path (no symlink in it). It stops the opened file being read, not
-//!   a copy of its content that already sits in an argument, an environment variable or a file
-//!   that is not named.
+//! - A file deny ([`Profile::deny_read`]) names the file by its path, as the sandbox compares
+//!   paths, so the caller passes the real path (no symlink in it; a path that does not exist cannot
+//!   be resolved and is written as given, so a symlink in its parent is not followed). The profile
+//!   denies reading and writing the file, and renaming or removing each directory above it, so the
+//!   file cannot be given another name by a rename, an unlink or a hard link, or by renaming a
+//!   directory above it (each shown to be refused by `kbf-task`'s tests on a Mac). A deny on one
+//!   letter case of a name also matches another (the same test, on the macOS runner's volume). It
+//!   stops the file being read, not a copy of its content that already sits in an argument, an
+//!   environment variable or a file that is not named.
+//! - `(allow default)` leaves the process every operation the profile does not name, among them
+//!   `mach-lookup` of helper daemons, which can act for it outside the profile, and any other
+//!   service on loopback or on a Unix socket on the node.
+//! - A process of the same user can look at the task runner's own arguments and process: the
+//!   Linux hardening against it (`protect_this_process`) does not exist on macOS. A credential
+//!   given as a flag value is in those arguments.
+//! - `DYLD_*` variables are not a way round the profile: `sandbox-exec` is a platform binary
+//!   protected by SIP, which ignores them.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -123,8 +136,9 @@ impl Profile {
     /// `lsopen`) and writing a preference through `cfprefsd`, then the network denial if asked,
     /// then [`NO_DEVICE_RULES`], then, per file, `(deny file-read* (literal "<path>"))` and the same for
     /// `file-write*` (which covers a rename, an unlink and a hard link of the file, each of which
-    /// would otherwise give the same file a second name the read deny does not name). The denies
-    /// are last: a later rule wins.
+    /// would otherwise give the same file a second name the read deny does not name), and one
+    /// `file-write-unlink` deny for each directory above it, so the directory cannot be renamed
+    /// away with the file in it. The denies are last: a later rule wins.
     ///
     /// Writes are not limited by this profile (the driver's profiles limit them to a lease
     /// directory; this one does not), so a process may write wherever its user can.
@@ -147,6 +161,14 @@ impl Profile {
                 });
             }
             let literal = quoted(path)?;
+            // Renaming a directory above the file gives it another path as well: no ancestor of
+            // it may be renamed or removed (a child of an ancestor still may).
+            for ancestor in path.ancestors().skip(1).filter(|a| a.parent().is_some()) {
+                let rule = format!("(deny file-write-unlink (literal {}))\n", quoted(ancestor)?);
+                if !text.contains(&rule) {
+                    text.push_str(&rule);
+                }
+            }
             for operation in ["file-read*", "file-write*"] {
                 text.push_str("(deny ");
                 text.push_str(operation);

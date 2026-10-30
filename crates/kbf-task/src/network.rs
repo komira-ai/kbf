@@ -88,14 +88,18 @@
 //!
 //! - for a Command denied the network, denies every network operation but to loopback and to Unix
 //!   sockets; for one allowed it, adds no network clause;
-//! - denies reading each file this tool was given a credential or presigned URL in
-//!   (`--grant-token-file`, `--pack-url-file`, `--put-urls-file`), for either kind of Command.
+//! - denies reading and writing each file this tool was given a credential or presigned URL in
+//!   (`--grant-token-file`, `--pack-url-file`, `--put-urls-file`), and renaming or removing each
+//!   directory above it, for either kind of Command: a rename, unlink, hard link or directory rename
+//!   cannot give the file a path the read deny does not name.
 //!
 //! What it does not do, as the driver's own profile does not: any Unix socket stays allowed (the
 //! system resolver, `mDNSResponder`, is reached through one, so a DNS lookup still leaves the node
 //! and a name the Command looks up can carry data out), and a connect to the node's own
 //! non-loopback address was allowed under the denial on the macOS runner. Writes are not limited by
-//! this profile. A credential given as a flag value (`--insecure-argv-secrets`) is in this tool's
+//! this profile, except to those files and directories. `mach-lookup` of helper daemons and other
+//! services on the node stay open, and the Command (the same user) can see this tool's argv and process
+//! (`protect_this_process` does nothing on macOS). A credential given as a flag value (`--insecure-argv-secrets`) is in this tool's
 //! argv, which the profile does not hide. Egress of the pool user is limited by the host's packet
 //! filter, not by this tool.
 //!

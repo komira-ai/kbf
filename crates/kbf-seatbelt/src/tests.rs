@@ -59,14 +59,31 @@ fn each_unreadable_path_gets_exactly_one_read_deny() {
 
 /// Catches a read deny that an allow after it would override: a later rule wins.
 #[test]
-fn the_read_denies_are_the_last_rules() {
+fn the_file_denies_are_the_last_rules() {
     let text = profile(true, &["/run/grant"]).render().expect("renders");
     let last_allow = text.rfind("(allow ").expect("an allow");
     assert!(
         last_allow < text.find("(deny file-read*").unwrap(),
         "{text}"
     );
-    assert!(text.ends_with("(deny file-read* (literal \"/run/grant\"))\n"));
+    assert!(text.ends_with("(deny file-write* (literal \"/run/grant\"))\n"));
+}
+
+/// Catches a credential file that can be renamed, unlinked or hard-linked (each makes a second
+/// name the read deny does not cover): one write deny per file, with the same literal.
+#[test]
+fn each_unreadable_path_also_gets_exactly_one_write_deny() {
+    let text = profile(false, &["/run/grant", "/run/put urls (1)"])
+        .render()
+        .expect("renders");
+    let denies: Vec<&str> = text.lines().filter(|l| l.contains("file-write*")).collect();
+    assert_eq!(
+        denies,
+        [
+            "(deny file-write* (literal \"/run/grant\"))",
+            "(deny file-write* (literal \"/run/put urls (1)\"))",
+        ]
+    );
 }
 
 /// Catches a path that could end the profile string and be read as rules: a quote, a backslash
@@ -137,4 +154,30 @@ fn every_profile_keeps_the_launchd_and_device_denies() {
             assert!(text.lines().any(|l| l == rule), "{rule}");
         }
     }
+}
+
+/// Catches a credential file reached by renaming a directory above it: every ancestor but `/` has
+/// one `file-write-unlink` deny, written once for paths that share it.
+#[test]
+fn every_directory_above_an_unreadable_path_cannot_be_renamed() {
+    let text = profile(false, &["/run/a/grant", "/run/a/b/urls"])
+        .render()
+        .expect("renders");
+    let denies: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("file-write-unlink"))
+        .collect();
+    assert_eq!(
+        denies,
+        [
+            "(deny file-write-unlink (literal \"/run/a\"))",
+            "(deny file-write-unlink (literal \"/run\"))",
+            "(deny file-write-unlink (literal \"/run/a/b\"))",
+        ]
+    );
+    let last_allow = text.rfind("(allow ").expect("an allow");
+    assert!(
+        last_allow < text.find("file-write-unlink").unwrap(),
+        "{text}"
+    );
 }
