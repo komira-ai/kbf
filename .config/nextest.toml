@@ -20,6 +20,18 @@ test-group = 'install-sh-fixture'
 filter = 'package(kbf-mac-provision)'
 test-group = 'mac-provision-scratch'
 
+# Hang guards. A test holds no timeout or deadline of its own: a test that waits for ever is
+# ended here, by nextest's slow-timeout with terminate-after (the test is killed and fails once
+# period x terminate-after has passed). These overrides are in the default profile, so they apply
+# to every profile, the pull-request one included. For each setting nextest takes the FIRST
+# matching override, so the specific budgets (longer or shorter) come first and the general one last.
+
+# The slowest test of the full run on main, the 5 GiB round trip of kbf-front::large_blobs,
+# takes about 970 seconds on a hosted runner: its binary gets 30 minutes (450 seconds x 4).
+[[profile.default.overrides]]
+filter = 'binary_id(=kbf-front::large_blobs)'
+slow-timeout = { period = "450s", terminate-after = 4 }
+
 # The backfill tests wait on the put's own signal, with no deadline of their own, so a put that
 # never ends hangs the test: nextest kills it after 30 s x 4 (the whole test takes milliseconds).
 [[profile.default.overrides]]
@@ -33,6 +45,15 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 [[profile.default.overrides]]
 filter = 'package(kbf-task) & test(/^fetch::tests::/)'
 slow-timeout = { period = "30s", terminate-after = 4 }
+
+# The general budget: every other test, of every package, is ended after eight minutes
+# (120 seconds x 4). The slowest of them in the full run on main takes about 240 seconds
+# (kbf-server::frontend, a_frontend_dialing_a_node_with_another_nodes_certificate_is_refused),
+# half the budget. A block for a narrower set of tests (a longer or shorter budget) goes ABOVE
+# this one, because the first match wins: a later block for the same tests would never apply.
+[[profile.default.overrides]]
+filter = 'all()'
+slow-timeout = { period = "120s", terminate-after = 4 }
 
 # The pull-request profile (`cargo nextest run --profile pr`, and `cargo llvm-cov nextest
 # --profile pr`): the fast gate. A pull request runs every test except the slow ones named
