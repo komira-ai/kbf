@@ -302,20 +302,53 @@ fn architecture(platform: Platform) -> &'static str {
     }
 }
 
+/// The tar `bytes` as a plain tar: gunzipped when it is gzip-compressed.
+fn plain_tar(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if !bytes.starts_with(&[0x1f, 0x8b]) {
+        return Ok(bytes.to_vec());
+    }
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(bytes)
+        .read_to_end(&mut out)
+        .map_err(|e| format!("not a gzip stream: {e}"))?;
+    Ok(out)
+}
+
+/// The entries of the layer `bytes` that a layer holding one program file may not have: anything
+/// that is neither a regular file nor the directories `usr/` and `usr/bin/` (a symlink, hard
+/// link, device, fifo, or another directory, whose mode or owner the layer would change), each as
+/// `path (kind)`. Regular files are judged by their paths, not here.
+fn odd_entries(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let plain = plain_tar(bytes)?;
+    let not_a_tar = |e: std::io::Error| format!("not a tar: {e}");
+    let mut archive = tar::Archive::new(plain.as_slice());
+    let mut odd = Vec::new();
+    for entry in archive.entries().map_err(not_a_tar)? {
+        let entry = entry.map_err(not_a_tar)?;
+        let kind = entry.header().entry_type();
+        let path = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
+        let path = path
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .to_owned();
+        let allowed = match kind {
+            tar::EntryType::Regular => true,
+            tar::EntryType::Directory => path == "usr" || path == "usr/bin",
+            _ => false,
+        };
+        if !allowed {
+            odd.push(format!("{path} ({kind:?})"));
+        }
+    }
+    Ok(odd)
+}
+
 /// The regular files of the tar `bytes`, plain or gzip-compressed (a layer is either): path
 /// without a leading `./` or `/`, mode, bytes.
 fn files(bytes: &[u8]) -> Result<Vec<(String, u32, Vec<u8>)>, String> {
-    let plain;
-    let tar: &[u8] = if bytes.starts_with(&[0x1f, 0x8b]) {
-        let mut out = Vec::new();
-        flate2::read::GzDecoder::new(bytes)
-            .read_to_end(&mut out)
-            .map_err(|e| format!("not a gzip stream: {e}"))?;
-        plain = out;
-        &plain
-    } else {
-        bytes
-    };
+    let plain = plain_tar(bytes)?;
+    let tar: &[u8] = &plain;
     let not_a_tar = |e: std::io::Error| format!("not a tar: {e}");
     let mut archive = tar::Archive::new(tar);
     let mut found = Vec::new();
@@ -540,6 +573,7 @@ fn opened(
                 .map(|(p, _, _)| p.clone())
                 .filter(|p| *p != in_image_path)
                 .collect();
+            others.extend(odd_entries(bytes).map_err(|e| one(format!("layer {digest}: {e}")))?);
         }
         if let Some(found) = held.into_iter().find(|(p, _, _)| *p == in_image_path) {
             in_image = Some(found);

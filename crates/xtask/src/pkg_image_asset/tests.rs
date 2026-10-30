@@ -71,6 +71,10 @@ struct Fix {
     base_layers: Vec<Vec<u8>>,
     /// More files in the layer that holds the program (path, mode, bytes), when it sits on a base.
     top_extra: Vec<(&'static str, u32, Vec<u8>)>,
+    /// More entries in that layer that are not regular files: (path, type, link target).
+    top_entries: Vec<(&'static str, tar::EntryType, &'static str)>,
+    /// Directories `usr/` and `usr/bin/` in that layer first, as BuildKit writes a `COPY`.
+    top_dirs: bool,
 }
 
 impl Fix {
@@ -89,6 +93,8 @@ impl Fix {
             no_index: false,
             base_layers: Vec::new(),
             top_extra: Vec::new(),
+            top_entries: Vec::new(),
+            top_dirs: false,
         }
     }
 
@@ -128,7 +134,31 @@ impl Fix {
                     .iter()
                     .map(|(p, m, b)| (*p, *m, b.as_slice())),
             );
-            layers.push(tar_of(&top));
+            let mut tar = tar::Builder::new(Vec::new());
+            let mut entry =
+                |path: &str, kind: tar::EntryType, mode: u32, link: &str, body: &[u8]| {
+                    let mut h = tar::Header::new_ustar();
+                    h.set_path(path).expect("path");
+                    h.set_entry_type(kind);
+                    h.set_size(body.len() as u64);
+                    h.set_mode(mode);
+                    if !link.is_empty() {
+                        h.set_link_name(link).expect("link");
+                    }
+                    h.set_cksum();
+                    tar.append(&h, body).expect("append");
+                };
+            if self.top_dirs {
+                entry("usr/", tar::EntryType::Directory, 0o755, "", b"");
+                entry("usr/bin/", tar::EntryType::Directory, 0o755, "", b"");
+            }
+            for (path, mode, bytes) in &top {
+                entry(path, tar::EntryType::Regular, *mode, "", bytes);
+            }
+            for (path, kind, link) in &self.top_entries {
+                entry(path, *kind, 0o755, link, b"");
+            }
+            layers.push(tar.into_inner().expect("tar"));
         }
         for (path, mode, bytes) in &self.later {
             layers.push(tar_of(&[(path, *mode, bytes)]));
@@ -1278,4 +1308,64 @@ fn the_facts_failures_name_what_is_wrong() {
             format!("{facts_name}: the facts of the image"),
         ]
     );
+}
+
+/// Asserts the top layer may hold the entries BuildKit writes for the copy (the directories `usr/`
+/// and `usr/bin/` and the program at 0755), and refuses a symlink, a hard link, a device, a fifo
+/// and a directory other than those two, each named with its type. Catches: an entry that is not a
+/// regular file passing unseen because only regular files are listed.
+#[test]
+fn the_top_layer_may_hold_only_the_program_and_its_directories() {
+    let base = task().base();
+    let mut good = task();
+    good.top_dirs = true;
+    assert!(task_against("top-dirs", &good, &base).is_empty());
+    for (name, path, kind, link, shown) in [
+        (
+            "sym",
+            "usr/bin/sh",
+            tar::EntryType::Symlink,
+            "/bin/busybox",
+            "usr/bin/sh (Symlink)",
+        ),
+        (
+            "hard",
+            "usr/bin/other",
+            tar::EntryType::Link,
+            "usr/bin/kbf-task",
+            "usr/bin/other (Link)",
+        ),
+        (
+            "dir",
+            "etc/",
+            tar::EntryType::Directory,
+            "",
+            "etc (Directory)",
+        ),
+        (
+            "dev",
+            "dev/null",
+            tar::EntryType::Char,
+            "",
+            "dev/null (Char)",
+        ),
+        (
+            "fifo",
+            "run/pipe",
+            tar::EntryType::Fifo,
+            "",
+            "run/pipe (Fifo)",
+        ),
+    ] {
+        let mut bad = task();
+        bad.top_dirs = true;
+        bad.top_entries = vec![(path, kind, link)];
+        assert_eq!(
+            task_against(&format!("top-{name}"), &bad, &base),
+            vec![format!(
+                "the layer above the base holds [\"{shown}\"] besides usr/bin/kbf-task"
+            )],
+            "{name}"
+        );
+    }
 }
