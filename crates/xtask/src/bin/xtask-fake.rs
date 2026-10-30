@@ -194,8 +194,8 @@ fn kbf_asked(argv0: &str) -> Option<ExitCode> {
             print!("{}", kbf_says(argv0).1);
             Some(ExitCode::FAILURE)
         }
-        // Long enough for any limit a test sets, short enough that a limit which is broken
-        // fails the test's own time assertion instead of hanging the suite.
+        // Long enough for any limit a test sets; a limit that is broken leaves the test
+        // running until the test runner's per-test limit ends it.
         Ok("hang") => {
             std::thread::sleep(std::time::Duration::from_secs(120));
             Some(ExitCode::FAILURE)
