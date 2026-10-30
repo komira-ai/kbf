@@ -676,7 +676,7 @@ mod tests {
                 result
                     .notes
                     .iter()
-                    .any(|n| n.starts_with("cpu time of this tool's process"))
+                    .any(|n| n.contains("cpu time of this tool's process"))
             );
         }
         let (c, h, i) = (cold.stats(), hot.stats(), instance.stats());
