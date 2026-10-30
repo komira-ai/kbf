@@ -467,3 +467,19 @@ impl Rig {
         self.file(key).is_file()
     }
 }
+
+/// The most turns `until` gives up the thread before it fails the test. A count and not a time: an
+/// event that never comes ends the test with a message, the same on a slow machine.
+const SPINS: u32 = 1_000_000;
+
+/// Waits, by giving up the thread, until `done` is true; fails the test, saying what `what` was
+/// to have happened, after [`SPINS`] turns.
+pub(in crate::server) async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..SPINS {
+        if done() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("after {SPINS} turns of the scheduler, this never happened: {what}");
+}

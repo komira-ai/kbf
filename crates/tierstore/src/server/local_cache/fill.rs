@@ -5,6 +5,7 @@ use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::future::Future;
 use std::io;
+use std::os::unix::fs::FileExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -12,15 +13,15 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
+use bytes::Bytes;
 use futures::FutureExt as _;
 use futures::future::{BoxFuture, OptionFuture, Shared};
 use sha2::{Digest, Sha256};
 use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::{ByteRange, Error};
+use crate::{ByteRange, Error, Meta};
 
 use super::layout::{Name, Sidecar, data_path, make_dirs, meta_path, object_dir, stage_dir};
 use super::metrics::{FailedFill, bump};
@@ -35,6 +36,13 @@ pub(super) enum Filled {
     Skipped,
 }
 
+/// The error of a read whose object was written over while it was being read: bytes of two
+/// versions must never be given as one.
+pub(super) fn written_over() -> Error {
+    let text = "the object was written over while it was being read";
+    Error::Unavailable(text.to_owned())
+}
+
 /// How far a fill has come, as its readers see it. The bytes are in a file, never in a copy in
 /// memory that the readers share.
 #[derive(Clone, Debug)]
@@ -44,8 +52,9 @@ pub(super) enum Live {
     /// The bytes of the object up to `written` are in the file `file` reads, flushed. The file
     /// stays readable through this handle after it is linked into `obj/` or removed.
     Staging {
-        /// The size the upstream said the object has.
-        size: u64,
+        /// What the upstream said of the object when the fill began: its size, and the tag a
+        /// reader that goes on from the upstream must find still there.
+        meta: Meta,
         file: Arc<File>,
         written: u64,
     },
@@ -79,6 +88,9 @@ enum Stop {
     Short,
     /// The cache directory could not be written.
     Local,
+    /// A write or a delete through the cache came while the object was being read (see `forget`):
+    /// what was read is not kept, and the readers go on from the upstream.
+    Invalidated,
     /// The bytes of a key named by its content hash to another name.
     Mismatch,
     /// The object changed while it was being read: the bytes may be of two versions.
@@ -100,9 +112,11 @@ impl From<Error> for Stop {
 /// A file of the stage directory, removed when it is dropped, and counted while it exists.
 struct Staged {
     inner: Arc<Inner>,
-    file: tokio::fs::File,
-    /// A handle that reads the file, for the readers that stream from it.
-    reader: Arc<File>,
+    /// The one descriptor of the file: the fill writes it at an offset and the readers read it at
+    /// an offset, so a fill needs no second descriptor however many readers it has.
+    file: Arc<File>,
+    /// The bytes written.
+    written: u64,
     path: PathBuf,
     /// Where the sidecar is written before it is renamed into place.
     sidecar: PathBuf,
@@ -117,6 +131,7 @@ impl Staged {
         let sidecar = stage_dir(&inner.config.path).join(format!("{number:016x}.meta"));
         let mut options = OpenOptions::new();
         let file = options
+            .read(true)
             .write(true)
             .create_new(true)
             .mode(0o444)
@@ -125,28 +140,34 @@ impl Staged {
         // The mode given to `open` is cut by the umask: set it, so that it is 0444 for any.
         file.set_permissions(std::fs::Permissions::from_mode(0o444))
             .await?;
-        let reader = tokio::fs::File::open(&path).await?.into_std().await;
+        let file = Arc::new(file.into_std().await);
         let _ = inner.counters.staging_files.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             inner: Arc::clone(inner),
             file,
-            reader: Arc::new(reader),
+            written: 0,
             path,
             sidecar,
         })
     }
 
-    /// Appends `chunk` and flushes it, so that a reader of the file sees it once this returns.
-    async fn append(&mut self, chunk: &[u8]) -> io::Result<()> {
-        self.file.write_all(chunk).await?;
-        self.file.flush().await
+    /// Appends `chunk`, on a thread that may block. The bytes are in the file for a reader of it
+    /// (a write at an offset, seen by a read at an offset) once this returns.
+    async fn append(&mut self, chunk: Bytes) -> io::Result<()> {
+        let (file, at) = (Arc::clone(&self.file), self.written);
+        let len = chunk.len() as u64;
+        let writing = tokio::task::spawn_blocking(move || file.write_all_at(&chunk, at));
+        writing.await.expect("a write does not panic")?;
+        self.written += len;
+        Ok(())
     }
 
     /// Writes the end of the file to the disk, so that a name linked to it is whole after a
     /// crash.
     async fn finish(&mut self) -> io::Result<()> {
-        self.file.flush().await?;
-        self.file.sync_data().await
+        let file = Arc::clone(&self.file);
+        let syncing = tokio::task::spawn_blocking(move || file.sync_data());
+        syncing.await.expect("a sync does not panic")
     }
 }
 
@@ -371,9 +392,9 @@ impl Inner {
             Err(Stop::Changed) => {
                 // Readers may have been given bytes of the first version already.
                 self.counters.failed(FailedFill::Changed);
-                let text = "the object was written over while it was being read";
-                Err(Error::Unavailable(text.to_owned()))
+                Err(written_over())
             }
+            Err(Stop::Invalidated) => self.skipped(FailedFill::Changed),
             Err(Stop::Mismatch) => {
                 // The bytes are known to be wrong: they go to nobody.
                 self.counters.failed(FailedFill::HashMismatch);
@@ -403,10 +424,10 @@ impl Inner {
         let mut staged = Staged::create(self).await?;
         let mut hasher = Sha256::new();
         let mut offset = 0;
-        let (size, reader) = (meta.size, Arc::clone(&staged.reader));
+        let (about, file) = (meta.clone(), Arc::clone(&staged.file));
         let progress = |written| Live::Staging {
-            size,
-            file: Arc::clone(&reader),
+            meta: about.clone(),
+            file: Arc::clone(&file),
             written,
         };
         let _ = live.send_replace(progress(0));
@@ -417,8 +438,8 @@ impl Inner {
             if chunk.len() as u64 != want {
                 return Err(Stop::Short);
             }
-            staged.append(&chunk).await?;
             hasher.update(&chunk);
+            staged.append(chunk).await?;
             offset += want;
             let _ = live.send_replace(progress(offset));
         }
@@ -450,7 +471,7 @@ impl Inner {
         // in the index; see `forget`).
         if self.is_invalidated(&name.hex) {
             self.drop_entry(&name.hex);
-            return Err(Stop::Changed);
+            return Err(Stop::Invalidated);
         }
         drop(reservation);
         if fresh {

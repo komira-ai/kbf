@@ -133,29 +133,31 @@ async fn a_streamed_answer_of_the_length_given_ends_cleanly() {
 
 /// Asserts that a streamed answer whose stream ends before the length it gave, gives more bytes
 /// than it gave, or ends with an error is an error of the body, which comes once and ends the
-/// body: the connection is cut and the client cannot take the answer for whole.
+/// body: the connection is cut and the client cannot take the answer for whole. The last chunk of
+/// the stream is held until the stream has ended well, so a body that fails after its last byte
+/// never gives that byte (the connection would otherwise count the bytes and end the answer
+/// before the error is read): the error is the only item where the last chunk would be.
 #[tokio::test]
 async fn a_streamed_answer_that_is_short_long_or_failed_ends_with_an_error() {
     let short = streamed_answer(StatusCode::OK, &[], 5, chunks(vec![Ok(b"abc")]));
     let seen = frames(short.into_body()).await;
-    assert_eq!(seen.len(), 2);
-    assert!(matches!(&seen[1], Err(Error::Other(text)) if text.contains("2 bytes short")));
+    assert_eq!(seen.len(), 1);
+    assert!(matches!(&seen[0], Err(Error::Other(text)) if text.contains("2 bytes short")));
 
     let long = streamed_answer(StatusCode::OK, &[], 2, chunks(vec![Ok(b"ab"), Ok(b"c")]));
     let seen = frames(long.into_body()).await;
-    assert_eq!(seen.len(), 2);
-    assert!(matches!(&seen[1], Err(Error::Other(text)) if text.contains("more bytes")));
+    assert_eq!(seen.len(), 1);
+    assert!(matches!(&seen[0], Err(Error::Other(text)) if text.contains("more bytes")));
 
     let failed = Error::Unavailable("gone".to_owned());
-    let late = chunks(vec![Ok(b"ab"), Err(failed.clone()), Ok(b"cd")]);
-    let seen = frames(streamed_answer(StatusCode::OK, &[], 4, late).into_body()).await;
+    let late = chunks(vec![Ok(b"ab"), Ok(b"cd"), Err(failed.clone()), Ok(b"ef")]);
+    let seen = frames(streamed_answer(StatusCode::OK, &[], 6, late).into_body()).await;
     assert_eq!(
         seen,
         vec![Ok(Bytes::from_static(b"ab")), Err(failed.clone())]
     );
 
-    // An error after every byte was given is still heard: the end is the stream's.
     let after = chunks(vec![Ok(b"ab"), Err(failed.clone())]);
     let seen = frames(streamed_answer(StatusCode::OK, &[], 2, after).into_body()).await;
-    assert_eq!(seen, vec![Ok(Bytes::from_static(b"ab")), Err(failed)]);
+    assert_eq!(seen, vec![Err(failed)]);
 }

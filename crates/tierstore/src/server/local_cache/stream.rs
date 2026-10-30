@@ -25,9 +25,9 @@ use futures::StreamExt as _;
 use futures::stream;
 use tokio::sync::watch;
 
-use crate::{ByteRange, Error, ReadBody};
+use crate::{ByteRange, Error, Meta, ReadBody};
 
-use super::fill::{Filled, Live, Pending};
+use super::fill::{Filled, Live, Pending, written_over};
 use super::layout::{Name, data_path};
 use super::metrics::{add, bump};
 use super::{Inner, gone, locked, window};
@@ -89,33 +89,36 @@ impl Inner {
         }
     }
 
-    /// `range` of the object from the upstream, a chunk at a time, keeping nothing: `len` bytes
-    /// from `offset`, or to the end of the object for `None`. A chunk shorter than asked is the
-    /// end of the object.
-    pub(super) fn chunked(self: &Arc<Self>, key: &str, offset: u64, len: Option<u64>) -> ReadBody {
-        let start = (Arc::clone(self), key.to_owned(), offset, len);
-        stream::try_unfold(start, |(inner, key, offset, left)| async move {
-            if left == Some(0) {
-                return Ok(None);
-            }
-            let chunk = inner.chunk();
-            let want = left.map_or(chunk, |left| left.min(chunk));
-            let bytes = inner
-                .upstream
-                .get(&key, Some(ByteRange::new(offset, want)))
-                .await?;
-            let got = bytes.len() as u64;
-            inner.served(Served::Upstream, got);
-            // A short chunk is the last: nothing is asked beyond it.
-            let left = if got < want {
-                Some(0)
-            } else {
-                left.map(|left| left - got)
-            };
-            if got == 0 {
-                return Ok(None);
-            }
-            Ok(Some((bytes, (inner, key, offset + got, left))))
+    /// `len` bytes of the object from `offset` (to its end for `None`), read from the upstream a
+    /// chunk at a time, keeping nothing.
+    ///
+    /// A read of more than one chunk is pinned to the version it began with: a HEAD before the
+    /// first chunk and another before the last chunk is given, and a body whose object changed
+    /// between them ends with an error, so a same-size overwrite never makes one body of two
+    /// versions. `expect` is the version bytes already given to the client came from (a read
+    /// that goes on after a fill); the read is pinned, whatever its size, and fails if the
+    /// upstream has another. The bytes are not hashed: a pass-through never was, so the tail of a
+    /// `cas/l` object read this way is not checked against its name.
+    pub(super) fn chunked(
+        self: &Arc<Self>,
+        key: &str,
+        offset: u64,
+        len: Option<u64>,
+        expect: Option<Meta>,
+    ) -> ReadBody {
+        let chunks = Chunks {
+            inner: Arc::clone(self),
+            key: key.to_owned(),
+            at: offset,
+            left: len,
+            expect,
+            pin: None,
+            started: false,
+            finished: false,
+        };
+        stream::unfold(chunks, |mut chunks| async move {
+            let item = chunks.next().await?;
+            Some((item, chunks))
         })
         .boxed()
     }
@@ -186,7 +189,9 @@ impl Inner {
             live_open: true,
             done: pending,
             verdict: None,
+            first: range.map_or(0, ByteRange::offset),
             sent: range.map_or(0, ByteRange::offset),
+            meta: None,
             end: None,
             tail: None,
             finished: false,
@@ -212,8 +217,12 @@ struct Follower {
     live_open: bool,
     /// How the fill ended, once it has.
     verdict: Option<Result<Filled, Error>>,
+    /// The offset in the object of the first byte this reader asked for.
+    first: u64,
     /// The offset in the object of the next byte to give.
     sent: u64,
+    /// What the upstream said of the object when the fill began, once the fill has said it.
+    meta: Option<Meta>,
     /// The offset in the object where the window ends, once the size is known.
     end: Option<u64>,
     /// The rest of the read from the upstream, once the fill ended without an object.
@@ -235,7 +244,10 @@ impl Follower {
             .end
             .or_else(|| self.range.map(|r| r.offset().saturating_add(r.size())));
         let left = limit.map(|limit| limit.saturating_sub(self.sent));
-        self.tail = Some(self.inner.chunked(&self.key, self.sent, left));
+        // A reader that was given bytes goes on only if the upstream still has the version they
+        // came from (it may have been deleted or written over, which is what ended the fill).
+        let had = self.meta.clone().filter(|_| self.sent > self.first);
+        self.tail = Some(self.inner.chunked(&self.key, self.sent, left, had));
     }
 
     /// The next chunk, or `None` at the end of the window.
@@ -250,13 +262,14 @@ impl Follower {
             let staged = match &*self.live.borrow_and_update() {
                 Live::Starting => None,
                 Live::Staging {
-                    size,
+                    meta,
                     file,
                     written,
-                } => Some((*size, Arc::clone(file), *written)),
+                } => Some((meta.clone(), Arc::clone(file), *written)),
             };
-            if let (Some((size, _, _)), None) = (&staged, self.end) {
-                match window(self.range, *size) {
+            if let (Some((meta, _, _)), None) = (&staged, self.end) {
+                self.meta = Some(meta.clone());
+                match window(self.range, meta.size) {
                     Ok((offset, len)) => self.end = Some(offset + len),
                     Err(error) => return self.fail(error),
                 }
@@ -310,5 +323,97 @@ impl Follower {
                 }
             }
         }
+    }
+}
+
+/// A read from the upstream a chunk at a time (see [`Inner::chunked`]).
+struct Chunks {
+    inner: Arc<Inner>,
+    key: String,
+    /// The offset of the next byte.
+    at: u64,
+    /// The bytes still to read; `None` only until the size is known.
+    left: Option<u64>,
+    expect: Option<Meta>,
+    /// The version the read is held to, once it has one.
+    pin: Option<Meta>,
+    started: bool,
+    finished: bool,
+}
+
+impl Chunks {
+    async fn next(&mut self) -> Option<Result<Bytes, Error>> {
+        if self.finished {
+            return None;
+        }
+        let step = self.step().await;
+        self.finished = !matches!(step, Ok(Some(_)));
+        step.transpose()
+    }
+
+    /// Takes the version of a read that has to have one, and sizes the window by it.
+    async fn begin(&mut self) -> Result<(), Error> {
+        let chunk = self.inner.chunk();
+        if self.expect.is_none() && self.left.is_some_and(|left| left <= chunk) {
+            return Ok(());
+        }
+        let meta = self.inner.upstream.head(&self.key).await?;
+        if self
+            .expect
+            .as_ref()
+            .is_some_and(|had| !meta.same_content(had))
+        {
+            return Err(written_over());
+        }
+        let asked = ByteRange::new(self.at, self.left.unwrap_or(u64::MAX));
+        self.left = Some(window(Some(asked), meta.size)?.1);
+        self.pin = Some(meta);
+        Ok(())
+    }
+
+    /// Whether the object is still the version the read began with: asked before the last chunk
+    /// is given, so that no body of a changed object ends cleanly.
+    async fn still_pinned(&self) -> Result<(), Error> {
+        let Some(pinned) = &self.pin else {
+            return Ok(());
+        };
+        let now = self.inner.upstream.head(&self.key).await?;
+        if now.same_content(pinned) {
+            return Ok(());
+        }
+        Err(written_over())
+    }
+
+    async fn step(&mut self) -> Result<Option<Bytes>, Error> {
+        if !self.started {
+            self.started = true;
+            self.begin().await?;
+        }
+        let chunk = self.inner.chunk();
+        let want = self.left.map_or(chunk, |left| left.min(chunk));
+        if want == 0 {
+            return Ok(None);
+        }
+        let range = ByteRange::new(self.at, want);
+        let bytes = self.inner.upstream.get(&self.key, Some(range)).await?;
+        let got = bytes.len() as u64;
+        if got > want {
+            return Err(Error::Other(
+                "the upstream gave more bytes than were asked".to_owned(),
+            ));
+        }
+        self.inner.served(Served::Upstream, got);
+        self.at += got;
+        let last = self.left.is_some_and(|left| left == got);
+        if got < want && self.pin.is_some() {
+            // The object is shorter than its HEAD said: not the end of a body that is whole.
+            return Err(written_over());
+        }
+        self.left = self.left.map(|left| left - got);
+        if last || got < want {
+            self.still_pinned().await?;
+            self.left = Some(0);
+        }
+        Ok((got > 0).then_some(bytes))
     }
 }

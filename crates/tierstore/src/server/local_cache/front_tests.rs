@@ -284,3 +284,35 @@ async fn a_body_that_fails_the_hash_is_a_broken_answer_not_a_clean_end() {
     assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(front.rig.cache.held(), (0, 0));
 }
+
+/// Asserts, on a connection, that a `cas/l` object whose bytes do not hash to its name is cut
+/// before its length: the answer gives the length of the object, and the connection ends with
+/// less than that, so a client sees the answer as incomplete (the check of the hash is in the
+/// last chunk, which is not sent).
+#[tokio::test]
+async fn a_body_that_fails_the_hash_ends_the_connection_before_its_length() {
+    let front = Front::with("tscache-front-wire", |config| config.fill_chunk = 10).await;
+    let name = format!(
+        "cas/l/{}",
+        crate::server::local_cache::testing::digest(b"other")
+    );
+    front.rig.put(&name, &[9u8; 100]).await;
+    let uri = format!("/{BUCKET}/{name}");
+    // The upstream gives one chunk first, so that the answer starts with the fill still running.
+    let gate = front.rig.tamper.hold();
+    gate.add_permits(1);
+    let (server, config) = (Arc::clone(&front.server), front.config.clone());
+    let reading =
+        tokio::spawn(async move { crate::server::pipes::raw_get(&server, &config, &uri).await });
+    let counters = front.rig.cache.counters();
+    super::testing::until("the first chunk was given", || {
+        super::metrics::read(&counters.bytes_served_upstream) >= 10
+    })
+    .await;
+    gate.add_permits(64);
+    let answer = reading.await.unwrap();
+    let (head, length, body) = crate::server::pipes::split_answer(&answer);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(length, Some(100));
+    assert!(body.len() < 100, "{} bytes", body.len());
+}

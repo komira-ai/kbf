@@ -34,12 +34,19 @@ enum Kind {
 
 /// A streamed body that is complete only if it gives as many bytes as the answer says it has:
 /// fewer, more, or an error of the stream is an error of the body, which ends the connection
-/// without a clean end (the length is in the answer's headers already, so a client that got that
-/// many bytes would otherwise take the answer for whole).
+/// without a clean end.
+///
+/// The length is in the answer's headers already, and a connection that has written that many
+/// bytes completes the answer without asking the body again, so an error that comes after the
+/// last byte would not be heard. The last chunk is therefore held until the stream has ended
+/// without an error: a chunk is given only when the stream has given the next one (or its end).
+/// The body holds one chunk of the stream's, as it holds none of its own.
 struct Counted {
     chunks: ReadBody,
-    /// The bytes still to come.
-    left: u64,
+    /// The bytes the stream has still to give.
+    owed: u64,
+    /// The chunk the stream gave last, not given on yet.
+    held: Option<Bytes>,
     /// Whether the body has ended, with an error or without.
     ended: bool,
 }
@@ -56,21 +63,30 @@ impl Counted {
             };
             let failure = match chunk {
                 Some(Ok(bytes)) if bytes.is_empty() => continue,
-                Some(Ok(bytes)) if bytes.len() as u64 <= self.left => {
-                    self.left -= bytes.len() as u64;
-                    return Poll::Ready(Some(Ok(bytes)));
+                Some(Ok(bytes)) if bytes.len() as u64 <= self.owed => {
+                    self.owed -= bytes.len() as u64;
+                    match self.held.replace(bytes) {
+                        Some(before) => return Poll::Ready(Some(Ok(before))),
+                        None => continue,
+                    }
                 }
                 Some(Ok(_)) => Error::Other("the read gave more bytes than were asked".to_owned()),
                 Some(Err(error)) => error,
-                None if self.left == 0 => {
+                None if self.owed == 0 => {
                     self.ended = true;
-                    return Poll::Ready(None);
+                    return Poll::Ready(self.held.take().map(Ok));
                 }
-                None => Error::Other(format!("the read ended {} bytes short", self.left)),
+                None => Error::Other(format!("the read ended {} bytes short", self.owed)),
             };
             self.ended = true;
+            self.held = None;
             return Poll::Ready(Some(Err(failure)));
         }
+    }
+
+    /// The bytes of the body not given yet.
+    fn left(&self) -> u64 {
+        self.owed + self.held.as_ref().map_or(0, |held| held.len() as u64)
     }
 }
 
@@ -79,7 +95,8 @@ impl AnswerBody {
     pub(crate) fn streamed(len: u64, chunks: ReadBody) -> Self {
         let kind = Kind::Streamed(Counted {
             chunks,
-            left: len,
+            owed: len,
+            held: None,
             ended: false,
         });
         Self { kind }
@@ -116,7 +133,7 @@ impl Body for AnswerBody {
     fn size_hint(&self) -> SizeHint {
         match &self.kind {
             Kind::Whole(whole) => whole.size_hint(),
-            Kind::Streamed(counted) => SizeHint::with_exact(counted.left),
+            Kind::Streamed(counted) => SizeHint::with_exact(counted.left()),
         }
     }
 }

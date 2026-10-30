@@ -14,7 +14,7 @@ use tokio::sync::Semaphore;
 use super::layout::name_of;
 use super::locked;
 use super::metrics::{FailedFill, read};
-use super::testing::{Quirk, Rig, digest, pattern};
+use super::testing::{Quirk, Rig, digest, pattern, until};
 use crate::{Backend, ByteRange, Error, Op, ReadBody};
 
 const CHUNK: u64 = 100;
@@ -62,9 +62,10 @@ async fn take(body: &mut ReadBody, need: usize) -> Vec<u8> {
 /// Yields until the cache has counted `count` misses (each is counted just before its reader
 /// joins or starts the fill of its key, with no wait between).
 async fn until_misses(rig: &Rig, count: u64) {
-    while read(&rig.cache.counters().misses) < count {
-        tokio::task::yield_now().await;
-    }
+    until("the misses were counted", || {
+        read(&rig.cache.counters().misses) >= count
+    })
+    .await;
 }
 
 /// Opens `permits` reads of the upstream.
@@ -110,8 +111,8 @@ async fn a_hit_is_streamed_in_chunks_no_larger_than_the_chunk() {
 /// Asserts that a read that goes to the upstream (a key under no policy) asks for one chunk at
 /// a time and only when the one before has been taken: after the call returns, one read has
 /// been made (the first chunk is read at once, so an object that is not there is the error of
-/// the call); each chunk taken makes one more; and the end is known by a read that gives
-/// nothing. An object is never read whole, whatever its size.
+/// the call); each chunk taken makes one more; the size is known from a HEAD, so no read is made to
+/// find the end. An object is never read whole, whatever its size.
 #[tokio::test]
 async fn a_read_that_passes_through_asks_the_upstream_one_chunk_at_a_time() {
     let rig = rig("tsstream-passthrough");
@@ -127,7 +128,8 @@ async fn a_read_that_passes_through_asks_the_upstream_one_chunk_at_a_time() {
     }
     assert_eq!(got, body);
     assert!(stream.next().await.is_none());
-    assert_eq!(rig.calls(Op::Get), 11);
+    // One HEAD before the first chunk and one before the last, ten reads, none for the end.
+    assert_eq!((rig.calls(Op::Head), rig.calls(Op::Get)), (2, 10));
     assert_eq!(rig.cache.held(), (0, 0));
 
     let absent = rig.cache.get_stream("plain/none", None).await;
@@ -137,7 +139,8 @@ async fn a_read_that_passes_through_asks_the_upstream_one_chunk_at_a_time() {
 /// Asserts that a miss is given to the reader while the fill is still running: with the upstream
 /// opened for one chunk only, the first chunk of the object reaches the reader, while the fill
 /// has written 100 bytes, nothing is in the cache and one file is staged. Then, a second reader
-/// that joins the running fill is given the object from its first byte, from the staged file. When the upstream is opened both have the object,
+/// that joins the running fill is given the object from its first byte, from the staged file.
+/// When the upstream is opened both have the object,
 /// the upstream was read ten times and not twenty, and the object is kept.
 #[tokio::test]
 async fn a_miss_is_streamed_while_it_is_filled_and_a_late_reader_reads_the_staged_file() {
@@ -289,9 +292,7 @@ async fn a_range_past_the_end_of_a_miss_is_the_error_of_the_call() {
     let range = ByteRange::new(SIZE as u64 + 1, 10);
     let error = rig.cache.get_stream("cas/b/obj", Some(range)).await;
     assert!(matches!(error, Err(Error::Other(_))));
-    while read(&rig.cache.counters().fills) < 1 {
-        tokio::task::yield_now().await;
-    }
+    until("the fill ended", || read(&rig.cache.counters().fills) >= 1).await;
     assert_eq!(rig.cache.held(), (SIZE as u64, 1));
 }
 
@@ -361,4 +362,202 @@ async fn the_read_that_follows_a_fill_is_served_from_the_file_and_not_counted_as
     assert_eq!(read(&counters.hits), 0);
     assert_eq!(read(&counters.bytes_served_upstream) - before, SIZE as u64);
     assert_eq!(rig.calls(Op::Get), gets);
+}
+
+/// A cache that takes writes, with a chunk of [`CHUNK`] bytes, called `name`.
+fn writing_rig(name: &str) -> Rig {
+    Rig::with(name, |config| {
+        config.fill_chunk = CHUNK;
+        config.write_through = true;
+    })
+}
+
+/// A key named by its content: a fill of it is stopped by nothing but a write or a delete.
+fn content_key(bytes: &[u8]) -> String {
+    format!("cas/l/{}", digest(bytes))
+}
+
+/// What a reader of `get_stream` ends with: the error of the call, or the bytes and the error of
+/// the body.
+type Ended = Result<(Vec<Bytes>, Option<Error>), Error>;
+
+/// Reads `key` through the cache to the end.
+async fn read_through(cache: super::LocalCache, key: String, range: Option<ByteRange>) -> Ended {
+    let body = cache.get_stream(&key, range).await?;
+    Ok(drain(body).await)
+}
+
+/// Asserts that a read that goes on past a same-size overwrite never ends cleanly: a pass-through
+/// of ten chunks whose object is written over (the same size, other bytes) after the first chunk
+/// ends with an `Unavailable` error and gives at most nine chunks, the last never given. Without
+/// a check of the version the length is right and the body ends with 200.
+#[tokio::test]
+async fn an_overwrite_between_the_chunks_of_a_pass_through_ends_the_body_with_an_error() {
+    let rig = rig("tsstream-overwrite-pass");
+    rig.put("plain/obj", &pattern(SIZE)).await;
+    let mut body = rig.cache.get_stream("plain/obj", None).await.unwrap();
+    let first = take(&mut body, 100).await;
+    rig.replace("plain/obj", &vec![3u8; SIZE]).await;
+    let (chunks, error) = drain(body).await;
+    let error = error.expect("a body of two versions does not end cleanly");
+    assert!(error.is_unavailable(), "{error}");
+    assert_eq!(first.len() + joined(&chunks).len(), SIZE - CHUNK as usize);
+}
+
+/// Asserts the same for a read that goes on from the upstream after a fill that ended without an
+/// object (a link the file system refuses): the bytes given came from the first version, so the
+/// upstream's other version of the same size ends the body with an `Unavailable` error.
+#[tokio::test]
+async fn an_overwrite_before_the_rest_of_a_resumed_read_ends_the_body_with_an_error() {
+    let rig = rig("tsstream-overwrite-tail");
+    rig.put("cas/b/obj", &pattern(SIZE)).await;
+    rig.disk
+        .set(Quirk::LinkFails(std::io::ErrorKind::PermissionDenied));
+    let gate = rig.tamper.hold();
+    open(&gate, 64);
+    let body = rig.cache.get_stream("cas/b/obj", None).await.unwrap();
+    let counters = rig.cache.counters();
+    until("the fill failed", || {
+        counters.failures(FailedFill::LocalIo) >= 1
+    })
+    .await;
+    rig.replace("cas/b/obj", &vec![3u8; SIZE]).await;
+    let (chunks, error) = drain(body).await;
+    let error = error.expect("a body of two versions does not end cleanly");
+    assert!(error.is_unavailable(), "{error}");
+    assert!(joined(&chunks).len() < SIZE);
+}
+
+/// Asserts that a pass-through whose upstream gives fewer bytes than the object has is the
+/// error of the call, not a short body that ends well.
+#[tokio::test]
+async fn a_pass_through_that_the_upstream_cuts_short_is_an_error() {
+    let rig = rig("tsstream-pass-short");
+    rig.put("plain/obj", &pattern(SIZE)).await;
+    rig.tamper.short.store(true, Ordering::SeqCst);
+    let error = rig.cache.get_stream("plain/obj", None).await;
+    assert!(matches!(error, Err(ref e) if e.is_unavailable()));
+}
+
+/// Asserts what a delete does to the readers of a fill it overtakes, one of them given no byte
+/// (a range of 50 bytes, held until the fill is checked) and one given 500: the first is answered
+/// from the upstream, which no longer has the object (`NotFound`); the second, whose bytes came
+/// from the object that is gone, ends with that error and no clean end. Nothing is kept or staged.
+#[tokio::test]
+async fn a_delete_during_a_fill_gives_each_reader_the_upstreams_answer() {
+    let rig = writing_rig("tsstream-forget-delete");
+    let bytes = pattern(SIZE);
+    let key = content_key(&bytes);
+    rig.put(&key, &bytes).await;
+    let gate = rig.tamper.hold();
+    open(&gate, 5);
+    let mut mid = rig.cache.get_stream(&key, None).await.unwrap();
+    let given = take(&mut mid, 500).await;
+    let zero = tokio::spawn(read_through(
+        rig.cache.clone(),
+        key.clone(),
+        Some(ByteRange::new(0, 50)),
+    ));
+    until_misses(&rig, 2).await;
+
+    assert_eq!(rig.cache.delete(&key).await, Ok(()));
+    open(&gate, 64);
+    let zero = zero.await.unwrap();
+    assert!(matches!(zero, Err(Error::NotFound(_))));
+    let (rest, error) = drain(mid).await;
+    assert!(matches!(error, Some(Error::NotFound(_))), "{error:?}");
+    assert!(given.len() + joined(&rest).len() <= SIZE - CHUNK as usize);
+    assert_eq!(rig.cache.held(), (0, 0));
+    assert!(!rig.has_file(&key));
+    assert_eq!(staged(&rig), 0);
+    assert!(locked(&rig.cache.inner.flights).is_empty());
+    assert!(locked(&rig.cache.inner.invalidated).is_empty());
+}
+
+/// Asserts what a write through the cache does to the readers of a fill it overtakes: the object
+/// is deleted and written again with the same bytes (the same tag) and the cache is told, as a
+/// write through it tells it. The fill does not keep what it read; the reader given no byte and
+/// the reader given 500 both go on from the upstream, which has the same version, and each gets
+/// the object's bytes and a clean end.
+#[tokio::test]
+async fn a_write_during_a_fill_has_each_reader_go_on_from_the_upstream() {
+    let rig = writing_rig("tsstream-forget-write");
+    let bytes = pattern(SIZE);
+    let key = content_key(&bytes);
+    rig.put(&key, &bytes).await;
+    let gate = rig.tamper.hold();
+    open(&gate, 5);
+    let mut mid = rig.cache.get_stream(&key, None).await.unwrap();
+    let mut given = take(&mut mid, 500).await;
+    let zero = tokio::spawn(read_through(
+        rig.cache.clone(),
+        key.clone(),
+        Some(ByteRange::new(0, 50)),
+    ));
+    until_misses(&rig, 2).await;
+
+    rig.replace(&key, &bytes).await;
+    rig.cache.inner.forget(&key);
+    open(&gate, 64);
+    let (chunks, error) = zero.await.unwrap().expect("the object is there");
+    assert_eq!(error, None);
+    assert_eq!(joined(&chunks), &bytes[..50]);
+    let (rest, error) = drain(mid).await;
+    assert_eq!(error, None);
+    given.extend_from_slice(&joined(&rest));
+    assert_eq!(given, bytes);
+    assert_eq!(rig.cache.held(), (0, 0));
+    assert!(!rig.has_file(&key));
+    assert_eq!(staged(&rig), 0);
+    assert!(locked(&rig.cache.inner.invalidated).is_empty());
+}
+
+/// Asserts that a fill that panics after a reader was given bytes ends that reader's body with an
+/// `Unavailable` error, counted once as aborted, and leaves no key, permit or file behind.
+#[tokio::test]
+async fn a_fill_that_panics_after_bytes_were_given_ends_the_body_with_an_error() {
+    let rig = rig("tsstream-panic");
+    rig.put("cas/b/obj", &pattern(SIZE)).await;
+    let gate = rig.tamper.hold();
+    open(&gate, 5);
+    let mut body = rig.cache.get_stream("cas/b/obj", None).await.unwrap();
+    let _ = take(&mut body, 500).await;
+    rig.tamper.panic_once.store(true, Ordering::SeqCst);
+    open(&gate, 64);
+    let (_, error) = drain(body).await;
+    assert!(error.is_some_and(|error| error.is_unavailable()));
+    let inner = &rig.cache.inner;
+    assert_eq!(rig.cache.counters().failures(FailedFill::Aborted), 1);
+    assert!(locked(&inner.flights).is_empty());
+    assert_eq!(
+        inner.permits.available_permits(),
+        rig.config.max_concurrent_fills
+    );
+    assert_eq!(staged(&rig), 0);
+    assert_eq!(rig.cache.held(), (0, 0));
+}
+
+/// Asserts that a staged file that is removed while a reader reads it does not fail the reader
+/// (it reads the descriptor, not the name): the fill cannot link the file and ends without an
+/// object, and the reader goes on from the upstream, which has the same version, to a clean end
+/// with every byte.
+#[tokio::test]
+async fn a_staged_file_removed_while_it_is_read_does_not_fail_the_reader() {
+    let rig = rig("tsstream-removed");
+    let body = pattern(SIZE);
+    rig.put("cas/b/obj", &body).await;
+    let gate = rig.tamper.hold();
+    open(&gate, 5);
+    let mut stream = rig.cache.get_stream("cas/b/obj", None).await.unwrap();
+    let mut got = take(&mut stream, 500).await;
+    for entry in std::fs::read_dir(rig.config.path.join(".stage")).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    open(&gate, 64);
+    let (rest, error) = drain(stream).await;
+    assert_eq!(error, None);
+    got.extend_from_slice(&joined(&rest));
+    assert_eq!(got, body);
+    assert_eq!(rig.cache.counters().failures(FailedFill::LocalIo), 1);
+    assert_eq!(rig.cache.held(), (0, 0));
 }

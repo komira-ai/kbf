@@ -379,14 +379,24 @@ the object is filled by the next miss of its key that finds a free slot, so with
 for long, as under a sustained cold load, new keys are warmed more slowly (watch
 `fills_skipped_busy_total`; raise `max_concurrent_fills` if it climbs). That bound is only for the
 fills. A read of the cache is streamed: a hit is read from its file, a miss is given to the client
-as the fill writes the bytes (every reader of a key reads the staged file, never a shared copy in
-memory), and a pass-through is read from the upstream a chunk at a time, so a GET holds at most
-one chunk (8 MiB) in memory whatever the size of the object. The last chunk of the bytes a client
-asked for is held back until the fill has checked the object: a `cas/l` object whose bytes do not
-hash to its name, or an object written over during its fill, ends the response with an error
-(the connection is closed, and a client never sees a complete answer), and nothing is kept. A
-storage node still holds the bytes of a GET whole. A fill that panics or is cancelled frees its slot and its key, and the
-readers that waited for it get a 503 (`fill_failures_total{reason="aborted"}`).
+as the fill writes the bytes (every reader of a key reads the staged file through the descriptor
+the fill writes it with, never a copy in memory), and a pass-through is read from the upstream a
+chunk at a time, so a GET holds at most two chunks of 8 MiB in memory (the front keeps the last one
+back) whatever the size of the object. The last chunk of the bytes a client asked for is held back
+until the fill has checked the object, so a ranged read of an object of at most 64 MiB waits for
+the whole fill before its last chunk. A `cas/l` object whose bytes do not hash to its name, or an
+object written over during its fill, ends the response with an error (the connection is closed,
+and a client never sees a complete answer), and nothing is kept. A write or delete through the
+cache that comes during a fill, or a fill that fails for a reason of the cache, is finished from
+the upstream: a reader given no byte is answered as if there had been no fill, and one given
+bytes goes on only if the upstream still has the version they came from (otherwise its response
+ends with an error). A read of more than one chunk from the upstream is held to the version it
+began with (a HEAD before the first chunk and another before the last); the bytes of a `cas/l`
+object read from the upstream this way are not hashed, as a pass-through never was. A client that
+stops reading keeps the unlinked file of an object that is evicted meanwhile, with its blocks,
+until the connection's idle time ends it; those blocks are outside the budget. A storage node
+still holds the bytes of a GET whole. A fill that panics or is cancelled frees its slot and its
+key, and the readers that waited for it get a 503 (`fill_failures_total{reason="aborted"}`).
 
 No scrub. A hit is not hashed again, and the sidecar's `sha256` is written but not checked after
 the fill: an object that rots on the disk is served as it is now until it is evicted. A restart

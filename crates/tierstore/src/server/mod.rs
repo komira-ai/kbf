@@ -236,6 +236,8 @@ mod slow_reader_tests;
 #[cfg(test)]
 mod stream_put_tests;
 #[cfg(test)]
+mod stream_wire_tests;
+#[cfg(test)]
 mod testing;
 #[cfg(test)]
 mod time_tests;

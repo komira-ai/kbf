@@ -113,7 +113,8 @@ async fn bytes_that_do_not_hash_to_their_name_are_not_kept_and_not_served() {
 }
 
 /// Asserts that an upstream that gives fewer bytes than its HEAD said leaves nothing in the
-/// cache and is counted as a short body.
+/// cache and is counted as a short body, and that the reader, who cannot be given the object
+/// from an upstream that is short too, gets an error.
 #[tokio::test]
 async fn a_short_upstream_body_is_not_kept() {
     let rig = Rig::new("tscache-short");
@@ -121,8 +122,10 @@ async fn a_short_upstream_body_is_not_kept() {
     rig.tamper
         .short
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    // The reader is served from the upstream, which is short too.
-    assert_eq!(rig.get("cas/b/obj").await.unwrap().len(), 99);
+    // The reader goes on from the upstream, which is short too: a body shorter than the object is
+    // the reader's error, not a clean end.
+    let error = rig.get("cas/b/obj").await.unwrap_err();
+    assert!(error.is_unavailable(), "{error}");
     assert_eq!(rig.cache.counters().failures(FailedFill::ShortBody), 1);
     assert_eq!(rig.cache.held(), (0, 0));
     assert!(!rig.has_file("cas/b/obj"));
@@ -328,9 +331,7 @@ async fn a_range_past_the_end_of_an_uncached_object_is_an_error() {
     let past = rig.cache.get("cas/b/obj", Some(range)).await;
     assert_eq!(past, Err(Error::Other(text.to_owned())));
     // The error is given as soon as the size is known; the fill goes on and keeps the object.
-    while read(&rig.cache.counters().fills) < 1 {
-        tokio::task::yield_now().await;
-    }
+    super::testing::until("the fill ended", || read(&rig.cache.counters().fills) >= 1).await;
     assert_eq!(rig.cache.held(), (100, 1));
 }
 
