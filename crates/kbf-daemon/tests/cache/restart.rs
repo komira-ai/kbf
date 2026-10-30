@@ -266,6 +266,7 @@ async fn a_lease_during_the_drain_waits_on_the_slot_it_holds() {
         );
         tokio::spawn(async move { lease(&cas, &cache, &root, &dir, "during").await })
     };
+    // The "during" lease waits on the slot the drain holds.
     wait_for_fill_waits(&cache, 1).await;
     assert_eq!(
         run2.reads_of(&digest(&blobs[0])),

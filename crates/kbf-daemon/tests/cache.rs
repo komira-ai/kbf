@@ -619,6 +619,11 @@ async fn a_failed_fill_fails_every_waiter_with_its_error() {
     }
     assert_eq!(waits, 8);
     assert_eq!(
+        cache.stats().fill_waits,
+        7,
+        "the seven other leases waited on the first one's fill"
+    );
+    assert_eq!(
         cas.reads_of(&digest(b"not stored")),
         1,
         "a waiter fetched again"
@@ -724,6 +729,7 @@ async fn a_fill_waits_for_the_evictor_holding_its_key() {
             (Arc::clone(&cas), Arc::clone(&cache), one(b'k'), dir.clone());
         tokio::spawn(async move { lease(&cas, &cache, &root, &dir, "k-again").await })
     };
+    // k-again waits on the slot the evictor holds for key k.
     wait_for_fill_waits(&cache, 1).await;
     assert_eq!(
         cas.reads_of(&digest(&[b'k'; 100])),

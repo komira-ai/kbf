@@ -127,6 +127,7 @@ async fn two_leases_for_one_missing_entry_count_one_fill_and_one_hit() {
         .await
         .expect("held");
     let second = spawn("second");
+    // The second lease waits on the slot the first one holds (its read is held).
     wait_for_fill_waits(&cache, 1).await;
     gates.release(held);
     first.await.expect("joined").expect("first");

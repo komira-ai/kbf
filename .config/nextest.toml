@@ -20,6 +20,14 @@ test-group = 'install-sh-fixture'
 filter = 'package(kbf-mac-provision)'
 test-group = 'mac-provision-scratch'
 
+# The kbf-daemon cache tests wait on the cache's own counters (tests/support/cache_kit.rs,
+# wait_for_fill_waits), never on a deadline in the test: a cache that never makes two leases
+# meet would hang, and this guard ends such a test (2 minutes) instead. Applies to every
+# profile, the pull-request one included.
+[[profile.default.overrides]]
+filter = 'package(kbf-daemon) & binary(cache)'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
 # The pull-request profile (`cargo nextest run --profile pr`, and `cargo llvm-cov nextest
 # --profile pr`): the fast gate. A pull request runs every test except the slow ones named
 # below; the push to main runs them all, with the default profile

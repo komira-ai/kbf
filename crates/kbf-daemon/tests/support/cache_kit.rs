@@ -398,23 +398,13 @@ pub async fn lease(
 }
 
 /// Returns once leases have waited on a held slot `at_least` times in all, as the cache
-/// counts them: the moment a wait begins, not a guess at how long one takes. The bound
-/// only turns a hang (a cache that never makes two leases meet) into a failure; it is
-/// not asserted on.
+/// counts them: the moment a wait begins, not a guess at how long one takes. A cache that
+/// never makes two leases meet would never return; the hang guard for that is the nextest
+/// profile's slow-timeout for this binary (.config/nextest.toml), not a deadline here.
 pub async fn wait_for_fill_waits(cache: &Cache, at_least: u64) {
-    let arrived = async {
-        while cache.stats().fill_waits < at_least {
-            tokio::task::yield_now().await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(120), arrived)
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "fewer than {at_least} lease waits began ({} did): the leases never met in one fill",
-                cache.stats().fill_waits
-            )
-        });
+    while cache.stats().fill_waits < at_least {
+        tokio::task::yield_now().await;
+    }
 }
 
 /// The bytes of every file under `v1/blobs` of the cache in `dir/cache`: the on-disk sum.
