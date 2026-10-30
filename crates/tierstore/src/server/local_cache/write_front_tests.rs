@@ -242,7 +242,9 @@ async fn a_create_only_put_is_200_and_a_repeat_is_412() {
 async fn a_body_that_does_not_hash_to_its_name_is_400_bad_digest() {
     let front = Front::new("tscache-wfront-bad-digest", true);
     let key = format!("cas/l/{}", digest(b"the right bytes"));
-    let create = [("if-none-match", "*")];
+    // The front hands the backend the length of the body only when the request says it, as a
+    // client of an S3 upstream must; without it the copy cannot be reserved for and is not kept.
+    let create = [("if-none-match", "*"), ("content-length", "15")];
     let wrong = front.full("PUT", &key, &create, b"the wrong bytes").await;
     assert_eq!(
         denied(&wrong),
