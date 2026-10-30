@@ -587,3 +587,53 @@ kind = "memory"
     let why = checked(&storage(&gone)).unwrap_err();
     assert!(why.to_string().contains("/no/such/access.key"), "{why}");
 }
+
+/// Asserts what `--check-config` finds in the `[oci]` table of a storage node: a plain listener
+/// off loopback passes (the warning of a start is not printed, which the binary test checks on
+/// stderr); a prefix that overlaps `_journal/` and a certificate file that is not there are
+/// refused, each with the reason; and a certificate without its key does not load at all.
+#[test]
+fn check_config_of_a_storage_node_checks_its_oci_table() {
+    let node = Node::new("tscache-cli-check-oci");
+    let with = |oci: &str| {
+        format!(
+            r#"
+[server]
+listen          = "127.0.0.1:0"
+proxy_id        = "s1"
+bucket          = "tier-bucket"
+access_key_file = "{key}"
+
+[hot_store]
+kind   = "memory"
+budget = 1048576
+
+[cold_store]
+kind = "memory"
+
+[oci]
+{oci}
+"#,
+            key = node.key.display()
+        )
+    };
+    let load = |oci: &str| settings_from_text(&with(oci), QUICK);
+    let plain = load("listen = \"0.0.0.0:0\"").unwrap();
+    assert!(checked(&plain).is_ok());
+
+    let overlapping = load("listen = \"127.0.0.1:0\"\nprefix = \"_journal/x/\"").unwrap();
+    let why = checked(&overlapping).unwrap_err();
+    assert!(why.to_string().contains("overlaps"), "{why}");
+    assert_eq!(exit_status(&why), 2);
+
+    let key = node.key.display();
+    let no_cert = format!(
+        "listen = \"127.0.0.1:0\"\ntls_cert_file = \"/no/such/cert.pem\"\ntls_key_file = \"{key}\""
+    );
+    let why = checked(&load(&no_cert).unwrap()).unwrap_err();
+    assert!(why.to_string().contains("/no/such/cert.pem"), "{why}");
+
+    let lone = format!("listen = \"127.0.0.1:0\"\ntls_cert_file = \"{key}\"");
+    let why = load(&lone).unwrap_err();
+    assert!(why.to_string().contains("tls_key_file"), "{why}");
+}

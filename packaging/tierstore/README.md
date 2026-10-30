@@ -572,7 +572,11 @@ exits 2. `--check-config` without `--config` is a usage error (status 2). It doe
 tiers, so a tier that is down, or a key that the store would refuse, is found by a start (its
 self-test) and not by the check. It does not look at the disk either: the start's refusal of a
 `budget` over the size of the file system less `free_floor` (exit status 2), the cache directory
-and the credentials file of a tier are checked by a start only.
+and the credentials file of a tier are checked by a start only. For a storage node with an `[oci]`
+table the check does validate the OCI front as a start does (the prefix, the connection lifetime,
+and the TLS certificate and key files, which it reads and parses), without binding the address
+and without the warning that a start gives for plain HTTP off loopback. A TLS file that is not
+there or cannot be used is exit status 2 under `--check-config`, where a start exits 1.
 
 ### What the loader refuses
 
