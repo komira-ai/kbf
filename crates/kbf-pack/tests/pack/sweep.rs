@@ -5,7 +5,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
-use kbf_objstore::PageSize;
+use bytes::Bytes;
+use kbf_objstore::{
+    ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectKey, ObjectStore,
+    ObjectStoreError, PageSize,
+};
 use kbf_pack::{Slot, SweepConfig, SweepError, SweepGates, Sweeper, TaskPackKey, task_key_age};
 use kbf_pack_index::memory::MemoryPackIndex;
 use kbf_pack_index::{
@@ -367,4 +371,125 @@ async fn an_old_large_object_is_swept_and_a_young_one_kept() {
     assert!(!rig.store.holds(&old).await);
     assert!(rig.store.holds(&young).await);
     assert_eq!((report.deleted, report.young), (1, 1));
+}
+
+/// Asserts that an old key under `cas/l/` (content-bound large objects), `cas/f/<writer>/`
+/// (frontend packs) or `cas/d/` (daemon packs) is never listed, so never aged or deleted,
+/// while the old task pack and large keys under `cas/b/` beside them are.
+#[tokio::test]
+async fn old_keys_of_every_other_prefix_survive_a_sweep_of_cas_b() {
+    let rig = Rig::new();
+    let old = u32::try_from(OLD).expect("fits");
+    let name = |slot: Slot| task_key(old, slot);
+    let elsewhere = [
+        name(Slot::Pack(0)).replace("cas/b/", "cas/f/writer/"),
+        name(Slot::Large(0)).replace("cas/b/", "cas/f/writer/"),
+        name(Slot::Pack(0)).replace("cas/b/", "cas/d/node/"),
+        name(Slot::Large(0)).replace("cas/b/", "cas/l/"),
+        format!("cas/l/{}", "ab".repeat(32)),
+    ];
+    for key in &elsewhere {
+        rig.store.seed(key, b"referenced data").await;
+    }
+    let (pack, large) = (name(Slot::Pack(0)), name(Slot::Large(0)));
+    rig.store.seed(&pack, b"orphan pack").await;
+    rig.store.seed(&large, b"orphan large").await;
+    let gates = SweepGates {
+        age_of: Box::new(task_key_age),
+        is_leader: Box::new(|| true),
+        verifying: Box::new(|_| false),
+    };
+    let report = sweeper(&rig, gates).sweep(now()).await.unwrap();
+    assert_eq!((report.listed, report.deleted), (2, 2));
+    assert!(!rig.store.holds(&pack).await);
+    assert!(!rig.store.holds(&large).await);
+    for key in &elsewhere {
+        assert!(rig.store.holds(key).await, "{key} was deleted");
+    }
+}
+
+/// A store that lists everything under `cas/` whatever prefix it is asked for, as a store that
+/// ignored the prefix would.
+struct IgnoresPrefix(Arc<crate::support::FaultyStore>);
+
+impl ObjectStore for IgnoresPrefix {
+    fn capabilities(&self) -> Capabilities {
+        self.0.capabilities()
+    }
+
+    async fn put_new(
+        &self,
+        key: &ObjectKey,
+        body: Bytes,
+        retain_until: Option<SystemTime>,
+    ) -> Result<(), ObjectStoreError> {
+        self.0.put_new(key, body, retain_until).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &ObjectKey,
+        range: ByteRange,
+    ) -> Result<Bytes, ObjectStoreError> {
+        self.0.get_range(key, range).await
+    }
+
+    async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
+        self.0.delete(key).await
+    }
+
+    async fn list(
+        &self,
+        _prefix: &KeyPrefix,
+        after: Option<&ListToken>,
+        max_keys: PageSize,
+    ) -> Result<ListPage, ObjectStoreError> {
+        let everything = KeyPrefix::new("cas/").expect("a prefix");
+        self.0.list(&everything, after, max_keys).await
+    }
+}
+
+/// Asserts that a key outside `cas/b/` that a listing returns anyway is counted and kept, even
+/// when its name is that of an old task pack: the sweep checks every key it is given against the
+/// prefix, and does not rely on the store to have filtered.
+#[tokio::test]
+async fn a_key_outside_cas_b_in_a_listing_is_never_deleted() {
+    let rig = Rig::new();
+    let old = u32::try_from(OLD).expect("fits");
+    let outside = task_key(old, Slot::Pack(0)).replace("cas/b/", "cas/l/");
+    let inside = task_key(old, Slot::Pack(1));
+    rig.store.seed(&outside, b"referenced data").await;
+    rig.store.seed(&inside, b"orphan").await;
+    let index: Arc<dyn PackIndex> = rig.index.clone();
+    let gates = SweepGates {
+        age_of: Box::new(task_key_age),
+        is_leader: Box::new(|| true),
+        verifying: Box::new(|_| false),
+    };
+    let store = Arc::new(IgnoresPrefix(Arc::clone(&rig.store)));
+    let sweep = Sweeper::new(store, index, SweepConfig::default(), gates);
+    let report = sweep.sweep(now()).await.unwrap();
+    assert_eq!((report.listed, report.outside, report.deleted), (2, 1, 1));
+    assert!(rig.store.holds(&outside).await);
+    assert!(!rig.store.holds(&inside).await);
+}
+
+/// Asserts that a sweep with a pause between pages still lists and deletes every page: the
+/// pause is taken after each page that has a next one (the clock of the test stands still until
+/// the sleep is waited on).
+#[tokio::test(start_paused = true)]
+async fn a_sweep_with_a_pause_between_pages_reaches_the_end() {
+    let rig = Rig::new();
+    for n in 0..5 {
+        rig.store.seed(&key(OLD + n), b"orphan").await;
+    }
+    let index: Arc<dyn PackIndex> = rig.index.clone();
+    let config = SweepConfig {
+        page: PageSize::new(2).unwrap(),
+        pause: Duration::from_secs(30),
+        ..SweepConfig::default()
+    };
+    let sweep = Sweeper::new(Arc::clone(&rig.store), index, config, gates(true, None));
+    let report = sweep.sweep(now()).await.unwrap();
+    assert_eq!((report.listed, report.deleted), (5, 5));
 }

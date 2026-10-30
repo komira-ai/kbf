@@ -4,9 +4,11 @@
 //! through presigned writes. When the
 //! pack is rejected, or the run fails after the write, nothing records it and nothing reads it:
 //! it is an orphan. [`Sweeper::sweep`] lists the prefix and deletes the orphans that are older
-//! than the grace period. Every delete is gated four ways: by the prefix, by the age the key
+//! than the grace period. Every delete is gated four ways: by the prefix (the listing is asked
+//! for [`SWEPT_PREFIX`], and each key it returns is checked to be under it), by the age the key
 //! itself says, by the set of keys under verification, and by the pack index, which is asked
-//! again for the one key just before the delete.
+//! again for the one key just before the delete. Between pages the sweep waits
+//! [`SweepConfig::pause`], which bounds how fast it lists and deletes.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -33,6 +35,9 @@ pub struct SweepConfig {
     pub page: PageSize,
     /// Log and count what would be deleted, and delete nothing.
     pub dry_run: bool,
+    /// How long the sweep waits after each page before it lists the next: with `page`, the
+    /// bound on how fast a sweep lists and deletes. Zero does not wait.
+    pub pause: Duration,
 }
 
 impl Default for SweepConfig {
@@ -41,6 +46,7 @@ impl Default for SweepConfig {
             grace: DEFAULT_GRACE,
             page: PageSize::MAX,
             dry_run: false,
+            pause: Duration::ZERO,
         }
     }
 }
@@ -82,6 +88,9 @@ pub struct SweepReport {
     pub verifying: usize,
     /// Keys under the prefix whose age the key does not say: reported, never deleted.
     pub strays: Vec<String>,
+    /// Keys the listing returned that are not under [`SWEPT_PREFIX`] (a store that ignored the
+    /// prefix): never looked at further, never deleted.
+    pub outside: usize,
     /// Objects deleted.
     pub deleted: usize,
     /// Objects a dry run would have deleted.
@@ -148,6 +157,13 @@ impl<S: ObjectStore> Sweeper<S> {
             let mut candidates = Vec::new();
             for object in &page.objects {
                 let key = object.key.as_str();
+                // The listing is asked for this prefix only; a store that answers with more is
+                // not trusted to have kept to it, and nothing else is ever a candidate.
+                if !key.starts_with(SWEPT_PREFIX) {
+                    tracing::warn!(%key, "the listing of cas/b/ returned a key outside it: kept");
+                    report.outside += 1;
+                    continue;
+                }
                 let Some(born) = (self.gates.age_of)(key) else {
                     tracing::warn!(%key, "a key under cas/b/ does not say its age: kept");
                     report.strays.push(key.to_owned());
@@ -168,6 +184,7 @@ impl<S: ObjectStore> Sweeper<S> {
                 Some(token) => after = Some(token),
                 None => return Ok(report),
             }
+            tokio::time::sleep(self.config.pause).await;
         }
     }
 
