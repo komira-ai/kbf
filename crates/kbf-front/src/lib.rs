@@ -81,6 +81,7 @@ pub mod job_read;
 mod meta_log;
 pub mod metrics;
 mod operations;
+pub mod prepare_run;
 mod proxy;
 mod qos_header;
 mod recorder;

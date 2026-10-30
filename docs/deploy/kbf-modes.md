@@ -113,6 +113,65 @@ that keeps sending, however slowly, is never cut and keeps its bytes until it en
 nothing holds only its reservation, never a buffer of the claimed size. Both flags are
 accepted and ignored without `--pack-store-endpoint`.
 
+Where the frontend runs the actions it places is `--executor` (the `[executor]` table of
+`kbf.toml`). `kbf-daemon`, the default, is the daemon of each node over the worker listener,
+as always: the frontend builds no executor and contacts no lease server, whatever the other
+`--executor-*` flags say, so a unit or `kbf.toml` that names a lease server keeps its settings
+when the executor is switched back, `--executor-insecure-argv-secrets` too (it is ignored, with a
+warning, so the rollback is the one flag: `executor = "kbf-daemon"`). Stopping the frontend
+releases its leases; a frontend that is killed (a stop timeout, SIGKILL) leaves them, and the
+hosts stay held until their ttl ends (`--executor-lease-ttl-secs`, an hour by default) unless a
+later `js-agent` start releases them. `js-agent` leases hosts from the job scheduler's lease server
+instead, one lease for each of `--executor-hosts` hosts of `--executor-host-cpus` cores and
+`--executor-host-memory-gib` GiB in the class `--executor-class`, asked for with
+`os=linux` and `--executor-arch` (default `x86_64`), and runs each placed action in its own
+image by a task tool that the agent mounts read-only (`--executor-task-tool`, default
+`/mnt/kbf-tools/kbf-task`). The image must be named by digest and be on the host. It needs the
+lease server (`--executor-lease-url`, `https://`, or `http://` to loopback only;
+`--executor-lease-token-file`, mode 0600 or 0400; `--executor-lease-ca-file` for an `https`
+URL), `--executor-frontend-id` (the `kbf-frontend` label on the frontend's leases, by which a
+restarted frontend finds and releases them; it must be different for each frontend, so a
+`kbf.toml` is not copied to a second frontend with it), the packs (`--pack-store-endpoint`, through which
+the pack a task writes is read, hashed and turned into the action's result) and
+`--executor-insecure-argv-secrets`: the lease server's job has no secret field yet, so the
+presigned write url and the read token travel as arguments of the run, where the action can
+read them. No image's config is read, and the task tool cannot run under an `ENTRYPOINT`, so
+every action is refused until `--executor-images-have-no-entrypoint` says no image of the farm
+sets one. The executor runs on exactly one frontend: it looks for another frontend's leases on
+the lease server before its first pass and every minute after, and a frontend that finds one
+older than its own (or finds one before it has any) stops with an error naming it. Each lease
+also carries the process that made it: a frontend that starts and finds leases of another
+process under its own id watches them for a renewal (the longest a live executor goes without
+one, 30 s, plus the fence time) before it takes them over, and stops if one is renewed; it takes
+them if none is, as after a crash. Nothing asks for a host meanwhile. A restart of the frontend fails the builds in flight, and
+stopping it stops the runs and releases the leases. The executor prepares each run with the
+frontend's **task runs** (below) and its job-facing read listener (`--job-listen`), so
+`--executor js-agent` is refused when the flags are read unless `--task-secret-file` (with the
+four flags it needs), `--job-listen` (with its three) and `--pack-store-endpoint` are given, and
+unless they agree with it: the tier store and the read url must be IP addresses (the job network
+has no DNS); `--task-put-bucket` must be `--pack-store-bucket`, the bucket the pack is read
+from; an `http://` `--task-put-endpoint` needs `--executor-allow-plain-http-put` (with an
+`https://` one the flag is only warned about); and the longest run (`--executor-max-run-secs`
+plus `--executor-run-margin-secs`) must fit 14400 s less `--task-url-slack-secs`, the longest a
+presigned write may be good for once the slack is added. A lease ttl over 3600 s is warned
+about: the lease server grants at most its `--max-ttl` (3600 s unless started with another) and
+clamps the ask. The run's wall time is the action's timeout plus the margin, and
+`--task-run-wall-secs` is not used by the executor. A run that cannot be prepared because an
+input blob is missing, malformed or over the closure budget ends as an invalid argument to its
+caller and is not rerun; one that cannot be prepared because the store cannot be read is rerun.
+`--executor-default-image` (`<repository>@sha256:<digest>`, the `docker://` scheme optional)
+is the image of an action that names no `container-image` property; an action that names one
+runs in its own, a tag is refused, and an action with neither is refused as invalid. The
+presigned write and the read token are never part of an error, a log line or a metric.
+`GET /metrics` gains the `kbf_executor_*` families. The remaining settings are `--executor-host-slots` (default 8),
+`--executor-run-margin-secs` (300; what a run's wall time adds to the action's timeout),
+`--executor-lease-ttl-secs` (3600), `--executor-max-run-secs` and
+`--executor-default-timeout-secs` (3000), `--executor-call-timeout-secs` (5),
+`--executor-root-der` and `--executor-work-dir` (for the task tool), and
+`--executor-allow-plain-http-put` (until the store serves TLS). A setting that breaks a rule
+the executor's safety rests on (the fence time against the scheduler's grace, the lease ttl
+against the longest run) is refused at start, exit status 2.
+
 A daemon reads from the packs with `--pack-read` (off by default; the `[packs]` table of
 `kbf.toml`), which needs `--pack-store-endpoint`, `--pack-store-bucket` and
 `--pack-store-credentials-file` (a JSON key pair, mode 0600 or 0400, of a key that may read
@@ -141,6 +200,34 @@ reads first, and the outputs still go to the members. `kbf all-in-one` and
 the whole farm, with no frontend to ask and no pack index, and refuse the flag. Counts of
 what was read from packs, elsewhere, lost and damaged are logged when the daemon stops
 (`pack reads: ...`), and a lost or damaged blob is logged when it is found.
+
+**Task runs** (off by default; the `[task-runs]` table of `kbf.toml`). With `--task-secret-file`
+the frontend prepares the runs of a host executor: for each lease and Action it makes the three
+values a task needs and the executor delivers, `RunInputs` of `kbf_front::prepare_run`. They are
+the pack key the task may write (`cas/b/<lease>/<nonce>-0`, which the executor passes to `ingest`
+when the run ends); a presigned `PUT` of exactly that key to the tier store, signed with a
+presign-only key (the URL takes a `PUT` until it expires, and the store is create-only, so the
+first write is the only one that lands); and a read grant, a bearer token with the base URL of the job-facing read
+listener, for the Action, its Command and every blob of its input tree (the job-facing read listener, kbf#1943, works
+the scope out again from the Action each time the token is used, so a blob removed after the run was prepared
+fails that read). The write and the grant
+are good for the run's wall limit plus a slack, `--task-run-wall-secs` (default 7200) and
+`--task-url-slack-secs` (default 600), and never for more than 4 hours (14400 seconds), the
+ceiling of a presigned write: the tier store's presigning key must allow at least that
+(`max_expires_secs` of its `--presign-key-file`, and `--presign-max-expires`), and a wall and
+slack that add up to more are refused at start. Before it signs anything the frontend reads the
+Action, its Command and the whole input tree and checks that every blob is held: a blob that is
+missing is an error, never a smaller grant, and a tree over `--task-closure-max-digests`
+(default 500000) or `--task-closure-max-bytes` (default 32 GiB) is refused. The switch needs
+`--task-put-endpoint` (the tier store's proxy, `http://` or `https://host:port`),
+`--task-put-bucket`, `--task-put-region` (default `us-east-1`),
+`--task-put-credentials-file` (JSON `{"access_key_id": "...", "secret_access_key": "..."}` of
+the presign-only key, owned by the server's user, mode 0600 or 0400) and `--task-read-url`
+(`https://host:port`, no path: an `http://` URL is refused at start, as the token is a bearer
+secret). The secret file holds one secret of at least 32 bytes, owned by the server's user
+and readable by it alone; the pack-key mint and the grant key are made from it, and the
+job-facing listener must verify grants with the same secret. No secret is a flag. Left out, no
+secret file is read and the frontend serves exactly as before.
 
 A daemon writes its outputs into packs with `--pack-write` (off by default; the `[packs]`
 table of `kbf.toml`), which needs `--pack-read` and `--pack-store-write-credentials-file`, a
