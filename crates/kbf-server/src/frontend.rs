@@ -195,10 +195,12 @@ pub const ALLOWED: &[&str] = &[
     "default_platform",
     "qos_allowed",
     "memory_ladder_gib",
+    "no_memory_climb",
     "vm_host_floor_cpus",
     "vm_host_floor_mem_gib",
     "scheduler_core",
     "learned_sizes",
+    "exclusive_actions",
     "placement_load",
     "placement_predictions",
     "whole_node_max",
@@ -915,10 +917,12 @@ impl<'a> Prepared<'a> {
             memory: listeners.memory_ladder.first(),
             platform: listeners.default_platform,
             qos: listeners.qos_allowed,
+            exclusive_actions: listeners.exclusive_actions,
         };
         let durable = state.is_some();
         let farm = Farm::from_listeners(backend.clone(), &listeners).recording(recorder.clone());
         crate::serve::log_core(&farm);
+        crate::serve::log_exclusive(listeners.exclusive_actions);
         let farm = Arc::new(farm.with_state(state)?);
         log_state(durable, farm.term(), farm.lease_epoch());
         let source = source.or_else(|| run_prep.as_ref().map(RunSource::of));

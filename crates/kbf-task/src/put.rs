@@ -11,8 +11,8 @@
 //! attempt.
 //!
 //! [`put_file`] is the same PUT for a large object: the body is streamed from a file, never read
-//! whole, and the file is reopened by each attempt of [`put_retrying`]. It is not yet called by
-//! the run.
+//! whole, and the file is reopened by each attempt of [`put_retrying`]. [`put_reader`] is the same
+//! PUT for a body that is held open rather than named by a path.
 
 use std::fs::File;
 use std::io::Read;
@@ -244,31 +244,56 @@ pub fn put_file(agent: &ureq::Agent, url: &str, path: &Path) -> Result<(), PutEr
 
 /// [`put_file`] with the cap as a parameter, so a test needs no file of the real cap's size.
 fn put_file_capped(agent: &ureq::Agent, url: &str, path: &Path, cap: u64) -> Result<(), PutError> {
-    let shown = redact(url);
-    let (file, len) = File::open(path)
+    let (mut file, len) = File::open(path)
         .and_then(|file| file.metadata().map(|meta| (file, meta.len())))
         .map_err(|e| PutError::File {
             path: path.display().to_string(),
             reason: e.to_string(),
         })?;
+    put_stream(agent, url, len, &mut file, cap)
+}
+
+/// [`put_file`] for a body that is not a path: the first `len` bytes of `body` are streamed as
+/// one create-only PUT with `Content-Length: len`. A `len` over [`MAX_LARGE_BYTES`] is refused
+/// before the store is contacted. A caller that retries makes a fresh reader for each attempt.
+///
+/// # Errors
+/// [`PutError::TooLarge`], else as [`put`]; a `body` shorter than `len` is a
+/// [`PutError::Transport`].
+pub fn put_reader(
+    agent: &ureq::Agent,
+    url: &str,
+    len: u64,
+    body: &mut dyn Read,
+) -> Result<(), PutError> {
+    put_stream(agent, url, len, body, MAX_LARGE_BYTES)
+}
+
+fn put_stream(
+    agent: &ureq::Agent,
+    url: &str,
+    len: u64,
+    body: &mut dyn Read,
+    cap: u64,
+) -> Result<(), PutError> {
     if len > cap {
         return Err(PutError::TooLarge {
             size: len,
             limit: cap,
         });
     }
-    // `take` keeps a file that grew after the measure from sending more than it announced.
-    let mut body = file.take(len);
+    // `take` keeps a body that grew after the measure from sending more than it announced.
+    let mut body = body.take(len);
     let response = agent
         .put(url)
         .header("If-None-Match", "*")
         .header("Content-Length", len.to_string())
         .send(ureq::SendBody::from_reader(&mut body))
         .map_err(|e| PutError::Transport {
-            url: shown.clone(),
+            url: redact(url),
             reason: scrub(&e.to_string(), url),
         })?;
-    answer(&response, &shown)
+    answer(&response, &redact(url))
 }
 
 /// What waits between the attempts of [`put_retrying`]; a parameter so tests record the waits

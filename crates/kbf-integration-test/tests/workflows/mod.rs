@@ -17,7 +17,9 @@
 //!   pipeline's watch job cancels its own run), which may be `write` only in a job whose `if:` is exactly
 //!   [`SIGNING_PUSH_ONLY`], and the two scopes
 //!   that sign build provenance ([`SIGNING_SCOPES`]: `id-token` and `attestations`),
-//!   which may be `write` only in a job whose `if:` is exactly [`SIGNING_PUSH_ONLY`] (`id-token`
+//!   which may be `write` only in a job whose `if:` is exactly [`SIGNING_PUSH_ONLY`] or exactly
+//!   [`SIGNING_STAGE_ONLY`] (the same push to main, and the called artifacts workflow's `sign`
+//!   stage; a caller job has no `inputs`, so it keeps [`SIGNING_PUSH_ONLY`]) (`id-token`
 //!   also in a job whose `if:` is exactly [`RELEASE_PUSH_ONLY`], for the release's deploy step,
 //!   [`DEPLOY_SCOPE`]), and
 //!   `contents` ([`RELEASE_SCOPES`]), which may be `write` only in a job whose `if:` is
@@ -88,7 +90,8 @@ mod yaml;
 mod jobs;
 pub use jobs::{
     concurrency, job_env, job_environment, job_has_key, job_needs, job_outputs,
-    job_permission_levels, job_uses, push_filters, top_env, trigger_filters,
+    job_permission_levels, job_uses, job_with, push_filters, top_defaults_shell, top_env,
+    trigger_filters,
 };
 
 use yaml::{Node, Value};
@@ -158,6 +161,12 @@ const SIGNING_SCOPES: &[&str] = &["id-token", "attestations"];
 const SIGNING_PUSH_ONLY: &str =
     "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
 
+/// The second `if:` spelling under which a job may hold [`SIGNING_SCOPES`] for writing (and
+/// only those, never [`ACTIONS_SCOPES`]): the push to `main` of [`SIGNING_PUSH_ONLY`], in the
+/// `sign` stage of a workflow that is called twice (`inputs.stage`, which a pull request or
+/// merge-queue run does not have: its `inputs` context is empty).
+const SIGNING_STAGE_ONLY: &str = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.stage == 'sign' }}";
+
 /// The one signing scope a job may also set to `write` under [`RELEASE_PUSH_ONLY`]: the OIDC
 /// token, which the release workflow's deploy step presents to the farm's update coordinator.
 /// It signs nothing (`attestations` stays under [`SIGNING_PUSH_ONLY`]), and the workflow lint of
@@ -220,6 +229,9 @@ pub struct Step {
     pub env: Vec<(String, String)>,
     pub conditional: bool,
     pub condition: Option<String>,
+    pub working_directory: Option<String>,
+    /// The step's own `shell:`, if it has one.
+    pub shell: Option<String>,
 }
 
 /// The steps of the job `job` (its key matched ignoring ASCII case) in a workflow
@@ -262,6 +274,8 @@ pub fn job_steps(text: &str, job: &str) -> Result<Vec<Step>, String> {
                 env: strings(m, "env"),
                 conditional: get(m, "if").is_some() || get(m, "continue-on-error").is_some(),
                 condition: text_of(get(m, "if")),
+                working_directory: text_of(get(m, "working-directory")),
+                shell: text_of(get(m, "shell")),
             },
             _ => Step::default(),
         })
@@ -671,31 +685,36 @@ impl Lint<'_> {
             if name == DEPLOY_SCOPE && granted == "write" && condition == Some(RELEASE_PUSH_ONLY) {
                 continue;
             }
-            let gate = if SIGNING_SCOPES.contains(&name) {
-                Some(SIGNING_PUSH_ONLY)
+            let gate: &[&str] = if SIGNING_SCOPES.contains(&name) {
+                &[SIGNING_PUSH_ONLY, SIGNING_STAGE_ONLY]
             } else if RELEASE_SCOPES.contains(&name) {
-                Some(RELEASE_PUSH_ONLY)
+                &[RELEASE_PUSH_ONLY]
             } else if ACTIONS_SCOPES.contains(&name) {
-                Some(SIGNING_PUSH_ONLY)
+                &[SIGNING_PUSH_ONLY]
             } else if ISSUE_SCOPES.contains(&name) {
-                Some(ISSUES_MAIN_ONLY)
+                &[ISSUES_MAIN_ONLY]
             } else {
-                None
+                &[]
             };
-            match gate {
-                Some(only) if granted == "write" && condition != Some(only) => self.refuse(
-                    level,
-                    format_args!(
-                        "`{name}: write` is allowed only in a job whose `if:` is exactly `{only}`"
-                    ),
-                ),
-                Some(_) if granted == "write" => {}
-                _ => self.refuse(
+            if gate.is_empty() || granted != "write" {
+                self.refuse(
                     level,
                     format_args!(
                         "a job's `permissions` may grant only `read` or `none`, got `{name}: {granted}`"
                     ),
-                ),
+                );
+            } else if !condition.is_some_and(|c| gate.contains(&c)) {
+                let list = gate
+                    .iter()
+                    .map(|c| format!("`{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(" or exactly ");
+                self.refuse(
+                    level,
+                    format_args!(
+                        "`{name}: write` is allowed only in a job whose `if:` is exactly {list}"
+                    ),
+                );
             }
         }
     }

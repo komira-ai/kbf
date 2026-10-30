@@ -5,10 +5,10 @@ use std::future::Future;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::{StreamExt as _, TryStreamExt as _};
+use futures::{FutureExt as _, StreamExt as _, TryStreamExt as _};
 use kbf_meta::{ActionRecord, Role};
 use kbf_storage::service::MAX_FIND_MISSING_DIGESTS;
-use kbf_storage::{Storage, StorageError};
+use kbf_storage::{OpenPieces, Storage, StorageError};
 use kbf_types::Digest;
 
 use crate::router::{Router, unavailable, write_order};
@@ -77,6 +77,27 @@ impl Router {
             )));
         }
         Ok(stored)
+    }
+
+    /// Streams the blob `digest` to the first of its write owners that is not `Down`, as
+    /// [`Router::put`] sends bytes, but taking the blob from `open` a piece at a time so
+    /// that this process never holds it whole.
+    ///
+    /// `open` is called once for each attempt (the next owner after one that could not be
+    /// reached, and the whole call again after `STALE_MAP`) and must give the blob from its
+    /// first byte. The owner is given `digest` as the digest the bytes must hash to, and
+    /// stores nothing if they do not.
+    ///
+    /// # Errors
+    /// As [`Router::put`]; a node that answers without having stored the blob is an
+    /// internal error.
+    pub async fn put_streamed(
+        &self,
+        digest: &Digest,
+        open: &OpenPieces<'_>,
+    ) -> Result<(), StorageError> {
+        self.routed(|view| self.put_streamed_in(view, *digest, open))
+            .await
     }
 
     /// The second half of an action-cache write: commits the entry for `action` at the
@@ -266,6 +287,28 @@ impl Router {
         self.at_a_write_owner(&view, &digest, |node| {
             let bytes = bytes.clone();
             async move { node.put(bytes).await.map_err(Tried::Node) }
+        })
+        .await
+    }
+
+    async fn put_streamed_in(
+        &self,
+        view: MapView,
+        digest: Digest,
+        open: &OpenPieces<'_>,
+    ) -> Result<(), StorageError> {
+        self.at_a_write_owner(&view, &digest, |node| {
+            let body = open();
+            async move {
+                let claim = futures::future::ready(Some(digest)).boxed();
+                match node.put_streamed(digest.size_bytes, body, claim).await {
+                    Ok(Some(stored)) if stored == digest => Ok(()),
+                    Ok(other) => Err(Tried::Elsewhere(StorageError::Internal(format!(
+                        "a node answered {other:?} for the streamed blob {digest}"
+                    )))),
+                    Err(e) => Err(Tried::Node(e)),
+                }
+            }
         })
         .await
     }

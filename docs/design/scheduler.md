@@ -513,6 +513,27 @@ What the code does today:
   its `gpu` count, and what its platform asks of a worker (`Request::needs`). The
   scheduler raises the memory of a new submission to its action key's memory floor,
   if it has one (see "Memory kills" below).
+- With `--exclusive-actions` on, the front sets `Request.whole_worker` on every `action`
+  request (not on a `whole_machine` or `vm` one). The request still carries the booking
+  above, which the front computes as before and which stays the record of what the
+  platform named, but the scheduler resolves it per worker: the request books the
+  worker's full capacity (all its CPUs, memory and GPUs), has room only on a worker that
+  holds no lease, and places no other lease beside it, as a whole-host action does. The
+  `Start` carries that capacity. It is placed by the same round, and while it waits the
+  scheduler holds a reservation for it on a worker. The action digest is untouched. A hint
+  (`kbf-book-cpus`, `kbf-book-mem-gib`) is read and recorded but not booked. An own-limit
+  memory kill has no larger rung (see "Memory kills"): the operation finishes
+  `Failed(OutOfMemory)` and leaves no memory floor. The control log has no field for the
+  request's `whole_worker`, so recovery reads every operation back with it false. A queued
+  operation is then an ordinary action. A running one is recovered by booking its request
+  as stored (`recover.rs`: `book` with `worker.booking(request)`, the request's own
+  resources, and a load charge from the recorded grant cost, which is the admission
+  charge of that booking; the worker-wide charge is made only in the scheduler's memory at
+  grant), so it holds the front's small booking and ordinary actions can be placed
+  beside it, and if it is lost or requeued it reruns as an ordinary action, up the memory
+  ladder, without owning the worker. A run that depends on one action per worker must not
+  restart the server. The server logs `exclusive-actions: on` at start when the flag is on. Both
+  scheduler cores take the request unchanged.
 - Each request carries its lease kind (`kbf-lease`: `action` or `whole_machine`). A
   worker is feasible for it only if its node report lists a driver that serves the
   kind (`container`, `native`, `fake` or `local` for `action`, `native-whole-machine` for
@@ -709,6 +730,34 @@ turns it into one of two outcomes, and the scheduler decides on the committed re
   the farm: where no live node has the first rung's memory, an action that names no
   size is unservable, as one that names that size would be, and is refused after the
   unservable wait; a farm of small nodes sets a lower first rung.
+- **With `--exclusive-actions` on**, an action already books the whole worker, so it has
+  no rung above: an own-limit kill finishes the operation `Failed(OutOfMemory)` and raises
+  no floor for its key, the same as a kill of a run that booked the cap.
+- **`--no-memory-climb`: no rung above the first booking.** With the flag, set on the
+  server (default off; off is the behaviour above), an own-limit kill does not queue the
+  operation again. The scheduler records the kill as a memory run, as it does a kill at
+  the cap, and finishes the operation `Failed(OutOfMemory)` at the booking it ran with:
+  the first rung, or the GiB its `kbf-book-mem-gib` names. Its callers are told
+  FAILED_PRECONDITION with reason `ACTION_OUT_OF_MEMORY`, the message saying the ladder is
+  off, not that no node is large enough (it passed its memory limit with 4 GiB booked on
+  node-a; the memory ladder is off (--no-memory-climb), so it is not run again with more
+  memory. Runs: 1 (4 GiB on node-a)). The server tells the two apart by the last run: a
+  kill below its cap can only end an operation when the climb is off, and its attempt in the invocation record carries
+  `memory_kill` `own_limit`. No booking, floor or key floor is raised, so every
+  submission of the action starts where the first did. A kill the node made under memory
+  pressure is not the action's: it runs again with the same booking and counts against
+  the farm-fault reruns, with the flag as without it. The ladder's rungs still matter
+  for the first booking only (the first rung). `--learned-sizes on` is allowed with the
+  flag: the booking floor the estimator adds comes from a kill that climbs, which the
+  flag never lets happen; the estimator still takes the kill in as a sample of the
+  action, as it takes any kill, but the scheduler holds no floor from it. The flag is
+  held by the legacy core's scheduler, which a restart builds again from the flag. The js
+  core builds its scheduler inside `js-server-core`, whose configuration has no setting
+  for it yet, so a server given `--no-memory-climb` with `--scheduler-core js` refuses to
+  start (exit status 2). A start logs `memory climb: on` or `memory climb: off`. With
+  `--exclusive-actions` as well, an action books the whole worker, so its booking is its
+  cap: an own-limit kill reads as a kill at the cap, with the original message, not the
+  ladder-off one.
 - **The memory floor.** Each raised booking is kept as the memory floor of the
   action's key (instance name and action digest), and a later submission of that key
   books at least the floor, so a known-big action starts at the rung that ran it
