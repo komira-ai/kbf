@@ -239,6 +239,28 @@ member-ttl-secs = 15
 # Turns on the object-store registration routes of the operator API (/v1/object-stores, docs/api.md) and names the directory where the secret key of each registered connection is kept, one file of mode 0600 each, in a directory made 0700. The directory must be readable by every frontend child that serves at once and left out of any backup of the host. The registration itself (endpoints, buckets, the audit log) is kept in the state store. Without it those routes answer 404.
 # object-store-secrets-dir = "DIR"
 
+[task-runs]
+# The most bytes of blobs, by their digests' sizes, the input tree of a run may have (each distinct blob once): a run whose tree has more is refused. Used only with `--task-secret-file`
+task-closure-max-bytes = 34359738368
+# The most distinct digests (directories and files) the input tree of a run may have: a run whose tree has more is refused, never run on a part of its inputs. Used only with `--task-secret-file`
+task-closure-max-digests = 500000
+# The bucket of `--task-put-endpoint` a task's pack is written to, under the key `cas/b/<lease>/<nonce>-0`
+# task-put-bucket = "BUCKET"
+# A file with the presign-only key of the tier store, as JSON `{"access_key_id": "...", "secret_access_key": "..."}`, owned by this user and readable by it alone (mode 0600 or 0400). The key signs a `PUT` of one object under its prefix and does nothing else; its ceiling (`max_expires_secs` of the store's `--presign-key-file`) must be at least 14400, and the store's `--presign-max-expires` too
+# task-put-credentials-file = "PATH"
+# The tier store's proxy, as `http://host:port` or `https://host:port`: the host a task's presigned write is signed for, and where it sends the pack. Used only with `--task-secret-file`
+# task-put-endpoint = "URL"
+# The region the presigned writes to `--task-put-endpoint` are signed for
+task-put-region = "us-east-1"
+# The base URL a task reads its inputs from: the job-facing read listener, as `https://host:port` with no path (a grant's token is a bearer secret and crosses only a TLS connection; `http://` is refused at start). A blob is `GET <url>/<hash>/<size>`
+# task-read-url = "URL"
+# The run wall limit a run is prepared for, in seconds, at least 1 and at most 14400: a task's presigned write and read grant are good for this plus `--task-url-slack-secs`. Used only with `--task-secret-file`
+task-run-wall-secs = 7200
+# Turns on the preparation of the runs of a host executor: for each run the frontend makes the key the task may write, one presigned write of it to the tier store, and a read grant for the task's inputs. The file holds one secret of at least 32 bytes (surrounding white space is dropped), owned by this user and readable by it alone (mode 0600 or 0400): the pack-key mint and the read-grant key are made from it, and it is the secret the job-facing listener verifies grants with. The secret is never a flag: a command line is world-readable. Needs `--task-put-endpoint`, `--task-put-bucket`, `--task-put-credentials-file` and `--task-read-url`. Left out, no run is prepared
+# task-secret-file = "PATH"
+# The time past the run wall, in seconds, that a task's presigned write and read grant stay good: the time a task takes to start and to put its pack. The wall and the slack together must not pass 14400, the ceiling of a presigned write, or the frontend does not start. Used only with `--task-secret-file`
+task-url-slack-secs = 600
+
 [tls]
 # A file holding the token operator API writes (cordon, drain, uncordon) must present as `Authorization: Bearer <token>`. It must be owned by the server's user with mode 0600 or 0400, or the server refuses to start; run the server as a user other than the daemon's, whose builds could read it. Without it, writes are refused
 # api-token-file = "API_TOKEN_FILE"

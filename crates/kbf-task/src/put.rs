@@ -221,6 +221,10 @@ fn wait_for(retry_after_secs: Option<u64>) -> Duration {
 /// key: a 503 stored nothing, and if an earlier attempt had in fact stored the object, the retry
 /// meets a 412 and fails instead of overwriting it.
 ///
+/// The URL's expiry is not checked: the waits add up to at most [`MAX_RETRIES`] times
+/// [`MAX_WAIT`] (90 s), and an attempt the store gets after the URL expired is refused with a
+/// 403, which is not retried. A late retry therefore fails the task and stores nothing.
+///
 /// # Errors
 /// The last attempt's [`PutError`].
 pub fn put_retrying(
@@ -612,6 +616,19 @@ mod tests {
         assert_eq!(put_retrying(attempt, &sleeper), Err(exists));
         assert_eq!(calls.get(), 1);
         assert!(sleeper.waits().is_empty());
+    }
+
+    /// Catches a retry that hides what the later attempt said: after a 503, the retry meets a
+    /// 412 (an earlier attempt's object, or another writer's, holds the key), and that 412 is the
+    /// failure, after exactly one wait and with no further attempt.
+    #[test]
+    fn a_412_after_a_503_is_the_failure_and_ends_the_retries() {
+        let sleeper = Recorded::default();
+        let exists = PutError::Exists { url: "u".into() };
+        let (attempt, calls) = answering(vec![busy(Some(4)), Err(exists.clone())]);
+        assert_eq!(put_retrying(attempt, &sleeper), Err(exists));
+        assert_eq!(calls.get(), 2);
+        assert_eq!(sleeper.waits(), [Duration::from_secs(4)]);
     }
 
     /// Catches a transport error or another status being retried: each is reported on the first

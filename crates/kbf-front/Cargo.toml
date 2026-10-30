@@ -46,6 +46,8 @@ serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
+# `server::presign_put`, the signer of the one presigned write of a task's pack (`prepare_run`).
+tierstore = { workspace = true, features = ["server"] }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tonic.workspace = true
 tower-layer.workspace = true
