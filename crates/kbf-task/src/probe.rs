@@ -705,6 +705,8 @@ pub fn run_cli_with(protection: std::io::Result<()>, cli: &ProbeCli) -> ExitCode
     )
 }
 
-#[cfg(test)]
+// The tests feed Linux errno numbers (ENETUNREACH is 101) and Linux observations to the checks, so
+// they are Linux tests: the probe has no macOS side (the Command reports nothing there).
+#[cfg(all(test, target_os = "linux"))]
 #[path = "probe_tests.rs"]
 mod tests;
