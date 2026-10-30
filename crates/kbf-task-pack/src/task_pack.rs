@@ -107,14 +107,33 @@ pub enum WritePackError {
 /// Checks that `footer`, the footer of an object of `pack_len` bytes, is that of a task pack, and
 /// returns the entry of the manifest: the record at offset 0.
 ///
-/// The rules: at most [`MAX_PACK_BYTES`]; 1 to [`MAX_PACK_RECORDS`] records; none of size 0 and
-/// none over [`MAX_RECORD_BYTES`]; records back to back in offset order from 0, the last ending
-/// where the footer starts; the manifest at most [`MAX_MANIFEST_BYTES`]. A zero-size record is
-/// reported before a gap, so one defect has one reason.
+/// The rules of [`check_records`], and the manifest at most [`MAX_MANIFEST_BYTES`]. This is the
+/// check of pack 0, whose first record is the manifest.
 ///
 /// # Errors
 /// The first rule that fails, as a [`ShapeError`].
 pub fn check_shape(footer: &Footer, pack_len: u64) -> Result<&IndexEntry, ShapeError> {
+    let first = check_records(footer, pack_len)?;
+    if first.digest.size_bytes > MAX_MANIFEST_BYTES {
+        return Err(ShapeError::ManifestTooLarge {
+            size: first.digest.size_bytes,
+        });
+    }
+    Ok(first)
+}
+
+/// Checks that `footer`, the footer of an object of `pack_len` bytes, lays out records as a task
+/// pack does, and returns the entry at offset 0. This is the whole check of a pack that holds no
+/// manifest (packs 1.. of a run), whose first record may be as large as any.
+///
+/// The rules: at most [`MAX_PACK_BYTES`]; 1 to [`MAX_PACK_RECORDS`] records; none of size 0 and
+/// none over [`MAX_RECORD_BYTES`]; records back to back in offset order from 0, the last ending
+/// where the footer starts. A zero-size record is reported before a gap, so one defect has one
+/// reason.
+///
+/// # Errors
+/// The first rule that fails, as a [`ShapeError`] (never [`ShapeError::ManifestTooLarge`]).
+pub fn check_records(footer: &Footer, pack_len: u64) -> Result<&IndexEntry, ShapeError> {
     if pack_len > MAX_PACK_BYTES {
         return Err(ShapeError::TooLarge { len: pack_len });
     }
@@ -156,13 +175,7 @@ pub fn check_shape(footer: &Footer, pack_len: u64) -> Result<&IndexEntry, ShapeE
             found: footer.records_len(),
         });
     }
-    let manifest = by_offset[0];
-    if manifest.digest.size_bytes > MAX_MANIFEST_BYTES {
-        return Err(ShapeError::ManifestTooLarge {
-            size: manifest.digest.size_bytes,
-        });
-    }
-    Ok(manifest)
+    Ok(by_offset[0])
 }
 
 /// Reads the manifest of `pack`, the whole object: checks the footer, the shape, the manifest

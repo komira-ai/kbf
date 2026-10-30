@@ -787,7 +787,7 @@ fn a_body_longer_than_the_digest_is_refused_as_it_streams() {
 fn a_destination_that_cannot_take_the_bytes_is_an_io_error() {
     let mut room = [0_u8; 2];
     let digest = digest_of(b"abc");
-    let error = stream_checked(&digest, Path::new("full"), &mut room[..], &mut |out| {
+    let error = stream_checked(&digest, Path::new("full"), &mut &mut room[..], &mut |out| {
         out.write_all(b"abc").map_err(|e| FetchError::Source {
             digest: label(&digest),
             why: e.to_string(),

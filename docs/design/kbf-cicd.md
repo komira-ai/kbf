@@ -576,6 +576,11 @@ A push to `main` runs one pipeline, `pipeline.yml`:
   trigger of their own. `ci.yml` and `artifacts.yml` keep `pull_request` and `merge_group`, so the pull-request gate and the
   merge queue are unchanged; `beta.yml` and `smoke.yml` have `workflow_call` alone (they never ran for a pull request). In a called workflow
   `github.event_name` and `github.ref` are the caller's, so the jobs that attest still read as a push to `main`.
+- **The pull request checks the static target.** The release builds `kbf-task` for `x86_64-unknown-linux-musl` and
+  `aarch64-unknown-linux-musl` (`artifacts.yml`), where libc's type aliases differ from glibc's (`libc::Ioctl` is `c_int`, not
+  `c_ulong`). The `lint` job of `ci.yml` therefore installs `musl-tools` and the musl target, as `artifacts.yml` does, and runs
+  `cargo check --locked --target x86_64-unknown-linux-musl -p kbf-task --bin kbf-task`, so a glibc-only type is red on the pull
+  request and not on the release build after the merge. `kbf-task` is the only binary the release builds for a musl target.
 - **Smoke tests the files that will be released.** `smoke` runs after `artifacts-sign` in the same run and downloads that run's
   `assets-*` and `sha256sums` artifacts (no run id), checks them with `verify-assets sums`, checks the tarball's `kbf` with `build-commit check-asset` (this commit, a
   release build), and the smoke farm runs the `kbf` out of the linux-x86_64 tarball. The release then publishes those same files (`release.yml` downloads them from the same

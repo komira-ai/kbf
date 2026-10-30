@@ -709,6 +709,28 @@ turns it into one of two outcomes, and the scheduler decides on the committed re
   the farm: where no live node has the first rung's memory, an action that names no
   size is unservable, as one that names that size would be, and is refused after the
   unservable wait; a farm of small nodes sets a lower first rung.
+- **`--no-memory-climb`: no rung above the first booking.** With the flag, set on the
+  server (default off; off is the behaviour above), an own-limit kill does not queue the
+  operation again. The scheduler records the kill as a memory run, as it does a kill at
+  the cap, and finishes the operation `Failed(OutOfMemory)` at the booking it ran with:
+  the first rung, or the GiB its `kbf-book-mem-gib` names. Its callers are told
+  FAILED_PRECONDITION with reason `ACTION_OUT_OF_MEMORY`, the message saying the ladder is
+  off, not that no node is large enough (it passed its memory limit with 4 GiB booked on
+  node-a; the memory ladder is off (--no-memory-climb), so it is not run again with more
+  memory. Runs: 1 (4 GiB on node-a)). The server tells the two apart by the last run: a
+  kill below its cap can only end an operation when the climb is off, and its attempt in the invocation record carries
+  `memory_kill` `own_limit`. No booking, floor or key floor is raised, so every
+  submission of the action starts where the first did. A kill the node made under memory
+  pressure is not the action's: it runs again with the same booking and counts against
+  the farm-fault reruns, with the flag as without it. The ladder's rungs still matter
+  for the first booking only (the first rung). `--learned-sizes on` is allowed with the
+  flag: the booking floor the estimator adds comes from a kill that climbs, which the
+  flag never lets happen; the estimator still takes the kill in as a sample of the
+  action, as it takes any kill, but the scheduler holds no floor from it. The flag is
+  held by the legacy core's scheduler, which a restart builds again from the flag. The js
+  core builds its scheduler inside `js-server-core`, whose configuration has no setting
+  for it yet, so a server given `--no-memory-climb` with `--scheduler-core js` refuses to
+  start (exit status 2). A start logs `memory climb: on` or `memory climb: off`.
 - **The memory floor.** Each raised booking is kept as the memory floor of the
   action's key (instance name and action digest), and a later submission of that key
   books at least the floor, so a known-big action starts at the rung that ran it

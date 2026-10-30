@@ -195,6 +195,7 @@ pub const ALLOWED: &[&str] = &[
     "default_platform",
     "qos_allowed",
     "memory_ladder_gib",
+    "no_memory_climb",
     "vm_host_floor_cpus",
     "vm_host_floor_mem_gib",
     "scheduler_core",

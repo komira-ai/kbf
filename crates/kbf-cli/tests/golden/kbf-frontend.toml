@@ -188,6 +188,8 @@ log-max-bytes = 67108864
 learned-sizes = "off"
 # The memory rungs of an action, in GiB, ascending and each at least 1. The first is what an action that names no size (`kbf-book-mem-gib`) books. An action that passes its own memory limit runs again on the next rung above what it booked, and after the last on a whole host: the memory of the largest node that could run it, so that no other lease fits there. A rung not below that node's memory is skipped for the whole host. An action that does finish keeps its rung: later runs of it start there
 memory-ladder-gib = [4, 16, 32]
+# Keeps an action's memory booking where it started. An action that passes its own memory limit is not run again on the next rung of `--memory-ladder-gib`: the kill finishes it, FAILED_PRECONDITION with reason `ACTION_OUT_OF_MEMORY`, as a kill at the largest node does, and its attempt is recorded with `memory_kill` `own_limit`. A booking is therefore the first rung, or the GiB the action names in `kbf-book-mem-gib`. No floor is raised, so with `--learned-sizes on` an own-limit kill leaves none either. A kill the node made under memory pressure is not the action's: it runs again with the same booking, as it does without this flag. Needs `--scheduler-core legacy`; a server given it with `js` refuses to start (exit status 2)
+no-memory-climb = false
 
 [packs]
 # The length, in bytes, at which a pack of client uploads is closed: the blobs of one batch or upload that do not fit are written as the next pack. Used only with `--pack-store-endpoint`
