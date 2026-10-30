@@ -60,6 +60,7 @@ pub struct Spy {
     reject_lens: AtomicU32,
     shave_len: AtomicU64,
     reject_big_reads: AtomicU32,
+    reject_large_lens: AtomicU32,
     overstated: Mutex<Vec<(String, u64)>>,
     puts: AtomicU32,
     ranges: Mutex<Vec<(String, u64, u64)>>,
@@ -98,6 +99,7 @@ impl Spy {
             reject_lens: AtomicU32::new(0),
             shave_len: AtomicU64::new(0),
             reject_big_reads: AtomicU32::new(0),
+            reject_large_lens: AtomicU32::new(0),
             overstated: Mutex::new(Vec::new()),
             puts: AtomicU32::new(0),
             ranges: Mutex::new(Vec::new()),
@@ -129,6 +131,11 @@ impl Spy {
     /// object's window, not of a footer or a record.
     pub fn reject_big_reads(&self, n: u32) {
         self.reject_big_reads.store(n, SeqCst);
+    }
+
+    /// The next `n` length questions about a large object (a key of slot `L<i>`) fail.
+    pub fn reject_large_lens(&self, n: u32) {
+        self.reject_large_lens.store(n, SeqCst);
     }
 
     /// The length answer for `key` is `by` bytes more than the object's: the store says an
@@ -219,6 +226,10 @@ impl ObjectStore for Spy {
 
     async fn len(&self, key: &ObjectKey) -> Result<Option<u64>, ObjectStoreError> {
         if fires(&self.reject_lens) {
+            return Err(injected());
+        }
+        let large = key.as_str().rsplit('-').next();
+        if large.is_some_and(|slot| slot.starts_with('L')) && fires(&self.reject_large_lens) {
             return Err(injected());
         }
         let shave = self.shave_len.load(SeqCst);

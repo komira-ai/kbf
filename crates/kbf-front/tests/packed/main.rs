@@ -16,6 +16,7 @@ mod bytestream;
 mod cas;
 mod closure;
 mod commit;
+mod multi;
 mod store;
 mod support;
 mod untrusted;

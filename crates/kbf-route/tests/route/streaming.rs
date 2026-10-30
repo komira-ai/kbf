@@ -20,7 +20,7 @@ use super::support::{
 fn source(
     blob: &[u8],
 ) -> (
-    impl Fn() -> BoxStream<'static, io::Result<Bytes>>,
+    impl Fn() -> BoxStream<'static, io::Result<Bytes>> + use<>,
     Arc<AtomicUsize>,
 ) {
     let blob = Bytes::copy_from_slice(blob);

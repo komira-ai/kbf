@@ -3,399 +3,20 @@
 //! object is a raw object under an `L<i>` key that is streamed through SHA-256 into the CAS, a
 //! window at a time, and never held whole. The action-cache entry is written last.
 //!
-//! The fixtures are those of `untrusted_task` (the store logs every range it is asked for, the
-//! index is in memory, the action cache is a real storage node read back through the frontend).
-//! Every test says the behaviour it asserts.
+//! The fixtures are in `multi`. Every test says the behaviour it asserts.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::Ordering;
 
-use bytes::Bytes;
-use futures::StreamExt as _;
-use futures::future::BoxFuture;
-use futures::stream::BoxStream;
 use kbf_front::{
-    Backend, Ingested, IssuedKeySet, IssuedPackKey, MAX_UNTRUSTED_LARGE_BYTES, PackKeyMint,
-    RejectReason, UntrustedLimits, ingest, ingest_set,
-};
-use kbf_meta::{ActionRecord, Role};
-use kbf_pack::{
-    LargeEntry, OutputDirectory, OutputFile, TaskManifest, Timing, Usage, write_pack_with,
+    Ingested, IssuedKeySet, IssuedPackKey, PackKeyMint, RejectReason, UntrustedLimits, ingest,
 };
 use kbf_pack_index::PackIndex as _;
-use kbf_proto::reapi::action_cache_client::ActionCacheClient;
-use kbf_proto::reapi::{self, ActionResult, GetActionResultRequest};
-use kbf_proto::worker::segments_server::Segments;
-use kbf_segments::{RecordHasher, sha256};
-use kbf_storage::{Answer, PutStream, ReadStream, Storage, StorageError};
-use kbf_types::Digest;
+use kbf_segments::sha256;
 use tonic::Code;
 
-use crate::support::{Rig, Spy, blob, update};
-use crate::untrusted_task::{
-    LEASE, SECRET, action_bytes, entry_of, forged, now, segment_of, tree_of, wire,
-};
-
-/// The most bytes of a large object ingest reads at a time.
-const WINDOW: u64 = 8 << 20;
-/// A large object: over the record cap, not a whole number of windows.
-const LARGE_LEN: usize = (64 << 20) + 12_345;
-
-fn patterned(len: usize) -> Vec<u8> {
-    (0..len).map(|i| (i * 31 % 251) as u8).collect()
-}
-
-/// The large object of the tests and its digest, made once.
-fn large() -> &'static (Bytes, Digest) {
-    static LARGE: OnceLock<(Bytes, Digest)> = OnceLock::new();
-    LARGE.get_or_init(|| {
-        let bytes = Bytes::from(patterned(LARGE_LEN));
-        let digest = sha256(&bytes);
-        (bytes, digest)
-    })
-}
-
-/// The records of an honest run besides its manifest.
-struct Parts {
-    /// More than the manifest cap, so a pack that starts with it is not a manifest's pack.
-    alpha: Bytes,
-    beta: Bytes,
-    stdout: Bytes,
-    in_dir: Bytes,
-    tree: (Digest, Bytes),
-}
-
-impl Parts {
-    fn new() -> Self {
-        let in_dir = blob("a file inside the output directory");
-        Self {
-            alpha: Bytes::from(patterned((5 << 20) + 17)),
-            beta: blob("beta object").1,
-            stdout: blob("compiling\n").1,
-            tree: tree_of(&[in_dir.0]),
-            in_dir: in_dir.1,
-        }
-    }
-
-    /// The digests of every record the run holds.
-    fn digests(&self) -> [Digest; 5] {
-        [
-            sha256(&self.alpha),
-            sha256(&self.beta),
-            sha256(&self.stdout),
-            self.tree.0,
-            sha256(&self.in_dir),
-        ]
-    }
-}
-
-/// The digest of every byte a node streams for `digest`.
-async fn streamed_by_node(rig: &Rig, digest: &Digest) -> Digest {
-    let mut stream = rig
-        .node()
-        .read_range(digest, 0, 0)
-        .await
-        .expect("the node streams it");
-    let mut hasher = RecordHasher::new();
-    while let Some(chunk) = stream.next().await {
-        hasher.update(&chunk.expect("a chunk"));
-    }
-    hasher.finish().0
-}
-
-/// What the storage node was told of a large blob: the pieces, the largest, and how many reads of
-/// the large object the object store had answered by the time each piece arrived beyond the pieces
-/// taken (a read-ahead is a buffer).
-struct Notes {
-    store: Arc<Spy>,
-    large_key: String,
-    pieces: AtomicUsize,
-    largest: AtomicUsize,
-    ahead: AtomicUsize,
-}
-
-impl Notes {
-    fn reads(&self) -> usize {
-        let ranges = self.store.ranges();
-        ranges
-            .iter()
-            .filter(|(k, _, _)| *k == self.large_key)
-            .count()
-    }
-
-    fn note(&self, len: usize) {
-        let taken = self.pieces.fetch_add(1, Ordering::SeqCst) + 1;
-        self.largest.fetch_max(len, Ordering::SeqCst);
-        let ahead = self.reads().saturating_sub(taken);
-        self.ahead.fetch_max(ahead, Ordering::SeqCst);
-    }
-}
-
-/// A storage node that notes how a large blob reaches it, and can be told to refuse one.
-struct Watching {
-    inner: Arc<dyn Storage>,
-    notes: Arc<Notes>,
-    refuse: AtomicBool,
-}
-
-impl Storage for Watching {
-    fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
-        self.inner.find_missing(digests)
-    }
-
-    fn find_durable<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>> {
-        self.inner.find_durable(digests)
-    }
-
-    fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Bytes> {
-        self.inner.read_blob(digest)
-    }
-
-    fn read_range<'a>(&'a self, d: &'a Digest, offset: u64, limit: u64) -> Answer<'a, ReadStream> {
-        self.inner.read_range(d, offset, limit)
-    }
-
-    fn put(&self, bytes: Bytes) -> Answer<'_, Digest> {
-        self.inner.put(bytes)
-    }
-
-    fn stream(&self, size: u64) -> Option<Box<dyn PutStream>> {
-        self.inner.stream(size)
-    }
-
-    fn put_streamed(
-        &self,
-        size: u64,
-        bytes: BoxStream<'static, std::io::Result<Bytes>>,
-        claim: BoxFuture<'static, Option<Digest>>,
-    ) -> Answer<'_, Option<Digest>> {
-        if self.refuse.load(Ordering::SeqCst) {
-            let down = std::io::Error::other("the node is down");
-            return Box::pin(async move { Err(StorageError::Unavailable(Arc::new(down))) });
-        }
-        let notes = Arc::clone(&self.notes);
-        let noted = bytes
-            .inspect(move |piece| {
-                if let Ok(piece) = piece {
-                    notes.note(piece.len());
-                }
-            })
-            .boxed();
-        self.inner.put_streamed(size, noted, claim)
-    }
-
-    fn segments(&self) -> Arc<dyn Segments> {
-        self.inner.segments()
-    }
-
-    fn action_result<'a>(&'a self, a: &'a Digest) -> Answer<'a, Option<(Digest, ActionResult)>> {
-        self.inner.action_result(a)
-    }
-
-    fn prepare_action_result<'a>(&'a self, r: &'a ActionResult) -> Answer<'a, ActionRecord> {
-        self.inner.prepare_action_result(r)
-    }
-
-    fn commit_action_record(&self, role: Role, a: Digest, r: ActionRecord) -> Answer<'_, ()> {
-        self.inner.commit_action_record(role, a, r)
-    }
-}
-
-/// The frontend with packs, a backend over a storage node that watches, the Action of the lease and
-/// the key set issued for it: three pack keys and two large keys unless said.
-struct Multi {
-    rig: Rig,
-    backend: Backend,
-    mint: PackKeyMint,
-    action: Digest,
-    keys: IssuedKeySet,
-    watching: Arc<Watching>,
-    p: Parts,
-}
-
-impl Multi {
-    async fn new() -> Self {
-        Self::sized(3, 2).await
-    }
-
-    async fn sized(packs: u8, large_keys: u8) -> Self {
-        let rig = Rig::new().await;
-        let bytes = action_bytes(false);
-        let action = sha256(&bytes);
-        assert_eq!(update(&rig.front, &[(action, bytes)]).await, [0]);
-        let mint = PackKeyMint::new(SECRET).expect("a mint");
-        let minted = mint
-            .mint_set(LEASE, &action, now(), packs, large_keys)
-            .expect("keys");
-        let keys = IssuedKeySet::from_minted(minted, usize::from(packs));
-        let large_key = keys.large().first().map(|k| k.key().to_owned());
-        let notes = Arc::new(Notes {
-            store: Arc::clone(&rig.store),
-            large_key: large_key.unwrap_or_default(),
-            pieces: AtomicUsize::new(0),
-            largest: AtomicUsize::new(0),
-            ahead: AtomicUsize::new(0),
-        });
-        let watching = Arc::new(Watching {
-            inner: Arc::clone(rig.node()),
-            notes,
-            refuse: AtomicBool::new(false),
-        });
-        let node = Arc::clone(&watching) as Arc<dyn Storage>;
-        let backend = Backend::remote_over(node, Some(rig.packs.clone()));
-        Self {
-            rig,
-            backend,
-            mint,
-            action,
-            keys,
-            watching,
-            p: Parts::new(),
-        }
-    }
-
-    /// The manifest of an honest run of `packs` packs whose large objects are `huge` (slot and
-    /// digest), each named by an output file of its own.
-    fn manifest(&self, packs: u8, huge: &[(u8, Digest)]) -> TaskManifest {
-        let file = |path: String, digest: Digest| OutputFile {
-            path,
-            digest,
-            is_executable: false,
-        };
-        let mut output_files = vec![
-            file("out/alpha".to_owned(), sha256(&self.p.alpha)),
-            file("out/beta".to_owned(), sha256(&self.p.beta)),
-        ];
-        for (slot, digest) in huge {
-            output_files.push(file(format!("out/big{slot}"), *digest));
-        }
-        TaskManifest {
-            lease: LEASE.to_owned(),
-            action: self.action,
-            exit_code: 0,
-            stdout: Some(sha256(&self.p.stdout)),
-            stderr: None,
-            output_files,
-            output_directories: vec![OutputDirectory {
-                path: "out/d".to_owned(),
-                tree: self.p.tree.0,
-            }],
-            output_symlinks: Vec::new(),
-            timing: Timing::default(),
-            usage: Usage::default(),
-            packs,
-            large: huge
-                .iter()
-                .map(|&(slot, digest)| LargeEntry { slot, digest })
-                .collect(),
-            inputs: None,
-        }
-    }
-
-    /// Pack 0 of `manifest` holding `records` after it.
-    fn pack_zero(manifest: &TaskManifest, records: &[&[u8]]) -> Vec<u8> {
-        write_pack_with(manifest, records, MAX_UNTRUSTED_LARGE_BYTES).expect("a pack")
-    }
-
-    /// The manifest and the two packs of an honest run of two packs: the tree, `beta` and the
-    /// standard output in pack 0; `alpha` (first, and over the manifest cap) and the file of the
-    /// tree in pack 1.
-    fn two_packs(&self) -> (TaskManifest, Vec<u8>, Vec<u8>) {
-        let (p, manifest) = (&self.p, self.manifest(2, &[]));
-        let zero = Self::pack_zero(&manifest, &[&p.tree.1, &p.beta, &p.stdout]);
-        let one = segment_of(&[&p.alpha, &p.in_dir]);
-        (manifest, zero, one)
-    }
-
-    /// The manifest and pack 0 of an honest run of one pack and the large object in slot 0.
-    fn large_run(&self) -> (TaskManifest, Vec<u8>) {
-        let p = &self.p;
-        let manifest = self.manifest(1, &[(0, large().1)]);
-        let records: [&[u8]; 5] = [&p.alpha, &p.beta, &p.stdout, &p.tree.1, &p.in_dir];
-        (manifest.clone(), Self::pack_zero(&manifest, &records))
-    }
-
-    fn pack_key(&self, at: usize) -> &IssuedPackKey {
-        &self.keys.packs()[at]
-    }
-
-    fn large_key(&self, at: usize) -> &IssuedPackKey {
-        &self.keys.large()[at]
-    }
-
-    async fn put(&self, key: &IssuedPackKey, bytes: &[u8]) {
-        self.rig.store.seed(key.key(), bytes).await;
-    }
-
-    async fn run_with(&self, keys: &IssuedKeySet, limits: &UntrustedLimits) -> Ingested {
-        let (packs, backend) = (&self.rig.packs, &self.backend);
-        let mint = &self.mint;
-        ingest_set(packs, backend, mint, LEASE, keys, &self.action, limits).await
-    }
-
-    async fn run(&self) -> Ingested {
-        self.run_with(&self.keys, &UntrustedLimits::default()).await
-    }
-
-    /// What the frontend's GetActionResult answers for the action.
-    async fn cached(&self) -> Result<ActionResult, tonic::Status> {
-        let request = GetActionResultRequest {
-            action_digest: Some(wire(&self.action)),
-            ..GetActionResultRequest::default()
-        };
-        let mut client = ActionCacheClient::new(self.rig.front.clone());
-        Ok(client.get_action_result(request).await?.into_inner())
-    }
-
-    /// Asserts that the run was refused for `reason`: counted under it and no other, nothing
-    /// cached.
-    async fn rejected(&self, got: Ingested, reason: RejectReason) {
-        assert_eq!(got, Ingested::Reject(reason));
-        let metrics = self.rig.packs.metrics();
-        for each in RejectReason::ALL {
-            let want = u64::from(each == reason);
-            assert_eq!(metrics.ingest_rejects(each), want, "{each:?}");
-        }
-        assert_eq!(metrics.ingests(), 0);
-        let cached = self.cached().await.expect_err("nothing cached");
-        assert_eq!(cached.code(), Code::NotFound);
-    }
-
-    /// Asserts that the index has no row for any pack of the set and none of the run's records.
-    fn nothing_indexed(&self) {
-        assert!(self.rig.index.has_none(&self.p.digests()));
-        for key in self.keys.packs() {
-            assert!(self.rig.index.pack(key.key()).expect("asked").is_none());
-        }
-    }
-}
-
-/// The result an honest manifest describes: sorted by path, no metadata.
-fn result_of(manifest: &TaskManifest) -> ActionResult {
-    let mut files: Vec<reapi::OutputFile> = manifest
-        .output_files
-        .iter()
-        .map(|file| reapi::OutputFile {
-            path: file.path.clone(),
-            digest: Some(wire(&file.digest)),
-            is_executable: file.is_executable,
-            ..reapi::OutputFile::default()
-        })
-        .collect();
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    let directory = |dir: &OutputDirectory| reapi::OutputDirectory {
-        path: dir.path.clone(),
-        tree_digest: Some(wire(&dir.tree)),
-        ..reapi::OutputDirectory::default()
-    };
-    ActionResult {
-        output_files: files,
-        output_directories: manifest.output_directories.iter().map(directory).collect(),
-        stdout_digest: manifest.stdout.as_ref().map(wire),
-        exit_code: manifest.exit_code,
-        ..ActionResult::default()
-    }
-}
+use crate::multi::{LARGE_LEN, Multi, WINDOW, large, result_of, streamed_by_node};
+use crate::support::blob;
+use crate::untrusted_task::{LEASE, SECRET, entry_of, forged, now, segment_of, tree_of};
 
 /// Asserts that a run of two packs is ingested into exactly the result its manifest describes and
 /// cached: the tree is read from the pack that holds it and the file it names is in the other, every
@@ -706,6 +327,42 @@ async fn a_node_that_cannot_take_the_large_blob_is_unavailable() {
     farm.nothing_indexed();
 }
 
+/// Asserts that a node that takes every byte of the large blob and then fails is `Unavailable`
+/// (the bytes were the blob's, the CAS did not keep them: the lease may be ingested again), not a
+/// refusal of the object, and nothing is indexed or cached.
+#[tokio::test]
+async fn a_node_that_fails_after_the_last_byte_is_unavailable() {
+    let farm = Multi::new().await;
+    let (_, zero) = farm.large_run();
+    farm.put(farm.pack_key(0), &zero).await;
+    farm.put(farm.large_key(0), &large().0).await;
+    farm.watching.refuse_after.store(true, Ordering::SeqCst);
+
+    let got = farm.run().await;
+
+    assert!(matches!(got, Ingested::Unavailable(_)), "{got:?}");
+    assert_eq!(farm.rig.packs.metrics().ingest_unavailable(), 1);
+    farm.nothing_indexed();
+}
+
+/// Asserts that a length question about the large object that fails in the object store is
+/// `Unavailable`, and no byte of the object is read.
+#[tokio::test]
+async fn a_failing_length_of_a_large_object_is_unavailable() {
+    let farm = Multi::new().await;
+    let (_, zero) = farm.large_run();
+    farm.put(farm.pack_key(0), &zero).await;
+    farm.rig.store.reject_large_lens(1);
+
+    let got = farm.run().await;
+
+    assert!(matches!(got, Ingested::Unavailable(_)), "{got:?}");
+    assert_eq!(farm.rig.packs.metrics().ingest_unavailable(), 1);
+    let key = farm.large_key(0).key();
+    assert!(farm.rig.store.ranges().iter().all(|(k, _, _)| k != key));
+    farm.nothing_indexed();
+}
+
 /// Asserts that a digest that is a record of two packs is `Malformed` and nothing is indexed: a
 /// digest is in one place.
 #[tokio::test]
@@ -867,6 +524,11 @@ async fn a_key_set_that_is_not_the_one_issued_is_wrong_key() {
         .map(|packs| IssuedKeySet::new(packs, large.clone()))
         .collect();
     cases.push(IssuedKeySet::new(packs.clone(), vec![packs[0].clone()]));
+    cases.push(IssuedKeySet::new(packs.clone(), vec![large[0].clone(); 9]));
+    let elsewhere = blob("an action this run is not").0;
+    let minted = |count| farm.mint.mint_set(LEASE, &elsewhere, now(), 3, count);
+    let other_action = IssuedKeySet::from_minted(minted(2).expect("keys"), 3);
+    cases.push(other_action);
 
     for keys in &cases {
         let got = farm.run_with(keys, &UntrustedLimits::default()).await;
@@ -900,4 +562,58 @@ fn a_minted_set_splits_into_pack_keys_then_large_keys() {
     let single = IssuedKeySet::single(keys[0].clone());
     assert_eq!(single.packs(), &keys[..1]);
     assert!(single.large().is_empty());
+}
+
+/// Asserts that a large entry is found by its slot number, not its place in the list: with six
+/// large keys issued and the one large object in slot 5 (slots need not be contiguous or start at
+/// 0), the object is read under the key of slot `L5` and the run is cached. Catches a lookup by
+/// position, which would ask for `L0`, absent.
+#[tokio::test]
+async fn a_large_object_in_a_slot_that_is_not_zero_is_read_under_that_slot() {
+    let farm = Multi::sized(3, 6).await;
+    let p = &farm.p;
+    let manifest = farm.manifest(1, &[(5, large().1)]);
+    let records: [&[u8]; 5] = [&p.alpha, &p.beta, &p.stdout, &p.tree.1, &p.in_dir];
+    farm.put(farm.pack_key(0), &Multi::pack_zero(&manifest, &records))
+        .await;
+    farm.put(farm.large_key(5), &large().0).await;
+
+    let got = farm.run().await;
+
+    let want = Ingested::Ran {
+        result: Box::new(result_of(&manifest)),
+        cached: true,
+    };
+    assert_eq!(got, want);
+    let used = farm.large_key(5).key();
+    let ranges = farm.rig.store.ranges();
+    assert!(ranges.iter().any(|(k, _, _)| k == used));
+    for slot in 0..5 {
+        let key = farm.large_key(slot).key();
+        assert!(ranges.iter().all(|(k, _, _)| k != key), "L{slot} was read");
+    }
+}
+
+/// Asserts that the advisory `inputs` object of a manifest is accepted and ignored: the run is
+/// ingested into the same result as without it.
+#[tokio::test]
+async fn the_advisory_inputs_of_a_manifest_are_accepted_and_ignored() {
+    let farm = Multi::new().await;
+    let p = &farm.p;
+    let mut manifest = farm.manifest(1, &[]);
+    manifest.inputs = Some(kbf_pack::InputStats {
+        blobs: 7,
+        ..kbf_pack::InputStats::default()
+    });
+    let records: [&[u8]; 5] = [&p.alpha, &p.beta, &p.stdout, &p.tree.1, &p.in_dir];
+    farm.put(farm.pack_key(0), &Multi::pack_zero(&manifest, &records))
+        .await;
+
+    let got = farm.run().await;
+
+    let want = Ingested::Ran {
+        result: Box::new(result_of(&manifest)),
+        cached: true,
+    };
+    assert_eq!(got, want);
 }
