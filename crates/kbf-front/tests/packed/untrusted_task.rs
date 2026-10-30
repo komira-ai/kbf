@@ -14,8 +14,8 @@ use kbf_front::{
     Backend, Ingested, IssuedPackKey, PackKeyMint, RejectReason, UntrustedLimits, ingest,
 };
 use kbf_pack::{
-    EMPTY_DIGEST, OutputDirectory, OutputFile, OutputSymlink, Slot, TaskManifest, Timing, Usage,
-    write_pack,
+    EMPTY_DIGEST, InputStats, OutputDirectory, OutputFile, OutputSymlink, Slot, TaskManifest,
+    Timing, Usage, write_pack, write_pack_with,
 };
 use kbf_pack_index::PackIndex as _;
 use kbf_proto::reapi::action_cache_client::ActionCacheClient;
@@ -862,13 +862,38 @@ async fn a_manifest_naming_two_packs_is_a_bad_manifest() {
     manifest.packs = 2;
     let (object, stdout) = (blob(OBJECT).1, blob(STDOUT).1);
     let (tree, in_dir) = (farm.tree().1, blob(IN_DIR).1);
-    let pack = write_pack(&manifest, &[&object, &stdout, &tree, &in_dir]).expect("a pack");
+    let pack = write_pack_with(&manifest, &[&object, &stdout, &tree, &in_dir], 0).expect("a pack");
     farm.put(&pack).await;
 
     let got = farm.ingest().await;
 
     farm.rejected(got, RejectReason::BadManifest).await;
     farm.nothing_indexed();
+}
+
+/// Asserts that a manifest carrying the advisory `inputs` object is ingested like any other: the
+/// numbers are carried for metrics and decide nothing.
+#[tokio::test]
+async fn a_manifest_with_inputs_is_ingested() {
+    let farm = Farm::new().await;
+    let mut manifest = farm.manifest(0);
+    manifest.inputs = Some(InputStats {
+        blobs: 3,
+        requests: 4,
+        ..InputStats::default()
+    });
+    let (object, stdout) = (blob(OBJECT).1, blob(STDOUT).1);
+    let (tree, in_dir) = (farm.tree().1, blob(IN_DIR).1);
+    let pack = write_pack(&manifest, &[&object, &stdout, &tree, &in_dir]).expect("a pack");
+    farm.put(&pack).await;
+
+    let got = farm.ingest().await;
+
+    let want = Ingested::Ran {
+        result: Box::new(farm.result(0)),
+        cached: true,
+    };
+    assert_eq!(got, want);
 }
 
 /// Asserts that a store or an index that fails is `Unavailable`, counted as neither a refusal nor

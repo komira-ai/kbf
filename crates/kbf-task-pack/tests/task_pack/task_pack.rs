@@ -8,7 +8,7 @@ use kbf_segments::{
 use kbf_task_pack::{
     MAX_MANIFEST_BYTES, MAX_PACK_BYTES, MAX_PACK_RECORDS, MAX_RECORD_BYTES, ManifestError,
     ShapeError, TaskManifest, TaskPackError, WritePackError, check_records, check_shape,
-    read_manifest, write_pack,
+    read_manifest, read_manifest_with, write_pack, write_pack_with,
 };
 use kbf_types::{Digest, DigestFunction};
 
@@ -399,4 +399,25 @@ fn check_records_keeps_the_layout_rules() {
             len: MAX_PACK_BYTES + 1
         })
     );
+}
+
+/// Asserts that a pack whose manifest names two packs is written and read only by the `_with`
+/// forms: `write_pack` and `read_manifest` refuse it (`MultiPack`), so a single-pack consumer
+/// cannot take pack 0 for the whole run.
+#[test]
+fn a_multi_pack_manifest_is_written_and_read_only_by_the_with_forms() {
+    let manifest = TaskManifest {
+        packs: 2,
+        ..golden()
+    };
+    assert!(matches!(
+        write_pack(&manifest, &[]),
+        Err(WritePackError::Manifest(ManifestError::MultiPack(2)))
+    ));
+    let pack = write_pack_with(&manifest, &[], 0).expect("written");
+    assert!(matches!(
+        read_manifest(&pack),
+        Err(TaskPackError::Manifest(ManifestError::MultiPack(2)))
+    ));
+    assert_eq!(read_manifest_with(&pack, 0).expect("read"), manifest);
 }

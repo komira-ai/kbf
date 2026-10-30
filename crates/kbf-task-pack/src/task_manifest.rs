@@ -33,7 +33,9 @@
 //!
 //! and may add an advisory `"inputs":{..}` ([`InputStats`]) after them, which only version 2
 //! may carry: a manifest with `inputs` is written as version 2, since a version 1 reader
-//! refuses a field it does not know.
+//! refuses a field it does not know. Version 2 is required exactly when `packs` is above 1, `large`
+//! is not empty or `inputs` is present: a body of either version that disagrees is refused, so a
+//! manifest has one spelling.
 //!
 //! `packs` is how many of packs `0..` were written (1 to [`MAX_PACKS`]); `large` names the
 //! large objects by slot (unique, below [`MAX_LARGE`]), each of a size above
@@ -117,6 +119,16 @@ pub enum ManifestError {
     /// A version 2 manifest lacks a field it requires.
     #[error("manifest version {MANIFEST_VERSION_2} requires the field {0:?}")]
     MissingField(&'static str),
+    /// A version 2 body that has one pack, no large object and no `inputs`: that manifest is
+    /// spelled as version 1.
+    #[error(
+        "manifest version {MANIFEST_VERSION_2} with one pack, no large object and no inputs is spelled as version {MANIFEST_VERSION}"
+    )]
+    NotV2,
+    /// A manifest that names more than one pack, given to a reader of one pack: only the `_with`
+    /// forms read a multi-pack run, because the others would take pack 0 for all of it.
+    #[error("the manifest names {0} packs; this reader takes one")]
+    MultiPack(u8),
     /// `packs` is 0 or more than [`MAX_PACKS`].
     #[error("packs is {0}, not in 1..={MAX_PACKS}")]
     Packs(u8),
@@ -393,14 +405,17 @@ pub struct TaskManifest {
 }
 
 impl TaskManifest {
-    /// Reads the manifest record `bytes`.
+    /// Reads the manifest record `bytes` for a consumer of one pack: a manifest of more than one
+    /// pack (or with a large object) is refused; [`TaskManifest::parse_with`] takes those.
     ///
     /// # Errors
     /// [`ManifestError::TooLarge`] first, before anything is parsed; then the first of
     /// [`ManifestError::Json`], [`ManifestError::Version`], [`ManifestError::Digest`] and the
-    /// refusals of [`TaskManifest::validate`].
+    /// refusals of [`TaskManifest::validate`], and [`ManifestError::MultiPack`].
     pub fn parse(bytes: &[u8]) -> Result<Self, ManifestError> {
-        Self::parse_with(bytes, 0)
+        let manifest = Self::parse_with(bytes, 0)?;
+        manifest.check_single_pack()?;
+        Ok(manifest)
     }
 
     /// [`TaskManifest::parse`] for a reader that accepts large objects of up to `large_max`
@@ -412,6 +427,7 @@ impl TaskManifest {
     pub fn parse_with(bytes: &[u8], large_max: u64) -> Result<Self, ManifestError> {
         check_len(bytes.len() as u64)?;
         let wire: Wire = serde_json::from_slice(bytes)?;
+        let wire_version = wire.version;
         match wire.version {
             MANIFEST_VERSION => {
                 if wire.packs.is_some() {
@@ -436,6 +452,9 @@ impl TaskManifest {
         }
         let manifest = wire.into_manifest()?;
         manifest.validate_with(large_max)?;
+        if wire_version == MANIFEST_VERSION_2 && manifest.version() == MANIFEST_VERSION {
+            return Err(ManifestError::NotV2);
+        }
         Ok(manifest)
     }
 
@@ -445,6 +464,7 @@ impl TaskManifest {
     /// The refusals of [`TaskManifest::validate`], and [`ManifestError::TooLarge`] when the
     /// JSON would pass [`MAX_MANIFEST_BYTES`].
     pub fn to_json(&self) -> Result<Vec<u8>, ManifestError> {
+        self.validate()?;
         self.to_json_with(0)
     }
 
@@ -469,7 +489,17 @@ impl TaskManifest {
     /// # Errors
     /// The first rule that fails, in the order of the fields.
     pub fn validate(&self) -> Result<(), ManifestError> {
-        self.validate_with(0)
+        self.validate_with(0)?;
+        self.check_single_pack()
+    }
+
+    /// The rule of the plain forms, which are for a consumer of one pack: more than one pack is
+    /// [`ManifestError::MultiPack`], so pack 0 is never taken for all of a multi-pack run.
+    pub(crate) fn check_single_pack(&self) -> Result<(), ManifestError> {
+        if self.packs > 1 {
+            return Err(ManifestError::MultiPack(self.packs));
+        }
+        Ok(())
     }
 
     /// [`TaskManifest::validate`] for a reader that accepts large objects of up to `large_max`

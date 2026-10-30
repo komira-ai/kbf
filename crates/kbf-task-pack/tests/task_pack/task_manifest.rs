@@ -577,7 +577,6 @@ fn parse_without_a_cap_refuses_a_large_object() {
             cap: 0
         })
     ));
-    assert!(TaskManifest::parse(&fixture("valid_v2/two_packs.json")).is_ok());
 }
 
 /// Asserts that `packs` is 1 to 8: 0 and 9 are refused, 1 and 8 are not.
@@ -593,7 +592,7 @@ fn packs_is_one_to_eight() {
     ));
     for packs in [1, MAX_PACKS] {
         let manifest = TaskManifest { packs, ..base() };
-        assert!(manifest.validate().is_ok(), "{packs}");
+        assert!(manifest.validate_with(LARGE_MAX).is_ok(), "{packs}");
     }
     for packs in [0, MAX_PACKS + 1] {
         let manifest = TaskManifest { packs, ..base() };
@@ -866,4 +865,47 @@ fn a_v1_manifest_with_inputs_is_refused() {
         refusal_v2("invalid_v2/v1_with_inputs.json"),
         ManifestError::UnexpectedField("inputs")
     ));
+}
+
+/// Asserts that a version 2 body that needs nothing of version 2 (one pack, no large object, no
+/// inputs) is refused, so every manifest has one spelling; and that each thing that does need
+/// version 2 is accepted in a version 2 body.
+#[test]
+fn a_v2_manifest_that_needs_nothing_of_v2_is_refused() {
+    assert!(matches!(
+        refusal_v2("invalid_v2/v2_needing_nothing.json"),
+        ManifestError::NotV2
+    ));
+    for name in [
+        "valid_v2/two_packs.json",
+        "valid_v2/one_large.json",
+        "valid_v2/inputs_partial.json",
+    ] {
+        assert!(parse_v2(name).is_ok(), "{name}");
+    }
+}
+
+/// Asserts that the plain forms are the single-pack path: `parse`, `validate` and `to_json`
+/// refuse a manifest of 2 to 8 packs (`MultiPack`), as they refuse a large entry, so a consumer
+/// of them cannot take pack 0 of a multi-pack run as the whole run; the `_with` forms accept
+/// the same file and manifest; and `inputs`, being advisory, is accepted by both.
+#[test]
+fn the_plain_forms_refuse_a_multi_pack_manifest_and_the_with_forms_take_it() {
+    let two = fixture("valid_v2/two_packs.json");
+    assert!(matches!(
+        TaskManifest::parse(&two),
+        Err(ManifestError::MultiPack(2))
+    ));
+    assert!(TaskManifest::parse_with(&two, 0).is_ok());
+    assert!(TaskManifest::parse_with(&two, LARGE_MAX).is_ok());
+    for packs in 2..=MAX_PACKS {
+        let manifest = TaskManifest { packs, ..base() };
+        assert!(matches!(manifest.validate(), Err(ManifestError::MultiPack(p)) if p == packs));
+        assert!(matches!(manifest.to_json(), Err(ManifestError::MultiPack(p)) if p == packs));
+        assert!(manifest.validate_with(0).is_ok());
+        assert!(manifest.to_json_with(0).is_ok());
+    }
+    let with_inputs = fixture("valid_v2/inputs_partial.json");
+    assert!(TaskManifest::parse(&with_inputs).is_ok());
+    assert!(TaskManifest::parse_with(&with_inputs, 0).is_ok());
 }
