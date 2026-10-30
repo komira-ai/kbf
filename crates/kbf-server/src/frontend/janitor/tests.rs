@@ -517,6 +517,9 @@ async fn the_metrics_render_every_family() {
         );
     }
     assert_eq!(text.matches("# TYPE").count(), families.len());
+    for (name, value) in families {
+        assert_eq!(rig.count(name), value, "{name}");
+    }
 }
 
 // Flags.
@@ -707,6 +710,12 @@ fn the_key_file_is_the_gc_key_of_cas_b_and_private() {
         (
             "no-id.json",
             r#"{"access_key_id": "", "secret_access_key": "hunter2", "prefix": "cas/b/"}"#,
+            0o600,
+            "exactly access_key_id",
+        ),
+        (
+            "no-secret.json",
+            r#"{"access_key_id": "k", "secret_access_key": "", "prefix": "cas/b/"}"#,
             0o600,
             "exactly access_key_id",
         ),

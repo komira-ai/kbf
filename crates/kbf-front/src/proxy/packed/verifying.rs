@@ -7,7 +7,6 @@
 //! every clone of the [`Packs`](super::Packs) it belongs to.
 
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// The keys held now, each with the number of holds on it (two runs of one lease hold the same
@@ -54,13 +53,8 @@ impl Drop for Held {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         for key in self.keys.drain(..) {
-            if let Entry::Occupied(mut holds) = held.entry(key) {
-                if *holds.get() > 1 {
-                    *holds.get_mut() -= 1;
-                } else {
-                    holds.remove();
-                }
-            }
+            held.entry(key).and_modify(|holds| *holds -= 1);
         }
+        held.retain(|_, holds| *holds > 0);
     }
 }
