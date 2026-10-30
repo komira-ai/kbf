@@ -24,7 +24,9 @@ async fn a_file_system_that_answers_a_question_wrongly_is_refused_naming_it() {
     let rig = Rig::new("tscache-selfcheck");
     assert_eq!(answer(&rig, Quirk::None), "passed");
     let stage = stage_dir(&rig.config.path);
+    let objects = rig.config.path.join("obj");
     assert_eq!(std::fs::read_dir(&stage).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(&objects).unwrap().count(), 0);
     let wrong = [
         (Quirk::LinkOverwrites, "create-only"),
         (Quirk::SecondDiffers, "atomic-visibility"),
@@ -34,6 +36,24 @@ async fn a_file_system_that_answers_a_question_wrongly_is_refused_naming_it() {
     for (quirk, check) in wrong {
         assert_eq!(answer(&rig, quirk), check, "{quirk:?}");
         assert_eq!(std::fs::read_dir(&stage).unwrap().count(), 0, "{quirk:?}");
+        assert_eq!(std::fs::read_dir(&objects).unwrap().count(), 0, "{quirk:?}");
+    }
+}
+
+/// Asserts that the second name of the probe is made in `obj/` and the first in `.stage/`: the
+/// link the check makes is the link a fill makes, so a cache whose two directories are on
+/// different file systems fails the check and not every fill.
+#[tokio::test]
+async fn the_probe_links_from_the_stage_directory_into_the_object_directory() {
+    let rig = Rig::new("tscache-selfcheck-dirs");
+    let disk = FakeDisk::new();
+    check_local(&disk, &rig.config.path, "run").unwrap();
+    let linked = disk.linked.lock().unwrap().clone();
+    assert!(!linked.is_empty());
+    let root = &rig.config.path;
+    for (from, to) in linked {
+        assert!(from.starts_with(stage_dir(root)), "{}", from.display());
+        assert!(to.starts_with(root.join("obj")), "{}", to.display());
     }
 }
 
@@ -62,6 +82,16 @@ async fn a_directory_the_probe_cannot_use_is_refused_with_its_path() {
         "{text}"
     );
     assert!(text.contains(&blocked.display().to_string()), "{text}");
+    // A name in the way of the probe's first file is a directory that cannot hold it.
+    let rig = Rig::new("tscache-selfcheck-first");
+    let first = stage_dir(&rig.config.path)
+        .join("selfcheck-run")
+        .join("first");
+    std::fs::create_dir_all(&first).unwrap();
+    let text = check_local(&SystemDisk, &rig.config.path, "run")
+        .unwrap_err()
+        .to_string();
+    assert!(text.starts_with("refusing to start: "), "{text}");
     let refused = LocalTierFailure::Failed {
         path: "/c".to_owned(),
         check: "create-only",

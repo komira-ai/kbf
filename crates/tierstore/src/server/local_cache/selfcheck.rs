@@ -2,7 +2,9 @@
 //!
 //! A hard link needs the file system to do them, and a cache on one that does not would serve
 //! wrong bytes or fail every fill. The check makes a probe object under `<path>/.stage/` (which is
-//! emptied at every start), and asks four questions of the file system:
+//! emptied at every start), gives it a second name under `<path>/obj/` (the link a fill makes, so
+//! that a cache whose two directories are on different file systems is refused), and asks four
+//! questions of the file system:
 //!
 //! - `create-only`: a second link to a name that exists is refused and leaves the first alone;
 //! - `atomic-visibility`: a name linked to a file that was written whole shows all of its bytes
@@ -14,7 +16,7 @@ use std::io;
 use std::path::Path;
 
 use super::Disk;
-use super::layout::stage_dir;
+use super::layout::{make_dirs, objects_dir, stage_dir};
 
 /// The bytes of the probe object.
 const PROBE: &[u8] = b"tierstore local cache probe\n";
@@ -43,16 +45,16 @@ pub enum LocalTierFailure {
     },
 }
 
-/// Writes the probe object and gives it a second name, then reads both.
-fn probe(disk: &dyn Disk, dir: &Path) -> io::Result<[(&'static str, bool); 4]> {
+/// Writes the probe object in `dir` and gives it a second name `second`, then reads both.
+fn probe(disk: &dyn Disk, dir: &Path, second: &Path) -> io::Result<[(&'static str, bool); 4]> {
     std::fs::create_dir_all(dir)?;
-    let (first, second) = (dir.join("first"), dir.join("second"));
+    let first = dir.join("first");
     std::fs::write(&first, PROBE)?;
-    disk.link(&first, &second)?;
-    let again = disk.link(&first, &second);
+    disk.link(&first, second)?;
+    let again = disk.link(&first, second);
     let create_only = again.is_err_and(|error| error.kind() == io::ErrorKind::AlreadyExists);
     // A file that cannot be read back is a question answered wrongly, not one not asked.
-    let seen = std::fs::read(&second).unwrap_or_default();
+    let seen = std::fs::read(second).unwrap_or_default();
     let back = std::fs::read(&first).unwrap_or_default();
     let links = disk.links(&first).unwrap_or(0);
     Ok([
@@ -72,12 +74,18 @@ fn probe(disk: &dyn Disk, dir: &Path) -> io::Result<[(&'static str, bool); 4]> {
 pub fn check_local(disk: &dyn Disk, root: &Path, run: &str) -> Result<(), LocalTierFailure> {
     let path = root.display().to_string();
     let dir = stage_dir(root).join(format!("selfcheck-{run}"));
-    let answers = probe(disk, &dir).map_err(|source| LocalTierFailure::Unusable {
-        path: path.clone(),
-        source,
-    })?;
-    // The probe is in the stage directory, which is emptied at start; this only tidies up.
+    let second = objects_dir(root).join(format!("selfcheck-{run}"));
+    let answers = make_dirs(root, &objects_dir(root))
+        .and_then(|()| probe(disk, &dir, &second))
+        .map_err(|source| LocalTierFailure::Unusable {
+            path: path.clone(),
+            source,
+        });
+    // The first name is in the stage directory, which is emptied at start; the second is not,
+    // so it is removed here.
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&second);
+    let answers = answers?;
     match answers.iter().find(|(_, right)| !right) {
         Some((check, _)) => Err(LocalTierFailure::Failed { path, check }),
         None => Ok(()),

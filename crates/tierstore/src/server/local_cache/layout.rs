@@ -12,6 +12,7 @@
 //! that has a data file has its `.meta`.
 
 use std::io;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -82,6 +83,29 @@ pub(super) fn stage_dir(root: &Path) -> PathBuf {
     root.join(STAGE)
 }
 
+/// The directory of the objects under `root`.
+pub(super) fn objects_dir(root: &Path) -> PathBuf {
+    root.join(OBJECTS)
+}
+
+/// Makes `dir`, which is under `root`, and the directories between them, with mode 0755 for
+/// each however the umask is set: the files in them are read by other users (the jobs that
+/// hard-link them), and no other user may change a name in them.
+///
+/// # Errors
+/// What the system said.
+pub(super) fn make_dirs(root: &Path, dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let depth = dir
+        .strip_prefix(root)
+        .map_or(0, |below| below.components().count());
+    for made in dir.ancestors().take(depth) {
+        let mode = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(made, mode)?;
+    }
+    Ok(())
+}
+
 /// What the sidecar of an object holds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Sidecar {
@@ -123,7 +147,7 @@ pub(super) struct Scanned {
 /// What the system said about making the directory.
 pub(super) fn clear_stage(root: &Path) -> io::Result<u64> {
     let stage = stage_dir(root);
-    std::fs::create_dir_all(&stage)?;
+    make_dirs(root, &stage)?;
     let mut removed = 0;
     for path in children(&stage, |_| true) {
         let gone = if path.is_dir() {
@@ -156,17 +180,17 @@ fn whole(root: &Path, path: &Path) -> Option<Found> {
     if !is_digest(hex) || data_path(root, hex) != path {
         return None;
     }
-    let data = std::fs::metadata(path).ok()?;
+    let data = std::fs::metadata(path).ok();
     let text = std::fs::read(meta_path(root, hex)).ok()?;
     let sidecar: Sidecar = serde_json::from_slice(&text).ok()?;
     let used = data
-        .modified()
-        .ok()
+        .as_ref()
+        .and_then(|data| data.modified().ok())
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |since| {
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         });
-    (sidecar.size == data.len()).then(|| Found {
+    (Some(sidecar.size) == data.map(|data| data.len())).then(|| Found {
         hex: hex.to_owned(),
         sidecar,
         used,
@@ -187,8 +211,8 @@ fn is_sidecar(path: &Path) -> bool {
 /// What the system said about making the directory.
 pub(super) fn scan(root: &Path) -> io::Result<Scanned> {
     let mut scanned = Scanned::default();
-    let objects = root.join(OBJECTS);
-    std::fs::create_dir_all(&objects)?;
+    let objects = objects_dir(root);
+    make_dirs(root, &objects)?;
     for first in children(&objects, Path::is_dir) {
         for second in children(&first, Path::is_dir) {
             let (sidecars, data): (Vec<PathBuf>, Vec<PathBuf>) = children(&second, Path::is_file)

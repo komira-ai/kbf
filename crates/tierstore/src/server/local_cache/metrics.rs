@@ -14,10 +14,18 @@ pub(super) enum FailedFill {
     ShortBody,
     /// The cache directory could not be written.
     LocalIo,
+    /// An object that was written over while it was read.
+    Changed,
 }
 
 /// The label of each [`FailedFill`], in the order of the enum.
-const FAILED: [&str; 4] = ["hash_mismatch", "upstream_error", "short_body", "local_io"];
+const FAILED: [&str; 5] = [
+    "hash_mismatch",
+    "upstream_error",
+    "short_body",
+    "local_io",
+    "changed",
+];
 
 /// Why an object was evicted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -334,12 +334,18 @@ disk and makes no call to the upstream. A GET of an object that is not there rea
 upstream in chunks of 8 MiB into `<path>/.stage/`, hashing the bytes as they pass, and links it into
 `<path>/obj/<aa>/<bb>/<hex>` (raw bytes, mode 0444; `<hex>` is the SHA-256 of the key, or, for a
 key `cas/l/<sha256>`, the SHA-256 in the key, which the bytes must hash to or the fill is
-discarded and counted) only when the object is whole; a sidecar `<hex>.meta` holds the key, the
+discarded and counted, and the read is answered with an error, since the upstream's bytes are known
+to be wrong) only when the object is whole; a sidecar `<hex>.meta` holds the key, the
 size, the hash of the bytes and the upstream's tag. The misses of one key share one fill. A ranged
 GET of an object that is not there fills the whole object if it is at most 64 MiB, and otherwise
-passes the range through and keeps nothing. A fill that fails (a short body, a hash that is not
-the name, an upstream error, a directory that cannot be written) never fails the reader for the
-cache's reasons: the reader is answered from the upstream. The front holds a response whole, as
+passes the range through and keeps nothing. A fill that fails (a short body, an object written over
+while it was read, an upstream error, a directory that cannot be written) never fails the reader for
+the cache's reasons: the reader is answered from the upstream. A kept object is never checked
+against the upstream again, and a hit is not hashed again: put `cache = true` only on prefixes whose
+objects are never rewritten (the content-addressed ones), and note that the start reads the sizes of
+the files, not their bytes. Anyone who may read through the front may read everything the upstream's
+read key can read, so give build clients scoped keys. The directories the cache makes are mode 0755
+whatever the umask. The front holds a response whole, as
 it does for any backend, so a read of a very large object holds it in memory whether or not it is
 kept; the bound on a fill is one chunk.
 
@@ -349,7 +355,8 @@ recently used objects until the cache is at `low_water` percent and the free spa
 floor. The order of use is in memory, seeded at start from the times of the files and written back
 to them (once for each object each pass); an object with a link count over one is in use by another
 tree, so it is skipped, counted and stays charged to the budget. A fill is skipped, and counted,
-when the object is larger than the budget or would take the cache above `critical`. The files of
+when the object is larger than the budget or would take the cache, with the fills that are running,
+above `critical`. The files of
 `.stage/` are never evicted and are removed at start. `scrub_rate` is accepted; this release does not
 scrub.
 

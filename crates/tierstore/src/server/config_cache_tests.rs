@@ -143,10 +143,8 @@ fn a_build_node_file_makes_a_cache() {
         .map(|(p, c)| ((*p).to_owned(), *c))
         .collect();
     assert_eq!(config.policies, policies);
-    assert_eq!(
-        (config.fill_chunk, config.whole_limit),
-        (FILL_CHUNK, WHOLE_FILL_LIMIT)
-    );
+    assert_eq!((config.fill_chunk, config.whole_limit), (8 << 20, 64 << 20));
+    assert_eq!((FILL_CHUNK, WHOLE_FILL_LIMIT), (8 << 20, 64 << 20));
     let upstream = &cache.upstream;
     assert_eq!(upstream.spec, "s3:tierstore");
     assert_eq!(upstream.endpoint.as_deref(), Some("http://192.0.2.20:9300"));
@@ -246,7 +244,7 @@ fn a_build_node_file_is_refused_when_it_cannot_be_run() {
         ),
         (
             cache_with("critical   = 97", "critical   = 80"),
-            "local_cache.high_water",
+            "must not be above critical",
         ),
         (
             cache_with("free_floor = 15", "free_floor = 100"),
@@ -330,6 +328,50 @@ fn a_build_node_file_is_refused_when_it_cannot_be_run() {
     }
 }
 
+/// Asserts the edges of the water marks: a low water mark one under the high one, a high one
+/// equal to the critical one and a free floor of 99 are accepted; a low water mark equal to the
+/// high one, a high one over the critical one, a high or low water mark of 0 and a floor of 100
+/// are refused naming the key.
+#[test]
+fn the_water_marks_are_judged_at_their_edges() {
+    let accepted = [
+        cache_with("low_water  = 60", "low_water  = 84"),
+        cache_with("high_water = 85", "high_water = 97"),
+        cache_with("free_floor = 15", "free_floor = 99"),
+        cache_with("free_floor = 15", "free_floor = 0"),
+    ];
+    for text in accepted {
+        let made = settings_from_text(&text, DEFAULTS);
+        assert!(made.is_ok(), "{text}");
+    }
+    let refused = [
+        (
+            cache_with("low_water  = 60", "low_water  = 85"),
+            "local_cache.low_water",
+        ),
+        (
+            cache_with("high_water = 85", "high_water = 98"),
+            "local_cache.high_water",
+        ),
+        (
+            cache_with("high_water = 85", "high_water = 0"),
+            "local_cache.high_water",
+        ),
+        (
+            cache_with("low_water  = 60", "low_water  = 0"),
+            "local_cache.low_water",
+        ),
+        (
+            cache_with("free_floor = 15", "free_floor = 100"),
+            "local_cache.free_floor",
+        ),
+    ];
+    for (text, key) in refused {
+        let why = refusal(&text);
+        assert!(why.contains(key), "{key}: {why}");
+    }
+}
+
 /// Asserts that a storage node refuses what only a build node has: a list of endpoints in either
 /// tier, and a policy that asks for a cache, with the reason.
 #[test]
@@ -342,14 +384,13 @@ fn a_storage_node_refuses_a_list_of_endpoints_and_a_cache_policy() {
     let cold = format!("{GOLDEN}endpoints = [\"http://c:1\"]\n");
     for (text, key) in [(hot, "hot_store.endpoints"), (cold, "cold_store.endpoints")] {
         let why = refusal(&text);
-        assert!(why.contains(key) && why.contains("build node"), "{why}");
+        assert!(why.contains(key), "{why}");
+        assert!(why.contains("build node"), "{why}");
     }
     let policy = format!("{GOLDEN}\n[[policy]]\nprefix = \"a/\"\ncache = true\n");
     let why = refusal(&policy);
-    assert!(
-        why.contains("policy[0].cache") && why.contains("keeps no cache"),
-        "{why}"
-    );
+    assert!(why.contains("policy[0].cache"), "{why}");
+    assert!(why.contains("keeps no cache"), "{why}");
 }
 
 /// Asserts that a rate reads as a size and `/s`, is refused otherwise, and is written back as a

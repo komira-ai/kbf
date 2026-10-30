@@ -1,7 +1,7 @@
 //! The eviction pass, the record of use, and the loop that runs them.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -20,6 +20,15 @@ pub struct Pass {
     pub freed: u64,
     /// The objects skipped because another name holds them (a link count over one).
     pub pinned: usize,
+}
+
+/// Clears the flag of a running pass when the pass ends, however it ends.
+struct Running<'a>(&'a AtomicBool);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 impl Inner {
@@ -41,6 +50,7 @@ impl Inner {
         if self.evicting.swap(true, Ordering::SeqCst) {
             return Pass::default();
         }
+        let _running = Running(&self.evicting);
         self.flush_touches();
         let (held, order) = {
             let index = locked(&self.index);
@@ -85,7 +95,6 @@ impl Inner {
             pass.evicted += 1;
             pass.freed += size;
         }
-        self.evicting.store(false, Ordering::SeqCst);
         pass
     }
 }

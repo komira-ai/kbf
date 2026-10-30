@@ -34,8 +34,12 @@
 //! reader's error). The front holds a response whole, as it always has: the memory of a read is
 //! the size of the range asked, never more because of a fill.
 //!
-//! A fill is skipped, and counted, when the object is larger than the budget or the cache would
-//! pass its critical mark; the reader is served from the upstream.
+//! A fill is skipped, and counted, when the object is larger than the budget or the cache, with the
+//! bytes of the fills that are running, would pass its critical mark; the reader is served from
+//! the upstream. A key that is not named by its content is read twice by HEAD, before the first
+//! chunk and after the last: if the size or the tag changed, the object was written over during
+//! the fill and is not kept. A key named by its content whose bytes do not hash to the name is
+//! the reader's error, not passed through. A hit is not hashed again.
 //!
 //! # Eviction
 //!
@@ -181,6 +185,14 @@ fn read_at(path: &Path, offset: u64, len: u64) -> io::Result<Bytes> {
     Ok(Bytes::from(bytes))
 }
 
+/// Whether `error` says the file is not there, or not as long as the cache believes.
+fn gone(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof
+    )
+}
+
 /// What the cache is made of; a [`LocalCache`] is a handle to one, so a fill that runs on its
 /// own task keeps it alive.
 pub(super) struct Inner {
@@ -194,6 +206,8 @@ pub(super) struct Inner {
     flights: Mutex<HashMap<String, Pending>>,
     /// The number of the next file in `.stage/`.
     staged: AtomicU64,
+    /// The bytes of the fills that are running and have no object in the index yet.
+    reserved: AtomicU64,
     /// Whether a pass of the eviction is running.
     evicting: AtomicBool,
 }
@@ -239,6 +253,7 @@ impl LocalCache {
             counters,
             flights: Mutex::new(HashMap::new()),
             staged: AtomicU64::new(0),
+            reserved: AtomicU64::new(0),
             evicting: AtomicBool::new(false),
         };
         Ok(Self {
@@ -300,12 +315,10 @@ impl Inner {
 
     /// Removes the object from the index and the disk.
     fn drop_entry(&self, hex: &str) {
-        let removed = locked(&self.index).remove(hex);
-        if removed.is_some() {
-            let root = &self.config.path;
-            let _ = std::fs::remove_file(data_path(root, hex));
-            let _ = std::fs::remove_file(layout::meta_path(root, hex));
-        }
+        drop(locked(&self.index).remove(hex));
+        let root = &self.config.path;
+        let _ = std::fs::remove_file(data_path(root, hex));
+        let _ = std::fs::remove_file(layout::meta_path(root, hex));
     }
 
     /// The bytes of `range` of the object if it is in the cache: `hit` says whether this is a
@@ -334,11 +347,13 @@ impl Inner {
                 }
                 Ok(Some(bytes))
             }
-            Err(_) => {
+            Err(error) if gone(&error) => {
                 // The file is gone or short: the entry is a lie, so it is dropped.
                 self.drop_entry(&name.hex);
                 Ok(None)
             }
+            // Out of descriptors, a failing disk: the object may be fine, so it stays.
+            Err(_) => Ok(None),
         }
     }
 

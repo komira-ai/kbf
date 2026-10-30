@@ -1,6 +1,9 @@
 //! A fill: what it keeps, what it refuses, and that the readers of one key share it.
 
 use std::os::unix::fs::PermissionsExt as _;
+use std::sync::atomic::Ordering;
+
+use bytes::Bytes;
 
 use super::layout::{Sidecar, data_path, meta_path, name_of};
 use super::metrics::{FailedFill, read};
@@ -36,7 +39,8 @@ async fn the_misses_of_one_key_fill_it_once() {
     for reader in readers {
         assert_eq!(reader.await.unwrap().unwrap(), body);
     }
-    assert_eq!((rig.calls(Op::Head), rig.calls(Op::Get)), (1, 1));
+    // One HEAD before the read of the object and one after it (to see it did not change).
+    assert_eq!((rig.calls(Op::Head), rig.calls(Op::Get)), (2, 1));
     let counters = rig.cache.counters();
     assert_eq!(read(&counters.fills), 1);
     assert_eq!(read(&counters.hits), 0);
@@ -87,25 +91,25 @@ async fn a_kept_object_is_raw_bytes_under_its_name_with_a_sidecar() {
     assert_eq!(read(&rig.cache.counters().staging_files), 0);
 }
 
-/// Asserts that a key named by its content whose bytes hash to another name is not kept and is
-/// counted, that the reader still gets the upstream's bytes unchanged, and that nothing is left
-/// in the stage directory.
+/// Asserts that a key named by its content whose bytes hash to another name is not kept, is
+/// counted, and is the reader's error (bytes known to be wrong go to nobody), that nothing is
+/// left in the stage directory, and that the upstream was read once.
 #[tokio::test]
-async fn bytes_that_do_not_hash_to_their_name_are_not_kept() {
+async fn bytes_that_do_not_hash_to_their_name_are_not_kept_and_not_served() {
     let rig = Rig::new("tscache-mismatch");
     let wrong = pattern(50);
     let key = format!("cas/l/{}", digest(b"what the name says"));
     rig.put(&key, &wrong).await;
-    assert_eq!(rig.get(&key).await.unwrap(), wrong);
+    let error = rig.get(&key).await.unwrap_err();
+    assert!(error.is_unavailable(), "{error}");
     let counters = rig.cache.counters();
     assert_eq!(counters.failures(FailedFill::HashMismatch), 1);
     assert_eq!(read(&counters.fills), 0);
     assert_eq!(rig.cache.held(), (0, 0));
     assert!(!rig.has_file(&key));
     assert_eq!(staged(&rig), 0);
-    assert_eq!(read(&counters.bytes_served_upstream), 50);
-    // The fill read it once, and the reader once more.
-    assert_eq!(rig.calls(Op::Get), 2);
+    assert_eq!(read(&counters.bytes_served_upstream), 0);
+    assert_eq!(rig.calls(Op::Get), 1);
 }
 
 /// Asserts that an upstream that gives fewer bytes than its HEAD said leaves nothing in the
@@ -117,7 +121,8 @@ async fn a_short_upstream_body_is_not_kept() {
     rig.tamper
         .short
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let _ = rig.get("cas/b/obj").await.unwrap();
+    // The reader is served from the upstream, which is short too.
+    assert_eq!(rig.get("cas/b/obj").await.unwrap().len(), 99);
     assert_eq!(rig.cache.counters().failures(FailedFill::ShortBody), 1);
     assert_eq!(rig.cache.held(), (0, 0));
     assert!(!rig.has_file("cas/b/obj"));
@@ -262,9 +267,7 @@ async fn a_fill_ends_when_its_reader_goes_away() {
     while read(&rig.cache.counters().fills) < 1 {
         tokio::task::yield_now().await;
     }
-    while !super::locked(&rig.cache.inner.flights).is_empty() {
-        tokio::task::yield_now().await;
-    }
+    assert!(super::locked(&rig.cache.inner.flights).is_empty());
     assert_eq!(rig.cache.held(), (100, 1));
     assert_eq!(rig.get("cas/b/obj").await.unwrap().len(), 100);
     assert_eq!(read(&rig.cache.counters().hits), 1);
@@ -276,8 +279,8 @@ async fn a_fill_ends_when_its_reader_goes_away() {
 async fn staged_files_are_counted_and_never_evicted() {
     let rig = Rig::with("tscache-staged", |config| {
         config.budget = 1000;
-        config.high_water = 1;
-        config.low_water = 0;
+        config.high_water = 100;
+        config.low_water = 50;
     });
     rig.put("cas/b/obj", &pattern(100)).await;
     let gate = rig.tamper.hold();
@@ -354,4 +357,161 @@ async fn a_ranged_read_fills_a_small_object_and_passes_a_large_one_through() {
     assert_eq!(rig.get("cas/b/large").await.unwrap(), large);
     assert!(rig.has_file("cas/b/large"));
     assert_eq!(rig.cache.held(), (201, 2));
+}
+
+/// Asserts that a reader whose miss was answered by a fill that ended before it asked for a fill
+/// of its own finds the object in the index and starts none: no HEAD and no GET reach the
+/// upstream, and nothing is counted as a fill. A defect that looked only at the table of fills
+/// that run would fill again.
+#[tokio::test]
+async fn a_fill_that_ended_after_the_miss_is_not_run_again() {
+    let rig = Rig::new("tscache-late-miss");
+    rig.put("cas/b/obj", &pattern(100)).await;
+    assert_eq!(rig.get("cas/b/obj").await.unwrap().len(), 100);
+    let (heads, gets) = (rig.calls(Op::Head), rig.calls(Op::Get));
+    let name = name_of("cas/b/obj");
+    let late = rig.cache.inner.fill_once("cas/b/obj", &name).await;
+    assert_eq!(late, Ok(super::fill::Filled::Kept));
+    assert_eq!((rig.calls(Op::Head), rig.calls(Op::Get)), (heads, gets));
+    assert_eq!(read(&rig.cache.counters().fills), 1);
+}
+
+/// Asserts that the bytes of the fills that are running count against the critical mark: two
+/// objects of 50 bytes in a cache of 100 (critical 95) filled at once keep one, skip the other
+/// (counted) and serve both readers, and the reservation is back to zero when they end. A
+/// defect that counted only the objects in the index would keep both.
+#[tokio::test]
+async fn fills_that_run_together_are_held_to_the_critical_mark() {
+    let rig = Rig::with("tscache-reserved", |config| {
+        config.budget = 100;
+        config.high_water = 100;
+        config.low_water = 50;
+    });
+    rig.put("cas/b/one", &pattern(50)).await;
+    rig.put("cas/b/two", &pattern(50)).await;
+    let gate = rig.tamper.hold();
+    let mut readers = Vec::new();
+    for key in ["cas/b/one", "cas/b/two"] {
+        let cache = rig.cache.clone();
+        readers.push(tokio::spawn(async move { cache.get(key, None).await }));
+    }
+    while read(&rig.cache.counters().fills_skipped) < 1 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(rig.cache.inner.reserved.load(Ordering::SeqCst), 50);
+    gate.add_permits(64);
+    for reader in readers {
+        assert_eq!(reader.await.unwrap().unwrap().len(), 50);
+    }
+    assert_eq!(rig.cache.inner.reserved.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.cache.held(), (50, 1));
+    assert_eq!(read(&rig.cache.counters().fills), 1);
+}
+
+/// Asserts that an object written over while it is read is not kept: the second HEAD shows
+/// another tag, the fill is counted as `changed`, nothing is left staged or indexed, and the
+/// reader is served the object as the upstream has it now. Also drives the upstream's
+/// conditional put and delete.
+#[tokio::test]
+async fn an_object_written_over_during_its_fill_is_not_kept() {
+    let rig = Rig::new("tscache-changed");
+    rig.put("cas/b/obj", &pattern(100)).await;
+    let gate = rig.tamper.hold();
+    let cache = rig.cache.clone();
+    let reader = tokio::spawn(async move { cache.get("cas/b/obj", None).await });
+    while read(&rig.cache.counters().staging_files) < 1 {
+        tokio::task::yield_now().await;
+    }
+    let old = rig.tamper.head("cas/b/obj").await.unwrap().tag;
+    let new = Bytes::from(vec![7u8; 100]);
+    let put = rig
+        .tamper
+        .put_if_match("cas/b/obj", new.clone(), &old)
+        .await;
+    assert!(put.is_ok());
+    gate.add_permits(64);
+    assert_eq!(reader.await.unwrap().unwrap(), new);
+    assert_eq!(rig.cache.counters().failures(FailedFill::Changed), 1);
+    assert_eq!(rig.cache.held(), (0, 0));
+    assert!(!rig.has_file("cas/b/obj"));
+    assert_eq!(staged(&rig), 0);
+    rig.tamper.delete("cas/b/obj").await.unwrap();
+    let absent = Error::NotFound("cas/b/obj".to_owned());
+    assert_eq!(rig.get("cas/b/obj").await, Err(absent));
+}
+
+/// Asserts that a write the cache directory refuses at each step of publishing (a name in the
+/// way of the directory, of the sidecar's temporary file, of the sidecar) fails the fill as a
+/// local error, not the read, and keeps nothing.
+#[tokio::test]
+async fn each_step_of_publishing_that_fails_fails_the_fill_not_the_read() {
+    for step in ["dirs", "sidecar-write", "sidecar-rename"] {
+        let rig = Rig::new(&format!("tscache-publish-{step}"));
+        let body = pattern(100);
+        rig.put("cas/b/obj", &body).await;
+        let hex = name_of("cas/b/obj").hex;
+        let root = &rig.config.path;
+        match step {
+            "dirs" => std::fs::write(root.join("obj").join(&hex[..2]), b"x").unwrap(),
+            "sidecar-write" => {
+                std::fs::create_dir(root.join(".stage").join("0000000000000000.meta")).unwrap();
+            }
+            _ => std::fs::create_dir_all(meta_path(root, &hex)).unwrap(),
+        }
+        assert_eq!(rig.get("cas/b/obj").await.unwrap(), body, "{step}");
+        assert_eq!(
+            rig.cache.counters().failures(FailedFill::LocalIo),
+            1,
+            "{step}"
+        );
+        assert_eq!(rig.cache.held(), (0, 0), "{step}");
+        assert!(!rig.has_file("cas/b/obj"), "{step}");
+    }
+}
+
+/// Asserts the modes of what a fill makes however the umask is set (a restrictive one and none
+/// at all): the directories 0755, the data file 0444, the sidecar 0644. A defect that left them
+/// to the umask would give 0700 directories and a 0400 file, or a world-writable sidecar.
+#[tokio::test]
+async fn modes_do_not_depend_on_the_umask() {
+    for mask in [0o077, 0o000] {
+        let previous = rustix::process::umask(rustix::fs::Mode::from_bits_truncate(mask));
+        let rig = Rig::new(&format!("tscache-umask-{mask:o}"));
+        rig.put("cas/b/obj", &pattern(100)).await;
+        let got = rig.get("cas/b/obj").await;
+        let _ = rustix::process::umask(previous);
+        assert_eq!(got.unwrap().len(), 100);
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let file = rig.file("cas/b/obj");
+        let bb = file.parent().unwrap();
+        let aa = bb.parent().unwrap();
+        let obj = aa.parent().unwrap();
+        for dir in [bb, aa, obj, &rig.config.path.join(".stage")] {
+            assert_eq!(mode(dir), 0o755, "{mask:o} {}", dir.display());
+        }
+        assert_eq!(mode(&file), 0o444, "{mask:o}");
+        let hex = name_of("cas/b/obj").hex;
+        assert_eq!(mode(&meta_path(&rig.config.path, &hex)), 0o644, "{mask:o}");
+    }
+}
+
+/// Asserts that a read error that does not say the file is gone (here a directory where the
+/// file was) leaves the entry and the files alone, and the reader is served from the upstream,
+/// while a file that is gone drops the entry.
+#[tokio::test]
+async fn only_a_missing_file_drops_the_entry() {
+    let rig = Rig::new("tscache-read-error");
+    let body = pattern(100);
+    rig.put("cas/b/obj", &body).await;
+    assert_eq!(rig.get("cas/b/obj").await.unwrap(), body);
+    let file = rig.file("cas/b/obj");
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    assert_eq!(rig.get("cas/b/obj").await.unwrap(), body);
+    assert_eq!(rig.cache.held(), (100, 1));
+    std::fs::remove_dir(&file).unwrap();
+    assert_eq!(rig.get("cas/b/obj").await.unwrap(), body);
+    assert_eq!(read(&rig.cache.counters().fills), 2);
+    assert_eq!(rig.cache.held(), (100, 1));
 }

@@ -5,9 +5,10 @@ use std::path::Path;
 use super::index::Index;
 use super::layout::{self, Sidecar, data_path, is_digest, meta_path, name_of, stage_dir};
 use super::metrics::read;
-use super::testing::{Rig, digest, pattern};
+use super::testing::{Quirk, Rig, digest, pattern};
 use super::{CacheConfig, Disk, LocalCache, SystemDisk};
-use crate::Backend;
+use crate::{Backend, Op};
+use std::sync::atomic::Ordering;
 
 /// A 64-digit name that starts with `first`.
 fn hex_of(first: &str) -> String {
@@ -229,7 +230,8 @@ fn the_system_disk_does_what_the_cache_relies_on() {
     assert_eq!(since.as_millis(), 1_700_000_000_123);
 
     let space = SystemDisk.space(dir).unwrap();
-    assert!(space.total > 0 && space.free <= space.total);
+    assert!(space.total > 0);
+    assert!(space.free <= space.total);
     let missing = dir.join("missing");
     assert!(SystemDisk.space(&missing).is_err());
     assert!(SystemDisk.links(&missing).is_err());
@@ -238,47 +240,74 @@ fn the_system_disk_does_what_the_cache_relies_on() {
 }
 
 /// Asserts that the text of `/metricz` names every counter and gauge the cache keeps, with the
-/// values of what happened: a miss and a fill, then a hit, a skipped fill, a failed one, a
-/// pinned object and an eviction.
+/// values of what happened: a miss and a fill, then a hit, a fill skipped for want of room, one
+/// failed for each reason (a hash that is not the name, a short body, an upstream error, a
+/// refused link, an object written over), and one eviction for each reason (the free-space
+/// floor, the high water mark). Every labelled line is driven to 1 by its own event, so labels
+/// that were swapped would show.
 #[tokio::test]
 async fn the_metrics_text_has_every_counter_with_its_value() {
     let rig = Rig::with("tscache-metrics", |config| {
         config.budget = 100;
-        config.high_water = 100;
+        config.high_water = 60;
         config.low_water = 50;
     });
     rig.disk.set_space(1000, 1000);
-    rig.put("cas/b/a", &pattern(40)).await;
-    rig.put("cas/b/big", &pattern(500)).await;
-    rig.put(&format!("cas/l/{}", digest(b"name")), &pattern(10))
-        .await;
+    let wrong = format!("cas/l/{}", digest(b"name"));
+    for (key, len) in [("a", 40), ("big", 500), ("s", 10), ("u", 10), ("l", 10)] {
+        rig.put(&format!("cas/b/{key}"), &pattern(len)).await;
+    }
+    rig.put(&wrong, &pattern(10)).await;
     let _ = rig.get("cas/b/a").await.unwrap();
     let _ = rig.get("cas/b/a").await.unwrap();
     let _ = rig.get("cas/b/big").await.unwrap();
-    let _ = rig
-        .get(&format!("cas/l/{}", digest(b"name")))
-        .await
-        .unwrap();
+    assert!(rig.get(&wrong).await.is_err());
+    rig.tamper.short.store(true, Ordering::SeqCst);
+    let _ = rig.get("cas/b/s").await.unwrap();
+    rig.tamper.short.store(false, Ordering::SeqCst);
+    rig.upstream.fail_next(Op::Head, 1);
+    assert!(rig.get("cas/b/u").await.is_err());
+    rig.disk
+        .set(Quirk::LinkFails(std::io::ErrorKind::PermissionDenied));
+    let _ = rig.get("cas/b/l").await.unwrap();
+    rig.disk.set(Quirk::None);
+    let gate = rig.tamper.hold();
+    let cache = rig.cache.clone();
+    let reader = tokio::spawn(async move { cache.get("cas/b/l", None).await });
+    while read(&rig.cache.counters().staging_files) < 1 {
+        tokio::task::yield_now().await;
+    }
+    rig.put("cas/b/l", &pattern(11)).await;
+    gate.add_permits(1000);
+    assert_eq!(reader.await.unwrap().unwrap().len(), 11);
+    rig.disk.set_space(1000, 50);
+    assert_eq!(rig.cache.evict().evicted, 1);
+    rig.disk.set_space(1000, 1000);
+    rig.put("cas/b/f1", &pattern(40)).await;
+    rig.put("cas/b/f2", &pattern(30)).await;
+    let _ = rig.get("cas/b/f1").await.unwrap();
+    let _ = rig.get("cas/b/f2").await.unwrap();
     let text = rig.cache.metrics();
     let expected = [
         "tierstore_cache_hits_total 1\n",
-        "tierstore_cache_misses_total 3\n",
+        "tierstore_cache_misses_total 9\n",
         "tierstore_cache_bytes_served_local_total 40\n",
-        "tierstore_cache_bytes_served_upstream_total 550\n",
-        "tierstore_cache_fills_total 1\n",
+        "tierstore_cache_fills_total 3\n",
         "tierstore_cache_fills_skipped_total 1\n",
         "tierstore_cache_pinned_skips_total 0\n",
         "tierstore_cache_discarded_at_start_total 0\n",
-        "tierstore_cache_bytes 40\n",
+        "tierstore_cache_bytes 30\n",
         "tierstore_cache_objects 1\n",
         "tierstore_cache_fs_free_bytes 1000\n",
         "tierstore_cache_staging_files 0\n",
         "tierstore_cache_fill_failures_total{reason=\"hash_mismatch\"} 1\n",
-        "tierstore_cache_fill_failures_total{reason=\"upstream_error\"} 0\n",
-        "tierstore_cache_fill_failures_total{reason=\"short_body\"} 0\n",
-        "tierstore_cache_fill_failures_total{reason=\"local_io\"} 0\n",
-        "tierstore_cache_evictions_total{reason=\"budget\"} 0\n",
-        "tierstore_cache_evictions_total{reason=\"floor\"} 0\n",
+        "tierstore_cache_fill_failures_total{reason=\"upstream_error\"} 1\n",
+        "tierstore_cache_fill_failures_total{reason=\"short_body\"} 1\n",
+        "tierstore_cache_fill_failures_total{reason=\"local_io\"} 1\n",
+        "tierstore_cache_fill_failures_total{reason=\"changed\"} 1\n",
+        "tierstore_cache_evictions_total{reason=\"budget\"} 1\n",
+        "tierstore_cache_evictions_total{reason=\"floor\"} 1\n",
+        "tierstore_cache_bytes_served_upstream_total ",
     ];
     for line in expected {
         assert!(text.contains(line), "{line} in {text}");

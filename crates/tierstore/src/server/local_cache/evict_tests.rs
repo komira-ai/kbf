@@ -227,12 +227,16 @@ async fn the_loop_runs_passes_until_it_is_halted_and_then_writes_the_uses() {
     let stop = Arc::clone(&halt);
     let looping = tokio::spawn(async move { cache.maintain(Duration::from_secs(10), stop).await });
     tokio::task::yield_now().await;
+    // No pass ran at start: the first one waits for the interval.
+    assert_eq!(rig.cache.counters().evictions(Evicted::Floor), 0);
     tokio::time::advance(Duration::from_secs(10)).await;
     while rig.cache.counters().evictions(Evicted::Floor) < 2 {
         tokio::task::yield_now().await;
     }
-    rig.clock.set(9_000);
-    let _ = rig.get("cas/b/k3").await.unwrap();
+    // The use is recorded in memory only, after the pass that has run: the one write of it to
+    // the file is the loop's, when it is halted (the halt arm is tried before the interval).
+    let hex = name_of("cas/b/k3").hex;
+    assert!(locked(&rig.cache.inner.index).used(&hex, 9_000).is_some());
     halt.notify_one();
     looping.await.unwrap();
     let touched = rig.disk.touched.lock().unwrap().clone();

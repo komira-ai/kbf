@@ -77,8 +77,8 @@ impl Backend for Tamper {
             gate.acquire().await.expect("the gate stays open").forget();
         }
         let body = self.memory.get(key, range).await?;
-        if self.short.load(Ordering::SeqCst) && !body.is_empty() {
-            return Ok(body.slice(..body.len() - 1));
+        if self.short.load(Ordering::SeqCst) {
+            return Ok(body.slice(..body.len().saturating_sub(1)));
         }
         Ok(body)
     }
@@ -135,6 +135,8 @@ pub(in crate::server) struct FakeDisk {
     pub(in crate::server) touched: Mutex<Vec<(PathBuf, u64)>>,
     /// The number of calls of `link`.
     links_made: Mutex<u32>,
+    /// The names of every call of `link`, in order: from and to.
+    pub(in crate::server) linked: Mutex<Vec<(PathBuf, PathBuf)>>,
 }
 
 impl FakeDisk {
@@ -144,6 +146,7 @@ impl FakeDisk {
             space: Mutex::new(None),
             touched: Mutex::new(Vec::new()),
             links_made: Mutex::new(0),
+            linked: Mutex::new(Vec::new()),
         }
     }
 
@@ -179,6 +182,10 @@ impl Disk for FakeDisk {
             *made += 1;
             *made
         };
+        self.linked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((from.to_path_buf(), to.to_path_buf()));
         let quirk = self.quirk();
         if let Quirk::LinkFails(kind) = quirk {
             return Err(io::Error::from(kind));
@@ -286,7 +293,7 @@ impl Rig {
     /// Puts an object in the upstream.
     pub(in crate::server) async fn put(&self, key: &str, body: &[u8]) {
         let body = Bytes::copy_from_slice(body);
-        self.tamper.memory.put(key, body).await.expect("a put");
+        self.tamper.put(key, body).await.expect("a put");
     }
 
     /// A whole read through the cache.

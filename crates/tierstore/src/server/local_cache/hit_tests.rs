@@ -19,7 +19,8 @@ async fn a_hit_serves_the_upstream_bytes_and_makes_no_upstream_call() {
     rig.put("cas/b/obj", &body).await;
     assert_eq!(rig.get("cas/b/obj").await.unwrap(), body);
     let (gets, heads) = (rig.calls(Op::Get), rig.calls(Op::Head));
-    assert!(gets >= 1 && heads >= 1);
+    assert_eq!(gets, 1);
+    assert_eq!(heads, 1);
 
     let meta = rig.cache.head("cas/b/obj").await.unwrap();
     let upstream_meta = rig.tamper.memory.head("cas/b/obj").await.unwrap();

@@ -2,6 +2,7 @@
 //! into `obj/`; and the single flight that lets the readers of one key share it.
 
 use std::io;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -14,7 +15,7 @@ use tokio::io::AsyncWriteExt as _;
 
 use crate::{ByteRange, Error};
 
-use super::layout::{Name, Sidecar, data_path, meta_path, object_dir, stage_dir};
+use super::layout::{Name, Sidecar, data_path, make_dirs, meta_path, object_dir, stage_dir};
 use super::metrics::{FailedFill, bump};
 use super::{Disk, Inner, locked, percent_of};
 
@@ -41,6 +42,8 @@ enum Stop {
     Local,
     /// The bytes of a key named by its content hash to another name.
     Mismatch,
+    /// The object changed while it was being read: the bytes may be of two versions.
+    Changed,
 }
 
 impl From<io::Error> for Stop {
@@ -78,6 +81,9 @@ impl Staged {
             .mode(0o444)
             .open(&path)
             .await?;
+        // The mode given to `open` is cut by the umask: set it, so that it is 0444 for any.
+        file.set_permissions(std::fs::Permissions::from_mode(0o444))
+            .await?;
         let _ = inner.counters.staging_files.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             inner: Arc::clone(inner),
@@ -104,6 +110,13 @@ impl Drop for Staged {
     }
 }
 
+/// Writes the sidecar at `path`, readable by everyone and writable by the owner whatever the
+/// umask.
+fn write_sidecar(path: &Path, text: &[u8]) -> io::Result<()> {
+    std::fs::write(path, text)
+        .and_then(|()| std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)))
+}
+
 /// Puts the staged file into the cache: the sidecar first, by rename, then the data file by a
 /// create-only link. Gives whether the data file is new (`false` if it was there already).
 fn publish(
@@ -115,9 +128,11 @@ fn publish(
 ) -> io::Result<bool> {
     let data = data_path(root, hex);
     let (from, temporary) = staged;
-    std::fs::create_dir_all(object_dir(root, hex))?;
-    std::fs::write(temporary, sidecar)?;
-    std::fs::rename(temporary, meta_path(root, hex))?;
+    let meta = meta_path(root, hex);
+    // The three steps in one chain, so that a failure of any is one way out.
+    make_dirs(root, &object_dir(root, hex))
+        .and_then(|()| write_sidecar(temporary, sidecar))
+        .and_then(|()| std::fs::rename(temporary, &meta))?;
     match disk.link(from, &data) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
@@ -129,13 +144,33 @@ fn publish(
     }
 }
 
+/// The bytes of a fill that is running, counted against the critical mark from the moment the
+/// fill starts until its object is in the index (or it ends without one).
+struct Reserved {
+    inner: Arc<Inner>,
+    size: u64,
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        let _ = self.inner.reserved.fetch_sub(self.size, Ordering::SeqCst);
+    }
+}
+
 impl Inner {
-    /// Whether an object of `size` bytes may be added: it fits in the budget and the cache would
-    /// not pass its critical mark.
-    fn has_room(&self, size: u64) -> bool {
+    /// Reserves room for an object of `size` bytes if it fits in the budget and the cache, with
+    /// the fills that are running, would not pass its critical mark.
+    fn reserve(self: &Arc<Self>, size: u64) -> Option<Reserved> {
         let held = locked(&self.index).bytes();
         let critical = percent_of(self.config.budget, self.config.critical);
-        size <= self.config.budget && held.saturating_add(size) <= critical
+        let before = self.reserved.fetch_add(size, Ordering::SeqCst);
+        let reservation = Reserved {
+            inner: Arc::clone(self),
+            size,
+        };
+        let total = held.saturating_add(before).saturating_add(size);
+        // A refused reservation is dropped, which gives the bytes back.
+        (size <= self.config.budget && total <= critical).then_some(reservation)
     }
 
     /// The fill of `key`, started if none is running, and waited for.
@@ -146,6 +181,12 @@ impl Inner {
     ) -> Result<Filled, Error> {
         let pending = {
             let mut flights = locked(&self.flights);
+            // A fill that ended after the reader missed, and before it got here, left the object
+            // in the index (it is put there before the flight is removed): that is not a miss
+            // to fill again.
+            if locked(&self.index).get(&name.hex).is_some() {
+                return Ok(Filled::Kept);
+            }
             flights
                 .entry(name.hex.clone())
                 .or_insert_with(|| self.start(key, name))
@@ -180,7 +221,13 @@ impl Inner {
             }
             Err(Stop::Short) => self.skipped(FailedFill::ShortBody),
             Err(Stop::Local) => self.skipped(FailedFill::LocalIo),
-            Err(Stop::Mismatch) => self.skipped(FailedFill::HashMismatch),
+            Err(Stop::Changed) => self.skipped(FailedFill::Changed),
+            Err(Stop::Mismatch) => {
+                // The bytes are known to be wrong: they go to nobody.
+                self.counters.failed(FailedFill::HashMismatch);
+                let text = "the upstream's bytes do not hash to the name of the object";
+                Err(Error::Unavailable(text.to_owned()))
+            }
         }
     }
 
@@ -192,10 +239,10 @@ impl Inner {
 
     async fn fetch(self: &Arc<Self>, key: &str, name: &Name) -> Result<Filled, Stop> {
         let meta = self.upstream.head(key).await?;
-        if !self.has_room(meta.size) {
+        let Some(reservation) = self.reserve(meta.size) else {
             bump(&self.counters.fills_skipped);
             return Ok(Filled::Skipped);
-        }
+        };
         let mut staged = Staged::create(self).await?;
         let mut hasher = Sha256::new();
         let mut offset = 0;
@@ -211,6 +258,11 @@ impl Inner {
             offset += want;
         }
         staged.finish().await?;
+        // A key named by its content is checked by the hash below. Any other key could have been
+        // written over while it was read, and the file would hold bytes of two versions.
+        if name.content.is_none() && !self.upstream.head(key).await?.same_content(&meta) {
+            return Err(Stop::Changed);
+        }
         let digest = hex::encode(hasher.finalize());
         if name
             .content
@@ -228,6 +280,7 @@ impl Inner {
         };
         let fresh = self.commit(&staged, name, &sidecar).await?;
         locked(&self.index).insert(&name.hex, meta.size, meta.tag, meta.modified);
+        drop(reservation);
         if fresh {
             bump(&self.counters.fills);
         }

@@ -97,7 +97,7 @@ async fn get_and_head_are_served_from_the_cache() {
 }
 
 /// Asserts that every write the S3 API has is refused with 403 `AccessDenied` and a text that
-/// says this is a read cache, before the body is read, and that nothing reaches the upstream or
+/// says this is a read cache, and that nothing reaches the upstream or
 /// the cache: a put, a put without the condition, a copy, a part, the start and the completion
 /// of an upload, a delete, the abort of an upload, and CreateBucket.
 #[tokio::test]
