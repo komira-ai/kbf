@@ -80,17 +80,31 @@ describe('kbf and tierstore names are disjoint', () => {
 });
 
 describe('the held CLI', () => {
-  const run = (argv: string[]) => {
+  const run = (argv: string[], github: string[] = []) => {
     const streams: string[] = [];
     const lines: string[] = [];
     const t: Tools = {
       capture: (cmd, args) => {
         const line = [cmd, ...args].join(' ');
-        if (line.includes('gh api repos/') && line.includes('/environments')) throw new Error('(HTTP 404)');
+        const envName = /environments\/([\w-]+)(\/deployment-branch-policies)?/.exec(line);
+        if (envName) {
+          const [, name, pols] = envName;
+          if (!github.includes(name)) throw new Error('(HTTP 404)');
+          const approval = name === TIER.approvalEnvironment;
+          if (pols) return JSON.stringify({ branch_policies: approval ? [{ name: 'main', type: 'branch' }, { name: 'v*', type: 'tag' }] : [{ name: 'v*', type: 'tag' }] });
+          return JSON.stringify({
+            can_admins_bypass: false,
+            deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
+            protection_rules: approval ? [{ type: 'required_reviewers', prevent_self_review: false, reviewers: [{ type: 'User', reviewer: { id: 5 } }] }] : [],
+          });
+        }
+        if (line.includes('oidc/customization/sub')) {
+          return JSON.stringify({ use_default: false, use_immutable_subject: true, include_claim_keys: ['repo', 'context', 'job_workflow_ref'] });
+        }
         if (line.includes('gh api repos/')) return JSON.stringify({ full_name: REPO, id: 222, owner: { id: 111 } });
         if (line.includes('gh api users/')) return JSON.stringify({ type: 'User', id: 5, login: 'someone' });
         if (line.includes('get-caller-identity')) return `${ACCOUNT}\n`;
-        if (line.includes('list-hosted-zones-by-name')) return JSON.stringify({ HostedZones: [{ Name: 'tierstore.dev.' }] });
+        if (line.includes('list-hosted-zones-by-name')) return JSON.stringify({ HostedZones: [{ Name: `${args[args.indexOf('--dns-name') + 1]}.` }] });
         if (line.includes('describe-stacks')) {
           return JSON.stringify([
             { OutputKey: 'BucketName', OutputValue: 'b' },
@@ -134,11 +148,16 @@ describe('the held CLI', () => {
     expect(r.text).not.toMatch(/environments\/prod(-site)?[ /]/);
     expect(r.text).toContain(`environment:${TIER.githubEnvironment}:job_workflow_ref:${REPO}/${TIER.publishWorkflow}@`);
   });
-  test('vars reads the tierstore stack and prints TIERSTORE_SITE_* variables into the tierstore environment', () => {
-    // the GitHub-side check fails on the fake (no environments), which is checked first; call checkGithub's absence via the refusal text
-    expect(() => run(['vars', ...common, '--repo', REPO, '--domain', 'tierstore.dev'])).toThrow(Refused);
-    expect(TIER.variables).toEqual(['TIERSTORE_SITE_BUCKET', 'TIERSTORE_SITE_DISTRIBUTION_ID', 'TIERSTORE_SITE_PUBLISH_ROLE_ARN']);
+  test('vars reads the tierstore stack and prints TIERSTORE_SITE_* variables into the tierstore site environment', () => {
+    const r = run(['vars', ...common, '--repo', REPO, '--domain', 'tierstore.dev'], [TIER.approvalEnvironment, TIER.githubEnvironment]);
+    const sets = r.text.split('\n').filter((l) => l.startsWith('gh variable set'));
+    expect(sets.map((l) => l.split(' ')[3])).toEqual(['TIERSTORE_SITE_BUCKET', 'TIERSTORE_SITE_DISTRIBUTION_ID', 'TIERSTORE_SITE_PUBLISH_ROLE_ARN']);
+    for (const l of sets) expect(l).toContain(`--env ${TIER.githubEnvironment} `);
+    expect(r.text).not.toContain('KBF_');
     expect(KBF.variables).toEqual(['KBF_SITE_BUCKET', 'KBF_SITE_DISTRIBUTION_ID', 'KBF_SITE_PUBLISH_ROLE_ARN']);
+  });
+  test('vars for tierstore refuses while only kbf.dev\'s environments exist', () => {
+    expect(() => run(['vars', ...common, '--repo', REPO, '--domain', 'tierstore.dev'], [KBF.approvalEnvironment, KBF.githubEnvironment])).toThrow(Refused);
   });
   test('an unmapped domain without --site, and a --site that contradicts the domain, are refused at parse time', () => {
     expect(() => parse(['dns', ...common, '--domain', 'docs.example.org'])).toThrow(Refused);
