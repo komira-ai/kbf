@@ -15,7 +15,14 @@ use crate::journal::{
     USAGE_KEY, Usage, encode_journal, is_reserved, journal_key, journal_prefix, load_checkpoint,
     proxy_key, seq_of,
 };
-use crate::{Backend, ByteRange, Clock, Error, JournalEntry, JournalOp, Listed, Meta, PartBody};
+use crate::{
+    Backend, ByteRange, Clock, Error, JournalEntry, JournalOp, Listed, Meta, OpenUpload, PartBody,
+    UploadsAfter,
+};
+
+/// The most calls to the cold tier that one listing of uploads makes to fill a page that the
+/// filter of reserved keys cut short.
+const UPLOAD_LISTING_CALLS: u32 = 100;
 
 /// The settings of a [`Proxy`].
 #[derive(Clone)]
@@ -167,6 +174,8 @@ fn refuse_reserved(key: &str) -> Result<(), Error> {
 ///   the object is in the cold tier, so a get, a head, a listing and a delete find it, and the
 ///   reconciler has nothing to copy. It is in the hot tier only after a get copies it back.
 ///   The cold tier must do multipart uploads (the provided methods of [`Backend`] do not).
+///   [`Backend::list_uploads`] lists the cold tier's open uploads, which are the only ones: the
+///   proxy keeps no state of an upload.
 ///
 /// The journal is written in batches of at most [`ProxyConfig::batch_entries`] entries, each
 /// batch after [`ProxyConfig::linger`] at most, as `_journal/<proxy_id>/<seq>`, create-only,
@@ -813,5 +822,50 @@ impl Backend for Proxy {
     async fn abort_upload(&self, key: &str, id: &str) -> Result<(), Error> {
         refuse_reserved(key)?;
         self.inner.cold.abort_upload(key, id).await
+    }
+
+    /// The open uploads are the cold tier's own (see the type), so this asks the cold tier, and
+    /// leaves out an upload of a reserved key: none is made through the proxy, but the tier is
+    /// shared with other writers. A page that the filter cut short is made up from the next
+    /// page of the tier, so that a short page is the last, as the trait says.
+    async fn list_uploads(
+        &self,
+        prefix: &str,
+        after: Option<UploadsAfter<'_>>,
+        max_uploads: usize,
+    ) -> Result<Vec<OpenUpload>, Error> {
+        let cold = &self.inner.cold;
+        let mut after = after.map(|(key, id)| (key.to_owned(), id.map(str::to_owned)));
+        let mut found: Vec<OpenUpload> = Vec::new();
+        let mut calls = 0;
+        while found.len() < max_uploads {
+            calls += 1;
+            if calls > UPLOAD_LISTING_CALLS {
+                let text = format!(
+                    "the cold tier's listing of uploads took over {UPLOAD_LISTING_CALLS} calls"
+                );
+                return Err(Error::Unavailable(text));
+            }
+            let want = max_uploads - found.len();
+            let marker = after
+                .as_ref()
+                .map(|(key, id)| (key.as_str(), id.as_deref()));
+            let page = cold.list_uploads(prefix, marker, want).await?;
+            let last = page.last().map(|up| (up.key.clone(), Some(up.id.clone())));
+            let full = page.len() == want;
+            found.extend(page.into_iter().filter(|up| !is_reserved(&up.key)));
+            match last {
+                Some(last) if full => {
+                    // A full page that ends where the last one did would be asked for for ever.
+                    if after.as_ref().is_some_and(|before| last <= *before) {
+                        let text = "the cold tier's listing of uploads did not advance";
+                        return Err(Error::Unavailable(text.to_owned()));
+                    }
+                    after = Some(last);
+                }
+                _ => break,
+            }
+        }
+        Ok(found)
     }
 }

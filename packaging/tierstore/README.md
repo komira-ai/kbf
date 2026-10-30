@@ -53,8 +53,9 @@ refuses a key file that its group or others can read):
   list, delete, and the calls of a multipart upload;
 - `/etc/tierstore/daemons.key`: a read-only key (`--read-only-key-file`), for the daemons that
   read blobs and must not write or delete them. A request signed with it may get and head an
-  object, list the bucket and head the bucket; a put, a delete, CreateBucket or any call of a
-  multipart upload is answered 403 `AccessDenied`, before its body is read, and changes nothing.
+  object, list the bucket (objects, and the open multipart uploads) and head the bucket; a put, a
+  delete, CreateBucket or any call that starts, feeds, completes or aborts a multipart upload is
+  answered 403 `AccessDenied`, before its body is read, and changes nothing.
   Give the flag once for each read-only key, to give each reader a key of its own. The access key
   ids of all the keys of one server must differ: a request names its key by its id, so a start
   with two keys that have one id is refused with exit status 2;
@@ -128,7 +129,7 @@ and is longer than it:
 | call | allowed |
 |---|---|
 | ListObjectsV2 | with a `prefix` inside the key's; a list with no prefix or another is 403, not filtered |
-| ListMultipartUploads | authorized the same way, but served once ListMultipartUploads lands; the front answers 501 until then |
+| ListMultipartUploads | with a `prefix` inside the key's, the open uploads under it; no prefix or another is 403, not filtered |
 | HeadObject | yes |
 | DeleteObject | yes: from both tiers, journaled as for any delete |
 | AbortMultipartUpload | of an upload of such a key |

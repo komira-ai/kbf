@@ -28,6 +28,12 @@
 //!   and `NoSuchUpload` is the answer for an id the backend does not hold. The ETag of a part
 //!   is the content tag the backend gives it, and that of the completion is the content tag of
 //!   the object;
+//! - ListMultipartUploads (`GET /<bucket>?uploads`) with `prefix`, `max-uploads`, `key-marker`
+//!   and `upload-id-marker`, without `delimiter`: the open uploads of the backend (for the
+//!   [`Proxy`](crate::Proxy), those of its cold tier), by key and then by id, paged by the two
+//!   markers, so that a janitor can find the uploads a job left open and abort them. Uploads of
+//!   a key under `_journal/` or `_tiering/` are not listed. ListParts (`GET /<key>?uploadId=`) is
+//!   `NotImplemented`;
 //! - CreateBucket and HeadBucket of the served bucket (always successful), for setup tools.
 //!
 //! Every other call, a copy (`x-amz-copy-source`), and a query parameter this front does not
@@ -77,8 +83,9 @@
 //!
 //! The server has one full key, which may do everything above, and any number of read-only
 //! keys ([`ServerConfig::read_only_keys`], `--read-only-key-file` in the binary), which may do
-//! GetObject, HeadObject, ListObjectsV2 and HeadBucket and nothing else. Any other call signed
-//! by a read-only key (a put, a delete, CreateBucket, and every call of a multipart upload) is
+//! GetObject, HeadObject, ListObjectsV2, ListMultipartUploads and HeadBucket and nothing else.
+//! Any other call signed by a read-only key (a put, a delete, CreateBucket, and every call of a
+//! multipart upload but the listing, which reads) is
 //! answered 403 `AccessDenied` with the S3 error document before its body is read, and changes
 //! nothing. The roles of those keys are of the key and not of a prefix. A put by the full key
 //! is create-only but, when the hot tier is full, can race another put of the same key into the
@@ -201,6 +208,8 @@ mod stream_put_tests;
 mod testing;
 #[cfg(test)]
 mod time_tests;
+#[cfg(test)]
+mod uploads_tests;
 #[cfg(test)]
 mod xml_tests;
 
@@ -683,6 +692,12 @@ impl Server {
         let query = Query::parse(parts.uri.query())?;
         if let Some(grant) = &signed.presign {
             grant.permit(parts, &target, &query)?;
+        }
+        // After the presigning grant, which refuses a listing: a presigned request may only PUT.
+        if parts.method == Method::GET && query.has("uploads") && target == Target::Bucket {
+            signed
+                .role
+                .permit_list_uploads(query.get("prefix").unwrap_or_default())?;
         }
         let data = matches!((&parts.method, &target), (&Method::PUT, Target::Object(_)));
         let check = Check::new(&signed.payload, &parts.headers, data)?;

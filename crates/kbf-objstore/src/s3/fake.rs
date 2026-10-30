@@ -1,6 +1,7 @@
 //! An S3 service on loopback, for tests (feature `testkit`): PUT, GET (whole or one range),
 //! HEAD, ListObjectsV2 (prefix, `max-keys`, `continuation-token`, `start-after`), and
-//! multipart upload (create, parts, complete, abort), with S3's rules on
+//! multipart upload (create, parts, complete, abort, and ListMultipartUploads with `prefix`,
+//! `max-uploads`, `key-marker` and `upload-id-marker`, in the order of key and id), with S3's rules on
 //! part sizes enforced at completion and conditional writes (`If-None-Match: *`) on a
 //! PUT and a completion, a PUT that replaces an object only if it has the entity tag in
 //! `If-Match` (412 for another tag, 404 if there is no object), and DELETE of a plain object.
@@ -43,6 +44,9 @@ use md5::{Digest, Md5};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+mod uploads;
+
+use self::uploads::list_uploads;
 use super::sigv4::{Request as Signed, Signer, Utc};
 use super::times::MONTHS;
 use super::{Credentials, S3Config, S3Store};
@@ -234,6 +238,8 @@ fn iso_date(seconds: u64) -> String {
 #[derive(Debug)]
 struct Upload {
     key: String,
+    /// The second the upload was started, by the clock of the service.
+    initiated: u64,
     parts: BTreeMap<u32, (String, Kept)>,
 }
 
@@ -561,7 +567,13 @@ fn handle(state: &mut State, request: &Request) -> Vec<u8> {
             state.next += 1;
             let id = format!("upload-{}", state.next);
             let parts = BTreeMap::new();
-            state.uploads.insert(id.clone(), Upload { key, parts });
+            let initiated = state.time.unwrap_or_else(system_seconds);
+            let upload = Upload {
+                key,
+                initiated,
+                parts,
+            };
+            state.uploads.insert(id.clone(), upload);
             let body = format!(
                 "<InitiateMultipartUploadResult><UploadId>{id}</UploadId>\
                  </InitiateMultipartUploadResult>"
@@ -605,6 +617,7 @@ fn handle(state: &mut State, request: &Request) -> Vec<u8> {
             state.stats.aborted += 1;
             answer("204 No Content", &[], b"")
         }
+        ("GET", Some(_), None, None) if key.is_empty() => list_uploads(state, request),
         ("PUT", None, None, None) => put_object(state, key, conditional, request),
         ("DELETE", None, None, None) => {
             state.objects.remove(&key);

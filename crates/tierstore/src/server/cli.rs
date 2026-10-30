@@ -205,8 +205,7 @@ pub struct Cli {
     pub presign_key_file: Vec<PathBuf>,
     /// A file that holds a GC key, JSON of exactly `access_key_id`, `secret_access_key` and
     /// `prefix` (ending in `/`): a header-signed key that lists (ListObjectsV2 and
-    /// ListMultipartUploads with a prefix inside its own: authorized, served once ListMultipartUploads
-    /// lands, 501 until then), heads, deletes and aborts uploads
+    /// ListMultipartUploads, each with a prefix inside its own), heads, deletes and aborts uploads
     /// under the prefix and does nothing else (no get, no put, no bucket call); it is refused on a
     /// presigned URL. Give the flag once for each such key; all key ids must differ. Only its
     /// owner may read it (mode 0600).
