@@ -39,6 +39,9 @@
 //! [`Limits::reads_in_flight`], and an ok blob is hashed against its digest here: bytes that
 //! are not the blob's are `store_unavailable`, never an ok frame.
 //!
+//! `GET /locate` answers where the blobs of the grant's Action are, as JSON lines, for the task
+//! to fetch from the stores itself: see the `locate` module.
+//!
 //! An answer carries a reason code in its body and no other detail: `missing_token`,
 //! `invalid_token`, `expired`, `revoked`, `no_scope`, `out_of_scope`, `too_large`,
 //! `not_found`, `method_not_allowed` or `store_unavailable`. Requests by outcome, the
@@ -175,6 +178,32 @@ impl BlobSource for Backend {
         digests: &'a [Digest],
     ) -> BoxFuture<'a, Vec<Result<Bytes, StorageError>>> {
         Box::pin(Backend::read_many(self, digests))
+    }
+
+    fn locate_packed<'a>(
+        &'a self,
+        digests: &'a [Digest],
+    ) -> BoxFuture<'a, Result<Vec<Option<Span>>, StorageError>> {
+        Box::pin(async move {
+            let located = Backend::locate_packed(self, digests).await?;
+            Ok(located
+                .into_iter()
+                .map(|at| {
+                    at.map(|at| Span {
+                        key: at.pack_key,
+                        offset: at.offset,
+                        length: at.length,
+                    })
+                })
+                .collect())
+        })
+    }
+
+    fn large_len<'a>(
+        &'a self,
+        digest: &'a Digest,
+    ) -> BoxFuture<'a, Result<Option<u64>, StorageError>> {
+        Box::pin(async move { Backend::object_len(self, &large_key(digest)).await })
     }
 }
 
@@ -340,6 +369,14 @@ const GET_OUTCOMES: [Outcome; 7] = [
     Outcome::Unavailable,
 ];
 
+/// The outcomes of a locate.
+const LOCATE_OUTCOMES: [Outcome; 4] = [
+    Outcome::Ok,
+    Outcome::Unauthorized,
+    Outcome::Forbidden,
+    Outcome::Unavailable,
+];
+
 /// The outcomes of a batch.
 const BATCH_OUTCOMES: [Outcome; 6] = [
     Outcome::Ok,
@@ -409,6 +446,7 @@ pub struct JobRead {
     grants: Arc<Grants>,
     limits: Limits,
     scopes: Mutex<Cells>,
+    locate: locate::Locating,
     reads: Arc<Semaphore>,
     budget: Budget,
     requests: Tally,
@@ -429,6 +467,7 @@ impl JobRead {
             budget: Budget::new(limits.read_budget_bytes),
             limits,
             scopes: Mutex::new(HashMap::new()),
+            locate: locate::Locating::new(&limits),
             requests: Default::default(),
             batches: Default::default(),
             blobs: Default::default(),
@@ -462,6 +501,9 @@ impl JobRead {
         }
         if *method != Method::GET {
             return self.refuse(Outcome::MethodNotAllowed, "method_not_allowed");
+        }
+        if path == LOCATE_PATH {
+            return self.locate(authorization).await;
         }
         let Some(digest) = digest_of(path) else {
             return self.refuse(Outcome::NotFound, "not_found");
@@ -787,6 +829,7 @@ impl JobRead {
                 counter.get()
             );
         }
+        self.locate.render_metrics(&mut families);
         *out = families.0;
     }
 

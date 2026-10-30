@@ -84,6 +84,8 @@ trait Plane: Send + Sync {
             digests.iter().map(|digest| self.read_blob(digest)),
         ))
     }
+    /// The packs a plane keeps its client uploads in, if it has any.
+    fn packs(&self) -> Option<&Packs>;
     fn action_result<'a>(
         &'a self,
         action: &'a Digest,
@@ -188,6 +190,33 @@ impl Backend {
         self.0.read_many(digests).await
     }
 
+    /// Where the blob of each of `digests` lies in a pack, in the order asked, `None` for one that
+    /// is in none; all `None` for a store without packs. One batched ask of the pack index.
+    ///
+    /// # Errors
+    /// As the pack index answers.
+    pub async fn locate_packed(
+        &self,
+        digests: &[Digest],
+    ) -> Result<Vec<Option<kbf_pack_index::Location>>, StorageError> {
+        let Some(packs) = self.0.packs() else {
+            return Ok(vec![None; digests.len()]);
+        };
+        packs.locate(digests).await.map_err(layered::unavailable)
+    }
+
+    /// The length of the object `key` in the object store the packs live in (a HEAD), `None` if
+    /// there is none or the store has no packs.
+    ///
+    /// # Errors
+    /// As the object store answers.
+    pub async fn object_len(&self, key: &str) -> Result<Option<u64>, StorageError> {
+        let Some(packs) = self.0.packs() else {
+            return Ok(None);
+        };
+        packs.object_len(key).await.map_err(layered::unavailable)
+    }
+
     pub(crate) async fn action_result(
         &self,
         action: &Digest,
@@ -272,6 +301,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> Plane for Local<M, O> {
         })
     }
 
+    fn packs(&self) -> Option<&Packs> {
+        None
+    }
     fn action_result<'a>(
         &'a self,
         action: &'a Digest,
@@ -388,6 +420,9 @@ impl Plane for Remote {
         }
     }
 
+    fn packs(&self) -> Option<&Packs> {
+        self.packs.as_ref()
+    }
     fn action_result<'a>(
         &'a self,
         action: &'a Digest,
@@ -545,6 +580,9 @@ impl Plane for RoutedPlane {
         }
     }
 
+    fn packs(&self) -> Option<&Packs> {
+        self.packs.as_ref()
+    }
     fn action_result<'a>(
         &'a self,
         action: &'a Digest,

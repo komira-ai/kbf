@@ -403,3 +403,57 @@ async fn a_result_the_closure_check_cannot_read_is_refused_with_packs() {
     let absent = absent.unwrap_err();
     assert!(matches!(absent, StorageError::NotFound(_)), "{absent:?}");
 }
+
+/// Asserts that `locate_packed` is the pack index's own answer and nothing more: a packed blob
+/// has a span of its blob's length that lies inside its pack, one that is in no pack has none,
+/// and a store without packs, or one whose index is down, is none and an error: and
+/// `object_len` is the length of a stored object, none for a key with no object.
+#[tokio::test]
+async fn locate_packed_is_the_indexs_answer_and_object_len_a_head() {
+    let held = blob("a blob held in a pack");
+    let other = blob("a blob held nowhere");
+    let packs = packs_holding(&[&held]).await;
+    let node = Arc::new(CacheStorage::new(
+        Arc::new(Cache::memory()),
+        SegmentsConfig::DEFAULT,
+    ));
+    let backend = Backend::remote_over(node.clone(), Some(packs));
+
+    let located = backend
+        .locate_packed(&[held.0, other.0])
+        .await
+        .expect("located");
+    let at = located[0].clone().expect("a span for the packed blob");
+    assert_eq!(at.length, held.1.len() as u64);
+    assert!(located[1].is_none());
+    let size = backend
+        .object_len(&at.pack_key)
+        .await
+        .expect("a head")
+        .expect("the pack is stored");
+    assert!(at.offset + at.length <= size);
+    assert_eq!(
+        backend
+            .object_len("cas/l/nothing-here")
+            .await
+            .expect("a head"),
+        None
+    );
+
+    let bare = Backend::remote_over(node.clone(), None);
+    assert_eq!(
+        bare.locate_packed(&[held.0]).await.expect("none"),
+        vec![None]
+    );
+    assert_eq!(bare.object_len(&at.pack_key).await.expect("none"), None);
+
+    let store = Arc::new(MemoryStore::new(Capabilities {
+        conditional_put: true,
+        object_lock: false,
+    }));
+    let keys = PackKeys::new(WriterKind::Frontend, "fe1", "boot1").expect("keys");
+    let down = Packs::new(store, Arc::new(Down), keys, PackSettings::default()).expect("packs");
+    let down = Backend::remote_over(node, Some(down));
+    let failed = down.locate_packed(&[held.0]).await.unwrap_err();
+    assert!(matches!(failed, StorageError::Unavailable(_)), "{failed:?}");
+}

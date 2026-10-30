@@ -279,7 +279,11 @@ fn small() -> Limits {
 #[tokio::test]
 async fn the_table_is_exactly_the_scope_with_the_indexs_spans() {
     let source = Source::default();
-    let a = build(&source, "a", &[b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]);
+    let a = build(
+        &source,
+        "a",
+        &[b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()],
+    );
     let b = build(&source, "b", &[b"other-1".to_vec(), b"other-2".to_vec()]);
     pack(&source, &a.files[0], span("cas/f/w/1", 0, 5));
     pack(&source, &a.files[1], span("cas/f/w/1", 5, 4));
@@ -329,7 +333,12 @@ async fn a_present_large_blob_is_a_key_and_the_others_are_absent() {
     let a = build(
         &source,
         "a",
-        &[vec![7; 2000], vec![8; 3000], vec![9; 4000], b"small".to_vec()],
+        &[
+            vec![7; 2000],
+            vec![8; 3000],
+            vec![9; 4000],
+            b"small".to_vec(),
+        ],
     );
     source.large.lock().unwrap().insert(a.files[0], 2000);
     // An object of another length than the digest names.
@@ -348,7 +357,10 @@ async fn a_present_large_blob_is_a_key_and_the_others_are_absent() {
     assert!(table[&a.files[3].to_string()]["pack"].is_object());
     let asked: Vec<Digest> = rig.source.asked().concat();
     for large in &a.files[..3] {
-        assert!(!asked.contains(large), "a large blob was asked of the index");
+        assert!(
+            !asked.contains(large),
+            "a large blob was asked of the index"
+        );
         assert_eq!(rig.source.heads_of(large), 1);
     }
     assert_eq!(rig.source.heads_of(&a.files[3]), 0);
@@ -417,7 +429,10 @@ async fn a_failed_presence_check_is_unavailable_and_not_remembered() {
     source.head_down.store(true, Ordering::SeqCst);
     let rig = rig(source, small());
     let token = rig.token(a.action);
-    assert_eq!(rig.locate(&token).await.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        rig.locate(&token).await.status,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
     rig.source.head_down.store(false, Ordering::SeqCst);
     let table = table(&rig.locate(&token).await);
     assert!(table[&a.files[0].to_string()]["large"].is_object());
@@ -486,7 +501,10 @@ async fn presence_is_remembered_for_seconds_and_a_negative_for_less() {
 
     rig.locate(&token).await;
     rig.locate(&token).await;
-    assert_eq!((rig.source.heads_of(&held), rig.source.heads_of(&missing)), (1, 1));
+    assert_eq!(
+        (rig.source.heads_of(&held), rig.source.heads_of(&missing)),
+        (1, 1)
+    );
 
     // The missing blob is written; its negative answer is still good.
     rig.source.large.lock().unwrap().insert(missing, 3000);
@@ -497,7 +515,10 @@ async fn presence_is_remembered_for_seconds_and_a_negative_for_less() {
     tokio::time::advance(Duration::from_secs(2)).await;
     let table_later = table(&rig.locate(&token).await);
     assert!(table_later[&missing.to_string()]["large"].is_object());
-    assert_eq!((rig.source.heads_of(&held), rig.source.heads_of(&missing)), (1, 2));
+    assert_eq!(
+        (rig.source.heads_of(&held), rig.source.heads_of(&missing)),
+        (1, 2)
+    );
 
     // The held object's answer runs out later, and the object is gone by then.
     rig.source.large.lock().unwrap().remove(&held);

@@ -27,6 +27,17 @@ impl Scope {
         }
     }
 
+    /// Every digest in the scope (the Action, its Command and the closure), once each, in
+    /// digest order.
+    #[must_use]
+    pub fn digests(&self) -> Vec<Digest> {
+        let mut all: Vec<Digest> = self.closure.iter().copied().collect();
+        all.extend([self.action, self.command]);
+        all.sort_unstable();
+        all.dedup();
+        all
+    }
+
     /// Whether `digest` is in the scope.
     #[must_use]
     pub fn allows(&self, digest: &Digest) -> bool {
