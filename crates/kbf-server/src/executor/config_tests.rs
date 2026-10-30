@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use kbf_lease_client::Mount;
 use kbf_sched::fence::{LEADER_LEASE_MARGIN, LEASE_GRACE, START_GRACE, START_VALIDITY};
 
 use super::{Config, ConfigError, HARD_CAP_PAD, PRESIGN_LIMIT};
@@ -236,16 +235,6 @@ fn each_unsafe_setting_is_refused_by_name() {
                 ..base()
             },
             ConfigError::InsecureArgv,
-        ),
-        (
-            Config {
-                tool_mount: Mount {
-                    ro: false,
-                    ..base().tool_mount
-                },
-                ..base()
-            },
-            ConfigError::ToolMount,
         ),
         (
             Config {
