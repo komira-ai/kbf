@@ -117,6 +117,12 @@ pub enum ManifestError {
     /// A version 2 manifest lacks a field it requires.
     #[error("manifest version {MANIFEST_VERSION_2} requires the field {0:?}")]
     MissingField(&'static str),
+    /// A version 2 body that has one pack, no large object and no `inputs`: that manifest is
+    /// spelled as version 1.
+    #[error(
+        "manifest version {MANIFEST_VERSION_2} with one pack, no large object and no inputs is spelled as version {MANIFEST_VERSION}"
+    )]
+    NotV2,
     /// `packs` is 0 or more than [`MAX_PACKS`].
     #[error("packs is {0}, not in 1..={MAX_PACKS}")]
     Packs(u8),

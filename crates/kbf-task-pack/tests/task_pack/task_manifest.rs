@@ -867,3 +867,21 @@ fn a_v1_manifest_with_inputs_is_refused() {
         ManifestError::UnexpectedField("inputs")
     ));
 }
+
+/// Asserts that a version 2 body that needs nothing of version 2 (one pack, no large object, no
+/// inputs) is refused, so every manifest has one spelling; and that each thing that does need
+/// version 2 is accepted in a version 2 body.
+#[test]
+fn a_v2_manifest_that_needs_nothing_of_v2_is_refused() {
+    assert!(matches!(
+        refusal_v2("invalid_v2/v2_needing_nothing.json"),
+        ManifestError::NotV2
+    ));
+    for name in [
+        "valid_v2/two_packs.json",
+        "valid_v2/one_large.json",
+        "valid_v2/inputs_partial.json",
+    ] {
+        assert!(parse_v2(name).is_ok(), "{name}");
+    }
+}
