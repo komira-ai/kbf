@@ -562,10 +562,17 @@ pub fn materialize(
         written.fetch_add(1, Ordering::SeqCst);
         Ok(())
     })?;
-    if written.into_inner() != files.len() {
-        return Err(FetchError::Invalid("a source skipped a blob".to_owned()));
+    all_written(written.into_inner(), files.len())
+}
+
+/// Fails when a source called back for fewer blobs than it was asked for. It is not generic, so
+/// both outcomes are one branch however many sources `materialize` is used with.
+fn all_written(written: usize, wanted: usize) -> Result<(), FetchError> {
+    if written == wanted {
+        Ok(())
+    } else {
+        Err(FetchError::Invalid("a source skipped a blob".to_owned()))
     }
-    Ok(())
 }
 
 /// Fetches and decodes one Directory message and checks its names.
