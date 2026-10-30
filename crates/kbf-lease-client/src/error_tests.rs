@@ -74,3 +74,14 @@ fn a_refusal_prints_its_status_code_and_reason() {
         "the lease server answered 400 bad-request (the body is not valid JSON (line 1, column 2))"
     );
 }
+
+/// Asserts that the code a js-agent refuses a start with when its scratch quota is out of
+/// order is typed, so that a caller can tell it from a code it does not know. It catches the
+/// code falling into `Other`, where the executor would treat it as an infrastructure failure
+/// of the action.
+#[test]
+fn quota_unavailable_is_a_code_of_its_own() {
+    let code = ErrorCode::from_text("quota-unavailable");
+    assert_eq!(code, ErrorCode::QuotaUnavailable);
+    assert_eq!(code.as_str(), "quota-unavailable");
+}

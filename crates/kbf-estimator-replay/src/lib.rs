@@ -29,6 +29,21 @@
 //! does not kill more, on one history, with a model of memory need. Only a concurrent
 //! holdout on the farm supports a claim.
 //!
+//! # The slowdown report
+//!
+//! `kbf-estimator-replay slowdown --from DIR [--quiet-pressure-centi 500] [--max-overlap 0]
+//! [--baseline-percentile 10] [--json]` reads an export and says, for each successful run,
+//! how much slower it took than the same estimator key on a quiet host: `wall / baseline`,
+//! with a per-key and an overall median, p90 and share of runs above 1.5x. The text form
+//! prints the definition, the funnel and one line per key; `--json` adds every run. The exact
+//! definition (what is measured, the key, which approximates the estimator's with an OS-only
+//! platform class, the quiet rule, the baseline statistic, how a key
+//! with no quiet run is reported) is in the [`slowdown`] module documentation, and the report
+//! prints what it cannot see ([`slowdown::LIMITS`]). The quiet signal is the node's CPU
+//! pressure at the lease start plus the overlap of exported attempts on the node; the record
+//! carries no concurrent-lease count, and a run with no pressure reading is counted apart and
+//! never imputed.
+//!
 //! This crate is a workspace member under the coverage gate (99% of lines and branches):
 //! the verbs are library functions over injected I/O, `main` is three lines, and every
 //! rule of the replay has a test that asserts it.
@@ -40,5 +55,6 @@ pub mod export;
 pub mod readonly;
 pub mod replay;
 pub mod row;
+pub mod slowdown;
 
 pub use cli::main;

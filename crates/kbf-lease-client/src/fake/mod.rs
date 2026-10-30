@@ -201,6 +201,12 @@ impl FakeLeaseServer {
         locked(&self.shared.state).taint(host, reason)
     }
 
+    /// The host refuses every new run with `409` and `code` (`None`: takes runs again). It
+    /// taints nothing, and the runs it has go on.
+    pub fn refuse_posts(&self, host: &str, code: Option<&'static str>) -> bool {
+        locked(&self.shared.state).refuse_posts(host, code)
+    }
+
     /// The host starts a queued run. False if the run is not queued.
     pub fn run_started(&self, run: &RunId) -> bool {
         locked(&self.shared.state).run_started(run)
@@ -237,6 +243,12 @@ impl FakeLeaseServer {
     #[must_use]
     pub fn run_args(&self, run: &RunId) -> Option<Vec<String>> {
         locked(&self.shared.state).run_args(run)
+    }
+
+    /// The image the run was queued with, as the server received it.
+    #[must_use]
+    pub fn run_image(&self, run: &RunId) -> Option<String> {
+        locked(&self.shared.state).run_image(run)
     }
 
     /// The mounts the run was queued with, as the server received them.
