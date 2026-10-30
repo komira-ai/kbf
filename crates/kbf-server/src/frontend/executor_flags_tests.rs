@@ -106,6 +106,8 @@ fn the_daemon_executor_keeps_the_lease_servers_settings_unread() {
             all[0] = executor;
         }
         assert!(all.contains(&"--executor-insecure-argv-secrets"));
+        // A tag, which the js-agent parse refuses: the daemon executor must never read it.
+        all.push("--executor-default-image=registry.test/base:22.04");
         let flags = parsed(argv(&all)).expect("flags");
         assert_eq!(flags.executor.kind, ExecutorKind::KbfDaemon);
         assert!(flags.executor.js.is_none());

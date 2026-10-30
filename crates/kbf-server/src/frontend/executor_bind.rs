@@ -82,6 +82,13 @@ pub(super) fn check(js: &mut JsAgentFlags, beside: &Beside<'_>) -> Result<Vec<St
     config.validate().map_err(|e| refuse(&e.to_string()))?;
 
     let put_https = task.put_endpoint.starts_with("https://");
+    let put_http = task.put_endpoint.starts_with("http://");
+    if !put_https && !put_http {
+        return Err(refuse(
+            "--task-put-endpoint must start with https:// (or http://, with \
+             --executor-allow-plain-http-put)",
+        ));
+    }
     match (put_https, config.allow_plain_http_put) {
         (false, false) => {
             return Err(refuse(

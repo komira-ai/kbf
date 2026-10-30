@@ -477,3 +477,58 @@ async fn an_action_runs_and_ingests_over_the_real_run_preparation() {
         assert!(!said.contains(secret), "{secret} in {said}");
     }
 }
+
+/// Catches a host's failure text reaching the log: a driver's error can quote the argument
+/// list, which holds the signed write and the read token, and the executor logs a run that
+/// ends badly. Nothing it logs may carry either, whatever the host wrote.
+#[tokio::test(start_paused = true)]
+async fn a_failed_runs_detail_quoting_the_arguments_never_reaches_the_log() {
+    let log = Log::default();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish(),
+    );
+    let _logged = tracing::dispatcher::set_default(&dispatch);
+
+    let (world, actions) = World::start(&[(b"input", true)]).await;
+    let stage = world.submit(actions[0]);
+    let run = world.posted().await;
+    let args = world.fake.run_args(&run).expect("a run");
+    let (pack_url, token) = (arg(&args, "--pack-url"), arg(&args, "--grant-token"));
+    let signature = pack_url
+        .split_once('?')
+        .and_then(|(_, query)| {
+            query
+                .split('&')
+                .find_map(|q| q.strip_prefix("X-Amz-Signature="))
+        })
+        .expect("a signature")
+        .to_owned();
+
+    world.fake.run_started(&run);
+    let detail = format!("exec failed: --pack-url {pack_url} --grant-token {token}");
+    assert!(
+        world
+            .fake
+            .finish_run(&run, Outcome::Failed, Some(1), Some(&detail))
+    );
+    // The farm may run the action again after an infrastructure failure, so the stage is not
+    // waited on: the executor has judged the run once it has had its turns.
+    for _ in 0..10 {
+        world.step().await;
+    }
+    drop(stage);
+    world.running.stop().await;
+
+    let said = log.text();
+    assert!(
+        said.contains("the task tool failed"),
+        "the run was logged: {said}"
+    );
+    for secret in [signature.as_str(), token.as_str(), pack_url.as_str()] {
+        assert!(!said.contains(secret), "{secret} in {said}");
+    }
+}

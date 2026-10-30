@@ -157,13 +157,15 @@ async fn leased_by(client: &Client, id: &str) -> Vec<kbf_lease_client::Lease> {
 /// Waits until `check` holds of the scraped metrics of `api`, asking again each time the
 /// frontend has had the chance to do something.
 async fn scraped_until(api: std::net::SocketAddr, check: impl Fn(&str) -> bool) -> String {
-    loop {
-        let text = scrape(api).await;
+    let mut text = String::new();
+    for _ in 0..100_000 {
+        text = scrape(api).await;
         if check(&text) {
             return text;
         }
         tokio::task::yield_now().await;
     }
+    panic!("the metrics never held: {text}");
 }
 
 /// Catches an executor built where none was asked for: a frontend of `kbf-daemon`, given or not

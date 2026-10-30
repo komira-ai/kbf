@@ -252,3 +252,16 @@ fn the_host_of_a_url_is_an_address_or_nothing() {
         );
     }
 }
+
+/// Catches a tier store whose scheme is not `http://` or `https://` riding in on the plain
+/// opt-in (or `HTTPS://` being taken for plain): only those two schemes are a store.
+#[test]
+fn a_put_endpoint_is_http_or_https_exactly() {
+    for endpoint in ["ftp://192.0.2.1:21", "HTTPS://192.0.2.5:9300"] {
+        let why = refused(&[], &[&format!("--task-put-endpoint={endpoint}")]);
+        assert!(
+            why.contains("--task-put-endpoint must start with https://"),
+            "{endpoint}: {why}"
+        );
+    }
+}
