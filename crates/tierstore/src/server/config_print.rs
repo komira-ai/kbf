@@ -110,6 +110,9 @@ pub(super) fn render(cli: &Cli) -> Result<String, ConfigError> {
         body_idle_timeout: Some(Dur(cli.body_idle_timeout)),
         s3_request_timeout: Some(Dur(cli.s3_request_timeout)),
         backend_check_wait: Some(Dur(cli.backend_check_wait)),
+        bridge_listen: None,
+        listen_unix: None,
+        listen_unix_group: None,
     };
     let file = File {
         server,

@@ -83,8 +83,9 @@ percent-encoding = { workspace = true, optional = true }
 # The SHA-1 a client may send as the `x-amz-checksum-sha1` of a body (`server`).
 ring = { workspace = true, optional = true }
 # The user id the server runs as, which a key file must belong to, and the free space, the link count and
-# the times of the files of the local cache (`server`).
-rustix = { workspace = true, features = ["fs", "process"], optional = true }
+# the times of the files of the local cache, and the Unix-domain socket of a build node, which is
+# made, given its mode and group, and only then listened on (`server`).
+rustix = { workspace = true, features = ["fs", "net", "process"], optional = true }
 # The body of a CompleteMultipartUpload request (`server`).
 roxmltree = { workspace = true, optional = true }
 # The journal objects, the checkpoints and the usage object are JSON.

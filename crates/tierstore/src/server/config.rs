@@ -47,6 +47,7 @@ use super::cli::{
 };
 use super::config_cache::{CacheSettings, LocalCacheTable};
 use super::front::FrontSettings;
+use super::listeners::JobListeners;
 use crate::journal::{JOURNAL_PREFIX, TIERING_PREFIX};
 
 /// The flags that stay flags: the file is for the data path, and these are per run.
@@ -332,6 +333,15 @@ pub(super) struct ServerTable {
     pub body_idle_timeout: Option<Dur>,
     pub s3_request_timeout: Option<Dur>,
     pub backend_check_wait: Option<Dur>,
+    /// Build node only: a second TCP listener, on one address (see `listeners`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_listen: Option<SocketAddr>,
+    /// Build node only: the path of a Unix-domain socket that is listened on as well.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_unix: Option<PathBuf>,
+    /// Build node only: the group of the socket file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_unix_group: Option<String>,
 }
 
 /// `[hot_store]` or `[cold_store]`: the tier and how to reach it, and the keys only one of the
@@ -511,11 +521,13 @@ fn looks_secret(key: &str) -> bool {
 /// Whether `key` is a name some table of the file holds: the last part of a key in [`KEYS`], or a
 /// `[[policy]]` key.
 fn known_key(key: &str) -> bool {
-    matches!(key, "prefix" | "cache")
-        || KEYS
-            .iter()
-            .flat_map(|(_, keys)| keys.iter())
-            .any(|name| name.rsplit('.').next() == Some(key))
+    matches!(
+        key,
+        "prefix" | "cache" | "bridge_listen" | "listen_unix" | "listen_unix_group"
+    ) || KEYS
+        .iter()
+        .flat_map(|(_, keys)| keys.iter())
+        .any(|name| name.rsplit('.').next() == Some(key))
 }
 
 /// The fault `error` found in `text`, as a [`ConfigError::Syntax`] that does not repeat the line
@@ -709,6 +721,16 @@ fn storage(
 ) -> Result<Cli, ConfigError> {
     let (hot, cold) = tiers;
     check_policies(policy, false)?;
+    let job_listeners = [
+        ("bridge_listen", server.bridge_listen.is_some()),
+        ("listen_unix", server.listen_unix.is_some()),
+        ("listen_unix_group", server.listen_unix_group.is_some()),
+    ];
+    refuse(
+        "server",
+        "only a build node has a listener for jobs",
+        &job_listeners,
+    )?;
     refuse_hot_keys(&cold)?;
     let why = "only the [cold_store] of a build node takes a list; give endpoint";
     refuse("hot_store", why, &[("endpoints", hot.endpoints.is_some())])?;
@@ -822,7 +844,14 @@ pub(super) fn front_of(server: ServerTable, per_run: PerRun) -> Result<Shared, C
         1,
         u32::MAX,
     )?;
+    let jobs = JobListeners::new(
+        server.listen,
+        server.bridge_listen,
+        server.listen_unix,
+        server.listen_unix_group,
+    )?;
     let front = FrontSettings {
+        jobs,
         listen: server.listen,
         proxy_id: server.proxy_id,
         bucket: server.bucket,
