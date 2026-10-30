@@ -316,7 +316,7 @@ task-put-region = "us-east-1"
 task-run-wall-secs = 7200
 # Turns on the preparation of the runs of a host executor: for each run the frontend makes the keys the task may write, a presigned write of each to the tier store, and a read grant for the task's inputs. The file holds one secret of at least 32 bytes (surrounding white space is dropped), owned by this user and readable by it alone (mode 0600 or 0400): the pack-key mint and the read-grant key are made from it, and it is the secret the job-facing listener verifies grants with. The secret is never a flag: a command line is world-readable. Needs `--task-put-endpoint`, `--task-put-bucket`, `--task-put-credentials-file` and `--task-read-url`. Left out, no run is prepared
 # task-secret-file = "PATH"
-# The time past the run wall, in seconds, that a task's presigned write and read grant stay good: the time a task takes to start and to put its pack. The wall and the slack together must not pass 14400, the ceiling of a presigned write, or the frontend does not start. Used only with `--task-secret-file`
+# The time past the run wall, in seconds, that a task's presigned write and read grant stay good: the time a task takes to start and to put its pack, which includes the retries of a put the store refuses with 503: about 165 seconds from the first attempt to the last by default (up to 60 s of the task's own waits, and up to 15 s at the store before each refusal). The wall and the slack together must not pass 14400, the ceiling of a presigned write, or the frontend does not start. Used only with `--task-secret-file`
 task-url-slack-secs = 600
 
 [tls]

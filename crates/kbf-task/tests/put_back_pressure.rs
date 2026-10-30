@@ -261,3 +261,108 @@ async fn a_large_put_refused_at_the_cap_is_stored_by_its_retry_once_a_slot_frees
         .expect("stored");
     assert_eq!(held.as_ref(), b"abcd");
 }
+
+/// What the stub saw of its connections.
+#[derive(Default)]
+struct Stub {
+    connections: std::sync::atomic::AtomicUsize,
+}
+
+/// Reads from `stream` until the request head is complete, and returns the head's bytes and
+/// whatever of the body came with them.
+async fn read_head(stream: &mut TcpStream) -> (Vec<u8>, Vec<u8>) {
+    let mut seen = Vec::new();
+    let mut piece = [0_u8; 16 << 10];
+    loop {
+        if let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+            let body = seen.split_off(end + 4);
+            return (seen, body);
+        }
+        let n = stream.read(&mut piece).await.expect("a request");
+        assert!(n > 0, "the client closed before it sent a head");
+        seen.extend_from_slice(&piece[..n]);
+    }
+}
+
+/// Asserts, with a raw stub and no tierstore, that a connection reset under a large body is
+/// retried and the retry stored: the stub reads the head and a part of the body of the first
+/// connection and resets it (`SO_LINGER` of zero, then closes, which sends an RST), and answers
+/// 201 on the second after reading its whole body. The client attempts twice and waits once
+/// (the default wait, as a reset names no `Retry-After`), and the stub saw exactly two
+/// connections. This is the case the first test above cannot pin, since it accepts either end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_reset_under_a_large_body_is_retried_and_the_retry_is_stored() {
+    use std::sync::atomic::Ordering;
+
+    const BODY: usize = 2 << 20;
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bound");
+    let addr = listener.local_addr().expect("an address");
+    let stub = Arc::new(Stub::default());
+    let seen = Arc::clone(&stub);
+    let serving = tokio::spawn(async move {
+        // The first connection: a part of the body is read, then the connection is reset.
+        let (mut first, _) = listener.accept().await.expect("accepted");
+        seen.connections.fetch_add(1, Ordering::SeqCst);
+        let (_, mut body) = read_head(&mut first).await;
+        let mut piece = [0_u8; 16 << 10];
+        while body.len() < 64 << 10 {
+            let n = first.read(&mut piece).await.expect("a part of the body");
+            assert!(n > 0, "the client closed before it sent a body");
+            body.extend_from_slice(&piece[..n]);
+        }
+        #[allow(deprecated)]
+        first.set_linger(Some(Duration::ZERO)).expect("linger");
+        drop(first);
+        // The second: the whole body is read, then 201.
+        let (mut second, _) = listener.accept().await.expect("accepted");
+        seen.connections.fetch_add(1, Ordering::SeqCst);
+        let (head, mut body) = read_head(&mut second).await;
+        let head = String::from_utf8(head)
+            .expect("a text head")
+            .to_ascii_lowercase();
+        let length: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .expect("a length")
+            .trim()
+            .parse()
+            .expect("a number");
+        while body.len() < length {
+            let n = second.read(&mut piece).await.expect("the body");
+            assert!(n > 0, "the client closed before it sent the whole body");
+            body.extend_from_slice(&piece[..n]);
+        }
+        second
+            .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("an answer");
+        second.shutdown().await.ok();
+        body.len()
+    });
+
+    let url = format!("http://{addr}/cas/b/run/nonce?X-Sig=secret");
+    let (outcome, attempts, waits) = tokio::task::spawn_blocking(move || {
+        let body = pattern(BODY);
+        let client = agent(None);
+        let sleeper = Recorded::default();
+        let mut attempts = 0_usize;
+        let outcome = put_retrying(
+            || {
+                attempts += 1;
+                put(&client, &url, &body)
+            },
+            &sleeper,
+            &Middle,
+        );
+        let waits = sleeper.0.lock().expect("lock").clone();
+        (outcome, attempts, waits)
+    })
+    .await
+    .expect("the client");
+
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(attempts, 2);
+    assert_eq!(waits, [kbf_task::put::DEFAULT_WAIT]);
+    assert_eq!(serving.await.expect("the stub"), BODY);
+    assert_eq!(stub.connections.load(Ordering::SeqCst), 2);
+}

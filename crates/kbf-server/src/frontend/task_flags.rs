@@ -173,8 +173,11 @@ pub(super) fn args() -> [Arg; 14] {
             .default_value("600")
             .help(
                 "The time past the run wall, in seconds, that a task's presigned write and read \
-                 grant stay good: the time a task takes to start and to put its pack. The wall \
-                 and the slack together must not pass 14400, the ceiling of a presigned write, \
+                 grant stay good: the time a task takes to start and to put its pack, which \
+                 includes the retries of a put the store refuses with 503: about 165 seconds \
+                 from the first attempt to the last by default (up to 60 s of the task's own \
+                 waits, and up to 15 s at the store before each refusal). The wall and the \
+                 slack together must not pass 14400, the ceiling of a presigned write, \
                  or the frontend does not start. Used only with `--task-secret-file`",
             ),
         Arg::new(MAX_DIGESTS)

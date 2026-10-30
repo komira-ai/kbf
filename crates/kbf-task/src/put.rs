@@ -131,9 +131,11 @@ pub enum PutError {
     },
 }
 
-/// The error of a request that did not complete: [`PutError::Interrupted`] for a connection that
-/// broke after it was made, [`PutError::Transport`] for any other (a store not reached, a bad
-/// URL, a timeout, a protocol error).
+/// The error of a request that did not complete: [`PutError::Interrupted`] for an I/O error of
+/// kind reset, abort or broken pipe, [`PutError::Transport`] for any other (a store not reached,
+/// a bad URL, a timeout, a protocol error, a clean close before any answer). The classification
+/// is by the kind of the error alone, so a reset while the connection was being made is
+/// `Interrupted` too; retrying that is harmless, since nothing was sent.
 fn transport_error(error: &ureq::Error, url: &str) -> PutError {
     use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
     let (url, reason) = (redact(url), scrub(&error.to_string(), url));
@@ -1008,6 +1010,57 @@ mod tests {
             );
             assert!(!got.to_string().contains("secret"), "{got}");
         }
+    }
+
+    /// Catches a store that closes the connection cleanly before it answers being retried: the
+    /// error ureq gives for it (an end of file, "Peer disconnected") is `Transport`, which is
+    /// final, so one attempt is made and no wait follows; and the same through a real socket,
+    /// where the stub reads the whole request, then closes without a byte of answer.
+    #[test]
+    fn a_store_that_closes_before_answering_is_a_final_transport_error() {
+        use std::io::{Error, ErrorKind};
+        let url = "http://h/k?X-Sig=secret";
+        let eof = ureq::Error::Io(Error::new(ErrorKind::UnexpectedEof, "Peer disconnected"));
+        let sleeper = Recorded::default();
+        let (attempt, calls) = answering(vec![Err(transport_error(&eof, url)), Ok(())]);
+        let err = put_retrying(attempt, &sleeper, &MIDDLE).unwrap_err();
+        assert!(matches!(err, PutError::Transport { .. }), "{err:?}");
+        assert_eq!(calls.get(), 1);
+        assert!(sleeper.waits().is_empty());
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("a line");
+                if line.trim_end().is_empty() {
+                    break;
+                }
+            }
+            // The one byte of the body, so that nothing unread makes the close a reset.
+            let mut body = [0_u8; 1];
+            reader.read_exact(&mut body).expect("the body");
+        });
+        let url = format!("{base}/k?X-Sig=secret");
+        let sleeper = Recorded::default();
+        let client = agent(None);
+        let mut attempts = 0;
+        let err = put_retrying(
+            || {
+                attempts += 1;
+                put(&client, &url, b"x")
+            },
+            &sleeper,
+            &MIDDLE,
+        )
+        .unwrap_err();
+        server.join().expect("server");
+        assert!(matches!(err, PutError::Transport { .. }), "{err:?}");
+        assert_eq!(attempts, 1);
+        assert!(sleeper.waits().is_empty());
     }
 
     /// Catches the real jitter being constant or outside 0 to under 1: 64 draws are all in range
